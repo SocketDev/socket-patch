@@ -238,7 +238,6 @@ async fn fetch_missing_sources_diff_uncreatable_archives_dir_is_per_archive_writ
     let diffs = notadir.join("diffs");
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: Some(&diffs),
         mem_blobs: None,
     };
@@ -469,7 +468,6 @@ async fn fetch_missing_sources_diff_disk_write_failure_is_per_archive_failure() 
 
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: Some(&diffs),
         mem_blobs: None,
     };

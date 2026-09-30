@@ -1,4 +1,5 @@
 pub mod cargo_workspace;
+pub mod composer_version;
 pub mod concurrent;
 pub(crate) mod digest;
 pub(crate) mod durability;
@@ -22,14 +23,5 @@ pub mod socket_cli_config;
 pub mod socket_dir;
 pub(crate) mod toml_edit_ext;
 pub mod uri;
-
-// Moved modules — these re-exports keep the old `utils::*` paths compiling
-// for external consumers of the published crate. Internal code must import
-// the new canonical paths; CI greps reject new uses of the old ones. Drop
-// these aliases at 5.0.
-pub use crate::api::date;
-pub use crate::crawlers::fuzzy_match;
-pub use crate::manifest::cleanup_blobs;
-pub use crate::telemetry;
 
 pub mod hatch;

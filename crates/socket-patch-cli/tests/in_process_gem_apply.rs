@@ -199,6 +199,7 @@ async fn gem_install_scan_sync_patches_real_file() {
     .await;
 
     let args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
@@ -220,11 +221,10 @@ async fn gem_install_scan_sync_patches_real_file() {
         prune: false,
         sync: true,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     let code = scan_run(args).await;
     assert_eq!(
@@ -312,6 +312,7 @@ async fn gem_crawler_finds_real_installed_gem() {
         .await;
 
     let args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
@@ -333,11 +334,10 @@ async fn gem_crawler_finds_real_installed_gem() {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     assert_eq!(scan_run(args).await, 0);
 

@@ -1,7 +1,7 @@
 //! Real-composer HOSTED (redirect) capstone — the composer twin of
 //! `e2e_redirect_npm_build.rs`, ending in the manifest-less VEX legs.
 //!
-//! `scan --redirect` never lands patched bytes in the repo: it rewrites
+//! `scan --mode hosted` never lands patched bytes in the repo: it rewrites
 //! composer.lock so the patched package's `dist` RESOLVES from Socket's
 //! hosted patch archive (here: a wiremock standing in for patch.socket.dev)
 //! and pins the archive's sha1 in `dist.shasum`. This proves every link of
@@ -15,10 +15,11 @@
 //!      marker comment appended to `src/LoggerInterface.php`, wrapped in a
 //!      GitHub-zipball-style top-level dir) and serve it from wiremock with
 //!      the discovery / reference / view API mocks.
-//!   3. `scan --redirect --json --vex …` (or its `get <uuid> --mode hosted`
+//!   3. `scan --mode hosted --json --vex …` (or its `get <uuid> --mode hosted`
 //!      twin): composer.lock's psr/log `dist` now points at the wiremock
-//!      archive with its sha1, the redirect ledger embeds the record, no
-//!      manifest is written, and the in-run VEX is `(redirected)`.
+//!      archive with its sha1, NO redirect ledger and no manifest is written
+//!      (v5: the lock is the hosted state), and the in-run VEX is
+//!      `(redirected)`.
 //!   4. FRESH-CHECKOUT PROOF: only composer.json + composer.lock + `.socket/`
 //!      travel; a cold-home/cache `composer install` downloads the archive
 //!      from the hosted patch server — the installed file is byte-identical
@@ -29,17 +30,22 @@
 //!      silently install the pristine upstream commit instead.)
 //!   5. MANIFEST-LESS VEX on the fresh checkout (the hosted flow never wrote
 //!      a manifest; asserted), against a mock patch API:
-//!      * ledger kept → standalone `vex` attests `(redirected)` with the
-//!        installed tree hash-verified, as does embedded `apply --vex`; a
-//!        tampered installed file is `hash_mismatch`;
-//!      * ledger deleted → attests from the composer.lock dist (the hosted
-//!        origin named by `--patch-server-url`) + the API record; without
-//!        that flag a loopback origin is not Socket's and nothing is
-//!        discovered;
-//!      * `--offline`, no ledger → `record_unavailable`, zero requests;
-//!      * composer.lock reverted to the registry dist with the ledger left
-//!        behind + a REAL re-install (pristine bytes) → `redirect_unwired`,
+//!      * standalone `vex` attests `(redirected)` from the composer.lock
+//!        dist (the hosted origin named by `--patch-server-url`) + the API
+//!        record, with the installed tree hash-verified, as does embedded
+//!        `apply --vex`; a tampered installed file is `hash_mismatch`;
+//!        without `--patch-server-url` a loopback origin is not Socket's and
+//!        nothing is discovered;
+//!      * `--offline` → `record_unavailable` (hosted mode keeps no local
+//!        record), zero requests;
+//!      * composer.lock reverted to the registry dist + a REAL re-install
+//!        (pristine bytes) → nothing names the patch any more,
 //!        `--no-verify` and `--offline` included.
+//!   6. ROLLBACK of the original project restores the upstream dist +
+//!      source from the REAL packagist metadata: byte-identical to the
+//!      registry lock on composer 2 (packagist-resolved); composer 1's
+//!      inline package repository is not packagist, so the pin is refused
+//!      with the `git checkout -- composer.lock` remedy and nothing moves.
 //!
 //! Skips (println) when composer is missing or the fixture install cannot
 //! reach its registry — unless `SOCKET_PATCH_COMPOSER_E2E_REQUIRED` is set,
@@ -65,7 +71,7 @@ mod vex_e2e_common;
 use composer_e2e_common::{composer, composer_major, fresh_checkout, setup_psr_log_project};
 use vex_e2e_common::{
     assert_absent, assert_attested, assert_not_attested, binary, git_sha256, patch_view, run_vex,
-    strip_ledgers, strip_manifest, Marker, PatchApi, VexOutcome, VexRun, VexVia,
+    strip_manifest, Marker, PatchApi, VexOutcome, VexRun, VexVia,
 };
 
 const SUITE: &str = "e2e_redirect_composer_build";
@@ -83,14 +89,136 @@ const FILE_KEY: &str = "src/LoggerInterface.php";
 /// Which CLI front door performs the redirect (step 3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RedirectCli {
-    /// `scan --redirect --json --yes --vex …` (embedded VEX asserted).
+    /// `scan --mode hosted --json --yes --vex …` (embedded VEX asserted).
     ScanRedirectVex,
     /// `get <UUID> --mode hosted --json --yes` (get has no `--vex`).
     GetUuidHosted,
+    /// `scan --mode hosted --yes` in human mode (the next-steps text asserted).
+    ScanRedirectHuman,
+}
+
+/// The real package a capstone redirects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FixturePkg {
+    /// psr/log 3.0.x (`composer_e2e_common`'s fixture).
+    PsrLog,
+    /// symfony/deprecation-contracts `v3.5.1` (PHP ≥ 8.1) or `v2.5.4`: a
+    /// release whose lock version carries the `v` tag.
+    VTagged,
+}
+
+impl FixturePkg {
+    fn name(self) -> &'static str {
+        match self {
+            Self::PsrLog => DEP,
+            Self::VTagged => VTAG_DEP,
+        }
+    }
+
+    fn file_key(self) -> &'static str {
+        match self {
+            Self::PsrLog => FILE_KEY,
+            Self::VTagged => "function.php",
+        }
+    }
+
+    /// The GitHub-zipball-style top-level dir of the hosted archive.
+    fn zip_top(self) -> String {
+        match self {
+            Self::PsrLog => format!("php-fig-log-{}", &composer_e2e_common::PSR_LOG_REF[..7]),
+            Self::VTagged => "symfony-deprecation-contracts-74c71c9".to_string(),
+        }
+    }
+
+    fn setup(self, suite: &str, proj: &Path, home: &Path, cache: &Path, major: u32) -> Option<()> {
+        match self {
+            Self::PsrLog => setup_psr_log_project(suite, proj, home, cache, major),
+            Self::VTagged => setup_vtag_project(suite, proj, home, cache, major),
+        }
+    }
+}
+
+const VTAG_DEP: &str = "symfony/deprecation-contracts";
+
+/// The v-tagged fixture: Composer picks `v3.5.1` or `v2.5.4` by its PHP;
+/// Composer 1 resolves them from an inline package repository.
+fn setup_vtag_project(
+    suite: &str,
+    proj: &Path,
+    home: &Path,
+    cache: &Path,
+    major: u32,
+) -> Option<()> {
+    let release = |version: &str, reference: &str, php: &str| {
+        serde_json::json!({
+            "name": VTAG_DEP,
+            "version": version,
+            "type": "library",
+            "dist": {
+                "type": "zip",
+                "url": format!("https://api.github.com/repos/symfony/deprecation-contracts/zipball/{reference}"),
+                "reference": reference,
+            },
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/deprecation-contracts.git",
+                "reference": reference,
+            },
+            "require": { "php": php },
+            "autoload": { "files": ["function.php"] },
+        })
+    };
+    let mut doc = serde_json::json!({
+        "name": "socket/composer-vtag-capstone",
+        "require": { VTAG_DEP: "3.5.1 || 2.5.4" },
+    });
+    if major < 2 {
+        doc["repositories"] = serde_json::json!([
+            { "packagist.org": false },
+            { "type": "package", "package": release("v3.5.1", "74c71c939a79f7d5bf3c1ce9f5ea37ba0114c6f6", ">=8.1") },
+            { "type": "package", "package": release("v2.5.4", "605389f2a7e5625f273b53960dc46aeaf9c62918", ">=7.1") },
+        ]);
+    }
+    std::fs::write(
+        proj.join("composer.json"),
+        format!("{}\n", serde_json::to_string_pretty(&doc).unwrap()),
+    )
+    .unwrap();
+    let update = composer(proj, &["update"], home, cache);
+    if !update.status.success() {
+        return composer_e2e_common::skip(
+            suite,
+            &format!(
+                "`composer update` failed:\n{}\n{}",
+                String::from_utf8_lossy(&update.stdout),
+                String::from_utf8_lossy(&update.stderr)
+            ),
+        );
+    }
+    Some(())
+}
+
+/// `(major, minor)` of the composer toolchain under test.
+fn composer_release() -> (u32, u32) {
+    let mut probe = composer_e2e_common::composer_command();
+    probe.arg("--version").arg("--no-ansi");
+    cache_env::isolate(&mut probe);
+    let out = probe.output().expect("run composer --version");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let version = text
+        .split_whitespace()
+        .skip_while(|w| *w != "version")
+        .nth(1)
+        .unwrap_or_else(|| panic!("unparseable `composer --version`: {text}"));
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
 }
 
 struct Fixture {
     tmp: tempfile::TempDir,
+    /// Composer major on PATH (1 resolves from an inline repository).
+    major: u32,
+    pkg: FixturePkg,
     proj: PathBuf,
     purl: String,
     orig: Vec<u8>,
@@ -105,7 +233,7 @@ struct Fixture {
 /// The dist zip composer downloads: every file of the installed package
 /// under one GitHub-zipball-style top-level dir (composer strips a lone
 /// top-level dir on both majors), with the patched entry point.
-fn build_patched_zip(pkg_dir: &Path, patched: &[u8]) -> Vec<u8> {
+fn build_patched_zip(pkg_dir: &Path, top: &str, file_key: &str, patched: &[u8]) -> Vec<u8> {
     fn walk(dir: &Path, rel: &str, out: &mut Vec<(String, PathBuf)>) {
         let mut entries: Vec<_> = std::fs::read_dir(dir)
             .unwrap()
@@ -133,11 +261,10 @@ fn build_patched_zip(pkg_dir: &Path, patched: &[u8]) -> Vec<u8> {
         let mut zip = zip::ZipWriter::new(&mut buf);
         let opts = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
-        let top = format!("php-fig-log-{}", &composer_e2e_common::PSR_LOG_REF[..7]);
         zip.add_directory(format!("{top}/"), opts).unwrap();
         for (rel, abs) in files {
             zip.start_file(format!("{top}/{rel}"), opts).unwrap();
-            let bytes = if rel == FILE_KEY {
+            let bytes = if rel == file_key {
                 patched.to_vec()
             } else {
                 std::fs::read(abs).unwrap()
@@ -149,28 +276,28 @@ fn build_patched_zip(pkg_dir: &Path, patched: &[u8]) -> Vec<u8> {
     buf.into_inner()
 }
 
-fn locked_version(lock: &[u8]) -> String {
+fn locked_version(lock: &[u8], name: &str) -> String {
     let lock: serde_json::Value = serde_json::from_slice(lock).expect("composer.lock parses");
     lock["packages"]
         .as_array()
         .expect("packages[]")
         .iter()
-        .find(|p| p["name"] == DEP)
+        .find(|p| p["name"] == name)
         .and_then(|p| p["version"].as_str())
-        .unwrap_or_else(|| panic!("{DEP} missing from composer.lock"))
+        .unwrap_or_else(|| panic!("{name} missing from composer.lock"))
         .trim_start_matches('v')
         .to_string()
 }
 
-fn lock_entry(proj: &Path) -> serde_json::Value {
+fn lock_entry(proj: &Path, name: &str) -> serde_json::Value {
     let lock: serde_json::Value =
         serde_json::from_slice(&std::fs::read(proj.join("composer.lock")).unwrap()).unwrap();
     lock["packages"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|p| p["name"] == DEP)
-        .unwrap_or_else(|| panic!("{DEP} missing from composer.lock"))
+        .find(|p| p["name"] == name)
+        .unwrap_or_else(|| panic!("{name} missing from composer.lock"))
         .clone()
 }
 
@@ -212,6 +339,7 @@ async fn redirected_project(
     tag: &str,
     cli: RedirectCli,
     tamper_served_archive: bool,
+    pkg: FixturePkg,
 ) -> Option<Fixture> {
     let suite = format!("{SUITE}({tag})");
     let major = composer_major(&suite)?;
@@ -220,12 +348,14 @@ async fn redirected_project(
     std::fs::create_dir_all(&proj).unwrap();
     let home = tmp.path().join("composer-home");
     let cache = tmp.path().join("composer-cache");
-    setup_psr_log_project(&suite, &proj, &home, &cache, major)?;
+    pkg.setup(&suite, &proj, &home, &cache, major)?;
+    let (name, file_key) = (pkg.name(), pkg.file_key());
+    let pkg_dir = proj.join("vendor").join(name);
 
     let registry_lock = std::fs::read(proj.join("composer.lock")).unwrap();
-    let version = locked_version(&registry_lock);
-    let purl = format!("pkg:composer/{DEP}@{version}");
-    let orig = std::fs::read(proj.join("vendor/psr/log").join(FILE_KEY)).expect("installed file");
+    let version = locked_version(&registry_lock, name);
+    let purl = format!("pkg:composer/{name}@{version}");
+    let orig = std::fs::read(pkg_dir.join(file_key)).expect("installed file");
     let marker = format!("\n// SOCKET-PATCH-HOSTED-E2E-MARKER patch={UUID}\n");
     assert!(
         !String::from_utf8_lossy(&orig).contains("SOCKET-PATCH-HOSTED-E2E-MARKER"),
@@ -234,16 +364,19 @@ async fn redirected_project(
     let patched: Vec<u8> = [orig.as_slice(), marker.as_bytes()].concat();
 
     // 2. The patched dist archive + its sha1 (what composer.lock pins).
-    let zip = build_patched_zip(&proj.join("vendor/psr/log"), &patched);
+    let top = pkg.zip_top();
+    let zip = build_patched_zip(&pkg_dir, &top, file_key, &patched);
     let sha1 = hex::encode(Sha1::digest(&zip));
     let served = if tamper_served_archive {
-        build_patched_zip(&proj.join("vendor/psr/log"), b"<?php // tampered\n")
+        build_patched_zip(&pkg_dir, &top, file_key, b"<?php // tampered\n")
     } else {
         zip
     };
+    let leaf = name.rsplit('/').next().unwrap();
 
     let server = MockServer::start().await;
-    let archive_path = format!("/patch/composer/{DEP}/{version}/{TOKEN}/{UUID}/log-{version}.zip");
+    let archive_path =
+        format!("/patch/composer/{name}/{version}/{TOKEN}/{UUID}/{leaf}-{version}.zip");
     let hosted_url = format!("{}{archive_path}", server.uri());
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
@@ -299,7 +432,7 @@ async fn redirected_project(
             "uuid": UUID,
             "purl": purl,
             "publishedAt": "2026-01-01T00:00:00Z",
-            "files": { FILE_KEY: {
+            "files": { file_key: {
                 "beforeHash": git_sha256(&orig),
                 "afterHash": git_sha256(&patched),
             }},
@@ -323,16 +456,19 @@ async fn redirected_project(
     let mut argv: Vec<&str> = match cli {
         RedirectCli::ScanRedirectVex => vec![
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--vex",
             "out.vex.json",
             "--vex-product",
             PRODUCT,
         ],
-        RedirectCli::GetUuidHosted => vec!["get", UUID, "--mode", "hosted"],
+        RedirectCli::GetUuidHosted => vec!["get", UUID, "--mode", "hosted", "--json"],
+        RedirectCli::ScanRedirectHuman => vec!["scan", "--mode", "hosted"],
     };
+    if cli == RedirectCli::ScanRedirectVex {
+        argv.push("--json");
+    }
     argv.extend([
-        "--json",
         "--yes",
         "--cwd",
         &proj_s,
@@ -348,9 +484,22 @@ async fn redirected_project(
         code, 0,
         "{cli:?} failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("{cli:?} --json is not JSON ({e}):\n{stdout}"));
+    let env: serde_json::Value = if cli == RedirectCli::ScanRedirectHuman {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("{cli:?} --json is not JSON ({e}):\n{stdout}"))
+    };
     match cli {
+        RedirectCli::ScanRedirectHuman => {
+            assert!(
+                stdout.contains(
+                    "Reinstall from the updated lockfile (e.g. `composer install`; on Composer 1 \
+                     first remove the patched packages' vendor/<vendor>/<name> directories)"
+                ),
+                "the next steps name the composer reinstall:\n{stdout}\n{stderr}"
+            );
+        }
         RedirectCli::ScanRedirectVex => {
             assert_eq!(env["redirect"]["redirected"], 1, "one redirect: {env}");
             assert_eq!(
@@ -369,7 +518,17 @@ async fn redirected_project(
     }
 
     // composer.lock now resolves psr/log from the hosted archive, pinned.
-    let entry = lock_entry(&proj);
+    let entry = lock_entry(&proj, name);
+    assert_eq!(
+        entry["version"],
+        serde_json::from_slice::<serde_json::Value>(&registry_lock).unwrap()["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap()["version"],
+        "the lock keeps its own version spelling: {entry}"
+    );
     assert_eq!(entry["dist"]["type"], "zip", "{entry}");
     assert_eq!(entry["dist"]["url"], hosted_url, "{entry}");
     assert_eq!(entry["dist"]["shasum"], sha1, "{entry}");
@@ -379,11 +538,9 @@ async fn redirected_project(
         entry.get("source").is_none(),
         "the redirected entry must not keep a source fallback: {entry}"
     );
-    let ledger =
-        std::fs::read_to_string(proj.join(".socket/vendor/redirect-state.json")).expect("ledger");
     assert!(
-        ledger.contains(&purl) && ledger.contains(GHSA),
-        "the ledger embeds the record: {ledger}"
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode must not write the redirect ledger"
     );
     assert!(
         !proj.join(".socket/manifest.json").exists(),
@@ -398,6 +555,8 @@ async fn redirected_project(
 
     Some(Fixture {
         tmp,
+        major,
+        pkg,
         proj,
         purl,
         orig,
@@ -441,35 +600,48 @@ fn assert_manifestless_hosted_vex(fx: &Fixture, fresh: &Path, tag: &str) {
     let vex_in = |dir: &Path, run: VexRun| -> VexOutcome { run_vex(&binary(), dir, &run) };
     let installed = fresh.join("vendor/psr/log").join(FILE_KEY);
 
-    // (1) the hosted flow never wrote a manifest; ledger kept.
+    // (1) the hosted flow never wrote a manifest nor a ledger: the lock's
+    // hosted dist + the API record.
     assert!(
         !fresh.join(".socket/manifest.json").exists(),
         "[{tag}] hosted checkout has no manifest"
     );
+    assert!(
+        !fresh.join(".socket/vendor/redirect-state.json").exists(),
+        "[{tag}] hosted checkout has no redirect ledger"
+    );
     strip_manifest(fresh);
+    let fetched = api.view_requests(UUID);
     let out = vex_in(fresh, hosted(VexRun::online(&api)));
-    assert_eq!(out.code, Some(0), "[{tag}] ledger kept:\n{out}");
+    assert_eq!(out.code, Some(0), "[{tag}] lock + API:\n{out}");
     assert_attested(out.doc(), purl, UUID, Marker::Redirected, vulns);
+    assert!(
+        api.view_requests(UUID) > fetched,
+        "[{tag}] the record came from the API: {:?}",
+        api.requests()
+    );
     let out = vex_in(fresh, hosted(VexRun::online(&api)).via(VexVia::Apply));
     assert_eq!(out.code, Some(0), "[{tag}] apply --vex:\n{out}");
     assert_eq!(out.envelope["status"], "noManifest", "[{tag}]:\n{out}");
     assert_eq!(out.envelope["vex"]["statements"], 1, "[{tag}]:\n{out}");
     assert_attested(out.doc(), purl, UUID, Marker::Redirected, vulns);
     // The installed tree is hash-verified, not just the lock: a tampered
-    // installed file un-attests even with the ledger and wiring intact.
+    // installed file un-attests even with the wiring intact.
     std::fs::write(&installed, b"<?php // tampered after install\n").unwrap();
     let out = vex_in(fresh, hosted(VexRun::online(&api)));
     assert_eq!(out.code, Some(1), "[{tag}] tampered install:\n{out}");
     assert_not_attested(&out.envelope, purl, "hash_mismatch");
     std::fs::write(&installed, &fx.patched).unwrap();
 
-    // (4) (prepared before the ledger goes) composer.lock reverted to the
-    // registry dist, ledger left behind, REAL re-install → pristine bytes.
+    // (4) composer.lock reverted to the registry dist, REAL re-install →
+    // pristine bytes.
     let reverted = fx.tmp.path().join(format!("reverted-{tag}"));
     std::fs::create_dir_all(&reverted).unwrap();
     std::fs::copy(fresh.join("composer.json"), reverted.join("composer.json")).unwrap();
     std::fs::write(reverted.join("composer.lock"), &fx.registry_lock).unwrap();
-    composer_e2e_common::copy_dir_recursive(&fresh.join(".socket"), &reverted.join(".socket"));
+    if fresh.join(".socket").is_dir() {
+        composer_e2e_common::copy_dir_recursive(&fresh.join(".socket"), &reverted.join(".socket"));
+    }
     let install = composer(
         &reverted,
         &["install"],
@@ -487,9 +659,6 @@ fn assert_manifestless_hosted_vex(fx: &Fixture, fresh: &Path, tag: &str) {
         fx.orig,
         "[{tag}] the reverted install holds the pristine registry bytes"
     );
-    assert!(reverted
-        .join(".socket/vendor/redirect-state.json")
-        .is_file());
     for (label, run) in [
         ("online", VexRun::online(&api)),
         (
@@ -515,26 +684,13 @@ fn assert_manifestless_hosted_vex(fx: &Fixture, fresh: &Path, tag: &str) {
             },
         ),
     ] {
+        // No lock names the patch and hosted mode keeps no ledger: nothing
+        // to attest at all.
         let out = vex_in(&reverted, hosted(run));
-        assert_eq!(out.code, Some(1), "[{tag}] reverted {label}:\n{out}");
-        assert_not_attested(&out.envelope, purl, "redirect_unwired");
+        assert_eq!(out.code, Some(2), "[{tag}] reverted {label}:\n{out}");
+        assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
         assert_absent(out.doc.as_ref(), purl);
     }
-
-    // (2) ledger deleted: the lock's hosted dist + the API record.
-    strip_ledgers(fresh);
-    let fetched = api.view_requests(UUID);
-    let out = vex_in(fresh, hosted(VexRun::online(&api)));
-    assert_eq!(out.code, Some(0), "[{tag}] ledger deleted:\n{out}");
-    assert_attested(out.doc(), purl, UUID, Marker::Redirected, vulns);
-    assert!(
-        api.view_requests(UUID) > fetched,
-        "[{tag}] the record came from the API: {:?}",
-        api.requests()
-    );
-    let out = vex_in(fresh, hosted(VexRun::online(&api)).via(VexVia::Apply));
-    assert_eq!(out.code, Some(0), "[{tag}] ledger-less apply --vex:\n{out}");
-    assert_attested(out.doc(), purl, UUID, Marker::Redirected, vulns);
     // Without `--patch-server-url` the loopback origin is not Socket's: no
     // reference, no fetch (`manifest_not_found`, exit 2).
     let seen = api.request_count();
@@ -549,7 +705,7 @@ fn assert_manifestless_hosted_vex(fx: &Fixture, fresh: &Path, tag: &str) {
     assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
     assert_eq!(api.request_count(), seen, "[{tag}] nothing fetched");
 
-    // (3) --offline, no ledger: record_unavailable, zero requests.
+    // (3) --offline: no local record → record_unavailable, zero requests.
     for no_verify in [false, true] {
         let out = vex_in(
             fresh,
@@ -572,7 +728,7 @@ fn assert_manifestless_hosted_vex(fx: &Fixture, fresh: &Path, tag: &str) {
 }
 
 async fn full_chain(tag: &str, cli: RedirectCli) {
-    let Some(fx) = redirected_project(tag, cli, false).await else {
+    let Some(fx) = redirected_project(tag, cli, false, FixturePkg::PsrLog).await else {
         return;
     };
     let (fresh, install) = tokio::task::block_in_place(|| fresh_install(&fx, tag));
@@ -598,6 +754,58 @@ async fn full_chain(tag: &str, cli: RedirectCli) {
         "installed.json names {DEP}"
     );
     tokio::task::block_in_place(|| assert_manifestless_hosted_vex(&fx, &fresh, tag));
+    tokio::task::block_in_place(|| assert_rollback_restores_upstream(&fx, tag));
+}
+
+/// Step 6: `rollback` of the original (still hosted) project. The pin is
+/// discovered from composer.lock on the `--patch-server-url` origin and
+/// restored from the REAL packagist metadata (reachable wherever the
+/// fixture install was).
+fn assert_rollback_restores_upstream(fx: &Fixture, tag: &str) {
+    let origin = fx.server.uri();
+    let before = std::fs::read(fx.proj.join("composer.lock")).unwrap();
+    let (code, stdout, stderr) = run_socket(
+        &fx.proj,
+        &[
+            "rollback",
+            "--json",
+            "--cwd",
+            fx.proj.to_str().unwrap(),
+            "--patch-server-url",
+            &origin,
+        ],
+    );
+    let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("[{tag}] rollback --json is not JSON ({e}):\n{stdout}\n{stderr}")
+    });
+    let after = std::fs::read(fx.proj.join("composer.lock")).unwrap();
+    if fx.major >= 2 {
+        assert_eq!(code, 0, "[{tag}] rollback: {env}\n{stderr}");
+        assert_eq!(
+            env["hosted"]["reverted"],
+            serde_json::json!([fx.purl]),
+            "[{tag}] {env}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&after),
+            String::from_utf8_lossy(&fx.registry_lock),
+            "[{tag}] rollback restores composer.lock byte-for-byte from packagist"
+        );
+    } else {
+        // Composer 1 resolved from an inline `package` repository: not
+        // packagist, so the restore refuses rather than guess.
+        assert_eq!(code, 1, "[{tag}] rollback: {env}\n{stderr}");
+        assert_eq!(env["hosted"]["failed"][0]["purl"], fx.purl, "[{tag}] {env}");
+        let why = env["hosted"]["failed"][0]["error"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            why.contains("git checkout -- composer.lock"),
+            "[{tag}] the refusal names the remedy: {env}"
+        );
+        assert_eq!(after, before, "[{tag}] a refused pin changes nothing");
+    }
+    assert!(!fx.proj.join(".socket/vendor/redirect-state.json").exists());
 }
 
 // multi_thread: the CLI/composer subprocesses block a worker thread while
@@ -625,7 +833,14 @@ async fn composer_get_uuid_hosted_fresh_checkout_and_manifestless_vex() {
 #[ignore = "host capstone: shells out to a real composer; the unpinned `test` job skips it, \
             the e2e job runs it with a pinned toolchain via --ignored"]
 async fn composer_redirect_tampered_archive_fails_checksum_verification() {
-    let Some(fx) = redirected_project("tampered", RedirectCli::ScanRedirectVex, true).await else {
+    let Some(fx) = redirected_project(
+        "tampered",
+        RedirectCli::ScanRedirectVex,
+        true,
+        FixturePkg::PsrLog,
+    )
+    .await
+    else {
         return;
     };
     let (fresh, install) = tokio::task::block_in_place(|| fresh_install(&fx, "tampered"));
@@ -656,4 +871,138 @@ async fn composer_redirect_tampered_archive_fails_checksum_verification() {
         Some(fx.patched.clone()),
         "nothing patched-looking may be installed"
     );
+}
+
+/// Control for WHY the redirect drops `source`: the same tampered hosted
+/// archive, but with the entry's git `source` put back. Composer 1 and
+/// 2.0 – 2.9 then "fall back to source" and install the PRISTINE upstream
+/// commit with exit 0; 2.10+ (`source-fallback` off by default) fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real composer; the unpinned `test` job skips it, \
+            the e2e job runs it with a pinned toolchain via --ignored"]
+async fn composer_hosted_keep_source_control_documents_fallback() {
+    let Some(fx) = redirected_project(
+        "keep-source",
+        RedirectCli::ScanRedirectVex,
+        true,
+        FixturePkg::PsrLog,
+    )
+    .await
+    else {
+        return;
+    };
+    let registry: serde_json::Value = serde_json::from_slice(&fx.registry_lock).unwrap();
+    let source = registry["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == DEP)
+        .and_then(|p| p.get("source"))
+        .filter(|s| s.is_object())
+        .cloned()
+        .expect("the registry lock records a git source");
+    let lock_path = fx.proj.join("composer.lock");
+    let mut lock: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    let entry = lock["packages"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|p| p["name"] == DEP)
+        .unwrap();
+    entry["source"] = source;
+    std::fs::write(
+        &lock_path,
+        format!("{}\n", serde_json::to_string_pretty(&lock).unwrap()),
+    )
+    .unwrap();
+
+    let (major, minor) = tokio::task::block_in_place(composer_release);
+    let (fresh, install) = tokio::task::block_in_place(|| fresh_install(&fx, "keep-source"));
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert!(
+        archive_hits(&fx.server, &fx.archive_path).await >= 1,
+        "the tampered archive was tried first:\n{text}"
+    );
+    let installed = std::fs::read(fresh.join("vendor/psr/log").join(FILE_KEY)).ok();
+    if major < 2 || minor < 10 {
+        assert!(
+            install.status.success(),
+            "composer {major}.{minor} falls back to the git source:\n{text}"
+        );
+        assert_eq!(
+            installed.as_deref(),
+            Some(fx.orig.as_slice()),
+            "composer {major}.{minor} installs the PRISTINE upstream commit:\n{text}"
+        );
+    } else {
+        assert!(
+            !install.status.success(),
+            "composer {major}.{minor} has no source fallback:\n{text}"
+        );
+        assert_ne!(installed, Some(fx.patched.clone()), "{text}");
+        assert_ne!(installed, Some(fx.orig.clone()), "{text}");
+    }
+}
+
+/// A `v`-tagged release (`v3.5.1` in the lock, `3.5.1` in the purl) is
+/// redirected in human mode — its next steps name the composer reinstall —
+/// keeps its lock spelling, and a fresh checkout installs the patched bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real composer; the unpinned `test` job skips it, \
+            the e2e job runs it with a pinned toolchain via --ignored"]
+async fn composer_hosted_v_tagged_fresh_checkout_install() {
+    let Some(fx) = redirected_project(
+        "v-tagged",
+        RedirectCli::ScanRedirectHuman,
+        false,
+        FixturePkg::VTagged,
+    )
+    .await
+    else {
+        return;
+    };
+    let (name, file_key) = (fx.pkg.name(), fx.pkg.file_key());
+    let pretty = lock_entry(&fx.proj, name)["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(pretty.starts_with('v'), "a v-tagged lock: {pretty}");
+    assert_eq!(fx.purl, format!("pkg:composer/{name}@{}", &pretty[1..]));
+    let (fresh, install) = tokio::task::block_in_place(|| fresh_install(&fx, "v-tagged"));
+    assert!(
+        install.status.success(),
+        "cold install from the hosted dist:\n{}\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("vendor").join(name).join(file_key)).unwrap(),
+        fx.patched,
+        "the installed file is the hosted patched bytes"
+    );
+    let origin = fx.server.uri();
+    tokio::task::block_in_place(|| {
+        let vulns: &[(&str, &[&str])] = &[(GHSA, &[CVE])];
+        let patched_hash = git_sha256(&fx.patched);
+        let api = PatchApi::start(vec![(
+            UUID.to_string(),
+            patch_view(UUID, &fx.purl, &[(file_key, &patched_hash)], vulns),
+        )]);
+        let out = run_vex(
+            &binary(),
+            &fresh,
+            &VexRun {
+                product: Some(PRODUCT.to_string()),
+                patch_server_url: Some(origin.clone()),
+                ..VexRun::online(&api)
+            },
+        );
+        assert_eq!(out.code, Some(0), "vex over the v-tagged checkout:\n{out}");
+        assert_attested(out.doc(), &fx.purl, UUID, Marker::Redirected, vulns);
+    });
 }

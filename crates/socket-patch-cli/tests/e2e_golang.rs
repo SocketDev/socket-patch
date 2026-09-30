@@ -96,7 +96,6 @@ async fn run(args: &[&str], cwd: &Path, gomodcache: &Path, api_url: &str) -> Out
             .env_remove("GOPATH")
             .env_remove("SOCKET_OFFLINE")
             .env_remove("SOCKET_PROXY_URL")
-            .env_remove("SOCKET_PATCH_PROXY_URL")
             .env_remove("SOCKET_BATCH_SIZE")
             .output()
             .expect("Failed to run socket-patch binary")

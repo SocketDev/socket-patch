@@ -46,7 +46,9 @@ use super::common::{
 use super::parse_memo::ParseMemo;
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::{extract_on_blocking_pool, extract_tgz};
-use super::service_fetch::{claim_prestaged, fetch_verified_archive, ServiceArtifact};
+use super::service_fetch::{
+    claim_prestaged, fetch_verified_archive, ServiceAttempt, ServicePolicy, ServiceTerminal,
+};
 use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, CargoLockOriginal, VendorArtifact, VendorEntry, VendorMarker,
@@ -319,15 +321,9 @@ async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bo
     prune_empty_vendor_levels(uuid_dir).await;
 }
 
-/// Outcome of attempting to materialise the cargo copy from the patch service.
-enum CargoServiceCopy {
-    /// The prebuilt crate was extracted into `copy_dir`.
-    Used,
-    /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
-    HardFail(Box<VendorOutcome>),
-    /// Fall back to copying + patching the pristine source.
-    FallBack,
-}
+/// Outcome of attempting to materialise the cargo copy from the patch service
+/// (`Used`: the prebuilt crate was extracted into `copy_dir`).
+type CargoServiceCopy = ServiceAttempt<()>;
 
 /// Download the prebuilt `.crate`, integrity-verify it, and extract it into
 /// `copy_dir` (a path-dep copy must carry no `.cargo-checksum.json`). Maps each
@@ -349,125 +345,83 @@ async fn cargo_service_copy(
     if !cfg.service_enabled() {
         return CargoServiceCopy::FallBack;
     }
-    fn hard(code: &'static str, detail: String) -> CargoServiceCopy {
-        CargoServiceCopy::HardFail(Box::new(refused(code, detail)))
-    }
-    let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
-        if cfg.source.requires_service() {
-            hard("vendor_prebuilt_required", reason)
-        } else {
-            warnings.push(VendorWarning::new(
-                code,
-                format!("{reason}; building locally instead"),
-            ));
-            CargoServiceCopy::FallBack
-        }
+    let policy = ServicePolicy::new(cfg, ServiceTerminal::Refused);
+    let fetched = fetch_verified_archive(cfg, &record.uuid).await;
+    let subject = format!("crate for {name}");
+    let mut archive = match policy.settle(fetched, "crate", &subject, warnings) {
+        Ok(archive) => archive,
+        Err(attempt) => return attempt,
     };
-    match fetch_verified_archive(cfg, &record.uuid).await {
-        ServiceArtifact::Ready(mut archive) => {
-            // Extract the `.crate` (tar.gz; strip its single
-            // `{name}-{version}/` top-level dir) into a STAGE sibling and
-            // swap it into the copy dir only once fully verified — a failure
-            // then leaves any pre-existing copy untouched and no husk behind.
-            let stage = stage_dir_for(copy_dir);
-            // A tree the download plan already extracted from these bytes
-            // (see `prestage`) is moved into the stage instead; otherwise —
-            // or should the move fail — extract here, as always.
-            if !claim_prestaged(&mut archive, &stage, copy_dir).await {
-                let _ = remove_tree(&stage).await;
-                if let Err(e) = tokio::fs::create_dir_all(&stage).await {
-                    cleanup_failed_stage(&stage, uuid_dir, false).await;
-                    return hard(
-                        "vendor_prebuilt_write_failed",
-                        format!("cannot create {}: {e}", stage.display()),
-                    );
-                }
-                let crate_bytes = std::mem::take(&mut archive.bytes);
-                if let Err(e) = extract_on_blocking_pool(crate_bytes, &stage, extract_tgz).await {
-                    cleanup_failed_stage(&stage, uuid_dir, false).await;
-                    return hard(
-                        "vendor_prebuilt_extract_failed",
-                        format!("cannot extract the prebuilt crate: {e}"),
-                    );
-                }
-            }
-            let _ = tokio::fs::remove_file(stage.join(".cargo-checksum.json")).await;
-            // Verify the EXTRACTED TREE, not just the archive bytes: the SRI
-            // proves the download is intact, but an unexpected internal
-            // layout (the single `{name}-{version}/` strip leaving an extra
-            // wrapper, or an over-strip) lands the patched files at the wrong
-            // paths and the caller would synthesize success from
-            // `record.files` while the copy is wrong. Fail closed → `auto`
-            // falls back to the local build. (Mirrors composer_lock.rs.)
-            if !copy_matches_after_hashes(&stage, &record.files).await {
-                cleanup_failed_stage(&stage, uuid_dir, false).await;
-                return miss(
-                    warnings,
-                    "vendor_prebuilt_layout_mismatch",
-                    format!(
-                        "prebuilt crate for {name} extracted to an unexpected \
-                         layout (patched files absent at their recorded paths)"
-                    ),
-                );
-            }
-            // The copy's version carries the patch uuid tag, written in the
-            // stage so a swapped-in copy is never untagged.
-            if let Err(e) = cargo_tag::tag_copy_manifest(&stage, version, &record.uuid).await {
-                cleanup_failed_stage(&stage, uuid_dir, false).await;
-                return miss(
-                    warnings,
-                    "vendor_prebuilt_layout_mismatch",
-                    format!("prebuilt crate for {name}: cannot tag its version ({e})"),
-                );
-            }
-            if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
-                cleanup_failed_stage(&stage, uuid_dir, false).await;
-                return hard(
-                    "vendor_prebuilt_write_failed",
-                    format!("cannot move the extracted crate into place: {e}"),
-                );
-            }
-            warnings.push(VendorWarning::new(
-                "vendor_prebuilt_downloaded",
-                format!(
-                    "vendored {name} from the patch service ({})",
-                    archive.source_url
-                ),
-            ));
-            CargoServiceCopy::Used
+    // Extract the `.crate` (tar.gz; strip its single `{name}-{version}/`
+    // top-level dir) into a STAGE sibling and swap it into the copy dir only
+    // once fully verified — a failure then leaves any pre-existing copy
+    // untouched and no husk behind.
+    let stage = stage_dir_for(copy_dir);
+    // A tree the download plan already extracted from these bytes (see
+    // `prestage`) is moved into the stage instead; otherwise — or should the
+    // move fail — extract here, as always.
+    if !claim_prestaged(&mut archive, &stage, copy_dir).await {
+        let _ = remove_tree(&stage).await;
+        if let Err(e) = tokio::fs::create_dir_all(&stage).await {
+            cleanup_failed_stage(&stage, uuid_dir, false).await;
+            return policy.hard(
+                "vendor_prebuilt_write_failed",
+                format!("cannot create {}: {e}", stage.display()),
+            );
         }
-        // Bytes that fail integrity verification are an active tamper signal:
-        // ALWAYS a hard error, in `auto` exactly as in `service` — never a
-        // quiet local-build fallback (`ServiceArtifact`'s documented
-        // contract; nothing was extracted, so there is nothing to clean up).
-        ServiceArtifact::IntegrityMismatch(reason) => hard(
-            "vendor_prebuilt_integrity_mismatch",
-            format!(
-                "prebuilt crate for {name} failed integrity verification ({reason}); \
-                 refusing to fall back to a local build on tampered bytes"
-            ),
-        ),
-        ServiceArtifact::Pending => miss(
-            warnings,
-            "vendor_prebuilt_pending",
-            "prebuilt crate is still building".to_string(),
-        ),
-        ServiceArtifact::Unavailable(reason) => {
-            if cfg.source.requires_service() {
-                hard(
-                    "vendor_prebuilt_required",
-                    format!("prebuilt crate unavailable: {reason}"),
-                )
-            } else {
-                CargoServiceCopy::FallBack
-            }
+        let crate_bytes = std::mem::take(&mut archive.bytes);
+        if let Err(e) = extract_on_blocking_pool(crate_bytes, &stage, extract_tgz).await {
+            cleanup_failed_stage(&stage, uuid_dir, false).await;
+            return policy.hard(
+                "vendor_prebuilt_extract_failed",
+                format!("cannot extract the prebuilt crate: {e}"),
+            );
         }
-        ServiceArtifact::Failed(reason) => miss(
-            warnings,
-            "vendor_prebuilt_unavailable",
-            format!("patch service request failed ({reason})"),
-        ),
     }
+    let _ = tokio::fs::remove_file(stage.join(".cargo-checksum.json")).await;
+    // Verify the EXTRACTED TREE, not just the archive bytes: the SRI proves
+    // the download is intact, but an unexpected internal layout (the single
+    // `{name}-{version}/` strip leaving an extra wrapper, or an over-strip)
+    // lands the patched files at the wrong paths and the caller would
+    // synthesize success from `record.files` while the copy is wrong. Fail
+    // closed → `auto` falls back to the local build. (Mirrors
+    // composer_lock.rs.)
+    if !copy_matches_after_hashes(&stage, &record.files).await {
+        cleanup_failed_stage(&stage, uuid_dir, false).await;
+        return policy.miss(
+            warnings,
+            "vendor_prebuilt_layout_mismatch",
+            format!(
+                "prebuilt crate for {name} extracted to an unexpected \
+                 layout (patched files absent at their recorded paths)"
+            ),
+        );
+    }
+    // The copy's version carries the patch uuid tag, written in the stage so
+    // a swapped-in copy is never untagged.
+    if let Err(e) = cargo_tag::tag_copy_manifest(&stage, version, &record.uuid).await {
+        cleanup_failed_stage(&stage, uuid_dir, false).await;
+        return policy.miss(
+            warnings,
+            "vendor_prebuilt_layout_mismatch",
+            format!("prebuilt crate for {name}: cannot tag its version ({e})"),
+        );
+    }
+    if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
+        cleanup_failed_stage(&stage, uuid_dir, false).await;
+        return policy.hard(
+            "vendor_prebuilt_write_failed",
+            format!("cannot move the extracted crate into place: {e}"),
+        );
+    }
+    warnings.push(VendorWarning::new(
+        "vendor_prebuilt_downloaded",
+        format!(
+            "vendored {name} from the patch service ({})",
+            archive.source_url
+        ),
+    ));
+    CargoServiceCopy::Used(())
 }
 
 /// Copy the pristine source into a STAGE sibling of `copy_dir`, run the
@@ -784,25 +738,23 @@ async fn cargo_wet_preflight(
     uuid: &str,
 ) -> Result<cargo_lock::LockEntryProbe, VendorOutcome> {
     // Cross-mode takeover guard (fail-closed): a LIVE hosted-redirect wiring
-    // for this crate must be reverted from the redirect ledger BEFORE
-    // vendoring — the CLI vendored flows do exactly that. Reaching this point
-    // with the residue still present means the redirect ledger is missing or
-    // corrupt (no recorded originals to revert with); proceeding would bake
+    // for this crate must be restored to its crates.io entry BEFORE
+    // vendoring — the CLI vendored flows do exactly that (the upstream
+    // restore). Reaching this point with the residue still present means
+    // that restore did not run or could not undo it; proceeding would bake
     // the hosted registry values into this entry's lock originals as if they
     // were pristine, leave Cargo.toml pinned to the hosted registry, and
     // report success on an unbuildable half-migrated project. Refuse with the
     // manual remediation instead. Runs after the dry-run branch: a preview
-    // must not report the wet run's ledger-driven revert as a failure.
+    // must not report the wet run's restore as a failure.
     if let Some(residue) = hosted_redirect_residue(project_root, name, version).await {
         return Err(refused(
             "hosted_redirect_live",
             format!(
-                "{residue}, but no redirect ledger record can revert it \
-                 (.socket/vendor/redirect-state.json is missing or does not \
-                 record this package); restore the ledger, or manually remove \
-                 the `registry = \"socket-patch-…\"` key from Cargo.toml, \
-                 restore the crates.io source/checksum in Cargo.lock, and drop \
-                 the `[registries.socket-patch-…]` block, then re-run"
+                "{residue}, and it was not restored to its crates.io entry; run \
+                 `socket-patch rollback` for this package first, or restore \
+                 Cargo.toml and Cargo.lock from version control (`git checkout \
+                 -- Cargo.toml Cargo.lock`), then re-run"
             ),
         ));
     }
@@ -1051,7 +1003,9 @@ pub async fn vendor_cargo_crate<'a>(
             )
             .await
             {
-                CargoServiceCopy::Used => already_patched_result(purl, &copy_dir, &record.files),
+                CargoServiceCopy::Used(()) => {
+                    already_patched_result(purl, &copy_dir, &record.files)
+                }
                 CargoServiceCopy::HardFail(outcome) => return *outcome,
                 CargoServiceCopy::FallBack => {
                     match copy_and_patch(
@@ -1197,7 +1151,7 @@ pub async fn vendor_cargo_crate<'a>(
     )
     .await
     {
-        CargoServiceCopy::Used => {
+        CargoServiceCopy::Used(()) => {
             // The service crate is the patched package; trust its verified
             // integrity (every file reads as AlreadyPatched).
             already_patched_result(purl, &copy_dir, &record.files)
@@ -4203,12 +4157,12 @@ mod tests {
         );
     }
 
-    /// FAIL CLOSED: vendoring over a LIVE hosted redirect with no ledger to
-    /// revert it must refuse — proceeding would record the hosted registry
+    /// FAIL CLOSED: vendoring over a LIVE hosted redirect the upstream
+    /// restore did not undo must refuse — proceeding would record the hosted registry
     /// values as the entry's "originals" and leave Cargo.toml pinned to the
     /// hosted registry (unbuildable in both modes) while reporting success.
     #[tokio::test]
-    async fn test_refuses_live_hosted_redirect_without_ledger() {
+    async fn test_refuses_live_hosted_redirect_left_unrestored() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
         let index = "sparse+http://127.0.0.1:5555/index/";
@@ -4245,7 +4199,12 @@ mod tests {
             run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
             "hosted_redirect_live",
         );
-        assert!(detail.contains("redirect-state.json"), "{detail}");
+        assert!(
+            detail.contains("socket-patch rollback")
+                && detail.contains("git checkout -- Cargo.toml Cargo.lock"),
+            "the refusal names the restore remedies: {detail}"
+        );
+        assert!(!detail.contains("redirect-state.json"), "{detail}");
         // Nothing was half-vendored.
         assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
 

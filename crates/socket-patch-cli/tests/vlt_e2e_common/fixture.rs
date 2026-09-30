@@ -29,7 +29,7 @@ pub const OPTIONAL_KEPT: &str = "socket-patch does not remove them because `vlt 
      project that declares only optional dependencies, so there both commands remove the \
      installed copy: upgrade vlt to 1.0.5 or later first.";
 pub const VLT_UPDATE_NOTE: &str =
-    " Note: `vlt update` re-resolves from the registry and drops these redirects.";
+    " Note: `vlt update` re-resolves from the registry and drops these hosted patches.";
 
 pub fn invalidated_head(n: usize) -> String {
     format!(
@@ -327,8 +327,18 @@ impl Fixture {
         vex_doc_attests(&self.proj.join("out.vex.json"), t)
     }
 
+    /// The pre-v5 hosted ledger, if any file sits there. v5 hosted mode
+    /// never writes it, so every hosted leg expects `None`.
     pub fn ledger(&self) -> Option<Vec<u8>> {
         std::fs::read(self.proj.join(".socket/vendor/redirect-state.json")).ok()
+    }
+
+    /// `rollback` of this fixture's hosted pins: discovered from the lock on
+    /// the mock patch service's origin, restored from the harness registry
+    /// (see [`rollback_upstream`]).
+    pub fn rollback(&self, extra: &[&str]) -> SocketOut {
+        let svc = self.svc.uri();
+        rollback_upstream(&self.proj, &self.reg.url(), Some(&svc), extra)
     }
 
     pub fn store_ids(&self, t: &PatchTarget) -> Vec<String> {

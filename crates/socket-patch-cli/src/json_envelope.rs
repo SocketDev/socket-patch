@@ -3,7 +3,7 @@
 //! The `--json` output of `apply`, `list`, `remove`, `repair`/`gc`,
 //! `vendor`, `self-update` and `vex --json --output` (and every command's
 //! lock-contention error) uses this top-level shape; `scan`, `get`,
-//! `rollback` and `setup` still emit their legacy shapes (see
+//! and `rollback` still emit their legacy shapes (see
 //! CLI_CONTRACT.md's migration status):
 //!
 //! ```json
@@ -350,7 +350,6 @@ pub enum PatchAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AppliedVia {
-    Package,
     Diff,
     Blob,
 }
@@ -359,7 +358,6 @@ impl AppliedVia {
     pub fn from_core(via: socket_patch_core::patch::apply::AppliedVia) -> Self {
         use socket_patch_core::patch::apply::AppliedVia as Core;
         match via {
-            Core::Package => AppliedVia::Package,
             Core::Diff => AppliedVia::Diff,
             Core::Blob => AppliedVia::Blob,
         }
@@ -374,7 +372,6 @@ pub enum Command {
     Apply,
     Vex,
     Vendor,
-    Setup,
     Rollback,
     Get,
     List,
@@ -910,7 +907,6 @@ mod tests {
             (Command::Apply, "apply"),
             (Command::Vex, "vex"),
             (Command::Vendor, "vendor"),
-            (Command::Setup, "setup"),
             (Command::Rollback, "rollback"),
             (Command::Get, "get"),
             (Command::List, "list"),

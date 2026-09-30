@@ -1,14 +1,22 @@
-//! In-process rollback tests for HOSTED-mode state (the redirect ledger).
+//! In-process rollback tests for HOSTED-mode state.
+//!
+//! v5 hosted mode keeps no ledger: the hosted pins ARE the lockfile entries
+//! (discovered on `--patch-server-url`'s origin for these mock-host URLs),
+//! and rollback restores each in-scope pin to its DEFAULT UPSTREAM registry
+//! entry, re-resolved from the (wiremocked) registry through the
+//! `SOCKET_NPM_REGISTRY` base override. A refused pin (offline, registry
+//! failure) is left untouched and reported. A pre-v5 ledger is never
+//! replayed; it is retired once no hosted pin remains.
 //!
 //! The genuine-wiring fixtures run the REAL hosted flow first — in-process
 //! `scan --mode hosted` over an npm package-lock project (the
 //! `in_process_redirect.rs` fixture, wiremock API) and in-process
 //! `get <uuid> --mode hosted` over a pip requirements.txt project (the
 //! `in_process_get_hosted_ecosystems.rs` fixture) — then roll back and
-//! byte-compare the lockfiles against their pristine snapshots. The
-//! fail-closed / replay fixtures hand-write the redirect ledger through the
-//! exported `socket_patch_core::patch::redirect` types (real schema, real
-//! edit kinds) with matching file fragments on disk.
+//! byte-compare the lockfiles against their pristine snapshots. The other
+//! fixtures hand-write hosted yarn.lock entries (and, for the migration
+//! tests, a pre-v5 ledger through the exported
+//! `socket_patch_core::patch::redirect` types).
 //!
 //! Convention split (the same one `in_process_redirect.rs` documents):
 //! in-process `rollback::run(RollbackArgs)` for exit codes + on-disk
@@ -51,17 +59,18 @@ const HOSTED_URL: &str = "http://patch.test/patch/npm/in-proc-redirect/1.0.0/222
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 const GHSA: &str = "GHSA-rbhr-aaaa-bbbb";
 
-// ── the hand-written two-record ledger fixture ──────────────────────────────
+// ── the hand-written hosted yarn.lock pins ──────────────────────────────────
 const LP_PURL: &str = "pkg:npm/left-pad@1.2.3";
 const LP_UUID: &str = "55555555-5555-4555-8555-555555555555";
 const LP_HOSTED_URL: &str = "http://patch.test/patch/npm/left-pad/1.2.3/66666666-6666-4666-8666-666666666666/55555555-5555-4555-8555-555555555555/left-pad-1.2.3.tgz";
-const GEM_PURL: &str = "pkg:gem/rex@1.0.0";
-const GEM_UUID: &str = "77777777-7777-4777-8777-777777777777";
+const IO_PURL: &str = "pkg:npm/is-odd@3.0.1";
+const IO_HOSTED_URL: &str = "http://patch.test/patch/npm/is-odd/3.0.1/66666666-6666-4666-8666-666666666666/99999999-9999-4999-8999-999999999999/is-odd-3.0.1.tgz";
 const GEM_UPSTREAM_REMOTE: &str = "https://rubygems.org/";
 const GEM_PATCH_REMOTE: &str = "http://patch.test/gems/t0k3nt0k3n/";
 
 fn hosted_scan_args(cwd: &Path, api_url: String) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
@@ -78,11 +87,10 @@ fn hosted_scan_args(cwd: &Path, api_url: String) -> ScanArgs {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: Some(ScanMode::Hosted),
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     }
 }
 
@@ -98,9 +106,9 @@ async fn rollback_in_process(cwd: &Path, targets: Vec<String>, preserve_state: b
             json: true,
             yes: true,
             silent: true,
+            patch_server_url: Some("http://patch.test".to_string()),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        one_off: false,
         preserve_state,
     };
     let code = rollback_run(args).await;
@@ -108,6 +116,48 @@ async fn rollback_in_process(cwd: &Path, targets: Vec<String>, preserve_state: b
     // nothing unsets it; scrub so a later in-process `scan`/`get` in this
     // `#[serial]` process isn't silently forced offline.
     std::env::remove_var("SOCKET_OFFLINE");
+    code
+}
+
+/// Serve the npm registry's version document for the real-flow fixture's
+/// package, so the upstream restore can re-resolve its pristine entry.
+async fn mock_npm_registry(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path(format!("/npm-registry/{NAME}/{VERSION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": NAME,
+            "version": VERSION,
+            "dist": {
+                "tarball": format!("https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz"),
+                "integrity": "sha512-UPSTREAMupstream==",
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Bare in-process rollback that may reach the (mocked) npm registry: the
+/// upstream restore re-resolves each hosted pin's registry entry.
+async fn rollback_online(cwd: &Path, server: &MockServer) -> i32 {
+    std::env::set_var(
+        "SOCKET_NPM_REGISTRY",
+        format!("{}/npm-registry", server.uri()),
+    );
+    let args = RollbackArgs {
+        targets: Vec::new(),
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: cwd.to_path_buf(),
+            manifest_path: ".socket/manifest.json".to_string(),
+            json: true,
+            yes: true,
+            silent: true,
+            patch_server_url: Some("http://patch.test".to_string()),
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
+        preserve_state: false,
+    };
+    let code = rollback_run(args).await;
+    std::env::remove_var("SOCKET_NPM_REGISTRY");
     code
 }
 
@@ -151,7 +201,8 @@ fn scrubbed_cli() -> std::process::Command {
     cmd
 }
 
-/// Run `rollback --json --yes --offline [extra]` as a scrubbed subprocess
+/// Run `rollback --json --yes --offline [extra]` (the mock patch host
+/// recognized as hosted) as a scrubbed subprocess
 /// and parse the envelope back (in-process runs print to the real stdout,
 /// which a hosting test can't read). Returns (exit code, envelope).
 fn run_rollback_subprocess(cwd: &Path, extra: &[&str]) -> (i32, Value) {
@@ -161,6 +212,39 @@ fn run_rollback_subprocess(cwd: &Path, extra: &[&str]) -> (i32, Value) {
             "--json",
             "--yes",
             "--offline",
+            "--patch-server-url",
+            "http://patch.test",
+            "--cwd",
+            cwd.to_str().unwrap(),
+        ])
+        .args(extra)
+        .output()
+        .expect("run socket-patch");
+    let envelope: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "rollback --json stdout must be a pure JSON envelope: {e}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.code().unwrap_or(-1), envelope)
+}
+
+/// [`run_rollback_subprocess`] ONLINE: no `--offline`, the npm registry
+/// pointed at `server`'s `/npm-registry` (see [`mock_yarn_registry`] /
+/// [`mock_npm_registry`]), and the mock patch host recognized as hosted.
+fn run_rollback_subprocess_online(cwd: &Path, server: &MockServer, extra: &[&str]) -> (i32, Value) {
+    let out = scrubbed_cli()
+        .env(
+            "SOCKET_NPM_REGISTRY",
+            format!("{}/npm-registry", server.uri()),
+        )
+        .args([
+            "rollback",
+            "--json",
+            "--yes",
+            "--patch-server-url",
+            "http://patch.test",
             "--cwd",
             cwd.to_str().unwrap(),
         ])
@@ -323,8 +407,7 @@ fn ledger_path(root: &Path) -> std::path::PathBuf {
     root.join(".socket/vendor/redirect-state.json")
 }
 
-/// A full camelCase patch record for hand-written ledgers (the same shape
-/// the hosted flow persists from `view/{uuid}`).
+/// A full camelCase patch record for the hand-written pre-v5 ledgers.
 fn patch_record(uuid: &str, ghsa: &str) -> PatchRecord {
     let mut files = HashMap::new();
     files.insert(
@@ -355,39 +438,74 @@ fn patch_record(uuid: &str, ghsa: &str) -> PatchRecord {
     }
 }
 
-/// Serialize a hand-written ledger through the real core writer (real
-/// schema: version, mode "hosted", edits[FileEdit], records{purl: record}).
-async fn write_hosted_ledger(root: &Path, records: Vec<(&str, PatchRecord)>, edits: Vec<FileEdit>) {
+/// Serialize a PRE-V5 hosted ledger (v5 never writes one) through the real
+/// core writer (real schema: version, mode "hosted", edits[FileEdit],
+/// records{purl: record}) — what an older release left on disk.
+async fn write_legacy_ledger(root: &Path, edits: Vec<FileEdit>) {
     let mut state = RedirectState::new();
     state.edits = edits;
-    for (purl, record) in records {
-        state.records.insert(purl.to_string(), record);
-    }
+    state.records.insert(
+        LP_PURL.to_string(),
+        patch_record(LP_UUID, "GHSA-lpad-aaaa-bbbb"),
+    );
     save_redirect_state(root, &state)
         .await
         .expect("write redirect ledger");
 }
 
-// ── yarn-classic fragments for the hand-written npm record ─────────────────
-// `redirect_yarn_classic_entry` is one of the text kinds the per-purl npm
-// revert claims by `<name>@<version>` key; original/new record whole blocks,
-// exactly as the real writer does.
+/// Serve the npm registry's version document for `name@version` under
+/// `/npm-registry` (the `SOCKET_NPM_REGISTRY` base `rollback_online` and
+/// `run_rollback_subprocess_online` set) in the shape a yarn-classic
+/// restore turns back into [`yarn_upstream_block`].
+async fn mock_yarn_registry(server: &MockServer, name: &str, version: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/npm-registry/{name}/{version}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": name,
+            "version": version,
+            "dist": {
+                "tarball": format!("https://registry.yarnpkg.com/{name}/-/{name}-{version}.tgz"),
+                "shasum": "aaaa",
+                "integrity": "sha512-UPSTREAMupstream==",
+            }
+        })))
+        .mount(server)
+        .await;
+}
 
-fn yarn_block(resolved: &str, integrity: &str) -> String {
+// ── yarn-classic fragments ──────────────────────────────────────────────────
+// The hosted wiring is the lock entry itself; the upstream block is exactly
+// what the restore re-derives from `mock_yarn_registry`'s document.
+
+fn yarn_block_for(name: &str, version: &str, resolved: &str, integrity: &str) -> String {
     format!(
-        "left-pad@1.2.3:\n  version \"1.2.3\"\n  resolved \"{resolved}\"\n  integrity {integrity}"
+        "{name}@{version}:\n  version \"{version}\"\n  resolved \"{resolved}\"\n  integrity {integrity}"
     )
 }
 
-fn yarn_original_block() -> String {
-    yarn_block(
-        "https://registry.yarnpkg.com/left-pad/-/left-pad-1.2.3.tgz#aaaa",
+fn yarn_block(resolved: &str, integrity: &str) -> String {
+    yarn_block_for("left-pad", "1.2.3", resolved, integrity)
+}
+
+fn yarn_upstream_block(name: &str, version: &str) -> String {
+    yarn_block_for(
+        name,
+        version,
+        &format!("https://registry.yarnpkg.com/{name}/-/{name}-{version}.tgz#aaaa"),
         "sha512-UPSTREAMupstream==",
     )
 }
 
+fn yarn_original_block() -> String {
+    yarn_upstream_block("left-pad", "1.2.3")
+}
+
 fn yarn_redirected_block() -> String {
     yarn_block(LP_HOSTED_URL, "sha512-PATCHEDpatched==")
+}
+
+fn io_redirected_block() -> String {
+    yarn_block_for("is-odd", "3.0.1", IO_HOSTED_URL, "sha512-PATCHEDio==")
 }
 
 fn yarn_lock_content(block: &str) -> String {
@@ -397,6 +515,7 @@ fn yarn_lock_content(block: &str) -> String {
     )
 }
 
+/// The yarn-classic edit a pre-v5 ledger recorded for the left-pad pin.
 fn yarn_classic_edit() -> FileEdit {
     FileEdit {
         path: "yarn.lock".to_string(),
@@ -408,10 +527,7 @@ fn yarn_classic_edit() -> FileEdit {
     }
 }
 
-// ── gem fragments for the hand-written gem record ───────────────────────────
-// `redirect_gemfile_lock_source_url` has NO per-purl revert (gem is not in
-// `redirect_revert_supported`); its unwind is the whole-ledger replay's
-// ReplaceFragment arm.
+// ── other pre-v5 ledger edits (never replayed) ──────────────────────────────
 
 fn gemfile_lock_content(remote: &str) -> String {
     format!(
@@ -431,45 +547,40 @@ fn gem_source_edit() -> FileEdit {
     }
 }
 
-/// The two-record fixture: an npm purl with a yarn-classic text edit (owned
-/// by the per-purl npm revert) and a gem purl with a Gemfile.lock edit
-/// (replay-only), both with REAL redirected fragments on disk.
-async fn write_two_record_fixture(root: &Path) {
-    std::fs::write(
-        root.join("yarn.lock"),
-        yarn_lock_content(&yarn_redirected_block()),
-    )
-    .unwrap();
-    std::fs::write(
-        root.join("Gemfile.lock"),
-        gemfile_lock_content(GEM_PATCH_REMOTE),
-    )
-    .unwrap();
-    write_hosted_ledger(
-        root,
-        vec![
-            (LP_PURL, patch_record(LP_UUID, "GHSA-lpad-aaaa-bbbb")),
-            (GEM_PURL, patch_record(GEM_UUID, "GHSA-gems-cccc-dddd")),
-        ],
-        vec![yarn_classic_edit(), gem_source_edit()],
-    )
-    .await;
+/// An edit kind no release understands (a ledger from a newer build).
+fn future_lock_edit() -> FileEdit {
+    FileEdit {
+        path: "future.lock".to_string(),
+        kind: "redirect_future_lock_entry".to_string(),
+        action: "rewritten".to_string(),
+        key: Some("left-pad@1.2.3".to_string()),
+        original: Some(Value::String(
+            "left-pad@1.2.3 sha512-UPSTREAMupstream==".to_string(),
+        )),
+        new: Some(Value::String(format!("left-pad@1.2.3 {LP_HOSTED_URL}"))),
+    }
 }
 
-/// Single-record npm fixture (yarn-classic wiring) for the manifest-less and
-/// preserve-state tests.
-async fn write_single_npm_fixture(root: &Path) {
+/// Single-pin npm fixture: a yarn.lock hosted-wired to the mock patch host.
+fn write_single_npm_fixture(root: &Path) {
     std::fs::write(
         root.join("yarn.lock"),
         yarn_lock_content(&yarn_redirected_block()),
     )
     .unwrap();
-    write_hosted_ledger(
-        root,
-        vec![(LP_PURL, patch_record(LP_UUID, "GHSA-lpad-aaaa-bbbb"))],
-        vec![yarn_classic_edit()],
+}
+
+/// Two-pin fixture: left-pad then is-odd, both hosted in one yarn.lock.
+fn write_two_pin_fixture(root: &Path) {
+    std::fs::write(
+        root.join("yarn.lock"),
+        yarn_lock_content(&format!(
+            "{}\n\n{}",
+            yarn_redirected_block(),
+            io_redirected_block()
+        )),
     )
-    .await;
+    .unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -477,9 +588,9 @@ async fn write_single_npm_fixture(root: &Path) {
 // ---------------------------------------------------------------------------
 
 /// Snapshot the pristine lock → `scan --mode hosted` wires it (resolved URL
-/// rewritten + ledger written) → bare in-process rollback → exit 0, lock
-/// byte-identical to pristine, redirect-state.json DELETED, and no manifest
-/// materialized as a side effect.
+/// rewritten, NO ledger written) → bare in-process rollback restoring the
+/// upstream entry from the mocked registry → exit 0, lock byte-identical to
+/// pristine, and nothing materialized under `.socket/` as a side effect.
 #[tokio::test]
 #[serial]
 async fn npm_hosted_round_trip() {
@@ -501,11 +612,12 @@ async fn npm_hosted_round_trip() {
     );
     assert_ne!(wired, pristine, "wiring must actually change the lock");
     assert!(
-        ledger_path(tmp.path()).is_file(),
-        "scan --mode hosted must write the redirect ledger"
+        !ledger_path(tmp.path()).exists(),
+        "scan --mode hosted keeps no redirect ledger: the lockfile is the record"
     );
 
-    let code = rollback_in_process(tmp.path(), Vec::new(), false).await;
+    mock_npm_registry(&server).await;
+    let code = rollback_online(tmp.path(), &server).await;
     assert_eq!(code, 0, "bare rollback over hosted wiring should exit 0");
 
     let restored = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
@@ -514,26 +626,16 @@ async fn npm_hosted_round_trip() {
         "rollback must restore the lock byte-identical to the pristine snapshot"
     );
     assert!(
-        !ledger_path(tmp.path()).exists(),
-        "an emptied redirect ledger must be DELETED, not left as an empty file"
-    );
-    assert!(
-        !tmp.path().join(".socket/manifest.json").exists(),
-        "a hosted-only rollback must not materialize a manifest"
-    );
-    assert!(
         !tmp.path().join(".socket").exists(),
-        "a fully unwound hosted project keeps no .socket/ residue: the ledger's \
-         vendor/ dir is pruned with it and the lock guard removes apply.lock and \
+        "a fully restored hosted project keeps no .socket/ residue: no manifest \
+         or ledger is materialized, and the lock guard removes apply.lock and \
          the emptied directory"
     );
 }
 
-/// Dry-run twin of the round trip — the review-caught regression: the
-/// per-purl dry revert must claim its npm JSON edits IN MEMORY so the
-/// whole-ledger replay does not refuse them as unclaimed (`group:npm`)
-/// and flip a would-succeed run to partial_failure. A hosted npm dry run
-/// exits 0, reports the purl as would-be-reverted, and mutates NOTHING.
+/// Dry-run twin of the round trip: a hosted npm dry run resolves the
+/// upstream entry exactly like a wet run (the registry IS asked), exits 0,
+/// and mutates NOTHING (no ledger is ever written either).
 #[tokio::test]
 #[serial]
 async fn npm_hosted_dry_run_previews_cleanly() {
@@ -547,40 +649,49 @@ async fn npm_hosted_dry_run_previews_cleanly() {
     let code = scan_run(hosted_scan_args(tmp.path(), server.uri())).await;
     assert_eq!(code, 0, "scan --mode hosted should succeed");
     let wired = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
-    let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
+    mock_npm_registry(&server).await;
 
+    std::env::set_var(
+        "SOCKET_NPM_REGISTRY",
+        format!("{}/npm-registry", server.uri()),
+    );
     let args = RollbackArgs {
         targets: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             manifest_path: ".socket/manifest.json".to_string(),
-            offline: true,
             json: true,
             yes: true,
             silent: true,
             dry_run: true,
+            patch_server_url: Some("http://patch.test".to_string()),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        one_off: false,
         preserve_state: false,
     };
     let code = rollback_run(args).await;
-    std::env::remove_var("SOCKET_OFFLINE");
+    std::env::remove_var("SOCKET_NPM_REGISTRY");
     std::env::remove_var("SOCKET_DRY_RUN");
-    assert_eq!(
-        code, 0,
-        "a hosted npm dry run must preview cleanly, never refuse its own \
-         per-purl-claimed edits"
+    assert_eq!(code, 0, "a hosted npm dry run must preview cleanly");
+    let registry_hits = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().starts_with("/npm-registry/"))
+        .count();
+    assert!(
+        registry_hits >= 1,
+        "a dry run resolves the upstream entry like a wet run"
     );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap(),
         wired,
         "dry run must not touch the lock"
     );
-    assert_eq!(
-        std::fs::read(ledger_path(tmp.path())).unwrap(),
-        ledger_before,
-        "dry run must not touch the on-disk ledger"
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "dry run must write no ledger (or any .socket/ state)"
     );
 }
 
@@ -600,7 +711,8 @@ async fn npm_hosted_round_trip_envelope() {
     let code = scan_run(hosted_scan_args(tmp.path(), server.uri())).await;
     assert_eq!(code, 0, "scan --mode hosted should succeed");
 
-    let (code, envelope) = run_rollback_subprocess(tmp.path(), &[]);
+    mock_npm_registry(&server).await;
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
     assert_eq!(code, 0, "bare rollback should exit 0: {envelope}");
     assert_eq!(envelope["status"], "success", "{envelope}");
     assert_eq!(
@@ -617,7 +729,7 @@ async fn npm_hosted_round_trip_envelope() {
     assert_eq!(
         envelope["manifest"]["removedEntries"],
         serde_json::json!([]),
-        "hosted state lives in the ledger, not the manifest: {envelope}"
+        "hosted state lives in the lockfile, not the manifest: {envelope}"
     );
     assert!(
         warning_codes(&envelope).contains(&"reinstall_required".to_string()),
@@ -626,7 +738,10 @@ async fn npm_hosted_round_trip_envelope() {
 
     let restored = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert_eq!(restored, pristine, "lock must be byte-restored");
-    assert!(!ledger_path(tmp.path()).exists(), "ledger must be deleted");
+    assert!(
+        !ledger_path(tmp.path()).exists(),
+        "no ledger is ever written"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -636,8 +751,9 @@ async fn npm_hosted_round_trip_envelope() {
 /// A pip project wired by the REAL hosted flow (`get <uuid> --mode hosted`,
 /// the `in_process_get_hosted_ecosystems.rs` fixture — the UUID path needs
 /// no installed tree), then a bare rollback: requirements.txt restored
-/// byte-for-byte via the whole-ledger replay (pypi has no per-purl revert),
-/// ledger deleted, exit 0.
+/// byte-for-byte to the upstream `name==version` line (the file is
+/// unhashed, so no registry lookup is needed and the run may stay offline),
+/// no ledger ever written, exit 0.
 #[tokio::test]
 #[serial]
 async fn pypi_requirements_hosted_round_trip() {
@@ -714,7 +830,6 @@ async fn pypi_requirements_hosted_round_trip() {
         ghsa: false,
         package: false,
         save_only: false,
-        one_off: false,
         all_releases: false,
         mode: Some(ScanMode::Hosted),
     };
@@ -726,10 +841,9 @@ async fn pypi_requirements_hosted_round_trip() {
         wired.contains(&url),
         "requirements.txt must be wired to the hosted wheel; got:\n{wired}"
     );
-    let ledger = std::fs::read_to_string(ledger_path(tmp.path())).unwrap();
     assert!(
-        ledger.contains(PY_PURL) && ledger.contains("redirect_requirements_line"),
-        "the ledger must record the pypi redirect; got:\n{ledger}"
+        !ledger_path(tmp.path()).exists(),
+        "get --mode hosted keeps no ledger: requirements.txt is the record"
     );
 
     // Manifest-less VEX over the committed hosted state (an EMPTY in-project
@@ -768,10 +882,6 @@ async fn pypi_requirements_hosted_round_trip() {
         "requirements.txt must be restored byte-for-byte"
     );
     assert!(
-        !ledger_path(tmp.path()).exists(),
-        "the emptied ledger must be deleted"
-    );
-    assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
         "hosted mode never touches the manifest"
     );
@@ -807,249 +917,193 @@ async fn pypi_requirements_hosted_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. scoped rollback of an unsupported ecosystem fails closed
+// 3. scoped rollback restores only the named pins
 // ---------------------------------------------------------------------------
 
-/// A two-record ledger (npm + gem) scoped to ONLY the gem purl: gem has no
-/// per-purl revert and the scope does not cover the full record set, so the
-/// replay may not run — the run fails closed with the purl in
-/// `hosted.unsupported`, exit 1, and both the ledger and every wired file
-/// stay byte-identical on disk.
+/// Two hosted pins in one yarn.lock, scoped to ONE: only the named pin is
+/// restored to its upstream registry entry (each pin restores on its own;
+/// there is no whole-state replay), the other stays hosted byte-for-byte,
+/// and a pre-v5 ledger beside them is kept while a pin remains. The
+/// unscoped follow-up restores the other pin and then retires the ledger.
 #[tokio::test]
 #[serial]
-async fn scoped_unsupported_ecosystem_fails_closed() {
+async fn scoped_rollback_restores_only_the_named_pin() {
+    let server = MockServer::start().await;
+    mock_yarn_registry(&server, "left-pad", "1.2.3").await;
+    mock_yarn_registry(&server, "is-odd", "3.0.1").await;
     let tmp = tempfile::tempdir().unwrap();
-    write_two_record_fixture(tmp.path()).await;
+    write_two_pin_fixture(tmp.path());
+    write_legacy_ledger(tmp.path(), vec![yarn_classic_edit()]).await;
     let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
-    let yarn_before = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
-    let gem_before = std::fs::read_to_string(tmp.path().join("Gemfile.lock")).unwrap();
 
-    let (code, envelope) = run_rollback_subprocess(tmp.path(), &[GEM_PURL]);
-    assert_eq!(
-        code, 1,
-        "a scoped hosted purl with no per-purl revert must fail closed: {envelope}"
-    );
-    assert_eq!(envelope["status"], "partial_failure", "{envelope}");
-    assert_eq!(
-        envelope["hosted"]["unsupported"],
-        serde_json::json!([GEM_PURL]),
-        "the refused purl must be reported unsupported: {envelope}"
-    );
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[LP_PURL]);
+    assert_eq!(code, 0, "{envelope}");
+    assert_eq!(envelope["status"], "success", "{envelope}");
     assert_eq!(
         envelope["hosted"]["reverted"],
-        serde_json::json!([]),
-        "nothing may be unwound on a refused scoped run: {envelope}"
+        serde_json::json!([LP_PURL]),
+        "only the named pin is restored: {envelope}"
     );
-
+    assert_eq!(envelope["hosted"]["failed"], serde_json::json!([]));
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_lock_content(&format!(
+            "{}\n\n{}",
+            yarn_original_block(),
+            io_redirected_block()
+        )),
+        "the out-of-scope pin must stay hosted"
+    );
     assert_eq!(
         std::fs::read(ledger_path(tmp.path())).unwrap(),
         ledger_before,
-        "the ledger must stay byte-identical on a fail-closed run"
+        "a pre-v5 ledger is kept while a hosted pin remains"
     );
+
+    let code = rollback_online(tmp.path(), &server).await;
+    assert_eq!(code, 0, "the unscoped follow-up restores the rest");
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
-        yarn_before,
-        "the out-of-scope npm wiring must be untouched"
+        yarn_lock_content(&format!(
+            "{}\n\n{}",
+            yarn_original_block(),
+            yarn_upstream_block("is-odd", "3.0.1")
+        ))
     );
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("Gemfile.lock")).unwrap(),
-        gem_before,
-        "the refused gem wiring must be untouched"
+    assert!(
+        !ledger_path(tmp.path()).exists(),
+        "with no hosted pin left the pre-v5 ledger is retired"
     );
 }
 
-/// A ledger written by a newer socket-patch carries a hosted edit kind this
-/// release has no revert for (`redirect_future_lock_entry`). A scoped
-/// rollback of the purl it names must refuse with nothing written, and an
-/// unscoped one must keep the record while that edit survives.
-async fn write_unknown_kind_ledger_fixture(root: &Path, with_gem: bool) -> String {
-    let future_new = format!("left-pad@1.2.3 {LP_HOSTED_URL}");
-    let future_lock = format!("{future_new}\n");
-    std::fs::write(root.join("future.lock"), &future_lock).unwrap();
-    std::fs::write(
-        root.join("yarn.lock"),
-        yarn_lock_content(&yarn_redirected_block()),
-    )
-    .unwrap();
-    let mut records = vec![(LP_PURL, patch_record(LP_UUID, "GHSA-lpad-aaaa-bbbb"))];
-    let mut edits = vec![yarn_classic_edit()];
-    if with_gem {
-        std::fs::write(
-            root.join("Gemfile.lock"),
-            gemfile_lock_content(GEM_PATCH_REMOTE),
-        )
-        .unwrap();
-        records.push((GEM_PURL, patch_record(GEM_UUID, "GHSA-gems-cccc-dddd")));
-        edits.push(gem_source_edit());
-    }
-    edits.push(FileEdit {
-        path: "future.lock".to_string(),
-        kind: "redirect_future_lock_entry".to_string(),
-        action: "rewritten".to_string(),
-        key: Some("left-pad@1.2.3".to_string()),
-        original: Some(Value::String(
-            "left-pad@1.2.3 sha512-UPSTREAMupstream==".to_string(),
-        )),
-        new: Some(Value::String(future_new)),
-    });
-    write_hosted_ledger(root, records, edits).await;
-    future_lock
-}
-
-fn ledger_edit_kinds(root: &Path) -> Vec<String> {
-    let ledger: Value = serde_json::from_slice(&std::fs::read(ledger_path(root)).unwrap()).unwrap();
-    ledger["edits"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["kind"].as_str().unwrap().to_string())
-        .collect()
-}
-
+/// A ledger written by an OLDER (or newer) socket-patch may carry edits of
+/// kinds this release never replays — an unknown kind, a gem source edit.
+/// v5 never replays a ledger at all: the yarn pin is restored from the
+/// registry (not from the ledger's recorded original), the files the
+/// ledger's other edits name are left byte-identical, and the ledger is
+/// retired once no hosted pin remains. Scoped and unscoped alike.
 #[tokio::test]
 #[serial]
-async fn scoped_rollback_refuses_a_purl_named_by_an_unknown_edit_kind() {
-    let tmp = tempfile::tempdir().unwrap();
-    let future_lock = write_unknown_kind_ledger_fixture(tmp.path(), true).await;
-    let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
-    let yarn_before = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
+async fn legacy_ledger_edits_of_any_kind_are_never_replayed() {
+    for scoped in [true, false] {
+        let server = MockServer::start().await;
+        mock_yarn_registry(&server, "left-pad", "1.2.3").await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_single_npm_fixture(tmp.path());
+        let future_lock = format!("left-pad@1.2.3 {LP_HOSTED_URL}\n");
+        std::fs::write(tmp.path().join("future.lock"), &future_lock).unwrap();
+        let gem_lock = gemfile_lock_content(GEM_PATCH_REMOTE);
+        std::fs::write(tmp.path().join("Gemfile.lock"), &gem_lock).unwrap();
+        write_legacy_ledger(
+            tmp.path(),
+            vec![
+                // Its recorded original disagrees with the registry: a
+                // replay would write it, the restore must not.
+                FileEdit {
+                    original: Some(Value::String(yarn_block(
+                        "https://registry.yarnpkg.com/left-pad/-/left-pad-1.2.3.tgz#bbbb",
+                        "sha512-LEDGERledger==",
+                    ))),
+                    ..yarn_classic_edit()
+                },
+                gem_source_edit(),
+                future_lock_edit(),
+            ],
+        )
+        .await;
 
-    let (code, envelope) = run_rollback_subprocess(tmp.path(), &[LP_PURL]);
+        let targets: &[&str] = if scoped { &[LP_PURL] } else { &[] };
+        let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, targets);
+        assert_eq!(code, 0, "scoped={scoped}: {envelope}");
+        assert_eq!(
+            envelope["hosted"]["reverted"],
+            serde_json::json!([LP_PURL]),
+            "scoped={scoped}: {envelope}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+            yarn_lock_content(&yarn_original_block()),
+            "scoped={scoped}: the entry comes back from the registry, not the ledger"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("future.lock")).unwrap(),
+            future_lock,
+            "scoped={scoped}: an unknown-kind ledger edit is never replayed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("Gemfile.lock")).unwrap(),
+            gem_lock,
+            "scoped={scoped}: a ledger-only gem edit is never replayed"
+        );
+        assert!(
+            !ledger_path(tmp.path()).exists(),
+            "scoped={scoped}: the pre-v5 ledger is retired once no hosted pin remains"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. a refused pin fails closed on its own
+// ---------------------------------------------------------------------------
+
+/// The registry answers for one pin and not the other: the answered pin is
+/// restored, the other is REFUSED with the `git checkout` remedy
+/// (`hosted.failed`, `partial_failure`, exit 1) and its block stays hosted
+/// byte-for-byte. An `--offline` run refuses every pin and writes nothing.
+#[tokio::test]
+#[serial]
+async fn a_refused_pin_fails_closed_beside_a_restored_one() {
+    let server = MockServer::start().await;
+    mock_yarn_registry(&server, "is-odd", "3.0.1").await;
+
+    // Offline: both refused, nothing written.
+    let tmp = tempfile::tempdir().unwrap();
+    write_two_pin_fixture(tmp.path());
+    let wired = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
+    let (code, envelope) = run_rollback_subprocess(tmp.path(), &[]);
     assert_eq!(code, 1, "{envelope}");
     assert_eq!(envelope["status"], "partial_failure", "{envelope}");
-    assert_eq!(
-        envelope["hosted"]["reverted"],
-        serde_json::json!([]),
-        "{envelope}"
-    );
-    let failed = envelope["hosted"]["failed"].as_array().unwrap();
-    assert_eq!(failed.len(), 1, "{envelope}");
-    assert_eq!(failed[0]["purl"], LP_PURL);
-    assert!(
-        failed[0]["error"].as_str().unwrap().contains(
-            "redirect_future_lock_entry edit this socket-patch release does not understand"
-        ),
-        "{envelope}"
-    );
-    assert_eq!(
-        std::fs::read(ledger_path(tmp.path())).unwrap(),
-        ledger_before
-    );
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
-        yarn_before
-    );
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("future.lock")).unwrap(),
-        future_lock
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn unscoped_rollback_holds_the_record_beside_an_unknown_edit_kind() {
-    let tmp = tempfile::tempdir().unwrap();
-    let future_lock = write_unknown_kind_ledger_fixture(tmp.path(), true).await;
-
-    let code = rollback_in_process(tmp.path(), Vec::new(), false).await;
-    assert_eq!(
-        code, 1,
-        "an unknown edit kind must fail the rollback closed"
-    );
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("future.lock")).unwrap(),
-        future_lock
-    );
-    let ledger: Value =
-        serde_json::from_slice(&std::fs::read(ledger_path(tmp.path())).unwrap()).unwrap();
-    assert!(ledger["records"].get(LP_PURL).is_some(), "{ledger}");
-    assert!(ledger["records"].get(GEM_PURL).is_some(), "{ledger}");
-    // The groups this release understands still unwind on disk; their
-    // records wait for the unknown group to clear.
-    assert_eq!(
-        ledger_edit_kinds(tmp.path()),
-        ["redirect_future_lock_entry"]
-    );
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
-        yarn_lock_content(&yarn_original_block())
-    );
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("Gemfile.lock")).unwrap(),
-        gemfile_lock_content(GEM_UPSTREAM_REMOTE)
-    );
-}
-
-/// With the purl as the only hosted record the scope covers the whole
-/// ledger: the per-purl claim refuses, then the replay still unwinds
-/// yarn.lock but holds the record and the unknown edit.
-#[tokio::test]
-#[serial]
-async fn scoped_rollback_of_the_only_record_holds_it_beside_an_unknown_edit_kind() {
-    let tmp = tempfile::tempdir().unwrap();
-    let future_lock = write_unknown_kind_ledger_fixture(tmp.path(), false).await;
-
-    let (code, envelope) = run_rollback_subprocess(tmp.path(), &[LP_PURL]);
-    assert_eq!(code, 1, "{envelope}");
-    assert_eq!(
-        envelope["hosted"]["reverted"],
-        serde_json::json!([]),
-        "{envelope}"
-    );
+    assert_eq!(envelope["hosted"]["reverted"], serde_json::json!([]));
     let failed: Vec<&str> = envelope["hosted"]["failed"]
         .as_array()
         .unwrap()
         .iter()
         .map(|f| f["purl"].as_str().unwrap())
         .collect();
-    assert_eq!(failed, [LP_PURL, "group:unknown"], "{envelope}");
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("future.lock")).unwrap(),
-        future_lock
-    );
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
-        yarn_lock_content(&yarn_original_block())
-    );
-    let ledger: Value =
-        serde_json::from_slice(&std::fs::read(ledger_path(tmp.path())).unwrap()).unwrap();
-    assert!(ledger["records"].get(LP_PURL).is_some(), "{ledger}");
-    assert_eq!(
-        ledger_edit_kinds(tmp.path()),
-        ["redirect_future_lock_entry"]
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 4. unscoped rollback replays the unsupported ecosystems
-// ---------------------------------------------------------------------------
-
-/// The same two-record ledger, unscoped: the npm purl unwinds through the
-/// per-purl revert and the gem purl through the whole-ledger reverse replay
-/// (its scope covers every record). Both files are byte-restored, the
-/// ledger is deleted, exit 0.
-#[tokio::test]
-#[serial]
-async fn unscoped_replays_unsupported_ecosystems() {
-    let tmp = tempfile::tempdir().unwrap();
-    write_two_record_fixture(tmp.path()).await;
-
-    let code = rollback_in_process(tmp.path(), Vec::new(), false).await;
-    assert_eq!(code, 0, "unscoped rollback must unwind BOTH records");
-
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
-        yarn_lock_content(&yarn_original_block()),
-        "the npm wiring must be unwound (per-purl revert)"
-    );
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("Gemfile.lock")).unwrap(),
-        gemfile_lock_content(GEM_UPSTREAM_REMOTE),
-        "the gem wiring must be unwound (whole-ledger replay)"
-    );
+    assert_eq!(failed, [IO_PURL, LP_PURL], "{envelope}");
     assert!(
-        !ledger_path(tmp.path()).exists(),
-        "all records and edits unwound: the ledger must be deleted"
+        envelope["hosted"]["failed"][0]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("this run is offline")
+                && e.contains(
+                    "restore it from version control instead (`git checkout -- yarn.lock`)"
+                )),
+        "{envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        wired,
+        "an offline run writes nothing"
+    );
+
+    // Online, left-pad unanswered (404): is-odd restores on its own.
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(code, 1, "{envelope}");
+    assert_eq!(envelope["status"], "partial_failure", "{envelope}");
+    assert_eq!(envelope["hosted"]["reverted"], serde_json::json!([IO_PURL]));
+    assert_eq!(
+        envelope["hosted"]["failed"][0]["purl"], LP_PURL,
+        "{envelope}"
+    );
+    assert_eq!(envelope["hosted"]["unsupported"], serde_json::json!([]));
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_lock_content(&format!(
+            "{}\n\n{}",
+            yarn_redirected_block(),
+            yarn_upstream_block("is-odd", "3.0.1")
+        )),
+        "the refused pin stays hosted, the other is restored"
     );
 }
 
@@ -1057,18 +1111,22 @@ async fn unscoped_replays_unsupported_ecosystems() {
 // 5. manifest-less hosted-only project vs. the truly-empty project
 // ---------------------------------------------------------------------------
 
-/// A hosted-only project (redirect ledger + wired lock, NO manifest) rolls
-/// back fine — a missing manifest is not fatal when a ledger holds work. A TRULY empty directory keeps the legacy "Manifest not found"
-/// exit-1 error.
+/// A hosted-only project (a wired lock, NO manifest, NO ledger) rolls back
+/// fine — a missing manifest is not fatal when the lockfiles pin hosted
+/// patches. A project whose only state is a stale pre-v5 ledger retires it
+/// and exits 0. A TRULY empty directory keeps the legacy "Manifest not
+/// found" exit-1 error.
 #[tokio::test]
 #[serial]
 async fn hosted_only_project_without_manifest() {
-    // Hosted-only: unwinds and exits 0.
+    // Hosted-only: restores and exits 0.
+    let server = MockServer::start().await;
+    mock_yarn_registry(&server, "left-pad", "1.2.3").await;
     let tmp = tempfile::tempdir().unwrap();
-    write_single_npm_fixture(tmp.path()).await;
-    assert!(!tmp.path().join(".socket/manifest.json").exists());
+    write_single_npm_fixture(tmp.path());
+    assert!(!tmp.path().join(".socket").exists());
 
-    let code = rollback_in_process(tmp.path(), Vec::new(), false).await;
+    let code = rollback_online(tmp.path(), &server).await;
     assert_eq!(
         code, 0,
         "a manifest-less hosted-only project must roll back fine"
@@ -1076,14 +1134,21 @@ async fn hosted_only_project_without_manifest() {
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
         yarn_lock_content(&yarn_original_block()),
-        "the hosted wiring must be unwound"
+        "the hosted pin must be restored to its upstream entry"
     );
-    assert!(!ledger_path(tmp.path()).exists(), "ledger must be deleted");
     assert!(
         !tmp.path().join(".socket").exists(),
-        "no manifest may be materialized, and the emptied .socket/ (ledger and \
-         vendor/ pruned, apply.lock removed) must be gone"
+        "no manifest or ledger may be materialized, and apply.lock is removed"
     );
+
+    // Only a stale pre-v5 ledger: retired, exit 0.
+    let stale = tempfile::tempdir().unwrap();
+    write_legacy_ledger(stale.path(), vec![yarn_classic_edit()]).await;
+    let (code, envelope) = run_rollback_subprocess(stale.path(), &[]);
+    assert_eq!(code, 0, "{envelope}");
+    assert_eq!(envelope["status"], "success", "{envelope}");
+    assert_eq!(envelope["legacyRedirectLedgerRemoved"], true, "{envelope}");
+    assert!(!ledger_path(stale.path()).exists());
 
     // Truly empty: all three stores absent keeps the legacy error.
     let empty = tempfile::tempdir().unwrap();
@@ -1103,20 +1168,23 @@ async fn hosted_only_project_without_manifest() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. --preserve-state still unwinds hosted state
+// 6. --preserve-state still restores hosted pins
 // ---------------------------------------------------------------------------
 
-/// Hosted redirects have no preservable local state: a `--preserve-state`
-/// run still unwinds the wiring and drops the ledger records, surfacing the
+/// Hosted pins have no preservable local state: a `--preserve-state` run
+/// still restores the upstream entry, surfacing the
 /// `hosted_state_not_preservable` warning; manifest cleanup and GC stay
 /// skipped (`manifest.preserved`, `gc.skipped`).
 #[tokio::test]
 #[serial]
 async fn preserve_state_still_unwinds_hosted() {
+    let server = MockServer::start().await;
+    mock_yarn_registry(&server, "left-pad", "1.2.3").await;
     let tmp = tempfile::tempdir().unwrap();
-    write_single_npm_fixture(tmp.path()).await;
+    write_single_npm_fixture(tmp.path());
 
-    let (code, envelope) = run_rollback_subprocess(tmp.path(), &["--preserve-state"]);
+    let (code, envelope) =
+        run_rollback_subprocess_online(tmp.path(), &server, &["--preserve-state"]);
     assert_eq!(
         code, 0,
         "preserve-state hosted rollback exits 0: {envelope}"
@@ -1125,11 +1193,11 @@ async fn preserve_state_still_unwinds_hosted() {
     assert_eq!(
         envelope["hosted"]["reverted"],
         serde_json::json!([LP_PURL]),
-        "the wiring must still be unwound under --preserve-state: {envelope}"
+        "the pin must still be restored under --preserve-state: {envelope}"
     );
     assert!(
         warning_codes(&envelope).contains(&"hosted_state_not_preservable".to_string()),
-        "dropping hosted records under --preserve-state must be surfaced: {envelope}"
+        "restoring hosted pins under --preserve-state must be surfaced: {envelope}"
     );
     assert_eq!(
         envelope["manifest"]["preserved"], true,
@@ -1143,31 +1211,26 @@ async fn preserve_state_still_unwinds_hosted() {
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
         yarn_lock_content(&yarn_original_block()),
-        "the hosted wiring must be unwound on disk"
-    );
-    assert!(
-        !ledger_path(tmp.path()).exists(),
-        "hosted ledger records are dropped with the wiring — no preservable state"
+        "the hosted pin must be restored on disk"
     );
     assert!(
         !tmp.path().join(".socket").exists(),
-        "with nothing preservable, the emptied .socket/ is gone too"
+        "with nothing preservable, no .socket/ is left behind"
     );
 }
 
 /// Manifest-less VEX across the hosted npm round trip. Before the rollback
-/// a checkout of the committed state (package.json, the redirected lock,
-/// `.socket/`; nothing installable — the host is fictional — so the lock pin
-/// is the basis) attests `(redirected)` with the ledger, and without it from
-/// lockfile discovery + the patch API. After the bare rollback the restored
-/// lock names no patch and the ledger is gone: nothing attests, online or
-/// `--no-verify`, and the patch API is never asked.
+/// a checkout of the committed state (package.json, the redirected lock;
+/// nothing installable — the host is fictional — so the lock pin is the
+/// basis; no ledger exists) attests `(redirected)` from lockfile discovery +
+/// the patch API. After the bare rollback the restored lock names no patch:
+/// nothing attests, online or `--no-verify`, and the patch API is never
+/// asked.
 #[tokio::test]
 #[serial]
 async fn npm_hosted_round_trip_manifest_less_vex() {
     use vex_e2e_common::{
-        assert_absent, assert_attested, patch_view, run_vex, strip_ledgers, Marker, PatchApi,
-        VexRun,
+        assert_absent, assert_attested, patch_view, run_vex, Marker, PatchApi, VexRun,
     };
     let server = MockServer::start().await;
     mock_discovery(&server).await;
@@ -1203,8 +1266,13 @@ async fn npm_hosted_round_trip_manifest_less_vex() {
         dir
     };
     let wired = checkout("wired");
+    assert!(
+        !wired.join(".socket").exists(),
+        "hosted mode commits no .socket/ state"
+    );
 
-    let code = rollback_in_process(tmp.path(), Vec::new(), false).await;
+    mock_npm_registry(&server).await;
+    let code = rollback_online(tmp.path(), &server).await;
     assert_eq!(code, 0, "bare rollback");
     let reverted = checkout("reverted");
 
@@ -1225,17 +1293,7 @@ async fn npm_hosted_round_trip_manifest_less_vex() {
                     ..VexRun::online(&api)
                 };
                 let out = run_vex(&vex_e2e_common::binary(), &wired, &online());
-                assert_eq!(out.code, Some(0), "wired, ledger:\n{out}");
-                assert_attested(
-                    out.doc(),
-                    PURL,
-                    UUID,
-                    Marker::Redirected,
-                    &[(GHSA, &["CVE-2024-9"])],
-                );
-                strip_ledgers(&wired);
-                let out = run_vex(&vex_e2e_common::binary(), &wired, &online());
-                assert_eq!(out.code, Some(0), "wired, no ledger:\n{out}");
+                assert_eq!(out.code, Some(0), "wired:\n{out}");
                 assert_attested(
                     out.doc(),
                     PURL,

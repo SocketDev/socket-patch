@@ -28,7 +28,7 @@ use crate::crawlers::go_crawler::encode_module_path;
 use crate::patch::apply::is_safe_relative_subpath;
 use crate::patch::path_safety::is_safe_single_segment;
 
-use super::lock_inventory::{LockIntegrity, LockfileEntry, SourceKind};
+use super::lock_inventory::{LockIntegrity, LockfileEntry};
 
 /// The default npm registry; override with `SOCKET_NPM_REGISTRY` (the
 /// enterprise-mirror / test escape hatch — `.npmrc` parsing is out of
@@ -38,7 +38,7 @@ pub const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
 /// Whole-package caps — wider than `patch/package.rs`'s patch-archive caps
 /// because these are full upstream packages, but still bounded so a
 /// poisoned lockfile cannot turn the fetch into a disk/memory bomb.
-const MAX_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
 // `pub(crate)`: `common::read_zip_members` is the in-memory twin of
 // [`extract_zip`] and must refuse exactly the same archives, so it reads the
 // one set of caps rather than carrying a copy that can drift.
@@ -279,6 +279,42 @@ pub fn staged_leaf_for_purl(purl: &str) -> String {
     }
 }
 
+/// Why [`fetch_and_stage`] refuses `entry` as unverifiable before any
+/// request, decided from the entry (and go's proxy settings) alone. Covers
+/// the npm, cargo, golang and composer fetchers completely; the gem and
+/// pypi fetchers raise further refusals only their downloads can decide.
+pub fn refusal_before_download(entry: &LockfileEntry) -> Option<String> {
+    if entry.integrity == LockIntegrity::None {
+        return Some(format!(
+            "the lockfile records no integrity hash for {}@{}; refusing to fetch \
+             unverifiable content",
+            entry.name, entry.version
+        ));
+    }
+    match entry.ecosystem {
+        "npm" => match &entry.integrity {
+            LockIntegrity::BerryChecksum(expected) if !expected.starts_with("10c0/") => {
+                Some(format!(
+                    "yarn berry checksum `{expected}` uses a cacheKey other than 10c0; \
+                     the cache-zip recipe is not reproducible for it"
+                ))
+            }
+            _ => None,
+        },
+        "golang" => match (&entry.integrity, &entry.resolved) {
+            (LockIntegrity::GoH1(_), Some(_)) => None,
+            (LockIntegrity::GoH1(_), None) => goproxy_base(&entry.name).err(),
+            _ => Some("go module entries verify via the go.sum h1 dirhash only".to_string()),
+        },
+        "composer" if entry.resolved.is_none() => Some(format!(
+            "composer.lock records no dist URL for {}@{}",
+            entry.name, entry.version
+        )),
+        "cargo" | "composer" | "gem" | "pypi" => None,
+        other => Some(format!("no registry fetcher for ecosystem `{other}`")),
+    }
+}
+
 /// Fetch + verify + extract one lockfile entry. Ecosystems without a
 /// fetcher yet return [`FetchError::Unverifiable`] (callers keep their
 /// not-installed outcome).
@@ -286,12 +322,8 @@ pub async fn fetch_and_stage(
     entry: &LockfileEntry,
     client: &reqwest::Client,
 ) -> Result<FetchedPackage, FetchError> {
-    if entry.integrity == LockIntegrity::None {
-        return Err(FetchError::Unverifiable(format!(
-            "the lockfile records no integrity hash for {}@{}; refusing to fetch \
-             unverifiable content",
-            entry.name, entry.version
-        )));
+    if let Some(reason) = refusal_before_download(entry) {
+        return Err(FetchError::Unverifiable(reason));
     }
     match entry.ecosystem {
         "npm" => fetch_npm(entry, client).await,
@@ -1071,7 +1103,7 @@ async fn fetch_gem(
 /// hash, and Pipfile.lock, which records every release file's hash).
 pub const DEFAULT_PYPI_JSON_API: &str = "https://pypi.org/pypi";
 
-fn pypi_json_api_base() -> String {
+pub(crate) fn pypi_json_api_base() -> String {
     std::env::var("SOCKET_PYPI_JSON_API")
         .ok()
         .map(|v| v.trim_end_matches('/').to_string())
@@ -1211,7 +1243,7 @@ async fn fetch_pypi(
 /// crates.io static download host; override with `SOCKET_CRATES_REGISTRY`.
 pub const DEFAULT_CRATES_REGISTRY: &str = "https://static.crates.io/crates";
 
-fn crates_registry_base() -> String {
+pub(crate) fn crates_registry_base() -> String {
     std::env::var("SOCKET_CRATES_REGISTRY")
         .ok()
         .map(|v| v.trim_end_matches('/').to_string())
@@ -1261,7 +1293,7 @@ pub const DEFAULT_GOPROXY: &str = "https://proxy.golang.org";
 /// the module matches GONOPROXY (defaulting to GOPRIVATE). Falling back to a
 /// public proxy there would send a private module path off the machine.
 /// A non-empty `SOCKET_GOPROXY` is an explicit choice and always wins.
-fn goproxy_base(module: &str) -> Result<String, String> {
+pub(crate) fn goproxy_base(module: &str) -> Result<String, String> {
     if let Ok(v) = std::env::var("SOCKET_GOPROXY") {
         let v = v.trim_end_matches('/').to_string();
         if !v.is_empty() {
@@ -1304,7 +1336,7 @@ fn goproxy_base(module: &str) -> Result<String, String> {
 /// glob match a leading path-element prefix of `target`? A glob with
 /// syntax this matcher does not implement (`[...]`, `\`) counts as a
 /// match, so an unrecognized private pattern never leaks a module path.
-fn go_match_prefix_patterns(globs: &str, target: &str) -> bool {
+pub(crate) fn go_match_prefix_patterns(globs: &str, target: &str) -> bool {
     globs
         .split(',')
         .map(str::trim)
@@ -1339,7 +1371,7 @@ fn go_glob_match(pattern: &[u8], name: &[u8]) -> bool {
 ///
 /// Runs in the ecosystem-agnostic service-download path whenever the
 /// service reports a `dirhashH1`.
-fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
+pub(crate) fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
     Ok(walk_module_zip(bytes, None)?.h1)
 }
 
@@ -1680,26 +1712,16 @@ async fn fetch_npm(
     entry: &LockfileEntry,
     client: &reqwest::Client,
 ) -> Result<FetchedPackage, FetchError> {
-    fetch_npm_inner(entry, client, true).await
-}
-
-async fn fetch_npm_inner(
-    entry: &LockfileEntry,
-    client: &reqwest::Client,
-    verify: bool,
-) -> Result<FetchedPackage, FetchError> {
     // A foreign berry cacheKey is decidable from the lockfile alone: refuse
     // BEFORE the download, keeping the Unverifiable no-network contract (and
     // not spending a full tarball download on an entry we could never
     // verify).
-    if verify {
-        if let LockIntegrity::BerryChecksum(expected) = &entry.integrity {
-            if !expected.starts_with("10c0/") {
-                return Err(FetchError::Unverifiable(format!(
-                    "yarn berry checksum `{expected}` uses a cacheKey other than 10c0; \
-                     the cache-zip recipe is not reproducible for it"
-                )));
-            }
+    if let LockIntegrity::BerryChecksum(expected) = &entry.integrity {
+        if !expected.starts_with("10c0/") {
+            return Err(FetchError::Unverifiable(format!(
+                "yarn berry checksum `{expected}` uses a cacheKey other than 10c0; \
+                 the cache-zip recipe is not reproducible for it"
+            )));
         }
     }
     let url = entry
@@ -1707,26 +1729,22 @@ async fn fetch_npm_inner(
         .clone()
         .unwrap_or_else(|| npm_tarball_url(&npm_registry_base(), &entry.name, &entry.version));
     let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
-    if !verify {
-        // fetch_npm_unverified: the caller owns end-to-end verification.
-    } else {
-        match &entry.integrity {
-            // yarn berry locks never hash the tarball itself — the checksum is
-            // sha512 of the deterministic cache zip. Rebuild it from the fetched
-            // bytes (the same spike-pinned recipe the berry wiring uses) and
-            // compare. Only cacheKey 10c0 (yarn 4 default) is reproducible.
-            LockIntegrity::BerryChecksum(expected) => {
-                let actual = super::berry_zip::berry_cache_checksum_10c0(&bytes, &entry.name)
-                    .map_err(FetchError::Failed)?;
-                if &actual != expected {
-                    return Err(FetchError::Failed(format!(
-                        "yarn berry cache checksum mismatch: lockfile records {expected}, \
-                         the fetched tarball rebuilds to {actual}"
-                    )));
-                }
+    match &entry.integrity {
+        // yarn berry locks never hash the tarball itself — the checksum is
+        // sha512 of the deterministic cache zip. Rebuild it from the fetched
+        // bytes (the same spike-pinned recipe the berry wiring uses) and
+        // compare. Only cacheKey 10c0 (yarn 4 default) is reproducible.
+        LockIntegrity::BerryChecksum(expected) => {
+            let actual = super::berry_zip::berry_cache_checksum_10c0(&bytes, &entry.name)
+                .map_err(FetchError::Failed)?;
+            if &actual != expected {
+                return Err(FetchError::Failed(format!(
+                    "yarn berry cache checksum mismatch: lockfile records {expected}, \
+                     the fetched tarball rebuilds to {actual}"
+                )));
             }
-            other => verify_integrity(&bytes, other)?,
         }
+        other => verify_integrity(&bytes, other)?,
     }
 
     let tmp = tempfile::tempdir()
@@ -1863,7 +1881,7 @@ pub async fn stage_local_dir_artifact(
 /// Capped download. http(s) only; the cap is enforced on the declared
 /// Content-Length AND the actual stream (a lying server cannot blow past
 /// it).
-async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+pub(crate) async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err(format!("refusing non-http(s) artifact URL `{url}`"));
     }
@@ -1897,32 +1915,6 @@ async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
-}
-
-/// Fetch + stage an npm package from its conventional registry URL WITHOUT
-/// content verification. The download/extract caps still apply.
-///
-/// SECURITY: callers MUST end-to-end verify whatever they derive from the
-/// staged copy against an independent trust anchor before committing it —
-/// repair's ledger reconstruction verifies the deterministically REBUILT
-/// vendored tarball against the integrity the rewired lockfile records
-/// (`artifact_matches_integrity`); a tampered pristine source then changes
-/// the rebuilt bytes and fails closed.
-pub async fn fetch_npm_unverified(
-    name: &str,
-    version: &str,
-    client: &reqwest::Client,
-) -> Result<FetchedPackage, FetchError> {
-    let entry = LockfileEntry {
-        ecosystem: "npm",
-        source_kind: SourceKind::Unspecified,
-        name: name.to_string(),
-        version: version.to_string(),
-        purl: format!("pkg:npm/{name}@{version}"),
-        resolved: None,
-        integrity: LockIntegrity::None,
-    };
-    fetch_npm_inner(&entry, client, false).await
 }
 
 /// Whole-artifact verification against a lock-recorded integrity (the same
@@ -2012,7 +2004,7 @@ fn verify_integrity(bytes: &[u8], integrity: &LockIntegrity) -> Result<(), Fetch
 /// legacy package unvendorable whenever the prebuilt-artifact service misses.
 /// The bare-hex twin of this trust
 /// decision already lives in the `LockIntegrity::Sha1Hex` arm above.
-fn verify_sri(bytes: &[u8], sri: &str) -> Result<(), String> {
+pub(crate) fn verify_sri(bytes: &[u8], sri: &str) -> Result<(), String> {
     let mut best: Option<(u8, &str, &str)> = None;
     for token in sri.split_whitespace() {
         let Some((algo, b64)) = token.split_once('-') else {
@@ -2317,6 +2309,7 @@ fn walk_tar_gz(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vendor::lock_inventory::SourceKind;
     use wiremock::matchers::{method, path as url_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3786,6 +3779,71 @@ mod tests {
             "case escaping must apply to the name AND the version"
         );
         assert!(fetched.dir().await.unwrap().join("go.mod").is_file());
+    }
+
+    /// The pre-download refusals the vendor loop's service deferral mirrors
+    /// are exactly the ones `fetch_and_stage` raises before any request.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn refusal_before_download_matches_the_fetchers_first_refusals() {
+        let entry = |ecosystem: &'static str, resolved: Option<&str>, integrity: LockIntegrity| {
+            LockfileEntry {
+                ecosystem,
+                name: "example.com/mod".into(),
+                version: "1.0.0".into(),
+                purl: format!("pkg:{ecosystem}/example.com/mod@1.0.0"),
+                resolved: resolved.map(str::to_string),
+                integrity,
+                source_kind: SourceKind::Unspecified,
+            }
+        };
+        let saved = std::env::var("GOPROXY").ok();
+        std::env::set_var("GOPROXY", "off");
+        let refused = [
+            entry("npm", None, LockIntegrity::None),
+            entry(
+                "npm",
+                Some("http://127.0.0.1:1/x.tgz"),
+                LockIntegrity::BerryChecksum("8/abc".into()),
+            ),
+            entry("golang", None, LockIntegrity::GoH1("h1:AAAA".into())),
+            entry("golang", None, LockIntegrity::Sri("sha512-AAAA".into())),
+            entry("composer", None, LockIntegrity::Sha1Hex("aa".into())),
+            entry("nuget", Some("http://127.0.0.1:1/x"), LockIntegrity::Sri("x".into())),
+        ];
+        for e in &refused {
+            let reason = refusal_before_download(e).expect("refused");
+            match fetch_and_stage(e, &build_registry_client()).await {
+                Err(FetchError::Unverifiable(d)) => assert_eq!(d, reason),
+                other => panic!("{e:?}: {:?}", other.err()),
+            }
+        }
+        match saved {
+            Some(v) => std::env::set_var("GOPROXY", v),
+            None => std::env::remove_var("GOPROXY"),
+        }
+        let fetchable = [
+            entry("npm", Some("http://127.0.0.1:1/x.tgz"), LockIntegrity::Sri("x".into())),
+            entry(
+                "npm",
+                Some("http://127.0.0.1:1/x.tgz"),
+                LockIntegrity::BerryChecksum("10c0/abc".into()),
+            ),
+            entry("cargo", None, LockIntegrity::Sha256Hex("aa".into())),
+            entry(
+                "golang",
+                Some("http://127.0.0.1:1/x.zip"),
+                LockIntegrity::GoH1("h1:AAAA".into()),
+            ),
+            entry(
+                "composer",
+                Some("http://127.0.0.1:1/x.zip"),
+                LockIntegrity::Sha1Hex("aa".into()),
+            ),
+        ];
+        for e in &fetchable {
+            assert_eq!(refusal_before_download(e), None, "{e:?}");
+        }
     }
 
     /// go never sends a module path to a proxy when GOPROXY starts with

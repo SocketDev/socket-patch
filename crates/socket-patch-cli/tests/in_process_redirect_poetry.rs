@@ -2,10 +2,12 @@
 //! API (discovery + reference + view) via wiremock, lays down a native
 //! `poetry.lock` (the committed Poetry 2.4.3 fixture) with NO installed
 //! package — the lock-only fresh-checkout / CI shape — and asserts the lock is
-//! repointed at the hosted wheel, the redirect ledger is written, the same-run
-//! `--vex` attests the redirect, a re-scan is idempotent, and `rollback`
-//! restores every byte. The rewriter bytes themselves are pinned by the core
-//! `poetry_hosted` tests; this covers the CLI wiring around them.
+//! repointed at the hosted wheel, NO redirect ledger is written (v5), the
+//! same-run `--vex` attests the redirect, a re-scan is idempotent, and
+//! `rollback` restores every byte by re-resolving the upstream entry from a
+//! mocked PyPI JSON API (`SOCKET_PYPI_JSON_API`). The rewriter bytes
+//! themselves are pinned by the core `poetry_hosted` tests; this covers the
+//! CLI wiring around them.
 
 use std::path::Path;
 
@@ -24,8 +26,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const ORG: &str = "test-org";
 /// Discovery names the base purl (the lockfile supplement's spelling)…
 const PURL: &str = "pkg:pypi/urllib3@1.26.18";
-/// …while the patch record carries the API's artifact-qualified purl, which
-/// is what the redirect ledger is keyed by.
+/// …while the patch record carries the API's artifact-qualified purl (what a
+/// pre-v5 redirect ledger was keyed by).
 const RECORD_PURL: &str = "pkg:pypi/urllib3@1.26.18?artifact_id=py2-py3-none-any-whl";
 const UUID: &str = "e828efa5-5c6d-43f3-9909-03f5ac232b98";
 const HOSTED_URL: &str = "http://patch.test/patch/pypi/urllib3/1.26.18/22222222-2222-4222-8222-222222222222/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl";
@@ -56,8 +58,69 @@ fn global(cwd: &Path, api_url: String) -> GlobalArgs {
     }
 }
 
+/// The urllib3 1.26.18 release files the Poetry fixtures pin, as the PyPI
+/// JSON API serves them (`GET /pypi/urllib3/1.26.18/json`).
+async fn mock_pypi(server: &MockServer) {
+    let file = |filename: &str, sha: &str, size: u64, uploaded: &str| {
+        serde_json::json!({
+            "filename": filename,
+            "url": format!("https://files.pythonhosted.org/packages/ab/cd/{filename}"),
+            "digests": { "sha256": sha },
+            "size": size,
+            "upload_time_iso_8601": uploaded,
+        })
+    };
+    Mock::given(method("GET"))
+        .and(path("/pypi/urllib3/1.26.18/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "urls": [
+                file(
+                    "urllib3-1.26.18-py2.py3-none-any.whl",
+                    "34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07",
+                    143835,
+                    "2023-10-17T17:46:21.184066Z",
+                ),
+                file(
+                    "urllib3-1.26.18.tar.gz",
+                    "f8ecc1bba5667413457c529ab955bf8c67b45db799d159066261719e328580a0",
+                    305687,
+                    "2023-10-17T17:46:24.000000Z",
+                ),
+            ]
+        })))
+        .mount(server)
+        .await;
+}
+
+/// In-process `rollback` of the hosted pin: the mock patch host is named by
+/// `--patch-server-url` (so discovery finds the pin) and the upstream restore
+/// re-resolves the release from the mocked PyPI JSON API.
+async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
+    mock_pypi(server).await;
+    std::env::set_var("SOCKET_PYPI_JSON_API", format!("{}/pypi", server.uri()));
+    let code = rollback::run(RollbackArgs {
+        targets: Vec::new(),
+        common: GlobalArgs {
+            patch_server_url: Some("http://patch.test".to_string()),
+            ..global(cwd, server.uri())
+        },
+        preserve_state: false,
+    })
+    .await;
+    std::env::remove_var("SOCKET_PYPI_JSON_API");
+    code
+}
+
+fn assert_no_ledger(root: &Path) {
+    assert!(
+        !root.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode writes no redirect ledger"
+    );
+}
+
 fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: global(cwd, api_url),
@@ -66,14 +129,13 @@ fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: true,
-        mode: None,
+        mode: Some(socket_patch_cli::commands::scan::ScanMode::Hosted),
         all_releases: false,
         vex: VexEmbedArgs {
             vex: vex.map(Path::to_path_buf),
             ..Default::default()
         },
+        rollout: Default::default(),
     }
 }
 
@@ -200,22 +262,10 @@ async fn lock_only_poetry_project_redirects_attests_rescans_and_rolls_back() {
         PYPROJECT,
         "pyproject untouched"
     );
-    let ledger: serde_json::Value = serde_json::from_str(&read(
-        &tmp.path().join(".socket/vendor/redirect-state.json"),
-    ))
-    .unwrap();
-    assert!(
-        ledger["records"][RECORD_PURL].is_object(),
-        "ledger keyed by the artifact-qualified purl: {ledger}"
-    );
-    assert_eq!(
-        ledger["edits"][0]["kind"].as_str(),
-        Some("redirect_poetry_lock_package"),
-        "{ledger}"
-    );
-    // The redirect is attested from the ledger (assume_applied) even though
-    // the base purl the run confirmed differs from the record's qualified
-    // purl only by its `?artifact_id=` qualifier.
+    assert_no_ledger(tmp.path());
+    // The redirect is attested from this run's fetched record (assume
+    // applied) even though the base purl the run confirmed differs from the
+    // record's qualified purl only by its `?artifact_id=` qualifier.
     let vex: serde_json::Value = serde_json::from_str(&read(&vex_path)).unwrap();
     let statements = vex["statements"].as_array().expect("statements");
     assert_eq!(statements.len(), 1, "{vex}");
@@ -234,30 +284,15 @@ async fn lock_only_poetry_project_redirects_attests_rescans_and_rolls_back() {
         "re-scan must not touch the lock"
     );
 
-    // 3. rollback unwinds the redirect and drops the record.
-    let code = rollback::run(RollbackArgs {
-        targets: Vec::new(),
-        common: global(tmp.path(), server.uri()),
-        one_off: false,
-        preserve_state: false,
-    })
-    .await;
+    // 3. rollback restores the upstream registry entry.
+    let code = rollback_hosted(tmp.path(), &server).await;
     assert_eq!(code, 0, "rollback must succeed");
     assert_eq!(
         read(&lock_path),
         LOCK,
         "rollback must restore the pristine lock byte for byte"
     );
-    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
-    if ledger_path.exists() {
-        let ledger: serde_json::Value = serde_json::from_str(&read(&ledger_path)).unwrap();
-        assert!(
-            ledger["records"]
-                .as_object()
-                .is_none_or(|records| records.is_empty()),
-            "no redirect record may survive rollback: {ledger}"
-        );
-    }
+    assert_no_ledger(tmp.path());
 }
 
 /// What `poetry lock --no-update` on Poetry 1.1 / 1.2 does to a redirected
@@ -285,9 +320,9 @@ fn simulate_poetry_1x_relock(lock: &str) -> String {
 }
 
 /// Relock → re-scan → rollback must still land on the pristine lock. The
-/// re-scan REBASES the ledger's edits (pristine → freshly written) instead of
-/// appending edits recorded against the relocked text, whose older links
-/// would match nothing and make rollback (and remove) refuse forever.
+/// re-scan plans from the relocked text (v5 keeps no ledger chain to rebase)
+/// and rollback re-resolves the upstream entry from the registry, so the
+/// relock never strands the unwind.
 #[tokio::test]
 #[serial]
 async fn relock_then_rescan_keeps_rollback_invertible() {
@@ -308,13 +343,8 @@ async fn assert_relock_roundtrip(lock: &str) {
 
     assert_eq!(run(hosted_args(tmp.path(), server.uri(), None)).await, 0);
     let redirected = read(&lock_path);
-    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
-    let ledger: serde_json::Value = serde_json::from_str(&read(&ledger_path)).unwrap();
-    assert_eq!(
-        ledger["edits"].as_array().unwrap().len(),
-        2,
-        "package + metadata fragments"
-    );
+    assert!(redirected.contains(HOSTED_URL), "{redirected}");
+    assert_no_ledger(tmp.path());
 
     let relocked = simulate_poetry_1x_relock(&redirected);
     assert_ne!(relocked, redirected);
@@ -328,29 +358,9 @@ async fn assert_relock_roundtrip(lock: &str) {
         rescanned, relocked,
         "the re-scan must restore the package files entry"
     );
-    let ledger: serde_json::Value = serde_json::from_str(&read(&ledger_path)).unwrap();
-    let edits = ledger["edits"].as_array().unwrap();
-    assert_eq!(edits.len(), 2, "rebased, not appended: {ledger}");
-    for edit in edits {
-        let original = edit["original"].as_str().unwrap();
-        assert!(
-            !original.contains(HOSTED_URL),
-            "originals stay pristine: {original}"
-        );
-        let new = edit["new"].as_str().unwrap();
-        assert!(
-            rescanned.contains(new),
-            "new fragments describe the current lock"
-        );
-    }
+    assert_no_ledger(tmp.path());
 
-    let code = rollback::run(RollbackArgs {
-        targets: Vec::new(),
-        common: global(tmp.path(), server.uri()),
-        one_off: false,
-        preserve_state: false,
-    })
-    .await;
+    let code = rollback_hosted(tmp.path(), &server).await;
     assert_eq!(code, 0, "rollback after relock + re-scan must succeed");
     assert_eq!(
         read(&lock_path),
@@ -456,7 +466,9 @@ async fn stale_python_install_warns_and_cannot_attest_even_on_rescan() {
             assert_eq!(json["error"]["code"], "no_applicable_patches", "{json}");
             assert!(!vex.exists(), "stale bytes cannot produce a VEX file");
         }
-        // A failed fresh record fetch must not bypass the persisted evidence.
+        // A failed fresh record fetch leaves the probe no evidence (v5 keeps
+        // no persisted record): the run still succeeds, says the record
+        // could not be fetched, and never attests.
         Mock::given(method("GET"))
             .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
             .respond_with(ResponseTemplate::new(404))
@@ -464,12 +476,12 @@ async fn stale_python_install_warns_and_cannot_attest_even_on_rescan() {
             .mount(&server)
             .await;
         let out = scan_output(tmp.path(), &server, &[]).await;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
         assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
+            stderr.contains("was switched to hosted, but its patch record could not be fetched"),
+            "{stderr}"
         );
-        assert!(String::from_utf8_lossy(&out.stderr).contains("redirect_pypi_stale_install"));
         assert_eq!(
             std::fs::read(installed).unwrap(),
             bytes,
@@ -575,15 +587,14 @@ fn manifestless_vex(
 }
 
 /// After `scan --mode hosted` wired the lock-only checkout, VEX needs no
-/// manifest (hosted never writes one) and — with the patch API reachable —
-/// no ledger either:
-///   1. manifest absent, ledger kept → attests offline from the ledger;
-///   2. ledger deleted → attests from the lock's sha256 pin + the API
-///      record, and after an install only when the installed tree hashes to
-///      the patch (`not_applied` for the upstream bytes); `apply --vex`
-///      agrees;
-///   3. `--offline` without the ledger → `record_unavailable`, no request;
-///   4. the lock reverted with the ledger kept → `redirect_unwired`, also
+/// manifest and no ledger (v5 hosted writes neither):
+///   1. attests from the lock's sha256 pin + the API record, and after an
+///      install only when the installed tree hashes to the patch
+///      (`not_applied` for the upstream bytes); `apply --vex` agrees;
+///   2. `--offline` with no local record → `record_unavailable`, no request;
+///   3. a pre-v5 ledger carrying the record is an extra local record
+///      source: the same offline run attests with no request;
+///   4. the lock reverted with that ledger kept → `redirect_unwired`, also
 ///      under `--no-verify`; and the self-hosted origin only counts when
 ///      `--patch-server-url` names it.
 #[test]
@@ -598,8 +609,8 @@ fn manifestless_vex_after_hosted_redirect() {
     let root = tmp.path();
     assert_eq!(rt.block_on(run(hosted_args(root, server.uri(), None))), 0);
     assert!(!root.join(".socket/manifest.json").exists());
+    assert_no_ledger(root);
     let ledger_path = root.join(".socket/vendor/redirect-state.json");
-    let ledger = std::fs::read(&ledger_path).unwrap();
     let redirected = read(&root.join("poetry.lock"));
 
     let mut view = vex_e2e_common::patch_view(
@@ -613,17 +624,10 @@ fn manifestless_vex_after_hosted_redirect() {
     );
     view["files"]["urllib3/response.py"]["beforeHash"] =
         compute_git_sha256_from_bytes(UPSTREAM).into();
-    let api = PatchApi::start(vec![(UUID.into(), view)]);
+    let api = PatchApi::start(vec![(UUID.into(), view.clone())]);
     let vulns: &[(&str, &[&str])] = &[(GHSA, &["CVE-2025-66418"])];
 
-    // 1. the ledger alone, offline.
-    let out = manifestless_vex(root, &api, true, &[]);
-    assert_eq!(out.code, Some(0), "{out}");
-    assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
-    api.assert_no_requests();
-
-    // 2. no ledger: lock pin + API record.
-    vex_e2e_common::strip_ledgers(root);
+    // 1. lock pin + API record.
     let out = manifestless_vex(root, &api, false, &[]);
     assert_eq!(out.code, Some(0), "{out}");
     assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
@@ -658,7 +662,7 @@ fn manifestless_vex_after_hosted_redirect() {
     assert_not_attested(&out.envelope, PURL, "not_applied");
     std::fs::write(&installed, PATCHED).unwrap();
 
-    // 3. offline without the ledger.
+    // 2. offline with no local record.
     let seen = api.request_count();
     let out = manifestless_vex(root, &api, true, &[]);
     assert_eq!(out.code, Some(1), "{out}");
@@ -666,8 +670,29 @@ fn manifestless_vex_after_hosted_redirect() {
     assert!(out.doc.is_none());
     assert_eq!(api.request_count(), seen, "--offline made a request");
 
-    // 4. reverted lock, ledger kept.
-    std::fs::write(&ledger_path, &ledger).unwrap();
+    // 3. a pre-v5 ledger's record serves the offline run.
+    let mut record = view;
+    let obj = record.as_object_mut().unwrap();
+    obj.remove("purl");
+    let exported = obj.remove("publishedAt").unwrap();
+    obj.insert("exportedAt".to_string(), exported);
+    std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &ledger_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "mode": "hosted",
+            "records": { RECORD_PURL: record },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = manifestless_vex(root, &api, true, &[]);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
+    assert_eq!(api.request_count(), seen, "--offline made a request");
+
+    // 4. reverted lock, that ledger kept.
     std::fs::write(root.join("poetry.lock"), LOCK).unwrap();
     for extra in [&[][..], &["--no-verify"][..]] {
         for offline in [true, false] {

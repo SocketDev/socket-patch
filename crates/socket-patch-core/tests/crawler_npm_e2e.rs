@@ -951,8 +951,8 @@ async fn crawl_all_discovers_deeply_nested_transitive_deps() {
     // patchable — exactly like a direct dependency (apply is path-agnostic). The
     // other nested tests stage only 2 levels; this pins 4, so a regression that
     // capped recursion depth (or stopped descending after the first nested
-    // node_modules) would surface here. See CLI_CONTRACT "Setup command contract"
-    // → "Monorepo / multi-project discovery model".
+    // node_modules) would surface here. See CLI_CONTRACT "Monorepo /
+    // multi-project discovery model".
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
 
@@ -2172,7 +2172,6 @@ async fn apply_and_rollback_reach_every_pnpm_peer_variant_copy() {
 
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: None,
         mem_blobs: None,
     };
@@ -2282,7 +2281,6 @@ async fn apply_heals_unpatched_pnpm_twin_when_primary_already_patched() {
     );
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: None,
         mem_blobs: None,
     };
@@ -3082,7 +3080,6 @@ async fn vlt_apply(
     use socket_patch_core::patch::apply::{apply_package_patch, MismatchPolicy, PatchSources};
     let sources = PatchSources {
         blobs_path: &patch.blobs,
-        packages_path: None,
         diffs_path: None,
         mem_blobs: None,
     };

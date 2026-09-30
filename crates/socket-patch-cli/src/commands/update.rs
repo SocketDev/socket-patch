@@ -144,16 +144,6 @@ fn confirm_prompt(current: &semver::Version, target: &semver::Version) -> String
     }
 }
 
-/// The line after a declined [`confirm_prompt`], naming the same action.
-fn cancelled_message(current: &semver::Version, target: &semver::Version) -> &'static str {
-    if target < current {
-        "Downgrade cancelled."
-    } else if target == current {
-        "Reinstall cancelled."
-    } else {
-        "Update cancelled."
-    }
-}
 
 /// The result line after a successful install, naming the same action as
 /// [`confirm_prompt`].
@@ -356,7 +346,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
     let prompt = confirm_prompt(&current, &target_version);
     if !crate::ui::confirm(&prompt, true, &args.common) {
         if !quiet {
-            eprintln!("{}", cancelled_message(&current, &target_version));
+            eprintln!("{}", crate::ui::CANCELLED);
         }
         return 1;
     }
@@ -497,10 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_and_result_lines_match_the_prompt() {
-        assert_eq!(cancelled_message(&v("4.0.0"), &v("9.9.9")), "Update cancelled.");
-        assert_eq!(cancelled_message(&v("4.0.0"), &v("3.0.0")), "Downgrade cancelled.");
-        assert_eq!(cancelled_message(&v("4.0.0"), &v("4.0.0")), "Reinstall cancelled.");
+    fn result_lines_match_the_prompt() {
         let p = std::path::Path::new("/opt/sp/socket-patch");
         assert_eq!(
             installed_message(&v("4.0.0"), &v("9.9.9"), p),

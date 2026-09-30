@@ -14,8 +14,8 @@
 //!     `dist: {type: path, url: <copy>, reference: <patch-uuid>}` +
 //!     `transport-options: {symlink: false}` + `source` removed, with
 //!     composer.json untouched; then `socket-patch vex` attests the vendored
-//!     patch (composer has no product auto-detect, so `--product` is
-//!     explicit) — exit 0 in-container, the statement body re-asserted
+//!     patch (`--product` is passed explicitly, although composer.json's
+//!     `name` is auto-detected too) — exit 0 in-container, the statement body re-asserted
 //!     host-side from the mounted out.vex.json.
 //!   stage 2 (`--network none`, empty COMPOSER_HOME): ONLY the committable
 //!     files (composer.json + composer.lock + .socket/) are copied to a

@@ -291,6 +291,7 @@ async fn mount_view(
 
 fn scan_args(tmp: &Path, api_url: String, all_releases: bool) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
@@ -318,11 +319,10 @@ fn scan_args(tmp: &Path, api_url: String, all_releases: bool) -> ScanArgs {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases,
         vex: Default::default(),
+        rollout: Default::default(),
     }
 }
 
@@ -578,7 +578,6 @@ async fn rollback_all_over_broad_manifest_succeeds() {
             ecosystems: Some(vec!["pypi".to_string()]),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        one_off: false,
     };
     let code = rollback_run(rollback_args).await;
     assert_eq!(code, 0, "rollback-all over broad manifest should exit 0");

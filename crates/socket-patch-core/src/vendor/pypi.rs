@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use sha2::{Digest as _, Sha256};
 
-use crate::api::client::{ApiClient, DeferredAttempt};
+use crate::api::client::{wheel_filename_from_url, ApiClient, DeferredAttempt, PYPI_NOT_A_WHEEL};
 use crate::constants::SOCKET_DIR;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::manifest::schema::PatchRecord;
@@ -40,7 +40,9 @@ use super::pypi_wheel::{
     WheelArtifact,
 };
 use super::reuse;
-use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::service_fetch::{
+    fetch_verified_archive, ServiceArtifact, ServiceAttempt, ServicePolicy, ServiceTerminal,
+};
 use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, PdmMeta, PipenvMeta, PoetryMeta, UvMeta, VendorArtifact, VendorEntry,
@@ -224,8 +226,8 @@ pub async fn finish_hosted_wheel_metadata(
 }
 
 const SETUP_ALTERNATIVE: &str =
-    "use the `socket-patch setup` .pth install hook instead, which patches installed \
-     site-packages without lockfile edits";
+    "use agent mode instead (`scan --mode agent`, then `socket-patch apply` after each \
+     install), which patches installed site-packages without lockfile edits";
 
 /// Route the project to a wiring flavor, first match wins. Lockfiles are the
 /// authoritative "this tool manages installs" signal, so locks are compared
@@ -1874,15 +1876,9 @@ async fn acquire_patched_wheel(
     })
 }
 
-/// Outcome of attempting a pypi service download.
-enum PypiServiceWheel {
-    /// Boxed: the wheel facts are large relative to the other variants.
-    Used(Box<AcquiredWheel>),
-    /// Bubble this terminal outcome (a `service`-mode miss, or a write failure).
-    HardFail(Box<VendorOutcome>),
-    /// Fall back to the local build.
-    FallBack,
-}
+/// Outcome of attempting a pypi service download (the wheel facts boxed —
+/// they are large).
+type PypiServiceWheel = ServiceAttempt<Box<AcquiredWheel>>;
 
 /// Download + verify the prebuilt wheel for `record.uuid`, mapping each service
 /// outcome onto the `auto` / `service` policy. Only `.whl` artifacts are usable
@@ -1897,150 +1893,100 @@ async fn try_pypi_service_wheel(
     expected_pin: Option<&(String, String)>,
     warnings: &mut Vec<VendorWarning>,
 ) -> PypiServiceWheel {
-    // A terminal `service`-mode refusal (boxed — the enum's other variants are
-    // small). A nested fn so both `miss` and the write-failure sites can use it.
-    fn hard_fail(code: &'static str, detail: String) -> PypiServiceWheel {
-        PypiServiceWheel::HardFail(Box::new(refused(code, detail)))
+    let policy = ServicePolicy::new(cfg, ServiceTerminal::Refused);
+    let fetched = fetch_verified_archive(cfg, &record.uuid).await;
+    // The client refused a non-wheel before downloading it.
+    if let ServiceArtifact::Unavailable(reason) = &fetched {
+        if reason == PYPI_NOT_A_WHEEL {
+            return policy.miss(warnings, "vendor_prebuilt_unavailable", reason.clone());
+        }
     }
-    // service-required → hard fail; `auto` → warn + fall back to the local build.
-    let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
-        if cfg.source.requires_service() {
-            hard_fail("vendor_prebuilt_required", reason)
-        } else {
-            warnings.push(VendorWarning::new(
-                code,
-                format!("{reason}; building locally instead"),
-            ));
-            PypiServiceWheel::FallBack
-        }
+    let archive = match policy.settle(fetched, "wheel", "wheel", warnings) {
+        Ok(archive) => archive,
+        Err(attempt) => return attempt,
     };
-
-    match fetch_verified_archive(cfg, &record.uuid).await {
-        ServiceArtifact::Ready(archive) => {
-            let Some(wheel_name) = wheel_filename_from_url(&archive.source_url) else {
-                return miss(
-                    warnings,
-                    "vendor_prebuilt_unavailable",
-                    "the prebuilt artifact is not a .whl (pypi vendoring is wheel-based)"
-                        .to_string(),
-                );
-            };
-            // The SRI proves only that the transfer is intact. A wheel's
-            // members are site-packages-relative (the `record.files` keys),
-            // so require each patched file to carry its afterHash before
-            // reporting the package patched and pinning the lockfile to it.
-            if !archive
-                .prestaged
-                .zip_verdict(&record.files)
-                .unwrap_or_else(|| zip_bytes_match_after_hashes(&archive.bytes, &record.files))
-            {
-                return miss(
-                    warnings,
-                    "vendor_prebuilt_layout_mismatch",
-                    format!(
-                        "prebuilt wheel for {base} does not carry the patched files at \
-                         their recorded paths"
-                    ),
-                );
-            }
-            let rel_wheel = format!("{uuid_dir_rel}/{wheel_name}");
-            // Digested on first ask: pypi is the only backend that pins it.
-            let sha256_hex = archive.sha256_hex().to_string();
-            // In-sync rebuild: the lockfile still pins the first vendor's
-            // wheel path + sha256, and a prebuilt wheel that differs would
-            // break every subsequent hash-checked install the moment vendor
-            // reports success. Checked BEFORE writing, so a mismatch leaves
-            // no poisoned artifact behind (`auto` falls back to the
-            // deterministic local build, which reproduces a local pin).
-            if let Some((pin_path, pin_sha)) = expected_pin {
-                if *pin_path != rel_wheel || *pin_sha != sha256_hex {
-                    return miss(
-                        warnings,
-                        "vendor_prebuilt_pin_mismatch",
-                        format!(
-                            "the prebuilt wheel ({rel_wheel}, sha256 {sha256_hex}) does not \
-                             match the wheel the lockfile still pins ({pin_path}, sha256 \
-                             {pin_sha})"
-                        ),
-                    );
-                }
-            }
-            let dest = project_root.join(uuid_dir_rel).join(&wheel_name);
-            if let Some(parent) = dest.parent() {
-                if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                    return hard_fail(
-                        "vendor_prebuilt_write_failed",
-                        format!("cannot create {}: {e}", parent.display()),
-                    );
-                }
-            }
-            if let Err(e) = atomic_write_artifact(&dest, &archive.bytes).await {
-                return hard_fail(
-                    "vendor_prebuilt_write_failed",
-                    format!("cannot write the vendored wheel: {e}"),
-                );
-            }
-            let (platform_locked, platform_tags_display) =
-                wheel_platform_from_filename(&wheel_name);
-            warnings.push(VendorWarning::new(
-                "vendor_prebuilt_downloaded",
-                format!(
-                    "vendored the wheel for {base} from the patch service ({})",
-                    archive.source_url
-                ),
-            ));
-            PypiServiceWheel::Used(Box::new(AcquiredWheel {
-                rel_wheel,
-                result: already_patched_result(base, &dest, &record.files),
-                artifact: Some(WheelArtifact {
-                    file_name: wheel_name.clone(),
-                    sha256_hex,
-                    size: archive.bytes.len() as u64,
-                }),
-                wheel_name,
-                platform_locked,
-                platform_tags_display,
-            }))
-        }
-        // Bytes that fail integrity verification are an active tamper signal:
-        // ALWAYS a hard error, in `auto` exactly as in `service` — never a
-        // quiet local-build fallback (`ServiceArtifact`'s documented contract).
-        ServiceArtifact::IntegrityMismatch(reason) => hard_fail(
-            "vendor_prebuilt_integrity_mismatch",
-            format!(
-                "prebuilt wheel failed integrity verification ({reason}); \
-                 refusing to fall back to a local build on tampered bytes"
-            ),
-        ),
-        ServiceArtifact::Pending => miss(
-            warnings,
-            "vendor_prebuilt_pending",
-            "prebuilt wheel is still building".to_string(),
-        ),
-        // Quiet under `auto` (the common "not built / free-only" case).
-        ServiceArtifact::Unavailable(reason) => {
-            if cfg.source.requires_service() {
-                hard_fail(
-                    "vendor_prebuilt_required",
-                    format!("prebuilt wheel unavailable: {reason}"),
-                )
-            } else {
-                PypiServiceWheel::FallBack
-            }
-        }
-        ServiceArtifact::Failed(reason) => miss(
+    let Some(wheel_name) = wheel_filename_from_url(&archive.source_url) else {
+        return policy.miss(
             warnings,
             "vendor_prebuilt_unavailable",
-            format!("patch service request failed ({reason})"),
-        ),
+            PYPI_NOT_A_WHEEL.to_string(),
+        );
+    };
+    // The SRI proves only that the transfer is intact. A wheel's
+    // members are site-packages-relative (the `record.files` keys),
+    // so require each patched file to carry its afterHash before
+    // reporting the package patched and pinning the lockfile to it.
+    if !archive
+        .prestaged
+        .zip_verdict(&record.files)
+        .unwrap_or_else(|| zip_bytes_match_after_hashes(&archive.bytes, &record.files))
+    {
+        return policy.miss(
+            warnings,
+            "vendor_prebuilt_layout_mismatch",
+            format!(
+                "prebuilt wheel for {base} does not carry the patched files at \
+                 their recorded paths"
+            ),
+        );
     }
-}
-
-/// The last path segment of a serve URL, when it names a `.whl`.
-fn wheel_filename_from_url(url: &str) -> Option<String> {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    let name = path.rsplit('/').next().unwrap_or("");
-    name.ends_with(".whl").then(|| name.to_string())
+    let rel_wheel = format!("{uuid_dir_rel}/{wheel_name}");
+    // Digested on first ask: pypi is the only backend that pins it.
+    let sha256_hex = archive.sha256_hex().to_string();
+    // In-sync rebuild: the lockfile still pins the first vendor's
+    // wheel path + sha256, and a prebuilt wheel that differs would
+    // break every subsequent hash-checked install the moment vendor
+    // reports success. Checked BEFORE writing, so a mismatch leaves
+    // no poisoned artifact behind (`auto` falls back to the
+    // deterministic local build, which reproduces a local pin).
+    if let Some((pin_path, pin_sha)) = expected_pin {
+        if *pin_path != rel_wheel || *pin_sha != sha256_hex {
+            return policy.miss(
+                warnings,
+                "vendor_prebuilt_pin_mismatch",
+                format!(
+                    "the prebuilt wheel ({rel_wheel}, sha256 {sha256_hex}) does not \
+                     match the wheel the lockfile still pins ({pin_path}, sha256 \
+                     {pin_sha})"
+                ),
+            );
+        }
+    }
+    let dest = project_root.join(uuid_dir_rel).join(&wheel_name);
+    if let Some(parent) = dest.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return policy.hard(
+                "vendor_prebuilt_write_failed",
+                format!("cannot create {}: {e}", parent.display()),
+            );
+        }
+    }
+    if let Err(e) = atomic_write_artifact(&dest, &archive.bytes).await {
+        return policy.hard(
+            "vendor_prebuilt_write_failed",
+            format!("cannot write the vendored wheel: {e}"),
+        );
+    }
+    let (platform_locked, platform_tags_display) = wheel_platform_from_filename(&wheel_name);
+    warnings.push(VendorWarning::new(
+        "vendor_prebuilt_downloaded",
+        format!(
+            "vendored the wheel for {base} from the patch service ({})",
+            archive.source_url
+        ),
+    ));
+    PypiServiceWheel::Used(Box::new(AcquiredWheel {
+        rel_wheel,
+        result: already_patched_result(base, &dest, &record.files),
+        artifact: Some(WheelArtifact {
+            file_name: wheel_name.clone(),
+            sha256_hex,
+            size: archive.bytes.len() as u64,
+        }),
+        wheel_name,
+        platform_locked,
+        platform_tags_display,
+    }))
 }
 
 /// Derive `(platform_locked, display)` from a wheel filename's trailing tag
@@ -2148,7 +2094,7 @@ mod tests {
         let err = detect_pypi_flavor(tmp.path(), None).await.unwrap_err();
         assert_eq!(err.0, "pypi_uv_no_lockfile");
         assert!(err.1.contains("uv lock"));
-        assert!(err.1.contains("socket-patch setup"));
+        assert!(err.1.contains("scan --mode agent"));
 
         let tmp = tempfile::tempdir().unwrap();
         touch(
@@ -2210,7 +2156,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let err = detect_pypi_flavor(tmp.path(), None).await.unwrap_err();
         assert_eq!(err.0, "pypi_no_requirements");
-        assert!(err.1.contains("socket-patch setup"));
+        assert!(err.1.contains("scan --mode agent"));
     }
 
     /// mkfifo(2) directly rather than shelling out to the `mkfifo` binary —
@@ -3232,6 +3178,21 @@ wheels = [
         let wheel_rel = format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}");
         assert_eq!(entry.artifact.path, wheel_rel);
         assert!(fx.root.join(&wheel_rel).exists());
+        assert_sdist_never_downloaded(&server).await;
+    }
+
+    /// The served sdist is refused from its reference alone: its bytes are
+    /// never requested.
+    async fn assert_sdist_never_downloaded(server: &wiremock::MockServer) {
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.iter().all(|r| r.method != wiremock::http::Method::GET),
+            "the sdist must not be downloaded: {:?}",
+            requests
+                .iter()
+                .map(|r| format!("{} {}", r.method, r.url.path()))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// `service` mode + an sdist (non-wheel) artifact hard-fails.
@@ -3264,6 +3225,7 @@ wheels = [
             matches!(outcome, VendorOutcome::Refused { .. }),
             "service mode must refuse a non-wheel artifact, got {outcome:?}"
         );
+        assert_sdist_never_downloaded(&server).await;
     }
 
     /// `service` mode + an integrity mismatch hard-fails (nothing written).

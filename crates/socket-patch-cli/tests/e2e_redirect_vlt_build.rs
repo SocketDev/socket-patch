@@ -29,6 +29,24 @@ fn hosted_leg(name: &'static str) -> Option<Leg> {
     Leg::start(SUITE, name)
 }
 
+/// v5 restores upstream pins without a saved lock fragment. The earliest
+/// vlt releases record npmjs URLs even with the harness registry configured;
+/// restore may omit that redundant slot or point it at the harness registry.
+/// All other bytes, including bystanders and line endings, must still match.
+fn assert_restored_lock(fx: &Fixture, before: &[u8]) {
+    let mut expected = String::from_utf8(before.to_vec()).unwrap();
+    let mut actual = String::from_utf8(lock_bytes(&fx.proj)).unwrap();
+    if fx.leg.version() <= VltVersion::zero(11) {
+        for target in &fx.svc.targets {
+            let bare = target.name.rsplit('/').next().unwrap();
+            let path = Registry::tarball_path(&target.name, bare, &target.version);
+            expected = expected.replace(&format!(",\"https://registry.npmjs.org{path}\""), "");
+            actual = actual.replace(&format!(",\"{}{path}\"", fx.reg.server.uri()), "");
+        }
+    }
+    assert_eq!(actual, expected, "rollback restores the upstream lock");
+}
+
 // ── drivers and fresh checkouts ───────────────────────────────────────────
 
 /// `scan --mode hosted --vex`: the lock pins the artifact (one preflight
@@ -167,7 +185,7 @@ async fn vlt_pinned_matrix_hosted_tamper_cold_eintegrity() {
 
 // ── rollback, rerun, heal ─────────────────────────────────────────────────
 
-/// Rollback restores the lock byte-for-byte, heals the patched store copy
+/// Rollback restores the upstream lock, heals the patched store copy
 /// (and nothing else), and the next `vlt install` is pristine.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
@@ -181,15 +199,14 @@ async fn vlt_pinned_matrix_hosted_rollback_byte_exact() {
     assert_eq!(state(&fx.proj, fx.t()), State::Patched);
     let ids = fx.store_ids(fx.t());
     let snap = fx.snapshot(&fx.proj, &ids);
-    let out = rollback(&fx.proj, &[]);
+    let out = fx.rollback(&[]);
     assert_eq!(out.code, 0, "{out}");
     let doc = out.json();
-    assert_eq!(
-        String::from_utf8_lossy(&lock_bytes(&fx.proj)),
-        String::from_utf8_lossy(&fx.lock_before),
-        "rollback restores vlt-lock.json byte-for-byte"
+    assert_restored_lock(&fx, &fx.lock_before);
+    assert!(
+        fx.ledger().is_none(),
+        "no hosted ledger is ever written (v5)"
     );
-    assert!(fx.ledger().is_none(), "the ledger is gone");
     fx.assert_advisory(&doc, &advisory_rolled_back(1));
     for id in &ids {
         assert!(!store_entry(&fx.proj, id).exists(), "{id} healed");
@@ -201,7 +218,8 @@ async fn vlt_pinned_matrix_hosted_rollback_byte_exact() {
 }
 
 /// A second scan of an already-patched, installed project changes
-/// nothing: the lock and ledger stay byte-identical and nothing is healed.
+/// nothing: the lock stays byte-identical, no ledger appears and nothing is
+/// healed.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_hosted_rerun_noop() {
@@ -213,11 +231,11 @@ async fn vlt_pinned_matrix_hosted_rerun_noop() {
     fx.vlt_ok(&fx.proj, &fx.leg.locked_install_args());
     assert_eq!(state(&fx.proj, fx.t()), State::Patched);
     let lock = lock_bytes(&fx.proj);
-    let ledger = fx.ledger();
+    assert!(fx.ledger().is_none(), "v5 hosted mode writes no ledger");
     let snap = fx.snapshot(&fx.proj, &[]);
     let doc = fx.scan(&[]);
     assert_eq!(lock_bytes(&fx.proj), lock, "rerun keeps the lock");
-    assert_eq!(fx.ledger(), ledger, "rerun keeps the ledger");
+    assert!(fx.ledger().is_none(), "the rerun writes no ledger either");
     fx.assert_advisory(&doc, &advisory_nothing_stale());
     snap.assert_same(&fx.snapshot(&fx.proj, &[]), "a healthy rerun");
     assert_eq!(state(&fx.proj, fx.t()), State::Patched);
@@ -461,7 +479,8 @@ async fn vlt_pinned_matrix_hosted_peer_workspace_instances() {
 /// From 1.0.8 vlt keys a root dependency with resolved peers by its peer
 /// context (`~peer.<16 hex>`), so `vlt install <peer>@<new>` re-keys the
 /// pinned node and carries the pin to the new DepID: a rescan leaves the
-/// ledger alone, and rollback restores the registry pin on the new DepID.
+/// lock alone (no ledger), and rollback restores the registry pin on the new
+/// DepID.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_hosted_peer_rekey_rollback() {
@@ -497,11 +516,10 @@ async fn vlt_pinned_matrix_hosted_peer_rekey_rollback() {
     assert_pinned(&fx.proj, &fx.svc, &t);
     assert_eq!(state(&fx.proj, &t), State::Patched);
     let lock = lock_bytes(&fx.proj);
-    let ledger = fx.ledger();
     fx.scan(&[]);
     assert_eq!(lock_bytes(&fx.proj), lock, "the rescan keeps the lock");
-    assert_eq!(fx.ledger(), ledger, "the rescan keeps the ledger");
-    let out = rollback(&fx.proj, &[]);
+    assert!(fx.ledger().is_none(), "v5 hosted mode writes no ledger");
+    let out = fx.rollback(&[]);
     assert_eq!(out.code, 0, "{out}");
     assert_not_pinned(&fx.proj, &t);
     fx.assert_advisory(&out.json(), &advisory_rolled_back(1));
@@ -633,23 +651,22 @@ async fn resave_install_rollback(name: &'static str, crlf: bool) {
     }
     if resave_drops_hosted_url(fx.leg.version()) {
         assert_url_dropped(&fx);
+        // The re-save kept the patched integrity but dropped the hosted
+        // URL: no lockfile pin is left for v5 rollback to discover (it keeps
+        // no ledger), so it finds no state and writes nothing; a re-scan
+        // re-pins the node and the rollback below restores it.
         let dropped = lock_bytes(&fx.proj);
-        let out = rollback(&fx.proj, &[]);
-        assert_eq!(out.code, 1, "{out}");
-        let failed = out.json()["hosted"]["failed"][0]["error"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        assert!(
-            failed.contains("drifted from the recorded redirect")
-                && failed.contains("re-run `socket-patch scan --mode hosted` and then roll back"),
-            "{out}"
+        let out = fx.rollback(&[]);
+        assert_eq!(
+            (out.code, out.json()["error"].as_str()),
+            (1, Some("Manifest not found")),
+            "a URL-less node is no hosted pin: {out}"
         );
         assert_eq!(lock_bytes(&fx.proj), dropped, "drift: no write");
         fx.scan(&[]);
     }
     assert_pinned(&fx.proj, &fx.svc, fx.t());
-    let out = rollback(&fx.proj, &[]);
+    let out = fx.rollback(&[]);
     assert_eq!(out.code, 0, "{out}");
     assert_not_pinned(&fx.proj, fx.t());
     let lock = read_lock(&fx.proj);
@@ -678,8 +695,10 @@ async fn vlt_pinned_matrix_hosted_resave_crlf_rollback() {
     resave_install_rollback("resave_crlf_rollback", true).await;
 }
 
-/// scan → `vlt update` → rollback: already reverted, and the patched store
-/// copy the update left behind is invalidated (r-vlt L3).
+/// scan → `vlt update` → rollback. Through 1.0.7 the update keeps the pin:
+/// rollback restores it and invalidates the patched store copy (r-vlt L3).
+/// From 1.0.8 the update re-resolves from the registry: no pin is left, so
+/// the ledger-free v5 rollback finds nothing to do and writes nothing.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_hosted_resave_update_rollback() {
@@ -705,17 +724,25 @@ async fn vlt_pinned_matrix_hosted_resave_update_rollback() {
     let lock = lock_bytes(&fx.proj);
     let ids = fx.store_ids(fx.t());
     let snap = fx.snapshot(&fx.proj, &ids);
-    let out = rollback(&fx.proj, &[]);
-    assert_eq!(out.code, 0, "{out}");
+    let out = fx.rollback(&[]);
     if drops {
+        // The update already put the lock back on the registry: v5 keeps no
+        // ledger, so no hosted pin (and no heal target) is left to find.
+        assert_eq!(
+            (out.code, out.json()["error"].as_str()),
+            (1, Some("Manifest not found")),
+            "already reverted: nothing to roll back: {out}"
+        );
         assert_eq!(
             lock_bytes(&fx.proj),
             lock,
             "already reverted: no lock write"
         );
-    } else {
-        assert_not_pinned(&fx.proj, fx.t());
+        fx.leg.ran();
+        return;
     }
+    assert_eq!(out.code, 0, "{out}");
+    assert_not_pinned(&fx.proj, fx.t());
     fx.assert_advisory(&out.json(), &advisory_rolled_back(1));
     for id in &ids {
         assert!(!store_entry(&fx.proj, id).exists(), "{id} invalidated");
@@ -747,13 +774,12 @@ async fn vlt_pinned_matrix_hosted_crlf_lock() {
     let co = fx.checkout("fresh-crlf");
     fx.vlt_ok_profile(&co, &fx.leg.locked_install_args(), "fresh-crlf");
     assert_eq!(state(&co, fx.t()), State::Patched);
-    let out = rollback(&fx.proj, &[]);
+    let out = fx.rollback(&[]);
     assert_eq!(out.code, 0, "{out}");
-    assert_eq!(
-        lock_bytes(&fx.proj),
-        crlf,
-        "rollback restores the CRLF lock"
-    );
+    assert_restored_lock(&fx, &crlf);
+    let co = fx.checkout("restored-crlf");
+    fx.vlt_ok_profile(&co, &fx.leg.locked_install_args(), "restored-crlf");
+    assert_eq!(state(&co, fx.t()), State::Pristine);
     fx.leg.ran();
 }
 
@@ -1166,22 +1192,25 @@ async fn vlt_pinned_matrix_hosted_idempotence() {
     let fx = Fixture::build(leg, Shape::left_pad()).await;
     get_hosted(&fx.proj, &fx.svc, UUID, &[]);
     let lock = lock_bytes(&fx.proj);
-    let ledger = fx.ledger();
+    assert!(fx.ledger().is_none(), "v5 hosted mode writes no ledger");
     get_hosted(&fx.proj, &fx.svc, UUID, &[]);
     assert_eq!(lock_bytes(&fx.proj), lock);
-    assert_eq!(fx.ledger(), ledger);
-    let out = rollback(&fx.proj, &[]);
+    assert!(fx.ledger().is_none());
+    let out = fx.rollback(&[]);
     assert_eq!(out.code, 0, "{out}");
-    assert_eq!(lock_bytes(&fx.proj), fx.lock_before);
+    assert_restored_lock(&fx, &fx.lock_before);
     assert!(fx.ledger().is_none());
     let files = package_files(&fx.proj);
-    let out = rollback(&fx.proj, &[]);
+    let out = fx.rollback(&[]);
     assert_eq!(
         (out.code, out.json()["error"].as_str()),
         (1, Some("Manifest not found")),
         "a second rollback finds no state: {out}"
     );
     assert_eq!(package_files(&fx.proj), files, "and writes nothing");
+    let co = fx.checkout("restored-idempotence");
+    fx.vlt_ok_profile(&co, &fx.leg.locked_install_args(), "restored-idempotence");
+    assert_eq!(state(&co, fx.t()), State::Pristine);
     fx.leg.ran();
 }
 
@@ -1222,9 +1251,11 @@ async fn vlt_pinned_matrix_hosted_manifestless_vex() {
     fx.leg.ran();
 }
 
-/// The TS twin's golden output for `basic` (the server's PR-flow lock and
-/// ledger) is reverted by SP `rollback`, and `vlt ci` then installs the
-/// registry bytes.
+/// The TS twin's golden output for `basic` (the server's PR-flow lock, its
+/// pin on `patch.socket.dev`) is restored by SP `rollback` to its upstream
+/// registry entry — byte-identical to the input — and `vlt ci` then
+/// installs the registry bytes. The pre-v5 ledger the server wrote beside it
+/// is never replayed, only retired.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_hosted_ts_written_lock() {
@@ -1273,12 +1304,21 @@ async fn vlt_pinned_matrix_hosted_ts_written_lock() {
         &proj.join(".socket/vendor/redirect-state.json"),
         serde_json::to_vec_pretty(&ledger).unwrap(),
     );
-    let out = rollback(&proj, &[]);
+    let out = rollback_upstream(&proj, &reg.url(), None, &[]);
     assert_eq!(out.code, 0, "{out}");
+    assert_eq!(
+        out.json()["hosted"]["reverted"],
+        json!(["pkg:npm/left-pad@1.3.0"]),
+        "{out}"
+    );
     assert_eq!(
         String::from_utf8_lossy(&lock_bytes(&proj)),
         input,
-        "SP reverts the TS-written lock to its input"
+        "SP restores the TS-written lock to its input"
+    );
+    assert!(
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "the pre-v5 ledger is retired once no hosted pin remains"
     );
     leg.vlt_ok(&proj, &["ci"]);
     let lp = reg.pkg(LP.0, LP.1);
@@ -1379,7 +1419,7 @@ async fn vlt_pinned_matrix_hosted_optional_dependency_heal() {
     }
     assert_eq!(lock_bytes(&fx.proj), before_ci, "ci keeps the lock");
     let snap = fx.snapshot(&fx.proj, &lp_ids);
-    let out = rollback(&fx.proj, &[]);
+    let out = fx.rollback(&[]);
     assert_eq!(out.code, 0, "{out}");
     snap.assert_same(
         &fx.snapshot(&fx.proj, &lp_ids),
@@ -1513,7 +1553,10 @@ async fn vlt_pinned_matrix_hosted_then_vendored_optional_takeover() {
             hidden_lock_exists(&proj),
             "{kind}: the warm tree has a hidden lock"
         );
-        let out = socket_api(&proj, &svc, &["scan", "--mode", "vendored"], &[]);
+        // The hosted pin sits on the mock patch service: name its origin so
+        // the takeover classifies it (v5 discovers hosted pins from the lock
+        // alone), and restore its upstream entry from the harness registry.
+        let out = vendored_over_hosted(&proj, &svc, &reg);
         assert_eq!(out.code, 0, "{kind}: {out}");
         let doc = out.json();
         let detail = event_reason(&doc, ADVISORY);
@@ -1566,6 +1609,36 @@ async fn vlt_pinned_matrix_hosted_then_vendored_optional_takeover() {
         }
     }
     leg.ran();
+}
+
+/// `scan --mode vendored` over a hosted pin on the mock patch service:
+/// `--patch-server-url` names its origin (v5 recognizes no other hosted
+/// host) and `SOCKET_NPM_REGISTRY` points the takeover's upstream restore
+/// at the harness registry.
+fn vendored_over_hosted(proj: &Path, svc: &PatchService, reg: &Registry) -> SocketOut {
+    let cwd = proj.to_str().unwrap().to_string();
+    let uri = svc.uri();
+    socket(
+        proj,
+        &[
+            "scan",
+            "--mode",
+            "vendored",
+            "--json",
+            "--yes",
+            "--cwd",
+            &cwd,
+            "--api-url",
+            &uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "sktsec_placeholder_value_for_tests_api",
+            "--patch-server-url",
+            &uri,
+        ],
+        &[("SOCKET_NPM_REGISTRY", &reg.url())],
+    )
 }
 
 fn optional_only_kind(leg: &Leg) -> OptionalOnly {

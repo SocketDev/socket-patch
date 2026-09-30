@@ -145,7 +145,7 @@ python3 scripts/backtest-poetry.py \
   --cli /tmp/socket-patch-under-test \
   --cli-revision "$(git rev-parse --short HEAD)" \
   --output /tmp/socket-patch-poetry-backtest \
-  --modes hosted vendored agent agent-oot setup \
+  --modes hosted vendored agent agent-oot \
   --shapes direct populated crlf pep621
 python3 scripts/backtest-poetry.py --render-doc-table /tmp/socket-patch-poetry-backtest/summary.json
 ```
@@ -162,9 +162,8 @@ verifies, Poetry's own relock keeps the source, and `rollback` restores every
 byte and clears the ledgers. Shapes: `direct` (the committed native fixture),
 `populated` (legacy locks with real upstream hashes filled in — today's PyPI
 JSON API leaves old Poetry's `[metadata.files]` empty), `crlf`, and `pep621`
-(2.x `[project]` tables with `package-mode = false`). Modes `agent-oot`
-(Poetry's default out-of-tree virtualenv via `poetry run`) and `setup`
-(`socket-patch setup` on a Poetry project, then `poetry lock`) are
+(2.x `[project]` tables with `package-mode = false`). Mode `agent-oot`
+(Poetry's default out-of-tree virtualenv via `poetry run`) is
 informational.
 
 Rust coverage of the rewriters: `cargo test -p socket-patch-core --lib

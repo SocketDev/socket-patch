@@ -49,14 +49,14 @@ export const model = "claude-opus-5";
 // feature gates, and naming one (`cargo`, `golang`, `maven`, …) makes cargo
 // abort with "none of the selected packages contains these features". The
 // default feature set is already exactly what we want here: all nine
-// ecosystems, minus the cfg-gated `docker-e2e`/`setup-e2e` suites
+// ecosystems, minus the cfg-gated `docker-e2e` suites
 // that `--all-features` would drag in.
 const FEATURES = "";
 
 export default function render(ctx: FileCtx): string {
   const featureFlag = FEATURES ? ` --features ${FEATURES}` : "";
   const isHarness =
-    /(^|\/)(common|setup_matrix_common|helpers?|support|fixtures?)(\/|$)/.test(
+    /(^|\/)(common|helpers?|support|fixtures?)(\/|$)/.test(
       ctx.relInCrate,
     ) || ctx.name === "mod.rs";
 

@@ -7,7 +7,8 @@ def _resolve_binary():
     """Locate the bundled socket-patch binary, or return ``None``.
 
     Single source of truth for binary discovery, reused by both ``main()`` (the
-    console-script entry point) and the ``socket_patch_hook`` startup hook. Never
+    console-script entry point) and the legacy ``socket_patch_hook`` startup hook
+    (no longer published since v5, but older installs still import this). Never
     raises: returns ``None`` if the binary can't be found, so callers that run at
     interpreter startup stay safe.
     """

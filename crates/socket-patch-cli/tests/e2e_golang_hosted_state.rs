@@ -83,6 +83,20 @@ async fn mount_hosted_grant(server: &MockServer) {
         .await;
 }
 
+/// Serve Go's checksum database lookup for the upstream module (the
+/// `SOCKET_GOSUMDB_URL` override the hosted -> upstream restore reads): the
+/// two go.sum lines of `UPSTREAM_SUM`, so the restore re-derives exactly
+/// the pair the hosted rewrite pruned.
+async fn mount_sumdb(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path(format!("/lookup/{UMOD}@{UVER}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "12345\n{UPSTREAM_SUM}\ngo.sum database tree\n12345\nAAAA\n"
+        )))
+        .mount(server)
+        .await;
+}
+
 fn get_hosted(consumer: &Path, server: &MockServer, modcache: &Path) -> serde_json::Value {
     let (code, stdout, stderr) = common::run_with_env(
         consumer,
@@ -311,8 +325,10 @@ fn pristine_module(modcache: &Path) {
     std::fs::write(module_dir.join("lib.go"), PRISTINE_LIB).unwrap();
 }
 
-/// Hosted `rollback` puts the pruned upstream go.sum pair back where go
-/// sorts it, so go.mod and go.sum return byte for byte.
+/// Hosted `rollback` drops the hosted `replace` and puts the pruned upstream
+/// go.sum pair back where go sorts it -- re-derived from the (mocked)
+/// checksum database, no ledger involved -- so go.mod and go.sum return
+/// byte for byte. Offline, the pin is refused and nothing is written.
 #[tokio::test(flavor = "multi_thread")]
 async fn hosted_rollback_restores_go_sum_byte_for_byte() {
     let tmp = tempfile::tempdir().unwrap();
@@ -325,22 +341,62 @@ async fn hosted_rollback_restores_go_sum_byte_for_byte() {
     mount_hosted_grant(&server).await;
     let env = get_hosted(&consumer, &server, &modcache);
     assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    assert!(
+        !consumer.join(".socket/vendor/redirect-state.json").exists(),
+        "hosted mode keeps no ledger: go.mod/go.sum are the record"
+    );
+    let wired_mod = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
+    let wired_sum = std::fs::read_to_string(consumer.join("go.sum")).unwrap();
+    assert_ne!(wired_mod, go_mod, "precondition: go.mod is hosted-wired");
 
-    let (code, stdout, stderr) = common::run_with_env(
-        &consumer,
-        &[
+    let rollback = |extra: &[&str], env: &[(&str, &str)]| {
+        let mut args = vec![
             "rollback",
             "--json",
             "--yes",
-            "--offline",
             "--cwd",
             consumer.to_str().unwrap(),
-        ],
-        &[("GOMODCACHE", modcache.to_str().unwrap())],
+        ];
+        args.extend_from_slice(extra);
+        let mut env_full = vec![("GOMODCACHE", modcache.to_str().unwrap())];
+        env_full.extend_from_slice(env);
+        common::run_with_env(&consumer, &args, &env_full)
+    };
+
+    let (code, stdout, stderr) = rollback(&["--offline"], &[]);
+    assert_eq!(
+        code, 1,
+        "offline must refuse\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(doc["hosted"]["failed"][0]["purl"], UPURL, "{doc}");
+    assert!(
+        doc["hosted"]["failed"][0]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("this run is offline") && e.contains("go.mod")),
+        "{doc}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(consumer.join("go.mod")).unwrap(),
+        wired_mod
+    );
+    assert_eq!(
+        std::fs::read_to_string(consumer.join("go.sum")).unwrap(),
+        wired_sum
+    );
+
+    mount_sumdb(&server).await;
+    let sumdb = server.uri();
+    let (code, stdout, stderr) = rollback(&[], &[("SOCKET_GOSUMDB_URL", sumdb.as_str())]);
     assert_eq!(
         code, 0,
         "rollback failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        doc["hosted"]["reverted"],
+        serde_json::json!([UPURL]),
+        "{doc}"
     );
     assert_eq!(
         std::fs::read_to_string(consumer.join("go.mod")).unwrap(),
@@ -352,10 +408,11 @@ async fn hosted_rollback_restores_go_sum_byte_for_byte() {
     );
 }
 
-/// hosted → vendored takeover: vendoring must first unwind the hosted
-/// redirect (replace, socket go.sum lines, pruned upstream pair, ledger
-/// record), so the project is fully vendored — never a vendored go.mod
-/// beside a redirect ledger that still claims the module.
+/// hosted → vendored takeover: vendoring must first restore the hosted pin
+/// to its upstream entry (drop the hosted replace and the socket go.sum
+/// lines, re-derive the pruned upstream pair from the checksum database),
+/// so the project is fully vendored — never a vendored go.mod beside a
+/// hosted pin. No ledger is involved at any point.
 #[tokio::test(flavor = "multi_thread")]
 async fn vendored_takeover_of_hosted_module_unwinds_the_redirect() {
     let tmp = tempfile::tempdir().unwrap();
@@ -370,11 +427,14 @@ async fn vendored_takeover_of_hosted_module_unwinds_the_redirect() {
     assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
     let ledger_path = consumer.join(".socket/vendor/redirect-state.json");
     assert!(
-        std::fs::read_to_string(&ledger_path)
+        std::fs::read_to_string(consumer.join("go.mod"))
             .unwrap()
-            .contains(UPURL),
+            .contains("gopatch"),
         "precondition: the module is hosted-redirected"
     );
+    assert!(!ledger_path.exists(), "hosted mode keeps no ledger");
+    mount_sumdb(&server).await;
+    let sumdb = server.uri();
 
     let socket = consumer.join(".socket");
     std::fs::create_dir_all(socket.join("blobs")).unwrap();
@@ -400,16 +460,15 @@ async fn vendored_takeover_of_hosted_module_unwinds_the_redirect() {
     .unwrap();
     std::fs::write(socket.join("blobs").join(&after), PATCHED_LIB).unwrap();
 
+    // Online: the takeover's upstream restore consults the (mocked)
+    // checksum database; the patch itself comes from the local manifest.
     let (code, stdout, stderr) = common::run_with_env(
         &consumer,
+        &["vendor", "--json", "--cwd", consumer.to_str().unwrap()],
         &[
-            "vendor",
-            "--json",
-            "--offline",
-            "--cwd",
-            consumer.to_str().unwrap(),
+            ("GOMODCACHE", modcache.to_str().unwrap()),
+            ("SOCKET_GOSUMDB_URL", sumdb.as_str()),
         ],
-        &[("GOMODCACHE", modcache.to_str().unwrap())],
     );
     assert_eq!(
         code, 0,
@@ -432,9 +491,5 @@ async fn vendored_takeover_of_hosted_module_unwinds_the_redirect() {
         go_sum,
         "go.sum is back to its pre-redirect bytes"
     );
-    let ledger = std::fs::read_to_string(&ledger_path).unwrap_or_default();
-    assert!(
-        !ledger.contains(UPURL),
-        "the redirect ledger no longer claims the module: {ledger}"
-    );
+    assert!(!ledger_path.exists(), "no hosted ledger is ever written");
 }

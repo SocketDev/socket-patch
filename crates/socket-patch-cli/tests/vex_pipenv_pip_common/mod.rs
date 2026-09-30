@@ -16,14 +16,17 @@
 //! mod vex_pipenv_pip_common;
 //! ```
 //!
-//! Every project is wired by the REAL CLI, not by hand: `scan --redirect`
+//! Every project is wired by the REAL CLI, not by hand: `scan --mode hosted`
 //! (hosted) or `scan --vendor --vendor-source build` (vendored) runs against
 //! a wiremock stand-in for the Socket API, with the package's pristine
 //! install in a fabricated `.venv` for the vendored build. The wired tree is
 //! snapshotted once per (flavor, mode) and every cell restores the snapshot
 //! into its own temp dir, then DELETES what the cell says to delete
-//! (`.socket/manifest.json`, the ledgers `.socket/vendor/state.json` /
-//! `.socket/vendor/redirect-state.json`, the venv) before running VEX.
+//! (`.socket/manifest.json`, the vendor ledger `.socket/vendor/state.json`,
+//! the venv) before running VEX. v5 hosted mode keeps no ledger at all —
+//! its only state is the wiring — so for hosted cells "ledgers kept" and
+//! "ledgers gone" are the same checkout, and an offline hosted run has no
+//! local record (`record_unavailable`).
 //!
 //! Hermetic: no network (the API is wiremock; `--offline` runs assert zero
 //! requests), no real Python / Pipenv / pip needed. The package is a
@@ -134,7 +137,24 @@ impl Mode {
         }
     }
 
-    /// The ledger file this mode's wiring run writes.
+    /// Whether this mode's wiring run writes a ledger: vendored keeps
+    /// `.socket/vendor/state.json`; v5 hosted keeps none (its state is the
+    /// wiring itself).
+    pub fn has_ledger(self) -> bool {
+        self == Mode::Vendored
+    }
+
+    /// The `keep` variants worth running for this mode: hosted has no
+    /// ledger, so [`LEDGERS_ONLY`] would only repeat [`NOTHING`].
+    pub fn ledger_keeps(self) -> &'static [Keep] {
+        match self {
+            Mode::Hosted => &[NOTHING],
+            Mode::Vendored => &[NOTHING, LEDGERS_ONLY],
+        }
+    }
+
+    /// The ledger file of this mode: the vendor ledger the vendored wiring
+    /// run writes, or the PRE-v5 hosted ledger v5 hosted mode never writes.
     pub fn ledger(self) -> &'static str {
         match self {
             Mode::Hosted => ".socket/vendor/redirect-state.json",
@@ -436,7 +456,7 @@ pub fn run_scan(
         cwd.to_str().unwrap(),
     ];
     match mode {
-        Mode::Hosted => args.push("--redirect"),
+        Mode::Hosted => args.push("--mode=hosted"),
         Mode::Vendored => args.extend(["--vendor", "--vendor-source", "build"]),
     }
     args.extend_from_slice(extra);
@@ -611,7 +631,8 @@ pub fn wired(flavor: &Flavor, mode: Mode) -> Arc<Wired> {
     });
     let what = wired.what();
     // Anti-vacuity: the run really rewired a project file, into the mode's
-    // reference shape, and left its ledger + artifact behind.
+    // reference shape, and (vendored) left its ledger + artifact behind —
+    // while v5 hosted mode left NO ledger (its state is the wiring alone).
     let changed = wired.changed_files();
     assert!(!changed.is_empty(), "{what}: nothing was rewired");
     let wiring_text: String = changed.iter().map(|rel| text(&wired.files[*rel])).collect();
@@ -632,9 +653,10 @@ pub fn wired(flavor: &Flavor, mode: Mode) -> Arc<Wired> {
             );
         }
     }
-    assert!(
+    assert_eq!(
         wired.files.contains_key(mode.ledger()),
-        "{what}: the {} ledger must be written: {:?}",
+        mode.has_ledger(),
+        "{what}: the {} ledger must be written iff the mode keeps one: {:?}",
         mode.ledger(),
         wired.files.keys().collect::<Vec<_>>()
     );
@@ -715,7 +737,8 @@ pub fn assert_no_statement(out: &VexOutcome, what: &str) {
 
 /// a) no manifest, no ledgers, online → attested from the wiring alone;
 /// vex never writes the manifest or a ledger. Also the committed `.socket/`
-/// (ledger, plus the wheel when vendored) baseline, offline.
+/// baseline, offline: vendored (ledger + wheel) attests from it; hosted
+/// commits no local record, so offline it is `record_unavailable`.
 pub fn a_wiring_only_checkout_attests_online(flavors: &[Flavor]) {
     for (flavor, mode) in cells(flavors) {
         let wired = wired(&flavor, mode);
@@ -753,7 +776,12 @@ pub fn a_wiring_only_checkout_attests_online(flavors: &[Flavor]) {
             offline: true,
             ..vex_run(None)
         };
-        assert_ok_attested(&vex(&cwd2, &run), mode, &format!("{what} committed"));
+        let out = vex(&cwd2, &run);
+        let what = format!("{what} committed");
+        match mode {
+            Mode::Vendored => assert_ok_attested(&out, mode, &what),
+            Mode::Hosted => assert_omitted(&out, "record_unavailable", &what),
+        }
     }
 }
 
@@ -807,8 +835,10 @@ pub fn b_no_local_record_is_record_unavailable(flavors: &[Flavor]) {
     }
 }
 
-/// c) ledger present, manifest absent → attests OFFLINE from the ledger
-/// record, verified and `--no-verify`.
+/// c) everything the wiring run left, manifest absent, OFFLINE (verified
+/// and `--no-verify`). Vendored: the vendor ledger's record attests. Hosted:
+/// v5 left no local record, so offline is `record_unavailable` — and the
+/// same checkout online attests from the API.
 pub fn c_ledger_without_manifest_attests_offline(flavors: &[Flavor]) {
     for (flavor, mode) in cells(flavors) {
         let wired = wired(&flavor, mode);
@@ -822,20 +852,31 @@ pub fn c_ledger_without_manifest_attests_offline(flavors: &[Flavor]) {
                 no_verify,
                 ..vex_run(Some(&api))
             };
-            assert_ok_attested(
-                &vex(&cwd, &run),
-                mode,
-                &format!("{what} no_verify={no_verify}"),
-            );
+            let out = vex(&cwd, &run);
+            let what = format!("{what} no_verify={no_verify}");
+            match mode {
+                Mode::Vendored => assert_ok_attested(&out, mode, &what),
+                Mode::Hosted => assert_omitted(&out, "record_unavailable", &what),
+            }
         }
         api.assert_no_requests();
+        if mode == Mode::Hosted {
+            let api = api_with(mode.uuid(), PURL);
+            assert_ok_attested(
+                &vex(&cwd, &vex_run(Some(&api))),
+                mode,
+                &format!("{what} online"),
+            );
+        }
     }
 }
 
-/// d) wiring reverted to the registry while the ledger (+ artifact)
-/// remain → `redirect_unwired` / `vendor_unwired`, `--no-verify` included,
-/// online too (the API would vouch for the uuid); with the manifest back as
-/// well nothing is attested; with the ledger gone nothing is discovered.
+/// d) wiring reverted to the registry. Vendored, while the ledger (+
+/// artifact) remain → `vendor_unwired`, `--no-verify` included, online too
+/// (the API would vouch for the uuid); with the manifest back as well
+/// nothing is attested; with the ledger gone nothing is discovered. Hosted
+/// (no ledger in v5): the reverted wiring was the only hosted state, so
+/// nothing is discovered at all and the API is never asked.
 pub fn d_reverted_wiring_is_unwired_even_with_no_verify(flavors: &[Flavor]) {
     for (flavor, mode) in cells(flavors) {
         let wired = wired(&flavor, mode);
@@ -856,11 +897,15 @@ pub fn d_reverted_wiring_is_unwired_even_with_no_verify(flavors: &[Flavor]) {
                 no_verify,
                 ..vex_run(Some(&api))
             };
-            assert_omitted(
-                &vex(&cwd, &run),
-                mode.unwired(),
-                &format!("{what} offline={offline} no_verify={no_verify}"),
-            );
+            let out = vex(&cwd, &run);
+            let what = format!("{what} offline={offline} no_verify={no_verify}");
+            match mode {
+                Mode::Vendored => assert_omitted(&out, mode.unwired(), &what),
+                Mode::Hosted => assert_nothing_discovered(&out, &what),
+            }
+        }
+        if mode == Mode::Hosted {
+            api.assert_no_requests();
         }
         // A patched install left behind does not revive the claim either.
         install(&cwd, ".venv", PATCHED);
@@ -927,12 +972,12 @@ pub fn tamper_wheel(cwd: &Path) {
 }
 
 /// e) tampered installed tree (hosted) / tampered wheel member (vendored)
-/// → omitted, with and without the ledger; `--no-verify` is the documented
-/// opt-out of hashing (the wiring / record gates still run).
+/// → omitted, with and without the (vendor) ledger; `--no-verify` is the
+/// documented opt-out of hashing (the wiring / record gates still run).
 pub fn e_tampered_evidence_is_omitted(flavors: &[Flavor]) {
     for (flavor, mode) in cells(flavors) {
         let wired = wired(&flavor, mode);
-        for keep in [NOTHING, LEDGERS_ONLY] {
+        for &keep in mode.ledger_keeps() {
             let what = format!("{} ledgers={}", wired.what(), keep.ledgers);
             let (_tmp, cwd) = fresh();
             wired.restore(&cwd, keep);
@@ -959,17 +1004,16 @@ pub fn e_tampered_evidence_is_omitted(flavors: &[Flavor]) {
 
 /// f) the Socket patch host swapped for a look-alike in every wired file
 /// (the uuid-shaped segments — grant token + patch uuid — are all still
-/// there): with no ledger nothing is discovered and the API is never asked;
-/// with the stale ledger kept the verified run still omits it (no
-/// discovered pin, nothing installed), and a patched install is not enough
-/// either once the ledger is gone.
+/// there): nothing is discovered and the API is never asked, and a patched
+/// install is not enough either (v5 hosted keeps no ledger that could vouch
+/// for a host outside the allowlist).
 pub fn f_hosted_uuid_on_a_foreign_host_is_not_a_reference(flavors: &[Flavor]) {
     for flavor in flavors.iter().filter(|f| f.hosted) {
         let wired = wired(flavor, Mode::Hosted);
         let what = wired.what();
-        for keep in [NOTHING, LEDGERS_ONLY] {
+        {
             let (_tmp, cwd) = fresh();
-            wired.restore(&cwd, keep);
+            wired.restore(&cwd, NOTHING);
             for rel in wired.changed_files() {
                 let spoofed = text(&wired.files[rel]).replace(
                     "https://patch.socket.dev/",
@@ -980,22 +1024,12 @@ pub fn f_hosted_uuid_on_a_foreign_host_is_not_a_reference(flavors: &[Flavor]) {
             }
             let api = api_with(HOSTED_UUID, PURL);
             let out = vex(&cwd, &vex_run(Some(&api)));
-            let what = format!("{what} ledgers={}", keep.ledgers);
-            if keep.ledgers {
-                // The redirect ledger's own evidence (a host outside the
-                // discovery allowlist falls back to the ledger's recorded
-                // edit file still naming the uuid — the `--patch-server-url`
-                // escape hatch), but without a discovered integrity pin or
-                // an installed tree there is nothing to verify.
-                assert_omitted(&out, "package_not_found", &what);
-            } else {
-                assert_nothing_discovered(&out, &what);
-                api.assert_no_requests();
-                install(&cwd, ".venv", PATCHED);
-                let out = vex(&cwd, &vex_run(Some(&api)));
-                assert_nothing_discovered(&out, &format!("{what} installed"));
-                api.assert_no_requests();
-            }
+            assert_nothing_discovered(&out, &what);
+            api.assert_no_requests();
+            install(&cwd, ".venv", PATCHED);
+            let out = vex(&cwd, &vex_run(Some(&api)));
+            assert_nothing_discovered(&out, &format!("{what} installed"));
+            api.assert_no_requests();
         }
     }
 }
@@ -1096,7 +1130,7 @@ pub fn g_hosted_installed_tree_states(flavors: &[Flavor]) {
     for flavor in flavors.iter().filter(|f| f.hosted) {
         let wired = wired(flavor, Mode::Hosted);
         for (bytes, expect) in [(PATCHED, None), (PRISTINE, Some("not_applied"))] {
-            for keep in [NOTHING, LEDGERS_ONLY] {
+            for &keep in Mode::Hosted.ledger_keeps() {
                 let what = format!(
                     "{} installed={expect:?} ledgers={}",
                     wired.what(),
@@ -1193,16 +1227,16 @@ pub fn g_vendored_attests_over_a_pristine_venv_with_a_warning(flavors: &[Flavor]
     }
 }
 
-/// `scan --vendor --detached --vex` never writes a manifest; its own VEX
+/// `scan --vendor --vex` never writes a manifest; its own VEX
 /// and a later standalone `vex` both attest (ledger present, then gone).
 pub fn embedded_detached_vendor_scan_attests_without_a_manifest(flavors: &[Flavor]) {
     for flavor in flavors.iter().filter(|f| f.vendored) {
         let (_tmp, cwd) = fresh();
-        wire_into(&cwd, flavor, Mode::Vendored, &["--detached"]);
-        let what = format!("{} detached", flavor.label);
+        wire_into(&cwd, flavor, Mode::Vendored, &[]);
+        let what = format!("{} vendored", flavor.label);
         assert!(
             !cwd.join(".socket/manifest.json").exists(),
-            "{what}: detached writes no manifest"
+            "{what}: vendored mode writes no manifest"
         );
         let run = VexRun {
             offline: true,
@@ -1219,7 +1253,7 @@ pub fn embedded_detached_vendor_scan_attests_without_a_manifest(flavors: &[Flavo
     }
 }
 
-/// A CI re-run of `scan --redirect --vex` / `scan --vendor --vex` on a
+/// A CI re-run of `scan --mode hosted --vex` / `scan --vendor --vex` on a
 /// checkout whose `.socket/` was never committed (the wiring is already
 /// there): the embedded document still attests, and the re-scan leaves the
 /// wired lockfile byte-identical.
@@ -1260,12 +1294,18 @@ pub fn embedded_rescan_of_a_manifest_less_checkout(flavors: &[Flavor]) {
 /// `apply --vex` and `vendor --vex` on a manifest-less wired checkout (CI:
 /// install, then `socket-patch apply --vex out.json`): the patches the
 /// wiring names are attested although there is no manifest to apply —
-/// offline from the ledgers, and online from the API with no ledger.
+/// offline from the vendor ledger, and online from the API with no ledger.
+/// Hosted: `apply --vex` only, online (v5 keeps no local hosted record; and
+/// `vendor` on a hosted checkout is the eject flow, not a no-op).
 pub fn embedded_apply_and_vendor_vex_attest_a_manifest_less_checkout(flavors: &[Flavor]) {
     for (flavor, mode) in cells(flavors) {
         let wired = wired(&flavor, mode);
-        for via in [VexVia::Apply, VexVia::Vendor] {
-            for keep in [LEDGERS_ONLY, NOTHING] {
+        let vias: &[VexVia] = match mode {
+            Mode::Hosted => &[VexVia::Apply],
+            Mode::Vendored => &[VexVia::Apply, VexVia::Vendor],
+        };
+        for &via in vias {
+            for &keep in mode.ledger_keeps().iter().rev() {
                 let what = format!("{} {via:?} ledgers={}", wired.what(), keep.ledgers);
                 let (_tmp, cwd) = fresh();
                 wired.restore(&cwd, keep);

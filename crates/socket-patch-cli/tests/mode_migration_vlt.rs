@@ -97,10 +97,55 @@ fn vendor_cmd(proj: &Path, extra: &[&str]) -> SocketOut {
     socket(proj, &args, &[])
 }
 
+/// `<head> … --json --yes --cwd <dir> --api-url/--org/--api-token <svc>
+/// --patch-server-url <svc> <extra>` with `SOCKET_NPM_REGISTRY` = the
+/// harness registry. v5 keeps no hosted ledger: a hosted pin on the mock
+/// patch service is only recognized under `--patch-server-url`, and every
+/// unwind of it (rollback, remove, a vendored takeover) restores its
+/// upstream entry from the npm registry — here the harness registry.
+fn api_upstream(fx: &Fixture, dir: &Path, head: &[&str], extra: &[&str]) -> SocketOut {
+    let cwd = cwd_args(dir);
+    let uri = fx.svc.uri();
+    let mut args: Vec<&str> = head.to_vec();
+    args.extend([
+        "--json",
+        "--yes",
+        "--cwd",
+        &cwd,
+        "--api-url",
+        &uri,
+        "--org",
+        ORG,
+        "--api-token",
+        "sktsec_placeholder_value_for_tests_api",
+        "--patch-server-url",
+        &uri,
+    ]);
+    args.extend_from_slice(extra);
+    socket(dir, &args, &[("SOCKET_NPM_REGISTRY", &fx.reg.url())])
+}
+
+/// `vendor` over a (possibly) hosted project: no `--offline`, since the
+/// takeover restores the hosted pin's upstream entry first.
+fn vendor_upstream(fx: &Fixture, dir: &Path, extra: &[&str]) -> SocketOut {
+    api_upstream(fx, dir, &["vendor"], extra)
+}
+
+/// `rollback` of everything `dir` holds, hosted pins restored upstream.
+fn rollback_all(fx: &Fixture, dir: &Path, extra: &[&str]) -> SocketOut {
+    let svc = fx.svc.uri();
+    rollback_upstream(dir, &fx.reg.url(), Some(&svc), extra)
+}
+
+/// `remove <purl>` with hosted pins restored upstream.
+fn remove_upstream(fx: &Fixture, dir: &Path, purl: &str) -> SocketOut {
+    api_upstream(fx, dir, &["remove", purl], &[])
+}
+
 fn vendored_scan(fx: &Fixture, dir: &Path, extra: &[&str]) -> SocketOut {
     let mut args = vec!["--vendor-source", "build"];
     args.extend_from_slice(extra);
-    socket_api(dir, &fx.svc, &["scan", "--mode", "vendored"], &args)
+    api_upstream(fx, dir, &["scan", "--mode", "vendored"], &args)
 }
 
 fn hosted_scan(fx: &Fixture, dir: &Path, extra: &[&str]) -> SocketOut {
@@ -134,33 +179,12 @@ fn assert_pure_hosted(fx: &Fixture, dir: &Path, t: &PatchTarget) {
         !dir.join(format!(".socket/vendor/npm/{}", t.uuid)).exists(),
         "no vendored artifact left"
     );
-    let ledger: Value = serde_json::from_slice(
-        &std::fs::read(dir.join(".socket/vendor/redirect-state.json")).unwrap(),
-    )
-    .unwrap();
-    let before: Value = serde_json::from_slice(&fx.lock_before).unwrap();
-    let id = node_id(&before, &t.name, &t.version);
-    let original = ledger["edits"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| {
-            e["kind"] == "redirect_vlt_lock_node"
-                && e["original"]
-                    .as_str()
-                    .is_some_and(|o| o.starts_with(&format!("\"{id}\"")))
-        })
-        .and_then(|e| e["original"].as_str())
-        .unwrap_or_else(|| panic!("a ledger edit for {id}: {ledger:#}"))
-        .to_string();
-    let pristine = node_line(&String::from_utf8_lossy(&fx.lock_before), &id)
-        .unwrap()
-        .trim()
-        .trim_end_matches(',')
-        .to_string();
-    assert_eq!(
-        original, pristine,
-        "the ledger original is the pristine registry line"
+    // v5: no hosted ledger — the lock pin is the whole hosted state (the
+    // vendored takeover restored the upstream entry before pinning, which
+    // the unscoped rollback's byte-exact pristine lock proves).
+    assert!(
+        !dir.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode writes no redirect ledger"
     );
 }
 
@@ -181,11 +205,8 @@ fn assert_pure_vendored(dir: &Path, t: &PatchTarget) {
         "no hosted URL left: {text}"
     );
     assert!(
-        !dir.join(".socket/vendor/redirect-state.json").exists()
-            || !std::fs::read_to_string(dir.join(".socket/vendor/redirect-state.json"))
-                .unwrap()
-                .contains(&t.purl()),
-        "the redirect record is gone"
+        !dir.join(".socket/vendor/redirect-state.json").exists(),
+        "no hosted ledger (v5)"
     );
 }
 
@@ -198,7 +219,7 @@ fn assert_fresh(fx: &Fixture, dir: &Path, t: &PatchTarget, want: State, name: &s
 }
 
 fn assert_unscoped_rollback_pristine(fx: &Fixture, dir: &Path, name: &str) {
-    let out = rollback(dir, &[]);
+    let out = rollback_all(fx, dir, &[]);
     assert_eq!(out.code, 0, "{name}: {out}");
     assert_eq!(
         String::from_utf8_lossy(&lock_bytes(dir)),
@@ -239,9 +260,9 @@ async fn two_target_fixture(leg: Leg) -> Fixture {
 // ── 1–2. takeovers ────────────────────────────────────────────────────────
 
 /// Vendored → hosted through `scan --mode hosted` and through `get <uuid>
-/// --mode hosted`: the vendored entry, artifact and wiring go, the ledger
-/// original is the pristine registry line, a fresh checkout is patched;
-/// the unscoped rollback restores the pristine lock.
+/// --mode hosted`: the vendored entry, artifact and wiring go, no hosted
+/// ledger is written, a fresh checkout is patched; the unscoped rollback
+/// restores the pristine lock (the hosted pin back to its upstream entry).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_migration_vendored_then_hosted() {
@@ -281,9 +302,9 @@ async fn vlt_pinned_matrix_migration_vendored_then_hosted() {
 }
 
 /// Hosted → vendored through `scan --mode vendored` and through `vendor`
-/// (a staged manifest): the redirect record goes, the lock is vendored,
-/// fresh checkouts are patched, and `vendor --revert` restores the
-/// pristine lock.
+/// (a staged manifest): the takeover restores the hosted pin's upstream
+/// entry first, the lock is vendored, fresh checkouts are patched, and
+/// `vendor --revert` restores the pristine (upstream) lock.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_migration_hosted_then_vendored() {
@@ -300,7 +321,7 @@ async fn vlt_pinned_matrix_migration_hosted_then_vendored() {
             vendored_scan(&fx, &dir, &[])
         } else {
             stage_manifest(&dir, &[fx.t()]);
-            vendor_cmd(&dir, &[])
+            vendor_upstream(&fx, &dir, &[])
         };
         assert_eq!(out.code, 0, "{driver}: {out}");
         assert!(
@@ -349,7 +370,7 @@ async fn vlt_pinned_matrix_migration_dry_run_parity() {
     fx.vlt_ok(&fx.proj, &fx.leg.locked_install_args());
     stage_manifest(&fx.proj, &[fx.t()]);
     let before = project_bytes(&fx.proj);
-    let out = vendor_cmd(&fx.proj, &["--dry-run"]);
+    let out = vendor_upstream(&fx, &fx.proj, &["--dry-run"]);
     assert_eq!(out.code, 0, "{out}");
     assert!(
         has_code(&out.json(), "vendor_would_revert_redirect"),
@@ -371,7 +392,7 @@ async fn vlt_pinned_matrix_migration_dry_run_parity() {
         before,
         "the previews write nothing"
     );
-    let out = vendor_cmd(&fx.proj, &[]);
+    let out = vendor_upstream(&fx, &fx.proj, &[]);
     assert_eq!(out.code, 0, "{out}");
     assert!(
         has_code(&out.json(), "vendor_takeover_reverted_redirect"),
@@ -400,9 +421,10 @@ async fn vlt_pinned_matrix_migration_dry_run_parity() {
 
 // ── 4–5. scoped and unscoped unwinds ──────────────────────────────────────
 
-/// Two hosted records; `rollback <purl-a>` and, on a copy, `remove
-/// <purl-a>` unwind only a; a fresh checkout lands a's registry bytes and
-/// b's patch; the unscoped rollback then restores the pristine lock.
+/// Two hosted pins; `rollback <purl-a>` and, on a copy, `remove <purl-a>`
+/// restore only a's upstream entry; a fresh checkout lands a's registry
+/// bytes and b's patch; the unscoped rollback then restores the pristine
+/// lock.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_migration_scoped_unwind_one_of_two() {
@@ -417,32 +439,28 @@ async fn vlt_pinned_matrix_migration_scoped_unwind_one_of_two() {
     assert_pinned(&fx.proj, &fx.svc, &a);
     assert_pinned(&fx.proj, &fx.svc, &b);
     let copy = copy_project(&fx, &fx.proj, "remove-copy");
-    let out = rollback(&fx.proj, &[&a.purl()]);
+    let out = rollback_all(&fx, &fx.proj, &[&a.purl()]);
     assert_eq!(out.code, 0, "{out}");
-    let cwd = cwd_args(&copy);
-    let purl = a.purl();
-    let out = socket(
-        &copy,
-        &[
-            "remove",
-            &purl,
-            "--json",
-            "--yes",
-            "--offline",
-            "--cwd",
-            &cwd,
-        ],
-        &[],
+    assert_eq!(
+        out.json()["hosted"]["reverted"],
+        serde_json::json!([a.purl()]),
+        "only a is restored: {out}"
     );
+    let out = remove_upstream(&fx, &copy, &a.purl());
     assert_eq!(out.code, 0, "{out}");
+    let before: Value = serde_json::from_slice(&fx.lock_before).unwrap();
     for dir in [&fx.proj, &copy] {
         assert_not_pinned(dir, &a);
         assert_pinned(dir, &fx.svc, &b);
-        let ledger =
-            std::fs::read_to_string(dir.join(".socket/vendor/redirect-state.json")).unwrap();
+        let lock = read_lock(dir);
+        let id = node_id(&lock, &a.name, &a.version);
+        assert_eq!(
+            lock["nodes"][&id][2], before["nodes"][&id][2],
+            "a's registry integrity is back: {lock:#}"
+        );
         assert!(
-            !ledger.contains(&a.purl()) && ledger.contains(&b.purl()),
-            "{ledger}"
+            !dir.join(".socket/vendor/redirect-state.json").exists(),
+            "no hosted ledger (v5)"
         );
         assert_fresh(&fx, dir, &a, State::Pristine, "a-unwound");
         assert_fresh(&fx, dir, &b, State::Patched, "b-kept");
@@ -464,9 +482,9 @@ async fn vlt_pinned_matrix_migration_rollback_from_mixed() {
     let b = fx.svc.target(MS.0).clone();
     let out = hosted_scan(&fx, &fx.proj, &[]);
     assert_eq!(out.code, 0, "{out}");
-    let out = socket_api(
+    let out = api_upstream(
+        &fx,
         &fx.proj,
-        &fx.svc,
         &["get", &a.uuid, "--mode", "vendored"],
         &["--vendor-source", "build"],
     );
@@ -585,7 +603,7 @@ async fn vlt_pinned_matrix_migration_agent_rollback_after_takeovers() {
             vendored_scan(&fx, &dir, &[])
         };
         assert_eq!(out.code, 0, "{mode}: {out}");
-        let out = rollback(&dir, &[]);
+        let out = rollback_all(&fx, &dir, &[]);
         assert_eq!(out.code, 0, "{mode} rollback: {out}");
         assert_eq!(
             String::from_utf8_lossy(&lock_bytes(&dir)),
@@ -614,29 +632,15 @@ async fn vlt_pinned_matrix_migration_agent_rollback_after_takeovers() {
     assert_eq!(out.code, 0, "{out}");
     let out = hosted_scan(&fx, &dir, &[]);
     assert_eq!(out.code, 0, "{out}");
-    let out = socket_api(
+    let out = api_upstream(
+        &fx,
         &dir,
-        &fx.svc,
         &["get", &b.uuid, "--mode", "vendored"],
         &["--vendor-source", "build"],
     );
     assert_eq!(out.code, 0, "{out}");
     for t in [&a, &b] {
-        let cwd = cwd_args(&dir);
-        let purl = t.purl();
-        let out = socket(
-            &dir,
-            &[
-                "remove",
-                &purl,
-                "--json",
-                "--yes",
-                "--offline",
-                "--cwd",
-                &cwd,
-            ],
-            &[],
-        );
+        let out = remove_upstream(&fx, &dir, &t.purl());
         assert_eq!(out.code, 0, "remove {}: {out}", t.name);
     }
     assert_eq!(
@@ -700,9 +704,9 @@ fn npm_run(dir: &Path, args: &[&str]) -> std::process::Output {
     cmd.output().expect("spawn npm")
 }
 
-/// vlt → npm (`vlt-lock.json` deleted): the rollback refuses the vlt edits
-/// ("vlt-lock.json no longer exists") and keeps the ledger, writing no
-/// lock.
+/// vlt → npm (`vlt-lock.json` deleted): with the lock gone no hosted pin is
+/// left to discover (v5 keeps no ledger), so rollback finds no state and
+/// recreates nothing.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_migration_pm_switch_vlt_to_npm() {
@@ -712,19 +716,19 @@ async fn vlt_pinned_matrix_migration_pm_switch_vlt_to_npm() {
     let fx = Fixture::build(leg, Shape::left_pad()).await;
     fx.scan(&[]);
     std::fs::remove_file(fx.proj.join(VLT_LOCK)).unwrap();
-    let ledger = std::fs::read(fx.proj.join(".socket/vendor/redirect-state.json")).unwrap();
-    let out = rollback(&fx.proj, &[]);
-    assert_eq!(out.code, 1, "{out}");
     assert!(
-        out.stdout.contains("vlt-lock.json no longer exists"),
-        "{out}"
+        !fx.proj.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode writes no ledger"
+    );
+    let files = package_files(&fx.proj);
+    let out = rollback_all(&fx, &fx.proj, &[]);
+    assert_eq!(
+        (out.code, out.json()["error"].as_str()),
+        (1, Some("Manifest not found")),
+        "no lock, no pin, nothing to roll back: {out}"
     );
     assert!(!fx.proj.join(VLT_LOCK).exists(), "nothing recreated");
-    assert_eq!(
-        std::fs::read(fx.proj.join(".socket/vendor/redirect-state.json")).unwrap(),
-        ledger,
-        "the ledger is kept"
-    );
+    assert_eq!(package_files(&fx.proj), files, "and nothing written");
     fx.leg.ran();
 }
 
@@ -772,9 +776,9 @@ fn upgrade() -> Option<Toolchain> {
 }
 
 /// rc.14 hosted, then the upgraded vlt refuses the v0 lock; the lock is
-/// re-created, the rescan re-pins under the tilde DepID (superseding the
-/// recorded legacy edit), rollback is clean and VEX attests after the
-/// rescan.
+/// re-created, the rescan re-pins under the tilde DepID (no ledger to
+/// supersede), rollback restores the re-created lock byte-for-byte and VEX
+/// attests after the rescan.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_migration_upgrade_hosted() {
@@ -810,17 +814,15 @@ async fn vlt_pinned_matrix_migration_upgrade_hosted() {
         fx.vex_attested(fx.t()),
         "attested after the rescan: {doc:#}"
     );
-    let ledger =
-        std::fs::read_to_string(fx.proj.join(".socket/vendor/redirect-state.json")).unwrap();
     assert!(
-        !ledger.contains('·'),
-        "the legacy edit is superseded: {ledger}"
+        !fx.proj.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode writes no ledger"
     );
-    let out = rollback(&fx.proj, &[]);
+    let out = rollback_all(&fx, &fx.proj, &[]);
     assert_eq!(out.code, 0, "{out}");
     assert_eq!(
-        lock_bytes(&fx.proj),
-        relocked,
+        String::from_utf8_lossy(&lock_bytes(&fx.proj)),
+        String::from_utf8_lossy(&relocked),
         "rollback to the re-created lock"
     );
     fx.leg.ran();

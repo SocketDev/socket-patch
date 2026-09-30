@@ -82,8 +82,8 @@ async fn mock_hosted_api(server: &MockServer) {
         })))
         .mount(server)
         .await;
-    // `view/{uuid}` — the record the wet run persists into the redirect
-    // ledger after a confirmed redirect.
+    // `view/{uuid}` — the record the wet run fetches (in memory: stale-install
+    // probes, in-run VEX) after a confirmed redirect.
     let before_hash = compute_git_sha256_from_bytes(ORIG_INDEX);
     let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
     Mock::given(method("GET"))
@@ -489,7 +489,7 @@ fn scan_hosted_human(cwd: &Path, api_url: &str, dry_run: bool) -> (i32, String, 
 fn summary_line(stdout: &str) -> &str {
     stdout
         .lines()
-        .find(|l| l.starts_with("Would redirect ") || l.starts_with("Redirected "))
+        .find(|l| l.starts_with("Would switch ") || l.starts_with("Switched "))
         .unwrap_or_default()
 }
 
@@ -526,7 +526,7 @@ async fn human_takeover_prints_migration_lines_and_matching_file_counts() {
     );
     assert_eq!(
         summary_line(&dry_out),
-        "Would redirect 1 package and rewrite 3 files (--dry-run: nothing was changed).",
+        "Would switch 1 package to hosted patches and rewrite 3 files (--dry-run: nothing was changed).",
         "stdout=\n{dry_out}"
     );
 
@@ -542,14 +542,13 @@ async fn human_takeover_prints_migration_lines_and_matching_file_counts() {
     );
     assert_eq!(
         summary_line(&wet_out),
-        "Redirected 1 package; rewrote 3 files.",
+        "Switched 1 package to hosted patches; rewrote 3 files.",
         "the wet count must equal the dry-run preview; stdout=\n{wet_out}"
     );
     assert!(
         wet_out.contains(
-            "Commit .socket/vendor/ (the redirect ledger, plus the removed vendored ledger \
-             entries and artifacts), package.json, pnpm-lock.yaml, and pnpm-workspace.yaml \
-             to keep the redirect."
+            "  1. Commit .socket/vendor/ (the removed vendored ledger entries and artifacts), \
+             package.json, pnpm-lock.yaml, and pnpm-workspace.yaml to keep the hosted patches."
         ),
         "stdout=\n{wet_out}"
     );

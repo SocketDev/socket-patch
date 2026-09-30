@@ -2,7 +2,10 @@
 //! ([`ProjectView::Disk`]) or an in-memory file map
 //! ([`ProjectView::Memory`]) handed in by a host that never materializes
 //! the repository (the hosted in-memory engine). The disk variant calls the
-//! plain FIFO-safe filesystem readers.
+//! plain FIFO-safe filesystem readers; the snapshot variant
+//! ([`ProjectView::Snapshot`]) is the disk variant with each file's
+//! content read at most once, so every reader of one run (the lock
+//! inventory, lockfile discovery) sees the same bytes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -12,11 +15,10 @@ use std::sync::Arc;
 use crate::constants::npm_family::{
     BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS, VLT_LOCK,
 };
-use crate::utils::fs::{
-    read_regular_to_bytes, read_regular_to_string, read_regular_to_string_sync,
-};
+use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 use crate::vendor::npm_flavor::NpmLockFlavor;
-use crate::vendor::pnpm_lock_legacy::{sniff_lock_grammar, PnpmLockGrammar};
+use crate::formats::pnpm::{sniff_lock_grammar, PnpmLockGrammar};
+use crate::formats::yarn::{sniff_grammar, YarnLockGrammar, UNIDENTIFIED_DETAIL};
 use crate::vendor::VendorWarning;
 
 /// One in-memory file.
@@ -49,20 +51,14 @@ impl MemoryProject {
         self.entries.insert(rel.into(), entry);
     }
 
-    pub fn insert_text(&mut self, rel: impl Into<String>, text: impl Into<Arc<str>>) {
+    #[cfg(test)]
+    pub(crate) fn insert_text(&mut self, rel: impl Into<String>, text: impl Into<Arc<str>>) {
         self.insert(rel, MemoryEntry::Text(text.into()));
     }
 
-    pub fn insert_binary(&mut self, rel: impl Into<String>, bytes: impl Into<Arc<[u8]>>) {
-        self.insert(rel, MemoryEntry::Binary(bytes.into()));
-    }
-
-    pub fn insert_present(&mut self, rel: impl Into<String>) {
+    #[cfg(test)]
+    pub(crate) fn insert_present(&mut self, rel: impl Into<String>) {
         self.insert(rel, MemoryEntry::Present);
-    }
-
-    pub fn insert_symlink(&mut self, rel: impl Into<String>) {
-        self.insert(rel, MemoryEntry::Symlink);
     }
 
     pub fn remove(&mut self, rel: &str) -> Option<MemoryEntry> {
@@ -88,11 +84,7 @@ impl MemoryProject {
         matches!(self.entries.get(rel), Some(MemoryEntry::Symlink))
     }
 
-    pub fn paths(&self) -> impl Iterator<Item = &str> {
-        self.entries.keys().map(String::as_str)
-    }
-
-    pub fn entries(&self) -> impl Iterator<Item = (&str, &MemoryEntry)> {
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&str, &MemoryEntry)> {
         self.entries.iter().map(|(k, v)| (k.as_str(), v))
     }
 
@@ -190,11 +182,70 @@ pub struct DirEntryInfo {
     pub is_dir: bool,
 }
 
+/// Cached reads by root-relative path: the content, or the error kind and
+/// message of the failed read.
+type ReadCache = std::collections::HashMap<String, Result<Arc<[u8]>, (io::ErrorKind, String)>>;
+
+/// A read-through cache over the files under `root`: the first read of a
+/// path hits the disk, later ones return the same content (or the same
+/// error). Everything that is not a content read (existence, file type,
+/// directory listings, the disk-only probes) goes to the disk directly.
+#[derive(Debug)]
+pub struct DiskSnapshot<'a> {
+    pub root: &'a Path,
+    reads: std::sync::Mutex<ReadCache>,
+}
+
+impl<'a> DiskSnapshot<'a> {
+    pub fn new(root: &'a Path) -> Self {
+        Self {
+            root,
+            reads: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReadCache> {
+        self.reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn cached(&self, rel: &str) -> Option<io::Result<Arc<[u8]>>> {
+        self.lock().get(rel).map(|r| match r {
+            Ok(bytes) => Ok(Arc::clone(bytes)),
+            Err((kind, msg)) => Err(io::Error::new(*kind, msg.clone())),
+        })
+    }
+
+    fn remember(&self, rel: &str, read: &io::Result<Vec<u8>>) {
+        let entry = match read {
+            Ok(bytes) => Ok(Arc::<[u8]>::from(bytes.as_slice())),
+            Err(e) => Err((e.kind(), e.to_string())),
+        };
+        self.lock().insert(rel.to_string(), entry);
+    }
+
+    async fn read_bytes(&self, rel: &str) -> io::Result<Vec<u8>> {
+        if let Some(hit) = self.cached(rel) {
+            return hit.map(|b| b.to_vec());
+        }
+        let read = read_regular_to_bytes(&self.root.join(rel)).await;
+        self.remember(rel, &read);
+        read
+    }
+}
+
+fn utf8(bytes: Vec<u8>) -> io::Result<String> {
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 /// Where the registry views read the project from.
 #[derive(Debug, Clone, Copy)]
 pub enum ProjectView<'a> {
     Disk(&'a Path),
     Memory(&'a MemoryProject),
+    /// The disk under a per-run read cache.
+    Snapshot(&'a DiskSnapshot<'a>),
 }
 
 impl ProjectView<'_> {
@@ -203,6 +254,20 @@ impl ProjectView<'_> {
         match self {
             ProjectView::Disk(root) => read_regular_to_string(&root.join(rel)).await,
             ProjectView::Memory(project) => project.read_text(rel),
+            ProjectView::Snapshot(snap) => match snap.cached(rel) {
+                Some(hit) => hit.and_then(|b| utf8(b.to_vec())),
+                None => {
+                    let read = read_regular_to_string(&snap.root.join(rel)).await;
+                    snap.remember(
+                        rel,
+                        &read
+                            .as_ref()
+                            .map(|t| t.as_bytes().to_vec())
+                            .map_err(|e| io::Error::new(e.kind(), e.to_string())),
+                    );
+                    read
+                }
+            },
         }
     }
 
@@ -211,21 +276,16 @@ impl ProjectView<'_> {
         match self {
             ProjectView::Disk(root) => read_regular_to_bytes(&root.join(rel)).await,
             ProjectView::Memory(project) => project.read_bytes(rel),
-        }
-    }
-
-    /// Synchronous twin of [`Self::read_text`].
-    pub fn read_text_sync(&self, rel: &str) -> io::Result<String> {
-        match self {
-            ProjectView::Disk(root) => read_regular_to_string_sync(&root.join(rel)),
-            ProjectView::Memory(project) => project.read_text(rel),
+            ProjectView::Snapshot(snap) => snap.read_bytes(rel).await,
         }
     }
 
     /// `metadata` (follows links) succeeds.
     pub async fn exists(&self, rel: &str) -> bool {
         match self {
-            ProjectView::Disk(root) => tokio::fs::metadata(root.join(rel)).await.is_ok(),
+            ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
+                tokio::fs::metadata(root.join(rel)).await.is_ok()
+            }
             ProjectView::Memory(project) => project.contains(rel) || project.is_dir(rel),
         }
     }
@@ -233,7 +293,9 @@ impl ProjectView<'_> {
     /// `symlink_metadata` (does not follow links) succeeds.
     pub async fn exists_no_follow(&self, rel: &str) -> bool {
         match self {
-            ProjectView::Disk(root) => tokio::fs::symlink_metadata(root.join(rel)).await.is_ok(),
+            ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
+                tokio::fs::symlink_metadata(root.join(rel)).await.is_ok()
+            }
             ProjectView::Memory(project) => project.contains(rel) || project.is_dir(rel),
         }
     }
@@ -241,7 +303,9 @@ impl ProjectView<'_> {
     /// A regular file (following links on disk).
     pub fn is_file(&self, rel: &str) -> bool {
         match self {
-            ProjectView::Disk(root) => root.join(rel).is_file(),
+            ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
+                root.join(rel).is_file()
+            }
             ProjectView::Memory(project) => matches!(
                 project.get(rel),
                 Some(MemoryEntry::Text(_) | MemoryEntry::Binary(_) | MemoryEntry::Present)
@@ -252,7 +316,7 @@ impl ProjectView<'_> {
     /// The path itself is a symbolic link.
     pub fn is_symlink(&self, rel: &str) -> bool {
         match self {
-            ProjectView::Disk(root) => {
+            ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
                 std::fs::symlink_metadata(root.join(rel)).is_ok_and(|m| m.file_type().is_symlink())
             }
             ProjectView::Memory(project) => project.is_symlink(rel),
@@ -262,7 +326,7 @@ impl ProjectView<'_> {
     /// The UTF-8-named entries of directory `rel`, sorted by name.
     pub async fn list_dir(&self, rel: &str) -> io::Result<Vec<DirEntryInfo>> {
         match self {
-            ProjectView::Disk(root) => {
+            ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
                 let mut dir = tokio::fs::read_dir(root.join(rel)).await?;
                 let mut out = Vec::new();
                 while let Ok(Some(entry)) = dir.next_entry().await {
@@ -289,10 +353,6 @@ impl ProjectView<'_> {
     }
 }
 
-/// How many head lines the yarn content sniff reads (mirrors the disk
-/// probe).
-const YARN_SNIFF_HEAD_LINES: usize = 30;
-
 /// [`crate::vendor::npm_flavor::detect_npm_lock_flavor`] over a
 /// [`ProjectView`]. The disk variant IS the disk probe; the memory variant
 /// follows the same decision table, with pnpm's own Plug'n'Play layout
@@ -301,7 +361,7 @@ pub(crate) async fn detect_npm_lock_flavor_in(
     view: &ProjectView<'_>,
 ) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
     let project = match view {
-        ProjectView::Disk(root) => {
+        ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
             return crate::vendor::npm_flavor::detect_npm_lock_flavor(root).await
         }
         ProjectView::Memory(project) => *project,
@@ -350,24 +410,16 @@ pub(crate) async fn detect_npm_lock_flavor_in(
         }
         if exists("yarn.lock") {
             let text = read_lock("yarn.lock")?;
-            let head: Vec<&str> = text
-                .strip_prefix('\u{feff}')
-                .unwrap_or(&text)
-                .lines()
-                .take(YARN_SNIFF_HEAD_LINES)
-                .collect();
-            if head.iter().any(|l| l.starts_with("__metadata:")) {
-                break 'flavor NpmLockFlavor::YarnBerry;
+            match sniff_grammar(&text) {
+                Some(YarnLockGrammar::Berry) => break 'flavor NpmLockFlavor::YarnBerry,
+                Some(YarnLockGrammar::Classic) => break 'flavor NpmLockFlavor::YarnClassic,
+                None => {
+                    return Err((
+                        "vendor_lockfile_version_unsupported",
+                        UNIDENTIFIED_DETAIL.to_string(),
+                    ))
+                }
             }
-            if head.iter().any(|l| l.trim() == "# yarn lockfile v1") {
-                break 'flavor NpmLockFlavor::YarnClassic;
-            }
-            return Err((
-                "vendor_lockfile_version_unsupported",
-                "yarn.lock carries neither the `# yarn lockfile v1` header nor a berry \
-                 `__metadata:` key; cannot identify the lockfile version"
-                    .to_string(),
-            ));
         }
         if exists(NPM_LOCKS[0]) || exists(NPM_LOCKS[1]) {
             break 'flavor NpmLockFlavor::PackageLock;
@@ -517,5 +569,26 @@ mod tests {
                 .0,
             "vendor_lockfile_missing"
         );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_reads_each_file_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.lock"), "one").unwrap();
+        let snap = DiskSnapshot::new(tmp.path());
+        let view = ProjectView::Snapshot(&snap);
+        assert_eq!(view.read_text("a.lock").await.unwrap(), "one");
+        std::fs::write(tmp.path().join("a.lock"), "two").unwrap();
+        assert_eq!(view.read_text("a.lock").await.unwrap(), "one", "cached");
+        assert_eq!(view.read_bytes("a.lock").await.unwrap(), b"one");
+        let missing = view.read_text("b.lock").await.unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        std::fs::write(tmp.path().join("b.lock"), "late").unwrap();
+        assert_eq!(
+            view.read_text("b.lock").await.unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "a cached miss stays a miss"
+        );
+        assert!(view.exists("b.lock").await, "non-read probes go to disk");
     }
 }

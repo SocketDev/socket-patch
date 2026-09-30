@@ -16,7 +16,8 @@ use socket_patch_core::patch::rollback::{
 };
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
-use socket_patch_core::vendor::{save_state, RevertOpts, VendorState, VendorWarning};
+use socket_patch_core::patch::redirect::upstream::HostedPin;
+use socket_patch_core::vendor::{purl_keys_cover, RevertOpts, VendorState};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -24,7 +25,7 @@ use std::time::Duration;
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::apply::is_local_go;
 use crate::commands::lock_cli::acquire_or_emit;
-use crate::commands::vendor::dispatch_revert_one_opts;
+use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
 use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls};
 use crate::json_envelope::Command as EnvelopeCommand;
 use crate::looks_like_uuid;
@@ -99,21 +100,6 @@ pub struct RollbackArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
 
-    // `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
-    // clap's default bool parser accepts only the literal strings
-    // `true`/`false` from the env binding, so `SOCKET_ONE_OFF=1` (or an
-    // exported-but-empty `SOCKET_ONE_OFF=`) aborted every `rollback`
-    // invocation. This flag is also outside `GLOBAL_ARG_ENV_VARS`, so
-    // `main`'s empty-var scrub never rescues it.
-    /// Roll back a patch by fetching beforeHash blobs from the API (no manifest required).
-    #[arg(
-        long = "one-off",
-        env = "SOCKET_ONE_OFF",
-        default_value_t = false,
-        value_parser = parse_bool_flag,
-    )]
-    pub one_off: bool,
-
     /// Restore the system (files and lockfiles) but PRESERVE the local
     /// patch state for a later re-apply: manifest entries are kept,
     /// vendored artifacts and their ledger entries are kept (only the
@@ -176,12 +162,7 @@ pub(crate) fn as_question(text: &str) -> String {
 
 /// The default (destructive) rollback's confirmation prompt, naming only
 /// the legs that have work.
-fn rollback_prompt(
-    manifest: usize,
-    vendored: usize,
-    hosted: usize,
-    leftover_edits: usize,
-) -> String {
+fn rollback_prompt(manifest: usize, vendored: usize, hosted: usize) -> String {
     let mut clauses: Vec<String> = Vec::new();
     if manifest > 0 {
         clauses.push(format!(
@@ -206,17 +187,8 @@ fn rollback_prompt(
     }
     if hosted > 0 {
         clauses.push(format!(
-            "unwind {}",
-            plural(hosted, "hosted redirect", "hosted redirects")
-        ));
-    } else if leftover_edits > 0 {
-        clauses.push(format!(
-            "replay {}",
-            plural(
-                leftover_edits,
-                "leftover hosted redirect edit",
-                "leftover hosted redirect edits"
-            )
+            "restore {} to the upstream registry",
+            plural(hosted, "hosted package", "hosted packages")
         ));
     }
     as_question(&join_clauses(&clauses))
@@ -840,76 +812,6 @@ pub(crate) struct HostedLegOutcome {
     pub(crate) edited_files: std::collections::BTreeSet<String>,
 }
 
-/// What one vendored ledger entry's revert did. Silent by design — the
-/// caller owns the print and envelope vocabulary. Shared by `rollback`'s
-/// vendored leg and both of `remove`'s vendored paths, so the drift-keep
-/// and `--preserve-state` rules are identical by construction.
-pub(crate) enum VendorRevertStep {
-    /// `key` has no ledger entry (a divergent ledger, or an earlier leg
-    /// already reverted it): a silent no-op.
-    Missing,
-    /// The backend refused; nothing changed for this entry.
-    Failed(String),
-    /// Drift-keep: the lock changed under us and the backend left both the
-    /// wiring and the artifact alone. Per `RevertOutcome`'s contract the
-    /// ledger entry — and any manifest record — must survive.
-    Kept,
-    /// Dry run: the revert (or, with `keep_artifact`, the unwire) would
-    /// succeed. Nothing changed.
-    WouldRevert,
-    /// `keep_artifact`: wiring restored; artifact and ledger entry kept
-    /// byte-identical. Its wiring records now describe already-reverted
-    /// fragments, which later reverts replay as silent no-ops (the
-    /// liveness contract), and a re-vendor re-wires from the live lock.
-    Preserved,
-    /// Reverted on disk, dropped from the ledger, ledger saved (per entry,
-    /// so the run is crash-consistent like `vendor --revert`).
-    Reverted,
-    /// Reverted on disk and dropped from the in-memory ledger, but the
-    /// ledger write failed.
-    LedgerWriteFailed(String),
-}
-
-pub(crate) struct VendorRevertResult {
-    pub(crate) warnings: Vec<VendorWarning>,
-    pub(crate) step: VendorRevertStep,
-}
-
-/// Revert the vendored ledger entry `key` (see [`VendorRevertStep`]).
-pub(crate) async fn revert_vendor_entry(
-    cwd: &Path,
-    key: &str,
-    state: &mut VendorState,
-    opts: RevertOpts,
-) -> VendorRevertResult {
-    let Some(entry) = state.entries.get(key).cloned() else {
-        return VendorRevertResult {
-            warnings: Vec::new(),
-            step: VendorRevertStep::Missing,
-        };
-    };
-    let outcome = dispatch_revert_one_opts(&entry, cwd, opts).await;
-    let step = if !outcome.success {
-        VendorRevertStep::Failed(outcome.error.unwrap_or_else(|| "unknown error".into()))
-    } else if outcome.kept_artifact {
-        VendorRevertStep::Kept
-    } else if opts.dry_run {
-        VendorRevertStep::WouldRevert
-    } else if opts.keep_artifact {
-        VendorRevertStep::Preserved
-    } else {
-        state.entries.remove(key);
-        match save_state(cwd, state).await {
-            Ok(()) => VendorRevertStep::Reverted,
-            Err(e) => VendorRevertStep::LedgerWriteFailed(e.to_string()),
-        }
-    };
-    VendorRevertResult {
-        warnings: outcome.warnings,
-        step,
-    }
-}
-
 /// One GC pass over `.socket/blobs`, `diffs` and `packages` against
 /// `reference` (the post-removal manifest with the revert blobs a later
 /// rollback needs pinned in). Each directory reports separately: callers
@@ -931,7 +833,14 @@ pub(crate) async fn sweep_unused_artifacts(
     ArtifactSweep {
         blobs: cleanup_unused_blobs(reference, &socket_dir.join("blobs"), dry_run).await,
         diffs: cleanup_unused_archives(reference, &socket_dir.join("diffs"), dry_run).await,
-        packages: cleanup_unused_archives(reference, &socket_dir.join("packages"), dry_run).await,
+        // Nothing writes or reads `.socket/packages/` any more; sweep the
+        // leftover directory whole.
+        packages: cleanup_unused_archives(
+            &PatchManifest::default(),
+            &socket_dir.join("packages"),
+            dry_run,
+        )
+        .await,
     }
 }
 
@@ -965,50 +874,58 @@ async fn run_vendored_leg(
         keep_artifact: preserve,
     };
     let loud = !common.json && !common.silent;
-    for key in keys {
-        let result = revert_vendor_entry(&common.cwd, key, state, opts).await;
-        for w in &result.warnings {
+    let reverted = VendoredBackend::new(common, None)
+        .revert(keys, state, opts, false)
+        .await;
+    for RevertedEntry {
+        key,
+        warnings,
+        step,
+        ..
+    } in reverted
+    {
+        for w in &warnings {
             if loud {
-                eprintln!("Warning ({}): {}", w.code, w.detail);
+                eprintln!("Warning: {}", w.detail);
             }
             out.warnings.push((w.code.to_string(), w.detail.clone()));
         }
-        match result.step {
+        match step {
             VendorRevertStep::Missing => {}
             VendorRevertStep::Failed(why) => {
                 // Errors print even under --silent.
                 if !common.json {
                     eprintln!("Error: Failed to revert vendoring for {key}: {why}");
                 }
-                out.failed.push((key.clone(), why));
+                out.failed.push((key, why));
             }
             VendorRevertStep::Kept => out.kept.push((
-                key.clone(),
+                key,
                 "lockfile wiring drifted; vendored state left untouched".to_string(),
             )),
             VendorRevertStep::WouldRevert if preserve => {
                 if loud {
                     println!("Would unwire vendoring for {key} (artifact preserved)");
                 }
-                out.preserved.push(key.clone());
+                out.preserved.push(key);
             }
             VendorRevertStep::WouldRevert => {
                 if loud {
                     println!("Would revert vendoring for {key}");
                 }
-                out.reverted.push(key.clone());
+                out.reverted.push(key);
             }
             VendorRevertStep::Preserved => {
                 if loud {
                     println!("Unwired vendoring for {key} (artifact preserved)");
                 }
-                out.preserved.push(key.clone());
+                out.preserved.push(key);
             }
             VendorRevertStep::Reverted => {
                 if loud {
                     println!("Reverted vendoring for {key}");
                 }
-                out.reverted.push(key.clone());
+                out.reverted.push(key);
             }
             VendorRevertStep::LedgerWriteFailed(e) => {
                 let why = format!("vendor ledger write failed: {e}");
@@ -1016,42 +933,41 @@ async fn run_vendored_leg(
                 if !common.json {
                     eprintln!("Error: Failed to revert vendoring for {key}: {why}");
                 }
-                out.failed.push((key.clone(), why));
+                out.failed.push((key, why));
             }
         }
     }
     out
 }
 
-/// Unwind the in-scope hosted redirects: per-purl reverts where they
-/// exist (cargo, npm-family, golang), and — when the scope covers the ENTIRE
-/// record set — the whole-ledger reverse replay for everything else.
-/// Mutates `state`; the caller persists on wet runs.
-pub(crate) async fn run_hosted_leg(
-    common: &GlobalArgs,
-    purls: &[String],
-    state: &mut socket_patch_core::patch::redirect::RedirectState,
-    replay_eligible: bool,
-) -> HostedLegOutcome {
-    use socket_patch_core::patch::redirect::{
-        redirect_revert_supported, revert_redirect_purl, revert_remaining_redirect_edits,
+/// The patch-server origins that count as hosted, besides Socket's own:
+/// the operator's `--patch-server-url` (discovery's allowlist).
+pub(crate) fn patch_server_origins(common: &GlobalArgs) -> Vec<String> {
+    common
+        .patch_server_url
+        .iter()
+        .filter(|url| !url.trim().is_empty())
+        .cloned()
+        .collect()
+}
+
+/// Restore the in-scope hosted pins to their default upstream registry
+/// entries (core `patch::redirect::upstream`): v5 hosted mode keeps no
+/// ledger, so each pin's lock entry is re-resolved from the registry, and a
+/// pin that cannot be is refused with the `git checkout` remedy. Shared
+/// with remove's hosted leg.
+pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> HostedLegOutcome {
+    use socket_patch_core::patch::redirect::upstream::{
+        restore_upstream, PinStatus, RestoreOptions,
     };
 
     let mut out = HostedLegOutcome::default();
-    // The vlt nodes the unwound purls pin, read before the revert drops
-    // their edits: the heal below invalidates the patched installed copies
-    // once the registry pins are back.
-    let vlt_scope: Vec<String> = if replay_eligible {
-        purls
-            .iter()
-            .cloned()
-            .chain(state.records.keys().cloned())
-            .collect()
-    } else {
-        purls.to_vec()
-    };
-    // FIFO-safe: a FIFO or device planted at the lock path must fail this
-    // read at once, not block the rollback in open(2).
+    if pins.is_empty() {
+        return out;
+    }
+    // The vlt nodes the restored pins pin, read before the restore rewrites
+    // them: the heal below invalidates the patched installed copies once the
+    // registry pins are back.
     let vlt_lock = socket_patch_core::utils::fs::read_regular_to_string(
         &common
             .cwd
@@ -1059,131 +975,102 @@ pub(crate) async fn run_hosted_leg(
     )
     .await
     .ok();
-    let vlt_targets = socket_patch_core::patch::redirect::vlt_heal::ledger_targets(
-        state,
-        &vlt_scope,
-        vlt_lock.as_deref(),
-    );
-    // When the whole-ledger replay will run anyway (the scope covers every
-    // record), npm purls on Bun projects defer to it so all lockfile edits
-    // are staged together atomically. A scoped unwind of one of several
-    // Bun records uses the per-purl revert to restore only its package.
-    let has_bun_edits = state.edits.iter().any(|e| {
-        matches!(
-            e.kind.as_str(),
-            "redirect_bun_lock_package" | "redirect_bun_lockb_package"
-        )
-    });
-    let mut deferred_to_replay: Vec<String> = Vec::new();
-    for purl in purls {
-        let defer_bun = has_bun_edits && purl.starts_with("pkg:npm/") && replay_eligible;
-        if !defer_bun && redirect_revert_supported(purl) {
-            match revert_redirect_purl(&common.cwd, state, purl, common.dry_run).await {
-                Ok(revert) => {
-                    for (code, detail) in &revert.warnings {
-                        out.warnings.push((code.clone(), detail.clone()));
-                    }
-                    if !common.json && !common.silent {
-                        if common.dry_run {
-                            println!("Would unwind hosted redirect for {purl}");
-                        } else {
-                            println!("Unwound hosted redirect for {purl}");
-                        }
-                    }
-                    out.edited_files
-                        .extend(revert.reverted_files.iter().cloned());
-                    out.reverted.push(purl.clone());
-                }
-                Err(e) => {
-                    if !common.json {
-                        eprintln!("Error: Failed to unwind hosted redirect for {purl}: {e}");
-                    }
-                    out.failed.push((purl.clone(), e));
-                }
-            }
-        } else if replay_eligible {
-            deferred_to_replay.push(purl.clone());
-        } else {
-            if !common.json {
-                eprintln!(
-                    "Error: Cannot unwind hosted redirect for {purl}: no per-purl revert exists for \
-                     this ecosystem. Run an unscoped `socket-patch rollback` to unwind ALL \
-                     hosted redirects, or re-run `scan --mode hosted` to normalize."
-                );
-            }
-            out.unsupported.push(purl.clone());
-        }
-    }
-    // The whole-ledger replay runs when the scope covers every record
-    // (however it was spelled), and also as the "last one out turns off
-    // the lights" pass — per-purl reverts never claim the non-package
-    // shared settings edits (such as pnpm trustLockfile), so an emptied
-    // record map with leftover edits replays them here too. (The npm
-    // `.npmrc` `allow-remote=all` edit is the one exception: the per-purl
-    // npm revert of the LAST package-lock entry unwinds it itself, so a
-    // scoped rollback leaves no loosened policy behind while other
-    // ecosystems' records remain.)
-    if replay_eligible || (state.records.is_empty() && !state.edits.is_empty()) {
-        let replay = revert_remaining_redirect_edits(&common.cwd, state, common.dry_run).await;
-        for refusal in &replay.refusals {
-            let files: Vec<&str> = refusal.files.iter().map(String::as_str).collect();
-            let why = format!("{} ({})", refusal.reason, files.join(", "));
-            if !common.json {
-                eprintln!(
-                    "Error: Cannot unwind hosted redirect edits ({}): {why}",
-                    refusal.group
-                );
-            }
-            out.failed.push((format!("group:{}", refusal.group), why));
-        }
-        out.warnings.extend(replay.warnings.iter().cloned());
-        out.edited_files
-            .extend(replay.reverted_files.iter().cloned());
-        // Deferred purls succeeded iff the replay dropped their records.
-        for purl in deferred_to_replay {
-            if replay.dropped_records.iter().any(|p| p == &purl) {
+    let origins = patch_server_origins(common);
+    let purls: Vec<String> = pins.iter().map(|p| p.purl.clone()).collect();
+    let vlt_targets = vlt_lock
+        .as_deref()
+        .map(|lock| {
+            socket_patch_core::patch::redirect::vlt_heal::lock_targets(lock, &origins, &purls)
+        })
+        .unwrap_or_default();
+    let opts = RestoreOptions {
+        dry_run: common.dry_run,
+        offline: common.offline,
+        patch_server_origins: origins,
+        // A binary bun.lockb pin refuses with the checkout remedy: its
+        // rebuilt registry record is not byte-exact for every lock.
+        bun_lockb: false,
+    };
+    let outcome = restore_upstream(&common.cwd, pins, &opts).await;
+    for pin in &outcome.pins {
+        match &pin.status {
+            PinStatus::Restored => {
                 if !common.json && !common.silent {
                     if common.dry_run {
-                        println!("Would unwind hosted redirect for {purl}");
+                        println!("Would restore {} to its upstream registry entry", pin.purl);
                     } else {
-                        println!("Unwound hosted redirect for {purl}");
+                        println!("Restored {} to its upstream registry entry", pin.purl);
                     }
                 }
-                out.reverted.push(purl);
-            } else if !out.failed.iter().any(|(p, _)| p.starts_with("group:")) {
-                let why = "hosted redirect edits could not be replayed";
+                out.reverted.push(pin.purl.clone());
+            }
+            PinStatus::Refused(why) => {
                 // Errors print even under --silent: this drives exit 1.
                 if !common.json {
-                    eprintln!("Error: Failed to unwind hosted redirect for {purl}: {why}");
+                    eprintln!("Error: {}", capitalize_first(why));
                 }
-                out.failed.push((purl, why.into()));
+                out.failed.push((pin.purl.clone(), why.clone()));
             }
         }
     }
-    // A target's registry pins are back when its purl reverted, or when the
-    // whole-ledger replay committed the vlt group: groups commit on their
-    // own, so another lock's refusal (a drifted package-lock.json) leaves
-    // the restored vlt-lock.json pins restored.
-    let vlt_group_refused = out.failed.iter().any(|(p, _)| p == "group:vlt");
+    if let Some(e) = &outcome.flush_error {
+        let why = format!("writing the restored lockfiles failed: {e}");
+        if !common.json {
+            eprintln!("Error: {}", capitalize_first(&why));
+        }
+        out.failed.push(("files".to_string(), why));
+    }
+    out.warnings.extend(
+        outcome
+            .warnings
+            .iter()
+            .map(|(code, detail)| (code.to_string(), detail.clone())),
+    );
+    out.edited_files.extend(outcome.reverted_files.iter().cloned());
     let unwound: Vec<_> = vlt_targets
         .into_iter()
-        .filter(|t| {
-            out.reverted.iter().any(|p| {
-                socket_patch_core::utils::purl::canonical_purl(p)
-                    == socket_patch_core::utils::purl::canonical_purl(&t.purl)
-            }) || (replay_eligible && !vlt_group_refused)
-        })
+        .filter(|t| out.reverted.iter().any(|p| p == &t.purl))
         .collect();
     out.warnings
         .extend(crate::commands::scan::vlt_rollback_heal(common, &unwound).await);
     out
 }
 
+/// Delete a pre-v5 hosted ledger once no hosted pin is left for it to
+/// describe (v5 never writes it; it is read only for migration). A wet run
+/// only; a failure is a warning (the file is inert).
+pub(crate) async fn retire_legacy_redirect_ledger(common: &GlobalArgs) -> Option<(String, String)> {
+    let path = common
+        .cwd
+        .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
+    if common.dry_run || tokio::fs::symlink_metadata(&path).await.is_err() {
+        return None;
+    }
+    let remaining = crate::commands::discover_wiring(common, &common.cwd).await;
+    if !HostedPin::all(&remaining).is_empty() {
+        return None;
+    }
+    // The emptied `.socket/vendor/` goes with it; the apply lock's drop
+    // prunes an emptied `.socket/` itself.
+    let stop = common.cwd.join(socket_patch_core::constants::SOCKET_DIR);
+    match socket_patch_core::utils::socket_dir::remove_file_and_prune(&path, &stop).await {
+        Ok(()) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some((
+            "legacy_redirect_ledger_kept".to_string(),
+            format!(
+                "could not delete the pre-v5 hosted ledger {}: {e}",
+                socket_patch_core::patch::redirect::REDIRECT_STATE_REL
+            ),
+        )),
+    }
+}
+
 pub async fn run(args: RollbackArgs) -> i32 {
     apply_env_toggles(&args.common);
 
-    // Classify targets up front: the one-off stub and the glob validation
-    // are pre-network usage checks.
+    // Classify targets up front: the glob validation is a pre-network
+    // usage check.
     let mut identifiers: Vec<String> = Vec::new();
     let mut path_patterns: Vec<String> = Vec::new();
     for token in &args.targets {
@@ -1191,31 +1078,6 @@ pub async fn run(args: RollbackArgs) -> i32 {
             RollbackTarget::Identifier(id) => identifiers.push(id),
             RollbackTarget::PathGlob(p) => path_patterns.push(p),
         }
-    }
-
-    // Bail on the unimplemented flag BEFORE constructing the API client:
-    // client construction can auto-resolve the org slug over the network,
-    // and the contract promises the one-off stub fails before any network
-    // or disk activity.
-    if args.one_off {
-        let msg = if identifiers.is_empty() {
-            "--one-off requires an identifier (UUID or PURL)"
-        } else {
-            "One-off rollback mode is not yet implemented"
-        };
-        if args.common.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "error",
-                    "error": msg,
-                }))
-                .expect("serializing an in-memory JSON value cannot fail")
-            );
-        } else {
-            eprintln!("Error: {msg}");
-        }
-        return 1;
     }
 
     // An unparseable glob is a usage error — same exit-2 stderr shape as
@@ -1237,10 +1099,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let cwd = args.common.cwd.clone();
 
     // ── state discovery ─────────────────────────────────────────────────
-    // Rollback infers what to undo from the three state stores: the
-    // manifest (in-place/agent patches), the vendor ledger (vendored
-    // patches), and the redirect ledger (hosted lockfile redirects). A
-    // missing manifest is not fatal when a ledger holds work.
+    // Rollback infers what to undo from three sources: the manifest
+    // (in-place/agent patches), the vendor ledger (vendored patches), and
+    // the lockfiles themselves (hosted pins — v5 hosted mode keeps no
+    // ledger). A missing manifest is not fatal when either holds work.
     //
     // Only cheap EXISTENCE probes happen before the lock (they decide the
     // truly-empty error path, which never locks: acquiring would create
@@ -1253,21 +1115,65 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let vendor_ledger_exists = tokio::fs::metadata(cwd.join(".socket/vendor/state.json"))
         .await
         .is_ok();
-    let redirect_ledger_exists =
-        tokio::fs::metadata(cwd.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL))
-            .await
-            .is_ok();
+    // The hosted pins the lockfiles wire (read-only discovery; the restore
+    // re-reads every file under the lock before it writes).
+    let hosted_inventory = crate::commands::hosted_inventory(&args.common, &cwd).await;
+    let hosted_pins: Vec<HostedPin> = hosted_inventory.pins.clone();
 
-    if manifest_missing && !vendor_ledger_exists && !redirect_ledger_exists {
+    if manifest_missing && !vendor_ledger_exists && hosted_pins.is_empty() {
+        // Hosted wiring the lockfiles name but cannot attribute is still
+        // hosted state: refuse, naming it, instead of "Manifest not found".
+        if let Some(refusal) = hosted_inventory.contested_refusal() {
+            emit_rollback_error(args.common.json, &refusal);
+            return 1;
+        }
+        // Only a pre-v5 hosted ledger left: no lockfile pins it any more,
+        // so there is nothing to restore — retire the stale file (a wet run
+        // only) instead of failing on the missing manifest.
+        let legacy = cwd.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
+        if tokio::fs::symlink_metadata(&legacy).await.is_ok() {
+            let warning = retire_legacy_redirect_ledger(&args.common).await;
+            if args.common.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "success",
+                        "rolledBack": 0,
+                        "alreadyOriginal": 0,
+                        "failed": 0,
+                        "dryRun": args.common.dry_run,
+                        "warnings": warning
+                            .iter()
+                            .map(|(code, detail)| serde_json::json!({
+                                "code": code, "detail": detail,
+                            }))
+                            .collect::<Vec<_>>(),
+                        "legacyRedirectLedgerRemoved": warning.is_none() && !args.common.dry_run,
+                    }))
+                    .expect("serializing an in-memory JSON value cannot fail")
+                );
+            } else if let Some((_, detail)) = &warning {
+                eprintln!("Warning: {}", capitalize_first(detail));
+            } else if !args.common.silent {
+                println!(
+                    "{} the pre-v5 hosted ledger {}: no lockfile pins a hosted patch.",
+                    if args.common.dry_run { "Would remove" } else { "Removed" },
+                    socket_patch_core::patch::redirect::REDIRECT_STATE_REL
+                );
+            }
+            return 0;
+        }
         // Ledger-less but still wired? (a deleted/uncommitted state.json
-        // with lockfiles still consuming `.socket/vendor/` artifacts is a
-        // supported recovery state — `repair` reconstructs the ledger.)
-        let wired = crate::commands::repair_vendor::scan_vendor_references(&cwd).await;
+        // with lockfiles still consuming `.socket/vendor/` artifacts: the
+        // ledger holds the pre-vendor originals, so it must come back from
+        // version control first.)
+        let wired = crate::commands::vendored_backend::repair::scan_vendor_references(&cwd).await;
         if !wired.is_empty() {
             emit_rollback_error(
                 args.common.json,
                 "lockfiles still reference .socket/vendor/ artifacts but the vendor ledger \
-                 is missing — run `socket-patch repair` to reconstruct it, then roll back",
+                 is missing — restore .socket/vendor/state.json from version control, then \
+                 roll back (or restore the lockfiles with `git checkout -- <lockfile>`)",
             );
             return 1;
         }
@@ -1308,9 +1214,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // each exactly once: the agent leg below receives the manifest and the
     // vendor-ownership key set instead of re-reading them.
     let vendor_state_result = socket_patch_core::vendor::load_state(&cwd).await;
-    let redirect_state_result = socket_patch_core::patch::redirect::load_redirect_state(&cwd).await;
     let vendor_corrupt = vendor_state_result.is_err();
-    let redirect_corrupt = redirect_state_result.is_err();
     // An unreadable ledger degrades to "nothing vendored" for the in-place
     // leg (its own containment is the `vendor_state_unreadable` exit below).
     let vendored_keys: HashSet<String> = vendor_state_result
@@ -1355,14 +1259,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
             Err(_) => Vec::new(),
         };
-    let redirect_records: Vec<(String, String)> = match &redirect_state_result {
-        Ok(Some(s)) => s
-            .records
-            .iter()
-            .map(|(purl, rec)| (purl.clone(), rec.uuid.clone()))
-            .collect(),
-        _ => Vec::new(),
-    };
+    let redirect_records: Vec<(String, String)> = hosted_pins
+        .iter()
+        .map(|pin| (pin.purl.clone(), pin.uuid.clone()))
+        .collect();
 
     let scoped = !identifiers.is_empty() || !path_scope.is_empty();
 
@@ -1376,20 +1276,17 @@ pub async fn run(args: RollbackArgs) -> i32 {
         vendor_scope.extend(vendor_entries.iter().map(|(k, _)| k.clone()));
         hosted_scope.extend(redirect_records.iter().map(|(p, _)| p.clone()));
     }
+    let ledgers = socket_patch_core::ledgers::Ledgers {
+        manifest: Some(&manifest),
+        vendor: vendor_state_result.as_ref().ok(),
+        redirect: None,
+    };
     for id in &identifiers {
-        let mut matched = false;
-        for (purl, patch) in &manifest.patches {
-            if patch_matches(purl, &patch.uuid, id) {
-                manifest_scope.insert(purl.clone());
-                matched = true;
-            }
-        }
-        for (key, entry) in &vendor_entries {
-            if entry.matches_identifier(key, id) {
-                vendor_scope.insert(key.clone());
-                matched = true;
-            }
-        }
+        let found = ledgers.matching(id);
+        let mut matched = !found.is_empty();
+        manifest_scope.extend(found.manifest);
+        vendor_scope.extend(found.vendor.into_iter().map(|(k, _)| k));
+        // Hosted pins live in the lockfiles, not in a store.
         for (purl, uuid) in &redirect_records {
             if patch_matches(purl, uuid, id) {
                 hosted_scope.insert(purl.clone());
@@ -1528,25 +1425,6 @@ pub async fn run(args: RollbackArgs) -> i32 {
         });
     }
 
-    // The whole-ledger hosted replay (which covers the ecosystems without
-    // a per-purl revert) runs only when the scope covers EVERY record —
-    // however the scope was spelled.
-    let replay_eligible = match &redirect_state_result {
-        // A records-EMPTY ledger (degraded record-fetch-failed runs leave
-        // edits without records) is vacuously "covered" by any scope; only
-        // an UNSCOPED run may replay those leftover edits — a scoped
-        // rollback of an unrelated purl must not unwind live redirects it
-        // was never asked about. `--ecosystems` counts as a scope here:
-        // recordless edits carry no purl to narrow by, so an eco-narrowed
-        // run leaves them to an unscoped rollback rather than replaying
-        // other ecosystems' edits behind the filter's back.
-        Ok(Some(s)) => {
-            (!s.records.is_empty() || (!scoped && args.common.ecosystems.is_none()))
-                && s.records.keys().all(|p| hosted_scope.contains(p))
-        }
-        _ => false,
-    };
-
     // Corrupt-ledger containment: a corrupt store fails ONLY the legs that
     // need it; the agent leg still restores files (emergency restores are
     // never blocked by an unrelated corrupt ledger). Cleanup/GC also skip
@@ -1564,40 +1442,14 @@ pub async fn run(args: RollbackArgs) -> i32 {
             ),
         ));
     }
-    if redirect_corrupt {
-        run_warnings.push((
-            "redirect_state_unreadable".into(),
-            // The core error already carries the recovery steps; only say
-            // what this run skipped.
-            format!(
-                "the hosted leg was skipped: cannot read the hosted redirect ledger: {}",
-                redirect_state_result
-                    .as_ref()
-                    .expect_err("checked corrupt above")
-            ),
-        ));
-    }
 
     // ── confirmation ────────────────────────────────────────────────────
     // The default run deletes manifest entries, vendored artifacts, ledger
     // records, and unused blobs — prompt once, remove-style. Auto-accepted
     // under --yes/--json/non-TTY; skipped for previews and for
     // --preserve-state runs (which delete no local state).
-    // Leftover hosted edits an eligible replay would unwind even with no
-    // in-scope records (degraded record-fetch-failed ledgers): they are
-    // work — and prompt-worthy mutation — too.
-    let hosted_leftover_edits = if replay_eligible {
-        match &redirect_state_result {
-            Ok(Some(st)) => st.edits.len(),
-            _ => 0,
-        }
-    } else {
-        0
-    };
-    let has_work = !manifest_scope.is_empty()
-        || !vendor_scope.is_empty()
-        || !hosted_scope.is_empty()
-        || hosted_leftover_edits > 0;
+    let has_work =
+        !manifest_scope.is_empty() || !vendor_scope.is_empty() || !hosted_scope.is_empty();
     // Everything in scope was filtered out by `--ecosystems`: say so,
     // instead of the misleading "No patches found in manifest".
     let eco_filtered_everything = !has_work && scope_before_eco_filter > 0;
@@ -1614,15 +1466,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
     if has_work && !args.common.dry_run && !args.preserve_state {
         // Compose only the clauses that apply, so a hosted-only run never
         // claims manifest entries it does not have.
-        let prompt = rollback_prompt(
-            manifest_scope.len(),
-            vendor_scope.len(),
-            hosted_scope.len(),
-            hosted_leftover_edits,
-        );
+        let prompt = rollback_prompt(manifest_scope.len(), vendor_scope.len(), hosted_scope.len());
         if !crate::ui::confirm(&prompt, true, &args.common) {
             if !args.common.json && !args.common.silent {
-                println!("Rollback cancelled.");
+                println!("{}", crate::ui::CANCELLED);
             }
             return 0;
         }
@@ -1675,33 +1522,28 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
 
             // ── hosted leg ───────────────────────────────────────────────
-            let mut hosted_leg = HostedLegOutcome::default();
-            if !redirect_corrupt {
-                if let Ok(Some(existing)) = &redirect_state_result {
-                    let mut st = existing.clone();
-                    let before = (st.edits.len(), st.records.len());
-                    let mut purls: Vec<String> = hosted_scope.iter().cloned().collect();
-                    purls.sort();
-                    if !purls.is_empty() || (replay_eligible && !st.edits.is_empty()) {
-                        hosted_leg =
-                            run_hosted_leg(&args.common, &purls, &mut st, replay_eligible).await;
-                        let changed = (st.edits.len(), st.records.len()) != before;
-                        if !args.common.dry_run && changed {
-                            if let Err(e) =
-                                socket_patch_core::patch::redirect::persist_redirect_state(
-                                    &cwd, &st,
-                                )
-                                .await
-                            {
-                                let msg =
-                                    format!("failed to persist the hosted redirect ledger: {e}");
-                                if !args.common.json {
-                                    eprintln!("Error: {}", capitalize_first(&msg));
-                                }
-                                hosted_leg.failed.push(("ledger".to_string(), msg));
-                            }
-                        }
+            let in_scope: Vec<HostedPin> = hosted_pins
+                .iter()
+                .filter(|pin| hosted_scope.contains(&pin.purl))
+                .cloned()
+                .collect();
+            let mut hosted_leg = run_hosted_leg(&args.common, &in_scope).await;
+            // An unscoped rollback promises to unwind EVERY hosted patch:
+            // contested wiring it cannot restore fails the leg (a scoped run
+            // names its own targets and leaves unrelated wiring alone).
+            if !scoped {
+                if let Some(refusal) = hosted_inventory.contested_refusal() {
+                    if !args.common.json {
+                        eprintln!("Error: {}", capitalize_first(&refusal));
                     }
+                    hosted_leg
+                        .failed
+                        .push(("hosted_wiring_contested".to_string(), refusal));
+                }
+            }
+            if hosted_leg.failed.is_empty() {
+                if let Some(warning) = retire_legacy_redirect_ledger(&args.common).await {
+                    run_warnings.push(warning);
                 }
             }
 
@@ -1760,7 +1602,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
             // The manifest is rewritten only when an entry actually leaves
             // it; an emptied manifest stays on disk as `{"patches": {}}`
-            // (it carries the setup block and `list`/`apply`/`repair`'s
+            // (it carries any legacy setup block and `list`/`apply`/`repair`'s
             // empty-vs-missing exit codes) — never deleted.
             let mut removed: Vec<String> = Vec::new();
             let mut updated_manifest = manifest.clone();
@@ -1846,8 +1688,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
             if args.preserve_state && !hosted_leg.reverted.is_empty() {
                 run_warnings.push((
                     "hosted_state_not_preservable".into(),
-                    "hosted redirects have no preservable local state: their ledger \
-                     records were dropped with the unwound wiring; re-run \
+                    "hosted wiring has no preservable local state: the lockfile pins are \
+                     the only record, and they now resolve upstream; re-run \
                      `scan --mode hosted` to re-wire"
                         .into(),
                 ));
@@ -1889,9 +1731,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .filter(|(code, _)| {
                     !matches!(
                         code.as_str(),
-                        "vendor_state_unreadable"
-                            | "redirect_state_unreadable"
-                            | "reinstall_required"
+                        "vendor_state_unreadable" | "reinstall_required"
                     )
                 })
                 .chain(hosted_leg.warnings.iter())
@@ -1928,7 +1768,6 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 && hosted_leg.failed.is_empty()
                 && hosted_leg.unsupported.is_empty()
                 && !vendor_corrupt
-                && !redirect_corrupt
                 && manifest_write_failed.is_none();
             let rolled_back_count = results
                 .iter()
@@ -2143,8 +1982,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
             // failures, hosted replay notes, ...): the JSON envelope's
             // `warnings[]`, one stderr line each here.
             if !args.common.json && !args.common.silent {
-                for (code, detail) in &human_warnings {
-                    eprintln!("Warning ({code}): {detail}");
+                for (_, detail) in &human_warnings {
+                    eprintln!("Warning: {detail}");
                 }
             }
 
@@ -2157,7 +1996,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     eprintln!("Error: Kept vendored state for {key}: {reason}");
                 }
                 for (code, detail) in &run_warnings {
-                    if code == "vendor_state_unreadable" || code == "redirect_state_unreadable" {
+                    if code == "vendor_state_unreadable" {
                         eprintln!("Error ({code}): {}", capitalize_first(detail));
                     }
                 }
@@ -2281,8 +2120,7 @@ pub(crate) async fn rollback_patches_inner(
     // `vendor --revert` undoes it wholesale. Matching mirrors apply's
     // ledger-key / base-purl / qualifier-stripped triple; the caller
     // degrades unreadable state to "nothing vendored".
-    let is_vendored =
-        |p: &str| vendored_keys.contains(p) || vendored_keys.contains(strip_purl_qualifiers(p));
+    let is_vendored = |p: &str| purl_keys_cover(vendored_keys, p);
     let (vendored_targets, patches_to_rollback): (Vec<_>, Vec<_>) = patches_to_rollback
         .into_iter()
         .partition(|p| is_vendored(&p.purl));
@@ -4671,30 +4509,29 @@ mod tests {
     #[test]
     fn rollback_prompt_singular_plural_and_clauses() {
         assert_eq!(
-            rollback_prompt(1, 0, 0, 0),
+            rollback_prompt(1, 0, 0),
             "Roll back 1 patch and remove it from the local manifest?"
         );
         assert_eq!(
-            rollback_prompt(2, 0, 0, 0),
+            rollback_prompt(2, 0, 0),
             "Roll back 2 patches and remove them from the local manifest?"
         );
-        // Never "..., and unwind" after an inner "and".
+        // Never "..., and restore" after an inner "and".
         assert_eq!(
-            rollback_prompt(1, 0, 1, 0),
-            "Roll back 1 patch, remove it from the local manifest, and unwind 1 hosted \
-             redirect?"
-        );
-        assert_eq!(rollback_prompt(0, 0, 3, 0), "Unwind 3 hosted redirects?");
-        assert_eq!(
-            rollback_prompt(0, 0, 0, 1),
-            "Replay 1 leftover hosted redirect edit?"
+            rollback_prompt(1, 0, 1),
+            "Roll back 1 patch, remove it from the local manifest, and restore 1 hosted \
+             package to the upstream registry?"
         );
         assert_eq!(
-            rollback_prompt(0, 1, 0, 0),
+            rollback_prompt(0, 0, 3),
+            "Restore 3 hosted packages to the upstream registry?"
+        );
+        assert_eq!(
+            rollback_prompt(0, 1, 0),
             "Delete 1 vendored artifact and its ledger record?"
         );
         assert_eq!(
-            rollback_prompt(0, 2, 0, 0),
+            rollback_prompt(0, 2, 0),
             "Delete 2 vendored artifacts and their ledger records?"
         );
     }
@@ -4718,13 +4555,13 @@ mod tests {
         assert_eq!(capitalize_first("path pattern x"), "Path pattern x");
         assert_eq!(capitalize_first("Already"), "Already");
         assert_eq!(capitalize_first("ülk"), "Ülk");
-        assert_eq!(capitalize_first("--one-off"), "--one-off");
+        assert_eq!(capitalize_first("--preserve-state"), "--preserve-state");
         assert_eq!(capitalize_first("cannot read x: y"), "Cannot read x: y");
         assert_eq!(capitalize_first("can't, really"), "Can't, really");
         // Values the user may copy back are never altered.
         assert_eq!(
-            capitalize_first("pkg:npm/a@1 matches only hosted redirect records"),
-            "pkg:npm/a@1 matches only hosted redirect records"
+            capitalize_first("pkg:npm/a@1 matches only hosted records"),
+            "pkg:npm/a@1 matches only hosted records"
         );
         assert_eq!(
             capitalize_first("a1b2c3d4-0000-4000-8000-000000000000 matches nothing"),

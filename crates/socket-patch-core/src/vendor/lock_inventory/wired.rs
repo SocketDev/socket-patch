@@ -6,15 +6,22 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item};
 
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK};
+use crate::formats::pnpm::PnpmLock;
 use crate::utils::digest::is_sri_pin;
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 use crate::utils::python_lock::{
     lock_artifact, lock_package_collection, package_artifacts, uv_source_location,
 };
+use crate::formats::yarn::is_berry_lock;
+use crate::vendor::bun_lock_text::{decode_json_string, split_name_spec};
 use crate::vendor::bun_lockb::BunLockb;
+use crate::vendor::yarn_berry_lock::berry_field;
+use crate::vendor::yarn_classic_lock::classic_field;
+use crate::vex::discover::{vendor_ref, vendor_ref_decorated};
 
+use super::bun::bun_text_entries;
 use super::npm::npm_lock_nodes;
-use super::recover::inline_yaml_field;
+use super::yarn::{berry_checksum_pin, berry_entries, classic_entries};
 use super::LockIntegrity;
 
 /// The integrity the REWIRED npm-family lockfile records for a vendored
@@ -23,11 +30,10 @@ use super::LockIntegrity;
 /// anchor for repair's no-ledger reconstruction: a rebuilt tarball that
 /// matches it is exactly what the package manager would have installed.
 ///
-/// package-lock/shrinkwrap are parsed as JSON; the text formats (pnpm,
-/// yarn classic/berry, bun) are scanned with a bounded forward window from
-/// each reference line. vlt yields `None`: its `file` nodes pin no
-/// integrity (slot [2] is `null`), and `vlt-lock.json` is never scanned,
-/// because the forward window would pick up a neighbouring node's sha512.
+/// package-lock/shrinkwrap are parsed as JSON, pnpm through its format
+/// model, yarn (classic and berry) and bun.lock through the entry models
+/// lockfile discovery reads. vlt yields `None`: its `file` nodes pin no
+/// integrity (slot [2] is `null`).
 pub async fn wired_vendor_integrity(
     project_root: &Path,
     artifact_rel: &str,
@@ -130,46 +136,87 @@ pub async fn wired_vendor_integrity(
         }
     }
 
-    // Text locks: any line referencing the artifact path, integrity within
-    // a short forward window (the same block).
-    for lock in [PNPM_LOCK, "yarn.lock", BUN_LOCK] {
-        let Ok(text) = read_regular_to_string(&project_root.join(lock)).await else {
-            continue;
+    // pnpm: the format model's vendored entry (every key generation).
+    if let Ok(text) = read_regular_to_string(&project_root.join(PNPM_LOCK)).await {
+        if let Some(sri) = PnpmLock::parse(&text).wired_integrity(rel) {
+            return Some(LockIntegrity::Sri(sri));
+        }
+    }
+
+    // yarn: the entry models lockfile discovery reads (live blocks only —
+    // yarn keeps the last block per pattern), classic `integrity` SRI or
+    // berry `checksum:` (yarn 4.0.x bare hex promoted under cacheKey 10c0).
+    if let Ok(text) = read_regular_to_string(&project_root.join("yarn.lock")).await {
+        let pins: Vec<LockIntegrity> = if is_berry_lock(&text) {
+            let lock = berry_entries(&text);
+            lock.entries
+                .iter()
+                .filter(|e| e.live)
+                .filter(|e| {
+                    e.locator()
+                        .and_then(|l| vendor_ref_decorated(l.reference))
+                        .is_some_and(|v| v.artifact_rel == rel)
+                })
+                .filter_map(|e| {
+                    berry_field(&e.block.lines, "checksum")
+                        .and_then(|c| berry_checksum_pin(c, lock.cache_key.as_deref()))
+                })
+                .collect()
+        } else {
+            classic_entries(&text)
+                .iter()
+                .filter(|e| e.live)
+                .filter(|e| {
+                    classic_field(&e.block.lines, "resolved")
+                        .and_then(vendor_ref_decorated)
+                        .is_some_and(|v| v.artifact_rel == rel)
+                })
+                .filter_map(|e| classic_field(&e.block.lines, "integrity"))
+                .filter(|sri| is_sri_pin(sri))
+                .map(|sri| LockIntegrity::Sri(sri.to_string()))
+                .collect()
         };
-        let lines: Vec<&str> = text.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            if !line.contains(rel) {
-                continue;
-            }
-            for probe in lines.iter().take((i + 6).min(lines.len())).skip(i) {
-                // pnpm `resolution: {integrity: …}` / classic `integrity …`
-                // / bun tuple `"sha512-…"`.
-                if let Some(v) = inline_yaml_field(probe, "integrity:") {
-                    if is_sri_pin(&v) {
-                        return Some(LockIntegrity::Sri(v));
-                    }
-                }
-                if let Some(rest) = probe.trim().strip_prefix("integrity ") {
-                    let v = rest.trim().trim_matches('"');
-                    if is_sri_pin(v) {
-                        return Some(LockIntegrity::Sri(v.to_string()));
-                    }
-                }
-                if let Some(sri) = probe.split('"').rev().find(|tok| is_sri_pin(tok)) {
-                    return Some(LockIntegrity::Sri(sri.to_string()));
-                }
-                // yarn berry: `checksum: 10c0/…`.
-                if let Some(v) = inline_yaml_field(probe, "checksum:") {
-                    if v.split_once('/')
-                        .is_some_and(|(k, b)| !k.is_empty() && !b.is_empty())
-                    {
-                        return Some(LockIntegrity::BerryChecksum(v));
-                    }
-                }
+        if let Some(pin) = unanimous(pins) {
+            return Some(pin);
+        }
+    }
+
+    // bun.lock: our tarball tuple `[spec, {meta}, "sha512-…"]` (bun
+    // < 1.3.10 re-saves it digest-less, which pins nothing).
+    if let Ok(text) = read_regular_to_string(&project_root.join(BUN_LOCK)).await {
+        if let Ok(entries) = bun_text_entries(&text) {
+            let pins: Vec<LockIntegrity> = entries
+                .iter()
+                .filter(|e| {
+                    matches!(e.elems.len(), 2 | 3)
+                        && e.elems[1].starts_with('{')
+                        && e.elems
+                            .first()
+                            .and_then(|spec| decode_json_string(spec))
+                            .is_some_and(|spec| {
+                                split_name_spec(&spec)
+                                    .and_then(|(_, target)| vendor_ref(target))
+                                    .is_some_and(|v| v.artifact_rel == rel)
+                            })
+                })
+                .filter_map(|e| e.elems.get(2).and_then(|sri| decode_json_string(sri)))
+                .filter(|sri| is_sri_pin(sri))
+                .map(LockIntegrity::Sri)
+                .collect();
+            if let Some(pin) = unanimous(pins) {
+                return Some(pin);
             }
         }
     }
     None
+}
+
+/// The one pin every entry agrees on; `None` when there is none or the
+/// entries disagree (no anchor beats a wrong one).
+fn unanimous(pins: Vec<LockIntegrity>) -> Option<LockIntegrity> {
+    let mut pins = pins.into_iter();
+    let first = pins.next()?;
+    pins.all(|p| p == first).then_some(first)
 }
 
 #[cfg(test)]

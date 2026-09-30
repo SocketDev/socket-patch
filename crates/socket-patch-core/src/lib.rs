@@ -1,21 +1,22 @@
 pub mod api;
 pub mod constants;
 pub mod crawlers;
+pub mod formats;
 pub mod hash;
+pub mod hosted;
+pub mod ledgers;
 pub mod manifest;
-pub mod package_json;
 pub mod patch;
-pub mod setup;
+pub mod policy;
+pub mod rollout;
 pub mod telemetry;
 pub mod update;
 pub mod utils;
 pub mod vendor;
 pub mod vex;
 
-// Moved modules — these aliases keep the old top-level paths compiling for
-// external consumers of the published crate. Internal code must import the
-// canonical `setup::*` paths; CI greps reject new uses of the old ones.
-// Drop these aliases at 5.0.
-pub use setup::composer as composer_setup;
-pub use setup::gem as gem_setup;
-pub use setup::pypi as pth_hook;
+
+#[cfg(test)]
+mod golden;
+#[cfg(test)]
+mod test_rng;

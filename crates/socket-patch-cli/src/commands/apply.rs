@@ -17,6 +17,7 @@ use socket_patch_core::patch::redirect::golang_local::{
 use socket_patch_core::telemetry::{track_patch_applied, track_patch_apply_failed};
 use socket_patch_core::utils::purl::parse_golang_purl;
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::vendor::purl_keys_cover;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -69,7 +70,7 @@ fn warn_mismatch_overwrites(result: &ApplyResult, common: &GlobalArgs) {
 fn format_mismatch_warning(purl: &str, file: &str, dry_run: bool) -> String {
     let what = if dry_run { "would apply" } else { "applied" };
     format!(
-        "Warning (content_mismatch_overwritten): {purl} {file} did not match the patch's \
+        "Warning: {purl} {file} did not match the patch's \
          expected original content; {what} the full verified patched content instead \
          (pass --strict to fail on mismatches)"
     )
@@ -246,11 +247,10 @@ async fn mismatch_blob_gaps(
             .iter()
             .filter(|(key, _)| *key == purl || strip_purl_qualifiers(key) == stripped)
             .collect();
-        if vendored_purls.contains(purl.as_str())
-            || vendored_purls.contains(stripped)
+        if purl_keys_cover(vendored_purls, purl)
             || records
                 .iter()
-                .any(|(key, _)| vendored_purls.contains(key.as_str()))
+                .any(|(key, _)| purl_keys_cover(vendored_purls, key))
         {
             continue;
         }
@@ -765,7 +765,8 @@ pub async fn run(args: ApplyArgs) -> i32 {
     let manifest_path = args.common.resolved_manifest_path();
 
     // No manifest → nothing to apply: a clean exit-0 no-op (load-bearing
-    // for the install hooks, which run `apply --silent` on every install).
+    // for CI steps and legacy install hooks that run `apply --silent` on
+    // every install).
     // Nothing below this gate is touched — no API client (its config read,
     // stderr advisory and org-slug round-trip), no lock, no `.socket/`.
     if tokio::fs::metadata(&manifest_path).await.is_err() {
@@ -1033,11 +1034,11 @@ pub(crate) async fn run_locked(
                     // own `Error:` diagnostic (already printed, even under
                     // --silent); they exist for the JSON envelope.
                     if !is_stage_failure_code(&w.code) {
-                        eprintln!("Warning ({}): {}", w.code, w.detail);
+                        eprintln!("Warning: {}", w.detail);
                     }
                 }
                 for skip in &fallback_skips {
-                    eprintln!("Warning (gem_fallback_home_skipped): {}", skip.detail());
+                    eprintln!("Warning: {}", skip.detail());
                 }
             }
 
@@ -1297,8 +1298,7 @@ fn synthesize_vendor_owned_results(
     target_manifest_purls: &HashSet<String>,
     vendored_purls: &HashSet<String>,
 ) -> (Vec<ApplyResult>, HashSet<String>, HashSet<String>) {
-    let is_vendored =
-        |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
+    let is_vendored = |p: &str| purl_keys_cover(vendored_purls, p);
     let mut results: Vec<ApplyResult> = Vec::new();
     let mut matched: HashSet<String> = HashSet::new();
     let mut vendored_targets: Vec<String> = target_manifest_purls
@@ -1715,8 +1715,7 @@ async fn apply_patches_inner(
     // release-variant manifest keys (pypi `?artifact_id=`…) hit too;
     // unreadable state degrades to "nothing vendored" (fail-open).
     let vendored_purls = socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await;
-    let is_vendored =
-        |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
+    let is_vendored = |p: &str| purl_keys_cover(&vendored_purls, p);
     let (mut results, mut matched_manifest_purls, vendored_bases) =
         synthesize_vendor_owned_results(&target_manifest_purls, &vendored_purls);
 
@@ -2331,7 +2330,7 @@ mod tests {
     fn applied_event_emits_one_file_entry_per_patched_file() {
         let mut applied_via = HashMap::new();
         applied_via.insert("package/a.js".to_string(), CoreAppliedVia::Diff);
-        applied_via.insert("package/b.js".to_string(), CoreAppliedVia::Package);
+        applied_via.insert("package/b.js".to_string(), CoreAppliedVia::Diff);
         applied_via.insert("package/c.js".to_string(), CoreAppliedVia::Blob);
         let result = ApplyResult {
             package_key: "pkg:npm/foo@1.0.0".to_string(),
@@ -2358,7 +2357,7 @@ mod tests {
             .map(|f| (f["path"].as_str().unwrap().to_string(), f))
             .collect();
         assert_eq!(by_path["package/a.js"]["appliedVia"], "diff");
-        assert_eq!(by_path["package/b.js"]["appliedVia"], "package");
+        assert_eq!(by_path["package/b.js"]["appliedVia"], "diff");
         assert_eq!(by_path["package/c.js"]["appliedVia"], "blob");
     }
 
@@ -3108,7 +3107,7 @@ mod tests {
     fn mismatch_messages_follow_dry_run_tense() {
         assert_eq!(
             format_mismatch_warning("pkg:npm/nuxt@4.5.0", "dist/index.mjs", false),
-            "Warning (content_mismatch_overwritten): pkg:npm/nuxt@4.5.0 dist/index.mjs did \
+            "Warning: pkg:npm/nuxt@4.5.0 dist/index.mjs did \
              not match the patch's expected original content; applied the full verified \
              patched content instead (pass --strict to fail on mismatches)"
         );

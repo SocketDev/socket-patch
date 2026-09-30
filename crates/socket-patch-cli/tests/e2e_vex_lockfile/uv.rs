@@ -10,7 +10,7 @@
 //! rewriters (`rewrite_python_lock`, `rewrite_project_metadata`,
 //! `rewrite_script_metadata`) over real uv output (uv 0.11 `uv lock` /
 //! `uv lock --script` / `uv export --format pylock.toml` grammar), and the
-//! writer-driven cells run the real `scan --redirect --vex` / `scan --vendor
+//! writer-driven cells run the real `scan --mode hosted --vex` / `scan --vendor
 //! --vex` binaries against a wiremock patch API. The package is a made-up
 //! `vexfixture`, so no interpreter's global site-packages on the test host
 //! can hold a copy (a no-venv python project falls back to the global
@@ -36,7 +36,7 @@
 //!      installed + patched → attests after hashing; installed pristine →
 //!      `not_applied`; a pin-less hosted entry needs an installed tree.
 //!
-//! Plus the embedded entry points (`scan --redirect --vex`, `scan --vendor
+//! Plus the embedded entry points (`scan --mode hosted --vex`, `scan --vendor
 //! --vex`, `apply --vex`).
 
 use crate::vex_e2e_common;
@@ -1367,7 +1367,7 @@ fn pinless_hosted_entry_needs_an_installed_tree() {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Writer-driven: the REAL `scan --redirect --vex` / `scan --vendor --vex`
+// Writer-driven: the REAL `scan --mode hosted --vex` / `scan --vendor --vex`
 // write the wiring and the ledgers; then the manifest (and the ledgers) are
 // deleted and standalone `vex` must still attest — and stop attesting once
 // the real revert unwinds the wiring with the ledger left behind.
@@ -1379,7 +1379,7 @@ impl Api {
     /// per-package search, the hosted grant (`artifact_url` pinned to
     /// `sha256`), the authenticated view with inline blob content, plus the
     /// public-proxy view `vex` falls back to and the hosted wheel itself
-    /// (`scan --redirect` reads a uv lock's wheel METADATA from it).
+    /// (`scan --mode hosted` reads a uv lock's wheel METADATA from it).
     fn serve_scan_routes(
         &self,
         flavor: Flavor,
@@ -1515,14 +1515,14 @@ fn writer_flavors() -> Vec<Flavor> {
     flavors(Mode::Hosted)
 }
 
-/// `scan --redirect --vex` on a lock-only checkout (nothing installed; an
+/// `scan --mode hosted --vex` on a lock-only checkout (nothing installed; an
 /// empty in-project venv keeps the crawl off the host interpreters) writes
-/// the hosted wiring + the redirect ledger and attests in-run; afterwards,
-/// with no manifest:
-///   c. the ledger alone attests offline;
-///   b. without the ledger, offline is `record_unavailable` with no request;
-///   a. without the ledger, online (public-proxy view) attests;
-///   d. `rollback` unwinds the wiring; with the ledger put back, it is dead.
+/// the hosted wiring — and NO ledger (v5) — and attests in-run from this
+/// run's records; afterwards, with no manifest:
+///   b. offline is `record_unavailable` with no request (the lock carries
+///      no record, and nothing else local does);
+///   a. online (public-proxy view) attests;
+///   d. the wiring reverted to the native files: nothing is discovered.
 ///
 /// uv locks are wired to the mock's origin (the writer fetches the hosted
 /// wheel's METADATA for them), so `vex` is told that origin is the patch
@@ -1531,7 +1531,7 @@ fn writer_flavors() -> Vec<Flavor> {
 #[test]
 fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
     for flavor in writer_flavors() {
-        let what = format!("{} scan --redirect", flavor.label());
+        let what = format!("{} scan --mode hosted", flavor.label());
         let p = Proj::new();
         p.write_files(&flavor.native_files());
         std::fs::create_dir_all(p.site()).unwrap();
@@ -1555,7 +1555,7 @@ fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
             &api,
             &[
                 "scan",
-                "--redirect",
+                "--mode=hosted",
                 "--vex",
                 embedded.to_str().unwrap(),
                 "--vex-product",
@@ -1568,7 +1568,10 @@ fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
             lock.contains(&artifact_url),
             "{what}: lock not wired:\n{lock}"
         );
-        assert!(p.exists(".socket/vendor/redirect-state.json"), "{what}");
+        assert!(
+            !p.exists(".socket/vendor/redirect-state.json"),
+            "{what}: v5 hosted mode writes no ledger"
+        );
         assert!(
             !p.exists(".socket/manifest.json"),
             "{what}: hosted writes no manifest"
@@ -1582,24 +1585,8 @@ fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
             Vec::new()
         };
 
-        // c. the writer's ledger attests offline.
+        // b / a. the wiring alone (the writer left no ledger).
         let before = api.requests();
-        let (code, env, doc) = vex_offline(&p, &api, &origin);
-        assert_attested(
-            &format!("{what} ledger"),
-            code,
-            &env,
-            &doc,
-            &flavor.api_purl(),
-            HOSTED_UUID,
-            Mode::Hosted,
-        );
-        assert_eq!(api.requests(), before, "{what}: offline made a request");
-
-        // b / a. no ledger.
-        let ledger_path = p.root.join(".socket/vendor/redirect-state.json");
-        let ledger = std::fs::read(&ledger_path).unwrap();
-        std::fs::remove_file(&ledger_path).unwrap();
         let (code, env, doc) = vex_offline(&p, &api, &origin);
         assert_omitted(
             &format!("{what} no ledger offline"),
@@ -1622,29 +1609,17 @@ fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
         );
         assert_no_manifest_written(&p, &what);
 
-        // d. the real revert, then the ledger restored behind its back.
-        std::fs::write(&ledger_path, &ledger).unwrap();
-        let (code, env) = run_authed(&p, &api, &["rollback"]);
-        assert_eq!(code, Some(0), "{what} rollback: {env}");
-        for (name, text) in flavor.native_files() {
-            assert_eq!(p.read(name), text, "{what}: rollback restores {name}");
-        }
-        // A fully reverted project keeps no `.socket/` at all: recreate the
-        // directory the stale ledger is planted back into.
-        std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
-        std::fs::write(&ledger_path, &ledger).unwrap();
+        // d. the wiring reverted to the native files: no hosted state is
+        // left anywhere, so nothing is discovered.
+        p.write_files(&flavor.native_files());
         for extra in [&[][..], &["--no-verify"][..]] {
             let mut args = origin.clone();
             args.extend_from_slice(extra);
             let (code, env, doc) = vex_offline(&p, &api, &args);
-            assert_omitted(
-                &format!("{what} reverted {extra:?}"),
-                code,
-                &env,
-                &doc,
-                &flavor.purl(),
-                "redirect_unwired",
-            );
+            let cell = format!("{what} reverted {extra:?}");
+            assert_eq!(code, Some(2), "{cell}: {env}");
+            assert_eq!(env["error"]["code"], "manifest_not_found", "{cell}: {env}");
+            assert!(doc.is_none(), "{cell}: {doc:?}");
         }
     }
 }
@@ -1659,142 +1634,132 @@ fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
 ///   a. without the ledger, online attests (the committed wheel is hashed);
 ///   d. `vendor --revert` unwinds the wiring; with the ledger put back (and
 ///      the artifact re-committed) it is `vendor_unwired`.
-/// The `--detached` twin (a hidden compatibility no-op) behaves the same.
 #[test]
 fn scan_vendor_wiring_attests_without_manifest_or_ledger() {
-    for detached in [false, true] {
-        for flavor in writer_flavors() {
-            if matches!(flavor, Flavor::UvLockOnly) {
-                // uv vendoring always edits the pyproject/lock pair.
-                continue;
-            }
-            let what = format!(
-                "{} scan --vendor{}",
-                flavor.label(),
-                if detached { " --detached" } else { "" }
-            );
-            let p = Proj::new();
-            p.write_files(&flavor.native_files());
-            p.install(flavor.version(), PRISTINE);
-            let api = Api::start();
-            api.serve_scan_routes(
-                flavor,
-                VENDORED_UUID,
-                &flavor.hosted_url(VENDORED_UUID),
-                build_wheel(flavor.version(), PATCHED),
-            );
-            let embedded = p.root.join("embedded.vex.json");
-            let mut args = vec![
-                "scan",
-                "--vendor",
-                "--vendor-source",
-                "build",
-                "--vex",
-                embedded.to_str().unwrap(),
-                "--vex-product",
-                PRODUCT,
-            ];
-            if detached {
-                args.push("--detached");
-            }
-            let (code, env) = run_authed(&p, &api, &args);
-            assert_eq!(code, Some(0), "{what}: {env}");
-            assert_embedded_doc(&what, &embedded, VENDORED_UUID, Mode::Vendored);
-            let lock = p.read(flavor.lock_file());
-            assert!(
-                lock.contains(&format!(".socket/vendor/pypi/{VENDORED_UUID}/")),
-                "{what}: lock not wired:\n{lock}"
-            );
-            assert!(
-                !p.exists(".socket/manifest.json"),
-                "{what}: vendored mode is manifest-free (--detached is a no-op)"
-            );
-            // The installed tree stays pristine: vendoring never patches it.
-            assert_eq!(std::fs::read(p.site().join(MODULE)).unwrap(), PRISTINE);
-            // A legacy (pre-5.0) checkout also carries the manifest record
-            // beside the ledger: same uuid, so it attests the same way.
-            assert!(vex_e2e_common::seed_legacy_manifest(&p.root) > 0, "{what}");
-            let (code, env, doc) = vex_offline(&p, &api, &[]);
-            assert_attested(
-                &format!("{what} legacy manifest"),
-                code,
-                &env,
-                &doc,
-                &flavor.api_purl(),
-                VENDORED_UUID,
-                Mode::Vendored,
-            );
-            vex_e2e_common::strip_manifest(&p.root);
+    for flavor in writer_flavors() {
+        if matches!(flavor, Flavor::UvLockOnly) {
+            // uv vendoring always edits the pyproject/lock pair.
+            continue;
+        }
+        let what = format!("{} scan --vendor", flavor.label());
+        let p = Proj::new();
+        p.write_files(&flavor.native_files());
+        p.install(flavor.version(), PRISTINE);
+        let api = Api::start();
+        api.serve_scan_routes(
+            flavor,
+            VENDORED_UUID,
+            &flavor.hosted_url(VENDORED_UUID),
+            build_wheel(flavor.version(), PATCHED),
+        );
+        let embedded = p.root.join("embedded.vex.json");
+        let args = vec![
+            "scan",
+            "--vendor",
+            "--vendor-source",
+            "build",
+            "--vex",
+            embedded.to_str().unwrap(),
+            "--vex-product",
+            PRODUCT,
+        ];
+        let (code, env) = run_authed(&p, &api, &args);
+        assert_eq!(code, Some(0), "{what}: {env}");
+        assert_embedded_doc(&what, &embedded, VENDORED_UUID, Mode::Vendored);
+        let lock = p.read(flavor.lock_file());
+        assert!(
+            lock.contains(&format!(".socket/vendor/pypi/{VENDORED_UUID}/")),
+            "{what}: lock not wired:\n{lock}"
+        );
+        assert!(
+            !p.exists(".socket/manifest.json"),
+            "{what}: vendored mode is manifest-free"
+        );
+        // The installed tree stays pristine: vendoring never patches it.
+        assert_eq!(std::fs::read(p.site().join(MODULE)).unwrap(), PRISTINE);
+        // A legacy (pre-5.0) checkout also carries the manifest record
+        // beside the ledger: same uuid, so it attests the same way.
+        assert!(vex_e2e_common::seed_legacy_manifest(&p.root) > 0, "{what}");
+        let (code, env, doc) = vex_offline(&p, &api, &[]);
+        assert_attested(
+            &format!("{what} legacy manifest"),
+            code,
+            &env,
+            &doc,
+            &flavor.api_purl(),
+            VENDORED_UUID,
+            Mode::Vendored,
+        );
+        vex_e2e_common::strip_manifest(&p.root);
 
-            // c. the ledger alone.
-            let before = api.requests();
-            let (code, env, doc) = vex_offline(&p, &api, &[]);
-            assert_attested(
-                &format!("{what} ledger"),
-                code,
-                &env,
-                &doc,
-                &flavor.api_purl(),
-                VENDORED_UUID,
-                Mode::Vendored,
-            );
-            assert_eq!(api.requests(), before, "{what}: offline made a request");
+        // c. the ledger alone.
+        let before = api.requests();
+        let (code, env, doc) = vex_offline(&p, &api, &[]);
+        assert_attested(
+            &format!("{what} ledger"),
+            code,
+            &env,
+            &doc,
+            &flavor.api_purl(),
+            VENDORED_UUID,
+            Mode::Vendored,
+        );
+        assert_eq!(api.requests(), before, "{what}: offline made a request");
 
-            // b / a. no ledger.
-            let ledger_path = p.root.join(".socket/vendor/state.json");
-            let ledger = std::fs::read(&ledger_path).unwrap();
-            std::fs::remove_file(&ledger_path).unwrap();
-            let (code, env, doc) = vex_offline(&p, &api, &[]);
+        // b / a. no ledger.
+        let ledger_path = p.root.join(".socket/vendor/state.json");
+        let ledger = std::fs::read(&ledger_path).unwrap();
+        std::fs::remove_file(&ledger_path).unwrap();
+        let (code, env, doc) = vex_offline(&p, &api, &[]);
+        assert_omitted(
+            &format!("{what} no ledger offline"),
+            code,
+            &env,
+            &doc,
+            &flavor.purl(),
+            "record_unavailable",
+        );
+        assert_eq!(api.requests(), before, "{what}: offline made a request");
+        let (code, env, doc) = vex_online(&p, &api, &[]);
+        assert_attested(
+            &format!("{what} no ledger online"),
+            code,
+            &env,
+            &doc,
+            &flavor.api_purl(),
+            VENDORED_UUID,
+            Mode::Vendored,
+        );
+        assert_no_manifest_written(&p, &what);
+
+        // d. the real revert, then the ledger + artifact put back.
+        std::fs::write(&ledger_path, &ledger).unwrap();
+        let artifact_dir = p.root.join(format!(".socket/vendor/pypi/{VENDORED_UUID}"));
+        let artifacts: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(&artifact_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| (e.path(), std::fs::read(e.path()).unwrap()))
+            .collect();
+        let (code, env) = run_authed(&p, &api, &["vendor", "--revert"]);
+        assert_eq!(code, Some(0), "{what} revert: {env}");
+        for (name, text) in flavor.native_files() {
+            assert_eq!(p.read(name), text, "{what}: revert restores {name}");
+        }
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        for (path, bytes) in &artifacts {
+            std::fs::write(path, bytes).unwrap();
+        }
+        std::fs::write(&ledger_path, &ledger).unwrap();
+        for extra in [&[][..], &["--no-verify"][..]] {
+            let (code, env, doc) = vex_offline(&p, &api, extra);
             assert_omitted(
-                &format!("{what} no ledger offline"),
+                &format!("{what} reverted {extra:?}"),
                 code,
                 &env,
                 &doc,
                 &flavor.purl(),
-                "record_unavailable",
+                "vendor_unwired",
             );
-            assert_eq!(api.requests(), before, "{what}: offline made a request");
-            let (code, env, doc) = vex_online(&p, &api, &[]);
-            assert_attested(
-                &format!("{what} no ledger online"),
-                code,
-                &env,
-                &doc,
-                &flavor.api_purl(),
-                VENDORED_UUID,
-                Mode::Vendored,
-            );
-            assert_no_manifest_written(&p, &what);
-
-            // d. the real revert, then the ledger + artifact put back.
-            std::fs::write(&ledger_path, &ledger).unwrap();
-            let artifact_dir = p.root.join(format!(".socket/vendor/pypi/{VENDORED_UUID}"));
-            let artifacts: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(&artifact_dir)
-                .unwrap()
-                .flatten()
-                .map(|e| (e.path(), std::fs::read(e.path()).unwrap()))
-                .collect();
-            let (code, env) = run_authed(&p, &api, &["vendor", "--revert"]);
-            assert_eq!(code, Some(0), "{what} revert: {env}");
-            for (name, text) in flavor.native_files() {
-                assert_eq!(p.read(name), text, "{what}: revert restores {name}");
-            }
-            std::fs::create_dir_all(&artifact_dir).unwrap();
-            for (path, bytes) in &artifacts {
-                std::fs::write(path, bytes).unwrap();
-            }
-            std::fs::write(&ledger_path, &ledger).unwrap();
-            for extra in [&[][..], &["--no-verify"][..]] {
-                let (code, env, doc) = vex_offline(&p, &api, extra);
-                assert_omitted(
-                    &format!("{what} reverted {extra:?}"),
-                    code,
-                    &env,
-                    &doc,
-                    &flavor.purl(),
-                    "vendor_unwired",
-                );
-            }
         }
     }
 }
@@ -1841,11 +1806,14 @@ fn embedded_vex(p: &Proj, command: &str, extra: &[&str]) -> (Option<i32>, Value,
 /// the embedded VEX (`generate_vex_without_manifest`) rather than return
 /// `noManifest` / exit 0 with the requested document silently never
 /// written. Every flavor × mode, with
-/// the writer's ledger and fully offline: the document is written (exit 0,
-/// envelope `vex` summary) with the right marker; `--dry-run` writes none;
-/// the lock reverted with the ledger left behind fails the command (exit 1,
+/// a committed ledger (vendored: the vendor ledger; hosted: a PRE-v5
+/// redirect ledger, which v5 still reads as a local record source) and
+/// fully offline: the document is written (exit 0, envelope `vex` summary)
+/// with the right marker; `--dry-run` writes none; the lock reverted with
+/// the ledger left behind fails the command (exit 1,
 /// `no_applicable_patches`) and leaves no stale document; and a project with
-/// NOTHING wired keeps the calm no-op.
+/// NOTHING wired keeps the calm no-op. `vendor` skips the hosted cells: over
+/// hosted pins it is the v5 eject flow, not a manifest-less VEX run.
 #[test]
 fn embedded_apply_and_vendor_vex_attest_manifest_less_checkouts() {
     for command in ["apply", "vendor"] {
@@ -1859,6 +1827,9 @@ fn embedded_apply_and_vendor_vex_attest_manifest_less_checkouts() {
         assert!(doc.is_none(), "{command}: nothing to attest, no document");
 
         for mode in [Mode::Hosted, Mode::Vendored] {
+            if command == "vendor" && mode == Mode::Hosted {
+                continue;
+            }
             for flavor in flavors(mode) {
                 let what = format!("{command} --vex {} {mode:?}", flavor.label());
                 let p = Proj::new();

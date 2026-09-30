@@ -1,8 +1,10 @@
 # Configuration design: env vars, the socket-cli config file, and what we deliberately don't read
 
-Status: **implemented** (v3.5). This document records the settled design so
-future configuration surface grows inside it instead of inventing new
-mechanisms.
+Status: **implemented** (v3.5); section 4 (`socket.yml` patch policy) is
+**implemented** in v5.0 for its filters (`socket_patch_core::policy`; the
+per-run cap follows with `--max-new-patches`, see `staged-rollout.md`). This document records the
+settled design so future configuration surface grows inside it instead of
+inventing new mechanisms.
 
 ## Problem
 
@@ -69,12 +71,56 @@ UX policy and are ignored.
 - The python `socketsecurity` CLI already accepts `SOCKET_API_TOKEN`, so
   the canonical names are the cross-tool bridge; no `SOCKET_SECURITY_*`
   aliases were added.
-- `socket.yml` stays a scanning-product surface (projectIgnorePaths /
-  issueRules / githubApp); socket-patch does not read it.
+- `socket.yml` is shared with the scanning product (projectIgnorePaths /
+  triggerPaths / issueRules / githubApp). As of v5.0 socket-patch reads
+  exactly two of its keys, `projectIgnorePaths` and a new `patches` block,
+  and nothing else (section 4).
 - `SOCKET_PROXY_URL` (the public patch **endpoint**) must never be
   conflated with socket-cli's `apiProxy` (an HTTP **forward proxy**).
   Forward-proxy behavior comes from the standard
   `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` vars, which reqwest honors.
+
+### 4. `socket.yml` carries patch selection policy, never settings (v5.0)
+
+Revisits the v3.5 position that socket-patch does not read `socket.yml`.
+Staged rollout needs a repo-owned, reviewable place to say which projects,
+ecosystems and packages may be patched, a severity floor and a per-run cap
+on new patches (`staged-rollout.md`). `socket.yml` is where Socket users
+already express repo policy, it lives at the repo root, and a new
+top-level `patches:` key is stripped or ignored by every existing parser.
+
+The trust boundary is unchanged and gains its positive half:
+
+- A repository file may **narrow or pace** what `scan` patches. It may
+  never widen it, name an endpoint or credential, choose a mode or download
+  format, or disable a safety interlock. The parser has no fields for any
+  of those; such keys are unknown keys and fail validation.
+- Because the file only narrows, an unreadable file or an invalid
+  `patches` block fails closed (exit 1, `socket_yml_invalid`, nothing
+  written) instead of being treated as absent. (A repo with no `patches`
+  block and a malformed `projectIgnorePaths` gets a warning, so repos that
+  never opted in do not start failing.) This is the opposite of the socket-cli `config.json` rule above
+  (corrupt → warn and ignore), and deliberately so: ignoring a broken
+  user-level login file loses a convenience; ignoring a broken repo policy
+  widens the rollout.
+- Lookup is bounded to the repository (nearest `.git` ancestor of
+  `--cwd` owned by the user, honoring `GIT_CEILING_DIRECTORIES`, else
+  `--cwd`), root files only, regular files only.
+- Flags and env vars still win over the file for scalars (CLI > env >
+  file > default) and intersect with it for list filters;
+  `--no-socket-yml` / `SOCKET_NO_SOCKET_YML` ignores the file.
+- Only `scan` (every mode) and the in-memory engine honor it. Commands
+  that report, attest or undo existing state (`list`, `vex`, `rollback`,
+  `remove`, `repair`, `apply`, `vendor`) ignore it; `get` bypasses it with
+  a warning.
+
+Implementation: `socket_patch_core::policy` (`SelectionPolicy::load` over a
+`PolicyFs`: `DiskPolicyFs` for a checkout, `MemoryPolicyFs` for the
+in-memory engine) parses the file as a YAML 1.2 event stream (serde-saphyr's
+parser, so aliases are never expanded) and validates only `version`,
+`projectIgnorePaths` and `patches`. Disk scan glue lives in
+`commands/scan/policy.rs`; the flags in `commands/scan/socket_yml_args.rs`.
+The full contract is CLI_CONTRACT.md "socket.yml patch policy".
 
 ## Explicitly rejected
 
@@ -83,21 +129,21 @@ UX policy and are ignored.
 | Auto-loading `.env` / `.env.local` | Trust boundary: the tool mutates installed packages while holding an API token; a file in a *cloned repo* must never redirect endpoints, disable interlocks, or spend the token. Also the wrong convention class — npm/cargo/pip/git read no `.env`; dotenv is an app-runtime convention. Users who want it have direnv/mise/dotenvx. |
 | A new socket-patch config file (`.socket/config.toml`, …) | Duplicates socket-cli's persisted config; one more file format to trust, document, and migrate. |
 | Writing to socket-cli's `config.json` | No login flow here; shared mutable state and format drift for zero benefit. |
-| Honoring endpoints/credentials from repo-level files (manifest, socket.yml) | Same trust boundary as `.env`. Stated as a contract property in `CLI_CONTRACT.md`. |
+| Honoring endpoints/credentials/interlock switches from repo-level files (manifest, socket.yml) | Same trust boundary as `.env`. Stated as a contract property in `CLI_CONTRACT.md`. Selection policy that only narrows is the one exception (section 4). |
+| A `version: 3` socket.yml for the `patches` block | socket-cli rejects any version but 2; older ajv parsers would treat 3 as 2 anyway. The block is additive under `version: 2`. |
+| Per-directory `socket.yml` files | No existing consumer supports them; one root file with `includePaths` covers monorepos. |
 | `SOCKET_CLI_CONFIG` (ephemeral full-JSON config override) | Imports socket-cli's whole config vocabulary as a permanent compat contract. |
 | Mapping `apiProxy` → anything | Forward-proxy vs patch-endpoint semantic trap; `HTTP_PROXY` et al. already work. |
 | `enforcedOrgs` / `skipAskToPersistDefaultOrg` | Interactive socket-cli UX policy with no socket-patch analog. |
 
 ## Deferred (designated homes, no implementation yet)
 
-- **Project-level behavioral defaults** (`ecosystems`, `downloadMode`,
-  `vendorSource`): if demand materializes, they go in the manifest `setup`
-  block (`setup.defaults`, camelCase) — the manifest already controls what
-  gets patched, so behavioral defaults there grant no new capability, and
-  the serde struct simply has no fields for URLs/credentials/interlocks.
-  Requires teaching the TS zod twin
-  (`npm/socket-patch/src/schema/manifest-schema.ts`) to model `setup`.
-  Precedence would be flag > env > `setup.defaults` > default.
+- **Project-level behavioral defaults** (`downloadMode`, `vendorSource`,
+  mode): not planned. The v3.5 idea of a manifest `setup.defaults` block is
+  obsolete in v5 (hosted and vendored projects have no manifest and `setup`
+  is removed). Selection policy (ecosystems, packages, paths, severity,
+  per-run cap) went to `socket.yml` `patches` instead (section 4). Anything
+  that is not pure narrowing stays out of repo files.
 - **Env cleanup sweep**: core's direct env readers (`SOCKET_OFFLINE` in
   `utils/env_compat.rs`, `SOCKET_TELEMETRY_DISABLED` in `telemetry.rs`)
   still match only `1|true`, unlike `parse_bool_flag`'s vocabulary (the CLI
@@ -111,6 +157,13 @@ UX policy and are ignored.
   config-file path exists.
 
 ## Test strategy (how this stays true)
+
+- socket.yml policy: table-driven unit tests in
+  `socket-patch-core/src/policy/` (every validation row, the lookup and
+  file-access rules, and a golden fixture generated from the npm `ignore`
+  package by `scripts/gen-ignore-golden.mjs`), the parser contract in
+  `tests/cli_parse_scan.rs`, disk e2e in `tests/e2e_socket_yml_policy.rs`
+  and disk/memory parity in `tests/hosted_memory_parity.rs`.
 
 - `tests/cli_config_fallback.rs` spawns the binary against fixture
   `config.json` files (fresh process per case — the disk read is cached per

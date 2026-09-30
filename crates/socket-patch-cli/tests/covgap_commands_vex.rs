@@ -1,5 +1,6 @@
 //! Coverage-gap tests for `commands/vex.rs`: the
-//! corrupt-ledger/corrupt-manifest hard-error family, the multi-manifest
+//! corrupt-ledger/corrupt-manifest family (hard errors, plus the advisory
+//! malformed pre-v5 redirect ledger), the multi-manifest
 //! product auto-detect warning echo, and the four skip guards in the
 //! go-patches `replace` synthesis (including the SECURITY fail-closed
 //! coordinate guard on tamper-able `go.mod` lines).
@@ -16,7 +17,7 @@ use std::process::Command;
 use serde_json::Value;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{
-    PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
+    PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 use socket_patch_core::vendor::state::{
     VendorArtifact, VendorEntry, VendorState, WiringAction, WiringRecord,
@@ -25,10 +26,6 @@ use socket_patch_core::vendor::state::{
 /// Canonical-grammar patch UUID (the vendored-artifact verifier validates
 /// the uuid path level, so fixtures must use the real shape).
 const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
-
-/// Every setup-supported ecosystem, declared `manual` so the property-7
-/// setup-state filter doesn't interfere with tests that aren't about it.
-const ALL_MANUAL: &[&str] = &["npm", "pypi", "cargo", "golang", "gem", "composer"];
 
 /// A prior successful run's minimal-but-recognizable OpenVEX document (the
 /// `@context` names openvex.dev, which is what `remove_stale_vex_doc` keys
@@ -56,19 +53,13 @@ fn cli() -> Command {
     cmd
 }
 
-/// Write `manifest` to `<cwd>/.socket/manifest.json`, declaring every
-/// setup-supported ecosystem `manual` so property 7 keeps the patches.
+/// Write `manifest` to `<cwd>/.socket/manifest.json`.
 fn write_manifest(cwd: &Path, manifest: &PatchManifest) {
     let dir = cwd.join(".socket");
     std::fs::create_dir_all(&dir).unwrap();
-    let mut m = manifest.clone();
-    m.setup = Some(SetupConfig {
-        exclude: Vec::new(),
-        manual: ALL_MANUAL.iter().map(|s| s.to_string()).collect(),
-    });
     std::fs::write(
         dir.join("manifest.json"),
-        serde_json::to_string_pretty(&m).unwrap(),
+        serde_json::to_string_pretty(manifest).unwrap(),
     )
     .unwrap();
 }
@@ -233,26 +224,46 @@ fn corrupt_manifest_json_envelope_carries_code_and_removes_stale_doc() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// corrupt redirect ledger → `redirect_ledger_corrupt`, exit 2 (redirect ledger load)
+// corrupt pre-v5 redirect ledger → `redirect_ledger_corrupt` WARNING
 //
-// The module doc promises a HARD error for a present-but-malformed
-// `.socket/vendor/redirect-state.json`: attesting with its records
-// silently dropped would produce a false document. No manifest is laid
-// down — the ledger load must error BEFORE the empty-manifest /
-// manifest_not_found check, which is itself an ordering assertion.
+// v5 hosted mode keeps no ledger: hosted references come from the
+// lockfiles and their records from the API. A pre-v5
+// `.socket/vendor/redirect-state.json` is only an extra local record
+// source, so a malformed one is an advisory — its records are simply not
+// consulted, the run proceeds to its normal outcome, and (vex being a
+// read-only consumer) the file is left byte-identical, never quarantined.
 // ──────────────────────────────────────────────────────────────────────
 
-/// Plant a malformed redirect ledger at its canonical path.
+const CORRUPT_REDIRECT_LEDGER: &str = "{{{";
+
+/// Plant a malformed pre-v5 redirect ledger at its canonical path.
 fn write_corrupt_redirect_ledger(cwd: &Path) {
     let dir = cwd.join(".socket/vendor");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("redirect-state.json"), "{{{").unwrap();
+    std::fs::write(dir.join("redirect-state.json"), CORRUPT_REDIRECT_LEDGER).unwrap();
+}
+
+fn assert_redirect_ledger_untouched(cwd: &Path) {
+    assert_eq!(
+        std::fs::read_to_string(cwd.join(".socket/vendor/redirect-state.json")).unwrap(),
+        CORRUPT_REDIRECT_LEDGER,
+        "vex must leave the malformed pre-v5 ledger byte-identical"
+    );
+    assert!(
+        !cwd.join(".socket/vendor/redirect-state.json.corrupt")
+            .exists(),
+        "vex must not quarantine the pre-v5 ledger"
+    );
 }
 
 #[test]
-fn corrupt_redirect_ledger_hard_errors_in_human_mode() {
+fn corrupt_redirect_ledger_is_a_warning_in_human_mode_and_the_run_proceeds() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
+    // A manifest patch whose package is nowhere on disk: the run's own
+    // outcome is `no_applicable_patches` (exit 1) — reaching it proves the
+    // malformed ledger did not abort the run.
+    write_ghost_npm_manifest(cwd, "pkg:npm/leftpad@1.0.0");
     write_corrupt_redirect_ledger(cwd);
 
     let out = cli()
@@ -265,32 +276,33 @@ fn corrupt_redirect_ledger_hard_errors_in_human_mode() {
         ])
         .output()
         .expect("invoke vex");
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
-        Some(2),
-        "a malformed redirect ledger is a hard error, never a degrade. stderr:\n{}",
-        String::from_utf8_lossy(&out.stderr)
+        Some(1),
+        "a malformed pre-v5 redirect ledger is advisory: the run reaches its own \
+         no_applicable_patches outcome. stderr:\n{stderr}"
     );
-    assert!(out.stdout.is_empty(), "no document on a hard error");
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("redirect ledger") && stderr.contains("malformed"),
-        "the CorruptRedirectState message must reach stderr. got: {stderr}"
+        stderr.contains("Warning:")
+            && stderr.contains("pre-v5 redirect ledger")
+            && stderr.contains("malformed")
+            && stderr.contains("not consulted"),
+        "the redirect_ledger_corrupt warning must reach stderr. got: {stderr}"
     );
-    // Ordering: the ledger error fires before the missing-manifest check —
-    // the (absent) manifest must not be what gets reported.
     assert!(
         !stderr.contains("Manifest not found"),
-        "the redirect-ledger error must win over manifest_not_found. got: {stderr}"
+        "the manifest was read and planned from. got: {stderr}"
     );
+    assert_redirect_ledger_untouched(cwd);
 }
 
 #[test]
-fn corrupt_redirect_ledger_json_envelope_carries_code_and_preserves_ledger() {
+fn corrupt_redirect_ledger_json_envelope_carries_the_warning_and_preserves_ledger() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
+    write_ghost_npm_manifest(cwd, "pkg:npm/leftpad@1.0.0");
     write_corrupt_redirect_ledger(cwd);
-    let ledger_path = cwd.join(".socket/vendor/redirect-state.json");
 
     let vex_path = cwd.join("out.vex.json");
     let out = cli()
@@ -306,43 +318,78 @@ fn corrupt_redirect_ledger_json_envelope_carries_code_and_preserves_ledger() {
         ])
         .output()
         .expect("invoke vex");
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "redirect_ledger_corrupt is a hard error in --json mode too. stdout:\n{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
     let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
-    assert_eq!(env["status"], "error", "{env}");
-    assert_eq!(env["error"]["code"], "redirect_ledger_corrupt", "{env}");
+    assert_eq!(out.status.code(), Some(1), "{env}");
+    // The run's own outcome, not a ledger error.
+    assert_eq!(env["error"]["code"], "no_applicable_patches", "{env}");
+    let skipped = env["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "skipped" && e["purl"] == "pkg:npm/leftpad@1.0.0")
+        .unwrap_or_else(|| panic!("the manifest patch was evaluated: {env}"));
+    assert_eq!(skipped["errorCode"], "package_not_found", "{env}");
+    let warning = env["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("warnings[] expected: {env}"))
+        .iter()
+        .find(|w| w["code"] == "redirect_ledger_corrupt")
+        .unwrap_or_else(|| panic!("redirect_ledger_corrupt must be in warnings[]: {env}"));
     assert!(
-        env["error"]["message"]
+        warning["detail"]
             .as_str()
-            .unwrap()
-            .contains("malformed"),
-        "the envelope must carry the CorruptRedirectState detail: {env}"
+            .is_some_and(|m| m.contains("malformed") && m.contains("redirect-state.json")),
+        "{env}"
     );
-    // vex is a READ-ONLY ledger consumer: the malformed file may still hold
-    // the only pre-redirect revert data, so it must be left exactly where it
-    // was — neither deleted nor quarantined by this run.
-    assert_eq!(
-        std::fs::read_to_string(&ledger_path).unwrap(),
-        "{{{",
-        "vex must not touch the malformed redirect ledger"
-    );
+    // Under --json the warning travels in the envelope only.
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !cwd.join(".socket/vendor/redirect-state.json.corrupt")
-            .exists(),
-        "vex must not quarantine the ledger (that is the writer's recovery flow)"
+        !stderr.contains("pre-v5 redirect ledger"),
+        "--json must not echo the warning on stderr: {stderr}"
     );
-    assert!(!vex_path.exists(), "no document on a hard error");
+    assert_redirect_ledger_untouched(cwd);
+    assert!(!vex_path.exists(), "no document when nothing was attested");
+}
+
+#[test]
+fn corrupt_redirect_ledger_alone_warns_and_is_still_manifest_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    write_corrupt_redirect_ledger(cwd);
+
+    let vex_path = cwd.join("out.vex.json");
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--json",
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
+    // A malformed ledger is no patch source: with nothing else on disk the
+    // run is the ordinary nothing-to-attest error.
+    assert_eq!(out.status.code(), Some(2), "{env}");
+    assert_eq!(env["error"]["code"], "manifest_not_found", "{env}");
+    assert!(
+        env["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| w["code"] == "redirect_ledger_corrupt")),
+        "{env}"
+    );
+    assert_redirect_ledger_untouched(cwd);
 }
 
 // ──────────────────────────────────────────────────────────────────────
 // corrupt vendor ledger → `vendor_ledger_corrupt`, exit 2
 //
 // A present-but-corrupt `.socket/vendor/state.json` is a hard error
-// mirroring `redirect_ledger_corrupt`: the vendor ledger is an
+// (unlike the advisory pre-v5 redirect ledger above): the vendor ledger is an
 // attestation input in its own right — it carries embedded records and
 // the entries whose wiring liveness gates them — so a run that cannot read
 // it cannot tell which vendored patches it is dropping, and attesting from

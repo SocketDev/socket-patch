@@ -20,11 +20,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use clap::Args;
-use socket_patch_core::crawlers::Ecosystem;
-use socket_patch_core::manifest::operations::read_manifest;
-use socket_patch_core::manifest::schema::PatchManifest;
+use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated};
-use socket_patch_core::vendor::state::VendorState;
 use socket_patch_core::vex::{
     build_document, detect_product, BuildOptions, Document, FailedPatch, VendorContext,
     VerifyOutcome,
@@ -38,15 +35,6 @@ use crate::commands::vex_sources::{
 use crate::ecosystem_dispatch::{collapse_to_first, find_manifest_package_copies_reusing};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning};
 use crate::ui::plural;
-
-/// Routing tag for a patch omitted from VEX by the property-7 ecosystem
-/// filter alone: the patch IS applied (byte-verified, or trusted under
-/// `--no-verify`) and carries vulnerability metadata, but its ecosystem has
-/// no install hook set up and is not declared `manual`. Distinct from the
-/// verification tags (`hash_mismatch`, `package_not_found`, …) so a JSON
-/// consumer can tell "not patched" from "patched but not persisted by any
-/// hook".
-const ECOSYSTEM_NOT_SETUP: &str = "ecosystem_not_setup";
 
 #[derive(Args)]
 pub struct VexArgs {
@@ -179,6 +167,7 @@ impl VexEmbedArgs {
             dry_run: false,
             product_flag: "--vex-product",
             npm_prior: None,
+            hosted_records: Default::default(),
         }
     }
 }
@@ -219,6 +208,12 @@ pub(crate) struct VexBuildParams {
     /// choice and order are unchanged. Ignored when taken with other crawler
     /// options. The standalone `vex` passes `None` and walks the tree.
     pub npm_prior: Option<crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+    /// Embedded hosted `scan --vex` only: the patch records THIS RUN
+    /// fetched for the pins it confirmed, keyed by purl. v5 hosted mode
+    /// keeps no ledger, so these are the in-run attestation's hosted
+    /// records (the post-install standalone `vex` fetches them from the
+    /// API instead). Empty everywhere else.
+    pub hosted_records: std::collections::BTreeMap<String, PatchRecord>,
 }
 
 /// Successful result of [`generate_vex`].
@@ -337,6 +332,7 @@ pub async fn run(args: VexArgs) -> i32 {
         dry_run: args.common.dry_run,
         product_flag: "--product",
         npm_prior: None,
+        hosted_records: Default::default(),
     };
 
     let manifest_path = args.common.resolved_manifest_path();
@@ -460,28 +456,6 @@ fn org_looks_like_path(org: Option<&str>) -> Option<String> {
     pathy.then(|| {
         format!("--org {org:?} looks like a file path; did you mean -O/--output? (-o is --org)")
     })
-}
-
-/// Map a `setup.manual` entry to an `Ecosystem`, case-insensitively.
-/// Accepts the canonical `cli_name`, the aliases `go`, `python`, `ruby`,
-/// `rust`, `php`, `java`, `dotnet` and `jsr`, and the npm-family package
-/// manager names (`yarn`/`pnpm`/`bun`/`vlt`). Unrecognized names yield
-/// `None` and are ignored.
-fn ecosystem_from_manual_name(name: &str) -> Option<Ecosystem> {
-    match name.to_ascii_lowercase().as_str() {
-        "npm" | "yarn" | "pnpm" | "bun" | "vlt" => Some(Ecosystem::Npm),
-        "pypi" | "python" => Some(Ecosystem::Pypi),
-        "gem" | "ruby" => Some(Ecosystem::Gem),
-        "cargo" | "rust" => Some(Ecosystem::Cargo),
-        "golang" | "go" => Some(Ecosystem::Golang),
-        "composer" | "php" => Some(Ecosystem::Composer),
-        // The apply-only ecosystems are the primary use of `manual` (hand-applied
-        // patches with no auto-install hook); they must map too.
-        "maven" | "java" => Some(Ecosystem::Maven),
-        "nuget" | "dotnet" => Some(Ecosystem::Nuget),
-        "deno" | "jsr" => Some(Ecosystem::Deno),
-        _ => None,
-    }
 }
 
 /// Core VEX pipeline shared by the standalone `vex` command and the
@@ -715,72 +689,13 @@ async fn generate_vex(
         );
     }
 
-    // Property 7: attest a patch only for an ecosystem that is actually set up —
-    // or explicitly declared `manual` in the manifest. Patches for an ecosystem
-    // that is neither are dropped regardless of verification mode (so even
-    // `--no-verify` won't attest an un-set-up ecosystem's patches).
-    // Exemption: VENDORED patches bypass the filter — the committed
-    // `.socket/vendor/` artifact + lockfile wiring IS the persistence
-    // mechanism, so no install hook exists (or is needed) by construction.
-    let vendored_set: std::collections::HashSet<String> =
-        outcome.vendored.iter().cloned().collect();
-    // Redirected (hosted) patches bypass the filter for the same reason: the
-    // committed lockfile rewrite IS the persistence mechanism.
-    let redirected_set: std::collections::HashSet<&str> =
-        redirected.iter().map(|s| s.as_str()).collect();
-    let mut allowed = crate::commands::setup::configured_ecosystems(common).await;
-    if let Some(s) = &manifest.setup {
-        for name in &s.manual {
-            if let Some(e) = ecosystem_from_manual_name(name) {
-                allowed.insert(e);
-            }
-        }
-    }
-    let mut setup_filtered: Vec<String> = Vec::new();
-    outcome.applied.retain(|purl| {
-        let keep = vendored_set.contains(purl)
-            || redirected_set.contains(purl.as_str())
-            || Ecosystem::from_purl(purl)
-                .map(|e| allowed.contains(&e))
-                .unwrap_or(false);
-        if !keep {
-            setup_filtered.push(purl.clone());
-        }
-        keep
-    });
-    let any_setup_filtered = !setup_filtered.is_empty();
-    // The filter drops join the omission channel (`failed`) with their own
-    // routing tag so they surface as per-purl `skipped` events in the
-    // envelope — success and error paths alike.
-    outcome
-        .failed
-        .extend(setup_filtered.into_iter().map(|purl| FailedPatch {
-            purl,
-            reason: ECOSYSTEM_NOT_SETUP.to_string(),
-        }));
     // `failed` is built by iterating the record view's HashMap: without a
     // sort the omission order (stderr, the error list and the JSON
     // `skipped` events) changes run to run.
     outcome
         .failed
         .sort_by(|a, b| (&a.purl, &a.reason).cmp(&(&b.purl, &b.reason)));
-
-    // When nothing attests and EVERY omission was the property-7 filter,
-    // the run fails with a message that explains the setup cause itself
-    // (see below), so the generic note would only repeat it.
-    let all_setup_drops = outcome.applied.is_empty()
-        && !outcome.failed.is_empty()
-        && outcome
-            .failed
-            .iter()
-            .all(|f| f.reason == ECOSYSTEM_NOT_SETUP);
     if !common.silent && !common.json {
-        if any_setup_filtered && !all_setup_drops {
-            eprintln!(
-                "Note: patches for ecosystems that are not set up (and not declared `manual` \
-                 in .socket/manifest.json's `setup.manual`) are omitted from VEX."
-            );
-        }
         for f in &outcome.failed {
             eprintln!("{}", format_omission_warning(&f.purl, &f.reason));
         }
@@ -810,18 +725,7 @@ async fn generate_vex(
         None => {
             let (token, org) = common.telemetry_credentials();
             track_vex_failed("no_applicable_patches", token.as_deref(), org.as_deref()).await;
-            // When nothing attested and EVERY omission was the property-7
-            // filter, say so: those patches ARE applied with vulnerability
-            // metadata, and the generic message below would read as "not
-            // patched" to a human. The code stays `no_applicable_patches` —
-            // it is the documented exit-1 routing tag consumers already
-            // branch on; the per-event `ecosystem_not_setup` errorCode is
-            // the machine-readable discriminator.
-            let message = if all_setup_drops {
-                format_setup_drops_message(outcome.failed.len())
-            } else {
-                "No applied patches with vulnerability metadata to attest.".to_string()
-            };
+            let message = "No applied patches with vulnerability metadata to attest.".to_string();
             return Err(VexGenError {
                 code: "no_applicable_patches",
                 message,
@@ -1054,7 +958,13 @@ async fn generate_vex_from_manifest_path_inner(
     calm_when_nothing: bool,
     warnings: &mut Vec<RunWarning>,
 ) -> Result<VexWriteSummary, VexGenError> {
-    let manifest_file = match read_manifest(manifest_path).await {
+    // One load of the three stores; each keeps vex's strict posture below.
+    let socket_patch_core::ledgers::LoadedLedgers {
+        manifest,
+        vendor,
+        redirect,
+    } = socket_patch_core::ledgers::LoadedLedgers::load(&common.cwd, manifest_path).await;
+    let manifest_file = match manifest {
         Ok(m) => m,
         Err(e) => {
             // Core's text ("Failed to parse manifest JSON: ...") does not
@@ -1064,27 +974,32 @@ async fn generate_vex_from_manifest_path_inner(
         }
     };
     let had_manifest_file = manifest_file.is_some();
-    // Both ledgers are attestation inputs (records, and the entries whose
-    // wiring liveness gates them), so a MALFORMED one is a hard error:
-    // attesting with its contents silently dropped would produce a false —
-    // or silently partial — document. A missing ledger is simply empty.
-    let redirect = match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await
-    {
+    // The vendor ledger is an attestation input (records, and the entries
+    // whose wiring liveness gates them), so a MALFORMED one is a hard error
+    // (below). v5 hosted mode keeps no ledger: hosted references come from
+    // the lockfiles, their records from the API. A pre-v5 redirect ledger
+    // is read (never written) only as an extra local record source for the
+    // pins it still describes, so a malformed one is an advisory: its
+    // records are simply not consulted.
+    let redirect = match redirect {
         Ok(state) => state,
         Err(corrupt) => {
-            // Not core's Display: that text ("... so it will not be
-            // overwritten") is written for the hosted `scan` writer, and
-            // `vex` only reads the ledger.
-            let message = format!(
-                "The redirect ledger {} is malformed ({}); cannot attest redirected patches. \
-                 Repair its JSON or restore it from version control, then re-run.",
-                corrupt.path.display(),
-                corrupt.detail
+            note_warning(
+                warnings,
+                common,
+                "redirect_ledger_corrupt",
+                format!(
+                    "the pre-v5 redirect ledger {} is malformed ({}); its records were not \
+                     consulted. socket-patch v5 no longer uses it: delete it, or restore it \
+                     from version control.",
+                    corrupt.path.display(),
+                    corrupt.detail
+                ),
             );
-            return Err(fail(common, "redirect_ledger_corrupt", message).await);
+            None
         }
     };
-    let vendor = match socket_patch_core::vendor::load_state(&common.cwd).await {
+    let vendor = match vendor {
         Ok(state) => state,
         Err(e) => {
             let message = format!(
@@ -1103,6 +1018,16 @@ async fn generate_vex_from_manifest_path_inner(
     for diag in &discovery.diagnostics {
         note_warning(warnings, common, diag.code, diag.detail.clone());
     }
+    // This run's hosted records (embedded hosted `scan --vex`) join a
+    // pre-v5 ledger's as the hosted record source, newest wins.
+    let redirect = if params.hosted_records.is_empty() {
+        redirect
+    } else {
+        let mut state =
+            redirect.unwrap_or_else(socket_patch_core::patch::redirect::RedirectState::new);
+        state.records.extend(params.hosted_records.clone());
+        Some(state)
+    };
     let sources = Sources {
         manifest: manifest_file.unwrap_or_else(PatchManifest::new),
         vendor,
@@ -1145,7 +1070,7 @@ async fn generate_vex_from_manifest_path_inner(
 /// Fire `vex_failed` telemetry and build the matching [`VexGenError`].
 /// Centralizes the "track then return error" pattern in [`generate_vex`].
 /// Attribution goes through the same layered credential chain as
-/// `list`/`setup` (flag / env / socket-cli `config.json`), not the raw
+/// `list` (flag / env / socket-cli `config.json`), not the raw
 /// flags — a `socket login`-only user must not report anonymously.
 async fn fail(common: &GlobalArgs, code: &'static str, message: String) -> VexGenError {
     let (token, org) = common.telemetry_credentials();
@@ -1227,78 +1152,7 @@ fn join_and(items: &[&str]) -> String {
     }
 }
 
-/// The one `unreadable vendor state` advisory (contract: `setup --check`
-/// surfaces a ledger it cannot read or parse as this line, muted by
-/// `--silent`): a read-only consumer degrades to "nothing vendored" and says
-/// so, on stderr, so the operator learns why nothing verifies. (`vex` itself
-/// refuses an unreadable ledger outright — `vendor_ledger_corrupt` — since
-/// the ledger's entries gate what attests.)
-pub(crate) fn warn_unreadable_vendor_state(common: &GlobalArgs, e: &std::io::Error) {
-    if !common.silent {
-        eprintln!(
-            "Warning: {}",
-            vendor_state_unreadable_message(&e.to_string())
-        );
-    }
-}
-
-/// Build the [`VendorContext`] for `setup --check`'s patch-consistency pass
-/// from `ledger` — the caller's ONE `load_state` of
-/// `.socket/vendor/state.json` (it also fed the vendor-record fold) — plus
-/// synthesized entries for the legacy `.socket/go-patches/` redirect
-/// backend: a vendored patch is judged by the committed artifact, never the
-/// installed tree. (`vex` itself builds its context from the gated plan
-/// instead, so a ledger entry no lockfile wires never routes its
-/// verification.)
-///
-/// Go-patches synthesis: an apply-redirected Go patch leaves the module
-/// cache pristine (the `replace` directive routes the build at the copy
-/// dir), so the copy dir is what verification must hash.
-///
-/// An unreadable/corrupt vendor ledger degrades to "no vendor entries":
-/// vendored PURLs then fall through to the installed tree, fail
-/// verification there, and are omitted — fail-closed, never falsely
-/// attested. The degrade is returned as a warning detail for the caller to
-/// report in its own channel. The context is `None` when there is nothing
-/// vendored and no redirect to synthesize (the common case).
-pub(crate) async fn vendor_context_from(
-    common: &GlobalArgs,
-    manifest: &PatchManifest,
-    ledger: std::io::Result<VendorState>,
-) -> (Option<VendorContext>, Option<String>) {
-    let (entries, warning) = match ledger {
-        Ok(state) => (state.entries, None),
-        Err(e) => (
-            HashMap::new(),
-            Some(vendor_state_unreadable_message(&e.to_string())),
-        ),
-    };
-
-    let go_patches = synthesize_go_patches(common, manifest, &entries).await;
-
-    if entries.is_empty() && go_patches.is_empty() {
-        return (None, warning);
-    }
-    let context = VendorContext {
-        project_root: common.cwd.clone(),
-        entries,
-        go_patches,
-        hosted: HashMap::new(),
-    };
-    (Some(context), warning)
-}
-
-/// The unreadable-`.socket/vendor/state.json` advisory (`cause` is
-/// `load_state`'s error, which names the file).
-pub(crate) fn vendor_state_unreadable_message(cause: &str) -> String {
-    format!(
-        "Unreadable vendor state ({cause}); vendored patches cannot be verified from the \
-         committed artifact"
-    )
-}
-
-/// Synthesize go-patches redirect targets for [`vendor_context_from`] and
-/// `vex`: for every socket-owned (`.socket/go-patches/`) `replace` in
+/// Synthesize go-patches redirect targets for `vex`: for every socket-owned (`.socket/go-patches/`) `replace` in
 /// `go.mod` whose module+version maps to a golang PURL of the record view
 /// (`manifest` — for `vex` the merged manifest + ledger + lockfile view, so
 /// a manifest-less project's ledger-recorded Go patch verifies too) with no
@@ -1389,10 +1243,6 @@ fn emit_envelope_error(
 /// machine-readable `errorCode`).
 fn omission_phrase(reason: &str) -> &'static str {
     match reason {
-        ECOSYSTEM_NOT_SETUP => {
-            "applied, but its ecosystem has no install hook set up and is not declared \
-             `manual` in setup.manual"
-        }
         "package_not_found" => "the package is not installed",
         "not_applied" => "the patched files still hold the original content",
         "hash_mismatch" => "a patched file matches neither the original nor the patched content",
@@ -1425,7 +1275,7 @@ fn omission_phrase(reason: &str) -> &'static str {
              package any more"
         }
         REDIRECT_UNWIRED => {
-            "the redirect ledger records it, but no lockfile wires its hosted patch to this \
+            "the hosted ledger records it, but no lockfile wires its hosted patch to this \
              package any more"
         }
         WIRING_CONFLICT => {
@@ -1448,29 +1298,7 @@ fn format_omission_warning(purl: &str, reason: &str) -> String {
 /// Human `reason` string for an omission event; the routing tag rides
 /// `errorCode`.
 fn omission_reason_message(reason: &str) -> String {
-    if reason == ECOSYSTEM_NOT_SETUP {
-        "applied patch omitted from VEX: its ecosystem has no install hook set up and is not \
-         declared `manual` in setup.manual"
-            .to_string()
-    } else {
-        format!("patch omitted from VEX: {}", omission_phrase(reason))
-    }
-}
-
-/// The `no_applicable_patches` message when every omission was the
-/// property-7 setup filter.
-fn format_setup_drops_message(n: usize) -> String {
-    let (subject, verb, their, ecosystems) = if n == 1 {
-        ("applied patch", "was", "its", "ecosystem is")
-    } else {
-        ("applied patches", "were", "their", "ecosystems are")
-    };
-    format!(
-        "{n} {subject} with vulnerability metadata {verb} omitted from VEX because {their} \
-         {ecosystems} not set up (no install hook) and not declared `manual` in \
-         .socket/manifest.json's `setup.manual`. Run `socket-patch setup`, or add the \
-         ecosystem to `setup.manual`, then re-run."
-    )
+    format!("patch omitted from VEX: {}", omission_phrase(reason))
 }
 
 fn emit_envelope_success(summary: &VexWriteSummary, dry_run: bool) {
@@ -1510,44 +1338,6 @@ mod tests {
     //! lives in `tests/e2e_vex*.rs`.
     use super::*;
     use clap::Parser;
-
-    // Property 7: every ecosystem a PURL can classify to must also be
-    // declarable `manual` (apply-only maven/nuget/deno are its primary use).
-    #[test]
-    fn ecosystem_from_manual_name_maps_every_ecosystem() {
-        assert_eq!(ecosystem_from_manual_name("npm"), Some(Ecosystem::Npm));
-        assert_eq!(ecosystem_from_manual_name("vlt"), Some(Ecosystem::Npm));
-        assert_eq!(ecosystem_from_manual_name("PyPI"), Some(Ecosystem::Pypi)); // case-insensitive
-        assert_eq!(ecosystem_from_manual_name("python"), Some(Ecosystem::Pypi));
-        assert_eq!(ecosystem_from_manual_name("ruby"), Some(Ecosystem::Gem));
-        assert_eq!(ecosystem_from_manual_name("nonsense"), None);
-        assert_eq!(ecosystem_from_manual_name("cargo"), Some(Ecosystem::Cargo));
-        assert_eq!(ecosystem_from_manual_name("go"), Some(Ecosystem::Golang));
-        assert_eq!(
-            ecosystem_from_manual_name("composer"),
-            Some(Ecosystem::Composer)
-        );
-        assert_eq!(ecosystem_from_manual_name("maven"), Some(Ecosystem::Maven));
-        assert_eq!(ecosystem_from_manual_name("nuget"), Some(Ecosystem::Nuget));
-        assert_eq!(ecosystem_from_manual_name("deno"), Some(Ecosystem::Deno));
-    }
-
-    // Every `Ecosystem::all()` variant must round-trip through its `cli_name`
-    // via `ecosystem_from_manual_name`, or its `manual`-declared patches are
-    // silently dropped by the `retain` in `generate_vex`.
-    #[test]
-    fn every_compiled_ecosystem_is_declarable_manual_via_cli_name() {
-        for &e in Ecosystem::all() {
-            assert_eq!(
-                ecosystem_from_manual_name(e.cli_name()),
-                Some(e),
-                "ecosystem {:?} (cli_name {:?}) is not reachable via ecosystem_from_manual_name — \
-                 its `manual`-declared patches would be silently dropped from VEX",
-                e,
-                e.cli_name(),
-            );
-        }
-    }
 
     /// The go-patches synthesis guards its copy-dir keys with core's
     /// `are_safe_redirect_coords`; pin the accept/reject set from the CLI
@@ -1637,30 +1427,6 @@ mod tests {
     }
 
     #[test]
-    fn setup_drops_message_agrees_in_number() {
-        let one = format_setup_drops_message(1);
-        assert!(
-            one.starts_with(
-                "1 applied patch with vulnerability metadata was omitted from VEX because its \
-                 ecosystem is not set up (no install hook)"
-            ),
-            "{one}"
-        );
-        let two = format_setup_drops_message(2);
-        assert!(
-            two.starts_with(
-                "2 applied patches with vulnerability metadata were omitted from VEX because \
-                 their ecosystems are not set up (no install hook)"
-            ),
-            "{two}"
-        );
-        for m in [&one, &two] {
-            assert!(!m.contains("(s)"), "{m}");
-            assert!(m.ends_with("then re-run."), "{m}");
-        }
-    }
-
-    #[test]
     fn omission_warning_names_phrase_and_tag() {
         assert_eq!(
             format_omission_warning("pkg:npm/a@1.0.0", "not_applied"),
@@ -1679,7 +1445,6 @@ mod tests {
              (brand_new_tag)"
         );
         for tag in [
-            ECOSYSTEM_NOT_SETUP,
             "package_not_found",
             "not_applied",
             "hash_mismatch",
@@ -1749,15 +1514,6 @@ mod tests {
         assert!(org_looks_like_path(Some("reports/vex")).is_some());
         assert!(org_looks_like_path(Some("C:\\vex")).is_some());
         assert!(org_looks_like_path(Some("OUT.JSON")).is_some());
-    }
-
-    #[test]
-    fn vendor_state_message_is_capitalized_and_keeps_cause() {
-        assert_eq!(
-            vendor_state_unreadable_message("corrupt x/state.json: eof"),
-            "Unreadable vendor state (corrupt x/state.json: eof); vendored patches cannot be \
-             verified from the committed artifact"
-        );
     }
 
     #[derive(Parser)]
@@ -1956,6 +1712,7 @@ mod npm_prior_tests {
             dry_run: false,
             product_flag: "--vex-product",
             npm_prior: prior,
+            hosted_records: Default::default(),
         };
         let manifest_path = common.resolved_manifest_path();
         match generate_vex_from_manifest_path(common, &params, &manifest_path).await {

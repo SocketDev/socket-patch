@@ -33,10 +33,10 @@
 //! (`npm_lock_nodes`, `pnpm::pnpm_packages`, `yarn::classic_entries` /
 //! `berry_entries`, `BunLockb::parse_packages`, `vlt::vlt_lock_model`) and,
 //! for the other formats, the readers the writers own (`cargo_lock` /
-//! `cargo_config`, `go_mod_edit` / `go_sum_edit`, `gemfile_lock`,
-//! `composer_lock_packages`, the
+//! `cargo_config`, `go_mod_edit` / `go_sum_edit`, `formats::gem`,
+//! `formats::composer`, the
 //! `utils::python_lock` / `poetry_lock` / `requirements` / `hatch` readers,
-//! `maven_pom`, `nuget_config` / `nuget_feed`). The inventory's registry
+//! `formats::maven`, `nuget_config` / `nuget_feed`). The inventory's registry
 //! views drop the Socket-owned entries (they feed registry discovery and
 //! fetches); the extractors here classify and validate exactly those. File
 //! selection and I/O stay with each consumer: discovery reads every present
@@ -515,7 +515,7 @@ impl Discovery {
         let key = canonical_base_purl(purl);
         self.refs
             .iter()
-            .any(|r| r.uuid == uuid && r.mode == mode && r.purl == key)
+            .any(|r| r.uuid == uuid && r.mode == mode && same_package(&r.purl, &key))
     }
 
     /// Whether some file discovery read mentions patch `uuid` as a `mode`
@@ -652,7 +652,7 @@ impl Discovery {
             self.refs.iter().any(|r| {
                 r.uuid == uuid
                     && r.mode == WiringMode::Vendored
-                    && r.purl == key
+                    && same_package(&r.purl, &key)
                     && r.artifact_rel.as_deref() == Some(artifact)
             })
         })
@@ -707,7 +707,22 @@ pub async fn discover_patched_refs(root: &Path) -> Discovery {
 /// See the module docs for the contract; the extractor order below is fixed
 /// only for deterministic diagnostics — refs are sorted afterwards.
 pub async fn discover_patched_refs_with(root: &Path, opts: &DiscoverOptions) -> Discovery {
-    let ctx = DiscoverCtx::with_origins(root, &opts.patch_server_origins);
+    discover_with_ctx(DiscoverCtx::with_origins(root, &opts.patch_server_origins)).await
+}
+
+/// [`discover_patched_refs_with`] reading the lock and config files through
+/// `snapshot`, so a run that also inventories the lockfiles reads each file
+/// once.
+pub async fn discover_patched_refs_in(
+    snapshot: &crate::vendor::lock_inventory::DiskSnapshot<'_>,
+    opts: &DiscoverOptions,
+) -> Discovery {
+    let mut ctx = DiscoverCtx::with_origins(snapshot.root, &opts.patch_server_origins);
+    ctx.view = crate::vendor::lock_inventory::ProjectView::Snapshot(snapshot);
+    discover_with_ctx(ctx).await
+}
+
+async fn discover_with_ctx(ctx: DiscoverCtx<'_>) -> Discovery {
     let mut out = Discovery::default();
     npm::extract(&ctx, &mut out).await;
     yarn::extract(&ctx, &mut out).await;
@@ -737,6 +752,9 @@ fn is_script_lock(file: &Path) -> bool {
 /// allowlist, with the guarded-read and identity helpers bolted on.
 pub(crate) struct DiscoverCtx<'a> {
     pub(crate) root: &'a Path,
+    /// Where the guarded reads read from: `root` on disk, or a per-run
+    /// snapshot of it.
+    view: crate::vendor::lock_inventory::ProjectView<'a>,
     patch_server_origins: &'a [String],
     /// What the guarded reads have recognized so far (rule 11) — collected
     /// here, not in the extractor's `&mut Discovery`, so a read into a
@@ -749,6 +767,7 @@ impl<'a> DiscoverCtx<'a> {
     pub(crate) fn with_origins(root: &'a Path, patch_server_origins: &'a [String]) -> Self {
         DiscoverCtx {
             root,
+            view: crate::vendor::lock_inventory::ProjectView::Disk(root),
             patch_server_origins,
             recognized: Mutex::new(BTreeSet::new()),
         }
@@ -813,7 +832,7 @@ impl<'a> DiscoverCtx<'a> {
     /// ledger claim it alone keeps textually "alive" must be dead (rule 11).
     /// Quiet — a missing or unreadable ignored file is not a finding.
     pub(crate) async fn recognize_ignored(&self, rel: &str) {
-        if let Ok(bytes) = crate::utils::fs::read_regular_to_bytes(&self.root.join(rel)).await {
+        if let Ok(bytes) = self.view.read_bytes(rel).await {
             self.recognize_text(rel, &String::from_utf8_lossy(&bytes));
         }
     }
@@ -828,9 +847,7 @@ impl<'a> DiscoverCtx<'a> {
     /// Whether `rel` exists (lstat — a dangling symlink still "exists", the
     /// read then fails and diagnoses).
     pub(crate) async fn exists(&self, rel: &str) -> bool {
-        tokio::fs::symlink_metadata(self.root.join(rel))
-            .await
-            .is_ok()
+        self.view.exists_no_follow(rel).await
     }
 
     /// Guarded UTF-8 read of root-relative `rel`: `None` when missing
@@ -839,7 +856,7 @@ impl<'a> DiscoverCtx<'a> {
     /// parsing (rule 11) — so a file that then fails to parse, or an entry
     /// the extractor rejects or skips, is still recognized.
     pub(crate) async fn read_text(&self, rel: &str, out: &mut Discovery) -> Option<String> {
-        match crate::utils::fs::read_regular_to_string(&self.root.join(rel)).await {
+        match self.view.read_text(rel).await {
             Ok(text) => {
                 self.recognize_text(rel, &text);
                 Some(text)
@@ -862,7 +879,7 @@ impl<'a> DiscoverCtx<'a> {
     /// left in `bun.lockb`'s append-only pool names a DEAD patch, which is
     /// exactly what recognition should say about it.
     pub(crate) async fn read_bytes(&self, rel: &str, out: &mut Discovery) -> Option<Vec<u8>> {
-        match crate::utils::fs::read_regular_to_bytes(&self.root.join(rel)).await {
+        match self.view.read_bytes(rel).await {
             Ok(bytes) => {
                 self.recognize_text(rel, &String::from_utf8_lossy(&bytes));
                 Some(bytes)
@@ -916,6 +933,21 @@ pub(crate) fn socket_patch_name_uuid(name: &str, vendored: bool) -> Option<Strin
 /// work per anchor, so a tampered multi-megabyte lock costs one linear pass
 /// per anchor kind.
 fn socket_identities(text: &str, origins: &[String]) -> BTreeSet<(String, WiringMode)> {
+    socket_identities_inner(text, origins)
+}
+
+/// The hosted patch uuids `text` mentions, under the same recognition
+/// rules as discovery's sweep (the upstream restore's "does anything in
+/// this file still need the hosted-side setting" probe).
+pub(crate) fn hosted_uuids_in_text(text: &str, origins: &[String]) -> BTreeSet<String> {
+    socket_identities(text, origins)
+        .into_iter()
+        .filter(|(_, mode)| *mode == WiringMode::Hosted)
+        .map(|(uuid, _)| uuid)
+        .collect()
+}
+
+fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, WiringMode)> {
     let mut found = BTreeSet::new();
     let norm = decode_escapes(text)
         .replace("\\/", "/")
@@ -1426,6 +1458,14 @@ pub fn canonical_base_purl(purl: &str) -> String {
     }
 }
 
+/// Whether a ref's [`canonical_base_purl`] and `key` (another canonical
+/// base) name the same package release: equal, or for composer the same
+/// release in another version spelling (a ledger's `@3.0.2.0` is the lock's
+/// `@3.0.2`).
+fn same_package(ref_purl: &str, key: &str) -> bool {
+    ref_purl == key || crate::utils::composer_version::composer_purls_equivalent(ref_purl, key)
+}
+
 /// [`canonical_base_purl`] for a ref about to be pushed, plus shape checks:
 /// a known ecosystem type and a non-empty name and version (the version
 /// after the LAST `@`, containing no `/`).
@@ -1454,7 +1494,9 @@ impl Discovery {
     /// `mode`, whichever patch it names.
     pub fn wires_package(&self, purl: &str, mode: WiringMode) -> bool {
         let key = canonical_base_purl(purl);
-        self.refs.iter().any(|r| r.mode == mode && r.purl == key)
+        self.refs
+            .iter()
+            .any(|r| r.mode == mode && same_package(&r.purl, &key))
     }
 
     /// Liveness of a VENDOR-ledger entry — the ONE rule every reader of the
@@ -1728,33 +1770,15 @@ pub async fn vendored_wiring_live(root: &Path, recorded: &[&str], eco: &str, uui
 }
 
 /// The root files a vendored `eco` artifact can be wired from — the vendor
-/// backends' lockfile / wiring config for that ecosystem (npm: every
-/// npm-family lock the `vendor_probe` table flags, `vlt-lock.json`
-/// included; cargo: the root `Cargo.toml` `[patch.crates-io]` table and the
+/// backends' lockfile / wiring config for that ecosystem, the format
+/// registry's [`crate::formats::registry::PROBE`] rows (npm: every
+/// npm-family lock, `vlt-lock.json` included; cargo: the root `Cargo.toml` `[patch.crates-io]` table and the
 /// pre-v5 `.cargo/config.toml` / `.cargo/config` spellings; maven /
 /// nuget: the repository / source that serves the vendored dir). Manifests
 /// such as package.json are deliberately absent: the lock is what the
 /// install consumes.
 pub fn vendored_wiring_probe_files(root: &Path, eco: &str) -> Vec<String> {
-    let fixed: Vec<&str> = match eco {
-        "npm" => crate::constants::npm_family::names_with(|r| r.vendor_probe),
-        "pypi" => vec![
-            "uv.lock",
-            "poetry.lock",
-            "pdm.lock",
-            "Pipfile.lock",
-            "requirements.txt",
-            "pyproject.toml",
-            "hatch.toml",
-        ],
-        "cargo" => vec!["Cargo.toml", ".cargo/config.toml", ".cargo/config"],
-        "golang" => vec!["go.mod"],
-        "gem" => vec!["Gemfile.lock"],
-        "composer" => vec!["composer.lock"],
-        "maven" => vec!["pom.xml"],
-        "nuget" => crate::vendor::nuget_config::CONFIG_NAMES.to_vec(),
-        _ => Vec::new(),
-    };
+    let fixed = crate::formats::registry::probe_paths(eco);
     let mut files: Vec<String> = fixed.into_iter().map(str::to_string).collect();
     if eco == "pypi" {
         // pylock.toml / pylock.<name>.toml / *.py.lock.
@@ -2956,7 +2980,10 @@ mod tests {
                     "uv.lock",
                 ],
             ),
-            ("cargo", &[".cargo/config", ".cargo/config.toml", "Cargo.toml"]),
+            (
+                "cargo",
+                &[".cargo/config", ".cargo/config.toml", "Cargo.toml"],
+            ),
             ("golang", &["go.mod"]),
             ("gem", &["Gemfile.lock"]),
             ("composer", &["composer.lock"]),

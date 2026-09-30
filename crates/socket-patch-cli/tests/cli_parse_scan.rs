@@ -45,6 +45,9 @@ const SCAN_ENV_VARS: &[&str] = &[
     "SOCKET_JSON",
     "SOCKET_LOCK_TIMEOUT",
     "SOCKET_MANIFEST_PATH",
+    "SOCKET_MAX_NEW_PATCHES",
+    "SOCKET_MIN_SEVERITY",
+    "SOCKET_NO_SOCKET_YML",
     "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
     "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
     "SOCKET_NO_VLT_INSTALL_CLEANUP",
@@ -143,7 +146,6 @@ fn defaults_match_contract() {
     );
     assert!(!args.sync, "--sync default is false");
     assert!(!args.vendor, "--vendor default is false");
-    assert!(!args.detached, "--detached default is false");
     assert_eq!(args.mode, None, "--mode default is None (no mode selector)");
     assert!(!args.common.dry_run, "--dry-run default is false");
     assert!(
@@ -473,6 +475,8 @@ fn scan_json_empty_cwd_emits_updates_key() {
     // sub-object onto the hosted default path fails loudly.
     let bin = env!("CARGO_BIN_EXE_socket-patch");
     let tmp = tempfile::tempdir().expect("tempdir");
+    // Its own repo root, so no socket.yml above the temp dir leaks in.
+    std::fs::create_dir(tmp.path().join(".git")).expect(".git");
     let mut cmd = std::process::Command::new(bin);
     cmd.args(["scan", "--json", "--cwd"]).arg(tmp.path());
     // Strip *every* SOCKET_* override the child would otherwise inherit.
@@ -518,6 +522,11 @@ fn scan_json_empty_cwd_emits_updates_key() {
         // v4 duality rework: the positional PATH globs are echoed on every
         // scan envelope, always present (empty when no scoping was given).
         "paths": [],
+        "rollout": {
+            "maxNewPatches": { "value": null, "source": "default" },
+            "counts": { "new": 0, "deferred": 0, "upgrade": 0, "already": 0 },
+            "deferred": [],
+        },
         // v5: a bare scan runs hosted mode, so its result nests here.
         "redirect": {
             "mode": "hosted",
@@ -526,6 +535,18 @@ fn scan_json_empty_cwd_emits_updates_key() {
             "skipped": [],
             "warnings": [],
             "dryRun": false
+        },
+        // v5: the socket.yml patch policy block rides every successful
+        // scan (no file here: the built-in defaults).
+        "policy": {
+            "source": "none",
+            "path": null,
+            "sha256": null,
+            "enabled": true,
+            "minSeverity": { "value": null, "source": "default" },
+            "counts": { "filtered": 0, "retained": 0 },
+            "filtered": [],
+            "retained": []
         },
     });
     assert_eq!(
@@ -558,10 +579,9 @@ fn scan_json_empty_cwd_emits_updates_key() {
 // `--mode <hosted|vendored|agent>` is the RELEASED spelling of the three
 // mode flags. `resolve_mode_flags` (run at the top of `scan::run`,
 // exercised directly here) makes `args.mode` the single source of truth:
-// the legacy `--redirect`/`--vendor`/`--apply`/`--sync` booleans fold INTO
-// the enum (they are input spellings, never read downstream), and the
-// cross-mode rules clap can't express (a value-dependent conflict) are
-// enforced. These tests lock both the fold and the legacy aliases.
+// the `--vendor`/`--apply`/`--sync` booleans fold INTO the enum (they are
+// input spellings, never read downstream), and the cross-mode rules clap
+// can't express (a value-dependent conflict) are enforced.
 
 /// Parse `extra` (must parse cleanly at the clap level), then run the mode
 /// fold — mirroring exactly what `scan::run` does before it reads the
@@ -579,13 +599,6 @@ fn mode_hosted_is_the_source_of_truth() {
     // single source of truth (the booleans are inputs, not outputs).
     let folded = parse_and_resolve(&["--mode", "hosted"]).expect("fold ok");
     assert_eq!(folded.mode, Some(ScanMode::Hosted));
-    // ...and the legacy boolean spelling folds INTO the enum.
-    let folded = parse_and_resolve(&["--redirect"]).expect("fold ok");
-    assert_eq!(
-        folded.mode,
-        Some(ScanMode::Hosted),
-        "--redirect == --mode hosted"
-    );
 }
 
 #[test]
@@ -683,37 +696,13 @@ fn mode_agent_with_sync_boolean_is_allowed() {
 
 #[test]
 #[serial_test::serial]
-fn mode_vendored_with_detached_ok() {
-    // --detached is legal under vendored mode selected via --mode.
-    let folded = parse_and_resolve(&["--mode", "vendored", "--detached"]).expect("fold ok");
-    assert_eq!(folded.mode, Some(ScanMode::Vendored));
-    assert!(folded.detached);
-}
-
-#[test]
-#[serial_test::serial]
-fn detached_without_vendored_mode_errors() {
-    // --detached now requires vendored mode via resolve_mode_flags (the
-    // former clap `requires = "vendor"` could not see `--mode vendored`, so
-    // the requirement moved into the fold). Parsing alone succeeds.
-    let mut args = parse_scan(&["--detached"]);
-    assert!(
-        resolve_mode_flags(&mut args).is_err(),
-        "--detached without vendored mode must error"
-    );
-}
-
-#[test]
-#[serial_test::serial]
 fn legacy_mode_spellings_still_parse() {
     // The boolean aliases keep working with no `--mode` given; the fold
     // derives the mode enum from them (the inverse of the historical
     // direction — `args.mode` is now the single source of truth).
-    assert!(parse_scan(&["--redirect"]).redirect);
     assert!(parse_scan(&["--vendor"]).vendor);
     assert!(parse_scan(&["--apply"]).apply);
-    let folded = parse_and_resolve(&["--vendor", "--detached"]).expect("legacy fold ok");
-    assert!(folded.detached);
+    let folded = parse_and_resolve(&["--vendor"]).expect("legacy fold ok");
     assert_eq!(
         folded.mode,
         Some(ScanMode::Vendored),
@@ -730,8 +719,8 @@ fn legacy_mode_spellings_still_parse() {
 /// `Debug` derive) are formatted individually.
 fn snap(a: &ScanArgs) -> String {
     format!(
-        "{:?} paths={:?} batch_size={:?} apply={} prune={} sync={} vendor={} detached={} \
-         redirect={} mode={:?} all_releases={} vex={:?} vex_product={:?} \
+        "{:?} paths={:?} batch_size={:?} apply={} prune={} sync={} vendor={} \
+         mode={:?} all_releases={} vex={:?} vex_product={:?} \
          vex_no_verify={} vex_doc_id={:?} vex_compact={}",
         a.common,
         a.paths,
@@ -740,8 +729,6 @@ fn snap(a: &ScanArgs) -> String {
         a.prune,
         a.sync,
         a.vendor,
-        a.detached,
-        a.redirect,
         a.mode,
         a.all_releases,
         a.vex.vex,
@@ -793,107 +780,50 @@ fn scrub_covers_every_scan_env_var_clap_consults() {
     }
 }
 
-// --- hidden `--mode` value aliases ("vendor" / "host" / "redirect") ---------
-//
-// `--mode vendor`, `--mode host`, and `--mode redirect` are UNDOCUMENTED
-// spellings accepted for muscle-memory reasons (they match the legacy
-// boolean flag names / the old mode name). They are clap value aliases on
-// the `ScanMode` variants, which clap keeps out of help output — the tests
-// below lock in both the acceptance and the hiding. `--mode apply` is
-// deliberately NOT an alias: applying is not a scan mode name anywhere
-// (the canonical name is `agent`), so it must stay rejected.
-
 #[test]
 #[serial_test::serial]
-fn mode_alias_vendor_folds_to_vendor() {
-    // The parser resolves the hidden alias to the canonical variant...
-    assert_eq!(
-        parse_scan(&["--mode", "vendor"]).mode,
-        Some(ScanMode::Vendored)
-    );
-    // ...and the fold keeps it as the single source of truth, exactly as if
-    // `--mode vendored` were given.
-    let folded = parse_and_resolve(&["--mode", "vendor"]).expect("fold ok");
-    assert_eq!(
-        folded.mode,
-        Some(ScanMode::Vendored),
-        "--mode vendor (hidden alias) == --mode vendored"
-    );
+fn non_canonical_mode_values_are_rejected() {
+    // Only the three canonical names parse: `apply` was never a mode name,
+    // and the v3/v4 value aliases `host` / `redirect` / `vendor` were
+    // removed in v5.0.
+    for value in ["apply", "host", "redirect", "vendor"] {
+        let parsed =
+            with_clean_env(|| Cli::try_parse_from(["socket-patch", "scan", "--mode", value]));
+        let Err(err) = parsed else {
+            panic!("--mode {value} must be rejected");
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(value),
+            "the error must echo the rejected value: {rendered}"
+        );
+    }
+}
+
+/// The v3/v4 hidden `--redirect` and no-op `--detached` flags were removed
+/// in v5.0: clap rejects them like any unknown argument.
+#[test]
+#[serial_test::serial]
+fn removed_legacy_scan_flags_are_rejected() {
+    for flag in ["--redirect", "--detached"] {
+        let parsed = with_clean_env(|| Cli::try_parse_from(["socket-patch", "scan", flag]));
+        let Err(err) = parsed else {
+            panic!("{flag} must be rejected");
+        };
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::UnknownArgument,
+            "{flag}: {err}"
+        );
+    }
 }
 
 #[test]
 #[serial_test::serial]
-fn mode_alias_host_folds_to_redirect() {
-    assert_eq!(parse_scan(&["--mode", "host"]).mode, Some(ScanMode::Hosted));
-    let folded = parse_and_resolve(&["--mode", "host"]).expect("fold ok");
-    assert_eq!(
-        folded.mode,
-        Some(ScanMode::Hosted),
-        "--mode host (hidden alias) == --mode hosted"
-    );
-}
-
-#[test]
-#[serial_test::serial]
-fn mode_alias_redirect_folds_to_hosted() {
-    // `redirect` is the legacy FLAG spelling (`--redirect`); the value
-    // aliases stay symmetric with `--mode vendor`/`--mode host`.
-    assert_eq!(
-        parse_scan(&["--mode", "redirect"]).mode,
-        Some(ScanMode::Hosted)
-    );
-    let folded = parse_and_resolve(&["--mode", "redirect"]).expect("fold ok");
-    assert_eq!(
-        folded.mode,
-        Some(ScanMode::Hosted),
-        "--mode redirect (hidden alias) == --mode hosted"
-    );
-    // The alias agrees with its own boolean: redundant, not contradictory.
-    let folded = parse_and_resolve(&["--mode", "redirect", "--redirect"]).expect("fold ok");
-    assert_eq!(folded.mode, Some(ScanMode::Hosted));
-}
-
-#[test]
-#[serial_test::serial]
-fn mode_apply_stays_rejected() {
-    // `apply` is NOT a scan mode name (canonical: `agent`); accepting it
-    // would mint a fourth spelling nothing else recognizes. Clap must
-    // reject it at parse time like any unknown value.
-    let parsed =
-        with_clean_env(|| Cli::try_parse_from(["socket-patch", "scan", "--mode", "apply"]));
-    let Err(err) = parsed else {
-        panic!("--mode apply must be rejected");
-    };
-    let rendered = err.to_string();
-    assert!(
-        rendered.contains("apply"),
-        "the error must echo the rejected value: {rendered}"
-    );
-}
-
-#[test]
-#[serial_test::serial]
-fn mode_alias_host_with_vendor_boolean_errors_with_canonical_name() {
-    // The alias resolves to `ScanMode::Hosted` at parse time, so the
-    // cross-mode contradiction fires exactly as with the canonical
-    // spelling — and the error message names the canonical mode
-    // (`cli_name()`), never echoing the alias the user typed.
-    let mut args = parse_scan(&["--mode", "host", "--vendor"]);
-    let err = resolve_mode_flags(&mut args).expect_err("cross-mode contradiction");
-    assert!(
-        err.contains("--mode hosted cannot be used with --vendor"),
-        "error must name the canonical mode (\"hosted\"), got: {err}"
-    );
-}
-
-#[test]
-#[serial_test::serial]
-fn mode_aliases_hidden_from_help() {
+fn mode_help_lists_only_canonical_names() {
     use clap::CommandFactory;
     // clap embeds live env values into help as `[env: VAR=value]` at
-    // command-build/render time; an ambient value containing "host:" or
-    // "vendor:" (e.g. SOCKET_PROXY_URL=http://localhost:8080) would trip
-    // the alias-leak asserts below, so the whole build+render runs clean.
+    // command-build/render time, so the whole build+render runs clean.
     let (short, long) = with_clean_env(|| {
         let mut cmd = Cli::command();
         let scan = cmd.find_subcommand_mut("scan").expect("scan subcommand");
@@ -904,57 +834,21 @@ fn mode_aliases_hidden_from_help() {
     });
 
     // Short help (`scan -h`) renders the compact bracketed list. Assert on
-    // the exact rendered segment — NOT on substring absence, because
-    // "vendored" contains "vendor" as a substring — so any extra value
-    // inside the brackets (a leaked alias) breaks the match.
+    // the exact rendered segment so any extra value inside the brackets
+    // breaks the match.
     assert!(
         short.contains("[possible values: hosted, vendored, agent]"),
         "scan -h must list exactly the canonical mode names; help was:\n{short}"
     );
 
     // Long help (`scan --help`) itemizes each possible value with its doc
-    // comment. The canonical items render as "hosted:" / "vendored:" /
-    // "agent:"; an alias leaking into the itemized list would render as
-    // "host:" or "vendor:" (name immediately followed by the colon).
+    // comment.
     for canonical in ["hosted:", "vendored:", "agent:"] {
         assert!(
             long.contains(canonical),
             "scan --help must itemize `{canonical}`; help was:\n{long}"
         );
     }
-    for alias in ["host:", "vendor:", "redirect:"] {
-        // "host:" is NOT a substring of "hosted:" (the canonical item has
-        // 'e' after "host"), so any literal hit is a genuine leak.
-        assert!(
-            !long.contains(alias),
-            "hidden alias `{alias}` leaked into scan --help; help was:\n{long}"
-        );
-    }
-}
-
-/// `--detached` is a compatibility no-op (vendored mode is always
-/// manifest-free): still parsed, still requiring vendored mode, but hidden
-/// from help like the legacy `--redirect` spelling.
-#[test]
-#[serial_test::serial]
-fn detached_flag_is_hidden_from_help() {
-    use clap::CommandFactory;
-    let long = with_clean_env(|| {
-        let mut cmd = Cli::command();
-        let scan = cmd.find_subcommand_mut("scan").expect("scan subcommand");
-        scan.render_long_help().to_string()
-    });
-    assert!(
-        !long.contains("--detached"),
-        "--detached must be hidden from scan --help; help was:\n{long}"
-    );
-    assert!(
-        long.contains("--prune"),
-        "control: a documented flag renders; help was:\n{long}"
-    );
-    // Still parsed (compatibility), still folded under vendored mode.
-    let folded = parse_and_resolve(&["--mode", "vendored", "--detached"]).expect("fold ok");
-    assert!(folded.detached);
 }
 
 #[test]
@@ -982,3 +876,133 @@ fn no_vlt_install_cleanup_flag_and_env_parse() {
         _ => panic!("expected Scan"),
     }
 }
+
+// ── --max-new-patches (staged rollout) ───────────────────────────────────
+
+#[test]
+#[serial_test::serial]
+fn max_new_patches_defaults_to_unset() {
+    let args = parse_scan(&[]);
+    assert_eq!(args.rollout.max_new_patches, None);
+}
+
+#[test]
+#[serial_test::serial]
+fn max_new_patches_takes_a_count_or_none() {
+    use socket_patch_cli::commands::scan::rollout_args::MaxNewPatches;
+    for (raw, want) in [
+        ("5", Some(5)),
+        ("0", Some(0)),
+        ("4294967295", Some(u32::MAX)),
+        ("none", None),
+        ("NONE", None),
+    ] {
+        let args = parse_scan(&["--max-new-patches", raw]);
+        assert_eq!(args.rollout.max_new_patches, Some(MaxNewPatches(want)), "{raw}");
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn max_new_patches_rejects_malformed_values() {
+    for raw in ["-1", "4294967296", "five", "", "all"] {
+        let err = match try_parse_scan(&[&format!("--max-new-patches={raw}")]) {
+            Ok(_) => panic!("{raw:?} must not parse"),
+            Err(e) => e,
+        };
+        assert_eq!(err.exit_code(), 2, "{raw:?}: usage error");
+    }
+}
+
+#[test]
+fn max_new_patches_env_is_read_at_run_time() {
+    // The env binding is resolved by `RolloutArgs::resolve` (the rollout
+    // block reports flag vs env), not by clap: empty is unset, malformed is
+    // a usage error, and the flag wins.
+    use socket_patch_cli::commands::scan::rollout_args::{MaxNewPatches, RolloutArgs};
+    use socket_patch_core::rollout::MaxNewSource;
+    let unset = RolloutArgs::default();
+    let got = unset.resolve(Some("7"), None).unwrap();
+    assert_eq!((got.value, got.source), (Some(7), MaxNewSource::Env));
+    let got = unset.resolve(Some(""), None).unwrap();
+    assert_eq!((got.value, got.source), (None, MaxNewSource::Default));
+    assert!(unset.resolve(Some("x"), None).is_err());
+    let mut flag = RolloutArgs::default();
+    flag.max_new_patches = Some(MaxNewPatches(Some(1)));
+    let got = flag.resolve(Some("7"), None).unwrap();
+    assert_eq!((got.value, got.source), (Some(1), MaxNewSource::Flag));
+}
+/// Parse `scan` under a clean env plus `env`, restoring it afterwards.
+fn parse_scan_with_env(extra: &[&str], env: &[(&str, &str)]) -> Result<ScanArgs, clap::Error> {
+    with_clean_env(|| {
+        for (k, v) in env {
+            std::env::set_var(k, v);
+        }
+        let mut argv = vec!["socket-patch", "scan"];
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(&argv);
+        for (k, _) in env {
+            std::env::remove_var(k);
+        }
+        cli.map(|c| match c.command {
+            Commands::Scan(a) => a,
+            _ => panic!("expected Scan"),
+        })
+    })
+}
+
+/// `--no-socket-yml` / `SOCKET_NO_SOCKET_YML`: a bool with the repo-wide
+/// vocabulary; empty is unset; garbage is a parse error.
+#[test]
+#[serial_test::serial]
+fn no_socket_yml_flag_and_env() {
+    assert!(!parse_scan(&[]).socket_yml.no_socket_yml);
+    assert!(parse_scan(&["--no-socket-yml"]).socket_yml.no_socket_yml);
+    for (value, expected) in [("1", true), ("true", true), ("0", false), ("", false)] {
+        let args = parse_scan_with_env(&[], &[("SOCKET_NO_SOCKET_YML", value)]).expect("parse");
+        assert_eq!(args.socket_yml.no_socket_yml, expected, "{value:?}");
+    }
+    assert!(parse_scan_with_env(&[], &[("SOCKET_NO_SOCKET_YML", "garbage")]).is_err());
+}
+
+/// `--min-severity` / `SOCKET_MIN_SEVERITY`: the flag beats the env, the
+/// layer is recorded, `none` lifts the floor, empty env is unset, and a
+/// malformed value is a usage error (the flag at parse time, the env when
+/// the overrides are resolved; scan exits 2 either way).
+#[test]
+#[serial_test::serial]
+fn min_severity_flag_and_env() {
+    use socket_patch_core::policy::OverrideSource;
+    let overrides = |extra: &[&str], env: &[(&str, &str)]| {
+        let args = parse_scan_with_env(extra, env).expect("parse");
+        with_clean_env(|| {
+            for (k, v) in env {
+                std::env::set_var(k, v);
+            }
+            let out = args.socket_yml.overrides();
+            for (k, _) in env {
+                std::env::remove_var(k);
+            }
+            out
+        })
+    };
+    assert_eq!(parse_scan(&[]).socket_yml.min_severity, None);
+    assert_eq!(overrides(&[], &[]).unwrap().min_severity, None);
+    assert_eq!(
+        overrides(&["--min-severity", "High"], &[]).unwrap().min_severity,
+        Some((Some(1), OverrideSource::Flag))
+    );
+    assert_eq!(
+        overrides(&["--min-severity", "none"], &[("SOCKET_MIN_SEVERITY", "critical")]).unwrap().min_severity,
+        Some((None, OverrideSource::Flag))
+    );
+    assert_eq!(
+        overrides(&[], &[("SOCKET_MIN_SEVERITY", "moderate")]).unwrap().min_severity,
+        Some((Some(2), OverrideSource::Env))
+    );
+    assert_eq!(overrides(&[], &[("SOCKET_MIN_SEVERITY", "")]).unwrap().min_severity, None);
+    assert!(overrides(&[], &[("SOCKET_MIN_SEVERITY", "severe")]).is_err());
+    assert!(try_parse_scan(&["--min-severity", "severe"]).is_err());
+    assert!(overrides(&["--no-socket-yml"], &[]).unwrap().bypass);
+}
+

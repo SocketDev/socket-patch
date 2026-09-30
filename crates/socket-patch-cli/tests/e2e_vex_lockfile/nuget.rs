@@ -1153,6 +1153,44 @@ fn standalone_after_writer(
     }
 }
 
+/// After the real HOSTED writer ran: v5 hosted mode left NO ledger, so
+/// the pin (lock + nuget.config) is the only hosted state — offline there
+/// is no local record (`record_unavailable`, zero requests), online the
+/// API's record attests, and with the wiring reverted nothing is
+/// discovered at all.
+fn standalone_after_hosted_writer(
+    fx: &Fx,
+    uuid: &str,
+    record_purl: &str,
+    api_view: Value,
+    revert: &dyn Fn(&Fx),
+) {
+    fx.rm(".socket/manifest.json");
+    fx.rm(".socket/blobs");
+    assert!(
+        !fx.cwd.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode writes no ledger"
+    );
+    let api = Api::serve(vec![(uuid, api_view)]);
+    let (code, env) = fx.vex(&["--offline", "--proxy-url", &api.uri()]);
+    assert_omitted(
+        code,
+        &env,
+        record_purl,
+        "record_unavailable",
+        "hosted writer, offline",
+    );
+    assert_eq!(api.requests(), 0, "--offline never asks the API");
+    let (code, env) = fx.vex(&["--proxy-url", &api.uri()]);
+    assert_attested(fx, code, &env, uuid, record_purl, "redirected");
+
+    revert(fx);
+    for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
+        let (code, env) = fx.vex(extra);
+        assert_nothing_to_attest(code, &env, "hosted writer, reverted");
+    }
+}
+
 #[test]
 fn nuget_vendor_command_wiring_reattests_without_manifest_or_ledger() {
     let fx = Fx::new();
@@ -1359,9 +1397,16 @@ fn nuget_scan_hosted_wiring_reattests_without_manifest_or_ledger() {
         "{config}"
     );
 
-    // The pristine shared-folder copy is installed evidence: omitted.
+    assert!(
+        !fx.cwd.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode writes no ledger"
+    );
+
+    // The pristine shared-folder copy is installed evidence: omitted (the
+    // record comes from the API — the scan left no local one).
     fx.rm(".socket/manifest.json");
-    let (code, env) = fx.vex(&["--offline"]);
+    let view_api = Api::serve(vec![(NUGET_HOSTED_UUID, nuget_hosted_view())]);
+    let (code, env) = fx.vex(&["--proxy-url", &view_api.uri()]);
     assert_omitted(
         code,
         &env,
@@ -1372,19 +1417,16 @@ fn nuget_scan_hosted_wiring_reattests_without_manifest_or_ledger() {
     // Cleared (a fresh CI restore would fetch the patched nupkg): the pin.
     std::fs::remove_dir_all(fx.nuget().join("newtonsoft.json")).unwrap();
     let inputs = copy_golden_to_vec(&format!("{golden}/input"));
-    standalone_after_writer(
+    standalone_after_hosted_writer(
         &fx,
-        ".socket/vendor/redirect-state.json",
         NUGET_HOSTED_UUID,
         NUGET_PURL,
-        "redirected",
         nuget_hosted_view(),
         &|fx| {
             for (file, bytes) in &inputs {
                 fx.put(file, bytes);
             }
         },
-        "redirect_unwired",
     );
 }
 
@@ -1416,13 +1458,6 @@ fn nuget_apply_vex_attests_but_agent_mode_needs_the_manifest() {
     put(&pkg, "newtonsoft.json.nuspec", b"<package/>");
     put(&pkg, NUGET_FILE_KEY, NUGET_PRISTINE);
     fx.stage_manifest(NUGET_PURL, NUGET_HOSTED_UUID, &nuget_files());
-    // nuget has no install hook: agent-mode statements need the ecosystem
-    // declared `setup.manual` (property 7) — the hosted/vendored cells
-    // above never do, their wiring IS the persistence.
-    let manifest = fx.cwd.join(".socket/manifest.json");
-    let mut m: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
-    m["setup"] = serde_json::json!({ "manual": ["nuget"] });
-    fx.put(".socket/manifest.json", m.to_string());
     let embedded = fx.cwd.join("embedded.vex.json");
     let (code, env, stderr) = fx.run(&[
         "apply",

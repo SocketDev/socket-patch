@@ -48,7 +48,7 @@
 pub mod path;
 pub mod state;
 
-mod berry_zip;
+pub(crate) mod berry_zip;
 mod bun_binary;
 pub mod bun_lock;
 pub(crate) mod bun_lock_text;
@@ -62,14 +62,12 @@ pub mod cargo_tag;
 pub(crate) mod common;
 pub mod composer_lock;
 pub mod gem;
-pub(crate) mod gemfile_lock;
 pub mod go_mod_edit;
 pub mod go_sum_edit;
 pub mod golang;
 pub mod jvm;
 pub(crate) mod ledger_snapshots;
 pub mod lock_inventory;
-pub(crate) mod maven_pom;
 pub mod maven_repo;
 pub(crate) mod npm_common;
 pub(crate) mod npm_dir;
@@ -100,7 +98,6 @@ pub(crate) mod test_support;
 mod toml_surgery;
 pub(crate) mod verify;
 pub mod vlt_lock;
-#[allow(dead_code)]
 pub(crate) mod vlt_lock_text;
 pub(crate) mod yarn_berry_lock;
 pub(crate) mod yarn_classic_lock;
@@ -108,6 +105,7 @@ pub(crate) mod yarn_classic_lock;
 mod yarn_layering_tests;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path};
+#[cfg(test)]
 pub(crate) use pypi_lock::restore_document as restore_python_document;
 pub use source::{DeferredFetchFn, DeferredMiss, DeferredPackage, PackageSource};
 // `vex::discover` validates lockfile-recorded npm names with the same rule the
@@ -115,8 +113,8 @@ pub use source::{DeferredFetchFn, DeferredMiss, DeferredPackage, PackageSource};
 pub(crate) use npm_common::is_safe_npm_name;
 pub use pypi_requirements::requirements_include_names;
 pub use state::{
-    carry_forward_wiring, load_state, lookup_entry, save_state, save_state_shared, VendorEntry,
-    VendorState, VENDOR_STATE_REL,
+    carry_forward_wiring, load_state, lookup_entry, purl_keys_cover, save_state, save_state_shared,
+    VendorEntry, VendorState, VENDOR_STATE_REL,
 };
 pub use verify::{
     artifact_is_file_shaped, check_vendored_artifact, compute_dir_inventory,

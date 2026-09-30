@@ -14,6 +14,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
+use crate::commands::fetch_stage::files_diffs_cannot_cover;
 use crate::commands::lock_cli::{acquire_or_emit, error_envelope};
 use crate::commands::rollback::{sweep_failure, sweep_unused_artifacts};
 use crate::json_envelope::{Command, Envelope, PatchAction, PatchEvent, Status};
@@ -64,18 +65,15 @@ pub async fn run(args: RepairArgs) -> i32 {
     let mut vendor_references: Option<Vec<(String, String, String)>> = None;
 
     if tokio::fs::metadata(&manifest_path).await.is_err() {
-        // Hosted (redirect) mode leaves no local artifacts to repair: the
-        // lockfiles point at patch.socket.dev URLs, not `.socket/vendor/...`,
-        // and there is no manifest or vendor ledger. A project whose only
-        // trace is `redirect-state.json` is therefore a no-op for repair —
-        // exit success with an informational skip rather than the
-        // `manifest_not_found` error a bare directory would get. Only cheap
-        // existence probes (and the read-only lockfile scan) run before the
-        // lock, so a project with nothing to repair never grows `.socket/`.
-        let redirect_state = args
-            .common
-            .cwd
-            .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
+        // Hosted mode leaves no local artifacts to repair: the lockfiles
+        // point at patch.socket.dev URLs, not `.socket/vendor/...`, and
+        // there is no manifest or vendor ledger. A project whose only trace
+        // is its hosted lockfile pins (or a pre-v5 `redirect-state.json`)
+        // is therefore a no-op for repair — exit success with an
+        // informational skip rather than the `manifest_not_found` error a
+        // bare directory would get. Only cheap existence probes (and the
+        // read-only lockfile scans) run before the lock, so a project with
+        // nothing to repair never grows `.socket/`.
         let state_file = args
             .common
             .cwd
@@ -83,12 +81,20 @@ pub async fn run(args: RepairArgs) -> i32 {
         let mut has_vendor_traces = tokio::fs::metadata(&state_file).await.is_ok();
         if !has_vendor_traces {
             let refs =
-                crate::commands::repair_vendor::scan_vendor_references(&args.common.cwd).await;
+                crate::commands::vendored_backend::repair::scan_vendor_references(&args.common.cwd).await;
             has_vendor_traces = !refs.is_empty();
             vendor_references = Some(refs);
         }
         if !has_vendor_traces {
-            if tokio::fs::metadata(&redirect_state).await.is_ok() {
+            let legacy_ledger = args
+                .common
+                .cwd
+                .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
+            let hosted = tokio::fs::metadata(&legacy_ledger).await.is_ok()
+                || !crate::commands::hosted_inventory(&args.common, &args.common.cwd)
+                    .await
+                    .is_empty();
+            if hosted {
                 let msg = HOSTED_ONLY_REASON;
                 if args.common.json {
                     let mut env = Envelope::new(Command::Repair);
@@ -145,7 +151,7 @@ pub async fn run(args: RepairArgs) -> i32 {
     // scanned this ledger-less project.
     let vendor_references = match vendor_references {
         Some(refs) => refs,
-        None => crate::commands::repair_vendor::scan_vendor_references(&args.common.cwd).await,
+        None => crate::commands::vendored_backend::repair::scan_vendor_references(&args.common.cwd).await,
     };
 
     // The API client is built lazily: `repair_inner` constructs it only on
@@ -258,9 +264,9 @@ fn format_found_missing(n: usize, noun: ArtifactNoun) -> String {
 
 /// Why a hosted-only project has nothing to repair (the JSON skip
 /// reason; the human line adds the period).
-const HOSTED_ONLY_REASON: &str = "Hosted redirects need no local repair; re-run \
-    `scan --mode hosted` to refresh the lockfile redirects (it also re-checks for stale \
-    pre-redirect installs)";
+const HOSTED_ONLY_REASON: &str = "Hosted patches need no local repair; re-run \
+    `scan --mode hosted` to refresh the lockfile (it also re-checks for stale \
+    pre-hosted installs)";
 
 /// Step 1's line when no patch artifact is missing: why there is nothing
 /// to download (no manifest, as in a vendored-only project, or an empty
@@ -336,6 +342,98 @@ fn format_final_line(
     }
 }
 
+/// The `.socket/` source directories a download pass writes into.
+struct SourcePaths<'a> {
+    blobs: &'a Path,
+    diffs: &'a Path,
+}
+
+/// What one download pass did: how many artifacts were missing, and how
+/// many of them it downloaded or failed to.
+#[derive(Default)]
+struct DownloadPass {
+    missing: usize,
+    downloaded: usize,
+    failed: usize,
+}
+
+/// Step 1's pass over `missing` (non-empty), the `mode` artifacts `m`
+/// references: the `--offline` warning, the `--dry-run` preview, or the
+/// download and its result lines.
+async fn download_pass(
+    args: &RepairArgs,
+    client: &mut Option<ApiClient>,
+    m: &socket_patch_core::manifest::schema::PatchManifest,
+    missing: &[String],
+    mode: DownloadMode,
+    paths: &SourcePaths<'_>,
+) -> DownloadPass {
+    let quiet = args.common.json || args.common.silent;
+    let noun = mode.noun();
+    let mut pass = DownloadPass {
+        missing: missing.len(),
+        ..DownloadPass::default()
+    };
+    if args.common.offline {
+        if !quiet {
+            eprintln!("{}", format_offline_warning(missing, noun));
+        }
+        return pass;
+    }
+    if !quiet {
+        println!("{}", format_found_missing(missing.len(), noun));
+    }
+    if args.common.dry_run {
+        if !quiet {
+            println!();
+            println!("Would download:");
+            for line in format_id_list(missing, noun, DRY_RUN_LIST_CAP) {
+                println!("{line}");
+            }
+        }
+        return pass;
+    }
+    let mut status = crate::ui::StatusLine::stderr(args.common.json, args.common.silent);
+    status.set(format!("Downloading {}...", noun.count(missing.len())));
+    if client.is_none() {
+        *client = Some(
+            get_api_client_with_overrides(args.common.api_client_overrides())
+                .await
+                .0,
+        );
+    }
+    let client = client.as_ref().expect("client built just above");
+    let sources = PatchSources {
+        blobs_path: paths.blobs,
+        diffs_path: Some(paths.diffs),
+        mem_blobs: None,
+    };
+    let fetch_result = fetch_missing_sources(m, &sources, mode, client, None).await;
+    status.finish();
+    pass.downloaded = fetch_result.downloaded;
+    pass.failed = fetch_result.failed;
+    if !quiet {
+        for line in format_fetch_successes(&fetch_result, noun) {
+            println!("{line}");
+        }
+    }
+    // Failures are error output: stderr, and not muted by `--silent`
+    // (`--json` runs carry them in the envelope).
+    if !args.common.json {
+        for (i, line) in format_fetch_failures(&fetch_result, noun)
+            .iter()
+            .enumerate()
+        {
+            if i == 0 {
+                eprintln!("Error: {line}");
+            } else {
+                eprintln!("{line}");
+            }
+        }
+    }
+    pass
+}
+
 /// Whether an API token will be found, mirroring the client's chain: the
 /// `--api-token` flag (clap also maps SOCKET_API_TOKEN into it), then —
 /// unless `SOCKET_NO_API_TOKEN` vetoes ambient tokens — the env var and the
@@ -373,7 +471,6 @@ async fn repair_inner(
     let socket_dir = crate::args::socket_dir_of(manifest_path, &args.common.cwd);
     let blobs_path = socket_dir.join("blobs");
     let diffs_path = socket_dir.join("diffs");
-    let packages_path = socket_dir.join("packages");
 
     let download_mode =
         DownloadMode::parse(&args.common.download_mode).map_err(|e| e.to_string())?;
@@ -415,9 +512,10 @@ async fn repair_inner(
     let ledger = socket_patch_core::vendor::load_state(&args.common.cwd).await;
     let no_entries = std::collections::HashMap::new();
     let vendor_entries = ledger.as_ref().map(|s| &s.entries).unwrap_or(&no_entries);
-    // Lockfile vendor references count as vendored even before the ledger
-    // is reconstructed, so a no-ledger repair doesn't download sources for
-    // entries the vendored phase is about to own.
+    // Lockfile vendor references count as vendored even with no ledger
+    // entry: the committed artifact is the patch, so a no-ledger repair
+    // must not litter `.socket/` with sources for it (the vendored phase
+    // reports the missing ledger instead).
     let referenced_uuids: std::collections::HashSet<String> = vendor_references
         .iter()
         .map(|(_, uuid, _)| uuid.clone())
@@ -449,100 +547,67 @@ async fn repair_inner(
             .into_iter()
             .collect(),
     };
-    let missing_count = missing_artifacts.len();
     let noun = download_mode.noun();
+    let paths = SourcePaths {
+        blobs: &blobs_path,
+        diffs: &diffs_path,
+    };
     // Whether stdout already carries a line, so the blank separators
     // between sections never open the output (the offline warning goes
     // to stderr).
-    let mut stdout_started = true;
-
-    if missing_artifacts.is_empty() {
-        if !quiet {
-            println!("{}", format_nothing_missing(manifest.as_ref(), noun));
+    let mut stdout_started = !args.common.offline || missing_artifacts.is_empty();
+    let primary = match scoped_manifest.as_ref() {
+        Some(m) if !missing_artifacts.is_empty() => {
+            download_pass(args, client, m, &missing_artifacts, download_mode, &paths).await
         }
-    } else if args.common.offline {
-        if !quiet {
-            eprintln!("{}", format_offline_warning(&missing_artifacts, noun));
-        }
-        stdout_started = false;
-    } else {
-        if !quiet {
-            println!("{}", format_found_missing(missing_artifacts.len(), noun));
-        }
-
-        if args.common.dry_run {
+        _ => {
             if !quiet {
-                println!();
-                println!("Would download:");
-                for line in format_id_list(&missing_artifacts, noun, DRY_RUN_LIST_CAP) {
-                    println!("{line}");
-                }
+                println!("{}", format_nothing_missing(manifest.as_ref(), noun));
             }
-        } else {
-            let mut status = crate::ui::StatusLine::stderr(args.common.json, args.common.silent);
-            status.set(format!(
-                "Downloading {}...",
-                noun.count(missing_artifacts.len())
-            ));
-            if client.is_none() {
-                *client = Some(
-                    get_api_client_with_overrides(args.common.api_client_overrides())
-                        .await
-                        .0,
-                );
-            }
-            let client = client.as_ref().expect("client built just above");
-            let sources = PatchSources {
-                blobs_path: &blobs_path,
-                packages_path: Some(&packages_path),
-                diffs_path: Some(&diffs_path),
-                mem_blobs: None,
-            };
-            // Step 1 only runs with a manifest (missing_artifacts is
-            // empty otherwise), so the expect is unreachable.
-            let m = scoped_manifest
-                .as_ref()
-                .expect("step 1 requires a manifest");
-            let fetch_result =
-                fetch_missing_sources(m, &sources, download_mode, client, None).await;
-            status.finish();
-            downloaded_count = fetch_result.downloaded;
-            download_failed_count = fetch_result.failed;
-            if !quiet {
-                for line in format_fetch_successes(&fetch_result, noun) {
-                    println!("{line}");
-                }
-            }
-            // Failures are error output: stderr, and not muted by
-            // `--silent` (`--json` runs carry them in the envelope).
-            if !args.common.json {
-                for (i, line) in format_fetch_failures(&fetch_result, noun)
-                    .iter()
-                    .enumerate()
-                {
-                    if i == 0 {
-                        eprintln!("Error: {line}");
-                    } else {
-                        eprintln!("{line}");
-                    }
-                }
+            DownloadPass::default()
+        }
+    };
+    // A diff archive has no delta for a file the patch creates, so in diff
+    // mode that file's blob is downloaded too: without it, a later
+    // `apply --offline` cannot apply the patch.
+    let created = match (&scoped_manifest, download_mode) {
+        (Some(m), DownloadMode::Diff) => {
+            let created = files_diffs_cannot_cover(m);
+            let missing: Vec<String> = get_missing_blobs(&created, &blobs_path)
+                .await
+                .into_iter()
+                .collect();
+            if missing.is_empty() {
+                DownloadPass::default()
+            } else {
+                download_pass(args, client, &created, &missing, DownloadMode::File, &paths).await
             }
         }
-    }
+        _ => DownloadPass::default(),
+    };
+    let missing_count = primary.missing;
+    downloaded_count += primary.downloaded;
+    download_failed_count += primary.failed;
 
-    // Step 1.5: vendored artifacts — health-check the ledger (and any
-    // lockfile vendor references with no ledger coverage) and rebuild
-    // missing/corrupt artifacts. Runs under `--download-only` too:
+    // Step 1.5: vendored artifacts — health-check the ledger and re-vendor
+    // missing/corrupt artifacts through the vendored backend (the patch
+    // service first, like `vendor`); lockfile vendor references with no
+    // ledger entry are reported. Runs under `--download-only` too:
     // restoring artifacts IS repair's download half. The reference scan
     // and ledger load above are handed over, not repeated.
-    let vendor_rebuilt = crate::commands::repair_vendor::repair_vendored_artifacts_with_references(
+    let vendor_rebuilt = crate::commands::vendored_backend::VendoredBackend::new(
         &args.common,
-        manifest.as_ref(),
-        &socket_dir,
+        None,
+    )
+    .repair(
+        crate::commands::vendored_backend::repair::RepairRequest {
+            manifest: manifest.as_ref(),
+            socket_dir: &socket_dir,
+            references: &vendor_references,
+            ledger,
+            client: client.as_ref(),
+        },
         &mut env,
-        &vendor_references,
-        ledger,
-        client.as_ref(),
     )
     .await;
     if !quiet && vendor_rebuilt > 0 {
@@ -608,13 +673,24 @@ async fn repair_inner(
         // so a piped stdout never ends in a stray blank line when the
         // line itself goes to stderr.
         let other_failure = matches!(env.status, Status::PartialFailure | Status::Error);
-        let line = format_final_line(
-            download_failed_count,
-            other_failure,
-            noun,
-            args.common.dry_run,
-        );
-        if download_failed_count > 0 || other_failure {
+        let failed = download_failed_count + created.failed;
+        let line = if download_failed_count > 0 && created.failed > 0 {
+            format!(
+                "Repair finished with errors: {} and {} were not downloaded.",
+                noun.count(download_failed_count),
+                BLOB.count(created.failed)
+            )
+        } else if download_failed_count > 0 {
+            format_final_line(
+                download_failed_count,
+                other_failure,
+                noun,
+                args.common.dry_run,
+            )
+        } else {
+            format_final_line(created.failed, other_failure, BLOB, args.common.dry_run)
+        };
+        if failed > 0 || other_failure {
             if stdout_started {
                 eprintln!();
             }
@@ -655,6 +731,28 @@ async fn repair_inner(
         ));
         env.mark_partial_failure();
     }
+    if created.downloaded > 0
+        || (!args.common.offline && args.common.dry_run && created.missing > 0)
+    {
+        let (action, count) = if args.common.dry_run {
+            (PatchAction::Verified, created.missing)
+        } else {
+            (PatchAction::Downloaded, created.downloaded)
+        };
+        env.record(
+            PatchEvent::artifact(action).with_details(serde_json::json!({
+                "count": count,
+                "mode": DownloadMode::File.as_tag(),
+            })),
+        );
+    }
+    if created.failed > 0 {
+        env.record(PatchEvent::artifact(PatchAction::Failed).with_error(
+            "download_failed",
+            format!("{} failed to download", BLOB.count(created.failed)),
+        ));
+        env.mark_partial_failure();
+    }
     if blobs_cleaned > 0 {
         let cleanup_action = if args.common.dry_run {
             PatchAction::Verified
@@ -671,7 +769,7 @@ async fn repair_inner(
     Ok((
         env,
         RepairCounts {
-            downloaded: downloaded_count,
+            downloaded: downloaded_count + created.downloaded,
             cleaned: blobs_cleaned,
             bytes_freed,
         },
@@ -709,8 +807,8 @@ mod tests {
         );
         assert_eq!(
             HOSTED_ONLY_REASON,
-            "Hosted redirects need no local repair; re-run `scan --mode hosted` to refresh \
-             the lockfile redirects (it also re-checks for stale pre-redirect installs)"
+            "Hosted patches need no local repair; re-run `scan --mode hosted` to refresh \
+             the lockfile (it also re-checks for stale pre-hosted installs)"
         );
     }
 
@@ -892,18 +990,22 @@ mod tests {
         );
     }
 
-    /// Cleanup must sweep orphaned diff *and* package archives in addition to
-    /// blobs, and the reclaimed counts/bytes from all three directories must
-    /// aggregate into a single `RepairCounts`. Guards against a regression
-    /// where a cleanup pass uses the wrong directory or drops its tallies.
+    /// Cleanup must sweep orphaned diff archives and every legacy
+    /// `.socket/packages/` archive (nothing reads them, so even one named
+    /// after a manifest UUID goes) in addition to blobs, and the reclaimed
+    /// counts/bytes from all three directories must aggregate into a single
+    /// `RepairCounts`. Guards against a regression where a cleanup pass uses
+    /// the wrong directory or drops its tallies.
     #[tokio::test]
     async fn cleanup_sweeps_diff_and_package_archives() {
         let tmp = tempfile::tempdir().unwrap();
         let socket = make_socket(tmp.path());
 
-        // Referenced archives (named after the manifest UUID) must survive.
+        // A referenced diff archive (named after the manifest UUID) must
+        // survive; a legacy package archive under the same name must not.
         write_archive(&socket, "diffs", REFERENCED_UUID, b"kept-diff");
-        write_archive(&socket, "packages", REFERENCED_UUID, b"kept-package");
+        let legacy_pkg = b"legacy package"; // 14 bytes
+        write_archive(&socket, "packages", REFERENCED_UUID, legacy_pkg);
 
         // Orphan archives (unknown UUIDs) must be swept.
         let orphan_diff = b"orphan diff archive bytes"; // 25 bytes
@@ -927,16 +1029,17 @@ mod tests {
                 .await
                 .expect("repair_inner");
 
-        // Two orphans removed (one diff, one package); the referenced ones stay.
-        assert_eq!(counts.cleaned, 2, "both orphan archives should be swept");
+        // Both orphans and the legacy package archive go; the referenced
+        // diff archive stays.
+        assert_eq!(counts.cleaned, 3, "orphans and legacy archives should be swept");
         assert_eq!(
             counts.bytes_freed,
-            (orphan_diff.len() + orphan_pkg.len()) as u64,
+            (orphan_diff.len() + orphan_pkg.len() + legacy_pkg.len()) as u64,
             "bytes_freed must aggregate diff + package reclaim"
         );
         // Cleanup is reported as a SINGLE batched `removed` artifact event whose
         // `details.count` carries the tally — so the event-count summary is 1
-        // (`Summary::bump` increments once per event), and the 2-artifact count
+        // (`Summary::bump` increments once per event), and the 3-artifact count
         // is asserted via `counts.cleaned` above and the event details here.
         assert_eq!(env.summary.removed, 1, "one batched removal event");
         let removed = env
@@ -950,15 +1053,15 @@ mod tests {
                 .as_ref()
                 .and_then(|d| d.get("count"))
                 .and_then(serde_json::Value::as_u64),
-            Some(2),
-            "the batched removal event must report 2 swept artifacts"
+            Some(3),
+            "the batched removal event must report 3 swept artifacts"
         );
 
         assert!(socket
             .join("diffs")
             .join(format!("{REFERENCED_UUID}.tar.gz"))
             .exists());
-        assert!(socket
+        assert!(!socket
             .join("packages")
             .join(format!("{REFERENCED_UUID}.tar.gz"))
             .exists());

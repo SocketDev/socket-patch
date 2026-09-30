@@ -211,9 +211,8 @@ fn apply_in_p1(pair: &Pair) {
 // ── linker legs ───────────────────────────────────────────────────────────
 
 /// Linux `auto` (hardlink): the default-flip canary (nlink ≥ 2 after the
-/// second install), apply CoW, p2 reinstalls pristine, `vlt install <x>`
-/// keeps the patch, and `vlt ci` restores pristine bytes and re-applies
-/// through the setup hook.
+/// second install), apply CoW, p2 reinstalls pristine, and `vlt install <x>`
+/// keeps the patch.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_safety_linux_auto() {
@@ -309,21 +308,6 @@ async fn linker_sequence(leg: Leg) {
         State::Patched,
         "vlt install <x> keeps it"
     );
-    let out = agent(&fx.proj, "setup", &["--json"]);
-    assert_eq!(out.code, 0, "{out}");
-    let before = pair.witness();
-    let run = VltRun::default().with_shims();
-    fx.leg.vlt_ok_with(&fx.proj, &["ci"], &run);
-    assert!(
-        !fx.leg.npx_log().is_empty(),
-        "the postinstall hook ran through the npx shim"
-    );
-    assert_eq!(
-        state(&fx.proj, fx.t()),
-        State::Patched,
-        "vlt ci + the hook re-apply"
-    );
-    pair.assert_untouched(&before, "vlt ci + hook");
     pair.fx.leg.ran();
 }
 

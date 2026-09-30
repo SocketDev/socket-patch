@@ -1190,8 +1190,8 @@ fn vendored_spoofed_locations_never_attest() {
 // ══════════════════════════════════════════════════════════════════════════
 // EMBEDDED — the REAL writers lay the wiring down (`vendor --vex`,
 // `scan --mode hosted --vex`, `apply --vex`); then the manifest and the
-// ledgers are deleted and the standalone `vex` must re-attest from the
-// project files alone.
+// vendor ledger are deleted (v5 hosted mode writes no ledger at all) and
+// the standalone `vex` must re-attest from the project files alone.
 // ══════════════════════════════════════════════════════════════════════════
 
 const ORG: &str = "test-org";
@@ -1228,16 +1228,6 @@ impl Fx {
                 after,
             );
         }
-    }
-
-    /// Declare `eco` in the manifest's `setup.manual` (CLI_CONTRACT property
-    /// 7): maven has no install hook, so agent-mode patches are attested
-    /// only for an ecosystem the user declares they `apply` by hand.
-    fn declare_manual(&self, eco: &str) {
-        let path = self.cwd.join(".socket/manifest.json");
-        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        manifest["setup"] = serde_json::json!({ "manual": [eco] });
-        std::fs::write(&path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
     }
 
     fn embedded_doc(&self) -> Value {
@@ -1307,6 +1297,43 @@ fn standalone_after_writer(
     for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
         let (code, env) = fx.vex(extra);
         assert_omitted(code, &env, record_purl, dead_reason, "writer, reverted");
+    }
+}
+
+/// After the real HOSTED writer ran: v5 hosted mode left NO ledger, so
+/// the lock pin is the only hosted state — offline there is no local
+/// record (`record_unavailable`, zero requests), online the API's record
+/// attests, and with the wiring reverted nothing is discovered at all.
+fn standalone_after_hosted_writer(
+    fx: &Fx,
+    uuid: &str,
+    record_purl: &str,
+    api_view: Value,
+    revert: &dyn Fn(&Fx),
+) {
+    fx.rm(".socket/manifest.json");
+    fx.rm(".socket/blobs");
+    assert!(
+        !fx.cwd.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode writes no ledger"
+    );
+    let api = Api::serve(vec![(uuid, api_view)]);
+    let (code, env) = fx.vex(&["--offline", "--proxy-url", &api.uri()]);
+    assert_omitted(
+        code,
+        &env,
+        record_purl,
+        "record_unavailable",
+        "hosted writer, offline",
+    );
+    assert_eq!(api.requests(), 0, "--offline never asks the API");
+    let (code, env) = fx.vex(&["--proxy-url", &api.uri()]);
+    assert_attested(fx, code, &env, uuid, record_purl, "redirected");
+
+    revert(fx);
+    for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
+        let (code, env) = fx.vex(extra);
+        assert_nothing_to_attest(code, &env, "hosted writer, reverted");
     }
 }
 
@@ -1475,8 +1502,9 @@ fn scan_hosted_vex(fx: &Fx, api: &Api) -> (Option<i32>, Value, String) {
 
 /// `scan --mode hosted --vex` against a project whose pristine base
 /// version is cached: the real rewriter pins `-socket.<hex8>`, the in-run
-/// VEX attests; the pristine base is never the consumed copy, so the
-/// standalone vex keeps attesting from the pin with no manifest/ledger.
+/// VEX attests and no ledger is written; the pristine base is never the
+/// consumed copy, so the standalone vex keeps attesting from the pin (with
+/// the API's record) with no manifest/ledger.
 #[test]
 fn maven_scan_hosted_wiring_reattests_without_manifest_or_ledger() {
     let golden = "maven/pom/basic";
@@ -1496,15 +1524,12 @@ fn maven_scan_hosted_wiring_reattests_without_manifest_or_ledger() {
     );
     let reverted =
         std::fs::read_to_string(fixture_dir(&format!("{golden}/input/pom.xml"))).unwrap();
-    standalone_after_writer(
+    standalone_after_hosted_writer(
         &fx,
-        ".socket/vendor/redirect-state.json",
         MVN_HOSTED_UUID,
         MVN_PURL,
-        "redirected",
         mvn_hosted_view(),
         &|fx| fx.put("pom.xml", &reverted),
-        "redirect_unwired",
     );
 }
 
@@ -1523,7 +1548,6 @@ fn maven_apply_vex_attests_but_agent_mode_needs_the_manifest() {
     put(&base, "slf4j-api-1.7.36.pom", b"<project><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId><version>1.7.36</version></project>");
     put(&base, MVN_JAR_KEY, MVN_PRISTINE);
     fx.stage_manifest(MVN_PURL, MVN_HOSTED_UUID, &mvn_files());
-    fx.declare_manual("maven");
     let embedded = fx.cwd.join("embedded.vex.json");
     let (code, env, stderr) = fx.run(&[
         "apply",

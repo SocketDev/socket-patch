@@ -1,0 +1,6 @@
+{
+    "name": "socket/composer-vendored-fixture",
+    "require": {
+        "psr/log": "3.0.2"
+    }
+}

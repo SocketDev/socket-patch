@@ -1204,7 +1204,7 @@ fn pnp_layout_contract() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// EMBEDDED — scan --vex / scan --redirect --vex / scan --vendor --vex /
+// EMBEDDED — scan --vex / scan --mode hosted --vex / scan --vendor --vex /
 // apply --vex, manifest-less
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1250,7 +1250,7 @@ fn assert_embedded_attested(doc: Option<Value>, env: &Value, marker: &str, cell:
 }
 
 /// The in-run VEX of `scan` (a bare scan, which runs hosted mode; the legacy
-/// `--redirect`; `--vendor`) on an
+/// `--mode hosted`; `--vendor`) on an
 /// already-wired, manifest-less checkout attests the lock's patch like the
 /// standalone command, never rewrites the wiring, never writes a manifest,
 /// and still refuses a tampered installed tree.
@@ -1258,7 +1258,7 @@ fn assert_embedded_attested(doc: Option<Value>, env: &Value, marker: &str, cell:
 fn embedded_scan_vex_attests_manifest_less_wiring() {
     for flavor in [Flavor::Classic, Flavor::Berry4] {
         for mode in ["hosted", "vendored"] {
-            for scan_mode in [None, Some("--redirect"), Some("--vendor")] {
+            for scan_mode in [None, Some("--mode=hosted"), Some("--vendor")] {
                 let tmp = tempfile::tempdir().unwrap();
                 let cwd = tmp.path();
                 if mode == "hosted" {

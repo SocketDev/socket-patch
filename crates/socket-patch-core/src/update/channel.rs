@@ -142,7 +142,7 @@ fn is_vlx_cache_dir(dir: &Path) -> bool {
     crate::utils::fs::read_regular_to_string_sync(&dir.join("package.json"))
         .ok()
         .and_then(|text| {
-            serde_json::from_str::<serde_json::Value>(crate::package_json::detect::strip_bom(&text))
+            serde_json::from_str::<serde_json::Value>(crate::utils::serde::strip_bom(&text))
                 .ok()
         })
         .is_some_and(|pkg| pkg.get("name").and_then(|n| n.as_str()) == Some("vlx"))

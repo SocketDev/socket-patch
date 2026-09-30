@@ -1,8 +1,10 @@
-//! In-process test for `socket-patch scan --redirect`: mocks the API
+//! In-process test for `socket-patch scan --mode hosted`: mocks the API
 //! (discovery + the `patches/package` reference endpoint) via wiremock, lays
-//! down an npm project with a lockfile, runs `scan --redirect`, and asserts the
+//! down an npm project with a lockfile, runs `scan --mode hosted`, and asserts the
 //! lockfile's patched-dependency entry was repointed at the hosted vendored
-//! patch (resolved URL + sha512 integrity) and a revert ledger was written.
+//! patch (resolved URL + sha512 integrity) — and (v5) that NO redirect
+//! ledger was written: the lockfile pin is the whole hosted state, and
+//! `rollback` restores the default upstream registry entry.
 //! This is the CLI counterpart of the depscan-side install-verify e2e; the
 //! rewriter bytes themselves are pinned by the shared golden fixtures.
 
@@ -13,7 +15,7 @@ use serial_test::serial;
 use socket_patch_cli::commands::scan::{run, ScanArgs};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{
-    PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
+    PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -43,6 +45,7 @@ const GHSA: &str = "GHSA-rdir-aaaa-bbbb";
 
 fn redirect_args(cwd: &Path, api_url: String) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
@@ -59,11 +62,10 @@ fn redirect_args(cwd: &Path, api_url: String) -> ScanArgs {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: true,
-        mode: None,
+        mode: Some(socket_patch_cli::commands::scan::ScanMode::Hosted),
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     }
 }
 
@@ -125,7 +127,7 @@ async fn mock_reference(server: &MockServer) {
 }
 
 /// The `view/{uuid}` endpoint `run_redirect` calls to build the patch record
-/// (file hashes + vulnerabilities) it persists into the redirect ledger for VEX.
+/// (file hashes + vulnerabilities) the in-run VEX attests from.
 async fn mock_view(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
@@ -204,7 +206,7 @@ async fn scan_redirect_rewrites_lockfile_to_hosted_patch() {
     write_project(tmp.path());
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "scan --redirect should succeed");
+    assert_eq!(code, 0, "scan --mode hosted should succeed");
 
     let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert!(
@@ -219,19 +221,15 @@ async fn scan_redirect_rewrites_lockfile_to_hosted_patch() {
         !lock.contains("UPSTREAMupstream"),
         "the upstream resolved/integrity must be replaced; got:\n{lock}"
     );
-    // Revert ledger written.
-    assert!(
-        tmp.path()
-            .join(".socket/vendor/redirect-state.json")
-            .is_file(),
-        "a redirect ledger should be written for revert"
-    );
+    // v5: no revert ledger — the lock pin is the whole record.
+    vlt_hosted_common::assert_no_ledger(tmp.path());
 }
 
-/// `scan --redirect --vex` must emit a valid OpenVEX doc for the redirected
+/// `scan --mode hosted --vex` must emit a valid OpenVEX doc for the redirected
 /// patch. The redirected bytes aren't installed in-run, so this is a NO-VERIFY
-/// attestation built from the patch records the redirect run persists into the
-/// ledger; the statement carries the `(redirected)` provenance marker.
+/// attestation built from the patch records this run fetched (held in memory
+/// — v5 writes no ledger); the statement carries the `(redirected)`
+/// provenance marker.
 #[tokio::test]
 #[serial]
 async fn scan_redirect_vex_emits_redirected_attestation() {
@@ -252,15 +250,10 @@ async fn scan_redirect_vex_emits_redirected_attestation() {
     };
 
     let code = run(args).await;
-    assert_eq!(code, 0, "scan --redirect --vex should succeed");
+    assert_eq!(code, 0, "scan --mode hosted --vex should succeed");
 
-    // The ledger embeds the patch record (so a post-install `vex` can verify).
-    let ledger =
-        std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
-    assert!(
-        ledger.contains("\"records\"") && ledger.contains(GHSA) && ledger.contains(PURL),
-        "ledger must embed the patch record + vulnerability: {ledger}"
-    );
+    // The record reached the attestation in memory: nothing persisted.
+    vlt_hosted_common::assert_no_ledger(tmp.path());
 
     // The VEX document attests the redirected patch with the (redirected) marker.
     let doc: serde_json::Value =
@@ -325,13 +318,12 @@ fn write_installed(root: &Path, name: &str, version: &str, bytes: &[u8]) {
     std::fs::write(pkg.join("index.js"), bytes).unwrap();
 }
 
-/// Idempotency guard for the revert ledger: a second `scan --redirect` run
-/// (whose rewrite matches the already-redirected entries) must MERGE into
-/// `redirect-state.json`, preserving the first run's edits — the entries whose
-/// `original` values a future revert needs — rather than clobbering the file.
+/// Idempotency: a second `scan --mode hosted` run over the already-redirected
+/// lock plans from the current lock text (v5 keeps no ledger chain), so it
+/// succeeds, leaves the lock byte-identical and still writes no ledger.
 #[tokio::test]
 #[serial]
-async fn second_redirect_run_preserves_revert_edits() {
+async fn second_redirect_run_is_idempotent() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
@@ -341,36 +333,18 @@ async fn second_redirect_run_preserves_revert_edits() {
     write_project(tmp.path());
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "first scan --redirect should succeed");
-    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
-    let first = std::fs::read_to_string(&ledger_path).unwrap();
-    assert!(
-        first.contains("registry.npmjs.org"),
-        "first run's edits must record the ORIGINAL upstream URL: {first}"
-    );
+    assert_eq!(code, 0, "first scan --mode hosted should succeed");
+    let first = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(first.contains(HOSTED_URL), "{first}");
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "second scan --redirect should succeed");
-    let second = std::fs::read_to_string(&ledger_path).unwrap();
-    assert!(
-        second.contains("registry.npmjs.org"),
-        "the second run must PRESERVE the original-upstream edit needed for \
-         revert (merge, not overwrite): {second}"
-    );
-    assert!(
-        second.contains(GHSA),
-        "records must survive the merge: {second}"
-    );
-    // Idempotency: the rewriters see an already-redirected lockfile, record
-    // no new edits, and the edit list stays the same length — unbounded edit
-    // growth across CI re-runs would poison a future revert.
-    let first_json: serde_json::Value = serde_json::from_str(&first).unwrap();
-    let second_json: serde_json::Value = serde_json::from_str(&second).unwrap();
+    assert_eq!(code, 0, "second scan --mode hosted should succeed");
     assert_eq!(
-        first_json["edits"].as_array().unwrap().len(),
-        second_json["edits"].as_array().unwrap().len(),
-        "a re-run must not append duplicate edits: {second}"
+        std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap(),
+        first,
+        "a re-run must leave the redirected lock byte-identical"
     );
+    vlt_hosted_common::assert_no_ledger(tmp.path());
 }
 
 /// A granted patch whose rewriter finds NOTHING to edit (no lockfile at all)
@@ -431,7 +405,7 @@ async fn no_lockfile_redirect_is_not_attested() {
 /// In-run `--vex` semantics: redirected PURLs are exempt from verification
 /// (their bytes are remote until install), but OTHER manifest patches still
 /// verify normally — an applied one attests plain, a not-applied one is
-/// omitted. This pins that `scan --redirect --vex` does NOT silently attest
+/// omitted. This pins that `scan --mode hosted --vex` does NOT silently attest
 /// the whole manifest unverified.
 #[tokio::test]
 #[serial]
@@ -472,12 +446,7 @@ async fn redirect_vex_verifies_manifest_patches_normally() {
             "GHSA-ctrl-bad",
         ),
     );
-    // npm declared `manual` so property-7 admits the controls — what drops
-    // GHSA-ctrl-bad must be VERIFICATION, not the ecosystem filter.
-    manifest.setup = Some(SetupConfig {
-        exclude: Vec::new(),
-        manual: vec!["npm".to_string()],
-    });
+    // What drops GHSA-ctrl-bad must be VERIFICATION.
     let socket_dir = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket_dir).unwrap();
     std::fs::write(
@@ -494,7 +463,7 @@ async fn redirect_vex_verifies_manifest_patches_normally() {
         ..Default::default()
     };
     let code = run(args).await;
-    assert_eq!(code, 0, "scan --redirect --vex should succeed");
+    assert_eq!(code, 0, "scan --mode hosted --vex should succeed");
 
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
@@ -601,7 +570,7 @@ async fn redirect_vex_doc_id_and_compact_flags() {
         ..Default::default()
     };
     let code = run(args).await;
-    assert_eq!(code, 0, "scan --redirect --vex should succeed");
+    assert_eq!(code, 0, "scan --mode hosted --vex should succeed");
 
     let raw = std::fs::read_to_string(&vex_path).unwrap();
     assert_eq!(
@@ -726,7 +695,7 @@ fn write_berry_project_spelled(root: &Path, spell: impl Fn(&str) -> String) {
 
 /// The berry leg: the yarn.lock entry is repointed via `::__archiveUrl=` (the
 /// URL percent-encoded) and its `checksum:` becomes the yarnBerry10c0. The
-/// descriptor KEY is preserved (so `--immutable` still passes), a ledger is
+/// descriptor KEY is preserved (so `--immutable` still passes), no ledger is
 /// written, and a second run is a no-op.
 #[tokio::test]
 #[serial]
@@ -739,7 +708,7 @@ async fn scan_redirect_rewrites_yarn_berry_lock() {
     write_berry_project(tmp.path());
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "scan --redirect (berry) should succeed");
+    assert_eq!(code, 0, "scan --mode hosted (berry) should succeed");
 
     let lock = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
     // yarn writes `__archiveUrl=<encodeURIComponent(url)>`; assert both the
@@ -757,35 +726,28 @@ async fn scan_redirect_rewrites_yarn_berry_lock() {
         lock.contains(&format!("\"{NAME}@npm:^{VERSION}\":")),
         "the descriptor key must be preserved verbatim; got:\n{lock}"
     );
-    assert!(
-        tmp.path()
-            .join(".socket/vendor/redirect-state.json")
-            .is_file(),
-        "a redirect ledger should be written"
-    );
+    vlt_hosted_common::assert_no_ledger(tmp.path());
 
-    // Idempotent: a second run rewrites nothing new (no ledger edit growth).
-    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
-    let first: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+    // Idempotent: a second run rewrites nothing (the lock is byte-stable).
     let code = run(redirect_args(tmp.path(), server.uri())).await;
     assert_eq!(code, 0, "second berry run should succeed");
-    let second: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
     assert_eq!(
-        first["edits"].as_array().unwrap().len(),
-        second["edits"].as_array().unwrap().len(),
-        "a berry re-run must not append duplicate edits"
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        lock,
+        "a berry re-run must leave the lock byte-identical"
     );
+    vlt_hosted_common::assert_no_ledger(tmp.path());
 }
 
 /// The berry leg on the Windows lock shapes: yarn berry writes a NEW
 /// `yarn.lock` with `os.EOL` (CRLF on Windows), a `core.autocrlf` checkout
 /// produces the same on any OS, and editors add a BOM. The hosted chain
 /// must redirect the dep (never `redirected: 0` with a line-ending
-/// refusal), keep every line CRLF and the BOM, record the lock's on-disk
-/// CRLF fragments in the ledger, stay a no-op on re-run, and `rollback`
-/// must restore the pristine lock byte-for-byte.
+/// refusal), keep every line CRLF and the BOM, write no ledger, stay a
+/// no-op on re-run, and `rollback` must restore the upstream registry entry
+/// (re-resolved from the mocked npm registry: the berry checksum is
+/// recomputed from the upstream tarball) — the pristine lock byte-for-byte
+/// but for that checksum value, CRLF and BOM kept.
 #[tokio::test]
 #[serial]
 async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_restores_them() {
@@ -793,6 +755,13 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
     mock_discovery(&server).await;
     mock_reference_with_berry(&server).await;
     mock_view(&server).await;
+    let tarball = upstream_tarball();
+    mock_npm_registry(
+        &server,
+        &vlt_hosted_common::sha512_sri(&tarball),
+        Some(tarball),
+    )
+    .await;
     let encoded = socket_patch_core::utils::uri::encode_uri_component(HOSTED_URL);
 
     for (label, bom) in [("crlf", ""), ("bom+crlf", "\u{feff}")] {
@@ -820,31 +789,9 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
         );
         assert_eq!(lock.starts_with('\u{feff}'), !bom.is_empty(), "{label}");
 
-        let ledger = read_ledger(tmp.path());
-        let edit = ledger["edits"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["kind"] == "redirect_yarn_berry_entry")
-            .unwrap_or_else(|| panic!("{label}: a berry ledger edit: {ledger:#}"));
-        for side in ["original", "new"] {
-            let fragment = edit[side].as_str().unwrap();
-            assert!(
-                fragment.contains("\r\n") && !fragment.replace("\r\n", "").contains('\n'),
-                "{label}: the ledger's {side} is the on-disk CRLF fragment: {fragment:?}"
-            );
-            assert!(
-                String::from_utf8_lossy(if side == "original" {
-                    &pristine
-                } else {
-                    lock.as_bytes()
-                })
-                .contains(fragment),
-                "{label}: {side} is a verbatim slice of the file"
-            );
-        }
+        vlt_hosted_common::assert_no_ledger(tmp.path());
 
-        // Re-run: in sync, byte-stable, no new ledger edit.
+        // Re-run: in sync, byte-stable.
         let env = run_redirect_subprocess(tmp.path(), &server.uri());
         assert_eq!(env["redirect"]["redirected"], 1, "{label}: {env:#}");
         assert_eq!(
@@ -852,25 +799,23 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
             lock,
             "{label}"
         );
-        assert_eq!(
-            read_ledger(tmp.path())["edits"].as_array().unwrap().len(),
-            ledger["edits"].as_array().unwrap().len(),
-            "{label}: a re-run appends nothing"
-        );
+        vlt_hosted_common::assert_no_ledger(tmp.path());
 
-        let (code, env) = rollback_json(tmp.path());
+        let (code, env) = rollback_json(tmp.path(), &server);
         assert_eq!(code, Some(0), "{label}: rollback: {env:#}");
+        assert_eq!(env["hosted"]["reverted"], serde_json::json!([PURL]), "{label}: {env:#}");
+        let restored = std::fs::read_to_string(&lock_path).unwrap();
+        let checksum = berry_checksum_of(&restored);
+        assert_ne!(checksum, BERRY_CHECKSUM, "{label}: the patched checksum is gone");
         assert_eq!(
-            std::fs::read(&lock_path).unwrap(),
-            pristine,
-            "{label}: rollback restores the pristine CRLF lock byte-for-byte"
+            restored,
+            String::from_utf8(pristine.clone())
+                .unwrap()
+                .replace(&format!("10c0/{}", "3".repeat(128)), &format!("10c0/{checksum}")),
+            "{label}: rollback restores the pristine CRLF lock (upstream checksum \
+             re-derived from the registry tarball)"
         );
-        assert!(
-            !tmp.path()
-                .join(".socket/vendor/redirect-state.json")
-                .exists(),
-            "{label}: the emptied ledger is removed"
-        );
+        vlt_hosted_common::assert_no_ledger(tmp.path());
     }
 }
 
@@ -878,7 +823,7 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
 /// cannot be kept in one style — and yarn itself rejects it under
 /// `--immutable` — so the hosted run refuses it untouched with a code that
 /// names the line endings and the `yarn install` remedy, redirecting
-/// nothing and writing no ledger.
+/// nothing and writing nothing.
 #[tokio::test]
 #[serial]
 async fn scan_redirect_refuses_a_mixed_line_ending_yarn_berry_lock() {
@@ -953,7 +898,7 @@ async fn scan_redirect_rewrites_correct_entry_in_crlf_classic_lock() {
     std::fs::write(tmp.path().join("yarn.lock"), lock_lf.replace('\n', "\r\n")).unwrap();
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "scan --redirect (classic CRLF) should succeed");
+    assert_eq!(code, 0, "scan --mode hosted (classic CRLF) should succeed");
 
     let lock = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
     assert!(
@@ -975,12 +920,7 @@ async fn scan_redirect_rewrites_correct_entry_in_crlf_classic_lock() {
         lock.matches("\r\n").count(),
         "every line must keep its CRLF ending: {lock}"
     );
-    assert!(
-        tmp.path()
-            .join(".socket/vendor/redirect-state.json")
-            .is_file(),
-        "a redirect ledger should be written"
-    );
+    vlt_hosted_common::assert_no_ledger(tmp.path());
 }
 
 /// Write a project whose only lockfile is a text `bun.lock` (registry
@@ -1048,7 +988,7 @@ async fn scan_redirect_rewrites_bun_lock() {
     let lock_before = std::fs::read(tmp.path().join("bun.lock")).unwrap();
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "scan --redirect (bun) should succeed");
+    assert_eq!(code, 0, "scan --mode hosted (bun) should succeed");
 
     let lock = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
     assert!(
@@ -1063,12 +1003,7 @@ async fn scan_redirect_rewrites_bun_lock() {
         !lock.contains("UPSTREAMupstream"),
         "upstream integrity must be replaced; got:\n{lock}"
     );
-    assert!(
-        tmp.path()
-            .join(".socket/vendor/redirect-state.json")
-            .is_file(),
-        "a redirect ledger should be written"
-    );
+    vlt_hosted_common::assert_no_ledger(tmp.path());
     bun_manifestless_vex(tmp.path(), &lock_before, "bun-v1");
 }
 
@@ -1089,7 +1024,7 @@ async fn scan_redirect_rewrites_bun_lock_v2() {
     let lock_before = std::fs::read(tmp.path().join("bun.lock")).unwrap();
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "scan --redirect (bun, lock v2) should succeed");
+    assert_eq!(code, 0, "scan --mode hosted (bun, lock v2) should succeed");
 
     let lock = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
     assert!(
@@ -1104,12 +1039,7 @@ async fn scan_redirect_rewrites_bun_lock_v2() {
         lock.contains(PATCHED_SHA512),
         "integrity must be the patched sha512"
     );
-    assert!(
-        tmp.path()
-            .join(".socket/vendor/redirect-state.json")
-            .is_file(),
-        "a redirect ledger should be written"
-    );
+    vlt_hosted_common::assert_no_ledger(tmp.path());
     bun_manifestless_vex(tmp.path(), &lock_before, "bun-v2");
 }
 
@@ -1176,14 +1106,11 @@ fn drop_bun_digest(line: &str) -> String {
 /// lock is re-saved for another reason. The digest-less 2-tuple is still
 /// our wiring (the spec bun installs from is intact): a repeat `scan
 /// --mode hosted` must report a CONSISTENT envelope — `redirected: 1` with
-/// no `redirect_bun_entry_not_found` — heal the line back to the 3-tuple
-/// and record the heal as a second ledger edit for the key (`original` =
-/// the 2-tuple); a third run appends nothing; and `rollback` must unwind
-/// the chain to the pristine registry line whether the lock is the healed
-/// 3-tuple or Bun has since dropped the digest again. Before the fix the
-/// repeat scan warned `entry_not_found` beside `redirected: 1` and
-/// rollback refused `partial_failure` ("matches neither the redirected nor
-/// the original fragment"), stranding every user on those releases.
+/// no `redirect_bun_entry_not_found` — and heal the line back to the
+/// 3-tuple; a third run is a no-op; no run writes a ledger; and `rollback`
+/// must restore the pristine registry line (re-resolved from the mocked npm
+/// registry) whether the lock is the healed 3-tuple or Bun has since
+/// dropped the digest again.
 #[tokio::test]
 #[serial]
 async fn scan_redirect_heals_digestless_bun_tuple_and_rollback_restores_the_registry_line() {
@@ -1198,7 +1125,7 @@ async fn scan_redirect_heals_digestless_bun_tuple_and_rollback_restores_the_regi
     write_bun_project(tmp.path(), 1);
     let lock_path = tmp.path().join("bun.lock");
     let pristine = std::fs::read_to_string(&lock_path).unwrap();
-    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
 
     for drop_again_before_rollback in [false, true] {
         let env = run_redirect_subprocess(tmp.path(), &server.uri());
@@ -1233,37 +1160,19 @@ async fn scan_redirect_heals_digestless_bun_tuple_and_rollback_restores_the_regi
             wired,
             "the digest is healed back — lock byte-identical to the first run's"
         );
-        let ledger = read_ledger(tmp.path());
-        let edits = ledger["edits"].as_array().unwrap();
-        assert_eq!(edits.len(), 2, "first edit + the heal: {ledger:#}");
-        assert_eq!(
-            edits[0]["original"],
-            serde_json::json!(bun_packages_line(&pristine, NAME)),
-            "{ledger:#}"
-        );
-        assert_eq!(edits[1]["key"], NAME, "{ledger:#}");
-        assert_eq!(
-            edits[1]["original"],
-            serde_json::json!(digestless),
-            "{ledger:#}"
-        );
-        assert_eq!(edits[1]["new"], serde_json::json!(wired_line), "{ledger:#}");
+        vlt_hosted_common::assert_no_ledger(tmp.path());
 
-        // A third run over the healed lock is a no-op for the ledger.
+        // A third run over the healed lock is a no-op.
         let env = run_redirect_subprocess(tmp.path(), &server.uri());
         assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
         assert!(warning_codes(&env).is_empty(), "{env:#}");
-        assert_eq!(
-            read_ledger(tmp.path())["edits"].as_array().unwrap().len(),
-            2,
-            "a re-run over the healed lock must not append edits"
-        );
+        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), wired);
 
         if drop_again_before_rollback {
             // Another `bun add` on Bun < 1.3.10: the digest is gone again.
             std::fs::write(&lock_path, wired.replace(&wired_line, &digestless)).unwrap();
         }
-        let (code, env) = rollback_json(tmp.path());
+        let (code, env) = rollback_json(tmp.path(), &server);
         assert_eq!(
             code,
             Some(0),
@@ -1276,28 +1185,33 @@ async fn scan_redirect_heals_digestless_bun_tuple_and_rollback_restores_the_regi
             "rollback lands on the pristine registry line (digest dropped again: \
              {drop_again_before_rollback})"
         );
-        assert!(
-            !ledger_path.exists(),
-            "the emptied ledger is deleted after a full unwind"
-        );
+        vlt_hosted_common::assert_no_ledger(tmp.path());
     }
 }
 
 // Native binary lockfiles are parsed and patched without invoking Bun.
 const INVALID_LOCKB_BYTES: &[u8] = b"\x00BUN-BINARY\xff\xfe\x00LOCK";
 
-/// `rollback --json --yes --offline` as a subprocess; returns (exit code,
-/// parsed envelope).
-fn rollback_json(cwd: &Path) -> (Option<i32>, serde_json::Value) {
+/// `rollback --json --yes` as a subprocess, with the mock patch host
+/// recognized (`--patch-server-url http://patch.test`, so lockfile
+/// discovery finds the hosted pins) and the upstream restore's npm registry
+/// pointed at `registry` (`SOCKET_NPM_REGISTRY`, see [`mock_npm_registry`]);
+/// returns (exit code, parsed envelope).
+fn rollback_json(cwd: &Path, registry: &MockServer) -> (Option<i32>, serde_json::Value) {
     let out = scrubbed_cli()
         .args([
             "rollback",
             "--json",
             "--yes",
-            "--offline",
+            "--patch-server-url",
+            "http://patch.test",
             "--cwd",
             cwd.to_str().unwrap(),
         ])
+        .env(
+            "SOCKET_NPM_REGISTRY",
+            format!("{}/npm-registry", registry.uri()),
+        )
         .output()
         .expect("run socket-patch rollback");
     let env_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
@@ -1310,9 +1224,64 @@ fn rollback_json(cwd: &Path) -> (Option<i32>, serde_json::Value) {
     (out.status.code(), env_json)
 }
 
-fn read_ledger(root: &Path) -> serde_json::Value {
-    let text = std::fs::read_to_string(root.join(".socket/vendor/redirect-state.json")).unwrap();
-    serde_json::from_str(&text).expect("the ledger is JSON")
+/// The npm registry's version document for `NAME@VERSION` under
+/// `<server>/npm-registry` — what rollback's upstream restore re-resolves a
+/// hosted pin from — carrying `integrity`, plus (when given) the upstream
+/// `tarball` served at the document's `dist.tarball` (a yarn berry restore
+/// downloads it to recompute the zip checksum).
+async fn mock_npm_registry(server: &MockServer, integrity: &str, tarball: Option<Vec<u8>>) {
+    let tarball_path = format!("/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz");
+    Mock::given(method("GET"))
+        .and(path(format!("/npm-registry/{NAME}/{VERSION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": NAME,
+            "version": VERSION,
+            "dist": {
+                "tarball": format!("{}{tarball_path}", server.uri()),
+                "integrity": integrity,
+                "shasum": "0".repeat(40),
+            }
+        })))
+        .mount(server)
+        .await;
+    if let Some(bytes) = tarball {
+        Mock::given(method("GET"))
+            .and(path(tarball_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(server)
+            .await;
+    }
+}
+
+/// A small upstream npm tarball for `NAME@VERSION`.
+fn upstream_tarball() -> Vec<u8> {
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(gz);
+    let package_json = format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#);
+    for (name, data) in [
+        ("package/package.json", package_json.as_bytes()),
+        ("package/index.js", b"module.exports = 'upstream'\n".as_slice()),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, data).unwrap();
+    }
+    builder.into_inner().unwrap().finish().unwrap()
+}
+
+/// The `checksum: 10c0/<hex>` value of the target entry in a berry lock.
+fn berry_checksum_of(lock: &str) -> String {
+    let at = lock
+        .find(&format!("\"{NAME}@npm:^{VERSION}\":"))
+        .unwrap_or_else(|| panic!("no target entry in {lock:?}"));
+    let rest = &lock[at..];
+    let line = rest
+        .split('\n')
+        .find_map(|l| l.trim_end_matches('\r').trim().strip_prefix("checksum: 10c0/"))
+        .unwrap_or_else(|| panic!("no checksum in {rest:?}"));
+    line.to_string()
 }
 
 /// A child-only PATH with `bin_dir` first, joined with the OS separator.
@@ -1324,7 +1293,7 @@ fn path_with_first(bin_dir: &Path) -> std::ffi::OsString {
     std::env::join_paths(entries).expect("PATH entries join")
 }
 
-/// `scan --redirect --json --yes` as a subprocess with the given child PATH;
+/// `scan --mode hosted --json --yes` as a subprocess with the given child PATH;
 /// returns (exit code, parsed envelope, stderr). Asserts stdout IS JSON so a
 /// leaking shim (bun chatter on stdout) fails loudly.
 fn scan_redirect_json_with_path(
@@ -1335,7 +1304,7 @@ fn scan_redirect_json_with_path(
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--json",
             "--yes",
             "--cwd",
@@ -1620,12 +1589,15 @@ async fn no_redirectable_patch_leaves_bun_lockb_alone() {
     );
 }
 
-/// A corrupt redirect ledger refuses before any binary-lockfile edits.
-/// The existing binary remains byte-identical and no Bun process starts.
+/// A corrupt pre-v5 redirect ledger is IGNORED (v5 never reads it): the
+/// binary-lockfile path runs exactly as without it — here a placeholder
+/// `bun.lockb` the native codec rejects (exit 0, nothing redirected) — no
+/// Bun process starts, no text lock appears, and the torn ledger is left
+/// byte-identical in place (never quarantined).
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
-async fn corrupt_ledger_refuses_before_the_bun_lockb_edit() {
+async fn corrupt_pre_v5_ledger_is_ignored_beside_a_bun_lockb() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
@@ -1648,7 +1620,6 @@ async fn corrupt_ledger_refuses_before_the_bun_lockb_edit() {
     .unwrap();
     std::fs::write(tmp.path().join("bun.lockb"), b"BUN-BINARY-PLACEHOLDER").unwrap();
 
-    // A torn ledger: parseable as neither the vendor nor the redirect shape.
     let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
     std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
     let corrupt_bytes = b"{\"mode\":\"hosted\",\"edits\":[{\"path\":\"bun.lo";
@@ -1669,38 +1640,32 @@ async fn corrupt_ledger_refuses_before_the_bun_lockb_edit() {
     unsafe {
         std::env::set_var("PATH", orig_path);
     }
-    assert_eq!(code, 1, "a corrupt ledger must flip the exit code");
+    assert_eq!(code, 0, "a pre-v5 ledger never fails a hosted run");
     assert!(!bin_dir.join("bun-was-spawned").exists());
     assert_eq!(
         std::fs::read(tmp.path().join("bun.lockb")).ok().as_deref(),
         Some(b"BUN-BINARY-PLACEHOLDER".as_slice()),
-        "the binary lock must be byte-untouched: the refusal precedes the rewrite"
+        "the unparseable binary lock stays byte-untouched"
     );
-    assert!(
-        !tmp.path().join("bun.lock").exists(),
-        "no text lock may be created by a run that refused before redirecting"
-    );
-    // The malformed ledger is quarantined (never deleted), so recovery of the
-    // pre-redirect originals it may still hold stays possible.
-    let quarantined = tmp
-        .path()
-        .join(".socket/vendor/redirect-state.json.corrupt");
+    assert!(!tmp.path().join("bun.lock").exists());
     assert_eq!(
-        std::fs::read(&quarantined).unwrap(),
+        std::fs::read(&ledger_path).unwrap(),
         corrupt_bytes,
-        "the malformed ledger is moved aside verbatim"
+        "the pre-v5 ledger is left byte-identical in place"
     );
+    assert!(!tmp
+        .path()
+        .join(".socket/vendor/redirect-state.json.corrupt")
+        .exists());
 }
 
-/// An unusable ledger is an ERROR, not a silent success:
-/// `.socket/vendor/redirect-state.json` is the only revert path (and the VEX
-/// record store). A DIRECTORY squatting on the ledger path makes it
-/// unloadable, so the run must fail closed BEFORE rewriting anything — the
-/// old flow rewrote the lockfile first and only then discovered the ledger
-/// could not be persisted, leaving the repo redirected with no way back.
+/// A DIRECTORY squatting on the pre-v5 ledger path used to make the run
+/// fail closed (the ledger was the revert path). v5 hosted mode never reads
+/// or writes that path, so the run succeeds, the lock is redirected, and
+/// the squatting directory is left alone.
 #[tokio::test]
 #[serial]
-async fn unwritable_ledger_fails_the_run() {
+async fn directory_at_the_legacy_ledger_path_does_not_block_the_run() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
@@ -1708,33 +1673,27 @@ async fn unwritable_ledger_fails_the_run() {
 
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
-    // Occupy the ledger path with a DIRECTORY so the ledger cannot be loaded
-    // (or written).
-    std::fs::create_dir_all(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
+    let squatter = tmp.path().join(".socket/vendor/redirect-state.json");
+    std::fs::create_dir_all(&squatter).unwrap();
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 1, "an unusable ledger must flip the exit code");
-    // Fail-closed ordering: the ledger problem surfaces before any project
-    // file is touched, so the lockfile still points at the upstream registry.
+    assert_eq!(code, 0, "the legacy ledger path is not consulted");
     let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
-    assert!(
-        !lock.contains(HOSTED_URL),
-        "an unusable ledger must abort before the lockfile rewrite; got:\n{lock}"
-    );
+    assert!(lock.contains(HOSTED_URL), "the lock is redirected; got:\n{lock}");
+    assert!(squatter.is_dir(), "the squatting directory is untouched");
 }
 
-/// Findings hosted-atomicity 1+2: a MID-RUN lockfile write failure (second of
-/// two locks unwritable) must never leave the successfully-written first lock
-/// redirected with no ledger record of its pre-redirect originals. The ledger
-/// is persisted BEFORE the lockfile loop, so every planned edit's original is
-/// durable even when a later write fails; the failed lock itself stays
-/// byte-untouched (atomic stage+rename, no truncation).
+/// A MID-RUN lockfile write failure (second of two locks unwritable) exits
+/// 1; the first lock landed, the failed lock stays byte-untouched (atomic
+/// stage+rename, no truncation), and no ledger is written (v5: a landed
+/// hosted pin is undone by `rollback`'s upstream restore, which needs no
+/// recorded originals).
 ///
 /// unix-only: a read-only directory does not block file creation on Windows.
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
-async fn partial_lockfile_write_failure_persists_ledger_originals() {
+async fn partial_lockfile_write_failure_exits_1_and_writes_no_ledger() {
     use std::os::unix::fs::PermissionsExt;
 
     let server = MockServer::start().await;
@@ -1764,19 +1723,7 @@ async fn partial_lockfile_write_failure_persists_ledger_originals() {
         common.contains(HOSTED_URL),
         "the common lock was written before the subspace failure; got:\n{common}"
     );
-    // …so its pre-redirect originals MUST already be in the ledger: without
-    // them a revert is impossible, and a re-run cannot recapture them (the
-    // entry is already redirected and produces no new edit).
-    let ledger = std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json"))
-        .expect("the ledger must be persisted before any lockfile is mutated");
-    assert!(
-        ledger.contains("UPSTREAMupstream"),
-        "the ledger must record the pre-redirect original integrity: {ledger}"
-    );
-    assert!(
-        ledger.contains("common/config/rush/pnpm-lock.yaml"),
-        "the ledger must record the edit for the lock that WAS written: {ledger}"
-    );
+    vlt_hosted_common::assert_no_ledger(tmp.path());
 
     // The failed lock is byte-untouched — no partial/truncated write.
     assert_eq!(
@@ -1838,7 +1785,7 @@ fn write_rush_project(root: &Path, with_repo_state: bool) {
     }
 }
 
-/// `scan --redirect` in a Rush monorepo rewrites BOTH the common
+/// `scan --mode hosted` in a Rush monorepo rewrites BOTH the common
 /// source-of-truth lock and every subspace lock in place (nested FileEdit
 /// paths), even though there is no root package.json/lock pair — the package
 /// is discovered from the Rush locks (lockfile supplement) and the pnpm
@@ -1856,7 +1803,7 @@ async fn scan_redirect_rewrites_rush_common_and_subspace_locks() {
     write_rush_project(tmp.path(), true);
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "scan --redirect should succeed in a Rush repo");
+    assert_eq!(code, 0, "scan --mode hosted should succeed in a Rush repo");
 
     // Both nested locks are rewritten in place (not a new root lock).
     for rel in [
@@ -1887,13 +1834,7 @@ async fn scan_redirect_rewrites_rush_common_and_subspace_locks() {
         "rush nested-lock redirects must not create a root pnpm-workspace.yaml"
     );
 
-    // repo-state.json present → the stale-hash warning fires.
-    let out = std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json"))
-        .expect("a redirect ledger should be written");
-    assert!(
-        out.contains(HOSTED_URL),
-        "the ledger records the redirect for revert: {out}"
-    );
+    vlt_hosted_common::assert_no_ledger(tmp.path());
 }
 
 /// Run the built `socket-patch` binary as a subprocess against `api_url`
@@ -1912,7 +1853,7 @@ fn run_redirect_subprocess_with(cwd: &Path, api_url: &str, extra: &[&str]) -> se
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--json",
             "--yes",
             "--cwd",
@@ -1930,13 +1871,13 @@ fn run_redirect_subprocess_with(cwd: &Path, api_url: &str, extra: &[&str]) -> se
     assert_eq!(
         out.status.code(),
         Some(0),
-        "scan --redirect must succeed; stdout=\n{}\nstderr=\n{}",
+        "scan --mode hosted must succeed; stdout=\n{}\nstderr=\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
         panic!(
-            "scan --redirect --json output is not JSON: {e}\nstdout:\n{}",
+            "scan --mode hosted --json output is not JSON: {e}\nstdout:\n{}",
             String::from_utf8_lossy(&out.stdout)
         )
     })
@@ -2104,23 +2045,8 @@ packages:
         !after.contains(HOSTED_URL),
         "the hosted URL must never appear (it would confirm + attest): {after}"
     );
-    // No ledger half-claims the purl either: an unconfirmed dep must fetch
-    // no record and record no edits.
-    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
-    if let Ok(text) = std::fs::read_to_string(&ledger_path) {
-        let ledger: serde_json::Value =
-            serde_json::from_str(&text).expect("the redirect ledger must be valid JSON");
-        assert!(
-            ledger["records"].get(PURL).is_none(),
-            "an unconfirmed dep must not be recorded: {ledger}"
-        );
-        let claimed = ledger["edits"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|e| e["key"].as_str().is_some_and(|k| k.contains(NAME)));
-        assert!(!claimed, "no edit may claim the refused dep: {ledger}");
-    }
+    // And nothing else half-claims the purl (v5 writes no ledger at all).
+    vlt_hosted_common::assert_no_ledger(tmp.path());
 }
 
 /// The rewriters' own warnings must reach HUMAN mode too, not just the
@@ -2129,7 +2055,7 @@ packages:
 /// `redirect_gradle_manual_snippet`, the missing-integrity family).
 /// Regression guard: the human branch printed skipped/record/rush warnings
 /// but dropped `rewrite.warnings` entirely, so a default-mode
-/// `scan --redirect` in a lockfile-less project reported "Redirected 0
+/// `scan --mode hosted` in a lockfile-less project reported "Redirected 0
 /// package(s)" with no explanation at all. Subprocess (not in-process) so
 /// stderr can be read back.
 #[tokio::test]
@@ -2160,7 +2086,7 @@ async fn redirect_human_mode_prints_rewriter_warnings() {
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--yes",
             "--cwd",
             tmp.path().to_str().unwrap(),
@@ -2181,12 +2107,12 @@ async fn redirect_human_mode_prints_rewriter_warnings() {
         "a no-op redirect still exits 0; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("Redirected 0 packages; rewrote 0 files."),
+        stdout.contains("Switched 0 packages to hosted patches; rewrote 0 files."),
         "anchor: the run must have taken the human-mode redirect branch; \
          stdout=\n{stdout}"
     );
     assert!(
-        stderr.contains("Warning (redirect_npm_no_lockfile): No package-lock.json"),
+        stderr.contains("Warning: No package-lock.json"),
         "human mode must print the rewriter's no-lockfile warning (JSON mode \
          already carries it); stderr=\n{stderr}"
     );
@@ -2217,7 +2143,7 @@ async fn redirect_human_mode_warnings_are_not_json_quoted() {
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--yes",
             "--cwd",
             tmp.path().to_str().unwrap(),
@@ -2250,7 +2176,7 @@ async fn redirect_human_mode_warnings_are_not_json_quoted() {
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--yes",
             "--cwd",
             tmp.path().to_str().unwrap(),
@@ -2266,13 +2192,13 @@ async fn redirect_human_mode_warnings_are_not_json_quoted() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("Redirected 1 package; rewrote"),
+        stdout.contains("Switched 1 package to hosted patches; rewrote"),
         "anchor: the dep must have been redirected so the record fetch runs; \
          stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
         stderr.contains(&format!(
-            "Warning (record_fetch_failed): {PURL} redirected, but its patch record could not \
+            "Warning: {PURL} was switched to hosted, but its patch record could not \
              be fetched"
         )),
         "the record-fetch warning must print the bare detail string, not a \
@@ -2515,20 +2441,8 @@ async fn pnpm_lock_redirect_autoconfigures_trust_lockfile_and_says_so() {
          got: {detail}"
     );
 
-    // The ledger records the workspace-trust edit (created ⇒ revert deletes).
-    let ledger: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(pnpm.path().join(".socket/vendor/redirect-state.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(
-        ledger["edits"].as_array().unwrap().iter().any(|e| {
-            e["kind"] == "redirect_pnpm_workspace_trust"
-                && e["action"] == "created"
-                && e["path"] == "pnpm-workspace.yaml"
-                && e["key"] == "trustLockfile"
-        }),
-        "the ledger must record the created workspace-trust edit: {ledger}"
-    );
+    // v5: the created workspace file is the record (no ledger edit).
+    vlt_hosted_common::assert_no_ledger(pnpm.path());
 
     // npm twin: only a package-lock.json is rewritten → no pnpm warning and
     // no workspace file materializes.
@@ -2578,14 +2492,7 @@ async fn pnpm_trust_opt_out_writes_nothing_and_keeps_manual_guidance() {
         serde_json::json!(["pnpm-lock.yaml"]),
         "only the lock may be rewritten under the opt-out: {env}"
     );
-    let ledger: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(
-        !ledger.to_string().contains("redirect_pnpm_workspace_trust"),
-        "the opt-out must record no workspace-trust edit: {ledger}"
-    );
+    vlt_hosted_common::assert_no_ledger(tmp.path());
     let detail = env["redirect"]["warnings"]
         .as_array()
         .unwrap()
@@ -2652,14 +2559,7 @@ async fn pnpm_trust_respects_an_explicit_user_false() {
         detail.contains("--trust-lockfile"),
         "the warning must fall back to the per-run flag recovery; got: {detail}"
     );
-    let ledger: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(
-        !ledger.to_string().contains("redirect_pnpm_workspace_trust"),
-        "no workspace-trust edit may be recorded for a respected user setting: {ledger}"
-    );
+    vlt_hosted_common::assert_no_ledger(tmp.path());
 }
 
 /// Two hardening pins on the trust-lockfile warning's host list, which lands
@@ -3060,7 +2960,7 @@ async fn cargo_redirect_writes_the_legacy_dot_cargo_config() {
     std::fs::write(tmp.path().join(".cargo/config"), "[net]\nretry = 3\n").unwrap();
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "scan --redirect should succeed");
+    assert_eq!(code, 0, "scan --mode hosted should succeed");
 
     let legacy = std::fs::read_to_string(tmp.path().join(".cargo/config")).unwrap();
     assert!(
@@ -3083,7 +2983,7 @@ async fn cargo_redirect_writes_the_legacy_dot_cargo_config() {
     );
 }
 
-/// `scan --redirect --json` must emit a machine-readable error envelope on
+/// `scan --mode hosted --json` must emit a machine-readable error envelope on
 /// stdout for EVERY failure exit, never empty stdout plus an exit code.
 ///
 /// Regression pin for the long-open hosted-mode JSON gap: the early
@@ -3148,7 +3048,7 @@ async fn redirect_json_mode_failures_emit_error_envelope() {
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--yes",
             "--json",
             "--cwd",
@@ -3177,7 +3077,7 @@ async fn redirect_json_mode_failures_emit_error_envelope() {
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--yes",
             "--json",
             "--cwd",
@@ -3222,13 +3122,13 @@ fn assert_write_failure_envelope(out: &std::process::Output, leg: &str) {
     );
 }
 
-/// Shared driver for the write-failure legs: a hosted `scan --redirect --json`
+/// Shared driver for the write-failure legs: a hosted `scan --mode hosted --json`
 /// subprocess against the obstructed project in `tmp`.
 async fn run_hosted_json_scan(tmp: &std::path::Path, server: &MockServer) -> std::process::Output {
     scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--yes",
             "--json",
             "--cwd",
@@ -3250,9 +3150,9 @@ async fn run_hosted_json_scan(tmp: &std::path::Path, server: &MockServer) -> std
 /// read-only lock FILE no longer fails this leg: the atomic stage+rename
 /// replaces it mode-preserved, like the vendored backend's writer. (Legs 1-2
 /// — the discovery-detail and reference-resolve failures — are pinned by
-/// `redirect_json_mode_failures_emit_error_envelope` above; leg 4 — the
-/// ledger write — is pinned by the unix-only
-/// `redirect_ledger_write_failure_leaves_project_files_untouched` below.)
+/// `redirect_json_mode_failures_emit_error_envelope` above. The former leg 4
+/// — the ledger write — has no subject in v5: hosted mode writes no ledger,
+/// see `readonly_socket_vendor_does_not_block_a_hosted_run` below.)
 ///
 /// unix-only: a read-only directory does not block file creation on Windows.
 #[cfg(unix)]
@@ -3266,8 +3166,7 @@ async fn redirect_json_mode_write_failures_emit_error_envelope() {
     mock_reference(&server).await;
     mock_view(&server).await;
     let tmp = tempfile::tempdir().unwrap();
-    // Rush project: the lock lives in a subdirectory, so obstructing it does
-    // not also block the (earlier) `.socket/vendor` ledger write at the root.
+    // Rush project: the lock lives in a subdirectory.
     write_rush_project(tmp.path(), false);
     let lock_dir = tmp.path().join("common/config/rush");
     std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -3276,26 +3175,22 @@ async fn redirect_json_mode_write_failures_emit_error_envelope() {
     assert_write_failure_envelope(&out, "lockfile-write failure");
 }
 
-/// Leg 4 of the four `--json` failure exits: the revert ledger cannot be
-/// persisted — `.socket/vendor` is read-only, so the atomic writer's stage
-/// file cannot be created. The ledger is written BEFORE the project files
-/// (its recorded originals are the only revert path), so the failure must
-/// also leave the lockfile untouched — not rewritten-but-unrevertable.
+/// v5 hosted mode writes nothing under `.socket/`, so a read-only
+/// `.socket/vendor` (which used to fail the run at the ledger write) no
+/// longer matters: the run succeeds and the lockfile is redirected.
 ///
-/// unix-only: the obstruction is a read-only DIRECTORY, and Windows ignores
-/// FILE_ATTRIBUTE_READONLY on directories for file creation, so the stage
-/// file would be created fine there.
+/// unix-only: the obstruction is a read-only DIRECTORY (Windows ignores
+/// FILE_ATTRIBUTE_READONLY on directories for file creation).
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
-async fn redirect_ledger_write_failure_leaves_project_files_untouched() {
+async fn readonly_socket_vendor_does_not_block_a_hosted_run() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
     mock_view(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
-    let lock_before = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     let vendor_dir = tmp.path().join(".socket/vendor");
     std::fs::create_dir_all(&vendor_dir).unwrap();
     let mut perms = std::fs::metadata(&vendor_dir).unwrap().permissions();
@@ -3308,23 +3203,27 @@ async fn redirect_ledger_write_failure_leaves_project_files_untouched() {
     #[allow(clippy::permissions_set_readonly_false)]
     perms.set_readonly(false);
     std::fs::set_permissions(&vendor_dir, perms).unwrap();
-    assert_write_failure_envelope(&out, "ledger-write failure");
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
-        std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap(),
-        lock_before,
-        "a failed ledger write must leave the project files untouched \
-         (ledger-before-files ordering)"
+        out.status.code(),
+        Some(0),
+        "stdout=\n{stdout}\nstderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("parseable envelope");
+    assert_eq!(v["redirect"]["redirected"], 1, "{v:#}");
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(lock.contains(HOSTED_URL), "{lock}");
+    vlt_hosted_common::assert_no_ledger(tmp.path());
 }
 
-/// A MALFORMED redirect ledger (torn write, truncation, bad hand-edit) must
-/// abort a hosted run before anything is written. The old tolerant load
-/// returned `None` for it, so `run_redirect` started a FRESH ledger and
-/// overwrote the corrupt file — permanently destroying every previously
-/// recorded pre-redirect original (the only revert path) with exit 0.
+/// A MALFORMED pre-v5 redirect ledger (torn write, truncation, bad
+/// hand-edit) is IGNORED by v5 hosted scan: never read for planning, never
+/// quarantined, never an error. The run succeeds and redirects, the torn
+/// bytes are left in place verbatim, and nothing about them is printed.
 #[tokio::test]
 #[serial]
-async fn corrupt_ledger_fails_closed_and_preserves_the_bytes() {
+async fn corrupt_pre_v5_ledger_is_ignored_and_left_untouched() {
     const TORN: &[u8] = b"{ \"version\": 1, \"mode\": \"hosted\", \"edits\": [ { \"path\": \"packa";
 
     let server = MockServer::start().await;
@@ -3333,80 +3232,36 @@ async fn corrupt_ledger_fails_closed_and_preserves_the_bytes() {
     mock_view(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
-    let lock_before = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     let vendor_dir = tmp.path().join(".socket/vendor");
     std::fs::create_dir_all(&vendor_dir).unwrap();
     std::fs::write(vendor_dir.join("redirect-state.json"), TORN).unwrap();
 
-    let out = scrubbed_cli()
-        .args([
-            "scan",
-            "--redirect",
-            "--yes",
-            "--json",
-            "--cwd",
-            tmp.path().to_str().unwrap(),
-            "--api-url",
-            &server.uri(),
-            "--org",
-            ORG,
-            "--api-token",
-            "fake",
-        ])
-        .output()
-        .expect("run socket-patch");
+    let out = run_hosted_json_scan(tmp.path(), &server).await;
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "a corrupt ledger must be a hard error, not a silent fresh start; \
-         stdout=\n{stdout}"
-    );
-    let v: serde_json::Value =
-        serde_json::from_str(&stdout).expect("--json stdout must stay parseable on failure");
-    assert_eq!(v["status"], "error");
-    let message = v["error"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("redirect-state.json"),
-        "error must name the ledger file: {message}"
-    );
-    assert!(
-        message.contains("redirect-state.json.corrupt"),
-        "error must point at the moved-aside file: {message}"
-    );
-    // The corruption is reported ONCE, as the engine's hard error: the
-    // read-only `updates[]` consult of the same file must not also print
-    // its advisory warning for a hosted run.
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(
-        stderr.matches("is malformed").count(),
-        1,
-        "the corrupt-ledger message must print exactly once; stderr=\n{stderr}"
-    );
-
-    // Nothing was rewritten, and the corrupt bytes survived verbatim in the
-    // quarantine file — never overwritten by a fresh ledger.
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap(),
-        lock_before,
-        "the project must be untouched"
-    );
-    assert_eq!(
-        std::fs::read(vendor_dir.join("redirect-state.json.corrupt")).unwrap(),
-        TORN,
-        "the corrupt ledger bytes must be preserved for recovery"
-    );
+    assert_eq!(out.status.code(), Some(0), "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("parseable envelope");
+    assert_eq!(v["status"], "success", "{v:#}");
+    assert_eq!(v["redirect"]["redirected"], 1, "{v:#}");
     assert!(
-        !vendor_dir.join("redirect-state.json").exists(),
-        "no fresh ledger may be written over the failure"
+        !stdout.contains("redirect-state.json") && !stderr.contains("malformed"),
+        "the legacy ledger is never mentioned; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(lock.contains(HOSTED_URL), "{lock}");
+    assert_eq!(
+        std::fs::read(vendor_dir.join("redirect-state.json")).unwrap(),
+        TORN,
+        "the pre-v5 ledger bytes are left in place verbatim"
+    );
+    assert!(!vendor_dir.join("redirect-state.json.corrupt").exists());
 }
 
-/// `--dry-run` over a corrupt ledger reports the same hard error but moves
-/// nothing: a dry run must not mutate the project, quarantine included.
+/// `--dry-run` over a corrupt pre-v5 ledger: the preview succeeds, and
+/// neither the ledger nor the lock is touched.
 #[tokio::test]
 #[serial]
-async fn corrupt_ledger_dry_run_errors_without_moving_the_file() {
+async fn corrupt_pre_v5_ledger_dry_run_succeeds_without_touching_it() {
     const TORN: &[u8] = b"{ not json";
 
     let server = MockServer::start().await;
@@ -3414,6 +3269,7 @@ async fn corrupt_ledger_dry_run_errors_without_moving_the_file() {
     mock_reference(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
+    let lock_before = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
     let vendor_dir = tmp.path().join(".socket/vendor");
     std::fs::create_dir_all(&vendor_dir).unwrap();
     std::fs::write(vendor_dir.join("redirect-state.json"), TORN).unwrap();
@@ -3421,7 +3277,7 @@ async fn corrupt_ledger_dry_run_errors_without_moving_the_file() {
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--yes",
             "--json",
             "--dry-run",
@@ -3437,65 +3293,57 @@ async fn corrupt_ledger_dry_run_errors_without_moving_the_file() {
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "dry-run must report the corruption a real run would refuse on; \
-         stdout=\n{stdout}"
-    );
+    assert_eq!(out.status.code(), Some(0), "stdout=\n{stdout}");
     assert_eq!(
         std::fs::read(vendor_dir.join("redirect-state.json")).unwrap(),
         TORN,
-        "dry-run must not move or rewrite the malformed ledger"
+        "dry-run must not move or rewrite the pre-v5 ledger"
     );
-    assert!(
-        !vendor_dir.join("redirect-state.json.corrupt").exists(),
-        "dry-run must not quarantine"
+    assert!(!vendor_dir.join("redirect-state.json.corrupt").exists());
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock_before,
+        "dry-run leaves the lock untouched"
     );
 }
 
-/// Hosted mode records patches ONLY in the redirect ledger — it never
-/// writes `.socket/manifest.json` — so `updates[]` (the documented CI
-/// signal) must consult the ledger too, or a pure hosted project whose
-/// redirected patch has been superseded reports `updates: []` forever.
+/// Hosted mode records patches ONLY in the lockfile pins — it never writes
+/// `.socket/manifest.json` (nor, in v5, a ledger) — so `updates[]` (the
+/// documented CI signal) must consult the hosted pins, or a pure hosted
+/// project whose redirected patch has been superseded reports
+/// `updates: []` forever.
 #[tokio::test]
 #[serial]
-async fn scan_updates_reports_superseding_patch_for_ledger_only_project() {
+async fn scan_updates_reports_superseding_patch_for_a_lock_pinned_project() {
     const OLD_UUID: &str = "99999999-9999-4999-8999-999999999999";
 
     let server = MockServer::start().await;
-    // Discovery offers ONLY the new uuid; the ledger records the old one.
+    // Discovery offers ONLY the new uuid; the lock pins the old one.
     mock_discovery(&server).await;
 
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
-    // Ledger-only persistence, exactly as a previous hosted run left it.
-    let mut ledger = socket_patch_core::patch::redirect::RedirectState::new();
-    ledger.records.insert(
-        PURL.to_string(),
-        PatchRecord {
-            uuid: OLD_UUID.to_string(),
-            exported_at: "2024-01-01T00:00:00Z".to_string(),
-            files: HashMap::new(),
-            vulnerabilities: HashMap::new(),
-            description: String::new(),
-            license: "MIT".to_string(),
-            tier: "free".to_string(),
-        },
-    );
-    let vendor_dir = tmp.path().join(".socket/vendor");
-    std::fs::create_dir_all(&vendor_dir).unwrap();
+    // The lock as a previous hosted run left it: pinned to OLD_UUID's
+    // hosted artifact (the only v5 hosted persistence).
+    let old_url = HOSTED_URL.replace(UUID, OLD_UUID);
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     std::fs::write(
-        vendor_dir.join("redirect-state.json"),
-        format!("{}\n", serde_json::to_string_pretty(&ledger).unwrap()),
+        tmp.path().join("package-lock.json"),
+        lock.replace(
+            &format!("https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz"),
+            &old_url,
+        ),
     )
     .unwrap();
 
-    // Bare `scan --json` (hosted by default) — the nightly CI shape.
+    // Bare `scan --json` (hosted by default) — the nightly CI shape; the
+    // mock host counts as the patch server via `--patch-server-url`.
     let out = scrubbed_cli()
         .args([
             "scan",
             "--json",
+            "--patch-server-url",
+            "http://patch.test",
             "--cwd",
             tmp.path().to_str().unwrap(),
             "--api-url",
@@ -3514,7 +3362,7 @@ async fn scan_updates_reports_superseding_patch_for_ledger_only_project() {
     assert_eq!(
         updates.len(),
         1,
-        "the ledger-recorded patch was superseded — updates[] must say so; \
+        "the lock-pinned patch was superseded — updates[] must say so; \
          stdout=\n{stdout}"
     );
     assert_eq!(updates[0]["purl"], PURL);
@@ -3716,7 +3564,7 @@ async fn mock_composer_api(server: &MockServer) {
 /// having done nothing: the rewriter wrote the hosted url with `\/`-escaped
 /// slashes while the post-rewrite confirmation probe searched only the raw and
 /// percent-encoded spellings, so a fully successful rewrite yielded
-/// `redirected: 0`, no patch record in the ledger, and nothing for `vex` to
+/// `redirected: 0`, no patch record fetched, and nothing for `vex` to
 /// attest. The rewriter now emits composer-native raw slashes and the probe
 /// asks the rewriter's own predicate, so the lock edit and the confirmation
 /// cannot disagree. Subprocess so the `--json` envelope can be read back.
@@ -3760,18 +3608,17 @@ async fn composer_redirect_is_confirmed_and_recorded() {
         "dist.shasum must pin the patched artifact's sha1; got:\n{lock}"
     );
 
-    // The confirmation is what drives the record fetch: no confirmation, no
-    // record, and `socket-patch vex` can never attest the patch.
-    let ledger =
-        std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
-    assert!(
-        ledger.contains(COMPOSER_PURL) && ledger.contains(GHSA),
-        "the ledger must carry the fetched patch record for the redirected purl: {ledger}"
-    );
-    assert!(
-        ledger.contains("redirect_composer_dist"),
-        "the ledger must carry the revert edit for the lock rewrite: {ledger}"
-    );
+    // The confirmation is what drives the record fetch (held in memory for
+    // the in-run VEX — v5 persists no ledger): no confirmation, no record.
+    let views = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().contains("/patches/view/"))
+        .count();
+    assert_eq!(views, 1, "the confirmed redirect fetched its patch record");
+    vlt_hosted_common::assert_no_ledger(tmp.path());
 }
 
 /// Mount the full cargo hosted-mock set (discovery + reference + view) for
@@ -4217,12 +4064,7 @@ async fn cargo_table_form_without_lock_is_pinned_and_attested() {
         !tmp.path().join("Cargo.lock").exists(),
         "no lockfile may be invented"
     );
-    let ledger =
-        std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
-    assert!(
-        ledger.contains(CARGO_UUID) && ledger.contains("GHSA-carg-cccc-dddd"),
-        "the ledger must record the landed redirect: {ledger}"
-    );
+    vlt_hosted_common::assert_no_ledger(tmp.path());
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
     let stmts = doc["statements"].as_array().unwrap();
