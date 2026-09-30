@@ -48,14 +48,16 @@ async fn download_archive(
 }
 
 // Without the ledger's fingerprint no download can be proven to be the
-// recorded artifact. A revert drops the entry, so the following `vendor`
-// downloads afresh and records a new fingerprint.
+// recorded artifact. A dir copy with no inventory is rebuilt from a fresh
+// verified download by re-running the vendoring command; a file artifact
+// with no SHA-256 needs a revert first (it reverts every vendored package),
+// so the next vendoring run downloads afresh and records a new fingerprint.
 const NO_ARCHIVE_SHA256: &str = "the ledger has no archive SHA-256; restore it from version \
-     control, or run `socket-patch vendor --revert` and then `socket-patch vendor` to vendor \
-     it again";
+     control, or run `socket-patch vendor --revert` (it reverts every vendored package) and \
+     vendor again";
 const NO_FILE_INVENTORY: &str = "the ledger has no complete file inventory; restore it from \
-     version control, or run `socket-patch vendor --revert` and then `socket-patch vendor` to \
-     vendor it again";
+     version control, or re-run the vendoring command (`socket-patch vendor`, or `scan --mode \
+     vendored`) to rebuild it from a verified download";
 
 /// Restore only the recorded artifact. Project wiring and ledger are never written.
 pub async fn restore(
@@ -581,7 +583,7 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("no archive SHA-256"), "{error}");
         assert!(
-            error.contains("`socket-patch vendor --revert` and then `socket-patch vendor`"),
+            error.contains("`socket-patch vendor --revert` (it reverts every vendored package) and vendor again"),
             "the refusal names the remedy that records a new fingerprint: {error}"
         );
         assert!(server.received_requests().await.unwrap().is_empty());
@@ -713,8 +715,12 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("no complete file inventory"), "{error}");
         assert!(
-            error.contains("`socket-patch vendor --revert` and then `socket-patch vendor`"),
-            "the refusal names the remedy that records a new inventory: {error}"
+            error.contains("re-run the vendoring command"),
+            "the refusal names the remedy that rebuilds the copy: {error}"
+        );
+        assert!(
+            !error.contains("--revert"),
+            "no revert is needed for a dir copy: {error}"
         );
         assert!(server.received_requests().await.unwrap().is_empty());
         assert_eq!(tree_snapshot(root.path()), before);
