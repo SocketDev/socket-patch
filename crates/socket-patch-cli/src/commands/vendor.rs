@@ -1804,6 +1804,7 @@ async fn plan_service_downloads(
     variant_groups: &HashMap<String, Vec<String>>,
     records: &HashMap<String, PatchRecord>,
     ledger: &VendorState,
+    refused: &HashSet<String>,
     bun_refusal: Option<&crate::commands::bun_preflight::BunVendorRefusal>,
     takeover_blocked: &dyn Fn(&str) -> bool,
     (pipenv_version, installed_sites): (
@@ -1834,23 +1835,29 @@ async fn plan_service_downloads(
             let Some((candidate, record)) = records.get_key_value(candidate) else {
                 continue;
             };
+            if refused.contains(candidate) {
+                continue;
+            }
             // The loop's installed-variant probe (see there).
             let probe_applicable = is_variant_eco
                 && !matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Maven));
             let ledger_answers_probe =
                 lookup_entry(&ledger.entries, candidate).is_some_and(|e| e.uuid == record.uuid);
-            if probe_applicable
-                && !force
-                && !ledger_answers_probe
-                && matches!(staged, StagedSource::Installed(_))
-            {
-                if let Some((file, info)) = representative_file(&record.files) {
-                    let dir = source.path();
-                    if !variant_matches_installed(Some(
-                        &verify_file_patch(dir, file, info).await.status,
-                    )) {
-                        continue;
+            if probe_applicable && !force && !ledger_answers_probe {
+                if matches!(staged, StagedSource::Installed(_)) {
+                    if let Some((file, info)) = representative_file(&record.files) {
+                        let dir = source.path();
+                        if !variant_matches_installed(Some(
+                            &verify_file_patch(dir, file, info).await.status,
+                        )) {
+                            continue;
+                        }
                     }
+                } else if candidates.len() > 1 && lookup_entry(&ledger.entries, candidate).is_none()
+                {
+                    // The loop leaves this variant to a sibling the ledger
+                    // records, or refuses it as ambiguous (see there).
+                    continue;
                 }
             }
             if bun_refusal.is_some_and(|r| r.applies_to(candidate)) {
@@ -2207,6 +2214,7 @@ pub(crate) async fn vendor_records_reusing(
                 &variant_groups,
                 records,
                 &state,
+                &fetch_failed,
                 bun_refusal.as_ref(),
                 &takeover_blocked,
                 (&pipenv_version, &installed_sites),
@@ -2251,6 +2259,11 @@ pub(crate) async fn vendor_records_reusing(
             let Some(record) = records.get(candidate) else {
                 continue;
             };
+            // Refused above (`vendor_ledger_entry_missing`); a sibling
+            // variant's group must not bring it back.
+            if fetch_failed.contains(candidate) {
+                continue;
+            }
 
             // Variant probe: only the installed distribution's variant is
             // vendored (mirrors apply / select_installed_variants). It hashes a
@@ -2277,9 +2290,23 @@ pub(crate) async fn vendor_records_reusing(
                             continue;
                         }
                     }
-                } else if candidates.len() > 1 {
-                    env.record(PatchEvent::new(PatchAction::Failed, candidate.clone()).with_error(
-                        "vendor_variant_ambiguous", "multiple patch variants match an uninstalled package; select one release variant"));
+                } else if candidates.len() > 1 && lookup_entry(&state.entries, candidate).is_none()
+                {
+                    // Nothing installed to probe: a variant the ledger
+                    // records (at any uuid) is the wired distribution, so
+                    // its siblings are left out and accounted for by it.
+                    if candidates
+                        .iter()
+                        .any(|c| lookup_entry(&state.entries, c).is_some())
+                    {
+                        continue;
+                    }
+                    let detail = "multiple patch variants match an uninstalled package; select one release variant";
+                    env.record(
+                        PatchEvent::new(PatchAction::Failed, candidate.clone())
+                            .with_error("vendor_variant_ambiguous", detail),
+                    );
+                    report_vendor_failure(common, candidate, detail);
                     fetch_failed.insert(candidate.clone());
                     continue;
                 }
@@ -3626,6 +3653,7 @@ mod plan_gate_tests {
             &HashMap::new(),
             &records,
             &VendorState::default(),
+            &HashSet::new(),
             None,
             &|_| false,
             (
@@ -3943,6 +3971,279 @@ mod variant_probe_tests {
             "the admitted variant must not be misclassified as not installed: {:?}",
             env.events
         );
+    }
+
+    const UUID_SDIST: &str = "3c8e1a5f-7b2d-4e9a-9c1f-5d7b3a9e1c2f";
+    const UUID_OLD: &str = "0a4d8f2b-6c1e-4b3a-8d5f-9e2c7a1b4d6e";
+    const BASE: &str = "pkg:pypi/foo@1.0.0";
+
+    /// The wheel (at `UUID`) and sdist (at `UUID_SDIST`) variants of
+    /// `foo@1.0.0`, each patching a file only its own distribution ships.
+    fn wheel_and_sdist() -> HashMap<String, PatchRecord> {
+        let before = compute_git_sha256_from_bytes(b"print('hi')\n");
+        let after = compute_git_sha256_from_bytes(b"patched\n");
+        let mut sdist = record(&[("setup.py", &before, &after)]);
+        sdist.uuid = UUID_SDIST.to_string();
+        HashMap::from([
+            (
+                WHEEL.to_string(),
+                record(&[("foo/__init__.py", &before, &after)]),
+            ),
+            (SDIST.to_string(), sdist),
+        ])
+    }
+
+    /// A ledger entry recording the wheel variant as vendored at `uuid`.
+    fn wheel_entry(uuid: &str) -> VendorEntry {
+        VendorEntry {
+            ecosystem: "pypi".into(),
+            base_purl: BASE.into(),
+            uuid: uuid.into(),
+            artifact: socket_patch_core::vendor::state::VendorArtifact {
+                yarn_berry10c0: None,
+                path: format!(".socket/vendor/pypi/{uuid}/foo-1.0.0-py3-none-any.whl"),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: Some("requirements".into()),
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        }
+    }
+
+    /// A dry run over `site` as the only site-packages.
+    fn dry_run_over(root: &Path, site: &Path) -> GlobalArgs {
+        GlobalArgs {
+            cwd: root.to_path_buf(),
+            global_prefix: Some(site.to_path_buf()),
+            ecosystems: Some(vec!["pypi".to_string()]),
+            dry_run: true,
+            offline: true,
+            json: true,
+            silent: true,
+            ..GlobalArgs::default()
+        }
+    }
+
+    /// Nothing installed to probe (a fresh clone): the variant the ledger
+    /// records — at the record's uuid, or at an older one after a patch
+    /// update — is the wired distribution, so it goes on to its backend and
+    /// its sibling is left out without an event instead of failing the
+    /// re-run as `vendor_variant_ambiguous`.
+    #[tokio::test]
+    async fn the_ledger_picks_the_variant_of_an_uninstalled_package() {
+        for ledger_uuid in [UUID, UUID_OLD] {
+            let tmp = tempfile::tempdir().unwrap();
+            let site = tmp.path().join("site-packages");
+            tokio::fs::create_dir_all(&site).await.unwrap();
+            let common = dry_run_over(tmp.path(), &site);
+            let sources = PatchSources {
+                blobs_path: tmp.path(),
+                diffs_path: None,
+                mem_blobs: None,
+            };
+            let mut state = VendorState::default();
+            state
+                .entries
+                .insert(WHEEL.to_string(), wheel_entry(ledger_uuid));
+
+            let mut env = Envelope::new(Command::Vendor);
+            vendor_records(
+                &common,
+                &wheel_and_sdist(),
+                &sources,
+                false,
+                false,
+                &mut env,
+                None,
+                Ok(state),
+            )
+            .await;
+
+            assert!(
+                !env.events
+                    .iter()
+                    .any(|e| e.error_code.as_deref() == Some("vendor_variant_ambiguous")),
+                "ledger at {ledger_uuid}: the ledger names the variant; events: {:?}",
+                env.events
+            );
+            assert!(
+                !env.events.iter().any(|e| e.purl.as_deref() == Some(SDIST)),
+                "ledger at {ledger_uuid}: the sibling of the ledger's variant is left out \
+                 silently; events: {:?}",
+                env.events
+            );
+            assert!(
+                env.events.iter().any(|e| e.purl.as_deref() == Some(WHEEL)),
+                "ledger at {ledger_uuid}: the ledger's variant reaches its backend; events: {:?}",
+                env.events
+            );
+        }
+    }
+
+    /// The control: with no ledger record either, nothing identifies the
+    /// distribution, and every variant fails `vendor_variant_ambiguous`.
+    #[tokio::test]
+    async fn an_uninstalled_variant_group_without_a_ledger_record_is_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site-packages");
+        tokio::fs::create_dir_all(&site).await.unwrap();
+        let common = dry_run_over(tmp.path(), &site);
+        let sources = PatchSources {
+            blobs_path: tmp.path(),
+            diffs_path: None,
+            mem_blobs: None,
+        };
+
+        let mut env = Envelope::new(Command::Vendor);
+        let has_errors = vendor_records(
+            &common,
+            &wheel_and_sdist(),
+            &sources,
+            false,
+            false,
+            &mut env,
+            None,
+            Ok(VendorState::default()),
+        )
+        .await;
+
+        assert!(has_errors, "an ambiguous variant fails the run");
+        for purl in [WHEEL, SDIST] {
+            assert!(
+                env.events.iter().any(|e| e.purl.as_deref() == Some(purl)
+                    && e.action == PatchAction::Failed
+                    && e.error_code.as_deref() == Some("vendor_variant_ambiguous")),
+                "{purl} fails as ambiguous; events: {:?}",
+                env.events
+            );
+        }
+    }
+
+    /// A variant refused for a lockfile reference with no ledger entry
+    /// (`vendor_ledger_entry_missing`) stays refused: its installed
+    /// sibling's variant group must not probe and dispatch it again.
+    #[tokio::test]
+    async fn a_variant_refused_for_a_missing_ledger_entry_is_not_revisited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site-packages");
+        tokio::fs::create_dir_all(site.join("foo-1.0.0.dist-info"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            site.join("foo-1.0.0.dist-info").join("METADATA"),
+            "Name: foo\nVersion: 1.0.0\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(site.join("foo")).await.unwrap();
+        // The wheel variant's `beforeHash`: its probe would admit it.
+        tokio::fs::write(site.join("foo").join("__init__.py"), b"print('hi')\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("requirements.txt"),
+            format!("foo @ file:./.socket/vendor/pypi/{UUID}/foo-1.0.0-py3-none-any.whl\n"),
+        )
+        .await
+        .unwrap();
+        let common = dry_run_over(tmp.path(), &site);
+        let sources = PatchSources {
+            blobs_path: tmp.path(),
+            diffs_path: None,
+            mem_blobs: None,
+        };
+
+        let mut env = Envelope::new(Command::Vendor);
+        vendor_records(
+            &common,
+            &wheel_and_sdist(),
+            &sources,
+            false,
+            false,
+            &mut env,
+            None,
+            Ok(VendorState::default()),
+        )
+        .await;
+
+        let wheel: Vec<&PatchEvent> = env
+            .events
+            .iter()
+            .filter(|e| e.purl.as_deref() == Some(WHEEL))
+            .collect();
+        assert_eq!(
+            wheel.len(),
+            1,
+            "the refused variant gets its refusal and nothing else; events: {:?}",
+            env.events
+        );
+        assert_eq!(
+            wheel[0].error_code.as_deref(),
+            Some("vendor_ledger_entry_missing")
+        );
+    }
+
+    /// The download plan follows the loop: an uninstalled variant group
+    /// plans only the variant the ledger records (here at an older uuid, so
+    /// the loop does ask the service), nothing when the ledger records none
+    /// (the loop refuses them as ambiguous), and never a variant refused
+    /// before the loop.
+    #[tokio::test]
+    async fn the_plan_follows_the_ledger_pick_of_an_uninstalled_variant_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("requirements.txt"), "foo==1.0.0\n").unwrap();
+        let missing = || StagedSource::Missing(root.join(".socket/vendor/.uninstalled"));
+        let both = vec![
+            (WHEEL.to_string(), missing()),
+            (SDIST.to_string(), missing()),
+        ];
+        let sdist_only = vec![(SDIST.to_string(), missing())];
+        let variant_groups =
+            HashMap::from([(BASE.to_string(), vec![WHEEL.to_string(), SDIST.to_string()])]);
+        let records = wheel_and_sdist();
+        let mut picked = VendorState::default();
+        picked
+            .entries
+            .insert(WHEEL.to_string(), wheel_entry(UUID_OLD));
+        let refused = HashSet::from([WHEEL.to_string()]);
+
+        let cases = [
+            (&both, VendorState::default(), HashSet::new(), vec![]),
+            (&both, picked.clone(), HashSet::new(), vec![UUID]),
+            (&sdist_only, picked, refused, vec![]),
+        ];
+        for (all_packages, ledger, refused, expected) in cases {
+            let planned = plan_service_downloads(
+                root,
+                false,
+                all_packages,
+                &variant_groups,
+                &records,
+                &ledger,
+                &refused,
+                None,
+                &|_| false,
+                (
+                    &tokio::sync::OnceCell::new(),
+                    &vendor::pypi::InstalledSiteListings::default(),
+                ),
+            )
+            .await;
+            let uuids: Vec<&str> = planned.iter().map(|d| d.uuid.as_str()).collect();
+            assert_eq!(uuids, expected, "refused: {refused:?}");
+        }
     }
 }
 
