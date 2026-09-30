@@ -914,6 +914,20 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **npm locks and `composer.json` keep their own layout when edited.**
+  `scan --mode hosted`, `scan --mode vendored`, `rollback` and
+  `vendor --revert` re-serialized `package-lock.json` /
+  `npm-shrinkwrap.json` with LF line endings (and, in hosted mode, a
+  fixed 2-space indent), so a CRLF or tab-indented lock got a whole-file
+  diff and the undo did not restore its bytes. A lock with a UTF-8 BOM,
+  which npm installs from, was skipped as unparseable (hosted) or
+  refused as `vendor_lockfile_version_unsupported` (vendored). The lock
+  now keeps its BOM, indent and line endings, and the undo is byte-exact
+  (#324). `setup` for Composer likewise rewrote a CRLF `composer.json`
+  as LF and dropped `\/` / `\uXXXX` escapes; it now edits only the
+  `scripts` key, in the file's own line ending and escaping, and
+  `setup --remove` restores the file byte for byte (#351).
+
 - **Hosted nuget redirects survive a `<clear />` in `nuget.config`.** The
   Socket source (and, in an existing `<packageSourceMapping>`, its
   mapping) was inserted ahead of the section's `<clear />`, which NuGet
