@@ -300,9 +300,16 @@ impl<'a> ManifestlessVex<'a> {
         let lock = std::fs::read(project.join("yarn.lock")).expect("yarn.lock");
         for (label, make) in &self.embedded {
             let run = make(self.online());
-            let missing_ledger = self.wiring == Wiring::Vendored
+            let vendored_scan = self.wiring == Wiring::Vendored
                 && !keep_ledgers
                 && matches!(run.via, crate::vex_e2e_common::VexVia::Scan);
+            // Without its ledger, a vendored scan refuses the installed
+            // package (`vendor_ledger_entry_missing`). yarn < 1.7 installs
+            // nothing for the vendored `file:` entry (see
+            // `installs_file_tarballs`), so there the scan has no package to
+            // vendor and attests from the lockfile like the other runs.
+            let installed = installs_file_tarballs(&yarn_classic_version());
+            let missing_ledger = vendored_scan && installed;
             if missing_ledger {
                 let output = project.join(
                     run.output
@@ -320,6 +327,16 @@ impl<'a> ManifestlessVex<'a> {
                 );
                 assert!(out.doc.is_none(), "failed scan cannot emit VEX: {out}");
             } else {
+                if vendored_scan {
+                    // Pin the limitation's shape so a behavior change is
+                    // noticed.
+                    assert_eq!(out.envelope["scannedPackages"], 0, "{out}");
+                    println!(
+                        "KNOWN LIMITATION {}: nothing installed, so a vendored scan \
+                         without its ledger vendors nothing and attests from the lockfile",
+                        yarn_classic()
+                    );
+                }
                 self.attested(&out, &format!("embedded {label} ({state})"));
             }
             assert!(
