@@ -2,9 +2,12 @@ name: CI
 
 on:
   push:
-    # The v5 integration branch too: PRs into it skip the full tier, and
-    # `schedule` only fires on main, so each landing runs the full tier.
-    branches: [main, release/v5-prerelease]
+    # Only main. A landing on the v5 integration branch runs through the
+    # pull_request event of its PR into main instead: the full-tier jobs
+    # below also run for `head_ref == release/v5-prerelease`. A push trigger
+    # on a release-named branch makes zizmor audit this as a release
+    # workflow (cache-poisoning).
+    branches: [main]
   pull_request:
   schedule:
     # Nightly on main: the `full` tier (e2e-full, cargo-vex-matrix-full,
@@ -1445,9 +1448,10 @@ jobs:
   # Pipenv releases and .NET SDK majors, and bundler 2.7. Skipped
   # on pull_request (the `e2e` rows keep every named boundary, the oldest
   # and newest release of each tool and every vlt era there); main pushes,
-  # the nightly schedule and dispatch run them with the `e2e` steps.
+  # v5 landings, the nightly schedule and dispatch run them with the `e2e`
+  # steps.
   e2e-full:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' || github.head_ref == 'release/v5-prerelease'
     needs: [test, e2e-build]
     strategy:
       fail-fast: false
@@ -1502,7 +1506,7 @@ jobs:
   # managers and run socket-patch against a wiremock-served fixture —
   # no real Socket API contact. Hermetic, reproducible.
   #
-  # Nightly, on dispatch and on v5 pushes only: coverage-docker runs these
+  # Nightly, on dispatch and on v5 landings only: coverage-docker runs these
   # suites on each push (with an instrumented binary mounted in); this job
   # is the one run of them against the base image's full-LTO release
   # binary. The `e2e` job above runs the `#[ignore]`-gated real-toolchain
@@ -1510,8 +1514,9 @@ jobs:
   # its matrix).
   # ----------------------------------------------------------------------
   e2e-docker:
-    # The v5 branch has no nightly of its own, so its pushes run it too.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/release/v5-prerelease'
+    # The v5 branch has no nightly of its own, so its landings (the
+    # pull_request runs of its PR into main) run it too.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'release/v5-prerelease'
     needs: docker-base
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -1657,10 +1662,10 @@ jobs:
           YARN_BERRY_RELEASE: ${{ matrix.yarn }}
         run: scripts/yarn-berry-vex-matrix.sh "$YARN_BERRY_RELEASE"
 
-  # Skipped on pull_request, like e2e-full.
+  # Skipped on pull_request (except v5 landings), like e2e-full.
   yarn-berry-full:
     name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' || github.head_ref == 'release/v5-prerelease'
     needs: test
     strategy:
       fail-fast: false
@@ -1752,7 +1757,7 @@ jobs:
 
   cargo-vex-matrix-full:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' || github.head_ref == 'release/v5-prerelease'
     needs: [test, e2e-build]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
