@@ -13,7 +13,6 @@ use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurre
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::vendor::lock_inventory::LockfileEntry;
 use socket_patch_core::vendor::VendorState;
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crate::args::GlobalArgs;
@@ -31,54 +30,21 @@ pub(super) struct UpdateInfo {
 /// Lockfile-only packages: dependencies the project's lockfile resolves
 /// that have no crawled (installed) counterpart.
 #[derive(Default)]
-pub(super) struct LockfileSupplement {
-    pub(super) packages: Vec<socket_patch_core::crawlers::types::CrawledPackage>,
+pub(crate) struct LockfileSupplement {
+    pub(crate) packages: Vec<socket_patch_core::crawlers::types::CrawledPackage>,
     /// Literal crawler-form purls, for fast membership tests.
-    pub(super) purls: HashSet<String>,
+    pub(crate) purls: HashSet<String>,
     /// The FULL lockfile inventory the supplement was derived from (installed
     /// packages included), kept so the hosted-wiring probes reuse it instead
     /// of re-parsing every project lockfile. Empty for global scans.
-    pub(super) entries: Vec<LockfileEntry>,
+    pub(crate) entries: Vec<LockfileEntry>,
     /// npm layouts the lockfile inventory REFUSED (Plug'n'Play loaders).
     /// Scan surfaces these as refusal warnings: under PnP the installed-tree
     /// crawl is empty too, so otherwise the project scans as a silent no-op.
-    pub(super) unsupported: Vec<socket_patch_core::vendor::lock_inventory::UnsupportedNpmLayout>,
+    pub(crate) unsupported: Vec<socket_patch_core::vendor::lock_inventory::UnsupportedNpmLayout>,
 }
 
-/// Map a core npm-layout refusal onto scan's warning channel as
-/// `(code, detail)`. The yarn code matches apply's refusal errorCode
-/// (`yarn_pnp_unsupported`) so consumers key on ONE name across commands;
-/// the pnpm twin gets the parallel spelling. Details are scan-phrased (what
-/// was NOT scanned + remedy) rather than the probe's vendor-phrased text.
-pub(crate) fn unsupported_layout_warnings(
-    unsupported: &[socket_patch_core::vendor::lock_inventory::UnsupportedNpmLayout],
-) -> Vec<(String, String)> {
-    unsupported
-        .iter()
-        .map(|diag| match diag.code {
-            "vendor_yarn_berry_unsupported" => (
-                "yarn_pnp_unsupported".to_string(),
-                "this project uses yarn Plug'n'Play (a `.pnp.*` loader is present): its npm \
-                 packages live inside `.yarn/cache/*.zip`, not `node_modules/`, so socket-patch \
-                 cannot discover or patch them in ANY mode (agent, hosted, or vendored) — npm \
-                 dependencies were NOT scanned. Use `yarn patch <pkg>` to patch them instead."
-                    .to_string(),
-            ),
-            "vendor_pnpm_pnp_unsupported" => (
-                "pnpm_pnp_unsupported".to_string(),
-                "this project uses pnpm's Plug'n'Play linker (`node-linker=pnp` in .npmrc): \
-                 lockfile discovery is skipped under this layout, so lockfile-only npm \
-                 dependencies were NOT scanned. Switch .npmrc to `node-linker=isolated`, run \
-                 `pnpm install`, and re-run — or use `socket-patch scan --mode hosted`, which \
-                 edits pnpm-lock.yaml in place."
-                    .to_string(),
-            ),
-            // Forward-compat: a new refusal code surfaces verbatim rather
-            // than being swallowed back into silence.
-            other => (other.to_string(), diag.detail.clone()),
-        })
-        .collect()
-}
+pub(crate) use socket_patch_core::vendor::lock_inventory::unsupported_layout_warnings;
 
 /// Inventory the project's lockfile(s) and fabricate crawl entries for
 /// dependencies that are not installed. The fabricated `path` is the
@@ -91,19 +57,19 @@ pub(crate) fn unsupported_layout_warnings(
 /// crawled): an entry of an ecosystem the crawl skipped is never counted
 /// lockfile-only, since there is no crawl to tell whether it is installed.
 /// `entries` still holds the full inventory.
-pub(super) async fn lockfile_supplement(
-    common: &GlobalArgs,
+pub(crate) async fn lockfile_supplement(
+    ctx: &crate::commands::context::ProjectContext<'_>,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     only: Option<&[String]>,
 ) -> LockfileSupplement {
-    use socket_patch_core::vendor::lock_inventory;
-
+    let common = ctx.common;
     let mut out = LockfileSupplement::default();
     if common.is_global() {
         return out;
     }
-    let (entries, unsupported) = lock_inventory::inventory_project_diagnosed(&common.cwd).await;
-    out.unsupported = unsupported;
+    let locks = ctx.locks().await;
+    out.unsupported = locks.unsupported.clone();
+    let entries = &locks.entries;
     if entries.is_empty() {
         return out;
     }
@@ -114,7 +80,7 @@ pub(super) async fn lockfile_supplement(
                 .is_some_and(|eco| list.iter().any(|name| name == eco.cli_name()))
         })
     };
-    for entry in &entries {
+    for entry in entries {
         if crawled_purls.contains(entry.purl.as_str()) || !in_scope(&entry.purl) {
             continue;
         }
@@ -124,7 +90,7 @@ pub(super) async fn lockfile_supplement(
         out.purls.insert(entry.purl.clone());
         out.packages.push(pkg);
     }
-    out.entries = entries;
+    out.entries = entries.clone();
     out
 }
 
@@ -167,7 +133,7 @@ fn crawled_from_purl(
 /// runs all keep working before any install). They are NOT "lockfile-only"
 /// — nothing needs installing; the artifact satisfies the lock. `state` is
 /// the ledger `run` already loaded (`vendor::load_state`).
-pub(super) async fn vendored_ledger_supplement(
+pub(crate) async fn vendored_ledger_supplement(
     common: &GlobalArgs,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     state: &std::io::Result<VendorState>,
@@ -398,52 +364,8 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
     (mismatched, views)
 }
 
-/// Fold the hosted pins and the vendor ledger's patch records into the
-/// manifest view update detection consults. Hosted mode records purl→uuid
-/// ONLY in the lockfiles (`hosted_pins`, uuid only; v5 keeps no hosted
-/// ledger) and vendored mode ONLY in `.socket/vendor/state.json`, so without
-/// this fold a pure hosted or vendored project's `updates[]` would always
-/// be empty. Precedence on a collision: manifest > hosted pins > vendor
-/// ledger (the live lock over a possibly superseded vendored entry). Vendor
-/// entries are keyed by their manifest-form ledger key (`detect_updates`
-/// bridges the spellings); a legacy entry without an embedded record
-/// contributes its uuid alone. Borrows the manifest untouched when nothing
-/// else contributes.
-pub(super) fn merge_ledger_records_for_updates<'a>(
-    manifest: Option<&'a PatchManifest>,
-    vendor: Option<&VendorState>,
-    hosted_pins: &[(String, String)],
-) -> Option<Cow<'a, PatchManifest>> {
-    let vendor_entries = vendor.map(|s| &s.entries).filter(|e| !e.is_empty());
-    if vendor_entries.is_none() && hosted_pins.is_empty() {
-        return manifest.map(Cow::Borrowed);
-    }
-    let uuid_only = |uuid: &str| PatchRecord {
-        uuid: uuid.to_string(),
-        exported_at: String::new(),
-        files: HashMap::new(),
-        vulnerabilities: HashMap::new(),
-        description: String::new(),
-        license: String::new(),
-        tier: String::new(),
-    };
-    let mut merged = manifest.cloned().unwrap_or_default();
-    for (purl, uuid) in hosted_pins {
-        merged
-            .patches
-            .entry(purl.clone())
-            .or_insert_with(|| uuid_only(uuid));
-    }
-    for (purl, entry) in vendor_entries.into_iter().flatten() {
-        merged.patches.entry(purl.clone()).or_insert_with(|| {
-            entry
-                .record
-                .clone()
-                .unwrap_or_else(|| uuid_only(&entry.uuid))
-        });
-    }
-    Some(Cow::Owned(merged))
-}
+pub(super) use socket_patch_core::ledgers::merge_ledger_records_for_updates;
+
 
 /// Cross-reference an existing manifest against discovery results to find
 /// PURLs whose newest available patch UUID differs from the locally-recorded
@@ -593,6 +515,7 @@ pub(super) fn severity_order(s: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
     use socket_patch_core::api::types::BatchPatchInfo;
 
     use crate::commands::scan::tests::manifest_with;

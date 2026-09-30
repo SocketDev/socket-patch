@@ -6,93 +6,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use socket_patch_core::constants::npm_family::{
-    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, VLT_HIDDEN_LOCK_REL, VLT_LOCK, VLT_STORE_DIR,
-};
+use socket_patch_core::constants::npm_family::{VLT_HIDDEN_LOCK_REL, VLT_LOCK};
+use socket_patch_core::hosted::vlt::{self as hosted_vlt, Preflight};
 use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::patch::redirect::vlt_heal::{
     self, classify_target, read_install_state, Expected, LedgerTarget, Target, TargetState,
 };
-use socket_patch_core::patch::redirect::vlt_preflight::{self, OFFLINE_REASON};
-use socket_patch_core::patch::redirect::{redact_grant_token, vlt, DepOverride};
+use socket_patch_core::patch::redirect::vlt_preflight;
+use socket_patch_core::patch::redirect::{vlt, DepOverride};
+use socket_patch_core::vendor::lock_inventory::ProjectView;
 
 use super::StaleInstallOutcome;
 
 pub(super) const REINSTALL_REQUIRED: &str = "redirect_vlt_reinstall_required";
-const ARTIFACT_UNVERIFIABLE: &str = "redirect_vlt_artifact_unverifiable";
-
-/// Whether vlt's install state exists: the hidden lock as a regular file,
-/// or the store as a real directory. Stat only; the hidden lock can be
-/// megabytes and is never read into the rewriter's input.
-pub(super) fn install_state_present(cwd: &Path) -> bool {
-    let is = |rel: &str, dir: bool| {
-        std::fs::symlink_metadata(cwd.join(rel)).is_ok_and(|m| {
-            if dir {
-                m.file_type().is_dir()
-            } else {
-                m.file_type().is_file()
-            }
-        })
-    };
-    is(VLT_HIDDEN_LOCK_REL, false) || is(VLT_STORE_DIR, true)
-}
-
-/// What the artifact preflight decided for this run's npm candidates.
-#[derive(Debug, Default)]
-pub(crate) struct Preflight {
-    /// Failed while vlt drives, or for a vlt-vendored takeover: withheld
-    /// from every rewriter.
-    pub(crate) withheld_everywhere: BTreeMap<String, String>,
-    /// Failed while another npm-family lock may drive: kept out of the vlt
-    /// rewrite only.
-    pub(crate) withheld_from_vlt: BTreeSet<String>,
-    pub(crate) passed: BTreeSet<String>,
-    /// Artifact bytes by URL, for the heal's no-record comparison.
-    pub(crate) artifacts: BTreeMap<String, Vec<u8>>,
-    pub(crate) warnings: Vec<serde_json::Value>,
-}
-
-/// The files `vlt_drives` and the preflight scope read: `vlt-lock.json`
-/// itself, and presence-only entries for the sibling locks and vlt's
-/// install state. Empty without a readable `vlt-lock.json`.
-async fn vlt_inputs(cwd: &Path) -> BTreeMap<String, String> {
-    let mut files = BTreeMap::new();
-    let Ok(lock) = socket_patch_core::utils::fs::read_regular_to_string(&cwd.join(VLT_LOCK)).await
-    else {
-        return files;
-    };
-    files.insert(VLT_LOCK.to_string(), lock);
-    for sibling in [NPM_LOCKS[0], NPM_LOCKS[1], "yarn.lock", PNPM_LOCK, BUN_LOCK] {
-        if std::fs::metadata(cwd.join(sibling)).is_ok_and(|m| m.is_file()) {
-            files.insert(sibling.to_string(), String::new());
-        }
-    }
-    if install_state_present(cwd) {
-        files.insert(VLT_HIDDEN_LOCK_REL.to_string(), String::new());
-    }
-    files
-}
-
-fn unverifiable_detail(
-    url: &str,
-    reason: &str,
-    purl: &str,
-    already_pinned: bool,
-    everywhere: bool,
-) -> String {
-    if already_pinned {
-        format!(
-            "vlt would fail to verify {url}: {reason}; {purl} was left pinned by an earlier run \
-             and `vlt ci` will fail until the artifact verifies"
-        )
-    } else if everywhere {
-        format!("vlt would fail to verify {url}: {reason}; nothing was written for {purl}")
-    } else {
-        format!(
-            "vlt would fail to verify {url}: {reason}; vlt-lock.json was not changed for {purl}"
-        )
-    }
-}
 
 /// The uuids of `deps` whose purl a vlt vendored ledger entry claims: a
 /// hosted takeover reverts them to a registry node before the rewrite.
@@ -114,113 +40,31 @@ async fn vlt_vendored_uuids(cwd: &Path, deps: &[(&str, &DepOverride)]) -> BTreeS
 
 /// Fetch each in-scope artifact the way vlt does (once per distinct URL,
 /// `offline` making no request) and decide which deps may be pinned in
-/// `vlt-lock.json`. Projects without `vlt-lock.json` make no request. A
-/// vlt-vendored dep is probed through its vendored node, before the
-/// takeover reverts it, and a failure keeps it vendored.
+/// `vlt-lock.json` ([`socket_patch_core::hosted::vlt`]). Projects without
+/// `vlt-lock.json` make no request. A vlt-vendored dep is probed through
+/// its vendored node, before the takeover reverts it, and a failure keeps
+/// it vendored.
 pub(super) async fn artifact_preflight(
     common: &crate::args::GlobalArgs,
     api_client: &socket_patch_core::api::client::ApiClient,
     deps: &[(&str, &DepOverride)],
 ) -> Preflight {
-    let files = vlt_inputs(&common.cwd).await;
+    let view = ProjectView::Disk(&common.cwd);
+    let files = hosted_vlt::inputs(&view).await;
     if files.is_empty() {
         return Preflight::default();
     }
-    let overrides: Vec<DepOverride> = deps.iter().map(|(_, dep)| (*dep).clone()).collect();
     let vendored = vlt_vendored_uuids(&common.cwd, deps).await;
-    let scope = vlt_preflight::preflight_scope(&files, &overrides, &vendored);
-    if scope.is_empty() {
+    let Some(plan) = hosted_vlt::plan(&view, &files, deps, &vendored) else {
         return Preflight::default();
-    }
-    let drives = vlt::vlt_drives(&files, common.cwd.join(BUN_LOCKB).exists());
-    let urls: BTreeSet<String> = scope.iter().map(|d| d.artifact_url.clone()).collect();
+    };
     let probes = if common.offline {
         BTreeMap::new()
     } else {
-        vlt_preflight::probe_artifacts(api_client, &urls).await
+        vlt_preflight::probe_artifacts(api_client, &plan.urls()).await
     };
-    judge_preflight(&scope, deps, drives, probes)
+    hosted_vlt::judge(&plan, deps, probes)
 }
-
-/// [`artifact_preflight`] for a host with no network (the in-memory hosted
-/// engine): every in-scope artifact is judged as `--offline` judges it, so
-/// the dep is withheld (`redirect_vlt_artifact_unverifiable`, "offline")
-/// rather than pinned in a lock vlt may not be able to install. `files`
-/// are the [`vlt_inputs`] entries built from the host's file set.
-pub(crate) fn offline_preflight(
-    files: &BTreeMap<String, String>,
-    deps: &[(&str, &DepOverride)],
-    bun_lockb_present: bool,
-) -> Preflight {
-    if files.is_empty() {
-        return Preflight::default();
-    }
-    let overrides: Vec<DepOverride> = deps.iter().map(|(_, dep)| (*dep).clone()).collect();
-    let scope = vlt_preflight::preflight_scope(files, &overrides, &BTreeSet::new());
-    if scope.is_empty() {
-        return Preflight::default();
-    }
-    let drives = vlt::vlt_drives(files, bun_lockb_present);
-    judge_preflight(&scope, deps, drives, BTreeMap::new())
-}
-
-/// The preflight's verdicts for `scope` given the `probes` fetched for it
-/// (none for a URL that was not fetched: judged offline).
-fn judge_preflight(
-    scope: &[vlt_preflight::PreflightDep],
-    deps: &[(&str, &DepOverride)],
-    drives: bool,
-    probes: BTreeMap<String, vlt_preflight::ArtifactProbe>,
-) -> Preflight {
-    let mut out = Preflight::default();
-    let mut passed_urls: BTreeSet<&str> = BTreeSet::new();
-    for dep in scope {
-        let reason = match probes.get(&dep.artifact_url) {
-            None => Some(OFFLINE_REASON.to_string()),
-            Some(probe) => probe.failure(&dep.sha512),
-        };
-        let Some(reason) = reason else {
-            out.passed.insert(dep.patch_uuid.clone());
-            passed_urls.insert(&dep.artifact_url);
-            continue;
-        };
-        let purl = deps
-            .iter()
-            .find(|(_, d)| d.patch_uuid == dep.patch_uuid)
-            .map_or("", |(purl, _)| *purl);
-        let everywhere = drives || dep.vendored;
-        let detail = unverifiable_detail(
-            &dep.artifact_url,
-            &reason,
-            purl,
-            dep.already_pinned,
-            everywhere,
-        );
-        out.warnings.push(serde_json::json!({
-            "code": ARTIFACT_UNVERIFIABLE,
-            "detail": redact_grant_token(&detail, &dep.artifact_url, &dep.patch_uuid),
-        }));
-        if everywhere {
-            out.withheld_everywhere
-                .insert(dep.patch_uuid.clone(), purl.to_string());
-        } else {
-            out.withheld_from_vlt.insert(dep.patch_uuid.clone());
-        }
-    }
-    // Moved, not copied: every dep has been judged, and the probes are not
-    // read again, so a verified body is held once.
-    for (url, probe) in probes {
-        if passed_urls.contains(url.as_str()) {
-            if let Some(body) = probe.body {
-                out.artifacts.insert(url, body);
-            }
-        }
-    }
-    out
-}
-
-/// The skip `reason` of a dep the preflight withheld from every rewriter.
-pub(crate) const WITHHELD_REASON: &str = ARTIFACT_UNVERIFIABLE;
 
 fn patch_server_origins(common: &crate::args::GlobalArgs) -> Vec<String> {
     common
@@ -325,7 +169,7 @@ fn with_optional_kept(mut detail: String, optional_left: usize, held: &str) -> S
 }
 
 const VLT_UPDATE_NOTE: &str =
-    " Note: `vlt update` re-resolves from the registry and drops these redirects.";
+    " Note: `vlt update` re-resolves from the registry and drops these hosted patches.";
 
 fn reinstall_detail(tally: &HealTally) -> String {
     let held = "unpatched copies of optional dependencies";
@@ -735,7 +579,6 @@ mod tests {
             token: String::new(),
             patch_uuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
             artifact_url: url.to_string(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: socket_patch_core::patch::redirect::Integrity {
                 sha512: Some("sha512-new".into()),
@@ -771,7 +614,7 @@ mod tests {
             Some("pkg:npm/left-pad@1.3.0")
         );
         assert_eq!(
-            pre.warnings[0]["detail"],
+            pre.warnings[0].detail,
             format!(
                 "vlt would fail to verify {url}: offline; nothing was written for \
                  pkg:npm/left-pad@1.3.0"
@@ -852,7 +695,7 @@ mod tests {
         assert!(claimed.withheld_from_vlt.is_empty());
         assert!(claimed.withheld_everywhere.contains_key(&dep.patch_uuid));
         assert_eq!(
-            claimed.warnings[0]["detail"],
+            claimed.warnings[0].detail,
             format!("vlt would fail to verify {url}: http 404; nothing was written for pkg:npm/left-pad@1.3.0")
         );
     }

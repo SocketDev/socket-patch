@@ -351,7 +351,6 @@ mod tests {
                 sha256: Some(HASH.into()),
                 ..Default::default()
             },
-            berry_zip_url: None,
             registry_override: None,
         }
     }

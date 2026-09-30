@@ -23,12 +23,12 @@ does not list as lagging — the cases authored Rust-first here lag until
 `bun.ts` is ported, see [depscan TS parity](#depscan-ts-parity); refusal
 fixtures pin their warning code through `expected-warnings.json`) and by
 hermetic CLI suites that
-need no Bun binary (`tests/in_process_vendor_bun.rs`,
+need no Bun binary (`tests/vendor/in_process_vendor_bun.rs`,
 `tests/in_process_vendor_bun_takeover.rs`, the bun cases of
 `tests/in_process_redirect.rs`, `tests/covgap_commands_scan_hosted.rs`,
 `tests/covgap_commands_scan_mod.rs`, `tests/covgap_commands_rollback.rs`,
-`tests/scan_vendor_e2e.rs`, `tests/get_modes_e2e.rs`,
-`tests/repair_vendor_flavors_e2e.rs`). The
+`tests/scan_vendor_e2e.rs`, `tests/get/get_modes_e2e.rs`,
+`tests/repair/repair_vendor_flavors_e2e.rs`). The
 [machine contract](../../crates/socket-patch-cli/CLI_CONTRACT.md) is the
 authority on envelopes and codes; this page is the measured matrix behind it.
 See the [ecosystem matrix](../ecosystems.md#mode--ecosystem-matrix) for the
@@ -478,14 +478,14 @@ table above.
 | Text lock 0 / 1 / 2 rewritten and installed, both modes | 1.1.39–1.4.2 | `e2e_redirect_bun_build` + `e2e_vendor_bun_build` on 1.4.2 (3 OS), 1.1.45 and 1.2.23 (Linux); the fixture asserts the lock version matches the era table, the v1-on-1.4 leg proves a committed v1 lock keeps installing | goldens `lock-v0`, `basic` (v1), `lock-v2`; `bun_lock.rs`, `lock_inventory/bun.rs` |
 | Native binary formats 1 / 2 / 3: inventory, hosted, vendored, repair, takeovers, rollback | `direct`, `legacy-lockb`, conversion shapes; dedicated `backtest-bun-lockb.py` | `e2e_bun_lockb` across writer / reader revisions | `bun_lockb.rs` and committed real binary fixtures; native CLI tests |
 | Version-0 workspace hosted refusal + remedy | `text-workspace` (1.1.39–1.1.45) | — | golden `lock-v0-workspace-refusal` (+ `expected-warnings.json`), `redirect/mod.rs` unit tests |
-| Pre-v2 workspace vendored refusal (policy) + remedy; version 2 supported incl. nested | v1: 1.2.0–1.3.14 `workspace*`; v0: `text-workspace`; v2: 1.4.x | `e2e_vendor_bun_build` scoped leg (deps + bin meta survive) | `bun_lock.rs` (`legacy_workspace_tarballs_refuse_before_writes`, in-sync / rebuild exemptions), `in_process_vendor_bun`, `repair_vendor_flavors_e2e` over {0, 1, 2} × workspace shapes |
+| Pre-v2 workspace vendored refusal (policy) + remedy; version 2 supported incl. nested | v1: 1.2.0–1.3.14 `workspace*`; v0: `text-workspace`; v2: 1.4.x | `e2e_vendor_bun_build` scoped leg (deps + bin meta survive) | `bun_lock.rs` (`legacy_workspace_tarballs_refuse_before_writes`, in-sync / rebuild exemptions), `vendor::in_process_vendor_bun`, `repair::repair_vendor_flavors_e2e` over {0, 1, 2} × workspace shapes |
 | Digest boundary 1.3.10 (registry tuples 1.2.0) | 1.3.9 vs 1.3.10 cells, `registryDigestEnforced` | tampered twins in both suites, pinned from both sides | — |
-| Digest-less re-saves below 1.3.10 recognised, healed and unwound (both modes, takeovers, scoped unwinds, `repair`) | `already-vendored-workspace` on 1.2.0–1.3.9 (`digestDroppedOnResave`; `resaveKeepsDigest` from 1.3.10) | `bun_redirect_survives_a_digest_dropping_lock_resave`, `bun_vendor_survives_a_digest_dropping_lock_resave` (real `file:`-dep re-save; the era's spelling asserted from both sides) | goldens `digestless-hosted-already-wired`, `digestless-hosted-stale-url-repin`; `bun_lock_text.rs` (`same_wiring_modulo_integrity`), `redirect/mod.rs`, `replay.rs`, `takeover.rs`, `bun_lock.rs` unit tests; `in_process_redirect`, `in_process_vendor_bun`, `in_process_vendor_bun_takeover` |
+| Digest-less re-saves below 1.3.10 recognised, healed and unwound (both modes, takeovers, scoped unwinds, `repair`) | `already-vendored-workspace` on 1.2.0–1.3.9 (`digestDroppedOnResave`; `resaveKeepsDigest` from 1.3.10) | `bun_redirect_survives_a_digest_dropping_lock_resave`, `bun_vendor_survives_a_digest_dropping_lock_resave` (real `file:`-dep re-save; the era's spelling asserted from both sides) | goldens `digestless-hosted-already-wired`, `digestless-hosted-stale-url-repin`; `bun_lock_text.rs` (`same_wiring_modulo_integrity`), `redirect/mod.rs`, `replay.rs`, `takeover.rs`, `bun_lock.rs` unit tests; `in_process_redirect`, `vendor::in_process_vendor_bun`, `in_process_vendor_bun_takeover` |
 | Mode conversion both directions; scoped `rollback` / `remove` | `hosted-then-vendored`, `vendored-then-hosted` | `mode_migration_bun` (1.4.2 × 3 OS, 1.3.14) | `in_process_vendor_bun_takeover`, `takeover.rs`, `covgap_commands_rollback` |
 | CRLF lockfiles preserved (hosted line, vendored, rollback) | `crlf-lock` | — | golden `lock-v2-crlf`, `bun_lock.rs` |
 | Bun 0.8.1 / 1.0.0 peer / transitive upstream limitation | recorded per cell; no selected target is installed, exit 0 and lock unchanged | — | — |
 | Manifest-less VEX: attested `(redirected)` / `(vendored)` from the lock with no `.socket/manifest.json` (ledgers kept, then deleted too), `--offline` → `record_unavailable`, reverted lock → not attested (also `--no-verify`), embedded `apply --vex` / `vendor --vex` | every supported cell after its installs (`vex*` checks; public patch API) | `vex_e2e_common/bun.rs` step at the end of every `e2e_redirect_bun_build` / `e2e_vendor_bun_build` / `mode_migration_bun` / `e2e_bun_lockb` flow (fresh checkout + real frozen install, wiremock API with a zero-request oracle offline); tampered install / artifact → `hash_mismatch` / `vendor_hash_mismatch`; stale takeover manifest → the wired uuid wins; production `bun_*_install_proof` legs | `e2e_vex_lockfile::bun` (text v0/1/2 + `bun.lockb` × both modes: spoofed hosts, record mismatch, pristine / tampered / alias installs, stale lockb); `in_process_vendor_bun*` lockfile-only twins |
-| Pre-download preflight envelopes, `--silent`, `--dry-run` `would_refuse`, manifest-free footprint | `get-uuid` / `get-search` / `workspace-get-uuid` / `workspace-get-search` refusals (exit codes, `downloaded == 0`) | — | `in_process_vendor_bun` (exact uuid-path envelope), `scan_vendor_e2e`, `get_modes_e2e`, `vendor_flow.rs` |
+| Pre-download preflight envelopes, `--silent`, `--dry-run` `would_refuse`, manifest-free footprint | `get-uuid` / `get-search` / `workspace-get-uuid` / `workspace-get-search` refusals (exit codes, `downloaded == 0`) | — | `vendor::in_process_vendor_bun` (exact uuid-path envelope), `scan_vendor_e2e`, `get::get_modes_e2e`, `vendor_flow.rs` |
 
 Not measured: a `--cwd <workspace member>` run (the member holds no
 `bun.lock`, so the preflight passes and the engine refuses

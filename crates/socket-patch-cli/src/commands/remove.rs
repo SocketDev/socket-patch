@@ -23,18 +23,16 @@ use crate::commands::lock_cli::acquire_or_emit;
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
 use crate::ui::plural;
 
-/// Vendor-ledger entries matching a remove identifier (by ledger key,
-/// base purl or uuid — `VendorEntry::matches_identifier`), sorted by key
-/// for deterministic event order.
+/// Vendor-ledger entries matching a remove identifier
+/// ([`socket_patch_core::ledgers::Ledgers::matching`]), sorted by key for
+/// deterministic event order.
 fn vendor_entries_matching(state: &VendorState, identifier: &str) -> Vec<(String, VendorEntry)> {
-    let mut matches: Vec<(String, VendorEntry)> = state
-        .entries
-        .iter()
-        .filter(|(key, entry)| entry.matches_identifier(key, identifier))
-        .map(|(k, e)| (k.clone(), e.clone()))
-        .collect();
-    matches.sort_by(|a, b| a.0.cmp(&b.0));
-    matches
+    socket_patch_core::ledgers::Ledgers {
+        vendor: Some(state),
+        ..Default::default()
+    }
+    .matching(identifier)
+    .vendor
 }
 
 /// The lockfiles' hosted pins matching a remove identifier (by purl or
@@ -96,7 +94,7 @@ async fn emit_not_found(
     }
 }
 
-/// Print the hosted leg's run-level advisories (`Warning (<code>): …`) on
+/// Print the hosted leg's run-level advisories (`Warning: …`) on
 /// stderr — never under `--silent` / `--json` (JSON carries them in the
 /// envelope's `warnings[]`). Printed as soon as the leg returns, so a
 /// human run that then fails still says what it did to the files.
@@ -104,8 +102,8 @@ fn print_hosted_leg_warnings(common: &GlobalArgs, warnings: &[(String, String)])
     if common.silent || common.json {
         return;
     }
-    for (code, detail) in warnings {
-        eprintln!("Warning ({code}): {detail}");
+    for (_, detail) in warnings {
+        eprintln!("Warning: {detail}");
     }
 }
 
@@ -183,7 +181,7 @@ fn remove_prompt(
     if hosted > 0 {
         clauses.push(format!(
             "unwind {}",
-            plural(hosted, "hosted redirect", "hosted redirects")
+            plural(hosted, "hosted patch", "hosted patches")
         ));
     }
     let question = super::rollback::as_question(&super::rollback::join_clauses(&clauses));
@@ -543,7 +541,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         );
         if !crate::ui::confirm(&prompt, true, &args.common) {
             if loud {
-                println!("Removal cancelled.");
+                println!("{}", crate::ui::CANCELLED);
             }
             return 0;
         }
@@ -816,7 +814,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // the blob sweep below can still preview against the post-removal
     // reference set. `--preserve-state` deliberately touches neither the
     // manifest nor the blobs. An emptied manifest stays on disk as
-    // `{"patches": {}}` — it carries the setup block and the
+    // `{"patches": {}}` — it carries any legacy setup block and the
     // empty-vs-missing exit codes of `list`/`apply`/`repair`.
     let mut updated_manifest = manifest.clone();
     let removed = if args.preserve_state {
@@ -962,8 +960,9 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 );
             }
         }
-        // Diff/package archives use the same manifest-uuid keep rule
-        // (parity with repair and scan --prune).
+        // Diff archives use the same manifest-uuid keep rule; legacy
+        // package archives are swept whole (parity with repair and scan
+        // --prune).
         for (dir, result) in [("diffs", sweep.diffs), ("packages", sweep.packages)] {
             if let Some(detail) = sweep_failure(dir, &result) {
                 if loud {
@@ -1168,7 +1167,7 @@ async fn revert_vendored_matches(
     {
         for w in &warnings {
             if loud {
-                eprintln!("Warning ({}): {}", w.code, w.detail);
+                eprintln!("Warning: {}", w.detail);
             }
             leg.skipped.push(
                 PatchEvent::new(PatchAction::Skipped, key.clone())
@@ -1360,9 +1359,9 @@ async fn remove_hosted_only(
         eprintln!(
             "The following {} {} unwound and removed:",
             if hosted_matches.len() == 1 {
-                "hosted redirect"
+                "hosted patch"
             } else {
-                "hosted redirects"
+                "hosted patches"
             },
             if args.common.dry_run {
                 "would be"
@@ -1378,7 +1377,7 @@ async fn remove_hosted_only(
     // `--dry-run` previews without mutating — nothing to confirm.
     let prompt = format!(
         "Remove {} and unwind {} lockfile wiring?",
-        plural(hosted_matches.len(), "hosted redirect", "hosted redirects"),
+        plural(hosted_matches.len(), "hosted patch", "hosted patches"),
         if hosted_matches.len() == 1 {
             "its"
         } else {
@@ -1387,7 +1386,7 @@ async fn remove_hosted_only(
     );
     if !args.common.dry_run && !crate::ui::confirm(&prompt, true, &args.common) {
         if loud {
-            println!("Removal cancelled.");
+            println!("{}", crate::ui::CANCELLED);
         }
         return 0;
     }
@@ -1504,7 +1503,7 @@ async fn remove_ledger_only(
     };
     if !args.common.dry_run && !crate::ui::confirm(&prompt, true, &args.common) {
         if loud {
-            println!("Removal cancelled.");
+            println!("{}", crate::ui::CANCELLED);
         }
         return 0;
     }
@@ -1785,12 +1784,12 @@ mod tests {
         );
         assert_eq!(
             remove_prompt(1, false, false, 0, 1),
-            "Remove 1 patch, roll back its files, and unwind 1 hosted redirect?"
+            "Remove 1 patch, roll back its files, and unwind 1 hosted patch?"
         );
         assert_eq!(
             remove_prompt(1, false, false, 2, 1),
             "Remove 1 patch, roll back its files, revert 2 vendored artifacts, and unwind 1 \
-             hosted redirect?"
+             hosted patch?"
         );
         assert_eq!(
             remove_prompt(1, true, false, 1, 0),

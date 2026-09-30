@@ -80,6 +80,7 @@ fn global(cwd: &Path, api_url: String) -> GlobalArgs {
 
 fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: global(cwd, api_url),
@@ -88,9 +89,7 @@ fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: true,
-        mode: None,
+        mode: Some(socket_patch_cli::commands::scan::ScanMode::Hosted),
         all_releases: false,
         vex: VexEmbedArgs {
             vex: vex.map(Path::to_path_buf),
@@ -100,6 +99,7 @@ fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
             vex_product: vex.map(|_| "pkg:pypi/pipenv-fixture@0.1.0".to_string()),
             ..Default::default()
         },
+        rollout: Default::default(),
     }
 }
 
@@ -315,7 +315,6 @@ async fn roll_back(cwd: &Path, server: &MockServer) {
     let code = rollback::run(RollbackArgs {
         targets: Vec::new(),
         common: global(cwd, server.uri()),
-        one_off: false,
         preserve_state: false,
     })
     .await;

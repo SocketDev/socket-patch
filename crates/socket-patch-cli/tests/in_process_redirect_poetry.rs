@@ -104,7 +104,6 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
             patch_server_url: Some("http://patch.test".to_string()),
             ..global(cwd, server.uri())
         },
-        one_off: false,
         preserve_state: false,
     })
     .await;
@@ -121,6 +120,7 @@ fn assert_no_ledger(root: &Path) {
 
 fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: global(cwd, api_url),
@@ -129,14 +129,13 @@ fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: true,
-        mode: None,
+        mode: Some(socket_patch_cli::commands::scan::ScanMode::Hosted),
         all_releases: false,
         vex: VexEmbedArgs {
             vex: vex.map(Path::to_path_buf),
             ..Default::default()
         },
+        rollout: Default::default(),
     }
 }
 
@@ -479,7 +478,10 @@ async fn stale_python_install_warns_and_cannot_attest_even_on_rescan() {
         let out = scan_output(tmp.path(), &server, &[]).await;
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{stderr}");
-        assert!(stderr.contains("record_fetch_failed"), "{stderr}");
+        assert!(
+            stderr.contains("was switched to hosted, but its patch record could not be fetched"),
+            "{stderr}"
+        );
         assert_eq!(
             std::fs::read(installed).unwrap(),
             bytes,

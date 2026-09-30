@@ -193,6 +193,20 @@ const GEM_PATCHES: &[(&str, &str)] = &[
         "c1a1cd3c-b670-4e44-b4fa-1a63ecd42db6",
         "lib/active_storage/transformers/image_processing_transformer.rb",
     ),
+    // GHSA-xr9x-r78c-5hrm / CVE-2026-66066, published 2026-08-21T19:07Z
+    // (also adds lib/active_storage/vips.rb).
+    (
+        "9c2b4925-b413-4a3a-bb3a-9990440fb446",
+        "lib/active_storage/transformers/image_processing_transformer.rb",
+    ),
+    // MERGED patch (GHSA-w749-p3v6-hccq + GHSA-r4mg-4433-c7g3 +
+    // GHSA-xr9x-r78c-5hrm), published 2026-09-04T21:23Z; the merge rung in
+    // `api::ranking` selects it. Also touches engine.rb, active_storage.rb and
+    // adds vips.rb — every file carries the marker.
+    (
+        "01019627-b481-4bae-bc09-e93b5a5e4481",
+        "lib/active_storage/transformers/image_processing_transformer.rb",
+    ),
 ];
 
 /// Header the patch service injects into patched npm / PyPI source files.
@@ -1245,14 +1259,13 @@ fn yarn_classic_vendored_install_proof() {
             ("apply --vex", yarn_classic_vex::via_apply()),
             ("vendor --vex", yarn_classic_vex::via_vendor()),
             // The command the leg itself ran, re-run manifest-less
-            // (`--detached`: no manifest writes — the shape under test).
+            // (vendored mode writes no manifest — the shape under test).
             (
-                "scan --mode vendored --detached --vex",
+                "scan --mode vendored --vex",
                 Box::new(|run: vex_e2e_common::VexRun| {
                     run.via(vex_e2e_common::VexVia::Scan)
                         .arg("--mode")
                         .arg("vendored")
-                        .arg("--detached")
                         .arg("--yes")
                 }),
             ),

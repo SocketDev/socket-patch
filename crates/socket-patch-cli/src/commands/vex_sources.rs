@@ -79,7 +79,7 @@ use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::redirect::RedirectState;
 use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
-use socket_patch_core::vendor::state::{lookup_entry_kv, VendorArtifact, VendorEntry, VendorState};
+use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry, VendorState};
 use socket_patch_core::vex::discover::{
     canonical_base_purl, vendor_ref, Discovery, LedgerLiveness, PatchedRef, WiringMode,
 };
@@ -141,8 +141,8 @@ impl Sources {
 
 /// The resolved attestation inputs.
 pub(crate) struct Plan {
-    /// purl → record for every candidate that passed the gates (with the
-    /// manifest file's `setup` block, which property 7 reads).
+    /// purl → record for every candidate that passed the gates (carrying
+    /// the manifest file's legacy `setup` block through unchanged).
     pub view: PatchManifest,
     /// Vendored-basis entries, keyed by view purl — the verification
     /// routing for `applied_patches_with_vendor`.
@@ -281,7 +281,7 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
 
     let mut notes = Vec::new();
     let mut gated: Vec<FailedPatch> = Vec::new();
-    let mut cands = build_candidates(&manifest, &vendor, &redirect_records);
+    let mut cands = build_candidates(&manifest, &vendor, redirect.as_ref());
     let conflicts = wiring_conflicts(&discovery);
     if !conflicts.is_empty() {
         // Gate every candidate for a conflicting package BEFORE anything can
@@ -364,7 +364,7 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
                         &cand.key,
                         &[
                             (&entry.uuid, WiringMode::Vendored, "vendor ledger"),
-                            (&hosted.uuid, WiringMode::Hosted, "redirect ledger"),
+                            (&hosted.uuid, WiringMode::Hosted, "hosted ledger"),
                         ],
                     ));
                     gated.push(failed(&cand.key, VENDOR_UNWIRED));
@@ -400,7 +400,7 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
                 notes.extend(dead_claim_notes(
                     &discovery,
                     &cand.key,
-                    &[(&cand.uuid, WiringMode::Hosted, "redirect ledger")],
+                    &[(&cand.uuid, WiringMode::Hosted, "hosted ledger")],
                 ));
                 gated.push(failed(&cand.key, REDIRECT_UNWIRED));
                 continue;
@@ -550,76 +550,35 @@ fn expected_package(cand: &Cand) -> String {
     }
 }
 
-/// One candidate per manifest key, then per unclaimed vendor-ledger key,
-/// then per unclaimed redirect-ledger key — the collision rule
-/// (the manifest owns a key it records; ledgers fill the rest), in sorted
-/// order so the output is deterministic.
+/// One candidate per owner key under the shared owner rule
+/// ([`socket_patch_core::ledgers::Ledgers::owned`]): the manifest keys, then
+/// the unclaimed vendor-ledger keys, then the redirect-ledger keys neither
+/// owns, each sorted, with the losing copies' records as `alts`.
 fn build_candidates(
     manifest: &PatchManifest,
     vendor: &VendorState,
-    redirect_records: &BTreeMap<String, PatchRecord>,
+    redirect: Option<&RedirectState>,
 ) -> Vec<Cand> {
-    let mut cands = Vec::new();
-    let mut claimed_entries: HashSet<&str> = HashSet::new();
-    let mut manifest_keys: Vec<&String> = manifest.patches.keys().collect();
-    manifest_keys.sort();
-    for key in manifest_keys {
-        let record = &manifest.patches[key];
-        let entry = lookup_entry_kv(&vendor.entries, key);
-        let mut alts = Vec::new();
-        if let Some((entry_key, e)) = entry {
-            claimed_entries.insert(entry_key.as_str());
-            alts.extend(e.record.clone());
-        }
-        alts.extend(redirect_records.get(key).cloned());
-        cands.push(Cand {
-            key: key.clone(),
-            uuid: record.uuid.clone(),
-            record: Some(record.clone()),
-            alts,
-            manifest_owned: true,
-            redirected: redirect_records.contains_key(key),
-            vendor_entry: entry.map(|(_, e)| e.clone()),
-            discovered: Vec::new(),
-            lockfile_only: false,
-        });
+    use socket_patch_core::ledgers::{Ledgers, Store};
+    Ledgers {
+        manifest: Some(manifest),
+        vendor: Some(vendor),
+        redirect,
     }
-    let mut vendor_keys: Vec<&String> = vendor.entries.keys().collect();
-    vendor_keys.sort();
-    for key in vendor_keys {
-        if claimed_entries.contains(key.as_str()) || manifest.patches.contains_key(key) {
-            continue;
-        }
-        let entry = &vendor.entries[key];
-        cands.push(Cand {
-            key: key.clone(),
-            uuid: entry.uuid.clone(),
-            record: entry.record.clone(),
-            alts: redirect_records.get(key).cloned().into_iter().collect(),
-            manifest_owned: false,
-            redirected: redirect_records.contains_key(key),
-            vendor_entry: Some(entry.clone()),
-            discovered: Vec::new(),
-            lockfile_only: false,
-        });
-    }
-    for (purl, record) in redirect_records {
-        if cands.iter().any(|c| c.key == *purl) {
-            continue;
-        }
-        cands.push(Cand {
-            key: purl.clone(),
-            uuid: record.uuid.clone(),
-            record: Some(record.clone()),
-            alts: Vec::new(),
-            manifest_owned: false,
-            redirected: true,
-            vendor_entry: None,
-            discovered: Vec::new(),
-            lockfile_only: false,
-        });
-    }
-    cands
+    .owned()
+    .into_iter()
+    .map(|o| Cand {
+        key: o.key.to_string(),
+        uuid: o.uuid.to_string(),
+        record: o.record.cloned(),
+        alts: o.alts.into_iter().cloned().collect(),
+        manifest_owned: o.store == Store::Manifest,
+        redirected: o.hosted,
+        vendor_entry: o.vendor.map(|(_, e)| e.clone()),
+        discovered: Vec::new(),
+        lockfile_only: false,
+    })
+    .collect()
 }
 
 /// Packages the discovered references wire to MORE than one patch uuid
@@ -1497,7 +1456,7 @@ mod tests {
         );
         assert!(
             dead.notes.iter().any(|n| n.detail.contains("Cargo.lock")
-                && n.detail.contains("redirect ledger")
+                && n.detail.contains("hosted ledger")
                 && n.detail.contains(U2)),
             "{:?}",
             dead.notes

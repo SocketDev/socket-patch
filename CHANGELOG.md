@@ -25,9 +25,9 @@ into the new version's section — see docs/releasing.md.
 > `.socket/vendor/` for offline installs (it ejects a hosted project: no
 > manifest needed); `socket-patch list` shows them. Hosted mode keeps no
 > ledger — the lockfile edits are the whole change, and `rollback` restores
-> each hosted package to its upstream registry entry.
-> `get`, `apply`, `setup`, `rollback`, `remove` and `repair` (the agent-mode
-> commands) keep working and are listed after these.
+> each hosted package to its upstream registry entry. `get`, `remove` and
+> `rollback` work in every mode; `apply` and `repair` are the agent-mode
+> commands; `setup` is removed.
 
 > **Semver note:** this entry changes `rollback`'s default behavior, narrows
 > the meaning of its existing `vendored: []` JSON key, makes vendored mode
@@ -43,9 +43,103 @@ into the new version's section — see docs/releasing.md.
 > `ledgerKey`; `vendor_supersedes_redirect` and `hosted_revert_unsupported`
 > are gone), and
 > retries a throttled patch API (new error text, added waiting, a throttled
-> package failing its legacy-proxy batch) — all
+> package failing its legacy-proxy batch), and removes the `setup`
+> subcommand — all
 > MAJOR per CLI_CONTRACT.md's semver policy — so it ships as the next major
 > release (v5.0).
+
+### Removed (BREAKING)
+
+- **`setup` is removed, with every install hook it wired.** `socket-patch
+  setup` (and `--check` / `--remove` / `--exclude`, `SOCKET_SETUP_EXCLUDE`)
+  is now an unknown subcommand: a clap usage error, exit 2. The hooks it
+  wrote were npm `postinstall` / `dependencies` scripts, the
+  `socket-patch[hook]` Python dependency (a `.pth` startup hook), a Bundler
+  plugin under `.socket/bundler-plugin/` plus a managed `plugin
+  "socket-patch"` Gemfile block, and Composer `post-install-cmd` /
+  `post-update-cmd` entries. Hooks already committed keep working, since
+  they only call `socket-patch apply`, which stays; delete them by hand to
+  stop them. The README's "Upgrading from `setup`" section lists each hook
+  and the commands to move to hosted mode or keep agent mode. Agent mode is now `socket-patch scan --mode agent` once
+  (commit `.socket/`), then `socket-patch apply` in CI after every install.
+  Hosted and vendored mode never needed a hook.
+- **The `socket-patch-hook` PyPI wheel and the `socket-patch-bundler` gem
+  are no longer built or published**, and the `socket-patch[hook]` extra is
+  gone from the `socket-patch` wheel (pip warns about the unknown extra and
+  installs the CLI). Their sources stay in the tree, frozen, for reference.
+- **`vex` no longer drops agent-mode patches whose ecosystem has no
+  install hook** ("Property 7"). A manifest patch that verifies as applied
+  (or any manifest patch under `--no-verify`) is now attested whatever the
+  ecosystem. The `ecosystem_not_setup` `skipped` code, its stderr note and
+  its `no_applicable_patches` message are retired. A manifest's `setup`
+  object (`manual`, `exclude`) still parses and is kept on rewrite, but
+  nothing reads it.
+- **The `patch_setup` telemetry event** is gone with the command.
+- **Core crate:** the `setup` and `package_json` modules and the
+  `gem_setup` / `composer_setup` / `pth_hook` aliases are removed from
+  `socket-patch-core`, along with the setup-only `npm_family` table column
+  (`FileRow::detects_pnpm`) and `VLT_SETUP_MARKERS`.
+- **v3/v4 compatibility spellings are gone.**
+  - The v3.0 legacy env names `SOCKET_PATCH_PROXY_URL`, `SOCKET_PATCH_DEBUG`
+    and `SOCKET_PATCH_TELEMETRY_DISABLED` are no longer read and no longer
+    print a deprecation warning. Use `SOCKET_PROXY_URL`, `SOCKET_DEBUG` and
+    `SOCKET_TELEMETRY_DISABLED`.
+  - The hidden `scan --redirect` flag (use `--mode hosted`) and the hidden
+    no-op `scan --detached` flag (vendored mode is always manifest-free) are
+    removed. Both are now unknown-flag usage errors (exit 2).
+  - The hidden `--mode` values `host`, `redirect` and `vendor` on `scan` and
+    `get` are rejected; only `hosted`, `vendored` and `agent` are accepted.
+    The hidden `scan --apply` and `scan --vendor` spellings stay.
+- **`get --one-off` and `rollback --one-off`** (and `SOCKET_ONE_OFF`) are
+  removed. They were never implemented and only failed with a usage error;
+  `--one-off` is now an unknown-flag error (still exit 2) and
+  `SOCKET_ONE_OFF` is ignored.
+- **`.socket/packages/` package archives are no longer read.** Nothing has
+  written them for several releases. `apply`, `vendor` and `repair` stop
+  probing and staging the directory, and `apply`'s JSON `appliedVia` loses
+  its `"package"` value (`"diff"` or `"blob"` remain). The GC sweeps
+  (`scan --prune`, `rollback`, `remove`, `repair`) delete any leftover
+  `.socket/packages/` files whole (`rollback` and `scan --prune` still
+  report them as `removedPackageArchives`).
+- **Core crate:** removed uncalled public helpers
+  (`bun_lock::snapshot_binary_workspace_artifacts`, `vlt_lock_sniff_ok`,
+  and several `lock_inventory::view` accessors) and the never-read
+  `DepOverride::berry_zip_url` field (a `berryZipUrl` key in a patch
+  reference still parses).
+
+### Changed (BREAKING): patch UI streamlining
+
+- **`list` on an empty project exits 0.** A project with no manifest and
+  no ledger record (normal for hosted mode) used to exit 1 with
+  `manifest_not_found`; it now prints `No patches in this project. Run
+  \`socket-patch scan\`.` (human) or the success envelope with
+  `events: []` (`--json`). Only an unreadable or invalid manifest fails.
+- **Help is grouped by task**: patch (`scan`, `get`, `list`), undo
+  (`remove`, `rollback`), ship (`vex`, `vendor`), and agent mode
+  (`apply`, `repair`). `-h` keeps `--cwd`, `--ecosystems` and
+  `--offline`; `scan --prune` moves to `--help`.
+- **Hosted and vendored `get` never prompt.** Like `scan`, they take the
+  top-ranked accessible patch per package with no picker and no
+  confirmation, in `--json` too (no `selection_required` outside agent
+  mode). Agent-mode `get` keeps its picker and `Download and apply N
+  patches?` prompt.
+- **`get` usage errors exit 2** (were 1): `get`'s
+  `--id`/`--cve`/`--ghsa`/`--package` multi-select,
+  `--mode hosted|vendored --save-only` and a malformed forced identifier.
+  Every usage error now exits 2.
+- **Human output:** warning lines no longer carry the `(code)` tag
+  (`Warning: …`, `GC: skipped: …`); the codes stay in the JSON envelope.
+  Error lines keep theirs (`Error (<code>): …`). Hosted mode is called "hosted", not "redirect", in human
+  text (`Switched 2 packages to hosted patches; rewrote 1 file.`). npm's
+  `allow-remote` notice is one line (full text under `--verbose` and in
+  `--json`). Hosted and vendored runs share one numbered `Next steps:`
+  block. Every declined prompt prints `Cancelled; no changes made.`, and
+  scan/get share one paid-plan upsell line.
+- **`-h` is short**: about eight options per command (`--json`,
+  `--dry-run`, `--cwd`, `--ecosystems`, `--offline`, `--yes` where the
+  command prompts, and the command's main flags); `--help` still lists everything. The deprecated
+  `scan --apply` / `--vendor` spellings are hidden from both (still
+  accepted).
 
 ### Changed (BREAKING)
 
@@ -435,9 +529,8 @@ into the new version's section — see docs/releasing.md.
   selected patch records are fetched into memory and every vendor-ledger entry
   carries `detached: true` plus the embedded `record` as its verification
   source, so a vendored project's footprint is `.socket/vendor/**` only. The
-  former `--detached` opt-in is now the only vendored posture — the flag is
-  hidden, accepted as a no-op for compatibility, and still a usage error
-  without vendored mode. JSON uses the detached download vocabulary for both
+  former `--detached` opt-in is now the only vendored posture, and the flag
+  itself is removed (see "Removed"). JSON uses the detached download vocabulary for both
   commands (`downloaded: N`, `detached: true`, `patches[].action` =
   `downloaded` | `skipped` | `failed`). The vendor step vendors exactly what
   discovery selected — the "whole manifest is vendored" re-vendor from a
@@ -500,8 +593,7 @@ into the new version's section — see docs/releasing.md.
   vanished-file retries into a spurious `lock_io`. Agent-mode `get`
   and `scan --apply`/`--sync` hold one lock window across download →
   manifest write → nested apply (the nested apply no longer re-acquires and
-  now inherits `--lock-timeout`/`--verbose`); `setup` takes the lock while
-  persisting `--exclude`; `scan --prune` acquires once for its vendored
+  now inherits `--lock-timeout`/`--verbose`); `scan --prune` acquires once for its vendored
   reconcile and manifest prune, and the GC legs of `scan --prune` and
   `vendor` honor `--lock-timeout` and report a lock I/O error instead of
   silently skipping on it.
@@ -560,7 +652,76 @@ into the new version's section — see docs/releasing.md.
   batch is reported as failed (warning, or the all-failed error when it was
   the only batch) — instead of that one package being skipped silently.
 
+- **scan honors the repo's socket.yml.** `projectIgnorePaths` (the
+  scanner's key) now also keeps `scan` from patching the matching projects,
+  in every mode and in the in-memory engine, whether or not the file has a
+  `patches` block (malformed values there only warn
+  `socket_yml_ignored_value`). See "socket.yml patch policy" in
+  CLI_CONTRACT.md.
+- **Test and fixture trees are skipped by default when scan discovers
+  projects.** `test/ tests/ fixtures/ __fixtures__/ testdata/` (any case)
+  are built-in `ignorePaths` for discovered roots: hosted/vendored
+  PATH-glob matches (`scan 'services/*'`) and the in-memory engine's
+  detected roots (which used to skip them through a hard-coded, case-
+  sensitive segment list). A directory you name (`--cwd`, a literal PATH,
+  `projectRoots`) is not affected; `ignorePaths: ["!/e2e/tests/"]`
+  re-includes one, in memory too.
+- **An invalid socket.yml fails scan.** An unparseable file, a misspelled
+  top-level `patches` key (`Patches`, `patchs`), a top-level merge or
+  aliased key, an invalid `patches` block (unknown key, wrong type, bad glob, `patches`
+  without `version: 2`), or `socket.yml` and `socket.yaml` that disagree
+  now fail `scan` before any request or write: exit 1, `errorCode:
+  socket_yml_invalid` / `socket_yml_ambiguous`, the key path and the fix
+  in the message. `--no-socket-yml` ignores the file for one run.
+- **scan rejects a PATH outside the repository root** (exit 2): one socket.yml
+  policy per invocation.
+
 ### Added
+
+- **`scan --max-new-patches <N|none>` rolls patches out gradually**
+  (env `SOCKET_MAX_NEW_PATCHES`; socket.yml `patches.maxNewPatches`).
+  Each run adds at most N patches to packages that had none, most severe first
+  (then by how many advisories a patch fixes), and defers the rest to the
+  next run; upgrades of packages that are already patched are never
+  capped, and `0` means upgrades only. Repeated scans on an unchanged repo
+  add the same packages in the same order and stop once everything is
+  patched. A patch that cannot land (not granted, refused by a preflight,
+  nothing in the lockfile to pin) never holds a slot, and a failed lookup
+  admits nothing new that run (`rollout_incomplete_lookup`). The project
+  directories of one scan share the budget. Works in hosted, vendored and
+  agent mode, `--dry-run` included; `scan --json` gains a top-level
+  `rollout` block (`maxNewPatches`, `counts`, ranked `deferred[]`) and
+  hosted mode lists deferred rows in `redirect.skipped[]` as
+  `rollout_deferred`.
+- **The in-memory hosted engine paces rollouts too.** It (napi,
+  `hosted-bundle`) takes
+  `maxNewPatches`, `maxNewPatchesCap` and `inFlightPatches`, spends one
+  budget across every project root, and reports a session `rollout` block
+  and `ProjectResult.deferred[]`.
+- **socket.yml patch policy (staged rollout).** A `patches` block in the
+  repo-root socket.yml narrows what `scan` patches: `enabled` (false =
+  report only), `includePaths` / `ignorePaths` (gitignore patterns matched
+  against each project's lockfiles, npm `ignore` semantics),
+  `ecosystems`, `packages` / `ignorePackages` (`--package` specs),
+  `minSeverity` (critical|high|medium|moderate|low, judged by the worst
+  advisory a patch fixes) and `maxNewPatches` (the per-run cap of
+  `--max-new-patches`). List flags (`--ecosystems`,
+  `--package`, PATHs) only narrow further; `--min-severity` beats the
+  file's floor and `--no-socket-yml` ignores the file. A package
+  that already carries a patch is never removed, upgraded or replaced by
+  the policy: it is held and reported under `policy.retained[]`. New flags
+  `--min-severity` / `SOCKET_MIN_SEVERITY` and `--no-socket-yml` /
+  `SOCKET_NO_SOCKET_YML`; every successful `scan --json` result gains a
+  top-level `policy` block (`source`, `sha256`, `minSeverity`, `filtered[]`,
+  `retained[]`) and the human output a `Policy (socket.yml): …` line that
+  names every skipped project and every critical/high patch the severity
+  floor held back. In memory, selection is two-phase:
+  `selectHostedScanPaths` takes the root policy files' text
+  (`policyFiles`) and `noSocketYml`, applies the full path policy and
+  returns `policyPaths`, `policySha256` and `policyError`; the session
+  takes `noSocketYml` / `minSeverity` / `policyPaths` / `policySha256` and
+  its result carries `policy` or `policyError`.
+  `get` ignores the policy and warns `policy_bypassed`.
 
 - **`scan --package <name|purl>`** (repeatable or comma-separated, env
   `SOCKET_SCAN_PACKAGES`) scopes a scan to the named packages: a name
@@ -709,22 +870,6 @@ into the new version's section — see docs/releasing.md.
   verified without its vendor ledger checks a devDependencies-stripped
   `package.json` against the patched blob in `.socket/blobs`, and is
   omitted as `vendor_manifest_unverifiable` when that blob is absent.
-  `setup.manual` accepts `vlt`.
-- **`setup` wires vlt projects.** A `vlt-lock.json`, `vlt.json`,
-  `node_modules/.vlt-lock.json` or `node_modules/.vlt/` directory in the
-  project root makes `setup` treat it as vlt, ahead of any pnpm marker. The
-  hook is npm's `npx @socketsecurity/socket-patch apply --silent --ecosystems
-  npm`, and a vlt workspace (vlt.json `workspaces`, or vlt <= 0.0.0-12's
-  `vlt-workspaces.json`) is wired at the root only, because vlt runs the
-  root hook once per install. The `setup --json` `packageManager` and the
-  `patch_setup` telemetry `manager` report `vlt`. vlt before 1.0.0-rc.13
-  never runs a root `postinstall`: `setup` still wires the project and
-  warns `vlt_root_scripts_not_run` — definitely when the `vlt` on `PATH`
-  reports such a version, and as a "may" when `vlt-lock.json` has
-  `lockfileVersion` 0 or none and no usable `vlt` is found, or the one
-  found would not write that lock (a v0 lock beside vlt 1.0.0-rc.15 or
-  later). `setup --remove` also clears the hooks earlier releases wrote
-  into vlt workspace members.
 - **vlt support is proven against real vlt releases.** Every supported vlt
   release (0.0.0-1 … 1.2.0, see `docs/testing/vlt-compatibility.md` for the
   excluded ones) ran the five real-vlt capstones locally; CI now runs 35 of
@@ -896,7 +1041,7 @@ into the new version's section — see docs/releasing.md.
   command now also writes `record` into `.socket/vendor/state.json` (never
   `detached` — the manifest record stays authoritative while the manifest
   covers the package), so a project it wired whose manifest is gone still
-  verifies, lists and attests offline: `vex`, `list` and `setup --check` read
+  verifies, lists and attests offline: `vex` and `list` read
   the embedded copy whenever no manifest entry covers the package, and
   `repair` recovers the record without the API when there is no manifest at
   all. Entries written by older releases keep working.
@@ -1133,8 +1278,10 @@ into the new version's section — see docs/releasing.md.
     a server-side archive build and count against quota, are exactly the
     one-at-a-time loop's (71 on a fresh depscan run, where an earlier
     draft of the look-ahead issued 74). What changes is only their timing:
-    up to four are in flight at once. `SOCKET_API_CONCURRENCY=1` turns the
-    look-ahead off entirely.
+    they are requested in one batch at the first planned package (see
+    "Fewer downloads in vendored runs"), and up to four archives are in
+    flight at once. `SOCKET_API_CONCURRENCY=1` turns the look-ahead off
+    entirely.
   - A token revoked *mid-run* now costs the authenticated batch endpoint
     the requests already in flight — up to the in-flight cap instead of
     one — before the run downgrades to the public proxy. Their answers are
@@ -1144,6 +1291,21 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **`apply` no longer half-applies a patch that creates a file from a
+  diff-only cache.** A diff archive has no delta for a file the patch
+  creates, but the source check counted a cached diff archive as covering
+  the whole patch: `apply --offline` passed it, patched the modified files,
+  then failed on the created file's missing blob; online `apply` never
+  fetched that blob. Coverage is now per file (a diff covers only files
+  with a `beforeHash`), so `apply --offline` reports the patch as having no
+  local source up front and changes nothing, online `apply` fetches just
+  the created files' blobs, and a default (diff-mode) `repair` downloads
+  them too. Such a repair's `--json` envelope carries a second
+  `downloaded` (dry-run `verified`) artifact event with `mode: "file"` for
+  those blobs.
+- **Hosted `scan` resolves more than 500 patches.** The package-reference
+  request is sent in chunks of 500 uuids, the endpoint's limit; a larger
+  scan used to fail with a 400.
 - **`rollback` fetches a before-blob that only a store peer variant
   needs.** The before-blob gate now probes every pnpm and vlt store variant
   copy the rollback restores, so an online rollback no longer fails
@@ -1310,13 +1472,6 @@ into the new version's section — see docs/releasing.md.
   `vendor_yarn_berry_mixed_line_endings`). Both takeovers now run the new
   mode's berry gates first — wet and `--dry-run` alike — and a refused purl
   keeps the old mode's wiring byte-identical.
-- **`setup` keeps a CRLF `package.json` CRLF.** `setup` and `setup --remove`
-  re-serialized `package.json` with bare LF and dropped a leading BOM, so on
-  a Windows yarn berry project (yarn pretty-prints the manifest with CRLF) a
-  two-key script edit became a whole-file diff that yarn then kept, and
-  `setup --remove` could not land byte-identical on the pre-setup file.
-  `package.json` is now written in its own layout (BOM, indent, line ending,
-  trailing-newline shape), the same helper the vendored backends use.
 - **Two vendored versions of one cargo crate are documented — and now
   warned about — as needing cargo 1.45.** The docs said older cargo (1.41)
   only needed a populated crates.io index. It needs more than that: cargo
@@ -1383,7 +1538,7 @@ into the new version's section — see docs/releasing.md.
   Progress, prompts, color and truncation now share one implementation.
   - **Progress lines:** a status line clears itself on finish. It is never
     drawn off a TTY, under `TERM=dumb`, in debug mode, or under
-    `--json`/`--silent`. `fetch`, `vendor`, `setup`, lock waits and
+    `--json`/`--silent`. `fetch`, `vendor`, lock waits and
     `--update` checks now show progress instead of going quiet.
   - **Prompts:** Ctrl-D at a `[Y/n]` prompt now declines instead of
     accepting. Keys pressed while a command is working no longer answer
@@ -1409,10 +1564,7 @@ into the new version's section — see docs/releasing.md.
   stores are removed, and `.socket/` itself goes with the lock when nothing is
   left — so a fully unwound hosted or vendored project has no `.socket/` at
   all. Deliberately kept: the zero-patch `.socket/manifest.json`
-  (`{"patches": {}}` + its `setup` block — `list`/`apply`/`vex` exit codes
-  depend on it) and the `setup`-owned `.socket/.gitignore`,
-  `gem-plugin-stamp` and `bundler-plugin/` (rollback never undoes setup).
-  `setup --remove` now also removes an emptied `.socket/`.
+  (`{"patches": {}}` — `list`/`apply`/`vex` exit codes depend on it).
 - **`scan --prune` says what it skipped and what it could not finish.** The
   `gc` JSON sub-object gains `failedVendoredEntries` plus the additive
   `skipped: {code, message}` (`lock_held` | `lock_io`) and
@@ -1456,19 +1608,10 @@ into the new version's section — see docs/releasing.md.
   `(not installed)` line prints only when something was not installed.
   `rollback` prints `No patches found in manifest` only for an unscoped run
   with no work in any leg.
-- **`setup --exclude` persists after the prompt, under the lock.** The
-  exclusion list is written after discovery and confirmation (also on the
-  already-configured path when the flag is explicit) as a read-modify-write
-  under `apply.lock`; a held or unopenable lock, or a manifest that cannot
-  be read or written, is reported as `not persisting --exclude: …` instead
-  of being swallowed. `setup --check` reads the vendor ledger even without
-  a manifest and, on a corrupt one, warns `unreadable vendor state` and
-  reports a `vendor_ledger` error entry (verdict `error`, exit 1) — never
-  `configured`; `vex` refuses the same unreadable ledger outright
-  (`vendor_ledger_corrupt`, see Changed); `list`
-  degrades a corrupt vendor ledger to a `Warning: unreadable vendor ledger …`
-  line (muted by `--silent`) rather than an error; `patch_setup` telemetry
-  fires only for a successful, non-dry-run setup.
+- **A corrupt vendor ledger is reported, never swallowed.** `vex` refuses
+  it outright (`vendor_ledger_corrupt`, see Changed); `list` degrades it to
+  a `Warning: unreadable vendor ledger …` line (muted by `--silent`) rather
+  than an error.
 - **`repair`/`vendor` state hygiene.** `repair` resolves installed copies
   through qualified ledger keys (gem `?platform=`, pypi `?artifact_id=`,
   maven `?classifier=` no longer read as "not installed"), puts a crashed
@@ -1509,8 +1652,8 @@ into the new version's section — see docs/releasing.md.
 - **`apply --silent` on an all-unmatched manifest prints its error line** —
   errors are never muted by `--silent`; and the no-manifest early exits of
   `apply` and `vendor` name the missing `.socket/manifest.json` instead of
-  "No .socket folder found" (the folder may legitimately hold setup files or
-  vendored state).
+  "No .socket folder found" (the folder may legitimately hold vendored
+  state).
 - **Hosted redirect hygiene.** Missing project files no longer skip silently:
   `redirect_composer_no_lockfile`, `redirect_gem_no_gemfile` (neither manifest
   nor lock present) and `redirect_maven_no_pom` (no `pom.xml`, no Gradle
@@ -1538,7 +1681,7 @@ into the new version's section — see docs/releasing.md.
   symlinked targets (`pypi_{poetry,pipenv,requirements}_symlink_unsupported`)
   and every pypi flavor refuses a project file that changed between plan and
   write (`pypi_{poetry,pdm,pipenv,uv}_changed`) instead of clobbering it;
-  `pyproject.toml` edits made by `setup` preserve CRLF line endings; an
+  an
   unreadable (EACCES / squatting directory or FIFO) redirect ledger is
   reported as unreadable and left in place instead of being quarantined as
   "malformed"; a blob-cleanup pass keeps sweeping after one unremovable file
@@ -1786,6 +1929,37 @@ into the new version's section — see docs/releasing.md.
 
 ### Changed
 
+- **`scan` keeps a patch you already have unless the new one supersedes
+  it.** A package whose recorded patch (agent manifest, hosted lockfile
+  pin or vendor ledger) still ranks level with the top offer on every
+  meaningful rung (merged state, severity, a later publish date) keeps
+  its recorded patch instead of switching on the tier or uuid tiebreak,
+  so re-running `scan` never swaps patches. `updates[]` and the
+  `[UPDATE]` marker now use the per-package records the selection itself
+  uses, so they list exactly the upgrades the run applies; a JSON
+  report-only run still reads the batch records.
+- **Fewer downloads in vendored runs.** A vendored run now asks the patch
+  service for all of its planned packages' download references in one
+  request (in chunks of 500) from the first package it reaches, in place
+  of one request per package; an outage costs the same retries as before,
+  and a package the service reports still building is asked again at its
+  turn. A pypi patch the service serves as an sdist (every patch without a
+  file qualifier) is refused from its reference, before its bytes are
+  downloaded: `auto` still warns `vendor_prebuilt_unavailable` and builds
+  the wheel locally, `service` still refuses.
+- **One owner rule for the patch stores.** `list`, `vex`, `scan`'s
+  `updates[]`, `rollback` and `remove` now read the
+  manifest and the vendor ledger (plus, in `vex`, the hosted records)
+  through one view (`socket_patch_core::ledgers`) with one precedence:
+  manifest, then vendor ledger, then hosted records, by ledger key; a
+  manifest key claims every vendor entry filed under it or naming it as
+  base purl. Visible differences: `scan`'s `updates[]` no longer folds a
+  vendor entry the manifest claims by base purl; `vex` treats every vendor
+  entry a manifest key claims as a fallback copy of that key's record (a
+  second variant of the same base purl used to become its own candidate).
+  `get`'s installed-version narrowing now uses
+  `scan`'s lockfile and vendored-ledger discovery, so a corrupt vendor
+  ledger falls back to the committed artifacts there too.
 - **The npm crawl skips tagged cache directories.** The walk that finds
   workspace `node_modules` trees no longer descends into a directory that
   carries a [Cache Directory Tagging](https://bford.info/cachedir/)
@@ -1883,22 +2057,25 @@ into the new version's section — see docs/releasing.md.
   covers the purl (its entry records the record's patch uuid and the
   committed artifact is on disk — a file artifact such as a wheel or
   tarball only while it still hashes to the ledger's `sha256`; `--force`
-  keeps the eager fetch), and for every lockfile-only cargo crate the
-  registry could fetch and verify (a crates.io `Cargo.lock` entry with a
-  checksum, or the pre-vendor resolution the ledger recovers) while the
-  patch service is enabled (the cargo backend reads the pristine source
-  only once `cargo_service_copy` falls back to the local build). A git,
-  path or custom-registry crate is never deferred: it keeps the eager
-  ladder's `vendor_fetch_unverifiable` + `package_not_installed` refusal
-  and is not vendored from the service's crates.io build, and a committed
+  keeps the eager fetch), and for every lockfile-only npm, cargo, golang
+  or composer package the registry would fetch and verify (a lock entry
+  with an integrity, or the pre-vendor resolution the ledger recovers,
+  that none of its fetcher's pre-download refusals applies to) while the
+  patch service is enabled (those backends read the pristine source only
+  once the service falls back to the local build; pypi and gem keep the
+  eager fetch, which their installed-variant probe reads). A git, path,
+  local-tarball or custom-registry package is never deferred: it keeps the
+  eager ladder's `vendor_fetch_unverifiable` + `package_not_installed`
+  refusal and is not vendored from the service's registry build, and a committed
   file artifact that no longer matches its pin keeps the eager ladder's
   outcome too. Visible effects: an idempotent re-run
   makes no registry requests and no longer reports `vendor_fetched_missing`
   for fetches it never needed; with no network (or under `--offline`) the
   re-run of an already-vendored pypi, cargo, go or lockfile-only gem
   project now SUCCEEDS (`already_vendored`, exit 0) instead of failing
-  `vendor_fetch_failed` / `package_not_installed`; a cargo crate the service
-  serves is never downloaded from the registry. When a deferred fetch does
+  `vendor_fetch_failed` / `package_not_installed`; an npm, cargo, golang or
+  composer package the service serves is never downloaded from the
+  registry. When a deferred fetch does
   happen (a drifted committed copy being rebuilt locally, a service miss),
   its `vendor_fetched_missing` warning is recorded just ahead of that
   package's own event instead of in the up-front fetch pass, and a failed,
@@ -2694,7 +2871,7 @@ and regression tests were added throughout (the lib + integration suites grow by
 
 ### Tests
 
-- New `tests/telemetry_e2e.rs` end-to-end behavioral coverage:
+- New `tests/cli/telemetry_e2e.rs` end-to-end behavioral coverage:
   apply/scan/get/list emit telemetry against a wiremock recorder;
   `SOCKET_OFFLINE=1` produces zero telemetry POSTs across all four;
   scan falls back on 401 + tags the resulting event; scan does NOT

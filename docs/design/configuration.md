@@ -1,7 +1,8 @@
 # Configuration design: env vars, the socket-cli config file, and what we deliberately don't read
 
 Status: **implemented** (v3.5); section 4 (`socket.yml` patch policy) is
-**planned** for v5.0 (see `staged-rollout.md`). This document records the
+**implemented** in v5.0 for its filters (`socket_patch_core::policy`; the
+per-run cap follows with `--max-new-patches`, see `staged-rollout.md`). This document records the
 settled design so future configuration surface grows inside it instead of
 inventing new mechanisms.
 
@@ -113,6 +114,14 @@ The trust boundary is unchanged and gains its positive half:
   `remove`, `repair`, `apply`, `vendor`) ignore it; `get` bypasses it with
   a warning.
 
+Implementation: `socket_patch_core::policy` (`SelectionPolicy::load` over a
+`PolicyFs`: `DiskPolicyFs` for a checkout, `MemoryPolicyFs` for the
+in-memory engine) parses the file as a YAML 1.2 event stream (serde-saphyr's
+parser, so aliases are never expanded) and validates only `version`,
+`projectIgnorePaths` and `patches`. Disk scan glue lives in
+`commands/scan/policy.rs`; the flags in `commands/scan/socket_yml_args.rs`.
+The full contract is CLI_CONTRACT.md "socket.yml patch policy".
+
 ## Explicitly rejected
 
 | Idea | Why not |
@@ -148,6 +157,13 @@ The trust boundary is unchanged and gains its positive half:
   config-file path exists.
 
 ## Test strategy (how this stays true)
+
+- socket.yml policy: table-driven unit tests in
+  `socket-patch-core/src/policy/` (every validation row, the lookup and
+  file-access rules, and a golden fixture generated from the npm `ignore`
+  package by `scripts/gen-ignore-golden.mjs`), the parser contract in
+  `tests/cli_parse_scan.rs`, disk e2e in `tests/e2e_socket_yml_policy.rs`
+  and disk/memory parity in `tests/hosted_memory_parity.rs`.
 
 - `tests/cli_config_fallback.rs` spawns the binary against fixture
   `config.json` files (fresh process per case — the disk read is cached per

@@ -1,11 +1,8 @@
-//! Real-vlt agent mode and setup (suites `agent` and `setup`, DESIGN §5,
-//! §8.3).
+//! Real-vlt agent mode (suite `agent`, DESIGN §5, §8.3).
 //!
 //! Agent legs patch a REAL vlt tree in place (importer links, the `.vlt`
 //! store, transitive, scoped, alias and peer copies) and pin how long the
-//! patch persists across vlt commands (T23). Setup legs wire the root
-//! `postinstall` hook and run vlt with a leg-private `npx` shim that execs
-//! the socket-patch under test, counting hook invocations (T17/T18/T22).
+//! patch persists across vlt commands (T23).
 //! Each leg is `vlt_pinned_matrix_<suite>_<leg>` and prints one `VLT-LEG`
 //! line.
 
@@ -23,14 +20,9 @@ const DEBUG: (&str, &str) = ("debug", "4.3.4");
 const MS2: (&str, &str) = ("ms", "2.1.2");
 const USX: (&str, &str) = ("use-sync-external-store", "1.2.0");
 const UUID_MS2: &str = "c9c9c9c9-9999-4999-8999-999999999999";
-const HOOK: &str = "npx @socketsecurity/socket-patch apply --silent --ecosystems npm";
 
 fn agent_leg(name: &'static str) -> Option<Leg> {
     Leg::start("agent", name)
-}
-
-fn setup_leg(name: &'static str) -> Option<Leg> {
-    Leg::start("setup", name)
 }
 
 fn cwd(dir: &Path) -> String {
@@ -447,8 +439,8 @@ async fn vlt_pinned_matrix_agent_persistence_reverted_by_reinstall() {
 }
 
 /// `apply` rerun is idempotent, `rollback` rerun is a no-op, and `vex`
-/// (the setup hook wired) attests the agent-patched store copy but not
-/// after a `vlt ci` that ran without the hook.
+/// attests the agent-patched store copy but not after a `vlt ci` restored
+/// the pristine bytes.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_agent_reruns_and_vex() {
@@ -465,8 +457,6 @@ async fn vlt_pinned_matrix_agent_reruns_and_vex() {
         "apply rerun"
     );
     assert_eq!(state(&fx.proj, fx.t()), State::Patched);
-    let out = setup(&fx.proj, &fx, &[]);
-    assert_eq!(out.code, 0, "{out}");
     let vex = |fx: &Fixture| {
         let _ = std::fs::remove_file(fx.proj.join("out.vex.json"));
         let out = offline(
@@ -479,13 +469,9 @@ async fn vlt_pinned_matrix_agent_reruns_and_vex() {
     let (attested, out) = vex(&fx);
     assert!(attested, "{out}");
     if fx.leg.at_least(HAS_CI_FROM) {
-        let out = setup(&fx.proj, &fx, &["--remove"]);
-        assert_eq!(out.code, 0, "{out}");
         fx.vlt_ok(&fx.proj, &["ci"]);
-        let out = setup(&fx.proj, &fx, &[]);
-        assert_eq!(out.code, 0, "{out}");
         let (attested, out) = vex(&fx);
-        assert!(!attested, "pristine after vlt ci without the hook: {out}");
+        assert!(!attested, "pristine after vlt ci: {out}");
         let out = offline(&fx.proj, &["apply"], &[]);
         assert_eq!(out.code, 0, "{out}");
     }
@@ -500,266 +486,6 @@ async fn vlt_pinned_matrix_agent_reruns_and_vex() {
         "rollback rerun"
     );
     assert_eq!(state(&fx.proj, fx.t()), State::Pristine);
-    fx.leg.ran();
-}
-
-// ── setup ─────────────────────────────────────────────────────────────────
-
-fn setup(dir: &Path, fx: &Fixture, extra: &[&str]) -> SocketOut {
-    let bin = fx.leg.shim_dir();
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let mut parts = vec![bin];
-    parts.extend(std::env::split_paths(&path));
-    let joined = std::env::join_paths(parts).unwrap();
-    let c = cwd(dir);
-    let mut args = vec!["setup", "--json", "--yes", "--cwd", &c];
-    args.extend_from_slice(extra);
-    socket(dir, &args, &[("PATH", joined.to_str().unwrap())])
-}
-
-fn with_hook_env(fx: &Fixture) -> VltRun {
-    let mut run = fx.run.clone().with_shims();
-    run.env.push(("SOCKET_NO_CONFIG".into(), "1".into()));
-    run.env.push(("SOCKET_NO_UPDATE_CHECK".into(), "1".into()));
-    run.env
-        .push(("SOCKET_TELEMETRY_DISABLED".into(), "1".into()));
-    run.env.push(("SOCKET_OFFLINE".into(), "1".into()));
-    run
-}
-
-fn hook_count(fx: &Fixture) -> usize {
-    fx.leg
-        .npx_log()
-        .iter()
-        .filter(|l| l.contains("apply"))
-        .count()
-}
-
-/// With the hook wired: every diff-bearing reify (fresh install, `install
-/// <x>`, `ci`) runs it exactly once from rc.13, and the patched bytes land
-/// in `.vlt/<DepID>/node_modules/<name>`; a no-op install runs nothing.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
-async fn vlt_pinned_matrix_setup_hook_fires_per_reify() {
-    let Some(leg) = setup_leg("hook_fires_per_reify") else {
-        return;
-    };
-    if !leg.at_least(ROOT_POSTINSTALL_FROM) {
-        return leg.skip("root-postinstall-not-run");
-    }
-    let mut shape = Shape::with_bystander();
-    shape.pins.push(SCOPED);
-    let fx = Fixture::build(leg, shape).await;
-    stage_manifest(&fx.proj, &[fx.t()]);
-    let out = setup(&fx.proj, &fx, &[]);
-    assert_eq!(out.code, 0, "{out}");
-    let pkg = std::fs::read_to_string(fx.proj.join("package.json")).unwrap();
-    assert!(pkg.contains(HOOK), "{pkg}");
-    let run = with_hook_env(&fx);
-    fx.leg.vlt_ok_with(&fx.proj, &["install"], &run);
-    assert_eq!(hook_count(&fx), 1, "fresh install: {:?}", fx.leg.npx_log());
-    assert_every_copy(&fx.proj, fx.t(), State::Patched);
-    fx.leg.vlt_ok_with(&fx.proj, &["install"], &run);
-    assert_eq!(hook_count(&fx), 1, "a no-op install runs no hook");
-    fx.leg.vlt_ok_with(
-        &fx.proj,
-        &["install", "@isaacs/string-locale-compare@1.1.0"],
-        &run,
-    );
-    assert_eq!(hook_count(&fx), 2, "install <x>");
-    fx.leg.vlt_ok_with(&fx.proj, &["ci"], &run);
-    assert_eq!(hook_count(&fx), 3, "ci");
-    assert_every_copy(&fx.proj, fx.t(), State::Patched);
-    fx.leg.ran();
-}
-
-/// `vlt_root_scripts_not_run`: definite through the `vlt` shim before
-/// rc.13, absent from rc.13.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
-async fn vlt_pinned_matrix_setup_root_scripts_advisory() {
-    let Some(leg) = setup_leg("root_scripts_advisory") else {
-        return;
-    };
-    let fx = Fixture::build(leg, Shape::left_pad()).await;
-    let out = setup(&fx.proj, &fx, &[]);
-    assert_eq!(out.code, 0, "{out}");
-    let warned = out.stdout.contains("vlt_root_scripts_not_run");
-    if fx.leg.at_least(ROOT_POSTINSTALL_FROM) {
-        assert!(!warned, "{out}");
-    } else {
-        assert!(warned, "{out}");
-        assert!(
-            out.stdout
-                .contains(&format!("(`vlt --version` reports {})", fx.leg.tc.raw)),
-            "the definite wording: {out}"
-        );
-    }
-    fx.leg.ran();
-}
-
-/// A workspace gets the hook at the root only, and a member-dir `vlt ci`
-/// runs the root hook once.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
-async fn vlt_pinned_matrix_setup_workspace_root_only() {
-    let Some(leg) = setup_leg("workspace_root_only") else {
-        return;
-    };
-    if !leg.at_least(ROOT_POSTINSTALL_FROM) {
-        return leg.skip("root-postinstall-not-run");
-    }
-    let mut shape = Shape::left_pad();
-    shape.deps = vec![];
-    shape.vlt_json.workspaces = Some(json!("packages/*"));
-    shape.files = vec![("packages/a/package.json".into(), package_json("a", &[LP]))];
-    let fx = Fixture::build(leg, shape).await;
-    stage_manifest(&fx.proj, &[fx.t()]);
-    let member = std::fs::read_to_string(fx.proj.join("packages/a/package.json")).unwrap();
-    let out = setup(&fx.proj, &fx, &[]);
-    assert_eq!(out.code, 0, "{out}");
-    assert!(std::fs::read_to_string(fx.proj.join("package.json"))
-        .unwrap()
-        .contains(HOOK));
-    assert_eq!(
-        std::fs::read_to_string(fx.proj.join("packages/a/package.json")).unwrap(),
-        member,
-        "the member is untouched"
-    );
-    let run = with_hook_env(&fx);
-    fx.leg
-        .vlt_ok_with(&fx.proj.join("packages/a"), &["ci"], &run);
-    assert_eq!(hook_count(&fx), 1, "{:?}", fx.leg.npx_log());
-    assert_eq!(
-        state_at(&importer_dir(&fx.proj, "packages/a", LP.0), fx.t()),
-        State::Patched
-    );
-    fx.leg.ran();
-}
-
-/// `setup` twice adds no duplicate hook.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
-async fn vlt_pinned_matrix_setup_twice_no_duplicate() {
-    let Some(leg) = setup_leg("twice_no_duplicate") else {
-        return;
-    };
-    let fx = Fixture::build(leg, Shape::left_pad()).await;
-    let out = setup(&fx.proj, &fx, &[]);
-    assert_eq!(out.code, 0, "{out}");
-    let once = std::fs::read(fx.proj.join("package.json")).unwrap();
-    let out = setup(&fx.proj, &fx, &[]);
-    assert_eq!(out.code, 0, "{out}");
-    assert_eq!(std::fs::read(fx.proj.join("package.json")).unwrap(), once);
-    let pkg: Value = serde_json::from_slice(&once).unwrap();
-    assert_eq!(pkg["scripts"]["postinstall"], HOOK, "{pkg:#}");
-    fx.leg.ran();
-}
-
-/// With the hook present: a project with no patches installs cleanly;
-/// with the patch API unreachable and the blobs not local, the hook's
-/// `apply --silent` exits with the contract's `sources_download_failed`
-/// code and vlt rolls the install back (a non-zero root script aborts it).
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
-async fn vlt_pinned_matrix_setup_hook_failure() {
-    let Some(leg) = setup_leg("hook_failure") else {
-        return;
-    };
-    if !leg.at_least(ROOT_POSTINSTALL_FROM) {
-        return leg.skip("root-postinstall-not-run");
-    }
-    let fx = Fixture::build(leg, Shape::with_bystander()).await;
-    let out = setup(&fx.proj, &fx, &[]);
-    assert_eq!(out.code, 0, "{out}");
-    let run = with_hook_env(&fx);
-    fx.leg.vlt_ok_with(&fx.proj, &["install"], &run);
-    assert_eq!(hook_count(&fx), 1, "the empty hook ran");
-    stage_manifest(&fx.proj, &[fx.t()]);
-    std::fs::remove_dir_all(fx.proj.join(".socket/blobs")).unwrap();
-    let dead = "http://127.0.0.1:9";
-    let mut cmd = socket_cmd();
-    let c = cwd(&fx.proj);
-    cmd.args([
-        "apply",
-        "--silent",
-        "--json",
-        "--ecosystems",
-        "npm",
-        "--cwd",
-        &c,
-    ])
-    .env("SOCKET_PROXY_URL", dead)
-    .env("SOCKET_API_URL", dead);
-    let direct = cmd.output().unwrap();
-    let text = String::from_utf8_lossy(&direct.stdout).into_owned();
-    assert!(
-        text.contains("sources_download_failed") && text.contains("partialFailure"),
-        "the contract's warning: {text}"
-    );
-    assert_eq!(
-        direct.status.code(),
-        Some(1),
-        "partialFailure exits 1: {}",
-        out_text(&direct)
-    );
-    remove_tree(&fx.proj);
-    let mut run = with_hook_env(&fx);
-    run.env.retain(|(k, _)| k != "SOCKET_OFFLINE");
-    run.env.push(("SOCKET_PROXY_URL".into(), dead.into()));
-    run.env.push(("SOCKET_API_URL".into(), dead.into()));
-    let out = fx.leg.vlt_with(&fx.proj, &["install"], &run);
-    assert_eq!(hook_count(&fx), 2, "the failing hook ran");
-    assert!(
-        !out.status.success(),
-        "the failing hook aborts the install: {}",
-        out_text(&out)
-    );
-    fx.leg.ran();
-}
-
-/// Windows from 1.0.5 (the rollback EBUSY fix): a failing hook's abort
-/// leaves no `.VLT.DELETE.*` staging dir the next crawl could misread.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
-async fn vlt_pinned_matrix_setup_hook_abort_leaves_no_staging() {
-    let Some(leg) = setup_leg("hook_abort_leaves_no_staging") else {
-        return;
-    };
-    if !cfg!(windows) {
-        return leg.skip("windows-only");
-    }
-    if !leg.at_least(REGISTRIES_NPM_REQUIRED_FROM) {
-        return leg.skip("pre-ebusy-fix");
-    }
-    let fx = Fixture::build(leg, Shape::with_bystander()).await;
-    let out = setup(&fx.proj, &fx, &[]);
-    assert_eq!(out.code, 0, "{out}");
-    stage_manifest(&fx.proj, &[fx.t()]);
-    std::fs::remove_dir_all(fx.proj.join(".socket/blobs")).unwrap();
-    let dead = "http://127.0.0.1:9";
-    let mut run = with_hook_env(&fx);
-    run.env.retain(|(k, _)| k != "SOCKET_OFFLINE");
-    run.env.push(("SOCKET_PROXY_URL".into(), dead.into()));
-    run.env.push(("SOCKET_API_URL".into(), dead.into()));
-    let out = fx.leg.vlt_with(&fx.proj, &["install"], &run);
-    assert!(
-        !out.status.success(),
-        "the failing hook aborts: {}",
-        out_text(&out)
-    );
-    let store = fx.proj.join("node_modules/.vlt");
-    let staging: Vec<String> = std::fs::read_dir(&store)
-        .map(|rd| {
-            rd.flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.starts_with(".VLT.DELETE"))
-                .collect()
-        })
-        .unwrap_or_default();
-    assert!(staging.is_empty(), "{staging:?}");
-    let out = socket_api(&fx.proj, &fx.svc, &["scan"], &[]);
-    assert!(!out.stdout.contains(".VLT.DELETE"), "{out}");
     fx.leg.ran();
 }
 

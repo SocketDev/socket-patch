@@ -200,8 +200,8 @@ class CiE2eVltRows(unittest.TestCase):
 
     def test_the_steps_install_vlt_and_check_the_legs(self):
         e2e = "\n".join(self.ci["e2e"])
-        self.assertIn("key: ${{ matrix.suite }}-${{ matrix.vlt || ", e2e,
-                      "vlt releases share a suite, so the release is part of the cache key")
+        self.assertIn("pattern: e2e-bin-${{ matrix.os }}*", e2e,
+                      "the legs run the binaries e2e-build compiled once per OS")
         setup = step(self.ci["e2e"], "Setup vlt")
         self.assertIn("if: matrix.vlt != ''", setup)
         self.assertIn("scripts/install-vlt.sh", setup)
@@ -215,6 +215,8 @@ class CiE2eVltRows(unittest.TestCase):
         self.assertIn("if: matrix.vlt != ''", run)
         self.assertIn("SOCKET_PATCH_VLT_E2E_REQUIRED: ${{ matrix.vlt != '' && '1' || '' }}", run)
         self.assertIn("scripts/check-vlt-legs.py", run)
+        self.assertIn('--binary "$VLT_SUITE"', run,
+                      "a directly run binary prints no cargo `Running` line to name it")
         self.assertIn("vlt-leg-manifest.json", run)
         other = step(self.ci["e2e"], "Run e2e tests")
         self.assertIn("if: matrix.vlt == ''", other)
@@ -304,8 +306,9 @@ class CompatibilityWorkflow(unittest.TestCase):
 
     def test_watchdog(self):
         text = WATCHDOG.read_text(encoding="utf-8")
-        self.assertIn("cron: '23 */6 * * *'", text)
-        self.assertIn("continue-on-error: true", text)
+        # Daily while disarmed; every 6 hours once continue-on-error goes.
+        armed = "continue-on-error: true" not in text
+        self.assertIn("cron: '23 */6 * * *'" if armed else "cron: '23 4 * * *'", text)
         self.assertIn("scripts/backtest-vlt.py --serve-probe", text)
 
 

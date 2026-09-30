@@ -100,21 +100,6 @@ pub struct RollbackArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
 
-    // `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
-    // clap's default bool parser accepts only the literal strings
-    // `true`/`false` from the env binding, so `SOCKET_ONE_OFF=1` (or an
-    // exported-but-empty `SOCKET_ONE_OFF=`) aborted every `rollback`
-    // invocation. This flag is also outside `GLOBAL_ARG_ENV_VARS`, so
-    // `main`'s empty-var scrub never rescues it.
-    /// Roll back a patch by fetching beforeHash blobs from the API (no manifest required).
-    #[arg(
-        long = "one-off",
-        env = "SOCKET_ONE_OFF",
-        default_value_t = false,
-        value_parser = parse_bool_flag,
-    )]
-    pub one_off: bool,
-
     /// Restore the system (files and lockfiles) but PRESERVE the local
     /// patch state for a later re-apply: manifest entries are kept,
     /// vendored artifacts and their ledger entries are kept (only the
@@ -848,7 +833,14 @@ pub(crate) async fn sweep_unused_artifacts(
     ArtifactSweep {
         blobs: cleanup_unused_blobs(reference, &socket_dir.join("blobs"), dry_run).await,
         diffs: cleanup_unused_archives(reference, &socket_dir.join("diffs"), dry_run).await,
-        packages: cleanup_unused_archives(reference, &socket_dir.join("packages"), dry_run).await,
+        // Nothing writes or reads `.socket/packages/` any more; sweep the
+        // leftover directory whole.
+        packages: cleanup_unused_archives(
+            &PatchManifest::default(),
+            &socket_dir.join("packages"),
+            dry_run,
+        )
+        .await,
     }
 }
 
@@ -894,7 +886,7 @@ async fn run_vendored_leg(
     {
         for w in &warnings {
             if loud {
-                eprintln!("Warning ({}): {}", w.code, w.detail);
+                eprintln!("Warning: {}", w.detail);
             }
             out.warnings.push((w.code.to_string(), w.detail.clone()));
         }
@@ -1077,8 +1069,8 @@ pub(crate) async fn retire_legacy_redirect_ledger(common: &GlobalArgs) -> Option
 pub async fn run(args: RollbackArgs) -> i32 {
     apply_env_toggles(&args.common);
 
-    // Classify targets up front: the one-off stub and the glob validation
-    // are pre-network usage checks.
+    // Classify targets up front: the glob validation is a pre-network
+    // usage check.
     let mut identifiers: Vec<String> = Vec::new();
     let mut path_patterns: Vec<String> = Vec::new();
     for token in &args.targets {
@@ -1086,31 +1078,6 @@ pub async fn run(args: RollbackArgs) -> i32 {
             RollbackTarget::Identifier(id) => identifiers.push(id),
             RollbackTarget::PathGlob(p) => path_patterns.push(p),
         }
-    }
-
-    // Bail on the unimplemented flag BEFORE constructing the API client:
-    // client construction can auto-resolve the org slug over the network,
-    // and the contract promises the one-off stub fails before any network
-    // or disk activity.
-    if args.one_off {
-        let msg = if identifiers.is_empty() {
-            "--one-off requires an identifier (UUID or PURL)"
-        } else {
-            "One-off rollback mode is not yet implemented"
-        };
-        if args.common.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "error",
-                    "error": msg,
-                }))
-                .expect("serializing an in-memory JSON value cannot fail")
-            );
-        } else {
-            eprintln!("Error: {msg}");
-        }
-        return 1;
     }
 
     // An unparseable glob is a usage error — same exit-2 stderr shape as
@@ -1185,8 +1152,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     }))
                     .expect("serializing an in-memory JSON value cannot fail")
                 );
-            } else if let Some((code, detail)) = &warning {
-                eprintln!("Warning ({code}): {}", capitalize_first(detail));
+            } else if let Some((_, detail)) = &warning {
+                eprintln!("Warning: {}", capitalize_first(detail));
             } else if !args.common.silent {
                 println!(
                     "{} the pre-v5 hosted ledger {}: no lockfile pins a hosted patch.",
@@ -1309,20 +1276,17 @@ pub async fn run(args: RollbackArgs) -> i32 {
         vendor_scope.extend(vendor_entries.iter().map(|(k, _)| k.clone()));
         hosted_scope.extend(redirect_records.iter().map(|(p, _)| p.clone()));
     }
+    let ledgers = socket_patch_core::ledgers::Ledgers {
+        manifest: Some(&manifest),
+        vendor: vendor_state_result.as_ref().ok(),
+        redirect: None,
+    };
     for id in &identifiers {
-        let mut matched = false;
-        for (purl, patch) in &manifest.patches {
-            if patch_matches(purl, &patch.uuid, id) {
-                manifest_scope.insert(purl.clone());
-                matched = true;
-            }
-        }
-        for (key, entry) in &vendor_entries {
-            if entry.matches_identifier(key, id) {
-                vendor_scope.insert(key.clone());
-                matched = true;
-            }
-        }
+        let found = ledgers.matching(id);
+        let mut matched = !found.is_empty();
+        manifest_scope.extend(found.manifest);
+        vendor_scope.extend(found.vendor.into_iter().map(|(k, _)| k));
+        // Hosted pins live in the lockfiles, not in a store.
         for (purl, uuid) in &redirect_records {
             if patch_matches(purl, uuid, id) {
                 hosted_scope.insert(purl.clone());
@@ -1505,7 +1469,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         let prompt = rollback_prompt(manifest_scope.len(), vendor_scope.len(), hosted_scope.len());
         if !crate::ui::confirm(&prompt, true, &args.common) {
             if !args.common.json && !args.common.silent {
-                println!("Rollback cancelled.");
+                println!("{}", crate::ui::CANCELLED);
             }
             return 0;
         }
@@ -1638,7 +1602,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
             // The manifest is rewritten only when an entry actually leaves
             // it; an emptied manifest stays on disk as `{"patches": {}}`
-            // (it carries the setup block and `list`/`apply`/`repair`'s
+            // (it carries any legacy setup block and `list`/`apply`/`repair`'s
             // empty-vs-missing exit codes) — never deleted.
             let mut removed: Vec<String> = Vec::new();
             let mut updated_manifest = manifest.clone();
@@ -2018,8 +1982,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
             // failures, hosted replay notes, ...): the JSON envelope's
             // `warnings[]`, one stderr line each here.
             if !args.common.json && !args.common.silent {
-                for (code, detail) in &human_warnings {
-                    eprintln!("Warning ({code}): {detail}");
+                for (_, detail) in &human_warnings {
+                    eprintln!("Warning: {detail}");
                 }
             }
 
@@ -4592,13 +4556,13 @@ mod tests {
         assert_eq!(capitalize_first("path pattern x"), "Path pattern x");
         assert_eq!(capitalize_first("Already"), "Already");
         assert_eq!(capitalize_first("ülk"), "Ülk");
-        assert_eq!(capitalize_first("--one-off"), "--one-off");
+        assert_eq!(capitalize_first("--preserve-state"), "--preserve-state");
         assert_eq!(capitalize_first("cannot read x: y"), "Cannot read x: y");
         assert_eq!(capitalize_first("can't, really"), "Can't, really");
         // Values the user may copy back are never altered.
         assert_eq!(
-            capitalize_first("pkg:npm/a@1 matches only hosted redirect records"),
-            "pkg:npm/a@1 matches only hosted redirect records"
+            capitalize_first("pkg:npm/a@1 matches only hosted records"),
+            "pkg:npm/a@1 matches only hosted records"
         );
         assert_eq!(
             capitalize_first("a1b2c3d4-0000-4000-8000-000000000000 matches nothing"),

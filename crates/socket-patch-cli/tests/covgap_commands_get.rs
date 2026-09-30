@@ -103,7 +103,6 @@ fn default_args(identifier: &str, cwd: &Path) -> GetArgs {
         ghsa: false,
         package: false,
         save_only: true,
-        one_off: false,
         all_releases: false,
         mode: Some(socket_patch_cli::commands::scan::ScanMode::Agent),
     }
@@ -488,7 +487,7 @@ async fn get_conflicting_type_flags_rejected_before_any_network() {
     args.cve = true;
 
     let code = run(args).await;
-    assert_eq!(code, 1, "conflicting --id/--cve must exit 1");
+    assert_eq!(code, 2, "conflicting --id/--cve is a usage error (exit 2)");
     assert_no_manifest(tmp.path());
     assert!(
         received_paths(&server).await.is_empty(),
@@ -1751,12 +1750,12 @@ async fn human_uuid_paid_via_proxy_prints_upgrade_message() {
     let tmp = tempfile::tempdir().unwrap();
     let uri = mock.uri();
     // No --api-token / --org: the scrubbed child env falls back to the
-    // public proxy seeded via the legacy env var (get_invariants' recipe).
+    // public proxy seeded via `SOCKET_PROXY_URL` (get_invariants' recipe).
     let (code, stdout, stderr) = common::run_with_env(
         tmp.path(),
         &["get", UUID, "--save-only", "--yes", "--api-url", &uri],
         &[
-            ("SOCKET_PATCH_PROXY_URL", uri.as_str()),
+            ("SOCKET_PROXY_URL", uri.as_str()),
             ("SOCKET_TELEMETRY_DISABLED", "1"),
         ],
     );
@@ -1765,7 +1764,7 @@ async fn human_uuid_paid_via_proxy_prints_upgrade_message() {
         "paid_required is exit 0; stdout={stdout}\nstderr={stderr}"
     );
     assert!(
-        stdout.contains("requires a paid subscription"),
+        stdout.contains("requires a paid Socket plan"),
         "stdout={stdout}"
     );
     assert!(
@@ -1906,7 +1905,7 @@ async fn human_paid_only_search_prints_subscription_message() {
     let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[cve, "--save-only"]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        stdout.contains("All available patches require a paid subscription."),
+        stdout.contains("All available patches require a paid Socket plan."),
         "stdout={stdout}"
     );
     assert!(
@@ -2814,7 +2813,7 @@ async fn nested_apply_block_starts_stdout_without_a_blank_line() {
 }
 
 /// A forced `--id` / `--cve` / `--ghsa` identifier is shape-checked before
-/// any network call: a readable error, exit 1, zero requests.
+/// any network call: a readable error, exit 2 (usage), zero requests.
 #[tokio::test]
 async fn forced_identifier_type_is_validated_locally() {
     let server = MockServer::start().await;
@@ -2825,13 +2824,13 @@ async fn forced_identifier_type_is_validated_locally() {
         ("--ghsa", "is not a valid GHSA ID"),
     ] {
         let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &["lodash", flag]);
-        assert_eq!(code, 1, "{flag}: stdout={stdout}\nstderr={stderr}");
+        assert_eq!(code, 2, "{flag}: stdout={stdout}\nstderr={stderr}");
         assert!(
             stderr.contains(&format!("Error: \"lodash\" {what} (expected ")),
             "{flag}: stderr={stderr}"
         );
         let (code, stdout, _) = run_get_bin(tmp.path(), &server.uri(), &["lodash", flag, "--json"]);
-        assert_eq!(code, 1);
+        assert_eq!(code, 2);
         let v = parse_single_json_doc(&stdout);
         assert_eq!(v["status"], "error", "{v}");
         assert!(v["error"].as_str().unwrap().contains(what), "{v}");
@@ -2862,7 +2861,7 @@ async fn proxy_403_on_uuid_is_paid_required() {
             tmp.path(),
             &args,
             &[
-                ("SOCKET_PATCH_PROXY_URL", uri.as_str()),
+                ("SOCKET_PROXY_URL", uri.as_str()),
                 ("SOCKET_TELEMETRY_DISABLED", "1"),
             ],
         )
@@ -2879,8 +2878,8 @@ async fn proxy_403_on_uuid_is_paid_required() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
         stdout.contains(&format!(
-            "This patch requires a paid subscription to download.\n  Patch: {UUID}\n  \
-             Upgrade at: https://socket.dev/pricing"
+            "This patch requires a paid Socket plan.\n  Patch: {UUID}\n\
+             Upgrade to a paid Socket plan to access all patches: https://socket.dev/pricing"
         )),
         "stdout={stdout}"
     );

@@ -2860,7 +2860,7 @@ async fn scan_vendor_gem_qualified_platform_ruby_purl_vendors() {
     );
 }
 
-/// The QUALIFIED purl through `--detached` + `vendor --revert`: a detached
+/// The QUALIFIED purl through `scan --vendor` + `vendor --revert`: a detached
 /// ledger entry has NO manifest fallback, so the revert must find it via its
 /// own key/`basePurl` alone. The bare-purl detached shape is covered by
 /// [`scan_vendor_gem_detached_writes_no_manifest_and_reverts`]; this pins
@@ -2871,10 +2871,10 @@ async fn scan_vendor_gem_detached_qualified_purl_reverts() {
     mount_gem_patch_api(&mock, GEM_PURL_QUALIFIED).await;
     let fx = gem_fixture();
 
-    let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &["--detached"]);
+    let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
     assert_eq!(
         code, 0,
-        "scan --vendor --detached must succeed on the qualified purl: {env:#}"
+        "scan --vendor must succeed on the qualified purl: {env:#}"
     );
     assert_eq!(env["vendor"]["summary"]["applied"], 1, "envelope: {env:#}");
 
@@ -2911,7 +2911,7 @@ async fn scan_vendor_gem_detached_qualified_purl_reverts() {
     assert!(!fx.root().join(".socket/vendor").exists());
 }
 
-/// `scan --vendor --detached` on the gem project: no manifest is written,
+/// `scan --vendor` on the gem project: no manifest is written,
 /// the ledger entry is detached with the patch record embedded, the pair
 /// edit still lands — and `vendor --revert` (the detached entry's only exit
 /// path) byte-restores both files.
@@ -2921,8 +2921,8 @@ async fn scan_vendor_gem_detached_writes_no_manifest_and_reverts() {
     mount_gem_patch_api(&mock, GEM_PURL).await;
     let fx = gem_fixture();
 
-    let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &["--detached"]);
-    assert_eq!(code, 0, "scan --vendor --detached must succeed: {env:#}");
+    let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "scan --vendor must succeed: {env:#}");
     assert_eq!(env["vendor"]["summary"]["applied"], 1, "envelope: {env:#}");
 
     assert!(
@@ -3246,6 +3246,7 @@ snapshots:
     /// `in_process_redirect_pnpm.rs` shape).
     fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
         ScanArgs {
+            socket_yml: Default::default(),
             paths: Vec::new(),
             packages: Vec::new(),
             common: GlobalArgs {
@@ -3262,11 +3263,10 @@ snapshots:
             prune: false,
             sync: false,
             vendor: false,
-            detached: false,
-            redirect: false,
             mode: Some(ScanMode::Hosted),
             all_releases: false,
             vex: Default::default(),
+            rollout: Default::default(),
         }
     }
 

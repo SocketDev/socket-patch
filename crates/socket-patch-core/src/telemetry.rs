@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::constants::USER_AGENT;
 use crate::utils::env_compat::{
-    is_debug_enabled, is_offline_env, proxy_url_from_env, read_env_with_legacy,
+    is_debug_enabled, is_offline_env, proxy_url_from_env,
 };
 use crate::utils::fs::home_dir;
 use crate::vex::time::unix_to_ymdhms;
@@ -50,7 +50,6 @@ enum PatchTelemetryEventType {
     PatchListed,
     PatchRepaired,
     PatchRepairFailed,
-    PatchSetup,
     // OpenVEX attestation (added in #81)
     VexGenerated,
     VexFailed,
@@ -75,7 +74,6 @@ impl PatchTelemetryEventType {
             Self::PatchListed => "patch_listed",
             Self::PatchRepaired => "patch_repaired",
             Self::PatchRepairFailed => "patch_repair_failed",
-            Self::PatchSetup => "patch_setup",
             Self::VexGenerated => "vex_generated",
             Self::VexFailed => "vex_failed",
         }
@@ -120,7 +118,6 @@ struct PatchTelemetryEvent {
 ///
 /// Telemetry is disabled when:
 /// - `SOCKET_TELEMETRY_DISABLED` is `"1"` or `"true"`
-///   (legacy `SOCKET_PATCH_TELEMETRY_DISABLED` still honored with warning)
 /// - `VITEST` is `"true"`. Load-bearing downstream dependency, not a relic:
 ///   socket-cli's vitest integration suite
 ///   (`packages/cli/test/integration/cli/cmd-patch*.test.mts`) spawns this
@@ -135,11 +132,7 @@ struct PatchTelemetryEvent {
 /// is set the CLI dispatcher sets `SOCKET_TELEMETRY_DISABLED=1` for the
 /// duration of the process so this check stays the single source of truth.
 pub fn is_telemetry_disabled() -> bool {
-    let env_value = read_env_with_legacy(
-        "SOCKET_TELEMETRY_DISABLED",
-        "SOCKET_PATCH_TELEMETRY_DISABLED",
-    )
-    .unwrap_or_default();
+    let env_value = std::env::var("SOCKET_TELEMETRY_DISABLED").unwrap_or_default();
     let disabled_via_env = matches!(env_value.as_str(), "1" | "true");
     let vitest = std::env::var("VITEST").unwrap_or_default() == "true";
     disabled_via_env || vitest || is_offline_env()
@@ -790,7 +783,7 @@ pub async fn track_patch_fetch_failed(
 }
 
 // ---------------------------------------------------------------------------
-// Inspection / housekeeping trackers: list / repair / setup
+// Inspection / housekeeping trackers: list / repair
 // ---------------------------------------------------------------------------
 
 /// Track a successful `list`. Reports the number of patches surfaced.
@@ -844,22 +837,6 @@ pub async fn track_patch_repair_failed(
         "repair",
         serde_json::Value::Null,
         Some(error),
-        api_token,
-        org_slug,
-    )
-    .await;
-}
-
-/// Track a successful `setup`. Reports the detected package manager so
-/// we can tell which install hooks are exercised in the wild: the
-/// `+`-joined in-scope tags, where the npm-family tag is `npm`, `pnpm` or
-/// `vlt` (e.g. `vlt+pypi`), or `none`.
-pub async fn track_patch_setup(manager: &str, api_token: Option<&str>, org_slug: Option<&str>) {
-    fire(
-        PatchTelemetryEventType::PatchSetup,
-        "setup",
-        serde_json::json!({ "manager": manager }),
-        None::<&str>,
         api_token,
         org_slug,
     )
@@ -1057,7 +1034,6 @@ mod tests {
         let saved: Vec<(&str, Option<String>)> = [
             "SOCKET_PROXY_URL",
             "SOCKET_TELEMETRY_DISABLED",
-            "SOCKET_PATCH_TELEMETRY_DISABLED",
             "SOCKET_OFFLINE",
             "VITEST",
         ]
@@ -1108,22 +1084,19 @@ mod tests {
     }
 
     /// Combined into a single test to avoid env-var races across parallel tests.
-    /// Exercises the `SOCKET_TELEMETRY_DISABLED` name, the legacy
-    /// `SOCKET_PATCH_TELEMETRY_DISABLED` shim, and the airgap gate via
-    /// `SOCKET_OFFLINE`. Serialized: SOCKET_* env is process-global and the
+    /// Exercises the `SOCKET_TELEMETRY_DISABLED` name and the airgap gate
+    /// via `SOCKET_OFFLINE`. Serialized: SOCKET_* env is process-global and the
     /// api/client.rs suite reads `SOCKET_OFFLINE` mid-test.
     #[test]
     #[serial_test::serial]
     fn test_is_telemetry_disabled() {
         // Save originals
         let orig_new = std::env::var("SOCKET_TELEMETRY_DISABLED").ok();
-        let orig_legacy = std::env::var("SOCKET_PATCH_TELEMETRY_DISABLED").ok();
         let orig_vitest = std::env::var("VITEST").ok();
         let orig_offline = std::env::var("SOCKET_OFFLINE").ok();
 
         // Default: not disabled
         std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
-        std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
         std::env::remove_var("VITEST");
         std::env::remove_var("SOCKET_OFFLINE");
         assert!(!is_telemetry_disabled());
@@ -1132,13 +1105,6 @@ mod tests {
         std::env::set_var("SOCKET_TELEMETRY_DISABLED", "1");
         assert!(is_telemetry_disabled());
         std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
-
-        // Disabled via legacy var (with deprecation warning)
-        std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", "1");
-        assert!(is_telemetry_disabled());
-        std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", "true");
-        assert!(is_telemetry_disabled());
-        std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
 
         // Disabled via airgap: SOCKET_OFFLINE=1 implies "no network",
         // which includes the telemetry endpoint.
@@ -1163,10 +1129,6 @@ mod tests {
         match orig_new {
             Some(v) => std::env::set_var("SOCKET_TELEMETRY_DISABLED", v),
             None => std::env::remove_var("SOCKET_TELEMETRY_DISABLED"),
-        }
-        match orig_legacy {
-            Some(v) => std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", v),
-            None => std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED"),
         }
         match orig_vitest {
             Some(v) => std::env::set_var("VITEST", v),
@@ -1252,7 +1214,6 @@ mod tests {
             PatchTelemetryEventType::PatchRepairFailed.as_str(),
             "patch_repair_failed"
         );
-        assert_eq!(PatchTelemetryEventType::PatchSetup.as_str(), "patch_setup");
         // OpenVEX
         assert_eq!(
             PatchTelemetryEventType::VexGenerated.as_str(),

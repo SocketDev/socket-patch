@@ -394,7 +394,6 @@ fn day2_machine_builds_patched_module_from_committed_files_alone() {
         token: String::new(),
         patch_uuid: UUID.into(),
         artifact_url: format!("{proxy_url}/{smod}/@v/{SVER}.zip"),
-        berry_zip_url: None,
         registry_override: Some(RegistryOverride {
             kind: "goproxy".into(),
             index_url: proxy_url.clone(),

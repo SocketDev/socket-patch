@@ -2,8 +2,7 @@
 //! patches, fetches their records in memory, and vendors each patched
 //! package into the committable `.socket/vendor/` tree instead of
 //! applying in place. Vendored mode is manifest-free: the ledger's
-//! embedded records are the only state written (`--detached` is an
-//! accepted no-op). Mock API + a real npm lockfile fixture, driven
+//! embedded records are the only state written. Mock API + a real npm lockfile fixture, driven
 //! through the built binary.
 
 use std::path::{Path, PathBuf};
@@ -518,9 +517,8 @@ async fn scan_vendor_migrates_legacy_manifest_mode_project() {
 }
 
 #[tokio::test]
-async fn scan_vendor_detached_mode_writes_no_manifest() {
-    // scan --vendor --detached: the flag is a compatibility no-op — the run
-    // is the same manifest-free flow, embedded-record ledger and all.
+async fn scan_vendor_writes_no_manifest() {
+    // scan --vendor: the manifest-free flow, embedded-record ledger and all.
     let mock = MockServer::start().await;
     mount_patch_api(&mock, UUID).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -529,7 +527,7 @@ async fn scan_vendor_detached_mode_writes_no_manifest() {
     let (code, stdout, stderr) = run_scan_vendor(
         tmp.path(),
         &mock.uri(),
-        &["--detached", "--vex", "out.vex.json"],
+        &["--vex", "out.vex.json"],
     );
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
@@ -587,7 +585,7 @@ async fn scan_vendor_detached_mode_writes_no_manifest() {
     // Idempotent re-run: the ledger's embedded record short-circuits the
     // view fetch entirely (request-log proof) and the backend skips.
     let before_reqs = mock.received_requests().await.unwrap().len();
-    let (code, stdout, _) = run_scan_vendor(tmp.path(), &mock.uri(), &["--detached"]);
+    let (code, stdout, _) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}");
     let v2: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(v2["download"]["skipped"], 1, "envelope={v2}");
@@ -661,14 +659,14 @@ async fn scan_vendor_dry_run_previews_without_touching_disk() {
     );
 }
 
-/// Interactive (non-JSON) `scan --vendor --detached` with a failing patch
+/// Interactive (non-JSON) `scan --vendor` with a failing patch
 /// view fetch must SAY what failed: exit 1 with a `[fail]` line naming the
 /// purl on stderr. Regression guard: `download_patch_records`' failure arms
 /// recorded the error only in their JSON report, so the human path exited
 /// non-zero with no error output at all (the JSON report is discarded and
 /// the vendor engine just says "No vendorable patches in scope").
 #[tokio::test]
-async fn scan_vendor_detached_fetch_failure_reports_error() {
+async fn scan_vendor_fetch_failure_reports_error() {
     let mock = MockServer::start().await;
     // Discovery succeeds (batch + per-package search, same shapes as
     // `mount_patch_api`), but the view fetch fails.
@@ -722,7 +720,6 @@ async fn scan_vendor_detached_fetch_failure_reports_error() {
         .args([
             "scan",
             "--vendor",
-            "--detached",
             "--yes",
             "--api-url",
             &mock.uri(),
@@ -764,11 +761,10 @@ async fn scan_vendor_detached_fetch_failure_reports_error() {
 
 #[tokio::test]
 async fn scan_vendor_flag_conflicts_are_clap_errors() {
-    // --vendor conflicts with --apply/--sync; --detached requires --vendor.
+    // --vendor conflicts with --apply/--sync.
     for argv in [
         &["scan", "--vendor", "--apply"][..],
         &["scan", "--vendor", "--sync"][..],
-        &["scan", "--detached"][..],
     ] {
         let out = Command::new(binary())
             .args(argv)
@@ -782,7 +778,7 @@ async fn scan_vendor_flag_conflicts_are_clap_errors() {
             "argv={argv:?} must be a clap usage error: {stderr}"
         );
         assert!(
-            stderr.contains("cannot be used with") || stderr.contains("required"),
+            stderr.contains("cannot be used with"),
             "argv={argv:?}: {stderr}"
         );
     }
@@ -1222,7 +1218,7 @@ async fn scan_vendor_annotates_mismatched_baseline_and_vendors_anyway() {
         "the annotation names the purl; stdout={stdout}"
     );
     assert!(
-        stderr.contains("vendor_content_mismatch_overwritten"),
+        stderr.contains("vendored the patched content anyway"),
         "overwrite warning surfaced; stderr={stderr}"
     );
     // Vendored despite the mismatch.
@@ -1406,6 +1402,143 @@ async fn vendor_auto_fetches_missing_package_from_lockfile() {
         !tmp.path().join("node_modules").exists(),
         "the project tree is never touched"
     );
+}
+
+/// A lockfile-only npm package the patch service serves prebuilt: the
+/// backend reads the pristine tarball only if the service falls back to a
+/// local build, so the registry download is deferred until then — here,
+/// never — and no `vendor_fetched_missing` is reported for it.
+#[tokio::test]
+async fn vendor_auto_takes_a_missing_package_from_the_service_without_the_registry() {
+    let registry = MockServer::start().await;
+    let tgz = pristine_tgz();
+    let integrity = sri_of(&tgz);
+    mount_registry_tarball(&registry, tgz).await;
+
+    let prebuilt = {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (path, bytes) in [
+            (
+                "package/package.json",
+                br#"{"name":"left-pad","version":"1.3.0"}"#.as_slice(),
+            ),
+            ("package/index.js", AFTER),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, bytes).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    };
+    let api = MockServer::start().await;
+    let serve_path = format!("/patch/npm/left-pad/1.3.0/tok/{UUID}/left-pad-1.3.0.tgz");
+    let serve_url = format!("{}{serve_path}", api.uri());
+    Mock::given(method("POST"))
+        .and(path("/v0/orgs/acme/patches/package"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": { UUID: {
+                "status": "granted", "url": serve_url, "purl": PURL,
+                "artifacts": [{ "kind": "tarball", "url": serve_url,
+                                "integrity": { "sha512": sri_of(&prebuilt) } }]
+            }}
+        })))
+        .mount(&api)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(serve_path))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(prebuilt))
+        .mount(&api)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_lockfile_only_fixture(
+        tmp.path(),
+        &format!("{}/left-pad/-/left-pad-1.3.0.tgz", registry.uri()),
+        &integrity,
+    );
+    seed_manifest_and_blob(tmp.path());
+    let vendor = |extra: &[&str]| {
+        let mut cmd = Command::new(binary());
+        cmd.args([
+            "vendor",
+            "--json",
+            "--vendor-source",
+            "auto",
+            "--api-url",
+            &api.uri(),
+            "--api-token",
+            "sktsec_placeholder_value_for_tests_api",
+            "--org",
+            "acme",
+        ])
+        .args(extra)
+        .current_dir(tmp.path());
+        for (key, _) in std::env::vars() {
+            if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
+                cmd.env_remove(key);
+            }
+        }
+        let out = cmd.env("SOCKET_TELEMETRY_DISABLED", "1").output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("{e}: {stdout}\n{}", String::from_utf8_lossy(&out.stderr)));
+        (out.status.code(), v)
+    };
+
+    // Offline, nothing is deferred to a service it cannot reach: the
+    // not-installed skip (exit 1, as before), and no request to either
+    // server.
+    let (code, v) = vendor(&["--offline"]);
+    assert_eq!(code, Some(1), "{v:#}");
+    assert!(
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["purl"] == PURL
+                && e["action"] == "skipped"
+                && e["errorCode"] == "package_not_installed"),
+        "{v:#}"
+    );
+    assert!(registry
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .is_empty());
+    assert!(api.received_requests().await.unwrap_or_default().is_empty());
+
+    let (code, v) = vendor(&[]);
+    assert_eq!(code, Some(0), "{v:#}");
+    let events = v["events"].as_array().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["action"] == "applied" && e["purl"] == PURL),
+        "{v:#}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_fetched_missing"),
+        "no pristine fetch happened, so none is reported: {v:#}"
+    );
+    assert!(
+        registry
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the pristine tarball is never downloaded"
+    );
+    assert!(tmp
+        .path()
+        .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"))
+        .is_file());
 }
 
 /// Integrity mismatch between the lock and the served bytes is a distinct
@@ -1806,8 +1939,7 @@ async fn scan_apply_skips_lockfile_only_without_error() {
 }
 
 // ---------------------------------------------------------------------------
-// Bun vendored-mode preflight through `scan`: download phase, --detached,
-// --silent
+// Bun vendored-mode preflight through `scan`: download phase, --silent
 // ---------------------------------------------------------------------------
 
 const BUN_WS_CODE: &str = "vendor_bun_workspace_unsupported";
@@ -1884,51 +2016,6 @@ async fn scan_vendored_bun_v1_workspace_refuses_in_download_phase() {
     assert!(
         !tmp.path().join(".socket").exists(),
         "a fully refused run vendors nothing and creates nothing under .socket/"
-    );
-}
-
-/// The `--detached` (no-op) twin refuses BEFORE any fetch too: same record,
-/// zero downloads, and no manifest at all.
-#[tokio::test]
-async fn scan_vendored_bun_detached_refuses_before_fetch() {
-    let mock = MockServer::start().await;
-    mount_patch_api(&mock, UUID).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_bun_v1_workspace_fixture(tmp.path());
-    let lock_before = std::fs::read(tmp.path().join("bun.lock")).unwrap();
-
-    let (code, stdout, stderr) = run_scan_vendor(
-        tmp.path(),
-        &mock.uri(),
-        &["--mode", "vendored", "--detached"],
-    );
-    assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(v["status"], "partial_failure", "envelope={v}");
-    assert_eq!(v["download"]["detached"], true, "envelope={v}");
-    assert_eq!(v["download"]["downloaded"], 0, "envelope={v}");
-    assert_eq!(v["download"]["failed"], 1, "envelope={v}");
-    assert_eq!(
-        v["download"]["patches"][0]["action"], "failed",
-        "envelope={v}"
-    );
-    assert_eq!(
-        v["download"]["patches"][0]["errorCode"], BUN_WS_CODE,
-        "envelope={v}"
-    );
-    let reqs = mock.received_requests().await.unwrap();
-    assert!(
-        !reqs.iter().any(|r| r.url.path().contains("/patches/view/")),
-        "detached must refuse before fetching"
-    );
-    assert!(
-        !tmp.path().join(".socket/manifest.json").exists(),
-        "detached mode never writes a manifest"
-    );
-    assert!(!tmp.path().join(".socket/vendor").exists());
-    assert_eq!(
-        std::fs::read(tmp.path().join("bun.lock")).unwrap(),
-        lock_before
     );
 }
 
@@ -2091,8 +2178,7 @@ async fn scan_vendored_vlt_direct_dependency_vendors() {
 
 /// Manifest-less VEX over the committed state `scan --vendor` leaves
 /// (manifest-free since 5.0 — the ledger's `detached` entries embed the
-/// records, and the hidden `--detached` flag is a no-op, so there is one
-/// shape to cover): the checkout attests `(vendored)` from the ledger's
+/// records, so there is one shape to cover): the checkout attests `(vendored)` from the ledger's
 /// embedded record, then from lockfile discovery + the patch API once the
 /// ledgers are gone too, never `--offline` (`record_unavailable`, zero
 /// requests), and not once the lock is reverted (`vendor_unwired`,

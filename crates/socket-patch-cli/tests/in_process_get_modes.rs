@@ -68,7 +68,6 @@ fn get_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
         ghsa: false,
         package: false,
         save_only: false,
-        one_off: false,
         all_releases: false,
         mode: Some(socket_patch_cli::commands::scan::ScanMode::Agent),
     }
@@ -653,7 +652,7 @@ async fn mode_with_save_only_conflicts_exit_one_before_network() {
         args.mode = Some(mode);
         args.save_only = true;
         let code = socket_patch_cli::commands::get::run(args).await;
-        assert_eq!(code, 1, "--save-only + --mode {mode:?} must be rejected");
+        assert_eq!(code, 2, "--save-only + --mode {mode:?} must be rejected (usage, exit 2)");
     }
     assert!(
         server

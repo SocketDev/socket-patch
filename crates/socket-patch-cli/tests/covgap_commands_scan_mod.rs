@@ -319,7 +319,7 @@ fn seed_manifest(root: &Path, entries: &[(&str, &str)]) {
 // resolve_mode_flags — the remaining cross-mode conflict arms
 // ---------------------------------------------------------------------------
 // Only the `--mode hosted --vendor` arm is pinned in cli_parse_scan.rs;
-// these cover the --redirect / --apply / --sync booleans against a
+// these cover the --apply / --sync / --vendor booleans against a
 // different --mode, plus ScanMode::Agent.cli_name() rendering into the
 // message. Clap parses each combination fine (no value-dependent conflict
 // is expressible); the fold is what rejects them.
@@ -365,16 +365,6 @@ mod mode_fold {
     fn fold_err(extra: &[&str]) -> String {
         let mut args = parse_scan(extra);
         resolve_mode_flags(&mut args).expect_err("cross-mode contradiction must error")
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn mode_vendored_with_redirect_boolean_errors() {
-        let err = fold_err(&["--mode", "vendored", "--redirect"]);
-        assert!(
-            err.contains("--mode vendored cannot be used with --redirect"),
-            "clap-style 'cannot be used with' phrasing naming both spellings: {err}"
-        );
     }
 
     #[test]
@@ -444,7 +434,7 @@ fn scan_hosted_prune_human_warns_prune_is_ignored() {
         "hosted --prune stays accepted (never a usage error)"
     );
     assert!(
-        stderr.contains("Warning (redirect_prune_ignored):"),
+        stderr.contains("Warning: --prune has no effect with --mode hosted"),
         "the ignored-prune warning must reach stderr; got {stderr:?}"
     );
     assert!(
@@ -547,7 +537,7 @@ async fn scan_paid_patch_without_access_nudges_and_downloads_nothing() {
         "the no-access summary counts FREE patches only; got {stdout:?}"
     );
     assert!(
-        stdout.contains("+ 1 additional patch is available with a paid subscription"),
+        stdout.contains("+ 1 additional patch is available with a paid Socket plan"),
         "the paid nudge must print; got {stdout:?}"
     );
     assert!(
@@ -555,7 +545,7 @@ async fn scan_paid_patch_without_access_nudges_and_downloads_nothing() {
         "the pricing URL must print; got {stdout:?}"
     );
     assert!(
-        stdout.contains("No downloadable patches (paid subscription required)."),
+        stdout.contains("No downloadable patches: every patch found requires a paid Socket plan."),
         "the gated-catalog terminal must print; got {stdout:?}"
     );
 
@@ -1067,7 +1057,7 @@ async fn scan_human_apply_over_live_hosted_wiring_warns_retained() {
     let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--yes"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stderr.contains("Warning (hosted_wiring_retained):"),
+        stderr.contains("Warning: agent-mode scan left the hosted wiring live"),
         "the retained-wiring warning must reach stderr; got {stderr:?}"
     );
     assert!(
@@ -1098,9 +1088,6 @@ fn scan_human_vex_success_prints_wrote_line() {
     std::fs::write(
         socket.join("manifest.json"),
         serde_json::to_string_pretty(&serde_json::json!({
-            // npm declared `manual` so VEX generation does not omit the
-            // patch (ecosystem_not_setup) and fail the run.
-            "setup": { "exclude": [], "manual": ["npm"] },
             "patches": {
                 "pkg:npm/vuln-pkg@1.0.0": {
                     "uuid": UUID,
@@ -1196,7 +1183,7 @@ async fn scan_human_pnp_refusal_prints_alongside_other_ecosystems() {
         "the gem must be discovered (non-empty path); got {stderr:?}"
     );
     assert!(
-        stderr.contains("Warning (yarn_pnp_unsupported):"),
+        stderr.contains("Warning: ") && stderr.contains("Plug'n'Play"),
         "the PnP refusal must print on the non-empty path; got {stderr:?}"
     );
     assert!(
@@ -1489,7 +1476,7 @@ async fn scan_hosted_paths_run_once_per_project_directory() {
         let header = format!("== {} ==", Path::new("apps").join(app).display());
         assert!(stdout.contains(&header), "missing {header:?}: {stdout}");
     }
-    assert_eq!(stdout.matches("Redirected 0 packages").count(), 2, "{stdout}");
+    assert_eq!(stdout.matches("Switched 0 packages to hosted patches").count(), 2, "{stdout}");
     let reqs = recorded(&mock).await;
     assert_eq!(batch_bodies(&reqs).len(), 2, "one discovery per directory");
 }
@@ -1529,7 +1516,7 @@ async fn scan_hosted_human_prints_table_updates_and_redirects() {
         "scan never prompts; got {stderr:?}"
     );
     assert!(
-        stdout.contains("Redirected 0 packages"),
+        stdout.contains("Switched 0 packages to hosted patches"),
         "the engine must run; got {stdout:?}"
     );
     let reqs = recorded(&mock).await;
@@ -1980,19 +1967,19 @@ fn scan_invalid_bun_lockb_warns_instead_of_silent_success() {
             "mode={mode:?}: the binary format error must name its file: {detail}"
         );
         assert!(
-            !stdout.contains("Warning ("),
+            !stdout.contains("Warning:"),
             "mode={mode:?}: the human warning line must not leak into the JSON stream: {stdout}"
         );
     }
 
-    // Human path: the same diagnosis as a stderr `Warning (code): detail`
+    // Human path: the same diagnosis as a stderr `Warning: detail`
     // line, exit 0, and the generic "No packages found" hint still prints.
     let tmp = tempfile::tempdir().unwrap();
     write_invalid_bun_lockb_project(tmp.path());
     let (code, stdout, stderr) = run_scan(tmp.path(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stderr.contains("Warning (bun_lockb_invalid): cannot inventory bun.lockb"),
+        stderr.contains("Warning: cannot inventory bun.lockb"),
         "the human path must name the layout and the code; got {stderr:?}"
     );
     assert!(
@@ -2058,7 +2045,7 @@ async fn scan_nonempty_keeps_the_bun_lockb_discovery_warning_in_every_mode() {
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--mode", "hosted"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stderr.contains("Warning (bun_lockb_invalid):"),
+        stderr.contains("Warning: cannot inventory bun.lockb"),
         "the human hosted path must keep the warning; got {stderr:?}"
     );
 }
@@ -2273,22 +2260,6 @@ fn scan_mode_conflict_error_is_capitalized_and_names_no_hidden_flag() {
         "{stderr:?}"
     );
     assert!(!stderr.contains("--redirect"), "{stderr:?}");
-    // Typing the hidden --redirect gets it explained.
-    let (code, _, stderr) = run_scan(tmp.path(), &["--mode", "agent", "--redirect"]);
-    assert_eq!(code, 2);
-    assert!(
-        stderr.starts_with(
-            "Error: --mode agent cannot be used with --redirect: the flags select \
-             different modes (--redirect means --mode hosted)"
-        ),
-        "{stderr:?}"
-    );
-    let (code, _, stderr) = run_scan(tmp.path(), &["--detached"]);
-    assert_eq!(code, 2);
-    assert!(
-        stderr.starts_with("Error: --detached requires vendored mode"),
-        "{stderr:?}"
-    );
 }
 
 /// A selection the manifest already records at the same uuid is not

@@ -272,7 +272,7 @@ fn yarn_pnp_refuses_in_human_mode() {
 /// the yarn-PnP refusal is an error exit, so it must still print the
 /// refusal to stderr under `--silent`. Without this, `apply --silent`
 /// on a PnP checkout exits 1 with zero output — undiagnosable in CI
-/// logs (the same contract violation class fixed in `setup`/`scan`).
+/// logs (the same contract violation class fixed in `scan`).
 #[test]
 fn yarn_pnp_refusal_still_prints_error_under_silent() {
     let dir = tempfile::tempdir().unwrap();
@@ -352,7 +352,7 @@ fn npm_layout_does_not_trigger_yarn_pnp_refusal() {
     // Belt-and-braces: the marker string must be absent from both
     // streams entirely.
     assert!(
-        !stdout.contains("yarn_pnp_unsupported") && !stderr.contains("yarn_pnp_unsupported"),
+        !stdout.contains("yarn_pnp_unsupported") && !stderr.contains("Plug'n'Play"),
         "npm layout should not mention yarn-pnp anywhere.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     // Far stronger than pinning a no-match `partialFailure`: with a
@@ -943,8 +943,8 @@ fn scan_human_mode_on_pnp_project_prints_refusal_to_stderr() {
         "human scan stays exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("yarn_pnp_unsupported"),
-        "human scan must print the stable refusal code to stderr, got:\n{stderr}"
+        stderr.contains("Warning: this project uses yarn Plug'n'Play"),
+        "human scan must print the refusal to stderr, got:\n{stderr}"
     );
     assert!(
         stderr.contains("Plug'n'Play") && stderr.contains("yarn patch"),

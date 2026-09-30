@@ -11,9 +11,12 @@ use socket_patch_core::api::types::{
 };
 use socket_patch_core::crawlers::fuzzy_match::fuzzy_match_packages;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
+use socket_patch_core::formats::pnpm::PnpmLock;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
+pub(crate) use socket_patch_core::manifest::records::record_from_patch_response;
+use socket_patch_core::manifest::records::{build_patch_record, files_for_manifest};
 use socket_patch_core::manifest::schema::{
-    PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
+    PatchFileInfo, PatchManifest, PatchRecord,
 };
 use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_variants};
 use socket_patch_core::patch::apply_lock::{LockError, LockGuard};
@@ -365,43 +368,6 @@ async fn unwind_new_blobs(blobs_dir: &Path, hashes: &[String]) {
     }
 }
 
-/// Convert the API-shaped vulnerability map on `PatchResponse` into the
-/// serialization-shaped map stored in the manifest.
-fn vulnerabilities_for_manifest(
-    vulns: &HashMap<String, VulnerabilityResponse>,
-) -> HashMap<String, VulnerabilityInfo> {
-    vulns
-        .iter()
-        .map(|(id, v)| {
-            (
-                id.clone(),
-                VulnerabilityInfo {
-                    cves: v.cves.clone(),
-                    summary: v.summary.clone(),
-                    severity: v.severity.clone(),
-                    description: v.description.clone(),
-                },
-            )
-        })
-        .collect()
-}
-
-/// Build the `PatchRecord` that will be inserted into the manifest for
-/// `patch`. `files` is the (purl-keyed) before/after-hash map the
-/// caller built — semantics for what counts as a "patchable file" differ
-/// between the get and download flows, so the caller owns that decision.
-fn build_patch_record(patch: &PatchResponse, files: HashMap<String, PatchFileInfo>) -> PatchRecord {
-    PatchRecord {
-        uuid: patch.uuid.clone(),
-        exported_at: patch.published_at.clone(),
-        files,
-        vulnerabilities: vulnerabilities_for_manifest(&patch.vulnerabilities),
-        description: patch.description.clone(),
-        license: patch.license.clone(),
-        tier: patch.tier.clone(),
-    }
-}
-
 /// Build a file map keyed by path, keeping only files that carry BOTH
 /// hashes — the rule used ONLY for installed-distribution matching in
 /// [`filter_to_installed_releases`]. New files (no `beforeHash`) can
@@ -425,44 +391,6 @@ fn files_with_both_hashes(patch: &PatchResponse) -> HashMap<String, PatchFileInf
     files
 }
 
-/// Build the manifest-shaped `files` map from a fetched patch view,
-/// keeping EVERY file the patch touches — including net-new files the
-/// patch ADDS, which carry an `afterHash` but no `beforeHash`. A new
-/// file is recorded with an empty-string `beforeHash` sentinel, the same
-/// convention `save_and_apply_patch`'s by-uuid path relies on: apply
-/// treats an empty `beforeHash` as "create this file" and
-/// [`select_installed_variants`] treats it as non-discriminating.
-///
-/// This is the shared record-building rule for the scan/download/vendor
-/// flows AND the single-uuid apply path, so `get <uuid>` and
-/// `scan`/`apply`/`vendor` all record and write the same set of files.
-/// A both-hashes rule here would drop every added file (e.g. a whole-crate
-/// cargo export where ALL files lack a `beforeHash`, recorded as `files:{}`
-/// while reporting `applied:1`).
-fn files_for_manifest(patch: &PatchResponse) -> HashMap<String, PatchFileInfo> {
-    let mut files = HashMap::new();
-    for (file_path, file_info) in &patch.files {
-        if let Some(after) = &file_info.after_hash {
-            files.insert(
-                file_path.clone(),
-                PatchFileInfo {
-                    before_hash: file_info.before_hash.clone().unwrap_or_default(),
-                    after_hash: after.clone(),
-                },
-            );
-        }
-    }
-    files
-}
-
-/// `(purl, manifest record)` from a fetched patch view — retains
-/// patch-added new files via [`files_for_manifest`].
-pub(crate) fn record_from_patch_response(patch: &PatchResponse) -> (String, PatchRecord) {
-    (
-        patch.purl.clone(),
-        build_patch_record(patch, files_for_manifest(patch)),
-    )
-}
 
 #[derive(Args)]
 pub struct GetArgs {
@@ -501,23 +429,6 @@ pub struct GetArgs {
         value_parser = crate::args::parse_bool_flag,
     )]
     pub save_only: bool,
-
-    /// Apply the patch without saving it to the .socket folder (not yet
-    /// implemented).
-    // Hidden: it always fails with "not yet implemented" (see `run`), but
-    // stays parseable so scripts and `SOCKET_ONE_OFF` keep getting that
-    // explicit error instead of a clap parse failure.
-    // `value_parser = parse_bool_flag`: same reason as `--save-only` above —
-    // and `SOCKET_ONE_OFF` is shared with `rollback --one-off`, which parses
-    // boolishly too; the two must not diverge.
-    #[arg(
-        long = "one-off",
-        env = "SOCKET_ONE_OFF",
-        default_value_t = false,
-        value_parser = crate::args::parse_bool_flag,
-        hide = true,
-    )]
-    pub one_off: bool,
 
     /// Download patches for every release variant of a matched package,
     /// not just the one matching the locally-installed distribution.
@@ -942,17 +853,14 @@ fn format_all_narrowed(skips: &[serde_json::Value]) -> String {
     }
 }
 
-/// The confirmation question for `n` selected patches.
-fn format_confirm_prompt(mode: super::scan::ScanMode, n: usize, save_only: bool) -> String {
+/// The agent-mode confirmation question for `n` selected patches (hosted
+/// and vendored `get` never prompt).
+fn format_confirm_prompt(save_only: bool, n: usize) -> String {
     let patches = crate::ui::plural(n, "patch", "patches");
-    match mode {
-        super::scan::ScanMode::Agent if save_only => format!("Download {patches}?"),
-        super::scan::ScanMode::Agent => format!("Download and apply {patches}?"),
-        super::scan::ScanMode::Vendored => format!("Download and vendor {patches}?"),
-        super::scan::ScanMode::Hosted => format!(
-            "Redirect {} to the hosted patch server?",
-            crate::ui::plural(n, "package", "packages")
-        ),
+    if save_only {
+        format!("Download {patches}?")
+    } else {
+        format!("Download and apply {patches}?")
     }
 }
 
@@ -975,9 +883,8 @@ fn no_packages_message(global: bool) -> String {
 /// `patch` names it (a purl, or the uuid when the purl is unknown).
 fn format_paid_required(patch: &str) -> String {
     format!(
-        "This patch requires a paid subscription to download.\n  \
-         Patch: {patch}\n  \
-         Upgrade at: https://socket.dev/pricing"
+        "This patch requires a paid Socket plan.\n  Patch: {patch}\n{}",
+        crate::ui::PAID_UPGRADE
     )
 }
 
@@ -1176,7 +1083,7 @@ pub(crate) fn select_patches(
                     return Err(1);
                 }
                 Err(SelectError::Cancelled) => {
-                    eprintln!("Selection cancelled.");
+                    eprintln!("{}", crate::ui::CANCELLED);
                     return Err(0);
                 }
             }
@@ -1498,47 +1405,6 @@ fn purl_has_version(purl: &str) -> bool {
         })
 }
 
-/// Does the raw pnpm-lock text RESOLVE `name@version`? Boundary-anchored
-/// probes over the three lock grammars — a plain `contains` collides on
-/// version prefixes (`left-pad@1.3.0` matches inside
-/// `left-pad@1.3.0-beta.1`), name suffixes (`pad@1.3.0` inside
-/// `left-pad@1.3.0`), and unscoped-inside-scoped names (`name@1.0.0` inside
-/// `@scope/name@1.0.0`). The needles cover v6/v9's `name@version` and v5's
-/// `/name/version` key spellings; a match counts only when the preceding
-/// char cannot extend the name (start/whitespace/quote, or a `/` delimiter
-/// itself preceded by such a boundary) and the following char cannot extend
-/// the version (so `:`, `'`, `(`, and v5's `_peer` suffix all accept).
-/// Heuristic by design: a false negative degrades to a calm skip, a false
-/// positive costs one grant request the rewriter's per-dep confirmation
-/// then ignores.
-fn pnpm_lock_resolves(text: &str, name: &str, version: &str) -> bool {
-    let version_boundary = |c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
-    let name_boundary = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\'' | '"');
-    for needle in [format!("{name}@{version}"), format!("/{name}/{version}")] {
-        for (pos, _) in text.match_indices(needle.as_str()) {
-            let before_ok = match text[..pos].chars().next_back() {
-                None => true,
-                // v5/v6's leading key delimiter — legitimate only when the
-                // char before it is itself a boundary (otherwise this is a
-                // scoped `@scope/<name>` tail: a DIFFERENT package).
-                Some('/') => text[..pos - 1]
-                    .chars()
-                    .next_back()
-                    .is_none_or(name_boundary),
-                Some(c) => name_boundary(c),
-            };
-            let after_ok = text[pos + needle.len()..]
-                .chars()
-                .next()
-                .is_none_or(version_boundary);
-            if before_ok && after_ok {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Outcome of the coarse installed-VERSION narrowing over a CVE/GHSA/PURL
 /// search fan-out (see [`filter_to_installed_purls`]).
 struct InstalledNarrowing {
@@ -1567,16 +1433,17 @@ struct InstalledNarrowing {
 ///   installed copy (CI manifest-maintenance);
 /// * hosted/vendored modes only: resolved in the project lockfile(s)
 ///   (hosted rewrites the lock; vendored auto-fetches pristine) or claimed
-///   by the vendor ledger (fresh-clone re-vendor) — mirroring scan's
-///   lockfile/vendored-ledger discovery supplements, including their
-///   global-scan gate.
+///   by the vendor ledger (fresh-clone re-vendor) — scan's own
+///   lockfile/vendored-ledger discovery supplements (a corrupt vendor
+///   ledger falls back to the committed artifacts, as in scan), including
+///   their global-scan gate.
 ///
 /// PnP layouts are surfaced, never silently misreported: yarn PnP packages
 /// are structurally unpatchable in every mode (skip records carry
 /// `yarn_pnp_unsupported`, not a false "not installed"). pnpm PnP skips
 /// carry `pnpm_pnp_unsupported` in agent/vendored modes; hosted mode — the
 /// refusal's own remedy — keeps the versions the raw pnpm-lock.yaml text
-/// resolves ([`pnpm_lock_resolves`]), labels a judged miss
+/// resolves ([`PnpmLock::resolves`]), labels a judged miss
 /// `package_not_installed` like any other mode, and reserves the layout
 /// code for an unreadable lock (no judgment possible).
 ///
@@ -1608,24 +1475,27 @@ async fn filter_to_installed_purls(
     let found = find_packages_for_rollback(&partitioned, &common.crawler_options(), true).await;
     let mut present: HashSet<String> = found.keys().map(|k| canon(k)).collect();
 
+    let ctx = super::context::ProjectContext::rooted(common, common.cwd.clone());
     // Manifest membership counts as presence (read-only probe: a corrupt
     // manifest degrades to "no extension" here — the download path's
     // fail-closed read still guards every write).
-    if let Ok(Some(manifest)) = read_manifest(&common.resolved_manifest_path()).await {
+    if let Some(manifest) = ctx.ledgers().await.manifest {
         present.extend(manifest.patches.keys().map(|k| canon(k)));
     }
 
-    // Lockfile + vendor-ledger supplements (scan's discovery gate: never on
-    // global scans, which target the machine tree, not this project).
+    // scan's lockfile + vendored-ledger discovery supplements (and their
+    // gate: never on global scans, which target the machine tree, not this
+    // project).
     let mut pnp_diags: Vec<lock_inventory::UnsupportedNpmLayout> = Vec::new();
-    if !common.global && common.global_prefix.is_none() {
-        let (entries, unsupported) = lock_inventory::inventory_project_diagnosed(&common.cwd).await;
-        pnp_diags = unsupported;
+    if !common.is_global() {
+        let supplement = super::scan::project_lockfile_supplement(&ctx, &[], None).await;
+        pnp_diags = supplement.unsupported;
         if mode != super::scan::ScanMode::Agent {
-            present.extend(entries.iter().map(|e| canon(&e.purl)));
-            if let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await {
-                present.extend(state.entries.values().map(|e| canon(&e.base_purl)));
-            }
+            present.extend(supplement.entries.iter().map(|e| canon(&e.purl)));
+            let vendored =
+                super::scan::project_vendored_supplement(common, &[], &ctx.loaded().await.vendor)
+                    .await;
+            present.extend(vendored.iter().map(|p| canon(&p.purl)));
         }
     }
 
@@ -1645,6 +1515,7 @@ async fn filter_to_installed_purls(
     let pnpm_pnp_lock_text: Option<String> = (pnp_pnpm && mode == super::scan::ScanMode::Hosted)
         .then(|| std::fs::read_to_string(common.cwd.join("pnpm-lock.yaml")).ok())
         .flatten();
+    let pnpm_pnp_lock = pnpm_pnp_lock_text.as_deref().map(PnpmLock::parse);
 
     let mut out = InstalledNarrowing {
         kept: Vec::new(),
@@ -1674,8 +1545,8 @@ async fn filter_to_installed_purls(
             // The pnpm PnP refusal's own remedy is the hosted lockfile
             // rewrite — but only for versions the lock ACTUALLY resolves:
             // keeping the whole fan-out would request grants for every
-            // version ever patched. Anchored probe over the raw lock text
-            // (see `pnpm_lock_resolves`); a hit is kept (the rewriter's
+            // version ever patched. The lock model's key probe
+            // (`PnpmLock::resolves`); a hit is kept (the rewriter's
             // per-dep confirmation still decides). A judged MISS is a
             // genuine "version not resolved" verdict — the layout blocked
             // nothing — so it carries the same `package_not_installed` code
@@ -1684,9 +1555,9 @@ async fn filter_to_installed_purls(
             let decoded = canon(&result.purl);
             let coord = decoded.strip_prefix("pkg:npm/").unwrap_or(&decoded);
             if mode == super::scan::ScanMode::Hosted {
-                match (pnpm_pnp_lock_text.as_deref(), coord.rsplit_once('@')) {
-                    (Some(text), Some((name, version))) => {
-                        if pnpm_lock_resolves(text, name, version) {
+                match (&pnpm_pnp_lock, coord.rsplit_once('@')) {
+                    (Some(lock), Some((name, version))) => {
+                        if lock.resolves(name, version) {
                             out.kept.push(result.clone());
                             continue;
                         }
@@ -2675,19 +2546,11 @@ pub async fn run(args: GetArgs) -> i32 {
             args.common.json,
             "Only one of --id, --cve, --ghsa, or --package can be specified",
         );
-        return 1;
-    }
-    if args.one_off && args.save_only {
-        report_error(
-            args.common.json,
-            "--one-off and --save-only cannot be used together",
-        );
-        return 1;
+        return 2;
     }
     // v5: hosted by default, like scan. `--save-only` (records a manifest
     // entry) and global installs (no project lockfile) mean agent mode.
-    // Conflicts use get's exit-1 report_error style (scan's self-enforced
-    // conflicts exit 2 — documented carve-out in CLI_CONTRACT.md).
+    // Usage errors exit 2, like clap's and scan's (v5.0).
     let mode = args.mode.unwrap_or(if args.save_only || args.common.is_global() {
         super::scan::ScanMode::Agent
     } else {
@@ -2703,15 +2566,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 mode.cli_name()
             ),
         );
-        return 1;
-    }
-    if args.one_off {
-        // The flag parses but is not implemented: fail loudly rather than
-        // save to the manifest anyway. Mirrors `rollback --one-off`'s
-        // not-yet-implemented contract; rejected before any network or disk
-        // activity.
-        report_error(args.common.json, "One-off get mode is not yet implemented");
-        return 1;
+        return 2;
     }
     // Strict airgap (CLI_CONTRACT.md `--offline`: never contact the
     // network; operations that need remote data fail loudly). Every `get`
@@ -2745,7 +2600,7 @@ pub async fn run(args: GetArgs) -> i32 {
     if args.id || args.cve || args.ghsa {
         if let Some(err) = forced_identifier_error(&args.identifier, id_type) {
             report_error(args.common.json, err);
-            return 1;
+            return 2;
         }
     }
 
@@ -3057,8 +2912,8 @@ pub async fn run(args: GetArgs) -> i32 {
                 "{}",
                 format_search_results(&all, search_response.can_access_paid_patches, color)
             );
-            println!("All available patches require a paid subscription.");
-            println!("  Upgrade at: https://socket.dev/pricing");
+            println!("All available patches require a paid Socket plan.");
+            println!("{}", crate::ui::PAID_UPGRADE);
         }
         return 0;
     }
@@ -3080,7 +2935,7 @@ pub async fn run(args: GetArgs) -> i32 {
     // included, so the listing can still show an installed package's paid
     // fix as `[PAID] (no access)`; selection, the skip records and the
     // JSON envelope only ever see the accessible share.
-    let (accessible, listed, narrow_skips, narrow_warnings) = if narrowing_exempt {
+    let (accessible, listed, narrow_skips, mut narrow_warnings) = if narrowing_exempt {
         let listed: Vec<PatchSearchResult> = search_response.patches.clone();
         (accessible, listed, Vec::new(), Vec::new())
     } else {
@@ -3101,12 +2956,14 @@ pub async fn run(args: GetArgs) -> i32 {
             .collect();
         (kept_accessible, narrowing.kept, skips, narrowing.warnings)
     };
+    // `get` bypasses the repo's socket.yml policy, but says so.
+    narrow_warnings.extend(super::scan::policy::policy_bypass_warnings(&args.common, &accessible));
     // Layout refusals print even when informational output is quieted only
     // by --json (stderr; the envelope carries them too) — but --silent
     // mutes them like scan does.
     if !args.common.silent {
-        for (code, detail) in &narrow_warnings {
-            eprintln!("Warning ({code}): {detail}");
+        for (_, detail) in &narrow_warnings {
+            eprintln!("Warning: {detail}");
         }
     }
     if accessible.is_empty() {
@@ -3164,10 +3021,18 @@ pub async fn run(args: GetArgs) -> i32 {
     // Smart patch selection: pick one patch per PURL. `accessible` is
     // non-empty here and every entry passes the selector's tier filter, so
     // the selection is never empty (one patch per purl group, or `Err`).
+    // Hosted and vendored `get` never prompt (v5.0): like `scan`, they take
+    // the top-ranked accessible patch per package, in JSON mode too.
+    let auto_pick = mode != super::scan::ScanMode::Agent;
+    let select_common = if auto_pick {
+        super::scan::selection_args(&args.common)
+    } else {
+        args.common.clone()
+    };
     let selected = match select_patches(
         &accessible,
-        search_response.can_access_paid_patches,
-        &args.common,
+        auto_pick || search_response.can_access_paid_patches,
+        &select_common,
     ) {
         Ok(s) => s,
         Err(code) => return code,
@@ -3182,7 +3047,7 @@ pub async fn run(args: GetArgs) -> i32 {
         && !selection_prompted(
             &accessible,
             search_response.can_access_paid_patches,
-            &args.common,
+            &select_common,
         )
     {
         print!("{}", format_selected_patches(&selected, color));
@@ -3211,14 +3076,17 @@ pub async fn run(args: GetArgs) -> i32 {
         return agent_dry_run(&args, &selected, &narrow_skips, &narrow_warnings).await;
     }
 
-    // Confirm before acting (default YES), with mode-appropriate wording.
-    // Dry runs skip the prompt: nothing mutates, so nothing to confirm.
-    let prompt = format_confirm_prompt(mode, selected.len(), args.save_only);
-    if !args.common.dry_run && !crate::ui::confirm(&prompt, true, &args.common) {
-        if !quiet {
-            eprintln!("Cancelled; no changes made.");
+    // Agent mode confirms before acting (default YES). Dry runs skip the
+    // prompt: nothing mutates, so nothing to confirm. Hosted and vendored
+    // runs never prompt (v5.0), like `scan`.
+    if mode == super::scan::ScanMode::Agent && !args.common.dry_run {
+        let prompt = format_confirm_prompt(args.save_only, selected.len());
+        if !crate::ui::confirm(&prompt, true, &args.common) {
+            if !quiet {
+                eprintln!("{}", crate::ui::CANCELLED);
+            }
+            return 0;
         }
-        return 0;
     }
 
     match mode {
@@ -3722,6 +3590,8 @@ async fn run_get_hosted(
         &pairs,
         scan_result,
         None,
+        // `get` is explicit intent: the rollout cap never applies.
+        None,
     )
     .await
 }
@@ -3983,77 +3853,6 @@ pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
-    /// The pnpm-PnP hosted lock probe must be boundary-anchored: plain
-    /// substring matching collides on version prefixes, name suffixes, and
-    /// unscoped-inside-scoped names.
-    #[test]
-    fn pnpm_lock_resolves_is_boundary_anchored() {
-        // v9/v6/v5 key spellings all resolve.
-        assert!(pnpm_lock_resolves(
-            "lockfileVersion: '9.0'\n\nsnapshots:\n\n  left-pad@1.3.0:\n",
-            "left-pad",
-            "1.3.0"
-        ));
-        assert!(pnpm_lock_resolves(
-            "  /left-pad@1.3.0:\n    resolution: {}\n",
-            "left-pad",
-            "1.3.0"
-        ));
-        assert!(pnpm_lock_resolves(
-            "  /left-pad/1.3.0:\n    resolution: {}\n",
-            "left-pad",
-            "1.3.0"
-        ));
-        // Peer-qualified keys still resolve: v9 `(peer)` and v5 `_peer`.
-        assert!(pnpm_lock_resolves(
-            "  'left-pad@1.3.0(react@18.0.0)':\n",
-            "left-pad",
-            "1.3.0"
-        ));
-        assert!(pnpm_lock_resolves(
-            "  /left-pad/1.3.0_react@18.0.0:\n",
-            "left-pad",
-            "1.3.0"
-        ));
-        // Scoped names resolve in both quoted-v9 and v6 spellings.
-        assert!(pnpm_lock_resolves(
-            "  '@scope/name@1.0.0':\n",
-            "@scope/name",
-            "1.0.0"
-        ));
-        assert!(pnpm_lock_resolves(
-            "  /@scope/name@1.0.0:\n",
-            "@scope/name",
-            "1.0.0"
-        ));
-
-        // Version-prefix collision: 1.3.0 must NOT match 1.3.0-beta.1.
-        assert!(!pnpm_lock_resolves(
-            "  left-pad@1.3.0-beta.1:\n",
-            "left-pad",
-            "1.3.0"
-        ));
-        // Name-suffix collision: `pad` must NOT match inside `left-pad`.
-        assert!(!pnpm_lock_resolves("  left-pad@1.3.0:\n", "pad", "1.3.0"));
-        assert!(!pnpm_lock_resolves("  /left-pad/1.3.0:\n", "pad", "1.3.0"));
-        // Unscoped-inside-scoped: `name` must NOT match `@scope/name`.
-        assert!(!pnpm_lock_resolves(
-            "  '@scope/name@1.0.0':\n",
-            "name",
-            "1.0.0"
-        ));
-        assert!(!pnpm_lock_resolves(
-            "  /@scope/name@1.0.0:\n",
-            "name",
-            "1.0.0"
-        ));
-        // Absent version: never resolves.
-        assert!(!pnpm_lock_resolves(
-            "  left-pad@1.3.0:\n",
-            "left-pad",
-            "2.0.0"
-        ));
-    }
     use socket_patch_core::api::types::{PatchFileResponse, VulnerabilityResponse};
     use std::collections::HashMap;
 
@@ -5032,36 +4831,6 @@ mod tests {
         );
     }
 
-    // --- pnpm_lock_resolves: needle at byte 0 ------------------------------
-    // The boundary probe reads the char BEFORE the match; a match at the very
-    // start of the text has none (`None => true`). A regression that indexes
-    // `text[..pos - 1]` unconditionally would underflow/panic here.
-
-    #[test]
-    fn pnpm_lock_resolves_needle_at_start_of_text() {
-        // pos == 0, plain v9 spelling: no preceding char is a valid boundary.
-        assert!(pnpm_lock_resolves("left-pad@1.3.0:\n", "left-pad", "1.3.0"));
-        // pos == 0, v5/v6 `/name/version` and `/name@version` spellings: the
-        // leading `/` delimiter itself has nothing before it.
-        assert!(pnpm_lock_resolves(
-            "/left-pad/1.3.0:\n",
-            "left-pad",
-            "1.3.0"
-        ));
-        assert!(pnpm_lock_resolves(
-            "/left-pad@1.3.0:\n",
-            "left-pad",
-            "1.3.0"
-        ));
-        // Still boundary-checked at the start of text: a scoped tail whose
-        // name begins mid-token must NOT match.
-        assert!(!pnpm_lock_resolves(
-            "@scope/left-pad@1.3.0:\n",
-            "left-pad",
-            "1.3.0"
-        ));
-    }
-
     // --- write_all_patch_blobs ---------------------------------------------
     // The per-patch fan-out over write_blob_entry: the FIRST bad entry must
     // fail the whole patch (Err(())) and leave nothing outside the blobs
@@ -5542,32 +5311,10 @@ mod tests {
     }
 
     #[test]
-    fn confirm_prompts_per_mode() {
-        use super::super::scan::ScanMode;
-        assert_eq!(
-            format_confirm_prompt(ScanMode::Agent, 1, false),
-            "Download and apply 1 patch?"
-        );
-        assert_eq!(
-            format_confirm_prompt(ScanMode::Agent, 2, false),
-            "Download and apply 2 patches?"
-        );
-        assert_eq!(
-            format_confirm_prompt(ScanMode::Agent, 1, true),
-            "Download 1 patch?"
-        );
-        assert_eq!(
-            format_confirm_prompt(ScanMode::Vendored, 3, false),
-            "Download and vendor 3 patches?"
-        );
-        assert_eq!(
-            format_confirm_prompt(ScanMode::Hosted, 1, false),
-            "Redirect 1 package to the hosted patch server?"
-        );
-        assert_eq!(
-            format_confirm_prompt(ScanMode::Hosted, 0, false),
-            "Redirect 0 packages to the hosted patch server?"
-        );
+    fn confirm_prompts_agent_mode() {
+        assert_eq!(format_confirm_prompt(false, 1), "Download and apply 1 patch?");
+        assert_eq!(format_confirm_prompt(false, 2), "Download and apply 2 patches?");
+        assert_eq!(format_confirm_prompt(true, 1), "Download 1 patch?");
     }
 
     #[test]
@@ -5595,9 +5342,9 @@ mod tests {
     fn paid_required_text() {
         assert_eq!(
             format_paid_required("pkg:npm/a@1"),
-            "This patch requires a paid subscription to download.\n  \
-             Patch: pkg:npm/a@1\n  \
-             Upgrade at: https://socket.dev/pricing"
+            "This patch requires a paid Socket plan.\n  \
+             Patch: pkg:npm/a@1\n\
+             Upgrade to a paid Socket plan to access all patches: https://socket.dev/pricing"
         );
     }
 
@@ -5834,8 +5581,6 @@ mod tests {
             "parse_bool_flag",
             "No env binding",
             "locally- installed",
-            "SOCKET_ONE_OFF",
-            "--one-off",
         ] {
             assert!(!help.contains(leak), "get --help leaks {leak:?}:\n{help}");
         }
@@ -5930,7 +5675,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let purl = "pkg:npm/covgap-no-after@1.0.0";
@@ -5974,7 +5719,7 @@ mod tests {
     async fn download_patch_records_view_404_is_fetch_miss() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         // No view mock mounted: wiremock answers 404, which the API client
         // maps to Ok(None) — the "could not fetch details" fetch-miss arm.
         let server = MockServer::start().await;
@@ -6001,7 +5746,7 @@ mod tests {
     async fn download_patch_records_uninstalled_variant_base_warns_and_keeps_all() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         // Two qualified PyPI variants sharing an UNINSTALLED base: release
         // narrowing must keep both (with the not-installed warning), and the
         // warnings key must ride the detached envelope. Views stay unmounted
@@ -6288,7 +6033,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let purl = "pkg:npm/covgap-blobfail@1.0.0";
@@ -6339,7 +6084,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let purl = "pkg:npm/covgap-badblob@1.0.0";
@@ -6393,7 +6138,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let good_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let good_purl = "pkg:npm/covgap-good@1.0.0";
@@ -6473,7 +6218,7 @@ mod tests {
     async fn download_patch_records_already_vendored_detached_skips_offline() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await; // trap: no mounts
         let tmp = tempfile::tempdir().unwrap();
         let uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -6579,7 +6324,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let uuid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
         let purl = "pkg:npm/covgap-bun@1.0.0";
@@ -6636,7 +6381,7 @@ mod tests {
     async fn download_patch_records_bun_v1_workspace_refuses_before_fetch() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await; // trap: no mounts
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("bun.lock"), BUN_V1_WORKSPACE_LOCK).unwrap();
@@ -6677,7 +6422,7 @@ mod tests {
     async fn download_patch_records_bun_refusal_skips_non_npm_purls() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("bun.lockb"), b"\x00binary").unwrap();
@@ -6708,7 +6453,7 @@ mod tests {
     async fn download_patch_records_bun_refusal_rejects_unwired_ledger_entries() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("bun.lock"), BUN_V1_WORKSPACE_LOCK).unwrap();
@@ -6931,7 +6676,7 @@ mod tests {
     async fn download_patch_records_with_prefetched_view_never_fetches() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await; // trap: no mounts
         let tmp = tempfile::tempdir().unwrap();
         // Two files: one with served `blobContent` (→ the blob seed), one
@@ -6999,7 +6744,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let purl = "pkg:npm/covgap-supersede@1.0.0";
         let old_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -7069,7 +6814,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let uuid = |c: char| {
             format!("{0}{0}{0}{0}{0}{0}{0}{0}-{0}{0}{0}{0}-4{0}{0}{0}-8{0}{0}{0}-{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}", c)
@@ -7244,7 +6989,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let site = tempfile::tempdir().unwrap();
         // Two installed pypi distributions, each with its own bytes.
         let installed = |name: &str, body: &[u8]| {
@@ -7460,7 +7205,7 @@ mod tests {
     async fn download_patches_json_is_purl_ordered() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
         let names = [

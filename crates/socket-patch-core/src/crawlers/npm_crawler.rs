@@ -65,7 +65,7 @@ fn parse_package_json_identity(content: &str) -> Option<(String, String)> {
     // (Windows-authored packages ship them), but serde_json rejects it —
     // a BOM'd install would be invisible to scan and unpatchable.
     let pkg: PackageJsonPartial =
-        serde_json::from_str(crate::package_json::detect::strip_bom(content)).ok()?;
+        serde_json::from_str(crate::utils::serde::strip_bom(content)).ok()?;
     let name = pkg.name?;
     let version = pkg.version?;
     if name.is_empty() || version.is_empty() {
@@ -609,10 +609,7 @@ pub fn parse_bun_bin_output(stdout: &str) -> Option<String> {
 ///
 /// Production callers live inside `#[cfg(target_os = "macos")]` blocks of
 /// `get_global_node_modules_paths` (Homebrew/nvm/volta/fnm fallbacks).
-/// `#[allow(dead_code)]` keeps the function visible to the inline
-/// `#[cfg(test)] mod tests` callers on every target without tripping
-/// `-D dead_code` on non-macOS clippy runs.
-#[allow(dead_code)]
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 fn find_node_dirs_sync(base: &Path, segments: &[&str]) -> Vec<PathBuf> {
     if !base.is_dir() {
         return Vec::new();
@@ -760,7 +757,7 @@ impl NpmCrawler {
     /// later restore) all of them: patching only one leaves a live,
     /// vulnerable copy while reporting success (a silent partial). The
     /// per-PURL `Vec` is ordered root-copy-first (breadth-first), so callers
-    /// that only need one representative (`vendor`, `vex`, `setup`) can take
+    /// that only need one representative (`vendor`, `vex`) can take
     /// the first and get the root copy.
     ///
     /// pnpm's and vlt's store peer-variant copies are deliberately NOT

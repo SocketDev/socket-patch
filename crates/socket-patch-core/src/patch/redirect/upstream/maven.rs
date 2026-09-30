@@ -318,7 +318,7 @@ pub(crate) async fn restore(
         if restored.is_empty() {
             continue;
         }
-        if let Err(why) = crate::vendor::maven_pom::parse_pom(&text) {
+        if let Err(why) = crate::formats::maven::parse_pom(&text) {
             refuse_all_in(
                 &pins,
                 rel,
@@ -382,7 +382,7 @@ async fn restore_mvn(
     let other_hosted = rest.lines().any(|l| {
         path_of(l).is_some_and(|p| {
             p.split('/')
-                .any(|seg| crate::vendor::maven_pom::split_socket_version(seg).is_some())
+                .any(|seg| crate::formats::maven::split_socket_version(seg).is_some())
         })
     });
     if has_resolver_lines && !other_hosted {

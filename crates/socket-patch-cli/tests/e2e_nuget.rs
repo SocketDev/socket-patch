@@ -10,7 +10,7 @@
 //!
 //! # Running
 //! ```sh
-//! cargo test -p socket-patch-cli --test e2e_nuget -- --ignored
+//! cargo test -p socket-patch-cli --test e2e_nuget
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -67,7 +67,6 @@ async fn run(args: &[&str], cwd: &Path, nuget_packages: &Path, proxy_url: &str) 
             .env_remove("SOCKET_API_URL")
             .env_remove("SOCKET_OFFLINE")
             .env_remove("SOCKET_PROXY_URL")
-            .env_remove("SOCKET_PATCH_PROXY_URL")
             .env_remove("SOCKET_BATCH_SIZE")
             .output()
             .expect("Failed to run socket-patch binary")
@@ -179,7 +178,6 @@ async fn assert_proxy_served_scans(server: &MockServer, scans: usize) {
 
 /// Verify that `socket-patch scan` discovers packages in a fake global cache layout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "opt-in nuget crawl e2e; run with --ignored"]
 async fn scan_discovers_global_cache_packages() {
     let server = start_proxy().await;
     let proxy_url = server.uri();
@@ -247,7 +245,6 @@ async fn scan_discovers_global_cache_packages() {
 
 /// Verify that `socket-patch scan` discovers packages in a fake legacy packages/ layout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "opt-in nuget crawl e2e; run with --ignored"]
 async fn scan_discovers_legacy_packages() {
     let server = start_proxy().await;
     let proxy_url = server.uri();

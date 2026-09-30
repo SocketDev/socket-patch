@@ -118,13 +118,11 @@ use super::{
     Discovery, PatchedRef, TomlDiag, UnlockedPin, VendorRef, DIAG_REF_INVALID,
     DIAG_REF_UNATTRIBUTABLE,
 };
+use crate::formats::cargo::{CargoLock, CopyClaim, LockedPackage};
 use crate::utils::digest::is_hex64_lower;
 use crate::vendor::cargo_config::{
     effective_config_rel, patch_entries, registry_definitions, CargoPatchEntry, CONFIG_LEGACY,
     CONFIG_TOML, SOCKET_REGISTRY_PREFIX,
-};
-use crate::vendor::cargo_lock::{
-    locked_packages, unused_patches, vendored_copy_claim, CopyClaim, LockedPackage,
 };
 use crate::vendor::cargo_manifest::{crates_io_url_alias_tables, is_crates_io_source};
 use crate::vendor::cargo_tag;
@@ -269,26 +267,21 @@ fn unattributed_tags(lock: &Lock, wired: &[VendorRef], out: &mut Discovery) {
 
 // ── reads ────────────────────────────────────────────────────────────────
 
-/// The state of the root `Cargo.lock`, read through the vendor backend's
-/// own lock model ([`locked_packages`] / [`unused_patches`]).
+/// The state of the root `Cargo.lock`, read through the format's model
+/// ([`CargoLock`]).
 #[derive(Debug)]
 enum Lock {
     /// No lock (or unreadable — diagnosed by the read).
     Absent,
     /// Present but not TOML (diagnosed).
     Unparseable,
-    Parsed {
-        pkgs: Vec<LockedPackage>,
-        /// `(name, version)` of every `[[patch.unused]]` entry: a `[patch]`
-        /// cargo resolved and then did NOT use in the crate graph.
-        unused: Vec<(String, String)>,
-    },
+    Parsed(CargoLock),
 }
 
 impl Lock {
     fn packages(&self) -> &[LockedPackage] {
         match self {
-            Lock::Parsed { pkgs, .. } => pkgs,
+            Lock::Parsed(lock) => lock.packages(),
             Lock::Absent | Lock::Unparseable => &[],
         }
     }
@@ -305,10 +298,7 @@ async fn load_lock(ctx: &DiscoverCtx<'_>, out: &mut Discovery) -> Lock {
     // checksums read as the same pin the inline v2+ `checksum` is — the
     // hosted rewriter writes it there for a v1 lock); `[[patch.unused]]` is
     // never a package — it is the "not wired" shape, kept apart.
-    Lock::Parsed {
-        pkgs: locked_packages(&doc),
-        unused: unused_patches(&doc),
-    }
+    Lock::Parsed(CargoLock::from_doc(&doc))
 }
 
 /// Guarded read + parse of a TOML file (`None`: missing, unreadable, or
@@ -747,9 +737,9 @@ async fn vendored_from_patches(
             }
         }
         let copy_tagged = matches!(tag, CopyTag::Tagged(_) | CopyTag::Unreadable);
-        if let Lock::Parsed { pkgs, unused } = lock {
+        if let Lock::Parsed(lock) = lock {
             let why =
-                match vendored_copy_claim(pkgs, unused, name, version, &vref.uuid, copy_tagged) {
+                match lock.vendored_in_use(name, version, &vref.uuid, copy_tagged) {
                     CopyClaim::Consumed => None,
                     CopyClaim::OtherTag(other) => Some(format!(
                         "{CARGO_LOCK} builds the copy tagged for patch {other} ({name} {})",

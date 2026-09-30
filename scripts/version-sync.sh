@@ -3,8 +3,7 @@
 #   - Cargo.toml (workspace version + socket-patch-core exact pin)
 #   - npm/socket-patch/package.json (+ optionalDependencies, package-lock.json)
 #   - npm/socket-patch-*/package.json (per-platform packages)
-#   - pypi/socket-patch/pyproject.toml + pypi/socket-patch-hook/pyproject.toml
-#   - gem/socket-patch-bundler/socket-patch-bundler.gemspec
+#   - pypi/socket-patch/pyproject.toml
 #   - gem/socket-patch/socket-patch.gemspec + lib/socket_patch/launcher.rb
 set -euo pipefail
 
@@ -69,21 +68,8 @@ pyproject="$REPO_ROOT/pypi/socket-patch/pyproject.toml"
 sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" "$pyproject"
 rm -f "$pyproject.bak"
 
-# Update the PyPI hook package version. The release build (build-pypi-wheels.py)
-# injects --version at wheel-build time, so this keeps the source-of-truth
-# pyproject.toml in sync for local builds and avoids a stale version field.
-hook_pyproject="$REPO_ROOT/pypi/socket-patch-hook/pyproject.toml"
-sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" "$hook_pyproject"
-rm -f "$hook_pyproject.bak"
-
-# Update the Ruby Bundler-plugin gem version (Phase 2 scaffolding). The in-tree
-# plugin is the active mechanism today; keep the published gem's version in sync
-# so a release publishes a version matching the CLI.
-gemspec="$REPO_ROOT/gem/socket-patch-bundler/socket-patch-bundler.gemspec"
-if [ -f "$gemspec" ]; then
-  sed -i.bak "s/s\.version *= *\".*\"/s.version     = \"$VERSION\"/" "$gemspec"
-  rm -f "$gemspec.bak"
-fi
+# pypi/socket-patch-hook and gem/socket-patch-bundler are frozen: `setup`
+# was removed in v5 and neither is built or published any more.
 
 # Update the RubyGems CLI launcher gem (gemspec version + the VERSION constant
 # the launcher uses to pick the matching GitHub release binary).

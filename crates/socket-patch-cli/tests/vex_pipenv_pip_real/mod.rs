@@ -94,7 +94,7 @@ impl Mode {
     /// The `scan` flags that produce this mode's wiring.
     pub fn scan_flags(self) -> &'static [&'static str] {
         match self {
-            Mode::Hosted => &["--redirect"],
+            Mode::Hosted => &["--mode=hosted"],
             Mode::Vendored => &["--vendor", "--vendor-source", "build"],
         }
     }

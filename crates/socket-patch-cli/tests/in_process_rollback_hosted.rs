@@ -70,6 +70,7 @@ const GEM_PATCH_REMOTE: &str = "http://patch.test/gems/t0k3nt0k3n/";
 
 fn hosted_scan_args(cwd: &Path, api_url: String) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
@@ -86,11 +87,10 @@ fn hosted_scan_args(cwd: &Path, api_url: String) -> ScanArgs {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: Some(ScanMode::Hosted),
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     }
 }
 
@@ -109,7 +109,6 @@ async fn rollback_in_process(cwd: &Path, targets: Vec<String>, preserve_state: b
             patch_server_url: Some("http://patch.test".to_string()),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        one_off: false,
         preserve_state,
     };
     let code = rollback_run(args).await;
@@ -155,7 +154,6 @@ async fn rollback_online(cwd: &Path, server: &MockServer) -> i32 {
             patch_server_url: Some("http://patch.test".to_string()),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        one_off: false,
         preserve_state: false,
     };
     let code = rollback_run(args).await;
@@ -669,7 +667,6 @@ async fn npm_hosted_dry_run_previews_cleanly() {
             patch_server_url: Some("http://patch.test".to_string()),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        one_off: false,
         preserve_state: false,
     };
     let code = rollback_run(args).await;
@@ -833,7 +830,6 @@ async fn pypi_requirements_hosted_round_trip() {
         ghsa: false,
         package: false,
         save_only: false,
-        one_off: false,
         all_releases: false,
         mode: Some(ScanMode::Hosted),
     };

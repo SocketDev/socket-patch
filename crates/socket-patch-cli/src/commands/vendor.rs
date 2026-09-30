@@ -408,13 +408,12 @@ fn advisory_tier(code: &str) -> AdvisoryTier {
 }
 
 /// The human line for a vendor advisory, or `None` when it is hidden at
-/// this verbosity. The stable code is kept on real warnings (it is what
-/// a user searches for); notes carry only the detail.
+/// this verbosity. The stable code is JSON-only (`warnings[].code`).
 pub(crate) fn format_advisory(code: &str, detail: &str, verbose: bool) -> Option<String> {
     match advisory_tier(code) {
         AdvisoryTier::Verbose if !verbose => None,
         AdvisoryTier::Verbose | AdvisoryTier::Note => Some(format!("Note: {detail}")),
-        AdvisoryTier::Warning => Some(format!("Warning ({code}): {detail}")),
+        AdvisoryTier::Warning => Some(format!("Warning: {detail}")),
     }
 }
 
@@ -634,7 +633,7 @@ pub(crate) fn note_classic_migration_risk(
         return;
     };
     if !common.silent && !common.json {
-        eprintln!("Warning ({}): {}", w.code, w.detail);
+        eprintln!("Warning: {}", w.detail);
     }
     env.warnings.push(RunWarning {
         code: w.code.to_string(),
@@ -1687,6 +1686,45 @@ pub(crate) async fn pristine_fetch_is_verifiable(
     }
 }
 
+/// Whether [`fetch_pristine_package`] would reach the download for this
+/// purl: the same entry choice (see [`pristine_fetch_is_verifiable`]), and
+/// none of the refusals its fetcher raises before the first request (a
+/// foreign yarn berry cacheKey, a go module go would not fetch through a
+/// proxy, a composer entry with no dist URL). Deferring a fetch that would
+/// refuse `vendor_fetch_unverifiable` behind the patch service would
+/// instead vendor the patch over a package it does not describe.
+async fn pristine_fetch_reaches_download(
+    project_root: &Path,
+    inventory: &[lock_inventory::LockfileEntry],
+    purl: &str,
+    ledger_entry: Option<&VendorEntry>,
+) -> bool {
+    let entry = match lock_inventory::lookup(inventory, purl)
+        .filter(|e| e.integrity != lock_inventory::LockIntegrity::None)
+    {
+        Some(e) => e.clone(),
+        None => match ledger_entry {
+            Some(le) => match lock_inventory::recover_lock_entry(project_root, le).await {
+                Ok(e) => e,
+                Err(_) => return false,
+            },
+            None => return false,
+        },
+    };
+    registry_fetch::refusal_before_download(&entry).is_none()
+}
+
+/// The ecosystems whose backend asks the patch service before it reads the
+/// pristine tree, and reads it only on a local-build fallback. pypi and gem
+/// read it earlier, in the loop's installed-variant probe; nuget and maven
+/// have no registry fetch.
+fn backend_reads_pristine_only_on_fallback(purl: &str) -> bool {
+    matches!(
+        Ecosystem::from_purl(purl),
+        Some(Ecosystem::Npm | Ecosystem::Cargo | Ecosystem::Golang | Ecosystem::Composer)
+    )
+}
+
 /// The purls among `purls` with an installed copy, found exactly as the
 /// vendor loop finds them: the qualified-aware resolver
 /// ([`find_packages_for_rollback_reusing`]), then the npm `package.json`
@@ -2366,11 +2404,12 @@ pub(crate) async fn vendor_records_reusing(
             //    backend's in-sync hot path answers it from the committed
             //    bytes alone, so a re-run needs no network. `--force` may
             //    rebuild anyway, so it keeps the eager fetch.
-            //  * a cargo crate the patch service can serve: the backend reads
-            //    the pristine tree only if it falls back to the local build.
-            //    Only a crate the registry ladder COULD fetch (see
-            //    `pristine_fetch_is_verifiable`) — a git, path or
-            //    custom-registry crate keeps the eager rung, whose
+            //  * a package the patch service can serve, in an ecosystem whose
+            //    backend reads the pristine tree only if it falls back to the
+            //    local build (`backend_reads_pristine_only_on_fallback`).
+            //    Only one the registry ladder would really download (see
+            //    `pristine_fetch_reaches_download`) — a git, path or
+            //    custom-registry crate, say, keeps the eager rung, whose
             //    `vendor_fetch_unverifiable` refusal keeps a crates.io patch
             //    off it.
             //
@@ -2390,10 +2429,10 @@ pub(crate) async fn vendor_records_reusing(
                         }
                         None => false,
                     };
-                let cargo_via_service = service_enabled
+                let via_service = service_enabled
                     && matches!(rung, MissingRung::Fetch)
-                    && Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo)
-                    && pristine_fetch_is_verifiable(
+                    && backend_reads_pristine_only_on_fallback(purl)
+                    && pristine_fetch_reaches_download(
                         &common.cwd,
                         inventory
                             .get_or_init(|| lock_inventory::inventory_project(&common.cwd))
@@ -2402,7 +2441,7 @@ pub(crate) async fn vendor_records_reusing(
                         lookup_entry(&state.entries, purl),
                     )
                     .await;
-                if covered || cargo_via_service {
+                if covered || via_service {
                     *rung = MissingRung::Deferred;
                 }
             }
@@ -3394,34 +3433,43 @@ pub(crate) async fn vendor_records_reusing(
             // package.json `pnpm.overrides` mirror is ignored), so pnpm-wired
             // runs must name that file among the committables: a checkout
             // that loses it silently unvendors on the next install.
-            if wired_flavors.contains("pnpm") {
-                println!(
-                    "Commit .socket/vendor/, package.json, pnpm-lock.yaml, and \
-                     pnpm-workspace.yaml to make the patches portable (pnpm >=11 reads \
-                     the vendored override only from pnpm-workspace.yaml)."
-                );
+            let commit = if wired_flavors.contains("pnpm") {
+                ".socket/vendor/, package.json, pnpm-lock.yaml, and pnpm-workspace.yaml to \
+                 make the patches portable (pnpm >=11 reads the vendored override only from \
+                 pnpm-workspace.yaml)"
             } else if wired_flavors.contains("vlt") {
-                println!("{VLT_COMMIT_HINT}");
+                VLT_COMMIT_HINT
             } else {
-                println!(
-                    "Commit .socket/vendor/ and the updated lockfiles to make the patches \
-                     portable."
-                );
-            }
-            if wired_flavors.contains("bun") && common.cwd.join("bun.lockb").exists() {
-                println!("For binary Bun workspaces, also commit the workspace members' .socket/vendor/ tarballs recorded in the vendor ledger.");
-            }
+                ".socket/vendor/ and the updated lockfiles to make the patches portable"
+            };
             let mut installs: Vec<&str> = wired_flavors
                 .iter()
                 .filter_map(|f| flavor_install_command(f))
                 .collect();
             installs.sort_unstable();
-            for cmd in installs {
-                println!(
-                    "Run `{cmd}` to update the installed tree — vendoring rewires the \
-                     lockfile only, so the current node_modules keeps the unpatched bytes \
-                     until reinstalled."
+            installs.dedup();
+            let reinstall = if installs.is_empty() {
+                "Reinstall from the updated lockfile so the installed packages pick up the \
+                 vendored artifacts"
+                    .to_string()
+            } else {
+                let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
+                format!(
+                    "Run {} to update the installed tree (vendoring rewires the lockfile \
+                     only; the current install keeps the unpatched bytes until reinstalled)",
+                    cmds.join(" and ")
+                )
+            };
+            let mut extra = Vec::new();
+            if wired_flavors.contains("bun") && common.cwd.join("bun.lockb").exists() {
+                extra.push(
+                    "For binary Bun workspaces, also commit the workspace members' \
+                     .socket/vendor/ tarballs recorded in the vendor ledger."
+                        .to_string(),
                 );
+            }
+            for line in crate::ui::next_steps(commit, &reinstall, &extra) {
+                println!("{line}");
             }
         }
     }
@@ -3429,10 +3477,10 @@ pub(crate) async fn vendor_records_reusing(
     has_errors
 }
 
-/// The committable-files hint of a vlt-wired run.
-const VLT_COMMIT_HINT: &str = "Commit package.json (and workspace package.json files), \
+/// What a vlt-wired run commits (the "Commit …" next step).
+const VLT_COMMIT_HINT: &str = "package.json (and workspace package.json files), \
      vlt-lock.json and .socket/vendor/ (the .gitignore there re-includes the payload and keeps \
-     vlt's node_modules links out of git); CI: `vlt ci`.";
+     vlt's node_modules links out of git); CI: `vlt ci`";
 
 /// The install command that re-materializes the project tree from the wired
 /// lockfile, per npm-family flavor. Vendoring edits ONLY the lockfile/config
@@ -3998,9 +4046,9 @@ pub(crate) async fn run_vendor_gc(
 /// Human-mode stderr line for a pass-level GC problem (the GC has no
 /// envelope of its own; JSON consumers see it as `scan --prune --json`'s
 /// `gc.skipped` / `gc.warnings`). Muted under `--json` and `--silent`.
-fn gc_note(common: &GlobalArgs, code: &str, detail: &str) {
+fn gc_note(common: &GlobalArgs, _code: &str, detail: &str) {
     if !common.json && !common.silent {
-        eprintln!("Warning ({code}): {detail}");
+        eprintln!("Warning: {detail}");
     }
 }
 
@@ -4027,7 +4075,6 @@ mod dispatch_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            packages_path: None,
             diffs_path: None,
             mem_blobs: None,
         };
@@ -4339,7 +4386,6 @@ mod variant_probe_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            packages_path: None,
             diffs_path: None,
             mem_blobs: None,
         };
@@ -4423,7 +4469,6 @@ mod variant_probe_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            packages_path: None,
             diffs_path: None,
             mem_blobs: None,
         };
@@ -5903,7 +5948,7 @@ mod ui_format_tests {
         );
         assert_eq!(
             format_advisory("vendor_lock_entry_drifted", "drifted", false),
-            Some("Warning (vendor_lock_entry_drifted): drifted".to_string())
+            Some("Warning: drifted".to_string())
         );
     }
 

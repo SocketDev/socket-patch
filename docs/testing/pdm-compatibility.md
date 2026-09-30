@@ -105,8 +105,11 @@ the patched `urllib3/response.py` (git-blob SHA-256 matches the ledger
 `afterHash`), ordinary `pdm install` keeps the lock stable, a tampered hash is
 rejected, a relock-then-rescan keeps rollback invertible, and rollback restores
 the lock and `pyproject.toml` byte for byte. `.github/workflows/pdm-compatibility.yml`
-runs it on Linux, Windows and macOS across every PDM major family. The matrix
-needs no Socket API token (the `urllib3@1.26.18` patch is a free tier).
+runs it on Linux and macOS across every PDM major family. It does not run on
+Windows: the harness bootstraps PDM through a POSIX venv layout (`bin/pdm`), so
+every Windows cell used to skip, and a run whose cells all skip or whose PDM
+bootstrap fails is now an error. The matrix needs no Socket API token (the
+`urllib3@1.26.18` patch is a free tier).
 
 > **Note (v5.0):** the "refused vendored scan still writes a `.socket/manifest.json`
 > record" observation in the notes column below describes the 4.0.0 binary the run

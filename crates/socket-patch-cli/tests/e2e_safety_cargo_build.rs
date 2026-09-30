@@ -40,10 +40,9 @@
 //!    with `.socket/manifest.json` deleted, `vex` finds nothing to attest
 //!    (`manifest_not_found`, exit 2, zero API requests, no document),
 //!    offline or online, and `apply --vex` stays the calm `noManifest`
-//!    exit 0 without a document. (With the manifest the patch is still
-//!    omitted, `ecosystem_not_setup`: cargo has no install hook, so an
-//!    agent-mode cargo patch attests only when `setup.manual` declares it.)
-//!    The patched bytes on disk never attest by themselves.
+//!    exit 0 without a document. (With the manifest the applied, verified
+//!    agent-mode patch attests.) The patched bytes on disk never attest by
+//!    themselves.
 //!
 //! Network: no. Toolchain: cargo (already on every e2e CI runner); the
 //! `cargo_e2e_matrix` knobs (`SOCKET_PATCH_CARGO_E2E_TOOLCHAIN` /
@@ -399,18 +398,34 @@ fn apply_then_cargo_check_succeeds() {
 /// the user's own), so VEX has nothing to attest and makes no request.
 fn manifestless_agent_patch_is_not_attested(consumer: &Path, cargo_home: &Path) {
     use vex_e2e_common::{
-        assert_not_attested, run_vex, strip_ledgers, strip_manifest, PatchApi, VexRun, VexVia,
+        run_vex, statements_for, strip_ledgers, strip_manifest, PatchApi, VexRun, VexVia,
     };
 
     let bin = vex_e2e_common::binary();
     let api = PatchApi::empty();
     let run = VexRun::online(&api).env("CARGO_HOME", cargo_home);
 
-    // Baseline, manifest present: cargo has no install hook, so the
-    // agent-mode patch is omitted until `setup.manual` declares it.
+    // Baseline, manifest present: the applied, verified agent-mode patch
+    // attests. The staged manifest carries no vulnerabilities (which alone
+    // would end `no_applicable_patches`), so give the entry one first.
+    let manifest_path = consumer.join(".socket/manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["patches"][FIXTURE_PURL]["vulnerabilities"] = serde_json::json!({
+        "GHSA-cccc-cccc-cccc": {
+            "cves": ["CVE-2099-0001"],
+            "summary": "cargo safety vex vuln",
+            "severity": "high",
+            "description": "d"
+        }
+    });
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
     let out = run_vex(&bin, consumer, &run);
-    assert_eq!(out.code, Some(1), "manifest-backed vex:\n{out}");
-    assert_not_attested(&out.envelope, FIXTURE_PURL, "ecosystem_not_setup");
+    assert_eq!(out.code, Some(0), "manifest-backed vex:\n{out}");
+    assert!(
+        !statements_for(out.doc(), FIXTURE_PURL).is_empty(),
+        "manifest-backed vex attests the agent-mode patch:\n{out}"
+    );
 
     strip_manifest(consumer);
     strip_ledgers(consumer);

@@ -25,7 +25,8 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 
-use super::pnpm_lock_legacy::PnpmLockGrammar;
+use crate::formats::pnpm::PnpmLockGrammar;
+use crate::formats::yarn::{sniff_grammar, YarnLockGrammar, UNIDENTIFIED_DETAIL};
 use super::source::PackageSource;
 use super::state::VendorEntry;
 use super::{
@@ -90,11 +91,6 @@ impl NpmLockFlavor {
 use crate::constants::npm_family::{
     BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS, VLT_LOCK,
 };
-
-/// How many head lines the yarn content sniff reads (the v1 header sits in
-/// the leading comment block; berry's `__metadata:` is the first top-level
-/// key after it).
-const YARN_SNIFF_HEAD_LINES: usize = 30;
 
 /// Every lockfile name the probe knows, grouped into wiring families: the
 /// flavor that owns a family wires (or supersedes) every file in it, so only
@@ -215,7 +211,7 @@ pub(crate) async fn detect_npm_lock_flavor(
         //    anything else refuses with the sniff's version-aware remedy.
         if exists(PNPM_LOCK).await {
             let text = read_lock(project_root, PNPM_LOCK).await?;
-            match pnpm_lock_legacy::sniff_lock_grammar(&text) {
+            match crate::formats::pnpm::sniff_lock_grammar(&text) {
                 Ok(PnpmLockGrammar::V9) => break 'flavor NpmLockFlavor::Pnpm,
                 Ok(PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => {
                     break 'flavor NpmLockFlavor::PnpmLegacy
@@ -322,29 +318,19 @@ async fn read_lock(project_root: &Path, name: &str) -> Result<String, (&'static 
 /// mistaken for classic.
 async fn sniff_yarn_lock(project_root: &Path) -> Result<NpmLockFlavor, (&'static str, String)> {
     let text = read_lock(project_root, "yarn.lock").await?;
-    // CRLF lines split like LF ones; a leading BOM is not key text.
-    let head: Vec<&str> = text
-        .strip_prefix('\u{feff}')
-        .unwrap_or(&text)
-        .lines()
-        .take(YARN_SNIFF_HEAD_LINES)
-        .collect();
     // Berry wins the check (it must never be mistaken for classic). The
     // node-modules linker keeps packages on disk for staging, and berry's
     // cache-zip checksum is reproducible from our tarball (berry_zip), so the
     // backend can wire it; PnP (caught earlier by the `.pnp.*` markers) is the
     // only berry layout vendor refuses.
-    if head.iter().any(|l| l.starts_with("__metadata:")) {
-        return Ok(NpmLockFlavor::YarnBerry);
-    }
-    if head.iter().any(|l| l.trim() == "# yarn lockfile v1") {
-        return Ok(NpmLockFlavor::YarnClassic);
+    match sniff_grammar(&text) {
+        Some(YarnLockGrammar::Berry) => return Ok(NpmLockFlavor::YarnBerry),
+        Some(YarnLockGrammar::Classic) => return Ok(NpmLockFlavor::YarnClassic),
+        None => {}
     }
     Err((
         "vendor_lockfile_version_unsupported",
-        "yarn.lock carries neither the `# yarn lockfile v1` header nor a berry \
-         `__metadata:` key; cannot identify the lockfile version"
-            .to_string(),
+        UNIDENTIFIED_DETAIL.to_string(),
     ))
 }
 
@@ -579,7 +565,6 @@ pub async fn lock_text_refusals(
     let nowhere = nowhere_buf.as_path();
     let no_sources = PatchSources {
         blobs_path: nowhere,
-        packages_path: None,
         diffs_path: None,
         mem_blobs: None,
     };
@@ -797,7 +782,6 @@ mod lock_text_refusal_tests {
         let nowhere = root.join("not-installed");
         let sources = PatchSources {
             blobs_path: &nowhere,
-            packages_path: None,
             diffs_path: None,
             mem_blobs: None,
         };
@@ -852,9 +836,9 @@ mod lock_text_refusal_tests {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn probe_lockfile_names_match_the_shared_npm_family_table() {
-        // Drift guard: the probe's wiring families and the shared
-        // constants::npm_family table must agree on which file names the
+    fn probe_lockfile_names_match_the_format_registry() {
+        // Drift guard: the probe's wiring families and the format
+        // registry's npm PROBE rows must agree on which file names the
         // vendor probe recognizes. A new lockfile spelling added in one
         // place must show up in the other (and in every other consumer's
         // guard test) instead of drifting silently.
@@ -863,7 +847,7 @@ mod tests {
             .flat_map(|(_, names)| names.iter().copied())
             .collect();
         from_families.sort_unstable();
-        let mut from_table = crate::constants::npm_family::names_with(|r| r.vendor_probe);
+        let mut from_table = crate::formats::registry::probe_paths("npm");
         from_table.sort_unstable();
         assert_eq!(from_families, from_table);
     }

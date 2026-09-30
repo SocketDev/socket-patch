@@ -23,6 +23,9 @@ The `yarn-berry-e2e` job in `.github/workflows/ci.yml` runs
 | macos-latest | 4.12.0 |
 | windows-latest | 4.12.0 |
 
+Pull requests skip ubuntu 4.6.0 and 4.12.0 (the `yarn-berry-full` job, which
+runs on main pushes, nightly and dispatch).
+
 Each release drives four real-yarn suites — `e2e_redirect_yarn_berry_build`,
 `e2e_vendor_yarn_berry_build`, `e2e_yarn4_pnpm_linker_build` and
 `e2e_yarn4_workspaces_build` — each ending in the manifest-less VEX matrix of
@@ -78,10 +81,6 @@ What socket-patch does with those files:
 | mixed CRLF / LF, or a bare CR | refused untouched: `redirect_yarn_berry_mixed_line_endings` | refused before any write: `vendor_yarn_berry_mixed_line_endings` |
 | revert (`rollback`, `remove`, takeovers) | byte-exact; a ledger recorded before a uniform LF ↔ CRLF checkout flip is replayed respelled; a mixed lock refuses as drift | byte-exact; a lock mixed after vendoring gets the restored entry in the terminator of the entry it replaces |
 | mode takeover into this mode | the berry gates (line endings, `cacheKey`, `compressionLevel`) run BEFORE the vendored wiring is reverted; a refused purl stays vendored, byte-identical | the backend's project gates (both files' line endings, `cacheKey`, `compressionLevel`) run BEFORE the hosted redirect is reverted; a refused purl stays hosted, byte-identical |
-
-`setup` / `setup --remove` write `package.json` in the same layout-keeping
-way (BOM, indent, ending, trailing newline), so the pair round-trips
-byte-exactly on a CRLF manifest too.
 
 Every reader — manifest-less `vex`, the lockfile inventory, the npm flavor
 sniff, `repair` — splits CRLF lines like LF ones and skips a leading BOM.

@@ -330,13 +330,13 @@ pub(super) fn format_gc_line(gc: &GcSummary, preview: bool) -> Option<String> {
 /// Human-readable line(s) for the vendored-state half of a GC pass (and
 /// the lock-skip reason / failed rewrites, when the pass could not run or
 /// persist in full), in order; empty when there is nothing to report.
-/// Split out so the contract's human GC vocabulary (`GC: skipped (<code>):
+/// Split out so the contract's human GC vocabulary (`GC: skipped:
 /// <message>.`, one `GC: <detail>.` per warning, `GC: failed to revert N
 /// vendored entry/entries: …`) is unit-testable without capturing stdout.
 pub(super) fn format_gc_vendored_lines(gc: &GcSummary) -> Vec<String> {
     let mut lines = Vec::new();
-    if let Some((code, message)) = &gc.skipped {
-        lines.push(format!("GC: skipped ({code}): {message}."));
+    if let Some((_, message)) = &gc.skipped {
+        lines.push(format!("GC: skipped: {message}."));
     }
     for (_, detail) in &gc.warnings {
         lines.push(format!("GC: {detail}."));
@@ -1524,7 +1524,7 @@ mod tests {
         assert_eq!(
             format_gc_vendored_lines(&gc),
             vec![
-                "GC: skipped (lock_held): another socket-patch process is operating in this \
+                "GC: skipped: another socket-patch process is operating in this \
                  directory."
                     .to_string(),
                 "GC: could not update manifest.".to_string(),

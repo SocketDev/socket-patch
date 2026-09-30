@@ -39,6 +39,11 @@ const PACKAGE_LOCK: &str = r#"{
       "version": "0.5.0",
       "resolved": "git+ssh://git@github.com/x/git-dep.git#abc"
     },
+    "node_modules/local-tarball": {
+      "version": "1.0.0",
+      "resolved": "file:vendor/local-tarball-1.0.0.tgz",
+      "integrity": "sha512-local=="
+    },
     "node_modules/vendored": {
       "version": "3.0.0",
       "resolved": "file:.socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/vendored-3.0.0.tgz",
@@ -80,6 +85,11 @@ async fn package_lock_inventories_registry_entries() {
     let git = entry(&entries, "git-dep");
     assert_eq!(git.resolved, None);
     assert_eq!(git.integrity, LockIntegrity::None);
+    // Nor does a local tarball: its integrity is of bytes no registry
+    // serves, so no registry fetch may be verified against it.
+    let local = entry(&entries, "local-tarball");
+    assert_eq!(local.resolved, None);
+    assert_eq!(local.integrity, LockIntegrity::None);
 
     // Workspace members, links, bundled deps, our vendored spec, the
     // unsafe-version entry, and the version-less node are all absent.
@@ -874,6 +884,69 @@ async fn yarn_classic_blocks_yield_resolved_sha1_and_integrity() {
     // `alias@npm:real@range` resolves to the real name.
     assert!(entries.iter().any(|e| e.name == "real-name"));
     assert_eq!(entry(&entries, "@scope/pkg").version, "2.0.0");
+}
+
+/// A git resolution's `#<commit>` fragment is not a tarball sha1: the
+/// entry carries no integrity, so no registry fetch (or fetch deferred
+/// behind the patch service) treats it as a verifiable registry package.
+#[tokio::test]
+async fn yarn_classic_git_resolution_fragment_is_not_an_integrity() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "yarn.lock",
+        "# yarn lockfile v1\n\n\
+         \"from-git@git+https://github.com/o/from-git.git\":\n\
+         \x20 version \"1.0.0\"\n\
+         \x20 resolved \"git+https://github.com/o/from-git.git#0123456789abcdef0123456789abcdef01234567\"\n",
+    )
+    .await;
+    let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    let e = entry(&entries, "from-git");
+    assert_eq!(e.resolved, None);
+    assert_eq!(e.integrity, LockIntegrity::None);
+}
+
+/// The same holds for a git repository reached over plain https (a
+/// `.git` URL or a codeload tarball), and an `integrity` field on such a
+/// block is not a registry integrity either; a registry tarball keeps
+/// both.
+#[tokio::test]
+async fn yarn_classic_https_git_resolutions_carry_no_integrity() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "yarn.lock",
+        "# yarn lockfile v1\n\n\
+         \"https-git@https://github.com/o/https-git.git\":\n\
+         \x20 version \"1.0.0\"\n\
+         \x20 resolved \"https://github.com/o/https-git.git#0123456789abcdef0123456789abcdef01234567\"\n\
+         \x20 integrity sha512-fromgit==\n\n\
+         \"codeload@o/codeload\":\n\
+         \x20 version \"2.0.0\"\n\
+         \x20 resolved \"https://codeload.github.com/o/codeload/tar.gz/0123456789abcdef0123456789abcdef01234567\"\n\
+         \x20 integrity sha512-codeload==\n\n\
+         registry-pkg@^3.0.0:\n\
+         \x20 version \"3.0.0\"\n\
+         \x20 resolved \"https://registry.yarnpkg.com/registry-pkg/-/registry-pkg-3.0.0.tgz#dddddddddddddddddddddddddddddddddddddddd\"\n\
+         \x20 integrity sha512-registry==\n",
+    )
+    .await;
+    let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    for name in ["https-git", "codeload"] {
+        let e = entry(&entries, name);
+        assert_eq!(e.resolved, None, "{name}");
+        assert_eq!(e.integrity, LockIntegrity::None, "{name}");
+    }
+    let registry = entry(&entries, "registry-pkg");
+    assert_eq!(
+        registry.resolved.as_deref(),
+        Some("https://registry.yarnpkg.com/registry-pkg/-/registry-pkg-3.0.0.tgz")
+    );
+    assert_eq!(
+        registry.integrity,
+        LockIntegrity::Sri("sha512-registry==".into())
+    );
 }
 
 // ── yarn berry ────────────────────────────────────────────────────────
@@ -2409,6 +2482,80 @@ async fn wired_vendor_integrity_reads_rewired_yarn_classic_and_skips_bad_json_lo
     );
 }
 
+/// The yarn / bun branches of `wired_vendor_integrity` read the entry
+/// models lockfile discovery reads, not a line window: a berry block whose
+/// carried sections push `checksum:` far below the reference, yarn 4.0.x's
+/// bare-hex checksum, a CRLF classic lock, a shadowed classic block (yarn
+/// keeps the last one) and bun's digest-less re-save (which must never
+/// borrow the next tuple's sha512).
+#[tokio::test]
+async fn wired_vendor_integrity_reads_yarn_and_bun_entries_structurally() {
+    let rel = ".socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
+    let hex = "ab".repeat(64);
+    let berry = |checksum: &str| {
+        format!(
+            "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"left-pad@file:./{rel}::locator=app%40workspace%3A.\":\n  \
+             version: 1.3.0\n  \
+             resolution: \"left-pad@file:./{rel}#./{rel}::hash=abc&locator=app%40workspace%3A.\"\n  \
+             dependencies:\n    a: \"npm:1.0.0\"\n    b: \"npm:1.0.0\"\n    c: \"npm:1.0.0\"\n    d: \"npm:1.0.0\"\n    e: \"npm:1.0.0\"\n  \
+             checksum: {checksum}\n  \
+             languageName: node\n  \
+             linkType: hard\n"
+        )
+    };
+    for (checksum, want) in [
+        (format!("10c0/{hex}"), format!("10c0/{hex}")),
+        (hex.clone(), format!("10c0/{hex}")),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "yarn.lock", &berry(&checksum)).await;
+        assert_eq!(
+            wired_vendor_integrity(tmp.path(), rel).await,
+            Some(LockIntegrity::BerryChecksum(want)),
+            "{checksum}"
+        );
+    }
+
+    let classic = |key: &str, sri: &str| {
+        format!(
+            "{key}:\n  version \"1.3.0\"\n  resolved \"file:./{rel}#0000000000000000000000000000000000000000\"\n  integrity {sri}\n"
+        )
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let lock = format!(
+        "# yarn lockfile v1\n\n{}\n{}",
+        classic("left-pad@^1.3.0", "sha512-shadowed=="),
+        classic("left-pad@^1.3.0", "sha512-live==")
+    )
+    .replace('\n', "\r\n");
+    write(tmp.path(), "yarn.lock", &lock).await;
+    assert_eq!(
+        wired_vendor_integrity(tmp.path(), rel).await,
+        Some(LockIntegrity::Sri("sha512-live==".into())),
+        "the live (last) block of a CRLF lock"
+    );
+
+    let bun = |ours: &str| {
+        format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {{\n    \"\": {{\n      \"name\": \"app\",\n    }},\n  }},\n  \"packages\": {{\n    \"left-pad\": [\"left-pad@./{rel}\", {{}}{ours}],\n\n    \"right-pad\": [\"right-pad@1.0.0\", \"\", {{}}, \"sha512-theirs==\"],\n  }}\n}}\n"
+        )
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "bun.lock", &bun(", \"sha512-ours==\"")).await;
+    assert_eq!(
+        wired_vendor_integrity(tmp.path(), rel).await,
+        Some(LockIntegrity::Sri("sha512-ours==".into()))
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "bun.lock", &bun("")).await;
+    assert_eq!(
+        wired_vendor_integrity(tmp.path(), rel).await,
+        None,
+        "a digest-less re-save pins nothing"
+    );
+}
+
 /// `PnpmPackage::resolution_tokens` exposes the raw `resolution:` value the
 /// grammar refused (a nested map, a duplicate key, a wrapped flow map), so
 /// lockfile discovery can still tell a Socket-shaped entry from anything
@@ -2419,7 +2566,7 @@ fn pnpm_resolution_tokens_cover_maps_the_grammar_refuses() {
     let lock = format!(
         "lockfileVersion: '9.0'\n\npackages:\n\n  x@1.0.0:\n    resolution:\n      tarball: {url}\n      nested:\n        a: b\n\n  y@1.0.0:\n    resolution: {{integrity: sha512-a}}\n    resolution: {{tarball: '{url}'}}\n\n  z@1.0.0:\n    resolution: {{integrity: sha512-z,\n      tarball: \"{url}\"}}\n\n  ok@1.0.0:\n    resolution: {{integrity: sha512-ok}}\n"
     );
-    let packages = super::pnpm::pnpm_packages(&lock);
+    let packages = crate::formats::pnpm::pnpm_packages(&lock);
     let by_key = |key: &str| packages.iter().find(|p| p.key == key).unwrap();
     for key in ["x@1.0.0", "y@1.0.0", "z@1.0.0"] {
         let package = by_key(key);
@@ -2660,7 +2807,6 @@ async fn the_hosted_rewriters_own_output_reinventories() {
             sha256: Some("c".repeat(64)),
             ..Default::default()
         },
-        berry_zip_url: None,
         registry_override: None,
     };
     let rewritten = rewrite_registry_redirect(

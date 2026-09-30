@@ -70,12 +70,12 @@ use super::common::{
     prune_empty_vendor_levels, refused, service_offline_conflict, stage_dir_for,
     swap_stage_into_place, synthesized_result,
 };
-use super::gemfile_lock::{is_plain_gem_token, split_checksum_entry, split_entry};
+use crate::formats::gem::{is_plain_gem_token, split_checksum_entry, split_entry};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::{extract_gem_data, extract_on_blocking_pool};
 use super::service_fetch::{
     claim_prestaged, fetch_verified_archive, fetch_verified_secondary, SecondaryArtifactResult,
-    ServiceArtifact,
+    ServiceAttempt, ServicePolicy, ServiceTerminal,
 };
 use super::source::PackageSource;
 use super::state::{
@@ -976,46 +976,14 @@ async fn gem_service_copy(
     };
 
     // Step 1: the prebuilt `.gem` (sha512-verified against the reference).
-    let mut archive = match fetch_verified_archive(cfg, &record.uuid).await {
-        ServiceArtifact::Ready(archive) => archive,
-        // Bytes that fail integrity verification are an active tamper signal:
-        // ALWAYS a hard error, in `auto` exactly as in `service` — never a
-        // quiet local-build fallback (`ServiceArtifact`'s documented contract).
-        ServiceArtifact::IntegrityMismatch(reason) => {
-            return hard(
-                "vendor_prebuilt_integrity_mismatch",
-                format!(
-                    "prebuilt .gem for {name} failed integrity verification ({reason}); \
-                     refusing to fall back to a local build on tampered bytes"
-                ),
-            );
-        }
-        ServiceArtifact::Pending => {
-            return miss(
-                warnings,
-                "vendor_prebuilt_pending",
-                ("vendor_prebuilt_required", ""),
-                "prebuilt .gem is still building".to_string(),
-                false,
-            );
-        }
-        ServiceArtifact::Unavailable(reason) => {
-            if cfg.source.requires_service() {
-                return hard(
-                    "vendor_prebuilt_required",
-                    format!("prebuilt .gem unavailable: {reason}"),
-                );
-            }
+    let fetched = fetch_verified_archive(cfg, &record.uuid).await;
+    let subject = format!(".gem for {name}");
+    let policy = ServicePolicy::new(cfg, ServiceTerminal::Refused);
+    let mut archive = match policy.settle::<()>(fetched, ".gem", &subject, warnings) {
+        Ok(archive) => archive,
+        Err(ServiceAttempt::HardFail(outcome)) => return GemServiceCopy::HardFail(outcome),
+        Err(ServiceAttempt::Used(()) | ServiceAttempt::FallBack) => {
             return GemServiceCopy::FallBack(None);
-        }
-        ServiceArtifact::Failed(reason) => {
-            return miss(
-                warnings,
-                "vendor_prebuilt_unavailable",
-                ("vendor_prebuilt_required", ""),
-                format!("patch service request failed ({reason})"),
-                false,
-            );
         }
     };
 

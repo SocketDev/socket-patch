@@ -180,8 +180,7 @@ pub async fn fetch_blobs_by_hash(
 
 /// Return the set of patch UUIDs whose archive at
 /// `<archives_dir>/<uuid>.tar.gz` is missing from disk. Used as the
-/// "what do I need to download" query for diff mode, and as a presence
-/// check for locally staged package archives (`.socket/packages/`).
+/// "what do I need to download" query for diff mode.
 pub async fn get_missing_archives(
     manifest: &PatchManifest,
     archives_dir: &Path,
@@ -347,7 +346,8 @@ pub const DIFF_ARCHIVE: ArtifactNoun = ArtifactNoun {
     abbreviate_ids: false,
 };
 
-/// Per-patch package archives (`.socket/packages/<uuid>.tar.gz`).
+/// Legacy per-patch package archives (`.socket/packages/<uuid>.tar.gz`),
+/// which nothing writes or reads any more; only the cleanup sweeps name them.
 pub const PACKAGE_ARCHIVE: ArtifactNoun = ArtifactNoun {
     one: "package archive",
     many: "package archives",

@@ -188,7 +188,10 @@ pub(super) async fn inventory_pypi_locks_in(view: &ProjectView<'_>) -> Option<Ve
 /// on disk; the in-memory project's root-level names otherwise), sorted.
 pub(crate) fn python_lock_paths_in(view: &ProjectView<'_>) -> std::io::Result<Vec<String>> {
     match view {
-        ProjectView::Disk(root) => crate::utils::python_lock::python_lock_paths(root),
+        ProjectView::Disk(root)
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot { root, .. }) => {
+            crate::utils::python_lock::python_lock_paths(root)
+        }
         ProjectView::Memory(project) => Ok(project
             .children("")
             .into_iter()

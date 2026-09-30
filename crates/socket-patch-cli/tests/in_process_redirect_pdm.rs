@@ -119,7 +119,6 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
             patch_server_url: Some(PATCH_SERVER.to_string()),
             ..global(cwd, server.uri())
         },
-        one_off: false,
         preserve_state: false,
     })
     .await;
@@ -152,6 +151,7 @@ fn assert_no_ledger(root: &Path) {
 
 fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: global(cwd, api_url),
@@ -160,14 +160,13 @@ fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: true,
-        mode: None,
+        mode: Some(socket_patch_cli::commands::scan::ScanMode::Hosted),
         all_releases: false,
         vex: VexEmbedArgs {
             vex: vex.map(Path::to_path_buf),
             ..Default::default()
         },
+        rollout: Default::default(),
     }
 }
 
