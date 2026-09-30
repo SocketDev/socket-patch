@@ -1065,9 +1065,13 @@ jobs:
           - {os: macos-latest, suite: e2e_vex_build, test_filter: 'pip:: --ignored', pip: '22 26'}
           # Real-Maven hosted + vendored capstones, one leg per Maven line:
           # 3.6 (pre http-blocker), 3.8 (resolver 1.6: no trusted checksums),
-          # 3.9 (trusted checksums), 4.0 rc.
+          # 3.9 (trusted checksums), 4.0 rc. Hosted also runs both sides of
+          # the trusted-checksums floor: 3.9.3 (last release that ignores
+          # the .mvn/checksums pin) and 3.9.4 (first that enforces it).
           - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '3.6.3'}
           - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '3.8.9'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '3.9.3'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '3.9.4'}
           - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '3.9.16'}
           - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '4.0.0-rc-6'}
           - {os: macos-latest, suite: e2e_redirect_maven_build, maven: '3.9.16'}
