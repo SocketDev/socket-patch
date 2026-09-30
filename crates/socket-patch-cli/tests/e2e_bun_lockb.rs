@@ -25,6 +25,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 mod bun_vex;
 #[path = "common/cache_env.rs"]
 mod cache_env;
+mod prebuilt_common;
 
 const ORG: &str = "binary-bun-test";
 const PURL: &str = "pkg:npm/minimist@1.2.2";
@@ -70,10 +71,10 @@ fn cli(project: &Path, args: &[&str]) -> Value {
 
 /// [`cli`] with extra environment variables.
 fn cli_env(project: &Path, args: &[&str], envs: &[(&str, &str)]) -> Value {
+    let mut cmd = command(env!("CARGO_BIN_EXE_socket-patch"), project);
+    let _prebuilt = prebuilt_common::prepare_command(&mut cmd, project, args, envs);
     let output = require_success(
-        command(env!("CARGO_BIN_EXE_socket-patch"), project)
-            .envs(envs.iter().copied())
-            .args(args)
+        cmd.envs(envs.iter().copied())
             .args([
                 "--cwd",
                 project.to_str().unwrap(),
@@ -673,6 +674,7 @@ fn file_mode(_p: &Path, name: &str) -> u32 {
 
 async fn mock_api(server: &MockServer, fixture: &Fixture, _target: &str) {
     let tgz = make_tgz_from_installed(&installed_target(&fixture.project), &fixture.patched);
+    prebuilt_common::mount_download(server, PURL, UUID, "minimist-1.2.2.tgz", &tgz).await;
     std::fs::write(fixture.temp.path().join("hosted.tgz"), &tgz).unwrap();
     let url = format!("{}/patch/npm/minimist/1.2.2/33333333-3333-4333-8333-333333333333/{UUID}/minimist-1.2.2.tgz", server.uri());
     let sri = format!(

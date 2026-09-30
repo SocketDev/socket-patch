@@ -422,7 +422,11 @@ fn source_dir(root: &Path, paths: &[PathBuf], purl: &str) -> PathBuf {
     let version = version.replace("%2B", "+").replace("%2b", "+");
     if kind == "npm" {
         let direct = root.join("node_modules").join(name);
-        if direct.is_dir() {
+        let version_matches = std::fs::read(direct.join("package.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_none_or(|package| package["version"].as_str().is_none_or(|v| v == version));
+        if direct.is_dir() && version_matches {
             return direct;
         }
     }
@@ -436,7 +440,10 @@ fn source_dir(root: &Path, paths: &[PathBuf], purl: &str) -> PathBuf {
             }))
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .is_some_and(|p| p["name"].as_str() == Some(name)),
+            .is_some_and(|p| {
+                p["name"].as_str() == Some(name)
+                    && (kind != "npm" || p["version"].as_str().is_none_or(|v| v == version))
+            }),
             "pypi" => {
                 leaf == "site-packages"
                     && dir
