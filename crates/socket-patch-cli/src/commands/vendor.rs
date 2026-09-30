@@ -98,7 +98,7 @@ pub struct VendorArgs {
     pub check: bool,
 
     /// Also check suffixed Maven jars in this local repository for conflicting bytes.
-    #[arg(long, requires = "check")]
+    #[arg(long, requires = "check", hide_short_help = true)]
     pub local_repo: Option<std::path::PathBuf>,
 
     /// On a successful vendor, also generate an OpenVEX 0.2.0 document

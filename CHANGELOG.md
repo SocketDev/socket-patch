@@ -682,6 +682,14 @@ into the new version's section — see docs/releasing.md.
 
 ### Added
 
+- **Vendored Maven reactors and Gradle builds.** Reactors use suffixed
+  coordinates and a committed Maven repository; Gradle keeps original
+  coordinates and lockfiles, with settings wiring and build-time integrity
+  checks. Existing Gradle verification metadata includes parent and BOM
+  metadata. `vendor --check` audits committed artifacts and wiring offline;
+  `--local-repo` checks Maven cache conflicts, and `--maven-config=none`
+  selects the fallback file repository. Repair, rollback, removal, patch
+  updates and VEX use the same JVM ledger. Single-POM vendoring is unchanged.
 - **`scan --max-new-patches <N|none>` rolls patches out gradually**
   (env `SOCKET_MAX_NEW_PATCHES`; socket.yml `patches.maxNewPatches`).
   Each run adds at most N patches to packages that had none, most severe first
