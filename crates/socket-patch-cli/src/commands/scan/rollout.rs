@@ -353,6 +353,27 @@ mod tests {
     }
 
     #[test]
+    fn composer_version_spellings_upgrade_without_spending_the_new_patch_budget() {
+        let stored = manifest(&[("pkg:composer/psr/log@3.0.2.0", "old")]);
+        let recorded = RecordedIndex::new(Some(&stored), &[]);
+        let offers = offers_from_results(
+            &[offer("pkg:composer/psr/log@v3.0.2", "new", "2026-02-01T00:00:00Z", &["high"])],
+            false,
+        );
+        let rows = classify(&offers, &recorded, "");
+        let plan = socket_patch_core::rollout::plan_rollout(
+            rows.into_iter().map(|row| row.candidate).collect(),
+            &MaxNew { value: Some(0), source: MaxNewSource::Flag },
+            false,
+            &BTreeSet::new(),
+        );
+        assert_eq!(plan.counts.upgrade, 1);
+        assert_eq!(plan.counts.new, 0);
+        assert!(plan.deferred.is_empty());
+        assert_eq!(plan.admitted.len(), 1);
+    }
+
+    #[test]
     fn recorded_matches_percent_encoding_and_qualifier_twins() {
         let results = vec![
             offer("pkg:npm/%40s/x@1", "e1", "", &["high"]),

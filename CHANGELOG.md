@@ -1306,6 +1306,22 @@ into the new version's section — see docs/releasing.md.
 - **Hosted `scan` resolves more than 500 patches.** The package-reference
   request is sent in chunks of 500 uuids, the endpoint's limit; a larger
   scan used to fail with a 400.
+- **Hosted nuget redirects survive a `<clear />` in `nuget.config`.** The
+  Socket source (and, in an existing `<packageSourceMapping>`, its
+  mapping) was inserted ahead of the section's `<clear />`, which NuGet
+  applies to everything read before it: `dotnet restore` then failed
+  NU1100 / NU1101 for the patched package. Both now land after the last
+  `<clear />`.
+
+- **nuget redirects and vendoring edit the config NuGet actually reads.**
+  NuGet reads the first of `nuget.config`, `NuGet.config` and
+  `NuGet.Config` in a directory. Hosted mode only knew `nuget.config`
+  and vendored mode missed `NuGet.config`, so on a case-sensitive
+  filesystem they created a fresh `nuget.config` that shadowed the
+  project's own file: its sources and mappings vanished and private
+  packages failed restore. Both modes now edit the existing spelling in
+  place.
+
 - **`rollback` fetches a before-blob that only a store peer variant
   needs.** The before-blob gate now probes every pnpm and vlt store variant
   copy the rollback restores, so an online rollback no longer fails

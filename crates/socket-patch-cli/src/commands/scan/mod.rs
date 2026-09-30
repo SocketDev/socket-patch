@@ -19,9 +19,10 @@ use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{
     spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry,
 };
+use socket_patch_core::utils::composer_version::purl_identity_key;
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
-use socket_patch_core::vendor::VendorState;
+use socket_patch_core::vendor::{purl_keys_cover, VendorState};
 use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
@@ -791,11 +792,8 @@ fn partition_agent_selection(
     vendored: &HashSet<String>,
     lockfile_only: &LockfileSupplement,
 ) -> AgentSelection {
-    let (kept, vendored_records) = partition_skipped_selected(
-        selected,
-        |p| vendored.contains(p) || vendored.contains(strip_purl_qualifiers(p)),
-        "vendored",
-    );
+    let (kept, vendored_records) =
+        partition_skipped_selected(selected, |p| purl_keys_cover(vendored, p), "vendored");
     let (kept, not_installed_records) = partition_skipped_selected(
         kept,
         |p| lockfile_only_contains(&lockfile_only.purls, p),
@@ -1154,17 +1152,19 @@ pub(super) async fn hosted_wiring_retained_purls(
         return Vec::new();
     }
     let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
+    // By release identity: a record keyed `@3.0.2.0` names the scanned
+    // composer `@3.0.2`.
     let scanned: std::collections::BTreeSet<String> = scanned_purls
         .into_iter()
-        .map(|p| canon(p.as_ref()))
+        .map(|p| purl_identity_key(p.as_ref()))
         .collect();
     // Cheap no-I/O gate: skip the lockfile proofs when no record names a
     // scanned purl.
     let candidates: Vec<(String, &str)> = redirect
         .records
         .iter()
+        .filter(|(key, _)| scanned.contains(&purl_identity_key(key)))
         .map(|(key, record)| (canon(key), record.uuid.as_str()))
-        .filter(|(purl, _)| scanned.contains(purl))
         .collect();
     if candidates.is_empty() {
         return Vec::new();
@@ -3418,6 +3418,97 @@ mod tests {
         let retained =
             hosted_wiring_retained_purls(&common_at(root), state.as_ref(), &scanned).await;
         assert_eq!(retained, vec![purl.to_string()]);
+    }
+
+    /// A composer package vendored under the padded `@3.0.2.0` spelling is
+    /// still vendor-owned when a later scan's batch echoes `@3.0.2`: it is
+    /// skipped as vendored, never applied in place.
+    #[test]
+    fn agent_selection_partitions_composer_vendored_by_release_identity() {
+        let result = |purl: &str| PatchSearchResult {
+            uuid: TAKEOVER_UUID.to_string(),
+            purl: purl.to_string(),
+            published_at: String::new(),
+            description: String::new(),
+            license: "MIT".to_string(),
+            tier: "free".to_string(),
+            vulnerabilities: HashMap::new(),
+        };
+        let mut state = VendorState::new();
+        let entry: socket_patch_core::vendor::VendorEntry = serde_json::from_value(
+            serde_json::json!({
+                "ecosystem": "composer",
+                "basePurl": "pkg:composer/psr/log@3.0.2.0",
+                "uuid": TAKEOVER_UUID,
+                "artifact": {"path": format!(".socket/vendor/composer/{TAKEOVER_UUID}/psr/log@3.0.2.0"), "sha256": ""},
+                "wiring": [],
+            }),
+        )
+        .unwrap();
+        state
+            .entries
+            .insert("pkg:composer/psr/log@3.0.2.0".to_string(), entry);
+        let split = partition_agent_selection(
+            vec![
+                result("pkg:composer/psr/log@3.0.2"),
+                result("pkg:composer/psr/log@3.0.3"),
+            ],
+            &state.purl_keys(),
+            &LockfileSupplement::default(),
+        );
+        assert_eq!(split.vendored_purls, vec!["pkg:composer/psr/log@3.0.2"]);
+        assert_eq!(
+            split
+                .kept
+                .iter()
+                .map(|p| p.purl.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pkg:composer/psr/log@3.0.3"]
+        );
+    }
+
+    /// A hosted record keyed by the padded `@3.0.2.0` spelling still names
+    /// the scanned composer `@3.0.2` whose live lock the patch server wires.
+    #[tokio::test]
+    async fn hosted_retained_probe_matches_composer_by_release_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let padded = "pkg:composer/psr/log@3.0.2.0";
+        let lock = serde_json::json!({
+            "packages": [{
+                "name": "psr/log",
+                "version": "3.0.2",
+                "dist": {
+                    "type": "zip",
+                    "url": format!("https://patch.socket.dev/patch/composer/psr/log/3.0.2/11111111-1111-1111-1111-111111111111/{TAKEOVER_UUID}/log-3.0.2.zip"),
+                    "reference": "f16e1d5863e37f8d8c2a01719f5b34baa2b714d3",
+                    "shasum": "0123456789abcdef0123456789abcdef01234567"
+                }
+            }],
+            "packages-dev": []
+        });
+        tokio::fs::write(
+            root.join("composer.lock"),
+            serde_json::to_string_pretty(&lock).unwrap(),
+        )
+        .await
+        .unwrap();
+        let ledger = pinned_state(&[padded]);
+        for scanned in ["pkg:composer/psr/log@3.0.2", "pkg:composer/psr/log@v3.0.2"] {
+            let scanned: HashSet<String> = [scanned.to_string()].into_iter().collect();
+            assert_eq!(
+                hosted_wiring_retained_purls(&common_at(root), Some(&ledger), &scanned).await,
+                vec![padded.to_string()]
+            );
+        }
+        let other: HashSet<String> = ["pkg:composer/psr/log@3.0.3".to_string()]
+            .into_iter()
+            .collect();
+        assert!(
+            hosted_wiring_retained_purls(&common_at(root), Some(&ledger), &other)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

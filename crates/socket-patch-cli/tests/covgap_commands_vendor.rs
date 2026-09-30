@@ -739,6 +739,61 @@ fn human_vendor_prints_summary_committables_and_reinstall_hint() {
     );
 }
 
+/// An npm-only run never opens the project's composer.lock for the
+/// Composer reinstall hint: a FIFO planted there would block the open(2)
+/// after the lock and ledger are written, and a lock naming vendored
+/// composer copies this run did not wire gets no composer hint.
+#[cfg(unix)]
+#[test]
+fn npm_only_human_vendor_does_not_read_composer_lock() {
+    use std::time::{Duration, Instant};
+    let fx = npm_fixture();
+    let fifo = fx.root().join("composer.lock");
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+        .args(["vendor", "--offline", "--cwd", fx.root().to_str().unwrap()])
+        .current_dir(fx.root())
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .env_remove("SOCKET_OFFLINE")
+        .env_remove("SOCKET_API_URL")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn socket-patch binary");
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            panic!("vendor blocked opening the composer.lock FIFO");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("Vendored 1 package."), "{stdout}");
+
+    let fx = npm_fixture();
+    std::fs::write(
+        fx.root().join("composer.lock"),
+        json!({"packages": [{"name": "psr/log", "version": "3.0.2", "dist": {
+            "type": "path",
+            "url": format!(".socket/vendor/composer/{UUID}/psr/log@3.0.2"),
+            "reference": UUID}}]})
+        .to_string(),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = human_vendor(&fx, &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("Run `npm install`"), "{stdout}");
+    assert!(!stdout.contains("composer install"), "{stdout}");
+}
+
 /// Human `--dry-run`: the `Would vendor` verb and NO commit/reinstall
 /// hints (nothing was written). A dry-run success is translated to a
 /// `Verified` event (counted under `summary.verified`, not `applied`); the

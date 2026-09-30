@@ -407,6 +407,21 @@ fn package_spec_matching_grammar() {
 }
 
 #[test]
+fn composer_package_filters_match_release_identity_and_preserve_branch_case() {
+    let policy = load(&[(
+        "socket.yml",
+        "version: 2\npatches:\n  ignorePackages: [pkg:composer/psr/log@3.0.2.0]\n",
+    )]);
+    assert!(matches!(
+        policy.admits_purl("pkg:composer/psr/log@v3.0.2"),
+        Err(FilterReason::PackageIgnored { .. })
+    ));
+    assert!(policy.admits_purl("pkg:composer/psr/log@3.0.3").is_ok());
+    assert!(package_spec_matches("pkg:composer/PSR/Log@3.0.2.0", "pkg:composer/psr/log@3.0.2"));
+    assert!(!package_spec_matches("pkg:composer/psr/log@dev-Feature", "pkg:composer/psr/log@dev-feature"));
+}
+
+#[test]
 fn enabled_false_is_reported_by_callers() {
     let policy = load(&[("socket.yml", "version: 2\npatches:\n  enabled: false\n")]);
     assert!(!policy.enabled());

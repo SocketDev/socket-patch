@@ -9,8 +9,9 @@ use socket_patch_core::api::types::{
     BatchPackagePatches, BatchPatchInfo, PatchResponse, PatchSearchResult,
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+use socket_patch_core::utils::composer_version::{composer_purl_identity, purl_identity_key};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
-use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{normalize_purl, purl_eq, strip_purl_qualifiers};
 use socket_patch_core::vendor::lock_inventory::LockfileEntry;
 use socket_patch_core::vendor::VendorState;
 use std::collections::{HashMap, HashSet};
@@ -99,8 +100,12 @@ pub(crate) async fn lockfile_supplement(
 /// the comparison bridges the two via `normalize_purl`. The ONE predicate
 /// behind the `notInstalled` flag, the `[NOT INSTALLED]` marker, the
 /// `package_not_installed` skip partition and the vendor baseline pre-check.
+/// A composer purl also matches its lock spelling of the same release (the
+/// API may serve the padded `@3.0.2.0` for a lock's `3.0.2`).
 pub(super) fn lockfile_only_contains(purls: &HashSet<String>, api_purl: &str) -> bool {
-    purls.contains(normalize_purl(strip_purl_qualifiers(api_purl)).as_ref())
+    let base = strip_purl_qualifiers(api_purl);
+    purls.contains(normalize_purl(base).as_ref())
+        || (base.starts_with("pkg:composer/") && purls.iter().any(|p| purl_eq(p, base)))
 }
 
 /// A displayable crawl entry fabricated from a purl (decoded form). The
@@ -153,14 +158,14 @@ pub(crate) async fn vendored_ledger_supplement(
         // would delete still-vendored packages' manifest entries and blobs.
         Err(_) => vendored_purls_from_artifacts(common).await,
     };
-    let crawled_norm: HashSet<String> = crawled
-        .iter()
-        .map(|p| normalize_purl(&p.purl).into_owned())
-        .collect();
+    // Composer by release identity: a ledger `@3.0.2.0` is the crawled
+    // `@3.0.2`, not a second package to supplement.
+    let key = |p: &str| composer_purl_identity(p).unwrap_or_else(|| normalize_purl(p).into_owned());
+    let crawled_norm: HashSet<String> = crawled.iter().map(|p| key(&p.purl)).collect();
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
     for base in &base_purls {
-        let norm = normalize_purl(base).into_owned();
+        let norm = key(base);
         if crawled_norm.contains(&norm) || !seen.insert(norm) {
             continue;
         }
@@ -248,7 +253,6 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
 ) -> (HashSet<String>, HashMap<String, PatchResponse>) {
     use socket_patch_core::manifest::schema::PatchFileInfo;
     use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
-    use socket_patch_core::utils::purl::purl_eq;
     use socket_patch_core::vendor::lookup_entry;
 
     let mut mismatched: HashSet<String> = HashSet::new();
@@ -391,21 +395,24 @@ pub(super) fn detect_updates(
         let Some(candidate) = pkg.patches.iter().min_by(|a, b| cmp_batch_infos(a, b)) else {
             continue;
         };
-        // Manifest keys are the API's *patch* purl (percent-encoded and,
-        // for artifact-pinned ecosystems, qualified); the batch *package*
-        // purl is the crawler's literal spelling. Exact hit first, then a
-        // normalized qualifier-stripped comparison.
+        // Manifest keys are written verbatim from the *patch* purl, which
+        // the API serves percent-encoded (`pkg:npm/%40scope/...`) and, for
+        // artifact-pinned ecosystems, qualified (`?artifact_id=...`); the
+        // batch *package* purl is the crawler's literal spelling. Bridge
+        // both divergences like the lockfile-only partition does: exact hit
+        // first, then a normalized qualifier-stripped comparison (composer
+        // by release identity: a `@3.0.2.0` key is the crawler's `@3.0.2`).
         //
         // Qualifier TWINS (e.g. a pypi wheel + sdist pair) all match the
         // stripped form: any stale twin means an update, so prefer the
         // first (sorted-key order, for stability) whose uuid differs.
         let existing = manifest.patches.get(&pkg.purl).or_else(|| {
-            let want = normalize_purl(strip_purl_qualifiers(&pkg.purl));
+            let want = purl_identity_key(&pkg.purl);
             let mut twins: Vec<(&String, &socket_patch_core::manifest::schema::PatchRecord)> =
                 manifest
                     .patches
                     .iter()
-                    .filter(|(k, _)| normalize_purl(strip_purl_qualifiers(k)) == want)
+                    .filter(|(k, _)| purl_identity_key(k) == want)
                     .collect();
             twins.sort_by(|a, b| a.0.cmp(b.0));
             twins
@@ -1015,6 +1022,43 @@ mod tests {
         };
         let state = socket_patch_core::vendor::load_state(root).await;
         vendored_ledger_supplement(&args, crawled, &state).await
+    }
+
+    /// A ledger entry vendored as `@3.0.2.0` is the crawled composer
+    /// `@3.0.2`, not a second package to add to the scan.
+    #[tokio::test]
+    async fn ledger_supplement_matches_composer_by_release_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = VendorState::new();
+        let entry: socket_patch_core::vendor::VendorEntry =
+            serde_json::from_value(serde_json::json!({
+                "ecosystem": "composer",
+                "basePurl": "pkg:composer/psr/log@3.0.2.0",
+                "uuid": VENDORED_UUID,
+                "artifact": {"path": format!(".socket/vendor/composer/{VENDORED_UUID}/psr/log@3.0.2.0"), "sha256": ""},
+                "wiring": [],
+            }))
+            .unwrap();
+        state
+            .entries
+            .insert("pkg:composer/psr/log@3.0.2.0".to_string(), entry);
+        let crawled = crawled_from_purl("pkg:composer/psr/log@3.0.2", tmp.path()).unwrap();
+        let args = GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            ..GlobalArgs::default()
+        };
+        let out = vendored_ledger_supplement(&args, &[crawled], &Ok(state.clone())).await;
+        assert!(
+            out.is_empty(),
+            "{:?}",
+            out.iter().map(|p| &p.purl).collect::<Vec<_>>()
+        );
+
+        let out = vendored_ledger_supplement(&args, &[], &Ok(state)).await;
+        assert_eq!(
+            out.iter().map(|p| p.purl.as_str()).collect::<Vec<_>>(),
+            vec!["pkg:composer/psr/log@3.0.2.0"]
+        );
     }
 
     #[tokio::test]

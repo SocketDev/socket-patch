@@ -4056,6 +4056,7 @@ fn rewrite_uv_lock(
     }
 }
 
+
 // ── composer.lock ────────────────────────────────────────────────────────────
 /// Whether `text` points at `artifact_url` in any spelling a rewritten file may
 /// carry: the raw url every rewriter emits — composer.lock included, since
@@ -4079,6 +4080,11 @@ pub fn artifact_url_spellings(artifact_url: &str) -> [String; 2] {
 }
 
 // ── nuget (nuget.config + packages.lock.json) ────────────────────────────────
+/// NuGet's per-directory config spellings, in the order it probes them on a
+/// case-sensitive filesystem (NuGet.Configuration `Settings`).
+pub(crate) const NUGET_CONFIG_FILE_NAMES: [&str; 3] =
+    ["nuget.config", "NuGet.config", "NuGet.Config"];
+
 fn default_nuget_config() -> String {
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n</configuration>\n".to_string()
 }
@@ -4106,7 +4112,10 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> O
     // socket-only and every other package would fail. Seed the implicit default
     // nuget.org source so the catch-all has a real target (unless the config
     // already has one). Only relevant when we are about to CREATE the mapping.
-    let creating_mapping = !out.contains("<packageSourceMapping>");
+    // The open tag may carry whitespace or attributes (`<packageSourceMapping >`
+    // is valid XML); a literal probe reads it as absent and authors a
+    // DUPLICATE section.
+    let creating_mapping = nuget_mapping_open_end(&out).is_none();
     // "Already has one" is decided by the parsed <packageSources> keys ALONE:
     // a whole-file "nuget.org" probe is satisfied by text that defines no
     // source (a defaultPushSource URL, a <disabledPackageSources> entry, a
@@ -4127,11 +4136,11 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> O
         // A mapping already exists (e.g. a prior patched dep, or the project's
         // own): append ONLY this source's mapping — every other source is
         // already covered.
-        out = out.replacen(
-            "<packageSourceMapping>",
-            &format!("<packageSourceMapping>\n{socket_mapping}"),
-            1,
-        );
+        // After any `<clear />` in the section: NuGet drops every mapping
+        // read before one, leaving the patched id routed nowhere.
+        let open_end = nuget_mapping_open_end(&out)?;
+        let at = nuget_after_last_clear(&out, open_end, "packageSourceMapping");
+        out = format!("{}\n{socket_mapping}{}", &out[..at], &out[at..]);
     } else {
         // Creating the mapping from scratch. Once ANY <packageSourceMapping>
         // exists, NuGet requires EVERY package to match some source's pattern,
@@ -4203,7 +4212,9 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
         // through to the from-scratch branch rather than insert outside it.
         .filter(|m| !m.as_str().ends_with("/>"))
     {
-        let end = m.end();
+        // After any `<clear />`: NuGet drops every source read before one,
+        // so the mapping would point at an undefined source (NU1100).
+        let end = nuget_after_last_clear(config, m.end(), "packageSources");
         Some(format!(
             "{}\n{source_line}{}",
             &config[..end],
@@ -4223,6 +4234,46 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
             &config[end..]
         ))
     }
+}
+
+/// The offset just past the `<packageSourceMapping>` open tag (any whitespace
+/// or attributes), or `None` when the config has no open/close section — a
+/// self-closing `<packageSourceMapping />` holds no children to append to.
+fn nuget_mapping_open_end(config: &str) -> Option<usize> {
+    static OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"<packageSourceMapping(?:\s[^>]*)?>")
+            .expect("static packageSourceMapping open-tag regex is valid")
+    });
+    OPEN_RE
+        .find(config)
+        .filter(|m| !m.as_str().ends_with("/>"))
+        .map(|m| m.end())
+}
+
+/// The offset just past the last `<clear />` between `from` and the `section`
+/// element's close tag (any whitespace before `>`), else `from`. Comments are
+/// skipped: a commented-out `<clear />` clears nothing, and anchoring on it
+/// would splice the new entry INSIDE the comment.
+fn nuget_after_last_clear(config: &str, from: usize, section: &str) -> usize {
+    static CLEAR_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"<clear\s*/>").expect("static clear-tag regex is valid"));
+    static COMMENT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").expect("static comment regex is valid"));
+    // Blank comment bytes in place so offsets still index `config`.
+    let mut masked = config.as_bytes()[from..].to_vec();
+    for m in COMMENT_RE.find_iter(&config[from..]) {
+        masked[m.range()].fill(b' ');
+    }
+    let masked = String::from_utf8(masked).expect("only whole comments are blanked");
+    let close_re =
+        Regex::new(&format!(r"</{section}\s*>")).expect("section close-tag regex is valid");
+    let Some(close) = close_re.find(&masked) else {
+        return from;
+    };
+    CLEAR_RE
+        .find_iter(&masked[..close.start()])
+        .last()
+        .map_or(from, |m| from + m.end())
 }
 
 /// The `key` of every `<add … />` under `<packageSources>` (empty when there
@@ -4281,13 +4332,19 @@ fn rewrite_nuget(
     if nuget.is_empty() {
         return;
     }
+    // NuGet reads the first of these spellings present in a directory; a
+    // fresh `nuget.config` beside a `NuGet.config` would shadow it.
+    let config_path = NUGET_CONFIG_FILE_NAMES
+        .into_iter()
+        .find(|name| files.contains_key(*name))
+        .unwrap_or(NUGET_CONFIG_FILE_NAMES[0]);
     let mut config = files
-        .get("nuget.config")
+        .get(config_path)
         .cloned()
         .unwrap_or_else(default_nuget_config);
     // A config this run authors from scratch records its source edits as
     // `added` — the spelling every other rewriter uses for a created file.
-    let source_action = if files.contains_key("nuget.config") {
+    let source_action = if files.contains_key(config_path) {
         "rewritten"
     } else {
         "added"
@@ -4366,7 +4423,7 @@ fn rewrite_nuget(
             config = updated;
             config_changed = true;
             result.edits.push(FileEdit {
-                path: "nuget.config".into(),
+                path: config_path.into(),
                 kind: "redirect_nuget_source".into(),
                 action: source_action.into(),
                 key: Some(reg.clone()),
@@ -4429,7 +4486,7 @@ fn rewrite_nuget(
     }
 
     if config_changed {
-        result.files.insert("nuget.config".into(), config);
+        result.files.insert(config_path.into(), config);
     }
     if lock_changed {
         if let Some(lock_val) = lock {
@@ -6940,6 +6997,141 @@ mod tests {
             1,
             "existing mapping element reused: {out}"
         );
+    }
+
+    /// NuGet's `<clear />` drops every item read before it: a Socket source
+    /// or mapping inserted ahead of one vanishes and restore NU1100s.
+    #[test]
+    fn nuget_socket_entries_land_after_clear() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "nuget.config".to_string(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <clear />\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n</configuration>\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let out = r.files.get("nuget.config").expect("config rewritten");
+        assert!(
+            out.contains(
+                "    <clear />\n    <add key=\"socket-patch-uuid\" value=\"https://patch.test/nuget/index.json\" />\n    <add key=\"nuget.org\""
+            ),
+            "socket source after <clear />, ahead of the other sources: {out}"
+        );
+    }
+
+    #[test]
+    fn nuget_existing_mapping_socket_entry_lands_after_clear() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "nuget.config".to_string(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <clear/>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n  <packageSourceMapping>\n    <clear  />\n    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>\n  </packageSourceMapping>\n  <disabledPackageSources>\n    <clear />\n  </disabledPackageSources>\n</configuration>\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let out = r.files.get("nuget.config").expect("config rewritten");
+        assert!(
+            out.contains("    <clear/>\n    <add key=\"socket-patch-uuid\""),
+            "socket source after <clear/>: {out}"
+        );
+        assert!(
+            out.contains(
+                "    <clear  />\n    <packageSource key=\"socket-patch-uuid\">\n      <package pattern=\"Newtonsoft.Json\" />"
+            ),
+            "socket mapping after the mapping's <clear />: {out}"
+        );
+        assert!(
+            out.contains("  <disabledPackageSources>\n    <clear />\n  </disabledPackageSources>"),
+            "a <clear /> in another section is not an anchor: {out}"
+        );
+    }
+
+    /// Close tags with whitespace before `>` are valid XML: a literal probe
+    /// misses the section, falls back to the open tag and lands the Socket
+    /// entries ahead of the `<clear />` that drops them.
+    #[test]
+    fn nuget_after_clear_tolerates_spaced_tags() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "nuget.config".to_string(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources >\n    <clear />\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources >\n  <packageSourceMapping >\n    <clear />\n    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>\n  </packageSourceMapping >\n</configuration>\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let out = r.files.get("nuget.config").expect("config rewritten");
+        assert!(
+            out.contains("  <packageSources >\n    <clear />\n    <add key=\"socket-patch-uuid\""),
+            "socket source after <clear />: {out}"
+        );
+        assert!(
+            out.contains(
+                "  <packageSourceMapping >\n    <clear />\n    <packageSource key=\"socket-patch-uuid\">"
+            ),
+            "socket mapping after the mapping's <clear />: {out}"
+        );
+        assert_eq!(
+            out.matches("<packageSourceMapping").count(),
+            1,
+            "no duplicate mapping section: {out}"
+        );
+    }
+
+    /// A commented-out `<clear />` clears nothing; anchoring on it would
+    /// splice the Socket source inside the comment.
+    #[test]
+    fn nuget_commented_clear_is_not_an_anchor() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "nuget.config".to_string(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <clear />\n    <!-- <clear /> -->\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n</configuration>\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let out = r.files.get("nuget.config").expect("config rewritten");
+        assert!(
+            out.contains("    <clear />\n    <add key=\"socket-patch-uuid\""),
+            "socket source after the real <clear />: {out}"
+        );
+        assert!(
+            out.contains("    <!-- <clear /> -->\n"),
+            "comment left intact: {out}"
+        );
+    }
+
+    /// NuGet reads the first of `nuget.config`, `NuGet.config`,
+    /// `NuGet.Config` present; authoring `nuget.config` beside another
+    /// spelling would shadow the project's sources.
+    #[test]
+    fn nuget_config_spelling_is_rewritten_in_place() {
+        let config = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key=\"corp-feed\" value=\"https://nuget.corp.example/v3/index.json\" />\n  </packageSources>\n</configuration>\n";
+        for (present, expected) in [
+            (&["NuGet.config"][..], "NuGet.config"),
+            (&["NuGet.Config"][..], "NuGet.Config"),
+            (&["NuGet.Config", "NuGet.config"][..], "NuGet.config"),
+            (&["NuGet.Config", "nuget.config"][..], "nuget.config"),
+        ] {
+            let files: BTreeMap<String, String> = present
+                .iter()
+                .map(|name| (name.to_string(), config.to_string()))
+                .collect();
+            let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+            assert_eq!(
+                r.files.keys().collect::<Vec<_>>(),
+                vec![expected],
+                "{present:?}"
+            );
+            assert!(
+                r.files[expected].contains("key=\"corp-feed\""),
+                "{present:?}: {}",
+                r.files[expected]
+            );
+            let source_edit = r
+                .edits
+                .iter()
+                .find(|e| e.kind == "redirect_nuget_source")
+                .expect("source edit recorded");
+            assert_eq!(source_edit.path, expected, "{present:?}");
+            assert_eq!(source_edit.action, "rewritten", "{present:?}");
+        }
     }
 
     fn berry_override(name: &str, version: &str, url: &str, checksum: &str) -> DepOverride {
@@ -12307,11 +12499,12 @@ snapshots:
         );
     }
 
-    /// A hand-ordered entry whose `source` does NOT directly precede its
-    /// `dist` keeps the source (the fragment edit cannot span it losslessly)
-    /// and says so; the dist is still redirected and pinned.
+    /// A hand-ordered entry whose `source` sits AFTER its `dist` still loses
+    /// the source (a failed hosted download could otherwise fall back to the
+    /// pristine upstream), with no warning; the one edit spans the dist
+    /// through the source so the fragment revert restores both.
     #[test]
-    fn composer_non_adjacent_source_is_kept_with_a_warning() {
+    fn composer_non_adjacent_source_is_removed() {
         let lock = composer_lock_with(
             "
             \"dist\": {
@@ -12327,23 +12520,93 @@ snapshots:
             }",
         );
         let r = composer_result(&lock, "1.0.0");
-        assert_eq!(warning_codes(&r), vec!["redirect_composer_source_kept"]);
+        assert!(r.warnings.is_empty(), "no warnings: {:?}", r.warnings);
         let out = r
             .files
             .get("composer.lock")
             .expect("the dist is redirected");
         let doc: Value = serde_json::from_str(out).expect("valid JSON");
         assert_eq!(doc["packages"][0]["dist"]["url"], COMPOSER_ARTIFACT_URL);
-        assert!(doc["packages"][0].get("source").is_some());
+        assert!(doc["packages"][0].get("source").is_none(), "{out}");
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
         let edit = &r.edits[0];
         let (original, new) = (
             edit.original.as_ref().and_then(Value::as_str).unwrap(),
             edit.new.as_ref().and_then(Value::as_str).unwrap(),
         );
+        assert!(original.starts_with("\"dist\": {"), "{original}");
+        assert!(
+            original.trim_end().ends_with('}') && original.contains("acme/target.git"),
+            "the edit spans the dist through the source: {original}"
+        );
+        assert!(!new.contains("\"source\""), "{new}");
         assert_eq!(
             out.replacen(new, original, 1),
             lock,
             "revert restores the lock"
+        );
+        let mut again = BTreeMap::new();
+        again.insert("composer.lock".to_string(), out.clone());
+        let second = rewrite_registry_redirect(&again, &[composer_override("1.0.0")]);
+        assert!(
+            second.files.is_empty() && second.edits.is_empty() && second.warnings.is_empty(),
+            "re-run must be a no-op: {:?} {:?}",
+            second.edits,
+            second.warnings
+        );
+    }
+
+    /// A lock an older rewriter redirected but left its `source` (or dist
+    /// `mirrors`) in is healed: one edit drops both, and the healed lock
+    /// is then a no-op.
+    #[test]
+    fn composer_already_redirected_entry_is_healed() {
+        let lock = composer_lock_with(&format!(
+            "
+            \"source\": {{
+                \"type\": \"git\",
+                \"url\": \"https://github.com/acme/target.git\",
+                \"reference\": \"cafe\"
+            }},
+            \"dist\": {{
+                \"type\": \"zip\",
+                \"url\": \"{COMPOSER_ARTIFACT_URL}\",
+                \"reference\": \"cafe\",
+                \"shasum\": \"{COMPOSER_SHA1}\",
+                \"mirrors\": [
+                    {{
+                        \"url\": \"https://mirror.example/%package%.%type%\",
+                        \"preferred\": true
+                    }}
+                ]
+            }}"
+        ));
+        let r = composer_result(&lock, "1.0.0");
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_composer_dist_mirrors_removed"]
+        );
+        let out = r.files.get("composer.lock").expect("the entry is healed");
+        let doc: Value = serde_json::from_str(out).expect("valid JSON");
+        let target = &doc["packages"][0];
+        assert!(target.get("source").is_none(), "{target}");
+        assert!(target["dist"].get("mirrors").is_none(), "{target}");
+        assert_eq!(target["dist"]["url"], COMPOSER_ARTIFACT_URL);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        let edit = &r.edits[0];
+        let (original, new) = (
+            edit.original.as_ref().and_then(Value::as_str).unwrap(),
+            edit.new.as_ref().and_then(Value::as_str).unwrap(),
+        );
+        assert_eq!(out.replacen(new, original, 1), lock);
+        let mut again = BTreeMap::new();
+        again.insert("composer.lock".to_string(), out.clone());
+        let second = rewrite_registry_redirect(&again, &[composer_override("1.0.0")]);
+        assert!(
+            second.files.is_empty() && second.edits.is_empty() && second.warnings.is_empty(),
+            "re-run over the healed lock must be a no-op: {:?} {:?}",
+            second.edits,
+            second.warnings
         );
     }
 

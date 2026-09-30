@@ -17,7 +17,7 @@ use socket_patch_core::patch::rollback::{
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
 use socket_patch_core::patch::redirect::upstream::HostedPin;
-use socket_patch_core::vendor::{RevertOpts, VendorState};
+use socket_patch_core::vendor::{purl_keys_cover, RevertOpts, VendorState};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -2120,8 +2120,7 @@ pub(crate) async fn rollback_patches_inner(
     // `vendor --revert` undoes it wholesale. Matching mirrors apply's
     // ledger-key / base-purl / qualifier-stripped triple; the caller
     // degrades unreadable state to "nothing vendored".
-    let is_vendored =
-        |p: &str| vendored_keys.contains(p) || vendored_keys.contains(strip_purl_qualifiers(p));
+    let is_vendored = |p: &str| purl_keys_cover(vendored_keys, p);
     let (vendored_targets, patches_to_rollback): (Vec<_>, Vec<_>) = patches_to_rollback
         .into_iter()
         .partition(|p| is_vendored(&p.purl));

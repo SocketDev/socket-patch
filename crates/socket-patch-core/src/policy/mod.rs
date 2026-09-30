@@ -744,6 +744,11 @@ pub struct Offers {
 /// case-insensitively (PyPI, NuGet and Composer names are case-insensitive;
 /// npm forbids uppercase).
 pub fn package_spec_matches(spec: &str, purl: &str) -> bool {
+    // Versioned Composer specs name a release, including its pretty/padded
+    // spellings. Compare before lowercasing: dev branch names retain case.
+    if crate::utils::composer_version::composer_purl_identity(spec.trim()).is_some() {
+        return crate::utils::composer_version::composer_purls_equivalent(spec.trim(), purl);
+    }
     let decoded = normalize_purl(strip_purl_qualifiers(purl)).to_lowercase();
     let spec = spec.trim().to_lowercase();
     if spec.is_empty() {

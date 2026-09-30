@@ -141,7 +141,11 @@ pub fn resolve_max_new(
 /// platforms), the API's encoded spelling and a lockfile's `Newtonsoft.Json`
 /// vs a pin's `newtonsoft.json` are one package.
 pub fn canonical_base_purl(purl: &str) -> String {
-    crate::vex::discover::canonical_base_purl(purl)
+    crate::utils::composer_version::composer_purl_identity(purl)
+        // Invalid-version identity keys contain an internal sentinel, which
+        // must not appear in the deferred purls reported to callers.
+        .filter(|key| !key.contains('\u{1}'))
+        .unwrap_or_else(|| crate::vex::discover::canonical_base_purl(purl))
 }
 
 /// Rollout order, most urgent first: in-flight, severity, advisory count
@@ -558,6 +562,40 @@ mod tests {
         );
         assert_eq!(plan.counts.new, 2);
         assert_eq!(deferred_purls(&plan), [("pkg:npm/zzz@1.0.0", 3)]);
+    }
+
+    #[test]
+    fn composer_version_spellings_share_one_budget_slot_across_projects() {
+        let rows = vec![
+            row("a", "pkg:composer/psr/log@3.0.2", "u1", 1, 1),
+            row("a", "pkg:composer/psr/log@3.0.2.0", "u1", 1, 1),
+        ];
+        let plan = plan_rollout(rows, &cap(1), false, &BTreeSet::new());
+        assert_eq!(plan.counts.new, 1);
+        assert_eq!(plan.admitted.len(), 2);
+        assert!(plan.deferred.is_empty());
+        let next = plan_rollout(
+            vec![row("b", "pkg:composer/psr/log@v3.0.2", "u1", 1, 1)],
+            &cap(0),
+            false,
+            &plan.admitted_base_purls,
+        );
+        assert_eq!(next.admitted.len(), 1);
+        assert!(next.deferred.is_empty());
+        assert_eq!(
+            crate::policy::canon("pkg:composer/psr/log@3.0.2.0"),
+            crate::policy::canon("pkg:composer/psr/log@v3.0.2")
+        );
+        for key in [
+            canonical_base_purl("pkg:composer/psr/log@not-a-version"),
+            crate::policy::canon("pkg:composer/psr/log@not-a-version"),
+        ] {
+            assert!(!key.contains('\u{1}'));
+        }
+        assert_ne!(
+            canonical_base_purl("pkg:composer/psr/log@dev-Feature"),
+            canonical_base_purl("pkg:composer/psr/log@dev-feature")
+        );
     }
 
     #[test]

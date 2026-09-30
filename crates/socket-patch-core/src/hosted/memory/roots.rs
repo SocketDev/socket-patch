@@ -25,7 +25,15 @@ pub const UNSUPPORTED_MARKERS: [(&str, &[&str]); 2] = [
             "settings.gradle.kts",
         ],
     ),
-    ("nuget", &["packages.lock.json", "nuget.config"]),
+    (
+        "nuget",
+        &[
+            "packages.lock.json",
+            "nuget.config",
+            "NuGet.config",
+            "NuGet.Config",
+        ],
+    ),
 ];
 
 /// Directory names whose subtrees never hold a project root: installed

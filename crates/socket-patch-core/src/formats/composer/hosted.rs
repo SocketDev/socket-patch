@@ -9,11 +9,11 @@ use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
-use serde_json::Value;
 
-use crate::crawlers::composer_crawler::normalize_version;
+use crate::utils::composer_version::composer_versions_equivalent;
+use super::source as composer_source;
 use crate::patch::redirect::{
-    artifact_url_present, full_name, DepOverride, FileEdit, RewriteResult, RewriteWarning,
+    artifact_url_present, full_name, DepOverride, RewriteResult, RewriteWarning,
 };
 
 /// Byte offset of the `}` closing the JSON object that CONTAINS `from`, which
@@ -75,10 +75,10 @@ pub(crate) enum ComposerEntry {
 /// Names match CASE-INSENSITIVELY, the way the composer crawler and the vendor
 /// backend already match them: packagist canonicalizes to lowercase, but
 /// hand-written mixed-case locks install fine and would otherwise silently miss
-/// the redirect. The locked version must match the patched one through
-/// composer's leading-`v` normalization (locks carry the pretty `v6.4.1`, PURLs
-/// the bare `6.4.1`); matching on name alone would repoint whatever version
-/// the lock happened to hold at a patch built for a different one.
+/// the redirect. The locked version must match the patched one by composer
+/// release identity (locks carry the pretty `v6.4.1`, PURLs the bare `6.4.1`
+/// or padded `6.4.1.0`); matching on name alone repointed whatever version the
+/// lock happened to hold at a patch built for a different one.
 pub(crate) fn find_composer_entry(content: &str, pkg: &str, version: &str) -> ComposerEntry {
     let mut mismatched: Option<String> = None;
     for (name_idx, _) in content.match_indices("\"name\": \"") {
@@ -100,7 +100,7 @@ pub(crate) fn find_composer_entry(content: &str, pkg: &str, version: &str) -> Co
         let Some(locked) = json_string_field(entry, "version") else {
             continue;
         };
-        if normalize_version(locked) == normalize_version(version) {
+        if composer_versions_equivalent(locked, version) {
             return ComposerEntry::Found(name_idx, end);
         }
         mismatched = Some(locked.to_string());
@@ -113,8 +113,8 @@ pub(crate) fn find_composer_entry(content: &str, pkg: &str, version: &str) -> Co
 
 /// Append `"shasum": "<sha1>"` as the last key of a `"dist": { … }` block,
 /// indented like the keys already in it. VCS/zipball dists omit `shasum`
-/// entirely; redirecting such a block without inserting the pin would leave the
-/// hosted artifact unverified, so composer would install whatever the URL returned.
+/// entirely; redirecting such a block without inserting the pin left the hosted
+/// artifact unverified, so composer would install whatever the URL returned.
 /// `block` is the whole dist object and already holds at least a `url`.
 pub(crate) fn append_composer_shasum(block: &str, sha1: &str) -> String {
     let Some(close) = block.rfind('}') else {
@@ -139,22 +139,6 @@ pub(crate) static COMPOSER_DIST_URL_RE: LazyLock<Regex> =
 pub(crate) static COMPOSER_DIST_SHASUM_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"("shasum": ")[^"]*(")"#).expect("static dist shasum regex is valid")
 });
-
-/// Byte offset of the entry's `"source": {` key when that object is the
-/// dist block's IMMEDIATE predecessor (only `,` + whitespace between them) —
-/// the layout composer itself always writes (`source` then `dist`).
-/// `None` when the entry has no source object there.
-pub(crate) fn composer_source_before_dist(
-    content: &str,
-    entry_start: usize,
-    dist_start: usize,
-) -> Option<usize> {
-    const SOURCE_KEY: &str = "\"source\": {";
-    let source_start = entry_start + content[entry_start..dist_start].rfind(SOURCE_KEY)?;
-    let source_end = json_object_end_from(content, source_start + SOURCE_KEY.len())?;
-    (source_end < dist_start && content[source_end + 1..dist_start].trim() == ",")
-        .then_some(source_start)
-}
 
 pub(crate) fn rewrite_composer_lock(
     files: &BTreeMap<String, String>,
@@ -219,7 +203,7 @@ pub(crate) fn rewrite_composer_lock(
                 }
             };
         // The dist block MUST belong to the located entry. Scanning forward
-        // from the name for the next `"dist": {` would walk into the FOLLOWING
+        // from the name for the next `"dist": {` walked into the FOLLOWING
         // package whenever the target was installed from source, repointing a
         // bystander's url + shasum — a checksum-clean install of the wrong
         // code. A target with no dist of its own pins nothing: fail closed.
@@ -240,14 +224,19 @@ pub(crate) fn rewrite_composer_lock(
             });
             continue;
         };
-        let block = content[dist_start..=dist_end].to_string();
-        // Already redirected (either slash spelling): recording an edit whose
-        // `original` IS the hosted url would grow the ledger on every re-run
-        // and poison a future revert.
-        if artifact_url_present(&block, &dep.artifact_url) && block.contains(&sha1) {
-            continue;
-        }
-        if !block.contains("\"url\": \"") {
+        // The dist's own members only: a `mirrors` entry listed before the
+        // dist `url` would otherwise take the redirected url and then be
+        // dropped with the mirrors, leaving the upstream url pinned to the
+        // patched sha1.
+        let current = &content[dist_start..=dist_end];
+        let block =
+            composer_source::strip_dist_mirrors(current).unwrap_or_else(|| current.to_string());
+        // Already redirected (either slash spelling): only the source/mirrors
+        // heal applies, so a re-run over a healed lock records no edit and
+        // the ledger never grows.
+        let already_redirected =
+            artifact_url_present(&block, &dep.artifact_url) && block.contains(&sha1);
+        if !already_redirected && !block.contains("\"url\": \"") {
             result.warnings.push(RewriteWarning {
                 code: "redirect_composer_no_dist_url".into(),
                 detail: format!("{composer_name}'s dist block has no url to redirect"),
@@ -268,47 +257,25 @@ pub(crate) fn rewrite_composer_lock(
         } else {
             append_composer_shasum(&rewritten, &sha1)
         };
-        // Drop the entry's `source` (the vendored backend does the same):
-        // when the dist download fails — checksum mismatch, an expired grant
-        // token, a patch-server outage — composer 1 and composer 2 before its
-        // source-fallback cutoff (2.2 LTS included) print "Now trying to
-        // download from source" and silently install the PRISTINE upstream
-        // commit from git, and `--prefer-source` / `preferred-install:
-        // source` always does. With the source gone the hosted archive is
-        // the only way to install the package, so a failed fetch fails the
-        // install instead of shipping the vulnerable code. The edit then
-        // spans `"source": {…},\n<indent>"dist": {…}`, so the ledger's
-        // fragment revert puts both blocks back byte-for-byte.
-        let (edit_start, original) =
-            match composer_source_before_dist(&content, entry_start, dist_start) {
-                Some(source_start) => (source_start, content[source_start..=dist_end].to_string()),
-                None => {
-                    if content[entry_start..=entry_end].contains("\"source\": {") {
-                        result.warnings.push(RewriteWarning {
-                            code: "redirect_composer_source_kept".into(),
-                            detail: format!(
-                                "{composer_name}'s source block does not directly precede its \
-                                 dist and was left in place; a failed hosted download may fall \
-                                 back to it"
-                            ),
-                        });
-                    }
-                    (dist_start, block.clone())
-                }
-            };
-        if rewritten != original {
-            // In place: a fresh whole-lock copy per edit would hold one
-            // lock-sized buffer per redirected dep.
-            content.replace_range(edit_start..=dist_end, &rewritten);
+        let rewritten = (!already_redirected).then_some(rewritten);
+        // Drops the entry's `source` wherever it sits and the dist's
+        // `mirrors` (see `composer_source`); the edit spans both, so the
+        // ledger's fragment revert restores them byte-for-byte.
+        let span = composer_source::DistSpan {
+            entry_start,
+            entry_end,
+            dist_start,
+            dist_end,
+        };
+        if let Some(edit) = composer_source::apply_dist_edit(
+            &mut content,
+            span,
+            rewritten.as_deref(),
+            &composer_name,
+            &mut result.warnings,
+        ) {
             changed = true;
-            result.edits.push(FileEdit {
-                path: "composer.lock".into(),
-                kind: "redirect_composer_dist".into(),
-                action: "rewritten".into(),
-                key: Some(composer_name),
-                original: Some(Value::String(original)),
-                new: Some(Value::String(rewritten)),
-            });
+            result.edits.push(edit);
         }
     }
     if changed {

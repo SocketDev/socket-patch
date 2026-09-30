@@ -54,8 +54,13 @@ fn dist_block(i: usize, rng: &mut Rng) -> String {
         2 => fields.push("\"shasum\": \"0123456789abcdef0123456789abcdef01234567\"".into()),
         _ => fields.push("\"shasum\": \"ffffffffffffffffffffffffffffffffffffffff\"".into()),
     }
-    if rng.chance(10) {
-        fields.push("\"mirrors\": [{ \"url\": \"https://m/{x}\", \"preferred\": true }]".into());
+    // Mirrors after the url, before it (the mirror's own `url` then comes
+    // first in the block), or as the dist's only url.
+    let mirrors = "\"mirrors\": [{ \"url\": \"https://m/{x}\", \"preferred\": true }]";
+    match rng.below(20) {
+        0 | 1 => fields.push(mirrors.into()),
+        2 => fields.insert(1, mirrors.into()),
+        _ => {}
     }
     format!(
         "\"dist\": {{\n{I}    {}\n{I}}}",
@@ -68,9 +73,14 @@ fn entry(i: usize, rng: &mut Rng) -> String {
         format!("\"name\": \"{}\"", pkg(i, rng)),
         format!("\"version\": \"{}\"", version(rng)),
     ];
-    let layout = rng.below(8);
+    let layout = rng.below(9);
     match layout {
         0 => fields.push(source_block(i)),
+        // A key-sorted or hand-edited lock can put `source` before `name`.
+        8 => {
+            fields.insert(0, source_block(i));
+            fields.push(dist_block(i, rng));
+        }
         1 => fields.push(dist_block(i, rng)),
         2 => {
             fields.push(dist_block(i, rng));
@@ -147,7 +157,12 @@ fn dep(rng: &mut Rng, pool: usize, n: usize) -> DepOverride {
         ecosystem: if rng.chance(5) { "npm" } else { "composer" }.into(),
         name: bare,
         namespace,
-        version: version(rng).trim_start_matches('v').to_string(),
+        // The bare, `v`-prefixed or padded spelling of the locked release.
+        version: match rng.below(4) {
+            0 => format!("{}.0", version(rng).trim_start_matches('v')),
+            1 => version(rng).to_string(),
+            _ => version(rng).trim_start_matches('v').to_string(),
+        },
         token: String::new(),
         patch_uuid: format!("00000000-0000-4000-8000-{n:012}"),
         artifact_url: url,
@@ -169,6 +184,7 @@ fn dep(rng: &mut Rng, pool: usize, n: usize) -> DepOverride {
 fn in_place_composer_rewrite_matches_golden() {
     let mut rewritten = 0;
     let mut edits = 0;
+    let mut reverted = 0;
     let mut codes = std::collections::BTreeSet::new();
     let mut golden = crate::golden::Golden::new(
         "composer_lock_rewrite",
@@ -193,6 +209,27 @@ fn in_place_composer_rewrite_matches_golden() {
             overrides.push(again);
         }
         let got = run(&files, &overrides);
+        // The ledger's fragment revert: undoing every edit, newest first,
+        // restores the input byte for byte (checked when each fragment is
+        // unambiguous in the text it is undone from).
+        if let (Some(out), Some(input)) =
+            (got.files.get("composer.lock"), files.get("composer.lock"))
+        {
+            let mut text = out.clone();
+            let mut unique = true;
+            for edit in got.edits.iter().rev() {
+                let (original, new) = (
+                    edit.original.as_ref().and_then(Value::as_str).unwrap(),
+                    edit.new.as_ref().and_then(Value::as_str).unwrap(),
+                );
+                unique &= text.matches(new).count() == 1;
+                text = text.replacen(new, original, 1);
+            }
+            if unique {
+                assert_eq!(&text, input, "seed {seed}: fragment revert");
+                reverted += 1;
+            }
+        }
         let mut rerun = files.clone();
         rerun.extend(got.files.clone());
         let again = run(&rerun, &overrides);
@@ -203,6 +240,7 @@ fn in_place_composer_rewrite_matches_golden() {
     }
     assert!(rewritten > 800, "only {rewritten} rewritten locks");
     assert!(edits > 1500, "only {edits} edits");
+    assert!(reverted > 600, "only {reverted} locks revert-checked");
     for code in [
         "redirect_composer_no_lockfile",
         "redirect_composer_missing_sha1",
@@ -210,7 +248,7 @@ fn in_place_composer_rewrite_matches_golden() {
         "redirect_composer_pkg_not_found",
         "redirect_composer_no_dist",
         "redirect_composer_no_dist_url",
-        "redirect_composer_source_kept",
+        "redirect_composer_dist_mirrors_removed",
     ] {
         assert!(codes.contains(code), "no case reached {code}: {codes:?}");
     }

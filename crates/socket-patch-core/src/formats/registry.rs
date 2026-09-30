@@ -117,8 +117,8 @@ const REGISTRY: &[FormatFile] = &[
     row("composer.lock", "composer", HOSTED | VENDORED | PROBE | ROOT),
     // ── nuget ──
     row("nuget.config", "nuget", HOSTED | PROBE),
-    row("NuGet.config", "nuget", PROBE),
-    row("NuGet.Config", "nuget", PROBE),
+    row("NuGet.config", "nuget", HOSTED | PROBE),
+    row("NuGet.Config", "nuget", HOSTED | PROBE),
     row("packages.lock.json", "nuget", HOSTED),
     // ── gem ──
     row("Gemfile", "gem", HOSTED | VENDORED),
@@ -218,6 +218,6 @@ mod tests {
         assert_eq!(hosted_file_ecosystem("checksums.sha256"), Some("maven"));
         assert_eq!(hosted_file_ecosystem("build.gradle"), None);
         assert_eq!(hosted_file_ecosystem("package.json"), None);
-        assert_eq!(hosted_file_ecosystem("NuGet.Config"), None);
+        assert_eq!(hosted_file_ecosystem("NuGet.Config"), Some("nuget"));
     }
 }

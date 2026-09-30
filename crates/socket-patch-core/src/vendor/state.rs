@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
+use crate::utils::composer_version::{composer_purl_identity, composer_purls_equivalent};
 use crate::utils::fs::{atomic_write_artifact, read_regular_to_bytes};
 use crate::utils::purl::{patch_matches, strip_purl_qualifiers};
 use crate::utils::serde::serialize_sorted;
@@ -310,12 +311,15 @@ impl VendorEntry {
     }
 
     /// Does this entry, stored under ledger `key`, own the manifest purl
-    /// `purl`? The ledger-key / qualifier-stripped-key / base-purl triple —
-    /// the per-entry form of the set [`VendorState::purl_keys`] flattens.
+    /// `purl`? The ledger-key / qualifier-stripped-key / base-purl triple,
+    /// plus composer release identity (`@3.0.2` owns `@3.0.2.0`) — the
+    /// per-entry form of the set [`VendorState::purl_keys`] flattens.
     pub fn covers_purl(&self, key: &str, purl: &str) -> bool {
         key == purl
             || strip_purl_qualifiers(key) == strip_purl_qualifiers(purl)
             || self.base_purl == strip_purl_qualifiers(purl)
+            || composer_purls_equivalent(key, purl)
+            || composer_purls_equivalent(&self.base_purl, purl)
     }
 }
 
@@ -337,22 +341,37 @@ impl VendorState {
 
     /// Every purl spelling under which this ledger's entries are
     /// addressable: each entry's map key (the manifest purl, possibly
-    /// qualified), its resolved base purl, and the qualifier-stripped key.
-    /// The one derivation behind every whole-set vendor-ownership match
-    /// (apply / rollback / remove / scan prune); [`super::vendored_purl_keys`]
-    /// is its load-then-derive convenience.
+    /// qualified), its resolved base purl, the qualifier-stripped key, and
+    /// for composer the release identity of both
+    /// ([`composer_purl_identity`]). The one derivation behind every
+    /// whole-set vendor-ownership match (apply / rollback / remove / scan
+    /// prune); match against it with [`purl_keys_cover`].
+    /// [`super::vendored_purl_keys`] is its load-then-derive convenience.
     pub fn purl_keys(&self) -> HashSet<String> {
         self.entries
             .iter()
             .flat_map(|(key, entry)| {
                 [
-                    key.clone(),
-                    entry.base_purl.clone(),
-                    strip_purl_qualifiers(key).to_string(),
+                    Some(key.clone()),
+                    Some(entry.base_purl.clone()),
+                    Some(strip_purl_qualifiers(key).to_string()),
+                    composer_purl_identity(key),
+                    composer_purl_identity(&entry.base_purl),
                 ]
             })
+            .flatten()
             .collect()
     }
+}
+
+/// Whether `purl` is vendor-owned according to `keys`, a
+/// [`VendorState::purl_keys`] set: by its own spelling, its
+/// qualifier-stripped base, or (composer) its release identity, so a scan
+/// that sees `@3.0.2` still finds the entry vendored as `@3.0.2.0`.
+pub fn purl_keys_cover(keys: &HashSet<String>, purl: &str) -> bool {
+    keys.contains(purl)
+        || keys.contains(strip_purl_qualifiers(purl))
+        || composer_purl_identity(purl).is_some_and(|identity| keys.contains(&identity))
 }
 
 impl Default for VendorState {
@@ -521,7 +540,9 @@ fn binary_snapshot_identity_matches(a: &serde_json::Value, b: &serde_json::Value
 
 /// The ledger entry addressable as `purl`: the exact map key first, then
 /// any entry whose resolved `base_purl` equals it (a qualified manifest
-/// key resolves to the entry recorded under the base PURL).
+/// key resolves to the entry recorded under the base PURL), then, for a
+/// composer purl, the entry of the same release in another version
+/// spelling (the smallest such key, so the pick is deterministic).
 pub fn lookup_entry<'a>(
     entries: &'a HashMap<String, VendorEntry>,
     purl: &str,
@@ -537,6 +558,15 @@ pub fn lookup_entry_kv<'a>(
     entries
         .get_key_value(purl)
         .or_else(|| entries.iter().find(|(_, e)| e.base_purl == purl))
+        .or_else(|| {
+            entries
+                .iter()
+                .filter(|(key, e)| {
+                    composer_purls_equivalent(key, purl)
+                        || composer_purls_equivalent(&e.base_purl, purl)
+                })
+                .min_by(|(a, _), (b, _)| a.cmp(b))
+        })
 }
 
 fn state_path(project_root: &Path) -> PathBuf {
@@ -1118,6 +1148,76 @@ mod tests {
         bytes.push(b'\n');
         std::fs::write(tmp.path().join(VENDOR_STATE_REL), &bytes).unwrap();
         assert_eq!(load_state(tmp.path()).await.unwrap(), legacy);
+    }
+
+    fn composer_entry(base_purl: &str) -> VendorEntry {
+        let mut entry = sample_entry();
+        entry.ecosystem = "composer".into();
+        entry.base_purl = base_purl.into();
+        entry
+    }
+
+    /// Composer ownership is by release identity: an entry vendored as
+    /// `@3.0.2.0` owns the `@3.0.2` / `@v3.0.2` a later scan sees, and the
+    /// reverse; another release or another ecosystem's spelling games do not.
+    #[test]
+    fn composer_ownership_matches_every_version_spelling() {
+        let padded = "pkg:composer/psr/log@3.0.2.0";
+        let entry = composer_entry(padded);
+        for purl in [
+            "pkg:composer/psr/log@3.0.2",
+            "pkg:composer/Psr/Log@v3.0.2",
+            padded,
+        ] {
+            assert!(entry.covers_purl(padded, purl), "{purl}");
+        }
+        assert!(!entry.covers_purl(padded, "pkg:composer/psr/log@3.0.3"));
+        let bare = composer_entry("pkg:composer/psr/log@3.0.2");
+        assert!(bare.covers_purl("pkg:composer/psr/log@3.0.2", padded));
+
+        let mut state = VendorState::new();
+        state.entries.insert(padded.into(), entry);
+        let keys = state.purl_keys();
+        assert!(purl_keys_cover(&keys, "pkg:composer/psr/log@3.0.2"));
+        assert!(purl_keys_cover(&keys, "pkg:composer/psr/log@v3.0.2"));
+        assert!(purl_keys_cover(&keys, padded));
+        assert!(!purl_keys_cover(&keys, "pkg:composer/psr/log@3.0.3"));
+        assert!(!purl_keys_cover(&keys, "pkg:npm/psr/log@3.0.2"));
+
+        // Non-composer ownership keeps exact spelling semantics.
+        let mut npm = VendorState::new();
+        npm.entries
+            .insert("pkg:npm/lodash@4.17.21".into(), sample_entry());
+        let npm_keys = npm.purl_keys();
+        assert!(purl_keys_cover(&npm_keys, "pkg:npm/lodash@4.17.21?x=y"));
+        assert!(!purl_keys_cover(&npm_keys, "pkg:npm/lodash@4.17.21.0"));
+    }
+
+    /// `lookup_entry_kv` finds a composer entry filed under another spelling
+    /// of the same release, preferring an exact key and picking the smallest
+    /// equivalent key when several exist.
+    #[test]
+    fn lookup_finds_a_composer_entry_by_release_identity() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "pkg:composer/psr/log@3.0.2.0".to_string(),
+            composer_entry("pkg:composer/psr/log@3.0.2.0"),
+        );
+        let (key, _) = lookup_entry_kv(&entries, "pkg:composer/psr/log@3.0.2").unwrap();
+        assert_eq!(key, "pkg:composer/psr/log@3.0.2.0");
+        assert!(lookup_entry(&entries, "pkg:composer/psr/log@3.0.3").is_none());
+
+        entries.insert(
+            "pkg:composer/psr/log@v3.0.2".to_string(),
+            composer_entry("pkg:composer/psr/log@v3.0.2"),
+        );
+        let (key, _) = lookup_entry_kv(&entries, "pkg:composer/psr/log@v3.0.2").unwrap();
+        assert_eq!(key, "pkg:composer/psr/log@v3.0.2", "an exact key wins");
+        let (key, _) = lookup_entry_kv(&entries, "pkg:composer/psr/log@3.0.2").unwrap();
+        assert_eq!(
+            key, "pkg:composer/psr/log@3.0.2.0",
+            "smallest equivalent key"
+        );
     }
 
     #[tokio::test]

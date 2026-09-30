@@ -6,7 +6,11 @@ use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
 
 /// The canonical spelling filters and the recorded view compare on.
 pub fn canon(purl: &str) -> String {
-    normalize_purl(strip_purl_qualifiers(purl)).into_owned()
+    crate::utils::composer_version::composer_purl_identity(purl)
+        // This spelling is also emitted in policy reports; keep internal
+        // invalid-version sentinels out of the user-facing purl.
+        .filter(|key| !key.contains('\u{1}'))
+        .unwrap_or_else(|| normalize_purl(strip_purl_qualifiers(purl)).into_owned())
 }
 
 /// One `policy.filtered[]` entry.
