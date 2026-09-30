@@ -24,6 +24,7 @@ jobs:
         run: rustup toolchain install 1.56.1 --profile minimal && rustup toolchain install stable --profile minimal
       - name: Probe custom cargo-vendor directory
         run: |
+          set +e +o pipefail
           SP="$GITHUB_WORKSPACE/target/release/socket-patch"
           cat > "$RUNNER_TEMP/stage.py" <<'PY'
           import sys, json, hashlib, os
