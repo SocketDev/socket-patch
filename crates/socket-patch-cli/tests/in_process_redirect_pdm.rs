@@ -571,10 +571,24 @@ async fn assert_relock_roundtrip(lock: &str, relocked: &str) {
 async fn rerender_keeping_the_patch_then_rescan_rolls_back_to_the_registry() {
     for start in ["\r\n", "\n"] {
         for keep_url in [true, false] {
-            let lock = LOCK.replace("\r\n", "\n").replace('\n', start);
-            assert_rerender_roundtrip(&lock, keep_url).await;
+            for later in [false, true] {
+                let lock = LOCK.replace("\r\n", "\n").replace('\n', start);
+                assert_rerender_roundtrip(&lock, keep_url, later).await;
+            }
         }
     }
+}
+
+/// A `pdm add`ed package that sorts AFTER `urllib3`: PDM appends its unit,
+/// which moves the `urllib3` fragment's boundary from EOF to a header.
+const ZIPP: &str = "\n[[package]]\nname = \"zipp\"\nversion = \"3.20.2\"\nrequires_python = \">=3.8\"\nsummary = \"Backport of pathlib-compatible object wrapper for zip files\"\ngroups = [\"default\"]\nfiles = [\n    {file = \"zipp-3.20.2-py3-none-any.whl\", hash = \"sha256:a817ac80d6cf4b23bf7f2828b7cabf326f15a001bea8b1f9b49631780ba28350\"},\n]\n";
+
+/// The end of the `urllib3` unit starting at `at`: the next unit's header
+/// (keeping the blank line before it with the successor) or EOF.
+fn unit_end(lock: &str, at: usize) -> usize {
+    lock[at + 1..]
+        .find("\n\n[[package]]")
+        .map_or(lock.len(), |i| at + 1 + i + 1)
 }
 
 /// Where the `urllib3` unit starts in `lock` (it is the last unit).
@@ -619,14 +633,27 @@ fn pdm_add_rerender(redirected: &str, keep_url: bool) -> String {
     format!("{head}{SIX}{unit}")
 }
 
-async fn assert_rerender_roundtrip(lock: &str, keep_url: bool) {
+/// [`pdm_add_rerender`], optionally also adding [`ZIPP`] after `urllib3`.
+fn pdm_add_rerender_with(redirected: &str, keep_url: bool, later: bool) -> String {
+    let rerendered = pdm_add_rerender(redirected, keep_url);
+    if later {
+        format!("{rerendered}{ZIPP}")
+    } else {
+        rerendered
+    }
+}
+
+async fn assert_rerender_roundtrip(lock: &str, keep_url: bool, later: bool) {
     let server = MockServer::start().await;
     mock_api(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path(), lock);
     let lock_path = tmp.path().join("pdm.lock");
     let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
-    let case = format!("keep_url={keep_url} crlf={}", lock.contains('\r'));
+    let case = format!(
+        "keep_url={keep_url} later={later} crlf={}",
+        lock.contains('\r')
+    );
 
     assert_eq!(
         run(hosted_args(tmp.path(), server.uri(), None)).await,
@@ -636,7 +663,7 @@ async fn assert_rerender_roundtrip(lock: &str, keep_url: bool) {
     let redirected = read(&lock_path);
     assert!(redirected.contains(HOSTED_URL), "{case}");
 
-    let rerendered = pdm_add_rerender(&redirected, keep_url);
+    let rerendered = pdm_add_rerender_with(&redirected, keep_url, later);
     std::fs::write(&lock_path, &rerendered).unwrap();
 
     // The re-scan converges the re-laid unit back onto the Socket wiring.
@@ -672,12 +699,15 @@ async fn assert_rerender_roundtrip(lock: &str, keep_url: bool) {
         !rolled_back.contains(HOSTED_URL) && !rolled_back.contains(&sha256()),
         "{case}: rollback must remove the Socket url and patched hash: {rolled_back}"
     );
-    // Exactly the user's re-rendered lock with the pristine (LF) unit back.
+    // Exactly the user's re-rendered lock with the pristine (LF) unit back,
+    // every other unit (a later one's header included) untouched.
     let pristine = LOCK.replace("\r\n", "\n");
+    let at = urllib3_unit(&rerendered);
     let expected = format!(
-        "{}{}",
-        &rerendered[..urllib3_unit(&rerendered)],
-        &pristine[urllib3_unit(&pristine)..]
+        "{}{}{}",
+        &rerendered[..at],
+        &pristine[urllib3_unit(&pristine)..],
+        &rerendered[unit_end(&rerendered, at)..]
     );
     assert_eq!(rolled_back, expected, "{case}");
 }

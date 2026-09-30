@@ -48,8 +48,11 @@ pub(crate) const REBASE_KINDS: &[&str] = &[
 /// rollback "revert" patched → patched and report success (#331). While the
 /// fresh `original` still carries any string the recorded edit introduced
 /// (a quoted value in its `new` that its `original` lacks: the url, the
-/// patched hash), keep the recorded pristine `original`, re-laid in the
-/// fresh fragment's line endings so it splices into the relocked text.
+/// patched hash), keep the recorded pristine unit, re-laid in the fresh
+/// fragment's line endings and ending in the fresh fragment's BOUNDARY (a
+/// unit fragment carries its blank lines plus the next top-level header, or
+/// EOF, and the relock may have added a unit after this one), so it splices
+/// into the relocked text without eating the successor's header.
 pub(crate) fn rebased_pdm_original(
     recorded: &socket_patch_core::patch::redirect::FileEdit,
     fresh: &socket_patch_core::patch::redirect::FileEdit,
@@ -77,13 +80,39 @@ pub(crate) fn rebased_pdm_original(
     if !still_patched {
         return fresh.original.clone();
     }
-    let lf = pristine.replace("\r\n", "\n");
-    let relaid = if current.contains("\r\n") {
+    let lf = split_pdm_boundary(&pristine).0.replace("\r\n", "\n");
+    let body = if current.contains("\r\n") {
         lf.replace('\n', "\r\n")
     } else {
         lf
     };
-    Some(serde_json::Value::String(relaid))
+    let boundary = split_pdm_boundary(&current).1;
+    Some(serde_json::Value::String(format!("{body}{boundary}")))
+}
+
+/// Split a PDM lock fragment into its body and its trailing boundary: the
+/// line break ending the body's last line, then any blank or comment lines
+/// and the next top-level header (`utils::pdm_lock`'s `next_header_end`),
+/// or trailing blank lines up to EOF. A fragment with no boundary (a legacy
+/// `[metadata.files]` entry) returns an empty one.
+fn split_pdm_boundary(fragment: &str) -> (&str, &str) {
+    let lines: Vec<&str> = fragment.split_inclusive('\n').collect();
+    let content = |line: &str| line.trim_end_matches(['\r', '\n']).trim().to_owned();
+    let mut keep = lines.len();
+    if keep > 1 && lines[keep - 1].starts_with('[') {
+        keep -= 1;
+    }
+    while keep > 1 && {
+        let line = content(lines[keep - 1]);
+        line.is_empty() || line.starts_with('#')
+    } {
+        keep -= 1;
+    }
+    let body: usize = lines[..keep].iter().map(|line| line.len()).sum();
+    let body = fragment[..body]
+        .trim_end_matches('\n')
+        .trim_end_matches('\r');
+    fragment.split_at(body.len())
 }
 
 pub(crate) const REDIRECT_CANDIDATE_FILES: &[&str] = &[

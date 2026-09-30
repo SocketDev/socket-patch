@@ -249,4 +249,28 @@ mod tests {
             );
         }
     }
+
+    /// A relock that appends a unit after this one moves the fragment's
+    /// boundary from EOF to the successor's header: the kept pristine body
+    /// takes the fresh boundary, so rollback cannot eat that header.
+    #[test]
+    fn pdm_rebase_keeps_the_fresh_fragment_boundary() {
+        let pristine = "[[package]]\nfiles = [\"sha256:1111\"]\n";
+        let wired = "[[package]]\nfiles = [\"sha256:cccc\"]\nurl = \"https://patch.test/u.whl\"\n";
+        let current = "[[package]]\nfiles = [ \"sha256:cccc\" ]\n# note\n\n[[package]]";
+        let fresh_new = "[[package]]\nfiles = [\"sha256:cccc\"]\nurl = \"https://patch.test/u.whl\"\n# note\n\n[[package]]";
+        let mut ledger = RedirectState::new();
+        ledger.edits.push(pdm(pristine, wired));
+        let files = BTreeMap::from([("pdm.lock".to_string(), current.to_string())]);
+        merge(
+            &mut ledger,
+            &[pdm(current, fresh_new)],
+            BTreeMap::new(),
+            &files,
+        );
+        assert_eq!(
+            ledger.edits[0].original.as_ref().unwrap().as_str().unwrap(),
+            "[[package]]\nfiles = [\"sha256:1111\"]\n# note\n\n[[package]]"
+        );
+    }
 }
