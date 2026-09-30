@@ -533,6 +533,32 @@ pub(crate) async fn copy_matches_after_hashes(
     true
 }
 
+/// Whole-tree inventory of a dir-shaped vendored copy (`subject` names it,
+/// `name@version`): the only whole-artifact drift/tamper anchor
+/// verify/VEX/repair have for it. Fail-soft: an uninventoriable copy
+/// (symlink, non-UTF-8 name, a tree past the inventory's file cap) vendors
+/// like a pre-inventory entry, with the gap surfaced here and again at
+/// repair time.
+pub(crate) async fn inventory_or_warn(
+    copy_dir: &Path,
+    subject: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    match super::verify::compute_dir_inventory(copy_dir).await {
+        Ok(inv) => Some(inv),
+        Err(detail) => {
+            warnings.push(VendorWarning::new(
+                "vendor_inventory_unrecorded",
+                format!(
+                    "could not inventory the vendored copy for {subject} ({detail}); \
+                     drift in its unpatched files will not be detectable"
+                ),
+            ));
+            None
+        }
+    }
+}
+
 /// Shared [`WiringRecord`] constructor for the lock-splicing backends:
 /// `original`/`new` are verbatim text fragments of `file`.
 pub(crate) fn record(

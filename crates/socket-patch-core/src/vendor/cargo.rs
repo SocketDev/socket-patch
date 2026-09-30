@@ -38,9 +38,9 @@ use super::cargo_lock::{self, LockEditError};
 use super::cargo_manifest;
 use super::cargo_tag;
 use super::common::{
-    already_patched_result, copy_matches_after_hashes, done, prune_empty_vendor_levels,
-    refuse_symlinked, refused, service_offline_conflict, stage_dir_for, swap_stage_into_place,
-    synthesized_result,
+    already_patched_result, copy_matches_after_hashes, done, inventory_or_warn,
+    prune_empty_vendor_levels, refuse_symlinked, refused, service_offline_conflict, stage_dir_for,
+    swap_stage_into_place, synthesized_result,
 };
 use super::parse_memo::ParseMemo;
 use super::path::vendor_uuid_dir_rel;
@@ -1028,10 +1028,8 @@ pub async fn vendor_cargo_crate<'a>(
         CargoServiceCopy::HardFail(outcome) => return *outcome,
     };
 
-    let file_inventory = match super::verify::compute_dir_inventory(&copy_dir).await {
-        Ok(inventory) => inventory,
-        Err(error) => return refused("vendor_inventory_unavailable", error),
-    };
+    let file_inventory =
+        inventory_or_warn(&copy_dir, &format!("{name}@{version}"), &mut warnings).await;
 
     // ── wire the manifest entry ───────────────────────────────────────────
     let ensured = match cargo_manifest::ensure_patch_entry(
@@ -1182,7 +1180,7 @@ pub async fn vendor_cargo_crate<'a>(
     write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
 
     let mut entry = cargo_entry(purl, record, &copy_rel, &ensured, lock_original);
-    entry.artifact.file_inventory = Some(file_inventory);
+    entry.artifact.file_inventory = file_inventory;
     done(result, Some(entry), warnings)
 }
 
@@ -2484,6 +2482,34 @@ mod tests {
             lockw.original,
             Some(serde_json::json!({ "source": SOURCE, "checksum": CHECKSUM }))
         );
+    }
+
+    /// A crate past the inventory's 10,000-file cap (well within the
+    /// extractor's entry cap) still vendors and is wired: the entry records
+    /// no inventory and says so, rather than refusing and leaving the
+    /// extracted copy behind unwired.
+    #[tokio::test]
+    async fn fresh_vendor_past_the_inventory_cap_records_no_inventory() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        std::fs::create_dir_all(pristine.join("filler")).unwrap();
+        for i in 0..10_000 {
+            std::fs::File::create(pristine.join(format!("filler/f{i}"))).unwrap();
+        }
+        let (result, entry, warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("the crate is vendored");
+        assert!(entry.artifact.file_inventory.is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_inventory_unrecorded"
+                    && w.detail.contains("exceeds 10000 files")),
+            "{warnings:?}"
+        );
+        assert_eq!(manifest_path(root).await, Some(copy_rel()));
+        assert!(lock_text(root).await.contains(&tagged(UUID)));
     }
 
     #[tokio::test]

@@ -66,7 +66,7 @@ use crate::utils::purl::{build_gem_purl, parse_gem_purl, purl_qualifier};
 use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
-    already_patched_result, copy_matches_after_hashes, done, failed_result,
+    already_patched_result, copy_matches_after_hashes, done, failed_result, inventory_or_warn,
     prune_empty_vendor_levels, refused, service_offline_conflict, stage_dir_for,
     swap_stage_into_place, synthesized_result,
 };
@@ -527,7 +527,7 @@ pub async fn vendor_gem<'a>(
             // the caller's `carry_forward_wiring` (same uuid) re-attaches the
             // first run's records, the only copy of the pre-vendor originals.
             let file_inventory =
-                gem_inventory_or_warn(copy_dir, name, version, &mut warnings).await;
+                inventory_or_warn(copy_dir, &format!("{name}@{version}"), &mut warnings).await;
             let entry = gem_entry(
                 build_gem_purl(name, version),
                 record,
@@ -739,7 +739,10 @@ pub async fn vendor_gem<'a>(
         }
     }
 
-    let file_inventory = gem_inventory_or_warn(copy_dir, name, version, &mut warnings).await;
+    // The whole tree, stub gemspec included: no lockfile integrity covers a
+    // path source's bytes.
+    let file_inventory =
+        inventory_or_warn(copy_dir, &format!("{name}@{version}"), &mut warnings).await;
     let entry = gem_entry(
         base_purl,
         record,
@@ -749,33 +752,6 @@ pub async fn vendor_gem<'a>(
     );
 
     done(result, Some(entry), warnings)
-}
-
-/// Whole-tree inventory of the committed copy (stub gemspec included): no
-/// lockfile integrity covers a path source's bytes, so this is the only
-/// whole-artifact drift/tamper anchor verify/VEX/repair have for a
-/// dir-shaped artifact. Fail-soft: an uninventoriable copy (symlink,
-/// non-UTF-8 name) vendors like a pre-inventory entry, with the gap
-/// surfaced here and again at repair time.
-async fn gem_inventory_or_warn(
-    copy_dir: &Path,
-    name: &str,
-    version: &str,
-    warnings: &mut Vec<VendorWarning>,
-) -> Option<std::collections::BTreeMap<String, String>> {
-    match super::verify::compute_dir_inventory(copy_dir).await {
-        Ok(inv) => Some(inv),
-        Err(detail) => {
-            warnings.push(VendorWarning::new(
-                "vendor_inventory_unrecorded",
-                format!(
-                    "could not inventory the vendored copy for {name}@{version} ({detail}); \
-                     drift in its unpatched files will not be detectable"
-                ),
-            ));
-            None
-        }
-    }
 }
 
 /// The ledger entry for a vendored gem copy: `wiring` is the Gemfile + lock

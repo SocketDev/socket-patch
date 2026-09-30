@@ -57,8 +57,8 @@ use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
     already_patched_result, any_live_file_references, copy_matches_after_hashes, done,
-    prune_empty_vendor_levels, refused, serialize_json, service_offline_conflict, stage_dir_for,
-    swap_stage_into_place, synthesized_result,
+    inventory_or_warn, prune_empty_vendor_levels, refused, serialize_json,
+    service_offline_conflict, stage_dir_for, swap_stage_into_place, synthesized_result,
 };
 use super::parse_memo::ParseMemo;
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
@@ -384,16 +384,8 @@ pub async fn vendor_composer<'a>(
         return refused("vendor_composer_mirror_filter_conflict", detail);
     }
 
-    let file_inventory = match super::verify::compute_dir_inventory(&copy_dir).await {
-        Ok(inventory) => inventory,
-        Err(error) => {
-            // Nothing is wired yet: drop the extracted copy, as the filter
-            // conflict above does, so no unwired uuid dir is left behind.
-            let _ = remove_tree(&uuid_dir).await;
-            prune_empty_vendor_dirs(&copy_dir).await;
-            return refused("vendor_inventory_unavailable", error);
-        }
-    };
+    let file_inventory =
+        inventory_or_warn(&copy_dir, &format!("{pkg}@{version}"), &mut warnings).await;
 
     // ── lock rewrite ─────────────────────────────────────────────────────
     // The memo hands the parse out shared; this is the one branch that
@@ -456,7 +448,7 @@ pub async fn vendor_composer<'a>(
             sha256: String::new(), // Directory integrity uses the complete inventory.
             size: None,
             platform_locked: None,
-            file_inventory: Some(file_inventory),
+            file_inventory,
         },
         wiring: vec![WiringRecord {
             file: COMPOSER_LOCK.to_string(),
@@ -4165,6 +4157,42 @@ mod tests {
             lock_before
         );
         assert_eq!(tokio::fs::read(ledger).await.unwrap(), ledger_before);
+    }
+
+    /// A package past the inventory's 10,000-file cap (well within the
+    /// extractor's entry cap) still vendors: the lock is wired, the entry
+    /// records no inventory and says so, and exact repair refuses it
+    /// cleanly instead of guessing.
+    #[tokio::test]
+    async fn fresh_composer_vendor_past_the_inventory_cap_records_no_inventory() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        std::fs::create_dir_all(installed.join("filler")).unwrap();
+        for i in 0..10_000 {
+            std::fs::File::create(installed.join(format!("filler/f{i}"))).unwrap();
+        }
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("the package is vendored");
+        assert!(entry.artifact.file_inventory.is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_inventory_unrecorded"
+                    && w.detail.contains("exceeds 10000 files")),
+            "{warnings:?}"
+        );
+        let lock_after = tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+            .await
+            .unwrap();
+        assert!(lock_after.contains(&copy_rel()), "{lock_after}");
+        let cfg = composer_service_cfg("http://127.0.0.1:1", VendorSource::Service, false);
+        let err = super::super::redownload::restore(root, &entry, &record, &cfg)
+            .await
+            .unwrap_err();
+        assert!(err.contains("no complete file inventory"), "{err}");
     }
 
     #[tokio::test]

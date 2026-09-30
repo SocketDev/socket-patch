@@ -30,8 +30,9 @@ use crate::vendor::go_mod_edit::{
 };
 
 use super::common::{
-    already_patched_result, copy_matches_after_hashes, done, prune_empty_vendor_levels, refused,
-    service_offline_conflict, stage_dir_for, swap_stage_into_place,
+    already_patched_result, copy_matches_after_hashes, done, inventory_or_warn,
+    prune_empty_vendor_levels, refused, service_offline_conflict, stage_dir_for,
+    swap_stage_into_place,
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::{extract_on_blocking_pool, extract_zip_with_prefix};
@@ -542,14 +543,7 @@ async fn go_service_redirect(
             ),
         );
     }
-    let file_inventory = match super::verify::compute_dir_inventory(&stage).await {
-        Ok(inventory) => inventory,
-        Err(error) => {
-            cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired)
-                .await;
-            return policy.hard("vendor_inventory_unavailable", error);
-        }
-    };
+    let file_inventory = inventory_or_warn(&stage, &format!("{module}@{version}"), warnings).await;
     if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
         cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired).await;
         return policy.hard(
@@ -580,7 +574,7 @@ async fn go_service_redirect(
             archive.source_url
         ),
     ));
-    GoServiceRedirect::Used(Some(file_inventory))
+    GoServiceRedirect::Used(file_inventory)
 }
 
 /// Failure cleanup for the service legs (the vendor-side sibling of the
@@ -991,6 +985,38 @@ mod tests {
         assert_eq!(
             w.new,
             Some(serde_json::Value::from(format!("./{}", copy_rel())))
+        );
+    }
+
+    /// A module past the inventory's 10,000-file cap (well within the
+    /// extractor's entry cap) still vendors and is wired: the entry records
+    /// no inventory and says so.
+    #[tokio::test]
+    async fn fresh_vendor_past_the_inventory_cap_records_no_inventory() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        std::fs::create_dir_all(pristine.join("filler")).unwrap();
+        for i in 0..10_000 {
+            std::fs::File::create(pristine.join(format!("filler/f{i}"))).unwrap();
+        }
+        let (result, entry, warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("the module is vendored");
+        assert!(entry.artifact.file_inventory.is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_inventory_unrecorded"
+                    && w.detail.contains("exceeds 10000 files")),
+            "{warnings:?}"
+        );
+        assert!(root.join(copy_rel()).join("filler/f0").exists());
+        let entries = read_replace_entries(root).await;
+        let e = entries.iter().find(|e| e.module == MODULE).unwrap();
+        assert_eq!(
+            e.path.as_deref(),
+            Some(format!("./{}", copy_rel()).as_str())
         );
     }
 
