@@ -1,0 +1,32 @@
+name: bughunt pip hook probe
+
+on:
+  push:
+    branches: ['bughunt/pip/**']
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ['3.8', '3.13']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Probe
+        shell: bash
+        run: |
+          python -m venv v
+          if [ -x v/Scripts/python.exe ]; then P=v/Scripts/python.exe; else P=v/bin/python; fi
+          echo "== pip index socket-patch-hook"; "$P" -m pip index versions socket-patch-hook 2>&1 | tail -2 || true
+          echo "== pinned 4.0.0 with hook"; "$P" -m pip install --no-cache-dir "socket-patch[hook]==4.0.0" 2>&1 | grep -E "ERROR|Successfully" || true
+          echo "== unpinned (the line setup writes)"; "$P" -m pip install --no-cache-dir "socket-patch[hook]" 2>&1 | grep -E "WARNING|ERROR|Successfully" || true
+          "$P" -m pip show socket-patch 2>&1 | grep -E "^Version" || true
+          "$P" -c "import sysconfig,os;sp=sysconfig.get_paths()['purelib'];print('pth files:',[f for f in os.listdir(sp) if f.endswith('.pth')])"
