@@ -63,10 +63,14 @@ into the new version's section — see docs/releasing.md.
   and the commands to move to hosted mode or keep agent mode. Agent mode is now `socket-patch scan --mode agent` once
   (commit `.socket/`), then `socket-patch apply` in CI after every install.
   Hosted and vendored mode never needed a hook.
-- **The `socket-patch-hook` PyPI wheel and the `socket-patch-bundler` gem
-  are no longer built or published**, and the `socket-patch[hook]` extra is
-  gone from the `socket-patch` wheel (pip warns about the unknown extra and
-  installs the CLI). Their sources stay in the tree, frozen, for reference.
+- **PyPI and RubyGems distributions are removed.** The `socket-patch` wheel
+  and launcher gem, `socket-patch-hook` wheel, and `socket-patch-bundler` gem
+  are no longer built or published. Their sources, package tests, publishing
+  workflows, wheel builder, and version-sync entries are removed. Install
+  the standalone binary via `https://install.socket.dev/patch` (preferred),
+  `cargo install socket-patch-cli`, or `npm install -g @socketsecurity/socket-patch`.
+  npm remains available for the official Socket CLI. Python and Ruby dependency
+  patching remain supported; see the README's migration instructions.
 - **`vex` no longer drops agent-mode patches whose ecosystem has no
   install hook** ("Property 7"). A manifest patch that verifies as applied
   (or any manifest patch under `--no-verify`) is now attested whatever the

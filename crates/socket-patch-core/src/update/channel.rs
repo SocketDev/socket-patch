@@ -2,13 +2,12 @@
 //!
 //! socket-patch ships through several channels, and only the standalone
 //! ones (install.sh, manual tarball copy) own a binary that self-update may
-//! replace. npm and PyPI bundle the binary inside a version-pinned package
-//! directory — swapping it there desyncs the package manager's metadata and
-//! the next `npm install` / `pip install` silently reverts the update. The
-//! gem launcher execs a per-version cached binary it re-resolves on every
-//! run, so replacing the cache entry is meaningless.
-//! For all of those, `--update` refuses and prints the channel's own
-//! upgrade command instead (`--force` overrides).
+//! replace. npm bundles the binary inside a version-pinned package directory;
+//! swapping it there desyncs the package manager's metadata. Legacy PyPI
+//! installs and RubyGems launcher caches remain protected for the same reason,
+//! but their hints migrate to a supported distribution: v5 no longer publishes
+//! those packages. `--update` refuses managed installs and prints an upgrade
+//! or migration command instead (`--force` overrides).
 //!
 //! Detection is a pure function over the canonicalized executable path plus
 //! a snapshot of the relevant environment, so the heuristics are
@@ -25,13 +24,13 @@ pub enum InstallChannel {
     /// Inside a `node_modules` tree (the npm platform packages bundle the
     /// binary; the JS shim spawns it from there).
     Npm,
-    /// Inside `site-packages`/`dist-packages` (the PyPI wheel bundles the
+    /// Inside `site-packages`/`dist-packages` (the pre-v5 PyPI wheel bundled the
     /// binary under `socket_patch/bin/`).
     Pypi,
     /// Under `$CARGO_HOME/bin` — managed by `cargo install`.
     Cargo,
     /// Under the launcher cache (`<cache>/socket-patch/bin/…`) used by the
-    /// RubyGems launcher.
+    /// pre-v5 RubyGems launcher.
     LauncherCache,
     /// Under a Homebrew prefix (`Cellar`, `/opt/homebrew`).
     Homebrew,
@@ -100,14 +99,24 @@ pub fn detect_channel(canonical_exe: &Path, env: &ChannelEnv) -> InstallChannel 
     InstallChannel::Standalone
 }
 
-/// The channel's own upgrade command, shown when `--update` refuses.
+/// The channel's upgrade or migration command, shown when `--update` refuses.
 pub fn upgrade_hint(channel: InstallChannel) -> &'static str {
     match channel {
         InstallChannel::Standalone => "socket-patch --update",
         InstallChannel::Npm => "npm update -g @socketsecurity/socket-patch",
-        InstallChannel::Pypi => "pip install --upgrade socket-patch",
+        InstallChannel::Pypi if cfg!(windows) => {
+            "pip uninstall socket-patch && npm install -g @socketsecurity/socket-patch"
+        }
+        InstallChannel::Pypi => {
+            "pip uninstall socket-patch && curl -fsSL https://install.socket.dev/patch | sh"
+        }
         InstallChannel::Cargo => "cargo install socket-patch-cli",
-        InstallChannel::LauncherCache => "gem update socket-patch",
+        InstallChannel::LauncherCache if cfg!(windows) => {
+            "gem uninstall socket-patch && npm install -g @socketsecurity/socket-patch"
+        }
+        InstallChannel::LauncherCache => {
+            "gem uninstall socket-patch && curl -fsSL https://install.socket.dev/patch | sh"
+        }
         InstallChannel::Homebrew => "brew upgrade socket-patch",
     }
 }
@@ -142,8 +151,7 @@ fn is_vlx_cache_dir(dir: &Path) -> bool {
     crate::utils::fs::read_regular_to_string_sync(&dir.join("package.json"))
         .ok()
         .and_then(|text| {
-            serde_json::from_str::<serde_json::Value>(crate::utils::serde::strip_bom(&text))
-                .ok()
+            serde_json::from_str::<serde_json::Value>(crate::utils::serde::strip_bom(&text)).ok()
         })
         .is_some_and(|pkg| pkg.get("name").and_then(|n| n.as_str()) == Some("vlx"))
 }
@@ -215,11 +223,10 @@ fn cargo_bin_dir(env: &ChannelEnv) -> Option<PathBuf> {
     env.home.as_ref().map(|h| h.join(".cargo").join("bin"))
 }
 
-/// Cache roots the gem launcher resolves, in its probe order:
+/// Cache roots the pre-v5 gem launcher resolved, in its probe order:
 /// `$XDG_CACHE_HOME`, `~/.cache`, `%LOCALAPPDATA%`, and the launcher's
 /// Windows fallback when LOCALAPPDATA is unset — `~/AppData/Local`
-/// (launcher.rb: `ENV["LOCALAPPDATA"] || File.join(Dir.home, "AppData",
-/// "Local")`).
+/// (`ENV["LOCALAPPDATA"] || File.join(Dir.home, "AppData", "Local")`).
 fn launcher_cache_roots(env: &ChannelEnv) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(xdg) = &env.xdg_cache_home {
@@ -655,9 +662,7 @@ mod tests {
     #[test]
     fn hints_route_to_the_owning_manager() {
         assert!(upgrade_hint(InstallChannel::Npm).contains("npm update -g"));
-        assert!(upgrade_hint(InstallChannel::Pypi).contains("pip install --upgrade"));
         assert!(upgrade_hint(InstallChannel::Cargo).contains("cargo install"));
-        assert!(upgrade_hint(InstallChannel::LauncherCache).contains("gem update"));
         assert!(upgrade_hint(InstallChannel::Homebrew).contains("brew upgrade"));
         assert!(upgrade_hint(InstallChannel::Standalone).contains("--update"));
     }

@@ -974,28 +974,33 @@ Synopsis and behavior:
 | Invocation | Behavior |
 |---|---|
 | `--update` | Resolve the latest release; install it if newer than the running version. Already-newest (including a dev build newer than any release): informational no-op, exit 0. `latest` never downgrades. |
-| `--update 3.4.0` | Install exactly that version, **up or down** — an explicit pin is explicit intent, no `--force` needed. Pin == current: no-op, exit 0. The inline `--update=3.4.0` spelling is equivalent. Also settable via `SOCKET_PATCH_VERSION` (the same pin env `install.sh` and the gem launcher honor); a malformed version is a usage error (exit 2). |
+| `--update 3.4.0` | Install exactly that version, **up or down** — an explicit pin is explicit intent, no `--force` needed. Pin == current: no-op, exit 0. The inline `--update=3.4.0` spelling is equivalent. Also settable via `SOCKET_PATCH_VERSION` (the same pin env `install.sh` honors); a malformed version is a usage error (exit 2). |
 | `--update --force` | Reinstall/downgrade even when already at the target version, and proceed past a managed-install refusal (with a warning that the owning manager's next upgrade will overwrite the binary). Env: `SOCKET_FORCE`. |
 | `--update --dry-run` | **Check-only**: one metadata request, zero downloads, zero mutation, exit 0 — and always the `verified`/`update_check` event shape, whether or not an update exists. `--json` details carry `{current, latest, updateAvailable, target, asset, path}` — the cheap scriptable "is an update available" probe. |
 | `--update --offline` | Refused up front (strict airgap, before any client exists), exit 1. `--force` does **not** bypass it. |
 
 Honored global flags: `--json`, `--silent` (errors only), `--yes` (skip the confirm prompt; `--json` also auto-confirms), `--dry-run`, `--offline`, `--verbose`, `--debug`, `--no-telemetry`. Other global flags parse and are ignored (the `list --global` precedent).
 
-**Managed-install refusal.** The canonicalized executable path (symlinked invocations resolve to the real file) is classified before any network I/O; non-standalone channels exit 1 with `errorCode: managed_install` and the owning manager's command:
+**Managed-install refusal.** The canonicalized executable path (symlinked invocations resolve to the real file) is classified before any network I/O; non-standalone channels exit 1 with `errorCode: managed_install` and an upgrade or migration command:
 
 | Detected channel | Hint |
 |---|---|
 | npm (`node_modules` path component) | project-local (the directory holding the outermost `node_modules` has a `package.json`, and it is not directly under `lib`/`npm` or below a yarn/pnpm `global` store): `npm install @socketsecurity/socket-patch@latest`, or `vlt install @socketsecurity/socket-patch@latest` when that directory holds `vlt-lock.json`, or `vlx -y -- @socketsecurity/socket-patch@latest …` when its `package.json` is vlx's (`"name": "vlx"`, the vlx cache); otherwise global (including version-manager prefixes such as nvm-windows and fnm): `npm update -g @socketsecurity/socket-patch` |
-| PyPI wheel (`site-packages`/`dist-packages`) | `pip install --upgrade socket-patch` |
+| Legacy PyPI wheel (`site-packages`/`dist-packages`) | `pip uninstall socket-patch` followed by the standalone installer (macOS/Linux) or `npm install -g @socketsecurity/socket-patch` (Windows) |
 | `cargo install` (`$CARGO_HOME/bin`, `~/.cargo/bin`) | `cargo install socket-patch-cli` |
-| gem launcher cache (`<cache>/socket-patch/bin/…`) | `gem update socket-patch` |
+| Legacy gem launcher cache (`<cache>/socket-patch/bin/…`) | `gem uninstall socket-patch` followed by the standalone installer (macOS/Linux) or `npm install -g @socketsecurity/socket-patch` (Windows) |
 | Homebrew (`Cellar`, `/opt/homebrew`) | `brew upgrade socket-patch` |
+
+v5 publishes only standalone binaries, Cargo crates, and npm packages. Legacy
+PyPI and RubyGems locations remain detectable so self-update does not silently
+replace a binary owned by an old package. The standalone migration command is
+`curl -fsSL https://install.socket.dev/patch | sh`.
 
 **Pipeline order** (each step gates the next; a failure at any point leaves the installed binary untouched): fetch `SHA256SUMS` → fetch the archive (`socket-patch-<target-triple>.tar.gz`/`.zip`, explicit timeouts, size caps) → verify the SHA-256 **before** extraction → extract the single expected member → stage as an executable sibling **in the install directory** (`EACCES` here is the permissions preflight → exit 1 with a sudo hint; system temp is never used, so `noexec` mounts don't matter) → run the staged binary's `--version` self-check (against real GitHub the reported version must equal the release tag; under a `SOCKET_UPDATE_BASE_URL` override a mismatch only warns) → one atomic rename over the install path (mode-preserving; a **setuid/setgid** target — or, on Linux, one carrying **file capabilities** (`setcap`) — is refused, since an unprivileged swap cannot restore those grants; Windows uses the rename-dance via `self-replace`). Concurrent updates are single-flighted per environment by an advisory lock at `<state dir>/update.lock` (`errorCode: update_in_progress`; the OS releases a dead holder's lock, so there is no stale-lock state). Two updaters whose state dirs diverge (e.g. different `$HOME`s targeting one shared `/usr/local/bin`) are not serialized, but every path to the destination is a whole-file rename and stage cleanup is age-gated — the worst case is duplicated work, never a torn binary.
 
 **Envelope.** `command: "update"`. Success events: `downloaded` (`details: {asset, bytes, sha256}`) then `updated` (`details: {from, to, path, target}`). No-op: `skipped` with reason `already_latest`. Dry-run: `verified` with reason `update_check`. Non-fatal advisories ride the run-level `warnings[]` (`{code, detail}`, omitted when empty) — human runs print the same text to stderr as `Warning: <detail>` (first letter capitalized), and `--json` (which silences stderr) carries them here instead so an override is never silent: `managed_install_override` (a `--force` run replaced a package-manager-owned binary that manager's next upgrade will overwrite) and `update_warning` (a non-fatal note from the update engine, today the relaxed version self-check under a `SOCKET_UPDATE_BASE_URL` override). Top-level `errorCode` values (stable): `offline`, `managed_install`, `check_failed`, `asset_not_found`, `download_failed`, `checksum_mismatch`, `verify_failed`, `swap_failed`, `permission_denied`, `update_in_progress`. Exit codes: 0 success / no-op / dry-run; 1 operational failure; 2 usage.
 
-**Trust model.** Checksum-only, rooted in HTTPS + GitHub (identical to install.sh and the launcher wrappers): `SHA256SUMS` is served from the same origin as the archives, there are no signatures yet. Downloads are credential-free — the Socket API bearer is never sent to the release host — and non-HTTPS redirect hops are refused when talking to the default endpoints.
+**Trust model.** Checksum-only, rooted in HTTPS + GitHub (identical to install.sh): `SHA256SUMS` is served from the same origin as the archives, there are no signatures yet. Downloads are credential-free — the Socket API bearer is never sent to the release host — and non-HTTPS redirect hops are refused when talking to the default endpoints.
 
 ### Passive update notice
 
@@ -1124,11 +1129,10 @@ Env-only knobs (no CLI flag) read by the vendor auto-fetch / artifact-rebuild pa
 
 ### Internal env vars (no stability guarantee)
 
-These exist for staged rollouts and the launcher wrappers. They are **internal**: names, semantics, and existence may change in any release without a semver bump.
+These exist for mirrors and testing. They are **internal**: names, semantics, and existence may change in any release without a semver bump.
 
 | Env var | Purpose |
 |---|---|
-| `SOCKET_PATCH_BIN` | Points the RubyGems CLI launcher and the gem Bundler plugin at an existing `socket-patch` binary (skips the download-on-first-run). |
 | `SOCKET_UPDATE_BASE_URL` | Points BOTH the release-metadata and asset-download routes of `--update`/the update notice at one base (mirror or test fixture) instead of `github.com` + `api.github.com`. Overriding it relaxes the downloaded binary's version self-check from hard-fail to warning. |
 | `SOCKET_UPDATE_STATE_DIR` | Overrides the per-user dir holding `update-check.json` + `update.lock` (tests point it into a tempdir). |
 | `SOCKET_UPDATE_TIMEOUT_MS` | Caps the update fetches' connect/metadata/download budgets (defaults 10 s / 30 s / 300 s; the notice's fetch defaults to 2 s). Doubles as the slow-network escape hatch. |
@@ -1655,7 +1659,7 @@ When verification is enabled (the default) and a patch is omitted, the failed PU
 
 ## Semver policy
 
-Versioning lives in **`Cargo.toml`** at the workspace root (`version = "..."`) and is propagated to every ecosystem wrapper and launcher package by **`scripts/version-sync.sh <new-version>`** (the full list of stamped files is below).
+Versioning lives in **`Cargo.toml`** at the workspace root (`version = "..."`) and is propagated to the Cargo and npm packages by **`scripts/version-sync.sh <new-version>`** (the full list of stamped files is below).
 
 | Change | Bump |
 |---|---|
@@ -1687,20 +1691,19 @@ scripts/version-sync.sh <new-version>
 
 This syncs the workspace package version into:
 
-- `npm/socket-patch/package.json` (and its `optionalDependencies`)
+- `Cargo.toml` (workspace version and the exact `socket-patch-core` dependency pin)
+- `npm/socket-patch/package.json` (and its `optionalDependencies`) and `package-lock.json`
 - every per-platform `npm/socket-patch-*/package.json`
-- `pypi/socket-patch/pyproject.toml`
-- `gem/socket-patch/socket-patch.gemspec` + its launcher `VERSION` (the RubyGems CLI launcher)
 
-All ecosystem publishing fans out from the single
-**`.github/workflows/release.yml`** dispatch: one run publishes crates.io,
-npm, and PyPI plus the CLI launcher gem (`socket-patch` on RubyGems). Each
-registry leg lives in its own workflow
-(`.github/workflows/publish-{cargo,npm,pypi,rubygems}.yml`), dispatched at
-the release tag by the release run and also independently dispatchable to
-retry one registry against an existing release. The npm, PyPI, and
-launcher-gem legs are gated on the GitHub release — with its binaries and
-`SHA256SUMS` — existing.
+Publishing fans out from the single **`.github/workflows/release.yml`**
+dispatch: one run creates a GitHub release with standalone binaries and
+`SHA256SUMS`, and publishes the crates.io and npm packages. The binary is
+the preferred install via `https://install.socket.dev/patch`; npm also
+supplies the official Socket CLI. Each registry leg lives in its own
+workflow (`.github/workflows/publish-{cargo,npm}.yml`), dispatched at the
+release tag and independently dispatchable to retry one registry against
+an existing release. The npm leg waits for the GitHub release so it can
+package those same binaries. See [the release runbook](../../docs/releasing.md).
 
 ## How the contract is enforced
 

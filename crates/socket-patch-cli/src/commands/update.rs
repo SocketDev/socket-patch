@@ -41,8 +41,7 @@ pub struct UpdateArgs {
     /// Exact version to install instead of the latest release (e.g.
     /// `socket-patch --update 3.4.0`). An explicit pin installs that
     /// version even if it is older than the current one. Also settable via
-    /// SOCKET_PATCH_VERSION — the same pin install.sh and the gem launcher
-    /// honor.
+    /// SOCKET_PATCH_VERSION — the same pin install.sh honors.
     //
     // Not named `version`: under `propagate_version` clap already owns a
     // `--version` arg id on every subcommand, and the collision panics at
@@ -55,7 +54,7 @@ pub struct UpdateArgs {
     pub pin_version: Option<String>,
 
     /// Proceed even when this install looks package-manager-managed
-    /// (npm/pip/cargo/Homebrew/launcher), and reinstall even when already
+    /// (e.g. npm or cargo), and reinstall even when already
     /// on the requested version.
     #[arg(
         long,
@@ -144,10 +143,13 @@ fn confirm_prompt(current: &semver::Version, target: &semver::Version) -> String
     }
 }
 
-
 /// The result line after a successful install, naming the same action as
 /// [`confirm_prompt`].
-fn installed_message(current: &semver::Version, target: &semver::Version, path: &std::path::Path) -> String {
+fn installed_message(
+    current: &semver::Version,
+    target: &semver::Version,
+    path: &std::path::Path,
+) -> String {
     let path = path.display();
     if target < current {
         format!("Downgraded socket-patch {current} \u{2192} {target} ({path})")
