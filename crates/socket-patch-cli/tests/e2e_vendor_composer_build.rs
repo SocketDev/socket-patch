@@ -1400,15 +1400,14 @@ fn composer_vendor_keeps_files_mirror_filters_would_drop() {
     assert_fresh_install_mirrors_whole_copy(tmp.path(), &proj, &copy_rel, &patched);
 }
 
-/// A copy vendored by a CLI that predates the neutralization (filter files
-/// intact in the committed copy) is healed by the idempotent re-run: the
-/// lock stays byte-identical, the heal is warned, and a fresh checkout then
-/// installs every file.
+/// Modified filter files trigger exact redownload of the committed copy.
+/// The original inventory, lock, and ledger survive, and a fresh checkout
+/// installs every file from the restored artifact.
 #[test]
 #[ignore = "host capstone: shells out to a real composer; the unpinned `test` job \
             skips it, the e2e job runs it with a pinned toolchain via --ignored"]
-fn composer_vendor_fast_path_heals_legacy_copy() {
-    let suite = "e2e_vendor_composer_build(legacy-copy)";
+fn composer_vendor_redownloads_modified_copy() {
+    let suite = "e2e_vendor_composer_build(redownload-copy)";
     let Some(major) = composer_e2e_common::composer_major(suite) else {
         return;
     };
@@ -1417,13 +1416,17 @@ fn composer_vendor_fast_path_heals_legacy_copy() {
     std::fs::create_dir_all(&proj).unwrap();
     let home = tmp.path().join("composer-home");
     let cache = tmp.path().join("composer-cache");
-    if !setup_composer_project(&proj, &home, &cache, "(legacy-copy)", major) {
+    if !setup_composer_project(&proj, &home, &cache, "(redownload-copy)", major) {
         return;
     }
     let lock_path = proj.join("composer.lock");
     let version = locked_composer_version(&lock_path, DEP).expect("psr/log locked");
     let orig = std::fs::read(proj.join("vendor/psr/log/src/LoggerInterface.php")).unwrap();
-    let patched: Vec<u8> = [orig.as_slice(), b"\n// SOCKET-PATCH-LEGACY-COPY-MARKER\n"].concat();
+    let patched: Vec<u8> = [
+        orig.as_slice(),
+        b"\n// SOCKET-PATCH-REDOWNLOAD-COPY-MARKER\n",
+    ]
+    .concat();
     let purl = format!("pkg:composer/{DEP}@{version}");
     stage_patch_with_vuln(&proj, &purl, "src/LoggerInterface.php", &orig, &patched);
     let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
@@ -1434,6 +1437,12 @@ fn composer_vendor_fast_path_heals_legacy_copy() {
 
     let copy_rel = format!(".socket/vendor/composer/{UUID}/{DEP}@{version}");
     let copy = proj.join(&copy_rel);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let inventory_before = runtime
+        .block_on(socket_patch_core::vendor::compute_dir_inventory(&copy))
+        .unwrap();
+    let ledger_path = proj.join(".socket/vendor/state.json");
+    let ledger_before = std::fs::read(&ledger_path).unwrap();
     plant_mirror_filters(&copy);
     let lock_wired = std::fs::read(&lock_path).unwrap();
 
@@ -1446,21 +1455,32 @@ fn composer_vendor_fast_path_heals_legacy_copy() {
     assert_eq!(env["summary"]["failed"], 0, "{env}");
     assert!(
         env["events"].as_array().unwrap().iter().any(|e| {
-            e["errorCode"] == "vendor_composer_mirror_filters_neutralized"
+            e["action"] == "rebuilt"
+                && e["details"]["redownloaded"] == true
                 && e["purl"] == purl.as_str()
         }),
-        "the heal is surfaced: {env}"
+        "the exact redownload is surfaced: {env}"
     );
     assert_eq!(
         std::fs::read(&lock_path).unwrap(),
         lock_wired,
         "composer.lock untouched"
     );
-    assert_eq!(std::fs::read(copy.join(".gitignore")).unwrap(), b"");
+    assert_eq!(
+        std::fs::read(&ledger_path).unwrap(),
+        ledger_before,
+        "ledger untouched"
+    );
+    assert_eq!(
+        runtime
+            .block_on(socket_patch_core::vendor::compute_dir_inventory(&copy))
+            .unwrap(),
+        inventory_before
+    );
     assert_eq!(
         std::fs::read(copy.join("src/LoggerInterface.php")).unwrap(),
         patched,
-        "the patched file is untouched by the heal"
+        "the redownload preserves the patched file"
     );
 
     let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
@@ -1474,8 +1494,9 @@ fn composer_vendor_fast_path_heals_legacy_copy() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|e| e["errorCode"] == "vendor_composer_mirror_filters_neutralized"),
-        "a healed copy has nothing left to neutralize: {env}"
+            .any(|e| e["action"] == "rebuilt"
+                || e["errorCode"] == "vendor_composer_mirror_filters_neutralized"),
+        "a restored copy has nothing left to neutralize: {env}"
     );
     assert_fresh_install_mirrors_whole_copy(tmp.path(), &proj, &copy_rel, &patched);
 }
