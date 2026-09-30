@@ -380,7 +380,9 @@ fn pipenv_venv_in_project(cwd: &Path, var: &impl Fn(&str) -> Option<String>) -> 
         Some(Err(text)) if !text.is_empty() => return Some(true),
         _ => {}
     }
-    let text = std::fs::read_to_string(cwd.join("Pipfile")).ok()?;
+    // Non-blocking, regular-files-only read: a FIFO `Pipfile` (a lock alone
+    // marks the project) must not wedge discovery.
+    let text = read_regular_to_string_sync(&cwd.join("Pipfile")).ok()?;
     let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
     let value = doc.get("pipenv")?.get("venv_in_project")?.as_value()?;
     // Python's `bool(value)` for the scalar shapes a Pipfile can hold.
@@ -2276,6 +2278,40 @@ mod tests {
             }
             assert!(result.unwrap().is_empty(), "{filename}");
         }
+    }
+
+    /// A `Pipfile.lock` alone marks a Pipenv project, so a FIFO `Pipfile`
+    /// beside it reaches the `[pipenv] venv_in_project` lookup, which must
+    /// not block on it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipenv_discovery_does_not_block_on_fifo_pipfile() {
+        let (_tmp, project, site, var) = pipenv_project_with_workon_venv(&[]);
+        let _dot = fake_venv(&project, ".venv");
+        std::fs::remove_file(project.join("Pipfile")).unwrap();
+        std::fs::write(project.join("Pipfile.lock"), "{}").unwrap();
+        let fifo = project.join("Pipfile");
+        assert!(tokio::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .await
+            .unwrap()
+            .success());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            find_local_venv_site_packages_with(&project, &var),
+        )
+        .await;
+        if result.is_err() {
+            let release = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fifo)
+                .unwrap();
+            drop(release);
+        }
+        let found = result.expect("discovery blocked on a FIFO Pipfile");
+        assert_eq!(found.first(), Some(&site));
     }
 
     // ── Poetry out-of-tree virtualenv discovery ─────────────────────────────
