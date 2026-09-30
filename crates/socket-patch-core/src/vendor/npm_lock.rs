@@ -28,6 +28,7 @@ use super::common::{already_patched_result, detect_indent, done, refused, serial
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
 };
+use super::npm_origin::npm_non_registry_entries;
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
@@ -460,7 +461,9 @@ fn rewritable_matches(
             .filter(|w| {
                 matches!(
                     w.code,
-                    "vendor_bundled_instance_skipped" | "vendor_link_entry_skipped"
+                    "vendor_bundled_instance_skipped"
+                        | "vendor_link_entry_skipped"
+                        | "vendor_non_registry_entry_skipped"
                 )
             })
             .map(|w| w.detail.as_str())
@@ -470,8 +473,9 @@ fn rewritable_matches(
                 "vendor_lock_entry_not_rewritable",
                 format!(
                     "every {lock_name} entry for {name}@{version} is bundled inside a \
-                     parent's tarball or a link and cannot be rewritten — those copies \
-                     stay UNPATCHED and `npm install` will not help: {}",
+                     parent's tarball, a link, or installed from a non-registry spec and \
+                     cannot be rewritten — those copies stay UNPATCHED and `npm install` \
+                     will not help: {}",
                     skipped.join("; ")
                 ),
             )));
@@ -833,6 +837,7 @@ fn scan_lock_matches(
     let Some(packages) = lock.get("packages").and_then(Value::as_object) else {
         return LockScan::Matches(matches); // validated earlier; defensive
     };
+    let non_registry = npm_non_registry_entries(lock);
     for (key, entry) in packages {
         // The root "" entry is the project itself, never a dependency.
         if key.is_empty() {
@@ -866,6 +871,21 @@ fn scan_lock_matches(
                     "lock entry `{key}` is bundled inside its parent's tarball and CANNOT be \
                      rewritten — that copy stays UNPATCHED; vendor or update the bundling \
                      parent to cover it"
+                ),
+            ));
+            continue;
+        }
+        if let Some(reason) = non_registry.get(key.as_str()) {
+            // LOUD: npm installs a git / url / `file:` dependency from the
+            // dependent's spec and ignores `resolved`, so a rewrite here
+            // would report the patch applied while the original bytes
+            // install (#326).
+            warnings.push(VendorWarning::new(
+                "vendor_non_registry_entry_skipped",
+                format!(
+                    "lock entry `{key}` is not installed from the registry ({reason}) and \
+                     CANNOT be rewritten — npm installs it from that spec, so that copy stays \
+                     UNPATCHED; depend on the registry release to vendor it"
                 ),
             ));
             continue;
@@ -2100,6 +2120,90 @@ mod tests {
         assert_eq!(
             live["packages"]["node_modules/bundler/node_modules/left-pad"],
             lock["packages"]["node_modules/bundler/node_modules/left-pad"]
+        );
+    }
+
+    /// #326: a git / remote-tarball / `file:` dependency is installed from
+    /// the dependent's spec, not the lock's `resolved`, so vendoring it
+    /// would report `applied` while `npm ci` installs the original bytes.
+    /// With no other copy the vendor refuses and writes nothing.
+    #[tokio::test]
+    async fn non_registry_only_instances_refuse_and_write_nothing() {
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        for (spec, resolved) in [
+            (
+                "github:stevemao/left-pad#v1.3.0",
+                "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba",
+            ),
+            (url, url),
+            ("file:../left-pad-1.3.0.tgz", "file:../left-pad-1.3.0.tgz"),
+        ] {
+            let lock = json!({
+                "name": "fixture",
+                "version": "1.0.0",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "fixture", "version": "1.0.0",
+                          "dependencies": { "left-pad": spec } },
+                    "node_modules/left-pad": {
+                        "version": "1.3.0",
+                        "resolved": resolved,
+                        "integrity": "sha512-orig=="
+                    }
+                }
+            });
+            let fx = fixture_with("left-pad", "1.3.0", lock).await;
+            let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_rewritable");
+            assert!(
+                detail.contains("UNPATCHED") && detail.contains("node_modules/left-pad"),
+                "{spec}: {detail}"
+            );
+            assert!(
+                !detail.contains("make sure the package is installed"),
+                "{spec}: {detail}"
+            );
+            assert_eq!(
+                tokio::fs::read(fx.lock_path()).await.unwrap(),
+                fx.lock_bytes,
+                "{spec}: lock untouched by the refusal"
+            );
+            assert!(
+                !fx.root().join(".socket/vendor").exists(),
+                "{spec}: refusal writes nothing"
+            );
+        }
+    }
+
+    /// #326, transitive: the nested git copy is skipped loudly and the
+    /// registry copies are still vendored.
+    #[tokio::test]
+    async fn nested_git_instance_is_skipped_with_warning() {
+        let mut lock = default_lock();
+        lock["packages"]["node_modules/foo"]["dependencies"] =
+            json!({ "left-pad": "github:stevemao/left-pad#v1.3.0" });
+        lock["packages"]["node_modules/foo/node_modules/left-pad"]["resolved"] =
+            json!("git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba");
+        let fx = fixture_with("left-pad", "1.3.0", lock.clone()).await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success);
+        assert_eq!(entry.unwrap().wiring.len(), 1, "only the hoisted copy");
+        let skipped = warnings
+            .iter()
+            .find(|w| w.code == "vendor_non_registry_entry_skipped")
+            .unwrap_or_else(|| panic!("{warnings:?}"));
+        assert!(
+            skipped.detail.contains("UNPATCHED")
+                && skipped
+                    .detail
+                    .contains("node_modules/foo/node_modules/left-pad"),
+            "{}",
+            skipped.detail
+        );
+        let live = fx.read_lock().await;
+        assert_eq!(
+            live["packages"]["node_modules/foo/node_modules/left-pad"],
+            lock["packages"]["node_modules/foo/node_modules/left-pad"],
+            "the git copy is byte-untouched"
         );
     }
 

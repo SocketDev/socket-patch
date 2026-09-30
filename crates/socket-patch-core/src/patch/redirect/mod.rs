@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use crate::utils::composer_version::composer_versions_equivalent;
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
+use crate::vendor::npm_origin::npm_non_registry_entries;
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 mod bun_binary;
@@ -859,6 +860,9 @@ fn rewrite_one_npm_lock(
                 .collect()
         })
         .unwrap_or_default();
+    // Entries npm installs from a git / url / `file:` spec: see
+    // `vendor::npm_origin` (#326).
+    let non_registry = npm_non_registry_entries(&lock);
     let mut changed = false;
     for dep in npm {
         let fname = full_name(dep);
@@ -902,6 +906,22 @@ fn rewrite_one_npm_lock(
                             "lock entry `{key}` is bundled inside its parent's tarball and \
                              CANNOT be redirected — that copy stays UNPATCHED; vendor or \
                              update the bundling parent to cover it"
+                        ),
+                    });
+                    continue;
+                }
+                // npm installs a git / url / `file:` dependency from the
+                // dependent's spec and ignores `resolved`, so a rewrite here
+                // would confirm (and VEX-attest) a patch that never installs.
+                if let Some(reason) = non_registry.get(key.as_str()) {
+                    matched_any = true;
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_npm_non_registry_entry_skipped".into(),
+                        detail: format!(
+                            "lock entry `{key}` is not installed from the registry ({reason}) \
+                             and CANNOT be redirected — npm installs it from that spec, so \
+                             that copy stays UNPATCHED; depend on the registry release to \
+                             patch it"
                         ),
                     });
                     continue;
@@ -13159,6 +13179,123 @@ mod tests {
             !warning_codes(&r).contains(&"redirect_npm_entry_not_found"),
             "a bundled skip is a MATCH — not-found must stay quiet: {:?}",
             r.warnings
+        );
+    }
+
+    /// #326: npm installs a git, remote-tarball or `file:` dependency from
+    /// the dependent's spec and ignores the lock's `resolved`, so rewiring
+    /// that entry would report (and VEX-attest) a patch `npm ci` never
+    /// installs. It must be skipped loudly, like a bundled copy.
+    #[test]
+    fn npm_non_registry_entries_are_skipped_with_loud_warning() {
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        for (spec, resolved) in [
+            (
+                "github:stevemao/left-pad#v1.3.0",
+                "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba",
+            ),
+            (url, url),
+            ("file:../left-pad-1.3.0.tgz", "file:../left-pad-1.3.0.tgz"),
+        ] {
+            let lock = json!({
+                "name": "app",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "app", "version": "0.0.0", "dependencies": { "left-pad": spec } },
+                    "node_modules/left-pad": {
+                        "version": "1.3.0",
+                        "resolved": resolved,
+                        "integrity": "sha512-UPSTREAM=="
+                    }
+                }
+            });
+            let mut files = BTreeMap::new();
+            files.insert(
+                "package-lock.json".to_string(),
+                serde_json::to_string_pretty(&lock).unwrap(),
+            );
+            let overrides = vec![npm_override(
+                "left-pad",
+                "1.3.0",
+                "http://patch.test/lp.tgz",
+                "sha512-PATCHED==",
+            )];
+            let r = rewrite_registry_redirect(&files, &overrides);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{spec}: a non-registry entry must not be rewired: {:?}",
+                r.edits
+            );
+            let skipped = r
+                .warnings
+                .iter()
+                .find(|w| w.code == "redirect_npm_non_registry_entry_skipped")
+                .unwrap_or_else(|| panic!("{spec}: the skip must warn: {:?}", r.warnings));
+            assert!(
+                skipped.detail.contains("UNPATCHED")
+                    && skipped.detail.contains("node_modules/left-pad"),
+                "{spec}: {}",
+                skipped.detail
+            );
+            assert!(
+                !warning_codes(&r).contains(&"redirect_npm_entry_not_found"),
+                "{spec}: the entry was found: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    /// #326, transitive: a nested git copy is skipped while the hoisted
+    /// registry copy of the same version is still redirected.
+    #[test]
+    fn npm_nested_git_copy_is_skipped_and_registry_copy_rewired() {
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0",
+                      "dependencies": { "a": "^1.0.0", "left-pad": "^1.3.0" } },
+                "node_modules/a": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+                    "integrity": "sha512-A==",
+                    "dependencies": { "left-pad": "stevemao/left-pad#v1.3.0" }
+                },
+                "node_modules/a/node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba"
+                },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-UPSTREAM=="
+                }
+            }
+        });
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            serde_json::to_string_pretty(&lock).unwrap(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        assert_eq!(r.edits[0].key.as_deref(), Some("node_modules/left-pad"));
+        assert!(
+            warning_codes(&r).contains(&"redirect_npm_non_registry_entry_skipped"),
+            "{:?}",
+            r.warnings
+        );
+        let out: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+        assert_eq!(
+            out["packages"]["node_modules/a/node_modules/left-pad"],
+            lock["packages"]["node_modules/a/node_modules/left-pad"],
+            "the git copy is byte-untouched"
         );
     }
 

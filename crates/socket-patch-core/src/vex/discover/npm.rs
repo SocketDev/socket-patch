@@ -55,6 +55,7 @@ use crate::vendor::lock_inventory::pnpm::{
 use crate::vendor::lock_inventory::{
     npm_lock_nodes, pnpm_registry_key, LockIntegrity, NpmLockNode,
 };
+use crate::vendor::npm_origin::npm_non_registry_entries;
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let mut locks: Vec<NpmLockRefs> = Vec::new();
@@ -146,7 +147,61 @@ async fn extract_package_lock(
     for node in npm_lock_nodes(&doc) {
         entry_ref(ctx, file, &node, &mut read, out);
     }
+    drop_non_registry_installs(file, &doc, &mut read, out);
     Some(read)
+}
+
+/// npm installs a git / url / `file:` dependency from the dependent's spec
+/// and ignores the entry's `resolved` (`vendor::npm_origin`, #326), so such
+/// an entry stays unpatched whatever its `resolved` says. Every ref for the
+/// same `name@version` is dropped (that copy is live beside it), and the
+/// copy counts as resolved elsewhere, so other locks' wiring for it is
+/// contested too.
+fn drop_non_registry_installs(
+    file: &str,
+    doc: &Value,
+    read: &mut NpmLockRefs,
+    out: &mut Discovery,
+) {
+    let non_registry = npm_non_registry_entries(doc);
+    if non_registry.is_empty() {
+        return;
+    }
+    let mut unpatched: Vec<(String, &str, &str)> = Vec::new();
+    for (key, reason) in &non_registry {
+        let entry = &doc["packages"][key.as_str()];
+        let key_name = key.rsplit_once("node_modules/").map_or("", |(_, n)| n);
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(key_name);
+        let Some(purl) = entry
+            .get("version")
+            .and_then(Value::as_str)
+            .and_then(|v| npm_purl(name, v))
+        else {
+            continue;
+        };
+        out.resolved_elsewhere(file, Some(purl.clone()));
+        read.unwired.insert(purl.clone());
+        unpatched.push((purl, key, reason));
+    }
+    read.refs.retain(|r| {
+        let Some((_, key, reason)) = unpatched.iter().find(|(p, _, _)| *p == r.purl) else {
+            return true;
+        };
+        out.diag(
+            DIAG_REF_UNATTRIBUTABLE,
+            file,
+            format!(
+                "{file}: {} is wired to Socket patch {} but lock entry `{key}` is not \
+                 installed from the registry ({reason}); npm installs it from that spec, so \
+                 that copy stays UNPATCHED and nothing is attested",
+                r.purl, r.uuid
+            ),
+        );
+        false
+    });
 }
 
 /// Classify one lock entry: a ref (into `read.refs`), a package resolved
@@ -839,6 +894,86 @@ mod tests {
         );
         let out = run(&v1).await;
         assert!(out.refs.is_empty(), "{:#?}", out.refs);
+    }
+
+    /// #326: a Socket-wired entry npm installs from a git / url / `file:`
+    /// spec (a lock rewired before the rewriters refused these, or by
+    /// hand) wires nothing, and neither does a wired registry copy while a
+    /// non-registry copy of the same version stays unpatched beside it.
+    #[tokio::test]
+    async fn entries_npm_installs_from_a_non_registry_spec_are_not_attested() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        let tarball = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        for spec in [
+            "github:stevemao/left-pad#v1.3.0",
+            tarball,
+            "file:../left-pad-1.3.0.tgz",
+        ] {
+            for resolved in [&hosted, &vendored] {
+                let p = Project::new();
+                p.write(
+                    "package-lock.json",
+                    lock_with_packages(serde_json::json!({
+                        "": { "name": "app", "version": "1.0.0",
+                              "dependencies": { "left-pad": spec } },
+                        "node_modules/left-pad": {
+                            "version": "1.3.0", "resolved": resolved, "integrity": SRI
+                        },
+                    })),
+                );
+                let out = run(&p).await;
+                assert!(out.refs.is_empty(), "{spec} / {resolved}: {:#?}", out.refs);
+                assert!(
+                    diag_codes(&out).contains(&DIAG_REF_UNATTRIBUTABLE),
+                    "{spec} / {resolved}: {:?}",
+                    out.diagnostics
+                );
+            }
+        }
+        // Transitive: the hoisted copy is wired, a nested git copy of the
+        // same version is not.
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({
+                "": { "name": "app", "version": "1.0.0",
+                      "dependencies": { "a": "^1.0.0", "left-pad": "^1.3.0" } },
+                "node_modules/a": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+                    "dependencies": { "left-pad": "stevemao/left-pad#v1.3.0" }
+                },
+                "node_modules/a/node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba"
+                },
+                "node_modules/left-pad": { "version": "1.3.0", "resolved": hosted, "integrity": SRI },
+            })),
+        );
+        let out = run(&p).await;
+        assert!(out.refs.is_empty(), "{:#?}", out.refs);
+        let diag = out
+            .diagnostics
+            .iter()
+            .find(|d| d.code == DIAG_REF_UNATTRIBUTABLE)
+            .unwrap_or_else(|| panic!("{:?}", out.diagnostics));
+        assert!(
+            diag.detail.contains("node_modules/a/node_modules/left-pad"),
+            "{}",
+            diag.detail
+        );
+        // Control: a registry spec keeps the ref.
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({
+                "": { "name": "app", "version": "1.0.0",
+                      "dependencies": { "left-pad": "^1.3.0" } },
+                "node_modules/left-pad": { "version": "1.3.0", "resolved": hosted, "integrity": SRI },
+            })),
+        );
+        assert_eq!(run(&p).await.refs.len(), 1);
     }
 
     /// Negative shapes: a uuid on a foreign host, a placeholder token, the

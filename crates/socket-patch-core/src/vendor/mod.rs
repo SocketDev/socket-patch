@@ -73,6 +73,7 @@ pub(crate) mod npm_common;
 pub(crate) mod npm_dir;
 pub mod npm_flavor;
 pub mod npm_lock;
+pub(crate) mod npm_origin;
 mod npm_pack;
 pub(crate) mod nuget_config;
 pub mod nuget_feed;
