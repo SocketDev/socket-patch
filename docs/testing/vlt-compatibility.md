@@ -134,6 +134,13 @@ The capstones serve npmjs bytes from a local wiremock registry `R` and write
 | rc.30 … rc.32 | `{"config":{"registry": R}}` | yes | URL-segment DepIDs |
 | ≥ rc.33 | `{"config":{"registries":{"npm": R}}}` (+ `config.registry = R` for rc.33 … 1.0.4) | yes | |
 
+The 0.0.0-1 and 0.0.0-11 writers can record an explicit npmjs tarball URL
+despite the configured harness registry. v5 rollback reconstructs the upstream
+pin without a saved lock fragment, so the rollback assertions allow that target
+URL to be omitted or restored on the harness registry. They still compare every
+other byte, including bystanders and CRLF line endings, and verify pristine
+package contents after a real install from the restored lock.
+
 `scripts/backtest-vlt.py`'s `write_vlt_json` follows the same table against
 public npm (a `registry` equal to vlt's npmjs default is left out: vlt strips
 it from the lock anyway).

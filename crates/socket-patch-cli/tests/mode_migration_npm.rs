@@ -388,11 +388,15 @@ async fn mount_hosted_mocks(
 /// Serve, from `server` (as `SOCKET_NPM_REGISTRY`), the npm registry version
 /// document the v5 upstream restore reads for DEP — mirrored from what the
 /// PRISTINE classic lock recorded (`resolved "<tarball>#<sha1>"`,
-/// `integrity`). The restore of a hosted classic entry must reproduce the
-/// registry entry yarn wrote from exactly that document; mirroring it keeps
+/// `integrity`, or the SHA-1 fragment on pre-1.10 releases). The restore must
+/// reproduce the registry entry yarn wrote from that document; mirroring it keeps
 /// the unwind hermetic (the binary's TLS stack need not reach the real
-/// registry). Returns the registry base to hand the binary.
-async fn mount_registry_from_classic_lock(server: &MockServer, lock: &str) -> String {
+/// registry). Returns the registry base and expected upstream lock. Hosted
+/// mode adds an integrity line even on pre-1.10 yarn, and v5 restores that
+/// line's registry hash without a saved fragment to recover its absence.
+async fn mount_registry_from_classic_lock(server: &MockServer, lock: &str) -> (String, String) {
+    use base64::Engine as _;
+
     let block = lock
         .split("\n\n")
         .find(|b| {
@@ -404,23 +408,43 @@ async fn mount_registry_from_classic_lock(server: &MockServer, lock: &str) -> St
             .lines()
             .find_map(|l| l.trim().strip_prefix(&format!("{name} ")))
             .map(|v| v.trim_matches('"').to_string())
-            .unwrap_or_else(|| panic!("no `{name}` in {block}"))
     };
-    let resolved = field("resolved");
+    let resolved = field("resolved").unwrap_or_else(|| panic!("no `resolved` in {block}"));
     let (tarball, shasum) = resolved
         .split_once('#')
         .map(|(t, s)| (t.to_string(), Some(s.to_string())))
         .unwrap_or((resolved.clone(), None));
+    let integrity = field("integrity").unwrap_or_else(|| {
+        let sha1 = hex::decode(
+            shasum
+                .as_ref()
+                .expect("pre-1.10 yarn pins a SHA-1 fragment"),
+        )
+        .expect("the resolved fragment is hex SHA-1");
+        format!(
+            "sha1-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha1)
+        )
+    });
+    let upstream_lock = if field("integrity").is_some() {
+        lock.to_string()
+    } else {
+        lock.replacen(
+            &format!("  resolved \"{resolved}\""),
+            &format!("  resolved \"{resolved}\"\n  integrity {integrity}"),
+            1,
+        )
+    };
     Mock::given(method("GET"))
         .and(path(format!("/registry/{DEP}/{DEP_VERSION}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "name": DEP,
             "version": DEP_VERSION,
-            "dist": { "tarball": tarball, "integrity": field("integrity"), "shasum": shasum }
+            "dist": { "tarball": tarball, "integrity": integrity, "shasum": shasum }
         })))
         .mount(server)
         .await;
-    format!("{}/registry", server.uri())
+    (format!("{}/registry", server.uri()), upstream_lock)
 }
 
 fn run_hosted_scan(proj: &Path, server_uri: &str) -> (i32, String, String) {
@@ -642,7 +666,7 @@ fn assert_pure_vendored_and_round_trip(
         "fresh vendored install must carry the PATCHED bytes ({tag})"
     );
 
-    // (b) Round trip: `vendor --revert` restores the REGISTRY lock
+    // (b) Round trip: `vendor --revert` restores the expected REGISTRY lock
     // byte-identically (pre-fix it restored the hosted fragment, with no CLI
     // path back to registry state).
     let (code, stdout, stderr) = run_socket(
@@ -659,8 +683,8 @@ fn assert_pure_vendored_and_round_trip(
     assert_eq!(
         std::fs::read(proj.join("yarn.lock")).unwrap(),
         lock_pristine,
-        "yarn.lock must be restored byte-identical to the pre-hosted \
-         REGISTRY pristine ({tag}); got:\n{}",
+        "yarn.lock must be restored byte-identical to the expected \
+         upstream REGISTRY lock ({tag}); got:\n{}",
         read(proj, "yarn.lock")
     );
     assert_eq!(
@@ -809,7 +833,7 @@ async fn classic_hosted_then_vendored_takeover_round_trips_to_registry() {
     // upstream restore re-resolves the registry entry (mirrored from the
     // pristine lock), and the mock origin is named hosted via
     // --patch-server-url.
-    let registry =
+    let (registry, lock_upstream) =
         mount_registry_from_classic_lock(&server, &String::from_utf8_lossy(&lock_pristine)).await;
     stage_patch(&proj, &fx.orig, &fx.patched);
     let (code, stdout, stderr) = run_socket_env(
@@ -847,7 +871,7 @@ async fn classic_hosted_then_vendored_takeover_round_trips_to_registry() {
         "classic",
         false,
         &hosted_url,
-        &lock_pristine,
+        lock_upstream.as_bytes(),
         &pkg_json_pristine,
         &stdout,
     );
@@ -1055,10 +1079,10 @@ async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
         )
     });
 
-    // The originals chain across migrations: `rollback` restores the hosted
-    // pin's upstream registry entry, which is the pristine lock byte for
-    // byte (online: the entry is re-resolved from the registry document).
-    let registry =
+    // Rollback re-resolves the upstream registry entry. Hosted mode added an
+    // integrity line even on pre-1.10 yarn; v5 has no saved fragment to tell
+    // whether it was originally absent, so it restores the registry hash.
+    let (registry, lock_upstream) =
         mount_registry_from_classic_lock(&server, &String::from_utf8_lossy(&lock_pristine)).await;
     let (code, stdout, stderr) = run_socket_env(
         &proj,
@@ -1076,8 +1100,27 @@ async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
     assert_eq!(code, 0, "rollback failed: {stdout}\n{stderr}");
     assert_eq!(
         read(&proj, "yarn.lock"),
-        String::from_utf8_lossy(&lock_pristine),
-        "rollback lands on the pristine registry lock"
+        lock_upstream,
+        "rollback restores the registry lock, allowing the added upstream integrity"
+    );
+    let fresh = fresh_checkout(&proj, fx.tmp.path(), "classic-rollback", false);
+    let fresh_cache = fx.tmp.path().join("fresh-cache-classic-rollback");
+    let ci = corepack(
+        &fresh,
+        &yarn_classic_vex::yarn_classic(),
+        &["install", "--frozen-lockfile", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
+    );
+    assert!(
+        ci.status.success(),
+        "fresh-checkout rollback install must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+        fx.orig,
+        "rollback installs the pristine registry bytes"
     );
 }
 

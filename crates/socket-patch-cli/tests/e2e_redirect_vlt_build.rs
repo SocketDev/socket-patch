@@ -29,6 +29,24 @@ fn hosted_leg(name: &'static str) -> Option<Leg> {
     Leg::start(SUITE, name)
 }
 
+/// v5 restores upstream pins without a saved lock fragment. The earliest
+/// vlt releases record npmjs URLs even with the harness registry configured;
+/// restore may omit that redundant slot or point it at the harness registry.
+/// All other bytes, including bystanders and line endings, must still match.
+fn assert_restored_lock(fx: &Fixture, before: &[u8]) {
+    let mut expected = String::from_utf8(before.to_vec()).unwrap();
+    let mut actual = String::from_utf8(lock_bytes(&fx.proj)).unwrap();
+    if fx.leg.version() <= VltVersion::zero(11) {
+        for target in &fx.svc.targets {
+            let bare = target.name.rsplit('/').next().unwrap();
+            let path = Registry::tarball_path(&target.name, bare, &target.version);
+            expected = expected.replace(&format!(",\"https://registry.npmjs.org{path}\""), "");
+            actual = actual.replace(&format!(",\"{}{path}\"", fx.reg.server.uri()), "");
+        }
+    }
+    assert_eq!(actual, expected, "rollback restores the upstream lock");
+}
+
 // ── drivers and fresh checkouts ───────────────────────────────────────────
 
 /// `scan --mode hosted --vex`: the lock pins the artifact (one preflight
@@ -167,7 +185,7 @@ async fn vlt_pinned_matrix_hosted_tamper_cold_eintegrity() {
 
 // ── rollback, rerun, heal ─────────────────────────────────────────────────
 
-/// Rollback restores the lock byte-for-byte, heals the patched store copy
+/// Rollback restores the upstream lock, heals the patched store copy
 /// (and nothing else), and the next `vlt install` is pristine.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
@@ -184,11 +202,7 @@ async fn vlt_pinned_matrix_hosted_rollback_byte_exact() {
     let out = fx.rollback(&[]);
     assert_eq!(out.code, 0, "{out}");
     let doc = out.json();
-    assert_eq!(
-        String::from_utf8_lossy(&lock_bytes(&fx.proj)),
-        String::from_utf8_lossy(&fx.lock_before),
-        "rollback restores vlt-lock.json byte-for-byte"
-    );
+    assert_restored_lock(&fx, &fx.lock_before);
     assert!(
         fx.ledger().is_none(),
         "no hosted ledger is ever written (v5)"
@@ -762,11 +776,10 @@ async fn vlt_pinned_matrix_hosted_crlf_lock() {
     assert_eq!(state(&co, fx.t()), State::Patched);
     let out = fx.rollback(&[]);
     assert_eq!(out.code, 0, "{out}");
-    assert_eq!(
-        lock_bytes(&fx.proj),
-        crlf,
-        "rollback restores the CRLF lock"
-    );
+    assert_restored_lock(&fx, &crlf);
+    let co = fx.checkout("restored-crlf");
+    fx.vlt_ok_profile(&co, &fx.leg.locked_install_args(), "restored-crlf");
+    assert_eq!(state(&co, fx.t()), State::Pristine);
     fx.leg.ran();
 }
 
@@ -1185,11 +1198,7 @@ async fn vlt_pinned_matrix_hosted_idempotence() {
     assert!(fx.ledger().is_none());
     let out = fx.rollback(&[]);
     assert_eq!(out.code, 0, "{out}");
-    assert_eq!(
-        String::from_utf8_lossy(&lock_bytes(&fx.proj)),
-        String::from_utf8_lossy(&fx.lock_before),
-        "rollback restores the registry lock byte-for-byte: {out}"
-    );
+    assert_restored_lock(&fx, &fx.lock_before);
     assert!(fx.ledger().is_none());
     let files = package_files(&fx.proj);
     let out = fx.rollback(&[]);
@@ -1199,6 +1208,9 @@ async fn vlt_pinned_matrix_hosted_idempotence() {
         "a second rollback finds no state: {out}"
     );
     assert_eq!(package_files(&fx.proj), files, "and writes nothing");
+    let co = fx.checkout("restored-idempotence");
+    fx.vlt_ok_profile(&co, &fx.leg.locked_install_args(), "restored-idempotence");
+    assert_eq!(state(&co, fx.t()), State::Pristine);
     fx.leg.ran();
 }
 
