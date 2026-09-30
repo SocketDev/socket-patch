@@ -111,6 +111,17 @@ pub(crate) fn find_composer_entry(content: &str, pkg: &str, version: &str) -> Co
     }
 }
 
+pub(crate) fn find_composer_member(
+    content: &str,
+    entry: (usize, usize),
+    key: &str,
+) -> Option<composer_source::Member> {
+    let object_open = composer_source::entry_object_start(content, entry.0)?;
+    composer_source::top_level_members(content, object_open, entry.1)
+        .into_iter()
+        .find(|member| member.key == key)
+}
+
 /// Append `"shasum": "<sha1>"` as the last key of a `"dist": { … }` block,
 /// indented like the keys already in it. VCS/zipball dists omit `shasum`
 /// entirely; redirecting such a block without inserting the pin left the hosted
@@ -201,14 +212,8 @@ pub(crate) fn rewrite_composer_lock(
                     continue;
                 }
             };
-        let dist_member =
-            composer_source::entry_object_start(&content, entry_start).and_then(|object_open| {
-                composer_source::top_level_members(&content, object_open, entry_end)
-                    .into_iter()
-                    .find(|member| member.key == "dist")
-            });
-        let Some(dist_member) =
-            dist_member.filter(|member| content.as_bytes()[member.value_start] == b'{')
+        let Some(dist_member) = find_composer_member(&content, (entry_start, entry_end), "dist")
+            .filter(|member| content.as_bytes()[member.value_start] == b'{')
         else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_composer_no_dist".into(),
