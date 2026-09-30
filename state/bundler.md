@@ -11,7 +11,7 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | Linux | 3.3.6 | 1.17.x | untested (must refuse) | untested | untested | untested | untested | untested | untested | untested |
 | Linux | 3.3.6 | 2.4.22 | untested | untested | fail #340 | untested | untested | untested | fail #341 | untested |
 | Linux | 3.3.6 | 2.6.9 | untested | untested | untested | untested | untested | untested | untested | untested |
-| Linux | 3.3.6 | 4.0.9 | untested | pass (CHECKSUMS + none) | fail #340 | pass | pass | untested (repo e2e covers it) | fail #341 | refused (odd reason, backlog 2) |
+| Linux | 3.3.6 | 4.0.9 | untested | pass (no CHECKSUMS) | fail #340 | pass | pass | untested (repo e2e covers it) | fail #341 | refused (odd reason, backlog 2) |
 | macOS | any | any | untested | untested | untested (OS-independent) | untested | untested | untested | untested (OS-independent) | untested |
 | Windows | any | any | untested | untested | untested (OS-independent) | untested | untested | untested | untested (OS-independent) | untested |
 
