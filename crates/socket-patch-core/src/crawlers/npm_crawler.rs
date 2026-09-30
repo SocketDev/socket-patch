@@ -296,6 +296,19 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     out
 }
 
+/// `store` relative to `importer`, when it names a directory strictly
+/// below it by plain child names only. A bare `strip_prefix` is not
+/// enough: the CLI's default `--cwd .` makes the importer the empty path,
+/// which is a prefix of everything, including an absolute store (`/…`,
+/// `C:\…`) or one that climbs out (`../…`).
+fn path_below(importer: &Path, store: &Path) -> Option<PathBuf> {
+    let below = store.strip_prefix(importer).ok()?;
+    let plain = below
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    (plain && !below.as_os_str().is_empty()).then(|| below.to_path_buf())
+}
+
 /// A pnpm virtual store that `node_modules/.modules.yaml` relocates away
 /// from the default `node_modules/.pnpm` (pnpm's `virtualStoreDir`
 /// setting, stored relative to `node_modules`, or absolute on old pnpm).
@@ -314,10 +327,7 @@ fn relocated_pnpm_virtual_store_sync(nm: &Path) -> Option<PathBuf> {
     if store == normalize_lexically(&nm.join(".pnpm")) || store == normalize_lexically(nm) {
         return None;
     }
-    let below = store.strip_prefix(&importer).ok()?;
-    if below.as_os_str().is_empty() {
-        return None;
-    }
+    let below = path_below(&importer, &store)?;
     let mut dir = importer;
     for component in below.components() {
         dir.push(component);
@@ -3960,6 +3970,43 @@ mod tests {
         write_pkg(&primary, "foo", "1.0.0");
         write_pkg(&twin, "foo", "1.0.0");
         assert_eq!(find_store_peer_variant_copies(&primary).await, vec![twin]);
+    }
+
+    /// A relocated store counts only when it sits strictly below the
+    /// importer by plain child names. With the CLI's default `--cwd .` the
+    /// importer is the empty path, which `strip_prefix` accepts as a
+    /// prefix of anything, absolute or climbing out.
+    #[test]
+    fn test_path_below_accepts_only_plain_children() {
+        let p = Path::new;
+        assert_eq!(
+            path_below(p(""), p(".vstore")),
+            Some(PathBuf::from(".vstore"))
+        );
+        assert_eq!(
+            path_below(p(""), p("node_modules/.custom")),
+            Some(PathBuf::from("node_modules/.custom"))
+        );
+        assert_eq!(
+            path_below(p("/proj"), p("/proj/.vstore")),
+            Some(PathBuf::from(".vstore"))
+        );
+        for (importer, store) in [
+            ("", "/home/u/.local/share/pnpm/store/v10/links"),
+            ("", "../other/.vstore"),
+            ("", ""),
+            ("/proj", "/proj"),
+            ("/proj", "/other/.vstore"),
+            ("../proj", "../other"),
+        ] {
+            assert_eq!(
+                path_below(p(importer), p(store)),
+                None,
+                "{importer:?} {store:?}"
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(path_below(p(""), p(r"C:\pnpm\links")), None);
     }
 
     /// A `virtualStoreDir` outside the project (pnpm's global virtual
