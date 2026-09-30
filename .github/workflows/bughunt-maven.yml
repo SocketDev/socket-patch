@@ -27,10 +27,10 @@ jobs:
           set +e
           java -version 2>&1 | head -1
           PY=python3; command -v python3 >/dev/null || PY=python
-          ROOT="$RUNNER_TEMP/bh"; mkdir -p "$ROOT/mvn"
+          ROOT="$RUNNER_TEMP/bh"; mkdir -p "$ROOT/mvn"; ls "$ROOT/mvn"
           for v in 3.6.3 3.9.11 4.0.0-rc-7; do
             case $v in 4.*) u=https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/$v/apache-maven-$v-bin.tar.gz;; *) u=https://archive.apache.org/dist/maven/maven-3/$v/binaries/apache-maven-$v-bin.tar.gz;; esac
-            curl -sSfL "$u" | tar xz -C "$ROOT/mvn"
+            (cd "$ROOT/mvn" && curl -sSfL "$u" | tar xz)
           done
           cat > "$ROOT/probe.py" <<'PYEOF'
           import os, sys, json, zipfile, hashlib, subprocess, shutil, tempfile
