@@ -1,0 +1,60 @@
+name: bughunt ledger to discussions
+
+on:
+  push:
+    branches: [bughunt/ledger]
+
+permissions:
+  contents: read
+  discussions: write
+
+concurrency:
+  group: bughunt-ledger
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Mirror new entries and state to discussions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          if ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            BEFORE=$(git hash-object -t tree /dev/null)
+          fi
+          discussion_id() {
+            local num
+            num=$(jq -r --arg p "$1" '.[$p] // empty' discussions.json)
+            if [ -z "$num" ]; then
+              return 1
+            fi
+            gh api graphql -F owner="$OWNER" -F repo="$REPO" -F n="$num" \
+              -f query='query($owner:String!,$repo:String!,$n:Int!){repository(owner:$owner,name:$repo){discussion(number:$n){id}}}' \
+              --jq '.data.repository.discussion.id'
+          }
+          git diff --name-only --diff-filter=A -z "$BEFORE" HEAD -- 'entries/*/*.md' |
+            sort -z | while IFS= read -r -d '' f; do
+              pm=$(basename "$(dirname "$f")")
+              id=$(discussion_id "$pm") || { echo "::warning::no discussion for $pm ($f)"; continue; }
+              gh api graphql -F d="$id" -F b=@"$f" \
+                -f query='mutation($d:ID!,$b:String!){addDiscussionComment(input:{discussionId:$d,body:$b}){comment{url}}}' \
+                --jq '.data.addDiscussionComment.comment.url'
+            done
+          git diff --name-only --diff-filter=AM -z "$BEFORE" HEAD -- 'state/*.md' |
+            while IFS= read -r -d '' f; do
+              pm=$(basename "$f" .md)
+              id=$(discussion_id "$pm") || { echo "::warning::no discussion for $pm ($f)"; continue; }
+              gh api graphql -F d="$id" -F b=@"$f" \
+                -f query='mutation($d:ID!,$b:String!){updateDiscussion(input:{discussionId:$d,body:$b}){discussion{url}}}' \
+                --jq '.data.updateDiscussion.discussion.url'
+            done

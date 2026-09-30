@@ -1,0 +1,22 @@
+{
+  "npm": 302,
+  "pnpm": 303,
+  "yarn-classic": 304,
+  "yarn-berry": 305,
+  "bun": 306,
+  "vlt": 307,
+  "deno": 308,
+  "pip": 309,
+  "uv": 310,
+  "poetry": 311,
+  "pdm": 312,
+  "pipenv": 313,
+  "hatch": 314,
+  "cargo": 315,
+  "bundler": 316,
+  "go": 317,
+  "maven": 318,
+  "gradle": 319,
+  "nuget": 320,
+  "composer": 321
+}
