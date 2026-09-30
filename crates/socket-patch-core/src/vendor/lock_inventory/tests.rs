@@ -1708,6 +1708,32 @@ async fn pipfile_lock_inventory_reads_hosted_refs_with_the_shared_url_grammar() 
     assert!(entries.iter().all(|e| e.integrity == LockIntegrity::None));
 }
 
+/// A vendored server sdist is Socket's own reference too: a lock-only
+/// re-scan keeps the package it replaces.
+#[tokio::test]
+async fn pipfile_lock_inventory_keeps_a_vendored_sdist_reference() {
+    let rel = "./.socket/vendor/pypi/00000000-0000-4000-8000-000000000000";
+    assert_eq!(
+        socket_reference_coords(&format!("{rel}/python-dateutil-2.8.2.tar.gz")),
+        Some(("python-dateutil".into(), "2.8.2".into()))
+    );
+    let lock = serde_json::json!({
+        "_meta": {"pipfile-spec": 6, "sources": []},
+        "default": {
+            "Six": {"file": format!("{rel}/six-1.16.0.tar.gz"), "hashes": ["sha256:dd"]},
+        }
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "Pipfile.lock", &lock.to_string()).await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![("six".into(), "1.16.0".into())],
+        "{entries:?}"
+    );
+    assert_eq!(entry(&entries, "six").integrity, LockIntegrity::None);
+}
+
 /// Socket's own references in a Pipfile.lock (a hosted URL, a vendored
 /// path) keep the package discoverable on a lock-only re-scan; a lock
 /// whose sources are private indexes only never carries a fetchable
