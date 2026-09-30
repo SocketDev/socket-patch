@@ -1,8 +1,16 @@
 # socket-patch CLI contract
 
-This document defines the **public surface** of the `socket-patch` binary. Anything listed here is part of the user-visible contract: third-party scripts, CI pipelines, and the npm/pypi/cargo wrappers depend on it. Changes are governed by the semver policy at the bottom of this file.
+This document defines the **public surface** of the `socket-patch` binary. Third-party scripts, CI pipelines, and the npm distribution depend on this contract. Changes are governed by the semver policy at the bottom of this file.
 
 > **Why this exists.** A flag rename, a default-value change, or a JSON key rename can land green and break every shipped wrapper silently. The contract below is backed by the unit tests under `crates/socket-patch-cli/src/**` (`#[cfg(test)] mod tests`) and the parser tests under `crates/socket-patch-cli/tests/cli_parse_*.rs`. Changes that violate the contract must update those tests in lock-step with a major version bump.
+
+For task-oriented guidance, start with [usage](../../docs/usage.md),
+[configuration](../../docs/configuration.md), or [v5 migration](../../docs/migrating-to-v5.md).
+
+**Reference:** [Commands](#subcommands) · [Arguments](#global-arguments) ·
+[Policy](#socketyml-patch-policy-v50) · [VEX](#manifest-less-vex-lockfile-discovery) ·
+[Vendoring](#vendor-command-contract) · [Rollback](#rollback-command-contract-v50) ·
+[Environment](#environment-variables) · [JSON](#json-output-shapes) · [Exit codes](#exit-codes)
 
 ## Subcommands
 
@@ -12,11 +20,11 @@ This document defines the **public surface** of the `socket-patch` binary. Anyth
 | `vex` | — | Emit an OpenVEX 0.2.0 attestation derived from the local manifest, the vendor ledger, and the hosted / vendored patch references the project's lockfiles wire (no manifest required; hosted records come from the API) |
 | `vendor` | — | Eject patched dependencies into committable `.socket/vendor/` and rewire lockfiles |
 | `list` | — | Print patches in the local manifest, plus the vendor ledger's records (v5.0) and the hosted pins the lockfiles wire (labeled; see the action matrix; an empty project exits 0) |
-| `get` | `download` | Agent mode by default (`--mode` selects hosted/vendored): fetch + apply a patch; requires positional `identifier` |
+| `get` | `download` | Fetch a selected patch in hosted mode by default; `--mode agent` selects in-place application, also the default with `--save-only` or global targeting. Requires positional `identifier`. |
 | `apply` | — | Agent mode: apply patches from the local manifest |
 | `rollback` | — | **Full-state rollback (v5.0, MAJOR)**: restore original files AND unwind vendored lockfile wiring / restore hosted pins to their upstream registry entries, remove the rolled-back entries from the manifest, and GC their blobs/archives; takes optional variadic positional `targets` (PURL \| UUID \| path glob). See [Rollback command contract](#rollback-command-contract-v50) |
-| `remove` | — | Agent mode: remove a patch from manifest (rolls back first); requires positional `identifier` |
-| `repair` | `gc` | Agent mode: download missing blobs, re-vendor missing/corrupt vendored artifacts (never re-synthesizing a lost ledger), and clean up unused ones (refuses with `lock_held` when a live process holds the lock; see "Lock lifecycle" below) |
+| `remove` | — | Restore and remove one patch across hosted, vendored, and agent state; requires positional `identifier`. |
+| `repair` | `gc` | Download missing agent blobs, re-vendor missing/corrupt vendored artifacts (never re-synthesizing a lost ledger), and clean up unused ones (refuses with `lock_held` when a live process holds the lock; see "Lock lifecycle" below) |
 
 Rows are in `--help` order (v5.0): the hosted/vendored workflow (`scan` → `vex` → `vendor`, with `list` to inspect), then the agent-mode (in-place patching) commands.
 
@@ -34,7 +42,7 @@ Rows are in `--help` order (v5.0): the hosted/vendored workflow (`scan` → `vex
 
 ## Global arguments
 
-In v3.0 every subcommand accepts the same set of "global" flags via a single shared `GlobalArgs` struct that's `#[command(flatten)]`-ed into each per-command struct (`crates/socket-patch-cli/src/args.rs`). Subcommands that don't actually consume a given flag accept it silently — e.g. `list --global` parses fine and is a no-op. Every flag also has an environment-variable binding; precedence is **CLI arg > env var > default** — and for exactly three keys (`--api-token`, `--org`, `--api-url`) the JS socket-cli's persisted login sits between env var and default: **CLI arg > env var (canonical, then `SOCKET_CLI_*` alias) > socket-cli `config.json` > default**. See "Persisted configuration" under Environment variables.
+Every subcommand accepts the same set of "global" flags via a single shared `GlobalArgs` struct that's `#[command(flatten)]`-ed into each per-command struct (`crates/socket-patch-cli/src/args.rs`). Subcommands that don't actually consume a given flag accept it silently — e.g. `list --global` parses fine and is a no-op. Every flag also has an environment-variable binding; precedence is **CLI arg > env var > default** — and for exactly three keys (`--api-token`, `--org`, `--api-url`) the JS socket-cli's persisted login sits between env var and default: **CLI arg > env var (canonical, then `SOCKET_CLI_*` alias) > socket-cli `config.json` > default**. See "Persisted configuration" under Environment variables.
 
 | Long | Short | Env var | Default | Type | Semantic |
 |---|---|---|---|---|---|
@@ -180,7 +188,7 @@ The hidden alias `--no-apply` on `get --save-only` is **part of the contract** �
 
 ### socket.yml patch policy (v5.0)
 
-A repository can **narrow** what `scan` patches with a `patches` block in its root `socket.yml` (the Socket scanner's config file; `version: 2` keeps every other consumer working — they strip or ignore the block). Design record: `docs/design/staged-rollout.md`.
+A repository can **narrow** what `scan` patches with a `patches` block in its root `socket.yml` (the Socket scanner's config file; `version: 2` keeps every other consumer working — they strip or ignore the block). Usage guide: [repository patch policy](../../docs/configuration.md#repository-patch-policy).
 
 **Grammar.** Every key is optional; camelCase, like the rest of socket.yml.
 
@@ -261,9 +269,9 @@ patches:
 
 ### Per-run limit on new patches (`scan --max-new-patches`, v5.0)
 
-`scan --max-new-patches <N|none>` (env `SOCKET_MAX_NEW_PATCHES`; socket.yml `patches.maxNewPatches`) paces a rollout: each run adds at most N patches to packages that had none, the most critical first, and defers the rest to the next run. It applies to `scan` in hosted, vendored and agent mode, wet and `--dry-run`, and to the in-memory engine (napi `maxNewPatches`, `hosted-bundle`); `get` is explicit intent and ignores it. Design: `docs/design/staged-rollout.md` §5.
+`scan --max-new-patches <N|none>` (env `SOCKET_MAX_NEW_PATCHES`; socket.yml `patches.maxNewPatches`) paces a rollout: each run adds at most N patches to packages that had none, the most critical first, and defers the rest to the next run. It applies to `scan` in hosted, vendored and agent mode, wet and `--dry-run`, and to the in-memory engine (napi `maxNewPatches`, `hosted-bundle`); `get` is explicit intent and ignores it. Usage guide: [gradual rollout](../../docs/configuration.md#gradual-rollout).
 
-**Classification.** After per-package selection, each selected `(project, purl)` row is compared with the project's **recorded view** — the merged manifest > hosted lockfile pins > vendor ledger that `updates[]` reads (§5.1):
+**Classification.** After per-package selection, each selected `(project, purl)` row is compared with the project's **recorded view** — the merged manifest > hosted lockfile pins > vendor ledger that `updates[]` reads:
 
 | Class | Rule | Capped | The writer gets |
 |---|---|---|---|
@@ -422,7 +430,7 @@ hand (the `postinstall`/`dependencies` entries, the `socket-patch[hook]` depende
 `socket-patch-bundler` gem are no longer published.
 
 Prefer hosted or vendored mode: their lockfile (and `.socket/vendor/`) edits are the persistence, so
-no install step exists. Agent mode (`scan --mode agent`, `get`, `apply`) patches the installed tree
+no Socket Patch install hook is needed. Agent mode (`scan --mode agent`, `get --mode agent`, `apply`) patches the installed tree
 in place, which the next package-manager install reverts; wire it into CI yourself:
 
 ```sh
@@ -1023,7 +1031,7 @@ State lives at `$XDG_CACHE_HOME`|`~/.cache` (Unix/macOS) or `%LOCALAPPDATA%` (Wi
 
 ## Environment variables
 
-All v3.0 env vars use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*` names are still honored at runtime for compatibility: on first read of any of the three the binary emits a one-shot deprecation warning to stderr (the warning fires unconditionally — even under `--silent` / `--json` — because it's a transition signal users need to see). The legacy names will be removed in a future major release.
+Public configuration uses the `SOCKET_*` names below. The three deprecated v3/v4 environment aliases were removed in v5; see [Removed env vars](#removed-env-vars).
 
 Four `SOCKET_CLI_*` names from the sibling JS Socket CLI are additionally accepted as **peer aliases** (supported, not deprecated — no warning): `SOCKET_CLI_API_TOKEN` → `SOCKET_API_TOKEN`, `SOCKET_CLI_ORG_SLUG` → `SOCKET_ORG_SLUG`, `SOCKET_CLI_API_BASE_URL` → `SOCKET_API_URL`, `SOCKET_CLI_NO_API_TOKEN` → `SOCKET_NO_API_TOKEN`. The canonical `SOCKET_*` name always wins when both are set; promotion is silent and happens in-process before clap parses. Other socket-cli names (`SOCKET_CLI_CONFIG`, `SOCKET_CLI_API_PROXY`, `SOCKET_CLI_DEBUG`) are deliberately **not** honored.
 
@@ -1058,7 +1066,7 @@ Empty string means unset at every layer: exported-but-empty flag-bound vars are 
 | `SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG` | `--no-npm-allow-remote-config` | `false` | Hosted mode: skip the `allow-remote=all` write to the project `.npmrc`. |
 | `SOCKET_NO_VLT_INSTALL_CLEANUP` | `--no-vlt-install-cleanup` | `false` | Hosted mode, `rollback`, `remove`: keep stale vlt installed copies. |
 | `SOCKET_FORCE` | `apply --force` / `-f`, `vendor --force` / `-f`, `--update --force` | `false` | Local to `apply`, `vendor` and `--update`. |
-| `SOCKET_PATCH_VERSION` | `--update <VERSION>` | (latest) | Local to `--update`; the same pin `install.sh` and the gem launcher honor. |
+| `SOCKET_PATCH_VERSION` | `--update <VERSION>` | (latest) | Local to `--update`; the same pin `install.sh` honors. |
 | `SOCKET_BATCH_SIZE` | `scan --batch-size` | `500` authenticated / `100` proxy | Local to `scan`. |
 | `SOCKET_MAX_NEW_PATCHES` | `scan --max-new-patches` | (unlimited) | Local to `scan` (v5.0): a count or `none`; empty is unset, malformed exits 2. |
 | `SOCKET_SCAN_PACKAGES` | `scan --package` | (none) | Local to `scan` (v5.0); comma-separated names or purls. |

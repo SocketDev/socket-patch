@@ -51,7 +51,7 @@
 //!   cargo tier emptied on 2026-08-28, so the leg was demoted to the canary
 //!   (`docs/testing/hosted-production-e2e.md` says how to re-promote it).
 //! * **golang** — hosted mode is supported for free-tier references carrying
-//!   a `goproxy` override (`docs/design/golang-hosted.md`), but production
+//!   a `goproxy` override (`docs/ecosystems.md#go-directory-replaces-and-gosum`), but production
 //!   publishes no golang hosted modules yet. Covered as a shape guard that
 //!   holds in both worlds.
 //! * **deno** — hosted mode is not supported. Covered as a negative assertion.
@@ -2427,7 +2427,7 @@ fn statements_for_opt(doc: Option<&serde_json::Value>, purl: &str) -> usize {
 // ===========================================================================
 
 /// Go hosted mode: supported for free-tier references that carry a `goproxy`
-/// override (`docs/design/golang-hosted.md`); refused with
+/// override (`docs/ecosystems.md#go-directory-replaces-and-gosum`); refused with
 /// `redirect_golang_unsupported` otherwise (`golang-hosted-no-go.md`, the
 /// paid-tier analysis).
 ///

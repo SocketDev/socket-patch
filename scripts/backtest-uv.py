@@ -1285,9 +1285,9 @@ def render_doc_table(results):
         f"untouched — and **{len(lock_changed)} changed the lock**. `--frozen` "
         f"never writes the lock, so the {len(locked_rows)} `--locked` rows are the "
         f"ones that measure preservation; {locked_ok} of them exited 0. The "
-        "[machine-readable results](uv-compatibility/results.json) contain all "
+        "machine-readable results JSON contains all "
         f"{len(all_obs)} observations and their command definitions. The "
-        "[binary catalog](uv-compatibility/binaries.json) records each uv wheel's "
+        "binary catalog records each uv wheel's "
         "public PyPI source and verified hash."
     )
     paragraph(
