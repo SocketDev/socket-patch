@@ -914,6 +914,19 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Agent mode finds Poetry's virtualenv in more setups.** Three cases
+  missed the virtualenv Poetry installed into. Each fell back to the
+  wrong interpreter, skipped the patch as `package_not_installed` and
+  still exited 0:
+  - a nameless `package-mode = false` project (Poetry names its env
+    `non-package-mode-…`);
+  - a Poetry 2 project with both `[project] name` and
+    `[tool.poetry] name` (Poetry uses `[project] name`);
+  - an explicit `virtualenvs.in-project = false` next to a stray `./.venv`.
+
+  Every Windows project missed it too, because the cwd hash included the
+  `\\?\` prefix that path canonicalization adds (#327, #329).
+
 - **Hosted nuget redirects survive a `<clear />` in `nuget.config`.** The
   Socket source (and, in an existing `<packageSourceMapping>`, its
   mapping) was inserted ahead of the section's `<clear />`, which NuGet

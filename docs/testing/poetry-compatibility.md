@@ -109,13 +109,18 @@ Other measured details:
 
 ## Mode notes
 
-- **Agent mode** patches the interpreter the crawler finds: `VIRTUAL_ENV`,
-  `./.venv`, `./venv`, then — for a Poetry project — the virtualenv(s) Poetry
-  placed under its `virtualenvs.path` (`<name>-<hash>-py<X.Y>`; every
-  interpreter minor), reproducing Poetry's own placement from `POETRY_*`, the
-  project's `poetry.toml`, the user `config.toml` and the platform default
-  cache dir without running Poetry; else — for a project directory — the global
-  interpreter's site-packages. So a bare `socket-patch scan --mode agent` /
+- **Agent mode** patches the interpreter the crawler finds: `VIRTUAL_ENV`;
+  then, for a Poetry project whose `./.venv` Poetry would not use (an explicit
+  `virtualenvs.in-project = false`, or no `./.venv` at all), the virtualenv(s)
+  Poetry placed under its `virtualenvs.path` (`<name>-<hash>-py<X.Y>`; every
+  interpreter minor); then `./.venv`, `./venv`; else, for a project
+  directory, the global interpreter's site-packages. Poetry's placement is
+  reproduced without running Poetry, from `POETRY_*`, the project's
+  `poetry.toml`, the user `config.toml` and the platform default cache dir.
+  The env name follows poetry-core's precedence: `[project] name` (2.x), then
+  `[tool.poetry] name`, then `non-package-mode` for a nameless
+  `package-mode = false` project. On Windows the cwd hash drops the `\\?\`
+  prefix that path canonicalization adds, as Python's `realpath` does. So a bare `socket-patch scan --mode agent` /
   `rollback` in a default-configured Poetry checkout works; `poetry run
   socket-patch …`, `VIRTUAL_ENV=$(poetry env info -p)` and
   `--global-prefix <site-packages>` keep working. `virtualenvs.create = false`
