@@ -729,7 +729,8 @@ jobs:
           retention-days: 3
 
   e2e:
-    needs: [test, e2e-build]
+    # These jobs consume e2e-build's binaries and can run alongside unit tests.
+    needs: [e2e-build]
     strategy:
       fail-fast: false
       matrix:
@@ -1270,8 +1271,8 @@ jobs:
           curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/maven.tgz"
           curl -fsSL --retry 3 "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
           python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
-          # stdin avoids GNU tar treating a Windows drive prefix as a remote host.
-          tar -xzf - -C "$RUNNER_TEMP" < "$RUNNER_TEMP/maven.tgz"
+          # Python accepts native Windows paths for both archive and destination.
+          python -m tarfile -e "$RUNNER_TEMP/maven.tgz" "$RUNNER_TEMP"
           launcher="$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin/mvn"
           if [ "$RUNNER_OS" = Windows ]; then launcher="${launcher}.cmd"; fi
           echo "SOCKET_PATCH_MAVEN_E2E_MVN=$launcher" >> "$GITHUB_ENV"
