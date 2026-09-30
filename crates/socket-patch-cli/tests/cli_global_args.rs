@@ -87,6 +87,9 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
         ("--download-mode", Some("file"), |c| {
             assert_eq!(c.download_mode, "file")
         }),
+        ("--maven-config", Some("none"), |c| {
+            assert_eq!(c.maven_config.as_deref(), Some("none"))
+        }),
         ("--vendor-source", Some("service"), |c| {
             assert_eq!(c.vendor_source, "service")
         }),
@@ -237,13 +240,14 @@ fn global_flag_cases_cover_every_global_field() {
         vendor_source: _,
         vendor_url: _,
         patch_server_url: _,
+        maven_config: _,
     } = common;
 
-    // 26 fields ↔ 26 long-flag cases. Bump both this count and add a case when
+    // 27 fields ↔ 27 long-flag cases. Bump both this count and add a case when
     // the destructure above forces you to add a field.
     assert_eq!(
         global_flag_cases().len(),
-        26,
+        27,
         "every GlobalArgs field needs a long-flag case in global_flag_cases()",
     );
 
@@ -767,7 +771,11 @@ fn empty_nonbool_env_vars_do_not_crash_the_binary() {
         envelope["status"], "success",
         "blank env vars must fall back to defaults: {envelope}",
     );
-    assert_eq!(out.status.code(), Some(0), "an empty project lists with exit 0");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an empty project lists with exit 0"
+    );
 }
 
 /// `save_and_clear_global_env` must clear **every** env var `GlobalArgs`

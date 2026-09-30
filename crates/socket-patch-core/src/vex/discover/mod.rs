@@ -1513,6 +1513,11 @@ impl Discovery {
     /// files still naming the uuid dir (or, with none recorded, the
     /// ecosystem's root locks — [`vendored_wiring_live`]).
     pub async fn vendor_entry_live(&self, root: &Path, entry: &VendorEntry) -> bool {
+        // The JVM backend's trees are not `<eco>/<uuid>` dirs its refs could
+        // name: its own layout decides.
+        if crate::vendor::jvm::apply::is_jvm_entry(entry) {
+            return crate::vendor::jvm::apply::entry_wired(root, entry);
+        }
         if let Some(live) = self.vendored_claim(&entry.base_purl, &entry.uuid, &entry.artifact.path)
         {
             return live;

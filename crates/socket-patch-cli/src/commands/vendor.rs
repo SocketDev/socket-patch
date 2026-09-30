@@ -93,6 +93,14 @@ pub struct VendorArgs {
     )]
     pub revert: bool,
 
+    /// Verify committed artifacts and JVM wiring offline without changing files.
+    #[arg(long, conflicts_with = "revert")]
+    pub check: bool,
+
+    /// Also check suffixed Maven jars in this local repository for conflicting bytes.
+    #[arg(long, requires = "check", hide_short_help = true)]
+    pub local_repo: Option<std::path::PathBuf>,
+
     /// On a successful vendor, also generate an OpenVEX 0.2.0 document
     /// (same contract as `apply --vex`).
     #[command(flatten)]
@@ -168,11 +176,13 @@ pub(crate) async fn dispatch_vendor_one(
     }
     // Maven and NuGet have no registry-fetch rung — `fetch_and_stage` serves
     // no fetcher for either and `stage_local_artifact` is npm-only — so their
-    // source is always the crawler's own directory.
+    // source is the crawler's own directory. A ledger-driven maven re-run on
+    // a cold cache gets a deferred hint instead: the committed tree answers
+    // an in-sync re-run, and anything else refuses for the missing jar.
     macro_rules! vend_installed {
         ($backend:path) => {{
             debug_assert!(
-                matches!(pkg_path, PackageSource::Installed(_)),
+                eco == "maven" || matches!(pkg_path, PackageSource::Installed(_)),
                 "{eco} has no fetch rung; a pending source would need materialising"
             );
             $backend(
@@ -244,7 +254,7 @@ pub(crate) async fn dispatch_revert_one_opts(
         "golang" => vendor::golang::revert_go_vendor_opts(entry, project_root, opts).await,
         "composer" => vendor::composer_lock::revert_composer_opts(entry, project_root, opts).await,
         "nuget" => vendor::nuget_feed::revert_nuget_opts(entry, project_root, opts).await,
-        "maven" => vendor::maven_repo::revert_maven_opts(entry, project_root, opts).await,
+        "maven" | "jvm" => vendor::maven_repo::revert_maven_opts(entry, project_root, opts).await,
         other => RevertOutcome::failed(format!(
             "this build has no vendor backend for ecosystem `{other}`"
         )),
@@ -643,6 +653,9 @@ pub(crate) fn note_classic_migration_risk(
 }
 
 pub async fn run(args: VendorArgs) -> i32 {
+    if args.check {
+        return run_check(&args).await;
+    }
     apply_env_toggles(&args.common);
 
     let manifest_path = args.common.resolved_manifest_path();
@@ -873,6 +886,81 @@ pub async fn run(args: VendorArgs) -> i32 {
     exit
 }
 
+/// Read-only audit: no API client, lock recovery, staging, or telemetry is started.
+async fn run_check(args: &VendorArgs) -> i32 {
+    let root = &args.common.project_root();
+    let local_repo = args.local_repo.as_ref().map(|p| args.common.cwd.join(p));
+    let mut env = Envelope::new(Command::Vendor);
+    let state = match load_state(root).await {
+        Ok(state) => state,
+        Err(e) => {
+            return emit_eject_refusal(&args.common, "vendor_state_unreadable", &e.to_string())
+        }
+    };
+    if state.entries.is_empty()
+        && [
+            ".socket/vendor/maven2",
+            ".socket/vendor/gradle",
+            ".socket/vendor/gradle-index.tsv",
+        ]
+        .iter()
+        .any(|rel| root.join(rel).exists())
+    {
+        return emit_eject_refusal(&args.common, "vendor_ledger_missing", "JVM artifacts exist without a vendor ledger; restore .socket/vendor/state.json from version control");
+    }
+    let manifest_path = args.common.resolved_manifest_path();
+    let manifest = match read_manifest(&manifest_path).await {
+        Ok(m) => m.unwrap_or_default(),
+        Err(e) => return emit_eject_refusal(&args.common, "manifest_unreadable", &e.to_string()),
+    };
+    let mut entries: Vec<_> = state.entries.iter().collect();
+    entries.sort_by_key(|(key, _)| *key);
+    for (key, entry) in entries {
+        let record = entry.record.as_ref().or_else(|| manifest.patches.get(key));
+        let mut failure = match record {
+            Some(record) => match vendor::check_vendored_artifact(root, entry, record).await {
+                vendor::ArtifactHealth::Healthy => None,
+                health => Some(format!("artifact verification failed: {health:?}")),
+            },
+            None => Some("patch record missing; restore the manifest or vendor ledger".to_string()),
+        };
+        if failure.is_none() && vendor::jvm::apply::is_jvm_entry(entry) {
+            failure = vendor::jvm::apply::check_entry(root, entry, local_repo.as_deref()).err();
+        }
+        if vendor::jvm::apply::upstream_unverified(entry) {
+            env.warnings.push(RunWarning {code: "vendor_jvm_upstream_unverified".into(), detail: format!("{key}: upstream metadata was accepted offline; run vendor online to verify registry checksums")});
+        }
+        let event = match failure {
+            Some(reason) => {
+                PatchEvent::new(PatchAction::Failed, key).with_reason("vendor_check_failed", reason)
+            }
+            None => PatchEvent::new(PatchAction::Verified, key)
+                .with_reason("vendor_check_ok", "committed artifact and wiring verified"),
+        };
+        if !args.common.json && (!args.common.silent || event.action == PatchAction::Failed) {
+            println!("{}: {}", key, event.reason.as_deref().unwrap_or("verified"));
+        }
+        env.record(event);
+    }
+    for key in manifest
+        .patches
+        .keys()
+        .filter(|k| !state.entries.contains_key(*k))
+    {
+        if !args.common.json {
+            eprintln!("{key}: patch has no vendored ledger entry");
+        }
+        env.record(PatchEvent::new(PatchAction::Failed, key).with_reason(
+            "vendor_ledger_missing",
+            "patch has no vendored ledger entry",
+        ));
+    }
+    if args.common.json {
+        println!("{}", env.to_pretty_json());
+    }
+    i32::from(env.summary.failed != 0)
+}
+
 /// A refused eject: the JSON error envelope (`status: error`) or an
 /// `Error:` line (printed even under `--silent`). Exit 1; nothing touched.
 fn emit_eject_refusal(common: &GlobalArgs, code: &'static str, message: &str) -> i32 {
@@ -935,7 +1023,11 @@ impl EjectSnapshot {
         let mut out = std::collections::BTreeSet::new();
         for eco in std::fs::read_dir(&base).into_iter().flatten().flatten() {
             if eco.file_type().is_ok_and(|t| t.is_dir()) {
-                for unit in std::fs::read_dir(eco.path()).into_iter().flatten().flatten() {
+                for unit in std::fs::read_dir(eco.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
                     out.insert(unit.path());
                 }
             }
@@ -971,7 +1063,8 @@ impl EjectSnapshot {
             let path = self.root.join(rel);
             let result = match bytes {
                 Some(bytes) => {
-                    socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(&path, bytes).await
+                    socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(&path, bytes)
+                        .await
                 }
                 None => match tokio::fs::remove_file(&path).await {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1032,7 +1125,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     if !common.json && !common.silent {
         println!(
             "{} {} into .socket/vendor/...",
-            if common.dry_run { "Would eject" } else { "Ejecting" },
+            if common.dry_run {
+                "Would eject"
+            } else {
+                "Ejecting"
+            },
             plural(pins.len(), "hosted package", "hosted packages")
         );
     }
@@ -1105,8 +1202,14 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         if common.json {
             println!("{}", env.to_pretty_json());
         }
-        track_outcomes_for_vendor(true, &env, common.dry_run, api_token.as_deref(), org_slug.as_deref())
-            .await;
+        track_outcomes_for_vendor(
+            true,
+            &env,
+            common.dry_run,
+            api_token.as_deref(),
+            org_slug.as_deref(),
+        )
+        .await;
         return 1;
     }
 
@@ -1147,8 +1250,14 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         if common.json {
             println!("{}", env.to_pretty_json());
         }
-        track_outcomes_for_vendor(true, &env, common.dry_run, api_token.as_deref(), org_slug.as_deref())
-            .await;
+        track_outcomes_for_vendor(
+            true,
+            &env,
+            common.dry_run,
+            api_token.as_deref(),
+            org_slug.as_deref(),
+        )
+        .await;
         return 1;
     }
 
@@ -1158,13 +1267,15 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         let mut env = Envelope::new(Command::Vendor);
         env.dry_run = true;
         for pin in &pins {
-            env.record(PatchEvent::new(PatchAction::Applied, pin.purl.clone()).with_reason(
-                "eject_planned",
-                format!(
-                    "would restore the upstream registry entry ({}) and vendor the patch",
-                    pin.files.join(", ")
+            env.record(
+                PatchEvent::new(PatchAction::Applied, pin.purl.clone()).with_reason(
+                    "eject_planned",
+                    format!(
+                        "would restore the upstream registry entry ({}) and vendor the patch",
+                        pin.files.join(", ")
+                    ),
                 ),
-            ));
+            );
             if !common.json && !common.silent {
                 println!(
                     "Would eject {} (restore {}, then vendor into .socket/vendor/)",
@@ -1174,12 +1285,16 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             }
         }
         if args.vex.vex.is_some() && !common.json && !common.silent {
-            println!("{}", crate::commands::vex::format_vex_dry_run_skip("vendored"));
+            println!(
+                "{}",
+                crate::commands::vex::format_vex_dry_run_skip("vendored")
+            );
         }
         if common.json {
             println!("{}", env.to_pretty_json());
         }
-        track_outcomes_for_vendor(false, &env, true, api_token.as_deref(), org_slug.as_deref()).await;
+        track_outcomes_for_vendor(false, &env, true, api_token.as_deref(), org_slug.as_deref())
+            .await;
         return 0;
     }
 
@@ -1234,7 +1349,10 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     if let Some(why) = restore_failure {
         env.mark_error(EnvelopeError::new("redirect_revert_failed", why.clone()));
         if !common.json {
-            eprintln!("Error: {}", crate::commands::rollback::capitalize_first(&why));
+            eprintln!(
+                "Error: {}",
+                crate::commands::rollback::capitalize_first(&why)
+            );
         }
         exit = 1;
     } else {
@@ -1315,7 +1433,10 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         if let Some(vex_path) = args.vex.vex.as_ref() {
             if common.dry_run {
                 if !common.json && !common.silent {
-                    println!("{}", crate::commands::vex::format_vex_dry_run_skip("vendored"));
+                    println!(
+                        "{}",
+                        crate::commands::vex::format_vex_dry_run_skip("vendored")
+                    );
                 }
             } else {
                 let params = args.vex.to_build_params();
@@ -1573,6 +1694,32 @@ async fn sweep_stale_artifact(
     stale: StaleArtifact,
 ) {
     let StaleArtifact { candidate, prev } = stale;
+    // A JVM tree is not a uuid dir: the replaced entry's own tree files go,
+    // minus any path a live entry records (a Gradle update rewrites them).
+    if vendor::jvm::apply::is_jvm_entry(&prev) {
+        let removed = if common.dry_run {
+            Ok(false)
+        } else {
+            vendor::jvm::apply::sweep_replaced_tree(&common.cwd, &prev, state.entries.values())
+                .await
+        };
+        match removed {
+            Ok(true) => env.record(
+                PatchEvent::new(PatchAction::Removed, candidate).with_reason(
+                    "vendor_stale_artifact_removed",
+                    "previous patch uuid's vendored artifact removed",
+                ),
+            ),
+            Ok(false) => {}
+            Err(detail) => record_warning(
+                env,
+                &candidate,
+                &VendorWarning::new("vendor_stale_artifact_kept", detail),
+                common,
+            ),
+        }
+        return;
+    }
     let still_referenced = state
         .entries
         .values()
@@ -3011,7 +3158,12 @@ pub(crate) async fn vendor_records_reusing(
                     continue;
                 }
                 for (code, detail) in &restore.warnings {
-                    record_warning(env, candidate, &VendorWarning::new(code, detail.clone()), common);
+                    record_warning(
+                        env,
+                        candidate,
+                        &VendorWarning::new(code, detail.clone()),
+                        common,
+                    );
                 }
                 if common.dry_run {
                     record_warning(
@@ -3681,7 +3833,12 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     // reconcile): dispatch → drift-keep → per-entry ledger save. Only the
     // event vocabulary and the human lines are this command's.
     let reverted = VendoredBackend::new(common, None)
-        .revert(&recorded, &mut state, RevertOpts::new(common.dry_run), false)
+        .revert(
+            &recorded,
+            &mut state,
+            RevertOpts::new(common.dry_run),
+            false,
+        )
         .await;
     for RevertedEntry {
         key: purl,
@@ -4183,7 +4340,11 @@ mod plan_gate_tests {
         .unwrap();
         let packages = [
             ("pkg:composer/psr/cache@1.0.0", "psr/cache", UUID_A),
-            ("pkg:composer/psr/http-message@1.1.0", "psr/http-message", UUID_B),
+            (
+                "pkg:composer/psr/http-message@1.1.0",
+                "psr/http-message",
+                UUID_B,
+            ),
             ("pkg:composer/psr/log@3.0.2", "psr/log", UUID_C),
         ];
         let mut all_packages: Vec<(String, StagedSource)> = Vec::new();

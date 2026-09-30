@@ -176,6 +176,11 @@ pub struct GlobalArgs {
     )]
     pub vendor_source: String,
 
+    /// Vendored Maven: auto writes the repository tail; none uses only the file repository.
+    /// The choice is preserved on subsequent runs.
+    #[arg(help_heading = GLOBAL_OPTIONS, long, value_parser = ["auto", "none"])]
+    pub maven_config: Option<String>,
+
     /// Base URL for the patch vendoring service. Defaults to the active API base (`--api-url`) when
     /// authenticated or the proxy base (`--proxy-url`) otherwise. Override to
     /// point `vendor` at staging / local dev independently of `--api-url`.
@@ -507,6 +512,7 @@ impl GlobalArgs {
         use_public_proxy: bool,
     ) -> VendorServiceConfig {
         VendorServiceConfig {
+            maven_config: self.maven_config.as_deref().map(|v| v != "none"),
             source: VendorSource::parse(&self.vendor_source).unwrap_or_default(),
             client,
             use_public_proxy,
@@ -675,6 +681,7 @@ impl Default for GlobalArgs {
             ecosystems: None,
             download_mode: "diff".to_string(),
             vendor_source: "auto".to_string(),
+            maven_config: None,
             vendor_url: None,
             patch_server_url: None,
             offline: false,

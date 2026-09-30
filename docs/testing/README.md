@@ -27,6 +27,7 @@ setting when that toolchain is required for the check.
 | npm family | [npm](npm-compatibility.md), [pnpm](pnpm-compatibility.md), [Yarn Berry](yarn-berry-compatibility.md), [Bun](bun-compatibility.md), [vlt](vlt-compatibility.md) |
 | Python | [uv](uv-compatibility.md), [Poetry](poetry-compatibility.md), [PDM](pdm-compatibility.md), [Pipenv](pipenv-compatibility.md), [Hatch](hatch.md) |
 | PHP | [Composer](composer-compatibility.md) |
+| JVM | [Maven reactor and Gradle vendoring](../design/maven-vendoring.md#validation-and-remaining-scope) |
 
 Other ecosystems have Rust and container suites listed in
 [ecosystem support](../ecosystems.md) and the Docker guide.

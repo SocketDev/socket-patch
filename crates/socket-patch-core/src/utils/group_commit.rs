@@ -167,7 +167,15 @@ fn is_captured(rel: &Path) -> bool {
         return false;
     }
     let spelled = rel.to_string_lossy().replace('\\', "/");
-    if LEDGERS.contains(&spelled.as_str()) {
+    if LEDGERS.contains(&spelled.as_str())
+        || [
+            ".socket/vendor/gradle-index.tsv",
+            ".socket/gradle/socket-patch.settings.gradle",
+            ".socket/vendor/maven2/.gitattributes",
+            ".socket/vendor/gradle/.gitattributes",
+        ]
+        .contains(&spelled.as_str())
+    {
         return true;
     }
     !rel.components()
@@ -1061,6 +1069,11 @@ mod tests {
             (".cargo/config.toml", true),
             (".socket/vendor/state.json", true),
             (".socket/vendor/redirect-state.json", true),
+            (".socket/vendor/gradle-index.tsv", true),
+            (".socket/gradle/socket-patch.settings.gradle", true),
+            (".socket/vendor/maven2/.gitattributes", true),
+            (".socket/vendor/gradle/.gitattributes", true),
+            (".socket/vendor/gradle/g/a/1/a-1.jar", false),
             (".socket/vendor/npm/u/left-pad-1.3.0.tgz", false),
             (".socket/manifest.json", false),
             ("packages/a/.socket/vendor/npm/u/a.tgz", false),

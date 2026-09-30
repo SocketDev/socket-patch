@@ -4437,6 +4437,7 @@ mod tests {
             .mount(&server)
             .await;
         let cfg = VendorServiceConfig {
+            maven_config: None,
             source: VendorSource::Service,
             client: Some(
                 ApiClient::new(ApiClientOptions {
@@ -4518,6 +4519,7 @@ mod tests {
             .mount(&server)
             .await;
         let cfg = VendorServiceConfig {
+            maven_config: None,
             source: VendorSource::Service,
             client: Some(
                 ApiClient::new(ApiClientOptions {
@@ -5008,6 +5010,7 @@ mod tests {
             .mount(&server)
             .await;
         let cfg = VendorServiceConfig {
+            maven_config: None,
             source: VendorSource::Service,
             client: Some(
                 ApiClient::new(ApiClientOptions {
@@ -5224,6 +5227,7 @@ mod tests {
     ) -> VendorServiceConfig {
         use crate::api::client::{ApiClient, ApiClientOptions};
         VendorServiceConfig {
+            maven_config: None,
             source,
             client: server.map(|s| {
                 ApiClient::new(ApiClientOptions {

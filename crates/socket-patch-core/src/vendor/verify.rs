@@ -50,6 +50,13 @@ pub(crate) fn checked_artifact_path(
     entry: &VendorEntry,
     record: &PatchRecord,
 ) -> Result<PathBuf, String> {
+    // The JVM trees are not `<eco>/<uuid>` dirs: the jar must be the
+    // entry's own tree jar for this uuid (checked against the layout and
+    // the marker).
+    if super::jvm::apply::is_jvm_entry(entry) {
+        return super::jvm::apply::checked_tree_jar(project_root, entry, &record.uuid)
+            .map(|rel| project_root.join(rel));
+    }
     let rel = &entry.artifact.path;
     let parts = parse_vendor_path(rel).ok_or_else(|| "vendor_path_unsafe".to_string())?;
     let norm = rel.replace('\\', "/");
@@ -391,7 +398,6 @@ fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
 /// [`read_wheel_to_map`] over in-memory zip bytes — the same entry and
 /// decompressed-size caps — for callers that hash and decode the SAME
 /// buffer (a committed wheel read exactly once).
-#[cfg(test)]
 pub(crate) fn read_zip_bytes_to_map(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, String> {
     read_zip_to_map(std::io::Cursor::new(bytes), false)
 }

@@ -42,7 +42,7 @@ Rows are in `--help` order (v5.0): the hosted/vendored workflow (`scan` → `vex
 
 ## Global arguments
 
-Every subcommand accepts the same set of "global" flags via a single shared `GlobalArgs` struct that's `#[command(flatten)]`-ed into each per-command struct (`crates/socket-patch-cli/src/args.rs`). Subcommands that don't actually consume a given flag accept it silently — e.g. `list --global` parses fine and is a no-op. Every flag also has an environment-variable binding; precedence is **CLI arg > env var > default** — and for exactly three keys (`--api-token`, `--org`, `--api-url`) the JS socket-cli's persisted login sits between env var and default: **CLI arg > env var (canonical, then `SOCKET_CLI_*` alias) > socket-cli `config.json` > default**. See "Persisted configuration" under Environment variables.
+Every subcommand accepts the same set of "global" flags via a single shared `GlobalArgs` struct that's `#[command(flatten)]`-ed into each per-command struct (`crates/socket-patch-cli/src/args.rs`). Subcommands that don't actually consume a given flag accept it silently — e.g. `list --global` parses fine and is a no-op. For flags with an environment-variable binding, precedence is **CLI arg > env var > default** — and for exactly three keys (`--api-token`, `--org`, `--api-url`) the JS socket-cli's persisted login sits between env var and default: **CLI arg > env var (canonical, then `SOCKET_CLI_*` alias) > socket-cli `config.json` > default**. See "Persisted configuration" under Environment variables.
 
 | Long | Short | Env var | Default | Type | Semantic |
 |---|---|---|---|---|---|
@@ -55,6 +55,7 @@ Every subcommand accepts the same set of "global" flags via a single shared `Glo
 | `--ecosystems` | `-e` | `SOCKET_ECOSYSTEMS` | (all) | CSV → `Vec<String>` | Restrict to these ecosystems |
 | `--download-mode` | — | `SOCKET_DOWNLOAD_MODE` | **`diff`** | enum: `diff` \| `file` (`package` was removed and is rejected) | Patch artifact format |
 | `--vendor-source` | — | `SOCKET_VENDOR_SOURCE` | **`auto`** | enum: `auto` \| `service` \| `build` | How `vendor` acquires the installable artifact (see "Prebuilt vendor artifacts") |
+| `--maven-config` | — | — | (recorded choice, else `auto`) | enum: `auto` \| `none` | Maven reactor vendoring: write the repository tail (`auto`) or use only the fallback file repository (`none`). The choice persists in the vendor ledger. |
 | `--vendor-url` | — | `SOCKET_VENDOR_URL` | (active API/proxy base) | string | Base host for the vendoring-service package-reference request |
 | `--patch-server-url` | — | `SOCKET_PATCH_SERVER_URL` | (server-returned) | string | Override the host of the prebuilt-archive download URL (local-dev / testing) |
 | `--offline` | — | `SOCKET_OFFLINE` | `false` | bool | **Strict airgap on every command** — never contact the network |
@@ -87,6 +88,8 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 | `apply` | `--check` | — | Read-only audit that the committed **Go** `replace`-redirects match the manifest (CI / GitHub-App auditing) — Go ONLY (cargo patches in place, so there is no redirect to audit). Lock-free, crawl-free, offline-safe; exits 0 in sync, 1 on drift. Vendored modules are excluded from the audit |
 | `vendor` | `--force` / `-f` | `SOCKET_FORCE` | Tolerate missing patch-target files in the stage + bypass the variant probe. A beforeHash mismatch no longer needs it: vendor staging auto-overwrites with the verified patched content (`vendor_content_mismatch_overwritten` warning) |
 | `vendor` | `--revert` | `SOCKET_VENDOR_REVERT` | Undo vendoring: restore recorded original lockfile fragments + remove `.socket/vendor/` artifacts. Works without a manifest. A package vendored over a hosted pin returns to its upstream registry entry, never to hosted (see "Takeover reconciliation") |
+| `vendor` | `--check` | — | Offline, read-only artifact and wiring audit; exits 1 on drift. Conflicts with `--revert`. |
+| `vendor` | `--local-repo <path>` | — | With `--check`, also inspect suffixed Maven jar/POM copies in this cache for conflicts. |
 | `apply`, `scan`, `vendor` | `--vex` | `SOCKET_VEX` | Generate an OpenVEX 0.2.0 document at this path on a successful run; see "embedded VEX" below |
 | `apply`, `scan`, `vendor` | `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | `SOCKET_VEX_PRODUCT`, `SOCKET_VEX_NO_VERIFY`, `SOCKET_VEX_DOC_ID`, `SOCKET_VEX_COMPACT` | Passthrough to the embedded VEX builder; mirror the standalone `vex` knobs. Inert unless `--vex` is set |
 | `scan` | positional `[PATHS]...` | — | (v5.0) Meaning depends on the mode. **Hosted / vendored** (bare `scan` included): each PATH, or directory glob (`apps/*`), is a project directory scanned on its own as if it were `--cwd`. **Agent** (and a mode-less `--prune`/`--global` report): path globs scoping DISCOVERY to packages installed under matching paths (`packages/foo`, `apps/**`). See "Path-scoped scans" below |
@@ -1722,3 +1725,24 @@ Every item in this document is locked in by at least one of:
 - **Async `run()` integration tests** in `tests/cli_parse_list.rs`, `tests/cli_parse_remove.rs` — exercise the no-network error paths and assert JSON shape via `serde_json::from_str::<Value>` + per-key assertions.
 
 If you add a new flag/subcommand/JSON key, add a test here that locks the new surface in the same PR.
+
+
+### Vendored JVM support (v5)
+
+Maven reactors and Gradle 6.8+ route to the JVM backend automatically. Ledger
+entries use ecosystem `jvm` with Maven PURLs. Revert, remove, rollback and repair
+share the v5 vendored backend; existing prototype wiring remains readable.
+See [the JVM design](../../docs/design/maven-vendoring.md) for supported shapes.
+
+`vendor --check` is an offline, read-only audit. Healthy entries emit `verified`
+with `vendor_check_ok`; drift emits `failed` with `vendor_check_failed`, a
+`partialFailure` envelope and exit 1. Missing ledger entries fail with
+`vendor_ledger_missing`. Offline upstream metadata is reported as the run warning
+`vendor_jvm_upstream_unverified`. The check never starts an API client or writes
+lock/recovery files. `--check` conflicts with `--revert`.
+
+`vendor --check --local-repo <path>` additionally checks existing suffixed Maven
+jar/POM copies for conflicting bytes. `--maven-config auto|none` is a global
+vendoring option so scan/get/repair receive it too; omission preserves the
+ledger's recorded choice. Switching existing auto-config wiring to `none`
+requires reverting it first. `none` cannot be combined with a repository ban.

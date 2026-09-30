@@ -3574,6 +3574,7 @@ mod tests {
 
     fn cargo_service_cfg(uri: &str, source: VendorSource, offline: bool) -> VendorServiceConfig {
         VendorServiceConfig {
+            maven_config: None,
             source,
             client: Some(
                 ApiClient::new(ApiClientOptions {

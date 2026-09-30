@@ -102,6 +102,10 @@ The CLI supports npm, PyPI, Cargo, Go, RubyGems, Maven, Composer, NuGet, and Den
 Mode and package-manager support vary: Deno uses agent mode, for example. Check the
 [ecosystem support matrix](docs/ecosystems.md) before choosing a mode.
 
+Vendored Maven reactors and Gradle 6.8+ builds are supported. See
+[JVM vendoring](docs/design/maven-vendoring.md) for supported project shapes,
+cache behavior, and offline checks.
+
 ## Common commands
 
 ```sh

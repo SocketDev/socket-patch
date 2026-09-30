@@ -105,6 +105,24 @@ operation never fetches missing inputs. `repair` can restore missing or corrupt
 artifacts from a valid ledger when sufficient inputs are available; it cannot
 reconstruct a lost vendor ledger. Restore a lost ledger from version control.
 
+### Maven reactors and Gradle
+
+Maven reactors use suffixed versions in `.socket/vendor/maven2`; Gradle 6.8+
+keeps its coordinates and lockfiles, with settings wiring and a configuration-time
+SHA-256 check. Existing Gradle verification files are updated. Single-POM Maven
+projects retain their existing vendoring behavior.
+
+```sh
+socket-patch vendor --check                       # read-only offline artifact and wiring audit
+socket-patch vendor --check --local-repo ~/.m2/repository  # also check Maven cache conflicts
+socket-patch scan --mode vendored --maven-config=none     # use only the fallback file repository
+```
+
+`--maven-config=auto` (the default) writes a Maven repository tail; `none` disables
+that tail. The choice persists in the ledger. See [JVM vendoring](design/maven-vendoring.md)
+for supported shapes, committed files, Maven mirror and `-f` limitations, and
+offline operation.
+
 ## OpenVEX
 
 Generate an attestation after installing the patched dependencies:

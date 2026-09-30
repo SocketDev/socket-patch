@@ -65,6 +65,7 @@ pub mod gem;
 pub mod go_mod_edit;
 pub mod go_sum_edit;
 pub mod golang;
+pub mod jvm;
 pub(crate) mod ledger_snapshots;
 pub mod lock_inventory;
 pub mod maven_repo;
@@ -264,6 +265,8 @@ impl VendorSource {
 /// "build-only".
 #[derive(Debug, Clone)]
 pub struct VendorServiceConfig {
+    /// Override Maven config wiring; None preserves the recorded choice (auto for new projects).
+    pub maven_config: Option<bool>,
     /// The `auto` / `service` / `build` policy.
     pub source: VendorSource,
     /// The run-level API client (reused from the CLI). `None` disables the

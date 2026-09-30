@@ -1286,6 +1286,7 @@ mod tests {
 
     fn service_cfg(server_uri: &str, source: VendorSource) -> VendorServiceConfig {
         VendorServiceConfig {
+            maven_config: None,
             source,
             client: Some(
                 ApiClient::new(ApiClientOptions {

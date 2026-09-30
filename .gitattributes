@@ -29,3 +29,7 @@ crates/socket-patch-core/tests/fixtures/vendor/** -text
 # compares the result byte for byte, so a CRLF checkout would change both
 # the replayed wiring files and the expected revert.
 crates/socket-patch-cli/tests/fixtures/legacy-ledgers/** -text
+
+# The owned Gradle settings script is embedded with include_str! and
+# written into user repos byte for byte; a CRLF checkout would change it.
+crates/socket-patch-core/src/vendor/jvm/socket-patch.settings.gradle -text

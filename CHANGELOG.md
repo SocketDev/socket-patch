@@ -70,6 +70,12 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
 
 ### Added
 
+- Vendored Maven reactors and Gradle builds, with committed repositories,
+  reversible wiring, repair, rollback, and VEX. Reactors use suffixed versions;
+  Gradle preserves coordinates and lockfiles, checks artifact hashes, and updates
+  existing verification metadata. `vendor --check` audits artifacts and wiring
+  offline; `--local-repo` checks Maven cache conflicts and `--maven-config=none`
+  selects the fallback file repository. Single-POM vendoring is unchanged.
 - `socket.yml` patch policy for paths, ecosystems, packages, severity, and per-run
   limits. `scan --package`, `--min-severity`, `--max-new-patches`, and
   `--no-socket-yml` support targeted and gradual rollout. Already-patched packages
