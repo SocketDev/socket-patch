@@ -1,0 +1,114 @@
+name: bughunt composer probe
+
+on:
+  push:
+    branches: ['bughunt/composer/**']
+
+permissions:
+  contents: read
+
+env:
+  SOCKET_NO_CONFIG: '1'
+  SOCKET_NO_UPDATE_CHECK: '1'
+  SOCKET_OFFLINE: '1'
+
+jobs:
+  probe:
+    name: composer ${{ matrix.composer }} / php ${{ matrix.php }} / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - {composer: '1.10.28', php: '8.1'}
+          - {composer: '2.2.30', php: '8.3'}
+          - {composer: '2.10.3', php: '8.5'}
+        composer: ['1.10.28', '2.2.30', '2.10.3']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: composer-compat
+          save-if: false
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: none
+          extensions: zip, mbstring, curl, openssl
+          ini-values: memory_limit=-1
+          coverage: none
+      - run: cargo build --release -p socket-patch-cli
+      - name: probe
+        shell: bash
+        env:
+          COMPOSER_RELEASE: ${{ matrix.composer }}
+        run: |
+          set -u
+          T="$RUNNER_TEMP"; command -v cygpath >/dev/null && T="$(cygpath -m "$RUNNER_TEMP")"
+          W="$(pwd)"; command -v cygpath >/dev/null && W="$(cygpath -m "$W")"
+          SP="$W/target/release/socket-patch"
+          curl -fsSL --retry 3 -o "$T/composer.phar" "https://getcomposer.org/download/$COMPOSER_RELEASE/composer.phar"
+          C() { php "$T/composer.phar" --no-interaction "$@"; }
+          export COMPOSER_HOME="$T/ch" COMPOSER_CACHE_DIR="$T/cc"
+          C --version
+          git config --global user.email a@b; git config --global user.name a; git config --global init.defaultBranch main
+          cat > "$T/stage.py" <<'PY'
+          import hashlib,json,os,sys
+          proj,purl,key,before_path,marker=sys.argv[1:6]
+          b=open(before_path,'rb').read(); a=b+marker.encode()
+          h=lambda c: hashlib.sha256(b"blob %d\0"%len(c)+c).hexdigest()
+          os.makedirs(proj+"/.socket/blobs",exist_ok=True)
+          m={"patches":{purl:{"uuid":"11111111-2222-4333-8444-555555555555","exportedAt":"2026-01-01T00:00:00Z","files":{key:{"beforeHash":h(b),"afterHash":h(a)}},"vulnerabilities":{},"description":"d","license":"MIT","tier":"free"}}}
+          json.dump(m,open(proj+"/.socket/manifest.json","w"),indent=2)
+          open(proj+"/.socket/blobs/"+h(a),"wb").write(a)
+          PY
+          PY=python; command -v python >/dev/null || PY=python3
+          result() { echo "RESULT $COMPOSER_RELEASE ${{ matrix.os }} $1: $2"; }
+
+          echo "::group::A source-only vcs entry -> vendor -> git clone -> install (#355)"
+          mkdir -p "$T/a/repo/src" "$T/a/app"; cd "$T/a/repo"
+          echo '{"name":"acme/lib","autoload":{"psr-4":{"Acme\\":"src"}}}' > composer.json
+          printf '<?php\nnamespace Acme;\nclass A {}\n' > src/A.php
+          git init -q . && git add -A && git commit -qm i && git tag v1.2.3
+          cd "$T/a/app"
+          echo "{\"name\":\"t/app\",\"repositories\":[{\"type\":\"vcs\",\"url\":\"$T/a/repo\"},{\"packagist.org\":false}],\"require\":{\"acme/lib\":\"1.2.3\"}}" > composer.json
+          C update -q; $PY -c "import json;e=json.load(open('composer.lock'))['packages'][0];print('lock keys',sorted(e))"
+          ls -a vendor/acme/lib
+          $PY "$T/stage.py" . pkg:composer/acme/lib@1.2.3 src/A.php vendor/acme/lib/src/A.php $'// PATCHED\n'
+          "$SP" vendor --offline --json | grep -E '"(status|action|code)"'
+          ls -a .socket/vendor/composer/*/acme/lib@1.2.3
+          printf '/vendor/\n' > .gitignore; git init -q . && git add -A 2>&1 | grep -i embedded; git commit -qm x
+          git ls-files -s | grep '^160000' && result A "gitlink recorded"
+          git clone -q . "$T/a/clone"; cd "$T/a/clone"; C install; echo "install exit $?"
+          if grep -q PATCHED vendor/acme/lib/src/A.php 2>/dev/null; then result A pass; else result A "FAIL (package missing or unpatched on fresh clone)"; fi
+          echo "::endgroup::"
+
+          echo "::group::B path repo (default symlink/junction) -> agent apply target"
+          mkdir -p "$T/b/sib/src" "$T/b/app"; cd "$T/b/sib"
+          echo '{"name":"psr/log","version":"3.0.2","autoload":{"psr-4":{"Psr\\Log\\":"src"}}}' > composer.json
+          printf '<?php\nnamespace Psr\\Log;\ninterface LoggerInterface {}\n' > src/LoggerInterface.php
+          cd "$T/b/app"
+          echo '{"name":"t/app","repositories":[{"type":"path","url":"../sib"},{"packagist.org":false}],"require":{"psr/log":"3.0.2"}}' > composer.json
+          C update 2>&1 | grep -i "installing"
+          $PY "$T/stage.py" . pkg:composer/psr/log@3.0.2 src/LoggerInterface.php vendor/psr/log/src/LoggerInterface.php $'// PATCHED\n'
+          "$SP" apply --offline --json | grep -E '"(status|action|code)"'
+          if grep -q PATCHED ../sib/src/LoggerInterface.php; then result B "apply wrote into ../sib (outside project)"; else result B "sibling untouched"; fi
+          echo "::endgroup::"
+
+          echo "::group::C path repo symlink:false -> vendor -> fresh install"
+          mkdir -p "$T/c/sib/src" "$T/c/app"; cp -r "$T/b/sib/composer.json" "$T/c/sib/"; printf '<?php\nnamespace Psr\\Log;\ninterface LoggerInterface {}\n' > "$T/c/sib/src/LoggerInterface.php"
+          cd "$T/c/app"
+          echo '{"name":"t/app","repositories":[{"type":"path","url":"../sib","options":{"symlink":false}},{"packagist.org":false}],"require":{"psr/log":"3.0.2"}}' > composer.json
+          C update -q; cp composer.lock "$T/c/lock.orig"
+          $PY "$T/stage.py" . pkg:composer/psr/log@3.0.2 src/LoggerInterface.php vendor/psr/log/src/LoggerInterface.php $'// PATCHED\n'
+          "$SP" vendor --offline --json | grep -E '"(status|action|code)"'
+          mkdir -p "$T/c/fresh"; cp -r composer.json composer.lock .socket "$T/c/fresh/"; cd "$T/c/fresh"; C install 2>&1 | grep -i "installing"
+          if grep -q PATCHED vendor/psr/log/src/LoggerInterface.php; then result C pass; else result C FAIL; fi
+          cd "$T/c/app"; "$SP" vendor --revert --json | grep -E '"status"'
+          if cmp -s composer.lock "$T/c/lock.orig"; then result C-revert pass; else result C-revert FAIL; diff "$T/c/lock.orig" composer.lock; fi
+          echo "::endgroup::"
