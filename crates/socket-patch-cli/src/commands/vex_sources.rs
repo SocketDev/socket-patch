@@ -338,6 +338,23 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
     let mut liveness = LedgerLiveness::new(root, &discovery, redirect.as_ref());
     let mut based: Vec<(Cand, Basis)> = Vec::new();
     for mut cand in cands {
+        if let Some(entry) = cand
+            .vendor_entry
+            .as_ref()
+            .filter(|e| socket_patch_core::vendor::jvm::apply::is_jvm_entry(e))
+        {
+            if let Err(detail) =
+                socket_patch_core::vendor::jvm::apply::entry_wired_checked(root, entry)
+            {
+                const CODE: &str = "vendor_jvm_shape_unsupported";
+                gated.push(failed(&cand.key, CODE));
+                notes.push(note(
+                    CODE,
+                    format!("{}: cannot establish JVM wiring: {detail}", cand.key),
+                ));
+                continue;
+            }
+        }
         let basis = if let Some(vref) = cand
             .discovered
             .iter()

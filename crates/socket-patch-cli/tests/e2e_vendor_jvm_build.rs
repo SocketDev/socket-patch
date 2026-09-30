@@ -1,6 +1,5 @@
-//! Real-tool capstones for the prototype v5 JVM vendored backend
-//! (`SOCKET_PATCH_EXPERIMENTAL_JVM_VENDOR=1`, `docs/design/maven-vendoring.md`
-//! §12.1 P1/P2): the two shapes the legacy `maven_repo` backend refuses.
+//! Real-tool capstones for the v5 JVM vendored backend
+//! (`docs/design/maven-vendoring.md`): Maven reactors and Gradle builds.
 //!
 //! Both start from the ACTUAL registry bytes of `commons-text:1.10.0` (see
 //! `maven_build_common`), stage a marker patch on its `META-INF/NOTICE.txt`
@@ -42,7 +41,6 @@ use maven_build_common::*;
 
 const UUID: &str = "1d3c1fd2-7b4e-4c1a-9f0e-2a3b4c5d6e7f";
 const SV: &str = "1.10.0-socket.1d3c1fd2";
-const EXPERIMENTAL_ENV: &str = "SOCKET_PATCH_EXPERIMENTAL_JVM_VENDOR";
 
 const GRADLE_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_GRADLE";
 const GRADLE_VERSION_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_VERSION";
@@ -64,8 +62,7 @@ fn git_sha256(bytes: &[u8]) -> String {
     socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
 }
 
-/// `socket-patch <args>` with ambient `SOCKET_*` scrubbed, the prototype
-/// backend switched on, and `m2` as the crawler's maven repo.
+/// `socket-patch <args>` with ambient `SOCKET_*` scrubbed and `m2` as the Maven repo.
 fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value, String) {
     let mut cmd = Command::new(binary());
     for (k, _) in std::env::vars_os() {
@@ -76,7 +73,6 @@ fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Val
     let out = cmd
         .args(args)
         .current_dir(cwd)
-        .env(EXPERIMENTAL_ENV, "1")
         .env("SOCKET_TELEMETRY_DISABLED", "1")
         .env("SOCKET_NO_CONFIG", "1")
         .env("MAVEN_REPO_LOCAL", m2)
@@ -660,7 +656,13 @@ impl Gradle {
     }
 }
 
-const GRADLE_SETTINGS: &str = r#"dependencyResolutionManagement {
+const GRADLE_SETTINGS: &str = r#"buildscript {
+    repositories { mavenCentral() }
+    dependencies { classpath("org.apache.commons:commons-text:1.10.0") }
+}
+val socketSettingsJar = java.util.jar.JarFile(java.io.File(org.apache.commons.text.StringSubstitutor::class.java.protectionDomain.codeSource.location.toURI()))
+println("SOCKET-SETTINGS-PATCHED " + socketSettingsJar.use { jar -> jar.getInputStream(jar.getJarEntry("META-INF/NOTICE.txt")).bufferedReader().readText().contains("SOCKET-PATCH-MAVEN-E2E-MARKER") })
+dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         mavenCentral()
@@ -745,6 +747,11 @@ fn gradle_tree_rel() -> String {
 
 fn assert_gradle_vendored(out: &Output, checkout: &Path, patched: &[u8], what: &str) {
     assert!(ok(out), "{what}:\n{}", dump(out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("SOCKET-SETTINGS-PATCHED true"),
+        "{what}: settings buildscript must load the patched jar:\n{}",
+        dump(out)
+    );
     let cp = gradle_classpath(out);
     let hits: Vec<&PathBuf> = cp
         .iter()
@@ -802,6 +809,21 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
         );
         return;
     }
+    // Gradle verifies the standalone parent's import as well as the child's
+    // effective import. Maven does not fetch the former or their module metadata.
+    for version in ["5.9.0", "5.9.1"] {
+        let out = mvn.run(
+            &root.join("seed"),
+            &m2,
+            &settings,
+            &[
+                &format!("{DEPENDENCY_PLUGIN}:get"),
+                &format!("-Dartifact=org.junit:junit-bom:{version}:module"),
+                "-Dtransitive=false",
+            ],
+        );
+        assert!(ok(&out), "seeding imported BOM metadata:\n{}", dump(&out));
+    }
     let jar =
         std::fs::read(repo_dir(&m2, VERSION).join(format!("{ARTIFACT}-{VERSION}.jar"))).unwrap();
 
@@ -833,7 +855,15 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
             locked.keys()
         );
     }
-    let out = gradle.run(&proj, &gradle_home, &[":app:printRuntimeClasspath"]);
+    let out = gradle.run(
+        &proj,
+        &gradle_home,
+        &[
+            ":app:printRuntimeClasspath",
+            "--write-verification-metadata",
+            "sha256",
+        ],
+    );
     assert!(ok(&out), "pre-vendor build:\n{}", dump(&out));
     assert!(
         gradle_classpath(&out)
@@ -843,6 +873,15 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
         dump(&out)
     );
 
+    // Remove parent entries to prove vendor adds the metadata needed by the local POM.
+    let verification = proj.join("gradle/verification-metadata.xml");
+    let verification_text = std::fs::read_to_string(&verification).unwrap();
+    let parents = regex::Regex::new(r#"(?s)\s*<component (?:group="org.apache" name="apache" version="27"|group="org.apache.commons" name="commons-parent" version="54")[^>]*>.*?</component>"#).unwrap();
+    std::fs::write(
+        &verification,
+        parents.replace_all(&verification_text, "").as_bytes(),
+    )
+    .unwrap();
     let (orig, patched) = patched_member(&jar, UUID);
     stage_manifest(&proj, &orig, &patched);
     let before = snapshot(&proj);
@@ -867,13 +906,11 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
     assert!(removed.is_empty(), "removed {removed:?}");
     assert_eq!(
         changed,
-        vec!["settings.gradle.kts".to_string()],
-        "only the settings file is edited; lockfiles and build scripts byte-unchanged"
+        vec!["gradle/verification-metadata.xml".to_string(), "settings.gradle.kts".to_string()],
+        "settings and existing verification metadata are edited; lockfiles and build scripts stay byte-unchanged"
     );
-    assert_eq!(
-        text(&vendored["settings.gradle.kts"]),
-        format!("{GRADLE_SETTINGS}{APPLY_LINE}\n")
-    );
+    assert!(text(&vendored["settings.gradle.kts"]).ends_with(&format!("{APPLY_LINE}\n")));
+    assert!(text(&vendored["settings.gradle.kts"]).contains("exclusiveContent"));
     assert_eq!(
         text(&vendored[socket_patch_core::vendor::jvm::gradle::SCRIPT_REL]),
         socket_patch_core::vendor::jvm::gradle::SCRIPT
@@ -932,6 +969,25 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
     assert!(
         !ok(&out),
         "a tampered vendored jar must fail the build:\n{log}"
+    );
+    assert!(
+        log.contains("Dependency verification failed") || log.contains("socket-patch:"),
+        "unexpected tamper failure: {log}"
+    );
+    // The index remains enforced when the user's Gradle verification is off.
+    let out = gradle.run(
+        &fresh,
+        &gradle_home,
+        &[
+            "--offline",
+            "--dependency-verification=off",
+            ":app:printRuntimeClasspath",
+        ],
+    );
+    let log = dump(&out);
+    assert!(
+        !ok(&out),
+        "the index must reject a tampered jar even with Gradle verification off: {log}"
     );
     assert!(
         log.contains(&format!(

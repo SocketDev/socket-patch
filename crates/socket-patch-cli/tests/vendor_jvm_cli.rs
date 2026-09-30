@@ -1,5 +1,4 @@
-//! CLI flows of the prototype v5 JVM vendored backend
-//! (`SOCKET_PATCH_EXPERIMENTAL_JVM_VENDOR=1`) over synthetic offline
+//! CLI flows of the v5 JVM vendored backend over synthetic offline
 //! fixtures: a reactor (an aggregator and one module) and a
 //! Gradle multi-project, each fed by a fake local Maven repository.
 //!
@@ -16,7 +15,6 @@ use std::process::Command;
 
 use sha2::{Digest as _, Sha256};
 
-const EXPERIMENTAL_ENV: &str = "SOCKET_PATCH_EXPERIMENTAL_JVM_VENDOR";
 const FOO_UUID: &str = "1d3c1fd2-7b4e-4c1a-9f0e-2a3b4c5d6e7f";
 const BAR_UUID: &str = "9a8b7c6d-7b4e-4c1a-9f0e-2a3b4c5d6e7f";
 const FOO_UPDATE_UUID: &str = "2e4d6f80-7b4e-4c1a-9f0e-2a3b4c5d6e7f";
@@ -94,6 +92,12 @@ fn fixture(root: &Path, shape: Shape, packages: &[(&str, &str)]) {
     .unwrap();
     match shape {
         Shape::Reactor => {
+            std::fs::create_dir_all(proj.join(".mvn/wrapper")).unwrap();
+            std::fs::write(
+                proj.join(".mvn/wrapper/maven-wrapper.properties"),
+                "distributionUrl=https://repo.maven.apache.org/apache-maven-3.9.16-bin.zip\n",
+            )
+            .unwrap();
             let deps: String = packages
                 .iter()
                 .map(|(name, _)| {
@@ -143,15 +147,12 @@ fn fixture(root: &Path, shape: Shape, packages: &[(&str, &str)]) {
 }
 
 /// `socket-patch <args> --json --offline --cwd <root>/proj`; `(exit, envelope)`.
-fn socket(root: &Path, experimental: bool, args: &[&str]) -> (Option<i32>, serde_json::Value) {
+fn socket(root: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("SOCKET_") {
             cmd.env_remove(&k);
         }
-    }
-    if experimental {
-        cmd.env(EXPERIMENTAL_ENV, "1");
     }
     let proj = root.join("proj");
     let out = cmd
@@ -173,8 +174,8 @@ fn socket(root: &Path, experimental: bool, args: &[&str]) -> (Option<i32>, serde
     (out.status.code(), env)
 }
 
-fn ok(root: &Path, experimental: bool, args: &[&str]) -> serde_json::Value {
-    let (code, env) = socket(root, experimental, args);
+fn ok(root: &Path, args: &[&str]) -> serde_json::Value {
+    let (code, env) = socket(root, args);
     assert_eq!(code, Some(0), "{args:?}: {env}");
     let failed = env["summary"].get("failed").unwrap_or(&env["failed"]);
     assert_eq!(failed, 0, "{args:?}: {env}");
@@ -243,11 +244,11 @@ fn two_patches_roll_back_one_at_a_time_to_pristine() {
             let root = tmp.path();
             fixture(root, shape, &[("foo", FOO_UUID), ("bar", BAR_UUID)]);
             let pristine = snapshot(root);
-            let env = ok(root, true, &["vendor"]);
+            let env = ok(root, &["vendor"]);
             assert_eq!(env["summary"]["applied"], 2, "{env}");
-            ok(root, true, &["rollback", &purl(first)]);
+            ok(root, &["rollback", &purl(first)]);
             let other = if first == "foo" { "bar" } else { "foo" };
-            let env = ok(root, true, &["vendor"]);
+            let env = ok(root, &["vendor"]);
             assert_eq!(
                 events(&env),
                 [(
@@ -257,7 +258,7 @@ fn two_patches_roll_back_one_at_a_time_to_pristine() {
                 )],
                 "{env}"
             );
-            ok(root, false, &["vendor", "--revert"]);
+            ok(root, &["vendor", "--revert"]);
             assert_eq!(snapshot(root), pristine, "first={first}");
         }
     }
@@ -273,11 +274,11 @@ fn patch_update_rewires_sweeps_and_reverts_to_pristine() {
         let root = tmp.path();
         fixture(root, shape, &[("foo", FOO_UUID)]);
         let pristine = snapshot(root);
-        ok(root, true, &["vendor"]);
+        ok(root, &["vendor"]);
         let manifest_path = root.join("proj/.socket/manifest.json");
         let manifest = std::fs::read_to_string(&manifest_path).unwrap();
         std::fs::write(&manifest_path, manifest.replace(FOO_UUID, FOO_UPDATE_UUID)).unwrap();
-        let env = ok(root, true, &["vendor"]);
+        let env = ok(root, &["vendor"]);
         let removed = events(&env)
             .iter()
             .any(|(_, _, code)| code == "vendor_stale_artifact_removed");
@@ -294,7 +295,7 @@ fn patch_update_rewires_sweeps_and_reverts_to_pristine() {
         } else {
             FOO_UPDATE_UUID
         }));
-        ok(root, true, &["vendor", "--revert"]);
+        ok(root, &["vendor", "--revert"]);
         assert_eq!(snapshot(root), pristine);
     }
 }
@@ -309,12 +310,12 @@ fn cold_cache_rerun_vex_repair_and_revert() {
         let root = tmp.path();
         fixture(root, shape, &[("foo", FOO_UUID)]);
         let pristine = snapshot(root);
-        ok(root, true, &["vendor"]);
+        ok(root, &["vendor"]);
         let m2 = root.join("m2");
         let parked = root.join("m2-parked");
         std::fs::rename(&m2, &parked).unwrap();
         for args in [&["vendor"][..], &["vendor", "--vendor-source=service"]] {
-            let env = ok(root, false, args);
+            let env = ok(root, args);
             assert_eq!(
                 events(&env),
                 [(
@@ -328,7 +329,6 @@ fn cold_cache_rerun_vex_repair_and_revert() {
         let vex = root.join("vex.json");
         ok(
             root,
-            false,
             &[
                 "vex",
                 "-O",
@@ -346,10 +346,15 @@ fn cold_cache_rerun_vex_repair_and_revert() {
             "proj/.socket/vendor/gradle/org/example/foo/1.0/foo-1.0.jar"
         };
         std::fs::remove_file(root.join(tree_jar)).unwrap();
-        let env = ok(root, false, &["repair"]);
+        let env = ok(root, &["repair"]);
         assert_eq!(env["events"][0]["action"], "rebuilt", "{env}");
         assert!(root.join(tree_jar).is_file());
-        ok(root, false, &["vendor", "--revert"]);
+        let expected = std::fs::read(root.join(tree_jar)).unwrap();
+        std::fs::write(root.join(tree_jar), jar(b"CORRUPT\n")).unwrap();
+        let env = ok(root, &["repair"]);
+        assert_eq!(env["events"][0]["action"], "rebuilt", "{env}");
+        assert_eq!(std::fs::read(root.join(tree_jar)).unwrap(), expected);
+        ok(root, &["vendor", "--revert"]);
         assert_eq!(snapshot(root), pristine);
     }
 }
@@ -360,8 +365,8 @@ fn preserve_state_keeps_the_tree() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
-    ok(root, true, &["vendor"]);
-    ok(root, true, &["rollback", "--preserve-state"]);
+    ok(root, &["vendor"]);
+    ok(root, &["rollback", "--preserve-state"]);
     let proj = root.join("proj");
     assert!(proj
         .join(
@@ -379,7 +384,7 @@ fn preserve_state_keeps_the_tree() {
 }
 
 /// A forged JVM ledger entry naming `.git/config` is refused before any
-/// write, with or without the switch.
+/// write, using only allowed JVM paths.
 #[test]
 fn forged_ledger_entries_touch_nothing() {
     let tmp = tempfile::tempdir().unwrap();
@@ -410,10 +415,8 @@ fn forged_ledger_entries_touch_nothing() {
         } } });
         std::fs::create_dir_all(proj.join(".socket/vendor")).unwrap();
         std::fs::write(proj.join(".socket/vendor/state.json"), state.to_string()).unwrap();
-        for experimental in [false, true] {
-            let (code, env) = socket(root, experimental, &["vendor", "--revert"]);
-            assert_ne!(code, Some(0), "{env}");
-        }
+        let (code, env) = socket(root, &["vendor", "--revert"]);
+        assert_ne!(code, Some(0), "{env}");
         assert_eq!(
             std::fs::read(proj.join(".git/config")).unwrap(),
             b"[core]\n"
@@ -434,6 +437,9 @@ fn escaping_symlinks_are_refused() {
         let proj = root.join("proj");
         let outside = root.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
+        if link == ".mvn" {
+            std::fs::remove_dir_all(proj.join(".mvn")).unwrap();
+        }
         if link == "a" {
             std::fs::rename(proj.join("a/pom.xml"), outside.join("pom.xml")).unwrap();
             std::fs::remove_dir(proj.join("a")).unwrap();
@@ -443,7 +449,7 @@ fn escaping_symlinks_are_refused() {
             .unwrap()
             .map(|e| e.unwrap().path())
             .collect();
-        let (code, env) = socket(root, true, &["vendor"]);
+        let (code, env) = socket(root, &["vendor"]);
         assert_ne!(code, Some(0), "{link}: {env}");
         assert_eq!(
             env["events"][0]["errorCode"], "vendor_jvm_shape_unsupported",
@@ -461,5 +467,210 @@ fn escaping_symlinks_are_refused() {
             .map(|e| e.unwrap().path())
             .collect();
         assert_eq!(before, after, "{link}: wrote outside the checkout");
+    }
+}
+
+#[test]
+fn offline_check_detects_metadata_and_wiring_drift_without_writes() {
+    for shape in [Shape::Reactor, Shape::Gradle] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(root, shape, &[("foo", FOO_UUID)]);
+        ok(root, &["vendor"]);
+        let before = snapshot(root);
+        ok(root, &["vendor", "--check"]);
+        assert_eq!(snapshot(root), before);
+        let pom = match shape {
+            Shape::Reactor => "proj/.socket/vendor/maven2/org/example/foo/1.0-socket.1d3c1fd2/foo-1.0-socket.1d3c1fd2.pom",
+            Shape::Gradle => "proj/.socket/vendor/gradle/org/example/foo/1.0/foo-1.0.pom",
+        };
+        let original = std::fs::read(root.join(pom)).unwrap();
+        std::fs::write(root.join(pom), b"tampered").unwrap();
+        let corrupt = snapshot(root);
+        let (code, env) = socket(root, &["vendor", "--check"]);
+        assert_eq!(code, Some(1), "{env}");
+        assert_eq!(snapshot(root), corrupt);
+        std::fs::write(root.join(pom), original).unwrap();
+        let wiring = if shape == Shape::Reactor {
+            "proj/a/pom.xml"
+        } else {
+            "proj/settings.gradle"
+        };
+        let text = std::fs::read_to_string(root.join(wiring)).unwrap();
+        let drifted = if shape == Shape::Reactor {
+            text.replace("1.0-socket.1d3c1fd2", "1.0")
+        } else {
+            text.lines()
+                .filter(|l| !l.contains("apply from:"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        std::fs::write(root.join(wiring), drifted).unwrap();
+        let (code, env) = socket(root, &["vendor", "--check"]);
+        assert_eq!(code, Some(1), "{env}");
+    }
+}
+
+#[test]
+fn maven_config_none_survives_rerun_and_checks_conflicting_local_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+    let before = snapshot(root);
+    ok(root, &["vendor", "--maven-config=none"]);
+    assert!(!root.join("proj/.mvn/maven.config").exists());
+    ok(root, &["vendor"]);
+    assert!(!root.join("proj/.mvn/maven.config").exists());
+    ok(root, &["vendor", "--check"]);
+    let m2 = root.join("other-cache");
+    let jar = m2.join("org/example/foo/1.0-socket.1d3c1fd2/foo-1.0-socket.1d3c1fd2.jar");
+    std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+    std::fs::write(&jar, b"conflicting bytes").unwrap();
+    let (code, env) = socket(
+        root,
+        &["vendor", "--check", "--local-repo", m2.to_str().unwrap()],
+    );
+    assert_eq!(code, Some(1), "{env}");
+    std::fs::remove_dir_all(m2).unwrap();
+    ok(root, &["vendor", "--revert"]);
+    assert_eq!(snapshot(root), before);
+}
+
+#[test]
+fn gradle_old_wrapper_refuses_before_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    std::fs::create_dir_all(root.join("proj/gradle/wrapper")).unwrap();
+    std::fs::write(
+        root.join("proj/gradle/wrapper/gradle-wrapper.properties"),
+        "distributionUrl=https\\://services.gradle.org/distributions/gradle-6.7.1-bin.zip\n",
+    )
+    .unwrap();
+    let before = snapshot(root);
+    let (code, env) = socket(root, &["vendor"]);
+    assert_eq!(code, Some(1), "{env}");
+    assert!(env.to_string().contains("gradle_below_6_8"), "{env}");
+    assert_eq!(snapshot(root), before);
+}
+
+#[test]
+fn gradle_verification_parents_and_boms_are_shared_and_revert_in_either_order() {
+    for (first, components) in [
+        ("foo", "<components>\n  </components>"),
+        ("bar", "<components>\n  </components>"),
+        ("foo", "<components/>"),
+        ("bar", "<components/>"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(root, Shape::Gradle, &[("foo", FOO_UUID), ("bar", BAR_UUID)]);
+        for name in ["foo", "bar"] {
+            std::fs::write(root.join(format!("m2/org/example/{name}/1.0/{name}-1.0.pom")), format!("<project><modelVersion>4.0.0</modelVersion><parent><groupId>org.example</groupId><artifactId>parent</artifactId><version>1</version></parent><artifactId>{name}</artifactId><version>1.0</version><properties><bom.version>2</bom.version></properties></project>")).unwrap();
+        }
+        for (name, body) in [
+            ("parent", "<properties><bom.version>1</bom.version></properties><dependencyManagement><dependencies><dependency><groupId>org.example</groupId><artifactId>bom</artifactId><version>${bom.version}</version><scope>import</scope><type>pom</type></dependency></dependencies></dependencyManagement>"),
+            ("bom", ""),
+        ] {
+            let version = if name == "bom" { "2" } else { "1" };
+            let dir = root.join(format!("m2/org/example/{name}/{version}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{name}-{version}.pom")), format!("<project><groupId>org.example</groupId><artifactId>{name}</artifactId><version>{version}</version>{body}</project>")).unwrap();
+        }
+        let default_bom = root.join("m2/org/example/bom/1");
+        std::fs::create_dir_all(&default_bom).unwrap();
+        std::fs::write(default_bom.join("bom-1.pom"), "<project><groupId>org.example</groupId><artifactId>bom</artifactId><version>1</version></project>").unwrap();
+        let verification = root.join("proj/gradle/verification-metadata.xml");
+        std::fs::create_dir_all(verification.parent().unwrap()).unwrap();
+        let original = format!("<verification-metadata>\n  <configuration><verify-metadata>true</verify-metadata></configuration>\n  {components}\n</verification-metadata>\n");
+        std::fs::write(&verification, &original).unwrap();
+        let before = snapshot(root);
+        ok(root, &["vendor"]);
+        ok(root, &["vendor", "--check"]);
+        let text = std::fs::read_to_string(&verification).unwrap();
+        assert!(text.contains("name=\"parent\""), "{text}");
+        assert!(text.contains("name=\"bom\" version=\"1\""), "{text}");
+        assert!(text.contains("name=\"bom\" version=\"2\""), "{text}");
+        let drifted = text.replace("name=\"parent\"", "name=\"not-parent\"");
+        std::fs::write(&verification, drifted).unwrap();
+        let (code, env) = socket(root, &["vendor", "--check"]);
+        assert_eq!(code, Some(1), "{env}");
+        std::fs::write(&verification, &text).unwrap();
+        ok(root, &["remove", &purl(first)]);
+        assert!(std::fs::read_to_string(&verification)
+            .unwrap()
+            .contains("name=\"parent\""));
+        ok(root, &["vendor", "--revert"]);
+        assert_eq!(std::fs::read_to_string(&verification).unwrap(), original);
+        // remove changes the manifest by design; all build wiring remains byte exact.
+        let mut after = snapshot(root);
+        let mut before = before;
+        after.remove(".socket/manifest.json");
+        before.remove(".socket/manifest.json");
+        assert_eq!(after, before);
+    }
+}
+
+#[test]
+fn check_refuses_a_missing_ledger_and_honors_manifest_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    ok(root, &["vendor"]);
+    let nested = root.join("proj/elsewhere");
+    std::fs::create_dir_all(nested.join(".socket")).unwrap();
+    std::fs::write(nested.join(".socket/manifest.json"), "{\"patches\":{}}").unwrap();
+    // A manifest path selects its project root, even with a different --cwd.
+    let env = ok(
+        root,
+        &[
+            "vendor",
+            "--check",
+            "--manifest-path",
+            "elsewhere/.socket/manifest.json",
+        ],
+    );
+    assert_eq!(env["summary"]["verified"], 0);
+    std::fs::remove_file(root.join("proj/.socket/manifest.json")).unwrap();
+    std::fs::remove_file(root.join("proj/.socket/vendor/state.json")).unwrap();
+    let before = snapshot(root);
+    let (code, env) = socket(root, &["vendor", "--check"]);
+    assert_eq!(code, Some(1), "{env}");
+    assert!(env.to_string().contains("vendor_ledger_missing"), "{env}");
+    assert_eq!(snapshot(root), before);
+}
+
+#[test]
+fn vex_reports_an_unreadable_jvm_layout_instead_of_an_unwired_patch() {
+    for shape in [Shape::Reactor, Shape::Gradle] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(root, shape, &[("foo", FOO_UUID)]);
+        ok(root, &["vendor"]);
+        let rel = if shape == Shape::Reactor {
+            "proj/a/pom.xml"
+        } else {
+            "proj/.socket/vendor/gradle-index.tsv"
+        };
+        std::fs::write(root.join(rel), "INVALID").unwrap();
+        let vex = root.join("vex.json");
+        let (_, env) = socket(
+            root,
+            &[
+                "vex",
+                "-O",
+                vex.to_str().unwrap(),
+                "--product",
+                "pkg:generic/x@1",
+            ],
+        );
+        assert!(
+            env.to_string().contains("vendor_jvm_shape_unsupported"),
+            "{env}"
+        );
+        assert!(!env.to_string().contains("vendor_unwired"), "{env}");
+        if let Ok(bytes) = std::fs::read(vex) {
+            assert!(!String::from_utf8_lossy(&bytes).contains("not_affected"));
+        }
     }
 }

@@ -49,6 +49,7 @@ pub(crate) fn service_cfg(
     offline: bool,
 ) -> VendorServiceConfig {
     VendorServiceConfig {
+        maven_config: None,
         source,
         client: Some(
             ApiClient::new(ApiClientOptions {

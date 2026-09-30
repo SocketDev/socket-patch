@@ -1,7 +1,7 @@
-//! Disk side of the prototype JVM backend: write a [`JvmPlan`], record it,
+//! Disk side of the JVM backend: write a [`JvmPlan`], record it,
 //! and revert it.
 //!
-//! Records (§7.1): the planners' fragment records, plus
+//! Records: the planners' fragment records, plus
 //! * [`TREE_KIND`] — one per vendored artifact file, `new` = its sha256.
 //!   Revert deletes it while the hash still matches;
 //! * [`CREATED_DIR_KIND`] — a directory vendor created; removed on revert
@@ -44,8 +44,17 @@ pub fn is_jvm_entry(entry: &VendorEntry) -> bool {
             .all(|w| KINDS.contains(&w.kind.as_str()))
 }
 
+/// Offline inputs have not been authenticated by independent registry checksums.
+pub fn upstream_unverified(entry: &VendorEntry) -> bool {
+    is_jvm_entry(entry)
+        && !entry
+            .wiring
+            .iter()
+            .any(|w| w.kind == super::UPSTREAM_KIND && op_of(w) == "registry_verified")
+}
+
 /// The validated `(group, artifact, version)` of a JVM entry: a maven purl
-/// in the D15 grammar and a canonical uuid.
+/// in the JVM coordinate grammar and a canonical uuid.
 pub fn entry_gav(entry: &VendorEntry) -> Result<(String, String, String), String> {
     if !is_canonical_uuid(&entry.uuid) {
         return Err(format!("non-canonical patch uuid {:?}", entry.uuid));
@@ -123,7 +132,7 @@ fn record_allowed(w: &WiringRecord, c: &Coords<'_>) -> bool {
             SETTINGS_FRAGMENT_KIND => is_settings_file(rel) && !rel.starts_with(".socket/"),
             VERIFICATION_FRAGMENT_KIND => rel == gradle::VERIFICATION_REL,
             OWNED_FILE_KIND => is_owned_file(rel),
-            TREE_KIND => is_own_tree_file(rel, c),
+            TREE_KIND | super::UPSTREAM_KIND => is_own_tree_file(rel, c),
             CREATED_DIR_KIND => is_creatable_dir(rel),
             _ => false,
         }
@@ -137,6 +146,7 @@ pub struct ProjectReader {
     root: PathBuf,
     canonical: Option<PathBuf>,
     escaped: RefCell<Option<String>>,
+    read_error: RefCell<Option<String>>,
 }
 
 impl ProjectReader {
@@ -145,17 +155,30 @@ impl ProjectReader {
             root: root.to_path_buf(),
             canonical: std::fs::canonicalize(root).ok(),
             escaped: RefCell::new(None),
+            read_error: RefCell::new(None),
         }
     }
 
     /// Regular files only; a directory, special file or unsafe path reads
     /// as missing.
     pub fn read(&self, rel: &str) -> Option<Vec<u8>> {
-        let path = self.resolve(rel).ok()?;
-        if let Some(captured) = group_commit::read(&path) {
-            return captured.ok();
+        let path = match self.resolve(rel) {
+            Ok(path) => path,
+            Err(e) => {
+                self.read_error.borrow_mut().get_or_insert(e);
+                return None;
+            }
+        };
+        match group_commit::read(&path).unwrap_or_else(|| read_regular_to_bytes_sync(&path)) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                self.read_error
+                    .borrow_mut()
+                    .get_or_insert(format!("{rel}: {e}"));
+                None
+            }
         }
-        read_regular_to_bytes_sync(&path).ok()
     }
 
     /// The first path that resolved outside the checkout.
@@ -169,16 +192,20 @@ impl ProjectReader {
             return Err(format!("unsafe path {rel:?}"));
         }
         let Some(canonical) = &self.canonical else {
-            return Ok(rel.split('/').fold(self.root.clone(), |p, s| p.join(s)));
+            return Err(format!(
+                "cannot resolve project root {}",
+                self.root.display()
+            ));
         };
         let segments: Vec<&str> = rel.split('/').collect();
         let mut cur = canonical.clone();
         for (i, seg) in segments.iter().enumerate() {
             let next = cur.join(seg);
             match std::fs::symlink_metadata(&next) {
-                Err(_) => {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(segments[i + 1..].iter().fold(next, |p, s| p.join(s)));
                 }
+                Err(e) => return Err(format!("cannot inspect {}: {e}", next.display())),
                 Ok(meta) if meta.file_type().is_symlink() => {
                     let target = std::fs::canonicalize(&next)
                         .ok()
@@ -240,6 +267,9 @@ fn is_vendored_tree_file(reader: &ProjectReader, rel: &str, existing: &[u8]) -> 
 /// records, then the created directories and the tree files. Nothing is
 /// written for a plan that fails validation.
 pub async fn write_plan(root: &Path, plan: &JvmPlan) -> Result<Vec<WiringRecord>, String> {
+    let state = super::super::state::load_state(root)
+        .await
+        .map_err(|e| format!("vendor_state_unreadable: {e}"))?;
     let reader = ProjectReader::new(root);
     let mut targets = Vec::new();
     for w in &plan.writes {
@@ -258,7 +288,22 @@ pub async fn write_plan(root: &Path, plan: &JvmPlan) -> Result<Vec<WiringRecord>
         let path = reader.resolve(&w.rel)?;
         match reader.read(&w.rel) {
             Some(existing) if w.tree && existing != w.bytes => {
-                if !is_vendored_tree_file(&reader, &w.rel, &existing) {
+                let owned = state.entries.values().any(|e| {
+                    let Ok((g, a, v)) = entry_gav(e) else {
+                        return false;
+                    };
+                    let c = Coords {
+                        group_id: &g,
+                        artifact_id: &a,
+                        version: &v,
+                        uuid: &e.uuid,
+                    };
+                    is_jvm_entry(e)
+                        && e.wiring.iter().any(|r| {
+                            r.kind == TREE_KIND && r.file == w.rel && record_allowed(r, &c)
+                        })
+                });
+                if !owned && !is_vendored_tree_file(&reader, &w.rel, &existing) {
                     return Err(format!(
                         "{} already exists and was not written by socket-patch; refusing to \
                          overwrite it",
@@ -339,7 +384,7 @@ async fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     atomic_write_bytes_preserving_mode(path, bytes).await
 }
 
-/// Complete `records` from other JVM entries (§7.3): an `adopt` record takes
+/// Complete `records` from other JVM entries: an `adopt` record takes
 /// the creation record of the peer that wrote that shared fragment, a
 /// rewrite of another patch's suffixed version takes its pristine
 /// `original`, and the directories a peer created that this entry now
@@ -417,7 +462,7 @@ fn is_gradle(wiring: &[WiringRecord]) -> bool {
     })
 }
 
-/// Revert the JVM `entry` (§7.3): its own fragments now, shared fragments
+/// Revert the JVM `entry`: its own fragments now, shared fragments
 /// only once no other patch references them, so peers stay wired whatever
 /// the revert order. A fragment still present but in a shape vendor did
 /// not write is left alone with `vendor_lock_entry_drifted`; while it still
@@ -441,8 +486,29 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
     }
     let reader = ProjectReader::new(root);
     let read = |rel: &str| reader.read(rel);
+    let peers = match super::super::state::load_state(root).await {
+        Ok(state) => state,
+        Err(e) => return RevertOutcome::failed(format!("vendor_state_unreadable: {e}")),
+    };
+    let records: Vec<_> = entry
+        .wiring
+        .iter()
+        .filter(|w| {
+            !(w.kind == VERIFICATION_FRAGMENT_KIND
+                && w.key.as_deref().is_some_and(|k| k.starts_with("metadata:"))
+                && peers.entries.values().any(|peer| {
+                    peer.base_purl != entry.base_purl
+                        && entry_wired(root, peer)
+                        && peer
+                            .wiring
+                            .iter()
+                            .any(|p| p.kind == w.kind && p.file == w.file && p.key == w.key)
+                }))
+        })
+        .cloned()
+        .collect();
     let unplan: JvmUnplan = if is_gradle(&entry.wiring) {
-        gradle::unplan(&read, &c, &entry.wiring)
+        gradle::unplan(&read, &c, &records)
     } else {
         maven_reactor::unplan(&read, &c, &entry.wiring)
     };
@@ -453,12 +519,25 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
     }
     let mut warnings: Vec<VendorWarning> = unplan.drifted.into_iter().map(drifted).collect();
     let mut kept = unplan.still_wired;
+    let mut present = Vec::new();
+    if !kept && !opts.keep_artifact {
+        for w in entry.wiring.iter().filter(|w| w.kind == TREE_KIND) {
+            let Some(bytes) = reader.read(&w.file) else {
+                continue;
+            };
+            if w.new.as_ref().and_then(Value::as_str) != Some(sha256_hex(&bytes).as_str()) {
+                warnings.push(drifted(format!("{} was modified", w.file)));
+                kept = true;
+            }
+            present.push(w);
+        }
+    }
     if opts.dry_run {
         return RevertOutcome {
             success: true,
             warnings,
             error: None,
-            kept_artifact: false,
+            kept_artifact: kept,
         };
     }
     let fail = |warnings: Vec<VendorWarning>, e: String| RevertOutcome {
@@ -495,17 +574,6 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
     if !kept && !opts.keep_artifact {
         // One modified file keeps the whole tree: a partial artifact is
         // worse than a kept one.
-        let mut present = Vec::new();
-        for w in entry.wiring.iter().filter(|w| w.kind == TREE_KIND) {
-            let Some(bytes) = reader.read(&w.file) else {
-                continue;
-            };
-            if w.new.as_ref().and_then(Value::as_str) != Some(sha256_hex(&bytes).as_str()) {
-                warnings.push(drifted(format!("{} was modified", w.file)));
-                kept = true;
-            }
-            present.push(w);
-        }
         for w in present.into_iter().filter(|_| !kept) {
             let res = match reader.resolve(&w.file) {
                 Ok(path) => remove_file(&path).await.map_err(|e| e.to_string()),
@@ -609,9 +677,13 @@ pub async fn sweep_replaced_tree<'e>(
 /// Whether the project still wires the JVM `entry` (its suffixed version in
 /// a reactor pom; its index rows plus the root apply line for Gradle).
 pub fn entry_wired(root: &Path, entry: &VendorEntry) -> bool {
-    let Ok((g, a, v)) = entry_gav(entry) else {
-        return false;
-    };
+    // Failure to read does not prove that deleting a tree is safe. Attestation
+    // uses the checked variant and reports the diagnostic instead.
+    entry_wired_checked(root, entry).unwrap_or(true)
+}
+
+pub fn entry_wired_checked(root: &Path, entry: &VendorEntry) -> Result<bool, String> {
+    let (g, a, v) = entry_gav(entry)?;
     let c = Coords {
         group_id: &g,
         artifact_id: &a,
@@ -621,11 +693,117 @@ pub fn entry_wired(root: &Path, entry: &VendorEntry) -> bool {
     let reader = ProjectReader::new(root);
     let read = |rel: &str| reader.read(rel);
     let wired = if is_gradle(&entry.wiring) {
-        gradle::wired(&read, &c)
+        gradle::wired_checked(&read, &c).map_err(|e| e.detail)
     } else {
-        maven_reactor::wired(&read, &c)
+        maven_reactor::wired_checked(&read, &c).map_err(|e| e.detail)
     };
-    wired && reader.escaped().is_none()
+    if let Some(e) = reader.read_error.borrow().as_ref() {
+        return Err(e.clone());
+    }
+    wired
+}
+
+/// Verify every recorded file plus the effective wiring, without writes or network I/O.
+pub fn check_entry(
+    root: &Path,
+    entry: &VendorEntry,
+    local_repo: Option<&Path>,
+) -> Result<(), String> {
+    let (g, a, v) = entry_gav(entry)?;
+    let c = Coords {
+        group_id: &g,
+        artifact_id: &a,
+        version: &v,
+        uuid: &entry.uuid,
+    };
+    let reader = ProjectReader::new(root);
+    let read = |rel: &str| reader.read(rel);
+    for w in &entry.wiring {
+        if !record_allowed(w, &c) {
+            return Err(format!("unsafe wiring record: {}", w.file));
+        }
+        if w.kind == TREE_KIND {
+            let bytes = read(&w.file).ok_or_else(|| format!("missing or unreadable {}", w.file))?;
+            if w.new.as_ref().and_then(Value::as_str) != Some(sha256_hex(&bytes).as_str()) {
+                return Err(format!("hash mismatch: {}", w.file));
+            }
+        }
+        if w.kind == VERIFICATION_FRAGMENT_KIND
+            && w.key.as_deref().is_some_and(|k| k.starts_with("metadata:"))
+        {
+            let bytes = read(&w.file).ok_or_else(|| format!("missing {}", w.file))?;
+            let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+            if !gradle::metadata_record_present(text, w) {
+                return Err(format!(
+                    "upstream verification entry drifted: {}",
+                    w.key.as_deref().unwrap_or("")
+                ));
+            }
+        }
+    }
+    let gradle = is_gradle(&entry.wiring);
+    let (jar, pom, module) = if gradle {
+        gradle::committed(&read, &c)
+    } else {
+        maven_reactor::committed(&read, &c).map(|(j, p)| (j, p, None))
+    }
+    .ok_or_else(|| "committed JVM tree is incomplete".to_string())?;
+    let patch = super::JvmPatch {
+        group_id: &g,
+        artifact_id: &a,
+        version: &v,
+        uuid: &entry.uuid,
+        jar: &jar,
+        upstream_pom: &pom,
+        upstream_module: module.as_deref(),
+    };
+    let plan = if gradle {
+        gradle::plan(&read, &patch)
+    } else {
+        let config = !entry.wiring.iter().any(|w| op_of(w) == "config_none");
+        maven_reactor::plan_with_config(&read, &patch, config)
+    }
+    .map_err(|e| e.detail)?;
+    if let Some(w) = plan.writes.first() {
+        return Err(format!("vendored wiring or metadata drifted: {}", w.rel));
+    }
+    if !entry_wired_checked(root, entry)? {
+        return Err("vendored artifact is no longer wired into the build".into());
+    }
+    let dir = reader.resolve(&plan.tree_dir)?;
+    for item in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let item = item.map_err(|e| e.to_string())?;
+        let rel = format!("{}/{}", plan.tree_dir, item.file_name().to_string_lossy());
+        if !entry
+            .wiring
+            .iter()
+            .any(|w| w.kind == TREE_KIND && w.file == rel)
+        {
+            return Err(format!("unindexed vendored file: {rel}"));
+        }
+    }
+    if !gradle {
+        if let Some(repo) = local_repo {
+            for ext in ["jar", "pom"] {
+                let sv = c.suffixed_version();
+                let name = format!("{a}-{sv}.{ext}");
+                let cached = repo.join(c.group_path()).join(&a).join(&sv).join(&name);
+                if cached.exists() {
+                    let bytes = read_regular_to_bytes_sync(&cached).map_err(|e| e.to_string())?;
+                    if Some(bytes) != read(&format!("{}/{name}", plan.tree_dir)) {
+                        return Err(format!(
+                            "local Maven cache conflicts with vendored bytes: {}",
+                            cached.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(rel) = reader.escaped() {
+        return Err(outside_root_detail(&rel));
+    }
+    Ok(())
 }
 
 /// The vendored jar of the JVM `entry` for `uuid`, project-relative: the
@@ -647,6 +825,9 @@ pub fn checked_tree_jar(root: &Path, entry: &VendorEntry, uuid: &str) -> Result<
         uuid,
     };
     let rel = entry.artifact.path.as_str();
+    ProjectReader::new(root)
+        .resolve(rel)
+        .map_err(|_| unsafe_path())?;
     let maven = format!(
         "{}/{a}-{}.jar",
         maven_reactor::tree_dir(&c),
@@ -891,6 +1072,40 @@ mod tests {
             std::fs::read(root.join("a/real.xml")).unwrap(),
             b"<project><x/></project>\n"
         );
+    }
+
+    #[tokio::test]
+    async fn unresolved_root_never_disables_confinement() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("missing");
+        let reader = ProjectReader::new(&root);
+        assert!(reader.resolve("pom.xml").is_err());
+        let p = plan(vec![FileWrite {
+            rel: "pom.xml".into(),
+            bytes: b"<project/>".to_vec(),
+            tree: false,
+        }]);
+        assert!(write_plan(&root, &p).await.is_err());
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_tree_retained_for_live_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(gradle::INDEX_REL);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "MALFORMED\n").unwrap();
+        let out = revert(
+            temp.path(),
+            &entry(vec![record(OWNED_FILE_KIND, gradle::INDEX_REL)]),
+            RevertOpts::new(true),
+        )
+        .await;
+        assert!(
+            out.success && out.kept_artifact && out.drift_skipped(),
+            "{out:?}"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "MALFORMED\n");
     }
 
     #[tokio::test]

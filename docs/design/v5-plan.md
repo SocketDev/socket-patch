@@ -27,9 +27,9 @@ patch-UI review.
   no longer replays recorded fragments.
 - **In-place vendored ledger re-synthesis in `repair` is cut**; repair
   re-downloads artifacts from the remote instead (see WS5 caveat).
-- **Future work (not v5):** a better vendored story for Maven and NuGet
-  (vendored Maven refuses multi-module/Gradle; NuGet feed is fragile).
-  Keep the current behavior; do not invest further now.
+- **Vendored JVM support is in v5:** Maven reactors and Gradle use the JVM
+  backend described in [maven-vendoring.md](maven-vendoring.md). Existing
+  single-POM behavior stays supported. NuGet feed redesign remains future work.
 
 ## Workstreams (ordered; WS1–WS3 unblock the rest)
 

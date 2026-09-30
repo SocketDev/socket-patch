@@ -871,6 +871,12 @@ the same restore `rollback` does — so `vendor --revert` later returns it to up
 never back to hosted. A package whose entry cannot be restored (offline, `bun.lockb`)
 fails with `redirect_revert_failed` and stays hosted.
 
+Maven reactors and Gradle 6.8+ are supported without an experimental flag. Reactors
+use suffixed versions in `.socket/vendor/maven2`; Gradle keeps its coordinates
+and lockfiles, with settings wiring and a configuration-time SHA-256 check.
+Existing Gradle verification files are updated. See the [JVM vendoring design](docs/design/maven-vendoring.md)
+for supported shapes, Maven mirror and `-f` limitations, and offline checks.
+
 Vendoring is per-patch: only dependencies with a Socket patch are vendored. For the
 lockfile flavors each ecosystem supports, see the
 [mode × ecosystem matrix](docs/ecosystems.md#mode--ecosystem-matrix).
@@ -886,6 +892,9 @@ socket-patch scan --mode vendored [PATHS]... [options]
 |------|---------|-------------|
 | `-f, --force` | `SOCKET_FORCE` | Tolerate *missing* patch-target files in the staged copy (skipped instead of failing the vendor) and bypass the variant probe for multi-release ecosystems. A plain before-hash mismatch doesn't need this: vendor staging always overwrites mismatched content with the verified patched bytes (surfaced as a `vendor_content_mismatch_overwritten` warning). |
 | `--revert` | `SOCKET_VENDOR_REVERT` | Undo vendoring: restore the recorded original lockfile fragments byte-for-byte and remove the `.socket/vendor/` artifacts. Works without a manifest. A package vendored over a hosted pin returns to its upstream registry entry. |
+| `--check` | — | Audit committed artifacts and JVM wiring offline without changing files; exit 1 on drift. |
+| `--local-repo <path>` | — | With `--check`, also detect conflicting suffixed Maven jars and POMs in this cache. |
+| `--maven-config auto\|none` | — | Maven reactors: write the repository tail (`auto`) or use only the file repository (`none`). The choice persists. |
 | `--vex <path>` | `SOCKET_VEX` | On a successful vendor, also write an OpenVEX 0.2.0 document to this path. |
 | `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | `SOCKET_VEX_*` | Passthrough to the embedded VEX builder. Inert unless `--vex` is set. |
 

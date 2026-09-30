@@ -1,21 +1,20 @@
-//! Prototype of the v5 vendored JVM backend (`docs/design/maven-vendoring.md`).
+//! The v5 vendored JVM backend (`docs/design/maven-vendoring.md`).
 //!
-//! Handles only the shapes the legacy `maven_repo` backend refuses — a
-//! multi-module Maven reactor and a Gradle build — and only when
-//! [`EXPERIMENTAL_ENV`] is set (or the ledger already holds an entry this
-//! backend wrote), so every shape vendored today keeps its current behavior.
+//! Handles multi-module Maven reactors and Gradle builds automatically.
+//! Single-POM builds retain the legacy backend.
 //!
 //! The planners are pure: they read project files through a [`ReadFn`] and
 //! return the full post-vendor bytes of every file they touch plus one
-//! fragment record per edit (§7.1: never a whole file). Revert is planned the
+//! fragment record per edit (never a whole file). Revert is planned the
 //! same way ([`maven_reactor::unplan`], [`gradle::unplan`]): per-patch
 //! fragments are cut by their exact text or their `socket-patch` tag, and a
 //! shared fragment (repository block, `maven.config` lines, apply lines,
 //! owned files) goes only once no other patch's reference is left in the
-//! project, so the result does not depend on revert order (§7.3). [`apply`]
+//! project, so the result does not depend on revert order. [`apply`]
 //! does the disk side.
 
 pub mod apply;
+pub(crate) mod archive;
 pub mod gradle;
 pub mod maven_reactor;
 
@@ -39,6 +38,8 @@ pub const OWNED_FILE_KIND: &str = "jvm_owned_file";
 pub const TREE_KIND: &str = "jvm_vendor_tree";
 /// A directory vendor created; removed on revert once empty.
 pub const CREATED_DIR_KIND: &str = "jvm_created_dir";
+/// Whether upstream metadata was verified against registry checksums.
+pub const UPSTREAM_KIND: &str = "jvm_upstream_status";
 /// Every kind this backend records.
 pub const KINDS: &[&str] = &[
     POM_FRAGMENT_KIND,
@@ -48,14 +49,28 @@ pub const KINDS: &[&str] = &[
     OWNED_FILE_KIND,
     TREE_KIND,
     CREATED_DIR_KIND,
+    UPSTREAM_KIND,
 ];
 
-/// Opt-in switch for the prototype backend.
-pub const EXPERIMENTAL_ENV: &str = "SOCKET_PATCH_EXPERIMENTAL_JVM_VENDOR";
-
-/// Whether [`EXPERIMENTAL_ENV`] is set to a non-empty value other than `0`.
-pub fn experimental_enabled() -> bool {
-    std::env::var(EXPERIMENTAL_ENV).is_ok_and(|v| !v.is_empty() && v != "0")
+/// Parse the distribution version from a checked-in wrapper only; never runs the build tool.
+pub fn wrapper_version(read: ReadFn<'_>, tool: &str) -> Option<(u32, u32, u32)> {
+    let path = match tool {
+        "maven" => ".mvn/wrapper/maven-wrapper.properties",
+        "gradle" => "gradle/wrapper/gradle-wrapper.properties",
+        _ => return None,
+    };
+    let bytes = read(path)?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let url = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("distributionUrl="))?;
+    let re = regex::Regex::new(&format!(r"{tool}-(\d+)\.(\d+)(?:\.(\d+))?")).ok()?;
+    let caps = re.captures(url)?;
+    Some((
+        caps[1].parse().ok()?,
+        caps[2].parse().ok()?,
+        caps.get(3).map_or(Some(0), |m| m.as_str().parse().ok())?,
+    ))
 }
 
 /// Reads a project-relative, forward-slash path. `None` = missing or
@@ -172,7 +187,7 @@ pub struct JvmPlan {
     pub writes: Vec<FileWrite>,
     /// One record per text fragment the patch relies on, including shared
     /// fragments another patch already wrote (`op: adopt`, which the caller
-    /// replaces with that patch's creation record, §7.3).
+    /// replaces with that patch's creation record).
     pub records: Vec<WiringRecord>,
     /// Every file of the patch's tree with its sha256, whether this plan
     /// writes it or it is already in place (a patch update recording only
@@ -205,7 +220,7 @@ pub struct JvmUnplan {
 pub fn detect(read: ReadFn<'_>) -> Shape {
     if let Some(pom) = read("pom.xml") {
         let text = String::from_utf8_lossy(&pom);
-        // Single-pom projects stay on the legacy path until Phase 4 (§7.6).
+        // Single-pom projects stay on the legacy path until Phase 4.
         return if maven_reactor::declares_modules(&text) {
             Shape::MavenReactor
         } else {
@@ -238,7 +253,7 @@ pub fn plan(shape: Shape, read: ReadFn<'_>, patch: &JvmPatch<'_>) -> Result<JvmP
     }
 }
 
-/// D15 narrowed to what every written file accepts unescaped: g is
+/// Safe coordinates that every written file accepts unescaped: g is
 /// dot-separated `[A-Za-z0-9_-]` segments, a is `[A-Za-z0-9_.-]`, v is
 /// `[A-Za-z0-9_.+-]` not ending in `+` nor starting with `latest.`; neither a
 /// nor v is all dots, and none holds `--` (it ends an XML comment).
@@ -278,7 +293,7 @@ pub(crate) fn fragment(
     }
 }
 
-/// A tree root's owned `.gitattributes` (D14): created when absent,
+/// A tree root's owned `.gitattributes`: created when absent,
 /// adopted (never overwritten) when present.
 pub(crate) fn owned_file(read: ReadFn<'_>, rel: &str, writes: &mut Vec<FileWrite>) -> WiringRecord {
     if read(rel).is_some() {

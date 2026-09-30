@@ -1420,6 +1420,7 @@ mod tests {
             out
         }
         let cfg = crate::vendor::VendorServiceConfig {
+            maven_config: None,
             source: crate::vendor::VendorSource::Auto,
             client: Some(client(&server.uri())),
             use_public_proxy: false,

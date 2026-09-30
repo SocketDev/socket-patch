@@ -1084,6 +1084,18 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_vendor_maven_build, maven: '3.9.16'}
           - {os: ubuntu-latest, suite: e2e_vendor_maven_build, maven: '4.0.0-rc-6'}
           - {os: macos-latest, suite: e2e_vendor_maven_build, maven: '3.9.16'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, maven: '3.6.3', test_filter: '--ignored maven_reactor'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, maven: '3.8.9', test_filter: '--ignored maven_reactor'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, maven: '3.9.2', test_filter: '--ignored maven_reactor'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, maven: '4.0.0-rc-6', test_filter: '--ignored maven_reactor'}
+          - {os: macos-latest, suite: e2e_vendor_jvm_build, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
+          - {os: windows-latest, suite: e2e_vendor_jvm_build, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_multi_project'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, gradle: '7.6.4', java: '17', test_filter: '--ignored gradle_multi_project'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, gradle: '8.14.3', java: '17', test_filter: '--ignored gradle_multi_project'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, gradle: '9.8.0', java: '17', test_filter: '--ignored gradle_multi_project'}
+          - {os: windows-latest, suite: e2e_vendor_jvm_build, gradle: '8.14.3', java: '17', test_filter: '--ignored gradle_multi_project'}
           # Real .NET SDK capstones: hosted + vendored nuget, one leg per SDK
           # major (the suite pins the major through a sandbox global.json):
           # the oldest and newest here, 7-9 on ubuntu in e2e-full.
@@ -1253,12 +1265,12 @@ jobs:
           php-version: '8.2'
           tools: composer:${{ matrix.composer }}
 
-      - name: Setup Java (Maven legs)
-        if: matrix.maven != ''
+      - name: Setup Java (Maven and Gradle legs)
+        if: matrix.maven != '' || matrix.gradle != ''
         uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: ${{ matrix.java || '17' }}
 
       - name: Install Maven ${{ matrix.maven }}
         if: matrix.maven != ''
@@ -1274,7 +1286,24 @@ jobs:
           sum="$(curl -fsSL --retry 3 "$url.sha512" | cut -d' ' -f1)"
           echo "$sum  $RUNNER_TEMP/maven.tgz" | shasum -a 512 -c -
           tar -xzf "$RUNNER_TEMP/maven.tgz" -C "$RUNNER_TEMP"
-          echo "SOCKET_PATCH_MAVEN_E2E_MVN=$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin/mvn" >> "$GITHUB_ENV"
+          launcher="$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin/mvn"
+          if [ "$RUNNER_OS" = Windows ]; then launcher="${launcher}.cmd"; fi
+          echo "SOCKET_PATCH_MAVEN_E2E_MVN=$launcher" >> "$GITHUB_ENV"
+
+      - name: Install Gradle ${{ matrix.gradle }}
+        if: matrix.gradle != ''
+        shell: bash
+        env:
+          GRADLE_VERSION: ${{ matrix.gradle }}
+        run: |
+          url="https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+          curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/gradle.zip"
+          curl -fsSL --retry 3 "$url.sha256" -o "$RUNNER_TEMP/gradle.sha256"
+          python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha256((p/"gradle.zip").read_bytes()).hexdigest() == (p/"gradle.sha256").read_text().strip()'
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+          launcher="$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin/gradle"
+          if [ "$RUNNER_OS" = Windows ]; then launcher="${launcher}.bat"; fi
+          echo "SOCKET_PATCH_GRADLE_E2E_GRADLE=$launcher" >> "$GITHUB_ENV"
 
       - name: Setup .NET SDK
         if: matrix.dotnet != ''
@@ -1380,6 +1409,8 @@ jobs:
           SOCKET_PATCH_COMPOSER_E2E_VERSION: ${{ matrix.composer }}
           SOCKET_PATCH_MAVEN_E2E_REQUIRED: ${{ matrix.maven != '' && '1' || '' }}
           SOCKET_PATCH_MAVEN_E2E_VERSION: ${{ matrix.maven }}
+          SOCKET_PATCH_GRADLE_E2E_REQUIRED: ${{ matrix.gradle != '' && '1' || '' }}
+          SOCKET_PATCH_GRADLE_E2E_VERSION: ${{ matrix.gradle }}
           SOCKET_PATCH_DOTNET_E2E_REQUIRED: ${{ matrix.dotnet != '' && '1' || '' }}
           SOCKET_PATCH_DOTNET_E2E_VERSION: ${{ matrix.dotnet }}
           SOCKET_PATCH_DENO_E2E_REQUIRED: ${{ matrix.deno != '' && '1' || '' }}

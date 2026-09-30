@@ -412,6 +412,7 @@ mod tests {
 
     fn cfg_for(server: &MockServer) -> VendorServiceConfig {
         VendorServiceConfig {
+            maven_config: None,
             source: VendorSource::Service,
             client: Some(
                 ApiClient::new(ApiClientOptions {
@@ -577,6 +578,7 @@ mod tests {
     #[tokio::test]
     async fn unavailable_when_client_absent() {
         let cfg = VendorServiceConfig {
+            maven_config: None,
             source: VendorSource::Auto,
             client: None,
             use_public_proxy: false,

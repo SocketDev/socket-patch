@@ -19,7 +19,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected |
 | RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` project cannot vendor yet) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` when present (bundler prefers them over `Gemfile`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
 | Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [golang-hosted.md](design/golang-hosted.md). Paid tier stays ❌ ([golang-hosted-no-go.md](design/golang-hosted-no-go.md)); `redirect_golang_unsupported` names the vendored remedy |
-| Maven (`maven`) | ✅ in-place jar patching leaves the `~/.m2` checksum sidecars stale — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed maven2 `file://` repository. A root pom declaring `<modules>` (multi-module aggregator) is refused (`vendor_maven_multimodule_unsupported`), and a gradle-only project is refused (`vendor_gradle_unsupported`) | ✅ **pom projects only, fail-closed** — the patched jar is pinned at a Socket-only `<version>-socket.<hex8>` suffix; `${property}` versions are refused; Gradle gets a manual `exclusiveContent` snippet — see [Maven & NuGet caveats](#maven--nuget-caveats) |
+| Maven (`maven`) | ✅ in-place jar patching leaves the `~/.m2` checksum sidecars stale — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ single-POM repository, suffixed Maven reactor repository, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks; see [JVM vendoring](design/maven-vendoring.md) | ✅ **pom projects only, fail-closed** — the patched jar is pinned at a Socket-only `<version>-socket.<hex8>` suffix; `${property}` versions are refused; Gradle gets a manual `exclusiveContent` snippet — see [Maven & NuGet caveats](#maven--nuget-caveats) |
 | NuGet (`nuget`) | ✅ in-place patching deletes `.nupkg.metadata` and advises on the `.nupkg.sha512` tamper-evidence sidecar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed folder feed + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats) |
 | Composer (`composer`) | ✅ in place (`vendor/`) | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite; the entry's `source` and `dist.mirrors` are removed. See [composer-compatibility.md](testing/composer-compatibility.md) |
 | Deno (`deno`) | ✅ in place (the only mode for Deno) | ❌ refused (`vendor_unsupported_ecosystem`) | ❌ not supported |
@@ -355,14 +355,15 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   confirmed directory, a POM at a canonical path whose contents disagree with its
   directory (hand-placed, or a legacy upstream POM with mismatched coordinates) reports
   the directory's coordinates.
-* **Warm `~/.m2` shadowing (vendored Maven only).** Maven consults the *local repository*
+* **Warm `~/.m2` shadowing (legacy single-POM vendoring).** Maven consults the *local repository*
   before any configured `<repository>`, so with vendored mode a warm `~/.m2` copy of the
   same GAV silently wins over the committed `file://` repository — the build succeeds
   with **unpatched** bytes. Purge it with:
   `mvn dependency:purge-local-repository -DmanualInclude=<groupId>:<artifactId>`
   (the always-on `vendor_maven_local_cache_shadow` warning carries the same one-liner).
-  Hosted mode is **not** affected: the patched jar lives at the suffixed version, which
-  no warm `~/.m2` entry can hold.
+  Reactor vendoring and hosted mode use a suffixed version, so a cached original
+  version cannot shadow it. Audit conflicting copies of that suffix with
+  `vendor --check --local-repo <path>`.
 * **`mirrorOf` mirrors (hosted Maven).** A `settings.xml` `<mirror>` with
   `<mirrorOf>*</mirrorOf>` (common in corporate environments) reroutes *all* repositories
   — including the injected `socket-patch-<uuid>` repository — through the mirror. Because

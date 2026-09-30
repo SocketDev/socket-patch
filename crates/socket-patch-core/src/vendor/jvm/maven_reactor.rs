@@ -1,6 +1,5 @@
-//! Multi-module Maven reactor planner (prototype). See the module doc of
-//! [`super`] and `docs/design/maven-vendoring.md` §3 and §4 (the v5.0
-//! column: 2-line `maven.config`, a fallback repository and a pin per local
+//! Multi-module Maven reactor planner. See the module doc of
+//! [`super`] and `docs/design/maven-vendoring.md` (the v5 behavior: 2-line `maven.config`, a fallback repository and a pin per local
 //! root, declaration rewrites; no build-time checksum pins).
 //!
 //! Every pom is edited by splicing at byte offsets found on a masked copy
@@ -20,10 +19,10 @@ use super::{
     POM_FRAGMENT_KIND, TREE_GITATTRIBUTES,
 };
 
-/// The committed maven2 tree (D2, §3).
+/// The committed maven2 tree.
 pub const TREE_ROOT: &str = ".socket/vendor/maven2";
 pub const MAVEN_CONFIG: &str = ".mvn/maven.config";
-/// The tree root's `.gitattributes` (D14), shared by every Maven patch.
+/// The tree root's `.gitattributes`, shared by every Maven patch.
 pub const GITATTRIBUTES_REL: &str = ".socket/vendor/maven2/.gitattributes";
 const OFFLINE_LINE: &str = "-Daether.offline.protocols=file";
 const OFFLINE_KEY: &str = "-Daether.offline.protocols=";
@@ -102,6 +101,15 @@ pub fn committed(read: ReadFn<'_>, c: &Coords<'_>) -> Option<(Vec<u8>, Vec<u8>)>
 
 /// Plan vendoring `patch` into the reactor rooted at `pom.xml`.
 pub fn plan(read: ReadFn<'_>, patch: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusal> {
+    plan_with_config(read, patch, true)
+}
+
+/// Plan with an explicit Maven config policy. A disabled policy is recorded for re-runs.
+pub fn plan_with_config(
+    read: ReadFn<'_>,
+    patch: &JvmPatch<'_>,
+    config_enabled: bool,
+) -> Result<JvmPlan, JvmRefusal> {
     let (g, a, v) = (patch.group_id, patch.artifact_id, patch.version);
     if !safe_coordinates(g, a, v) {
         return Err(JvmRefusal {
@@ -123,6 +131,14 @@ pub fn plan(read: ReadFn<'_>, patch: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusa
 
     let reactor = Reactor::discover(read)?;
     let mut warnings = Vec::new();
+    let wrapper = super::wrapper_version(read, "maven");
+    if config_enabled && wrapper.is_none_or(|v| ((3, 9, 2)..(3, 9, 9)).contains(&v)) {
+        warnings.push(degraded("maven_f_outside_root", "Maven 3.9.2–3.9.8 cannot interpolate the repository tail with -f from outside the project; run Maven from this root or vendor with --maven-config=none"));
+    }
+    if !config_enabled || wrapper.is_none_or(|v| v < (3, 9, 2)) {
+        warnings.push(degraded("maven_mirror_of_all", "Maven before 3.9.2, or --maven-config=none, relies on the file repository; exclude socket-patch-vendor from mirrorOf=* in your Maven settings"));
+    }
+
     let mut edits: BTreeMap<String, Vec<Edit>> = BTreeMap::new();
     let mut unpinned: BTreeSet<String> = BTreeSet::new();
     let mut managed_roots: BTreeSet<String> = BTreeSet::new();
@@ -210,24 +226,38 @@ pub fn plan(read: ReadFn<'_>, patch: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusa
             tree: false,
         });
     }
-    let (config, config_op) = merge_maven_config(read(MAVEN_CONFIG).as_deref());
-    let action = match op_of_value(&config_op) {
-        "config" if read(MAVEN_CONFIG).is_some() => WiringAction::Rewritten,
-        _ => WiringAction::Added,
-    };
-    records.push(fragment(
-        MAVEN_CONFIG,
-        CONFIG_LINE_KIND,
-        "config",
-        action,
-        None,
-        config_op,
-    ));
-    writes.push(FileWrite {
-        rel: MAVEN_CONFIG.to_string(),
-        bytes: config,
-        tree: false,
-    });
+    if config_enabled {
+        let (config, config_op) = merge_maven_config(read(MAVEN_CONFIG).as_deref());
+        let action = match op_of_value(&config_op) {
+            "config" if read(MAVEN_CONFIG).is_some() => WiringAction::Rewritten,
+            _ => WiringAction::Added,
+        };
+        records.push(fragment(
+            MAVEN_CONFIG,
+            CONFIG_LINE_KIND,
+            "config",
+            action,
+            None,
+            config_op,
+        ));
+        writes.push(FileWrite {
+            rel: MAVEN_CONFIG.to_string(),
+            bytes: config,
+            tree: false,
+        });
+    } else {
+        if banning.is_some() {
+            return Err(JvmRefusal { code: SHAPE_UNSUPPORTED, detail: "reason: maven_repository_banned: --maven-config=none requires the fallback file repository".into() });
+        }
+        records.push(fragment(
+            MAVEN_CONFIG,
+            CONFIG_LINE_KIND,
+            "disabled",
+            WiringAction::Added,
+            None,
+            json!({"op": "config_none"}),
+        ));
+    }
     records.push(owned_file(read, GITATTRIBUTES_REL, &mut writes));
     let (tree_dir, jar_rel, tree) = tree_writes(patch, &sv, suffixed_pom);
     writes.extend(tree);
@@ -246,7 +276,7 @@ fn op_of_value(op: &Value) -> &str {
     op.get("op").and_then(Value::as_str).unwrap_or_default()
 }
 
-/// Plan the revert of `c`'s wiring (§7.3). The pin and the rewritten
+/// Plan the revert of `c`'s wiring. The pin and the rewritten
 /// versions go now; `pin_section` shells once empty; the repository block,
 /// the `maven.config` lines and the tree `.gitattributes` only once no pom
 /// references another patch.
@@ -351,8 +381,12 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
 /// Whether a pom of the reactor still declares `c`'s suffixed version
 /// (outside comments): the liveness proof `vex` needs for this layout.
 pub fn wired(read: ReadFn<'_>, c: &Coords<'_>) -> bool {
+    wired_checked(read, c).unwrap_or(false)
+}
+
+pub fn wired_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<bool, JvmRefusal> {
     let sv = c.suffixed_version();
-    Reactor::discover(read).is_ok_and(|reactor| {
+    Reactor::discover(read).map(|reactor| {
         reactor
             .scope
             .iter()
@@ -573,7 +607,96 @@ fn degraded(reason: &str, detail: impl std::fmt::Display) -> JvmWarning {
     }
 }
 
-// ── reactor discovery (§4.1, D3) ─────────────────────────────────────────────
+/// Whether an ancestor reactor owns the requested pom. Used to reject partial vendoring.
+pub fn contains_module(read: ReadFn<'_>, rel: &str) -> bool {
+    Reactor::discover(read).is_ok_and(|r| r.reactor.iter().any(|p| p == rel))
+}
+
+pub(crate) type Gav = (String, String, String);
+
+/// Metadata needed to verify upstream parents and imported BOMs in Gradle.
+pub(crate) struct MetadataModel {
+    pub parent: Option<Gav>,
+    pub imports: Vec<Gav>,
+    pub properties: BTreeMap<String, String>,
+}
+
+pub(crate) fn metadata_model(
+    bytes: &[u8],
+    inherited: &BTreeMap<String, String>,
+    descendant: &BTreeMap<String, String>,
+    include_imports: bool,
+) -> Result<MetadataModel, String> {
+    let pom = Pom::parse("upstream.pom", bytes.to_vec()).map_err(|e| e.detail)?;
+    let mut properties = inherited.clone();
+    properties.extend(pom.props.clone());
+    properties.extend(descendant.clone());
+    for (key, value) in [
+        ("project.version", pom.effective_version()),
+        ("project.groupId", pom.effective_group()),
+        ("project.artifactId", pom.artifact.as_deref()),
+    ] {
+        if let Some(v) = value {
+            properties.insert(key.into(), v.into());
+        }
+    }
+    let resolve = |value: &str| -> Result<String, String> {
+        let mut value = value.to_string();
+        for _ in 0..MAX_INTERPOLATION_DEPTH {
+            let Some(start) = value.find("${") else {
+                return Ok(value);
+            };
+            let end = value[start..]
+                .find('}')
+                .map(|n| start + n)
+                .ok_or("invalid metadata property")?;
+            let key = &value[start + 2..end];
+            let replacement = properties
+                .get(key)
+                .ok_or_else(|| format!("unresolved metadata property {key}"))?;
+            value.replace_range(start..=end, replacement);
+        }
+        Err("cyclic metadata property".into())
+    };
+    let gav = |g: Option<String>, a: Option<String>, v: Option<String>| -> Result<Gav, String> {
+        let (g, a, v) = (
+            resolve(&g.ok_or("missing groupId")?)?,
+            resolve(&a.ok_or("missing artifactId")?)?,
+            resolve(&v.ok_or("missing version")?)?,
+        );
+        if !safe_coordinates(&g, &a, &v) {
+            return Err("unsafe metadata coordinates".into());
+        }
+        Ok((g, a, v))
+    };
+    let parent = pom
+        .parent
+        .as_ref()
+        .map(|p| gav(p.group.clone(), p.artifact.clone(), p.version.clone()))
+        .transpose()?;
+    let mut imports = Vec::new();
+    if include_imports {
+        for dep in pom.doc.declarations() {
+            if pom.doc.is_top_level_managed(dep)
+                && pom.doc.child_text(dep, "scope").as_deref() == Some("import")
+                && pom.doc.child_text(dep, "type").as_deref() == Some("pom")
+            {
+                imports.push(gav(
+                    pom.doc.child_text(dep, "groupId"),
+                    pom.doc.child_text(dep, "artifactId"),
+                    pom.doc.child_text(dep, "version"),
+                )?);
+            }
+        }
+    }
+    Ok(MetadataModel {
+        parent,
+        imports,
+        properties,
+    })
+}
+
+// ── reactor discovery ─────────────────────────────────────────────
 
 /// One loaded pom.
 struct Pom {
@@ -753,7 +876,7 @@ impl Reactor {
         })
     }
 
-    /// The topmost local ancestor of `rel` (D3).
+    /// The topmost local ancestor of `rel`.
     fn local_root(&self, rel: &str) -> String {
         self.chain(rel).last().unwrap_or(rel).to_string()
     }
@@ -761,7 +884,7 @@ impl Reactor {
     /// Local roots that get a pin and the fallback repository. A root that
     /// no other pom inherits from, packaged `pom` and declaring no
     /// dependencies, is a pure aggregator: nothing resolves through it, so
-    /// it stays untouched (§4.6).
+    /// it stays untouched.
     fn wired_roots(&self) -> Vec<String> {
         let mut roots: Vec<String> = Vec::new();
         for rel in &self.reactor {
@@ -832,7 +955,7 @@ impl Reactor {
             .filter(move |p| *p != rel && self.chain(p).any(|a| a == rel))
     }
 
-    /// Rewrite the base declarations of `rel` (§4.5 table) and record the
+    /// Rewrite the base declarations of `rel` and record the
     /// warnings, the local roots not to pin, and the local roots whose own
     /// top-level management already covers g:a.
     #[allow(clippy::too_many_arguments)]
@@ -1132,7 +1255,7 @@ fn cli_properties(config: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-// ── pom edits (§4.4, §4.5) ───────────────────────────────────────────────────
+// ── pom edits ───────────────────────────────────────────────────
 
 /// Replace `text[start..end]` with `text` (an insertion when `start == end`).
 #[derive(Debug)]
@@ -1385,7 +1508,7 @@ fn repository_edit(doc: &Doc) -> Edit {
     edit
 }
 
-// ── .mvn/maven.config (§4.2, v5.0 two lines) ─────────────────────────────────
+// ── .mvn/maven.config ─────────────────────────────────
 
 /// `config` with the offline-protocols and tail lines present, and the
 /// `config` op recording what changed (`adopt` when nothing did):
@@ -1456,7 +1579,7 @@ fn extend_list(arg: &str, key: &str, item: &str) -> Option<String> {
     Some(format!("{key}{list}{sep}{item}"))
 }
 
-// ── vendored tree (§3) ───────────────────────────────────────────────────────
+// ── vendored tree ───────────────────────────────────────────────────────
 
 /// `(tree_dir, jar_rel, writes)` of the version directory.
 fn tree_writes(
@@ -2049,7 +2172,7 @@ fn indent_unit(masked: &str) -> String {
     }
 }
 
-// ── suffixed pom (D11): a port of depscan's `suffixMavenPom` ─────────────────
+// ── suffixed pom: a port of depscan's `suffixMavenPom` ─────────────────
 
 /// An element of the depscan pom scan (`maven-pom-scan.ts`).
 #[derive(Debug, Clone)]
@@ -2288,10 +2411,16 @@ mod tests {
     type Fs = BTreeMap<String, Vec<u8>>;
 
     fn fs(files: &[(&str, &str)]) -> Fs {
-        files
-            .iter()
-            .map(|(p, c)| (p.to_string(), c.as_bytes().to_vec()))
-            .collect()
+        let mut defaults = BTreeMap::from([(
+            ".mvn/wrapper/maven-wrapper.properties".to_string(),
+            b"distributionUrl=https://repo.maven.apache.org/apache-maven-3.9.16-bin.zip\n".to_vec(),
+        )]);
+        defaults.extend(
+            files
+                .iter()
+                .map(|(p, c)| (p.to_string(), c.as_bytes().to_vec())),
+        );
+        defaults
     }
 
     fn run(files: &Fs) -> Result<JvmPlan, JvmRefusal> {
@@ -3391,7 +3520,7 @@ mod tests {
     }
 
     /// A same-uuid re-run that edits a file again keeps the first run's
-    /// records (§7.1 fragments, carried forward), so revert still restores
+    /// records (carried-forward fragments), so revert still restores
     /// the pristine pom and deletes the tree only once nothing names it.
     #[tokio::test]
     async fn same_uuid_rerun_keeps_the_first_runs_originals() {
@@ -3444,6 +3573,12 @@ mod tests {
             ("b/pom.xml", &module("b", &dep("1.10.0"))),
         ]);
         let root = dir.path();
+        std::fs::create_dir_all(root.join(".mvn/wrapper")).unwrap();
+        std::fs::write(
+            root.join(".mvn/wrapper/maven-wrapper.properties"),
+            "distributionUrl=https://example.test/apache-maven-3.9.16-bin.zip\n",
+        )
+        .unwrap();
         let pristine = testing::snapshot(root);
         let mut ledger = BTreeMap::new();
         let p1 = patch();
@@ -3598,7 +3733,7 @@ mod tests {
 
     /// Maven interpolates after inheritance: a module overriding the
     /// property keeps its own version, so the inherited `${p}` stays and
-    /// the root is not pinned (§4.5 "a different literal").
+    /// the root is not pinned.
     #[test]
     fn inherited_property_overridden_by_a_module_is_left_alone() {
         let root = ROOT.replace(

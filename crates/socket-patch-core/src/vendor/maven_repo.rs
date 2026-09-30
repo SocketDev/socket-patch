@@ -340,6 +340,29 @@ pub async fn vendor_maven(
     force: bool,
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
+    for ancestor in project_root.ancestors().skip(1) {
+        let reader = super::jvm::apply::ProjectReader::new(ancestor);
+        let rel = project_root
+            .join("pom.xml")
+            .strip_prefix(ancestor)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"));
+        if rel
+            .as_ref()
+            .is_some_and(|rel| super::jvm::maven_reactor::contains_module(&|p| reader.read(p), rel))
+        {
+            return refused(
+                "vendor_jvm_shape_unsupported",
+                format!(
+                    "reason: not_build_root: run vendor from reactor root {}",
+                    ancestor.display()
+                ),
+            );
+        }
+        if ancestor.join(".git").exists() {
+            break;
+        }
+    }
     if let Some(shape) = jvm_shape(project_root).await {
         return vendor_maven_jvm(
             shape,
@@ -708,19 +731,10 @@ pub async fn revert_maven_opts(
     outcome
 }
 
-// ── prototype v5 JVM backend (reactors, Gradle) ─────────────────────────────────
+// ── v5 JVM backend (reactors, Gradle) ─────────────────────────────────
 
-/// The JVM shape this project routes to the prototype backend: only with
-/// [`super::jvm::EXPERIMENTAL_ENV`] set, or once the ledger holds an entry
-/// that backend wrote (so a vendored project keeps working without the
-/// flag), and only for a reactor or a Gradle build.
+/// Route reactors and Gradle builds to the JVM backend.
 async fn jvm_shape(project_root: &Path) -> Option<super::jvm::Shape> {
-    if !super::jvm::experimental_enabled() {
-        let state = super::state::load_state(project_root).await.ok()?;
-        if !state.entries.values().any(super::jvm::apply::is_jvm_entry) {
-            return None;
-        }
-    }
     let reader = super::jvm::apply::ProjectReader::new(project_root);
     let shape = super::jvm::detect(&|rel: &str| reader.read(rel));
     (shape != super::jvm::Shape::Other).then_some(shape)
@@ -744,6 +758,33 @@ async fn jvm_committed_patch(
     };
     let reader = super::jvm::apply::ProjectReader::new(project_root);
     let read = |rel: &str| reader.read(rel);
+    let dir = match shape {
+        super::jvm::Shape::MavenReactor => super::jvm::maven_reactor::tree_dir(&coords),
+        super::jvm::Shape::Gradle => super::jvm::gradle::tree_dir(&coords),
+        super::jvm::Shape::Other => return None,
+    };
+    let marker: serde_json::Value =
+        serde_json::from_slice(&read(&format!("{dir}/socket-patch.vendor.json"))?).ok()?;
+    if marker.get("uuid")?.as_str()? != record.uuid {
+        return None;
+    }
+    let files = marker.get("files")?.as_object()?;
+    let tree_version = match shape {
+        super::jvm::Shape::MavenReactor => coords.suffixed_version(),
+        _ => v.to_string(),
+    };
+    for ext in ["jar", "pom"] {
+        files.get(&format!("{a}-{tree_version}.{ext}"))?;
+    }
+    for (name, file) in files {
+        if name.contains('/') || name.contains('\\') || name == ".." {
+            return None;
+        }
+        let bytes = read(&format!("{dir}/{name}"))?;
+        if file.get("sha256")?.as_str()? != super::jvm::sha256_hex(&bytes) {
+            return None;
+        }
+    }
     let committed = match shape {
         super::jvm::Shape::MavenReactor => {
             super::jvm::maven_reactor::committed(&read, &coords).map(|(jar, pom)| (jar, pom, None))
@@ -756,7 +797,7 @@ async fn jvm_committed_patch(
 }
 
 /// Vendor into a multi-module reactor or a Gradle build through the
-/// prototype [`super::jvm`] backend. The jar and pom come from the committed
+/// [`super::jvm`] backend. The jar and pom come from the committed
 /// tree when it already holds this patch, else from the same service /
 /// local-rebuild rungs as the legacy path; nothing is written for a
 /// refused plan.
@@ -792,8 +833,32 @@ async fn vendor_maven_jvm(
             format!("unsafe maven coordinates `{group_id}:{artifact_id}` @ `{version}`"),
         );
     }
+    let state = match super::state::load_state(project_root).await {
+        Ok(state) => Some(state),
+        Err(e) => return refused("vendor_state_unreadable", e.to_string()),
+    };
     let display_path = project_root.join(".socket/vendor");
     if record.files.is_empty() {
+        let reader = super::jvm::apply::ProjectReader::new(project_root);
+        let patch = super::jvm::JvmPatch {
+            group_id: &group_id,
+            artifact_id: &artifact_id,
+            version: &version,
+            uuid: &record.uuid,
+            jar: &[],
+            upstream_pom: b"<project></project>",
+            upstream_module: None,
+        };
+        let plan = super::jvm::plan(shape, &|rel| reader.read(rel), &patch);
+        if let Some(rel) = reader.escaped() {
+            return refused(
+                "vendor_jvm_shape_unsupported",
+                super::jvm::apply::outside_root_detail(&rel),
+            );
+        }
+        if let Err(e) = plan {
+            return refused(e.code, e.detail);
+        }
         return done(
             synthesized_result(purl, &display_path, Vec::new(), true, None),
             None,
@@ -803,7 +868,8 @@ async fn vendor_maven_jvm(
 
     let mut warnings: Vec<VendorWarning> = Vec::new();
     let committed = jvm_committed_patch(shape, purl, project_root, record).await;
-    let (jar_bytes, pom_bytes, module_bytes, mut result) = match committed {
+    let was_committed = committed.is_some();
+    let (jar_bytes, mut pom_bytes, mut module_bytes, mut result) = match committed {
         Some((jar, pom, module)) => (
             jar,
             pom,
@@ -834,6 +900,37 @@ async fn vendor_maven_jvm(
                         )
                         .await
                         {
+                            Ok((bytes, result)) if result.success => {
+                                let upstream = match read_regular_to_bytes(
+                                    &installed_dir.join(format!("{artifact_id}-{version}.jar")),
+                                )
+                                .await
+                                {
+                                    Ok(bytes) => bytes,
+                                    Err(e) => {
+                                        return refused(
+                                            "vendor_jvm_upstream_unavailable",
+                                            e.to_string(),
+                                        )
+                                    }
+                                };
+                                if let Err(e) = verify_jvm_upstream(
+                                    &upstream,
+                                    &group_id,
+                                    &artifact_id,
+                                    &version,
+                                    "jar",
+                                    service,
+                                )
+                                .await
+                                {
+                                    return refused("vendor_prebuilt_integrity_mismatch", e);
+                                }
+                                match super::jvm::archive::canonical_jar(&upstream, &bytes) {
+                                    Ok(bytes) => (bytes, result),
+                                    Err(e) => return refused("vendor_jvm_upstream_unavailable", e),
+                                }
+                            }
                             Ok(pair) => pair,
                             Err(outcome) => return jvm_refusal(*outcome),
                         }
@@ -842,14 +939,13 @@ async fn vendor_maven_jvm(
             if !result.success {
                 return done(result, None, warnings);
             }
-            let pom = match acquire_upstream_pom(
+            let pom = match acquire_jvm_metadata(
                 installed_dir,
                 &group_id,
                 &artifact_id,
                 &version,
-                &group_id_to_path(&group_id),
+                "pom",
                 service,
-                &mut warnings,
             )
             .await
             {
@@ -870,6 +966,57 @@ async fn vendor_maven_jvm(
         }
     };
 
+    let online = service.is_some_and(|s| !s.offline);
+    if online && was_committed {
+        let upstream = match acquire_jvm_metadata(
+            installed_dir,
+            &group_id,
+            &artifact_id,
+            &version,
+            "jar",
+            service,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => return refused("vendor_jvm_upstream_unavailable", e),
+        };
+        if let Err(e) = verify_unpatched_jar_members(&upstream, &jar_bytes, record) {
+            return refused("vendor_prebuilt_integrity_mismatch", e);
+        }
+        pom_bytes = match acquire_jvm_metadata(
+            installed_dir,
+            &group_id,
+            &artifact_id,
+            &version,
+            "pom",
+            service,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => return refused("vendor_jvm_upstream_unavailable", e),
+        };
+    }
+    if shape == super::jvm::Shape::Gradle
+        && (module_bytes.is_some()
+            || String::from_utf8_lossy(&pom_bytes).contains("published-with-gradle-metadata"))
+        && (module_bytes.is_none() || online)
+    {
+        module_bytes = match acquire_jvm_metadata(
+            installed_dir,
+            &group_id,
+            &artifact_id,
+            &version,
+            "module",
+            service,
+        )
+        .await
+        {
+            Ok(bytes) => Some(bytes),
+            Err(e) => return refused("vendor_jvm_upstream_unavailable", e),
+        };
+    }
     let patch = super::jvm::JvmPatch {
         group_id: &group_id,
         artifact_id: &artifact_id,
@@ -880,17 +1027,136 @@ async fn vendor_maven_jvm(
         upstream_module: module_bytes.as_deref(),
     };
     let reader = super::jvm::apply::ProjectReader::new(project_root);
-    let planned = super::jvm::plan(shape, &|rel: &str| reader.read(rel), &patch);
+    let prior_disabled = state.as_ref().is_some_and(|s| {
+        s.entries.values().any(|e| {
+            e.wiring
+                .iter()
+                .any(|w| super::jvm::op_of(w) == "config_none")
+        })
+    });
+    let config_enabled = service
+        .and_then(|s| s.maven_config)
+        .unwrap_or(!prior_disabled);
+    if !config_enabled
+        && state.as_ref().is_some_and(|s| {
+            s.entries.values().any(|e| {
+                e.wiring.iter().any(|w| {
+                    w.kind == super::jvm::CONFIG_LINE_KIND && super::jvm::op_of(w) == "config"
+                })
+            })
+        })
+    {
+        return refused("vendor_jvm_shape_unsupported", "reason: maven_config_changed: revert the existing Maven wiring before selecting --maven-config=none");
+    }
+    let read = |rel: &str| reader.read(rel);
+    let planned = match shape {
+        super::jvm::Shape::MavenReactor => {
+            super::jvm::maven_reactor::plan_with_config(&read, &patch, config_enabled)
+        }
+        _ => super::jvm::plan(shape, &read, &patch),
+    };
     if let Some(rel) = reader.escaped() {
         return refused(
             "vendor_jvm_shape_unsupported",
             super::jvm::apply::outside_root_detail(&rel),
         );
     }
-    let plan = match planned {
+    let mut plan = match planned {
         Ok(plan) => plan,
         Err(refusal) => return refused(refusal.code, refusal.detail),
     };
+    if shape == super::jvm::Shape::Gradle
+        && reader
+            .read(super::jvm::gradle::VERIFICATION_REL)
+            .is_some_and(|b| super::jvm::gradle::verifies_metadata(&String::from_utf8_lossy(&b)))
+    {
+        // An in-sync run can reuse the already recorded metadata edits offline.
+        let previous = state.as_ref().and_then(|s| {
+            s.entries.values().find(|e| {
+                e.uuid == record.uuid
+                    && e.base_purl == build_maven_purl(&group_id, &artifact_id, &version)
+            })
+        });
+        let metadata_records: Vec<_> = previous
+            .into_iter()
+            .flat_map(|e| &e.wiring)
+            .filter(|w| {
+                w.kind == super::jvm::VERIFICATION_FRAGMENT_KIND
+                    && w.key.as_deref().is_some_and(|k| k.starts_with("metadata:"))
+            })
+            .cloned()
+            .collect();
+        let text = reader
+            .read(super::jvm::gradle::VERIFICATION_REL)
+            .unwrap_or_default();
+        let reusable = !online
+            && !metadata_records.is_empty()
+            && metadata_records.iter().all(|w| {
+                super::jvm::gradle::metadata_record_present(&String::from_utf8_lossy(&text), w)
+            });
+        if reusable {
+            plan.records.extend(metadata_records);
+            plan.warnings.retain(|w| {
+                !w.detail
+                    .starts_with("reason: verification_parent_chain_unhandled:")
+            });
+        } else {
+            let mut repo = installed_dir.to_path_buf();
+            for _ in 0..group_id.split('.').count() + 2 {
+                repo.pop();
+            }
+            let mut metadata = vec![super::jvm::gradle::MetadataArtifact {
+                group: group_id.clone(),
+                artifact: artifact_id.clone(),
+                version: version.clone(),
+                extension: "pom",
+                bytes: pom_bytes.clone(),
+            }];
+            if let Some(module) = &module_bytes {
+                metadata.push(super::jvm::gradle::MetadataArtifact {
+                    group: group_id.clone(),
+                    artifact: artifact_id.clone(),
+                    version: version.clone(),
+                    extension: "module",
+                    bytes: module.clone(),
+                });
+            }
+            // Gradle verifies both the parent's standalone model and the
+            // child's effective imports, which can select different BOM versions.
+            for propagate_properties in [false, true] {
+                if let Err(e) = collect_gradle_metadata(
+                    &pom_bytes,
+                    &repo,
+                    service,
+                    &mut metadata,
+                    0,
+                    &std::collections::BTreeMap::new(),
+                    propagate_properties,
+                )
+                .await
+                {
+                    return refused(
+                        "vendor_jvm_upstream_unavailable",
+                        format!("reason: verification_metadata_unavailable: {e}"),
+                    );
+                }
+            }
+            if let Err(e) =
+                super::jvm::gradle::add_verification_metadata(&read, &mut plan, &metadata)
+            {
+                return refused(e.code, e.detail);
+            }
+        }
+    }
+    let previous = state.as_ref().and_then(|s| {
+        s.entries.values().find(|e| {
+            e.uuid == record.uuid
+                && e.base_purl == build_maven_purl(&group_id, &artifact_id, &version)
+        })
+    });
+    let prior_verified = previous.is_some_and(|e| !super::jvm::apply::upstream_unverified(e));
+    let registry_verified = online || (was_committed && prior_verified);
+    plan.records.push(WiringRecord {file: plan.jar_rel.clone(), kind: super::jvm::UPSTREAM_KIND.into(), action: WiringAction::Added, key: Some("upstream".into()), original: None, new: Some(serde_json::json!({"op": if registry_verified {"registry_verified"} else {"local_unverified"}}))});
     warnings.extend(
         plan.warnings
             .iter()
@@ -898,7 +1164,7 @@ async fn vendor_maven_jvm(
     );
     let jar_path = project_root.join(&plan.jar_rel);
     result.package_path = jar_path.display().to_string();
-    if plan.writes.is_empty() {
+    if plan.writes.is_empty() && (previous.is_none() || registry_verified == prior_verified) {
         return done(
             already_patched_result(purl, &jar_path, &record.files),
             None,
@@ -913,21 +1179,217 @@ async fn vendor_maven_jvm(
         Err(e) => return done(failed_result(purl, &jar_path, e), None, warnings),
     };
     // Shared fragments another JVM entry wrote, and the pristine originals
-    // of a patch update, come from the ledger (§7.3).
-    if let Ok(state) = super::state::load_state(project_root).await {
+    // of a patch update, come from the ledger.
+    if let Some(state) = &state {
         super::jvm::apply::inherit_peer_records(&mut wiring, state.entries.values());
     }
-    let entry = maven_entry(
+    let mut entry = maven_entry(
         build_maven_purl(&group_id, &artifact_id, &version),
         record,
         plan.jar_rel.clone(),
         &jar_bytes,
         wiring,
     );
+    entry.ecosystem = "jvm".to_string();
     done(result, Some(entry), warnings)
 }
 
-/// A legacy jar refusal in the JVM backend's codes (§8.2).
+/// Verify upstream cache/registry bytes against checksums fetched independently over TLS.
+fn verify_unpatched_jar_members(
+    upstream: &[u8],
+    patched: &[u8],
+    record: &PatchRecord,
+) -> Result<(), String> {
+    let mut original = super::verify::read_zip_bytes_to_map(upstream)?;
+    let mut committed = super::verify::read_zip_bytes_to_map(patched)?;
+    let retain = |name: &String, _: &mut Vec<u8>| {
+        !record.files.contains_key(name) && !super::jvm::archive::is_signature(name)
+    };
+    original.retain(retain);
+    committed.retain(retain);
+    if original != committed {
+        return Err(
+            "committed jar's unpatched members differ from the verified upstream jar".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Check registry sidecars independently of any checksum in the local cache.
+async fn verify_jvm_upstream(
+    bytes: &[u8],
+    g: &str,
+    a: &str,
+    v: &str,
+    ext: &str,
+    service: Option<&VendorServiceConfig>,
+) -> Result<(), String> {
+    if service.is_none_or(|s| s.offline) {
+        return Ok(());
+    }
+    use sha2::Digest;
+    let url = format!(
+        "{}/{gpath}/{a}/{v}/{a}-{v}.{ext}",
+        maven_registry_base(),
+        gpath = group_id_to_path(g)
+    );
+    let (checksum, actual) = match fetch_pom_bytes(&format!("{url}.sha512")).await {
+        Ok(sum) => (sum, hex::encode(sha2::Sha512::digest(bytes))),
+        Err(_) => (
+            fetch_pom_bytes(&format!("{url}.sha1")).await?,
+            sha1_hex(bytes),
+        ),
+    };
+    let expected = std::str::from_utf8(&checksum)
+        .map_err(|_| "upstream checksum is not UTF-8")?
+        .split_whitespace()
+        .next()
+        .ok_or("upstream checksum is empty")?;
+    if !expected.eq_ignore_ascii_case(&actual) {
+        return Err(format!("upstream checksum mismatch for {g}:{a}:{v}.{ext}"));
+    }
+    Ok(())
+}
+
+async fn acquire_jvm_metadata(
+    dir: &Path,
+    g: &str,
+    a: &str,
+    v: &str,
+    ext: &str,
+    service: Option<&VendorServiceConfig>,
+) -> Result<Vec<u8>, String> {
+    let path = dir.join(format!("{a}-{v}.{ext}"));
+    let bytes = match read_regular_to_bytes(&path).await {
+        Ok(bytes) => bytes,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound && service.is_some_and(|s| !s.offline) =>
+        {
+            fetch_registry_bytes(
+                &format!(
+                    "{}/{}/{a}/{v}/{a}-{v}.{ext}",
+                    maven_registry_base(),
+                    group_id_to_path(g)
+                ),
+                if ext == "jar" {
+                    super::registry_fetch::MAX_DOWNLOAD_BYTES
+                } else {
+                    MAX_POM_BYTES as u64
+                },
+            )
+            .await?
+        }
+        Err(e) => return Err(format!("upstream {g}:{a}:{v}.{ext} unavailable: {e}")),
+    };
+    verify_jvm_upstream(&bytes, g, a, v, ext, service).await?;
+    Ok(bytes)
+}
+
+/// Collect effective parent/BOM metadata. Descendant properties override parent
+/// import versions, but do not leak into a separately imported BOM's own model.
+async fn collect_gradle_metadata(
+    bytes: &[u8],
+    repo: &Path,
+    service: Option<&VendorServiceConfig>,
+    out: &mut Vec<super::jvm::gradle::MetadataArtifact>,
+    depth: usize,
+    descendant: &std::collections::BTreeMap<String, String>,
+    propagate_properties: bool,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    use super::jvm::maven_reactor::metadata_model;
+    if depth > 32 || out.len() > 128 {
+        return Err("upstream metadata graph exceeds the depth or size limit".into());
+    }
+    let empty = std::collections::BTreeMap::new();
+    let model = metadata_model(bytes, &empty, descendant, false)?;
+    let mut properties = empty;
+    if let Some((g, a, v)) = model.parent {
+        let path = repo.join(group_id_to_path(&g)).join(&a).join(&v);
+        let parent = acquire_jvm_metadata(&path, &g, &a, &v, "pom", service).await?;
+        let child_properties = model
+            .properties
+            .into_iter()
+            .filter(|(key, _)| {
+                propagate_properties
+                    && !matches!(
+                        key.as_str(),
+                        "project.groupId" | "project.artifactId" | "project.version"
+                    )
+            })
+            .collect();
+        properties = Box::pin(collect_gradle_metadata(
+            &parent,
+            repo,
+            service,
+            out,
+            depth + 1,
+            &child_properties,
+            propagate_properties,
+        ))
+        .await?;
+        collect_metadata_artifacts(repo, &g, &a, &v, parent, service, out).await?;
+    }
+    let model = metadata_model(bytes, &properties, descendant, true)?;
+    for (g, a, v) in model.imports {
+        if out
+            .iter()
+            .any(|m| m.group == g && m.artifact == a && m.version == v && m.extension == "pom")
+        {
+            continue;
+        }
+        let path = repo.join(group_id_to_path(&g)).join(&a).join(&v);
+        let bom = acquire_jvm_metadata(&path, &g, &a, &v, "pom", service).await?;
+        Box::pin(collect_gradle_metadata(
+            &bom,
+            repo,
+            service,
+            out,
+            depth + 1,
+            &std::collections::BTreeMap::new(),
+            propagate_properties,
+        ))
+        .await?;
+        collect_metadata_artifacts(repo, &g, &a, &v, bom, service, out).await?;
+    }
+    Ok(model.properties)
+}
+
+async fn collect_metadata_artifacts(
+    repo: &Path,
+    g: &str,
+    a: &str,
+    v: &str,
+    pom: Vec<u8>,
+    service: Option<&VendorServiceConfig>,
+    out: &mut Vec<super::jvm::gradle::MetadataArtifact>,
+) -> Result<(), String> {
+    if out
+        .iter()
+        .any(|m| m.group == g && m.artifact == a && m.version == v)
+    {
+        return Ok(());
+    }
+    let module = if String::from_utf8_lossy(&pom).contains("published-with-gradle-metadata") {
+        let path = repo.join(group_id_to_path(g)).join(a).join(v);
+        Some(acquire_jvm_metadata(&path, g, a, v, "module", service).await?)
+    } else {
+        None
+    };
+    for (extension, bytes) in [("pom", Some(pom)), ("module", module)] {
+        if let Some(bytes) = bytes {
+            out.push(super::jvm::gradle::MetadataArtifact {
+                group: g.into(),
+                artifact: a.into(),
+                version: v.into(),
+                extension,
+                bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A legacy jar refusal in the JVM backend's codes.
 fn jvm_refusal(outcome: VendorOutcome) -> VendorOutcome {
     match outcome {
         VendorOutcome::Refused {
@@ -1168,6 +1630,10 @@ async fn acquire_upstream_pom(
 
 /// Bounded HTTP GET of a pom from the maven2 registry.
 async fn fetch_pom_bytes(url: &str) -> Result<Vec<u8>, String> {
+    fetch_registry_bytes(url, MAX_POM_BYTES as u64).await
+}
+
+async fn fetch_registry_bytes(url: &str, cap: u64) -> Result<Vec<u8>, String> {
     let client = reqwest::Client::builder()
         .user_agent(MAVEN_USER_AGENT)
         .timeout(Duration::from_secs(60))
@@ -1185,7 +1651,7 @@ async fn fetch_pom_bytes(url: &str) -> Result<Vec<u8>, String> {
     // bytes (the shared reader every other registry download uses): a
     // mirror serving a huge body is refused mid-stream instead of being
     // buffered whole before the size check.
-    crate::utils::http::read_capped(resp, MAX_POM_BYTES as u64, "pom")
+    crate::utils::http::read_capped(resp, cap, "Maven artifact")
         .await
         .map_err(|e| format!("{url}: {e}"))
 }
@@ -2210,7 +2676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_multimodule_root() {
+    async fn missing_reactor_module_is_refused_without_writes() {
         let multimodule = "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n\
              \x20 <modelVersion>4.0.0</modelVersion>\n\
              \x20 <groupId>com.example</groupId>\n\
@@ -2224,7 +2690,7 @@ mod tests {
         let (dir, blobs, installed, record) = fixture(Some(multimodule), true, true).await;
         let root = dir.path();
         let (code, _d) = unwrap_refused(run_vendor(root, &blobs, &installed, &record, false).await);
-        assert_eq!(code, "vendor_maven_multimodule_unsupported");
+        assert_eq!(code, "vendor_jvm_shape_unsupported");
         assert!(!root.join(".socket").exists(), "refusal writes nothing");
     }
 
@@ -2250,16 +2716,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_gradle_only_project() {
+    async fn vendors_gradle_only_project_by_default() {
         // build.gradle but no pom.xml → gradle-only.
         let (dir, blobs, installed, record) = fixture(None, true, true).await;
         let root = dir.path();
         tokio::fs::write(root.join("build.gradle"), b"plugins { id 'java' }\n")
             .await
             .unwrap();
-        let (code, _d) = unwrap_refused(run_vendor(root, &blobs, &installed, &record, false).await);
-        assert_eq!(code, "vendor_gradle_unsupported");
-        assert!(!root.join(".socket").exists());
+        let (result, entry, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(entry.unwrap().ecosystem, "jvm");
+        assert!(root.join(".socket/vendor/gradle-index.tsv").is_file());
     }
 
     #[tokio::test]
@@ -3093,6 +3561,7 @@ mod tests {
     ) -> VendorServiceConfig {
         use crate::api::client::{ApiClient, ApiClientOptions};
         VendorServiceConfig {
+            maven_config: None,
             source,
             client: api_url.map(|uri| {
                 ApiClient::new(ApiClientOptions {
@@ -4527,7 +4996,62 @@ mod tests {
         assert!(!root.join(".socket").exists(), "nothing written");
     }
 
-    // ── prototype JVM backend glue ──
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn jvm_upstream_checksums_are_independent_of_cache_sidecars() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let _reg = EnvGuard::set("SOCKET_MAVEN_REGISTRY", &server.uri());
+        let cfg = service_cfg(None, crate::vendor::VendorSource::Build, false);
+        let bytes = b"upstream";
+        let route = "/org/example/foo/1/foo-1.jar";
+        Mock::given(method("GET"))
+            .and(path(format!("{route}.sha512")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(hex::encode(sha2::Sha512::digest(bytes))),
+            )
+            .mount(&server)
+            .await;
+        assert!(
+            verify_jvm_upstream(bytes, "org.example", "foo", "1", "jar", Some(&cfg))
+                .await
+                .is_ok()
+        );
+        assert!(
+            verify_jvm_upstream(b"corrupt", "org.example", "foo", "1", "jar", Some(&cfg))
+                .await
+                .unwrap_err()
+                .contains("checksum mismatch")
+        );
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path(format!("{route}.sha1")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sha1_hex(bytes)))
+            .mount(&server)
+            .await;
+        assert!(
+            verify_jvm_upstream(bytes, "org.example", "foo", "1", "jar", Some(&cfg))
+                .await
+                .is_ok()
+        );
+        server.reset().await;
+        assert!(
+            verify_jvm_upstream(bytes, "org.example", "foo", "1", "jar", Some(&cfg))
+                .await
+                .is_err()
+        );
+        let mut offline = cfg;
+        offline.offline = true;
+        assert!(
+            verify_jvm_upstream(bytes, "org.example", "foo", "1", "jar", Some(&offline))
+                .await
+                .is_ok()
+        );
+    }
+
+    // ── JVM backend glue ──
 
     const REACTOR_ROOT: &str = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  \
         <groupId>t</groupId>\n  <artifactId>root</artifactId>\n  <version>1</version>\n  \
@@ -4551,6 +5075,37 @@ mod tests {
             .await
             .unwrap();
         fx
+    }
+
+    #[tokio::test]
+    async fn corrupt_jvm_ledger_refuses_without_losing_revert_records() {
+        let (dir, blobs, installed, record) = reactor_fixture(true).await;
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
+        std::fs::write(root.join(".socket/vendor/state.json"), "{corrupt").unwrap();
+        let (code, _) = unwrap_refused(run_jvm(root, &blobs, &installed, &record, None).await);
+        assert_eq!(code, "vendor_state_unreadable");
+        assert_eq!(
+            std::fs::read_to_string(root.join("pom.xml")).unwrap(),
+            REACTOR_ROOT
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap(),
+            "{corrupt"
+        );
+        assert!(!root.join(".socket/vendor/maven2").exists());
+    }
+
+    #[tokio::test]
+    async fn empty_jvm_patch_still_validates_the_reactor_layout() {
+        let (dir, blobs, installed, mut record) = reactor_fixture(true).await;
+        record.files.clear();
+        std::fs::remove_file(dir.path().join("a/pom.xml")).unwrap();
+        let (code, detail) =
+            unwrap_refused(run_jvm(dir.path(), &blobs, &installed, &record, None).await);
+        assert_eq!(code, "vendor_jvm_shape_unsupported");
+        assert!(detail.contains("module"), "{detail}");
+        assert!(!dir.path().join(".socket").exists());
     }
 
     async fn run_jvm(
@@ -4649,7 +5204,7 @@ mod tests {
     }
 
     /// A forged JVM entry (tamper-able state.json) is refused before any
-    /// disk access, whatever the experimental switch says.
+    /// disk access.
     #[tokio::test]
     async fn jvm_revert_refuses_forged_entries() {
         let dir = tempfile::tempdir().unwrap();
@@ -4726,15 +5281,13 @@ mod tests {
         );
     }
 
-    /// A project the prototype vendored keeps routing to it once the
+    /// A previously vendored project keeps routing to the JVM backend when the
     /// switch is unset (its ledger names a JVM entry).
     #[tokio::test]
     async fn jvm_routing_follows_the_ledger() {
         let (dir, blobs, installed, record) = reactor_fixture(true).await;
         let root = dir.path();
-        if !super::super::jvm::experimental_enabled() {
-            assert!(jvm_shape(root).await.is_none());
-        }
+        assert!(jvm_shape(root).await.is_some());
         let (_, entry, _) = unwrap_done(run_jvm(root, &blobs, &installed, &record, None).await);
         let mut state = super::super::state::VendorState::new();
         state.entries.insert(PURL.to_string(), entry.unwrap());

@@ -217,6 +217,8 @@ fn vendor_args(cwd: &Path) -> VendorArgs {
         },
         force: false,
         revert: false,
+        check: false,
+        local_repo: None,
         vex: Default::default(),
     }
 }

@@ -265,6 +265,8 @@ impl VendorSource {
 /// "build-only".
 #[derive(Debug, Clone)]
 pub struct VendorServiceConfig {
+    /// Override Maven config wiring; None preserves the recorded choice (auto for new projects).
+    pub maven_config: Option<bool>,
     /// The `auto` / `service` / `build` policy.
     pub source: VendorSource,
     /// The run-level API client (reused from the CLI). `None` disables the

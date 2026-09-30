@@ -398,7 +398,6 @@ fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
 /// [`read_wheel_to_map`] over in-memory zip bytes — the same entry and
 /// decompressed-size caps — for callers that hash and decode the SAME
 /// buffer (a committed wheel read exactly once).
-#[cfg(test)]
 pub(crate) fn read_zip_bytes_to_map(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, String> {
     read_zip_to_map(std::io::Cursor::new(bytes), false)
 }

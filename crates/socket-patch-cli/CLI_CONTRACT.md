@@ -1711,3 +1711,24 @@ Every item in this document is locked in by at least one of:
 - **Async `run()` integration tests** in `tests/cli_parse_list.rs`, `tests/cli_parse_remove.rs` — exercise the no-network error paths and assert JSON shape via `serde_json::from_str::<Value>` + per-key assertions.
 
 If you add a new flag/subcommand/JSON key, add a test here that locks the new surface in the same PR.
+
+
+### Vendored JVM support (v5)
+
+Maven reactors and Gradle 6.8+ route to the JVM backend automatically. Ledger
+entries use ecosystem `jvm` with Maven PURLs. Revert, remove, rollback and repair
+share the v5 vendored backend; existing prototype wiring remains readable.
+See [the JVM design](../../docs/design/maven-vendoring.md) for supported shapes.
+
+`vendor --check` is an offline, read-only audit. Healthy entries emit `verified`
+with `vendor_check_ok`; drift emits `failed` with `vendor_check_failed`, a
+`partialFailure` envelope and exit 1. Missing ledger entries fail with
+`vendor_ledger_missing`. Offline upstream metadata is reported as the run warning
+`vendor_jvm_upstream_unverified`. The check never starts an API client or writes
+lock/recovery files. `--check` conflicts with `--revert`.
+
+`vendor --check --local-repo <path>` additionally checks existing suffixed Maven
+jar/POM copies for conflicting bytes. `--maven-config auto|none` is a global
+vendoring option so scan/get/repair receive it too; omission preserves the
+ledger's recorded choice. Switching existing auto-config wiring to `none`
+requires reverting it first. `none` cannot be combined with a repository ban.

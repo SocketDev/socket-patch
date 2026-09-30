@@ -237,6 +237,7 @@ fn global_flag_cases_cover_every_global_field() {
         vendor_source: _,
         vendor_url: _,
         patch_server_url: _,
+        maven_config: _,
     } = common;
 
     // 26 fields ↔ 26 long-flag cases. Bump both this count and add a case when
@@ -767,7 +768,11 @@ fn empty_nonbool_env_vars_do_not_crash_the_binary() {
         envelope["status"], "success",
         "blank env vars must fall back to defaults: {envelope}",
     );
-    assert_eq!(out.status.code(), Some(0), "an empty project lists with exit 0");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an empty project lists with exit 0"
+    );
 }
 
 /// `save_and_clear_global_env` must clear **every** env var `GlobalArgs`

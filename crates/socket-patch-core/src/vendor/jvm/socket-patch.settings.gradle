@@ -43,16 +43,17 @@ socketListed.each { String dir, Set names ->
   if (extra) { socketFail("unindexed files in ${dir}: ${extra}") }
 }
 def socketName = 'socketPatchVendor'
+def socketOwned = { ArtifactRepository r -> r.name == socketName || r.name.startsWith(socketName + '_') }
 def socketWire = { RepositoryHandler repos ->
-  if (repos.findByName(socketName) != null) { return }
+  if (repos.any(socketOwned)) { return }
   repos.exclusiveContent {
     forRepository { repos.maven { name = socketName; url = socketRepoDir.toURI() } }
     filter { socketModules.values().each { m -> includeVersion(m[0], m[1], m[2]) } }
   }
 }
 def socketFollow = { RepositoryHandler repos ->
-  if (repos.any { it.name != socketName }) { socketWire(repos) }
-  repos.whenObjectAdded { ArtifactRepository r -> if (r.name != socketName) { socketWire(repos) } }
+  if (repos.any { !socketOwned(it) }) { socketWire(repos) }
+  repos.whenObjectAdded { ArtifactRepository r -> if (!socketOwned(r)) { socketWire(repos) } }
 }
 def socketDrm = settings.dependencyResolutionManagement
 socketWire(socketDrm.repositories)
