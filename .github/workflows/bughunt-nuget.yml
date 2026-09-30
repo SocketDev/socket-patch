@@ -38,7 +38,7 @@ jobs:
           DOTNET_NOLOGO: '1'
           SOCKET_OFFLINE: '1'
         run: |
-          set -u
+          set +e +o pipefail
           SP="$GITHUB_WORKSPACE/target/release/socket-patch"
           W="$RUNNER_TEMP/bh"; rm -rf "$W"; mkdir -p "$W"; cd "$W"
           wp(){ if command -v cygpath >/dev/null; then cygpath -w "$1"; else echo "$1"; fi; }

@@ -927,3 +927,107 @@ fn nuget_vendored_dotnet_restore_then_manifestless_vex() {
         None,
     );
 }
+
+#[test]
+#[ignore = "bughunt scratch"]
+fn bughunt_hosted_warm_cache() {
+    let sb = Sandbox::new();
+    let Some(dn) = Dotnet::probe("hosted", &sb) else { return; };
+    let fixture = sb.dir("fixture");
+    let store_fx = sb.dir("store-fixture");
+    let _registry = restore_fixture(&dn, &sb, &fixture, &store_fx);
+    let pristine = std::fs::read(pkg_dir(&store_fx).join(FILE_KEY)).unwrap();
+    let mut patched = pristine.clone();
+    patched.extend_from_slice(MARKER);
+    let upstream = std::fs::read(pkg_dir(&store_fx).join(NUPKG_NAME)).unwrap();
+    let nupkg = patched_nupkg(&upstream, &patched);
+    let backend = Backend::start(HOSTED_UUID, &pristine, &patched, Some(&nupkg));
+    let uri = backend.uri();
+    let (code, env, stderr) = socket_patch(&fixture, &store_fx, &["scan","--mode","hosted","--json","--yes","--api-url",&uri,"--org",ORG,"--api-token","fake-token","--patch-server-url",&uri]);
+    eprintln!("BH scan code={code:?} warnings={:#}\n{stderr}", env["redirect"]);
+    if dn.major >= 9 { allow_http_source(&fixture.join("nuget.config"), HOSTED_UUID); }
+    // Warm cache, locked restore on the same machine.
+    std::fs::remove_dir_all(fixture.join("obj")).ok();
+    let out = dn.restore(&sb, &fixture, &store_fx, &["--locked-mode"]);
+    eprintln!("BH warm locked: status={:?}\n{}", out.status, String::from_utf8_lossy(&out.stdout));
+    // Warm cache, no lockfile.
+    std::fs::remove_file(fixture.join("packages.lock.json")).ok();
+    std::fs::remove_dir_all(fixture.join("obj")).ok();
+    let out = dn.restore(&sb, &fixture, &store_fx, &["-p:RestorePackagesWithLockFile=false"]);
+    eprintln!("BH warm nolock: status={:?}\n{}", out.status, String::from_utf8_lossy(&out.stdout));
+    let now = std::fs::read(pkg_dir(&store_fx).join(FILE_KEY)).unwrap();
+    eprintln!("BH warm nolock installed patched? {} ; socket feed nupkg hits={}", now == patched, backend.hits(&format!("/{NUPKG_NAME}")));
+    let assets = std::fs::read_to_string(fixture.join("obj/project.assets.json")).unwrap_or_default();
+    eprintln!("BH assets mentions packageFolders: {}", assets.contains("store-fixture"));
+}
+
+#[test]
+#[ignore = "bughunt scratch"]
+fn bughunt_hosted_subdir_lock() {
+    let sb = Sandbox::new();
+    let Some(dn) = Dotnet::probe("hosted", &sb) else { return; };
+    let fixture = sb.dir("fixture");
+    let store_fx = sb.dir("store-fixture");
+    let _registry = restore_fixture(&dn, &sb, &fixture, &store_fx);
+    let sub = fixture.join("src/App");
+    std::fs::create_dir_all(&sub).unwrap();
+    for f in ["app.csproj", "packages.lock.json"] { std::fs::rename(fixture.join(f), sub.join(f)).unwrap(); }
+    std::fs::rename(fixture.join("obj"), sub.join("obj")).unwrap();
+    let before = std::fs::read_to_string(sub.join("packages.lock.json")).unwrap();
+    let pristine = std::fs::read(pkg_dir(&store_fx).join(FILE_KEY)).unwrap();
+    let mut patched = pristine.clone();
+    patched.extend_from_slice(MARKER);
+    let upstream = std::fs::read(pkg_dir(&store_fx).join(NUPKG_NAME)).unwrap();
+    let nupkg = patched_nupkg(&upstream, &patched);
+    let backend = Backend::start(HOSTED_UUID, &pristine, &patched, Some(&nupkg));
+    let uri = backend.uri();
+    let (code, env, stderr) = socket_patch(&fixture, &store_fx, &["scan","--mode","hosted","--json","--yes","--api-url",&uri,"--org",ORG,"--api-token","fake-token","--patch-server-url",&uri]);
+    eprintln!("BH scan code={code:?} redirect={:#}\n{stderr}", env["redirect"]);
+    let after = std::fs::read_to_string(sub.join("packages.lock.json")).unwrap();
+    eprintln!("BH sub lock changed? {}", before != after);
+    let co = sb.dir("checkout");
+    copy_tree(&fixture, &co);
+    std::fs::remove_dir_all(co.join("src/App/obj")).ok();
+    if dn.major >= 9 { allow_http_source(&co.join("nuget.config"), HOSTED_UUID); }
+    let store_co = sb.dir("store-co");
+    let out = dn.restore(&sb, &co.join("src/App"), &store_co, &["--locked-mode"]);
+    eprintln!("BH cold locked restore: {:?}\n{}", out.status, String::from_utf8_lossy(&out.stdout));
+}
+
+#[test]
+#[ignore = "bughunt scratch"]
+fn bughunt_hosted_user_level_source() {
+    let sb = Sandbox::new();
+    let Some(dn) = Dotnet::probe("hosted", &sb) else { return; };
+    let fixture = sb.dir("fixture");
+    let store_fx = sb.dir("store-fixture");
+    let _registry = restore_fixture(&dn, &sb, &fixture, &store_fx);
+    // user-level config with a corp folder feed
+    let feed = sb.dir("corpfeed");
+    std::fs::copy("/tmp/claude-0/Corp.Lib.1.0.0.nupkg", feed.join("Corp.Lib.1.0.0.nupkg")).unwrap();
+    let ucfg = sb.root().join("home/.nuget/NuGet");
+    std::fs::create_dir_all(&ucfg).unwrap();
+    std::fs::write(ucfg.join("NuGet.Config"), format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration><packageSources><add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" /><add key=\"corp\" value=\"{}\" /></packageSources></configuration>\n", feed.display())).unwrap();
+    std::fs::remove_file(fixture.join("nuget.config")).unwrap();
+    let cs = std::fs::read_to_string(fixture.join("app.csproj")).unwrap();
+    let cs = cs.replacen("<PackageReference ", "<PackageReference Include=\"Corp.Lib\" Version=\"1.0.0\" /><PackageReference ", 1);
+    std::fs::write(fixture.join("app.csproj"), cs).unwrap();
+    std::fs::remove_file(fixture.join("packages.lock.json")).unwrap();
+    dn.restore_ok(&sb, &fixture, &store_fx, &[], "re-restore with corp");
+    let pristine = std::fs::read(pkg_dir(&store_fx).join(FILE_KEY)).unwrap();
+    let mut patched = pristine.clone();
+    patched.extend_from_slice(MARKER);
+    let upstream = std::fs::read(pkg_dir(&store_fx).join(NUPKG_NAME)).unwrap();
+    let nupkg = patched_nupkg(&upstream, &patched);
+    let backend = Backend::start(HOSTED_UUID, &pristine, &patched, Some(&nupkg));
+    let uri = backend.uri();
+    let (code, env, _stderr) = socket_patch(&fixture, &store_fx, &["scan","--mode","hosted","--json","--yes","--api-url",&uri,"--org",ORG,"--api-token","fake-token","--patch-server-url",&uri]);
+    eprintln!("BH scan code={code:?} redirect={}", env["redirect"]);
+    eprintln!("BH config:\n{}", std::fs::read_to_string(fixture.join("nuget.config")).unwrap_or_default());
+    let co = sb.dir("checkout");
+    fresh_checkout(&fixture, &co);
+    if dn.major >= 9 { allow_http_source(&co.join("nuget.config"), HOSTED_UUID); }
+    let store_co = sb.dir("store-co");
+    let out = dn.restore(&sb, &co, &store_co, &["--locked-mode"]);
+    eprintln!("BH cold locked restore: {:?}\n{}", out.status, String::from_utf8_lossy(&out.stdout));
+}
