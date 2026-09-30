@@ -1,0 +1,99 @@
+name: bughunt-pdm probe
+on:
+  push:
+    branches: ['bughunt/pdm/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      PDM_CHECK_UPDATE: 'false'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - run: cargo build -p socket-patch-cli
+      - name: Probe PDM install.cache symlink write-through
+        shell: bash
+        run: |
+          cat > probe.py <<'PY'
+          import base64, hashlib, json, os, subprocess, sys, threading, glob, shutil
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          PDM, METHOD, W, SP = sys.argv[1], sys.argv[2], os.path.abspath(sys.argv[3]), os.path.abspath(sys.argv[4])
+          UUID = "11111111-2222-4333-8444-555555555555"; PURL = "pkg:pypi/urllib3@1.26.18"
+          def gh(b): return hashlib.sha256(b"blob %d\0" % len(b) + b).hexdigest()
+          ST = {}
+          class H(BaseHTTPRequestHandler):
+              def log_message(self, *a): pass
+              def j(self, o):
+                  b = json.dumps(o).encode(); self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
+              def do_POST(self):
+                  self.rfile.read(int(self.headers.get("content-length", 0)))
+                  if self.path.endswith("/patches/batch"):
+                      return self.j({"packages": [{"purl": PURL, "patches": [{"uuid": UUID, "purl": PURL, "tier": "free", "cveIds": [], "ghsaIds": [], "severity": "high", "title": "mock"}]}], "canAccessPaidPatches": False})
+                  self.send_response(404); self.end_headers()
+              def do_GET(self):
+                  o, p = ST["orig"], ST["patched"]
+                  if "/patches/by-package/" in self.path:
+                      return self.j({"patches": [{"uuid": UUID, "purl": PURL, "publishedAt": "2024-01-01T00:00:00Z", "description": "x", "license": "MIT", "tier": "free", "vulnerabilities": {}}], "canAccessPaidPatches": False})
+                  if self.path.endswith("/patches/view/" + UUID):
+                      return self.j({"uuid": UUID, "purl": PURL, "publishedAt": "2024-01-01T00:00:00Z", "files": {"urllib3/response.py": {"beforeHash": gh(o), "afterHash": gh(p), "blobContent": base64.b64encode(p).decode()}}, "vulnerabilities": {}, "description": "mock", "license": "MIT", "tier": "free"})
+                  if "/patches/blob/" in self.path:
+                      h = self.path.rsplit("/", 1)[1]
+                      for b in (o, p):
+                          if gh(b) == h:
+                              self.send_response(200); self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+                  self.send_response(404); self.end_headers()
+          srv = ThreadingHTTPServer(("127.0.0.1", 0), H); threading.Thread(target=srv.serve_forever, daemon=True).start()
+          API = "http://127.0.0.1:%d" % srv.server_address[1]
+          shutil.rmtree(W, ignore_errors=True); os.makedirs(W + "/home")
+          env = dict(os.environ, HOME=W + "/home", USERPROFILE=W + "/home", PDM_HOME=W + "/pdmhome", PDM_CACHE_DIR=W + "/pdmcache", PDM_CHECK_UPDATE="false", SOCKET_NO_CONFIG="1", SOCKET_NO_UPDATE_CHECK="1")
+          env.pop("VIRTUAL_ENV", None)
+          def run(cmd, cwd, check=True):
+              r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+              if check and r.returncode: print("FAILED", cmd, r.stdout[-1500:], r.stderr[-1500:]); sys.exit(2)
+              return r
+          for k, v in [("install.cache", "true"), ("install.cache_method", METHOD), ("venv.in_project", "true")]:
+              run([PDM, "config", k, v], W)
+          for p in "ab":
+              os.makedirs(f"{W}/{p}")
+              open(f"{W}/{p}/pyproject.toml", "w").write(f'[project]\nname = "proj-{p}"\nversion = "0.1.0"\nrequires-python = ">=3.8"\ndependencies = ["urllib3==1.26.18"]\n[tool.pdm]\ndistribution = false\n')
+          run([PDM, "lock"], W + "/a"); run([PDM, "sync"], W + "/a")
+          def sp(p): return (glob.glob(f"{W}/{p}/.venv/lib/python3*/site-packages") + glob.glob(f"{W}/{p}/.venv/Lib/site-packages"))[0]
+          pkg = os.path.join(sp("a"), "urllib3")
+          print("site-packages/urllib3 is symlink:", os.path.islink(pkg), "-> ", os.path.realpath(pkg))
+          target = os.path.join(pkg, "response.py")
+          print("response.py is symlink:", os.path.islink(target))
+          ST["orig"] = open(target, "rb").read(); ST["patched"] = ST["orig"] + b"\n# SOCKET-MOCK-MARKER\n"
+          cache = [f for f in glob.glob(W + "/pdmcache/**/urllib3/response.py", recursive=True)]
+          print("cache copies:", cache)
+          common = ["--api-url", API, "--api-token", "fake", "--org", "test"]
+          r = run([SP, "scan", "--mode", "agent", "--json", "--yes", "--ecosystems", "pypi"] + common, W + "/a", check=False)
+          print("scan exit", r.returncode, "apply:", json.loads(r.stdout[r.stdout.find("{"):]).get("apply", {}).get("applied"))
+          mk = lambda f: b"SOCKET-MOCK-MARKER" in open(f, "rb").read()
+          print("a patched:", mk(target), "| cache patched:", [mk(c) for c in cache])
+          shutil.copy(W + "/a/pdm.lock", W + "/b/pdm.lock"); run([PDM, "sync"], W + "/b")
+          tb = os.path.join(sp("b"), "urllib3", "response.py")
+          print("b (never scanned, no .socket:", not os.path.exists(W + "/b/.socket"), ") patched:", mk(tb))
+          VERDICT = "BUG" if any(mk(c) for c in cache) or mk(tb) else "OK"
+          print("VERDICT", VERDICT)
+          PY
+          cli=target/debug/socket-patch; [ "$RUNNER_OS" = Windows ] && cli=target/debug/socket-patch.exe
+          for v in 2.8.2 2.12.4 2.15.4 2.29.2; do
+            for m in symlink hardlink; do
+              python -m venv "pdm-$v"
+              if [ "$RUNNER_OS" = Windows ]; then pdm="pdm-$v/Scripts/pdm.exe"; py="pdm-$v/Scripts/python.exe"; else pdm="pdm-$v/bin/pdm"; py="pdm-$v/bin/python"; fi
+              "$py" -m pip install -q "pdm==$v" >/dev/null 2>&1 || { echo "install pdm $v failed"; continue; }
+              echo "################ $RUNNER_OS PDM $v cache_method=$m"
+              python probe.py "$PWD/$pdm" "$m" "$RUNNER_TEMP/w-$v-$m" "$PWD/$cli" || echo "probe exit $?"
+            done
+          done
