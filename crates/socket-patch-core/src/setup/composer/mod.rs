@@ -21,7 +21,10 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use tokio::fs;
 
-use crate::vendor::common::{detect_indent, serialize_json};
+use crate::patch::redirect::composer_source::{top_level_members, value_end_at};
+use crate::utils::line_endings::{majority_terminator, LineEndings};
+use crate::vendor::common::{detect_indent, JsonLayout};
+use crate::vendor::composer_lock::lock_text::render_in_style_of;
 
 /// The command `setup` appends to each composer script event. The socket-patch
 /// CLI is invoked from `PATH` (composer has no `npx`-style fetch), offline (the
@@ -115,27 +118,103 @@ fn parse_checked(content: &str) -> Result<Value, String> {
     Ok(doc)
 }
 
-/// Re-serialize the edited document in the formatting the file already used.
+/// `original` with its top-level `scripts` member set to `scripts` (`None`
+/// deletes it), every other byte left alone.
 ///
-/// Composer writes `composer.json` through PHP's `JSON_PRETTY_PRINT`, which
-/// indents with 4 spaces, while serde's `to_string_pretty` is hard-wired to 2 —
-/// so re-serializing turned a two-key edit into a whole-file diff and left
-/// `--remove` unable to restore the original bytes. `detect_indent` /
-/// `serialize_json` are the same helpers the vendor backends use when they
-/// rewrite composer.json and the lockfiles. A file saved without a trailing
-/// newline keeps that too, since `serialize_json` always appends one.
+/// Composer writes `composer.json` through PHP's `JSON_PRETTY_PRINT` (4-space
+/// indent, `\/` and `\uXXXX` escapes by default), and users commit it with
+/// CRLF too. Re-serializing the whole document through serde reformatted all
+/// of that, so `setup` produced a whole-file diff and `--remove` could not
+/// restore the original bytes. Like Composer's own `JsonManipulator`, this
+/// splices only the `scripts` value, rendered in the file's indent, line
+/// ending and escaping. A new `scripts` is appended as the last member, which
+/// is exactly what a later delete takes back out.
+///
+/// Falls back to re-serializing `doc` in the file's [`JsonLayout`] (BOM,
+/// indent, line ending, trailer) when the text has no member to anchor the
+/// splice on (an empty root object, or a leading BOM).
 fn serialize_like_input(doc: &Value, original: &str) -> String {
-    let indent = detect_indent(original);
-    let mut text = match serialize_json(doc, &indent) {
+    let scripts = doc.get("scripts");
+    if let Some(text) = splice_scripts(original, scripts) {
+        return text;
+    }
+    match JsonLayout::of(original).render(doc) {
         // Always valid UTF-8: serde_json emits escaped ASCII/UTF-8 only.
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         // Serializing a `Value` cannot fail; fall back to the 2-space form.
         Err(_) => serde_json::to_string_pretty(doc).unwrap_or_default() + "\n",
-    };
-    if !original.ends_with('\n') {
-        text.pop();
     }
-    text
+}
+
+/// See [`serialize_like_input`]. `None` when the splice has no anchor.
+fn splice_scripts(original: &str, scripts: Option<&Value>) -> Option<String> {
+    let bytes = original.as_bytes();
+    let open = original.find(|c: char| !c.is_ascii_whitespace())?;
+    if bytes[open] != b'{' {
+        return None;
+    }
+    let close = value_end_at(bytes, open, bytes.len())?;
+    let members = top_level_members(original, open, close);
+    let eol = match LineEndings::of(original) {
+        LineEndings::Crlf => "\r\n",
+        LineEndings::Mixed => majority_terminator(original),
+        LineEndings::Lf | LineEndings::None => "\n",
+    };
+    let unit = detect_indent(original);
+    // The indentation of the line a member starts on, when the member
+    // starts its own line.
+    let line_base = |at: usize| -> Option<&str> {
+        let line_start = original[..at].rfind('\n').map_or(0, |i| i + 1);
+        let base = &original[line_start..at];
+        base.bytes()
+            .all(|b| b == b' ' || b == b'\t')
+            .then_some(base)
+    };
+    let render = |value: &Value, base: &str| {
+        render_in_style_of(original, value, &unit, base, eol)
+    };
+    // serde_json keeps the last of a repeated key, so edit that one.
+    let existing = members.iter().rposition(|m| m.key == "scripts");
+    match (existing, scripts) {
+        (Some(i), Some(value)) => {
+            let m = &members[i];
+            let rendered = render(value, line_base(m.key_start)?)?;
+            Some(format!(
+                "{}{rendered}{}",
+                &original[..m.value_start],
+                &original[m.value_end + 1..]
+            ))
+        }
+        (Some(i), None) => {
+            let m = &members[i];
+            let (cut_start, cut_end) = if i > 0 {
+                // `,<ws>"scripts": …` after the previous member.
+                (members[i - 1].value_end + 1, m.value_end + 1)
+            } else if let Some(next) = members.get(1) {
+                // `"scripts": …,<ws>` before the next member.
+                (m.key_start, next.key_start)
+            } else {
+                return None;
+            };
+            Some(format!(
+                "{}{}",
+                &original[..cut_start],
+                &original[cut_end..]
+            ))
+        }
+        (None, Some(value)) => {
+            let last = members.last()?;
+            let base = line_base(last.key_start)?;
+            let rendered = render(value, base)?;
+            let at = last.value_end + 1;
+            Some(format!(
+                "{},{eol}{base}\"scripts\": {rendered}{}",
+                &original[..at],
+                &original[at..]
+            ))
+        }
+        (None, None) => Some(original.to_string()),
+    }
 }
 
 /// Append [`APPLY_COMMAND`] to both hook events, normalising each to an array.
@@ -931,5 +1010,45 @@ mod tests {
                 assert!(!is_hook_present(&rem), "remove left hook for {inp}\n{rem}");
             }
         }
+    }
+
+    /// #351: a CRLF manifest keeps CRLF through `setup`, and `setup --remove`
+    /// restores it byte for byte (Composer's own edits keep CRLF too).
+    #[test]
+    fn test_round_trip_preserves_crlf_line_endings() {
+        let inp = COMPOSER_AUTHORED.replace('\n', "\r\n");
+        let added = composer_add(&inp).unwrap().unwrap();
+        assert!(
+            !added.replace("\r\n", "").contains('\n'),
+            "setup must write the file's CRLF, not LF:\n{added:?}"
+        );
+        assert!(is_hook_present(&added));
+        assert_eq!(composer_remove(&added).unwrap().unwrap(), inp);
+    }
+
+    /// #351: `\/` and `\uXXXX` escapes (PHP `json_encode`'s default) outside
+    /// the edited `scripts` key survive `setup` + `setup --remove`.
+    #[test]
+    fn test_round_trip_preserves_string_escapes() {
+        let inp = "{\n    \"name\": \"acme/app\",\n    \"homepage\": \"https:\\/\\/example.com\",\n    \"description\": \"caf\\u00e9\",\n    \"require\": {}\n}\n";
+        let added = composer_add(inp).unwrap().unwrap();
+        assert!(
+            added.contains("\"https:\\/\\/example.com\"") && added.contains("\"caf\\u00e9\""),
+            "setup must leave untouched values' escapes alone:\n{added}"
+        );
+        assert!(is_hook_present(&added));
+        assert_eq!(composer_remove(&added).unwrap().unwrap(), inp);
+    }
+
+    /// #351, the existing-`scripts` case: only the edited events change, and
+    /// the user's other scripts (and the rest of the file) keep their bytes.
+    #[test]
+    fn test_round_trip_with_user_scripts_keeps_crlf_and_escapes() {
+        let inp = "{\r\n    \"homepage\": \"https:\\/\\/example.com\",\r\n    \"scripts\": {\r\n        \"test\": \"phpunit\"\r\n    },\r\n    \"description\": \"caf\\u00e9\"\r\n}";
+        let added = composer_add(inp).unwrap().unwrap();
+        assert!(!added.replace("\r\n", "").contains('\n'), "{added:?}");
+        assert!(added.starts_with("{\r\n    \"homepage\": \"https:\\/\\/example.com\",\r\n"));
+        assert!(added.ends_with("    \"description\": \"caf\\u00e9\"\r\n}"));
+        assert_eq!(composer_remove(&added).unwrap().unwrap(), inp);
     }
 }

@@ -2863,6 +2863,54 @@ mod tests {
         assert_eq!(e["license"], json!("WTFPL"), "non-dep fields untouched");
     }
 
+    /// #324: vendoring keeps a CRLF, tab-indented or BOM-prefixed lock's
+    /// layout (a BOM lock is read the way npm reads it, not refused), and
+    /// `vendor --revert` restores its original bytes.
+    #[tokio::test]
+    async fn vendor_and_revert_keep_crlf_tab_and_bom_lock_layout() {
+        let lf = String::from_utf8(serialize_json(&default_lock(), "  ").unwrap()).unwrap();
+        let shapes = [
+            ("crlf", lf.replace('\n', "\r\n")),
+            ("tabs", lf.replace("  ", "\t")),
+            ("bom", format!("\u{feff}{lf}")),
+            ("bom+crlf", format!("\u{feff}{}", lf.replace('\n', "\r\n"))),
+        ];
+        for (shape, pristine) in shapes {
+            let fx = fixture().await;
+            tokio::fs::write(fx.lock_path(), &pristine).await.unwrap();
+
+            let (result, entry, _w) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{shape}: {:?}", result.error);
+            let wired = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+            assert_ne!(wired, pristine, "{shape}: the lock must be rewired");
+            assert_eq!(
+                wired.starts_with('\u{feff}'),
+                pristine.starts_with('\u{feff}'),
+                "{shape}: BOM kept"
+            );
+            if pristine.contains("\r\n") {
+                assert!(
+                    !wired.replace("\r\n", "").contains('\n'),
+                    "{shape}: every line stays CRLF:\n{wired:?}"
+                );
+            }
+            if pristine.contains('\t') {
+                assert!(
+                    wired.contains("\n\t\"packages\"") && !wired.contains("\n  "),
+                    "{shape}: tab indent kept:\n{wired}"
+                );
+            }
+
+            let outcome = revert_npm(&entry.unwrap(), fx.root(), false).await;
+            assert!(outcome.success, "{shape}: {:?}", outcome.error);
+            assert_eq!(
+                tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+                pristine,
+                "{shape}: lock restored byte-for-byte"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn revert_round_trips_the_lock_and_removes_the_artifact() {
         let fx = fixture().await;

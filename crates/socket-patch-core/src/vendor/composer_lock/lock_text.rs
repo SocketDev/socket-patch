@@ -38,7 +38,23 @@ pub(super) fn replace_entry(
         LineEndings::Mixed => majority_terminator(current),
         LineEndings::None => majority_terminator(text),
     };
-    let mut rendered = serialize_json(entry, &indent_unit(text, base)).ok()?;
+    let rendered = render_in_style_of(text, entry, &indent_unit(text, base), base, eol)?;
+    Some(format!("{}{rendered}{}", &text[..start], &text[end + 1..]))
+}
+
+/// `value` pretty-printed to be spliced into `text` on a line that starts
+/// with `base`: nested levels indent by `unit`, lines break with `eol`, and
+/// strings follow `text`'s slash and unicode escaping (PHP `json_encode`'s
+/// `\/` and `\uXXXX` defaults), so the spliced value reads like its
+/// neighbours.
+pub(crate) fn render_in_style_of(
+    text: &str,
+    value: &Value,
+    unit: &str,
+    base: &str,
+    eol: &str,
+) -> Option<String> {
+    let mut rendered = serialize_json(value, unit).ok()?;
     rendered.pop();
     let mut rendered = String::from_utf8(rendered).ok()?;
     if escapes_slashes(text) {
@@ -48,9 +64,8 @@ pub(super) fn replace_entry(
         rendered = escape_non_ascii(&rendered);
     }
     // serde_json escapes every newline inside a string, so each `\n` it
-    // emits is a line break of the entry.
-    let rendered = rendered.replace('\n', &format!("{eol}{base}"));
-    Some(format!("{}{rendered}{}", &text[..start], &text[end + 1..]))
+    // emits is a line break of the value.
+    Some(rendered.replace('\n', &format!("{eol}{base}")))
 }
 
 /// Byte span (inclusive) of `lock[section][index]`, counting every array

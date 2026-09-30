@@ -69,7 +69,7 @@ use super::state::{
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
-mod lock_text;
+pub(crate) mod lock_text;
 mod mirror_filters;
 
 /// Project-relative lockfile this backend wires.

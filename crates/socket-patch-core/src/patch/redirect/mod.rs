@@ -13074,6 +13074,43 @@ mod tests {
         );
     }
 
+    /// #324: the hosted npm rewrite changes only the rewired values and keeps
+    /// the lock's layout: CRLF stays CRLF, a tab indent stays tabs, and a
+    /// UTF-8 BOM lock (npm strips the BOM and installs from it) is rewritten
+    /// with its BOM rather than skipped as unparseable.
+    #[test]
+    fn npm_lock_rewrite_keeps_crlf_tabs_and_bom() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let lf = "{\n  \"name\": \"app\",\n  \"lockfileVersion\": 3,\n  \"packages\": {\n    \"\": {\n      \"name\": \"app\"\n    },\n    \"node_modules/left-pad\": {\n      \"version\": \"1.3.0\",\n      \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\",\n      \"integrity\": \"sha512-UPSTREAM==\"\n    }\n  }\n}\n";
+        let shapes = [
+            ("crlf", lf.replace('\n', "\r\n")),
+            ("tabs", lf.replace("  ", "\t")),
+            ("bom", format!("\u{feff}{lf}")),
+            ("bom+crlf+tabs", format!("\u{feff}{}", lf.replace("  ", "\t").replace('\n', "\r\n"))),
+        ];
+        for (shape, pristine) in shapes {
+            let mut files = BTreeMap::new();
+            files.insert("package-lock.json".to_string(), pristine.clone());
+            let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+            let out = r
+                .files
+                .get("package-lock.json")
+                .unwrap_or_else(|| panic!("{shape}: lock must be rewritten: {:?}", r.warnings));
+            let expected = pristine
+                .replace(
+                    "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "http://patch.test/left-pad-1.3.0.tgz",
+                )
+                .replace("sha512-UPSTREAM==", "sha512-PATCHED==");
+            assert_eq!(out, &expected, "{shape}: only the rewired values may change");
+        }
+    }
+
     /// An unparseable package-lock.json must surface a warning, not silently
     /// skip the npm redirect entirely (missing-lockfile already warns; a
     /// corrupt lockfile is strictly worse and was silent).

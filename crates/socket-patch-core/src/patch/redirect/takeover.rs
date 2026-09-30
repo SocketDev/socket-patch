@@ -3539,6 +3539,32 @@ mod tests {
         assert!(state.records.is_empty() && state.edits.is_empty());
     }
 
+    /// #324: `rollback` of a hosted npm redirect puts the lock's original
+    /// bytes back for CRLF, tab-indented and BOM-prefixed locks alike.
+    #[tokio::test]
+    async fn npm_revert_restores_crlf_tab_and_bom_locks_byte_for_byte() {
+        let lf = "{\n  \"name\": \"app\",\n  \"version\": \"1.0.0\",\n  \"lockfileVersion\": 3,\n  \"requires\": true,\n  \"packages\": {\n    \"\": {\n      \"name\": \"app\",\n      \"version\": \"1.0.0\"\n    },\n    \"node_modules/left-pad\": {\n      \"version\": \"1.3.0\",\n      \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\",\n      \"integrity\": \"sha512-pristine==\"\n    }\n  }\n}\n";
+        let shapes = [
+            ("crlf", lf.replace('\n', "\r\n")),
+            ("tabs", lf.replace("  ", "\t")),
+            ("bom", format!("\u{feff}{lf}")),
+        ];
+        for (shape, pristine) in shapes {
+            let (tmp, mut state) = npm_redirected_fixture("package-lock.json", &pristine).await;
+            let root = tmp.path();
+            revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
+                .await
+                .unwrap_or_else(|e| panic!("{shape}: revert must succeed: {e}"));
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("package-lock.json"))
+                    .await
+                    .unwrap(),
+                pristine,
+                "{shape}: package-lock.json restored byte-identical"
+            );
+        }
+    }
+
     /// The version-scoped claim must not soften the fail-closed contract: a
     /// lock entry that VANISHED after being redirected still refuses (its
     /// edit is attributed by key path + recorded URLs), never a silent
