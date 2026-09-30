@@ -69,6 +69,7 @@ def doh_resolve(host, template, timeout):
 def verified(host, address, timeout):
     """A TLS handshake to `address` with SNI `host` verifies `host`'s cert."""
     context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     try:
         with socket.create_connection((address, 443), timeout=timeout) as raw:
             with context.wrap_socket(raw, server_hostname=host):

@@ -59,6 +59,16 @@ class PinSocketHostsTests(unittest.TestCase):
             self.assertEqual(run(lambda: pin.resolve(HOST, 60, 1)), ['172.66.3.58'])
         sleep.assert_called_once()
 
+    def test_verification_handshake_refuses_tls_below_1_2(self):
+        with patch.object(pin.socket, 'create_connection') as connect, \
+                patch.object(pin.ssl, 'create_default_context') as make_context:
+            self.assertTrue(pin.verified(HOST, '172.66.3.58', 5))
+        context = make_context.return_value
+        self.assertEqual(context.minimum_version, pin.ssl.TLSVersion.TLSv1_2)
+        connect.assert_called_once_with(('172.66.3.58', 443), timeout=5)
+        context.wrap_socket.assert_called_once_with(
+            connect.return_value.__enter__.return_value, server_hostname=HOST)
+
     def test_main_prints_hosts_lines_and_fails_closed(self):
         out = io.StringIO()
         with patch.object(pin, 'resolve', return_value=['172.66.3.58']), \
