@@ -1,0 +1,135 @@
+name: bughunt pipenv probe
+
+on:
+  push:
+    branches: ['bughunt/pipenv/**']
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        pipenv: ['2023.12.1', '2026.8.0']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      SOCKET_NO_CONFIG: '1'
+      SOCKET_NO_UPDATE_CHECK: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: bughunt-pipenv
+          save-if: false
+      - run: cargo build --locked -p socket-patch-cli
+      - name: Install Pipenv
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/pipenv-venv"
+          if [ -x "$RUNNER_TEMP/pipenv-venv/Scripts/python.exe" ]; then PY="$RUNNER_TEMP/pipenv-venv/Scripts/python.exe"; P="$RUNNER_TEMP/pipenv-venv/Scripts/pipenv.exe"; else PY="$RUNNER_TEMP/pipenv-venv/bin/python"; P="$RUNNER_TEMP/pipenv-venv/bin/pipenv"; fi
+          "$PY" -m pip install -q "pipenv==${{ matrix.pipenv }}"
+          echo "PIPENV_BIN=$P" >> "$GITHUB_ENV"
+          echo "BASE_PY=$(python -c 'import sys;print(sys.executable)')" >> "$GITHUB_ENV"
+      - name: Probe
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/probe.py" <<'PROBE_EOF'
+          import base64, hashlib, io, json, os, shutil, subprocess, sys, tempfile, threading, urllib.request, zipfile
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          CLI = os.path.abspath(sys.argv[1]); PIPENV = sys.argv[2]; PY = sys.argv[3]
+          UUID = "3c5e7a9b-1d3f-4b5d-8f7a-9b1d3f5a7c9e"
+          WHL = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl"
+          RAW = urllib.request.urlopen(WHL).read()
+          before = zipfile.ZipFile(io.BytesIO(RAW)).read("six.py")
+          after = before + b"\n# SOCKET-PATCHED\nSOCKET_PATCHED = 1\n"
+          def build():
+              zin = zipfile.ZipFile(io.BytesIO(RAW)); out = io.BytesIO(); zout = zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED)
+              rec = [n for n in zin.namelist() if n.endswith(".dist-info/RECORD")][0]; lines = []
+              for n in zin.namelist():
+                  if n == rec: continue
+                  d = after if n == "six.py" else zin.read(n); zout.writestr(n, d)
+                  lines.append("%s,sha256=%s,%d" % (n, base64.urlsafe_b64encode(hashlib.sha256(d).digest()).rstrip(b"=").decode(), len(d)))
+              lines.append(rec + ",,"); zout.writestr(rec, "\n".join(lines) + "\n"); zout.close(); return out.getvalue()
+          g = lambda b: hashlib.sha256(b"blob %d\0" % len(b) + b).hexdigest()
+          API_PURL = "pkg:pypi/six@1.16.0?artifact_id=py2-py3-none-any-whl"
+          VIEW = {"uuid": UUID, "purl": API_PURL, "publishedAt": "2026-09-01T00:00:00Z",
+                  "files": {"six.py": {"beforeHash": g(before), "afterHash": g(after), "blobContent": base64.b64encode(after).decode()}},
+                  "vulnerabilities": {"GHSA-aaaa-bbbb-cccc": {"cves": ["CVE-2026-0001"], "summary": "s", "severity": "high", "description": "d"}},
+                  "description": "x", "license": "MIT", "tier": "free"}
+          PATCH = {"uuid": UUID, "purl": API_PURL, "tier": "free", "cveIds": ["CVE-2026-0001"], "ghsaIds": ["GHSA-aaaa-bbbb-cccc"], "severity": "HIGH", "title": "t"}
+          class H(BaseHTTPRequestHandler):
+              def log_message(self, *a): pass
+              def out(self, obj):
+                  b = json.dumps(obj).encode(); self.send_response(200); self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+              def do_GET(self):
+                  if "/patches/view/" in self.path: return self.out(VIEW)
+                  if self.path.startswith("/patch/pypi/"):
+                      self.send_response(200); self.send_header("Content-Length", str(len(WHEEL))); self.end_headers(); self.wfile.write(WHEEL); return
+                  if "/by-package/" in self.path: return self.out({"patches": [dict(PATCH, publishedAt="2026-09-01T00:00:00Z", description="x", license="MIT", vulnerabilities={})], "canAccessPaidPatches": False})
+                  self.send_response(404); self.end_headers()
+              def do_POST(self):
+                  raw = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
+                  if self.path.endswith("/patches/batch"):
+                      has = "pkg:pypi/six@1.16.0" in raw
+                      return self.out({"packages": [{"purl": "pkg:pypi/six@1.16.0", "patches": [PATCH]}] if has else [], "canAccessPaidPatches": False})
+                  if self.path.endswith("/patches/package"):
+                      url = API + "/patch/pypi/six/1.16.0/11111111-2222-4333-8444-555555555555/" + UUID + "/six-1.16.0-py2.py3-none-any.whl"
+                      return self.out({"results": {UUID: {"status": "granted", "url": url, "purl": "pkg:pypi/six@1.16.0",
+                          "artifacts": [{"kind": "tarball", "url": url, "integrity": {"sha256": hashlib.sha256(WHEEL).hexdigest()}}], "registryOverride": None}}})
+                  self.out({})
+          srv = ThreadingHTTPServer(("127.0.0.1", 0), H); threading.Thread(target=srv.serve_forever, daemon=True).start()
+          API = "http://127.0.0.1:%d" % srv.server_address[1]
+          WHEEL = build()
+          SRC = '[[source]]\nurl = "https://pypi.org/simple"\nverify_ssl = true\nname = "pypi"\n\n'
+          env = {k: v for k, v in os.environ.items() if not k.startswith(("PIPENV_", "VIRTUAL_ENV", "WORKON_HOME"))}
+          env.update(PIPENV_YES="1", PIPENV_NOSPIN="1", SOCKET_API_URL=API, SOCKET_API_TOKEN="fake", SOCKET_ORG_SLUG="test-org",
+                     SOCKET_NO_CONFIG="1", SOCKET_NO_UPDATE_CHECK="1", SOCKET_TELEMETRY_DISABLED="1")
+          ver = subprocess.run([PIPENV, "--version"], capture_output=True, text=True).stdout.strip()
+          base = os.path.realpath(os.path.join(os.environ.get("RUNNER_TEMP", tempfile.gettempdir()), "bh"))
+          os.makedirs(base, exist_ok=True)
+          rows = []
+          def run(args, d, e):
+              return subprocess.run(args, cwd=d, env=e, capture_output=True, text=True)
+          def six_state(d, e):
+              r = run([PIPENV, "run", "python", "-c", "import six;print(six.__file__, 'PATCHED' if hasattr(six,'SOCKET_PATCHED') else 'UNPATCHED')"], d, e)
+              return r.stdout.strip() or r.stderr.strip()[-200:]
+          def j(s):
+              try: return json.loads(s.stdout[s.stdout.find("{"):])
+              except Exception: return {"nojson": (s.stdout + s.stderr)[-400:]}
+          for case in ("baseline", "stray-venv-dir", "dotvenv-in-project-0"):
+              d = os.path.join(base, case); os.makedirs(d)
+              open(os.path.join(d, "Pipfile"), "w").write(SRC + '[packages]\nsix = "==1.16.0"\n')
+              e = dict(env)
+              if case == "stray-venv-dir":
+                  run([PY, "-m", "venv", "venv"], d, e)
+              if case == "dotvenv-in-project-0":
+                  run([PY, "-m", "venv", ".venv"], d, e); e["PIPENV_VENV_IN_PROJECT"] = "0"
+              inst = run([PIPENV, "install", "--python", PY], d, e)
+              venv = run([PIPENV, "--venv"], d, e).stdout.strip()
+              s = run([CLI, "scan", "--mode", "agent", "--json", "--yes"], d, e); o = j(s)
+              acts = [(p.get("action"), p.get("errorCode")) for p in o.get("apply", {}).get("patches", [])]
+              rows.append((case, "install=%d" % inst.returncode, "scan exit=%d status=%s %s" % (s.returncode, o.get("status"), acts), "pipenv --venv=" + venv, six_state(d, e)))
+          d = os.path.join(base, "hosted-conflict"); os.makedirs(os.path.join(d, "wheels"))
+          open(os.path.join(d, "wheels", "six-1.16.0-py2.py3-none-any.whl"), "wb").write(RAW)
+          open(os.path.join(d, "Pipfile"), "w").write(SRC + '[packages]\nsix = {file = "wheels/six-1.16.0-py2.py3-none-any.whl"}\n')
+          e = dict(env, PIPENV_VENV_IN_PROJECT="1")
+          inst = run([PIPENV, "install", "--python", PY], d, e)
+          open(os.path.join(d, "requirements.txt"), "w").write("six==1.16.0\n")
+          s = run([CLI, "scan", "--mode", "hosted", "--json", "--yes"], d, e); o = j(s); r = o.get("redirect", {})
+          rows.append(("hosted-conflict", "install=%d" % inst.returncode, "scan exit=%d status=%s redirected=%s files=%s" % (s.returncode, o.get("status"), r.get("redirected"), r.get("rewrittenFiles")),
+                       str([(w.get("code"), w.get("detail", "")[:120]) for w in r.get("warnings", [])]), "requirements.txt=" + open(os.path.join(d, "requirements.txt")).read().strip()[:90]))
+          print("== %s | %s | base=%s" % (ver, sys.platform, base))
+          for row in rows: print(" | ".join(row))
+          PROBE_EOF
+          CLI="$PWD/target/debug/socket-patch"; [ -f "$CLI.exe" ] && CLI="$CLI.exe"
+          python "$RUNNER_TEMP/probe.py" "$CLI" "$PIPENV_BIN" "$BASE_PY"
