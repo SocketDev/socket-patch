@@ -409,10 +409,11 @@ pub(super) fn check_target_guards(
 /// The (wheel path, sha256) the WIRED pair still pins for an in-sync target:
 /// the lock's rewritten `[[package]]` unit carries `source = { path = … }`
 /// under THIS patch uuid's dir plus the single `{ filename, hash }` wheels
-/// element vendor wrote — the very pin the next `uv sync` verifies. The
-/// in-sync rebuild guard falls back to it when the state.json ledger has no
-/// entry left for the patch. Paths are returned bare (no `./` prefix),
-/// matching the ledger's `artifact.path` spelling.
+/// element (a server sdist: the `sdist = { hash }` table) vendor wrote — the
+/// very pin the next `uv sync` verifies. The in-sync rebuild guard falls
+/// back to it when the state.json ledger has no entry left for the patch.
+/// Paths are returned bare (no `./` prefix), matching the ledger's
+/// `artifact.path` spelling.
 pub(super) fn wired_pin(
     p: &UvProject,
     canon_name: &str,
@@ -432,16 +433,21 @@ pub(super) fn wired_pin(
         .and_then(Value::as_str)?;
     super::path::parse_vendor_path(path)
         .filter(|parts| parts.eco == "pypi" && parts.uuid == record_uuid)?;
-    let sha = unit
-        .get("wheels")
-        .and_then(Item::as_array)?
-        .iter()
-        .find_map(|w| {
+    let sha = match unit.get("wheels").and_then(Item::as_array) {
+        Some(wheels) => wheels.iter().find_map(|w| {
             w.as_inline_table()?
                 .get("hash")?
                 .as_str()?
                 .strip_prefix("sha256:")
-        })?;
+        })?,
+        // A server sdist is wired as `sdist = { hash = … }` instead.
+        None => unit
+            .get("sdist")
+            .and_then(Item::as_inline_table)
+            .and_then(|sdist| sdist.get("hash"))
+            .and_then(Value::as_str)
+            .and_then(|h| h.strip_prefix("sha256:"))?,
+    };
     if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -2018,6 +2024,37 @@ wheels = [
             wired_pin(&p2, "six", UUID),
             None,
             "a registry-shaped lock pins nothing of ours"
+        );
+    }
+
+    /// A server sdist is wired with `sdist = { hash }` instead of a wheels
+    /// array; the guard's fallback reads that pin too.
+    #[tokio::test]
+    async fn wired_pin_reads_a_wired_server_sdist() {
+        let rel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0.tar.gz");
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            &rel,
+            "six-1.16.0.tar.gz",
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let (_, lock) = read_pair(tmp.path()).await;
+        assert!(
+            lock.contains(&format!("sdist = {{ hash = \"sha256:{WHEEL_SHA}\" }}")),
+            "{lock}"
+        );
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            wired_pin(&p, "six", UUID),
+            Some((rel, WHEEL_SHA.to_string()))
         );
     }
 

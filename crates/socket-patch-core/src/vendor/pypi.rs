@@ -1657,7 +1657,12 @@ async fn fresh_reuse_wheel(
             return None;
         }
     };
-    let (locked, platform_tags_display) = wheel_platform_from_filename(&leaf);
+    // An sdist carries no platform tags, as `try_pypi_service_wheel` records.
+    let (locked, platform_tags_display) = if leaf.ends_with(".whl") {
+        wheel_platform_from_filename(&leaf)
+    } else {
+        (false, String::new())
+    };
     if locked || prior.artifact.platform_locked == Some(true) {
         reuse::log_miss(base, &reuse::ReuseMiss::PlatformLocked);
         return None;
@@ -6604,6 +6609,155 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
                     );
                 }
             }
+        }
+
+        const SDIST_NAME: &str = "six-1.16.0.tar.gz";
+
+        /// A server sdist carrying the patched `six.py`; `salt` varies the
+        /// bytes without breaking verification.
+        fn served_sdist(salt: &[u8]) -> Vec<u8> {
+            let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::default(),
+            ));
+            for (path, bytes) in [
+                ("six-1.16.0/six.py", PATCHED),
+                (
+                    "six-1.16.0/PKG-INFO",
+                    b"Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n\n".as_slice(),
+                ),
+                ("six-1.16.0/README", salt),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar.append_data(&mut header, path, bytes).unwrap();
+            }
+            tar.into_inner().unwrap().finish().unwrap()
+        }
+
+        /// Run 1 from the served sdist `bytes`, persisted like the CLI does
+        /// when `persist`.
+        async fn first_sdist_run(fx: &E2eFixture, bytes: &[u8], persist: bool) -> VendorEntry {
+            let server = wiremock::MockServer::start().await;
+            mount_pypi_granted(&server, SDIST_NAME, &sri_sha512(bytes), bytes).await;
+            let cfg = ts::service_cfg(&server.uri(), VendorSource::Service, false);
+            let (r, e, _) = ts::expect_done(
+                vendor_six(fx, &PatchSources::blobs_only(&fx.blobs), Some(&cfg)).await,
+            );
+            assert!(r.success, "run 1: {:?}", r.error);
+            let e = e.expect("run 1 wires");
+            assert!(e.artifact.path.ends_with(SDIST_NAME), "{}", e.artifact.path);
+            if persist {
+                ts::persist(&fx.root, KEY, e.clone()).await;
+            }
+            e
+        }
+
+        /// P1 + P2 for a committed server sdist (no platform tags): a
+        /// relock re-scan under `service` + `--offline` re-wires it like a
+        /// pure wheel — no request, the sdist bytes unchanged.
+        #[tokio::test]
+        async fn relock_rescan_rewires_a_committed_server_sdist_offline() {
+            let bytes = served_sdist(b"");
+            for (name, files) in flavors()
+                .into_iter()
+                .filter(|(n, _)| ["pdm", "uv", "poetry"].contains(n))
+            {
+                let fx = flavor_fixture(&files).await;
+                let registry = snap(&fx).await;
+                let first = first_sdist_run(&fx, &bytes, true).await;
+                let wired = snap(&fx).await;
+                restore(&fx, &registry).await; // the relock
+                let (outcome, requests) = run(&fx, None, VendorSource::Service, true).await;
+                let (r, e, w) = ts::expect_done(outcome);
+                assert!(r.success, "{name}: {:?}", r.error);
+                let e = e.expect("the relocked wiring is re-applied");
+                assert_eq!(e.artifact.path, first.artifact.path, "{name}");
+                assert_eq!(e.artifact.sha256, first.artifact.sha256, "{name}");
+                assert!(
+                    ts::has_warning(&w, "vendor_artifact_reused"),
+                    "{name}: {w:?}"
+                );
+                assert_eq!(requests, 0, "{name}: no request");
+                assert_eq!(
+                    tokio::fs::read(fx.root.join(&first.artifact.path))
+                        .await
+                        .unwrap(),
+                    bytes,
+                    "{name}"
+                );
+                assert_eq!(snap(&fx).await, wired, "{name}: re-wired byte-identically");
+            }
+        }
+
+        /// P4 for a committed server sdist: a `pdm add` partial relock
+        /// refuses, and the sdist the ledger still names survives the
+        /// wiring failure.
+        #[tokio::test]
+        async fn pdm_partial_relock_keeps_the_committed_server_sdist() {
+            let bytes = served_sdist(b"");
+            let fx = flavor_fixture(&[("pdm.lock", PDM_LOCK_REGISTRY)]).await;
+            let first = first_sdist_run(&fx, &bytes, true).await;
+            let partial = partial_pdm_lock(&first.artifact.sha256);
+            tokio::fs::write(fx.root.join("pdm.lock"), &partial)
+                .await
+                .unwrap();
+            let ledger = tokio::fs::read(fx.root.join(".socket/vendor/state.json"))
+                .await
+                .unwrap();
+            let (outcome, requests) = run(&fx, None, VendorSource::Service, false).await;
+            let (r, e, _) = ts::expect_failed(outcome);
+            assert!(e.is_none());
+            let err = r.error.unwrap();
+            assert!(err.contains("pypi_pdm_source_already_exists"), "{err}");
+            assert_eq!(requests, 0);
+            assert_eq!(
+                tokio::fs::read_to_string(fx.root.join("pdm.lock"))
+                    .await
+                    .unwrap(),
+                partial,
+                "lock untouched"
+            );
+            assert_eq!(
+                tokio::fs::read(fx.root.join(".socket/vendor/state.json"))
+                    .await
+                    .unwrap(),
+                ledger
+            );
+            assert_eq!(
+                tokio::fs::read(fx.root.join(&first.artifact.path))
+                    .await
+                    .unwrap(),
+                bytes,
+                "the reused committed sdist survives the wiring failure"
+            );
+        }
+
+        /// The ledgerless in-sync rebuild guard for a uv-wired server sdist:
+        /// with no state.json and the sdist gone, a served artifact other
+        /// than the one uv.lock pins is refused, never written.
+        #[tokio::test]
+        async fn ledgerless_uv_sdist_rebuild_keeps_the_wired_pin() {
+            let fx = flavor_fixture(&[
+                ("pyproject.toml", UV_PYPROJECT),
+                ("uv.lock", UV_LOCK_REGISTRY),
+            ])
+            .await;
+            let first = first_sdist_run(&fx, &served_sdist(b""), false).await;
+            let wired = snap(&fx).await;
+            tokio::fs::remove_dir_all(uuid_dir_of(&fx)).await.unwrap();
+            let other = served_sdist(b"different bytes");
+            let server = wiremock::MockServer::start().await;
+            mount_pypi_granted(&server, SDIST_NAME, &sri_sha512(&other), &other).await;
+            let cfg = ts::service_cfg(&server.uri(), VendorSource::Service, false);
+            let error = ts::expect_failure(
+                vendor_six(&fx, &PatchSources::blobs_only(&fx.blobs), Some(&cfg)).await,
+            );
+            assert!(error.contains("the lockfile still pins"), "{error}");
+            assert!(!fx.root.join(&first.artifact.path).exists());
+            assert_eq!(snap(&fx).await, wired, "uv pair unchanged");
         }
 
         /// P5: in-sync wiring, the SERVICE-built wheel missing, service
