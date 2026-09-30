@@ -3600,10 +3600,14 @@ mod tests {
         std::os::unix::fs::symlink(target, link).unwrap();
         #[cfg(windows)]
         {
+            // Rebuilt from components so every separator is `\`: `mklink`
+            // reads a `/` inside a path (`a@1/node_modules/b`) as a switch.
+            let link: PathBuf = link.components().collect();
+            let target: PathBuf = target.components().collect();
             let status = std::process::Command::new("cmd")
                 .args(["/C", "mklink", "/J"])
-                .arg(link)
-                .arg(target)
+                .arg(&link)
+                .arg(&target)
                 .status()
                 .unwrap();
             assert!(status.success(), "mklink /J failed");
