@@ -1,0 +1,99 @@
+name: bughunt gradle probe
+on:
+  push:
+    branches: ['bughunt/gradle/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        gradle: ['6.9.4', '7.6.6', '8.14.3', '9.8.0']
+        include:
+          - gradle: '6.9.4'
+            jdk: '11'
+          - gradle: '7.6.6'
+            jdk: '17'
+          - gradle: '8.14.3'
+            jdk: '21'
+          - gradle: '9.8.0'
+            jdk: '21'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Probe hosted exclusiveContent snippet under dependency locking
+        env:
+          GV: ${{ matrix.gradle }}
+          JDK: ${{ matrix.jdk }}
+        run: |
+          set -u
+          for v in JAVA_HOME_${JDK}_X64 JAVA_HOME_${JDK}_arm64 JAVA_HOME_${JDK}_ARM64; do
+            if [ -n "${!v:-}" ]; then export JAVA_HOME="${!v}"; break; fi
+          done
+          echo "JAVA_HOME=$JAVA_HOME"
+          W="$RUNNER_TEMP/w"; mkdir -p "$W"; cd "$W"
+          [ -f g.zip ] || curl -sSfL --retry 6 --retry-all-errors --retry-delay 15 -o g.zip "https://services.gradle.org/distributions/gradle-$GV-bin.zip"
+          python3 -c "import zipfile;zipfile.ZipFile('g.zip').extractall('.')" || python -c "import zipfile;zipfile.ZipFile('g.zip').extractall('.')"
+          PY=$(command -v python3 || command -v python)
+          G="$W/gradle-$GV/bin/gradle"; if [ "$RUNNER_OS" = Windows ]; then G="$G.bat"; else chmod +x "$G"; fi
+          export GRADLE_USER_HOME="$W/gh"
+          SFX=1.10.0-socket.4d5e6f70
+          C=https://repo.maven.apache.org/maven2/org/apache/commons/commons-text/1.10.0
+          for e in jar pom; do [ -f orig.$e ] || curl -sSfL --retry 6 --retry-all-errors --retry-delay 15 -o orig.$e "$C/commons-text-1.10.0.$e"; done
+          # Socket-shaped maven2 repo: patched jar + upstream pom re-versioned to the suffix.
+          REPO=$("$PY" - "$SFX" <<'PYEOF'
+          import zipfile,hashlib,os,sys,pathlib
+          SFX=sys.argv[1]
+          zi=zipfile.ZipFile("orig.jar"); zo=zipfile.ZipFile("patched.jar","w",zipfile.ZIP_DEFLATED)
+          for i in zi.infolist():
+              d=zi.read(i.filename)
+              if i.filename=="META-INF/NOTICE.txt": d+=b"\nSOCKET-PATCH-GRADLE-MARKER\n"
+              zo.writestr(i,d)
+          zo.close()
+          pom=open("orig.pom").read(); a=pom.index("</parent>"); n="<version>1.10.0</version>"; b=pom.index(n,a)
+          pom=pom[:b]+"<version>%s</version>"%SFX+pom[b+len(n):]
+          d=f"repo/org/apache/commons/commons-text/{SFX}"; os.makedirs(d,exist_ok=True)
+          for ext,data in (("jar",open("patched.jar","rb").read()),("pom",pom.encode())):
+              p=f"{d}/commons-text-{SFX}.{ext}"; open(p,"wb").write(data); open(p+".sha1","w").write(hashlib.sha1(data).hexdigest())
+          print(pathlib.Path("repo").resolve().as_uri())
+          PYEOF
+          )
+          echo "REPO=$REPO"
+          probe() { # $1 = case name, $2 = dependencyLocking block (or empty)
+            D="$W/$1"; rm -rf "$D"; mkdir -p "$D"; cd "$D"
+            echo "rootProject.name='app'" > settings.gradle
+            printf '%s\n' "plugins { id 'java' }" "repositories { mavenCentral() }" "$2" \
+              "dependencies { implementation 'org.apache.commons:commons-text:1.10.0' }" \
+              "tasks.register('cp', Copy) { from configurations.runtimeClasspath; into 'build/cp' }" > build.gradle
+            if [ -n "$2" ]; then "$G" -q --no-daemon dependencies --write-locks > wl.log 2>&1 || { echo "write-locks failed"; cat wl.log; }; fi
+            # The snippet exactly as `scan --mode hosted` prints it (redirect_gradle_manual_snippet), url swapped to the local repo.
+            cat >> build.gradle <<SNIP
+          repositories {
+              exclusiveContent {
+                  forRepository {
+                      maven { url "$REPO" }
+                  }
+                  filter {
+                      includeVersion("org.apache.commons", "commons-text", "$SFX")
+                  }
+              }
+          }
+          SNIP
+            "$PY" -c "import sys;p='build.gradle';t=open(p).read().replace(\"commons-text:1.10.0'\",\"commons-text:$SFX'\");open(p,'w').write(t)"
+            rc=0; ok=0
+            for try in 1 2 3; do "$G" -q --no-daemon cp > g.log 2>&1 && { rc=0; ok=1; break; }; rc=$?; grep -q "429" g.log || break; sleep 30; done
+            jar=$(ls build/cp 2>/dev/null | grep commons-text || true)
+            m=$("$PY" -c "import zipfile,glob;fs=glob.glob('build/cp/commons-text-*.jar');print(zipfile.ZipFile(fs[0]).read('META-INF/NOTICE.txt').count(b'SOCKET-PATCH') if fs else 'none')")
+            echo "RESULT os=$RUNNER_OS gradle=$GV case=$1 exit=$rc jar=$jar patched=$m"
+            [ "$rc" != 0 ] && grep -v JAVA_TOOL g.log | head -20
+            cd "$W"
+          }
+          probe nolock ""
+          probe lock-default "dependencyLocking { lockAllConfigurations() }"
+          probe lock-strict "dependencyLocking { lockAllConfigurations(); lockMode = LockMode.STRICT }"
+          probe lock-lenient "dependencyLocking { lockAllConfigurations(); lockMode = LockMode.LENIENT }"
