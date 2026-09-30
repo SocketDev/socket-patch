@@ -244,6 +244,7 @@ pub async fn vendor_yarn_berry<'a>(
     // re-read and must still be the bytes the pack hashed (the lock's
     // checksum and `hash=` are derived from these, so a file swapped after
     // verification must fail, never be pinned).
+    let reused = staged.verified_bytes.is_some();
     let tgz_bytes = match staged.verified_bytes {
         Some(bytes) => bytes,
         None => match tokio::fs::read(&dest).await {
@@ -274,6 +275,29 @@ pub async fn vendor_yarn_berry<'a>(
     // `hash=` — the first 6 hex chars of sha512(tgz): the lock-committed
     // tamper guard on the tarball itself (flips on any byte edit).
     let hash6 = &tgz_sha512[..6];
+    let locator = encode_uri_component(&format!("{workspace}@workspace:."));
+    let resolution = format!("{name}@file:./{rel_tgz}#./{rel_tgz}::hash={hash6}&locator={locator}");
+    // A reused ledger entry written before the checksum was recorded (or by
+    // another npm flavor) carries none. When our own lock entry already
+    // pins `hash=` of these verified bytes, it was written from them: its
+    // checksum is theirs, so an in-sync re-run needs no service (offline
+    // included).
+    if packed.yarn_berry10c0.is_none()
+        && reused
+        && target_is_ours
+        && berry_field(&target.lines, "resolution") == Some(resolution.as_str())
+    {
+        if let Some(c) = berry_field(&target.lines, "checksum") {
+            let full = if c.contains('/') {
+                c.to_string()
+            } else {
+                format!("{SUPPORTED_CACHE_KEY}/{c}")
+            };
+            if valid_berry_checksum(&full) {
+                packed.yarn_berry10c0 = Some(full);
+            }
+        }
+    }
     if packed.yarn_berry10c0.is_none() {
         if let Some(cfg) = service.filter(|cfg| cfg.service_enabled()) {
             if let super::service_fetch::ServiceArtifact::Ready(archive) =
@@ -287,15 +311,18 @@ pub async fn vendor_yarn_berry<'a>(
     }
     let checksum = match packed.yarn_berry10c0.as_deref().filter(|c| valid_berry_checksum(c)) {
         Some(c) => checksum_in_lock_spelling(&lock_text, c),
+        // A reused tarball is kept as is, so retrying cannot help when the
+        // service serves other bytes: only a fresh vendor can wire it.
+        None if reused => return done_failure_unstage(purl,
+            format!("the patch service supplied no Yarn Berry checksum for the committed {rel_tgz}; run `vendor --revert` for {purl} and re-vendor"),
+            project_root, &uuid_dir_rel, uuid_dir_preexisted).await,
         None => return done_failure_unstage(purl,
             format!("the patch service supplied no Yarn Berry checksum for {name}; retry after the server artifact is ready"),
             project_root, &uuid_dir_rel, uuid_dir_preexisted).await,
     };
 
     // ── 9. The replacement lock entry (verbatim B3 shape) ─────────────────
-    let locator = encode_uri_component(&format!("{workspace}@workspace:."));
     let lock_key = format!("\"{name}@file:./{rel_tgz}::locator={locator}\"");
-    let resolution = format!("{name}@file:./{rel_tgz}#./{rel_tgz}::hash={hash6}&locator={locator}");
     // Sections beyond the five we own (dependencies:, peerDependencies:,
     // bin:, …) describe the same package version and carry over verbatim.
     let carried = carried_sections(&target.lines);
@@ -2032,6 +2059,92 @@ __metadata:
         assert_eq!(tokio::fs::read(fx.pkg_path()).await.unwrap(), pkg_first);
         assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), lock_first);
         assert_eq!(tokio::fs::read(fx.tgz_path()).await.unwrap(), tgz_first);
+    }
+
+    /// A reused ledger entry with no `yarnBerry10c0` (written before it was
+    /// recorded, or by another npm flavor): the in-sync re-run takes the
+    /// checksum from our own lock entry pinning `hash=` of the same verified
+    /// bytes — with no service, offline, or against a service serving a
+    /// re-encoded tarball, and without a request — but never from an entry
+    /// pinning other bytes.
+    #[tokio::test]
+    async fn in_sync_rerun_recovers_a_missing_ledger_checksum_from_our_lock_entry() {
+        use crate::vendor::test_support as ts;
+        use crate::vendor::VendorSource;
+
+        async fn rerun(
+            fx: &Fixture,
+            service: Option<&crate::vendor::VendorServiceConfig>,
+        ) -> VendorOutcome {
+            let blobs = fx.root().join(".socket/blobs");
+            vendor_yarn_berry(
+                "pkg:npm/left-pad@1.3.0",
+                &fx.installed(),
+                fx.root(),
+                &fx.record,
+                &PatchSources::blobs_only(&blobs),
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                service,
+            )
+            .await
+        }
+
+        let bare_lock = B3_BEFORE_LOCK.replace("checksum: 10c0/", "checksum: ");
+        for lock in [B3_BEFORE_LOCK, bare_lock.as_str()] {
+            let fx = fixture_with(B3_BEFORE_PKG, lock).await;
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{:?}", result.error);
+            let mut entry = entry.expect("run 1 wires");
+            assert!(entry.artifact.yarn_berry10c0.is_some());
+            entry.artifact.yarn_berry10c0 = None;
+            ts::persist(fx.root(), "pkg:npm/left-pad@1.3.0", entry).await;
+            let pkg_first = tokio::fs::read(fx.pkg_path()).await.unwrap();
+            let lock_first = tokio::fs::read(fx.lock_path()).await.unwrap();
+            let tgz_first = tokio::fs::read(fx.tgz_path()).await.unwrap();
+
+            let server = wiremock::MockServer::start().await;
+            ts::mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &ts::regzip(&tgz_first)).await;
+            let offline = ts::service_cfg(&server.uri(), VendorSource::Service, true);
+            let reencoded = ts::service_cfg(&server.uri(), VendorSource::Service, false);
+            for service in [None, Some(&offline), Some(&reencoded)] {
+                let (result, entry, _) = expect_done(rerun(&fx, service).await);
+                assert!(result.success, "{:?}", result.error);
+                assert!(entry.is_none(), "in-sync re-run writes no ledger entry");
+                assert!(
+                    result
+                        .files_verified
+                        .iter()
+                        .all(|v| v.status == VerifyStatus::AlreadyPatched),
+                    "{:?}",
+                    result.files_verified
+                );
+                assert_eq!(tokio::fs::read(fx.pkg_path()).await.unwrap(), pkg_first);
+                assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), lock_first);
+                assert_eq!(tokio::fs::read(fx.tgz_path()).await.unwrap(), tgz_first);
+            }
+            assert_eq!(ts::request_count(&server).await, 0, "no service request");
+
+            // Our entry pinning other bytes vouches for nothing.
+            let tampered = String::from_utf8(lock_first)
+                .unwrap()
+                .replace("::hash=", "::hash=0");
+            tokio::fs::write(fx.lock_path(), &tampered).await.unwrap();
+            let (result, entry, _) = expect_done(rerun(&fx, None).await);
+            assert!(!result.success);
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains("no Yarn Berry checksum") && error.contains("vendor --revert"),
+                "{error}"
+            );
+            assert!(entry.is_none());
+            assert_eq!(
+                tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+                tampered
+            );
+            assert_eq!(tokio::fs::read(fx.tgz_path()).await.unwrap(), tgz_first);
+        }
     }
 
     #[tokio::test]
