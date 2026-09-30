@@ -2211,19 +2211,27 @@ pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
         }
     }
     // A pnpm store relocated by `virtualStoreDir` has no fixed name; the
-    // importer's `node_modules/.modules.yaml` says where it is. Every
-    // ancestor is a candidate importer (a transitive copy's chain runs
-    // through the store, not through the importer's `node_modules`).
-    let importer_nms: Vec<PathBuf> = chains
+    // importer's `node_modules/.modules.yaml` says where it is. Only a
+    // store that holds the primary itself counts (a transitive copy, or a
+    // direct dep's link target on the canonical chain): an enclosing
+    // project's `.modules.yaml` further up names a store this project
+    // does not use.
+    let candidates: Vec<(PathBuf, PathBuf)> = chains
         .into_iter()
         .flatten()
-        .flat_map(|start| start.ancestors().skip(1))
-        .map(|dir| dir.join("node_modules"))
+        .flat_map(|start| {
+            start
+                .ancestors()
+                .skip(1)
+                .map(move |dir| (start.to_path_buf(), dir.join("node_modules")))
+        })
         .collect();
     let relocated = run_walk(move || {
-        importer_nms
+        candidates
             .iter()
-            .filter_map(|nm| relocated_pnpm_virtual_store_sync(nm))
+            .filter_map(|(start, nm)| {
+                relocated_pnpm_virtual_store_sync(nm).filter(|store| start.starts_with(store))
+            })
             .collect::<Vec<_>>()
     })
     .await;
@@ -3900,7 +3908,43 @@ mod tests {
             let mut variants = find_store_peer_variant_copies(&foo).await;
             variants.sort();
             assert_eq!(variants, vec![foo_twin.clone()], "{store_rel}");
+            // From a direct dep's importer link into the store too.
+            link_dir(&foo, &nm.join("foo"));
+            assert_eq!(
+                find_store_peer_variant_copies(&nm.join("foo")).await,
+                vec![foo_twin.clone()],
+                "{store_rel}"
+            );
         }
+    }
+
+    /// The peer-variant fan-out only uses a relocated store that holds
+    /// the primary: an ENCLOSING project's `.modules.yaml` names a store
+    /// this project never loads from, and its copies are not ours to
+    /// patch.
+    #[tokio::test]
+    async fn test_enclosing_projects_relocated_store_is_not_a_peer_variant_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer: PathBuf = tmp.path().components().collect();
+        let outer_nm = outer.join("node_modules");
+        std::fs::create_dir_all(&outer_nm).unwrap();
+        std::fs::write(
+            outer_nm.join(".modules.yaml"),
+            "{\"virtualStoreDir\": \"../.vstore\"}",
+        )
+        .unwrap();
+        write_pkg(
+            &outer.join(".vstore/foo@1.0.0(react@18.2.0)/node_modules/foo"),
+            "foo",
+            "1.0.0",
+        );
+
+        let inner_store = outer.join("app/node_modules/.pnpm");
+        let primary = inner_store.join("foo@1.0.0(react@17.0.2)/node_modules/foo");
+        let twin = inner_store.join("foo@1.0.0(react@16.14.0)/node_modules/foo");
+        write_pkg(&primary, "foo", "1.0.0");
+        write_pkg(&twin, "foo", "1.0.0");
+        assert_eq!(find_store_peer_variant_copies(&primary).await, vec![twin]);
     }
 
     /// A `virtualStoreDir` outside the project (pnpm's global virtual
