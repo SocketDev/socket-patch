@@ -440,16 +440,7 @@ pub async fn vendor_composer<'a>(
     let marker = VendorMarker::new("composer", &base_purl, record, vendored_at);
     write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
 
-    let file_inventory = match super::verify::compute_dir_inventory(&copy_dir).await {
-        Ok(inventory) => inventory,
-        Err(error) => {
-            let _ = remove_tree(&uuid_dir).await;
-            prune_empty_vendor_dirs(&copy_dir).await;
-            return refused("vendor_inventory_unavailable", error);
-        }
-    };
-
-    let mut entry = VendorEntry {
+    let entry = VendorEntry {
         ecosystem: "composer".to_string(),
         base_purl,
         uuid: record.uuid.clone(),
@@ -480,7 +471,6 @@ pub async fn vendor_composer<'a>(
         pdm: None,
         pipenv: None,
     };
-    entry.artifact.file_inventory = Some(file_inventory);
 
     done(result, Some(entry), warnings)
 }
