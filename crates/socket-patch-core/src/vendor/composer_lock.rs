@@ -386,7 +386,13 @@ pub async fn vendor_composer<'a>(
 
     let file_inventory = match super::verify::compute_dir_inventory(&copy_dir).await {
         Ok(inventory) => inventory,
-        Err(error) => return refused("vendor_inventory_unavailable", error),
+        Err(error) => {
+            // Nothing is wired yet: drop the extracted copy, as the filter
+            // conflict above does, so no unwired uuid dir is left behind.
+            let _ = remove_tree(&uuid_dir).await;
+            prune_empty_vendor_dirs(&copy_dir).await;
+            return refused("vendor_inventory_unavailable", error);
+        }
     };
 
     // ── lock rewrite ─────────────────────────────────────────────────────
