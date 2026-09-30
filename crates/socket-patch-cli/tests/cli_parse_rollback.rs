@@ -378,11 +378,7 @@ fn bare_bool_does_not_consume_next_token() {
 /// relied on the rejection get a test-visible flip instead of a silent one.
 #[test]
 fn multiple_targets_parse_in_order() {
-    let args = parse_rollback(&[
-        "pkg:npm/foo@1",
-        "packages/api/**",
-        "b0630680-4da6-45f9-bba8-b888e0ffd58c",
-    ]);
+    let args = parse_rollback(&["pkg:npm/foo@1", "packages/api/**", "b0630680-4da6-45f9-bba8-b888e0ffd58c"]);
     assert_eq!(
         args.targets,
         vec![

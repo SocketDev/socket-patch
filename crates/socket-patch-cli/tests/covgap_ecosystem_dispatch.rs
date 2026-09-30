@@ -254,10 +254,7 @@ fn rollback_dispatch_branch_deno() {
         .unwrap_or_else(|e| panic!("rollback envelope must parse ({e}); stdout={stdout}"));
     let code = out.status.code().unwrap_or(-1);
 
-    assert_eq!(
-        code, 0,
-        "rollback --ecosystems=deno: expected exit 0; env={env}"
-    );
+    assert_eq!(code, 0, "rollback --ecosystems=deno: expected exit 0; env={env}");
     assert_eq!(
         env["status"], "success",
         "rollback --ecosystems=deno: expected success; env={env}"
@@ -298,8 +295,7 @@ fn rollback_dispatch_branch_deno() {
     // The decisive check: the on-disk bytes are restored to ORIGINAL.
     let restored = std::fs::read(&verify_file).unwrap();
     assert_eq!(
-        restored,
-        ORIGINAL,
+        restored, ORIGINAL,
         "rollback --ecosystems=deno: {} was not restored to its original bytes",
         verify_file.display()
     );

@@ -65,8 +65,8 @@ pub(crate) mod npm_family;
 pub(crate) mod pnpm;
 pub(crate) mod pypi;
 pub(crate) mod recover;
-pub mod view;
 pub(crate) mod vlt;
+pub mod view;
 pub(crate) mod wired;
 pub(crate) mod yarn;
 

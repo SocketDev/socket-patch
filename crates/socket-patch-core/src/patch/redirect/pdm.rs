@@ -278,18 +278,9 @@ mod tests {
     #[test]
     fn legacy_formats_warn_stale_install_risk_once() {
         for (fixture, warns) in [
-            (
-                include_str!("../../../tests/fixtures/pdm-native/0.12.3.lock"),
-                true,
-            ),
-            (
-                include_str!("../../../tests/fixtures/pdm-native/2.8.2.lock"),
-                true,
-            ),
-            (
-                include_str!("../../../tests/fixtures/pdm-native/2.29.2.lock"),
-                false,
-            ),
+            (include_str!("../../../tests/fixtures/pdm-native/0.12.3.lock"), true),
+            (include_str!("../../../tests/fixtures/pdm-native/2.8.2.lock"), true),
+            (include_str!("../../../tests/fixtures/pdm-native/2.29.2.lock"), false),
         ] {
             let mut result = RewriteResult::default();
             rewrite(

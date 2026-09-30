@@ -19,7 +19,8 @@ use socket_patch_core::patch::redirect::npmrc::{
     NPMRC_REL,
 };
 use socket_patch_core::patch::redirect::{
-    rewrite_registry_redirect_withholding_vlt, DepOverride, FileEdit, RewriteResult, RewriteWarning,
+    rewrite_registry_redirect_withholding_vlt, DepOverride, FileEdit, RewriteResult,
+    RewriteWarning,
 };
 use socket_patch_core::utils::purl::{purl_parts, strip_purl_qualifiers};
 use socket_patch_core::vendor::lock_inventory::{MemoryEntry, MemoryProject};

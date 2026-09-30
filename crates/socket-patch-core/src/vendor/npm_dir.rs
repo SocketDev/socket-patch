@@ -1249,10 +1249,8 @@ mod tests {
         let why = gitignore_probe(&root, &outside).await.unwrap_err();
         assert!(why.contains("`git check-ignore` exited 128"), "{why}");
         assert_eq!(gitignored(&root, &outside).await, None);
-        assert!(
-            gitignore_unchecked_detail(".socket/vendor/npm/u/a-1.0.0", &why)
-                .contains("make sure no ignore rule covers .socket/")
-        );
+        assert!(gitignore_unchecked_detail(".socket/vendor/npm/u/a-1.0.0", &why)
+            .contains("make sure no ignore rule covers .socket/"));
     }
 
     #[cfg(unix)]

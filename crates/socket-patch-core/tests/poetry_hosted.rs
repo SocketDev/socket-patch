@@ -65,11 +65,7 @@ async fn native_lock_generations_redirect_idempotently_and_restore_every_byte() 
             let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
             assert_eq!(
                 codes,
-                if pre_1_4 {
-                    vec!["redirect_poetry_stale_install_risk"]
-                } else {
-                    vec![]
-                },
+                if pre_1_4 { vec!["redirect_poetry_stale_install_risk"] } else { vec![] },
                 "{version}: {:?}",
                 result.warnings
             );
@@ -115,24 +111,12 @@ fn hosted_shapes_match_each_lock_generations_installer() {
     )
     .files["poetry.lock"]
         .clone();
-    assert!(
-        lock10.contains(&format!("url = \"{URL}#sha256={sha}&\"")),
-        "{lock10}"
-    );
+    assert!(lock10.contains(&format!("url = \"{URL}#sha256={sha}&\"")), "{lock10}");
     assert!(lock10.contains("reference = \"\""), "{lock10}");
-    assert!(
-        lock10.contains(&format!(
-            "urllib3 = [{{ file = \"{WHEEL}\", hash = \"sha256:{sha}\" }}]"
-        )),
-        "{lock10}"
-    );
+    assert!(lock10.contains(&format!("urllib3 = [{{ file = \"{WHEEL}\", hash = \"sha256:{sha}\" }}]")), "{lock10}");
     // Poetry >= 1.2 consuming this 1.0 lock verifies the package `files`
     // entry, so it is written too (1.0 ignores the extra key).
-    assert_eq!(
-        lock10.matches(&format!("sha256:{sha}")).count(),
-        2,
-        "{lock10}"
-    );
+    assert_eq!(lock10.matches(&format!("sha256:{sha}")).count(), 2, "{lock10}");
     let doc: toml_edit::DocumentMut = lock10.parse().unwrap();
     assert!(doc["package"][0]["files"].is_array(), "{lock10}");
 
@@ -142,15 +126,8 @@ fn hosted_shapes_match_each_lock_generations_installer() {
     )
     .files["poetry.lock"]
         .clone();
-    assert_eq!(
-        lock11.matches(&format!("sha256:{sha}")).count(),
-        2,
-        "package files + metadata.files:\n{lock11}"
-    );
-    assert!(
-        lock11.contains(&format!("url = \"{URL}\"")),
-        "no fragment on 1.1"
-    );
+    assert_eq!(lock11.matches(&format!("sha256:{sha}")).count(), 2, "package files + metadata.files:\n{lock11}");
+    assert!(lock11.contains(&format!("url = \"{URL}\"")), "no fragment on 1.1");
     assert!(!lock11.contains("reference"), "{lock11}");
     let doc: toml_edit::DocumentMut = lock11.parse().unwrap();
     assert!(doc["package"][0]["files"].is_array());
@@ -162,19 +139,11 @@ fn hosted_shapes_match_each_lock_generations_installer() {
     )
     .files["poetry.lock"]
         .clone();
-    assert_eq!(
-        lock21.matches(&format!("sha256:{sha}")).count(),
-        1,
-        "{lock21}"
-    );
+    assert_eq!(lock21.matches(&format!("sha256:{sha}")).count(), 1, "{lock21}");
     assert!(!lock21.contains("reference"));
     let pristine: toml_edit::DocumentMut = original("2.4.3").parse().unwrap();
     let doc: toml_edit::DocumentMut = lock21.parse().unwrap();
-    assert_eq!(
-        doc["metadata"].to_string(),
-        pristine["metadata"].to_string(),
-        "[metadata] untouched on 2.x"
-    );
+    assert_eq!(doc["metadata"].to_string(), pristine["metadata"].to_string(), "[metadata] untouched on 2.x");
 }
 
 #[test]
@@ -391,21 +360,14 @@ fn absent_entries_warn_once_and_missing_sha256_is_gated_once_per_dep() {
     let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
     assert_eq!(
         codes,
-        vec![
-            "redirect_poetry_entry_not_found",
-            "redirect_poetry_entry_not_found"
-        ]
+        vec!["redirect_poetry_entry_not_found", "redirect_poetry_entry_not_found"]
     );
     let mut missing_hash = patch();
     missing_hash.integrity.sha256 = None;
     let result = rewrite_registry_redirect(&files, &[missing_hash]);
     assert!(result.files.is_empty());
     let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
-    assert_eq!(
-        codes,
-        vec!["redirect_poetry_missing_sha256"],
-        "gated once, not once per lock"
-    );
+    assert_eq!(codes, vec!["redirect_poetry_missing_sha256"], "gated once, not once per lock");
 }
 
 /// A future Poetry that bumps the lock minor (2.2) is rewritten like 2.1 in
@@ -419,12 +381,9 @@ async fn newer_2x_minor_redirects_and_reverts() {
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     assert!(result.files["poetry.lock"].contains(URL));
     let directory = tempfile::tempdir().unwrap();
-    tokio::fs::write(
-        directory.path().join("poetry.lock"),
-        &result.files["poetry.lock"],
-    )
-    .await
-    .unwrap();
+    tokio::fs::write(directory.path().join("poetry.lock"), &result.files["poetry.lock"])
+        .await
+        .unwrap();
     let mut state = RedirectState {
         edits: result.edits,
         ..RedirectState::default()
@@ -432,9 +391,7 @@ async fn newer_2x_minor_redirects_and_reverts() {
     let outcome = revert_remaining_redirect_edits(directory.path(), &mut state, false).await;
     assert!(outcome.fully_reverted(), "{:?}", outcome.refusals);
     assert_eq!(
-        tokio::fs::read_to_string(directory.path().join("poetry.lock"))
-            .await
-            .unwrap(),
+        tokio::fs::read_to_string(directory.path().join("poetry.lock")).await.unwrap(),
         lock
     );
 }
@@ -448,22 +405,13 @@ fn rotated_grant_token_supersedes_the_prior_hosted_url() {
     let first = rewrite_registry_redirect(&files, &[patch()]);
     let mut rotated = patch();
     rotated.token = "00000000-0000-4000-8000-000000000000".into();
-    rotated.artifact_url = URL.replace(
-        "7e52b8b6-53f2-4dc8-860a-1ae7ebd8be0e",
-        "00000000-0000-4000-8000-000000000000",
-    );
+    rotated.artifact_url = URL.replace("7e52b8b6-53f2-4dc8-860a-1ae7ebd8be0e", "00000000-0000-4000-8000-000000000000");
     let second = rewrite_registry_redirect(&first.files, &[rotated.clone()]);
     assert!(second.warnings.is_empty(), "{:?}", second.warnings);
     let lock = &second.files["poetry.lock"];
     assert!(lock.contains(&rotated.artifact_url) && !lock.contains(URL));
     assert_eq!(second.edits.len(), 1);
-    assert!(second.edits[0]
-        .original
-        .as_ref()
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .contains(URL));
+    assert!(second.edits[0].original.as_ref().unwrap().as_str().unwrap().contains(URL));
 }
 
 /// A relock (or hand edit) that drops the inserted `files` line but keeps
@@ -485,35 +433,22 @@ async fn dropped_files_line_with_source_kept_is_refused_not_converged() {
             .collect::<Vec<_>>()
             .join("\n")
             + "\n";
-        assert_ne!(
-            drifted, *redirected,
-            "{version}: the files line must have been removed"
-        );
+        assert_ne!(drifted, *redirected, "{version}: the files line must have been removed");
         assert!(drifted.contains("[package.source]"));
         let directory = tempfile::tempdir().unwrap();
-        tokio::fs::write(directory.path().join("poetry.lock"), &drifted)
-            .await
-            .unwrap();
+        tokio::fs::write(directory.path().join("poetry.lock"), &drifted).await.unwrap();
         let mut state = RedirectState {
             edits: result.edits.clone(),
             ..RedirectState::default()
         };
         let outcome = revert_remaining_redirect_edits(directory.path(), &mut state, false).await;
-        assert!(
-            !outcome.fully_reverted(),
-            "{version}: must refuse, not report success"
-        );
+        assert!(!outcome.fully_reverted(), "{version}: must refuse, not report success");
         assert_eq!(
-            tokio::fs::read_to_string(directory.path().join("poetry.lock"))
-                .await
-                .unwrap(),
+            tokio::fs::read_to_string(directory.path().join("poetry.lock")).await.unwrap(),
             drifted,
             "{version}: a refused revert writes nothing"
         );
-        assert!(
-            !state.edits.is_empty(),
-            "{version}: the ledger keeps its edits for a re-scan"
-        );
+        assert!(!state.edits.is_empty(), "{version}: the ledger keeps its edits for a re-scan");
     }
 }
 
@@ -528,9 +463,7 @@ async fn lock_1_0_rollback_converges_on_a_hand_restored_lock() {
     let result = rewrite_registry_redirect(&files, &[patch()]);
     assert!(!result.edits.is_empty());
     let directory = tempfile::tempdir().unwrap();
-    tokio::fs::write(directory.path().join("poetry.lock"), &pristine)
-        .await
-        .unwrap();
+    tokio::fs::write(directory.path().join("poetry.lock"), &pristine).await.unwrap();
     let mut state = RedirectState {
         edits: result.edits,
         ..RedirectState::default()
@@ -539,9 +472,7 @@ async fn lock_1_0_rollback_converges_on_a_hand_restored_lock() {
     assert!(outcome.fully_reverted(), "{:?}", outcome.refusals);
     assert!(state.edits.is_empty());
     assert_eq!(
-        tokio::fs::read_to_string(directory.path().join("poetry.lock"))
-            .await
-            .unwrap(),
+        tokio::fs::read_to_string(directory.path().join("poetry.lock")).await.unwrap(),
         pristine
     );
 }

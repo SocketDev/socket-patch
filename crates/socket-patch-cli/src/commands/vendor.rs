@@ -3864,11 +3864,7 @@ mod plan_gate_tests {
         .unwrap();
         let packages = [
             ("pkg:composer/psr/cache@1.0.0", "psr/cache", UUID_A),
-            (
-                "pkg:composer/psr/http-message@1.1.0",
-                "psr/http-message",
-                UUID_B,
-            ),
+            ("pkg:composer/psr/http-message@1.1.0", "psr/http-message", UUID_B),
             ("pkg:composer/psr/log@3.0.2", "psr/log", UUID_C),
         ];
         let mut all_packages: Vec<(String, StagedSource)> = Vec::new();
