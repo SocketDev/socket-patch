@@ -213,6 +213,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn requires_hashes_reads_pip_hash_checking_mode() {
+        for hashed in [
+            "six==1.16.0 --hash=sha256:aa\nidna==3.7\n",
+            "six==1.16.0 \\\n    --hash sha256:aa\n",
+            "six==1.16.0 --hash=sha512:aa\n",
+            "--require-hashes\nsix==1.16.0\n",
+            "\u{feff}--require-hashes\r\nsix==1.16.0\r\n",
+        ] {
+            assert!(requires_hashes(hashed), "{hashed:?}");
+        }
+        for unhashed in [
+            "",
+            "six==1.16.0\nidna==3.7\n",
+            // Comments and url fragments are not hash options.
+            "six==1.16.0  # --hash=sha256:aa\n# --require-hashes\n",
+            "six @ https://example.test/six-1.16.0-py2.py3-none-any.whl#sha256=aa\n",
+        ] {
+            assert!(!requires_hashes(unhashed), "{unhashed:?}");
+        }
+    }
+
+    #[test]
     fn lexer_joins_continuations_and_strips_comments_correctly() {
         let lines = logical_lines("six==1.16.0 \\\n    --hash=sha256:abc\nrequests\n");
         assert_eq!(lines.len(), 2);

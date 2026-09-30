@@ -24,6 +24,7 @@ use super::detect::{deps_contain_hook, HOOK_DEP};
 // `requirements.txt` sight-unseen).
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::python_lock::preserve_line_endings;
+use crate::utils::requirements::{logical_lines, requires_hashes};
 use crate::utils::toml_edit_ext::ensure_table;
 use crate::vendor::common::detect_eol;
 
@@ -108,9 +109,44 @@ pub async fn add_hook_dependency(path: &Path, kind: ManifestKind, dry_run: bool)
 
     let outcome = match kind {
         ManifestKind::Pyproject => pyproject_add(&content),
-        ManifestKind::Requirements => Ok(requirements_add(&content)),
+        ManifestKind::Requirements => match requirements_add(&content) {
+            Some(_) if requirements_tree_requires_hashes(path, &content).await => Err(format!(
+                "{} is in pip's hash-checking mode (its requirements carry --hash or it sets \
+                 --require-hashes), so pip would refuse an unpinned, unhashed `{HOOK_DEP}` line \
+                 and install nothing; add a pinned, hashed hook requirement yourself",
+                path.display()
+            )),
+            added => Ok(added),
+        },
     };
     finish(path, dry_run, outcome).await
+}
+
+/// Whether pip reads this requirements file in hash-checking mode (#378):
+/// its own lines, or any in-root `-r` include it pulls in, carry `--hash` or
+/// `--require-hashes` (the mode spans the whole install). An include that
+/// cannot be read is left to pip to report.
+async fn requirements_tree_requires_hashes(path: &Path, content: &str) -> bool {
+    if requires_hashes(content) {
+        return true;
+    }
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    if path.file_name() != Some(std::ffi::OsStr::new("requirements.txt")) {
+        return false;
+    }
+    let Ok(names) = crate::vendor::pypi_requirements::requirements_include_names(dir).await else {
+        return false;
+    };
+    for rel in names.iter().filter(|rel| *rel != "requirements.txt") {
+        if let Ok(include) = read_regular_to_string(&dir.join(rel)).await {
+            if requires_hashes(&include) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Remove the hook dependency from a manifest. Idempotent (already-absent ->
@@ -155,10 +191,31 @@ fn requirements_add(content: &str) -> Option<String> {
 }
 
 /// Returns `Some(new_content)` if any hook line was removed, `None` otherwise.
+///
+/// Works on pip's logical lines, so a hook requirement continued with `\`
+/// (a pinned, `--hash`-ed hook line) goes as a whole instead of leaving its
+/// `--hash` continuation lines behind (#378).
 fn requirements_remove(content: &str) -> Option<String> {
-    let kept: Vec<&str> = content.lines().filter(|l| !deps_contain_hook(l)).collect();
-    if kept.len() == content.lines().count() {
+    let lines = logical_lines(content);
+    let mut kept: Vec<String> = Vec::new();
+    let mut removed = false;
+    let mut bom = false;
+    for line in &lines {
+        if deps_contain_hook(&line.text) {
+            removed = true;
+            // The file's BOM is encoding, not part of the hook line.
+            bom |= line.start == 0 && line.physical[0].starts_with('\u{feff}');
+        } else {
+            kept.extend(line.physical.iter().cloned());
+        }
+    }
+    if !removed {
         return None;
+    }
+    if bom {
+        if let Some(first) = kept.first_mut() {
+            first.insert(0, '\u{feff}');
+        }
     }
     let nl = detect_eol(content);
     let mut new = kept.join(nl);
@@ -514,6 +571,90 @@ mod tests {
     #[test]
     fn test_requirements_remove_absent() {
         assert!(requirements_remove("requests\n").is_none());
+    }
+
+    /// #378: a hook line with `\` continuations (the `--hash` lines of a
+    /// hash-pinned file) is ONE requirement; `--remove` drops all of it, not
+    /// just the first physical line, leaving no dangling `--hash` behind.
+    #[test]
+    fn test_requirements_remove_drops_continuation_lines() {
+        for nl in ["\n", "\r\n"] {
+            let content = format!(
+                "six==1.16.0 \\{nl}    --hash=sha256:aa{nl}socket-patch-hook==4.0.0 \\{nl}    --hash=sha256:bb \\{nl}    --hash=sha256:cc{nl}idna==3.7 --hash=sha256:dd{nl}"
+            );
+            assert_eq!(
+                requirements_remove(&content).unwrap(),
+                format!("six==1.16.0 \\{nl}    --hash=sha256:aa{nl}idna==3.7 --hash=sha256:dd{nl}")
+            );
+        }
+        // A first-line hook keeps the file's BOM on the next line.
+        assert_eq!(
+            requirements_remove("\u{feff}socket-patch[hook]\nsix\n").unwrap(),
+            "\u{feff}six\n"
+        );
+    }
+
+    /// #378: pip's hash-checking mode (any `--hash`, or `--require-hashes`)
+    /// requires every requirement to be `==`-pinned and hashed. An unhashed
+    /// `socket-patch[hook]` line would make `pip install -r` refuse the whole
+    /// file, so `setup` refuses instead of reporting success — and leaves the
+    /// manifest untouched.
+    #[tokio::test]
+    async fn test_add_refuses_hash_pinned_requirements() {
+        for original in [
+            "six==1.16.0 \\\n    --hash=sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\n",
+            "--require-hashes\nsix==1.16.0\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let req = dir.path().join("requirements.txt");
+            tokio::fs::write(&req, original).await.unwrap();
+            for dry_run in [true, false] {
+                let res = add_hook_dependency(&req, ManifestKind::Requirements, dry_run).await;
+                assert_eq!(res.status, PthStatus::Error, "{original:?}");
+                assert!(
+                    res.error.as_deref().unwrap_or("").contains("hash-checking mode"),
+                    "{:?}",
+                    res.error
+                );
+                assert_eq!(tokio::fs::read_to_string(&req).await.unwrap(), original);
+            }
+        }
+    }
+
+    /// #378: the hash-checking mode spans `-r` includes too.
+    #[tokio::test]
+    async fn test_add_refuses_when_an_include_is_hash_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = dir.path().join("requirements.txt");
+        tokio::fs::write(&req, "-r base.txt\n").await.unwrap();
+        tokio::fs::write(
+            dir.path().join("base.txt"),
+            "six==1.16.0 --hash=sha256:aa\n",
+        )
+        .await
+        .unwrap();
+        let res = add_hook_dependency(&req, ManifestKind::Requirements, false).await;
+        assert_eq!(res.status, PthStatus::Error);
+        assert_eq!(
+            tokio::fs::read_to_string(&req).await.unwrap(),
+            "-r base.txt\n"
+        );
+    }
+
+    /// A hash-pinned file that already declares the hook (the user wrote the
+    /// pinned, hashed line themselves) is configured, not refused.
+    #[tokio::test]
+    async fn test_add_hash_pinned_file_with_hook_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = dir.path().join("requirements.txt");
+        tokio::fs::write(
+            &req,
+            "six==1.16.0 --hash=sha256:aa\nsocket-patch-hook==4.0.0 --hash=sha256:bb\n",
+        )
+        .await
+        .unwrap();
+        let res = add_hook_dependency(&req, ManifestKind::Requirements, false).await;
+        assert_eq!(res.status, PthStatus::AlreadyConfigured);
     }
 
     // ── pyproject PEP 621 ────────────────────────────────────────────
