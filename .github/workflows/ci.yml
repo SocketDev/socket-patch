@@ -1257,19 +1257,19 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java || '17' }}
 
-      - name: Install Maven ${{ matrix.maven }}
-        if: matrix.maven != ''
+      - name: Install Maven ${{ matrix.maven || '3.9.16' }}
+        if: matrix.maven != '' || matrix.gradle != ''
         # Straight from the Apache archive (sha512-verified), so a leg gets
         # exactly the release it names rather than the runner's Maven.
         shell: bash
         env:
-          MAVEN_VERSION: ${{ matrix.maven }}
+          MAVEN_VERSION: ${{ matrix.maven || '3.9.16' }}
         run: |
           major="${MAVEN_VERSION%%.*}"
           url="https://archive.apache.org/dist/maven/maven-${major}/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"
           curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/maven.tgz"
-          sum="$(curl -fsSL --retry 3 "$url.sha512" | cut -d' ' -f1)"
-          echo "$sum  $RUNNER_TEMP/maven.tgz" | shasum -a 512 -c -
+          curl -fsSL --retry 3 "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
+          python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
           tar -xzf "$RUNNER_TEMP/maven.tgz" -C "$RUNNER_TEMP"
           launcher="$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin/mvn"
           if [ "$RUNNER_OS" = Windows ]; then launcher="${launcher}.cmd"; fi
@@ -1393,7 +1393,7 @@ jobs:
           SOCKET_PATCH_COMPOSER_E2E_REQUIRED: ${{ matrix.composer != '' && '1' || '' }}
           SOCKET_PATCH_COMPOSER_E2E_VERSION: ${{ matrix.composer }}
           SOCKET_PATCH_MAVEN_E2E_REQUIRED: ${{ (matrix.maven != '' || matrix.gradle != '') && '1' || '' }}
-          SOCKET_PATCH_MAVEN_E2E_VERSION: ${{ matrix.maven }}
+          SOCKET_PATCH_MAVEN_E2E_VERSION: ${{ matrix.maven || (matrix.gradle != '' && '3.9.16') || '' }}
           SOCKET_PATCH_GRADLE_E2E_REQUIRED: ${{ matrix.gradle != '' && '1' || '' }}
           SOCKET_PATCH_GRADLE_E2E_VERSION: ${{ matrix.gradle }}
           SOCKET_PATCH_DOTNET_E2E_REQUIRED: ${{ matrix.dotnet != '' && '1' || '' }}

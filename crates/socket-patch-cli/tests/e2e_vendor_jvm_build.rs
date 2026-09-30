@@ -58,6 +58,23 @@ fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
 }
 
+/// Java rejects the extended Windows paths returned by canonicalize.
+/// Keep a canonical root for symlinked macOS temp directories, but use the
+/// ordinary drive/UNC spelling when handing paths to Maven and Gradle.
+fn fixture_root(tmp: &tempfile::TempDir) -> PathBuf {
+    let root = tmp.path().canonicalize().unwrap();
+    #[cfg(windows)]
+    if let Some(path) = root.to_str() {
+        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}").into();
+        }
+        if let Some(rest) = path.strip_prefix(r"\\?\") {
+            return rest.into();
+        }
+    }
+    root
+}
+
 fn git_sha256(bytes: &[u8]) -> String {
     socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
 }
@@ -380,7 +397,7 @@ fn maven_reactor_vendor_fresh_checkout_offline_build_and_byte_exact_revert() {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
-    let root: PathBuf = tmp.path().canonicalize().unwrap();
+    let root = fixture_root(&tmp);
     let m2 = root.join("m2");
     let proj = root.join("proj");
     let settings = root.join("settings.xml");
@@ -777,7 +794,7 @@ fn assert_gradle_vendored(out: &Output, checkout: &Path, patched: &[u8], what: &
 fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
     const SUITE: &str = "e2e_vendor_jvm_build::gradle";
     let tmp = tempfile::tempdir().unwrap();
-    let root: PathBuf = tmp.path().canonicalize().unwrap();
+    let root = fixture_root(&tmp);
     let gradle_home = root.join("gradle-home");
     let Some(gradle) = Gradle::detect(SUITE, &gradle_home) else {
         return;
