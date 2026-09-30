@@ -1270,7 +1270,8 @@ jobs:
           curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/maven.tgz"
           curl -fsSL --retry 3 "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
           python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
-          tar -xzf "$RUNNER_TEMP/maven.tgz" -C "$RUNNER_TEMP"
+          # stdin avoids GNU tar treating a Windows drive prefix as a remote host.
+          tar -xzf - -C "$RUNNER_TEMP" < "$RUNNER_TEMP/maven.tgz"
           launcher="$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin/mvn"
           if [ "$RUNNER_OS" = Windows ]; then launcher="${launcher}.cmd"; fi
           echo "SOCKET_PATCH_MAVEN_E2E_MVN=$launcher" >> "$GITHUB_ENV"
