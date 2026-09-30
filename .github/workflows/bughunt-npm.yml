@@ -1,0 +1,40 @@
+name: bughunt-npm
+on:
+  push:
+    branches: ['bughunt/npm/**']
+permissions:
+  contents: read
+jobs:
+  npm-e2e:
+    name: ${{ matrix.os }} npm ${{ matrix.npm }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        npm: ['10.9.9', '12.1.0']
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.15.0'
+      - name: Install npm under test
+        shell: bash
+        run: |
+          npm install --prefix "$RUNNER_TEMP/npm-tool" --no-audit --no-fund "npm@${{ matrix.npm }}"
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN="$RUNNER_TEMP/npm-tool/node_modules/.bin/npm.cmd"; else BIN="$RUNNER_TEMP/npm-tool/node_modules/.bin/npm"; fi
+          "$BIN" --version
+          echo "SOCKET_PATCH_NPM_E2E_BIN=$BIN" >> "$GITHUB_ENV"
+      - name: Real-npm hosted + vendored e2e
+        shell: bash
+        env:
+          SOCKET_PATCH_NPM_E2E_VERSION: ${{ matrix.npm }}
+          SOCKET_PATCH_NPM_E2E_REQUIRED: '1'
+        run: |
+          cargo test -p socket-patch-cli --test e2e_redirect_npm_build --test e2e_vendor_npm_build -- --include-ignored --test-threads 2 2>&1 | tee e2e.log
+          exit "${PIPESTATUS[0]}"
+      - name: Print failures
+        if: failure()
+        shell: bash
+        run: grep -n -E "panicked|FAILED|failures:|assert|Error|error\[" e2e.log | head -200 || true
