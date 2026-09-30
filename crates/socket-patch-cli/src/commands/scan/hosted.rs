@@ -96,6 +96,10 @@ pub(crate) const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     // clobbered).
     ".mvn/maven.config",
     ".mvn/checksums/checksums.sha256",
+    // Never edited: its `distributionUrl` names the project's Maven, which
+    // the maven rewriter checks against the Trusted Checksums floor (3.9.4)
+    // to warn when the `.mvn/*` pin above would be inert.
+    ".mvn/wrapper/maven-wrapper.properties",
     // Gradle build scripts are never edited — their presence only feeds the
     // maven rewriter's paste-able `exclusiveContent` snippet warning.
     "settings.gradle",

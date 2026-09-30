@@ -6554,6 +6554,56 @@ pub(crate) const TRUSTED_CHECKSUMS_ON: &str =
 
 pub(crate) const MVN_CONFIG: &str = ".mvn/maven.config";
 pub(crate) const MVN_CHECKSUMS: &str = ".mvn/checksums/checksums.sha256";
+/// The Maven Wrapper's settings file. Read only, never edited: its
+/// `distributionUrl` names the Maven release the project builds with, so the
+/// rewriter can tell when the Trusted Checksums files it writes are inert.
+pub(crate) const MVN_WRAPPER_PROPERTIES: &str = ".mvn/wrapper/maven-wrapper.properties";
+
+/// The first Maven release that enforces the `.mvn/*` Trusted Checksums
+/// files (#258). 3.9.0 / 3.9.1 do not interpolate `${session.rootDirectory}`
+/// in `maven.config`, so the summary file is never found; 3.9.2 / 3.9.3
+/// ignore `checksumAlgorithms=SHA-256` and check SHA-1 only. Older lines have
+/// no Trusted Checksums post-processor at all.
+const TRUSTED_CHECKSUMS_MIN_MAVEN: [u32; 3] = [3, 9, 4];
+
+/// The Apache Maven release a `maven-wrapper.properties` pins, taken from its
+/// `distributionUrl` (`…/apache-maven-<version>-bin.zip` or `.tar.gz`). None
+/// for a missing key or any other distribution (e.g. mvnd), which then goes
+/// unwarned.
+fn maven_wrapper_version(props: &str) -> Option<String> {
+    props.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with('!') {
+            return None;
+        }
+        let rest = line.strip_prefix("distributionUrl")?;
+        if !rest.starts_with(|c: char| c == '=' || c == ':' || c.is_whitespace()) {
+            return None;
+        }
+        let value = rest
+            .trim_start()
+            .strip_prefix(['=', ':'])
+            .unwrap_or(rest)
+            .trim();
+        let file = value.rsplit('/').next()?;
+        let version = file
+            .strip_prefix("apache-maven-")?
+            .strip_suffix(".zip")
+            .or_else(|| file.strip_prefix("apache-maven-")?.strip_suffix(".tar.gz"))?
+            .strip_suffix("-bin")?;
+        (!version.is_empty()).then(|| version.to_string())
+    })
+}
+
+/// Whether Maven `version` enforces the Trusted Checksums files (≥ 3.9.4;
+/// pre-release suffixes such as `-rc-6` compare as their release).
+fn maven_enforces_trusted_checksums(version: &str) -> bool {
+    let mut parts = [0u32; 3];
+    for (slot, part) in parts.iter_mut().zip(version.split(['.', '-'])) {
+        *slot = part.parse().unwrap_or(0);
+    }
+    parts >= TRUSTED_CHECKSUMS_MIN_MAVEN
+}
 
 /// Strip any `sha256-`/`sha256:` SRI-style prefix off a stored hash, leaving the
 /// bare lowercase hex Maven's trusted-checksums summary file expects (twin of
@@ -6989,6 +7039,25 @@ fn rewrite_maven_pom(
             original: None,
             new: None,
         });
+        // The pin is written regardless (a later wrapper upgrade enforces
+        // it, and the version suffix is fail-closed on its own), but a
+        // project whose wrapper pins a Maven that ignores it must not read
+        // it as client-side content pinning.
+        if let Some(version) = files
+            .get(MVN_WRAPPER_PROPERTIES)
+            .and_then(|props| maven_wrapper_version(props))
+            .filter(|v| !maven_enforces_trusted_checksums(v))
+        {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_trusted_checksums_unenforced".into(),
+                detail: format!(
+                    "{MVN_WRAPPER_PROPERTIES} pins Maven {version}, which does not enforce the \
+                     Trusted Checksums pin in {MVN_CHECKSUMS} (Maven enforces it from 3.9.4); \
+                     only the transport .sha1 check guards the Socket-served artifacts. \
+                     Upgrade the Maven Wrapper to 3.9.4 or later"
+                ),
+            });
+        }
     }
 }
 
@@ -7873,6 +7942,106 @@ mod tests {
 
     /// A user `.mvn/maven.config` key set to a different value is preserved
     /// (never overridden) and a conflict warning is emitted.
+    /// A Maven Wrapper `maven-wrapper.properties` with the given
+    /// `distributionUrl` release.
+    fn maven_wrapper(version: &str) -> String {
+        format!(
+            "# Licensed to the Apache Software Foundation (ASF)\nwrapperVersion=3.3.2\ndistributionType=only-script\ndistributionUrl=https\\://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/{version}/apache-maven-{version}-bin.zip\n"
+        )
+    }
+
+    fn rewrite_with_wrapper(wrapper: &str) -> RewriteResult {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            pom_with_dep("\n      <version>1.7.36</version>", ""),
+        );
+        files.insert(MVN_WRAPPER_PROPERTIES.to_string(), wrapper.to_string());
+        rewrite_registry_redirect(&files, &[maven_override()])
+    }
+
+    /// Maven 3.9.0-3.9.3 (and every older line) never enforce the committed
+    /// `.mvn/checksums` summary (#258). A project whose Maven Wrapper pins
+    /// such a release gets the pin written AND a warning saying it is inert,
+    /// instead of a silent claim of client-side content pinning.
+    #[test]
+    fn maven_pom_trusted_checksums_warns_when_the_wrapper_maven_ignores_them() {
+        for version in ["3.9.0", "3.9.3", "3.8.9", "3.6.3"] {
+            let r = rewrite_with_wrapper(&maven_wrapper(version));
+            assert!(
+                r.files.contains_key(MVN_CHECKSUMS),
+                "{version}: the pin is still written"
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_maven_trusted_checksums_unenforced"],
+                "{version}: {:?}",
+                r.warnings
+            );
+            let detail = &r.warnings[0].detail;
+            assert!(
+                detail.contains(&format!("Maven {version}")) && detail.contains("3.9.4"),
+                "{detail}"
+            );
+            assert!(detail.contains(MVN_WRAPPER_PROPERTIES), "{detail}");
+        }
+    }
+
+    /// 3.9.4 is the first release that rejects a mismatch; newer lines
+    /// (3.10 / 4.0 release candidates included) enforce too. A wrapper with
+    /// no recognisable Apache Maven distribution is never warned about.
+    #[test]
+    fn maven_pom_trusted_checksums_no_warning_for_enforcing_or_unknown_wrapper() {
+        for wrapper in [
+            maven_wrapper("3.9.4"),
+            maven_wrapper("3.9.16"),
+            maven_wrapper("3.10.0-rc-1"),
+            maven_wrapper("4.0.0-rc-6"),
+            "distributionUrl=https://example.test/maven-mvnd-1.0.2-linux-amd64.zip\n".to_string(),
+            "# distributionUrl=https\\://x/apache-maven/3.9.3/apache-maven-3.9.3-bin.zip\n"
+                .to_string(),
+            String::new(),
+        ] {
+            let r = rewrite_with_wrapper(&wrapper);
+            assert!(r.files.contains_key(MVN_CHECKSUMS), "{wrapper}");
+            assert!(r.warnings.is_empty(), "{wrapper}: {:?}", r.warnings);
+        }
+    }
+
+    /// The `distributionUrl` parse: escaped or plain `:`, `=`/`:`/space
+    /// separators, `.tar.gz` distributions, comments and CRLF.
+    #[test]
+    fn maven_wrapper_version_parses_distribution_url() {
+        assert_eq!(
+            maven_wrapper_version(&maven_wrapper("3.9.3")).as_deref(),
+            Some("3.9.3")
+        );
+        assert_eq!(
+            maven_wrapper_version(
+                "distributionUrl : https://archive.apache.org/dist/maven/maven-3/3.9.2/binaries/apache-maven-3.9.2-bin.tar.gz\r\n"
+            )
+            .as_deref(),
+            Some("3.9.2")
+        );
+        assert_eq!(
+            maven_wrapper_version(
+                "! comment\r\ndistributionUrl=https\\://repo/apache-maven-4.0.0-rc-6-bin.zip\r\n"
+            )
+            .as_deref(),
+            Some("4.0.0-rc-6")
+        );
+        assert_eq!(maven_wrapper_version("wrapperVersion=3.3.2\n"), None);
+        assert_eq!(
+            maven_wrapper_version("distributionUrlOld=https://x/apache-maven-3.9.3-bin.zip\n"),
+            None
+        );
+        assert!(!maven_enforces_trusted_checksums("3.9.3"));
+        assert!(maven_enforces_trusted_checksums("3.9.4"));
+        assert!(maven_enforces_trusted_checksums("3.10.0-rc-1"));
+        assert!(maven_enforces_trusted_checksums("4.0.0"));
+        assert!(!maven_enforces_trusted_checksums("3.8.9"));
+    }
+
     #[test]
     fn maven_pom_trusted_checksums_conflict() {
         let mut files = BTreeMap::new();
