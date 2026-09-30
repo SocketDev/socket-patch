@@ -53,7 +53,10 @@ async fn npm_project_local_refuses_with_local_hint() {
         "a project install must get the in-project upgrade command: {stderr}"
     );
     assert!(!stderr.contains("npm update -g"), "{stderr}");
-    assert!(stderr.starts_with("Error: This socket-patch binary ("), "{stderr}");
+    assert!(
+        stderr.starts_with("Error: This socket-patch binary ("),
+        "{stderr}"
+    );
 }
 
 /// An npm-bundled binary (any `node_modules` component) refuses with the
@@ -109,10 +112,10 @@ async fn npm_bundled_refuses_with_npm_hint() {
     release.verify_request_hygiene().await;
 }
 
-/// A PyPI-wheel-bundled binary (`site-packages` component) refuses with
-/// the pip upgrade command.
+/// A legacy PyPI-wheel-bundled binary (`site-packages` component) refuses
+/// in-place updates and points at a supported v5 distribution.
 #[tokio::test]
-async fn pip_bundled_refuses_with_pip_hint() {
+async fn pip_bundled_refuses_with_migration_hint() {
     let install = staged_install_at("venv/lib/python3.12/site-packages/socket_patch/bin");
 
     let (code, _stdout, stderr) = run_installed(
@@ -125,8 +128,13 @@ async fn pip_bundled_refuses_with_pip_hint() {
         "pip-managed install must refuse.\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("pip install --upgrade socket-patch"),
-        "refusal must route to pip's own upgrade command: {stderr}"
+        stderr.contains("pip uninstall socket-patch && ")
+            && stderr.contains(if cfg!(windows) {
+                "npm install -g @socketsecurity/socket-patch"
+            } else {
+                "curl -fsSL https://install.socket.dev/patch | sh"
+            }),
+        "refusal must route to a supported v5 distribution: {stderr}"
     );
 
     install.assert_binary_intact();
@@ -173,14 +181,14 @@ async fn cargo_install_refuses_with_cargo_hint() {
     install.assert_only_binary_present();
 }
 
-/// The gem launcher execs a per-version cached binary under
+/// The legacy gem launcher execs a per-version cached binary under
 /// `<cache>/socket-patch/bin/<version>/<triple>/`; replacing the cache
 /// entry is meaningless (the launcher re-resolves every run), so the
-/// refusal points at the gem's own upgrade command.
+/// refusal points at a supported v5 distribution.
 /// Unix resolution goes through XDG_CACHE_HOME.
 #[cfg(unix)]
 #[tokio::test]
-async fn launcher_cache_refuses_with_gem_hint() {
+async fn launcher_cache_refuses_with_migration_hint() {
     let install = staged_install_at("cache/socket-patch/bin/3.3.0/x86_64-unknown-linux-gnu");
     let cache_root = install
         .root
@@ -203,9 +211,10 @@ async fn launcher_cache_refuses_with_gem_hint() {
         "launcher-cache install must refuse.\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("gem update"),
-        "the launcher-cache refusal must point at the gem's own upgrade \
-         command: {stderr}"
+        stderr.contains(
+            "gem uninstall socket-patch && curl -fsSL https://install.socket.dev/patch | sh"
+        ),
+        "the launcher-cache refusal must point at the standalone installer: {stderr}"
     );
 
     install.assert_binary_intact();
@@ -216,7 +225,7 @@ async fn launcher_cache_refuses_with_gem_hint() {
 /// %LOCALAPPDATA% there (no ~/.cache convention).
 #[cfg(windows)]
 #[tokio::test]
-async fn launcher_cache_refuses_with_gem_hint_windows() {
+async fn launcher_cache_refuses_with_migration_hint_windows() {
     let install = staged_install_at("cache/socket-patch/bin/3.3.0/x86_64-pc-windows-msvc");
     // Canonicalized for the same reason as the unix rows: the exe path is
     // canonicalized (verbatim \\?\ form on Windows), so the root must be
@@ -242,9 +251,9 @@ async fn launcher_cache_refuses_with_gem_hint_windows() {
         "launcher-cache install must refuse.\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("gem update"),
-        "the launcher-cache refusal must point at the gem's own upgrade \
-         command: {stderr}"
+        stderr
+            .contains("gem uninstall socket-patch && npm install -g @socketsecurity/socket-patch"),
+        "the launcher-cache refusal must point at the npm distribution: {stderr}"
     );
 
     install.assert_binary_intact();

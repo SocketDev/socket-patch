@@ -2,27 +2,21 @@ name: Release
 
 # One-dispatch release orchestrator: version gate, build matrix, tag, and
 # GitHub release live here; each registry publish lives in its own
-# independently-runnable workflow (publish-cargo.yml, publish-npm.yml,
-# publish-pypi.yml, publish-rubygems.yml). The fan-out jobs below dispatch
-# each of those at the release tag via `gh workflow run`
+# independently-runnable workflow (publish-cargo.yml, publish-npm.yml).
+# The fan-out jobs below dispatch each at the release tag via `gh workflow run`
 # (scripts/dispatch-publish.sh) and watch the dispatched run to completion,
 # so this run's job graph still reflects every registry's real outcome and
 # "Re-run failed jobs" re-dispatches exactly the failed legs. A failed leg
 # can also be retried without this run at all: fix the cause and dispatch
 # that registry's workflow manually with the release version — no rebuild
-# happens either way. The npm and PyPI legs take the prebuilt binaries from
+# happens either way. The npm leg takes the prebuilt binaries from
 # the GitHub release's assets (verified against SHA256SUMS, pinned by digest
-# on the fan-out path), and the launcher gem downloads its binary from the
-# release at run time — which is why npm/PyPI/RubyGems wait on
-# `github-release` below.
+# on the fan-out path), which is why it waits on `github-release` below.
 #
 # Why dispatch instead of `uses:` (reusable workflows) — two GitHub/registry
 # facts, verified 2026-08-21 against the registries' docs and source:
-#   1. Registry OIDC trusted publishers are keyed on a workflow FILENAME,
-#      but the registries disagree on WHICH one: npm and crates.io match the
-#      top-level workflow (`workflow_ref` claim), while PyPI and RubyGems
-#      match the file defining the job (`job_workflow_ref`) — and PyPI plans
-#      to flip to top-level matching (warehouse PR #20083). npm additionally
+#   1. npm and crates.io OIDC trusted publishers match the top-level
+#      workflow filename (`workflow_ref` claim). npm additionally
 #      allows only ONE trusted publisher per package, so a leg that is
 #      sometimes `uses:`-called (top-level = release.yml) and sometimes
 #      dispatched (top-level = its own file) can never be authorized for
@@ -35,14 +29,11 @@ name: Release
 #      are documented exceptions, so `gh workflow run` with GITHUB_TOKEN
 #      works without a PAT/GitHub App token.
 #
-# Credentials / deployment-environment matrix (per-registry):
+# Registry credentials:
 #   - crates.io:     OIDC trusted publishing (rust-lang/crates-io-auth-action);
 #                    no long-lived secret, no environment.
 #   - npm:           OIDC via `npm stage publish`; staged versions require
 #                    manual 2FA approval (see the npm run's step summary).
-#   - PyPI:          OIDC trusted publishing; environment `pypi`.
-#   - RubyGems:      OIDC trusted publishing; environment `rubygems`
-#                    (the `socket-patch` launcher gem).
 # Every registry's trusted publisher is keyed on the repo + the publish
 # workflow's own filename (see each publish-*.yml header), NOT release.yml.
 
@@ -240,9 +231,9 @@ jobs:
     permissions:
       contents: write
     outputs:
-      # sha256 of the SHA256SUMS file uploaded below. The npm/PyPI fan-out
-      # passes it to those legs, which re-download the assets from the
-      # release: pinning the sums file by digest binds what the legs publish
+      # sha256 of the SHA256SUMS file uploaded below. The npm fan-out
+      # passes it to the publish leg, which re-downloads the assets from the
+      # release: pinning the sums file by digest binds what it publishes
       # to exactly what THIS run built, restoring the same-run-artifact
       # provenance the pre-split inline jobs had (release assets are mutable;
       # anyone with contents:write could clobber them between jobs).
@@ -318,9 +309,8 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: bash scripts/dispatch-publish.sh publish-cargo.yml "$VERSION"
 
-  # npm, PyPI, and RubyGems consume the GitHub release (npm/PyPI take the
-  # prebuilt binaries from its assets; the launcher gem downloads its binary
-  # from it at run time), so all three wait on `github-release`.
+  # npm takes the prebuilt binaries from the GitHub release's assets,
+  # so it waits on `github-release`.
   npm-publish:
     needs: [version, github-release]
     if: ${{ !inputs.dry-run }}
@@ -348,51 +338,3 @@ jobs:
             exit 1
           fi
           bash scripts/dispatch-publish.sh publish-npm.yml "$VERSION" "sums-digest=${SUMS_DIGEST}"
-
-  pypi-publish:
-    needs: [version, github-release]
-    if: ${{ !inputs.dry-run }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      actions: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Dispatch and watch Publish PyPI
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.version.outputs.version }}
-          SUMS_DIGEST: ${{ needs.github-release.outputs.sums-digest }}
-        run: |
-          # Fail closed: an empty digest would silently downgrade the leg's
-          # asset check from provenance-pinned to integrity-only.
-          if [ -z "$SUMS_DIGEST" ]; then
-            echo "::error::github-release produced no SHA256SUMS digest; refusing to dispatch an unpinned publish"
-            exit 1
-          fi
-          bash scripts/dispatch-publish.sh publish-pypi.yml "$VERSION" "sums-digest=${SUMS_DIGEST}"
-
-  rubygems-publish:
-    needs: [version, github-release]
-    if: ${{ !inputs.dry-run }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      actions: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Dispatch and watch Publish RubyGems
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.version.outputs.version }}
-        run: bash scripts/dispatch-publish.sh publish-rubygems.yml "$VERSION"

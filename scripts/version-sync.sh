@@ -3,8 +3,6 @@
 #   - Cargo.toml (workspace version + socket-patch-core exact pin)
 #   - npm/socket-patch/package.json (+ optionalDependencies, package-lock.json)
 #   - npm/socket-patch-*/package.json (per-platform packages)
-#   - pypi/socket-patch/pyproject.toml
-#   - gem/socket-patch/socket-patch.gemspec + lib/socket_patch/launcher.rb
 set -euo pipefail
 
 VERSION="${1:?Usage: version-sync.sh <version>}"
@@ -62,26 +60,5 @@ for platform_dir in "$REPO_ROOT"/npm/socket-patch-*/; do
     "
   fi
 done
-
-# Update PyPI package version
-pyproject="$REPO_ROOT/pypi/socket-patch/pyproject.toml"
-sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" "$pyproject"
-rm -f "$pyproject.bak"
-
-# pypi/socket-patch-hook and gem/socket-patch-bundler are frozen: `setup`
-# was removed in v5 and neither is built or published any more.
-
-# Update the RubyGems CLI launcher gem (gemspec version + the VERSION constant
-# the launcher uses to pick the matching GitHub release binary).
-ruby_cli_gemspec="$REPO_ROOT/gem/socket-patch/socket-patch.gemspec"
-if [ -f "$ruby_cli_gemspec" ]; then
-  sed -i.bak "s/s\.version *= *\".*\"/s.version     = \"$VERSION\"/" "$ruby_cli_gemspec"
-  rm -f "$ruby_cli_gemspec.bak"
-fi
-ruby_cli_launcher="$REPO_ROOT/gem/socket-patch/lib/socket_patch/launcher.rb"
-if [ -f "$ruby_cli_launcher" ]; then
-  sed -i.bak "s/VERSION = \".*\"/VERSION = \"$VERSION\"/" "$ruby_cli_launcher"
-  rm -f "$ruby_cli_launcher.bak"
-fi
 
 echo "Synced version to $VERSION"
