@@ -2454,12 +2454,25 @@ pub(crate) async fn vendor_records_reusing(
                     && (entry.artifact.file_inventory.is_some()
                         || vendor::artifact_is_file_shaped(&entry.artifact.path))
             }) {
-                if vendor::check_vendored_artifact(&common.cwd, entry, record).await
-                    != vendor::ArtifactHealth::Healthy
-                    || (entry.artifact.sha256.is_empty()
-                        && entry.artifact.file_inventory.is_none()
-                        && vendor::artifact_is_file_shaped(&entry.artifact.path))
-                {
+                let redownload =
+                    match vendor::check_vendored_artifact(&common.cwd, entry, record).await {
+                        vendor::ArtifactHealth::Healthy => {
+                            entry.artifact.sha256.is_empty()
+                                && entry.artifact.file_inventory.is_none()
+                                && vendor::artifact_is_file_shaped(&entry.artifact.path)
+                        }
+                        // Only a Bun member-relative mirror of the verified
+                        // canonical tarball is off: the backend rewrites it from
+                        // the committed tarball, offline too.
+                        vendor::ArtifactHealth::Corrupt { reason }
+                            if reason.starts_with("vendor_workspace_artifact_")
+                                && !entry.artifact.sha256.is_empty() =>
+                        {
+                            false
+                        }
+                        _ => true,
+                    };
+                if redownload {
                     if common.dry_run {
                         env.record(PatchEvent::new(PatchAction::Verified, candidate.clone()).with_details(serde_json::json!({"wouldRedownload": true, "path": entry.artifact.path})));
                         continue;

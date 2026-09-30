@@ -398,3 +398,35 @@ async fn rollback_and_offline_vendor_refuse_with_the_checkout_remedy() {
     );
     assert_eq!(p.lock(), hosted, "a refused rollback writes nothing");
 }
+
+/// A Bun workspace's member-relative mirror of the vendored tarball goes
+/// missing while the canonical tarball still matches its ledger SHA-256:
+/// an offline re-vendor rewrites the mirror from the committed tarball
+/// rather than refusing to redownload an artifact it already holds.
+#[tokio::test]
+async fn offline_vendor_rewrites_a_missing_workspace_mirror() {
+    let p = hosted_project("1.1.45-extensions").await;
+    // The pre-hosted lock (`git checkout -- bun.lockb`): a plain vendor.
+    std::fs::write(p.root().join("bun.lockb"), &p.pristine).unwrap();
+    stage_record(p.root());
+    let (code, env) = p.run_json(&["vendor"]);
+    assert_eq!(code, 0, "{env:#}");
+    let canonical = p
+        .root()
+        .join(format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz"));
+    let mirror = p.root().join(format!(
+        "packages/helper/.socket/vendor/npm/{UUID}/minimist-1.2.2.tgz"
+    ));
+    let tarball = std::fs::read(&canonical).unwrap();
+    assert_eq!(std::fs::read(&mirror).unwrap(), tarball, "{env:#}");
+    std::fs::remove_file(&mirror).unwrap();
+
+    let (code, env) = p.run_json(&["vendor", "--offline"]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(
+        !codes(&env).iter().any(|c| c == "vendor_redownload_failed"),
+        "{env:#}"
+    );
+    assert_eq!(std::fs::read(&mirror).unwrap(), tarball);
+    assert_eq!(std::fs::read(&canonical).unwrap(), tarball);
+}
