@@ -277,11 +277,28 @@ pub async fn vendor_yarn_berry<'a>(
     let hash6 = &tgz_sha512[..6];
     let locator = encode_uri_component(&format!("{workspace}@workspace:."));
     let resolution = format!("{name}@file:./{rel_tgz}#./{rel_tgz}::hash={hash6}&locator={locator}");
+    // The service is the authority for the checksum of these bytes.
+    let mut service_serves_other_bytes = false;
+    if packed.yarn_berry10c0.is_none() {
+        if let Some(cfg) = service.filter(|cfg| cfg.service_enabled()) {
+            if let super::service_fetch::ServiceArtifact::Ready(archive) =
+                super::service_fetch::fetch_verified_archive(cfg, &record.uuid).await
+            {
+                if hex::encode(Sha256::digest(&archive.bytes)) == packed.sha256_hex {
+                    packed.yarn_berry10c0 = archive.yarn_berry10c0;
+                } else {
+                    service_serves_other_bytes = true;
+                }
+            }
+        }
+    }
     // A reused ledger entry written before the checksum was recorded (or by
-    // another npm flavor) carries none. When our own lock entry already
-    // pins `hash=` of these verified bytes, it was written from them: its
-    // checksum is theirs, so an in-sync re-run needs no service (offline
-    // included).
+    // another npm flavor) carries none. When the service cannot vouch
+    // (offline, unavailable, or serving other bytes) but our own lock entry
+    // already pins `hash=` of these verified bytes, it was written from
+    // them, so an in-sync re-run can keep its checksum. Such a checksum only
+    // re-wires; it is never recorded in the ledger.
+    let mut recovered_from_lock = false;
     if packed.yarn_berry10c0.is_none()
         && reused
         && target_is_ours
@@ -295,17 +312,7 @@ pub async fn vendor_yarn_berry<'a>(
             };
             if valid_berry_checksum(&full) {
                 packed.yarn_berry10c0 = Some(full);
-            }
-        }
-    }
-    if packed.yarn_berry10c0.is_none() {
-        if let Some(cfg) = service.filter(|cfg| cfg.service_enabled()) {
-            if let super::service_fetch::ServiceArtifact::Ready(archive) =
-                super::service_fetch::fetch_verified_archive(cfg, &record.uuid).await
-            {
-                if hex::encode(Sha256::digest(&archive.bytes)) == packed.sha256_hex {
-                    packed.yarn_berry10c0 = archive.yarn_berry10c0;
-                }
+                recovered_from_lock = true;
             }
         }
     }
@@ -313,8 +320,11 @@ pub async fn vendor_yarn_berry<'a>(
         Some(c) => checksum_in_lock_spelling(&lock_text, c),
         // A reused tarball is kept as is, so retrying cannot help when the
         // service serves other bytes: only a fresh vendor can wire it.
+        None if reused && service_serves_other_bytes => return done_failure_unstage(purl,
+            format!("the patch service now serves other bytes than the committed {rel_tgz}, and no Yarn Berry checksum is recorded for it; restore yarn.lock from version control, or run `socket-patch vendor --revert` (it reverts every vendored package) and vendor again"),
+            project_root, &uuid_dir_rel, uuid_dir_preexisted).await,
         None if reused => return done_failure_unstage(purl,
-            format!("the patch service supplied no Yarn Berry checksum for the committed {rel_tgz}; run `vendor --revert` for {purl} and re-vendor"),
+            format!("no Yarn Berry checksum is recorded for the committed {rel_tgz}; re-run online so the patch service can supply it"),
             project_root, &uuid_dir_rel, uuid_dir_preexisted).await,
         None => return done_failure_unstage(purl,
             format!("the patch service supplied no Yarn Berry checksum for {name}; retry after the server artifact is ready"),
@@ -450,7 +460,10 @@ pub async fn vendor_yarn_berry<'a>(
         base_purl,
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
-            yarn_berry10c0: packed.yarn_berry10c0.clone(),
+            yarn_berry10c0: packed
+                .yarn_berry10c0
+                .clone()
+                .filter(|_| !recovered_from_lock),
             path: rel_tgz,
             sha256: packed.sha256_hex,
             size: Some(packed.size),
@@ -2108,7 +2121,12 @@ __metadata:
             ts::mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &ts::regzip(&tgz_first)).await;
             let offline = ts::service_cfg(&server.uri(), VendorSource::Service, true);
             let reencoded = ts::service_cfg(&server.uri(), VendorSource::Service, false);
-            for service in [None, Some(&offline), Some(&reencoded)] {
+            for (service, asks_service) in [
+                (None, false),
+                (Some(&offline), false),
+                (Some(&reencoded), true),
+            ] {
+                let requests_before = ts::request_count(&server).await;
                 let (result, entry, _) = expect_done(rerun(&fx, service).await);
                 assert!(result.success, "{:?}", result.error);
                 assert!(entry.is_none(), "in-sync re-run writes no ledger entry");
@@ -2123,19 +2141,37 @@ __metadata:
                 assert_eq!(tokio::fs::read(fx.pkg_path()).await.unwrap(), pkg_first);
                 assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), lock_first);
                 assert_eq!(tokio::fs::read(fx.tgz_path()).await.unwrap(), tgz_first);
+                // Online, the service is asked first; offline or without one,
+                // nothing goes out.
+                assert_eq!(
+                    ts::request_count(&server).await > requests_before,
+                    asks_service
+                );
             }
-            assert_eq!(ts::request_count(&server).await, 0, "no service request");
 
             // Our entry pinning other bytes vouches for nothing.
             let tampered = String::from_utf8(lock_first)
                 .unwrap()
                 .replace("::hash=", "::hash=0");
             tokio::fs::write(fx.lock_path(), &tampered).await.unwrap();
+            // Without the service, a retry online is the remedy.
             let (result, entry, _) = expect_done(rerun(&fx, None).await);
             assert!(!result.success);
             let error = result.error.unwrap_or_default();
             assert!(
-                error.contains("no Yarn Berry checksum") && error.contains("vendor --revert"),
+                error.contains("no Yarn Berry checksum")
+                    && error.contains("re-run online")
+                    && !error.contains("--revert"),
+                "{error}"
+            );
+            assert!(entry.is_none());
+            // A service serving other bytes can never vouch: only a revert
+            // and a fresh vendor can wire it.
+            let (result, entry, _) = expect_done(rerun(&fx, Some(&reencoded)).await);
+            assert!(!result.success);
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains("serves other bytes") && error.contains("vendor --revert"),
                 "{error}"
             );
             assert!(entry.is_none());
