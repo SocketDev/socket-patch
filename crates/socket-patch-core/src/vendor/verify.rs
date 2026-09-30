@@ -196,11 +196,16 @@ async fn verify_dir_members(
     Ok(())
 }
 
-/// A vlt package-dir entry: npm, flavor `vlt`, not a tarball.
+/// A vlt package-dir entry: npm, flavor `vlt`, not a tarball. The vendored
+/// dir layout decides before the suffix does: the path ends in the package
+/// name, which may itself end in one (`lodash.zip`).
 pub(crate) fn is_vlt_dir_entry(entry: &VendorEntry) -> bool {
     entry.ecosystem == "npm"
         && entry.flavor.as_deref() == Some(super::vlt_lock::FLAVOR)
-        && !artifact_is_file_shaped(&entry.artifact.path)
+        && (!artifact_is_file_shaped(&entry.artifact.path)
+            || parse_vendor_path(&entry.artifact.path)
+                .and_then(|p| super::vlt_lock_text::parse_vendored_dir_leaf(&p.leaf))
+                .is_some())
 }
 
 /// The largest afterHash blob the vlt manifest exemption reads.
@@ -1758,6 +1763,35 @@ mod tests {
             check_vendored_artifact(root, &ent, &rec).await,
             ArtifactHealth::Corrupt { .. }
         ));
+    }
+
+    /// A vlt package whose name ends in an archive suffix (`lodash.zip`) is
+    /// still a vlt dir: its dependency links pass the vlt structure rule
+    /// instead of failing the generic whole-tree inventory walk.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vlt_dir_named_like_an_archive_is_still_a_vlt_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/npm/{UUID}/lodash.zip-4.2.0/node_modules/lodash.zip");
+        let dir = root.join(&rel);
+        tokio::fs::create_dir_all(dir.join("node_modules"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("index.js"), PATCHED)
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("../../../dep", dir.join("node_modules/dep")).unwrap();
+        let rec = record(UUID, "package/index.js");
+        let mut ent = entry("npm", UUID, &rel);
+        ent.flavor = Some("vlt".into());
+        ent.artifact.file_inventory = Some(compute_package_dir_inventory(&dir).await.unwrap());
+        assert!(artifact_is_file_shaped(&rel));
+        assert!(is_vlt_dir_entry(&ent));
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Healthy
+        );
     }
 
     #[tokio::test]
