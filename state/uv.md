@@ -1,19 +1,19 @@
 [agent] Progress ledger for the scheduled uv bug-hunt routine (label pm:uv).
 
-Last run: 2026-10-01 (run 4) on main `6e7ef74` (v5; CLI reports 4.0.0, and the released 4.0.0 predates both the v4 uv rewriter and the v5 upstream restore). Earlier cells are from `2463257`; the commits since then don't touch uv code. Linux runs use real uv against a local mock patch API (with `integrity.sha512`, `--patch-server-url`, and `SOCKET_PYPI_JSON_API` → a local pypi.org forwarder). macOS and Windows runs use probe branches.
+Last run: 2026-10-01 (run 5) on main `61cfb9b` (v5; CLI reports 4.0.0, and the released 4.0.0 predates both the v4 uv rewriter and the v5 upstream restore). Earlier cells are from `2463257` / `6e7ef74`. Linux runs use real uv against a local mock patch API (with `integrity.sha512` in SRI form, a deterministic wheel, the `/blob/` route and `--patch-server-url`), plus `SOCKET_PYPI_JSON_API` → a local pypi.org pass-through that must not rewrite file URLs. uv 0.1.x needs `SSL_CERT_FILE`; uv 0.0.5 needs `PUFFIN_INDEX_URL` → a local `/simple/` proxy. macOS and Windows runs use probe branches.
 
 ## Coverage matrix
 H = hosted, V = vendored, A = agent. "pass/fail" is Linux unless an OS is named. Results are from v5 main (`2463257` / `6e7ef74`) unless marked (v4).
 
 | uv | H native | H rollback / remove (upstream restore) | V native | V repair | A | Other |
 | --- | --- | --- | --- | --- | --- | --- |
-| 0.0.5 – 0.1.44 (requirements lane) | blocked in sandbox (TLS) | – | – | – | untested | |
+| 0.0.5 / 0.1.20 / 0.1.32 / 0.1.44 (requirements lane) | pass (hashed and unhashed; 0.1.44 on 3 OS) | pass byte-identical; **fail #477** stale install after unwind (3 OS) | pass (0.1.44, 3 OS, hashed, LF/CRLF) | – | untested | |
 | 0.1.45 / 0.2.5 / 0.2.18 / 0.2.34 (`[[distribution]]`) | pass (plain sync; 0.2.34 `--frozen`/`--locked`) | refused (documented) | refused (documented) | – | untested | |
-| 0.2.37 | pass | pass after edit / `uv add` (Linux, macOS, Windows); **fail #411** user override (Linux, Windows) | pass | pass (Linux, macOS, Windows) | untested | |
-| 0.4.30 | pass (v4) | untested on v5 | untested | untested | untested | |
-| 0.5.17 / 0.5.31 | pass | pass after edit / `uv add` (3 OS); **fail #411** (3 OS); **fail #473** (3 OS) | pass; **fail #474** (3 OS, 0.5.17 Linux) | pass (Windows, macOS) | untested | |
-| 0.8.17 | pass (explicit / default local index, groups, `package = false`, `environments`, self-ref extras) | **fail #407**; **fail #408**; **fail #411**; **fail #473** include-group (3 OS) | pass (script lock, `pylock.dev.toml`, include-group); **fail #474** script revert after `uv add --script` (3 OS) | untested | pass (v5: hardlink, VEX, reinstall → re-apply) | workspace refused (by design) |
-| 0.12.21 | pass (`--locked`/`--frozen`/plain, inline sources, BOM, odd-case name, idempotent, VEX, pylock, script lock, CRLF, hashed requirements, markers, ranges, groups, extras, transitive override) | pass after edit / `uv add` (3 OS), script lock, hashed requirements, CRLF, multi-file; **fail #411** (3 OS); **fail #407**; **fail #408**; **fail #473** (3 OS) | pass; **fail #474** (3 OS) | pass (3 OS, venv + lock-only) | pass (v4: hardlink / symlink link-mode) | H→V pass (v5); V→H warn-only |
+| 0.2.37 / 0.4.30 | pass | pass after edit / `uv add` (Linux, macOS, Windows); **fail #411** user override (Linux, Windows); **fail #477** `uv sync` keeps patched wheel after rollback | pass | pass (Linux, macOS, Windows) | untested | |
+| 0.5.17 / 0.5.31 | pass; requirements lane pass (3 OS) | pass after edit / `uv add` (3 OS); **fail #411** (3 OS); **fail #473** (3 OS); **fail #477** stale after rollback (uv.lock and `uv pip sync`) | pass; **fail #474** (3 OS, 0.5.17 Linux) | pass (Windows, macOS) | untested | |
+| 0.8.17 | pass (explicit / default local index, groups, `package = false`, `environments`, self-ref extras, hashed-requirements variants, uv.lock + exported requirements.txt, two pylocks) | pass after `uv remove` / `uv lock --upgrade-package`; **fail #407**; **fail #408** (re-confirmed on `61cfb9b`); **fail #411**; **fail #473** include-group (3 OS); **fail #477** stale after rollback/revert | pass (script lock, `pylock.dev.toml`, include-group); **fail #474** script revert after `uv add --script` (3 OS) | untested | pass (v5: hardlink, VEX, reinstall → re-apply) | workspace refused (by design) |
+| 0.8.18 – 0.12.0 (bisect) | – | `uv sync` after rollback reinstalls upstream (uv-side fix in 0.8.18) | – | – | – | |
+| 0.12.21 | pass (requirements lane on 3 OS, `--locked`/`--frozen`/plain, inline sources, BOM, odd-case name, idempotent, VEX, pylock, script lock, CRLF, hashed requirements, markers, ranges, groups, extras, transitive override) | pass after edit / `uv add` (3 OS), script lock, hashed requirements, CRLF, multi-file; **fail #411** (3 OS); **fail #407**; **fail #408**; **fail #473** (3 OS); `uv pip sync` after requirements unwind **fail #477** (3 OS) | pass; **fail #474** (3 OS) | pass (3 OS, venv + lock-only) | pass (v5: hardlink apply / VEX / rollback / re-apply) | H→V pass (v5); V→H warn-only |
 
 
 ### Global (`-g`) mode
@@ -27,11 +27,11 @@ H = hosted, V = vendored, A = agent. "pass/fail" is Linux unless an OS is named.
 
 ## Backlog
 1. **Maintainer request (still open):** global `-g` apply / rollback / vex against a live free pypi patch (the e2e UUID `725a5343-…` returns `not_found`), plus the unwritable-prefix cell. Checklist in the 20261001T040000Z entry.
-2. uv 0.0.5 – 0.1.44 hosted requirements lane via a probe (the sandbox can't reach PyPI with those binaries).
-3. Array-shrink and array-grow drift around #474: hosted script lock + `uv add/remove --script` on v5; vendored project lock + `uv remove` of a sibling; vendored `[manifest] constraints` / `overrides` after a user adds another entry.
-4. Windows uv-managed Python root under `-g`.
-5. `pylock.<name>.toml` mixed index / no-index siblings (the #407 rule); Windows CRLF checkout + vendored `repair`.
-6. Re-triage #407, #408, #411, #449, #473 and #474 once main moves.
+2. After #481 merges: re-check #474, plus vendored `[manifest] constraints` / `overrides` growth and vendored project `uv remove` of a sibling.
+3. Windows uv-managed Python root under `-g`, and re-check #449 on a Windows probe.
+4. `pylock.<name>.toml` mixed index / no-index siblings (the #407 rule); Windows CRLF checkout + vendored `repair` on uv.lock.
+5. Hosted uv.lock on Windows with space / unicode project paths; `uv sync --frozen` from a lock-only checkout.
+6. Re-triage #407, #408, #411, #449, #473, #474 and #477 (uv part) once main moves.
 
 ## Known non-bugs
 - uv workspaces (`[tool.uv.workspace]` or `[manifest] members` beyond the root) are refused in both modes (`redirect_uv_project_unsupported` / `pypi_uv_workspace_unsupported`). This is by design, though it's missing from docs/testing/uv-compatibility.md.
@@ -46,3 +46,7 @@ H = hosted, V = vendored, A = agent. "pass/fail" is Linux unless an OS is named.
 - `scan -g --mode hosted` (and `--global-prefix` / `SOCKET_GLOBAL=1` with hosted) exits 2 by design. A global scan with no mode is report-only.
 - Hosted rollback refuses a uv lock whose other registry packages come from an explicit `[[tool.uv.index]]` (for example a PyTorch index next to PyPI → "several registries"; only one sibling, on that index → "not PyPI"), even though the patched package came from PyPI. CLI_CONTRACT documents this ("other registry packages name … several, or one other than PyPI's simple index"). Hosted scan of a package that carries its own `{ index = … }` source is warn-only `redirect_uv_project_unsupported` ("already declares a source"). Both are documented. The first is a candidate for a maintainer to narrow.
 - Agent-mode `repair` → `download_failed` against the local mock is a harness gap (no diff archive served).
+- Hosted rollback of a requirements line spelled `Six===1.16.0` restores `six==1.16.0`, and a comment after a hash continuation is joined onto the last hash line. v5 upstream restore re-derives the pin, so the install is identical. uv never writes either spelling (cosmetic).
+- Scan with an in-run `--vex` exits 1 `no_applicable_patches` while the venv is still stale (documented "installed evidence wins").
+- Hosted rollback of a script lock after `uv remove --script` of its only sibling refuses "no sibling registry package…" (documented; same as the project case).
+- Mock-harness pitfalls: a hex `integrity.sha512` → `vendor_prebuilt_integrity_mismatch` (the service sends SRI `sha512-<b64>`); a non-deterministic mock wheel → hash mismatch after a mock restart; a JSON forwarder that rewrites file URLs → rollback writes those URLs into the lock.
