@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Deno bug-hunt routine (label pm:deno).
 
-Last updated: 2026-10-01 (run 2), main `2463257` (#277, the v5 consolidation; `setup` removed), latest release 4.0.0 (previous 3.3.0).
+Last updated: 2026-10-01 (run 3, global mode), main `2463257` (#277, the v5 consolidation; `setup` removed), latest release 4.0.0 (previous 3.3.0).
 
 Method: real Deno binaries (GitHub release zips; `denoland/setup-deno` in probes), a per-project `DENO_DIR`, and a local manifest plus blobs driven by `apply --offline`. The patched bytes record themselves in `globalThis.__SP`, so `deno run` shows which patched modules actually loaded. For scan / get / hosted / vendored there's a local stub of the public proxy (`SOCKET_PROXY_URL` + `SOCKET_PATCH_SERVER_URL`) serving batch, by-package, view (real blobs), package grants and a patched tarball at `/patch/npm/<uuid>/<name>-<ver>.tgz`. Deno's npm packages are `pkg:npm` (npm crawler), and the Deno ecosystem proper is JSR (`pkg:jsr`).
 
@@ -15,16 +15,24 @@ Method: real Deno binaries (GitHub release zips; `denoland/setup-deno` in probes
 | macOS | 1.46.3 / 2.2.15 / 2.9.6 | pass (scoped; apply / vex / rollback) | fail #373 | untested | fail #374 | pass | untested | untested | pass (agent) |
 | Windows | 1.46.3 / 2.2.15 / 2.9.6 | pass (scoped via junctions; apply / vex / rollback) | fail #373 | untested | fail #374 | pass | untested | untested | pass (agent) |
 
+### Global mode (`-g` / `--global-prefix` / `SOCKET_GLOBAL`), `deno install -g` of a tool with an `npm:` dep
+
+| OS | Deno | `scan -g` report | `apply -g` | `--global-prefix` on `$DENO_DIR` layouts | 2.9 per-tool `bin/.<tool>/node_modules` | rollback -g | vex -g | hosted refusal |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Linux | 1.46.3 / 2.2.15 | fail #444 | fail #444 | fail #444 | n/a | untested (blocked by #444) | fail #444 (`no_applicable_patches`) | pass (2.9.6) |
+| Linux | 2.9.6 | fail #444 | fail #444 | fail #444 | fail #444 (false `applied` + VEX for local/JSR tools; pass for `npm:` tools) | untested | fail #444 | pass |
+| Linux / macOS / Windows | 1.46.3, 2.0.6, 2.2.15, 2.4.5, 2.9.6 (probe) | Windows also #434 | fail #444 | fail #444 | 2.9.6 only: fail #444 | untested | 2.9.6 decoy: false `not_affected` | untested |
+
 Other passes (Linux): re-apply idempotency, rollback, `remove`, breaking cache hardlinks, end-to-end `scan --mode agent` via the stub, unicode / space paths, and deno.lock v3 / v5 never edited (`--frozen` still OK).
 
 ## Backlog
 
-0. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Deno version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
-1. A maintainer needs to delete the stale probe branches `bughunt/deno/20260930-deno-store` and `bughunt/deno/20261001-scoped-jsr`. The git proxy refuses `push --delete`.
-2. #406 follow-ups: pnpm-lock / yarn.lock / bun.lock beside deno.lock. Done: Deno 1.46.3 (affected) and vendored (affected, and VEX survives the install).
-3. `.deno` peer-variant and scoped transitive entries, once #373 is fixed.
-4. Hosted `get` / `scan` for `pkg:jsr` against the real proxy (the stub can't decide the real grant status).
-5. `nodeModulesDir: none`: deno.lock as a lockfile supplement (enhancement).
+0. **Maintainer request (global mode), partly covered.** Filed #444. Still to do: an unwritable global prefix (read-only `DENO_INSTALL_ROOT` / `DENO_DIR`) on all 3 OSes (blocked on Linux because the sandbox runs as root), `rollback -g` after #444 is fixed, `DENO_DIR` with spaces or unicode, and macOS/Windows hosted-refusal cells. Full checklist in the 20261001T040000Z entry.
+1. A maintainer needs to delete the stale probe branches `bughunt/deno/20260930-deno-store`, `bughunt/deno/20261001-scoped-jsr` and `bughunt/deno/20261001-global`. The git proxy refuses `push --delete`.
+2. Find the first Deno 2.x that writes the per-tool `bin/.<tool>` dir (absent in 2.4.5, present in 2.9.6), for #444.
+3. #406 follow-ups: pnpm-lock / yarn.lock / bun.lock beside deno.lock. Done: Deno 1.46.3 (affected) and vendored (affected, and VEX survives the install).
+4. `.deno` peer-variant and scoped transitive entries, once #373 is fixed.
+5. Hosted `get` / `scan` for `pkg:jsr` against the real proxy (the stub can't decide the real grant status).
 6. CRLF / BOM `deno.jsonc` / `deno.lock`, and `DENO_DIR` with spaces, on Windows.
 
 ## Known non-bugs
@@ -37,3 +45,6 @@ Other passes (Linux): re-apply idempotency, rollback, `remove`, breaking cache h
 - Hosted `get pkg:jsr/...` gives `redirected: 0` with only a human "no lockfile entry" line (no JSON code). Unverified against the real proxy; revisit (backlog 3).
 - `nodeModulesDir: "auto"` / `"manual"` are Deno 2 values; on 1.x, use `true`.
 - `setup.manual: ["deno"]` (legacy) covered only `pkg:jsr`; `npm:` deps are the npm ecosystem.
+- `get -g --mode hosted|vendored` not refusing is #436 (generic). Don't re-file it from Deno.
+- `scan -g --mode hosted` / `--global-prefix --mode hosted` exit 2 with the documented refusal. That's correct.
+- A Deno 2.9 `npm:`-entrypoint global tool gets `"nodeModulesDir": "manual"` and really loads `bin/.<tool>/node_modules`. Only local/JSR-entrypoint tools load the `DENO_DIR` copy (#444).
