@@ -192,10 +192,10 @@ impl Bundled {
                 DIAG_REF_UNATTRIBUTABLE,
                 file,
                 format!(
-                    "{file}: {label}: {} is wired to Socket patch {} in a bundled entry, but \
-                     bun unpacks bundled dependencies from the parent package's tarball and \
-                     never reads that entry, so the copy stays unpatched; the patch is not \
-                     attested",
+                    "{file}: {label}: {} is wired to Socket patch {}, but bun installs this \
+                     entry as a bundled dependency, unpacked from the parent package's \
+                     tarball that no rewire reaches, so that copy stays unpatched; the patch \
+                     is not attested",
                     r.purl, r.uuid,
                 ),
             );
@@ -258,28 +258,35 @@ async fn extract_binary(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             return;
         }
     };
+    let mut bundled = Bundled::default();
     for p in &packages {
         let integrity = p
             .integrity
             .as_deref()
             .filter(|sri| is_sri_pin(sri))
             .map(|sri| LockIntegrity::Sri(sri.to_string()));
-        classify(
-            ctx,
-            BUN_LOCKB,
-            Entry {
-                label: &format!("package #{}", p.id),
-                name: &p.name,
-                target: &p.resolution,
-                recorded_version: p.version.as_deref(),
-                integrity,
-                // The codec only yields a resolution STRING for registry and
-                // tarball-like records; git records come back empty.
-                shape_ok: true,
-            },
-            out,
-        );
+        let label = format!("package #{}", p.id);
+        let classified = Entry {
+            label: &label,
+            name: &p.name,
+            target: &p.resolution,
+            recorded_version: p.version.as_deref(),
+            integrity,
+            // The codec only yields a resolution STRING for registry and
+            // tarball-like records; git records come back empty.
+            shape_ok: true,
+        };
+        // A record some bundled edge reaches installs (also) as a copy
+        // unpacked from that parent's tarball. Bun keeps ONE record for a
+        // regular and a bundled install of the same version, so even a
+        // record a regular edge also reaches is never attested.
+        if p.bundled {
+            bundled.record(ctx, BUN_LOCKB, classified, out);
+        } else {
+            classify(ctx, BUN_LOCKB, classified, out);
+        }
     }
+    bundled.contest(BUN_LOCKB, out);
 }
 
 // ── shared classification ────────────────────────────────────────────────
@@ -1134,6 +1141,43 @@ mod tests {
                     ),
                 }
             }
+        }
+    }
+
+    /// REGRESSION (#469), `bun.lockb`: a record a bundled edge reaches is
+    /// (also) installed from the parent's tarball, so a Socket resolution
+    /// on it is never attested — whether only the bundled edge reaches it
+    /// (`only`) or Bun shares it with a regular install (`both`).
+    #[tokio::test]
+    async fn binary_bundled_records_are_never_attested() {
+        for shape in ["only", "both"] {
+            let bytes = std::fs::read(
+                fixture_path("bun-lockb-bundled")
+                    .join(shape)
+                    .join("bun.lockb"),
+            )
+            .expect("bundled fixture");
+            let mut lock = crate::vendor::bun_lockb::BunLockb::parse(&bytes).unwrap();
+            let id = lock
+                .packages()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.name == "is-number")
+                .unwrap()
+                .id;
+            let url = hosted_url("npm", "is-number", "7.0.0", UUID_A, "is-number-7.0.0.tgz");
+            lock.set_package(id, &url, SRI).unwrap();
+            let p = Project::new();
+            p.write("bun.lockb", lock.bytes());
+            let out = run(&p).await;
+            assert_refs(&out, &[]);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("bundled")),
+                "{shape}: {:#?}",
+                out.diagnostics
+            );
         }
     }
 

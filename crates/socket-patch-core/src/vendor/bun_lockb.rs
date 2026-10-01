@@ -20,6 +20,11 @@ const HEADER: &[u8] = b"#!/usr/bin/env bun\nbun-lockfile-format-v0\n";
 const TOTAL_AT: usize = HEADER.len() + 4 + 32;
 const PACKAGES_AT: usize = TOTAL_AT + 8;
 const INTEGRITY_LEN: usize = 65;
+/// Bun's `Dependency.Behavior.bundled` bit (byte 16 of a 26-byte
+/// dependency record): the edge is a `bundleDependencies` entry of its
+/// parent (verified against a real Bun 1.3.14 lock, fixture
+/// `bun-lockb-bundled`).
+const BEHAVIOR_BUNDLED: u8 = 0x40;
 /// Written by this codec in the last eight bytes of the root package's
 /// resolution (its value union, which a root resolution never reads — early
 /// writers leave uninitialized bytes there, and every supported reader
@@ -41,6 +46,13 @@ pub(crate) struct BinaryPackage {
     pub(crate) version: Option<String>,
     pub(crate) resolution: String,
     pub(crate) integrity: Option<String>,
+    /// Some dependency edge with Bun's `bundled` behavior (0x40) resolves
+    /// to this record: that copy is unpacked from the parent's tarball,
+    /// whatever the record's resolution says (#469).
+    pub(crate) bundled: bool,
+    /// EVERY edge resolving to this record is bundled (and there is at
+    /// least one): rewiring its resolution installs nothing.
+    pub(crate) bundled_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -197,7 +209,32 @@ impl BunLockb {
     }
 
     pub(crate) fn packages(&self) -> Result<Vec<BinaryPackage>, String> {
-        (0..self.count).map(|id| self.package(id)).collect()
+        let mut packages = (0..self.count)
+            .map(|id| self.package(id))
+            .collect::<Result<Vec<_>, _>>()?;
+        // (bundled edges, other edges) resolving to each record.
+        let mut edges = vec![(0usize, 0usize); self.count];
+        let dependencies = self.dependency_array()?;
+        let resolutions = self.buffer_array(2)?;
+        if dependencies.data.len() / 26 != resolutions.data.len() / 4 {
+            return Err("bun.lockb: dependency and resolution buffer lengths differ".into());
+        }
+        for index in 0..dependencies.data.len() / 26 {
+            let behavior = self.data[dependencies.data.start + index * 26 + 16];
+            let id = u32_at(&self.data, resolutions.data.start + index * 4)? as usize;
+            if let Some((bundled, other)) = edges.get_mut(id) {
+                if behavior & BEHAVIOR_BUNDLED != 0 {
+                    *bundled += 1;
+                } else {
+                    *other += 1;
+                }
+            }
+        }
+        for (package, (bundled, other)) in packages.iter_mut().zip(edges) {
+            package.bundled = bundled > 0;
+            package.bundled_only = bundled > 0 && other == 0;
+        }
+        Ok(packages)
     }
 
     /// Parse `input` and read every active package record — the one
@@ -252,6 +289,8 @@ impl BunLockb {
             version,
             resolution,
             integrity,
+            bundled: false,
+            bundled_only: false,
         })
     }
 
@@ -1685,6 +1724,55 @@ mod tests {
         "0.8.1-production",
         "1.0.0-production",
     ];
+
+    /// REGRESSION (#469): a record reached by a bundled edge is flagged —
+    /// only through that edge (`only`), or shared with a regular root
+    /// dependency (`both`, where Bun keeps ONE record for both installs).
+    /// Every other record, and every pre-existing fixture's, is not.
+    #[test]
+    fn bundled_edges_flag_their_records() {
+        let flags = |shape: &str| {
+            let bytes = std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/bun-lockb-bundled")
+                    .join(shape)
+                    .join("bun.lockb"),
+            )
+            .unwrap();
+            BunLockb::parse_packages(&bytes)
+                .unwrap()
+                .into_iter()
+                .map(|p| (p.name, p.bundled, p.bundled_only))
+                .collect::<Vec<_>>()
+        };
+        let only = flags("only");
+        assert!(only.contains(&("is-number".into(), true, true)), "{only:?}");
+        assert!(
+            only.contains(&("@bh/bund".into(), false, false)),
+            "{only:?}"
+        );
+        let both = flags("both");
+        assert!(
+            both.contains(&("is-number".into(), true, false)),
+            "{both:?}"
+        );
+        assert!(
+            both.contains(&("@bh/bund".into(), false, false)),
+            "{both:?}"
+        );
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bun-lockb");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let lock = entry.unwrap().path().join("bun.lockb");
+            if !lock.is_file() {
+                continue;
+            }
+            seen += 1;
+            let packages = BunLockb::parse_packages(&std::fs::read(&lock).unwrap()).unwrap();
+            assert!(packages.iter().all(|p| !p.bundled), "{}", lock.display());
+        }
+        assert!(seen >= 20, "{seen} fixtures");
+    }
 
     fn fixture(version: &str) -> Vec<u8> {
         std::fs::read(

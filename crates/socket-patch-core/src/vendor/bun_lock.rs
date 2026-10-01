@@ -263,7 +263,11 @@ pub async fn wired_instances_all_ours(
                 })?;
             let leaf = tgz_rel_leaf(&name, &version);
             let mut matched = false;
-            for package in packages.into_iter().filter(|package| package.name == name) {
+            // A record only bundled edges reach is never rewired (#469).
+            for package in packages
+                .into_iter()
+                .filter(|package| package.name == name && !package.bundled_only)
+            {
                 let ours = parse_vendor_path(&package.resolution)
                     .is_some_and(|path| path.eco == "npm" && path.leaf == leaf);
                 if ours {
@@ -2030,6 +2034,71 @@ mod tests {
                 .iter()
                 .any(|w| w.code == "vendor_bundled_instance_skipped"
                     && w.detail.contains("haspad/left-pad")),
+            "{warnings:?}"
+        );
+    }
+
+    /// REGRESSION (#469), `bun.lockb`: a record only a bundled edge
+    /// reaches refuses with the real reason; a record Bun shares between a
+    /// regular and a bundled install is vendored for the regular install,
+    /// with a loud warning that the bundled copy stays unpatched.
+    #[tokio::test]
+    async fn binary_bundled_records_are_never_silently_rewired() {
+        async fn binary_fixture(shape: &str, installed_rel: &str) -> Fixture {
+            let fx = fixture_with("", installed_rel).await;
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/bun-lockb-bundled")
+                .join(shape);
+            tokio::fs::remove_file(fx.root().join(BUN_LOCK))
+                .await
+                .unwrap();
+            for file in ["bun.lockb", "package.json"] {
+                tokio::fs::copy(dir.join(file), fx.root().join(file))
+                    .await
+                    .unwrap();
+            }
+            tokio::fs::write(
+                fx.installed.join("package.json"),
+                br#"{"name":"is-number","version":"7.0.0"}"#,
+            )
+            .await
+            .unwrap();
+            fx
+        }
+        async fn vendor(fx: &Fixture) -> VendorOutcome {
+            let blobs = fx.root().join(".socket/blobs");
+            crate::vendor::test_support::vendor_bun(
+                "pkg:npm/is-number@7.0.0",
+                &fx.installed,
+                fx.root(),
+                &fx.record,
+                &PatchSources::blobs_only(&blobs),
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                None,
+            )
+            .await
+        }
+
+        let fx = binary_fixture("only", "node_modules/@bh/bund/node_modules/is-number").await;
+        let before = tokio::fs::read(fx.root().join("bun.lockb")).await.unwrap();
+        let detail = expect_refused(vendor(&fx).await, "vendor_lock_entry_not_rewritable");
+        assert!(detail.contains("UNPATCHED"), "{detail}");
+        assert_eq!(
+            tokio::fs::read(fx.root().join("bun.lockb")).await.unwrap(),
+            before,
+            "refusal writes nothing"
+        );
+
+        let fx = binary_fixture("both", "node_modules/is-number").await;
+        let (result, entry, warnings) = expect_done(vendor(&fx).await);
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(entry.unwrap().wiring.len(), 1);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_bundled_instance_skipped"),
             "{warnings:?}"
         );
     }
