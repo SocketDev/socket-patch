@@ -44,20 +44,55 @@ const MAX_LEGACY_NPM_DEPTH: usize = 64;
 ///   through nested `dependencies`, `bundled: true` entries skipped (their
 ///   nested trees are still walked).
 pub(crate) fn npm_lock_nodes(doc: &Value) -> Vec<NpmLockNode<'_>> {
+    walk_npm_lock(doc, Bundled::Skip)
+        .into_iter()
+        .map(|(_, node)| node)
+        .collect()
+}
+
+/// The BUNDLED entries of a parsed npm lock, each with where the lock puts
+/// it: `inBundle: true` in `packages` (lockfileVersion 2/3; the location is
+/// the `packages` key), `bundled: true` in the v1 `dependencies` tree (the
+/// location is the `>`-joined chain of dependency names). These are exactly
+/// the entries [`npm_lock_nodes`] skips for being bundled, read from the
+/// same tree npm reads. npm unpacks them from the parent package's own
+/// tarball, so a Socket rewire never reaches them: a bundled copy of a
+/// patched `name@version` stays unpatched in the install (the rewriters
+/// warn `*_bundled_instance_skipped`), and lockfile discovery
+/// (`vex::discover::npm`) weighs it against the rewired entries.
+pub(crate) fn npm_lock_bundled_nodes(doc: &Value) -> Vec<(String, NpmLockNode<'_>)> {
+    walk_npm_lock(doc, Bundled::Only)
+}
+
+/// Which side of the bundled split [`walk_npm_lock`] returns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bundled {
+    Skip,
+    Only,
+}
+
+/// [`npm_lock_nodes`] / [`npm_lock_bundled_nodes`]: one walk, split on the
+/// bundled flag. Locations are built only for [`Bundled::Only`] (empty
+/// otherwise), so the common walk allocates nothing extra.
+fn walk_npm_lock(doc: &Value, bundled: Bundled) -> Vec<(String, NpmLockNode<'_>)> {
     let mut out = Vec::new();
     if let Some(packages) = doc.get("packages").and_then(Value::as_object) {
         for (key, node) in packages {
             let Some((_, key_name)) = key.rsplit_once("node_modules/") else {
                 continue;
             };
-            if npm_flag(node, "link") || npm_flag(node, "inBundle") {
+            if npm_flag(node, "link") || npm_flag(node, "inBundle") != (bundled == Bundled::Only) {
                 continue;
             }
             let name = node.get("name").and_then(Value::as_str).unwrap_or(key_name);
-            out.push(NpmLockNode::of(name, node));
+            let location = match bundled {
+                Bundled::Only => key.clone(),
+                Bundled::Skip => String::new(),
+            };
+            out.push((location, NpmLockNode::of(name, node)));
         }
     } else if let Some(deps) = doc.get("dependencies").and_then(Value::as_object) {
-        walk_npm_legacy_dependencies(deps, 0, &mut out);
+        walk_npm_legacy_dependencies(deps, 0, bundled, "", &mut out);
     }
     out
 }
@@ -89,17 +124,24 @@ fn npm_flag(node: &Value, key: &str) -> bool {
 fn walk_npm_legacy_dependencies<'a>(
     deps: &'a serde_json::Map<String, Value>,
     depth: usize,
-    out: &mut Vec<NpmLockNode<'a>>,
+    bundled: Bundled,
+    parent: &str,
+    out: &mut Vec<(String, NpmLockNode<'a>)>,
 ) {
     if depth > MAX_LEGACY_NPM_DEPTH {
         return;
     }
     for (name, node) in deps {
-        if !npm_flag(node, "bundled") {
-            out.push(NpmLockNode::of(name, node));
+        let location = match bundled {
+            Bundled::Only if parent.is_empty() => name.clone(),
+            Bundled::Only => format!("{parent} > {name}"),
+            Bundled::Skip => String::new(),
+        };
+        if npm_flag(node, "bundled") == (bundled == Bundled::Only) {
+            out.push((location.clone(), NpmLockNode::of(name, node)));
         }
         if let Some(nested) = node.get("dependencies").and_then(Value::as_object) {
-            walk_npm_legacy_dependencies(nested, depth + 1, out);
+            walk_npm_legacy_dependencies(nested, depth + 1, bundled, &location, out);
         }
     }
 }
