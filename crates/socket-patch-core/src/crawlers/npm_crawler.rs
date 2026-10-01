@@ -472,11 +472,17 @@ struct StoreEntryDir {
 // Global prefix detection helpers
 // ---------------------------------------------------------------------------
 
-use crate::utils::process::{CommandRunner, SystemCommandRunner};
+use crate::utils::process::{CommandRunner, GlobalProbeRunner};
 
 /// Get the npm global `node_modules` path via `npm root -g`.
+///
+/// This and the yarn / pnpm / bun probes below run through
+/// [`GlobalProbeRunner`]: the tool is resolved through `PATHEXT` (the
+/// Windows `npm.cmd` shim) and asked from a neutral directory, never from
+/// the scanned project, whose own scripts and config must not answer a
+/// question about the machine-wide install.
 pub fn get_npm_global_prefix() -> Result<String, String> {
-    get_npm_global_prefix_with(&SystemCommandRunner)
+    get_npm_global_prefix_with(&GlobalProbeRunner)
 }
 
 /// Version of `get_npm_global_prefix` that accepts an injected
@@ -506,7 +512,7 @@ pub fn parse_npm_root_output(stdout: &str) -> Option<String> {
 
 /// Get the yarn global `node_modules` path via `yarn global dir`.
 pub fn get_yarn_global_prefix() -> Option<String> {
-    get_yarn_global_prefix_with(&SystemCommandRunner)
+    get_yarn_global_prefix_with(&GlobalProbeRunner)
 }
 
 /// Version of `get_yarn_global_prefix` that accepts an injected
@@ -538,7 +544,7 @@ pub fn parse_yarn_dir_output(stdout: &str) -> Option<String> {
 
 /// Get the pnpm global `node_modules` path via `pnpm root -g`.
 pub fn get_pnpm_global_prefix() -> Option<String> {
-    get_pnpm_global_prefix_with(&SystemCommandRunner)
+    get_pnpm_global_prefix_with(&GlobalProbeRunner)
 }
 
 /// Version of `get_pnpm_global_prefix` that accepts an injected
@@ -559,7 +565,7 @@ pub fn parse_pnpm_root_output(stdout: &str) -> Option<String> {
 
 /// Get the bun global `node_modules` path via `bun pm bin -g`.
 pub fn get_bun_global_prefix() -> Option<String> {
-    get_bun_global_prefix_with(&SystemCommandRunner)
+    get_bun_global_prefix_with(&GlobalProbeRunner)
 }
 
 /// Version of `get_bun_global_prefix` that accepts an injected
@@ -958,7 +964,11 @@ impl NpmCrawler {
     /// Inside a store entry (`store_entry`) a link is a dependency edge into
     /// a sibling entry, whose own visit records that copy, so only a real
     /// directory there matches.
-    fn visit_resolver_dir(nm_path: PathBuf, store_entry: bool, pending: &[Target]) -> ResolverVisit {
+    fn visit_resolver_dir(
+        nm_path: PathBuf,
+        store_entry: bool,
+        pending: &[Target],
+    ) -> ResolverVisit {
         let listing = list_dir_sync(&nm_path);
         let probe_filter = ProbeFilter::new(&listing);
         let matched = pending

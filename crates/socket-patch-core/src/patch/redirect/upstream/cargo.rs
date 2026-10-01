@@ -97,7 +97,10 @@ pub(crate) async fn restore(
             )
         });
         let cksums: BTreeMap<String, Result<String, String>> =
-            futures_util::future::join_all(lookups).await.into_iter().collect();
+            futures_util::future::join_all(lookups)
+                .await
+                .into_iter()
+                .collect();
         let mut changed = false;
         let mut restored: Vec<(&LockHit, String)> = Vec::new();
         for hit in &hits {
@@ -116,7 +119,9 @@ pub(crate) async fn restore(
         }
         // The entries' own source + checksum values, spliced at the parse's
         // spans (every hit is a distinct block: its source names its uuid).
-        let spans = model.spans().expect("a lock parsed from text carries spans");
+        let spans = model
+            .spans()
+            .expect("a lock parsed from text carries spans");
         let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
         for (hit, cksum) in &restored {
             let at = &spans.packages[hit.index];
@@ -133,7 +138,10 @@ pub(crate) async fn restore(
         }
         for (hit, cksum) in &restored {
             // Dependents' full-id references and the v1 `[metadata]` key.
-            lock = lock.replace(&format!("({})", hit.source), &format!("({CRATES_IO_SOURCE})"));
+            lock = lock.replace(
+                &format!("({})", hit.source),
+                &format!("({CRATES_IO_SOURCE})"),
+            );
             let metadata_key = format!(
                 "\"checksum {} {} ({CRATES_IO_SOURCE})\" = \"",
                 hit.name, hit.version
@@ -152,7 +160,11 @@ pub(crate) async fn restore(
         if changed {
             view.write(
                 "Cargo.lock",
-                if crlf { lock.replace('\n', "\r\n") } else { lock },
+                if crlf {
+                    lock.replace('\n', "\r\n")
+                } else {
+                    lock
+                },
             );
         }
     }
@@ -317,11 +329,10 @@ fn remove_registry_block(config: &str, reg: &str) -> Option<String> {
         end -= 1;
     }
     let fragment = format!("{}\n", lines[i..end].join("\n"));
-    let removed = remove_appended_cargo_block(&lf, &fragment)
-        .or_else(|| {
-            // The block ends the file with no final newline.
-            remove_appended_cargo_block(&lf, fragment.trim_end_matches('\n'))
-        })?;
+    let removed = remove_appended_cargo_block(&lf, &fragment).or_else(|| {
+        // The block ends the file with no final newline.
+        remove_appended_cargo_block(&lf, fragment.trim_end_matches('\n'))
+    })?;
     Some(if crlf {
         removed.replace('\n', "\r\n")
     } else {
@@ -388,7 +399,10 @@ mod tests {
 
     #[test]
     fn table_form_line_is_dropped() {
-        assert_eq!(unpin_line(&format!("registry = \"{REG}\""), REG), Some(None));
+        assert_eq!(
+            unpin_line(&format!("registry = \"{REG}\""), REG),
+            Some(None)
+        );
     }
 
     #[test]
@@ -397,7 +411,10 @@ mod tests {
         let hosted = format!(
             "{original}\n[registries.{REG}]\nindex = \"sparse+https://patch.socket.dev/x/index/\"\n"
         );
-        assert_eq!(remove_registry_block(&hosted, REG).as_deref(), Some(original));
+        assert_eq!(
+            remove_registry_block(&hosted, REG).as_deref(),
+            Some(original)
+        );
         let created = format!("[registries.{REG}]\nindex = \"sparse+https://x/\"\n");
         assert_eq!(remove_registry_block(&created, REG).as_deref(), Some(""));
     }

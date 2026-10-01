@@ -127,6 +127,17 @@ pub trait CommandRunner {
 
 /// Default runner: spawns the real binary via `std::process::Command`.
 ///
+/// The program is looked up with [`resolve_tool`] and the RESOLVED path is
+/// spawned, never the bare name: on Windows `std` appends only `.exe`, so a
+/// bare `Command::new("npm")` never finds the `npm.cmd` / `yarn.cmd` /
+/// `gem.cmd` / `composer.bat` shim those tools install as, and every probe
+/// silently answered "not installed". The lookup also skips relative `PATH`
+/// entries, so a tool planted in the scanned project is never run.
+///
+/// The child inherits the caller's working directory: some probes must ask
+/// from the project (`gem env` follows rbenv's `.ruby-version` there). A
+/// probe about the machine-wide install uses [`GlobalProbeRunner`].
+///
 /// `output()` nulls stdin so the child can't block waiting for
 /// input. stdout is captured; stderr is captured and dropped (we
 /// don't surface CLI diagnostics — the helpers fall back to other
@@ -135,16 +146,73 @@ pub(crate) struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
     fn run(&self, bin: &str, args: &[&str]) -> Option<String> {
-        let output = Command::new(bin).args(args).output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if stdout.is_empty() {
-            None
-        } else {
-            Some(stdout)
-        }
+        run_resolved(bin, args, None)
+    }
+}
+
+/// [`SystemCommandRunner`] for a question about a package manager's GLOBAL
+/// install (`npm root -g`, `yarn global dir`, ...): the child runs from
+/// [`neutral_probe_dir`], never from the scanned project. From inside a
+/// project the tool reads that project's configuration — Yarn Berry has no
+/// `global` command and runs the project's `"global"` package.json script
+/// instead, whose stdout then picked the directory scanned (and patched) as
+/// the global install; a `.yarnrc.yml` `yarnPath` runs a project-supplied
+/// JS file for any `yarn` call.
+pub(crate) struct GlobalProbeRunner;
+
+impl CommandRunner for GlobalProbeRunner {
+    fn run(&self, bin: &str, args: &[&str]) -> Option<String> {
+        run_resolved(bin, args, Some(&neutral_probe_dir()?))
+    }
+}
+
+/// Where global probes run: the user's home directory (theirs, not a
+/// checkout's, and never world-writable like the temp dir), else the root
+/// of the current drive. `None` only when neither can be determined, and
+/// then the probe is not run at all rather than run from the project.
+pub(crate) fn neutral_probe_dir() -> Option<PathBuf> {
+    neutral_probe_dir_with(&|var| std::env::var_os(var))
+}
+
+/// [`neutral_probe_dir`] over an injected environment reader (tests).
+pub(crate) fn neutral_probe_dir_with(var: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let home = ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(|name| var(name))
+        .map(PathBuf::from)
+        .find(|path| path.is_absolute() && path.is_dir());
+    home.or_else(|| {
+        std::env::current_dir()
+            .ok()?
+            .ancestors()
+            .last()
+            .map(Path::to_path_buf)
+    })
+}
+
+/// Spawn `bin` (looked up with [`resolve_tool`]; a value that already
+/// names a path is spawned as given) with `args`, optionally from `cwd`,
+/// and return its trimmed stdout under the [`CommandRunner`] contract.
+fn run_resolved(bin: &str, args: &[&str], cwd: Option<&Path>) -> Option<String> {
+    let program = if Path::new(bin).components().count() > 1 {
+        PathBuf::from(bin)
+    } else {
+        resolve_tool(bin)?
+    };
+    let mut command = command_for(&program);
+    command.args(args);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        None
+    } else {
+        Some(stdout)
     }
 }
 
@@ -244,6 +312,28 @@ mod tests {
         let runner = SystemCommandRunner;
         let out = runner.run("sh", &["-c", "printf '%s' \"$1\"", "sh", "forwarded"]);
         assert_eq!(out.as_deref(), Some("forwarded"));
+    }
+
+    /// Global probes run from the home dir; a relative or missing HOME is
+    /// never used (it would resolve against the project), and with no
+    /// usable home the probe falls back to the drive root, not the cwd.
+    #[test]
+    fn neutral_probe_dir_prefers_an_absolute_home_and_never_the_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let env = |name: &str| (name == "HOME").then(|| home.clone().into_os_string());
+        assert_eq!(neutral_probe_dir_with(&env), Some(home.clone()));
+
+        let profile = |name: &str| match name {
+            "HOME" => Some(OsString::from("relative/home")),
+            "USERPROFILE" => Some(home.clone().into_os_string()),
+            _ => None,
+        };
+        assert_eq!(neutral_probe_dir_with(&profile), Some(home.clone()));
+
+        let none = |_: &str| None::<OsString>;
+        let root = neutral_probe_dir_with(&none).expect("the drive root");
+        assert!(root.is_absolute() && root.parent().is_none(), "{root:?}");
     }
 
     // ───────────────────────── resolve_tool / command_for ─────────────────────────

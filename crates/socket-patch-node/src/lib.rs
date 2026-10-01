@@ -15,11 +15,11 @@ use std::sync::Arc;
 use napi::bindgen_prelude::{Buffer, External, Function, JsObjectValue, Object, PromiseRaw};
 use napi::{Env, Status};
 use napi_derive::napi;
-use socket_patch_core::hosted::memory::{
-    self as hosted_memory, EngineError, HostedScanOptions, HostedScanOutput, PresentKind, SelectOptions,
-    SessionBuilder, TreeEntryInput,
-};
 use socket_patch_core::api::client::PatchApi;
+use socket_patch_core::hosted::memory::{
+    self as hosted_memory, EngineError, HostedScanOptions, HostedScanOutput, PresentKind,
+    SelectOptions, SessionBuilder, TreeEntryInput,
+};
 use tokio_util::sync::CancellationToken;
 
 use provider::{JsPatchApi, ProviderRefs};

@@ -4,8 +4,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use socket_patch_core::rollout::{canonical_base_purl, severity_label, MaxNew, MaxNewSource, Recorded, RolloutPlan};
 pub(crate) use socket_patch_core::rollout::stage::*;
+use socket_patch_core::rollout::{
+    canonical_base_purl, severity_label, MaxNew, MaxNewSource, Recorded, RolloutPlan,
+};
 
 use super::discovery::UpdateInfo;
 
@@ -208,11 +210,11 @@ pub(crate) fn human_lines(
 mod tests {
     use super::*;
     use socket_patch_core::api::types::PatchSearchResult;
-    use socket_patch_core::manifest::schema::PatchManifest;
-    use std::path::Path;
     use socket_patch_core::api::types::VulnerabilityResponse;
+    use socket_patch_core::manifest::schema::PatchManifest;
     use socket_patch_core::manifest::schema::PatchRecord;
     use std::collections::HashMap;
+    use std::path::Path;
 
     fn offer(purl: &str, uuid: &str, published: &str, severities: &[&str]) -> PatchSearchResult {
         PatchSearchResult {
@@ -357,13 +359,21 @@ mod tests {
         let stored = manifest(&[("pkg:composer/psr/log@3.0.2.0", "old")]);
         let recorded = RecordedIndex::new(Some(&stored), &[]);
         let offers = offers_from_results(
-            &[offer("pkg:composer/psr/log@v3.0.2", "new", "2026-02-01T00:00:00Z", &["high"])],
+            &[offer(
+                "pkg:composer/psr/log@v3.0.2",
+                "new",
+                "2026-02-01T00:00:00Z",
+                &["high"],
+            )],
             false,
         );
         let rows = classify(&offers, &recorded, "");
         let plan = socket_patch_core::rollout::plan_rollout(
             rows.into_iter().map(|row| row.candidate).collect(),
-            &MaxNew { value: Some(0), source: MaxNewSource::Flag },
+            &MaxNew {
+                value: Some(0),
+                source: MaxNewSource::Flag,
+            },
             false,
             &BTreeSet::new(),
         );
