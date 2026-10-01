@@ -2642,8 +2642,12 @@ mod tests {
     #[tokio::test]
     async fn gems_rb_twin_is_refused_before_any_write() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
-        tokio::fs::write(root.join("gems.rb"), GEMFILE_DIRECT).await.unwrap();
-        tokio::fs::write(root.join("gems.locked"), LOCK_DIRECT).await.unwrap();
+        tokio::fs::write(root.join("gems.rb"), GEMFILE_DIRECT)
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("gems.locked"), LOCK_DIRECT)
+            .await
+            .unwrap();
 
         let (code, detail) =
             unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
@@ -2655,7 +2659,10 @@ mod tests {
             ("gems.rb", GEMFILE_DIRECT),
             ("gems.locked", LOCK_DIRECT),
         ] {
-            assert_eq!(tokio::fs::read_to_string(root.join(file)).await.unwrap(), want);
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(file)).await.unwrap(),
+                want
+            );
         }
         assert!(!root.join(".socket/vendor").exists());
     }
@@ -2666,9 +2673,15 @@ mod tests {
     #[tokio::test]
     async fn bundle_gemfile_naming_another_manifest_is_refused() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
-        tokio::fs::write(root.join("Gemfile.next"), GEMFILE_DIRECT).await.unwrap();
-        tokio::fs::write(root.join("Gemfile.next.lock"), LOCK_DIRECT).await.unwrap();
-        tokio::fs::create_dir_all(root.join(".bundle")).await.unwrap();
+        tokio::fs::write(root.join("Gemfile.next"), GEMFILE_DIRECT)
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("Gemfile.next.lock"), LOCK_DIRECT)
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join(".bundle"))
+            .await
+            .unwrap();
         tokio::fs::write(
             root.join(".bundle/config"),
             "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n",
@@ -2685,7 +2698,9 @@ mod tests {
             GEMFILE_DIRECT
         );
         assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
             LOCK_DIRECT
         );
         assert!(!root.join(".socket/vendor").exists());
@@ -2696,8 +2711,12 @@ mod tests {
     #[tokio::test]
     async fn bundle_gemfile_naming_the_gemfile_overrides_a_gems_rb_twin() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
-        tokio::fs::write(root.join("gems.rb"), GEMFILE_DIRECT).await.unwrap();
-        tokio::fs::create_dir_all(root.join(".bundle")).await.unwrap();
+        tokio::fs::write(root.join("gems.rb"), GEMFILE_DIRECT)
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join(".bundle"))
+            .await
+            .unwrap();
         tokio::fs::write(
             root.join(".bundle/config"),
             "---\nBUNDLE_GEMFILE: \"Gemfile\"\n",
@@ -2709,11 +2728,15 @@ mod tests {
             unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert!(result.success, "vendor failed: {:?}", result.error);
         assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
             expected_lock_direct()
         );
         assert_eq!(
-            tokio::fs::read_to_string(root.join("gems.rb")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("gems.rb"))
+                .await
+                .unwrap(),
             GEMFILE_DIRECT
         );
     }

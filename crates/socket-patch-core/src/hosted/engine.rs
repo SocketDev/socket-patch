@@ -1703,8 +1703,16 @@ mod tests {
             "{:?}",
             done.rewrite.files.keys()
         );
-        let codes: Vec<&str> = done.rewrite.warnings.iter().map(|w| w.code.as_str()).collect();
-        assert!(codes.contains(&"redirect_gem_bundle_gemfile_unsupported"), "{codes:?}");
+        let codes: Vec<&str> = done
+            .rewrite
+            .warnings
+            .iter()
+            .map(|w| w.code.as_str())
+            .collect();
+        assert!(
+            codes.contains(&"redirect_gem_bundle_gemfile_unsupported"),
+            "{codes:?}"
+        );
         assert!(!codes.contains(&"redirect_gem_no_gemfile"), "{codes:?}");
     }
 
@@ -1720,7 +1728,11 @@ mod tests {
         p.insert_text("gems.locked", GEM_LOCK);
         p.insert_text(".bundle/config", "---\nBUNDLE_GEMFILE: \"Gemfile\"\n");
         let (_read, done) = gem_rewrite(&p).await;
-        assert!(done.rewrite.files.contains_key("Gemfile"), "{:?}", done.rewrite.files.keys());
+        assert!(
+            done.rewrite.files.contains_key("Gemfile"),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
         assert!(!done.rewrite.files.contains_key("gems.rb"));
         assert!(!done.rewrite.files.contains_key("gems.locked"));
     }
@@ -1736,7 +1748,11 @@ mod tests {
         p.insert_text("gems.locked", GEM_LOCK);
         let (read, done) = gem_rewrite(&p).await;
         assert!(read.files.contains_key("Gemfile"));
-        assert!(done.rewrite.files.contains_key("gems.rb"), "{:?}", done.rewrite.files.keys());
+        assert!(
+            done.rewrite.files.contains_key("gems.rb"),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
         assert!(!done.rewrite.files.contains_key("Gemfile"));
     }
 

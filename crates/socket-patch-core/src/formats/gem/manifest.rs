@@ -39,7 +39,9 @@ impl GemfileSetting {
     pub fn describe(self) -> &'static str {
         match self {
             GemfileSetting::Env => "the BUNDLE_GEMFILE environment variable",
-            GemfileSetting::AppConfig => "BUNDLE_GEMFILE in the bundler app config (.bundle/config)",
+            GemfileSetting::AppConfig => {
+                "BUNDLE_GEMFILE in the bundler app config (.bundle/config)"
+            }
         }
     }
 }
@@ -147,7 +149,11 @@ pub fn classify(
         },
     };
     let display = value.display().to_string();
-    let absolute = |p: &Path| std::path::absolute(p).ok().and_then(|p| normalize_lexically(&p));
+    let absolute = |p: &Path| {
+        std::path::absolute(p)
+            .ok()
+            .and_then(|p| normalize_lexically(&p))
+    };
     let target = if value.is_absolute() {
         absolute(&value)
     } else {
@@ -161,10 +167,7 @@ pub fn classify(
             }
         }
     }
-    LoadedManifest::Unsupported {
-        value: display,
-        by,
-    }
+    LoadedManifest::Unsupported { value: display, by }
 }
 
 #[cfg(test)]
@@ -251,7 +254,9 @@ mod tests {
     #[test]
     fn config_gemfile_reads_bundlers_own_spelling() {
         assert_eq!(
-            config_gemfile("---\nBUNDLE_PATH: \"vendor/bundle\"\nBUNDLE_GEMFILE: \"Gemfile.next\"\n"),
+            config_gemfile(
+                "---\nBUNDLE_PATH: \"vendor/bundle\"\nBUNDLE_GEMFILE: \"Gemfile.next\"\n"
+            ),
             Some("Gemfile.next".into())
         );
         assert_eq!(config_gemfile("---\nBUNDLE_GEMFILE: \"\"\n"), None);

@@ -102,6 +102,10 @@ limits, and required install commands.
 
 ### Fixed
 
+- Gem hosted and vendored modes wire only the manifest Bundler loads. A `gems.rb`
+  twin or a `BUNDLE_GEMFILE` setting (environment or `.bundle/config`) no longer
+  leads to an edit of an ignored `Gemfile` that reports success and attests an
+  unpatched gem; unsupported layouts are refused before any write (#341, #390).
 - Patch application, reversal, and cleanup handle missing files, release variants,
   corrupt state, newer ledger formats, and unsafe manifest paths without silently
   dropping protection. File ownership restoration failures produce warnings.
