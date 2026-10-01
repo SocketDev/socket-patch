@@ -968,8 +968,7 @@ pub async fn bundler_loaded_manifest_with_env(
         .await
         .ok()
         .and_then(|text| crate::formats::gem::manifest::config_gemfile(&text));
-    let cwd = std::env::current_dir().unwrap_or_default();
-    crate::formats::gem::manifest::classify(root, &cwd, gemfile_env, config_value.as_deref())
+    crate::formats::gem::manifest::classify(root, gemfile_env, config_value.as_deref())
 }
 
 /// Bundler's app-config dir for `root`, following `Bundler.app_config_path`

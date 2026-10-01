@@ -5,8 +5,10 @@
 //! Bundler's own order (`Bundler::SharedHelpers#default_gemfile` and the CLI's
 //! `gemfile` setting):
 //!
-//! 1. `BUNDLE_GEMFILE` from the environment (a relative value expands
-//!    against the process cwd, as `File.expand_path` does);
+//! 1. `BUNDLE_GEMFILE` from the environment (a relative value is read
+//!    against the project root: bundler expands it against the directory
+//!    `bundle` runs in, which is the project, not socket-patch's own
+//!    cwd when it runs with `--cwd`);
 //! 2. `BUNDLE_GEMFILE:` in the app config file, `$BUNDLE_APP_CONFIG/config`
 //!    else `<root>/.bundle/config` (what `bundle config set --local gemfile
 //!    Gemfile.next` writes; relative to the project root);
@@ -85,12 +87,23 @@ impl LoadedManifest {
     /// The detail line for a caller that refuses an unsupported manifest.
     pub fn unsupported_detail(&self) -> Option<String> {
         match self {
-            LoadedManifest::Unsupported { value, by } => Some(format!(
-                "bundler loads `{value}` ({}), not the project's Gemfile or gems.rb; \
-                 socket-patch only wires those, so it left the gem manifests untouched (unset \
-                 BUNDLE_GEMFILE, or point it at the project's Gemfile, and re-run)",
-                by.describe()
-            )),
+            LoadedManifest::Unsupported { value, by } => {
+                let remedy = match by {
+                    GemfileSetting::Env => {
+                        "unset BUNDLE_GEMFILE, or point it at the project's Gemfile"
+                    }
+                    GemfileSetting::AppConfig => {
+                        "run `bundle config unset --local gemfile`, or point it at the \
+                         project's Gemfile"
+                    }
+                };
+                Some(format!(
+                    "bundler loads `{value}` ({}), not the project's Gemfile or gems.rb; \
+                     socket-patch only wires those, so it left the gem manifests untouched \
+                     ({remedy}, and re-run)",
+                    by.describe()
+                ))
+            }
             _ => None,
         }
     }
@@ -110,18 +123,16 @@ pub fn config_gemfile(contents: &str) -> Option<String> {
 }
 
 /// Classify the configured `BUNDLE_GEMFILE` (environment first, then the
-/// app config value) against `root`. `cwd` anchors a relative environment
-/// value; a relative config value is anchored at `root`.
+/// app config value) against `root`, which also anchors a relative value.
 pub fn classify(
     root: &Path,
-    cwd: &Path,
     gemfile_env: Option<&OsStr>,
     config_value: Option<&str>,
 ) -> LoadedManifest {
-    let (value, base, by) = match gemfile_env.filter(|v| !v.is_empty()) {
-        Some(v) => (PathBuf::from(v), cwd, GemfileSetting::Env),
+    let (value, by) = match gemfile_env.filter(|v| !v.is_empty()) {
+        Some(v) => (PathBuf::from(v), GemfileSetting::Env),
         None => match config_value.filter(|v| !v.is_empty()) {
-            Some(v) => (PathBuf::from(v), root, GemfileSetting::AppConfig),
+            Some(v) => (PathBuf::from(v), GemfileSetting::AppConfig),
             None => return LoadedManifest::Default,
         },
     };
@@ -134,7 +145,7 @@ pub fn classify(
     let target = if value.is_absolute() {
         absolute(&value)
     } else {
-        absolute(&base.join(&value))
+        absolute(&root.join(&value))
     };
     let root = absolute(root);
     if let (Some(target), Some(root)) = (target, root) {
@@ -157,20 +168,20 @@ mod tests {
 
     #[test]
     fn no_setting_is_bundlers_default_discovery() {
-        let m = classify(&root(), &root(), None, None);
+        let m = classify(&root(), None, None);
         assert_eq!(m, LoadedManifest::Default);
         assert_eq!(m.pair(true), Some(("gems.rb", "gems.locked")));
         assert_eq!(m.pair(false), Some(("Gemfile", "Gemfile.lock")));
         // An empty value is unset, as in bundler.
         assert_eq!(
-            classify(&root(), &root(), Some(OsStr::new("")), Some("")),
+            classify(&root(), Some(OsStr::new("")), Some("")),
             LoadedManifest::Default
         );
     }
 
     #[test]
     fn config_naming_another_manifest_is_unsupported() {
-        let m = classify(&root(), &root(), None, Some("Gemfile.next"));
+        let m = classify(&root(), None, Some("Gemfile.next"));
         assert_eq!(
             m,
             LoadedManifest::Unsupported {
@@ -186,23 +197,22 @@ mod tests {
     fn config_naming_the_default_spellings_selects_that_pair() {
         // `bundle config set --local gemfile Gemfile` beside a gems.rb:
         // bundler loads Gemfile + Gemfile.lock, not gems.rb.
-        let m = classify(&root(), &root(), None, Some("Gemfile"));
+        let m = classify(&root(), None, Some("Gemfile"));
         assert_eq!(m.pair(true), Some(("Gemfile", "Gemfile.lock")));
-        let m = classify(&root(), &root(), None, Some("./gems.rb"));
+        let m = classify(&root(), None, Some("./gems.rb"));
         assert_eq!(m.pair(false), Some(("gems.rb", "gems.locked")));
         let abs = root().join("Gemfile");
-        let m = classify(&root(), &root(), None, Some(abs.to_str().unwrap()));
+        let m = classify(&root(), None, Some(abs.to_str().unwrap()));
         assert_eq!(m.pair(true), Some(("Gemfile", "Gemfile.lock")));
     }
 
+    /// The environment wins over the app config, and a relative value is
+    /// read against the project root even when socket-patch runs elsewhere
+    /// with `--cwd` (Bugbot on #431: `BUNDLE_GEMFILE=Gemfile` must select
+    /// the project's Gemfile, not a file under the process cwd).
     #[test]
-    fn env_wins_over_config_and_expands_against_the_cwd() {
-        let m = classify(
-            &root(),
-            &root().join("sub"),
-            Some(OsStr::new("../Gemfile")),
-            Some("Gemfile.next"),
-        );
+    fn env_wins_over_config_and_is_anchored_at_the_project_root() {
+        let m = classify(&root(), Some(OsStr::new("Gemfile")), Some("Gemfile.next"));
         assert_eq!(
             m,
             LoadedManifest::Configured {
@@ -210,7 +220,7 @@ mod tests {
                 by: GemfileSetting::Env
             }
         );
-        let m = classify(&root(), &root(), Some(OsStr::new("Gemfile.next")), None);
+        let m = classify(&root(), Some(OsStr::new("Gemfile.next")), None);
         assert!(matches!(
             m,
             LoadedManifest::Unsupported {
@@ -220,11 +230,27 @@ mod tests {
         ));
     }
 
+    /// The refusal names the remedy for the knob that set it: unsetting the
+    /// environment variable does nothing to a `.bundle/config` setting.
+    #[test]
+    fn unsupported_detail_names_the_knob_that_set_it() {
+        let env = classify(&root(), Some(OsStr::new("Gemfile.next")), None);
+        let env = env.unsupported_detail().unwrap();
+        assert!(env.contains("unset BUNDLE_GEMFILE"), "{env}");
+        let config = classify(&root(), None, Some("Gemfile.next"));
+        let config = config.unsupported_detail().unwrap();
+        assert!(
+            config.contains("bundle config unset --local gemfile"),
+            "{config}"
+        );
+        assert!(!config.contains("unset BUNDLE_GEMFILE"), "{config}");
+    }
+
     #[test]
     fn a_manifest_in_another_directory_is_unsupported() {
-        let m = classify(&root(), &root(), None, Some("../other/Gemfile"));
+        let m = classify(&root(), None, Some("../other/Gemfile"));
         assert!(matches!(m, LoadedManifest::Unsupported { .. }));
-        let m = classify(&root(), &root(), None, Some("sub/Gemfile"));
+        let m = classify(&root(), None, Some("sub/Gemfile"));
         assert!(matches!(m, LoadedManifest::Unsupported { .. }));
     }
 
