@@ -1,0 +1,93 @@
+name: bughunt-maven probe
+on:
+  push:
+    branches: ['bughunt/maven/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build
+        shell: bash
+        run: cargo build --release -p socket-patch-cli
+      - name: Probe Maven global discovery
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/probe.py" <<'PY'
+          import http.server, json, os, subprocess, sys, tarfile, threading, urllib.request, shutil, tempfile, re
+          WIN = os.name == "nt"
+          SP = os.path.abspath("target/release/socket-patch" + (".exe" if WIN else ""))
+          T = os.environ["RUNNER_TEMP"]
+          LOG = []
+          class H(http.server.BaseHTTPRequestHandler):
+              def _r(self):
+                  n = int(self.headers.get("Content-Length") or 0)
+                  LOG.append(self.rfile.read(n).decode() if n else self.path)
+                  out = json.dumps({"packages": [], "canAccessPaidPatches": False}).encode()
+                  self.send_response(200); self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
+              do_GET = _r; do_POST = _r
+              def log_message(self, *a): pass
+          srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+          threading.Thread(target=srv.serve_forever, daemon=True).start()
+          PROXY = f"http://127.0.0.1:{srv.server_address[1]}"
+          home = os.path.expanduser("~")
+          m2 = os.path.join(home, ".m2")
+          proj = os.path.join(T, "proj"); os.makedirs(proj, exist_ok=True)
+          open(os.path.join(proj, "pom.xml"), "w").write('<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion><groupId>t</groupId><artifactId>p</artifactId><version>1</version></project>')
+          def mvn_bin(v):
+              d = os.path.join(T, f"apache-maven-{v}")
+              if not os.path.isdir(d):
+                  major = v.split(".")[0]
+                  url = f"https://archive.apache.org/dist/maven/maven-{major}/{v}/binaries/apache-maven-{v}-bin.tar.gz"
+                  p = os.path.join(T, f"m{v}.tgz"); urllib.request.urlretrieve(url, p)
+                  tarfile.open(p).extractall(T)
+              return d, os.path.join(d, "bin", "mvn.cmd" if WIN else "mvn")
+          def mvn(m, args, env=None):
+              cmd = f'"{m}" -B ' + " ".join(args)
+              r = subprocess.run(cmd, shell=True, cwd=proj, env=env or os.environ.copy(), capture_output=True, text=True)
+              return r.returncode, r.stdout + r.stderr
+          def maven_repo(m, env=None):
+              rc, out = mvn(m, ["-X", "-o", "validate"], env)
+              g = re.search(r"Using local repository at (\S+)", out)
+              return g.group(1) if g else f"?(rc={rc})"
+          def scan(env):
+              LOG.clear()
+              r = subprocess.run([SP, "scan", "-g", "--json", "--proxy-url", PROXY, "--ecosystems", "maven"], cwd=proj, env=env, capture_output=True, text=True)
+              try: n = json.loads(r.stdout).get("scannedPackages")
+              except Exception: n = f"nojson rc={r.returncode} {r.stderr[:200]}"
+              return n, any("commons-text@1.10.0" in l for l in LOG)
+          rows = []
+          for v in ["3.6.3", "3.9.11", "4.0.0-rc-7"]:
+              d, m = mvn_bin(v)
+              shutil.rmtree(m2, ignore_errors=True)
+              rc, out = mvn(m, ["org.apache.maven.plugins:maven-dependency-plugin:3.1.2:get", "-Dartifact=org.apache.commons:commons-text:1.10.0"])
+              if rc != 0: rows.append((v, "seed", f"seed failed rc={rc}", out[-400:])); continue
+              base = {k: val for k, val in os.environ.items() if k not in ("M2_HOME", "MAVEN_REPO_LOCAL")}
+              rows.append((v, "default", maven_repo(m, base), scan(base)))
+              e = dict(base, M2_HOME=d)
+              rows.append((v, "M2_HOME=<maven install>", maven_repo(m, e), scan(e)))
+              if WIN:
+                  other = os.path.join(T, "githome"); os.makedirs(other, exist_ok=True)
+                  e = dict(base, HOME=other)
+                  rows.append((v, "HOME!=USERPROFILE", maven_repo(m, e), scan(e)))
+                  e = {k: val for k, val in base.items() if k != "HOME"}
+                  rows.append((v, "HOME unset", maven_repo(m, e), scan(e)))
+              custom = os.path.join(T, f"custom repo {v}")
+              shutil.rmtree(m2, ignore_errors=True); os.makedirs(m2)
+              open(os.path.join(m2, "settings.xml"), "w").write(f"<settings><localRepository>{custom}</localRepository></settings>")
+              rc, out = mvn(m, ["org.apache.maven.plugins:maven-dependency-plugin:3.1.2:get", "-Dartifact=org.apache.commons:commons-text:1.10.0"], base)
+              rows.append((v, "settings.xml <localRepository>", maven_repo(m, base), scan(base) if rc == 0 else f"seed rc={rc}"))
+              os.remove(os.path.join(m2, "settings.xml"))
+          print(f"OS={sys.platform} HOME={os.environ.get('HOME')} USERPROFILE={os.environ.get('USERPROFILE')} expanduser={home}")
+          for r in rows: print("ROW", " | ".join(str(x) for x in r))
+          PY
+          PYBIN=python3; if [ "$RUNNER_OS" = Windows ]; then PYBIN=python; fi
+          "$PYBIN" "$RUNNER_TEMP/probe.py"
