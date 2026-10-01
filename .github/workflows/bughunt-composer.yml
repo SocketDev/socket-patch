@@ -89,8 +89,9 @@ jobs:
           REPO='{"type":"path","url":"'"$T/pkg"'","options":{"symlink":false}}'
           # --- 1. default home
           GH="$(composer global config home 2>/dev/null | tail -1)"; echo "default home: $GH"
-          composer global config repositories.local "$REPO"
-          composer global require acme/tool:1.0.0 2>&1 | tail -3
+          mkdir -p "$GH"
+          printf '{"repositories":[%s],"require":{"acme/tool":"1.0.0"}}\n' "$REPO" > "$GH/composer.json"
+          composer global update 2>&1 | tail -3
           F="$GH/vendor/acme/tool/src/Msg.php"; grep -o 'VULNERABLE\|PATCHED' "$F"
           cd "$T/work"
           "$B" scan -g --json $A > s.json 2>s.err; echo "scan exit $?"
@@ -103,16 +104,15 @@ jobs:
           "$B" rollback -g $A --yes 2>&1 | tail -1
           cmp -s "$F" "$T/orig.php" && R rollback-g pass || R rollback-g fail
           # --- 2. composer NOT on PATH, default home (fallback resolution)
-          CDIR="$(dirname "$(command -v composer)")"; echo "composer dir: $CDIR"
-          NP="$(echo "$PATH" | tr ':' '\n' | grep -vxF "$CDIR" | paste -sd: -)"
+          NP="$PATH"
+          while d="$(PATH="$NP" command -v composer)"; do d="$(dirname "$d")"; echo "strip composer dir: $d"; NP="$(echo "$NP" | tr ':' '\n' | grep -vxF "$d" | paste -sd: -)"; done
           PATH="$NP" bash -c 'command -v composer || echo "composer not on PATH"'
           PATH="$NP" "$B" scan -g --json $A > s2.json 2>s2.err
           N=$(python3 -c "import json;print(json.load(open('s2.json')).get('packagesWithPatches'))"); [ "$N" = 1 ] && R scan-g-no-composer-on-path pass || { R scan-g-no-composer-on-path "fail($N)"; tail -2 s2.err; }
           # --- 3. custom global vendor-dir (explicit COMPOSER_HOME)
           export COMPOSER_HOME="$T/ch2"; mkdir -p "$COMPOSER_HOME"
-          composer global config repositories.local "$REPO"
-          composer global config vendor-dir deps
-          composer global require acme/tool:1.0.0 2>&1 | tail -1
+          printf '{"repositories":[%s],"require":{"acme/tool":"1.0.0"},"config":{"vendor-dir":"deps"}}\n' "$REPO" > "$COMPOSER_HOME/composer.json"
+          composer global update 2>&1 | tail -1
           ls "$COMPOSER_HOME"
           "$B" scan -g --json $A > s3.json 2>s3.err
           N=$(python3 -c "import json;print(json.load(open('s3.json')).get('packagesWithPatches'))"); [ "$N" = 1 ] && R scan-g-vendor-dir pass || { R scan-g-vendor-dir "fail($N)"; tail -2 s3.err; }
