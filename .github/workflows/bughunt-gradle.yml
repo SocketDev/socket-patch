@@ -1,0 +1,70 @@
+name: bughunt-gradle probe
+on:
+  push:
+    branches: ['bughunt/gradle/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    name: ${{ matrix.os }} gradle ${{ matrix.gradle }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+        gradle: ['6.9.4', '7.6.6', '9.8.0']
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.gradle == '6.9.4' && '11' || (matrix.gradle == '7.6.6' && '17' || '21') }}
+      - name: Tools
+        shell: bash
+        env:
+          GRADLE_VERSION: ${{ matrix.gradle }}
+        run: |
+          set -euo pipefail
+          url="https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+          curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/gradle.zip"
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+          launcher="$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin/gradle"
+          mvnurl="https://archive.apache.org/dist/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz"
+          curl -fsSL --retry 3 "$mvnurl" -o "$RUNNER_TEMP/maven.tgz"
+          python -m tarfile -e "$RUNNER_TEMP/maven.tgz" "$RUNNER_TEMP"
+          mvn="$RUNNER_TEMP/apache-maven-3.9.11/bin/mvn"
+          if [ "$RUNNER_OS" = Windows ]; then launcher="${launcher}.bat"; mvn="${mvn}.cmd"; fi
+          echo "BH_GRADLE=$launcher" >> "$GITHUB_ENV"
+          echo "MVN=$mvn" >> "$GITHUB_ENV"
+          git config --show-origin --get core.autocrlf || echo "autocrlf unset"
+      - name: Unpack harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -c "import base64,sys; open(sys.argv[1],'wb').write(base64.b64decode(sys.argv[2]))" "$RUNNER_TEMP/pkg.tgz" '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'
+          mkdir -p "$RUNNER_TEMP/pkg"
+          python -m tarfile -e "$RUNNER_TEMP/pkg.tgz" "$RUNNER_TEMP/pkg"
+          cp "$RUNNER_TEMP/pkg/zz_bughunt_gradle.rs" crates/socket-patch-cli/tests/
+          mkdir -p "$RUNNER_TEMP/seed" "$RUNNER_TEMP/m2" "$RUNNER_TEMP/ghome" "$RUNNER_TEMP/t"
+          cd "$RUNNER_TEMP/seed"
+          for a in org.apache.commons:commons-text:1.10.0 org.junit:junit-bom:5.9.0:module org.junit:junit-bom:5.9.1:module; do
+            "$MVN" -B -q "-Dmaven.repo.local=$RUNNER_TEMP/m2" org.apache.maven.plugins:maven-dependency-plugin:3.6.1:get "-Dartifact=$a" -Dtransitive=false || "$MVN" -B -q "-Dmaven.repo.local=$RUNNER_TEMP/m2" org.apache.maven.plugins:maven-dependency-plugin:3.6.1:get "-Dartifact=$a"
+          done
+          "$MVN" -B -q "-Dmaven.repo.local=$RUNNER_TEMP/m2" org.apache.maven.plugins:maven-dependency-plugin:3.6.1:get -Dartifact=org.apache.commons:commons-text:1.10.0
+      - name: Build harness
+        shell: bash
+        run: cargo test -p socket-patch-cli --test zz_bughunt_gradle --no-run
+      - name: Run scenarios
+        shell: bash
+        run: |
+          export BH_M2="$RUNNER_TEMP/m2" BH_GHOME="$RUNNER_TEMP/ghome" TMPDIR="$RUNNER_TEMP/t"
+          for s in s1 s9 s12 s14; do
+            echo "################ SCENARIO $s"
+            BH_SCEN="$RUNNER_TEMP/pkg/scen/$s" BH_WORK="$RUNNER_TEMP/work/$s" BH_REVERT=1 \
+              cargo test -q -p socket-patch-cli --test zz_bughunt_gradle bh -- --exact --ignored --nocapture 2>&1 \
+              | grep -E "VENDOR exit|\"status\"|errorCode|\"error\"|CHECK|autocrlf|^0000|GRADLE|CP |What went wrong|socket-patch:|REVERT exit|^ ?[MDA?]{1,2} " || true
+          done
