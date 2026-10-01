@@ -26,9 +26,9 @@
 //!     code `redirect_yarn_berry_cache_unsupported` (the CODE, not human
 //!     text), and `yarn.lock` + `package.json` byte-identical.
 //!   * `scan --mode vendored`: exit 1, envelope `status: partial_failure`,
-//!     a per-package failed event with errorCode
-//!     `vendor_yarn_berry_cache_unsupported` (download succeeded — the
-//!     refusal is at the wiring step, not discovery), zero mutations to
+//!     a failed DOWNLOAD record (errorCode
+//!     `vendor_yarn_berry_cache_unsupported`) produced before any view
+//!     fetch, with no vendor-step event for the package, zero mutations to
 //!     `yarn.lock` / `package.json`, and no `.socket/vendor` artifacts.
 //!
 //! If a future corepack pin emits a different cacheKey, the pin assertion

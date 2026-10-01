@@ -54,11 +54,11 @@
 //!
 //! | cell | shape | expectation |
 //! |---|---|---|
-//! | `manifest-deleted` | ledgers + artifacts, `--immutable --check-cache` install | online + offline attest (ledger record); embedded `apply --vex` (+ `vendor --vex` / `scan --mode hosted --vex`) attest |
+//! | `manifest-deleted` | ledgers + artifacts (hosted: v5 writes no ledger, asserted), `--immutable --check-cache` install | online attests; offline attests from the vendor ledger record (hosted: `record_unavailable`, no local record); embedded `apply --vex` (+ `vendor --vex` / `scan --mode hosted --vex`) attest |
 //! | `ledgers-deleted` | lockfile (+ vendored artifact) only | online attests from the API record; embedded `apply --vex` attests |
 //! | `offline` | no ledgers, `--offline` | `record_unavailable`, exit 1, ZERO API requests |
 //! | `tampered` | installed file (hosted) / artifact member (vendored) altered | `hash_mismatch` / `vendor_hash_mismatch` |
-//! | `reverted` | lock (+ package.json) back to the registry, ledgers + artifacts kept, real `--immutable` install of the pristine bytes | `redirect_unwired` / `vendor_unwired` with AND without `--no-verify`, online and offline, zero API requests; with the ledgers gone too: nothing discovered |
+//! | `reverted` | lock (+ package.json) back to the registry, ledgers + artifacts kept, real `--immutable` install of the pristine bytes | vendored: `vendor_unwired`; hosted: nothing discovered (exit 2 `manifest_not_found`, the lock was the only hosted state) — with AND without `--no-verify`, online and offline, zero API requests; with the ledgers gone too: nothing discovered |
 //! | `reverted-lock-only` (vendored) | lock reverted, the `resolutions` mapping left behind | `vendor_unwired` (with and without `--no-verify`) |
 //! | `pnp-linker` | the SAME wired lock installed under `nodeLinker: pnp` | the documented PnP contract: standalone vex attests from the lock's `checksum:` pin (hosted) / the committed artifact (vendored); `apply --vex` refuses (`yarn_pnp_unsupported`) |
 //!
@@ -576,6 +576,25 @@ impl<'a> BerryVexFlow<'a> {
     fn assert_omitted_run(&self, out: &VexOutcome, reason: &str, ctx: &str) {
         crate::vex_e2e_common::assert_omitted(out, self.purl, reason, ctx);
     }
+
+    /// A reverted checkout: vendored, the stale ledger entry is
+    /// `vendor_unwired`; hosted (v5, no ledger), the lock was the only
+    /// hosted state, so nothing is discovered at all.
+    fn assert_reverted_run(&self, out: &VexOutcome, ctx: &str) {
+        match self.wiring {
+            BerryWiring::Vendored { .. } => {
+                self.assert_omitted_run(out, self.wiring.unwired_reason(), ctx)
+            }
+            BerryWiring::Hosted { .. } => {
+                assert_eq!(out.code, Some(2), "{ctx}: {out}");
+                assert_eq!(
+                    out.envelope["error"]["code"], "manifest_not_found",
+                    "{ctx}: no hosted state is left: {out}"
+                );
+                assert!(out.doc.is_none(), "{ctx}: no document: {out}");
+            }
+        }
+    }
 }
 
 /// Recursive copy (files and dirs; symlinks are followed).
@@ -635,10 +654,16 @@ pub fn run_manifestless_vex_matrix(flow: &BerryVexFlow<'_>) -> Vec<String> {
     // ── manifest-deleted: ledgers + artifacts travel, the real yarn installs ──
     let fresh = flow.checkout("vex-manifest-deleted", true);
     strip_manifest(&fresh);
-    assert!(
-        fresh.join(".socket/vendor").is_dir(),
-        "manifest-deleted: the flow must have left its .socket/vendor ledgers"
-    );
+    if is_hosted {
+        // v5 hosted mode keeps no redirect ledger: the yarn.lock pin is the
+        // whole hosted state, so this checkout already has no ledger.
+        crate::vex_e2e_common::assert_no_hosted_ledger(&fresh, "manifest-deleted");
+    } else {
+        assert!(
+            fresh.join(socket_patch_core::vendor::VENDOR_STATE_REL).is_file(),
+            "manifest-deleted: the vendored flow must have left its .socket/vendor ledger"
+        );
+    }
     flow.install(
         &fresh,
         &["install", "--immutable", "--check-cache"],
@@ -662,7 +687,12 @@ pub fn run_manifestless_vex_matrix(flow: &BerryVexFlow<'_>) -> Vec<String> {
     let before = api.request_count();
     let ctx = flow.cell_tag("manifest-deleted/offline-ledger");
     let out = run_vex(&bin, &fresh, &flow.offline(&api));
-    flow.assert_attested_run(&out, &ctx);
+    if is_hosted {
+        // No ledger, so no local record: offline, the hosted pin is omitted.
+        flow.assert_omitted_run(&out, "record_unavailable", &ctx);
+    } else {
+        flow.assert_attested_run(&out, &ctx);
+    }
     assert_eq!(
         api.request_count(),
         before,
@@ -861,7 +891,7 @@ pub fn run_manifestless_vex_matrix(flow: &BerryVexFlow<'_>) -> Vec<String> {
                 ..base.clone()
             };
             let out = run_vex(&bin, &reverted, &run);
-            flow.assert_omitted_run(&out, unwired, &ctx);
+            flow.assert_reverted_run(&out, &ctx);
         }
     }
     assert_eq!(
@@ -874,15 +904,21 @@ pub fn run_manifestless_vex_matrix(flow: &BerryVexFlow<'_>) -> Vec<String> {
     std::fs::write(reverted.join(flow.installed), flow.patched).unwrap();
     let ctx = flow.cell_tag("reverted/stale-patched-tree");
     let out = run_vex(&bin, &reverted, &flow.offline(&api));
-    flow.assert_omitted_run(&out, unwired, &ctx);
+    flow.assert_reverted_run(&out, &ctx);
     std::fs::write(reverted.join(flow.installed), flow.pristine).unwrap();
     let ctx = flow.cell_tag("reverted/apply--vex");
     let out = run_vex(&bin, &reverted, &flow.offline(&api).via(VexVia::Apply));
-    assert_ne!(
-        out.code,
-        Some(0),
-        "{ctx}: a stale ledger fails the requested VEX: {out}"
-    );
+    if is_hosted {
+        // Nothing references the patch anywhere: manifest-less `apply
+        // --vex` keeps its calm exit-0 no-op and writes no document.
+        assert_eq!(out.code, Some(0), "{ctx}: nothing to attest: {out}");
+    } else {
+        assert_ne!(
+            out.code,
+            Some(0),
+            "{ctx}: a stale ledger fails the requested VEX: {out}"
+        );
+    }
     assert!(out.doc.is_none(), "{ctx}: no document: {out}");
     strip_ledgers(&reverted);
     let ctx = flow.cell_tag("reverted/no-ledgers");

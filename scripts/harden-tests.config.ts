@@ -44,7 +44,7 @@ export default function render(ctx: FileCtx): string {
   // often hides here: a helper that swallows errors, a fake fixture that never
   // exercises the real path, an assertion shim that always passes.
   const isHarness =
-    /(^|\/)(common|setup_matrix_common|helpers?|support|fixtures?)(\/|$)/.test(
+    /(^|\/)(common|helpers?|support|fixtures?)(\/|$)/.test(
       ctx.relInCrate,
     ) || ctx.name === "mod.rs";
 

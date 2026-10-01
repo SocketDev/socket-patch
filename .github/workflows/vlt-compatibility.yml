@@ -21,6 +21,8 @@ on:
   pull_request:
     paths:
       - '.github/actions/upload-artifact/**'
+      - '.github/actions/pin-socket-hosts/**'
+      - 'scripts/pin-socket-hosts.py'
       - '.github/workflows/vlt-compatibility.yml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -35,9 +37,8 @@ on:
       - 'crates/socket-patch-cli/src/commands/apply.rs'
       - 'crates/socket-patch-cli/src/commands/rollback.rs'
       - 'crates/socket-patch-cli/src/commands/remove.rs'
-      - 'crates/socket-patch-cli/src/commands/setup.rs'
       - 'crates/socket-patch-cli/src/commands/vendor.rs'
-      - 'crates/socket-patch-cli/src/commands/repair_vendor.rs'
+      - 'crates/socket-patch-cli/src/commands/vendored_backend/**'
       - 'crates/socket-patch-cli/src/commands/get.rs'
       - 'crates/socket-patch-cli/src/commands/vlt_preflight.rs'
       - 'crates/socket-patch-cli/src/commands/scan/**'
@@ -54,10 +55,15 @@ on:
       - 'scripts/install-vlt.sh'
       - 'scripts/vlt-historical-integrity.json'
       - 'scripts/gen-vlt-collation-golden.mjs'
+      - 'scripts/ci-vlt-proof-suites.py'
+      - '.github/workflows/ci.yml'
+      - 'scripts/tests/test_ci_vlt_rows.py'
   push:
     branches: [main]
     paths:
       - '.github/actions/upload-artifact/**'
+      - '.github/actions/pin-socket-hosts/**'
+      - 'scripts/pin-socket-hosts.py'
       - '.github/workflows/vlt-compatibility.yml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -72,9 +78,8 @@ on:
       - 'crates/socket-patch-cli/src/commands/apply.rs'
       - 'crates/socket-patch-cli/src/commands/rollback.rs'
       - 'crates/socket-patch-cli/src/commands/remove.rs'
-      - 'crates/socket-patch-cli/src/commands/setup.rs'
       - 'crates/socket-patch-cli/src/commands/vendor.rs'
-      - 'crates/socket-patch-cli/src/commands/repair_vendor.rs'
+      - 'crates/socket-patch-cli/src/commands/vendored_backend/**'
       - 'crates/socket-patch-cli/src/commands/get.rs'
       - 'crates/socket-patch-cli/src/commands/vlt_preflight.rs'
       - 'crates/socket-patch-cli/src/commands/scan/**'
@@ -91,6 +96,9 @@ on:
       - 'scripts/install-vlt.sh'
       - 'scripts/vlt-historical-integrity.json'
       - 'scripts/gen-vlt-collation-golden.mjs'
+      - 'scripts/ci-vlt-proof-suites.py'
+      - '.github/workflows/ci.yml'
+      - 'scripts/tests/test_ci_vlt_rows.py'
   schedule:
     # Nightly: vlt releases and the production service drift with no PR open.
     - cron: '17 4 * * *'
@@ -117,11 +125,11 @@ on:
 permissions:
   contents: read
 
-# Supersede stale PR runs; main runs are the only rust-cache writers, so they
-# are never cancelled mid-save.
+# Supersede stale PR runs only: main runs are the only rust-cache writers, so
+# push, dispatch and schedule runs are never cancelled mid-save.
 concurrency:
   group: vlt-compat-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_PROFILE_DEV_DEBUG: '0'
@@ -313,6 +321,8 @@ jobs:
           SOCKET_PATCH_VLT_E2E_STORE_LINKER: ${{ matrix.linker }}
           SOCKET_PATCH_VLT_E2E_CACHE_ROOT: ${{ matrix.cache_root }}
           VLT_SUITES: ${{ matrix.suites || 'e2e_redirect_vlt_build e2e_vendor_vlt_build mode_migration_vlt e2e_safety_vlt e2e_vlt' }}
+          MATRIX_OS: ${{ matrix.os }}
+          NODE_PIN: ${{ matrix.node }}
         run: |
           set -uo pipefail
           exe=''
@@ -328,6 +338,17 @@ jobs:
             mkdir -p "$SOCKET_PATCH_VLT_E2E_CACHE_ROOT"
           fi
           py=$(command -v python3 || command -v python)
+          # Cells ci.yml's e2e rows run identically (every PR, main push and
+          # nightly) are left to them; a dispatch runs every cell.
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
+            # shellcheck disable=SC2086 # VLT_SUITES is a word list
+            VLT_SUITES=$("$py" scripts/ci-vlt-proof-suites.py --os "$MATRIX_OS" --vlt "$SOCKET_PATCH_VLT_E2E_VERSION" \
+              --node "$NODE_PIN" --linker "${SOCKET_PATCH_VLT_E2E_STORE_LINKER:-}" \
+              --cache-root "${SOCKET_PATCH_VLT_E2E_CACHE_ROOT:-}" $VLT_SUITES | tr -d '\r') || exit 1
+          fi
+          if [ -z "$VLT_SUITES" ]; then
+            echo "::notice::every capstone of this cell runs in ci.yml's e2e rows; nothing left to run here"
+          fi
           status=0
           for suite in $VLT_SUITES; do
             echo "::group::$suite"
@@ -390,6 +411,10 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
+      - name: Pin the production patch hosts (macOS)
+        # The hosted macOS resolver intermittently loses patch.socket.dev for
+        # minutes (EAI_NONAME) while the service is up; see the action.
+        uses: ./.github/actions/pin-socket-hosts
       - name: Backtest against production
         # Every hosted cell probes the artifact first; it records
         # blocked-by-server-encoding only when that probe saw a non-identity

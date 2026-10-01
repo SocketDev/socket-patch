@@ -11,20 +11,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::vlt_hosted_common::*;
 
-fn ledger(root: &Path) -> Value {
-    serde_json::from_str(&read(root, ".socket/vendor/redirect-state.json")).unwrap()
-}
-
-fn vlt_edit_keys(root: &Path) -> Vec<String> {
-    ledger(root)["edits"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|e| e["kind"] == "redirect_vlt_lock_node")
-        .map(|e| e["key"].as_str().unwrap().to_string())
-        .collect()
-}
-
 fn skipped_reasons(doc: &Value) -> Vec<String> {
     doc["redirect"]["skipped"]
         .as_array()
@@ -57,8 +43,8 @@ async fn assert_rewrites(era: Era, expected_warnings: &[&str]) {
     );
     assert_eq!(warning_codes(&doc), expected_warnings, "{doc:#}");
     assert_eq!(warning_detail(&doc, ADVISORY), ADVISORY_NOTHING_STALE);
-    assert_eq!(vlt_edit_keys(tmp.path()), ["left-pad@1.3.0"]);
-    assert!(ledger(tmp.path())["records"][PURL].is_object());
+    // v5: the lock pin is the whole record — no redirect ledger.
+    assert_no_ledger(tmp.path());
     assert_eq!(artifact_requests(&server).await, 1);
 }
 
@@ -104,15 +90,16 @@ async fn scan_redirect_refuses_vlt_lock_v2() {
     assert!(!ledger_path(tmp.path()).exists());
 }
 
+/// A re-run over the pinned lock is idempotent: still confirmed, the lock
+/// byte-identical, and (v5) still no ledger.
 #[tokio::test]
-async fn scan_redirect_vlt_rerun_noop_keeps_ledger() {
+async fn scan_redirect_vlt_rerun_is_a_noop() {
     let server = MockServer::start().await;
     mock_all(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     write_vlt_project(tmp.path(), Era::V1);
     scan_hosted(tmp.path(), &server, &[], &[]);
     let lock = read(tmp.path(), "vlt-lock.json");
-    let ledger_bytes = read(tmp.path(), ".socket/vendor/redirect-state.json");
 
     let (_, doc) = scan_hosted(tmp.path(), &server, &[], &[]);
 
@@ -122,11 +109,7 @@ async fn scan_redirect_vlt_rerun_noop_keeps_ledger() {
         "a pinned lock stays confirmed: {doc:#}"
     );
     assert_eq!(read(tmp.path(), "vlt-lock.json"), lock);
-    assert_eq!(
-        read(tmp.path(), ".socket/vendor/redirect-state.json"),
-        ledger_bytes
-    );
-    assert_eq!(vlt_edit_keys(tmp.path()), ["left-pad@1.3.0"]);
+    assert_no_ledger(tmp.path());
 }
 
 #[tokio::test]
@@ -146,14 +129,7 @@ async fn scan_redirect_vlt_crlf() {
         read(tmp.path(), "vlt-lock.json"),
         lock_with(Era::V1, &[pinned_node(TILDE_ID, &server), other]).replace('\n', "\r\n")
     );
-    let original = ledger(tmp.path())["edits"][0]["original"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(
-        !original.contains('\r') && !original.ends_with(','),
-        "{original:?}"
-    );
+    assert_no_ledger(tmp.path());
 }
 
 #[tokio::test]
@@ -179,10 +155,7 @@ async fn scan_redirect_vlt_peer_instances() {
             &[pinned_node(TILDE_ID, &server), pinned_node(peer, &server)]
         )
     );
-    assert_eq!(
-        vlt_edit_keys(tmp.path()),
-        ["left-pad@1.3.0", "left-pad@1.3.0~peer.2"]
-    );
+    assert_no_ledger(tmp.path());
     assert_eq!(
         artifact_requests(&server).await,
         1,
@@ -234,7 +207,7 @@ async fn scan_redirect_vlt_sibling_package_lock_vlt_installed_does_not_confirm_r
     );
     assert!(warning_codes(&doc).contains(&"redirect_vlt_unsupported_lock_key".to_string()));
     assert_eq!(read(tmp.path(), "vlt-lock.json"), lock);
-    assert!(!ledger_path(tmp.path()).exists() || ledger(tmp.path())["records"][PURL].is_null());
+    assert_no_ledger(tmp.path());
 }
 
 // ── artifact preflight ───────────────────────────────────────────────────
@@ -625,7 +598,7 @@ async fn scan_redirect_vlt_not_driving_entry_not_found_sibling_confirms() {
     );
     assert!(read(tmp.path(), "package-lock.json").contains(&artifact_url(&server)));
     assert_eq!(redirected(&doc), 1, "{doc:#}");
-    assert!(ledger(tmp.path())["records"][PURL].is_object());
+    assert_no_ledger(tmp.path());
 }
 
 /// A dep the vlt rewriter refuses is confirmed by no lock, even when vlt
@@ -656,7 +629,7 @@ async fn scan_redirect_vlt_not_driving_refused_dep_is_not_confirmed_by_the_sibli
     assert_eq!(read(tmp.path(), "vlt-lock.json"), lock);
     assert!(read(tmp.path(), "package-lock.json").contains(&artifact_url(&server)));
     assert_eq!(redirected(&doc), 0, "{doc:#}");
-    assert!(!ledger_path(tmp.path()).exists() || ledger(tmp.path())["records"][PURL].is_null());
+    assert_no_ledger(tmp.path());
 }
 
 const VENDORED_UUID: &str = "11111111-2222-4333-8444-555555555555";

@@ -57,6 +57,8 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -756,15 +758,44 @@ def main():
             return sorted({e.get("errorCode") for e in envelope.get("vendor", {}).get("events", []) if e.get("errorCode")})
         return sorted({p.get("errorCode") for p in envelope.get("apply", {}).get("patches", []) if p.get("errorCode")})
 
+    def hosted_uuid(text):
+        """The patch uuid of the first patch.socket.dev URL in `text` (the
+        LAST uuid-shaped path segment: an earlier one may be a grant token)."""
+        m = re.search(r"https://patch\.socket\.dev/[^\s\"'#]+", text)
+        if not m:
+            return None
+        uuids = re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", m[0])
+        return uuids[-1] if uuids else None
+
+    def published_record(uuid):
+        """`GET https://patches-api.socket.dev/patch/view/<uuid>` (the public proxy)."""
+        url = f"https://patches-api.socket.dev/patch/view/{uuid}"
+        for attempt in range(1, 6):
+            try:
+                req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SocketPatchCLI-backtest/1.0"})
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                if attempt == 5:
+                    raise
+                time.sleep(10 * attempt)
+
     def record_hashes(project, mode):
-        """The first patch record the mode's store holds: the redirect ledger's
-        `records` (hosted), the vendor ledger entry's embedded `record`
-        (vendored — vendored mode never writes `.socket/manifest.json`), or the
-        manifest's `patches` (agent)."""
-        ledger = project / {"hosted": ".socket/vendor/redirect-state.json", "vendored": ".socket/vendor/state.json"}.get(mode, ".socket/manifest.json")
-        if not ledger.exists():
-            return {}, {}, None
-        data = json.loads(ledger.read_text(encoding="utf-8"))
+        """The first patch record the mode's store holds: hosted (v5 keeps no
+        ledger) the public API's record for the uuid the lock pins, the vendor
+        ledger entry's embedded `record` (vendored — vendored mode never
+        writes `.socket/manifest.json`), or the manifest's `patches` (agent)."""
+        if mode == "hosted":
+            texts = [p.read_text(encoding="utf-8") for p in (project / "pdm.lock", project / "pyproject.toml") if p.exists()]
+            uuid = next((u for u in map(hosted_uuid, texts) if u), None)
+            if uuid is None:
+                return {}, {}, None
+            data = {"records": {PURL_BASE: published_record(uuid)}}
+        else:
+            ledger = project / {"vendored": ".socket/vendor/state.json"}.get(mode, ".socket/manifest.json")
+            if not ledger.exists():
+                return {}, {}, None
+            data = json.loads(ledger.read_text(encoding="utf-8"))
         if mode == "hosted":
             recs = data.get("records") or {}
         elif mode == "vendored":
@@ -783,8 +814,8 @@ def main():
 
     def ledger_cleared(project, mode):
         if mode == "hosted":
-            p = project / ".socket/vendor/redirect-state.json"
-            return not p.exists() or not json.loads(p.read_text(encoding="utf-8")).get("records")
+            # v5 hosted mode never writes the redirect ledger at all.
+            return not (project / ".socket/vendor/redirect-state.json").exists()
         if mode == "vendored":
             # Vendored mode is manifest-free: the ledger is the only store.
             st = project / ".socket/vendor/state.json"
@@ -822,28 +853,31 @@ def main():
         standalone `vex` (public patch API, no token) must:
 
           vexManifestDeleted  attest PURL_BASE via `uuid` with the mode's
-                              `(redirected)` / `(vendored)` marker (ledgers kept)
+                              `(redirected)` / `(vendored)` marker (vendor
+                              ledger kept; hosted keeps none in v5)
           vexLedgersDeleted   still attest with both ledgers deleted (lockfile
                               discovery + the patch API record)
           vexOfflineUnavailable  `--offline`, no ledger: exit 1, omitted
                               `record_unavailable`
-          vexRevertedUnwired  lock restored to the registry, ledgers +
-                              artifacts kept: exit 1, omitted
-                              `redirect_unwired` / `vendor_unwired`, with and
-                              without `--no-verify`
+          vexRevertedUnwired  lock restored to the registry, vendor ledger +
+                              artifacts kept: exit 1, omitted `vendor_unwired`
+                              (hosted: nothing names the patch any more —
+                              exit 2 `manifest_not_found`), with and without
+                              `--no-verify`
           vexApplyEmbedded    `apply --vex` on the manifest-less checkout
                               attests too
 
         (Refused lock formats get `vexRefusedAttestsNothing` instead.)
         """
         marker = "(redirected)" if mode == "hosted" else "(vendored)"
-        unwired = "redirect_unwired" if mode == "hosted" else "vendor_unwired"
+        unwired = "vendor_unwired"
         vdir = case / "vex-checkout"
         shutil.rmtree(vdir, ignore_errors=True)
         vdir.mkdir()
         for name in ("pyproject.toml", lockname):
             shutil.copyfile(project / name, vdir / name)
-        shutil.copytree(project / ".socket", vdir / ".socket")
+        if (project / ".socket").is_dir():
+            shutil.copytree(project / ".socket", vdir / ".socket")
         (vdir / ".socket/manifest.json").unlink(missing_ok=True)
         ledgers = [vdir / ".socket/vendor/state.json", vdir / ".socket/vendor/redirect-state.json"]
         saved = {p: p.read_bytes() for p in ledgers if p.exists()}
@@ -900,9 +934,13 @@ def main():
         reverted = {}
         for flags in ((), ("--no-verify",), ("--offline", "--no-verify")):
             r, env_, doc = vex("vex-reverted%s.log" % "".join(flags).replace("--", "-"), *flags)
-            reverted[" ".join(flags) or "default"] = {"exit": r.rc, "omitted": omitted(env_, unwired), "attested": attested(doc)}
+            if mode == "hosted":
+                dead = r.rc == 2 and (env_.get("error") or {}).get("code") == "manifest_not_found"
+            else:
+                dead = r.rc == 1 and omitted(env_, unwired)
+            reverted[" ".join(flags) or "default"] = {"exit": r.rc, "dead": dead, "attested": attested(doc)}
         notes["reverted"] = reverted
-        check("vexRevertedUnwired", bool(saved) and all(v["exit"] == 1 and v["omitted"] and not v["attested"] for v in reverted.values()), reverted)
+        check("vexRevertedUnwired", bool(saved) == (mode != "hosted") and all(v["dead"] and not v["attested"] for v in reverted.values()), reverted)
         if not args.keep_environments:
             for path in (vvenv, vhome, vcache):
                 shutil.rmtree(path, ignore_errors=True)
@@ -1164,6 +1202,9 @@ def main():
         after, before, uuid = record_hashes(project, mode)
         info["uuid"] = uuid
         check("recordHasFiles", bool(after))
+        if mode == "hosted":
+            # v5: the lock pin is the whole hosted state — no ledger, ever.
+            check("noLedger", not (project / ".socket/vendor/redirect-state.json").exists())
         if mode == "vendored":
             wheel_dir = project / ".socket/vendor/pypi" / (uuid or "")
             check("vendoredWheelPresent", wheel_dir.is_dir() and any(wheel_dir.glob("*.whl")))
@@ -1232,6 +1273,8 @@ def main():
             check("reinstallOk", ok, r.tail(300))
         # relock -> re-scan -> rollback (must restore the relocked bytes)
         saved = case / "saved-socket"
+        # v5 hosted mode may leave no `.socket/` at all.
+        (project / ".socket").mkdir(exist_ok=True)
         shutil.copytree(project / ".socket", saved)
         if excluded:
             # The marker kept PDM from installing urllib3, so put the upstream
@@ -1319,7 +1362,7 @@ def main():
             for s in args.shapes:
                 for m in args.modes:
                     if wanted(v, s, m):
-                        results.append({"pdm": v, "python": python_for(v), "shape": s, "mode": m, "outcome": "SKIP", "passed": None, "checks": {}, "info": {"skip": "tool bootstrap failed: " + tool_environments.get(v, {}).get("error", "?")[-300:]}})
+                        results.append({"pdm": v, "python": python_for(v), "shape": s, "mode": m, "outcome": "ERROR", "passed": False, "checks": {}, "info": {"error": "tool bootstrap failed: " + tool_environments.get(v, {}).get("error", "?")[-300:]}})
     jobs = [j for j in jobs if tool_environments.get(j[0], {}).get("ok")]
 
     def persist():
@@ -1351,6 +1394,10 @@ def main():
     say(render_matrix(summary))
     bad = [r for r in summary["results"] if r["outcome"] in ("FAIL", "ERROR")]
     say(f"{len(summary['results'])} rows: " + ", ".join(f"{o} {sum(1 for r in summary['results'] if r['outcome'] == o)}" for o in ("PASS", "REFUSED-EXPECTED", "UNSUPPORTED", "SKIP", "FAIL", "ERROR")))
+    # A cell whose every row skipped exercised nothing; it must not read as green.
+    if summary["results"] and all(r["outcome"] == "SKIP" for r in summary["results"]):
+        say("every row SKIPPED: this cell exercised nothing")
+        sys.exit(1)
     if bad or errors:
         sys.exit(1)
 

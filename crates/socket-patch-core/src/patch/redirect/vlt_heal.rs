@@ -1,4 +1,4 @@
-//! Warm-tree heal for hosted vlt redirects (DESIGN D7).
+//! Warm-tree heal for hosted vlt redirects.
 //!
 //! vlt never refreshes a store entry it already holds: after the lock is
 //! repointed, `vlt install` keeps `node_modules/.vlt/<DepID>` and the
@@ -370,7 +370,7 @@ async fn bytes_check(dir: &Path, target: &Target<'_>, expected: Expected) -> Byt
 }
 
 /// Is `target`'s store entry stale against `expected`, healthy, or
-/// impossible to judge? See DESIGN §3.9 "Heal" for the rules.
+/// impossible to judge? The module doc states the rules.
 pub async fn classify_target(
     state: &InstallState,
     root: &Path,
@@ -456,6 +456,29 @@ pub async fn invalidate(root: &Path, state: &InstallState, stale: &[String]) -> 
         }
     }
     out
+}
+
+/// The Socket-hosted vlt nodes of `lock` (read BEFORE a restore rewrites
+/// it) that stand for one of `purls` — the ledger-free rollback heal's
+/// targets. No patch record rides along (v5 keeps no hosted ledger), so the
+/// heal judges each installed copy against the lock's own pins.
+pub fn lock_targets(lock: &str, origins: &[String], purls: &[String]) -> Vec<LedgerTarget> {
+    let wanted: Vec<String> = purls.iter().map(|p| canonical_purl(p)).collect();
+    socket_owned_instances(lock, origins)
+        .into_iter()
+        .filter_map(|instance| {
+            let purl = crate::utils::purl::npm_purl(&instance.name, &instance.version)?;
+            let canon = canonical_purl(&purl);
+            let at = wanted.iter().position(|w| *w == canon)?;
+            Some(LedgerTarget {
+                purl: purls[at].clone(),
+                dep_id: instance.dep_id,
+                name: instance.name,
+                record: None,
+                flags: instance.flags,
+            })
+        })
+        .collect()
 }
 
 /// The vlt nodes the ledger's `redirect_vlt_lock_node` edits name for each

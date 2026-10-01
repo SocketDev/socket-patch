@@ -12,7 +12,7 @@
 
 use serde_json::Value;
 
-use crate::patch::redirect::composer_source::{top_level_members, value_end_at};
+use crate::formats::composer::source::{top_level_members, value_end_at};
 use crate::utils::line_endings::{majority_terminator, LineEndings};
 use crate::vendor::common::{detect_indent, serialize_json};
 

@@ -23,7 +23,7 @@ use socket_patch_core::patch::sidecars::dispatch_fixup;
 /// Empty `patched` list short-circuits with `Ok(None)` — guards
 /// against callers that forget to check `files_patched.is_empty()`
 /// (apply.rs does, but the guard belongs on the engine side too).
-/// Covers `sidecars/mod.rs:110`.
+/// Covers the `patched.is_empty()` early return in `dispatch_fixup`.
 ///
 /// The PURL MUST name an ecosystem whose non-short-circuited path
 /// returns `Some` — otherwise the test is vacuous. A `pkg:cargo/...`
@@ -51,7 +51,8 @@ async fn dispatch_fixup_empty_patched_returns_none() {
 }
 
 /// Unknown PURL ecosystem (no recognized scheme prefix) also
-/// short-circuits with `Ok(None)`. Covers `sidecars/mod.rs:115`.
+/// short-circuits with `Ok(None)`. Covers the `Ecosystem::from_purl`
+/// early return in `dispatch_fixup`.
 #[tokio::test]
 async fn dispatch_fixup_unknown_ecosystem_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
@@ -70,8 +71,8 @@ async fn dispatch_fixup_unknown_ecosystem_returns_none() {
 
 /// `dispatch_fixup` cargo path with a `patched` entry that points
 /// at a file that doesn't exist on disk exercises the
-/// `sha256_file` error arm inside `update_entries`
-/// (cargo.rs:131-133). In the apply-CLI flow this is race-only
+/// `read_regular_to_bytes(on_disk)` error arm inside `update_entries`.
+/// In the apply-CLI flow this is race-only
 /// (apply atomically wrote the file before dispatch_fixup is
 /// called), so direct invocation is the only way to drive it
 /// from outside the engine.
@@ -79,7 +80,7 @@ async fn dispatch_fixup_unknown_ecosystem_returns_none() {
 /// The setup: a valid `.cargo-checksum.json` on disk + a `patched`
 /// entry naming a file that doesn't exist. cargo::fixup parses the
 /// checksum, then `update_entries` walks `patched`, calls
-/// `sha256_file(on_disk)`, and the open fails with NotFound. The
+/// `read_regular_to_bytes(on_disk)`, and the open fails with NotFound. The
 /// `.map_err(|source| SidecarError::Io { ... })?` wraps it; the
 /// dispatcher returns `Err(SidecarError::Io)`.
 #[tokio::test]
@@ -95,7 +96,7 @@ async fn dispatch_fixup_cargo_sha256_file_failure_arm() {
     )
     .unwrap();
     // Note: we DO NOT create "missing-on-disk.txt" — that's
-    // exactly the condition that fires the sha256_file Err arm.
+    // exactly the condition that fires the read Err arm.
 
     let result = dispatch_fixup(
         "pkg:cargo/anything@1.0.0",
@@ -111,12 +112,8 @@ async fn dispatch_fixup_cargo_sha256_file_failure_arm() {
                 path.contains("missing-on-disk.txt"),
                 "Io error path must reference the missing file; got {path:?}"
             );
-            // The premise of this test is that the file is *absent* and
-            // the `read()` in `sha256_file` fails with NotFound. Assert
-            // that exact errno so a regression that surfaced some other
-            // Io failure (EACCES, EISDIR, a wrapped/mislabeled error)
-            // here — i.e. NOT the missing-file arm we claim to cover —
-            // cannot masquerade as this test passing.
+            // Pin NotFound so some other Io failure (EACCES, EISDIR, a
+            // mislabeled error) can't masquerade as the missing-file arm.
             assert_eq!(
                 source.kind(),
                 std::io::ErrorKind::NotFound,
@@ -130,9 +127,9 @@ async fn dispatch_fixup_cargo_sha256_file_failure_arm() {
 /// `dispatch_fixup` against a non-existent `pkg_path` exercises
 /// the nuget side: `remove_file(.nupkg.metadata)` returns NotFound
 /// (already covered by the success-path tests), then
-/// `has_signed_marker` runs and its `read_dir(pkg_path)` ALSO
-/// fails — non-existent dir hits the `Err(_) => return false`
-/// fallback at nuget.rs:86. The fixup then returns `Ok(None)`.
+/// `has_signed_marker` runs, and the missing dir makes
+/// `list_dir_entries` (utils/fs.rs) yield no entries, so it returns
+/// false. The fixup then returns `Ok(None)`.
 ///
 /// Together with the no-metadata + signed-marker tests this nails
 /// down every branch in `has_signed_marker`'s setup.
@@ -149,7 +146,7 @@ async fn dispatch_fixup_nuget_with_nonexistent_pkg_path() {
     .await
     .unwrap();
     // No metadata removed (NotFound), no signed marker found
-    // (read_dir failed → false), advisory absent → Ok(None).
+    // (no dir entries → false), advisory absent → Ok(None).
     assert!(
         out.is_none(),
         "non-existent pkg_path must yield no sidecar record"

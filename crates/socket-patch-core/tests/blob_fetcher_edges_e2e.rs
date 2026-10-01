@@ -181,7 +181,6 @@ async fn fetch_missing_sources_diff_mode_with_no_diffs_path() {
     std::fs::create_dir(&blobs).unwrap();
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: None,
         mem_blobs: None,
     };
@@ -262,7 +261,7 @@ fn download_mode_as_tag_round_trips_with_parse() {
 /// `fetch_blobs_by_hash` with a hash whose blob is already on disk
 /// short-circuits the network call and reports `skipped: 1`, leaving the
 /// existing file byte-for-byte untouched. Covers the `skip if already on
-/// disk` branch (~L184-206).
+/// disk` branch.
 #[tokio::test]
 async fn fetch_blobs_by_hash_skips_existing_blobs() {
     let tmp = tempfile::tempdir().unwrap();
@@ -581,7 +580,6 @@ async fn fetch_missing_sources_diff_downloads_and_writes_archive() {
     std::fs::create_dir(&diffs).unwrap();
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: Some(&diffs),
         mem_blobs: None,
     };
@@ -634,7 +632,6 @@ async fn fetch_missing_sources_diff_404_is_failure_with_kind_message() {
     std::fs::create_dir(&diffs).unwrap();
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: Some(&diffs),
         mem_blobs: None,
     };
@@ -677,7 +674,6 @@ async fn fetch_missing_sources_diff_invokes_progress_callback() {
     std::fs::create_dir(&diffs).unwrap();
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: Some(&diffs),
         mem_blobs: None,
     };

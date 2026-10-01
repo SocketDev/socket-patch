@@ -40,10 +40,9 @@
 //!    with `.socket/manifest.json` deleted, `vex` finds nothing to attest
 //!    (`manifest_not_found`, exit 2, zero API requests, no document),
 //!    offline or online, and `apply --vex` stays the calm `noManifest`
-//!    exit 0 without a document. (With the manifest the patch is still
-//!    omitted, `ecosystem_not_setup`: cargo has no install hook, so an
-//!    agent-mode cargo patch attests only when `setup.manual` declares it.)
-//!    The patched bytes on disk never attest by themselves.
+//!    exit 0 without a document. (With the manifest the applied, verified
+//!    agent-mode patch attests.) The patched bytes on disk never attest by
+//!    themselves.
 //!
 //! Network: no. Toolchain: cargo (already on every e2e CI runner); the
 //! `cargo_e2e_matrix` knobs (`SOCKET_PATCH_CARGO_E2E_TOOLCHAIN` /
@@ -399,18 +398,34 @@ fn apply_then_cargo_check_succeeds() {
 /// the user's own), so VEX has nothing to attest and makes no request.
 fn manifestless_agent_patch_is_not_attested(consumer: &Path, cargo_home: &Path) {
     use vex_e2e_common::{
-        assert_not_attested, run_vex, strip_ledgers, strip_manifest, PatchApi, VexRun, VexVia,
+        run_vex, statements_for, strip_ledgers, strip_manifest, PatchApi, VexRun, VexVia,
     };
 
     let bin = vex_e2e_common::binary();
     let api = PatchApi::empty();
     let run = VexRun::online(&api).env("CARGO_HOME", cargo_home);
 
-    // Baseline, manifest present: cargo has no install hook, so the
-    // agent-mode patch is omitted until `setup.manual` declares it.
+    // Baseline, manifest present: the applied, verified agent-mode patch
+    // attests. The staged manifest carries no vulnerabilities (which alone
+    // would end `no_applicable_patches`), so give the entry one first.
+    let manifest_path = consumer.join(".socket/manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["patches"][FIXTURE_PURL]["vulnerabilities"] = serde_json::json!({
+        "GHSA-cccc-cccc-cccc": {
+            "cves": ["CVE-2099-0001"],
+            "summary": "cargo safety vex vuln",
+            "severity": "high",
+            "description": "d"
+        }
+    });
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
     let out = run_vex(&bin, consumer, &run);
-    assert_eq!(out.code, Some(1), "manifest-backed vex:\n{out}");
-    assert_not_attested(&out.envelope, FIXTURE_PURL, "ecosystem_not_setup");
+    assert_eq!(out.code, Some(0), "manifest-backed vex:\n{out}");
+    assert!(
+        !statements_for(out.doc(), FIXTURE_PURL).is_empty(),
+        "manifest-backed vex attests the agent-mode patch:\n{out}"
+    );
 
     strip_manifest(consumer);
     strip_ledgers(consumer);
@@ -605,7 +620,7 @@ fn apply_with_malformed_checksum_reports_sidecar_fixup_failed() {
     stage_socket_manifest(&consumer);
 
     // Corrupt the checksum file so cargo::fixup hits the
-    // `serde_json::from_str` Malformed error path. The fixup runs
+    // `serde_json::from_slice` Malformed error path. The fixup runs
     // AFTER the patch is committed atomically, so the patch itself
     // succeeds; only the sidecar emits an Error-severity advisory.
     let checksum = consumer.join("vendor/safety-fixture/.cargo-checksum.json");
@@ -843,10 +858,9 @@ fn apply_with_readonly_checksum_still_rewrites_it() {
 }
 
 /// Third Malformed branch: when `.cargo-checksum.json` exists but
-/// is a *directory* rather than a file. `tokio::fs::read_to_string`
-/// returns an I/O error with kind `IsADirectory` (Linux) /
-/// `InvalidInput` (macOS) — NOT `NotFound` — so the fixup hits the
-/// generic `Err(source)` arm in cargo.rs (lines 61-65) and returns
+/// is a *directory* rather than a file. `read_regular_to_bytes`'s
+/// regular-file check rejects it with a non-`NotFound` I/O error, so the
+/// fixup hits the generic `Err(source)` arm and returns
 /// `SidecarError::Io`. The boundary converts that to a
 /// `sidecar_fixup_failed` advisory.
 ///
@@ -861,8 +875,7 @@ fn apply_with_checksum_directory_reports_sidecar_fixup_failed() {
     stage_socket_manifest(&consumer);
 
     // Replace the regular `.cargo-checksum.json` file with a
-    // directory of the same name. `read_to_string` will refuse to
-    // treat it as a string.
+    // directory of the same name, which `read_regular_to_bytes` refuses.
     let checksum = consumer.join("vendor/safety-fixture/.cargo-checksum.json");
     std::fs::remove_file(&checksum).unwrap();
     std::fs::create_dir(&checksum).unwrap();
@@ -910,7 +923,7 @@ fn apply_with_checksum_directory_reports_sidecar_fixup_failed() {
 }
 
 /// Cargo sidecar no-op: no `.cargo-checksum.json` present at all.
-/// The fixup returns `Ok(None)` (lines 56-60 of cargo.rs) and the
+/// The fixup returns `Ok(None)` and the
 /// envelope carries no cargo record at all — apply still succeeds
 /// because the sidecar contract treats "no checksum file" as
 /// "nothing to do, package isn't from a directory source".

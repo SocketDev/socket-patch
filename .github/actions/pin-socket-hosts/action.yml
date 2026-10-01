@@ -1,0 +1,42 @@
+name: Pin Socket patch hosts
+description: >-
+  On macOS runners, resolve the production patch hosts once (system resolver,
+  then DNS-over-HTTPS by IP literal), TLS-verify every address for its host,
+  and pin them in /etc/hosts for the rest of the job
+inputs:
+  hosts:
+    description: Space-separated hostnames to pin
+    default: patch.socket.dev patches-api.socket.dev
+runs:
+  using: composite
+  steps:
+    # GitHub's hosted macOS runners intermittently answer patch.socket.dev
+    # with EAI_NONAME ("[Errno 8] nodename nor servname provided", bun's
+    # `FailedToOpenSocket`) for minutes at a time — at job start or mid-job —
+    # while the service is up: the ubuntu / windows legs of the same run pass
+    # and the same macOS cells pass before and after the window. A pre-flight
+    # wait cannot cover a mid-job window and the failing processes are the
+    # real package managers, not the CLI, so the job takes the runner's
+    # resolver out of the path instead. Every request still goes to the
+    # production service over TLS verified for the hostname.
+    # scripts/pin-socket-hosts.py documents the resolution and verification.
+    - name: Pin hosts
+      if: runner.os == 'macOS'
+      shell: bash
+      env:
+        PIN_HOSTS: ${{ inputs.hosts }}
+      run: |
+        set -euo pipefail
+        # shellcheck disable=SC2086 # PIN_HOSTS is a space-separated list
+        lines=$(python3 "$GITHUB_WORKSPACE/scripts/pin-socket-hosts.py" $PIN_HOSTS)
+        printf '%s\n' "$lines"
+        printf '\n# pinned by .github/actions/pin-socket-hosts\n%s\n' "$lines" | sudo tee -a /etc/hosts >/dev/null
+        sudo dscacheutil -flushcache
+        sudo killall -HUP mDNSResponder || true
+        for host in $PIN_HOSTS; do
+          got=$(python3 -c 'import socket, sys; print(" ".join(sorted({i[4][0] for i in socket.getaddrinfo(sys.argv[1], 443)})))' "$host" || true)
+          echo "$host now resolves to: ${got:-nothing}"
+          if [ -z "$got" ] || ! grep -qE "^(${got// /|}) $host\$" <<<"$lines"; then
+            echo "::warning::$host does not resolve to its pinned address after pinning (got: ${got:-nothing})"
+          fi
+        done

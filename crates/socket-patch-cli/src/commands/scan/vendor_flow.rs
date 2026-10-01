@@ -9,8 +9,7 @@
 //! embeds each record in its ledger entry (`detached: true`), and
 //! `.socket/manifest.json` is never written — a project vendored by an
 //! older, manifest-mode CLI is migrated on its next vendored run (see
-//! [`migrate_legacy_manifest_records`]). `--detached` is accepted as a
-//! no-op for compatibility.
+//! [`migrate_legacy_manifest_records`]).
 //!
 //! One API client per run: `scan`/`get` build it once (proxy fallback
 //! included) and thread it through the download phase and into the vendor
@@ -20,35 +19,31 @@
 use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::api::types::{BatchPackagePatches, PatchResponse, PatchSearchResult};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
-use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::telemetry::{track_patch_vendor_failed, PendingTelemetry};
 use socket_patch_core::utils::composer_version::composer_purls_equivalent;
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
 use std::collections::{HashMap, HashSet};
-use std::io::IsTerminal;
 use std::path::Path;
 use std::time::Duration;
 
 use crate::args::GlobalArgs;
 use crate::commands::bun_preflight::bun_vendor_preflight_with_ledger;
-use crate::commands::fetch_stage::{
-    drop_unstageable, stage_vendor_sources_in_memory, MemStageOutcome,
-};
 use crate::commands::get::{download_patch_records_reusing, DetachedDownload, DownloadParams};
 use crate::commands::lock_cli::lock_failure;
-use crate::commands::vendor::{
-    note_classic_migration_risk, track_outcomes_for_vendor, vendor_records_reusing,
-};
+use crate::commands::vendor::{note_classic_migration_risk, track_outcomes_for_vendor};
+use crate::commands::vendored_backend::{records_manifest, ApplyRequest, VendoredBackend};
 use crate::commands::vlt_preflight::{vlt_refusal_for, vlt_vendor_preflight_selected};
 use crate::ecosystem_dispatch::NpmCrawlSnapshot;
 use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
 use crate::ui::{plural, print_json};
 
 use super::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
+use super::rollout::Stage;
 use super::{
-    discover_selected, download_params, embed_vex_into_json, emit_discovery_error_json,
-    note_vendor_supersedes_redirect, push_run_warning, ScanArgs,
+    classified_rows, discover_selected, download_params, embed_vex_into_json,
+    emit_discovery_error_json, finish_rollout_json, push_run_warning, writers_of, ScanArgs,
 };
 
 /// Run-level warning: a `.socket/manifest.json` record for a purl the
@@ -78,22 +73,16 @@ type VendorStepResult = Result<(bool, Envelope), VendorStepError>;
 /// ([`crate::commands::bun_preflight::BunVendorRefusal`],
 /// [`crate::commands::vlt_preflight`]) would refuse before any download.
 /// The preview stays a ledger classification otherwise (engine refusals
-/// outside the preflights are not predicted), and it never flips the run's
-/// status or exit code: `would_refuse` is best-effort advice so a preview
-/// never advertises vendoring the wet run is known to refuse. The
-/// preflights read `bun.lock`/`bun.lockb` (plus, on a refused workspace
-/// lock, the lock once more per npm purl for the exemption) or
-/// `vlt-lock.json` with its importer package.json files — the only disk
-/// access here — and run only when the selection holds an npm purl.
+/// outside the preflights are not predicted), and `would_refuse` never
+/// flips the run's status or exit code. The preflights (the only disk
+/// access besides the ledger) run only when the selection holds an npm purl.
 pub(crate) async fn preview_vendor_json(
     cwd: &Path,
     selected: &[PatchSearchResult],
 ) -> serde_json::Value {
     // The ledger load outcome reaches the preflight AS a result, so an
-    // unreadable ledger previews as `vendor_state_unreadable` (nothing
-    // exempt) instead of being flattened into an empty ledger that then
-    // predicts a Bun lock refusal; the classification below degrades it to
-    // empty (every npm record then reads `would_refuse` with that code).
+    // unreadable ledger previews as `vendor_state_unreadable` rather than
+    // as an empty ledger.
     let state = load_state(cwd).await;
     let refusal =
         bun_vendor_preflight_with_ledger(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
@@ -135,14 +124,35 @@ pub(crate) async fn preview_vendor_json(
     serde_json::json!({ "dryRun": true, "patches": patches })
 }
 
+/// The purls of `selected` the wet run's Bun or vlt preflight would refuse
+/// before any download (the `would_refuse` rows of
+/// [`preview_vendor_json`]): the vendored planning pass, so a refused NEW
+/// patch holds no rollout slot.
+pub(super) async fn preflight_refused_purls(
+    cwd: &Path,
+    selected: &[PatchSearchResult],
+) -> HashSet<String> {
+    let state = load_state(cwd).await;
+    let refusal =
+        bun_vendor_preflight_with_ledger(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
+    let vlt_refusals =
+        vlt_vendor_preflight_selected(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
+    selected
+        .iter()
+        .filter(|p| {
+            refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl))
+                || vlt_refusal_for(&vlt_refusals, &p.purl).is_some()
+        })
+        .map(|p| p.purl.clone())
+        .collect()
+}
+
 /// Human rendering of the vendored dry-run preview's `would_refuse` records
 /// (see [`preview_vendor_json`]): the count line above it still says
 /// "would download and vendor", so name what the wet run would refuse and
-/// why. Shared by `scan --mode vendored --dry-run`'s interactive arm and
-/// both `get … --mode vendored --dry-run` arms so the two commands' human
-/// previews cannot drift (the contract promises the line for both).
-/// Informational (the preview exits 0), hence behind the caller's
-/// `--silent` gate.
+/// why. Shared by `scan --mode vendored --dry-run` and
+/// `get … --mode vendored --dry-run` so the two cannot drift. Callers gate
+/// it on `--silent`.
 pub(crate) fn print_dry_run_refusals(preview: &serde_json::Value) {
     let Some(patches) = preview["patches"].as_array() else {
         return;
@@ -157,44 +167,96 @@ pub(crate) fn print_dry_run_refusals(preview: &serde_json::Value) {
     }
 }
 
-/// The vendor step shared by `scan --vendor`'s JSON and interactive arms
-/// (and, through [`boxed_scan_vendor_step`], `get --mode vendored`):
-/// acquire the apply lock, stage the in-memory `records` (from
-/// [`download_patch_records_reusing`], whose blob `seed` spares the stager a
-/// second view fetch), drive [`vendor_records`] detached — every ledger
-/// entry embeds its record; `.socket/manifest.json` is never a record
-/// source — over the run's `client`, then migrate any legacy manifest
-/// records the ledger now owns and run the run-level advisories, all under
-/// the lock.
+/// Everything the vendor step takes: the in-memory `records` to vendor
+/// (from [`download_patch_records_reusing`] or `get`'s download phase), the
+/// blob `seed` that phase fetched (so the stager fetches no view twice),
+/// the run's API client, and the run outcome so far for telemetry.
+pub(crate) struct VendorStep<'a> {
+    pub(crate) common: &'a GlobalArgs,
+    pub(crate) records: HashMap<String, PatchRecord>,
+    pub(crate) client: ApiClient,
+    pub(crate) use_public_proxy: bool,
+    /// Print "No vendorable patches in scope." when there are no records
+    /// at all (the step is a silent no-op then). `get --mode vendored` and
+    /// scan's JSON arm want it; scan's interactive arm prints its own
+    /// closing line instead (see [`format_nothing_vendored`]).
+    pub(crate) report_empty: bool,
+    /// The npm half of scan's crawl, for the engine to reuse instead of
+    /// walking the untouched tree again (see `vendor_records_reusing`).
+    pub(crate) prior: Option<&'a NpmCrawlSnapshot>,
+    /// The download phase failed or refused some patch: the run exits 1
+    /// and its telemetry must not report a clean vendoring.
+    pub(crate) download_errors: bool,
+    pub(crate) telemetry_token: Option<&'a str>,
+    pub(crate) telemetry_org: Option<&'a str>,
+}
+
+/// The one vendored-apply entry of `scan --mode vendored` (JSON and
+/// interactive arms) and `get --mode vendored`: acquire the apply lock,
+/// drive [`VendoredBackend::apply`] detached (every ledger entry embeds its
+/// record) over the run's client, migrate any legacy manifest records the
+/// ledger now owns, run the run-level advisories — all under the lock —
+/// then report the run's telemetry.
 ///
-/// An empty `records` map (nothing selected, or everything refused/failed
-/// in the download phase) is a no-op BEFORE the lock: nothing is staged,
-/// the engine does not run, and no `.socket/` is created for a run with
-/// nothing to vendor.
+/// An empty `records` map is a no-op BEFORE the lock: nothing is staged and
+/// no `.socket/` is created.
 ///
-/// `Ok((has_errors, envelope))` on a run that reached the engine;
-/// `Err((code, message, envelope))` for the lock/stage failures the caller
-/// folds into its own output shape (scan's ad-hoc JSON can't use
-/// `acquire_or_emit`, which prints an Envelope). A lock failure precedes
-/// the step, so it carries no envelope (`None`); a staging failure
-/// (`no_local_source`) hands back the step's envelope demoted to
-/// `partialFailure` — the contract's `vendor` sub-object is present
-/// whenever the step ran, and a consumer reading `.vendor.status` inside a
-/// `"status":"error"` result must never see the fresh-envelope default of
-/// `success`. Nothing mutates the project before staging, so that
-/// envelope carries no events.
-async fn run_scan_vendor_step(
+/// `Ok((has_errors, envelope))` — `has_errors` includes
+/// [`VendorStep::download_errors`]. `Err((code, message, envelope))` is a
+/// lock/stage failure the caller folds into its own output shape. A lock
+/// failure carries no envelope; a staging failure (`no_local_source`) hands
+/// back the step's envelope demoted to `partialFailure`, so
+/// `.vendor.status` inside a `"status":"error"` result never reads
+/// `success`.
+async fn run_vendor_step(step: VendorStep<'_>) -> VendorStepResult {
+    let VendorStep {
+        common,
+        records,
+        client,
+        use_public_proxy,
+        report_empty,
+        prior,
+        download_errors,
+        telemetry_token,
+        telemetry_org,
+    } = step;
+    let outcome = vendor_under_lock(
+        common,
+        records,
+        client,
+        use_public_proxy,
+        report_empty,
+        prior,
+    )
+    .await;
+    match &outcome {
+        // Telemetry follows the RUN outcome: a download-phase failure (a
+        // Bun refusal, a failed view fetch) exits 1 and must not report a
+        // successful vendoring of zero patches.
+        Ok((vendor_errors, venv)) => {
+            track_outcomes_for_vendor(
+                download_errors || *vendor_errors,
+                venv,
+                common.dry_run,
+                telemetry_token,
+                telemetry_org,
+            )
+            .await
+        }
+        Err((_, message, _)) => {
+            track_patch_vendor_failed(message, common.dry_run, telemetry_token, telemetry_org).await
+        }
+    }
+    outcome.map(|(vendor_errors, venv)| (download_errors || vendor_errors, venv))
+}
+
+/// [`run_vendor_step`]'s locked half (see there).
+async fn vendor_under_lock(
     common: &GlobalArgs,
     records: HashMap<String, PatchRecord>,
-    seed: HashMap<String, Vec<u8>>,
     client: ApiClient,
     use_public_proxy: bool,
-    // Print "No vendorable patches in scope." when there are no records at
-    // all (the step is a silent no-op then). `get --mode vendored` wants
-    // it; scan's interactive arm prints its own closing line instead.
     report_empty: bool,
-    // The npm half of scan's crawl, for the engine to reuse instead of
-    // walking the untouched tree again (see `vendor_records_reusing`).
     prior: Option<&NpmCrawlSnapshot>,
 ) -> VendorStepResult {
     let mut env = Envelope::new(EnvelopeCommand::Vendor);
@@ -209,10 +271,8 @@ async fn run_scan_vendor_step(
     let manifest_path = common.resolved_manifest_path();
     let socket_dir = common.socket_dir();
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-    // `acquire` creates `.socket/` itself and reports a file squatting on
-    // it as `LockError::Io` (→ `lock_io`). The guard lives to the end of
-    // the step so the ledger migration and the redirect-ledger reconcile
-    // inside `note_vendor_supersedes_redirect` run under the lock too.
+    // The guard lives to the end of the step so the ledger migration runs
+    // under the lock too.
     let _guard =
         crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout).map_err(|e| {
             let (code, message) = lock_failure(&e, timeout);
@@ -221,104 +281,34 @@ async fn run_scan_vendor_step(
 
     // Staging probes blobs by the records' hashes; a manifest VIEW over the
     // in-memory records (a move, not a clone) is all it needs.
-    let manifest = PatchManifest {
-        patches: records,
-        setup: None,
-    };
-    let has_errors = match stage_and_vendor(
-        common,
-        &socket_dir,
-        &manifest,
-        seed,
-        client,
-        use_public_proxy,
-        &mut env,
-        prior,
-    )
-    .await
-    {
-        Ok(has_errors) => has_errors,
-        Err((code, message)) => {
-            // The step ran and is aborting: hand its envelope (demoted) to
-            // the caller's fold instead of letting the `vendor` sub-object
-            // vanish from a run that entered the step.
-            env.mark_partial_failure();
-            return Err((code, message, Some(Box::new(env))));
-        }
-    };
+    let manifest = records_manifest(records);
+    // The SAME service-config assembler the `vendor` command uses
+    // (`--vendor-source` / `--vendor-url` / `--patch-server-url`), so
+    // `scan --mode vendored` and `vendor` commit byte-identical artifacts.
+    let service = common.vendor_service_config(Some(client), use_public_proxy);
+    let applied = VendoredBackend::new(common, Some(&service))
+        .apply(
+            ApplyRequest {
+                manifest: &manifest,
+                socket_dir: &socket_dir,
+                // Loaded ONCE under the lock: the staging harvest reads it,
+                // then the engine takes it over for its persists.
+                ledger: load_state(&common.cwd).await,
+                // Always detached: vendored mode is manifest-free.
+                detached: true,
+                force: false,
+                prior,
+            },
+            &mut env,
+        )
+        .await;
+    let has_errors = applied;
     migrate_legacy_manifest_records(common, &manifest_path, &manifest.patches, &mut env).await;
     if has_errors {
         env.mark_partial_failure();
     }
     note_classic_migration_risk(&mut env, &common.cwd, common);
-    note_vendor_supersedes_redirect(&mut env, &common.cwd, common).await;
     Ok((has_errors, env))
-}
-
-/// Stage `manifest`'s patch sources in memory (seeded with the download
-/// phase's blobs, harvesting the committed artifacts the ledger names for
-/// the rest) and drive the vendor engine over them (detached: every entry
-/// embeds its record). The caller holds the apply lock. `Err` is the
-/// `no_local_source` fold (staging could not obtain the patch content —
-/// offline, or the view fetch failed).
-#[allow(clippy::too_many_arguments)]
-async fn stage_and_vendor(
-    common: &GlobalArgs,
-    socket_dir: &Path,
-    manifest: &PatchManifest,
-    seed: HashMap<String, Vec<u8>>,
-    client: ApiClient,
-    use_public_proxy: bool,
-    env: &mut Envelope,
-    prior: Option<&NpmCrawlSnapshot>,
-) -> Result<bool, (&'static str, String)> {
-    // Loaded ONCE under the lock: the staging harvest reads it here, then
-    // the engine takes it over for its persists. An unreadable ledger
-    // harvests nothing and is the engine's report.
-    let ledger = load_state(&common.cwd).await;
-    let staged = match stage_vendor_sources_in_memory(
-        common,
-        manifest,
-        socket_dir,
-        &common.cwd,
-        ledger.as_ref().map(|s| &s.entries),
-        seed,
-        Some(&client),
-    )
-    .await
-    {
-        MemStageOutcome::Ready(s) => s,
-        MemStageOutcome::Unavailable => {
-            return Err((
-                "no_local_source",
-                "patch artifacts unavailable (offline or download failure)".to_string(),
-            ));
-        }
-    };
-    let sources = staged.as_patch_sources();
-    // A record whose content this run could not obtain is an unsatisfiable
-    // PACKAGE, reported per-package and left out of the engine run — the
-    // rest of the selection still vendors (the stager reserves its
-    // whole-run `no_local_source` bail for "nothing is stageable").
-    let (records, staging_errors) = drop_unstageable(env, &manifest.patches, staged.unavailable());
-    // Honor `--vendor-source` (and `--vendor-url` / `--patch-server-url`)
-    // exactly as the `vendor` command does: the SAME service-config
-    // assembler, over the run's one client, so `scan --mode vendored` and a
-    // plain `vendor` commit byte-identical artifacts by default (both
-    // service-download under `auto`) instead of scan silently building
-    // locally.
-    let service = common.vendor_service_config(Some(client), use_public_proxy);
-    let engine_errors = boxed_vendor_records(
-        common,
-        &records,
-        &sources,
-        Some(&service),
-        ledger,
-        env,
-        prior,
-    )
-    .await;
-    Ok(staging_errors || engine_errors)
 }
 
 /// The ledger key addressable as `purl`: the exact key, else the entry
@@ -327,27 +317,19 @@ fn ledger_key_for(state: &VendorState, purl: &str) -> Option<String> {
     socket_patch_core::vendor::state::lookup_entry_kv(&state.entries, purl).map(|(k, _)| k.clone())
 }
 
-/// Migrate a project vendored by an older, manifest-mode CLI: the ledger
-/// is now the single owner of vendored state, so for the purls THIS run
-/// vendored (`records` — the selection, in-sync `already_vendored` skips
-/// included): (1) a legacy entry the engine just found in sync at a
-/// record's uuid (an `already_vendored` skip persists nothing) is upgraded
-/// in place — `detached: true` plus the embedded record, the verification
-/// source every manifest-free reader needs — and (2) every
+/// Migrate a project vendored by an older, manifest-mode CLI. For the purls
+/// THIS run vendored (`records`, in-sync `already_vendored` skips included):
+/// (1) a legacy entry in sync at a record's uuid is upgraded in place
+/// (`detached: true` plus the embedded record), and (2) every
 /// `.socket/manifest.json` record keyed by (or sharing a qualifier-stripped
-/// base with) the purl's ledger entry is dropped, provided the ledger now
-/// owns it: the entry is detached with an embedded record AT the record's
-/// uuid. An emptied manifest is left as `{"patches":{}}` (never deleted:
-/// `list`/`apply`/`repair` distinguish empty from missing). Scoped to the
-/// selection on purpose (D2: "when a vendored run vendors a purl that ALSO
-/// has a manifest record, drop that manifest record"): an agent-mode `get X`
-/// may legitimately record X at a NEWER uuid than the ledger's while the
-/// user is told to run `vendor` to refresh the artifact — a vendored run for
-/// some other purl must not destroy that pending signal. Idempotent for the
-/// selected purls, so it also heals their records stranded by earlier
-/// detached runs; a project with no manifest is untouched (no file is
-/// created). Best-effort: failures are reported as run-level warnings,
-/// never as run errors — the vendoring itself already committed.
+/// base with) the purl's ledger entry is dropped, provided the entry is
+/// detached with an embedded record AT the record's uuid. An emptied
+/// manifest is left as `{"patches":{}}` (`list`/`apply`/`repair` distinguish
+/// empty from missing). Scoped to the selection on purpose: an agent-mode
+/// `get X` may record X at a NEWER uuid than the ledger's, a pending signal
+/// a vendored run for another purl must not destroy. Idempotent; a project
+/// with no manifest is untouched. Best-effort: failures are run-level
+/// warnings, never run errors.
 ///
 /// Caller holds the apply lock (both files are rewritten).
 async fn migrate_legacy_manifest_records(
@@ -470,11 +452,9 @@ async fn migrate_legacy_manifest_records(
 /// The dry-run arm skips the VEX embed (emitting a `vex.skipped` marker
 /// instead): a dry run vendors nothing, so there is no state to attest.
 ///
-/// Extracted from `run` (and called through `Box::pin`) so its sizeable
-/// temporaries get their own poll frame, entered only when `--vendor` is
-/// actually requested — in debug builds the enclosing frame retains stack
-/// slots for never-taken branches, and `run`'s frame must fit Windows'
-/// 1 MiB main-thread stack.
+/// Extracted from `run` (and called through `Box::pin`) so its temporaries
+/// get their own poll frame: `run`'s frame must fit Windows' 1 MiB
+/// main-thread stack, and debug builds reserve slots for never-taken branches.
 #[allow(clippy::too_many_arguments)]
 async fn run_vendor_json_path(
     args: &ScanArgs,
@@ -482,6 +462,10 @@ async fn run_vendor_json_path(
     use_public_proxy: bool,
     all_packages_with_patches: &[BatchPackagePatches],
     can_access_paid_patches: bool,
+    recorded: &super::rollout::RecordedState<'_>,
+    batch_failed: bool,
+    stage: &mut Stage,
+    policy: &super::policy::ScanPolicy,
     result: &mut serde_json::Value,
     manifest_path: &Path,
     socket_dir: &Path,
@@ -499,11 +483,12 @@ async fn run_vendor_json_path(
     // Same discovery as `--apply`. Vendored purls are NOT filtered here —
     // re-vendoring a stale uuid is the point of the flag (same-uuid re-runs
     // land on the backend's `already_vendored` skip).
-    let selected = match discover_selected(
+    let discovered = match discover_selected(
         api_client,
         all_packages_with_patches,
         can_access_paid_patches,
-        &args.common,
+        policy,
+        false,
         false,
         false,
         telemetry,
@@ -511,12 +496,31 @@ async fn run_vendor_json_path(
     )
     .await
     {
-        Ok(s) => s,
+        Ok(d) => d,
         Err((code, message)) => {
             emit_discovery_error_json(result, &message);
             return code;
         }
     };
+    let rows = classified_rows(
+        stage,
+        &discovered,
+        recorded,
+        batch_failed,
+        all_packages_with_patches,
+        Some(&mut *result),
+    );
+    // The planning pass: a patch the preflight refuses holds no slot (it
+    // still reaches the engine, which reports the refusal).
+    let writers = writers_of(&rows);
+    let refused = preflight_refused_purls(&args.common.cwd, &writers).await;
+    stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
+    let deferred = stage.deferred_keys();
+    let selected: Vec<PatchSearchResult> = writers
+        .into_iter()
+        .filter(|p| !deferred.contains(&(p.purl.clone(), p.uuid.clone())))
+        .collect();
+    finish_rollout_json(stage, result);
 
     if args.common.dry_run {
         // No downloads, no backends: classify against the ledger
@@ -533,12 +537,8 @@ async fn run_vendor_json_path(
             )
             .await;
         }
-        // Embedded VEX is skipped on a dry run (apply.rs's precedent):
-        // nothing was vendored, so there is no just-vendored state to
-        // attest — generating here would verify the deliberately untouched
-        // tree (failing outright on a not-yet-vendored project) and write
-        // an attestation file during --dry-run. The marker keeps the
-        // request visible to JSON consumers instead of silently dropping it.
+        // Embedded VEX is skipped on a dry run (nothing was vendored to
+        // attest); the marker keeps the request visible to JSON consumers.
         if args.vex.vex.is_some() {
             result["vex"] = serde_json::json!({ "skipped": true, "reason": "dry_run" });
         }
@@ -552,48 +552,31 @@ async fn run_vendor_json_path(
     let params = download_params(
         args, /*save_only=*/ true, /*json=*/ true, /*silent=*/ true,
     );
-    let (dl_code, dl_json, records, blobs) =
+    let (dl_code, dl_json, records) =
         boxed_download_patch_records(&selected, &params, api_client, HashMap::new(), prior).await;
-    let mut has_errors = dl_code != 0;
     result["download"] = dl_json;
 
     // 2) The vendor engine, under the same lock as apply/vendor (a no-op
     //    that creates nothing when there is nothing to vendor).
-    let vendor_code = match boxed_scan_vendor_step_reusing(
-        &args.common,
+    let vendor_code = match boxed_vendor_step(VendorStep {
+        common: &args.common,
         records,
-        blobs,
-        api_client.clone(),
+        client: api_client.clone(),
         use_public_proxy,
+        report_empty: true,
         prior,
-    )
+        download_errors: dl_code != 0,
+        telemetry_token,
+        telemetry_org,
+    })
     .await
     {
-        Ok((vendor_errors, venv)) => {
-            has_errors |= vendor_errors;
-            // Telemetry follows the RUN outcome: a download-phase failure
-            // (a Bun refusal, a failed view fetch) exits 1 and must not
-            // report a successful vendoring of zero patches.
-            track_outcomes_for_vendor(
-                has_errors,
-                &venv,
-                args.common.dry_run,
-                telemetry_token,
-                telemetry_org,
-            )
-            .await;
+        Ok((has_errors, venv)) => {
             result["vendor"] =
                 serde_json::to_value(&venv).unwrap_or_else(|_| serde_json::json!({}));
             i32::from(has_errors)
         }
         Err((code, message, venv)) => {
-            track_patch_vendor_failed(
-                &message,
-                args.common.dry_run,
-                telemetry_token,
-                telemetry_org,
-            )
-            .await;
             // A step that ran (and died at staging) hands back its demoted
             // envelope; it must reach the JSON consumer even though the run
             // aborts here. A lock failure carries none — no `vendor` key.
@@ -606,6 +589,9 @@ async fn run_vendor_json_path(
                 "code": code,
                 "message": message,
             });
+            if let Some(obj) = result.as_object_mut() {
+                obj.remove("rollout");
+            }
             print_json(result);
             return 1;
         }
@@ -637,7 +623,7 @@ async fn run_vendor_json_path(
 }
 
 /// The `scan --vendor` interactive arm: download → vendor engine → GC,
-/// with human-readable output. `prefetched` holds the views the pre-prompt
+/// with human-readable output. `prefetched` holds the views the pre-download
 /// baseline check already fetched (uuid-keyed), so the download phase
 /// serves those records from memory. Extracted + boxed for the same
 /// Windows-1-MiB-poll-frame reason as [`run_vendor_json_path`].
@@ -656,68 +642,47 @@ async fn run_vendor_interactive_path(
     prune: bool,
     telemetry_token: Option<&str>,
     telemetry_org: Option<&str>,
-    // The npm half of scan's crawl, for the vendor engine to reuse —
-    // `None` when the tree may have changed since (an answered prompt).
+    // The npm half of scan's crawl, for the vendor engine to reuse.
     prior: Option<&NpmCrawlSnapshot>,
 ) -> i32 {
     // The download phase is quiet about its own header in vendored mode
     // (only the manifest-mode download prints it), so this arm does.
     if !args.common.silent && !selected.is_empty() {
-        // A blank line after an answered prompt; otherwise the listing's
-        // trailing blank line already separates the sections.
-        if !args.common.yes && std::io::stdin().is_terminal() {
-            eprintln!();
-        }
         eprintln!(
             "Downloading {}...",
             plural(selected.len(), "patch", "patches")
         );
     }
-    let (dl_code, dl_json, records, blobs) =
+    let (dl_code, dl_json, records) =
         boxed_download_patch_records(selected, params, api_client, prefetched, prior).await;
-    let mut has_errors = dl_code != 0;
     // Patches the download phase could not get (it reported each one).
     let download_failed = dl_json["failed"].as_u64().unwrap_or(0);
     // The vendor step is a silent no-op on an empty record set (it can't
     // know why it is empty); this arm can.
     let nothing_to_vendor = records.is_empty();
-    let code = match boxed_scan_vendor_step_quiet_empty(
-        &args.common,
+    let code = match boxed_vendor_step(VendorStep {
+        common: &args.common,
         records,
-        blobs,
-        api_client.clone(),
+        client: api_client.clone(),
         use_public_proxy,
+        report_empty: false,
         prior,
-    )
+        download_errors: dl_code != 0,
+        telemetry_token,
+        telemetry_org,
+    })
     .await
     {
-        Ok((vendor_errors, venv)) => {
-            has_errors |= vendor_errors;
+        Ok((has_errors, _venv)) => {
             if nothing_to_vendor && !args.common.silent {
                 println!("{}", format_nothing_vendored(download_failed));
             }
-            // Run-outcome telemetry, same as the JSON arm above.
-            track_outcomes_for_vendor(
-                has_errors,
-                &venv,
-                args.common.dry_run,
-                telemetry_token,
-                telemetry_org,
-            )
-            .await;
             i32::from(has_errors)
         }
         // Human mode prints no per-event lines even on success, so the
         // carried envelope has no human rendering to feed — JSON mode is
         // where the reconcile events must survive (see the JSON fold above).
         Err((code, message, _envelope)) => {
-            track_patch_vendor_failed(
-                &message,
-                args.common.dry_run,
-                telemetry_token,
-                telemetry_org,
-            )
-            .await;
             eprintln!("{}", format_vendor_step_error(code, &message));
             return 1;
         }
@@ -788,14 +753,11 @@ pub(crate) fn format_vendor_step_error(code: &str, message: &str) -> String {
 ///   verification (`vendor_uuid_mismatch`) until a vendor run.
 /// * `"package_not_installed"` — the package is not on disk to patch in
 ///   place, and downloading its patch into the manifest would create a
-///   not-yet-appliable entry (and flip the apply path's exit code).
-///   `scan --vendor` is the route that handles these (the vendor engine
-///   auto-fetches lockfile-resolved packages); matching bridges API purl
-///   encoding via `normalize_purl`.
+///   not-yet-appliable entry. `scan --mode vendored` handles these (the
+///   vendor engine auto-fetches lockfile-resolved packages).
 ///
 /// A plain fn (not inlined into `run`) so the json! temporaries don't ride
-/// `run`'s async poll frame — see [`run_vendor_json_path`]'s Windows-stack
-/// note.
+/// `run`'s async poll frame — see [`run_vendor_json_path`].
 pub(super) fn partition_skipped_selected(
     selected: Vec<PatchSearchResult>,
     skip: impl Fn(&str) -> bool,
@@ -842,12 +804,10 @@ pub(super) fn fold_vendored_skips_into_apply(
 }
 
 /// Construct the (large) vendor-JSON-path future on THIS transient frame
-/// and hand `run` only the heap pointer. Writing
-/// `Box::pin(run_vendor_json_path(..))` inline in `run` materializes the
-/// future — which embeds the whole vendor engine — as a stack temporary in
-/// `run`'s poll frame: debug builds allocate slots even for never-taken
-/// branches, and that frame has to fit Windows' 1 MiB main-thread stack
-/// (every plain `scan` was overflowing there).
+/// and hand `run` only the heap pointer. `Box::pin(run_vendor_json_path(..))`
+/// inline in `run` would materialize the future (which embeds the whole
+/// vendor engine) as a stack temporary in `run`'s poll frame, which has to
+/// fit Windows' 1 MiB main-thread stack.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn boxed_vendor_json_path<'a>(
     args: &'a ScanArgs,
@@ -855,6 +815,10 @@ pub(super) fn boxed_vendor_json_path<'a>(
     use_public_proxy: bool,
     all_packages_with_patches: &'a [BatchPackagePatches],
     can_access_paid_patches: bool,
+    recorded: &'a super::rollout::RecordedState<'a>,
+    batch_failed: bool,
+    stage: &'a mut Stage,
+    policy: &'a super::policy::ScanPolicy,
     result: &'a mut serde_json::Value,
     manifest_path: &'a Path,
     socket_dir: &'a Path,
@@ -872,6 +836,10 @@ pub(super) fn boxed_vendor_json_path<'a>(
         use_public_proxy,
         all_packages_with_patches,
         can_access_paid_patches,
+        recorded,
+        batch_failed,
+        stage,
+        policy,
         result,
         manifest_path,
         socket_dir,
@@ -922,71 +890,14 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
     ))
 }
 
-/// Transient-frame boxed constructor for [`run_scan_vendor_step`] — the
-/// one entry for scan's two arms and for `get --mode vendored`. The future
-/// embeds the entire vendor engine, and the vendor-path frames it would
-/// otherwise ride must themselves fit Windows' 1 MiB main-thread stack
-/// (same rationale as [`boxed_vendor_json_path`], one level down). Moving
-/// the records and seed maps and the client into the future is
-/// stack-neutral (a few words each).
-pub(crate) fn boxed_scan_vendor_step<'a>(
-    common: &'a GlobalArgs,
-    records: HashMap<String, PatchRecord>,
-    seed: HashMap<String, Vec<u8>>,
-    client: ApiClient,
-    use_public_proxy: bool,
+/// Transient-frame boxed constructor for [`run_vendor_step`] — the one
+/// vendored-apply entry for scan's two arms and for `get --mode vendored`.
+/// Same Windows-stack rationale as [`boxed_vendor_json_path`], one level
+/// down (the engine itself is boxed inside `VendoredBackend::apply`).
+pub(crate) fn boxed_vendor_step<'a>(
+    step: VendorStep<'a>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = VendorStepResult> + 'a>> {
-    Box::pin(run_scan_vendor_step(
-        common,
-        records,
-        seed,
-        client,
-        use_public_proxy,
-        true,
-        None,
-    ))
-}
-
-/// [`boxed_scan_vendor_step`] handing the engine scan's npm crawl to reuse
-/// (see `vendor_records_reusing`).
-fn boxed_scan_vendor_step_reusing<'a>(
-    common: &'a GlobalArgs,
-    records: HashMap<String, PatchRecord>,
-    seed: HashMap<String, Vec<u8>>,
-    client: ApiClient,
-    use_public_proxy: bool,
-    prior: Option<&'a NpmCrawlSnapshot>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = VendorStepResult> + 'a>> {
-    Box::pin(run_scan_vendor_step(
-        common,
-        records,
-        seed,
-        client,
-        use_public_proxy,
-        true,
-        prior,
-    ))
-}
-
-/// [`boxed_scan_vendor_step`] without the empty-run line, for scan's
-/// interactive arm, which prints its own (see [`format_nothing_vendored`]).
-fn boxed_scan_vendor_step_quiet_empty<'a>(
-    common: &'a GlobalArgs,
-    records: HashMap<String, PatchRecord>,
-    seed: HashMap<String, Vec<u8>>,
-    client: ApiClient,
-    use_public_proxy: bool,
-    prior: Option<&'a NpmCrawlSnapshot>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = VendorStepResult> + 'a>> {
-    Box::pin(run_scan_vendor_step(
-        common,
-        records,
-        seed,
-        client,
-        use_public_proxy,
-        false,
-        prior,
-    ))
+    Box::pin(run_vendor_step(step))
 }
 
 /// Transient-frame boxed constructor for the download-phase future used
@@ -1001,28 +912,6 @@ fn boxed_download_patch_records<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DetachedDownload> + 'a>> {
     Box::pin(download_patch_records_reusing(
         selected, params, api_client, prefetched, prior,
-    ))
-}
-
-/// Transient-frame boxed constructor for the vendor engine itself
-/// ([`vendor_records`]) — the deepest, largest future on the scan-vendor
-/// chain. See [`boxed_vendor_json_path`] for the Windows-stack rationale.
-fn boxed_vendor_records<'a>(
-    common: &'a GlobalArgs,
-    records: &'a HashMap<String, PatchRecord>,
-    sources: &'a socket_patch_core::patch::apply::PatchSources<'a>,
-    service: Option<&'a socket_patch_core::vendor::VendorServiceConfig>,
-    ledger: std::io::Result<VendorState>,
-    env: &'a mut Envelope,
-    prior: Option<&'a NpmCrawlSnapshot>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + 'a>> {
-    // `scan --vendor` threads the SAME service config the `vendor` command
-    // builds (honoring `--vendor-source`), so both entry points vendor the
-    // same bytes by default. See `run_scan_vendor_step`. Always detached:
-    // vendored mode is manifest-free. The ledger is the one the harvest
-    // just read, handed over so the engine does not reload it.
-    Box::pin(vendor_records_reusing(
-        common, records, sources, /*detached=*/ true, false, env, service, ledger, prior,
     ))
 }
 
@@ -1065,6 +954,7 @@ mod migration_tests {
             base_purl: PURL.into(),
             uuid: uuid.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: format!(".socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz"),
                 sha256: String::new(),
                 size: None,
@@ -1352,8 +1242,8 @@ mod preview_tests {
             .unwrap_or_else(|| panic!("no preview record for {purl}: {preview}"))
     }
 
-    /// Without a Bun lock the preview is the pre-existing ledger
-    /// classification, byte for byte: `would_vendor` and nothing else.
+    /// Without a Bun lock the preview is the plain ledger classification:
+    /// `would_vendor` and nothing else.
     #[tokio::test]
     async fn preview_without_bun_lock_is_plain_would_vendor() {
         let tmp = tempfile::tempdir().unwrap();

@@ -5,7 +5,8 @@
 //! `scan --mode hosted` never lands patched bytes in the repo: it rewrites the
 //! classic `yarn.lock` block to
 //! `resolved "<hosted-tgz-url>#<sha1>"` + a recomputed `integrity sha512-…`
-//! line, and records the patch in the redirect ledger. This test proves every
+//! line — and writes nothing else (v5: no redirect ledger; the lock IS the
+//! hosted state). This test proves every
 //! link against the REAL `corepack yarn@1.22.22` — the gap the 2026-07 strapi
 //! incident exposed: hosted wiring for a classic lock had never been
 //! install-proven with the installer that actually honors the v1 format
@@ -21,7 +22,7 @@
 //!      cache-zip `10c0` checksum).
 //!   3. `scan --mode hosted --json --vex` (the real binary) against a wiremock
 //!      Socket API: yarn.lock now pins the hosted URL + `#sha1` + recomputed
-//!      integrity, the ledger embeds the record, the in-run VEX is the
+//!      integrity, no ledger is written, the in-run VEX is the
 //!      `(redirected)` attestation.
 //!   4. FRESH-CHECKOUT PROOF: only package.json + yarn.lock + .socket/ travel;
 //!      `yarn install --frozen-lockfile` (empty private cache; the only dep
@@ -34,7 +35,7 @@
 //!
 //! Manifest-less VEX (the depscan / never-committed-manifest shape): once the
 //! fresh checkout has installed the hosted bytes, `ManifestlessVex` deletes
-//! `.socket/manifest.json`, then the redirect ledger, and proves the patch is
+//! `.socket/manifest.json` (and any ledger), and proves the patch is
 //! still attested `(redirected)` from the `yarn.lock` wiring alone (record
 //! from the patch API), is `record_unavailable` `--offline` with zero API
 //! requests, and is NOT attested once the lock is reverted to the registry
@@ -107,7 +108,7 @@ fn scrub_socket_env(cmd: &mut Command) {
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("corepack");
     cmd.arg(pm).args(args).current_dir(cwd);
-    // Scrub FIRST (it removes YARN_* / SOCKET_* from the inherited env), then
+    // Scrub FIRST (it removes SOCKET_* and YARN_CACHE_FOLDER), then
     // set the hermetic flags so they survive.
     scrub_socket_env(&mut cmd);
     cache_env::isolate(&mut cmd);
@@ -218,7 +219,7 @@ struct ClassicRedirectFixture {
 }
 
 /// Which CLI front door drives the hosted engine. Both consume the SAME
-/// engine by construction (v3.6): `scan --mode hosted` discovers the dep,
+/// engine by construction (v4.0): `scan --mode hosted` discovers the dep,
 /// while `get <uuid> --mode hosted` names the patch explicitly (the uuid
 /// identifier path is exempt from installed narrowing and needs only the
 /// view + reference mocks, which the fixture mounts anyway). get has no
@@ -455,10 +456,9 @@ async fn classic_hosted_project(
         "the registry resolution must be gone from the rewired block:\n{lock}"
     );
 
-    let ledger = std::fs::read_to_string(proj.join(".socket/vendor/redirect-state.json")).unwrap();
     assert!(
-        ledger.contains("\"records\"") && ledger.contains(GHSA),
-        "redirect ledger must embed the patch record + vulnerability: {ledger}"
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode writes no redirect ledger — the lock is the hosted state"
     );
 
     Some(ClassicRedirectFixture {
@@ -479,7 +479,10 @@ fn fresh_checkout_yarn_install(fx: &ClassicRedirectFixture) -> (PathBuf, Output)
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(fx.proj.join("package.json"), fresh.join("package.json")).unwrap();
     std::fs::copy(fx.proj.join("yarn.lock"), fresh.join("yarn.lock")).unwrap();
-    copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
+    // v5 hosted mode writes nothing under `.socket/`; carry it when present.
+    if fx.proj.join(".socket").is_dir() {
+        copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
+    }
     let fresh_cache = fx.tmp.path().join("fresh-yarn-cache");
     let ci = corepack(
         &fresh,
@@ -686,7 +689,7 @@ async fn classic_redirect_fresh_checkout_installs_patched_bytes() {
     tokio::task::block_in_place(|| hosted_dev_resave_vex(&fx));
 }
 
-/// get-driven hosted twin (v3.6): `get <uuid> --mode hosted --json --yes`
+/// get-driven hosted twin (v4.0): `get <uuid> --mode hosted --json --yes`
 /// routes through the SAME hosted engine as `scan --mode hosted`, so the
 /// classic chain must hold unchanged — the fixture's lock pin (hosted URL +
 /// `#sha1` + recomputed integrity) and ledger assertions run against the get

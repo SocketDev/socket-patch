@@ -18,6 +18,9 @@
 
 #![allow(dead_code)]
 
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -382,6 +385,13 @@ pub fn socket(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, Value, S
     for (k, v) in env {
         cmd.env(k, v);
     }
+    let fixture = prebuilt_common::Server::project_with_env(cwd, env);
+    if !args.contains(&"--vendor-url")
+        && !args.contains(&"--api-url")
+        && !env.iter().any(|(k, _)| *k == "SOCKET_VENDOR_URL")
+    {
+        fixture.command(&mut cmd);
+    }
     let out = cmd.output().expect("spawn socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -394,11 +404,11 @@ pub fn socket(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, Value, S
 /// `socket-patch <args>` in `cwd`, human output: `(exit code, stdout,
 /// stderr)`.
 pub fn socket_human(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let out = cli()
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn socket-patch");
+    let fixture = prebuilt_common::Server::project(cwd);
+    let mut cmd = cli();
+    cmd.args(args).current_dir(cwd);
+    fixture.command(&mut cmd);
+    let out = cmd.output().expect("spawn socket-patch");
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -409,7 +419,7 @@ pub fn socket_human(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// `vendor --json --offline` plus `extra`.
 pub fn vendor(root: &Path, extra: &[&str]) -> (i32, Value, String) {
     let cwd = root.to_str().unwrap().to_string();
-    let mut args = vec!["vendor", "--json", "--offline", "--cwd", &cwd];
+    let mut args = vec!["vendor", "--json", "--cwd", &cwd];
     args.extend_from_slice(extra);
     socket(root, &args, &[])
 }

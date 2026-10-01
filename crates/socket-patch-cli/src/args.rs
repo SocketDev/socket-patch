@@ -9,9 +9,7 @@
 //!
 //! Precedence for every flag: CLI arg > env var > default.
 //!
-//! All env-var names use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*`
-//! names are still read at runtime (via `socket_patch_core::env_compat`) with
-//! a one-shot deprecation warning; they will be removed in the next major.
+//! All env-var names use the `SOCKET_*` prefix.
 
 use std::path::{Path, PathBuf};
 
@@ -91,7 +89,7 @@ pub(crate) fn parse_bool_flag(s: &str) -> Result<bool, String> {
 /// flags (listed first, under "Options") are not buried among the ~24 shared
 /// ones. Set per-arg rather than as the struct's `next_help_heading`: that
 /// would leak onto the subcommand-local flags declared after the flatten.
-const GLOBAL_OPTIONS: &str = "Global options";
+pub(crate) const GLOBAL_OPTIONS: &str = "Global options";
 
 // Arguments inherited by every subcommand via `#[command(flatten)]`.
 //
@@ -163,20 +161,23 @@ pub struct GlobalArgs {
     )]
     pub download_mode: String,
 
-    /// Where `vendor` acquires the installable patched artifact. `auto`
-    /// (default) downloads the prebuilt archive from the patch.socket.dev
-    /// vendoring service and silently falls back to a local build on any miss;
-    /// `service` requires the service and fails closed; `build` always builds
-    /// locally. Only `vendor` and the vendored modes of `scan`/`get` use
-    /// this; other subcommands accept it silently.
+    /// Download installable patched artifacts from the patch service.
+    /// `service` is the default; `auto` is a compatibility alias. Local
+    /// artifact building is no longer supported. Healthy committed artifacts
+    /// can be reused offline; missing or corrupt artifacts require a download.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "vendor-source",
         env = "SOCKET_VENDOR_SOURCE",
-        default_value = "auto",
+        default_value = "service",
         value_parser = parse_vendor_source,
     )]
     pub vendor_source: String,
+
+    /// Vendored Maven: auto writes the repository tail; none uses only the file repository.
+    /// The choice is preserved on subsequent runs.
+    #[arg(help_heading = GLOBAL_OPTIONS, long, value_parser = ["auto", "none"])]
+    pub maven_config: Option<String>,
 
     /// Base URL for the patch vendoring service. Defaults to the active API base (`--api-url`) when
     /// authenticated or the proxy base (`--proxy-url`) otherwise. Override to
@@ -303,7 +304,7 @@ pub struct GlobalArgs {
     /// backoff until the lock frees or the budget elapses. Only meaningful
     /// for the commands that take the lock (`apply`, `rollback`, `repair`,
     /// `remove`, `vendor`, `get` and `scan` when they record, apply,
-    /// vendor or redirect patches, and `setup --exclude`'s manifest write);
+    /// vendor or host patches);
     /// other commands accept it silently. Every holder removes the lock file on exit, so a leftover
     /// from a crashed run never contends.
     #[arg(help_heading = GLOBAL_OPTIONS, long = "lock-timeout", env = "SOCKET_LOCK_TIMEOUT")]
@@ -364,7 +365,7 @@ pub struct GlobalArgs {
     pub no_npm_allow_remote_config: bool,
 
     /// Hosted mode (`scan`/`get --mode hosted`, and `rollback`/`remove` of
-    /// hosted redirects): do NOT remove stale vlt installed copies
+    /// hosted patches): do NOT remove stale vlt installed copies
     /// (`node_modules/.vlt-lock.json` and the stale `node_modules/.vlt`
     /// entries) after `vlt-lock.json` is repointed or restored. vlt never
     /// refreshes an installed copy on its own, so opting out means running
@@ -382,6 +383,40 @@ pub struct GlobalArgs {
 }
 
 impl GlobalArgs {
+    /// The crawler options this run's `--cwd` / `--global` /
+    /// `--global-prefix` select.
+    pub(crate) fn crawler_options(&self) -> socket_patch_core::crawlers::CrawlerOptions {
+        socket_patch_core::crawlers::CrawlerOptions {
+            cwd: self.cwd.clone(),
+            global: self.global,
+            global_prefix: self.global_prefix.clone(),
+        }
+    }
+
+    /// Whether this run targets globally installed packages (`--global` or
+    /// `--global-prefix`) rather than the project at `--cwd`.
+    pub(crate) fn is_global(&self) -> bool {
+        self.global || self.global_prefix.is_some()
+    }
+
+    /// Whether `--ecosystems` selects `eco` (every ecosystem when unset or
+    /// empty). The names are validated at parse time, so this is an exact
+    /// match.
+    pub(crate) fn ecosystem_selected(&self, eco: Ecosystem) -> bool {
+        self.ecosystems
+            .as_ref()
+            .is_none_or(|list| list.is_empty() || list.iter().any(|name| name == eco.cli_name()))
+    }
+
+    /// [`Self::ecosystem_selected`] for the ecosystem of `purl`; a purl of
+    /// no known ecosystem is selected only when `--ecosystems` is unset.
+    pub(crate) fn purl_ecosystem_selected(&self, purl: &str) -> bool {
+        match Ecosystem::from_purl(purl) {
+            Some(eco) => self.ecosystem_selected(eco),
+            None => self.ecosystems.as_ref().is_none_or(Vec::is_empty),
+        }
+    }
+
     /// Resolve `manifest_path` against `cwd`: absolute paths are returned
     /// as-is, relative paths are joined to `cwd`.
     pub(crate) fn resolved_manifest_path(&self) -> PathBuf {
@@ -393,7 +428,7 @@ impl GlobalArgs {
     }
 
     /// The project root whose `.socket/` state stores — manifest, vendor
-    /// ledger, redirect ledger — belong together: the RESOLVED manifest's
+    /// ledger — belong together: the RESOLVED manifest's
     /// directory, stepping out of a standard `.socket/` layout when the
     /// manifest lives in one. For the default `<cwd>/.socket/manifest.json`
     /// this is exactly `cwd`; for a `--manifest-path` into another project
@@ -449,7 +484,7 @@ impl GlobalArgs {
     /// The `(api_token, org_slug)` telemetry is attributed with, resolved
     /// through the API client's own credential chain (flag → the
     /// `SOCKET_NO_API_TOKEN` veto → env → `socket login` config) WITHOUT
-    /// building a client. For the purely local commands (`list`, `setup`,
+    /// building a client. For the purely local commands (`list`,
     /// `vex`): a client would add the org-slug auto-resolve round-trip and
     /// the "No SOCKET_API_TOKEN set" advisory to a command that needs
     /// neither, while anything less than the full chain reported a
@@ -475,6 +510,7 @@ impl GlobalArgs {
         use_public_proxy: bool,
     ) -> VendorServiceConfig {
         VendorServiceConfig {
+            maven_config: self.maven_config.as_deref().map(|v| v != "none"),
             source: VendorSource::parse(&self.vendor_source).unwrap_or_default(),
             client,
             use_public_proxy,
@@ -580,14 +616,13 @@ pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_FORCE",
     "SOCKET_PATCH_VERSION",
     "SOCKET_SAVE_ONLY",
-    "SOCKET_ONE_OFF",
     "SOCKET_ALL_RELEASES",
     "SOCKET_SKIP_ROLLBACK",
     "SOCKET_PRESERVE_STATE",
     "SOCKET_DOWNLOAD_ONLY",
-    "SOCKET_SETUP_EXCLUDE",
     "SOCKET_VENDOR_REVERT",
     "SOCKET_BATCH_SIZE",
+    "SOCKET_SCAN_PACKAGES",
     "SOCKET_VEX",
     "SOCKET_VEX_OUTPUT",
     "SOCKET_VEX_PRODUCT",
@@ -607,7 +642,7 @@ pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
 /// per-token validator) outright — a single stray blank var crashed every
 /// subcommand — and an empty `SOCKET_DOWNLOAD_MODE` / `SOCKET_MANIFEST_PATH`
 /// (or `SOCKET_VEX_OUTPUT`, which would silently target `""`) leaked `""`
-/// past the documented defaults. Called from `main` after legacy-name
+/// past the documented defaults. Called from `main` after peer-alias
 /// promotion and before clap runs. Only exactly-empty values are scrubbed;
 /// whitespace is significant in paths, so it is left for the parsers to
 /// judge.
@@ -643,7 +678,8 @@ impl Default for GlobalArgs {
             proxy_url: None,
             ecosystems: None,
             download_mode: "diff".to_string(),
-            vendor_source: "auto".to_string(),
+            vendor_source: "service".to_string(),
+            maven_config: None,
             vendor_url: None,
             patch_server_url: None,
             offline: false,
@@ -729,11 +765,10 @@ mod tests {
 
     /// Clear the extra env the core telemetry gate reads beyond the
     /// `SOCKET_*` set (`is_telemetry_disabled` also consults `VITEST` — the
-    /// kill-switch socket-cli's vitest suite relies on — and the legacy
-    /// `SOCKET_PATCH_TELEMETRY_DISABLED` name), so the airgap tests below
-    /// can't pass or fail vacuously. Restores afterwards.
+    /// kill-switch socket-cli's vitest suite relies on), so the airgap tests
+    /// below can't pass or fail vacuously. Restores afterwards.
     fn with_clean_telemetry_env(f: impl FnOnce()) {
-        with_env_cleared(&["VITEST", "SOCKET_PATCH_TELEMETRY_DISABLED"], f);
+        with_env_cleared(&["VITEST"], f);
     }
 
     /// `--offline` promises "never contact the network", but the telemetry
@@ -852,8 +887,8 @@ mod tests {
     /// `scrub_empty_env_vars` removes exactly-empty `SOCKET_*` flag vars
     /// (the `VAR=` blank-without-unsetting idiom) — global and local — and
     /// nothing else: set, non-empty values — even whitespace-only ones,
-    /// which are significant in paths — survive, and the
-    /// previously-crashing parse then sees plain defaults.
+    /// which are significant in paths — survive, and the parse then sees
+    /// plain defaults.
     #[test]
     #[serial_test::serial]
     fn scrub_empty_env_vars_unsets_only_empties() {
@@ -900,7 +935,7 @@ mod tests {
             assert!(cli.common.ecosystems.is_none());
             assert_eq!(cli.common.download_mode, "diff");
             assert_eq!(
-                cli.common.vendor_source, "auto",
+                cli.common.vendor_source, "service",
                 "empty SOCKET_VENDOR_SOURCE must fall back to the `auto` default"
             );
             assert_eq!(cli.common.manifest_path, "keep.json");
@@ -915,7 +950,7 @@ mod tests {
         with_clean_socket_env(|| {
             // Default when unset.
             let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
-            assert_eq!(cli.common.vendor_source, "auto");
+            assert_eq!(cli.common.vendor_source, "service");
 
             // CLI value, case-normalized to the canonical tag.
             let cli =
@@ -924,8 +959,7 @@ mod tests {
 
             // Env var honored.
             std::env::set_var("SOCKET_VENDOR_SOURCE", "build");
-            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
-            assert_eq!(cli.common.vendor_source, "build");
+            assert!(TestCli::try_parse_from(["socket-patch"]).is_err());
             std::env::remove_var("SOCKET_VENDOR_SOURCE");
 
             // Garbage is rejected at parse time.
@@ -948,28 +982,20 @@ mod tests {
         }
     }
 
-    /// Regression: scan's vendored flow must build its service config FROM
-    /// `--vendor-source`, not hardcode build-only (the pre-fix `service =
-    /// None`). Under the default (`auto`), the config must permit the
-    /// vendoring service exactly as the `vendor` command's default does —
-    /// otherwise `scan --mode vendored` silently builds locally while a
-    /// plain `vendor` service-downloads, and the two commit different bytes /
-    /// lock integrity for the same patch (lock churn / merge conflicts).
     #[test]
     fn vendor_service_config_default_source_permits_service() {
         let cfg = common_with_source("auto").vendor_service_config(None, false);
-        assert_eq!(cfg.source, VendorSource::Auto);
+        assert_eq!(cfg.source, VendorSource::Service);
         assert!(
             cfg.source.may_use_service(),
             "the default must be able to use the service (matching `vendor`)"
         );
-        assert!(!cfg.source.requires_service());
+        assert!(cfg.source.requires_service());
         assert!(cfg.client.is_none());
         assert!(!cfg.use_public_proxy);
     }
 
-    /// `--vendor-source service` reaches the fail-closed service path and
-    /// `--vendor-source build` never contacts the service.
+    /// The assembler fails closed even if a caller bypasses argument validation.
     #[test]
     fn vendor_service_config_honors_service_and_build_sources() {
         let cfg = common_with_source("service").vendor_service_config(None, true);
@@ -981,8 +1007,8 @@ mod tests {
         );
 
         let cfg = common_with_source("build").vendor_service_config(None, false);
-        assert_eq!(cfg.source, VendorSource::Build);
-        assert!(!cfg.source.may_use_service());
+        assert_eq!(cfg.source, VendorSource::Service);
+        assert!(cfg.source.requires_service());
     }
 
     /// The service overrides (`--vendor-url` / `--patch-server-url` /
@@ -1071,7 +1097,7 @@ mod tests {
         }
     }
 
-    /// The bug fix: an empty (or whitespace-only) string is `false`, not an
+    /// An empty (or whitespace-only) string is `false`, not an
     /// error. Shells/CI export `SOCKET_OFFLINE=` to mean "unset".
     #[test]
     fn parse_bool_flag_treats_empty_as_false() {
@@ -1088,9 +1114,9 @@ mod tests {
         assert!(parse_bool_flag("tru").is_err());
     }
 
-    /// Regression: an exported-but-empty bool env var must NOT crash the parse.
-    /// Before the fix, `BoolishValueParser` aborted with "value was not a
-    /// boolean", taking down every subcommand. Now it resolves to `false`.
+    /// Regression: an exported-but-empty bool env var must NOT crash the parse
+    /// (`BoolishValueParser` rejects it, taking down every subcommand); it
+    /// resolves to `false`.
     #[test]
     #[serial_test::serial]
     fn empty_bool_env_var_parses_as_false_not_crash() {
@@ -1450,15 +1476,15 @@ mod tests {
     }
 
     /// The mirror only works if every subcommand's `run` actually calls
-    /// `apply_env_toggles`. `list` and `setup` fire telemetry
-    /// (`track_patch_listed` / `track_patch_setup`) whose kill-switch reads
+    /// `apply_env_toggles`. `list` fires telemetry
+    /// (`track_patch_listed`) whose kill-switch reads
     /// `SOCKET_TELEMETRY_DISABLED` / `SOCKET_OFFLINE` from the env only — a
     /// run entry point that skips the mirror silently ignores
     /// `--no-telemetry` and lets `--offline` (strict airgap: never contact
     /// the network) still fire the telemetry HTTP request.
     #[test]
     #[serial_test::serial]
-    fn list_and_setup_run_mirror_global_toggles_for_airgap() {
+    fn list_run_mirrors_global_toggles_for_airgap() {
         with_clean_socket_env(|| {
             with_clean_telemetry_env(|| {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -1487,28 +1513,6 @@ mod tests {
                     "`list --offline --no-telemetry` must mirror the toggles into the \
                      env — its telemetry kill-switch reads only SOCKET_OFFLINE / \
                      SOCKET_TELEMETRY_DISABLED",
-                );
-
-                // Reset the mirrored vars so setup can't pass on list's leftovers.
-                std::env::remove_var("SOCKET_OFFLINE");
-                std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
-
-                let tmp = tempfile::tempdir().unwrap();
-                rt.block_on(crate::commands::setup::run(
-                    crate::commands::setup::SetupArgs {
-                        check: false,
-                        remove: false,
-                        exclude: Vec::new(),
-                        common: GlobalArgs {
-                            // `setup` must not write anything from a unit test.
-                            dry_run: true,
-                            ..toggles_on(tmp.path())
-                        },
-                    },
-                ));
-                assert!(
-                    socket_patch_core::telemetry::is_telemetry_disabled(),
-                    "`setup --offline --no-telemetry` must mirror the toggles into the env",
                 );
             });
         });
@@ -1560,12 +1564,10 @@ mod tests {
             ("SOCKET_FORCE", &["socket-patch", "vendor"]),
             ("SOCKET_FORCE", &["socket-patch", "self-update"]),
             ("SOCKET_SAVE_ONLY", &["socket-patch", "get", "x"]),
-            ("SOCKET_ONE_OFF", &["socket-patch", "get", "x"]),
-            ("SOCKET_ONE_OFF", &["socket-patch", "rollback"]),
             ("SOCKET_ALL_RELEASES", &["socket-patch", "get", "x"]),
             ("SOCKET_ALL_RELEASES", &["socket-patch", "scan"]),
             ("SOCKET_SKIP_ROLLBACK", &["socket-patch", "remove", "x"]),
-            // Shared by rollback and remove, like SOCKET_ONE_OFF above.
+            // Shared by rollback and remove.
             ("SOCKET_PRESERVE_STATE", &["socket-patch", "rollback"]),
             ("SOCKET_PRESERVE_STATE", &["socket-patch", "remove", "x"]),
             ("SOCKET_DOWNLOAD_ONLY", &["socket-patch", "repair"]),
@@ -1573,7 +1575,7 @@ mod tests {
             ("SOCKET_VEX_NO_VERIFY", &["socket-patch", "vex"]),
             ("SOCKET_VEX_COMPACT", &["socket-patch", "vex"]),
             // The embedded `--vex-*` twins share the same env vars and must
-            // not abort host commands (e.g. apply from a postinstall hook).
+            // not abort host commands (e.g. apply from a CI step).
             ("SOCKET_VEX_NO_VERIFY", &["socket-patch", "apply"]),
             ("SOCKET_VEX_COMPACT", &["socket-patch", "scan"]),
         ];
@@ -1609,8 +1611,8 @@ mod tests {
 
         const VALUE_BINDINGS: &[(&str, &[&str])] = &[
             ("SOCKET_BATCH_SIZE", &["socket-patch", "scan"]),
+            ("SOCKET_SCAN_PACKAGES", &["socket-patch", "scan"]),
             ("SOCKET_PATCH_VERSION", &["socket-patch", "self-update"]),
-            ("SOCKET_SETUP_EXCLUDE", &["socket-patch", "setup"]),
             ("SOCKET_VEX", &["socket-patch", "apply"]),
             ("SOCKET_VEX_OUTPUT", &["socket-patch", "vex"]),
             ("SOCKET_VEX_PRODUCT", &["socket-patch", "vex"]),

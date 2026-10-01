@@ -15,8 +15,11 @@ readme = "README.md"
 # [dev-dependencies] only, so a `cargo build --release` / `cargo install`
 # binary never carries it.
 failpoints = []
+# Shared HTTP artifact fixtures, enabled only by the CLI dev-dependency.
+test-fixtures = ["dep:wiremock"]
 
 [dependencies]
+wiremock = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -24,6 +27,8 @@ sha1 = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
+# CancellationToken for the in-memory hosted engine (`hosted::memory`).
+tokio-util = { workspace = true }
 futures-util = { workspace = true }
 thiserror = { workspace = true }
 walkdir = { workspace = true }
@@ -42,6 +47,8 @@ tempfile = { workspace = true }
 zip = { workspace = true }
 base64 = { workspace = true }
 semver = { workspace = true }
+serde-saphyr = { workspace = true }
+ignore = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -66,8 +73,7 @@ sha2 = { workspace = true, features = ["asm"] }
 
 # All ecosystems (npm, PyPI, Ruby gems, Go, Cargo, NuGet, Maven, Composer,
 # Deno) are unconditionally compiled in AND enabled at runtime — there are
-# no ecosystem feature gates and no runtime env gates (the old
-# SOCKET_EXPERIMENTAL_MAVEN/NUGET opt-ins are retired).
+# no ecosystem feature gates and no runtime env gates.
 
 [dev-dependencies]
 tempfile = { workspace = true }

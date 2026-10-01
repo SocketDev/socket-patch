@@ -1,5 +1,5 @@
 //! Coverage-gap tests for `api::blob_fetcher`'s never-executed error
-//! branches (audit of commit d5e1815):
+//! branches:
 //!
 //! * an uncreatable cache directory — the dir is created by the first
 //!   verified download inside `write_cache_entry_atomic`, never up front,
@@ -7,11 +7,10 @@
 //!   fetch that lands nothing leaves no `.socket/blobs/` husk — driven
 //!   cross-platform via ENOTDIR (the target directory is routed *through
 //!   a regular file*, which fails even as root, unlike permission tricks);
-//! * the blob-download loop's progress callback (~471) — the diff-loop
+//! * the blob-download loop's progress callback — the diff-loop
 //!   twin is tested in `blob_fetcher_edges_e2e.rs`, this one never ran;
-//! * the "Failed to write blob/archive to disk" arms (~501-508,
-//!   ~306-313) where the download succeeded but the atomic cache write
-//!   failed (unix-only, read-only directory);
+//! * the "Failed to write blob/archive to disk" arms where the download
+//!   succeeded but the atomic cache write failed (unix-only, read-only directory);
 //! * mixed-outcome aggregation across `download_hashes` arms — each arm
 //!   is individually covered by the sibling suite, but a single run
 //!   combining success + 404 + hash-mismatch never was.
@@ -239,7 +238,6 @@ async fn fetch_missing_sources_diff_uncreatable_archives_dir_is_per_archive_writ
     let diffs = notadir.join("diffs");
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: Some(&diffs),
         mem_blobs: None,
     };
@@ -470,7 +468,6 @@ async fn fetch_missing_sources_diff_disk_write_failure_is_per_archive_failure() 
 
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: Some(&diffs),
         mem_blobs: None,
     };

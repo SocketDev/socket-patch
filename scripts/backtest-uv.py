@@ -845,12 +845,13 @@ def vex(case, key, rows, *flags):
 def vex_matrix(version):
     """Manifest-less VEX over every installed hosted / vendored case: with
     `.socket/manifest.json` deleted, `vex` must attest urllib3 with the
-    mode's marker; with both ledgers deleted too it must still attest (the
-    lockfile references + the public patch API); `--offline` then has no
-    record (`record_unavailable`); and for the native project cases, the
-    pair reverted to the registry lock with the ledgers left behind must
-    NOT attest — verified or `--no-verify`. Each case runs in a copy, so
-    the other phases' results are untouched."""
+    mode's marker; with the vendor ledger deleted too (v5 hosted writes no
+    ledger at all) it must still attest (the lockfile references + the
+    public patch API); `--offline` then has no record
+    (`record_unavailable`); and for the native project cases, the pair
+    reverted to the registry lock (a vendor ledger left behind) must NOT
+    attest — verified or `--no-verify`. Each case runs in a copy, so the
+    other phases' results are untouched."""
     base = ROOT / 'matrix' / version
     rows = []
     cases = [
@@ -1284,9 +1285,9 @@ def render_doc_table(results):
         f"untouched — and **{len(lock_changed)} changed the lock**. `--frozen` "
         f"never writes the lock, so the {len(locked_rows)} `--locked` rows are the "
         f"ones that measure preservation; {locked_ok} of them exited 0. The "
-        "[machine-readable results](uv-compatibility/results.json) contain all "
+        "machine-readable results JSON contains all "
         f"{len(all_obs)} observations and their command definitions. The "
-        "[binary catalog](uv-compatibility/binaries.json) records each uv wheel's "
+        "binary catalog records each uv wheel's "
         "public PyPI source and verified hash."
     )
     paragraph(

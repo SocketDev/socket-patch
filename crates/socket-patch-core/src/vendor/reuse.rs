@@ -1,50 +1,3 @@
-//! Reuse of an already-committed, file-shaped vendored artifact (npm
-//! tarball, pypi wheel) instead of acquiring a new one.
-//!
-//! The directory-shaped backends (cargo, golang, composer, gem, maven,
-//! nuget) decide "in sync" from the COMMITTED artifact before they ever
-//! consult the patch service. The archive-shaped backends used to acquire
-//! first (service download, else a local deterministic pack) and compare the
-//! lock's digests with those NEW bytes — so a prebuilt ↔ local source flip
-//! between two runs (a service outage, or its recovery) rewrote the lock and
-//! the tarball even though nothing needed vendoring. This module gives them
-//! the same rule: when the ledger vouches for the committed artifact and the
-//! bytes verify, reuse them.
-//!
-//! Anchor: the vendor ledger entry (`.socket/vendor/state.json`) recorded
-//! the artifact's path + sha256 when it was wired. Reuse requires, fail
-//! closed at every step (any miss falls through to the caller's normal
-//! acquisition, exactly today's behavior):
-//!
-//! 1. a non-empty patch record (nothing to verify ⇒ never reused);
-//! 2. a canonical, uuid-bound artifact path (`checked_artifact_path`) — an
-//!    artifact under another uuid's directory is never reused;
-//! 3. no symlink anywhere on the path below the project root;
-//! 4. a regular file (FIFO-safe open), at most `MAX_HEALTH_HASH_BYTES`, read
-//!    ONCE into memory — every later check runs on that one buffer;
-//! 5. `sha256(bytes)` == the ledger sha256 (and the ledger size, when
-//!    recorded) — the tamper anchor for unpatched members and re-encodings;
-//! 6. the archive is CANONICAL (strict decode: every tarball entry under
-//!    `package/`, only regular/directory entries, no exact or case-folded
-//!    duplicate names; the same name rules for wheels) — so the decoded
-//!    members are exactly what an installer extracts, and the afterHash
-//!    check below cannot be satisfied by one entry while a sibling the
-//!    installer prefers (another top-level dir, a type-`7` twin, a
-//!    case-variant name) carries different bytes;
-//! 7. every `record.files` afterHash verifies inside the decoded members.
-//!
-//! The lockfile is deliberately NOT an input: the flavor's own in-sync code
-//! runs afterwards against the reused bytes' facts, so a lock that already
-//! pins them is a true no-op and a lock that drifted is re-pinned to the
-//! verified committed bytes.
-//!
-//! Residual trust (the same level `repair` and `vex`'s
-//! `check_vendored_artifact` already grant the ledger): an attacker who edits
-//! an unpatched member AND rewrites the ledger sha256 keeps the edit, because
-//! the afterHash check only covers patched members.
-//!
-//! Read-only: nothing here writes or touches the network.
-
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -93,7 +46,7 @@ pub(crate) enum ReuseMiss {
     PlatformLocked,
 }
 
-/// Debug-log a reuse miss (`SOCKET_PATCH_DEBUG`); the caller then acquires.
+/// Debug-log a reuse miss (`SOCKET_DEBUG`); the caller then acquires.
 pub(crate) fn log_miss(purl: &str, miss: &ReuseMiss) {
     if is_debug_enabled() {
         eprintln!("[socket-patch debug] vendor reuse skipped for {purl}: {miss:?}");
@@ -114,7 +67,7 @@ fn norm(path: &str) -> String {
 /// The ledger comes from [`load_state_shared`]: the run asks it once per
 /// npm/pypi package, and on a big monorepo the ledger runs to megabytes,
 /// so re-parsing (or, inside a group commit, deep-cloning) it per package
-/// was the vendored re-run's dominant cost. The shared read still reads
+/// would dominate the vendored re-run. The shared read still reads
 /// the bytes every time and re-parses whenever they changed, answers from
 /// the group commit's captured ledger when there is one, and fails exactly
 /// where [`super::state::load_state`] fails. Only the one matching entry is
@@ -166,7 +119,7 @@ fn select_prior_entry<'a>(
     Ok(first)
 }
 
-/// The pre-SC1 [`prior_entry`], kept as the equivalence oracle: a full
+/// The reloading form of [`prior_entry`], kept as the equivalence oracle: a full
 /// [`super::state::load_state`] per call, entries taken by value.
 #[cfg(test)]
 pub(crate) async fn prior_entry_reloading(
@@ -282,12 +235,21 @@ pub(crate) async fn verify_committed_artifact(
 
     // Members from the SAME buffer.
     let is_tarball = rel_path.ends_with(".tgz") || rel_path.ends_with(".tar.gz");
-    let is_wheel = rel_path.ends_with(".whl");
+    let is_wheel = rel_path.ends_with(".whl") || rel_path.ends_with(".zip");
     if !is_tarball && !is_wheel {
         return Err(ReuseMiss::Unreadable);
     }
+    let python_name = (entry.ecosystem == "pypi").then(|| rel_path.clone());
     let (bytes, members) = tokio::task::spawn_blocking(move || {
-        let members = if is_tarball {
+        let members = if let Some(name) = &python_name {
+            super::pypi_distribution::read_members(&bytes, name).map_err(|error| {
+                if error == "vendor_artifact_non_canonical" {
+                    ReuseMiss::NonCanonical
+                } else {
+                    ReuseMiss::Unreadable
+                }
+            })
+        } else if is_tarball {
             crate::patch::package::read_archive_bytes_to_map_strict(&bytes).map_err(|e| match e {
                 crate::patch::package::ArchiveError::NonCanonical(_) => ReuseMiss::NonCanonical,
                 _ => ReuseMiss::Unreadable,
@@ -306,7 +268,12 @@ pub(crate) async fn verify_committed_artifact(
     .await
     .map_err(|_| ReuseMiss::Unreadable)?;
     let members = members?;
-    verify_member_map(&members, record).map_err(ReuseMiss::MemberMismatch)?;
+    if entry.ecosystem == "pypi" {
+        super::pypi_distribution::verify_members(&members, &rel_path, record)
+    } else {
+        verify_member_map(&members, record)
+    }
+    .map_err(ReuseMiss::MemberMismatch)?;
 
     Ok(CommittedArtifact {
         rel_path,
@@ -327,7 +294,7 @@ pub(crate) async fn reusable_committed_artifact(
     verify_committed_artifact(project_root, &entry, record).await
 }
 
-/// DESIGN §4.3 step 2: the committed vlt package dir at `rel_dir`, when
+/// The committed vlt package dir at `rel_dir`, when
 /// the ledger records it for `record.uuid` with an inventory and the tree
 /// still verifies (no link on the path, the structure rule, only links and
 /// `.bin/` scripts under its `node_modules/`, every member and the whole
@@ -444,6 +411,7 @@ mod tests {
             base_purl: "pkg:npm/left-pad@1.3.0".into(),
             uuid: uuid.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel.into(),
                 sha256: hex::encode(Sha256::digest(bytes)),
                 size: Some(bytes.len() as u64),
@@ -664,8 +632,8 @@ mod tests {
     }
 
     /// An UNPATCHED member edited and re-gzipped, with the ledger still
-    /// recording the original sha: the anchor rejects it (today's rebuild
-    /// then heals it).
+    /// recording the original sha: the anchor rejects it (the rebuild then
+    /// heals it).
     #[tokio::test]
     async fn edited_unpatched_member_with_stale_ledger_sha_misses() {
         let (tmp, _) = project(&good_tgz()).await;
@@ -1015,7 +983,7 @@ mod tests {
         assert!(wheel_reuse(&zip_of(&[("index.js", PATCHED)])).await.is_ok());
     }
 
-    /// SC1: the shared-ledger [`prior_entry`] answers exactly what the
+    /// The shared-ledger [`prior_entry`] answers exactly what the
     /// reloading oracle answers — hits, path filters, twins that agree or
     /// disagree, a missing or corrupt ledger — including after the ledger
     /// changes between two calls (the memo must miss) and inside a group

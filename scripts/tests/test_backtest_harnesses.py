@@ -608,6 +608,29 @@ class VltLockHelperTests(unittest.TestCase):
 
 
 class VltRetryTests(unittest.TestCase):
+    def test_json_cli_failures_reach_the_retry_classifier(self):
+        for phase in ('initial', 'repeat', 'rollback'):
+            for status in (504, 404):
+                with self.subTest(phase=phase, status=status), tempfile.TemporaryDirectory() as temp:
+                    cell = vlt.Cell({'out': Path(temp), 'record': {}, 'cli': 'socket-patch',
+                                     'cli_env': {}}, '1.2.0', 'hosted', 'direct')
+                    cell.project.mkdir(parents=True)
+                    row = dict(cell=cell.name, expectedVerdict='patched', passed=False, checks={})
+                    envelope = {'status': 'error',
+                                'error': f'API request failed with status {status}: error code: {status}'}
+                    with patch.object(vlt, 'run', return_value=(1, json.dumps(envelope), '')):
+                        if phase == 'initial':
+                            cell.patch_run('hosted')
+                        elif phase == 'repeat':
+                            cell.repeat(row, row['checks'], b'')
+                        else:
+                            cell.revert()
+                    with patch('sys.stdout'):
+                        cell.finish(row, row['checks'], vlt.time.time())
+                    captured = json.loads((cell.case / 'result.json').read_text())
+                    self.assertEqual(captured['cliFailures'][0]['envelope'], envelope)
+                    self.assertEqual(vlt.transient(captured), status == 504)
+
     def test_only_transport_failures_retry(self):
         self.assertFalse(vlt.transient({'matchesExpectation': True, 'serveProbe': {'curlExit': 7}}))
         self.assertTrue(vlt.transient({'serveProbe': {'curlExit': 7}}))
