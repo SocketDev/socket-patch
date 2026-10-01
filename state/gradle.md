@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Gradle bug-hunt routine (label pm:gradle).
 
-Last updated: 2026-10-01 (run 5), main `9d718cf` (no Gradle code changes since `2463257` / #277), latest release v4.0.0. #428 and #461 were re-confirmed on `9d718cf`.
+Last updated: 2026-10-01 (run 6), main `61cfb9b` (no Gradle code changes since `2463257` / #277), latest release v4.0.0. #487 was re-confirmed on `61cfb9b`, and #428 and #461 on `9d718cf`.
 
 ## Coverage matrix
 
@@ -34,6 +34,16 @@ Last updated: 2026-10-01 (run 5), main `9d718cf` (no Gradle code changes since `
 | 9.8.0 (21) | untested | untested | untested | untested | untested | **fail #487** | untested | pass |
 | 6.9.4 / 7.6.6, macOS, Windows | untested | untested | untested | untested | untested | untested | untested | untested |
 
+**Vendored, run 6 cells (Linux).**
+
+| Gradle (JDK) | Range `[1.9,1.10.0]` | Rich `strictly` range + `prefer` | Strict exact `1.10.0!!` | `1.+` / `latest.release` | `vendor --check` on pgp verification-metadata | `vendor --revert` on pgp verification-metadata |
+|---|---|---|---|---|---|---|
+| 8.14.3 (21) | **fail #511** | **fail #511** | pass | unaffected | passes on a broken tree (#487) | pass |
+| 9.8.0 (21) | **fail #511** | **fail #511** | untested | untested | untested | untested |
+| 6.9.4 / 7.6.6, macOS, Windows | untested | untested | untested | untested | untested | untested |
+
+**Hosted snippet vs settings `dependencyResolutionManagement` (run 6, Linux, 8.14.3 / 9.8.0).** Pasted in `build.gradle` under FAIL_ON_PROJECT_REPOS / PREFER_SETTINGS / PREFER_PROJECT: loud failure in each mode (fail-closed). Wrapped inside settings DRM `repositories`: pass.
+
 **Global (`-g`), Linux, 8.14.3 cache.**
 - `scan -g` report: fail. No Gradle-cached purls (#349 comment).
 - `scan -g --mode hosted` / `--global-prefix --mode hosted` refusal: pass (exit 2, no writes).
@@ -42,12 +52,12 @@ Last updated: 2026-10-01 (run 5), main `9d718cf` (no Gradle code changes since `
 - macOS / Windows: untested.
 
 ## Backlog
-1. **Maintainer request (partly done):** global `-g` mode. Linux is covered (the report, the refusal, and no project leakage). Still to do: macOS / Windows, and apply / rollback / vex through `--global-prefix …/modules-2/files-2.1` if that's meant to be supported (see the 20261001T040000Z entry).
-2. #487 on Gradle 6.9.4 / 7.6.6 (a JDK 11/17 probe), plus `verify-signatures` with `.module` artifacts and imported BOMs.
-3. `vendor --check` / `--revert` byte-exactness on a verification-metadata file that has pgp entries.
+1. #511 variants: version-catalog ranges (`require`/`prefer`/`strictly`), a transitive range from a dependency's POM, and whether a `gradle.lockfile` that locks the base masks it.
+2. **Maintainer request (partly done):** global `-g` mode. Linux is covered (the report, the refusal, and no project leakage). Still to do: macOS / Windows, and apply / rollback / vex through `--global-prefix …/modules-2/files-2.1` if that's meant to be supported (see the 20261001T040000Z entry).
+3. #487 and #511 on Gradle 6.9.4 / 7.6.6 (a JDK 11/17 probe), plus `verify-signatures` with `.module` artifacts and imported BOMs.
 4. The hosted snippet in its suffixed form, with the dependency bumped and then `vendor`. Check the result and VEX.
-5. `dependencyResolutionManagement` FAIL_ON_PROJECT_REPOS with the hosted snippet; IDE `sources` classifier downloads under the vendored exclusiveContent.
-6. Re-test #347, #348, #349, #395, #396, #428, #429, #461 and #487 when `vendor/jvm/`, `maven_crawler.rs` or `gradle_snippet` change.
+5. IDE `sources` / `javadoc` classifier downloads under the vendored exclusiveContent.
+6. Re-test #347, #348, #349, #395, #396, #428, #429, #461, #487 and #511 when `vendor/jvm/`, `maven_crawler.rs` or `gradle_snippet` change.
 
 ## Known non-bugs
 - The sandbox can't reach the Socket API. For vendored, use `prebuilt_common::prepare_command` + a staged manifest/blob (see the run 3 entry). For hosted, use the wiremock shaped like `e2e_redirect_maven_build`.
@@ -67,3 +77,6 @@ Last updated: 2026-10-01 (run 5), main `9d718cf` (no Gradle code changes since `
 - `vex -g` attests the cwd project's vendored or hosted state by design (`vex.rs:1013`).
 - Agent-mode Maven patches whole jar files. A manifest keyed by a jar *member* (the vendored fixture format) fails `apply` with "File not found", which is a fixture error.
 - Under isolated projects, harness init scripts must avoid `allprojects`; the vendored script itself is IP-compatible on 9.8.0.
+- The hosted snippet pasted into `build.gradle` of a settings-DRM build fails loudly in every `repositoriesMode`. It works when wrapped inside `dependencyResolutionManagement { repositories { … } }`. That's placement, not a silent bypass.
+- `1.+` / `latest.release` declarations resolve the newest release before and after vendoring, so a base-version patch correctly doesn't apply. That isn't #511.
+- `vendor --revert` is byte-exact on a verification-metadata file with pgp entries (run 6).
