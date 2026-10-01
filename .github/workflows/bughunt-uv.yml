@@ -35,7 +35,7 @@ jobs:
           TARGET: ${{ matrix.target }}
           EXT: ${{ matrix.ext }}
         run: |
-          set -u
+          set +e -u
           W="$RUNNER_TEMP/w"; mkdir -p "$W"
           SP="$PWD/target/release/socket-patch"
           PY="$(python -c 'import sys;print(sys.executable)')"
