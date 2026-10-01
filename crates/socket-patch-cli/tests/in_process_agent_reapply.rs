@@ -63,7 +63,7 @@ fn scan_args(cwd: &Path, server: &MockServer) -> ScanArgs {
     }
 }
 
-fn get_uuid_args(cwd: &Path, server: &MockServer) -> GetArgs {
+fn agent_get_args(cwd: &Path, server: &MockServer) -> GetArgs {
     GetArgs {
         common: common(cwd, server),
         identifier: UUID.to_string(),
@@ -150,7 +150,7 @@ async fn mock_api(server: &MockServer) {
         .await;
 }
 
-fn manifest_uuid(root: &Path) -> Option<String> {
+fn recorded_patch_id(root: &Path) -> Option<String> {
     let text = std::fs::read_to_string(root.join(".socket/manifest.json")).ok()?;
     let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
     manifest["patches"][PURL]["uuid"]
@@ -171,7 +171,7 @@ async fn first_run_then_reinstall(root: &Path, server: &MockServer) {
     args.mode = Some(ScanMode::Agent);
     assert_eq!(scan(args).await, 0, "first agent scan must apply cleanly");
     assert_eq!(std::fs::read(index_js(root)).unwrap(), PATCHED);
-    assert_eq!(manifest_uuid(root).as_deref(), Some(UUID));
+    assert_eq!(recorded_patch_id(root).as_deref(), Some(UUID));
     install(root);
     assert_eq!(std::fs::read(index_js(root)).unwrap(), ORIGINAL);
 }
@@ -192,7 +192,7 @@ async fn agent_scan_reapplies_already_recorded_patch_after_reinstall() {
         PATCHED,
         "a re-scan must re-apply the recorded patch to the reinstalled package"
     );
-    assert_eq!(manifest_uuid(tmp.path()).as_deref(), Some(UUID));
+    assert_eq!(recorded_patch_id(tmp.path()).as_deref(), Some(UUID));
 }
 
 #[tokio::test]
@@ -267,11 +267,11 @@ async fn get_uuid_agent_reapplies_already_recorded_patch_after_reinstall() {
     mock_api(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     install(tmp.path());
-    assert_eq!(get_run(get_uuid_args(tmp.path(), &server)).await, 0);
+    assert_eq!(get_run(agent_get_args(tmp.path(), &server)).await, 0);
     assert_eq!(std::fs::read(index_js(tmp.path())).unwrap(), PATCHED);
 
     install(tmp.path());
-    assert_eq!(get_run(get_uuid_args(tmp.path(), &server)).await, 0);
+    assert_eq!(get_run(agent_get_args(tmp.path(), &server)).await, 0);
     assert_eq!(
         std::fs::read(index_js(tmp.path())).unwrap(),
         PATCHED,
@@ -287,7 +287,7 @@ async fn get_purl_agent_reapplies_already_recorded_patch_after_reinstall() {
     let tmp = tempfile::tempdir().unwrap();
     first_run_then_reinstall(tmp.path(), &server).await;
 
-    let mut args = get_uuid_args(tmp.path(), &server);
+    let mut args = agent_get_args(tmp.path(), &server);
     args.identifier = PURL.to_string();
     args.id = false;
     assert_eq!(get_run(args).await, 0);
@@ -306,7 +306,7 @@ async fn get_save_only_of_recorded_patch_still_does_not_apply() {
     let tmp = tempfile::tempdir().unwrap();
     first_run_then_reinstall(tmp.path(), &server).await;
 
-    let mut args = get_uuid_args(tmp.path(), &server);
+    let mut args = agent_get_args(tmp.path(), &server);
     args.save_only = true;
     assert_eq!(get_run(args).await, 0);
     assert_eq!(
