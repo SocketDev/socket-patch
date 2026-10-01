@@ -1,0 +1,138 @@
+name: bughunt pip probe (global --user)
+on:
+  push:
+    branches: ['bughunt/pip/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - python: '3.8'
+            pipv: '20.3.4'
+          - python: '3.13'
+            pipv: ''
+        python: ['3.8', '3.13']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: bughunt-pip-g
+          save-if: false
+      - name: Build the CLI
+        shell: bash
+        run: cargo build --locked -p socket-patch-cli
+      - name: Write probe
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/probe_g.py" <<'PYEOF'
+          import base64, csv, hashlib, http.server, io, json, os, subprocess, sys, tempfile, threading, urllib.request, zipfile
+          CLI = os.environ["SP_CLI"]; WIN = os.name == "nt"
+          UUID = "4d5e6f70-8192-4a1b-8c2d-0123456789ab"; TOKEN = "11111111-1111-4111-8111-111111111111"
+          work = tempfile.mkdtemp(prefix="bh pip ")
+          def run(cmd, cwd=None, env=None, check=False):
+              p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+              if check and p.returncode: print(p.stdout, p.stderr); raise SystemExit(f"failed: {cmd}")
+              return p
+          # patched wheel
+          up = os.path.join(work, "six-1.16.0-py2.py3-none-any.whl")
+          urllib.request.urlretrieve("https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl", up)
+          zin = zipfile.ZipFile(up); buf = io.BytesIO(); zout = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+          ORIG = zin.read("six.py"); patched_six = ORIG + b"\nSOCKET_PATCHED = 1\n"
+          def gsha(b): return hashlib.sha256(b"blob %d\0" % len(b) + b).hexdigest()
+          for item in zin.infolist():
+              data = zin.read(item.filename)
+              if item.filename == "six.py": data = patched_six
+              if item.filename.endswith("RECORD"):
+                  rows = []
+                  for row in csv.reader(io.StringIO(data.decode())):
+                      if row and row[0] == "six.py":
+                          row = ["six.py", "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(patched_six).digest()).rstrip(b"=").decode(), str(len(patched_six))]
+                      rows.append(row)
+                  s = io.StringIO(); csv.writer(s, lineterminator="\n").writerows(rows); data = s.getvalue().encode()
+              zout.writestr(item, data)
+          zout.close(); WHL = buf.getvalue(); SHA = hashlib.sha256(WHL).hexdigest()
+          class H(http.server.BaseHTTPRequestHandler):
+              def log_message(self, *a): pass
+              def send(self, code, body, ct="application/json"):
+                  b = body if isinstance(body, bytes) else json.dumps(body).encode()
+                  self.send_response(code); self.send_header("Content-Type", ct); self.send_header("Content-Length", str(len(b))); self.end_headers()
+                  if self.command != "HEAD": self.wfile.write(b)
+              def do_HEAD(self): self.do_GET()
+              def do_GET(self):
+                  if self.path.endswith(".whl"): return self.send(200, WHL, "application/octet-stream")
+                  if "/patches/blob/" in self.path or "/patch/blob/" in self.path:
+                      h = self.path.rsplit("/", 1)[1]
+                      for b in (ORIG, patched_six):
+                          if gsha(b) == h: return self.send(200, b, "application/octet-stream")
+                      return self.send(404, {"error": "nf"})
+                  if "/patches/view/" in self.path:
+                      return self.send(200, {"uuid": UUID, "purl": "pkg:pypi/six@1.16.0", "publishedAt": "2024-01-01T00:00:00Z", "files": {"six.py": {"beforeHash": gsha(ORIG), "afterHash": gsha(patched_six), "blobContent": base64.b64encode(patched_six).decode()}}, "vulnerabilities": {"GHSA-xxxx-yyyy-zzzz": {"cves": ["CVE-2024-88888"], "summary": "s", "severity": "high", "description": "d"}}, "description": "d", "license": "MIT", "tier": "free"})
+                  if "/patches/by-package/" in self.path:
+                      hit = "six%401.16.0" in self.path
+                      return self.send(200, {"patches": [{"uuid": UUID, "purl": "pkg:pypi/six@1.16.0", "publishedAt": "2024-01-01T00:00:00Z", "description": "d", "license": "MIT", "tier": "free", "vulnerabilities": {"GHSA-xxxx-yyyy-zzzz": {"cves": ["CVE-2024-88888"], "summary": "s", "severity": "high", "description": "d"}}}] if hit else [], "canAccessPaidPatches": True})
+                  self.send(404, {"error": "nf"})
+              def do_POST(self):
+                  body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                  if self.path.endswith("/patches/package"):
+                      url = f"http://127.0.0.1:{PORT}/patch/pypi/six/1.16.0/{TOKEN}/{UUID}/six-1.16.0-py2.py3-none-any.whl"
+                      return self.send(200, {"results": {UUID: {"status": "granted", "url": url, "purl": "pkg:pypi/six@1.16.0", "artifacts": [{"kind": "tarball", "url": url, "integrity": {"sha256": SHA}}], "registryOverride": None}}})
+                  if self.path.endswith("/patches/batch"):
+                      comps = [c["purl"] for c in json.loads(body or b"{}").get("components", [])]
+                      pk = [{"purl": "pkg:pypi/six@1.16.0", "patches": [{"uuid": UUID, "purl": "pkg:pypi/six@1.16.0", "tier": "free", "cveIds": ["CVE-2024-88888"], "ghsaIds": ["GHSA-xxxx-yyyy-zzzz"], "severity": "high", "title": "t"}]}] if "pkg:pypi/six@1.16.0" in comps else []
+                      return self.send(200, {"packages": pk, "canAccessPaidPatches": True})
+                  self.send(200, {})
+          srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H); PORT = srv.server_address[1]
+          threading.Thread(target=srv.serve_forever, daemon=True).start()
+          
+          import shutil, site
+          env = {k: v for k, v in os.environ.items() if not k.startswith("SOCKET_") and k != "VIRTUAL_ENV"}
+          env["SOCKET_API_TOKEN"] = "sktsec_" + "a" * 44 + "_api"
+          API = ["--api-url", f"http://127.0.0.1:{PORT}", "--org", "test-org"]
+          py = sys.executable
+          if os.environ.get("PIPV"): run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check", "pip==" + os.environ["PIPV"]], check=True)
+          print("pip", run([py, "-m", "pip", "--version"]).stdout.strip())
+          r = run([py, "-m", "pip", "install", "--disable-pip-version-check", "--user", "--force-reinstall", "six==1.16.0"] + os.environ.get("PIP_EXTRA", "").split())
+          print("user install rc", r.returncode, r.stderr[-400:])
+          usersite = run([py, "-c", "import site;print(site.getusersitepackages())"]).stdout.strip()
+          six_path = os.path.join(usersite, "six.py"); print("USER_SITE", usersite, os.path.exists(six_path))
+          before = open(six_path, "rb").read() if os.path.exists(six_path) else b""
+          proj = os.path.join(work, "outside"); os.makedirs(proj)
+          def cli(*args):
+              p = run([CLI, *args, "--json", "--cwd", proj] + API, cwd=proj, env=env)
+              try: return p.returncode, json.loads(p.stdout)
+              except Exception: return p.returncode, {"raw": p.stdout[-600:], "err": p.stderr[-600:]}
+          def oracle():
+              o = run([py, "-c", "import six;print('PATCHED' if getattr(six,'SOCKET_PATCHED',0) else 'UNPATCHED', six.__file__)"], cwd=proj)
+              return o.stdout.strip() or o.stderr.strip()[-200:]
+          rc, j = cli("scan", "-g")
+          purls = [p.get("purl") for p in j.get("packages", [])] if isinstance(j.get("packages"), list) else j
+          print(f"CELL scan-g-report rc={rc} scanned={j.get('scannedPackages')} six_found={'pkg:pypi/six@1.16.0' in str(purls)} status={j.get('status')} file_unchanged={open(six_path,'rb').read()==before}")
+          rc, j = cli("scan", "-g", "--mode", "hosted", "--yes")
+          print(f"CELL scan-g-hosted-refused rc={rc} status={j.get('status')} err={str(j.get('error') or j.get('raw'))[:200]}")
+          rc, j = cli("get", UUID, "-g", "--yes")
+          print(f"CELL get-g rc={rc} status={j.get('status')} oracle={oracle()} detail={json.dumps(j)[:400]}")
+          rc, j = cli("rollback", "-g", "--yes")
+          print(f"CELL rollback-g rc={rc} status={j.get('status')} byte_exact={open(six_path,'rb').read()==before} oracle={oracle()}")
+          print("ROLLBACK_JSON", json.dumps(j)[:1500])
+          PYEOF
+      - name: Run probe
+        shell: bash
+        env:
+          PIPV: ${{ matrix.pipv }}
+          SOCKET_NO_CONFIG: '1'
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then export SP_CLI="$GITHUB_WORKSPACE/target/debug/socket-patch.exe"; else export SP_CLI="$GITHUB_WORKSPACE/target/debug/socket-patch"; fi
+          python "$RUNNER_TEMP/probe_g.py"
