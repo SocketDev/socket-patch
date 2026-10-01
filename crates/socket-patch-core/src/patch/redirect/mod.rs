@@ -5122,7 +5122,17 @@ fn rewrite_gem(
                         "source \"{}\" do\n  gem \"{}\", \"{}\"\nend",
                         ov.index_url, dep.name, dep.version
                     );
-                    let sep = if gf.ends_with('\n') { "" } else { "\n" };
+                    // Always one blank line before the block: the in-place
+                    // rewrite above swallows every blank line before a
+                    // declaration, so this is what lets `rollback` /
+                    // `remove` prove the block is this append and drop it
+                    // instead of restoring a direct exact pin (#457).
+                    let eol = if gf.contains("\r\n") { "\r\n" } else { "\n" };
+                    let sep = if gf.is_empty() || gf.ends_with('\n') {
+                        eol.to_string()
+                    } else {
+                        eol.repeat(2)
+                    };
                     *gf = format!("{gf}{sep}{block}\n");
                     gemfile_changed = true;
                     result.edits.push(FileEdit {
