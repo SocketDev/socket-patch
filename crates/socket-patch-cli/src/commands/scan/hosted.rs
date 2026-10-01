@@ -1364,7 +1364,9 @@ pub(crate) async fn run_redirect_selected(
             // line per sentence so CI can grep them.
             let width =
                 std::io::IsTerminal::is_terminal(&std::io::stderr()).then(crate::ui::stderr_width);
-            for purl in &takeover_migrated {
+            // A stranded takeover was NOT migrated to hosted: its
+            // `redirect_takeover_unpatched` warning below says so instead.
+            for purl in takeover_migrated.iter().filter(|p| !stranded.contains(p)) {
                 eprintln!("{}", format_takeover_line(purl, common.dry_run));
             }
             // The files a takeover's revert touched (or, on --dry-run,
@@ -1474,7 +1476,9 @@ pub(crate) async fn run_redirect_selected(
             if let Some(line) = rollout_line {
                 println!("{line}");
             }
-            let mut next_steps = if common.dry_run {
+            // "Commit … to keep the hosted patches" / "reinstall" would be
+            // wrong for a stranded takeover, whose warning names the remedy.
+            let mut next_steps = if common.dry_run || !stranded.is_empty() {
                 Vec::new()
             } else {
                 format_next_steps(&human_files, &rewrite.edits, !takeover_migrated.is_empty())
@@ -1488,6 +1492,21 @@ pub(crate) async fn run_redirect_selected(
         // "nothing"): exit 1 with no message would be undiagnosable.
         if let Some(e) = &vex_error {
             e.print_embedded(common);
+        }
+        if common.silent {
+            for w in warnings
+                .iter()
+                .filter(|w| w["code"] == "redirect_takeover_unpatched")
+            {
+                eprintln!(
+                    "{}",
+                    format_warning(
+                        "redirect_takeover_unpatched",
+                        w["detail"].as_str().unwrap_or_default(),
+                        None
+                    )
+                );
+            }
         }
     }
     if vex_code == 0 && !stranded.is_empty() {
@@ -1750,6 +1769,11 @@ async fn vendored_takeover(
                 // would refuse the still-vendored wiring.
                 let outcome =
                     crate::commands::vendor::dispatch_revert_one(entry, &common.cwd, true).await;
+                if outcome.success && revert_keeps_wiring(&outcome) {
+                    refused.push(purl.clone());
+                    out.pre_warnings.push(drifted_takeover_warning(purl));
+                    continue;
+                }
                 if !outcome.success {
                     refused.push(purl.clone());
                     out.pre_warnings.push(serde_json::json!({
@@ -1796,22 +1820,14 @@ async fn vendored_takeover(
                 }));
                 continue;
             }
-            if outcome.kept_artifact {
+            if revert_keeps_wiring(&outcome) {
                 // A wiring record drifted and was left in place, so the
                 // project may still resolve through the vendored artifact
                 // and the ledger entry holds the only recorded originals
                 // (the RevertOutcome contract): keep both and refuse,
                 // exactly as `vendor --revert` reports it skipped.
                 refused.push(purl.clone());
-                out.pre_warnings.push(serde_json::json!({
-                    "code": "redirect_vendored_revert_failed",
-                    "detail": format!(
-                        "{purl} is vendored and part of its vendored wiring was edited \
-                         since vendoring, so it was left in place; NOT switched to \
-                         hosted — restore or remove that wiring (`socket-patch vendor \
-                         --revert` lists it), then re-run `scan --mode hosted`"
-                    ),
-                }));
+                out.pre_warnings.push(drifted_takeover_warning(purl));
                 continue;
             }
             // Drop the reverted entry from the in-memory ledger and
@@ -1924,6 +1940,32 @@ async fn vendored_takeover(
         candidates.retain(|c| !withheld.contains(c.purl.as_str()));
     }
     Ok(out)
+}
+
+/// Whether a takeover revert left (or, on `--dry-run`, would leave) vendored
+/// wiring in place: a drift-skipped record, or a reverted file that still
+/// references the artifact dir. The backends compute both signals on dry
+/// runs too, while `kept_artifact` itself is set only on wet runs.
+fn revert_keeps_wiring(outcome: &socket_patch_core::vendor::RevertOutcome) -> bool {
+    outcome.kept_artifact
+        || outcome.drift_skipped()
+        || outcome
+            .warnings
+            .iter()
+            .any(|w| w.code == "vendor_revert_residual_reference")
+}
+
+/// The refusal for a takeover whose vendored wiring drifted since vendoring.
+fn drifted_takeover_warning(purl: &str) -> serde_json::Value {
+    serde_json::json!({
+        "code": "redirect_vendored_revert_failed",
+        "detail": format!(
+            "{purl} is vendored and part of its vendored wiring was edited since \
+             vendoring, so it is left in place; NOT switched to hosted — restore or \
+             remove that wiring (`socket-patch vendor --revert` lists it), then re-run \
+             `scan --mode hosted`"
+        ),
+    })
 }
 
 /// What [`vendored_takeover`] did (or, on `--dry-run`, would do).

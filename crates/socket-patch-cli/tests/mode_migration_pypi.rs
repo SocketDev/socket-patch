@@ -90,6 +90,17 @@ fn stage_manifest(root: &Path) {
 /// `VIRTUAL_ENV` keeps the installed-tree probes off the host's Python
 /// (Ubuntu's apt ships a python3-six 1.16.0 whose bytes are not ours).
 fn run_cli(root: &Path, args: &[&str], extra: &[(&str, &str)]) -> (i32, Value) {
+    let mut json_args = args.to_vec();
+    json_args.push("--json");
+    let (code, stdout, stderr) = run_raw(root, &json_args, extra);
+    let env = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    (code, env)
+}
+
+/// [`run_cli`] without `--json`: `(exit code, stdout, stderr)`.
+fn run_raw(root: &Path, args: &[&str], extra: &[(&str, &str)]) -> (i32, String, String) {
     let venv = root.join("../empty-venv");
     std::fs::create_dir_all(venv.join(if cfg!(windows) {
         "Lib/site-packages"
@@ -98,11 +109,7 @@ fn run_cli(root: &Path, args: &[&str], extra: &[(&str, &str)]) -> (i32, Value) {
     }))
     .unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    cmd.args(args)
-        .arg("--json")
-        .arg("--cwd")
-        .arg(root)
-        .current_dir(root);
+    cmd.args(args).arg("--cwd").arg(root).current_dir(root);
     for (key, _) in std::env::vars() {
         if key.starts_with("SOCKET_") {
             cmd.env_remove(key);
@@ -119,14 +126,11 @@ fn run_cli(root: &Path, args: &[&str], extra: &[(&str, &str)]) -> (i32, Value) {
     });
     let out = cmd.output().expect("spawn socket-patch");
     drop(fixture);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let env = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!(
-            "--json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        )
-    });
-    (out.status.code().unwrap_or(-1), env)
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 /// The hosted API: discovery (`batch` / `by-package`), the grant naming the
@@ -208,24 +212,24 @@ fn vendor_project(root: &Path, files: &[&str]) {
 /// `scan --mode hosted` against `server`.
 fn hosted_scan(root: &Path, server: &MockServer) -> (i32, Value) {
     let uri = server.uri();
-    run_cli(
-        root,
-        &[
-            "scan",
-            "--mode",
-            "hosted",
-            "--yes",
-            "--api-url",
-            &uri,
-            "--org",
-            ORG,
-            "--api-token",
-            "fake-token",
-            "--patch-server-url",
-            &uri,
-        ],
-        &[],
-    )
+    run_cli(root, &hosted_scan_args(&uri), &[])
+}
+
+fn hosted_scan_args(uri: &str) -> Vec<&str> {
+    vec![
+        "scan",
+        "--mode",
+        "hosted",
+        "--yes",
+        "--api-url",
+        uri,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake-token",
+        "--patch-server-url",
+        uri,
+    ]
 }
 
 /// Vendor the staged project, then `scan --mode hosted` over it: the
@@ -407,9 +411,9 @@ async fn hatch_vendored_to_hosted() {
 /// after the takeover reverted the vendored wiring. When it is unavailable
 /// the package is left on the unpatched registry release in both modes, so
 /// the run must fail loudly instead of reporting success.
-#[tokio::test]
-async fn uv_takeover_without_wheel_metadata_fails_loudly() {
-    let (_tmp, root) = project();
+/// A vendored uv project whose hosted wheel the API cannot serve.
+async fn stranded_uv_project() -> (tempfile::TempDir, std::path::PathBuf, MockServer) {
+    let (tmp, root) = project();
     std::fs::write(
         root.join("pyproject.toml"),
         "[project]\nname = \"demo\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\"]\n",
@@ -425,6 +429,12 @@ async fn uv_takeover_without_wheel_metadata_fails_loudly() {
     vendor_project(&root, &["uv.lock"]);
     let server = MockServer::start().await;
     mount_hosted_api(&server, false).await;
+    (tmp, root, server)
+}
+
+#[tokio::test]
+async fn uv_takeover_without_wheel_metadata_fails_loudly() {
+    let (_tmp, root, server) = stranded_uv_project().await;
     let (code, env) = hosted_scan(&root, &server);
     assert_eq!(code, 1, "a stranded takeover is a failure: {env:#}");
     assert_eq!(env["status"], "partial_failure", "{env:#}");
@@ -477,5 +487,75 @@ async fn drifted_vendored_line_refuses_takeover() {
     assert!(
         root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
         "the vendored artifact is kept"
+    );
+}
+
+/// Human output for a stranded takeover: no "Migrated … to hosted" progress
+/// line and no "keep the hosted patches" next steps, only the warning.
+#[tokio::test]
+async fn stranded_takeover_human_output_is_not_a_migration() {
+    let (_tmp, root, server) = stranded_uv_project().await;
+    let uri = server.uri();
+    let (code, stdout, stderr) = run_raw(&root, &hosted_scan_args(&uri), &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        !stderr.contains("Migrated pkg:pypi/six@1.16.0"),
+        "a stranded package is not reported migrated:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("keep the hosted patches") && !stdout.contains("Reinstall"),
+        "no next steps for a stranded takeover:\n{stdout}"
+    );
+    assert!(stderr.contains("UNPATCHED"), "{stderr}");
+}
+
+/// `--silent` keeps errors: the stranded takeover's exit 1 is explained.
+#[tokio::test]
+async fn stranded_takeover_is_reported_under_silent() {
+    let (_tmp, root, server) = stranded_uv_project().await;
+    let uri = server.uri();
+    let mut args = hosted_scan_args(&uri);
+    args.push("--silent");
+    let (code, stdout, stderr) = run_raw(&root, &args, &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("UNPATCHED") && stderr.contains("pkg:pypi/six@1.16.0"),
+        "the failure is diagnosable under --silent:\n{stderr}"
+    );
+}
+
+/// `--dry-run` predicts the drifted-wiring refusal instead of previewing a
+/// takeover the wet run would refuse.
+#[tokio::test]
+async fn dry_run_predicts_drifted_takeover_refusal() {
+    let (_tmp, root) = project();
+    std::fs::write(root.join("requirements.txt"), "idna==3.7\nsix==1.16.0\n").unwrap();
+    vendor_project(&root, &["requirements.txt"]);
+    let reqs = root.join("requirements.txt");
+    let vendored = std::fs::read_to_string(&reqs).unwrap();
+    let drifted = vendored.replacen(
+        "six-1.16.0-py3-none-any.whl",
+        "six-1.16.0-py3-none-any.whl ; python_version >= \"3\"",
+        1,
+    );
+    std::fs::write(&reqs, &drifted).unwrap();
+
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+    let mut args = hosted_scan_args(&uri);
+    args.push("--dry-run");
+    let (_, env) = run_cli(&root, &args, &[]);
+    let text = env.to_string();
+    assert!(
+        !text.contains("redirect_would_revert_vendored"),
+        "no takeover is previewed over drifted wiring: {env:#}"
+    );
+    assert!(text.contains("redirect_vendored_revert_failed"), "{env:#}");
+    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    assert_eq!(
+        std::fs::read_to_string(&reqs).unwrap(),
+        drifted,
+        "dry run writes nothing"
     );
 }
