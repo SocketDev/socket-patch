@@ -456,38 +456,41 @@ async fn pypi_egg_info_layout_handled() {
     let tmp = tempfile::tempdir().unwrap();
     let site = venv_site_packages(&tmp.path().join(".venv"), "python3.11");
     std::fs::create_dir_all(&site).unwrap();
-    // egg-info — older format. The crawler only recognizes `.dist-info`
-    // dirs, so the egg-info package is NOT discovered. Pin that current
-    // contract: scan exits cleanly (like the empty-site-packages case) and
-    // ships no PURL for it. If egg-info support is added later this fails
-    // loudly and the assertion should be flipped to `assert_discovered`.
-    let egg = site.join("legacy_pkg-1.0.0.egg-info");
+    // egg-info — the legacy layout pip < 23.1 writes for an sdist built
+    // without `wheel` (and distutils / distro packages write as a bare
+    // FILE). It is a real, importable install, so the crawler must report
+    // it (#447). Three shapes: a `-pyX.Y`-suffixed directory with
+    // `PKG-INFO`, a bare `.egg-info` file, and a directory whose PKG-INFO
+    // is missing (the filename carries the identity).
+    let egg = site.join("legacy_pkg-1.0.0-py3.11.egg-info");
     std::fs::create_dir_all(&egg).unwrap();
     std::fs::write(
         egg.join("PKG-INFO"),
         "Metadata-Version: 1.0\nName: legacy_pkg\nVersion: 1.0.0\n",
     )
     .unwrap();
+    std::fs::write(
+        site.join("distro_pkg-2.1.egg-info"),
+        "Metadata-Version: 1.1\nName: distro-pkg\nVersion: 2.1\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(site.join("bare_dir_pkg-0.3-py3.11.egg-info")).unwrap();
 
-    // Positive control in the SAME site-packages: a real `.dist-info`
-    // package the crawler must discover. Without it, the negative
-    // assertions below are vacuous — they pass even if the crawler never
-    // walked this directory at all (e.g. a regression that stops probing
-    // `.venv`). The control proves the dir WAS walked, so a missing
-    // `legacy_pkg` means egg-info was specifically not recognized, not that
-    // scanning silently no-op'd.
+    // A `.dist-info` sibling in the SAME site-packages: both layouts are
+    // listed side by side.
     write_dist_info(&site, "modern_sibling", "2.0.0");
 
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
     let res = scan_scrubbed(default_args(tmp.path(), server.uri())).await;
-    assert_eq!(res, 0, "egg-info layout must scan cleanly without crashing");
+    assert_eq!(res, 0, "egg-info layout must scan cleanly");
     let bodies = batch_bodies(&server).await;
-    // Control: proves the crawler genuinely walked this site-packages dir.
     assert_discovered(&bodies, "pkg:pypi/modern-sibling@2.0.0");
-    // Not discovered today; neither the canonical nor raw name may appear.
-    assert_not_discovered(&bodies, "pkg:pypi/legacy-pkg@1.0.0");
-    assert_not_discovered(&bodies, "pkg:pypi/legacy_pkg@1.0.0");
+    assert_discovered(&bodies, "pkg:pypi/legacy-pkg@1.0.0");
+    assert_discovered(&bodies, "pkg:pypi/distro-pkg@2.1");
+    assert_discovered(&bodies, "pkg:pypi/bare-dir-pkg@0.3");
+    // The `-pyX.Y` suffix is not part of the version.
+    assert_not_discovered(&bodies, "py3.11");
 }
 
 // ---------------------------------------------------------------------------

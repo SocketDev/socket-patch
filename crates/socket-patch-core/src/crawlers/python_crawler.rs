@@ -123,6 +123,59 @@ fn dist_info_dir_name_fallback(dist_info_path: &Path, is_dir: bool) -> Option<(S
     parse_dist_info_dir_name(&dir_name)
 }
 
+/// Read `Name` and `Version` for a legacy `.egg-info` entry: the layout
+/// pip < 23.1 writes when it builds an sdist without `wheel`
+/// (`setup.py install`), and the one distutils and distro packages
+/// (Debian's `python3-*`) ship. Two shapes:
+///
+/// * a DIRECTORY holding `PKG-INFO` (the same `Name:`/`Version:` header
+///   block as `METADATA`), falling back to the
+///   `<name>-<version>[-pyX.Y].egg-info` directory name like the
+///   `.dist-info` reader does;
+/// * a bare FILE that IS the `PKG-INFO` (distutils). It has no directory
+///   to vouch for it, so it counts only when its headers parse.
+pub async fn read_egg_info_metadata(egg_info_path: &Path) -> Option<(String, String)> {
+    if is_dir(egg_info_path).await {
+        let content = read_regular_to_string(&egg_info_path.join("PKG-INFO"))
+            .await
+            .ok();
+        return content
+            .and_then(|c| parse_metadata_text(&c))
+            .or_else(|| parse_egg_info_dir_name(&egg_info_path.file_name()?.to_string_lossy()));
+    }
+    // FIFO-safe like the METADATA read: the regular-file reader rejects
+    // FIFOs, devices and directories.
+    let content = read_regular_to_string(egg_info_path).await.ok()?;
+    parse_metadata_text(&content)
+}
+
+/// Blocking twin of [`read_egg_info_metadata`] for the walk-pool scan.
+fn read_egg_info_metadata_sync(egg_info_path: &Path) -> Option<(String, String)> {
+    if is_dir_sync(egg_info_path) {
+        let content = read_regular_to_string_sync(&egg_info_path.join("PKG-INFO")).ok();
+        return content
+            .and_then(|c| parse_metadata_text(&c))
+            .or_else(|| parse_egg_info_dir_name(&egg_info_path.file_name()?.to_string_lossy()));
+    }
+    let content = read_regular_to_string_sync(egg_info_path).ok()?;
+    parse_metadata_text(&content)
+}
+
+/// Derive `(name, version)` from a `<name>-<version>[-pyX.Y].egg-info`
+/// name. setuptools and distutils escape `-` to `_` in both the name and
+/// the version (`to_filename`), so the FIRST `-` ends the name and the
+/// second one (if any) starts the `-pyX.Y` interpreter tag.
+fn parse_egg_info_dir_name(dir_name: &str) -> Option<(String, String)> {
+    let base = dir_name.strip_suffix(".egg-info")?;
+    let mut parts = base.split('-');
+    let name = parts.next()?;
+    let version = parts.next()?;
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), version.to_string()))
+}
+
 /// The `Name`/`Version` header parse of a METADATA body (see
 /// [`parse_metadata_headers`]).
 fn parse_metadata_text(content: &str) -> Option<(String, String)> {
@@ -1565,10 +1618,13 @@ impl PythonCrawler {
     }
 }
 
-/// Scan a `site-packages` directory for `.dist-info` entries, returning
-/// `(canonicalized name, version)` for each package that yields metadata,
-/// in listing order. One blocking-pool task for the listing and every
-/// METADATA read, rather than a runtime hop per open, read and stat.
+/// Scan a `site-packages` directory for installed distributions — the
+/// `.dist-info` entries wheels install, and the legacy `.egg-info`
+/// entries an sdist built without `wheel`, distutils or a distro package
+/// leaves — returning `(canonicalized name, version)` for each one that
+/// yields metadata, in listing order. One blocking-pool task for the
+/// listing and every metadata read, rather than a runtime hop per open,
+/// read and stat.
 pub(crate) async fn list_dist_info_packages(site_packages_path: &Path) -> Vec<(String, String)> {
     let site_packages_path = site_packages_path.to_path_buf();
     run_blocking(move || list_dist_info_packages_sync(&site_packages_path)).await
@@ -1576,21 +1632,20 @@ pub(crate) async fn list_dist_info_packages(site_packages_path: &Path) -> Vec<(S
 
 /// Blocking body of [`list_dist_info_packages`].
 fn list_dist_info_packages_sync(site_packages_path: &Path) -> Vec<(String, String)> {
-    let dist_infos: Vec<PathBuf> = list_dir_sync(site_packages_path)
+    list_dir_sync(site_packages_path)
         .into_iter()
         .filter_map(|entry| {
             let name_str = entry.name.to_string_lossy();
-            name_str
-                .ends_with(".dist-info")
-                .then(|| site_packages_path.join(&*name_str))
+            let path = site_packages_path.join(&*name_str);
+            if name_str.ends_with(".dist-info") {
+                read_python_metadata_sync(&path)
+            } else if name_str.ends_with(".egg-info") {
+                read_egg_info_metadata_sync(&path)
+            } else {
+                None
+            }
         })
-        .collect();
-    dist_infos
-        .iter()
-        .filter_map(|dist_info_path| {
-            read_python_metadata_sync(dist_info_path)
-                .map(|(raw_name, version)| (canonicalize_pypi_name(&raw_name), version))
-        })
+        .map(|(raw_name, version)| (canonicalize_pypi_name(&raw_name), version))
         .collect()
 }
 
@@ -2246,6 +2301,62 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dist_info = dir.path().join("nonexistent.dist-info");
         assert!(read_python_metadata(&dist_info).await.is_none());
+    }
+
+    #[test]
+    fn test_parse_egg_info_dir_name() {
+        assert_eq!(
+            parse_egg_info_dir_name("six-1.16.0-py3.11.egg-info"),
+            Some(("six".into(), "1.16.0".into()))
+        );
+        assert_eq!(
+            parse_egg_info_dir_name("Flask_SQLAlchemy-3.0.5.egg-info"),
+            Some(("Flask_SQLAlchemy".into(), "3.0.5".into()))
+        );
+        assert!(parse_egg_info_dir_name("noversion.egg-info").is_none());
+        assert!(parse_egg_info_dir_name("-1.0.egg-info").is_none());
+        assert!(parse_egg_info_dir_name("six-1.16.0.dist-info").is_none());
+    }
+
+    /// Legacy `.egg-info` installs (#447): a `PKG-INFO` directory, a
+    /// headerless directory (named fallback), and a bare distutils FILE are
+    /// installs; a bare file without headers is not.
+    #[tokio::test]
+    async fn egg_info_entries_are_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sp = dir.path();
+        let egg = sp.join("six-1.16.0-py3.11.egg-info");
+        tokio::fs::create_dir_all(&egg).await.unwrap();
+        tokio::fs::write(egg.join("PKG-INFO"), "Name: six\nVersion: 1.16.0\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(sp.join("zope.interface-5.4.0-py3.11.egg-info"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            sp.join("PyGObject-3.48.2.egg-info"),
+            "Metadata-Version: 1.1\nName: PyGObject\nVersion: 3.48.2\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(sp.join("ghost-1.0.egg-info"), "not metadata")
+            .await
+            .unwrap();
+        let mut listed = list_dist_info_packages(sp).await;
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec![
+                ("pygobject".to_string(), "3.48.2".to_string()),
+                ("six".to_string(), "1.16.0".to_string()),
+                ("zope-interface".to_string(), "5.4.0".to_string()),
+            ]
+        );
+        let found = PythonCrawler::new()
+            .find_by_purls(sp, &["pkg:pypi/six@1.16.0".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(found["pkg:pypi/six@1.16.0"].path, sp);
     }
 
     #[test]
