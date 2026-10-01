@@ -1,0 +1,77 @@
+name: bughunt-deno
+on:
+  push:
+    branches: ['bughunt/deno/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        deno: ['1.46.3', '2.0.6', '2.2.15', '2.4.5', '2.9.6']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: false
+      - run: cargo build -p socket-patch-cli
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: ${{ matrix.deno }}
+      - name: probe
+        env:
+          DV: ${{ matrix.deno }}
+        run: |
+          set +e +o pipefail; set -u
+          SP="$GITHUB_WORKSPACE/target/debug/socket-patch"; [ -f "$SP.exe" ] && SP="$SP.exe"
+          W="$RUNNER_TEMP/w"; mkdir -p "$W/tool" "$W/cwd"
+          if [ "$RUNNER_OS" = Windows ]; then PY=python; else PY=python3; fi
+          res() { echo "RESULT ${{ matrix.os }} deno=$DV $1"; }
+          cat > "$W/mkman.py" <<'PY'
+          import sys,os,json,hashlib
+          def gh(b): return hashlib.sha256(b"blob %d\0"%len(b)+b).hexdigest()
+          root,src=sys.argv[1],sys.argv[2]; m={"patches":{}}
+          os.makedirs(f"{root}/.socket/blobs",exist_ok=True)
+          b=open(src,"rb").read(); a=b+b"\n;console.log('SP-PATCHED');\n"
+          for x in (b,a): open(f"{root}/.socket/blobs/{gh(x)}","wb").write(x)
+          m["patches"]["pkg:npm/is-odd@3.0.1"]={"uuid":"11111111-1111-4111-8111-111111111111","exportedAt":"2026-01-01T00:00:00Z","files":{"package/index.js":{"beforeHash":gh(b),"afterHash":gh(a)}},"vulnerabilities":{"GHSA-xxxx-xxxx-xxxx":{"cves":["CVE-2099-0001"],"summary":"t","severity":"high","description":"t"}},"description":"t","license":"MIT","tier":"free"}
+          json.dump(m,open(f"{root}/.socket/manifest.json","w"),indent=2)
+          PY
+          ev() { $PY -c "import json,sys;d=json.load(sys.stdin);print(d.get('status'),[(e.get('action'),e.get('errorCode')) for e in d.get('events',[])])" 2>&1; }
+          export DENO_DIR="$W/dd" DENO_INSTALL_ROOT="$W/root"
+          printf 'import isOdd from "npm:is-odd@3.0.1";\nconsole.log("isOdd(3)=" + isOdd(3));\n' > "$W/tool/t.ts"
+          deno install -g -A -f -n sptool "$W/tool/t.ts" 2>&1 | tail -2 || deno install -A -f -n sptool "$W/tool/t.ts" 2>&1 | tail -2
+          ls -la "$W/root/bin"
+          runtool() { if [ "$RUNNER_OS" = Windows ]; then cmd.exe //c "$(cygpath -w "$W/root/bin/sptool.cmd")" 2>&1; else "$W/root/bin/sptool" 2>&1; fi; }
+          echo "--- tool:"; runtool
+          echo "--- copies of is-odd:"; find "$W" -path '*is-odd*' -name index.js
+          echo "--- resolved:"; DENO_LOG=debug runtool | grep -E "Resolved package folder of is-odd|code cache.*is-odd" | head -2
+          REG="$W/dd/npm/registry.npmjs.org"; [ -d "$REG/is-odd/3.0.1" ] && res "deno-dir-copy present" || res "deno-dir-copy ABSENT"
+          [ -d "$W/root/bin/.sptool/node_modules" ] && res "per-tool-node_modules present" || res "per-tool-node_modules absent"
+          cd "$W/cwd"; git init -q .; $PY "$W/mkman.py" . "$REG/is-odd/3.0.1/index.js"
+          o=$("$SP" apply -g --offline --json | ev); echo "$o"; case "$o" in *applied*) res "apply-g found";; *) res "apply-g NOTFOUND $o";; esac
+          r=$(runtool); case "$r" in *SP-PATCHED*) res "apply-g tool-patched";; *) res "apply-g tool-UNPATCHED";; esac
+          o=$("$SP" scan -g -e npm --json 2>/dev/null | $PY -c "import json,sys;d=json.load(sys.stdin);print(d.get('status'),d.get('scannedPackages'))"); res "scan-g npm: $o"
+          for P in "$REG" "$W/dd/npm" "$W/dd"; do
+            o=$("$SP" apply --global-prefix "$P" --offline --json | ev); case "$o" in *applied*) res "apply-prefix $(basename "$P") found";; *) res "apply-prefix $(basename "$P") NOTFOUND $o";; esac
+          done
+          if [ -d "$W/root/bin/.sptool/node_modules" ]; then
+            PT="$W/root/bin/.sptool/node_modules"
+            o=$("$SP" apply --global-prefix "$PT" --offline --json | ev); echo "$o"
+            case "$o" in *applied*) res "apply-pertool reported-applied";; *) res "apply-pertool not-applied $o";; esac
+            r=$(runtool); echo "$r"; case "$r" in *SP-PATCHED*) res "apply-pertool tool-patched";; *) res "apply-pertool tool-UNPATCHED (Deno runs the DENO_DIR copy)";; esac
+            v=$("$SP" vex --global-prefix "$PT" --offline --json --output v.json --product pkg:generic/t | ev); res "vex-pertool: $v"
+            [ -f v.json ] && $PY -c "import json;d=json.load(open('v.json'));print([(s['vulnerability']['name'],s['status']) for s in d['statements']])"
+            "$SP" rollback --global-prefix "$PT" --offline --json > /dev/null
+          fi
+          exit 0
