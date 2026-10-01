@@ -76,7 +76,6 @@ jobs:
                   self.send(404,{})
           ThreadingHTTPServer(('127.0.0.1',18999),H).serve_forever()
           PY
-          sed -i.bak 's/^          //' mock.py
           python mock.py & sleep 3
           sp(){ (cd "$W/empty" && SOCKET_NO_CONFIG=true "$BIN" "$@" --api-url http://127.0.0.1:18999 --api-token fake --org org --no-telemetry); }
           has(){ grep -q 'SOCKET-PATCHED' "$1" && echo PATCHED || echo UNPATCHED; }
