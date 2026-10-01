@@ -145,18 +145,32 @@ struct GemPrelude {
 /// asks this BEFORE it reverts a live hosted pin, so a refused gem keeps
 /// its hosted wiring instead of ending up unpatched in both modes.
 pub async fn gem_manifest_refusal(project_root: &Path) -> Option<(&'static str, String)> {
+    use crate::formats::gem::manifest::LoadedManifest;
     let loaded = crate::formats::gem::manifest::loaded_manifest(project_root).await;
     let gems_rb_present = tokio::fs::symlink_metadata(project_root.join("gems.rb"))
         .await
         .is_ok();
     match loaded.pair(gems_rb_present) {
         Some((GEMFILE, GEMFILE_LOCK)) => None,
+        // A `gems.rb` twin is refused whatever bundler runs: bundler >= 2
+        // loads `gems.rb` (with a "Multiple gemfiles" warning) while 1.x
+        // still reads the Gemfile first, so wiring the Gemfile is only
+        // right on a bundler this backend cannot see.
+        Some((manifest, lock)) if matches!(loaded, LoadedManifest::Default) => Some((
+            "gemfile_not_loaded",
+            format!(
+                "a {manifest} sits beside the Gemfile and bundler >= 2 loads {manifest} + \
+                 {lock} instead of the Gemfile + Gemfile.lock pair vendored mode wires (a \
+                 gems.rb project cannot vendor yet); use hosted mode, or remove gems.rb / \
+                 gems.locked if the Gemfile is the real manifest"
+            ),
+        )),
         Some((manifest, lock)) => Some((
             "gemfile_not_loaded",
             format!(
-                "bundler loads {manifest} + {lock}, not the Gemfile + Gemfile.lock pair \
-                 vendored mode wires (a gems.rb project cannot vendor yet); use hosted \
-                 mode, or remove gems.rb / gems.locked if the Gemfile is the real manifest"
+                "BUNDLE_GEMFILE makes bundler load {manifest} + {lock}, not the Gemfile + \
+                 Gemfile.lock pair vendored mode wires (a gems.rb project cannot vendor yet); \
+                 use hosted mode"
             ),
         )),
         None => Some((

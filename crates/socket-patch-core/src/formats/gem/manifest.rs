@@ -10,7 +10,9 @@
 //! 2. `BUNDLE_GEMFILE:` in the app config file, `$BUNDLE_APP_CONFIG/config`
 //!    else `<root>/.bundle/config` (what `bundle config set --local gemfile
 //!    Gemfile.next` writes; relative to the project root);
-//! 3. otherwise `gems.rb` when present, else `Gemfile`.
+//! 3. otherwise `gems.rb` when present, else `Gemfile` (bundler >= 2; 1.x
+//!    reads a `Gemfile` first, so callers treat a twin as ambiguous or
+//!    follow the >= 2 order, as the hosted rewriter does).
 //!
 //! A configured value that names the root's own `Gemfile` or `gems.rb` is
 //! that spelling; anything else (`Gemfile.next`, a file in another
@@ -49,7 +51,7 @@ impl GemfileSetting {
 /// The manifest Bundler loads for a project root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadedManifest {
-    /// No `BUNDLE_GEMFILE`: Bundler's default discovery (`gems.rb` first,
+    /// No `BUNDLE_GEMFILE`: Bundler's default discovery (bundler >= 2: `gems.rb` first,
     /// then `Gemfile`), which callers apply to the files they see.
     Default,
     /// `BUNDLE_GEMFILE` names the root's own `Gemfile` or `gems.rb`.

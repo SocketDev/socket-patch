@@ -1447,11 +1447,11 @@ fn staged_rack_project(
     Some((tmp, proj, bundler, purl))
 }
 
-/// Run `vendor` on a project where bundler loads a manifest other than the
-/// Gemfile, and assert the refusal: a `gemfile_not_loaded` failure for the
+/// Run `vendor` on a project whose manifest choice vendored mode cannot
+/// follow (`loaded` is what the host bundler loads), and assert the refusal: a `gemfile_not_loaded` failure for the
 /// gem, and every manifest and lock byte-untouched.
 fn assert_vendor_refuses_unloaded_gemfile(proj: &Path, purl: &str, loaded: &str, files: &[&str]) {
-    // The premise: real bundler loads `loaded`, not the Gemfile.
+    // The premise: the host bundler loads `loaded`.
     let probe = bundle(
         proj,
         &["exec", "ruby", "-e", "puts Bundler.default_gemfile"],
@@ -1512,15 +1512,22 @@ fn assert_vendor_refuses_unloaded_gemfile(proj: &Path, purl: &str, loaded: &str,
 #[ignore = "host capstone: shells out to a real bundler >= 1.17; the unpinned `test` job \
             skips it, the e2e job runs it with a pinned toolchain via --ignored"]
 fn gem_vendor_refuses_a_gems_rb_twin() {
-    let Some((_tmp, proj, _bundler, purl)) = staged_rack_project("gems.rb twin") else {
+    let Some((_tmp, proj, bundler, purl)) = staged_rack_project("gems.rb twin") else {
         return;
     };
     std::fs::copy(proj.join("Gemfile"), proj.join("gems.rb")).unwrap();
     std::fs::copy(proj.join("Gemfile.lock"), proj.join("gems.locked")).unwrap();
+    // bundler >= 2 loads gems.rb; 1.x still reads the Gemfile first. The
+    // twin is refused either way (vendor cannot tell which bundler runs).
+    let loaded = if bundler.at_least(2, 0) {
+        "gems.rb"
+    } else {
+        "Gemfile"
+    };
     assert_vendor_refuses_unloaded_gemfile(
         &proj,
         &purl,
-        "gems.rb",
+        loaded,
         &["Gemfile", "Gemfile.lock", "gems.rb", "gems.locked"],
     );
 }
