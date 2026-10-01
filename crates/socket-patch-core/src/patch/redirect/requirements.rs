@@ -7,14 +7,14 @@ use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::purl::percent_decode_purl_component;
 
-struct LogicalRequirement {
-    original: String,
-    text: String,
-    ending: String,
-    unterminated: bool,
+pub(super) struct LogicalRequirement {
+    pub(super) original: String,
+    pub(super) text: String,
+    pub(super) ending: String,
+    pub(super) unterminated: bool,
 }
 
-fn logical_requirements(content: &str) -> Vec<LogicalRequirement> {
+pub(super) fn logical_requirements(content: &str) -> Vec<LogicalRequirement> {
     let physical: Vec<&str> = content.split_inclusive('\n').collect();
     let mut requirements = Vec::new();
     let mut index = 0;
@@ -62,7 +62,7 @@ fn logical_requirements(content: &str) -> Vec<LogicalRequirement> {
     requirements
 }
 
-fn unquoted_index(text: &str, target: char, after_whitespace: bool) -> Option<usize> {
+pub(super) fn unquoted_index(text: &str, target: char, after_whitespace: bool) -> Option<usize> {
     let mut quote = None;
     let mut escaped = false;
     let mut previous = None;
@@ -87,7 +87,7 @@ fn unquoted_index(text: &str, target: char, after_whitespace: bool) -> Option<us
     None
 }
 
-fn requirement_tokens(text: &str) -> Vec<&str> {
+pub(super) fn requirement_tokens(text: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
     let mut start = None;
     let mut quote = None;
@@ -207,6 +207,10 @@ pub(super) fn rewrite(
             .or_default()
             .insert(&dep.version);
     }
+    // pip's hash-checking mode is all or nothing (#376): pin the patched
+    // artifact with `--hash` only when the file already carries hashes
+    // (the replaced pin's own included), else by the url fragment.
+    let hashed = crate::utils::requirements::requires_hashes(content);
     let mut changed = false;
     for dep in overrides.iter().filter(|dep| dep.ecosystem == "pypi") {
         let Some(sha256) = &dep.integrity.sha256 else {
@@ -265,7 +269,9 @@ pub(super) fn rewrite(
                 }
             }
             matched = true;
-            result.confirmed_requirements_uuids.insert(dep.patch_uuid.clone());
+            result
+                .confirmed_requirements_uuids
+                .insert(dep.patch_uuid.clone());
             let options = requirement_tokens(specifier)
                 .into_iter()
                 .skip_while(|token| !token.starts_with("--"))
@@ -285,14 +291,28 @@ pub(super) fn rewrite(
             } else {
                 ""
             };
-            let mut rewritten = format!("{bom}{indent}{}{extras} @ {}", dep.name, dep.artifact_url);
+            // Unhashed file: the url's `#sha256=` fragment, which pip
+            // verifies without turning hash-checking mode on.
+            let location = if hashed {
+                dep.artifact_url.clone()
+            } else {
+                let separator = if dep.artifact_url.contains('#') {
+                    '&'
+                } else {
+                    '#'
+                };
+                format!("{}{separator}sha256={sha256}", dep.artifact_url)
+            };
+            let mut rewritten = format!("{bom}{indent}{}{extras} @ {location}", dep.name);
             for suffix in [marker.trim(), options.as_str()] {
                 if !suffix.is_empty() {
                     rewritten.push(' ');
                     rewritten.push_str(suffix);
                 }
             }
-            rewritten.push_str(&format!(" --hash=sha256:{sha256}"));
+            if hashed {
+                rewritten.push_str(&format!(" --hash=sha256:{sha256}"));
+            }
             if !comment.is_empty() {
                 rewritten.push(' ');
                 rewritten.push_str(comment);
@@ -351,7 +371,6 @@ mod tests {
                 sha256: Some(HASH.into()),
                 ..Default::default()
             },
-            berry_zip_url: None,
             registry_override: None,
         }
     }
@@ -427,7 +446,7 @@ mod tests {
             let result = rewrite_registry_redirect(&input(&source), &[patch()]);
             assert_eq!(
                 result.files["requirements.txt"],
-                format!("{prefix}# documentation \\\nrequests @ {URL} --hash=sha256:{HASH}\n")
+                format!("{prefix}# documentation \\\nrequests @ {URL}#sha256={HASH}\n")
             );
         }
     }
@@ -486,7 +505,7 @@ mod tests {
         other.artifact_url = URL.replace("2.28.1", "2.32.0");
         other.integrity.sha256 = Some("d".repeat(64));
         let expected = format!(
-            "requests @ {URL} ; python_version < '3.10' --hash=sha256:{HASH}\nrequests @ {} ; python_version >= '3.10' --hash=sha256:{}\n",
+            "requests @ {URL}#sha256={HASH} ; python_version < '3.10'\nrequests @ {}#sha256={} ; python_version >= '3.10'\n",
             other.artifact_url,
             "d".repeat(64)
         );
@@ -525,9 +544,53 @@ mod tests {
             let result = rewrite_registry_redirect(&input(source), &[patch()]);
             assert_eq!(
                 result.files["requirements.txt"],
-                format!("requests @ {URL} --hash=sha256:{HASH}")
+                format!("requests @ {URL}#sha256={HASH}")
             );
         }
+    }
+
+    /// #376: an unhashed requirements file must stay unhashed. pip turns
+    /// hash-checking mode on for the WHOLE install as soon as one line has a
+    /// `--hash`, so pinning only the patched line breaks every other
+    /// requirement (and every transitive dependency). The patched sha256
+    /// rides in the url's `#sha256=` fragment instead, which pip verifies
+    /// without turning the mode on.
+    #[test]
+    fn unhashed_file_pins_the_artifact_by_url_fragment_not_hash_option() {
+        let source = "requests==2.28.1\nidna==3.7\n";
+        let result = rewrite_registry_redirect(&input(source), &[patch()]);
+        let expected = format!("requests @ {URL}#sha256={HASH}\nidna==3.7\n");
+        assert_eq!(result.files["requirements.txt"], expected);
+        assert!(!result.files["requirements.txt"].contains("--hash"));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        // Idempotent: the rewritten line keeps the file unhashed.
+        let rerun = rewrite_registry_redirect(&input(&expected), &[patch()]);
+        assert!(rerun.files.is_empty() && rerun.edits.is_empty());
+    }
+
+    /// #376: a file the user already hashes keeps `--hash` on the patched
+    /// line (hash-checking mode is on either way), whether the hashes sit on
+    /// another requirement or the file sets `--require-hashes`.
+    #[test]
+    fn hashed_file_keeps_the_hash_option() {
+        for other in [
+            "idna==3.7 --hash=sha256:aaaa\n",
+            "idna==3.7 \\\n    --hash sha512:bbbb\n",
+            "--require-hashes\nidna==3.7\n",
+        ] {
+            let source = format!("requests==2.28.1\n{other}");
+            let result = rewrite_registry_redirect(&input(&source), &[patch()]);
+            assert_eq!(
+                result.files["requirements.txt"],
+                format!("requests @ {URL} --hash=sha256:{HASH}\n{other}"),
+                "{other:?}"
+            );
+        }
+        // A hash in a comment, or a url fragment, is not a hash option.
+        let source = "requests==2.28.1\n# idna==3.7 --hash=sha256:aaaa\nsix @ https://files.pythonhosted.org/six-1.16.0-py2.py3-none-any.whl#sha256=dd\n";
+        let result = rewrite_registry_redirect(&input(source), &[patch()]);
+        assert!(result.files["requirements.txt"]
+            .starts_with(&format!("requests @ {URL}#sha256={HASH}\n")));
     }
 
     #[test]
@@ -549,7 +612,7 @@ mod tests {
         let result = rewrite_registry_redirect(&input("requests\n"), &[patch()]);
         assert_eq!(
             result.files["requirements.txt"],
-            format!("requests @ {URL} --hash=sha256:{HASH}\n")
+            format!("requests @ {URL}#sha256={HASH}\n")
         );
         let mut other = patch();
         other.version = "2.32.0".into();

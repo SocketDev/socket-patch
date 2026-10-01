@@ -19,3 +19,12 @@ where
 {
     map.iter().collect::<BTreeMap<_, _>>().serialize(serializer)
 }
+
+/// Strip a leading UTF-8 BOM. npm and Node tolerate (and strip) a BOM in
+/// package.json, and cargo accepts one in Cargo.toml — files saved by Windows
+/// editors commonly carry one — but serde_json (and vex's TOML line scanner)
+/// reject it, so every parse of user-supplied manifest content must go through
+/// this first or toolchain-valid manifests error out.
+pub(crate) fn strip_bom(content: &str) -> &str {
+    content.strip_prefix('\u{feff}').unwrap_or(content)
+}

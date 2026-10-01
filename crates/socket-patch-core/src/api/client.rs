@@ -332,6 +332,21 @@ fn retry_after_secs(headers: &HeaderMap) -> Option<Duration> {
 /// without a hint).
 type VendorAttemptError = (ApiError, Option<Option<Duration>>);
 
+/// Most UUIDs the package-reference endpoint takes in one request.
+pub(crate) const MAX_REFERENCE_BATCH: usize = 500;
+
+/// Why a pypi reference is refused before its download: the served
+/// artifact is not a wheel.
+pub(crate) const PYPI_NOT_A_WHEEL: &str =
+    "the prebuilt artifact is not a supported Python distribution (.whl, .tar.gz, .tgz, .zip)";
+
+/// The last path segment of a serve URL, when it names a `.whl`.
+pub(crate) fn wheel_filename_from_url(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let name = path.rsplit('/').next().unwrap_or("");
+    crate::vendor::pypi_distribution::supported(name).then(|| name.to_string())
+}
+
 /// Body payload for the batch search POST endpoint.
 #[derive(Serialize)]
 struct BatchSearchBody {
@@ -738,10 +753,11 @@ impl ApiClient {
     }
 
     /// Resolve hosted-patch references for a set of published-patch UUIDs
-    /// (`scan --redirect`). Uses the authenticated
+    /// (hosted-mode `scan`, the default for a bare `scan`). Uses the authenticated
     /// `POST /v0/orgs/{org}/patches/package` when a token+org are set, else the
-    /// public proxy `POST /patch/package` (free patches only). Returns a
-    /// UUID → reference map (missing/404 → empty).
+    /// public proxy `POST /patch/package` (free patches only), in requests
+    /// of at most [`MAX_REFERENCE_BATCH`] UUIDs (the endpoint rejects more).
+    /// Returns a UUID → reference map (missing/404 → empty).
     ///
     /// Uses the client's configured org slug; see
     /// [`Self::fetch_registry_references_for_org`] for a per-call override.
@@ -765,14 +781,18 @@ impl ApiClient {
             return Ok(std::collections::HashMap::new());
         }
         let path = self.patches_path(org_slug, "package");
-        let body = PackageVendorRequest {
-            uuids: uuids.to_vec(),
-            free_only: None,
-        };
-        let resp = self
-            .post_json::<PackageVendorResponse, _>(&path, &body)
-            .await?;
-        Ok(resp.map(|r| r.results).unwrap_or_default())
+        let mut results = std::collections::HashMap::new();
+        for chunk in uuids.chunks(MAX_REFERENCE_BATCH) {
+            let body = PackageVendorRequest {
+                uuids: chunk.to_vec(),
+                free_only: None,
+            };
+            let resp = self
+                .post_json::<PackageVendorResponse, _>(&path, &body)
+                .await?;
+            results.extend(resp.map(|r| r.results).unwrap_or_default());
+        }
+        Ok(results)
     }
 
     /// Internal: POST the batch search to the public proxy's
@@ -1306,6 +1326,15 @@ impl ApiClient {
             },
             None => download_url.to_string(),
         };
+        // Reject unsupported distribution names before downloading.
+        if result
+            .purl
+            .as_deref()
+            .is_some_and(|purl| purl.starts_with("pkg:pypi/"))
+            && wheel_filename_from_url(&download_url).is_none()
+        {
+            return done(VendorServiceOutcome::Unavailable(PYPI_NOT_A_WHEEL.into()));
+        }
 
         // Surface the OTHER served artifacts (e.g. the gem path-source stub
         // gemspec) — their host-rewritten URL + normalized sha512 — so a
@@ -1341,6 +1370,11 @@ impl ApiClient {
         match self.download_vendor_archive_retrying(&download_url).await {
             (ServeDownload::Ok(bytes), _) => {
                 done(VendorServiceOutcome::Ready(FetchedVendorPackage {
+                    yarn_berry10c0: result
+                        .artifacts
+                        .as_ref()
+                        .and_then(|arts| arts.iter().find(|a| a.kind == "yarn-berry-zip"))
+                        .and_then(|a| a.integrity.yarn_berry10c0.clone()),
                     tarball: bytes,
                     integrity_sri,
                     dirhash_h1: artifact.integrity.dirhash_h1.clone(),
@@ -1398,21 +1432,54 @@ impl ApiClient {
 
     /// Step 1 of [`Self::fetch_vendor_package`], retried per the client's
     /// [`VendorRetryPolicy`]. `Err` carries whether the final failure was a
-    /// retryable (availability) one.
+    /// retryable (availability) one. A uuid the attached plan names is
+    /// answered from the plan's one reference batch (see
+    /// [`VendorPrefetch::reference`]).
     async fn request_vendor_package(
         &self,
         uuid: &str,
         free_only: bool,
         vendor_url: Option<&str>,
     ) -> Result<PackageVendorResult, (ApiError, bool)> {
+        let plan = self
+            .vendor_prefetch
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(plan) = plan {
+            if let Some(result) = plan.reference(self, uuid, free_only, vendor_url).await {
+                return result;
+            }
+        }
+        let mut results = self
+            .request_vendor_references(&[uuid.to_string()], free_only, vendor_url)
+            .await?;
+        results.remove(uuid).ok_or_else(|| {
+            (
+                ApiError::Other(format!("package response missing a result for {uuid}")),
+                false,
+            )
+        })
+    }
+
+    /// One package-reference request for `uuids` (at most
+    /// [`MAX_REFERENCE_BATCH`]), retried per the client's
+    /// [`VendorRetryPolicy`]: the per-uuid results. `Err` carries whether
+    /// the final failure was a retryable (availability) one.
+    pub(crate) async fn request_vendor_references(
+        &self,
+        uuids: &[String],
+        free_only: bool,
+        vendor_url: Option<&str>,
+    ) -> Result<std::collections::HashMap<String, PackageVendorResult>, (ApiError, bool)> {
         let attempts = self.vendor_retry.attempts.max(1);
         let mut attempt = 1;
         loop {
             match self
-                .request_vendor_package_once(uuid, free_only, vendor_url)
+                .request_vendor_references_once(uuids, free_only, vendor_url)
                 .await
             {
-                Ok(result) => return Ok(result),
+                Ok(results) => return Ok(results),
                 Err((e, Some(retry_after))) if attempt < attempts => {
                     debug_log(&format!(
                         "vendor package request attempt {attempt} failed: {e}"
@@ -1425,15 +1492,15 @@ impl ApiClient {
         }
     }
 
-    /// One package-reference POST: the single requested UUID's result.
-    async fn request_vendor_package_once(
+    /// One package-reference POST: the requested UUIDs' results.
+    async fn request_vendor_references_once(
         &self,
-        uuid: &str,
+        uuids: &[String],
         free_only: bool,
         vendor_url: Option<&str>,
-    ) -> Result<PackageVendorResult, VendorAttemptError> {
+    ) -> Result<std::collections::HashMap<String, PackageVendorResult>, VendorAttemptError> {
         let body = PackageVendorRequest {
-            uuids: vec![uuid.to_string()],
+            uuids: uuids.to_vec(),
             // Only send freeOnly when forcing it (the public-proxy contract);
             // the authenticated endpoint defaults to false.
             free_only: free_only.then_some(true),
@@ -1481,12 +1548,7 @@ impl ApiClient {
                     hint,
                 )
             })?;
-            return parsed.results.get(uuid).cloned().ok_or_else(|| {
-                (
-                    ApiError::Other(format!("package response missing a result for {uuid}")),
-                    None,
-                )
-            });
+            return Ok(parsed.results);
         }
         // 429 classifies as RateLimited but is still retried (the hint);
         // 401/403 carry no hint.
@@ -1728,6 +1790,7 @@ pub(crate) const MAX_VENDOR_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 /// `h1:` dirhash) before writing/extracting.
 #[derive(Debug, Clone)]
 pub(crate) struct FetchedVendorPackage {
+    pub yarn_berry10c0: Option<String>,
     pub tarball: Vec<u8>,
     /// Normalized Subresource-Integrity string, always `sha512-<b64>`.
     pub integrity_sri: String,
@@ -1890,8 +1953,7 @@ fn rewrite_url_host(original: &str, new_base: &str) -> Result<String, ApiError> 
 /// Explicit overrides for environment-based API client construction.
 ///
 /// Each `Some(value)` wins over the corresponding env var; `None` falls
-/// back to env-var lookup (with the legacy `SOCKET_PATCH_*` shim where
-/// applicable).
+/// back to env-var lookup.
 #[derive(Debug, Clone, Default)]
 pub struct ApiClientEnvOverrides {
     pub api_url: Option<String>,
@@ -1919,7 +1981,7 @@ pub struct ApiClientEnvOverrides {
 /// |---|---|
 /// | `SOCKET_API_URL` | Override the API URL (default `https://api.socket.dev`; socket-cli config `apiBaseUrl` sits between) |
 /// | `SOCKET_API_TOKEN` | API token for authenticated access (socket-cli config `apiToken` is the fallback) |
-/// | `SOCKET_PROXY_URL` | Override the public proxy URL (default `https://patches-api.socket.dev`). Legacy: `SOCKET_PATCH_PROXY_URL`. |
+/// | `SOCKET_PROXY_URL` | Override the public proxy URL (default `https://patches-api.socket.dev`) |
 /// | `SOCKET_ORG_SLUG` | Organization slug (socket-cli config `defaultOrg` is the fallback) |
 /// | `SOCKET_NO_API_TOKEN` | Truthy: ignore ambient tokens (env + config); only an explicit override authenticates |
 /// | `SOCKET_NO_CONFIG` | Truthy: disable the socket-cli config fallback layer entirely |
@@ -2468,8 +2530,9 @@ fn convert_search_result_to_batch_info(patch: PatchSearchResult) -> BatchPatchIn
         severity: highest_severity,
         title,
         // Carry the timestamp through. The batch shape does not require it,
-        // but dropping it here would cost this path the recency tiebreak in
-        // `ranking` — and it is the one path where we definitely have it.
+        // but dropping it here would cost this path its recency ordering in
+        // `ranking` (the tiebreak after severity and advisory count) — and
+        // it is the one path where we definitely have it.
         published_at: Some(patch.published_at),
     }
 }
@@ -3116,9 +3179,7 @@ mod tests {
     fn binary_url_rederives_proxy_from_env_when_org_slug_missing() {
         const HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         let saved_proxy = std::env::var("SOCKET_PROXY_URL").ok();
-        let saved_legacy = std::env::var("SOCKET_PATCH_PROXY_URL").ok();
         std::env::set_var("SOCKET_PROXY_URL", "http://env-proxy.test:9999/");
-        std::env::remove_var("SOCKET_PATCH_PROXY_URL");
 
         let client = ApiClient::new(ApiClientOptions {
             api_url: "https://api.socket.dev".into(),
@@ -3128,17 +3189,13 @@ mod tests {
         });
         let (env_url, env_use_auth) = client.binary_url("blob", HASH);
 
-        // With the vars unset the base falls back to the built-in default.
+        // With the var unset the base falls back to the built-in default.
         std::env::remove_var("SOCKET_PROXY_URL");
         let (default_url, default_use_auth) = client.binary_url("blob", HASH);
 
         match saved_proxy {
             Some(v) => std::env::set_var("SOCKET_PROXY_URL", v),
             None => std::env::remove_var("SOCKET_PROXY_URL"),
-        }
-        match saved_legacy {
-            Some(v) => std::env::set_var("SOCKET_PATCH_PROXY_URL", v),
-            None => std::env::remove_var("SOCKET_PATCH_PROXY_URL"),
         }
 
         assert_eq!(
@@ -3348,9 +3405,8 @@ mod tests {
 
     #[test]
     fn test_convert_moderate_outranks_low() {
-        // Regression: `moderate` (GHSA medium tier) used to rank below
-        // `low`, so a moderate+low patch reported `low` as its highest
-        // severity.
+        // `moderate` (GHSA medium tier) must outrank `low`, so a
+        // moderate+low patch reports `moderate` as its highest severity.
         let mut vulns = HashMap::new();
         vulns.insert(
             "GHSA-1111".into(),
@@ -3698,9 +3754,8 @@ mod tests {
     #[test]
     fn validate_token_shape_redacts_by_chars_not_bytes() {
         // Regression: the preview tail and the "(N chars)" count must be
-        // measured in *characters*, not bytes. A multi-byte token used to be
-        // sized with `token.len()` (bytes), which over-reported the length
-        // and mis-sliced the "last 4 chars" tail.
+        // measured in *characters*, not bytes: `token.len()` (bytes) would
+        // over-report the length and mis-slice the "last 4 chars" tail.
         //
         // 1 multi-byte char ('é', 2 bytes) + 16 ASCII + "WXYZ" = 21 chars /
         // 22 bytes. Correct redaction keeps the last 4 chars ("WXYZ") and
@@ -3727,11 +3782,10 @@ mod tests {
 
     // ── classify_auth_error: shared 401/403/429 classification ──────────
     //
-    // Regression: `fetch_binary` used to fold *every* non-OK/404 status into
-    // `ApiError::Other`, so an authenticated blob/diff/package fetch that
-    // 401'd/403'd was never recognized by `is_fallback_candidate` and the
-    // auth→proxy fallback silently never fired. Both transport paths now route
-    // through this shared classifier; these pin its contract directly.
+    // Both transport paths (including `fetch_binary`) route through this
+    // shared classifier, so an authenticated blob/diff/package fetch that
+    // 401s/403s is recognized by `is_fallback_candidate` and the auth→proxy
+    // fallback fires. These pin its contract directly.
 
     #[test]
     fn classify_auth_error_maps_401_to_unauthorized() {
@@ -3876,10 +3930,10 @@ mod tests {
 
     // ── binary_url: proxy override must reach blob/diff/package fetches ──
     //
-    // Regression: `fetch_binary` used to re-derive the proxy base from
-    // `SOCKET_PROXY_URL`/default instead of the client's configured
-    // `api_url`, so a `--proxy-url` override (which sets `api_url` but no env
-    // var) was honored for searches yet silently ignored for downloads.
+    // `fetch_binary` must use the client's configured `api_url`, not
+    // re-derive the proxy base from `SOCKET_PROXY_URL`/default, so a
+    // `--proxy-url` override (which sets `api_url` but no env var) reaches
+    // downloads as well as searches.
 
     fn proxy_client(api_url: &str) -> ApiClient {
         ApiClient::new(ApiClientOptions {
@@ -4530,7 +4584,7 @@ mod vendor_package_tests {
         ));
     }
 
-    // ── fetch_registry_references (scan --redirect resolution) ────────
+    // ── fetch_registry_references (hosted-mode scan resolution) ────────
 
     /// `fetch_registry_references` with no UUIDs must return an empty map
     /// with zero I/O — the client points at a closed port, so a regression
@@ -4558,7 +4612,7 @@ mod vendor_package_tests {
         }
     }
 
-    /// The anonymous `scan --redirect` route: `fetch_registry_references`
+    /// The anonymous hosted-mode `scan` route: `fetch_registry_references`
     /// on a public-proxy client POSTs `/patch/package` with no bearer and
     /// no `freeOnly` key, and returns the UUID → reference map.
     #[tokio::test]
@@ -4582,6 +4636,48 @@ mod vendor_package_tests {
             .expect("proxy package-reference resolution must succeed");
         assert_eq!(map.len(), 1);
         assert_eq!(map[UUID].status, "granted");
+    }
+
+    /// The endpoint rejects more than [`MAX_REFERENCE_BATCH`] uuids per
+    /// request (400), so a larger scan goes out in capped chunks whose
+    /// results are merged.
+    #[tokio::test]
+    async fn fetch_registry_references_chunks_at_the_endpoint_cap() {
+        struct EchoGranted;
+        impl wiremock::Respond for EchoGranted {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let uuids = body["uuids"].as_array().unwrap();
+                if uuids.len() > MAX_REFERENCE_BATCH {
+                    return ResponseTemplate::new(400);
+                }
+                let results: serde_json::Map<String, serde_json::Value> = uuids
+                    .iter()
+                    .map(|u| {
+                        (
+                            u.as_str().unwrap().to_string(),
+                            json!({ "status": "granted", "url": null, "artifacts": [] }),
+                        )
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({ "results": results }))
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/patch/package"))
+            .respond_with(EchoGranted)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let uuids: Vec<String> = (0..=MAX_REFERENCE_BATCH)
+            .map(|i| format!("{i:08x}-0000-4000-8000-{i:012x}"))
+            .collect();
+        let map = proxy_client(server.uri())
+            .fetch_registry_references(&uuids)
+            .await
+            .expect("chunked resolution succeeds");
+        assert_eq!(map.len(), uuids.len());
     }
 
     /// The package-reference route honors a per-call org override:

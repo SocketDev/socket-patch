@@ -123,6 +123,59 @@ fn dist_info_dir_name_fallback(dist_info_path: &Path, is_dir: bool) -> Option<(S
     parse_dist_info_dir_name(&dir_name)
 }
 
+/// Read `Name` and `Version` for a legacy `.egg-info` entry: the layout
+/// pip < 23.1 writes when it builds an sdist without `wheel`
+/// (`setup.py install`), and the one distutils and distro packages
+/// (Debian's `python3-*`) ship. Two shapes:
+///
+/// * a DIRECTORY holding `PKG-INFO` (the same `Name:`/`Version:` header
+///   block as `METADATA`), falling back to the
+///   `<name>-<version>[-pyX.Y].egg-info` directory name like the
+///   `.dist-info` reader does;
+/// * a bare FILE that IS the `PKG-INFO` (distutils). It has no directory
+///   to vouch for it, so it counts only when its headers parse.
+pub async fn read_egg_info_metadata(egg_info_path: &Path) -> Option<(String, String)> {
+    if is_dir(egg_info_path).await {
+        let content = read_regular_to_string(&egg_info_path.join("PKG-INFO"))
+            .await
+            .ok();
+        return content
+            .and_then(|c| parse_metadata_text(&c))
+            .or_else(|| parse_egg_info_dir_name(&egg_info_path.file_name()?.to_string_lossy()));
+    }
+    // FIFO-safe like the METADATA read: the regular-file reader rejects
+    // FIFOs, devices and directories.
+    let content = read_regular_to_string(egg_info_path).await.ok()?;
+    parse_metadata_text(&content)
+}
+
+/// Blocking twin of [`read_egg_info_metadata`] for the walk-pool scan.
+fn read_egg_info_metadata_sync(egg_info_path: &Path) -> Option<(String, String)> {
+    if is_dir_sync(egg_info_path) {
+        let content = read_regular_to_string_sync(&egg_info_path.join("PKG-INFO")).ok();
+        return content
+            .and_then(|c| parse_metadata_text(&c))
+            .or_else(|| parse_egg_info_dir_name(&egg_info_path.file_name()?.to_string_lossy()));
+    }
+    let content = read_regular_to_string_sync(egg_info_path).ok()?;
+    parse_metadata_text(&content)
+}
+
+/// Derive `(name, version)` from a `<name>-<version>[-pyX.Y].egg-info`
+/// name. setuptools and distutils escape `-` to `_` in both the name and
+/// the version (`to_filename`), so the FIRST `-` ends the name and the
+/// second one (if any) starts the `-pyX.Y` interpreter tag.
+fn parse_egg_info_dir_name(dir_name: &str) -> Option<(String, String)> {
+    let base = dir_name.strip_suffix(".egg-info")?;
+    let mut parts = base.split('-');
+    let name = parts.next()?;
+    let version = parts.next()?;
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), version.to_string()))
+}
+
 /// The `Name`/`Version` header parse of a METADATA body (see
 /// [`parse_metadata_headers`]).
 fn parse_metadata_text(content: &str) -> Option<(String, String)> {
@@ -265,49 +318,175 @@ async fn find_site_packages_under(
 /// Find local virtual environment `site-packages` directories.
 ///
 /// Checks (in order):
-/// 1. `VIRTUAL_ENV` environment variable
-/// 2. `.venv` directory in `cwd`
-/// 3. `venv` directory in `cwd`
-/// 4. Poetry's out-of-tree virtualenv(s) for a Poetry project (see
-///    [`find_poetry_virtualenv_site_packages`])
+/// 1. `VIRTUAL_ENV` environment variable (for a Pipenv project, only when
+///    Pipenv itself would use it)
+/// 2. For a Pipenv project, the venv(s) Pipenv resolves for it (see
+///    [`pipenv_project_site_packages`]), and nothing else
+/// 3. Poetry's out-of-tree virtualenv(s), when Poetry itself would not use
+///    `./.venv` for the project (see [`find_poetry_virtualenv_site_packages`])
+/// 4. `.venv` directory in `cwd`
+/// 5. `venv` directory in `cwd`
 pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
-    let mut results = Vec::new();
+    let var = |name: &str| std::env::var(name).ok();
+    find_local_venv_site_packages_with(cwd, &var).await
+}
 
-    // 1. Check VIRTUAL_ENV env var
-    if let Ok(virtual_env) = std::env::var("VIRTUAL_ENV") {
-        let venv_path = PathBuf::from(&virtual_env);
-        let matches = find_site_packages_under(&venv_path, "site-packages").await;
-        results.extend(matches);
-        if !results.is_empty() {
-            return results;
+/// [`find_local_venv_site_packages`] over an explicit environment (tests pass
+/// a closure instead of mutating the process environment).
+async fn find_local_venv_site_packages_with(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+    let pipenv = is_pipenv_project(cwd);
+
+    // 1. Check VIRTUAL_ENV env var. Pipenv ignores it under `PIPENV_ACTIVE`
+    // (a `pipenv shell` started in another project) and
+    // `PIPENV_IGNORE_VIRTUALENVS`, so for a Pipenv project the activated venv
+    // then belongs to something else and must not be patched.
+    if !pipenv || pipenv_uses_virtual_env(var) {
+        if let Some(virtual_env) = var("VIRTUAL_ENV") {
+            let venv_path = PathBuf::from(&virtual_env);
+            let matches = find_site_packages_under(&venv_path, "site-packages").await;
+            results.extend(matches);
+            if !results.is_empty() {
+                return results;
+            }
         }
     }
 
-    // 2. Check .venv and venv in cwd
+    // 2. A Pipenv project's venv is whatever Pipenv resolves, which is not
+    // the generic probe order below: Pipenv never uses `venv/`, and its
+    // in-project settings can rule out an existing `./.venv`. When Pipenv
+    // has no venv yet there is nothing to patch, so the generic probes must
+    // not fall back to a tree Pipenv will never use.
+    if pipenv {
+        return pipenv_project_site_packages(cwd, var).await;
+    }
+
+    // 3. Poetry decides for itself whether `./.venv` is the project's env
+    // (`EnvManager.use_in_project_venv`): an explicit `virtualenvs.in-project`
+    // wins, and only when it is unset does an existing `./.venv` count. When
+    // Poetry would NOT use `./.venv` (`in-project = false`, or no `.venv` at
+    // all), its out-of-tree env is probed first so a stray `.venv` / `venv`
+    // left by another tool does not shadow the env Poetry installed into.
+    let poetry = load_poetry_project(cwd).await;
+    if let Some(project) = poetry.as_ref().filter(|p| !p.uses_in_project_venv(cwd)) {
+        let found = poetry_virtualenv_site_packages(cwd, project, var).await;
+        if !found.is_empty() {
+            return found;
+        }
+    }
+
+    // 4. Check .venv and venv in cwd
     for venv_dir in &[".venv", "venv"] {
         let venv_path = cwd.join(venv_dir);
         let matches = find_site_packages_under(&venv_path, "site-packages").await;
         results.extend(matches);
     }
 
-    // 3. Poetry keeps its virtualenv OUTSIDE the project by default, so a plain
-    // `poetry install` leaves nothing above to find and the crawl used to fall
-    // through to the global interpreter (patching the wrong site-packages, or
-    // nothing, and reporting success).
-    if results.is_empty() {
-        results.extend(find_poetry_virtualenv_site_packages(cwd).await);
-    }
+    results
+}
 
-    // 4. Pipenv keeps its virtualenv OUTSIDE the project by default
-    // (`$WORKON_HOME/<dir>-<hash>`), so a plain `pipenv install` leaves
-    // nothing above to find and the crawl used to fall through to the global
-    // interpreter's site-packages — patching the wrong Python (or nothing)
-    // and reporting success. Measured on real Pipenv 11.10.4, 2018.11.26 and
-    // 2026.8.0.
-    if results.is_empty() {
-        results.extend(find_pipenv_virtualenv_site_packages(cwd).await);
-    }
+/// Whether `cwd` is a Pipenv project: a `Pipfile` or a `Pipfile.lock`.
+fn is_pipenv_project(cwd: &Path) -> bool {
+    cwd.join("Pipfile").is_file() || cwd.join("Pipfile.lock").is_file()
+}
 
+/// Pipenv's `get_from_env(arg)` for a boolean setting: `PIPENV_<arg>`, else
+/// the negated `PIPENV_NO_<arg>`. `Ok` for a value Pipenv's `env_to_bool`
+/// understands (`1/true/yes/on`, `0/false/no/off`, any case), `Err` with the
+/// raw text otherwise (Pipenv then keeps the string), `None` when unset.
+fn pipenv_env_setting(
+    var: &impl Fn(&str) -> Option<String>,
+    arg: &str,
+) -> Option<Result<bool, String>> {
+    let parse = |value: String| match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(value),
+    };
+    if let Some(value) = var(&format!("PIPENV_{arg}")) {
+        return Some(parse(value));
+    }
+    var(&format!("PIPENV_NO_{arg}")).map(|value| parse(value).map(|flag| !flag))
+}
+
+/// Whether Pipenv would take `VIRTUAL_ENV` as the project's venv: only when
+/// `PIPENV_ACTIVE` is absent (any value counts) and
+/// `bool(PIPENV_IGNORE_VIRTUALENVS)` is false. The same test in every Pipenv
+/// from 2018.11 through 2026.8 (`Project.virtualenv_location`, later
+/// `VenvLocator.location`).
+fn pipenv_uses_virtual_env(var: &impl Fn(&str) -> Option<String>) -> bool {
+    let ignore = match pipenv_env_setting(var, "IGNORE_VIRTUALENVS") {
+        Some(Ok(flag)) => flag,
+        Some(Err(text)) => !text.is_empty(),
+        None => false,
+    };
+    var("PIPENV_ACTIVE").is_none() && !ignore
+}
+
+/// An explicit in-project choice for the Pipenv project at `cwd`, if any:
+/// `PIPENV_VENV_IN_PROJECT` (or `PIPENV_NO_VENV_IN_PROJECT`) first, then
+/// Pipenv 2026.2+'s Pipfile `[pipenv] venv_in_project`. A non-boolean,
+/// non-empty variable counts as "yes", as `setting or <auto-detect>` did
+/// through Pipenv 2026.1.
+fn pipenv_venv_in_project(cwd: &Path, var: &impl Fn(&str) -> Option<String>) -> Option<bool> {
+    match pipenv_env_setting(var, "VENV_IN_PROJECT") {
+        Some(Ok(flag)) => return Some(flag),
+        Some(Err(text)) if !text.is_empty() => return Some(true),
+        _ => {}
+    }
+    // Non-blocking, regular-files-only read: a FIFO `Pipfile` (a lock alone
+    // marks the project) must not wedge discovery.
+    let text = read_regular_to_string_sync(&cwd.join("Pipfile")).ok()?;
+    let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+    let value = doc.get("pipenv")?.get("venv_in_project")?.as_value()?;
+    // Python's `bool(value)` for the scalar shapes a Pipfile can hold.
+    match value {
+        toml_edit::Value::Boolean(flag) => Some(*flag.value()),
+        toml_edit::Value::Integer(number) => Some(*number.value() != 0),
+        toml_edit::Value::String(text) => Some(!text.value().is_empty()),
+        _ => None,
+    }
+}
+
+/// `site-packages` of the venv(s) Pipenv uses for the project at `cwd`
+/// (`VenvLocator.get_location`, `VIRTUAL_ENV` aside), most likely first:
+///
+/// - No `./.venv` directory: Pipenv's own placement (a `.venv` file pointer
+///   or `$WORKON_HOME/<name>-<hash>`, see
+///   [`find_pipenv_virtualenv_site_packages`]). An explicit "in project"
+///   with no `./.venv` means Pipenv has no venv yet, so nothing.
+/// - A `./.venv` directory and an explicit "in project": `./.venv` only.
+/// - A `./.venv` directory and an explicit "not in project": the
+///   WORKON_HOME venv only (Pipenv 2023+ ignores `./.venv` then).
+/// - A `./.venv` directory and nothing explicit: Pipenv up to 2026.1 uses
+///   it, 2026.2+ prefers an existing WORKON_HOME venv. Without running
+///   Pipenv the version is unknown, so both are returned, WORKON_HOME
+///   first, and whichever one the installed Pipenv uses gets patched.
+///
+/// Never `./venv`: no Pipenv release uses it.
+async fn pipenv_project_site_packages(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    let in_project = pipenv_venv_in_project(cwd, var);
+    let dot_venv = cwd.join(".venv");
+    if !dot_venv.is_dir() {
+        if in_project == Some(true) && !dot_venv.exists() {
+            return Vec::new();
+        }
+        return find_pipenv_virtualenv_site_packages_with(cwd, var).await;
+    }
+    let in_tree = find_site_packages_under(&dot_venv, "site-packages").await;
+    if in_project == Some(true) {
+        return in_tree;
+    }
+    let mut results = find_pipenv_virtualenv_site_packages_with(cwd, var).await;
+    if in_project.is_none() {
+        results.extend(in_tree);
+    }
     results
 }
 
@@ -484,42 +663,74 @@ fn poetry_env_name_prefix(project_name: &str, normalized_cwd: &str) -> String {
 }
 
 /// `os.path.normcase(os.path.realpath(cwd))` as Poetry hashes it: symlinks
-/// resolved; on Windows lowercased with forward slashes turned into
-/// backslashes, elsewhere unchanged.
+/// resolved; on Windows see [`windows_normcase`], elsewhere unchanged.
 fn poetry_normalized_cwd(cwd: &Path) -> String {
     let real = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let text = real.to_string_lossy().into_owned();
     if cfg!(windows) {
-        text.replace('/', "\\").to_lowercase()
+        windows_normcase(&text)
     } else {
         text
     }
 }
 
-/// The project name Poetry derives its virtualenv name from: `[tool.poetry]
-/// name`, else PEP 621 `[project] name`. Poetry canonicalizes it (PEP 503) —
-/// both spellings are returned so a lock written before that normalization
-/// still matches.
+/// Python's Windows `normcase(realpath(p))` for a path Rust canonicalized:
+/// `realpath` drops the verbatim `\\?\` prefix that `std::fs::canonicalize`
+/// adds (`\\?\UNC\server` becomes `\\server`), and `normcase` lowercases
+/// and turns `/` into `\`. Hashing the verbatim form made every Windows
+/// env-name hash miss.
+fn windows_normcase(text: &str) -> String {
+    strip_windows_verbatim_prefix(text)
+        .replace('/', "\\")
+        .to_lowercase()
+}
+
+/// `\\?\C:\x` -> `C:\x`, `\\?\UNC\srv\share` -> `\\srv\share`; anything
+/// else unchanged.
+fn strip_windows_verbatim_prefix(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+/// The project names Poetry may have derived the virtualenv name from, in
+/// the order Poetry picks them. poetry-core 2.x takes `[project] name`, then
+/// `[tool.poetry] name`, then `"non-package-mode"`. poetry-core 1.9 (Poetry
+/// 1.8) ignores `[project]` and takes `[tool.poetry] name`, then
+/// `"non-package-mode"`. Poetry canonicalizes the name (PEP 503); the raw
+/// spelling follows each canonical one so a venv made before that
+/// normalization still matches. Empty only when the file does not parse.
 fn poetry_project_names(pyproject: &str) -> Vec<String> {
     let Ok(doc) = pyproject.parse::<toml_edit::DocumentMut>() else {
         return Vec::new();
     };
-    let raw = doc
+    let project_name = doc
+        .get("project")
+        .and_then(|p| p.get("name"))
+        .and_then(toml_edit::Item::as_str);
+    let poetry_name = doc
         .get("tool")
         .and_then(|t| t.get("poetry"))
         .and_then(|p| p.get("name"))
-        .and_then(toml_edit::Item::as_str)
-        .or_else(|| {
-            doc.get("project")
-                .and_then(|p| p.get("name"))
-                .and_then(toml_edit::Item::as_str)
-        });
-    let Some(raw) = raw else {
-        return Vec::new();
+        .and_then(toml_edit::Item::as_str);
+    let mut names: Vec<String> = Vec::new();
+    let mut push = |raw: &str| {
+        for name in [canonicalize_pypi_name(raw), raw.to_string()] {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
     };
-    let mut names = vec![canonicalize_pypi_name(raw)];
-    if !names.contains(&raw.to_string()) {
-        names.push(raw.to_string());
+    project_name.into_iter().for_each(&mut push);
+    match poetry_name {
+        Some(name) => push(name),
+        // Poetry 2 with no name at all, or Poetry 1.8 with only a
+        // `[project] name`, both fall back to this placeholder.
+        None => push("non-package-mode"),
     }
     names
 }
@@ -578,19 +789,46 @@ fn expand_home(raw: &str, var: &impl Fn(&str) -> Option<String>) -> PathBuf {
 /// executed, no `poetry` binary is needed.
 pub async fn find_poetry_virtualenv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     let var = |name: &str| std::env::var(name).ok();
+    match load_poetry_project(cwd).await {
+        Some(project) => poetry_virtualenv_site_packages(cwd, &project, &var).await,
+        None => Vec::new(),
+    }
+}
+
+/// What venv discovery needs to know about a Poetry project: the candidate
+/// env names and the layered `virtualenvs.*` configuration.
+struct PoetryProject {
+    names: Vec<String>,
+    config: PoetryVirtualenvConfig,
+}
+
+impl PoetryProject {
+    /// Poetry's `EnvManager.use_in_project_venv`: an explicit
+    /// `virtualenvs.in-project` decides; unset means "if `./.venv` is a
+    /// directory".
+    fn uses_in_project_venv(&self, cwd: &Path) -> bool {
+        self.config
+            .in_project
+            .unwrap_or_else(|| cwd.join(".venv").is_dir())
+    }
+}
+
+/// `None` for a non-Poetry project (no `poetry.lock`, `poetry.toml` or
+/// `[tool.poetry`) or an unreadable / unparseable `pyproject.toml`.
+async fn load_poetry_project(cwd: &Path) -> Option<PoetryProject> {
+    let var = |name: &str| std::env::var(name).ok();
     let has = |leaf: &str| cwd.join(leaf).is_file();
-    let pyproject = match read_regular_to_string(&cwd.join("pyproject.toml")).await {
-        Ok(text) => text,
-        Err(_) => return Vec::new(),
-    };
+    let pyproject = read_regular_to_string(&cwd.join("pyproject.toml"))
+        .await
+        .ok()?;
     let poetry_project =
         has("poetry.lock") || has("poetry.toml") || pyproject.contains("[tool.poetry");
     if !poetry_project {
-        return Vec::new();
+        return None;
     }
     let names = poetry_project_names(&pyproject);
     if names.is_empty() {
-        return Vec::new();
+        return None;
     }
     let local = match read_regular_to_string(&cwd.join("poetry.toml")).await {
         Ok(text) => PoetryVirtualenvConfig::from_toml(&text),
@@ -604,27 +842,42 @@ pub async fn find_poetry_virtualenv_site_packages(cwd: &Path) -> Vec<PathBuf> {
         None => PoetryVirtualenvConfig::default(),
     };
     let config = PoetryVirtualenvConfig::from_env(var).or(local).or(user);
-    let Some(root) = poetry_virtualenvs_root(cwd, &config, &var) else {
+    Some(PoetryProject { names, config })
+}
+
+/// The out-of-tree venvs for `project`, taking the first candidate name (in
+/// Poetry's precedence order) that has at least one `<name>-<hash>-py*` dir.
+async fn poetry_virtualenv_site_packages(
+    cwd: &Path,
+    project: &PoetryProject,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    let Some(root) = poetry_virtualenvs_root(cwd, &project.config, var) else {
         return Vec::new();
     };
-    let normalized = poetry_normalized_cwd(cwd);
-    let prefixes: Vec<String> = names
-        .iter()
-        .map(|name| format!("{}-py", poetry_env_name_prefix(name, &normalized)))
-        .collect();
     let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
         return Vec::new();
     };
-    let mut venvs = Vec::new();
+    let mut dir_names = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if prefixes.iter().any(|prefix| name.starts_with(prefix)) {
-            venvs.push(entry.path());
+        if let Some(name) = entry.file_name().to_str() {
+            dir_names.push(name.to_string());
         }
     }
+    let normalized = poetry_normalized_cwd(cwd);
+    let mut venvs: Vec<PathBuf> = project
+        .names
+        .iter()
+        .map(|name| format!("{}-py", poetry_env_name_prefix(name, &normalized)))
+        .map(|prefix| {
+            dir_names
+                .iter()
+                .filter(|dir| dir.starts_with(&prefix))
+                .map(|dir| root.join(dir))
+                .collect::<Vec<_>>()
+        })
+        .find(|found| !found.is_empty())
+        .unwrap_or_default();
     venvs.sort();
     let mut results = Vec::new();
     for venv in venvs {
@@ -651,8 +904,7 @@ async fn find_pipenv_virtualenv_site_packages_with(
     cwd: &Path,
     var: &impl Fn(&str) -> Option<String>,
 ) -> Vec<PathBuf> {
-    let is_file = |leaf: &str| cwd.join(leaf).is_file();
-    if !is_file("Pipfile") && !is_file("Pipfile.lock") {
+    if !is_pipenv_project(cwd) {
         return Vec::new();
     }
     let mut venvs: Vec<PathBuf> = Vec::new();
@@ -876,11 +1128,7 @@ fn pipenv_venv_hash(pipfile_location: &str) -> String {
 fn pipenv_path_string(path: &Path) -> String {
     let mut text = path.to_string_lossy().into_owned();
     if cfg!(windows) {
-        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-            text = format!(r"\\{rest}");
-        } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-            text = rest.to_string();
-        }
+        text = strip_windows_verbatim_prefix(&text);
         let mut chars: Vec<char> = text.chars().collect();
         if chars.len() >= 2 && chars[1] == ':' && chars[0].is_ascii_lowercase() {
             chars[0] = chars[0].to_ascii_uppercase();
@@ -1073,7 +1321,8 @@ fn run_site_query() -> Option<String> {
 /// Get global/system Python `site-packages` directories.
 ///
 /// Queries `python3` for site-packages paths, then checks well-known system
-/// locations including Homebrew, conda, uv tools, pip --user, etc.
+/// locations including Homebrew, conda, uv tools, pipx venvs, pip --user,
+/// etc.
 pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     let mut results = Vec::new();
     let mut seen = HashSet::new();
@@ -1090,10 +1339,8 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     }
 
     // 1. Ask Python for site-packages (subprocesses: on the blocking pool)
-    let site_output = run_blocking(|| {
-        SITE_QUERY_MEMO.get_or_run(site_query_key(), run_site_query)
-    })
-    .await;
+    let site_output =
+        run_blocking(|| SITE_QUERY_MEMO.get_or_run(site_query_key(), run_site_query)).await;
     if let Some(stdout) = site_output {
         for p in parse_python_site_packages_output(&stdout) {
             add_path(p, &mut seen, &mut results);
@@ -1297,6 +1544,26 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         }
     }
 
+    // pipx app venvs (`pipx install hatch`): one venv per app under
+    // `<pipx home>/venvs/<app>`. Every candidate home that exists is
+    // scanned, not just the one pipx would pick today: an app installed
+    // under an older default is still a real install, and `seen` dedups
+    // overlaps (e.g. PIPX_HOME set to the default).
+    for pipx_home in pipx_home_candidates(&home_dir) {
+        let venvs = pipx_home.join("venvs");
+        #[cfg(not(windows))]
+        let mut matches =
+            find_python_dirs(&venvs, &["*", "lib", "python3.*", "site-packages"]).await;
+        #[cfg(not(windows))]
+        matches
+            .extend(find_python_dirs(&venvs, &["*", "lib64", "python3.*", "site-packages"]).await);
+        #[cfg(windows)]
+        let matches = find_python_dirs(&venvs, &["*", "Lib", "site-packages"]).await;
+        for m in matches {
+            add_path(m, &mut seen, &mut results);
+        }
+    }
+
     // uv-managed Python interpreters (`uv python install 3.X`) live at:
     //   Linux/macOS: ~/.local/share/uv/python/cpython-3.X.*/lib/python3.X/site-packages/
     //   Windows:     %LOCALAPPDATA%\uv\python\cpython-3.X.*\Lib\site-packages\
@@ -1332,12 +1599,56 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     results
 }
 
+/// The directories pipx may use as its home, most specific first.
+///
+/// pipx (>= 1.3, `pipx/paths.py`) uses `$PIPX_HOME` when set, otherwise
+/// its legacy home `~/.local/pipx` if that exists, otherwise platformdirs'
+/// user data dir: `$XDG_DATA_HOME/pipx` (default `~/.local/share/pipx`) on
+/// Linux, `~/Library/Application Support/pipx` on macOS, and
+/// `%USERPROFILE%\pipx` on Windows (with `%LOCALAPPDATA%\pipx\pipx` as its
+/// platformdirs fallback). All of them are returned; callers skip the ones
+/// that don't exist.
+fn pipx_home_candidates(home_dir: &Path) -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    if let Some(pipx_home) = std::env::var_os("PIPX_HOME").filter(|v| !v.is_empty()) {
+        homes.push(PathBuf::from(pipx_home));
+    }
+    homes.push(home_dir.join(".local").join("pipx"));
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    {
+        // platformdirs ignores a relative XDG_DATA_HOME, per the XDG spec.
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+        {
+            homes.push(xdg.join("pipx"));
+        }
+        homes.push(home_dir.join(".local").join("share").join("pipx"));
+    }
+    #[cfg(target_os = "macos")]
+    homes.push(
+        home_dir
+            .join("Library")
+            .join("Application Support")
+            .join("pipx"),
+    );
+    #[cfg(windows)]
+    {
+        homes.push(home_dir.join("pipx"));
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            homes.push(PathBuf::from(local).join("pipx").join("pipx"));
+        }
+    }
+    homes
+}
+
 /// Returns true if `cwd` looks like a Python project root.
 ///
 /// Used by `PythonCrawler::get_site_packages_paths` to decide
 /// whether to fall back to the global-discovery path when no venv
-/// was found. Mirrors `is_dotnet_project` in nuget_crawler and the
-/// `has_gemfile || has_gemfile_lock` check in ruby_crawler.
+/// was found. Mirrors `is_dotnet_project` in nuget_crawler and
+/// `RubyCrawler::has_bundler_manifest` (Gemfile / Gemfile.lock / gems.rb /
+/// gems.locked) in ruby_crawler.
 ///
 /// The list intentionally covers all major Python toolchains:
 ///   * `pyproject.toml` — PEP 518 / 621 (poetry, hatch, uv, flit,
@@ -1384,11 +1695,10 @@ impl PythonCrawler {
     ///
     /// Local-mode discovery has two stages:
     ///   1. `find_local_venv_site_packages` — handles `VIRTUAL_ENV`,
-    ///      `.venv`, and `venv` directories (covers the common case
-    ///      of an activated or project-local venv).
+    ///      `.venv`, and `venv` directories, then Poetry's and Pipenv's
+    ///      out-of-tree virtualenvs.
     ///   2. If no venv was found AND the cwd looks like a Python
-    ///      project (`pyproject.toml`, `setup.py`, `setup.cfg`,
-    ///      `requirements.txt`, or `uv.lock` present), fall through
+    ///      project (see `is_python_project`), fall through
     ///      to `get_global_python_site_packages`. This mirrors the
     ///      cargo / ruby / go pattern where a project marker
     ///      indicates "scan this ecosystem globally for this project".
@@ -1569,11 +1879,13 @@ impl PythonCrawler {
     }
 }
 
-/// Scan a `site-packages` directory for `.dist-info` entries, returning
-/// `(canonicalized name, version)` for each package that yields metadata,
-/// in listing order. One blocking-pool task for the listing and every
-/// METADATA read (one runtime hop per open, read and stat used to set the
-/// scan's pace).
+/// Scan a `site-packages` directory for installed distributions — the
+/// `.dist-info` entries wheels install, and the legacy `.egg-info`
+/// entries an sdist built without `wheel`, distutils or a distro package
+/// leaves — returning `(canonicalized name, version)` for each one that
+/// yields metadata, in listing order. One blocking-pool task for the
+/// listing and every metadata read, rather than a runtime hop per open,
+/// read and stat.
 pub(crate) async fn list_dist_info_packages(site_packages_path: &Path) -> Vec<(String, String)> {
     let site_packages_path = site_packages_path.to_path_buf();
     run_blocking(move || list_dist_info_packages_sync(&site_packages_path)).await
@@ -1581,21 +1893,20 @@ pub(crate) async fn list_dist_info_packages(site_packages_path: &Path) -> Vec<(S
 
 /// Blocking body of [`list_dist_info_packages`].
 fn list_dist_info_packages_sync(site_packages_path: &Path) -> Vec<(String, String)> {
-    let dist_infos: Vec<PathBuf> = list_dir_sync(site_packages_path)
+    list_dir_sync(site_packages_path)
         .into_iter()
         .filter_map(|entry| {
             let name_str = entry.name.to_string_lossy();
-            name_str
-                .ends_with(".dist-info")
-                .then(|| site_packages_path.join(&*name_str))
+            let path = site_packages_path.join(&*name_str);
+            if name_str.ends_with(".dist-info") {
+                read_python_metadata_sync(&path)
+            } else if name_str.ends_with(".egg-info") {
+                read_egg_info_metadata_sync(&path)
+            } else {
+                None
+            }
         })
-        .collect();
-    dist_infos
-        .iter()
-        .filter_map(|dist_info_path| {
-            read_python_metadata_sync(dist_info_path)
-                .map(|(raw_name, version)| (canonicalize_pypi_name(&raw_name), version))
-        })
+        .map(|(raw_name, version)| (canonicalize_pypi_name(&raw_name), version))
         .collect()
 }
 
@@ -1800,10 +2111,6 @@ mod tests {
             .is_empty());
     }
 
-    /// The crawler's public entry point wires step 3 in: with no VIRTUAL_ENV
-    /// and no in-project venv, `find_local_venv_site_packages` returns the
-    /// out-of-tree Pipenv venv instead of nothing (which used to trigger the
-    /// global fallback).
     /// Pipenv 2018–2021 with an absolute PIPENV_PYTHON append the whole
     /// interpreter path to the venv name, so the virtualenv sits at the
     /// bottom of `<workon>/<name>-<hash>-/<abs>/<python>/`; the crawler must
@@ -1875,6 +2182,234 @@ mod tests {
         assert_eq!(
             find_pipenv_virtualenv_site_packages_with(&project, &var).await,
             vec![rel]
+        );
+    }
+
+    /// A Pipenv project `proj` with Pipenv's default WORKON_HOME venv laid
+    /// out, plus an environment closure over `extra` (and WORKON_HOME).
+    /// Returns `(tmp, project, workon site-packages, var)`.
+    fn pipenv_project_with_workon_venv(
+        extra: &[(&'static str, String)],
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        impl Fn(&str) -> Option<String>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("Pipfile"), "[packages]\nsix = \"==1.16.0\"\n").unwrap();
+        let workon = tmp.path().join("wh");
+        let real = std::fs::canonicalize(&project).unwrap();
+        let hash = pipenv_venv_hash(&pipenv_path_string(&real.join("Pipfile")));
+        let site = fake_venv(&workon, &format!("proj-{hash}"));
+        let mut env: Vec<(&'static str, String)> =
+            vec![("WORKON_HOME", workon.to_string_lossy().into_owned())];
+        env.extend(extra.iter().cloned());
+        let var = move |name: &str| {
+            env.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.clone())
+        };
+        (tmp, project, site, var)
+    }
+
+    /// #384: Pipenv uses `VIRTUAL_ENV` only when neither `PIPENV_ACTIVE` nor
+    /// `PIPENV_IGNORE_VIRTUALENVS` is set (`VenvLocator.location` /
+    /// `Project.virtualenv_location`, 2022.12 through 2026.8). With either
+    /// opt-out, the activated venv belongs to something else (another
+    /// project's `pipenv shell`, a tool venv) and must not be patched.
+    #[tokio::test]
+    async fn pipenv_opt_outs_keep_virtual_env_from_hijacking_the_project() {
+        let other = tempfile::tempdir().unwrap();
+        let other_site = fake_venv(other.path(), "tool-venv");
+        let other_env = other
+            .path()
+            .join("tool-venv")
+            .to_string_lossy()
+            .into_owned();
+
+        for opt_out in [
+            ("PIPENV_IGNORE_VIRTUALENVS", "1"),
+            ("PIPENV_IGNORE_VIRTUALENVS", "true"),
+            ("PIPENV_IGNORE_VIRTUALENVS", "anything"),
+            ("PIPENV_NO_IGNORE_VIRTUALENVS", "0"),
+            ("PIPENV_ACTIVE", "1"),
+            ("PIPENV_ACTIVE", ""),
+        ] {
+            let (_tmp, project, site, var) = pipenv_project_with_workon_venv(&[
+                ("VIRTUAL_ENV", other_env.clone()),
+                (opt_out.0, opt_out.1.to_string()),
+            ]);
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &var).await,
+                vec![site],
+                "{}={:?} must send discovery to Pipenv's own venv",
+                opt_out.0,
+                opt_out.1
+            );
+        }
+
+        // Opt-out set but Pipenv has no venv yet: still never the activated
+        // venv (Pipenv would create a new one, not reuse it).
+        let (_tmp, project, site, var) = pipenv_project_with_workon_venv(&[
+            ("VIRTUAL_ENV", other_env.clone()),
+            ("PIPENV_IGNORE_VIRTUALENVS", "1".to_string()),
+        ]);
+        std::fs::remove_dir_all(site.ancestors().nth(3).unwrap()).unwrap();
+        assert!(!find_local_venv_site_packages_with(&project, &var)
+            .await
+            .contains(&other_site));
+
+        // Controls: without an opt-out (or with a falsy one) Pipenv does use
+        // VIRTUAL_ENV, and a non-Pipenv project always does.
+        for extra in [
+            vec![],
+            vec![("PIPENV_IGNORE_VIRTUALENVS", "0".to_string())],
+            vec![("PIPENV_NO_IGNORE_VIRTUALENVS", "1".to_string())],
+        ] {
+            let mut env = vec![("VIRTUAL_ENV", other_env.clone())];
+            env.extend(extra);
+            let (_tmp, project, _site, var) = pipenv_project_with_workon_venv(&env);
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &var).await,
+                vec![other_site.clone()]
+            );
+        }
+        let (tmp, _project, _site, var) = pipenv_project_with_workon_venv(&[
+            ("VIRTUAL_ENV", other_env.clone()),
+            ("PIPENV_IGNORE_VIRTUALENVS", "1".to_string()),
+        ]);
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&plain, &var).await,
+            vec![other_site.clone()]
+        );
+    }
+
+    /// #334: Pipenv never uses a `venv/` directory, so a stray one must not
+    /// shadow the WORKON_HOME venv Pipenv installed into.
+    #[tokio::test]
+    async fn pipenv_stray_venv_dir_does_not_shadow_the_workon_home_venv() {
+        let (_tmp, project, site, var) = pipenv_project_with_workon_venv(&[]);
+        let _stray = fake_venv(&project, "venv");
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![site]
+        );
+    }
+
+    /// #334: when Pipenv has no venv yet, discovery must not fall back to a
+    /// tree Pipenv will never use: a stray `venv/`, or a `./.venv` that an
+    /// explicit "not in project" rules out.
+    #[tokio::test]
+    async fn pipenv_without_its_venv_does_not_fall_back_to_stray_trees() {
+        let (_tmp, project, site, var) = pipenv_project_with_workon_venv(&[]);
+        std::fs::remove_dir_all(site.ancestors().nth(3).unwrap()).unwrap();
+        let _stray = fake_venv(&project, "venv");
+        assert!(find_local_venv_site_packages_with(&project, &var)
+            .await
+            .is_empty());
+
+        let (_tmp, project, site, var) =
+            pipenv_project_with_workon_venv(&[("PIPENV_VENV_IN_PROJECT", "0".to_string())]);
+        std::fs::remove_dir_all(site.ancestors().nth(3).unwrap()).unwrap();
+        let _dot = fake_venv(&project, ".venv");
+        assert!(find_local_venv_site_packages_with(&project, &var)
+            .await
+            .is_empty());
+    }
+
+    /// #334: an explicit "not in project" (`PIPENV_VENV_IN_PROJECT` falsy,
+    /// `PIPENV_NO_VENV_IN_PROJECT` truthy, or Pipenv 2026.2+'s Pipfile
+    /// `[pipenv] venv_in_project = false`) makes Pipenv ignore a `./.venv`
+    /// directory. An explicit "in project" makes it use `./.venv` only, and
+    /// the environment variable beats the Pipfile.
+    #[tokio::test]
+    async fn pipenv_venv_in_project_settings_decide_about_dot_venv() {
+        for env in [
+            ("PIPENV_VENV_IN_PROJECT", "0"),
+            ("PIPENV_VENV_IN_PROJECT", "false"),
+            ("PIPENV_VENV_IN_PROJECT", "Off"),
+            ("PIPENV_NO_VENV_IN_PROJECT", "1"),
+        ] {
+            let (_tmp, project, site, var) =
+                pipenv_project_with_workon_venv(&[(env.0, env.1.to_string())]);
+            let _dot = fake_venv(&project, ".venv");
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &var).await,
+                vec![site],
+                "{}={:?} must skip ./.venv",
+                env.0,
+                env.1
+            );
+        }
+
+        let (_tmp, project, site, var) = pipenv_project_with_workon_venv(&[]);
+        let dot = fake_venv(&project, ".venv");
+        std::fs::write(
+            project.join("Pipfile"),
+            "[packages]\nsix = \"==1.16.0\"\n\n[pipenv]\nvenv_in_project = false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![site.clone()],
+            "Pipfile venv_in_project = false must skip ./.venv"
+        );
+        std::fs::write(
+            project.join("Pipfile"),
+            "[packages]\nsix = \"==1.16.0\"\n\n[pipenv]\nvenv_in_project = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![dot.clone()],
+            "Pipfile venv_in_project = true must use ./.venv only"
+        );
+
+        for env in [
+            ("PIPENV_VENV_IN_PROJECT", "1"),
+            ("PIPENV_NO_VENV_IN_PROJECT", "0"),
+        ] {
+            let (_tmp, project, _site, var) =
+                pipenv_project_with_workon_venv(&[(env.0, env.1.to_string())]);
+            let dot = fake_venv(&project, ".venv");
+            std::fs::write(
+                project.join("Pipfile"),
+                "[packages]\n\n[pipenv]\nvenv_in_project = false\n",
+            )
+            .unwrap();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &var).await,
+                vec![dot],
+                "{}={:?} beats the Pipfile and uses ./.venv only",
+                env.0,
+                env.1
+            );
+        }
+    }
+
+    /// #334: with nothing explicit, Pipenv up to 2026.1 uses an existing
+    /// `./.venv` directory, while 2026.2+ prefers a WORKON_HOME venv that
+    /// already exists. The crawler cannot tell the versions apart without
+    /// running Pipenv, so it returns both (Pipenv 2026.2+'s choice first),
+    /// and either version's venv is patched. With only one of them present,
+    /// that one is the answer.
+    #[tokio::test]
+    async fn pipenv_auto_detected_dot_venv_and_workon_home_venv_are_both_returned() {
+        let (_tmp, project, site, var) = pipenv_project_with_workon_venv(&[]);
+        let dot = fake_venv(&project, ".venv");
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![site.clone(), dot.clone()]
+        );
+        std::fs::remove_dir_all(site.ancestors().nth(3).unwrap()).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![dot]
         );
     }
 
@@ -1952,6 +2487,40 @@ mod tests {
         }
     }
 
+    /// A `Pipfile.lock` alone marks a Pipenv project, so a FIFO `Pipfile`
+    /// beside it reaches the `[pipenv] venv_in_project` lookup, which must
+    /// not block on it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipenv_discovery_does_not_block_on_fifo_pipfile() {
+        let (_tmp, project, site, var) = pipenv_project_with_workon_venv(&[]);
+        let _dot = fake_venv(&project, ".venv");
+        std::fs::remove_file(project.join("Pipfile")).unwrap();
+        std::fs::write(project.join("Pipfile.lock"), "{}").unwrap();
+        let fifo = project.join("Pipfile");
+        assert!(tokio::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .await
+            .unwrap()
+            .success());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            find_local_venv_site_packages_with(&project, &var),
+        )
+        .await;
+        if result.is_err() {
+            let release = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fifo)
+                .unwrap();
+            drop(release);
+        }
+        let found = result.expect("discovery blocked on a FIFO Pipfile");
+        assert_eq!(found.first(), Some(&site));
+    }
+
     // ── Poetry out-of-tree virtualenv discovery ─────────────────────────────
 
     /// Known-answer vectors computed with Poetry's own algorithm
@@ -1974,22 +2543,69 @@ mod tests {
         assert_eq!(prefix.rsplit_once('-').unwrap().1.len(), 8);
     }
 
+    /// poetry-core 2.x: `[project] name`, then `[tool.poetry] name`, then
+    /// `"non-package-mode"` (#327 cases 1 and 2). The `[tool.poetry]` /
+    /// placeholder candidates stay in the list for Poetry 1.8, which ignores
+    /// `[project]`.
     #[test]
-    fn poetry_project_names_prefer_tool_poetry_and_return_both_spellings() {
+    fn poetry_project_names_follow_poetry_core_precedence() {
         assert_eq!(
             poetry_project_names(
                 "[tool.poetry]\nname = \"Flask_Login\"\n[project]\nname = \"other\"\n"
             ),
+            vec![
+                "other".to_string(),
+                "flask-login".to_string(),
+                "Flask_Login".to_string()
+            ]
+        );
+        assert_eq!(
+            poetry_project_names("[tool.poetry]\nname = \"Flask_Login\"\n"),
             vec!["flask-login".to_string(), "Flask_Login".to_string()]
         );
         assert_eq!(
             poetry_project_names(
                 "[project]\nname = \"my-app\"\n[tool.poetry]\npackage-mode = false\n"
             ),
-            vec!["my-app".to_string()]
+            vec!["my-app".to_string(), "non-package-mode".to_string()]
         );
-        assert!(poetry_project_names("[tool.poetry]\nversion = \"1\"\n").is_empty());
+        assert_eq!(
+            poetry_project_names("[tool.poetry]\npackage-mode = false\n"),
+            vec!["non-package-mode".to_string()]
+        );
         assert!(poetry_project_names("not toml [").is_empty());
+    }
+
+    /// Known answers from CPython's `ntpath.normcase` and Poetry's
+    /// `generate_env_name`: the verbatim `\\?\` prefix `canonicalize` adds on
+    /// Windows must not reach the hash (#329).
+    #[test]
+    fn windows_normcase_drops_the_verbatim_prefix_like_python_realpath() {
+        let local = r"\\?\C:\Users\RunnerAdmin\AppData\Local\Temp\agent-named";
+        assert_eq!(
+            windows_normcase(local),
+            r"c:\users\runneradmin\appdata\local\temp\agent-named"
+        );
+        assert_eq!(
+            poetry_env_name_prefix("probe-named", &windows_normcase(local)),
+            "probe-named-vC9KVdIy"
+        );
+        let unc = r"\\?\UNC\Server\Share\Proj";
+        assert_eq!(windows_normcase(unc), r"\\server\share\proj");
+        assert_eq!(
+            poetry_env_name_prefix("probe-named", &windows_normcase(unc)),
+            "probe-named-KJ5ISM87"
+        );
+        assert_eq!(windows_normcase("C:/Work/Proj"), r"c:\work\proj");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn poetry_normalized_cwd_has_no_verbatim_prefix_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let normalized = poetry_normalized_cwd(tmp.path());
+        assert!(!normalized.starts_with(r"\\?\"), "{normalized}");
+        assert_eq!(normalized, normalized.to_lowercase());
     }
 
     #[test]
@@ -2160,6 +2776,83 @@ mod tests {
         assert!(find_local_venv_site_packages(&project).await.is_empty());
         std::fs::remove_file(project.join("poetry.toml")).unwrap();
 
+        // #327 case 3: an explicit `in-project = false` means Poetry never
+        // uses `./.venv`, even when one exists; the stray `.venv` loses.
+        std::fs::create_dir_all(site(&project.join(".venv"), "3.12")).unwrap();
+        std::fs::write(
+            project.join("poetry.toml"),
+            "[virtualenvs]\nin-project = false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages(&project).await,
+            vec![site(&venv311, "3.11"), site(&venv312, "3.12")]
+        );
+        std::fs::remove_file(project.join("poetry.toml")).unwrap();
+        std::fs::remove_dir_all(project.join(".venv")).unwrap();
+
+        // Poetry never looks at `./venv`: with no `./.venv` its out-of-tree
+        // env is still the one it installed into.
+        std::fs::create_dir_all(site(&project.join("venv"), "3.12")).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages(&project).await,
+            vec![site(&venv311, "3.11"), site(&venv312, "3.12")]
+        );
+        // ...but a `./venv` still serves when Poetry has no env at all.
+        let venv_only = tmp.path().join("venv-only");
+        std::fs::create_dir_all(site(&venv_only.join("venv"), "3.12")).unwrap();
+        std::fs::write(
+            venv_only.join("pyproject.toml"),
+            "[tool.poetry]\nname = \"venv-only\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages(&venv_only).await,
+            vec![site(&venv_only.join("venv"), "3.12")]
+        );
+        std::fs::remove_dir_all(project.join("venv")).unwrap();
+
+        // #327 case 1: a nameless `package-mode = false` project. Poetry
+        // names its env `non-package-mode-<hash>-py<X.Y>`.
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[tool.poetry]\npackage-mode = false\n",
+        )
+        .unwrap();
+        let nameless = venvs.join(format!(
+            "{}-py3.12",
+            poetry_env_name_prefix("non-package-mode", &poetry_normalized_cwd(&project))
+        ));
+        std::fs::create_dir_all(site(&nameless, "3.12")).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages(&project).await,
+            vec![site(&nameless, "3.12")]
+        );
+
+        // #327 case 2: Poetry 2 names the env after `[project] name` when both
+        // tables carry one, even though `[tool.poetry] name` has a venv too.
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"pep-name\"\n[tool.poetry]\nname = \"poetry-patch-fixture\"\n",
+        )
+        .unwrap();
+        let pep = venvs.join(format!(
+            "{}-py3.12",
+            poetry_env_name_prefix("pep-name", &poetry_normalized_cwd(&project))
+        ));
+        std::fs::create_dir_all(site(&pep, "3.12")).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages(&project).await,
+            vec![site(&pep, "3.12")]
+        );
+        // With only the legacy-named env on disk (Poetry 1.8 ignores
+        // `[project]`), that one is found.
+        std::fs::remove_dir_all(&pep).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages(&project).await,
+            vec![site(&venv311, "3.11"), site(&venv312, "3.12")]
+        );
+
         // Not a Poetry project (no lock, no [tool.poetry]): untouched.
         std::fs::write(
             project.join("pyproject.toml"),
@@ -2255,6 +2948,62 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dist_info = dir.path().join("nonexistent.dist-info");
         assert!(read_python_metadata(&dist_info).await.is_none());
+    }
+
+    #[test]
+    fn test_parse_egg_info_dir_name() {
+        assert_eq!(
+            parse_egg_info_dir_name("six-1.16.0-py3.11.egg-info"),
+            Some(("six".into(), "1.16.0".into()))
+        );
+        assert_eq!(
+            parse_egg_info_dir_name("Flask_SQLAlchemy-3.0.5.egg-info"),
+            Some(("Flask_SQLAlchemy".into(), "3.0.5".into()))
+        );
+        assert!(parse_egg_info_dir_name("noversion.egg-info").is_none());
+        assert!(parse_egg_info_dir_name("-1.0.egg-info").is_none());
+        assert!(parse_egg_info_dir_name("six-1.16.0.dist-info").is_none());
+    }
+
+    /// Legacy `.egg-info` installs (#447): a `PKG-INFO` directory, a
+    /// headerless directory (named fallback), and a bare distutils FILE are
+    /// installs; a bare file without headers is not.
+    #[tokio::test]
+    async fn egg_info_entries_are_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sp = dir.path();
+        let egg = sp.join("six-1.16.0-py3.11.egg-info");
+        tokio::fs::create_dir_all(&egg).await.unwrap();
+        tokio::fs::write(egg.join("PKG-INFO"), "Name: six\nVersion: 1.16.0\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(sp.join("zope.interface-5.4.0-py3.11.egg-info"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            sp.join("PyGObject-3.48.2.egg-info"),
+            "Metadata-Version: 1.1\nName: PyGObject\nVersion: 3.48.2\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(sp.join("ghost-1.0.egg-info"), "not metadata")
+            .await
+            .unwrap();
+        let mut listed = list_dist_info_packages(sp).await;
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec![
+                ("pygobject".to_string(), "3.48.2".to_string()),
+                ("six".to_string(), "1.16.0".to_string()),
+                ("zope-interface".to_string(), "5.4.0".to_string()),
+            ]
+        );
+        let found = PythonCrawler::new()
+            .find_by_purls(sp, &["pkg:pypi/six@1.16.0".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(found["pkg:pypi/six@1.16.0"].path, sp);
     }
 
     #[test]
@@ -2412,8 +3161,7 @@ mod tests {
 
     /// Regression for the macOS Python.framework layout: the `Versions/`
     /// directory holds bare version dirs (`3.11`), so the version segment
-    /// must be matched with `*`. A `python3.*` pattern matches nothing —
-    /// which is exactly the bug that was fixed.
+    /// must be matched with `*`. A `python3.*` pattern matches nothing.
     #[tokio::test]
     async fn test_find_python_dirs_framework_versions_layout() {
         let dir = tempfile::tempdir().unwrap();

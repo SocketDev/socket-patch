@@ -19,7 +19,8 @@
 //!      production-shaped `…/patch-registry/maven/<token>/<uuid>/maven2`
 //!      path, next to the discovery / reference / view API mocks.
 //!   3. `scan --mode hosted --json --vex …` (the real binary) rewires the
-//!      three files, writes the ledger, and attests in-run `(redirected)`.
+//!      three files (v5: NO redirect ledger — the pom is the hosted state)
+//!      and attests in-run `(redirected)`.
 //!   4. FRESH CHECKOUT: only `pom.xml` + `.mvn/` + `.socket/` travel, the
 //!      fixture is purged from the local repository, and Maven resolves
 //!      with a user `settings.xml` mirroring ONLY `socket-patch-<uuid>`
@@ -33,17 +34,18 @@
 //!      lines ignore the `aether.*` properties — asserted, so a change in
 //!      either direction is noticed).
 //!   6. MANIFEST-LESS VEX over the fresh checkout (`vex_e2e_common`):
-//!      * the ledger present, online → the installed suffixed copy
-//!        hash-verifies, attested `(redirected)`; `--offline` → attested
-//!        from the ledger's record;
-//!      * the ledgers deleted, online → attested from the pom wiring +
-//!        the API record; `--offline` → `record_unavailable`, ZERO
-//!        requests;
+//!      * online → attested from the pom wiring + the API record (the
+//!        installed suffixed copy hash-verifies, `(redirected)`);
+//!        `--offline` → `record_unavailable`, ZERO requests (hosted mode
+//!        keeps no local record);
 //!      * embedded `apply --vex` with no manifest attests the same;
 //!      * a tampered installed jar → `hash_mismatch`;
-//!      * the pom reverted to the registry version (ledgers, `.mvn/` and
-//!        the installed suffixed copy left behind) → `redirect_unwired`,
+//!      * the pom reverted to the registry version (`.mvn/` and the
+//!        installed suffixed copy left behind) → nothing names the patch,
 //!        with and without `--no-verify`.
+//!   7. ROLLBACK (`--offline`: Maven restores with no network) returns the
+//!      original project's pom byte-for-byte to its registry version and
+//!      drops the `.mvn/` provenance hosted mode wrote.
 //!
 //! Gated like the other real-toolchain capstones: `#[ignore]` (network to
 //! Maven Central for the fixture), toolchain selection and the
@@ -308,6 +310,19 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
         return;
     };
     let pristine_pom = std::fs::read_to_string(proj.join("pom.xml")).unwrap();
+    // The project pins the Maven under test through the Maven Wrapper, so
+    // the rewriter's "your Maven ignores the Trusted Checksums pin" warning
+    // is judged against the same release that step 5b drives (#258).
+    std::fs::create_dir_all(proj.join(".mvn/wrapper")).unwrap();
+    std::fs::write(
+        proj.join(".mvn/wrapper/maven-wrapper.properties"),
+        format!(
+            "distributionUrl=https\\://repo.maven.apache.org/maven2/org/apache/maven/\
+             apache-maven/{v}/apache-maven-{v}-bin.zip\n",
+            v = mvn.version
+        ),
+    )
+    .unwrap();
 
     // 2. Patched jar + served pom + the record (real before/after hashes).
     let (_orig, patched) = patched_member(&jar, UUID);
@@ -323,7 +338,7 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
     mount_api(&server, &patched_jar, &sfx_pom, &view);
     server.serve_repo(&patched_jar, &sfx_pom, None);
 
-    // 3. The real writer: three-file rewrite + ledger + in-run VEX.
+    // 3. The real writer: three-file rewrite + in-run VEX, no ledger.
     let (code, env, stderr) = socket(
         &proj,
         &m2,
@@ -351,6 +366,17 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
     assert_eq!(env["redirect"]["mode"], "hosted", "{env}");
     assert_eq!(env["redirect"]["redirected"], 1, "{env}");
     assert_eq!(env["vex"]["statements"], 1, "{env}");
+    let unenforced = env["redirect"]["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|w| w["code"] == "redirect_maven_trusted_checksums_unenforced");
+    assert_eq!(
+        unenforced,
+        !mvn.enforces_trusted_checksums(),
+        "Maven {}: the unenforced-pin warning must match what step 5b proves: {env}",
+        mvn.version
+    );
     let embedded: serde_json::Value =
         serde_json::from_slice(&std::fs::read(proj.join("embedded.vex.json")).unwrap()).unwrap();
     assert_attested(&embedded, &purl(), UUID, Marker::Redirected, &vulns());
@@ -367,7 +393,10 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
         checksums.contains(&sha256_hex(&patched_jar)) && checksums.contains(&sha256_hex(&sfx_pom)),
         "trusted checksums pin the jar and the served pom:\n{checksums}"
     );
-    assert!(proj.join(".socket/vendor/redirect-state.json").is_file());
+    assert!(
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode must not write the redirect ledger"
+    );
     assert!(
         !proj.join(".socket/manifest.json").exists(),
         "hosted mode never writes the manifest"
@@ -473,35 +502,8 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
     let api = PatchApi::start(vec![(UUID.to_string(), view.clone())]);
     let run = vex_run(&m2);
 
-    // Ledger present, online: the installed suffixed copy hash-verifies.
-    let out = run_vex(
-        &binary(),
-        &fresh,
-        &VexRun {
-            proxy_url: Some(api.uri()),
-            ..run.clone()
-        },
-    );
-    assert_eq!(out.code, Some(0), "{out}");
-    assert_attested(out.doc(), &purl(), UUID, Marker::Redirected, &vulns());
-    // ...and offline from the ledger's embedded record.
-    let quiet = PatchApi::empty();
-    let out = run_vex(
-        &binary(),
-        &fresh,
-        &VexRun {
-            offline: true,
-            proxy_url: Some(quiet.uri()),
-            ..run.clone()
-        },
-    );
-    assert_eq!(out.code, Some(0), "{out}");
-    assert_attested(out.doc(), &purl(), UUID, Marker::Redirected, &vulns());
-    quiet.assert_no_requests();
-
-    // Ledgers gone: the pom wiring + the API record.
-    let ledger = std::fs::read(fresh.join(".socket/vendor/redirect-state.json")).unwrap();
-    strip_ledgers(&fresh);
+    // Online: the pom wiring + the API record; the installed suffixed copy
+    // hash-verifies.
     let before = api.view_requests(UUID);
     let out = run_vex(
         &binary(),
@@ -530,7 +532,8 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
     assert_eq!(out.code, Some(0), "{out}");
     assert_attested(out.doc(), &purl(), UUID, Marker::Redirected, &vulns());
 
-    // Offline, no ledgers: record_unavailable with zero network.
+    // Offline: no local record (hosted mode keeps none) → record_unavailable
+    // with zero network.
     let quiet = PatchApi::empty();
     let out = run_vex(
         &binary(),
@@ -574,36 +577,55 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
     assert_not_attested(&out.envelope, &purl(), "hash_mismatch");
     std::fs::write(&installed, &patched_jar).unwrap();
 
-    // Reverted to the registry version, ledger + `.mvn/` + the installed
-    // suffixed copy left behind: dead, with and without --no-verify.
+    // Reverted to the registry version, `.mvn/` + the installed suffixed
+    // copy left behind: nothing names the patch any more, with and without
+    // --no-verify.
     std::fs::write(fresh.join("pom.xml"), &pristine_pom).unwrap();
-    std::fs::write(fresh.join(".socket/vendor/redirect-state.json"), &ledger).unwrap();
     for no_verify in [false, true] {
-        let quiet = PatchApi::empty();
         let out = run_vex(
             &binary(),
             &fresh,
             &VexRun {
-                offline: true,
+                proxy_url: Some(api.uri()),
                 no_verify,
-                proxy_url: Some(quiet.uri()),
                 ..run.clone()
             },
         );
-        assert_eq!(out.code, Some(1), "reverted no_verify={no_verify}: {out}");
-        assert_not_attested(&out.envelope, &purl(), "redirect_unwired");
+        assert_eq!(out.code, Some(2), "reverted no_verify={no_verify}: {out}");
+        assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
         assert_absent(out.doc.as_ref(), &purl());
     }
-    // ...and with the ledger gone too there is nothing to attest at all.
-    strip_ledgers(&fresh);
-    let out = run_vex(
-        &binary(),
-        &fresh,
-        &VexRun {
-            proxy_url: Some(api.uri()),
-            ..run.clone()
-        },
+
+    // 7. ROLLBACK of the original project: Maven's restore needs no
+    // network, so `--offline` returns the pom byte-for-byte to its registry
+    // version and drops the `.mvn/` provenance.
+    let (code, env, stderr) = socket(
+        &proj,
+        &m2,
+        &[
+            "rollback",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(out.code, Some(2), "{out}");
-    assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
+    assert_eq!(code, Some(0), "rollback --offline: {env}\n{stderr}");
+    assert_eq!(
+        env["hosted"]["reverted"],
+        serde_json::json!([purl()]),
+        "rollback restores the hosted pin: {env}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("pom.xml")).unwrap(),
+        pristine_pom,
+        "rollback restores the pom byte-for-byte"
+    );
+    for rel in [".mvn/checksums/checksums.sha256", ".mvn/maven.config"] {
+        assert!(
+            !proj.join(rel).exists(),
+            "rollback removes the {rel} hosted mode wrote"
+        );
+    }
+    assert!(!proj.join(".socket/vendor/redirect-state.json").exists());
 }

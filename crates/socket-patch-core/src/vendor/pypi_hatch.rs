@@ -61,7 +61,7 @@ pub(super) async fn load(
             )
         })?;
         if leaf.contains(['/', '\\', '%', ':'])
-            || !leaf.ends_with(".whl")
+            || !super::pypi_distribution::supported(leaf)
             || hash.len() != 64
             || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
@@ -133,7 +133,7 @@ async fn require_environment_context_support(root: &Path) -> Result<(), Failure>
             return Ok(());
         }
     }
-    Err(("pypi_hatch_unsupported", "vendored environment dependencies require Hatch >=1.2 on PATH for root URI expansion; upgrade Hatch or use the install hook".into()))
+    Err(("pypi_hatch_unsupported", "vendored environment dependencies require Hatch >=1.2 on PATH for root URI expansion; upgrade Hatch or use agent mode".into()))
 }
 
 async fn write_files(

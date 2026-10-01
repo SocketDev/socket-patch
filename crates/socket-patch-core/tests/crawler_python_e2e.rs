@@ -130,7 +130,7 @@ async fn find_python_dirs_python3_wildcard_matches_versions() {
 }
 
 /// `*` generic wildcard matches every directory entry. Covers the
-/// generic wildcard branch (L142-L160 of python_crawler.rs).
+/// generic `*` wildcard branch of `find_python_dirs`.
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_python_dirs_star_wildcard_matches_all() {
@@ -159,7 +159,7 @@ async fn find_python_dirs_star_wildcard_matches_all() {
 }
 
 /// `*` wildcard skips non-directory entries (regular files). Covers
-/// the `if !ft.is_dir() { continue; }` arm.
+/// the `entry_is_dir` skip arm.
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_python_dirs_star_wildcard_skips_files() {
@@ -341,12 +341,11 @@ async fn get_global_python_site_packages_discovers_anaconda() {
 /// Both Apple's `/usr/bin/python3` and Homebrew's `python3` are framework
 /// builds and use it, so a stock Mac has several of these trees.
 ///
-/// The well-known scan covers pip --user on Linux (`~/.local`) and Windows
-/// (`%APPDATA%\Python`) but had no macOS entry, so the only thing that ever
-/// surfaced such a package was the `site.getusersitepackages()` query — which
-/// reports at most the ONE interpreter first on PATH. Everything
-/// `pip3 install --user`ed under any other interpreter was invisible to
-/// global discovery.
+/// The well-known scan needs a macOS entry alongside pip --user on Linux
+/// (`~/.local`) and Windows (`%APPDATA%\Python`): the
+/// `site.getusersitepackages()` query reports at most the ONE interpreter
+/// first on PATH, so everything `pip3 install --user`ed under any other
+/// interpreter would be invisible to global discovery.
 ///
 /// Two versions are staged deliberately: the runtime-query arm can only ever
 /// contribute the host interpreter's own version, so requiring BOTH to surface
@@ -519,6 +518,191 @@ async fn get_global_python_site_packages_discovers_uv_python_install() {
     );
 }
 
+// ── pipx venv discovery ───────────────────────────────────────
+
+/// Run `get_global_python_site_packages` with HOME, PIPX_HOME and
+/// XDG_DATA_HOME rebound (`None` unsets), restoring all three after.
+/// pipx resolves its home from these, so every pipx test has to pin
+/// them or an ambient value on the host would decide the result.
+async fn global_site_packages_with_env(
+    home: &Path,
+    pipx_home: Option<&Path>,
+    xdg_data_home: Option<&Path>,
+) -> Vec<std::path::PathBuf> {
+    let saved: Vec<(&str, Option<String>)> = ["HOME", "PIPX_HOME", "XDG_DATA_HOME"]
+        .into_iter()
+        .map(|k| (k, std::env::var(k).ok()))
+        .collect();
+    std::env::set_var("HOME", home);
+    for (key, value) in [("PIPX_HOME", pipx_home), ("XDG_DATA_HOME", xdg_data_home)] {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+    let result = get_global_python_site_packages().await;
+    for (key, value) in saved {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+    result
+}
+
+/// The site-packages of a pipx app venv under `pipx_home`, in the
+/// platform's venv layout (`lib/python3.X/site-packages` on Unix,
+/// `Lib\site-packages` on Windows).
+fn pipx_venv_site_packages(pipx_home: &Path, app: &str) -> std::path::PathBuf {
+    let venv = pipx_home.join("venvs").join(app);
+    if cfg!(windows) {
+        venv.join("Lib").join("site-packages")
+    } else {
+        venv.join("lib").join("python3.11").join("site-packages")
+    }
+}
+
+/// `pipx install hatch` on Linux (pipx >= 1.3) puts the app venv at
+/// `~/.local/share/pipx/venvs/hatch` (#415). Every app venv must surface,
+/// not just the first.
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pipx_venvs_linux() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pipx_home = tmp.path().join(".local").join("share").join("pipx");
+    let staged: Vec<_> = ["hatch", "black"]
+        .iter()
+        .map(|app| pipx_venv_site_packages(&pipx_home, app))
+        .collect();
+    for sp in &staged {
+        tokio::fs::create_dir_all(sp).await.unwrap();
+    }
+
+    let result = global_site_packages_with_env(tmp.path(), None, None).await;
+    for sp in &staged {
+        assert!(
+            result.iter().any(|p| p == sp),
+            "pipx venv {} must surface; got {result:?}",
+            sp.display()
+        );
+    }
+}
+
+/// pipx's Linux default follows `$XDG_DATA_HOME` (platformdirs'
+/// `user_data_dir`), so a relocated data home moves the venvs too.
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pipx_venvs_under_xdg_data_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path().join("xdg-data");
+    let sp = pipx_venv_site_packages(&xdg.join("pipx"), "hatch");
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_env(tmp.path(), None, Some(&xdg)).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "pipx venv under XDG_DATA_HOME must surface; got {result:?}"
+    );
+}
+
+/// Native (C-extension) packages land in `lib64` on RHEL/Fedora/SUSE
+/// venvs, the same split the other well-known scans already handle.
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pipx_venv_lib64() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pipx_home = tmp.path().join("pipx-home");
+    let sp = pipx_home
+        .join("venvs")
+        .join("hatch")
+        .join("lib64")
+        .join("python3.11")
+        .join("site-packages");
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_env(tmp.path(), Some(&pipx_home), None).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "pipx venv lib64 site-packages must surface; got {result:?}"
+    );
+}
+
+/// pipx's legacy home `~/.local/pipx` is still used when it exists
+/// (pipx < 1.3 installs, and pipx's fallback on every OS), and is
+/// what macOS runners use in the #415 probe.
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pipx_venvs_legacy_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sp = pipx_venv_site_packages(&tmp.path().join(".local").join("pipx"), "hatch");
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_env(tmp.path(), None, None).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "legacy ~/.local/pipx venv must surface; got {result:?}"
+    );
+}
+
+/// platformdirs' macOS data dir is `~/Library/Application Support`,
+/// which pipx 1.3–1.4 used as its default home.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pipx_venvs_macos_app_support() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pipx_home = tmp
+        .path()
+        .join("Library")
+        .join("Application Support")
+        .join("pipx");
+    let sp = pipx_venv_site_packages(&pipx_home, "hatch");
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_env(tmp.path(), None, None).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "macOS Application Support pipx venv must surface; got {result:?}"
+    );
+}
+
+/// pipx's Windows default home is `%USERPROFILE%\pipx`, with venvs in
+/// the Windows layout `venvs\<app>\Lib\site-packages`.
+#[cfg(windows)]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pipx_venvs_windows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sp = pipx_venv_site_packages(&tmp.path().join("pipx"), "hatch");
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_env(tmp.path(), None, None).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "%USERPROFILE%\\pipx venv must surface; got {result:?}"
+    );
+}
+
+/// An explicit `PIPX_HOME` relocates every pipx venv, on every OS.
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pipx_venvs_under_pipx_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pipx_home = tmp.path().join("custom pipx");
+    let sp = pipx_venv_site_packages(&pipx_home, "hatch");
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_env(tmp.path(), Some(&pipx_home), None).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "pipx venv under PIPX_HOME must surface; got {result:?}"
+    );
+}
+
 // ── project-marker fallback in get_site_packages_paths ────────
 
 /// A project with `pyproject.toml` but no `.venv` must fall through
@@ -593,12 +777,9 @@ async fn get_site_packages_paths_falls_back_via_pyproject_marker() {
 /// `uv.lock` alone is also a valid Python-project marker — a fresh
 /// clone of a uv-managed repo shouldn't need a venv to be scannable.
 ///
-/// Previously this test only asserted the call returned `Ok` without
-/// staging anything discoverable, so a regression that dropped
-/// `uv.lock` from the marker list (returning an empty Vec via the
-/// no-marker early-out) stayed green. We now stage a real global
-/// layout under the stubbed HOME and assert it surfaces — which can
-/// ONLY happen if the `uv.lock` marker triggered the global fallback.
+/// Stages a real global layout under the stubbed HOME and asserts it
+/// surfaces — which can ONLY happen if the `uv.lock` marker triggered
+/// the global fallback (no marker returns an empty Vec).
 #[tokio::test]
 #[serial]
 async fn get_site_packages_paths_falls_back_via_uv_lock_marker() {
@@ -868,7 +1049,8 @@ async fn read_python_metadata_rejects_fifo_metadata_without_hanging() {
 mod common;
 
 /// `find_by_purls` short-circuits when the site-packages dir is
-/// unreadable. Drives the python_crawler.rs:530 read_dir Err arm.
+/// unreadable. Drives the unreadable-listing arm of
+/// `list_dist_info_packages`.
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::parallel]
@@ -892,8 +1074,8 @@ async fn find_by_purls_handles_unreadable_site_packages() {
     assert!(result.is_empty());
 }
 
-/// `scan_site_packages` short-circuits when site-packages is
-/// unreadable — drives python_crawler.rs:584 read_dir Err arm.
+/// `list_dist_info_packages` yields nothing when site-packages is
+/// unreadable (`list_dir_sync` degrades to an empty listing).
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::parallel]
@@ -998,8 +1180,8 @@ async fn find_by_purls_strips_qualifiers() {
 /// A bare `#subpath` (no `?qualifier`) is valid PURL grammar and must be
 /// stripped the same way qualifiers are — cutting only at `?` leaks the
 /// subpath into the version (`2.28.0#src/requests`), so the installed
-/// package silently fails to match. Twin of the strip_purl_qualifiers
-/// subpath fix in utils::purl.
+/// package silently fails to match. Twin of `strip_purl_qualifiers`'
+/// subpath handling in utils::purl.
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_by_purls_strips_subpath() {
@@ -1179,7 +1361,7 @@ async fn crawl_all_with_unparseable_dist_info_skips() {
 }
 
 /// `get_site_packages_paths` with `global_prefix` set returns just that
-/// prefix — exercises the early-return arm at python_crawler.rs:473-474.
+/// prefix — exercises its `global_prefix` early-return arm.
 #[tokio::test]
 #[serial_test::parallel]
 async fn get_site_packages_paths_with_global_prefix_passthrough() {

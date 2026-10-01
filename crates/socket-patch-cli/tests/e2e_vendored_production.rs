@@ -55,18 +55,11 @@
 //!
 //! # Ecosystem coverage notes (gaps, and one resolved gap)
 //!
-//! * **gem** — RESOLVED: full coverage. The old `platform_gem_unsupported`
-//!   refusal for `?platform=ruby` purls was fixed in the CLI (#172 — only
-//!   non-`ruby` platform qualifiers are refused), and the 2026-08-18 catalog
-//!   republish restored the pinned patch, so
-//!   [`gem_bundler_vendored_install_proof`] now runs the complete vendored
-//!   loop including the fresh-dir `bundle install` delivery proof. While
-//!   production's served `gem-stub-gemspec` remains invalid (D4: missing the
-//!   rubygems-required `summary`/`authors`), the leg passes via the CLI's
-//!   invalid-stub hardening — `--vendor-source auto` detects the defect and
-//!   falls back to the local build (`vendor_prebuilt_stub_invalid` warning);
-//!   once the server-side stub fix deploys and the artifacts rebuild, the
-//!   same leg exercises the service artifact directly.
+//! * **gem** — full coverage (only non-`ruby` platform qualifiers are
+//!   refused): [`gem_bundler_vendored_install_proof`] runs the complete vendored
+//!   loop including the fresh-dir `bundle install` delivery proof. The server
+//!   must provide a valid `gem-stub-gemspec` with summary and authors; invalid
+//!   stubs fail closed without constructing a local replacement.
 //! * **golang** — vendored mode *works* (directory `replace`), but production
 //!   publishes no free golang patches, so there is nothing to vendor.
 //!   [`golang_vendored_finds_no_free_patches`] asserts exactly that (zero
@@ -146,8 +139,9 @@ const PYPI_PURL: &str = "pkg:pypi/urllib3@1.26.18";
 const PYPI_NAME: &str = "urllib3";
 const PYPI_VERSION: &str = "1.26.18";
 /// urllib3 1.26.18 carries **three** distinct free patches (one per advisory).
-/// Which one the resolver selects is a server-side ordering detail, so the
-/// tests assert "one of these" rather than pinning a single UUID.
+/// The CLI's own ranking (`socket_patch_core::api::ranking`) picks one, and
+/// the pick changes whenever production publishes a new or merged patch, so
+/// the tests assert "one of these" rather than pinning a single UUID.
 const PYPI_UUIDS: &[&str] = &[
     "de58c8b8-796c-4b6d-8a48-539b5563db76",
     "26242e35-f867-4da8-8789-f0d2ea49e0f1",
@@ -164,9 +158,10 @@ const GEM_NAME: &str = "activestorage";
 const GEM_VERSION: &str = "6.0.3";
 /// Any-of pin set for the gem leg: `(patch uuid, the file its diff marks)`.
 /// Production has published several distinct free 6.0.3 patches (one per
-/// advisory), the manifest holds one patch per PURL, and which one the
-/// server-ranked resolver returns is a server-side ordering detail — so the
-/// leg accepts any pinned patch and probes the marker file that PATCH
+/// advisory), the manifest holds one patch per PURL, and the CLI's own
+/// ranking (`socket_patch_core::api::ranking`: severity, advisory count,
+/// then newest) picks one — the pick changes whenever
+/// production publishes a new or merged patch, so the leg accepts any pinned patch and probes the marker file that PATCH
 /// actually touches. When production publishes another acceptable 6.0.3
 /// patch, verify its `/patch/view` blobs carry the marker and append it here
 /// (and to the hosted suite's `GEM_UUIDS`).
@@ -189,10 +184,23 @@ const GEM_PATCHES: &[(&str, &str)] = &[
         "eeb6bf9f-96c0-4963-a0f1-2e88f91f8b1a",
         "lib/active_storage/service/disk_service.rb",
     ),
-    // GHSA-r4mg-4433-c7g3 / CVE-2025-24293, published 2026-08-20T20:31Z —
-    // the one the server-ranked selection wires as of 2026-08-20.
+    // GHSA-r4mg-4433-c7g3 / CVE-2025-24293, published 2026-08-20T20:31Z.
     (
         "c1a1cd3c-b670-4e44-b4fa-1a63ecd42db6",
+        "lib/active_storage/transformers/image_processing_transformer.rb",
+    ),
+    // GHSA-xr9x-r78c-5hrm / CVE-2026-66066, published 2026-08-21T19:07Z
+    // (also adds lib/active_storage/vips.rb).
+    (
+        "9c2b4925-b413-4a3a-bb3a-9990440fb446",
+        "lib/active_storage/transformers/image_processing_transformer.rb",
+    ),
+    // MERGED patch (GHSA-w749-p3v6-hccq + GHSA-r4mg-4433-c7g3 +
+    // GHSA-xr9x-r78c-5hrm), published 2026-09-04T21:23Z; the merge rung in
+    // `api::ranking` selects it. Also touches engine.rb, active_storage.rb and
+    // adds vips.rb — every file carries the marker.
+    (
+        "01019627-b481-4bae-bc09-e93b5a5e4481",
         "lib/active_storage/transformers/image_processing_transformer.rb",
     ),
 ];
@@ -209,10 +217,8 @@ const YARN_BERRY: &str = "yarn@4.6.0";
 /// patches to exercise it with. [`canary_unpublished_vendored_ecosystems`]
 /// watches these so coverage can be extended the moment one lights up.
 const UNPUBLISHED_ECOSYSTEMS: &[(&str, &[&str])] = &[
-    // cargo joined this list on 2026-09-01: production deleted its last free
-    // cargo patches on 2026-08-28, retiring the pinned `[patch.crates-io]`
-    // delivery proof this suite used to carry. Re-promotion procedure:
-    // docs/testing/vendored-production-e2e.md.
+    // Production has no free cargo patches (since 2026-08-28). Re-promotion
+    // procedure: docs/testing/vendored-production-e2e.md.
     (
         "cargo",
         &["pkg:cargo/openssl", "pkg:cargo/tokio", "pkg:cargo/smallvec"],
@@ -1249,14 +1255,13 @@ fn yarn_classic_vendored_install_proof() {
             ("apply --vex", yarn_classic_vex::via_apply()),
             ("vendor --vex", yarn_classic_vex::via_vendor()),
             // The command the leg itself ran, re-run manifest-less
-            // (`--detached`: no manifest writes — the shape under test).
+            // (vendored mode writes no manifest — the shape under test).
             (
-                "scan --mode vendored --detached --vex",
+                "scan --mode vendored --vex",
                 Box::new(|run: vex_e2e_common::VexRun| {
                     run.via(vex_e2e_common::VexVia::Scan)
                         .arg("--mode")
                         .arg("vendored")
-                        .arg("--detached")
                         .arg("--yes")
                 }),
             ),
@@ -1886,8 +1891,9 @@ fn pypi_requirements_txt_vendored_install_proof() {
         "{LEG}: requirements.txt was not rewired to the vendored wheel:\n{reqs}"
     );
     assert!(
-        reqs.contains("--hash=sha256:"),
-        "{LEG}: rewritten requirements.txt carries no --hash pin:\n{reqs}"
+        !reqs.contains("--hash"),
+        "{LEG}: an unhashed requirements.txt must stay unhashed, or pip's \
+         hash-checking mode refuses every other requirement (#376):\n{reqs}"
     );
 
     // DELIVERY PROOF: requirements.txt + .socket only, fresh venv, --no-index
@@ -2139,29 +2145,8 @@ fn pypi_uv_lock_vendored_install_proof() {
 /// rubygems.org — a path source only pins the one gem), and the file the
 /// patch rewrites must carry the `Socket Community Patch` header.
 ///
-/// # How the leg passes while production's served stub is invalid (D4)
-///
-/// The `gem-stub-gemspec` artifact production currently serves omits the
-/// rubygems-required `summary`/`authors`, so writing it verbatim would make
-/// the frozen `bundle install` below exit 1 on every bundler major. The CLI's
-/// invalid-stub hardening is what this leg regression-tests live: under the
-/// default `--vendor-source auto` the scan detects the defective stub, warns
-/// (`vendor_prebuilt_stub_invalid`), and falls back to the LOCAL build
-/// (installed gem + locally derived stub), which installs green. That is also
-/// why the leg installs in bundler's deployment layout (`vendor/bundle`
-/// inside the project): the crawler only sees a project-local install, and
-/// the fallback needs the install's `specifications/` stub. Once the
-/// server-side stub fix (depscan) deploys and the artifacts rebuild, the same
-/// leg exercises the service artifact directly — no test change needed.
-///
-/// # History
-///
-/// This leg used to tolerate a `platform_gem_unsupported` vendor refusal:
-/// production publishes the gem purl platform-qualified (`?platform=ruby`)
-/// and the old vendor gate refused every platform qualifier. #172 fixed the
-/// gate to refuse only non-empty, non-`ruby` platforms, and the 2026-08-18
-/// catalog republish restored the pinned patch, so the leg was upgraded to
-/// this full install proof per its own auto-retire NOTE.
+/// The service must supply both the patched archive and a valid stub gemspec.
+/// A defective stub is a server failure; the CLI cannot build a replacement.
 #[test]
 #[ignore = "live production API + real rubygems.org. Run with --ignored."]
 fn gem_bundler_vendored_install_proof() {
@@ -2213,7 +2198,7 @@ fn gem_bundler_vendored_install_proof() {
     );
     let installed_dir = PathBuf::from(String::from_utf8_lossy(&info.stdout).trim());
     // Anti-vacuity over EVERY pinned patch's marker file: whichever patch the
-    // server-ranked resolver wires below, its target must start pristine.
+    // CLI's ranking wires below, its target must start pristine.
     // Capture the pristine bytes now, keyed by file, for the post-install
     // byte-inequality probe.
     let mut pristine_by_file = std::collections::HashMap::new();
@@ -2619,9 +2604,7 @@ fn deno_vendored_is_unsupported() {
 }
 
 /// cargo, maven, nuget and composer all implement vendored mode, but
-/// production publishes no free-tier patches for them. (cargo used to have a
-/// full delivery proof — retired 2026-09-01 when production's free cargo tier
-/// emptied.) This probes production every run and reports the moment that
+/// production publishes no free-tier patches for them. This probes production every run and reports the moment that
 /// changes, so coverage can be extended deliberately rather than by accident.
 /// It does not fail when patches appear;
 /// `SOCKET_PATCH_VENDORED_E2E_CANARY_STRICT=1` makes it fail, for a scheduled

@@ -36,7 +36,7 @@
 //!    [`inventory_project_every_lock`] unions for ledger liveness).
 //!
 //! Formats whose reader a writer already owns keep the model there
-//! (`cargo_lock::locked_packages`, `gemfile_lock`, `utils::python_lock` /
+//! (`formats::cargo`, `formats::gem`, `utils::python_lock` /
 //! `poetry_lock`, `utils::requirements`), and only the registry view lives
 //! here. [`LockfileEntry::source_kind`] carries provenance a view knows
 //! positively (crates.io), which ledger liveness reads instead of inferring
@@ -65,19 +65,17 @@ pub(crate) mod npm_family;
 pub(crate) mod pnpm;
 pub(crate) mod pypi;
 pub(crate) mod recover;
-pub(crate) mod vlt;
 pub mod view;
+pub(crate) mod vlt;
 pub(crate) mod wired;
 pub(crate) mod yarn;
 
-pub(crate) use self::composer::{composer_lock_packages, ComposerLockPackage};
-pub(crate) use self::npm::{npm_lock_nodes, NpmLockNode};
+pub(crate) use self::npm::{npm_lock_bundled_nodes, npm_lock_nodes, NpmLockNode};
 #[cfg(test)]
 pub(crate) use self::npm_family::inventory_npm_lock;
-pub(crate) use self::pnpm::pnpm_registry_key;
 pub(crate) use self::pypi::pipfile_lock_entries;
 pub use self::recover::recover_lock_entry;
-pub use self::view::{MemoryEntry, MemoryProject, ProjectView};
+pub use self::view::{DiskSnapshot, MemoryEntry, MemoryProject, ProjectView};
 pub use self::wired::wired_vendor_integrity;
 
 // The per-format views `inventory_project_diagnosed` unions (and the test
@@ -173,7 +171,7 @@ pub struct LockfileEntry {
 }
 
 impl LockfileEntry {
-    fn npm(
+    pub(crate) fn npm(
         name: impl Into<String>,
         version: impl Into<String>,
         resolved: Option<String>,
@@ -203,6 +201,39 @@ pub struct UnsupportedNpmLayout {
     pub code: &'static str,
     /// Human-readable diagnosis with format or filesystem error details.
     pub detail: String,
+}
+
+/// Map a core npm-layout refusal onto scan's warning channel as
+/// `(code, detail)`. The yarn code matches apply's refusal errorCode
+/// (`yarn_pnp_unsupported`) so consumers key on ONE name across commands;
+/// the pnpm twin gets the parallel spelling. Details are scan-phrased (what
+/// was NOT scanned + remedy) rather than the probe's vendor-phrased text.
+pub fn unsupported_layout_warnings(unsupported: &[UnsupportedNpmLayout]) -> Vec<(String, String)> {
+    unsupported
+        .iter()
+        .map(|diag| match diag.code {
+            "vendor_yarn_berry_unsupported" => (
+                "yarn_pnp_unsupported".to_string(),
+                "this project uses yarn Plug'n'Play (a `.pnp.*` loader is present): its npm \
+                 packages live inside `.yarn/cache/*.zip`, not `node_modules/`, so socket-patch \
+                 cannot discover or patch them in ANY mode (agent, hosted, or vendored) — npm \
+                 dependencies were NOT scanned. Use `yarn patch <pkg>` to patch them instead."
+                    .to_string(),
+            ),
+            "vendor_pnpm_pnp_unsupported" => (
+                "pnpm_pnp_unsupported".to_string(),
+                "this project uses pnpm's Plug'n'Play linker (`node-linker=pnp` in .npmrc): \
+                 lockfile discovery is skipped under this layout, so lockfile-only npm \
+                 dependencies were NOT scanned. Switch .npmrc to `node-linker=isolated`, run \
+                 `pnpm install`, and re-run — or use `socket-patch scan --mode hosted`, which \
+                 edits pnpm-lock.yaml in place."
+                    .to_string(),
+            ),
+            // Forward-compat: a new refusal code surfaces verbatim rather
+            // than being swallowed back into silence.
+            other => (other.to_string(), diag.detail.clone()),
+        })
+        .collect()
 }
 
 /// Match a manifest/API purl (possibly percent-encoded, possibly carrying
@@ -364,7 +395,7 @@ fn dedup_prefer_integrity(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
 /// (drops `git+…`, `file:…`, `link:…` — content the registry conventions
 /// cannot reproduce; such entries stay listed for discovery but the fetch
 /// layer's integrity rule decides fetchability).
-fn http_url(raw: &str) -> Option<String> {
+pub(crate) fn http_url(raw: &str) -> Option<String> {
     (raw.starts_with("https://") || raw.starts_with("http://")).then(|| raw.to_string())
 }
 
@@ -374,8 +405,8 @@ fn http_url(raw: &str) -> Option<String> {
 /// `// ── file selection ──` (stat / list only, never a content read), and
 /// `// ── registry view ──` (unrestricted) — so lockfile discovery can
 /// import the models without bypassing its recognizing ctx reads. The same
-/// rule covers the other readers discovery imports: `vendor::maven_pom`,
-/// `vendor::nuget_config`'s reader half, and the `// ── pure reader ──`
+/// rule covers the other readers discovery imports: `formats::maven`,
+/// `formats::nuget`, and the `// ── pure reader ──`
 /// regions of the writer-owned `go_mod_edit`, `go_sum_edit`,
 /// `cargo_config` and `cargo_manifest`.
 #[cfg(test)]
@@ -471,7 +502,7 @@ mod architecture_tests {
             check(name, &text);
         }
         // Vendor-side readers lockfile discovery imports.
-        for rel in ["vendor/nuget_config.rs", "vendor/maven_pom.rs"] {
+        for rel in ["formats/nuget/mod.rs", "formats/maven/mod.rs"] {
             let text = std::fs::read_to_string(src.join(rel)).expect("read reader module");
             check(rel, &text);
         }
@@ -483,8 +514,8 @@ mod architecture_tests {
             "vendor/go_sum_edit.rs",
             "vendor/cargo_config.rs",
             "vendor/cargo_manifest.rs",
-            "vendor/nuget_config.rs",
-            "vendor/maven_pom.rs",
+            "formats/nuget/mod.rs",
+            "formats/maven/mod.rs",
         ] {
             let text = std::fs::read_to_string(src.join(rel)).expect("read reader module");
             assert!(

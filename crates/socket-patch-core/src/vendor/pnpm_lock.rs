@@ -5,7 +5,7 @@
 //! lockfile's own `overrides:` section, so a lock-only edit is unsound:
 //! `--frozen-lockfile` fails with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` and a
 //! plain `pnpm install` silently strips the section and reinstalls the
-//! unpatched registry bytes (spike P3, `spikes/PHASE0-V2-FINDINGS.txt`).
+//! unpatched registry bytes (spike P3).
 //!
 //! WHERE pnpm reads overrides moved between majors: pnpm <= 10 reads
 //! package.json `pnpm.overrides`; pnpm >= 11 no longer reads the package.json
@@ -18,11 +18,10 @@
 //! has no `pnpm-workspace.yaml`, one is created carrying a root-only
 //! `packages:` list (pnpm 9 refuses a workspace file with no `packages`
 //! field) plus the `overrides:` block; `vendor --revert` deletes it again.
-//! The lock still gets the four fragments pnpm itself would emit. The surgery
-//! is a faithful port of
-//! `spikes/pnpm/edit_lock.py`, whose output was verified byte-identical to
-//! pnpm's own lock on BOTH supported majors (9.15.9 / 10.34.1 — they emit
-//! byte-identical `lockfileVersion: '9.0'` locks; fixtures in `spikes/pnpm/`):
+//! The lock still gets the four fragments pnpm itself would emit; the
+//! surgery's output was verified byte-identical to pnpm's own lock on BOTH
+//! supported majors (9.15.9 / 10.34.1 — they emit byte-identical
+//! `lockfileVersion: '9.0'` locks):
 //!
 //! 1. `overrides:` section — inserted before `importers:` or extended;
 //! 2. every importer's dep entry — `specifier:` AND `version:` rewritten to
@@ -73,6 +72,12 @@ use super::state::{
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use crate::constants::npm_family::PNPM_LOCK;
+use crate::formats::pnpm::lines::{
+    indent_of, next_block, parse_key_line, section_bounds, split_lines, unquote_value, yaml_key,
+    yaml_key_like, YamlBlock,
+};
+use crate::formats::pnpm::workspace;
+use crate::formats::pnpm::{check_v9_lock_version as check_lock_version, vendored_npm_uuids};
 
 const PACKAGE_JSON: &str = "package.json";
 const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
@@ -83,10 +88,6 @@ const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
 /// no-op that cannot accidentally glob a stray `packages/` subtree into a
 /// workspace the way `packages/*` would.
 const WS_SCAFFOLD_PACKAGES: [&str; 2] = ["packages:", "  - '.'"];
-
-/// The only lockfileVersion the surgery has byte-exact fixtures for (both
-/// pnpm 9 and 10 emit it).
-const SUPPORTED_LOCK_VERSION: &str = "9.0";
 
 /// Wiring kinds (the `WiringRecord.kind` discriminators this backend owns).
 pub(super) const KIND_PKG_OVERRIDE: &str = "pnpm_pkg_override";
@@ -333,6 +334,7 @@ pub async fn vendor_pnpm<'a>(
         base_purl: coords.base_purl,
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: rel_tgz,
             sha256: packed.sha256_hex,
             size: Some(packed.size),
@@ -560,48 +562,12 @@ pub async fn pnpm_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Opti
     if check_lock_version(&text).is_err() {
         return None;
     }
-    // CRLF (a Windows autocrlf checkout) breaks every structural probe
-    // below: the scan would find nothing and call a lock that still
-    // resolves through the artifact "provably orphaned" — undeterminable,
-    // keep (the unwired-revert guard then refuses, fail-closed).
-    if text.contains('\r') {
-        return None;
-    }
     // Every `packages:`/`snapshots:` block key resolving into
-    // `.socket/vendor/npm/<uuid>/`, collected once per lock bytes (see
-    // [`LockIndex`]) once these bytes are probed again; the first probe
-    // runs [`pnpm_entry_in_use_scan`], the per-call scan it answers for.
-    let doc = LOCK_MEMO.parse_infallible(text.as_bytes(), || LockDoc::new(split_lines(&text)));
-    doc.note_probe();
-    Some(match doc.index() {
-        Some(index) => index.vendored_npm_uuids.contains(&entry.uuid),
-        None => pnpm_entry_in_use_scan(&entry.uuid, &doc.lines),
-    })
-}
-
-/// The pre-index [`pnpm_entry_in_use`] body over already-split lines: the
-/// answer for a lock probed once, and the equivalence oracle for the
-/// indexed answer.
-fn pnpm_entry_in_use_scan(uuid: &str, lines: &[String]) -> bool {
-    for section in ["packages", "snapshots"] {
-        let Some((start, end)) = section_bounds(lines, section) else {
-            continue;
-        };
-        let mut i = start + 1;
-        while let Some(block) = next_block(lines, i, end) {
-            let resolved_to_ours = block
-                .key
-                .find("@file:")
-                .map(|at| &block.key[at + 1..])
-                .and_then(parse_vendor_path)
-                .is_some_and(|p| p.eco == "npm" && p.uuid == uuid);
-            if resolved_to_ours {
-                return true;
-            }
-            i = block.end;
-        }
-    }
-    false
+    // `.socket/vendor/npm/<uuid>/` — the format model's one walk
+    // ([`vendored_npm_uuids`], CRLF read like LF), collected once per lock
+    // bytes: a revert pass probes once per ledger entry.
+    let vendored = IN_USE_MEMO.parse_infallible(text.as_bytes(), || vendored_npm_uuids(&text));
+    Some(vendored.contains(&entry.uuid))
 }
 
 /// FAIL-CLOSED revert guard for a ledger entry with NO wiring records,
@@ -612,9 +578,9 @@ fn pnpm_entry_in_use_scan(uuid: &str, lines: &[String]) -> bool {
 /// restored entry carries empty wiring). Revert has nothing to replay for
 /// them — it cannot un-wire the lock — so removing the artifact while
 /// `pnpm-lock.yaml` still resolves through it bricks every subsequent
-/// install (ENOENT on the missing `file:` tarball), and used to do so
-/// silently. `in_use` is the calling backend's own lock probe result
-/// ([`pnpm_entry_in_use`] / its legacy twin): `Some(true)` refuses;
+/// install (ENOENT on the missing `file:` tarball). `in_use` is the calling
+/// backend's own lock probe result ([`pnpm_entry_in_use`] / its legacy
+/// twin): `Some(true)` refuses;
 /// `Some(false)` (provably orphaned) returns `None` and the caller's
 /// removal proceeds unchanged; undeterminable (`None`) refuses too UNLESS
 /// the lock is absent altogether — a missing lock cannot reference the
@@ -877,11 +843,11 @@ pub async fn revert_pnpm_opts(
         }
     }
 
-    // LOSSINESS GUARD (residual #131): when any wiring record was left
-    // alone ("drifted; left alone"), the uuid dir may hold the only copy of
-    // what the lock — or the redirect ledger's recorded originals — still
-    // points at. Keep it (and let the CLI keep the ledger entry) instead of
-    // deleting evidence out from under a lock we just refused to touch.
+    // LOSSINESS GUARD: when any wiring record was left alone ("drifted;
+    // left alone"), the uuid dir may hold the only copy of what the lock —
+    // or the redirect ledger's recorded originals — still points at. Keep
+    // it (and let the CLI keep the ledger entry) instead of deleting evidence
+    // out from under a lock we just refused to touch.
     if outcome.drift_skipped() {
         outcome.keep_artifact(&uuid_dir_rel);
         return outcome;
@@ -1120,46 +1086,6 @@ impl EditCtx<'_> {
 }
 
 // ─────────────────────────── pre-flight checks ───────────────────────────
-
-/// `lockfileVersion: '9.0'` head check (accept pnpm's single quotes plus
-/// double-quoted/bare spellings) — the v9 BACKEND's own guard. The flavor
-/// router sniffs with [`super::pnpm_lock_legacy::sniff_lock_grammar`]
-/// instead, whose allowlist also routes the legacy 5.4/6.0 grammars to
-/// their backend; this check only fires if a non-9.0 lock reaches
-/// `vendor_pnpm` directly.
-pub(super) fn check_lock_version(text: &str) -> Result<(), String> {
-    let version = text
-        .lines()
-        .take(5)
-        .find_map(|line| line.strip_prefix("lockfileVersion:"))
-        .map(|rest| rest.trim().trim_matches(['\'', '"']).to_string());
-    match version {
-        Some(v) if v == SUPPORTED_LOCK_VERSION => Ok(()),
-        Some(v) => {
-            // The remedy must point the right way: 5.x (pnpm 7) / 6.x
-            // (pnpm 8) locks predate the v9 grammar and upgrading pnpm
-            // re-locks them, but a HIGHER version means the user's pnpm
-            // already outgrew this build — telling them "re-lock with
-            // pnpm >= 9" would loop them back to the lock they have.
-            let major = v.split('.').next().and_then(|m| m.parse::<u32>().ok());
-            Err(match major {
-                Some(m) if m < 9 => format!(
-                    "{PNPM_LOCK} has lockfileVersion {v}; only {SUPPORTED_LOCK_VERSION} is \
-                     supported — re-lock with pnpm >= 9"
-                ),
-                _ => format!(
-                    "{PNPM_LOCK} has lockfileVersion {v}; this socket-patch build supports \
-                     lockfileVersion {SUPPORTED_LOCK_VERSION} — re-lock with a pnpm release \
-                     that emits it, or update socket-patch"
-                ),
-            })
-        }
-        None => Err(format!(
-            "{PNPM_LOCK} has no lockfileVersion in its head; only \
-             {SUPPORTED_LOCK_VERSION} is supported — re-lock with pnpm >= 9"
-        )),
-    }
-}
 
 /// The package-name component of a pnpm override key
 /// (`[@scope/]name[@range]`, possibly behind a `parent>child` selector
@@ -1661,14 +1587,16 @@ struct WorkspaceEdit {
     created_overrides: bool,
 }
 
-/// Locate the top-level `overrides:` block and the indent its entries use
+/// Locate the top-level `overrides:` block (any key spelling pnpm reads:
+/// quoted, `overrides :`, a trailing comment) and the indent its entries use
 /// (pnpm's canonical is 2 spaces; a hand-authored file may differ). `None`
 /// when there is no block-style `overrides:` section.
 fn ws_overrides_section(lines: &[String]) -> Option<(usize, usize, usize)> {
-    let (start, end) = section_bounds(lines, "overrides")?;
+    let (start, end) = workspace::block_section_bounds(lines, "overrides")?;
+    // Comment lines (any indent) say nothing about the entries' indent.
     let indent = lines[start + 1..end]
         .iter()
-        .find(|l| !l.trim().is_empty())
+        .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
         .map(|l| indent_of(l))
         .filter(|&n| n >= 1)
         .unwrap_or(2);
@@ -1690,10 +1618,18 @@ fn check_workspace_override(
         return Ok(());
     };
     let lines = split_lines(text);
-    if lines
-        .iter()
-        .any(|l| l.starts_with("overrides:") && l.trim_end() != "overrides:")
-    {
+    // A document the line surgery cannot extend (flow-style root, several
+    // documents) would be corrupted by any splice: refuse before writing.
+    if let Err(why) = workspace::block_insert_point(&lines) {
+        return Err(format!(
+            "{PNPM_WORKSPACE} {why}, which the override surgery cannot edit without \
+             corrupting it — rewrite it as a single block mapping and re-run"
+        ));
+    }
+    if lines.iter().any(|l| {
+        workspace::top_level_key(l)
+            .is_some_and(|(key, value)| key == "overrides" && !value.is_empty())
+    }) {
         return Err(format!(
             "{PNPM_WORKSPACE} has an inline `overrides:` mapping the pair surgery cannot \
              edit — rewrite it as a block mapping (`overrides:` then indented entries) \
@@ -1791,14 +1727,12 @@ fn apply_workspace_override(
         });
     }
 
-    // File exists without an `overrides:` section: append one after the last
-    // non-empty line (no blank separator, so revert removes exactly two
-    // lines and the file's trailing bytes stay put).
-    let anchor = lines
-        .iter()
-        .rposition(|l| !l.trim().is_empty())
-        .map(|i| i + 1)
-        .unwrap_or(lines.len());
+    // File exists without an `overrides:` section: append one after the
+    // document's last non-empty line, before a `...` end marker (no blank
+    // separator, so revert removes exactly two lines and the file's trailing
+    // bytes stay put).
+    let anchor = workspace::block_insert_point(&lines)
+        .map_err(|why| format!("{PNPM_WORKSPACE} {why}; the overrides section cannot be added"))?;
     lines.splice(
         anchor..anchor,
         [
@@ -2293,10 +2227,13 @@ fn matching_blocks<L: EditLines>(
 /// The run's `pnpm-lock.yaml` split. A vendored run reads the lock once per
 /// patched npm package — and a monorepo lock runs to megabytes, so the
 /// split into lines and the whole-section scans the pre-flight and the
-/// edits make were paid per package. See [`ParseMemo`]: the read still
+/// edits make would be paid per package. See [`ParseMemo`]: the read still
 /// happens every time, and a lock whose bytes changed between two packages
 /// is split afresh. The backend re-seeds the slot with the lock it wrote.
 static LOCK_MEMO: ParseMemo<LockDoc> = ParseMemo::new();
+
+/// [`pnpm_entry_in_use`]'s vendored-uuid set, per lock bytes.
+static IN_USE_MEMO: ParseMemo<HashSet<String>> = ParseMemo::new();
 
 /// One lock's lines plus their [`LockIndex`] — a pure function of the
 /// lines, so of the bytes the memo keys on — built only once the same lines
@@ -2548,9 +2485,6 @@ struct LockIndex {
     first_importer_ver_paren: HashMap<String, usize>,
     first_importer_dep_ver_paren: HashMap<(String, String), usize>,
     first_importer_catalog: HashMap<(String, String), usize>,
-    /// The uuid of every packages/snapshots key resolving into
-    /// `.socket/vendor/npm/<uuid>/` ([`pnpm_entry_in_use`]).
-    vendored_npm_uuids: HashSet<String>,
 }
 
 /// Every prefix of `s` that ends right before a `(`.
@@ -2657,20 +2591,6 @@ impl LockIndex {
                     k = f;
                 }
                 i = importer.end;
-            }
-        }
-
-        for section in [&index.packages, &index.snapshots] {
-            for block in &section.blocks {
-                if let Some(parts) = block
-                    .key
-                    .find("@file:")
-                    .map(|at| &block.key[at + 1..])
-                    .and_then(parse_vendor_path)
-                    .filter(|p| p.eco == "npm")
-                {
-                    index.vendored_npm_uuids.insert(parts.uuid);
-                }
             }
         }
         index
@@ -3246,156 +3166,7 @@ async fn unwind_override_surfaces(
     }
 }
 
-// ───────────────────────────── guarded reads ──────────────────────────────
-
-// ─────────────────────── yaml-ish line-block helpers ──────────────────────
-// pnpm-lock.yaml is machine-emitted with a fixed 2/4/6/8-space shape; these
-// helpers splice line blocks and never interpret YAML generically.
-
-pub(super) fn split_lines(text: &str) -> Vec<String> {
-    text.split('\n').map(str::to_string).collect()
-}
-
-/// `(header_idx, end_idx)` of a top-level `name:` section; `end` is the
-/// first following column-0 line (exclusive), so trailing blank separator
-/// lines belong to the section.
-pub(super) fn section_bounds(lines: &[String], name: &str) -> Option<(usize, usize)> {
-    let header = format!("{name}:");
-    let start = lines.iter().position(|l| l == &header)?;
-    let end = lines
-        .iter()
-        .enumerate()
-        .skip(start + 1)
-        .find(|(_, l)| !l.is_empty() && !l.starts_with(' '))
-        .map(|(i, _)| i)
-        .unwrap_or(lines.len());
-    Some((start, end))
-}
-
-/// One 2-space-keyed block inside a section (`[header, end)`; `end` stops at
-/// the blank separator / next block header, so the captured fragment is the
-/// verbatim entry without surrounding blanks).
-pub(super) struct YamlBlock {
-    pub(super) header: usize,
-    pub(super) end: usize,
-    pub(super) key: String,
-    /// The key exactly as spelled in the file (incl. quotes) — rekeys
-    /// preserve the file's quoting style.
-    repr: String,
-    /// Inline value after `:` (e.g. `{}` for empty snapshots), `""` if none.
-    rest: String,
-}
-
-impl YamlBlock {
-    /// The inline-rest suffix to re-emit after the (re)written key.
-    fn rest_suffix(&self) -> String {
-        if self.rest.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", self.rest)
-        }
-    }
-}
-
-/// The next block at or after line `i` (within `[i, end)`).
-pub(super) fn next_block(lines: &[String], mut i: usize, end: usize) -> Option<YamlBlock> {
-    while i < end {
-        if let Some((key, repr, rest)) = parse_key_line(&lines[i], 2) {
-            let mut j = i + 1;
-            while j < end && !lines[j].is_empty() && indent_of(&lines[j]) >= 4 {
-                j += 1;
-            }
-            return Some(YamlBlock {
-                header: i,
-                end: j,
-                key: key.to_string(),
-                repr: repr.to_string(),
-                rest: rest.to_string(),
-            });
-        }
-        i += 1;
-    }
-    None
-}
-
-pub(super) fn indent_of(line: &str) -> usize {
-    line.len() - line.trim_start_matches(' ').len()
-}
-
-/// Parse a mapping line at exactly `indent` spaces into
-/// `(key, verbatim_key_repr, value_after_colon)`. Accepts pnpm's bare keys
-/// and both quote styles (single quotes are what pnpm emits for `@`-leading
-/// keys); the value separator is the first `:` followed by a space or EOL
-/// (keys themselves contain `:` in `file:` specs).
-///
-/// All three are slices of `line`. Every scan below runs this over whole
-/// `packages:` / `snapshots:` sections once per vendored package, so on a
-/// multi-megabyte lock the owning copies it used to hand back dominated
-/// the surgery's CPU. A caller that keeps a piece past the next edit to
-/// `lines` copies it itself.
-pub(super) fn parse_key_line(line: &str, indent: usize) -> Option<(&str, &str, &str)> {
-    if line.len() <= indent || !line.as_bytes()[..indent].iter().all(|&b| b == b' ') {
-        return None;
-    }
-    let s = &line[indent..];
-    let c0 = s.as_bytes()[0];
-    if c0 == b' ' {
-        return None;
-    }
-    if c0 == b'\'' || c0 == b'"' {
-        let quote = c0 as char;
-        let close = s[1..].find(quote)? + 1;
-        let after = &s[close + 1..];
-        let rest = after.strip_prefix(':')?;
-        let rest = rest.strip_prefix(' ').unwrap_or(rest);
-        return Some((&s[1..close], &s[..close + 1], rest));
-    }
-    let bytes = s.as_bytes();
-    for i in 0..bytes.len() {
-        if bytes[i] == b':' && (i + 1 == bytes.len() || bytes[i + 1] == b' ') {
-            if i == 0 {
-                return None;
-            }
-            let rest = if i + 1 < bytes.len() { &s[i + 2..] } else { "" };
-            return Some((&s[..i], &s[..i], rest));
-        }
-    }
-    None
-}
-
-/// Strip one matching pair of surrounding quotes from a mapping VALUE
-/// (pnpm quotes values that would misparse as plain YAML scalars, e.g. the
-/// default-catalog specifier `'catalog:'`).
-fn unquote_value(value: &str) -> &str {
-    let bytes = value.as_bytes();
-    if bytes.len() >= 2
-        && (bytes[0] == b'\'' || bytes[0] == b'"')
-        && bytes[bytes.len() - 1] == bytes[0]
-    {
-        &value[1..value.len() - 1]
-    } else {
-        value
-    }
-}
-
-/// pnpm quotes `@`-leading keys with single quotes; everything we write is
-/// otherwise bare.
-pub(super) fn yaml_key(key: &str) -> String {
-    if key.starts_with('@') {
-        format!("'{key}'")
-    } else {
-        key.to_string()
-    }
-}
-
-/// Re-spell `key` in the same quoting style as the original `repr`.
-pub(super) fn yaml_key_like(key: &str, original_repr: &str) -> String {
-    match original_repr.as_bytes().first() {
-        Some(b'\'') => format!("'{key}'"),
-        Some(b'"') => format!("\"{key}\""),
-        _ => yaml_key(key),
-    }
-}
+// ─────────────────────────── wiring record helpers ──────────────────────────
 
 pub(super) fn lines_value(lines: &[String]) -> Value {
     Value::Array(lines.iter().map(|l| Value::String(l.clone())).collect())
@@ -3433,7 +3204,7 @@ mod tests {
         "sha512-VR8nCbFxvOcFX5Rxku2psjaj0+xzKdzFkcuqZJSHf597bMVomG100t6+cJkMBFRLhyVdSVwufbCwVzlCzZkUwg==";
 
     // ── tool-generated byte-exact oracles ─────────────────────────────────
-    // Provenance: spikes/pnpm/p1-multi-dep/{before,after}/ — generated by
+    // Provenance: spike P1 (multi-dep) before/after — generated by
     // pnpm 9.15.9 AND 10.34.1 (byte-identical on both majors), spike P1/P2.
     const P1_BEFORE_PKG: &str = r#"{
   "name": "vendor-spike",
@@ -3552,7 +3323,7 @@ snapshots:
   left-pad@file:.socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz: {}
 ";
 
-    // Provenance: spikes/pnpm/p7-workspace/{before,after}/ (spike P7) — the
+    // Provenance: spike P7 (workspace) before/after — the
     // per-importer re-relativized specifier vs root-relative version.
     const P7_BEFORE_PKG: &str = r#"{
   "name": "ws-root",
@@ -3665,7 +3436,7 @@ snapshots:
         async fn vendor(&self, dry_run: bool) -> VendorOutcome {
             let blobs = self.root().join(".socket/blobs");
             let sources = PatchSources::blobs_only(&blobs);
-            vendor_pnpm(
+            crate::vendor::test_support::vendor_pnpm(
                 "pkg:npm/left-pad@1.3.0",
                 &self.installed(),
                 self.root(),
@@ -3709,7 +3480,7 @@ snapshots:
         cfg: Option<&crate::vendor::VendorServiceConfig>,
     ) -> VendorOutcome {
         let blobs = fx.root().join(".socket/blobs");
-        vendor_pnpm(
+        crate::vendor::test_support::vendor_pnpm(
             "pkg:npm/left-pad@1.3.0",
             &fx.installed(),
             fx.root(),
@@ -4031,11 +3802,9 @@ snapshots:
         (fx, entry)
     }
 
-    /// P1 regression (empirically confirmed vs a real pnpm@10.34.5 project,
-    /// 2026-08-18): a `repair`-reconstructed entry carries no wiring
-    /// records; revert used to remove the artifact dir unconditionally,
-    /// leaving the lock resolving through a deleted tarball — every later
-    /// install failed ENOENT, and nothing said so. With nothing to replay,
+    /// A `repair`-reconstructed entry carries no wiring records; removing
+    /// the artifact dir would leave the lock resolving through a deleted
+    /// tarball (every later install fails ENOENT). With nothing to replay,
     /// revert must refuse (fail-closed) while the lock still resolves
     /// through the artifact.
     #[tokio::test]
@@ -4442,12 +4211,11 @@ snapshots:
     /// Two VERSIONS of the same package vendored in sequence: each edit
     /// must bind to its own version's entries — a name-only "ours" match
     /// would let the second vendor clobber/rekey the first one's blocks
-    /// (live-debugged on Flowise: identical duplicated mapping keys).
-    /// 1.2.0 is reachable through a transitive dependent's snapshot ref
-    /// (the Flowise shape) — the P1 `npm:` ALIAS shape now refuses
-    /// fail-closed instead (see
+    /// (identical duplicated mapping keys). 1.2.0 is reachable through a
+    /// transitive dependent's snapshot ref — the P1 `npm:` ALIAS shape
+    /// refuses fail-closed instead (see
     /// `aliased_same_version_reference_refuses_fail_closed`; the surgery
-    /// cannot rewrite alias dep paths and used to strand them dangling).
+    /// cannot rewrite alias dep paths).
     #[tokio::test]
     async fn multi_version_vendor_does_not_clobber_sibling_entries() {
         // P1 with the `left-pad-old` alias swapped for a `dep-two`
@@ -4494,7 +4262,7 @@ snapshots:
         record2.uuid = uuid2.to_string();
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_pnpm(
+        let outcome = crate::vendor::test_support::vendor_pnpm(
             "pkg:npm/left-pad@1.2.0",
             &installed2,
             fx.root(),
@@ -5184,8 +4952,8 @@ snapshots:
         );
         // Non-drifted fragments still restored.
         assert!(after.contains("  left-pad@1.3.0:\n    resolution: {integrity: sha512-XI5MPzVN"));
-        // Residual #131: a drift-skip keeps the artifact dir (the drifted
-        // fragment's recorded original may still be needed later) and says so.
+        // A drift-skip keeps the artifact dir (the drifted fragment's
+        // recorded original may still be needed later) and says so.
         assert!(
             fx.root()
                 .join(format!(".socket/vendor/npm/{UUID}"))
@@ -5290,7 +5058,7 @@ snapshots:
     /// pnpm >= 9" would loop those users back to the lock they have.
     #[test]
     fn lock_version_remedy_is_version_aware() {
-        use super::super::pnpm_lock_legacy::{sniff_lock_grammar, PnpmLockGrammar};
+        use crate::formats::pnpm::{sniff_lock_grammar, PnpmLockGrammar};
 
         assert!(check_lock_version("lockfileVersion: '9.0'\n").is_ok());
         assert_eq!(
@@ -5901,13 +5669,13 @@ snapshots:
         );
     }
 
-    /// A CRLF lock breaks the packages/snapshots section probes, so the
-    /// in-use scan finds nothing and would call a still-referenced artifact
-    /// "provably orphaned" (`Some(false)`) — letting the unwired-revert
-    /// guard delete it out from under the lock. CRLF must be undeterminable
-    /// (`None`), which the guard refuses on while the lock exists.
+    /// A CRLF lock (a Windows autocrlf checkout) must never read as
+    /// "provably orphaned" while it still resolves through the artifact —
+    /// that would let the unwired-revert guard delete it out from under the
+    /// lock. The in-use walk reads CRLF like LF, so it answers `Some(true)`
+    /// and the guard refuses.
     #[tokio::test]
-    async fn crlf_lock_is_undeterminable_for_in_use_and_unwired_revert_refuses() {
+    async fn crlf_lock_reads_as_in_use_and_unwired_revert_refuses() {
         let (fx, entry) = reconstructed_fixture().await;
         let crlf_lock = fx.read(PNPM_LOCK).await.replace('\n', "\r\n");
         tokio::fs::write(fx.root().join(PNPM_LOCK), &crlf_lock)
@@ -5916,8 +5684,8 @@ snapshots:
 
         assert_eq!(
             pnpm_entry_in_use(&entry, fx.root()).await,
-            None,
-            "a CRLF lock is undeterminable, never provably orphaned"
+            Some(true),
+            "a CRLF lock still consuming the artifact reads as in use"
         );
         let outcome = revert_pnpm(&entry, fx.root(), false).await;
         assert!(!outcome.success, "unwired revert must refuse: {outcome:?}");
@@ -5947,7 +5715,8 @@ snapshots:
     /// pnpm-workspace.yaml are the FIRST opens in the vendor flow (flavor
     /// detection reads only the lock), and revert's lock/package.json reads
     /// are the first opens of theirs. Same `open_regular_file` guard class
-    /// as the vendor siblings (npm_lock.rs, npm_flavor.rs, lock_inventory.rs).
+    /// as the vendor siblings (npm_lock.rs, npm_flavor.rs, the
+    /// lock_inventory/ readers).
     #[cfg(unix)]
     #[tokio::test]
     async fn fifo_pair_files_fail_fast_instead_of_wedging_vendor_and_revert() {
@@ -7612,7 +7381,7 @@ snapshots:
         let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_pnpm(
+        let outcome = crate::vendor::test_support::vendor_pnpm(
             "pkg:npm/left-pad", // no @version — the npm purl grammar refuses
             &fx.installed(),
             fx.root(),
@@ -7645,7 +7414,7 @@ snapshots:
             result
                 .error
                 .as_deref()
-                .is_some_and(|e| e.contains("cannot stage a copy of the installed package")),
+                .is_some_and(|e| e.contains("patch service request failed")),
             "{:?}",
             result.error
         );
@@ -8349,10 +8118,6 @@ snapshots:
         assert_eq!(planned, looped);
     }
 
-    /// A gate only the local build reaches — bundled dependencies are
-    /// checked on the STAGED copy, after the service has been asked — is
-    /// not a pre-flight gate: the plan admits the package (the loop would
-    /// ask the service for it) and the loop's own refusal stands.
     #[tokio::test]
     async fn preflight_leaves_post_service_gates_to_the_loop() {
         let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
@@ -8364,7 +8129,7 @@ snapshots:
         .unwrap();
         let (planned, looped) = preflight_then_vendor(&fx).await;
         assert_eq!(planned, Ok(()), "the plan cannot see a staged-copy gate");
-        assert_eq!(looped, Err("vendor_bundled_deps_unsupported"));
+        assert_eq!(looped, Ok(()));
     }
 
     // ─────────────── V-2: memoized split + section index oracles ───────────────
@@ -8578,13 +8343,12 @@ snapshots:
                     "seed {seed} {name}"
                 );
             }
-            for uuid in [UUID, OTHER_UUID] {
-                assert_eq!(
-                    index.vendored_npm_uuids.contains(uuid),
-                    pnpm_entry_in_use_scan(uuid, &lines),
-                    "seed {seed} in-use {uuid}"
-                );
-            }
+            // The in-use walk reads a CRLF lock like its LF twin.
+            assert_eq!(
+                vendored_npm_uuids(&text),
+                vendored_npm_uuids(&text.replace('\n', "\r\n")),
+                "seed {seed} in-use"
+            );
             for name in NAMES {
                 for version in VERSIONS {
                     let scan = check_rewritable_refs_with(&lines, name, version, None);
@@ -8756,5 +8520,166 @@ snapshots:
             "right-pad",
             "1.3.0"
         ));
+    }
+
+    /// pnpm-workspace.yaml spellings and document shapes the overrides surgery
+    /// must read the way pnpm's YAML parser does (#400, #402).
+    mod workspace_yaml_shape_tests {
+        use super::*;
+
+        const SPEC: &str = "file:.socket/vendor/npm/u1/left-pad-1.3.0.tgz";
+
+        fn apply(text: &str) -> Result<String, String> {
+            check_workspace_override(Some(text), "left-pad", "1.3.0", "left-pad@1.3.0")?;
+            let mut wiring = Vec::new();
+            let edit = apply_workspace_override(Some(text), "left-pad@1.3.0", SPEC, &mut wiring)?;
+            Ok(edit.new_text.expect("an edit"))
+        }
+
+        /// #402: a quoted or space-before-colon `overrides` key is the section
+        /// pnpm reads; the entry goes inside it, never into a duplicate key.
+        #[test]
+        fn quoted_or_spaced_overrides_key_is_edited_in_place() {
+            for header in [
+                "\"overrides\":",
+                "'overrides':",
+                "overrides :",
+                "overrides: # pins",
+            ] {
+                let text = format!("packages:\n  - '.'\n{header}\n  is-number: 7.0.0\n");
+                assert_eq!(
+                    apply(&text).unwrap(),
+                    format!(
+                        "packages:\n  - '.'\n{header}\n  is-number: 7.0.0\n  left-pad@1.3.0: {SPEC}\n"
+                    ),
+                    "{header}"
+                );
+            }
+        }
+
+        /// A column-0 comment inside the section does not hide later
+        /// entries from the check, the edit or the revert.
+        #[test]
+        fn column_zero_comment_inside_the_section_keeps_later_entries() {
+            let text = "packages:\n  - '.'\noverrides:\n  is-number: 7.0.0\n# pinned\n  left-pad@1.3.0: 1.3.1\n";
+            let err = check_workspace_override(Some(text), "left-pad", "1.3.0", "left-pad@1.3.0")
+                .unwrap_err();
+            assert!(err.contains("already carries an override"), "{err}");
+
+            let text = format!(
+                "overrides:\n  is-number: 7.0.0\n# ours below\n  left-pad@1.3.0: {SPEC}\nnext: x\n"
+            );
+            // Our entry below the comment is found: already in sync, no edit.
+            let mut wiring = Vec::new();
+            let edit =
+                apply_workspace_override(Some(&text), "left-pad@1.3.0", SPEC, &mut wiring).unwrap();
+            assert!(edit.new_text.is_none(), "{:?}", edit.new_text);
+            let rec = ws_record("left-pad@1.3.0", SPEC, WiringAction::Added, None);
+            let mut lines = split_lines(&text);
+            let (mut dirty, mut warnings) = (false, Vec::new());
+            revert_ws_record(&mut lines, &rec, "u1", &mut dirty, &mut warnings);
+            assert!(dirty && warnings.is_empty(), "{warnings:?}");
+            assert_eq!(
+                lines.join("\n"),
+                "overrides:\n  is-number: 7.0.0\n# ours below\nnext: x\n"
+            );
+        }
+
+        /// A leading comment does not decide the entries' indent: a
+        /// 4-space section is still read, edited and reverted as such.
+        #[test]
+        fn leading_comment_does_not_set_the_entry_indent() {
+            for comment in ["# pins", "  # pins"] {
+                let text = format!("overrides:\n{comment}\n    left-pad@1.3.0: 1.3.1\nnext: x\n");
+                let err =
+                    check_workspace_override(Some(&text), "left-pad", "1.3.0", "left-pad@1.3.0")
+                        .unwrap_err();
+                assert!(
+                    err.contains("already carries an override"),
+                    "{comment:?}: {err}"
+                );
+                let text = format!("overrides:\n{comment}\n    is-number: 7.0.0\nnext: x\n");
+                assert_eq!(
+                    apply(&text).unwrap(),
+                    format!(
+                        "overrides:\n{comment}\n    is-number: 7.0.0\n    left-pad@1.3.0: {SPEC}\nnext: x\n"
+                    ),
+                    "{comment:?}"
+                );
+            }
+        }
+
+        /// #402: the pre-flight conflict check examines a quoted section too.
+        #[test]
+        fn quoted_overrides_section_conflict_is_refused() {
+            let text = "packages:\n  - '.'\n\"overrides\":\n  left-pad@1.3.0: 1.3.1\n";
+            let err = check_workspace_override(Some(text), "left-pad", "1.3.0", "left-pad@1.3.0")
+                .unwrap_err();
+            assert!(err.contains("already carries an override"), "{err}");
+        }
+
+        /// #402: a quoted inline mapping is refused like an unquoted one.
+        #[test]
+        fn quoted_inline_overrides_mapping_is_refused() {
+            for line in [
+                "\"overrides\": {is-number: 7.0.0}",
+                "overrides : {is-number: 7.0.0}",
+            ] {
+                let text = format!("packages:\n  - '.'\n{line}\n");
+                let err =
+                    check_workspace_override(Some(&text), "left-pad", "1.3.0", "left-pad@1.3.0")
+                        .unwrap_err();
+                assert!(err.contains("inline `overrides:`"), "{line}: {err}");
+            }
+        }
+
+        /// #402: revert finds our key inside a quoted section.
+        #[test]
+        fn revert_removes_our_key_from_a_quoted_section() {
+            let rec = ws_record("left-pad@1.3.0", SPEC, WiringAction::Added, None);
+            let mut lines = split_lines(&format!(
+                "packages:\n  - '.'\n\"overrides\":\n  is-number: 7.0.0\n  left-pad@1.3.0: {SPEC}\n"
+            ));
+            let (mut dirty, mut warnings) = (false, Vec::new());
+            revert_ws_record(&mut lines, &rec, "u1", &mut dirty, &mut warnings);
+            assert!(dirty && warnings.is_empty(), "{warnings:?}");
+            assert_eq!(
+                lines.join("\n"),
+                "packages:\n  - '.'\n\"overrides\":\n  is-number: 7.0.0\n"
+            );
+        }
+
+        /// #400: a `...` document-end marker keeps the new section inside the
+        /// document (inserted before the marker).
+        #[test]
+        fn document_end_marker_keeps_the_section_in_the_document() {
+            assert_eq!(
+                apply("packages:\n  - '.'\n...\n").unwrap(),
+                format!("packages:\n  - '.'\noverrides:\n  left-pad@1.3.0: {SPEC}\n...\n")
+            );
+            // A leading `---` document start is an ordinary single document.
+            assert_eq!(
+                apply("---\npackages:\n  - '.'\n").unwrap(),
+                format!("---\npackages:\n  - '.'\noverrides:\n  left-pad@1.3.0: {SPEC}\n")
+            );
+        }
+
+        /// #400: shapes a line splice cannot extend are refused before any write.
+        #[test]
+        fn unspliceable_document_shapes_are_refused() {
+            for text in [
+                "{packages: [.]}\n",
+                "{\n  packages: [.]\n}\n",
+                "--- {packages: [.]}\n",
+                "packages:\n  - '.'\n...\n---\ncatalog: {}\n",
+                "packages:\n  - '.'\n---\ncatalog: {}\n",
+                "  packages:\n    - '.'\n",
+            ] {
+                let err =
+                    check_workspace_override(Some(text), "left-pad", "1.3.0", "left-pad@1.3.0")
+                        .unwrap_err();
+                assert!(err.contains(PNPM_WORKSPACE), "{text:?}: {err}");
+            }
+        }
     }
 }

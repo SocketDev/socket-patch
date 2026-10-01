@@ -1,6 +1,6 @@
-//! Coverage-gap tests for `commands/scan/hosted.rs` (coverage audit 2026-09).
+//! Coverage-gap tests for `commands/scan/hosted.rs`.
 //!
-//! Targets the audited never-executed branches of `run_redirect_selected`:
+//! Targets otherwise-untested branches of `run_redirect_selected`:
 //! the `bad_purl` / `no_url` reference skips, the WET takeover refusal
 //! (vendored revert fails closed) and its refused-purl cleanup, the cargo
 //! socket-owned-wiring-without-ledger refusal, the bun.lockb dry-run /
@@ -388,7 +388,7 @@ fn warning_detail<'a>(doc: &'a Value, code: &str) -> &'a str {
         .unwrap_or_else(|| panic!("expected a `{code}` warning: {doc:#}"))
 }
 
-// ───────────────────── reference-skip reasons (835-844) ─────────────────────
+// ───────────────────── reference-skip reasons ─────────────────────
 
 /// A granted reference whose purl fails `parse_purl_simple` is skipped with
 /// reason `bad_purl` — never redirected, never recorded — and the project is
@@ -517,7 +517,7 @@ async fn wet_takeover_refuses_unrevertable_vendored_flavor_fail_closed() {
     assert_eq!(code, 0, "a refused takeover still exits 0: {doc:#}");
     let detail = warning_detail(&doc, "redirect_vendored_revert_failed");
     assert!(
-        detail.contains("NOT redirected") && detail.contains("vendor --revert"),
+        detail.contains("NOT switched to hosted") && detail.contains("vendor --revert"),
         "the refusal must name the fail-closed outcome and the manual path: {detail}"
     );
     assert!(
@@ -555,18 +555,18 @@ async fn wet_takeover_refuses_unrevertable_vendored_flavor_fail_closed() {
     let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &[], &[]);
     assert_eq!(code, 0, "human refusal run exits 0; stderr=\n{stderr}");
     assert!(
-        stdout.contains("Redirected 0 packages; rewrote 0 files."),
+        stdout.contains("Switched 0 packages to hosted patches; rewrote 0 files."),
         "anchor: the human redirect branch ran; stdout=\n{stdout}"
     );
     assert!(
         stderr.contains(&format!(
-            "No patches could be redirected:\n  {PURL}: its vendored state could not be \
+            "No patches could be switched to hosted:\n  {PURL}: its vendored state could not be \
              reverted (see the warning)"
         )),
         "the human skipped line must name purl + reason; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Warning (redirect_vendored_revert_failed): ")
+        stderr.contains("Warning: ")
             && stderr.contains("could not be reverted"),
         "the takeover pre-warning must reach human stderr; stderr=\n{stderr}"
     );
@@ -791,16 +791,13 @@ async fn hosted_lock_held_refuses_before_any_write() {
     );
 }
 
-/// A WET zero-grant run (every reference skipped) holds no apply lock, so
-/// it must not perform the one write the strict ledger load can make: the
-/// `redirect-state.json` → `redirect-state.json.corrupt` quarantine. Under a
-/// held lock AND with no holder, a malformed ledger is reported as the hard
-/// error it is (exit 1, the repair-or-move-aside remedy) and left exactly
-/// where it was — no `.corrupt` file, no `.socket/vendor/` mutation
-/// lock-free. A granted wet run (the lock holder) still quarantines
-/// (pinned in in_process_redirect.rs).
+/// A zero-grant wet run over a project holding a MALFORMED pre-v5 redirect
+/// ledger: v5 scan never reads that ledger, so it is neither an error nor
+/// quarantined — the run succeeds (nothing granted, nothing written) under a
+/// lock held by another process and with no holder alike, and the torn file
+/// stays byte-identical in place. The human arm never mentions it either.
 #[tokio::test]
-async fn zero_grant_wet_run_reports_a_malformed_ledger_without_moving_it() {
+async fn zero_grant_wet_run_ignores_a_malformed_pre_v5_ledger() {
     use std::time::Duration;
 
     let no_grant = MockServer::start().await;
@@ -816,21 +813,12 @@ async fn zero_grant_wet_run_reports_a_malformed_ledger_without_moving_it() {
     std::fs::write(&ledger, TORN).unwrap();
     let lock_before = std::fs::read(root.join("package-lock.json")).unwrap();
 
-    let assert_left_in_place = |code: i32, doc: &Value, label: &str| {
-        assert_eq!(
-            code, 1,
-            "{label}: a malformed ledger is a hard error: {doc:#}"
-        );
-        assert_eq!(doc["status"], "error", "{label}: {doc:#}");
-        let error = doc["error"].as_str().unwrap_or_default();
+    let assert_ignored = |code: i32, doc: &Value, label: &str| {
+        assert_eq!(code, 0, "{label}: a pre-v5 ledger is never an error: {doc:#}");
+        assert_eq!(doc["status"], "success", "{label}: {doc:#}");
         assert!(
-            error.contains("redirect-state.json") && error.contains("is malformed"),
-            "{label}: the error names the ledger: {error}"
-        );
-        assert!(
-            !error.contains(".corrupt") && error.contains("move it aside"),
-            "{label}: no lock, so nothing was moved — the remedy is the repair-or-move-aside \
-             variant: {error}"
+            !doc.to_string().contains("redirect-state.json"),
+            "{label}: the envelope never mentions the legacy ledger: {doc:#}"
         );
         assert_eq!(
             std::fs::read(&ledger).unwrap(),
@@ -841,7 +829,7 @@ async fn zero_grant_wet_run_reports_a_malformed_ledger_without_moving_it() {
             !root
                 .join(".socket/vendor/redirect-state.json.corrupt")
                 .exists(),
-            "{label}: a zero-grant run never quarantines"
+            "{label}: never quarantined"
         );
         assert_eq!(
             std::fs::read(root.join("package-lock.json")).unwrap(),
@@ -850,8 +838,8 @@ async fn zero_grant_wet_run_reports_a_malformed_ledger_without_moving_it() {
         );
     };
 
-    // Under a lock held by another process: the run does not contend (it
-    // would write nothing) and must not rename under the holder either.
+    // Under a lock held by another process: a zero-grant run writes nothing,
+    // so it never contends.
     let holder =
         socket_patch_core::patch::apply_lock::acquire(&root.join(".socket"), Duration::ZERO)
             .unwrap();
@@ -860,30 +848,27 @@ async fn zero_grant_wet_run_reports_a_malformed_ledger_without_moving_it() {
         doc["errorCode"], "lock_held",
         "a zero-grant run never contends: {doc:#}"
     );
-    assert_left_in_place(code, &doc, "held lock");
+    assert_ignored(code, &doc, "held lock");
     drop(holder);
 
-    // No holder: same outcome — the gate is "this run holds the lock", not
-    // "nobody else does".
     let (code, doc) = scan_hosted_json(root, &no_grant.uri(), &[], &[]);
-    assert_left_in_place(code, &doc, "no holder");
+    assert_ignored(code, &doc, "no holder");
     assert!(
         !root.join(".socket/apply.lock").exists(),
         "no lock was taken, none is left behind"
     );
 
-    // Human arm: the same hard error on stderr, once.
     let (code, _stdout, stderr) = scan_hosted(root, &no_grant.uri(), &[], &[]);
-    assert_eq!(code, 1, "stderr=\n{stderr}");
-    assert_eq!(
-        stderr.matches("is malformed").count(),
-        1,
-        "reported exactly once; stderr=\n{stderr}"
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    assert!(
+        !stderr.contains("malformed") && !stderr.contains("redirect ledger"),
+        "stderr=\n{stderr}"
     );
     assert_eq!(std::fs::read(&ledger).unwrap(), TORN);
 }
 
-/// The hosted `lock_io` envelope (contract §123/§138): a regular file
+/// The hosted `lock_io` envelope (CLI_CONTRACT.md "Lock lifecycle (v5.0)" and
+/// the hosted-mode "Lock (v5.0)" clause): a regular file
 /// squatting on `.socket/` makes the wet run's lock acquire fail with an I/O
 /// fault, not contention — top-level `errorCode: "lock_io"`, a string
 /// `error` naming the squatting path, `redirect: {mode: "hosted"}` retained,
@@ -944,49 +929,51 @@ async fn hosted_lock_io_when_a_file_squats_on_socket_dir() {
 
 /// The footprint of a SUCCESSFUL wet hosted run (G6 / lock lifecycle): after
 /// `scan --mode hosted --yes` (human) and `scan --mode hosted --json`, each
-/// on a fresh project, `.socket/` holds exactly `vendor/` (the redirect
-/// ledger's home) — no `apply.lock` outlives the run, nothing else is
-/// created. The `--yes` human run also never prints the `Non-interactive
-/// mode detected` auto-accept line: the prompt is skipped, not answered.
+/// on a fresh project, `.socket/` holds NOTHING (v5 hosted mode writes no
+/// ledger; the lockfile is the whole record) — no `apply.lock` outlives the
+/// run, and nothing else is created. The human run also never prints the `Non-interactive mode
+/// detected` auto-accept line: scan never prompts.
 #[tokio::test]
-async fn successful_wet_hosted_run_leaves_only_vendor_under_socket() {
+async fn successful_wet_hosted_run_leaves_nothing_under_socket() {
     let server = MockServer::start().await;
     mock_discovery(&server, PURL, UUID).await;
     mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
     mock_view(&server, UUID, PURL).await;
 
     let socket_listing = |root: &Path| -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(root.join(".socket"))
-            .unwrap()
+        let Ok(dir) = std::fs::read_dir(root.join(".socket")) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = dir
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
         names
     };
 
-    // Human `--yes` arm.
+    // Human arm.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write_npm_project(root, NAME);
     let (code, stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains("Redirected 1 package; rewrote"),
+        stdout.contains("Switched 1 package to hosted patches; rewrote"),
         "the run must have redirected (and therefore locked); stdout=\n{stdout}"
     );
     assert!(
         !stderr.contains("Non-interactive mode detected"),
         "--yes skips the prompt outright; stderr=\n{stderr}"
     );
-    assert!(root.join(".socket/vendor/redirect-state.json").is_file());
+    assert!(!root.join(".socket/vendor/redirect-state.json").exists());
     assert!(
         !root.join(".socket/apply.lock").exists(),
         "apply.lock never outlives the run"
     );
     assert_eq!(
         socket_listing(root),
-        vec!["vendor".to_string()],
-        "a hosted run writes ONLY .socket/vendor/**"
+        Vec::<String>::new(),
+        "a v5 hosted run writes nothing under .socket/"
     );
 
     // `--json` arm on a fresh project (a second run over the redirected
@@ -1001,17 +988,15 @@ async fn successful_wet_hosted_run_leaves_only_vendor_under_socket() {
         !root.join(".socket/apply.lock").exists(),
         "apply.lock never outlives the run"
     );
-    assert_eq!(socket_listing(root), vec!["vendor".to_string()]);
+    assert_eq!(socket_listing(root), Vec::<String>::new());
 }
 
 /// Human `scan --mode hosted` on a project whose discovery is EMPTY returns
-/// before the engine (exit 0, `No patches available…`) — the only place a
-/// malformed redirect ledger would have been reported. It is reported there
-/// as an advisory instead, exactly once, and the file is never moved (a
-/// read-only consult; quarantine is the engine's job under the lock).
-/// `--silent` mutes it like every advisory.
+/// before the engine (exit 0, `No patches available…`). A malformed pre-v5
+/// redirect ledger is ignored there like everywhere else in v5 scan: no
+/// advisory (with or without `--silent`), never moved, no lock taken.
 #[tokio::test]
-async fn hosted_human_empty_discovery_still_reports_a_malformed_ledger() {
+async fn hosted_human_empty_discovery_ignores_a_malformed_pre_v5_ledger() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
@@ -1030,33 +1015,25 @@ async fn hosted_human_empty_discovery_still_reports_a_malformed_ledger() {
     const TORN: &[u8] = b"{ torn";
     std::fs::write(&ledger, TORN).unwrap();
 
-    let (code, stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
-    assert_eq!(code, 0, "an empty discovery exits 0; stderr=\n{stderr}");
-    assert!(
-        stdout.contains("No patches available for installed packages."),
-        "{stdout}"
-    );
-    assert_eq!(
-        stderr.matches("is malformed").count(),
-        1,
-        "the corruption is reported exactly once; stderr=\n{stderr}"
-    );
-    assert!(
-        stderr.contains("Warning: the redirect ledger"),
-        "advisory form; stderr=\n{stderr}"
-    );
-    assert_eq!(std::fs::read(&ledger).unwrap(), TORN, "left in place");
-    assert!(!root
-        .join(".socket/vendor/redirect-state.json.corrupt")
-        .exists());
-    assert!(!root.join(".socket/apply.lock").exists());
-
-    let (code, _stdout, stderr) = scan_hosted(root, &server.uri(), &["--silent"], &[]);
-    assert_eq!(code, 0, "stderr=\n{stderr}");
-    assert!(
-        !stderr.contains("is malformed"),
-        "--silent mutes the advisory; stderr=\n{stderr}"
-    );
+    for extra in [&[][..], &["--silent"][..]] {
+        let (code, stdout, stderr) = scan_hosted(root, &server.uri(), extra, &[]);
+        assert_eq!(code, 0, "{extra:?}: an empty discovery exits 0; stderr=\n{stderr}");
+        if extra.is_empty() {
+            assert!(
+                stdout.contains("No patches available for installed packages."),
+                "{stdout}"
+            );
+        }
+        assert!(
+            !stderr.contains("malformed") && !stderr.contains("redirect ledger"),
+            "{extra:?}: a pre-v5 ledger is never read; stderr=\n{stderr}"
+        );
+        assert_eq!(std::fs::read(&ledger).unwrap(), TORN, "left in place");
+        assert!(!root
+            .join(".socket/vendor/redirect-state.json.corrupt")
+            .exists());
+        assert!(!root.join(".socket/apply.lock").exists());
+    }
 }
 
 /// A free-tier org whose every discovered hosted offer is paid-tier: the
@@ -1106,15 +1083,15 @@ async fn hosted_human_paid_only_discovery_stops_with_the_paid_hint() {
     let (code, stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains("No downloadable patches (paid subscription required)."),
+        stdout.contains("No downloadable patches: every patch found requires a paid Socket plan."),
         "stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("1 additional patch is available with a paid subscription"),
+        stdout.contains("1 additional patch is available with a paid Socket plan"),
         "the table's paid nudge still prints; stdout=\n{stdout}"
     );
     assert!(
-        !stdout.contains("Redirected"),
+        !stdout.contains("Switched"),
         "the engine is never entered; stdout=\n{stdout}"
     );
     assert_eq!(
@@ -1125,7 +1102,7 @@ async fn hosted_human_paid_only_discovery_stops_with_the_paid_hint() {
     server.verify().await;
 }
 
-// ───────────── cargo wiring-without-ledger refusal (1104-1114) ─────────────
+// ───────────── cargo wiring-without-ledger refusal ─────────────
 
 /// A cargo purl with SOCKET-OWNED `[patch.crates-io]` wiring — pre-v5 in
 /// .cargo/config.toml, or v5 in the root Cargo.toml — but NO vendored ledger
@@ -1340,10 +1317,18 @@ async fn ledgerless_cargo_wiring_refuses(manifest_wiring: bool) {
 
 /// Dry-run and apply use the same native binary rewrite, with no Bun
 /// executable or installed dependencies. A fresh clone works immediately.
+/// No run writes a redirect ledger (v5), and `rollback` cannot restore a
+/// binary `bun.lockb` pin to its upstream entry: it refuses the pin
+/// (`partial_failure`, exit 1) naming the `git checkout` remedy and leaves
+/// the lock byte-identical.
 #[tokio::test]
 async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
     let purl = "pkg:npm/minimist@1.2.2";
-    let url = "https://patch.test/minimist-1.2.2.tgz";
+    // A standard hosted URL shape (grant token, then the patch uuid), so
+    // lockfile discovery recognizes the pin under `--patch-server-url`.
+    let url = &format!(
+        "https://patch.test/patch/npm/minimist/1.2.2/22222222-2222-4222-8222-222222222222/{UUID}/minimist-1.2.2.tgz"
+    );
     let sri = format!("sha512-{}", "A".repeat(86) + "==");
     let server = MockServer::start().await;
     mock_discovery(&server, purl, UUID).await;
@@ -1394,15 +1379,10 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
         .any(|bytes| bytes == url.as_bytes()));
     assert!(!tmp.path().join("bun.lock").exists());
     assert!(!tmp.path().join("node_modules").exists());
-    let ledger: Value = serde_json::from_slice(
-        &std::fs::read(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(ledger["edits"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|edit| edit["kind"] == "redirect_bun_lockb_package"));
+    assert!(!tmp
+        .path()
+        .join(".socket/vendor/redirect-state.json")
+        .exists());
 
     let (code, rerun) = scan_hosted_json(tmp.path(), &server.uri(), &[], &env);
     assert_eq!(code, 0, "{rerun:#}");
@@ -1417,17 +1397,30 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
             "rollback",
             "--json",
             "--yes",
-            "--offline",
+            "--patch-server-url",
+            "https://patch.test",
             "--cwd",
             tmp.path().to_str().unwrap(),
         ],
         &env,
     );
-    assert_eq!(code, 0, "{stdout}\n{stderr}");
-    let entries = socket_patch_core::vendor::lock_inventory::inventory_project(tmp.path()).await;
+    assert_eq!(code, 1, "a binary bun.lockb pin is refused: {stdout}\n{stderr}");
+    let doc: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    assert_eq!(doc["status"], "partial_failure", "{doc:#}");
+    let failed = doc["hosted"]["failed"].as_array().unwrap_or_else(|| panic!("{doc:#}"));
+    assert_eq!(failed.len(), 1, "{doc:#}");
+    assert_eq!(failed[0]["purl"], purl, "{doc:#}");
+    let error = failed[0]["error"].as_str().unwrap_or_default();
     assert!(
-        entries.iter().any(|entry| entry.purl == purl),
-        "{entries:?}"
+        error.starts_with(&format!("cannot restore {purl} to its upstream registry entry: "))
+            && error.contains("bun.lockb")
+            && error.contains("git checkout"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("bun.lockb")).unwrap(),
+        patched,
+        "nothing is written for a refused pin"
     );
     assert!(!tmp.path().join("bun.lock").exists());
     assert!(!tmp
@@ -1769,7 +1762,7 @@ async fn malformed_bun_lockb_beside_pnpm_lock_is_not_confirmed() {
     );
 }
 
-// ───────────── live unreadable pnpm-workspace.yaml fallback (1450) ─────────────
+// ───────────── live unreadable pnpm-workspace.yaml fallback ─────────────
 
 /// Production wiring of the present-but-unreadable pnpm-workspace.yaml arm
 /// (the exact seam where a Create once overwrote the user's workspace file):
@@ -1825,19 +1818,17 @@ async fn unreadable_pnpm_workspace_gets_warning_only_guidance_in_a_live_run() {
         user_bytes,
         "the unreadable workspace file must be left byte-identical"
     );
-    let ledger =
-        std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
     assert!(
-        !ledger.contains("redirect_pnpm_workspace_trust"),
-        "no workspace-trust edit may be recorded when the file was unreadable: {ledger}"
+        !tmp.path().join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode writes no redirect ledger"
     );
 }
 
-// ──────────── redirect_supersedes_vendored (1723-1726 + human) ────────────
+// ──────────── redirect_supersedes_vendored (+ human) ────────────
 
 /// The hosted-direction takeover warning: a LIVE lock routing package X to
-/// its hosted artifact while BOTH ledgers still claim X (redirect records +
-/// vendored state) must fire `redirect_supersedes_vendored` naming X — the
+/// its hosted artifact (a lockfile hosted pin — v5 hosted state) while the
+/// vendored ledger still claims X must fire `redirect_supersedes_vendored` naming X — the
 /// only signal that X's vendored ledger entry and committed tarball are now
 /// orphaned. A DIFFERENT package Y is granted this run so the takeover
 /// pre-revert never consumes X's vendored entry. The human re-run prints
@@ -1899,31 +1890,9 @@ async fn live_hosted_overlap_fires_redirect_supersedes_vendored() {
         ),
     )
     .unwrap();
-    // Redirect ledger: records X (the record uuid the live-lock proof keys on).
-    let socket_vendor = root.join(".socket/vendor");
-    std::fs::create_dir_all(&socket_vendor).unwrap();
-    let redirect_ledger = json!({
-        "version": 1,
-        "mode": "hosted",
-        "records": {
-            XPURL: {
-                "uuid": XUUID,
-                "exportedAt": "2026-01-01T00:00:00Z",
-                "files": {
-                    "package/index.js": { "beforeHash": "a".repeat(64), "afterHash": "b".repeat(64) }
-                },
-                "vulnerabilities": {},
-                "description": "x",
-                "license": "MIT",
-                "tier": "free"
-            }
-        }
-    });
-    std::fs::write(
-        socket_vendor.join("redirect-state.json"),
-        serde_json::to_vec_pretty(&redirect_ledger).unwrap(),
-    )
-    .unwrap();
+    // No redirect ledger (v5): X's hosted pin in the lock is the whole
+    // hosted state. The mock host is recognized as a patch server only via
+    // `--patch-server-url` below.
     // Vendored ledger ALSO claims X (stale — the lock routes X hosted).
     write_vendor_state(
         root,
@@ -1932,7 +1901,8 @@ async fn live_hosted_overlap_fires_redirect_supersedes_vendored() {
         "package-lock",
     );
 
-    let (code, doc) = scan_hosted_json(root, &server.uri(), &[], &[]);
+    let psu = ["--patch-server-url", "http://patch.test"];
+    let (code, doc) = scan_hosted_json(root, &server.uri(), &psu, &[]);
     assert_eq!(
         code, 0,
         "the overlap warning never flips the exit code: {doc:#}"
@@ -1958,12 +1928,11 @@ async fn live_hosted_overlap_fires_redirect_supersedes_vendored() {
     );
 
     // Human re-run (idempotent): the takeover-warning loop prints the detail.
-    let (code, _stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
+    let (code, _stdout, stderr) = scan_hosted(root, &server.uri(), &psu, &[]);
     assert_eq!(code, 0, "human overlap run exits 0; stderr=\n{stderr}");
     assert!(
         stderr.contains(
-            "Warning (redirect_supersedes_vendored): Hosted redirect superseded the vendored \
-             ledger for:"
+            "Warning: Hosted wiring superseded the vendored ledger for:"
         ) && stderr.contains(XPURL),
         "the supersedes warning must reach human stderr; stderr=\n{stderr}"
     );
@@ -2003,16 +1972,16 @@ async fn human_dry_run_prints_would_rewrite_pnpm_guidance_and_vex_skip() {
     );
     assert!(
         stdout.contains(
-            "Would redirect 1 package and rewrite 2 files (--dry-run: nothing was changed)."
+            "Would switch 1 package to hosted patches and rewrite 2 files (--dry-run: nothing was changed)."
         ),
         "the dry-run summary must use the preview verb; stdout=\n{stdout}"
     );
     assert!(
-        stderr.contains("Skipping VEX generation (--dry-run: nothing was redirected)."),
+        stderr.contains("Skipping VEX generation (--dry-run: nothing was rewritten)."),
         "the requested-but-skipped VEX must be announced; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Warning (redirect_pnpm_trust_lockfile): ")
+        stderr.contains("Warning: ")
             && stderr.contains("trustLockfile"),
         "the pnpm trust guidance must reach human stderr; stderr=\n{stderr}"
     );
@@ -2057,7 +2026,7 @@ async fn human_vex_success_summary_names_statements_path_and_ledger_caveat() {
         "scan --vex exits 0; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("Redirected 1 package; rewrote"),
+        stdout.contains("Switched 1 package to hosted patches; rewrote"),
         "anchor: the wet-run summary verb; stdout=\n{stdout}"
     );
     assert!(
@@ -2066,7 +2035,7 @@ async fn human_vex_success_summary_names_statements_path_and_ledger_caveat() {
         "the VEX summary must name the count and the path; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("attested from the ledger"),
+        stderr.contains("attested from their patch records"),
         "the no-verify caveat is load-bearing; stderr=\n{stderr}"
     );
     let doc: Value =
@@ -2152,19 +2121,19 @@ async fn human_rush_run_prints_the_repo_state_stale_warning_line() {
         "rush run exits 0; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("Redirected 1 package; rewrote"),
+        stdout.contains("Switched 1 package to hosted patches; rewrote"),
         "anchor: the rush lock must be rewritten; stdout=\n{stdout}"
     );
     assert!(
         stderr.contains(
-            "Warning (redirect_rush_repo_state_stale): pnpm-lock.yaml was edited outside \
+            "Warning: pnpm-lock.yaml was edited outside \
              `rush update`"
         ),
         "the rush repo-state warning must reach human stderr; stderr=\n{stderr}"
     );
 }
 
-// ───────── ledger save failure after a successful revert (1065-1079) ─────────
+// ───────── ledger save failure after a successful revert ─────────
 
 /// save_state failure AFTER a successful takeover revert: the wiring is gone
 /// but the vendored ledger still claims it, so the purl must fail CLOSED —
@@ -2271,7 +2240,7 @@ async fn human_reference_failure_prints_an_error_line_and_exits_1() {
             && line.ends_with("(nothing was changed; re-run to retry)"),
         "{line}"
     );
-    assert!(!stdout.contains("Redirected"), "stdout=\n{stdout}");
+    assert!(!stdout.contains("Switched"), "stdout=\n{stdout}");
     assert_eq!(
         std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
         lock_before
@@ -2286,10 +2255,10 @@ async fn human_reference_failure_prints_an_error_line_and_exits_1() {
     );
 }
 
-/// A malformed redirect ledger aborts with an `Error: The redirect ledger
-/// ...` line (it used to print a bare lowercase sentence).
+/// A malformed pre-v5 redirect ledger no longer aborts anything: the human
+/// dry run proceeds (exit 0, the preview summary) with no `Error:` line.
 #[tokio::test]
-async fn human_malformed_ledger_prints_an_error_prefix() {
+async fn human_malformed_pre_v5_ledger_does_not_abort_the_run() {
     let server = MockServer::start().await;
     mock_discovery(&server, PURL, UUID).await;
     mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
@@ -2303,13 +2272,19 @@ async fn human_malformed_ledger_prints_an_error_prefix() {
     )
     .unwrap();
 
-    let (code, _stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &["--dry-run"], &[]);
-    assert_eq!(code, 1, "stderr=\n{stderr}");
+    let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &["--dry-run"], &[]);
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stderr
-            .lines()
-            .any(|l| l.starts_with("Error: The redirect ledger ") && l.contains("malformed")),
+        stdout.contains("Would switch 1 package to hosted patches"),
+        "stdout=\n{stdout}"
+    );
+    assert!(
+        !stderr.lines().any(|l| l.starts_with("Error:")) && !stderr.contains("malformed"),
         "stderr=\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap(),
+        b"{bad"
     );
 }
 
@@ -2362,11 +2337,12 @@ async fn human_rerun_says_already_redirected_and_first_run_prints_next_steps() {
     assert_eq!(code, 0, "stderr=\n{stderr}");
     assert_eq!(
         engine_stdout(&stdout),
-        "Redirected 1 package; rewrote 2 files.\n\
-         Commit .socket/vendor/redirect-state.json, .npmrc, and package-lock.json to keep \
-         the redirect.\n\
-         Reinstall from the updated lockfile (e.g. `npm ci`) so the installed packages pick \
-         up the patched artifacts, then run `socket-patch vex` to verify them.\n",
+        "Switched 1 package to hosted patches; rewrote 2 files.\n\
+         Next steps:\n  \
+         1. Commit .npmrc and package-lock.json to keep the hosted patches.\n  \
+         2. Reinstall from the updated lockfile (e.g. `npm ci`) so the installed packages pick \
+         up the patched artifacts, then run `socket-patch vex` to verify the installed \
+         patches.\n",
         "stderr=\n{stderr}"
     );
 
@@ -2374,20 +2350,20 @@ async fn human_rerun_says_already_redirected_and_first_run_prints_next_steps() {
     assert_eq!(code, 0, "stderr=\n{stderr}");
     assert_eq!(
         engine_stdout(&stdout),
-        "1 package is already redirected; nothing to rewrite.\n",
+        "1 package is already on hosted patches; nothing to rewrite.\n",
         "stderr=\n{stderr}"
     );
     let (code, stdout, _) = scan_hosted(tmp.path(), &server.uri(), &["--dry-run"], &[]);
     assert_eq!(code, 0);
     assert_eq!(
         engine_stdout(&stdout),
-        "1 package is already redirected; nothing to rewrite.\n"
+        "1 package is already on hosted patches; nothing to rewrite.\n"
     );
 }
 
 /// A granted patch whose package has no lock entry is listed by purl on
-/// stderr (it used to vanish: only a raw rewriter warning hinted at it),
-/// under a `No patches could be redirected:` headline when nothing was.
+/// stderr (not just hinted at by a raw rewriter warning), under a
+/// `No patches could be redirected:` headline when nothing was.
 #[tokio::test]
 async fn human_unconfirmed_purl_is_listed_with_a_headline() {
     let server = MockServer::start().await;
@@ -2408,13 +2384,13 @@ async fn human_unconfirmed_purl_is_listed_with_a_headline() {
     let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &["--dry-run"], &[]);
     assert_eq!(code, 0, "a no-op redirect still exits 0; stderr=\n{stderr}");
     assert!(
-        stdout.contains("Would redirect 0 packages and rewrite 0 files"),
+        stdout.contains("Would switch 0 packages to hosted patches and rewrite 0 files"),
         "stdout=\n{stdout}"
     );
     assert!(
         stderr.contains(&format!(
-            "No patches could be redirected:\n  {PURL}: no lockfile entry pinning it could \
-             be redirected"
+            "No patches could be switched to hosted:\n  {PURL}: no lockfile entry pinning it \
+             could be rewritten"
         )),
         "stderr=\n{stderr}"
     );
@@ -2436,22 +2412,22 @@ async fn human_pnpm_rerun_prints_only_the_reminder_and_heal_restores_guidance() 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write_pnpm_project(root);
-    const REMINDER: &str = "Warning (redirect_pnpm_trust_lockfile): pnpm-lock.yaml is already \
-        redirected and pnpm-workspace.yaml already sets `trustLockfile: true`; keep both \
+    const REMINDER: &str = "Warning: pnpm-lock.yaml already uses \
+        hosted patches and pnpm-workspace.yaml already sets `trustLockfile: true`; keep both \
         committed, and never rebuild the lockfile (`pnpm clean --lockfile`), which discards \
-        the redirect\n";
+        the hosted patches\n";
 
     let (code, stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        engine_stdout(&stdout).starts_with("Redirected 1 package; rewrote 2 files.\n"),
+        engine_stdout(&stdout).starts_with("Switched 1 package to hosted patches; rewrote 2 files.\n"),
         "{stdout}"
     );
     // Everything from the pnpm warning on (the lines above it are the
     // token-format notice and discovery progress).
     let pnpm_part = |stderr: &str| -> String {
         stderr
-            .find("Warning (redirect_pnpm_trust_lockfile): ")
+            .find("Warning: pnpm-lock.yaml")
             .map(|i| stderr[i..].to_string())
             .unwrap_or_default()
     };
@@ -2465,7 +2441,7 @@ async fn human_pnpm_rerun_prints_only_the_reminder_and_heal_restores_guidance() 
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert_eq!(
         engine_stdout(&stdout),
-        "1 package is already redirected; nothing to rewrite.\n"
+        "1 package is already on hosted patches; nothing to rewrite.\n"
     );
     assert_eq!(
         pnpm_part(&stderr),

@@ -15,9 +15,6 @@
 //! 4. `apply --check --silent` with real redirect drift exited 1 with zero
 //!    output (the OUT OF SYNC report was muted).
 //!
-//! Same bug class previously fixed in `scan` (`embed_vex_human`), `setup`
-//! (all three modes), and apply's own yarn-PnP refusal.
-//!
 //! Stderr assertions ignore the "No SOCKET_API_TOKEN set" client warning:
 //! it's printed by `get_api_client_with_overrides` in core for every ONLINE
 //! command (offline runs suppress it — see

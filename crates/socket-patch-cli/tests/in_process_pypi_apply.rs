@@ -248,7 +248,9 @@ async fn pypi_install_scan_sync_patches_real_file() {
     setup_pypi_apply_mock(&server, &before_hash, &after_hash, &patched).await;
 
     let mut args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),
@@ -268,11 +270,10 @@ async fn pypi_install_scan_sync_patches_real_file() {
         prune: false,
         sync: true,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     // Avoid borrow problem with into_iter
     let _ = &mut args;
@@ -324,7 +325,9 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
 
     // 1. scan --sync to write the manifest + blob.
     let scan_args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),
@@ -344,11 +347,10 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
         prune: false,
         sync: true,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     let scan_code = scan_run(scan_args).await;
     assert_eq!(scan_code, 0, "scan --sync should succeed (exit 0)");
@@ -433,7 +435,9 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
     setup_pypi_apply_mock(&server, &before_hash, &after_hash, &patched).await;
 
     let scan_args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),
@@ -453,11 +457,10 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     // Require success: otherwise an early crash (before the apply path
     // is ever reached) would leave the file untouched and let this test
@@ -503,15 +506,12 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
          the unchanged file does not prove dry-run suppressed a real patch; \
          bodies: {batch_bodies:?}"
     );
-    // Discovery alone still doesn't pin the APPLY path: a scan that
-    // degraded to plain listing (e.g. a broken `--apply` → agent-mode
-    // fold in `resolve_mode_flags`) also queries batch with the purl,
-    // exits 0, and leaves the file untouched — vacuously green. In JSON
-    // mode only the agent-mode apply branch fetches per-package patch
-    // details (`discover_selected`, which runs before the dry-run gate),
-    // so requiring that fetch proves dry-run reached the apply path with
-    // a real patch selected and then declined to write. Mutation-verified:
-    // dropping the `--apply` fold passes every assert above but fails here.
+    // Discovery alone doesn't prove a patch was selected. Requiring the
+    // per-package fetch (`discover_selected`, which runs before the dry-run
+    // gate) proves a real patch was selected before dry-run declined to
+    // write. Hosted mode's `run_redirect` also calls `discover_selected`, so
+    // this does NOT tell a broken `--apply` → agent fold (which would fall
+    // into the hosted default) apart from a working one.
     assert!(
         requests.iter().any(|r| r
             .url
@@ -565,7 +565,9 @@ async fn pypi_crawler_finds_real_installed_six() {
         .await;
 
     let args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),
@@ -585,11 +587,10 @@ async fn pypi_crawler_finds_real_installed_six() {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     assert_eq!(scan_run(args).await, 0);
 
@@ -611,4 +612,91 @@ async fn pypi_crawler_finds_real_installed_six() {
         batch_bodies.iter().any(|b| b.contains(&purl)),
         "batch request did not include the discovered six PURL {purl}; bodies: {batch_bodies:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Legacy `.egg-info` installs (#447)
+// ---------------------------------------------------------------------------
+
+/// pip < 23.1 installing an sdist without `wheel` (the default state of a
+/// fresh venv on CPython <= 3.11) records the install as
+/// `<name>-<version>-pyX.Y.egg-info` instead of `.dist-info`. Agent mode
+/// must find and patch that copy instead of skipping it as "not installed".
+/// The layouts are planted directly so the test needs no interpreter.
+#[tokio::test]
+#[serial]
+async fn pypi_scan_sync_patches_egg_info_install() {
+    // (a) the pip/setuptools directory form with `PKG-INFO`;
+    // (b) the bare distutils / apt `.egg-info` FILE form.
+    for bare_file in [false, true] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let venv = tmp.path().join(".venv");
+        let site = if cfg!(windows) {
+            venv.join("Lib").join("site-packages")
+        } else {
+            venv.join("lib").join("python3.11").join("site-packages")
+        };
+        std::fs::create_dir_all(&site).unwrap();
+        let pkg_info =
+            format!("Metadata-Version: 1.2\nName: {PYPI_PACKAGE}\nVersion: {PYPI_VERSION}\n");
+        if bare_file {
+            std::fs::write(
+                site.join(format!("{PYPI_PACKAGE}-{PYPI_VERSION}.egg-info")),
+                &pkg_info,
+            )
+            .unwrap();
+        } else {
+            let egg = site.join(format!("{PYPI_PACKAGE}-{PYPI_VERSION}-py3.11.egg-info"));
+            std::fs::create_dir_all(&egg).unwrap();
+            std::fs::write(egg.join("PKG-INFO"), &pkg_info).unwrap();
+        }
+        let six_path = site.join("six.py");
+        let original = b"# six from an sdist\n".to_vec();
+        std::fs::write(&six_path, &original).unwrap();
+        let mut patched = original.clone();
+        patched.extend_from_slice(b"# SOCKET-PATCH-E2E-MARKER\n");
+
+        let server = MockServer::start().await;
+        setup_pypi_apply_mock(
+            &server,
+            &git_sha256(&original),
+            &git_sha256(&patched),
+            &patched,
+        )
+        .await;
+
+        std::env::remove_var("VIRTUAL_ENV");
+        let code = scan_run(ScanArgs {
+            socket_yml: Default::default(),
+            paths: Vec::new(),
+            packages: Vec::new(),
+            common: socket_patch_cli::args::GlobalArgs {
+                cwd: tmp.path().to_path_buf(),
+                org: Some(ORG.to_string()),
+                json: true,
+                yes: true,
+                api_url: Some(server.uri()),
+                api_token: Some("fake".to_string()),
+                ecosystems: Some(vec!["pypi".to_string()]),
+                download_mode: "diff".to_string(),
+                ..socket_patch_cli::args::GlobalArgs::default()
+            },
+            batch_size: Some(100),
+            apply: false,
+            prune: false,
+            sync: true,
+            vendor: false,
+            mode: None,
+            all_releases: false,
+            vex: Default::default(),
+            rollout: Default::default(),
+        })
+        .await;
+        assert_eq!(code, 0, "bare_file={bare_file}: scan --sync should succeed");
+        assert_eq!(
+            std::fs::read(&six_path).unwrap(),
+            patched,
+            "bare_file={bare_file}: the egg-info install must be patched"
+        );
+    }
 }

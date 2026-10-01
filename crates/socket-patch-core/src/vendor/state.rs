@@ -51,6 +51,8 @@ const VENDOR_STATE_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct VendorArtifact {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yarn_berry10c0: Option<String>,
     /// Project-relative, forward-slashed path of the artifact
     /// (`.socket/vendor/<eco>/<uuid>/<leaf>`).
     pub path: String,
@@ -212,7 +214,7 @@ pub struct PipenvMeta {
 #[serde(rename_all = "camelCase")]
 pub struct VendorEntry {
     /// Vendor ecosystem dir name (`npm`, `cargo`, `golang`, `composer`,
-    /// `gem`, `pypi`).
+    /// `gem`, `pypi`, `nuget`, `maven`).
     pub ecosystem: String,
     /// Qualifier-free base PURL (`pkg:npm/lodash@4.17.21`). The map key is
     /// the manifest PURL (possibly qualified); this is the resolved base.
@@ -234,9 +236,10 @@ pub struct VendorEntry {
     /// npm: `package-lock` | `yarn-classic` | `yarn-berry` | `pnpm` |
     /// `pnpm-legacy` | `bun` | `vlt` (absent on pre-flavor entries ⇒
     /// `package-lock`; a `vlt` artifact is a package directory, whose
-    /// `fileInventory` excludes its `node_modules/`); pypi: `uv` | `requirements` |
-    /// `poetry` | `pdm` | `pipenv`. Reverts route on this and fail closed
-    /// on flavors this build has no backend for.
+    /// `fileInventory` excludes its `node_modules/`); pypi: `uv` |
+    /// `python-lock` | `requirements` | `hatch` | `poetry` | `pdm` |
+    /// `pipenv`. Reverts route on this and fail closed on flavors this build
+    /// has no backend for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flavor: Option<String>,
     /// pypi/uv extras.
@@ -642,8 +645,8 @@ fn parse_snapshot_state(bytes: &[u8], path: &Path) -> std::io::Result<VendorStat
 /// questions for every patched package — which entry carries this uuid, and
 /// which wiring record already allows direct references — and a ledger
 /// holding a whole-file snapshot per wired file runs to megabytes, so an
-/// idempotent re-run (which writes no ledger at all) parsed the same bytes
-/// once per package. See [`ParseMemo`]: the read still happens every time,
+/// idempotent re-run (which writes no ledger at all) would otherwise parse
+/// the same bytes once per package. See [`ParseMemo`]: the read still happens every time,
 /// and a ledger something else rewrote between two packages differs in its
 /// bytes and is re-parsed.
 static STATE_MEMO: ParseMemo<VendorState> = ParseMemo::new();
@@ -831,6 +834,7 @@ mod tests {
             base_purl: "pkg:npm/lodash@4.17.21".into(),
             uuid: UUID.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: format!(".socket/vendor/npm/{UUID}/lodash-4.17.21.tgz"),
                 sha256: "ab".repeat(32),
                 size: Some(3668),
@@ -886,6 +890,7 @@ mod tests {
             base_purl: "pkg:cargo/cfg-if@1.0.4".into(),
             uuid: uuid.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: format!(".socket/vendor/cargo/{uuid}/cfg-if-1.0.4"),
                 sha256: String::new(),
                 size: None,

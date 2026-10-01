@@ -1,10 +1,10 @@
 //! Residue-free removal of socket-patch-owned state under `.socket/`.
 //!
 //! Every reversal path (an emptied ledger, a swept blob store, a reverted
-//! vendored unit) used to hand-roll "delete the file, then `remove_dir` the
-//! parents I created" — or forgot to, leaving empty `.socket/vendor/`,
-//! `.socket/vendor/<eco>/` or `.socket/blobs/` husks behind. The helpers here
-//! are the one implementation: delete, then climb the now-empty parents up
+//! vendored unit) must "delete the file, then `remove_dir` the parents I
+//! created", or it leaves empty `.socket/vendor/`, `.socket/vendor/<eco>/`
+//! or `.socket/blobs/` husks behind. The helpers here are the one
+//! implementation: delete, then climb the now-empty parents up
 //! to but EXCLUDING `stop_dir` (normally the project's `.socket/`, which the
 //! lock guard owns).
 //!

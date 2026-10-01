@@ -1,4 +1,4 @@
-//! The real-vlt capstone harness (DESIGN §8.3), shared by
+//! The real-vlt capstone harness (docs/testing/vlt-compatibility.md, "The capstone registry harness"), shared by
 //! `e2e_redirect_vlt_build`, `e2e_vendor_vlt_build`, `mode_migration_vlt`,
 //! `e2e_safety_vlt`, `e2e_vlt` and the production suites.
 //!
@@ -146,6 +146,13 @@ impl std::fmt::Display for VltVersion {
 
 /// `vlt ci`, `--frozen-lockfile` and `--expect-lockfile` exist.
 pub const HAS_CI_FROM: VltVersion = VltVersion::zero(19);
+/// `vlt ci` defaults `--allow-scripts` to `:scripts:not(:malware)`, whose
+/// `:malware` selector makes every install with new nodes POST them to
+/// api.socket.dev ("*" before).
+pub const CI_MALWARE_QUERY_FROM: VltVersion = VltVersion::rc(24);
+/// vlt's `ci` default minus its `:malware` filter: the same set for the
+/// harness's packages, with no Socket API call.
+pub const CI_ALLOW_SCRIPTS: &str = ":scripts";
 /// A root `postinstall` runs without an `install` script.
 pub const ROOT_POSTINSTALL_FROM: VltVersion = VltVersion::rc(13);
 /// Install commands need a registry configuration.
@@ -300,7 +307,7 @@ pub fn legacy_workspaces_file(v: VltVersion) -> bool {
     v <= VltVersion::zero(12)
 }
 
-/// The lockfile grammar a release writes (DESIGN §1.1).
+/// The lockfile grammar a release writes (docs/testing/vlt-compatibility.md, "Formats").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VltEra {
     A0,
@@ -653,7 +660,8 @@ impl Leg {
         }
         env.extend(run.env.iter().cloned());
         let pairs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        common::vlt_run(cwd, &tc.js, args, &pairs)
+        let args = hermetic_args(tc.version, args);
+        common::vlt_run(cwd, &tc.js, &args, &pairs)
     }
 
     /// [`Leg::vlt`], asserting success.
@@ -702,6 +710,21 @@ impl Drop for Leg {
             );
         }
     }
+}
+
+/// `args`, with an explicit [`CI_ALLOW_SCRIPTS`] on a `vlt ci` that would
+/// otherwise query api.socket.dev for `:malware` (a 401 there failed whole
+/// matrix rows). An explicit `--allow-scripts` is left alone.
+pub fn hermetic_args<'a>(v: VltVersion, args: &[&'a str]) -> Vec<&'a str> {
+    let mut out = args.to_vec();
+    if v >= CI_MALWARE_QUERY_FROM
+        && args.first() == Some(&"ci")
+        && !args.iter().any(|a| a.starts_with("--allow-scripts"))
+    {
+        out.push("--allow-scripts");
+        out.push(CI_ALLOW_SCRIPTS);
+    }
+    out
 }
 
 /// Per-invocation options for [`Leg::vlt_with`].
@@ -809,15 +832,8 @@ pub fn write_shims_for(bin: &Path, js: &Path, log: &Path, socket: &Path) {
         "@echo off\r\nnode --no-warnings \"{}\" %*\r\n",
         js.display()
     );
-    for (name, body) in [("npx", sh_npx), ("vlt", sh_vlt)] {
-        let p = bin.join(name);
-        std::fs::write(&p, body).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-    }
+    write_executable(&bin.join("npx"), sh_npx);
+    write_executable(&bin.join("vlt"), sh_vlt);
     std::fs::write(bin.join("npx.cmd"), cmd_npx).unwrap();
     std::fs::write(bin.join("vlt.cmd"), cmd_vlt).unwrap();
 }
@@ -837,7 +853,7 @@ pub struct VltJson {
     pub no_registry: bool,
 }
 
-/// The vlt.json the §8.3 era table prescribes for registry `r`
+/// The per-era vlt.json (docs/testing/vlt-compatibility.md, "The capstone registry harness") for registry `r`
 /// (`http://127.0.0.1:<port>/`).
 pub fn vlt_json(v: VltVersion, r: &str, opts: &VltJson) -> Value {
     let mut config = serde_json::Map::new();
@@ -1819,12 +1835,34 @@ pub fn get_hosted(proj: &Path, svc: &PatchService, uuid: &str, extra: &[&str]) -
     out.json()
 }
 
-/// `rollback --yes --json` (whole ledger) in `proj`.
+/// `rollback --yes --json` in `proj`: every hosted pin the lockfiles wire
+/// (v5 keeps no hosted ledger) plus the vendor ledger / manifest.
 pub fn rollback(proj: &Path, extra: &[&str]) -> SocketOut {
     let cwd = proj.to_str().unwrap().to_string();
     let mut args = vec!["rollback", "--json", "--yes", "--cwd", &cwd];
     args.extend_from_slice(extra);
     socket(proj, &args, &[])
+}
+
+/// [`rollback`] of HOSTED pins against the harness: `--patch-server-url
+/// <patch_server>` (when the pins sit on the mock patch service rather than
+/// `patch.socket.dev`; discovery recognizes no other host) and
+/// `SOCKET_NPM_REGISTRY=<registry>`, the npm registry the v5 upstream
+/// restore re-resolves each pin's integrity from (the harness registry, so
+/// synthetic packages restore too and the run stays hermetic).
+pub fn rollback_upstream(
+    proj: &Path,
+    registry: &str,
+    patch_server: Option<&str>,
+    extra: &[&str],
+) -> SocketOut {
+    let cwd = proj.to_str().unwrap().to_string();
+    let mut args = vec!["rollback", "--json", "--yes", "--cwd", &cwd];
+    if let Some(origin) = patch_server {
+        args.extend(["--patch-server-url", origin]);
+    }
+    args.extend_from_slice(extra);
+    socket(proj, &args, &[("SOCKET_NPM_REGISTRY", registry)])
 }
 
 pub fn redirect_warnings(doc: &Value) -> Vec<(String, String)> {
@@ -1869,7 +1907,7 @@ pub fn lock_bytes(proj: &Path) -> Vec<u8> {
     std::fs::read(proj.join(VLT_LOCK)).expect("vlt-lock.json")
 }
 
-/// vlt's tilde segment decode (DESIGN §1.6).
+/// vlt's tilde segment decode (docs/testing/vlt-compatibility.md, "Formats").
 pub fn tilde_decode(seg: &str) -> String {
     let chars: Vec<char> = seg.chars().collect();
     let mut out = String::new();
@@ -2153,6 +2191,33 @@ pub fn write(path: &Path, body: impl AsRef<[u8]>) {
     std::fs::write(path, body).unwrap();
 }
 
+/// Write `body` to `path` as an executable without this process ever
+/// holding a writable fd to it.
+///
+/// Linux refuses to exec a file while any process holds it open for
+/// writing (`ETXTBSY`). Tests run on parallel threads, and a sibling
+/// thread that forks while an `fs::write` handle is open passes that fd
+/// to its child until the child execs, so exec'ing a just-written script
+/// fails intermittently, both when the test spawns it and when a shim
+/// `exec`s it. A child `cp` creates the file instead: the only write fd
+/// lives in a process no test thread forks from.
+pub fn write_executable(path: &Path, body: impl AsRef<[u8]>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut name = path.file_name().unwrap().to_os_string();
+        name.push(".staged");
+        let staged = path.with_file_name(name);
+        write(&staged, body);
+        let out = Command::new("cp").arg(&staged).arg(path).output().unwrap();
+        assert_ok(&out, "cp of a staged executable");
+        std::fs::remove_file(&staged).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(not(unix))]
+    write(path, body);
+}
+
 pub fn package_json(name: &str, deps: &[(&str, &str)]) -> String {
     package_json_fields(name, &[("dependencies", deps)])
 }
@@ -2426,6 +2491,18 @@ fn vlt_e2e_harness_vlt_json_follows_the_era_table() {
 }
 
 #[test]
+fn vlt_e2e_harness_ci_never_queries_the_socket_api() {
+    let v = |s: &str| VltVersion::parse(s).unwrap();
+    let pinned = ["ci", "--allow-scripts", CI_ALLOW_SCRIPTS];
+    assert_eq!(hermetic_args(v("1.2.0"), &["ci"]), pinned);
+    assert_eq!(hermetic_args(v("1.0.0-rc.24"), &["ci"]), pinned);
+    assert_eq!(hermetic_args(v("1.0.0-rc.23"), &["ci"]), ["ci"]);
+    assert_eq!(hermetic_args(v("1.2.0"), &["install"]), ["install"]);
+    let own = ["ci", "--allow-scripts=*"];
+    assert_eq!(hermetic_args(v("1.2.0"), &own), own);
+}
+
+#[test]
 fn vlt_e2e_harness_leg_lines_have_the_counted_shape() {
     let line = leg_line("1.2.0", "hosted", "fresh_ci", "ran");
     let parts: Vec<&str> = line.split(' ').collect();
@@ -2489,15 +2566,10 @@ fn vlt_e2e_harness_npx_shim_forwards_the_args_after_the_package() {
         fake
     } else {
         let fake = dir.join("socket");
-        write(
+        write_executable(
             &fake,
             format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n", argv.display()),
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
         fake
     };
     let bin = dir.join("bin");

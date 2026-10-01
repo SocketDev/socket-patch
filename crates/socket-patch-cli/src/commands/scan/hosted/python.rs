@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use socket_patch_core::crawlers::{types::CrawlerOptions, PythonCrawler};
+use socket_patch_core::crawlers::PythonCrawler;
 use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vex::verify::judge_installed_record;
@@ -10,8 +10,9 @@ use socket_patch_core::vex::verify::judge_installed_record;
 use super::StaleInstallOutcome;
 
 /// A lock rewrite cannot prove a warm virtualenv has installed the wheel.
-/// Use the same discovery as apply (including Poetry's out-of-tree venvs),
-/// and inspect every interpreter rather than deduplicating by package name.
+/// Use the project's own venv discovery (`--global`/`--global-prefix` use
+/// the crawler's global paths), and inspect every interpreter rather than
+/// deduplicating by package name.
 /// Missing/unreadable files are not positive evidence of stale bytes.
 pub(super) async fn stale_install_warnings(
     common: &crate::args::GlobalArgs,
@@ -40,17 +41,12 @@ pub(super) async fn stale_install_warnings(
     let crawler = PythonCrawler::new();
     // Only venvs that belong to THIS project (VIRTUAL_ENV, ./.venv, ./venv,
     // Poetry's and Pipenv's out-of-tree venvs): the crawler's project-marker
-    // fallback to the global interpreters would judge some unrelated Python's
-    // copy of the release (a tool venv on PATH) and warn about a venv the
-    // project's installer never touches — a false positive that also fails
-    // the same-run --vex. --global / --global-prefix keep their meaning.
-    let paths = if common.global || common.global_prefix.is_some() {
+    // fallback to the global interpreters would judge an unrelated Python's
+    // copy of the release (a tool venv on PATH) and warn falsely.
+    // --global / --global-prefix keep their meaning.
+    let paths = if common.is_global() {
         crawler
-            .get_site_packages_paths(&CrawlerOptions {
-                cwd: common.cwd.clone(),
-                global: common.global,
-                global_prefix: common.global_prefix.clone(),
-            })
+            .get_site_packages_paths(&common.crawler_options())
             .await
             .unwrap_or_default()
     } else {
@@ -136,7 +132,7 @@ pub(super) async fn stale_install_warnings(
             out.warnings.push(serde_json::json!({
                 "code": "redirect_pypi_stale_install",
                 "detail": format!(
-                    "{purl} was redirected to a hosted patch, but installed files in {} \
+                    "{purl} was switched to a hosted patch, but installed files in {} \
                      still differ from the patched hashes. {remedy} The installed files \
                      were left unchanged.",
                     site.display()
@@ -216,5 +212,29 @@ mod tests {
         let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), &ledger).await;
         assert!(out.stale_purls.is_empty());
         assert!(out.warnings.is_empty());
+    }
+
+    /// A legacy `.egg-info` install (pip < 23.1 building an sdist without
+    /// `wheel`) is a real copy pip keeps on `install -r`, so the hosted
+    /// stale-install guard must judge it like a `.dist-info` one (#447).
+    #[tokio::test]
+    async fn egg_info_install_gets_the_stale_install_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site-packages");
+        let egg = site.join("six-1.16.0-py3.11.egg-info");
+        std::fs::create_dir_all(&egg).unwrap();
+        std::fs::write(egg.join("PKG-INFO"), "Name: six\nVersion: 1.16.0\n").unwrap();
+        std::fs::write(site.join("six.py"), b"upstream").unwrap();
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            global_prefix: Some(site.clone()),
+            ..Default::default()
+        };
+        let purl = "pkg:pypi/six@1.16.0";
+        let confirmed = vec![(purl.to_string(), "six-uuid".to_string())];
+        let ledger = BTreeMap::from([("k".into(), record("six-uuid", "six.py", b"patched"))]);
+        let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), &ledger).await;
+        assert_eq!(out.stale_purls, BTreeSet::from([purl.to_string()]));
+        assert_eq!(out.warnings[0]["code"], "redirect_pypi_stale_install");
     }
 }

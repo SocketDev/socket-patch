@@ -15,19 +15,20 @@
 //!   3. FRESH checkout (no materialization) → quiet.
 //!   4. TWO gem homes both stale → one warning per home, each naming its
 //!      own paths.
-//!   5. RE-FIRE: a re-scan whose /patches/view fetch fails transiently
-//!      still warns, judged from the redirect ledger's persisted record.
-//!   6. Same-run `--vex`: the stale purl is excluded from the ledger-based
-//!      attestation — the envelope must never attest a CVE its own warning
-//!      says is live.
+//!   5. RE-SCAN with a failing record fetch: v5 hosted mode keeps no ledger,
+//!      so a re-scan whose /patches/view fetch fails has no persisted record
+//!      to judge from — it surfaces `record_fetch_failed` (the VEX-omission
+//!      detail) and leaves the committed wiring untouched.
+//!   6. Same-run `--vex`: the stale purl is excluded from the attestation
+//!      (built from this run's fetched records) — the envelope must never
+//!      attest a CVE its own warning says is live.
 //!   7. Manifest-less standalone `vex` over the same committed state follows
-//!      the installed tree: stale → `not_applied` (ledger kept) / nothing
-//!      discoverable (ledgers deleted, lock not yet converged); after the
-//!      prescribed re-install (the lock bundler then writes — separate
-//!      patch-registry `GEM` section on bundler >= 2.2, the merged
-//!      multi-remote section on <= 2.1) it attests from the lock + patch API
-//!      with no ledger; offline → `record_unavailable`; tampered →
-//!      `hash_mismatch`; reverted pair → `redirect_unwired`.
+//!      the installed tree: stale → nothing discoverable (no ledger, lock not
+//!      yet converged); after the prescribed re-install (the lock bundler
+//!      then writes — separate patch-registry `GEM` section on bundler >=
+//!      2.2, the merged multi-remote section on <= 2.1) it attests from the
+//!      lock + patch API; offline → `record_unavailable`; tampered →
+//!      `hash_mismatch`; reverted pair → not attested (nothing wires it).
 
 use std::path::{Path, PathBuf};
 
@@ -326,8 +327,8 @@ async fn gem_hosted_redirect_over_stale_install_warns_loudly() {
     );
     assert_eq!(code, 0, "human re-scan must succeed:\n{stderr}");
     assert!(
-        stderr.contains("redirect_gem_stale_install"),
-        "human mode must carry the greppable code tag on stderr:\n{stderr}"
+        stderr.contains("Warning: ") && stderr.contains("was switched to its hosted patch, but a stale"),
+        "human mode must print the stale-install warning on stderr:\n{stderr}"
     );
     assert!(
         stderr.contains(&gem_dir.display().to_string()),
@@ -417,12 +418,13 @@ async fn gem_hosted_redirect_warns_once_per_stale_gem_home() {
     assert!(b.contains(&cache_b.display().to_string()), "{b}");
 }
 
-/// RE-FIRE guarantee: scan 1 warns and persists the patch record in the
-/// redirect ledger; scan 2's /patches/view fetch fails transiently (500) —
-/// the warning must STILL fire, judged from the ledger's persisted record,
-/// alongside the record_fetch_failed warning for the fetch itself.
+/// v5 hosted mode keeps no ledger: scan 1 warns (from its fetched record)
+/// and persists nothing but the Gemfile/lock edits; scan 2's /patches/view
+/// fetch fails transiently (500), so it surfaces `record_fetch_failed` with
+/// the VEX-omission detail, exits 0, and leaves the committed wiring
+/// byte-identical (the re-run is idempotent) — still with no ledger.
 #[tokio::test(flavor = "multi_thread")]
-async fn gem_hosted_stale_warning_refires_when_record_fetch_fails() {
+async fn gem_hosted_rescan_with_failing_record_fetch_reports_it_and_keeps_the_wiring() {
     let server = MockServer::start().await;
     mount_api(&server, Some(1)).await; // view answers 200 exactly once
     let tmp = tempfile::tempdir().unwrap();
@@ -431,43 +433,51 @@ async fn gem_hosted_stale_warning_refires_when_record_fetch_fails() {
     write_manifest_pair(&proj);
     let (gem_dir, ..) = materialize_installed_gem(&proj, "3.3.0", UPSTREAM_LIB);
 
-    // Scan 1: fresh record, warning fires, ledger persists the record.
+    // Scan 1: fresh record, warning fires, no ledger persists anything.
     let (code, stdout, _) = hosted_scan_json(&proj, &server.uri());
     assert_eq!(code, 0);
     let env = common::parse_json_envelope(&stdout);
-    assert_eq!(stale_warnings(&env).len(), 1, "scan 1 must warn: {env}");
-    let ledger = std::fs::read_to_string(proj.join(".socket/vendor/redirect-state.json")).unwrap();
-    assert!(
-        ledger.contains(UUID),
-        "the ledger must persist the record scan 2 falls back to: {ledger}"
-    );
+    let details = stale_warnings(&env);
+    assert_eq!(details.len(), 1, "scan 1 must warn: {env}");
+    assert!(details[0].contains(&gem_dir.display().to_string()), "{env}");
+    let ledger = proj.join(".socket/vendor/redirect-state.json");
+    assert!(!ledger.exists(), "hosted mode writes no redirect ledger");
+    let gemfile = std::fs::read(proj.join("Gemfile")).unwrap();
+    let lock = std::fs::read(proj.join("Gemfile.lock")).unwrap();
 
-    // Scan 2: view 500s → record_fetch_failed, but the stale warning
-    // re-fires from the ledger record.
+    // Scan 2: view 500s → record_fetch_failed with the VEX-omission detail.
     let (code, stdout, _) = hosted_scan_json(&proj, &server.uri());
-    assert_eq!(code, 0);
+    assert_eq!(code, 0, "{stdout}");
     let env = common::parse_json_envelope(&stdout);
-    let codes: Vec<&str> = env["redirect"]["warnings"]
+    let failed = env["redirect"]["warnings"]
         .as_array()
         .expect("warnings")
         .iter()
-        .filter_map(|w| w["code"].as_str())
-        .collect();
-    assert!(
-        codes.contains(&"record_fetch_failed"),
-        "the transient fetch failure itself is surfaced: {env}"
-    );
-    let details = stale_warnings(&env);
+        .find(|w| w["code"] == "record_fetch_failed")
+        .unwrap_or_else(|| panic!("the transient fetch failure is surfaced: {env}"));
     assert_eq!(
-        details.len(),
-        1,
-        "a flaky record fetch must not retire the stale warning: {env}"
+        failed["detail"],
+        format!(
+            "{PURL} was switched to hosted, but its patch record could not be fetched; this run's VEX \
+             attestation omits it (`socket-patch vex` fetches it again once the API answers)"
+        ),
+        "{env}"
     );
-    assert!(details[0].contains(&gem_dir.display().to_string()), "{env}");
+    assert_eq!(
+        std::fs::read(proj.join("Gemfile")).unwrap(),
+        gemfile,
+        "the re-run leaves the Gemfile as the first run wrote it"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("Gemfile.lock")).unwrap(),
+        lock,
+        "the re-run leaves the lock as the first run wrote it"
+    );
+    assert!(!ledger.exists(), "still no ledger");
 }
 
 /// Same-run `--vex` consistency: a stale-flagged purl is EXCLUDED from the
-/// ledger-based `assume_applied` attestation — the envelope must never
+/// run's `assume_applied` attestation — the envelope must never
 /// attest a CVE its own warning says is live. With the only patch stale,
 /// verification finds nothing attestable, so the run fails the VEX step
 /// (the embedded-VEX fail-the-command contract) and no document attests
@@ -576,16 +586,14 @@ async fn gem_hosted_manifest_less_vex_follows_the_installed_tree() {
         1
     );
     strip_manifest(&proj);
-    let ledger = std::fs::read(proj.join(".socket/vendor/redirect-state.json")).unwrap();
+    assert!(
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "hosted mode writes no redirect ledger"
+    );
 
-    // Stale, ledger kept: the Gemfile block keeps the claim live, the
-    // pristine installed tree decides.
-    let out = run_vex(&bin, &proj, &base);
-    assert_eq!(out.code, Some(1), "stale install: {out}");
-    assert_not_attested(&out.envelope, PURL, "not_applied");
-
-    // Stale, no ledgers: the lock is not converged yet (bundler < 2.6 mixed
-    // pair) and the Gemfile is not a discovery input — nothing to attest.
+    // Stale: the lock is not converged yet (bundler < 2.6 mixed pair), the
+    // Gemfile is not a discovery input, and v5 keeps no ledger claim —
+    // nothing to attest.
     strip_ledgers(&proj);
     let out = run_vex(&bin, &proj, &base);
     assert_eq!(out.code, Some(2), "nothing discoverable: {out}");
@@ -631,15 +639,15 @@ async fn gem_hosted_manifest_less_vex_follows_the_installed_tree() {
     assert_not_attested(&out.envelope, PURL, "hash_mismatch");
     std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), PATCHED_LIB).unwrap();
 
-    // Reverted pair, ledger (and the patched install) kept.
-    std::fs::write(proj.join(".socket/vendor/redirect-state.json"), &ledger).unwrap();
+    // Reverted pair (the patched install kept): nothing wires the patch any
+    // more, so nothing attests it — verified or not.
     std::fs::write(proj.join("Gemfile"), &pristine_gemfile).unwrap();
     std::fs::write(proj.join("Gemfile.lock"), &pristine_lock).unwrap();
     for no_verify in [false, true] {
         let mut run = base.clone();
         run.no_verify = no_verify;
         let out = run_vex(&bin, &proj, &run);
-        assert_eq!(out.code, Some(1), "reverted no_verify={no_verify}: {out}");
-        assert_not_attested(&out.envelope, PURL, "redirect_unwired");
+        assert_ne!(out.code, Some(0), "reverted no_verify={no_verify}: {out}");
+        assert_absent(out.doc.as_ref(), PURL);
     }
 }

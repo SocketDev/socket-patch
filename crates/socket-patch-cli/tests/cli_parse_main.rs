@@ -76,7 +76,7 @@ fn help_flag_triggers_display_help() {
     // listed in the rendered help.
     let help = err.to_string();
     for name in [
-        "scan", "apply", "vex", "vendor", "setup", "rollback", "get", "list", "remove", "repair",
+        "scan", "apply", "vex", "vendor", "rollback", "get", "list", "remove", "repair",
     ] {
         assert!(
             help.contains(name),
@@ -155,9 +155,12 @@ fn remove_subcommand_parses_with_identifier() {
 }
 
 #[test]
-fn setup_subcommand_parses() {
-    let cli = parse(&["socket-patch", "setup"]).expect("setup must parse with no positional");
-    assert!(matches!(cli.command, Commands::Setup(_)));
+fn setup_subcommand_is_removed() {
+    // BREAKING (5.0): `setup` (the npm/Python/Bundler/Composer install
+    // hooks) was removed. Agent mode wires `socket-patch apply` into CI
+    // instead. Pin the removal so the name can't quietly come back.
+    let err = expect_err(parse(&["socket-patch", "setup"]));
+    assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
 }
 
 #[test]

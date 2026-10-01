@@ -1,11 +1,11 @@
 # Ecosystem & platform support
 
 This is the detailed support matrix for `socket-patch`: which package ecosystems work
-with which [patch mode](../README.md#three-patch-modes), the per-ecosystem caveats, and
+with which [patch mode](../README.md#patch-modes), the per-ecosystem caveats, and
 the platforms the binary ships for.
 
 For what the three modes *are* and how to choose between them, see
-[How Socket Patch works](../README.md#how-socket-patch-works) in the README.
+[Patch modes](../README.md#patch-modes) in the README.
 
 ## Mode × ecosystem matrix
 
@@ -14,18 +14,17 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 
 | Ecosystem | agent (`--mode agent`) | vendored (`--mode vendored`) | hosted (`--mode hosted`) |
 |-----------|------------------------|------------------------------|--------------------------|
-| npm (`npm`) — pnpm / yarn / berry / bun / vlt | ✅ any install layout, vlt's `node_modules/.vlt` store included (every store copy, copy-on-write); `setup` postinstall hook | ✅ seven lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun text `bun.lock` lockfileVersion 0/1/2 and native binary `bun.lockb` revisions 1/2/3 (binary locks stay binary; text workspace vendoring requires lockfileVersion 2 — see [Bun compatibility](testing/bun-compatibility.md)), vlt `vlt-lock.json` lockfileVersion 0/1 (patched package directories for direct dependencies of the root or a workspace member; transitive targets refused — see [vlt notes](#npm-vlt-notes)). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun, vlt (`vlt-lock.json` without `lockfileVersion`, 0 or 1) — pnpm, berry, bun and vlt carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) and [vlt notes](#npm-vlt-notes) |
-| PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ `.pth` startup hook via `setup` | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
+| npm (`npm`) — pnpm / yarn / berry / bun / vlt | ✅ any install layout, vlt's `node_modules/.vlt` store included (every store copy, copy-on-write) | ✅ seven lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun text `bun.lock` lockfileVersion 0/1/2 and native binary `bun.lockb` revisions 1/2/3 (binary locks stay binary; text workspace vendoring requires lockfileVersion 2 — see [Bun compatibility](testing/bun-compatibility.md)), vlt `vlt-lock.json` lockfileVersion 0/1 (patched package directories for direct dependencies of the root or a workspace member; transitive targets refused — see [vlt notes](#npm-vlt-notes)). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun, vlt (`vlt-lock.json` without `lockfileVersion`, 0 or 1) — pnpm, berry, bun and vlt carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) and [vlt notes](#npm-vlt-notes) |
+| PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ in place | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected |
-| RubyGems (`gem`) | ✅ Bundler plugin via `setup` — needs bundler ≥ 2.2 (1.x cannot load `plugin ... path:` directives; `setup` refuses below the floor and `setup --check` red-flags a wired 1.x project) | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` project cannot vendor yet) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` when present (bundler prefers them over `Gemfile`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
-| Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [golang-hosted.md](design/golang-hosted.md). Paid tier stays ❌ ([golang-hosted-no-go.md](design/golang-hosted-no-go.md)); `redirect_golang_unsupported` names the vendored remedy |
-| Maven (`maven`) | ✅ apply-only (no `setup` hook — reports `no_files`); in-place jar patching leaves the `~/.m2` checksum sidecars stale — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed maven2 `file://` repository. A root pom declaring `<modules>` (multi-module aggregator) is refused (`vendor_maven_multimodule_unsupported`), and a gradle-only project is refused (`vendor_gradle_unsupported`) | ✅ **pom projects only, fail-closed** — the patched jar is pinned at a Socket-only `<version>-socket.<hex8>` suffix; `${property}` versions are refused; Gradle gets a manual `exclusiveContent` snippet — see [Maven & NuGet caveats](#maven--nuget-caveats) |
-| NuGet (`nuget`) | ✅ apply-only (no `setup` hook — reports `no_files`); in-place patching deletes `.nupkg.metadata` and advises on the `.nupkg.sha512` tamper-evidence sidecar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed folder feed + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats) |
-| Composer (`composer`) | ✅ post-install script events | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite; the entry's `source` and `dist.mirrors` are removed. See [composer-compatibility.md](testing/composer-compatibility.md) |
-| Deno (`deno`) | ✅ apply-only — no install hook (`setup` reports `no_files`); declare in `setup.manual` for VEX coverage | ❌ refused (`vendor_unsupported_ecosystem`) | ❌ not supported |
+| RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` when present (bundler prefers them over `Gemfile`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from the environment or `.bundle/config` is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
+| Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [Go notes](#go-directory-replaces-and-gosum). Paid hosted patches are unsupported; `redirect_golang_unsupported` names the vendored remedy |
+| Maven (`maven`) | ✅ in-place jar patching leaves the `~/.m2` checksum sidecars stale — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ single-POM repository, suffixed Maven reactor repository, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks; see [JVM vendoring](design/maven-vendoring.md) | ✅ **pom projects only, fail-closed** — the patched jar is pinned at a Socket-only `<version>-socket.<hex8>` suffix; `${property}` versions are refused; Gradle gets a manual `exclusiveContent` snippet — see [Maven & NuGet caveats](#maven--nuget-caveats) |
+| NuGet (`nuget`) | ✅ in-place patching deletes `.nupkg.metadata` and advises on the `.nupkg.sha512` tamper-evidence sidecar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed folder feed + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats) |
+| Composer (`composer`) | ✅ in place (`vendor/`) | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite; the entry's `source` and `dist.mirrors` are removed. See [composer-compatibility.md](testing/composer-compatibility.md) |
+| Deno (`deno`) | ✅ in place (the only mode for Deno) | ❌ refused (`vendor_unsupported_ecosystem`) | ❌ not supported |
 
-> **Maven / NuGet sidecar caveat**: Maven and NuGet are fully enabled in every mode (the
-> old `SOCKET_EXPERIMENTAL_MAVEN` / `SOCKET_EXPERIMENTAL_NUGET` opt-ins are retired).
+> **Maven / NuGet sidecar caveat**: Maven and NuGet are fully enabled in every mode.
 > In-place (agent-mode) patching leaves the caches' own checksum sidecars stale: NuGet's
 > post-apply fixup deletes `.nupkg.metadata` and raises an advisory for the
 > signed-package `.nupkg.sha512` tamper marker it cannot honestly rewrite; Maven's
@@ -40,8 +39,9 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   committed shrinkwrap). npm 12 defaults `allow-remote=none` and refuses the
   redirected tarballs (EALLOWREMOTE) unless the project `.npmrc` sets
   `allow-remote=all`, so the hosted run writes it (new file, or one appended
-  line; ledger-recorded as `redirect_npmrc_allow_remote` and removed again by
-  `rollback` / `remove` / the vendored takeover) and always warns
+  line; once `rollback` / `remove` / the vendored takeover has restored the last
+  hosted lock entry, a file holding only that line is deleted, otherwise the line
+  stays with an `npm_allow_remote_left` warning) and always warns
   `redirect_npm_allow_remote` with the tradeoff (any url-resolved dependency is
   then admitted; sha512 pins stay enforced). Commit `.npmrc` with the lock. An
   explicit user `allow-remote=none` / `root` is respected (never rewritten or
@@ -108,9 +108,13 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   malformed binary locks fail closed before patching. Hosted → vendored and
   vendored → hosted conversions both work
   in place (mode takeover) — on a lock the vendored backend refuses (a pre-version-2
-  `workspace:` lock) `vendor` reports the refusal before the hosted revert and leaves the
-  purl hosted-patched — and `rollback <purl>` / `remove <purl>` unwind one of several
-  hosted bun redirects.
+  `workspace:` lock) `vendor` reports the refusal before the upstream restore and leaves the
+  purl hosted-patched — and `rollback <purl>` / `remove <purl>` restore one of several
+  hosted bun packages to its upstream registry entry. A hosted `bun.lockb` entry is not
+  rolled back (v5.0 keeps no hosted ledger, and a rebuilt binary record is not byte-exact
+  for every lock): rollback and remove refuse it with the `git checkout -- bun.lockb`
+  remedy, while the hosted → vendored takeover rebuilds its npm registry record natively
+  and vendors over it.
   Bun verifies the sha512 of URL and local-tarball tuples only from 1.3.10 (registry
   tuples from 1.2.0), so on 1.1.39–1.3.9 a hosted or vendored rewrite removes digest
   enforcement for the patched package. Every boundary here is measured against real
@@ -134,6 +138,17 @@ other tools that follow the convention: neither that directory's own
 `node_modules` nor anything below it is crawled. The scan root is always
 crawled, even when it is tagged itself. A `CACHEDIR.TAG` that lacks the
 signature, is a directory or is a symlink prunes nothing.
+
+Inside each `node_modules`, the package stores of isolated layouts are
+walked too, since they are the only home of transitive dependencies:
+pnpm's virtual store (`node_modules/.pnpm`, pnpm <= 3's
+`node_modules/.registry.*`, or the directory a `virtualStoreDir` setting
+moved it to, as recorded in `node_modules/.modules.yaml`), vlt's
+`node_modules/.vlt`, and npm's `install-strategy=linked` store
+`node_modules/.store`. A recorded virtual store outside the project,
+notably pnpm's global virtual store (`enableGlobalVirtualStore`, under the
+pnpm store directory), is not walked: other projects on the machine load
+the same files, so patching it in place would patch them as well.
 
 Every command that looks for installed npm copies walks these same trees, not
 only `scan`. A package installed only under a pruned directory is therefore
@@ -289,22 +304,16 @@ directory) or a link still into the vendored directory.
 replace each file instead of writing through it, so vlt 1.2's shared store (hardlinked on
 Linux) and every other project linked to it keep their bytes. A patch survives `vlt
 install`, `install <new>`, `uninstall` and frozen installs; `vlt ci` and deleting
-`node_modules` restore the upstream bytes, which is what the setup hook is for.
-
-**Setup.** vlt gets npm's `npx @socketsecurity/socket-patch apply --silent --ecosystems
-npm` postinstall hook, wired at the workspace root only (vlt runs the root hook once per
-install that changes the graph, never on a no-op install). vlt before 1.0.0-rc.13 never
-runs a root `postinstall` without an `install` script: `setup` still wires it and warns
-`vlt_root_scripts_not_run`. A failing hook aborts and rolls back the whole `vlt install`.
+`node_modules` restore the upstream bytes; run `socket-patch apply` after them.
 
 **Locale.** vlt sorts its lock with the process locale for one key, so byte-stability is
 claimed only for `en`-equivalent locales (`LANG` unset, `C`, `POSIX` or `en_US`); every vlt
 test job sets `LANG=C` and `LC_ALL=C`. Vendored ownership and revert match by entry text,
 so they do not depend on the order.
 
-**Compatibility of ledgers.** vlt ledgers (`redirect_vlt_lock_node` hosted edits and
-`flavor: "vlt"` vendored entries) require the socket-patch release that adds vlt support:
-an older release does not understand them.
+**Compatibility of ledgers.** vlt vendor ledgers (`flavor: "vlt"` entries) require the
+socket-patch release that adds vlt support: an older release does not understand them.
+Hosted vlt pins need no ledger (v5.0): `rollback` restores them from the npm registry.
 
 ## Maven & NuGet caveats
 
@@ -325,18 +334,27 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   a depMgmt pin could strand sibling artifacts sharing the property. A literal version
   that matches neither the base nor the suffixed value is skipped
   (`redirect_maven_dep_version_mismatch`).
-* **Trusted Checksums reinforcement (hosted Maven, 3.9+).** When the patch server
+* **Trusted Checksums reinforcement (hosted Maven, 3.9.4+).** When the patch server
   supplies both the jar and pom sha256, the rewriter also emits Maven
   [Trusted Checksums](https://maven.apache.org/resolver/expected-checksums.html) files —
   `.mvn/maven.config` resolver args plus `.mvn/checksums/checksums.sha256` entries
   pinning both artifacts under the suffixed version's local-repo path (merging into any
   pre-existing user config / checksum set; a conflicting value is never overridden and
   surfaces `redirect_maven_trusted_checksums_conflict`). This is an **independent
-  client-side content pin** on top of the transport check. It requires **Maven 3.9+**
-  (the resolver post-processor and the `${session.rootDirectory}` basedir expression the
-  config uses); on older Maven the `.mvn/*` files are silently inert — the
-  version-suffixing above is still fail-closed on its own. On Maven **3.9.0–3.9.8** a
-  *mismatch* is enforced but reported unclearly; the readability fix landed in **3.9.9**
+  client-side content pin** on top of the transport check. It requires **Maven 3.9.4+**.
+  Older releases leave the `.mvn/*` files inert, and only the transport `.sha1` check
+  guards the Socket-served bytes. The version suffixing above still fails closed on its
+  own.
+  - **3.9.0 / 3.9.1** do not interpolate the `${session.rootDirectory}` basedir the config
+    uses, so the summary file is never found.
+  - **3.9.2 / 3.9.3** ignore `checksumAlgorithms=SHA-256` and check SHA-1 only.
+  - **Below 3.9** there is no Trusted Checksums post-processor.
+
+  When `.mvn/wrapper/maven-wrapper.properties` pins a Maven older than 3.9.4, the rewriter
+  still writes the files and warns `redirect_maven_trusted_checksums_unenforced`. Without
+  a Maven Wrapper, the CLI can't tell which Maven builds the project, so it doesn't warn.
+  On Maven **3.9.4–3.9.8** a *mismatch* is enforced but reported unclearly; the
+  readability fix landed in **3.9.9**
   ([MNG-8182](https://issues.apache.org/jira/browse/MNG-8182)). The args are
   `originAware=false` and `failIfMissing=false`, so one checksum matches the artifact
   from any repository and a dependency with no committed checksum still resolves — only a
@@ -357,14 +375,15 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   confirmed directory, a POM at a canonical path whose contents disagree with its
   directory (hand-placed, or a legacy upstream POM with mismatched coordinates) reports
   the directory's coordinates.
-* **Warm `~/.m2` shadowing (vendored Maven only).** Maven consults the *local repository*
+* **Warm `~/.m2` shadowing (legacy single-POM vendoring).** Maven consults the *local repository*
   before any configured `<repository>`, so with vendored mode a warm `~/.m2` copy of the
   same GAV silently wins over the committed `file://` repository — the build succeeds
   with **unpatched** bytes. Purge it with:
   `mvn dependency:purge-local-repository -DmanualInclude=<groupId>:<artifactId>`
   (the always-on `vendor_maven_local_cache_shadow` warning carries the same one-liner).
-  Hosted mode is **not** affected: the patched jar lives at the suffixed version, which
-  no warm `~/.m2` entry can hold.
+  Reactor vendoring and hosted mode use a suffixed version, so a cached original
+  version cannot shadow it. Audit conflicting copies of that suffix with
+  `vendor --check --local-repo <path>`.
 * **`mirrorOf` mirrors (hosted Maven).** A `settings.xml` `<mirror>` with
   `<mirrorOf>*</mirrorOf>` (common in corporate environments) reroutes *all* repositories
   — including the injected `socket-patch-<uuid>` repository — through the mirror. Because
@@ -385,6 +404,8 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   a tampered or wrong package fails restore with `NU1403`. Without a lockfile there is no
   client-side content pin (vendored surfaces this as a `vendor_nuget_no_lockfile`
   warning; the feed + source mapping still force the patched copy).
+
+* **NuGet package signatures.** The server constructs the patched `.nupkg` and removes invalidated upstream signatures. The CLI verifies and stores the served archive without repacking it. Vendoring uses a folder feed with source mapping; installations requiring signed packages need an appropriate server artifact and signing policy.
 
 ## Cargo: shared registry cache
 
@@ -525,17 +546,46 @@ commit it, and review it like any other vendored code. The wiring survives
 `go mod tidy`, and `apply --check` gives CI a read-only audit that the committed
 redirects still match the manifest.
 
-Hosted mode uses Go's other native `replace` form — a fork-style
-module-to-module directive onto a Socket-published, content-addressed module
-(`replace <mod> <ver> => patch.socket.dev/gopatch/<uuid> <ver>-socketpatch.<n>`)
-plus the module's two committed `go.sum` lines. Because go consults the
-checksum database only for modules *absent* from `go.sum`, the committed pair
-is the complete day-2 state: fresh clones and CI build the patched module with
-no machine-local configuration, and a tampered hash still fails closed with
-go's checksum `SECURITY ERROR`. Free tier only; the paid-tier analysis (and
-the ephemeral-CI workaround) is in
-[golang-hosted-no-go.md](design/golang-hosted-no-go.md), the full free-tier
-design in [golang-hosted.md](design/golang-hosted.md).
+Hosted mode uses a fork-style module replacement and two committed checksums:
+
+```text
+# go.mod
+replace example.com/module v1.4.2 => patch.socket.dev/gopatch/<uuid> v1.4.2-socketpatch.1
+
+# go.sum
+patch.socket.dev/gopatch/<uuid> v1.4.2-socketpatch.1 h1:<module-zip-hash>
+patch.socket.dev/gopatch/<uuid> v1.4.2-socketpatch.1/go.mod h1:<module-file-hash>
+```
+
+The service supplies the replacement path, version, and both hashes; the example
+version is illustrative. Both hashes must be present before the CLI writes the
+replacement. Go uses committed `go.sum` entries without consulting the checksum
+database for those entries, so a fresh checkout needs no per-machine checksum
+exemption. A mismatched checksum still fails the build. The rewriter removes the
+replaced version's original sum lines to keep the result stable under `go mod tidy`.
+
+This requires a free, publicly retrievable patch reference carrying a `goproxy`
+override. CLI support does not imply a patch is published for a particular module.
+Paid hosted Go references are unsupported: embedding credentials in module paths
+would expose them to module proxies and change module identity. Use vendored mode
+for those patches; the CLI reports `redirect_golang_unsupported` when the required
+hosted reference is absent.
+
+Important limits:
+
+- A replacement targets an exact original module version. Updating the `require`
+  can leave it unused; re-scan and regenerate VEX after dependency updates.
+- An internal `GOPROXY` must be able to serve or forward the Socket module path.
+  Comma-separated proxy fallbacks do not recover from every HTTP error.
+- User-authored conflicting replacements are preserved and the patch is refused.
+  Missing module metadata, untrusted Socket module paths, or missing integrity
+  values are also refused before writing.
+- Local directory replacements in agent and vendored mode are not checked against
+  `go.sum`; commit and review those trees. Hosted replacements use the module
+  checksum mechanism above.
+
+The implemented hosted shape and fresh-checkout behavior are exercised by
+[`e2e_golang_hosted_build.rs`](../crates/socket-patch-cli/tests/e2e_golang_hosted_build.rs).
 
 ## Supported platforms
 

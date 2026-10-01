@@ -333,6 +333,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             st.bytes_in += len(body)
         t0 = time.time()
         status = 599
+        accounted = False
         try:
             key = f"{self.server.upstream} {method} {self.path} {canon_body(body)}"
             is_batch = method == "POST" and BATCH_RE.search(urllib.parse.urlsplit(self.path).path)
@@ -365,16 +366,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 delay = upstream_ms / 1000.0 if cfg.latency == "recorded" else cfg.latency_ms / 1000.0
                 if delay > 0:
                     time.sleep(delay)
+            # Account before replying: a client that has its response must
+            # see this request in /__stats (and in-process snapshots).
+            self._account(kind, status, t0, len(data))
+            accounted = True
             self._send(status, headers, data)
-            with st.lock:
-                st.bytes_out += len(data)
         finally:
-            t1 = time.time()
-            with st.lock:
-                st.inflight -= 1
-                st.by_kind[kind] = st.by_kind.get(kind, 0) + 1
-                st.by_status[str(status)] = st.by_status.get(str(status), 0) + 1
-                st.timeline.append([t0 - st.t0, t1 - st.t0, kind, status])
+            if not accounted:
+                self._account(kind, status, t0, 0)
+
+    def _account(self, kind, status, t0, bytes_out):
+        st = self.server.stats
+        t1 = time.time()
+        with st.lock:
+            st.inflight -= 1
+            st.bytes_out += bytes_out
+            st.by_kind[kind] = st.by_kind.get(kind, 0) + 1
+            st.by_status[str(status)] = st.by_status.get(str(status), 0) + 1
+            st.timeline.append([t0 - st.t0, t1 - st.t0, kind, status])
 
     do_GET = do_POST = do_PUT = do_HEAD = do_DELETE = do_PATCH = _handle
 

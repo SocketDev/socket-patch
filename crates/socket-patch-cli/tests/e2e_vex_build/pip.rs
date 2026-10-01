@@ -1,18 +1,19 @@
 //! Real-pip capstone for manifest-less VEX over `requirements.txt`: for
 //! every pip major (latest release of each, `SOCKET_PATCH_PIP_E2E_VERSIONS`
-//! overrides), HOSTED and VENDORED, three project shapes:
+//! overrides), HOSTED and VENDORED, four project shapes:
 //!
 //! | cell | requirements | hosted | vendored |
 //! | --- | --- | --- | --- |
 //! | `root` | `six==1.16.0` | yes | yes |
 //! | `hashes` | `pip-compile --generate-hashes` style (`\` continued `--hash`, hash-checking mode) | yes | yes |
 //! | `include` | `-r requirements/base.txt` | root-only rewriter: stays on the registry, nothing attested | yes |
+//! | `unhashed` | `six==1.16.0` + `idna==3.7`, no hashes: the wiring must not add a `--hash` (#376) | yes | yes |
 //!
 //! Each flow:
 //!
 //! 1. `python -m pip install -r requirements.txt` with the real pip major
 //!    from PyPI (the pristine install);
-//! 2. `socket-patch scan --redirect --vex` (hosted, on the lock-only
+//! 2. `socket-patch scan --mode hosted --vex` (hosted, on the lock-only
 //!    checkout) / `scan --vendor --vendor-source build --vex` (vendored,
 //!    from the pristine install) against a wiremock Socket API that also
 //!    serves the patched wheel — the same-run document attests;
@@ -24,7 +25,7 @@
 //! 4. the manifest-less VEX matrix (`vex_pipenv_pip_real`): manifest
 //!    deleted, ledgers deleted, `--offline` (zero requests), requirements
 //!    reverted to the registry pin (also `--no-verify`), `apply --vex`;
-//!    plus the embedded `scan --redirect --vex` / `scan --vendor --vex`
+//!    plus the embedded `scan --mode hosted --vex` / `scan --vendor --vex`
 //!    re-run on the manifest-less checkout.
 //!
 //! `#[ignore]`d (network: PyPI) — run with `--ignored`; CI sets
@@ -57,6 +58,10 @@ enum Cell {
     Root,
     Hashes,
     Include,
+    /// #376: a second, unhashed requirement next to the patched one. One
+    /// `--hash` on the wired line would put pip in hash-checking mode for
+    /// the whole install and refuse `idna==3.7`.
+    Unhashed,
 }
 
 impl Cell {
@@ -65,6 +70,7 @@ impl Cell {
             Cell::Root => "root",
             Cell::Hashes => "hashes",
             Cell::Include => "include",
+            Cell::Unhashed => "unhashed",
         }
     }
 
@@ -82,6 +88,7 @@ impl Cell {
                 ("requirements.txt", "-r requirements/base.txt\n".into()),
                 ("requirements/base.txt", "six==1.16.0\n".into()),
             ],
+            Cell::Unhashed => vec![("requirements.txt", "six==1.16.0\nidna==3.7\n".into())],
         }
     }
 }
@@ -221,10 +228,19 @@ fn flow(uv: &Path, major: &str, pip_version: &str, cell: Cell, mode: Mode, root:
     record("pip", pip_version, &row, "embedded-scan-vex", "pass");
     std::fs::remove_file(&embedded).unwrap();
     let wired = wiring_text(&proj, cell);
+    // pip's hash-checking mode is all or nothing (#376): only an already
+    // hashed file gets a `--hash`; the hosted url otherwise carries the
+    // pin as a `#sha256=` fragment pip verifies without the mode.
+    assert_eq!(
+        wired.contains("--hash="),
+        cell == Cell::Hashes,
+        "{what}: the wiring must keep the file's hash-checking mode: {wired}"
+    );
     match mode {
         Mode::Hosted => assert!(
-            wired.contains(&api.artifact_url()) && wired.contains("--hash=sha256:"),
-            "{what}: requirements must point at the hosted wheel: {wired}"
+            wired.contains(&api.artifact_url())
+                && (cell == Cell::Hashes || wired.contains(".whl#sha256=")),
+            "{what}: requirements must point at the pinned hosted wheel: {wired}"
         ),
         Mode::Vendored => assert!(
             wired.contains(&format!(".socket/vendor/pypi/{}/", mode.uuid())),
@@ -239,11 +255,14 @@ fn flow(uv: &Path, major: &str, pip_version: &str, cell: Cell, mode: Mode, root:
     let fresh_venv = fresh.join(".venv");
     pip_venv(uv, major, &fresh_venv).unwrap_or_else(|e| panic!("{what}: fresh venv: {e}"));
     let downloads = api.artifact_downloads();
-    let out = pip(
-        &fresh_venv,
-        &fresh,
-        &["install", "--no-index", "-r", "requirements.txt"],
-    );
+    // The unhashed cell's other requirement (idna) comes from PyPI; the
+    // patched six still can only come from the wiring.
+    let install: &[&str] = if cell == Cell::Unhashed {
+        &["install", "-r", "requirements.txt"]
+    } else {
+        &["install", "--no-index", "-r", "requirements.txt"]
+    };
+    let out = pip(&fresh_venv, &fresh, install);
     assert_ok(&out, &format!("{what}: fresh `pip install --no-index -r`"));
     let (_, bytes, is_patched) = six_oracle(&venv_bin(&fresh_venv, "python"), &fresh)
         .unwrap_or_else(|| panic!("{what}: six not importable in the fresh checkout"));
@@ -335,7 +354,7 @@ fn pip_every_major_hosted_and_vendored_end_in_manifest_less_vex() {
                 continue;
             }
         };
-        for cell in [Cell::Root, Cell::Hashes, Cell::Include] {
+        for cell in [Cell::Root, Cell::Hashes, Cell::Include, Cell::Unhashed] {
             for mode in [Mode::Hosted, Mode::Vendored] {
                 let root = scratch.path().join("run");
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

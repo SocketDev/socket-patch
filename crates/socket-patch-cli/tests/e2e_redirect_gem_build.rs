@@ -6,7 +6,7 @@
 //! `/api/v1/dependencies` fallback returned a zero-byte body); the 2026-08-18
 //! gem catalog republish fixed the served index, and this hermetic suite pins
 //! the contract from both sides regardless of production's current state —
-//! see the history section of `docs/testing/hosted-production-e2e.md`.
+//! see `docs/testing/hosted-production-e2e.md` for the live-service counterpart.
 //!
 //! Unlike the npm/cargo siblings, this suite is FULLY hermetic: the fixture
 //! gems are authored here and built with the real `gem build`, and ONE
@@ -28,26 +28,27 @@
 //!      project-local `vendor/bundle` (no rubygems.org, no network beyond
 //!      loopback).
 //!   2. `scan --mode hosted --json --vex …` (the real binary): the Gemfile
-//!      gains the `source "<index-url>" do … end` block, the ledger embeds
-//!      the patch record, the in-run VEX is the unverified `(redirected)`
-//!      attestation.
+//!      gains the `source "<index-url>" do … end` block, NO redirect ledger
+//!      is written (v5: the manifest pair is the hosted state), the in-run
+//!      VEX is the unverified `(redirected)` attestation.
 //!   3. FRESH-CHECKOUT PROOF: only the committable files travel; an UNFROZEN
 //!      `bundle install` (the flow the rewriter's `redirect_gem_frozen_install`
 //!      warning prescribes) resolves the patched gem from the mock patch
 //!      registry: installed bytes byte-match the patch blob, the runtime dep
 //!      installs BECAUSE the registry `/info` declares it, and a require
 //!      probe loads the patched code.
-//!   4. POST-INSTALL VERIFIED VEX: `socket-patch vex` hash-verifies the
-//!      installed tree against the ledger record.
+//!   4. POST-INSTALL VERIFIED VEX: `socket-patch vex` discovers the pin from
+//!      the lock (`--patch-server-url` names the mock origin), fetches the
+//!      record from the patch API and hash-verifies the installed tree.
 //!
 //! The `gems.rb` twin drives the same chain through bundler's modern
 //! `gems.rb`/`gems.locked` spelling (which bundler prefers over `Gemfile`
 //! when both exist — this pins the candidate-list + rewriter support).
 //!
-//! The `get <uuid> --mode hosted` twin (v3.6) drives the SAME fixture
+//! The `get <uuid> --mode hosted` twin (v4.0) drives the SAME fixture
 //! through get's per-advisory selector instead of scan — same hosted engine
 //! by construction (CLI_CONTRACT.md "get --mode and installed narrowing"):
-//! identical Gemfile/lock rewrite + ledger, get's envelope (nested
+//! identical Gemfile/lock rewrite (no ledger), get's envelope (nested
 //! `redirect`, no `downloaded`/`applied`), NO manifest, NO blobs, no --vex.
 //!
 //! The deps red-arm serves an `/info` shaped like production's HISTORICAL
@@ -72,11 +73,10 @@
 //!
 //! MANIFEST-LESS VEX (every installing arm, `manifestless_vex_matrix`): on
 //! the fresh checkout the real bundler installed — hosted never writes a
-//! `.socket/manifest.json` — `vex` attests `(redirected)` from the lock +
-//! ledger; with both ledgers deleted it still attests from the lockfile
-//! wiring + the patch API (and so does the embedded `apply --vex`);
-//! `--offline` without ledgers is `record_unavailable` with zero requests;
-//! the pair reverted to its registry version is `redirect_unwired` even
+//! `.socket/manifest.json` nor a ledger — `vex` attests `(redirected)` from
+//! the lockfile wiring + the patch API (and so does the embedded
+//! `apply --vex`); `--offline` is `record_unavailable` with zero requests;
+//! the pair reverted to its registry version names the patch nowhere, even
 //! under `--no-verify`. The main arm also proves the lock-only revert
 //! (Gemfile block kept) re-converges on the next unfrozen install.
 //!
@@ -233,7 +233,12 @@ fn md5_hex(bytes: &[u8]) -> String {
     hexstr
 }
 
+/// Copy `src` into `dst`; a missing `src` copies nothing (v5 hosted mode may
+/// leave no `.socket/` at all).
 fn copy_dir_recursive(src: &Path, dst: &Path) {
+    if !src.exists() {
+        return;
+    }
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
         let entry = entry.unwrap();
@@ -392,9 +397,14 @@ enum Driver {
     /// recipe with the in-run (unverified) attestation.
     ScanVex,
     /// `get <uuid> --mode hosted --json --yes` — get's per-advisory
-    /// selector (v3.6). No `--vex` (get has none); the uuid path needs only
+    /// selector (v4.0). No `--vex` (get has none); the uuid path needs only
     /// the view + reference mocks and is exempt from installed narrowing.
     GetUuid,
+    /// [`Driver::ScanVex`] on a dual-boot project whose `.bundle/config`
+    /// sets `BUNDLE_GEMFILE: "Gemfile.next"` (#390): bundler loads
+    /// `Gemfile.next`, so the run must redirect nothing and attest nothing.
+    /// The fixture asserts that contract itself and yields `None`.
+    ScanVexDualBoot,
 }
 
 impl Driver {
@@ -402,6 +412,7 @@ impl Driver {
         match self {
             Driver::ScanVex => "scan --mode hosted",
             Driver::GetUuid => "get <uuid> --mode hosted",
+            Driver::ScanVexDualBoot => "scan --mode hosted (BUNDLE_GEMFILE=Gemfile.next)",
         }
     }
 }
@@ -484,8 +495,9 @@ fn run_hosted_scan(proj: &Path, api: &str) -> (i32, String, String) {
 /// and assert the redirect envelope + Gemfile rewrite. `checksums_lock` opts
 /// the fixture lock into a CHECKSUMS section (`bundle lock --add-checksums`);
 /// `registry_declares_deps` toggles the patch registry's `/info` between the
-/// CORRECT contract (runtime deps declared) and today's production-like
-/// deps-less answer. `rotated_token` = Some(token B) arms a grant-rotation
+/// CORRECT contract (runtime deps declared) and production's HISTORICAL
+/// deps-less answer (fixed by the 2026-08-18 republish). `rotated_token` =
+/// Some(token B) arms a grant-rotation
 /// plan: the `TOKEN` grant answers the first two reference calls, token B
 /// (same uuid) every later one, and the patch registry serves both token
 /// paths (production keeps a grant alive until it expires). `None` = skip
@@ -748,8 +760,22 @@ async fn redirect_scanned_project(
     //    --vex (get has none), get's envelope with the nested `redirect`.
     let api = server.uri();
     let proj_str = proj.to_str().expect("utf8 tmp path");
+    if driver == Driver::ScanVexDualBoot {
+        // The next-Rails dual boot: a `Gemfile.next` pair that bundler loads
+        // through the committed `.bundle/config`.
+        std::fs::copy(proj.join(gemfile_name), proj.join("Gemfile.next")).unwrap();
+        std::fs::copy(proj.join(lock_name), proj.join("Gemfile.next.lock")).unwrap();
+        let args = bundler.config_local_args("gemfile", "Gemfile.next");
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let cfg = bundle(&proj, &args);
+        assert!(
+            cfg.status.success(),
+            "bundle config set --local gemfile failed:\n{}",
+            String::from_utf8_lossy(&cfg.stderr)
+        );
+    }
     let argv: Vec<&str> = match driver {
-        Driver::ScanVex => vec![
+        Driver::ScanVex | Driver::ScanVexDualBoot => vec![
             "scan",
             "--mode",
             "hosted",
@@ -786,6 +812,19 @@ async fn redirect_scanned_project(
         ],
     };
     let (code, stdout, stderr) = run_socket(&proj, &argv);
+    if driver == Driver::ScanVexDualBoot {
+        let env: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"));
+        // `--vex` with nothing to attest is an error: the run must not
+        // look like a successful, attested patch.
+        assert_ne!(code, 0, "nothing was patched or attested: {env}");
+        assert_eq!(
+            env["error"]["code"], "manifest_not_found",
+            "envelope: {env}"
+        );
+        assert_dual_boot_redirects_nothing(&env, &proj, &pristine_gemfile, &pristine_lock);
+        return None;
+    }
     assert_eq!(
         code,
         0,
@@ -856,14 +895,15 @@ async fn redirect_scanned_project(
             assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
             assert_eq!(
                 env["vex"]["verified"], false,
-                "in-run hosted VEX is attested from the ledger, not hash-verified: {env}"
+                "in-run hosted VEX is attested from this run's fetched record, not hash-verified: {env}"
             );
         }
+        Driver::ScanVexDualBoot => unreachable!("asserted and returned above"),
         Driver::GetUuid => {
             // get's hosted envelope (CLI_CONTRACT.md "get --mode and
             // installed narrowing"): `found` counts the resolved patch;
             // `downloaded`/`applied` are ABSENT — nothing lands in
-            // `.socket/`, the redirect ledger IS the persistence — and no
+            // `.socket/`, the lockfile IS the persistence — and no
             // `vex` key (get has no --vex).
             assert_eq!(env["found"], 1, "envelope: {env}");
             assert!(
@@ -895,12 +935,8 @@ async fn redirect_scanned_project(
         );
     }
 
-    // Ledger embeds the patch record so a post-install `vex` can verify.
-    let ledger = std::fs::read_to_string(proj.join(".socket/vendor/redirect-state.json")).unwrap();
-    assert!(
-        ledger.contains("\"records\"") && ledger.contains(GHSA),
-        "redirect ledger must embed the patch record + vulnerability: {ledger}"
-    );
+    // v5: hosted mode writes no ledger — the manifest pair is the state.
+    assert_no_redirect_ledger(&proj);
 
     Some(RedirectFixture {
         tmp,
@@ -914,6 +950,60 @@ async fn redirect_scanned_project(
         bundler,
         _server: server,
     })
+}
+
+/// #390's contract on a `BUNDLE_GEMFILE: Gemfile.next` project: the hosted
+/// scan names the setting, rewrites neither the `Gemfile` pair (which
+/// bundler ignores) nor `Gemfile.next`, and its in-run VEX attests nothing.
+/// Then the real bundler, loading `Gemfile.next`, resolves the upstream gem
+/// (nothing pretends otherwise).
+fn assert_dual_boot_redirects_nothing(
+    env: &serde_json::Value,
+    proj: &Path,
+    pristine_gemfile: &[u8],
+    pristine_lock: &[u8],
+) {
+    let warning_codes: Vec<&str> = env["redirect"]["warnings"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|w| w["code"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        warning_codes.contains(&"redirect_gem_bundle_gemfile_unsupported"),
+        "the BUNDLE_GEMFILE refusal must be reported: {env}"
+    );
+    assert!(
+        !warning_codes.contains(&"redirect_gem_no_gemfile"),
+        "the refusal names its real cause, not a missing Gemfile: {env}"
+    );
+    assert_eq!(
+        env["redirect"]["redirected"], 0,
+        "nothing redirected: {env}"
+    );
+    assert!(
+        env["vex"]["statements"].as_u64().unwrap_or(0) == 0,
+        "no in-run attestation for a gem bundler installs unpatched: {env}"
+    );
+    for (file, want) in [
+        ("Gemfile", pristine_gemfile),
+        ("Gemfile.lock", pristine_lock),
+        ("Gemfile.next", pristine_gemfile),
+        ("Gemfile.next.lock", pristine_lock),
+    ] {
+        assert_eq!(
+            std::fs::read(proj.join(file)).unwrap(),
+            want,
+            "{file} must be byte-untouched"
+        );
+    }
+    assert_no_redirect_ledger(proj);
+}
+
+/// v5 hosted mode never writes `.socket/vendor/redirect-state.json`.
+fn assert_no_redirect_ledger(proj: &Path) {
+    assert!(
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode must not write the redirect ledger"
+    );
 }
 
 /// New dir named `name` holding ONLY what a git checkout would carry — the
@@ -977,8 +1067,9 @@ fn assert_patched_install(fx: &RedirectFixture, fresh: &Path) {
     );
     // The deps contract: `tiny-dep` reaches the install ONLY through the
     // patch registry's `/info` declaring it (the fresh resolution re-derives
-    // vuln-gem's dependencies from that answer — production's deps-less
-    // answer drops it, see the red-arm twin).
+    // vuln-gem's dependencies from that answer — a deps-less answer
+    // (production's historical defect, reproduced by the red-arm twin) drops
+    // it).
     assert!(
         fresh_installed_lib(fresh, &format!("{TRANSITIVE}-1.0.0"), "tiny_dep.rb").is_file(),
         "the runtime dependency must install alongside the patched gem"
@@ -1055,22 +1146,22 @@ async fn view_requests(fx: &RedirectFixture) -> usize {
 }
 
 /// Manifest-less VEX over a fresh checkout the REAL bundler just installed
-/// the patched gem into (`fresh`, whose ledger came along with the commit):
+/// the patched gem into (`fresh`):
 ///
-///   1. no `.socket/manifest.json` (hosted never writes one): `vex` attests
-///      `(redirected)` from the lockfile wiring + the ledger record, hash-
-///      verified against the installed tree;
-///   2. both ledgers deleted too: still attested — discovery reads the
-///      converged lock's patch-registry `GEM` remote and the record comes
-///      from the patch API; the embedded `apply --vex` agrees;
-///   3. `--offline` with no ledgers: `record_unavailable`, ZERO requests;
-///   4. the manifest pair reverted to its registry version (ledgers and the
-///      installed patched tree kept): `redirect_unwired`, with and without
-///      `--no-verify`, online and offline.
+///   1. no `.socket/manifest.json` and no ledger (hosted writes neither):
+///      `vex` attests `(redirected)` — discovery reads the converged lock's
+///      patch-registry `GEM` remote and the record comes from the patch
+///      API, hash-verified against the installed tree; the embedded
+///      `apply --vex` agrees;
+///   2. `--offline`: no local record → `record_unavailable`, ZERO requests;
+///   3. the manifest pair reverted to its registry version (the installed
+///      patched tree kept): nothing names the patch any more
+///      (`manifest_not_found`), with and without `--no-verify`, online and
+///      offline.
 async fn manifestless_vex_matrix(fx: &RedirectFixture, fresh: &Path) {
     use vex_e2e_common::{
-        assert_absent, assert_attested, assert_not_attested, run_vex, strip_ledgers,
-        strip_manifest, Marker, VexVia,
+        assert_absent, assert_attested, assert_not_attested, run_vex, strip_manifest, Marker,
+        VexVia,
     };
     let bin = binary();
     let lock = std::fs::read_to_string(fresh.join(fx.lock_name)).unwrap();
@@ -1080,15 +1171,11 @@ async fn manifestless_vex_matrix(fx: &RedirectFixture, fresh: &Path) {
         fx.lock_name,
         fx.bundler.version
     );
-    let ledgers = fresh.join(".socket/vendor");
-    let saved = fx.tmp.path().join(format!(
-        "ledgers-{}",
-        fresh.file_name().unwrap().to_string_lossy()
-    ));
-    copy_dir_recursive(&ledgers, &saved);
+    assert_no_redirect_ledger(fresh);
 
-    // 1. manifest-less (the ledger rides along).
+    // 1. manifest-less, ledger-less: lockfile discovery + the patch API.
     strip_manifest(fresh);
+    let views = view_requests(fx).await;
     let out = run_vex(&bin, fresh, &vex_run(fx));
     assert_eq!(
         out.code,
@@ -1098,24 +1185,12 @@ async fn manifestless_vex_matrix(fx: &RedirectFixture, fresh: &Path) {
     );
     assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
     assert_eq!(out.envelope["summary"]["verified"], 1, "{out}");
-
-    // 2. no ledgers: lockfile discovery + the patch API.
-    strip_ledgers(fresh);
-    let views = view_requests(fx).await;
-    let out = run_vex(&bin, fresh, &vex_run(fx));
-    assert_eq!(
-        out.code,
-        Some(0),
-        "ledger-less vex: {out}\n--- {}\n{lock}",
-        fx.lock_name
-    );
-    assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
     assert!(
         view_requests(fx).await > views,
         "the record must come from the patch API"
     );
     let out = run_vex(&bin, fresh, &vex_run(fx).via(VexVia::Apply));
-    assert_eq!(out.code, Some(0), "ledger-less apply --vex: {out}");
+    assert_eq!(out.code, Some(0), "manifest-less apply --vex: {out}");
     assert_eq!(out.envelope["status"], "noManifest", "{out}");
     assert_eq!(out.envelope["vex"]["statements"], 1, "{out}");
     assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
@@ -1124,18 +1199,17 @@ async fn manifestless_vex_matrix(fx: &RedirectFixture, fresh: &Path) {
         "vex / apply --vex must never write the manifest"
     );
 
-    // 3. offline, no ledgers: nothing to build a statement from, no network.
+    // 2. offline: no local record to build a statement from, no network.
     let before = request_count(fx).await;
     let mut offline = vex_run(fx);
     offline.offline = true;
     let out = run_vex(&bin, fresh, &offline);
-    assert_eq!(out.code, Some(1), "offline ledger-less vex: {out}");
+    assert_eq!(out.code, Some(1), "offline vex: {out}");
     assert_not_attested(&out.envelope, PURL, "record_unavailable");
     assert_eq!(request_count(fx).await, before, "--offline made requests");
 
-    // 4. reverted to the registry pair; ledgers (and the patched install)
-    //    kept.
-    copy_dir_recursive(&saved, &ledgers);
+    // 3. reverted to the registry pair (the patched install kept): no lock
+    //    names the patch, and hosted mode keeps no ledger to remember it.
     std::fs::write(fresh.join(fx.gemfile_name), &fx.pristine_gemfile).unwrap();
     std::fs::write(fresh.join(fx.lock_name), &fx.pristine_lock).unwrap();
     for (offline, no_verify) in [(false, false), (false, true), (true, false), (true, true)] {
@@ -1144,8 +1218,11 @@ async fn manifestless_vex_matrix(fx: &RedirectFixture, fresh: &Path) {
         run.no_verify = no_verify;
         let out = run_vex(&bin, fresh, &run);
         let cell = format!("reverted offline={offline} no_verify={no_verify}");
-        assert_eq!(out.code, Some(1), "{cell}: {out}");
-        assert_not_attested(&out.envelope, PURL, "redirect_unwired");
+        assert_eq!(out.code, Some(2), "{cell}: {out}");
+        assert_eq!(
+            out.envelope["error"]["code"], "manifest_not_found",
+            "{cell}: {out}"
+        );
         assert_absent(out.doc.as_ref(), PURL);
     }
 }
@@ -1153,12 +1230,12 @@ async fn manifestless_vex_matrix(fx: &RedirectFixture, fresh: &Path) {
 /// The mixed pair the bundler < 2.6 rewriter leaves (and a lock-only
 /// `git checkout`): the Gemfile still carries the patch-registry source
 /// block, the lock resolves the gem from upstream. Bundler re-resolves from
-/// the Gemfile — proven here with the REAL bundler — so the ledger keeps the
-/// patch live (vex_sources `redirect_record_live` step 0), while a
-/// ledger-less checkout has nothing discovery reads until that install
-/// re-converges the lock, after which it attests from the lock alone.
+/// the Gemfile — proven here with the REAL bundler. v5 keeps no ledger, so
+/// the mixed checkout has nothing discovery reads (lockfile pins only) until
+/// that install re-converges the lock, after which it attests from the lock
+/// alone.
 async fn lock_only_revert_reconverges(fx: &RedirectFixture) {
-    use vex_e2e_common::{assert_attested, run_vex, strip_ledgers, Marker};
+    use vex_e2e_common::{assert_attested, run_vex, Marker};
     let bin = binary();
     let dir = stage_fresh_checkout(fx, "fresh-lock-only-revert");
     let install = bundle(&dir, &["install"]);
@@ -1168,20 +1245,12 @@ async fn lock_only_revert_reconverges(fx: &RedirectFixture) {
         String::from_utf8_lossy(&install.stderr)
     );
     std::fs::write(dir.join(fx.lock_name), &fx.pristine_lock).unwrap();
-    let out = run_vex(&bin, &dir, &vex_run(fx));
-    assert_eq!(
-        out.code,
-        Some(0),
-        "Gemfile-wired, lock reverted, ledger kept: {out}"
-    );
-    assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
-
-    strip_ledgers(&dir);
+    assert_no_redirect_ledger(&dir);
     let out = run_vex(&bin, &dir, &vex_run(fx));
     assert_eq!(
         out.code,
         Some(2),
-        "no ledger and no lockfile reference: nothing to attest: {out}"
+        "Gemfile-wired, lock reverted: no lockfile reference, nothing to attest: {out}"
     );
     assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
 
@@ -1199,7 +1268,7 @@ async fn lock_only_revert_reconverges(fx: &RedirectFixture) {
     );
     assert_patched_install(fx, &dir);
     let out = run_vex(&bin, &dir, &vex_run(fx));
-    assert_eq!(out.code, Some(0), "re-converged, ledger-less: {out}");
+    assert_eq!(out.code, Some(0), "re-converged: {out}");
     assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
 }
 
@@ -1248,8 +1317,10 @@ async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex
     );
 
     // POST-INSTALL VERIFIED VEX: default verify mode hash-verifies the
-    // installed tree against the ledger's patch record.
+    // installed tree against the patch API's record (v5: no ledger — the pin
+    // comes from the lock on the `--patch-server-url` origin).
     let doc_path = fresh.join("doc.json");
+    let server = fx._server.uri();
     let (code, stdout, stderr) = run_socket(
         &fresh,
         &[
@@ -1260,6 +1331,14 @@ async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex
             PRODUCT,
             "--cwd",
             fresh.to_str().unwrap(),
+            "--patch-server-url",
+            &server,
+            "--api-url",
+            &server,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
         ],
     );
     assert_eq!(
@@ -1287,9 +1366,9 @@ async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex
     lock_only_revert_reconverges(&fx).await;
 }
 
-/// GET-DRIVEN TWIN of the main capstone: `get <uuid> --mode hosted` (v3.6,
+/// GET-DRIVEN TWIN of the main capstone: `get <uuid> --mode hosted` (v4.0,
 /// the per-advisory selector) must leave the same committable redirect
-/// state as `scan --mode hosted` — same Gemfile source block, same ledger,
+/// state as `scan --mode hosted` — same Gemfile source block, NO ledger,
 /// NO manifest, NO blobs — proven the same way against the REAL bundler: a
 /// fresh checkout of only the committable files resolves the PATCHED gem
 /// (bytes + runtime dep + require probe) from the mock patch registry.
@@ -1310,9 +1389,9 @@ async fn gem_get_uuid_hosted_fresh_checkout_bundle_install() {
         return;
     };
 
-    // Persistence parity with `scan --mode hosted`: the redirect ledger is
-    // the ONLY .socket/ artifact — no manifest, no blobs (the fixture
-    // already asserted the ledger + the Gemfile source block).
+    // Persistence parity with `scan --mode hosted`: nothing lands in
+    // .socket/ — no ledger, no manifest, no blobs (the fixture already
+    // asserted the missing ledger + the Gemfile source block).
     assert!(
         !fx.proj.join(".socket/manifest.json").exists(),
         "get --mode hosted must NOT write the manifest (parity with scan --mode hosted)"
@@ -1389,10 +1468,91 @@ async fn gem_hosted_gems_rb_spelling_redirects_and_installs() {
     manifestless_vex_matrix(&fx, &fresh).await;
 }
 
+/// #341 follow-through: a CHECKSUMS-converged hosted `gems.rb` pin is a
+/// live hosted pin, so `get --mode vendored` takes it over. Vendored mode
+/// cannot wire `gems.rb`, and the refusal must come before the takeover
+/// reverts the pin.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_gems_rb_pin_survives_a_refused_vendored_takeover() {
+    let Some(fx) = redirect_scanned_project(
+        "gems.rb takeover",
+        Spelling::GemsRb,
+        true,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    vendor_takeover_keeps_the_hosted_gems_rb_pin(&fx);
+}
+
+/// A hosted→vendored takeover of a `gems.rb` project: vendored mode cannot
+/// wire `gems.rb`, so `get --mode vendored` must refuse BEFORE it restores the hosted
+/// pin's upstream entry, or the gem ends up unpatched in both modes.
+fn vendor_takeover_keeps_the_hosted_gems_rb_pin(fx: &RedirectFixture) {
+    let before: Vec<Vec<u8>> = ["gems.rb", "gems.locked"]
+        .iter()
+        .map(|f| std::fs::read(fx.proj.join(f)).unwrap())
+        .collect();
+    let proj = fx.proj.to_str().expect("utf8 tmp path");
+    let api = fx._server.uri();
+    let (code, stdout, stderr) = run_socket(
+        &fx.proj,
+        &[
+            "get", UUID, "--mode", "vendored", "--json", "--yes", "--cwd", proj, "--api-url",
+            &api, "--org", ORG, "--api-token", "fake",
+            // The mock serves the patch registry: its origin is the one a
+            // hosted pin is trusted on.
+            "--patch-server-url", &api,
+        ],
+    );
+    assert_ne!(code, 0, "vendor must refuse.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("gemfile_not_loaded"),
+        "the manifest refusal names its cause:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("vendor_takeover_reverted_redirect"),
+        "the hosted pin must not be reverted first:\n{stdout}"
+    );
+    for (file, before) in ["gems.rb", "gems.locked"].iter().zip(before) {
+        assert_eq!(
+            std::fs::read(fx.proj.join(file)).unwrap(),
+            before,
+            "{file} keeps its hosted wiring"
+        );
+    }
+}
+
+/// #390: bundler's `BUNDLE_GEMFILE` (here a committed `.bundle/config`
+/// naming `Gemfile.next`, the dual-boot layout) picks the manifest it
+/// loads. The hosted scan used to rewrite the ignored `Gemfile`, report
+/// success and attest the patch; it must redirect and attest nothing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_bundle_gemfile_dual_boot_redirects_nothing() {
+    let fx = redirect_scanned_project(
+        "dual-boot",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVexDualBoot,
+    )
+    .await;
+    assert!(fx.is_none(), "the dual-boot driver asserts in place");
+}
+
 /// The compact-index DEPENDENCY contract, pinned from the red side: a patch
 /// registry whose `/info` omits the gem's runtime deps (production's
-/// HISTORICAL behavior until the 2026-08-18 republish fixed the served index
-/// — see docs/testing/hosted-production-e2e.md's history section) BREAKS the
+/// HISTORICAL behavior until the 2026-08-18 republish fixed the served index)
+/// BREAKS the
 /// prescribed install with bundler's `APIResponseMismatchError`. If the CLI
 /// or fixture ever starts tolerating that silently, this turns red.
 #[tokio::test(flavor = "multi_thread")]
@@ -1455,8 +1615,8 @@ async fn gem_hosted_registry_info_without_deps_breaks_install_like_production() 
 
 /// FLIPPED CANARY — CHECKSUMS locks (bundler >= 4 default) must come out
 /// FULLY CONVERGED: patch-registry GEM section holding the dep's spec,
-/// `<name> (= <ver>)!` DEPENDENCIES pin, patched CHECKSUMS sha (upstream sha
-/// recorded in the ledger for revert). The old mixed-state rewrite (pin only,
+/// `<name> (= <ver>)!` DEPENDENCIES pin, patched CHECKSUMS sha (v5 keeps no
+/// ledger: a rollback re-resolves the upstream sha from the registry). The old mixed-state rewrite (pin only,
 /// GEM section left upstream) made the prescribed unfrozen install fail with
 /// "Bundler found mismatched checksums" (exit 37 — the bundler-4 DEFAULT
 /// lock, i.e. the mainstream hosted-gem path) and forced a frozen-install
@@ -1481,31 +1641,24 @@ async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() 
         return;
     };
 
-    // The rewrite half: the ledger's CHECKSUMS edit must carry the UPSTREAM
-    // sha as `original` (the only revert path back to the registry line).
-    let ledger: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(fx.proj.join(".socket/vendor/redirect-state.json")).unwrap(),
-    )
-    .unwrap();
-    let edits = ledger["edits"].as_array().expect("ledger edits");
-    let edit = edits
-        .iter()
-        .find(|e| e["kind"] == "redirect_gemfile_lock_checksum")
-        .expect("CHECKSUMS pin edit recorded in the ledger");
-    assert_eq!(edit["path"], "Gemfile.lock", "edit path: {edit}");
-    let original = edit["original"].as_str().expect("original recorded");
-    assert!(
-        original.starts_with(&format!("{DEP} ({DEP_VERSION}) sha256=")),
-        "original must be the pre-edit registry line: {original}"
-    );
+    // The rewrite half: the registry lock's upstream CHECKSUMS line must
+    // actually have been replaced (else the pin is vacuous). No ledger
+    // records it (v5).
+    let pristine_lock = String::from_utf8_lossy(&fx.pristine_lock).into_owned();
+    let original = pristine_lock
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with(&format!("{DEP} ({DEP_VERSION}) sha256=")))
+        .unwrap_or_else(|| panic!("the registry lock pins an upstream sha:\n{pristine_lock}"))
+        .to_string();
     let lock = std::fs::read_to_string(fx.proj.join("Gemfile.lock")).unwrap();
     assert!(
-        !lock.contains(original),
+        !lock.contains(&original),
         "the upstream sha line must actually have been replaced (else the pin is vacuous)"
     );
+    assert_no_redirect_ledger(&fx.proj);
 
-    // The converged half: GEM section attribution + bundler's own `!` pin,
-    // with the move and the pin recorded in the ledger.
+    // The converged half: GEM section attribution + bundler's own `!` pin.
     assert!(
         lock.contains(&format!(
             "GEM\n  remote: {}\n  specs:\n    {DEP} ({DEP_VERSION})",
@@ -1516,12 +1669,6 @@ async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() 
     assert!(
         lock.contains(&format!("  {DEP} (= {DEP_VERSION})!")),
         "DEPENDENCIES must carry the source-pinned entry:\n{lock}"
-    );
-    assert!(
-        edits
-            .iter()
-            .any(|e| e["kind"] == "redirect_gemfile_lock_gem_source"),
-        "the GEM-section move must be a ledger edit: {edits:?}"
     );
 
     // FROZEN fresh checkout: the converged pair needs no unfrozen two-step —
@@ -1547,8 +1694,8 @@ async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() 
     // rewrite): discovery reads it AND its CHECKSUMS pin.
     manifestless_vex_matrix(&fx, &frozen).await;
 
-    // UNFROZEN fresh checkout: the previously-pinned exit 37 "mismatched
-    // checksums" refusal is gone too.
+    // UNFROZEN fresh checkout: no exit 37 "mismatched checksums" refusal
+    // either.
     let (fresh, install) = fresh_checkout_bundle_install(&fx);
     assert!(
         install.status.success(),
@@ -1565,12 +1712,10 @@ async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() 
 /// index URL per request, so a periodic/CI re-scan sees a NEW index URL for
 /// the SAME redirect. The re-scan must (1) be byte-idempotent under the same
 /// grant, (2) refresh the source block's URL IN PLACE under a rotated grant —
-/// exactly one Socket source block, a `redirect_gemfile_source_url` ledger
-/// edit, no stale token anywhere — and (3) leave a pair a fresh checkout
-/// installs the patched bytes from. Before the fix, the rotated re-scan
-/// wrapped the old block's indented gem line in a new NESTED source block
-/// (+1 nesting per re-scan), kept the stale token URL live, and still
-/// reported success.
+/// exactly one Socket source block, no stale token anywhere, no ledger — and (3) leave a pair a fresh checkout
+/// installs the patched bytes from — never wrap the old block's indented
+/// gem line in a new NESTED source block (+1 nesting per re-scan) with the
+/// stale token URL still live.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
@@ -1592,19 +1737,9 @@ async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
     let index_url_b = format!("{api}/patch-registry/gem/{TOKEN_B}/{UUID}/");
     let gemfile_after_run1 = std::fs::read_to_string(fx.proj.join("Gemfile"))
         .expect("read Gemfile after initial hosted scan");
-    let ledger_edits = |proj: &Path| -> Vec<serde_json::Value> {
-        serde_json::from_str::<serde_json::Value>(
-            &std::fs::read_to_string(proj.join(".socket/vendor/redirect-state.json"))
-                .expect("read redirect ledger"),
-        )
-        .expect("ledger is JSON")["edits"]
-            .as_array()
-            .expect("ledger edits array")
-            .clone()
-    };
-    let edits_after_run1 = ledger_edits(&fx.proj).len();
+    let lock_after_run1 = std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap();
 
-    // Re-scan 2, SAME grant: byte-idempotent, no ledger growth.
+    // Re-scan 2, SAME grant: byte-idempotent (Gemfile AND lock), no ledger.
     let (code, stdout, stderr) = run_hosted_scan(&fx.proj, &api);
     assert_eq!(
         code, 0,
@@ -1619,10 +1754,11 @@ async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
         "same-grant re-scan must leave the Gemfile byte-identical"
     );
     assert_eq!(
-        ledger_edits(&fx.proj).len(),
-        edits_after_run1,
-        "same-grant re-scan must not grow the ledger"
+        std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap(),
+        lock_after_run1,
+        "same-grant re-scan must leave the lock byte-identical"
     );
+    assert_no_redirect_ledger(&fx.proj);
 
     // Re-scan 3, ROTATED grant (token B, same uuid): refresh in place.
     let (code, stdout, stderr) = run_hosted_scan(&fx.proj, &api);
@@ -1649,20 +1785,11 @@ async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
         !gemfile.contains(TOKEN),
         "the stale grant token must be gone from the Gemfile:\n{gemfile}"
     );
-    let refresh = ledger_edits(&fx.proj)
-        .into_iter()
-        .find(|e| e["kind"] == "redirect_gemfile_source_url")
-        .expect("rotation must be recorded as a redirect_gemfile_source_url ledger edit");
-    assert_eq!(
-        refresh["original"],
-        serde_json::Value::String(fx.index_url.clone()),
-        "refresh edit original: {refresh}"
+    assert!(
+        !gemfile.contains(&fx.index_url),
+        "the grant-A index URL must be refreshed away:\n{gemfile}"
     );
-    assert_eq!(
-        refresh["new"],
-        serde_json::Value::String(index_url_b),
-        "refresh edit new: {refresh}"
-    );
+    assert_no_redirect_ledger(&fx.proj);
 
     // Fresh checkout of the rotated pair: the prescribed unfrozen install
     // resolves the patched gem from the rotated registry path.

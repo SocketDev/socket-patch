@@ -208,41 +208,102 @@ fn new_ledgers_compact_whole_file_snapshots_and_revert() {
     }
 }
 
+/// `bytes` with every ` --hash=sha256:<64 hex>` option removed.
+fn strip_sha256_hash_options(bytes: &[u8]) -> Vec<u8> {
+    const NEEDLE: &[u8] = b" --hash=sha256:";
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes.get(i + NEEDLE.len()..i + NEEDLE.len() + 64);
+        if bytes[i..].starts_with(NEEDLE)
+            && hex.is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))
+        {
+            i += NEEDLE.len() + 64;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Against the integrated base: for every ecosystem this binary wires
 /// exactly the files the base binary wired (the checked-in legacy
 /// fixtures), and its ledger — whatever its on-disk version — loads to the
 /// same entries the base's version-1 ledger loads to.
 #[tokio::test]
-async fn this_binary_wires_what_the_base_binary_wired() {
+async fn server_artifacts_preserve_legacy_wiring_shape_and_originals() {
     for eco in fx::ALL {
-        let base_wired = read_tree(&fixtures_dir().join(eco).join("wired"));
+        let mut base_wired = read_tree(&fixtures_dir().join(eco).join("wired"));
+        if *eco == "pypi-requirements" {
+            // The one intended difference: the base binary pinned its vendor
+            // lines with `--hash` even in this unhashed requirements.txt,
+            // which put pip in hash-checking mode for every other
+            // requirement (#376). This binary writes the same lines without
+            // it — in the file and in the ledger's recorded `new` text.
+            for (_, bytes) in &mut base_wired {
+                *bytes = strip_sha256_hash_options(bytes);
+            }
+        }
         let f = Fixture::new(eco);
-        let pristine = tree(&f.root);
         let (code, stdout, stderr) = f.vendor(&[], &[]);
         assert_eq!(code, 0, "{eco}: {stdout}\n{stderr}");
-        let wired = wiring_delta(&pristine, &tree(&f.root));
-        let strip = |t: &[(String, Vec<u8>)]| -> Vec<(String, Vec<u8>)> {
-            t.iter()
-                .filter(|(rel, _)| rel != ".socket/vendor/state.json")
-                .cloned()
-                .collect()
-        };
-        assert_eq!(
-            strip(&wired),
-            strip(&base_wired),
-            "{eco}: the same wiring files, byte for byte"
-        );
         let base_dir = tempfile::tempdir().unwrap();
         write_tree(base_dir.path(), &base_wired);
-        let base_state = socket_patch_core::vendor::load_state(base_dir.path())
+        let base = socket_patch_core::vendor::load_state(base_dir.path())
             .await
             .unwrap();
         let state = socket_patch_core::vendor::load_state(&f.root)
             .await
             .unwrap();
-        assert_eq!(
-            state.entries, base_state.entries,
-            "{eco}: the same ledger entries"
-        );
+        assert_eq!(state.entries.len(), base.entries.len(), "{eco}");
+        for (purl, old) in &base.entries {
+            let new = &state.entries[purl];
+            assert_eq!(
+                (
+                    &new.ecosystem,
+                    &new.base_purl,
+                    &new.uuid,
+                    &new.artifact.path
+                ),
+                (
+                    &old.ecosystem,
+                    &old.base_purl,
+                    &old.uuid,
+                    &old.artifact.path
+                ),
+                "{eco}"
+            );
+            let shape = |entry: &socket_patch_core::vendor::state::VendorEntry| {
+                entry
+                    .wiring
+                    .iter()
+                    .map(|w| {
+                        let original = w.original.clone().map(|value| {
+                            if let serde_json::Value::String(mut text) = value {
+                                for (purl, current) in &state.entries {
+                                    let legacy = &base.entries[purl];
+                                    if !current.artifact.sha256.is_empty() {
+                                        text = text.replace(
+                                            &current.artifact.sha256,
+                                            &legacy.artifact.sha256,
+                                        );
+                                    }
+                                }
+                                serde_json::Value::String(text)
+                            } else {
+                                value
+                            }
+                        });
+                        (w.file.clone(), w.kind.clone(), original)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                shape(new),
+                shape(old),
+                "{eco}: rollback originals survive server repacking"
+            );
+        }
     }
 }

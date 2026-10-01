@@ -95,9 +95,8 @@ pub async fn verify_file_rollback(
     if is_new_file {
         // Probe the directory ENTRY (`symlink_metadata`), not the symlink
         // target: a dangling symlink left where the patch-added file was
-        // makes `metadata` report ENOENT, which mis-classified the entry
-        // as already rolled back — the package rollback claimed success
-        // while silently leaving the stray entry behind. Only a true
+        // makes `metadata` report ENOENT, which would mis-classify the
+        // entry as already rolled back. Only a true
         // NotFound means already-gone; any other stat error (ELOOP,
         // EACCES) is an unverifiable state and must fail closed.
         match tokio::fs::symlink_metadata(&filepath).await {
@@ -822,9 +821,7 @@ mod tests {
     /// Validate-before-write: a corrupt/mismatched rollback blob must be
     /// refused *before* any disk write, leaving the on-disk file
     /// byte-identical to its pre-call (patched) state and dropping no
-    /// `.socket-stage-*` litter. Regression: the old in-place
-    /// `tokio::fs::write` committed the bad bytes over the file and only
-    /// then hashed, leaving the file corrupted on the error path.
+    /// `.socket-stage-*` litter.
     #[tokio::test]
     async fn test_rollback_file_patch_hash_mismatch_leaves_file_intact() {
         let dir = tempfile::tempdir().unwrap();
@@ -857,8 +854,7 @@ mod tests {
     /// Copy-on-write safety: rolling back a file that shares an inode
     /// with a sibling (the pnpm / Go-cache hardlink case) must only
     /// restore *our* copy. The sibling — another project's view or the
-    /// shared store entry — must keep its bytes. Regression: the old
-    /// in-place write mutated the shared inode and corrupted the sibling.
+    /// shared store entry — must keep its bytes.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_rollback_file_patch_does_not_propagate_to_hardlinked_sibling() {
@@ -892,9 +888,7 @@ mod tests {
 
     /// Permission fidelity: rolling back a read-only file (Go module
     /// cache marks sources `0o444`) must restore the original content
-    /// AND leave the file read-only afterward. Regression: the old code
-    /// relaxed the mode to `0o644` to write and never restored it,
-    /// silently leaving rolled-back cache files writable.
+    /// AND leave the file read-only afterward.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_rollback_file_patch_preserves_readonly_mode() {
@@ -931,8 +925,7 @@ mod tests {
     /// End-to-end rollback against a fully read-only package directory
     /// (Go cache: `0o444` files inside a `0o555` directory). The atomic
     /// stage+rename path must temporarily grant directory write, restore
-    /// content, and put the directory mode back. Regression: the old
-    /// in-place write could not stage inside a read-only directory.
+    /// content, and put the directory mode back.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_rollback_package_patch_in_readonly_dir() {
@@ -1170,13 +1163,11 @@ mod tests {
         assert!(result.error.is_some());
     }
 
-    /// Regression (blob-vs-already-original ordering): a file already at
+    /// Blob-vs-already-original ordering: a file already at
     /// its original (`beforeHash`) state must verify as `AlreadyOriginal`
     /// even when the before-blob is gone. A finished rollback needs no
     /// blob to restore, so a GC'd blob must NOT downgrade it to
-    /// `MissingBlob`. Before the fix the blob check ran first and a
-    /// re-run rollback (or one after blob cleanup) reported a spurious
-    /// missing-blob failure.
+    /// `MissingBlob`.
     #[tokio::test]
     async fn test_verify_file_rollback_already_original_without_blob() {
         let pkg_dir = tempfile::tempdir().unwrap();
@@ -1200,11 +1191,10 @@ mod tests {
         assert_eq!(result.status, VerifyRollbackStatus::AlreadyOriginal);
     }
 
-    /// Package-level consequence of the ordering fix: an already-original
+    /// Package-level consequence of that ordering: an already-original
     /// file whose blob was GC'd must not block its sibling's real
     /// rollback. The whole package should succeed and the ready file
-    /// should be restored. Before the fix the missing blob on the
-    /// no-op file aborted the entire package rollback.
+    /// should be restored.
     #[tokio::test]
     async fn test_rollback_package_patch_already_original_missing_blob_does_not_block() {
         let pkg_dir = tempfile::tempdir().unwrap();
@@ -1271,8 +1261,6 @@ mod tests {
     /// the package directory must be refused at verification — never
     /// hashed or stat'd through `pkg_path.join`. Returns a blocking
     /// status (not Ready/AlreadyOriginal) so the package rollback aborts.
-    /// Regression: verify joined the raw key with no safety check, the
-    /// same hole the apply path closes with `is_safe_relative_subpath`.
     #[tokio::test]
     async fn test_verify_file_rollback_rejects_path_escape() {
         let pkg_dir = tempfile::tempdir().unwrap();
@@ -1300,8 +1288,7 @@ mod tests {
     /// branch builds the path itself and calls `remove_file` directly,
     /// bypassing `apply_file_patch_at`'s guard. A poisoned manifest with an
     /// empty `beforeHash` and an escaping key must NOT unlink a file
-    /// outside the package dir. Regression: the bare `remove_file` would
-    /// delete an arbitrary host file.
+    /// outside the package dir.
     #[tokio::test]
     async fn test_rollback_package_patch_new_file_path_escape_blocked() {
         let root = tempfile::tempdir().unwrap();
@@ -1406,11 +1393,10 @@ mod tests {
         assert_eq!(result.files_rolled_back.len(), 0);
     }
 
-    /// Regression (read-only-dir delete): deleting a patch-added file
+    /// Read-only-dir delete: deleting a patch-added file
     /// requires write permission on the *parent directory*. A Go-cache
     /// style read-only directory (0o555) must be temporarily relaxed for
-    /// the unlink and restored to its exact prior mode afterward. Before
-    /// the fix the bare `remove_file` failed with EACCES.
+    /// the unlink and restored to its exact prior mode afterward.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_rollback_package_patch_new_file_delete_in_readonly_dir() {
@@ -1474,10 +1460,9 @@ mod tests {
     /// joined onto the blobs directory as a path component. A traversal
     /// (`../x`) or absolute "hash" must be refused at verification —
     /// `Path::join` discards the base on an absolute string and `..`
-    /// walks out, so an escaping hash that resolved to any existing file
-    /// verified `Ready` and the rollback loop then read an arbitrary
-    /// out-of-tree path (existence oracle, unbounded read of `/dev/zero`,
-    /// FIFO hang).
+    /// walks out, so an escaping hash must never verify `Ready` and let the
+    /// rollback loop read an arbitrary out-of-tree path (existence oracle,
+    /// unbounded read of `/dev/zero`, FIFO hang).
     #[tokio::test]
     async fn test_verify_file_rollback_rejects_blob_hash_escape() {
         let root = tempfile::tempdir().unwrap();
@@ -1521,10 +1506,9 @@ mod tests {
 
     /// SECURITY (before-blob escape at the read site): a poisoned manifest
     /// whose `beforeHash` escapes the blobs directory must fail the
-    /// package rollback with the path-safety error. Regression: the
-    /// unguarded code read the out-of-tree file and leaked its git-sha256
-    /// into the error message ("Got: <hash>") — an existence +
-    /// content-hash oracle over any host file readable by the user.
+    /// package rollback with the path-safety error, never leaking the
+    /// out-of-tree file's git-sha256 into the error message ("Got: <hash>")
+    /// — an existence + content-hash oracle over any host file.
     #[tokio::test]
     async fn test_rollback_package_patch_blob_hash_escape_blocked() {
         let root = tempfile::tempdir().unwrap();
@@ -1574,11 +1558,10 @@ mod tests {
         );
     }
 
-    /// Regression (new-file dangling symlink): `metadata()` follows
-    /// symlinks, so a dangling symlink left where the patch-added file
-    /// was reported ENOENT → `AlreadyOriginal`, and the package rollback
-    /// claimed success while silently leaving the stray entry behind.
-    /// The entry probe must be `symlink_metadata`: a path occupied by
+    /// New-file dangling symlink: `metadata()` follows symlinks, so a
+    /// dangling symlink left where the patch-added file was would read
+    /// ENOENT → `AlreadyOriginal`. The entry probe must be
+    /// `symlink_metadata`: a path occupied by
     /// something that is neither the added file nor absent is a modified
     /// state and must fail closed, like every other modified state.
     #[cfg(unix)]
@@ -1617,14 +1600,12 @@ mod tests {
         assert!(tokio::fs::symlink_metadata(&path).await.is_ok());
     }
 
-    /// Regression (cargo sidecar resync): apply rewrites
-    /// `.cargo-checksum.json` to the *patched* SHA256s (and inserts
-    /// entries for patch-added files). Rolling the package back restores
-    /// the original bytes but used to leave the checksum file untouched —
-    /// original sources verified against patched hashes, so the very next
-    /// `cargo build` of the vendored crate refused with "checksum ...
-    /// has changed" (proven by `cargo_check_fails_without_sidecar_fixup`
-    /// in the cargo-build e2e). Rollback must resync the sidecar:
+    /// Cargo sidecar resync: apply rewrites `.cargo-checksum.json` to the
+    /// *patched* SHA256s (and inserts entries for patch-added files). With
+    /// the original bytes restored, a stale checksum file makes the next
+    /// `cargo build` of the vendored crate refuse with "checksum ... has
+    /// changed" (see `cargo_check_fails_without_sidecar_fixup` in the
+    /// cargo-build e2e). Rollback must resync the sidecar:
     /// restored files get their original hash back, and the entry for a
     /// patch-added (now deleted) file is removed entirely.
     #[tokio::test]
@@ -1793,7 +1774,7 @@ mod tests {
         assert_eq!(advisory.severity, SidecarSeverity::Error);
     }
 
-    /// Regression (retried partial rollback wedges cargo): a previous
+    /// Retried partial rollback must not wedge cargo: a previous
     /// rollback that failed partway restored a.rs to its ORIGINAL bytes
     /// but returned before the resync boundary, leaving a.rs's
     /// `.cargo-checksum.json` entry at the PATCHED hash apply's fixup
@@ -1897,10 +1878,8 @@ mod tests {
     /// directory only ever contains regular files the CLI wrote, but a
     /// symlink planted at `blobs/<hash>` — committable to a poisoned repo
     /// alongside the manifest, unlike the already-guarded escaping hash
-    /// STRING — re-opens the same out-of-tree read the string guard
-    /// blocks. Regression: `metadata` followed the link, verify reported
-    /// `Ready`, and the restore loop then read an arbitrary out-of-tree
-    /// file through it.
+    /// STRING — would re-open the same out-of-tree read the string guard
+    /// blocks.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_verify_file_rollback_rejects_symlinked_blob_entry() {
@@ -2052,13 +2031,11 @@ mod tests {
 
     /// SECURITY (symlinked blob entry at the read site): a poisoned repo
     /// that commits `blobs/<hex>` as a symlink to an out-of-tree file must
-    /// fail the package rollback WITHOUT reading through the link.
-    /// Regression: the bare `tokio::fs::read` followed it and the
-    /// hash-verify mismatch error leaked the target's git-sha256
-    /// ("Got: <hash>") — the same existence + content-hash oracle the
-    /// escaping-hash-string fix closed (see
-    /// `test_rollback_package_patch_blob_hash_escape_blocked`); a FIFO or
-    /// device target instead meant an unbounded read or a permanent hang.
+    /// fail the package rollback WITHOUT reading through the link: the
+    /// hash-verify mismatch error would leak the target's git-sha256
+    /// ("Got: <hash>") — the same oracle
+    /// `test_rollback_package_patch_blob_hash_escape_blocked` pins — and a
+    /// FIFO or device target would mean an unbounded read or a hang.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_rollback_package_patch_symlinked_blob_entry_blocked() {
@@ -2113,12 +2090,9 @@ mod tests {
     }
 
     /// SECURITY/robustness (FIFO blob entry): a FIFO planted at
-    /// `blobs/<hash>` must be refused at verification. Regression: the
-    /// `metadata` probe reported it present, verify said `Ready`, and the
-    /// restore loop's blob read then blocked forever waiting for a writer
-    /// — the rollback wedged with zero diagnostics (same class as the
-    /// crawler/state-file FIFO wedges). The verify-time probe is
-    /// stat-only, so this test cannot hang even on the broken code.
+    /// `blobs/<hash>` must be refused at verification, or the restore
+    /// loop's blob read blocks forever waiting for a writer. The
+    /// verify-time probe is stat-only, so this test cannot hang.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_verify_file_rollback_rejects_fifo_blob_entry() {
@@ -2200,11 +2174,11 @@ mod tests {
     }
 
     /// Fail-closed (existing-entry hash error): when the manifest-keyed path
-    /// exists but cannot be hashed — a DIRECTORY planted at the path passes
-    /// the `metadata` existence probe, then `open_regular_file` rejects it —
-    /// verify must block with the real error, not fabricate a hash. The
-    /// new-file twin of this branch is covered by the dangling-symlink test;
-    /// this pins the non-empty-`beforeHash` route.
+    /// exists but cannot be hashed — a DIRECTORY planted at the path is
+    /// rejected by `open_regular_file` when verify hashes it (there is no
+    /// separate existence probe) — verify must block with the real error,
+    /// not fabricate a hash. The new-file twin of this branch is covered by
+    /// the dangling-symlink test; this pins the non-empty-`beforeHash` route.
     #[tokio::test]
     async fn test_verify_file_rollback_hash_error_on_existing_entry_fails_closed() {
         let pkg_dir = tempfile::tempdir().unwrap();

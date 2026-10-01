@@ -51,7 +51,7 @@
 //!   cargo tier emptied on 2026-08-28, so the leg was demoted to the canary
 //!   (`docs/testing/hosted-production-e2e.md` says how to re-promote it).
 //! * **golang** — hosted mode is supported for free-tier references carrying
-//!   a `goproxy` override (`docs/design/golang-hosted.md`), but production
+//!   a `goproxy` override (`docs/ecosystems.md#go-directory-replaces-and-gosum`), but production
 //!   publishes no golang hosted modules yet. Covered as a shape guard that
 //!   holds in both worlds.
 //! * **deno** — hosted mode is not supported. Covered as a negative assertion.
@@ -143,10 +143,11 @@ const GEM_PURL: &str = "pkg:gem/activestorage@6.0.3";
 const GEM_NAME: &str = "activestorage";
 const GEM_VERSION: &str = "6.0.3";
 /// Acceptable patch UUIDs for [`GEM_PURL`] — an any-of set, mirroring
-/// [`PYPI_UUIDS`]: patch selection is server-ranked and the non-TTY scan
-/// auto-selects the top candidate, so pinning a single UUID would red the
-/// required check on a server-side reorder or a second published 6.0.3
-/// patch. The gem leg parses the UUID actually WIRED into the rewritten
+/// [`PYPI_UUIDS`]: patch selection is ranked by `api::ranking` (merged
+/// patches first, newest first) and scan always auto-selects the top
+/// candidate, so pinning a single UUID would red the required check whenever
+/// production publishes a newer or merged 6.0.3 patch. The gem leg parses
+/// the UUID actually WIRED into the rewritten
 /// Gemfile, asserts it is one of these, and content-verifies against that
 /// exact patch's `/patch/view` manifest. When production publishes another
 /// acceptable 6.0.3 patch, verify it and append its UUID here.
@@ -155,40 +156,27 @@ const GEM_UUIDS: &[&str] = &[
     // 2026-08-18 catalog republish.
     "15e960b5-f432-4b6c-b8aa-534a2b419323",
     // GHSA-w749-p3v6-hccq / CVE-2022-21831 (image_processing_transformer.rb),
-    // published 2026-08-19T21:19Z when production re-extended 6.0.3 with the
-    // second advisory; the server-ranked selection now wires this one.
-    // Content live-verified 2026-08-20: served .gem matches the /info
-    // checksum, carries the Socket patch header in the transformer, and every
-    // other file is byte-identical to stock rubygems 6.0.3.
+    // published 2026-08-19T21:19Z — the second advisory.
     "6c4141c5-1535-4fd2-9db1-b5f8e4834bdb",
     // GHSA-9xrj-h377-fr87 / CVE-2026-33195 (disk_service.rb +
     // disk_controller.rb + errors.rb), published 2026-08-20T16:14Z when
-    // production extended 6.0.3 with a third advisory. /patch/view blobs
-    // live-verified 2026-08-20: every touched file carries the Socket
-    // Community Patch header.
+    // production extended 6.0.3 with a third advisory.
     "eeb6bf9f-96c0-4963-a0f1-2e88f91f8b1a",
     // GHSA-r4mg-4433-c7g3 / CVE-2025-24293 (image_processing_transformer.rb),
-    // published 2026-08-20T20:31Z — the fourth advisory. /patch/view blobs
-    // live-verified 2026-08-20: carries the Socket Community Patch header.
+    // published 2026-08-20T20:31Z — the fourth advisory.
     "c1a1cd3c-b670-4e44-b4fa-1a63ecd42db6",
     // GHSA-xr9x-r78c-5hrm / CVE-2026-66066 (image_processing_transformer.rb +
     // NEW lib/active_storage/vips.rb backporting the libvips
     // unfuzzed-operations hardening), published 2026-08-21T19:07Z — the fifth
-    // advisory, and the one the server-ranked selection now wires.
-    // /patch/view blobs live-verified 2026-08-24: both files carry the Socket
-    // Community Patch header and git-blob-sha256-match their manifest
-    // afterHash entries.
+    // advisory; selected until the 2026-09-04 merged patch below.
     "9c2b4925-b413-4a3a-bb3a-9990440fb446",
     // MERGED patch — the first one production has published for any pinned
     // purl: GHSA-w749-p3v6-hccq / CVE-2022-21831 + GHSA-r4mg-4433-c7g3 /
     // CVE-2025-24293 + GHSA-xr9x-r78c-5hrm / CVE-2026-66066 in one artifact
     // (image_processing_transformer.rb allowlist + unsupported-method guard,
     // engine.rb + active_storage.rb config plumbing, NEW vips.rb libvips
-    // backport). Published 2026-09-04T21:23Z; the server-ranked selection
-    // (merge rung) now wires this one. Served .gem live-verified 2026-09-08:
-    // sha256 matches the registry /info checksum, all four touched files
-    // carry the Socket Community Patch header naming this UUID, metadata and
-    // every other file are byte-identical to stock rubygems 6.0.3.
+    // backport). Published 2026-09-04T21:23Z; the client-side merge rung in
+    // `api::ranking` now selects this one.
     "01019627-b481-4bae-bc09-e93b5a5e4481",
 ];
 
@@ -305,15 +293,6 @@ fn has_command(cmd: &str) -> bool {
     probe_cmd.status().map(|s| s.success()).unwrap_or(false)
 }
 
-/// The three legacy `SOCKET_PATCH_*` names still honored at runtime via
-/// `socket_patch_core::env_compat` — not in the clap-bound lists, so they need
-/// scrubbing separately.
-const LEGACY_ENV_VARS: &[&str] = &[
-    "SOCKET_PATCH_PROXY_URL",
-    "SOCKET_PATCH_DEBUG",
-    "SOCKET_PATCH_TELEMETRY_DISABLED",
-];
-
 /// Run the CLI with a hermetically pinned environment.
 ///
 /// The scrub matters more here than in any offline suite. An ambient
@@ -336,11 +315,7 @@ fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         .env("SOCKET_API_TOKEN", "hostile-seed-must-be-scrubbed")
         .env("SOCKET_PROXY_URL", "http://127.0.0.1:1/hostile")
         .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json");
-    for var in GLOBAL_ARG_ENV_VARS
-        .iter()
-        .chain(LOCAL_ARG_ENV_VARS)
-        .chain(LEGACY_ENV_VARS)
-    {
+    for var in GLOBAL_ARG_ENV_VARS.iter().chain(LOCAL_ARG_ENV_VARS) {
         cmd.env_remove(var);
     }
     let out: Output = cmd.output().expect("failed to execute socket-patch binary");
@@ -370,7 +345,35 @@ fn scan_hosted(cwd: &Path, extra: &[&str]) -> serde_json::Value {
         // Exit 0 alone is not enough: the envelope carries the real verdict.
         "scan --mode hosted did not report success.\nenvelope:\n{env:#}\nstderr:\n{stderr}"
     );
+    // v5 hosted mode keeps no ledger: the lockfile pins are the whole state.
+    assert!(
+        !cwd.join(".socket/vendor/redirect-state.json").exists(),
+        "scan --mode hosted wrote the pre-v5 redirect ledger"
+    );
     env
+}
+
+/// The production record `GET /patch/view/<uuid>` serves (the public
+/// proxy), fetched on a private runtime so the sync legs can call it.
+fn published_view_record_blocking(uuid: &str) -> serde_json::Value {
+    let url = format!("{PROXY}/patch/view/{uuid}");
+    tokio::runtime::Runtime::new()
+        .expect("tokio runtime")
+        .block_on(async {
+            let resp = reqwest::Client::new()
+                .get(&url)
+                .header("Accept", "application/json")
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("GET {url}: {e}"));
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| panic!("GET {url}: reading body: {e}"));
+            assert!(status.is_success(), "GET {url}: HTTP {status}\n{body}");
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("GET {url}: bad JSON ({e})"))
+        })
 }
 
 /// Assert the hosted redirect actually rewrote something, and return the list
@@ -791,16 +794,15 @@ async fn preflight_required_patches_are_published() {
     );
 }
 
-/// Canary: production must keep naming advisories, because merge state is
-/// **inferred** from the advisory count rather than read off a flag.
+/// Canary: production must keep naming advisories, because advisory count
+/// breaks severity ties in the patch ranking.
 ///
 /// `api::ranking` ranks a patch that remediates several advisories above one
-/// that remediates a single advisory. The whole signal is the size of the
-/// `vulnerabilities` map. If production ever stopped populating it — shipping
-/// patches with an empty map, or moving advisory ids somewhere else — every
-/// patch would collapse to coverage 0, the merge rung would go permanently
-/// inert, and selection would silently fall through to recency with no error
-/// anywhere.
+/// that remediates a single advisory at the same severity. The signal is the
+/// size of the `vulnerabilities` map. If production ever stopped populating
+/// it — shipping patches with an empty map, or moving advisory ids somewhere
+/// else — every patch would collapse to coverage 0, the advisory-count rung
+/// would become inert, and equal-severity selection would silently fall through to recency.
 ///
 /// This asserts only that the signal EXISTS (every patch names >= 1
 /// advisory), never how many. Production published its first merged patch on
@@ -1046,10 +1048,39 @@ fn npm_package_lock_hosted_install_proof() {
     );
     assert_patched(&minimist_entry(&fx.proj), PATCH_MARKER, LEG);
 
+    // ROLLBACK on a copy of the committed state: v5 restores the upstream
+    // registry entry re-resolved from the REAL npm registry — the lock
+    // comes back equal to what npm wrote — and removes the `.npmrc` the
+    // hosted run created.
+    let copy = fx.proj.parent().unwrap().join("rollback-copy");
+    std::fs::create_dir_all(&copy).unwrap();
+    for f in ["package.json", "package-lock.json", ".npmrc"] {
+        std::fs::copy(fx.proj.join(f), copy.join(f)).unwrap();
+    }
+    let (code, stdout, stderr) = run(&copy, &["rollback", "--json", "--yes"]);
+    assert_eq!(code, 0, "{LEG}: rollback failed:\n{stdout}\n{stderr}");
+    let rb: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("{LEG}: rollback --json is not JSON ({e}):\n{stdout}"));
+    assert_eq!(
+        rb["hosted"]["reverted"],
+        serde_json::json!([NPM_PURL]),
+        "{LEG}: rollback restores the hosted pin: {rb:#}"
+    );
+    let json = |b: &[u8]| serde_json::from_slice::<serde_json::Value>(b).unwrap();
+    assert_eq!(
+        json(&std::fs::read(copy.join("package-lock.json")).unwrap()),
+        json(&lock_before),
+        "{LEG}: rollback restores the registry lock"
+    );
+    assert!(
+        !copy.join(".npmrc").exists(),
+        "{LEG}: rollback removes the .npmrc the hosted run created"
+    );
+
     // MANIFEST-LESS VEX against production: the installed patched tree is
-    // hash-verified against the real patch record — with the ledger, from
-    // lockfile discovery + the public proxy without it, never offline, and
-    // not once the lock is reverted.
+    // hash-verified against the real patch record — from lockfile discovery
+    // + the public proxy (hosted keeps no ledger), never offline, and not
+    // once the lock is reverted.
     npm_e2e_common::production_manifestless_vex(
         LEG,
         &fx.proj,
@@ -1166,13 +1197,13 @@ fn pnpm_hosted_install_proof() {
     //   (https://patch.socket.dev/...) that does not match the registry's
     //   published metadata (https://registry.npmjs.org/minimist/-/...)
     //
-    // `--trust-lockfile` is pnpm's documented opt-out. This is a real
-    // compatibility gap in socket-patch's pnpm hosted mode, not a test bug:
-    // the CLI should emit a `redirect_pnpm_*` warning naming the flag, the way
-    // it already does for the gem CHECKSUMS and Rush repo-state cases. Until
-    // it does, this leg proves the artifact IS correctly served and installs
-    // cleanly once the policy is relaxed — and it fails loudly if the failure
-    // is anything OTHER than that known policy rejection.
+    // `--trust-lockfile` is pnpm's documented opt-out. The CLI warns with
+    // `redirect_pnpm_trust_lockfile` and, by default, auto-configures
+    // `trustLockfile: true` in pnpm-workspace.yaml; the `--trust-lockfile`
+    // retry below is the fallback for layouts that auto-config does not
+    // cover. It proves the artifact IS correctly served and installs cleanly
+    // once the policy is relaxed — and fails loudly if the failure is
+    // anything OTHER than that known policy rejection.
     let detail = dump(&reinstall);
     assert!(
         detail.contains("ERR_PNPM_TARBALL_URL_MISMATCH"),
@@ -1211,15 +1242,14 @@ fn pnpm_hosted_install_proof() {
 }
 
 /// Manifest-less VEX over the reinstalled pnpm project, against the REAL
-/// public patch proxy: the ledger record attests `(redirected)`; with both
-/// ledgers deleted the production `view/<uuid>` record does; `--offline`
-/// has no record; and with the lock back on the registry (ledger kept)
-/// nothing attests, `--no-verify` included. Only the pinned advisory is
-/// asserted — production may add more to the patch later.
+/// public patch proxy: hosted keeps no ledger, so the production
+/// `view/<uuid>` record attests `(redirected)` from the lock alone;
+/// `--offline` has no record; and with the lock back on the registry
+/// nothing names the patch, `--no-verify` included. Only the pinned
+/// advisory is asserted — production may add more to the patch later.
 fn pnpm_hosted_manifestless_vex(proj: &Path, lock_pristine: &[u8], leg: &str) {
     use vex_e2e_common::{
-        assert_absent, assert_not_attested, run_vex, statements_for, strip_ledgers, strip_manifest,
-        VexRun,
+        assert_absent, assert_not_attested, run_vex, statements_for, strip_manifest, VexRun,
     };
     let bin = binary();
     let attested = |run: &VexRun, cell: &str| {
@@ -1238,15 +1268,14 @@ fn pnpm_hosted_manifestless_vex(proj: &Path, lock_pristine: &[u8], leg: &str) {
         );
     };
     strip_manifest(proj);
-    let ledger = proj.join(".socket/vendor/redirect-state.json");
-    let ledger_bytes = std::fs::read(&ledger).expect("redirect ledger");
-    attested(&VexRun::default(), "manifest deleted");
-    strip_ledgers(proj);
-    attested(&VexRun::default(), "ledgers deleted");
+    assert!(
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "{leg}: v5 hosted mode writes no ledger"
+    );
+    attested(&VexRun::default(), "lock + public proxy");
     let out = run_vex(&bin, proj, &VexRun::offline());
     assert_eq!(out.code, Some(1), "{leg} [offline]: {out}");
     assert_not_attested(&out.envelope, NPM_PURL, "record_unavailable");
-    std::fs::write(&ledger, &ledger_bytes).unwrap();
     std::fs::write(proj.join("pnpm-lock.yaml"), lock_pristine).unwrap();
     for no_verify in [false, true] {
         let out = run_vex(
@@ -1257,13 +1286,16 @@ fn pnpm_hosted_manifestless_vex(proj: &Path, lock_pristine: &[u8], leg: &str) {
                 ..VexRun::default()
             },
         );
-        assert_ne!(
+        assert_eq!(
             out.code,
-            Some(0),
-            "{leg} [reverted, no_verify={no_verify}]: {out}"
+            Some(2),
+            "{leg} [reverted, no_verify={no_verify}]: nothing names the patch: {out}"
+        );
+        assert_eq!(
+            out.envelope["error"]["code"], "manifest_not_found",
+            "{leg}: {out}"
         );
         assert_absent(out.doc.as_ref(), NPM_PURL);
-        assert_not_attested(&out.envelope, NPM_PURL, "redirect_unwired");
     }
 }
 
@@ -1340,9 +1372,9 @@ fn yarn_classic_hosted_install_proof() {
     assert_patched(&minimist_entry(&fx.proj), PATCH_MARKER, LEG);
 
     // Manifest-less VEX against the REAL public proxy: the record for the
-    // production patch comes from `patches-api.socket.dev` once the redirect
-    // ledger is gone; `--offline` is pointed at an empty local stand-in so
-    // its zero-request claim is observable.
+    // production patch comes from `patches-api.socket.dev` (hosted keeps no
+    // ledger); `--offline` is pointed at an empty local stand-in so its
+    // zero-request claim is observable.
     let empty = vex_e2e_common::PatchApi::empty();
     let reinstall_env = env;
     yarn_classic_vex::ManifestlessVex {
@@ -1545,11 +1577,11 @@ fn berry_skip_code(env: &serde_json::Value) -> String {
 /// Manifest-less VEX against PRODUCTION for the berry hosted leg (a hosted
 /// checkout carries no `.socket/manifest.json` by design): after the
 /// `--immutable` reinstall served the patched bytes, standalone `vex`
-/// attests the production patch — with the redirect ledger (online and
-/// `--offline`), with the lockfile alone (the record fetched from the
-/// public proxy), not at all `--offline` without a ledger
-/// (`record_unavailable`), and not once the lock is reverted to the
-/// registry and reinstalled (`redirect_unwired`, even with `--no-verify`).
+/// attests the production patch from the lockfile alone (the record fetched
+/// from the public proxy — v5 hosted keeps no ledger), not at all
+/// `--offline` (`record_unavailable`), and not once the lock is reverted to
+/// the registry and reinstalled (nothing names the patch, even with
+/// `--no-verify`).
 fn yarn_berry_hosted_manifestless_vex(fx: &NpmFixture, registry_lock: &[u8], env: &[(&str, &str)]) {
     const LEG: &str = "yarn_berry_hosted_install_proof (manifest-less vex)";
     let proj = &fx.proj;
@@ -1557,15 +1589,10 @@ fn yarn_berry_hosted_manifestless_vex(fx: &NpmFixture, registry_lock: &[u8], env
         !proj.join(".socket/manifest.json").exists(),
         "{LEG}: hosted mode writes no manifest"
     );
-    let ledger_path = proj.join(".socket/vendor/redirect-state.json");
-    let ledger = std::fs::read(&ledger_path).expect("redirect ledger");
-
-    let (code, env_json, doc) = yarn_berry_vex(proj, &[]);
-    assert_berry_redirected_attestation(code, &env_json, doc, &format!("{LEG}: ledger, online"));
-    let (code, env_json, doc) = yarn_berry_vex(proj, &["--offline"]);
-    assert_berry_redirected_attestation(code, &env_json, doc, &format!("{LEG}: ledger, offline"));
-
-    std::fs::remove_file(&ledger_path).unwrap();
+    assert!(
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "{LEG}: v5 hosted mode writes no ledger"
+    );
     let (code, env_json, doc) = yarn_berry_vex(proj, &[]);
     assert_berry_redirected_attestation(code, &env_json, doc, &format!("{LEG}: lockfile only"));
     let (code, env_json, doc) = yarn_berry_vex(proj, &["--offline"]);
@@ -1573,8 +1600,7 @@ fn yarn_berry_hosted_manifestless_vex(fx: &NpmFixture, registry_lock: &[u8], env
     assert_eq!(berry_skip_code(&env_json), "record_unavailable", "{LEG}");
     assert!(doc.is_none(), "{LEG}: no document");
 
-    // Revert the lock to the registry (ledger kept) and reinstall.
-    std::fs::write(&ledger_path, &ledger).unwrap();
+    // Revert the lock to the registry and reinstall.
     std::fs::write(proj.join("yarn.lock"), registry_lock).unwrap();
     std::fs::remove_dir_all(proj.join("node_modules")).ok();
     let reinstall = tool(proj, "yarn", &["install", "--immutable"], env);
@@ -1590,15 +1616,19 @@ fn yarn_berry_hosted_manifestless_vex(fx: &NpmFixture, registry_lock: &[u8], env
         &[][..],
     ] {
         let (code, env_json, doc) = yarn_berry_vex(proj, extra);
-        assert_eq!(code, 1, "{LEG}: reverted {extra:?}: {env_json:#}");
         assert_eq!(
-            berry_skip_code(&env_json),
-            "redirect_unwired",
-            "{LEG}: reverted {extra:?}"
+            code, 2,
+            "{LEG}: reverted {extra:?}: nothing names the patch: {env_json:#}"
+        );
+        assert_eq!(
+            env_json["error"]["code"], "manifest_not_found",
+            "{LEG}: reverted {extra:?}: {env_json:#}"
         );
         assert!(doc.is_none(), "{LEG}: reverted {extra:?}: no document");
     }
-    println!("VEX-MATRIX|yarn@4.6.0|production|hosted|manifest-less+ledgers-deleted+offline+reverted|PASS");
+    println!(
+        "VEX-MATRIX|yarn@4.6.0|production|hosted|manifest-less+lockfile-only+offline+reverted|PASS"
+    );
 }
 
 #[test]
@@ -1651,22 +1681,22 @@ fn bun_hosted_install_proof() {
         dump(&reinstall)
     );
     assert_patched(&minimist_entry(&fx.proj), PATCH_MARKER, LEG);
-    let ledger: serde_json::Value =
-        serde_json::from_str(&read(&fx.proj.join(".socket/vendor/redirect-state.json"))).unwrap();
-    let record = ledger["records"][NPM_PURL].clone();
+    // v5 hosted keeps no ledger: the record the attestation must match is
+    // production's own (`/patch/view/<uuid>` on the public proxy).
+    let record = published_view_record_blocking(NPM_UUID);
     bun_manifestless_vex_production(&fx.proj, &record, "redirected", &lock_before, LEG);
 }
 
 /// Manifest-less VEX over a PRODUCTION bun checkout (`checkout` holds the
 /// committed state plus a real frozen install of the patched bytes):
 /// with `.socket/manifest.json` deleted, standalone `vex` against the public
-/// patch API attests minimist under the ledger record's uuid with `marker`
-/// (`redirected` / `vendored`) and exactly the record's vulnerability ids;
-/// with both ledgers deleted as well it still attests (lockfile discovery +
-/// the API); `--offline` then omits it as `record_unavailable`; and with
-/// the ledgers back but `bun.lock` reverted to `registry_lock` it is NOT
-/// attested, verified or not. The hermetic twins (mock API, zero-request
-/// oracle) run in `e2e_redirect_bun_build` / `e2e_vendor_bun_build`.
+/// patch API attests minimist under the production record's uuid with
+/// `marker` and exactly the record's vulnerability ids (lockfile discovery
+/// plus the API: v5 hosted keeps no ledger); `--offline` omits it as
+/// `record_unavailable`; and with `bun.lock` reverted to `registry_lock`
+/// nothing names the patch any more, verified or not. The hermetic twins
+/// (mock API, zero-request oracle) run in `e2e_redirect_bun_build` /
+/// `e2e_vendor_bun_build`.
 fn bun_manifestless_vex_production(
     checkout: &Path,
     record: &serde_json::Value,
@@ -1742,24 +1772,13 @@ fn bun_manifestless_vex_production(
         })
     };
     let _ = std::fs::remove_file(checkout.join(".socket/manifest.json"));
+    assert!(
+        !checkout.join(".socket/vendor/redirect-state.json").exists(),
+        "{leg}: v5 hosted mode writes no ledger"
+    );
     let (code, env, doc) = vex(&[]);
     assert_eq!(code, Some(0), "{leg}: manifest-less vex: {env:#}");
     assert_eq!(attested(&doc), want, "{leg}: manifest-less vex: {env:#}");
-    let ledgers: Vec<(PathBuf, Vec<u8>)> = [
-        ".socket/vendor/state.json",
-        ".socket/vendor/redirect-state.json",
-    ]
-    .iter()
-    .map(|rel| checkout.join(rel))
-    .filter_map(|p| std::fs::read(&p).ok().map(|b| (p, b)))
-    .collect();
-    assert!(!ledgers.is_empty(), "{leg}: the flow left no ledger");
-    for (p, _) in &ledgers {
-        std::fs::remove_file(p).unwrap();
-    }
-    let (code, env, doc) = vex(&[]);
-    assert_eq!(code, Some(0), "{leg}: ledger-less vex: {env:#}");
-    assert_eq!(attested(&doc), want, "{leg}: ledger-less vex: {env:#}");
     let (code, env, doc) = vex(&["--offline"]);
     assert_eq!(code, Some(1), "{leg}: offline vex: {env:#}");
     assert_eq!(
@@ -1768,21 +1787,16 @@ fn bun_manifestless_vex_production(
         "{leg}: {env:#}"
     );
     assert!(attested(&doc).is_empty(), "{leg}: offline vex: {env:#}");
-    for (p, b) in &ledgers {
-        std::fs::write(p, b).unwrap();
-    }
     std::fs::write(checkout.join("bun.lock"), registry_lock).unwrap();
-    let unwired = if marker == "redirected" {
-        "redirect_unwired"
-    } else {
-        "vendor_unwired"
-    };
     for extra in [&[][..], &["--no-verify"][..]] {
         let (code, env, doc) = vex(extra);
-        assert_eq!(code, Some(1), "{leg}: reverted vex {extra:?}: {env:#}");
         assert_eq!(
-            skip(&env).as_deref(),
-            Some(unwired),
+            code,
+            Some(2),
+            "{leg}: reverted vex {extra:?}: nothing names the patch: {env:#}"
+        );
+        assert_eq!(
+            env["error"]["code"], "manifest_not_found",
             "{leg}: reverted {extra:?}: {env:#}"
         );
         assert!(
@@ -1790,7 +1804,7 @@ fn bun_manifestless_vex_production(
             "{leg}: reverted vex {extra:?}: {env:#}"
         );
     }
-    eprintln!("BUN-VEX production {marker} manifest-deleted/ledgers-deleted/offline/reverted ok");
+    eprintln!("BUN-VEX production {marker} manifest-deleted/offline/reverted ok");
 }
 
 // ===========================================================================
@@ -1916,10 +1930,14 @@ fn pypi_requirements_txt_hosted_install_proof() {
     assert_redirected(&env_json, "requirements.txt");
     let reqs = read(&proj.join("requirements.txt"));
     assert_hosted_pin(&reqs, PYPI_UUIDS, LEG);
+    // An unhashed file is pinned by the url's `#sha256=` fragment, which
+    // pip and uv both verify; a `--hash` would put pip in hash-checking
+    // mode for every other requirement (#376).
     assert!(
-        reqs.contains("--hash=sha256:"),
-        "{LEG}: rewritten requirements.txt carries no --hash pin, so pip/uv \
-         would install the hosted wheel unverified:\n{reqs}"
+        reqs.contains(".whl#sha256=") && !reqs.contains("--hash"),
+        "{LEG}: rewritten requirements.txt must pin the hosted wheel by its \
+         url fragment (and add no --hash), or pip/uv would install it \
+         unverified:\n{reqs}"
     );
 
     std::fs::remove_dir_all(&venv).expect("rm venv");
@@ -1947,7 +1965,7 @@ fn pypi_requirements_txt_hosted_install_proof() {
     );
 
     // Manifest-less VEX over the installed, redirected checkout (hosted
-    // writes no manifest; the steps also drop the redirect ledger).
+    // writes no manifest, and v5 no redirect ledger either).
     let original = format!("{PYPI_NAME}=={PYPI_VERSION}\n");
     pypi_manifestless_vex(
         &proj,
@@ -2016,6 +2034,17 @@ fn pypi_uv_lock_hosted_install_proof() {
     assert_redirected(&env_json, "uv.lock");
     let lock = read(&proj.join("uv.lock"));
     assert_hosted_pin(&lock, PYPI_UUIDS, LEG);
+    // The ONE uuid the resolver granted (and the lock now pins). The VEX
+    // stand-in below serves exactly that record: v5 hosted keeps no local
+    // record, so `production_record` resolves it from the public proxy, and
+    // handing it all of PYPI_UUIDS would let it serve the first one the
+    // proxy answers for — a different patch than the lock wires, which the
+    // manifest-less `vex` then (rightly) reports `record_unavailable` for.
+    let wired_uuid: &str = PYPI_UUIDS
+        .iter()
+        .copied()
+        .find(|u| lock.contains(u))
+        .unwrap_or_else(|| panic!("{LEG}: the uv.lock pins none of PYPI_UUIDS"));
 
     std::fs::remove_dir_all(&venv).expect("rm venv");
     let resync = tool(&proj, &uv, &["sync", "--frozen", "--quiet"], &env);
@@ -2032,19 +2061,19 @@ fn pypi_uv_lock_hosted_install_proof() {
     );
 
     // Manifest-less VEX over a fresh checkout (pyproject + uv.lock + .socket,
-    // reinstalled by uv from an empty cache through patch.socket.dev): the
-    // record comes from the redirect ledger, then — ledger deleted — from a
-    // local stand-in serving the SAME production record (hermetic, so a
-    // proxy 503 cannot flake the matrix); `--offline` makes zero requests;
-    // `apply --vex` and the leg's own `scan --mode hosted --vex` (live) attest;
-    // the reverted pair, ledger kept, reinstalled pristine, does not.
+    // reinstalled by uv from an empty cache through patch.socket.dev): v5
+    // hosted keeps no ledger, so the record comes from a local stand-in
+    // serving the SAME production record (hermetic, so a proxy 503 cannot
+    // flake the matrix); `--offline` makes zero requests; `apply --vex` and
+    // the leg's own `scan --mode hosted --vex` (live) attest; the reverted
+    // pair, reinstalled pristine, does not.
     uv_vex::production_manifestless(&uv_vex::Production {
         leg: LEG,
         proj: &proj,
         tmp: tmp.path(),
         mode: uv_vex::Mode::Hosted,
         purl: PYPI_PURL,
-        uuids: PYPI_UUIDS,
+        uuids: &[wired_uuid],
         registry: &registry,
         uv: &uv,
         patched: &|dir: &Path| {
@@ -2072,16 +2101,10 @@ fn pypi_uv_lock_hosted_install_proof() {
 /// the patch rewrites is verified on disk against the `/patch/view`
 /// afterHash.
 ///
-/// # History
-///
-/// Hosted gem mode was long blocked by a **server-side** compact-index
-/// defect: the patch-registry's `/info/<gem>` line declared no runtime
-/// dependencies while the `.gem` it served declared several, so bundler's
-/// `ensure_same_dependencies` check failed closed with
-/// `Bundler::APIResponseMismatchError`. The 2026-08-18 gem catalog republish
-/// fixed the index (deps now served, `/versions` 200), and the probe-based
-/// tolerance this leg used to carry — pass on a non-2xx `/versions`, enforce
-/// on 2xx — retired itself exactly as designed and was deleted.
+/// The patch-registry's `/info/<gem>` line must declare the served `.gem`'s
+/// runtime dependencies, or bundler's `ensure_same_dependencies` check fails
+/// closed with `Bundler::APIResponseMismatchError` (production's defect until
+/// the 2026-08-18 gem catalog republish).
 ///
 /// NOTE (latent, server-side): the registry's `/api/v1/dependencies` route
 /// still answers 200 with an empty body. That bug is unreachable today —
@@ -2147,9 +2170,10 @@ async fn gem_bundler_hosted_install_proof() {
 
     // Hard assertions: the redirect itself must be correct. The wired patch
     // UUID is parsed back out of the rewritten Gemfile rather than assumed:
-    // selection is server-ranked (the non-TTY scan auto-selects the top
-    // candidate), so the leg accepts any UUID in the pinned any-of set and
-    // then content-verifies against the one bundler was actually given.
+    // selection is ranked client-side by `api::ranking` and scan always
+    // auto-selects the top candidate, so the leg accepts any UUID in the
+    // pinned any-of set and then content-verifies against the one bundler
+    // was actually given.
     let gemfile = read(&proj.join("Gemfile"));
     let wired_uuid = wired_gem_registry_uuid(&gemfile).unwrap_or_else(|| {
         panic!(
@@ -2169,7 +2193,7 @@ async fn gem_bundler_hosted_install_proof() {
         lock.contains("CHECKSUMS"),
         "{LEG}: Gemfile.lock lost its CHECKSUMS section:\n{lock}"
     );
-    // Converged-lock proof (the #212 shape): a rewrite that only moved the
+    // Converged-lock proof: a rewrite that only moved the
     // CHECKSUMS pin would leave the lock's GEM section on rubygems.org — a
     // mixed state an unfrozen install can silently paper over. The GEM
     // section must carry a patch-registry remote and DEPENDENCIES must
@@ -2310,7 +2334,6 @@ async fn gem_bundler_hosted_install_proof() {
         &proj,
         &wired_uuid,
         "redirected",
-        "redirect_unwired",
         (&pristine_gemfile, pristine_lock.as_bytes()),
         &[
             ("BUNDLE_PATH", bundle_path.as_str()),
@@ -2322,10 +2345,9 @@ async fn gem_bundler_hosted_install_proof() {
 /// Manifest-less VEX over a gem production leg's installed checkout `dir`
 /// (the real public patch proxy supplies records; `envs` point the crawler
 /// at the leg's BUNDLE_PATH so the installed tree is hash-verified):
-/// attested with the ledger kept → attested from the lockfile wiring alone
-/// once both ledgers are deleted → `record_unavailable` offline (no
-/// ledger) → `unwired` once the Gemfile + lock are reverted to `pristine`
-/// (ledger restored), with and without `--no-verify`. Production's
+/// attested from the lockfile wiring alone (v5 hosted keeps no ledger) →
+/// `record_unavailable` offline → nothing names the patch once the Gemfile
+/// and lock are reverted to `pristine`, with and without `--no-verify`. Production's
 /// vulnerability set is not pinned here: every statement for the purl must
 /// be `not_affected` via `uuid` with `marker`.
 fn gem_manifestless_vex(
@@ -2333,13 +2355,10 @@ fn gem_manifestless_vex(
     dir: &Path,
     uuid: &str,
     marker: &str,
-    unwired: &str,
     pristine: (&[u8], &[u8]),
     envs: &[(&str, &str)],
 ) {
-    use vex_e2e_common::{
-        assert_not_attested, run_vex, statements_for, strip_ledgers, strip_manifest, VexRun,
-    };
+    use vex_e2e_common::{assert_not_attested, run_vex, statements_for, strip_manifest, VexRun};
     let purl = format!("pkg:gem/{GEM_NAME}@{GEM_VERSION}");
     let mut base = VexRun {
         product: Some("pkg:gem/app@1.0.0".into()),
@@ -2368,27 +2387,17 @@ fn gem_manifestless_vex(
             );
         }
     };
-    let ledgers = dir.join(".socket/vendor");
-    let saved: Vec<(std::ffi::OsString, Vec<u8>)> = std::fs::read_dir(&ledgers)
-        .map(|rd| {
-            rd.flatten()
-                .filter(|e| e.path().is_file())
-                .map(|e| (e.file_name(), std::fs::read(e.path()).unwrap()))
-                .collect()
-        })
-        .unwrap_or_default();
     strip_manifest(dir);
-    attested(&base, "ledger kept");
-    strip_ledgers(dir);
-    attested(&base, "ledgers deleted");
+    assert!(
+        !dir.join(".socket/vendor/redirect-state.json").exists(),
+        "{leg}: v5 hosted mode writes no ledger"
+    );
+    attested(&base, "lockfile wiring + public proxy");
     let mut offline = base.clone();
     offline.offline = true;
     let out = run_vex(&vex_e2e_common::binary(), dir, &offline);
-    assert_eq!(out.code, Some(1), "{leg} offline, no ledger: {out}");
+    assert_eq!(out.code, Some(1), "{leg} offline: {out}");
     assert_not_attested(&out.envelope, &purl, "record_unavailable");
-    for (name, bytes) in &saved {
-        std::fs::write(ledgers.join(name), bytes).unwrap();
-    }
     std::fs::write(dir.join("Gemfile"), pristine.0).unwrap();
     std::fs::write(dir.join("Gemfile.lock"), pristine.1).unwrap();
     for no_verify in [false, true] {
@@ -2397,11 +2406,23 @@ fn gem_manifestless_vex(
         let out = run_vex(&vex_e2e_common::binary(), dir, &run);
         assert_eq!(
             out.code,
-            Some(1),
-            "{leg} reverted no_verify={no_verify}: {out}"
+            Some(2),
+            "{leg} reverted no_verify={no_verify}: nothing names the patch: {out}"
         );
-        assert_not_attested(&out.envelope, &purl, unwired);
+        assert_eq!(
+            out.envelope["error"]["code"], "manifest_not_found",
+            "{leg}: {out}"
+        );
+        assert!(
+            statements_for_opt(out.doc.as_ref(), &purl) == 0,
+            "{leg} reverted: {out}"
+        );
     }
+}
+
+/// How many statements `doc` (if any) carries for `purl`.
+fn statements_for_opt(doc: Option<&serde_json::Value>, purl: &str) -> usize {
+    doc.map_or(0, |d| vex_e2e_common::statements_for(d, purl).len())
 }
 
 // ===========================================================================
@@ -2409,7 +2430,7 @@ fn gem_manifestless_vex(
 // ===========================================================================
 
 /// Go hosted mode: supported for free-tier references that carry a `goproxy`
-/// override (`docs/design/golang-hosted.md`); refused with
+/// override (`docs/ecosystems.md#go-directory-replaces-and-gosum`); refused with
 /// `redirect_golang_unsupported` otherwise (`golang-hosted-no-go.md`, the
 /// paid-tier analysis).
 ///

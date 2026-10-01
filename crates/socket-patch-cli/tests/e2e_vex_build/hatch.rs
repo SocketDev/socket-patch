@@ -14,7 +14,7 @@
 //!    hosted rewriter reads the exact pin from the declaration);
 //! 2. the synthetic patch appends a marker to `six.py`; a wiremock Socket
 //!    API serves discovery, the grant, the view and the patched wheel;
-//! 3. hosted: `scan --redirect --vex`; vendored: `scan --vendor
+//! 3. hosted: `scan --mode hosted --vex`; vendored: `scan --vendor
 //!    --vendor-source build --vex` — the same-run VEX attests, and the
 //!    declaration becomes `six @ <url>#sha256=…` /
 //!    `six @ {root:uri}/.socket/vendor/pypi/<uuid>/<wheel>#sha256=…`;
@@ -25,9 +25,10 @@
 //! 5. manifest-less VEX there (`vex_pypi_real_common::VexMatrix`, with
 //!    `VIRTUAL_ENV` naming Hatch's out-of-tree environment so the crawler
 //!    hashes the real install): manifest deleted, tampered install (hosted),
-//!    ledgers deleted, embedded `apply --vex` / `vendor --vex`, offline with
-//!    no ledger → `record_unavailable`, declaration reverted →
-//!    `redirect_unwired` / `vendor_unwired` (`--no-verify` too); plus the
+//!    ledgers deleted (v5 hosted writes none), embedded `apply --vex` /
+//!    `vendor --vex`, offline with no ledger → `record_unavailable`,
+//!    declaration reverted → `vendor_unwired` / hosted: nothing names the
+//!    patch (`--no-verify` too); plus the
 //!    manifest-less `scan --vex` re-run and, hosted, the not-installed
 //!    (pin) basis.
 //!
@@ -199,8 +200,8 @@ fn hatch() -> Option<Hatch> {
 
 fn scan_mode_args(mode: Mode) -> Vec<&'static str> {
     match mode {
-        Mode::Hosted => vec!["--redirect"],
-        Mode::Vendored => vec!["--vendor", "--vendor-source", "build"],
+        Mode::Hosted => vec!["--mode=hosted"],
+        Mode::Vendored => vec!["--vendor", "--vendor-source", "service"],
     }
 }
 
@@ -290,6 +291,12 @@ fn flow(flavor: Flavor, mode: Mode) {
         Flavor::HatchTomlEnv => "hatch.toml",
     };
     let wired = std::fs::read_to_string(project.join(wired_file)).unwrap();
+    assert!(
+        !project
+            .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL)
+            .exists(),
+        "{what}: v5 writes no redirect ledger"
+    );
     match mode {
         Mode::Hosted => assert!(
             wired.contains(&format!(
@@ -407,8 +414,20 @@ fn flow(flavor: Flavor, mode: Mode) {
     );
 
     if mode == Mode::Hosted {
-        // Not installed as far as the crawler knows (no VIRTUAL_ENV, no
-        // in-project venv): the declaration's sha256 pin is the basis.
+        // Not installed as far as the crawler knows: the declaration's
+        // sha256 pin is the basis. The run points VIRTUAL_ENV at an EMPTY
+        // virtualenv. With no venv at all, a Python project falls back to
+        // the global interpreters, and on Ubuntu runners those carry apt's
+        // python3-six 1.16.0 (`six-1.16.0.egg-info` in
+        // /usr/lib/python3/dist-packages) — a real unpatched copy that vex
+        // rightly refuses to attest over.
+        let empty_venv = tmp.path().join("empty-venv");
+        std::fs::create_dir_all(empty_venv.join(if cfg!(windows) {
+            "Lib/site-packages"
+        } else {
+            "lib/python3.11/site-packages"
+        }))
+        .unwrap();
         let patch_api = vex_e2e_common::PatchApi::start(vec![(
             mode.uuid().to_string(),
             view(mode.uuid(), &pristine, &patched),
@@ -416,6 +435,7 @@ fn flow(flavor: Flavor, mode: Mode) {
         let run = vex_e2e_common::VexRun {
             patch_server_url: Some(api.uri()),
             product: Some(PRODUCT.into()),
+            envs: vec![("VIRTUAL_ENV".into(), empty_venv.into_os_string())],
             ..vex_e2e_common::VexRun::online(&patch_api)
         };
         let out = vex_e2e_common::run_vex(&vex_e2e_common::binary(), &fresh, &run);

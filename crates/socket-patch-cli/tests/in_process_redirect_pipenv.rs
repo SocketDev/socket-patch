@@ -7,17 +7,22 @@
 //! * the lock-only fresh-checkout shape (nothing installed) is discovered
 //!   from `Pipfile.lock` alone, repointed with a `file` reference carrying
 //!   the `#sha256=` fragment and a matching `hashes` entry, attested by the
-//!   same-run `--vex`, re-scanned idempotently and rolled back byte for byte;
+//!   same-run `--vex`, re-scanned idempotently and rolled back byte for byte
+//!   (v5: no redirect ledger is written; `rollback` re-resolves the upstream
+//!   entry from a mocked PyPI JSON API, `SOCKET_PYPI_JSON_API`);
 //! * `SOCKET_PIPENV_MAJOR=11` selects the legacy `path` reference shape the
 //!   installer probe would otherwise need a real Pipenv 7–11 on PATH for;
-//! * a stale `Pipfile.lock` that does not pin the package no longer vetoes
-//!   the sibling `requirements.txt` redirect (Bugbot HIGH on #242);
+//! * a stale `Pipfile.lock` that does not pin the package does not veto
+//!   the sibling `requirements.txt` redirect;
+//! * a conflicting entry in a live `Pipfile.lock` (a `Pipfile` beside it)
+//!   vetoes the sibling `requirements.txt` redirect, while the same
+//!   conflict in an abandoned lock (no `Pipfile`) does not (#333);
 //! * a venv still holding the UPSTREAM release is reported stale and kept
 //!   out of the same-run attestation.
 //!
 //! Every flow ends with the manifest-less VEX steps (`vex_pipenv_pip_steps`)
-//! over a copy of the committed state it produced: manifest deleted,
-//! ledgers deleted too, `--offline` (`record_unavailable`, zero requests),
+//! over a copy of the committed state it produced: no manifest and no ledger,
+//! `--offline` (`record_unavailable`, zero requests),
 //! the lock reverted to the registry (`redirect_unwired`, `--no-verify`
 //! too) and `apply --vex` — and, for the warm venv, `not_applied` whatever
 //! the lock says.
@@ -44,8 +49,7 @@ use vex_pipenv_pip_steps::{run_manifestless_steps, Records, Steps};
 const ORG: &str = "test-org";
 /// Discovery names the base purl (the lockfile supplement's spelling)…
 const PURL: &str = "pkg:pypi/urllib3@1.26.18";
-/// …while the patch record carries the API's artifact-qualified purl, which
-/// is what the redirect ledger is keyed by.
+/// …while the patch record carries the API's artifact-qualified purl.
 const RECORD_PURL: &str = "pkg:pypi/urllib3@1.26.18?artifact_id=py2-py3-none-any-whl";
 const UUID: &str = "e828efa5-5c6d-43f3-9909-03f5ac232b98";
 const HOSTED_URL: &str = "https://patch.socket.dev/patch/pypi/urllib3/1.26.18/22222222-2222-4222-8222-222222222222/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl";
@@ -79,16 +83,16 @@ fn global(cwd: &Path, api_url: String) -> GlobalArgs {
 
 fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: global(cwd, api_url),
         batch_size: Some(100),
         apply: false,
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: true,
-        mode: None,
+        mode: Some(socket_patch_cli::commands::scan::ScanMode::Hosted),
         all_releases: false,
         vex: VexEmbedArgs {
             vex: vex.map(Path::to_path_buf),
@@ -98,6 +102,7 @@ fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
             vex_product: vex.map(|_| "pkg:pypi/pipenv-fixture@0.1.0".to_string()),
             ..Default::default()
         },
+        rollout: Default::default(),
     }
 }
 
@@ -271,15 +276,61 @@ fn urllib3_entry(lock: &str) -> serde_json::Value {
     value["default"]["urllib3"].clone()
 }
 
-async fn roll_back(cwd: &Path, api_url: String) {
+/// The urllib3 1.26.18 release files the Pipenv fixture pins, as the PyPI
+/// JSON API serves them (`GET /pypi/urllib3/1.26.18/json`).
+async fn mock_pypi(server: &MockServer) {
+    let file = |filename: &str, sha: &str, size: u64, uploaded: &str| {
+        serde_json::json!({
+            "filename": filename,
+            "url": format!("https://files.pythonhosted.org/packages/ab/cd/{filename}"),
+            "digests": { "sha256": sha },
+            "size": size,
+            "upload_time_iso_8601": uploaded,
+        })
+    };
+    Mock::given(method("GET"))
+        .and(path("/pypi/urllib3/1.26.18/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "urls": [
+                file(
+                    "urllib3-1.26.18-py2.py3-none-any.whl",
+                    "34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07",
+                    143835,
+                    "2023-10-17T17:46:21.184066Z",
+                ),
+                file(
+                    "urllib3-1.26.18.tar.gz",
+                    "f8ecc1bba5667413457c529ab955bf8c67b45db799d159066261719e328580a0",
+                    305687,
+                    "2023-10-17T17:46:24.000000Z",
+                ),
+            ]
+        })))
+        .mount(server)
+        .await;
+}
+
+/// In-process `rollback`: the hosted pin (on patch.socket.dev) is restored
+/// to its upstream entry, re-resolved from the mocked PyPI JSON API.
+async fn roll_back(cwd: &Path, server: &MockServer) {
+    mock_pypi(server).await;
+    std::env::set_var("SOCKET_PYPI_JSON_API", format!("{}/pypi", server.uri()));
     let code = rollback::run(RollbackArgs {
         targets: Vec::new(),
-        common: global(cwd, api_url),
-        one_off: false,
+        common: global(cwd, server.uri()),
         preserve_state: false,
     })
     .await;
+    std::env::remove_var("SOCKET_PYPI_JSON_API");
     assert_eq!(code, 0, "rollback must succeed");
+    assert_no_ledger(cwd);
+}
+
+fn assert_no_ledger(root: &Path) {
+    assert!(
+        !root.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode writes no redirect ledger"
+    );
 }
 
 #[tokio::test]
@@ -308,7 +359,12 @@ async fn lock_only_pipenv_project_redirects_attests_rescans_and_rolls_back() {
         serde_json::json!([format!("sha256:{}", sha256())]),
         "{redirected}"
     );
-    assert!(entry.get("version").is_none() && entry.get("index").is_none(), "{entry}");
+    assert!(entry.get("version").is_none(), "{entry}");
+    assert_eq!(
+        entry.get("index"),
+        urllib3_entry(LOCK).get("index"),
+        "Pipenv's own index is kept for rollback"
+    );
     assert_eq!(
         entry["markers"],
         urllib3_entry(LOCK)["markers"],
@@ -318,25 +374,10 @@ async fn lock_only_pipenv_project_redirects_attests_rescans_and_rolls_back() {
     let after: serde_json::Value = serde_json::from_str(&redirected).unwrap();
     assert_eq!(after["_meta"], before["_meta"], "the Pipfile content hash stays");
     assert_eq!(read(&tmp.path().join("Pipfile")), PIPFILE, "Pipfile untouched");
-    let ledger: serde_json::Value =
-        serde_json::from_str(&read(&tmp.path().join(".socket/vendor/redirect-state.json")))
-            .unwrap();
-    assert!(
-        ledger["records"][RECORD_PURL].is_object(),
-        "ledger keyed by the artifact-qualified purl: {ledger}"
-    );
-    assert_eq!(
-        ledger["edits"][0]["kind"].as_str(),
-        Some("redirect_pipenv_entry"),
-        "{ledger}"
-    );
-    assert_eq!(
-        ledger["edits"][0]["key"].as_str(),
-        Some(r#"["default","urllib3"]"#),
-        "{ledger}"
-    );
-    // Attested from the ledger (assume_applied) although the base purl the
-    // run confirmed differs from the record's qualified purl.
+    assert_no_ledger(tmp.path());
+    // Attested from this run's fetched record (keyed by RECORD_PURL, assume
+    // applied) although the base purl the run confirmed differs from the
+    // record's qualified purl.
     let vex: serde_json::Value = serde_json::from_str(&read(&vex_path)).unwrap();
     let statements = vex["statements"].as_array().expect("statements");
     assert_eq!(statements.len(), 1, "{vex}");
@@ -347,29 +388,16 @@ async fn lock_only_pipenv_project_redirects_attests_rescans_and_rolls_back() {
     let code = run(hosted_args(tmp.path(), server.uri(), None)).await;
     assert_eq!(code, 0);
     assert_eq!(read(&lock_path), redirected, "re-scan must not touch the lock");
-    let ledger: serde_json::Value =
-        serde_json::from_str(&read(&tmp.path().join(".socket/vendor/redirect-state.json")))
-            .unwrap();
-    assert_eq!(ledger["edits"].as_array().map(Vec::len), Some(1), "one edit, not two");
+    assert_no_ledger(tmp.path());
 
     // Manifest-less VEX over the committed state (the depscan / CI shape).
     manifestless_vex(tmp.path(), "pipenv lock-only", &|p: &Path| {
         std::fs::write(p.join("Pipfile.lock"), LOCK).unwrap();
     });
 
-    // 3. rollback unwinds the redirect and drops the record.
-    roll_back(tmp.path(), server.uri()).await;
+    // 3. rollback restores the upstream registry entry.
+    roll_back(tmp.path(), &server).await;
     assert_eq!(read(&lock_path), LOCK, "rollback must restore the pristine lock byte for byte");
-    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
-    if ledger_path.exists() {
-        let ledger: serde_json::Value = serde_json::from_str(&read(&ledger_path)).unwrap();
-        assert!(
-            ledger["records"]
-                .as_object()
-                .is_none_or(|records| records.is_empty()),
-            "no redirect record may survive rollback: {ledger}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -399,7 +427,7 @@ async fn legacy_installer_major_selects_path_references() {
         std::fs::write(p.join("Pipfile.lock"), LOCK).unwrap();
     });
 
-    roll_back(tmp.path(), server.uri()).await;
+    roll_back(tmp.path(), &server).await;
     assert_eq!(read(&lock_path), LOCK);
 }
 
@@ -415,7 +443,11 @@ async fn stale_pipfile_lock_does_not_veto_the_requirements_redirect() {
     // installs from requirements.txt.
     let stale = LOCK.replace("\"urllib3\"", "\"six\"").replace("==1.26.18", "==1.16.0");
     std::fs::write(tmp.path().join("Pipfile.lock"), &stale).unwrap();
-    std::fs::write(tmp.path().join("requirements.txt"), "urllib3==1.26.18\n").unwrap();
+    // An unpatched, unhashed sibling makes the file's hash mode derivable,
+    // so rollback can restore the hosted line (a file whose every line is a
+    // hosted pin is refused with the `git checkout` remedy instead).
+    const REQS: &str = "urllib3==1.26.18\nrequests==2.31.0\n";
+    std::fs::write(tmp.path().join("requirements.txt"), REQS).unwrap();
 
     let code = run(hosted_args(tmp.path(), server.uri(), None)).await;
     assert_eq!(code, 0);
@@ -433,15 +465,79 @@ async fn stale_pipfile_lock_does_not_veto_the_requirements_redirect() {
     // The requirements wiring attests manifest-less; the stale lock beside
     // it neither vetoes nor contributes.
     manifestless_vex(tmp.path(), "requirements past a stale lock", &|p: &Path| {
-        std::fs::write(p.join("requirements.txt"), "urllib3==1.26.18\n").unwrap();
+        std::fs::write(p.join("requirements.txt"), REQS).unwrap();
     });
 
-    roll_back(tmp.path(), server.uri()).await;
+    roll_back(tmp.path(), &server).await;
     assert_eq!(
         read(&tmp.path().join("requirements.txt")),
-        "urllib3==1.26.18\n"
+        REQS
     );
     assert_eq!(read(&tmp.path().join("Pipfile.lock")), stale);
+}
+
+/// The lock entry repointed at the user's own wheel: a `file` source that
+/// is not Socket's, which the Pipenv planner refuses as a conflict.
+fn lock_with_user_file_source() -> String {
+    LOCK.replace(
+        "\"version\": \"==1.26.18\"",
+        "\"file\": \"wheels/urllib3-1.26.18-py2.py3-none-any.whl\"",
+    )
+}
+
+/// #333: a conflicting entry in a LIVE Pipfile.lock (a Pipfile beside it)
+/// means Pipenv never installs the patch, so the patch is refused for the
+/// whole project. The hosted scan must therefore see the Pipfile: the
+/// sibling requirements.txt stays untouched instead of being
+/// half-redirected.
+#[tokio::test]
+#[serial]
+async fn live_pipfile_lock_conflict_vetoes_the_requirements_redirect() {
+    let _major = MajorGuard::set("2026");
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let lock = lock_with_user_file_source();
+    std::fs::write(tmp.path().join("Pipfile.lock"), &lock).unwrap();
+    const REQS: &str = "urllib3==1.26.18\nrequests==2.31.0\n";
+    std::fs::write(tmp.path().join("requirements.txt"), REQS).unwrap();
+
+    run(hosted_args(tmp.path(), server.uri(), None)).await;
+    assert_eq!(
+        read(&tmp.path().join("requirements.txt")),
+        REQS,
+        "a live Pipfile.lock conflict must veto the sibling requirements.txt"
+    );
+    assert_eq!(read(&tmp.path().join("Pipfile.lock")), lock);
+    assert_eq!(read(&tmp.path().join("Pipfile")), PIPFILE);
+}
+
+/// The same conflict in an ABANDONED lock (no Pipfile beside it) says
+/// nothing about the project's install files: the sibling requirements.txt
+/// is still redirected.
+#[tokio::test]
+#[serial]
+async fn abandoned_pipfile_lock_conflict_does_not_veto_the_requirements_redirect() {
+    let _major = MajorGuard::set("2026");
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    std::fs::remove_file(tmp.path().join("Pipfile")).unwrap();
+    let lock = lock_with_user_file_source();
+    std::fs::write(tmp.path().join("Pipfile.lock"), &lock).unwrap();
+    const REQS: &str = "urllib3==1.26.18\nrequests==2.31.0\n";
+    std::fs::write(tmp.path().join("requirements.txt"), REQS).unwrap();
+
+    let code = run(hosted_args(tmp.path(), server.uri(), None)).await;
+    assert_eq!(code, 0);
+    let requirements = read(&tmp.path().join("requirements.txt"));
+    assert!(
+        requirements.contains(HOSTED_URL),
+        "an abandoned lock must not veto requirements.txt: {requirements}"
+    );
+    assert_eq!(read(&tmp.path().join("Pipfile.lock")), lock);
 }
 
 #[tokio::test]
@@ -467,7 +563,7 @@ async fn warm_venv_with_the_upstream_release_is_not_attested() {
         .then(|| serde_json::from_str::<serde_json::Value>(&read(&vex_path)).unwrap())
         .and_then(|v| v["statements"].as_array().map(Vec::len))
         .unwrap_or(0);
-    assert_eq!(attested, 0, "a stale install must not be attested from the ledger");
+    assert_eq!(attested, 0, "a stale install must not be attested from the fetched record");
     assert_ne!(code, 0, "nothing to attest fails the embedded-VEX run");
     assert_eq!(
         std::fs::read(site_packages(tmp.path()).join("urllib3").join("response.py")).unwrap(),
@@ -475,38 +571,34 @@ async fn warm_venv_with_the_upstream_release_is_not_attested() {
         "the probe is read-only"
     );
 
+    assert_no_ledger(tmp.path());
+
     // Manifest-less: the installed UPSTREAM copy is the evidence, whatever
-    // the lock and the ledger say — `not_applied`, with or without the
-    // ledger, online.
+    // the lock says — `not_applied`, online (the record from the API).
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
                 let api = vex_e2e_common::PatchApi::start(vec![(UUID.to_string(), view_body())]);
-                for strip_ledgers in [false, true] {
-                    let scratch = tempfile::tempdir().unwrap();
-                    let p = scratch.path().join("proj");
-                    vex_pipenv_pip_steps::copy_tree(tmp.path(), &p);
-                    vex_e2e_common::strip_manifest(&p);
-                    if strip_ledgers {
-                        vex_e2e_common::strip_ledgers(&p);
-                    }
-                    let out = vex_e2e_common::run_vex(
-                        &vex_e2e_common::binary(),
-                        &p,
-                        &vex_e2e_common::VexRun {
-                            product: Some(VEX_PRODUCT.into()),
-                            ..vex_e2e_common::VexRun::online(&api)
-                        },
-                    );
-                    assert_eq!(out.code, Some(1), "ledgers stripped={strip_ledgers}: {out}");
-                    vex_e2e_common::assert_absent(out.doc.as_ref(), PURL);
-                    vex_e2e_common::assert_not_attested(&out.envelope, PURL, "not_applied");
-                }
+                let scratch = tempfile::tempdir().unwrap();
+                let p = scratch.path().join("proj");
+                vex_pipenv_pip_steps::copy_tree(tmp.path(), &p);
+                vex_e2e_common::strip_manifest(&p);
+                let out = vex_e2e_common::run_vex(
+                    &vex_e2e_common::binary(),
+                    &p,
+                    &vex_e2e_common::VexRun {
+                        product: Some(VEX_PRODUCT.into()),
+                        ..vex_e2e_common::VexRun::online(&api)
+                    },
+                );
+                assert_eq!(out.code, Some(1), "{out}");
+                vex_e2e_common::assert_absent(out.doc.as_ref(), PURL);
+                vex_e2e_common::assert_not_attested(&out.envelope, PURL, "not_applied");
             })
             .join()
             .unwrap_or_else(|e| std::panic::resume_unwind(e));
     });
 
-    roll_back(tmp.path(), server.uri()).await;
+    roll_back(tmp.path(), &server).await;
     assert_eq!(read(&lock_path), LOCK);
 }

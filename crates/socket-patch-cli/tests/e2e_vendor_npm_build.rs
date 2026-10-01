@@ -35,6 +35,9 @@
 //! cannot reach the registry — unless `SOCKET_PATCH_NPM_E2E_REQUIRED` is
 //! set; every assertion after that is hard.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -71,13 +74,14 @@ fn binary() -> PathBuf {
 /// flip behavior) along with `VIRTUAL_ENV` (crawler discovery input).
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
             cmd.env_remove(&k);
         }
     }
     cmd.env_remove("VIRTUAL_ENV");
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -491,6 +495,115 @@ fn npm_vendor_fresh_checkout_npm_ci_and_revert() {
     );
 }
 
+/// #324 with the real npm: a CRLF lock with a UTF-8 BOM (npm installs from
+/// both) is vendored in its own layout, a fresh `npm ci` installs the
+/// patched bytes from it, and `vendor --revert` restores its exact bytes.
+#[test]
+fn npm_vendor_keeps_a_crlf_bom_lock_and_reverts_it_byte_for_byte() {
+    let Some(major) = npm_major_or_skip("e2e_vendor_npm_build") else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"vendor-crlf-bom","version":"0.0.0","private":true}"#,
+    )
+    .unwrap();
+    let cache = tmp.path().join("npm-cache");
+    if !npm_e2e_common::install_fixture(
+        "e2e_vendor_npm_build",
+        &proj,
+        &cache,
+        &format!("{DEP}@{DEP_VERSION}"),
+    ) {
+        return;
+    }
+    let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js")).unwrap();
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    stage_patch_with_vuln(&proj, &purl, "package/index.js", &orig, &patched, TAIL_GHSA);
+    if v1_lock_is_refused(&proj, major) {
+        return;
+    }
+
+    let lock_path = proj.join("package-lock.json");
+    let lf = std::fs::read_to_string(&lock_path).unwrap();
+    let pristine = format!("\u{feff}{}", lf.replace('\n', "\r\n"));
+    std::fs::write(&lock_path, &pristine).unwrap();
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
+    let wired = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(wired.starts_with('\u{feff}'), "the BOM is kept");
+    assert!(
+        !wired.replace("\r\n", "").contains('\n'),
+        "every line stays CRLF:\n{wired:?}"
+    );
+
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
+    std::fs::copy(&lock_path, fresh.join("package-lock.json")).unwrap();
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    let fresh_cache = tmp.path().join("fresh-npm-cache");
+    let ci = npm(
+        &fresh,
+        &[
+            "ci",
+            "--cache",
+            fresh_cache.to_str().unwrap(),
+            "--no-audit",
+            "--no-fund",
+        ],
+    );
+    assert!(
+        ci.status.success(),
+        "`npm ci` must install from the CRLF/BOM lock.\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+        patched,
+        "npm ci installs the PATCHED bytes"
+    );
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        pristine,
+        "revert restores the CRLF/BOM lock byte for byte"
+    );
+}
+
 /// Real-toolchain VEX capstone for npm: after a REAL install + `vendor`, the
 /// vendored `.tgz` is the on-disk evidence. `socket-patch vex` must attest the
 /// patch against that vendored tarball with the `(vendored)` marker — proving
@@ -592,13 +705,126 @@ fn npm_vendor_vex_attests_against_vendored_tarball() {
     );
 }
 
+/// #326: a dependency installed from a remote-tarball spec (`"left-pad":
+/// "https://…/left-pad-1.3.0.tgz"`) is fetched from that url by `npm ci`,
+/// whatever the lock's `resolved` says. Vendoring used to rewire the entry
+/// and report `applied` (and `vex` attested it) while `npm ci` installed
+/// the original bytes. It must refuse, leave the lock untouched, and give
+/// `vex` nothing to attest.
+#[test]
+fn npm_vendor_refuses_a_remote_tarball_dependency() {
+    let suite = "e2e_vendor_npm_build (remote tarball)";
+    let Some(major) = npm_major_or_skip(suite) else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"vendor-url-spec","version":"0.0.0","private":true}"#,
+    )
+    .unwrap();
+    let cache = tmp.path().join("npm-cache");
+    let url = format!("https://registry.npmjs.org/{DEP}/-/{DEP}-{DEP_VERSION}.tgz");
+    // npm 12 refuses remote-tarball specs unless `allow-remote` permits them.
+    let spec = if major >= 12 {
+        format!("{url} --allow-remote=all")
+    } else {
+        url.clone()
+    };
+    let mut args = vec!["install", "--no-audit", "--no-fund", "--cache"];
+    args.push(cache.to_str().unwrap());
+    args.extend(spec.split(' '));
+    let out = npm(&proj, &args);
+    if !out.status.success() {
+        npm_e2e_common::skip(
+            suite,
+            &format!(
+                "`npm install {spec}` failed (registry unreachable?):\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        );
+        return;
+    }
+    let pkg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(proj.join("package.json")).unwrap()).unwrap();
+    assert_eq!(
+        pkg["dependencies"][DEP], url,
+        "the fixture depends on the url spec: {pkg}"
+    );
+
+    let installed_index = proj.join("node_modules").join(DEP).join("index.js");
+    let orig = std::fs::read(&installed_index).expect("installed index.js");
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    const GHSA: &str = "GHSA-vend-npm-url";
+    stage_patch_with_vuln(&proj, &purl, "package/index.js", &orig, &patched, GHSA);
+    if v1_lock_is_refused(&proj, major) {
+        return;
+    }
+    let lock_before = std::fs::read(proj.join("package-lock.json")).unwrap();
+
+    let (_code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(
+        env["summary"]["applied"], 0,
+        "a url-spec dependency must not be vendored: {env}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("vendor_lock_entry_not_rewritable") && stdout.contains("UNPATCHED"),
+        "the refusal must say why: {env}"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("package-lock.json")).unwrap(),
+        lock_before,
+        "the lock is untouched"
+    );
+    assert!(
+        !proj.join(format!(".socket/vendor/npm/{UUID}")).exists(),
+        "no artifact is written"
+    );
+
+    let vex_path = proj.join("out.vex.json");
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vex",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ],
+    );
+    let attested = std::fs::read(&vex_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|doc| doc["statements"].as_array().map(|s| !s.is_empty()))
+        .unwrap_or(false);
+    assert!(
+        !attested,
+        "vex must not attest an unwired patch (exit {code}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 /// get-driven twin of the capstone (v3.6): instead of hand-staging
 /// `.socket/` (manifest + blob) and running `vendor --offline`,
 /// `get <uuid> --mode vendored` resolves the SAME patch from a mocked
 /// `view/{uuid}` endpoint — the before/after git-blob hashes `stage_patch`
 /// would compute from the actually-installed bytes, plus the after bytes
 /// inline as base64 `blobContent` — and must land the identical committed
-/// state: manifest record, deterministic artifact, vendor ledger, `file:`
+/// state: a detached vendor-ledger entry (NO manifest), deterministic artifact, vendor ledger, `file:`
 /// lock wiring with a recomputed sha512, and NO `.socket/blobs` (scan
 /// parity: the download phase holds patch content in memory). The
 /// fresh-checkout `npm ci` proof is the capstone's, verbatim.
@@ -642,29 +868,31 @@ async fn npm_get_uuid_vendored_fresh_checkout_npm_ci() {
     // 2. The patch record arrives over the (mocked) API instead of being
     //    staged on disk: same hashes, after bytes inline.
     let server = MockServer::start().await;
+    let view = serde_json::json!({
+        "uuid": UUID,
+        "purl": purl,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": git_sha256(&orig),
+                "afterHash": git_sha256(&patched),
+                "blobContent": b64(&patched),
+            }
+        },
+        "vulnerabilities": { TAIL_GHSA: {
+            "cves": [TAIL_CVE],
+            "summary": "get vendored vex vuln",
+            "severity": "high",
+            "description": "d",
+        }},
+        "description": "capstone marker patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view(&server, &view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": purl,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": git_sha256(&orig),
-                    "afterHash": git_sha256(&patched),
-                    "blobContent": b64(&patched),
-                }
-            },
-            "vulnerabilities": { TAIL_GHSA: {
-                "cves": [TAIL_CVE],
-                "summary": "get vendored vex vuln",
-                "severity": "high",
-                "description": "d",
-            }},
-            "description": "capstone marker patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
         .mount(&server)
         .await;
 
@@ -705,7 +933,7 @@ async fn npm_get_uuid_vendored_fresh_checkout_npm_ci() {
             "--org",
             ORG,
             "--vendor-source",
-            "build",
+            "service",
         ],
     );
     assert_eq!(
@@ -1043,5 +1271,126 @@ fn npm6_installs_a_vendored_v2_lock_from_its_legacy_mirror() {
         TAIL_GHSA,
         vec![("package-lock.json", lock_before)],
         &[VexVia::Apply, VexVia::Vendor],
+    );
+}
+
+/// The one real package dir npm's linked store holds for `name@version`
+/// (`node_modules/.store/<name>@<version>-<hash>/node_modules/<name>`).
+fn linked_store_copy(proj: &Path, name: &str, version: &str) -> Option<PathBuf> {
+    let prefix = format!("{name}@{version}-");
+    std::fs::read_dir(proj.join("node_modules/.store"))
+        .ok()?
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|e| e.path().join("node_modules").join(name))
+}
+
+/// What Node loads for `dep` when `from` requires it.
+fn node_loads(proj: &Path, from: &str, dep: &str) -> String {
+    let script = format!(
+        "const p=require('path');process.stdout.write(require('fs').readFileSync(\
+         require.resolve('{dep}',{{paths:[p.dirname(require.resolve('{from}'))]}}),'utf8'))"
+    );
+    let out = Command::new("node")
+        .args(["-e", &script])
+        .current_dir(proj)
+        .output()
+        .expect("node runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        npm_e2e_common::output_text(&out)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// #359: with `install-strategy=linked` (npm 9.4+), a transitive package
+/// is a real dir ONLY in `node_modules/.store`. `apply` must patch the
+/// copy Node loads, `rollback` must restore it, and `vendor` must build
+/// its tarball from it; before the fix all three reported
+/// `package_not_installed`.
+#[test]
+fn npm_linked_strategy_transitive_package_is_patched_rolled_back_and_vendored() {
+    let suite = "e2e_vendor_npm_build (linked)";
+    let Some(major) = npm_major_or_skip(suite) else {
+        return;
+    };
+    // `install-strategy=linked` arrived in npm 9.4.0 (measured: 9.0-9.3
+    // ignore it and install the hoisted tree).
+    let minor: u32 = npm_e2e_common::npm_version()
+        .and_then(|v| v.split('.').nth(1)?.parse().ok())
+        .unwrap_or(0);
+    if major < 9 || (major == 9 && minor < 4) {
+        println!("SKIP {suite}: npm {major}.{minor} has no install-strategy=linked");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"linked-capstone","version":"0.0.0","private":true}"#,
+    )
+    .unwrap();
+    std::fs::write(proj.join(".npmrc"), "install-strategy=linked\n").unwrap();
+    let cache = tmp.path().join("npm-cache");
+    // is-odd@3.0.1 depends on is-number@6.0.0: transitive, so store-only.
+    if !npm_e2e_common::install_fixture(suite, &proj, &cache, "is-odd@3.0.1") {
+        return;
+    }
+    let copy = linked_store_copy(&proj, "is-number", "6.0.0")
+        .expect("npm's linked strategy put is-number in node_modules/.store");
+    assert!(!proj.join("node_modules/is-number").exists());
+    let index = copy.join("index.js");
+    let orig = std::fs::read(&index).unwrap();
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    stage_patch_with_vuln(
+        &proj,
+        "pkg:npm/is-number@6.0.0",
+        "package/index.js",
+        &orig,
+        &patched,
+        "GHSA-link-npm-real",
+    );
+    // Rollback restores from the before-blob.
+    std::fs::write(proj.join(".socket/blobs").join(git_sha256(&orig)), &orig).unwrap();
+    let cwd = proj.to_str().unwrap();
+
+    let (code, stdout, stderr) = run_socket(&proj, &["apply", "--json", "--offline", "--cwd", cwd]);
+    assert_eq!(code, 0, "apply failed.\n{stdout}\n{stderr}");
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "success", "{env}");
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    assert_eq!(std::fs::read(&index).unwrap(), patched);
+    assert!(node_loads(&proj, "is-odd", "is-number").starts_with(MARKER));
+
+    let (code, stdout, stderr) = run_socket(&proj, &["rollback", "--json", "--cwd", cwd]);
+    assert_eq!(code, 0, "rollback failed.\n{stdout}\n{stderr}");
+    assert_eq!(std::fs::read(&index).unwrap(), orig);
+
+    // Rollback drops the record from the manifest; stage it again.
+    stage_patch_with_vuln(
+        &proj,
+        "pkg:npm/is-number@6.0.0",
+        "package/index.js",
+        &orig,
+        &patched,
+        "GHSA-link-npm-real",
+    );
+    let lock_before = std::fs::read(proj.join("package-lock.json")).unwrap();
+    let (code, stdout, stderr) =
+        run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+    assert_eq!(code, 0, "vendor failed.\n{stdout}\n{stderr}");
+    assert_eq!(parse_envelope(&stdout)["status"], "success", "{stdout}");
+    assert_ne!(
+        std::fs::read(proj.join("package-lock.json")).unwrap(),
+        lock_before,
+        "vendor must rewire the lock: {stdout}"
+    );
+    let (code, stdout, stderr) = run_socket(&proj, &["vendor", "--revert", "--json", "--cwd", cwd]);
+    assert_eq!(code, 0, "vendor --revert failed.\n{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read(proj.join("package-lock.json")).unwrap(),
+        lock_before
     );
 }

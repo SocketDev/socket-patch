@@ -289,8 +289,10 @@ fn percent_decode(s: &str) -> String {
 /// with an empty (no-patch) result. Returns the running server.
 ///
 /// In proxy mode (no API token — `run()` strips `SOCKET_API_TOKEN`) the scan
-/// issues one `GET /patch/by-package/<percent-encoded-purl>` per discovered
-/// package. Capturing those requests lets us assert the *exact* PURLs the
+/// first POSTs `/patch/batch`, which this mock leaves unrouted (404), so the
+/// client falls back to one `GET /patch/by-package/<percent-encoded-purl>`
+/// per discovered package. Capturing those fallback requests lets us assert
+/// the *exact* PURLs the
 /// gem crawler synthesized — name, version, and `pkg:gem/` ecosystem — rather
 /// than trusting a self-reported count.
 async fn start_proxy() -> MockServer {
@@ -482,7 +484,7 @@ fn test_gem_full_lifecycle() {
     let gem_dir = find_gem_dir(cwd);
 
     // -- GET: download + apply patch ------------------------------------------
-    assert_run_ok(cwd, &["get", GEM_UUID], "get");
+    assert_run_ok(cwd, &["get", GEM_UUID, "--mode", "agent"], "get");
 
     let manifest_path = cwd.join(".socket/manifest.json");
     assert!(
@@ -581,7 +583,7 @@ fn test_gem_dry_run() {
     let gem_dir = find_gem_dir(cwd);
 
     // Download without applying.
-    assert_run_ok(cwd, &["get", GEM_UUID, "--no-apply"], "get --no-apply");
+    assert_run_ok(cwd, &["get", GEM_UUID, "--mode", "agent", "--no-apply"], "get --no-apply");
 
     // Read manifest to get file list and expected hashes.
     let manifest_path = cwd.join(".socket/manifest.json");

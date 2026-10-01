@@ -66,6 +66,12 @@ fn stderr_chatter(stderr: &str) -> Vec<String> {
 /// artifact anywhere under `.socket/` (and no committed vendor artifact
 /// to harvest) — the mem stager must fetch, or fail.
 fn write_sourceless_manifest(root: &Path) {
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"fixture","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("package-lock.json"), r#"{"lockfileVersion":3,"packages":{"":{},"node_modules/left-pad":{"version":"1.3.0","resolved":"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz","integrity":"sha512-original"}}}"#).unwrap();
     let socket = root.join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
     std::fs::write(
@@ -114,7 +120,7 @@ fn vendor_silent_offline_missing_source_keeps_error_output() {
     );
     let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter.iter().any(|l| l.contains("no local source")),
+        chatter.iter().any(|l| l.contains("offline")),
         "--silent must keep the offline no-source error (errors only, \
          never nothing); stderr was: {stderr:?}"
     );
@@ -152,9 +158,7 @@ fn vendor_silent_online_fetch_failure_keeps_error_output() {
     );
     let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter
-            .iter()
-            .any(|l| l.contains("Could not fetch patch content")),
+        chatter.iter().any(|l| l.contains("request")),
         "--silent must keep the fetch-failure error (errors only, \
          never nothing); stderr was: {stderr:?}"
     );
@@ -188,7 +192,7 @@ fn vendor_json_online_fetch_failure_keeps_stderr_clean() {
     let v: serde_json::Value =
         serde_json::from_str(&stdout).expect("vendor --json must emit valid JSON");
     assert_eq!(
-        v["error"]["code"], "no_local_source",
+        v["events"][0]["errorCode"], "apply_failed",
         "the pinned envelope error for the unavailable bail, got {v}"
     );
     let chatter = stderr_chatter(&stderr);

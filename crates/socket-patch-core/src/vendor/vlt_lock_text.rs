@@ -779,10 +779,6 @@ impl EdgeEntry<'_> {
         self.value.rsplit_once(' ').map_or("", |(_, to)| to)
     }
 
-    pub(crate) fn entry_text(&self) -> String {
-        entry_text(self.key, self.raw_value)
-    }
-
     pub(crate) fn sort_key(&self) -> EdgeSortKey<'_> {
         EdgeSortKey {
             from: self.from(),
@@ -1015,8 +1011,7 @@ mod tests {
     use super::*;
 
     use crate::constants::npm_family::{
-        VLT_CONFIG, VLT_HIDDEN_LOCK_REL, VLT_LEGACY_WORKSPACES, VLT_LOCK, VLT_SETUP_MARKERS,
-        VLT_STORE_DIR,
+        VLT_CONFIG, VLT_HIDDEN_LOCK_REL, VLT_LEGACY_WORKSPACES, VLT_LOCK, VLT_STORE_DIR,
     };
 
     const UUID: &str = "0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b";
@@ -2000,7 +1995,7 @@ mod tests {
         assert_eq!(edge.entry.spec(), "^3.0.0 || ^4.0.0");
         assert_eq!(edge.entry.target(), "~npm~js-tokens@4.0.0");
         assert_eq!(
-            edge.entry.entry_text(),
+            entry_text(edge.entry.key, edge.entry.raw_value),
             "\"~npm~loose-envify@1.4.0 js-tokens\": \"prod ^3.0.0 || ^4.0.0 ~npm~js-tokens@4.0.0\""
         );
         let missing = parse_edge_line("    \"~npm~tap@15.2.3~peer.6f88d0ccf17dbbdc ts-node\": \"peerOptional >=8.5.2 MISSING\"")
@@ -2204,9 +2199,8 @@ mod tests {
         }
     }
 
-    // Captured with vlt 1.2.0 and rc.14 (design probes peerprobe/t2 and
-    // e1c/base): every entry line is inside the grammar and both sections
-    // are in the order the comparators compute.
+    // Captured with vlt 1.2.0 and rc.14: every entry line is inside the
+    // grammar and both sections are in the order the comparators compute.
     const CAPTURED_1_2_0: &str = r#"{
   "lockfileVersion": 1,
   "options": {
@@ -2524,15 +2518,6 @@ mod tests {
         assert_eq!(VLT_HIDDEN_LOCK_REL, "node_modules/.vlt-lock.json");
         assert_eq!(VLT_STORE_DIR, "node_modules/.vlt");
         assert_eq!(VLT_LEGACY_WORKSPACES, "vlt-workspaces.json");
-        assert_eq!(
-            VLT_SETUP_MARKERS,
-            [
-                "vlt-lock.json",
-                "vlt.json",
-                "node_modules/.vlt-lock.json",
-                "node_modules/.vlt"
-            ]
-        );
     }
 
     #[test]

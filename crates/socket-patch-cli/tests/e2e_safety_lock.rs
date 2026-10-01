@@ -186,7 +186,7 @@ fn lock_held_human_mode_mentions_other_process() {
 /// `--silent` is "errors only" (CLI_CONTRACT.md), never "nothing":
 /// a lock_held contention under `apply --silent` must still put the
 /// error line on stderr. Exit 1 with zero output is undiagnosable —
-/// the same violation fixed for setup/scan/apply's other error exits.
+/// the same violation fixed for scan/apply's other error exits.
 #[test]
 fn lock_held_silent_mode_still_reports_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -228,9 +228,9 @@ fn lock_released_after_external_drop() {
     // The synthetic manifest targets a package that isn't on disk, so
     // apply runs the pipeline to a partialFailure (exit 1). The point
     // of THIS test is that the released lock is re-acquired: assert the
-    // envelope proves we got past the lock (not the old vacuous
-    // `!stdout.contains("lock_held")`, which a crash to empty stdout or
-    // an unrelated error would also satisfy).
+    // envelope proves we got past the lock (a bare
+    // `!stdout.contains("lock_held")` would also pass on a crash to empty
+    // stdout or an unrelated error).
     let env = parse_json_envelope(&stdout);
     assert_lock_acquired(&env);
     assert_eq!(
