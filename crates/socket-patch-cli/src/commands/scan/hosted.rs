@@ -934,7 +934,8 @@ pub(crate) async fn run_redirect_selected(
             socket_patch_core::utils::fs::read_regular_to_string_sync(path).ok()
         })
     };
-    let rewrite_options = || RewriteOptions {
+    let rewrite_options = || {
+        RewriteOptions {
         dry_run: common.dry_run,
         targets_pipenv_lock,
         pipenv_major,
@@ -946,6 +947,7 @@ pub(crate) async fn run_redirect_selected(
         npm_allow_remote_config: !common.no_npm_allow_remote_config,
         npm_outer: &npm_outer,
         blocking: true,
+    }
     };
     // The rollout gate plans again without its deferred rows: keep what
     // the second pass needs.
@@ -2171,13 +2173,19 @@ fn join_names(names: &[String], max: usize) -> String {
 /// artifacts, then verify with `vex`. After a vendored→hosted takeover
 /// (`vendored_removed`) the commit also has to carry the deleted vendored
 /// ledger entries and artifacts.
-fn format_next_steps(files: &[String], edits: &[socket_patch_core::patch::redirect::FileEdit], vendored_removed: bool) -> Vec<String> {
+fn format_next_steps(
+    files: &[String],
+    edits: &[socket_patch_core::patch::redirect::FileEdit],
+    vendored_removed: bool,
+) -> Vec<String> {
     if files.is_empty() && !vendored_removed {
         return Vec::new();
     }
     let mut commit: Vec<String> = Vec::new();
     if vendored_removed {
-        commit.push(".socket/vendor/ (the removed vendored ledger entries and artifacts)".to_string());
+        commit.push(
+            ".socket/vendor/ (the removed vendored ledger entries and artifacts)".to_string(),
+        );
     }
     commit.extend(files.iter().cloned());
     let npm = files
@@ -2468,6 +2476,19 @@ mod tests {
             }
             _ => panic!("a `...`-terminated block mapping must plan an Append"),
         }
+        // The refusal reason reaches the warning with both manual recoveries.
+        let TrustPlan::Unsupported(why) = plan_workspace_trust(Some("{packages: [.]}\n")) else {
+            panic!("a flow-style document must be refused");
+        };
+        let detail = socket_patch_core::hosted::guidance::pnpm_trust_workspace_unsupported_detail(
+            "the hosted patch server (patch.test)",
+            &why,
+        );
+        assert!(detail.contains("flow-style"), "{detail}");
+        assert!(detail.contains("left untouched"), "{detail}");
+        assert!(detail.contains("--trust-lockfile"), "{detail}");
+        assert!(detail.contains("trustLockfile: true"), "{detail}");
+        assert!(detail.contains("pnpm clean --lockfile"), "{detail}");
         for text in [
             "{packages: [.]}\n",
             "--- {packages: [.]}\n",
@@ -4147,19 +4168,43 @@ mod tests {
         use super::npm_allow_remote_one_line;
         let hosts = ["patch.socket.dev"];
         let cases = [
-            (npm_allow_remote_configured_detail(&hosts, true, false), "Note: set"),
-            (npm_allow_remote_configured_detail(&hosts, false, false), "Note: set"),
-            (npm_allow_remote_configured_detail(&hosts, true, true), "Note: would set"),
-            (npm_allow_remote_already_detail(&hosts), "Note: .npmrc already"),
-            (npm_allow_remote_user_set_detail(&hosts, "none"), "Warning: npm >=12"),
-            (npm_allow_remote_env_set_detail(&hosts, "npm_config_allow_remote", "none"), "Warning: npm >=12"),
+            (
+                npm_allow_remote_configured_detail(&hosts, true, false),
+                "Note: set",
+            ),
+            (
+                npm_allow_remote_configured_detail(&hosts, false, false),
+                "Note: set",
+            ),
+            (
+                npm_allow_remote_configured_detail(&hosts, true, true),
+                "Note: would set",
+            ),
+            (
+                npm_allow_remote_already_detail(&hosts),
+                "Note: .npmrc already",
+            ),
+            (
+                npm_allow_remote_user_set_detail(&hosts, "none"),
+                "Warning: npm >=12",
+            ),
+            (
+                npm_allow_remote_env_set_detail(&hosts, "npm_config_allow_remote", "none"),
+                "Warning: npm >=12",
+            ),
             (npm_allow_remote_manual_detail(&hosts), "Warning: npm >=12"),
-            (npm_allow_remote_unreadable_detail(&hosts, "is a symlink"), "Warning: npm >=12"),
+            (
+                npm_allow_remote_unreadable_detail(&hosts, "is a symlink"),
+                "Warning: npm >=12",
+            ),
         ];
         for (detail, start) in cases {
             let line = npm_allow_remote_one_line(&detail);
             assert!(line.starts_with(start), "{line}");
-            assert!(!line.contains('\n') && line.ends_with("(details: --verbose)."), "{line}");
+            assert!(
+                !line.contains('\n') && line.ends_with("(details: --verbose)."),
+                "{line}"
+            );
         }
     }
 }

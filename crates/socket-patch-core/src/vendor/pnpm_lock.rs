@@ -76,6 +76,7 @@ use crate::formats::pnpm::lines::{
     indent_of, next_block, parse_key_line, section_bounds, split_lines, unquote_value, yaml_key,
     yaml_key_like, YamlBlock,
 };
+use crate::formats::pnpm::workspace;
 use crate::formats::pnpm::{check_v9_lock_version as check_lock_version, vendored_npm_uuids};
 
 const PACKAGE_JSON: &str = "package.json";
@@ -1586,11 +1587,12 @@ struct WorkspaceEdit {
     created_overrides: bool,
 }
 
-/// Locate the top-level `overrides:` block and the indent its entries use
+/// Locate the top-level `overrides:` block (any key spelling pnpm reads:
+/// quoted, `overrides :`, a trailing comment) and the indent its entries use
 /// (pnpm's canonical is 2 spaces; a hand-authored file may differ). `None`
 /// when there is no block-style `overrides:` section.
 fn ws_overrides_section(lines: &[String]) -> Option<(usize, usize, usize)> {
-    let (start, end) = section_bounds(lines, "overrides")?;
+    let (start, end) = workspace::block_section_bounds(lines, "overrides")?;
     let indent = lines[start + 1..end]
         .iter()
         .find(|l| !l.trim().is_empty())
@@ -1615,10 +1617,18 @@ fn check_workspace_override(
         return Ok(());
     };
     let lines = split_lines(text);
-    if lines
-        .iter()
-        .any(|l| l.starts_with("overrides:") && l.trim_end() != "overrides:")
-    {
+    // A document the line surgery cannot extend (flow-style root, several
+    // documents) would be corrupted by any splice: refuse before writing.
+    if let Err(why) = workspace::block_insert_point(&lines) {
+        return Err(format!(
+            "{PNPM_WORKSPACE} {why}, which the override surgery cannot edit without \
+             corrupting it — rewrite it as a single block mapping and re-run"
+        ));
+    }
+    if lines.iter().any(|l| {
+        workspace::top_level_key(l)
+            .is_some_and(|(key, value)| key == "overrides" && !value.is_empty())
+    }) {
         return Err(format!(
             "{PNPM_WORKSPACE} has an inline `overrides:` mapping the pair surgery cannot \
              edit — rewrite it as a block mapping (`overrides:` then indented entries) \
@@ -1716,14 +1726,12 @@ fn apply_workspace_override(
         });
     }
 
-    // File exists without an `overrides:` section: append one after the last
-    // non-empty line (no blank separator, so revert removes exactly two
-    // lines and the file's trailing bytes stay put).
-    let anchor = lines
-        .iter()
-        .rposition(|l| !l.trim().is_empty())
-        .map(|i| i + 1)
-        .unwrap_or(lines.len());
+    // File exists without an `overrides:` section: append one after the
+    // document's last non-empty line, before a `...` end marker (no blank
+    // separator, so revert removes exactly two lines and the file's trailing
+    // bytes stay put).
+    let anchor = workspace::block_insert_point(&lines)
+        .map_err(|why| format!("{PNPM_WORKSPACE} {why}; the overrides section cannot be added"))?;
     lines.splice(
         anchor..anchor,
         [
@@ -8533,7 +8541,12 @@ mod workspace_yaml_shape_tests {
     /// pnpm reads; the entry goes inside it, never into a duplicate key.
     #[test]
     fn quoted_or_spaced_overrides_key_is_edited_in_place() {
-        for header in ["\"overrides\":", "'overrides':", "overrides :", "overrides: # pins"] {
+        for header in [
+            "\"overrides\":",
+            "'overrides':",
+            "overrides :",
+            "overrides: # pins",
+        ] {
             let text = format!("packages:\n  - '.'\n{header}\n  is-number: 7.0.0\n");
             assert_eq!(
                 apply(&text).unwrap(),
@@ -8557,7 +8570,10 @@ mod workspace_yaml_shape_tests {
     /// #402: a quoted inline mapping is refused like an unquoted one.
     #[test]
     fn quoted_inline_overrides_mapping_is_refused() {
-        for line in ["\"overrides\": {is-number: 7.0.0}", "overrides : {is-number: 7.0.0}"] {
+        for line in [
+            "\"overrides\": {is-number: 7.0.0}",
+            "overrides : {is-number: 7.0.0}",
+        ] {
             let text = format!("packages:\n  - '.'\n{line}\n");
             let err = check_workspace_override(Some(&text), "left-pad", "1.3.0", "left-pad@1.3.0")
                 .unwrap_err();

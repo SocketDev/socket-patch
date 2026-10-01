@@ -738,7 +738,11 @@ pub(crate) async fn cleanup_side_config(
         if let Ok(Some(ws)) = view.read(WORKSPACE).await {
             if ws == "packages:\n  - '.'\ntrustLockfile: true\n" {
                 view.remove(WORKSPACE);
-            } else if ws.lines().any(|l| l.trim_end() == "trustLockfile: true") {
+            } else if ws.lines().any(|l| {
+                crate::formats::pnpm::workspace::top_level_key(l).is_some_and(|(key, value)| {
+                    key == "trustLockfile" && value.trim_matches(['\'', '"']) == "true"
+                })
+            }) {
                 result.warnings.push((
                     "pnpm_trust_lockfile_left",
                     format!(

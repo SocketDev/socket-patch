@@ -27,6 +27,7 @@
 pub(crate) mod grammar;
 pub(crate) mod hosted;
 pub(crate) mod lines;
+pub(crate) mod workspace;
 
 pub(crate) use grammar::{entry_field, is_pnpm_lock_text, Entry, Resolution};
 pub(crate) use hosted::plan_hosted;
@@ -37,7 +38,6 @@ use crate::constants::npm_family::PNPM_LOCK;
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::{http_url, LockIntegrity, LockfileEntry};
 use crate::vendor::path::parse_vendor_path;
-
 
 // ── entry model ──
 
@@ -282,7 +282,10 @@ fn lock_versions(text: &str) -> impl Iterator<Item = (Option<u32>, u32)> + '_ {
         let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
         let mut parts = value.split('.');
         let major = parts.next().and_then(|m| m.parse::<u32>().ok());
-        let minor = parts.next().and_then(|m| m.parse::<u32>().ok()).unwrap_or(0);
+        let minor = parts
+            .next()
+            .and_then(|m| m.parse::<u32>().ok())
+            .unwrap_or(0);
         Some((major, minor))
     })
 }
@@ -302,7 +305,8 @@ pub fn lock_version_major(text: &str) -> Option<u32> {
 /// rejects it): a `shrinkwrapVersion` lock (pnpm 1–2) or lockfileVersion
 /// 5.0–5.2 (pnpm 3–5). Later locks never get the `--store` note.
 pub fn may_need_store_flag(text: &str) -> bool {
-    text.lines().any(|line| line.starts_with("shrinkwrapVersion:"))
+    text.lines()
+        .any(|line| line.starts_with("shrinkwrapVersion:"))
         || lock_versions(text).any(|(major, minor)| major == Some(5) && minor <= 2)
 }
 
@@ -490,7 +494,9 @@ pub(crate) fn vendored_npm_uuids(text: &str) -> HashSet<String> {
         if !in_section {
             continue;
         }
-        if let Some(uuid) = lines::parse_key_line(line, 2).and_then(|(key, _, _)| vendored_npm_uuid(key)) {
+        if let Some(uuid) =
+            lines::parse_key_line(line, 2).and_then(|(key, _, _)| vendored_npm_uuid(key))
+        {
             out.insert(uuid);
         }
     }
@@ -507,17 +513,52 @@ mod tests {
     fn resolves_reads_every_key_generation_boundary_anchored() {
         let lock = |keys: &str| format!("lockfileVersion: '9.0'\n\npackages:\n\n{keys}");
         let yes = [
-            ("  left-pad@1.3.0:\n    resolution: {integrity: sha512-x}\n", "left-pad", "1.3.0"),
-            ("  /left-pad@1.3.0:\n    resolution: {}\n", "left-pad", "1.3.0"),
-            ("  /left-pad/1.3.0:\n    resolution: {}\n", "left-pad", "1.3.0"),
-            ("  'left-pad@1.3.0(react@18.0.0)':\n    dev: false\n", "left-pad", "1.3.0"),
-            ("  /left-pad/1.3.0_react@18.0.0:\n    dev: false\n", "left-pad", "1.3.0"),
-            ("  '@scope/name@1.0.0':\n    dev: false\n", "@scope/name", "1.0.0"),
-            ("  /@scope/name@1.0.0:\n    dev: false\n", "@scope/name", "1.0.0"),
-            ("  /@scope/name/1.0.0:\n    dev: false\n", "@scope/name", "1.0.0"),
+            (
+                "  left-pad@1.3.0:\n    resolution: {integrity: sha512-x}\n",
+                "left-pad",
+                "1.3.0",
+            ),
+            (
+                "  /left-pad@1.3.0:\n    resolution: {}\n",
+                "left-pad",
+                "1.3.0",
+            ),
+            (
+                "  /left-pad/1.3.0:\n    resolution: {}\n",
+                "left-pad",
+                "1.3.0",
+            ),
+            (
+                "  'left-pad@1.3.0(react@18.0.0)':\n    dev: false\n",
+                "left-pad",
+                "1.3.0",
+            ),
+            (
+                "  /left-pad/1.3.0_react@18.0.0:\n    dev: false\n",
+                "left-pad",
+                "1.3.0",
+            ),
+            (
+                "  '@scope/name@1.0.0':\n    dev: false\n",
+                "@scope/name",
+                "1.0.0",
+            ),
+            (
+                "  /@scope/name@1.0.0:\n    dev: false\n",
+                "@scope/name",
+                "1.0.0",
+            ),
+            (
+                "  /@scope/name/1.0.0:\n    dev: false\n",
+                "@scope/name",
+                "1.0.0",
+            ),
         ];
         for (keys, name, version) in yes {
-            assert!(PnpmLock::parse(&lock(keys)).resolves(name, version), "{keys}");
+            assert!(
+                PnpmLock::parse(&lock(keys)).resolves(name, version),
+                "{keys}"
+            );
         }
         let no = [
             ("  left-pad@1.3.0-beta.1:\n    dev: false\n", "left-pad", "1.3.0"),
@@ -533,7 +574,10 @@ mod tests {
             ),
         ];
         for (keys, name, version) in no {
-            assert!(!PnpmLock::parse(&lock(keys)).resolves(name, version), "{keys}");
+            assert!(
+                !PnpmLock::parse(&lock(keys)).resolves(name, version),
+                "{keys}"
+            );
         }
         // Keys outside `packages:` (importers, overrides) resolve nothing.
         let importers = "lockfileVersion: '9.0'\n\nimporters:\n\n  left-pad@1.3.0:\n    x: y\n";
@@ -556,7 +600,10 @@ mod tests {
             let other = "22222222-2222-4222-8222-222222222222";
             assert!(!PnpmLock::parse(text).vendored_in_use(other));
             let crlf = text.replace('\n', "\r\n");
-            assert!(PnpmLock::parse(&crlf).vendored_in_use(UUID), "CRLF reads like LF");
+            assert!(
+                PnpmLock::parse(&crlf).vendored_in_use(UUID),
+                "CRLF reads like LF"
+            );
         }
         // An overrides declaration alone is not usage.
         let overrides = format!(

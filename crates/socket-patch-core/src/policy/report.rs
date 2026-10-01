@@ -48,7 +48,9 @@ pub fn policy_block(
     let (floor, floor_source) = policy.min_severity();
     // Sorted: crawl order is filesystem order, and the two engines differ.
     let mut filtered: Vec<&FilteredEntry> = filtered.iter().collect();
-    filtered.sort_by(|a, b| (&a.project, &a.purl, a.reason.code()).cmp(&(&b.project, &b.purl, b.reason.code())));
+    filtered.sort_by(|a, b| {
+        (&a.project, &a.purl, a.reason.code()).cmp(&(&b.project, &b.purl, b.reason.code()))
+    });
     let mut retained: Vec<&RetainedEntry> = retained.iter().collect();
     retained.sort_by(|a, b| (&a.project, &a.purl).cmp(&(&b.project, &b.purl)));
     let filtered: Vec<serde_json::Value> = filtered

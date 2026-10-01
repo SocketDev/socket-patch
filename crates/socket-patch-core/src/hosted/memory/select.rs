@@ -15,8 +15,8 @@ use crate::patch::redirect::npmrc::NPMRC_REL;
 use crate::utils::python_lock::is_python_lock_name;
 
 use crate::policy::{
-    MemoryPolicyFs, PolicyOverrides, PolicySource, Root, RootFile, SelectionPolicy, POLICY_FILE_NAMES,
-    SOCKET_YML_INVALID,
+    MemoryPolicyFs, PolicyOverrides, PolicySource, Root, RootFile, SelectionPolicy,
+    POLICY_FILE_NAMES, SOCKET_YML_INVALID,
 };
 
 use super::roots::{
@@ -46,7 +46,12 @@ pub(crate) const VENDOR_STATE_REL: &str = ".socket/vendor/state.json";
 pub(crate) const MANIFEST_REL: &str = ".socket/manifest.json";
 
 /// Root-relative text files read beyond `REDIRECT_CANDIDATE_FILES`.
-const EXTRA_TEXT_FILES: [&str; 4] = [PNPM_WORKSPACE_REL, NPMRC_REL, VENDOR_STATE_REL, MANIFEST_REL];
+const EXTRA_TEXT_FILES: [&str; 4] = [
+    PNPM_WORKSPACE_REL,
+    NPMRC_REL,
+    VENDOR_STATE_REL,
+    MANIFEST_REL,
+];
 
 /// The one directory name the disk Cargo member walk never enters (it
 /// follows `members`, `exclude`, path dependencies and `[patch]` paths
@@ -175,7 +180,10 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
 /// The listed root policy files with the text the caller fetched first. A
 /// listed file with no text (not passed, `missing`, or a symlink) is present
 /// without content, so loading it fails closed.
-fn selection_policy_fs(blobs: &BTreeMap<String, bool>, supplied: &[PolicyFileInput]) -> MemoryPolicyFs {
+fn selection_policy_fs(
+    blobs: &BTreeMap<String, bool>,
+    supplied: &[PolicyFileInput],
+) -> MemoryPolicyFs {
     let mut fs = MemoryPolicyFs::default();
     for name in POLICY_FILE_NAMES {
         let Some(&symlink) = blobs.get(name) else {
@@ -201,7 +209,10 @@ fn selection_policy(
     options: &SelectOptions,
 ) -> Result<SelectionPolicy, PolicyErrorInfo> {
     let supplied = options.policy_files.as_deref().unwrap_or_default();
-    if let Some(bad) = supplied.iter().find(|f| !POLICY_FILE_NAMES.contains(&f.path.as_str())) {
+    if let Some(bad) = supplied
+        .iter()
+        .find(|f| !POLICY_FILE_NAMES.contains(&f.path.as_str()))
+    {
         return Err(PolicyErrorInfo {
             code: SOCKET_YML_INVALID.to_string(),
             detail: format!(

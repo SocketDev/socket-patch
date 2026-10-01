@@ -91,6 +91,24 @@ pub fn pnpm_trust_legacy_detail(server: &str) -> String {
     )
 }
 
+/// The unspliceable-workspace fallback: pnpm-workspace.yaml is valid YAML
+/// that a line append would corrupt (a flow-style root, several
+/// documents), so the auto-config stands down and the warning names the
+/// reason and both manual recoveries.
+pub fn pnpm_trust_workspace_unsupported_detail(server: &str, why: &str) -> String {
+    format!(
+        "{}. {PNPM_WORKSPACE_REL} {why}, which the trust edit cannot extend \
+         without corrupting it; it was left untouched. Install with \
+         `pnpm install --trust-lockfile`, or add `trustLockfile: true` to it \
+         yourself so every install accepts the patched artifacts. Do NOT \
+         follow pnpm's advice to rebuild the lockfile (`pnpm clean \
+         --lockfile`): that silently discards the hosted patches and \
+         reinstalls the vulnerable upstream artifact. pnpm <=10 installs \
+         work unchanged",
+        pnpm_trust_policy_preamble(server),
+    )
+}
+
 /// The unreadable-workspace fallback: pnpm-workspace.yaml EXISTS but could
 /// not be read (permissions, invalid UTF-8, I/O error). Planning a Create
 /// here would OVERWRITE the user's file with the root-only scaffold —
@@ -155,9 +173,7 @@ pub fn pnpm_lock_carries_hosted_redirect(
 pub fn npm_lock_url_needles(artifact_url: &str) -> Vec<String> {
     let mut needles: Vec<String> =
         crate::patch::redirect::artifact_url_spellings(artifact_url).into();
-    needles.push(crate::utils::uri::encode_uri_component(
-        artifact_url,
-    ));
+    needles.push(crate::utils::uri::encode_uri_component(artifact_url));
     needles
 }
 
@@ -218,6 +234,10 @@ pub enum TrustPlan {
     /// call is respected — flipping an explicit security setting behind the
     /// user's back is worse than a failing install with a clear warning.
     UserSet(String),
+    /// The file is valid YAML a line splice cannot extend (a flow-style
+    /// root, an indented root, several documents): nothing is written and
+    /// the reason is surfaced, since appending would corrupt it.
+    Unsupported(String),
 }
 
 /// Decide how to ensure `trustLockfile: true` in pnpm-workspace.yaml.
@@ -225,28 +245,35 @@ pub enum TrustPlan {
 /// workspace surgery: untouched lines stay byte-identical, so a revert can
 /// remove exactly what was added.
 pub fn plan_workspace_trust(existing: Option<&str>) -> TrustPlan {
+    use crate::formats::pnpm::workspace::{block_insert_point, top_level_key};
     let Some(text) = existing else {
         return TrustPlan::Create("packages:\n  - '.'\ntrustLockfile: true\n".to_string());
     };
-    // Top-level key only: an indented `trustLockfile:` under some other
+    let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    // Where the key would go — refused when the document is not a single
+    // block mapping, so the scan for an existing key below is meaningful.
+    let anchor = match block_insert_point(&lines) {
+        Ok(anchor) => anchor,
+        Err(why) => return TrustPlan::Unsupported(why),
+    };
+    // Top-level key only (every spelling pnpm reads: quoted, `key :`, a
+    // trailing comment): an indented `trustLockfile:` under some other
     // mapping is not the setting pnpm reads.
-    for line in text.split('\n') {
-        if let Some(rest) = line.strip_prefix("trustLockfile:") {
-            let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
+    for line in &lines {
+        if let Some((key, value)) = top_level_key(line) {
+            if key != "trustLockfile" {
+                continue;
+            }
+            let value = value.trim_matches(|c| c == '\'' || c == '"');
             if value == "true" {
                 return TrustPlan::AlreadyTrue;
             }
             return TrustPlan::UserSet(value.to_string());
         }
     }
-    let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
-    // After the last non-empty line (no blank separator): a revert removes
-    // exactly one line and the file's trailing bytes stay put.
-    let anchor = lines
-        .iter()
-        .rposition(|l| !l.trim().is_empty())
-        .map(|i| i + 1)
-        .unwrap_or(lines.len());
+    // After the document's last non-empty line (no blank separator; before a
+    // `...` end marker): a revert removes exactly one line and the file's
+    // trailing bytes stay put.
     lines.insert(anchor, "trustLockfile: true".to_string());
     TrustPlan::Append(lines.join("\n"))
 }
@@ -281,11 +308,7 @@ fn npm_allow_remote_preamble(hosts: &[&str]) -> String {
 
 /// The auto-config variant: `allow-remote=all` was (or, on `--dry-run`,
 /// would be) written to the project `.npmrc`, so installs need no flags.
-pub fn npm_allow_remote_configured_detail(
-    hosts: &[&str],
-    created: bool,
-    dry_run: bool,
-) -> String {
+pub fn npm_allow_remote_configured_detail(hosts: &[&str], created: bool, dry_run: bool) -> String {
     let how = match (created, dry_run) {
         (true, false) => "`allow-remote=all` was written to a new",
         (false, false) => "`allow-remote=all` was appended to the existing",

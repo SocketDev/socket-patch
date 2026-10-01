@@ -468,7 +468,11 @@ fn maven_hosted_get_state_attests_without_manifest(
         &[(purl, vlt_hosted_common::legacy_record_from_view(&view))],
     );
     let out = run_vex(&binary(), project, &offline);
-    assert_eq!(out.code, Some(0), "a pre-v5 ledger record serves offline: {out}");
+    assert_eq!(
+        out.code,
+        Some(0),
+        "a pre-v5 ledger record serves offline: {out}"
+    );
     assert_attested(out.doc(), purl, uuid, Marker::Redirected, &vulns);
     quiet.assert_no_requests();
 
@@ -749,7 +753,11 @@ fn nuget_hosted_manifestless_vex(root: &Path, uuid: &str, purl: &str) {
         &[(purl, vlt_hosted_common::legacy_record_from_view(&view))],
     );
     let out = run(VexRun::offline());
-    assert_eq!(out.code, Some(0), "a pre-v5 ledger record serves offline: {out}");
+    assert_eq!(
+        out.code,
+        Some(0),
+        "a pre-v5 ledger record serves offline: {out}"
+    );
     assert_attested(out.doc(), purl, uuid, Marker::Redirected, vulns);
 
     std::fs::write(
