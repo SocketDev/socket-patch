@@ -309,6 +309,32 @@ fn path_below(importer: &Path, store: &Path) -> Option<PathBuf> {
     (plain && !below.as_os_str().is_empty()).then(|| below.to_path_buf())
 }
 
+/// [`path_below`] for a recorded `virtualStoreDir`, which old pnpm writes
+/// as an absolute path. A relative importer (the default `--cwd .` makes
+/// it the empty path) is never a lexical prefix of an absolute store, and
+/// an absolute one may be spelled through a link (macOS `/var` →
+/// `/private/var`), so an absolute store is also compared with both sides
+/// canonicalized. A store that resolves outside the importer, such as
+/// pnpm's global virtual store or a link planted at the recorded path,
+/// still gets `None`.
+fn store_below_importer(importer: &Path, store: &Path) -> Option<PathBuf> {
+    if let Some(below) = path_below(importer, store) {
+        return Some(below);
+    }
+    if !store.is_absolute() {
+        return None;
+    }
+    let importer = if importer.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        importer
+    };
+    path_below(
+        &std::fs::canonicalize(importer).ok()?,
+        &std::fs::canonicalize(store).ok()?,
+    )
+}
+
 /// A pnpm virtual store that `node_modules/.modules.yaml` relocates away
 /// from the default `node_modules/.pnpm` (pnpm's `virtualStoreDir`
 /// setting, stored relative to `node_modules`, or absolute on old pnpm).
@@ -327,7 +353,7 @@ fn relocated_pnpm_virtual_store_sync(nm: &Path) -> Option<PathBuf> {
     if store == normalize_lexically(&nm.join(".pnpm")) || store == normalize_lexically(nm) {
         return None;
     }
-    let below = path_below(&importer, &store)?;
+    let below = store_below_importer(&importer, &store)?;
     let mut dir = importer;
     for component in below.components() {
         dir.push(component);
@@ -4047,5 +4073,64 @@ mod tests {
             .await
             .unwrap();
         assert!(found.is_empty(), "{found:?}");
+
+        // The same link recorded as an absolute path, the form old pnpm
+        // writes, is still refused.
+        let abs = format!("{}", root.join(".vstore").display()).replace('\\', "\\\\");
+        std::fs::write(
+            nm.join(".modules.yaml"),
+            format!("{{\"virtualStoreDir\": \"{abs}\"}}"),
+        )
+        .unwrap();
+        assert!(scan_paths(&root).await.is_empty());
+    }
+
+    /// Old pnpm records `virtualStoreDir` as an absolute path. A store
+    /// inside the project must still be walked when the project is
+    /// reached through a different spelling than the recorded one (a
+    /// linked ancestor, like macOS's `/var` → `/private/var`), which no
+    /// lexical prefix check can match.
+    #[tokio::test]
+    async fn test_absolute_in_project_store_is_walked_through_any_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real: PathBuf = std::fs::canonicalize(tmp.path())
+            .unwrap()
+            .join("real")
+            .components()
+            .collect();
+        let store = real.join(".vstore");
+        write_pkg(
+            &store.join("is-number@6.0.0/node_modules/is-number"),
+            "is-number",
+            "6.0.0",
+        );
+        let nm = real.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        let abs = format!("{}", store.display()).replace('\\', "\\\\");
+        std::fs::write(
+            nm.join(".modules.yaml"),
+            format!("{{\"virtualStoreDir\": \"{abs}\"}}"),
+        )
+        .unwrap();
+
+        // Recorded and walked spellings agree.
+        let scanned = scan_paths(&real).await;
+        assert_eq!(scanned.len(), 1, "{scanned:?}");
+
+        // Walked through a linked ancestor: the recorded absolute path is
+        // no lexical prefix match, but both resolve to the same store.
+        let alias = tmp.path().join("alias");
+        link_dir(&real, &alias);
+        let scanned = scan_paths(&alias).await;
+        assert_eq!(scanned.len(), 1, "{scanned:?}");
+        assert!(scanned[0].1.starts_with(&alias), "{scanned:?}");
+        let found = NpmCrawler::new()
+            .find_by_purls(
+                &alias.join("node_modules"),
+                &["pkg:npm/is-number@6.0.0".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
     }
 }

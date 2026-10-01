@@ -6,7 +6,8 @@
 //! recorded store (pnpm's global virtual store, `<store-dir>/v10/links`,
 //! shared by every project on the machine) then passed the in-project
 //! check and was crawled, so `apply` would patch the other projects too
-//! (#361). A store inside the project is still walked from the same cwd.
+//! (#361). A store inside the project is still walked from the same cwd,
+//! whether it is recorded relative or absolute.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -131,4 +132,21 @@ async fn default_cwd_scan_walks_a_store_inside_the_project() {
     let proj = stage(tmp.path(), "../.vstore", &store, "inproj-dep");
     let bodies = scan_bodies(&proj).await;
     assert!(bodies.contains("pkg:npm/inproj-dep@1.0.0"), "{bodies}");
+}
+
+/// Old pnpm records `virtualStoreDir` as an absolute path. From the
+/// default cwd the importer is the empty path, which is no lexical prefix
+/// of an absolute store, but a store inside the project is still walked.
+#[tokio::test]
+async fn default_cwd_scan_walks_an_absolute_store_inside_the_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("proj/.vstore");
+    let proj = stage(
+        tmp.path(),
+        &store.display().to_string(),
+        &store,
+        "absolute-dep",
+    );
+    let bodies = scan_bodies(&proj).await;
+    assert!(bodies.contains("pkg:npm/absolute-dep@1.0.0"), "{bodies}");
 }
