@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Gradle bug-hunt routine (label pm:gradle).
 
-Last updated: 2026-10-01 (run 3), main `2463257` (#277, v5: Gradle 6.8+ vendoring backend), latest release v4.0.0.
+Last updated: 2026-10-01 (run 4), main `2463257` (#277, v5: Gradle 6.8+ vendoring backend), latest release v4.0.0.
 
 ## Coverage matrix
 
@@ -15,16 +15,16 @@ Last updated: 2026-10-01 (run 3), main `2463257` (#277, v5: Gradle 6.8+ vendorin
 | macOS | 6.9.4 / 7.6.6 / 8.14.3 / 9.8.0 | untested (OS-independent) | untested | pass (probe) | untested | untested | fail #396 | untested | untested |
 | Windows | 6.9.4 / 7.6.6 / 8.14.3 / 9.8.0 | untested (OS-independent) | untested | pass (probe) | untested | untested | fail #396 | untested | untested |
 
-**Vendored (v5 Gradle backend, new in `2463257`).** "Shapes" means: Groovy project repos, no settings file, Kotlin DSL, CRLF settings, allprojects, buildSrc, transitive-only. Probes: runs 36821273765 and 36821988108.
+**Vendored (v5 Gradle backend, new in `2463257`).** "Shapes" means: Groovy project repos, no settings file, Kotlin DSL, CRLF settings, allprojects, buildSrc, transitive-only. Probes: runs 36821273765 and 36821988108. Run 4 used Linux only.
 
-| OS | Gradle (JDK) | Shapes → patched fresh-checkout build | Lock STRICT + verification-metadata | Config cache + tamper | Revert / remove / rollback (LF checkout) | `vendor --check` on a git checkout | Vendor from a subproject | Mixed pom + gradle |
-|---|---|---|---|---|---|---|---|---|
-| Linux | 6.9.4 (11) | pass (probe) | untested (repo CI capstone) | untested | pass (probe) | pass | untested (path-only, expect #428) | fail #395 |
-| Linux | 7.6.6 (17) | pass (probe) | untested (repo CI capstone) | untested | pass (probe) | pass | untested | fail #395 |
-| Linux | 8.14.3 (21) | pass | pass | pass | pass | pass; autocrlf=true clone fails #429 | fail #428 | fail #395 |
-| Linux | 9.8.0 (21) | pass (local + probe) | pass | pass | pass | pass | fail #428 | fail #395 |
-| macOS | 6.9.4 / 7.6.6 / 9.8.0 | pass (probe) | untested | untested | pass (probe) | pass | untested | untested |
-| Windows | 6.9.4 / 7.6.6 / 9.8.0 | pass (probe: s1, s9, s12, s14) | untested | untested | fail #429 (script left behind) | **fail #429** | untested | untested |
+| OS | Gradle (JDK) | Shapes → patched fresh-checkout build | Lock STRICT + verification-metadata | Config cache + tamper | Revert / remove / rollback (LF checkout) | `vendor --check` on a git checkout | Vendor from a subproject | Mixed pom + gradle | Two patches, drop one | User exclusiveContent in a subproject / buildSrc (incl. pasted hosted snippet) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Linux | 6.9.4 (11) | pass (probe) | untested (repo CI capstone) | untested | pass (probe) | pass | untested (path-only, expect #428) | fail #395 | untested | untested |
+| Linux | 7.6.6 (17) | pass (probe) | untested (repo CI capstone) | untested | pass (probe) | pass | untested | fail #395 | untested | untested |
+| Linux | 8.14.3 (21) | pass | pass | pass | pass | pass; autocrlf=true clone fails #429 | fail #428 | fail #395 | pass | fail #461 |
+| Linux | 9.8.0 (21) | pass (local + probe) | pass | pass | pass | pass | fail #428 | fail #395 | untested | fail #461 |
+| macOS | 6.9.4 / 7.6.6 / 9.8.0 | pass (probe) | untested | untested | pass (probe) | pass | untested | untested | untested | untested (static planner) |
+| Windows | 6.9.4 / 7.6.6 / 9.8.0 | pass (probe: s1, s9, s12, s14) | untested | untested | fail #429 (script left behind) | **fail #429** | untested | untested | untested | untested (static planner) |
 
 **Global (`-g`), Linux, 8.14.3 cache.**
 - `scan -g` report: fail. No Gradle-cached purls (#349 comment).
@@ -34,11 +34,11 @@ Last updated: 2026-10-01 (run 3), main `2463257` (#277, v5: Gradle 6.8+ vendorin
 
 ## Backlog
 1. **Maintainer request (partly done):** global `-g` mode. Linux report and refusal are covered. Still to do: macOS / Windows, and apply / rollback / vex through `--global-prefix …/modules-2/files-2.1` if that's meant to be supported (see the 20261001T040000Z entry).
-2. Two vendored Gradle patches: revert one, keep the other.
-3. Hosted snippet (suffixed version) pasted, then `vendor` (hosted → vendored takeover).
-4. `pluginManagement { includeBuild("build-logic") }` convention plugins, Kotlin settings.
+2. Kotlin `settings.gradle.kts` + `pluginManagement { includeBuild("build-logic") }` convention plugins: is `build-logic` wired, and are its repositories checked (#461)?
+3. The hosted snippet in its suffixed form, with the dependency bumped, followed by `vendor`. Check the result and VEX.
+4. `apply from: 'gradle/repos.gradle'` script plugins declaring repositories (a likely #461 sibling).
 5. `dependencyResolutionManagement` FAIL_ON_PROJECT_REPOS with the hosted snippet; multi-project hosted snippet placement.
-6. Re-test #347, #348, #349, #395, #396, #428 and #429 when main moves.
+6. Re-test #347, #348, #349, #395, #396, #428, #429 and #461 when main moves.
 
 ## Known non-bugs
 - The sandbox can't reach the Socket API. For vendored, use `prebuilt_common::prepare_command` + a staged manifest/blob (see the run 3 entry). For hosted, use the wiremock shaped like `e2e_redirect_maven_build`.
@@ -52,3 +52,5 @@ Last updated: 2026-10-01 (run 3), main `2463257` (#277, v5: Gradle 6.8+ vendorin
 - `vex` has no Gradle product auto-detection (pass `--product`, or use the git remote), as documented.
 - Snippet + `verification-metadata.xml` fails loudly, which is fail-closed.
 - The session's git proxy refuses branch deletes, so probe branches need maintainer cleanup.
+- Maven Central (both `repo.maven.apache.org` and `repo1.maven.org`) can 429 Gradle in the sandbox. Point mavenCentral at `file://<seeded m2>` with an init script.
+- Dropping one of two vendored Gradle patches (`remove <purl>`, or a manifest edit + re-vendor) keeps the other wired correctly. Verified in run 4.
