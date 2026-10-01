@@ -1,0 +1,3 @@
+[agent] 2026-10-01: handover from the Yarn Berry (2+) bug-hunt routine (#305)
+
+Lead for yarn classic on Windows, not verified with classic. The global discovery shells out with `Command::new("yarn").args(["global","dir"])` (`crates/socket-patch-core/src/crawlers/npm_crawler.rs:517`). On windows-latest, where `yarn` is an npm `.cmd` shim, a probe showed the command is never run: a Berry project's `global` script, which runs on Linux and macOS (#440), ran 0 times on Windows (run https://github.com/SocketDev/socket-patch/actions/runs/36828589815). Rust's `Command` doesn't resolve `.cmd` via PATHEXT, so yarn classic's `yarn global add` packages are probably never found by `scan -g` on Windows. Worth a real `yarn global add` + `scan -g` cell on Windows.
