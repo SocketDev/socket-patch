@@ -1,0 +1,75 @@
+name: bughunt-deno
+on:
+  push:
+    branches: ['bughunt/deno/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        deno: ['2.8.3', '2.9.7']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: false
+      - run: cargo build -p socket-patch-cli
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: ${{ matrix.deno }}
+      - name: probe
+        env:
+          DV: ${{ matrix.deno }}
+        run: |
+          set +e +o pipefail; set -u
+          SP="$GITHUB_WORKSPACE/target/debug/socket-patch"; [ -f "$SP.exe" ] && SP="$SP.exe"
+          if [ "$RUNNER_OS" = Windows ]; then PY=python; else PY=python3; fi
+          res() { echo "RESULT ${{ matrix.os }} deno=$DV $1"; }
+          W="$RUNNER_TEMP/w"; mkdir -p "$W"
+          cat > "$W/mf.py" <<'PY'
+          import sys,hashlib,json,os
+          h=lambda x: hashlib.sha256(b"blob %d\0"%len(x)+x).hexdigest()
+          os.makedirs('.socket/blobs',exist_ok=True); m={"patches":{}}
+          for i,arg in enumerate(sys.argv[1:]):
+              d,purl=arg.split('=',1); b=open(d+'/index.js','rb').read()
+              name=purl.split('/')[-1].split('@')[0]
+              a=b'globalThis.__SP=(globalThis.__SP||[]).concat(["%s"]);\n'%name.encode()+b
+              open('.socket/blobs/'+h(a),'wb').write(a); open('.socket/blobs/'+h(b),'wb').write(b)
+              m["patches"][purl]={"uuid":"7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8%d"%i,"exportedAt":"2026-01-01T00:00:00Z","files":{"package/index.js":{"beforeHash":h(b),"afterHash":h(a)}},"vulnerabilities":{"GHSA-aaaa-bbbb-ccc%d"%i:{"cves":["CVE-2099-000%d"%i],"summary":"s","severity":"high","description":"d"}},"description":"t","license":"MIT","tier":"free"}
+          json.dump(m,open('.socket/manifest.json','w'),indent=2)
+          PY
+          ev() { $PY -c "import json,sys;d=json.load(sys.stdin);print(d.get('status'),[(e.get('action'),e.get('purl'),e.get('errorCode')) for e in d.get('events',[])])" 2>&1; }
+          P="$W/p"; mkdir -p "$P"; cd "$P"; git init -q .
+          export DENO_DIR="$W/dd"
+          echo '{"name":"m","version":"1.0.0","dependencies":{"is-odd":"3.0.1","is-number":"7.0.0"}}' > package.json
+          echo '{"nodeModulesDir":"manual","nodeModulesLinker":"hoisted"}' > deno.json
+          echo 'import isOdd from "is-odd"; isOdd(3); console.log("loaded="+JSON.stringify((globalThis as any).__SP||[]));' > probe.ts
+          deno install 2>&1 | tail -3
+          find node_modules -name package.json -not -path '*/.deno/*' | xargs grep -H '"version"'
+          N=node_modules/is-odd/node_modules/is-number
+          [ -f "$N/index.js" ] && res "layout nested-is-number@6 present" || res "layout NO-nested"
+          CA="$DENO_DIR/npm/registry.npmjs.org/is-odd/3.0.1/index.js"; CB="$DENO_DIR/npm/registry.npmjs.org/is-number/6.0.0/index.js"
+          ha=$($PY -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$CA"); hb=$($PY -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$CB")
+          $PY "$W/mf.py" node_modules/is-odd=pkg:npm/is-odd@3.0.1 $N=pkg:npm/is-number@6.0.0
+          o=$("$SP" apply --offline --json | ev); echo "$o"; res "apply: $o"
+          r=$(deno run -A probe.ts 2>&1); res "run-after-apply: $r"
+          ha2=$($PY -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$CA"); hb2=$($PY -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$CB")
+          [ "$ha" = "$ha2" ] && [ "$hb" = "$hb2" ] && res "deno-dir-cache untouched" || res "deno-dir-cache MODIFIED"
+          o=$("$SP" apply --offline --json | ev); res "reapply: $o"
+          o=$("$SP" vex --offline --json -O v.json --product pkg:generic/t | ev); res "vex: $o"
+          o=$("$SP" rollback --offline --json | $PY -c "import json,sys;d=json.load(sys.stdin);print(d.get('status'),d.get('rolledBack'),d.get('failed'))"); res "rollback: $o"
+          r=$(deno run -A probe.ts 2>&1); res "run-after-rollback: $r"
+          # second project sharing the same DENO_DIR must stay unpatched
+          Q="$W/q"; mkdir -p "$Q"; cd "$Q"; cp "$P/package.json" "$P/deno.json" "$P/probe.ts" .; deno install >/dev/null 2>&1; r=$(deno run -A probe.ts 2>&1); res "sibling-project: $r"
+          exit 0
