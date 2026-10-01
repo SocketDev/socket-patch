@@ -1,0 +1,364 @@
+name: bughunt uv probe
+on:
+  push:
+    branches: ["bughunt/uv/**"]
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build CLI
+        run: cargo build --release -p socket-patch-cli
+      - name: Write probe files
+        run: |
+          mkdir -p "$RUNNER_TEMP/mock" "$RUNNER_TEMP/work"
+          cat > "$RUNNER_TEMP/mock/mock.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """Local mock of the Socket patch API serving one patched pypi package (six 1.16.0)."""
+          import base64, hashlib, io, json, os, re, sys, zipfile
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          HERE = os.path.dirname(os.path.abspath(__file__))
+          PORT = int(os.environ.get("MOCK_PORT", "18080"))
+          ORG = "test-org"
+          UUID = "0f6e7c1a-1111-4222-8333-444455556666"
+          TOKEN = "11111111-2222-4333-8444-555555555555"
+          SUFFIX = b"\n# SOCKET-PATCHED\nSOCKET_PATCHED = 1\n"
+          NAME, VER = "six", "1.16.0"
+          PURL = f"pkg:pypi/{NAME}@{VER}"
+          LEAF = f"{NAME}-{VER}-py2.py3-none-any.whl"
+          LOG = os.path.join(HERE, "requests.log")
+
+
+          def git_sha256(b):
+              return hashlib.sha256(b"blob %d\0" % len(b) + b).hexdigest()
+
+
+          def build():
+              src = zipfile.ZipFile(os.path.join(HERE, LEAF))
+              members = []
+              dist = f"{NAME}-{VER}.dist-info"
+              for info in src.infolist():
+                  if info.filename == f"{dist}/RECORD":
+                      continue
+                  data = src.read(info.filename)
+                  if info.filename == "six.py":
+                      orig = data
+                      data = data + SUFFIX
+                  members.append((info.filename, data))
+              rec = ""
+              for n, d in members:
+                  dig = base64.urlsafe_b64encode(hashlib.sha256(d).digest()).rstrip(b"=").decode()
+                  rec += f"{n},sha256={dig},{len(d)}\n"
+              rec += f"{dist}/RECORD,,\n"
+              members.append((f"{dist}/RECORD", rec.encode()))
+              buf = io.BytesIO()
+              with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                  for n, d in members:
+                      zi = zipfile.ZipInfo(n, date_time=(2020, 1, 1, 0, 0, 0)); zi.compress_type = zipfile.ZIP_DEFLATED
+                      z.writestr(zi, d)
+              return orig, orig + SUFFIX, buf.getvalue()
+
+
+          ORIG, PATCHED, WHEEL = build()
+          SHA = hashlib.sha256(WHEEL).hexdigest()
+          BASE = f"http://127.0.0.1:{PORT}"
+          ART_PATH = f"/patch/pypi/{NAME}/{VER}/{TOKEN}/{UUID}/{LEAF}"
+          ART = BASE + ART_PATH
+          VIEW = {
+              "uuid": UUID, "purl": PURL, "publishedAt": "Fri, 27 Mar 2026 00:00:00 GMT",
+              "files": {"six.py": {"beforeHash": git_sha256(ORIG), "afterHash": git_sha256(PATCHED),
+                                   "blobContent": base64.b64encode(PATCHED).decode()}},
+              "vulnerabilities": {"GHSA-uvbu-ildv-ex01": {"cves": ["CVE-2026-7101"], "summary": "s",
+                                                          "severity": "high", "description": "d"}},
+              "description": "uv bughunt patch", "license": "MIT", "tier": "free",
+          }
+
+
+          class H(BaseHTTPRequestHandler):
+              def log_message(self, *a):
+                  pass
+
+              def send(self, code, body, ctype="application/json"):
+                  if not isinstance(body, bytes):
+                      body = json.dumps(body).encode()
+                  self.send_response(code)
+                  self.send_header("Content-Type", ctype)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def route(self):
+                  with open(LOG, "a") as f:
+                      f.write(f"{self.command} {self.path}\n")
+                  p = self.path.split("?")[0]
+                  n = int(self.headers.get("Content-Length") or 0)
+                  body = self.rfile.read(n) if n else b""
+                  if p == ART_PATH:
+                      if self.command == "HEAD":
+                          self.send_response(200); self.send_header("Content-Length", str(len(WHEEL))); self.end_headers(); return
+                      return self.send(200, WHEEL, "application/octet-stream")
+                  if re.fullmatch(rf"/v0/orgs/{ORG}/patches/batch", p) or p.endswith("/patch/batch"):
+                      try:
+                          comps = json.loads(body or b"{}").get("components", [])
+                      except Exception:
+                          comps = []
+                      purls = [c.get("purl", "") for c in comps] if comps else [PURL]
+                      if not any(pu.lower().startswith(f"pkg:pypi/{NAME}@{VER}") for pu in purls):
+                          return self.send(200, {"packages": [], "canAccessPaidPatches": False})
+                      return self.send(200, {"packages": [{"purl": PURL, "patches": [{
+                          "uuid": UUID, "purl": PURL, "tier": "free", "cveIds": ["CVE-2026-7101"],
+                          "ghsaIds": ["GHSA-uvbu-ildv-ex01"], "severity": "HIGH", "title": "uv bughunt"}]}],
+                          "canAccessPaidPatches": False})
+                  if "/patches/by-package/" in p or "/patch/by-package/" in p:
+                      return self.send(200, {"patches": [{"uuid": UUID, "purl": PURL,
+                          "publishedAt": "2026-09-01T00:00:00Z", "description": "uv bughunt",
+                          "license": "MIT", "tier": "free", "vulnerabilities": {}}],
+                          "canAccessPaidPatches": False})
+                  if p.endswith("/patches/package") or p.endswith("/patch/package"):
+                      return self.send(200, {"results": {UUID: {"status": "granted", "url": ART, "purl": PURL,
+                          "artifacts": [{"kind": "tarball", "url": ART, "integrity": {"sha256": SHA, "sha512": "sha512-" + base64.b64encode(hashlib.sha512(WHEEL).digest()).decode()}}],
+                          "registryOverride": None}}})
+                  if p.endswith(f"/view/{UUID}"):
+                      return self.send(200, VIEW)
+                  if "/blob/" in p:
+                      h = p.rsplit("/", 1)[1]
+                      if h == git_sha256(PATCHED):
+                          return self.send(200, PATCHED, "application/octet-stream")
+                      if h == git_sha256(ORIG):
+                          return self.send(200, ORIG, "application/octet-stream")
+                  return self.send(404, {"error": "not found", "path": p})
+
+              do_GET = route
+              do_POST = route
+              do_HEAD = route
+
+
+          if __name__ == "__main__":
+              print(json.dumps({"art": ART, "sha": SHA, "patched_py_sha": hashlib.sha256(PATCHED).hexdigest(),
+                                "orig_py_sha": hashlib.sha256(ORIG).hexdigest()}), flush=True)
+              ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+          PYEOF
+          cat > "$RUNNER_TEMP/driver_rb.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """uv hosted rollback-after-edit probe. usage: driver.py SOCKET_PATCH UV WORKDIR"""
+          import json, os, shutil, subprocess, sys
+
+          SP, UV, WORK = sys.argv[1], sys.argv[2], sys.argv[3]
+          API = ["--api-url", "http://127.0.0.1:18080", "--api-token", "fake-token", "--org", "test-org", "--patch-server-url", "http://127.0.0.1:18080"]
+          ENV = dict(os.environ, SOCKET_TELEMETRY_DISABLED="1", SOCKET_NO_CONFIG="1")
+          PYPROJECT = '[project]\nname = "uvp"\nversion = "0.1.0"\nrequires-python = ">=3.9"\ndependencies = ["six==1.16.0", "idna==3.7"]\n'
+
+
+          def run(cmd, cwd):
+              return subprocess.run(cmd, cwd=cwd, env=ENV, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+
+          def sp(args, cwd):
+              p = run([SP] + args + API, cwd)
+              try:
+                  return p.returncode, json.loads(p.stdout)
+              except Exception:
+                  return p.returncode, {"raw": p.stdout[-500:], "stderr": p.stderr[-500:]}
+
+
+          def hosted_refs(d):
+              n = 0
+              for f in os.listdir(d):
+                  if f in ("pyproject.toml", "uv.lock") or f.endswith(".py.lock") or f.endswith(".py"):
+                      with open(os.path.join(d, f), encoding="utf-8") as fh:
+                          n += fh.read().count("127.0.0.1:18080")
+              return n
+
+
+          def case(name, mutate):
+              d = os.path.join(WORK, name)
+              shutil.rmtree(d, ignore_errors=True)
+              os.makedirs(d)
+              with open(os.path.join(d, "pyproject.toml"), "w", newline="\n") as f:
+                  f.write(PYPROJECT)
+              for c in (["lock", "-q"], ["sync", "-q"]):
+                  p = run([UV] + c, d)
+                  if p.returncode:
+                      return {"case": name, "result": "setup-failed", "err": p.stderr[-400:]}
+              rc, s1 = sp(["scan", "--mode", "hosted", "--json", "--yes"], d)
+              red = s1.get("redirect", {}).get("redirected")
+              mutate(d)
+              rc, s2 = sp(["scan", "--mode", "hosted", "--json", "--yes"], d)
+              rc, rb = sp(["rollback", "--json", "--yes"], d)
+              failed = [f.get("error", "")[:400] for f in rb.get("hosted", {}).get("failed", [])]
+              refs = hosted_refs(d)
+              return {"case": name, "scanRedirected": red, "rollbackExit": rc, "rollbackStatus": rb.get("status"),
+                      "hostedFailed": failed, "hostedRefsLeft": refs,
+                      "result": "PASS" if rc == 0 and refs == 0 else "FAIL"}
+
+
+          def none(d):
+              pass
+
+
+          def add_desc(d):
+              p = os.path.join(d, "pyproject.toml")
+              with open(p, encoding="utf-8") as f:
+                  t = f.read()
+              with open(p, "w", newline="\n") as f:
+                  f.write(t.replace('version = "0.1.0"\n', 'version = "0.1.0"\ndescription = "hello"\n', 1))
+
+
+          def uv_add(d):
+              p = run([UV, "add", "-q", "certifi==2024.2.2"], d)
+              if p.returncode:
+                  print("uv add failed:", p.stderr[-300:])
+
+
+          results = [case("control-no-edit", none), case("pyproject-description", add_desc), case("uv-add-idna", uv_add)]
+          out = subprocess.run([UV, "--version"], capture_output=True, text=True).stdout.strip()
+          for r in results:
+              r["uv"] = out
+              print("RESULT " + json.dumps(r))
+          PYEOF
+          cat > "$RUNNER_TEMP/driver_rep.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """uv vendored repair probe (lock-only checkout, committed wheel deleted). usage: driver.py SOCKET_PATCH UV WORKDIR"""
+          import glob, json, os, shutil, subprocess, sys, hashlib
+
+          SP, UV, WORK = sys.argv[1], sys.argv[2], sys.argv[3]
+          API = ["--api-url", "http://127.0.0.1:18080", "--api-token", "fake-token", "--org", "test-org", "--patch-server-url", "http://127.0.0.1:18080"]
+          ENV = dict(os.environ, SOCKET_TELEMETRY_DISABLED="1", SOCKET_NO_CONFIG="1")
+          PYPROJECT = '[project]\nname = "uvp"\nversion = "0.1.0"\nrequires-python = ">=3.9"\ndependencies = ["six==1.16.0"]\n'
+          PATCHED = "c0c1c71ca455"
+
+
+          def run(cmd, cwd, **kw):
+              return subprocess.run(cmd, cwd=cwd, env=kw.get("env", ENV), capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+
+          def sp(args, cwd):
+              p = run([SP] + args + API, cwd)
+              try:
+                  return p.returncode, json.loads(p.stdout)
+              except Exception:
+                  return p.returncode, {"raw": p.stdout[-500:], "stderr": p.stderr[-500:]}
+
+
+          def six_sha(d):
+              hits = glob.glob(os.path.join(d, ".venv", "**", "six.py"), recursive=True)
+              return hashlib.sha256(open(hits[0], "rb").read()).hexdigest()[:12] if hits else None
+
+
+          def install(d, tag, *flags):
+              shutil.rmtree(os.path.join(d, ".venv"), ignore_errors=True)
+              env = dict(ENV, UV_CACHE_DIR=os.path.join(WORK, "cache-" + tag))
+              p = run([UV, "sync"] + list(flags), d, env=env)
+              return {"rc": p.returncode, "six": six_sha(d), "err": p.stderr[-300:] if p.returncode else ""}
+
+
+          def git(d, *a):
+              return run(["git"] + list(a), d)
+
+
+          shutil.rmtree(WORK, ignore_errors=True)
+          proj = os.path.join(WORK, "proj")
+          os.makedirs(proj)
+          with open(os.path.join(proj, "pyproject.toml"), "w", newline="\n") as f:
+              f.write(PYPROJECT)
+          with open(os.path.join(proj, ".gitignore"), "w", newline="\n") as f:
+              f.write(".venv\n")
+          r = {}
+          for c in (["lock", "-q"], ["sync", "-q"]):
+              run([UV] + c, proj)
+          rc, s = sp(["scan", "--mode", "vendored", "--json", "--yes"], proj)
+          r["vendorScan"] = [rc, s.get("vendor", {}).get("summary", {}).get("applied")]
+          git(proj, "init", "-q", ".")
+          git(proj, "add", "-A")
+          git(proj, "commit", "-qm", "vendored")
+          r["committed"] = git(proj, "ls-files", ".socket").stdout.split()
+          def repair_case(tag, with_venv):
+              clone = os.path.join(WORK, "clone-" + tag)
+              git(WORK, "clone", "-q", proj, clone)
+              c = {}
+              if with_venv:
+                  c["preInstall"] = install(clone, tag + "0", "--locked")
+              wheels = glob.glob(os.path.join(clone, ".socket", "vendor", "pypi", "*", "*.whl"))
+              for w in wheels:
+                  os.remove(w)
+              rc, rep = sp(["repair", "--json"], clone)
+              c["repair"] = {"rc": rc, "status": rep.get("status"),
+                             "events": [(e.get("action"), e.get("errorCode"), (e.get("error") or "")[:260]) for e in rep.get("events", [])]}
+              c["wheelBack"] = bool(glob.glob(os.path.join(clone, ".socket", "vendor", "pypi", "*", "*.whl")))
+              c["afterRepairLocked"] = install(clone, tag + "1", "--locked")
+              c["gitStatus"] = git(clone, "status", "--short").stdout.strip().splitlines()
+              ok = rc == 0 and c["wheelBack"] and c["afterRepairLocked"]["six"] == PATCHED and c["afterRepairLocked"]["rc"] == 0
+              c["result"] = "PASS" if ok else "FAIL"
+              return c
+
+
+          r["lockOnly"] = repair_case("lockonly", False)
+          r["withPatchedVenv"] = repair_case("venv", True)
+          r["uv"] = subprocess.run([UV, "--version"], capture_output=True, text=True).stdout.strip()
+          print("RESULT " + json.dumps(r))
+          PYEOF
+          cat > "$RUNNER_TEMP/driver_ovr.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """uv hosted rollback/remove vs a user-authored override-dependencies pin. usage: driver_ovr.py SP UV WORK"""
+          import json, os, re, shutil, subprocess, sys
+          SP, UV, WORK = sys.argv[1], sys.argv[2], sys.argv[3]
+          API = ["--api-url", "http://127.0.0.1:18080", "--api-token", "fake-token", "--org", "test-org", "--patch-server-url", "http://127.0.0.1:18080"]
+          ENV = dict(os.environ, SOCKET_TELEMETRY_DISABLED="1", SOCKET_NO_CONFIG="1")
+          PP = '[project]\nname = "uvp"\nversion = "0.1.0"\nrequires-python = ">=3.9"\ndependencies = ["python-dateutil==2.8.2"]\n\n[tool.uv]\noverride-dependencies = ["six==1.16.0"]\n'
+          def run(cmd, cwd):
+              return subprocess.run(cmd, cwd=cwd, env=ENV, capture_output=True, text=True, encoding="utf-8", errors="replace")
+          def six_locked(d):
+              t = open(os.path.join(d, "uv.lock"), encoding="utf-8").read()
+              m = re.search(r'name = "six"\nversion = "([^"]+)"', t)
+              return m.group(1) if m else None
+          for cmd in (["rollback", "--json", "--yes"], ["remove", "pkg:pypi/six@1.16.0", "--json", "--yes"], None):
+              name = cmd[0] if cmd else "control-no-socket-patch"
+              d = os.path.join(WORK, name); shutil.rmtree(d, ignore_errors=True); os.makedirs(d)
+              with open(os.path.join(d, "pyproject.toml"), "w", newline="\n") as f: f.write(PP)
+              run([UV, "lock", "-q"], d)
+              r = {"case": name}
+              if cmd:
+                  p = run([SP, "scan", "--mode", "hosted", "--json", "--yes"] + API, d)
+                  r["scanRc"] = p.returncode
+                  p = run([SP] + cmd + API, d)
+                  r["undoRc"] = p.returncode
+                  try: r["warnings"] = [w.get("code") for w in json.loads(p.stdout).get("warnings", [])]
+                  except Exception: r["undoOut"] = p.stdout[-300:]
+              r["userOverrideKept"] = "override-dependencies" in open(os.path.join(d, "pyproject.toml"), encoding="utf-8").read()
+              run([UV, "lock", "-q", "--upgrade"], d)
+              r["sixAfterUpgrade"] = six_locked(d)
+              r["uv"] = run([UV, "--version"], d).stdout.strip()
+              r["result"] = "PASS" if r["userOverrideKept"] and r["sixAfterUpgrade"] == "1.16.0" else "FAIL"
+              print("RESULT " + json.dumps(r), flush=True)
+          PYEOF
+          python -m pip download --no-deps six==1.16.0 -d "$RUNNER_TEMP/mock"
+      - name: Run probe
+        run: |
+          python "$RUNNER_TEMP/mock/mock.py" > "$RUNNER_TEMP/mock.out" 2>&1 &
+          sleep 3; cat "$RUNNER_TEMP/mock.out"
+          SP="$PWD/target/release/socket-patch"; [ -f "$SP.exe" ] && SP="$SP.exe"
+          git config --global user.email probe@example.com; git config --global user.name probe
+          for v in 0.2.37 0.5.31 0.12.21; do
+            python -m venv "$RUNNER_TEMP/uv-$v"
+            if [ -d "$RUNNER_TEMP/uv-$v/Scripts" ]; then B="$RUNNER_TEMP/uv-$v/Scripts"; else B="$RUNNER_TEMP/uv-$v/bin"; fi
+            "$B/python" -m pip install -q "uv==$v"
+            UVB="$B/uv"; [ -f "$UVB.exe" ] && UVB="$UVB.exe"
+            echo "::group::uv $v rollback-after-edit (#379)"; python "$RUNNER_TEMP/driver_rb.py" "$SP" "$UVB" "$RUNNER_TEMP/work/rb-$v" || true; echo "::endgroup::"
+            echo "::group::uv $v vendored repair (#381)"; python "$RUNNER_TEMP/driver_rep.py" "$SP" "$UVB" "$RUNNER_TEMP/work/rep-$v" || true; echo "::endgroup::"
+            echo "::group::uv $v user override"; python "$RUNNER_TEMP/driver_ovr.py" "$SP" "$UVB" "$RUNNER_TEMP/work/ovr-$v" || true; echo "::endgroup::"
+          done
