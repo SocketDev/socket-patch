@@ -1,0 +1,100 @@
+name: bughunt vlt probe
+on:
+  push:
+    branches: ['bughunt/vlt/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.21.0
+      - name: Build CLI
+        run: cargo build --release -p socket-patch-cli
+      - name: Write probe
+        run: |
+          mkdir -p probe
+          cat > probe/mock.mjs <<'MOCKEOF'
+          import http from 'node:http';
+          import zlib from 'node:zlib';
+          import crypto from 'node:crypto';
+          import fs from 'node:fs';
+          const PORT = +process.env.PORT || 18555;
+          const R = `http://127.0.0.1:${PORT}`;
+          const NAME='left-pad', VER='1.3.0', UUID='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', TOKEN='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', ORG='test-org';
+          const PURL=`pkg:npm/${NAME}@${VER}`;
+          const ALT = process.env.NO_ALT ? false : true;
+          function hdr(name,size){const b=Buffer.alloc(512);b.write(name,0);b.write('0000644\0',100);b.write('0000000\0',108);b.write('0000000\0',116);b.write(size.toString(8).padStart(11,'0')+'\0',124);b.write('00000000000\0',136);b.write('        ',148);b.write('0',156);b.write('ustar\0',257);b.write('00',263);let c=0;for(const x of b)c+=x;b.write(c.toString(8).padStart(6,'0')+'\0 ',148);return b;}
+          function tarFiles(files){const parts=[];for(const [n,d] of files){const buf=Buffer.from(d);parts.push(hdr(n,buf.length),buf,Buffer.alloc((512-buf.length%512)%512));}parts.push(Buffer.alloc(1024));return Buffer.concat(parts);}
+          function tarOf(content){return tarFiles([['package/package.json',JSON.stringify({name:NAME,version:VER,main:'index.js'})+'\n'],['package/index.js',content]]);}
+          const sri = b => 'sha512-'+crypto.createHash('sha512').update(b).digest('base64');
+          const git = b => crypto.createHash('sha256').update(Buffer.concat([Buffer.from(`blob ${b.length}\0`), b])).digest('hex');
+          const PRIST = Buffer.from("module.exports = 'pristine'\n"), PATCH = Buffer.from("module.exports = 'patched'\n");
+          const tgz = zlib.gzipSync(tarOf(PRIST)), br = zlib.brotliCompressSync(tarOf(PRIST)), ptgz = zlib.gzipSync(tarOf(PATCH));
+          function wrapTar(){return zlib.gzipSync(tarFiles([['package/package.json',JSON.stringify({name:'wrapper',version:'1.0.0',main:'index.js',dependencies:{'left-pad':'1.3.0'}})+'\n'],['package/index.js',"module.exports = require('left-pad')\n"]]));}
+          const wtgz = wrapTar();
+          const artPath = `/patch/npm/${NAME}/${VER}/${TOKEN}/${UUID}/${NAME}-${VER}.tgz`;
+          const log = [];
+          http.createServer((req,res)=>{
+            let body=''; req.on('data',c=>body+=c); req.on('end',()=>{
+            const u = req.url.split('?')[0]; log.push(req.method+' '+u); 
+            const j = o => { res.writeHead(200,{'content-type':'application/json'}); res.end(JSON.stringify(o)); };
+            const b = x => { res.writeHead(200,{'content-type':'application/octet-stream'}); res.end(x); };
+            if (u===`/${NAME}`) {
+              const dist = {tarball:`${R}/${NAME}/-/${NAME}-${VER}.tgz`, integrity: sri(tgz)};
+              if (ALT) dist.alternates=[{kind:'tar.br', tarball:`${R}/${NAME}/-/${NAME}-${VER}.tar.br`, integrity: sri(br)}];
+              return j({name:NAME, 'dist-tags':{latest:VER}, versions:{[VER]:{name:NAME,version:VER,main:'index.js',dist}}});
+            }
+            if (u===`/${NAME}/${VER}`) { const dist = {tarball:`${R}/${NAME}/-/${NAME}-${VER}.tgz`, integrity: sri(tgz)}; return j({name:NAME,version:VER,main:'index.js',dist}); }
+            if (u==='/wrapper/1.0.0') return j({name:'wrapper',version:'1.0.0',dist:{tarball:`${R}/wrapper/-/wrapper-1.0.0.tgz`,integrity:sri(wtgz)}});
+            if (u==='/wrapper') return j({name:'wrapper','dist-tags':{latest:'1.0.0'},versions:{'1.0.0':{name:'wrapper',version:'1.0.0',main:'index.js',dependencies:{'left-pad':'1.3.0'},dist:{tarball:`${R}/wrapper/-/wrapper-1.0.0.tgz`,integrity:sri(wtgz)}}}});
+            if (u==='/wrapper/-/wrapper-1.0.0.tgz') return b(wtgz);
+            if (u===`/${NAME}/-/${NAME}-${VER}.tgz`) return b(tgz);
+            if (u===`/${NAME}/-/${NAME}-${VER}.tar.br`) return b(br);
+            if (u===artPath) return b(ptgz);
+            if (u.startsWith(`/v0/orgs/${ORG}/patches/blob/`)) { const h=u.split('/').pop(); for (const x of [PRIST,PATCH]) if (git(x)===h) return b(x); }
+            if (u===`/v0/orgs/${ORG}/patches/batch`) { if (!body.includes(PURL)) return j({packages:[],canAccessPaidPatches:false}); return j({packages:[{purl:PURL,patches:[{uuid:UUID,purl:PURL,tier:'free',cveIds:[],ghsaIds:[],severity:'high',title:'fx'}]}],canAccessPaidPatches:false}); }
+            if (u.startsWith(`/v0/orgs/${ORG}/patches/by-package/`)) return j({patches:[{uuid:UUID,purl:PURL,publishedAt:'2024-01-01T00:00:00Z',description:'x',license:'MIT',tier:'free',vulnerabilities:{}}],canAccessPaidPatches:false});
+            if (u===`/v0/orgs/${ORG}/patches/package`) return j({results:{[UUID]:{status:'granted',url:R+artPath,purl:PURL,artifacts:[{kind:'tarball',url:R+artPath,integrity:{sha512:sri(ptgz)}}],registryOverride:null}}});
+            if (u===`/v0/orgs/${ORG}/patches/view/${UUID}`) return j({uuid:UUID,purl:PURL,publishedAt:'2024-01-01T00:00:00Z',files:{'package/index.js':{beforeHash:git(PRIST),afterHash:git(PATCH),blobContent:PATCH.toString('base64'),beforeBlobContent:PRIST.toString('base64')}},vulnerabilities:{'GHSA-vlth-aaaa-bbbb':{cves:['CVE-2026-4242'],summary:'s',severity:'high',description:'d'}},description:'x',license:'MIT',tier:'free'});
+            res.writeHead(404); res.end('nf');
+            });
+          }).listen(PORT, '127.0.0.1', ()=>console.log('listening', PORT));
+
+          MOCKEOF
+          cat > probe/ro.sh <<'PROBEEOF'
+          #!/usr/bin/env bash
+          set -u
+          SP=$1; MOCK=$2
+          export LANG=C SOCKET_NPM_REGISTRY=http://127.0.0.1:18555 SOCKET_API_URL=http://127.0.0.1:18556 SOCKET_PATCH_SERVER_URL=http://127.0.0.1:18556 SOCKET_ORG_SLUG=test-org SOCKET_API_TOKEN=fake
+          NO_ALT=1 PORT=18555 node "$MOCK" & M1=$!; NO_ALT=1 PORT=18556 node "$MOCK" & M2=$!; sleep 2
+          W="$RUNNER_TEMP/ro$RANDOM"; mkdir -p "$W"; cd "$W"
+          export HOME="$W/h" NPM_CONFIG_PREFIX="$W/gprefix" NPM_CONFIG_REGISTRY=http://127.0.0.1:18555/ NPM_CONFIG_CACHE="$W/.c"; mkdir -p "$HOME"
+          npm install -g left-pad@1.3.0 >/dev/null 2>&1; GROOT=$(npm root -g); G="$GROOT/left-pad"; cp "$G/index.js" g.orig
+          sudo chown -R root "$W/gprefix"; sudo chmod -R go-w "$W/gprefix"; ls -la "$G"
+          req() { node -e "console.log(require(process.argv[1]))" "$1"; }
+          for i in 1 2; do
+          for form in "-g" "--global-prefix $GROOT" "env"; do
+            if [ "$form" = env ]; then SOCKET_GLOBAL=1 "$SP" scan --mode agent --yes --json > out.json 2>err.txt; rc=$?; else "$SP" scan $form --mode agent --yes --json > out.json 2>err.txt; rc=$?; fi
+            echo "RO[$i] form=$form rc=$rc status=$(grep -o '"status": "[a-z_]*"' out.json | head -1) global=$(req "$G") bytes=$(cmp -s "$G/index.js" g.orig && echo same || echo differ) errcode=$(grep -o '"errorCode": "[a-zA-Z_]*"\|"code": "[a-z_]*"' out.json | sort -u | tr '\n' ' ')"
+            head -c 600 err.txt | tr '\n' ' '; echo
+            "$SP" get pkg:npm/left-pad@1.3.0 -g --yes --json > g.json 2>/dev/null; echo "RO[$i] get -g rc=$? status=$(grep -o '"status": "[a-zA-Z_]*"' g.json | head -1) global=$(req "$G")"
+            "$SP" rollback -g --yes --json > r.json 2>/dev/null; echo "RO[$i] rollback -g rc=$? global=$(req "$G")"
+          done; done
+          kill $M1 $M2
+          PROBEEOF
+      - name: Probe
+        run: bash probe/ro.sh "$PWD/target/release/socket-patch" "$PWD/probe/mock.mjs"
