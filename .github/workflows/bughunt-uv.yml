@@ -1,0 +1,85 @@
+name: bughunt uv global apply probe
+on:
+  push:
+    branches: ['bughunt/uv/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: tar.gz }
+          - { os: macos-latest, target: aarch64-apple-darwin, ext: tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: zip }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: bughunt-uv
+          save-if: false
+      - run: cargo build --release -p socket-patch-cli
+      - name: probe
+        env:
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
+        run: |
+      - name: probe
+        env:
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          set -u
+          W="$RUNNER_TEMP/w"; mkdir -p "$W"
+          SP="$PWD/target/release/socket-patch"
+          PY="$(python -c 'import sys;print(sys.executable)')"
+          UUID=725a5343-52ec-4290-b7ce-e1cec55878e1
+          unset SOCKET_API_TOKEN || true
+          for V in 0.5.31 0.9.5; do
+            D="$W/uv-$V"; mkdir -p "$D"
+            curl -sSLf -o "$D/uv.$EXT" "https://github.com/astral-sh/uv/releases/download/$V/uv-$TARGET.$EXT"
+            if [ "$EXT" = zip ]; then (cd "$D" && unzip -q -o uv.zip); else tar -xzf "$D/uv.$EXT" -C "$D"; fi
+            UV="$(find "$D" -type f \( -name uv -o -name uv.exe \) | head -1)"
+            for lane in default custom; do
+              echo "::group::uv $V lane $lane"
+              if [ "$lane" = custom ]; then export UV_TOOL_DIR="$W/custom tools $V"; export UV_TOOL_BIN_DIR="$W/cbin-$V"; else unset UV_TOOL_DIR UV_TOOL_BIN_DIR || true; fi
+              TD="$("$UV" tool dir)"; echo "uv tool dir: $TD"
+              "$UV" tool uninstall pycowsay >/dev/null 2>&1 || true
+              "$UV" tool install --python "$PY" --with pydantic-ai==0.0.36 pycowsay > "$W/inst.log" 2>&1 || { echo "install failed"; tail -5 "$W/inst.log"; }
+              PKG="$(find "$TD" -type d -name pydantic_ai -path '*site-packages*' | head -1)"
+              echo "pydantic_ai at: $PKG"
+              rm -rf "$W/before" && cp -R "$PKG" "$W/before"
+              P="$W/proj-$V-$lane"; rm -rf "$P"; mkdir -p "$P"; cd "$P"
+              "$SP" scan -g --ecosystems pypi --json > s.json 2>s.err; echo "scan -g exit $?"
+              python -c "import json;d=json.load(open('s.json'));print('scan -g packages with patches:',[p['purl'] for p in d.get('packages',[]) if 'pydantic-ai@' in p['purl']])"
+              "$SP" get "$UUID" -g --json > g.json 2>g.err; rc=$?
+              python -c "import json;d=json.load(open('g.json'));print('get -g status:',d.get('status'),'applied:',d.get('applied'),'found:',d.get('found'))" 2>/dev/null || { echo "get json:"; head -c 800 g.json; head -5 g.err; }
+              echo "get -g exit $rc; files changed vs pristine: $(diff -rq "$W/before" "$PKG" | wc -l)"
+              "$SP" vex -g --json > v.json 2>v.err; echo "vex -g exit $?; statements: $(python -c "import json;d=json.load(open('v.json'));print(len(d.get('statements',d.get('vex',{}).get('statements',[]))))" 2>/dev/null)"
+              "$SP" rollback -g --json > r.json 2>r.err; echo "rollback -g exit $?; diff after rollback: $(diff -rq "$W/before" "$PKG" | wc -l)"
+              echo "RESULT os=$RUNNER_OS uv=$V lane=$lane get_rc=$rc"
+              cd "$GITHUB_WORKSPACE"
+              "$UV" tool uninstall pycowsay >/dev/null 2>&1 || true
+              echo "::endgroup::"
+            done
+          done
+      - name: root-owned prefix (linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -u
+          SP="$PWD/target/release/socket-patch"; unset SOCKET_API_TOKEN || true
+          G=/opt/rootprefix
+          sudo mkdir -p $G && sudo "$(command -v python)" -m pip install -q --target $G pydantic-ai==0.0.36 >/dev/null 2>&1; sudo chmod -R a-w,a+rX $G
+          mkdir -p "$RUNNER_TEMP/rp" && cd "$RUNNER_TEMP/rp"
+          "$SP" get 725a5343-52ec-4290-b7ce-e1cec55878e1 -g --global-prefix $G --json > g.json 2>g.err; echo "get root-owned exit $?"; head -c 1500 g.json; echo; head -5 g.err
