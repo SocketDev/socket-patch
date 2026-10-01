@@ -108,6 +108,12 @@ limits, and required install commands.
   scanned project, so a Yarn Berry project's `global` script can't run or pick
   the directory treated as the global install. Composer's global home also
   falls back to `%APPDATA%\Composer` and `$XDG_CONFIG_HOME/composer`.
+- Hosted Maven warns `redirect_maven_trusted_checksums_unenforced` when
+  `.mvn/wrapper/maven-wrapper.properties` pins a Maven older than 3.9.4. Maven
+  3.9.0–3.9.3 never enforce the Trusted Checksums pin that hosted mode writes;
+  the 4.0.0 notes and docs wrongly said every 3.9 release does. The version
+  suffix still fails closed. CI runs the real-Maven hosted capstone on 3.9.3 and
+  3.9.4 (#258).
 - Patch application, reversal, and cleanup handle missing files, release variants,
   corrupt state, newer ledger formats, and unsafe manifest paths without silently
   dropping protection. File ownership restoration failures produce warnings.
@@ -129,6 +135,11 @@ limits, and required install commands.
   not build from a previous patch's modified bytes. Verified service artifacts
   keep their identity; integrity failures do not fall through to a local rebuild.
   Repair rebuilds against recorded pins and reports unavailable inputs.
+- VEX no longer attests an npm package that also ships a bundled, unpatched
+  copy of the same `name@version` (`inBundle: true`, or v1 `bundled: true`).
+  npm unpacks that copy from the parent's tarball, so no rewire reaches it; the
+  reference is now reported `patched_ref_unattributable`, naming the bundled
+  copy, in hosted and vendored mode (#325).
 - API throttling uses bounded retries, failed queries appear in JSON diagnostics,
   and hosted reference resolution handles batches larger than 500 patches.
 - Transient apply locks are removed on normal command exit; no-op scans and full

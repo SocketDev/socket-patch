@@ -1343,6 +1343,135 @@ fn vendored_live_tree_out_of_sync_warns_but_attests() {
     );
 }
 
+/// REGRESSION (#325): the lock rewires the hoisted `lodash@4.17.21` to the
+/// vendored tarball, but a parent package also BUNDLES `lodash@4.17.21`
+/// (`inBundle: true`). npm unpacks that copy from the parent's tarball, so
+/// no rewire reaches it and the build ships it unpatched. `vex` must not
+/// attest the purl, from the lock basis (no `node_modules`) or after an
+/// install whose hoisted copy is patched and bundled copy is not. The
+/// same lock without the bundled copy is the control and still attests.
+#[test]
+fn vendored_npm_patch_with_an_unpatched_bundled_copy_is_not_attested() {
+    let purl = "pkg:npm/lodash@4.17.21";
+    let uuid = "0a0a0a0a-1111-4111-8111-0a0a0a0a0a0a";
+    let patched = b"patched npm bytes\n";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    for (label, bundled, installed) in [
+        ("control, lock basis", false, false),
+        ("bundled, lock basis", true, false),
+        ("bundled, installed", true, true),
+    ] {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let cwd = tmp.path();
+        let rel = format!(".socket/vendor/npm/{uuid}/lodash-4.17.21.tgz");
+        let sha256 = sha256_hex(&write_member_tgz(
+            &cwd.join(&rel),
+            "package/index.js",
+            patched,
+        ));
+        let record = make_record(
+            uuid,
+            "package/index.js",
+            &after_hash,
+            "GHSA-bndl-aaaa",
+            &["CVE-2026-325"],
+        );
+        let wiring = write_matrix_wiring(cwd, "npm", uuid, &rel);
+        if bundled {
+            let lock_path = cwd.join("package-lock.json");
+            let mut lock: Value =
+                serde_json::from_str(&std::fs::read_to_string(&lock_path).unwrap()).unwrap();
+            let packages = lock["packages"].as_object_mut().unwrap();
+            packages.insert(
+                "node_modules/bund".to_string(),
+                serde_json::json!({ "version": "1.0.0", "resolved": "file:bund-1.0.0.tgz" }),
+            );
+            packages.insert(
+                "node_modules/bund/node_modules/lodash".to_string(),
+                serde_json::json!({
+                    "version": "4.17.21",
+                    "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                    "integrity": "sha512-T1JJR0lOQUw=",
+                    "inBundle": true
+                }),
+            );
+            std::fs::write(&lock_path, lock.to_string()).unwrap();
+        }
+        let mut state = VendorState::new();
+        state.entries.insert(
+            purl.to_string(),
+            detached_matrix_entry("npm", purl, uuid, &rel, sha256, record, wiring),
+        );
+        let dir = cwd.join(".socket/vendor");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        if installed {
+            for (pkg_dir, bytes) in [
+                ("node_modules/lodash", &patched[..]),
+                (
+                    "node_modules/bund/node_modules/lodash",
+                    b"original unpatched bytes\n",
+                ),
+            ] {
+                let nm = cwd.join(pkg_dir);
+                std::fs::create_dir_all(&nm).unwrap();
+                std::fs::write(
+                    nm.join("package.json"),
+                    r#"{"name":"lodash","version":"4.17.21"}"#,
+                )
+                .unwrap();
+                std::fs::write(nm.join("index.js"), bytes).unwrap();
+            }
+        }
+
+        let vex_path = cwd.join("out.vex.json");
+        let out = cli()
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--json",
+                "--output",
+                vex_path.to_str().unwrap(),
+                "--product",
+                "pkg:npm/app@1.0.0",
+            ])
+            .output()
+            .expect("invoke vex");
+        let env: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{label}: envelope JSON on stdout ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        });
+        if !bundled {
+            assert!(out.status.success(), "{label}: {env}");
+            let doc: Value =
+                serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+            assert_eq!(
+                doc["statements"].as_array().unwrap().len(),
+                1,
+                "{label}: {doc}"
+            );
+            continue;
+        }
+        assert_eq!(out.status.code(), Some(1), "{label}: {env}");
+        assert!(
+            !vex_path.exists(),
+            "{label}: no VEX document may attest the purl: {env}"
+        );
+        assert!(
+            env.to_string()
+                .contains("node_modules/bund/node_modules/lodash"),
+            "{label}: the envelope names the bundled copy: {env}"
+        );
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // 8. an applied, byte-verified agent-mode patch attests whether or not its
 // ecosystem has an install hook (there is no setup-state filter).
