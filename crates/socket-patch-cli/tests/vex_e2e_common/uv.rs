@@ -1560,6 +1560,11 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
         &|step, result| report.row(step, result),
     );
 
+    // ── 5b. a sibling dependency added after vendoring (#474) ─────────
+    if mode == Mode::Vendored && lane == Lane::Script {
+        script_sibling_revert(uv, &report, &proj, tmp.path());
+    }
+
     // ── 6. the real revert ────────────────────────────────────────────
     // Vendored: `vendor --revert` restores every wiring file byte for
     // byte. Hosted (v5): `rollback` rewrites each pin back to the DEFAULT
@@ -1680,6 +1685,85 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
         );
     }
     report.row("revert", "byte-identical");
+}
+
+/// #474: `uv add --script` after vendoring adds an unrelated requirement
+/// to the script and its lock (a new `[manifest] requirements` element and
+/// `[[package]]`). `vendor --revert` must still restore six's registry
+/// wiring and keep the user's addition, leaving a lock uv accepts as is.
+/// Runs on a copy so the byte-identical revert below is unaffected.
+fn script_sibling_revert(uv: &Uv, report: &Report<'_>, proj: &Path, tmp: &Path) {
+    let dir = tmp.join("sibling");
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in [SCRIPT, "tool.py.lock"] {
+        std::fs::copy(proj.join(f), dir.join(f)).unwrap();
+    }
+    copy_tree(&proj.join(".socket"), &dir.join(".socket"));
+    let cache = tmp.join("sibling-cache");
+    let out = uv.run_py(&dir, &["add", "--script", SCRIPT, "idna==3.7"], &cache);
+    if !ok(&out) {
+        report.row("sibling-revert", "n/a (`uv add --script` failed)");
+        println!("{}", dump(&out));
+        return;
+    }
+    let lock = std::fs::read_to_string(dir.join("tool.py.lock")).unwrap();
+    assert!(
+        lock.contains("name = \"idna\"") && lock.contains(".socket/vendor"),
+        "{}: uv add did not keep the vendored lock:\n{lock}",
+        report.what("sibling-revert")
+    );
+    let out = socket_patch(
+        &dir,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            dir.to_str().unwrap(),
+        ],
+    );
+    let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), dump(&out));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}:\n{text}",
+        report.what("sibling-revert")
+    );
+    assert!(
+        !text.contains("vendor_lock_entry_drifted"),
+        "{}: an added sibling counted as drift:\n{text}",
+        report.what("sibling-revert")
+    );
+    for f in [SCRIPT, "tool.py.lock"] {
+        let body = std::fs::read_to_string(dir.join(f)).unwrap();
+        assert!(
+            !body.contains(".socket/vendor") && body.contains("idna"),
+            "{}: {f} still vendored or lost idna:\n{body}",
+            report.what("sibling-revert")
+        );
+    }
+    assert!(
+        !dir.join(".socket/vendor/pypi")
+            .join(Mode::Vendored.uuid())
+            .exists(),
+        "{}: the vendored artifact was kept",
+        report.what("sibling-revert")
+    );
+    let reverted = std::fs::read(dir.join("tool.py.lock")).unwrap();
+    let out = uv.run_py(&dir, &["lock", "--script", SCRIPT], &cache);
+    assert!(
+        ok(&out),
+        "{}: uv lock --script:\n{}",
+        report.what("sibling-revert"),
+        dump(&out)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(dir.join("tool.py.lock")).unwrap()),
+        String::from_utf8_lossy(&reverted),
+        "{}: uv rewrote the reverted lock",
+        report.what("sibling-revert")
+    );
+    report.row("sibling-revert", "restored, user addition kept");
 }
 
 // ── production legs ────────────────────────────────────────────────────

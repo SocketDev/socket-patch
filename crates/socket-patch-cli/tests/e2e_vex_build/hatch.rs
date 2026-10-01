@@ -323,6 +323,52 @@ fn flow(flavor: Flavor, mode: Mode) {
         "pass",
     );
 
+    // ── #385: everyday pyproject edits must not block the revert ──────
+    // A release bump and a new sibling dependency after vendoring: the
+    // revert restores six's pin and drops the permission, keeping both.
+    if mode == Mode::Vendored && flavor == Flavor::Project {
+        let edited = tmp.path().join("edited");
+        copy_tree(&project, &edited, &[]);
+        let edit = |text: &str| {
+            text.replacen("version = \"0.1.0\"", "version = \"0.2.0\"", 1)
+                .replacen("dependencies = [", "dependencies = [\"idna==3.7\", ", 1)
+        };
+        std::fs::write(edited.join("pyproject.toml"), edit(&wired)).unwrap();
+        let out = std::process::Command::new(vex_e2e_common::binary())
+            .args(["vendor", "--revert", "--json", "--cwd"])
+            .arg(&edited)
+            .current_dir(&edited)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{what}: revert after project edits: {}",
+            out_text(&out)
+        );
+        let native = &flavor.native()[0].1;
+        assert_eq!(
+            std::fs::read_to_string(edited.join("pyproject.toml")).unwrap(),
+            edit(native),
+            "{what}: revert after project edits: {}",
+            out_text(&out)
+        );
+        assert!(
+            !edited
+                .join(".socket/vendor/pypi")
+                .join(mode.uuid())
+                .exists(),
+            "{what}: the vendored artifact was kept"
+        );
+        record(
+            "hatch",
+            &version,
+            &format!("{cell}/{}", mode.label()),
+            "revert-after-project-edits",
+            "pass",
+        );
+    }
+
     // ── fresh checkout, real `hatch env create` ───────────────────────
     let fresh = tmp.path().join("fresh");
     copy_tree(&project, &fresh, &[".socket/manifest.json"]);
