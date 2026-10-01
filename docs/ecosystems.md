@@ -324,18 +324,27 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   a depMgmt pin could strand sibling artifacts sharing the property. A literal version
   that matches neither the base nor the suffixed value is skipped
   (`redirect_maven_dep_version_mismatch`).
-* **Trusted Checksums reinforcement (hosted Maven, 3.9+).** When the patch server
+* **Trusted Checksums reinforcement (hosted Maven, 3.9.4+).** When the patch server
   supplies both the jar and pom sha256, the rewriter also emits Maven
   [Trusted Checksums](https://maven.apache.org/resolver/expected-checksums.html) files —
   `.mvn/maven.config` resolver args plus `.mvn/checksums/checksums.sha256` entries
   pinning both artifacts under the suffixed version's local-repo path (merging into any
   pre-existing user config / checksum set; a conflicting value is never overridden and
   surfaces `redirect_maven_trusted_checksums_conflict`). This is an **independent
-  client-side content pin** on top of the transport check. It requires **Maven 3.9+**
-  (the resolver post-processor and the `${session.rootDirectory}` basedir expression the
-  config uses); on older Maven the `.mvn/*` files are silently inert — the
-  version-suffixing above is still fail-closed on its own. On Maven **3.9.0–3.9.8** a
-  *mismatch* is enforced but reported unclearly; the readability fix landed in **3.9.9**
+  client-side content pin** on top of the transport check. It requires **Maven 3.9.4+**.
+  Older releases leave the `.mvn/*` files inert, and only the transport `.sha1` check
+  guards the Socket-served bytes. The version suffixing above still fails closed on its
+  own.
+  - **3.9.0 / 3.9.1** do not interpolate the `${session.rootDirectory}` basedir the config
+    uses, so the summary file is never found.
+  - **3.9.2 / 3.9.3** ignore `checksumAlgorithms=SHA-256` and check SHA-1 only.
+  - **Below 3.9** there is no Trusted Checksums post-processor.
+
+  When `.mvn/wrapper/maven-wrapper.properties` pins a Maven older than 3.9.4, the rewriter
+  still writes the files and warns `redirect_maven_trusted_checksums_unenforced`. Without
+  a Maven Wrapper, the CLI can't tell which Maven builds the project, so it doesn't warn.
+  On Maven **3.9.4–3.9.8** a *mismatch* is enforced but reported unclearly; the
+  readability fix landed in **3.9.9**
   ([MNG-8182](https://issues.apache.org/jira/browse/MNG-8182)). The args are
   `originAware=false` and `failIfMissing=false`, so one checksum matches the artifact
   from any repository and a dependency with no committed checksum still resolves — only a

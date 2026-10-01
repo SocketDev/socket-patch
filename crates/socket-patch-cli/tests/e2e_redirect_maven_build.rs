@@ -310,6 +310,19 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
         return;
     };
     let pristine_pom = std::fs::read_to_string(proj.join("pom.xml")).unwrap();
+    // The project pins the Maven under test through the Maven Wrapper, so
+    // the rewriter's "your Maven ignores the Trusted Checksums pin" warning
+    // is judged against the same release that step 5b drives (#258).
+    std::fs::create_dir_all(proj.join(".mvn/wrapper")).unwrap();
+    std::fs::write(
+        proj.join(".mvn/wrapper/maven-wrapper.properties"),
+        format!(
+            "distributionUrl=https\\://repo.maven.apache.org/maven2/org/apache/maven/\
+             apache-maven/{v}/apache-maven-{v}-bin.zip\n",
+            v = mvn.version
+        ),
+    )
+    .unwrap();
 
     // 2. Patched jar + served pom + the record (real before/after hashes).
     let (_orig, patched) = patched_member(&jar, UUID);
@@ -353,6 +366,17 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
     assert_eq!(env["redirect"]["mode"], "hosted", "{env}");
     assert_eq!(env["redirect"]["redirected"], 1, "{env}");
     assert_eq!(env["vex"]["statements"], 1, "{env}");
+    let unenforced = env["redirect"]["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|w| w["code"] == "redirect_maven_trusted_checksums_unenforced");
+    assert_eq!(
+        unenforced,
+        !mvn.enforces_trusted_checksums(),
+        "Maven {}: the unenforced-pin warning must match what step 5b proves: {env}",
+        mvn.version
+    );
     let embedded: serde_json::Value =
         serde_json::from_slice(&std::fs::read(proj.join("embedded.vex.json")).unwrap()).unwrap();
     assert_attested(&embedded, &purl(), UUID, Marker::Redirected, &vulns());

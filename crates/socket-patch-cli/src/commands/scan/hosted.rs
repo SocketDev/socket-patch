@@ -3551,6 +3551,7 @@ mod tests {
                 "pom.xml",
                 ".mvn/maven.config",
                 ".mvn/checksums/checksums.sha256",
+                ".mvn/wrapper/maven-wrapper.properties",
                 "settings.gradle",
                 "settings.gradle.kts",
                 "build.gradle",
