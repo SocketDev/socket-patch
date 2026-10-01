@@ -3,7 +3,7 @@
 //!
 //! Each crawler walks one or more package directories and decides
 //! whether each entry is a candidate package. The operations that
-//! all eight crawlers repeat are:
+//! the ecosystem crawlers repeat are:
 //!
 //! - listing entries in a directory while tolerating permission /
 //!   I/O errors (we treat an unreadable directory as "no entries");
@@ -31,7 +31,6 @@
 
 use std::path::{Path, PathBuf};
 
-use std::fs::FileType;
 use tokio::fs::DirEntry;
 
 /// List the immediate children of `path`.
@@ -81,8 +80,7 @@ pub(crate) async fn entry_is_dir(entry: &DirEntry) -> bool {
 /// Returns `false` if the stat fails (missing path, broken symlink,
 /// permission error, etc.) — the crawlers probe candidate package
 /// roots and treat "can't stat" the same as "not there". The
-/// `Path`-taking counterpart of [`entry_is_dir`]; previously
-/// copy-pasted into every crawler.
+/// `Path`-taking counterpart of [`entry_is_dir`].
 pub(crate) async fn is_dir(path: &Path) -> bool {
     tokio::fs::metadata(path)
         .await
@@ -371,7 +369,8 @@ pub async fn remove_link(path: &Path) -> std::io::Result<()> {
 /// be treated as scannable-but-non-recurseable). The returned
 /// `FileType` is the symlink-aware kind from `entry.file_type()`,
 /// not the resolved-target kind from `metadata()`.
-pub(crate) async fn entry_file_type(entry: &DirEntry) -> Option<FileType> {
+#[cfg(test)]
+pub(crate) async fn entry_file_type(entry: &DirEntry) -> Option<std::fs::FileType> {
     entry.file_type().await.ok()
 }
 
@@ -383,7 +382,7 @@ pub(crate) async fn entry_file_type(entry: &DirEntry) -> Option<FileType> {
 /// crawlers at directories inside the user's project. The shared
 /// fallback chain for every crawler that scans well-known per-user
 /// package roots (`~/.cargo`, `~/.m2`, `~/.nuget`, …) and for
-/// telemetry's home-dir redaction; previously copy-pasted into each.
+/// telemetry's home-dir redaction.
 /// The go/composer crawlers deliberately use a stricter
 /// no-home-means-no-path chain instead.
 pub(crate) fn home_dir() -> PathBuf {
@@ -924,8 +923,8 @@ mod tests {
     /// The stage of a mode-preserving write is CREATED with the preserved
     /// bits, never the 0666 & ~umask default: the full new content (a
     /// `.npmrc` auth token) is written and fsynced into it before the final
-    /// chmod, and a killed process leaves it behind. Red before the fix:
-    /// the 0600 destination's stage came out 0644 (umask 022).
+    /// chmod, and a killed process leaves it behind (a 0600 destination's
+    /// stage must not come out 0644 under umask 022).
     #[cfg(unix)]
     #[tokio::test]
     async fn preserving_stage_is_created_with_the_destination_mode() {

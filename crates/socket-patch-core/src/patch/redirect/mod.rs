@@ -1,4 +1,4 @@
-//! Registry-redirect rewriters (the `scan --redirect` engine).
+//! Registry-redirect rewriters (the hosted-mode `scan` engine).
 //!
 //! Rewrites lockfiles / registry configs so ONLY the patched dependency points
 //! at Socket's HOSTED vendored patches — the Rust counterpart of the depscan
@@ -7,7 +7,8 @@
 //! `tests/fixtures/redirect/` (see `tests/redirect_golden.rs`): a fixture's
 //! `expected/` bytes are produced identically by the TS backend (the GitHub-app
 //! PR flow) and by this CLI, so a customer gets the same result whether Socket
-//! opens the PR or they run `socket-patch scan --redirect` locally.
+//! opens the PR or they run `socket-patch scan --mode hosted` (or a bare
+//! `socket-patch scan`) locally.
 //!
 //! Python lockfiles use TOML-aware edits to keep source identities consistent.
 //! Other non-JSON formats use targeted text edits; JSON uses `serde_json` with
@@ -22,7 +23,6 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::utils::composer_version::composer_versions_equivalent;
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
 use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries};
@@ -45,39 +45,41 @@ pub mod npmrc;
 mod pdm;
 mod pipenv;
 pub mod presence;
-// pub(crate): manifest-less VEX discovery (`vex::discover::npm`) reads
-// hosted pnpm locks with the SAME grammar this rewriter writes them in.
-pub(crate) mod pnpm;
+// The pnpm hosted planner lives with the format's model.
+use crate::formats::pnpm::plan_hosted;
+use crate::formats::cargo::CargoLock;
+use crate::formats::composer::hosted::rewrite_composer_lock;
+use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
+pub(crate) use crate::formats::yarn::is_berry_lock;
+use crate::formats::cargo::hosted::CargoLockPlan;
+#[cfg(test)]
+use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
+#[cfg(test)]
+use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 mod poetry;
 #[cfg(test)]
 mod python_lock_equivalence_tests;
-mod replay;
 mod requirements;
-#[cfg(test)]
-mod rewrite_oracle_support;
 mod staged;
 mod state;
-mod takeover;
+mod hosted_url;
+pub mod upstream;
 pub mod vlt;
 pub mod vlt_heal;
 pub mod vlt_preflight;
-pub use replay::{revert_remaining_redirect_edits, GroupRefusal, ReplayOutcome};
 pub use state::{
-    drop_superseded_purl, load_redirect_state, persist_redirect_state, save_redirect_state,
+    load_redirect_state, save_redirect_state,
     CorruptRedirectState, RedirectState, REDIRECT_STATE_REL,
 };
 /// Hosted-artifact leaf ownership rule, shared with `vex`'s bun lockfile
 /// discovery (which recovers a URL tuple's version from that leaf).
-pub(crate) use takeover::{hosted_url_names, hosted_url_version};
-pub use takeover::{
-    redirect_revert_supported, revert_cargo_redirect_purl, revert_golang_redirect_purl,
-    revert_npm_redirect_purl, revert_redirect_purl, RedirectRevert,
-};
+pub(crate) use hosted_url::{hosted_url_names, hosted_url_version};
 
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 pub struct Integrity {
     pub sha512: Option<String>,
@@ -95,6 +97,7 @@ pub struct Integrity {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 pub struct RegistryOverrideIdentifiers {
     pub name: String,
@@ -143,6 +146,7 @@ pub struct RegistryOverrideIdentifiers {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 pub struct RegistryOverride {
     pub kind: String,
@@ -152,6 +156,7 @@ pub struct RegistryOverride {
 
 /// One patched dependency to redirect (mirrors the TS `DepOverride`).
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 pub struct DepOverride {
     pub ecosystem: String,
@@ -162,8 +167,6 @@ pub struct DepOverride {
     pub token: String,
     pub patch_uuid: String,
     pub artifact_url: String,
-    #[serde(default)]
-    pub berry_zip_url: Option<String>,
     #[serde(default)]
     pub registry_override: Option<RegistryOverride>,
     pub integrity: Integrity,
@@ -194,6 +197,7 @@ pub struct RewriteWarning {
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct RewriteResult {
     /// Rewritten file contents keyed by repo-relative path — only CHANGED files.
     pub files: BTreeMap<String, String>,
@@ -257,7 +261,7 @@ pub struct RewriteResult {
 }
 
 /// Combined name as it appears in registry coordinates / lock keys.
-fn full_name(dep: &DepOverride) -> String {
+pub(crate) fn full_name(dep: &DepOverride) -> String {
     match &dep.namespace {
         Some(ns) if !ns.is_empty() => format!("{ns}/{}", dep.name),
         _ => dep.name.clone(),
@@ -430,7 +434,7 @@ fn rewriter_groups<'a>(
     vec![
         Box::new(move |result| {
             rewrite_npm_lock(files, overrides, result);
-            rewrite_pnpm_lock(files, overrides, result);
+            plan_hosted(files, overrides, result);
             rewrite_yarn_classic(files, overrides, result);
             rewrite_yarn_berry(files, overrides, result);
             rewrite_bun_lock(files, overrides, result);
@@ -754,7 +758,7 @@ fn rewrite_npm_lock(
     // `package-lock.json` beside any committed `npm-shrinkwrap.json` on first
     // install and reifies the install FROM `package-lock.json`. So the
     // dual-lock state is the DEFAULT for a shrinkwrap repo under npm 12.
-    // Rewriting only the first present lock patched the file npm doesn't
+    // Rewriting only the first present lock would patch the file npm doesn't
     // install from — a silent FALSE SUCCESS. Rewrite EVERY present npm lock so
     // a fresh `npm install`/`npm ci` from EITHER is redirected (shrinkwrap-only
     // repos on npm <= 6 keep working: only that one file is present).
@@ -1387,7 +1391,12 @@ fn rewrite_cargo(
             Absent,
         }
         let lock_commit = if let Some(lock_text) = cargo_lock.as_ref() {
-            match plan_cargo_lock(lock_text, &dep.name, &dep.version, index_url, &cksum) {
+            // A lock that does not parse never reaches here: the dependents
+            // check above refuses it.
+            let plan = CargoLock::parse(lock_text).map_or(CargoLockPlan::NotFound, |lock| {
+                lock.plan_hosted(lock_text, &dep.name, &dep.version, index_url, &cksum)
+            });
+            match plan {
                 CargoLockPlan::Rewritten { content, edits } => LockCommit::Write(content, edits),
                 CargoLockPlan::AlreadyRedirected => LockCommit::InPlace,
                 CargoLockPlan::NotFound => {
@@ -1524,11 +1533,7 @@ fn cargo_not_declared_detail(
     } else {
         "Cargo.toml".to_string()
     };
-    let head = format!("[[package]]\nname = \"{crate_name}\"\nversion = \"{version}\"\n");
-    let transitive = lock.is_some_and(|lock| {
-        lock.match_indices(head.as_str())
-            .any(|(at, _)| at == 0 || lock.as_bytes()[at - 1] == b'\n')
-    });
+    let transitive = cargo_lock_holds(lock, crate_name, version);
     if transitive {
         format!(
             "{crate_name}@{version} is a transitive-only dependency (Cargo.lock resolves it, \
@@ -1558,11 +1563,7 @@ fn cargo_requirement_excludes_detail(
         .map(|(path, req)| format!("\"{req}\" in {path}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let head = format!("[[package]]\nname = \"{crate_name}\"\nversion = \"{version}\"\n");
-    let locked = lock.is_some_and(|lock| {
-        lock.match_indices(head.as_str())
-            .any(|(at, _)| at == 0 || lock.as_bytes()[at - 1] == b'\n')
-    });
+    let locked = cargo_lock_holds(lock, crate_name, version);
     let remedy = if locked {
         "; Cargo.lock resolves it for another package, which a pin cannot reach — patch it \
          with `socket-patch scan --mode vendored`"
@@ -1629,34 +1630,13 @@ fn cargo_unpinnable_dependents(
     version: &str,
     pinned_packages: &std::collections::BTreeSet<(&str, &str)>,
 ) -> Vec<String> {
-    let Ok(doc) = lock.parse::<toml_edit::DocumentMut>() else {
+    let Ok(lock) = CargoLock::parse(lock) else {
         return vec!["Cargo.lock (it does not parse as TOML)".to_string()];
     };
-    let Some(packages) = doc
-        .get("package")
-        .and_then(toml_edit::Item::as_array_of_tables)
-    else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    for package in packages.iter() {
-        let field = |key: &str| package.get(key).and_then(toml_edit::Item::as_str);
-        let (Some(name), Some(pkg_version)) = (field("name"), field("version")) else {
-            continue;
-        };
-        let depends = package
-            .get("dependencies")
-            .and_then(toml_edit::Item::as_array)
-            .is_some_and(|deps| {
-                deps.iter().filter_map(|d| d.as_str()).any(|d| {
-                    let mut parts = d.splitn(3, ' ');
-                    parts.next() == Some(crate_name) && parts.next().is_none_or(|v| v == version)
-                })
-            });
-        if !depends {
-            continue;
-        }
-        match field("source") {
+    for package in lock.dependents(crate_name, version) {
+        let (name, pkg_version) = (package.name.as_str(), package.version.as_str());
+        match &package.source {
             Some(source) => {
                 let kind = if source.starts_with("git+") {
                     "git"
@@ -2443,23 +2423,23 @@ enum CargoWorkspaceEntry {
     OtherPackage,
 }
 
+/// Whether a Cargo.lock (when there is one, and it parses) resolves
+/// `crate_name`@`version`.
+fn cargo_lock_holds(lock: Option<&str>, crate_name: &str, version: &str) -> bool {
+    lock.and_then(|lock| CargoLock::parse(lock).ok())
+        .is_some_and(|lock| lock.is_locked(crate_name, version))
+}
+
 /// Every version of `crate_name` a Cargo.lock holds other than `version`.
 fn cargo_lock_other_versions(lock: Option<&str>, crate_name: &str, version: &str) -> Vec<String> {
     let Some(lock) = lock else {
         return Vec::new();
     };
-    let head = format!("[[package]]\nname = \"{crate_name}\"\nversion = \"");
-    let mut versions: Vec<String> = lock
-        .match_indices(head.as_str())
-        .filter(|&(at, _)| at == 0 || lock.as_bytes()[at - 1] == b'\n')
-        .filter_map(|(at, _)| {
-            let rest = &lock[at + head.len()..];
-            rest.split_once('"').map(|(v, _)| v.to_string())
-        })
-        .filter(|v| v != version)
-        .collect();
-    versions.sort();
-    versions.dedup();
+    let Ok(lock) = CargoLock::parse(lock) else {
+        return Vec::new();
+    };
+    let mut versions = lock.locked_versions(crate_name);
+    versions.retain(|v| v != version);
     versions
 }
 
@@ -2754,8 +2734,7 @@ fn plan_cargo_toml(
             }
             // Plain version: `crate = "1.0"` (+ optional trailing comment).
             // The rewrite is line-scoped, so the trailing newline / blank
-            // line after the entry is untouched (the old `\s*$` regex
-            // swallowed it).
+            // line after the entry is untouched.
             let c = regex::escape(crate_name);
             let line_re = Regex::new(&format!(
                 r#"^(\s*(?:{c}|"{c}")\s*=\s*)"([^"]+)"([ \t]*(?:#.*)?)$"#
@@ -2908,286 +2887,6 @@ fn plan_cargo_toml(
     })
 }
 
-/// The Cargo.lock edit kind for dependents' full-id references: `original`
-/// / `new` are the quoted `"<name> <version> (<source>)"` ids, keyed
-/// `<name>@<version>`, and the inverse replaces EVERY occurrence of `new`.
-pub(crate) const CARGO_LOCK_REFERENCE_KIND: &str = "redirect_cargo_lock_reference";
-
-static CARGO_LOCK_SOURCE_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)^source = "([^"]*)"$"#).expect("static lock source-line regex is valid")
-});
-static CARGO_LOCK_CHECKSUM_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)^checksum = "[^"]*"$"#).expect("static lock checksum-line regex is valid")
-});
-// `$` (not `\n`) so it also anchors a source line that ENDS the block: the
-// trailing newline sits outside the block region.
-static CARGO_LOCK_AFTER_SOURCE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)^(source = "[^"]*")$"#).expect("static source-line anchor regex is valid")
-});
-
-/// Repoint the crate's `[[package]]` at the hosted index with the patched
-/// `.crate`'s checksum, in whichever Cargo.lock format the file is:
-///
-/// * v2–v4: `source` + an inline `checksum` in the entry;
-/// * v1 (cargo < 1.41, still read by every cargo): the entry carries only
-///   `source`; the checksum lives in the trailing `[metadata]` table under
-///   `"checksum <name> <version> (<source>)"`, and every dependent names the
-///   crate by its FULL package id `"<name> <version> (<source>)"`. Both are
-///   keyed by the source, so both must follow it — a v1 lock with only the
-///   entry repointed names a package that no longer exists (cargo discards
-///   the lock and re-resolves; `--locked` fails) and pins nothing.
-///
-/// Full-id references are rewritten in any format (v2+ spells them that way
-/// when a name + version is ambiguous). Each changed fragment is its own
-/// `redirect_cargo_lock_entry` edit (unique text, so the fragment revert is
-/// unambiguous) — the entry and the `[metadata]` line — and the dependents'
-/// references are one `redirect_cargo_lock_reference` edit holding the
-/// quoted full id, reverted at every occurrence.
-fn plan_cargo_lock(
-    content: &str,
-    crate_name: &str,
-    version: &str,
-    index_url: &str,
-    cksum: &str,
-) -> CargoLockPlan {
-    // Rust's regex has NO lookahead, so bound the [[package]] block by string
-    // search (see [`lock_block_end`]): from its header to the next block or
-    // trailing table (or EOF), so the bytes after the block (incl. the final
-    // newline) are preserved.
-    let head = format!("[[package]]\nname = \"{crate_name}\"\nversion = \"{version}\"\n");
-    // Every line-anchored header for this name@version. A Cargo.lock may
-    // legitimately hold TWO blocks for one name@version from different
-    // sources — after a redirect, a transitive crates.io copy resolves beside
-    // the socket-registry copy, and cargo sorts the crates.io block FIRST —
-    // so the first hit alone would repoint the wrong twin.
-    let heads: Vec<usize> = content
-        .match_indices(head.as_str())
-        .map(|(at, _)| at)
-        .filter(|&at| at == 0 || content.as_bytes()[at - 1] == b'\n')
-        .collect();
-    let block_start = match heads.as_slice() {
-        [] => return CargoLockPlan::NotFound,
-        [only] => *only,
-        twins => {
-            // Exactly one twin already at the target index is OURS (a re-run
-            // over a redirected lock); anything else cannot be attributed and
-            // the dep is skipped transactionally.
-            let target_source = format!("source = \"{index_url}\"");
-            let mut ours = twins.iter().copied().filter(|&at| {
-                let body_start = at + head.len();
-                content[body_start..lock_block_end(content, body_start)]
-                    .lines()
-                    .any(|line| line == target_source)
-            });
-            match (ours.next(), ours.next()) {
-                (Some(at), None) => at,
-                _ => return CargoLockPlan::Ambiguous,
-            }
-        }
-    };
-    let body_start = block_start + head.len();
-    let block_end = lock_block_end(content, body_start);
-    let original = content[block_start..block_end].to_string();
-    let mut body = content[body_start..block_end].to_string();
-    let old_source = CARGO_LOCK_SOURCE_LINE_RE
-        .captures(&body)
-        .map(|c| c[1].to_string());
-    if old_source.is_some() {
-        body = CARGO_LOCK_SOURCE_LINE_RE
-            .replace(&body, format!("source = \"{index_url}\"").as_str())
-            .to_string();
-    } else {
-        body = format!("source = \"{index_url}\"\n{body}");
-    }
-    // A v1 lock keeps the checksum in `[metadata]`, keyed by the package id
-    // — the chosen block's OWN source when it has one, so a multi-source
-    // twin's line is never taken for ours.
-    let metadata_source = old_source
-        .as_deref()
-        .map_or_else(|| r#"[^)"]*"#.to_string(), regex::escape);
-    let metadata_re = Regex::new(&format!(
-        r#"(?m)^"checksum {} {} \({metadata_source}\)" = "[^"]*"$"#,
-        regex::escape(crate_name),
-        regex::escape(version)
-    ))
-    .expect("escaped lock metadata-line regex is valid");
-    let metadata_line = metadata_re.find(content).map(|m| m.as_str().to_string());
-    if metadata_line.is_none() {
-        if CARGO_LOCK_CHECKSUM_LINE_RE.is_match(&body) {
-            body = CARGO_LOCK_CHECKSUM_LINE_RE
-                .replace(&body, format!("checksum = \"{cksum}\"").as_str())
-                .to_string();
-        } else {
-            body = CARGO_LOCK_AFTER_SOURCE_RE
-                .replace(&body, format!("${{1}}\nchecksum = \"{cksum}\"").as_str())
-                .to_string();
-        }
-    }
-    let rebuilt = format!("{head}{body}");
-    let key = format!("{crate_name}@{version}");
-    let edit = |original: &str, new: &str| FileEdit {
-        path: "Cargo.lock".into(),
-        kind: "redirect_cargo_lock_entry".into(),
-        action: "rewritten".into(),
-        key: Some(key.clone()),
-        original: Some(Value::String(original.to_string())),
-        new: Some(Value::String(new.to_string())),
-    };
-    let mut edits = Vec::new();
-    let mut new_content = content.to_string();
-    if rebuilt != original {
-        new_content.replace_range(block_start..block_end, &rebuilt);
-        edits.push(edit(&original, &rebuilt));
-    }
-    if let Some(line) = metadata_line {
-        let pinned = format!("\"checksum {crate_name} {version} ({index_url})\" = \"{cksum}\"");
-        if line != pinned {
-            new_content = new_content.replacen(&line, &pinned, 1);
-            edits.push(edit(&line, &pinned));
-        }
-    }
-    // Dependents' full-id references to the OLD source, recorded as ONE
-    // `redirect_cargo_lock_reference` edit holding just the quoted id —
-    // never a dependent's whole block: a block referencing two patched
-    // packages (the root of a v1 lock) would hold two overlapping block
-    // edits, and reverting the first-applied one alone found neither of its
-    // fragments. The id names this name + version + source exactly, so its
-    // inverse puts back EVERY occurrence, independently of any other
-    // package's edits and in any removal order.
-    if let Some(old) = old_source.filter(|old| old != index_url) {
-        let from = format!("\"{crate_name} {version} ({old})\"");
-        let to = format!("\"{crate_name} {version} ({index_url})\"");
-        let mut repointed_any = false;
-        // The oldest v1 locks keep the ROOT package in a standalone `[root]`
-        // table instead of the `[[package]]` array, with its own full-id
-        // `dependencies`. It precedes the array, so the block walk below
-        // never reaches it and the lock would keep naming a package it no
-        // longer contains (`--locked` fails; an unlocked build silently
-        // re-resolves).
-        if let Some((start, end)) = lock_root_table(&new_content) {
-            if new_content[start..end].contains(&from) {
-                let repointed = new_content[start..end].replace(&from, &to);
-                new_content.replace_range(start..end, &repointed);
-                repointed_any = true;
-            }
-        }
-        let mut cursor = 0;
-        while let Some((start, end)) = next_lock_block(&new_content, cursor) {
-            if new_content[start..end].contains(&from) {
-                let repointed = new_content[start..end].replace(&from, &to);
-                new_content.replace_range(start..end, &repointed);
-                repointed_any = true;
-                cursor = start + repointed.len();
-            } else {
-                cursor = end;
-            }
-        }
-        if repointed_any {
-            edits.push(FileEdit {
-                kind: CARGO_LOCK_REFERENCE_KIND.into(),
-                ..edit(&from, &to)
-            });
-        }
-    }
-    // Already redirected (re-run): every fragment is at the target values; a
-    // recorded edit would have original == new and grow the ledger forever.
-    if edits.is_empty() {
-        return CargoLockPlan::AlreadyRedirected;
-    }
-    CargoLockPlan::Rewritten {
-        content: new_content,
-        edits,
-    }
-}
-
-/// The v1 `[root]` table's span, when the lock has one: cargo before the
-/// `[root]` removal recorded the root package there rather than in the
-/// `[[package]]` array, and its `dependencies` spell full package ids the
-/// same way. Bounded by [`lock_block_end`], like a package block.
-fn lock_root_table(content: &str) -> Option<(usize, usize)> {
-    const HEADER: &str = "[root]\n";
-    let at = content
-        .match_indices(HEADER)
-        .map(|(at, _)| at)
-        .find(|&at| at == 0 || content.as_bytes()[at - 1] == b'\n')?;
-    Some((at, lock_block_end(content, at + HEADER.len())))
-}
-
-/// The next `[[package]]` block starting at or after `from`, as
-/// [`lock_block_end`] bounds it.
-fn next_lock_block(content: &str, from: usize) -> Option<(usize, usize)> {
-    let rel = content.get(from..)?.find("[[package]]\n")?;
-    let start = from + rel;
-    if start != 0 && content.as_bytes()[start - 1] != b'\n' {
-        return next_lock_block(content, start + 1);
-    }
-    Some((
-        start,
-        lock_block_end(content, start + "[[package]]\n".len()),
-    ))
-}
-
-/// End of the `[[package]]` block whose body starts at `body_start`,
-/// excluding the newline(s) before the next block / trailing table / EOF (so
-/// a recorded original/new stops after the block's last content byte — the
-/// TS rewriter's `(?=\n*$)` lookahead — while the file keeps its newlines).
-fn lock_block_end(content: &str, body_start: usize) -> usize {
-    // The next block, or the `[metadata]` / `[[patch.unused]]` tables that
-    // trail the packages. The trailing tables are searched only up to the
-    // next block: they sit after every `[[package]]` (absent entirely from
-    // v3/v4 locks), and an unbounded search per block scanned to EOF for
-    // every block of every dep. Each marker holds its only `\n` at offset 0,
-    // so a hit starting before the next block also ends by it — the bounded
-    // minimum is the unbounded one.
-    let rest = &content[body_start..];
-    let next_block = rest.find("\n[[package]]").unwrap_or(rest.len());
-    let mut end = ["\n[metadata]", "\n[[patch.unused]]", "\n[patch"]
-        .iter()
-        .filter_map(|marker| rest[..next_block].find(marker))
-        .min()
-        .map_or(body_start + next_block, |rel| body_start + rel);
-    while end > body_start && content.as_bytes()[end - 1] == b'\n' {
-        end -= 1;
-    }
-    end
-}
-
-/// The previous, unbounded [`lock_block_end`], kept as the equivalence
-/// oracle.
-#[cfg(test)]
-fn lock_block_end_unbounded(content: &str, body_start: usize) -> usize {
-    let mut end = [
-        "\n[[package]]",
-        "\n[metadata]",
-        "\n[[patch.unused]]",
-        "\n[patch",
-    ]
-    .iter()
-    .filter_map(|marker| content[body_start..].find(marker))
-    .min()
-    .map_or(content.len(), |rel| body_start + rel);
-    while end > body_start && content.as_bytes()[end - 1] == b'\n' {
-        end -= 1;
-    }
-    end
-}
-
-/// Outcome of the Cargo.lock `[[package]]` plan — distinguishes a re-run
-/// over an already-redirected block (no edit, no warning) from a genuinely
-/// missing package (the caller warns AND skips the dep entirely).
-enum CargoLockPlan {
-    Rewritten {
-        content: String,
-        edits: Vec<FileEdit>,
-    },
-    AlreadyRedirected,
-    NotFound,
-    /// Several `[[package]]` blocks for the name@version (multi-source twins)
-    /// and not exactly one of them at the target index — which twin is ours
-    /// cannot be decided, so the caller warns AND skips the dep entirely.
-    Ambiguous,
-}
-
 struct CargoConfigPlan {
     content: String,
     edit: FileEdit,
@@ -3197,9 +2896,9 @@ struct CargoConfigPlan {
 /// HEALTHY block is already wired in — an uncommented header with an
 /// uncommented `index = "<index_url>"` line. Comments never satisfy the
 /// check: a user who commented the managed block out gets it restored on the
-/// next run (the old substring test matched the commented text, reported
-/// success, and left `registry = "socket-patch-…"` in Cargo.toml naming an
-/// undefined registry). A degraded block (missing/stale index line) is
+/// next run (a substring test would match the commented text and leave
+/// `registry = "socket-patch-…"` in Cargo.toml naming an undefined
+/// registry). A degraded block (missing/stale index line) is
 /// regenerated in place — it is ours, the header grammar proves it.
 fn plan_cargo_config(
     config: &str,
@@ -3288,422 +2987,6 @@ fn plan_cargo_config(
             new: Some(Value::String(recorded)),
         },
     })
-}
-
-// ── pnpm-lock.yaml ───────────────────────────────────────────────────────────
-
-/// Test-only reference for the residual gate: every instance of this exact
-/// name@version in `content` that does not resolve to `artifact_url`.
-/// Production judges the same predicate inline, per instance, on each
-/// indexed hit's post-splice body in `rewrite_pnpm_lock`; snapshots and
-/// other versions do not participate in resolution.
-#[cfg(test)]
-fn pnpm_unrewritten_instances(
-    content: &str,
-    fname: &str,
-    version: &str,
-    artifact_url: &str,
-) -> Vec<String> {
-    pnpm::entries(content)
-        .into_iter()
-        .filter_map(|entry| {
-            pnpm::suffix(entry.key, fname, version)?;
-            (!pnpm_resolves_to(&entry, artifact_url)).then(|| entry.key.to_string())
-        })
-        .collect()
-}
-
-/// Whether `entry` resolves to exactly `artifact_url` — the per-instance
-/// residual-gate predicate.
-fn pnpm_resolves_to(entry: &pnpm::Entry<'_>, artifact_url: &str) -> bool {
-    pnpm::resolution(entry).is_some_and(|r| r.tarball() == Some(artifact_url))
-}
-
-/// One pnpm lock under rewrite. `text` is the lock as of the last
-/// materialization; `pending` holds the resolution splices committed since,
-/// in `text`'s byte coordinates, and `spliced` the entries they touch.
-///
-/// The logical (post-splice) lock is `text` with `pending` applied. Parsing
-/// once and indexing is sound because a resolution splice never changes the
-/// entry structure: the replaced range and its replacement are only
-/// resolution-field material (6-space-indented `k: v` child lines of a block
-/// resolution, or the `{…}` flow value after `    resolution:`), and no raw
-/// newline can enter a value (`Resolution::rewrite` JSON-quotes whitespace).
-/// So every column-0 line (the shrinkwrap-version sniff) and every entry
-/// boundary line survives unchanged, and an entry no pending splice touched
-/// has byte-identical key and body. An entry that WAS touched is re-read
-/// only after materializing, so a later dep with the same name@version (a
-/// duplicate override) sees the rewritten text exactly as before.
-struct PnpmLockState<'f> {
-    path: &'f String,
-    text: Cow<'f, str>,
-    early_shrinkwrap: bool,
-    /// (key span, body span) per `packages:` entry, in file order.
-    entries: Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>,
-    /// Entry indices sorted by normalized (unquoted, `/`-stripped) key.
-    sorted: Vec<usize>,
-    pending: Vec<(std::ops::Range<usize>, String)>,
-    spliced: std::collections::HashSet<usize>,
-    changed: bool,
-}
-
-impl<'f> PnpmLockState<'f> {
-    fn new(path: &'f String, text: &'f str) -> Self {
-        let mut state = PnpmLockState {
-            path,
-            text: Cow::Borrowed(text),
-            early_shrinkwrap: pnpm::unsupported_early_shrinkwrap(text),
-            entries: Vec::new(),
-            sorted: Vec::new(),
-            pending: Vec::new(),
-            spliced: Default::default(),
-            changed: false,
-        };
-        state.reindex();
-        state
-    }
-
-    fn reindex(&mut self) {
-        let text: &str = &self.text;
-        let base = text.as_ptr() as usize;
-        self.entries = pnpm::entries(text)
-            .iter()
-            .map(|e| {
-                let key_start = e.key.as_ptr() as usize - base;
-                (
-                    key_start..key_start + e.key.len(),
-                    e.offset..e.offset + e.body.len(),
-                )
-            })
-            .collect();
-        let mut sorted: Vec<usize> = (0..self.entries.len()).collect();
-        sorted.sort_by(|&a, &b| self.norm_key(a).cmp(self.norm_key(b)).then(a.cmp(&b)));
-        self.sorted = sorted;
-    }
-
-    fn entry(&self, i: usize) -> pnpm::Entry<'_> {
-        let (key, body) = &self.entries[i];
-        pnpm::Entry {
-            key: &self.text[key.clone()],
-            body: &self.text[body.clone()],
-            offset: body.start,
-        }
-    }
-
-    /// The key as [`pnpm::suffix`] compares it.
-    fn norm_key(&self, i: usize) -> &str {
-        let key = pnpm::unquote(&self.text[self.entries[i].0.clone()]);
-        key.strip_prefix('/').unwrap_or(key)
-    }
-
-    /// Entries whose key names `fname@version` (any suffix), in file order —
-    /// the same set a full [`pnpm::suffix`] scan of the logical lock yields.
-    fn hits(&mut self, fname: &str, version: &str) -> Vec<usize> {
-        let hits = self.lookup(fname, version);
-        if hits.iter().any(|i| self.spliced.contains(i)) {
-            self.materialize();
-            return self.lookup(fname, version);
-        }
-        hits
-    }
-
-    fn lookup(&self, fname: &str, version: &str) -> Vec<usize> {
-        let mut out = Vec::new();
-        for sep in ['@', '/'] {
-            let prefix = format!("{fname}{sep}{version}");
-            let start = self
-                .sorted
-                .partition_point(|&i| self.norm_key(i) < prefix.as_str());
-            out.extend(
-                self.sorted[start..]
-                    .iter()
-                    .take_while(|&&i| self.norm_key(i).starts_with(prefix.as_str()))
-                    .copied(),
-            );
-        }
-        out.sort_unstable();
-        out.dedup();
-        out.retain(|&i| pnpm::suffix(self.entry(i).key, fname, version).is_some());
-        out
-    }
-
-    /// Fold `pending` into `text` and re-parse.
-    fn materialize(&mut self) {
-        if self.pending.is_empty() {
-            return;
-        }
-        #[cfg(debug_assertions)]
-        let keys_before: Vec<String> = (0..self.entries.len())
-            .map(|i| self.entry(i).key.to_string())
-            .collect();
-        let mut pending = std::mem::take(&mut self.pending);
-        pending.sort_by_key(|(range, _)| range.start);
-        let mut out = String::with_capacity(self.text.len());
-        let mut cursor = 0usize;
-        for (range, replacement) in pending {
-            out.push_str(&self.text[cursor..range.start]);
-            out.push_str(&replacement);
-            cursor = range.end;
-        }
-        out.push_str(&self.text[cursor..]);
-        self.text = Cow::Owned(out);
-        self.spliced.clear();
-        self.reindex();
-        #[cfg(debug_assertions)]
-        debug_assert_eq!(
-            keys_before,
-            (0..self.entries.len())
-                .map(|i| self.entry(i).key.to_string())
-                .collect::<Vec<_>>(),
-            "a resolution splice changed the pnpm entry structure"
-        );
-    }
-
-    fn into_rewritten(mut self) -> Option<(&'f String, String)> {
-        if !self.changed {
-            return None;
-        }
-        self.materialize();
-        Some((self.path, self.text.into_owned()))
-    }
-}
-
-fn rewrite_pnpm_lock(
-    files: &BTreeMap<String, String>,
-    overrides: &[DepOverride],
-    result: &mut RewriteResult,
-) {
-    let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
-    // A pnpm lock lives at the project root or at any nested path (e.g. Rush
-    // repos keep them under `common/config/rush/`); every such files-map key
-    // is rewritten under the same grammar. Deterministic order: BTreeMap
-    // iterates keys sorted, so goldens are stable across every lock in the set.
-    let lock_keys: Vec<&String> = files
-        .keys()
-        .filter(|k| {
-            matches!(
-                k.rsplit('/').next(),
-                Some("pnpm-lock.yaml" | "shrinkwrap.yaml")
-            )
-        })
-        .collect();
-    if npm.is_empty() || lock_keys.is_empty() {
-        return;
-    }
-    // Each lock is parsed and indexed ONCE; splices accumulate per lock and
-    // are applied in one pass at the end (see `PnpmLockState`).
-    let mut locks: Vec<PnpmLockState> = lock_keys
-        .iter()
-        .map(|k| PnpmLockState::new(k, &files[*k]))
-        .collect();
-    for dep in &npm {
-        let fname = full_name(dep);
-        let hits: Vec<Vec<usize>> = locks
-            .iter_mut()
-            .map(|lock| lock.hits(&fname, &dep.version))
-            .collect();
-        let unsafe_locks: Vec<_> = locks
-            .iter()
-            .zip(&hits)
-            .filter(|(lock, hits)| lock.early_shrinkwrap && !hits.is_empty())
-            .map(|(lock, _)| lock.path.as_str())
-            .collect();
-        if !unsafe_locks.is_empty() {
-            result.refused_pnpm_uuids.insert(dep.patch_uuid.clone());
-            result.warnings.push(RewriteWarning {
-                code: "redirect_pnpm_legacy_lockfile_unsupported".into(),
-                detail: format!("{} uses early pnpm 1 shrinkwrapVersion 3 without a supported minor version. Those installers discard hosted tarball URLs; {fname}@{} was left unchanged in every lock. Upgrade to a tested pnpm release (1.43.1 or newer) and regenerate the lock, or use `scan --mode agent` for installed-file patching.", unsafe_locks.join(", "), dep.version),
-            });
-            continue;
-        }
-        let Some(sha512) = dep.integrity.sha512.clone() else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_pnpm_missing_sha512".into(),
-                detail: format!("{fname}@{} has no sha512 integrity", dep.version),
-            });
-            continue;
-        };
-        // Every peer instance must be redirected, including nested peer
-        // contexts and the block resolutions emitted by pnpm 1–5.
-        let mut matched_any = false;
-        // Per-lock rewrites are PLANNED first and committed only after the
-        // residual gate below proves no instance of this dep escaped the
-        // splice grammar in ANY lock — committing lock-by-lock as we go
-        // would ship exactly the partial rewrite the gate exists to refuse.
-        type Splice = (usize, std::ops::Range<usize>, String);
-        let mut planned: Vec<(usize, Vec<Splice>, Vec<FileEdit>)> = Vec::new();
-        let mut residuals: Vec<(&str, Vec<String>)> = Vec::new();
-        for (idx, (lock, hits)) in locks.iter().zip(&hits).enumerate() {
-            // (entry, byte range to replace, replacement text) per instance,
-            // plus one FileEdit per instance keyed by the canonical instance
-            // key — per-instance edits keep the revert ledger lossless when
-            // several instances of one dep live in the same lock.
-            let mut splices: Vec<Splice> = Vec::new();
-            let mut instance_edits: Vec<FileEdit> = Vec::new();
-            // Residual gate, judged per instance on its POST-splice body:
-            // any instance of this exact name@version still resolving
-            // somewhere other than the hosted artifact — in a spelling the
-            // splice grammar cannot parse (e.g. an unbalanced peer suffix) —
-            // makes this a partial rewrite. Shipping it would confirm and
-            // VEX-attest the dep while dependents through the unmatched
-            // instance keep installing the unpatched upstream tarball, so
-            // the dep is refused instead.
-            let mut leftover: Vec<String> = Vec::new();
-            for &i in hits {
-                let entry = lock.entry(i);
-                let suffix = pnpm::suffix(entry.key, &fname, &dep.version)
-                    .expect("hits only holds entries naming this dep");
-                let resolution = if pnpm::supported_suffix(suffix) {
-                    pnpm::resolution(&entry)
-                } else {
-                    None
-                };
-                let Some(resolution) = resolution else {
-                    if !pnpm_resolves_to(&entry, &dep.artifact_url) {
-                        leftover.push(entry.key.to_string());
-                    }
-                    continue;
-                };
-                matched_any = true;
-                let original = &lock.text[resolution.range.clone()];
-                let rebuilt = resolution.rewrite(&sha512, &dep.artifact_url);
-                let rel =
-                    resolution.range.start - entry.offset..resolution.range.end - entry.offset;
-                let body = format!(
-                    "{}{rebuilt}{}",
-                    &entry.body[..rel.start],
-                    &entry.body[rel.end..]
-                );
-                let after = pnpm::Entry {
-                    key: entry.key,
-                    body: &body,
-                    offset: 0,
-                };
-                if !pnpm_resolves_to(&after, &dep.artifact_url) {
-                    leftover.push(entry.key.to_string());
-                }
-                if rebuilt == original {
-                    continue;
-                }
-                instance_edits.push(FileEdit {
-                    path: lock.path.clone(),
-                    kind: "redirect_pnpm_resolution".into(),
-                    action: "rewritten".into(),
-                    key: Some(format!("{fname}@{}{suffix}", dep.version)),
-                    original: Some(Value::String(original.to_string())),
-                    new: Some(Value::String(rebuilt.clone())),
-                });
-                splices.push((i, resolution.range, rebuilt));
-            }
-            if !leftover.is_empty() {
-                residuals.push((lock.path.as_str(), leftover));
-                continue;
-            }
-            if !splices.is_empty() {
-                planned.push((idx, splices, instance_edits));
-            }
-        }
-        // ANY residual anywhere refuses the dep across the WHOLE lock set —
-        // nothing rewritten, nothing recorded, nothing confirmed (the same
-        // fail-closed contract the pre-splice v5/v6 refusal had): a rewrite
-        // committed in one lock while another still resolves the dep
-        // upstream would confirm the dep set-wide.
-        if !residuals.is_empty() {
-            result.refused_pnpm_uuids.insert(dep.patch_uuid.clone());
-            for (lock_key, keys) in &residuals {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_pnpm_unsupported_lock_key".into(),
-                    detail: format!(
-                        "{fname}@{} still resolves through pnpm lock key(s) whose \
-                         resolution the redirect grammar cannot repoint: {} in \
-                         {lock_key}; the dep is left unredirected in EVERY lock \
-                         (nothing rewritten, nothing confirmed) — regenerate the \
-                         lock with a current pnpm (lockfileVersion 9) and re-run",
-                        dep.version,
-                        keys.join(", ")
-                    ),
-                });
-            }
-            continue;
-        }
-        for (idx, splices, mut instance_edits) in planned {
-            let lock = &mut locks[idx];
-            for (i, range, replacement) in splices {
-                lock.spliced.insert(i);
-                lock.pending.push((range, replacement));
-            }
-            lock.changed = true;
-            result.edits.append(&mut instance_edits);
-        }
-        // The entry-not-found warning fires only when the dep matched in NO
-        // pnpm lock across the whole set, not once per lock. A VENDORED dep
-        // is named as such: `socket-patch vendor` removes the registry
-        // resolution this grammar looks for (v9 respells the packages key
-        // `<name>@file:.socket/vendor/…`; v5/v6 rekey it to a bare `file:`
-        // key but keep the `<name>@<version>: file:…` overrides line), so
-        // the generic not-locked wording would send users on a wild-goose
-        // `pnpm install` when the real path is a mode switch. Fail-closed
-        // either way: nothing is rewritten for the dep.
-        if !matched_any {
-            let v9_vendored_key = format!("{fname}@file:");
-            let override_key = format!("{fname}@{}", dep.version);
-            // Scanned over the post-splice text, so fold pending splices in.
-            for lock in locks.iter_mut() {
-                lock.materialize();
-            }
-            let vendored = locks.iter().any(|lock| {
-                lock.text.lines().any(|line| {
-                    let t = line.trim_start();
-                    let t = t.strip_prefix('\'').unwrap_or(t);
-                    // v9 packages/snapshots key (leading `/` in v6 spelling).
-                    // The vendor backend always writes the RELATIVE
-                    // `file:.socket/vendor/…` spelling here, so anchoring on
-                    // it keeps a user's own `file:` dep of the same name
-                    // from being misreported as vendored.
-                    let key = t.strip_prefix('/').unwrap_or(t);
-                    if key
-                        .strip_prefix(&v9_vendored_key)
-                        .is_some_and(|rest| rest.starts_with(".socket/vendor/"))
-                    {
-                        return true;
-                    }
-                    // overrides / root-dep line: `<name>@<version>: file:…`
-                    // (pnpm <=8 absolutizes the value, so only the
-                    // `.socket/vendor/` tail is stable enough to match).
-                    t.strip_prefix(&override_key)
-                        .map(|rest| rest.strip_prefix('\'').unwrap_or(rest))
-                        .and_then(|rest| rest.strip_prefix(':'))
-                        .is_some_and(|rest| {
-                            rest.contains("file:") && rest.contains(".socket/vendor/")
-                        })
-                })
-            });
-            if vendored {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_pnpm_entry_vendored".into(),
-                    detail: format!(
-                        "{fname}@{} has no registry resolution because it is \
-                         VENDORED (the lock resolves it to a \
-                         file:.socket/vendor/… tarball); the hosted redirect \
-                         does not apply — run `socket-patch vendor --revert` to \
-                         restore the registry resolution, then re-run `scan \
-                         --mode hosted`",
-                        dep.version
-                    ),
-                });
-            } else {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_pnpm_entry_not_found".into(),
-                    detail: format!("no resolution for {fname}@{}", dep.version),
-                });
-            }
-        }
-    }
-    for lock in locks {
-        if let Some((key, content)) = lock.into_rewritten() {
-            result.files.insert(key.clone(), content);
-        }
-    }
 }
 
 // ── yarn.lock (classic) ──────────────────────────────────────────────────────
@@ -3910,32 +3193,6 @@ fn yarn_classic_block_head(block: &str) -> Option<(String, Option<String>)> {
 /// can reproduce offline; matches the vendored backend's `SUPPORTED_CACHE_KEY`.
 const YARN_BERRY_SUPPORTED_CACHE_KEY: &str = "10c0";
 
-/// Whether ledger edits of `kind` are yarn.lock blocks — the fragments the
-/// yarn rewriters record in the lock's ON-DISK line endings, which the
-/// reverts (the per-purl takeover and the whole-ledger replay) may respell
-/// in the live lock's ending when a `core.autocrlf` checkout changed it
-/// ([`crate::utils::line_endings::fragments_in_eol_of`]).
-pub(crate) fn yarn_lock_fragment_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "redirect_yarn_berry_entry" | "redirect_yarn_classic_entry"
-    )
-}
-
-/// A yarn.lock is berry (v2+) when it carries the `__metadata:` header block;
-/// anything else is a classic v1 lock. Shared by both yarn rewriters and
-/// lockfile discovery (`vex::discover::yarn`) so the grammar split cannot
-/// drift. A leading BOM is encoding, not key text (yarn's YAML parser drops
-/// it), so a header-less lock opening with `\u{feff}__metadata:` is berry
-/// too.
-pub(crate) fn is_berry_lock(content: &str) -> bool {
-    content
-        .strip_prefix('\u{feff}')
-        .unwrap_or(content)
-        .lines()
-        .any(|line| line.starts_with("__metadata:"))
-}
-
 /// The `cacheKey:` value from the `__metadata` block (berry writes it unquoted:
 /// `  cacheKey: 10c0`), mirroring the vendored backend's `berry_field`.
 fn berry_cache_key(content: &str) -> Option<String> {
@@ -3961,8 +3218,8 @@ fn berry_cache_key(content: &str) -> Option<String> {
 /// Exposed so the vendored→hosted mode takeover (`scan`/`get --mode hosted`
 /// over a vendored berry purl) can refuse BEFORE it reverts the vendored
 /// wiring: the vendored revert never refuses on line endings (it keeps a
-/// mixed lock mixed), so without this preflight the takeover stripped the
-/// live vendored patch and then this rewriter refused the lock, leaving the
+/// mixed lock mixed), so without this preflight the takeover would strip the
+/// live vendored patch and then this rewriter would refuse the lock, leaving the
 /// package unpatched in both modes — the bun twin is
 /// [`preflight_bun_hosted`].
 ///
@@ -4083,7 +3340,7 @@ fn rewrite_yarn_berry(
             });
             continue;
         };
-        // Berry versions are UNQUOTED (`  version: 1.3.0`, spike B3 ground truth).
+        // Berry versions are UNQUOTED (`  version: 1.3.0`).
         let version_re =
             Regex::new(&(String::from(r"\n {2}version: ") + &regex::escape(&dep.version) + "\n"))
                 .expect("version regex from the escaped version is valid");
@@ -4158,8 +3415,8 @@ fn rewrite_yarn_berry(
             }
             // Descriptor ranges carry a protocol; only an `npm:` range names
             // a registry tarball this rewriter can own. A `patch:` range
-            // (yarn's OWN builtin compat patches — the 2026-07 strapi
-            // incident family), `workspace:`, `portal:`, or `link:` block
+            // (including yarn's OWN builtin compat patches), `workspace:`,
+            // `portal:`, or `link:` block
             // must survive byte-identically: splicing an npm resolution
             // under such a key corrupts the key/resolution protocol pairing.
             // Mirrors the vendor backend's fail-closed gate
@@ -4184,9 +3441,10 @@ fn rewrite_yarn_berry(
                 // the real way out. `remove <purl>` is the per-package
                 // retirement; `vendor --revert` works too but unwinds EVERY
                 // vendored package, so it is scoped, not recommended. The
-                // remedy holds whether or not a vendored→hosted pre-revert
-                // ever lands for npm-family — today no berry counterpart of
-                // the cargo takeover exists.
+                // CLI's vendored→hosted takeover (scan/hosted.rs) reverts
+                // ledger-recorded vendored npm purls, berry included, before
+                // this rewriter runs; this refusal is only reached when that
+                // wiring was not taken over (e.g. no vendor ledger entry).
                 if ranges
                     .iter()
                     .any(|r| r.starts_with("file:") && r.contains(".socket/vendor/"))
@@ -4306,24 +3564,21 @@ pub fn preflight_bun_hosted(content: &str) -> Result<(), RewriteWarning> {
 fn parse_bun_hosted_lock(
     content: &str,
 ) -> Result<(Vec<String>, Vec<crate::vendor::bun_lock_text::BunEntry>), RewriteWarning> {
-    use crate::vendor::bun_lock_text::{
-        check_lock_version, has_workspace_packages, lock_version, parse_packages_section,
-    };
+    use crate::vendor::bun_lock_text::{has_workspace_packages, lock_version};
 
     // The shared gate's `Err` text IS the detail: hosted and vendored refuse
     // an unsupported head with one message (and one remedy per arm — a
     // future version means "update socket-patch", a missing integer means
     // "re-lock"), so the two modes cannot drift apart.
-    if let Err(detail) = check_lock_version(content) {
-        return Err(RewriteWarning {
-            code: "redirect_bun_lock_unsupported".into(),
-            detail,
-        });
-    }
-    let lines: Vec<String> = content.split('\n').map(str::to_string).collect();
-    let entries = match parse_packages_section(&lines) {
-        Ok(entries) => entries,
-        Err(_) => {
+    let (lines, entries) = match crate::formats::bun::BunTextLock::parse(content) {
+        Ok(lock) => (lock.lines, lock.entries),
+        Err(crate::formats::bun::BunTextError::Version(detail)) => {
+            return Err(RewriteWarning {
+                code: "redirect_bun_lock_unsupported".into(),
+                detail,
+            });
+        }
+        Err(crate::formats::bun::BunTextError::Packages(_)) => {
             // Fail-closed: never line-splice a lock whose packages section
             // deviates from bun's emitted single-line grammar.
             return Err(RewriteWarning {
@@ -4841,7 +4096,6 @@ fn rewrite_uv_lock(
     }
 }
 
-pub(crate) mod composer_source;
 
 // ── composer.lock ────────────────────────────────────────────────────────────
 /// Whether `text` points at `artifact_url` in any spelling a rewritten file may
@@ -4850,10 +4104,9 @@ pub(crate) mod composer_source;
 /// `\/`-escaped slashes an older composer wrote, which redirect the install just
 /// as well. Shared by the composer rewriter's already-redirected check and the
 /// CLI's post-rewrite confirmation probe so the writer's spelling and the
-/// probe's cannot drift: the probe searched only raw and percent-encoded urls
-/// while the composer rewriter emitted `\/`, so a fully successful composer
-/// redirect reported nothing redirected — no patch record reached the ledger and
-/// `vex` had nothing to attest.
+/// probe's cannot drift: a probe blind to `\/` would report a fully
+/// successful composer redirect as nothing redirected, leaving `vex` nothing
+/// to attest.
 pub fn artifact_url_present(text: &str, artifact_url: &str) -> bool {
     text.contains(artifact_url) || text.contains(&artifact_url.replace('/', "\\/"))
 }
@@ -4864,273 +4117,6 @@ pub fn artifact_url_present(text: &str, artifact_url: &str) -> bool {
 /// `artifact_url_present` answers for every text.
 pub fn artifact_url_spellings(artifact_url: &str) -> [String; 2] {
     [artifact_url.to_string(), artifact_url.replace('/', "\\/")]
-}
-
-/// Byte offset of the `}` closing the JSON object that CONTAINS `from`, which
-/// must be a position inside that object. Brace counting skips string literals,
-/// so a brace inside a description or URL cannot move the boundary.
-///
-/// Walks bytes, not chars: every byte it acts on is ASCII, and no byte of a
-/// multi-byte UTF-8 sequence is, so the offsets are the char walk's (an
-/// escaped multi-byte char clears `escaped` on its lead byte).
-fn json_object_end_from(text: &str, from: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (offset, &byte) in text.as_bytes()[from..].iter().enumerate() {
-        if in_string {
-            match byte {
-                _ if escaped => escaped = false,
-                b'\\' => escaped = true,
-                b'"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match byte {
-            b'"' => in_string = true,
-            b'{' => depth += 1,
-            b'}' if depth == 0 => return Some(from + offset),
-            b'}' => depth -= 1,
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Value of the first `"<key>": "<value>"` pair in `text` (composer writes its
-/// lock with exactly one space after the colon, the same shape the surgical
-/// `dist` regexes below assume).
-fn json_string_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    let pattern = format!("\"{key}\": \"");
-    let start = text.find(&pattern)? + pattern.len();
-    let end = text[start..].find('"')? + start;
-    Some(&text[start..end])
-}
-
-/// Outcome of locating a package entry in a composer.lock.
-enum ComposerEntry {
-    /// Inclusive byte range from the entry's `"name"` key to the `}` closing
-    /// the entry — composer writes `name` first, so this covers every key the
-    /// rewriter edits.
-    Found(usize, usize),
-    /// The name matched but the lock pins this OTHER version.
-    VersionMismatch(String),
-    NotFound,
-}
-
-/// Locate `pkg`'s entry in a composer.lock (either `packages[]` or
-/// `packages-dev[]` — the scan is over the whole file).
-///
-/// Names match CASE-INSENSITIVELY, the way the composer crawler and the vendor
-/// backend already match them: packagist canonicalizes to lowercase, but
-/// hand-written mixed-case locks install fine and would otherwise silently miss
-/// the redirect. The locked version must match the patched one by composer
-/// release identity (locks carry the pretty `v6.4.1`, PURLs the bare `6.4.1`
-/// or padded `6.4.1.0`); matching on name alone repointed whatever version the
-/// lock happened to hold at a patch built for a different one.
-fn find_composer_entry(content: &str, pkg: &str, version: &str) -> ComposerEntry {
-    let mut mismatched: Option<String> = None;
-    for (name_idx, _) in content.match_indices("\"name\": \"") {
-        // The name is the value at `name_idx` — the entry's first field —
-        // and its closing quote precedes any `}` the object walk can stop
-        // at, so test it before walking to the end of the object: most
-        // occurrences name some other package.
-        if !json_string_field(&content[name_idx..], "name")
-            .is_some_and(|n| n.eq_ignore_ascii_case(pkg))
-        {
-            continue;
-        }
-        let Some(end) = json_object_end_from(content, name_idx) else {
-            continue;
-        };
-        let entry = &content[name_idx..=end];
-        // Every package entry carries `version`; an `authors[]`/`support`
-        // object that happens to have a matching `name` does not.
-        let Some(locked) = json_string_field(entry, "version") else {
-            continue;
-        };
-        if composer_versions_equivalent(locked, version) {
-            return ComposerEntry::Found(name_idx, end);
-        }
-        mismatched = Some(locked.to_string());
-    }
-    match mismatched {
-        Some(locked) => ComposerEntry::VersionMismatch(locked),
-        None => ComposerEntry::NotFound,
-    }
-}
-
-/// Append `"shasum": "<sha1>"` as the last key of a `"dist": { … }` block,
-/// indented like the keys already in it. VCS/zipball dists omit `shasum`
-/// entirely; redirecting such a block without inserting the pin left the hosted
-/// artifact unverified, so composer would install whatever the URL returned.
-/// `block` is the whole dist object and already holds at least a `url`.
-fn append_composer_shasum(block: &str, sha1: &str) -> String {
-    let Some(close) = block.rfind('}') else {
-        return block.to_string();
-    };
-    let head = block[..close].trim_end();
-    let indent: String = head[head.rfind('\n').map_or(0, |i| i + 1)..]
-        .chars()
-        .take_while(|c| c.is_whitespace())
-        .collect();
-    format!(
-        "{head},\n{indent}\"shasum\": \"{sha1}\"{}",
-        &block[head.len()..]
-    )
-}
-
-static COMPOSER_DIST_TYPE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"("type": ")[^"]*(")"#).expect("static dist type regex is valid")
-});
-static COMPOSER_DIST_URL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"("url": ")[^"]*(")"#).expect("static dist url regex is valid"));
-static COMPOSER_DIST_SHASUM_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"("shasum": ")[^"]*(")"#).expect("static dist shasum regex is valid")
-});
-
-fn rewrite_composer_lock(
-    files: &BTreeMap<String, String>,
-    overrides: &[DepOverride],
-    result: &mut RewriteResult,
-) {
-    let composer: Vec<&DepOverride> = overrides
-        .iter()
-        .filter(|o| o.ecosystem == "composer")
-        .collect();
-    if composer.is_empty() {
-        return;
-    }
-    // Parity with `redirect_npm_no_lockfile`: a granted dep the project has
-    // no lock to pin must be SAID, not silently dropped from the redirected
-    // count (a composer.json + installed vendor tree without a lock is
-    // discovered and granted like any other).
-    if !files.contains_key("composer.lock") {
-        result.warnings.push(RewriteWarning {
-            code: "redirect_composer_no_lockfile".into(),
-            detail: "no composer.lock present; composer redirect skipped".into(),
-        });
-        return;
-    }
-    const DIST_KEY: &str = "\"dist\": {";
-    let mut content = files["composer.lock"].clone();
-    let type_re: &Regex = &COMPOSER_DIST_TYPE_RE;
-    let url_re: &Regex = &COMPOSER_DIST_URL_RE;
-    let shasum_re: &Regex = &COMPOSER_DIST_SHASUM_RE;
-    let mut changed = false;
-    for dep in &composer {
-        let composer_name = full_name(dep);
-        let Some(sha1) = dep.integrity.sha1.clone() else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_composer_missing_sha1".into(),
-                detail: format!("{composer_name} has no sha1 (dist.shasum) integrity"),
-            });
-            continue;
-        };
-        let (entry_start, entry_end) =
-            match find_composer_entry(&content, &composer_name, &dep.version) {
-                ComposerEntry::Found(start, end) => (start, end),
-                ComposerEntry::VersionMismatch(locked) => {
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_composer_version_mismatch".into(),
-                        detail: format!(
-                            "composer.lock pins {composer_name}@{locked}, not the patched {}",
-                            dep.version
-                        ),
-                    });
-                    continue;
-                }
-                ComposerEntry::NotFound => {
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_composer_pkg_not_found".into(),
-                        detail: format!(
-                            "no composer.lock package named {composer_name}@{}",
-                            dep.version
-                        ),
-                    });
-                    continue;
-                }
-            };
-        // The dist block MUST belong to the located entry. Scanning forward
-        // from the name for the next `"dist": {` walked into the FOLLOWING
-        // package whenever the target was installed from source, repointing a
-        // bystander's url + shasum — a checksum-clean install of the wrong
-        // code. A target with no dist of its own pins nothing: fail closed.
-        let Some(dist_start) = content[entry_start..=entry_end]
-            .find(DIST_KEY)
-            .map(|offset| entry_start + offset)
-        else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_composer_no_dist".into(),
-                detail: format!("{composer_name} has no dist block"),
-            });
-            continue;
-        };
-        let Some(dist_end) = json_object_end_from(&content, dist_start + DIST_KEY.len()) else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_composer_lock_malformed".into(),
-                detail: format!("{composer_name}'s dist block is unterminated"),
-            });
-            continue;
-        };
-        // The dist's own members only: a `mirrors` entry listed before the
-        // dist `url` would otherwise take the redirected url and then be
-        // dropped with the mirrors, leaving the upstream url pinned to the
-        // patched sha1.
-        let current = &content[dist_start..=dist_end];
-        let block =
-            composer_source::strip_dist_mirrors(current).unwrap_or_else(|| current.to_string());
-        // Already redirected (either slash spelling): only the source/mirrors
-        // heal applies, so a re-run over a healed lock records no edit and
-        // the ledger never grows.
-        let already_redirected =
-            artifact_url_present(&block, &dep.artifact_url) && block.contains(&sha1);
-        if !already_redirected && !block.contains("\"url\": \"") {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_composer_no_dist_url".into(),
-                detail: format!("{composer_name}'s dist block has no url to redirect"),
-            });
-            continue;
-        }
-        let mut rewritten = type_re.replace(&block, "${1}zip${2}").to_string();
-        rewritten = url_re
-            .replace(
-                &rewritten,
-                format!("${{1}}{}${{2}}", dep.artifact_url).as_str(),
-            )
-            .to_string();
-        rewritten = if rewritten.contains("\"shasum\": \"") {
-            shasum_re
-                .replace(&rewritten, format!("${{1}}{sha1}${{2}}").as_str())
-                .to_string()
-        } else {
-            append_composer_shasum(&rewritten, &sha1)
-        };
-        let rewritten = (!already_redirected).then_some(rewritten);
-        // Drops the entry's `source` wherever it sits and the dist's
-        // `mirrors` (see `composer_source`); the edit spans both, so the
-        // ledger's fragment revert restores them byte-for-byte.
-        let span = composer_source::DistSpan {
-            entry_start,
-            entry_end,
-            dist_start,
-            dist_end,
-        };
-        if let Some(edit) = composer_source::apply_dist_edit(
-            &mut content,
-            span,
-            rewritten.as_deref(),
-            &composer_name,
-            &mut result.warnings,
-        ) {
-            changed = true;
-            result.edits.push(edit);
-        }
-    }
-    if changed {
-        result.files.insert("composer.lock".into(), content);
-    }
 }
 
 // ── nuget (nuget.config + packages.lock.json) ────────────────────────────────
@@ -5557,7 +4543,7 @@ fn rewrite_nuget(
 /// version-constraint args (`"7.0.0"`, `'~> 7.0'`, `">= 1", "< 2"`) — i.e. the
 /// options (`require: false`, `group: :test`, …) that must survive the move
 /// into the source block. Empty when the line carries none; bails to empty on
-/// an unparseable tail (unbalanced quote), matching the previous behavior.
+/// an unparseable tail (unbalanced quote).
 /// Shared with the vendor backend's Gemfile rewrite (`vendor::gem`),
 /// which has the same drop-the-options failure mode.
 pub(crate) fn gem_line_trailing_options(tail: &str) -> String {
@@ -5740,12 +4726,12 @@ pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec
 /// A dep's Socket index URL as a regex source with the per-request rotating
 /// segments (grant token, patch uuid) wildcarded — an exact-URL pattern
 /// misses the URL a previous run wrote under an older grant. The grant token
-/// is wildcarded even when the caller left `dep.token` empty (the CLI
-/// historically never populated it): the token path level is derived from
+/// is wildcarded even when the caller left `dep.token` empty: the token path
+/// level is derived from
 /// the index URL itself as the segment immediately preceding the patch-uuid
 /// level, so the idempotency guard never silently degrades into the
 /// nesting-corruption failure mode when a caller forgets the token.
-fn gem_index_url_pattern(dep: &DepOverride, index_url: &str) -> String {
+pub(crate) fn gem_index_url_pattern(dep: &DepOverride, index_url: &str) -> String {
     let mut url_pat = regex::escape(index_url);
     let derived_token = grant_token_path_segment(index_url, &dep.patch_uuid);
     let rotating = [
@@ -5801,271 +4787,6 @@ fn gem_spelling_residue(content: &str, deps: &[&DepOverride]) -> String {
     residue.trim_end().to_string()
 }
 
-/// A lock line without its `\r?\n` ending (never more than one of each).
-fn gem_lock_line_content(line: &str) -> &str {
-    let line = line.strip_suffix('\n').unwrap_or(line);
-    line.strip_suffix('\r').unwrap_or(line)
-}
-
-/// The gem name of a 2-space DEPENDENCIES entry (`  rails`, `  rails!`,
-/// `  rails (= 7.0.0)!`) — the text before any constraint, sans source pin.
-fn gem_lock_dependency_name(entry: &str) -> &str {
-    let entry = entry.trim_start();
-    let entry = entry.split(" (").next().unwrap_or(entry);
-    entry.trim_end_matches('!')
-}
-
-/// One parsed `GEM` section of a Gemfile.lock: its header line index, its
-/// `remote:` lines (index + URL) and the exclusive end index — the start of
-/// the next column-0 header (trailing blank separator included) or EOF.
-struct GemLockSection {
-    start: usize,
-    remotes: Vec<(usize, String)>,
-    end: usize,
-}
-
-/// Converge the lock's source attribution for one redirected dep so the
-/// Gemfile + lock pair is what bundler itself would write after an install
-/// from the redirected Gemfile (verified frozen-installable on bundler 4):
-/// the dep's spec entry (+ its dependency sublines) moves out of the
-/// upstream `GEM` section into a patch-registry `GEM` section
-/// (`remote: <index-url>`), and DEPENDENCIES pins `<name> (= <version>)!`
-/// (bundler's source-pin spelling for a block-scoped exact-version gem) —
-/// added in sorted position when the dep was transitive. Without this the
-/// CHECKSUMS pin leaves a MIXED state bundler refuses: the lock still
-/// attributes the gem to the upstream remote, so the prescribed unfrozen
-/// install exits 37 "mismatched checksums" and a frozen install exits 16.
-///
-/// Idempotent and rotation-aware: a section whose remote matches the
-/// token-wildcard pattern is recognized as ours (never duplicated) and its
-/// remote is refreshed in place under a rotated grant
-/// (`redirect_gemfile_lock_source_url`, mirroring the Gemfile refresh).
-///
-/// Returns true when the lock ends converged (already, or via edits recorded
-/// into `result`); false when the dep cannot be attributed safely — spec
-/// entry absent or duplicated, a legacy multi-remote `GEM` section, or no
-/// DEPENDENCIES section — in which case nothing is touched and the caller
-/// surfaces the frozen-install caveat exactly as before.
-fn converge_gem_lock_source(
-    lk: &mut String,
-    dep: &DepOverride,
-    index_url: &str,
-    lock_name: &str,
-    lock_changed: &mut bool,
-    result: &mut RewriteResult,
-) -> bool {
-    let eol = if lk.contains("\r\n") { "\r\n" } else { "\n" };
-    let mut lines: Vec<String> = lk.split_inclusive('\n').map(str::to_string).collect();
-    let is_header = |c: &str| !c.is_empty() && !c.starts_with(' ');
-
-    // Parse: GEM sections, the dep's 4-space spec entry, DEPENDENCIES range.
-    let spec_content = format!("    {} ({})", dep.name, dep.version);
-    let mut sections: Vec<GemLockSection> = Vec::new();
-    let mut spec_at: Vec<(usize, usize)> = Vec::new(); // (section idx, line idx)
-    let mut deps_range: Option<(usize, usize)> = None; // exclusive of header
-    let mut i = 0;
-    while i < lines.len() {
-        let c = gem_lock_line_content(&lines[i]);
-        if !is_header(c) {
-            i += 1;
-            continue;
-        }
-        let header_is_gem = c == "GEM";
-        let start = i;
-        let mut remotes = Vec::new();
-        let mut j = i + 1;
-        while j < lines.len() && !is_header(gem_lock_line_content(&lines[j])) {
-            let cj = gem_lock_line_content(&lines[j]);
-            if header_is_gem {
-                if let Some(url) = cj.strip_prefix("  remote: ") {
-                    remotes.push((j, url.to_string()));
-                }
-                if cj == spec_content {
-                    spec_at.push((sections.len(), j));
-                }
-            }
-            j += 1;
-        }
-        if header_is_gem {
-            sections.push(GemLockSection {
-                start,
-                remotes,
-                end: j,
-            });
-        } else if c == "DEPENDENCIES" {
-            deps_range = Some((start + 1, j));
-        }
-        i = j;
-    }
-
-    let spec_pos = if spec_at.len() == 1 {
-        Some(spec_at[0])
-    } else {
-        None
-    };
-    let (Some((sec_idx, spec_idx)), Some((deps_start, deps_end))) = (spec_pos, deps_range) else {
-        return false;
-    };
-    if sections[sec_idx].remotes.len() != 1 {
-        return false;
-    }
-    // Bundler always writes source sections before DEPENDENCIES — the pin
-    // edit below runs first on that premise (its lines sit after the parsed
-    // spec/remote/end indices, so they never shift). A hand-edited lock with
-    // DEPENDENCIES before the dep's GEM section breaks the premise: the
-    // transitive-dep pin INSERT would leave the spec-move splicing on stale
-    // indices. Fail soft to the mixed state instead.
-    if deps_start < sections[sec_idx].end {
-        return false;
-    }
-    let (remote_idx, remote_url) = sections[sec_idx].remotes[0].clone();
-    let socket_remote_re = Regex::new(&format!("^{}$", gem_index_url_pattern(dep, index_url)))
-        .expect("anchored index-url pattern from the escaped URL is valid");
-    let mut changed = false;
-
-    // DEPENDENCIES pin first — its lines sit AFTER the GEM sections, so the
-    // spec move below never invalidates these indices (and vice versa would).
-    let target = format!("  {} (= {})!", dep.name, dep.version);
-    let is_entry = |c: &str| c.starts_with("  ") && !c.starts_with("   ");
-    let entry_idx = (deps_start..deps_end).find(|&k| {
-        let ck = gem_lock_line_content(&lines[k]);
-        is_entry(ck) && gem_lock_dependency_name(ck) == dep.name
-    });
-    match entry_idx {
-        Some(k) if gem_lock_line_content(&lines[k]) == target => {}
-        Some(k) => {
-            let old = gem_lock_line_content(&lines[k]).trim_start().to_string();
-            let ending = lines[k][gem_lock_line_content(&lines[k]).len()..].to_string();
-            lines[k] = format!("{target}{ending}");
-            result.edits.push(FileEdit {
-                path: lock_name.into(),
-                kind: "redirect_gemfile_lock_dependency_pin".into(),
-                action: "rewritten".into(),
-                key: Some(dep.name.clone()),
-                original: Some(Value::String(old)),
-                new: Some(Value::String(target.trim_start().to_string())),
-            });
-            changed = true;
-        }
-        None => {
-            // Transitive dep: bundler keeps DEPENDENCIES sorted by name.
-            let mut at = deps_end;
-            for (k, line) in lines.iter().enumerate().take(deps_end).skip(deps_start) {
-                let ck = gem_lock_line_content(line);
-                if ck.is_empty()
-                    || (is_entry(ck) && gem_lock_dependency_name(ck) > dep.name.as_str())
-                {
-                    at = k;
-                    break;
-                }
-            }
-            lines.insert(at, format!("{target}{eol}"));
-            result.edits.push(FileEdit {
-                path: lock_name.into(),
-                kind: "redirect_gemfile_lock_dependency_pin".into(),
-                action: "added".into(),
-                key: Some(dep.name.clone()),
-                original: None,
-                new: Some(Value::String(target.trim_start().to_string())),
-            });
-            changed = true;
-        }
-    }
-
-    if socket_remote_re.is_match(&remote_url) {
-        // Already ours. Rotated grant: refresh the remote in place.
-        if remote_url != index_url {
-            let ending =
-                lines[remote_idx][gem_lock_line_content(&lines[remote_idx]).len()..].to_string();
-            lines[remote_idx] = format!("  remote: {index_url}{ending}");
-            result.edits.push(FileEdit {
-                path: lock_name.into(),
-                kind: "redirect_gemfile_lock_source_url".into(),
-                action: "rewritten".into(),
-                key: Some(dep.name.clone()),
-                original: Some(Value::String(remote_url)),
-                new: Some(Value::String(index_url.to_string())),
-            });
-            changed = true;
-        }
-    } else {
-        // Move the spec (+ sublines) into a patch-registry section of its
-        // own, inserted where bundler itself writes it: bundler emits the
-        // rubygems `GEM` sections sorted by source identifier
-        // (`SourceList#lock_rubygems_sources`: `sort_by(&:identifier)`, i.e.
-        // by the section's remote URLs), so the new section goes before the
-        // first `GEM` section whose remotes sort after the index URL, else
-        // after the last one. A frozen install re-renders the lock, and
-        // since bundler 4.0.19 (rubygems#9750, "fail instead of warning when
-        // frozen mode can't update the lockfile") any difference is fatal:
-        // "Your lockfile needs to be updated, but it can't be because frozen
-        // mode is set". Appending after `https://rubygems.org/` when the
-        // patch registry (`https://patch.socket.dev/…`) sorts first broke
-        // every converged hosted pair under `BUNDLE_FROZEN` / deployment
-        // mode (verified: 4.0.15 installs it, 4.0.21 refuses it).
-        let mut last = spec_idx;
-        while last + 1 < lines.len()
-            && gem_lock_line_content(&lines[last + 1]).starts_with("      ")
-        {
-            last += 1;
-        }
-        let moved: Vec<String> = lines.drain(spec_idx..=last).collect();
-        let n = moved.len();
-        // Section bounds after the drain (every drained line sat inside
-        // section `sec_idx`, which keeps its start).
-        let bounds = |k: usize| -> (usize, usize) {
-            let s = &sections[k];
-            match k.cmp(&sec_idx) {
-                std::cmp::Ordering::Less => (s.start, s.end),
-                std::cmp::Ordering::Equal => (s.start, s.end - n),
-                std::cmp::Ordering::Greater => (s.start - n, s.end - n),
-            }
-        };
-        let identifier = |k: usize| -> String {
-            sections[k]
-                .remotes
-                .iter()
-                .map(|(_, url)| url.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let insert_at = (0..sections.len())
-            .find(|&k| identifier(k).as_str() > index_url)
-            .map(|k| bounds(k).0)
-            .unwrap_or_else(|| bounds(sections.len() - 1).1);
-        let mut block: Vec<String> = Vec::with_capacity(moved.len() + 4);
-        block.push(format!("GEM{eol}"));
-        block.push(format!("  remote: {index_url}{eol}"));
-        block.push(format!("  specs:{eol}"));
-        for line in moved {
-            // Moved lines keep their own bytes; only a final line that lacked
-            // a newline (EOF) gains the file's ending.
-            if line.ends_with('\n') {
-                block.push(line);
-            } else {
-                block.push(format!("{line}{eol}"));
-            }
-        }
-        block.push(eol.to_string());
-        lines.splice(insert_at..insert_at, block);
-        result.edits.push(FileEdit {
-            path: lock_name.into(),
-            kind: "redirect_gemfile_lock_gem_source".into(),
-            action: "rewritten".into(),
-            key: Some(dep.name.clone()),
-            original: Some(Value::String(remote_url)),
-            new: Some(Value::String(index_url.to_string())),
-        });
-        changed = true;
-    }
-
-    if changed {
-        *lk = lines.concat();
-        *lock_changed = true;
-    }
-    true
-}
-
 fn rewrite_gem(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -6080,7 +4801,7 @@ fn rewrite_gem(
     // `default_gemfile` tries gems.rb first — verified on bundler 4.0.15,
     // which warns "Multiple gemfiles (gems.rb and Gemfile) detected ...
     // bundler is ignoring them in favor of gems.rb and gems.locked"; same
-    // order as `setup::gem::discover_bundler_project`). DIVERGING spellings
+    // order as the ruby crawler's manifest probe). DIVERGING spellings
     // are ambiguous — the redirect would land in the file bundler reads while
     // tooling pinned to the other keeps resolving upstream — so fail closed
     // on the whole gem set. Divergence is judged on the redirect-footprint
@@ -6115,8 +4836,8 @@ fn rewrite_gem(
     // Static regex — compile once, not per-dependency (clippy: regex-in-loop).
     // `\r?` throughout the lock handling: a CRLF Gemfile.lock is legal to
     // bundler (verified: `bundle check`/frozen install both accept one on
-    // 4.0.15), and without the tolerance the CHECKSUMS header never matched,
-    // misdiagnosing the lock as bundler <2.6.
+    // 4.0.15), and without the tolerance the CHECKSUMS header would never
+    // match, misdiagnosing the lock as bundler <2.6.
     let checksums_re =
         Regex::new(r"(?m)^CHECKSUMS(\r?)$").expect("static CHECKSUMS header regex is valid");
     // True once any redirected dep leaves the pair MIXED: the lock still
@@ -6418,46 +5139,30 @@ fn rewrite_gem(
                 });
                 continue;
             }
-            let sum_line_re = Regex::new(
-                &(String::from(r"(?m)^(  ")
-                    + &regex::escape(&dep.name)
-                    + r" \("
-                    + &regex::escape(&dep.version)
-                    + r"\)) sha256=([0-9a-f]+)(\r?)$"),
-            )
-            .expect("checksum-line regex from the escaped name/version is valid");
             let new_val = format!("{} ({}) sha256={sha256}", dep.name, dep.version);
-            // Already redirected (re-run): the CHECKSUMS line is at the
-            // target value; recording an edit would grow the ledger forever.
-            let already_re =
-                Regex::new(&(String::from(r"(?m)^  ") + &regex::escape(&new_val) + r"\r?$"))
-                    .expect("already-redirected regex from the escaped line is valid");
             let mut checksums_era = true;
-            if already_re.is_match(lk) {
-                // no-op
-            } else if let Some(m) = sum_line_re.captures(lk) {
-                // The pre-edit line goes into the ledger as `original` so a
-                // future `--revert` can restore the upstream sha.
-                let old_val = format!(
-                    "{} ({}) sha256={}",
-                    dep.name,
-                    dep.version,
-                    m.get(2)
-                        .expect("sum_line_re always captures group 2 (sha hex)")
-                        .as_str()
-                );
-                *lk = sum_line_re
-                    .replace(lk, format!("${{1}} sha256={sha256}${{3}}").as_str())
-                    .to_string();
-                lock_changed = true;
-                result.edits.push(FileEdit {
-                    path: lock_name.into(),
-                    kind: "redirect_gemfile_lock_checksum".into(),
-                    action: "rewritten".into(),
-                    key: Some(dep.name.clone()),
-                    original: Some(Value::String(old_val)),
-                    new: Some(Value::String(new_val)),
-                });
+            // The entry for exactly `name (version)`, read with the shared
+            // Bundler-lock grammar the discovery reader uses — whatever
+            // digests it carries (bare, uppercase, several algorithms), so it
+            // is REPLACED, never shadowed by a second, conflicting entry.
+            if let Some((start, end)) = checksum_entry_span(lk, &dep.name, &dep.version) {
+                let old_val = lk[start + 2..end].to_string();
+                // Already redirected (re-run): the entry is at the target
+                // value; recording an edit would grow the ledger forever.
+                if old_val != new_val {
+                    lk.replace_range(start + 2..end, &new_val);
+                    lock_changed = true;
+                    // The pre-edit entry goes into the ledger verbatim as
+                    // `original` so a revert restores the upstream digests.
+                    result.edits.push(FileEdit {
+                        path: lock_name.into(),
+                        kind: "redirect_gemfile_lock_checksum".into(),
+                        action: "rewritten".into(),
+                        key: Some(dep.name.clone()),
+                        original: Some(Value::String(old_val)),
+                        new: Some(Value::String(new_val)),
+                    });
+                }
             } else if checksums_re.is_match(lk) {
                 *lk = checksums_re
                     .replace(
@@ -6492,7 +5197,7 @@ fn rewrite_gem(
             // sha pinned, bundler still attributes the gem to the upstream
             // remote and refuses the pair outright (unfrozen: exit 37
             // "mismatched checksums"; frozen: exit 16). A pre-CHECKSUMS lock
-            // has no sha to converge around, so it keeps today's
+            // has no sha to converge around, so it keeps the
             // mixed-but-installable state + the frozen-install caveat.
             if !checksums_era
                 || !converge_gem_lock_source(
@@ -6753,8 +5458,7 @@ fn rewrite_maven_pom(
 
         // LEGACY same-GAV fallback: no suffixed version means the patched jar is
         // served under its original GAV. Add the repository (transport checksum
-        // policy `fail`) exactly as before and warn that this is NOT
-        // fail-closed.
+        // policy `fail`) and warn that this is NOT fail-closed.
         let Some(suffixed_version) = suffixed_version else {
             // Verify-only inspection: warn when the redirect can't take effect.
             // Only the FIRST match matters here (legacy behavior).
@@ -7204,7 +5908,7 @@ fn go_token_safe(s: &str) -> bool {
     !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-// The committable shape (validated empirically — `docs/design/golang-hosted.md`):
+// The committable shape (validated empirically — `docs/ecosystems.md#go-directory-replaces-and-gosum`):
 //
 //   go.mod:  replace <orig> <ver> => patch.socket.dev/gopatch/<uuid> <sver>
 //   go.sum:  patch.socket.dev/gopatch/<uuid> <sver> h1:…          (zip dirhash)
@@ -7215,7 +5919,7 @@ fn go_token_safe(s: &str) -> bool {
 // grant-free/content-addressed (one build-once artifact per patch, public on
 // the free tier), and with the pinned replace in force go never fetches or
 // verifies the original module at all. A dep whose reference carries no
-// `goproxy` override falls back to the historical `redirect_golang_unsupported`
+// `goproxy` override falls back to the `redirect_golang_unsupported`
 // warning (the paid tier's tokened URLs remain a genuine no-go — see the
 // design doc's paid-tier analysis).
 fn rewrite_golang(
@@ -7515,7 +6219,6 @@ mod tests {
             token: String::new(),
             patch_uuid: "11111111-1111-4111-8111-111111111111".into(),
             artifact_url: url.into(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha512: Some(sha512.into()),
@@ -7533,7 +6236,6 @@ mod tests {
             token: String::new(),
             patch_uuid: "11111111-1111-4111-8111-111111111111".into(),
             artifact_url: url.into(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha256: Some(sha256.into()),
@@ -7545,7 +6247,7 @@ mod tests {
     /// Re-running a rewriter over its own output must be a no-op: zero new
     /// edits, byte-identical files. Recorded edits whose `original` is the
     /// already-redirected value would grow the committed ledger on every
-    /// `scan --redirect` run and poison a future revert.
+    /// hosted `scan` run and poison a future revert.
     #[test]
     fn second_pass_over_rewritten_output_is_a_noop() {
         let mut files = BTreeMap::new();
@@ -7608,7 +6310,7 @@ mod tests {
 
     /// The requirements marker is taken from the requirement portion only —
     /// a previously appended `--hash=…` must never be swallowed into the
-    /// marker (that duplicated the hash on every re-run).
+    /// marker (that would duplicate the hash on every re-run).
     #[test]
     fn requirements_marker_line_is_rerun_stable() {
         let mut files = BTreeMap::new();
@@ -7684,7 +6386,6 @@ mod tests {
             artifact_url:
                 "https://patch.socket.dev/patch/maven/org.slf4j/slf4j-api/1.7.36/tok/uuid/slf4j-api-1.7.36.jar"
                     .into(),
-            berry_zip_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "maven2".into(),
                 index_url: "https://patch.socket.dev/patch-registry/maven/tok/uuid/maven2".into(),
@@ -7988,7 +6689,6 @@ mod tests {
             token: "tok".into(),
             patch_uuid: "uuid".into(),
             artifact_url: "https://patch.test/newtonsoft.json.13.0.3.nupkg".into(),
-            berry_zip_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "nuget-v3".into(),
                 index_url: "https://patch.test/nuget/index.json".into(),
@@ -8168,7 +6868,7 @@ mod tests {
         }
     }
 
-    /// An `<add>` keyed nuget.org that the strict scan used to miss (XML
+    /// An `<add>` keyed nuget.org that a strict scan would miss (XML
     /// allows whitespace around `=` and any attribute order) is a REAL
     /// source: it must be harvested as the catch-all target — not
     /// double-added by the seed, and not left out of the `*` fan-out.
@@ -8197,11 +6897,10 @@ mod tests {
     /// A `<packageSources >`-style open tag, or single-quoted `<add>`
     /// attributes — both valid XML NuGet parses — is a REAL source list: its
     /// keys must be harvested and the socket source inserted into the
-    /// EXISTING element. The literal probes used to read it as zero sources:
-    /// a SECOND `<packageSources>` element appeared carrying a duplicate
-    /// nuget.org seed, and the catch-all fanned `*` only to nuget.org —
-    /// every corp-feed-only package then NU1100s. Mirrors the tolerant
-    /// vendor/nuget_feed twin.
+    /// EXISTING element. Read as zero sources, a SECOND `<packageSources>`
+    /// element would appear carrying a duplicate nuget.org seed, and the
+    /// catch-all would fan `*` only to nuget.org — every corp-feed-only
+    /// package would NU1100. Mirrors the tolerant vendor/nuget_feed twin.
     #[test]
     fn nuget_open_tag_whitespace_and_single_quotes_harvested_not_reseeded() {
         for config in [
@@ -8240,7 +6939,7 @@ mod tests {
 
     /// A root open tag that isn't the literal `<configuration>` — trailing
     /// whitespace or attributes, both valid XML NuGet parses fine — must
-    /// still receive the source insert. The literal `replacen` used to no-op
+    /// still receive the source insert. A literal `replacen` would no-op
     /// silently while the mapping (anchored on the close tag) still landed,
     /// routing the patched id to a source that was never defined.
     #[test]
@@ -8494,9 +7193,9 @@ mod tests {
         )
     }
 
-    /// REGRESSION (yarn 4.0.x): a lock that spells its `10c0` checksums
-    /// bare (yarn 4.0.0–4.0.2) gets the hosted entry's checksum spelled bare
-    /// — the API's prefixed `yarnBerry10c0` made `yarn install --immutable`
+    /// yarn 4.0.x: a lock that spells its `10c0` checksums bare (yarn
+    /// 4.0.0–4.0.2) gets the hosted entry's checksum spelled bare — the
+    /// API's prefixed `yarnBerry10c0` would make `yarn install --immutable`
     /// reject the rewritten lock (YN0028). A 4.1+ (prefixed) lock keeps it.
     #[test]
     fn yarn_berry_checksum_follows_the_lock_spelling() {
@@ -8614,17 +7313,14 @@ mod tests {
 
     /// A `file:` lock entry carrying the `.socket/vendor/` signature is
     /// socket-patch's OWN vendored wiring (a `scan --mode vendored` project
-    /// being converted to hosted). Refusing it under the generic
-    /// `redirect_yarn_berry_unsupported_protocol` code misdiagnosed it —
-    /// the detail hardcoded "(workspace:/patch:/portal:/link:)" (`file:`
-    /// was not even listed) and named no way out. The refusal itself is
-    /// correct (fail-closed, byte-identical), but it must carry a DISTINCT
-    /// code and the real per-package remediation: retire the vendored
-    /// wiring first (`socket-patch remove <purl>`; `vendor --revert`
-    /// unwinds EVERY vendored package), then re-run `scan --mode hosted`.
-    /// That remedy holds whether or not a vendored→hosted pre-revert ever
-    /// lands for npm-family — today no berry counterpart of the cargo
-    /// takeover exists, so manual retirement is the only path.
+    /// being converted to hosted). The refusal is fail-closed and
+    /// byte-identical, but it must carry a DISTINCT code (not the generic
+    /// `redirect_yarn_berry_unsupported_protocol`) and the real per-package
+    /// remediation: retire the vendored wiring first (`socket-patch remove
+    /// <purl>`; `vendor --revert` unwinds EVERY vendored package), then
+    /// re-run `scan --mode hosted`. This refusal covers vendored wiring the
+    /// CLI takeover did not revert (e.g. no vendor ledger entry), where
+    /// manual retirement is the way out.
     #[test]
     fn yarn_berry_vendored_file_entry_refused_with_distinct_code_and_remediation() {
         let checksum = format!("10c0/{}", "7".repeat(128));
@@ -8683,8 +7379,8 @@ mod tests {
             "must name the re-run step: {}",
             w.detail
         );
-        // The old misdiagnosis must be gone: no four-protocol list that
-        // does not even include `file:`.
+        // Not the generic four-protocol list that does not even include
+        // `file:`.
         assert!(
             !w.detail.contains("(workspace:/patch:/portal:/link:)"),
             "must not misdiagnose the vendored entry with the generic \
@@ -8696,8 +7392,7 @@ mod tests {
     /// The generic unsupported-protocol refusal must name the entry's
     /// ACTUAL protocol (backticked), not a hardcoded four-item list that
     /// omits, e.g., `file:` — an operator debugging the refusal needs the
-    /// real cause, and the old list actively misdirected for any protocol
-    /// outside it.
+    /// real cause, and a fixed list misdirects for any protocol outside it.
     #[test]
     fn yarn_berry_unsupported_protocol_detail_names_actual_protocol() {
         let checksum = format!("10c0/{}", "7".repeat(128));
@@ -8767,7 +7462,7 @@ mod tests {
     }
 
     /// Two-entry classic lock: a decoy entry FIRST, the target second — the
-    /// shape that exposed the CRLF wrong-entry rewrite.
+    /// shape that catches a CRLF wrong-entry rewrite.
     fn classic_lock_two_entries() -> String {
         "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n\
          # yarn lockfile v1\n\n\n\
@@ -8782,10 +7477,8 @@ mod tests {
 
     /// A CRLF classic lock (Windows `core.autocrlf` checkout) must rewrite
     /// the TARGET entry, not whichever entry happens to come first, and every
-    /// untouched line must keep its CRLF ending byte-exactly. Regression:
-    /// `split("\n\n")` never matched in a CRLF file, so the whole lock was
-    /// one block and the leftmost `resolved`/`integrity` — the decoy's —
-    /// were rewritten (then confirmed and attested downstream).
+    /// untouched line must keep its CRLF ending byte-exactly (see the CRLF
+    /// note in `rewrite_yarn_classic`).
     #[test]
     fn yarn_classic_crlf_lock_rewrites_only_the_target_entry() {
         let ovr = npm_override(
@@ -9183,7 +7876,7 @@ mod tests {
     /// the registry `name@version` spec is gone — so when the artifact URL
     /// changes (patch republish rotates the uuid segment, token rotation
     /// changes the token) the entry MUST still be re-pinned to the new URL;
-    /// exact-URL matching alone stranded the stale pin forever. Ownership is
+    /// exact-URL matching alone would strand the stale pin forever. Ownership is
     /// origin + `<name>-<version>.tgz` leaf, so user URL deps and
     /// other-version artifacts stay untouched.
     #[test]
@@ -9625,7 +8318,6 @@ mod tests {
             token: "tok".into(),
             patch_uuid: CARGO_UUID.into(),
             artifact_url: "https://patch.test/serde-1.0.190.crate".into(),
-            berry_zip_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "cargo-sparse".into(),
                 index_url: cargo_index_url(),
@@ -9758,7 +8450,7 @@ mod tests {
     /// `[patch.crates-io]` on top of a live hosted redirect) reads back
     /// EVERY declaration shape this rewriter pins — driven through the
     /// rewriter itself so the two can never drift apart. A single-line
-    /// `<name> = { … }` regex saw only the first of these.
+    /// `<name> = { … }` regex would see only the first of these.
     #[test]
     fn cargo_socket_registry_pin_reads_back_every_written_shape() {
         let head = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n";
@@ -9964,12 +8656,12 @@ mod tests {
         files
     }
 
-    /// AUDIT A1+A7: a crate declared in BOTH [dev-dependencies] and
+    /// A crate declared in BOTH [dev-dependencies] and
     /// [dependencies] must gain the registry pin in BOTH sections — a
     /// first-match-only rewrite gives the two sections different sources for
     /// the same dep, which cargo rejects at manifest-parse time, bricking
     /// every cargo command. The blank separator line after each entry must
-    /// survive (the old `\s*$` regex swallowed it).
+    /// survive.
     #[test]
     fn cargo_two_sections_rewrites_all_occurrences_and_preserves_blank_lines() {
         let files = cargo_files(
@@ -10004,11 +8696,11 @@ mod tests {
         );
     }
 
-    /// AUDIT A2: the multi-line `[dependencies.<name>]` table form is a
-    /// completely standard manifest shape — it gains a `registry = "…"` line
-    /// instead of being reported not-found (which used to leave the lock
-    /// repointed while the manifest still said crates.io: `--locked` builds
-    /// broke, unlocked builds silently dropped the patch).
+    /// The multi-line `[dependencies.<name>]` table form is a completely
+    /// standard manifest shape — it gains a `registry = "…"` line instead of
+    /// being reported not-found (which would leave the lock repointed while
+    /// the manifest still said crates.io: `--locked` builds break, unlocked
+    /// builds silently drop the patch).
     #[test]
     fn cargo_table_form_dep_gains_registry_line() {
         let files = cargo_files(
@@ -10043,7 +8735,7 @@ mod tests {
         assert!(second.confirmed_cargo_uuids.contains(CARGO_UUID));
     }
 
-    /// AUDIT A5: rename-aware matching. An entry whose KEY matches the
+    /// Rename-aware matching. An entry whose KEY matches the
     /// patched crate but whose `package = "<other>"` names a different crate
     /// is NOT the patched crate (pinning it would point a foreign package at
     /// the single-crate socket registry — resolution hard-fails); the patched
@@ -10230,7 +8922,7 @@ mod tests {
         }
     }
 
-    /// AUDIT A5(a) alone: when the ONLY key match renames a different crate,
+    /// Rename case alone: when the ONLY key match renames a different crate,
     /// the dep is genuinely not declared → not-found, and NOTHING is written
     /// (no config block, no lock repoint).
     #[test]
@@ -10256,12 +8948,12 @@ mod tests {
         assert!(r.confirmed_cargo_uuids.is_empty());
     }
 
-    /// AUDIT A4: a re-scan that selects a NEWER patch uuid over an existing
-    /// redirect must supersede the old `registry = "socket-patch-<old>"` pin
-    /// in place — the old code classified it as a foreign registry and left
-    /// the manifest on the OLD uuid while moving the lock to the NEW one
-    /// (broken `--locked` builds, unlocked builds resolving the superseded
-    /// patch, VEX attesting the new one).
+    /// A re-scan that selects a NEWER patch uuid over an existing redirect
+    /// must supersede the old `registry = "socket-patch-<old>"` pin in place
+    /// — classifying it as a foreign registry would leave the manifest on
+    /// the OLD uuid while moving the lock to the NEW one (broken `--locked`
+    /// builds, unlocked builds resolving the superseded patch, VEX attesting
+    /// the new one).
     #[test]
     fn cargo_supersede_replaces_previous_socket_registry_pin() {
         const OLD_UUID: &str = "0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d";
@@ -10361,7 +9053,7 @@ mod tests {
         assert!(r.confirmed_cargo_uuids.is_empty());
     }
 
-    /// AUDIT A2/A3 (transactionality): when ONE occurrence is rewritable but
+    /// Transactionality: when ONE occurrence is rewritable but
     /// ANOTHER is not, the dep is skipped ENTIRELY — a partial pin (one
     /// section redirected, one not) gives the dep two different sources and
     /// cargo refuses the manifest.
@@ -10385,12 +9077,11 @@ mod tests {
         assert!(r.confirmed_cargo_uuids.is_empty());
     }
 
-    /// AUDIT A3 (the cargo analogue of npm's
-    /// `no_lockfile_redirect_is_not_attested`): a granted dep the project
-    /// does not declare at all (e.g. surfaced by the machine-wide
-    /// $CARGO_HOME crawl) must produce NO writes — the old code still wrote
-    /// the inert `[registries.…]` block, whose index URL then satisfied the
-    /// hosted confirmed check and produced a false VEX attestation.
+    /// The cargo analogue of npm's `no_lockfile_redirect_is_not_attested`:
+    /// a granted dep the project does not declare at all (e.g. surfaced by
+    /// the machine-wide $CARGO_HOME crawl) must produce NO writes — an inert
+    /// `[registries.…]` block's index URL would satisfy the hosted confirmed
+    /// check and produce a false VEX attestation.
     #[test]
     fn cargo_undeclared_dep_writes_nothing_not_even_the_config_block() {
         let mut files = BTreeMap::new();
@@ -10435,11 +9126,11 @@ mod tests {
         assert!(r.confirmed_cargo_uuids.is_empty());
     }
 
-    /// AUDIT A6: a user who commented the managed [registries] block out (to
-    /// debug an install) and re-runs the scan gets the block RESTORED. The
-    /// old substring idempotence check matched the commented text, wrote
-    /// nothing, and the run still reported the dep redirected while every
-    /// cargo command failed on the undefined registry.
+    /// A user who commented the managed [registries] block out (to debug an
+    /// install) and re-runs the scan gets the block RESTORED. A substring
+    /// idempotence check would match the commented text, write nothing, and
+    /// report the dep redirected while every cargo command failed on the
+    /// undefined registry.
     #[test]
     fn cargo_commented_config_block_is_restored() {
         // First run to produce the redirected state.
@@ -10570,7 +9261,7 @@ mod tests {
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
     }
 
-    /// AUDIT A9: an empty-string `cargoCksumSha256` is MISSING (the TS twin's
+    /// An empty-string `cargoCksumSha256` is MISSING (the TS twin's
     /// falsy check), never written as `checksum = ""` into Cargo.lock — that
     /// hard-fails the next `cargo fetch --locked`.
     #[test]
@@ -10599,7 +9290,7 @@ mod tests {
         assert!(r.confirmed_cargo_uuids.is_empty());
     }
 
-    /// AUDIT A8: service-supplied strings are validated against their exact
+    /// Service-supplied strings are validated against their exact
     /// grammars before interpolation into raw TOML — a hostile patch uuid,
     /// index URL, or cksum must be refused, never written (TOML injection:
     /// a `]`+newline uuid can define `[source.crates-io] replace-with = …`
@@ -10779,11 +9470,11 @@ mod tests {
     const CFG_IF_MULTI_DEPS: &str = "[dependencies]\ncfg-if = \"1.0.4\"\n\
          cfg-if-legacy = { package = \"cfg-if\", version = \"0.1.10\" }\n";
 
-    /// Bug B: the manifest pin matched the crate NAME only, so every
-    /// same-named declaration — `cfg-if-legacy = { package = "cfg-if",
-    /// version = "0.1.10" }` too — was pinned to the one patched version's
-    /// registry, where `^0.1.10` cannot resolve. Each declaration is pinned
-    /// only by the patch its version requirement selects.
+    /// A manifest pin matched by crate NAME only would pin every same-named
+    /// declaration — `cfg-if-legacy = { package = "cfg-if", version =
+    /// "0.1.10" }` too — to the one patched version's registry, where
+    /// `^0.1.10` cannot resolve. Each declaration is pinned only by the
+    /// patch its version requirement selects.
     #[test]
     fn cargo_multi_version_pins_only_the_declaration_the_version_selects() {
         let files = cfg_if_multi_files(CFG_IF_MULTI_DEPS);
@@ -10948,10 +9639,10 @@ mod tests {
         files
     }
 
-    /// Bug F: only the root's `[workspace.dependencies]` was pinned; member
-    /// `b`'s own `serde = "1.0.190"` stayed on crates.io, so `--locked`
-    /// failed against the repointed lock while the dep was reported
-    /// redirected. Every member manifest the caller supplies is planned in
+    /// Pinning only the root's `[workspace.dependencies]` would leave member
+    /// `b`'s own `serde = "1.0.190"` on crates.io, so `--locked` fails
+    /// against the repointed lock while the dep is reported redirected.
+    /// Every member manifest the caller supplies is planned in
     /// the same transaction; inheritors are satisfied by the root's pin.
     #[test]
     fn cargo_workspace_member_direct_declaration_is_pinned() {
@@ -11141,9 +9832,8 @@ mod tests {
         }
     }
 
-    /// Bug K: CRLF manifests and locks (Windows checkouts) were refused —
-    /// every planner matched LF text only. A CRLF-only file is now planned
-    /// as LF and written back CRLF, recorded fragments included, and a
+    /// CRLF manifests and locks (Windows checkouts): every planner matches
+    /// LF text, so a CRLF-only file is planned as LF and written back CRLF, recorded fragments included, and a
     /// re-run over the output is a silent no-op.
     #[test]
     fn cargo_crlf_files_are_rewritten_with_crlf_kept() {
@@ -11212,7 +9902,7 @@ mod tests {
         );
     }
 
-    /// Bug J (kept a refusal): a crate only reached transitively cannot be
+    /// A crate only reached transitively cannot be
     /// pinned by a manifest `registry` key. Nothing is written or
     /// confirmed, and the warning says it is transitive-only, unpatched, and
     /// which mode can patch it.
@@ -11375,7 +10065,6 @@ mod tests {
             token: "tok".into(),
             patch_uuid: "uuid".into(),
             artifact_url: format!("https://patch.test/{name}-{version}.gem"),
-            berry_zip_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "rubygems-compact-index".into(),
                 index_url: "https://patch.test/gem/tok/uuid/".into(),
@@ -11463,6 +10152,77 @@ mod tests {
              PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\n\
              CHECKSUMS\n{checksums}\n\nBUNDLED WITH\n   2.6.2\n"
         )
+    }
+
+    /// The CHECKSUMS writer finds the dep's entry with the shared Bundler-lock
+    /// grammar the discovery reader uses, so every spelling that reader
+    /// accepts — lowercase, uppercase, extra digest tokens (space- or
+    /// comma-joined), a bare entry, CRLF — is REPLACED by the patched pin:
+    /// exactly one `rails (7.0.0)` row survives, it reads back as the
+    /// patched sha, and the ledger holds the old entry verbatim for revert.
+    #[test]
+    fn gem_checksum_rewrite_replaces_every_spelling_the_reader_accepts() {
+        let lower = "2".repeat(64);
+        let upper = "A".repeat(64);
+        let sha512 = "b".repeat(128);
+        let patched = "f".repeat(64);
+        let entries = [
+            format!("rails (7.0.0) sha256={lower}"),
+            format!("rails (7.0.0) sha256={upper}"),
+            format!("rails (7.0.0) sha256={lower} sha512={sha512}"),
+            format!("rails (7.0.0) sha256={lower},sha512={sha512}"),
+            "rails (7.0.0)".to_string(),
+        ];
+        for crlf in [false, true] {
+            for entry in &entries {
+                let mut lock = gem_lock(&format!("  {entry}"));
+                if crlf {
+                    lock = lock.replace('\n', "\r\n");
+                }
+                let mut files = BTreeMap::new();
+                files.insert(
+                    "Gemfile".to_string(),
+                    "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+                );
+                files.insert("Gemfile.lock".to_string(), lock);
+                let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+                let out = r.files.get("Gemfile.lock").expect("lock rewritten");
+                let rows: Vec<&str> = out
+                    .lines()
+                    .filter(|l| l.trim_start().starts_with("rails (7.0.0)") && l.starts_with("  ") && !l.starts_with("    "))
+                    .collect();
+                assert_eq!(
+                    rows,
+                    [format!("  rails (7.0.0) sha256={patched}")],
+                    "{entry} (crlf={crlf}): exactly one patched row\n{out}"
+                );
+                let eol = if crlf { "\r\n" } else { "\n" };
+                assert!(
+                    out.contains(&format!("  rails (7.0.0) sha256={patched}{eol}")),
+                    "{entry}: the entry keeps its line ending: {out:?}"
+                );
+                let model = crate::formats::gem::GemfileLock::parse(out);
+                assert_eq!(model.checksum("rails", "7.0.0"), Some(patched.as_str()), "{entry}");
+                assert!(!out.contains("\r\r"), "line endings kept: {out:?}");
+                let edit = r
+                    .edits
+                    .iter()
+                    .find(|e| e.kind == "redirect_gemfile_lock_checksum")
+                    .expect("checksum edit recorded");
+                assert_eq!(edit.action, "rewritten", "{entry}");
+                assert_eq!(edit.original, Some(Value::String(entry.clone())), "{entry}");
+
+                // A re-run over the rewritten lock records nothing new.
+                files.insert("Gemfile".to_string(), r.files["Gemfile"].clone());
+                files.insert("Gemfile.lock".to_string(), out.clone());
+                let again = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+                assert!(
+                    !again.edits.iter().any(|e| e.kind == "redirect_gemfile_lock_checksum"),
+                    "{entry}: rerun is a no-op: {:?}",
+                    again.edits
+                );
+            }
+        }
     }
 
     /// The edit must splice by the regex match's byte range: a substring
@@ -11555,11 +10315,9 @@ mod tests {
         );
     }
 
-    /// The CLI's ONLY production `DepOverride` construction site
-    /// (`scan/hosted.rs`) builds every override with an EMPTY `token` — the
-    /// reference endpoint hands the grant token back only inside the URLs it
-    /// returns. The rotated-grant idempotency guard must therefore never
-    /// depend on the caller populating `token`: a re-scan under a rotated
+    /// The CLI derives `token` from the reference URLs (`scan/hosted.rs`,
+    /// `hosted_memory/redirect.rs`), but the rotated-grant idempotency guard
+    /// must not depend on any caller populating it: a re-scan under a rotated
     /// grant must still recognize the source block a previous run wrote and
     /// refresh its URL in place. With a token-dependent guard the recognizer
     /// misses the old block, `gem_line_re` matches the INDENTED gem line
@@ -11571,7 +10329,7 @@ mod tests {
         const PATCH_UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
         fn ov(token: &str) -> DepOverride {
             let mut o = gem_override("rails", "7.0.0");
-            // Exactly as the CLI builds it: the grant token never populated.
+            // A caller that leaves the grant token empty.
             o.token = String::new();
             o.patch_uuid = PATCH_UUID.into();
             if let Some(r) = o.registry_override.as_mut() {
@@ -11636,7 +10394,7 @@ mod tests {
     /// The gems.rb/Gemfile divergence guard erases the redirect's own
     /// footprint with the same token-wildcard pattern, so it too must not
     /// depend on `DepOverride.token` being populated: identical twins
-    /// re-scanned under a rotated grant with the CLI's empty token must reach
+    /// re-scanned under a rotated grant with an empty token must reach
     /// the in-place refresh, not be trapped behind
     /// `redirect_gem_gemfile_spellings_diverge` by run 1's own edit.
     #[test]
@@ -12093,7 +10851,7 @@ mod tests {
 
     /// The rewritten CHECKSUMS edit must carry the pre-edit line as
     /// `original` — with `None` the ledger cannot restore the upstream sha on
-    /// a future revert.
+    /// revert.
     #[test]
     fn gem_lock_rewrite_records_original_checksum_line() {
         let mut files = BTreeMap::new();
@@ -12125,8 +10883,8 @@ mod tests {
     /// come out FULLY CONVERGED, not mixed-state: the dep's spec entry moves
     /// out of the upstream GEM section into a patch-registry GEM section
     /// (`remote: <index-url>`), DEPENDENCIES pins `<name> (= <ver>)!`, and
-    /// CHECKSUMS carries the patched sha. The old mixed rewrite (CHECKSUMS
-    /// pinned, GEM section left upstream) made bundler refuse the prescribed
+    /// CHECKSUMS carries the patched sha. A mixed rewrite (CHECKSUMS
+    /// pinned, GEM section left upstream) makes bundler refuse the prescribed
     /// unfrozen install with exit 37 "mismatched checksums" — and the
     /// converged pair needs no frozen-install caveat at all.
     #[test]
@@ -12187,11 +10945,11 @@ mod tests {
         );
     }
 
-    /// REGRESSION (bundler 4.0.19+): the patch-registry `GEM` section must
+    /// Bundler 4.0.19+: the patch-registry `GEM` section must
     /// land where bundler itself renders it — rubygems sections sorted by
     /// remote (`SourceList#lock_rubygems_sources`) — because a frozen install
     /// re-renders the lock and, since rubygems#9750, FAILS on any difference.
-    /// Appending after the upstream section produced a lock bundler 4.0.21
+    /// Appending after the upstream section would produce a lock bundler 4.0.21
     /// refuses under `BUNDLE_FROZEN=true` whenever the patch registry sorts
     /// first (`https://patch.socket.dev/` < `https://rubygems.org/`), i.e. on
     /// every production pair. Pinned both ways, with a third section present.
@@ -12469,8 +11227,7 @@ mod tests {
     }
 
     /// Bundler's modern `gems.rb`/`gems.locked` spelling must be redirected
-    /// exactly like the classic pair — before this, a gems.rb project was a
-    /// silent no-op (the rewriter keyed on the literal "Gemfile" names).
+    /// exactly like the classic pair.
     #[test]
     fn gems_rb_pair_is_rewritten_with_modern_paths() {
         let mut files = BTreeMap::new();
@@ -12644,8 +11401,9 @@ mod tests {
 
     /// The identical-twins re-run with a ROTATED grant (the token/uuid URL
     /// segments rotate per request) must still reach the in-place URL
-    /// refresh — with a raw-byte divergence guard, run 1's edit tripped the
-    /// trap and the redirect went permanently stale under the old grant.
+    /// refresh — with a raw-byte divergence guard, run 1's edit would trip
+    /// the trap and the redirect would go permanently stale under the old
+    /// grant.
     #[test]
     fn gems_rb_identical_twins_rerun_refreshes_rotated_grant_url() {
         fn ov(token: &str) -> DepOverride {
@@ -12816,9 +11574,9 @@ mod tests {
 
     /// A CRLF Gemfile.lock is legal to bundler (`bundle check` and a frozen
     /// install both accept one — verified on 4.0.15). The CHECKSUMS pin must
-    /// land in place, byte-preserving the `\r\n` endings — before this, the
-    /// `(?m)^…$` matchers never saw the `\r`-terminated lines and the lock
-    /// was misdiagnosed as bundler <2.6 (`redirect_gem_no_checksums_section`).
+    /// land in place, byte-preserving the `\r\n` endings — `(?m)^…$`
+    /// matchers blind to the `\r`-terminated lines would misdiagnose the lock
+    /// as bundler <2.6 (`redirect_gem_no_checksums_section`).
     #[test]
     fn gem_crlf_lock_checksum_pinned_preserving_crlf() {
         let mut files = BTreeMap::new();
@@ -12907,7 +11665,7 @@ mod tests {
         );
     }
 
-    /// REGRESSION (npm 6): a lockfileVersion 1 lock is only ever written by
+    /// npm 6: a lockfileVersion 1 lock is only ever written by
     /// npm <= 6, which ignores `resolved` for registry deps (verified against
     /// real npm 6.14.18) — so its installs of the redirected lock fail
     /// EINTEGRITY. The rewrite still happens (npm >= 7 installs it), but the
@@ -12969,10 +11727,10 @@ mod tests {
     /// `package-lock.json` beside any committed `npm-shrinkwrap.json` on first
     /// install — and reifies the install from `package-lock.json`. So a
     /// shrinkwrap repo's DEFAULT state under npm 12 is BOTH locks present,
-    /// byte-divergent but pinning the same versions. The old rewriter rewrote
-    /// only the FIRST present lock (`npm-shrinkwrap.json`) and left
-    /// `package-lock.json` — the file npm actually installs from — pristine,
-    /// with no warning: a silent FALSE SUCCESS. EVERY present npm lock must be
+    /// byte-divergent but pinning the same versions. Rewriting only the FIRST
+    /// present lock (`npm-shrinkwrap.json`) would leave `package-lock.json` —
+    /// the file npm actually installs from — pristine, with no warning: a
+    /// silent FALSE SUCCESS. EVERY present npm lock must be
     /// rewritten so a fresh install/ci from EITHER is redirected.
     #[test]
     fn npm_dual_lock_shrinkwrap_and_package_lock_both_rewritten() {
@@ -13063,8 +11821,8 @@ mod tests {
 
     /// A shrinkwrap-ONLY project (the npm <= 6 world, where `npm shrinkwrap`
     /// wrote the sole lock and no `package-lock.json` was auto-created) must
-    /// still be rewritten with zero warnings — the dual-lock fix must not
-    /// perturb the single-lock path.
+    /// still be rewritten with zero warnings — the dual-lock handling must
+    /// not perturb the single-lock path.
     #[test]
     fn npm_shrinkwrap_only_still_rewritten_no_warnings() {
         let ovr = npm_override(
@@ -13116,7 +11874,7 @@ mod tests {
 
     /// An unparseable package-lock.json must surface a warning, not silently
     /// skip the npm redirect entirely (missing-lockfile already warns; a
-    /// corrupt lockfile is strictly worse and was silent).
+    /// corrupt lockfile is strictly worse).
     #[test]
     fn npm_unparseable_lockfile_warns() {
         let mut files = BTreeMap::new();
@@ -13604,7 +12362,7 @@ mod tests {
     /// A granted npm override matching no lock entry (not installed, or the
     /// lock drifted to another version) must warn — parity with
     /// `redirect_pnpm_entry_not_found` / `redirect_yarn_berry_entry_not_found`.
-    /// Silence here made every npm redirect miss unreadable in CI.
+    /// Silence here would make every npm redirect miss unreadable in CI.
     #[test]
     fn npm_entry_not_found_warns() {
         let mut files = BTreeMap::new();
@@ -13733,7 +12491,6 @@ snapshots:
             token: String::new(),
             patch_uuid: "44444444-4444-4444-4444-444444444444".into(),
             artifact_url: COMPOSER_ARTIFACT_URL.into(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha1: Some(COMPOSER_SHA1.into()),
@@ -13776,10 +12533,10 @@ snapshots:
     }
 
     /// A source-only target (composer.lock records `source`, no `dist` — a VCS
-    /// install) must fail closed. The rewriter used to find the package by name
-    /// and then scan FORWARD for the next `"dist": {` with no package boundary,
-    /// so it repointed the FOLLOWING package's url AND shasum at the target's
-    /// patch: a checksum-clean install of the wrong code.
+    /// install) must fail closed. Scanning FORWARD from the name for the next
+    /// `"dist": {` with no package boundary would repoint the FOLLOWING
+    /// package's url AND shasum at the target's patch: a checksum-clean
+    /// install of the wrong code.
     #[test]
     fn composer_source_only_target_never_touches_the_next_package() {
         let lock = composer_lock_with(
@@ -13847,8 +12604,8 @@ snapshots:
     }
 
     /// The locked version must match the patched one. Matching on name alone
-    /// repointed whichever version the lock happened to hold at a patch built
-    /// for a different one.
+    /// would repoint whichever version the lock happened to hold at a patch
+    /// built for a different one.
     #[test]
     fn composer_version_mismatch_fails_closed() {
         let lock = composer_lock_with(
@@ -14333,7 +13090,7 @@ packages:
     }
 
     /// The same boundaries, judged by the PRODUCTION inline residual gate
-    /// (`rewrite_pnpm_lock` over indexed hits), not the reference probe: an
+    /// (`plan_hosted` over indexed hits), not the reference probe: an
     /// instance already on the hosted artifact, a longer version sharing
     /// the prefix, a different quoted scoped package and resolution-less
     /// `snapshots:` keys never count as residuals, v6 nested-paren and v5
@@ -14462,7 +13219,7 @@ snapshots:",
 
     /// A v6 dep resolved ONLY through a peer-suffixed key (pnpm 8 dedupes a
     /// workspace onto the peered instantiation — captured live from corepack
-    /// pnpm@8.15.9, 2026-08-18) is spliced in place like any other instance,
+    /// pnpm@8.15.9) is spliced in place like any other instance,
     /// scoped names included, with the peered key preserved verbatim in the
     /// ledger edit.
     #[test]
@@ -14663,7 +13420,7 @@ packages:
     /// Byte-accurate pnpm 7 (lockfileVersion 5.4) grammar, captured live from
     /// `corepack pnpm@7.33.5 install` of a workspace where pkg-a consumes
     /// use-sync-external-store@1.2.0 bare and pkg-b consumes it beside
-    /// react@18.2.0 (2026-08-18): the plain and `_react@18.2.0`-suffixed
+    /// react@18.2.0: the plain and `_react@18.2.0`-suffixed
     /// instances each carry their own resolution and BOTH get spliced, with
     /// every sibling line (`peerDependencies:`, `dependencies:`, `dev:`)
     /// byte-preserved. The spliced shape is exactly what pnpm@7.33.5 then
@@ -14763,7 +13520,7 @@ packages:
     }
 
     /// Byte-accurate pnpm 8 (lockfileVersion '6.0') grammar from the same
-    /// live capture (`corepack pnpm@8.15.9`, 2026-08-18): pnpm 8 deduped both
+    /// live capture (`corepack pnpm@8.15.9`): pnpm 8 deduped both
     /// importers onto the single peer-suffixed instance
     /// `/use-sync-external-store@1.2.0(react@18.2.0):` — the real-world v6
     /// peered shape — and the spliced lock frozen-installed from an empty
@@ -14898,10 +13655,10 @@ snapshots:
     }
 
     /// A clean, fully-successful redirect must emit EXACTLY zero rewrite
-    /// warnings — for the npm lock AND for a pnpm-only project. The pnpm leg
-    /// regressed silently for a long time: `rewrite_npm_lock` pushed a
-    /// spurious `redirect_npm_no_lockfile` onto every pnpm/yarn/bun/Rush run
-    /// because those projects (correctly) have no package-lock.json.
+    /// warnings — for the npm lock AND for a pnpm-only project:
+    /// `rewrite_npm_lock` must not push a spurious `redirect_npm_no_lockfile`
+    /// onto pnpm/yarn/bun/Rush runs, which (correctly) have no
+    /// package-lock.json.
     #[test]
     fn clean_success_run_emits_no_warnings_for_npm_and_pnpm() {
         let ovr = npm_override(
@@ -15079,7 +13836,7 @@ snapshots:
     /// key is `<name>@file:.socket/vendor/…` (v9) and the generic
     /// entry-not-found wording invites a wild-goose `pnpm install`. The
     /// warning must name the vendored state and the `vendor --revert` path
-    /// instead, while a genuinely unlocked dep keeps the old code, and a
+    /// instead, while a genuinely unlocked dep keeps the generic code, and a
     /// same-name USER `file:` dep (not under .socket/vendor/) is never
     /// misreported as vendored. Fail-closed in all three: zero rewrites.
     #[test]
@@ -15091,8 +13848,8 @@ snapshots:
             "sha512-PATCHED==",
         );
 
-        // Byte-real v9 vendored lock shape (2026-08-18 mode-conversion
-        // matrix, projB snap): overrides + file:-keyed packages/snapshots.
+        // Byte-real v9 vendored lock shape (captured from a real
+        // mode-conversion run): overrides + file:-keyed packages/snapshots.
         let vendored_lock = "lockfileVersion: '9.0'
 
 settings:
@@ -15391,8 +14148,7 @@ packages:
 
     /// The whole-file gates read the NORMALIZED lock: a CRLF lock at an
     /// unsupported cacheKey is refused naming THAT key — never
-    /// "`(missing)`", which is what the `\n\n` grammar made of a CRLF
-    /// `__metadata` block before line endings were handled.
+    /// "`(missing)`".
     #[test]
     fn berry_crlf_lock_cache_key_gate_names_the_real_key() {
         let checksum = format!("10c0/{}", "7".repeat(128));
@@ -15450,7 +14206,7 @@ packages:
             pnpm_v9_lock("left-pad", "1.3.0").replace('\n', "\r\n"),
         );
         let mut r = RewriteResult::default();
-        rewrite_pnpm_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        plan_hosted(&files, std::slice::from_ref(&ovr), &mut r);
         let out = &r.files["pnpm-lock.yaml"];
         assert!(out.contains("tarball: http://patch.test/left-pad-1.3.0.tgz"));
         assert!(!out.replace("\r\n", "").contains('\n'));
@@ -15481,7 +14237,6 @@ packages:
                 "https://patch.socket.dev/patch-registry/golang/{}/@v/v1.4.2-socketpatch.1.zip",
                 golang_socket_module()
             ),
-            berry_zip_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "goproxy".into(),
                 index_url: "https://patch.socket.dev/patch-registry/golang".into(),
@@ -15931,15 +14686,15 @@ packages:
                     .contains("v1.4.2-socketpatch.1"))));
     }
 
-    // ── coverage-audit 2026-09 additions ─────────────────────────────────────
-    // Warning/refusal legs and rare-lock-shape branches the golden fixtures
+    // ── warning/refusal legs ─────────────────────────────────────────────────
+    // These and the rare-lock-shape branches the golden fixtures
     // deliberately do not pin (they are byte-shared with the TS backend).
 
     /// A crafted lock entry that carries BOTH `link: true` and a version gets
     /// the specific link diagnosis; the REAL npm-emitted link shape (no
     /// `version` key at all) falls through to the generic not-found today —
     /// pinned here so a future link-aware diagnosis flips this test
-    /// deliberately (audit bug anchor #2).
+    /// deliberately.
     #[test]
     fn npm_link_entry_versioned_skips_loudly_versionless_is_generic_not_found() {
         let ovr = npm_override(
@@ -16562,13 +15317,12 @@ packages:
     /// Cargo.lock v1 (cargo < 1.41; every cargo still reads it and, under
     /// `--locked`, never rewrites it): the checksum lives in `[metadata]`
     /// keyed by the source, and dependents reference the crate by its full
-    /// `"name version (source)"` id. REGRESSION: only the entry's `source`
-    /// was repointed — the dependent's reference then named a package no
-    /// longer in the lock (real cargo discards the lock and re-resolves;
-    /// `cargo fetch --locked` fails) and nothing pinned the patched
-    /// `.crate` (the v1 entry has no inline checksum, and the insert after a
-    /// block-final `source` line never matched). Every fragment now follows
-    /// the source, each as its own revertible edit.
+    /// `"name version (source)"` id. Repointing only the entry's `source`
+    /// would leave the dependent's reference naming a package no longer in
+    /// the lock (real cargo discards the lock and re-resolves; `cargo fetch
+    /// --locked` fails) with nothing pinning the patched `.crate` (the v1
+    /// entry has no inline checksum). Every fragment follows the source,
+    /// each as its own revertible edit.
     #[test]
     fn cargo_lock_v1_repoints_metadata_checksum_and_full_id_references() {
         const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
@@ -16647,12 +15401,12 @@ packages:
     /// The OLDEST v1 locks (cargo before the `[root]` removal) record the
     /// root package in a standalone `[root]` table — not in the
     /// `[[package]]` array — and its `dependencies` spell full package ids
-    /// the same way. REGRESSION: the reference walk searched `[[package]]`
-    /// blocks only, so `[root]` kept naming the crates.io id of a package
-    /// the repointed lock no longer contained: `cargo build --locked` fails
-    /// and an unlocked build silently discards the lock, while the scan
-    /// reports the crate redirected. The vendored twin has handled this
-    /// table since `dependency_tables_mut`.
+    /// the same way. A reference walk over `[[package]]` blocks only would
+    /// leave `[root]` naming the crates.io id of a package the repointed
+    /// lock no longer contains: `cargo build --locked` fails and an unlocked
+    /// build silently discards the lock, while the scan reports the crate
+    /// redirected. The vendored twin handles this table too
+    /// (`dependency_tables_mut`).
     #[test]
     fn cargo_lock_v1_root_table_references_are_repointed() {
         const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
@@ -16776,8 +15530,7 @@ packages:
     /// crate (cfg-if, libc, serde…) cannot be hosted-redirected: the pin
     /// reaches only the root's declaration, the other crate keeps resolving
     /// it from crates.io, so the repointed lock fails `--locked` and the
-    /// unpatched copy is compiled. REGRESSION: it was pinned, repointed and
-    /// confirmed (reported redirected, attested by VEX).
+    /// unpatched copy is compiled.
     #[test]
     fn cargo_crate_another_lock_package_depends_on_is_refused() {
         const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
@@ -18027,9 +16780,8 @@ packages:
         assert!(checksums.contains(&format!("{}  ", "d".repeat(64))));
     }
 
-    // ── coverage mop-up 2026-09 (final wave) ─────────────────────────────────
-    // Residual branches the earlier audit passes did not pin: malformed-input
-    // tolerance legs, workspace-inheritance satisfaction, and the remaining
+    // ── residual branches ────────────────────────────────────────────────────
+    // Malformed-input tolerance legs, workspace-inheritance satisfaction, and the remaining
     // diagnosis spellings.
 
     #[test]
@@ -18429,7 +17181,8 @@ packages:
 
     /// A dep whose registry override is of a FOREIGN kind writes nothing —
     /// the nuget and golang arms skip it rather than misinterpreting the
-    /// override's fields (silently, matching the TS twin).
+    /// override's fields, and each warns its missing-override code, as for
+    /// an absent override.
     #[test]
     fn foreign_override_kind_warns_missing_override_for_nuget_and_golang() {
         let mut nuget = nuget_override();
@@ -18625,7 +17378,6 @@ mod python_lock_warning_tests {
             token: "11111111-1111-4111-8111-111111111111".into(),
             patch_uuid: "22222222-2222-4222-8222-222222222222".into(),
             artifact_url: "https://patch.socket.dev/requests-2.28.1-py3-none-any.whl".into(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity::default(),
         };
@@ -18667,7 +17419,6 @@ mod python_metadata_pairing_tests {
             token: "11111111-1111-4111-8111-111111111111".into(),
             patch_uuid: "22222222-2222-4222-8222-222222222222".into(),
             artifact_url: "https://patch.socket.dev/click-8.1.7-py3-none-any.whl".into(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity::default(),
         }
@@ -18769,7 +17520,6 @@ mod hatch_tests {
             token: String::new(),
             patch_uuid: "test-uuid".into(),
             artifact_url: "https://patch.test/urllib3-1.26.18-py2.py3-none-any.whl".into(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha256: Some("a".repeat(64)),

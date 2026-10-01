@@ -5,8 +5,9 @@
 //! * `scan --json --apply --yes` adds, updates, and skips patches based on
 //!   the existing manifest, emitting the `apply.patches[]` action vocabulary
 //!   (`"added"`, `"updated"`, `"skipped"`).
-//! * Read-only `scan --json` emits the `updates` array (PURLs whose UUID
-//!   would change) and does NOT emit a `gc` field by default.
+//! * A bare `scan --json` (hosted mode by default) emits the `updates`
+//!   array (PURLs whose UUID would change) and does NOT emit a `gc` field
+//!   by default; it never writes `.socket/manifest.json` or node_modules.
 //! * `--prune` opts into garbage collection (manifest pruning + orphan
 //!   file cleanup). Without it, scan leaves the manifest alone.
 //! * `--sync` is sugar for `--apply --prune` — the canonical bot mode.
@@ -365,9 +366,9 @@ fn test_scan_apply_json_updates_existing() {
     assert_ne!(new_uuid, FAKE_OLD_UUID, "manifest must reflect the update");
 }
 
-/// `scan --json` (without `--apply`) is read-only: it lists available
-/// patches and an `updates` array reflecting manifest-vs-API drift, but
-/// does not mutate `.socket/manifest.json` or the file on disk.
+/// Bare `scan --json` (hosted by default) lists available patches and an
+/// `updates` array reflecting manifest-vs-API drift, but never writes
+/// `.socket/manifest.json` or touches node_modules.
 #[test]
 #[ignore]
 fn test_scan_json_read_only_emits_updates_array() {
@@ -400,8 +401,8 @@ fn test_scan_json_read_only_emits_updates_array() {
     assert_eq!(git_sha256_file(&index_js), BEFORE_HASH);
 }
 
-/// `scan --json` against a project with no existing manifest does NOT
-/// create one — read-only is read-only.
+/// Bare `scan --json` against a project with no existing manifest does NOT
+/// create one.
 #[test]
 #[ignore]
 fn test_scan_json_read_only_no_mutation() {
@@ -420,11 +421,11 @@ fn test_scan_json_read_only_no_mutation() {
     let (stdout, _) = assert_run_ok(cwd, &["scan", "--json"], "scan --json (no manifest)");
     let v = parse_scan_json(&stdout);
 
-    // Positive proof the read-only scan actually *did the read* — without
-    // this, a scan that crawled 0 packages or whose API batches all failed
-    // would still trivially satisfy the "no mutation" assertions below and
-    // falsely pass. A real read-only scan of an installed minimist must
-    // report it as scanned with a free patch available.
+    // Positive proof the scan actually *did the read* — without this, a
+    // scan that crawled 0 packages or whose API batches all failed would
+    // still trivially satisfy the "no mutation" assertions below. A real
+    // scan of an installed minimist must report it as scanned with a free
+    // patch available.
     assert_eq!(v["status"], "success");
     assert!(
         v["scannedPackages"].as_u64().unwrap_or(0) >= 1,
@@ -731,7 +732,7 @@ fn test_scan_json_no_gc_field_without_prune() {
     let (stdout, _) = assert_run_ok(cwd, &["scan", "--json"], "scan --json (no prune)");
     let v = parse_scan_json(&stdout);
 
-    // Positive proof the read-only scan actually ran a discovery pass — a
+    // Positive proof the scan actually ran a discovery pass — a
     // scan that crawled nothing would emit no gc field and pass the negative
     // assertion below for the wrong reason. left-pad is the installed package
     // here (minimist was uninstalled), so at minimum one package is scanned.

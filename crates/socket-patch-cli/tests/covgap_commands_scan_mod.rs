@@ -1,6 +1,6 @@
-//! Coverage-gap tests for `commands/scan/mod.rs` (2026-09 audit).
+//! Coverage-gap tests for `commands/scan/mod.rs`.
 //!
-//! Pins the audited-but-untested surfaces of `scan`:
+//! Pins the otherwise-untested surfaces of `scan`:
 //!
 //! * the remaining `resolve_mode_flags` cross-mode conflict arms (and
 //!   `ScanMode::Agent.cli_name()` reaching an error message);
@@ -19,12 +19,14 @@
 //! * per-patch vulnerability rendering in the "Patches to apply" preview;
 //! * the human post-apply GC line (both pluralization arms) and the
 //!   `hosted_wiring_retained` stderr warning after an in-place apply;
-//! * non-TTY human runs: a mode-less scan is report-only (no download, no
-//!   `.socket/`), while `--mode agent` / `--apply` / `--prune` auto-proceed;
-//! * the hosted human arm's results table, `[UPDATE]` detection and
-//!   confirm prompt (parity with the agent/vendored arms);
-//! * the declined download / redirect confirm via a PTY (exit 0, hint, no
-//!   mutation).
+//! * human runs: a bare scan runs hosted mode; a mode-less `--prune`/global
+//!   scan is report-only (no download, no `.socket/`, prints the
+//!   `scan --mode agent` hint), while `--mode agent` / `--apply` apply
+//!   without prompting;
+//! * the hosted human arm's results table and `[UPDATE]` detection (parity
+//!   with the agent/vendored arms);
+//! * scan on a PTY: never prompts, never opens the select menu under
+//!   --json, and renders the live status line cleanly.
 //!
 //! Subprocess runs scrub the `SOCKET_*` flag environment (the
 //! `cli_scan_silent.rs` pattern) so ambient developer/CI configuration
@@ -113,6 +115,14 @@ fn run_scan_human(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, St
     ];
     args.extend_from_slice(extra);
     run_scan(cwd, &args)
+}
+
+/// [`run_scan_human`] in agent mode: v5's bare scan is hosted, and these
+/// fixtures exercise the in-place apply flow.
+fn run_scan_agent(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, String) {
+    let mut args = vec!["--mode", "agent"];
+    args.extend_from_slice(extra);
+    run_scan_human(cwd, api_url, &args)
 }
 
 async fn recorded(mock: &MockServer) -> Vec<wiremock::Request> {
@@ -309,7 +319,7 @@ fn seed_manifest(root: &Path, entries: &[(&str, &str)]) {
 // resolve_mode_flags — the remaining cross-mode conflict arms
 // ---------------------------------------------------------------------------
 // Only the `--mode hosted --vendor` arm is pinned in cli_parse_scan.rs;
-// these cover the --redirect / --apply / --sync booleans against a
+// these cover the --apply / --sync / --vendor booleans against a
 // different --mode, plus ScanMode::Agent.cli_name() rendering into the
 // message. Clap parses each combination fine (no value-dependent conflict
 // is expressible); the fold is what rejects them.
@@ -355,16 +365,6 @@ mod mode_fold {
     fn fold_err(extra: &[&str]) -> String {
         let mut args = parse_scan(extra);
         resolve_mode_flags(&mut args).expect_err("cross-mode contradiction must error")
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn mode_vendored_with_redirect_boolean_errors() {
-        let err = fold_err(&["--mode", "vendored", "--redirect"]);
-        assert!(
-            err.contains("--mode vendored cannot be used with --redirect"),
-            "clap-style 'cannot be used with' phrasing naming both spellings: {err}"
-        );
     }
 
     #[test]
@@ -434,7 +434,7 @@ fn scan_hosted_prune_human_warns_prune_is_ignored() {
         "hosted --prune stays accepted (never a usage error)"
     );
     assert!(
-        stderr.contains("Warning (redirect_prune_ignored):"),
+        stderr.contains("Warning: --prune has no effect with --mode hosted"),
         "the ignored-prune warning must reach stderr; got {stderr:?}"
     );
     assert!(
@@ -537,7 +537,7 @@ async fn scan_paid_patch_without_access_nudges_and_downloads_nothing() {
         "the no-access summary counts FREE patches only; got {stdout:?}"
     );
     assert!(
-        stdout.contains("+ 1 additional patch is available with a paid subscription"),
+        stdout.contains("+ 1 additional patch is available with a paid Socket plan"),
         "the paid nudge must print; got {stdout:?}"
     );
     assert!(
@@ -545,7 +545,7 @@ async fn scan_paid_patch_without_access_nudges_and_downloads_nothing() {
         "the pricing URL must print; got {stdout:?}"
     );
     assert!(
-        stdout.contains("No downloadable patches (paid subscription required)."),
+        stdout.contains("No downloadable patches: every patch found requires a paid Socket plan."),
         "the gated-catalog terminal must print; got {stdout:?}"
     );
 
@@ -579,7 +579,7 @@ async fn scan_paid_patch_with_access_counts_all_and_reports_detail_failure() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
 
-    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &[]);
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
     assert_eq!(
         code, 1,
         "a failed detail fetch fails the scan; stdout={stdout}"
@@ -649,9 +649,9 @@ async fn scan_human_table_renders_update_marker_and_vuln_overflow() {
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
     seed_manifest(tmp.path(), &[(purl, OLD_UUID)]);
 
-    // --dry-run keeps the run read-only past the table (the confirm and
+    // --dry-run keeps the run read-only past the table (the download and
     // apply never run), so no view/blob mocks are needed.
-    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--dry-run", "--yes"]);
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--dry-run", "--yes"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
         stdout.contains("[UPDATE]"),
@@ -693,7 +693,7 @@ async fn scan_human_detail_fetch_failure_errors_once() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
 
-    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &[]);
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
     assert!(
         stderr.contains(&format!(
@@ -748,7 +748,7 @@ async fn scan_human_partial_detail_fetch_failure_warns_per_package() {
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
     write_npm_package(tmp.path(), "lodash", "4.17.20", b"x\n");
 
-    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--dry-run"]);
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--dry-run"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert_eq!(
         stderr
@@ -804,7 +804,7 @@ async fn scan_human_skips_vendored_purls_without_downloading() {
     )
     .unwrap();
 
-    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--yes"]);
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--yes"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
         stdout.contains(&format!(
@@ -864,7 +864,7 @@ async fn scan_human_preview_renders_vulnerability_details() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
 
-    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--dry-run", "--yes"]);
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--dry-run", "--yes"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
         stdout.contains("Fixes: "),
@@ -905,7 +905,7 @@ async fn scan_human_dry_run_vex_prints_the_shared_skip_line() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
 
-    let (code, stdout, stderr) = run_scan_human(
+    let (code, stdout, stderr) = run_scan_agent(
         tmp.path(),
         &mock.uri(),
         &["--dry-run", "--yes", "--vex", "out.vex.json"],
@@ -1052,34 +1052,12 @@ async fn scan_human_apply_over_live_hosted_wiring_warns_retained() {
     )
     .unwrap();
 
-    // The redirect ledger recording that hosted redirect.
-    use socket_patch_core::manifest::schema::PatchRecord;
-    use socket_patch_core::patch::redirect::RedirectState;
-    let mut state = RedirectState::new();
-    state.records.insert(
-        purl.to_string(),
-        PatchRecord {
-            uuid: UUID.to_string(),
-            exported_at: "2024-01-01T00:00:00Z".to_string(),
-            files: std::collections::HashMap::new(),
-            vulnerabilities: std::collections::HashMap::new(),
-            description: String::new(),
-            license: "MIT".to_string(),
-            tier: "free".to_string(),
-        },
-    );
-    let vendor_dir = tmp.path().join(".socket/vendor");
-    std::fs::create_dir_all(&vendor_dir).unwrap();
-    std::fs::write(
-        vendor_dir.join("redirect-state.json"),
-        serde_json::to_string_pretty(&state).unwrap(),
-    )
-    .unwrap();
+    // v5: the lock pin above is the whole hosted state (no ledger).
 
-    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--yes"]);
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--yes"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stderr.contains("Warning (hosted_wiring_retained):"),
+        stderr.contains("Warning: agent-mode scan left the hosted wiring live"),
         "the retained-wiring warning must reach stderr; got {stderr:?}"
     );
     assert!(
@@ -1110,9 +1088,6 @@ fn scan_human_vex_success_prints_wrote_line() {
     std::fs::write(
         socket.join("manifest.json"),
         serde_json::to_string_pretty(&serde_json::json!({
-            // npm declared `manual` so VEX generation does not omit the
-            // patch (ecosystem_not_setup) and fail the run.
-            "setup": { "exclude": [], "manual": ["npm"] },
             "patches": {
                 "pkg:npm/vuln-pkg@1.0.0": {
                     "uuid": UUID,
@@ -1208,7 +1183,7 @@ async fn scan_human_pnp_refusal_prints_alongside_other_ecosystems() {
         "the gem must be discovered (non-empty path); got {stderr:?}"
     );
     assert!(
-        stderr.contains("Warning (yarn_pnp_unsupported):"),
+        stderr.contains("Warning: ") && stderr.contains("Plug'n'Play"),
         "the PnP refusal must print on the non-empty path; got {stderr:?}"
     );
     assert!(
@@ -1263,21 +1238,18 @@ async fn scan_human_empty_batch_reports_no_patches_once() {
 }
 
 // ---------------------------------------------------------------------------
-// Non-TTY human scans: the mode-less scan is report-only, explicit intent
-// auto-proceeds
+// Human scans never prompt: a mode-less --prune/global scan is report-only,
+// agent mode applies
 // ---------------------------------------------------------------------------
-// Every `Command::output()` child here has a non-TTY stdin. A bare `scan`
-// (no `--mode`/`--apply`/`--sync`/`--vendor`/`--redirect`, no `--prune`,
-// no `--yes`) must stop BEFORE the download with exit 0 and the get-hint,
-// creating nothing under `.socket/`; any intent flag keeps `confirm()`'s
-// non-TTY auto-accept and applies.
+// A bare scan runs hosted mode; a `--prune` or
+// global scan with no mode only reports (it has no lockfile to rewire),
+// and `--mode agent` applies in place without asking.
 
-/// Bare `scan` piped: the discovery, table and per-patch preview print
-/// (the report IS the value), then the run stops — no view fetch, no
-/// `.socket/`, the installed file untouched — and `confirm()` was never
-/// consulted (no "Non-interactive mode" line).
+/// `--prune` with no mode: the discovery, table and per-patch preview
+/// print (the report IS the value), then the run stops — no view fetch, no
+/// `.socket/`, the installed file untouched.
 #[tokio::test]
-async fn scan_bare_human_non_tty_is_report_only() {
+async fn scan_prune_without_a_mode_is_report_only() {
     let mock = MockServer::start().await;
     let purl = "pkg:npm/minimist@1.2.2";
     mount_one_patch_api(&mock, purl, b"x\n").await;
@@ -1286,7 +1258,7 @@ async fn scan_bare_human_non_tty_is_report_only() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
 
-    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &[]);
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--prune"]);
     assert_eq!(
         code, 0,
         "report-only is a success; stdout={stdout}; stderr={stderr}"
@@ -1296,13 +1268,13 @@ async fn scan_bare_human_non_tty_is_report_only() {
         "the per-patch preview still prints; got {stdout:?}"
     );
     assert!(
-        stdout.contains("To apply a single patch, run:")
-            && stdout.contains("socket-patch get <CVE-ID>"),
-        "the get-hint must print; got {stdout:?}"
+        stdout.contains("To apply these patches in place, run:")
+            && stdout.contains("socket-patch scan --mode agent"),
+        "the agent-mode hint must print; got {stdout:?}"
     );
     assert!(
         !stderr.contains("Non-interactive mode detected"),
-        "confirm() must not be consulted on the report-only path; got {stderr:?}"
+        "scan never prompts; got {stderr:?}"
     );
     assert!(
         !tmp.path().join(".socket").exists(),
@@ -1321,11 +1293,9 @@ async fn scan_bare_human_non_tty_is_report_only() {
     );
 }
 
-/// The same piped run with an explicit intent flag (each spelling that
-/// folds to `--mode agent`) auto-proceeds through `confirm()`'s non-TTY
-/// default and applies.
+/// Each spelling that folds to `--mode agent` applies without prompting.
 #[tokio::test]
-async fn scan_human_non_tty_explicit_intent_auto_proceeds() {
+async fn scan_human_agent_mode_applies_without_prompting() {
     for flags in [&["--mode", "agent"][..], &["--apply"][..]] {
         let mock = MockServer::start().await;
         let purl = "pkg:npm/silent-target@1.0.0";
@@ -1339,8 +1309,8 @@ async fn scan_human_non_tty_explicit_intent_auto_proceeds() {
         let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), flags);
         assert_eq!(code, 0, "flags={flags:?}: stdout={stdout}; stderr={stderr}");
         assert!(
-            stderr.contains("Non-interactive mode detected, proceeding automatically."),
-            "flags={flags:?}: explicit intent keeps confirm()'s non-TTY auto-accept; got {stderr:?}"
+            !stderr.contains("Non-interactive mode detected"),
+            "flags={flags:?}: scan never prompts; got {stderr:?}"
         );
         assert_eq!(
             std::fs::read(tmp.path().join("node_modules/silent-target/index.js")).unwrap(),
@@ -1354,22 +1324,17 @@ async fn scan_human_non_tty_explicit_intent_auto_proceeds() {
     }
 }
 
-/// `--prune` alone is explicit intent too (it asks for a `.socket/`
-/// mutation): the piped run applies AND garbage-collects.
+/// `--mode agent --prune` applies AND garbage-collects, unprompted.
 #[tokio::test]
-async fn scan_human_non_tty_prune_counts_as_intent() {
+async fn scan_human_agent_prune_applies_and_collects() {
     let mock = MockServer::start().await;
     let (code, stdout, stderr, tmp) = run_apply_with_orphans(
         &mock,
         &[("pkg:npm/gone@1.0.0", OLD_UUID, 'c')],
-        &["--prune"],
+        &["--mode", "agent", "--prune"],
     )
     .await;
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    assert!(
-        stderr.contains("Non-interactive mode detected, proceeding automatically."),
-        "--prune auto-proceeds through confirm(); got {stderr:?}"
-    );
     assert!(
         stdout.contains("GC: pruned 1 manifest entry and removed 1 orphan file ("),
         "the GC still runs; got {stdout:?}"
@@ -1385,9 +1350,9 @@ async fn scan_human_non_tty_prune_counts_as_intent() {
 }
 
 /// An empty discovery stops every human mode at "No patches available"
-/// with exit 0 and no `.socket/`: vendored mode no longer falls through to
+/// with exit 0 and no `.socket/`: vendored mode does not fall through to
 /// its vendor step to re-vendor a committed manifest (scan vendors what
-/// discovery selects), and hosted mode no longer enters its engine for a
+/// discovery selects), and hosted mode does not enter its engine for a
 /// zero-package redirect.
 #[tokio::test]
 async fn scan_human_empty_discovery_stops_in_every_mode() {
@@ -1423,15 +1388,13 @@ async fn scan_human_empty_discovery_stops_in_every_mode() {
 }
 
 // ---------------------------------------------------------------------------
-// Human `--mode hosted`: table + update detection parity and the confirm
+// Human hosted scan: table + update detection parity
 // ---------------------------------------------------------------------------
-// The hosted human arm used to return straight into the redirect engine —
-// no results table, no `[UPDATE]` marker, and no prompt (while `get --mode
-// hosted` and scan's agent/vendored arms all confirm). It now shares the
-// table/update block and confirms before the engine runs.
+// The hosted human arm shares the table/update block with the agent/vendored
+// arms, then runs the engine without prompting (scan never prompts).
 
 /// Reference endpoint denying the grant: the engine runs (proving the
-/// prompt was accepted) but rewrites nothing, so no lockfile fixture is
+/// hosted arm reached it) but rewrites nothing, so no lockfile fixture is
 /// needed.
 async fn mount_forbidden_reference(mock: &MockServer, purl: &str) {
     Mock::given(method("POST"))
@@ -1452,37 +1415,74 @@ fn reference_posts(reqs: &[wiremock::Request]) -> usize {
         .count()
 }
 
-/// Seed a redirect ledger recording `uuid` for `purl` (hosted mode's only
-/// patch store), so update detection has an "old" side to compare. Written
-/// through the real ledger type so the hosted engine's strict loader
-/// accepts it.
-fn seed_redirect_ledger(root: &Path, purl: &str, uuid: &str) {
-    use socket_patch_core::manifest::schema::PatchRecord;
-    use socket_patch_core::patch::redirect::RedirectState;
-    let mut state = RedirectState::new();
-    state.records.insert(
-        purl.to_string(),
-        PatchRecord {
-            uuid: uuid.to_string(),
-            exported_at: "2024-01-01T00:00:00Z".to_string(),
-            files: std::collections::HashMap::new(),
-            vulnerabilities: std::collections::HashMap::new(),
-            description: "seed".to_string(),
-            license: "MIT".to_string(),
-            tier: "free".to_string(),
-        },
-    );
-    let vendor_dir = root.join(".socket/vendor");
-    std::fs::create_dir_all(&vendor_dir).unwrap();
+/// Seed a hosted pin for the npm `purl` in `package-lock.json` — the
+/// lockfile resolving it to the Socket patch server under `uuid`. v5 hosted
+/// mode keeps its state only in lockfile pins, so this is update
+/// detection's "old" side.
+fn seed_hosted_pin(root: &Path, purl: &str, uuid: &str) {
+    let (name, version) = purl
+        .strip_prefix("pkg:npm/")
+        .and_then(|rest| rest.rsplit_once('@'))
+        .expect("an npm purl");
+    let lock = serde_json::json!({
+        "name": "covgap-scan-root",
+        "version": "0.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": {
+                "name": "covgap-scan-root",
+                "version": "0.0.0",
+                "dependencies": { name: version }
+            },
+            format!("node_modules/{name}"): {
+                "version": version,
+                "resolved": format!(
+                    "https://patch.socket.dev/patch/npm/{name}/{version}/tok/{uuid}/{name}-{version}.tgz"
+                ),
+                "integrity": "sha512-orig==",
+            }
+        }
+    });
     std::fs::write(
-        vendor_dir.join("redirect-state.json"),
-        serde_json::to_string_pretty(&state).unwrap(),
+        root.join("package-lock.json"),
+        serde_json::to_string_pretty(&lock).unwrap(),
     )
     .unwrap();
 }
 
+/// Hosted PATHs name project directories: each runs as its own scan
+/// (its own discovery and redirect), under a `== <dir> ==` header.
 #[tokio::test]
-async fn scan_hosted_human_prints_table_updates_and_confirms() {
+async fn scan_hosted_paths_run_once_per_project_directory() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+    mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+    mount_forbidden_reference(&mock, purl).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    for app in ["apps/a", "apps/b"] {
+        let dir = tmp.path().join(app);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_root_package_json(&dir);
+        write_npm_package(&dir, "minimist", "1.2.2", b"x\n");
+    }
+
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["apps/*"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    // glob rebuilds matches with the native separator (`apps\a` on Windows).
+    for app in ["a", "b"] {
+        let header = format!("== {} ==", Path::new("apps").join(app).display());
+        assert!(stdout.contains(&header), "missing {header:?}: {stdout}");
+    }
+    assert_eq!(stdout.matches("Switched 0 packages to hosted patches").count(), 2, "{stdout}");
+    let reqs = recorded(&mock).await;
+    assert_eq!(batch_bodies(&reqs).len(), 2, "one discovery per directory");
+}
+
+#[tokio::test]
+async fn scan_hosted_human_prints_table_updates_and_redirects() {
     let mock = MockServer::start().await;
     let purl = "pkg:npm/minimist@1.2.2";
     mount_batch_one(&mock, purl, UUID, "free", &["CVE-2024-0001"], false).await;
@@ -1492,11 +1492,12 @@ async fn scan_hosted_human_prints_table_updates_and_confirms() {
     let tmp = tempfile::tempdir().unwrap();
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
-    // The ledger records an OLDER patch: the shared update detection must
+    // The lock pins an OLDER hosted patch: the shared update detection must
     // flag the newer offer in hosted mode too.
-    seed_redirect_ledger(tmp.path(), purl, OLD_UUID);
+    seed_hosted_pin(tmp.path(), purl, OLD_UUID);
 
-    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--mode", "hosted"]);
+    // v5: a bare scan is hosted.
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
         stdout.contains("VULNERABILITIES") && stdout.contains("CVE-2024-0001"),
@@ -1510,15 +1511,13 @@ async fn scan_hosted_human_prints_table_updates_and_confirms() {
         stdout.contains("[UPDATE]") && stdout.contains("1 package has a newer patch available."),
         "update detection must run in hosted mode; got {stdout:?}"
     );
-    // `--mode hosted` is explicit intent: the new prompt auto-accepts on a
-    // non-TTY stdin and the engine runs.
     assert!(
-        stderr.contains("Non-interactive mode detected, proceeding automatically."),
-        "the hosted confirm must run (and auto-accept) on a non-TTY; got {stderr:?}"
+        !stderr.contains("Non-interactive mode detected"),
+        "scan never prompts; got {stderr:?}"
     );
     assert!(
-        stdout.contains("Redirected 0 packages"),
-        "the engine must run after the prompt; got {stdout:?}"
+        stdout.contains("Switched 0 packages to hosted patches"),
+        "the engine must run; got {stdout:?}"
     );
     let reqs = recorded(&mock).await;
     assert_eq!(
@@ -1538,11 +1537,8 @@ async fn scan_hosted_human_prints_table_updates_and_confirms() {
 }
 
 // ---------------------------------------------------------------------------
-// Declined download confirm via PTY (unix only)
+// Scan on a PTY (unix only)
 // ---------------------------------------------------------------------------
-// A non-TTY mode-less scan never reaches `confirm()` (report-only above),
-// and every explicit-intent run auto-accepts there, so only a PTY reaches
-// the decline arm: exit 0, the get-hint, and no mutation.
 
 #[cfg(unix)]
 mod pty {
@@ -1584,8 +1580,8 @@ mod pty {
             cmd.arg(a);
         }
         cmd.cwd(cwd);
-        // Scrub the flag-bound SOCKET_* surface (SOCKET_YES=true would skip
-        // the very prompt under test); keep telemetry disabled and the
+        // Scrub the flag-bound SOCKET_* surface so ambient configuration
+        // cannot reroute the run; keep telemetry disabled and the
         // update notifier off — this child gets a REAL terminal, so the
         // stderr-TTY guard does not protect it.
         for (key, _) in std::env::vars_os() {
@@ -1643,80 +1639,18 @@ mod pty {
         )
     }
 
+    /// v5 scan never prompts, even on a TTY: agent mode applies with no
+    /// input at all.
     #[tokio::test(flavor = "multi_thread")]
-    async fn scan_decline_at_download_prompt_exits_zero_without_mutation() {
+    async fn scan_on_a_tty_applies_without_prompting() {
         let mock = MockServer::start().await;
-        let purl = "pkg:npm/minimist@1.2.2";
-        mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
-        mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+        let purl = "pkg:npm/silent-target@1.0.0";
+        let before = b"before\n";
+        mount_one_patch_api(&mock, purl, before).await;
 
         let tmp = tempfile::tempdir().unwrap();
         write_root_package_json(tmp.path());
-        write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
-
-        let uri = mock.uri();
-        let cwd = tmp.path().to_path_buf();
-        let (code, output) = tokio::task::spawn_blocking(move || {
-            run_in_pty(
-                &[
-                    "scan",
-                    "--api-url",
-                    &uri,
-                    "--api-token",
-                    "fake-token-for-test",
-                    "--org",
-                    ORG_SLUG,
-                ],
-                &cwd,
-                "n\n",
-                Duration::from_secs(60),
-            )
-        })
-        .await
-        .expect("spawn_blocking join");
-
-        assert_eq!(code, 0, "declining is not an error; output:\n{output}");
-        // The prompt genuinely ran (a regression auto-proceeding in a TTY
-        // would skip it — and would mutate, failing below too).
-        assert!(
-            output.contains("Download and apply 1 patch?"),
-            "the confirm prompt must have shown; got:\n{output}"
-        );
-        assert!(
-            output.contains("To apply a single patch, run:"),
-            "the decline hint must print; got:\n{output}"
-        );
-        assert!(
-            output.contains("socket-patch get <CVE-ID>"),
-            "the decline hint names the get command; got:\n{output}"
-        );
-
-        // Decline mutates nothing: no manifest, untouched file, no download.
-        assert!(
-            !tmp.path().join(".socket/manifest.json").exists(),
-            "declining must not create the manifest"
-        );
-        assert_eq!(
-            std::fs::read(tmp.path().join("node_modules/minimist/index.js")).unwrap(),
-            b"x\n",
-            "declining must not patch the installed file"
-        );
-        let reqs = recorded(&mock).await;
-        assert_eq!(view_gets(&reqs), 0, "declining must not download the patch");
-    }
-
-    /// Declining the vendored-mode prompt points at the vendored `get`,
-    /// not the in-place one (which would apply instead of vendoring).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn scan_vendored_decline_hint_names_vendored_get() {
-        let mock = MockServer::start().await;
-        let purl = "pkg:npm/minimist@1.2.2";
-        mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
-        mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
-
-        let tmp = tempfile::tempdir().unwrap();
-        write_root_package_json(tmp.path());
-        write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+        write_npm_package(tmp.path(), "silent-target", "1.0.0", before);
 
         let uri = mock.uri();
         let cwd = tmp.path().to_path_buf();
@@ -1725,7 +1659,7 @@ mod pty {
                 &[
                     "scan",
                     "--mode",
-                    "vendored",
+                    "agent",
                     "--api-url",
                     &uri,
                     "--api-token",
@@ -1734,26 +1668,22 @@ mod pty {
                     ORG_SLUG,
                 ],
                 &cwd,
-                "n\n",
+                "",
                 Duration::from_secs(60),
             )
         })
         .await
         .expect("spawn_blocking join");
 
-        assert_eq!(code, 0, "declining is not an error; output:\n{output}");
+        assert_eq!(code, 0, "output:\n{output}");
         assert!(
-            output.contains("Download and vendor 1 patch?"),
-            "the vendored prompt must have shown; got:\n{output}"
+            !output.contains("[Y/n]") && !output.contains("Download and apply"),
+            "scan must not prompt; got:\n{output}"
         );
-        assert!(
-            output.contains("To vendor a single patch, run:")
-                && output.contains("socket-patch get <package-name-or-purl> --mode vendored"),
-            "the decline hint must name the vendored get; got:\n{output}"
-        );
-        assert!(
-            !output.contains("To apply a single patch"),
-            "no agent-mode hint in vendored mode; got:\n{output}"
+        assert_eq!(
+            std::fs::read(tmp.path().join("node_modules/silent-target/index.js")).unwrap(),
+            b"after\n",
+            "the apply must proceed unattended"
         );
     }
 
@@ -1921,63 +1851,6 @@ mod pty {
         }
     }
 
-    /// Keystrokes typed while the scan is still querying the API must not
-    /// answer the default-yes download prompt: `confirm` discards
-    /// typeahead before showing it. Without the flush, the early "n\n"
-    /// would decline; with it, the Enter sent at the prompt takes the
-    /// default (yes) and the patch is applied.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn scan_typeahead_before_the_prompt_is_discarded() {
-        let mock = MockServer::start().await;
-        let purl = "pkg:npm/typeahead-target@1.0.0";
-        let before = b"before\n";
-        // The batch answers late, so the early "n\n" is certainly sitting
-        // in the terminal's input queue before the prompt appears.
-        mount_one_patch_api_delayed(&mock, purl, before, Duration::from_millis(1500)).await;
-
-        let tmp = tempfile::tempdir().unwrap();
-        write_root_package_json(tmp.path());
-        write_npm_package(tmp.path(), "typeahead-target", "1.0.0", before);
-
-        let uri = mock.uri();
-        let cwd = tmp.path().to_path_buf();
-        let (code, output) = tokio::task::spawn_blocking(move || {
-            run_in_pty_with(
-                &[
-                    "scan",
-                    "--api-url",
-                    &uri,
-                    "--api-token",
-                    "fake-token-for-test",
-                    "--org",
-                    ORG_SLUG,
-                ],
-                &cwd,
-                &[],
-                "n\n",
-                "\n",
-                Duration::from_secs(60),
-            )
-        })
-        .await
-        .expect("spawn_blocking join");
-
-        assert_eq!(code, 0, "output:\n{output}");
-        assert!(
-            output.contains("Download and apply 1 patch? [Y/n] "),
-            "the default-yes prompt must have shown; got:\n{output}"
-        );
-        assert!(
-            !output.contains("To apply a single patch, run:"),
-            "the early \"n\" must not have declined the prompt; got:\n{output}"
-        );
-        assert_eq!(
-            std::fs::read(tmp.path().join("node_modules/typeahead-target/index.js")).unwrap(),
-            b"after\n",
-            "the Enter at the prompt takes the default and applies; got:\n{output}"
-        );
-    }
-
     /// Under `SOCKET_DEBUG` core prints `[socket-patch debug] ...` lines
     /// straight to stderr. The live status line is off then, so those
     /// lines never land glued onto the end of a progress message.
@@ -2043,69 +1916,6 @@ mod pty {
         );
     }
 
-    /// The hosted twin: declining "Redirect N packages …?" exits 0 with
-    /// the hosted get-hint and never enters the engine (no reference
-    /// resolve, no `.socket/`).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn scan_hosted_decline_at_redirect_prompt_exits_zero_without_mutation() {
-        let mock = MockServer::start().await;
-        let purl = "pkg:npm/minimist@1.2.2";
-        mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
-        mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
-        mount_forbidden_reference(&mock, purl).await;
-
-        let tmp = tempfile::tempdir().unwrap();
-        write_root_package_json(tmp.path());
-        write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
-
-        let uri = mock.uri();
-        let cwd = tmp.path().to_path_buf();
-        let (code, output) = tokio::task::spawn_blocking(move || {
-            run_in_pty(
-                &[
-                    "scan",
-                    "--mode",
-                    "hosted",
-                    "--api-url",
-                    &uri,
-                    "--api-token",
-                    "fake-token-for-test",
-                    "--org",
-                    ORG_SLUG,
-                ],
-                &cwd,
-                "n\n",
-                Duration::from_secs(60),
-            )
-        })
-        .await
-        .expect("spawn_blocking join");
-
-        assert_eq!(code, 0, "declining is not an error; output:\n{output}");
-        assert!(
-            output.contains("Redirect 1 package to the hosted patch server?"),
-            "the hosted confirm prompt must have shown; got:\n{output}"
-        );
-        assert!(
-            output.contains("To redirect a package, run:")
-                && output.contains("socket-patch get <CVE-ID> --mode hosted"),
-            "the hosted decline hint must print; got:\n{output}"
-        );
-        assert!(
-            !output.contains("Redirected"),
-            "declining must not enter the redirect engine; got:\n{output}"
-        );
-        assert!(
-            !tmp.path().join(".socket").exists(),
-            "declining must create nothing under .socket/"
-        );
-        let reqs = recorded(&mock).await;
-        assert_eq!(
-            reference_posts(&reqs),
-            0,
-            "declining must not resolve the hosted reference"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2157,19 +1967,19 @@ fn scan_invalid_bun_lockb_warns_instead_of_silent_success() {
             "mode={mode:?}: the binary format error must name its file: {detail}"
         );
         assert!(
-            !stdout.contains("Warning ("),
+            !stdout.contains("Warning:"),
             "mode={mode:?}: the human warning line must not leak into the JSON stream: {stdout}"
         );
     }
 
-    // Human path: the same diagnosis as a stderr `Warning (code): detail`
+    // Human path: the same diagnosis as a stderr `Warning: detail`
     // line, exit 0, and the generic "No packages found" hint still prints.
     let tmp = tempfile::tempdir().unwrap();
     write_invalid_bun_lockb_project(tmp.path());
     let (code, stdout, stderr) = run_scan(tmp.path(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stderr.contains("Warning (bun_lockb_invalid): cannot inventory bun.lockb"),
+        stderr.contains("Warning: cannot inventory bun.lockb"),
         "the human path must name the layout and the code; got {stderr:?}"
     );
     assert!(
@@ -2235,7 +2045,7 @@ async fn scan_nonempty_keeps_the_bun_lockb_discovery_warning_in_every_mode() {
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--mode", "hosted"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stderr.contains("Warning (bun_lockb_invalid):"),
+        stderr.contains("Warning: cannot inventory bun.lockb"),
         "the human hosted path must keep the warning; got {stderr:?}"
     );
 }
@@ -2332,7 +2142,7 @@ async fn mount_empty_batch(mock: &MockServer) {
 }
 
 /// `scan --prune` with nothing to apply still garbage-collects, like the
-/// JSON path (it used to return early and silently skip the GC), and a
+/// JSON path, and a
 /// `--dry-run` previews it without touching the manifest.
 #[tokio::test]
 async fn scan_human_prune_runs_gc_even_when_no_patches_are_available() {
@@ -2450,22 +2260,6 @@ fn scan_mode_conflict_error_is_capitalized_and_names_no_hidden_flag() {
         "{stderr:?}"
     );
     assert!(!stderr.contains("--redirect"), "{stderr:?}");
-    // Typing the hidden --redirect gets it explained.
-    let (code, _, stderr) = run_scan(tmp.path(), &["--mode", "agent", "--redirect"]);
-    assert_eq!(code, 2);
-    assert!(
-        stderr.starts_with(
-            "Error: --mode agent cannot be used with --redirect: the flags select \
-             different modes (--redirect means --mode hosted)"
-        ),
-        "{stderr:?}"
-    );
-    let (code, _, stderr) = run_scan(tmp.path(), &["--detached"]);
-    assert_eq!(code, 2);
-    assert!(
-        stderr.starts_with("Error: --detached requires vendored mode"),
-        "{stderr:?}"
-    );
 }
 
 /// A selection the manifest already records at the same uuid is not
@@ -2482,7 +2276,7 @@ async fn scan_human_does_not_offer_an_already_recorded_patch() {
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
     seed_manifest(tmp.path(), &[(purl, UUID)]);
 
-    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--yes"]);
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--yes"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
         stdout.contains(&format!("[skip] {purl} (already recorded: 11111111)")),
@@ -2501,8 +2295,8 @@ async fn scan_human_does_not_offer_an_already_recorded_patch() {
     );
 }
 
-/// The human table's PACKAGE column grows to fit the PURL (the old fixed
-/// 40-column cut dropped the version), and the rule matches the table.
+/// The human table's PACKAGE column grows to fit the PURL (a fixed-width
+/// cut would drop the version), and the rule matches the table.
 #[tokio::test]
 async fn scan_human_table_shows_full_purl_with_version() {
     let mock = MockServer::start().await;
@@ -2612,18 +2406,17 @@ async fn scan_prune_keeps_a_wired_vlt_uuid_and_sweeps_an_unwired_one() {
     );
 }
 
-/// The degraded-ledger overlap through the CLI: a redirect ledger holding
-/// only a vlt node edit (no records) keyed at a peer variant of the
-/// vendored package's DepID is superseded by the vendored wiring (warned
-/// and reconciled), at the `~` boundary only.
+/// A pre-v5 redirect ledger holding only a vlt node edit keyed at a peer
+/// variant of the vendored package's DepID is IGNORED by a vendored scan:
+/// v5 has no `vendor_supersedes_redirect` reconciliation (once the lock
+/// routes a package to `.socket/vendor/`, no hosted state is left), so no
+/// warning fires at either side of the `~` boundary and the legacy file is
+/// left byte-identical.
 #[tokio::test]
-async fn scan_vendored_warns_on_a_degraded_vlt_edit_at_the_tilde_boundary() {
+async fn scan_vendored_ignores_a_degraded_pre_v5_vlt_ledger_edit() {
     use socket_patch_core::patch::redirect::{FileEdit, RedirectState};
     use vlt_hosted_common as hosted;
-    for (key, overlaps) in [
-        ("left-pad@1.3.0~peer.2", true),
-        ("left-pad@1.3.00~peer.2", false),
-    ] {
+    for key in ["left-pad@1.3.0~peer.2", "left-pad@1.3.00~peer.2"] {
         let server = MockServer::start().await;
         hosted::mock_all(&server).await;
         let tmp = tempfile::tempdir().unwrap();
@@ -2638,14 +2431,11 @@ async fn scan_vendored_warns_on_a_degraded_vlt_edit_at_the_tilde_boundary() {
             original: None,
             new: None,
         }];
-        std::fs::write(
-            hosted::ledger_path(root),
-            serde_json::to_string_pretty(&ledger).unwrap(),
-        )
-        .unwrap();
+        let bytes = serde_json::to_string_pretty(&ledger).unwrap();
+        std::fs::write(hosted::ledger_path(root), &bytes).unwrap();
         let cwd = root.to_str().unwrap().to_string();
         let uri = server.uri();
-        let (_, env, stderr) = hosted::run_json(
+        let (code, env, stderr) = hosted::run_json(
             root,
             &[
                 "scan",
@@ -2663,22 +2453,16 @@ async fn scan_vendored_warns_on_a_degraded_vlt_edit_at_the_tilde_boundary() {
             ],
             &[],
         );
+        assert_eq!(code, 0, "{key}: {env:#}\n{stderr}");
         let text = env.to_string();
-        let warned = text.contains("vendor_supersedes_redirect");
-        assert_eq!(warned, overlaps, "{key}: {env:#}\n{stderr}");
-        let edits = std::fs::read(hosted::ledger_path(root))
-            .ok()
-            .map(|b| {
-                serde_json::from_slice::<RedirectState>(&b)
-                    .unwrap()
-                    .edits
-                    .len()
-            })
-            .unwrap_or(0);
+        assert!(
+            !text.contains("vendor_supersedes_redirect"),
+            "{key}: the v5 vendored scan never reconciles a hosted ledger: {env:#}"
+        );
         assert_eq!(
-            edits,
-            usize::from(!overlaps),
-            "{key}: the reconciliation drops exactly the claimed edit: {env:#}"
+            std::fs::read_to_string(hosted::ledger_path(root)).unwrap(),
+            bytes,
+            "{key}: the pre-v5 ledger is left byte-identical: {env:#}"
         );
     }
 }

@@ -187,13 +187,10 @@ fi
 # too in case anything else stomps on it.
 chmod u+w "$LIB_RS" || true
 
-# Pre-seed setup.manual so the agent-mode VEX leg keeps the cargo patch
-# through property 7 (cargo has no auto-install setup hook; agent patches are
-# applied by hand/CI — exactly what `manual` declares). scan --sync merges the
-# downloaded patch into this manifest and preserves the setup block.
+# Pre-seed an empty manifest; scan --sync merges the downloaded patch into it.
 mkdir -p .socket
 cat > .socket/manifest.json <<'MANIFEST'
-{{ "patches": {{}}, "setup": {{ "manual": ["cargo"] }} }}
+{{ "patches": {{}} }}
 MANIFEST
 
 # scan --sync writes manifest + blob; the cargo crawler with --global

@@ -33,10 +33,9 @@ fn git_sha256(content: &[u8]) -> String {
 }
 
 // --- Request introspection helpers -----------------------------------------
-// The discovery-only tests below previously asserted *only* `scan_run == 0`.
 // Exit 0 is also what a crawler that discovered nothing (or short-circuited
-// the API entirely) returns, so the old assertion was vacuous. These helpers
-// let us assert on the real code path: that the batch endpoint was actually
+// the API entirely) returns, so these helpers let the discovery-only tests
+// assert on the real code path: that the batch endpoint was actually
 // hit and that it carried the PURL the crawler was supposed to discover.
 async fn recorded(server: &MockServer) -> Vec<wiremock::Request> {
     server.received_requests().await.unwrap_or_default()
@@ -72,7 +71,9 @@ async fn assert_discovered_purl(server: &MockServer, expected_purl: &str) {
 
 fn default_scan_args(cwd: &Path, eco: &str, api_url: String) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: cwd.to_path_buf(),
             org: Some(ORG.to_string()),
@@ -93,11 +94,10 @@ fn default_scan_args(cwd: &Path, eco: &str, api_url: String) -> ScanArgs {
         prune: false,
         sync: true,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     }
 }
 
@@ -230,7 +230,7 @@ async fn golang_handcrafted_install_apply_patches_file() {
     let args = default_scan_args(tmp.path(), "golang", server.uri());
     let code = scan_run(args).await;
     // A single free patch that downloads + applies cleanly must exit 0.
-    // `download_and_apply_patches` only returns 1 when a patch fails to
+    // `download_and_apply_patches_with` only returns 1 when a patch fails to
     // download or apply, so 1 here means the apply path silently broke.
     assert_eq!(
         code, 0,
@@ -527,9 +527,6 @@ async fn nuget_handcrafted_install_apply_patches_file() {
     let after_hash = git_sha256(&patched);
 
     std::env::set_var("NUGET_PACKAGES", &packages);
-    // NuGet crawler is runtime-gated behind this env var (see
-    // `ecosystem_dispatch::nuget_runtime_enabled`). The test
-    // deliberately exercises the NuGet apply path, so opt in.
 
     let server = MockServer::start().await;
     setup_apply_mock(

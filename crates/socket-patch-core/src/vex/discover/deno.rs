@@ -1,7 +1,8 @@
 //! Deno — deliberately always empty.
 //!
-//! Neither mode exists for Deno: there is no hosted rewriter
-//! (`commands/scan/hosted.rs:78-80` refuses the ecosystem) and no vendored
+//! Neither mode exists for Deno: there is no hosted rewriter (no rewriter
+//! edits `deno.lock`; `commands/scan/hosted.rs` leaves it out of the
+//! rewriter's input files on purpose) and no vendored
 //! backend (`vendor::path::ecosystem_dir_for_purl` maps `pkg:jsr/…` to
 //! `None` — there is no `.socket/vendor/jsr/`). A `deno.lock` can therefore
 //! never carry a Socket patch reference, and a Socket-looking url in one is

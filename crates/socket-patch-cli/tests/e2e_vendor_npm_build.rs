@@ -35,6 +35,9 @@
 //! cannot reach the registry — unless `SOCKET_PATCH_NPM_E2E_REQUIRED` is
 //! set; every assertion after that is hard.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -71,13 +74,14 @@ fn binary() -> PathBuf {
 /// flip behavior) along with `VIRTUAL_ENV` (crawler discovery input).
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
             cmd.env_remove(&k);
         }
     }
     cmd.env_remove("VIRTUAL_ENV");
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -711,7 +715,7 @@ fn npm_vendor_refuses_a_remote_tarball_dependency() {
 /// `view/{uuid}` endpoint — the before/after git-blob hashes `stage_patch`
 /// would compute from the actually-installed bytes, plus the after bytes
 /// inline as base64 `blobContent` — and must land the identical committed
-/// state: manifest record, deterministic artifact, vendor ledger, `file:`
+/// state: a detached vendor-ledger entry (NO manifest), deterministic artifact, vendor ledger, `file:`
 /// lock wiring with a recomputed sha512, and NO `.socket/blobs` (scan
 /// parity: the download phase holds patch content in memory). The
 /// fresh-checkout `npm ci` proof is the capstone's, verbatim.
@@ -755,29 +759,31 @@ async fn npm_get_uuid_vendored_fresh_checkout_npm_ci() {
     // 2. The patch record arrives over the (mocked) API instead of being
     //    staged on disk: same hashes, after bytes inline.
     let server = MockServer::start().await;
+    let view = serde_json::json!({
+        "uuid": UUID,
+        "purl": purl,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": git_sha256(&orig),
+                "afterHash": git_sha256(&patched),
+                "blobContent": b64(&patched),
+            }
+        },
+        "vulnerabilities": { TAIL_GHSA: {
+            "cves": [TAIL_CVE],
+            "summary": "get vendored vex vuln",
+            "severity": "high",
+            "description": "d",
+        }},
+        "description": "capstone marker patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view(&server, &view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": purl,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": git_sha256(&orig),
-                    "afterHash": git_sha256(&patched),
-                    "blobContent": b64(&patched),
-                }
-            },
-            "vulnerabilities": { TAIL_GHSA: {
-                "cves": [TAIL_CVE],
-                "summary": "get vendored vex vuln",
-                "severity": "high",
-                "description": "d",
-            }},
-            "description": "capstone marker patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
         .mount(&server)
         .await;
 
@@ -818,7 +824,7 @@ async fn npm_get_uuid_vendored_fresh_checkout_npm_ci() {
             "--org",
             ORG,
             "--vendor-source",
-            "build",
+            "service",
         ],
     );
     assert_eq!(

@@ -248,7 +248,9 @@ async fn pypi_install_scan_sync_patches_real_file() {
     setup_pypi_apply_mock(&server, &before_hash, &after_hash, &patched).await;
 
     let mut args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),
@@ -268,11 +270,10 @@ async fn pypi_install_scan_sync_patches_real_file() {
         prune: false,
         sync: true,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     // Avoid borrow problem with into_iter
     let _ = &mut args;
@@ -324,7 +325,9 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
 
     // 1. scan --sync to write the manifest + blob.
     let scan_args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),
@@ -344,11 +347,10 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
         prune: false,
         sync: true,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     let scan_code = scan_run(scan_args).await;
     assert_eq!(scan_code, 0, "scan --sync should succeed (exit 0)");
@@ -433,7 +435,9 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
     setup_pypi_apply_mock(&server, &before_hash, &after_hash, &patched).await;
 
     let scan_args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),
@@ -453,11 +457,10 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     // Require success: otherwise an early crash (before the apply path
     // is ever reached) would leave the file untouched and let this test
@@ -503,15 +506,12 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
          the unchanged file does not prove dry-run suppressed a real patch; \
          bodies: {batch_bodies:?}"
     );
-    // Discovery alone still doesn't pin the APPLY path: a scan that
-    // degraded to plain listing (e.g. a broken `--apply` → agent-mode
-    // fold in `resolve_mode_flags`) also queries batch with the purl,
-    // exits 0, and leaves the file untouched — vacuously green. In JSON
-    // mode only the agent-mode apply branch fetches per-package patch
-    // details (`discover_selected`, which runs before the dry-run gate),
-    // so requiring that fetch proves dry-run reached the apply path with
-    // a real patch selected and then declined to write. Mutation-verified:
-    // dropping the `--apply` fold passes every assert above but fails here.
+    // Discovery alone doesn't prove a patch was selected. Requiring the
+    // per-package fetch (`discover_selected`, which runs before the dry-run
+    // gate) proves a real patch was selected before dry-run declined to
+    // write. Hosted mode's `run_redirect` also calls `discover_selected`, so
+    // this does NOT tell a broken `--apply` → agent fold (which would fall
+    // into the hosted default) apart from a working one.
     assert!(
         requests.iter().any(|r| r
             .url
@@ -565,7 +565,9 @@ async fn pypi_crawler_finds_real_installed_six() {
         .await;
 
     let args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),
@@ -585,11 +587,10 @@ async fn pypi_crawler_finds_real_installed_six() {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     assert_eq!(scan_run(args).await, 0);
 

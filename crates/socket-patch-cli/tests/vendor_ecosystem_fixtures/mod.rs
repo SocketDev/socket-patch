@@ -9,6 +9,9 @@
 //! what makes whole-file ledger snapshots chain.
 #![allow(dead_code)]
 
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -112,7 +115,14 @@ impl Fixture {
         extra_env: &[(&str, &str)],
     ) -> (i32, String, String) {
         let mut cmd = Command::new(bin);
-        cmd.args(args).current_dir(&self.root);
+        let args: Vec<_> = args
+            .iter()
+            .copied()
+            .filter(|a| {
+                args.first() != Some(&"vendor") || args.contains(&"--revert") || *a != "--offline"
+            })
+            .collect();
+        cmd.args(&args).current_dir(&self.root);
         for (key, _) in std::env::vars() {
             if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
                 cmd.env_remove(key);
@@ -133,6 +143,14 @@ impl Fixture {
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
+        let fixture_env: Vec<_> = self
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .chain(extra_env.iter().copied())
+            .collect();
+        let server = prebuilt_common::Server::project_with_env(&self.root, &fixture_env);
+        server.command(&mut cmd);
         let out = cmd.output().expect("run socket-patch");
         (
             out.status.code().unwrap_or(-1),
@@ -143,7 +161,7 @@ impl Fixture {
 
     /// `vendor --json --offline [extra]`.
     pub fn vendor(&self, extra: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
-        let mut args = vec!["vendor", "--json", "--offline"];
+        let mut args = vec!["vendor", "--json"];
         args.extend_from_slice(extra);
         self.run(&args, extra_env)
     }

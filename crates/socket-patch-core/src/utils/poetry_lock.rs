@@ -15,7 +15,7 @@
 use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::python_lock::table_likes;
+use crate::utils::python_lock::{is_prior_hosted_url, table_likes};
 
 /// The `{file, hash}` tables Poetry records in `package`'s own
 /// `files = [...]` (lock 2.x; also written into 1.0/1.1 locks). Read by the
@@ -40,6 +40,76 @@ pub(crate) fn metadata_files<'d>(lock: &'d DocumentMut, name: &str) -> Vec<&'d d
                 .map(|(_, item)| item)
         });
     table_likes(entry)
+}
+
+/// Whether a `[metadata.files]` entry is laid out one file per line, which is
+/// how Poetry 1.0/1.1 write every NON-empty entry (tomlkit `multiline(True)`);
+/// an empty one is `[]`.
+pub(crate) fn is_multiline_array(item: &Item) -> bool {
+    item.as_array().is_some_and(|array| {
+        let has_break = |raw: Option<&str>| raw.is_some_and(|s| s.contains('\n'));
+        has_break(array.trailing().as_str())
+            || array
+                .iter()
+                .any(|v| has_break(v.decor().prefix().and_then(|p| p.as_str())))
+    })
+}
+
+/// The patched `[metadata.files]` entry (lock 1.0/1.1) replacing
+/// `table[name]`, laid out as the entry it replaces: one file per line
+/// (Poetry's own rendering) when that entry listed files, inline when it was
+/// Poetry's empty `[]` (what Poetry 1.0/1.1 record against today's PyPI JSON
+/// API). The layout is the only record of which the lock had: the hosted
+/// restore (`patch::redirect::upstream::pypi_locks`) reads it back to put
+/// either the full release list or `[]` back. A `rewritten` package (one
+/// already carrying a source: a rotated hosted url) keeps the layout of the
+/// entry it has, which is the original's bit, so re-runs are idempotent.
+fn legacy_files_entry(table: &dyn TableLike, name: &str, files: Array, rewritten: bool) -> Item {
+    let canon = canonicalize_pypi_name(name);
+    let existing = table.get(name).or_else(|| {
+        table
+            .iter()
+            .find(|(key, _)| canonicalize_pypi_name(key) == canon)
+            .map(|(_, item)| item)
+    });
+    let populated = if rewritten {
+        existing.is_some_and(is_multiline_array)
+    } else {
+        existing
+            .and_then(Item::as_array)
+            .is_some_and(|existing| !existing.is_empty())
+    };
+    if !populated {
+        return value(files);
+    }
+    let entries: Vec<String> = files
+        .iter()
+        .filter_map(Value::as_inline_table)
+        .map(|entry| {
+            let field = |key: &str| {
+                entry
+                    .get(key)
+                    .map(|v| {
+                        let mut v = v.clone();
+                        v.decor_mut().clear();
+                        v.to_string()
+                    })
+                    .unwrap_or_default()
+            };
+            format!(
+                "    {{file = {}, hash = {}}},\n",
+                field("file"),
+                field("hash")
+            )
+        })
+        .collect();
+    match format!("[\n{}]", entries.concat()).parse::<Value>() {
+        Ok(mut multiline) => {
+            multiline.decor_mut().clear();
+            Item::Value(multiline)
+        }
+        Err(_) => value(files),
+    }
 }
 
 /// The lock generation: `"0"`, `"1.0"`, `"1.1"`, or any `"2.<minor>"` (Poetry
@@ -71,7 +141,10 @@ fn lock_version_of(lock: &Table) -> Result<&str, String> {
         {
             Ok("0")
         }
-        None => Err("poetry.lock has neither a [metadata] lock-version nor a [metadata.hashes] table".into()),
+        None => Err(
+            "poetry.lock has neither a [metadata] lock-version nor a [metadata.hashes] table"
+                .into(),
+        ),
     }
 }
 
@@ -94,32 +167,6 @@ pub fn generated_by_version(lock_text: &str) -> Option<(u64, u64)> {
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     Some((major, minor))
-}
-
-/// Whether `existing` is an earlier hosted redirect of the SAME artifact:
-/// same origin (`scheme://host[:port]`) and same trailing filename as the
-/// current artifact URL, fragments ignored. Grant tokens and patch uuids live
-/// in the path between them, so a rotated token or a republished patch is
-/// superseded in place instead of stranding the pin on a URL that no longer
-/// serves (the bun / requirements / cargo rewriters make the same call).
-fn is_prior_hosted_url(existing: &str, current: &str) -> bool {
-    fn origin_and_leaf(url: &str) -> Option<(&str, &str)> {
-        if !url.starts_with("https://") && !url.starts_with("http://") {
-            return None;
-        }
-        let url = url.split('#').next()?;
-        let scheme_end = url.find("://")? + 3;
-        let path_start = url[scheme_end..].find('/')? + scheme_end;
-        let leaf = url[path_start..]
-            .rsplit('/')
-            .next()
-            .filter(|leaf| !leaf.is_empty())?;
-        Some((&url[..path_start], leaf))
-    }
-    match (origin_and_leaf(existing), origin_and_leaf(current)) {
-        (Some(old), Some(new)) => old == new,
-        _ => false,
-    }
 }
 
 /// Rewrite the `[[package]]` for `name`@`version` to install the wheel at
@@ -239,14 +286,7 @@ pub fn rewrite_poetry_lock_in<'a>(
     // Poetry compares the lock's `sha256:<hex>` against `hashlib`'s lowercase
     // hexdigest as strings, so an uppercase digest would fail every install.
     let sha256 = sha256.to_ascii_lowercase();
-    if filename.contains(['/', '\\']) || !filename.ends_with(".whl") {
-        return Err("Poetry patch wheel does not match the locked package".into());
-    }
-    let parts: Vec<_> = filename.split('-').collect();
-    if !matches!(parts.len(), 5 | 6)
-        || canonicalize_pypi_name(parts[0]) != canonicalize_pypi_name(name)
-        || parts[1] != version
-    {
+    if !crate::vendor::pypi_distribution::matches(filename, name, version) {
         return Err("Poetry patch wheel does not match the locked package".into());
     }
     let doc = match parse.doc.take() {
@@ -269,7 +309,7 @@ pub fn rewrite_poetry_lock_in<'a>(
         package_name,
     } = plan;
     // The original's fragments come from the same parse; an error surfaces
-    // where the fresh parse used to raise it, after the rewrite.
+    // where a fresh parse would raise it, after the rewrite.
     let before = poetry_lock_fragments_in(&doc, text, name);
     let mut lock = doc.into_mut();
     let package = lock
@@ -290,6 +330,7 @@ pub fn rewrite_poetry_lock_in<'a>(
         // without it), even for archive sources.
         source.insert("reference", value(""));
     }
+    let rewritten = package.contains_key("source");
     package.insert("source", Item::Table(source));
     if matches!(format.as_str(), "1.0" | "1.1") && source_type == "url" {
         // Poetry >= 1.2 verifies url sources against the package's own
@@ -318,7 +359,8 @@ pub fn rewrite_poetry_lock_in<'a>(
             hashes.push(sha256.as_str());
             table.insert(&package_name, value(hashes));
         } else {
-            table.insert(&package_name, value(files));
+            let entry = legacy_files_entry(table, &package_name, files, rewritten);
+            table.insert(&package_name, entry);
         }
     }
     let mut rewritten = lock.to_string();
@@ -429,7 +471,7 @@ fn plan_poetry_rewrite(
 /// End (exclusive, before its line break) of the first top-level TOML header
 /// line at or after `from`, skipping blank lines; `text.len()` at EOF; `from`
 /// itself when the next non-blank line is not a header (a shape Poetry never
-/// writes — the fragment then ends where it used to).
+/// writes — the fragment is then not extended).
 fn next_header_end(text: &str, from: usize) -> usize {
     let mut pos = from;
     for line in text[from..].split_inclusive('\n') {
@@ -605,7 +647,7 @@ mod tests {
     }
 
     /// A user-editable lock with a malformed integrity table must be refused,
-    /// never panic (it used to `IndexMut` straight into `metadata.files`).
+    /// never panic (no `IndexMut` straight into `metadata.files`).
     #[test]
     fn malformed_integrity_tables_are_refused_without_panicking() {
         let lock = fixture("1.2.2");
@@ -630,7 +672,15 @@ mod tests {
                 Ok(other) => panic!("{label}: expected a refusal, got {other:?}"),
             }
             // The vendored (file-source) spelling takes the same guarded path.
-            match rewrite_poetry_lock(&text, "urllib3", "1.26.18", "file", ".socket/vendor/pypi/x/urllib3-1.26.18-py2.py3-none-any.whl", WHEEL, &sha()) {
+            match rewrite_poetry_lock(
+                &text,
+                "urllib3",
+                "1.26.18",
+                "file",
+                ".socket/vendor/pypi/x/urllib3-1.26.18-py2.py3-none-any.whl",
+                WHEEL,
+                &sha(),
+            ) {
                 Err(err) => assert!(!err.is_empty(), "{label}"),
                 Ok(other) => panic!("{label}: expected a refusal, got {other:?}"),
             }
@@ -639,8 +689,8 @@ mod tests {
 
     /// Poetry bumps the 2.x minor additively; the vendored loader accepts a
     /// newer minor with an advisory, so the shared rewriter must too — the
-    /// same lock used to be applied (LF vendored), hard-failed (CRLF vendored)
-    /// and silently skipped (hosted) depending only on the path taken.
+    /// same lock must get the same treatment on every path (LF vendored, CRLF
+    /// vendored, hosted).
     #[test]
     fn newer_2x_minor_is_rewritten_like_2_1() {
         let lock = fixture("2.4.3").replace("lock-version = \"2.1\"", "lock-version = \"2.2\"");
@@ -648,7 +698,10 @@ mod tests {
         assert!(rewritten.contains(URL));
         assert!(rewritten.contains("lock-version = \"2.2\""));
         for bad in ["3.0", "2", "2.x", "1.2"] {
-            let lock = fixture("2.4.3").replace("lock-version = \"2.1\"", &format!("lock-version = \"{bad}\""));
+            let lock = fixture("2.4.3").replace(
+                "lock-version = \"2.1\"",
+                &format!("lock-version = \"{bad}\""),
+            );
             let err = hosted(&lock).unwrap_err();
             assert!(err.contains(bad), "{bad}: {err}");
         }
@@ -671,28 +724,47 @@ mod tests {
         // Poetry 1.0 carries a `#sha256=…&` fragment; the comparison ignores it.
         let lock10 = fixture("1.0.10");
         let first10 = hosted(&lock10).unwrap().unwrap();
-        let second10 = rewrite_poetry_lock(&first10, "urllib3", "1.26.18", "url", &rotated, WHEEL, &"b".repeat(64))
-            .unwrap()
-            .unwrap();
+        let second10 = rewrite_poetry_lock(
+            &first10,
+            "urllib3",
+            "1.26.18",
+            "url",
+            &rotated,
+            WHEEL,
+            &"b".repeat(64),
+        )
+        .unwrap()
+        .unwrap();
         assert!(second10.contains(&format!("{rotated}#sha256={}&", "b".repeat(64))));
         // A user's own url source on another origin stays untouched.
         let foreign = first.replace("https://patch.socket.dev", "https://mirror.example");
-        assert!(hosted(&foreign).unwrap_err().contains("existing Poetry source"));
+        assert!(hosted(&foreign)
+            .unwrap_err()
+            .contains("existing Poetry source"));
         // A vendored file source is never taken over by the hosted path here.
-        let vendored = rewrite_poetry_lock(&lock, "urllib3", "1.26.18", "file", ".socket/vendor/pypi/x/urllib3-1.26.18-py2.py3-none-any.whl", WHEEL, &sha())
-            .unwrap()
-            .unwrap();
-        assert!(hosted(&vendored).unwrap_err().contains("existing Poetry source"));
+        let vendored = rewrite_poetry_lock(
+            &lock,
+            "urllib3",
+            "1.26.18",
+            "file",
+            ".socket/vendor/pypi/x/urllib3-1.26.18-py2.py3-none-any.whl",
+            WHEEL,
+            &sha(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(hosted(&vendored)
+            .unwrap_err()
+            .contains("existing Poetry source"));
     }
 
     #[test]
     fn sha256_is_written_lowercase() {
         let lock = fixture("2.4.3");
         let upper = "A".repeat(64);
-        let rewritten =
-            rewrite_poetry_lock(&lock, "urllib3", "1.26.18", "url", URL, WHEEL, &upper)
-                .unwrap()
-                .unwrap();
+        let rewritten = rewrite_poetry_lock(&lock, "urllib3", "1.26.18", "url", URL, WHEEL, &upper)
+            .unwrap()
+            .unwrap();
         assert!(rewritten.contains(&format!("sha256:{}", "a".repeat(64))));
         assert!(!rewritten.contains(&upper));
     }
@@ -712,7 +784,10 @@ mod tests {
         let lock = format!("{lock}{sibling}");
         let rewritten = hosted(&lock).unwrap().unwrap();
         assert!(rewritten.contains(URL));
-        assert!(rewritten.contains(&sibling), "sibling entry must survive verbatim");
+        assert!(
+            rewritten.contains(&sibling),
+            "sibling entry must survive verbatim"
+        );
         let edits = poetry_lock_edits(&lock, &rewritten, "urllib3").unwrap();
         assert_eq!(edits.len(), 2);
         assert!(edits[1].0.starts_with('\n'));
@@ -733,7 +808,10 @@ mod tests {
                 "{version}: {original:?}"
             );
             assert!(new.ends_with("[metadata]") || new.ends_with("[extras]"));
-            assert!(!new.contains(original.as_str()), "{version}: pristine must not be a prefix of new");
+            assert!(
+                !new.contains(original.as_str()),
+                "{version}: pristine must not be a prefix of new"
+            );
             // A relock that keeps `[package.source]` but drops the inserted
             // `files` line must NOT contain the pristine fragment either.
             let drifted: String = rewritten
@@ -747,12 +825,20 @@ mod tests {
         // header, the second starts with it; both splice independently.
         let lock = fixture("2.4.3");
         let mut doc: DocumentMut = lock.parse().unwrap();
-        let mut second = doc["package"].as_array_of_tables().unwrap().get(0).unwrap().clone();
+        let mut second = doc["package"]
+            .as_array_of_tables()
+            .unwrap()
+            .get(0)
+            .unwrap()
+            .clone();
         second["name"] = value("six");
         second["version"] = value("1.16.0");
         second.set_position(None);
         second.remove("extras");
-        doc["package"].as_array_of_tables_mut().unwrap().push(second);
+        doc["package"]
+            .as_array_of_tables_mut()
+            .unwrap()
+            .push(second);
         let two = doc.to_string();
         let first = hosted(&two).unwrap().unwrap();
         let edits = poetry_lock_edits(&two, &first, "urllib3").unwrap();
@@ -764,11 +850,29 @@ mod tests {
     fn absent_or_other_version_yields_none_not_error() {
         let lock = fixture("2.4.3");
         assert_eq!(
-            rewrite_poetry_lock(&lock, "six", "1.16.0", "url", &URL.replace("urllib3", "six").replace("1.26.18", "1.16.0"), "six-1.16.0-py2.py3-none-any.whl", &sha()).unwrap(),
+            rewrite_poetry_lock(
+                &lock,
+                "six",
+                "1.16.0",
+                "url",
+                &URL.replace("urllib3", "six").replace("1.26.18", "1.16.0"),
+                "six-1.16.0-py2.py3-none-any.whl",
+                &sha()
+            )
+            .unwrap(),
             None
         );
         assert_eq!(
-            rewrite_poetry_lock(&lock, "urllib3", "1.26.17", "url", &URL.replace("1.26.18", "1.26.17"), "urllib3-1.26.17-py2.py3-none-any.whl", &sha()).unwrap(),
+            rewrite_poetry_lock(
+                &lock,
+                "urllib3",
+                "1.26.17",
+                "url",
+                &URL.replace("1.26.18", "1.26.17"),
+                "urllib3-1.26.17-py2.py3-none-any.whl",
+                &sha()
+            )
+            .unwrap(),
             None
         );
     }
@@ -854,171 +958,11 @@ mod tests {
 #[cfg(test)]
 mod parse_reuse_equivalence_tests {
     //! The single-parse rewrite ([`rewrite_poetry_lock_in`], reusing the
-    //! previous rewrite's parsed output) against the previous
-    //! [`rewrite_poetry_lock_with_edits`], kept verbatim: identical verdicts,
-    //! texts and edits at every step of a dep sequence, on every lock
-    //! generation, LF and CRLF, with refusals and re-runs in between.
+    //! previous rewrite's parsed output): verdicts, texts and edits at every
+    //! step of a dep sequence, on every lock generation, LF and CRLF, with
+    //! refusals and re-runs in between, pinned by golden (blessed against
+    //! #257's fresh-parse rewrite).
     use super::*;
-
-    fn rewrite_poetry_lock_with_edits_oracle<'a>(
-        text: &'a str,
-        name: &'a str,
-        version: &str,
-        source_type: &str,
-        source_url: &str,
-        filename: &str,
-        sha256: &str,
-    ) -> Result<Option<PoetryLockRewrite<'a>>, String> {
-        if !matches!(source_type, "file" | "url")
-            || sha256.len() != 64
-            || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err("invalid Poetry artifact source or SHA-256".into());
-        }
-        // Poetry compares the lock's `sha256:<hex>` against `hashlib`'s lowercase
-        // hexdigest as strings, so an uppercase digest would fail every install.
-        let sha256 = sha256.to_ascii_lowercase();
-        if filename.contains(['/', '\\']) || !filename.ends_with(".whl") {
-            return Err("Poetry patch wheel does not match the locked package".into());
-        }
-        let parts: Vec<_> = filename.split('-').collect();
-        if !matches!(parts.len(), 5 | 6)
-            || canonicalize_pypi_name(parts[0]) != canonicalize_pypi_name(name)
-            || parts[1] != version
-        {
-            return Err("Poetry patch wheel does not match the locked package".into());
-        }
-        let mut lock: DocumentMut = text
-            .parse()
-            .map_err(|e| format!("invalid Poetry lock: {e}"))?;
-        let format = lock_version(&lock)?.to_string();
-        if format == "0" && source_type == "url" {
-            return Err(
-                "Poetry 0.x ignores URL sources; hosted patches require Poetry >= 1.0".into(),
-            );
-        }
-        let effective_url = if format == "1.0" && source_type == "url" {
-            // Poetry 1.0 hands pip `<url>#egg=<name>` unconditionally; the trailing
-            // `&` keeps `sha256=<hex>` a complete fragment parameter when `#egg=`
-            // is appended (pip >= 22 would otherwise read `<hex>#egg=<name>` as the
-            // digest and hard-fail the install).
-            format!("{source_url}#sha256={sha256}&")
-        } else {
-            source_url.to_string()
-        };
-        let packages = lock
-            .get_mut("package")
-            .and_then(Item::as_array_of_tables_mut)
-            .ok_or("missing Poetry packages")?;
-        let indices: Vec<_> = packages
-            .iter()
-            .enumerate()
-            .filter(|(_, package)| {
-                package
-                    .get("name")
-                    .and_then(Item::as_str)
-                    .is_some_and(|candidate| {
-                        canonicalize_pypi_name(candidate) == canonicalize_pypi_name(name)
-                    })
-            })
-            .map(|(index, _)| index)
-            .collect();
-        if indices.is_empty() {
-            return Ok(None);
-        }
-        if indices.len() != 1 {
-            return Err("forked Poetry package requires an unambiguous source".into());
-        }
-        let package = packages
-            .get_mut(indices[0])
-            .ok_or("missing Poetry package")?;
-        if package.get("version").and_then(Item::as_str) != Some(version) {
-            return Ok(None);
-        }
-        let package_name = package
-            .get("name")
-            .and_then(Item::as_str)
-            .unwrap_or(name)
-            .to_string();
-        if let Some(source) = package.get("source") {
-            let existing_type = source.get("type").and_then(Item::as_str);
-            let existing_url = source.get("url").and_then(Item::as_str).unwrap_or("");
-            let same_target = existing_type == Some(source_type) && existing_url == effective_url;
-            let prior_hosted = source_type == "url"
-                && existing_type == Some("url")
-                && is_prior_hosted_url(existing_url, &effective_url);
-            if !same_target && !prior_hosted {
-                return Err(format!(
-                    "refusing to replace an existing Poetry source ({} {}) for {package_name}",
-                    existing_type.unwrap_or("unknown"),
-                    existing_url
-                ));
-            }
-        }
-        let mut entry = InlineTable::new();
-        entry.insert("file", Value::from(filename));
-        entry.insert("hash", Value::from(format!("sha256:{sha256}")));
-        let mut files = Array::new();
-        files.push(entry);
-        let mut source = Table::new();
-        source.insert("type", value(source_type));
-        source.insert("url", value(effective_url));
-        if matches!(format.as_str(), "0" | "1.0") {
-            // Poetry 0.12 / 1.0 read `source.reference` unconditionally (KeyError
-            // without it), even for archive sources.
-            source.insert("reference", value(""));
-        }
-        package.insert("source", Item::Table(source));
-        if matches!(format.as_str(), "1.0" | "1.1") && source_type == "url" {
-            // Poetry >= 1.2 verifies url sources against the package's own
-            // `files` (it never reads `metadata.files` hashes for them), Poetry
-            // 1.0/1.1 against `metadata.files` — write both so whichever installer
-            // consumes this legacy lock enforces the patched hash. Poetry 1.0/1.1
-            // ignore the extra package key (measured on 1.0.10; 1.2.2 rejects a
-            // tampered package `files` hash on a lock-1.0 file only when it is
-            // present).
-            package.insert("files", value(files.clone()));
-        }
-        if format.starts_with('2') {
-            package.insert("files", value(files));
-        } else {
-            let field = if format == "0" { "hashes" } else { "files" };
-            let table = lock
-                .get_mut("metadata")
-                .and_then(Item::as_table_like_mut)
-                .ok_or("missing Poetry lock metadata")?
-                .get_mut(field)
-                .ok_or_else(|| format!("missing Poetry integrity table [metadata.{field}]"))?
-                .as_table_like_mut()
-                .ok_or_else(|| format!("[metadata.{field}] is not a table"))?;
-            if format == "0" {
-                let mut hashes = Array::new();
-                hashes.push(sha256.as_str());
-                table.insert(&package_name, value(hashes));
-            } else {
-                table.insert(&package_name, value(files));
-            }
-        }
-        let mut rewritten = lock.to_string();
-        if text.contains("\r\n") {
-            rewritten = rewritten.replace("\r\n", "\n").replace('\n', "\r\n");
-        }
-        let before = poetry_lock_fragments(text, name)?;
-        let after = poetry_lock_fragments(&rewritten, name)?;
-        let edits = pair_poetry_lock_fragments(text, &before, &rewritten, after)?;
-        let mut result = text.to_string();
-        for (original, replacement) in &edits {
-            result = result.replacen(original, replacement, 1);
-        }
-        let known_edits = (result == rewritten).then_some(edits);
-        Ok(Some(PoetryLockRewrite {
-            text: result,
-            original: text,
-            name,
-            before,
-            known_edits,
-        }))
-    }
 
     const VERSIONS: &[&str] = &[
         "0.12.17", "1.0.10", "1.1.15", "1.2.2", "1.3.2", "1.4.2", "1.5.1", "1.6.1", "1.7.1",
@@ -1092,7 +1036,11 @@ mod parse_reuse_equivalence_tests {
     }
 
     #[test]
-    fn reused_parse_matches_the_fresh_parse_rewrite() {
+    fn reused_parse_matches_golden() {
+        let mut golden = crate::golden::Golden::new(
+            "poetry_lock_reused_parse",
+            "One rewrite step over a grown poetry.lock: the text and edits, none, or the refusal.",
+        );
         let mut landed = 0;
         for version in VERSIONS {
             for extra in [0, 2, 4] {
@@ -1101,20 +1049,10 @@ mod parse_reuse_equivalence_tests {
                     if crlf {
                         lock = lock.replace('\n', "\r\n");
                     }
-                    let (mut want_text, mut got_text) = (lock.clone(), lock);
+                    let mut got_text = lock;
                     let mut parse = PoetryLockParse::default();
-                    for (i, (name, version, source_type, url)) in steps(extra).iter().enumerate() {
-                        let what = format!("{version} extra={extra} crlf={crlf} step {i}");
+                    for (name, version, source_type, url) in steps(extra).iter() {
                         let filename = url.rsplit('/').next().unwrap();
-                        let want = rewrite_poetry_lock_with_edits_oracle(
-                            &want_text,
-                            name,
-                            version,
-                            source_type,
-                            url,
-                            filename,
-                            SHA,
-                        );
                         let got = rewrite_poetry_lock_in(
                             &mut parse,
                             &got_text,
@@ -1125,27 +1063,24 @@ mod parse_reuse_equivalence_tests {
                             filename,
                             SHA,
                         );
-                        match (want, got) {
-                            (Err(w), Err(g)) => assert_eq!(g, w, "{what}"),
-                            (Ok(None), Ok(None)) => {}
-                            (Ok(Some(w)), Ok(Some(g))) => {
-                                assert_eq!(g.text, w.text, "{what}: text");
-                                assert_eq!(g.edits(), w.edits(), "{what}: edits");
-                                landed += 1;
-                                want_text = w.text;
-                                got_text = g.text;
-                            }
-                            (w, g) => panic!(
-                                "{what}: verdicts differ: {:?} vs {:?}",
-                                w.map(|r| r.map(|r| r.text)),
-                                g.map(|r| r.map(|r| r.text))
+                        golden.next(
+                            &(&got_text, name, version, source_type, url),
+                            &format!(
+                                "{:?}",
+                                got.as_ref()
+                                    .map(|r| r.as_ref().map(|r| (&r.text, r.edits())))
                             ),
+                        );
+                        if let Ok(Some(g)) = got {
+                            landed += 1;
+                            got_text = g.text;
                         }
                     }
                 }
             }
         }
         assert!(landed > 200, "only {landed} rewrites landed");
+        golden.finish();
     }
 
     /// A parse is reused only for byte-identical text: an external edit

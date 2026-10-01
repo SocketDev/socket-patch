@@ -429,7 +429,7 @@ mod tests {
 
         assert_eq!(result.blobs_removed, 2);
         // A wet sweep that orphaned everything leaves no empty `blobs/` husk
-        // behind (the residue a full agent-mode rollback used to leave).
+        // behind.
         assert!(
             !blobs_dir.exists(),
             "an emptied store directory is removed with its last orphan"
@@ -786,8 +786,8 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_dangling_symlink_does_not_abort() {
         // Regression: a single dangling symlink must not abort cleanup of every
-        // other orphan. Previously `tokio::fs::metadata(..)?` followed the link,
-        // hit a NotFound error, and propagated it out of the whole operation.
+        // other orphan (following the link would hit NotFound and propagate it
+        // out of the whole operation).
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();

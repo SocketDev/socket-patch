@@ -4,7 +4,7 @@
 //! is fully instrumented. Mocks the API via wiremock. Hits every flag
 //! combination that the subprocess-based tests don't explicitly
 //! exercise (non-JSON paths, --apply without --prune, --prune without
-//! --apply, --batch-size variations, --download-mode variations).
+//! --apply, --batch-size variations).
 
 use std::path::Path;
 
@@ -19,7 +19,9 @@ const UUID: &str = "11111111-1111-4111-8111-111111111111";
 
 fn default_args(cwd: &Path) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: cwd.to_path_buf(),
             org: Some(ORG.to_string()),
@@ -38,11 +40,10 @@ fn default_args(cwd: &Path) -> ScanArgs {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     }
 }
 
@@ -195,7 +196,7 @@ async fn run_scrubbed(args: ScanArgs) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Discovery — read-only --json mode
+// Discovery — default (hosted) --json mode
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -236,7 +237,7 @@ async fn scan_installed_package_discovers_patch() {
     assert_eq!(run_scrubbed(args).await, 0);
     // The installed package must actually be discovered by the crawler and
     // sent to the batch endpoint. Without this, a regression that crawled
-    // nothing would still exit 0 and pass the old test.
+    // nothing would still exit 0.
     let reqs = recorded(&server).await;
     let posts = batch_posts(&reqs);
     assert_eq!(posts.len(), 1, "exactly one batch query expected");
@@ -354,30 +355,33 @@ async fn scan_apply_wet_writes_manifest_and_blob() {
 /// uuid tiebreak rather than the severity ranking would still name `UUID`.
 const UUID_LOW: &str = "22222222-2222-4222-8222-222222222222";
 
-/// A package with two available patches: a freshly-published `low` and an
-/// older `critical`. `paid` toggles `canAccessPaidPatches`, which selects
-/// between `select_patches`' auto-select branch and its interactive one.
+/// A package with two available patches: a freshly-published merged `low`
+/// and an older single-advisory `critical`. `paid` toggles
+/// `canAccessPaidPatches`, which selects between `select_patches`' paid
+/// auto-select branch and its free-tier
+/// `--yes` auto-select (scan never prompts).
 ///
-/// This is the exact shape of the reported bug — the old selector took the
-/// most recent patch and left the critical unfixed.
+/// Severity must beat both advisory count and recency.
 async fn mock_two_patches(server: &MockServer, paid: bool) {
     let low = serde_json::json!({
         "uuid": UUID_LOW, "purl": PURL, "tier": "free",
         // Uppercase severity + RFC 2822 date, exactly as production emits
         // them (verified against patches-api.socket.dev).
-        "cveIds": [], "ghsaIds": [], "severity": "LOW", "title": "low sev",
+        "cveIds": [], "ghsaIds": ["GHSA-low0-low0-low0", "GHSA-low1-low1-low1"],
+        "severity": "LOW", "title": "low sev",
         "publishedAt": "Mon, 03 Aug 2026 20:23:06 GMT",
     });
     let critical = serde_json::json!({
         "uuid": UUID, "purl": PURL, "tier": "free",
-        "cveIds": [], "ghsaIds": [], "severity": "CRITICAL", "title": "critical sev",
+        "cveIds": [], "ghsaIds": ["GHSA-crit-crit-crit"],
+        "severity": "CRITICAL", "title": "critical sev",
         "publishedAt": "Wed, 01 Jan 2025 00:00:00 GMT",
     });
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            // Listed newest-first, i.e. the order the old `.first()` /
-            // date-sort logic would have taken the WRONG patch from.
+            // Listed newest-first, so a `.first()` / date-sort pick would
+            // take the WRONG patch.
             "packages": [{ "purl": PURL, "patches": [low, critical] }],
             "canAccessPaidPatches": paid,
         })))
@@ -394,9 +398,14 @@ async fn mock_two_patches(server: &MockServer, paid: bool) {
                     "uuid": UUID_LOW, "purl": PURL,
                     "publishedAt": "Mon, 03 Aug 2026 20:23:06 GMT",
                     "description": "low", "license": "MIT", "tier": "free",
-                    "vulnerabilities": { "GHSA-low0-low0-low0": {
-                        "cves": [], "summary": "s", "severity": "LOW", "description": "d"
-                    }}
+                    "vulnerabilities": {
+                        "GHSA-low0-low0-low0": {
+                            "cves": [], "summary": "s", "severity": "LOW", "description": "d"
+                        },
+                        "GHSA-low1-low1-low1": {
+                            "cves": [], "summary": "s", "severity": "LOW", "description": "d"
+                        }
+                    }
                 },
                 {
                     "uuid": UUID, "purl": PURL,
@@ -457,10 +466,9 @@ async fn scan_apply_picks_critical_over_more_recent_low_for_paid_user() {
     );
 }
 
-/// Same package, but the user has no paid access, so `select_patches`
-/// takes the interactive branch. Tests run headless, so `select_one`
-/// auto-selects option 0 — which means the *presented order* is what
-/// decides, and it must be the ranked order.
+/// Same package, but the user has no paid access. Scan never prompts:
+/// `selection_args` forces `--yes`, so `select_patches` auto-selects the
+/// top-ranked accessible patch, and the ranking alone decides.
 #[tokio::test]
 #[serial]
 async fn scan_apply_picks_critical_for_free_user_via_ranked_prompt_order() {
@@ -877,6 +885,7 @@ async fn scan_non_json_with_patches_prints_table() {
     let mut args = default_args(tmp.path());
     args.common.api_url = Some(server.uri());
     args.common.json = false;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
 
     let code = run_scrubbed(args).await;
     // Non-JSON path: discovery → batch query → render table → fetch
@@ -925,19 +934,10 @@ async fn scan_non_json_empty_project_friendly_message() {
 // ---------------------------------------------------------------------------
 // API error handling
 //
-// The original `assert!(code == 0 || code == 1)` here was the headline
-// loophole of this file: a disjoint-outcome assertion that passes whether
-// the scan correctly surfaces the failure OR silently swallows it. The
-// implementation used to only emit a telemetry event when every batch
-// errored — returning 0 and printing status="success" with an empty package
-// list — so the assertions below were first committed RED to encode the
-// documented intent ("surface this as a full scan failure rather than
-// silently reporting zero patches").
-//
-// That bug is now FIXED (scan/mod.rs bails with exit 1 when
+// Documented intent: "surface this as a full scan failure rather than
+// silently reporting zero patches" — scan/mod.rs bails with exit 1 when
 // batch_error_count == total_batches, and discover_selected likewise errors
-// when every detail query fails); these tests pass and stay as regression
-// guards for both levels.
+// when every detail query fails. These pin both levels.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1177,8 +1177,7 @@ async fn scan_prune_with_ecosystem_filter_keeps_other_ecosystem() {
 async fn scan_prune_keeps_entry_of_uncrawled_ecosystem() {
     // `.socket/manifest.json` is a COMMITTED, shared file. A teammate on a
     // newer CLI can add a patch for an ecosystem this binary has no crawler
-    // for (here `pkg:hex/…`; the runtime-gated maven/nuget crawlers behave
-    // the same way with their gate off). That purl is never looked for, so
+    // for (here `pkg:hex/…`). That purl is never looked for, so
     // its absence from the crawl says nothing about whether it is installed
     // — yet prune treated "not in scanned_purls" as "uninstalled" and
     // deleted both the entry and its blob: silent, cross-machine patch loss.
@@ -1373,9 +1372,7 @@ async fn scan_non_json_dry_run_does_not_mutate() {
 // Maven/NuGet are first-class: every scan mode discovers them.
 // ---------------------------------------------------------------------------
 
-/// Maven and NuGet used to sit behind `SOCKET_EXPERIMENTAL_MAVEN` /
-/// `SOCKET_EXPERIMENTAL_NUGET` runtime gates that silently dropped them
-/// from discovery. The gates are retired: every scan mode (default,
+/// Maven and NuGet have no runtime gate: every scan mode (default,
 /// `--mode hosted`, `--mode vendored`) must crawl both with no opt-in of
 /// any kind. The oracle is the batch POST body — it carries exactly the
 /// purls the crawl discovered, so a resurrected gate shows up as the
@@ -1496,10 +1493,9 @@ async fn scan_vendor_dry_run_with_vex_does_not_write_attestation_file() {
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
 
     // A manifest whose sole record WOULD attest successfully: vulnerability
-    // metadata for the statement, `setup.manual: ["npm"]` to pass the
-    // property-7 ecosystem filter, and `--vex-no-verify` below to skip the
-    // on-disk hash check. Under the old behavior the dry run generated the
-    // document for real and wrote it to disk.
+    // metadata for the statement and `--vex-no-verify` below to skip the
+    // on-disk hash check, so only the dry-run gate keeps the document off
+    // disk.
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
     std::fs::write(
@@ -1515,7 +1511,7 @@ async fn scan_vendor_dry_run_with_vex_does_not_write_attestation_file() {
                 }},
                 "description": "x", "license": "MIT", "tier": "free"
             }
-        }, "setup": { "manual": ["npm"] } }"#,
+        } }"#,
     )
     .unwrap();
     let before = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
@@ -1592,7 +1588,7 @@ async fn scan_apply_json_dry_run_with_vex_does_not_write_attestation() {
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
 
     // Attestable manifest (same fixture as the vendor twin above): metadata
-    // for the statement, `setup.manual: ["npm"]`, `--vex-no-verify` below.
+    // for the statement, `--vex-no-verify` below.
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
     std::fs::write(
@@ -1608,7 +1604,7 @@ async fn scan_apply_json_dry_run_with_vex_does_not_write_attestation() {
                 }},
                 "description": "x", "license": "MIT", "tier": "free"
             }
-        }, "setup": { "manual": ["npm"] } }"#,
+        } }"#,
     )
     .unwrap();
 

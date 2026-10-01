@@ -1,21 +1,19 @@
-//! Equivalence oracle for the indexed pnpm hosted rewriter: the previous
-//! implementation (re-parse every lock per dep, splice per dep) is kept here
-//! verbatim as `rewrite_pnpm_lock_oracle`, and the production
-//! `rewrite_pnpm_lock` must produce the identical `RewriteResult` — output
-//! bytes, the FileEdit list (order and `original` fragments), warnings and
-//! refusals — on depscan-sized synthetic locks and on randomized mixes of
-//! every lock flavor the grammar handles.
+//! Depscan-sized and seeded pnpm-lock.yaml sweeps for the indexed hosted
+//! rewriter (one parse per lock, every dep spliced from it): output bytes,
+//! the FileEdit list (order and `original` fragments), warnings and
+//! refusals are pinned per case by `tests/equivalence/pnpm_*.golden`,
+//! blessed while the per-dep re-parsing rewriter still ran beside it as an
+//! oracle.
 
-use super::rewrite_oracle_support::{assert_same, Rng};
 use super::*;
+use crate::golden::{record, Sweep};
+use crate::test_rng::Rng;
 
-/// Run both implementations and assert they agree; returns the result.
-fn assert_equivalent(files: &BTreeMap<String, String>, overrides: &[DepOverride]) -> RewriteResult {
-    let mut want = RewriteResult::default();
-    rewrite_pnpm_lock_oracle(files, overrides, &mut want);
+/// The production rewriter, recorded into the running sweep.
+fn run(files: &BTreeMap<String, String>, overrides: &[DepOverride]) -> RewriteResult {
     let mut got = RewriteResult::default();
-    rewrite_pnpm_lock(files, overrides, &mut got);
-    assert_same(&want, &got, "pnpm");
+    plan_hosted(files, overrides, &mut got);
+    record(&(files, overrides), &got);
     got
 }
 
@@ -193,7 +191,6 @@ fn dep(p: &Pkg, uuid: usize, url_tag: &str, sha512: Option<&str>) -> DepOverride
             "https://patch.socket.dev/{url_tag}/{}-{}.tgz",
             p.name, p.version
         ),
-        berry_zip_url: None,
         registry_override: None,
         integrity: Integrity {
             sha512: sha512.map(str::to_string),
@@ -218,7 +215,11 @@ fn packages(n: usize, rng: &mut Rng) -> Vec<Pkg> {
 /// already-hosted, residual (unbalanced peer suffix), vendored, not-found and
 /// missing-sha512 deps, plus a non-npm override the rewriter must ignore.
 #[test]
-fn indexed_pnpm_rewrite_matches_oracle_on_depscan_sized_lock_set() {
+fn indexed_pnpm_rewrite_matches_golden_on_depscan_sized_lock_set() {
+    let sweep = Sweep::start(
+        "pnpm_depscan_sized",
+        "A depscan-sized seeded pnpm-lock.yaml set + shuffled overrides.",
+    );
     let mut rng = Rng(0x5eed_cafe_f00d_0001);
     let root = packages(4000, &mut rng);
     let nested = packages(1200, &mut rng);
@@ -312,7 +313,7 @@ fn indexed_pnpm_rewrite_matches_oracle_on_depscan_sized_lock_set() {
         shuffled.push(overrides.remove(i));
     }
 
-    let r = assert_equivalent(&files, &shuffled);
+    let r = run(&files, &shuffled);
     // The fixture must actually exercise the interesting paths.
     assert!(r.edits.len() > 90, "edits: {}", r.edits.len());
     assert_eq!(r.files.len(), 3, "{:?}", r.files.keys());
@@ -325,6 +326,7 @@ fn indexed_pnpm_rewrite_matches_oracle_on_depscan_sized_lock_set() {
     ] {
         assert!(codes.contains(&code), "missing {code}: {codes:?}");
     }
+    sweep.finish();
 }
 
 /// Two overrides of the SAME name@version with different artifacts: the
@@ -332,6 +334,10 @@ fn indexed_pnpm_rewrite_matches_oracle_on_depscan_sized_lock_set() {
 /// is the first's `new`), exactly as the per-dep re-parse did.
 #[test]
 fn duplicate_override_sees_the_prior_rewrite() {
+    let sweep = Sweep::start(
+        "pnpm_duplicate_override",
+        "A pnpm lock whose overrides repeat a package.",
+    );
     let p = Pkg {
         name: "left-pad".into(),
         version: "1.3.0".into(),
@@ -340,7 +346,7 @@ fn duplicate_override_sees_the_prior_rewrite() {
     let files = BTreeMap::from([("pnpm-lock.yaml".to_string(), lock.to_string())]);
     let first = dep(&p, 1, "a", Some("sha512-FIRST=="));
     let second = dep(&p, 2, "b", Some("sha512-SECOND=="));
-    let r = assert_equivalent(&files, &[first.clone(), second.clone()]);
+    let r = run(&files, &[first.clone(), second.clone()]);
     assert_eq!(r.edits.len(), 4, "{:#?}", r.edits);
     for i in 0..2 {
         assert_eq!(r.edits[i + 2].original, r.edits[i].new, "edit {i}");
@@ -353,8 +359,9 @@ fn duplicate_override_sees_the_prior_rewrite() {
     );
     assert!(!out.contains(first.artifact_url.as_str()), "{out}");
     // The same pair with identical artifacts: the second is a no-op.
-    let r = assert_equivalent(&files, &[second.clone(), second]);
+    let r = run(&files, &[second.clone(), second]);
     assert_eq!(r.edits.len(), 2, "{:#?}", r.edits);
+    sweep.finish();
 }
 
 /// Every peer-suffixed instance gets its own edit, in file order, keyed by
@@ -362,6 +369,10 @@ fn duplicate_override_sees_the_prior_rewrite() {
 /// contexts and a v5 `_` suffix in a second lock.
 #[test]
 fn peer_suffixed_instances_rewrite_in_file_order() {
+    let sweep = Sweep::start(
+        "pnpm_peer_suffixed",
+        "A pnpm lock with peer-suffixed instances of one package.",
+    );
     let lock_v6 = "lockfileVersion: '6.0'\n\npackages:\n\n  '/@s/p@1.0.0(react@18.2.0(scheduler@0.23.2))':\n    resolution: {integrity: sha512-UP==}\n\n  /@s/p@1.0.0:\n    resolution: {integrity: sha512-UP==}\n\n  /@s/p@1.0.0(react@17.0.2):\n    resolution: {integrity: sha512-UP==}\n\n  /@s/p@1.0.01:\n    resolution: {integrity: sha512-OTHER==}\n";
     let lock_v5 = "lockfileVersion: 5.4\n\npackages:\n\n  /@s/p/1.0.0_react@18.2.0:\n    resolution: {integrity: sha512-UP==}\n";
     let files = BTreeMap::from([
@@ -372,7 +383,7 @@ fn peer_suffixed_instances_rewrite_in_file_order() {
         name: "@s/p".into(),
         version: "1.0.0".into(),
     };
-    let r = assert_equivalent(&files, &[dep(&p, 1, "a", Some("sha512-P=="))]);
+    let r = run(&files, &[dep(&p, 1, "a", Some("sha512-P=="))]);
     let keys: Vec<(&str, &str)> = r
         .edits
         .iter()
@@ -391,13 +402,18 @@ fn peer_suffixed_instances_rewrite_in_file_order() {
         ]
     );
     assert!(r.files["a/pnpm-lock.yaml"].contains("sha512-OTHER=="));
+    sweep.finish();
 }
 
 /// Randomized small lock sets over every flavor (including the refused
 /// early shrinkwrap and CRLF), with overrides drawn so hits, duplicates,
 /// residuals and misses all interleave.
 #[test]
-fn indexed_pnpm_rewrite_matches_oracle_on_random_lock_sets() {
+fn indexed_pnpm_rewrite_matches_golden_on_random_lock_sets() {
+    let sweep = Sweep::start(
+        "pnpm_random",
+        "One seeded pnpm-lock.yaml set (every flavor) + overrides.",
+    );
     let flavors = [
         Flavor::V9,
         Flavor::V6,
@@ -492,7 +508,7 @@ fn indexed_pnpm_rewrite_matches_oracle_on_random_lock_sets() {
                 overrides.push(dep(&p, i + 100, tag, Some(&sri("DUP"))));
             }
         }
-        let r = assert_equivalent(&files, &overrides);
+        let r = run(&files, &overrides);
         if !r.edits.is_empty() {
             outcomes.insert("edit".into());
         }
@@ -524,233 +540,5 @@ fn indexed_pnpm_rewrite_matches_oracle_on_random_lock_sets() {
             "sweep never reached {want}: {outcomes:?}"
         );
     }
-}
-
-// ── oracle: the pre-index implementation, verbatim ──────────────────────────
-
-fn rewrite_pnpm_lock_oracle(
-    files: &BTreeMap<String, String>,
-    overrides: &[DepOverride],
-    result: &mut RewriteResult,
-) {
-    let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
-    // A pnpm lock lives at the project root or at any nested path (e.g. Rush
-    // repos keep them under `common/config/rush/`); every such files-map key
-    // is rewritten under the same grammar. Deterministic order: BTreeMap
-    // iterates keys sorted, so goldens are stable across every lock in the set.
-    let lock_keys: Vec<&String> = files
-        .keys()
-        .filter(|k| {
-            matches!(
-                k.rsplit('/').next(),
-                Some("pnpm-lock.yaml" | "shrinkwrap.yaml")
-            )
-        })
-        .collect();
-    if npm.is_empty() || lock_keys.is_empty() {
-        return;
-    }
-    let mut contents: Vec<(&String, String, bool)> = lock_keys
-        .iter()
-        .map(|k| (*k, files[*k].clone(), false))
-        .collect();
-    for dep in &npm {
-        let fname = full_name(dep);
-        let unsafe_locks: Vec<_> = contents
-            .iter()
-            .filter(|(_, content, _)| {
-                pnpm::unsupported_early_shrinkwrap(content)
-                    && pnpm::entries(content)
-                        .iter()
-                        .any(|e| pnpm::suffix(e.key, &fname, &dep.version).is_some())
-            })
-            .map(|(path, _, _)| path.as_str())
-            .collect();
-        if !unsafe_locks.is_empty() {
-            result.refused_pnpm_uuids.insert(dep.patch_uuid.clone());
-            result.warnings.push(RewriteWarning {
-                code: "redirect_pnpm_legacy_lockfile_unsupported".into(),
-                detail: format!("{} uses early pnpm 1 shrinkwrapVersion 3 without a supported minor version. Those installers discard hosted tarball URLs; {fname}@{} was left unchanged in every lock. Upgrade to a tested pnpm release (1.43.1 or newer) and regenerate the lock, or use `scan --mode agent` for installed-file patching.", unsafe_locks.join(", "), dep.version),
-            });
-            continue;
-        }
-        let Some(sha512) = dep.integrity.sha512.clone() else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_pnpm_missing_sha512".into(),
-                detail: format!("{fname}@{} has no sha512 integrity", dep.version),
-            });
-            continue;
-        };
-        // Every peer instance must be redirected, including nested peer
-        // contexts and the block resolutions emitted by pnpm 1–5.
-        let mut matched_any = false;
-        // Per-lock rewrites are PLANNED first and committed only after the
-        // residual gate below proves no instance of this dep escaped the
-        // splice grammar in ANY lock — committing lock-by-lock as we go
-        // would ship exactly the partial rewrite the gate exists to refuse.
-        let mut planned: Vec<(usize, String, Vec<FileEdit>)> = Vec::new();
-        let mut residuals: Vec<(&str, Vec<String>)> = Vec::new();
-        for (idx, (lock_key, content, _)) in contents.iter().enumerate() {
-            // (byte range to replace, replacement text) per instance, plus
-            // one FileEdit per instance keyed by the canonical instance key —
-            // per-instance edits keep the revert ledger lossless when several
-            // instances of one dep live in the same lock.
-            let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
-            let mut instance_edits: Vec<FileEdit> = Vec::new();
-            for entry in pnpm::entries(content) {
-                let Some(suffix) = pnpm::suffix(entry.key, &fname, &dep.version) else {
-                    continue;
-                };
-                if !pnpm::supported_suffix(suffix) {
-                    continue;
-                }
-                let Some(resolution) = pnpm::resolution(&entry) else {
-                    continue;
-                };
-                matched_any = true;
-                let original = &content[resolution.range.clone()];
-                let rebuilt = resolution.rewrite(&sha512, &dep.artifact_url);
-                if rebuilt == original {
-                    continue;
-                }
-                splices.push((resolution.range, rebuilt.clone()));
-                instance_edits.push(FileEdit {
-                    path: (*lock_key).clone(),
-                    kind: "redirect_pnpm_resolution".into(),
-                    action: "rewritten".into(),
-                    key: Some(format!("{fname}@{}{suffix}", dep.version)),
-                    original: Some(Value::String(original.to_string())),
-                    new: Some(Value::String(rebuilt)),
-                });
-            }
-            // Splice by byte range (package blocks are disjoint and ordered) — a string replace could hit the wrong
-            // instance when two entries share identical surrounding bytes.
-            let candidate: Option<String> = if splices.is_empty() {
-                None
-            } else {
-                let mut out = String::with_capacity(content.len());
-                let mut cursor = 0usize;
-                for (range, replacement) in splices {
-                    out.push_str(&content[cursor..range.start]);
-                    out.push_str(&replacement);
-                    cursor = range.end;
-                }
-                out.push_str(&content[cursor..]);
-                Some(out)
-            };
-            // Residual gate, run over the POST-splice text: any instance of
-            // this exact name@version still resolving somewhere other than
-            // the hosted artifact — in a spelling the splice grammar cannot
-            // parse (e.g. an unbalanced peer suffix) — makes this a partial
-            // rewrite. Shipping it would confirm and VEX-attest the dep while
-            // dependents through the unmatched instance keep installing the
-            // unpatched upstream tarball, so the dep is refused instead.
-            let leftover = pnpm_unrewritten_instances(
-                candidate.as_deref().unwrap_or(content),
-                &fname,
-                &dep.version,
-                &dep.artifact_url,
-            );
-            if !leftover.is_empty() {
-                residuals.push(((*lock_key).as_str(), leftover));
-                continue;
-            }
-            if let Some(out) = candidate {
-                planned.push((idx, out, instance_edits));
-            }
-        }
-        // ANY residual anywhere refuses the dep across the WHOLE lock set —
-        // nothing rewritten, nothing recorded, nothing confirmed (the same
-        // fail-closed contract the pre-splice v5/v6 refusal had): a rewrite
-        // committed in one lock while another still resolves the dep
-        // upstream would confirm the dep set-wide.
-        if !residuals.is_empty() {
-            result.refused_pnpm_uuids.insert(dep.patch_uuid.clone());
-            for (lock_key, keys) in &residuals {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_pnpm_unsupported_lock_key".into(),
-                    detail: format!(
-                        "{fname}@{} still resolves through pnpm lock key(s) whose \
-                         resolution the redirect grammar cannot repoint: {} in \
-                         {lock_key}; the dep is left unredirected in EVERY lock \
-                         (nothing rewritten, nothing confirmed) — regenerate the \
-                         lock with a current pnpm (lockfileVersion 9) and re-run",
-                        dep.version,
-                        keys.join(", ")
-                    ),
-                });
-            }
-            continue;
-        }
-        for (idx, out, mut instance_edits) in planned {
-            let (_, content, changed) = &mut contents[idx];
-            *content = out;
-            *changed = true;
-            result.edits.append(&mut instance_edits);
-        }
-        // The entry-not-found warning fires only when the dep matched in NO
-        // pnpm lock across the whole set, not once per lock. A VENDORED dep
-        // is named as such: `socket-patch vendor` removes the registry
-        // resolution this grammar looks for (v9 respells the packages key
-        // `<name>@file:.socket/vendor/…`; v5/v6 rekey it to a bare `file:`
-        // key but keep the `<name>@<version>: file:…` overrides line), so
-        // the generic not-locked wording would send users on a wild-goose
-        // `pnpm install` when the real path is a mode switch. Fail-closed
-        // either way: nothing is rewritten for the dep.
-        if !matched_any {
-            let v9_vendored_key = format!("{fname}@file:");
-            let override_key = format!("{fname}@{}", dep.version);
-            let vendored = contents.iter().any(|(_, content, _)| {
-                content.lines().any(|line| {
-                    let t = line.trim_start();
-                    let t = t.strip_prefix('\'').unwrap_or(t);
-                    // v9 packages/snapshots key (leading `/` in v6 spelling).
-                    // The vendor backend always writes the RELATIVE
-                    // `file:.socket/vendor/…` spelling here, so anchoring on
-                    // it keeps a user's own `file:` dep of the same name
-                    // from being misreported as vendored.
-                    let key = t.strip_prefix('/').unwrap_or(t);
-                    if key
-                        .strip_prefix(&v9_vendored_key)
-                        .is_some_and(|rest| rest.starts_with(".socket/vendor/"))
-                    {
-                        return true;
-                    }
-                    // overrides / root-dep line: `<name>@<version>: file:…`
-                    // (pnpm <=8 absolutizes the value, so only the
-                    // `.socket/vendor/` tail is stable enough to match).
-                    t.strip_prefix(&override_key)
-                        .map(|rest| rest.strip_prefix('\'').unwrap_or(rest))
-                        .and_then(|rest| rest.strip_prefix(':'))
-                        .is_some_and(|rest| {
-                            rest.contains("file:") && rest.contains(".socket/vendor/")
-                        })
-                })
-            });
-            if vendored {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_pnpm_entry_vendored".into(),
-                    detail: format!(
-                        "{fname}@{} has no registry resolution because it is \
-                         VENDORED (the lock resolves it to a \
-                         file:.socket/vendor/… tarball); the hosted redirect \
-                         does not apply — run `socket-patch vendor --revert` to \
-                         restore the registry resolution, then re-run `scan \
-                         --mode hosted`",
-                        dep.version
-                    ),
-                });
-            } else {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_pnpm_entry_not_found".into(),
-                    detail: format!("no resolution for {fname}@{}", dep.version),
-                });
-            }
-        }
-    }
-    for (key, content, changed) in contents {
-        if changed {
-            result.files.insert(key.clone(), content);
-        }
-    }
+    sweep.finish();
 }

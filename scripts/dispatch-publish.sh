@@ -13,7 +13,7 @@
 #   <version>        X.Y.Z; the tag v<version> must exist (the dispatch runs
 #                    the workflow file as of that tag)
 #   [key=value]...   extra workflow inputs, passed through as `-f key=value`
-#                    (e.g. sums-digest=<sha256> for the npm/PyPI legs)
+#                    (e.g. sums-digest=<sha256> for the npm leg)
 #
 # Requires: gh authenticated via GH_TOKEN with actions:write on
 # $GITHUB_REPOSITORY; GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT for run correlation.

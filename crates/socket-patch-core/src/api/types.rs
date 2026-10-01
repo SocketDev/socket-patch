@@ -102,11 +102,11 @@ pub struct BatchPatchInfo {
     pub title: String,
     /// When **this patch** was published (see
     /// [`PatchResponse::published_at`]), if the server supplies it. The
-    /// batch shape historically omits it, which is why it is optional — a
-    /// `None` here only weakens the recency tiebreak in
-    /// [`crate::api::ranking`], it never changes the severity or
-    /// merge-state ordering. The public-proxy fallback path fills it in from the
-    /// per-package search results.
+    /// batch shape may omit it, which is why it is optional — a `None`
+    /// ranks as oldest in [`crate::api::ranking`], which weakens recency
+    /// ordering (the tiebreak after severity and advisory count) but never
+    /// changes severity or advisory count. The public-proxy fallback path
+    /// fills it in from the per-package search results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_at: Option<String>,
 }
@@ -159,7 +159,7 @@ pub struct PackageVendorResult {
     pub purl: Option<String>,
     #[serde(default)]
     pub artifacts: Option<Vec<PackageVendorArtifact>>,
-    /// Per-ecosystem registry override that `scan --redirect` turns into a
+    /// Per-ecosystem registry override that hosted-mode `scan` turns into a
     /// `DepOverride`.
     #[serde(default)]
     pub registry_override: Option<RegistryOverride>,
@@ -179,7 +179,7 @@ pub struct PackageVendorArtifact {
     /// `sha512-<b64>`) + `sha1` + `md5`; golang additionally `dirhash_h1`
     /// (`h1:<b64>`); the npm yarn-berry zip carries only `yarn_berry10c0`
     /// (`10c0/<sha512-hex>`). A plain `sha256` IS served and is load-bearing
-    /// for `scan --redirect`: the pypi (`requirements.txt` / `uv.lock`) and
+    /// for hosted-mode `scan`: the pypi (`requirements.txt` / `uv.lock`) and
     /// maven rewriters pin it directly, and cargo / gem fall back to it when
     /// the `registry_override` identifiers carry no checksum.
     #[serde(default)]

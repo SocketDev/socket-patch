@@ -1,11 +1,12 @@
-//! Equivalence oracles for the npm package-lock and classic yarn.lock hosted
-//! rewriters, which now derive each entry's identity once per lock instead
-//! of once per entry per dep. The previous implementations are kept here
-//! verbatim and the production rewriters must produce the identical output
-//! bytes, FileEdit list, warnings and refusals on randomized locks.
+//! Seeded package-lock.json and classic yarn.lock sweeps for the indexed
+//! hosted rewriters (each entry's identity derived once per lock). Every
+//! output channel is pinned per case by `tests/equivalence/npm_lock_rewrite`
+//! and `yarn_classic_rewrite.golden`, blessed while the pre-index rewriters
+//! still ran beside them as oracles.
 
-use super::rewrite_oracle_support::{assert_same, Rng};
 use super::*;
+use crate::golden::{record, Golden, Sweep};
+use crate::test_rng::Rng;
 
 fn name(i: usize) -> String {
     match i % 4 {
@@ -32,7 +33,6 @@ fn dep(name: &str, version: &str, uuid: usize, rng: &mut Rng) -> DepOverride {
         token: String::new(),
         patch_uuid: format!("00000000-0000-4000-8000-{uuid:012}"),
         artifact_url: format!("https://patch.socket.dev/{tag}/{name}-{version}.tgz"),
-        berry_zip_url: None,
         registry_override: None,
         integrity: Integrity {
             sha512: (!rng.chance(5)).then(|| format!("sha512-P{}==", rng.below(3))),
@@ -145,21 +145,26 @@ fn npm_lock(rng: &mut Rng, pool: &mut Vec<(String, String)>) -> String {
 }
 
 #[test]
-fn indexed_npm_lock_rewrite_matches_oracle() {
+fn indexed_npm_lock_rewrite_matches_golden() {
+    let sweep = Sweep::with(
+        Golden::new(
+            "npm_lock_rewrite",
+            "One seeded package-lock.json / npm-shrinkwrap.json + overrides.",
+        )
+        .chunked(4),
+    );
     let mut edits = 0;
     let mut codes = std::collections::BTreeSet::new();
     for seed in 1..=400u64 {
-        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut rng = Rng::new(seed);
         let mut pool = Vec::new();
         let text = npm_lock(&mut rng, &mut pool);
         let deps = overrides(&pool, &mut rng);
         let refs: Vec<&DepOverride> = deps.iter().collect();
         for lockfile in ["package-lock.json", "npm-shrinkwrap.json"] {
-            let mut want = RewriteResult::default();
-            rewrite_one_npm_lock_oracle(&text, lockfile, &refs, &mut want);
             let mut got = RewriteResult::default();
             rewrite_one_npm_lock(&text, lockfile, &refs, &mut got);
-            assert_same(&want, &got, &format!("seed {seed} {lockfile}"));
+            record(&(&text, lockfile, &deps), &got);
             edits += got.edits.len();
             codes.extend(got.warnings.iter().map(|w| w.code.clone()));
         }
@@ -176,6 +181,7 @@ fn indexed_npm_lock_rewrite_matches_oracle() {
     ] {
         assert!(codes.contains(code), "missing {code}: {codes:?}");
     }
+    sweep.finish();
 }
 
 fn yarn_block(rng: &mut Rng, pool: &mut Vec<(String, String)>, i: usize) -> String {
@@ -222,7 +228,14 @@ fn yarn_block(rng: &mut Rng, pool: &mut Vec<(String, String)>, i: usize) -> Stri
 }
 
 #[test]
-fn indexed_yarn_classic_rewrite_matches_oracle() {
+fn indexed_yarn_classic_rewrite_matches_golden() {
+    let sweep = Sweep::with(
+        Golden::new(
+            "yarn_classic_rewrite",
+            "One seeded yarn.lock (v1) + overrides.",
+        )
+        .chunked(2),
+    );
     let mut edits = 0;
     let mut codes = std::collections::BTreeSet::new();
     for seed in 1..=400u64 {
@@ -243,11 +256,9 @@ fn indexed_yarn_classic_rewrite_matches_oracle() {
         }
         let files = BTreeMap::from([("yarn.lock".to_string(), text)]);
         let deps = overrides(&pool, &mut rng);
-        let mut want = RewriteResult::default();
-        rewrite_yarn_classic_oracle(&files, &deps, &mut want);
         let mut got = RewriteResult::default();
         rewrite_yarn_classic(&files, &deps, &mut got);
-        assert_same(&want, &got, &format!("seed {seed}"));
+        record(&(&files, &deps), &got);
         edits += got.edits.len();
         codes.extend(got.warnings.iter().map(|w| w.code.clone()));
     }
@@ -260,321 +271,5 @@ fn indexed_yarn_classic_rewrite_matches_oracle() {
     ] {
         assert!(codes.contains(code), "missing {code}: {codes:?}");
     }
-}
-
-// ── oracles: the pre-index implementations, verbatim ────────────────────────
-
-fn rewrite_one_npm_lock_oracle(
-    content: &str,
-    lockfile: &str,
-    npm: &[&DepOverride],
-    result: &mut RewriteResult,
-) {
-    let Ok(mut lock) = serde_json::from_str::<Value>(content) else {
-        // A corrupt lockfile is strictly worse than a missing one (which
-        // warns in the caller) — never skip the whole npm redirect silently.
-        result.warnings.push(RewriteWarning {
-            code: "redirect_npm_lock_unparseable".into(),
-            detail: format!("{lockfile} is not valid JSON; npm redirect skipped"),
-        });
-        return;
-    };
-    let mut changed = false;
-    for dep in npm {
-        let fname = full_name(dep);
-        let Some(sha512) = dep.integrity.sha512.clone() else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_npm_missing_sha512".into(),
-                detail: format!("{fname}@{} has no sha512 integrity", dep.version),
-            });
-            continue;
-        };
-        let mut matched_any = false;
-        if let Some(packages) = lock.get_mut("packages").and_then(Value::as_object_mut) {
-            for (key, entry) in packages.iter_mut() {
-                // Only `node_modules/` keys are installable dependencies:
-                // "" is the project root and other bare keys are workspace
-                // members — SOURCE dirs a resolved/integrity insert would
-                // corrupt.
-                let Some((_, key_name)) = key.rsplit_once("node_modules/") else {
-                    continue;
-                };
-                // The package a lock entry stands for: the explicit `name`
-                // field when present (npm writes it for aliases — `npm i
-                // alias@npm:real` keys the entry by the ALIAS), else the
-                // key's trailing path. Mirrors `vendor::npm_lock`'s
-                // `entry_name`, so an alias install of the patched package
-                // redirects and an entry that merely SHARES the key name
-                // (`npm i <fname>@npm:other`) is never hijacked.
-                let entry_nm = entry
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or(key_name);
-                let matches_ver =
-                    entry.get("version").and_then(Value::as_str) == Some(dep.version.as_str());
-                if entry_nm != fname || !matches_ver {
-                    continue;
-                }
-                if entry.get("link").and_then(Value::as_bool) == Some(true) {
-                    matched_any = true;
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_npm_link_entry_skipped".into(),
-                        detail: format!(
-                            "lock entry `{key}` is a link (npm workspaces/file: dir); skipped"
-                        ),
-                    });
-                    continue;
-                }
-                // npm reify extracts a bundled copy from its PARENT's tarball
-                // and ignores the entry's resolved/integrity, so a rewrite
-                // here would put the hosted URL in the lockfile (confirming
-                // and VEX-attesting the patch) while the unpatched bundled
-                // bytes keep installing. Mirrors the vendored backend's
-                // `vendor_bundled_instance_skipped` refusal.
-                if entry.get("inBundle").and_then(Value::as_bool) == Some(true) {
-                    matched_any = true;
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_npm_bundled_instance_skipped".into(),
-                        detail: format!(
-                            "lock entry `{key}` is bundled inside its parent's tarball and \
-                             CANNOT be redirected — that copy stays UNPATCHED; vendor or \
-                             update the bundling parent to cover it"
-                        ),
-                    });
-                    continue;
-                }
-                matched_any = true;
-                if let Some(edit) = rewrite_npm_entry(
-                    entry,
-                    dep,
-                    &sha512,
-                    lockfile,
-                    "redirect_npm_lock_entry",
-                    key,
-                ) {
-                    result.edits.push(edit);
-                    changed = true;
-                }
-            }
-        }
-        // v2 legacy `dependencies` tree (keyed by name), recursive.
-        if let Some(deps) = lock.get_mut("dependencies").and_then(Value::as_object_mut) {
-            // The randomized locks carry only registry specs, so the #326
-            // non-registry guard never fires and the oracle passes none.
-            changed = rewrite_npm_v2_deps(
-                deps,
-                "",
-                &BTreeMap::new(),
-                &fname,
-                dep,
-                &sha512,
-                lockfile,
-                result,
-                &mut matched_any,
-            ) || changed;
-        }
-        // Parity with the pnpm/berry/uv rewriters: a granted dep the
-        // lockfile cannot pin must be SAID, not silently dropped from the
-        // redirected count.
-        if !matched_any {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_npm_entry_not_found".into(),
-                detail: format!("no {lockfile} entry for {fname}@{}", dep.version),
-            });
-        }
-    }
-    if changed {
-        // npm <= 6 (the only writer of lockfileVersion 1) installs a registry
-        // dependency from the CONFIGURED registry and ignores the entry's
-        // `resolved` — verified against real npm 6.14.18, while npm 7 / 11
-        // fetch the rewritten url from the same v1 lock. Under npm 6 the
-        // redirected lock therefore fails EINTEGRITY against the patched
-        // sha512 pin (fail-closed: the unpatched bytes never install). Say
-        // so instead of letting an npm 6 CI discover it.
-        if lock.get("lockfileVersion").and_then(Value::as_u64) == Some(1) {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_npm_legacy_client".into(),
-                detail: format!(
-                    "{lockfile} is lockfileVersion 1 (written by npm <= 6). npm <= 6 installs \
-                     registry dependencies from the configured registry and ignores the \
-                     redirected `resolved` url, so its installs fail EINTEGRITY against the \
-                     patched sha512 pin (the unpatched bytes are never installed); install \
-                     with npm >= 7, which fetches the hosted patch (and upgrades the lock)"
-                ),
-            });
-        }
-        result.files.insert(lockfile.into(), serialize_json(&lock));
-    }
-}
-
-fn rewrite_yarn_classic_oracle(
-    files: &BTreeMap<String, String>,
-    overrides: &[DepOverride],
-    result: &mut RewriteResult,
-) {
-    use crate::vendor::yarn_classic_lock::{pattern_real_name, split_key_patterns, split_pattern};
-
-    let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
-    if npm.is_empty() || !files.contains_key("yarn.lock") {
-        return;
-    }
-    let raw = &files["yarn.lock"];
-    if is_berry_lock(raw) {
-        return; // yarn-berry — not classic
-    }
-    // CRLF locks (core.autocrlf Windows checkouts — yarn v1 parses them fine)
-    // are processed LF-normalized and re-expanded on output, so untouched
-    // lines round-trip byte-identically. Without this, `split("\n\n")` never
-    // splits a CRLF file: the whole lock becomes ONE block and the
-    // leftmost-match replaces below would rewrite the FIRST entry in the
-    // file, not the target's. Bare `\r`s outside a CRLF pair make the
-    // round-trip lossy, so such a lock is refused untouched.
-    let crlf = raw.contains('\r');
-    let normalized: String;
-    let content: &str = if crlf {
-        normalized = raw.replace("\r\n", "\n");
-        if normalized.contains('\r') {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_yarn_classic_unsupported_line_endings".into(),
-                detail: "yarn.lock contains bare carriage returns (mixed line endings); \
-                         leaving it untouched"
-                    .into(),
-            });
-            return;
-        }
-        &normalized
-    } else {
-        raw
-    };
-    let mut blocks: Vec<String> = content.split("\n\n").map(String::from).collect();
-    let resolved_re =
-        Regex::new(r#"\n {2}resolved "[^"]*""#).expect("static resolved-line regex is valid");
-    let integrity_re =
-        Regex::new(r"\n {2}integrity [^\n]*").expect("static integrity-line regex is valid");
-    let mut changed = false;
-    for dep in &npm {
-        let fname = full_name(dep);
-        let Some(sha512) = dep.integrity.sha512.clone() else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_yarn_classic_missing_sha512".into(),
-                detail: format!("{fname}@{} has no sha512 integrity", dep.version),
-            });
-            continue;
-        };
-        let version_re =
-            Regex::new(&(String::from(r#"\n {2}version ""#) + &regex::escape(&dep.version) + "\""))
-                .expect("version regex from the escaped version is valid");
-        let mut matched_any = false;
-        let mut alias_skipped = false;
-        for block in blocks.iter_mut() {
-            // The block's key line names its consumers; resolve every
-            // comma-joined pattern to the REAL package it stands for
-            // (`alias@npm:target@range` → target). A key like
-            // `<fname>@npm:<other-pkg>@…` — yarn v1's fork-substitution
-            // idiom — resolves to <other-pkg>, so it is NOT ours to touch:
-            // matching on the alias name alone would hijack the fork.
-            let Some(key_line) = block
-                .lines()
-                .find(|l| !l.is_empty() && !l.starts_with([' ', '\t', '#']))
-            else {
-                continue;
-            };
-            let Some(key) = key_line.strip_suffix(':') else {
-                continue;
-            };
-            let patterns = split_key_patterns(key);
-            if patterns.is_empty()
-                || !patterns
-                    .iter()
-                    .all(|p| pattern_real_name(p) == Some(fname.as_str()))
-            {
-                continue;
-            }
-            if !version_re.is_match(block) {
-                continue;
-            }
-            // A block reached only through `alias@npm:<fname>@range`
-            // descriptors is left byte-identical (mirroring the berry
-            // rewriter), but never silently: that copy keeps installing the
-            // unpatched artifact.
-            if !patterns
-                .iter()
-                .any(|p| split_pattern(p).is_some_and(|(n, _)| n == fname))
-            {
-                alias_skipped = true;
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_yarn_classic_alias_skipped".into(),
-                    detail: format!(
-                        "lock entry `{key}` consumes {fname}@{} only through npm: alias \
-                         descriptors; the hosted redirect does not rewrite alias entries, \
-                         so this copy stays unpatched",
-                        dep.version
-                    ),
-                });
-                continue;
-            }
-            matched_any = true;
-            let frag = dep
-                .integrity
-                .sha1
-                .as_ref()
-                .map(|s| format!("#{s}"))
-                .unwrap_or_default();
-            let mut rewritten = resolved_re
-                .replace(
-                    block,
-                    format!("\n  resolved \"{}{frag}\"", dep.artifact_url).as_str(),
-                )
-                .to_string();
-            if integrity_re.is_match(&rewritten) {
-                rewritten = integrity_re
-                    .replace(&rewritten, format!("\n  integrity {sha512}").as_str())
-                    .to_string();
-            } else {
-                rewritten = resolved_re
-                    .replace(
-                        &rewritten,
-                        // $0 re-inserts the matched resolved line, then add integrity.
-                        format!(
-                            "\n  resolved \"{}{frag}\"\n  integrity {sha512}",
-                            dep.artifact_url
-                        )
-                        .as_str(),
-                    )
-                    .to_string();
-            }
-            if rewritten != *block {
-                // Ledger originals record the on-disk byte form, so a future
-                // revert of a CRLF lock can match what the file really held.
-                let (edit_original, edit_new) = if crlf {
-                    (block.replace('\n', "\r\n"), rewritten.replace('\n', "\r\n"))
-                } else {
-                    (block.clone(), rewritten.clone())
-                };
-                result.edits.push(FileEdit {
-                    path: "yarn.lock".into(),
-                    kind: "redirect_yarn_classic_entry".into(),
-                    action: "rewritten".into(),
-                    key: Some(format!("{fname}@{}", dep.version)),
-                    original: Some(Value::String(edit_original)),
-                    new: Some(Value::String(edit_new)),
-                });
-                *block = rewritten;
-                changed = true;
-            }
-        }
-        if !matched_any && !alias_skipped {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_yarn_classic_entry_not_found".into(),
-                detail: format!("no yarn.lock entry resolving {fname}@{}", dep.version),
-            });
-        }
-    }
-    if changed {
-        let mut out = blocks.join("\n\n");
-        if crlf {
-            out = out.replace('\n', "\r\n");
-        }
-        result.files.insert("yarn.lock".into(), out);
-    }
+    sweep.finish();
 }
