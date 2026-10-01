@@ -1,46 +1,54 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-09-30 (run 1), main `f6b7fb9`, latest release 4.0.0 (previous 3.3.0).
+Last updated: 2026-10-01 (run 2), main `2463257` (v5 consolidation, #277), latest release 4.0.0.
 
-Method: real Bun installs (GitHub release binaries) and a local Python mock of the patch API and hosted tarball route (batch, by-package, `patches/package` grant, `patches/view` with `blobContent`). The oracle is a marker in the installed file after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2, but always with `--ignore-scripts` and never in agent mode. This ledger tracks what it doesn't.
+Method: real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` to the mock. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
 ## Coverage matrix
 
-| OS | Bun | Agent: hoisted | Agent: isolated linker | Hosted / vendored: `bun patch` (patchedDependencies) | Hosted / vendored: default-trusted lifecycle scripts | Hosted: `bun update` → vex |
-| --- | --- | --- | --- | --- | --- | --- |
-| Linux | 1.1.45 | untested | n/a | untested | pass | untested |
-| Linux | 1.2.23 | pass | fail #366 (opt-in) | fail #367 | pass | untested |
-| Linux | 1.3.0–1.3.4 | untested | untested | untested | pass | untested |
-| Linux | 1.3.5–1.3.9 | untested | untested | fail #367 (1.3.9) | fail #371 | untested |
-| Linux | 1.3.14 | pass | fail #366 (default for workspaces) | fail #367 | fail #371 | untested |
-| Linux | 1.4.2 | pass | fail #366 (default for workspaces) | fail #367 (text + lockb) | fail #371 | pass |
-| macOS | 1.2.23 | pass | fail #366 | fail #367 | untested | untested |
-| macOS | 1.3.4 | untested | untested | untested | pass | untested |
-| macOS | 1.3.5 | untested | untested | untested | fail #371 | untested |
-| macOS | 1.3.14 / 1.4.2 | pass | fail #366 | fail #367 | fail #371 (1.4.2) | untested |
-| Windows | 1.2.23 | pass | fail #366 | fail #367 | untested | untested |
-| Windows | 1.3.4 | untested | untested | untested | pass | untested |
-| Windows | 1.3.5 | untested | untested | untested | fail #371 | untested |
-| Windows | 1.3.14 / 1.4.2 | pass | fail #366 (bunfig); default-workspace cell inconclusive | fail #367 | fail #371 (1.4.2) | untested |
+| OS | Bun | Agent: hoisted | Agent: isolated linker | Hosted/vendored: `bun patch` | Hosted/vendored: default-trusted scripts | Hosted → `vex`: isolated linker | Hosted rollback/remove byte-exact (text lock) | `bun.lockb` takeover ⇄ revert |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Linux | 1.1.45 | untested | n/a | untested | pass | n/a | pass (v0) | untested |
+| Linux | 1.2.23 | pass | fail #366 (opt-in) | fail #367 | pass | fail #405 (opt-in) | untested | untested |
+| Linux | 1.3.0–1.3.4 | untested | untested | untested | pass | untested | untested | untested |
+| Linux | 1.3.5–1.3.9 | untested | untested | fail #367 (1.3.9) | fail #371 | untested | untested | untested |
+| Linux | 1.3.14 | pass | fail #366 (default for workspaces) | fail #367 | fail #371 | fail #405 | pass (v1, workspace, catalog) | untested |
+| Linux | 1.4.2 | pass | fail #366 (default for workspaces) | fail #367 (text + lockb) | fail #371 | fail #405 | pass (v2, alias, overrides) | pass (semantic; not byte-exact, see Known non-bugs) |
+| macOS | 1.2.23 | pass | fail #366 | fail #367 | untested | fail #405 | untested | untested |
+| macOS | 1.3.4 / 1.3.5 | untested | untested | untested | pass / fail #371 | untested | untested | untested |
+| macOS | 1.3.14 / 1.4.2 | pass | fail #366 | fail #367 | fail #371 (1.4.2) | fail #405 | untested | untested |
+| Windows | 1.2.23 | pass | fail #366 | fail #367 | untested | fail #405 | untested | untested |
+| Windows | 1.3.4 / 1.3.5 | untested | untested | untested | pass / fail #371 | untested | untested | untested |
+| Windows | 1.3.14 / 1.4.2 | pass | fail #366 (bunfig) | fail #367 | fail #371 (1.4.2) | fail #405 (bunfig + default workspace) | untested | untested |
 
-Other passes (Linux, 1.4.2): agent `scan --global` on Bun globals; the `setup` hook in a Bun-only PATH; a hosted scoped rollback restoring a user `bun patch`.
+Other passes (Linux, 1.4.2 unless noted):
+- Run 1: agent `scan --global`, and the (pre-v5) `setup` hook.
+- Run 2:
+  - Agent scan → vex → rollback, with no cache write-through.
+  - `remove`, `repair` and `list` on hosted pins.
+  - Hosted `bun.lockb` idempotency, `--dry-run`, and the rollback refusal.
+  - Vendored `catalog:` and `overrides`.
+  - Lockfile-only vendored scan on 1.1.45 v0 with a CRLF + BOM `package.json`.
+  - A corrupt served tarball rejected on 1.3.9, 1.3.10 and 1.4.2, text + lockb.
 
 ## Backlog
 
-0. Delete the stale probe branches `bughunt/bun/20260930-isolated-bunpatch` and `bughunt/bun/20260930-default-trust`. The git proxy refused `git push --delete` in run 1.
-1. Agent + isolated linker on Windows (junctions), and the Windows default-workspace `bun install` exit 1.
-2. `bun.lockb` hosted ⇄ vendored takeover and scoped rollback / remove with two patched packages, one of them workspace-only (1.2.23 vs 1.4.2).
-3. The digest boundary (1.3.9 vs 1.3.10) with a tampered hosted tarball on a `bun.lockb` project.
-4. `overrides` / `resolutions` targeting the patched package, and `catalog:` specs in workspaces (Bun 1.3+).
-5. Lockfile-only vendored `scan` on Bun 1.1.45 (lockfileVersion 0), CRLF + BOM `package.json`.
-6. Agent `rollback` with a mock that serves before-blobs (run 1's mock lacked them).
+0. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch` and `bughunt/bun/20261001-vex-isolated`. The sandbox can't delete branches.
+1. Digest boundary with a valid, well-formed substitute tarball: a 1.3.9 text lock vs 1.3.10, hosted + vendored. `bun.lockb` already enforces on 1.3.9.
+2. `vex` on a vendored project with the isolated linker: does `vendored_tree_out_of_sync` fire for a stale `.bun/` copy?
+3. Windows agent mode with the isolated linker (junctions) once #366 lands. VEX after a real frozen hosted install on Windows.
+4. A hosted → vendored takeover on a v1 workspace lock (1.3.14). It must refuse before writes and leave the hosted pin untouched. Check `--dry-run` parity.
+5. v5 `socket.yml` policy and per-run limits in a Bun workspace.
+6. Hosted rollback on macOS and Windows (CRLF lock on Windows checkouts with `core.autocrlf`).
 
 ## Known non-bugs
 
-- `patches-api.socket.dev` is blocked by the sandbox proxy. Mock the API; `mkpatch` + `mock.py` are described in the run-1 entry.
-- Agent `rollback` → `missing_blob` when the fixture has no before-blob in `.socket/blobs` and the mock serves none.
-- Bun 1.2.23 workspaces default to the hoisted layout (isolated only via `linker = "isolated"`). From Bun 1.3.x a fresh workspace lock (`configVersion: 1`) defaults to isolated.
-- The `setup` hook's `npx @socketsecurity/socket-patch …` works in Bun-only environments: Bun's script runner maps `npx`.
-- esbuild after rewiring: `bun pm untrusted` lists it, but nothing observable breaks (its binary comes via optionalDependencies). Use a native-build package (better-sqlite3) to observe #371.
-- Documented refusals (see docs/testing/bun-compatibility.md): a version-0 workspace lock in hosted mode (`redirect_bun_workspace_unsupported`), a pre-v2 workspace lock in vendored mode (`vendor_bun_workspace_unsupported`), and missing digest enforcement on Bun < 1.3.10.
-- Agent-mode npm aliases under Bun are #356 (npm-owned, same `find_by_purls` path), not a separate Bun bug.
+- `patches-api.socket.dev` is blocked by the sandbox proxy. Mock the API. Also, the CLI's reqwest can't reach `registry.npmjs.org` from the sandbox (curl can), so hosted rollback/remove need `SOCKET_NPM_REGISTRY` pointed at a local passthrough. Without it you get `cannot restore … error sending request`, which is a sandbox artifact.
+- Agent `rollback` → `missing_blob` when the mock serves no before-blob (fixture limit).
+- v5 `rollback` removes the rolled-back entries from `.socket/manifest.json`, so a later `apply` is a success no-op (CLI_CONTRACT `rollback` row).
+- Hosted `bun.lockb` pins: `rollback` / `remove` refuse with the `git checkout -- bun.lockb` remedy (documented). After a hosted → vendored → `vendor --revert` round trip, `bun.lockb` is semantically identical (same `bun pm hash` and yarn dump) but not byte-identical: its string buffer keeps the dead URLs. The doc promises a byte-exact *registry record*, not the whole file.
+- Bun 1.2.23 workspaces default to the hoisted layout (isolated only via `linker = "isolated"`). From Bun 1.3.x a fresh workspace lock defaults to isolated.
+- `setup` was removed in v5 (#277). The run-1 `setup` pass is obsolete.
+- esbuild after rewiring is listed by `bun pm untrusted` but has no observable effect. Use better-sqlite3 to observe #371.
+- Documented refusals (docs/testing/bun-compatibility.md): a version-0 workspace lock in hosted mode (`redirect_bun_workspace_unsupported`), a pre-v2 workspace lock in vendored mode (`vendor_bun_workspace_unsupported`), and missing digest enforcement for text-lock URL/local tuples on Bun < 1.3.10.
+- Agent-mode npm aliases under Bun are #356 (npm-owned).
