@@ -1,0 +1,79 @@
+name: bughunt-deno
+on:
+  push:
+    branches: ['bughunt/deno/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        deno: ['1.46.3', '2.2.15', '2.9.6']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: false
+      - run: cargo build -p socket-patch-cli
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: ${{ matrix.deno }}
+      - name: probe
+        env:
+          DV: ${{ matrix.deno }}
+        run: |
+          set -u
+          SP="$GITHUB_WORKSPACE/target/debug/socket-patch"; [ -f "$SP.exe" ] && SP="$SP.exe"
+          W="$RUNNER_TEMP/w"; mkdir -p "$W"
+          if [ "$RUNNER_OS" = Windows ]; then PY=python; else PY=python3; fi
+          cat > "$W/mkman.py" <<'PY'
+          import sys,os,json,hashlib,uuid
+          def gh(b): return hashlib.sha256(b"blob %d\0"%len(b)+b).hexdigest()
+          root=sys.argv[1]; m={"patches":{}}
+          os.makedirs(f"{root}/.socket/blobs",exist_ok=True)
+          for spec in sys.argv[2:]:
+              purl,rest=spec.split("=",1); d,_,f=rest.partition(":"); f=f or "index.js"
+              b=open(os.path.join(root,d,f),"rb").read()
+              name=purl.split("/")[-1].split("@")[0]
+              a=f'globalThis.__SP=(globalThis.__SP||[]).concat(["{name}"]);\n'.encode()+b
+              for x in (b,a): open(f"{root}/.socket/blobs/{gh(x)}","wb").write(x)
+              m["patches"][purl]={"uuid":str(uuid.uuid4()),"exportedAt":"2026-01-01T00:00:00Z","files":{"package/"+f:{"beforeHash":gh(b),"afterHash":gh(a)}},"vulnerabilities":{"GHSA-xxxx-xxxx-"+name[:4].ljust(4,'x'):{"cves":["CVE-2099-0001"],"summary":"t","severity":"high","description":"t"}},"description":"t","license":"MIT","tier":"free"}
+          json.dump(m,open(f"{root}/.socket/manifest.json","w"),indent=2)
+          PY
+          ev() { $PY -c "import json,sys;d=json.load(sys.stdin);print(d.get('status'),[(e.get('action'),e.get('errorCode')) for e in d.get('events',[])])"; }
+          res() { echo "RESULT ${{ matrix.os }} deno=$DV $1"; }
+          case "$DV" in 1.*) NMD=true;; *) NMD='"auto"';; esac
+          # A: scoped direct npm dep through node_modules/.deno (junctions on Windows)
+          A="$W/scoped"; mkdir -p "$A"; cd "$A"; export DENO_DIR="$A/.dd"
+          echo "{\"nodeModulesDir\":$NMD,\"imports\":{\"@sindresorhus/is\":\"npm:@sindresorhus/is@4.6.0\"}}" > deno.json
+          echo 'import is from "@sindresorhus/is"; is.string("x"); console.log("loaded-patched=" + JSON.stringify((globalThis as any).__SP || []));' > probe.ts
+          deno cache probe.ts >/dev/null 2>&1; ls -la node_modules node_modules/@sindresorhus || true
+          $PY "$W/mkman.py" . "pkg:npm/@sindresorhus/is@4.6.0=node_modules/@sindresorhus/is:dist/index.js"
+          git init -q . ; out=$("$SP" apply --offline --json); echo "$out" | ev; r=$(deno run -A probe.ts); echo "$r"
+          [ "$r" = 'loaded-patched=["is"]' ] && res "A-apply pass" || res "A-apply FAIL $r"
+          v=$("$SP" vex --offline --json --output v.json --product pkg:generic/t | ev); echo "$v"; case "$v" in *verified*) res "A-vex pass";; *) res "A-vex FAIL $v";; esac
+          "$SP" rollback --offline --json >/dev/null; r=$(deno run -A probe.ts); [ "$r" = 'loaded-patched=[]' ] && res "A-rollback pass" || res "A-rollback FAIL $r"
+          "$SP" apply --offline --json | ev
+          # B: JSR vendor:true (#374) and --global-prefix
+          B="$W/jsr"; mkdir -p "$B"; cd "$B"; export DENO_DIR="$B/.dd"
+          echo '{"vendor":true,"imports":{"@std/path":"jsr:@std/path@1.0.8"}}' > deno.json
+          echo 'import {join} from "@std/path"; join("a","b"); console.log("loaded-patched="+JSON.stringify((globalThis as any).__SP||[]));' > probe.ts
+          deno cache probe.ts >/dev/null 2>&1; ls vendor/jsr.io/@std/path/1.0.8/join.ts; ls "$DENO_DIR/npm/jsr.io" 2>&1 | head -1
+          $PY "$W/mkman.py" . "pkg:jsr/@std/path@1.0.8=vendor/jsr.io/@std/path/1.0.8:join.ts"
+          git init -q .
+          o=$("$SP" apply --offline --json | ev); echo "$o"; case "$o" in *package_not_installed*) res "B-local-apply FAIL(#374) $o";; *applied*) res "B-local-apply pass";; *) res "B-local-apply other $o";; esac
+          GP=$($PY -c "import os;print(os.path.join(os.getcwd(),'vendor','jsr.io'))")
+          o=$("$SP" apply --offline --json --global-prefix "$GP" | ev); echo "$o"; r=$(deno run probe.ts); [ "$r" = 'loaded-patched=["path"]' ] && res "B-gp-apply pass" || res "B-gp-apply FAIL $r $o"
+          v=$("$SP" vex --offline --json --output v.json --product pkg:generic/t --global-prefix "$GP" | ev); case "$v" in *verified*) res "B-gp-vex pass";; *) res "B-gp-vex FAIL $v";; esac
+          "$SP" rollback --offline --json --global-prefix "$GP" >/dev/null; r=$(deno run probe.ts); [ "$r" = 'loaded-patched=[]' ] && res "B-gp-rollback pass" || res "B-gp-rollback FAIL $r"
+          exit 0
