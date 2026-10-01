@@ -3504,9 +3504,7 @@ fn rewrite_yarn_berry(
             // An entry an earlier hosted run already keyed by its tarball
             // descriptor (`"<name>@<hosted url>"`): ours to re-pin.
             if let [Some((_, range))] = parsed.as_slice() {
-                if *range == dep.artifact_url
-                    || hosted_url::hosted_url_names(range, &fname, &dep.version)
-                {
+                if berry_hosted_pin_is_ours(range, &fname, Some(&dep.version), &dep.artifact_url) {
                     targets.push((block_idx, Vec::new()));
                     continue;
                 }
@@ -3782,13 +3780,44 @@ pub(crate) fn berry_entries_sorted(blocks: &[String]) -> bool {
 /// The root manifest the yarn berry hosted pin edits.
 const BERRY_MANIFEST: &str = "package.json";
 
+/// Whether `url` (a URL lock key or `resolutions` value) is a hosted
+/// tarball pin socket-patch wrote for `name` (at `version`, when given):
+/// this run's own artifact URL, or a URL on the same patch server (scheme,
+/// host and port of `artifact_url`) whose leaf names the package version.
+/// A user's own tarball for the package — a mirror, a fork — is on another
+/// origin and is never ours to rewrite.
+fn berry_hosted_pin_is_ours(
+    url: &str,
+    name: &str,
+    version: Option<&str>,
+    artifact_url: &str,
+) -> bool {
+    if url == artifact_url {
+        return true;
+    }
+    let names_it = match version {
+        Some(v) => hosted_url::hosted_url_names(url, name, v),
+        None => hosted_url::hosted_url_version(url, name).is_some(),
+    };
+    let same_origin = match (reqwest::Url::parse(url), reqwest::Url::parse(artifact_url)) {
+        (Ok(a), Ok(b)) => {
+            a.scheme() == b.scheme()
+                && a.host_str().is_some()
+                && a.host_str() == b.host_str()
+                && a.port_or_known_default() == b.port_or_known_default()
+        }
+        _ => false,
+    };
+    names_it && same_origin
+}
+
 /// Whether `value` (a `resolutions` value) is a hosted tarball pin written
-/// for some version of `name` (or this run's own artifact URL) — ours to
-/// rewrite or drop.
+/// for some version of `name` — ours to rewrite or drop (see
+/// [`berry_hosted_pin_is_ours`]).
 fn berry_resolution_is_ours(value: &Value, name: &str, artifact_url: &str) -> bool {
     value
         .as_str()
-        .is_some_and(|v| v == artifact_url || hosted_url::hosted_url_version(v, name).is_some())
+        .is_some_and(|v| berry_hosted_pin_is_ours(v, name, None, artifact_url))
 }
 
 /// The manifest side of one berry hosted pin, computed by
@@ -3900,8 +3929,10 @@ fn berry_resolutions_pin(
             code: "redirect_yarn_berry_resolutions_conflict".into(),
             detail: format!(
                 "yarn.lock pins {name}@{version} to a hosted tarball but package.json has no \
-                 resolutions entry routing a descriptor to it; run `socket-patch rollback` \
-                 (or restore both files from version control) and re-run"
+                 resolutions entry routing a descriptor to it, so the original descriptor is \
+                 unknown and neither this run nor `socket-patch rollback` can rebuild the \
+                 entry — restore yarn.lock and package.json from version control (or delete \
+                 the entry and run `yarn install`), then re-run"
             ),
         });
     }
@@ -3909,9 +3940,9 @@ fn berry_resolutions_pin(
         .iter()
         .filter(|(selector, value)| {
             !selectors.contains(selector)
-                && value.as_str().is_some_and(|v| {
-                    v == artifact_url || hosted_url::hosted_url_names(v, name, version)
-                })
+                && value
+                    .as_str()
+                    .is_some_and(|v| berry_hosted_pin_is_ours(v, name, Some(version), artifact_url))
         })
         .map(|(selector, _)| (*selector).clone())
         .collect();
@@ -8085,6 +8116,25 @@ mod tests {
                 "{label}"
             );
         }
+        // A user's own tarball for the package — same `<name>-<version>.tgz`
+        // leaf, another origin (a mirror, a fork) — is user-authored too.
+        let manifest = "{\n  \"name\": \"app\",\n  \"resolutions\": {\n    \
+             \"left-pad@npm:^1.3.0\": \"https://mirror.example/left-pad-1.3.0.tgz\"\n  }\n}\n";
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), manifest.into()),
+            std::slice::from_ref(&ovr),
+            &mut r,
+        );
+        assert!(r.files.is_empty(), "mirror tarball: {:?}", r.files);
+        assert_eq!(
+            r.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["redirect_yarn_berry_resolutions_conflict"],
+            "mirror tarball"
+        );
         // An unrelated user entry is kept as-is next to ours.
         let manifest = "{\n  \"name\": \"app\",\n  \"resolutions\": {\n    \"other\": \"2.0.0\"\n  }\n}\n";
         let mut r = RewriteResult::default();

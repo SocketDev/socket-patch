@@ -501,7 +501,9 @@ async fn restore_berry(
                     &uuid,
                     format!(
                         "{pkg_rel} has no resolutions entry routing a {name} descriptor to the \
-                         hosted tarball, so the {rel} entry's original key cannot be rebuilt"
+                         hosted tarball, so the {rel} entry's original key cannot be rebuilt — \
+                         restore {rel} and {pkg_rel} from version control (or delete the entry \
+                         and run `yarn install`)"
                     ),
                 );
                 continue;

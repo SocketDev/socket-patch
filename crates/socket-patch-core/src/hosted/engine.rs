@@ -1318,15 +1318,20 @@ fn confirm(
     // artifact failed the preflight beside another npm-family lock) may
     // still hold an earlier run's pin: only the sibling lock this run
     // rewrote can confirm that dep.
+    // The yarn berry pin's `package.json` `resolutions` entry is only half of
+    // it — the URL-keyed `yarn.lock` entry is what installs — so a hosted URL
+    // left in the manifest (an earlier run, a refused rewrite) proves
+    // nothing on its own: the manifest never feeds the probe.
     let final_texts: Vec<(&str, &String)> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
+        .filter(|(name, _)| name.as_str() != "package.json")
         .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
         .chain(
             rewrite
                 .files
                 .iter()
-                .filter(|(name, _)| !files.contains_key(*name))
+                .filter(|(name, _)| !files.contains_key(*name) && name.as_str() != "package.json")
                 .map(|(name, content)| (name.as_str(), content)),
         )
         .collect();
@@ -1654,6 +1659,61 @@ mod tests {
         // A non-UTF-8 file is absent to disk too: not a refusal.
         let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
         assert!(read.unreadable_reads.is_empty());
+    }
+
+    /// A hosted URL left in a berry project's `package.json` `resolutions`
+    /// while `yarn.lock` still resolves the registry entry confirms nothing:
+    /// only the lock pin installs (#404).
+    #[test]
+    fn a_resolutions_url_alone_does_not_confirm_a_berry_redirect() {
+        use crate::patch::redirect::Integrity;
+        let url = "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/uuid/left-pad-1.3.0.tgz";
+        let candidate = Candidate {
+            purl: "pkg:npm/left-pad@1.3.0".into(),
+            dep: DepOverride {
+                ecosystem: "npm".into(),
+                name: "left-pad".into(),
+                namespace: None,
+                version: "1.3.0".into(),
+                token: "tok".into(),
+                patch_uuid: "uuid".into(),
+                artifact_url: url.into(),
+                registry_override: None,
+                integrity: Integrity::default(),
+            },
+        };
+        let lock = "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\"left-pad@npm:^1.3.0\":\n  \
+                    version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n";
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), lock.to_string());
+        files.insert(
+            "package.json".to_string(),
+            format!("{{\"resolutions\": {{\"left-pad@npm:^1.3.0\": \"{url}\"}}}}"),
+        );
+        let none = confirm(
+            &files,
+            &RewriteResult::default(),
+            std::slice::from_ref(&candidate),
+            false,
+            &BTreeSet::new(),
+        );
+        assert!(none.is_empty(), "{none:?}");
+        // The lock pin itself still confirms.
+        files.insert(
+            "yarn.lock".to_string(),
+            lock.replace(
+                "resolution: \"left-pad@npm:1.3.0\"",
+                &format!("resolution: \"left-pad@{url}\""),
+            ),
+        );
+        let confirmed = confirm(
+            &files,
+            &RewriteResult::default(),
+            std::slice::from_ref(&candidate),
+            false,
+            &BTreeSet::new(),
+        );
+        assert_eq!(confirmed.len(), 1, "{confirmed:?}");
     }
 
     fn gem_candidate() -> Candidate {
