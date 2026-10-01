@@ -8556,6 +8556,34 @@ snapshots:
             }
         }
 
+        /// A column-0 comment inside the section does not hide later
+        /// entries from the check, the edit or the revert.
+        #[test]
+        fn column_zero_comment_inside_the_section_keeps_later_entries() {
+            let text = "packages:\n  - '.'\noverrides:\n  is-number: 7.0.0\n# pinned\n  left-pad@1.3.0: 1.3.1\n";
+            let err = check_workspace_override(Some(text), "left-pad", "1.3.0", "left-pad@1.3.0")
+                .unwrap_err();
+            assert!(err.contains("already carries an override"), "{err}");
+
+            let text = format!(
+                "overrides:\n  is-number: 7.0.0\n# ours below\n  left-pad@1.3.0: {SPEC}\nnext: x\n"
+            );
+            // Our entry below the comment is found: already in sync, no edit.
+            let mut wiring = Vec::new();
+            let edit =
+                apply_workspace_override(Some(&text), "left-pad@1.3.0", SPEC, &mut wiring).unwrap();
+            assert!(edit.new_text.is_none(), "{:?}", edit.new_text);
+            let rec = ws_record("left-pad@1.3.0", SPEC, WiringAction::Added, None);
+            let mut lines = split_lines(&text);
+            let (mut dirty, mut warnings) = (false, Vec::new());
+            revert_ws_record(&mut lines, &rec, "u1", &mut dirty, &mut warnings);
+            assert!(dirty && warnings.is_empty(), "{warnings:?}");
+            assert_eq!(
+                lines.join("\n"),
+                "overrides:\n  is-number: 7.0.0\n# ours below\nnext: x\n"
+            );
+        }
+
         /// #402: the pre-flight conflict check examines a quoted section too.
         #[test]
         fn quoted_overrides_section_conflict_is_refused() {

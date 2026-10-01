@@ -104,8 +104,10 @@ pub(crate) fn block_insert_point(lines: &[String]) -> Result<usize, String> {
 }
 
 /// The top-level `name:` section holding a block mapping: `(header, end)`,
-/// `end` being the next column-0 line (exclusive), as `lines::section_bounds`
-/// but for every spelling of the key. `None` when absent or inline-valued.
+/// `end` being the next column-0 line that is not a comment (exclusive) — a
+/// `#` comment at column 0 does not close a YAML block mapping. Unlike
+/// `lines::section_bounds` it accepts every spelling of the key. `None` when
+/// absent or inline-valued.
 pub(crate) fn block_section_bounds(lines: &[String], name: &str) -> Option<(usize, usize)> {
     let start = lines.iter().position(|l| {
         top_level_key(l).is_some_and(|(key, value)| key == name && value.is_empty())
@@ -114,7 +116,10 @@ pub(crate) fn block_section_bounds(lines: &[String], name: &str) -> Option<(usiz
         .iter()
         .enumerate()
         .skip(start + 1)
-        .find(|(_, l)| !l.is_empty() && !l.starts_with(' '))
+        .find(|(_, l)| {
+            let l = l.strip_suffix('\r').unwrap_or(l);
+            !l.is_empty() && !l.starts_with([' ', '\t', '#'])
+        })
         .map(|(i, _)| i)
         .unwrap_or(lines.len());
     Some((start, end))
@@ -269,6 +274,9 @@ mod tests {
     fn block_section_bounds_matches_any_key_spelling() {
         let l = lines("packages:\n  - '.'\n\"overrides\":\n  a: 1\nnext: x\n");
         assert_eq!(block_section_bounds(&l, "overrides"), Some((2, 4)));
+        // A column-0 comment (or a stray `\r` blank) stays inside the section.
+        let l = lines("\"overrides\":\n  a: 1\n# note\n\r\n  b: 2\nnext: x\n");
+        assert_eq!(block_section_bounds(&l, "overrides"), Some((0, 5)));
         let inline = lines("overrides : {a: 1}\n");
         assert_eq!(block_section_bounds(&inline, "overrides"), None);
     }
