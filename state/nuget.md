@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled NuGet / dotnet bug-hunt routine (label pm:nuget).
 
-Last run: 2026-10-01 12:20 UTC, main `2463257` (v5 consolidation, #277), release v4.0.0.
+Last run: 2026-10-01 17:50 UTC, main `9d718cf`, release v4.0.0.
 
 ## Coverage matrix
 
@@ -37,19 +37,22 @@ Project-mode agent scan (no `-g`) patches unrelated cached packages and VEX atte
 | Windows | 9.0.x | pass | fail #426 | fail #397 | untested | fail #397 | untested | untested |
 | Windows | 10.0.x | pass | fail #426 | fail #397 | untested | fail #397 | untested | untested |
 
+`-g` run from inside a vendored project (`scan -g --mode agent` → `rollback -g`): Linux 8 fail #489 (vendored: regression from #446, `551c362`; hosted: pre-existing). macOS / Windows untested.
+
 Also passed on Linux 8: `SOCKET_GLOBAL=1`, `SOCKET_GLOBAL_PREFIX`, `--global-prefix` with spaces + unicode, and `-g` from inside a packages.config project (no leak).
 
 ## Backlog
 
-1. #462 on macOS / Windows and SDK 6/9/10 (probe branch). dot.net installs are blocked in the sandbox.
-2. Re-run #353 / #354 under the v5 flow (a scratch copy of `e2e_nuget_dotnet_build.rs` with the `Backend` stand-in works well).
-3. Unwritable folder on macOS / Windows (Program Files); local tools (`dotnet-tools.json`); apply/rollback/vex `-g` on macOS / Windows.
-4. Mapping edge cases: a prefix pattern on another source (expect pass), a case-variant exact id, and two Socket patches for different ids.
-5. #354 on macOS / Windows (`%APPDATA%\NuGet\NuGet.Config`), plus machine-wide configs.
-6. Vendored/hosted with packages.config (needs nuget.exe / mono, or Windows).
-7. #427 on macOS / Windows; unicode / space paths and Windows long paths.
+1. #489 on macOS / Windows and SDK 6/9/10 (probe branch; inline the harness). Also `apply -g` / `remove -g <purl>` from a vendored project.
+2. #462 on macOS / Windows and SDK 6/9/10 (probe branch). dot.net installs are blocked in the sandbox.
+3. Re-run #353 / #354 under the v5 flow (a scratch copy of `e2e_nuget_dotnet_build.rs` with the `Backend` stand-in works well).
+4. Unwritable folder on macOS / Windows (Program Files); local tools (`dotnet-tools.json`); apply/rollback/vex `-g` on macOS / Windows.
+5. Mapping edge cases: a prefix pattern on another source (expect pass), a case-variant exact id, and two Socket patches for different ids.
+6. #354 on macOS / Windows (`%APPDATA%\NuGet\NuGet.Config`), plus machine-wide configs.
+7. Vendored/hosted with packages.config (needs nuget.exe / mono, or Windows).
+8. #427 on macOS / Windows; unicode / space paths and Windows long paths.
 
-Also passed on Linux 8 (no issue): vendored with a BOM + CRLF `NuGet.Config` (+ byte-exact revert), multi-TFM + `RestoreLockedMode`, and a transitive-only patched package.
+Also passed on Linux 8 (no issue): vendored with a BOM + CRLF `NuGet.Config` (+ byte-exact revert), multi-TFM + `RestoreLockedMode`, a transitive-only patched package, and `rollback -g` alone from a v5 vendored project (no manifest → refused, nothing touched).
 
 ## Known non-bugs
 
@@ -63,3 +66,4 @@ Also passed on Linux 8 (no issue): vendored with a BOM + CRLF `NuGet.Config` (+ 
 - `apply -g` on a global tool fails loudly (rc 1, not found). The silent part is `scan -g` (#426).
 - A vendored `NuGet.Config` with CRLF gets LF-terminated inserted lines (mixed endings). NuGet parses it fine, and revert is byte-exact, so it's cosmetic.
 - A partial apply (EACCES midway through a multi-file patch) leaves the earlier files patched. That's intended (apply.rs retry design). It's loud (rc 1 `partialFailure`), VEX omits it, and rollback restores it.
+- `vex -o` is `--org`; the output flag is `-O` / `--output`. Not a bug.
