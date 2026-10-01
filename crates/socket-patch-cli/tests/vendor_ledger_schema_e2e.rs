@@ -208,6 +208,25 @@ fn new_ledgers_compact_whole_file_snapshots_and_revert() {
     }
 }
 
+/// `bytes` with every ` --hash=sha256:<64 hex>` option removed.
+fn strip_sha256_hash_options(bytes: &[u8]) -> Vec<u8> {
+    const NEEDLE: &[u8] = b" --hash=sha256:";
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes.get(i + NEEDLE.len()..i + NEEDLE.len() + 64);
+        if bytes[i..].starts_with(NEEDLE)
+            && hex.is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))
+        {
+            i += NEEDLE.len() + 64;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Against the integrated base: for every ecosystem this binary wires
 /// exactly the files the base binary wired (the checked-in legacy
 /// fixtures), and its ledger — whatever its on-disk version — loads to the
@@ -215,7 +234,17 @@ fn new_ledgers_compact_whole_file_snapshots_and_revert() {
 #[tokio::test]
 async fn server_artifacts_preserve_legacy_wiring_shape_and_originals() {
     for eco in fx::ALL {
-        let base_wired = read_tree(&fixtures_dir().join(eco).join("wired"));
+        let mut base_wired = read_tree(&fixtures_dir().join(eco).join("wired"));
+        if *eco == "pypi-requirements" {
+            // The one intended difference: the base binary pinned its vendor
+            // lines with `--hash` even in this unhashed requirements.txt,
+            // which put pip in hash-checking mode for every other
+            // requirement (#376). This binary writes the same lines without
+            // it — in the file and in the ledger's recorded `new` text.
+            for (_, bytes) in &mut base_wired {
+                *bytes = strip_sha256_hash_options(bytes);
+            }
+        }
         let f = Fixture::new(eco);
         let (code, stdout, stderr) = f.vendor(&[], &[]);
         assert_eq!(code, 0, "{eco}: {stdout}\n{stderr}");
