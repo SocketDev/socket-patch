@@ -19,6 +19,7 @@
 //! readers that must refuse such a lock.
 
 pub(crate) mod hosted;
+pub(crate) mod manifest;
 
 use std::collections::{BTreeSet, HashMap};
 

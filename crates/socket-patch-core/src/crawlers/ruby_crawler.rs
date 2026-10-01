@@ -944,11 +944,38 @@ fn expand_tilde(value: &Path, home: Option<&Path>) -> PathBuf {
     value.to_path_buf()
 }
 
+/// [`crate::formats::gem::manifest::classify`] for `root` on disk: the
+/// manifest bundler loads, reading the ambient `BUNDLE_GEMFILE` /
+/// `BUNDLE_APP_CONFIG` and the app config file.
+pub async fn bundler_loaded_manifest(root: &Path) -> crate::formats::gem::manifest::LoadedManifest {
+    bundler_loaded_manifest_with_env(
+        root,
+        std::env::var_os("BUNDLE_GEMFILE").as_deref(),
+        std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+    )
+    .await
+}
+
+/// [`bundler_loaded_manifest`] with the environment passed explicitly (hermetic
+/// tests).
+pub async fn bundler_loaded_manifest_with_env(
+    root: &Path,
+    gemfile_env: Option<&OsStr>,
+    app_config_env: Option<&OsStr>,
+) -> crate::formats::gem::manifest::LoadedManifest {
+    let config = bundler_app_config_dir(root, app_config_env).join("config");
+    let config_value = crate::utils::fs::read_regular_to_string(&config)
+        .await
+        .ok()
+        .and_then(|text| crate::formats::gem::manifest::config_gemfile(&text));
+    crate::formats::gem::manifest::classify(root, gemfile_env, config_value.as_deref())
+}
+
 /// Bundler's app-config dir for `root`, following `Bundler.app_config_path`
 /// exactly: `$BUNDLE_APP_CONFIG` when set (a relative value resolves against
 /// the project root, NOT the process cwd), else `<root>/.bundle` — e.g. the
 /// official ruby Docker images export `BUNDLE_APP_CONFIG=/usr/local/bundle`.
-fn bundler_app_config_dir(root: &Path, env_value: Option<&OsStr>) -> PathBuf {
+pub(crate) fn bundler_app_config_dir(root: &Path, env_value: Option<&OsStr>) -> PathBuf {
     match env_value {
         Some(v) if !v.is_empty() => {
             let p = PathBuf::from(v);
@@ -1070,7 +1097,7 @@ fn parse_bundle_config_path(contents: &str) -> Option<String> {
 
 /// Unwrap one bundler app-config scalar: trim, then strip one matching
 /// pair of double or single quotes (bundler double-quotes what it writes).
-fn unquote_bundle_config_value(rest: &str) -> &str {
+pub(crate) fn unquote_bundle_config_value(rest: &str) -> &str {
     let v = rest.trim();
     v.strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
@@ -1096,6 +1123,33 @@ fn is_safe_gem_coordinate(name: &str, version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn loaded_manifest_reads_the_app_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".bundle")).unwrap();
+        std::fs::write(
+            dir.path().join(".bundle/config"),
+            "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n",
+        )
+        .unwrap();
+        let m = bundler_loaded_manifest_with_env(dir.path(), None, None).await;
+        assert!(matches!(
+            m,
+            crate::formats::gem::manifest::LoadedManifest::Unsupported {
+                by: crate::formats::gem::manifest::GemfileSetting::AppConfig,
+                ..
+            }
+        ));
+        // BUNDLE_APP_CONFIG moves the config file away from `.bundle`.
+        let m = bundler_loaded_manifest_with_env(
+            dir.path(),
+            None,
+            Some(std::ffi::OsStr::new("elsewhere")),
+        )
+        .await;
+        assert_eq!(m, crate::formats::gem::manifest::LoadedManifest::Default);
+    }
 
     #[test]
     fn test_parse_gem_dir_name() {

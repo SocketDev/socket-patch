@@ -1,0 +1,268 @@
+//! Which manifest Bundler loads for a project: the ONE answer shared by the
+//! hosted rewriter's caller and the vendored backend, so neither can wire a
+//! file Bundler ignores.
+//!
+//! Bundler's own order (`Bundler::SharedHelpers#default_gemfile` and the CLI's
+//! `gemfile` setting):
+//!
+//! 1. `BUNDLE_GEMFILE` from the environment (a relative value is read
+//!    against the project root: bundler expands it against the directory
+//!    `bundle` runs in, which is the project, not socket-patch's own
+//!    cwd when it runs with `--cwd`);
+//! 2. `BUNDLE_GEMFILE:` in the app config file, `$BUNDLE_APP_CONFIG/config`
+//!    else `<root>/.bundle/config` (what `bundle config set --local gemfile
+//!    Gemfile.next` writes; relative to the project root);
+//! 3. otherwise `gems.rb` when present, else `Gemfile` (bundler >= 2; 1.x
+//!    reads a `Gemfile` first, so callers treat a twin as ambiguous or
+//!    follow the >= 2 order, as the hosted rewriter does).
+//!
+//! A configured value that names the root's own `Gemfile` or `gems.rb` is
+//! that spelling; anything else (`Gemfile.next`, a file in another
+//! directory, a missing file) is [`LoadedManifest::Unsupported`]: the
+//! rewriters and the lock readers only know the two default pairs, so the
+//! callers fail closed rather than wire a manifest Bundler never reads.
+//! The user-level `~/.bundle/config` is not consulted. The model is pure:
+//! the disk and environment reads live in
+//! [`crate::crawlers::ruby_crawler::bundler_loaded_manifest`].
+
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+
+use crate::crawlers::ruby_crawler::unquote_bundle_config_value;
+use crate::utils::fs::normalize_lexically;
+
+/// Where a configured `BUNDLE_GEMFILE` came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GemfileSetting {
+    /// The `BUNDLE_GEMFILE` environment variable.
+    Env,
+    /// `BUNDLE_GEMFILE:` in the project's bundler app config file.
+    AppConfig,
+}
+
+impl GemfileSetting {
+    /// How the setting is named in warnings and refusals.
+    pub fn describe(self) -> &'static str {
+        match self {
+            GemfileSetting::Env => "the BUNDLE_GEMFILE environment variable",
+            GemfileSetting::AppConfig => {
+                "BUNDLE_GEMFILE in the bundler app config (.bundle/config)"
+            }
+        }
+    }
+}
+
+/// The manifest Bundler loads for a project root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadedManifest {
+    /// No `BUNDLE_GEMFILE`: Bundler's default discovery (bundler >= 2: `gems.rb` first,
+    /// then `Gemfile`), which callers apply to the files they see.
+    Default,
+    /// `BUNDLE_GEMFILE` names the root's own `Gemfile` or `gems.rb`.
+    Configured {
+        manifest: &'static str,
+        by: GemfileSetting,
+    },
+    /// `BUNDLE_GEMFILE` names any other file.
+    Unsupported { value: String, by: GemfileSetting },
+}
+
+impl LoadedManifest {
+    /// The manifest/lock pair Bundler loads, given whether the root holds a
+    /// `gems.rb`. `None` for [`LoadedManifest::Unsupported`].
+    pub fn pair(&self, gems_rb_present: bool) -> Option<(&'static str, &'static str)> {
+        let manifest = match self {
+            LoadedManifest::Default if gems_rb_present => "gems.rb",
+            LoadedManifest::Default => "Gemfile",
+            LoadedManifest::Configured { manifest, .. } => manifest,
+            LoadedManifest::Unsupported { .. } => return None,
+        };
+        Some(if manifest == "gems.rb" {
+            ("gems.rb", "gems.locked")
+        } else {
+            ("Gemfile", "Gemfile.lock")
+        })
+    }
+
+    /// The detail line for a caller that refuses an unsupported manifest.
+    pub fn unsupported_detail(&self) -> Option<String> {
+        match self {
+            LoadedManifest::Unsupported { value, by } => {
+                let remedy = match by {
+                    GemfileSetting::Env => {
+                        "unset BUNDLE_GEMFILE, or point it at the project's Gemfile"
+                    }
+                    GemfileSetting::AppConfig => {
+                        "run `bundle config unset --local gemfile`, or point it at the \
+                         project's Gemfile"
+                    }
+                };
+                Some(format!(
+                    "bundler loads `{value}` ({}), not the project's Gemfile or gems.rb; \
+                     socket-patch only wires those, so it left the gem manifests untouched \
+                     ({remedy}, and re-run)",
+                    by.describe()
+                ))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The `BUNDLE_GEMFILE:` value of a bundler app config file (flat YAML that
+/// bundler writes itself; an empty value counts as unset).
+pub fn config_gemfile(contents: &str) -> Option<String> {
+    let mut found = None;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("BUNDLE_GEMFILE:") {
+            let v = unquote_bundle_config_value(rest);
+            found = (!v.is_empty()).then(|| v.to_string());
+        }
+    }
+    found
+}
+
+/// Classify the configured `BUNDLE_GEMFILE` (environment first, then the
+/// app config value) against `root`, which also anchors a relative value.
+pub fn classify(
+    root: &Path,
+    gemfile_env: Option<&OsStr>,
+    config_value: Option<&str>,
+) -> LoadedManifest {
+    let (value, by) = match gemfile_env.filter(|v| !v.is_empty()) {
+        Some(v) => (PathBuf::from(v), GemfileSetting::Env),
+        None => match config_value.filter(|v| !v.is_empty()) {
+            Some(v) => (PathBuf::from(v), GemfileSetting::AppConfig),
+            None => return LoadedManifest::Default,
+        },
+    };
+    let display = value.display().to_string();
+    let absolute = |p: &Path| {
+        std::path::absolute(p)
+            .ok()
+            .and_then(|p| normalize_lexically(&p))
+    };
+    let target = if value.is_absolute() {
+        absolute(&value)
+    } else {
+        absolute(&root.join(&value))
+    };
+    let root = absolute(root);
+    if let (Some(target), Some(root)) = (target, root) {
+        for manifest in ["Gemfile", "gems.rb"] {
+            if target == root.join(manifest) {
+                return LoadedManifest::Configured { manifest, by };
+            }
+        }
+    }
+    LoadedManifest::Unsupported { value: display, by }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root() -> PathBuf {
+        std::path::absolute("/proj").unwrap()
+    }
+
+    #[test]
+    fn no_setting_is_bundlers_default_discovery() {
+        let m = classify(&root(), None, None);
+        assert_eq!(m, LoadedManifest::Default);
+        assert_eq!(m.pair(true), Some(("gems.rb", "gems.locked")));
+        assert_eq!(m.pair(false), Some(("Gemfile", "Gemfile.lock")));
+        // An empty value is unset, as in bundler.
+        assert_eq!(
+            classify(&root(), Some(OsStr::new("")), Some("")),
+            LoadedManifest::Default
+        );
+    }
+
+    #[test]
+    fn config_naming_another_manifest_is_unsupported() {
+        let m = classify(&root(), None, Some("Gemfile.next"));
+        assert_eq!(
+            m,
+            LoadedManifest::Unsupported {
+                value: "Gemfile.next".into(),
+                by: GemfileSetting::AppConfig
+            }
+        );
+        assert_eq!(m.pair(false), None);
+        assert!(m.unsupported_detail().unwrap().contains("Gemfile.next"));
+    }
+
+    #[test]
+    fn config_naming_the_default_spellings_selects_that_pair() {
+        // `bundle config set --local gemfile Gemfile` beside a gems.rb:
+        // bundler loads Gemfile + Gemfile.lock, not gems.rb.
+        let m = classify(&root(), None, Some("Gemfile"));
+        assert_eq!(m.pair(true), Some(("Gemfile", "Gemfile.lock")));
+        let m = classify(&root(), None, Some("./gems.rb"));
+        assert_eq!(m.pair(false), Some(("gems.rb", "gems.locked")));
+        let abs = root().join("Gemfile");
+        let m = classify(&root(), None, Some(abs.to_str().unwrap()));
+        assert_eq!(m.pair(true), Some(("Gemfile", "Gemfile.lock")));
+    }
+
+    /// The environment wins over the app config, and a relative value is
+    /// read against the project root even when socket-patch runs elsewhere
+    /// with `--cwd` (Bugbot on #431: `BUNDLE_GEMFILE=Gemfile` must select
+    /// the project's Gemfile, not a file under the process cwd).
+    #[test]
+    fn env_wins_over_config_and_is_anchored_at_the_project_root() {
+        let m = classify(&root(), Some(OsStr::new("Gemfile")), Some("Gemfile.next"));
+        assert_eq!(
+            m,
+            LoadedManifest::Configured {
+                manifest: "Gemfile",
+                by: GemfileSetting::Env
+            }
+        );
+        let m = classify(&root(), Some(OsStr::new("Gemfile.next")), None);
+        assert!(matches!(
+            m,
+            LoadedManifest::Unsupported {
+                by: GemfileSetting::Env,
+                ..
+            }
+        ));
+    }
+
+    /// The refusal names the remedy for the knob that set it: unsetting the
+    /// environment variable does nothing to a `.bundle/config` setting.
+    #[test]
+    fn unsupported_detail_names_the_knob_that_set_it() {
+        let env = classify(&root(), Some(OsStr::new("Gemfile.next")), None);
+        let env = env.unsupported_detail().unwrap();
+        assert!(env.contains("unset BUNDLE_GEMFILE"), "{env}");
+        let config = classify(&root(), None, Some("Gemfile.next"));
+        let config = config.unsupported_detail().unwrap();
+        assert!(
+            config.contains("bundle config unset --local gemfile"),
+            "{config}"
+        );
+        assert!(!config.contains("unset BUNDLE_GEMFILE"), "{config}");
+    }
+
+    #[test]
+    fn a_manifest_in_another_directory_is_unsupported() {
+        let m = classify(&root(), None, Some("../other/Gemfile"));
+        assert!(matches!(m, LoadedManifest::Unsupported { .. }));
+        let m = classify(&root(), None, Some("sub/Gemfile"));
+        assert!(matches!(m, LoadedManifest::Unsupported { .. }));
+    }
+
+    #[test]
+    fn config_gemfile_reads_bundlers_own_spelling() {
+        assert_eq!(
+            config_gemfile(
+                "---\nBUNDLE_PATH: \"vendor/bundle\"\nBUNDLE_GEMFILE: \"Gemfile.next\"\n"
+            ),
+            Some("Gemfile.next".into())
+        );
+        assert_eq!(config_gemfile("---\nBUNDLE_GEMFILE: \"\"\n"), None);
+        assert_eq!(config_gemfile("---\nBUNDLE_PATH: \"x\"\n"), None);
+    }
+}
