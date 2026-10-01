@@ -1,0 +1,106 @@
+name: bughunt npm probe
+on:
+  push:
+    branches: ['bughunt/npm/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        npm: ['10.9.7', '12.1.0']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.15.0'
+      - name: Build CLI
+        run: cargo build --release -p socket-patch-cli
+      - name: Install npm
+        run: npm install -g npm@${{ matrix.npm }} && npm --version
+      - name: Probe
+        env:
+          SOCKET_NO_UPDATE_CHECK: '1'
+          SOCKET_NO_CONFIG: '1'
+        run: |
+          set +e
+          BIN="$PWD/target/release/socket-patch"
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          git config --global user.email probe@example.com; git config --global user.name probe
+          git config --global init.defaultBranch main
+          W="$RUNNER_TEMP/pr obé ü"; mkdir -p "$W"
+          cat > "$W/stage.js" <<'JS'
+          const fs=require('fs'),path=require('path'),crypto=require('crypto');
+          const [proj,purl,pkgdir]=process.argv.slice(2);
+          const before=fs.readFileSync(path.join(pkgdir,'index.js'));
+          const after=Buffer.concat([Buffer.from('/* SOCKET-PATCHED */\n'),before]);
+          const gh=b=>crypto.createHash('sha256').update(Buffer.concat([Buffer.from('blob '+b.length+'\0'),b])).digest('hex');
+          fs.mkdirSync(path.join(proj,'.socket','blobs'),{recursive:true});
+          const m={patches:{[purl]:{uuid:'1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab',exportedAt:'2026-01-01T00:00:00Z',
+            files:{'package/index.js':{beforeHash:gh(before),afterHash:gh(after)}},
+            vulnerabilities:{'GHSA-xxxx-yyyy-zzzz':{cves:['CVE-2024-99999'],summary:'s',severity:'high',description:'d'}},
+            description:'m',license:'MIT',tier:'free'}}};
+          fs.writeFileSync(path.join(proj,'.socket','manifest.json'),JSON.stringify(m,null,2)+'\n');
+          fs.writeFileSync(path.join(proj,'.socket','blobs',gh(after)),after);
+          fs.writeFileSync(path.join(proj,'.socket','blobs',gh(before)),before);
+          JS
+          head20() { node -e "process.stdout.write(require('fs').readFileSync(process.argv[1],'utf8').slice(0,20).replace(/\r?\n/g,' '))" "$1" 2>/dev/null || echo MISSING; }
+          vexst() { node -e "try{const d=require(process.argv[1]);console.log((d.statements||[]).map(s=>s.status).join(',')||'none')}catch(e){console.log('nodoc')}" "$1"; }
+          T="${{ matrix.os }} npm ${{ matrix.npm }}"
+
+          echo "::group::vendored on LF, fresh clone with core.autocrlf=true"
+          V="$W/vend src"; mkdir -p "$V"; cd "$V"
+          echo '{"name":"app","version":"1.0.0","private":true,"dependencies":{"left-pad":"1.3.0","is-odd":"3.0.1","is-number":"7.0.0"}}' > package.json
+          printf 'node_modules\n' > .gitignore
+          npm install --no-audit --no-fund >/dev/null 2>&1
+          node "$W/stage.js" . pkg:npm/left-pad@1.3.0 node_modules/left-pad
+          "$BIN" vendor --offline --json > "$W/vendor1.json"; echo "vendor exit $?"
+          git init -q . && git add -A && git commit -qm vendored
+          C="$W/vend clone"; git -c core.autocrlf=true clone -q "$V" "$C"; cd "$C"
+          echo "lock has CRLF: $(grep -c $'\r' package-lock.json)  state.json CRLF: $(grep -c $'\r' .socket/vendor/state.json 2>/dev/null)"
+          npm ci --no-audit --no-fund > "$W/ci.log" 2>&1; CI=$?
+          "$BIN" vex --output "$W/v1.json" --json > "$W/vex1.json" 2>&1; VX=$?
+          echo "RESULT autocrlf-ci $T: ci=$CI left-pad=[$(head20 node_modules/left-pad/index.js)] vex_exit=$VX vex=$(vexst "$W/v1.json")"
+          cat "$W/vex1.json" | head -c 1500; echo
+          "$BIN" vendor --offline --json > "$W/vendor2.json" 2>&1; R2=$?
+          echo "RESULT autocrlf-revendor $T: exit=$R2 status=$(node -e "console.log(require(process.argv[1]).status)" "$W/vendor2.json") gitdiff=[$(git status --short | tr '\n' ' ')]"
+          head -c 1500 "$W/vendor2.json"; echo
+          "$BIN" vendor --revert --json > "$W/revert.json" 2>&1; RV=$?
+          echo "RESULT autocrlf-revert $T: exit=$RV gitstatus=[$(git status --short | tr '\n' ' ')] diffstat=[$(git diff --stat HEAD~0 | tail -1)]"
+          head -c 1500 "$W/revert.json"; echo
+          echo "::endgroup::"
+
+          echo "::group::agent mode, CRLF manifest + unicode/space path"
+          AG="$W/agent é"; mkdir -p "$AG"; cd "$AG"
+          echo '{"name":"app","version":"1.0.0","private":true,"dependencies":{"left-pad":"1.3.0"}}' > package.json
+          npm install --no-audit --no-fund >/dev/null 2>&1
+          node "$W/stage.js" . pkg:npm/left-pad@1.3.0 node_modules/left-pad
+          node -e "const f='.socket/manifest.json';const fs=require('fs');fs.writeFileSync(f,fs.readFileSync(f,'utf8').replace(/\n/g,'\r\n'))"
+          "$BIN" apply --offline --json > "$W/ap.json" 2>&1; AP=$?
+          "$BIN" vex --offline --output "$W/v2.json" --json > /dev/null 2>&1; VX2=$?
+          "$BIN" rollback --offline --json > "$W/rb.json" 2>&1; RB=$?
+          echo "RESULT agent-crlf $T: apply=$AP vex=$VX2/$(vexst "$W/v2.json") rollback=$RB after_rb=[$(head20 node_modules/left-pad/index.js)]"
+          head -c 800 "$W/ap.json"; echo
+          echo "::endgroup::"
+
+          echo "::group::agent mode --cwd from elsewhere with deep path"
+          D="$W/$(printf 'd%.0s' {1..60})/$(printf 'e%.0s' {1..60})/$(printf 'f%.0s' {1..60})/$(printf 'g%.0s' {1..60})"; mkdir -p "$D"; cd "$D"
+          echo '{"name":"app","version":"1.0.0","private":true,"dependencies":{"left-pad":"1.3.0"}}' > package.json
+          npm install --no-audit --no-fund >/dev/null 2>&1; NI=$?
+          node "$W/stage.js" . pkg:npm/left-pad@1.3.0 node_modules/left-pad
+          cd "$W"
+          "$BIN" vendor --offline --json --cwd "$D" > "$W/vd.json" 2>&1; VD=$?
+          cd "$D"; rm -rf node_modules; npm ci --no-audit --no-fund >/dev/null 2>&1; CI2=$?
+          echo "RESULT deep-vendor $T: pathlen=${#D} install=$NI vendor=$VD ci=$CI2 left-pad=[$(head20 node_modules/left-pad/index.js)]"
+          head -c 800 "$W/vd.json"; echo
+          echo "::endgroup::"
+          exit 0
