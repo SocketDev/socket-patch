@@ -3448,7 +3448,8 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
                 &action,
                 &manifest_path,
                 &patch.purl,
-                args.save_only
+                // An unchanged record ends the run only when no apply follows.
+                apply_lock.is_none()
             )
         );
     }
