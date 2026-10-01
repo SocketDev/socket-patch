@@ -1028,17 +1028,17 @@ mod tests {
                     assert_eq!(
                         bundled_contests(&out),
                         1,
-                        "{mode:?}: {:#?}",
-                        out.diagnostics
+                        "{mode:?}: {:?}",
+                        diag_codes(&out)
                     );
                     assert!(
                         out.diagnostics.iter().any(|d| d.detail.contains(parent)),
-                        "the diagnostic names the copy: {:#?}",
-                        out.diagnostics
+                        "the diagnostic names the copy: {:?}",
+                        diag_codes(&out)
                     );
                 } else {
                     assert_refs(&out, &[(PURL, uuid, mode)]);
-                    assert_eq!(bundled_contests(&out), 0, "{:#?}", out.diagnostics);
+                    assert_eq!(bundled_contests(&out), 0, "{:?}", diag_codes(&out));
                 }
             }
         }

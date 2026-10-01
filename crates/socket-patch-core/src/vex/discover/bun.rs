@@ -680,24 +680,30 @@ mod tests {
         };
 
         // A Socket-wired bundled entry alone (hosted / vendored): not a ref.
-        for spec in [format!("left-pad@{url}"), vendored.clone()] {
+        for (case, spec) in [format!("left-pad@{url}"), vendored.clone()]
+            .into_iter()
+            .enumerate()
+        {
             let p = Project::new();
             p.write("bun.lock", text_lock(1, &[bundled(&spec)]));
             let out = run(&p).await;
             assert_refs(&out, &[]);
-            assert_eq!(bundled_contests(&out), 1, "{spec}: {:#?}", out.diagnostics);
+            assert_eq!(bundled_contests(&out), 1, "wired bundled case {case}");
         }
 
         // A wired regular entry beside a registry bundled copy of the SAME
         // version (hosted and vendored), and beside a wired bundled entry.
-        for (wired, other) in [
+        for (case, (wired, other)) in [
             (format!("left-pad@{url}"), registry_bundled("1.3.0")),
             (vendored.clone(), registry_bundled("1.3.0")),
             (
                 format!("left-pad@{url}"),
                 bundled(&format!("left-pad@{url}")),
             ),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let p = Project::new();
             p.write(
                 "bun.lock",
@@ -705,11 +711,7 @@ mod tests {
             );
             let out = run(&p).await;
             assert_refs(&out, &[]);
-            assert!(
-                bundled_contests(&out) >= 1,
-                "{other}: {:#?}",
-                out.diagnostics
-            );
+            assert!(bundled_contests(&out) >= 1, "contested case {case}");
         }
 
         // A bundled copy of ANOTHER version is a different package.
@@ -726,7 +728,7 @@ mod tests {
         );
         let out = run(&p).await;
         assert_refs(&out, &[(LEFT_PAD, UUID_A, WiringMode::Hosted)]);
-        assert_eq!(bundled_contests(&out), 0, "{:#?}", out.diagnostics);
+        assert_eq!(bundled_contests(&out), 0, "{:?}", diag_codes(&out));
     }
 
     /// Hosted and vendored entries in one lock are all discovered (a mixed
@@ -1175,8 +1177,8 @@ mod tests {
                 out.diagnostics
                     .iter()
                     .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("bundled")),
-                "{shape}: {:#?}",
-                out.diagnostics
+                "{shape}: {:?}",
+                diag_codes(&out)
             );
         }
     }
