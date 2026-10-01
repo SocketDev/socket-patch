@@ -264,6 +264,55 @@ async fn pypi_requirements_hosted_rewrites_pinned_line() {
     });
 }
 
+/// #475: pip resolves `==` under PEP 440, so `requests==2.31` (and
+/// `==2.31.0.0`, `==02.31.0`) installs exactly the patched 2.31.0. The
+/// hosted grant must rewrite each such pin instead of reporting "no entry"
+/// and exiting 0 with the project unpatched.
+#[tokio::test]
+#[serial]
+async fn pypi_requirements_hosted_rewrites_pep440_equivalent_pin() {
+    const UUID: &str = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a2";
+    const PURL: &str = "pkg:pypi/requests@2.31.0";
+    const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let url = format!(
+        "http://patch.test/patch/pypi/requests/2.31.0/{TOKEN}/{UUID}/requests-2.31.0-py3-none-any.whl"
+    );
+
+    for pin in ["requests==2.31", "requests==2.31.0.0", "Requests==02.31.0"] {
+        let server = MockServer::start().await;
+        mock_view(&server, UUID, PURL).await;
+        mock_reference(
+            &server,
+            UUID,
+            PURL,
+            &url,
+            serde_json::json!({ "sha256": SHA256 }),
+            serde_json::Value::Null,
+        )
+        .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("requirements.txt"),
+            format!("flask==2.0.1\n{pin}\n"),
+        )
+        .unwrap();
+
+        let code =
+            socket_patch_cli::commands::get::run(get_hosted_args(UUID, tmp.path(), server.uri()))
+                .await;
+        assert_eq!(code, 0, "{pin}: get <uuid> --mode hosted should succeed");
+
+        let reqs = std::fs::read_to_string(tmp.path().join("requirements.txt")).unwrap();
+        assert_eq!(
+            reqs,
+            format!("flask==2.0.1\nrequests @ {url} --hash=sha256:{SHA256}\n"),
+            "{pin}: the PEP 440-equivalent pin must be redirected"
+        );
+        assert_no_manifest_no_blobs(tmp.path());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // maven — pom.xml fail-closed suffixed-version pin (rewrite_maven_pom)
 // ---------------------------------------------------------------------------
