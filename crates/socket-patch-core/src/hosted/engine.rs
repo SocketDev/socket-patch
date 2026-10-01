@@ -402,6 +402,18 @@ pub async fn read_candidate_files(
         out.read(view, unreadable, name).await;
     }
 
+    // A yarn berry lock is pinned through the root manifest's `resolutions`
+    // (see `patch::redirect::rewrite_yarn_berry`): read `package.json` only
+    // then, so no other npm flavor ever reads or writes it.
+    if candidates.iter().any(|c| c.dep.ecosystem == "npm")
+        && out
+            .files
+            .get("yarn.lock")
+            .is_some_and(|lock| crate::patch::redirect::is_berry_lock(lock))
+    {
+        out.read(view, unreadable, "package.json").await;
+    }
+
     // Cargo workspace members (and in-root path dependencies) declare
     // dependencies of their own: a member's direct `cfg-if = "1"` must be
     // pinned alongside the root's, or the redirected lock entry is

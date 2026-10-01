@@ -142,6 +142,11 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
     if REDIRECT_CANDIDATE_FILES.contains(&rel) || EXTRA_TEXT_FILES.contains(&rel) {
         return Some(Need::Text);
     }
+    // The yarn berry hosted pin routes through the root manifest's
+    // `resolutions`; the engine reads it only beside a `yarn.lock`.
+    if rel == "package.json" && root_files.contains("yarn.lock") {
+        return Some(Need::Text);
+    }
     if PNP_MARKERS.contains(&rel) || rel == "rush.json" {
         return Some(Need::Present);
     }
@@ -423,6 +428,7 @@ pub fn candidate_files() -> Vec<String> {
         "common/config/subspaces/*/pnpm-lock.yaml",
         "*.py.lock",
         "*.py (beside *.py.lock)",
+        "package.json (beside yarn.lock)",
         "pylock.toml",
         "pylock.*.toml",
         "**/Cargo.toml (Cargo workspaces)",

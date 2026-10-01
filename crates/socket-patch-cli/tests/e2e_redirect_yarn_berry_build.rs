@@ -270,6 +270,9 @@ struct BerryRedirectFixture {
     host: String,
     /// `yarn.lock` as the real yarn wrote it, BEFORE the hosted rewrite.
     registry_lock: Vec<u8>,
+    /// The root `package.json` BEFORE the hosted rewrite (#404 option C
+    /// pins through its `resolutions`, so a revert restores both files).
+    registry_pkg: Vec<u8>,
     _server: MockServer,
 }
 
@@ -350,6 +353,7 @@ async fn berry_hosted_project(
     let installed_dir = proj.join("node_modules").join(DEP);
     let orig = std::fs::read(installed_dir.join("index.js")).expect("installed index.js");
     let registry_lock = std::fs::read(proj.join("yarn.lock")).expect("registry yarn.lock");
+    let registry_pkg = std::fs::read(proj.join("package.json")).expect("registry package.json");
     assert!(
         !orig.starts_with(MARKER.as_bytes()),
         "pristine install must not carry the marker"
@@ -560,6 +564,21 @@ async fn berry_hosted_project(
         lock.contains(&format!("\n  resolution: \"{DEP}@{hosted_url}\"")),
         "yarn.lock must pin the hosted tarball locator; got:\n{lock}"
     );
+    // #404 option C: the entry is keyed by the tarball descriptor, and the
+    // root package.json routes the locked descriptor there.
+    assert!(
+        lock.contains(&format!("\n\"{DEP}@{hosted_url}\":\n")),
+        "yarn.lock entry must be keyed by the tarball descriptor; got:\n{lock}"
+    );
+    let root_pkg = std::fs::read_to_string(proj.join("package.json")).unwrap();
+    let root_pkg: serde_json::Value = serde_json::from_str(&root_pkg).unwrap();
+    assert!(
+        root_pkg["resolutions"]
+            .as_object()
+            .is_some_and(|r| r.iter().any(|(sel, v)| sel.starts_with(&format!("{DEP}@npm:"))
+                && v.as_str() == Some(hosted_url.as_str()))),
+        "package.json must route {DEP} to the hosted tarball: {root_pkg}"
+    );
     assert!(
         !lock.contains("__archiveUrl"),
         "the hosted pin must not be an npm: locator; got:\n{lock}"
@@ -587,6 +606,7 @@ async fn berry_hosted_project(
         patched,
         host,
         registry_lock,
+        registry_pkg,
         _server: server,
     })
 }
@@ -633,6 +653,11 @@ fn fresh_checkout_yarn_install(fx: &BerryRedirectFixture) -> (PathBuf, Output) {
             ("YARN_ENABLE_GLOBAL_CACHE", "false"),
             ("YARN_NPM_AUTH_TOKEN", REGISTRY_TOKEN),
             ("YARN_NPM_ALWAYS_AUTH", "true"),
+            // Hardened mode (yarn enables it on its own for public-PR CI)
+            // re-validates every lock resolution against its descriptor; a
+            // tarball locator under an `npm:` key fails it with YN0078 —
+            // why the pin routes through `resolutions` (#404).
+            ("YARN_ENABLE_HARDENED_MODE", "true"),
         ],
     );
     (fresh, ci)
@@ -689,7 +714,10 @@ async fn assert_patch_host_got_no_auth(fx: &BerryRedirectFixture) {
 /// the REAL binary against a mock patch API.
 fn hosted_manifestless_vex_matrix(fx: &BerryRedirectFixture, driver: HostedDriver) {
     let yarnrc = fresh_yarnrc(fx);
-    let registry_state = [("yarn.lock", fx.registry_lock.clone())];
+    let registry_state = [
+        ("yarn.lock", fx.registry_lock.clone()),
+        ("package.json", fx.registry_pkg.clone()),
+    ];
     let yarn =
         |cwd: &Path, args: &[&str], env: &[(&str, &str)]| corepack(cwd, yarn_berry(), args, env);
     let api_url = fx._server.uri();

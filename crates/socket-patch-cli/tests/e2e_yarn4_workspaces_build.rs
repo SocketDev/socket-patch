@@ -556,6 +556,21 @@ async fn yarn4_workspaces_hosted_redirect_rewires_member_dep_from_root_scan() {
         lock.contains(&format!("\n  resolution: \"{DEP}@{hosted_url}\"")),
         "yarn.lock must pin the hosted tarball locator; got:\n{lock}"
     );
+    // #404 option C: the entry is keyed by the tarball descriptor, and the
+    // root package.json routes the locked descriptor there.
+    assert!(
+        lock.contains(&format!("\n\"{DEP}@{hosted_url}\":\n")),
+        "yarn.lock entry must be keyed by the tarball descriptor; got:\n{lock}"
+    );
+    let root_pkg = std::fs::read_to_string(proj.join("package.json")).unwrap();
+    let root_pkg: serde_json::Value = serde_json::from_str(&root_pkg).unwrap();
+    assert!(
+        root_pkg["resolutions"]
+            .as_object()
+            .is_some_and(|r| r.iter().any(|(sel, v)| sel.starts_with(&format!("{DEP}@npm:"))
+                && v.as_str() == Some(hosted_url.as_str()))),
+        "package.json must route {DEP} to the hosted tarball: {root_pkg}"
+    );
     assert!(
         !lock.contains("__archiveUrl"),
         "the hosted pin must not be an npm: locator (#404); got:\n{lock}"
@@ -573,11 +588,15 @@ async fn yarn4_workspaces_hosted_redirect_rewires_member_dep_from_root_scan() {
         lock.contains("\"app@workspace:packages/app\""),
         "the workspace member entry must stay workspace-resolved:\n{lock}"
     );
-    assert_eq!(
-        std::fs::read(proj.join("package.json")).unwrap(),
-        root_pkg_before,
-        "hosted redirect must not touch the root package.json"
-    );
+    // #404 option C: the root package.json gains only the `resolutions` pin
+    // (it is the one yarn reads resolutions from); the member is untouched.
+    {
+        let mut after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(proj.join("package.json")).unwrap()).unwrap();
+        let before: serde_json::Value = serde_json::from_slice(&root_pkg_before).unwrap();
+        after.as_object_mut().unwrap().shift_remove("resolutions");
+        assert_eq!(after, before, "the hosted pin only adds `resolutions` to the root package.json");
+    }
     assert_eq!(
         std::fs::read(proj.join("packages/app/package.json")).unwrap(),
         member_pkg_before,
@@ -610,7 +629,7 @@ async fn yarn4_workspaces_hosted_redirect_rewires_member_dep_from_root_scan() {
     eprintln!("FRESH INSTALL + MEMBER RESOLUTION OK");
 
     // MANIFEST-LESS VEX over the hosted wiring (see `yarn_berry_common`).
-    let registry_state = [("yarn.lock", registry_lock)];
+    let registry_state = [("yarn.lock", registry_lock), ("package.json", root_pkg_before.clone())];
     let yarn =
         |cwd: &Path, args: &[&str], env: &[(&str, &str)]| corepack(cwd, yarn_berry(), args, env);
     let api_url = server.uri();

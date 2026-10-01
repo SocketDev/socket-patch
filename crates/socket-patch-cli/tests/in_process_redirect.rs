@@ -729,9 +729,18 @@ async fn scan_redirect_rewrites_yarn_berry_lock() {
         lock.contains(BERRY_CHECKSUM),
         "checksum must be the yarnBerry10c0"
     );
+    // Option C (#404): the entry is re-keyed by the tarball descriptor, and
+    // the root package.json routes the original descriptor there.
     assert!(
-        lock.contains(&format!("\"{NAME}@npm:^{VERSION}\":")),
-        "the descriptor key must be preserved verbatim; got:\n{lock}"
+        lock.contains(&format!("\"{NAME}@{HOSTED_URL}\":")),
+        "the entry is keyed by the tarball descriptor; got:\n{lock}"
+    );
+    let pkg = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
+    let pkg: serde_json::Value = serde_json::from_str(&pkg).unwrap();
+    assert_eq!(
+        pkg["resolutions"],
+        serde_json::json!({ format!("{NAME}@npm:^{VERSION}"): HOSTED_URL }),
+        "{pkg}"
     );
     vlt_hosted_common::assert_no_ledger(tmp.path());
 
@@ -841,6 +850,13 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
             ),
             "{label}: rollback restores the pristine CRLF lock (upstream checksum \
              re-derived from the registry tarball)"
+        );
+        let pkg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.path().join("package.json")).unwrap())
+                .unwrap();
+        assert!(
+            pkg.get("resolutions").is_none(),
+            "{label}: rollback drops the resolutions pin: {pkg}"
         );
         vlt_hosted_common::assert_no_ledger(tmp.path());
     }
