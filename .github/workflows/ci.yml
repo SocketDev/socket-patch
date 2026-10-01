@@ -284,25 +284,49 @@ jobs:
           cache: false
 
       - name: Install vexctl
-        # `go install` puts the binary in $(go env GOPATH)/bin; surface
-        # that path to subsequent steps so `Command::new("vexctl")` in
-        # the test resolves. Pinned to a tagged release rather than
-        # @latest for reproducibility.
+        # Linux / Windows: the v0.3.0 release binary, checked against the
+        # sha256 pinned here (from the release's vexctl_checksums.txt).
+        # Compiling it took ~80s on ubuntu and ~180s on windows, the
+        # slowest job in this workflow.
         #
-        # Retried: the install compiles sigstore/cosign, whose module
-        # verification reads dozens of sum.golang.org checksum tiles, and
-        # transient INTERNAL_ERROR stream resets there have failed this
-        # step on otherwise-green runs (2026-08-20: two attempts ~18 min
-        # apart, different modules each time — an upstream incident, not
-        # one bad tile). The backoff rides out short resets; a persistent
-        # outage still fails loudly on the last attempt. Follow-up option
-        # if this recurs: install the pinned release BINARY (sha256-pinned)
-        # instead of compiling, which sidesteps module verification and
-        # drops ~100s of compile time per leg.
+        # macOS still compiles: the release's darwin binaries are built
+        # with go1.22.7 and have no LC_UUID, so the runner's dyld refuses
+        # them (see the Go step above). The compile is retried: it builds
+        # sigstore/cosign, whose module verification reads dozens of
+        # sum.golang.org checksum tiles, and transient INTERNAL_ERROR
+        # stream resets there have failed this step on otherwise-green
+        # runs (2026-08-20: two attempts ~18 min apart, different modules
+        # each time — an upstream incident, not one bad tile). The backoff
+        # rides out short resets; a persistent outage still fails loudly
+        # on the last attempt.
+        #
+        # Either way the binary's directory goes on PATH so
+        # `Command::new("vexctl")` in the tests resolves.
         shell: bash
+        env:
+          VEXCTL_VERSION: v0.3.0
+          VEXCTL_SHA256_LINUX_AMD64: cd7f8b57d20642166ed4eb3dd1fd849bbb30bbd7c5b9f5b0316b6003b57ceaba
+          VEXCTL_SHA256_WINDOWS_AMD64: 346fb3104b656fe1a407cbae88ea29a636b36f4569ec58a5a8dadca7343993ed
         run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            Linux) asset=vexctl-linux-amd64 bin=vexctl sha="$VEXCTL_SHA256_LINUX_AMD64" ;;
+            Windows) asset=vexctl-windows-amd64.exe bin=vexctl.exe sha="$VEXCTL_SHA256_WINDOWS_AMD64" ;;
+            *) asset='' ;;
+          esac
+          if [ -n "$asset" ]; then
+            dir="$RUNNER_TEMP/vexctl-bin"
+            mkdir -p "$dir"
+            curl -fsSL --retry 5 --retry-all-errors -o "$dir/$bin" \
+              "https://github.com/openvex/vexctl/releases/download/$VEXCTL_VERSION/$asset"
+            echo "$sha  $dir/$bin" | sha256sum -c -
+            chmod +x "$dir/$bin"
+            "$dir/$bin" version
+            echo "$dir" >> "$GITHUB_PATH"
+            exit 0
+          fi
           for attempt in 1 2 3 4 5; do
-            if go install github.com/openvex/vexctl@v0.3.0; then
+            if go install "github.com/openvex/vexctl@$VEXCTL_VERSION"; then
               break
             fi
             if [ "$attempt" = 5 ]; then
