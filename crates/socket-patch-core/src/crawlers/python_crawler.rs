@@ -266,11 +266,11 @@ async fn find_site_packages_under(
 ///
 /// Checks (in order):
 /// 1. `VIRTUAL_ENV` environment variable
-/// 2. `.venv` and `venv` directories in `cwd`
-/// 3. Poetry's out-of-tree virtualenv(s) for a Poetry project (see
-///    [`find_poetry_virtualenv_site_packages`])
-/// 4. Pipenv's out-of-tree virtualenv for a Pipenv project (see
-///    [`find_pipenv_virtualenv_site_packages`])
+/// 2. Poetry's out-of-tree virtualenv(s), when Poetry itself would not use
+///    `./.venv` for the project (see [`find_poetry_virtualenv_site_packages`])
+/// 3. `.venv` directory in `cwd`
+/// 4. `venv` directory in `cwd`
+/// 5. Pipenv's out-of-tree virtualenv
 pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     let mut results = Vec::new();
 
@@ -284,18 +284,26 @@ pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
         }
     }
 
-    // 2. Check .venv and venv in cwd
+    // 2. Poetry decides for itself whether `./.venv` is the project's env
+    // (`EnvManager.use_in_project_venv`): an explicit `virtualenvs.in-project`
+    // wins, and only when it is unset does an existing `./.venv` count. When
+    // Poetry would NOT use `./.venv` (`in-project = false`, or no `.venv` at
+    // all), its out-of-tree env is probed first so a stray `.venv` / `venv`
+    // left by another tool does not shadow the env Poetry installed into.
+    let poetry = load_poetry_project(cwd).await;
+    let var = |name: &str| std::env::var(name).ok();
+    if let Some(project) = poetry.as_ref().filter(|p| !p.uses_in_project_venv(cwd)) {
+        let found = poetry_virtualenv_site_packages(cwd, project, &var).await;
+        if !found.is_empty() {
+            return found;
+        }
+    }
+
+    // 3. Check .venv and venv in cwd
     for venv_dir in &[".venv", "venv"] {
         let venv_path = cwd.join(venv_dir);
         let matches = find_site_packages_under(&venv_path, "site-packages").await;
         results.extend(matches);
-    }
-
-    // 3. Poetry keeps its virtualenv OUTSIDE the project by default, so a plain
-    // `poetry install` leaves nothing above to find; without this probe the
-    // crawl would fall through to the global interpreter.
-    if results.is_empty() {
-        results.extend(find_poetry_virtualenv_site_packages(cwd).await);
     }
 
     // 4. Pipenv keeps its virtualenv OUTSIDE the project by default
@@ -480,42 +488,74 @@ fn poetry_env_name_prefix(project_name: &str, normalized_cwd: &str) -> String {
 }
 
 /// `os.path.normcase(os.path.realpath(cwd))` as Poetry hashes it: symlinks
-/// resolved; on Windows lowercased with forward slashes turned into
-/// backslashes, elsewhere unchanged.
+/// resolved; on Windows see [`windows_normcase`], elsewhere unchanged.
 fn poetry_normalized_cwd(cwd: &Path) -> String {
     let real = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let text = real.to_string_lossy().into_owned();
     if cfg!(windows) {
-        text.replace('/', "\\").to_lowercase()
+        windows_normcase(&text)
     } else {
         text
     }
 }
 
-/// The project name Poetry derives its virtualenv name from: `[tool.poetry]
-/// name`, else PEP 621 `[project] name`. Poetry canonicalizes it (PEP 503) —
-/// both spellings are returned so a lock written before that normalization
-/// still matches.
+/// Python's Windows `normcase(realpath(p))` for a path Rust canonicalized:
+/// `realpath` drops the verbatim `\\?\` prefix that `std::fs::canonicalize`
+/// adds (`\\?\UNC\server` becomes `\\server`), and `normcase` lowercases
+/// and turns `/` into `\`. Hashing the verbatim form made every Windows
+/// env-name hash miss.
+fn windows_normcase(text: &str) -> String {
+    strip_windows_verbatim_prefix(text)
+        .replace('/', "\\")
+        .to_lowercase()
+}
+
+/// `\\?\C:\x` -> `C:\x`, `\\?\UNC\srv\share` -> `\\srv\share`; anything
+/// else unchanged.
+fn strip_windows_verbatim_prefix(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+/// The project names Poetry may have derived the virtualenv name from, in
+/// the order Poetry picks them. poetry-core 2.x takes `[project] name`, then
+/// `[tool.poetry] name`, then `"non-package-mode"`. poetry-core 1.9 (Poetry
+/// 1.8) ignores `[project]` and takes `[tool.poetry] name`, then
+/// `"non-package-mode"`. Poetry canonicalizes the name (PEP 503); the raw
+/// spelling follows each canonical one so a venv made before that
+/// normalization still matches. Empty only when the file does not parse.
 fn poetry_project_names(pyproject: &str) -> Vec<String> {
     let Ok(doc) = pyproject.parse::<toml_edit::DocumentMut>() else {
         return Vec::new();
     };
-    let raw = doc
+    let project_name = doc
+        .get("project")
+        .and_then(|p| p.get("name"))
+        .and_then(toml_edit::Item::as_str);
+    let poetry_name = doc
         .get("tool")
         .and_then(|t| t.get("poetry"))
         .and_then(|p| p.get("name"))
-        .and_then(toml_edit::Item::as_str)
-        .or_else(|| {
-            doc.get("project")
-                .and_then(|p| p.get("name"))
-                .and_then(toml_edit::Item::as_str)
-        });
-    let Some(raw) = raw else {
-        return Vec::new();
+        .and_then(toml_edit::Item::as_str);
+    let mut names: Vec<String> = Vec::new();
+    let mut push = |raw: &str| {
+        for name in [canonicalize_pypi_name(raw), raw.to_string()] {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
     };
-    let mut names = vec![canonicalize_pypi_name(raw)];
-    if !names.contains(&raw.to_string()) {
-        names.push(raw.to_string());
+    project_name.into_iter().for_each(&mut push);
+    match poetry_name {
+        Some(name) => push(name),
+        // Poetry 2 with no name at all, or Poetry 1.8 with only a
+        // `[project] name`, both fall back to this placeholder.
+        None => push("non-package-mode"),
     }
     names
 }
@@ -574,19 +614,46 @@ fn expand_home(raw: &str, var: &impl Fn(&str) -> Option<String>) -> PathBuf {
 /// executed, no `poetry` binary is needed.
 pub async fn find_poetry_virtualenv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     let var = |name: &str| std::env::var(name).ok();
+    match load_poetry_project(cwd).await {
+        Some(project) => poetry_virtualenv_site_packages(cwd, &project, &var).await,
+        None => Vec::new(),
+    }
+}
+
+/// What venv discovery needs to know about a Poetry project: the candidate
+/// env names and the layered `virtualenvs.*` configuration.
+struct PoetryProject {
+    names: Vec<String>,
+    config: PoetryVirtualenvConfig,
+}
+
+impl PoetryProject {
+    /// Poetry's `EnvManager.use_in_project_venv`: an explicit
+    /// `virtualenvs.in-project` decides; unset means "if `./.venv` is a
+    /// directory".
+    fn uses_in_project_venv(&self, cwd: &Path) -> bool {
+        self.config
+            .in_project
+            .unwrap_or_else(|| cwd.join(".venv").is_dir())
+    }
+}
+
+/// `None` for a non-Poetry project (no `poetry.lock`, `poetry.toml` or
+/// `[tool.poetry`) or an unreadable / unparseable `pyproject.toml`.
+async fn load_poetry_project(cwd: &Path) -> Option<PoetryProject> {
+    let var = |name: &str| std::env::var(name).ok();
     let has = |leaf: &str| cwd.join(leaf).is_file();
-    let pyproject = match read_regular_to_string(&cwd.join("pyproject.toml")).await {
-        Ok(text) => text,
-        Err(_) => return Vec::new(),
-    };
+    let pyproject = read_regular_to_string(&cwd.join("pyproject.toml"))
+        .await
+        .ok()?;
     let poetry_project =
         has("poetry.lock") || has("poetry.toml") || pyproject.contains("[tool.poetry");
     if !poetry_project {
-        return Vec::new();
+        return None;
     }
     let names = poetry_project_names(&pyproject);
     if names.is_empty() {
-        return Vec::new();
+        return None;
     }
     let local = match read_regular_to_string(&cwd.join("poetry.toml")).await {
         Ok(text) => PoetryVirtualenvConfig::from_toml(&text),
@@ -600,27 +667,42 @@ pub async fn find_poetry_virtualenv_site_packages(cwd: &Path) -> Vec<PathBuf> {
         None => PoetryVirtualenvConfig::default(),
     };
     let config = PoetryVirtualenvConfig::from_env(var).or(local).or(user);
-    let Some(root) = poetry_virtualenvs_root(cwd, &config, &var) else {
+    Some(PoetryProject { names, config })
+}
+
+/// The out-of-tree venvs for `project`, taking the first candidate name (in
+/// Poetry's precedence order) that has at least one `<name>-<hash>-py*` dir.
+async fn poetry_virtualenv_site_packages(
+    cwd: &Path,
+    project: &PoetryProject,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    let Some(root) = poetry_virtualenvs_root(cwd, &project.config, var) else {
         return Vec::new();
     };
-    let normalized = poetry_normalized_cwd(cwd);
-    let prefixes: Vec<String> = names
-        .iter()
-        .map(|name| format!("{}-py", poetry_env_name_prefix(name, &normalized)))
-        .collect();
     let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
         return Vec::new();
     };
-    let mut venvs = Vec::new();
+    let mut dir_names = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if prefixes.iter().any(|prefix| name.starts_with(prefix)) {
-            venvs.push(entry.path());
+        if let Some(name) = entry.file_name().to_str() {
+            dir_names.push(name.to_string());
         }
     }
+    let normalized = poetry_normalized_cwd(cwd);
+    let mut venvs: Vec<PathBuf> = project
+        .names
+        .iter()
+        .map(|name| format!("{}-py", poetry_env_name_prefix(name, &normalized)))
+        .map(|prefix| {
+            dir_names
+                .iter()
+                .filter(|dir| dir.starts_with(&prefix))
+                .map(|dir| root.join(dir))
+                .collect::<Vec<_>>()
+        })
+        .find(|found| !found.is_empty())
+        .unwrap_or_default();
     venvs.sort();
     let mut results = Vec::new();
     for venv in venvs {
@@ -872,11 +954,7 @@ fn pipenv_venv_hash(pipfile_location: &str) -> String {
 fn pipenv_path_string(path: &Path) -> String {
     let mut text = path.to_string_lossy().into_owned();
     if cfg!(windows) {
-        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-            text = format!(r"\\{rest}");
-        } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-            text = rest.to_string();
-        }
+        text = strip_windows_verbatim_prefix(&text);
         let mut chars: Vec<char> = text.chars().collect();
         if chars.len() >= 2 && chars[1] == ':' && chars[0].is_ascii_lowercase() {
             chars[0] = chars[0].to_ascii_uppercase();
@@ -1965,22 +2043,69 @@ mod tests {
         assert_eq!(prefix.rsplit_once('-').unwrap().1.len(), 8);
     }
 
+    /// poetry-core 2.x: `[project] name`, then `[tool.poetry] name`, then
+    /// `"non-package-mode"` (#327 cases 1 and 2). The `[tool.poetry]` /
+    /// placeholder candidates stay in the list for Poetry 1.8, which ignores
+    /// `[project]`.
     #[test]
-    fn poetry_project_names_prefer_tool_poetry_and_return_both_spellings() {
+    fn poetry_project_names_follow_poetry_core_precedence() {
         assert_eq!(
             poetry_project_names(
                 "[tool.poetry]\nname = \"Flask_Login\"\n[project]\nname = \"other\"\n"
             ),
+            vec![
+                "other".to_string(),
+                "flask-login".to_string(),
+                "Flask_Login".to_string()
+            ]
+        );
+        assert_eq!(
+            poetry_project_names("[tool.poetry]\nname = \"Flask_Login\"\n"),
             vec!["flask-login".to_string(), "Flask_Login".to_string()]
         );
         assert_eq!(
             poetry_project_names(
                 "[project]\nname = \"my-app\"\n[tool.poetry]\npackage-mode = false\n"
             ),
-            vec!["my-app".to_string()]
+            vec!["my-app".to_string(), "non-package-mode".to_string()]
         );
-        assert!(poetry_project_names("[tool.poetry]\nversion = \"1\"\n").is_empty());
+        assert_eq!(
+            poetry_project_names("[tool.poetry]\npackage-mode = false\n"),
+            vec!["non-package-mode".to_string()]
+        );
         assert!(poetry_project_names("not toml [").is_empty());
+    }
+
+    /// Known answers from CPython's `ntpath.normcase` and Poetry's
+    /// `generate_env_name`: the verbatim `\\?\` prefix `canonicalize` adds on
+    /// Windows must not reach the hash (#329).
+    #[test]
+    fn windows_normcase_drops_the_verbatim_prefix_like_python_realpath() {
+        let local = r"\\?\C:\Users\RunnerAdmin\AppData\Local\Temp\agent-named";
+        assert_eq!(
+            windows_normcase(local),
+            r"c:\users\runneradmin\appdata\local\temp\agent-named"
+        );
+        assert_eq!(
+            poetry_env_name_prefix("probe-named", &windows_normcase(local)),
+            "probe-named-vC9KVdIy"
+        );
+        let unc = r"\\?\UNC\Server\Share\Proj";
+        assert_eq!(windows_normcase(unc), r"\\server\share\proj");
+        assert_eq!(
+            poetry_env_name_prefix("probe-named", &windows_normcase(unc)),
+            "probe-named-KJ5ISM87"
+        );
+        assert_eq!(windows_normcase("C:/Work/Proj"), r"c:\work\proj");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn poetry_normalized_cwd_has_no_verbatim_prefix_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let normalized = poetry_normalized_cwd(tmp.path());
+        assert!(!normalized.starts_with(r"\\?\"), "{normalized}");
+        assert_eq!(normalized, normalized.to_lowercase());
     }
 
     #[test]
@@ -2150,6 +2275,83 @@ mod tests {
         .unwrap();
         assert!(find_local_venv_site_packages(&project).await.is_empty());
         std::fs::remove_file(project.join("poetry.toml")).unwrap();
+
+        // #327 case 3: an explicit `in-project = false` means Poetry never
+        // uses `./.venv`, even when one exists; the stray `.venv` loses.
+        std::fs::create_dir_all(site(&project.join(".venv"), "3.12")).unwrap();
+        std::fs::write(
+            project.join("poetry.toml"),
+            "[virtualenvs]\nin-project = false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages(&project).await,
+            vec![site(&venv311, "3.11"), site(&venv312, "3.12")]
+        );
+        std::fs::remove_file(project.join("poetry.toml")).unwrap();
+        std::fs::remove_dir_all(project.join(".venv")).unwrap();
+
+        // Poetry never looks at `./venv`: with no `./.venv` its out-of-tree
+        // env is still the one it installed into.
+        std::fs::create_dir_all(site(&project.join("venv"), "3.12")).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages(&project).await,
+            vec![site(&venv311, "3.11"), site(&venv312, "3.12")]
+        );
+        // ...but a `./venv` still serves when Poetry has no env at all.
+        let venv_only = tmp.path().join("venv-only");
+        std::fs::create_dir_all(site(&venv_only.join("venv"), "3.12")).unwrap();
+        std::fs::write(
+            venv_only.join("pyproject.toml"),
+            "[tool.poetry]\nname = \"venv-only\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages(&venv_only).await,
+            vec![site(&venv_only.join("venv"), "3.12")]
+        );
+        std::fs::remove_dir_all(project.join("venv")).unwrap();
+
+        // #327 case 1: a nameless `package-mode = false` project. Poetry
+        // names its env `non-package-mode-<hash>-py<X.Y>`.
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[tool.poetry]\npackage-mode = false\n",
+        )
+        .unwrap();
+        let nameless = venvs.join(format!(
+            "{}-py3.12",
+            poetry_env_name_prefix("non-package-mode", &poetry_normalized_cwd(&project))
+        ));
+        std::fs::create_dir_all(site(&nameless, "3.12")).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages(&project).await,
+            vec![site(&nameless, "3.12")]
+        );
+
+        // #327 case 2: Poetry 2 names the env after `[project] name` when both
+        // tables carry one, even though `[tool.poetry] name` has a venv too.
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"pep-name\"\n[tool.poetry]\nname = \"poetry-patch-fixture\"\n",
+        )
+        .unwrap();
+        let pep = venvs.join(format!(
+            "{}-py3.12",
+            poetry_env_name_prefix("pep-name", &poetry_normalized_cwd(&project))
+        ));
+        std::fs::create_dir_all(site(&pep, "3.12")).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages(&project).await,
+            vec![site(&pep, "3.12")]
+        );
+        // With only the legacy-named env on disk (Poetry 1.8 ignores
+        // `[project]`), that one is found.
+        std::fs::remove_dir_all(&pep).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages(&project).await,
+            vec![site(&venv311, "3.11"), site(&venv312, "3.12")]
+        );
 
         // Not a Poetry project (no lock, no [tool.poetry]): untouched.
         std::fs::write(
