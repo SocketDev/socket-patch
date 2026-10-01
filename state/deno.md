@@ -6,12 +6,12 @@ Method: real Deno binaries (GitHub release zips; `denoland/setup-deno` in probes
 
 ## Coverage matrix
 
-| OS | Deno | Agent: direct npm dep (incl. scoped, alias, workspace member) | Agent: transitive npm dep (`node_modules/.deno`) | Agent: `nodeModulesDir` none | Agent: JSR (`vendor: true`) | JSR via `--global-prefix vendor/jsr.io` | vendored refusal | hosted (npm deps) | VEX |
+| OS | Deno | Agent: direct npm dep (incl. scoped, alias, workspace member) | Agent: transitive npm dep (`node_modules/.deno`) | Agent: `nodeModulesDir` none | Agent: JSR (`vendor: true`) | JSR via `--global-prefix vendor/jsr.io` | vendored refusal | hosted / vendored (npm deps via package-lock.json) | VEX |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 1.46.3 | pass | fail #373 | known limitation | fail #374 | pass | untested | untested | pass (agent) |
+| Linux | 1.46.3 | pass | fail #373 | known limitation | fail #374 | pass | untested | hosted fail #406 | pass (agent), fail #406 (hosted) |
 | Linux | 2.0.6 | pass (run 1) | fail #373 | known limitation | fail #374 | untested | untested | untested | untested |
-| Linux | 2.2.15 | pass | fail #373 | known limitation | fail #374 | pass | untested | fail #406 (package-lock + deno.lock) | fail #406 |
-| Linux | 2.9.6 | pass | fail #373 (also `--prune` drops records) | known limitation | fail #374 | pass | pass (`vendor_unsupported_ecosystem`, npm fails closed) | fail #406 | pass (agent), fail #406 (hosted) |
+| Linux | 2.2.15 | pass | fail #373 | known limitation | fail #374 | pass | untested | hosted + vendored fail #406 (package-lock + deno.lock) | fail #406 |
+| Linux | 2.9.6 | pass | fail #373 (also `--prune` drops records) | known limitation | fail #374 | pass (scan + apply; unsafe with npm deps, see #374) | pass for `pkg:jsr` (`vendor_unsupported_ecosystem`) | hosted + vendored fail #406 | pass (agent), fail #406 (hosted) |
 | macOS | 1.46.3 / 2.2.15 / 2.9.6 | pass (scoped; apply / vex / rollback) | fail #373 | untested | fail #374 | pass | untested | untested | pass (agent) |
 | Windows | 1.46.3 / 2.2.15 / 2.9.6 | pass (scoped via junctions; apply / vex / rollback) | fail #373 | untested | fail #374 | pass | untested | untested | pass (agent) |
 
@@ -20,7 +20,7 @@ Other passes (Linux): re-apply idempotency, rollback, `remove`, breaking cache h
 ## Backlog
 
 0. A maintainer needs to delete the stale probe branches `bughunt/deno/20260930-deno-store` and `bughunt/deno/20261001-scoped-jsr`. The git proxy refuses `push --delete`.
-1. #406 follow-ups: Deno 1.46.3 with package.json; pnpm-lock / yarn.lock / bun.lock beside deno.lock; vendored takeover in a mixed project.
+1. #406 follow-ups: pnpm-lock / yarn.lock / bun.lock beside deno.lock. Done: Deno 1.46.3 (affected) and vendored (affected, and VEX survives the install).
 2. `.deno` peer-variant and scoped transitive entries, once #373 is fixed.
 3. Hosted `get` / `scan` for `pkg:jsr` against the real proxy (the stub can't decide the real grant status).
 4. `nodeModulesDir: none`: deno.lock as a lockfile supplement (enhancement).
