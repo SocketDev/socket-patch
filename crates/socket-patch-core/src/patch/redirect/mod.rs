@@ -259,7 +259,12 @@ pub struct RewriteResult {
     /// skipped (Bun's `bundled` entries/records, #469): that copy is
     /// unpacked from its parent's tarball and stays unpatched, so a
     /// confirmation of the uuid must never stand in for the installed tree
-    /// (in-run VEX verifies it instead).
+    /// (in-run VEX verifies it instead). Left out of the golden digests
+    /// while empty, so the blessed oracle outputs predating it still hold.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
     pub bundled_skipped_uuids: std::collections::BTreeSet<String>,
     /// [`vlt::vlt_drives`] over the rewriter's input files and the
     /// caller's `bun_lockb_present`.
