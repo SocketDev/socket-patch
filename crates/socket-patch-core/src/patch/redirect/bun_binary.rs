@@ -109,6 +109,9 @@ pub fn rewrite_bun_binary(content: &[u8], overrides: &[DepOverride], result: &mu
             }
             Ok::<_, String>((edits, wired))
         })();
+        if !skipped.is_empty() {
+            result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+        }
         result.warnings.append(&mut skipped);
         match attempt {
             Ok((_, false)) => {}
@@ -199,6 +202,7 @@ mod tests {
             result.warnings
         );
         assert!(result.warnings[0].detail.contains("UNPATCHED"));
+        assert!(result.bundled_skipped_uuids.contains("7.0.0"));
 
         let both = bundled_fixture("both");
         let mut result = RewriteResult::default();
@@ -212,6 +216,7 @@ mod tests {
             "{:?}",
             result.warnings
         );
+        assert!(result.bundled_skipped_uuids.contains("7.0.0"));
     }
 
     #[test]

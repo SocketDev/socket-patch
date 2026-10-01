@@ -255,6 +255,12 @@ pub struct RewriteResult {
     /// Patch uuids with a same-`name@version` vlt node under a named alias,
     /// a scoped registry or jsr, which hosted mode leaves unpatched.
     pub vlt_foreign_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids with a same-`name@version` bundled instance the rewriter
+    /// skipped (Bun's `bundled` entries/records, #469): that copy is
+    /// unpacked from its parent's tarball and stays unpatched, so a
+    /// confirmation of the uuid must never stand in for the installed tree
+    /// (in-run VEX verifies it instead).
+    pub bundled_skipped_uuids: std::collections::BTreeSet<String>,
     /// [`vlt::vlt_drives`] over the rewriter's input files and the
     /// caller's `bun_lockb_present`.
     pub vlt_drives: bool,
@@ -524,6 +530,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         confirmed_vlt_uuids,
         refused_vlt_uuids,
         vlt_foreign_uuids,
+        bundled_skipped_uuids,
         vlt_drives: _,
     } = delta;
     result.files.extend(files);
@@ -555,6 +562,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.confirmed_vlt_uuids.extend(confirmed_vlt_uuids);
     result.refused_vlt_uuids.extend(refused_vlt_uuids);
     result.vlt_foreign_uuids.extend(vlt_foreign_uuids);
+    result.bundled_skipped_uuids.extend(bundled_skipped_uuids);
 }
 
 /// [`rewrite_groups_serial`], with the groups run concurrently under
@@ -3684,6 +3692,7 @@ fn rewrite_bun_lock(
                     || is_prior_hosted_bun_spec(&spec, &fname, &dep.artifact_url))
             {
                 matched_any = true;
+                result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
                 result.warnings.push(RewriteWarning {
                     code: "redirect_bun_bundled_instance_skipped".into(),
                     detail: format!(
@@ -8442,6 +8451,7 @@ mod tests {
             "{}",
             r.warnings[0].detail
         );
+        assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
 
         // Both: only the regular entry is rewired; the bundled line keeps
         // its registry bytes.
