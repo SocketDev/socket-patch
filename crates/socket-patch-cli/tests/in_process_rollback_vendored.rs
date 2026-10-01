@@ -24,13 +24,22 @@
 //! `--offline` INTO the env, which every test here wants anyway), so none
 //! need `#[serial]` — each runs in its own tempdir.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
+async fn vendor_run(mut args: VendorArgs) -> i32 {
+    let server = prebuilt_common::Server::project(&args.common.cwd);
+    server.configure(&mut args.common);
+    actual_vendor_run(args).await
+}
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{json, Value};
 use socket_patch_cli::args::GlobalArgs;
 use socket_patch_cli::commands::rollback::{run as rollback_run, RollbackArgs};
-use socket_patch_cli::commands::vendor::{run as vendor_run, VendorArgs};
+use socket_patch_cli::commands::vendor::{run as actual_vendor_run, VendorArgs};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
 #[path = "vex_e2e_common/mod.rs"]
@@ -187,13 +196,15 @@ fn vendor_args(cwd: &Path) -> VendorArgs {
             cwd: cwd.to_path_buf(),
             json: true,
             silent: true,
-            offline: true,
+            offline: false,
             // Absorb the fork→exec OFD-lock window (see in_process_vendor.rs).
             lock_timeout: Some(5),
             ..GlobalArgs::default()
         },
         force: false,
         revert: false,
+        check: false,
+        local_repo: None,
         vex: Default::default(),
     }
 }
@@ -211,7 +222,6 @@ fn rollback_args(cwd: &Path, preserve_state: bool) -> RollbackArgs {
             lock_timeout: Some(5),
             ..GlobalArgs::default()
         },
-        one_off: false,
         preserve_state,
     }
 }

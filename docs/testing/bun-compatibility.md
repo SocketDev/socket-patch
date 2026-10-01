@@ -23,12 +23,12 @@ does not list as lagging — the cases authored Rust-first here lag until
 `bun.ts` is ported, see [depscan TS parity](#depscan-ts-parity); refusal
 fixtures pin their warning code through `expected-warnings.json`) and by
 hermetic CLI suites that
-need no Bun binary (`tests/in_process_vendor_bun.rs`,
+need no Bun binary (`tests/vendor/in_process_vendor_bun.rs`,
 `tests/in_process_vendor_bun_takeover.rs`, the bun cases of
 `tests/in_process_redirect.rs`, `tests/covgap_commands_scan_hosted.rs`,
 `tests/covgap_commands_scan_mod.rs`, `tests/covgap_commands_rollback.rs`,
-`tests/scan_vendor_e2e.rs`, `tests/get_modes_e2e.rs`,
-`tests/repair_vendor_flavors_e2e.rs`). The
+`tests/scan_vendor_e2e.rs`, `tests/get/get_modes_e2e.rs`,
+`tests/repair/repair_vendor_flavors_e2e.rs`). The
 [machine contract](../../crates/socket-patch-cli/CLI_CONTRACT.md) is the
 authority on envelopes and codes; this page is the measured matrix behind it.
 See the [ecosystem matrix](../ecosystems.md#mode--ecosystem-matrix) for the
@@ -42,7 +42,7 @@ other npm lockfile flavors.
 | Version-0 lock (Bun 1.1.39–1.1.45 `--save-text-lockfile`) with `workspace:` packages — 2-tuple entries `"consumer": ["consumer@workspace:packages/consumer", { "dependencies": { … } }]` | Refused `redirect_bun_workspace_unsupported`, lock untouched, exit 0. Remedy: delete `bun.lock` and re-lock with Bun ≥ 1.2 (writes lockfileVersion 1, which hosted mode accepts; 2 on Bun ≥ 1.4). A plain in-place `bun install` bumps the version only when a workspace depends on another workspace (root → member — the matrix's `workspace` shape, the only shape it was measured on); otherwise Bun 1.2.0 keeps version 0 and 1.2.23+ fail to resolve (see [In-place re-versioning](#installer-boundaries-measured)). | Refused `vendor_bun_workspace_unsupported` (pre-version-2 policy, next row); its remedy tail for a version-0 lock says to re-lock with Bun ≥ 1.2 before trying `--mode hosted`, which refuses version 0 too. | Works. |
 | Version-1 lock (Bun 1.2–1.3 default) with `workspace:` packages — 1-tuple entries `["consumer@workspace:packages/consumer"]` | Rewritten (golden `lock-v1-workspace`; matrix 1.2.0–1.3.14 `workspace` / `workspace-nested`). | Refused `vendor_bun_workspace_unsupported` before any write. Policy, not a grammar limit: Bun 1.2.x–1.3.x resolve a workspace member's local-tarball path relative to the MEMBER (our root-relative tuple ENOENTs on `bun install`), 1.4.x relative to the lockfile, and a committed lockfileVersion-2 lock is the only proof that every consumer runs Bun ≥ 1.4 (1.3.x cannot parse v2). A deliberate over-approximation: a package declared only by the workspace ROOT vendors and installs on v1 too, but the lock cannot cheaply prove which workspace declares a hoisted entry. Remedy in the detail: delete `bun.lock`, re-run `bun install` with Bun ≥ 1.4 (an in-place `bun install` keeps the existing version), or — version 1 — use `--mode hosted`, which accepts version-1 workspace locks (a version-0 lock is told to re-lock with Bun ≥ 1.2 first). NOT refused: purls the vendor ledger wires at the selected uuid, purls whose every matching lock tuple already points into `.socket/vendor/npm/` (any uuid — a superseding patch re-pins in place; the lock-derived rule the engine uses), in-sync re-runs and `repair` rebuilds. `vendor` and the vendor step run the same preflight BEFORE a hosted → vendored takeover's revert, so a hosted-redirected purl on such a lock stays hosted-patched (`failed vendor_bun_workspace_unsupported`, lock and ledgers untouched; `vendor --dry-run` previews the same code). A `.socket/vendor/state.json` the preflight cannot read is `vendor_state_unreadable`, fail-closed. | Works. |
 | Version-2 lock (Bun 1.4+) with `workspace:` packages, nested versions included | Rewritten (golden `lock-v2-workspace-nested` — provenance: its nested same-version `consumer/left-pad` entry is a synthetic, grammar-valid extension of the 1.4.2 capture; bun hoists identical resolutions and never writes that entry itself, but bun 1.4.2 installs the fixture unchanged, and it is the only case pinning the rewrite of every matching tuple in one lock). | Vendored (matrix 1.4.0 / 1.4.2 `workspace`, `workspace-nested`, `already-vendored-workspace`). | Works. |
-| Binary `bun.lockb` (binary format revisions 1, 2 and 3) | Package resolution and integrity records are rewritten in place. The CLI does not spawn Bun or produce a text lock. | Native local-tarball wiring, committed artifact, repair and hosted ⇄ vendored takeover. | Registry package records are inventoried directly, including lockfile-only projects without `node_modules`. |
+| Binary `bun.lockb` (binary format revisions 1, 2 and 3) | Package resolution and integrity records are rewritten in place. The CLI does not spawn Bun or produce a text lock. `rollback` / `remove` cannot restore a hosted `bun.lockb` entry to its upstream registry entry (v5.0 keeps no ledger to replay, and the binary lock is not re-derived), so they refuse it with the `git checkout -- bun.lockb` remedy. | Native local-tarball wiring, committed artifact, repair and vendored → hosted takeover. Hosted → vendored rebuilds a hosted `bun.lockb` pin's npm registry record from the registry (byte-exact for a lock socket-patch wired hosted), then vendors; `vendor --revert` returns the pre-hosted lock. Offline it refuses (`redirect_revert_failed`), leaving it hosted. | Registry package records are inventoried directly, including lockfile-only projects without `node_modules`. |
 | Truncated, corrupt or unrecognized binary `bun.lockb` | Refused with `redirect_bun_lockb_invalid`, preserving the lock. | Refused with `vendor_bun_lockb_invalid` before downloads or artifact creation. | The inventory reports the malformed lock. |
 | `bun.lock` with a `lockfileVersion` ≥ 3, no integer version, or a `packages` section outside bun's single-line grammar | Refused `redirect_bun_lock_unsupported`. | Refused `vendor_lockfile_version_unsupported` (preflight and engine). | The inventory skips the lock. |
 
@@ -65,19 +65,22 @@ code-tagged refusal on stderr; `--dry-run` previews it as the additive
 `would_refuse` action. Agent-mode `get --save-only` is not preflighted.
 
 **Mode conversion.** Hosted → vendored (`scan` / `get --mode vendored`,
-`vendor` over a hosted-redirected `bun.lock`) reverts the hosted line to its
-pristine registry tuple, drops the redirect-ledger record and vendors
-(`vendor_takeover_reverted_redirect`; `vendor --dry-run` PROBES the revert and
-reports `vendor_would_revert_redirect`) — but only after the Bun vendored
+`vendor` over a hosted `bun.lock`) restores the hosted line to its upstream
+registry tuple — re-resolved from the npm registry, since v5.0 keeps no hosted
+ledger — and vendors (`vendor_takeover_reverted_redirect`; `vendor --dry-run`
+resolves the same restore and reports `vendor_would_revert_redirect`) — but only after the Bun vendored
 preflight accepted the lock: on a lock the vendored backend refuses (a
 pre-version-2 `workspace:` lock) `vendor`, the vendor step and the dry run
-report `failed vendor_bun_workspace_unsupported` BEFORE the revert, leaving the
-hosted wiring, the redirect ledger and `bun.lock` byte-untouched (the purl
+report `failed vendor_bun_workspace_unsupported` BEFORE the restore, leaving the
+hosted wiring and `bun.lock` byte-untouched (the purl
 stays hosted-patched). Vendored → hosted reverts the vendored
 wiring, ledger entry and committed artifact first
 (`redirect_takeover_reverted_vendored`). `rollback <purl>` / `remove <purl>`
-unwind one of several hosted bun records; an unscoped `rollback` unwinds
-everything through the whole-ledger replay. Pinned hermetically by
+restore one of several hosted bun packages to its upstream registry tuple; an
+unscoped `rollback` restores every hosted pin the same way (no ledger replay).
+A hosted `bun.lockb` pin is refused by `rollback` / `remove` (`git checkout --
+bun.lockb`); the hosted → vendored takeover rebuilds its registry record and
+vendors (`tests/vendor_eject_bun_lockb.rs`, real Bun in `tests/e2e_bun_lockb.rs`). Pinned hermetically by
 `tests/in_process_vendor_bun_takeover.rs`, against real Bun by
 `tests/mode_migration_bun.rs` (CI: Bun 1.4.2 on three OSes, 1.3.14 on Linux)
 and by the matrix's `hosted-then-vendored` / `vendored-then-hosted` shapes.
@@ -93,10 +96,18 @@ normalized to the equivalent representation accepted by old and new readers;
 the original encoding is retained for rollback. Unknown versions and invalid
 offsets fail closed.
 
-Hosted redirects and vendoring use per-package binary snapshots in their ledgers.
-This allows a scoped rollback or mode switch to restore one package while keeping
-other packages wired. Whole-ledger reverse replay restores the original binary
-bytes when no external re-save occurred. Scoped rollback restores package
+Vendoring uses per-package binary snapshots in its ledger. This allows a scoped
+rollback or mode switch to restore one package while keeping other packages wired.
+Hosted mode (v5.0) keeps no ledger. The hosted → vendored takeover (and the
+eject) rebuild a hosted `bun.lockb` entry as Bun's npm registry record from the
+registry's `dist.tarball` / `dist.integrity`; the hosted rewrite keeps the
+registry record's inactive bytes, so that rebuild is byte-exact. A lock the
+rewrite had to normalize is marked in the root package's resolution value
+bytes (never read for a root resolution): a format-1 lock it promoted is
+demoted back to its exact format-1 bytes (verified by promoting again), and a
+lock whose workspace dependency behaviors it normalized is refused with the
+checkout remedy. `rollback` and `remove` refuse a hosted
+`bun.lockb` entry instead (restore `bun.lockb` from version control). Scoped rollback restores package
 resolutions and may retain equivalent binary normalization; if Bun itself has
 subsequently upgraded the binary schema, rollback preserves that schema and
 restores the original package resolutions.
@@ -165,54 +176,14 @@ frozen and ordinary installs, and digest tampering.
 `cargo test -p socket-patch-cli --test e2e_bun_lockb` uses Bun on `PATH`; a modern
 Bun reads the committed binary fixture, so no separate old writer is needed.
 
-### Measured validation
+### Historical runtime limitations
 
-Measured on 2026-09-21, macOS arm64, using the native binary implementation in
-the worktree based on `4b61c9620b800d26056211060ebb4a4c60288da5`:
-
-| Suite | Result | Coverage |
-|-------|--------|----------|
-| Public patch service | 370 / 370 cases passed | 11 releases: 0.8.1, 1.0.0, 1.0.36, 1.1.0, 1.1.38, 1.1.45, 1.2.0, 1.2.23, 1.3.0, 1.3.14, 1.4.2. 340 accepted flows and 30 expected text-workspace refusals. Direct, alias, transitive, two-version, workspace, nested workspace, root workspace, lockfile-only, UUID/search get, legacy binary and both takeover shapes. |
-| Explicit warm-cache installs | 90 / 90 cases passed | Six eras: 0.8.1, 1.0.36, 1.1.45, 1.2.23, 1.3.14, 1.4.2. Direct, workspace, nested workspace, legacy binary and both takeovers, with cold and warmed-cache frozen and ordinary installs. Includes eight expected text-workspace refusals. |
-| Native binary writer/reader matrix | 25 / 25 pairs passed | All 17 fixture writers listed above; own-version readers from 0.5.9 onward, 0.5.9 readers for the three 0.1.x writers, five 1.2–1.4 readers of 1.1.45, and 1.4.2 readers of 0.1.1, 0.1.6 and 0.6.7. All three Rust acceptance tests ran in each pair. |
-| Historical concurrency regression | 30 / 30 pairs passed | Six repetitions of 0.5.9 reading 0.1.1, 0.1.6 and 0.5.9, plus 1.4.2 reading 0.1.1 and 0.1.6, with isolated temporary directories. |
-
-The public-service captures record CLI SHA-256
-`a3e7683d66e6e6654644c3cd51ada1260a58a8d8f9b96c0a2ea4f585a9219910`.
-The binary matrix records both Bun executable hashes and its test executable
-hash in every result. The final local reports are under
-`/tmp/socket-patch-bun-public-final`, `/tmp/socket-patch-bun-public-warm-final`
-and `/tmp/socket-patch-bun-native-final-isolated`.
-
-Early parallel historical probes exposed Bun 0.5.9's `FileNotFound extracting
-tarball` and Bun 0.1.1's lockfile `AccessDenied` errors in a shared temporary
-directory. The harness now gives every fixture its own temporary directory and
-an empty cache directory. Historical writers use timestamp-derived temporary
-names. The failing logs remain under `/tmp/socket-patch-bun-native-verified` and
-`/tmp/socket-patch-bun-native-emptycache-*`; the six repeated runs above verify
-the corrected isolation without retrying failed assertions or changing readers.
-
-On 2026-09-22, the full workspace test run passed 7,326 tests with no failures,
-and production Clippy passed with warnings denied. The production-filter
-regression passed all 33 public-service cases across the same 11 release eras,
-including cold and warmed-cache frozen and ordinary installs. A separate complex
-graph passed both scoped rollback orders on 0.8.1 and 1.0.0; that graph is now
-part of the permanent binary matrix. These local measurements use macOS arm64.
-
-The [PR validation run for `9644add`](https://github.com/SocketDev/socket-patch/actions/runs/35729497310)
-also passed all 25 native binary writer/reader pairs on macOS and all 13 pairs
-available on Windows, including the permanent production/scoped-rollback cases.
-Windows has no official Bun binaries before 1.1.0. Each pair ran all three Rust
-acceptance tests.
-
-The Linux runner exposed a separate historical-runtime boundary: official Bun
-0.5.9, 0.6.7 and 0.6.8 crashed with `SIGSEGV` during pristine installs on
-`ubuntu-latest` (Ubuntu 24.04), before `socket-patch` ran. The workflow retains
-all 25 required historical pairs on Ubuntu 22.04, and additionally runs the 16
-pairs using Bun 0.8.1 and later on `ubuntu-latest`; every historical format and
-reader remains in the required matrix. Linux failures upload bounded pristine
-runtime probes and, when available, syscall traces under the binary result artifact's
-`linux-diagnostics/` directory.
+The binary matrix keeps each fixture's temporary directory and cache isolated;
+old Bun writers can collide when sharing temporary paths. Windows has no official
+Bun binaries before 1.1.0. Official Bun 0.5.9, 0.6.7, and 0.6.8 can crash during
+pristine installs on Ubuntu 24.04, before Socket Patch runs; the compatibility
+workflow retains those historical pairs on Ubuntu 22.04. Read the workflow and
+its uploaded diagnostics for each run's coverage and results.
 
 ## Installer boundaries (measured)
 
@@ -275,8 +246,7 @@ runners) from the GitHub releases and verifies it against `SHASUMS256.txt`. Ever
   `["name@<url|path>", {meta}]`, spec and meta intact; 1.3.10, 1.3.14 and
   1.4.2 keep the digest. The CLI recognises that spelling as its own wiring:
   the repeat hosted run heals it (`redirected: 1`, no
-  `redirect_bun_entry_not_found`, a second ledger edit whose `original` is
-  the 2-tuple), the vendored re-run stays `already_vendored` and re-pins the
+  `redirect_bun_entry_not_found`), the vendored re-run stays `already_vendored` and re-pins the
   digest on disk, `repair` rebuilds through it, and `rollback` / scoped
   `rollback` / `remove` / `vendor --revert` / both takeovers accept the
   digest-less spelling of a recorded line and restore the registry original
@@ -335,6 +305,18 @@ matrix to six concurrent jobs, with three cells per job. Each cell has its own
 temporary directory so historical Bun processes cannot collide while extracting
 identically named packages.
 
+On macOS the job first runs `.github/actions/pin-socket-hosts`
+(`scripts/pin-socket-hosts.py`): the hosted macOS resolver intermittently
+answers `patch.socket.dev` with EAI_NONAME for minutes at a time, at job start
+or mid-job, while the service is up, which failed every hosted cell in the
+window (`FailedToOpenSocket`, `[Errno 8] nodename nor servname provided`, or a
+Bun 1.3.x workspace install that never exits). The action resolves the patch
+hosts once (the system resolver, then DNS-over-HTTPS by IP literal), keeps only
+addresses whose TLS handshake verifies the hostname, and pins them in
+`/etc/hosts`, so cells still reach the production service over verified TLS
+without depending on the runner's resolver. The vlt and Poetry workflows run
+the same step.
+
 **Pinned versions:** 0.8.1, 1.0.0, 1.0.36, 1.1.0, 1.1.38 (binary lock),
 1.1.39 (first text lock, version 0), 1.1.43 (first `--lockfile-only`), 1.1.45
 (last version-0 writer), 1.2.0, 1.2.23, 1.3.0 (version 1), 1.3.9 / 1.3.10
@@ -374,9 +356,10 @@ asserted: supported → 0; hosted refusals → 0 with `redirect.redirected == 0`
 
 **Every supported case verifies:**
 
-- the ledger record (redirect ledger for hosted, vendor ledger for vendored — no
-  mode writes `.socket/manifest.json`, and every cell asserts its absence) names
-  the expected published patch uuid;
+- the patch uuid (the hosted URL in the lock for hosted — v5.0 writes no hosted
+  ledger — and the vendor ledger record for vendored; no mode writes
+  `.socket/manifest.json`, and every cell asserts its absence) is the expected
+  published patch uuid;
 - a fresh `bun install --frozen-lockfile` and a fresh ordinary `bun install`
   (empty caches, no `node_modules`) install the record's exact `afterHash`
   bytes and leave the lockfile byte-identical;
@@ -452,17 +435,17 @@ table above.
 
 | Claim | Real-Bun matrix (`backtest-bun.py`) | Real-Bun hermetic suites (`ci.yml` `e2e`) | Bun-less unit / CLI tests |
 |---|---|---|---|
-| Text lock 0 / 1 / 2 rewritten and installed, both modes | 1.1.39–1.4.2 | `e2e_redirect_bun_build` + `e2e_vendor_bun_build` on 1.4.2 (3 OS), 1.1.45 and 1.2.23 (Linux); the fixture asserts the lock version matches the era table, the v1-on-1.4 leg proves a committed v1 lock keeps installing | goldens `lock-v0`, `basic` (v1), `lock-v2`; `bun_lock.rs`, `lock_inventory.rs` |
+| Text lock 0 / 1 / 2 rewritten and installed, both modes | 1.1.39–1.4.2 | `e2e_redirect_bun_build` + `e2e_vendor_bun_build` on 1.4.2 (3 OS), 1.1.45 and 1.2.23 (Linux); the fixture asserts the lock version matches the era table, the v1-on-1.4 leg proves a committed v1 lock keeps installing | goldens `lock-v0`, `basic` (v1), `lock-v2`; `bun_lock.rs`, `lock_inventory/bun.rs` |
 | Native binary formats 1 / 2 / 3: inventory, hosted, vendored, repair, takeovers, rollback | `direct`, `legacy-lockb`, conversion shapes; dedicated `backtest-bun-lockb.py` | `e2e_bun_lockb` across writer / reader revisions | `bun_lockb.rs` and committed real binary fixtures; native CLI tests |
 | Version-0 workspace hosted refusal + remedy | `text-workspace` (1.1.39–1.1.45) | — | golden `lock-v0-workspace-refusal` (+ `expected-warnings.json`), `redirect/mod.rs` unit tests |
-| Pre-v2 workspace vendored refusal (policy) + remedy; version 2 supported incl. nested | v1: 1.2.0–1.3.14 `workspace*`; v0: `text-workspace`; v2: 1.4.x | `e2e_vendor_bun_build` scoped leg (deps + bin meta survive) | `bun_lock.rs` (`legacy_workspace_tarballs_refuse_before_writes`, in-sync / rebuild exemptions), `in_process_vendor_bun`, `repair_vendor_flavors_e2e` over {0, 1, 2} × workspace shapes |
+| Pre-v2 workspace vendored refusal (policy) + remedy; version 2 supported incl. nested | v1: 1.2.0–1.3.14 `workspace*`; v0: `text-workspace`; v2: 1.4.x | `e2e_vendor_bun_build` scoped leg (deps + bin meta survive) | `bun_lock.rs` (`legacy_workspace_tarballs_refuse_before_writes`, in-sync / rebuild exemptions), `vendor::in_process_vendor_bun`, `repair::repair_vendor_flavors_e2e` over {0, 1, 2} × workspace shapes |
 | Digest boundary 1.3.10 (registry tuples 1.2.0) | 1.3.9 vs 1.3.10 cells, `registryDigestEnforced` | tampered twins in both suites, pinned from both sides | — |
-| Digest-less re-saves below 1.3.10 recognised, healed and unwound (both modes, takeovers, scoped unwinds, `repair`) | `already-vendored-workspace` on 1.2.0–1.3.9 (`digestDroppedOnResave`; `resaveKeepsDigest` from 1.3.10) | `bun_redirect_survives_a_digest_dropping_lock_resave`, `bun_vendor_survives_a_digest_dropping_lock_resave` (real `file:`-dep re-save; the era's spelling asserted from both sides) | goldens `digestless-hosted-already-wired`, `digestless-hosted-stale-url-repin`; `bun_lock_text.rs` (`same_wiring_modulo_integrity`), `redirect/mod.rs`, `replay.rs`, `takeover.rs`, `bun_lock.rs` unit tests; `in_process_redirect`, `in_process_vendor_bun`, `in_process_vendor_bun_takeover` |
+| Digest-less re-saves below 1.3.10 recognised, healed and unwound (both modes, takeovers, scoped unwinds, `repair`) | `already-vendored-workspace` on 1.2.0–1.3.9 (`digestDroppedOnResave`; `resaveKeepsDigest` from 1.3.10) | `bun_redirect_survives_a_digest_dropping_lock_resave`, `bun_vendor_survives_a_digest_dropping_lock_resave` (real `file:`-dep re-save; the era's spelling asserted from both sides) | goldens `digestless-hosted-already-wired`, `digestless-hosted-stale-url-repin`; `bun_lock_text.rs` (`same_wiring_modulo_integrity`), `redirect/mod.rs`, `replay.rs`, `takeover.rs`, `bun_lock.rs` unit tests; `in_process_redirect`, `vendor::in_process_vendor_bun`, `in_process_vendor_bun_takeover` |
 | Mode conversion both directions; scoped `rollback` / `remove` | `hosted-then-vendored`, `vendored-then-hosted` | `mode_migration_bun` (1.4.2 × 3 OS, 1.3.14) | `in_process_vendor_bun_takeover`, `takeover.rs`, `covgap_commands_rollback` |
 | CRLF lockfiles preserved (hosted line, vendored, rollback) | `crlf-lock` | — | golden `lock-v2-crlf`, `bun_lock.rs` |
 | Bun 0.8.1 / 1.0.0 peer / transitive upstream limitation | recorded per cell; no selected target is installed, exit 0 and lock unchanged | — | — |
 | Manifest-less VEX: attested `(redirected)` / `(vendored)` from the lock with no `.socket/manifest.json` (ledgers kept, then deleted too), `--offline` → `record_unavailable`, reverted lock → not attested (also `--no-verify`), embedded `apply --vex` / `vendor --vex` | every supported cell after its installs (`vex*` checks; public patch API) | `vex_e2e_common/bun.rs` step at the end of every `e2e_redirect_bun_build` / `e2e_vendor_bun_build` / `mode_migration_bun` / `e2e_bun_lockb` flow (fresh checkout + real frozen install, wiremock API with a zero-request oracle offline); tampered install / artifact → `hash_mismatch` / `vendor_hash_mismatch`; stale takeover manifest → the wired uuid wins; production `bun_*_install_proof` legs | `e2e_vex_lockfile::bun` (text v0/1/2 + `bun.lockb` × both modes: spoofed hosts, record mismatch, pristine / tampered / alias installs, stale lockb); `in_process_vendor_bun*` lockfile-only twins |
-| Pre-download preflight envelopes, `--silent`, `--dry-run` `would_refuse`, manifest-free footprint | `get-uuid` / `get-search` / `workspace-get-uuid` / `workspace-get-search` refusals (exit codes, `downloaded == 0`) | — | `in_process_vendor_bun` (exact uuid-path envelope), `scan_vendor_e2e`, `get_modes_e2e`, `vendor_flow.rs` |
+| Pre-download preflight envelopes, `--silent`, `--dry-run` `would_refuse`, manifest-free footprint | `get-uuid` / `get-search` / `workspace-get-uuid` / `workspace-get-search` refusals (exit codes, `downloaded == 0`) | — | `vendor::in_process_vendor_bun` (exact uuid-path envelope), `scan_vendor_e2e`, `get::get_modes_e2e`, `vendor_flow.rs` |
 
 Not measured: a `--cwd <workspace member>` run (the member holds no
 `bun.lock`, so the preflight passes and the engine refuses

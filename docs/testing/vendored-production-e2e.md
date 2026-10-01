@@ -1,209 +1,70 @@
-# Vendored-mode production e2e
+# Vendored production tests
 
-`crates/socket-patch-cli/tests/e2e_vendored_production.rs` is the vendored-mode
-counterpart to [`hosted-production-e2e.md`](./hosted-production-e2e.md). The
-synthetic `e2e_vendor_*_build.rs` capstones prove the vendoring *mechanism* with
-a hand-staged `.socket/` blob and `vendor --offline`; they never contact
-production. This suite is the opposite: it drives `scan --mode vendored` against
-the **real** Socket production service and the **real** upstream registries with
-**no mocking anywhere**, on the anonymous **free public proxy** (no API token).
+[`e2e_vendored_production.rs`](../../crates/socket-patch-cli/tests/e2e_vendored_production.rs)
+uses the public patch service and real upstream registries to test committed
+patched artifacts. It complements the [hosted suite](hosted-production-e2e.md)
+and controlled-input vendor tests.
 
 ## What it proves
 
-For each ecosystem × package manager:
+Each install-proof case starts with pristine installed bytes, runs
+`scan --mode vendored`, and checks the artifact, ledger, and dependency edits.
+It copies only committable project files to a fresh checkout, isolates caches,
+installs from the committed artifacts, and checks the patched bytes. Reruns,
+reversal, and manifest-free VEX exercise the rest of the lifecycle.
 
-1. install a pinned, known-vulnerable dependency from its **real** upstream
-   registry with the **real** package manager;
-2. assert the installed bytes are pristine (anti-vacuity);
-3. `socket-patch scan --mode vendored --json --yes` — resolves a free patch from
-   `patches-api.socket.dev`, materializes the patched package into the
-   committable `.socket/vendor/<eco>/<uuid>/` tree, and rewires the lockfile /
-   manifest to consume it;
-4. assert the vendor landed (`summary.applied >= 1`, `failed == 0`, expected
-   patch UUID present, artifact on disk, lock rewired);
-5. **DELIVERY proof** — copy ONLY the committable files (project manifest +
-   lockfile + `.socket/` + any PM config) into a fresh dir, point every cache
-   var at a fresh EMPTY dir, run the package manager's clean-install offline,
-   and assert the installed bytes are the VENDORED (patched) bytes, NOT the
-   pristine registry bytes;
-6. idempotency (a second run is an `already_vendored` no-op with a byte-stable
-   lock) and `vendor --revert` byte-restores.
+This tests patch delivery, not exploit efficacy. The fixture determines which
+other dependencies must be available during installation; vendoring patched
+packages does not itself make every dependency offline.
 
-Step 5 is the point. It is the only place in this repo where a third-party
-package manager installs, from a genuinely cold cache and with only the
-committable files, a package vendored from a **real** Socket production patch.
+## Catalog fixtures and coverage
 
-This suite proves **byte delivery** — the bytes the vendored patch produced are
-the bytes the package manager installs. It does NOT assert CVE efficacy;
-whether the fix content actually closes the advisory is a separate concern, and
-several production patches are byte-valid but that is a different question. This
-matches how the `e2e_vendor_*_build.rs` capstones assert.
+The test source defines required PURLs, accepted patch UUIDs, byte markers, and
+preflight checks. It shares the npm, PyPI, and RubyGems fixture families with the
+hosted suite. Follow its [withdrawn-patch procedure](hosted-production-e2e.md#if-a-required-patch-is-withdrawn)
+when the catalog changes, updating both suites.
 
-## Required production patches
+| Coverage | Cases |
+| --- | --- |
+| Native production installs | npm, pnpm, Yarn Classic, Yarn Berry with node-modules, Bun text locks, vlt, pip requirements, uv, and Bundler |
+| Catalog canaries | Cargo, Maven, NuGet, and Composer; require a published free fixture before adding full install proofs |
+| Go / Deno | Catalog/unsupported-mode assertions, not production vendor install proofs |
 
-Pinned to these free-tier patches; they must stay published on
-`patches-api.socket.dev`. `preflight_required_patches_are_published` checks all
-three every run and fails first with the offending PURL named.
+The vlt case installs a committed directory artifact with `vlt ci`. The CLI
+decodes the service download before vendoring it, so the hosted vlt
+[serve-encoding gate](hosted-production-e2e.md#vlt-the-serve-encoding-gate) does
+not prevent this proof. Per-release coverage lives in the
+[compatibility guides](README.md#package-manager-guides).
 
-| Ecosystem | PURL | Patch UUID | Marker in the patched bytes |
-|-----------|------|------------|-----------------------------|
-| npm | `pkg:npm/minimist@1.2.2` | `80630680-4da6-45f9-bba8-b888e0ffd58c` | `Socket Community Patch` header |
-| PyPI | `pkg:pypi/urllib3@1.26.18` | one of three (server-ordered) | `Socket Community Patch` header |
-| RubyGems | `pkg:gem/activestorage@6.0.3` | any of the `GEM_PATCHES` table (4 as of 2026-08-20 — see the hosted doc's UUID list; each patch marks a different file) | `Socket Community Patch` header |
+### RubyGems artifact validation
 
-If a required patch is withdrawn, update the catalog constants at the top of
-`e2e_vendored_production.rs` **and** the table above (same procedure as the
-hosted suite).
-
-## Coverage: PM × proof
-
-| Package manager | Fixture | Delivery install (cold, offline, committable-only) | Status |
-|-----------------|---------|-----------------------------------------------------|--------|
-| npm | minimist@1.2.2 | `npm ci` | ✅ full |
-| pnpm | minimist@1.2.2 | `pnpm install --frozen-lockfile --offline` | ✅ full |
-| yarn classic | minimist@1.2.2 | `yarn install --frozen-lockfile --offline` | ✅ full |
-| yarn berry (node-modules) | minimist@1.2.2 | `yarn install --immutable --check-cache` | ✅ full |
-| bun (text lockfile) | minimist@1.2.2 | `bun install --frozen-lockfile` | ✅ full |
-| vlt 1.2.0 (`vlt-lock.json`) | minimist@1.2.2 | fresh checkout, `vlt ci` (lock byte-stable) | ✅ full (`vlt_pinned_matrix_production_vendored_install_proof`) |
-| pip (requirements.txt) | urllib3@1.26.18 | `pip install --no-index -r requirements.txt` | ✅ full |
-| uv (uv.lock) | urllib3@1.26.18 | `uv sync --frozen --offline` | ✅ full |
-| bundler | activestorage@6.0.3 | frozen `bundle install`, fresh empty `BUNDLE_PATH` | ✅ full |
-| go | — | — | zero-patch assertion (no free golang patches) |
-| deno | — | — | negative assertion (unsupported) |
-| cargo / maven / nuget / composer | — | — | canary (no free production patches) |
-
-Cargo sat in the ✅-full rows until 2026-09-01: the leg vendored a pinned crate
-as a `[patch.crates-io]` path dep and proved delivery with
-`cargo fetch --offline --locked` from an empty `CARGO_HOME`. Production's free
-cargo tier emptied on 2026-08-28 (the pinned patches were deleted server-side,
-leaving zero live free patches for any cargo crate), so the leg was demoted to
-`canary_unpublished_vendored_ecosystems` — deliberately dropping the cargo
-install-proof coverage. To re-promote: pick a live free cargo patch and follow
-the withdrawn-patch procedure in the
-[hosted doc](./hosted-production-e2e.md#if-a-required-patch-is-withdrawn); the
-git history of this demotion shows every piece to restore in both production
-suites.
-
-## Known issues this suite surfaced
-
-All were found against real production + real toolchains; none is a test bug.
-The first two are fixed; the third is mitigated CLI-side (the served artifact
-is still defective server-side).
-
-### 1. `pnpm` >= 11 — vendored `overrides` land in the wrong file (CLI) — FIXED
-
-pnpm 11 stopped reading `overrides` from `package.json`'s `pnpm` field — it
-moved to `pnpm-workspace.yaml` (https://pnpm.io/settings). The CLI used to write
-only `package.json` `pnpm.overrides`, so pnpm 11 ignored it and a frozen install
-refused with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`, even though the vendored
-tarball and lock were correct (the lockfile passes pnpm's supply-chain policy).
-
-**Fixed** (`fix/pnpm11-overrides-location`): the pnpm vendor backend now
-mirrors the same versioned `<name>@<version>` → `file:` override into
-`pnpm-workspace.yaml` (creating the file with a root-only `packages: ['.']`
-list — pnpm 9 refuses a workspace file with no `packages` field — when the
-project has none), alongside the existing `package.json` `pnpm.overrides` for
-pnpm 9/10. The committable set installs cleanly on pnpm 9/10/11 with no config
-mismatch, and `vendor --revert` deletes a file it created (or splices its
-override back out of one it edited). This leg now asserts the frozen install
-succeeds directly, with no workaround.
-
-### 2. `gem` — vendoring the platform-qualified purl was unsupported (CLI) — FIXED
-
-`scan --mode vendored` resolved and downloaded the activestorage patch, but the
-vendor backend refused the platform-qualified purl
-(`pkg:gem/activestorage@…?platform=ruby` — the spelling production publishes)
-with `platform_gem_unsupported`, so `summary.applied == 0`, `failed == 1`, and
-the run exited non-zero with `"status": "partial_failure"`.
-
-**Fixed** (PR #172): the gate in `vendor/gem.rs` now refuses only non-empty,
-non-`ruby` platform qualifiers — `?platform=ruby` is the portable default and
-vendors like a bare purl. The suite's original pin
-(`activestorage@7.0.2.2` / `2535d43d-67ce-4944-be27-c19e113997fb`) was
-withdrawn on 2026-08-14; the 2026-08-18 catalog republish REPLACED it, and the
-suite was re-pinned to `activestorage@6.0.3` /
-`15e960b5-f432-4b6c-b8aa-534a2b419323`. The vendor succeeds live and the leg
-was upgraded to the full fresh-dir `bundle install` delivery proof
-(`gem_bundler_vendored_install_proof`), retiring its failure-tolerance branch
-and its `SOCKET_PATCH_VENDORED_E2E_GEM_STRICT` knob.
-
-### 3. `gem` — the served gem-stub gemspec is invalid (SERVER; CLI mitigated)
-
-Discovered 2026-08-19 while upgrading the gem leg to a full delivery proof:
-the gem-stub-gemspec artifact production serves is invalid — it is missing
-`summary`/`authors`, which rubygems validation requires — so writing it
-verbatim makes bundler reject the vendored `path:` source and
-`bundle install` exit 1 on every bundler major.
-
-**Mitigated CLI-side**: the gem vendor backend now validates BOTH stub sources
-at the write choke point (a conservative textual check matched to what
-rubygems 3.3–3.6 actually hard-fails — empirically verified in the bundler-era
-docker images). `--vendor-source auto` detects the served defect, warns
-(`vendor_prebuilt_stub_invalid`), and falls back to the local build — which is
-how `gem_bundler_vendored_install_proof` passes against production today —
-while explicit `--vendor-source service` refuses with
-`vendor_prebuilt_stub_invalid`. When the gem is also not installed (no local
-stub to derive), `auto` refuses with the same code, the served defect named,
-and the install-the-gem remedy; a corrupted LOCAL `specifications/` stub
-refuses `gem_spec_invalid`. Re-vendoring a project that committed a defective
-stub pre-hardening re-validates the ON-DISK stub and rebuilds the artifact
-with a valid one. The leg's route-attribution assertion (exactly one of
-`vendor_prebuilt_downloaded` / `vendor_prebuilt_stub_invalid`) auto-retires
-the fallback expectation once the depscan stub-generator fix deploys and the
-rebuilt artifacts serve valid stubs — the same leg then exercises the service
-artifact directly.
+A vendored Bundler path source needs the server's valid stub gemspec. The CLI downloads and validates it with the archive. Missing or invalid server stubs fail closed; there is no local gem build fallback.
 
 ## Running
 
 ```sh
-# everything, soft-skipping legs whose toolchain is absent
-cargo test -p socket-patch-cli --test e2e_vendored_production -- --ignored --test-threads=1
+cargo test --locked -p socket-patch-cli --test e2e_vendored_production -- \
+  --ignored --test-threads=1
 
-# CI: turn every "toolchain missing" soft-skip into a hard failure
+# Require the toolchains instead of allowing local skips:
 SOCKET_PATCH_VENDORED_E2E_STRICT=1 \
-  cargo test -p socket-patch-cli --test e2e_vendored_production -- --ignored --test-threads=1
+  cargo test --locked -p socket-patch-cli --test e2e_vendored_production -- \
+  --ignored --test-threads=1
 ```
 
-The suite is `#[ignore]`-gated, so it stays out of the `test` and `e2e` jobs and
-runs only where it is explicitly asked for. `--test-threads=1` keeps the real
-installs from contending on the shared cache sandbox.
-
-The bun leg (`bun_vendored_install_proof`) is therefore on-demand production
-coverage. The per-PR real-Bun evidence for vendored mode is the hermetic
-`e2e_vendor_bun_build` suite in `ci.yml`'s `e2e` matrix (Bun 1.4.2 on three
-OSes, 1.1.45 and 1.2.23 on Linux) plus the production native matrix in
-`bun-compatibility.yml` (16 releases × 3 OS in hosted and vendored mode —
-vendored is manifest-free) — see [Bun compatibility](bun-compatibility.md).
-
-The vlt leg vendors the service's directory artifact into the D19 layout
-(`.socket/vendor/npm/<uuid>/minimist-1.2.2/node_modules/minimist`) and proves
-it with a fresh `vlt ci`. The CLI's own download decodes the transfer, so the
-serve-encoding gate that blocks hosted vlt (see the
-[hosted doc](hosted-production-e2e.md#vlt-the-serve-encoding-gate)) does not
-apply. CI runs it in the `hosted-e2e` job
-(`--test e2e_vendored_production -- --include-ignored vlt_pinned_matrix`,
-through `scripts/check-vlt-legs.py`); the per-release evidence is in
-[vlt compatibility](vlt-compatibility.md).
-
-### Environment knobs
+The suite is opt-in. Single-threaded execution avoids competing native installs.
+It clears ambient Socket credentials and disables persisted login; no API token
+is needed.
 
 | Variable | Effect |
-|----------|--------|
-| `SOCKET_PATCH_VENDORED_E2E_STRICT=1` | Turn every "toolchain missing" soft-skip into a hard failure. |
-| `SOCKET_PATCH_VLT_E2E_JS` / `SOCKET_PATCH_VLT_E2E_VERSION` | The vlt release the vlt leg runs (`node <vlt.js>`, exact `--version`). |
-| `SOCKET_PATCH_VENDORED_E2E_CANARY_STRICT=1` | Fail when cargo/maven/nuget/composer gain their first free published patch. |
+| --- | --- |
+| `SOCKET_PATCH_VENDORED_E2E_STRICT=1` | Fail instead of skipping missing required toolchains |
+| `SOCKET_PATCH_VENDORED_E2E_CANARY_STRICT=1` | Fail when a watched ecosystem gains a free fixture |
+| `SOCKET_PATCH_VLT_E2E_JS` / `SOCKET_PATCH_VLT_E2E_VERSION` | Select the version-pinned vlt executable |
 
-The suite forces `SOCKET_NO_CONFIG=true` and scrubs every ambient `SOCKET_*`
-var, planting hostile seeds so a dropped scrub reddens the suite instead of
-letting a developer's socket-cli login move the run onto the org catalog. No API
-token is used.
-
-### Toolchains
-
-`npm`, `pnpm`, `corepack` (yarn classic + berry), `bun`, `vlt` (Node ≥ 22.22), `uv`, `python3` (pip),
-`ruby` + `bundle`, `go`.
-
-### Network egress
-
-`patches-api.socket.dev`, `patch.socket.dev`, `registry.npmjs.org`, `pypi.org`,
-`files.pythonhosted.org`, `rubygems.org`.
+Tools include npm, pnpm, Corepack for Yarn, Bun, vlt, uv, Python/pip, Ruby/Bundler,
+and Go. Networked fixture preparation requires Socket's API and patch server plus
+npm, PyPI, and RubyGems. CI versions and triggers are defined in the
+[main workflow](../../.github/workflows/ci.yml) and package-manager workflows.
+The main `hosted-e2e` job includes the vendored vlt proof; it does not imply that
+every vendored production case ran.

@@ -24,13 +24,11 @@ use crate::json_envelope::{Command, Envelope, PatchAction, PatchEvent, RunWarnin
 pub const UPDATE_TARGET: &str = env!("SOCKET_PATCH_TARGET");
 
 // `socket-patch --update --help` must describe the public `--update`
-// flag, not the hidden `self-update` subcommand it is rewritten to. The
-// variant's doc comment in lib.rs (developer notes) becomes the
-// subcommand's `about` and is applied after these attributes, so the help
-// text is fixed through a template that never renders `{about}`.
-// (The usage line still reads `socket-patch self-update ...`: lib.rs's
-// `update_help_shows_self_update_help` pins that; overriding it to
-// `socket-patch --update [VERSION] [OPTIONS]` belongs with that test.)
+// flag, not the hidden `self-update` subcommand it is rewritten to. lib.rs
+// sets an explicit `about`/`override_usage` on the hidden variant, and this
+// template keeps `--update --help` on the public wording; both are pinned by
+// lib.rs `update_help_shows_self_update_help` and help_text_hygiene
+// `self_update_help_shows_the_public_spelling`.
 #[derive(Args)]
 #[command(
     help_template = "Update socket-patch itself to the latest release (or to VERSION).\n\n\
@@ -43,8 +41,7 @@ pub struct UpdateArgs {
     /// Exact version to install instead of the latest release (e.g.
     /// `socket-patch --update 3.4.0`). An explicit pin installs that
     /// version even if it is older than the current one. Also settable via
-    /// SOCKET_PATCH_VERSION — the same pin install.sh and the gem launcher
-    /// honor.
+    /// SOCKET_PATCH_VERSION — the same pin install.sh honors.
     //
     // Not named `version`: under `propagate_version` clap already owns a
     // `--version` arg id on every subcommand, and the collision panics at
@@ -57,7 +54,7 @@ pub struct UpdateArgs {
     pub pin_version: Option<String>,
 
     /// Proceed even when this install looks package-manager-managed
-    /// (npm/pip/cargo/Homebrew/launcher), and reinstall even when already
+    /// (e.g. npm or cargo), and reinstall even when already
     /// on the requested version.
     #[arg(
         long,
@@ -146,20 +143,13 @@ fn confirm_prompt(current: &semver::Version, target: &semver::Version) -> String
     }
 }
 
-/// The line after a declined [`confirm_prompt`], naming the same action.
-fn cancelled_message(current: &semver::Version, target: &semver::Version) -> &'static str {
-    if target < current {
-        "Downgrade cancelled."
-    } else if target == current {
-        "Reinstall cancelled."
-    } else {
-        "Update cancelled."
-    }
-}
-
 /// The result line after a successful install, naming the same action as
 /// [`confirm_prompt`].
-fn installed_message(current: &semver::Version, target: &semver::Version, path: &std::path::Path) -> String {
+fn installed_message(
+    current: &semver::Version,
+    target: &semver::Version,
+    path: &std::path::Path,
+) -> String {
     let path = path.display();
     if target < current {
         format!("Downgraded socket-patch {current} \u{2192} {target} ({path})")
@@ -358,7 +348,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
     let prompt = confirm_prompt(&current, &target_version);
     if !crate::ui::confirm(&prompt, true, &args.common) {
         if !quiet {
-            eprintln!("{}", cancelled_message(&current, &target_version));
+            eprintln!("{}", crate::ui::CANCELLED);
         }
         return 1;
     }
@@ -499,10 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_and_result_lines_match_the_prompt() {
-        assert_eq!(cancelled_message(&v("4.0.0"), &v("9.9.9")), "Update cancelled.");
-        assert_eq!(cancelled_message(&v("4.0.0"), &v("3.0.0")), "Downgrade cancelled.");
-        assert_eq!(cancelled_message(&v("4.0.0"), &v("4.0.0")), "Reinstall cancelled.");
+    fn result_lines_match_the_prompt() {
         let p = std::path::Path::new("/opt/sp/socket-patch");
         assert_eq!(
             installed_message(&v("4.0.0"), &v("9.9.9"), p),

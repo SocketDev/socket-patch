@@ -1,7 +1,7 @@
 //! Pure text builders for `scan`'s human output: the results table, the
-//! summary and prompt lines, the per-patch preview, and the hints. No I/O
-//! and no terminal state (color is decided by the caller and passed in),
-//! so every string is unit-testable byte for byte.
+//! summary lines, the dry-run line, the per-patch preview, and the hints.
+//! No I/O and no terminal state (color is decided by the caller and passed
+//! in), so every string is unit-testable byte for byte.
 
 use std::collections::HashMap;
 
@@ -150,7 +150,7 @@ pub(super) fn summary_line(packages: usize, patches: usize, all_accessible: bool
 pub(super) fn paid_extra_line(paid: usize) -> String {
     let verb = if paid == 1 { "is" } else { "are" };
     format!(
-        "         + {} {verb} available with a paid subscription",
+        "         + {} {verb} available with a paid Socket plan",
         plural(paid, "additional patch", "additional patches")
     )
 }
@@ -202,8 +202,6 @@ fn quoted_list(items: &[String], one: &str, many: &str) -> String {
     format!("{label}: {}", items.join(", "))
 }
 
-/// Warning printed when `--prune` cannot run because nothing was crawled
-/// (pruning every manifest entry is too destructive to do implicitly).
 /// The warning for one failed API batch of several (the scan goes on
 /// with the others). A one-batch scan prints only [`all_batches_failed`].
 pub(super) fn batch_failed_warning(batch: usize, total: usize, err: &str) -> String {
@@ -219,37 +217,19 @@ pub(super) fn all_batches_failed(total: usize, err: &str) -> String {
     }
 }
 
+/// Warning printed when `--prune` cannot run because nothing was crawled
+/// (pruning every manifest entry is too destructive to do implicitly).
 pub(super) const PRUNE_SKIPPED_EMPTY: &str = "Warning: --prune skipped: no installed packages \
      were found, and pruning every manifest entry is too destructive to do implicitly; run \
      `socket-patch repair` to clean up .socket/ explicitly.";
 
-/// Note printed when the user declines the download prompt of a
-/// `--prune` run: nothing is changed, the GC included.
-pub(super) const PRUNE_SKIPPED_DECLINED: &str = "Note: --prune skipped (download declined).";
-
-/// What the confirm prompt / dry-run line is about to do.
+/// What the dry-run line says the run would do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Plan {
     /// Agent mode: download `n` patches and apply them in place.
     Apply(usize),
     /// Vendored mode: download `n` patches and vendor them.
     Vendor(usize),
-}
-
-/// The confirm prompt for `plan` (the `[Y/n]` hint is added by the prompt).
-pub(super) fn confirm_prompt(plan: Plan) -> String {
-    match plan {
-        Plan::Apply(n) => format!("Download and apply {}?", plural(n, "patch", "patches")),
-        Plan::Vendor(n) => format!("Download and vendor {}?", plural(n, "patch", "patches")),
-    }
-}
-
-/// The hosted-mode confirm prompt (the `[Y/n]` hint is added by the prompt).
-pub(super) fn hosted_confirm_prompt(n: usize) -> String {
-    format!(
-        "Redirect {} to the hosted patch server?",
-        plural(n, "package", "packages")
-    )
 }
 
 /// The `--dry-run` headline. `refused` counts the patches the vendored
@@ -268,36 +248,17 @@ pub(super) fn dry_run_line(plan: Plan, refused: usize) -> String {
     format!("[dry-run] Would {what}. No changes made.")
 }
 
-/// Lines printed after the user declines the prompt: how to pick patches
-/// one at a time in the same mode.
-pub(super) fn decline_hint(vendor: bool) -> [String; 3] {
-    if vendor {
-        [
-            "To vendor a single patch, run:".to_string(),
-            "  socket-patch get <package-name-or-purl> --mode vendored".to_string(),
-            "  socket-patch get <CVE-ID> --mode vendored".to_string(),
-        ]
-    } else {
-        [
-            "To apply a single patch, run:".to_string(),
-            "  socket-patch get <package-name-or-purl>".to_string(),
-            "  socket-patch get <CVE-ID>".to_string(),
-        ]
-    }
-}
-
-/// Lines printed after the user declines the hosted-mode prompt: how to
-/// redirect packages one at a time (`get` defaults to agent mode, so the
-/// mode is named).
-pub(super) fn hosted_decline_hint() -> [String; 3] {
+/// Lines printed after a report-only scan (`--prune` or global with no
+/// mode, so no lockfile to rewire): how to apply what it found.
+pub(super) fn report_only_hint() -> [String; 3] {
     [
-        "To redirect a package, run:".to_string(),
-        "  socket-patch get <package-name-or-purl> --mode hosted".to_string(),
-        "  socket-patch get <CVE-ID> --mode hosted".to_string(),
+        "To apply these patches in place, run:".to_string(),
+        "  socket-patch scan --mode agent [PATHS]".to_string(),
+        "  socket-patch get <package-name-or-purl-or-CVE-ID>".to_string(),
     ]
 }
 
-/// Printed (vendored mode, before the prompt) for a selected package whose
+/// Printed (vendored mode, before vendoring) for a selected package whose
 /// installed bytes differ from the patch baseline: vendoring still
 /// proceeds, with the verified patched content.
 pub(super) fn baseline_mismatch_line(purl: &str) -> String {
@@ -688,11 +649,11 @@ mod tests {
     fn paid_extra_line_agrees_in_number() {
         assert_eq!(
             paid_extra_line(1),
-            "         + 1 additional patch is available with a paid subscription"
+            "         + 1 additional patch is available with a paid Socket plan"
         );
         assert_eq!(
             paid_extra_line(3),
-            "         + 3 additional patches are available with a paid subscription"
+            "         + 3 additional patches are available with a paid Socket plan"
         );
     }
 
@@ -741,31 +702,7 @@ mod tests {
         assert_eq!(generic, no_packages_message(false, None, &[]));
     }
 
-    // ---- prompt / dry-run / hints -------------------------------------------
-
-    #[test]
-    fn confirm_prompt_counts_patches() {
-        assert_eq!(
-            confirm_prompt(Plan::Apply(1)),
-            "Download and apply 1 patch?"
-        );
-        assert_eq!(
-            confirm_prompt(Plan::Apply(3)),
-            "Download and apply 3 patches?"
-        );
-        assert_eq!(
-            confirm_prompt(Plan::Vendor(2)),
-            "Download and vendor 2 patches?"
-        );
-        assert_eq!(
-            hosted_confirm_prompt(1),
-            "Redirect 1 package to the hosted patch server?"
-        );
-        assert_eq!(
-            hosted_confirm_prompt(2),
-            "Redirect 2 packages to the hosted patch server?"
-        );
-    }
+    // ---- dry-run / hints -------------------------------------------
 
     #[test]
     fn dry_run_line_counts_refusals() {
@@ -788,17 +725,9 @@ mod tests {
     }
 
     #[test]
-    fn decline_hint_matches_mode() {
-        assert_eq!(decline_hint(false)[0], "To apply a single patch, run:");
-        assert!(decline_hint(false).iter().all(|l| !l.contains("--mode")));
-        assert_eq!(decline_hint(true)[0], "To vendor a single patch, run:");
-        assert!(decline_hint(true)[1..]
-            .iter()
-            .all(|l| l.ends_with(" --mode vendored")));
-        assert_eq!(hosted_decline_hint()[0], "To redirect a package, run:");
-        assert!(hosted_decline_hint()[1..]
-            .iter()
-            .all(|l| l.ends_with(" --mode hosted")));
+    fn report_only_hint_names_agent_mode() {
+        assert_eq!(report_only_hint()[0], "To apply these patches in place, run:");
+        assert!(report_only_hint()[1].contains("--mode agent"));
     }
 
     #[test]

@@ -26,9 +26,11 @@ npm 12 notes:
   dependencies. `allow-remote=all` is the setting a hosted redirect needs; it
   also admits any other url-resolved dependency (the per-entry sha512 pins
   stay enforced). The hosted run writes it to the project `.npmrc` (created,
-  or one appended line; ledger kind `redirect_npmrc_allow_remote`, removed by
-  `rollback` / `remove` / the vendored takeover once no package-lock entry
-  needs it), respects an explicit other value — in the project `.npmrc`, the
+  or one appended line). Hosted mode keeps no ledger. Once rollback, removal,
+  or vendored takeover removes the last hosted npm pin, an `.npmrc` containing
+  only that setting is deleted; a file with other settings is retained with
+  `npm_allow_remote_left`. The writer respects an explicit other value — in the
+  project `.npmrc`, the
   user / global / builtin npm config, or an `npm_config_allow_remote`
   environment variable (which beats every `.npmrc`) — and is disabled by
   `--no-npm-allow-remote-config`.
@@ -59,7 +61,7 @@ npm 12 notes:
 | `e2e_redirect_npm_build` (`#[ignore]`) | real | scan / get-uuid / get-ghsa hosted redirects, shrinkwrap flavor, tampered-tarball rejection, fresh-checkout `npm ci`, manifest-less VEX tail |
 | `e2e_vendor_npm_build` | real | vendor / get-vendored, shrinkwrap flavor, npm 6 × v2 lock, idempotency, byte-exact revert, manifest-less VEX tail |
 | `e2e_vex_lockfile::npm` | none | tamper / spoof / mismatch / pin cells over lockfileVersion 1, 2, 3, shrinkwrap and dual-lock shapes |
-| `redirect_npm_allow_remote` | none | the npm 12 `allow-remote` auto-config: `.npmrc` create / append (BOM, CRLF), explicit values respected (project file, user / global config, env var), unhonored spellings, bare-CR and indented-section files, section-scoped copies, opt-out flag + env, dry run, symlinked `.npmrc`, `--silent`, rollback removing exactly what was added, `remove` surfacing `redirect_npmrc_allow_remote_modified` |
+| `redirect_npm_allow_remote` | none | the npm 12 `allow-remote` auto-config: `.npmrc` create / append (BOM, CRLF), explicit values respected (project file, user / global config, env var), unhonored spellings, bare-CR and indented-section files, section-scoped copies, opt-out flag + env, dry run, symlinked `.npmrc`, `--silent`, rollback/removal deleting a standalone setting or warning `npm_allow_remote_left` when other settings remain |
 | `e2e_hosted_production` / `e2e_vendored_production` (`#[ignore]`) | real (ambient) | the same flows against production, ending in the manifest-less VEX tail |
 
 The manifest-less VEX tail (`tests/npm_e2e_common/manifestless.rs`) runs four
@@ -88,26 +90,5 @@ unreachable registry into a failure instead of a skip.
 6 cross-version cell needs an npm >= 7 to write its v2 lock: `npm` on `PATH`,
 or `SOCKET_PATCH_NPM_E2E_LOCK_WRITER_BIN`.
 
-## Local results (2026-09-22)
-
-Every row below ran both real-npm suites with `SOCKET_PATCH_NPM_E2E_REQUIRED=1`
-on Node 24.21 (macOS): all 20 legs green, 77 manifest-less VEX matrices, each
-with all four cells (manifest deleted, ledgers deleted, `--offline`, lock
-reverted) passing. Re-run 2026-09-23 after the `.npmrc` auto-config landed:
-`e2e_redirect_npm_build` on 10.9.9, 11.20.0 and 12.1.0 (every hosted flow
-installs from the committed, auto-configured `.npmrc` with a plain `npm ci`;
-the main capstone's `rollback` removes it) and `e2e_vendor_npm_build` on
-12.1.0 (no `.npmrc`), all green with every manifest-less VEX cell passing.
-
-| npm | hosted flows (scan, get uuid, get GHSA, shrinkwrap) | hosted fresh install | vendored flows | vendored fresh install |
-| --- | --- | --- | --- | --- |
-| 6.14.18 | 4 | refused EINTEGRITY (fail closed); VEX cells on the lockfile basis | v1 lock refused; npm 6 × v2-lock cell | patched (from the v2 legacy mirror) |
-| 7.0.0 | 4 | patched | vendor, get vendored, in-place VEX, shrinkwrap | patched |
-| 7.24.2 | 4 | patched | 4 | patched |
-| 8.19.4 | 4 | patched | 4 | patched |
-| 9.0.0 | 4 | patched | 4 | patched |
-| 9.9.4 | 4 | patched | 4 | patched |
-| 10.9.9 | 4 | patched | 4 | patched |
-| 11.20.0 | 4 | patched | 4 | patched |
-| 12.0.0 | 4 | EALLOWREMOTE, then patched with `allow-remote=all` (measured before the auto-config) | 4 (shrinkwrap: both locks wired) | patched |
-| 12.1.0 | 4 | patched with a plain `npm ci` from the auto-configured `.npmrc` (EALLOWREMOTE without it); `rollback` removes the `.npmrc` | 4 (shrinkwrap: both locks wired) | patched |
+Full run results belong with the source revision and toolchain versions in CI
+artifacts or a local output directory. See the [testing guide](README.md#ci-and-results).

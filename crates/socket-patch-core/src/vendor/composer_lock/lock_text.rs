@@ -12,7 +12,7 @@
 
 use serde_json::Value;
 
-use crate::patch::redirect::composer_source::{top_level_members, value_end_at};
+use crate::formats::composer::source::{top_level_members, value_end_at};
 use crate::utils::line_endings::{majority_terminator, LineEndings};
 use crate::vendor::common::{detect_indent, serialize_json};
 
@@ -38,23 +38,7 @@ pub(super) fn replace_entry(
         LineEndings::Mixed => majority_terminator(current),
         LineEndings::None => majority_terminator(text),
     };
-    let rendered = render_in_style_of(text, entry, &indent_unit(text, base), base, eol)?;
-    Some(format!("{}{rendered}{}", &text[..start], &text[end + 1..]))
-}
-
-/// `value` pretty-printed to be spliced into `text` on a line that starts
-/// with `base`: nested levels indent by `unit`, lines break with `eol`, and
-/// strings follow `text`'s slash and unicode escaping (PHP `json_encode`'s
-/// `\/` and `\uXXXX` defaults), so the spliced value reads like its
-/// neighbours.
-pub(crate) fn render_in_style_of(
-    text: &str,
-    value: &Value,
-    unit: &str,
-    base: &str,
-    eol: &str,
-) -> Option<String> {
-    let mut rendered = serialize_json(value, unit).ok()?;
+    let mut rendered = serialize_json(entry, &indent_unit(text, base)).ok()?;
     rendered.pop();
     let mut rendered = String::from_utf8(rendered).ok()?;
     if escapes_slashes(text) {
@@ -64,8 +48,9 @@ pub(crate) fn render_in_style_of(
         rendered = escape_non_ascii(&rendered);
     }
     // serde_json escapes every newline inside a string, so each `\n` it
-    // emits is a line break of the value.
-    Some(rendered.replace('\n', &format!("{eol}{base}")))
+    // emits is a line break of the entry.
+    let rendered = rendered.replace('\n', &format!("{eol}{base}"));
+    Some(format!("{}{rendered}{}", &text[..start], &text[end + 1..]))
 }
 
 /// Byte span (inclusive) of `lock[section][index]`, counting every array

@@ -1,8 +1,8 @@
 //! Shared steps for manifest-less VEX end-to-end tests (hosted + vendored
 //! patches, one suite per package manager).
 //!
-//! A hosted (`scan --mode hosted`) or vendored (`scan --vendor`,
-//! `vendor --detached`, a depscan-opened PR) checkout has NO
+//! A hosted (`scan --mode hosted`) or vendored (`scan --mode vendored`,
+//! `get --mode vendored`, a depscan-opened PR) checkout has NO
 //! `.socket/manifest.json`: the patches live in the lockfiles/configs, the
 //! committed `.socket/vendor/` artifacts and (optionally) the two ledgers.
 //! These helpers take a project a real package manager produced, strip it
@@ -130,13 +130,66 @@ pub fn seed_legacy_manifest(project: &Path) -> usize {
     seeded
 }
 
-/// Delete both ledgers — `.socket/vendor/state.json` (vendor) and
-/// `.socket/vendor/redirect-state.json` (hosted) — so the lockfile wiring
-/// (+ committed `.socket/vendor/<eco>/<uuid>/` artifacts) is the ONLY
-/// evidence left. Artifacts are kept.
+/// Delete both ledgers — `.socket/vendor/state.json` (vendor) and a PRE-v5
+/// `.socket/vendor/redirect-state.json` (v5 hosted mode writes none) — so
+/// the lockfile wiring (+ committed `.socket/vendor/<eco>/<uuid>/`
+/// artifacts) is the ONLY evidence left. Artifacts are kept.
 pub fn strip_ledgers(project: &Path) {
     remove_if_present(&project.join(socket_patch_core::vendor::VENDOR_STATE_REL));
     remove_if_present(&project.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL));
+}
+
+/// The pre-v5 hosted ledger's path, relative to the project root. v5
+/// hosted mode never writes it; it is only read, as an extra local record
+/// source, when a checkout still commits one.
+pub const LEGACY_REDIRECT_LEDGER: &str = ".socket/vendor/redirect-state.json";
+
+/// Panic if a hosted run left a `.socket/vendor/redirect-state.json`
+/// behind: v5 hosted mode keeps its state in the lockfiles only.
+pub fn assert_no_hosted_ledger(project: &Path, what: &str) {
+    assert!(
+        !project.join(LEGACY_REDIRECT_LEDGER).exists(),
+        "{what}: v5 hosted mode writes no {LEGACY_REDIRECT_LEDGER}"
+    );
+}
+
+/// Commit a PRE-v5 hosted ledger (`.socket/vendor/redirect-state.json`)
+/// recording `purl` → the patch record carried by `view` (a
+/// [`patch_view`]-shaped API body) — the shape a checkout wired by an
+/// older socket-patch still carries. v5 reads it only as an extra local
+/// record source (so a hosted pin it describes attests offline); it never
+/// writes one.
+pub fn write_legacy_redirect_ledger(project: &Path, purl: &str, view: &Value) {
+    let files: serde_json::Map<String, Value> = view["files"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(k, f)| {
+            (
+                k.clone(),
+                serde_json::json!({
+                    "beforeHash": f["beforeHash"],
+                    "afterHash": f["afterHash"],
+                }),
+            )
+        })
+        .collect();
+    let record: socket_patch_core::manifest::schema::PatchRecord =
+        serde_json::from_value(serde_json::json!({
+            "uuid": view["uuid"],
+            "exportedAt": "2026-03-27T00:00:00Z",
+            "files": files,
+            "vulnerabilities": view["vulnerabilities"],
+            "description": view["description"],
+            "license": view["license"],
+            "tier": view["tier"],
+        }))
+        .expect("the view converts to a patch record");
+    let mut state = socket_patch_core::patch::redirect::RedirectState::new();
+    state.records.insert(purl.to_string(), record);
+    let path = project.join(LEGACY_REDIRECT_LEDGER);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 }
 
 fn remove_if_present(path: &Path) {

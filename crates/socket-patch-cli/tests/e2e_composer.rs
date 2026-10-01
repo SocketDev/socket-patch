@@ -4,10 +4,8 @@
 //! Composer vendor layout.  They do **not** require network access or a real
 //! PHP/Composer installation: every scan's patch lookup is pinned to an
 //! in-test wiremock proxy (empty no-patch result), so a live-API outage can
-//! never fail them and the discovery counts stay the only thing under test.
-//! (They used to call the real public proxy implicitly — green only while
-//! production was healthy — and turned red when the all-batches-failed
-//! exit-code fix made total API failure exit non-zero.)
+//! never fail them (total API failure exits non-zero) and the discovery
+//! counts stay the only thing under test.
 //!
 //! # Running
 //! ```sh
@@ -63,7 +61,6 @@ async fn run(args: &[&str], cwd: &std::path::Path, proxy_url: &str) -> Output {
             .env_remove("SOCKET_API_URL")
             .env_remove("SOCKET_OFFLINE")
             .env_remove("SOCKET_PROXY_URL")
-            .env_remove("SOCKET_PATCH_PROXY_URL")
             .env_remove("SOCKET_BATCH_SIZE")
             .output()
             .expect("Failed to run socket-patch binary")
@@ -72,10 +69,10 @@ async fn run(args: &[&str], cwd: &std::path::Path, proxy_url: &str) -> Output {
     .expect("socket-patch subprocess task panicked")
 }
 
-/// Regression guard: every scan in a test must have routed its patch lookup
+/// Hermeticity guard: every scan in a test must have routed its patch lookup
 /// through the in-test proxy. Fewer recorded requests than scans means a
 /// binary invocation talked to the live API (or skipped the lookup) despite
-/// the pinning — exactly the flake this file used to have.
+/// the pinning.
 async fn assert_proxy_served_scans(server: &MockServer, scans: usize) {
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(
@@ -91,8 +88,9 @@ async fn assert_proxy_served_scans(server: &MockServer, scans: usize) {
 ///
 /// Parsing (rather than substring matching) means a malformed or missing
 /// envelope fails the test loudly instead of slipping past a `.contains()`
-/// check. Doing this offline is safe: the package *count* is derived from the
-/// local crawl and is emitted regardless of whether the API query succeeds.
+/// check. The package *count* is derived from the local crawl; the patch
+/// lookup is served by the in-test proxy, so the exit-0 / status=success
+/// assertions hold without live network access.
 async fn scan_json(cwd: &std::path::Path, proxy_url: &str) -> serde_json::Value {
     let output = run(
         &["scan", "--json", "--cwd", cwd.to_str().unwrap()],

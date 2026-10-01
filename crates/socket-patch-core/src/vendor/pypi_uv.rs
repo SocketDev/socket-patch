@@ -1,20 +1,21 @@
 //! uv-project wiring: paired `pyproject.toml` + `uv.lock` surgery.
 //!
-//! The pairing is load-bearing (spike claims 7/9): a `[tool.uv.sources]`
+//! The pairing is load-bearing (spike-verified): a `[tool.uv.sources]`
 //! entry for a package uv doesn't consider declared is SILENTLY ignored, and
 //! a path-source lock without the pyproject entry is silently rewritten back
 //! to the registry by a plain `uv sync`. So vendor always writes BOTH — the
 //! pyproject sources entry (plus, for transitive deps, a
-//! `[tool.uv] override-dependencies` pin, which sources DO apply to — claim
-//! 8 — but only on uv >= 0.5.6: 0.2.35–0.5.3 ignore sources for overrides
+//! `[tool.uv] override-dependencies` pin, which sources DO apply to — but
+//! only on uv >= 0.5.6: 0.2.35–0.5.3 ignore sources for overrides
 //! and a plain `uv sync` there reinstalls the registry wheel, hence the
 //! `pypi_uv_override_requires_uv_0_5_6` advisory on that branch) and the
 //! lock's `[[package]]` / `requires-dist` / `[manifest]` fragments.
 //!
 //! All lock edits are targeted text surgery rather than a TOML re-serialize:
 //! the spike proved a surgical edit reproduces uv's own serializer output
-//! byte-identically (claim 2), which keeps `uv lock --check` green and the
-//! committed diff minimal. The `spikes/uv/` fixtures pin the exact shapes.
+//! byte-identically, which keeps `uv lock --check` green and the committed
+//! diff minimal. The inline fixture constants in this module's tests
+//! (captured from real uv output) pin the exact shapes.
 
 use std::ops::Range;
 use std::path::Path;
@@ -43,7 +44,7 @@ use super::toml_surgery::{
 };
 use super::{RevertOutcome, VendorWarning};
 
-/// Highest uv.lock `revision` the spike fixtures were generated with. A newer
+/// Highest uv.lock `revision` the test fixtures were generated with. A newer
 /// revision is a warning, not a refusal: the shapes we rewrite have been
 /// stable across revisions and `uv lock --check` will catch a real mismatch.
 const HIGHEST_TESTED_LOCK_REVISION: u64 = 3;
@@ -70,7 +71,7 @@ enum UvDepClass {
 /// the lock rewrite is text surgery, so there is no mutated document to
 /// hand back, and the pyproject's emitted text may have had its CRLF line
 /// endings restored — the document those bytes parse to is not the one in
-/// hand. A write simply costs the next package one parse, as before, and
+/// hand. A write simply costs the next package one parse, and
 /// every write path here drops the slot it just made unreachable rather
 /// than leaving a megabyte of document for the next read to evict.
 static PYPROJECT_MEMO: ParseMemo<DocumentMut> = ParseMemo::new();
@@ -408,10 +409,11 @@ pub(super) fn check_target_guards(
 /// The (wheel path, sha256) the WIRED pair still pins for an in-sync target:
 /// the lock's rewritten `[[package]]` unit carries `source = { path = … }`
 /// under THIS patch uuid's dir plus the single `{ filename, hash }` wheels
-/// element vendor wrote — the very pin the next `uv sync` verifies. The
-/// in-sync rebuild guard falls back to it when the state.json ledger has no
-/// entry left for the patch. Paths are returned bare (no `./` prefix),
-/// matching the ledger's `artifact.path` spelling.
+/// element (a server sdist: the `sdist = { hash }` table) vendor wrote — the
+/// very pin the next `uv sync` verifies. The in-sync rebuild guard falls
+/// back to it when the state.json ledger has no entry left for the patch.
+/// Paths are returned bare (no `./` prefix), matching the ledger's
+/// `artifact.path` spelling.
 pub(super) fn wired_pin(
     p: &UvProject,
     canon_name: &str,
@@ -431,16 +433,21 @@ pub(super) fn wired_pin(
         .and_then(Value::as_str)?;
     super::path::parse_vendor_path(path)
         .filter(|parts| parts.eco == "pypi" && parts.uuid == record_uuid)?;
-    let sha = unit
-        .get("wheels")
-        .and_then(Item::as_array)?
-        .iter()
-        .find_map(|w| {
+    let sha = match unit.get("wheels").and_then(Item::as_array) {
+        Some(wheels) => wheels.iter().find_map(|w| {
             w.as_inline_table()?
                 .get("hash")?
                 .as_str()?
                 .strip_prefix("sha256:")
-        })?;
+        })?,
+        // A server sdist is wired as `sdist = { hash = … }` instead.
+        None => unit
+            .get("sdist")
+            .and_then(Item::as_inline_table)
+            .and_then(|sdist| sdist.get("hash"))
+            .and_then(Value::as_str)
+            .and_then(|h| h.strip_prefix("sha256:"))?,
+    };
     if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -451,7 +458,7 @@ pub(super) fn wired_pin(
 /// Wire the pair for the vendored wheel. Writes `pyproject.toml` FIRST, then
 /// `uv.lock`; a failed lock write unwinds the pyproject from the recorded
 /// original so the pair is never left half-wired (either half alone is a
-/// silent no-op or a silent revert — spike claims 7/9). The third element
+/// silent no-op or a silent revert). The third element
 /// carries wiring-time advisories (non-fatal, surfaced with the outcome).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn wire_uv(
@@ -1077,13 +1084,19 @@ fn rewrite_target_package_unit(
     // rebuilt unit splices back in front of the same `\r\n`.
     let old_unit = lock_text[span].trim_end_matches('\r').to_string();
     let unit: Vec<&str> = old_unit.lines().collect();
-    let wheels_lines = [
-        "wheels = [".to_string(),
-        format!(
-            "    {{ filename = \"{wheel_file_name}\", hash = \"sha256:{wheel_sha256_hex}\" }},"
-        ),
-        "]".to_string(),
-    ];
+    let wheels_lines = if wheel_file_name.ends_with(".whl") {
+        vec![
+            "wheels = [".to_string(),
+            format!(
+                "    {{ filename = \"{wheel_file_name}\", hash = \"sha256:{wheel_sha256_hex}\" }},"
+            ),
+            "]".to_string(),
+        ]
+    } else {
+        vec![format!(
+            "sdist = {{ hash = \"sha256:{wheel_sha256_hex}\" }}"
+        )]
+    };
 
     let mut out: Vec<String> = Vec::new();
     let mut wheels_done = false;
@@ -1553,7 +1566,17 @@ struct MetaDep {
 /// the fixtures that pass no block stay byte-exact.
 pub(super) async fn wheel_metadata_block(wheel_path: &Path) -> Option<String> {
     let bytes = tokio::fs::read(wheel_path).await.ok()?;
-    let text = wheel_metadata_text(&bytes)?;
+    let text = if wheel_path.to_string_lossy().ends_with(".whl") {
+        wheel_metadata_text(&bytes)?
+    } else {
+        let members =
+            super::pypi_distribution::read_members(&bytes, &wheel_path.to_string_lossy()).ok()?;
+        let metadata = members.get("PKG-INFO")?;
+        if metadata.len() > 4 * 1024 * 1024 {
+            return None;
+        }
+        String::from_utf8(metadata.clone()).ok()?
+    };
     render_package_metadata_block(&text)
 }
 
@@ -1704,8 +1727,8 @@ fn render_requires_dist_entry(dep: &MetaDep) -> String {
 /// wheel core METADATA text. Returns the block (no leading/trailing newline)
 /// or `None` when there is nothing to record (no requires-dist AND no
 /// provides-extras) or a `Requires-Dist` line fails to parse — in which case
-/// we emit no block rather than risk malformed TOML (`uv sync` then heals it,
-/// the pre-fix behavior, instead of failing to parse the lock).
+/// we emit no block rather than risk malformed TOML (`uv sync` then heals it
+/// instead of failing to parse the lock).
 pub(super) fn render_package_metadata_block(metadata_text: &str) -> Option<String> {
     let (requires_raw, provides_raw) = parse_core_metadata_fields(metadata_text);
     if requires_raw.is_empty() && provides_raw.is_empty() {
@@ -1762,9 +1785,9 @@ mod tests {
     const WHEEL_SHA: &str = "8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254";
 
     // ── fixture constants ──────────────────────────────────────────────
-    // Byte-exact copies of the uv-generated spikes/uv/ fixtures (uv 0.11.19,
-    // 2026-06-09). If these drift from the committed fixtures, the spike
-    // dirs are the source of truth.
+    // Byte-exact copies of uv-generated output (uv 0.11.19, 2026-06-09;
+    // captured during the phase-0 spike, not committed). These constants are
+    // the source of truth.
 
     const DIRECT_REGISTRY_PYPROJECT: &str = r#"[project]
 name = "proj"
@@ -1956,6 +1979,7 @@ wheels = [
             base_purl: "pkg:pypi/six@1.16.0".into(),
             uuid: UUID.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: REL_WHEEL.into(),
                 sha256: WHEEL_SHA.into(),
                 size: Some(11053),
@@ -1979,8 +2003,8 @@ wheels = [
     /// The wired-pair pin reader the in-sync rebuild guard falls back to
     /// when the state.json ledger has no entry: the lock's rewritten
     /// `[[package]]` unit yields (wheel path, sha256); a registry-shaped
-    /// lock, or a foreign uuid, yields None (the guard then stays off, as
-    /// before, rather than guessing).
+    /// lock, or a foreign uuid, yields None (the guard then stays off rather
+    /// than guessing).
     #[tokio::test]
     async fn wired_pin_reads_the_wired_pair() {
         let tmp = write_pair(DIRECT_PATH_PYPROJECT, DIRECT_PATH_LOCK).await;
@@ -2000,6 +2024,37 @@ wheels = [
             wired_pin(&p2, "six", UUID),
             None,
             "a registry-shaped lock pins nothing of ours"
+        );
+    }
+
+    /// A server sdist is wired with `sdist = { hash }` instead of a wheels
+    /// array; the guard's fallback reads that pin too.
+    #[tokio::test]
+    async fn wired_pin_reads_a_wired_server_sdist() {
+        let rel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0.tar.gz");
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            &rel,
+            "six-1.16.0.tar.gz",
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let (_, lock) = read_pair(tmp.path()).await;
+        assert!(
+            lock.contains(&format!("sdist = {{ hash = \"sha256:{WHEEL_SHA}\" }}")),
+            "{lock}"
+        );
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            wired_pin(&p, "six", UUID),
+            Some((rel, WHEEL_SHA.to_string()))
         );
     }
 
@@ -2050,7 +2105,7 @@ wheels = [
         );
     }
 
-    /// Transitive deps wire via override-dependencies (spike claim 8), never
+    /// Transitive deps wire via override-dependencies, never
     /// promotion — the result must byte-match the override-transitive pair,
     /// including the lock's 1.17.0 → 1.16.0 version pin-down.
     #[tokio::test]
@@ -2275,8 +2330,8 @@ wheels = [
     }
 
     /// A failed lock write must unwind the already-written pyproject — a
-    /// sources entry without the lock pair is exactly the silent-failure
-    /// combo the spike warned about.
+    /// sources entry without the lock pair is a silent failure (uv ignores
+    /// the entry).
     #[tokio::test]
     async fn lock_write_failure_unwinds_pyproject() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
@@ -2856,10 +2911,9 @@ wheels = [
         tokio::fs::write(&path, &bytes).await.unwrap();
     }
 
-    /// The core defect: after wiring, the path-sourced package must carry the
-    /// reconstructed `[package.metadata]` block (it was dropped before the
-    /// fix, leaving `uv lock --check` red), and `vendor --revert` must
-    /// byte-restore the original registry lock.
+    /// After wiring, the path-sourced package must carry the reconstructed
+    /// `[package.metadata]` block (without it `uv lock --check` is red), and
+    /// `vendor --revert` must byte-restore the original registry lock.
     #[tokio::test]
     async fn direct_wiring_reconstructs_package_metadata_block_and_reverts() {
         let rel_wheel = format!(".socket/vendor/pypi/{UUID}/{WIDGET_WHEEL_NAME}");
@@ -2929,9 +2983,9 @@ wheels = [
     }
 
     /// A hand-edited `overrides = []` (uv itself omits the key when empty)
-    /// must extend to a well-formed single-element array — the single-line
-    /// branch used to emit `[, { … }]`, a leading comma that stops the whole
-    /// lock from parsing (every later `uv sync` AND our own next load fail).
+    /// must extend to a well-formed single-element array — never `[, { … }]`,
+    /// a leading comma that stops the whole lock from parsing (every later
+    /// `uv sync` AND our own next load fail).
     #[tokio::test]
     async fn override_wiring_extends_an_empty_manifest_overrides_array() {
         let empty_overrides_lock = TRANSITIVE_REGISTRY_LOCK.replace(
@@ -3291,8 +3345,7 @@ wheels = [
     // ── load/wire refusal edges ──────────────────────────────────────────
 
     /// Load-side error tuples for malformed pyproject shapes: an unparseable
-    /// pyproject.toml and a `[project]` with no `name` (only their uv.lock
-    /// twins were covered).
+    /// pyproject.toml and a `[project]` with no `name`.
     #[tokio::test]
     async fn load_refuses_unparseable_or_nameless_pyproject() {
         let tmp = write_pair("not = [broken\n", DIRECT_REGISTRY_LOCK).await;
@@ -3649,7 +3702,7 @@ wheels = [
 
     /// A third-party edit to the REWRITTEN `[manifest] overrides` array must
     /// be left alone with a drift warning — the never-clobber contract for
-    /// this record kind (only the uv_lock_package drift arm was covered).
+    /// this record kind.
     #[tokio::test]
     async fn revert_warns_and_skips_on_drifted_manifest_overrides_array() {
         let one_el = "overrides = [{ name = \"other\", path = \"o.whl\" }]";
@@ -3826,9 +3879,9 @@ wheels = [
 
     /// The pypi drift-keep gate × the convergence carve-out, end to end: a
     /// hand-restored uv pair converges silently, so `revert_pypi` must still
-    /// DELETE the artifact dir (no `kept_artifact`) — before the carve-out
-    /// the gate misread the convergence as drift and kept the uuid dir and
-    /// ledger entry forever with an unsatisfiable remediation.
+    /// DELETE the artifact dir (no `kept_artifact`) — without the carve-out
+    /// the gate would misread the convergence as drift and keep the uuid dir
+    /// and ledger entry forever with an unsatisfiable remediation.
     #[tokio::test]
     async fn revert_pypi_converged_uv_cleans_up_the_artifact() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
@@ -4299,8 +4352,8 @@ wheels = [
         assert_eq!(wheel_metadata_text(&bytes).as_deref(), Some(real));
     }
 
-    /// METADATA over the size cap drops the WHOLE extraction (degrade to the
-    /// pre-fix no-block behavior), never a truncated block.
+    /// METADATA over the size cap drops the WHOLE extraction (degrade to no
+    /// block), never a truncated block.
     #[test]
     fn wheel_metadata_text_drops_an_oversized_metadata_file() {
         let entries = vec![(
@@ -4346,7 +4399,7 @@ wheels = [
         );
     }
 
-    // ── coverage mop-up 2026-09: guard/error/skip arms ────────────────────
+    // ── guard/error/skip arms ────────────────────────────────────────────
 
     /// In-memory pair (no tempdir) for the pure-read helpers.
     fn project_from(pyproject: &str, lock: &str) -> UvProject {
@@ -4982,10 +5035,11 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
     /// A target declared ONLY in the legacy `[tool.uv] dev-dependencies`
     /// array is a Direct dependency: `[tool.uv.sources]` applies to it and
     /// the lock keeps it in `[package.metadata.requires-dev]`. Classifying
-    /// it Transitive took the override branch and left the requires-dev
-    /// `specifier` in place, so every uv >= 0.2.37 `uv sync --locked` /
-    /// `uv lock --check` failed after a "successful" vendored scan (and a
-    /// plain `uv sync` on 0.2.37/0.4.30 reinstalled the pristine wheel).
+    /// it Transitive would take the override branch and leave the
+    /// requires-dev `specifier` in place, so every uv >= 0.2.37 `uv sync
+    /// --locked` / `uv lock --check` would fail after a "successful" vendored
+    /// scan (and a plain `uv sync` on 0.2.37/0.4.30 would reinstall the
+    /// pristine wheel).
     #[tokio::test]
     async fn tool_uv_dev_dependencies_classify_direct_and_repoint_requires_dev() {
         let tmp = write_pair(TOOL_UV_DEV_REGISTRY_PYPROJECT, DEV_GROUP_REGISTRY_LOCK).await;
@@ -5124,9 +5178,9 @@ wheels = [
 "#;
 
     /// Both requires-dist entries for one package (bare + extra-marker) are
-    /// repointed — one wiring record each — and revert restores both. The
-    /// first-match `break` left the marker entry with its `specifier`, so
-    /// `uv lock --check` / `uv sync --locked` failed after vendoring.
+    /// repointed — one wiring record each — and revert restores both. A
+    /// marker entry left with its `specifier` fails `uv lock --check` /
+    /// `uv sync --locked` after vendoring.
     #[tokio::test]
     async fn duplicate_requires_dist_entries_all_repointed() {
         let tmp = write_pair(EXTRAS_DUP_REGISTRY_PYPROJECT, EXTRAS_DUP_REGISTRY_LOCK).await;
@@ -5352,10 +5406,9 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
     }
 
     /// A pure-CRLF pair (git autocrlf on Windows) must wire to a pure-CRLF
-    /// pair and revert byte-exactly. `doc.to_string()` re-emits every
-    /// pyproject newline as LF, the lock surgery joined rebuilt units and
-    /// created `[manifest]` fragments with LF (mixed endings), and revert's
-    /// hardcoded `"{new}\n"` removals then missed. Covers the Direct,
+    /// pair and revert byte-exactly: `doc.to_string()` re-emits every
+    /// pyproject newline as LF, and every lock fragment spliced, created or
+    /// removed must use the file's own terminator. Covers the Direct,
     /// Transitive (created override + created `[manifest]`), Rewritten
     /// override (multi-line arrays in both files) and requires-dev shapes.
     #[tokio::test]
@@ -5461,8 +5514,7 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
     /// The `[[distribution]]` refusal names the REAL limitation measured
     /// against the 0.1.45–0.2.34 binaries (relative path sources are
     /// rejected by `--locked` and absolutized by `uv lock` / `uv sync`),
-    /// not the old "records absolute file paths" folklore, and points at
-    /// both exits (uv >= 0.2.35, or a requirements.txt install).
+    /// and points at both exits (uv >= 0.2.35, or a requirements.txt install).
     #[tokio::test]
     async fn legacy_distribution_lock_refusal_names_the_real_limitation() {
         let legacy_lock = "version = 1\nrequires-python = \">=3.9\"\n\n[[distribution]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = { editable = \".\" }\n";

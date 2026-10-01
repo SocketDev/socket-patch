@@ -155,7 +155,7 @@ pub(super) fn default_instances<'a>(lock: &'a HostedLock, dep: &DepOverride) -> 
     partition_instances(nodes, &full_name(dep), &dep.version, lock.parsed.options()).0
 }
 
-/// Does `dep` have a node of socket-patch's vendored vlt shape (§3.4) in a
+/// Does `dep` have a node of socket-patch's vendored vlt shape in a
 /// lock that passed the lock-level parse?
 pub(super) fn has_vendored_instance(lock: &HostedLock, dep: &DepOverride) -> bool {
     lock.parsed
@@ -163,9 +163,9 @@ pub(super) fn has_vendored_instance(lock: &HostedLock, dep: &DepOverride) -> boo
         .is_some_and(|nodes| has_vendored_node(nodes, &full_name(dep), &dep.version))
 }
 
-/// The lock-level warnings that say vlt may discard the lock's pins
-/// (§3.9 (c)): neither in-run nor standalone VEX attests a hosted pin of such
-/// a lock from the lock alone.
+/// The lock-level warnings that say vlt may discard the lock's pins:
+/// neither in-run nor standalone VEX attests a hosted pin of such a lock
+/// from the lock alone.
 pub const DISCARDING_LOCK_CODES: [&str; 3] = [
     VERSION_MISSING,
     OLD_LOCKFILE_IGNORED,
@@ -529,8 +529,8 @@ fn rewrite_dep(
     changed
 }
 
-/// The hosted vlt rewrite (DESIGN §3.2–§3.8): lock-level refusal and
-/// advisories, then each npm override's default-registry instances.
+/// The hosted vlt rewrite: lock-level refusal and advisories, then each
+/// npm override's default-registry instances.
 pub(super) fn rewrite_vlt_lock(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -586,26 +586,6 @@ fn same_slots(a: &NodeEntry<'_>, b: &NodeEntry<'_>) -> bool {
     slot_value(a, 2) == slot_value(b, 2) && slot_value(a, 3) == slot_value(b, 3)
 }
 
-fn drift(id: &str, why: &str) -> String {
-    format!(
-        "vlt-lock.json {why}; restore the registry pin for {id} manually, or re-run \
-         `socket-patch scan --mode hosted` and then roll back"
-    )
-}
-
-/// What [`revert_vlt_slots`] found on the line keyed by an edit's DepID.
-#[derive(Debug, PartialEq)]
-pub(crate) enum SlotRevert {
-    /// The lock text with `original`'s slots back on that line.
-    Restored(String),
-    /// The line already holds `original`'s slots.
-    Unchanged,
-    /// No line has the DepID. Every instance of a `name@version` shares one
-    /// hosted URL, so [`revert_vanished`] runs only after the transaction's
-    /// other edits are staged.
-    Vanished,
-}
-
 /// The recorded DepID and entries of a [`KIND`] edit.
 fn recorded(edit: &FileEdit) -> Result<(NodeEntry<'_>, NodeEntry<'_>), String> {
     fn fragment(v: &Option<Value>) -> Option<&str> {
@@ -624,91 +604,6 @@ fn recorded(edit: &FileEdit) -> Result<(NodeEntry<'_>, NodeEntry<'_>), String> {
         return Err(format!("{KIND} edit records two different DepIDs"));
     }
     Ok((original, new))
-}
-
-/// Undo one [`KIND`] edit by slots. The line keyed by the recorded DepID
-/// gets `original`'s slots [2] and [3] back while its current flags,
-/// trailing slots, indent, comma and `\r` stay, so a lock vlt re-laid since
-/// the rewrite still reverts. A line that already holds `original`'s slots
-/// is [`SlotRevert::Unchanged`]; anything else on that line is drift.
-pub(crate) fn revert_vlt_slots(text: &str, edit: &FileEdit) -> Result<SlotRevert, String> {
-    let (original, new) = recorded(edit)?;
-    let id = original.key;
-    let lines = split_lines(text);
-    let Some(span) = nodes_block(&lines) else {
-        return Err(drift(id, "nodes section is not in vlt's canonical layout"));
-    };
-    let prefix = format!("    \"{id}\": ");
-    let keyed: Vec<usize> = span
-        .entry_lines()
-        .filter(|&i| lines[i].starts_with(prefix.as_str()))
-        .collect();
-    match keyed.as_slice() {
-        [] => Ok(SlotRevert::Vanished),
-        [idx] => {
-            let Some(line) = parse_node_line(lines[*idx]) else {
-                return Err(drift(
-                    id,
-                    &format!("entry {id} is outside vlt's node grammar"),
-                ));
-            };
-            if same_slots(&line.entry, &original) {
-                return Ok(SlotRevert::Unchanged);
-            }
-            if !same_slots(&line.entry, &new) {
-                return Err(drift(
-                    id,
-                    &format!("entry {id} drifted from the recorded redirect"),
-                ));
-            }
-            let tuple = render_tuple_with_slots(
-                &line.entry.elems,
-                original.slot(2).filter(|s| *s != "null"),
-                original.slot(3).filter(|s| *s != "null"),
-            );
-            let mut out: Vec<String> = lines.iter().map(|l| (*l).to_string()).collect();
-            out[*idx] = render_entry_line(&entry_text(id, &tuple), line.comma, line.cr);
-            Ok(SlotRevert::Restored(out.join("\n")))
-        }
-        _ => Err(drift(id, &format!("has {id} more than once"))),
-    }
-}
-
-/// Finish a [`SlotRevert::Vanished`] edit against `text`, the lock with
-/// every other edit of the same revert already staged. `Ok(None)`: a
-/// re-lock dropped the pin, so nothing is left to revert. `Ok(Some(text))`:
-/// vlt re-keyed the node (a new peer context) and carried the pin, so every
-/// default-registry instance of the same `name@version` that holds exactly
-/// `new`'s slots gets `original`'s back. The hosted URL on any other line
-/// is drift.
-pub(crate) fn revert_vanished(text: &str, edit: &FileEdit) -> Result<Option<String>, String> {
-    let (original, new) = recorded(edit)?;
-    let Some(url) = slot_value(&new, 3).and_then(|v| v.as_str().map(str::to_string)) else {
-        return Ok(None);
-    };
-    if !text.contains(url.as_str()) {
-        return Ok(None);
-    }
-    let lines = split_lines(text);
-    let mut out: Vec<String> = lines.iter().map(|l| (*l).to_string()).collect();
-    let carried = carried_pin_lines(text, &lines, &new);
-    for &i in &carried {
-        let line = parse_node_line(lines[i]).expect("carried_pin_lines parsed this line");
-        let tuple = render_tuple_with_slots(
-            &line.entry.elems,
-            original.slot(2).filter(|s| *s != "null"),
-            original.slot(3).filter(|s| *s != "null"),
-        );
-        out[i] = render_entry_line(&entry_text(line.entry.key, &tuple), line.comma, line.cr);
-    }
-    let restored = out.join("\n");
-    if carried.is_empty() || restored.contains(url.as_str()) {
-        return Err(drift(
-            new.key,
-            &format!("no longer has {}, but still pins its hosted URL", new.key),
-        ));
-    }
-    Ok(Some(restored))
 }
 
 /// The nodes-section lines of `text` that hold `new`'s pin under another
@@ -848,10 +743,6 @@ mod tests {
 
     fn registry_entry() -> String {
         format!("\"{ID}\": [0,\"left-pad\",\"{REG_SHA}\",\"{REG_URL}\"]")
-    }
-
-    fn hosted_entry() -> String {
-        format!("\"{ID}\": [0,\"left-pad\",\"{SHA}\",\"{URL}\"]")
     }
 
     #[test]
@@ -1070,173 +961,6 @@ mod tests {
         assert!(result.warnings.is_empty());
     }
 
-    fn revert(lock: &str, edit: &FileEdit) -> Result<Option<String>, String> {
-        match revert_vlt_slots(lock, edit)? {
-            SlotRevert::Restored(text) => Ok(Some(text)),
-            SlotRevert::Unchanged => Ok(None),
-            SlotRevert::Vanished => revert_vanished(lock, edit),
-        }
-    }
-
-    #[test]
-    fn revert_restores_the_slots_after_a_comma_move() {
-        let edit = vlt_edit(&registry_entry(), &hosted_entry());
-        let lone = lock_with(&[&hosted_entry()]);
-        assert_eq!(
-            revert(&lone, &edit).unwrap().unwrap(),
-            lock_with(&[&registry_entry()])
-        );
-        let sibling = "\"~npm~zz@1.0.0\": [0,\"zz\",\"sha512-z\"]";
-        let moved = lock_with(&[&hosted_entry(), sibling]);
-        assert_eq!(
-            revert(&moved, &edit).unwrap().unwrap(),
-            lock_with(&[&registry_entry(), sibling])
-        );
-    }
-
-    #[test]
-    fn revert_keeps_a_changed_flag_and_new_trailing_slots() {
-        let edit = vlt_edit(&registry_entry(), &hosted_entry());
-        let relaid = lock_with(&[&format!(
-            "\"{ID}\": [2,\"left-pad\",\"{SHA}\",\"{URL}\",null,null,null,null,{{  \"lp\": \"bin.js\"}}]"
-        )]);
-        assert_eq!(
-            revert(&relaid, &edit).unwrap().unwrap(),
-            lock_with(&[&format!(
-                "\"{ID}\": [2,\"left-pad\",\"{REG_SHA}\",\"{REG_URL}\",null,null,null,null,{{  \"lp\": \"bin.js\"}}]"
-            )])
-        );
-    }
-
-    #[test]
-    fn revert_of_a_three_tuple_original() {
-        let original = format!("\"{ID}\": [0,\"left-pad\",\"{REG_SHA}\"]");
-        let edit = vlt_edit(&original, &hosted_entry());
-        assert_eq!(
-            revert(&lock_with(&[&hosted_entry()]), &edit)
-                .unwrap()
-                .unwrap(),
-            lock_with(&[&original])
-        );
-        let five = lock_with(&[&format!(
-            "\"{ID}\": [1,\"left-pad\",\"{SHA}\",\"{URL}\",\"lib\"]"
-        )]);
-        assert_eq!(
-            revert(&five, &edit).unwrap().unwrap(),
-            lock_with(&[&format!(
-                "\"{ID}\": [1,\"left-pad\",\"{REG_SHA}\",null,\"lib\"]"
-            )])
-        );
-    }
-
-    #[test]
-    fn revert_after_an_lf_resave_of_a_crlf_lock() {
-        let edit = vlt_edit(&registry_entry(), &hosted_entry());
-        let crlf = lock_with(&[&hosted_entry()]).replace('\n', "\r\n");
-        assert_eq!(
-            revert(&crlf, &edit).unwrap().unwrap(),
-            lock_with(&[&registry_entry()]).replace('\n', "\r\n")
-        );
-        let lf = lock_with(&[&hosted_entry()]);
-        assert_eq!(
-            revert(&lf, &edit).unwrap().unwrap(),
-            lock_with(&[&registry_entry()])
-        );
-    }
-
-    #[test]
-    fn revert_already_reverted() {
-        let edit = vlt_edit(&registry_entry(), &hosted_entry());
-        assert_eq!(revert(&lock_with(&[&registry_entry()]), &edit), Ok(None));
-        let relaid = lock_with(&[&format!(
-            "\"{ID}\": [2,\"left-pad\",\"{REG_SHA}\",\"{REG_URL}\"]"
-        )]);
-        assert_eq!(revert(&relaid, &edit), Ok(None));
-        let relocked = lock_with(&[&format!(
-            "\"~npm~left-pad@1.3.0~peer.1\": [0,\"left-pad\",\"{REG_SHA}\",\"{REG_URL}\"]"
-        )]);
-        assert_eq!(revert(&relocked, &edit), Ok(None));
-    }
-
-    #[test]
-    fn revert_refuses_drift() {
-        let edit = vlt_edit(&registry_entry(), &hosted_entry());
-        let other = lock_with(&[&format!(
-            "\"{ID}\": [0,\"left-pad\",\"sha512-OTHER==\",\"{URL}\"]"
-        )]);
-        assert!(revert(&other, &edit).unwrap_err().contains("drifted"));
-        let moved = lock_with(&[&format!(
-            "\"~npm~left-pad@1.3.0~peer.1\": [0,\"left-pad\",\"sha512-OTHER==\",\"{URL}\"]"
-        )]);
-        let err = revert(&moved, &edit).unwrap_err();
-        assert!(err.contains("still pins its hosted URL"), "{err}");
-        assert!(err.contains("restore the registry pin for ~npm~left-pad@1.3.0 manually"));
-        let elsewhere = lock_with(&[&format!(
-            "\"~npm~right-pad@1.3.0\": [0,\"right-pad\",\"{SHA}\",\"{URL}\"]"
-        )]);
-        let err = revert(&elsewhere, &edit).unwrap_err();
-        assert!(err.contains("still pins its hosted URL"), "{err}");
-        let foreign = format!(
-            "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{\"registries\": {{\"acme\": \
-             \"https://acme.test/\"}}}},\n  \"nodes\": {{\n    \"~acme~left-pad@1.3.0\": \
-             [0,\"left-pad\",\"{SHA}\",\"{URL}\"]\n  }},\n  \"edges\": {{}}\n}}\n"
-        );
-        let err = revert(&foreign, &edit).unwrap_err();
-        assert!(err.contains("still pins its hosted URL"), "{err}");
-        let twice = format!(
-            "{{\n  \"nodes\": {{\n    {},\n    {}\n  }}\n}}\n",
-            hosted_entry(),
-            hosted_entry()
-        );
-        assert!(revert(&twice, &edit)
-            .unwrap_err()
-            .contains("more than once"));
-        let multi = format!("{{\n  \"nodes\": {{\n    \"{ID}\": [\n      0\n    ]\n  }}\n}}\n");
-        assert!(revert(&multi, &edit).unwrap_err().contains("node grammar"));
-        assert!(revert("{\"nodes\": {}}", &edit)
-            .unwrap_err()
-            .contains("canonical"));
-    }
-
-    #[test]
-    fn revert_follows_a_pin_vlt_carried_to_a_new_peer_context() {
-        let old_id = "~npm~left-pad@1.3.0~peer.0df72515a50372ba";
-        let new_id = "~npm~left-pad@1.3.0~peer.32643a3290c32d5d";
-        let edit = vlt_edit(
-            &format!("\"{old_id}\": [0,\"left-pad\",\"{REG_SHA}\"]"),
-            &format!("\"{old_id}\": [0,\"left-pad\",\"{SHA}\",\"{URL}\"]"),
-        );
-        let sibling = "\"~npm~zz@1.0.0\": [0,\"zz\",\"sha512-z\"]";
-        let rekeyed = lock_with(&[
-            &format!("\"{new_id}\": [2,\"left-pad\",\"{SHA}\",\"{URL}\",null,null,null,\"lib\"]"),
-            sibling,
-        ]);
-        assert_eq!(
-            revert(&rekeyed, &edit).unwrap().unwrap(),
-            lock_with(&[
-                &format!(
-                    "\"{new_id}\": [2,\"left-pad\",\"{REG_SHA}\",null,null,null,null,\"lib\"]"
-                ),
-                sibling,
-            ])
-        );
-        let crlf = lock_with(&[&format!(
-            "\"{new_id}\": [0,\"left-pad\",\"{SHA}\",\"{URL}\"]"
-        )])
-        .replace('\n', "\r\n");
-        assert_eq!(
-            revert(&crlf, &edit).unwrap().unwrap(),
-            lock_with(&[&format!("\"{new_id}\": [0,\"left-pad\",\"{REG_SHA}\"]")])
-                .replace('\n', "\r\n")
-        );
-        let both = lock_with(&[
-            &format!("\"{new_id}\": [0,\"left-pad\",\"{SHA}\",\"{URL}\"]"),
-            &format!("\"~npm~right-pad@1.3.0\": [0,\"right-pad\",\"sha512-R==\",\"{URL}\"]"),
-        ]);
-        let err = revert(&both, &edit).unwrap_err();
-        assert!(err.contains("still pins its hosted URL"), "{err}");
-    }
-
     #[test]
     fn a_superseding_edit_keeps_the_pristine_slots_of_a_carried_pin() {
         let old_id = "~npm~left-pad@1.3.0~peer.1";
@@ -1262,19 +986,4 @@ mod tests {
         assert_eq!(carried_pin_original(&relocked, &old), None);
     }
 
-    #[test]
-    fn revert_refuses_a_malformed_ledger_edit() {
-        let mut edit = vlt_edit(&registry_entry(), &hosted_entry());
-        edit.original = None;
-        assert!(revert(&lock_with(&[&hosted_entry()]), &edit).is_err());
-        let edit = vlt_edit("not an entry", &hosted_entry());
-        assert!(revert(&lock_with(&[&hosted_entry()]), &edit).is_err());
-        let edit = vlt_edit(
-            &format!("\"~npm~other@1.0.0\": [0,\"other\",\"{REG_SHA}\"]"),
-            &hosted_entry(),
-        );
-        assert!(revert(&lock_with(&[&hosted_entry()]), &edit)
-            .unwrap_err()
-            .contains("two different DepIDs"));
-    }
 }

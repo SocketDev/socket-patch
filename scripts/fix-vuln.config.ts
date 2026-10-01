@@ -1,8 +1,9 @@
 /**
- * Example prompt module for scripts/study-crates.ts.
+ * Bug-fixing prompt module for scripts/study-crates.ts, with extra emphasis on
+ * the patch engine and crawlers.
  *
  * Pass it with:
- *   npx tsx scripts/study-crates.ts --prompt-file scripts/study-crates.config.example.ts
+ *   npx tsx scripts/study-crates.ts --prompt-file scripts/fix-vuln.config.ts
  *
  * The module's default export is a function `(ctx: FileCtx) => string` that
  * returns the prompt for one file. This gives you full programmatic control:

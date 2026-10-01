@@ -4,14 +4,16 @@
 //! view) via wiremock, lays down a pnpm project whose only lockfile is a root
 //! `pnpm-lock.yaml`, runs the redirect, and asserts the patched package's
 //! `resolution:` was spliced to `{integrity: sha512-<patched>, tarball:
-//! <hosted url>}` (the shape the shared golden `npm/pnpm` fixture pins) with a
-//! `redirect_pnpm_resolution` edit recorded in the revert ledger.
+//! <hosted url>}` (the shape the shared golden `npm/pnpm` fixture pins) — and,
+//! v5, that no redirect ledger is written: `rollback` restores the upstream
+//! entry from the (mocked) npm registry instead.
 //!
 //! `in_process_redirect.rs` covers pnpm ONLY through the Rush nested-lock
 //! path; these tests pin the plain single-project pnpm root-lock rewrite plus
 //! its idempotency and the `--vex` `(redirected)` attestation.
 
 use serial_test::serial;
+use socket_patch_cli::commands::rollback::{self, RollbackArgs};
 use socket_patch_cli::commands::scan::{run, ScanArgs, ScanMode};
 use std::path::Path;
 
@@ -30,10 +32,54 @@ const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 const UPSTREAM_SHA512: &str = "sha512-UPSTREAMupstream==";
 const GHSA: &str = "GHSA-rdir-pnpm-bbbb";
 
-/// `--mode hosted` (the released spelling that folds to `redirect: true`).
+fn assert_no_ledger(root: &Path) {
+    assert!(
+        !root.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode writes no redirect ledger"
+    );
+}
+
+/// In-process `rollback` of the hosted pin: the mock patch host is named by
+/// `--patch-server-url` (so discovery finds the pin) and the upstream restore
+/// re-resolves `NAME@VERSION` from a mocked npm registry serving
+/// `UPSTREAM_SHA512`.
+async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
+    Mock::given(method("GET"))
+        .and(path(format!("/npm-registry/{NAME}/{VERSION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": NAME,
+            "version": VERSION,
+            "dist": {
+                "tarball": format!("{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz", server.uri()),
+                "integrity": UPSTREAM_SHA512,
+            }
+        })))
+        .mount(server)
+        .await;
+    std::env::set_var("SOCKET_NPM_REGISTRY", format!("{}/npm-registry", server.uri()));
+    let code = rollback::run(RollbackArgs {
+        targets: Vec::new(),
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: cwd.to_path_buf(),
+            json: true,
+            yes: true,
+            silent: true,
+            patch_server_url: Some("http://patch.test".to_string()),
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
+        preserve_state: false,
+    })
+    .await;
+    std::env::remove_var("SOCKET_NPM_REGISTRY");
+    code
+}
+
+/// `--mode hosted`.
 fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: cwd.to_path_buf(),
             org: Some(ORG.to_string()),
@@ -48,11 +94,10 @@ fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: Some(ScanMode::Hosted),
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     }
 }
 
@@ -111,7 +156,7 @@ async fn mock_reference(server: &MockServer) {
         .await;
 }
 
-/// `view/{uuid}` — the patch record persisted into the redirect ledger for VEX.
+/// `view/{uuid}` — the patch record the in-run VEX attests from (in memory).
 async fn mock_view(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
@@ -185,9 +230,9 @@ snapshots:
 
 /// (a) The pnpm root-lock rewrite: the `resolution:` for the patched package
 /// gains the `tarball:` key pointing at the hosted patch and its integrity
-/// becomes the patched sha512, the upstream integrity is gone, a
-/// `redirect_pnpm_resolution` edit lands in the ledger, and a second run adds
-/// zero edits (idempotent).
+/// becomes the patched sha512, the upstream integrity is gone, no ledger is
+/// written, a second run is a byte-stable no-op, and `rollback` restores the
+/// pristine lock AND removes the auto-created pnpm-workspace.yaml.
 #[tokio::test]
 #[serial]
 async fn hosted_rewrites_pnpm_root_lock_resolution() {
@@ -197,6 +242,7 @@ async fn hosted_rewrites_pnpm_root_lock_resolution() {
 
     let tmp = tempfile::tempdir().unwrap();
     write_pnpm_project(tmp.path());
+    let pristine_lock = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
 
     let code = run(hosted_args(tmp.path(), server.uri())).await;
     assert_eq!(code, 0, "scan --mode hosted should succeed for pnpm");
@@ -225,27 +271,12 @@ async fn hosted_rewrites_pnpm_root_lock_resolution() {
         "the importer/snapshot keys must be preserved; got:\n{lock}"
     );
 
-    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
-    let first: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
-    let edits = first["edits"].as_array().unwrap();
-    assert!(
-        edits
-            .iter()
-            .any(|e| e["kind"] == "redirect_pnpm_resolution"
-                && e["key"] == format!("{NAME}@{VERSION}")),
-        "the ledger must record a redirect_pnpm_resolution edit: {first}"
-    );
-    // The ORIGINAL upstream integrity is preserved for revert.
-    assert!(
-        first.to_string().contains("UPSTREAMupstream"),
-        "the ledger must preserve the original upstream integrity for revert: {first}"
-    );
+    assert_no_ledger(tmp.path());
 
     // Zero-touch trust config: a rewritten root v9 lock auto-creates
     // pnpm-workspace.yaml with the root-only scaffold + `trustLockfile: true`
     // (pnpm >=11 rejects the redirected lock without it; 9/10 ignore the
-    // key), and the ledger records the created-file edit for revert.
+    // key).
     let ws_path = tmp.path().join("pnpm-workspace.yaml");
     let ws = std::fs::read_to_string(&ws_path)
         .expect("the redirect must auto-create pnpm-workspace.yaml");
@@ -253,28 +284,12 @@ async fn hosted_rewrites_pnpm_root_lock_resolution() {
         ws, "packages:\n  - '.'\ntrustLockfile: true\n",
         "created workspace file must be the scaffold + trust key"
     );
-    assert!(
-        edits.iter().any(|e| {
-            e["kind"] == "redirect_pnpm_workspace_trust"
-                && e["action"] == "created"
-                && e["path"] == "pnpm-workspace.yaml"
-                && e["key"] == "trustLockfile"
-        }),
-        "the ledger must record the workspace-trust creation: {first}"
-    );
 
-    // Idempotency: a second run rewrites nothing new — an already-redirected
-    // resolution must not append duplicate edits (which would poison a revert),
-    // and the auto-created workspace file must stay byte-stable.
+    // Idempotency: a second run rewrites nothing — the lock and the
+    // auto-created workspace file stay byte-stable.
+    let pristine = pristine_lock;
     let code = run(hosted_args(tmp.path(), server.uri())).await;
     assert_eq!(code, 0, "second scan --mode hosted should succeed");
-    let second: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
-    assert_eq!(
-        edits.len(),
-        second["edits"].as_array().unwrap().len(),
-        "a pnpm re-run must not append duplicate edits: {second}"
-    );
     let lock_after_rerun = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
     assert_eq!(
         lock, lock_after_rerun,
@@ -285,13 +300,31 @@ async fn hosted_rewrites_pnpm_root_lock_resolution() {
         ws,
         "the re-run must leave pnpm-workspace.yaml byte-stable"
     );
+    assert_no_ledger(tmp.path());
+
+    // rollback: the upstream entry comes back from the registry, and the
+    // trust key the run added (here: the whole scaffold file) goes with it.
+    let code = rollback_hosted(tmp.path(), &server).await;
+    assert_eq!(code, 0, "rollback must restore the pnpm pin");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        pristine,
+        "rollback restores the pristine lock byte for byte"
+    );
+    assert!(
+        !ws_path.exists(),
+        "the auto-created pnpm-workspace.yaml is removed with the pin"
+    );
+    assert_no_ledger(tmp.path());
 }
 
 /// MERGE case: a pre-existing pnpm-workspace.yaml (comments, multi-glob
 /// packages, catalog — none of it ours) gains EXACTLY one appended
 /// `trustLockfile: true` line after its last non-empty line; every other
-/// byte survives verbatim, and the ledger records the `added` (not
-/// `created`) action so a revert removes just that line.
+/// byte survives verbatim. v5 keeps no ledger record of that edit, so
+/// `rollback` cannot prove the line is ours: it restores the lock entry and
+/// leaves the user's file (trust line included) alone, warning
+/// `pnpm_trust_lockfile_left` instead of guessing.
 #[tokio::test]
 #[serial]
 async fn hosted_merges_trust_key_into_existing_workspace_yaml_byte_exactly() {
@@ -314,17 +347,20 @@ async fn hosted_merges_trust_key_into_existing_workspace_yaml_byte_exactly() {
         "# team workspace\npackages:\n  - '.'\n  - 'tools/*'\n\ncatalog:\n  react: ^18.0.0\ntrustLockfile: true\n",
         "the merge must preserve every user byte and append exactly one line"
     );
-    let ledger: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap(),
-    )
-    .unwrap();
+    assert_no_ledger(tmp.path());
+
+    let code = rollback_hosted(tmp.path(), &server).await;
+    assert_eq!(code, 0, "rollback must restore the pnpm pin");
     assert!(
-        ledger["edits"].as_array().unwrap().iter().any(|e| {
-            e["kind"] == "redirect_pnpm_workspace_trust"
-                && e["action"] == "added"
-                && e["path"] == "pnpm-workspace.yaml"
-        }),
-        "the ledger must record the merged (added) trust edit: {ledger}"
+        !std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml"))
+            .unwrap()
+            .contains(HOSTED_URL),
+        "the pin is restored upstream"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pnpm-workspace.yaml")).unwrap(),
+        ws,
+        "a user-authored workspace file is never edited by the restore"
     );
 }
 
@@ -368,7 +404,7 @@ async fn hosted_dry_run_writes_neither_lock_nor_workspace_trust() {
 /// plain `/name@version:` key stays redirectable, but the trustLockfile
 /// auto-config must NOT fire — pnpm 7/8 have neither the >=11 policy nor the
 /// flag, so writing trust config for them would be pure noise. No
-/// pnpm-workspace.yaml appears and the ledger carries no workspace-trust
+/// pnpm-workspace.yaml appears (and no ledger is written) — no workspace-trust
 /// edit.
 #[tokio::test]
 #[serial]
@@ -431,11 +467,7 @@ packages:
         !root.join("pnpm-workspace.yaml").exists(),
         "a legacy v6 lock must not trigger the trustLockfile auto-config"
     );
-    let ledger = std::fs::read_to_string(root.join(".socket/vendor/redirect-state.json")).unwrap();
-    assert!(
-        !ledger.contains("redirect_pnpm_workspace_trust"),
-        "no workspace-trust edit may be recorded for a legacy lock: {ledger}"
-    );
+    assert_no_ledger(root);
 }
 
 /// (a2) SCOPED package: pnpm lockfileVersion 9 single-quotes `packages:` keys
@@ -561,24 +593,12 @@ snapshots:
         "the upstream integrity must be replaced; got:\n{lock}"
     );
 
-    let ledger: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(root.join(".socket/vendor/redirect-state.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(
-        ledger["edits"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["kind"] == "redirect_pnpm_resolution"
-                && e["key"] == format!("{SCOPED_NAME}@{VERSION}")),
-        "the ledger must record the scoped redirect edit: {ledger}"
-    );
+    assert_no_ledger(root);
 }
 
 /// (b) `scan --mode hosted --vex`: the redirected pnpm patch is attested with
 /// the `(redirected)` provenance marker (bytes are remote until install, so
-/// this is the NO-VERIFY attestation built from the ledger record — the same
+/// this is the NO-VERIFY attestation built from this run's fetched record — the same
 /// contract `scan_redirect_vex_emits_redirected_attestation` pins for npm).
 #[tokio::test]
 #[serial]
@@ -602,13 +622,8 @@ async fn hosted_pnpm_vex_emits_redirected_attestation() {
     let code = run(args).await;
     assert_eq!(code, 0, "scan --mode hosted --vex should succeed for pnpm");
 
-    // The ledger embeds the patch record (so a post-install `vex` can verify).
-    let ledger =
-        std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
-    assert!(
-        ledger.contains("\"records\"") && ledger.contains(GHSA) && ledger.contains(PURL),
-        "ledger must embed the patch record + vulnerability: {ledger}"
-    );
+    // The record reached the attestation in memory: nothing persisted.
+    assert_no_ledger(tmp.path());
 
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
@@ -633,18 +648,18 @@ async fn hosted_pnpm_vex_emits_redirected_attestation() {
 /// manifest (hosted mode never writes one), the hosted URL sits on the
 /// operator's patch server (`--patch-server-url http://patch.test`).
 ///
-/// * not installed, ledger kept: the ledger record + the lock's
-///   integrity-pinned wiring attest `(redirected)`;
-/// * ledgers deleted: the lockfile reference + the patch API record attest,
-///   first from the pin, then hash-verified against an installed copy;
-/// * `--offline`, no ledgers: `record_unavailable`, zero requests;
-/// * lock reverted, ledger restored: `redirect_unwired`, `--no-verify` too.
+/// * not installed, no ledger (v5): the lockfile reference + the patch API
+///   record attest `(redirected)` from the integrity pin, then
+///   hash-verified against an installed copy;
+/// * `--offline`, no local record: `record_unavailable`, zero requests;
+/// * a pre-v5 ledger carrying the record serves the offline run;
+/// * lock reverted, that ledger kept: `redirect_unwired`, `--no-verify` too.
 #[tokio::test]
 #[serial]
-async fn hosted_pnpm_manifestless_vex_from_lockfile_ledger_and_api() {
+async fn hosted_pnpm_manifestless_vex_from_lockfile_legacy_ledger_and_api() {
     use vex_e2e_common::{
         assert_absent, assert_attested, assert_not_attested, git_sha256, patch_view, run_vex,
-        strip_ledgers, strip_manifest, Marker, PatchApi, VexRun,
+        strip_manifest, Marker, PatchApi, VexRun,
     };
     const PATCHED: &[u8] = b"/* patched */\nmodule.exports = 1;\n";
     let vulns: &[(&str, &[&str])] = &[(GHSA, &["CVE-2024-9"])];
@@ -681,29 +696,21 @@ async fn hosted_pnpm_manifestless_vex_from_lockfile_ledger_and_api() {
         std::thread::scope(|s| {
             s.spawn(|| {
                 let bin = vex_e2e_common::binary();
-                let api = PatchApi::start(vec![(
-                    UUID.to_string(),
-                    patch_view(
-                        UUID,
-                        PURL,
-                        &[("package/index.js", &git_sha256(PATCHED))],
-                        vulns,
-                    ),
-                )]);
+                let view = patch_view(
+                    UUID,
+                    PURL,
+                    &[("package/index.js", &git_sha256(PATCHED))],
+                    vulns,
+                );
+                let api = PatchApi::start(vec![(UUID.to_string(), view.clone())]);
                 let online = |no_verify| VexRun {
                     patch_server_url: Some("http://patch.test".to_string()),
                     no_verify,
                     ..VexRun::online(&api)
                 };
                 strip_manifest(root);
+                assert_no_ledger(root);
                 std::fs::remove_dir_all(root.join("node_modules")).unwrap();
-                let out = run_vex(&bin, root, &online(false));
-                assert_eq!(out.code, Some(0), "[{lock_name}] ledger kept: {out}");
-                assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
-
-                let ledger = root.join(".socket/vendor/redirect-state.json");
-                let ledger_bytes = std::fs::read(&ledger).unwrap();
-                strip_ledgers(root);
                 let out = run_vex(&bin, root, &online(false));
                 assert_eq!(out.code, Some(0), "[{lock_name}] ledger-less: {out}");
                 assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
@@ -733,7 +740,34 @@ async fn hosted_pnpm_manifestless_vex_from_lockfile_ledger_and_api() {
                 assert_not_attested(&out.envelope, PURL, "record_unavailable");
                 assert_eq!(api.request_count(), seen);
 
-                std::fs::write(&ledger, &ledger_bytes).unwrap();
+                // A pre-v5 ledger's record is an extra local record source.
+                let mut record = view.clone();
+                let obj = record.as_object_mut().unwrap();
+                obj.remove("purl");
+                let exported = obj.remove("publishedAt").unwrap();
+                obj.insert("exportedAt".to_string(), exported);
+                let ledger = root.join(".socket/vendor/redirect-state.json");
+                std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+                std::fs::write(
+                    &ledger,
+                    serde_json::to_vec_pretty(&serde_json::json!({
+                        "version": 1, "mode": "hosted", "records": { PURL: record },
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                let out = run_vex(
+                    &bin,
+                    root,
+                    &VexRun {
+                        patch_server_url: Some("http://patch.test".to_string()),
+                        ..VexRun::offline()
+                    },
+                );
+                assert_eq!(out.code, Some(0), "[{lock_name}] legacy ledger, offline: {out}");
+                assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
+                assert_eq!(api.request_count(), seen);
+
                 std::fs::write(root.join(lock_name), &pristine).unwrap();
                 for no_verify in [false, true] {
                     let out = run_vex(&bin, root, &online(no_verify));
@@ -874,7 +908,7 @@ specifiers:
     assert!(!doc.to_string().contains("redirect_pnpm_legacy_lockfile"));
 
     // The lockfile-only supplement reads shrinkwrap.yaml: the uninstalled
-    // `/legacy-only-dep/2.0.0` entry surfaces (it was 0 before the fix).
+    // `/legacy-only-dep/2.0.0` entry surfaces.
     assert_eq!(
         doc["lockfileOnlyPackages"], 1,
         "shrinkwrap.yaml must feed the lockfile-only supplement: {doc}"

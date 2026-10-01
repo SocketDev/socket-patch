@@ -1,302 +1,103 @@
-# Hosted-mode production e2e
+# Hosted production tests
 
-`crates/socket-patch-cli/tests/e2e_hosted_production.rs` is the only test suite
-in this repo that exercises [hosted mode](../ecosystems.md#mode--ecosystem-matrix)
-(`scan --mode hosted`) against the **real** Socket production service with **no
-mocking anywhere**. Every other hosted-mode capstone (`e2e_redirect_*_build.rs`)
-serves the patch artifact from a local wiremock, which proves the CLI's rewrite
-grammar but cannot notice production drifting away from it.
+[`e2e_hosted_production.rs`](../../crates/socket-patch-cli/tests/e2e_hosted_production.rs)
+exercises hosted patching against Socket's production public proxy, patch server,
+and upstream registries. It complements controlled-input native installer suites,
+which can validate rewrite behavior without detecting production-service drift.
 
 ## What it proves
 
-For each ecosystem × package manager:
+Each install-proof case installs a pinned upstream package, checks that its bytes
+are pristine, runs a hosted scan, and verifies the new reference and integrity pin.
+It then removes the installed tree, installs from the changed dependency files with
+fresh caches, and verifies patched bytes. The suite also exercises manifest-free
+VEX. This proves delivery of the selected patch; it does not test exploit efficacy.
 
-1. install a pinned, known-vulnerable dependency from its **real** upstream
-   registry with the **real** package manager;
-2. assert the installed bytes are pristine (anti-vacuity);
-3. `socket-patch scan --mode hosted --json --yes` — resolves a hosted patch
-   reference from `patches-api.socket.dev` and rewrites the lockfile / registry
-   config to point at `patch.socket.dev`;
-4. assert the rewrite landed (patch host + patch UUID present, integrity pin
-   replaced);
-5. **wipe the install tree and reinstall from the rewritten lock alone** — the
-   package manager itself fetches from `patch.socket.dev` and verifies the
-   integrity pin it was handed;
-6. assert the reinstalled bytes carry the patch.
+## Catalog fixtures and coverage
 
-Step 5 is the point. It is the only place in this repo where a third-party
-package manager — not socket-patch — downloads a Socket-hosted artifact and
-independently verifies its checksum.
+The test's catalog constants and preflight checks are authoritative for required
+PURLs, patch UUIDs, and byte markers. They use free patches through
+`patches-api.socket.dev`, with ambient authentication scrubbed. Catalog contents
+can change independently of this repository; do not treat a past run as a current
+publication guarantee.
 
-## Required production patches
+| Coverage | Cases |
+| --- | --- |
+| Native production installs | npm/shrinkwrap, pnpm, Yarn Classic, Yarn Berry with node-modules, Bun, pip requirements, uv, and Bundler |
+| Conditional production proof | vlt: validates the served encoding before attempting installation |
+| Catalog canaries | Cargo, Maven, NuGet, and Composer: detect when a free fixture becomes available; do not prove an install |
+| Go | Validates the required hosted reference shape; see [Go support](../ecosystems.md#go-directory-replaces-and-gosum) |
+| Unsupported mode | Deno hosted refusal |
 
-The suite is pinned to these patches. They must stay **published** and
-**free-tier** on `patches-api.socket.dev`; the suite runs against the
-unauthenticated public proxy on purpose, because that is the surface every user
-without a token gets. No API token is used, and `SOCKET_API_TOKEN` is scrubbed
-from the child environment.
-
-| Ecosystem | PURL | Patch UUID | Advisory | Used by |
-|-----------|------|------------|----------|---------|
-| npm | `pkg:npm/minimist@1.2.2` | `80630680-4da6-45f9-bba8-b888e0ffd58c` | GHSA-xvch-5gv4-984h / CVE-2021-44906 | all five npm-family legs |
-| PyPI | `pkg:pypi/urllib3@1.26.18` | `de58c8b8-796c-4b6d-8a48-539b5563db76`, `26242e35-f867-4da8-8789-f0d2ea49e0f1`, `e828efa5-5c6d-43f3-9909-03f5ac232b98` | GHSA-38jv-5279-wg99, GHSA-2xpw-w6gg-jr37, GHSA-gm62-xv2j-4w53 | requirements.txt, uv.lock |
-| RubyGems | `pkg:gem/activestorage@6.0.3` | any of `15e960b5-f432-4b6c-b8aa-534a2b419323` (GHSA-m42x-37p3-fv5w / CVE-2020-8162), `6c4141c5-1535-4fd2-9db1-b5f8e4834bdb` (GHSA-w749-p3v6-hccq / CVE-2022-21831, published 2026-08-19), `eeb6bf9f-96c0-4963-a0f1-2e88f91f8b1a` (GHSA-9xrj-h377-fr87 / CVE-2026-33195, published 2026-08-20), `c1a1cd3c-b670-4e44-b4fa-1a63ecd42db6` (GHSA-r4mg-4433-c7g3 / CVE-2025-24293, published 2026-08-20), `9c2b4925-b413-4a3a-bb3a-9990440fb446` (GHSA-xr9x-r78c-5hrm / CVE-2026-66066, published 2026-08-21), `01019627-b481-4bae-bc09-e93b5a5e4481` (MERGED: CVE-2022-21831 + CVE-2025-24293 + CVE-2026-66066, published 2026-09-04) | see UUID column | bundler leg |
-
-urllib3 1.26.18 carries **three** distinct free patches, one per advisory. Which
-one the resolver returns is a server-side ordering detail, so the suite accepts
-any of the three rather than pinning one — pinning would go red on an unrelated
-server-side reorder.
-
-`preflight_required_patches_are_published` checks all three every run and fails
-first with the offending PURL named, so a withdrawn patch produces one clear
-failure instead of N confusing ones that look like CLI regressions.
+Poetry, PDM, and Pipenv production installers are covered by their
+[release backtests](README.md#package-manager-guides). Rush and Yarn PnP are not
+production install-proof cases in this suite. Controlled fixtures and production
+coverage are distinct; neither should be inferred from the other.
 
 ### If a required patch is withdrawn
 
-1. Find a replacement in the same ecosystem:
-   ```sh
-   # version-less lookup lists every patched version of a package
-   curl -s 'https://patches-api.socket.dev/patch/by-package/pkg%3Anpm%2Flodash' | jq
-   ```
-   Prefer a package that is small, dependency-free, and installable by every
-   package manager in that ecosystem's leg.
-2. Update the catalog constants at the top of `e2e_hosted_production.rs`
-   (`*_PURL`, `*_NAME`, `*_VERSION`, `*_UUID`) **and** the table above.
-3. If the new patch does not inject the `// Socket Community Patch` header,
-   pick a marker unique to the patch and set the ecosystem's `*_MARKER`
-   constant.
+1. Choose a published free patch in the same ecosystem, preferably a small package
+   supported by each affected installer.
+2. Update the catalog constants, accepted patch set, and patched-byte marker in
+   both production suites. Read the selected record rather than assuming the
+   catalog's ranking is unchanged.
+3. Run preflight and every affected native install proof. Keep the production
+   fixtures and assertions consistent; a missing fixture must not silently turn a
+   required install check into a pass.
 
-## Ecosystem coverage, and the honest gaps
-
-| Ecosystem | Hosted mode | Free patches in production | Suite coverage |
-|-----------|-------------|----------------------------|----------------|
-| npm | ✅ | ✅ many | ✅ npm, npm-shrinkwrap, pnpm, yarn classic, yarn berry, bun; vlt probe-driven (see [vlt](#vlt-the-serve-encoding-gate)) |
-| PyPI | ✅ (requirements.txt, uv.lock, Pipfile.lock) | ✅ many | ✅ requirements.txt, uv.lock, Pipfile.lock |
-| RubyGems | ✅ | ✅ (this suite pins one purl/UUID: `activestorage@6.0.3`; the 2026-08-18 republish covers more versions) | ✅ full bundler install proof |
-| Cargo | ✅ | ❌ **none** (tier emptied 2026-08-28) | canary only |
-| Maven | ✅ | ❌ **none** | canary only |
-| NuGet | ✅ | ❌ **none** | canary only |
-| Composer | ✅ | ❌ **none** | canary only |
-| Go | ✅ free tier [by design](../design/golang-hosted.md) (paid: ❌ [analysis](../design/golang-hosted-no-go.md)) | ❌ none published yet | shape guard (redirects only via `goproxy` override) |
-| Deno | ❌ not supported | — | negative assertion |
-
-Cargo, Maven, NuGet and Composer all *implement* hosted mode, but production
-publishes **zero** free-tier patches for them, so there is nothing real to
-redirect to. Rather than skipping silently, `canary_unpublished_ecosystems`
-probes production every run and reports the moment that changes, so coverage
-can be extended deliberately. It does not fail when patches appear — production
-publishing a patch is not a socket-patch regression — but
-`SOCKET_PATCH_HOSTED_E2E_CANARY_STRICT=1` makes it fail, for use in a scheduled
-nag run.
-
-**Cargo was demoted to the canary on 2026-09-01.** Until then the suite carried
-a full sparse-registry install proof pinned to one crate, but production's free
-cargo tier emptied on 2026-08-28 (both pinned patches were deleted server-side,
-leaving zero live free patches for any cargo crate), so there is nothing honest
-left to pin. This deliberately drops the cargo install-proof coverage — the
-canary only watches for the tier lighting up again. To re-promote cargo: pick a
-live free patch and follow
-[the withdrawn-patch procedure](#if-a-required-patch-is-withdrawn); the git
-history of this demotion shows every piece to restore (catalog constants,
-preflight registration, the install-proof leg, and these tables) in both
-production suites.
-
-PyPI's `poetry.lock`, `pdm.lock` and `Pipfile.lock` ARE rewritten by hosted
-mode (Poetry 1.0+; PDM lock formats `2` and `4.3`–`4.5.1`; Pipenv 7+); their
-live coverage is the per-release matrices in
-[poetry-compatibility.md](poetry-compatibility.md) (`scripts/backtest-poetry.py`),
-[pdm-compatibility.md](pdm-compatibility.md) (`scripts/backtest-pdm.py`) and
-[pipenv-compatibility.md](pipenv-compatibility.md) (`scripts/backtest-pipenv.py`),
-which install the redirected lock with every release rather than one pinned
-installer, so they are not duplicated as legs here.
-
-Two supported hosted shapes are deliberately **not** covered here:
-
-* **npm Rush monorepos** — hosted mode supports them (`common/config/rush/pnpm-lock.yaml`
-  plus per-subspace locks), but a faithful leg needs a real `rush install`, which
-  is a much heavier fixture than everything else in this file. It also inherits
-  the pnpm issue below. Covered by `e2e_redirect_rush_sim.rs` against a mock.
-* **yarn berry with the PnP linker** — documented as untested for hosted mode
-  (the lock rewrite fires, but PnP's `.yarn/cache` resolution is not exercised).
-  The berry leg here pins `nodeLinker: node-modules`, matching the documented
-  support boundary.
+To promote a canary into installation coverage, add its catalog fixture, preflight
+registration, install-proof test, and CI toolchain. Update this coverage table and
+the [vendored suite](vendored-production-e2e.md) together.
 
 ## vlt: the serve-encoding gate
 
-`vlt_pinned_matrix_production_hosted_install_proof` pins the public minimist
-patch in a vlt 1.2.0 project (`vlt.json` with `registries.npm`). vlt hashes the
-wire body of a tarball and sends `accept-encoding: gzip;q=1.0, identity;q=0.5`,
-so it fails `EINTEGRITY` whenever patch.socket.dev (or its CDN) serves the
-artifact content-encoded. The leg therefore probes the artifact the way vlt
-does (the core `fetch_artifact_probe`) and branches on what it sees:
+vlt verifies the raw response body. If the patch server returns a content-encoded
+artifact, the hosted CLI refuses it with `redirect_vlt_artifact_unverifiable` and
+leaves the lock unchanged. The production leg probes the artifact using vlt's
+request headers and asserts either that refusal or, for identity encoding, the
+full fresh-checkout `vlt ci` proof.
 
-| Probe | Asserted |
-|---|---|
-| `Content-Encoding` other than identity | the clean refusal: `redirect_vlt_artifact_unverifiable` naming the encoding, `vlt-lock.json` byte-identical, no redirect ledger. With `SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED=1` the encoded response is itself a failure. |
-| identity | the full proof: slot [2] is the served sha512, and a fresh checkout's `vlt ci` installs the patched minimist |
-
-So the leg neither breaks nor goes vacuous when the serve fix
-(`Cache-Control: no-transform`) deploys. As of 2026-09-26 production still
-re-gzips the artifact and the leg runs the refusal branch. Under
-`SOCKET_PATCH_HOSTED_E2E_STRICT=1` a missing `SOCKET_PATCH_VLT_E2E_JS` fails
-instead of skipping, and CI runs the leg's output through
-`scripts/check-vlt-legs.py`. `.github/workflows/vlt-serve-watchdog.yml` probes
-the same artifact every 6 hours; see [vlt compatibility](vlt-compatibility.md).
-
-## Known issues this suite surfaced
-
-All were found by running against real production; none is a test bug.
-
-### 1. `gem` — hosted mode was unusable for gems with dependencies (SERVER) — FIXED
-
-Socket's gem patch-registry used to serve a compact index whose `/info/<gem>`
-line declared **no runtime dependencies** while the `.gem` it served declared
-several, so bundler's `ensure_same_dependencies` check failed closed with
-`Bundler::APIResponseMismatchError` — hosted gem mode was unusable for any gem
-with runtime dependencies. (The suite's original pin, activestorage@7.0.2.2 /
-`2535d43d-…` / GHSA-w749-p3v6-hccq, was unpublished on 2026-08-14 pending the
-fix.)
-
-**Fixed by the 2026-08-18 gem catalog republish**: the patch-registry's compact
-index now serves the gemspec's runtime dependencies (verified against
-activestorage@6.0.3: `/versions` 200, `/info/activestorage` 200 with the full
-dep list). The leg's probe-based tolerance — pass on a non-2xx `/versions`,
-enforce on 2xx — retired itself as designed and was deleted along with its
-`SOCKET_PATCH_HOSTED_E2E_GEM_STRICT` knob; the leg is now the unconditional
-`gem_bundler_hosted_install_proof`.
-
-**Latent, still open (server)**: the registry's `/api/v1/dependencies` route
-answers 200 with an empty body. Unreachable today — bundler only falls back to
-the Dependency fetcher when the compact index is unavailable — but it would
-resurface as a confusing Marshal error if the compact index ever broke again.
-
-### 2. `pnpm` — trust configuration and cache handling
-
-The CLI now configures `trustLockfile: true` for root lockfileVersion 9 projects
-unless the project explicitly disables it or the user passes
-`--no-trust-lockfile-config`. This accepts hosted tarball URLs on pnpm >=11;
-it disables registry re-verification for the entire lock while retaining
-per-artifact integrity checks. The historical missing-warning gap is closed.
-
-An installed tree or warm store can still retain upstream bytes. Use a clean
-install tree and an empty store, then verify with `socket-patch vex`.
-`--force` alone is not a portable recovery. The required
-[pnpm compatibility matrix](pnpm-compatibility.md) tests this distinction,
-integrity rejection, peer instances, and rollback across pnpm majors 1–12.
-The production pnpm test proves installation from the public hosted service;
-it does not test the SBOM backend, dashboard badges, policies, or alert counts.
-
-### 3. `uv.lock` — the `sdist` entry is rewritten to a wheel URL (CLI, minor)
-
-The uv.lock rewriter points the `sdist` entry at the patched **wheel** and keeps
-the original sdist's `size`, producing an entry whose URL, hash and size are
-mutually inconsistent:
-
-```toml
-# pristine
-sdist  = { url = ".../urllib3-1.26.18.tar.gz",            hash = "sha256:f8ecc1bb…", size = 305687 }
-wheels = [{ url = ".../urllib3-1.26.18-py2.py3-none-any.whl", hash = "sha256:34b97092…", size = 143835 }]
-
-# after scan --mode hosted
-sdist  = { url = "…patch.socket.dev/…-py2.py3-none-any.whl", hash = "sha256:ccc9a9e0…", size = 305687 }
-wheels = [{ url = "…patch.socket.dev/…-py2.py3-none-any.whl", hash = "sha256:ccc9a9e0…", size = 143835 }]
-```
-
-uv tolerates it today because it prefers the wheel, so the leg passes. It would
-bite on a `--no-binary` resolve or a platform with no matching wheel. The
-rewriter should either leave `sdist` alone or update its `size` alongside the
-URL and hash.
+`SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED=1` requires the install branch and
+fails on an encoded response. The
+[serve watchdog](../../.github/workflows/vlt-serve-watchdog.yml) monitors this
+boundary; the current run's probe, not a dated note, determines server behavior.
+The [vlt guide](vlt-compatibility.md) defines the required leg reporting.
 
 ## Running
 
 ```sh
-# everything, soft-skipping legs whose toolchain is absent
-cargo test -p socket-patch-cli --test e2e_hosted_production -- --ignored
+cargo test --locked -p socket-patch-cli --test e2e_hosted_production -- --ignored
 
-# one leg
-cargo test -p socket-patch-cli --test e2e_hosted_production -- --ignored \
-  yarn_berry_hosted_install_proof --nocapture
+# One install proof:
+cargo test --locked -p socket-patch-cli --test e2e_hosted_production -- \
+  --ignored yarn_berry_hosted_install_proof --nocapture
 ```
 
-The suite is `#[ignore]`-gated, so it stays out of the `test` and `e2e` jobs and
-runs only where it is explicitly asked for.
-
-### Environment knobs
+The suite is opt-in. Missing tools can skip local cases; use strict mode when
+coverage is required.
 
 | Variable | Effect |
-|----------|--------|
-| `SOCKET_PATCH_HOSTED_E2E_STRICT=1` | Turn every "toolchain missing" soft-skip into a hard failure. **CI sets this** — a required check must never report green on an unexercised leg. |
-| `SOCKET_PATCH_HOSTED_E2E_CANARY_STRICT=1` | Fail when cargo/maven/nuget/composer gain their first free published patch. |
-| `SOCKET_PATCH_VLT_E2E_JS` / `SOCKET_PATCH_VLT_E2E_VERSION` | The vlt release the vlt leg runs (`node <vlt.js>`, exact `--version`); CI installs 1.2.0 with `scripts/install-vlt.sh`. |
-| `SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED=1` | Fail the vlt leg while the artifact is served content-encoded. Unset until the serve fix is verified in production. |
+| --- | --- |
+| `SOCKET_PATCH_HOSTED_E2E_STRICT=1` | Fail instead of skipping missing required toolchains |
+| `SOCKET_PATCH_HOSTED_E2E_CANARY_STRICT=1` | Fail when a watched ecosystem gains a free fixture, prompting promotion |
+| `SOCKET_PATCH_VLT_E2E_JS` / `SOCKET_PATCH_VLT_E2E_VERSION` | Select an installed, version-pinned vlt executable |
+| `SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED=1` | Require vlt's actual install proof rather than its encoding refusal |
 
-### Toolchains
+Tools include npm, Corepack for pnpm/Yarn, Bun, uv, Go, and Ruby/Bundler. The gem
+proof requires Bundler 2.6+ for lockfile checksums. vlt requires its configured
+Node runtime and executable. The workflow pins and provisions CI versions.
+Network access includes Socket's public API and patch server, npm, PyPI, and
+RubyGems registries.
 
-`npm`, `corepack` (pnpm + yarn classic + yarn berry), `bun`, `vlt` (Node ≥ 22.22), `uv`,
-`ruby` + `bundle` (**≥ 2.6** — `bundle lock --add-checksums` emits the CHECKSUMS
-section the gem rewrite pins into), `go`.
+## CI and service outages
 
-### Network egress
+The [`hosted-e2e` job](../../.github/workflows/ci.yml) runs independently of the
+other test jobs and retries production failures up to three times. It also runs
+the vendored vlt production proof and validates vlt leg output. Branch protection
+settings are configured separately from the workflow.
 
-`patches-api.socket.dev`, `patch.socket.dev`, `registry.npmjs.org`, `pypi.org`,
-`files.pythonhosted.org`, `rubygems.org`.
-
-## CI: the `hosted-e2e` job
-
-Defined in `.github/workflows/ci.yml`. It is intended to be a **required** status
-check in branch protection, registered under exactly the name `hosted-e2e`.
-
-The job deliberately has **no** job-level `if:`, **no** `needs:`, **no** matrix
-and **no** `continue-on-error`. A *skipped* required check is ambiguous to branch
-protection and can wedge a PR at "Expected — waiting for status", so the job
-always runs and always reaches success or failure; the kill switch gates the
-*steps*, not the job.
-
-It retries the suite up to three times with backoff, because the public proxy
-intermittently returns 503 "Service temporarily over capacity" — the documented
-reason the older live-API suites were pulled from the PR matrix.
-
-The job installs `bun@1` through npm, so its bun leg (`bun_hosted_install_proof`)
-runs against whatever 1.x release that resolves to (a lockfileVersion-2 lock
-today). Lock-era coverage — version-0 and version-1 locks, native `bun.lockb`
-rewrites, the 1.3.10 digest boundary — lives in `ci.yml`'s hermetic
-`e2e_redirect_bun_build` legs and in `bun-compatibility.yml`; see
-[Bun compatibility](bun-compatibility.md).
-
-The job also installs vlt 1.2.0 (`scripts/install-vlt.sh`: `npm pack`, the
-tarball's sha512 checked against the registry and
-`scripts/vlt-historical-integrity.json`), exports `SOCKET_PATCH_VLT_E2E_JS`,
-`_VERSION` and `_REQUIRED=1`, checks the passing attempt's vlt leg with
-`scripts/check-vlt-legs.py`, and then runs the vendored vlt proof
-(`e2e_vendored_production -- --include-ignored vlt_pinned_matrix`) with the
-same retries. Release-era coverage lives in `ci.yml`'s `e2e` vlt rows and in
-`vlt-compatibility.yml`; see [vlt compatibility](vlt-compatibility.md).
-
-### Escape hatch — production is down and this is blocking merges
-
-Set a repository variable (Settings → Secrets and variables → Actions →
-Variables):
-
-```
-HOSTED_E2E_DISABLED = true
-```
-
-then hit **Re-run failed jobs** on any blocked PR. `vars` is read at job-run
-time, so no commit and no push is needed: the job goes green with a loud
-`::warning::` and a **BYPASSED** banner in the job summary, and every open PR
-clears on its next re-run.
-
-**Delete the variable to re-arm.** Any value other than exactly `true` (including
-`yes`, `1`, `True`) leaves the suite armed — a typo must not silently disable
-production coverage.
-
-For a single run without touching the variable: **Actions → CI → Run workflow**,
-then `hosted_e2e = force` (ignore the variable) or `skip` (bypass this run).
-
-### Turning it on
-
-The job runs as soon as this lands. Making it *required* is a one-time repo
-setting, done after the first green run on `main`:
-
-> Settings → Branches → branch protection rule for `main` → Require status
-> checks to pass → add **`hosted-e2e`**.
+During a production outage, maintainers can set the repository Actions variable
+`HOSTED_E2E_DISABLED` to exactly `true`, then rerun affected jobs. The steps report
+**BYPASSED** in the job summary; that successful job is not test evidence. Delete
+the variable to restore coverage. Manual workflow dispatch accepts `hosted_e2e`
+values `force` (ignore the variable) or `skip` (bypass that run).

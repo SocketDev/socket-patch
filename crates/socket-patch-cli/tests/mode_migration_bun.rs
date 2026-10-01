@@ -20,6 +20,13 @@
 //! that matters — a fresh checkout's `bun install --frozen-lockfile` from
 //! an EMPTY cache materializes the bytes the lock claims.
 //!
+//! v5: hosted mode keeps no ledger. Every unwind of a hosted pin (the
+//! vendor takeover, `rollback`, `remove`) restores the entry's upstream
+//! registry 4-tuple, re-resolving the integrity from the npm registry —
+//! here a wiremock mirror of the pristine lock's integrities
+//! (`SOCKET_NPM_REGISTRY`), with the mock patch server named hosted via
+//! `SOCKET_PATCH_SERVER_URL` (see [`ONLINE_ENV`]).
+//!
 //! Fixture: `package.json` with two real registry deps, `left-pad@1.3.0`
 //! (the patched target) and `is-number@7.0.0` (dependency-free; the
 //! untouched bystander in the single-patch legs, the second hosted record
@@ -39,17 +46,17 @@
 //! stage the patched content).
 //!
 //! Scenarios:
-//!   1. vendored → hosted (`vendor --offline`, then `scan --mode hosted`):
+//!   1. vendored → hosted (`vendor`, then `scan --mode hosted`):
 //!      `redirect_takeover_reverted_vendored`, vendored ledger entry +
 //!      committed artifact gone, bun.lock = the hosted URL 3-tuple with no
-//!      `.socket/vendor/` residue, the redirect ledger's `original` is the
-//!      PRISTINE registry line (originals chain intact across migrations),
-//!      fresh frozen install → marker bytes; `rollback` → pristine bytes,
-//!      no vendor artifacts or ledgers, fresh install → original bytes.
+//!      `.socket/vendor/` residue and no hosted ledger, fresh frozen
+//!      install → marker bytes; `rollback` → pristine bytes (the upstream
+//!      restore), no vendor artifacts or ledgers, fresh install → original
+//!      bytes.
 //!   2. hosted → vendored, BOTH drivers on copies of one hosted project:
-//!      `vendor --offline` (staged manifest) and `scan --mode vendored`:
-//!      `vendor_takeover_reverted_redirect`, redirect ledger record + edit
-//!      dropped (file removed when emptied), bun.lock carries the local
+//!      `vendor` (staged manifest) and `scan --mode vendored`:
+//!      `vendor_takeover_reverted_redirect` (upstream restored first, no
+//!      ledger anywhere), bun.lock carries the local
 //!      `.socket/vendor/npm/<uuid>/` 3-tuple and not the hosted URL, the
 //!      vendor ledger's `original` is the pristine registry line, fresh
 //!      frozen install → marker bytes; `vendor --revert` → pristine bytes.
@@ -59,11 +66,10 @@
 //!      vendored --dry-run` classifies `would_vendor` (never `would_refuse`);
 //!      over a live vendored state `scan --mode hosted --dry-run` previews
 //!      `redirect_would_revert_vendored`; none of the previews writes a
-//!      byte (bun.lock, both ledgers, every file under `.socket/`), and the
+//!      byte (bun.lock, every file under `.socket/`), and the
 //!      wet runs then land exactly the takeovers previewed.
 //!   4. two hosted records in ONE scan; scoped `rollback <purl-a>` and, on
-//!      a fresh copy, `remove <purl-a>` (per-purl path — the whole-ledger
-//!      replay is not eligible) unwind ONLY a's line/record/edit; a fresh
+//!      a fresh copy, `remove <purl-a>` restore ONLY a's upstream line; a fresh
 //!      frozen install lands a's ORIGINAL bytes and b's MARKER bytes; the
 //!      unscoped `rollback` that follows restores the pristine lock.
 //!   5. unscoped `rollback` from each mixed state — after (1) and after
@@ -316,7 +322,7 @@ fn bun_toolchain(tag: &str) -> Option<(String, BunVersion)> {
 /// every `BUN_*` var (the harness passes bun's install/cache dirs
 /// explicitly per project), `npm_config_*` (bun reads npm's registry
 /// config; an ambient mirror or auth token would change what the fixture
-/// install resolves against) and `VIRTUAL_ENV` — the scrub the three bun
+/// install resolves against) and `VIRTUAL_ENV` — the scrub the bun
 /// suites share, so none can drift back to a `SOCKET_*`-only scrub.
 fn scrub_env(cmd: &mut Command) {
     cache_env::scrub_ambient_bun_env(cmd);
@@ -342,12 +348,23 @@ fn bun(cwd: &Path, args: &[&str], bun_home: &Path) -> Output {
     cmd.output().expect("failed to run bun")
 }
 
+/// The env every binary run of the current (serialized) test carries once
+/// [`mount_hosted_api`] has set it up: `SOCKET_PATCH_SERVER_URL` (the mock
+/// patch server's origin, so its hosted URLs count as hosted pins — v5
+/// keeps no ledger to vouch for them) and `SOCKET_NPM_REGISTRY` (the
+/// registry mirror the upstream restore reads). Every test is
+/// `#[serial]`, so one slot is enough.
+static ONLINE_ENV: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
 /// The real binary with `--no-telemetry` appended: nothing in this suite
 /// should ever post a telemetry event, mocked API or not.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
     cmd.args(args).arg("--no-telemetry").current_dir(cwd);
     scrub_env(&mut cmd);
+    for (k, v) in ONLINE_ENV.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        cmd.env(k, v);
+    }
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -383,9 +400,8 @@ fn hosted_scan(proj: &Path, api: &str, extra: &[&str]) -> (i32, String, String) 
     run_socket(proj, &args)
 }
 
-/// `scan --mode vendored` builds the artifact locally (`--vendor-source
-/// build`): no vendoring-service round trip, so the only network is the
-/// wiremock patch API.
+/// `scan --mode vendored` downloads the immutable artifact from the
+/// fixture service mounted alongside the patch API.
 fn vendored_scan(proj: &Path, api: &str, extra: &[&str]) -> (i32, String, String) {
     let mut args = vec![
         "scan",
@@ -402,21 +418,18 @@ fn vendored_scan(proj: &Path, api: &str, extra: &[&str]) -> (i32, String, String
         "--api-token",
         "fake",
         "--vendor-source",
-        "build",
+        "service",
     ];
     args.extend_from_slice(extra);
     run_socket(proj, &args)
 }
 
-/// `vendor --json --offline` (+ extra) over the staged manifest.
+/// `vendor --json` (+ extra) over the staged manifest. Online: vendoring
+/// over a hosted pin restores its upstream registry entry first, which reads
+/// the registry (the [`ONLINE_ENV`] mirror); the staged manifest + blob keep
+/// everything else local.
 fn vendor_cmd(proj: &Path, extra: &[&str]) -> (i32, String, String) {
-    let mut args = vec![
-        "vendor",
-        "--json",
-        "--offline",
-        "--cwd",
-        proj.to_str().unwrap(),
-    ];
+    let mut args = vec!["vendor", "--json", "--cwd", proj.to_str().unwrap()];
     args.extend_from_slice(extra);
     run_socket(proj, &args)
 }
@@ -588,17 +601,6 @@ fn packages_line(lock: &str, name: &str) -> String {
         .to_string()
 }
 
-/// The redirect ledger's `redirect_bun_lock_package` edit keyed by the
-/// lock's package-map key (`name`), if any.
-fn ledger_edit_for(ledger: &Value, name: &str) -> Option<Value> {
-    ledger["edits"].as_array().and_then(|edits| {
-        edits
-            .iter()
-            .find(|e| e["kind"] == "redirect_bun_lock_package" && e["key"] == name)
-            .cloned()
-    })
-}
-
 fn warning_codes(v: &Value) -> Vec<String> {
     v.as_array()
         .map(|w| {
@@ -671,6 +673,8 @@ impl Fixture {
 /// package.json + real install + era assertions. `None` = skip (already
 /// reported), or a hard failure under the REQUIRED gate.
 fn stage_fixture(tag: &str) -> Option<Fixture> {
+    // A previous test's mock servers are gone: start with no online env.
+    ONLINE_ENV.lock().unwrap_or_else(|e| e.into_inner()).clear();
     let (bun_raw, bun_version) = bun_toolchain(tag)?;
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
@@ -988,6 +992,15 @@ async fn mount_hosted_api(
             .mount(server)
             .await;
     }
+    // Public service grants cover both the staged and API-discovered UUIDs.
+    for p in &patches {
+        results.insert(p.dep.uuid_v.to_string(), results[p.dep.uuid_h].clone());
+    }
+    Mock::given(method("POST"))
+        .and(path("/patch/package"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "results": results })))
+        .mount(server)
+        .await;
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/package")))
         .respond_with(
@@ -995,6 +1008,42 @@ async fn mount_hosted_api(
         )
         .mount(server)
         .await;
+    // The npm registry mirror the v5 upstream restore reads for a hosted
+    // bun.lock entry: each dep's version document carrying the integrity the
+    // PRISTINE lock recorded (bun's registry 4-tuple is `name@version`, `""`,
+    // deps, integrity — the integrity is the only registry-derived field).
+    for dep in [&DEP_A, &DEP_B] {
+        let line = fx.pristine_line(dep);
+        let integrity = line
+            .rsplit('"')
+            .nth(1)
+            .filter(|s| s.starts_with("sha512-"))
+            .unwrap_or_else(|| panic!("no integrity in the pristine line {line}"))
+            .to_string();
+        Mock::given(method("GET"))
+            .and(path(format!("/registry/{}/{}", dep.name, dep.version)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": dep.name,
+                "version": dep.version,
+                "dist": {
+                    "tarball": format!(
+                        "https://registry.npmjs.org/{0}/-/{0}-{1}.tgz",
+                        dep.name, dep.version
+                    ),
+                    "integrity": integrity
+                }
+            })))
+            .mount(server)
+            .await;
+    }
+    *ONLINE_ENV.lock().unwrap_or_else(|e| e.into_inner()) = vec![
+        ("SOCKET_PATCH_SERVER_URL".to_string(), server.uri()),
+        ("SOCKET_VENDOR_URL".to_string(), server.uri()),
+        (
+            "SOCKET_NPM_REGISTRY".to_string(),
+            format!("{}/registry", server.uri()),
+        ),
+    ];
     patches
 }
 
@@ -1002,10 +1051,9 @@ async fn mount_hosted_api(
 
 /// `proj` is PURELY hosted for `hp.dep`: no vendored ledger claim, no
 /// committed artifact (at either uuid), no `.socket/vendor/` residue in the
-/// lock, the packages line IS the URL 3-tuple, and the redirect ledger's
-/// record + edit are present with `original` == the PRISTINE registry line
-/// and `new` == the live line. Every other dep's line is byte-identical to
-/// the pristine lock.
+/// lock, the packages line IS the URL 3-tuple, and no hosted ledger is
+/// written (v5: the lock is the hosted state). Every other dep's line is
+/// byte-identical to the pristine lock.
 fn assert_pure_hosted(fx: &Fixture, proj: &Path, hp: &HostedPatch) {
     let dep = hp.dep;
     let state = read(proj, ".socket/vendor/state.json");
@@ -1047,57 +1095,23 @@ fn assert_pure_hosted(fx: &Fixture, proj: &Path, hp: &HostedPatch) {
             other.name
         );
     }
-    let ledger = read_json(proj, ".socket/vendor/redirect-state.json");
-    assert_eq!(
-        ledger["records"][dep.purl]["uuid"], dep.uuid_h,
-        "the redirect ledger must record the hosted patch: {ledger:#}"
-    );
-    let edit = ledger_edit_for(&ledger, dep.name).unwrap_or_else(|| {
-        panic!(
-            "no redirect_bun_lock_package edit for {}: {ledger:#}",
-            dep.name
-        )
-    });
-    assert_eq!(edit["path"], "bun.lock", "{edit:#}");
-    assert_eq!(
-        edit["original"],
-        json!(fx.pristine_line(dep)),
-        "the redirect ledger's `original` must be the PRISTINE registry line — never a \
-         `.socket/vendor/` local-path line (originals chain intact across migrations): {edit:#}"
-    );
-    assert_eq!(
-        edit["new"],
-        json!(packages_line(&lock, dep.name)),
-        "the redirect ledger's `new` must be the live lock line: {edit:#}"
+    assert!(
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "hosted mode writes no ledger"
     );
 }
 
-/// `proj` is PURELY vendored for `dep` at `uuid`: the redirect ledger no
-/// longer claims the purl (record and edit both gone; file removed when
-/// emptied), the packages line carries the local `.socket/vendor/npm/<uuid>/`
+/// `proj` is PURELY vendored for `dep` at `uuid`: no hosted ledger exists,
+/// the packages line carries the local `.socket/vendor/npm/<uuid>/`
 /// 3-tuple and no hosted URL, the artifact is committed, and the vendor
 /// ledger's `bun_lock_package` wiring records the PRISTINE registry line as
 /// its `original` (never the grant-tokenized hosted URL line). Every other
 /// dep's line is byte-identical to the pristine lock.
 fn assert_pure_vendored(fx: &Fixture, proj: &Path, dep: &Dep, uuid: &str, hosted_url: &str) {
-    match std::fs::read_to_string(proj.join(".socket/vendor/redirect-state.json")) {
-        Ok(text) => {
-            let ledger: Value = serde_json::from_str(&text).unwrap();
-            assert!(
-                ledger["records"].get(dep.purl).is_none(),
-                "the superseded redirect record must be dropped: {ledger:#}"
-            );
-            assert!(
-                ledger_edit_for(&ledger, dep.name).is_none(),
-                "the superseded bun.lock edit must be dropped: {ledger:#}"
-            );
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // An emptied ledger is deleted — the expected outcome when this
-            // was the only hosted record.
-        }
-        Err(e) => panic!("unreadable redirect ledger: {e}"),
-    }
+    assert!(
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "no hosted ledger may exist"
+    );
     let lock = read(proj, "bun.lock");
     assert!(
         !lock.contains(hosted_url) && !lock.contains("/patch/npm/"),
@@ -1324,12 +1338,27 @@ fn take_over_to_hosted(fx: &Fixture, proj: &Path, api: &str, hp: &HostedPatch, t
                 bun_vex::Marker::Redirected,
                 &[(GHSA, &[CVE_VIEW])],
             );
+            // The stale uuid may only be NAMED by the advisory that says it
+            // was superseded (v5: no hosted ledger record shadows the
+            // manifest's, so the manifest record is what gets superseded) —
+            // never in an event or the document.
             assert!(
-                !out.stdout.contains(DEP_A.uuid_v)
+                !out.envelope["events"].to_string().contains(DEP_A.uuid_v)
                     && !std::fs::read_to_string(&out.output)
                         .unwrap()
                         .contains(DEP_A.uuid_v),
                 "the stale manifest uuid must not be attested ({tag}): {out}"
+            );
+            let warnings = out.envelope["warnings"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                warnings
+                    .iter()
+                    .filter(|w| w.to_string().contains(DEP_A.uuid_v))
+                    .all(|w| w["code"] == "vex_record_superseded"),
+                "only the supersede advisory may name the stale uuid ({tag}): {out}"
             );
         });
         eprintln!("BUN-VEX stale-manifest-{tag} hosted wired-uuid-wins ok");
@@ -1354,8 +1383,8 @@ fn take_over_to_hosted(fx: &Fixture, proj: &Path, api: &str, hp: &HostedPatch, t
 /// committed artifact. Returns that uuid.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum VendoredDriver {
-    /// `vendor --json --offline` over a hand-staged manifest (uuid_v).
-    VendorOffline,
+    /// `vendor --json` over a hand-staged manifest (uuid_v).
+    VendorManifest,
     /// `scan --mode vendored --json --yes` — discovery + download from the
     /// mock API (uuid_h), then the same vendor engine.
     ScanVendored,
@@ -1374,11 +1403,11 @@ fn take_over_to_vendored(
     // cleartext-logging heuristic would otherwise taint every `{vendor_env}`
     // assertion message with the `uuid`-named half.
     let uuid = match driver {
-        VendoredDriver::VendorOffline => dep.uuid_v,
+        VendoredDriver::VendorManifest => dep.uuid_v,
         VendoredDriver::ScanVendored => dep.uuid_h,
     };
     let vendor_env = match driver {
-        VendoredDriver::VendorOffline => {
+        VendoredDriver::VendorManifest => {
             stage_manifest(fx, proj, dep);
             let (code, stdout, stderr) = vendor_cmd(proj, &[]);
             assert_eq!(code, 0, "vendor failed ({tag}): {stdout}\n{stderr}");
@@ -1419,7 +1448,7 @@ fn take_over_to_vendored(
     match driver {
         // Standalone `vendor` is fed by the staged manifest and leaves its
         // record in place — the legacy manifest-tracked shape.
-        VendoredDriver::VendorOffline => {
+        VendoredDriver::VendorManifest => {
             let manifest = read_json(proj, ".socket/manifest.json");
             assert_eq!(
                 manifest["patches"][dep.purl]["uuid"], uuid,
@@ -1454,7 +1483,7 @@ fn take_over_to_vendored(
     );
     eprintln!("HOSTED→VENDORED OK ({tag}, {driver:?}, bun {})", fx.bun_raw);
     let cve = match driver {
-        VendoredDriver::VendorOffline => CVE_MANIFEST,
+        VendoredDriver::VendorManifest => CVE_MANIFEST,
         VendoredDriver::ScanVendored => CVE_VIEW,
     };
     manifestless_vex(
@@ -1500,7 +1529,10 @@ async fn bun_vendored_then_hosted_takeover_leaves_pure_hosted() {
     };
     let proj = fx.proj.clone();
 
-    // A: vendor (offline) from the staged manifest.
+    let server = MockServer::start().await;
+    let patches = mount_hosted_api(&server, &fx, &[&DEP_A]).await;
+
+    // A: vendor from the staged manifest.
     stage_manifest(&fx, &proj, &DEP_A);
     let (code, stdout, stderr) = vendor_cmd(&proj, &[]);
     assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");
@@ -1518,8 +1550,6 @@ async fn bun_vendored_then_hosted_takeover_leaves_pure_hosted() {
 
     // B: hosted redirect over the vendored state — the takeover — then the
     //    fresh-checkout marker proof.
-    let server = MockServer::start().await;
-    let patches = mount_hosted_api(&server, &fx, &[&DEP_A]).await;
     take_over_to_hosted(&fx, &proj, &server.uri(), &patches[0], "rev");
 
     // C: unscoped rollback → pristine bytes, no vendor artifacts or
@@ -1542,10 +1572,8 @@ async fn bun_hosted_then_vendored_takeover_round_trips_to_registry() {
     let patches = mount_hosted_api(&server, &fx, &[&DEP_A]).await;
     let hp = &patches[0];
 
-    // A: hosted redirect: registry 4-tuple → URL 3-tuple, ledger claims the
-    //    purl with one `redirect_bun_lock_package` edit whose original is
-    //    the pristine registry line; a fresh frozen install lands the
-    //    patched tree.
+    // A: hosted redirect: registry 4-tuple → URL 3-tuple (no ledger); a
+    //    fresh frozen install lands the patched tree.
     let (code, stdout, stderr) = hosted_scan(&proj, &server.uri(), &[]);
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
     let env = envelope(&stdout, &stderr);
@@ -1574,10 +1602,10 @@ async fn bun_hosted_then_vendored_takeover_round_trips_to_registry() {
         &by_vendor,
         &server.uri(),
         hp,
-        VendoredDriver::VendorOffline,
-        "vendor-offline",
+        VendoredDriver::VendorManifest,
+        "vendor-manifest",
     );
-    assert_vendor_revert_restores_pristine(&fx, &by_vendor, "vendor-offline");
+    assert_vendor_revert_restores_pristine(&fx, &by_vendor, "vendor-manifest");
 
     take_over_to_vendored(
         &fx,
@@ -1624,14 +1652,14 @@ async fn bun_dry_run_previews_match_wet_outcomes() {
     let (code, stdout, stderr) = hosted_scan(&hosted, &api, &[]);
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
     assert_pure_hosted(&fx, &hosted, hp);
-    // The manifest record `vendor` acts on (offline: the staged blob).
+    // The manifest record `vendor` acts on (the staged blob).
     stage_manifest(&fx, &hosted, &DEP_A);
     let before = snapshot(&hosted);
 
-    // `vendor --dry-run`: the takeover is PROBED (write-free per-purl revert
-    // on a ledger clone) and previewed; the backend preview does not run
-    // against the still-hosted lock, so no false `vendor_lock_entry_not_found`
-    // and no refusal.
+    // `vendor --dry-run`: the takeover's upstream restore is resolved
+    // write-free (registry lookup included) and previewed; the backend
+    // preview does not run against the still-hosted lock, so no false
+    // `vendor_lock_entry_not_found` and no refusal.
     let (code, stdout, stderr) = vendor_cmd(&hosted, &["--dry-run"]);
     assert_eq!(code, 0, "vendor --dry-run must succeed: {stdout}\n{stderr}");
     let env = envelope(&stdout, &stderr);
@@ -1741,7 +1769,7 @@ async fn bun_dry_run_previews_match_wet_outcomes() {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// After unwinding ONLY DEP_A: its line is the pristine registry tuple,
-/// DEP_B is still hosted, the ledger keeps exactly DEP_B's record + edit,
+/// DEP_B is still hosted (the lock is the only hosted state — no ledger),
 /// and a fresh frozen install lands A's ORIGINAL and B's MARKER bytes.
 fn assert_only_a_unwound(fx: &Fixture, proj: &Path, b: &HostedPatch, tag: &str) {
     let lock = read(proj, "bun.lock");
@@ -1757,22 +1785,10 @@ fn assert_only_a_unwound(fx: &Fixture, proj: &Path, b: &HostedPatch, tag: &str) 
         "{tag}: {} must stay hosted:\n{lock}",
         DEP_B.name
     );
-    let ledger = read_json(proj, ".socket/vendor/redirect-state.json");
     assert!(
-        ledger["records"].get(DEP_A.purl).is_none(),
-        "{tag}: A's record must be dropped: {ledger:#}"
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "{tag}: no hosted ledger may exist"
     );
-    assert_eq!(
-        ledger["records"][DEP_B.purl]["uuid"], DEP_B.uuid_h,
-        "{tag}: B's record must stay: {ledger:#}"
-    );
-    let edits = ledger["edits"].as_array().unwrap();
-    assert_eq!(
-        edits.len(),
-        1,
-        "{tag}: exactly B's edit must stay: {ledger:#}"
-    );
-    assert_eq!(edits[0]["key"], DEP_B.name, "{tag}: {ledger:#}");
     let fresh = fresh_frozen_install(fx, proj, &format!("fresh-{tag}"));
     assert_installed(&fresh, &DEP_A, &fx.a.orig, tag);
     assert_installed(&fresh, &DEP_B, &fx.b.patched, tag);
@@ -1790,7 +1806,7 @@ async fn bun_scoped_rollback_and_remove_unwind_one_of_two_hosted_records() {
     let patches = mount_hosted_api(&server, &fx, &[&DEP_A, &DEP_B]).await;
     let (a, b) = (&patches[0], &patches[1]);
 
-    // Both deps hosted-redirected in ONE scan: two records, two edits.
+    // Both deps hosted-redirected in ONE scan: two lock pins, no ledger.
     let (code, stdout, stderr) = hosted_scan(&proj, &server.uri(), &[]);
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
     let env = envelope(&stdout, &stderr);
@@ -1804,33 +1820,17 @@ async fn bun_scoped_rollback_and_remove_unwind_one_of_two_hosted_records() {
             hp.dep.name
         );
     }
-    let ledger = read_json(&proj, ".socket/vendor/redirect-state.json");
-    assert_eq!(
-        ledger["records"].as_object().map(|m| m.len()),
-        Some(2),
-        "{ledger:#}"
+    assert!(
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "hosted mode writes no ledger"
     );
-    assert_eq!(
-        ledger["edits"].as_array().map(|e| e.len()),
-        Some(2),
-        "{ledger:#}"
-    );
-    for hp in [a, b] {
-        let edit = ledger_edit_for(&ledger, hp.dep.name)
-            .unwrap_or_else(|| panic!("no edit for {}: {ledger:#}", hp.dep.name));
-        assert_eq!(
-            edit["original"],
-            json!(fx.pristine_line(hp.dep)),
-            "{edit:#}"
-        );
-    }
     let fresh = fresh_frozen_install(&fx, &proj, "fresh-two-hosted");
     assert_installed(&fresh, &DEP_A, &fx.a.patched, "two hosted records");
     assert_installed(&fresh, &DEP_B, &fx.b.patched, "two hosted records");
 
-    // Scoped rollback of A: per-purl path (two records ⇒ the whole-ledger
-    // replay is not eligible). Used to exit 1 with hosted.failed = ["cannot
-    // replay yet"].
+    // Scoped rollback of A: only A's pin is restored to its upstream
+    // registry entry (v5: re-resolved from the registry mirror); B's pin is
+    // left alone.
     let by_rollback = fx.dir("two-hosted-copy-rollback");
     copy_project(&proj, &by_rollback);
     let (code, stdout, stderr) = rollback_cmd(&by_rollback, &[DEP_A.purl]);
@@ -1841,12 +1841,10 @@ async fn bun_scoped_rollback_and_remove_unwind_one_of_two_hosted_records() {
     assert_eq!(env["hosted"]["failed"], json!([]), "{env:#}");
     assert_eq!(env["hosted"]["unsupported"], json!([]), "{env:#}");
     assert_only_a_unwound(&fx, &by_rollback, b, "scoped-rollback");
-    // Then the unscoped rollback: covers the last record ⇒ whole-ledger
-    // replay ⇒ pristine.
+    // Then the unscoped rollback restores the remaining pin ⇒ pristine.
     assert_unscoped_rollback_restores_pristine(&fx, &by_rollback, "after-scoped-rollback");
 
-    // `remove <purl>` takes the same per-purl hosted leg; used to exit 1
-    // with `hosted_revert_failed`.
+    // `remove <purl>` takes the same per-purl hosted leg.
     let by_remove = fx.dir("two-hosted-copy-remove");
     copy_project(&proj, &by_remove);
     let (code, stdout, stderr) = run_socket(
@@ -1915,8 +1913,8 @@ async fn bun_rollback_from_each_mixed_state_restores_pristine() {
     assert_unscoped_rollback_restores_pristine(&fx, &one, "mixed-1");
 
     // State (2): hosted → vendored (scan-driven), then rollback: the
-    // vendored leg unwires + removes the artifact, the (emptied) redirect
-    // ledger is already gone, the manifest record is retired.
+    // vendored leg unwires + removes the artifact (the takeover already
+    // restored the upstream entry, so nothing hosted is left).
     let two = fx.dir("mixed-hosted-then-vendored");
     copy_project(&proj, &two);
     let (code, stdout, stderr) = hosted_scan(&two, &api, &[]);

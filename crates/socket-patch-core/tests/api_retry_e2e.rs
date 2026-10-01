@@ -344,7 +344,7 @@ async fn batch_post_503_retries_then_succeeds_or_reports() {
     assert_eq!(waits(&log).len(), 3);
 }
 
-/// 401, 403, 404, 400 and 500 are answered once: never retried, and 401 /
+/// 401, 403, 404, 400, 500 and 502 are answered once: never retried, and 401 /
 /// 403 still classify as the proxy-fallback candidates they were.
 #[tokio::test]
 async fn other_statuses_are_not_retried() {

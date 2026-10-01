@@ -10,7 +10,7 @@
 //!
 //! ## Lock grammar
 //!
-//! Read with the lock inventory's own model ([`gemfile_lock`]): column-0
+//! Read with the lock inventory's own model ([`GemfileLock`]): column-0
 //! section headers, 2-space `remote:` keys, 4-space `specs:` entries,
 //! `CHECKSUMS` and `DEPENDENCIES` pins, CRLF tolerated. A file the model
 //! flags — conflict markers, indented text before the first header, or no
@@ -126,8 +126,8 @@ use super::{
     PatchedRef, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::vendor::gem::{gem_declaration_any, quoted_literal};
-use crate::vendor::gemfile_lock::{
-    self, bundler_manifest_for, same_remote, GemfileLock, Section, SpecLine, BUNDLER_LOCKS,
+use crate::formats::gem::{
+    bundler_manifest_for, same_remote, GemfileLock, Section, SpecLine, BUNDLER_LOCKS,
 };
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
@@ -136,7 +136,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         let Some(text) = ctx.read_text(file, out).await else {
             continue;
         };
-        let lock = gemfile_lock::parse(&text);
+        let lock = GemfileLock::parse(&text);
         // A readable lock with a `GEM` section listing several remotes.
         let merged = lock.problems.is_empty() && lock.gem_sections().any(|s| s.remotes.len() > 1);
         let blocks = if merged {
@@ -940,11 +940,10 @@ mod tests {
         )
     }
 
-    /// REGRESSION: a merged section (bundler <= 2.1) used to be flatly
-    /// unattributable — and, being RECOGNIZED, it killed the redirect
-    /// ledger's claim too, so a correctly patched bundler 1.17-2.1 project
-    /// could not attest its hosted patch at all, ledger or not. The source
-    /// pin (DEPENDENCIES `!` + the Gemfile block on that remote) attributes
+    /// A merged section (bundler <= 2.1) must stay attributable — being
+    /// RECOGNIZED, an unattributable one would also kill the redirect
+    /// ledger's claim, so a correctly patched bundler 1.17-2.1 project could
+    /// not attest its hosted patch at all. The source pin (DEPENDENCIES `!` + the Gemfile block on that remote) attributes
     /// the gem; the upstream spec in the same section stays silent.
     #[tokio::test]
     async fn merged_section_source_pinned_gem_is_hosted() {

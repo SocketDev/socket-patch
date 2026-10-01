@@ -74,7 +74,8 @@ use super::{
     DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::vendor::lock_inventory::LockIntegrity;
-use crate::vendor::nuget_config::{parse_config, same_file, NugetConfig, CONFIG_NAMES};
+use crate::formats::nuget::{parse_config, NugetConfig};
+use crate::vendor::nuget_config::{same_file, CONFIG_NAMES};
 use crate::vendor::nuget_feed::{is_plain_nuget_token, nuget_lock_entries, nupkg_leaf};
 use crate::vendor::path::VENDOR_DIR;
 
