@@ -124,7 +124,9 @@ pub(super) enum RequirementsTarget {
         /// The wheel path + sha256 the wired vendor line still pins — the
         /// very pin `pip install --require-hashes` verifies. The in-sync
         /// rebuild guard falls back to it when the state.json ledger has no
-        /// entry left for the patch.
+        /// entry left for the patch. An unhashed vendor line (written into
+        /// an unhashed requirements set) pins its path alone: the sha256 is
+        /// empty and the guard checks only the path.
         pin: Option<(String, String)>,
     },
 }
@@ -199,16 +201,18 @@ fn vendored_uuid_for(content: &str, canon_name: &str) -> Option<String> {
 
 /// Extract the (wheel path, sha256) pin the wired vendor line for
 /// `canon_name` carries — the same line shape [`vendored_uuid_for`] matches,
-/// restricted to THIS patch uuid and requiring the `--hash=sha256:` pin
-/// vendor always writes. Paths are returned bare (no `./` prefix), matching
-/// the ledger's `artifact.path` spelling.
+/// restricted to THIS patch uuid. A line with no `--hash` (vendor writes
+/// none into an unhashed requirements set) still pins its path, with an
+/// empty sha256; a `--hash` that is not a sha256 hex digest pins nothing.
+/// Paths are returned bare (no `./` prefix), matching the ledger's
+/// `artifact.path` spelling.
 fn wired_pin_in(content: &str, canon_name: &str, record_uuid: &str) -> Option<(String, String)> {
     vendor_lines(content, canon_name).find_map(|(parts, token, code)| {
         if parts.uuid != record_uuid {
             return None;
         }
-        let sha = hash_options(&code).into_iter().next()?;
-        if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let sha = hash_options(&code).into_iter().next().unwrap_or_default();
+        if !sha.is_empty() && (sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit())) {
             return None;
         }
         let path = token.strip_prefix("./").unwrap_or(&token);
@@ -1103,10 +1107,11 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(read_root(tmp.path()).await, wired);
-            // Still read back as our line for this patch.
+            // Still read back as our line for this patch, pinning the path.
             assert!(matches!(
                 preflight_requirements(tmp.path(), "six", "1.16.0", UUID).await,
-                Ok(RequirementsTarget::InSync { pin: None })
+                Ok(RequirementsTarget::InSync { pin: Some((path, sha)) })
+                    if path == REL_WHEEL && sha.is_empty()
             ));
             let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
             assert!(outcome.success, "{:?}", outcome.error);
@@ -1761,6 +1766,12 @@ mod tests {
         assert_eq!(wired_pin_in(&content, "six", "not-the-uuid"), None);
         let short = content.replace(&hex, "abc");
         assert_eq!(wired_pin_in(&short, "six", UUID), None);
+        // An unhashed vendor line still pins its path, with no sha256.
+        let unhashed = format!("{wheel}  # socket-patch vendor: six==1.16.0\nattrs==23.1.0\n");
+        assert_eq!(
+            wired_pin_in(&unhashed, "six", UUID),
+            Some((wheel.trim_start_matches("./").to_string(), String::new()))
+        );
     }
 
     /// Multi-package coexistence: a root already carrying ANOTHER package's

@@ -985,6 +985,13 @@ async fn pypi_prelude<'p>(
     })
 }
 
+/// Whether a rebuilt wheel reproduces the in-sync pin. An empty pinned
+/// sha256 comes from an unhashed requirements vendor line, which pins the
+/// wheel path alone.
+fn pin_matches(pin_path: &str, pin_sha: &str, rel_wheel: &str, sha256_hex: &str) -> bool {
+    pin_path == rel_wheel && (pin_sha.is_empty() || pin_sha == sha256_hex)
+}
+
 /// Whether [`vendor_pypi_with_pipenv_version`] — a wet run with the service
 /// enabled — asks the patch service for `record`: past every refusal it
 /// raises first, and answered neither by the in-sync hot path nor by the
@@ -1153,7 +1160,7 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         // `uv sync`, …) the moment vendor reports success. Sweep the
         // mismatched wheel back out and fail loudly instead.
         if let Some((pin_path, pin_sha)) = &expected_pin {
-            if *pin_path != rel_wheel || *pin_sha != artifact.sha256_hex {
+            if !pin_matches(pin_path, pin_sha, &rel_wheel, &artifact.sha256_hex) {
                 let _ = tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await;
                 prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
                 let mut result = result;
@@ -1843,7 +1850,7 @@ async fn try_pypi_service_wheel(
     // Digested on first ask: pypi is the only backend that pins it.
     let sha256_hex = archive.sha256_hex().to_string();
     if let Some((pin_path, pin_sha)) = expected_pin {
-        if *pin_path != rel_wheel || *pin_sha != sha256_hex {
+        if !pin_matches(pin_path, pin_sha, &rel_wheel, &sha256_hex) {
             return policy.miss(
                 warnings,
                 "vendor_prebuilt_pin_mismatch",
@@ -3426,6 +3433,80 @@ wheels = [
             "{error}"
         );
         assert!(!fx.root.join(&entry.artifact.path).exists());
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            wired
+        );
+    }
+
+    /// An unhashed requirements set gets a hashless vendor line, which still
+    /// pins the wheel PATH. With no ledger entry, a service rebuild that
+    /// lands at another filename would leave that line pointing at nothing,
+    /// so the guard refuses it; different bytes at the pinned path break no
+    /// hash and are accepted.
+    #[tokio::test]
+    async fn in_sync_ledgerless_rebuild_of_unhashed_line_keeps_the_wired_path() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let vendor = |cfg: Option<VendorServiceConfig>| {
+            let (fx, sources) = (&fx, &sources);
+            async move {
+                crate::vendor::test_support::vendor_pypi(
+                    "pkg:pypi/six@1.16.0",
+                    &fx.site_packages,
+                    &fx.root,
+                    &fx.record,
+                    sources,
+                    "2026-06-09T00:00:00Z",
+                    false,
+                    false,
+                    cfg.as_ref(),
+                )
+                .await
+            }
+        };
+        let VendorOutcome::Done { result, .. } = vendor(None).await else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let wired = tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+            .await
+            .unwrap();
+        assert!(!wired.contains("--hash"), "{wired}");
+        let uuid_dir = fx.root.join(format!(".socket/vendor/pypi/{UUID}"));
+
+        // Another filename: refused, requirements.txt untouched.
+        tokio::fs::remove_dir_all(&uuid_dir).await.unwrap();
+        let bytes = served_wheel(b"service wheel at another filename");
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_granted(&server, "six-1.16.0-py3-none-any.whl", &sri_sha512(&bytes), &bytes)
+            .await;
+        let cfg = pypi_service_cfg(&server.uri(), VendorSource::Service, false);
+        let error = crate::vendor::test_support::expect_failure(vendor(Some(cfg)).await);
+        assert!(
+            error.contains("does not match the wheel the lockfile still pins"),
+            "{error}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            wired
+        );
+
+        // Same filename, different bytes: rebuilt, requirements.txt untouched.
+        let _ = tokio::fs::remove_dir_all(&uuid_dir).await;
+        let bytes = served_wheel(b"service wheel at the pinned filename");
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_granted(&server, WHEEL_NAME, &sri_sha512(&bytes), &bytes).await;
+        let cfg = pypi_service_cfg(&server.uri(), VendorSource::Service, false);
+        let VendorOutcome::Done { result, .. } = vendor(Some(cfg)).await else {
+            panic!("same-path rebuild must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert!(uuid_dir.join(WHEEL_NAME).is_file());
         assert_eq!(
             tokio::fs::read_to_string(fx.root.join("requirements.txt"))
                 .await
