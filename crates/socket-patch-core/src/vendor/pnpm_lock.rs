@@ -8513,3 +8513,103 @@ snapshots:
         ));
     }
 }
+
+/// pnpm-workspace.yaml spellings and document shapes the overrides surgery
+/// must read the way pnpm's YAML parser does (#400, #402).
+#[cfg(test)]
+mod workspace_yaml_shape_tests {
+    use super::*;
+
+    const SPEC: &str = "file:.socket/vendor/npm/u1/left-pad-1.3.0.tgz";
+
+    fn apply(text: &str) -> Result<String, String> {
+        check_workspace_override(Some(text), "left-pad", "1.3.0", "left-pad@1.3.0")?;
+        let mut wiring = Vec::new();
+        let edit = apply_workspace_override(Some(text), "left-pad@1.3.0", SPEC, &mut wiring)?;
+        Ok(edit.new_text.expect("an edit"))
+    }
+
+    /// #402: a quoted or space-before-colon `overrides` key is the section
+    /// pnpm reads; the entry goes inside it, never into a duplicate key.
+    #[test]
+    fn quoted_or_spaced_overrides_key_is_edited_in_place() {
+        for header in ["\"overrides\":", "'overrides':", "overrides :", "overrides: # pins"] {
+            let text = format!("packages:\n  - '.'\n{header}\n  is-number: 7.0.0\n");
+            assert_eq!(
+                apply(&text).unwrap(),
+                format!(
+                    "packages:\n  - '.'\n{header}\n  is-number: 7.0.0\n  left-pad@1.3.0: {SPEC}\n"
+                ),
+                "{header}"
+            );
+        }
+    }
+
+    /// #402: the pre-flight conflict check examines a quoted section too.
+    #[test]
+    fn quoted_overrides_section_conflict_is_refused() {
+        let text = "packages:\n  - '.'\n\"overrides\":\n  left-pad@1.3.0: 1.3.1\n";
+        let err = check_workspace_override(Some(text), "left-pad", "1.3.0", "left-pad@1.3.0")
+            .unwrap_err();
+        assert!(err.contains("already carries an override"), "{err}");
+    }
+
+    /// #402: a quoted inline mapping is refused like an unquoted one.
+    #[test]
+    fn quoted_inline_overrides_mapping_is_refused() {
+        for line in ["\"overrides\": {is-number: 7.0.0}", "overrides : {is-number: 7.0.0}"] {
+            let text = format!("packages:\n  - '.'\n{line}\n");
+            let err = check_workspace_override(Some(&text), "left-pad", "1.3.0", "left-pad@1.3.0")
+                .unwrap_err();
+            assert!(err.contains("inline `overrides:`"), "{line}: {err}");
+        }
+    }
+
+    /// #402: revert finds our key inside a quoted section.
+    #[test]
+    fn revert_removes_our_key_from_a_quoted_section() {
+        let rec = ws_record("left-pad@1.3.0", SPEC, WiringAction::Added, None);
+        let mut lines = split_lines(&format!(
+            "packages:\n  - '.'\n\"overrides\":\n  is-number: 7.0.0\n  left-pad@1.3.0: {SPEC}\n"
+        ));
+        let (mut dirty, mut warnings) = (false, Vec::new());
+        revert_ws_record(&mut lines, &rec, "u1", &mut dirty, &mut warnings);
+        assert!(dirty && warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            lines.join("\n"),
+            "packages:\n  - '.'\n\"overrides\":\n  is-number: 7.0.0\n"
+        );
+    }
+
+    /// #400: a `...` document-end marker keeps the new section inside the
+    /// document (inserted before the marker).
+    #[test]
+    fn document_end_marker_keeps_the_section_in_the_document() {
+        assert_eq!(
+            apply("packages:\n  - '.'\n...\n").unwrap(),
+            format!("packages:\n  - '.'\noverrides:\n  left-pad@1.3.0: {SPEC}\n...\n")
+        );
+        // A leading `---` document start is an ordinary single document.
+        assert_eq!(
+            apply("---\npackages:\n  - '.'\n").unwrap(),
+            format!("---\npackages:\n  - '.'\noverrides:\n  left-pad@1.3.0: {SPEC}\n")
+        );
+    }
+
+    /// #400: shapes a line splice cannot extend are refused before any write.
+    #[test]
+    fn unspliceable_document_shapes_are_refused() {
+        for text in [
+            "{packages: [.]}\n",
+            "{\n  packages: [.]\n}\n",
+            "--- {packages: [.]}\n",
+            "packages:\n  - '.'\n...\n---\ncatalog: {}\n",
+            "packages:\n  - '.'\n---\ncatalog: {}\n",
+            "  packages:\n    - '.'\n",
+        ] {
+            let err = check_workspace_override(Some(text), "left-pad", "1.3.0", "left-pad@1.3.0")
+                .unwrap_err();
+            assert!(err.contains(PNPM_WORKSPACE), "{text:?}: {err}");
+        }
+    }
+}
