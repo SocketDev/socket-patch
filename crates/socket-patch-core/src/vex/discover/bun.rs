@@ -192,11 +192,11 @@ impl Bundled {
                 DIAG_REF_UNATTRIBUTABLE,
                 file,
                 format!(
-                    "{file}: {label}: {} is wired to Socket patch {}, but bun installs this \
+                    "{file}: {label}: {} is wired to a Socket patch, but bun installs this \
                      entry as a bundled dependency, unpacked from the parent package's \
                      tarball that no rewire reaches, so that copy stays unpatched; the patch \
                      is not attested",
-                    r.purl, r.uuid,
+                    r.purl,
                 ),
             );
             purls.push(r.purl);
@@ -229,12 +229,12 @@ impl Bundled {
                 DIAG_REF_UNATTRIBUTABLE,
                 file,
                 format!(
-                    "{file}: {} is wired to Socket patch {} but {file} also installs a bundled \
+                    "{file}: {} is wired to a Socket patch but {file} also installs a bundled \
                      copy of it at {label:?} (bun unpacks bundled dependencies from the parent \
                      package's tarball, so no rewire reaches it and that copy stays unpatched); \
                      the patch is not attested while the build ships unpatched bytes of this \
                      version",
-                    r.purl, r.uuid,
+                    r.purl,
                 ),
             );
         }

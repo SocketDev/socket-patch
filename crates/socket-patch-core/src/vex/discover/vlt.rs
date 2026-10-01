@@ -267,12 +267,12 @@ async fn contest_bundled_copies(ctx: &DiscoverCtx<'_>, nodes: &[VltLockNode], ou
             DIAG_REF_UNATTRIBUTABLE,
             VLT_LOCK,
             format!(
-                "{VLT_LOCK}: {} is wired to Socket patch {} but vlt also installs a bundled \
+                "{VLT_LOCK}: {} is wired to a Socket patch but vlt also installs a bundled \
                  copy of it at {location:?} (vlt unpacks bundled dependencies from the parent \
                  package's tarball and records no lock node for them, so no rewire reaches it \
                  and that copy stays unpatched); the patch is not attested while the build \
                  ships unpatched bytes of this version",
-                r.purl, r.uuid,
+                r.purl,
             ),
         );
     }
