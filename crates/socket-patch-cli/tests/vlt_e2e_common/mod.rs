@@ -809,15 +809,8 @@ pub fn write_shims_for(bin: &Path, js: &Path, log: &Path, socket: &Path) {
         "@echo off\r\nnode --no-warnings \"{}\" %*\r\n",
         js.display()
     );
-    for (name, body) in [("npx", sh_npx), ("vlt", sh_vlt)] {
-        let p = bin.join(name);
-        std::fs::write(&p, body).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-    }
+    write_executable(&bin.join("npx"), sh_npx);
+    write_executable(&bin.join("vlt"), sh_vlt);
     std::fs::write(bin.join("npx.cmd"), cmd_npx).unwrap();
     std::fs::write(bin.join("vlt.cmd"), cmd_vlt).unwrap();
 }
@@ -2175,6 +2168,33 @@ pub fn write(path: &Path, body: impl AsRef<[u8]>) {
     std::fs::write(path, body).unwrap();
 }
 
+/// Write `body` to `path` as an executable without this process ever
+/// holding a writable fd to it.
+///
+/// Linux refuses to exec a file while any process holds it open for
+/// writing (`ETXTBSY`). Tests run on parallel threads, and a sibling
+/// thread that forks while an `fs::write` handle is open passes that fd
+/// to its child until the child execs, so exec'ing a just-written script
+/// fails intermittently, both when the test spawns it and when a shim
+/// `exec`s it. A child `cp` creates the file instead: the only write fd
+/// lives in a process no test thread forks from.
+pub fn write_executable(path: &Path, body: impl AsRef<[u8]>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut name = path.file_name().unwrap().to_os_string();
+        name.push(".staged");
+        let staged = path.with_file_name(name);
+        write(&staged, body);
+        let out = Command::new("cp").arg(&staged).arg(path).output().unwrap();
+        assert_ok(&out, "cp of a staged executable");
+        std::fs::remove_file(&staged).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(not(unix))]
+    write(path, body);
+}
+
 pub fn package_json(name: &str, deps: &[(&str, &str)]) -> String {
     package_json_fields(name, &[("dependencies", deps)])
 }
@@ -2511,15 +2531,10 @@ fn vlt_e2e_harness_npx_shim_forwards_the_args_after_the_package() {
         fake
     } else {
         let fake = dir.join("socket");
-        write(
+        write_executable(
             &fake,
             format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n", argv.display()),
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
         fake
     };
     let bin = dir.join("bin");
