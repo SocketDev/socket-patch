@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-01 (run 3), main `2463257` (#277, the v5 consolidation), latest release 4.0.0.
+Last updated: 2026-10-01 (run 5), main `2463257` (#277, the v5 consolidation), latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, package grant, hosted tarball, `/registry/<name>/<ver>` mirror). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -17,11 +17,13 @@ Project modes (cells before run 3 were tested on main `f6b7fb9`; "v5" marks cell
 | Linux | 10.5.2 / 10.12.1 | untested | fail #361 #362 (10.12.1) | untested | untested | untested | fail #360 | untested | untested | untested |
 | Linux | 10.34.5 | pass | fail #361 #362 | fail #362 | untested | pass | fail #360 (v5 too) | pass / pass; v5 rollback pass | fail #400 #402 | untested |
 | Linux | 11.27.0 | pass | fail #361 #362 | fail #362 | pass | pass | fail #400 #402 | pass / pass; v5 rollback pass | fail #400 #402; pass CRLF, no-EOL, comment | v5 pass (#401 closed: `pnpm_trust_lockfile_left` warning) |
-| Linux | 12.8.1 | pass | fail #361 #362 | fail #362 | untested | pass | fail #400 #402 | pass / pass; v5 rollback pass | fail #400 #402 | v5 pass (#401 closed) |
+| Linux | 12.8.1 | pass | fail #361 #362 | fail #362 | untested | pass; fail #466 with `packageManager` (two-doc lock) | fail #400 #402 | pass / pass; v5 rollback pass; two-doc lock pass | fail #400 #402 | v5 pass (#401 closed); vendored→hosted on two-doc lock fail #466 |
 | macOS | 10.34.5 | pass | n/a on CI (pnpm 10 disables it) | fail #362 | untested | untested | untested | untested | untested | untested |
 | macOS | 11.27.0 / 12.8.1 | pass | fail #361 #362 | fail #362 | untested | untested | untested | untested | untested | untested |
 | Windows | 10.34.5 | pass | n/a on CI | fail #362 | untested | untested | untested | untested | untested | untested |
 | Windows | 11.27.0 / 12.8.1 | pass | fail #361 #362 | fail #362 | untested | untested | untested | untested | untested | untested |
+
+Hosted `--frozen-lockfile [--offline]` over an upstream `node_modules` or warm store (run 5): VEX stays honest on 9.15.9 / 10.34.5 / 11.28.3 / 12.8.1 (pass).
 
 "Edge shapes" means a whole-document flow mapping, a `...` document end, and quoted or `key :` top-level keys.
 
@@ -39,9 +41,9 @@ Global mode (`-g`, v5 main `2463257`):
 ## Backlog
 
 0. **Maintainer request (global `-g` mode):** the Linux cells are done. Still to do: macOS and Windows (corepack, standalone and npm-installed pnpm; `PNPM_HOME` with spaces or unicode; Windows `%LOCALAPPDATA%\pnpm`), and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry. Needs a probe branch.
-1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` has failed through the git proxy in runs 1 and 3 (and was denied in run 2), so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
-2. Hosted on v5: Rush / subspace locks, peer-suffixed workspace instances, and catalogs, using the `SOCKET_PATCH_SERVER_URL` / `SOCKET_NPM_REGISTRY` harness.
-3. Hosted `--frozen-lockfile --offline` with a warm store holding the upstream tarball, on pnpm 9–12. Check that `vex` doesn't attest unpatched installed bytes.
+1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` has failed through the git proxy in runs 1 and 3, and was denied by the permission policy in runs 2 and 5, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
+2. Two-doc lock, part 2: pnpm 10/11 `configDependencies` env documents, and hosted two-doc workspaces. Re-verify #466 when fixed.
+3. Hosted on v5: Rush / subspace locks, peer-suffixed workspace instances, and catalogs, using the `SOCKET_PATCH_SERVER_URL` / `SOCKET_NPM_REGISTRY` harness.
 4. Agent: `dependenciesMeta.injected`, `package-import-method=clone|copy`, and pnpm 1–6 legacy layouts (Node 16).
 5. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout). Needs a probe branch.
 6. Re-verify #360, #361, #362 (PR #365), #400 and #402 (PR #414), and #435 when fixes land.
@@ -59,4 +61,6 @@ Global mode (`-g`, v5 main `2463257`):
 - `vex -g` needs `--product` outside a project ("Could not auto-detect a top-level product PURL").
 - Agent-mode `get <purl>` for an uninstalled package reports `success, applied: 1` when another manifest entry applies. The nested apply fails only when nothing matches. It's not pnpm-specific (noted on #362).
 - A compact single-line `package.json` comes back 2-space-indented after vendor + rollback. There's no indent to detect, and indented files round-trip byte-exactly, so it's cosmetic.
+- Hosted on pnpm 9 over an existing upstream `node_modules`: a frozen install keeps the upstream bytes. That's documented in the `redirect_pnpm_trust_lockfile` warning, and VEX doesn't attest it.
+- pnpm 12 warns that `package.json` `pnpm.overrides` is ignored on vendored projects. The workspace-file override is what takes effect, so this is noise only.
 - A `vex --output /dev/stdout` hang when stdout is a pipe is not pnpm-specific.
