@@ -69,8 +69,7 @@ pub enum SidecarFileAction {
     Deleted,
 }
 
-/// Structured operator advisory. Replaces the previous free-form
-/// `Option<String>` field so consumers can switch on `code` and
+/// Structured operator advisory: consumers switch on `code` and
 /// route on `severity` without regex-matching `message`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -280,8 +279,8 @@ mod tests {
     }
 
     /// Multi-file record + advisory together — the NuGet
-    /// signed-package case that the old design lost. Verify both
-    /// surface in the JSON simultaneously.
+    /// signed-package case. Verify both surface in the JSON
+    /// simultaneously.
     #[test]
     fn nuget_signed_case_carries_files_and_advisory() {
         let r = SidecarRecord {

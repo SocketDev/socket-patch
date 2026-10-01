@@ -25,7 +25,7 @@
 //!      patch uuid survives into `vendor/composer/installed.json`
 //!      (`dist.reference`).
 //!      Then the **manifest-less VEX legs** run on that fresh checkout (the shape a
-//!      depscan PR / a `vendor --detached` checkout has): with
+//!      depscan PR / a `scan --mode vendored` checkout has): with
 //!      `.socket/manifest.json` deleted, standalone `vex` (and embedded
 //!      `vendor --vex` / `apply --vex`) still attests `(vendored)` from the
 //!      ledger; with both ledgers deleted too it attests from the
@@ -38,7 +38,7 @@
 //!   7. **Revert proof**: `vendor --revert` restores composer.lock
 //!      byte-for-byte and removes `.socket/vendor/` entirely.
 //!
-//! A third twin drives `scan --vendor --detached --vex` (the depscan-style
+//! A third twin drives `scan --vendor --vex` (the depscan-style
 //! front door: batch discovery → vendored copy + lock wiring, NO manifest,
 //! embedded VEX in the same run) against the same mocked API, then the same
 //! fresh-checkout install and manifest-less VEX legs.
@@ -57,6 +57,9 @@
 //! `SOCKET_PATCH_COMPOSER_E2E_REQUIRED` is set (then those fail); every
 //! assertion after that is hard. `SOCKET_PATCH_COMPOSER_E2E_VERSION` pins
 //! the release a CI leg expects.
+
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -100,13 +103,14 @@ fn binary() -> PathBuf {
 /// flip behavior) along with `VIRTUAL_ENV` (crawler discovery input).
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
             cmd.env_remove(&k);
         }
     }
     cmd.env_remove("VIRTUAL_ENV");
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -200,7 +204,8 @@ fn lock_entry(lock_path: &Path, name: &str) -> serde_json::Value {
 /// `.socket/` manifest + blob fully offline, while `get <uuid> --mode
 /// vendored` fetches the record from the mocked API (the uuid path is
 /// exempt from installed narrowing, so only the `view/{uuid}` route is
-/// needed), writes the manifest itself, and stages patch content in memory
+/// needed), writes NO manifest (the vendor ledger's detached entry is the
+/// record), and stages patch content in memory
 /// — `.socket/blobs` must stay absent. `--vendor-source build` keeps the
 /// get flow off the vendoring service (no grant/tarball mocks needed).
 enum VendorDriver<'a> {
@@ -237,7 +242,7 @@ fn run_vendored(driver: &VendorDriver<'_>, proj: &Path) -> (i32, String, String)
                 "--org",
                 ORG,
                 "--vendor-source",
-                "build",
+                "service",
                 "--cwd",
                 proj.to_str().unwrap(),
             ],
@@ -296,27 +301,29 @@ async fn mount_view_mock(
 ) {
     use base64::Engine as _;
     let blob_b64 = base64::engine::general_purpose::STANDARD.encode(after);
+    let view = serde_json::json!({
+        "uuid": UUID,
+        "purl": purl,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": { file_key: {
+            "beforeHash": git_sha256(before),
+            "afterHash": git_sha256(after),
+            "blobContent": blob_b64,
+        }},
+        "vulnerabilities": { GHSA: {
+            "cves": ["CVE-2026-44444"],
+            "summary": "composer capstone vex vuln",
+            "severity": "high",
+            "description": "d",
+        }},
+        "description": "capstone marker patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view(server, &view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": purl,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": { file_key: {
-                "beforeHash": git_sha256(before),
-                "afterHash": git_sha256(after),
-                "blobContent": blob_b64,
-            }},
-            "vulnerabilities": { GHSA: {
-                "cves": ["CVE-2026-44444"],
-                "summary": "composer capstone vex vuln",
-                "severity": "high",
-                "description": "d",
-            }},
-            "description": "capstone marker patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
         .mount(server)
         .await;
 }
@@ -574,7 +581,7 @@ fn assert_manifestless_vendored_vex(
 // ── the capstone ──────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "host capstone: shells out to a real composer 2; the unpinned `test` job \
+#[ignore = "host capstone: shells out to a real composer; the unpinned `test` job \
             skips it, the e2e job runs it with a pinned toolchain via --ignored"]
 fn composer_vendor_fresh_checkout_install_and_revert() {
     let Some(major) = composer_e2e_common::composer_major("e2e_vendor_composer_build") else {
@@ -773,14 +780,15 @@ fn composer_vendor_fresh_checkout_install_and_revert() {
 /// get's uuid path — exempt from installed narrowing, so only the mocked
 /// `view/{uuid}` route is needed. Unlike the capstone, NOTHING is staged
 /// locally: the record and the patched content come from the API mock, get
-/// writes `.socket/manifest.json` itself, and `.socket/blobs` must stay
+/// writes NO manifest (the ledger's detached entry in
+/// `.socket/vendor/state.json` is the record), and `.socket/blobs` must stay
 /// absent (vendored downloads live in memory). Ends with the same
 /// fresh-checkout `composer install` proof; the revert half stays with the
 /// vendor capstone (same engine, same ledger).
 // multi_thread: the CLI/composer subprocesses block a worker thread while
 // wiremock keeps serving the view route on the others.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "host capstone: shells out to a real composer 2; the unpinned `test` job \
+#[ignore = "host capstone: shells out to a real composer; the unpinned `test` job \
             skips it, the e2e job runs it with a pinned toolchain via --ignored"]
 async fn composer_get_uuid_vendored_fresh_checkout_install() {
     let Some(major) = composer_e2e_common::composer_major("e2e_vendor_composer_build(get)") else {
@@ -925,14 +933,15 @@ async fn composer_get_uuid_vendored_fresh_checkout_install() {
     // capstone — cold home + cache, path dist the only source.
     let fresh = assert_fresh_checkout_installs_patched(tmp.path(), &proj, &patched);
 
-    // Manifest-less VEX legs on the get-produced checkout: `get` wrote the
-    // manifest, so deleting it is exactly the depscan / detached shape.
+    // Manifest-less VEX legs on the get-produced checkout: `get --mode
+    // vendored` writes no manifest, so this checkout already is the
+    // depscan / detached shape.
     tokio::task::block_in_place(|| {
         assert_manifestless_vendored_vex(tmp.path(), &fresh, &purl, &patched, &lock_before, "get")
     });
 }
 
-/// `scan --vendor --detached --vex` twin: batch discovery over the REAL
+/// `scan --vendor --vex` twin: batch discovery over the REAL
 /// install → the vendored copy + composer.lock wiring with NO manifest
 /// (detached), the in-run embedded VEX attesting `(vendored)`, then the same
 /// fresh-checkout install and manifest-less VEX legs.
@@ -969,9 +978,8 @@ async fn composer_scan_vendor_detached_vex_fresh_checkout_install() {
         &[
             "scan",
             "--vendor",
-            "--detached",
             "--vendor-source",
-            "build",
+            "service",
             "--vex",
             "out.vex.json",
             "--vex-product",
@@ -990,7 +998,7 @@ async fn composer_scan_vendor_detached_vex_fresh_checkout_install() {
     );
     assert_eq!(
         code, 0,
-        "scan --vendor --detached --vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "scan --vendor --vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env = parse_envelope(&stdout);
     assert_eq!(env["vex"]["statements"], 1, "in-run vex block: {env}");
@@ -999,7 +1007,7 @@ async fn composer_scan_vendor_detached_vex_fresh_checkout_install() {
     assert_attested(&doc, &purl, UUID, Marker::Vendored, &[(GHSA, &[VEX_CVE])]);
     assert!(
         !proj.join(".socket/manifest.json").exists(),
-        "--detached must not write a manifest: {env}"
+        "scan --vendor must not write a manifest: {env}"
     );
     let copy_rel = format!(".socket/vendor/composer/{UUID}/{DEP}@{version}");
     let entry = lock_entry(&lock_path, DEP);
@@ -1022,9 +1030,9 @@ async fn composer_scan_vendor_detached_vex_fresh_checkout_install() {
 // artifact instead of driving composer, so they need neither the toolchain
 // nor the network and run in the normal `test` job (no `#[ignore]`).
 
-/// `repair`-reconstructed ledger entry: recovered from the lockfile path, so
-/// it owns the artifact but records NO pre-vendor wiring (see
-/// `repair_vendor.rs`'s `synth_entry`).
+/// A ledger entry with NO pre-vendor wiring (the shape a pre-v5 `repair`
+/// reconstructed from the lockfile path): it owns the artifact but has
+/// nothing to replay.
 const UUID_RECONSTRUCTED: &str = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
 /// Un-ledgered artifact dir that composer.lock still points at.
 const UUID_ORPHAN_WIRED: &str = "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e";
@@ -1362,7 +1370,8 @@ fn composer_vendor_keeps_files_mirror_filters_would_drop() {
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("Warning (vendor_composer_mirror_filters_neutralized)"),
+        stderr.contains("Warning:")
+            && stderr.contains("Composer's path mirror would have skipped files"),
         "the neutralization is surfaced:\n{stderr}"
     );
     assert!(
@@ -1391,15 +1400,14 @@ fn composer_vendor_keeps_files_mirror_filters_would_drop() {
     assert_fresh_install_mirrors_whole_copy(tmp.path(), &proj, &copy_rel, &patched);
 }
 
-/// A copy vendored by a CLI that predates the neutralization (filter files
-/// intact in the committed copy) is healed by the idempotent re-run: the
-/// lock stays byte-identical, the heal is warned, and a fresh checkout then
-/// installs every file.
+/// Modified filter files trigger exact redownload of the committed copy.
+/// The original inventory, lock, and ledger survive, and a fresh checkout
+/// installs every file from the restored artifact.
 #[test]
 #[ignore = "host capstone: shells out to a real composer; the unpinned `test` job \
             skips it, the e2e job runs it with a pinned toolchain via --ignored"]
-fn composer_vendor_fast_path_heals_legacy_copy() {
-    let suite = "e2e_vendor_composer_build(legacy-copy)";
+fn composer_vendor_redownloads_modified_copy() {
+    let suite = "e2e_vendor_composer_build(redownload-copy)";
     let Some(major) = composer_e2e_common::composer_major(suite) else {
         return;
     };
@@ -1408,13 +1416,17 @@ fn composer_vendor_fast_path_heals_legacy_copy() {
     std::fs::create_dir_all(&proj).unwrap();
     let home = tmp.path().join("composer-home");
     let cache = tmp.path().join("composer-cache");
-    if !setup_composer_project(&proj, &home, &cache, "(legacy-copy)", major) {
+    if !setup_composer_project(&proj, &home, &cache, "(redownload-copy)", major) {
         return;
     }
     let lock_path = proj.join("composer.lock");
     let version = locked_composer_version(&lock_path, DEP).expect("psr/log locked");
     let orig = std::fs::read(proj.join("vendor/psr/log/src/LoggerInterface.php")).unwrap();
-    let patched: Vec<u8> = [orig.as_slice(), b"\n// SOCKET-PATCH-LEGACY-COPY-MARKER\n"].concat();
+    let patched: Vec<u8> = [
+        orig.as_slice(),
+        b"\n// SOCKET-PATCH-REDOWNLOAD-COPY-MARKER\n",
+    ]
+    .concat();
     let purl = format!("pkg:composer/{DEP}@{version}");
     stage_patch_with_vuln(&proj, &purl, "src/LoggerInterface.php", &orig, &patched);
     let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
@@ -1425,6 +1437,12 @@ fn composer_vendor_fast_path_heals_legacy_copy() {
 
     let copy_rel = format!(".socket/vendor/composer/{UUID}/{DEP}@{version}");
     let copy = proj.join(&copy_rel);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let inventory_before = runtime
+        .block_on(socket_patch_core::vendor::compute_dir_inventory(&copy))
+        .unwrap();
+    let ledger_path = proj.join(".socket/vendor/state.json");
+    let ledger_before = std::fs::read(&ledger_path).unwrap();
     plant_mirror_filters(&copy);
     let lock_wired = std::fs::read(&lock_path).unwrap();
 
@@ -1437,21 +1455,32 @@ fn composer_vendor_fast_path_heals_legacy_copy() {
     assert_eq!(env["summary"]["failed"], 0, "{env}");
     assert!(
         env["events"].as_array().unwrap().iter().any(|e| {
-            e["errorCode"] == "vendor_composer_mirror_filters_neutralized"
+            e["action"] == "rebuilt"
+                && e["details"]["redownloaded"] == true
                 && e["purl"] == purl.as_str()
         }),
-        "the heal is surfaced: {env}"
+        "the exact redownload is surfaced: {env}"
     );
     assert_eq!(
         std::fs::read(&lock_path).unwrap(),
         lock_wired,
         "composer.lock untouched"
     );
-    assert_eq!(std::fs::read(copy.join(".gitignore")).unwrap(), b"");
+    assert_eq!(
+        std::fs::read(&ledger_path).unwrap(),
+        ledger_before,
+        "ledger untouched"
+    );
+    assert_eq!(
+        runtime
+            .block_on(socket_patch_core::vendor::compute_dir_inventory(&copy))
+            .unwrap(),
+        inventory_before
+    );
     assert_eq!(
         std::fs::read(copy.join("src/LoggerInterface.php")).unwrap(),
         patched,
-        "the patched file is untouched by the heal"
+        "the redownload preserves the patched file"
     );
 
     let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
@@ -1465,8 +1494,9 @@ fn composer_vendor_fast_path_heals_legacy_copy() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|e| e["errorCode"] == "vendor_composer_mirror_filters_neutralized"),
-        "a healed copy has nothing left to neutralize: {env}"
+            .any(|e| e["action"] == "rebuilt"
+                || e["errorCode"] == "vendor_composer_mirror_filters_neutralized"),
+        "a restored copy has nothing left to neutralize: {env}"
     );
     assert_fresh_install_mirrors_whole_copy(tmp.path(), &proj, &copy_rel, &patched);
 }

@@ -161,7 +161,9 @@ impl Wiring {
         }
     }
 
-    /// The omission code once the ledger outlives a reverted lock.
+    /// The omission code once the (vendor) ledger outlives a reverted lock.
+    /// Hosted never reaches it: v5 writes no redirect ledger, so a reverted
+    /// hosted lock names the patch nowhere.
     fn unwired(self) -> &'static str {
         match self {
             Wiring::Hosted => "redirect_unwired",
@@ -297,8 +299,46 @@ impl<'a> ManifestlessVex<'a> {
     fn embedded_attest(&self, project: &Path, state: &str, keep_ledgers: bool) {
         let lock = std::fs::read(project.join("yarn.lock")).expect("yarn.lock");
         for (label, make) in &self.embedded {
-            let out = run_vex(&binary(), project, &make(self.online()));
-            self.attested(&out, &format!("embedded {label} ({state})"));
+            let run = make(self.online());
+            let vendored_scan = self.wiring == Wiring::Vendored
+                && !keep_ledgers
+                && matches!(run.via, crate::vex_e2e_common::VexVia::Scan);
+            // Without its ledger, a vendored scan refuses the installed
+            // package (`vendor_ledger_entry_missing`). yarn < 1.7 installs
+            // nothing for the vendored `file:` entry (see
+            // `installs_file_tarballs`), so there the scan has no package to
+            // vendor and attests from the lockfile like the other runs.
+            let installed = installs_file_tarballs(&yarn_classic_version());
+            let missing_ledger = vendored_scan && installed;
+            if missing_ledger {
+                let output = project.join(
+                    run.output
+                        .as_deref()
+                        .unwrap_or_else(|| Path::new("out.vex.json")),
+                );
+                let _ = std::fs::remove_file(output);
+            }
+            let out = run_vex(&binary(), project, &run);
+            if missing_ledger {
+                assert_eq!(out.code, Some(1), "{out}");
+                assert_eq!(
+                    out.envelope["vendor"]["events"][0]["errorCode"], "vendor_ledger_entry_missing",
+                    "{out}"
+                );
+                assert!(out.doc.is_none(), "failed scan cannot emit VEX: {out}");
+            } else {
+                if vendored_scan {
+                    // Pin the limitation's shape so a behavior change is
+                    // noticed.
+                    assert_eq!(out.envelope["scannedPackages"], 0, "{out}");
+                    println!(
+                        "KNOWN LIMITATION {}: nothing installed, so a vendored scan \
+                         without its ledger vendors nothing and attests from the lockfile",
+                        yarn_classic()
+                    );
+                }
+                self.attested(&out, &format!("embedded {label} ({state})"));
+            }
             assert!(
                 !project.join(".socket/manifest.json").exists(),
                 "{}: embedded {label} ({state}) must not write a manifest",
@@ -345,6 +385,10 @@ impl<'a> ManifestlessVex<'a> {
             socket_patch_core::patch::redirect::REDIRECT_STATE_REL,
         ]
         .map(|rel| (rel, std::fs::read(project.join(rel)).ok()));
+        assert!(
+            ledgers[1].1.is_none(),
+            "{leg}: v5 hosted mode writes no redirect ledger"
+        );
         strip_ledgers(project);
         let before = self.api.view_requests(self.uuid);
         let out = run_vex(&binary(), project, &self.online());

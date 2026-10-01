@@ -207,7 +207,7 @@ fn expected_defaults() -> Snap {
         proxy_url: None, // no clap default — resolved in core
         ecosystems: None,
         download_mode: "diff".to_string(),
-        vendor_source: "auto".to_string(),
+        vendor_source: "service".to_string(),
         vendor_url: None,
         patch_server_url: None,
         offline: false,
@@ -494,8 +494,9 @@ fn repair_unknown_flag_is_unknown_argument_error() {
 
 // --- `gc` is a first-class visible alias for `repair` ---------------------
 //
-// `scan --sync` is the recommended combined workflow, but `gc`/`repair`
-// remain documented commands for users who want to clean up without an
+// `scan --mode agent --prune` (or `--sync`) combines apply and GC in one
+// pass, but `gc`/`repair` remain documented commands for users who want to
+// clean up without an
 // apply pass. These tests guard the `visible_alias = "gc"` attribute on
 // `Commands::Repair` — if a future refactor demotes the alias (to
 // `alias = "gc"` or removes it entirely), the help output check below

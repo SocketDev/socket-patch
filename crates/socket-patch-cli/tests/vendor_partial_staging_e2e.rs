@@ -1,31 +1,6 @@
-//! Two rules about a patch view that does not serve every file's bytes.
-//!
-//! The view serves `blobContent` only for files the patch actually CHANGES:
-//! a file whose `beforeHash` equals its `afterHash` comes back with hashes
-//! and no content (live example: `pkg:npm/tar-fs@2.1.1`, patch
-//! `8ff3e0c7-6855-4224-924b-3e1151744ed4`, seven zero-delta fixture files
-//! plus one changed `package/index.js`).
-//!
-//! 1. A zero-delta file needs NO content — the pristine copy already holds
-//!    the patched bytes — so such a view stages and the package vendors
-//!    (`a_view_whose_only_contentless_files_are_zero_delta_vendors`).
-//! 2. A file the patch CHANGES that is served without content is genuinely
-//!    unsatisfiable. That is a broken PACKAGE, not a broken run: it gets
-//!    its own `failed` event and the rest of the run carries on. A single
-//!    such patch used to make the WHOLE run bail `no_local_source` — exit
-//!    1, `status: error`, zero events, and every OTHER package in the
-//!    manifest left unvendored without a word.
-//!
-//! A package whose patch content cannot be obtained is an unsatisfiable
-//! package like any other (`vendor_fetch_failed`, `redirect_revert_failed`,
-//! the Bun refusals …). The pre-event `no_local_source` bail stays for the
-//! case it was written for — NOTHING in the manifest can be staged, so
-//! there are no events to report.
-//!
-//! Hermetic: the API is a `wiremock` mock, `--vendor-source build` keeps the
-//! vendoring service out of the run, and every package is installed on disk
-//! so no registry fetch happens.
-
+//! Vendoring consumes immutable service artifacts without downloading patch blobs.
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 use std::path::Path;
 use std::process::Command;
 
@@ -36,8 +11,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ORG: &str = "test-org";
 
-/// The satisfiable package: its after-blob is staged under `.socket/blobs`,
-/// so staging never fetches its view.
 const GOOD_PURL: &str = "pkg:npm/left-pad@1.3.0";
 const GOOD_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 const GOOD_ORIG: &[u8] = b"module.exports = () => 'orig';\n";
@@ -91,8 +64,6 @@ fn bad_files() -> Value {
     })
 }
 
-/// A two-package npm project: both installed, both in the v3 lock, both in
-/// the manifest. Only the good package's after-blob is staged on disk.
 fn fixture(root: &Path) {
     for (name, version, index, extra) in [
         ("left-pad", "1.3.0", GOOD_ORIG, None),
@@ -167,55 +138,6 @@ fn fixture(root: &Path) {
     .unwrap();
 }
 
-/// Mount the bad package's view. `changed_content` is the `blobContent`
-/// the CHANGED file is served with; `None` makes the view genuinely
-/// unsatisfiable (the patch needs those bytes and nothing can supply
-/// them). The zero-delta file always comes back with hashes and no
-/// content — that is how the API serves a file a patch does not change.
-async fn mount_view(server: &MockServer, changed_content: Option<&[u8]>) {
-    use base64::Engine;
-    let mut changed = json!({
-        "beforeHash": git_hash(BAD_ORIG),
-        "afterHash": git_hash(BAD_PATCHED),
-    });
-    if let Some(bytes) = changed_content {
-        changed["blobContent"] = json!(base64::engine::general_purpose::STANDARD.encode(bytes));
-    }
-    Mock::given(method("GET"))
-        .and(wm_path(format!("/v0/orgs/{ORG}/patches/view/{BAD_UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "uuid": BAD_UUID,
-            "purl": BAD_PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": changed,
-                "package/test/fixtures/d/file1": {
-                    "beforeHash": git_hash(BAD_FIXTURE),
-                    "afterHash": git_hash(BAD_FIXTURE),
-                }
-            },
-            "vulnerabilities": {},
-            "description": "d",
-            "license": "MIT",
-            "tier": "free",
-        })))
-        .mount(server)
-        .await;
-}
-
-/// A view the run genuinely cannot satisfy: the file the patch CHANGES is
-/// served with no `blobContent`, so the patched bytes exist nowhere.
-async fn mount_contentless_view(server: &MockServer) {
-    mount_view(server, None).await;
-}
-
-/// The live JS-7 view: the changed file carries `blobContent`, and only
-/// the zero-delta file comes back contentless — which needs no content.
-async fn mount_zero_delta_view(server: &MockServer) {
-    mount_view(server, Some(BAD_PATCHED)).await;
-}
-
-/// The `path -> bytes` map of a gzipped tarball's regular members.
 fn tgz_members(tgz: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     let file = std::fs::File::open(tgz).unwrap_or_else(|e| panic!("open {}: {e}", tgz.display()));
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
@@ -234,13 +156,6 @@ fn tgz_members(tgz: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     out
 }
 
-/// `vendor --json --vendor-source build` against the mock API, with every
-/// ambient `SOCKET_*` var scrubbed from the child.
-fn vendor_cli(root: &Path, api_url: &str) -> (i32, Value, String) {
-    vendor_cli_with_source(root, api_url, "build")
-}
-
-/// [`vendor_cli`] under an explicit `--vendor-source`.
 fn vendor_cli_with_source(root: &Path, api_url: &str, source: &str) -> (i32, Value, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
     cmd.args([
@@ -282,288 +197,6 @@ fn event_for<'a>(env: &'a Value, purl: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("expected an event for {purl} in:\n{env:#}"))
 }
 
-#[tokio::test]
-async fn contentless_patch_view_fails_only_its_own_package() {
-    let server = MockServer::start().await;
-    mount_contentless_view(&server).await;
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    fixture(root);
-
-    let (code, env, stderr) = vendor_cli(root, &server.uri());
-
-    assert_eq!(
-        code, 1,
-        "an unstageable package still fails the run: {env:#}\nstderr:\n{stderr}"
-    );
-    assert_eq!(
-        env["status"], "partialFailure",
-        "one bad package is a partial failure, not a pre-event abort: {env:#}"
-    );
-    assert!(
-        env["error"].is_null(),
-        "no run-level error payload: the failure is per-package: {env:#}"
-    );
-
-    let bad = event_for(&env, BAD_PURL);
-    assert_eq!(bad["action"], "failed", "{env:#}");
-    assert_eq!(
-        bad["errorCode"], "no_local_source",
-        "the per-package failure keeps the staging code: {env:#}"
-    );
-    // The per-package slot is the ONE machine-readable explanation a
-    // `--json` consumer gets (every human channel in the stager is gated
-    // on `!--json`), so it must carry the REAL reason. This run is neither
-    // offline nor a download failure: the view was served, 200, with a
-    // file it had no content for.
-    assert_eq!(
-        bad["error"].as_str(),
-        Some("the patch view served no blob content for package/index.js"),
-        "the failure names the file that was served without content: {env:#}"
-    );
-
-    let good = event_for(&env, GOOD_PURL);
-    assert_eq!(
-        good["action"], "applied",
-        "the rest of the run must continue: {env:#}"
-    );
-    assert!(
-        root.join(format!(".socket/vendor/npm/{GOOD_UUID}/left-pad-1.3.0.tgz"))
-            .is_file(),
-        "the satisfiable package must still be vendored: {env:#}"
-    );
-    // The unstageable package is left completely alone.
-    assert!(
-        !root.join(format!(".socket/vendor/npm/{BAD_UUID}")).exists(),
-        "nothing is written for the unstageable package: {env:#}"
-    );
-    let lock: Value =
-        serde_json::from_slice(&std::fs::read(root.join("package-lock.json")).unwrap()).unwrap();
-    assert_eq!(
-        lock["packages"]["node_modules/tar-fs"]["resolved"],
-        "https://registry.npmjs.org/tar-fs/-/tar-fs-2.1.1.tgz",
-        "the unstageable package's lock entry stays registry-resolved: {env:#}"
-    );
-}
-
-/// The pre-event bail survives for the case it was written for: when NO
-/// patch in the manifest can be staged there are no per-package events to
-/// report, so the run keeps its top-level `no_local_source` error.
-#[tokio::test]
-async fn every_patch_unstageable_keeps_the_run_level_error() {
-    let server = MockServer::start().await;
-    mount_contentless_view(&server).await;
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    fixture(root);
-    // Drop the good package's staged blob: now both patches need a view,
-    // and neither view is complete (left-pad's 404s).
-    std::fs::remove_file(root.join(".socket/blobs").join(git_hash(GOOD_PATCHED))).unwrap();
-
-    let (code, env, stderr) = vendor_cli(root, &server.uri());
-
-    assert_eq!(code, 1, "{env:#}\nstderr:\n{stderr}");
-    assert_eq!(env["status"], "error", "{env:#}");
-    assert_eq!(env["error"]["code"], "no_local_source", "{env:#}");
-    assert!(
-        events(&env).is_empty(),
-        "a pre-event abort reports no events: {env:#}"
-    );
-    assert!(
-        !root.join(".socket/vendor").exists(),
-        "an aborted run vendors nothing: {env:#}"
-    );
-}
-
-/// The JS-7 package itself must VENDOR, not merely fail politely.
-///
-/// `pkg:npm/tar-fs@2.1.1` patch `8ff3e0c7-…` changes one file and carries
-/// seven zero-delta fixture files (`beforeHash == afterHash`). The view
-/// serves `blobContent` only for the file it CHANGES, so those seven come
-/// back contentless — and a zero-delta file needs no content: the pristine
-/// copy already holds the patched bytes, which is exactly what
-/// `verify_file_patch` answers `AlreadyPatched` for. Requiring the
-/// after-blob for every file made this patch permanently unvendorable.
-#[tokio::test]
-async fn a_view_whose_only_contentless_files_are_zero_delta_vendors() {
-    let server = MockServer::start().await;
-    mount_zero_delta_view(&server).await;
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    fixture(root);
-
-    let (code, env, stderr) = vendor_cli(root, &server.uri());
-
-    assert_eq!(
-        code, 0,
-        "nothing in this patch needs the unserved bytes: {env:#}\nstderr:\n{stderr}"
-    );
-    assert_eq!(env["status"], "success", "{env:#}");
-    assert_eq!(event_for(&env, BAD_PURL)["action"], "applied", "{env:#}");
-    assert_eq!(event_for(&env, GOOD_PURL)["action"], "applied", "{env:#}");
-
-    // The vendored tarball carries BOTH files — the changed one at its
-    // patched bytes, the zero-delta one at the bytes it always had.
-    let tgz = root.join(format!(".socket/vendor/npm/{BAD_UUID}/tar-fs-2.1.1.tgz"));
-    let members = tgz_members(&tgz);
-    assert_eq!(
-        members.get("package/index.js").map(Vec::as_slice),
-        Some(BAD_PATCHED),
-        "the changed file is the patched content: {members:?}"
-    );
-    assert_eq!(
-        members
-            .get("package/test/fixtures/d/file1")
-            .map(Vec::as_slice),
-        Some(BAD_FIXTURE),
-        "the zero-delta file is vendored from the pristine copy: {members:?}"
-    );
-}
-
-/// A package staging drops must stay out of the vendoring service's
-/// download plan as well as the loop.
-///
-/// With the service enabled the vendor loop fetches its service downloads
-/// ahead of itself, from an EXACT plan built over the records it is handed
-/// — a download grant can start a server-side build and counts against
-/// quota, so a package the run never vendors must never be granted. The
-/// staging drop hands the engine only the stageable records, so the
-/// unstageable package reaches neither the plan nor the loop's own call.
-/// Two stageable packages keep the plan attached (one download has nothing
-/// to overlap), and the service answering `not_found` sends both to the
-/// local build, so the run's outcome is the build-mode one.
-#[tokio::test]
-async fn a_dropped_package_is_never_granted_a_service_download() {
-    const THIRD_PURL: &str = "pkg:npm/is-odd@3.0.1";
-    const THIRD_UUID: &str = "3c1d5e7f-2a4b-4c6d-8e0f-1a2b3c4d5e6f";
-    const THIRD_ORIG: &[u8] = b"module.exports = n => n % 2 === 1;\n";
-    const THIRD_PATCHED: &[u8] = b"module.exports = n => Math.abs(n % 2) === 1;\n";
-
-    /// Answer every grant request `not_found`, whichever uuids it names.
-    struct NotFound;
-    impl wiremock::Respond for NotFound {
-        fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
-            let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-            let results: serde_json::Map<String, Value> = body["uuids"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(|u| {
-                    (
-                        u.to_string(),
-                        json!({ "status": "not_found", "url": null, "artifacts": [] }),
-                    )
-                })
-                .collect();
-            ResponseTemplate::new(200).set_body_json(json!({ "results": results }))
-        }
-    }
-
-    let server = MockServer::start().await;
-    mount_contentless_view(&server).await;
-    Mock::given(method("POST"))
-        .and(wm_path(format!("/v0/orgs/{ORG}/patches/package")))
-        .respond_with(NotFound)
-        .mount(&server)
-        .await;
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    fixture(root);
-    // A second stageable package: installed, locked, blob staged.
-    let pkg = root.join("node_modules/is-odd");
-    std::fs::create_dir_all(&pkg).unwrap();
-    std::fs::write(
-        pkg.join("package.json"),
-        br#"{"name":"is-odd","version":"3.0.1"}"#,
-    )
-    .unwrap();
-    std::fs::write(pkg.join("index.js"), THIRD_ORIG).unwrap();
-    let mut lock: Value =
-        serde_json::from_slice(&std::fs::read(root.join("package-lock.json")).unwrap()).unwrap();
-    lock["packages"][""]["dependencies"]["is-odd"] = json!("^3.0.1");
-    lock["packages"]["node_modules/is-odd"] = json!({
-        "version": "3.0.1",
-        "resolved": "https://registry.npmjs.org/is-odd/-/is-odd-3.0.1.tgz",
-        "integrity": "sha512-orig3=="
-    });
-    std::fs::write(
-        root.join("package-lock.json"),
-        serde_json::to_vec_pretty(&lock).unwrap(),
-    )
-    .unwrap();
-    let manifest_path = root.join(".socket/manifest.json");
-    let mut manifest: Value =
-        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-    manifest["patches"][THIRD_PURL] = patch_record(
-        THIRD_UUID,
-        json!({ "package/index.js": {
-            "beforeHash": git_hash(THIRD_ORIG),
-            "afterHash": git_hash(THIRD_PATCHED),
-        }}),
-    );
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
-    std::fs::write(
-        root.join(".socket/blobs").join(git_hash(THIRD_PATCHED)),
-        THIRD_PATCHED,
-    )
-    .unwrap();
-
-    let (code, env, stderr) = vendor_cli_with_source(root, &server.uri(), "auto");
-
-    assert_eq!(code, 1, "{env:#}\nstderr:\n{stderr}");
-    assert_eq!(env["status"], "partialFailure", "{env:#}");
-    assert_eq!(
-        event_for(&env, BAD_PURL)["errorCode"],
-        "no_local_source",
-        "{env:#}"
-    );
-    assert_eq!(event_for(&env, GOOD_PURL)["action"], "applied", "{env:#}");
-    assert_eq!(event_for(&env, THIRD_PURL)["action"], "applied", "{env:#}");
-
-    let granted: Vec<String> = server
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .iter()
-        .filter(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/patches/package"))
-        .flat_map(|r| {
-            let body: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
-            body["uuids"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|u| u.as_str().map(str::to_string))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    assert!(
-        granted.iter().any(|u| u == GOOD_UUID) && granted.iter().any(|u| u == THIRD_UUID),
-        "the stageable packages ask the service (the test is not vacuous): {granted:?}"
-    );
-    assert!(
-        !granted.iter().any(|u| u == BAD_UUID),
-        "the dropped package must never be granted a download: {granted:?}\n{env:#}"
-    );
-}
-
-// ── the other caller of the per-package drop ────────────────────────────
-//
-// `drop_unstageable` is wired into `vendor` (above), `scan --mode vendored`
-// / `get --mode vendored` (`scan::vendor_flow`) and `repair`. The vendored
-// SCAN fold — `Ok(staging_errors || engine_errors)` — has its own error
-// path, and every existing suite that touches it mounts a single-patch
-// manifest, so it only ever exercised the preserved whole-run bail.
-
-const GOOD_ENCODED: &str = "pkg%3Anpm%2Fleft-pad%401.3.0";
-const BAD_ENCODED: &str = "pkg%3Anpm%2Ftar-fs%402.1.1";
-
-/// Discovery for both packages: the batch endpoint plus the per-package
-/// search each purl falls back to.
 async fn mount_discovery(server: &MockServer) {
     Mock::given(method("POST"))
         .and(wm_path(format!("/v0/orgs/{ORG}/patches/batch")))
@@ -583,8 +216,8 @@ async fn mount_discovery(server: &MockServer) {
         .mount(server)
         .await;
     for (encoded, uuid, purl) in [
-        (GOOD_ENCODED, GOOD_UUID, GOOD_PURL),
-        (BAD_ENCODED, BAD_UUID, BAD_PURL),
+        ("pkg%3Anpm%2Fleft-pad%401.3.0", GOOD_UUID, GOOD_PURL),
+        ("pkg%3Anpm%2Ftar-fs%402.1.1", BAD_UUID, BAD_PURL),
     ] {
         Mock::given(method("GET"))
             .and(wm_path(format!(
@@ -607,36 +240,6 @@ async fn mount_discovery(server: &MockServer) {
     }
 }
 
-/// The good package's view, served complete.
-async fn mount_good_view(server: &MockServer) {
-    use base64::Engine;
-    Mock::given(method("GET"))
-        .and(wm_path(format!("/v0/orgs/{ORG}/patches/view/{GOOD_UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "uuid": GOOD_UUID,
-            "purl": GOOD_PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": { "package/index.js": {
-                "beforeHash": git_hash(GOOD_ORIG),
-                "afterHash": git_hash(GOOD_PATCHED),
-                "blobContent": base64::engine::general_purpose::STANDARD.encode(GOOD_PATCHED),
-            }},
-            "vulnerabilities": {},
-            "description": "d",
-            "license": "MIT",
-            "tier": "free",
-        })))
-        .mount(server)
-        .await;
-}
-
-/// The project WITHOUT `.socket/`: vendored mode is manifest-free, so the
-/// records come from discovery and the blobs from the download phase.
-fn scan_fixture(root: &Path) {
-    fixture(root);
-    std::fs::remove_dir_all(root.join(".socket")).unwrap();
-}
-
 fn scan_vendored_cli(root: &Path, api_url: &str) -> (i32, Value, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
     cmd.args([
@@ -646,7 +249,7 @@ fn scan_vendored_cli(root: &Path, api_url: &str) -> (i32, Value, String) {
         "vendored",
         "--yes",
         "--vendor-source",
-        "build",
+        "service",
         "--api-url",
         api_url,
         "--api-token",
@@ -670,52 +273,147 @@ fn scan_vendored_cli(root: &Path, api_url: &str) -> (i32, Value, String) {
     (out.status.code().unwrap_or(-1), env, stderr)
 }
 
-/// `scan --mode vendored` over a mixed selection: one package the view
-/// cannot supply and one it can. The unsatisfiable package is reported
-/// once, per package, and the other still vendors — the vendored scan's
-/// own fold, not `vendor`'s.
-#[tokio::test]
-async fn scan_vendored_reports_an_unstageable_package_and_vendors_the_rest() {
+async fn publish(server: &MockServer, root: &Path, bad: Option<&[u8]>) {
+    if let Some(bytes) = bad {
+        std::fs::write(
+            root.join(".socket/blobs").join(git_hash(BAD_PATCHED)),
+            bytes,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".socket/blobs").join(git_hash(BAD_FIXTURE)),
+            BAD_FIXTURE,
+        )
+        .unwrap();
+    }
+    prebuilt_common::mount_project(server, root).await;
+    std::fs::remove_dir_all(root.join(".socket/blobs")).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vendor_downloads_without_local_blobs_or_installed_packages() {
     let server = MockServer::start().await;
-    mount_discovery(&server).await;
-    mount_good_view(&server).await;
-    mount_contentless_view(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    scan_fixture(root);
+    fixture(root);
+    publish(&server, root, Some(BAD_PATCHED)).await;
+    std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+    let (code, env, stderr) = vendor_cli_with_source(root, &server.uri(), "service");
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert_eq!(env["summary"]["applied"], 2);
+    assert!(!root.join(".socket/blobs").exists());
+    let members =
+        tgz_members(&root.join(format!(".socket/vendor/npm/{BAD_UUID}/tar-fs-2.1.1.tgz")));
+    assert_eq!(members["package/index.js"], BAD_PATCHED);
+    assert_eq!(members["package/test/fixtures/d/file1"], BAD_FIXTURE);
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.iter().any(|r| r.url.path().contains("/view/")));
+    let requested: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "POST")
+        .flat_map(|r| {
+            serde_json::from_slice::<Value>(&r.body).unwrap()["uuids"]
+                .as_array()
+                .unwrap()
+                .clone()
+        })
+        .collect();
+    assert!(requested.contains(&json!(GOOD_UUID)) && requested.contains(&json!(BAD_UUID)));
+}
 
+#[tokio::test(flavor = "multi_thread")]
+async fn unavailable_artifact_fails_only_its_package_without_local_fallback() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root);
+    publish(&server, root, None).await;
+    // Even valid after-blobs cannot supply an unavailable server artifact.
+    std::fs::create_dir_all(root.join(".socket/blobs")).unwrap();
+    std::fs::write(
+        root.join(".socket/blobs").join(git_hash(BAD_PATCHED)),
+        BAD_PATCHED,
+    )
+    .unwrap();
+    let (code, env, stderr) = vendor_cli_with_source(root, &server.uri(), "auto");
+    assert_eq!(code, 1, "{env:#}\n{stderr}");
+    assert_eq!(event_for(&env, GOOD_PURL)["action"], "applied");
+    assert_eq!(event_for(&env, BAD_PURL)["action"], "failed");
+    assert!(!root.join(format!(".socket/vendor/npm/{BAD_UUID}")).exists());
+    assert_eq!(
+        std::fs::read(root.join("node_modules/tar-fs/index.js")).unwrap(),
+        BAD_ORIG
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn valid_archive_integrity_does_not_hide_incorrect_patched_members() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root);
+    publish(&server, root, Some(BAD_ORIG)).await;
+    let (code, env, stderr) = vendor_cli_with_source(root, &server.uri(), "service");
+    assert_eq!(code, 1, "{env:#}\n{stderr}");
+    assert_eq!(event_for(&env, GOOD_PURL)["action"], "applied");
+    assert_eq!(event_for(&env, BAD_PURL)["action"], "failed");
+    assert!(!root.join(format!(".socket/vendor/npm/{BAD_UUID}")).exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_vendor_uses_contentless_views_and_downloaded_archives() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root);
+    publish(&server, root, Some(BAD_PATCHED)).await;
+    mount_discovery(&server).await;
+    for (purl, uuid, files) in [
+        (GOOD_PURL, GOOD_UUID, good_files()),
+        (BAD_PURL, BAD_UUID, bad_files()),
+    ] {
+        let mut view = patch_record(uuid, files);
+        view["purl"] = json!(purl);
+        view["publishedAt"] = json!("2026-01-01T00:00:00Z");
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(view))
+            .mount(&server)
+            .await;
+    }
+    std::fs::remove_file(root.join(".socket/manifest.json")).unwrap();
     let (code, env, stderr) = scan_vendored_cli(root, &server.uri());
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert_eq!(env["vendor"]["summary"]["applied"], 2);
+    assert!(!root.join(".socket/manifest.json").exists());
+    assert!(!root.join(".socket/blobs").exists());
+}
 
-    assert_eq!(code, 1, "{env:#}\nstderr:\n{stderr}");
-    let vendor = &env["vendor"];
-    assert_eq!(
-        vendor["status"], "partialFailure",
-        "one bad package is a partial failure, not a step abort: {env:#}"
-    );
-    let bad = event_for(vendor, BAD_PURL);
-    assert_eq!(bad["action"], "failed", "{env:#}");
-    assert_eq!(bad["errorCode"], "no_local_source", "{env:#}");
-    assert_eq!(
-        bad["error"].as_str(),
-        Some("the patch view served no blob content for package/index.js"),
-        "{env:#}"
-    );
-    assert_eq!(
-        events(vendor)
-            .iter()
-            .filter(|e| e["purl"] == BAD_PURL)
-            .count(),
-        1,
-        "the stuck package is reported exactly once: {env:#}"
-    );
-    assert_eq!(event_for(vendor, GOOD_PURL)["action"], "applied", "{env:#}");
+#[tokio::test(flavor = "multi_thread")]
+async fn local_build_source_is_rejected() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    fixture(tmp.path());
+    let before = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+        .current_dir(tmp.path())
+        .args([
+            "vendor",
+            "--json",
+            "--vendor-source",
+            "build",
+            "--api-url",
+            &server.uri(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
     assert!(
-        root.join(format!(".socket/vendor/npm/{GOOD_UUID}/left-pad-1.3.0.tgz"))
-            .is_file(),
-        "the satisfiable package must still be vendored: {env:#}"
+        String::from_utf8_lossy(&out.stderr).contains("local artifact construction was removed")
     );
-    assert!(
-        !root.join(format!(".socket/vendor/npm/{BAD_UUID}")).exists(),
-        "nothing is written for the unstageable package: {env:#}"
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        before
     );
+    assert!(server.received_requests().await.unwrap().is_empty());
 }

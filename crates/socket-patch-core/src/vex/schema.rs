@@ -632,8 +632,7 @@ mod tests {
     /// OpenVEX 0.2.0 — it cascades from the document when omitted. A
     /// spec-valid statement that leaves it out (the canonical spec
     /// example does exactly this for a `fixed` statement) MUST parse,
-    /// not error with "missing field `timestamp`". Previously the
-    /// field was a required `String`, so this document was rejected.
+    /// not error with "missing field `timestamp`".
     #[test]
     fn statement_without_timestamp_parses_and_leaves_it_none() {
         let doc_json = r#"{

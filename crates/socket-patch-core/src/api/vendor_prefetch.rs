@@ -86,6 +86,17 @@
 //! download, removed as soon as their package is passed over or the loop
 //! ends) and by the [`crate::vendor::prestage`] pool, not by size.
 //!
+//! The package-reference half is batched: the plan's first call sends
+//! one request naming the planned uuids from its own position on (see
+//! [`VendorPrefetch::reference`]) in place of its own, and later calls
+//! take their granted reference from it. That request grants the rest of
+//! the plan up front, which the plan's exactness makes safe: a position
+//! the loop passes over is granted only if the loop passes it after the
+//! batch was sent. The bounds
+//! above then limit the archive downloads. A package the batch reports
+//! still building, or leaves out, makes its own request at its turn, as
+//! before.
+//!
 //! A planned download may name a secondary artifact (the gem stub
 //! gemspec) its backend fetches right after a verified archive; the task
 //! fetches it along with the archive, under the backend's own conditions,
@@ -107,8 +118,10 @@ use futures_util::StreamExt;
 
 use super::client::{
     hold_back_debug, ApiClient, HeldBack, PlannedDownload, PrefetchedSecondary,
-    VendorServiceOutcome, VENDOR_BREAKER_THRESHOLD,
+    VendorServiceOutcome, MAX_REFERENCE_BATCH, VENDOR_BREAKER_THRESHOLD,
 };
+use super::types::PackageVendorResult;
+use crate::api::client::ApiError;
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::prestage::PrestageRecipe;
 use crate::vendor::registry_fetch::{artifact_matches_integrity, verify_go_h1};
@@ -153,6 +166,9 @@ pub(crate) struct VendorPrefetch {
     /// What the task is allowed to request, shared with it.
     look: Arc<Lookahead>,
     state: tokio::sync::Mutex<PrefetchState>,
+    /// The plan's package references, resolved in one batch by the first
+    /// planned call (see [`Self::reference`]) and taken uuid by uuid.
+    references: tokio::sync::OnceCell<std::sync::Mutex<HashMap<String, PackageVendorResult>>>,
 }
 
 /// The window of plan positions the task may request: `[at, at + reach)`,
@@ -354,7 +370,84 @@ impl VendorPrefetch {
             window: window.max(1),
             look: Arc::new(Lookahead::new(byte_budget)),
             state: tokio::sync::Mutex::new(PrefetchState::default()),
+            references: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Step 1 (the package-reference request) for a planned `uuid`, or
+    /// `None` to make the live request (not planned, other parameters, or
+    /// the batch did not answer it).
+    ///
+    /// The first planned call sends ONE request naming the plan from its
+    /// own position on, its own uuid first, in place of its single-uuid request and with the
+    /// same retry ladder: the endpoint takes up to [`MAX_REFERENCE_BATCH`]
+    /// uuids, and one request per package paid a round trip and a quota
+    /// unit each. Its failure is that call's own failure, so an outage
+    /// costs what the serial loop paid, and every later call makes its
+    /// live request. A package still building (`pending_build`) is asked
+    /// again at its own turn, as the serial loop did, since it may be
+    /// ready by then; every other answer is final and is reused.
+    pub(crate) async fn reference(
+        &self,
+        client: &ApiClient,
+        uuid: &str,
+        free_only: bool,
+        vendor_url: Option<&str>,
+    ) -> Option<Result<PackageVendorResult, (ApiError, bool)>> {
+        if free_only != self.free_only || vendor_url != self.vendor_url.as_deref() {
+            return None;
+        }
+        let at = self.planned.iter().position(|planned| planned == uuid)?;
+        let mut own = None;
+        let cache = self
+            .references
+            .get_or_init(|| async {
+                // Positions before this call's were passed over: the loop
+                // never asks for them, so they are never granted.
+                let mut order = vec![uuid.to_string()];
+                for planned in &self.planned[at..] {
+                    if !order.contains(planned) {
+                        order.push(planned.clone());
+                    }
+                }
+                let mut kept = HashMap::new();
+                for (i, chunk) in order.chunks(MAX_REFERENCE_BATCH).enumerate() {
+                    match client
+                        .request_vendor_references(chunk, free_only, vendor_url)
+                        .await
+                    {
+                        Ok(mut results) => {
+                            if i == 0 {
+                                own = Some(results.remove(uuid).ok_or_else(|| {
+                                    (
+                                        ApiError::Other(format!(
+                                            "package response missing a result for {uuid}"
+                                        )),
+                                        false,
+                                    )
+                                }));
+                            }
+                            kept.extend(
+                                results
+                                    .into_iter()
+                                    .filter(|(_, r)| r.status != "pending_build"),
+                            );
+                        }
+                        Err(e) if i == 0 => {
+                            own = Some(Err(e));
+                            break;
+                        }
+                        // The chunk's uuids make their live requests.
+                        Err(_) => break,
+                    }
+                }
+                std::sync::Mutex::new(kept)
+            })
+            .await;
+        if own.is_some() {
+            return own;
+        }
+        cache.lock().ok()?.remove(uuid).map(Ok)
     }
 
     /// The prefetched outcome of the loop's call for `uuid`, or `None` to
@@ -1327,7 +1420,8 @@ mod tests {
             out
         }
         let cfg = crate::vendor::VendorServiceConfig {
-            source: crate::vendor::VendorSource::Auto,
+            maven_config: None,
+            source: crate::vendor::VendorSource::Service,
             client: Some(client(&server.uri())),
             use_public_proxy: false,
             vendor_url: None,
@@ -1352,5 +1446,202 @@ mod tests {
         serial_requests.sort();
         planned_requests.sort();
         assert_eq!(planned_requests, serial_requests);
+    }
+
+    /// A service that answers every uuid a package-reference request names,
+    /// as the real endpoint does: the request's first uuid decides a
+    /// whole-request failure (503 / 403), and the others it cannot grant
+    /// are left out of the results.
+    struct BatchService {
+        base: String,
+        scripts: HashMap<String, Script>,
+    }
+
+    impl wiremock::Respond for BatchService {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let uuids: Vec<String> = body["uuids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|u| u.as_str().unwrap().to_string())
+                .collect();
+            match self.scripts.get(&uuids[0]) {
+                Some(Script::Down) => return ResponseTemplate::new(503),
+                Some(Script::Forbidden) => return ResponseTemplate::new(403),
+                _ => {}
+            }
+            let mut results = serde_json::Map::new();
+            for u in uuids {
+                let status = match self.scripts.get(&u) {
+                    Some(Script::Granted(_)) => "granted",
+                    Some(Script::Pending) => "pending_build",
+                    Some(Script::NotFound) => "not_found",
+                    _ => continue,
+                };
+                let url = format!("{}/serve/{u}.tgz", self.base);
+                let sri = format!(
+                    "sha512-{}",
+                    base64::engine::general_purpose::STANDARD.encode(Sha512::digest(u.as_bytes()))
+                );
+                let artifacts = if status == "granted" {
+                    serde_json::json!([{ "kind": "tarball", "url": url,
+                                         "integrity": { "sha512": sri } }])
+                } else {
+                    serde_json::json!([])
+                };
+                results.insert(
+                    u.clone(),
+                    serde_json::json!({ "status": status, "url": url, "artifacts": artifacts }),
+                );
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": results }))
+        }
+    }
+
+    async fn serve_batches(scripts: &[Script]) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(BatchService {
+                base: server.uri(),
+                scripts: scripts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (uuid(i), *s))
+                    .collect(),
+            })
+            .mount(&server)
+            .await;
+        for i in 0..scripts.len() {
+            let u = uuid(i);
+            Mock::given(method("GET"))
+                .and(path(format!("/serve/{u}.tgz")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(u.into_bytes()))
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    /// The `(POSTs, GETs)` the server has seen.
+    async fn request_counts(server: &MockServer) -> (usize, usize) {
+        let log = request_log(server).await;
+        let posts = log.iter().filter(|r| r.starts_with("POST")).count();
+        (posts, log.len() - posts)
+    }
+
+    /// One package-reference request resolves the whole plan: the serial
+    /// loop's outcomes, one POST instead of one per package, and the same
+    /// downloads.
+    #[tokio::test]
+    async fn one_reference_request_serves_the_whole_plan() {
+        let scripts: Vec<Script> = (0..6).map(|_| Script::Granted(0)).collect();
+        let all: Vec<usize> = (0..scripts.len()).collect();
+        let server = serve_batches(&scripts).await;
+        let serial = run(&server, None, &all).await;
+        assert_eq!(request_counts(&server).await, (6, 6));
+        assert_eq!(run(&server, Some(&all), &all).await, serial);
+        assert_eq!(request_counts(&server).await, (6 + 1, 6 + 6));
+    }
+
+    /// The batch replaces the first package's own request, so a service
+    /// that is down costs the same ladders, outcomes and breaker count as
+    /// the serial loop.
+    #[tokio::test]
+    async fn a_failed_reference_batch_costs_what_the_serial_loop_paid() {
+        let scripts: Vec<Script> = (0..8).map(|_| Script::Down).collect();
+        let all: Vec<usize> = (0..scripts.len()).collect();
+        let server = serve_batches(&scripts).await;
+        let serial = run(&server, None, &all).await;
+        let (serial_posts, serial_gets) = request_counts(&server).await;
+        assert_eq!(run(&server, Some(&all), &all).await, serial);
+        assert_eq!(
+            request_counts(&server).await,
+            (2 * serial_posts, 2 * serial_gets)
+        );
+    }
+
+    /// Final answers are reused: a package still building is asked again
+    /// at its own turn, as the serial loop did, and one the batch left out
+    /// makes its live request.
+    #[tokio::test]
+    async fn a_building_package_is_asked_again_at_its_turn() {
+        use Script::*;
+        let scripts = [Granted(0), Pending, Granted(0), NotFound, Down, Granted(0)];
+        let all: Vec<usize> = (0..scripts.len()).collect();
+        let server = serve_batches(&scripts).await;
+        let serial = run(&server, None, &all).await;
+        let (serial_posts, _) = request_counts(&server).await;
+        assert_eq!(run(&server, Some(&all), &all).await, serial);
+        let (posts, _) = request_counts(&server).await;
+        // The down package's three attempts, one retry-policy ladder.
+        let down_ladder = 3;
+        assert_eq!(serial_posts, 5 + down_ladder);
+        assert_eq!(
+            posts - serial_posts,
+            1 + 1 + down_ladder,
+            "the batch, then the pending and the down package live"
+        );
+    }
+
+    /// Plans past the endpoint's cap go out in requests of at most
+    /// [`MAX_REFERENCE_BATCH`] uuids.
+    #[tokio::test]
+    async fn a_plan_past_the_cap_is_resolved_in_capped_requests() {
+        let n = MAX_REFERENCE_BATCH + 1;
+        let scripts: Vec<Script> = (0..n).map(|_| Script::Granted(0)).collect();
+        let server = serve_batches(&scripts).await;
+        let c = client(&server.uri());
+        let _guard = c.prefetch_vendor_packages((0..n).map(uuid).collect(), false, None, None, 1);
+        for i in [0, n - 1] {
+            assert!(
+                summary(&c.fetch_vendor_package(&uuid(i), false, None, None).await)
+                    .starts_with("ready")
+            );
+        }
+        let sizes: Vec<usize> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                body["uuids"].as_array().unwrap().len()
+            })
+            .collect();
+        assert_eq!(sizes, [MAX_REFERENCE_BATCH, 1]);
+    }
+
+    /// The batch names the plan from the first call's position on: a
+    /// position the loop passed over before it is never granted.
+    #[tokio::test]
+    async fn the_reference_batch_starts_at_the_first_call() {
+        let scripts: Vec<Script> = (0..4).map(|_| Script::Granted(0)).collect();
+        let server = serve_batches(&scripts).await;
+        let c = client(&server.uri());
+        let _guard = c.prefetch_vendor_packages((0..4).map(uuid).collect(), false, None, None, 1);
+        assert!(
+            summary(&c.fetch_vendor_package(&uuid(2), false, None, None).await)
+                .starts_with("ready")
+        );
+        let bodies: Vec<Vec<String>> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                body["uuids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|u| u.as_str().unwrap().to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(bodies, [vec![uuid(2), uuid(3)]]);
     }
 }

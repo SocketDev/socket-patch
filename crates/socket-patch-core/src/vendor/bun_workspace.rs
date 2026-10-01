@@ -139,25 +139,6 @@ pub(super) async fn repair(
     Ok((wiring, !updates.is_empty()))
 }
 
-/// Preserve both existing and missing member copies before a rebuild whose
-/// source still has to be checked against the lockfile's trust anchor.
-pub(super) fn snapshot(
-    root: &Path,
-    entry: &VendorEntry,
-) -> Result<super::bun_lock::BinaryWorkspaceArtifactSnapshot, String> {
-    required_mirrors(root, entry)?
-        .into_iter()
-        .map(|(_, rel, path)| {
-            let before = match read_regular_to_bytes_sync(&path) {
-                Ok(bytes) => Some(bytes),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(format!("cannot snapshot workspace tarball {rel}: {e}")),
-            };
-            Ok((path, before))
-        })
-        .collect()
-}
-
 /// Remove superseded mirrors only when every recorded artifact remains ours.
 /// Validate the entire set before removing any file.
 pub(super) async fn cleanup(root: &Path, entry: &VendorEntry, dry_run: bool) -> Result<(), String> {

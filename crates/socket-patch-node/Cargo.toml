@@ -12,13 +12,13 @@ name = "socket_patch_node"
 path = "src/lib.rs"
 crate-type = ["cdylib"]
 # A cdylib that links against the host's `napi_*` symbols has nothing to
-# test outside Node; the engine's tests live in socket-patch-cli and the
+# test outside Node; the engine's tests live in socket-patch-core (unit) and
+# socket-patch-cli (disk parity), and the
 # addon's in npm/test/smoke.mjs.
 test = false
 doctest = false
 
 [dependencies]
-socket-patch-cli = { path = "../socket-patch-cli" }
 socket-patch-core = { workspace = true }
 napi = { workspace = true }
 napi-derive = { workspace = true }

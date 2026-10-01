@@ -10,7 +10,7 @@ use std::process::{Command, Output};
 
 use serde_json::Value;
 use socket_patch_core::manifest::schema::{
-    PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
+    PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 
 const STALE_OPENVEX_DOC: &str = r#"{"@context":"https://openvex.dev/ns/v0.2.0","@id":"urn:uuid:stale","author":"Socket","timestamp":"2020-01-01T00:00:00Z","version":1,"statements":[]}"#;
@@ -56,10 +56,8 @@ fn record(uuid: &str, ghsa: &str) -> PatchRecord {
     }
 }
 
-/// A manifest with `purls` (each with a distinct GHSA). `manual` declares
-/// npm so the property-7 setup filter keeps the patches; `None` leaves the
-/// ecosystem un-set-up.
-fn write_manifest(cwd: &Path, purls: &[&str], manual: bool) {
+/// A manifest with `purls` (each with a distinct GHSA).
+fn write_manifest(cwd: &Path, purls: &[&str]) {
     let mut m = PatchManifest::new();
     for (i, purl) in purls.iter().enumerate() {
         m.patches.insert(
@@ -69,12 +67,6 @@ fn write_manifest(cwd: &Path, purls: &[&str], manual: bool) {
                 &format!("GHSA-test-{i}"),
             ),
         );
-    }
-    if manual {
-        m.setup = Some(SetupConfig {
-            exclude: Vec::new(),
-            manual: vec!["npm".to_string()],
-        });
     }
     let dir = cwd.join(".socket");
     std::fs::create_dir_all(&dir).unwrap();
@@ -112,7 +104,7 @@ fn stdout(o: &Output) -> String {
 fn dry_run_with_output_writes_nothing_and_says_so() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"], true);
+    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
     let out_path = cwd.join("d.json");
 
     let o = vex(
@@ -150,7 +142,7 @@ fn dry_run_failure_keeps_previous_document() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
     // Verify mode with nothing installed: nothing attests.
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"], true);
+    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
     let out_path = cwd.join("keep.json");
     std::fs::write(&out_path, STALE_OPENVEX_DOC).unwrap();
 
@@ -164,7 +156,7 @@ fn dry_run_failure_keeps_previous_document() {
 fn output_dash_means_stdout() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"], true);
+    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
 
     let o = vex(cwd, &["--no-verify", "-O", "-"]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
@@ -184,7 +176,7 @@ fn output_dash_means_stdout() {
 fn written_document_ends_with_newline_and_summary_is_singular() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"], true);
+    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
     let out_path = cwd.join("out.json");
 
     let o = vex(cwd, &["--no-verify", "-O", out_path.to_str().unwrap()]);
@@ -208,7 +200,7 @@ fn written_document_ends_with_newline_and_summary_is_singular() {
 fn failed_run_reports_stale_document_removal() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"], true);
+    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
     let out_path = cwd.join("keep.json");
     std::fs::write(&out_path, STALE_OPENVEX_DOC).unwrap();
 
@@ -254,7 +246,7 @@ fn omissions_are_sorted_and_listed_once() {
         "pkg:npm/alpha@1.0.0",
         "pkg:npm/mid@1.0.0",
     ];
-    write_manifest(cwd, &purls, true);
+    write_manifest(cwd, &purls);
 
     let o = vex(cwd, &[]);
     assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
@@ -308,34 +300,26 @@ fn omissions_are_sorted_and_listed_once() {
 }
 
 #[test]
-fn all_setup_drops_skip_the_generic_note() {
+fn trusted_patch_attests_without_setup_config() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    // No `manual`, no hook: property 7 drops the (trusted) patch.
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"], false);
+    // No manifest `setup` section and no install hook: the trusted patch
+    // still attests, with no omission warning.
+    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
 
     let o = vex(cwd, &["--no-verify"]);
-    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
     let err = stderr(&o);
-    assert!(!err.contains("Note:"), "{err}");
-    let lines: Vec<&str> = err.lines().collect();
-    assert_eq!(lines.len(), 2, "{err}");
-    assert!(lines[0].starts_with("Warning: omitting pkg:npm/a@1.0.0 from VEX: applied, but"));
-    assert!(lines[0].ends_with("(ecosystem_not_setup)"), "{err}");
-    assert!(
-        lines[1].starts_with(
-            "Error: 1 applied patch with vulnerability metadata was omitted from VEX because \
-             its ecosystem is not set up"
-        ),
-        "{err}"
-    );
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    assert!(!err.contains("omitting"), "{err}");
+    let doc: Value = serde_json::from_slice(&o.stdout).expect("OpenVEX doc on stdout");
+    assert_eq!(doc["statements"].as_array().unwrap().len(), 1, "{doc}");
 }
 
 #[test]
 fn org_that_looks_like_a_file_warns() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"], true);
+    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
 
     let o = vex(cwd, &["--no-verify", "-o", "out.json"]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
@@ -401,7 +385,7 @@ fn corrupt_manifest_error_names_the_file() {
 fn product_undetected_names_the_unusable_manifest() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"], true);
+    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
     std::fs::write(cwd.join("package.json"), r#"{"name":"app"}"#).unwrap();
     let o = cli()
         .args(["vex", "--no-verify", "--cwd", cwd.to_str().unwrap()])

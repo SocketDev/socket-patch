@@ -17,9 +17,9 @@ requirements.txt lanes of the same ecosystem.
 
 | Input | Hosted | Vendored | Agent |
 |-------|--------|----------|-------|
-| `Pipfile.lock`, `pipfile-spec: 6` (Pipenv 7 and later) | Every category (`default`, `develop`, Pipenv 2022+ named categories) that pins the patched release becomes `{"file" \| "path": "<url>#sha256=<hex>", "hashes": ["sha256:<hex>"]}` with `markers`/`extras` preserved and `version`/`index` dropped. `path` for Pipenv 7–11, `file` from 2018. `_meta` (the Pipfile content hash) and the Pipfile are untouched. | Every matching category refers to the committed wheel under `.socket/vendor/pypi/<uuid>/`; wheels with extras use `path` (Pipenv 2022's file-URL bug). Requires Pipenv 2018 or later (`pypi_pipenv_installer_unsupported`). | Independent of the lock: patches the installed distribution in the venv Pipenv resolves for the project — `VIRTUAL_ENV` unless `PIPENV_ACTIVE` / `PIPENV_IGNORE_VIRTUALENVS` is set, in-project `.venv` subject to `PIPENV_VENV_IN_PROJECT` and the Pipfile's `[pipenv] venv_in_project`, or Pipenv's default `$WORKON_HOME/<dir>-<hash>[-<python>]`; never `venv/` (discovered without running Pipenv). With an auto-detected `.venv` and an existing WORKON_HOME venv, both are patched, since Pipenv 2026.2+ uses the WORKON_HOME venv and older releases use `.venv`. |
+| `Pipfile.lock`, `pipfile-spec: 6` (Pipenv 7 and later) | Every category (`default`, `develop`, Pipenv 2022+ named categories) that pins the patched release becomes `{"file" \| "path": "<url>#sha256=<hex>", "hashes": ["sha256:<hex>"]}` with `markers`/`extras`/`index` kept as Pipenv wrote them and `version` dropped. `path` for Pipenv 7–11, `file` from 2018. `_meta` (the Pipfile content hash) and the Pipfile are untouched. | Every matching category refers to the committed wheel under `.socket/vendor/pypi/<uuid>/`; wheels with extras use `path` (Pipenv 2022's file-URL bug). Requires Pipenv 2018 or later (`pypi_pipenv_installer_unsupported`). | Independent of the lock: patches the installed distribution in the venv Pipenv resolves for the project — `VIRTUAL_ENV` unless `PIPENV_ACTIVE` / `PIPENV_IGNORE_VIRTUALENVS` is set, in-project `.venv` subject to `PIPENV_VENV_IN_PROJECT` and the Pipfile's `[pipenv] venv_in_project`, or Pipenv's default `$WORKON_HOME/<dir>-<hash>[-<python>]`; never `venv/` (discovered without running Pipenv). With an auto-detected `.venv` and an existing WORKON_HOME venv, both are patched, since Pipenv 2026.2+ uses the WORKON_HOME venv and older releases use `.venv`. |
 | `Pipfile.lock`, `pipfile-spec` < 6 (Pipenv 0–6) | Refused (`redirect_pipenv_skipped`), lock untouched. | Refused (`pypi_pipenv_spec_unsupported`). | Works. |
-| Lock-only checkout (nothing installed) | Discovered from the lock and redirected. | Discovered from the lock; the pristine wheel is fetched by one of the lock's recorded digests (Pipenv records every release file's sha256 without filenames) through PyPI's JSON API, verified against the same digest, and the patched wheel comes from the service. | Nothing to patch (no installed distribution); the lock's pins are listed as lockfile-only packages. |
+| Lock-only checkout (nothing installed) | Discovered from the lock and redirected. | Discovered from the lock; the patched wheel or source distribution is downloaded and verified from the service without a local install. | Nothing to patch (no installed distribution); the lock's pins are listed as lockfile-only packages. |
 
 Both hash fields are load-bearing: Pipenv 2023+ verifies the `#sha256=` URL
 fragment, 2018–2022 verify the `hashes` list, Pipenv 11 accepts either. A
@@ -77,9 +77,8 @@ import on modern Pythons); 2018–2022 on Python 3.8; 2023+ on Python 3.12.
   interpreter's basename on 2026, the full string on 2018 and 11). The
   crawler reproduces it (and honours the `.venv` file pointer,
   `PIPENV_CUSTOM_VENV_NAME`, `PIPENV_PIPFILE`, `WORKON_HOME` and Pipenv's
-  case-insensitive-filesystem fallback) so a bare `scan`/`rollback` sees the
-  project's venv; before, it fell through to the global interpreter and
-  reported success while the venv stayed unpatched.
+  case-insensitive-filesystem fallback) so an agent-mode `scan`/`rollback`
+  run outside `pipenv run` sees the project's venv.
 - **CLI scope.** The CLI reads `<cwd>/Pipfile.lock` and discovers the
   project's venv from that directory; it does not walk up to a parent
   Pipfile the way Pipenv does (`PIPENV_MAX_DEPTH`) and does not follow
@@ -121,69 +120,7 @@ rejection, what `pipenv lock` does to the entry, rollback after that relock
 hybrid that still carries our reference rolls back to the original entry),
 `vex`, and a byte-exact `rollback`. Agent mode additionally checks that
 repeat installs and `sync` keep the in-place patch, and the out-of-tree leg
-requires the bare scan to see Pipenv's venv.
+requires an agent-mode scan run outside `pipenv run` to see Pipenv's venv.
 
-## Results
-
-<!-- GENERATED:BEGIN pipenv-matrix -->
-### macOS — full matrix (18 majors × 8 shapes × 4 modes)
-
-CLI revision `e521093`: **470 cases, 470 pass** (103 expected refusals, 36 skipped installer limitations, 0 failing, 0 harness errors).
-
-| Pipenv | hosted | vendored | agent (in-project venv) | agent (out-of-tree venv) | bare CLI sees out-of-tree venv | tamper rejected (hosted / vendored) | warm venv re-installed (hosted / vendored) | relock keeps patch (hosted / vendored) | `pipenv verify` (hosted / vendored) |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0.2.8 | refused (redirect_pipenv_skipped) | refused (pypi_pipenv_spec_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | refused (skipped: Pipenv 0.x has no `--venv` and no WORKON_HOME placement to discover) | none | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a |
-| 3.6.2 | refused (redirect_pipenv_skipped) | refused (pypi_pipenv_spec_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | none/true | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a |
-| 4.1.4 | refused (redirect_pipenv_skipped) | refused (pypi_pipenv_spec_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | none/true | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a |
-| 5.4.2 | refused (redirect_pipenv_skipped) | refused (pypi_pipenv_spec_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | none/true | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a |
-| 6.2.9 | refused (redirect_pipenv_skipped) | refused (pypi_pipenv_spec_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | none/true | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a |
-| 7.9.10 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | refused (pypi_pipenv_installer_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | refused (skipped: Pipenv 7 cannot create its out-of-tree virtualenv in the harness image) | none | yes / n/a | false / n/a | false / n/a | 2 / n/a |
-| 8.3.2 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | refused (pypi_pipenv_installer_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | true | yes / n/a | false / n/a | false / n/a | 2 / n/a |
-| 9.1.0 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | refused (pypi_pipenv_installer_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | true | yes / n/a | false / n/a | false / n/a | 2 / n/a |
-| 10.1.2 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | refused (pypi_pipenv_installer_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | true | yes / n/a | false / n/a | false / n/a | 2 / n/a |
-| 11.10.4 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | refused (pypi_pipenv_installer_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | true | yes / n/a | false / n/a | false / n/a | 2 / n/a |
-| 2018.11.26 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | true | yes / yes | false / false | false / false | 2 / 2 |
-| 2020.11.15 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | true | yes / yes | false / false | false / false | 2 / 2 |
-| 2021.11.23 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | true | yes / yes | false / false | false / false | 2 / 2 |
-| 2022.12.19 | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,transitive) | true | yes / yes | false / false | false / false | 0 / 0 |
-| 2023.12.1 | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,transitive) | true | yes / no | false / false | false / false | 0 / 0 |
-| 2024.4.1 | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,transitive) | true | yes / no | false / false | false / false | 0 / 0 |
-| 2025.1.3 | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,transitive) | true | yes / no | false / false | false / false | 0 / 0 |
-| 2026.8.0 | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,transitive) | true | yes / no | false / false | false / false | 0 / 0 |
-
-### Linux — release binary in a container (2018+ majors, direct shape, 4 modes)
-
-CLI revision `e521093`: **32 cases, 32 pass** (0 expected refusals, 0 skipped installer limitations, 0 failing, 0 harness errors).
-
-| Pipenv | hosted | vendored | agent (in-project venv) | agent (out-of-tree venv) | bare CLI sees out-of-tree venv | tamper rejected (hosted / vendored) | warm venv re-installed (hosted / vendored) | relock keeps patch (hosted / vendored) | `pipenv verify` (hosted / vendored) |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2018.11.26 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / yes | false / false | false / false | 2 / 2 |
-| 2020.11.15 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / yes | false / false | false / false | 2 / 2 |
-| 2021.11.23 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / yes | false / false | false / false | 2 / 2 |
-| 2022.12.19 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / yes | false / false | false / false | 0 / 0 |
-| 2023.12.1 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / no | false / false | false / false | 0 / 0 |
-| 2024.4.1 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / no | false / false | false / false | 0 / 0 |
-| 2025.1.3 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / no | false / false | false / false | 0 / 0 |
-| 2026.8.0 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / no | false / false | false / false | 0 / 0 |
-
-### Invocation variants (`--cwd`, nested `--cwd`, symlinked project directory; direct shape, 4 modes)
-
-CLI revision `e521093`: **48 cases, 48 pass** (3 expected refusals, 0 skipped installer limitations, 0 failing, 0 harness errors).
-
-| Pipenv | invocation | hosted | vendored | agent | agent-oot |
-| --- | --- | --- | --- | --- | --- |
-| 11.10.4 | `--cwd <project>` | pass | refused (pypi_pipenv_installer_unsupported) | pass | pass |
-| 11.10.4 | `--cwd` from a nested directory | pass | refused (pypi_pipenv_installer_unsupported) | pass | pass |
-| 11.10.4 | symlinked project directory | pass | refused (pypi_pipenv_installer_unsupported) | pass | pass |
-| 2018.11.26 | `--cwd <project>` | pass | pass | pass | pass |
-| 2018.11.26 | `--cwd` from a nested directory | pass | pass | pass | pass |
-| 2018.11.26 | symlinked project directory | pass | pass | pass | pass |
-| 2022.12.19 | `--cwd <project>` | pass | pass | pass | pass |
-| 2022.12.19 | `--cwd` from a nested directory | pass | pass | pass | pass |
-| 2022.12.19 | symlinked project directory | pass | pass | pass | pass |
-| 2026.8.0 | `--cwd <project>` | pass | pass | pass | pass |
-| 2026.8.0 | `--cwd` from a nested directory | pass | pass | pass | pass |
-| 2026.8.0 | symlinked project directory | pass | pass | pass | pass |
-
-Every `pass` cell verified the installed `urllib3/response.py` against the patch record's Git blob SHA-256 after a real Pipenv install. Columns: `warm venv re-installed` and `relock keeps patch` are measured Pipenv boundaries (see above), not requirements; `pipenv verify` exit 2 means the subcommand does not exist on that release. Per-case checks, notes and harness provenance: [`results.json`](pipenv-compatibility/results.json).
-<!-- GENERATED:END pipenv-matrix -->
+Full run results belong with the source revision and toolchain versions in CI
+artifacts or a local output directory. See the [testing guide](README.md#ci-and-results).

@@ -13,21 +13,21 @@
 //!
 //! Every cell of `vex_pipenv_pip_common` runs per (flavor, mode): wiring
 //! alone attests online; `--offline` / unreachable / 404 / 403 with no
-//! local record is `record_unavailable` (zero requests offline); ledger-only
-//! attests offline; a reverted lock is `redirect_unwired` /
-//! `vendor_unwired` under `--no-verify` too; tampered installed tree /
+//! local record is `record_unavailable` (zero requests offline); the vendor
+//! ledger alone attests offline (v5 hosted keeps no ledger: offline it is
+//! `record_unavailable`); a reverted lock is `vendor_unwired` under
+//! `--no-verify` too (hosted: nothing is discovered); tampered installed tree /
 //! wheel member is omitted; foreign-host, root-escaping and
 //! record-mismatched references never attest; hosted not-installed attests
 //! from the pin, a pristine install is `not_applied`, pinless needs an
 //! install; a vendored wheel over a pristine venv warns; and the embedded
-//! forms (`scan --redirect --vex` / `scan --vendor --vex` re-runs,
-//! `scan --vendor --detached --vex`, `apply --vex`, `vendor --vex`).
+//! forms (`scan --mode hosted --vex` / `scan --vendor --vex` re-runs,
+//! `apply --vex`, `vendor --vex`).
 //!
 //! Pipenv-specific cells below: a relock that re-serializes AROUND our
 //! reference (Pipenv 2023+ restores `version` / `index` / registry
-//! `hashes`) still attests unless the restored version disagrees, in which
-//! case even the ledger claim is dead; an entry carrying both `file` and
-//! `path` is ambiguous; and the vendored backend refusing a legacy installer
+//! `hashes`) still attests unless the restored version disagrees; an entry
+//! carrying both `file` and `path` is ambiguous; and the vendored backend refusing a legacy installer
 //! leaves nothing to attest.
 //!
 //! The real-Pipenv counterpart (every calendar major 2022..2026, real
@@ -213,9 +213,8 @@ fn edit_entry(lock: &str, edit: impl Fn(&mut serde_json::Map<String, Value>)) ->
 /// but restores the registry `version` / `index` / `hashes` around it
 /// (`reserialized_around_reference`). Pipenv still installs the reference,
 /// so it is still wired: attested with no ledger. When the restored
-/// `version` names ANOTHER release the entry is diagnosed, and the stale
-/// ledger claim dies with it (discover rule 11: a recognized-but-rejected
-/// mention is authoritative), `--no-verify` included.
+/// `version` names ANOTHER release the entry is diagnosed and never
+/// attested, `--no-verify` included.
 #[test]
 fn relock_reserialized_around_the_reference_attests_unless_the_version_disagrees() {
     for flavor in flavors().into_iter().filter(|f| f.pipenv_major == "2026") {
@@ -246,34 +245,26 @@ fn relock_reserialized_around_the_reference_attests_unless_the_version_disagrees
             &format!("{what} hybrid"),
         );
 
-        for keep in [NOTHING, LEDGERS_ONLY] {
-            let (_tmp, cwd) = fresh();
-            wired.restore(&cwd, keep);
-            put(&cwd, "Pipfile.lock", hybrid("9.9.9").as_bytes());
-            for no_verify in [false, true] {
-                let run = VexRun {
-                    no_verify,
-                    offline: keep.ledgers,
-                    ..vex_run(Some(&api))
-                };
-                let out = vex(&cwd, &run);
-                let what = format!(
-                    "{what} hybrid@9.9.9 ledgers={} no_verify={no_verify}",
-                    keep.ledgers
-                );
-                assert_ne!(out.code, Some(0), "{what}: {out}");
-                assert_no_statement(&out, &what);
-                if keep.ledgers {
-                    assert_omitted(&out, "redirect_unwired", &what);
-                }
-            }
+        let (_tmp, cwd) = fresh();
+        wired.restore(&cwd, NOTHING);
+        put(&cwd, "Pipfile.lock", hybrid("9.9.9").as_bytes());
+        for no_verify in [false, true] {
+            let run = VexRun {
+                no_verify,
+                ..vex_run(Some(&api))
+            };
+            let out = vex(&cwd, &run);
+            let what = format!("{what} hybrid@9.9.9 no_verify={no_verify}");
+            assert_ne!(out.code, Some(0), "{what}: {out}");
+            assert_no_statement(&out, &what);
         }
     }
 }
 
 /// An entry carrying BOTH `file` and `path` (neither writer produces one)
 /// is ambiguous — which one Pipenv reads depends on its release — so it is
-/// diagnosed, never attested, and it kills the stale ledger claim.
+/// diagnosed, never attested, and (vendored) it kills the stale ledger
+/// claim.
 #[test]
 fn entry_with_both_file_and_path_is_ambiguous() {
     let flavor = &flavors()[0];
@@ -289,7 +280,7 @@ fn entry_with_both_file_and_path_is_ambiguous() {
             let value = entry[have].clone();
             entry.insert(add.into(), value);
         });
-        for keep in [NOTHING, LEDGERS_ONLY] {
+        for &keep in mode.ledger_keeps() {
             let what = format!("{} both keys ledgers={}", wired.what(), keep.ledgers);
             let (_tmp, cwd) = fresh();
             wired.restore(&cwd, keep);

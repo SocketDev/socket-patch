@@ -81,39 +81,6 @@ pub(crate) fn majority_terminator(text: &str) -> &'static str {
     }
 }
 
-/// A recorded `(original, new)` fragment pair of a line-oriented text edit,
-/// respelled in `content`'s line endings when the two disagree wholesale.
-///
-/// The yarn rewriters record their fragments in the lock's on-disk form
-/// (CRLF lines for a CRLF lock), and every revert matches them
-/// byte-exactly. But the committed ledger keeps those JSON-escaped
-/// fragments verbatim while a `core.autocrlf` checkout re-spells the lock
-/// itself: Git for Windows' default install converts LF to CRLF on
-/// checkout, and a macOS or Linux clone of the same commit is LF. When the
-/// live file is uniformly one style and the fragments uniformly the other,
-/// they record the same edit; anything else (a mixed file, fragments that
-/// disagree with each other) proves nothing and stays a drift refusal.
-pub(crate) fn fragments_in_eol_of(
-    content: &str,
-    original: &str,
-    new: &str,
-) -> Option<(String, String)> {
-    let fragments = match (LineEndings::of(original), LineEndings::of(new)) {
-        (a, b) if a == b => a,
-        (LineEndings::None, style) | (style, LineEndings::None) => style,
-        _ => return None,
-    };
-    match (LineEndings::of(content), fragments) {
-        (LineEndings::Crlf, LineEndings::Lf) => {
-            Some((original.replace('\n', "\r\n"), new.replace('\n', "\r\n")))
-        }
-        (LineEndings::Lf, LineEndings::Crlf) => {
-            Some((original.replace("\r\n", "\n"), new.replace("\r\n", "\n")))
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,28 +120,4 @@ mod tests {
         assert_eq!(majority_terminator("{}"), "\n", "no break: LF, not os.EOL");
     }
 
-    #[test]
-    fn fragments_are_respelled_only_across_uniform_styles() {
-        let (orig, new) = ("k:\n  a: 1\n", "k:\n  a: 2\n");
-        assert_eq!(
-            fragments_in_eol_of("x\r\nk:\r\n  a: 2\r\n", orig, new),
-            Some(("k:\r\n  a: 1\r\n".into(), "k:\r\n  a: 2\r\n".into()))
-        );
-        let (orig, new) = ("k:\r\n  a: 1", "k:\r\n  a: 2");
-        assert_eq!(
-            fragments_in_eol_of("x\nk:\n  a: 2\n", orig, new),
-            Some(("k:\n  a: 1".into(), "k:\n  a: 2".into()))
-        );
-        // Same style, a mixed file, disagreeing or line-free fragments:
-        // nothing to respell.
-        assert_eq!(fragments_in_eol_of("x\n", "a\nb", "a\nc"), None);
-        assert_eq!(fragments_in_eol_of("x\r\ny\n", "a\nb", "a\nc"), None);
-        assert_eq!(fragments_in_eol_of("x\r\n", "a\nb", "a\r\nc"), None);
-        assert_eq!(fragments_in_eol_of("x\r\n", "ab", "ac"), None);
-        // One single-line side takes the other side's style.
-        assert_eq!(
-            fragments_in_eol_of("x\r\n", "ab", "a\nc"),
-            Some(("ab".into(), "a\r\nc".into()))
-        );
-    }
 }

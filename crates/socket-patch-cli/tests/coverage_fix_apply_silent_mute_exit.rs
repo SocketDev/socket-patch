@@ -12,9 +12,8 @@
 //!    exited 1 with zero output (the "Some artifacts could not be
 //!    downloaded" line was gated on `!quiet`, i.e. muted by `--silent`).
 //!
-//! Same class previously fixed in four other apply paths (see
-//! `cli_apply_silent.rs`), in scan, and in setup; `rollback --silent
-//! --offline` (`cli_rollback_silent.rs`) pins the same rule for rollback.
+//! Sibling suites: `cli_apply_silent.rs` (other apply paths) and
+//! `cli_rollback_silent.rs` (the same rule for rollback).
 //!
 //! Under `--json` both diagnostics stay off stderr — the envelope is the
 //! machine channel, and `apply_invariants.rs` pins its exact shape for

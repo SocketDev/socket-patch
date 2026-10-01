@@ -199,7 +199,7 @@ fn neutralized_warning(pkg: &str, report: &MirrorFilterReport) -> VendorWarning 
 
 /// Fresh-vendor gate: neutralize, warn on change; `Err(detail)` when the
 /// copy cannot be made mirror-safe (the caller unwinds and refuses).
-pub(super) async fn neutralize_or_conflict(
+pub(crate) async fn neutralize_or_conflict(
     copy_dir: &Path,
     record: &PatchRecord,
     pkg: &str,

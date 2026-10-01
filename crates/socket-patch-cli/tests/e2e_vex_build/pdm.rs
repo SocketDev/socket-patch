@@ -11,20 +11,21 @@
 //! 2. the synthetic patch appends a marker to the INSTALLED `six.py`; a
 //!    wiremock Socket API serves discovery, the grant, the view and the
 //!    patched wheel itself;
-//! 3. hosted: `scan --redirect --vex` (same-run VEX attests); vendored:
+//! 3. hosted: `scan --mode hosted --vex` (same-run VEX attests); vendored:
 //!    `scan --vendor --vendor-source build --vex`;
 //! 4. a FRESH checkout of only the committable files (pyproject, pdm.lock,
 //!    `.socket/` minus the manifest) is installed by the real `pdm sync` —
 //!    from the mock patch server (hosted) or the committed wheel (vendored)
 //!    — and `import six` must see the patched bytes;
 //! 5. manifest-less VEX there (`vex_pypi_real_common::VexMatrix`): manifest
-//!    deleted (ledger offline + online), tampered install → `hash_mismatch`
+//!    deleted (vendored: vendor ledger offline + online; hosted: online —
+//!    v5 hosted writes no ledger), tampered install → `hash_mismatch`
 //!    (hosted), ledgers deleted (lockfile discovery + API), embedded
 //!    `apply --vex` / `vendor --vex`, `--offline` with no ledger →
 //!    `record_unavailable` with zero requests, and the lock reverted to the
-//!    registry (ledgers + artifacts kept) → `redirect_unwired` /
-//!    `vendor_unwired`, `--no-verify` included; plus a manifest-less
-//!    `scan --redirect|--vendor --vex` re-run.
+//!    registry (vendor ledger + artifacts kept) → `vendor_unwired` /
+//!    hosted: nothing names the patch, `--no-verify` included; plus a
+//!    manifest-less `scan --mode hosted|--vendor --vex` re-run.
 //!
 //! Releases whose lock format loses url/path identity (PDM 1.8 – 1.15 =
 //! 3.1, 2.0 – 2.7 = 4.0 – 4.2) must REFUSE both scans with the lock
@@ -309,8 +310,8 @@ fn patched_of(pristine: &[u8]) -> Vec<u8> {
 
 fn scan_mode_args(mode: Mode) -> Vec<&'static str> {
     match mode {
-        Mode::Hosted => vec!["--redirect"],
-        Mode::Vendored => vec!["--vendor", "--vendor-source", "build"],
+        Mode::Hosted => vec!["--mode=hosted"],
+        Mode::Vendored => vec!["--vendor", "--vendor-source", "service"],
     }
 }
 
@@ -417,6 +418,12 @@ fn flow(mode: Mode) {
     assert_attested(&doc, PURL, mode.uuid(), mode.marker(), VULNS);
     std::fs::remove_file(&vex_out).unwrap();
     let wired_lock = std::fs::read_to_string(project.join("pdm.lock")).unwrap();
+    assert!(
+        !project
+            .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL)
+            .exists(),
+        "{what}: v5 writes no redirect ledger"
+    );
     match mode {
         Mode::Hosted => assert!(
             wired_lock.contains(&api.artifact_url()),
