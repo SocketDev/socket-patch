@@ -174,9 +174,11 @@ fn assert_no_manifest_no_blobs(cwd: &Path) {
 // ---------------------------------------------------------------------------
 
 /// A pip project pinning `requests==2.31.0`: the hosted grant must rewrite
-/// that one line to `requests @ <hosted-url> --hash=sha256:<hex>` (the
-/// integrity pin fails closed on tampered bytes), leave the bystander line
-/// byte-identical — and write no manifest and no ledger.
+/// that one line to `requests @ <hosted-url>#sha256=<hex>` (the integrity
+/// pin fails closed on tampered bytes; a url fragment, not `--hash`, since
+/// one `--hash` would put pip in hash-checking mode for the unhashed
+/// `flask` line too — #376), leave the bystander line byte-identical — and
+/// write no manifest and no ledger.
 #[tokio::test]
 #[serial]
 async fn pypi_requirements_hosted_rewrites_pinned_line() {
@@ -211,7 +213,7 @@ async fn pypi_requirements_hosted_rewrites_pinned_line() {
     assert_eq!(code, 0, "get <uuid> --mode hosted (pypi) should succeed");
 
     let reqs = std::fs::read_to_string(tmp.path().join("requirements.txt")).unwrap();
-    let expected_line = format!("requests @ {url} --hash=sha256:{SHA256}");
+    let expected_line = format!("requests @ {url}#sha256={SHA256}");
     assert!(
         reqs.lines().any(|l| l == expected_line),
         "requirements.txt must pin the hosted wheel URL + sha256; got:\n{reqs}"
@@ -233,7 +235,7 @@ async fn pypi_requirements_hosted_rewrites_pinned_line() {
 
     // Manifest-less VEX over what `get --mode hosted` committed (it never
     // writes a manifest). An EMPTY in-project venv keeps the crawl hermetic
-    // (nothing installed: the `--hash` pin is the evidence); the grant's
+    // (nothing installed: the `#sha256=` pin is the evidence); the grant's
     // origin is this test's patch server, hence `--patch-server-url`.
     let site = if cfg!(windows) {
         tmp.path().join(".venv/Lib/site-packages")

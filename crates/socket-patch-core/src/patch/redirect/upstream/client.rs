@@ -668,6 +668,18 @@ pub(crate) fn go_mod_h1(go_mod: &[u8]) -> String {
 }
 
 #[cfg(test)]
+impl UpstreamClient {
+    /// Answer `rubygems_sha256(name, version)` with `sha` without a request
+    /// (an offline client otherwise refuses every lookup).
+    pub(crate) async fn seed_rubygems_sha256(&self, name: &str, version: &str, sha: &str) {
+        self.rubygems
+            .lock()
+            .await
+            .insert((name.to_string(), version.to_string()), Ok(sha.to_string()));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

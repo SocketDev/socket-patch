@@ -1398,3 +1398,167 @@ async fn gem_get_uuid_vendored_fresh_checkout_bundle_install() {
         });
     });
 }
+
+/// A real `rack ~> 3.1` project installed into `vendor/bundle`, with a
+/// marker patch for the installed rack staged under `.socket/`. `None` =
+/// skip (message already printed).
+fn staged_rack_project(
+    tag: &str,
+) -> Option<(tempfile::TempDir, PathBuf, bundler_e2e::Bundler, String)> {
+    let bundler = gate(tag)?;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("Gemfile"),
+        "source \"https://rubygems.org\"\n\ngem \"rack\", \"~> 3.1\"\n",
+    )
+    .unwrap();
+    let config = bundle(
+        &proj,
+        &argv(&bundler.config_local_args("path", "vendor/bundle")),
+        false,
+    );
+    let install = config
+        .status
+        .success()
+        .then(|| bundle(&proj, &["install"], false));
+    if !install.as_ref().is_some_and(|i| i.status.success()) {
+        println!("SKIP e2e_vendor_gem_build ({tag}): fixture `bundle install` failed");
+        return None;
+    }
+    let lock = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
+    let version = locked_gem_version(&lock, DEP).expect("resolved rack version");
+    let mut ruby = Command::new("ruby");
+    ruby.args(["-e", "puts Gem.ruby_api_version"]);
+    cache_env::isolate(&mut ruby);
+    let api = ruby.output().expect("failed to run ruby");
+    let api = String::from_utf8_lossy(&api.stdout).trim().to_string();
+    let installed_rb = proj
+        .join("vendor/bundle/ruby")
+        .join(&api)
+        .join("gems")
+        .join(format!("{DEP}-{version}"))
+        .join("lib/rack.rb");
+    let orig = std::fs::read(&installed_rb).expect("installed lib/rack.rb");
+    let patched: Vec<u8> = [orig.as_slice(), b"\n# SOCKET-PATCH-VENDOR-E2E-MARKER\n"].concat();
+    let purl = format!("pkg:gem/{DEP}@{version}");
+    stage_patch_with_vuln(&proj, &purl, "lib/rack.rb", &orig, &patched);
+    Some((tmp, proj, bundler, purl))
+}
+
+/// Run `vendor` on a project whose manifest choice vendored mode cannot
+/// follow (`loaded` is what the host bundler loads), and assert the refusal: a `gemfile_not_loaded` failure for the
+/// gem, and every manifest and lock byte-untouched.
+fn assert_vendor_refuses_unloaded_gemfile(proj: &Path, purl: &str, loaded: &str, files: &[&str]) {
+    // The premise: the host bundler loads `loaded`.
+    let probe = bundle(
+        proj,
+        &["exec", "ruby", "-e", "puts Bundler.default_gemfile"],
+        false,
+    );
+    assert!(
+        String::from_utf8_lossy(&probe.stdout)
+            .trim()
+            .ends_with(&format!("/{loaded}")),
+        "bundler must load {loaded} (test premise):\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let before: Vec<Vec<u8>> = files
+        .iter()
+        .map(|f| std::fs::read(proj.join(f)).unwrap())
+        .collect();
+    let (code, stdout, stderr) = run_socket(
+        proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_ne!(
+        code, 0,
+        "vendor must not succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["summary"]["applied"], 0, "nothing vendored: {env}");
+    let event = env["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["purl"] == purl)
+        .unwrap_or_else(|| panic!("an event for {purl}: {env}"));
+    assert_eq!(event["errorCode"], "gemfile_not_loaded", "event: {event}");
+    for (file, before) in files.iter().zip(before) {
+        assert_eq!(
+            std::fs::read(proj.join(file)).unwrap(),
+            before,
+            "{file} must be byte-untouched"
+        );
+    }
+    assert!(
+        !proj.join(".socket/vendor/gem").exists(),
+        "no vendored copy is written"
+    );
+}
+
+/// #341: a `gems.rb` / `gems.locked` twin beside the Gemfile pair is what
+/// bundler loads. Vendor used to wire the ignored Gemfile, exit 0, and
+/// leave bundler installing upstream rack; it must refuse before any write.
+#[test]
+#[ignore = "host capstone: shells out to a real bundler >= 1.17; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+fn gem_vendor_refuses_a_gems_rb_twin() {
+    let Some((_tmp, proj, bundler, purl)) = staged_rack_project("gems.rb twin") else {
+        return;
+    };
+    std::fs::copy(proj.join("Gemfile"), proj.join("gems.rb")).unwrap();
+    std::fs::copy(proj.join("Gemfile.lock"), proj.join("gems.locked")).unwrap();
+    // bundler >= 2 loads gems.rb; 1.x still reads the Gemfile first. The
+    // twin is refused either way (vendor cannot tell which bundler runs).
+    let loaded = if bundler.at_least(2, 0) {
+        "gems.rb"
+    } else {
+        "Gemfile"
+    };
+    assert_vendor_refuses_unloaded_gemfile(
+        &proj,
+        &purl,
+        loaded,
+        &["Gemfile", "Gemfile.lock", "gems.rb", "gems.locked"],
+    );
+}
+
+/// #390: `bundle config set --local gemfile Gemfile.next` (the dual-boot
+/// layout) makes bundler load `Gemfile.next`. Vendor used to wire the
+/// ignored Gemfile; it must refuse before any write.
+#[test]
+#[ignore = "host capstone: shells out to a real bundler >= 1.17; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+fn gem_vendor_refuses_a_bundle_gemfile_dual_boot() {
+    let Some((_tmp, proj, bundler, purl)) = staged_rack_project("dual boot") else {
+        return;
+    };
+    std::fs::copy(proj.join("Gemfile"), proj.join("Gemfile.next")).unwrap();
+    std::fs::copy(proj.join("Gemfile.lock"), proj.join("Gemfile.next.lock")).unwrap();
+    let cfg = bundle(
+        &proj,
+        &argv(&bundler.config_local_args("gemfile", "Gemfile.next")),
+        false,
+    );
+    assert!(cfg.status.success(), "bundle config set --local gemfile");
+    assert_vendor_refuses_unloaded_gemfile(
+        &proj,
+        &purl,
+        "Gemfile.next",
+        &[
+            "Gemfile",
+            "Gemfile.lock",
+            "Gemfile.next",
+            "Gemfile.next.lock",
+        ],
+    );
+}

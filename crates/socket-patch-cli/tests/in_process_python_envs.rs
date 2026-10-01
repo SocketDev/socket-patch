@@ -456,38 +456,41 @@ async fn pypi_egg_info_layout_handled() {
     let tmp = tempfile::tempdir().unwrap();
     let site = venv_site_packages(&tmp.path().join(".venv"), "python3.11");
     std::fs::create_dir_all(&site).unwrap();
-    // egg-info — older format. The crawler only recognizes `.dist-info`
-    // dirs, so the egg-info package is NOT discovered. Pin that current
-    // contract: scan exits cleanly (like the empty-site-packages case) and
-    // ships no PURL for it. If egg-info support is added later this fails
-    // loudly and the assertion should be flipped to `assert_discovered`.
-    let egg = site.join("legacy_pkg-1.0.0.egg-info");
+    // egg-info — the legacy layout pip < 23.1 writes for an sdist built
+    // without `wheel` (and distutils / distro packages write as a bare
+    // FILE). It is a real, importable install, so the crawler must report
+    // it (#447). Three shapes: a `-pyX.Y`-suffixed directory with
+    // `PKG-INFO`, a bare `.egg-info` file, and a directory whose PKG-INFO
+    // is missing (the filename carries the identity).
+    let egg = site.join("legacy_pkg-1.0.0-py3.11.egg-info");
     std::fs::create_dir_all(&egg).unwrap();
     std::fs::write(
         egg.join("PKG-INFO"),
         "Metadata-Version: 1.0\nName: legacy_pkg\nVersion: 1.0.0\n",
     )
     .unwrap();
+    std::fs::write(
+        site.join("distro_pkg-2.1.egg-info"),
+        "Metadata-Version: 1.1\nName: distro-pkg\nVersion: 2.1\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(site.join("bare_dir_pkg-0.3-py3.11.egg-info")).unwrap();
 
-    // Positive control in the SAME site-packages: a real `.dist-info`
-    // package the crawler must discover. Without it, the negative
-    // assertions below are vacuous — they pass even if the crawler never
-    // walked this directory at all (e.g. a regression that stops probing
-    // `.venv`). The control proves the dir WAS walked, so a missing
-    // `legacy_pkg` means egg-info was specifically not recognized, not that
-    // scanning silently no-op'd.
+    // A `.dist-info` sibling in the SAME site-packages: both layouts are
+    // listed side by side.
     write_dist_info(&site, "modern_sibling", "2.0.0");
 
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
     let res = scan_scrubbed(default_args(tmp.path(), server.uri())).await;
-    assert_eq!(res, 0, "egg-info layout must scan cleanly without crashing");
+    assert_eq!(res, 0, "egg-info layout must scan cleanly");
     let bodies = batch_bodies(&server).await;
-    // Control: proves the crawler genuinely walked this site-packages dir.
     assert_discovered(&bodies, "pkg:pypi/modern-sibling@2.0.0");
-    // Not discovered today; neither the canonical nor raw name may appear.
-    assert_not_discovered(&bodies, "pkg:pypi/legacy-pkg@1.0.0");
-    assert_not_discovered(&bodies, "pkg:pypi/legacy_pkg@1.0.0");
+    assert_discovered(&bodies, "pkg:pypi/legacy-pkg@1.0.0");
+    assert_discovered(&bodies, "pkg:pypi/distro-pkg@2.1");
+    assert_discovered(&bodies, "pkg:pypi/bare-dir-pkg@0.3");
+    // The `-pyX.Y` suffix is not part of the version.
+    assert_not_discovered(&bodies, "py3.11");
 }
 
 // ---------------------------------------------------------------------------
@@ -524,4 +527,113 @@ async fn pypi_ambient_virtual_env_does_not_hijack_scan() {
     let bodies = batch_bodies(&server).await;
     assert_discovered(&bodies, "pkg:pypi/local-pkg@1.0.0");
     assert_not_discovered(&bodies, "pkg:pypi/ambient-decoy@6.6.6");
+}
+
+// ---------------------------------------------------------------------------
+// Pipenv projects: the venv Pipenv resolves, not the generic probe order
+// ---------------------------------------------------------------------------
+
+/// Pipenv's environment knobs, cleared before each Pipenv test and after it
+/// so ambient values (a `pipenv shell`, CI images) cannot leak in or out.
+const PIPENV_VARS: &[&str] = &[
+    "VIRTUAL_ENV",
+    "WORKON_HOME",
+    "PIPENV_ACTIVE",
+    "PIPENV_IGNORE_VIRTUALENVS",
+    "PIPENV_NO_IGNORE_VIRTUALENVS",
+    "PIPENV_VENV_IN_PROJECT",
+    "PIPENV_NO_VENV_IN_PROJECT",
+    "PIPENV_CUSTOM_VENV_NAME",
+    "PIPENV_PIPFILE",
+];
+
+/// Run `scan` with exactly `env` set among [`PIPENV_VARS`].
+async fn scan_with_pipenv_env(args: ScanArgs, env: &[(&str, &Path)]) -> i32 {
+    for name in PIPENV_VARS {
+        std::env::remove_var(name);
+    }
+    for (name, value) in env {
+        std::env::set_var(name, value);
+    }
+    let code = scan_run(args).await;
+    for name in PIPENV_VARS {
+        std::env::remove_var(name);
+    }
+    code
+}
+
+/// A Pipenv project (`<tmp>/proj` with a Pipfile) whose Pipenv venv is
+/// `<tmp>/wh/proj-env` (named through `PIPENV_CUSTOM_VENV_NAME`) holding
+/// `pipenv_pkg 1.0.0`. Returns `(tmp, project, workon_home)`.
+fn pipenv_project() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("Pipfile"), "[packages]\npipenv-pkg = \"*\"\n").unwrap();
+    let workon = tmp.path().join("wh");
+    let site = venv_site_packages(&workon.join("proj-env"), "python3.12");
+    std::fs::create_dir_all(&site).unwrap();
+    write_dist_info(&site, "pipenv_pkg", "1.0.0");
+    (tmp, project, workon)
+}
+
+/// #384: with `PIPENV_IGNORE_VIRTUALENVS` or `PIPENV_ACTIVE` set, Pipenv
+/// ignores the activated `VIRTUAL_ENV`, so scan must look at Pipenv's own
+/// venv and leave the activated one (another project's, a tool venv) alone.
+#[tokio::test]
+#[serial]
+async fn pipenv_opt_outs_keep_activated_virtual_env_from_hijacking_scan() {
+    let other = tempfile::tempdir().unwrap();
+    let decoy = other.path().join("tool-venv");
+    let decoy_site = venv_site_packages(&decoy, "python3.12");
+    std::fs::create_dir_all(&decoy_site).unwrap();
+    write_dist_info(&decoy_site, "activated_decoy", "6.6.6");
+
+    for opt_out in ["PIPENV_IGNORE_VIRTUALENVS", "PIPENV_ACTIVE"] {
+        let (_tmp, project, workon) = pipenv_project();
+        let server = MockServer::start().await;
+        mock_batch_empty(&server).await;
+        let one = Path::new("1");
+        let code = scan_with_pipenv_env(
+            default_args(&project, server.uri()),
+            &[
+                ("VIRTUAL_ENV", &decoy),
+                ("WORKON_HOME", &workon),
+                ("PIPENV_CUSTOM_VENV_NAME", Path::new("proj-env")),
+                (opt_out, one),
+            ],
+        )
+        .await;
+        assert_eq!(code, 0, "{opt_out}");
+        let bodies = batch_bodies(&server).await;
+        assert_discovered(&bodies, "pkg:pypi/pipenv-pkg@1.0.0");
+        assert_not_discovered(&bodies, "pkg:pypi/activated-decoy@6.6.6");
+    }
+}
+
+/// #334: Pipenv never uses `venv/`, and `PIPENV_VENV_IN_PROJECT=0` makes it
+/// ignore a `./.venv` directory, so neither may shadow Pipenv's venv.
+#[tokio::test]
+#[serial]
+async fn pipenv_stray_venv_dirs_do_not_shadow_the_pipenv_venv() {
+    for (stray, opt_out) in [("venv", None), (".venv", Some("0"))] {
+        let (_tmp, project, workon) = pipenv_project();
+        let stray_site = venv_site_packages(&project.join(stray), "python3.12");
+        std::fs::create_dir_all(&stray_site).unwrap();
+        write_dist_info(&stray_site, "stray_decoy", "6.6.6");
+        let server = MockServer::start().await;
+        mock_batch_empty(&server).await;
+        let mut env: Vec<(&str, &Path)> = vec![
+            ("WORKON_HOME", &workon),
+            ("PIPENV_CUSTOM_VENV_NAME", Path::new("proj-env")),
+        ];
+        if let Some(value) = opt_out {
+            env.push(("PIPENV_VENV_IN_PROJECT", Path::new(value)));
+        }
+        let code = scan_with_pipenv_env(default_args(&project, server.uri()), &env).await;
+        assert_eq!(code, 0, "{stray}");
+        let bodies = batch_bodies(&server).await;
+        assert_discovered(&bodies, "pkg:pypi/pipenv-pkg@1.0.0");
+        assert_not_discovered(&bodies, "pkg:pypi/stray-decoy@6.6.6");
+    }
 }

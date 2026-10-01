@@ -234,20 +234,13 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
         // stays report-only (neither has a project lockfile to rewire).
         args.mode = Some(ScanMode::Hosted);
     }
-    if args.mode == Some(ScanMode::Hosted)
-        && args.common.is_global()
+    // Global installs have no project lockfile: hosted and vendored mode
+    // would rewire the cwd project instead of the global copy.
+    if let Some(conflict) = args
+        .mode
+        .and_then(|mode| crate::commands::global_mode_conflict(&args.common, mode))
     {
-        // Global installs have no project lockfile to repoint: the hosted
-        // flow would "redirect 0 packages" and exit 0, a silent no-op.
-        return Err(format!(
-            "{} cannot be used with --mode hosted: global installs have no project \
-             lockfile to redirect",
-            if args.common.global {
-                "--global"
-            } else {
-                "--global-prefix"
-            },
-        ));
+        return Err(conflict);
     }
     Ok(())
 }
@@ -1653,6 +1646,15 @@ async fn run_scan(
         .as_ref()
         .map(VendorState::purl_keys)
         .unwrap_or_default();
+    // The ledger owns and records the PROJECT's copies only: a global
+    // scan's agent leg patches the global copy even when the cwd project
+    // vendors the same purl (see `project_state_in_scope`).
+    let project_state = crate::commands::project_state_in_scope(&args.common);
+    let vendor_owned_purls: HashSet<String> = if project_state {
+        vendored_purls.clone()
+    } else {
+        HashSet::new()
+    };
 
     // Read existing manifest once for update detection.
     let existing_manifest = ctx.ledgers().await.manifest;
@@ -1676,7 +1678,7 @@ async fn run_scan(
         .collect();
     let update_manifest = merge_ledger_records_for_updates(
         existing_manifest,
-        vendor_state.as_ref().ok(),
+        vendor_state.as_ref().ok().filter(|_| project_state),
         &hosted_pins,
     );
     policy.set_recorded(update_manifest.as_deref());
@@ -2245,7 +2247,7 @@ async fn run_scan(
                 skip_records: vendored_records,
                 vendored_purls: vendored_skip_purls,
                 ..
-            } = partition_agent_selection(writers_of(&rows), &vendored_purls, &lockfile_only);
+            } = partition_agent_selection(writers_of(&rows), &vendor_owned_purls, &lockfile_only);
             let selected = plan_kept_rows(&mut stage, rows, kept);
 
             if dry {
@@ -2665,7 +2667,7 @@ async fn run_scan(
     let selected = if vendor {
         selected
     } else {
-        let split = partition_agent_selection(selected, &vendored_purls, &lockfile_only);
+        let split = partition_agent_selection(selected, &vendor_owned_purls, &lockfile_only);
         if !silent {
             for purl in &split.vendored_purls {
                 open_paragraph(&mut skip_paragraph);

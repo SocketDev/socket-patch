@@ -1714,7 +1714,14 @@ async fn apply_patches_inner(
     // by ledger key, resolved base purl, or qualifier-stripped key so
     // release-variant manifest keys (pypi `?artifact_id=`…) hit too;
     // unreadable state degrades to "nothing vendored" (fail-open).
-    let vendored_purls = socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await;
+    // The ledger owns the PROJECT's copies only: a global apply restores
+    // and patches the global copy even when the cwd project vendors the
+    // same purl (see `project_state_in_scope`).
+    let vendored_purls = if crate::commands::project_state_in_scope(&args.common) {
+        socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await
+    } else {
+        Default::default()
+    };
     let is_vendored = |p: &str| purl_keys_cover(&vendored_purls, p);
     let (mut results, mut matched_manifest_purls, vendored_bases) =
         synthesize_vendor_owned_results(&target_manifest_purls, &vendored_purls);

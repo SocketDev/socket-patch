@@ -46,9 +46,9 @@ use super::guidance::{
     npm_allow_remote_user_set_detail, npm_lock_url_needles, plan_workspace_trust, pnpm_heal_root,
     pnpm_lock_may_need_store_flag, pnpm_lock_version_major, pnpm_trust_configured_detail,
     pnpm_trust_legacy_detail, pnpm_trust_manual_guidance, pnpm_trust_policy_preamble,
-    pnpm_trust_workspace_unreadable_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    url_host, TrustPlan, NPM_LOCKS, PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL,
-    REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+    pnpm_trust_workspace_unreadable_detail, pnpm_trust_workspace_unsupported_detail,
+    read_npmrc_for_allow_remote, read_workspace_for_trust, url_host, TrustPlan, NPM_LOCKS,
+    PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
 
@@ -302,6 +302,10 @@ pub struct CandidateFiles {
     /// project whose candidates could rewrite (or whose rewrite depends on)
     /// one is refused, since the rewriters would treat it as absent.
     pub unreadable_reads: Vec<String>,
+    /// Set when bundler is configured (`BUNDLE_GEMFILE`) to load a manifest
+    /// the gem rewriter cannot edit: every gem manifest and lock was left
+    /// out of `files`, and the rewrite reports this instead of a redirect.
+    pub gem_manifest_unsupported: Option<RewriteWarning>,
 }
 
 impl CandidateFiles {
@@ -377,6 +381,22 @@ fn rush_repo(view: &ProjectView<'_>) -> bool {
     }
 }
 
+/// Whether `rel` is a [`PRESENCE_ONLY`](crate::formats::registry::PRESENCE_ONLY)
+/// row the in-memory host lists without usable content (a symbolic link,
+/// an oversize or presence-only entry). Its planners only ask whether it
+/// exists — the Pipenv planner tells a live `Pipfile.lock` from an
+/// abandoned one by the `Pipfile` beside it — so it is recorded as present
+/// (empty) rather than dropped. Disk reads such a file through any link.
+fn presence_only_present(view: &ProjectView<'_>, rel: &str) -> bool {
+    let ProjectView::Memory(project) = view else {
+        return false;
+    };
+    project.contains(rel)
+        && crate::formats::registry::registry()
+            .iter()
+            .any(|f| f.path == rel && f.has(crate::formats::registry::PRESENCE_ONLY))
+}
+
 /// Read the project's candidate files: [`REDIRECT_CANDIDATE_FILES`], the
 /// Cargo workspace members (when a cargo candidate meets a root
 /// `Cargo.toml`), the Python locks and their scripts, and the Rush locks.
@@ -399,7 +419,9 @@ pub async fn read_candidate_files(
             }
             continue;
         }
-        out.read(view, unreadable, name).await;
+        if !out.read(view, unreadable, name).await && presence_only_present(view, name) {
+            out.files.insert((*name).to_string(), String::new());
+        }
     }
 
     // A yarn berry lock is pinned through the root manifest's `resolutions`
@@ -452,11 +474,65 @@ pub async fn read_candidate_files(
             }
         }
     }
+    if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
+        keep_bundler_loaded_gem_files(view, &mut out).await;
+    }
     out.symlinked_reads.sort();
     out.symlinked_reads.dedup();
     out.unreadable_reads.sort();
     out.unreadable_reads.dedup();
     out
+}
+
+/// The Bundler manifest/lock spellings among the candidate files.
+const GEM_MANIFEST_FILES: [&str; 4] = ["Gemfile", "Gemfile.lock", "gems.rb", "gems.locked"];
+
+/// Leave only the gem manifest pair bundler loads in the candidate set
+/// (see [`crate::formats::gem::manifest`]). The gem rewriter picks between
+/// the two default spellings by filename alone; this narrows what it sees
+/// to bundler's own choice, so it can never wire a manifest bundler
+/// ignores:
+///
+/// - no `BUNDLE_GEMFILE`: unchanged (the rewriter's `gems.rb`-first choice
+///   and its divergence guard are bundler's default discovery);
+/// - `BUNDLE_GEMFILE` naming the root `Gemfile` / `gems.rb`: the other
+///   spelling is dropped;
+/// - `BUNDLE_GEMFILE` naming anything else: every spelling is dropped and
+///   [`CandidateFiles::gem_manifest_unsupported`] says why.
+///
+/// A memory view has no environment: only its own app config is read.
+async fn keep_bundler_loaded_gem_files(view: &ProjectView<'_>, out: &mut CandidateFiles) {
+    use crate::formats::gem::manifest::{self, LoadedManifest};
+    let loaded = match view {
+        ProjectView::Disk(root)
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot { root, .. }) => {
+            crate::crawlers::ruby_crawler::bundler_loaded_manifest(root).await
+        }
+        ProjectView::Memory(_) => {
+            let config = view.read_text(".bundle/config").await.ok();
+            let value = config.as_deref().and_then(manifest::config_gemfile);
+            let root = std::path::Path::new("/");
+            manifest::classify(root, None, value.as_deref())
+        }
+    };
+    let keep: &[&str] = match &loaded {
+        LoadedManifest::Default => return,
+        LoadedManifest::Configured { .. } => {
+            let (gemfile, lock) = loaded
+                .pair(out.files.contains_key("gems.rb"))
+                .expect("a configured default spelling has a pair");
+            &[gemfile, lock]
+        }
+        LoadedManifest::Unsupported { .. } => &[],
+    };
+    let dropped = |rel: &str| GEM_MANIFEST_FILES.contains(&rel) && !keep.contains(&rel);
+    out.files.retain(|rel, _| !dropped(rel));
+    out.symlinked_reads.retain(|rel| !dropped(rel));
+    out.unreadable_reads.retain(|rel| !dropped(rel));
+    out.gem_manifest_unsupported = loaded.unsupported_detail().map(|detail| RewriteWarning {
+        code: "redirect_gem_bundle_gemfile_unsupported".into(),
+        detail,
+    });
 }
 
 /// The pypi wheels whose metadata a native lock rewrite needs, in
@@ -722,6 +798,7 @@ pub async fn rewrite(
         rush_lock_keys,
         symlinked_reads,
         unreadable_reads,
+        gem_manifest_unsupported,
     } = read;
     // The rewriters' override slice — materialized ONCE, after the last
     // candidate filter, so it can never disagree with `candidates`.
@@ -783,6 +860,13 @@ pub async fn rewrite(
         );
         (files, rewrite)
     };
+    // The gem files were withheld on purpose: say why, not "no Gemfile".
+    if let Some(warning) = gem_manifest_unsupported {
+        rewrite
+            .warnings
+            .retain(|w| w.code != "redirect_gem_no_gemfile");
+        rewrite.warnings.push(warning);
+    }
     if let Some(content) = binary_content {
         rewrite
             .warnings
@@ -1070,6 +1154,9 @@ fn pnpm_trust(
                  artifacts. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
                     pnpm_trust_policy_preamble(&server),
                 ),
+                TrustPlan::Unsupported(why) => {
+                    pnpm_trust_workspace_unsupported_detail(&server, &why)
+                }
             },
         }
     };
@@ -1569,6 +1656,178 @@ mod tests {
         assert!(read.unreadable_reads.is_empty());
     }
 
+    fn gem_candidate() -> Candidate {
+        use crate::patch::redirect::{Integrity, RegistryOverride, RegistryOverrideIdentifiers};
+        Candidate {
+            purl: "pkg:gem/rails@7.0.0".into(),
+            dep: DepOverride {
+                ecosystem: "gem".into(),
+                name: "rails".into(),
+                namespace: None,
+                version: "7.0.0".into(),
+                token: "tok".into(),
+                patch_uuid: "uuid".into(),
+                artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
+                registry_override: Some(RegistryOverride {
+                    kind: "rubygems-compact-index".into(),
+                    index_url: "https://patch.test/gem/tok/uuid/".into(),
+                    identifiers: RegistryOverrideIdentifiers {
+                        name: "rails".into(),
+                        version: "7.0.0".into(),
+                        gem_checksum_sha256: Some("f".repeat(64)),
+                        ..Default::default()
+                    },
+                }),
+                integrity: Integrity::default(),
+            },
+        }
+    }
+
+    const GEMFILE: &str = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n";
+    const GEM_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
+        PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.5.22\n";
+
+    async fn gem_rewrite(p: &MemoryProject) -> (CandidateFiles, Rewritten) {
+        let outer = OuterAllowRemote::default;
+        let options = RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: true,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            blocking: false,
+        };
+        let candidates = vec![gem_candidate()];
+        let view = ProjectView::Memory(p);
+        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        let done = rewrite(
+            &view,
+            read.clone(),
+            &candidates,
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            &[],
+            options,
+        )
+        .await;
+        (read, done)
+    }
+
+    /// #390: `bundle config set --local gemfile Gemfile.next` makes bundler
+    /// load `Gemfile.next`; the hosted redirect used to rewrite `Gemfile`
+    /// (which bundler ignores) and attest the patch. Now no gem file is a
+    /// candidate and the run says why.
+    #[tokio::test]
+    async fn bundle_gemfile_naming_another_manifest_redirects_nothing() {
+        let mut p = MemoryProject::new();
+        for name in ["Gemfile", "Gemfile.next"] {
+            p.insert_text(name, GEMFILE);
+        }
+        for name in ["Gemfile.lock", "Gemfile.next.lock"] {
+            p.insert_text(name, GEM_LOCK);
+        }
+        p.insert_text(".bundle/config", "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n");
+        let (read, done) = gem_rewrite(&p).await;
+        assert!(!read.files.contains_key("Gemfile"));
+        assert!(!read.files.contains_key("Gemfile.lock"));
+        assert!(
+            done.rewrite.files.keys().all(|k| !k.starts_with("Gemfile")),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        let codes: Vec<&str> = done
+            .rewrite
+            .warnings
+            .iter()
+            .map(|w| w.code.as_str())
+            .collect();
+        assert!(
+            codes.contains(&"redirect_gem_bundle_gemfile_unsupported"),
+            "{codes:?}"
+        );
+        assert!(!codes.contains(&"redirect_gem_no_gemfile"), "{codes:?}");
+    }
+
+    /// `BUNDLE_GEMFILE: Gemfile` beside a `gems.rb`: bundler loads the
+    /// Gemfile pair, so that is the pair the redirect edits (the rewriter's
+    /// own filename rule would have picked gems.rb).
+    #[tokio::test]
+    async fn bundle_gemfile_naming_the_gemfile_redirects_it_over_gems_rb() {
+        let mut p = MemoryProject::new();
+        p.insert_text("Gemfile", GEMFILE);
+        p.insert_text("Gemfile.lock", GEM_LOCK);
+        p.insert_text("gems.rb", GEMFILE);
+        p.insert_text("gems.locked", GEM_LOCK);
+        p.insert_text(".bundle/config", "---\nBUNDLE_GEMFILE: \"Gemfile\"\n");
+        let (_read, done) = gem_rewrite(&p).await;
+        assert!(
+            done.rewrite.files.contains_key("Gemfile"),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        assert!(!done.rewrite.files.contains_key("gems.rb"));
+        assert!(!done.rewrite.files.contains_key("gems.locked"));
+    }
+
+    /// Without `BUNDLE_GEMFILE` nothing changes: `gems.rb` is still the
+    /// spelling bundler (and the rewriter) picks.
+    #[tokio::test]
+    async fn default_discovery_still_prefers_gems_rb() {
+        let mut p = MemoryProject::new();
+        p.insert_text("Gemfile", GEMFILE);
+        p.insert_text("Gemfile.lock", GEM_LOCK);
+        p.insert_text("gems.rb", GEMFILE);
+        p.insert_text("gems.locked", GEM_LOCK);
+        let (read, done) = gem_rewrite(&p).await;
+        assert!(read.files.contains_key("Gemfile"));
+        assert!(
+            done.rewrite.files.contains_key("gems.rb"),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        assert!(!done.rewrite.files.contains_key("Gemfile"));
+    }
+
+    /// #333: the Pipenv planner keys a live lock on the `Pipfile` beside
+    /// it, so the candidate reads must carry it — read from disk, and kept
+    /// as present in memory even when the host has no content for it.
+    #[tokio::test]
+    async fn the_pipfile_is_read_for_its_presence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Pipfile"), "[packages]\n").unwrap();
+        std::fs::write(tmp.path().join("Pipfile.lock"), "{}").unwrap();
+        let read =
+            read_candidate_files(&ProjectView::Disk(tmp.path()), &BTreeSet::new(), &[]).await;
+        assert_eq!(
+            read.files.get("Pipfile").map(String::as_str),
+            Some("[packages]\n")
+        );
+
+        for entry in [MemoryEntry::Symlink, MemoryEntry::Present] {
+            let mut p = MemoryProject::new();
+            p.insert_text("Pipfile.lock", "{}");
+            p.insert("Pipfile", entry.clone());
+            let unreadable = match entry {
+                MemoryEntry::Present => BTreeSet::from(["Pipfile".to_string()]),
+                _ => BTreeSet::new(),
+            };
+            let read = read_candidate_files(&ProjectView::Memory(&p), &unreadable, &[]).await;
+            assert_eq!(
+                read.files.get("Pipfile").map(String::as_str),
+                Some(""),
+                "{entry:?}"
+            );
+        }
+
+        // Absent stays absent: a lone Pipfile.lock is abandoned.
+        let mut p = MemoryProject::new();
+        p.insert_text("Pipfile.lock", "{}");
+        let read = read_candidate_files(&ProjectView::Memory(&p), &BTreeSet::new(), &[]).await;
+        assert!(!read.files.contains_key("Pipfile"));
+    }
+
     #[test]
     fn file_ecosystems_cover_the_rewrite_targets() {
         assert_eq!(file_ecosystem("package-lock.json"), Some("npm"));
@@ -1579,6 +1838,7 @@ mod tests {
         assert_eq!(file_ecosystem("tool.py.lock"), Some("pypi"));
         assert_eq!(file_ecosystem("crates/a/Cargo.toml"), Some("cargo"));
         assert_eq!(file_ecosystem("build.gradle"), None);
+        assert_eq!(file_ecosystem("Pipfile"), None);
     }
 }
 

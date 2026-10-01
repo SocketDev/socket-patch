@@ -640,6 +640,25 @@ mod tests {
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 
+    /// #324: a BOM-prefixed lock (npm reads past the BOM, and the rewriters
+    /// now keep it) is discovered like any other, not reported unparseable.
+    #[tokio::test]
+    async fn bom_prefixed_wired_lock_is_discovered() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let p = Project::new();
+        let lock = lock_with_packages(serde_json::json!({
+            "": { "name": "app", "version": "1.0.0" },
+            "node_modules/left-pad": { "version": "1.3.0", "resolved": hosted, "integrity": SRI },
+        }));
+        p.write("package-lock.json", format!("\u{feff}{lock}"));
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
+        );
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
     #[tokio::test]
     async fn hosted_and_vendored_entries_in_one_lock() {
         let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");

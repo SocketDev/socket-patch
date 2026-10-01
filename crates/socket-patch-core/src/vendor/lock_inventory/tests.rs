@@ -2948,7 +2948,7 @@ async fn the_vendored_requirements_writers_own_output_reinventories() {
     let tmp = tempfile::tempdir().unwrap();
     let line = crate::vendor::pypi_requirements::vendor_line(
         &format!(".socket/vendor/pypi/{UUID}/requests-2.28.1-py3-none-any.whl"),
-        &"c".repeat(64),
+        Some(&"c".repeat(64)),
         "requests",
         "2.28.1",
         &None,

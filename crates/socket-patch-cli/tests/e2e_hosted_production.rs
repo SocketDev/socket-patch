@@ -1930,10 +1930,14 @@ fn pypi_requirements_txt_hosted_install_proof() {
     assert_redirected(&env_json, "requirements.txt");
     let reqs = read(&proj.join("requirements.txt"));
     assert_hosted_pin(&reqs, PYPI_UUIDS, LEG);
+    // An unhashed file is pinned by the url's `#sha256=` fragment, which
+    // pip and uv both verify; a `--hash` would put pip in hash-checking
+    // mode for every other requirement (#376).
     assert!(
-        reqs.contains("--hash=sha256:"),
-        "{LEG}: rewritten requirements.txt carries no --hash pin, so pip/uv \
-         would install the hosted wheel unverified:\n{reqs}"
+        reqs.contains(".whl#sha256=") && !reqs.contains("--hash"),
+        "{LEG}: rewritten requirements.txt must pin the hosted wheel by its \
+         url fragment (and add no --hash), or pip/uv would install it \
+         unverified:\n{reqs}"
     );
 
     std::fs::remove_dir_all(&venv).expect("rm venv");
