@@ -10,11 +10,11 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::utils::composer_version::composer_versions_equivalent;
 use super::source as composer_source;
 use crate::patch::redirect::{
     artifact_url_present, full_name, DepOverride, RewriteResult, RewriteWarning,
 };
-use crate::utils::composer_version::composer_versions_equivalent;
 
 /// Byte offset of the `}` closing the JSON object that CONTAINS `from`, which
 /// must be a position inside that object. Brace counting skips string literals,

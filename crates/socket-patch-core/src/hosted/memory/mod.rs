@@ -58,17 +58,17 @@ pub use limits::SessionBuilder;
 pub use select::{candidate_files, safe_repo_path, select_paths};
 pub use types::*;
 
-use crate::policy::{
-    canon, patch_severity_order, policy_block, FilterReason, FilteredEntry, MemoryPolicyFs,
-    PolicyError, PolicySource, Root, RootFile, SelectionPolicy, PATCHES_DISABLED,
-    POLICY_FILE_NAMES,
-};
 use crate::rollout::stage::{
     classify, lookup_incomplete, mentioned_uuids, offers_from_results, Offers, RecordedIndex, Row,
-    Stage, ROLLOUT_DEFERRED,
+    Stage,
+    ROLLOUT_DEFERRED,
 };
 use discover::Provider;
 use stages::{Planned, RewriteRefused, Rewritten, StageOptions};
+use crate::policy::{
+    canon, patch_severity_order, policy_block, FilterReason, FilteredEntry, MemoryPolicyFs, PolicyError,
+    PolicySource, Root, RootFile, SelectionPolicy, PATCHES_DISABLED, POLICY_FILE_NAMES,
+};
 
 /// `"<crate version>+<git sha or 'unknown'>"`; the sha comes from the
 /// `SOCKET_PATCH_GIT_SHA` build-time variable.
@@ -419,8 +419,11 @@ fn memory_recorded(
                 .map(|p| (purl.clone(), p.uuid.clone()))
         })
         .collect();
-    let merged =
-        crate::ledgers::merge_ledger_records_for_updates(manifest.as_ref(), vendor.as_ref(), &pins);
+    let merged = crate::ledgers::merge_ledger_records_for_updates(
+        manifest.as_ref(),
+        vendor.as_ref(),
+        &pins,
+    );
     RecordedIndex::new(merged.as_deref(), &pins)
 }
 
@@ -447,20 +450,13 @@ async fn engine(
 
     // The repo's socket.yml policy, before any root is processed: a file
     // that cannot be honored fails the whole session closed.
-    let (policy, policy_warnings) = match SelectionPolicy::load(
-        &memory_policy_fs(&files, &options.policy_paths),
-        &options.policy_overrides,
-    ) {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            return Ok(policy_error_output(
-                &error,
-                warnings,
-                files_input,
-                bytes_input,
-            ));
-        }
-    };
+    let (policy, policy_warnings) =
+        match SelectionPolicy::load(&memory_policy_fs(&files, &options.policy_paths), &options.policy_overrides) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return Ok(policy_error_output(&error, warnings, files_input, bytes_input));
+            }
+        };
     // Path selection chose which files to send by the policy it read; a
     // different policy here would judge roots it never fetched.
     let read = match policy.source() {
@@ -469,27 +465,16 @@ async fn engine(
     };
     // Selection returns no digest when it bypassed the file, so a digest
     // with a bypassed session means the two sides disagree.
-    let expected = if options.policy_overrides.bypass {
-        None
-    } else {
-        read.map(|(_, sha)| sha)
-    };
+    let expected = if options.policy_overrides.bypass { None } else { read.map(|(_, sha)| sha) };
     if expected != options.policy_sha256.as_deref() {
         let error = PolicyError::Invalid {
-            file: read
-                .map_or(POLICY_FILE_NAMES[0], |(path, _)| path)
-                .to_string(),
+            file: read.map_or(POLICY_FILE_NAMES[0], |(path, _)| path).to_string(),
             key: String::new(),
             message: "the policy content differs from the one path selection read: pass \
                       selectHostedScanPaths' policySha256 and stream the same text"
                 .to_string(),
         };
-        return Ok(policy_error_output(
-            &error,
-            warnings,
-            files_input,
-            bytes_input,
-        ));
+        return Ok(policy_error_output(&error, warnings, files_input, bytes_input));
     }
     for w in policy_warnings {
         warnings.push(EngineWarning::new(w.code, w.detail, None));
@@ -737,25 +722,23 @@ async fn engine(
     // the tree's manifest and vendor ledger, and the hosted pins its
     // lockfiles name. ALREADY rows carry the recorded uuid, so a re-scan
     // re-confirms a pin instead of swapping it.
-    let mut stage = Stage::new(
-        options.max_new(policy.max_new_patches()),
-        None,
-        std::path::Path::new(""),
-    );
+    let mut stage = Stage::new(options.max_new(policy.max_new_patches()), None, std::path::Path::new(""));
     // A root whose every lookup failed hides packages that could have been
     // NEW: a capped run then admits none anywhere (§5.2).
-    stage.incomplete |= states.iter().any(|s| {
-        s.error
-            .as_ref()
-            .is_some_and(|e| e.code == "patch_lookup_failed")
-    });
+    stage.incomplete |= states
+        .iter()
+        .any(|s| s.error.as_ref().is_some_and(|e| e.code == "patch_lookup_failed"));
     let roots_by_path: Vec<String> = states.iter().map(|s| s.root.clone()).collect();
     for state in states.iter_mut().filter(|s| s.error.is_none()) {
         let Some(project) = state.project.as_ref() else {
             continue;
         };
         let recorded = memory_recorded(project, &state.root, &roots_by_path, &state.offers);
-        stage.incomplete |= lookup_incomplete(&recorded, &state.failed_details, batch_failed);
+        stage.incomplete |= lookup_incomplete(
+            &recorded,
+            &state.failed_details,
+            batch_failed,
+        );
         let mut rows = classify(&state.offers, &recorded, &state.root);
         for row in &mut rows {
             row.candidate.in_flight = options.in_flight.contains(&row.candidate.base_purl);
@@ -876,11 +859,8 @@ async fn engine(
         unknown_roots.contains(&row.candidate.project)
             || confirmed.contains(&(row.candidate.project.clone(), row.writer.uuid.clone()))
     });
-    let deferred_rows: Vec<(crate::rollout::Candidate, u32)> = stage
-        .plan
-        .as_ref()
-        .map(|p| p.deferred.clone())
-        .unwrap_or_default();
+    let deferred_rows: Vec<(crate::rollout::Candidate, u32)> =
+        stage.plan.as_ref().map(|p| p.deferred.clone()).unwrap_or_default();
     if !deferred_rows.is_empty() {
         let root_index: BTreeMap<String, usize> = states
             .iter()
@@ -1132,10 +1112,7 @@ fn select_with_policy(
     let mut by_purl: BTreeMap<String, Vec<(PatchSearchResult, FilterReason)>> = BTreeMap::new();
     for (patch, reason) in dropped {
         if !chosen.contains(patch.purl.as_str()) {
-            by_purl
-                .entry(patch.purl.clone())
-                .or_default()
-                .push((patch, reason));
+            by_purl.entry(patch.purl.clone()).or_default().push((patch, reason));
         }
     }
     for (purl, mut group) in by_purl {
