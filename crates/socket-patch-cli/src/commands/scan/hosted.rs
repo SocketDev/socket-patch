@@ -2432,6 +2432,71 @@ mod tests {
         }
     }
 
+    /// #402: every key spelling pnpm reads as `trustLockfile` is the
+    /// setting — an explicit value is respected, never duplicated.
+    #[test]
+    fn plan_workspace_trust_reads_quoted_and_spaced_keys() {
+        for spelled in [
+            "packages:\n  - '.'\n\"trustLockfile\": false\n",
+            "packages:\n  - '.'\ntrustLockfile : false\n",
+            "packages:\n  - '.'\n'trustLockfile':   false   # opt out\n",
+        ] {
+            match plan_workspace_trust(Some(spelled)) {
+                TrustPlan::UserSet(value) => assert_eq!(value, "false", "{spelled:?}"),
+                _ => panic!("an explicit false must be respected for {spelled:?}"),
+            }
+        }
+        for spelled in [
+            "'trustLockfile': true\npackages:\n  - '.'\n",
+            "\"trustLockfile\" : \"true\"\n",
+            "trustLockfile: true # set by hand\n",
+        ] {
+            assert!(
+                matches!(plan_workspace_trust(Some(spelled)), TrustPlan::AlreadyTrue),
+                "already-true must be a no-op for {spelled:?}"
+            );
+        }
+    }
+
+    /// #400: the key goes inside the document — before a `...` marker —
+    /// and shapes a line append would corrupt are never appended to.
+    #[test]
+    fn plan_workspace_trust_respects_the_document_shape() {
+        match plan_workspace_trust(Some("packages:\n  - '.'\n...\n")) {
+            TrustPlan::Append(text) => {
+                assert_eq!(text, "packages:\n  - '.'\ntrustLockfile: true\n...\n")
+            }
+            _ => panic!("a `...`-terminated block mapping must plan an Append"),
+        }
+        // The refusal reason reaches the warning with both manual recoveries.
+        let TrustPlan::Unsupported(why) = plan_workspace_trust(Some("{packages: [.]}\n")) else {
+            panic!("a flow-style document must be refused");
+        };
+        let detail = socket_patch_core::hosted::guidance::pnpm_trust_workspace_unsupported_detail(
+            "the hosted patch server (patch.test)",
+            &why,
+        );
+        assert!(detail.contains("flow-style"), "{detail}");
+        assert!(detail.contains("left untouched"), "{detail}");
+        assert!(detail.contains("--trust-lockfile"), "{detail}");
+        assert!(detail.contains("trustLockfile: true"), "{detail}");
+        assert!(detail.contains("pnpm clean --lockfile"), "{detail}");
+        for text in [
+            "{packages: [.]}\n",
+            "--- {packages: [.]}\n",
+            "packages:\n  - '.'\n---\ncatalog: {}\n",
+            "packages:\n  - '.'\n...\n---\ncatalog: {}\n",
+        ] {
+            assert!(
+                !matches!(
+                    plan_workspace_trust(Some(text)),
+                    TrustPlan::Append(_) | TrustPlan::Create(_)
+                ),
+                "{text:?} must not be appended to"
+            );
+        }
+    }
+
     /// The warning variants: the configured text says trust is in place and
     /// installs need no flags; the dry-run text says WOULD; both carry the
     /// whole-lock tradeoff disclosure and the don't-rebuild caution; the
