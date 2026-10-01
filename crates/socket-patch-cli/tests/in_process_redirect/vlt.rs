@@ -517,6 +517,52 @@ async fn scan_redirect_vlt_artifact_ambiguous_earlier_pin_is_not_confirmed() {
     );
 }
 
+/// REGRESSION (#471): `bund` bundles left-pad@1.3.0, which vlt unpacks
+/// into bund's own store entry with no `vlt-lock.json` node. The hosted
+/// redirect still pins the regular node, but the scan must say loudly that
+/// the bundled copy stays unpatched instead of reporting a clean success.
+#[tokio::test]
+async fn scan_redirect_vlt_bundled_store_copy_warns() {
+    let server = MockServer::start().await;
+    mock_all(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_vlt_project(tmp.path(), Era::V1);
+    let bund = "\"~npm~bund@1.0.0\": [0,\"bund\",\"sha512-BUND==\"]";
+    std::fs::write(
+        tmp.path().join("vlt-lock.json"),
+        lock_with(Era::V1, &[bund.to_string(), registry_node(TILDE_ID)]),
+    )
+    .unwrap();
+    let parent = tmp
+        .path()
+        .join("node_modules/.vlt/~npm~bund@1.0.0/node_modules/bund");
+    std::fs::create_dir_all(parent.join("node_modules/left-pad")).unwrap();
+    std::fs::write(
+        parent.join("package.json"),
+        r#"{"name":"bund","version":"1.0.0","bundleDependencies":["left-pad"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        parent.join("node_modules/left-pad/package.json"),
+        PACKAGE_JSON,
+    )
+    .unwrap();
+    std::fs::write(parent.join("node_modules/left-pad/index.js"), PRISTINE).unwrap();
+
+    let (_, doc) = scan_hosted(tmp.path(), &server, &[], &[]);
+
+    assert_eq!(redirected(&doc), 1, "{doc:#}");
+    assert!(
+        warning_codes(&doc).contains(&"redirect_vlt_bundled_instance_skipped".to_string()),
+        "{doc:#}"
+    );
+    let detail = warning_detail(&doc, "redirect_vlt_bundled_instance_skipped");
+    assert!(
+        detail.contains("~npm~bund@1.0.0") && detail.contains("UNPATCHED"),
+        "{detail}"
+    );
+}
+
 /// A real `node_modules/.vlt` store with no hidden lock (0.0.0-1 and
 /// 0.0.0-32 write none) is vlt's install state too: vlt drives beside a
 /// package-lock.json, so there is no sibling warning and a failed preflight
