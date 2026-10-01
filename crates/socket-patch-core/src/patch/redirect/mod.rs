@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
+use crate::vendor::common::{parse_json_text, JsonLayout};
 use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries};
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
@@ -278,6 +279,17 @@ fn serialize_json(value: &Value) -> String {
         "{}\n",
         serde_json::to_string_pretty(value).expect("serde_json::Value serializes infallibly")
     )
+}
+
+/// `value` pretty-printed in the layout of `original`, the text it replaces
+/// (BOM, indent, line ending and trailer; see [`JsonLayout`]), so a rewrite
+/// and its revert change nothing but the edited values. npm keeps a lock's
+/// CRLF and tab indent on its own rewrites, and so must we.
+fn serialize_json_like(value: &Value, original: &str) -> String {
+    let bytes = JsonLayout::of(original)
+        .render(value)
+        .expect("serde_json::Value serializes infallibly");
+    String::from_utf8(bytes).expect("rendered JSON is UTF-8")
 }
 
 /// The dep's registry override when it is of `kind`. `None` for an absent
@@ -821,7 +833,8 @@ fn rewrite_one_npm_lock(
     npm: &[&DepOverride],
     result: &mut RewriteResult,
 ) {
-    let Ok(mut lock) = serde_json::from_str::<Value>(content) else {
+    // npm reads past a leading UTF-8 BOM; so do we.
+    let Ok(mut lock) = parse_json_text(content) else {
         // A corrupt lockfile is strictly worse than a missing one (which
         // warns in the caller) — never skip the whole npm redirect silently.
         result.warnings.push(RewriteWarning {
@@ -988,7 +1001,9 @@ fn rewrite_one_npm_lock(
                 ),
             });
         }
-        result.files.insert(lockfile.into(), serialize_json(&lock));
+        result
+            .files
+            .insert(lockfile.into(), serialize_json_like(&lock, content));
     }
 }
 
@@ -12101,6 +12116,43 @@ mod tests {
             "a clean shrinkwrap-only success must emit NO warnings: {:?}",
             r.warnings
         );
+    }
+
+    /// #324: the hosted npm rewrite changes only the rewired values and keeps
+    /// the lock's layout: CRLF stays CRLF, a tab indent stays tabs, and a
+    /// UTF-8 BOM lock (npm strips the BOM and installs from it) is rewritten
+    /// with its BOM rather than skipped as unparseable.
+    #[test]
+    fn npm_lock_rewrite_keeps_crlf_tabs_and_bom() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let lf = "{\n  \"name\": \"app\",\n  \"lockfileVersion\": 3,\n  \"packages\": {\n    \"\": {\n      \"name\": \"app\"\n    },\n    \"node_modules/left-pad\": {\n      \"version\": \"1.3.0\",\n      \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\",\n      \"integrity\": \"sha512-UPSTREAM==\"\n    }\n  }\n}\n";
+        let shapes = [
+            ("crlf", lf.replace('\n', "\r\n")),
+            ("tabs", lf.replace("  ", "\t")),
+            ("bom", format!("\u{feff}{lf}")),
+            ("bom+crlf+tabs", format!("\u{feff}{}", lf.replace("  ", "\t").replace('\n', "\r\n"))),
+        ];
+        for (shape, pristine) in shapes {
+            let mut files = BTreeMap::new();
+            files.insert("package-lock.json".to_string(), pristine.clone());
+            let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+            let out = r
+                .files
+                .get("package-lock.json")
+                .unwrap_or_else(|| panic!("{shape}: lock must be rewritten: {:?}", r.warnings));
+            let expected = pristine
+                .replace(
+                    "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "http://patch.test/left-pad-1.3.0.tgz",
+                )
+                .replace("sha512-UPSTREAM==", "sha512-PATCHED==");
+            assert_eq!(out, &expected, "{shape}: only the rewired values may change");
+        }
     }
 
     /// An unparseable package-lock.json must surface a warning, not silently

@@ -162,6 +162,15 @@ limits, and required install commands.
 - Transient apply locks are removed on normal command exit; no-op scans and full
   reversal avoid leaving unused `.socket/` state. Terminal output, telemetry
   timeouts, and update-check handling are more consistent.
+- npm locks keep their own layout when edited. `scan --mode hosted`,
+  `scan --mode vendored`, `rollback` and `vendor --revert`
+  re-serialized `package-lock.json` / `npm-shrinkwrap.json` with LF line
+  endings (and, in hosted mode, a fixed 2-space indent), so a CRLF or
+  tab-indented lock got a whole-file diff and the undo did not restore its
+  bytes. A lock with a UTF-8 BOM, which npm installs from, was skipped as
+  unparseable (hosted) or refused as `vendor_lockfile_version_unsupported`
+  (vendored). The lock now keeps its BOM, indent and line endings, and the
+  undo is byte-exact (#324).
 
 ### Maintenance
 

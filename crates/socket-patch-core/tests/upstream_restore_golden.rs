@@ -239,6 +239,39 @@ async fn package_lock_goldens_round_trip() {
     npm_flavor("npm/package-lock-v3", &[]).await;
 }
 
+/// #324: the hosted unwind of a CRLF, tab-indented or BOM-prefixed
+/// package-lock.json gives back the lock's original bytes (npm keeps those
+/// layouts on its own rewrites and installs from a BOM lock).
+#[tokio::test]
+#[serial]
+async fn package_lock_layouts_round_trip() {
+    let basic = load("npm/package-lock-v3")
+        .into_iter()
+        .find(|c| c.dir.ends_with("basic"))
+        .expect("npm/package-lock-v3/basic golden");
+    let lf = basic.input["package-lock.json"].clone();
+    let shapes = [
+        ("crlf", lf.replace('\n', "\r\n")),
+        ("tabs", lf.replace("  ", "\t")),
+        ("bom", format!("\u{feff}{lf}")),
+        (
+            "bom+crlf+tabs",
+            format!("\u{feff}{}", lf.replace("  ", "\t").replace('\n', "\r\n")),
+        ),
+    ];
+    for (shape, pristine) in shapes {
+        let case = synthetic(
+            &format!("npm-lock-{shape}"),
+            &[("package-lock.json", &pristine)],
+            serde_json::Value::Array(basic.overrides.clone()),
+        );
+        let server = npm_mock(&case).await;
+        let _env = EnvGuard::set(&[("SOCKET_NPM_REGISTRY", server.uri())]);
+        let (after, statuses) = run_case(&case).await;
+        assert_round_trip(&case, &after, &statuses);
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn yarn_classic_goldens_round_trip() {

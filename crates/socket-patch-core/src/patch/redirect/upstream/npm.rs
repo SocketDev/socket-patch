@@ -149,7 +149,8 @@ pub(crate) async fn restore_npm_locks(
         let Some(text) = read_or_refuse(view, rel, &pins, &mut result).await else {
             continue;
         };
-        let Ok(mut lock) = serde_json::from_str::<Value>(&text) else {
+        // npm reads past a leading UTF-8 BOM; so do we.
+        let Ok(mut lock) = crate::vendor::common::parse_json_text(&text) else {
             refuse_all_in(&pins, rel, &mut result, format!("{rel} is not valid JSON"));
             continue;
         };
@@ -192,7 +193,8 @@ pub(crate) async fn restore_npm_locks(
             changed = true;
         }
         if changed {
-            view.write(rel, super::super::serialize_json(&lock));
+            // The lock's own BOM, indent and line endings (#324).
+            view.write(rel, super::super::serialize_json_like(&lock, &text));
         }
     }
     result
