@@ -1260,7 +1260,8 @@ async fn berry_crlf_takeovers_round_trip_both_directions() {
         npm_tgz("left-pad", "1.3.0", ORIG_INDEX),
     )
     .await;
-    let encoded = socket_patch_core::utils::uri::encode_uri_component(&hosted_url);
+    // The hosted pin is the tarball-URL locator `left-pad@<url>` (#404).
+    let encoded = format!("left-pad@{hosted_url}\"");
     let (pkg, lock) = (
         windows_shape(BERRY_WIN_PKG, true),
         windows_shape(&berry_win_lock(), false),

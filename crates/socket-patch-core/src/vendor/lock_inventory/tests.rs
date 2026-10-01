@@ -998,6 +998,40 @@ async fn yarn_berry_registry_resolutions_inventory_with_checksums() {
     assert!(!entries.iter().any(|e| e.name == "fixture"), "{entries:?}");
 }
 
+/// #404: a hosted berry pin is a tarball-URL locator under the untouched
+/// `npm:` descriptor key — still the registry package, so lock-only
+/// discovery keeps inventorying it (and a later hosted scan can re-pin it).
+/// A user's own URL dependency (its key names the URL) is not a registry
+/// package and stays out.
+#[tokio::test]
+async fn yarn_berry_hosted_tarball_pin_stays_in_the_inventory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hosted = YARN_BERRY
+        .replace(
+            "resolution: \"left-pad@npm:1.3.0\"",
+            "resolution: \"left-pad@https://patch.socket.dev/patch/npm/left-pad/1.3.0/t/u/left-pad-1.3.0.tgz\"",
+        )
+        .replace(
+            "resolution: \"@scope/pkg@npm:2.0.0\"",
+            "resolution: \"@scope/pkg@https://patch.socket.dev/patch/npm/@scope/pkg/2.0.0/t/u/pkg-2.0.0.tgz\"",
+        )
+        + "\n\"own@https://example.test/own-1.0.0.tgz\":\n  version: 1.0.0\n  \
+           resolution: \"own@https://example.test/own-1.0.0.tgz\"\n  \
+           checksum: 10c0/own==\n  languageName: node\n  linkType: hard\n";
+    write(tmp.path(), "yarn.lock", &hosted).await;
+
+    let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    assert_eq!(flavor, NpmLockFlavor::YarnBerry);
+    let lp = entry(&entries, "left-pad");
+    assert_eq!(lp.version, "1.3.0");
+    assert_eq!(
+        lp.integrity,
+        LockIntegrity::BerryChecksum("10c0/deadbeefcafe==".into())
+    );
+    assert_eq!(entry(&entries, "@scope/pkg").version, "2.0.0");
+    assert!(!entries.iter().any(|e| e.name == "own"), "{entries:?}");
+}
+
 /// yarn berry writes a CRLF `yarn.lock` on Windows (a new lockfile gets
 /// `os.EOL`), and editors add a BOM: the Windows spellings — header-less
 /// too — inventory exactly like the LF lock, with no stray `\r` riding into

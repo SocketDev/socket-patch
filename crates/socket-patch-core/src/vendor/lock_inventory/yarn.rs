@@ -187,6 +187,18 @@ pub(super) async fn inventory_yarn_berry_in(view: &ProjectView<'_>) -> Option<Ve
 
 /// The registry packages of a berry lock text: `__metadata*` and
 /// workspace/patch/file resolutions are not registry packages.
+/// Whether a berry entry resolving to `reference` is a hosted redirect's
+/// tarball-URL pin: an `http(s)://` locator under descriptor patterns that
+/// are all `npm:` ranges (the rewriter leaves the key untouched).
+fn berry_hosted_tarball_entry(entry: &YarnEntry, reference: &str) -> bool {
+    use crate::vendor::yarn_classic_lock::split_pattern;
+    (reference.starts_with("https://") || reference.starts_with("http://"))
+        && !entry.patterns.is_empty()
+        && entry.patterns.iter().all(|p| {
+            split_pattern(p).is_some_and(|(_, range)| range.starts_with("npm:"))
+        })
+}
+
 fn berry_registry_view(text: &str) -> Vec<LockfileEntry> {
     let mut out = Vec::new();
     for entry in berry_entries(text).entries {
@@ -194,16 +206,28 @@ fn berry_registry_view(text: &str) -> Vec<LockfileEntry> {
             continue;
         }
         // Registry resolutions are `name@npm:<version>` (a `::binding`
-        // suffix may follow). Anything else (workspace:/patch:/file:/link:)
-        // is skipped — including our own vendored file: resolutions.
+        // suffix may follow). A Socket hosted pin is a tarball-URL locator
+        // (`name@https://…tgz`, #404) under descriptor keys that all stay
+        // `npm:` — still the registry package, just fetched from the patch
+        // host. Anything else (workspace:/patch:/file:/link:, or a user's
+        // own URL dependency, whose key names the URL) is skipped —
+        // including our own vendored file: resolutions.
         let Some(locator) = entry.locator() else {
             continue;
         };
-        let Some((version_from_res, _)) = locator.npm() else {
-            continue;
-        };
         let lines = &entry.block.lines;
-        let version = berry_field(lines, "version").unwrap_or(version_from_res);
+        let version = match locator.npm() {
+            Some((version_from_res, _)) => {
+                berry_field(lines, "version").unwrap_or(version_from_res)
+            }
+            None if berry_hosted_tarball_entry(&entry, locator.reference) => {
+                match berry_field(lines, "version") {
+                    Some(v) => v,
+                    None => continue,
+                }
+            }
+            None => continue,
+        };
         let integrity = berry_field(lines, "checksum")
             .map(|c| LockIntegrity::BerryChecksum(c.to_string()))
             .unwrap_or(LockIntegrity::None);
