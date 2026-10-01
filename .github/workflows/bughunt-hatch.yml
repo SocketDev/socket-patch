@@ -1,0 +1,138 @@
+name: bughunt-hatch
+on:
+  push:
+    branches: ['bughunt/hatch/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo build -p socket-patch-cli
+      - name: Probe global mode with pipx-installed Hatch
+        shell: bash
+        run: |
+          cat > mock.py <<'PY'
+          import base64, hashlib, json, sys, io, zipfile, threading
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          ORG="test-org"; PURL="pkg:pypi/six@1.16.0"; UUID="5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"; TOKEN="11111111-2222-4333-8444-555555555555"
+          WHEEL="six-1.16.0-py2.py3-none-any.whl"
+          PORT=int(sys.argv[1])
+          orig=open(sys.argv[2],'rb').read(); patched=orig+b"\n# SOCKET-PATCHED\nSOCKET_PATCHED = 1\n"
+          def gh(b): return hashlib.sha256(b"blob %d\0"%len(b)+b).hexdigest()
+          def d(b): return base64.urlsafe_b64encode(hashlib.sha256(b).digest()).rstrip(b"=").decode()
+          meta=b"Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\nSummary: x\n"
+          wh=b"Wheel-Version: 1.0\nGenerator: t\nRoot-Is-Purelib: true\nTag: py2-none-any\nTag: py3-none-any\n"
+          mem=[("six.py",patched),("six-1.16.0.dist-info/METADATA",meta),("six-1.16.0.dist-info/WHEEL",wh)]
+          rec="".join(f"{n},sha256={d(b)},{len(b)}\n" for n,b in mem)+"six-1.16.0.dist-info/RECORD,,\n"
+          buf=io.BytesIO(); z=zipfile.ZipFile(buf,"w")
+          for n,b in mem+[("six-1.16.0.dist-info/RECORD",rec.encode())]: z.writestr(n,b)
+          z.close(); wheel=buf.getvalue(); SHA=hashlib.sha256(wheel).hexdigest(); S512="sha512-"+base64.b64encode(hashlib.sha512(wheel).digest()).decode()
+          BASE=f"http://127.0.0.1:{PORT}"; APATH=f"/patch/pypi/six/1.16.0/{TOKEN}/{UUID}/{WHEEL}"; URL=BASE+APATH
+          VIEW={"uuid":UUID,"purl":PURL,"publishedAt":"Fri, 27 Mar 2026 00:00:00 GMT","files":{"six.py":{"beforeHash":gh(orig),"afterHash":gh(patched),"blobContent":base64.b64encode(patched).decode()}},"vulnerabilities":{"GHSA-real-pypi-0001":{"cves":["CVE-2026-7201"],"summary":"s","severity":"high","description":"d"}},"description":"d","license":"MIT","tier":"free"}
+          class H(BaseHTTPRequestHandler):
+              def log_message(self,*a): sys.stderr.write("REQ "+self.command+" "+self.path+"\n")
+              def j(self,o):
+                  b=json.dumps(o).encode(); self.send_response(200); self.send_header("content-type","application/json"); self.send_header("content-length",str(len(b))); self.end_headers(); self.wfile.write(b)
+              def do_POST(self):
+                  self.rfile.read(int(self.headers.get("content-length",0)))
+                  if self.path==f"/v0/orgs/{ORG}/patches/batch":
+                      return self.j({"packages":[{"purl":PURL,"patches":[{"uuid":UUID,"purl":PURL,"tier":"free","cveIds":["CVE-2026-7201"],"ghsaIds":["GHSA-real-pypi-0001"],"severity":"high","title":"t"}]}],"canAccessPaidPatches":False})
+                  if self.path==f"/v0/orgs/{ORG}/patches/package":
+                      return self.j({"results":{UUID:{"status":"granted","url":URL,"purl":PURL,"artifacts":[{"kind":"tarball","url":URL,"integrity":{"sha256":SHA,"sha512":S512}}],"registryOverride":None}}})
+                  self.send_response(404); self.end_headers()
+              def do_GET(self):
+                  p=self.path.split("?")[0]
+                  if p.startswith(f"/v0/orgs/{ORG}/patches/by-package/"):
+                      return self.j({"patches":[{"uuid":UUID,"purl":PURL,"publishedAt":"2026-03-27T00:00:00Z","description":"x","license":"MIT","tier":"free","vulnerabilities":{}}],"canAccessPaidPatches":False})
+                  if p in (f"/patch/view/{UUID}",f"/v0/orgs/{ORG}/patches/view/{UUID}"): return self.j(VIEW)
+                  if p.startswith(f"/v0/orgs/{ORG}/patches/blob/") or p.startswith("/patch/blob/"):
+                      h=p.rsplit("/",1)[1]
+                      for b in (orig,patched):
+                          if gh(b)==h:
+                              self.send_response(200); self.send_header("content-length",str(len(b))); self.end_headers(); self.wfile.write(b); return
+                  if p==APATH:
+                      self.send_response(200); self.send_header("content-type","application/octet-stream"); self.send_header("content-length",str(len(wheel))); self.end_headers(); self.wfile.write(wheel); return
+                  self.send_response(404); self.end_headers()
+              def do_HEAD(self):
+                  p=self.path.split("?")[0]
+                  if p==APATH:
+                      self.send_response(200); self.send_header("content-type","application/octet-stream"); self.send_header("content-length",str(len(wheel))); self.end_headers(); return
+                  self.send_response(404); self.end_headers()
+          print("SHA",SHA,flush=True)
+          ThreadingHTTPServer(("127.0.0.1",PORT),H).serve_forever()
+          PY
+          cat > probe_g.py <<'PY'
+          import json, os, subprocess, sys, shutil, glob
+          SP, W, WHEEL, VER = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2]), os.path.abspath(sys.argv[3]), sys.argv[4]
+          API = "http://127.0.0.1:18080"
+          SPA = ["--api-url", API, "--api-token", "fake", "--org", "test-org", "--patch-server-url", API, "--ecosystems", "pypi"]
+          WIN = os.name == "nt"
+          shutil.rmtree(W, ignore_errors=True); os.makedirs(W)
+          env = dict(os.environ, SOCKET_NO_CONFIG="1", SOCKET_TELEMETRY_DISABLED="1", SOCKET_NO_UPDATE_CHECK="1")
+          env.pop("VIRTUAL_ENV", None)
+          for k in ("PIPX_HOME", "PIPX_BIN_DIR", "PIPX_MAN_DIR"): env.pop(k, None)
+          def run(cmd, cwd=W, extra=None):
+              return subprocess.run(cmd, cwd=cwd, env=dict(env, **(extra or {})), capture_output=True, text=True, encoding="utf-8", errors="replace")
+          def js(r):
+              try: return json.loads(r.stdout[r.stdout.find("{"):])
+              except Exception: return {"_raw": (r.stdout + r.stderr)[-400:]}
+          def marked(p):
+              try: return "SOCKET_PATCHED" in open(p, encoding="utf-8").read()
+              except Exception as e: return "ERR " + str(e)
+          # pipx in its own venv
+          pv = os.path.join(W, "pipxvenv"); subprocess.run([sys.executable, "-m", "venv", pv], check=True)
+          pvpy = os.path.join(pv, "Scripts" if WIN else "bin", "python")
+          subprocess.run([pvpy, "-m", "pip", "install", "-q", "pipx==1.7.1"], check=True)
+          PIPX = [pvpy, "-m", "pipx"]
+          r = run(PIPX + ["install", f"hatch=={VER}"]); print("pipx install", r.returncode, r.stderr[-300:] if r.returncode else "")
+          r = run(PIPX + ["inject", "hatch", WHEEL]); print("pipx inject", r.returncode, r.stderr[-300:] if r.returncode else "")
+          venvs = run(PIPX + ["environment", "--value", "PIPX_LOCAL_VENVS"]).stdout.strip()
+          six = glob.glob(os.path.join(venvs, "hatch", "**", "six.py"), recursive=True)
+          print("PIPX_LOCAL_VENVS", venvs, "six:", six)
+          proj = os.path.join(W, "proj"); os.makedirs(proj)
+          pp = '[build-system]\nrequires = ["hatchling"]\nbuild-backend = "hatchling.build"\n\n[project]\nname = "app"\nversion = "0.1.0"\ndependencies = ["six==1.16.0"]\n'
+          open(os.path.join(proj, "pyproject.toml"), "w").write(pp)
+          d = js(run([SP, "scan", "-g", "--json"] + SPA, proj))
+          print("scan -g report: status", d.get("status"), "scanned", d.get("scannedPackages"), "purls", [p["purl"] for p in d.get("packages", [])])
+          print("pyproject unchanged after report:", open(os.path.join(proj, "pyproject.toml")).read() == pp)
+          r = run([SP, "scan", "-g", "--mode", "agent", "--json", "--yes"] + SPA, proj); d = js(r)
+          print("scan -g --mode agent: exit", r.returncode, "status", d.get("status"), "applied", d.get("apply", {}).get("applied"))
+          print("pipx six patched:", [marked(p) for p in six])
+          r = run([SP, "rollback", "-g", "--json"] + SPA, proj); print("rollback -g exit", r.returncode, js(r).get("rolledBack"))
+          r = run([SP, "scan", "-g", "--mode", "hosted", "--json", "--yes"] + SPA, proj); print("scan -g --mode hosted exit", r.returncode, r.stderr.strip().splitlines()[-1:] )
+          run(PIPX + ["uninstall", "hatch"])
+          # global-prefix with space + unicode
+          gp = os.path.join(W, "gl ob", "ünï", "site-packages")
+          subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--target", gp, WHEEL], check=True)
+          orig = open(os.path.join(gp, "six.py"), "rb").read()
+          r = run([SP, "scan", "--global-prefix", gp, "--mode", "agent", "--json", "--yes"] + SPA, proj); d = js(r)
+          print("global-prefix agent: exit", r.returncode, d.get("status"), "applied", d.get("apply", {}).get("applied"), "patched", marked(os.path.join(gp, "six.py")))
+          r = run([SP, "vex", "--global-prefix", gp, "--product", "pkg:pypi/app@0.1.0"] + SPA[:-2], proj)
+          print("vex global-prefix:", [s["status"] for s in js(r).get("statements", [])] or r.stderr[-200:])
+          r = run([SP, "rollback", "--global-prefix", gp, "--json"] + SPA, proj)
+          print("rollback global-prefix exit", r.returncode, "byte-exact", open(os.path.join(gp, "six.py"), "rb").read() == orig)
+          PY
+          python -m pip download -q --no-deps six==1.16.0 -d sixdl
+          whl=$(ls $PWD/sixdl/*.whl)
+          python -c "import zipfile,glob;open('six.py','wb').write(zipfile.ZipFile(glob.glob('sixdl/*.whl')[0]).read('six.py'))"
+          python mock.py 18080 six.py > mock.log 2>&1 &
+          sleep 3
+          cli=$PWD/target/debug/socket-patch; [ "$RUNNER_OS" = Windows ] && cli=$PWD/target/debug/socket-patch.exe
+          if [ "$RUNNER_OS" = Windows ]; then cli=$(cygpath -w "$cli"); whl=$(cygpath -w "$whl"); fi
+          for v in 1.7.0 1.16.5 1.18.1; do
+            echo "################ $RUNNER_OS Hatch $v"
+            python probe_g.py "$cli" "$RUNNER_TEMP/g-$v" "$whl" "$v" || echo "probe exit $?"
+          done
