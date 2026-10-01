@@ -1,0 +1,124 @@
+name: bughunt pip probe
+on:
+  push:
+    branches: ['bughunt/pip/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - python: '3.8'
+            pips: '20.3.4 23.0.1 bundled'
+          - python: '3.13'
+            pips: '24.0 bundled'
+        python: ['3.8', '3.13']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: bughunt-pip
+          save-if: false
+      - name: Build the CLI
+        shell: bash
+        run: cargo build --locked -p socket-patch-cli
+      - name: Write probe
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/probe.py" <<'PYEOF'
+          import base64, csv, hashlib, http.server, io, json, os, subprocess, sys, tempfile, threading, urllib.request, zipfile
+          CLI = os.environ["SP_CLI"]; WIN = os.name == "nt"
+          UUID = "4d5e6f70-8192-4a1b-8c2d-0123456789ab"; TOKEN = "11111111-1111-4111-8111-111111111111"
+          work = tempfile.mkdtemp(prefix="bh pip ")
+          def run(cmd, cwd=None, env=None, check=False):
+              p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+              if check and p.returncode: print(p.stdout, p.stderr); raise SystemExit(f"failed: {cmd}")
+              return p
+          # patched wheel
+          up = os.path.join(work, "six-1.16.0-py2.py3-none-any.whl")
+          urllib.request.urlretrieve("https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl", up)
+          zin = zipfile.ZipFile(up); buf = io.BytesIO(); zout = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+          patched_six = zin.read("six.py") + b"\nSOCKET_PATCHED = 1\n"
+          for item in zin.infolist():
+              data = zin.read(item.filename)
+              if item.filename == "six.py": data = patched_six
+              if item.filename.endswith("RECORD"):
+                  rows = []
+                  for row in csv.reader(io.StringIO(data.decode())):
+                      if row and row[0] == "six.py":
+                          row = ["six.py", "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(patched_six).digest()).rstrip(b"=").decode(), str(len(patched_six))]
+                      rows.append(row)
+                  s = io.StringIO(); csv.writer(s, lineterminator="\n").writerows(rows); data = s.getvalue().encode()
+              zout.writestr(item, data)
+          zout.close(); WHL = buf.getvalue(); SHA = hashlib.sha256(WHL).hexdigest()
+          class H(http.server.BaseHTTPRequestHandler):
+              def log_message(self, *a): pass
+              def send(self, code, body, ct="application/json"):
+                  b = body if isinstance(body, bytes) else json.dumps(body).encode()
+                  self.send_response(code); self.send_header("Content-Type", ct); self.send_header("Content-Length", str(len(b))); self.end_headers()
+                  if self.command != "HEAD": self.wfile.write(b)
+              def do_HEAD(self): self.do_GET()
+              def do_GET(self):
+                  if self.path.endswith(".whl"): return self.send(200, WHL, "application/octet-stream")
+                  if "/patches/by-package/" in self.path:
+                      hit = "six%401.16.0" in self.path
+                      return self.send(200, {"patches": [{"uuid": UUID, "purl": "pkg:pypi/six@1.16.0", "publishedAt": "2024-01-01T00:00:00Z", "description": "d", "license": "MIT", "tier": "free", "vulnerabilities": {"GHSA-xxxx-yyyy-zzzz": {"cves": ["CVE-2024-88888"], "summary": "s", "severity": "high", "description": "d"}}}] if hit else [], "canAccessPaidPatches": True})
+                  self.send(404, {"error": "nf"})
+              def do_POST(self):
+                  body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                  if self.path.endswith("/patches/package"):
+                      url = f"http://127.0.0.1:{PORT}/patch/pypi/six/1.16.0/{TOKEN}/{UUID}/six-1.16.0-py2.py3-none-any.whl"
+                      return self.send(200, {"results": {UUID: {"status": "granted", "url": url, "purl": "pkg:pypi/six@1.16.0", "artifacts": [{"kind": "tarball", "url": url, "integrity": {"sha256": SHA}}], "registryOverride": None}}})
+                  if self.path.endswith("/patches/batch"):
+                      comps = [c["purl"] for c in json.loads(body or b"{}").get("components", [])]
+                      pk = [{"purl": "pkg:pypi/six@1.16.0", "patches": [{"uuid": UUID, "purl": "pkg:pypi/six@1.16.0", "tier": "free", "cveIds": ["CVE-2024-88888"], "ghsaIds": ["GHSA-xxxx-yyyy-zzzz"], "severity": "high", "title": "t"}]}] if "pkg:pypi/six@1.16.0" in comps else []
+                      return self.send(200, {"packages": pk, "canAccessPaidPatches": True})
+                  self.send(200, {})
+          srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H); PORT = srv.server_address[1]
+          threading.Thread(target=srv.serve_forever, daemon=True).start()
+          def venv(d, pipv):
+              run([sys.executable, "-m", "venv", os.path.join(d, ".venv")], check=True)
+              py = os.path.join(d, ".venv", "Scripts" if WIN else "bin", "python.exe" if WIN else "python")
+              if pipv != "bundled": run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check", f"pip=={pipv}"], check=True)
+              return py
+          rows = []
+          for pipv in os.environ["PIPS"].split():
+              for spec in ["six==1.16.0", "six==1.16", "six==1.16.0.0", "Six==01.16.0"]:
+                  d = os.path.join(work, f"p{len(rows)}"); os.makedirs(d)
+                  py = venv(d, pipv)
+                  run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check", "six==1.16.0"], check=True)
+                  open(os.path.join(d, "requirements.txt"), "w").write(spec + "\n")
+                  env = {k: v for k, v in os.environ.items() if not k.startswith("SOCKET_") and k != "VIRTUAL_ENV"}
+                  env["SOCKET_API_TOKEN"] = "sktsec_" + "a" * 44 + "_api"
+                  p = run([CLI, "scan", "--mode", "hosted", "--yes", "--json", "--api-url", f"http://127.0.0.1:{PORT}", "--org", "test-org", "--patch-server-url", f"http://127.0.0.1:{PORT}", "--cwd", d], cwd=d, env=env)
+                  try: j = json.loads(p.stdout); red = j["redirect"]["redirected"]; warns = [w["code"] for w in j["redirect"]["warnings"]]
+                  except Exception: red, warns = "?", [p.stdout[-300:], p.stderr[-300:]]
+                  f = os.path.join(d, "fresh"); os.makedirs(f)
+                  import shutil; shutil.copy(os.path.join(d, "requirements.txt"), f)
+                  fpy = venv(f, pipv)
+                  inst = run([fpy, "-m", "pip", "install", "--disable-pip-version-check", "-r", "requirements.txt"], cwd=f)
+                  o = run([fpy, "-c", "import six;print('PATCHED' if getattr(six,'SOCKET_PATCHED',0) else 'UNPATCHED', six.__version__)"], cwd=f)
+                  pipver = run([fpy, "-m", "pip", "--version"]).stdout.split()[1]
+                  rows.append((pipver, spec, p.returncode, red, warns, inst.returncode, o.stdout.strip() or o.stderr.strip()[-120:]))
+                  print(f"CELL pip={pipver} py={sys.version.split()[0]} spec={spec!r} scan_rc={p.returncode} redirected={red} warnings={warns} fresh_install_rc={inst.returncode} result={rows[-1][-1]}", flush=True)
+          PYEOF
+      - name: Run probe
+        shell: bash
+        env:
+          PIPS: ${{ matrix.pips }}
+          SOCKET_NO_CONFIG: '1'
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then export SP_CLI="$GITHUB_WORKSPACE/target/debug/socket-patch.exe"; else export SP_CLI="$GITHUB_WORKSPACE/target/debug/socket-patch"; fi
+          python "$RUNNER_TEMP/probe.py"
