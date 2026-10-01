@@ -29,7 +29,7 @@ jobs:
         run: cargo build --release -p socket-patch-cli
       - name: probe
         run: |
-          set -x
+          set +e -x +o pipefail
           ROOT="$PWD"; SP="$ROOT/target/release/socket-patch"; [ -f "$SP.exe" ] && SP="$SP.exe"
           W="$RUNNER_TEMP/w"; mkdir -p "$W/patches"
           cat > "$W/mkpatch.py" <<'PY'
