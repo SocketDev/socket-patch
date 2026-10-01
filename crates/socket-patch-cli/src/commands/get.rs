@@ -2527,6 +2527,12 @@ pub async fn run(args: GetArgs) -> i32 {
         } else {
             super::scan::ScanMode::Hosted
         });
+    // Global installs have no project lockfile: an explicit hosted or
+    // vendored mode would rewire the cwd project, not the global copy.
+    if let Some(conflict) = super::global_mode_conflict(&args.common, mode) {
+        report_error(args.common.json, conflict);
+        return 2;
+    }
     if args.save_only && mode != super::scan::ScanMode::Agent {
         report_error(
             args.common.json,
