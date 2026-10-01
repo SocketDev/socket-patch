@@ -1,34 +1,38 @@
 [agent] Progress ledger for the scheduled uv bug-hunt routine (label pm:uv).
 
-Last run: 2026-09-30 on main `f6b7fb9` (CLI 4.0.0; the released 4.0.0 predates the current uv backend). Linux runs use real uv against a local mock patch API. macOS and Windows runs use probe branches.
+Last run: 2026-10-01 on main `2463257` (v5, #277; CLI reports 4.0.0, and the released 4.0.0 predates both the v4 uv rewriter and the v5 upstream restore). Linux runs use real uv against a local mock patch API (with `integrity.sha512`, `--patch-server-url`, and `SOCKET_PYPI_JSON_API` → a local pypi.org forwarder). macOS and Windows runs use probe branches.
 
 ## Coverage matrix
-H = hosted, V = vendored, A = agent. "pass/fail" is Linux unless an OS is named.
+H = hosted, V = vendored, A = agent. "pass/fail" is Linux unless an OS is named. Results are from v5 main `2463257` unless marked (v4).
 
-| uv | H native | H rollback after edit / `uv add` | V native | V repair (patched venv) | V repair (lock-only) | A | Other |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 0.2.37 | untested | untested | untested | pass Linux/macOS, **fail Windows #381** | pass Linux/macOS, fail Windows (see #381) | untested | |
-| 0.4.30 | pass | **fail #379** | untested | untested | untested | untested | |
-| 0.5.31 | pass | **fail #379** (Linux/macOS/Windows) | untested | untested | untested | untested | |
-| 0.8.17 | pass | **fail #379** | untested | untested | untested | untested | workspace refused (by design) |
-| 0.12.21 | pass (--locked/--frozen/plain, inline sources, BOM, odd-case name, idempotent, VEX, pylock.dev.toml, script lock) | **fail #379** (Linux/macOS/Windows; script lock too) | pass (install, rollback after `uv add`) | **fail #381** (Linux/macOS/Windows) | pass (Linux/macOS/Windows) | pass (hardlink / symlink link-mode) | H→V fail #328; V→H warn-only |
-| 0.0.5 – 0.1.44 (requirements lane) | untested | – | untested | – | – | untested | |
-| 0.1.45 – 0.2.34 (`[[distribution]]`) | untested | untested | refused (documented) | – | – | untested | |
+| uv | H native | H rollback / remove (upstream restore) | V native | V repair | A | Other |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0.0.5 – 0.1.44 (requirements lane) | blocked in sandbox (TLS) | – | – | – | untested | |
+| 0.1.45 / 0.2.5 / 0.2.18 / 0.2.34 (`[[distribution]]`) | pass (plain sync; 0.2.34 `--frozen`/`--locked`) | refused (documented) | refused (documented) | – | untested | |
+| 0.2.37 | pass | pass after edit / `uv add` (Linux, macOS, Windows); **fail #411** user override (Linux, Windows) | pass | pass (Linux, macOS, Windows) | untested | |
+| 0.4.30 | pass (v4) | untested on v5 | untested | untested | untested | |
+| 0.5.31 | pass | pass after edit / `uv add` (3 OS); **fail #411** (3 OS) | pass | pass (Windows, macOS) | untested | |
+| 0.8.17 | pass | **fail #407** pip-compile pylock; **fail #408** export pylock precision | untested | untested | untested | workspace refused (by design) |
+| 0.12.21 | pass (`--locked`/`--frozen`/plain, inline sources, BOM, odd-case name, idempotent, VEX, pylock, script lock, CRLF, hashed requirements, markers, ranges, groups, extras, transitive override) | pass after edit / `uv add` (3 OS), script lock, hashed requirements, CRLF, multi-file; **fail #411** (3 OS); **fail #407**; **fail #408** | pass | pass (3 OS, venv + lock-only) | pass (v4: hardlink / symlink link-mode) | H→V pass (v5); V→H warn-only |
+
+Closed this run: #379 and #381 (fixed by #277).
 
 ## Backlog
-1. Windows + uv 0.2.37 lock-only repair mismatch: is the vendor-time wheel built from the installed dist?
-2. `[[distribution]]` hosted locks (0.1.45 / 0.2.5 / 0.2.18 / 0.2.34): relock, rollback, `--locked`.
-3. Non-default / explicit `[[tool.uv.index]]` and `{ index = … }` pins, including transitive overrides.
-4. Hosted hashed requirements (`uv pip compile --generate-hashes`) + `--require-hashes`, upgrade, rollback; requirements floor 0.0.5.
-5. CRLF uv.lock + `uv add` on Windows; `resolution-markers` forks (refusal vs VEX).
+1. uv 0.0.5 – 0.1.44 hosted requirements lane via a probe (the sandbox can't reach PyPI with those binaries).
+2. `[[tool.uv.index]]` / `{ index = … }` pins and a non-PyPI default index: hosted scan plus the documented restore refusals.
+3. Agent mode on v5 (`scan --mode agent`, `apply` after `uv sync`, `--sync` prune).
+4. `pylock.<name>.toml` variants and mixed index / no-index pylock siblings (#407 rule).
+5. Vendored script-lock and pylock round-trips on v5; Windows CRLF checkout + `repair`.
 6. `uv sync --frozen` with `default-groups` / `--no-dev`, and `package = false` projects.
-7. Re-triage #379 and #381.
+7. Re-triage #407, #408 and #411.
 
 ## Known non-bugs
-- uv workspaces (`[tool.uv.workspace]` or `[manifest] members` beyond the root) are refused in both modes: `redirect_uv_project_unsupported` ("hosted sources for uv workspaces require a package-scoped source mapping") and `pypi_uv_workspace_unsupported`. This is by design, though it's missing from docs/testing/uv-compatibility.md.
-- Scanning from inside a workspace member directory falls through to the PATH interpreter and finds nothing (documented fall-through).
-- vendored → hosted on a uv project is warn-only (`redirect_uv_project_unsupported`, exit 0).
-- A failed `repair` removes the package's `socket-patch.vendor.json` sidecar ("nothing kept" contract). `vendor --revert` still works from state.json.
-- Hosted rollback needs `.socket/vendor/redirect-state.json`; without it the result is `Manifest not found`.
-- `vendor_fetch_failed` against files.pythonhosted.org in the sandbox is a rustls vs proxy-CA artifact.
-- The `redirect_pypi_stale_install` text mentions Poetry on uv projects (cosmetic).
+- uv workspaces (`[tool.uv.workspace]` or `[manifest] members` beyond the root) are refused in both modes (`redirect_uv_project_unsupported` / `pypi_uv_workspace_unsupported`). This is by design, though it's missing from docs/testing/uv-compatibility.md.
+- Scanning from inside a workspace member directory falls through to the PATH interpreter and finds nothing.
+- vendored → hosted on a uv project is warn-only (`redirect_uv_project_unsupported`, exit 0). In v5, `vendored_takeover` only covers cargo/npm/golang. CLI_CONTRACT.md line ~123 says both directions "work in place on the locks the target mode accepts", so a maintainer may want to clarify that this is PyPI-wide (Poetry/PDM too).
+- v5 hosted rollback refuses a uv project whose only registry package is the patched one ("no sibling registry package…"). Documented in CLI_CONTRACT "Hosted unwind coverage".
+- v5 hosted rollback refuses a multi-clause direct specifier (`six>=1.10,<1.17`) unless another lock entry shows uv's clause spelling. This is in the `upstream/uv.rs` module doc, not the user docs. It's justified: uv 0.2.37 keeps clause order and ≥0.5 sorts them.
+- v5 hosted rollback refuses `[[distribution]]` locks, `exclude-newer` / `no-binary` / `no-build`, and non-PyPI registries (documented).
+- Hosted rollback without `--patch-server-url` for a non-Socket origin reports "Manifest not found" (the origin isn't recognised as hosted). This is a harness artifact.
+- `vendor_fetch_failed` / "error sending request" for pypi.org / files.pythonhosted.org in the sandbox is a rustls vs proxy-CA artifact. Use a local forwarder via `SOCKET_PYPI_JSON_API`.
+- The `redirect_pypi_stale_install` text mentions Poetry on uv projects (cosmetic, v4 observation).
