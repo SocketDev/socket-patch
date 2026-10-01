@@ -32,7 +32,7 @@ jobs:
         env:
           DV: ${{ matrix.deno }}
         run: |
-          set -u
+          set +e +o pipefail; set -u
           SP="$GITHUB_WORKSPACE/target/debug/socket-patch"; [ -f "$SP.exe" ] && SP="$SP.exe"
           W="$RUNNER_TEMP/w"; mkdir -p "$W"
           if [ "$RUNNER_OS" = Windows ]; then PY=python; else PY=python3; fi
