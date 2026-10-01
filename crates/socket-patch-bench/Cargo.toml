@@ -1,0 +1,31 @@
+[package]
+name = "socket-patch-bench"
+description = "Benchmark harness for `socket-patch scan`: synthetic projects, a local patch API, and A/B regression checks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "socket-patch-bench"
+path = "src/main.rs"
+
+# Only crates the workspace already pins: the harness adds nothing to
+# Cargo.lock that the CLI's own tests do not already pull in.
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sha1 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+tempfile = { workspace = true }
+regex = { workspace = true }
+# uv's hosted rewrite reads the patched wheel's METADATA, so the mock
+# serves real (tiny) wheels.
+zip = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

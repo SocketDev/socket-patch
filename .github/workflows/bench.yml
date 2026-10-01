@@ -1,0 +1,191 @@
+name: Benchmarks
+
+# Performance gate for `socket-patch scan` (crates/socket-patch-bench; its
+# README has the details). Builds the pull request's base and head with the
+# same profile on one runner, times both on a synthetic project per package
+# manager against a local patch API (interleaved: base, head, head, base,
+# ...), and fails when the head
+#   - is significantly slower (wall or CPU time; median of the paired
+#     head/base ratios past the threshold with its 95% interval above 1,
+#     confirmed by a second round of pairs),
+#   - uses significantly more memory,
+#   - makes more API requests, or
+#   - no longer does a scenario's work (scan counts, redirected patches,
+#     rewritten files).
+# The job summary carries the full table; results.json is uploaded.
+#
+# An intentional slowdown: label the PR `performance-regression-accepted`.
+# The comparison still runs and reports, but a regression no longer fails
+# the job (a head that fails a scenario's validation still does).
+#
+# On main, each push is compared against the commit before it and recorded
+# (an artifact per push) without failing on regressions.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - '.github/workflows/bench.yml'
+      - '.cargo/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'rust-toolchain.toml'
+      - 'crates/socket-patch-bench/**'
+      - 'crates/socket-patch-cli/Cargo.toml'
+      - 'crates/socket-patch-cli/build.rs'
+      - 'crates/socket-patch-cli/src/**'
+      - 'crates/socket-patch-core/Cargo.toml'
+      - 'crates/socket-patch-core/src/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bench.yml'
+      - '.cargo/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'rust-toolchain.toml'
+      - 'crates/socket-patch-bench/**'
+      - 'crates/socket-patch-cli/Cargo.toml'
+      - 'crates/socket-patch-cli/build.rs'
+      - 'crates/socket-patch-cli/src/**'
+      - 'crates/socket-patch-core/Cargo.toml'
+      - 'crates/socket-patch-core/src/**'
+  workflow_dispatch:
+    inputs:
+      base:
+        description: 'Commit or ref to compare HEAD against (default: the parent commit)'
+        required: false
+        default: ''
+      filter:
+        description: 'Only scenarios matching this regex (see `socket-patch-bench list`)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: scan performance
+    # Labels re-trigger the workflow; only this one changes the outcome.
+    if: >-
+      (github.event.action != 'labeled' && github.event.action != 'unlabeled')
+      || github.event.label.name == 'performance-regression-accepted'
+    # Job-level, so an unrelated label (skipped above) cannot cancel a run
+    # in progress. A newer push to the same PR supersedes the older run.
+    concurrency:
+      group: bench-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Both sides build with these, so a base that predates the `perf`
+      # profile (or carries an older copy of it) builds the same way.
+      CARGO_PROFILE_PERF_INHERITS: release
+      CARGO_PROFILE_PERF_LTO: thin
+      CARGO_PROFILE_PERF_STRIP: none
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          # The parent is the baseline: for a pull request, the merge
+          # commit's first parent is exactly the base it was merged onto.
+          fetch-depth: 2
+
+      - name: Install Rust
+        # rustup is pre-installed; `rustup show` installs the
+        # rust-toolchain.toml channel.
+        run: rustup show
+
+      - name: Cache cargo
+        # Swatinem/rust-cache, main-only saves: see ci.yml.
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Resolve the baseline commit
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          INPUT_BASE: ${{ inputs.base }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            push) ref="$PUSH_BEFORE" ;;
+            workflow_dispatch) ref="${INPUT_BASE:-HEAD^1}" ;;
+            *) ref="HEAD^1" ;;
+          esac
+          if ! git rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then
+            git fetch --quiet --depth 1 origin "$ref"
+            ref=FETCH_HEAD
+          fi
+          sha="$(git rev-parse "$ref^{commit}")"
+          echo "Baseline: $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Build head
+        run: |
+          set -euo pipefail
+          BENCH="$RUNNER_TEMP/bench"
+          cargo build --locked --profile perf -p socket-patch-cli -p socket-patch-bench
+          mkdir -p "$BENCH/head"
+          cp target/perf/socket-patch "$BENCH/head/"
+          cp target/perf/socket-patch-bench "$BENCH/"
+
+      - name: Build base
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          BENCH="$RUNNER_TEMP/bench"
+          git worktree add --detach "$BENCH/base-src" "$BASE_SHA"
+          # Same target directory: the dependencies are already built, only
+          # the workspace crates compile again (unless the base pins another
+          # toolchain, which `rustup show` installs first).
+          (cd "$BENCH/base-src" && rustup show >/dev/null && \
+            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+            cargo build --locked --profile perf -p socket-patch-cli)
+          mkdir -p "$BENCH/base"
+          cp target/perf/socket-patch "$BENCH/base/"
+          "$BENCH/base/socket-patch" --version
+          "$BENCH/head/socket-patch" --version
+
+      - name: Compare
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ACCEPTED: ${{ contains(github.event.pull_request.labels.*.name, 'performance-regression-accepted') }}
+          FILTER: ${{ inputs.filter }}
+        run: |
+          set -euo pipefail
+          BENCH="$RUNNER_TEMP/bench"
+          args=()
+          if [ "$EVENT_NAME" != pull_request ] || [ "$ACCEPTED" = true ]; then
+            args+=(--no-fail)
+          fi
+          if [ -n "${FILTER:-}" ]; then
+            args+=(--filter "$FILTER")
+          fi
+          "$BENCH/socket-patch-bench" compare \
+            --base "$BENCH/base/socket-patch" \
+            --head "$BENCH/head/socket-patch" \
+            --work-dir "$BENCH/work" \
+            --out "$BENCH/out" \
+            ${args[@]+"${args[@]}"}
+
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f "$RUNNER_TEMP/bench/out/summary.md" ]; then
+            cat "$RUNNER_TEMP/bench/out/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: bench-scan
+          path: ${{ runner.temp }}/bench/out/
+          if-no-files-found: warn
+          retention-days: 90
