@@ -620,16 +620,27 @@ async fn gem_pre_checksums_states() {
 
 #[tokio::test]
 #[serial]
-async fn gem_transitive_without_proof_stays_declared() {
-    // The rewriter's append for a transitive gem is indistinguishable from a
-    // direct last-line declaration, so it is kept as a direct exact pin.
+async fn gem_transitive_append_round_trips_unless_unprovable() {
+    // #457: on a Gemfile ending in a declaration line, the rewriter's own
+    // append for a transitive gem is undone byte for byte: no new `gem`
+    // line, no `(= version)` DEPENDENCIES pin freezing the version.
     let gemfile = "source \"https://rubygems.org\"\n\ngem \"puma\"\n";
     let lock = transitive_lock().replace("  rails (= 7.0.0)\n", "");
     let case = synthetic(
-        "transitive-ambiguous",
+        "transitive-appended",
         &[("Gemfile", gemfile), ("Gemfile.lock", &lock)],
         gem_override("zeitwerk", "2.6.0"),
     );
+    let (after, statuses) = gem_run(&case).await;
+    assert_round_trip(&case, &after, &statuses);
+
+    // An append with no blank line before it (what releases before #457
+    // wrote) is indistinguishable from a direct last-line declaration, so
+    // it is kept as a direct exact pin.
+    let mut case = case.clone_with("transitive-ambiguous");
+    let legacy = case.expected["Gemfile"].replace("\n\nsource", "\nsource");
+    assert_ne!(legacy, case.expected["Gemfile"]);
+    case.expected.insert("Gemfile".into(), legacy);
     let (after, statuses) = gem_run(&case).await;
     assert_eq!(statuses[0].1, PinStatus::Restored);
     assert_eq!(after["Gemfile"], format!("{gemfile}gem \"zeitwerk\", \"2.6.0\"\n"));
