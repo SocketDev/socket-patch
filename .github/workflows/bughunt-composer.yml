@@ -1,0 +1,121 @@
+name: bughunt composer global probe
+on:
+  push:
+    branches: ['bughunt/composer/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    name: ${{ matrix.os }} / composer ${{ matrix.composer }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        composer: ['1.10.28', '2.2.30', '2.10.3']
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: bughunt-composer-global
+          save-if: false
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: ${{ matrix.composer == '1.10.28' && '8.1' || '8.4' }}
+          tools: composer:${{ matrix.composer }}
+          extensions: zip, mbstring, curl, openssl
+          coverage: none
+      - run: cargo build --release -p socket-patch-cli
+      - name: Write mock
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/m"
+          cat > "$RUNNER_TEMP/m/mock.py" <<'EOF'
+          import json,base64,hashlib,sys,re
+          from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+          ORIG=open(sys.argv[2],'rb').read(); PAT=open(sys.argv[3],'rb').read()
+          FILE=sys.argv[4]; NAME=sys.argv[5]; VER=sys.argv[6]
+          def gh(b): return hashlib.sha256(b"blob %d\0"%len(b)+b).hexdigest()
+          UUID="11111111-2222-4333-8444-555555555555"
+          PURL=f"pkg:composer/{NAME}@{VER}"
+          LOG=open(sys.argv[7],'a')
+          class H(BaseHTTPRequestHandler):
+            def _j(self,o,c=200):
+              b=json.dumps(o).encode(); self.send_response(c); self.send_header('content-type','application/json'); self.send_header('content-length',str(len(b))); self.end_headers(); self.wfile.write(b)
+            def do_POST(self):
+              n=int(self.headers.get('content-length',0)); body=self.rfile.read(n).decode()
+              LOG.write(f"POST {self.path} {body}\n"); LOG.flush()
+              if self.path.endswith('/batch'):
+                req=json.loads(body); comps=[c.get('purl') for c in req.get('components',[])]
+                pk=[{"purl":p,"patches":[{"uuid":UUID,"purl":PURL,"tier":"free","cveIds":["CVE-2026-0001"],"ghsaIds":["GHSA-aaaa-bbbb-cccc"],"severity":"high","title":"t"}]} for p in comps if p and p.split('@')[0]==PURL.split('@')[0]]
+                return self._j({"packages":pk,"canAccessPaidPatches":False})
+              self._j({},404)
+            def do_GET(self):
+              LOG.write(f"GET {self.path}\n"); LOG.flush()
+              if '/blob/' in self.path:
+                h=self.path.rsplit('/',1)[1]; m={gh(ORIG):ORIG,gh(PAT):PAT}
+                if h in m:
+                  b=m[h]; self.send_response(200); self.send_header('content-length',str(len(b))); self.end_headers(); self.wfile.write(b); return
+              if '/view/' in self.path:
+                return self._j({"uuid":UUID,"purl":PURL,"publishedAt":"2026-01-01T00:00:00Z","files":{f"package/{FILE}":{"beforeHash":gh(ORIG),"afterHash":gh(PAT),"blobContent":base64.b64encode(PAT).decode(),"beforeBlobContent":base64.b64encode(ORIG).decode()}},"vulnerabilities":{"GHSA-aaaa-bbbb-cccc":{"cves":["CVE-2026-0001"],"summary":"s","severity":"high","description":"d"}},"description":"x","license":"MIT","tier":"free"})
+              if '/by-package/' in self.path or '/by-' in self.path:
+                return self._j({"patches":[{"uuid":UUID,"purl":PURL,"publishedAt":"2026-01-01T00:00:00Z","description":"x","license":"MIT","tier":"free","vulnerabilities":{"GHSA-aaaa-bbbb-cccc":{"cves":["CVE-2026-0001"],"summary":"s","severity":"high","description":"d"}}}],"canAccessPaidPatches":False})
+              self._j({},404)
+            def log_message(self,*a): pass
+          ThreadingHTTPServer(('127.0.0.1',int(sys.argv[1])),H).serve_forever()
+          EOF
+      - name: Probe global mode
+        shell: bash
+        run: |
+          set +e
+          T="$RUNNER_TEMP"; if command -v cygpath >/dev/null; then T="$(cygpath -m "$RUNNER_TEMP")"; fi
+          B="$PWD/target/release/socket-patch"; [ -f "$B.exe" ] && B="$B.exe"
+          export COMPOSER_ALLOW_SUPERUSER=1 SOCKET_TELEMETRY_DISABLED=1 COMPOSER_NO_INTERACTION=1
+          unset COMPOSER_HOME
+          composer --version
+          mkdir -p "$T/pkg/bin" "$T/pkg/src" "$T/work"
+          printf '{"name":"acme/tool","version":"1.0.0","type":"library","bin":["bin/acme-tool"]}\n' > "$T/pkg/composer.json"
+          printf '<?php\nnamespace Acme\\Tool;\nfunction msg() { return "VULNERABLE"; }\n' > "$T/pkg/src/Msg.php"
+          printf '#!/usr/bin/env php\n<?php\nrequire __DIR__."/../src/Msg.php";\necho \\Acme\\Tool\\msg(), "\\n";\n' > "$T/pkg/bin/acme-tool"
+          cp "$T/pkg/src/Msg.php" "$T/orig.php"; sed 's/VULNERABLE/PATCHED/' "$T/orig.php" > "$T/patched.php"
+          python3 "$RUNNER_TEMP/m/mock.py" 18999 "$T/orig.php" "$T/patched.php" src/Msg.php acme/tool 1.0.0 "$T/mock.log" &
+          sleep 3
+          A="--api-url http://127.0.0.1:18999 --org o --api-token fake --ecosystems composer"
+          R() { echo "RESULT ${{ matrix.os }} composer-${{ matrix.composer }} $1 $2"; }
+          REPO='{"type":"path","url":"'"$T/pkg"'","options":{"symlink":false}}'
+          # --- 1. default home
+          GH="$(composer global config home 2>/dev/null | tail -1)"; echo "default home: $GH"
+          composer global config repositories.local "$REPO"
+          composer global require acme/tool:1.0.0 2>&1 | tail -3
+          F="$GH/vendor/acme/tool/src/Msg.php"; grep -o 'VULNERABLE\|PATCHED' "$F"
+          cd "$T/work"
+          "$B" scan -g --json $A > s.json 2>s.err; echo "scan exit $?"
+          N=$(python3 -c "import json;print(json.load(open('s.json')).get('packagesWithPatches'))"); [ "$N" = 1 ] && R scan-g pass || { R scan-g "fail($N)"; cat s.err; }
+          "$B" scan -g --mode hosted $A >/dev/null 2>h.err; e=$?; [ $e = 2 ] && R hosted-refusal pass || R hosted-refusal "fail(exit $e)"
+          "$B" scan -g --mode agent --yes $A 2>&1 | tail -2
+          grep -q PATCHED "$F" && R apply-g pass || R apply-g fail
+          "$B" vex -g $A --product pkg:composer/x@1 -O v.json 2>&1 | tail -1
+          N=$(python3 -c "import json;print(len(json.load(open('v.json'))['statements']))" 2>/dev/null); [ "$N" = 1 ] && R vex-g pass || R vex-g "fail($N)"
+          "$B" rollback -g $A --yes 2>&1 | tail -1
+          cmp -s "$F" "$T/orig.php" && R rollback-g pass || R rollback-g fail
+          # --- 2. composer NOT on PATH, default home (fallback resolution)
+          CDIR="$(dirname "$(command -v composer)")"; echo "composer dir: $CDIR"
+          NP="$(echo "$PATH" | tr ':' '\n' | grep -vxF "$CDIR" | paste -sd: -)"
+          PATH="$NP" bash -c 'command -v composer || echo "composer not on PATH"'
+          PATH="$NP" "$B" scan -g --json $A > s2.json 2>s2.err
+          N=$(python3 -c "import json;print(json.load(open('s2.json')).get('packagesWithPatches'))"); [ "$N" = 1 ] && R scan-g-no-composer-on-path pass || { R scan-g-no-composer-on-path "fail($N)"; tail -2 s2.err; }
+          # --- 3. custom global vendor-dir (explicit COMPOSER_HOME)
+          export COMPOSER_HOME="$T/ch2"; mkdir -p "$COMPOSER_HOME"
+          composer global config repositories.local "$REPO"
+          composer global config vendor-dir deps
+          composer global require acme/tool:1.0.0 2>&1 | tail -1
+          ls "$COMPOSER_HOME"
+          "$B" scan -g --json $A > s3.json 2>s3.err
+          N=$(python3 -c "import json;print(json.load(open('s3.json')).get('packagesWithPatches'))"); [ "$N" = 1 ] && R scan-g-vendor-dir pass || { R scan-g-vendor-dir "fail($N)"; tail -2 s3.err; }
+          "$B" scan -g --mode agent --yes $A 2>&1 | tail -1
+          grep -q PATCHED "$COMPOSER_HOME/deps/acme/tool/src/Msg.php" && R apply-g-vendor-dir pass || R apply-g-vendor-dir fail
+          exit 0
