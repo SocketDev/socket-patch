@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-01 (run 4), main `d984832`, latest release 4.0.0.
+Last updated: 2026-10-01 (run 5), main `61cfb9b`, latest release 4.0.0, latest Bun 1.4.2.
 
 Method: real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` to the mock. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -41,6 +41,24 @@ Untested: a non-writable global dir, a symlinked `BUN_INSTALL`, and Bun 1.0.x.
 | Linux | 1.4.2 | text v2 / lockb | fail #469 | fail #469 | fail #469 | fail #469 | pass | fail #469 |
 | macOS, Windows | all | all | untested | untested | untested | untested | untested | untested |
 
+### Non-registry copies of a patched `name@version` (run 5, Linux)
+
+| Bun | lock | URL tgz + nested registry copy: scan warns | root copy patched after frozen install | vendored `vex` | hosted `vex` | hosted `vex --no-verify` | URL-only refusal |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1.1.45 | text v0 | fail #497 | fail #497 | fail #497 (attests) | pass (`not_applied`) | fail #497 | untested |
+| 1.2.23 | text v1 | fail #497 | fail #497 | fail #497 | pass | fail #497 | untested |
+| 1.3.14 | text v1 | fail #497 | fail #497 | fail #497 | pass | untested | untested |
+| 1.4.2 | text v2 (URL and `file:` tgz) | fail #497 | fail #497 | fail #497 | pass | fail #497 | pass |
+| any | `bun.lockb`, `github:` tuples | untested | untested | untested | untested | untested | untested |
+| macOS, Windows | all | untested | untested | untested | untested | untested | untested |
+
+### Lock-shape edge cases (run 5, Linux)
+- CRLF `bun.lock` + CRLF `package.json` (1.1.45 v0, 1.3.14, 1.4.2): hosted scan → frozen install → `rollback`, and vendored → `vendor --revert`. Both byte-exact: pass.
+- `bun install --yarn` (sibling `yarn.lock`), on 1.1.45 lockb, 1.2.23 and 1.4.2: hosted rewires both locks; lockb `rollback` refuses and touches neither file: pass.
+- `[install.scopes]` custom-registry scope (1.3.14, 1.4.2): hosted rewrite and byte-exact rollback: pass.
+- 1.1.45 binary workspace lock, hosted, read by 1.1.45 / 1.2.23 / 1.3.14 / 1.4.2. Frozen installs are patched, the takeover refuses as documented, and `vex` is correct: pass.
+- `bun add` after hosted (all four versions; the pins survive) and after vendored (digest-less re-save on < 1.3.10, healed by the re-run): pass.
+
 ### Takeovers and vendored VEX (run 4, Linux)
 - Hosted → vendored on a v1 workspace lock (1.3.14): pass. Refuses before any write; dry-run parity is as documented.
 - Vendored + isolated linker, stale tree → `vendored_tree_out_of_sync` is missing (1.4.2): fail, under #405 (comment). Hoisted control: pass.
@@ -58,13 +76,13 @@ Other passes (Linux, 1.4.2 unless noted):
 
 ## Backlog
 
-0. **Maintainer request (partly covered in run 3):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly; a symlinked `BUN_INSTALL`; Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. Re-test #443 (still reproduces on `d984832`) and #434 (`bun.cmd`) once PR #442 lands. Checklist: the 20261001T040000Z entry.
-1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. The sandbox can't delete branches.
-2. #469 follow-ups: macOS/Windows cells; `bundled` inside a workspace member; `rollback` / `remove` of a rewired bundled entry; re-test when fixed.
-3. Re-check the #405 vendored warning once the `.bun` store lookup lands (#366).
-4. Windows agent mode with the isolated linker (junctions) once #366 lands. VEX after a real frozen hosted install on Windows.
+0. **Maintainer request (partly covered in run 3):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly; a symlinked `BUN_INSTALL`; Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. Re-test #443 (still reproduces on `61cfb9b`) and #434 (`bun.cmd`) once PR #442 lands. Checklist: the 20261001T040000Z entry.
+1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. The sandbox can't delete branches (still denied in run 5), so no new probes until that's fixed.
+2. #497 variants: `github:` tuples (unresolvable in the sandbox, needs a probe) and a binary `bun.lockb` with a URL dependency. Re-test when fixed.
+3. #469 follow-ups: macOS/Windows cells; `bundled` inside a workspace member; `rollback` / `remove` of a rewired bundled entry; re-test when fixed.
+4. Re-test #366 once `.bun` joins the crawler walks (#365 landed without it). Then re-check the #405 vendored warning and Windows agent mode with the isolated linker (junctions).
 5. v5 `socket.yml` policy and per-run limits in a Bun workspace.
-6. Hosted rollback on macOS and Windows (CRLF lock on Windows checkouts with `core.autocrlf`).
+6. Hosted rollback on real macOS and Windows checkouts (Linux CRLF analog passes, run 5).
 7. Digest boundary with a valid substitute tarball, 1.3.9 text lock vs 1.3.10. Low priority: Bun < 1.3.10 is a documented limitation.
 
 ## Known non-bugs
@@ -84,3 +102,8 @@ Other passes (Linux, 1.4.2 unless noted):
 - Vendored `vex` attests from the committed artifact even when the installed tree is stale. By design: only a `vendored_tree_out_of_sync` warning is owed.
 - Hosted default `vex` on a bundled-copy project correctly refuses (`not_applied`). #469 is about vendored mode and `--no-verify`.
 - `bun pm bin -g` ignores a project-local `bunfig.toml`, so `scan -g` inside a project can't be redirected by the project.
+- Vendored, then `bun add`, on Bun < 1.3.10 re-saves the local tuples without `sha512`. That's documented ("Digest-less re-saves"): the vendored re-run reports `already_vendored` and re-pins the digest.
+- Bun records `""` as the registry field of a tuple even when it came from an `[install.scopes]` or custom default registry, so rollback restoring `""` is correct.
+- On a `bun install --yarn` project, hosted `rollback` restores `bun.lock` byte-exact but adds a `#<sha1>` fragment to Bun's `yarn.lock` `resolved` lines. It's semantically equivalent and yarn-classic's rewriter, so it isn't filed as a Bun bug.
+- Mock fixture: build the patched tarball with a fixed gzip mtime. Otherwise a mock restart changes its sha512 and later installs fail `IntegrityCheckFailed`.
+- `link:` deps need `bun link` registration, and `github:` deps don't resolve in the sandbox. Both are environment limits.
