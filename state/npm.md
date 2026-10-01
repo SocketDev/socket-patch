@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-01 (run 3 with a ledger), main `2463257` (the **v5 consolidation**, #277; the binary still reports 4.0.0), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`.
+Last updated: 2026-10-01 12:26Z (run 4 with a ledger), main `2463257` (the **v5 consolidation**, #277; the binary still reports 4.0.0), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`.
 
 ## Coverage matrix
 
@@ -9,11 +9,11 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 | OS | npm | Agent (apply / scan --mode agent) | Vendored | Hosted (v5 default) | Global `-g` (scan report / get+apply / vex / rollback) |
 | --- | --- | --- | --- | --- | --- |
 | Linux | 6.14.18 | fail #356 (v4). pass: `-g` (v4) | pass: nested v2 lock (v4). fail #432 (alias mirror) | pass: v1-lock cycle (npm 6 installs the patched bytes). v1 alias: not wired (#432) | pass (v4) |
-| Linux | 8.19.4 | fail #356 (v4), #403 (v4) | fail #326 (v4), #432 | pass: nested v2 cycle. fail #432 (alias mirror, npm 6 consumer) | untested |
+| Linux | 8.19.4 | fail #356 (v4), #403 (v4) | fail #326 (v4), #432 | pass: nested v2 cycle, `overrides` (flat, alias, nested). fail #432 (alias mirror, npm 6 consumer) | untested |
 | Linux | 9.9.4 | pass `-g` (v4) | pass (suites, v4) | pass (suites, v4) | pass (v4) |
-| Linux | 10.9.7 | fail #356 (re-checked on v5), #403 (re-checked on v5), #359 (v4) | pass (v4). fail #324, #325, #326 (v4) | pass: cycles (plain, alias, nested), stale tree, lockfile-only, dry-run, rescan no-op, nested project (loud) | pass: all four, `--global-prefix`, `SOCKET_GLOBAL`, `--mode hosted` refused |
-| Linux | 11.20.0 | pass (v4). fail #403 (v4) | pass (v4). fail #326 (v4) | pass: scoped, duplicate nested workspace copies, dual-lock drift, `omit-lockfile-registry-resolved` | untested |
-| Linux | 12.1.0 | fail #356, #359, #403 (v4) | pass: hosted→vendored takeover + rollback, `repair` | pass: workspace + alias cycle, dual-lock, drift, `npm install <pkg>` keeps the pin, path-scoped rollback, remove. fail #433 | pass: all four |
+| Linux | 10.9.7 | fail #356 (re-checked on v5), #403 (re-checked on v5), #359 (v4). `get` rerun after reinstall: fail #454 (dup) | pass (v4). fail #324, #325, #326 (v4) | pass: cycles (plain, alias, nested), stale tree, lockfile-only, dry-run, rescan no-op, nested project (loud), `registry=` mirror, `.npmrc` variants, `overrides`, policy (`--package`, `maxNewPatches`, `ignorePackages`, `minSeverity`). fail #324, #325 (re-checked on v5) | pass: all four, `--global-prefix`, `SOCKET_GLOBAL`, `--mode hosted` refused. fail #464 (report-only hint has no `-g`) |
+| Linux | 11.20.0 | pass (v4). fail #403 (v4) | pass (v4). fail #326 (v4) | pass: scoped, duplicate nested workspace copies, dual-lock drift, `omit-lockfile-registry-resolved`, `overrides`, `install-strategy=linked/nested/shallow` | untested |
+| Linux | 12.1.0 | fail #356, #359, #403 (v4) | pass: hosted→vendored takeover + rollback, `repair` | pass: workspace + alias cycle, dual-lock, drift, `npm install <pkg>` keeps the pin, path-scoped rollback, remove, `registry=` mirror, CRLF / spaced `.npmrc`. fail #433 | pass: all four |
 | macOS | 10.9.7 | fail #356, #359, #403 (v4) | pass (v4) | pass: cycle (probe) | pass: all four (custom prefix) |
 | macOS | 12.1.0 | fail #356, #359, #403 (v4) | pass (v4) | pass: cycle (probe) | pass: all four (custom prefix) |
 | Windows | 10.9.7 | fail #403 (v4) | pass (v4). #324 (v4) | pass: cycle (probe) | **fail #434** (default and custom prefix; `--global-prefix` works) |
@@ -22,13 +22,12 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 
 ## Backlog
 
-1. **Maintainer request (global `-g`), still open:** Linux, macOS and Windows are covered for npm 10/12 (Windows is #434). Remaining: npm 6/8/11 on macOS and Windows; an unwritable prefix (root-owned / `Program Files`; the sandbox runs as root); nvm, volta, fnm and Homebrew prefixes on macOS; and `%APPDATA%\npm` once #434 is fixed. Full checklist in the 20261001T040000Z entry.
-2. Hosted mode with an `.npmrc` `registry=` mirror or a scoped registry: what rollback restores to, and whether `npm ci` works afterwards.
+1. **Maintainer request (global `-g`), still open:** Linux, macOS and Windows are covered for npm 10/12 (Windows is #434). Remaining: npm 6/8/11 on macOS and Windows; an unwritable prefix (root-owned / `Program Files`); nvm, volta, fnm and Homebrew prefixes on macOS; and `%APPDATA%\npm` once #434 is fixed. Full checklist in the 20261001T040000Z entry. (Linux non-root read-only checks: see #424 and #454.)
+2. Node 18 with npm 9/10, and npm 12 on Node 26.
 3. `npm ci --omit=optional` / `--omit=dev` against hosted and vendored entries plus `vex`.
-4. v5 `socket.yml` policy (`minSeverity`, `maxNewPatches`) and the `--package` filter on npm workspaces and aliases.
-5. Node 18 with npm 9/10, and npm 12 on Node 26.
-6. Re-verify the (v4) agent and vendored cells on v5 (#324, #325, #326 and #359 on the new main).
-7. Stale probe branches the proxy can't delete (`git push --delete` prints "Everything up-to-date"): `bughunt/npm/20260930-alias-linked`, `20260930-win-mac-e2e`, `20260930-win-old-npm`, `20261001-crlf-paths`, `20261001-optional-dep`, `20261001-v5-hosted-global`, `20261001-win-global`. A maintainer needs to delete them.
+4. Re-verify #326 (git deps) and #359 (linked transitive, agent) on v5.
+5. After #456 merges, re-check the npm `get`/`scan --mode agent` rerun case (#454).
+6. Stale probe branches the proxy can't delete (`git push --delete` prints "Everything up-to-date"): `bughunt/npm/20260930-alias-linked`, `20260930-win-mac-e2e`, `20260930-win-old-npm`, `20261001-crlf-paths`, `20261001-optional-dep`, `20261001-v5-hosted-global`, `20261001-win-global`. A maintainer needs to delete them.
 
 ## Known non-bugs
 
@@ -57,3 +56,7 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 - Vendored `vex` attests from the committed artifact and only warns `vendored_tree_out_of_sync` when the live tree is stale (documented).
 - `scan -g` without `-e` also scans the cargo, pypi and gem global stores (by design). `vex -g` outside a project needs `--product`.
 - v5 removes `setup`, so the setup-hook cells are retired.
+- Hosted `rollback` restores `resolved` to `registry.npmjs.org` (or `SOCKET_NPM_REGISTRY`) even when the project `.npmrc` uses a `registry=` mirror. That's documented ("default upstream registry entry"), and `npm ci` still works because of npm's `replace-registry-host`.
+- `--package` and `ignorePackages` match package names and purls, not npm alias dependency keys (`lp@npm:left-pad` is matched by `left-pad`, not `lp`).
+- npm 12 ignores `ALLOW-REMOTE=` and `allow_remote=` keys in `.npmrc`, so socket-patch appending `allow-remote=all` after them is correct.
+- `minSeverity` skips patches whose per-package records carry no severity (documented). Mocks must fill `vulnerabilities` in `by-package`.
