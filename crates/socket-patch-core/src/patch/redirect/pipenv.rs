@@ -482,10 +482,7 @@ mod tests {
             let original = serde_json::to_string(&value).unwrap();
             // A live lock (Pipfile beside it): conflicts veto the siblings.
             let files = BTreeMap::from([
-                (
-                    "Pipfile".to_string(),
-                    "[packages]\nurllib3 = \"*\"\n".to_string(),
-                ),
+                ("Pipfile".to_string(), "[packages]\nurllib3 = \"*\"\n".to_string()),
                 ("Pipfile.lock".to_string(), original),
             ]);
             let mut result = RewriteResult::default();
@@ -525,30 +522,20 @@ mod tests {
         for stale in &stale_locks {
             let files = BTreeMap::from([
                 ("Pipfile.lock".to_string(), stale.clone()),
-                (
-                    "requirements.txt".to_string(),
-                    "urllib3==1.26.18\n".to_string(),
-                ),
+                ("requirements.txt".to_string(), "urllib3==1.26.18\n".to_string()),
             ]);
-            let result =
-                super::super::rewrite_registry_redirect(&files, std::slice::from_ref(&dep));
+            let result = super::super::rewrite_registry_redirect(&files, std::slice::from_ref(&dep));
             assert!(
                 !result.refused_pipenv_uuids.contains("patch-one"),
                 "a non-conflict must not veto: {stale}"
             );
             assert!(
-                result
-                    .warnings
-                    .iter()
-                    .any(|w| w.code == "redirect_pipenv_skipped"),
+                result.warnings.iter().any(|w| w.code == "redirect_pipenv_skipped"),
                 "{:?}",
                 result.warnings
             );
             assert!(
-                result
-                    .files
-                    .get("requirements.txt")
-                    .is_some_and(|t| t.contains("patch.socket.dev")),
+                result.files.get("requirements.txt").is_some_and(|t| t.contains("patch.socket.dev")),
                 "requirements.txt must still be redirected past a stale Pipfile.lock: {result:?}"
             );
             assert!(!result.files.contains_key("Pipfile.lock"));
@@ -606,10 +593,7 @@ mod tests {
         let files = |text: &str| BTreeMap::from([("Pipfile.lock".to_string(), text.to_string())]);
         assert!(lock_targets(&files(&lock()), std::slice::from_ref(&dep)));
         assert!(!lock_targets(&files(&lock()), std::slice::from_ref(&other)));
-        assert!(!lock_targets(
-            &files("{ not json"),
-            std::slice::from_ref(&dep)
-        ));
+        assert!(!lock_targets(&files("{ not json"), std::slice::from_ref(&dep)));
         assert!(!lock_targets(&BTreeMap::new(), std::slice::from_ref(&dep)));
         let mut npm = dep.clone();
         npm.ecosystem = "npm".into();
@@ -635,10 +619,7 @@ mod tests {
         let entry: Value = serde_json::from_str(&fixed).unwrap();
         assert!(entry["default"]["urllib3"].get("version").is_none());
         assert_eq!(entry["default"]["urllib3"]["index"], json!("pypi"));
-        assert!(entry["default"]["urllib3"]["file"]
-            .as_str()
-            .unwrap()
-            .contains("patch-one"));
+        assert!(entry["default"]["urllib3"]["file"].as_str().unwrap().contains("patch-one"));
 
         value["default"]["urllib3"]["version"] = json!("==2.0.0");
         let conflicting = serde_json::to_string(&value).unwrap();
@@ -659,10 +640,7 @@ mod tests {
         assert!(owned_url(public, &dep));
         assert!(!owned_url("https://example.org/patch/pypi/urllib3/1.26.18/tok/patch-one/urllib3-1.26.18-py3-none-any.whl", &dep));
         dep.artifact_url = "https://patches.internal.example:8443/patch/pypi/urllib3/1.26.18/tok/patch-one/urllib3-1.26.18-py3-none-any.whl".into();
-        assert!(
-            owned_url(&dep.artifact_url, &dep),
-            "the grant's own origin is ours"
-        );
+        assert!(owned_url(&dep.artifact_url, &dep), "the grant's own origin is ours");
         assert!(owned_url(public, &dep), "and so is the public service");
         assert!(!owned_url("https://patches.internal.example:8443/patch/pypi/urllib3/1.26.19/tok/patch-one/urllib3-1.26.19-py3-none-any.whl", &dep), "another version is not");
         // Rotation on the custom origin re-points the owned entry.
@@ -672,6 +650,7 @@ mod tests {
         assert!(!rotation.is_empty());
         assert!(second.contains("/rotated/") && !second.contains("/tok/"));
     }
+
 }
 
 #[cfg(test)]
@@ -722,9 +701,7 @@ mod compatibility_tests {
         assert!(!result.refused_pipenv_uuids.contains("patch-one"));
         assert!(result.files["requirements.txt"].contains("patch.socket.dev"));
         assert!(!result.files.contains_key("Pipfile.lock"));
-        assert!(result
-            .warnings
-            .iter()
-            .any(|w| w.code == "redirect_pipenv_refused" && w.detail.contains("no Pipfile")));
+        assert!(result.warnings.iter().any(|w| w.code == "redirect_pipenv_refused" && w.detail.contains("no Pipfile")));
     }
+
 }

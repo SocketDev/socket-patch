@@ -958,11 +958,7 @@ impl NpmCrawler {
     /// Inside a store entry (`store_entry`) a link is a dependency edge into
     /// a sibling entry, whose own visit records that copy, so only a real
     /// directory there matches.
-    fn visit_resolver_dir(
-        nm_path: PathBuf,
-        store_entry: bool,
-        pending: &[Target],
-    ) -> ResolverVisit {
+    fn visit_resolver_dir(nm_path: PathBuf, store_entry: bool, pending: &[Target]) -> ResolverVisit {
         let listing = list_dir_sync(&nm_path);
         let probe_filter = ProbeFilter::new(&listing);
         let matched = pending

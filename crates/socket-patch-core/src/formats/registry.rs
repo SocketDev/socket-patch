@@ -67,11 +67,7 @@ const fn row(path: &'static str, ecosystem: &'static str, roles: u8) -> FormatFi
 const REGISTRY: &[FormatFile] = &[
     // ── npm family ──
     row("package-lock.json", "npm", HOSTED | VENDORED | PROBE | ROOT),
-    row(
-        "npm-shrinkwrap.json",
-        "npm",
-        HOSTED | VENDORED | PROBE | ROOT,
-    ),
+    row("npm-shrinkwrap.json", "npm", HOSTED | VENDORED | PROBE | ROOT),
     row(
         "pnpm-lock.yaml",
         "npm",
@@ -118,11 +114,7 @@ const REGISTRY: &[FormatFile] = &[
     row(".cargo/config", "cargo", HOSTED | VENDORED | PROBE),
     // ── composer ──
     row("composer.json", "composer", VENDORED),
-    row(
-        "composer.lock",
-        "composer",
-        HOSTED | VENDORED | PROBE | ROOT,
-    ),
+    row("composer.lock", "composer", HOSTED | VENDORED | PROBE | ROOT),
     // ── nuget ──
     row("nuget.config", "nuget", HOSTED | PROBE),
     row("NuGet.config", "nuget", HOSTED | PROBE),
@@ -217,11 +209,7 @@ mod tests {
         paths.dedup();
         assert_eq!(before, paths.len(), "duplicate registry path");
         for f in REGISTRY.iter().filter(|f| f.has(ROOT)) {
-            assert!(
-                !f.path.contains('/'),
-                "{}: a root marker is a basename",
-                f.path
-            );
+            assert!(!f.path.contains('/'), "{}: a root marker is a basename", f.path);
         }
     }
 

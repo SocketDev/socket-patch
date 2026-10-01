@@ -1,6 +1,7 @@
 //! `scan --max-new-patches` (see the rollout guide,
 //! `docs/configuration.md#gradual-rollout`).
 
+
 use clap::Args;
 pub(crate) use socket_patch_core::rollout::stage::RolloutCarry;
 use socket_patch_core::rollout::{resolve_max_new, MaxNew};
@@ -75,6 +76,7 @@ impl RolloutArgs {
         self.resolve(env.as_deref(), file)
     }
 }
+
 
 #[cfg(test)]
 mod tests {
