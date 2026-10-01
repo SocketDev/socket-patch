@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Cargo bug-hunt routine (label pm:cargo).
 
-Last updated: 2026-10-01 (run 5), main `6e7ef74` (no cargo code changes since `2463257`, the v5 consolidation #277; CLI reports 4.0.0), latest release 4.0.0.
+Last updated: 2026-10-01 (run 6), main `61cfb9b` (no cargo crawler, format or VEX code changes since `2463257`, the v5 consolidation #277; CLI reports 4.0.0), latest release 4.0.0.
 
 ## Coverage matrix
 
@@ -8,25 +8,26 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real cargo build (`
 
 Cells marked (pre-v5) were last verified on `f6b7fb9` and need a re-check on v5.
 
-| OS | cargo | Agent `vendor/` (source replacement) | Agent custom vendor dir / member cwd | Agent two index dirs (#339 family) | Agent→vendored takeover + rollback | Vendored (CRLF, BOM, ws, existing `[patch]`, re-run, repair) | Hosted extra shapes | Agent after prior build (target/ cache) | Hosted `registry = "crates-io"` | Agent rollback of `cargo vendor` `.cargo-checksum.json` | Hosted `--cwd` = workspace member | Global `-g`: scan report / hosted refusal / apply / rollback / vex | Hosted in a `cargo vendor` project (source replacement) | Vendored BOM+CRLF workspace / member refusal / `exclude` | Hosted with user `[patch.crates-io]` (same crate / unrelated used / unrelated unused) / path dep refusal |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 1.56.1 | pass (probe, pre-v5) | fail #338 (probe) | n/a | untested | untested | untested | fail #387 | untested | untested | untested | untested | untested | untested | untested |
-| Linux | 1.84.1 | untested | untested | fail #339 | untested | untested | untested | fail #387 | untested | untested | untested | untested | untested | untested | untested |
-| Linux | 1.93.1 | pass | fail #338 | fail #339 (re-confirmed on v5, also under `-g`) | fail #336 (re-confirmed on v5) | pass (pre-v5; repo suites pass on v5) | pass (pre-v5 list, plus v5: `[registries.other]` config, CRLF config, dead-index remove fails loudly) | fail #387 (pre-v5) | fail #386 (re-confirmed on v5) | fail #416 | fail #417 | pass / pass / pass / pass / pass (plus unicode path, unwritable dir, `SOCKET_GLOBAL`, `--global-prefix`); multi-index fail #339 | fail #455 | untested | fail #480 / pass / pass / pass |
-| Linux | 1.97.0 (stable) | pass (v5) | fail #338 (v5) | untested | fail #336 (v5) | pass (repo suites, lock v1–v3) | pass (repo shapes, lock v1–v3) | fail #387 | untested | fail #416 | fail #417 | untested (the CLI path is the same as on 1.93.1) | fail #455 | pass / pass / pass | fail #480 / untested / untested / untested |
-| macOS | 1.56.1 / 1.84.1 / 1.93.1 / stable | pass (probe, pre-v5) | fail #338 (probe) | fail #339 | untested | untested | untested | untested | untested | untested (expected same) | untested | untested (needs a probe) | untested | untested | untested |
-| Windows | 1.56.1 / 1.84.1 / 1.93.1 / stable | pass (probe, stable, pre-v5) | fail #338 (probe) | fail #339 | untested | untested | untested | untested | untested | untested (expected same) | untested | untested (needs a probe) | untested | untested | untested |
+| OS | cargo | Agent `vendor/` (source replacement) | Agent custom vendor dir / member cwd | Agent two index dirs (#339 family) | Agent→vendored takeover + rollback | Vendored (CRLF, BOM, ws, existing `[patch]`, re-run, repair) | Hosted extra shapes | Agent after prior build (target/ cache) | Hosted `registry = "crates-io"` | Agent rollback of `cargo vendor` `.cargo-checksum.json` | Hosted `--cwd` = workspace member | Global `-g`: scan report / hosted refusal / apply / rollback / vex | Hosted in a `cargo vendor` project (source replacement) | Vendored BOM+CRLF workspace / member refusal / `exclude` | Hosted with user `[patch.crates-io]` (same crate / unrelated used / unrelated unused) / path dep refusal | Hosted URL-spelled `[patch]` / `[replace]` of the patched crate | Agent with user `[patch.crates-io]` override of the patched crate | Agent re-run after a registry-copy reset (#454) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Linux | 1.56.1 | pass (probe, pre-v5) | fail #338 (probe) | n/a | untested | untested | untested | fail #387 | untested | untested | untested | untested | untested | untested | untested | untested | untested | untested |
+| Linux | 1.84.1 | untested | untested | fail #339 | untested | untested | untested | fail #387 | untested | untested | untested | untested | untested | untested | untested | untested | untested | untested |
+| Linux | 1.93.1 | pass | fail #338 | fail #339 (re-confirmed on v5, also under `-g`) | fail #336 (re-confirmed on v5) | pass (pre-v5; repo suites pass on v5) | pass (pre-v5 list, plus v5: `[registries.other]` config, CRLF config, dead-index remove fails loudly) | fail #387 (pre-v5) | fail #386 (re-confirmed on v5) | fail #416 | fail #417 | pass / pass / pass / pass / pass (plus unicode path, unwritable dir, `SOCKET_GLOBAL`, `--global-prefix`); multi-index fail #339 | fail #455 | untested | fail #480 / pass / pass / pass | fail #480 / pass (refused) | fail #506 | pass |
+| Linux | 1.97.0 (stable) | pass (v5) | fail #338 (v5) | untested | fail #336 (v5) | pass (repo suites, lock v1–v3) | pass (repo shapes, lock v1–v3) | fail #387 | untested | fail #416 | fail #417 | untested (the CLI path is the same as on 1.93.1) | fail #455 | pass / pass / pass | fail #480 / untested / untested / untested | fail #480 / pass (refused) | fail #506 | pass |
+| macOS | 1.56.1 / 1.84.1 / 1.93.1 / stable | pass (probe, pre-v5) | fail #338 (probe) | fail #339 | untested | untested | untested | untested | untested | untested (expected same) | untested | untested (needs a probe) | untested | untested | untested | untested | untested | untested |
+| Windows | 1.56.1 / 1.84.1 / 1.93.1 / stable | pass (probe, stable, pre-v5) | fail #338 (probe) | fail #339 | untested | untested | untested | untested | untested | untested (expected same) | untested | untested (needs a probe) | untested | untested | untested | untested | untested | untested |
 
 ## Backlog
 
 0. **Maintainer request (Linux done in run 3):** global `-g` mode on macOS and Windows across the Cargo majors: scan report, hosted refusal, apply, rollback and vex. The full checklist is in the 20261001T040000Z entry.
-1. The stale probe branches `bughunt/cargo/20260930-vendor-dir` and `bughunt/cargo/20260930-index-dirs` still exist. `git push --delete` fails through the git proxy (HTTP 403 in runs 1 and 2, "unexpected disconnect" in runs 3–5). A maintainer needs to delete them. Until deletes work, avoid new probe branches.
-2. Hosted with `[patch."https://github.com/rust-lang/crates.io-index"]` overriding the patched crate (the URL spelling of #480), and with a user `[replace]` entry.
-3. Agent mode with a user `[patch.crates-io]` path override of the patched crate: is the patch applied to the unused registry copy, and does vex attest it?
+1. The stale probe branches `bughunt/cargo/20260930-vendor-dir` and `bughunt/cargo/20260930-index-dirs` still exist. Deleting them failed through the git proxy in runs 1–5 and was blocked by the session permission policy in run 6. A maintainer needs to delete them. Until then, avoid new probe branches.
+2. Vendored with a user `[patch."https://github.com/rust-lang/crates.io-index"]` / `[replace]` of the patched crate (does `user_authored_patch_entry` / `cargo_manifest_patch_source_alias` fire?). Needs the `tests/prebuilt_common` fixture server.
+3. Agent with a user `[patch]` in `.cargo/config.toml` / `$CARGO_HOME/config.toml`, and a git `[patch.crates-io]` override: the #506 family.
 4. Vendored on old cargo (`+1.41` / `+1.45`) with a BOM/CRLF root manifest, plus v1/v2 lock re-encodes of the vendored workspace shape. Also vendored on Windows and macOS.
-5. Re-triage #387 and #339 live once cargo code changes on main (unchanged through `6e7ef74`).
-6. The git-index dir `github.com-1ecc6299db9ec823` under `-g`, and default `~/.cargo` versus a custom `CARGO_HOME`.
-7. Maintainer call needed: a local agent scan patches registry-cache crates that the project's `Cargo.lock` doesn't contain, and `vex --product <project>` lists them (see Known non-bugs).
+5. A `-g` run from inside a cargo project that vendors the same crate (#446's `project_state_in_scope` on cargo).
+6. Re-triage #387 and #339 live once cargo code changes on main (unchanged through `61cfb9b`).
+7. The git-index dir `github.com-1ecc6299db9ec823` under `-g`, and default `~/.cargo` versus a custom `CARGO_HOME`.
+8. Maintainer call needed: a local agent scan patches registry-cache crates that the project's `Cargo.lock` doesn't contain, and `vex --product <project>` lists them (see Known non-bugs; #506 is the narrower, filed case).
 
 ## Known non-bugs
 
@@ -47,3 +48,4 @@ Cells marked (pre-v5) were last verified on `f6b7fb9` and need a re-check on v5.
 - (v5) `vendor --offline` with no committed artifact refuses `vendor_service_offline_conflict`: artifacts come from the service (`--vendor-source service` is the default, and local building was removed). Use the `tests/prebuilt_common` fixture server for vendored cells.
 - `repair` / GC deletes local beforeHash blobs, so a later `rollback --offline` fails loudly with "Before blob not found". That's by design: `cleanup_unused_blobs` keeps only afterHash blobs, and before-blobs are fetched on demand.
 - Hosted `cfg-if = { path = …, version = "1.0.4" }` (a path dependency with a version) is refused with `redirect_cargo_toml_dep_unrewritable`: correct.
+- Hosted with a legacy `[replace] "cfg-if:1.0.4" = { path = … }` is refused with `redirect_cargo_lock_pkg_ambiguous`, with nothing rewritten: correct (run 6).
