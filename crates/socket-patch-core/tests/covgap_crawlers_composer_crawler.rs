@@ -72,6 +72,10 @@ async fn get_vendor_paths_global_nonexistent_composer_home_falls_back() {
     let _composer_home = EnvVarGuard::set("COMPOSER_HOME", bogus_home.as_os_str());
     let _home = EnvVarGuard::set("HOME", tmp.path().as_os_str());
     let _path = EnvVarGuard::set("PATH", empty_path.path().as_os_str());
+    // Composer's other platform defaults (`%APPDATA%\Composer` on Windows,
+    // `$XDG_CONFIG_HOME/composer`) would outrank the HOME candidate here.
+    let _app_data = EnvVarGuard::remove("APPDATA");
+    let _xdg = EnvVarGuard::remove("XDG_CONFIG_HOME");
 
     let crawler = ComposerCrawler;
     let paths = crawler

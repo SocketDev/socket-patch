@@ -414,6 +414,12 @@ async fn get_vendor_paths_global_via_home_dot_composer_fallback() {
     std::env::remove_var("COMPOSER_HOME");
     std::env::set_var("HOME", tmp.path());
     std::env::set_var("PATH", empty_path.path());
+    // Composer's other platform defaults (`%APPDATA%\Composer` on Windows,
+    // `$XDG_CONFIG_HOME/composer`) would outrank the HOME candidates here.
+    let prev_app_data = std::env::var_os("APPDATA");
+    let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    std::env::remove_var("APPDATA");
+    std::env::remove_var("XDG_CONFIG_HOME");
 
     let crawler = ComposerCrawler;
     let opts = CrawlerOptions {
@@ -435,6 +441,12 @@ async fn get_vendor_paths_global_via_home_dot_composer_fallback() {
         std::env::set_var("PATH", v);
     } else {
         std::env::remove_var("PATH");
+    }
+    if let Some(v) = prev_app_data {
+        std::env::set_var("APPDATA", v);
+    }
+    if let Some(v) = prev_xdg {
+        std::env::set_var("XDG_CONFIG_HOME", v);
     }
 
     assert_eq!(
@@ -466,6 +478,12 @@ async fn get_vendor_paths_global_via_home_xdg_config_composer_fallback() {
     std::env::remove_var("COMPOSER_HOME");
     std::env::set_var("HOME", tmp.path());
     std::env::set_var("PATH", empty_path.path());
+    // Composer's other platform defaults (`%APPDATA%\Composer` on Windows,
+    // `$XDG_CONFIG_HOME/composer`) would outrank the HOME candidates here.
+    let prev_app_data = std::env::var_os("APPDATA");
+    let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    std::env::remove_var("APPDATA");
+    std::env::remove_var("XDG_CONFIG_HOME");
 
     let crawler = ComposerCrawler;
     let opts = CrawlerOptions {
@@ -487,6 +505,12 @@ async fn get_vendor_paths_global_via_home_xdg_config_composer_fallback() {
         std::env::set_var("PATH", v);
     } else {
         std::env::remove_var("PATH");
+    }
+    if let Some(v) = prev_app_data {
+        std::env::set_var("APPDATA", v);
+    }
+    if let Some(v) = prev_xdg {
+        std::env::set_var("XDG_CONFIG_HOME", v);
     }
 
     assert_eq!(
