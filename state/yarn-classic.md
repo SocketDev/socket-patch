@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-01 (run 2), main `f6b7fb9`, latest release v4.0.0.
+Last updated: 2026-10-01 (run 3), main `2463257` (the v5 consolidation, #277), latest release v4.0.0. The project-mode matrix below was measured on `f6b7fb9` (v4); only the cells marked "(v5)" and the global matrix were re-run on v5.
 
 ## Coverage matrix
 
@@ -14,22 +14,33 @@ Cells are "pass", "fail #N", "n/a", "CI" or "untested". H = hosted, V = vendored
 | Linux | 1.9.4 | CI | fail #364 (`--offline`) | untested | untested | untested | untested | CI | untested | untested |
 | Linux | 1.10.1 | pass | fail #364 | fail #363 | pass | pass | untested | pass | pass | pass |
 | Linux | 1.17.3 | pass (in-place) | fail #364 | untested | untested | untested | untested | pass (in-place) | untested | untested |
-| Linux | 1.22.22 | pass | fail #364 | fail #363 | pass | pass | pass | pass | pass | pass |
+| Linux | 1.22.22 | pass (v5, + hosted rollback pass) | fail #364 (v5) | fail #363 (v5; rollback also wrong) | pass | pass | pass | pass | pass | pass |
 | macOS | 1.7.0 | untested | untested | fail #363 | pass | pass | pass | pass | untested | untested |
 | macOS | 1.10.1 / 1.22.22 | pass (probe) | fail #364 | fail #363 | pass | pass | pass | pass | untested | untested |
 | Windows | 1.7.0 / 1.10.1 / 1.22.22 | pass (probe) | fail #364 (1.10.1/1.22.22) | fail #363 (vendored: `Couldn't find the binary git`) | pass | pass | pass | pass | untested | untested |
+
+### Global mode (`-g`) on v5 `2463257`
+Report = `scan -g` report-only + no leakage; refusal = `scan -g/--global-prefix/SOCKET_GLOBAL --mode hosted` exits 2; A = agent apply + import + `vex -g` + `rollback -g` byte-exact; get-mode = `get -g --mode hosted|vendored` / `scan -g --mode vendored`; RO = read-only global folder fails loudly.
+
+| OS | yarn | report | refusal | A apply/vex/rollback | get-mode | RO | custom global-folder (space+unicode) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Linux | 1.0.2 | fail #437 | pass | fail #437 | fail #436 | n/a (nothing found) | untested |
+| Linux | 1.10.1 / 1.22.22 | pass | pass | pass | fail #436 | pass (CI runner) | pass (1.22.22) |
+| macOS | 1.0.2 | fail #437 | pass | fail #437 | fail #436 | n/a | untested |
+| macOS | 1.10.1 / 1.22.22 | pass | pass | pass | fail #436 | pass | untested |
+| Windows | 1.0.2 | fail #437 / #434 | pass | fail #434 | fail #436 | untested | untested |
+| Windows | 1.10.1 / 1.22.22 | fail #434 | pass | fail #434 | fail #436 | untested | untested |
 
 Other cells that pass on Linux 1.22.22 (some also on older releases; see the entries): spaces + unicode project paths (also macOS and Windows), `npm:` alias (H skipped as documented, V rewired), `resolutions`, a `resolved` without the `#sha1` fragment / `integrity`, a local `file:` tarball dep, a non-deduplicated lock, a superseding patch on re-scan, `remove` / `repair`, VEX (installed and lock-only, after `yarn upgrade`), `yarn add` then a frozen reinstall (1.7.0 too), `yarn check --integrity` / `--verify-tree`, in-place reinstalls on 1.7–1.22, concurrent scans (`lock_held`), the GitHub shorthand dep on all 3 OSes.
 
 ## Backlog
 
-1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Yarn classic (1.x) version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
-2. Yarn ≤ 1.6 pin signals (`.yarnrc yarn-path`, `packageManager: yarn@1.x`, `engines.yarn`): does vendored mode warn or refuse? Decide whether "success, then empty node_modules" is worth a docs or refusal issue.
-3. Interrupted runs (SIGKILL mid-rewrite) and recovery; `--dry-run` byte-identity on CRLF / BOM locks.
-4. `get <uuid> --mode vendored|hosted` targeting one version of a multi-version package; `scan --prune` / `--sync` after `yarn remove`.
-5. `.yarnrc` `--install.frozen-lockfile true`, `--pure-lockfile`, and locks produced by `yarn import`.
-6. `optionalDependencies` / platform-skipped (lock-only) packages in both modes and VEX.
-7. Older yarn on macOS / Windows (1.0.2 hosted), and 1.9.4 / 1.17.3 on the probe matrix.
+1. **Maintainer request (global mode), still open:** Windows after #434 is fixed; yarn via corepack and the Windows MSI; 1.6.0 / 1.9.4 on the probe; a read-only prefix on Windows (Program Files).
+2. Re-run the project-mode matrix on v5: vendored mode with **service artifacts** (CRLF / BOM, workspaces + multi-version, `npm:` alias, offline mirror, `vendor --check`, `repair`).
+3. v5 hosted→vendored takeover and `vendor --revert` (upstream-restore based) on CRLF locks and 1.9-style locks without `integrity`: frozen-installable, CRLF preserved?
+4. Yarn ≤ 1.6 pin signals (`packageManager`, `.yarnrc yarn-path`) in vendored mode; `socket.yml` filters and `--max-new-patches` on a yarn workspace.
+5. Interrupted runs (SIGKILL mid-rewrite) and recovery; `--dry-run` byte-identity on CRLF / BOM locks.
+6. `.yarnrc` `--install.frozen-lockfile true`, `--pure-lockfile`, `yarn import` locks; `optionalDependencies` / platform-skipped packages in both modes and VEX.
 
 ## Known non-bugs
 
@@ -43,3 +54,8 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - hosted→agent / vendored→agent keep the existing wiring (`hosted_wiring_retained` / `vendored_ownership_retained`), as documented.
 - Concurrent scans: the extras fail with `lock_held` (intended).
 - Probe branches can't be deleted from the sandbox (the git proxy rejects ref deletion). Leftovers: `bughunt/yarn-classic/20260930-mirror-git`, `bughunt/yarn-classic/20261001-win-crlf-git`.
+- **v5 hosted `rollback` / `remove` need the npm registry.** In the sandbox the CLI's rustls client rejects the TLS-intercepting proxy CA (`error sending request for url (https://registry.npmjs.org/…)`). That's a sandbox artifact. Use a local plain-HTTP registry passthrough with `env -u HTTPS_PROXY -u https_proxy SOCKET_NPM_REGISTRY=http://127.0.0.1:<port>`. With `SOCKET_NPM_REGISTRY` set, the restored `resolved` uses `dist.tarball` verbatim (registry.npmjs.org), not registry.yarnpkg.com. That's by design (`npm.rs` `yarn_classic_tarball`).
+- v5 vendored mode has no local build (`--vendor-source build` is rejected). The mock must serve a `tarball` artifact from `POST …/patches/package`.
+- `scan -g` also reports npm's own bundled deps (npm global root), e.g. `@isaacs/string-locale-compare`. That's correct global discovery.
+- Probe branch `bughunt/yarn-classic/20261001-global-mode` is also left on the remote (the proxy blocks deletion).
+
