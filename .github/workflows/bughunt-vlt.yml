@@ -16,8 +16,6 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      LANG: C
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -53,6 +51,8 @@ jobs:
           const tgz = zlib.gzipSync(tarOf(PRIST)), br = zlib.brotliCompressSync(tarOf(PRIST)), ptgz = zlib.gzipSync(tarOf(PATCH));
           function wrapTar(){return zlib.gzipSync(tarFiles([['package/package.json',JSON.stringify({name:'wrapper',version:'1.0.0',main:'index.js',dependencies:{'left-pad':'1.3.0'}})+'\n'],['package/index.js',"module.exports = require('left-pad')\n"]]));}
           const wtgz = wrapTar();
+          const bpj = {name:'bundler',version:'1.0.0',main:'index.js',dependencies:{'left-pad':'1.3.0'},bundleDependencies:['left-pad']};
+          const btgz = zlib.gzipSync(tarFiles([['package/package.json',JSON.stringify(bpj)+'\n'],['package/index.js',"module.exports = require('left-pad')\n"],['package/node_modules/left-pad/package.json',JSON.stringify({name:NAME,version:VER,main:'index.js'})+'\n'],['package/node_modules/left-pad/index.js',PRIST]]));
           const artPath = `/patch/npm/${NAME}/${VER}/${TOKEN}/${UUID}/${NAME}-${VER}.tgz`;
           const log = [];
           http.createServer((req,res)=>{
@@ -69,6 +69,9 @@ jobs:
             if (u==='/wrapper/1.0.0') return j({name:'wrapper',version:'1.0.0',dist:{tarball:`${R}/wrapper/-/wrapper-1.0.0.tgz`,integrity:sri(wtgz)}});
             if (u==='/wrapper') return j({name:'wrapper','dist-tags':{latest:'1.0.0'},versions:{'1.0.0':{name:'wrapper',version:'1.0.0',main:'index.js',dependencies:{'left-pad':'1.3.0'},dist:{tarball:`${R}/wrapper/-/wrapper-1.0.0.tgz`,integrity:sri(wtgz)}}}});
             if (u==='/wrapper/-/wrapper-1.0.0.tgz') return b(wtgz);
+                      if (u==='/bundler/1.0.0') return j({...bpj,dist:{tarball:`${R}/bundler/-/bundler-1.0.0.tgz`,integrity:sri(btgz)}});
+                      if (u==='/bundler') return j({name:'bundler','dist-tags':{latest:'1.0.0'},versions:{'1.0.0':{...bpj,dist:{tarball:`${R}/bundler/-/bundler-1.0.0.tgz`,integrity:sri(btgz)}}}});
+                      if (u==='/bundler/-/bundler-1.0.0.tgz') return b(btgz);
             if (u===`/${NAME}/-/${NAME}-${VER}.tgz`) return b(tgz);
             if (u===`/${NAME}/-/${NAME}-${VER}.tar.br`) return b(br);
             if (u===artPath) return b(ptgz);
@@ -82,79 +85,28 @@ jobs:
           }).listen(PORT, '127.0.0.1', ()=>console.log('listening', PORT));
 
           MOCKEOF
-          cat > probe/gprobe.sh <<'PROBEEOF'
+          cat > probe/bprobe.sh <<'PROBEEOF'
           #!/usr/bin/env bash
-          # usage: gprobe.sh <socket-patch> <vlt.js> <mock.mjs>
+          # usage: bprobe2.sh <sp> <vlt.js> <workdir> <hosted|vendored>
           set -u
-          SP=$1; VJS=$2; MOCK=$3
+          SP=$1; VJS=$2; W=$3; MODE=$4; rm -rf "$W"; mkdir -p "$W"; cd "$W"
           export LANG=C SOCKET_NPM_REGISTRY=http://127.0.0.1:18555 SOCKET_API_URL=http://127.0.0.1:18556 SOCKET_PATCH_SERVER_URL=http://127.0.0.1:18556 SOCKET_ORG_SLUG=test-org SOCKET_API_TOKEN=fake
-          NO_ALT=1 PORT=18555 node "$MOCK" & M1=$!; NO_ALT=1 PORT=18556 node "$MOCK" & M2=$!; sleep 2
-          T=${RUNNER_TEMP:-$(mktemp -d)}; W="$T/gp$RANDOM"; mkdir -p "$W"; cd "$W"; FAIL=0
-          export XDG_CACHE_HOME="$W/.cache" XDG_DATA_HOME="$W/.data" XDG_CONFIG_HOME="$W/.config" LOCALAPPDATA="$W/.localappdata" HOME="$W/.home"; mkdir -p "$HOME"
-          export NPM_CONFIG_PREFIX="$W/gprefix" NPM_CONFIG_REGISTRY=http://127.0.0.1:18555/ NPM_CONFIG_CACHE="$W/.npmcache" NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false
-          ok() { if [ "$2" = "$3" ]; then echo "PASS $1"; else echo "FAIL $1 (got '$2' want '$3')"; FAIL=1; fi; }
-          obs() { echo "OBS  $1: $2"; }
-          vlt() { node "$VJS" "$@" >>"$W/vlt.log" 2>&1; }
-          req() { (cd "$W" && node -e "try{console.log(require(require('path').resolve(process.argv[1])))}catch(e){console.log('MISSING')}" "$1"); }
-          lp() { node -e "try{console.log(require('left-pad'))}catch(e){console.log('MISSING')}"; }
-          same() { cmp -s "$1" "$2" && echo same || echo differ; }
-          npm install -g left-pad@1.3.0 >"$W/npm.log" 2>&1; ok setup.npm.global $? 0
-          GROOT=$(npm root -g | tr -d '\r'); echo "GROOT=$GROOT"
-          G="$GROOT/left-pad"; ok setup.global "$(req "$G")" pristine; cp "$G/index.js" "$W/g.orig"
-          mkproj() { cd "$W"; rm -rf "$1"; mkdir -p "$1"; cd "$1"; echo '{"name":"app","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}' > package.json; echo '{"config":{"registries":{"npm":"http://127.0.0.1:18555/"}}}' > vlt.json; vlt install; }
-          mkproj proj; cp vlt-lock.json "$W/lock.orig"
-          # report-only scan -g
-          "$SP" scan -g --json > "$W/s1.json" 2>"$W/s1.err"; ok scan_g.rc $? 0
-          ok scan_g.found "$(node -e "const d=require(process.argv[1]);console.log(d.packagesWithPatches)" "$W/s1.json")" 1
-          ok scan_g.proj_lock "$(same "$W/lock.orig" vlt-lock.json)" same; ok scan_g.no_socket "$([ -e .socket ] && echo yes || echo no)" no
-          ok scan_g.global_untouched "$(req "$G")" pristine
-          # outside any project
-          (cd "$W" && "$SP" scan -g --json > "$W/s1o.json" 2>/dev/null); ok scan_g.outside.found "$(node -e "const d=require(process.argv[1]);console.log(d.packagesWithPatches)" "$W/s1o.json")" 1
-          # hosted refusal
-          "$SP" scan -g --mode hosted --json > /dev/null 2>&1; ok scan_g_hosted.rc $? 2
-          "$SP" scan --global-prefix "$GROOT" --mode hosted --json > /dev/null 2>&1; ok scan_prefix_hosted.rc $? 2
-          SOCKET_GLOBAL=1 "$SP" scan --mode hosted --json > /dev/null 2>&1; ok scan_envglobal_hosted.rc $? 2
-          ok hosted_refusal.proj_lock "$(same "$W/lock.orig" vlt-lock.json)" same
-          # agent apply/vex/rollback
-          "$SP" scan -g --mode agent --yes --json > "$W/a.json" 2>&1; ok agent_g.rc $? 0
-          ok agent_g.global "$(req "$G")" patched; ok agent_g.project "$(lp)" pristine
-          "$SP" vex -g --output "$W/vex.json" > /dev/null 2>&1; ok vex_g.rc $? 0
-          "$SP" rollback -g --yes --json > /dev/null 2>&1; ok rollback_g.rc $? 0
-          ok rollback_g.bytes "$(same "$G/index.js" "$W/g.orig")" same; ok rollback_g.project "$(lp)" pristine
-          "$SP" get pkg:npm/left-pad@1.3.0 -g --yes --json > /dev/null 2>&1; ok get_g.rc $? 0; ok get_g.global "$(req "$G")" patched
-          "$SP" rollback -g --yes --json > /dev/null 2>&1; ok get_g.rollback "$(same "$G/index.js" "$W/g.orig")" same
-          SOCKET_GLOBAL=1 "$SP" scan --mode agent --yes --json > /dev/null 2>&1; ok envglobal.rc $? 0; ok envglobal.global "$(req "$G")" patched; ok envglobal.project "$(lp)" pristine
-          SOCKET_GLOBAL=1 "$SP" rollback --yes --json > /dev/null 2>&1; ok envglobal.rollback "$(same "$G/index.js" "$W/g.orig")" same
-          # custom prefix with space + unicode
-          CP="$W/my prefix café/node_modules"; mkdir -p "$CP"; cp -R "$G" "$CP/"
-          "$SP" scan --global-prefix "$CP" --mode agent --yes --json > /dev/null 2>&1; ok prefix_unicode.rc $? 0
-          ok prefix_unicode.copy "$(req "$CP/left-pad")" patched; ok prefix_unicode.default_global "$(req "$G")" pristine
-          "$SP" rollback --global-prefix "$CP" --yes --json > /dev/null 2>&1; ok prefix_unicode.rollback "$(same "$CP/left-pad/index.js" "$W/g.orig")" same
-          # local scan never touches global
-          "$SP" scan --mode agent --yes --json > /dev/null 2>&1; ok local.project "$(lp)" patched; ok local.global "$(req "$G")" pristine
-          "$SP" rollback --yes --json > /dev/null 2>&1; ok local.rollback "$(lp)" pristine
-          # read-only global (non-root unix only)
-          if [ "$(uname -s | cut -c1-5)" != MINGW ] && [ "$(id -u)" != 0 ]; then
-            chmod -R a-w "$G"; "$SP" scan -g --mode agent --yes --json > "$W/ro.json" 2>&1; rc=$?
-            ok readonly.nonzero "$([ $rc != 0 ] && echo yes || echo no)" yes; ok readonly.global "$(req "$G")" pristine; chmod -R u+w "$G"
-          fi
-          # BUG candidates: rollback -g / remove -g inside hosted / vendored vlt projects
-          for mode in hosted vendored; do for cmd in rollback remove; do
-            mkproj "bug-$mode-$cmd"
-            if [ $mode = hosted ]; then "$SP" scan --yes --json >/dev/null 2>&1; else "$SP" scan --mode vendored --yes --json >/dev/null 2>&1; fi
-            rm -rf node_modules; vlt ci; cp vlt-lock.json wired.lock; before=$(lp)
-            if [ $cmd = rollback ]; then "$SP" rollback -g --yes --json > out.json 2>/dev/null; rc=$?; else "$SP" remove pkg:npm/left-pad@1.3.0 -g --yes --json > out.json 2>/dev/null; rc=$?; fi
-            obs "bug.$mode.${cmd}_g" "rc=$rc project_lock=$(same wired.lock vlt-lock.json) project_left_pad=$before->$(lp) .socket/vendor=$([ -d .socket/vendor ] && echo kept || echo gone)"
-          done; done
-          mkproj vend-agent; "$SP" scan --mode vendored --yes --json >/dev/null 2>&1
-          "$SP" scan -g --mode agent --yes --json > out.json 2>/dev/null; obs "bug.vendored_project.scan_g_agent" "rc=$? global=$(req "$G") warn=$(grep -o 'vendored_ownership_retained' out.json | head -1)"
-          "$SP" rollback -g --yes --json >/dev/null 2>&1
-          kill $M1 $M2 2>/dev/null
-          exit $FAIL
+          export XDG_CACHE_HOME="$W/.cache" XDG_DATA_HOME="$W/.data" XDG_CONFIG_HOME="$W/.config" LOCALAPPDATA="$W/.lad" HOME="$W/.home"; mkdir -p "$HOME"
+          vlt() { node "$VJS" "$@" >>"$W/vlt.log" 2>&1; echo "vlt $1 rc=$?"; }
+          mkdir proj; cd proj
+          echo '{"name":"app","version":"1.0.0","dependencies":{"left-pad":"1.3.0","bundler":"1.0.0"}}' > package.json
+          echo '{"config":{"registries":{"npm":"http://127.0.0.1:18555/"}}}' > vlt.json
+          vlt install
+          "$SP" scan --mode $MODE --yes --json > scan.json 2>scan.err; echo "scan rc=$?"
+          node -e "const d=require('./scan.json');const w=JSON.stringify(d).match(/bundl[a-z_]*/gi);console.log('scan status='+d.status+' bundled-mentions='+(w?w.join(','):'none'))"
+          rm -rf node_modules; vlt ci
+          echo "RESULT top=$(node -p "require('left-pad')" 2>&1|tail -1) bundled=$(node -p "require('bundler')" 2>&1|tail -1)"
+          "$SP" vex --output vex.json > vex.out 2>&1; echo "vex rc=$?"; grep -i bundl vex.out || echo "vex: no bundled warning"
+          node -e "try{const d=require('./vex.json');for(const s of d.statements)console.log('STATEMENT',s.status,s.justification||'',s.products.map(p=>(p.subcomponents||[]).map(x=>x['@id']).join(',')).join(';'))}catch(e){console.log('no vex.json')}"
           PROBEEOF
-      - name: Probe
+      - name: Probe bundled copy
         run: |
           cli="$PWD/target/release/socket-patch"
           if [ "$RUNNER_OS" = Windows ]; then cli="$cli.exe"; fi
-          echo "npm root -g: $(npm root -g)"
-          bash probe/gprobe.sh "$cli" "$VLT_JS" "$PWD/probe/mock.mjs"
+          NO_ALT=1 PORT=18555 node probe/mock.mjs & NO_ALT=1 PORT=18556 node probe/mock.mjs & sleep 3
+          for m in hosted vendored; do echo "=== $m"; bash probe/bprobe.sh "$cli" "$VLT_JS" "$RUNNER_TEMP/b-$m" $m; done
