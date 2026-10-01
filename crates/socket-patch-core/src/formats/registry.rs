@@ -140,6 +140,14 @@ const REGISTRY: &[FormatFile] = &[
     // into (read so an existing user config / checksum set is preserved).
     row(".mvn/maven.config", "maven", HOSTED),
     row(".mvn/checksums/checksums.sha256", "maven", HOSTED),
+    // Never edited: its `distributionUrl` names the project's Maven, which
+    // the maven planner checks against the Trusted Checksums floor (3.9.4)
+    // to warn when the `.mvn/*` pin above would be inert.
+    row(
+        ".mvn/wrapper/maven-wrapper.properties",
+        "maven",
+        HOSTED | PRESENCE_ONLY,
+    ),
     // Gradle build scripts are never edited — their presence only feeds the
     // maven planner's paste-able `exclusiveContent` snippet warning.
     row("settings.gradle", "maven", HOSTED | PRESENCE_ONLY),
