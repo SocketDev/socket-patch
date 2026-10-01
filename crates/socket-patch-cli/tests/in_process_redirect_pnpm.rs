@@ -367,6 +367,47 @@ async fn hosted_merges_trust_key_into_existing_workspace_yaml_byte_exactly() {
     );
 }
 
+/// #400 / #402: a workspace file the trust edit must not append to — an
+/// explicit opt-out spelled with a quoted key, a `trustLockfile : false`
+/// key, or a flow-style document — is left byte-identical (no duplicate key,
+/// no block line after a flow mapping), while the lock is still redirected.
+/// A `...`-terminated file gains the key inside the document.
+#[tokio::test]
+#[serial]
+async fn hosted_trust_edit_reads_the_workspace_yaml_shape() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    for (user_ws, want) in [
+        ("packages:\n  - '.'\n\"trustLockfile\": false\n", None),
+        ("packages:\n  - '.'\ntrustLockfile : false\n", None),
+        ("{packages: [.]}\n", None),
+        (
+            "packages:\n  - '.'\n...\n",
+            Some("packages:\n  - '.'\ntrustLockfile: true\n...\n"),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_project(tmp.path());
+        std::fs::write(tmp.path().join("pnpm-workspace.yaml"), user_ws).unwrap();
+
+        let code = run(hosted_args(tmp.path(), server.uri())).await;
+        assert_eq!(code, 0, "scan --mode hosted should succeed for {user_ws:?}");
+        assert!(
+            std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml"))
+                .unwrap()
+                .contains(HOSTED_URL),
+            "the lock is still redirected for {user_ws:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("pnpm-workspace.yaml")).unwrap(),
+            want.unwrap_or(user_ws),
+            "workspace file for {user_ws:?}"
+        );
+    }
+}
+
 /// `--dry-run` previews: NOTHING lands on disk — no lock rewrite, no
 /// pnpm-workspace.yaml, no ledger — while the envelope still reports both
 /// files as would-be-rewritten (`dryRun: true`).
