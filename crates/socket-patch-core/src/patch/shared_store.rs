@@ -83,6 +83,42 @@ pub async fn shared_store_of(pkg_path: &Path) -> Option<SharedStore> {
         .flatten()
 }
 
+/// Classify every directory a patch writes into: `pkg_path` itself and
+/// the parent of each (normalized, package-relative) file key. The package
+/// root is not always the package directory: a PyPI patch is rooted at
+/// `site-packages` with keys like `urllib3/response.py`, so the directory
+/// symlink into PDM's cache sits *below* the root. A parent that does not
+/// exist yet (a patch adding a file under a new subdir) is classified by
+/// its nearest existing ancestor at or below `pkg_path`. Keys that escape
+/// the package dir are skipped; the caller refuses them on its own.
+pub async fn shared_store_of_patch_dirs<'a>(
+    pkg_path: &Path,
+    file_keys: impl IntoIterator<Item = &'a str>,
+) -> Option<SharedStore> {
+    let pkg_path = pkg_path.to_path_buf();
+    let keys: Vec<String> = file_keys
+        .into_iter()
+        .map(crate::patch::apply::normalize_file_path)
+        .filter(|k| crate::patch::apply::is_safe_relative_subpath(k))
+        .map(str::to_string)
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        let mut seen = std::collections::HashSet::new();
+        let dirs = std::iter::once(pkg_path.clone()).chain(keys.iter().filter_map(|key| {
+            let mut dir = pkg_path.join(key).parent()?.to_path_buf();
+            while dir != pkg_path && !dir.exists() {
+                dir = dir.parent()?.to_path_buf();
+            }
+            Some(dir)
+        }));
+        dirs.filter(|dir| seen.insert(dir.clone()))
+            .find_map(|dir| shared_store_of_blocking(&dir))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 fn shared_store_of_blocking(pkg_path: &Path) -> Option<SharedStore> {
     let real = std::fs::canonicalize(pkg_path).ok()?;
     for dir in real.ancestors() {
@@ -258,6 +294,34 @@ mod tests {
         std::fs::create_dir_all(&private).unwrap();
         std::os::unix::fs::symlink(&private, nm.join("is-odd")).unwrap();
         assert_eq!(shared_store_of(&nm.join("is-odd")).await, None);
+    }
+
+    /// A PyPI patch is rooted at `site-packages` (keys `<pkg>/<file>`), so
+    /// the directory link into PDM's cache sits below the root and is found
+    /// through the keys, including a key under a subdir that does not exist
+    /// yet. A top-level module key (`six.py`) is classified by its parent,
+    /// `site-packages`, which is private.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn patch_dirs_find_a_link_below_the_package_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = make_pdm_cache_entry(dir.path());
+        let site = dir.path().join("venv").join("site-packages");
+        std::fs::create_dir_all(&site).unwrap();
+        std::os::unix::fs::symlink(&pkg, site.join("urllib3")).unwrap();
+
+        assert_eq!(shared_store_of(&site).await, None);
+        for key in ["urllib3/response.py", "urllib3/new/dir/added.py"] {
+            let got = shared_store_of_patch_dirs(&site, [key]).await;
+            assert_eq!(
+                got.map(|s| s.kind),
+                Some(SharedStoreKind::PdmPackageCache),
+                "{key}"
+            );
+        }
+        assert_eq!(shared_store_of_patch_dirs(&site, ["six.py"]).await, None);
+        // An escaping key is ignored here (apply refuses it separately).
+        assert_eq!(shared_store_of_patch_dirs(&site, ["../x/y.py"]).await, None);
     }
 
     #[test]

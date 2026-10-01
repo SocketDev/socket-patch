@@ -442,7 +442,12 @@ async fn rollback_package_patch_at(
     // them. Refused whenever a write would happen, dry run included; an
     // already-original shared copy needs no write and passes.
     if !all_original {
-        if let Some(store) = crate::patch::shared_store::shared_store_of(pkg_path).await {
+        if let Some(store) = crate::patch::shared_store::shared_store_of_patch_dirs(
+            pkg_path,
+            files.keys().map(String::as_str),
+        )
+        .await
+        {
             result.error = Some(store.refusal("roll back"));
             return result;
         }
@@ -2541,20 +2546,27 @@ mod tests {
             std::fs::create_dir_all(&install_dir).unwrap();
             let link = install_dir.join(store_pkg.file_name().unwrap());
             std::os::unix::fs::symlink(&store_pkg, &link).unwrap();
+            // What the crawlers hand rollback: the linked package dir for
+            // npm, but `site-packages` (keys `<pkg>/<file>`) for PyPI.
+            let (pkg_root, key) = if pdm {
+                (install_dir.clone(), "urllib3/index.js")
+            } else {
+                (link.clone(), "index.js")
+            };
             let blobs = root.path().join("blobs");
             std::fs::create_dir_all(&blobs).unwrap();
             let before_hash = compute_git_sha256_from_bytes(&original);
             std::fs::write(blobs.join(&before_hash), &original).unwrap();
             let mut files = HashMap::new();
             files.insert(
-                "index.js".to_string(),
+                key.to_string(),
                 PatchFileInfo {
                     before_hash,
                     after_hash: compute_git_sha256_from_bytes(&patched),
                 },
             );
             for dry_run in [true, false] {
-                let result = rollback_package_patch(purl, &link, &files, &blobs, dry_run).await;
+                let result = rollback_package_patch(purl, &pkg_root, &files, &blobs, dry_run).await;
                 assert!(!result.success, "{purl} dry_run={dry_run}: must refuse");
                 let err = result.error.unwrap_or_default();
                 assert!(
@@ -2566,7 +2578,7 @@ mod tests {
 
             // Already original: nothing to write, so nothing to refuse.
             std::fs::write(store_pkg.join("index.js"), &original).unwrap();
-            let result = rollback_package_patch(purl, &link, &files, &blobs, false).await;
+            let result = rollback_package_patch(purl, &pkg_root, &files, &blobs, false).await;
             assert!(result.success, "{purl}: {:?}", result.error);
         }
     }

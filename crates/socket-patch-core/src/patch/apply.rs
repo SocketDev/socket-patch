@@ -816,7 +816,12 @@ async fn apply_package_patch_at(
     // patch: the rename below would land in the shared dir and patch every
     // project using it. Refused in every state, dry run and already-patched
     // included, so this project never records the shared copy as its patch.
-    if let Some(store) = crate::patch::shared_store::shared_store_of(pkg_path).await {
+    if let Some(store) = crate::patch::shared_store::shared_store_of_patch_dirs(
+        pkg_path,
+        files.keys().map(String::as_str),
+    )
+    .await
+    {
         result.error = Some(store.refusal("patch"));
         return result;
     }
@@ -3503,14 +3508,17 @@ mod tests {
     /// Lay out one shared store package with `index.js` (original bytes)
     /// and link it into two projects' install dirs, the way pnpm's global
     /// virtual store (#361) and PDM's symlink cache (#332) do. Returns
-    /// (root, [project A link, project B link], blobs dir, files, original,
-    /// patched).
+    /// (root, [project A, project B] package roots, file key, blobs dir,
+    /// files, original, patched). The package root is what the crawlers
+    /// hand apply: the linked `node_modules/<dep>` for npm, but the
+    /// `site-packages` dir for PyPI, whose keys are `<pkg>/<file>`.
     #[cfg(unix)]
     fn shared_store_fixture(
         pdm: bool,
     ) -> (
         tempfile::TempDir,
         [std::path::PathBuf; 2],
+        String,
         std::path::PathBuf,
         HashMap<String, PatchFileInfo>,
         Vec<u8>,
@@ -3526,7 +3534,7 @@ mod tests {
         let original = b"original shared bytes".to_vec();
         let patched = b"PATCHED shared bytes".to_vec();
         std::fs::write(store_pkg.join("index.js"), &original).unwrap();
-        let links = ["a", "b"].map(|p| {
+        let roots = ["a", "b"].map(|p| {
             let install_dir = if pdm {
                 root.path()
                     .join(p)
@@ -3537,8 +3545,13 @@ mod tests {
             std::fs::create_dir_all(&install_dir).unwrap();
             let link = install_dir.join(store_pkg.file_name().unwrap());
             std::os::unix::fs::symlink(&store_pkg, &link).unwrap();
-            link
+            if pdm {
+                install_dir
+            } else {
+                link
+            }
         });
+        let key = if pdm { "urllib3/index.js" } else { "index.js" }.to_string();
         let blobs = root.path().join("blobs");
         std::fs::create_dir_all(&blobs).unwrap();
         let before_hash = compute_git_sha256_from_bytes(&original);
@@ -3547,13 +3560,13 @@ mod tests {
         std::fs::write(blobs.join(&after_hash), &patched).unwrap();
         let mut files = HashMap::new();
         files.insert(
-            "index.js".to_string(),
+            key.clone(),
             PatchFileInfo {
                 before_hash,
                 after_hash,
             },
         );
-        (root, links, blobs, files, original, patched)
+        (root, roots, key, blobs, files, original, patched)
     }
 
     /// #361 / #332: agent apply must not write through a package directory
@@ -3566,7 +3579,7 @@ mod tests {
             (false, "pkg:npm/left-pad@1.3.0"),
             (true, "pkg:pypi/urllib3@1.26.18"),
         ] {
-            let (_root, [a, b], blobs, files, original, _patched) = shared_store_fixture(pdm);
+            let (_root, [a, b], key, blobs, files, original, _patched) = shared_store_fixture(pdm);
             let sources = PatchSources::blobs_only(&blobs);
             for dry_run in [true, false] {
                 let result = apply_package_patch(
@@ -3587,11 +3600,7 @@ mod tests {
                 );
                 assert!(result.files_patched.is_empty());
             }
-            assert_eq!(
-                std::fs::read(b.join("index.js")).unwrap(),
-                original,
-                "{purl}"
-            );
+            assert_eq!(std::fs::read(b.join(&key)).unwrap(), original, "{purl}");
         }
     }
 
@@ -3601,8 +3610,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_apply_refuses_already_patched_shared_store_package_dir() {
-        let (_root, [a, _b], blobs, files, _original, patched) = shared_store_fixture(false);
-        std::fs::write(a.join("index.js"), &patched).unwrap();
+        let (_root, [a, _b], key, blobs, files, _original, patched) = shared_store_fixture(false);
+        std::fs::write(a.join(key), &patched).unwrap();
         let result = apply_package_patch(
             "pkg:npm/left-pad@1.3.0",
             &a,
