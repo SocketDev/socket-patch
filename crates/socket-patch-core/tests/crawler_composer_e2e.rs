@@ -534,6 +534,10 @@ async fn get_vendor_paths_global_no_composer_no_home_layout_returns_empty() {
     let prev_composer = std::env::var("COMPOSER_HOME").ok();
     let prev_home = std::env::var("HOME").ok();
     let prev_path = std::env::var("PATH").ok();
+    let prev_app_data = std::env::var_os("APPDATA");
+    let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    std::env::remove_var("APPDATA");
+    std::env::remove_var("XDG_CONFIG_HOME");
     std::env::remove_var("COMPOSER_HOME");
     // HOME is set, but the temp HOME has no .composer / .config/composer.
     std::env::set_var("HOME", tmp.path());
@@ -560,6 +564,12 @@ async fn get_vendor_paths_global_no_composer_no_home_layout_returns_empty() {
         std::env::set_var("PATH", v);
     } else {
         std::env::remove_var("PATH");
+    }
+    if let Some(v) = prev_app_data {
+        std::env::set_var("APPDATA", v);
+    }
+    if let Some(v) = prev_xdg {
+        std::env::set_var("XDG_CONFIG_HOME", v);
     }
 
     assert!(
@@ -588,6 +598,10 @@ async fn get_vendor_paths_global_empty_home_not_cwd_relative() {
     let prev_home = std::env::var("HOME").ok();
     let prev_profile = std::env::var("USERPROFILE").ok();
     let prev_path = std::env::var("PATH").ok();
+    let prev_app_data = std::env::var_os("APPDATA");
+    let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    std::env::remove_var("APPDATA");
+    std::env::remove_var("XDG_CONFIG_HOME");
     std::env::remove_var("COMPOSER_HOME");
     std::env::set_var("HOME", "");
     std::env::set_var("USERPROFILE", "");
@@ -620,6 +634,12 @@ async fn get_vendor_paths_global_empty_home_not_cwd_relative() {
         std::env::set_var("PATH", v);
     } else {
         std::env::remove_var("PATH");
+    }
+    if let Some(v) = prev_app_data {
+        std::env::set_var("APPDATA", v);
+    }
+    if let Some(v) = prev_xdg {
+        std::env::set_var("XDG_CONFIG_HOME", v);
     }
 
     assert!(
