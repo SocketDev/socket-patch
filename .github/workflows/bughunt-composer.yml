@@ -1,0 +1,78 @@
+name: bughunt-composer probe
+on:
+  push:
+    branches: ['bughunt/composer/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    name: composer ${{ matrix.composer }} / php ${{ matrix.php }} / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, composer: '1.10.28', php: '7.2', sha256: 0915af36eb01e3f0e16cd309adff7051832b9ef014e38371756804b20425cd5a}
+          - {os: ubuntu-latest, composer: '1.10.28', php: '7.4', sha256: 0915af36eb01e3f0e16cd309adff7051832b9ef014e38371756804b20425cd5a}
+          - {os: ubuntu-latest, composer: '1.10.28', php: '8.0', sha256: 0915af36eb01e3f0e16cd309adff7051832b9ef014e38371756804b20425cd5a}
+          - {os: ubuntu-latest, composer: '1.10.28', php: '8.1', sha256: 0915af36eb01e3f0e16cd309adff7051832b9ef014e38371756804b20425cd5a}
+          - {os: ubuntu-latest, composer: '1.10.28', php: '8.4', sha256: 0915af36eb01e3f0e16cd309adff7051832b9ef014e38371756804b20425cd5a}
+          - {os: windows-latest, composer: '1.10.28', php: '8.1', sha256: 0915af36eb01e3f0e16cd309adff7051832b9ef014e38371756804b20425cd5a}
+          - {os: macos-latest, composer: '1.10.28', php: '8.1', sha256: 0915af36eb01e3f0e16cd309adff7051832b9ef014e38371756804b20425cd5a}
+          - {os: ubuntu-latest, composer: '2.2.30', php: '7.2', sha256: 8c2b4478b64f8f7cdf1574838fdb0033b29049ca821dad452db7a3dcfcdbffc2}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: none
+          extensions: zip, mbstring, curl, openssl
+          coverage: none
+      - name: probe
+        shell: bash
+        env:
+          V: ${{ matrix.composer }}
+          SHA: ${{ matrix.sha256 }}
+        run: |
+          set -uo pipefail
+          W="$RUNNER_TEMP/w"; command -v cygpath >/dev/null && W="$(cygpath -m "$RUNNER_TEMP")/w"
+          mkdir -p "$W/srv" "$W/pkgs/tool/src" "$W/app"
+          curl -fsSL --retry 3 -o "$W/composer.phar" "https://github.com/composer/composer/releases/download/$V/composer.phar"
+          actual="$(php -r 'echo hash_file("sha256", $argv[1]);' "$W/composer.phar")"
+          [ "$actual" = "$SHA" ] || { echo "sha mismatch $actual"; exit 1; }
+          PY=python3; command -v python3 >/dev/null || PY=python
+          cd "$W"
+          printf '{"name":"acme/tool","version":"1.0.0","autoload":{"psr-4":{"Acme\\\\":"src/"}}}' > pkgs/tool/composer.json
+          printf "<?php\nfunction acme_tool() { return 'vulnerable'; }\n" > pkgs/tool/src/Tool.php
+          $PY - <<'PYEOF'
+          import hashlib, json, zipfile
+          z = "srv/tool-1.0.0.zip"
+          with zipfile.ZipFile(z, "w") as f:
+              f.writestr("acme-tool-1.0.0/composer.json", open("pkgs/tool/composer.json").read())
+              f.writestr("acme-tool-1.0.0/src/Tool.php", "<?php\nfunction acme_tool() { return 'patched'; }\n")
+          sha1 = hashlib.sha1(open(z, "rb").read()).hexdigest()
+          json.dump({"name": "app/app", "repositories": [{"type": "path", "url": "../pkgs/tool"}, {"packagist": False}],
+                     "require": {"acme/tool": "1.0.0"}, "config": {"secure-http": False}}, open("app/composer.json", "w"), indent=4)
+          entry = {"name": "acme/tool", "version": "1.0.0",
+                   "dist": {"type": "zip", "url": "http://127.0.0.1:18765/tool-1.0.0.zip",
+                            "reference": "3769e7846b03796e6519e41c1f801f1905d22889", "shasum": sha1},
+                   "type": "library", "autoload": {"psr-4": {"Acme\\": "src/"}},
+                   "transport-options": {"relative": True}}
+          lock = {"_readme": [], "content-hash": "x", "packages": [entry], "packages-dev": [], "aliases": [],
+                  "minimum-stability": "stable", "stability-flags": [], "prefer-stable": False, "prefer-lowest": False,
+                  "platform": [], "platform-dev": [], "plugin-api-version": "1.1.0"}
+          json.dump(lock, open("app/kept.lock", "w"), indent=4)
+          entry.pop("transport-options")
+          json.dump(lock, open("app/stripped.lock", "w"), indent=4)
+          PYEOF
+          (cd srv && $PY -m http.server 18765 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          sleep 3
+          cd app
+          for variant in kept stripped; do
+            rm -rf vendor "$W/cache-$variant"; cp "$variant.lock" composer.lock
+            COMPOSER_HOME="$W/home" COMPOSER_CACHE_DIR="$W/cache-$variant" php ../composer.phar install --no-interaction --no-progress > "../$variant.log" 2>&1
+            rc=$?
+            got="$(cat vendor/acme/tool/src/Tool.php 2>/dev/null | grep -o "'[a-z]*'" || echo NOT-INSTALLED)"
+            echo "RESULT $V php${{ matrix.php }} ${{ matrix.os }} $variant: exit=$rc installed=$got"
+            grep -m2 -iE "ValueError|options should|exception|error" "../$variant.log" || true
+          done
