@@ -20,12 +20,13 @@ Last run: 2026-10-01 03:16Z on main `2463257` (v5 consolidation #277; latest tag
 Modes × macOS/Windows for hosted and vendored: untested by this routine (the repo's pdm-compatibility.yml covers them).
 
 ## Backlog
-1. Re-triage #332 on v5 (agent mode, install.cache symlink).
-2. Vendored on v5 (`vendored_backend`): 2.29.2 / 2.12.4 / 1.4.5, incl. private index + static_urls.
-3. Hosted lock_version 2 (0.12, 1.4.5) through the v5 upstream restore.
-4. Hosted → vendored takeover on v5; `pdm update --unconstrained` / `lock --update-all` on hosted.
-5. Non-static private index with different bytes (the hash variant of #413); PDM 1.x `feature.install_cache` with agent mode.
-6. macOS / Windows probes, once probe-branch deletion is permitted (the stale `bughunt/pdm/20260930-cache-symlink` still needs a maintainer to delete it).
+1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major PDM version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+2. Re-triage #332 on v5 (agent mode, install.cache symlink).
+3. Vendored on v5 (`vendored_backend`): 2.29.2 / 2.12.4 / 1.4.5, incl. private index + static_urls.
+4. Hosted lock_version 2 (0.12, 1.4.5) through the v5 upstream restore.
+5. Hosted → vendored takeover on v5; `pdm update --unconstrained` / `lock --update-all` on hosted.
+6. Non-static private index with different bytes (the hash variant of #413); PDM 1.x `feature.install_cache` with agent mode.
+7. macOS / Windows probes, once probe-branch deletion is permitted (the stale `bughunt/pdm/20260930-cache-symlink` still needs a maintainer to delete it).
 
 ## Known non-bugs
 - lock_version absent / 3.1 / 4.0–4.2 refused; 2.8.0 accepted-but-crashes (documented).

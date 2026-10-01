@@ -33,13 +33,14 @@ Other passes (Linux, 1.4.2 unless noted):
 
 ## Backlog
 
-0. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch` and `bughunt/bun/20261001-vex-isolated`. The sandbox can't delete branches.
-1. Digest boundary with a valid, well-formed substitute tarball: a 1.3.9 text lock vs 1.3.10, hosted + vendored. `bun.lockb` already enforces on 1.3.9.
-2. `vex` on a vendored project with the isolated linker: does `vendored_tree_out_of_sync` fire for a stale `.bun/` copy?
-3. Windows agent mode with the isolated linker (junctions) once #366 lands. VEX after a real frozen hosted install on Windows.
-4. A hosted → vendored takeover on a v1 workspace lock (1.3.14). It must refuse before writes and leave the hosted pin untouched. Check `--dry-run` parity.
-5. v5 `socket.yml` policy and per-run limits in a Bun workspace.
-6. Hosted rollback on macOS and Windows (CRLF lock on Windows checkouts with `core.autocrlf`).
+0. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Bun version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch` and `bughunt/bun/20261001-vex-isolated`. The sandbox can't delete branches.
+2. Digest boundary with a valid, well-formed substitute tarball: a 1.3.9 text lock vs 1.3.10, hosted + vendored. `bun.lockb` already enforces on 1.3.9.
+3. `vex` on a vendored project with the isolated linker: does `vendored_tree_out_of_sync` fire for a stale `.bun/` copy?
+4. Windows agent mode with the isolated linker (junctions) once #366 lands. VEX after a real frozen hosted install on Windows.
+5. A hosted → vendored takeover on a v1 workspace lock (1.3.14). It must refuse before writes and leave the hosted pin untouched. Check `--dry-run` parity.
+6. v5 `socket.yml` policy and per-run limits in a Bun workspace.
+7. Hosted rollback on macOS and Windows (CRLF lock on Windows checkouts with `core.autocrlf`).
 
 ## Known non-bugs
 

@@ -17,12 +17,13 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real `go build`/`go
 
 ## Backlog
 
-0. Delete stale probe branches `bughunt/go/20260930-goenv-vendor`, `bughunt/go/20260930-windows-apply` and `bughunt/go/20260930-windows-bisect`: `git push --delete` gets HTTP 403 from the git proxy.
-1. Hosted mode (wiremock harness) × go.work user replace, upgrade drift, `/v2`, `+incompatible`, CRLF/BOM go.sum, `go.work.sum`.
-2. Toolchain matrix (1.18 / 1.21 / 1.26) for #391, #392 and #393 via a probe branch, once branch deletion works.
-3. `GOFLAGS=-mod=vendor` in the env or GOENV; `go work vendor` (1.22+) with a committed vendor/.
-4. go.work root without a root go.mod: `apply` fails with "matched no installed package". Decide between limitation and bug.
-5. Windows cells once #346 is fixed (long paths, CRLF checkouts, drive-letter replace targets).
+0. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Go modules version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+1. Delete stale probe branches `bughunt/go/20260930-goenv-vendor`, `bughunt/go/20260930-windows-apply` and `bughunt/go/20260930-windows-bisect`: `git push --delete` gets HTTP 403 from the git proxy.
+2. Hosted mode (wiremock harness) × go.work user replace, upgrade drift, `/v2`, `+incompatible`, CRLF/BOM go.sum, `go.work.sum`.
+3. Toolchain matrix (1.18 / 1.21 / 1.26) for #391, #392 and #393 via a probe branch, once branch deletion works.
+4. `GOFLAGS=-mod=vendor` in the env or GOENV; `go work vendor` (1.22+) with a committed vendor/.
+5. go.work root without a root go.mod: `apply` fails with "matched no installed package". Decide between limitation and bug.
+6. Windows cells once #346 is fixed (long paths, CRLF checkouts, drive-letter replace targets).
 
 ## Known non-bugs
 

@@ -20,12 +20,13 @@ Method: real vlt installs (`scripts/install-vlt.sh`) against a local Node mock o
 
 ## Backlog
 
-1. v5 upstream restore against a registry with non-conventional `dist.tarball` (Artifactory scoped `/-/@scope/name-ver.tgz`). The restore rebuilds slot [3] conventionally and takes integrity from `SOCKET_NPM_REGISTRY`, not the project registry.
-2. #372 follow-ups once fixed: a mixed brotli / non-brotli lock, a brotli dev node (flag 6) heal, the restore putting bit 4 back, and VEX on brotli nodes.
-3. Peer-extras DepIDs (two instances of one name@version) through hosted scan → `remove`.
-4. Concurrent or interrupted `scan` / `rollback` on vlt projects.
-5. Root-cause the intermittent CI `native (ubuntu, rc.14) hosted-direct warmOrdinary` failure if it recurs (needs the result artifact, which the sandbox can't download).
-6. Once vlt 1.3.x lands in CI's matrix, drop it from the probe.
+1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major vlt version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+2. v5 upstream restore against a registry with non-conventional `dist.tarball` (Artifactory scoped `/-/@scope/name-ver.tgz`). The restore rebuilds slot [3] conventionally and takes integrity from `SOCKET_NPM_REGISTRY`, not the project registry.
+3. #372 follow-ups once fixed: a mixed brotli / non-brotli lock, a brotli dev node (flag 6) heal, the restore putting bit 4 back, and VEX on brotli nodes.
+4. Peer-extras DepIDs (two instances of one name@version) through hosted scan → `remove`.
+5. Concurrent or interrupted `scan` / `rollback` on vlt projects.
+6. Root-cause the intermittent CI `native (ubuntu, rc.14) hosted-direct warmOrdinary` failure if it recurs (needs the result artifact, which the sandbox can't download).
+7. Once vlt 1.3.x lands in CI's matrix, drop it from the probe.
 
 ## Known non-bugs
 

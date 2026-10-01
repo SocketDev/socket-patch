@@ -20,11 +20,12 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 
 ## Backlog
 
-1. Vendored mode with `BUNDLE_GEMFILE` in `.bundle/config`: confirm it shares the #390 gap, and comment on #390.
-2. #390 on Bundler 2.2–2.6, and the `BUNDLE_GEMFILE` env-only form with `setup`.
-3. Git- and path-sourced gems (`bundler/gems/<name>-<sha>`): hosted redirect and agent patch targets, and the plugin's `patch_target_files`.
-4. A macOS/Windows probe branch: hosted CRLF Gemfile/lock, a Windows `BUNDLE_PATH` with a drive letter or spaces, `vendor/bundle` deployment mode, and plugin `Dir.glob` on `x64-mingw-ucrt` platform gems.
-5. Ruby 2.7 / 3.4 runtimes, and `scan` from a subdirectory of a bundler project.
+1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Bundler (RubyGems) version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+2. Vendored mode with `BUNDLE_GEMFILE` in `.bundle/config`: confirm it shares the #390 gap, and comment on #390.
+3. #390 on Bundler 2.2–2.6, and the `BUNDLE_GEMFILE` env-only form with `setup`.
+4. Git- and path-sourced gems (`bundler/gems/<name>-<sha>`): hosted redirect and agent patch targets, and the plugin's `patch_target_files`.
+5. A macOS/Windows probe branch: hosted CRLF Gemfile/lock, a Windows `BUNDLE_PATH` with a drive letter or spaces, `vendor/bundle` deployment mode, and plugin `Dir.glob` on `x64-mingw-ucrt` platform gems.
+6. Ruby 2.7 / 3.4 runtimes, and `scan` from a subdirectory of a bundler project.
 
 ## Known non-bugs
 

@@ -21,12 +21,13 @@ Last run: 2026-09-30 (second run), main `f6b7fb9` (4.0.0).
 
 ## Backlog
 
-1. Pipenv 7–11 hosted `path` refs (py3.6 / Docker, or py3.7 via uv), and the `SOCKET_PIPENV_MAJOR` override.
-2. Windows and macOS hosted and vendored on 2018 / 2022, and CRLF locks on Windows.
-3. Relock on 2022 (`install <other>`) after hosted or vendored, then rollback, re-scan and VEX.
-4. Hosted stale-install warning under the #384 / #334 conditions and a 2026.2+ auto-`.venv`.
-5. Concurrent or interrupted scans on a Pipfile.lock.
-6. `PIPENV_PIPFILE` / subdirectory runs (a documented limitation; check the refusal message).
+1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Pipenv version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+2. Pipenv 7–11 hosted `path` refs (py3.6 / Docker, or py3.7 via uv), and the `SOCKET_PIPENV_MAJOR` override.
+3. Windows and macOS hosted and vendored on 2018 / 2022, and CRLF locks on Windows.
+4. Relock on 2022 (`install <other>`) after hosted or vendored, then rollback, re-scan and VEX.
+5. Hosted stale-install warning under the #384 / #334 conditions and a 2026.2+ auto-`.venv`.
+6. Concurrent or interrupted scans on a Pipfile.lock.
+7. `PIPENV_PIPFILE` / subdirectory runs (a documented limitation; check the refusal message).
 
 ## Known non-bugs
 

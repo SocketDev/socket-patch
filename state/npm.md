@@ -23,12 +23,13 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. A
 
 ## Backlog
 
-1. Hosted mode on macOS and Windows with the `.npmrc` allow-remote auto-config (user-config `none`, env overrides, CRLF `.npmrc`).
-2. `npm ci --omit=optional` / `--omit=dev` against a manifest that patches an omitted package, in agent, vendored and hosted modes (likely related to #403).
-3. Node 18 with npm 9/10, and npm 12 on Node 26.
-4. `install-links=true` file: directory deps (packed copies) in agent and vendored modes.
-5. An interrupted hosted run (`.npmrc` written, lock unchanged), via the wiremock harness.
-6. Stale probe branches the proxy can't delete (`git push --delete` prints "Everything up-to-date" and deletes nothing): `bughunt/npm/20260930-alias-linked`, `20260930-win-mac-e2e`, `20260930-win-old-npm`, `20261001-crlf-paths`, `20261001-optional-dep`. A maintainer needs to delete them.
+1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major npm version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+2. Hosted mode on macOS and Windows with the `.npmrc` allow-remote auto-config (user-config `none`, env overrides, CRLF `.npmrc`).
+3. `npm ci --omit=optional` / `--omit=dev` against a manifest that patches an omitted package, in agent, vendored and hosted modes (likely related to #403).
+4. Node 18 with npm 9/10, and npm 12 on Node 26.
+5. `install-links=true` file: directory deps (packed copies) in agent and vendored modes.
+6. An interrupted hosted run (`.npmrc` written, lock unchanged), via the wiremock harness.
+7. Stale probe branches the proxy can't delete (`git push --delete` prints "Everything up-to-date" and deletes nothing): `bughunt/npm/20260930-alias-linked`, `20260930-win-mac-e2e`, `20260930-win-old-npm`, `20261001-crlf-paths`, `20261001-optional-dep`. A maintainer needs to delete them.
 
 ## Known non-bugs
 

@@ -18,13 +18,14 @@ H = hosted, V = vendored, A = agent. "pass/fail" is Linux unless an OS is named.
 Closed this run: #379 and #381 (fixed by #277).
 
 ## Backlog
-1. uv 0.0.5 – 0.1.44 hosted requirements lane via a probe (the sandbox can't reach PyPI with those binaries).
-2. `[[tool.uv.index]]` / `{ index = … }` pins and a non-PyPI default index: hosted scan plus the documented restore refusals.
-3. Agent mode on v5 (`scan --mode agent`, `apply` after `uv sync`, `--sync` prune).
-4. `pylock.<name>.toml` variants and mixed index / no-index pylock siblings (#407 rule).
-5. Vendored script-lock and pylock round-trips on v5; Windows CRLF checkout + `repair`.
-6. `uv sync --frozen` with `default-groups` / `--no-dev`, and `package = false` projects.
-7. Re-triage #407, #408 and #411.
+1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major uv version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+2. uv 0.0.5 – 0.1.44 hosted requirements lane via a probe (the sandbox can't reach PyPI with those binaries).
+3. `[[tool.uv.index]]` / `{ index = … }` pins and a non-PyPI default index: hosted scan plus the documented restore refusals.
+4. Agent mode on v5 (`scan --mode agent`, `apply` after `uv sync`, `--sync` prune).
+5. `pylock.<name>.toml` variants and mixed index / no-index pylock siblings (#407 rule).
+6. Vendored script-lock and pylock round-trips on v5; Windows CRLF checkout + `repair`.
+7. `uv sync --frozen` with `default-groups` / `--no-dev`, and `package = false` projects.
+8. Re-triage #407, #408 and #411.
 
 ## Known non-bugs
 - uv workspaces (`[tool.uv.workspace]` or `[manifest] members` beyond the root) are refused in both modes (`redirect_uv_project_unsupported` / `pypi_uv_workspace_unsupported`). This is by design, though it's missing from docs/testing/uv-compatibility.md.

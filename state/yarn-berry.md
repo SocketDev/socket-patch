@@ -20,13 +20,14 @@ Cells are "pass", "fail #N", "refused (by design)" or "untested". Linker is node
 
 ## Backlog
 
-1. Build a vendoring-service mock (`--vendor-url`) and re-run the v5 vendored cells, #369 and the takeovers (#369 hasn't been re-checked on v5).
-2. Probe branch: #404 on macOS/Windows; yarn with `npmRegistryServer` set to a private registry plus `npmAlwaysAuth`.
-3. Hosted upgrade path (a superseding uuid), and rollback through the new uuid's `/upstream` metadata.
-4. Zero-install committed `.yarn/cache` after hosted/rollback (stale zips, `--immutable-cache`).
-5. `compressionLevel` from `YARN_COMPRESSION_LEVEL` / `~/.yarnrc.yml` / a parent rc; a quoted key.
-6. Yarn 2/3 agent-mode cells; `enableImmutableInstalls: true` with rollback/remove on workspaces.
-7. Stale probe branch `bughunt/yarn-berry/20260930-builtin-patch-takeover`: deletion failed again on 2026-10-01 (remote hung up). A maintainer needs to delete it.
+1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Yarn Berry (2+) version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+2. Build a vendoring-service mock (`--vendor-url`) and re-run the v5 vendored cells, #369 and the takeovers (#369 hasn't been re-checked on v5).
+3. Probe branch: #404 on macOS/Windows; yarn with `npmRegistryServer` set to a private registry plus `npmAlwaysAuth`.
+4. Hosted upgrade path (a superseding uuid), and rollback through the new uuid's `/upstream` metadata.
+5. Zero-install committed `.yarn/cache` after hosted/rollback (stale zips, `--immutable-cache`).
+6. `compressionLevel` from `YARN_COMPRESSION_LEVEL` / `~/.yarnrc.yml` / a parent rc; a quoted key.
+7. Yarn 2/3 agent-mode cells; `enableImmutableInstalls: true` with rollback/remove on workspaces.
+8. Stale probe branch `bughunt/yarn-berry/20260930-builtin-patch-takeover`: deletion failed again on 2026-10-01 (remote hung up). A maintainer needs to delete it.
 
 ## Known non-bugs
 

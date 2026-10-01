@@ -29,13 +29,14 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 
 ## Backlog
 
-1. macOS / Windows on Poetry 2.5.1: hosted/vendored, the #329 false hosted VEX for default out-of-tree venvs, in-project `.venv` agent mode (`Lib\site-packages`), and long project paths (> 260 chars) under `.socket/vendor/pypi/`. This needs probe branches.
-2. Probe branches are blocked: the permission policy refuses `git push --delete` (runs 1–3). A maintainer needs to delete `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes`.
-3. Hosted rollback (v5 upstream re-resolution) when PyPI's file list differs from the lock (files uploaded after locking, yanked files) and for non-canonical names (`Foo_Bar`, dotted).
-4. Interrupted / concurrent `scan` on a Poetry lock (kill mid-write), and `poetry install` racing a scan.
-5. `socket.yml` policy (`minSeverity`, package filters, `maxNewPatches`) on a Poetry project with several patches. This needs a multi-package mock.
-6. Agent mode on Poetry ≤ 1.7 out-of-tree venvs, `virtualenvs.path` with `{cache-dir}` / relative / `~`, `POETRY_VIRTUALENVS_PREFER_ACTIVE_PYTHON`, and `poetry env use` with several minors.
-7. Vendored optional extra via PEP 621 `[project.optional-dependencies]` on 2.4 / 2.5.
+1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Poetry version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+2. macOS / Windows on Poetry 2.5.1: hosted/vendored, the #329 false hosted VEX for default out-of-tree venvs, in-project `.venv` agent mode (`Lib\site-packages`), and long project paths (> 260 chars) under `.socket/vendor/pypi/`. This needs probe branches.
+3. Probe branches are blocked: the permission policy refuses `git push --delete` (runs 1–3). A maintainer needs to delete `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes`.
+4. Hosted rollback (v5 upstream re-resolution) when PyPI's file list differs from the lock (files uploaded after locking, yanked files) and for non-canonical names (`Foo_Bar`, dotted).
+5. Interrupted / concurrent `scan` on a Poetry lock (kill mid-write), and `poetry install` racing a scan.
+6. `socket.yml` policy (`minSeverity`, package filters, `maxNewPatches`) on a Poetry project with several patches. This needs a multi-package mock.
+7. Agent mode on Poetry ≤ 1.7 out-of-tree venvs, `virtualenvs.path` with `{cache-dir}` / relative / `~`, `POETRY_VIRTUALENVS_PREFER_ACTIVE_PYTHON`, and `poetry env use` with several minors.
+8. Vendored optional extra via PEP 621 `[project.optional-dependencies]` on 2.4 / 2.5.
 
 ## Known non-bugs
 

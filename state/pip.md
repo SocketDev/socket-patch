@@ -19,12 +19,13 @@ Commands covered on Linux: scan (all modes), rollback, remove, vendored takeover
 
 ## Backlog
 
-1. Agent mode on Windows (`Scripts/` + `Lib/`), `--user`, and virtualenv (not venv) layouts under v5.
-2. VCS / URL / `--no-binary` sdist-only installs after a hosted rewrite; `uv pip install -r` on a pip-hosted file.
-3. `repair` and `list` for vendored requirements; `--json` envelopes for rollback / remove failures.
-4. The same name pinned twice under different markers: hosted rewrite + upstream restore.
-5. Re-verify #376 / #409 / #410 / #412 as fixes land (#383 needs a rebase onto v5).
-6. Lock-only discovery ignores `name == ver` (spaces) and `===`, while the rewriter accepts them (deliberate per the `exact_pin` tests; decide whether a warning is warranted).
+1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major pip / requirements.txt version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+2. Agent mode on Windows (`Scripts/` + `Lib/`), `--user`, and virtualenv (not venv) layouts under v5.
+3. VCS / URL / `--no-binary` sdist-only installs after a hosted rewrite; `uv pip install -r` on a pip-hosted file.
+4. `repair` and `list` for vendored requirements; `--json` envelopes for rollback / remove failures.
+5. The same name pinned twice under different markers: hosted rewrite + upstream restore.
+6. Re-verify #376 / #409 / #410 / #412 as fixes land (#383 needs a rebase onto v5).
+7. Lock-only discovery ignores `name == ver` (spaces) and `===`, while the rewriter accepts them (deliberate per the `exact_pin` tests; decide whether a warning is warranted).
 
 ## Known non-bugs
 

@@ -19,12 +19,13 @@ Other passes (Linux): re-apply idempotency, rollback, `remove`, breaking cache h
 
 ## Backlog
 
-0. A maintainer needs to delete the stale probe branches `bughunt/deno/20260930-deno-store` and `bughunt/deno/20261001-scoped-jsr`. The git proxy refuses `push --delete`.
-1. #406 follow-ups: pnpm-lock / yarn.lock / bun.lock beside deno.lock. Done: Deno 1.46.3 (affected) and vendored (affected, and VEX survives the install).
-2. `.deno` peer-variant and scoped transitive entries, once #373 is fixed.
-3. Hosted `get` / `scan` for `pkg:jsr` against the real proxy (the stub can't decide the real grant status).
-4. `nodeModulesDir: none`: deno.lock as a lockfile supplement (enhancement).
-5. CRLF / BOM `deno.jsonc` / `deno.lock`, and `DENO_DIR` with spaces, on Windows.
+0. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Deno version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+1. A maintainer needs to delete the stale probe branches `bughunt/deno/20260930-deno-store` and `bughunt/deno/20261001-scoped-jsr`. The git proxy refuses `push --delete`.
+2. #406 follow-ups: pnpm-lock / yarn.lock / bun.lock beside deno.lock. Done: Deno 1.46.3 (affected) and vendored (affected, and VEX survives the install).
+3. `.deno` peer-variant and scoped transitive entries, once #373 is fixed.
+4. Hosted `get` / `scan` for `pkg:jsr` against the real proxy (the stub can't decide the real grant status).
+5. `nodeModulesDir: none`: deno.lock as a lockfile supplement (enhancement).
+6. CRLF / BOM `deno.jsonc` / `deno.lock`, and `DENO_DIR` with spaces, on Windows.
 
 ## Known non-bugs
 

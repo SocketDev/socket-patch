@@ -19,12 +19,13 @@ Cells are "pass", "fail #N" or "untested". Upstream `composer-compatibility.yml`
 
 ## Backlog
 
-1. Hosted: other repo-scoped lock fields that follow the package to the hosted origin (`notification-url`, `ssl` transport options, `http.proxy`). Check that `rollback` / the vendored takeover restore `transport-options`.
-2. Re-check #399 / #355 on `release/v5-prerelease` (#277), where the hosted ledger is gone.
-3. composer/installers custom `install-path` (a WordPress plugin) for agent apply and vendored discovery, Composer 2 vs 1.
-4. `COMPOSER=<other>.json` projects (crawler vendor-dir resolution).
-5. Concurrent `vendor` + `composer install`; an interrupted vendor followed by `repair`.
-6. Delete the leftover probe branch `bughunt/composer/20260930-srconly-probe` (the sandbox git proxy refuses branch deletes). Needs a maintainer.
+1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Composer version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+2. Hosted: other repo-scoped lock fields that follow the package to the hosted origin (`notification-url`, `ssl` transport options, `http.proxy`). Check that `rollback` / the vendored takeover restore `transport-options`.
+3. Re-check #399 / #355 on `release/v5-prerelease` (#277), where the hosted ledger is gone.
+4. composer/installers custom `install-path` (a WordPress plugin) for agent apply and vendored discovery, Composer 2 vs 1.
+5. `COMPOSER=<other>.json` projects (crawler vendor-dir resolution).
+6. Concurrent `vendor` + `composer install`; an interrupted vendor followed by `repair`.
+7. Delete the leftover probe branch `bughunt/composer/20260930-srconly-probe` (the sandbox git proxy refuses branch deletes). Needs a maintainer.
 
 ## Known non-bugs
 

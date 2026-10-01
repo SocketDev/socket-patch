@@ -16,11 +16,12 @@ Hosted cells: the real CLI prints the snippet against a local mock API, it's pas
 | Windows | 6.9.4 / 7.6.6 / 8.14.3 / 9.8.0 | untested (OS-independent) | untested | pass (probe) | untested (OS-independent) | untested (OS-independent) | fail #396 | untested | untested | untested | untested |
 
 ## Backlog
-1. `dependencyResolutionManagement` with `FAIL_ON_PROJECT_REPOS` / `PREFER_SETTINGS`: snippet placement, loud vs silent.
-2. Multi-project builds (snippet in a subproject vs root, `allprojects {}`).
-3. Kotlin DSL combined with locking and catalogs.
-4. Agent mode on the Gradle cache `<sha1>` layout via `--global-prefix` (blocked by #349), and Windows `GRADLE_USER_HOME` with spaces.
-5. `release/v5-prerelease` Gradle vendoring (#287) once it lands on main.
+1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Gradle version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+2. `dependencyResolutionManagement` with `FAIL_ON_PROJECT_REPOS` / `PREFER_SETTINGS`: snippet placement, loud vs silent.
+3. Multi-project builds (snippet in a subproject vs root, `allprojects {}`).
+4. Kotlin DSL combined with locking and catalogs.
+5. Agent mode on the Gradle cache `<sha1>` layout via `--global-prefix` (blocked by #349), and Windows `GRADLE_USER_HOME` with spaces.
+6. `release/v5-prerelease` Gradle vendoring (#287) once it lands on main.
 
 ## Known non-bugs
 - The sandbox can't reach `patches-api.socket.dev` / `api.socket.dev`. Use a local mock API (`--api-url … --org test-org --api-token fake`). For vendored, key the view by jar member (`META-INF/NOTICE.txt`) with `blobContent`, otherwise the run ends in `no_local_source` / `apply_failed`, which are mock artifacts.

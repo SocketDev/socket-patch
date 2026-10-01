@@ -15,11 +15,12 @@ Last run: 2026-09-30 (second run) on main `f6b7fb9` (v4.0.0 predates Hatch suppo
 Fresh-environment installs of hosted and vendored rewrites pass on 1.18.1 (and on 1.7.0 for vendored). Workspaces (1.18.1): a member-only dependency is refused from the root with a warning, and passes when scanned from the member.
 
 ## Backlog
-1. Hatch 1.0 / 1.1 / 1.2 vendored-env boundary; 1.14.x with a pinned virtualenv.
-2. Refusal correctness: `overrides`, `template`, `[env]` collectors, custom env types (hatch-pip-compile lock plugin), hatch.toml `envs` non-table.
-3. Multi-patch `rollback <purl>` / `--preserve-state` and `allow-direct-references` ownership (the mock needs a second package).
-4. Windows long paths / drive letters for vendored `{root:uri}` (probe).
-5. Re-triage #335, #385, and the Hatch rows of #328 when main moves.
+1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Hatch version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+2. Hatch 1.0 / 1.1 / 1.2 vendored-env boundary; 1.14.x with a pinned virtualenv.
+3. Refusal correctness: `overrides`, `template`, `[env]` collectors, custom env types (hatch-pip-compile lock plugin), hatch.toml `envs` non-table.
+4. Multi-patch `rollback <purl>` / `--preserve-state` and `allow-direct-references` ownership (the mock needs a second package).
+5. Windows long paths / drive letters for vendored `{root:uri}` (probe).
+6. Re-triage #335, #385, and the Hatch rows of #328 when main moves.
 
 ## Known non-bugs
 - Vendored PEP 735 dependency groups are refused (Hatch does not expand `{root:uri}` there): documented.

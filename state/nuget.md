@@ -21,12 +21,13 @@ Cells: OS × SDK × mode. "warm" means the global packages folder already holds 
 
 ## Backlog
 
-1. Hosted: exact id already mapped to nuget.org in the user's mapping. Two HTTP sources for the same id may race without a lock.
-2. #354 on macOS/Windows (`%APPDATA%\NuGet\NuGet.Config`), plus machine-wide configs.
-3. Vendored/hosted with packages.config (`packages/`, `repositoryPath`), where there is no PackageReference and no lock.
-4. `scan` / VEX discovery with a custom `globalPackagesFolder` (the read-path sibling of #397).
-5. Unicode / space paths and Windows long paths (agent + vendor).
-6. Legacy `packages/<Id>.<Version>` parse with numeric id segments during `scan`.
+1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major NuGet / dotnet version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+2. Hosted: exact id already mapped to nuget.org in the user's mapping. Two HTTP sources for the same id may race without a lock.
+3. #354 on macOS/Windows (`%APPDATA%\NuGet\NuGet.Config`), plus machine-wide configs.
+4. Vendored/hosted with packages.config (`packages/`, `repositoryPath`), where there is no PackageReference and no lock.
+5. `scan` / VEX discovery with a custom `globalPackagesFolder` (the read-path sibling of #397).
+6. Unicode / space paths and Windows long paths (agent + vendor).
+7. Legacy `packages/<Id>.<Version>` parse with numeric id segments during `scan`.
 
 Also passed on Linux 8 (no issue): vendored with a BOM + CRLF `NuGet.Config` (+ byte-exact revert), multi-TFM + `RestoreLockedMode`, and a transitive-only patched package.
 

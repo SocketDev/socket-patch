@@ -17,12 +17,13 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real cargo build (`
 
 ## Backlog
 
-0. The stale probe branches `bughunt/cargo/20260930-vendor-dir` and `bughunt/cargo/20260930-index-dirs` still exist: the git proxy refused `git push --delete` with HTTP 403 in runs 1 and 2. A maintainer needs to delete them. Until deletes work, avoid new probe branches.
-1. `.cargo-checksum.json` formatting: agent `rollback` restores a `cargo vendor` checksum file semantically but not byte-for-byte (compact JSON is re-emitted pretty-printed; `sidecars/cargo.rs` uses `to_vec_pretty`). Check whether the contract promises byte-exact rollback for sidecars before filing. It's low severity.
-2. Hosted: `registry-index = …` deps; a project with `[registries]` / `[registry] default` config; hosted plus existing `[source.crates-io] replace-with` on a fresh `--locked` checkout; Windows fresh-checkout `--locked`.
-3. Vendored mode on Windows and macOS (CRLF checkouts, long paths under `.socket/vendor/cargo/<uuid>/`), and vendored builds on `cargo +1.41` / `+1.45`.
-4. Agent `--global` / `--global-prefix` against a CARGO_HOME with several index dirs, plus the git-index dir `github.com-1ecc6299db9ec823` (both the #339 family).
-5. `repair` in agent mode for a deleted vendored file; agent `vex` against a hand-edited `.cargo-checksum.json`.
+0. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Cargo version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+1. The stale probe branches `bughunt/cargo/20260930-vendor-dir` and `bughunt/cargo/20260930-index-dirs` still exist: the git proxy refused `git push --delete` with HTTP 403 in runs 1 and 2. A maintainer needs to delete them. Until deletes work, avoid new probe branches.
+2. `.cargo-checksum.json` formatting: agent `rollback` restores a `cargo vendor` checksum file semantically but not byte-for-byte (compact JSON is re-emitted pretty-printed; `sidecars/cargo.rs` uses `to_vec_pretty`). Check whether the contract promises byte-exact rollback for sidecars before filing. It's low severity.
+3. Hosted: `registry-index = …` deps; a project with `[registries]` / `[registry] default` config; hosted plus existing `[source.crates-io] replace-with` on a fresh `--locked` checkout; Windows fresh-checkout `--locked`.
+4. Vendored mode on Windows and macOS (CRLF checkouts, long paths under `.socket/vendor/cargo/<uuid>/`), and vendored builds on `cargo +1.41` / `+1.45`.
+5. Agent `--global` / `--global-prefix` against a CARGO_HOME with several index dirs, plus the git-index dir `github.com-1ecc6299db9ec823` (both the #339 family).
+6. `repair` in agent mode for a deleted vendored file; agent `vex` against a hand-edited `.cargo-checksum.json`.
 
 ## Known non-bugs
 

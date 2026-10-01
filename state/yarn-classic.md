@@ -23,12 +23,13 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 
 ## Backlog
 
-1. Yarn ≤ 1.6 pin signals (`.yarnrc yarn-path`, `packageManager: yarn@1.x`, `engines.yarn`): does vendored mode warn or refuse? Decide whether "success, then empty node_modules" is worth a docs or refusal issue.
-2. Interrupted runs (SIGKILL mid-rewrite) and recovery; `--dry-run` byte-identity on CRLF / BOM locks.
-3. `get <uuid> --mode vendored|hosted` targeting one version of a multi-version package; `scan --prune` / `--sync` after `yarn remove`.
-4. `.yarnrc` `--install.frozen-lockfile true`, `--pure-lockfile`, and locks produced by `yarn import`.
-5. `optionalDependencies` / platform-skipped (lock-only) packages in both modes and VEX.
-6. Older yarn on macOS / Windows (1.0.2 hosted), and 1.9.4 / 1.17.3 on the probe matrix.
+1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Yarn classic (1.x) version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+2. Yarn ≤ 1.6 pin signals (`.yarnrc yarn-path`, `packageManager: yarn@1.x`, `engines.yarn`): does vendored mode warn or refuse? Decide whether "success, then empty node_modules" is worth a docs or refusal issue.
+3. Interrupted runs (SIGKILL mid-rewrite) and recovery; `--dry-run` byte-identity on CRLF / BOM locks.
+4. `get <uuid> --mode vendored|hosted` targeting one version of a multi-version package; `scan --prune` / `--sync` after `yarn remove`.
+5. `.yarnrc` `--install.frozen-lockfile true`, `--pure-lockfile`, and locks produced by `yarn import`.
+6. `optionalDependencies` / platform-skipped (lock-only) packages in both modes and VEX.
+7. Older yarn on macOS / Windows (1.0.2 hosted), and 1.9.4 / 1.17.3 on the probe matrix.
 
 ## Known non-bugs
 

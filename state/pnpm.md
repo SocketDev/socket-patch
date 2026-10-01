@@ -25,12 +25,13 @@ Method: real pnpm installs. Agent and vendored modes use a hand-staged `.socket/
 
 ## Backlog
 
-0. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. Run 1 failed through the git proxy, and run 2 was denied by the session permission policy, so a maintainer needs to do it. Until deletion works, new probe branches can't be cleaned up, so macOS and Windows cells are on hold.
-1. Hosted: Rush / subspace locks and peer-suffixed workspace instances, using the mock harness.
-2. Hosted `--frozen-lockfile --offline` with a warm store holding the upstream tarball, on pnpm 9–12. Check that `vex` doesn't attest unpatched installed bytes.
-3. Agent: `dependenciesMeta.injected`, `package-import-method=clone|copy`, and pnpm 1–6 legacy layouts (Node 16).
-4. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout). Needs a probe branch.
-5. Re-verify #360–#362 (PR #365) and #400–#402 when fixes land.
+0. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major pnpm version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. Run 1 failed through the git proxy, and run 2 was denied by the session permission policy, so a maintainer needs to do it. Until deletion works, new probe branches can't be cleaned up, so macOS and Windows cells are on hold.
+2. Hosted: Rush / subspace locks and peer-suffixed workspace instances, using the mock harness.
+3. Hosted `--frozen-lockfile --offline` with a warm store holding the upstream tarball, on pnpm 9–12. Check that `vex` doesn't attest unpatched installed bytes.
+4. Agent: `dependenciesMeta.injected`, `package-import-method=clone|copy`, and pnpm 1–6 legacy layouts (Node 16).
+5. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout). Needs a probe branch.
+6. Re-verify #360–#362 (PR #365) and #400–#402 when fixes land.
 
 ## Known non-bugs
 
