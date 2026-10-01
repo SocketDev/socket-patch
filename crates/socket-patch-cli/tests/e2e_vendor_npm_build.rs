@@ -596,6 +596,119 @@ fn npm_vendor_vex_attests_against_vendored_tarball() {
     );
 }
 
+/// #326: a dependency installed from a remote-tarball spec (`"left-pad":
+/// "https://…/left-pad-1.3.0.tgz"`) is fetched from that url by `npm ci`,
+/// whatever the lock's `resolved` says. Vendoring used to rewire the entry
+/// and report `applied` (and `vex` attested it) while `npm ci` installed
+/// the original bytes. It must refuse, leave the lock untouched, and give
+/// `vex` nothing to attest.
+#[test]
+fn npm_vendor_refuses_a_remote_tarball_dependency() {
+    let suite = "e2e_vendor_npm_build (remote tarball)";
+    let Some(major) = npm_major_or_skip(suite) else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"vendor-url-spec","version":"0.0.0","private":true}"#,
+    )
+    .unwrap();
+    let cache = tmp.path().join("npm-cache");
+    let url = format!("https://registry.npmjs.org/{DEP}/-/{DEP}-{DEP_VERSION}.tgz");
+    // npm 12 refuses remote-tarball specs unless `allow-remote` permits them.
+    let spec = if major >= 12 {
+        format!("{url} --allow-remote=all")
+    } else {
+        url.clone()
+    };
+    let mut args = vec!["install", "--no-audit", "--no-fund", "--cache"];
+    args.push(cache.to_str().unwrap());
+    args.extend(spec.split(' '));
+    let out = npm(&proj, &args);
+    if !out.status.success() {
+        npm_e2e_common::skip(
+            suite,
+            &format!(
+                "`npm install {spec}` failed (registry unreachable?):\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        );
+        return;
+    }
+    let pkg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(proj.join("package.json")).unwrap()).unwrap();
+    assert_eq!(
+        pkg["dependencies"][DEP], url,
+        "the fixture depends on the url spec: {pkg}"
+    );
+
+    let installed_index = proj.join("node_modules").join(DEP).join("index.js");
+    let orig = std::fs::read(&installed_index).expect("installed index.js");
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    const GHSA: &str = "GHSA-vend-npm-url";
+    stage_patch_with_vuln(&proj, &purl, "package/index.js", &orig, &patched, GHSA);
+    if v1_lock_is_refused(&proj, major) {
+        return;
+    }
+    let lock_before = std::fs::read(proj.join("package-lock.json")).unwrap();
+
+    let (_code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(
+        env["summary"]["applied"], 0,
+        "a url-spec dependency must not be vendored: {env}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("vendor_lock_entry_not_rewritable") && stdout.contains("UNPATCHED"),
+        "the refusal must say why: {env}"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("package-lock.json")).unwrap(),
+        lock_before,
+        "the lock is untouched"
+    );
+    assert!(
+        !proj.join(format!(".socket/vendor/npm/{UUID}")).exists(),
+        "no artifact is written"
+    );
+
+    let vex_path = proj.join("out.vex.json");
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vex",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ],
+    );
+    let attested = std::fs::read(&vex_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|doc| doc["statements"].as_array().map(|s| !s.is_empty()))
+        .unwrap_or(false);
+    assert!(
+        !attested,
+        "vex must not attest an unwired patch (exit {code}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 /// get-driven twin of the capstone (v3.6): instead of hand-staging
 /// `.socket/` (manifest + blob) and running `vendor --offline`,
 /// `get <uuid> --mode vendored` resolves the SAME patch from a mocked

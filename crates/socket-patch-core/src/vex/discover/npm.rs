@@ -18,6 +18,9 @@
 //!   (workspace members — source dirs) are skipped, as are `link: true` and
 //!   `inBundle: true` entries: npm installs those from elsewhere, so a
 //!   Socket URL written there wires nothing (the rewriters refuse them too).
+//!   A bundled entry is still an install of its `name@version`, unpacked
+//!   unpatched from the parent's tarball, so it CONTESTS a ref for the same
+//!   version in either npm lock ([`push_uncontested`]) and in any other lock.
 //! * `dependencies` (lockfileVersion 1 ONLY): keyed by name, recursive
 //!   through nested `dependencies`; `bundled: true` skipped for the same
 //!   reason as `inBundle`. A v2 lock's `dependencies` is a legacy mirror
@@ -37,7 +40,7 @@
 //!   after the entry it rewires, so a leaf naming a DIFFERENT package than
 //!   the entry is not Socket-written and is diagnosed, not trusted.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -52,7 +55,10 @@ use crate::formats::pnpm::{
 };
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::pnpm::rush_lock_rels;
-use crate::vendor::lock_inventory::{npm_lock_nodes, LockIntegrity, NpmLockNode};
+use crate::vendor::lock_inventory::{
+    npm_lock_bundled_nodes, npm_lock_nodes, LockIntegrity, NpmLockNode,
+};
+use crate::vendor::npm_origin::npm_non_registry_entries;
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let mut locks: Vec<NpmLockRefs> = Vec::new();
@@ -66,11 +72,13 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 }
 
 /// What one parsed npm lock wires, plus the packages it resolves ELSEWHERE
-/// (an entry whose `resolved` is not a Socket reference).
+/// (an entry whose `resolved` is not a Socket reference) and the packages it
+/// installs BUNDLED (purl → the first bundled entry's lock location).
 struct NpmLockRefs {
     file: &'static str,
     refs: Vec<PatchedRef>,
     unwired: BTreeSet<String>,
+    bundled: BTreeMap<String, String>,
 }
 
 /// Push every ref no OTHER npm lock contests. npm <= 11 installs from
@@ -84,6 +92,10 @@ struct NpmLockRefs {
 /// another npm installs). The lock that does not mention the package at all
 /// contests nothing. Two locks wiring DIFFERENT patches are both emitted
 /// (the CLI's `wiring_conflict` gate).
+///
+/// A bundled copy of the ref's `name@version` in either lock contests it
+/// too, the same lock included (#325): the rewired entry and the bundled
+/// copy install side by side, and the bundled one stays unpatched.
 fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
     let wired: Vec<BTreeSet<String>> = locks
         .iter()
@@ -91,6 +103,27 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
         .collect();
     for (i, lock) in locks.iter().enumerate() {
         for r in &lock.refs {
+            // A bundled copy of the same `name@version` in EITHER lock of the
+            // pair: npm unpacks it from the parent's tarball, so it installs
+            // unpatched beside the rewired entry whichever lock npm reads.
+            let bundled_in = locks
+                .iter()
+                .find_map(|l| l.bundled.get(&r.purl).map(|loc| (l.file, loc)));
+            if let Some((bundle_file, location)) = bundled_in {
+                out.diag(
+                    DIAG_REF_UNATTRIBUTABLE,
+                    lock.file,
+                    format!(
+                        "{}: {} is wired to Socket patch {} but {bundle_file} also installs a \
+                         bundled copy of it at {location:?} (npm unpacks bundled \
+                         dependencies from the parent package's tarball, so no rewire \
+                         reaches it and that copy stays unpatched); the patch is not \
+                         attested while the build ships unpatched bytes of this version",
+                        lock.file, r.purl, r.uuid,
+                    ),
+                );
+                continue;
+            }
             let contested_by = locks.iter().enumerate().find(|(j, other)| {
                 *j != i && other.unwired.contains(&r.purl) && !wired[*j].contains(&r.purl)
             });
@@ -127,6 +160,7 @@ async fn extract_package_lock(
         file,
         refs: Vec::new(),
         unwired: BTreeSet::new(),
+        bundled: BTreeMap::new(),
     };
     let doc: Value = match parse_json(file, &bytes) {
         Ok(doc) => doc,
@@ -144,7 +178,72 @@ async fn extract_package_lock(
     for node in npm_lock_nodes(&doc) {
         entry_ref(ctx, file, &node, &mut read, out);
     }
+    // Bundled entries are never refs (a Socket url written there wires
+    // nothing), but each one IS an install of that `name@version` from a
+    // non-Socket source — the parent's tarball — so it contests a ref for
+    // the same version, here ([`push_uncontested`]) and in any other lock
+    // (the orchestrator).
+    for (location, node) in npm_lock_bundled_nodes(&doc) {
+        if let Some(purl) = node.version.and_then(|v| npm_purl(node.name, v)) {
+            out.resolved_elsewhere(file, Some(purl.clone()));
+            read.bundled.entry(purl).or_insert(location);
+        }
+    }
+    drop_non_registry_installs(file, &doc, &mut read, out);
     Some(read)
+}
+
+/// npm installs a git / url / `file:` dependency from the dependent's spec
+/// and ignores the entry's `resolved` (`vendor::npm_origin`, #326), so such
+/// an entry stays unpatched whatever its `resolved` says. Every ref for the
+/// same `name@version` is dropped (that copy is live beside it), and the
+/// copy counts as resolved elsewhere, so other locks' wiring for it is
+/// contested too.
+fn drop_non_registry_installs(
+    file: &str,
+    doc: &Value,
+    read: &mut NpmLockRefs,
+    out: &mut Discovery,
+) {
+    let non_registry = npm_non_registry_entries(doc);
+    if non_registry.is_empty() {
+        return;
+    }
+    let mut unpatched: Vec<(String, &str, &str)> = Vec::new();
+    for (key, reason) in &non_registry {
+        let entry = &doc["packages"][key.as_str()];
+        let key_name = key.rsplit_once("node_modules/").map_or("", |(_, n)| n);
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(key_name);
+        let Some(purl) = entry
+            .get("version")
+            .and_then(Value::as_str)
+            .and_then(|v| npm_purl(name, v))
+        else {
+            continue;
+        };
+        out.resolved_elsewhere(file, Some(purl.clone()));
+        read.unwired.insert(purl.clone());
+        unpatched.push((purl, key, reason));
+    }
+    read.refs.retain(|r| {
+        let Some((_, key, reason)) = unpatched.iter().find(|(p, _, _)| *p == r.purl) else {
+            return true;
+        };
+        out.diag(
+            DIAG_REF_UNATTRIBUTABLE,
+            file,
+            format!(
+                "{file}: {} is wired to a Socket patch but lock entry `{key}` is not \
+                 installed from the registry ({reason}); npm installs it from that spec, so \
+                 that copy stays UNPATCHED and nothing is attested",
+                r.purl
+            ),
+        );
+        false
+    });
 }
 
 /// Classify one lock entry: a ref (into `read.refs`), a package resolved
@@ -838,6 +937,222 @@ mod tests {
         );
         let out = run(&v1).await;
         assert!(out.refs.is_empty(), "{:#?}", out.refs);
+    }
+
+    /// The `DIAG_REF_UNATTRIBUTABLE` diagnostics that name a bundled copy.
+    fn bundled_contests(out: &Discovery) -> Vec<&Diag> {
+        out.diagnostics
+            .iter()
+            .filter(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("bundled"))
+            .collect()
+    }
+
+    /// REGRESSION (#325): the rewired hoisted entry plus an `inBundle` copy
+    /// of the SAME `name@version` (npm unpacks it from the parent's tarball,
+    /// so no rewire reaches it and it stays unpatched) is NOT attested, in
+    /// either mode: the build ships unpatched bytes of that package. The
+    /// uuid stays recognized, so the ledger record is dead too, and a
+    /// bundled copy of a DIFFERENT version contests nothing.
+    #[tokio::test]
+    async fn bundled_copy_of_the_same_version_contests_the_wired_entry() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        let bundled = serde_json::json!({
+            "version": "1.3.0",
+            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+            "integrity": "sha512-ORIG",
+            "inBundle": true,
+        });
+        for (label, resolved, uuid, mode) in [
+            ("hosted", hosted.clone(), UUID_A, WiringMode::Hosted),
+            ("vendored", vendored.clone(), UUID_B, WiringMode::Vendored),
+        ] {
+            let p = Project::new();
+            p.write(
+                "package-lock.json",
+                lock_with_packages(serde_json::json!({
+                    "node_modules/left-pad": { "version": "1.3.0", "resolved": resolved, "integrity": SRI },
+                    "node_modules/bund": { "version": "1.0.0", "resolved": "file:bund-1.0.0.tgz" },
+                    "node_modules/bund/node_modules/left-pad": bundled,
+                })),
+            );
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{label}: {:#?}", out.refs);
+            let contested = bundled_contests(&out);
+            assert_eq!(contested.len(), 1, "{label}: {:#?}", out.diagnostics);
+            assert!(
+                contested[0].detail.contains("pkg:npm/left-pad@1.3.0")
+                    && contested[0]
+                        .detail
+                        .contains("node_modules/bund/node_modules/left-pad"),
+                "{label}: {:#?}",
+                contested[0]
+            );
+            assert!(out.recognizes(uuid, mode), "{label}: {:#?}", out.recognized);
+        }
+
+        // A bundled copy of another version is a different package: the
+        // wired entry is still attested.
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({
+                "node_modules/left-pad": { "version": "1.3.0", "resolved": hosted, "integrity": SRI },
+                "node_modules/bund/node_modules/left-pad": {
+                    "version": "1.2.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.2.0.tgz",
+                    "inBundle": true,
+                },
+            })),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
+        );
+        assert!(bundled_contests(&out).is_empty(), "{:#?}", out.diagnostics);
+    }
+
+    /// REGRESSION (#325), lockfileVersion 1: a `bundled: true` copy nested in
+    /// the parent's `dependencies` contests the wired top-level entry the
+    /// same way.
+    #[tokio::test]
+    async fn v1_bundled_copy_contests_the_wired_entry() {
+        let url = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            serde_json::json!({
+                "lockfileVersion": 1,
+                "dependencies": {
+                    "left-pad": { "version": "1.3.0", "resolved": url, "integrity": SRI },
+                    "bund": {
+                        "version": "1.0.0",
+                        "resolved": "file:bund-1.0.0.tgz",
+                        "dependencies": {
+                            "left-pad": { "version": "1.3.0", "bundled": true }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let out = run(&p).await;
+        assert!(out.refs.is_empty(), "{:#?}", out.refs);
+        assert_eq!(bundled_contests(&out).len(), 1, "{:#?}", out.diagnostics);
+    }
+
+    /// REGRESSION (#325): the bundled copy sits in the OTHER npm lock of the
+    /// pair (npm <= 11 installs from the shrinkwrap, npm 12 from
+    /// package-lock.json). Either way that lock's install unpacks the
+    /// unpatched copy, so the ref is not attested.
+    #[tokio::test]
+    async fn bundled_copy_in_the_sibling_npm_lock_contests_the_ref() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let wired = serde_json::json!({
+            "version": "1.3.0", "resolved": hosted, "integrity": SRI,
+        });
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({ "node_modules/left-pad": wired.clone() })),
+        );
+        p.write(
+            "npm-shrinkwrap.json",
+            lock_with_packages(serde_json::json!({
+                "node_modules/left-pad": wired,
+                "node_modules/bund/node_modules/left-pad": {
+                    "version": "1.3.0", "inBundle": true,
+                },
+            })),
+        );
+        let out = run(&p).await;
+        assert!(out.refs.is_empty(), "{:#?}", out.refs);
+        assert_eq!(bundled_contests(&out).len(), 2, "{:#?}", out.diagnostics);
+    }
+
+    /// #326: a Socket-wired entry npm installs from a git / url / `file:`
+    /// spec (a lock rewired before the rewriters refused these, or by
+    /// hand) wires nothing, and neither does a wired registry copy while a
+    /// non-registry copy of the same version stays unpatched beside it.
+    #[tokio::test]
+    async fn entries_npm_installs_from_a_non_registry_spec_are_not_attested() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        let tarball = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        for spec in [
+            "github:stevemao/left-pad#v1.3.0",
+            tarball,
+            "file:../left-pad-1.3.0.tgz",
+        ] {
+            for (wiring, resolved) in [("hosted", &hosted), ("vendored", &vendored)] {
+                let p = Project::new();
+                p.write(
+                    "package-lock.json",
+                    lock_with_packages(serde_json::json!({
+                        "": { "name": "app", "version": "1.0.0",
+                              "dependencies": { "left-pad": spec } },
+                        "node_modules/left-pad": {
+                            "version": "1.3.0", "resolved": resolved, "integrity": SRI
+                        },
+                    })),
+                );
+                let out = run(&p).await;
+                assert!(
+                    out.refs.is_empty(),
+                    "{spec} / {wiring}: {} refs",
+                    out.refs.len()
+                );
+                assert!(
+                    diag_codes(&out).contains(&DIAG_REF_UNATTRIBUTABLE),
+                    "{spec} / {wiring}: {:?}",
+                    diag_codes(&out)
+                );
+            }
+        }
+        // Transitive: the hoisted copy is wired, a nested git copy of the
+        // same version is not.
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({
+                "": { "name": "app", "version": "1.0.0",
+                      "dependencies": { "a": "^1.0.0", "left-pad": "^1.3.0" } },
+                "node_modules/a": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+                    "dependencies": { "left-pad": "stevemao/left-pad#v1.3.0" }
+                },
+                "node_modules/a/node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba"
+                },
+                "node_modules/left-pad": { "version": "1.3.0", "resolved": hosted, "integrity": SRI },
+            })),
+        );
+        let out = run(&p).await;
+        assert!(out.refs.is_empty(), "{} refs", out.refs.len());
+        let diag = out
+            .diagnostics
+            .iter()
+            .find(|d| d.code == DIAG_REF_UNATTRIBUTABLE)
+            .unwrap_or_else(|| panic!("{:?}", out.diagnostics));
+        assert!(
+            diag.detail.contains("node_modules/a/node_modules/left-pad"),
+            "{}",
+            diag.detail
+        );
+        // Control: a registry spec keeps the ref.
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({
+                "": { "name": "app", "version": "1.0.0",
+                      "dependencies": { "left-pad": "^1.3.0" } },
+                "node_modules/left-pad": { "version": "1.3.0", "resolved": hosted, "integrity": SRI },
+            })),
+        );
+        assert_eq!(run(&p).await.refs.len(), 1);
     }
 
     /// Negative shapes: a uuid on a foreign host, a placeholder token, the
