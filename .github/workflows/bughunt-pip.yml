@@ -29,7 +29,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: probe
         run: |
-          set -x
+          set +e -x
           W="$RUNNER_TEMP/w"; mkdir -p "$W"; cd "$W"
           BIN="$GITHUB_WORKSPACE/target/release/socket-patch"; [ -f "$BIN.exe" ] && BIN="$BIN.exe"
           python -m venv pv
