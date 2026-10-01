@@ -104,10 +104,9 @@ pub struct BatchPatchInfo {
     /// [`PatchResponse::published_at`]), if the server supplies it. The
     /// batch shape may omit it, which is why it is optional — a `None`
     /// ranks as oldest in [`crate::api::ranking`], which weakens recency
-    /// ordering (the sole key among merged patches, the tiebreak after
-    /// severity otherwise) but never changes merge state or severity. The
-    /// public-proxy fallback path fills it in from the per-package search
-    /// results.
+    /// ordering (the tiebreak after severity and advisory count) but never
+    /// changes severity or advisory count. The public-proxy fallback path
+    /// fills it in from the per-package search results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_at: Option<String>,
 }

@@ -6613,9 +6613,9 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
 
         const SDIST_NAME: &str = "six-1.16.0.tar.gz";
 
-        /// A server sdist carrying the patched `six.py`; `salt` varies the
+        /// A server sdist carrying the patched `six.py`; `readme` varies the
         /// bytes without breaking verification.
-        fn served_sdist(salt: &[u8]) -> Vec<u8> {
+        fn served_sdist(readme: &[u8]) -> Vec<u8> {
             let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
                 Vec::new(),
                 flate2::Compression::default(),
@@ -6626,7 +6626,7 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
                     "six-1.16.0/PKG-INFO",
                     b"Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n\n".as_slice(),
                 ),
-                ("six-1.16.0/README", salt),
+                ("six-1.16.0/README", readme),
             ] {
                 let mut header = tar::Header::new_gnu();
                 header.set_size(bytes.len() as u64);

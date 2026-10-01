@@ -2531,9 +2531,8 @@ fn convert_search_result_to_batch_info(patch: PatchSearchResult) -> BatchPatchIn
         title,
         // Carry the timestamp through. The batch shape does not require it,
         // but dropping it here would cost this path its recency ordering in
-        // `ranking` (the sole key among merged patches, the tiebreak after
-        // severity otherwise) — and it is the one path where we definitely
-        // have it.
+        // `ranking` (the tiebreak after severity and advisory count) — and
+        // it is the one path where we definitely have it.
         published_at: Some(patch.published_at),
     }
 }

@@ -159,8 +159,8 @@ const GEM_VERSION: &str = "6.0.3";
 /// Any-of pin set for the gem leg: `(patch uuid, the file its diff marks)`.
 /// Production has published several distinct free 6.0.3 patches (one per
 /// advisory), the manifest holds one patch per PURL, and the CLI's own
-/// ranking (`socket_patch_core::api::ranking`: newest merged patch first,
-/// otherwise severity, then newest) picks one — the pick changes whenever
+/// ranking (`socket_patch_core::api::ranking`: severity, advisory count,
+/// then newest) picks one — the pick changes whenever
 /// production publishes a new or merged patch, so the leg accepts any pinned patch and probes the marker file that PATCH
 /// actually touches. When production publishes another acceptable 6.0.3
 /// patch, verify its `/patch/view` blobs carry the marker and append it here

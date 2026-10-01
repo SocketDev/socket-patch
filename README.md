@@ -118,8 +118,9 @@ socket-patch rollback                      # restore upstream dependencies
 ```
 
 `get` also accepts a GHSA, patch UUID, PURL, or package name. `scan` selects from
-patches your account can download, preferring the newest merged patch and then the
-highest-severity patch. Existing patches are upgraded only by a better-ranked patch.
+patches your account can download, preferring the highest severity, then the most
+advisories fixed, then the newest publication date. Existing patches are upgraded
+only by a better-ranked patch.
 
 Hosted rollback resolves upstream metadata and generally needs network access.
 Where restoration is unsupported, including hosted binary `bun.lockb`, the CLI

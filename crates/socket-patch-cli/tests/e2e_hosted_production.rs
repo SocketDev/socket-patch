@@ -794,16 +794,15 @@ async fn preflight_required_patches_are_published() {
     );
 }
 
-/// Canary: production must keep naming advisories, because merge state is
-/// **inferred** from the advisory count rather than read off a flag.
+/// Canary: production must keep naming advisories, because advisory count
+/// breaks severity ties in the patch ranking.
 ///
 /// `api::ranking` ranks a patch that remediates several advisories above one
-/// that remediates a single advisory. The whole signal is the size of the
-/// `vulnerabilities` map. If production ever stopped populating it — shipping
-/// patches with an empty map, or moving advisory ids somewhere else — every
-/// patch would collapse to coverage 0, the merge rung would go permanently
-/// inert, and selection would silently fall through to recency with no error
-/// anywhere.
+/// that remediates a single advisory at the same severity. The signal is the
+/// size of the `vulnerabilities` map. If production ever stopped populating
+/// it — shipping patches with an empty map, or moving advisory ids somewhere
+/// else — every patch would collapse to coverage 0, the advisory-count rung
+/// would become inert, and equal-severity selection would silently fall through to recency.
 ///
 /// This asserts only that the signal EXISTS (every patch names >= 1
 /// advisory), never how many. Production published its first merged patch on

@@ -113,8 +113,8 @@ const P_RACK: Patch = Patch {
     severities: &["high"],
     published: "2024-01-01T00:00:00Z",
 };
-/// A merged (two-advisory) low patch for alpha: ranks first while no floor
-/// applies.
+/// A merged (two-advisory) low patch for alpha: ranks below P_ALPHA's
+/// higher severity, even though it fixes more advisories.
 const P_ALPHA_MERGED_LOW: Patch = Patch {
     uuid: "a2a2a2a2-0000-4000-8000-000000000002",
     name: "alpha",
@@ -713,26 +713,53 @@ async fn report_only_json_fails_when_every_detail_query_fails() {
 
 #[tokio::test]
 #[serial]
-async fn recorded_merged_patch_below_a_new_floor_is_kept() {
+async fn recorded_merge_below_the_floor_is_kept_until_a_more_severe_patch_is_available() {
     let server = MockServer::start().await;
-    mount_api(&server, vec![P_ALPHA_MERGED_LOW, P_ALPHA]).await;
+    mount_api(&server, vec![P_ALPHA_MERGED_LOW]).await;
     let repo = Repo::new(None);
     let web = repo.dir("services/web");
     let (code, doc) = scan_json(&web, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "{doc:#}");
     let pinned = repo.lock("services/web");
-    assert!(pinned.contains(&P_ALPHA_MERGED_LOW.hosted_url()), "merged ranks first:\n{pinned}");
+    assert!(
+        pinned.contains(&P_ALPHA_MERGED_LOW.hosted_url()),
+        "the only available patch is pinned:\n{pinned}"
+    );
 
     std::fs::write(repo.root.join("socket.yml"), "version: 2\npatches:\n  minSeverity: high\n").unwrap();
     let (code, doc) = scan_json(&web, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(repo.lock("services/web"), pinned, "the floor never replaces the recorded merged patch");
-    assert_eq!(doc["policy"]["minSeverity"], json!({"value": "high", "source": "file"}));
-    assert_eq!(doc["policy"]["counts"]["filtered"], 0, "a kept recorded patch is not a skip: {:#}", doc["policy"]);
+    assert_eq!(
+        repo.lock("services/web"),
+        pinned,
+        "the floor keeps an existing patch when no upgrade is available"
+    );
+    assert_eq!(
+        doc["policy"]["minSeverity"],
+        json!({"value": "high", "source": "file"})
+    );
+    assert_eq!(
+        doc["policy"]["counts"]["filtered"], 0,
+        "a kept recorded patch is not a skip: {:#}",
+        doc["policy"]
+    );
 
-    // The floor is live: a fresh root with the same offers gets the
-    // floor-admitted patch, not the merged low one.
-    let fresh = Repo::new(Some("version: 2\npatches:\n  minSeverity: high\n"));
+    // A higher-severity single patch now outranks the recorded lower-
+    // severity merge. Both a re-scan and a fresh scan must choose it.
+    server.reset().await;
+    mount_api(&server, vec![P_ALPHA_MERGED_LOW, P_ALPHA]).await;
+    let (code, doc) = scan_json(&web, &server.uri(), &[], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    let upgraded = repo.lock("services/web");
+    assert!(upgraded.contains(&P_ALPHA.hosted_url()), "{upgraded}");
+    assert!(!upgraded.contains(P_ALPHA_MERGED_LOW.uuid), "{upgraded}");
+    assert_eq!(
+        doc["updates"][0]["oldUuid"], P_ALPHA_MERGED_LOW.uuid,
+        "{doc:#}"
+    );
+    assert_eq!(doc["updates"][0]["newUuid"], P_ALPHA.uuid, "{doc:#}");
+
+    let fresh = Repo::new(None);
     let (code, doc) = scan_json(&fresh.dir("services/web"), &server.uri(), &[], &[]);
     assert_eq!(code, 0, "{doc:#}");
     let lock = fresh.lock("services/web");

@@ -298,7 +298,7 @@ async fn scan_emits_updates_entry_when_newer_uuid_available() {
 #[tokio::test]
 async fn scan_update_candidate_is_the_highest_ranked_patch() {
     // `updates[].newUuid` must name the patch `--apply` would install —
-    // the highest-ranked one (merged → severity → recency), NOT whatever
+    // the highest-ranked one (severity → advisory count → recency), NOT whatever
     // the server listed first. The two are computed by different code over
     // different API shapes (`detect_updates` over the batch response,
     // `select_patches` over by-package), so they can drift.

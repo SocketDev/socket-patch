@@ -232,7 +232,7 @@ patches:
 
 **The trust boundary holds.** No key names an endpoint, a credential, an org, a mode, a download format or a safety switch — such keys are unknown keys and fail validation. Every key only removes candidates or (`maxNewPatches`) delays them; none can add a package or bypass the tier filter, the agent partition, reference grants, containment checks or any refusal.
 
-**Narrowing never removes.** The policy runs after the `--prune` universe is captured, so `--prune` still judges the full crawl. A package that already carries a recorded patch (the merged recorded view: manifest > hosted lockfile pins > vendor ledger) and is now excluded by paths, ecosystems, packages or `enabled: false` is **retained**: never handed to the hosted rewriters, the vendor engine or agent apply, never upgraded, left byte-identical, and listed under `policy.retained[]` with `upgradeAvailable`. A recorded package whose patches all fall below a new floor keeps its recorded patch, and the floor never replaces a recorded patch that outranks every admitted one (a recorded merged patch stays). Removing a patch is only ever `rollback` / `remove`, or the dependency leaving the lockfile.
+**Narrowing never removes.** The policy runs after the `--prune` universe is captured, so `--prune` still judges the full crawl. A package that already carries a recorded patch (the merged recorded view: manifest > hosted lockfile pins > vendor ledger) and is now excluded by paths, ecosystems, packages or `enabled: false` is **retained**: never handed to the hosted rewriters, the vendor engine or agent apply, never upgraded, left byte-identical, and listed under `policy.retained[]` with `upgradeAvailable`. A recorded package whose patches all fall below a new floor keeps its recorded patch, and the floor never replaces a recorded patch that outranks every admitted one. Removing a patch is only ever `rollback` / `remove`, or the dependency leaving the lockfile.
 
 **`enabled: false`.** Discovery and the table still run; nothing is written (the `--prune` GC is skipped too); every candidate is reported `policy_disabled` (recorded ones as retained); warning `patches_disabled`; exit 0.
 
@@ -1385,14 +1385,14 @@ record per PURL, so exactly one is chosen. Both `get` and every `scan`
 mode rank candidates identically (`socket_patch_core::api::ranking`),
 best first (v5.0, MAJOR):
 
-1. **Merged patches** (a patch naming ≥ 2 advisories; inferred, see
-   below), **newest first, whatever their severity**. A merged patch is
-   the cumulative fix for its package, so the most recent one wins
-   outright — even against a newer single-advisory `critical` patch.
-2. **Everything else** — by **severity** (`critical > high > medium =
-   moderate > low > (unknown)`, the worst severity across everything the
-   patch fixes), then **patch publish date**, most recent first.
-3. `tier` (paid first), then `uuid` — tiebreaks only, present so the
+1. **Severity** (`critical > high > medium = moderate > low > (unknown)`),
+   using the worst severity across everything the patch fixes.
+2. **Advisory count**, most distinct advisories fixed first. This breaks
+   severity ties, including between merged patches: a three-advisory
+   `high` patch beats a two-advisory `high` patch, but neither beats a
+   single-advisory `critical` patch.
+3. **Patch publish date**, most recent first.
+4. `tier` (paid first), then `uuid` — tiebreaks only, present so the
    order is total and therefore reproducible across runs.
 
 "Publish date" is when the *patch* was published, never the upstream
@@ -1404,10 +1404,10 @@ false, so the winner is the best patch the account can download.
 
 `scan`'s `[UPDATE]` marker and `updates[]` use the same order
 (`ranking::search_result_supersedes`, v5.0): a candidate supersedes the
-applied patch only on a meaningful rung — merged over unmerged, higher
-severity between unmerged patches, or a real, strictly later publish
-date. The tier and uuid tiebreaks and a missing date never count. Every
-mode that fetches the by-package records (hosted, vendored, agent, and
+applied patch only on a meaningful rung — higher severity, more advisories
+at equal severity, or a real, strictly later publish date at equal severity
+and advisory count. The tier and uuid tiebreaks and a missing date never
+count. Every mode that fetches the by-package records (hosted, vendored, agent, and
 every human run with a downloadable patch) judges this on those records,
 so `updates[]` lists exactly the UPGRADE rows the run acts on; a package
 the by-package lookup returns no offer for, and a JSON report-only run
@@ -1422,19 +1422,18 @@ see "Per-run limit on new patches"): severity of the selected patch, then
 advisory count, then ecosystem, base purl and uuid — never the publish
 date.
 
-#### Merge state is inferred, not reported
+#### Advisory count
 
-There is no `merged` field on the wire and none is required. A merged
-patch is by definition one that folds several fixes into a single blob,
-so it **names several advisories** — which every endpoint already tells
-us. Merge state is therefore the count of distinct advisories a patch
-remediates: `vulnerabilities` map keys on `by-package` / `view`,
-`ghsaIds` on `batch` (falling back to `cveIds` only when no GHSA is
-named). `1` is an ordinary patch, `>= 2` is merged.
+There is no `merged` field on the wire and none is required. The count is
+the number of distinct advisories a patch names: `vulnerabilities` map
+keys on `by-package` / `view`, distinct `ghsaIds` on `batch` (falling back
+to distinct `cveIds` only when no GHSA is named). A patch naming several
+advisories is a merged patch, but its count does not prove that it includes
+every fix from another patch.
 
-Advisories are counted, **not** CVE ids: one advisory routinely carries
-several CVE aliases, and counting those would inflate a single-fix patch
-into a phantom merged one.
+When GHSA ids are present, CVE aliases do not increase the count: one
+advisory routinely carries several CVE aliases. Repeated ids in a batch
+response are counted once.
 
 Production published its first merged patch on 2026-09-04.
 
@@ -1464,7 +1463,7 @@ per-package results).
 > built from the **batch** endpoint, whose response shape currently omits `publishedAt`;
 > the selection that `--apply` performs is built from the **by-package**
 > endpoint, which carries it. The two diverge wherever the date decides —
-> between merged patches, or between unmerged patches of equal severity —
+> between patches of equal severity and advisory count —
 > where the batch side falls through to the tier/UUID tiebreak while apply
 > correctly uses the date.
 >

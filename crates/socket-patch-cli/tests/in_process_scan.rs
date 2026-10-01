@@ -355,23 +355,26 @@ async fn scan_apply_wet_writes_manifest_and_blob() {
 /// uuid tiebreak rather than the severity ranking would still name `UUID`.
 const UUID_LOW: &str = "22222222-2222-4222-8222-222222222222";
 
-/// A package with two available patches: a freshly-published `low` and an
-/// older `critical`. `paid` toggles `canAccessPaidPatches`, which selects
-/// between `select_patches`' paid auto-select branch and its free-tier
+/// A package with two available patches: a freshly-published merged `low`
+/// and an older single-advisory `critical`. `paid` toggles
+/// `canAccessPaidPatches`, which selects between `select_patches`' paid
+/// auto-select branch and its free-tier
 /// `--yes` auto-select (scan never prompts).
 ///
-/// Neither is merged, so severity must beat recency.
+/// Severity must beat both advisory count and recency.
 async fn mock_two_patches(server: &MockServer, paid: bool) {
     let low = serde_json::json!({
         "uuid": UUID_LOW, "purl": PURL, "tier": "free",
         // Uppercase severity + RFC 2822 date, exactly as production emits
         // them (verified against patches-api.socket.dev).
-        "cveIds": [], "ghsaIds": [], "severity": "LOW", "title": "low sev",
+        "cveIds": [], "ghsaIds": ["GHSA-low0-low0-low0", "GHSA-low1-low1-low1"],
+        "severity": "LOW", "title": "low sev",
         "publishedAt": "Mon, 03 Aug 2026 20:23:06 GMT",
     });
     let critical = serde_json::json!({
         "uuid": UUID, "purl": PURL, "tier": "free",
-        "cveIds": [], "ghsaIds": [], "severity": "CRITICAL", "title": "critical sev",
+        "cveIds": [], "ghsaIds": ["GHSA-crit-crit-crit"],
+        "severity": "CRITICAL", "title": "critical sev",
         "publishedAt": "Wed, 01 Jan 2025 00:00:00 GMT",
     });
     Mock::given(method("POST"))
@@ -395,9 +398,14 @@ async fn mock_two_patches(server: &MockServer, paid: bool) {
                     "uuid": UUID_LOW, "purl": PURL,
                     "publishedAt": "Mon, 03 Aug 2026 20:23:06 GMT",
                     "description": "low", "license": "MIT", "tier": "free",
-                    "vulnerabilities": { "GHSA-low0-low0-low0": {
-                        "cves": [], "summary": "s", "severity": "LOW", "description": "d"
-                    }}
+                    "vulnerabilities": {
+                        "GHSA-low0-low0-low0": {
+                            "cves": [], "summary": "s", "severity": "LOW", "description": "d"
+                        },
+                        "GHSA-low1-low1-low1": {
+                            "cves": [], "summary": "s", "severity": "LOW", "description": "d"
+                        }
+                    }
                 },
                 {
                     "uuid": UUID, "purl": PURL,

@@ -47,9 +47,9 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
   requests or writes. Discovered test and fixture projects are excluded by
   default; literal project targets skip those defaults. Hosted/vendored PATHs
   outside the repository are rejected.
-- Automatic patch selection prefers the newest merged patch, otherwise severity
-  and publication date. Existing patches change only when the new patch outranks
-  them; tier/UUID tie-breaking alone does not trigger replacement.
+- Automatic patch selection prefers the highest severity, then the most advisories
+  fixed, then publication date. Existing patches change only when the new patch
+  outranks them; tier/UUID tie-breaking alone does not trigger replacement.
 - `setup`, its publishing helpers, and the PyPI/RubyGems CLI distributions are
   removed. Standalone binaries, Cargo, and npm remain supported; Python and Ruby
   project support is unchanged. Remove old hooks using the migration guide.

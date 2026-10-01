@@ -978,11 +978,10 @@ fn forced_identifier_error(identifier: &str, id_type: IdentifierType) -> Option<
 
 /// Select one patch per PURL from available patches.
 ///
-/// Within a PURL, candidates are ranked by [`cmp_search_results`]: merged
-/// patches first (newest first, whatever their severity); other patches by
-/// severity (critical → low), then most recently published. `tier` is an
-/// access filter here, not a ranking signal — a free critical patch
-/// outranks a paid low one.
+/// Within a PURL, candidates are ranked by [`cmp_search_results`]: severity
+/// first (critical → low), then most advisories fixed, then most recently
+/// published. `tier` is an access filter here, not a ranking signal — a
+/// free critical patch outranks a paid low one.
 ///
 /// - Users with paid access: auto-select the top-ranked patch per PURL.
 /// - Free users with one patch, or with `--yes`: auto-select the
@@ -1026,7 +1025,7 @@ pub(crate) fn select_patches(
 
         if can_access_paid {
             // Take the top-ranked patch. Note this is NOT "prefer paid":
-            // tier only breaks ties once the merged/severity/recency ranking
+            // tier only breaks ties once the severity/coverage/recency ranking
             // (see `api::ranking`) has tied.
             selected.push(group[0].clone());
         } else if group.len() == 1 || (common.yes && !common.json) {
@@ -4050,9 +4049,7 @@ mod tests {
     }
 
     #[test]
-    fn select_prefers_the_merged_patch_over_a_higher_severity_one() {
-        // A merged patch is the cumulative fix, so it wins even against a
-        // newer single-advisory CRITICAL.
+    fn select_prefers_a_higher_severity_patch_over_a_lower_severity_merge() {
         let patches = vec![
             mk_patch_sev(
                 "a_critical",
@@ -4071,7 +4068,34 @@ mod tests {
         ];
         let out = select_patches(&patches, true, &human_args()).expect("ok");
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].uuid, "z_merged");
+        assert_eq!(out[0].uuid, "a_critical");
+    }
+
+    #[test]
+    fn select_prefers_more_fixes_between_equal_severity_merges() {
+        let patches = vec![
+            mk_patch_multi(
+                "a_newer",
+                "pkg:npm/foo@1.0",
+                "free",
+                "2026-06-01",
+                &["high", "high"],
+            ),
+            mk_patch_multi(
+                "z_broader",
+                "pkg:npm/foo@1.0",
+                "free",
+                "2020-01-01",
+                &["high", "low", "low"],
+            ),
+        ];
+        let mut args = human_args();
+        args.yes = true;
+        for can_access_paid in [true, false] {
+            let out = select_patches(&patches, can_access_paid, &args).expect("ok");
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].uuid, "z_broader");
+        }
     }
 
     #[test]
@@ -4148,7 +4172,7 @@ mod tests {
 
     #[test]
     fn select_paid_user_prefers_paid_when_everything_else_ties() {
-        // Tier survives only as a late tiebreak: same merge status, same
+        // Tier survives only as a late tiebreak: same advisory count, same
         // (absent) severity, same publish date → paid wins.
         let patches = vec![
             mk_patch("free1", "pkg:npm/foo@1.0", "free", "2024-01-01"),

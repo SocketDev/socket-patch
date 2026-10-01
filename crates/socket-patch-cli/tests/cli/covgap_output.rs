@@ -337,7 +337,7 @@ fn single_file_view() -> serde_json::Value {
 /// be caught by the request log rather than dying on a confusing 404.
 ///
 /// Both patches carry the same `publishedAt` and no vulnerabilities, so
-/// `cmp_search_results` falls through merge coverage/severity/recency/tier to its
+/// `cmp_search_results` falls through severity/advisory count/recency/tier to its
 /// uuid-ascending backstop: UUID_A ranks first, deterministically, without
 /// depending on how the date string parses.
 async fn mount_two_free_patches(mock: &MockServer, purl: &str, encoded: &str) {

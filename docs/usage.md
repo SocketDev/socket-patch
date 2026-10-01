@@ -37,11 +37,11 @@ accepts a patch UUID or package name. It defaults to hosted mode; `--save-only` 
 global targeting default to agent mode instead. Hosted and vendored `get` do not
 prompt. Agent-mode searches can offer an interactive choice.
 
-For each package version, automatic selection prefers the newest downloadable
-merged patch (covering multiple advisories). Otherwise it selects by severity and
-then publication date. Exact ties use tier and UUID. A rerun replaces a recorded
-patch only with one that outranks it by merge status, severity, or date; tie-breaking
-alone does not cause a replacement. The
+For each package version, automatic selection prefers the highest severity among
+downloadable patches, then the most distinct advisories fixed, then the newest
+publication date. Exact ties use tier and UUID. A rerun replaces a recorded patch
+only with one that outranks it by severity, advisory count, or date; tier and UUID
+tie-breaking alone does not cause a replacement. The
 [ranking contract](../crates/socket-patch-cli/CLI_CONTRACT.md#which-patch-gets-selected)
 details selection and upgrades.
 

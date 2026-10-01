@@ -1358,10 +1358,10 @@ mod tests {
         assert_ne!(rewritten[0].1, "probe detail text");
     }
 
-    // ---- candidate_supersedes (merge rung) ---------------------------------
+    // ---- candidate_supersedes (advisory-count rung) -------------------------
 
     /// A batch-shaped patch with explicit advisory lists and NO publish
-    /// date, so only the merge and severity rungs can decide.
+    /// date, so only the severity and advisory-count rungs can decide.
     fn info_with_advisories(
         uuid: &str,
         severity: Option<&str>,
@@ -1396,7 +1396,7 @@ mod tests {
             candidate_supersedes(&merged, &single),
             "broader merge coverage is a genuine supersede"
         );
-        // Swapped: an unmerged candidate never supersedes a merged one.
+        // Swapped: fewer advisories at equal severity cannot supersede.
         assert!(
             !candidate_supersedes(&single, &merged),
             "narrower coverage must never supersede"
@@ -1404,8 +1404,8 @@ mod tests {
     }
 
     #[test]
-    fn a_merged_candidate_supersedes_a_more_severe_single_patch() {
-        // Same rule as the selection ranking: merged beats severity, so the
+    fn a_more_severe_single_candidate_supersedes_a_lower_severity_merge() {
+        // Same rule as selection: severity beats advisory count, so the
         // [UPDATE] marker names the patch scan would install.
         let merged = info_with_advisories(
             "uuid-merged",
@@ -1415,8 +1415,17 @@ mod tests {
         );
         let critical =
             info_with_advisories("uuid-crit", Some("critical"), &["GHSA-3333-3333-3333"], &[]);
-        assert!(candidate_supersedes(&merged, &critical));
-        assert!(!candidate_supersedes(&critical, &merged));
+        assert!(!candidate_supersedes(&merged, &critical));
+        assert!(candidate_supersedes(&critical, &merged));
+    }
+
+    #[test]
+    fn a_larger_merge_supersedes_a_smaller_merge_at_equal_severity() {
+        let smaller = info_with_advisories("small", Some("high"), &["GHSA-a", "GHSA-b"], &[]);
+        let larger =
+            info_with_advisories("large", Some("high"), &["GHSA-a", "GHSA-b", "GHSA-c"], &[]);
+        assert!(candidate_supersedes(&larger, &smaller));
+        assert!(!candidate_supersedes(&smaller, &larger));
     }
 
     #[test]
