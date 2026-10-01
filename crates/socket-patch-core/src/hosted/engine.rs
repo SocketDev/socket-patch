@@ -476,7 +476,7 @@ async fn keep_bundler_loaded_gem_files(view: &ProjectView<'_>, out: &mut Candida
     let loaded = match view {
         ProjectView::Disk(root)
         | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot { root, .. }) => {
-            manifest::loaded_manifest(root).await
+            crate::crawlers::ruby_crawler::bundler_loaded_manifest(root).await
         }
         ProjectView::Memory(_) => {
             let config = view.read_text(".bundle/config").await.ok();

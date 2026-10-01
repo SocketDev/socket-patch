@@ -146,7 +146,7 @@ struct GemPrelude {
 /// its hosted wiring instead of ending up unpatched in both modes.
 pub async fn gem_manifest_refusal(project_root: &Path) -> Option<(&'static str, String)> {
     use crate::formats::gem::manifest::LoadedManifest;
-    let loaded = crate::formats::gem::manifest::loaded_manifest(project_root).await;
+    let loaded = crate::crawlers::ruby_crawler::bundler_loaded_manifest(project_root).await;
     let gems_rb_present = tokio::fs::symlink_metadata(project_root.join("gems.rb"))
         .await
         .is_ok();

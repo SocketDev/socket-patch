@@ -19,12 +19,14 @@
 //! directory, a missing file) is [`LoadedManifest::Unsupported`]: the
 //! rewriters and the lock readers only know the two default pairs, so the
 //! callers fail closed rather than wire a manifest Bundler never reads.
-//! The user-level `~/.bundle/config` is not consulted.
+//! The user-level `~/.bundle/config` is not consulted. The model is pure:
+//! the disk and environment reads live in
+//! [`crate::crawlers::ruby_crawler::bundler_loaded_manifest`].
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use crate::crawlers::ruby_crawler::{bundler_app_config_dir, unquote_bundle_config_value};
+use crate::crawlers::ruby_crawler::unquote_bundle_config_value;
 use crate::utils::fs::normalize_lexically;
 
 /// Where a configured `BUNDLE_GEMFILE` came from.
@@ -92,33 +94,6 @@ impl LoadedManifest {
             _ => None,
         }
     }
-}
-
-/// [`classify`] for `root` on disk, reading the ambient `BUNDLE_GEMFILE` /
-/// `BUNDLE_APP_CONFIG` and the app config file.
-pub async fn loaded_manifest(root: &Path) -> LoadedManifest {
-    loaded_manifest_with_env(
-        root,
-        std::env::var_os("BUNDLE_GEMFILE").as_deref(),
-        std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
-    )
-    .await
-}
-
-/// [`loaded_manifest`] with the environment passed explicitly (hermetic
-/// tests).
-pub async fn loaded_manifest_with_env(
-    root: &Path,
-    gemfile_env: Option<&OsStr>,
-    app_config_env: Option<&OsStr>,
-) -> LoadedManifest {
-    let config = bundler_app_config_dir(root, app_config_env).join("config");
-    let config_value = crate::utils::fs::read_regular_to_string(&config)
-        .await
-        .ok()
-        .and_then(|text| config_gemfile(&text));
-    let cwd = std::env::current_dir().unwrap_or_default();
-    classify(root, &cwd, gemfile_env, config_value.as_deref())
 }
 
 /// The `BUNDLE_GEMFILE:` value of a bundler app config file (flat YAML that
@@ -263,27 +238,5 @@ mod tests {
         );
         assert_eq!(config_gemfile("---\nBUNDLE_GEMFILE: \"\"\n"), None);
         assert_eq!(config_gemfile("---\nBUNDLE_PATH: \"x\"\n"), None);
-    }
-
-    #[tokio::test]
-    async fn loaded_manifest_reads_the_app_config_file() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(".bundle")).unwrap();
-        std::fs::write(
-            dir.path().join(".bundle/config"),
-            "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n",
-        )
-        .unwrap();
-        let m = loaded_manifest_with_env(dir.path(), None, None).await;
-        assert!(matches!(
-            m,
-            LoadedManifest::Unsupported {
-                by: GemfileSetting::AppConfig,
-                ..
-            }
-        ));
-        // BUNDLE_APP_CONFIG moves the config file away from `.bundle`.
-        let m = loaded_manifest_with_env(dir.path(), None, Some(OsStr::new("elsewhere"))).await;
-        assert_eq!(m, LoadedManifest::Default);
     }
 }
