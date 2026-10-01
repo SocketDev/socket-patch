@@ -268,7 +268,7 @@ async fn find_site_packages_under(
 /// 1. `VIRTUAL_ENV` environment variable (for a Pipenv project, only when
 ///    Pipenv itself would use it)
 /// 2. For a Pipenv project, the venv(s) Pipenv resolves for it (see
-///    [`pipenv_project_site_packages`])
+///    [`pipenv_project_site_packages`]), and nothing else
 /// 3. `.venv` directory in `cwd`
 /// 4. `venv` directory in `cwd`
 /// 5. Poetry's out-of-tree virtualenv(s) for a Poetry project (see
@@ -304,13 +304,11 @@ async fn find_local_venv_site_packages_with(
 
     // 2. A Pipenv project's venv is whatever Pipenv resolves, which is not
     // the generic probe order below: Pipenv never uses `venv/`, and its
-    // in-project settings can rule out an existing `./.venv`. Only when
-    // Pipenv's venv does not exist yet do the generic probes run.
+    // in-project settings can rule out an existing `./.venv`. When Pipenv
+    // has no venv yet there is nothing to patch, so the generic probes must
+    // not fall back to a tree Pipenv will never use.
     if pipenv {
-        let found = pipenv_project_site_packages(cwd, var).await;
-        if !found.is_empty() {
-            return found;
-        }
+        return pipenv_project_site_packages(cwd, var).await;
     }
 
     // 3. Check .venv and venv in cwd
@@ -2105,6 +2103,27 @@ mod tests {
             find_local_venv_site_packages_with(&project, &var).await,
             vec![site]
         );
+    }
+
+    /// #334: when Pipenv has no venv yet, discovery must not fall back to a
+    /// tree Pipenv will never use: a stray `venv/`, or a `./.venv` that an
+    /// explicit "not in project" rules out.
+    #[tokio::test]
+    async fn pipenv_without_its_venv_does_not_fall_back_to_stray_trees() {
+        let (_tmp, project, site, var) = pipenv_project_with_workon_venv(&[]);
+        std::fs::remove_dir_all(site.ancestors().nth(3).unwrap()).unwrap();
+        let _stray = fake_venv(&project, "venv");
+        assert!(find_local_venv_site_packages_with(&project, &var)
+            .await
+            .is_empty());
+
+        let (_tmp, project, site, var) =
+            pipenv_project_with_workon_venv(&[("PIPENV_VENV_IN_PROJECT", "0".to_string())]);
+        std::fs::remove_dir_all(site.ancestors().nth(3).unwrap()).unwrap();
+        let _dot = fake_venv(&project, ".venv");
+        assert!(find_local_venv_site_packages_with(&project, &var)
+            .await
+            .is_empty());
     }
 
     /// #334: an explicit "not in project" (`PIPENV_VENV_IN_PROJECT` falsy,
