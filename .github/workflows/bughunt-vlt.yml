@@ -1,0 +1,143 @@
+name: bughunt vlt probe
+on:
+  push:
+    branches: ['bughunt/vlt/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        vlt: ['1.2.0', '1.3.2']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      LANG: C
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.21.0
+      - name: Build CLI
+        run: cargo build --release -p socket-patch-cli
+      - name: Install vlt
+        run: |
+          js=$(bash scripts/install-vlt.sh "${{ matrix.vlt }}" "$RUNNER_TEMP/vlt" | tail -n 1)
+          echo "VLT_JS=$js" >> "$GITHUB_ENV"
+      - name: Write probe
+        run: |
+          mkdir -p probe
+          cat > probe/mock.mjs <<'MOCKEOF'
+          import http from 'node:http';
+          import zlib from 'node:zlib';
+          import crypto from 'node:crypto';
+          import fs from 'node:fs';
+          const PORT = +process.env.PORT || 18555;
+          const R = `http://127.0.0.1:${PORT}`;
+          const NAME='left-pad', VER='1.3.0', UUID='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', TOKEN='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', ORG='test-org';
+          const PURL=`pkg:npm/${NAME}@${VER}`;
+          const ALT = process.env.NO_ALT ? false : true;
+          function hdr(name,size){const b=Buffer.alloc(512);b.write(name,0);b.write('0000644\0',100);b.write('0000000\0',108);b.write('0000000\0',116);b.write(size.toString(8).padStart(11,'0')+'\0',124);b.write('00000000000\0',136);b.write('        ',148);b.write('0',156);b.write('ustar\0',257);b.write('00',263);let c=0;for(const x of b)c+=x;b.write(c.toString(8).padStart(6,'0')+'\0 ',148);return b;}
+          function tarFiles(files){const parts=[];for(const [n,d] of files){const buf=Buffer.from(d);parts.push(hdr(n,buf.length),buf,Buffer.alloc((512-buf.length%512)%512));}parts.push(Buffer.alloc(1024));return Buffer.concat(parts);}
+          function tarOf(content){return tarFiles([['package/package.json',JSON.stringify({name:NAME,version:VER,main:'index.js'})+'\n'],['package/index.js',content]]);}
+          const sri = b => 'sha512-'+crypto.createHash('sha512').update(b).digest('base64');
+          const git = b => crypto.createHash('sha256').update(Buffer.concat([Buffer.from(`blob ${b.length}\0`), b])).digest('hex');
+          const PRIST = Buffer.from("module.exports = 'pristine'\n"), PATCH = Buffer.from("module.exports = 'patched'\n");
+          const tgz = zlib.gzipSync(tarOf(PRIST)), br = zlib.brotliCompressSync(tarOf(PRIST)), ptgz = zlib.gzipSync(tarOf(PATCH));
+          function wrapTar(){return zlib.gzipSync(tarFiles([['package/package.json',JSON.stringify({name:'wrapper',version:'1.0.0',main:'index.js',dependencies:{'left-pad':'1.3.0'}})+'\n'],['package/index.js',"module.exports = require('left-pad')\n"]]));}
+          const wtgz = wrapTar();
+          const artPath = `/patch/npm/${NAME}/${VER}/${TOKEN}/${UUID}/${NAME}-${VER}.tgz`;
+          const log = [];
+          http.createServer((req,res)=>{
+            let body=''; req.on('data',c=>body+=c); req.on('end',()=>{
+            const u = req.url.split('?')[0]; log.push(req.method+' '+u); 
+            const j = o => { res.writeHead(200,{'content-type':'application/json'}); res.end(JSON.stringify(o)); };
+            const b = x => { res.writeHead(200,{'content-type':'application/octet-stream'}); res.end(x); };
+            if (u===`/${NAME}`) {
+              const dist = {tarball:`${R}/${NAME}/-/${NAME}-${VER}.tgz`, integrity: sri(tgz)};
+              if (ALT) dist.alternates=[{kind:'tar.br', tarball:`${R}/${NAME}/-/${NAME}-${VER}.tar.br`, integrity: sri(br)}];
+              return j({name:NAME, 'dist-tags':{latest:VER}, versions:{[VER]:{name:NAME,version:VER,main:'index.js',dist}}});
+            }
+            if (u===`/${NAME}/${VER}`) { const dist = {tarball:`${R}/${NAME}/-/${NAME}-${VER}.tgz`, integrity: sri(tgz)}; return j({name:NAME,version:VER,main:'index.js',dist}); }
+            if (u==='/wrapper/1.0.0') return j({name:'wrapper',version:'1.0.0',dist:{tarball:`${R}/wrapper/-/wrapper-1.0.0.tgz`,integrity:sri(wtgz)}});
+            if (u==='/wrapper') return j({name:'wrapper','dist-tags':{latest:'1.0.0'},versions:{'1.0.0':{name:'wrapper',version:'1.0.0',main:'index.js',dependencies:{'left-pad':'1.3.0'},dist:{tarball:`${R}/wrapper/-/wrapper-1.0.0.tgz`,integrity:sri(wtgz)}}}});
+            if (u==='/wrapper/-/wrapper-1.0.0.tgz') return b(wtgz);
+            if (u===`/${NAME}/-/${NAME}-${VER}.tgz`) return b(tgz);
+            if (u===`/${NAME}/-/${NAME}-${VER}.tar.br`) return b(br);
+            if (u===artPath) return b(ptgz);
+            if (u.startsWith(`/v0/orgs/${ORG}/patches/blob/`)) { const h=u.split('/').pop(); for (const x of [PRIST,PATCH]) if (git(x)===h) return b(x); }
+            if (u===`/v0/orgs/${ORG}/patches/batch`) return j({packages:[{purl:PURL,patches:[{uuid:UUID,purl:PURL,tier:'free',cveIds:[],ghsaIds:[],severity:'high',title:'fx'}]}],canAccessPaidPatches:false});
+            if (u.startsWith(`/v0/orgs/${ORG}/patches/by-package/`)) return j({patches:[{uuid:UUID,purl:PURL,publishedAt:'2024-01-01T00:00:00Z',description:'x',license:'MIT',tier:'free',vulnerabilities:{}}],canAccessPaidPatches:false});
+            if (u===`/v0/orgs/${ORG}/patches/package`) return j({results:{[UUID]:{status:'granted',url:R+artPath,purl:PURL,artifacts:[{kind:'tarball',url:R+artPath,integrity:{sha512:sri(ptgz)}}],registryOverride:null}}});
+            if (u===`/v0/orgs/${ORG}/patches/view/${UUID}`) return j({uuid:UUID,purl:PURL,publishedAt:'2024-01-01T00:00:00Z',files:{'package/index.js':{beforeHash:git(PRIST),afterHash:git(PATCH),blobContent:PATCH.toString('base64'),beforeBlobContent:PRIST.toString('base64')}},vulnerabilities:{'GHSA-vlth-aaaa-bbbb':{cves:['CVE-2026-4242'],summary:'s',severity:'high',description:'d'}},description:'x',license:'MIT',tier:'free'});
+            res.writeHead(404); res.end('nf');
+            });
+          }).listen(PORT, '127.0.0.1', ()=>console.log('listening', PORT));
+
+          MOCKEOF
+          cat > probe/probe.sh <<'PROBEEOF'
+          #!/usr/bin/env bash
+          # usage: probe.sh <socket-patch> <vlt.js> <mock.mjs>
+          set -u
+          SP=$1; VJS=$2; MOCK=$3
+          export LANG=C SOCKET_NPM_REGISTRY=http://127.0.0.1:18555 SOCKET_API_URL=http://127.0.0.1:18556 SOCKET_PATCH_SERVER_URL=http://127.0.0.1:18556 SOCKET_ORG_SLUG=test-org SOCKET_API_TOKEN=fake
+          NO_ALT=1 PORT=18555 node "$MOCK" & NO_ALT=1 PORT=18556 node "$MOCK" & sleep 2
+          vlt() { node "$VJS" "$@" >>"$W/vlt.log" 2>&1; }
+          W=$(mktemp -d); cd "$W"; FAIL=0; export XDG_CACHE_HOME="$W/.cache" XDG_DATA_HOME="$W/.data" XDG_CONFIG_HOME="$W/.config" LOCALAPPDATA="$W/.localappdata" HOME="$W/.home"; mkdir -p "$HOME"
+          ok() { if [ "$2" = "$3" ]; then echo "PASS $1"; else echo "FAIL $1 (got '$2' want '$3')"; FAIL=1; fi; }
+          mk() { cd "$W"; rm -rf "$1"; mkdir -p "$1"; cd "$1"; echo '{"name":"app","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}' > package.json; echo '{"config":{"registries":{"npm":"http://127.0.0.1:18555/"}}}' > vlt.json; }
+          lp() { node -e "console.log(require('left-pad'))" 2>&1; }
+          same() { cmp -s "$1" "$2" && echo same || echo differ; }
+          # hosted
+          mk hosted; vlt install; cp vlt-lock.json orig
+          "$SP" scan --yes --json > s.json 2>/dev/null; ok hosted.scan.rc $? 0
+          vlt install; ok hosted.warm "$(lp)" patched
+          cp vlt-lock.json h; rm -rf node_modules; vlt ci; ok hosted.ci "$(lp)" patched; ok hosted.ci.lockstable "$(same h vlt-lock.json)" same
+          "$SP" rollback --yes --json > r.json 2>/dev/null; ok hosted.rollback.rc $? 0; ok hosted.rollback.lock "$(same orig vlt-lock.json)" same
+          vlt install; ok hosted.rollback.warm "$(lp)" pristine
+          # hosted CRLF
+          mk crlf; vlt install; perl -pi -e 's/\n/\r\n/' vlt-lock.json; cp vlt-lock.json orig
+          "$SP" scan --yes --json > s.json 2>/dev/null; ok crlf.keeps.cr "$(grep -c $'\r' vlt-lock.json)" "$(grep -c $'\r' orig)"
+          "$SP" rollback --yes --json > r.json 2>/dev/null; ok crlf.rollback.lock "$(same orig vlt-lock.json)" same
+          # vendored + takeover
+          mk vend; vlt install; cp vlt-lock.json orig
+          "$SP" scan --yes --json > s.json 2>/dev/null
+          "$SP" scan --mode vendored --yes --json > v.json 2>/dev/null; ok vend.scan.rc $? 0
+          rm -rf node_modules; vlt ci; ok vend.ci "$(lp)" patched
+          cp vlt-lock.json v; vlt install --frozen-lockfile; ok vend.frozen "$(same v vlt-lock.json)" same
+          "$SP" vex --output vex.json > /dev/null 2>&1; ok vend.vex $? 0
+          "$SP" rollback --yes --json > r.json 2>/dev/null; ok vend.rollback.lock "$(same orig vlt-lock.json)" same
+          vlt install; ok vend.rollback.warm "$(lp)" pristine
+          # vendored workspace with space/unicode dirs
+          cd "$W"; rm -rf ws; mkdir -p "ws/packages/my pkg" "ws/packages/café"; cd ws
+          echo '{"name":"root","version":"1.0.0","private":true}' > package.json
+          echo '{"workspaces":["packages/*"],"config":{"registries":{"npm":"http://127.0.0.1:18555/"}}}' > vlt.json
+          for d in "my pkg" café; do echo "{\"name\":\"m$RANDOM\",\"version\":\"1.0.0\",\"dependencies\":{\"left-pad\":\"1.3.0\"}}" > "packages/$d/package.json"; done
+          vlt install; cp vlt-lock.json orig
+          "$SP" scan --mode vendored --yes --json > v.json 2>/dev/null; ok ws.scan.rc $? 0
+          rm -rf node_modules packages/*/node_modules; vlt ci
+          for d in "my pkg" café; do (cd "packages/$d" && ok "ws.ci[$d]" "$(lp)" patched); done
+          "$SP" rollback --yes --json > r.json 2>/dev/null; ok ws.rollback.lock "$(same orig vlt-lock.json)" same
+          # agent
+          mk agent; vlt install; "$SP" scan --mode agent --yes --json > a.json 2>/dev/null; ok agent.patched "$(lp)" patched
+          "$SP" rollback --yes --json > r.json 2>/dev/null; ok agent.rollback "$(lp)" pristine
+          mk agent2; vlt install; ok agent.otherproject "$(lp)" pristine
+          echo "== vlt log tail"; tail -20 "$W/vlt.log"
+          for f in $(find "$W" -name '*.json' -path '*/[srva].json'); do echo "== $f"; head -c 1500 "$f"; echo; done > "$W/envelopes.txt"
+          [ $FAIL = 0 ] || { cat "$W/envelopes.txt" | head -300; }
+          kill %1 %2 2>/dev/null
+          exit $FAIL
+
+          PROBEEOF
+      - name: Probe
+        run: |
+          cli="$PWD/target/release/socket-patch"
+          if [ "$RUNNER_OS" = Windows ]; then cli="$cli.exe"; fi
+          bash probe/probe.sh "$cli" "$VLT_JS" "$PWD/probe/mock.mjs"
