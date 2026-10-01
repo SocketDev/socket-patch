@@ -6434,14 +6434,16 @@ mod tests {
         )];
         let first = rewrite_registry_redirect(&files, &overrides);
         let out = first.files.get("requirements.txt").expect("rewritten");
+        // An unhashed file pins by the url fragment (#376), so the marker
+        // follows it.
         assert_eq!(
-            out.matches("--hash=sha256:").count(),
+            out.matches("sha256").count(),
             1,
             "exactly one hash after the first pass: {out}"
         );
         assert!(
-            out.contains("; python_version >= \"3.7\" --hash="),
-            "marker preserved ahead of the hash: {out}"
+            out.contains("-none-any.whl#sha256=") && out.contains(" ; python_version >= \"3.7\"\n"),
+            "marker preserved after the pinned url: {out}"
         );
 
         let mut again = files.clone();
@@ -6455,10 +6457,11 @@ mod tests {
         );
     }
 
-    /// An inline comment after the marker must not swallow the appended
-    /// `--hash=…` (pip would then treat the hash as comment text and skip
-    /// enforcement). The comment is split off and re-appended AFTER the hash
-    /// so the pin stays active and the user's note survives.
+    /// An inline comment after the marker must not swallow the appended pin
+    /// (pip would then treat it as comment text and skip enforcement). The
+    /// comment is split off and re-appended AFTER the pin — the url's
+    /// `#sha256=` fragment in an unhashed file (#376), `--hash` in a hashed
+    /// one — so the pin stays active and the user's note survives.
     #[test]
     fn requirements_marker_comment_keeps_hash_active() {
         let original = "requests==2.28.1 ; python_version >= \"3.7\" # explanation\n";
@@ -6471,13 +6474,23 @@ mod tests {
         assert_eq!(
             output,
             &format!(
-                "requests @ {url} ; python_version >= \"3.7\" --hash=sha256:{sha256} # explanation\n"
+                "requests @ {url}#sha256={sha256} ; python_version >= \"3.7\" # explanation\n"
             )
         );
         let again = BTreeMap::from([("requirements.txt".to_string(), output.clone())]);
         let second = rewrite_registry_redirect(&again, &overrides);
         assert!(second.files.is_empty());
         assert!(second.edits.is_empty());
+
+        let hashed = original.replace("# explanation", "--hash=sha256:old # explanation");
+        let files = BTreeMap::from([("requirements.txt".to_string(), hashed)]);
+        let first = rewrite_registry_redirect(&files, &overrides);
+        assert_eq!(
+            first.files["requirements.txt"],
+            format!(
+                "requests @ {url} ; python_version >= \"3.7\" --hash=sha256:{sha256} # explanation\n"
+            )
+        );
     }
 
     const MAVEN_SUFFIXED: &str = "1.7.36-socket.aaaaaaaa";
