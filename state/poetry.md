@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-01 (run 3), main `2463257` (#277, v5 consolidation), latest release 4.0.0 (previous 3.3.0).
+Last updated: 2026-10-01 (run 4), main `2463257` (#277, v5 consolidation, unchanged since run 3), latest release 4.0.0 (previous 3.3.0).
 
 ## Coverage matrix
 
@@ -27,16 +27,34 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | Windows | 2.4.3 | untested | fail #329 | fail #327 | pass (LF + CRLF) | untested (likely #327/#329) | pass (LF + CRLF) | untested | untested |
 | Windows | 2.5.1 | untested | untested | untested | untested | untested | untested | untested | untested |
 
+### Global mode (`-g` / `--global-prefix` / `SOCKET_GLOBAL=1`), agent patches (run 4)
+
+Global installs aren't Poetry-specific (Poetry never installs globally unless `virtualenvs.create = false`), so these cells were run from inside a Poetry 2.1.1 project (in-project `.venv`) against a real `pip install --user` copy and a `pip install --target` prefix.
+
+| OS | Cell | Result |
+| --- | --- | --- |
+| Linux | `scan -g` report-only (`--json`): global user-site `six` found, project `.venv` and lock-only packages don't leak in | pass |
+| Linux | `scan -g` sees Debian/apt `.egg-info` installs | fail #447 (pip sibling; all PyPI) |
+| Linux | `scan -g` sees Poetry's official-installer venv (`~/.local/share/pypoetry/venv`) | fail (commented on #415) |
+| Linux | `scan -g --mode hosted`, `--global-prefix --mode hosted`, `SOCKET_GLOBAL=1 --mode hosted`: exit 2, poetry.lock untouched | pass |
+| Linux | `scan -g --mode agent`, re-run idempotent, `get <uuid> -g`, `SOCKET_GLOBAL=1 get`: global copy patched, `.venv` and lock untouched | pass |
+| Linux | `vex -g` attests applied global patch; plain `vex` refuses (`not_applied`) | pass |
+| Linux | `rollback -g` restores the global copy byte for byte | pass |
+| Linux | Cross-scope rollback (project apply + `rollback -g`, or `-g` apply + `rollback`) | fail #450 |
+| Linux | Read-only `--global-prefix` (non-root user, path with space + `é`): human mode shows the error, exit 1 | pass; JSON drops the error (#424) |
+| Linux | Project scan without `-g`, Poetry venv undiscovered / not created yet: falls back to and **patches** the global interpreter | fail (new evidence on #327) |
+| macOS / Windows | all of the above | untested (probe branches blocked) |
+
 ## Backlog
 
-1. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Poetry version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
+1. **Maintainer request (global mode), continued:** run the global-mode table on macOS and Windows and on Poetry 1.x installer venvs (needs probe branches). Also cover `-g` with `virtualenvs.create = false` (Poetry installing into the global interpreter, where the global fallback is correct), and `vex -g` / `list -g` with a hosted Poetry project in cwd (PR #446 notes they still read cwd lockfile discovery).
 2. macOS / Windows on Poetry 2.5.1: hosted/vendored, the #329 false hosted VEX for default out-of-tree venvs, in-project `.venv` agent mode (`Lib\site-packages`), and long project paths (> 260 chars) under `.socket/vendor/pypi/`. This needs probe branches.
-3. Probe branches are blocked: the permission policy refuses `git push --delete` (runs 1–3). A maintainer needs to delete `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes`.
-4. Hosted rollback (v5 upstream re-resolution) when PyPI's file list differs from the lock (files uploaded after locking, yanked files) and for non-canonical names (`Foo_Bar`, dotted).
-5. Interrupted / concurrent `scan` on a Poetry lock (kill mid-write), and `poetry install` racing a scan.
-6. `socket.yml` policy (`minSeverity`, package filters, `maxNewPatches`) on a Poetry project with several patches. This needs a multi-package mock.
-7. Agent mode on Poetry ≤ 1.7 out-of-tree venvs, `virtualenvs.path` with `{cache-dir}` / relative / `~`, `POETRY_VIRTUALENVS_PREFER_ACTIVE_PYTHON`, and `poetry env use` with several minors.
-8. Vendored optional extra via PEP 621 `[project.optional-dependencies]` on 2.4 / 2.5.
+3. Probe branches are blocked: `git push --delete` still fails ("remote end hung up", runs 1–4). A maintainer needs to delete `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes`.
+4. Re-test #436 / #445 on a Poetry project once PR #446 merges (`get -g --mode hosted|vendored`, `scan -g --mode vendored`, `rollback -g` on a hosted/vendored poetry.lock). The mock needs the `/patches/package` grant route.
+5. Hosted rollback (v5 upstream re-resolution) when PyPI's file list differs from the lock (files uploaded after locking, yanked files) and for non-canonical names (`Foo_Bar`, dotted).
+6. Interrupted / concurrent `scan` on a Poetry lock (kill mid-write), and `poetry install` racing a scan.
+7. `socket.yml` policy (`minSeverity`, package filters, `maxNewPatches`) on a Poetry project with several patches. This needs a multi-package mock.
+8. Agent mode on Poetry ≤ 1.7 out-of-tree venvs, `virtualenvs.path` with `{cache-dir}` / relative / `~`, `POETRY_VIRTUALENVS_PREFER_ACTIVE_PYTHON`, and `poetry env use` with several minors.
 
 ## Known non-bugs
 
@@ -59,3 +77,6 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 - `scan --json` with several directory targets is refused ("--json takes one project directory").
 - v5 removed `--vendor-source build` (local artifact construction). Repair re-downloads from the service.
 - Agent rollback needs the "before" blob from `/v0/orgs/<org>/patches/blob/<hash>`. A mock without that route gives `missing_blob`.
+- `scan --mode agent` re-run after a failed apply says `[skip] … (already recorded)` and exits 0 with the file unpatched. That's by design (it prints "run `socket-patch apply` to re-apply them"), and `apply` / `vex` then report the failure correctly.
+- My mock answers every per-ecosystem batch with the same patch, so a mode-less multi-ecosystem scan lists `six` twice. That's a mock artifact; pass `--ecosystems pypi`.
+- In the sandbox, `/usr/lib/python3/dist-packages/six` is an apt `.egg-info` install, invisible to the crawler (#447). Use `pip install --user --ignore-installed` for a real global copy.
