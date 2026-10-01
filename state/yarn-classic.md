@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-01 (run 3), main `2463257` (the v5 consolidation, #277), latest release v4.0.0. The project-mode matrix below was measured on `f6b7fb9` (v4); only the cells marked "(v5)" and the global matrix were re-run on v5.
+Last updated: 2026-10-01 (run 4), main `2463257` (the v5 consolidation, #277), latest release v4.0.0. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -33,14 +33,21 @@ Report = `scan -g` report-only + no leakage; refusal = `scan -g/--global-prefix/
 
 Other cells that pass on Linux 1.22.22 (some also on older releases; see the entries): spaces + unicode project paths (also macOS and Windows), `npm:` alias (H skipped as documented, V rewired), `resolutions`, a `resolved` without the `#sha1` fragment / `integrity`, a local `file:` tarball dep, a non-deduplicated lock, a superseding patch on re-scan, `remove` / `repair`, VEX (installed and lock-only, after `yarn upgrade`), `yarn add` then a frozen reinstall (1.7.0 too), `yarn check --integrity` / `--verify-tree`, in-place reinstalls on 1.7–1.22, concurrent scans (`lock_held`), the GitHub shorthand dep on all 3 OSes.
 
+### v5 project-mode cells (Linux, run 4)
+- Mixed CRLF+LF lock, H and V: **fail #467** (line endings converted; rollback not byte-exact).
+- Uniform CRLF / BOM+CRLF: H⇄V takeovers + rollback, pass. `--dry-run` byte-identity (H / V / A / rollback) on CRLF / BOM / mixed, pass.
+- V service artifacts: workspaces + multi-version + merged key + `npm:` alias, vex / `vendor --check` / `repair` / frozen offline / rollback, pass (1.22.22).
+- V + offline mirror + pruning: pass (1.7.0 / 1.10.1 / 1.22.22).
+- No-`integrity` (1.7-style) locks, H and V: pass (1.7.0 / 1.22.22). Tarball-URL dep, H and V: pass. `file:` dir dep, H: pass.
+- SIGKILL-interrupted scans, H and V: pass (recoverable by `repair` / re-scan).
+
 ## Backlog
 
-1. **Maintainer request (global mode), still open:** Windows after #434 is fixed; yarn via corepack and the Windows MSI; 1.6.0 / 1.9.4 on the probe; a read-only prefix on Windows (Program Files).
-2. Re-run the project-mode matrix on v5: vendored mode with **service artifacts** (CRLF / BOM, workspaces + multi-version, `npm:` alias, offline mirror, `vendor --check`, `repair`).
-3. v5 hosted→vendored takeover and `vendor --revert` (upstream-restore based) on CRLF locks and 1.9-style locks without `integrity`: frozen-installable, CRLF preserved?
-4. Yarn ≤ 1.6 pin signals (`packageManager`, `.yarnrc yarn-path`) in vendored mode; `socket.yml` filters and `--max-new-patches` on a yarn workspace.
-5. Interrupted runs (SIGKILL mid-rewrite) and recovery; `--dry-run` byte-identity on CRLF / BOM locks.
-6. `.yarnrc` `--install.frozen-lockfile true`, `--pure-lockfile`, `yarn import` locks; `optionalDependencies` / platform-skipped packages in both modes and VEX.
+1. **Maintainer request (global mode), still open:** Windows after #434 (PR #442) / #436 (PR #446) are fixed; yarn via corepack and the Windows MSI; 1.6.0 / 1.9.4 on the probe; a read-only prefix on Windows (Program Files).
+2. `socket.yml` filters and `--max-new-patches` on a yarn workspace; `optionalDependencies` / platform-skipped packages in both modes and vex.
+3. `.yarnrc` `--install.frozen-lockfile true`, `--pure-lockfile`, `yarn import` locks.
+4. Custom `.yarnrc` `registry` (private mirror hosts in `resolved`) through hosted → rollback → frozen install.
+5. Re-run the v4-only project matrix columns (git dep #363, offline mirror H #364) on macOS/Windows once fixes land.
 
 ## Known non-bugs
 
@@ -59,3 +66,8 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - `scan -g` also reports npm's own bundled deps (npm global root), e.g. `@isaacs/string-locale-compare`. That's correct global discovery.
 - Probe branch `bughunt/yarn-classic/20261001-global-mode` is also left on the remote (the proxy blocks deletion).
 
+- Hosted pins are recognized only on `patch.socket.dev` or the `--patch-server-url` / `SOCKET_PATCH_SERVER_URL` origin. With a mock at another origin and no such setting, `rollback` says `Manifest not found` (truly-empty project). Set `SOCKET_PATCH_SERVER_URL=<mock>`.
+- Hosted rollback of a lock without `integrity` lines (yarn < 1.10) adds `integrity` lines. That's the "default upstream entry", and yarn 1.7 still installs it frozen.
+- Vendored mode on yarn ≤ 1.6 installs nothing. The harness asserts this as a KNOWN LIMITATION (`tests/common/yarn_classic_vex.rs:89`); it's not in the user docs.
+- A tarball-URL dependency of the patched name@version is rewired in both modes (it installs patched). Whether a URL "fork" should be refused, as vlt does, is a design question.
+- A SIGKILL can leave the lock wired with no `vendor/state.json`. `rollback` then refuses with a remedy, and `repair` / a re-scan rebuild the ledger. That's intended crash handling.
