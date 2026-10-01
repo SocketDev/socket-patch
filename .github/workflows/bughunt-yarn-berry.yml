@@ -1,0 +1,58 @@
+name: bughunt yarn-berry probe
+on:
+  push:
+    branches: ['bughunt/yarn-berry/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build CLI
+        run: cargo build --release -p socket-patch-cli
+      - name: Probe scan -g inside a berry project with a "global" script
+        env:
+          YARN_ENABLE_TELEMETRY: '0'
+          YARN_ENABLE_IMMUTABLE_INSTALLS: 'false'
+          SOCKET_TELEMETRY_DISABLED: '1'
+        run: |
+          BIN="$PWD/target/release/socket-patch"
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          W="$RUNNER_TEMP/probe"; mkdir -p "$W"
+          for v in 2.4.2 3.8.7 4.12.0 4.18.1; do
+            npm i -g --force "@yarnpkg/cli-dist@$v" >/dev/null 2>&1
+            echo "== yarn $(yarn --version) at $(command -v yarn)"
+            P="$W/proj-$v"; rm -rf "$P"; mkdir -p "$P/fakeglobal/node_modules/zz-project-only-pkg"
+            cd "$P"
+            echo '{"name":"zz-project-only-pkg","version":"9.9.9"}' > fakeglobal/node_modules/zz-project-only-pkg/package.json
+            cat > mark.js <<'JS'
+          const fs = require('fs'), path = require('path');
+          fs.appendFileSync(path.join(__dirname, 'MARKER'), 'ran ' + process.argv.slice(2).join(' ') + '\n');
+          console.log(path.join(__dirname, 'fakeglobal'));
+          JS
+            echo '{"name":"p","scripts":{"global":"node mark.js"}}' > package.json
+            touch yarn.lock
+            printf 'nodeLinker: node-modules\n' > .yarnrc.yml
+            yarn install >/dev/null 2>&1 || echo "install failed"
+            echo "yarn global dir -> $(yarn global dir 2>&1 | head -1)"
+            rm -f MARKER
+            n1=$("$BIN" scan -g --json 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).scannedPackages)}catch(e){console.log("?")}})')
+            ran=$( [ -f MARKER ] && wc -l < MARKER | tr -d ' ' || echo 0)
+            echo '{"name":"p"}' > package.json
+            n0=$("$BIN" scan -g --json 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).scannedPackages)}catch(e){console.log("?")}})')
+            echo "RESULT os=${{ matrix.os }} yarn=$v script_runs=$ran scanned_with_script=$n1 scanned_without=$n0"
+            cd "$W"
+          done
