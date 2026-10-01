@@ -1,0 +1,79 @@
+name: bughunt npm probe
+on:
+  push:
+    branches: ['bughunt/npm/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        npm: ['10.9.7', '12.1.0']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.15.0'
+      - name: Build CLI
+        run: cargo build --release -p socket-patch-cli
+      - name: Install npm
+        run: npm install -g npm@${{ matrix.npm }} && npm --version
+      - name: Probe
+        env:
+          SOCKET_NO_UPDATE_CHECK: '1'
+          SOCKET_NO_CONFIG: '1'
+        run: |
+          set +e
+          BIN="$PWD/target/release/socket-patch"
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          W="$RUNNER_TEMP/opt"; mkdir -p "$W/pk"
+          # Every platform package of esbuild 0.20.2 is an optional dependency;
+          # each OS installs exactly one. Patch the three host-specific ones, so
+          # on every runner two of the three are platform-skipped.
+          cd "$W/pk"
+          for p in linux-x64 darwin-arm64 win32-x64; do npm pack "@esbuild/$p@0.20.2" >/dev/null 2>&1; mkdir -p "$p"; tar xzf "esbuild-$p-0.20.2.tgz" -C "$p"; done
+          cat > "$W/stage.js" <<'JS'
+          const fs=require('fs'),path=require('path'),crypto=require('crypto');
+          const [proj,pk,...plats]=process.argv.slice(2);
+          const gh=b=>crypto.createHash('sha256').update(Buffer.concat([Buffer.from('blob '+b.length+'\0'),b])).digest('hex');
+          fs.mkdirSync(path.join(proj,'.socket','blobs'),{recursive:true});
+          const m={patches:{}};
+          plats.forEach((p,i)=>{
+            const before=fs.readFileSync(path.join(pk,p,'package','package.json'));
+            const after=Buffer.from(before.toString().replace('"name"','"x-socket-patched": true,\n  "name"'));
+            m.patches['pkg:npm/@esbuild/'+p+'@0.20.2']={uuid:'1a2b3c4d-5e6f-4a1b-8c2d-01234567890'+i,exportedAt:'2026-01-01T00:00:00Z',
+              files:{'package/package.json':{beforeHash:gh(before),afterHash:gh(after)}},vulnerabilities:{},description:'m',license:'MIT',tier:'free'};
+            fs.writeFileSync(path.join(proj,'.socket','blobs',gh(after)),after);
+            fs.writeFileSync(path.join(proj,'.socket','blobs',gh(before)),before);
+          });
+          fs.writeFileSync(path.join(proj,'.socket','manifest.json'),JSON.stringify(m,null,2)+'\n');
+          JS
+          case "${{ matrix.os }}" in ubuntu*) HOST=linux-x64; OTHERS="darwin-arm64 win32-x64";; macos*) HOST=darwin-arm64; OTHERS="linux-x64 win32-x64";; *) HOST=win32-x64; OTHERS="linux-x64 darwin-arm64";; esac
+          T="${{ matrix.os }} npm ${{ matrix.npm }}"
+          mk() { rm -rf "$W/app"; mkdir -p "$W/app"; cd "$W/app"; echo '{"name":"app","version":"1.0.0","private":true,"dependencies":{"esbuild":"0.20.2"}}' > package.json; npm install --no-audit --no-fund --ignore-scripts >/dev/null 2>&1; }
+          echo "::group::A: only other-platform patches"
+          mk; ls node_modules/@esbuild
+          node "$W/stage.js" . "$W/pk" $OTHERS
+          "$BIN" apply --offline --json > a.json; A=$?; "$BIN" apply --offline --silent; AS=$?
+          "$BIN" setup --yes >/dev/null 2>&1
+          node -e "const f='package.json',fs=require('fs');const j=JSON.parse(fs.readFileSync(f));for(const k of ['postinstall','dependencies'])j.scripts[k]=j.scripts[k].replace('npx @socketsecurity/socket-patch',JSON.stringify(process.argv[1]));fs.writeFileSync(f,JSON.stringify(j,null,2))" "$BIN"
+          grep postinstall package.json
+          rm -rf node_modules; npm ci --no-audit --no-fund > ci.log 2>&1; CI=$?
+          echo "RESULT only-other $T: host=$HOST apply_json_exit=$A apply_silent_exit=$AS status=$(node -p "require('./a.json').status") npm_ci_exit=$CI"
+          tail -6 ci.log
+          echo "::endgroup::"
+          echo "::group::B: host + other-platform patches"
+          mk; node "$W/stage.js" . "$W/pk" $HOST $OTHERS
+          "$BIN" apply --offline --silent; B=$?
+          echo "RESULT host-plus-other $T: apply_silent_exit=$B host_patched=$(grep -c x-socket-patched node_modules/@esbuild/$HOST/package.json)"
+          echo "::endgroup::"
+          exit 0
