@@ -10,13 +10,13 @@ use socket_patch_core::manifest::operations::{
 };
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::select_installed_variants;
-use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::patch::rollback::{
     cannot_rollback_error, rollback_package_patch, verify_file_rollback, RollbackResult,
     VerifyRollbackResult, VerifyRollbackStatus,
 };
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
+use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::vendor::{purl_keys_cover, RevertOpts, VendorState};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1026,8 +1026,7 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
             .iter()
             .map(|(code, detail)| (code.to_string(), detail.clone())),
     );
-    out.edited_files
-        .extend(outcome.reverted_files.iter().cloned());
+    out.edited_files.extend(outcome.reverted_files.iter().cloned());
     let unwound: Vec<_> = vlt_targets
         .into_iter()
         .filter(|t| out.reverted.iter().any(|p| p == &t.purl))
@@ -1158,11 +1157,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             } else if !args.common.silent {
                 println!(
                     "{} the pre-v5 hosted ledger {}: no lockfile pins a hosted patch.",
-                    if args.common.dry_run {
-                        "Would remove"
-                    } else {
-                        "Removed"
-                    },
+                    if args.common.dry_run { "Would remove" } else { "Removed" },
                     socket_patch_core::patch::redirect::REDIRECT_STATE_REL
                 );
             }
