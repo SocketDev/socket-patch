@@ -144,8 +144,10 @@ walked too, since they are the only home of transitive dependencies:
 pnpm's virtual store (`node_modules/.pnpm`, pnpm <= 3's
 `node_modules/.registry.*`, or the directory a `virtualStoreDir` setting
 moved it to, as recorded in `node_modules/.modules.yaml`), vlt's
-`node_modules/.vlt`, and npm's `install-strategy=linked` store
-`node_modules/.store`. A recorded virtual store outside the project,
+`node_modules/.vlt`, Bun's isolated-linker store `node_modules/.bun`,
+Deno's isolated `nodeModulesDir` store `node_modules/.deno`, and
+`node_modules/.store`, written by npm's `install-strategy=linked` and by
+Yarn 4's pnpm linker (where each entry's `package/` dir is the copy). A recorded virtual store outside the project,
 notably pnpm's global virtual store (`enableGlobalVirtualStore`, under the
 pnpm store directory), is not walked: other projects on the machine load
 the same files, so patching it in place would patch them as well.
