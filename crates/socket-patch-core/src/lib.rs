@@ -15,7 +15,6 @@ pub mod utils;
 pub mod vendor;
 pub mod vex;
 
-
 #[cfg(test)]
 mod golden;
 #[cfg(test)]

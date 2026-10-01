@@ -46,16 +46,17 @@ mod pdm;
 mod pipenv;
 pub mod presence;
 // The pnpm hosted planner lives with the format's model.
-use crate::formats::pnpm::plan_hosted;
-use crate::formats::cargo::CargoLock;
-use crate::formats::composer::hosted::rewrite_composer_lock;
-use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
-pub(crate) use crate::formats::yarn::is_berry_lock;
 use crate::formats::cargo::hosted::CargoLockPlan;
 #[cfg(test)]
 use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
+use crate::formats::cargo::CargoLock;
+use crate::formats::composer::hosted::rewrite_composer_lock;
+use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
+use crate::formats::pnpm::plan_hosted;
+pub(crate) use crate::formats::yarn::is_berry_lock;
+mod hosted_url;
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 mod poetry;
@@ -64,18 +65,17 @@ mod python_lock_equivalence_tests;
 mod requirements;
 mod staged;
 mod state;
-mod hosted_url;
 pub mod upstream;
 pub mod vlt;
 pub mod vlt_heal;
 pub mod vlt_preflight;
-pub use state::{
-    load_redirect_state, save_redirect_state,
-    CorruptRedirectState, RedirectState, REDIRECT_STATE_REL,
-};
 /// Hosted-artifact leaf ownership rule, shared with `vex`'s bun lockfile
 /// discovery (which recovers a URL tuple's version from that leaf).
 pub(crate) use hosted_url::{hosted_url_names, hosted_url_version};
+pub use state::{
+    load_redirect_state, save_redirect_state, CorruptRedirectState, RedirectState,
+    REDIRECT_STATE_REL,
+};
 
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -3626,7 +3626,7 @@ fn rewrite_bun_lock(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    use crate::vendor::bun_lock_text::decode_json_string;
+    use crate::vendor::bun_lock_text::{decode_json_string, is_bundled_entry};
 
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     if npm.is_empty() {
@@ -3674,6 +3674,27 @@ fn rewrite_bun_lock(
             let Some(spec) = entry.elems.first().and_then(|e| decode_json_string(e)) else {
                 continue;
             };
+            // Bun unpacks a bundled copy from its PARENT's tarball and never
+            // reads the entry's spec (#469), so a rewrite here would count
+            // as redirected (and VEX-attest the patch) while the unpatched
+            // bundled bytes keep installing. Mirrors npm's `inBundle` guard.
+            if is_bundled_entry(entry)
+                && (spec == target_spec
+                    || spec == url_spec
+                    || is_prior_hosted_bun_spec(&spec, &fname, &dep.artifact_url))
+            {
+                matched_any = true;
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_bun_bundled_instance_skipped".into(),
+                    detail: format!(
+                        "bun.lock entry `{}` is bundled inside its parent's tarball and \
+                         CANNOT be redirected — that copy stays UNPATCHED; vendor or update \
+                         the bundling parent to cover it",
+                        entry.key
+                    ),
+                });
+                continue;
+            }
             let deps_verbatim: String;
             if entry.elems.len() == 4
                 && spec == target_spec
@@ -4095,7 +4116,6 @@ fn rewrite_uv_lock(
         }
     }
 }
-
 
 // ── composer.lock ────────────────────────────────────────────────────────────
 /// Whether `text` points at `artifact_url` in any spelling a rewritten file may
@@ -8389,6 +8409,59 @@ mod tests {
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
 
+    /// REGRESSION (#469): Bun records a `bundleDependencies` copy as its own
+    /// `parent/child` entry flagged `{ "bundled": true }` and unpacks it
+    /// from the PARENT's tarball, never fetching it. Rewriting that entry
+    /// would count it `redirected` (and let VEX attest it) while the copy
+    /// the parent loads stays unpatched — the Bun twin of npm's `inBundle`
+    /// guard (#325). The bundled entry is skipped loudly; a regular entry of
+    /// the same version beside it is still rewritten.
+    #[test]
+    fn bun_lock_bundled_entry_is_skipped_with_loud_warning() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override("is-number", "7.0.0", "http://p.test/isn.tgz", &sha512);
+        let bundled = "\"@bh/bund/is-number\": [\"is-number@7.0.0\", \"\", { \"bundled\": true }, \"sha512-UP==\"],";
+        let regular = "\"is-number\": [\"is-number@7.0.0\", \"\", {}, \"sha512-UP==\"],";
+
+        // Bundled copy only: nothing is rewritten, and the warning names the
+        // real reason instead of `redirect_bun_entry_not_found`.
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), bun_lock_file(bundled, 1));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_bun_bundled_instance_skipped"],
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings[0].detail.contains("@bh/bund/is-number")
+                && r.warnings[0].detail.contains("UNPATCHED"),
+            "{}",
+            r.warnings[0].detail
+        );
+
+        // Both: only the regular entry is rewired; the bundled line keeps
+        // its registry bytes.
+        let both = format!("{regular}\n    {bundled}");
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), bun_lock_file(&both, 1));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        assert_eq!(r.edits[0].key.as_deref(), Some("is-number"));
+        let out = r.files.get("bun.lock").expect("lock rewritten");
+        assert!(out.contains(bundled), "bundled line untouched: {out}");
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_bun_bundled_instance_skipped"],
+            "{:?}",
+            r.warnings
+        );
+    }
+
     /// A CRLF bun.lock (Windows `core.autocrlf` checkout) must keep CRLF on
     /// the REWRITTEN line too — the vendored engine already does — so the
     /// file never ends up mixed-EOL, and the ledger `new` fragment carries
@@ -10420,7 +10493,11 @@ mod tests {
                 let out = r.files.get("Gemfile.lock").expect("lock rewritten");
                 let rows: Vec<&str> = out
                     .lines()
-                    .filter(|l| l.trim_start().starts_with("rails (7.0.0)") && l.starts_with("  ") && !l.starts_with("    "))
+                    .filter(|l| {
+                        l.trim_start().starts_with("rails (7.0.0)")
+                            && l.starts_with("  ")
+                            && !l.starts_with("    ")
+                    })
                     .collect();
                 assert_eq!(
                     rows,
@@ -10433,7 +10510,11 @@ mod tests {
                     "{entry}: the entry keeps its line ending: {out:?}"
                 );
                 let model = crate::formats::gem::GemfileLock::parse(out);
-                assert_eq!(model.checksum("rails", "7.0.0"), Some(patched.as_str()), "{entry}");
+                assert_eq!(
+                    model.checksum("rails", "7.0.0"),
+                    Some(patched.as_str()),
+                    "{entry}"
+                );
                 assert!(!out.contains("\r\r"), "line endings kept: {out:?}");
                 let edit = r
                     .edits
@@ -10448,7 +10529,10 @@ mod tests {
                 files.insert("Gemfile.lock".to_string(), out.clone());
                 let again = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
                 assert!(
-                    !again.edits.iter().any(|e| e.kind == "redirect_gemfile_lock_checksum"),
+                    !again
+                        .edits
+                        .iter()
+                        .any(|e| e.kind == "redirect_gemfile_lock_checksum"),
                     "{entry}: rerun is a no-op: {:?}",
                     again.edits
                 );
@@ -10816,11 +10900,19 @@ mod tests {
         let redacted = format!(
             "https://patch.socket.dev/patch/npm/left-pad/1.3.0/<redacted>/{uuid}/left-pad-1.3.0.tgz?x=1"
         );
-        assert_eq!(redact_grant_token(&url, &url, uuid), redacted, "the URL alone");
+        assert_eq!(
+            redact_grant_token(&url, &url, uuid),
+            redacted,
+            "the URL alone"
+        );
         let text = format!("vlt would fail to verify {url}: fetch error GET {url}: reset");
-        let want = format!("vlt would fail to verify {redacted}: fetch error GET {redacted}: reset");
+        let want =
+            format!("vlt would fail to verify {redacted}: fetch error GET {redacted}: reset");
         assert_eq!(redact_grant_token(&text, &url, uuid), want, "every quote");
-        assert!(!redact_grant_token(&text, &url, uuid).contains(token), "no token left");
+        assert!(
+            !redact_grant_token(&text, &url, uuid).contains(token),
+            "no token left"
+        );
         let registry = format!("https://patch.socket.dev/patch-registry/npm/{token}/{uuid}");
         assert_eq!(
             redact_grant_token(&registry, &registry, uuid),

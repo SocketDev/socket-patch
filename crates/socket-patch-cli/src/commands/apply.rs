@@ -2,9 +2,7 @@ use clap::Args;
 use socket_patch_core::api::blob_fetcher::get_missing_blobs;
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
-use socket_patch_core::crawlers::{
-    detect_npm_pkg_manager, Ecosystem, NpmPkgManager, RubyCrawler,
-};
+use socket_patch_core::crawlers::{detect_npm_pkg_manager, Ecosystem, NpmPkgManager, RubyCrawler};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{

@@ -506,7 +506,8 @@ mod tests {
         // CRLF, and a hand edit can leave a mixed-ending file, so the
         // removal helpers must never normalize: every byte outside the
         // removed segment survives verbatim.
-        let wired = "[project]\r\nname = \"x\"\r\n\n[tool.uv.sources]\nfoo = { path = \"w.whl\" }\n";
+        let wired =
+            "[project]\r\nname = \"x\"\r\n\n[tool.uv.sources]\nfoo = { path = \"w.whl\" }\n";
         let after = remove_exact_line(wired, "foo = { path = \"w.whl\" }").unwrap();
         assert_eq!(after, "[project]\r\nname = \"x\"\r\n\n[tool.uv.sources]\n");
         assert_eq!(
