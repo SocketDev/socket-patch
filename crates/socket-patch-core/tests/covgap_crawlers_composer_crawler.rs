@@ -95,7 +95,11 @@ async fn get_vendor_paths_global_nonexistent_composer_home_falls_back() {
 fn write_composer_shim(dir: &Path, echo_path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let shim = dir.join("composer");
-    std::fs::write(&shim, format!("#!/bin/sh\necho '{}'\n", echo_path.display())).unwrap();
+    std::fs::write(
+        &shim,
+        format!("#!/bin/sh\necho '{}'\n", echo_path.display()),
+    )
+    .unwrap();
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 

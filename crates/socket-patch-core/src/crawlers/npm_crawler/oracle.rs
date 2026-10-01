@@ -9,9 +9,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::{
-    build_npm_purl, is_legacy_pnpm_store_dir_name,
-    is_safe_npm_component, parse_package_name, read_package_json, NpmCrawler, StoreEntry,
-    Target, NESTED_STORE_MAX_DEPTH, NESTED_STORE_MAX_DIRS, SKIP_DIRS, VLT_STORE_NAME,
+    build_npm_purl, is_legacy_pnpm_store_dir_name, is_safe_npm_component, parse_package_name,
+    read_package_json, NpmCrawler, StoreEntry, Target, NESTED_STORE_MAX_DEPTH,
+    NESTED_STORE_MAX_DIRS, SKIP_DIRS, VLT_STORE_NAME,
 };
 use crate::crawlers::types::{CrawledPackage, CrawlerOptions};
 use crate::utils::fs::is_dir;
