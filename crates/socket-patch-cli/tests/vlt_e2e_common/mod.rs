@@ -146,6 +146,13 @@ impl std::fmt::Display for VltVersion {
 
 /// `vlt ci`, `--frozen-lockfile` and `--expect-lockfile` exist.
 pub const HAS_CI_FROM: VltVersion = VltVersion::zero(19);
+/// `vlt ci` defaults `--allow-scripts` to `:scripts:not(:malware)`, whose
+/// `:malware` selector makes every install with new nodes POST them to
+/// api.socket.dev ("*" before).
+pub const CI_MALWARE_QUERY_FROM: VltVersion = VltVersion::rc(24);
+/// vlt's `ci` default minus its `:malware` filter: the same set for the
+/// harness's packages, with no Socket API call.
+pub const CI_ALLOW_SCRIPTS: &str = ":scripts";
 /// A root `postinstall` runs without an `install` script.
 pub const ROOT_POSTINSTALL_FROM: VltVersion = VltVersion::rc(13);
 /// Install commands need a registry configuration.
@@ -653,7 +660,8 @@ impl Leg {
         }
         env.extend(run.env.iter().cloned());
         let pairs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        common::vlt_run(cwd, &tc.js, args, &pairs)
+        let args = hermetic_args(tc.version, args);
+        common::vlt_run(cwd, &tc.js, &args, &pairs)
     }
 
     /// [`Leg::vlt`], asserting success.
@@ -702,6 +710,21 @@ impl Drop for Leg {
             );
         }
     }
+}
+
+/// `args`, with an explicit [`CI_ALLOW_SCRIPTS`] on a `vlt ci` that would
+/// otherwise query api.socket.dev for `:malware` (a 401 there failed whole
+/// matrix rows). An explicit `--allow-scripts` is left alone.
+pub fn hermetic_args<'a>(v: VltVersion, args: &[&'a str]) -> Vec<&'a str> {
+    let mut out = args.to_vec();
+    if v >= CI_MALWARE_QUERY_FROM
+        && args.first() == Some(&"ci")
+        && !args.iter().any(|a| a.starts_with("--allow-scripts"))
+    {
+        out.push("--allow-scripts");
+        out.push(CI_ALLOW_SCRIPTS);
+    }
+    out
 }
 
 /// Per-invocation options for [`Leg::vlt_with`].
@@ -2445,6 +2468,18 @@ fn vlt_e2e_harness_vlt_json_follows_the_era_table() {
         vlt_json(v("1.2.0"), r, &d),
         json!({ "config": { "registries": { "npm": r } } })
     );
+}
+
+#[test]
+fn vlt_e2e_harness_ci_never_queries_the_socket_api() {
+    let v = |s: &str| VltVersion::parse(s).unwrap();
+    let pinned = ["ci", "--allow-scripts", CI_ALLOW_SCRIPTS];
+    assert_eq!(hermetic_args(v("1.2.0"), &["ci"]), pinned);
+    assert_eq!(hermetic_args(v("1.0.0-rc.24"), &["ci"]), pinned);
+    assert_eq!(hermetic_args(v("1.0.0-rc.23"), &["ci"]), ["ci"]);
+    assert_eq!(hermetic_args(v("1.2.0"), &["install"]), ["install"]);
+    let own = ["ci", "--allow-scripts=*"];
+    assert_eq!(hermetic_args(v("1.2.0"), &own), own);
 }
 
 #[test]
