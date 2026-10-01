@@ -239,6 +239,39 @@ async fn package_lock_goldens_round_trip() {
     npm_flavor("npm/package-lock-v3", &[]).await;
 }
 
+/// #324: the hosted unwind of a CRLF, tab-indented or BOM-prefixed
+/// package-lock.json gives back the lock's original bytes (npm keeps those
+/// layouts on its own rewrites and installs from a BOM lock).
+#[tokio::test]
+#[serial]
+async fn package_lock_layouts_round_trip() {
+    let basic = load("npm/package-lock-v3")
+        .into_iter()
+        .find(|c| c.dir.ends_with("basic"))
+        .expect("npm/package-lock-v3/basic golden");
+    let lf = basic.input["package-lock.json"].clone();
+    let shapes = [
+        ("crlf", lf.replace('\n', "\r\n")),
+        ("tabs", lf.replace("  ", "\t")),
+        ("bom", format!("\u{feff}{lf}")),
+        (
+            "bom+crlf+tabs",
+            format!("\u{feff}{}", lf.replace("  ", "\t").replace('\n', "\r\n")),
+        ),
+    ];
+    for (shape, pristine) in shapes {
+        let case = synthetic(
+            &format!("npm-lock-{shape}"),
+            &[("package-lock.json", &pristine)],
+            serde_json::Value::Array(basic.overrides.clone()),
+        );
+        let server = npm_mock(&case).await;
+        let _env = EnvGuard::set(&[("SOCKET_NPM_REGISTRY", server.uri())]);
+        let (after, statuses) = run_case(&case).await;
+        assert_round_trip(&case, &after, &statuses);
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn yarn_classic_goldens_round_trip() {
@@ -620,16 +653,27 @@ async fn gem_pre_checksums_states() {
 
 #[tokio::test]
 #[serial]
-async fn gem_transitive_without_proof_stays_declared() {
-    // The rewriter's append for a transitive gem is indistinguishable from a
-    // direct last-line declaration, so it is kept as a direct exact pin.
+async fn gem_transitive_append_round_trips_unless_unprovable() {
+    // #457: on a Gemfile ending in a declaration line, the rewriter's own
+    // append for a transitive gem is undone byte for byte: no new `gem`
+    // line, no `(= version)` DEPENDENCIES pin freezing the version.
     let gemfile = "source \"https://rubygems.org\"\n\ngem \"puma\"\n";
     let lock = transitive_lock().replace("  rails (= 7.0.0)\n", "");
     let case = synthetic(
-        "transitive-ambiguous",
+        "transitive-appended",
         &[("Gemfile", gemfile), ("Gemfile.lock", &lock)],
         gem_override("zeitwerk", "2.6.0"),
     );
+    let (after, statuses) = gem_run(&case).await;
+    assert_round_trip(&case, &after, &statuses);
+
+    // An append with no blank line before it (what releases before #457
+    // wrote) is indistinguishable from a direct last-line declaration, so
+    // it is kept as a direct exact pin.
+    let mut case = case.clone_with("transitive-ambiguous");
+    let legacy = case.expected["Gemfile"].replace("\n\nsource", "\nsource");
+    assert_ne!(legacy, case.expected["Gemfile"]);
+    case.expected.insert("Gemfile".into(), legacy);
     let (after, statuses) = gem_run(&case).await;
     assert_eq!(statuses[0].1, PinStatus::Restored);
     assert_eq!(after["Gemfile"], format!("{gemfile}gem \"zeitwerk\", \"2.6.0\"\n"));

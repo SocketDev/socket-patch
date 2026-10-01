@@ -400,6 +400,11 @@ enum Driver {
     /// selector (v4.0). No `--vex` (get has none); the uuid path needs only
     /// the view + reference mocks and is exempt from installed narrowing.
     GetUuid,
+    /// [`Driver::ScanVex`] on a dual-boot project whose `.bundle/config`
+    /// sets `BUNDLE_GEMFILE: "Gemfile.next"` (#390): bundler loads
+    /// `Gemfile.next`, so the run must redirect nothing and attest nothing.
+    /// The fixture asserts that contract itself and yields `None`.
+    ScanVexDualBoot,
 }
 
 impl Driver {
@@ -407,6 +412,7 @@ impl Driver {
         match self {
             Driver::ScanVex => "scan --mode hosted",
             Driver::GetUuid => "get <uuid> --mode hosted",
+            Driver::ScanVexDualBoot => "scan --mode hosted (BUNDLE_GEMFILE=Gemfile.next)",
         }
     }
 }
@@ -754,8 +760,22 @@ async fn redirect_scanned_project(
     //    --vex (get has none), get's envelope with the nested `redirect`.
     let api = server.uri();
     let proj_str = proj.to_str().expect("utf8 tmp path");
+    if driver == Driver::ScanVexDualBoot {
+        // The next-Rails dual boot: a `Gemfile.next` pair that bundler loads
+        // through the committed `.bundle/config`.
+        std::fs::copy(proj.join(gemfile_name), proj.join("Gemfile.next")).unwrap();
+        std::fs::copy(proj.join(lock_name), proj.join("Gemfile.next.lock")).unwrap();
+        let args = bundler.config_local_args("gemfile", "Gemfile.next");
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let cfg = bundle(&proj, &args);
+        assert!(
+            cfg.status.success(),
+            "bundle config set --local gemfile failed:\n{}",
+            String::from_utf8_lossy(&cfg.stderr)
+        );
+    }
     let argv: Vec<&str> = match driver {
-        Driver::ScanVex => vec![
+        Driver::ScanVex | Driver::ScanVexDualBoot => vec![
             "scan",
             "--mode",
             "hosted",
@@ -792,6 +812,19 @@ async fn redirect_scanned_project(
         ],
     };
     let (code, stdout, stderr) = run_socket(&proj, &argv);
+    if driver == Driver::ScanVexDualBoot {
+        let env: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"));
+        // `--vex` with nothing to attest is an error: the run must not
+        // look like a successful, attested patch.
+        assert_ne!(code, 0, "nothing was patched or attested: {env}");
+        assert_eq!(
+            env["error"]["code"], "manifest_not_found",
+            "envelope: {env}"
+        );
+        assert_dual_boot_redirects_nothing(&env, &proj, &pristine_gemfile, &pristine_lock);
+        return None;
+    }
     assert_eq!(
         code,
         0,
@@ -865,6 +898,7 @@ async fn redirect_scanned_project(
                 "in-run hosted VEX is attested from this run's fetched record, not hash-verified: {env}"
             );
         }
+        Driver::ScanVexDualBoot => unreachable!("asserted and returned above"),
         Driver::GetUuid => {
             // get's hosted envelope (CLI_CONTRACT.md "get --mode and
             // installed narrowing"): `found` counts the resolved patch;
@@ -916,6 +950,52 @@ async fn redirect_scanned_project(
         bundler,
         _server: server,
     })
+}
+
+/// #390's contract on a `BUNDLE_GEMFILE: Gemfile.next` project: the hosted
+/// scan names the setting, rewrites neither the `Gemfile` pair (which
+/// bundler ignores) nor `Gemfile.next`, and its in-run VEX attests nothing.
+/// Then the real bundler, loading `Gemfile.next`, resolves the upstream gem
+/// (nothing pretends otherwise).
+fn assert_dual_boot_redirects_nothing(
+    env: &serde_json::Value,
+    proj: &Path,
+    pristine_gemfile: &[u8],
+    pristine_lock: &[u8],
+) {
+    let warning_codes: Vec<&str> = env["redirect"]["warnings"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|w| w["code"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        warning_codes.contains(&"redirect_gem_bundle_gemfile_unsupported"),
+        "the BUNDLE_GEMFILE refusal must be reported: {env}"
+    );
+    assert!(
+        !warning_codes.contains(&"redirect_gem_no_gemfile"),
+        "the refusal names its real cause, not a missing Gemfile: {env}"
+    );
+    assert_eq!(
+        env["redirect"]["redirected"], 0,
+        "nothing redirected: {env}"
+    );
+    assert!(
+        env["vex"]["statements"].as_u64().unwrap_or(0) == 0,
+        "no in-run attestation for a gem bundler installs unpatched: {env}"
+    );
+    for (file, want) in [
+        ("Gemfile", pristine_gemfile),
+        ("Gemfile.lock", pristine_lock),
+        ("Gemfile.next", pristine_gemfile),
+        ("Gemfile.next.lock", pristine_lock),
+    ] {
+        assert_eq!(
+            std::fs::read(proj.join(file)).unwrap(),
+            want,
+            "{file} must be byte-untouched"
+        );
+    }
+    assert_no_redirect_ledger(proj);
 }
 
 /// v5 hosted mode never writes `.socket/vendor/redirect-state.json`.
@@ -1386,6 +1466,87 @@ async fn gem_hosted_gems_rb_spelling_redirects_and_installs() {
         "gems.locked must converge on the patch-registry source:\n{lock}"
     );
     manifestless_vex_matrix(&fx, &fresh).await;
+}
+
+/// #341 follow-through: a CHECKSUMS-converged hosted `gems.rb` pin is a
+/// live hosted pin, so `get --mode vendored` takes it over. Vendored mode
+/// cannot wire `gems.rb`, and the refusal must come before the takeover
+/// reverts the pin.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_gems_rb_pin_survives_a_refused_vendored_takeover() {
+    let Some(fx) = redirect_scanned_project(
+        "gems.rb takeover",
+        Spelling::GemsRb,
+        true,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    vendor_takeover_keeps_the_hosted_gems_rb_pin(&fx);
+}
+
+/// A hosted→vendored takeover of a `gems.rb` project: vendored mode cannot
+/// wire `gems.rb`, so `get --mode vendored` must refuse BEFORE it restores the hosted
+/// pin's upstream entry, or the gem ends up unpatched in both modes.
+fn vendor_takeover_keeps_the_hosted_gems_rb_pin(fx: &RedirectFixture) {
+    let before: Vec<Vec<u8>> = ["gems.rb", "gems.locked"]
+        .iter()
+        .map(|f| std::fs::read(fx.proj.join(f)).unwrap())
+        .collect();
+    let proj = fx.proj.to_str().expect("utf8 tmp path");
+    let api = fx._server.uri();
+    let (code, stdout, stderr) = run_socket(
+        &fx.proj,
+        &[
+            "get", UUID, "--mode", "vendored", "--json", "--yes", "--cwd", proj, "--api-url",
+            &api, "--org", ORG, "--api-token", "fake",
+            // The mock serves the patch registry: its origin is the one a
+            // hosted pin is trusted on.
+            "--patch-server-url", &api,
+        ],
+    );
+    assert_ne!(code, 0, "vendor must refuse.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("gemfile_not_loaded"),
+        "the manifest refusal names its cause:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("vendor_takeover_reverted_redirect"),
+        "the hosted pin must not be reverted first:\n{stdout}"
+    );
+    for (file, before) in ["gems.rb", "gems.locked"].iter().zip(before) {
+        assert_eq!(
+            std::fs::read(fx.proj.join(file)).unwrap(),
+            before,
+            "{file} keeps its hosted wiring"
+        );
+    }
+}
+
+/// #390: bundler's `BUNDLE_GEMFILE` (here a committed `.bundle/config`
+/// naming `Gemfile.next`, the dual-boot layout) picks the manifest it
+/// loads. The hosted scan used to rewrite the ignored `Gemfile`, report
+/// success and attest the patch; it must redirect and attest nothing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_bundle_gemfile_dual_boot_redirects_nothing() {
+    let fx = redirect_scanned_project(
+        "dual-boot",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVexDualBoot,
+    )
+    .await;
+    assert!(fx.is_none(), "the dual-boot driver asserts in place");
 }
 
 /// The compact-index DEPENDENCY contract, pinned from the red side: a patch

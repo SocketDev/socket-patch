@@ -1033,8 +1033,9 @@ fn pip_requirements_vendor_fresh_checkout_no_index_and_revert() {
     );
     assert_vendored_applied(&parse_envelope(&stdout));
 
-    // Artifact + the rewritten pin line (the exact spike-tested shape:
-    // `./<wheel> --hash=sha256:<hex>  # socket-patch vendor: six==1.16.0`).
+    // Artifact + the rewritten pin line (the spike-tested shape:
+    // `./<wheel>  # socket-patch vendor: six==1.16.0`; `--hash=sha256:<hex>`
+    // only in a file already in pip's hash-checking mode, #376).
     let wheel = vendored_wheel(&proj);
     let wheel_rel = format!(
         ".socket/vendor/pypi/{UUID}/{}",
@@ -1052,8 +1053,9 @@ fn pip_requirements_vendor_fresh_checkout_no_index_and_revert() {
         "the path line must be ./-prefixed and project-relative: {vendor_line}"
     );
     assert!(
-        vendor_line.contains("--hash=sha256:"),
-        "the path line must pin the wheel hash (hardens every install): {vendor_line}"
+        !requirements.contains("--hash"),
+        "an unhashed requirements.txt must stay unhashed, or pip's \
+         hash-checking mode refuses every other requirement (#376):\n{requirements}"
     );
     assert!(
         !requirements
@@ -1201,7 +1203,12 @@ fn pip_vendored_requirements_evaluate_environment_markers() {
             "install upstream six",
         );
         let patched = stage_patch(&project, &site_packages(&venv).join("six.py"));
-        let original = format!("six==1.16.0 ; {marker}\n");
+        // Hash-pinned (pip-compile style), so the fresh install below can run
+        // `--require-hashes`: a hashed file keeps the vendor line hashed
+        // (#376), and the marker must survive next to the `--hash`.
+        let original = format!(
+            "six==1.16.0 ; {marker} \\\n    --hash=sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\n"
+        );
         std::fs::write(project.join("requirements.txt"), &original).unwrap();
         let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &project);
         assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");

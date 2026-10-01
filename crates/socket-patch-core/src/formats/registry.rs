@@ -101,6 +101,10 @@ const REGISTRY: &[FormatFile] = &[
     row("poetry.lock", "pypi", HOSTED | VENDORED | PROBE | ROOT),
     row("pdm.lock", "pypi", HOSTED | VENDORED | PROBE | ROOT),
     row("Pipfile.lock", "pypi", HOSTED | VENDORED | PROBE | ROOT),
+    // Never edited — its presence tells the Pipenv planner a Pipfile.lock is
+    // live (a conflict there vetoes the sibling Python rewriters) rather
+    // than abandoned.
+    row("Pipfile", "pypi", HOSTED | PRESENCE_ONLY),
     row("pyproject.toml", "pypi", HOSTED | VENDORED | PROBE),
     row("hatch.toml", "pypi", HOSTED | PROBE),
     // ── cargo ──
@@ -140,6 +144,14 @@ const REGISTRY: &[FormatFile] = &[
     // into (read so an existing user config / checksum set is preserved).
     row(".mvn/maven.config", "maven", HOSTED),
     row(".mvn/checksums/checksums.sha256", "maven", HOSTED),
+    // Never edited: its `distributionUrl` names the project's Maven, which
+    // the maven planner checks against the Trusted Checksums floor (3.9.4)
+    // to warn when the `.mvn/*` pin above would be inert.
+    row(
+        ".mvn/wrapper/maven-wrapper.properties",
+        "maven",
+        HOSTED | PRESENCE_ONLY,
+    ),
     // Gradle build scripts are never edited — their presence only feeds the
     // maven planner's paste-able `exclusiveContent` snippet warning.
     row("settings.gradle", "maven", HOSTED | PRESENCE_ONLY),
@@ -217,6 +229,7 @@ mod tests {
         assert_eq!(hosted_file_ecosystem(".cargo/config"), Some("cargo"));
         assert_eq!(hosted_file_ecosystem("checksums.sha256"), Some("maven"));
         assert_eq!(hosted_file_ecosystem("build.gradle"), None);
+        assert_eq!(hosted_file_ecosystem("Pipfile"), None);
         assert_eq!(hosted_file_ecosystem("package.json"), None);
         assert_eq!(hosted_file_ecosystem("NuGet.Config"), Some("nuget"));
     }

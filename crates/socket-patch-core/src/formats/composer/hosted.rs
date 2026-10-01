@@ -10,11 +10,11 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::utils::composer_version::composer_versions_equivalent;
 use super::source as composer_source;
 use crate::patch::redirect::{
     artifact_url_present, full_name, DepOverride, RewriteResult, RewriteWarning,
 };
+use crate::utils::composer_version::composer_versions_equivalent;
 
 /// Byte offset of the `}` closing the JSON object that CONTAINS `from`, which
 /// must be a position inside that object. Brace counting skips string literals,
@@ -111,6 +111,17 @@ pub(crate) fn find_composer_entry(content: &str, pkg: &str, version: &str) -> Co
     }
 }
 
+pub(crate) fn find_composer_member(
+    content: &str,
+    entry: (usize, usize),
+    key: &str,
+) -> Option<composer_source::Member> {
+    let object_open = composer_source::entry_object_start(content, entry.0)?;
+    composer_source::top_level_members(content, object_open, entry.1)
+        .into_iter()
+        .find(|member| member.key == key)
+}
+
 /// Append `"shasum": "<sha1>"` as the last key of a `"dist": { … }` block,
 /// indented like the keys already in it. VCS/zipball dists omit `shasum`
 /// entirely; redirecting such a block without inserting the pin left the hosted
@@ -163,7 +174,6 @@ pub(crate) fn rewrite_composer_lock(
         });
         return;
     }
-    const DIST_KEY: &str = "\"dist\": {";
     let mut content = files["composer.lock"].clone();
     let type_re: &Regex = &COMPOSER_DIST_TYPE_RE;
     let url_re: &Regex = &COMPOSER_DIST_URL_RE;
@@ -202,14 +212,8 @@ pub(crate) fn rewrite_composer_lock(
                     continue;
                 }
             };
-        // The dist block MUST belong to the located entry. Scanning forward
-        // from the name for the next `"dist": {` walked into the FOLLOWING
-        // package whenever the target was installed from source, repointing a
-        // bystander's url + shasum — a checksum-clean install of the wrong
-        // code. A target with no dist of its own pins nothing: fail closed.
-        let Some(dist_start) = content[entry_start..=entry_end]
-            .find(DIST_KEY)
-            .map(|offset| entry_start + offset)
+        let Some(dist_member) = find_composer_member(&content, (entry_start, entry_end), "dist")
+            .filter(|member| content.as_bytes()[member.value_start] == b'{')
         else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_composer_no_dist".into(),
@@ -217,13 +221,8 @@ pub(crate) fn rewrite_composer_lock(
             });
             continue;
         };
-        let Some(dist_end) = json_object_end_from(&content, dist_start + DIST_KEY.len()) else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_composer_lock_malformed".into(),
-                detail: format!("{composer_name}'s dist block is unterminated"),
-            });
-            continue;
-        };
+        let dist_start = dist_member.key_start;
+        let dist_end = dist_member.value_end;
         // The dist's own members only: a `mirrors` entry listed before the
         // dist `url` would otherwise take the redirected url and then be
         // dropped with the mirrors, leaving the upstream url pinned to the

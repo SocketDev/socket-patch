@@ -213,4 +213,28 @@ mod tests {
         assert!(out.stale_purls.is_empty());
         assert!(out.warnings.is_empty());
     }
+
+    /// A legacy `.egg-info` install (pip < 23.1 building an sdist without
+    /// `wheel`) is a real copy pip keeps on `install -r`, so the hosted
+    /// stale-install guard must judge it like a `.dist-info` one (#447).
+    #[tokio::test]
+    async fn egg_info_install_gets_the_stale_install_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site-packages");
+        let egg = site.join("six-1.16.0-py3.11.egg-info");
+        std::fs::create_dir_all(&egg).unwrap();
+        std::fs::write(egg.join("PKG-INFO"), "Name: six\nVersion: 1.16.0\n").unwrap();
+        std::fs::write(site.join("six.py"), b"upstream").unwrap();
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            global_prefix: Some(site.clone()),
+            ..Default::default()
+        };
+        let purl = "pkg:pypi/six@1.16.0";
+        let confirmed = vec![(purl.to_string(), "six-uuid".to_string())];
+        let ledger = BTreeMap::from([("k".into(), record("six-uuid", "six.py", b"patched"))]);
+        let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), &ledger).await;
+        assert_eq!(out.stale_purls, BTreeSet::from([purl.to_string()]));
+        assert_eq!(out.warnings[0]["code"], "redirect_pypi_stale_install");
+    }
 }

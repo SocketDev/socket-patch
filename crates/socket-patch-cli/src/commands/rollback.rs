@@ -1043,7 +1043,10 @@ pub(crate) async fn retire_legacy_redirect_ledger(common: &GlobalArgs) -> Option
     let path = common
         .cwd
         .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
-    if common.dry_run || tokio::fs::symlink_metadata(&path).await.is_err() {
+    if common.dry_run
+        || !crate::commands::project_state_in_scope(common)
+        || tokio::fs::symlink_metadata(&path).await.is_err()
+    {
         return None;
     }
     let remaining = crate::commands::discover_wiring(common, &common.cwd).await;
@@ -1111,13 +1114,23 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // themselves are LOADED UNDER the apply lock below: this run persists
     // mutated clones of the ledgers, so a pre-lock snapshot could clobber
     // a concurrent run's writes with stale state.
+    //
+    // Under global scope the project's hosted pins and vendor ledger are
+    // not this run's to unwind (see `project_state_in_scope`): a global
+    // rollback restores the global copies and their manifest records only.
+    let project_state = crate::commands::project_state_in_scope(&args.common);
     let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
-    let vendor_ledger_exists = tokio::fs::metadata(cwd.join(".socket/vendor/state.json"))
-        .await
-        .is_ok();
+    let vendor_ledger_exists = project_state
+        && tokio::fs::metadata(cwd.join(".socket/vendor/state.json"))
+            .await
+            .is_ok();
     // The hosted pins the lockfiles wire (read-only discovery; the restore
     // re-reads every file under the lock before it writes).
-    let hosted_inventory = crate::commands::hosted_inventory(&args.common, &cwd).await;
+    let hosted_inventory = if project_state {
+        crate::commands::hosted_inventory(&args.common, &cwd).await
+    } else {
+        Default::default()
+    };
     let hosted_pins: Vec<HostedPin> = hosted_inventory.pins.clone();
 
     if manifest_missing && !vendor_ledger_exists && hosted_pins.is_empty() {
@@ -1131,7 +1144,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         // so there is nothing to restore — retire the stale file (a wet run
         // only) instead of failing on the missing manifest.
         let legacy = cwd.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
-        if tokio::fs::symlink_metadata(&legacy).await.is_ok() {
+        if project_state && tokio::fs::symlink_metadata(&legacy).await.is_ok() {
             let warning = retire_legacy_redirect_ledger(&args.common).await;
             if args.common.json {
                 println!(
@@ -1167,7 +1180,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
         // with lockfiles still consuming `.socket/vendor/` artifacts: the
         // ledger holds the pre-vendor originals, so it must come back from
         // version control first.)
-        let wired = crate::commands::vendored_backend::repair::scan_vendor_references(&cwd).await;
+        let wired = if project_state {
+            crate::commands::vendored_backend::repair::scan_vendor_references(&cwd).await
+        } else {
+            Default::default()
+        };
         if !wired.is_empty() {
             emit_rollback_error(
                 args.common.json,
@@ -1213,7 +1230,22 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // Load the state stores UNDER the lock (see the discovery note above),
     // each exactly once: the agent leg below receives the manifest and the
     // vendor-ownership key set instead of re-reading them.
-    let vendor_state_result = socket_patch_core::vendor::load_state(&cwd).await;
+    //
+    // Under global scope the ledger is read only to keep the project's
+    // vendored manifest records (see the cleanup below): no vendored leg
+    // runs, and the ledger does not own the global copies, so the in-place
+    // leg restores them.
+    let loaded_vendor_state = socket_patch_core::vendor::load_state(&cwd).await;
+    let project_vendored_keys: HashSet<String> = loaded_vendor_state
+        .as_ref()
+        .map(VendorState::purl_keys)
+        .unwrap_or_default();
+    let ledger_unreadable = loaded_vendor_state.is_err();
+    let vendor_state_result = if project_state {
+        loaded_vendor_state
+    } else {
+        Ok(VendorState::default())
+    };
     let vendor_corrupt = vendor_state_result.is_err();
     // An unreadable ledger degrades to "nothing vendored" for the in-place
     // leg (its own containment is the `vendor_state_unreadable` exit below).
@@ -1558,7 +1590,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .filter(|r| !r.success)
                 .map(|r| r.package_key.clone())
                 .collect();
-            let cleanup_allowed = !args.preserve_state && !aborted && !vendor_corrupt;
+            // A global run keeps the project's vendored records too: their
+            // vendored state is not unwound, so dropping them would hand a
+            // later `vendor` reconcile a revert with no backing record. An
+            // unreadable ledger leaves that ownership unknowable either way.
+            let cleanup_allowed = !args.preserve_state && !aborted && !ledger_unreadable;
             // A vendor-owned manifest purl is removable only when its
             // ledger entry was cleanly reverted this run (drift-keeps and
             // failures keep the record; the matching mirrors the
@@ -1586,6 +1622,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .iter()
                 .filter(|purl| {
                     if failed_purls.contains(*purl) {
+                        return false;
+                    }
+                    if !project_state && purl_keys_cover(&project_vendored_keys, purl) {
                         return false;
                     }
                     if vendored_excluded.contains(purl) {

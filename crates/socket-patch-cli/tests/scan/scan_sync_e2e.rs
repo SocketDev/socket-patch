@@ -386,9 +386,10 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
     assert_eq!(v["status"], "success", "envelope={v}");
 
     // The pre-staged manifest already carries this exact UUID, so the patch
-    // MUST be classified `skipped` (not re-applied / re-added). Nothing in
-    // the original test verified this — exit 0 alone would also hold if the
-    // patch were wrongly re-applied.
+    // MUST be classified `skipped` (not re-downloaded / re-added), yet the
+    // installed copy is still pristine, so the nested apply must reconcile it
+    // from the cached blob (#454: a recorded-but-unapplied patch used to be
+    // left unpatched with exit 0).
     let apply = v["apply"]
         .as_object()
         .unwrap_or_else(|| panic!("scan --apply must emit an apply sub-object; envelope={v}"));
@@ -398,8 +399,8 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
         "patch must be skipped; apply={apply:?}"
     );
     assert_eq!(
-        apply["applied"], 0,
-        "nothing applied on a skip; apply={apply:?}"
+        apply["applied"], 1,
+        "the recorded patch is applied to the pristine install; apply={apply:?}"
     );
     assert_eq!(apply["failed"], 0, "apply.failed; apply={apply:?}");
     // The defining claim of this test ("skip the blob download / use the cached
@@ -424,8 +425,8 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
         patches[0]
     );
 
-    // A skip must NOT touch the file: index.js stays at its original
-    // ("before") content (the patch was never re-applied).
+    // The skipped record is still applied: index.js now holds the cached
+    // blob's ("after") content, with no blob download (asserted above).
     let on_disk = std::fs::read(
         tmp.path()
             .join("node_modules")
@@ -434,8 +435,8 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
     )
     .expect("index.js must exist");
     assert_eq!(
-        on_disk, before,
-        "skipped patch must leave the file untouched"
+        on_disk, after,
+        "a recorded patch must be applied to the pristine install from the cache"
     );
 
     // The pre-staged cached blob must still be present and unchanged.

@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use super::{canonicalize_pypi_name, read_python_metadata, PythonCrawler};
+use super::{canonicalize_pypi_name, read_egg_info_metadata, read_python_metadata, PythonCrawler};
 use crate::crawlers::types::{CrawledPackage, CrawlerOptions};
 
 pub(super) struct LegacyPythonCrawler;
@@ -78,17 +78,22 @@ impl LegacyPythonCrawler {
     }
 }
 
-/// The old per-entry async `list_dist_info_packages`.
+/// The old per-entry async `list_dist_info_packages` (with the same
+/// `.egg-info` support as the parallel scan).
 pub(super) async fn list_dist_info_packages(site_packages_path: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for entry in crate::utils::fs::list_dir_entries(site_packages_path).await {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if !name_str.ends_with(".dist-info") {
-            continue;
-        }
-        let dist_info_path = site_packages_path.join(&*name_str);
-        if let Some((raw_name, version)) = read_python_metadata(&dist_info_path).await {
+        let entry_path = site_packages_path.join(&*name_str);
+        let found = if name_str.ends_with(".dist-info") {
+            read_python_metadata(&entry_path).await
+        } else if name_str.ends_with(".egg-info") {
+            read_egg_info_metadata(&entry_path).await
+        } else {
+            None
+        };
+        if let Some((raw_name, version)) = found {
             out.push((canonicalize_pypi_name(&raw_name), version));
         }
     }

@@ -14,6 +14,7 @@
 //! bytes — no error, no patch. Every rewrite therefore carries the packed
 //! tarball's own hash, never an inherited one.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::Value;
@@ -24,10 +25,11 @@ use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_bytes};
 use crate::utils::socket_dir::remove_tree_and_prune;
 
-use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
+use super::common::{already_patched_result, done, parse_json_manifest, refused, JsonLayout};
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
 };
+use super::npm_origin::{legacy_packages_key, npm_non_registry_entries};
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
@@ -131,7 +133,7 @@ pub async fn vendor_npm<'a>(
             );
         }
     };
-    let lock = match LOCK_MEMO.parse(&lock_bytes, || serde_json::from_slice::<Value>(&lock_bytes)) {
+    let lock = match LOCK_MEMO.parse(&lock_bytes, || parse_json_manifest(&lock_bytes)) {
         Ok(v) => v,
         Err(e) => {
             return refused(
@@ -265,8 +267,8 @@ pub async fn vendor_npm<'a>(
         }
         if sib_changed {
             changed = true;
-            let indent = detect_indent(&String::from_utf8_lossy(&sib.bytes));
-            match serialize_json(&sib.lock, &indent) {
+            let layout = JsonLayout::of(&String::from_utf8_lossy(&sib.bytes));
+            match layout.render(&sib.lock) {
                 Ok(out) => sibling_writes.push((sib.name.clone(), sib.bytes.clone(), out)),
                 Err(e) => {
                     return done_failure_unstage(
@@ -306,8 +308,8 @@ pub async fn vendor_npm<'a>(
         );
     }
 
-    let indent = detect_indent(&String::from_utf8_lossy(&lock_bytes));
-    let out = match serialize_json(&lock, &indent) {
+    let layout = JsonLayout::of(&String::from_utf8_lossy(&lock_bytes));
+    let out = match layout.render(&lock) {
         Ok(out) => out,
         Err(e) => {
             return done_failure_unstage(
@@ -461,7 +463,9 @@ fn rewritable_matches(
             .filter(|w| {
                 matches!(
                     w.code,
-                    "vendor_bundled_instance_skipped" | "vendor_link_entry_skipped"
+                    "vendor_bundled_instance_skipped"
+                        | "vendor_link_entry_skipped"
+                        | "vendor_non_registry_entry_skipped"
                 )
             })
             .map(|w| w.detail.as_str())
@@ -471,8 +475,9 @@ fn rewritable_matches(
                 "vendor_lock_entry_not_rewritable",
                 format!(
                     "every {lock_name} entry for {name}@{version} is bundled inside a \
-                     parent's tarball or a link and cannot be rewritten — those copies \
-                     stay UNPATCHED and `npm install` will not help: {}",
+                     parent's tarball, a link, or installed from a non-registry spec and \
+                     cannot be rewritten — those copies stay UNPATCHED and `npm install` \
+                     will not help: {}",
                     skipped.join("; ")
                 ),
             )));
@@ -507,7 +512,7 @@ pub(super) async fn read_project(project_root: &Path) -> Result<NpmLockProject, 
         Ok(None) | Err(_) => return Err("vendor_lockfile_missing"),
     };
     let lock = LOCK_MEMO
-        .parse(&lock_bytes, || serde_json::from_slice::<Value>(&lock_bytes))
+        .parse(&lock_bytes, || parse_json_manifest(&lock_bytes))
         .map_err(|_| "vendor_lockfile_version_unsupported")?;
     lock_version_gate(&lock, &lock_name).map_err(|o| super::npm_common::refusal_code(&o))?;
     Ok(NpmLockProject { lock_name, lock })
@@ -698,17 +703,16 @@ pub async fn revert_npm_opts(
             }
             Err(e) => return RevertOutcome::failed(format!("cannot read {lock_name}: {e}")),
         };
-        let mut lock =
-            match LOCK_MEMO.parse(&lock_bytes, || serde_json::from_slice::<Value>(&lock_bytes)) {
-                Ok(v) => (*v).clone(),
-                // Fail-closed: editing a lock we cannot parse risks destroying
-                // it; the user must repair it before revert can restore.
-                Err(e) => {
-                    return RevertOutcome::failed(format!(
-                        "{lock_name} is not parseable JSON ({e}); fix it and re-run revert"
-                    ))
-                }
-            };
+        let mut lock = match LOCK_MEMO.parse(&lock_bytes, || parse_json_manifest(&lock_bytes)) {
+            Ok(v) => (*v).clone(),
+            // Fail-closed: editing a lock we cannot parse risks destroying
+            // it; the user must repair it before revert can restore.
+            Err(e) => {
+                return RevertOutcome::failed(format!(
+                    "{lock_name} is not parseable JSON ({e}); fix it and re-run revert"
+                ))
+            }
+        };
 
         let mut changed = false;
         // Reverse application order, like every backend's revert.
@@ -723,8 +727,8 @@ pub async fn revert_npm_opts(
         }
 
         if changed {
-            let indent = detect_indent(&String::from_utf8_lossy(&lock_bytes));
-            let out = match serialize_json(&lock, &indent) {
+            let layout = JsonLayout::of(&String::from_utf8_lossy(&lock_bytes));
+            let out = match layout.render(&lock) {
                 Ok(out) => out,
                 Err(e) => {
                     return RevertOutcome::failed(format!("cannot serialize {lock_name}: {e}"))
@@ -836,6 +840,7 @@ fn scan_lock_matches(
     let Some(packages) = lock.get("packages").and_then(Value::as_object) else {
         return LockScan::Matches(matches); // validated earlier; defensive
     };
+    let non_registry = npm_non_registry_entries(lock);
     for (key, entry) in packages {
         // The root "" entry is the project itself, never a dependency.
         if key.is_empty() {
@@ -869,6 +874,21 @@ fn scan_lock_matches(
                     "lock entry `{key}` is bundled inside its parent's tarball and CANNOT be \
                      rewritten — that copy stays UNPATCHED; vendor or update the bundling \
                      parent to cover it"
+                ),
+            ));
+            continue;
+        }
+        if let Some(reason) = non_registry.get(key.as_str()) {
+            // LOUD: npm installs a git / url / `file:` dependency from the
+            // dependent's spec and ignores `resolved`, so a rewrite here
+            // would report the patch applied while the original bytes
+            // install (#326).
+            warnings.push(VendorWarning::new(
+                "vendor_non_registry_entry_skipped",
+                format!(
+                    "lock entry `{key}` is not installed from the registry ({reason}) and \
+                     CANNOT be rewritten — npm installs it from that spec, so that copy stays \
+                     UNPATCHED; depend on the registry release to vendor it"
                 ),
             ));
             continue;
@@ -936,6 +956,8 @@ fn recompute_dep_fields(live: &mut serde_json::Map<String, Value>, staged_pkg: &
 fn rewrite_legacy_tree(
     deps: &mut serde_json::Map<String, Value>,
     pointer_base: &str,
+    parent_key: &str,
+    non_registry: &BTreeMap<String, String>,
     name: &str,
     version: &str,
     resolved: &str,
@@ -953,6 +975,7 @@ fn rewrite_legacy_tree(
             continue;
         };
         let pointer = format!("{pointer_base}/{}", escape_json_pointer_token(dep_name));
+        let packages_key = legacy_packages_key(parent_key, dep_name);
         let node_version = obj.get("version").and_then(Value::as_str);
         if node_version == Some(alias_version.as_str()) {
             // An aliased consumer of the patched package. The modern
@@ -982,6 +1005,14 @@ fn rewrite_legacy_tree(
             // stays-UNPATCHED warning.)
         } else if dep_name == name
             && node_version == Some(version)
+            && non_registry.contains_key(&packages_key)
+        {
+            // The mirror of a `packages` entry npm installs from a git / url
+            // / `file:` spec (#326): its twin was skipped with
+            // `vendor_non_registry_entry_skipped`, so rewiring this copy
+            // would record wiring for bytes that never install.
+        } else if dep_name == name
+            && node_version == Some(version)
             && !entry_in_sync(obj, resolved, integrity)
         {
             let was_vendored = entry_points_into_vendor(obj);
@@ -1005,6 +1036,8 @@ fn rewrite_legacy_tree(
             rewrite_legacy_tree(
                 sub,
                 &format!("{pointer}/dependencies"),
+                &packages_key,
+                non_registry,
                 name,
                 version,
                 resolved,
@@ -1176,7 +1209,7 @@ fn sibling_lock_target(
 ) -> Result<SiblingLock, String> {
     let bytes = sib_bytes.map_err(|e| format!("it cannot be read: {e}"))?;
     let lock = (*LOCK_MEMO
-        .parse(&bytes, || serde_json::from_slice::<Value>(&bytes))
+        .parse(&bytes, || parse_json_manifest(&bytes))
         .map_err(|e| format!("it is not parseable JSON: {e}"))?)
     .clone();
     let lock_version = lock.get("lockfileVersion").and_then(Value::as_u64);
@@ -1224,6 +1257,8 @@ impl LockRewire<'_> {
         recomputed_deps: &mut bool,
         warnings: &mut Vec<VendorWarning>,
     ) -> Result<(), String> {
+        // Taken before any rewrite, for the legacy mirror below.
+        let non_registry = npm_non_registry_entries(lock);
         let Some(packages) = lock.get_mut("packages").and_then(Value::as_object_mut) else {
             return Err("lock `packages` object vanished mid-rewrite".to_string());
         };
@@ -1274,6 +1309,8 @@ impl LockRewire<'_> {
                 rewrite_legacy_tree(
                     deps,
                     "/dependencies",
+                    "",
+                    &non_registry,
                     self.name,
                     self.version,
                     self.resolved,
@@ -1295,6 +1332,7 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::apply::{ApplyResult, VerifyStatus};
+    use crate::vendor::common::{detect_indent, serialize_json};
     use base64::Engine as _;
     use serde_json::json;
     use sha2::{Digest, Sha512};
@@ -2026,6 +2064,90 @@ mod tests {
         );
     }
 
+    /// #326: a git / remote-tarball / `file:` dependency is installed from
+    /// the dependent's spec, not the lock's `resolved`, so vendoring it
+    /// would report `applied` while `npm ci` installs the original bytes.
+    /// With no other copy the vendor refuses and writes nothing.
+    #[tokio::test]
+    async fn non_registry_only_instances_refuse_and_write_nothing() {
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        for (spec, resolved) in [
+            (
+                "github:stevemao/left-pad#v1.3.0",
+                "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba",
+            ),
+            (url, url),
+            ("file:../left-pad-1.3.0.tgz", "file:../left-pad-1.3.0.tgz"),
+        ] {
+            let lock = json!({
+                "name": "fixture",
+                "version": "1.0.0",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "fixture", "version": "1.0.0",
+                          "dependencies": { "left-pad": spec } },
+                    "node_modules/left-pad": {
+                        "version": "1.3.0",
+                        "resolved": resolved,
+                        "integrity": "sha512-orig=="
+                    }
+                }
+            });
+            let fx = fixture_with("left-pad", "1.3.0", lock).await;
+            let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_rewritable");
+            assert!(
+                detail.contains("UNPATCHED") && detail.contains("node_modules/left-pad"),
+                "{spec}: {detail}"
+            );
+            assert!(
+                !detail.contains("make sure the package is installed"),
+                "{spec}: {detail}"
+            );
+            assert_eq!(
+                tokio::fs::read(fx.lock_path()).await.unwrap(),
+                fx.lock_bytes,
+                "{spec}: lock untouched by the refusal"
+            );
+            assert!(
+                !fx.root().join(".socket/vendor").exists(),
+                "{spec}: refusal writes nothing"
+            );
+        }
+    }
+
+    /// #326, transitive: the nested git copy is skipped loudly and the
+    /// registry copies are still vendored.
+    #[tokio::test]
+    async fn nested_git_instance_is_skipped_with_warning() {
+        let mut lock = default_lock();
+        lock["packages"]["node_modules/foo"]["dependencies"] =
+            json!({ "left-pad": "github:stevemao/left-pad#v1.3.0" });
+        lock["packages"]["node_modules/foo/node_modules/left-pad"]["resolved"] =
+            json!("git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba");
+        let fx = fixture_with("left-pad", "1.3.0", lock.clone()).await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success);
+        assert_eq!(entry.unwrap().wiring.len(), 1, "only the hoisted copy");
+        let skipped = warnings
+            .iter()
+            .find(|w| w.code == "vendor_non_registry_entry_skipped")
+            .unwrap_or_else(|| panic!("{warnings:?}"));
+        assert!(
+            skipped.detail.contains("UNPATCHED")
+                && skipped
+                    .detail
+                    .contains("node_modules/foo/node_modules/left-pad"),
+            "{}",
+            skipped.detail
+        );
+        let live = fx.read_lock().await;
+        assert_eq!(
+            live["packages"]["node_modules/foo/node_modules/left-pad"],
+            lock["packages"]["node_modules/foo/node_modules/left-pad"],
+            "the git copy is byte-untouched"
+        );
+    }
+
     /// When EVERY lock instance of the target is bundled or a link, the
     /// refusal must state the real reason (the entry IS in the lock and
     /// `npm install` will not help) and keep the stays-UNPATCHED advisory —
@@ -2520,6 +2642,72 @@ mod tests {
         );
     }
 
+    /// #326, v2 legacy mirror: the mirror of a non-registry `packages`
+    /// entry is not rewired either, even when it stores the plain version.
+    #[tokio::test]
+    async fn v2_legacy_mirror_of_a_git_instance_is_not_rewritten() {
+        let git = "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba";
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 2,
+            "requires": true,
+            "packages": {
+                "": { "name": "fixture", "version": "1.0.0",
+                      "dependencies": { "foo": "^2.0.0", "left-pad": "^1.3.0" } },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                },
+                "node_modules/foo": {
+                    "version": "2.0.0",
+                    "resolved": "https://registry.npmjs.org/foo/-/foo-2.0.0.tgz",
+                    "integrity": "sha512-foo==",
+                    "dependencies": { "left-pad": "github:stevemao/left-pad#v1.3.0" }
+                },
+                "node_modules/foo/node_modules/left-pad": { "version": "1.3.0", "resolved": git }
+            },
+            "dependencies": {
+                "foo": {
+                    "version": "2.0.0",
+                    "resolved": "https://registry.npmjs.org/foo/-/foo-2.0.0.tgz",
+                    "integrity": "sha512-foo==",
+                    "requires": { "left-pad": "github:stevemao/left-pad#v1.3.0" },
+                    "dependencies": {
+                        "left-pad": { "version": "1.3.0", "resolved": git }
+                    }
+                },
+                "left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                }
+            }
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock.clone()).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let legacy_keys: Vec<String> = entry
+            .unwrap()
+            .wiring
+            .iter()
+            .filter(|r| r.kind == KIND_LOCK_LEGACY_ENTRY)
+            .filter_map(|r| r.key.clone())
+            .collect();
+        assert_eq!(
+            legacy_keys,
+            ["/dependencies/left-pad"],
+            "only the registry copy's mirror"
+        );
+        let live = fx.read_lock().await;
+        assert_eq!(
+            live["dependencies"]["foo"]["dependencies"]["left-pad"],
+            lock["dependencies"]["foo"]["dependencies"]["left-pad"],
+            "the git copy's legacy mirror is byte-untouched"
+        );
+    }
+
     /// v2 legacy mirror: an alias consumer (`"aliased": {"version":
     /// "npm:left-pad@1.3.0"}`) has no proven equivalent rewrite — it must be
     /// left untouched AND loudly warned, since npm 6 reading the mirror
@@ -2723,6 +2911,54 @@ mod tests {
             "field absent from the patched manifest must be removed"
         );
         assert_eq!(e["license"], json!("WTFPL"), "non-dep fields untouched");
+    }
+
+    /// #324: vendoring keeps a CRLF, tab-indented or BOM-prefixed lock's
+    /// layout (a BOM lock is read the way npm reads it, not refused), and
+    /// `vendor --revert` restores its original bytes.
+    #[tokio::test]
+    async fn vendor_and_revert_keep_crlf_tab_and_bom_lock_layout() {
+        let lf = String::from_utf8(serialize_json(&default_lock(), "  ").unwrap()).unwrap();
+        let shapes = [
+            ("crlf", lf.replace('\n', "\r\n")),
+            ("tabs", lf.replace("  ", "\t")),
+            ("bom", format!("\u{feff}{lf}")),
+            ("bom+crlf", format!("\u{feff}{}", lf.replace('\n', "\r\n"))),
+        ];
+        for (shape, pristine) in shapes {
+            let fx = fixture().await;
+            tokio::fs::write(fx.lock_path(), &pristine).await.unwrap();
+
+            let (result, entry, _w) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{shape}: {:?}", result.error);
+            let wired = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+            assert_ne!(wired, pristine, "{shape}: the lock must be rewired");
+            assert_eq!(
+                wired.starts_with('\u{feff}'),
+                pristine.starts_with('\u{feff}'),
+                "{shape}: BOM kept"
+            );
+            if pristine.contains("\r\n") {
+                assert!(
+                    !wired.replace("\r\n", "").contains('\n'),
+                    "{shape}: every line stays CRLF:\n{wired:?}"
+                );
+            }
+            if pristine.contains('\t') {
+                assert!(
+                    wired.contains("\n\t\"packages\"") && !wired.contains("\n  "),
+                    "{shape}: tab indent kept:\n{wired}"
+                );
+            }
+
+            let outcome = revert_npm(&entry.unwrap(), fx.root(), false).await;
+            assert!(outcome.success, "{shape}: {:?}", outcome.error);
+            assert_eq!(
+                tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+                pristine,
+                "{shape}: lock restored byte-for-byte"
+            );
+        }
     }
 
     #[tokio::test]

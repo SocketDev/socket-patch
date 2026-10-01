@@ -1382,7 +1382,10 @@ pub(crate) fn npm_vendored_tarball_names(vref: &VendorRef, purl: &str) -> bool {
 /// diagnostic detail `"<file> is not valid JSON: <error>"`. No BOM handling:
 /// the callers that tolerate one strip it first.
 pub(crate) fn parse_json(file: &str, bytes: &[u8]) -> Result<serde_json::Value, String> {
-    serde_json::from_slice(bytes).map_err(|e| format!("{file} is not valid JSON: {e}"))
+    // npm and Composer both read past a leading UTF-8 BOM, and the
+    // rewriters keep one, so a wired BOM lock must stay discoverable.
+    crate::vendor::common::parse_json_manifest(bytes)
+        .map_err(|e| format!("{file} is not valid JSON: {e}"))
 }
 
 /// How [`toml_or_diag`] spells the parse error in its diagnostic (the goldens

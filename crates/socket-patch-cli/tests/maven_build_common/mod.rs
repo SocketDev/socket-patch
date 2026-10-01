@@ -179,13 +179,15 @@ impl Mvn {
         self.numeric()[0]
     }
 
-    /// Maven ≥ 3.9 (resolver ≥ 1.9) enforces the trusted-checksums summary
-    /// file the hosted rewriter commits under `.mvn/checksums/`; older
-    /// lines ignore the `aether.*` properties and only the transport
-    /// `checksumPolicy=fail` sidecar check protects the download.
+    /// Maven ≥ 3.9.4 enforces the trusted-checksums summary file the hosted
+    /// rewriter commits under `.mvn/checksums/` (#258). 3.9.0 / 3.9.1 leave
+    /// `${session.rootDirectory}` in `maven.config` uninterpolated, so the
+    /// file is never found; 3.9.2 / 3.9.3 ignore `checksumAlgorithms=SHA-256`
+    /// and check SHA-1 only; older lines have no trusted-checksums support.
+    /// Below 3.9.4 only the transport `checksumPolicy=fail` sidecar check
+    /// protects the download.
     pub fn enforces_trusted_checksums(&self) -> bool {
-        let v = self.numeric();
-        v[0] > 3 || (v[0] == 3 && v[1] >= 9)
+        self.numeric() >= vec![3, 9, 4]
     }
 
     /// `mvn -B <args>` in `cwd` against the local repository `m2`, with the

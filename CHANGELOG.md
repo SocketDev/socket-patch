@@ -102,6 +102,39 @@ limits, and required install commands.
 
 ### Fixed
 
+- Gem hosted and vendored modes wire only the manifest Bundler loads. A `gems.rb`
+  twin or a `BUNDLE_GEMFILE` setting (environment or `.bundle/config`) no longer
+  leads to an edit of an ignored `Gemfile` that reports success and attests an
+  unpatched gem; unsupported layouts are refused before any write (#341, #390).
+- **npm dependencies installed from git, a URL or `file:` are no longer
+  reported patched.** npm installs such a dependency from the dependent's
+  spec (`github:user/repo`, `https://…/x.tgz`, `file:…`) and ignores the
+  lock entry's `resolved`, so `npm ci` kept installing the original bytes
+  after `scan --mode hosted` or `vendor` rewired the entry and `vex`
+  attested it. Both modes now skip such an entry with a loud
+  stays-UNPATCHED warning (`redirect_npm_non_registry_entry_skipped` /
+  `vendor_non_registry_entry_skipped`; vendoring refuses with
+  `vendor_lock_entry_not_rewritable` when no registry copy is left), and
+  `vex` attests nothing for a `name@version` while such a copy is in the
+  lock (#326).
+- **Agent mode finds Poetry's virtualenv in more setups.** Three cases
+  missed the virtualenv Poetry installed into. Each fell back to the
+  wrong interpreter, skipped the patch as `package_not_installed` and
+  still exited 0:
+  - a nameless `package-mode = false` project (Poetry names its env
+    `non-package-mode-…`);
+  - a Poetry 2 project with both `[project] name` and
+    `[tool.poetry] name` (Poetry uses `[project] name`);
+  - an explicit `virtualenvs.in-project = false` next to a stray `./.venv`.
+
+  Every Windows project missed it too, because the cwd hash included the
+  `\\?\` prefix that path canonicalization adds (#327, #329).
+- Hosted Maven warns `redirect_maven_trusted_checksums_unenforced` when
+  `.mvn/wrapper/maven-wrapper.properties` pins a Maven older than 3.9.4. Maven
+  3.9.0–3.9.3 never enforce the Trusted Checksums pin that hosted mode writes;
+  the 4.0.0 notes and docs wrongly said every 3.9 release does. The version
+  suffix still fails closed. CI runs the real-Maven hosted capstone on 3.9.3 and
+  3.9.4 (#258).
 - Patch application, reversal, and cleanup handle missing files, release variants,
   corrupt state, newer ledger formats, and unsafe manifest paths without silently
   dropping protection. File ownership restoration failures produce warnings.
@@ -119,10 +152,18 @@ limits, and required install commands.
 - Python rewrites preserve supported markers, groups, extras, source metadata, and
   integrity pins. Relocks, out-of-tree environments, and lock-only VEX are handled
   consistently with each installer's supported behavior.
+- Hosted Pipenv scans read the `Pipfile`, so a conflicting `Pipfile.lock` entry
+  refuses the patch project-wide instead of half-redirecting a sibling
+  `requirements.txt` (#333).
 - Vendoring reuses valid committed artifacts during service outages. Updates do
   not build from a previous patch's modified bytes. Verified service artifacts
   keep their identity; integrity failures do not fall through to a local rebuild.
   Repair rebuilds against recorded pins and reports unavailable inputs.
+- VEX no longer attests an npm package that also ships a bundled, unpatched
+  copy of the same `name@version` (`inBundle: true`, or v1 `bundled: true`).
+  npm unpacks that copy from the parent's tarball, so no rewire reaches it; the
+  reference is now reported `patched_ref_unattributable`, naming the bundled
+  copy, in hosted and vendored mode (#325).
 - API throttling uses bounded retries, failed queries appear in JSON diagnostics,
   and hosted reference resolution handles batches larger than 500 patches.
 - Transient apply locks are removed on normal command exit; no-op scans and full
@@ -133,6 +174,15 @@ limits, and required install commands.
   `virtualStoreDir`, instead of reporting them `package_not_installed` (#359,
   #362). A store outside the project, such as pnpm's global virtual store, is
   shared with other projects and is still not patched in place.
+- npm locks keep their own layout when edited. `scan --mode hosted`,
+  `scan --mode vendored`, `rollback` and `vendor --revert`
+  re-serialized `package-lock.json` / `npm-shrinkwrap.json` with LF line
+  endings (and, in hosted mode, a fixed 2-space indent), so a CRLF or
+  tab-indented lock got a whole-file diff and the undo did not restore its
+  bytes. A lock with a UTF-8 BOM, which npm installs from, was skipped as
+  unparseable (hosted) or refused as `vendor_lockfile_version_unsupported`
+  (vendored). The lock now keeps its BOM, indent and line endings, and the
+  undo is byte-exact (#324).
 
 ### Maintenance
 

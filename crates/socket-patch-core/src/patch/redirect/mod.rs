@@ -25,6 +25,8 @@ use serde_json::{json, Value};
 
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
+use crate::vendor::common::{parse_json_text, JsonLayout};
+use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries};
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 mod bun_binary;
@@ -277,6 +279,17 @@ fn serialize_json(value: &Value) -> String {
         "{}\n",
         serde_json::to_string_pretty(value).expect("serde_json::Value serializes infallibly")
     )
+}
+
+/// `value` pretty-printed in the layout of `original`, the text it replaces
+/// (BOM, indent, line ending and trailer; see [`JsonLayout`]), so a rewrite
+/// and its revert change nothing but the edited values. npm keeps a lock's
+/// CRLF and tab indent on its own rewrites, and so must we.
+fn serialize_json_like(value: &Value, original: &str) -> String {
+    let bytes = JsonLayout::of(original)
+        .render(value)
+        .expect("serde_json::Value serializes infallibly");
+    String::from_utf8(bytes).expect("rendered JSON is UTF-8")
 }
 
 /// The dep's registry override when it is of `kind`. `None` for an absent
@@ -820,7 +833,8 @@ fn rewrite_one_npm_lock(
     npm: &[&DepOverride],
     result: &mut RewriteResult,
 ) {
-    let Ok(mut lock) = serde_json::from_str::<Value>(content) else {
+    // npm reads past a leading UTF-8 BOM; so do we.
+    let Ok(mut lock) = parse_json_text(content) else {
         // A corrupt lockfile is strictly worse than a missing one (which
         // warns in the caller) — never skip the whole npm redirect silently.
         result.warnings.push(RewriteWarning {
@@ -863,6 +877,9 @@ fn rewrite_one_npm_lock(
                 .collect()
         })
         .unwrap_or_default();
+    // Entries npm installs from a git / url / `file:` spec: see
+    // `vendor::npm_origin` (#326).
+    let non_registry = npm_non_registry_entries(&lock);
     let mut changed = false;
     for dep in npm {
         let fname = full_name(dep);
@@ -910,6 +927,22 @@ fn rewrite_one_npm_lock(
                     });
                     continue;
                 }
+                // npm installs a git / url / `file:` dependency from the
+                // dependent's spec and ignores `resolved`, so a rewrite here
+                // would confirm (and VEX-attest) a patch that never installs.
+                if let Some(reason) = non_registry.get(key.as_str()) {
+                    matched_any = true;
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_npm_non_registry_entry_skipped".into(),
+                        detail: format!(
+                            "lock entry `{key}` is not installed from the registry ({reason}) \
+                             and CANNOT be redirected — npm installs it from that spec, so \
+                             that copy stays UNPATCHED; depend on the registry release to \
+                             patch it"
+                        ),
+                    });
+                    continue;
+                }
                 matched_any = true;
                 if let Some(edit) = rewrite_npm_entry(
                     entry,
@@ -928,6 +961,8 @@ fn rewrite_one_npm_lock(
         if let Some(deps) = lock.get_mut("dependencies").and_then(Value::as_object_mut) {
             changed = rewrite_npm_v2_deps(
                 deps,
+                "",
+                &non_registry,
                 &fname,
                 dep,
                 &sha512,
@@ -966,7 +1001,9 @@ fn rewrite_one_npm_lock(
                 ),
             });
         }
-        result.files.insert(lockfile.into(), serialize_json(&lock));
+        result
+            .files
+            .insert(lockfile.into(), serialize_json_like(&lock, content));
     }
 }
 
@@ -1002,8 +1039,11 @@ fn rewrite_npm_entry(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rewrite_npm_v2_deps(
     deps: &mut serde_json::Map<String, Value>,
+    parent_key: &str,
+    non_registry: &BTreeMap<String, String>,
     fname: &str,
     dep: &DepOverride,
     sha512: &str,
@@ -1013,6 +1053,7 @@ fn rewrite_npm_v2_deps(
 ) -> bool {
     let mut changed = false;
     for (name, entry) in deps.iter_mut() {
+        let packages_key = legacy_packages_key(parent_key, name);
         if name == fname
             && entry.get("version").and_then(Value::as_str) == Some(dep.version.as_str())
         {
@@ -1028,6 +1069,12 @@ fn rewrite_npm_v2_deps(
                          or update the bundling parent to cover it"
                     ),
                 });
+            } else if non_registry.contains_key(&packages_key) {
+                // The mirror of a `packages` entry npm installs from a git /
+                // url / `file:` spec: that twin was skipped (and warned about)
+                // above, so rewriting this copy would only record an edit for
+                // bytes that never install.
+                *matched_any = true;
             } else {
                 *matched_any = true;
                 if let Some(edit) =
@@ -1039,9 +1086,17 @@ fn rewrite_npm_v2_deps(
             }
         }
         if let Some(nested) = entry.get_mut("dependencies").and_then(Value::as_object_mut) {
-            changed =
-                rewrite_npm_v2_deps(nested, fname, dep, sha512, lockfile, result, matched_any)
-                    || changed;
+            changed = rewrite_npm_v2_deps(
+                nested,
+                &packages_key,
+                non_registry,
+                fname,
+                dep,
+                sha512,
+                lockfile,
+                result,
+                matched_any,
+            ) || changed;
         }
     }
     changed
@@ -5067,7 +5122,17 @@ fn rewrite_gem(
                         "source \"{}\" do\n  gem \"{}\", \"{}\"\nend",
                         ov.index_url, dep.name, dep.version
                     );
-                    let sep = if gf.ends_with('\n') { "" } else { "\n" };
+                    // Always one blank line before the block: the in-place
+                    // rewrite above swallows every blank line before a
+                    // declaration, so this is what lets `rollback` /
+                    // `remove` prove the block is this append and drop it
+                    // instead of restoring a direct exact pin (#457).
+                    let eol = if gf.contains("\r\n") { "\r\n" } else { "\n" };
+                    let sep = if gf.is_empty() || gf.ends_with('\n') {
+                        eol.to_string()
+                    } else {
+                        eol.repeat(2)
+                    };
                     *gf = format!("{gf}{sep}{block}\n");
                     gemfile_changed = true;
                     result.edits.push(FileEdit {
@@ -5259,6 +5324,56 @@ pub(crate) const TRUSTED_CHECKSUMS_ON: &str =
 
 pub(crate) const MVN_CONFIG: &str = ".mvn/maven.config";
 pub(crate) const MVN_CHECKSUMS: &str = ".mvn/checksums/checksums.sha256";
+/// The Maven Wrapper's settings file. Read only, never edited: its
+/// `distributionUrl` names the Maven release the project builds with, so the
+/// rewriter can tell when the Trusted Checksums files it writes are inert.
+pub(crate) const MVN_WRAPPER_PROPERTIES: &str = ".mvn/wrapper/maven-wrapper.properties";
+
+/// The first Maven release that enforces the `.mvn/*` Trusted Checksums
+/// files (#258). 3.9.0 / 3.9.1 do not interpolate `${session.rootDirectory}`
+/// in `maven.config`, so the summary file is never found; 3.9.2 / 3.9.3
+/// ignore `checksumAlgorithms=SHA-256` and check SHA-1 only. Older lines have
+/// no Trusted Checksums post-processor at all.
+const TRUSTED_CHECKSUMS_MIN_MAVEN: [u32; 3] = [3, 9, 4];
+
+/// The Apache Maven release a `maven-wrapper.properties` pins, taken from its
+/// `distributionUrl` (`…/apache-maven-<version>-bin.zip` or `.tar.gz`). None
+/// for a missing key or any other distribution (e.g. mvnd), which then goes
+/// unwarned.
+fn maven_wrapper_version(props: &str) -> Option<String> {
+    props.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with('!') {
+            return None;
+        }
+        let rest = line.strip_prefix("distributionUrl")?;
+        if !rest.starts_with(|c: char| c == '=' || c == ':' || c.is_whitespace()) {
+            return None;
+        }
+        let value = rest
+            .trim_start()
+            .strip_prefix(['=', ':'])
+            .unwrap_or(rest)
+            .trim();
+        let file = value.rsplit('/').next()?;
+        let version = file
+            .strip_prefix("apache-maven-")?
+            .strip_suffix(".zip")
+            .or_else(|| file.strip_prefix("apache-maven-")?.strip_suffix(".tar.gz"))?
+            .strip_suffix("-bin")?;
+        (!version.is_empty()).then(|| version.to_string())
+    })
+}
+
+/// Whether Maven `version` enforces the Trusted Checksums files (≥ 3.9.4;
+/// pre-release suffixes such as `-rc-6` compare as their release).
+fn maven_enforces_trusted_checksums(version: &str) -> bool {
+    let mut parts = [0u32; 3];
+    for (slot, part) in parts.iter_mut().zip(version.split(['.', '-'])) {
+        *slot = part.parse().unwrap_or(0);
+    }
+    parts >= TRUSTED_CHECKSUMS_MIN_MAVEN
+}
 
 /// Strip any `sha256-`/`sha256:` SRI-style prefix off a stored hash, leaving the
 /// bare lowercase hex Maven's trusted-checksums summary file expects (twin of
@@ -5358,6 +5473,10 @@ fn rewrite_maven_pom(
     let mut checksum_entries: Vec<(String, String)> = vec![];
     let gradle_build_present = GRADLE_FILES.iter().any(|f| files.contains_key(*f));
     let mut warned_no_pom = false;
+    // Local-repo paths of the suffixed jars this run's Trusted Checksums pin
+    // covers, whether the pin lands now or a prior run wrote it: the
+    // unenforced-pin warning must fire on re-scans too.
+    let mut pinned_jar_paths: Vec<String> = vec![];
 
     for dep in &maven {
         let Some(ov) = registry_override_of_kind(dep, "maven2") else {
@@ -5606,6 +5725,15 @@ fn rewrite_maven_pom(
             });
         }
 
+        if jar_sha256.is_some() && pom_sha256.is_some() {
+            pinned_jar_paths.push(local_repo_artifact_path(
+                &group_id,
+                &artifact_id,
+                &suffixed_version,
+                "jar",
+            ));
+        }
+
         // A pin landed this run: inject the repository (idempotent via the <id>
         // guard) and emit trusted checksums. When the pin was already present
         // from a prior run, `pin_landed` stays false and both are skipped,
@@ -5692,6 +5820,36 @@ fn rewrite_maven_pom(
             key: None,
             original: None,
             new: None,
+        });
+    }
+
+    // The pin is written regardless (a later wrapper upgrade enforces it, and
+    // the version suffix is fail-closed on its own), but a project whose
+    // wrapper pins a Maven that ignores it must not read it as client-side
+    // content pinning. Judged on the files as they stand after this run, so a
+    // re-scan of an already-pinned project warns as well.
+    let final_text = |rel: &str| result.files.get(rel).or_else(|| files.get(rel));
+    let pin_in_place = final_text(MVN_CONFIG)
+        .is_some_and(|c| c.lines().any(|l| l.trim() == TRUSTED_CHECKSUMS_ON))
+        && final_text(MVN_CHECKSUMS).is_some_and(|c| {
+            pinned_jar_paths.iter().any(|p| {
+                c.lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(p.as_str()))
+            })
+        });
+    if let Some(version) = files
+        .get(MVN_WRAPPER_PROPERTIES)
+        .and_then(|props| maven_wrapper_version(props))
+        .filter(|v| pin_in_place && !maven_enforces_trusted_checksums(v))
+    {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_maven_trusted_checksums_unenforced".into(),
+            detail: format!(
+                "{MVN_WRAPPER_PROPERTIES} pins Maven {version}, which does not enforce the \
+                 Trusted Checksums pin in {MVN_CHECKSUMS} (Maven enforces it from 3.9.4); \
+                 only the transport .sha1 check guards the Socket-served artifacts. \
+                 Upgrade the Maven Wrapper to 3.9.4 or later"
+            ),
         });
     }
 }
@@ -6286,14 +6444,16 @@ mod tests {
         )];
         let first = rewrite_registry_redirect(&files, &overrides);
         let out = first.files.get("requirements.txt").expect("rewritten");
+        // An unhashed file pins by the url fragment (#376), so the marker
+        // follows it.
         assert_eq!(
-            out.matches("--hash=sha256:").count(),
+            out.matches("sha256").count(),
             1,
             "exactly one hash after the first pass: {out}"
         );
         assert!(
-            out.contains("; python_version >= \"3.7\" --hash="),
-            "marker preserved ahead of the hash: {out}"
+            out.contains("-none-any.whl#sha256=") && out.contains(" ; python_version >= \"3.7\"\n"),
+            "marker preserved after the pinned url: {out}"
         );
 
         let mut again = files.clone();
@@ -6307,10 +6467,11 @@ mod tests {
         );
     }
 
-    /// An inline comment after the marker must not swallow the appended
-    /// `--hash=…` (pip would then treat the hash as comment text and skip
-    /// enforcement). The comment is split off and re-appended AFTER the hash
-    /// so the pin stays active and the user's note survives.
+    /// An inline comment after the marker must not swallow the appended pin
+    /// (pip would then treat it as comment text and skip enforcement). The
+    /// comment is split off and re-appended AFTER the pin — the url's
+    /// `#sha256=` fragment in an unhashed file (#376), `--hash` in a hashed
+    /// one — so the pin stays active and the user's note survives.
     #[test]
     fn requirements_marker_comment_keeps_hash_active() {
         let original = "requests==2.28.1 ; python_version >= \"3.7\" # explanation\n";
@@ -6323,13 +6484,23 @@ mod tests {
         assert_eq!(
             output,
             &format!(
-                "requests @ {url} ; python_version >= \"3.7\" --hash=sha256:{sha256} # explanation\n"
+                "requests @ {url}#sha256={sha256} ; python_version >= \"3.7\" # explanation\n"
             )
         );
         let again = BTreeMap::from([("requirements.txt".to_string(), output.clone())]);
         let second = rewrite_registry_redirect(&again, &overrides);
         assert!(second.files.is_empty());
         assert!(second.edits.is_empty());
+
+        let hashed = original.replace("# explanation", "--hash=sha256:old # explanation");
+        let files = BTreeMap::from([("requirements.txt".to_string(), hashed)]);
+        let first = rewrite_registry_redirect(&files, &overrides);
+        assert_eq!(
+            first.files["requirements.txt"],
+            format!(
+                "requests @ {url} ; python_version >= \"3.7\" --hash=sha256:{sha256} # explanation\n"
+            )
+        );
     }
 
     const MAVEN_SUFFIXED: &str = "1.7.36-socket.aaaaaaaa";
@@ -6574,6 +6745,144 @@ mod tests {
 
     /// A user `.mvn/maven.config` key set to a different value is preserved
     /// (never overridden) and a conflict warning is emitted.
+    /// A Maven Wrapper `maven-wrapper.properties` with the given
+    /// `distributionUrl` release.
+    fn maven_wrapper(version: &str) -> String {
+        format!(
+            "# Licensed to the Apache Software Foundation (ASF)\nwrapperVersion=3.3.2\ndistributionType=only-script\ndistributionUrl=https\\://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/{version}/apache-maven-{version}-bin.zip\n"
+        )
+    }
+
+    fn rewrite_with_wrapper(wrapper: &str) -> RewriteResult {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            pom_with_dep("\n      <version>1.7.36</version>", ""),
+        );
+        files.insert(MVN_WRAPPER_PROPERTIES.to_string(), wrapper.to_string());
+        rewrite_registry_redirect(&files, &[maven_override()])
+    }
+
+    /// Maven 3.9.0-3.9.3 (and every older line) never enforce the committed
+    /// `.mvn/checksums` summary (#258). A project whose Maven Wrapper pins
+    /// such a release gets the pin written AND a warning saying it is inert,
+    /// instead of a silent claim of client-side content pinning.
+    #[test]
+    fn maven_pom_trusted_checksums_warns_when_the_wrapper_maven_ignores_them() {
+        for version in ["3.9.0", "3.9.3", "3.8.9", "3.6.3"] {
+            let r = rewrite_with_wrapper(&maven_wrapper(version));
+            assert!(
+                r.files.contains_key(MVN_CHECKSUMS),
+                "{version}: the pin is still written"
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_maven_trusted_checksums_unenforced"],
+                "{version}: {:?}",
+                r.warnings
+            );
+            let detail = &r.warnings[0].detail;
+            assert!(
+                detail.contains(&format!("Maven {version}")) && detail.contains("3.9.4"),
+                "{detail}"
+            );
+            assert!(detail.contains(MVN_WRAPPER_PROPERTIES), "{detail}");
+        }
+    }
+
+    /// A re-scan of a project a prior run already pinned writes nothing, but
+    /// the wrapper's Maven still ignores the pin, so it still warns. Without
+    /// the Socket checksum entry (or with Trusted Checksums switched off) there
+    /// is no pin to call inert, and nothing is said.
+    #[test]
+    fn maven_pom_trusted_checksums_unenforced_warning_survives_a_rescan() {
+        let first = rewrite_with_wrapper(&maven_wrapper("3.9.3"));
+        let mut again = BTreeMap::new();
+        for (rel, text) in &first.files {
+            again.insert(rel.clone(), text.clone());
+        }
+        again.insert(MVN_WRAPPER_PROPERTIES.to_string(), maven_wrapper("3.9.3"));
+        let second = rewrite_registry_redirect(&again, &[maven_override()]);
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "re-scan is edit-free: {:?}",
+            second.edits
+        );
+        assert_eq!(
+            warning_codes(&second),
+            vec!["redirect_maven_trusted_checksums_unenforced"]
+        );
+
+        let mut no_entry = again.clone();
+        no_entry.insert(MVN_CHECKSUMS.to_string(), String::new());
+        let r = rewrite_registry_redirect(&no_entry, &[maven_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+        let mut switched_off = again.clone();
+        switched_off.remove(MVN_CONFIG);
+        let r = rewrite_registry_redirect(&switched_off, &[maven_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+        again.insert(MVN_WRAPPER_PROPERTIES.to_string(), maven_wrapper("3.9.4"));
+        let r = rewrite_registry_redirect(&again, &[maven_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// 3.9.4 is the first release that rejects a mismatch; newer lines
+    /// (3.10 / 4.0 release candidates included) enforce too. A wrapper with
+    /// no recognisable Apache Maven distribution is never warned about.
+    #[test]
+    fn maven_pom_trusted_checksums_no_warning_for_enforcing_or_unknown_wrapper() {
+        for wrapper in [
+            maven_wrapper("3.9.4"),
+            maven_wrapper("3.9.16"),
+            maven_wrapper("3.10.0-rc-1"),
+            maven_wrapper("4.0.0-rc-6"),
+            "distributionUrl=https://example.test/maven-mvnd-1.0.2-linux-amd64.zip\n".to_string(),
+            "# distributionUrl=https\\://x/apache-maven/3.9.3/apache-maven-3.9.3-bin.zip\n"
+                .to_string(),
+            String::new(),
+        ] {
+            let r = rewrite_with_wrapper(&wrapper);
+            assert!(r.files.contains_key(MVN_CHECKSUMS), "{wrapper}");
+            assert!(r.warnings.is_empty(), "{wrapper}: {:?}", r.warnings);
+        }
+    }
+
+    /// The `distributionUrl` parse: escaped or plain `:`, `=`/`:`/space
+    /// separators, `.tar.gz` distributions, comments and CRLF.
+    #[test]
+    fn maven_wrapper_version_parses_distribution_url() {
+        assert_eq!(
+            maven_wrapper_version(&maven_wrapper("3.9.3")).as_deref(),
+            Some("3.9.3")
+        );
+        assert_eq!(
+            maven_wrapper_version(
+                "distributionUrl : https://archive.apache.org/dist/maven/maven-3/3.9.2/binaries/apache-maven-3.9.2-bin.tar.gz\r\n"
+            )
+            .as_deref(),
+            Some("3.9.2")
+        );
+        assert_eq!(
+            maven_wrapper_version(
+                "! comment\r\ndistributionUrl=https\\://repo/apache-maven-4.0.0-rc-6-bin.zip\r\n"
+            )
+            .as_deref(),
+            Some("4.0.0-rc-6")
+        );
+        assert_eq!(maven_wrapper_version("wrapperVersion=3.3.2\n"), None);
+        assert_eq!(
+            maven_wrapper_version("distributionUrlOld=https://x/apache-maven-3.9.3-bin.zip\n"),
+            None
+        );
+        assert!(!maven_enforces_trusted_checksums("3.9.3"));
+        assert!(maven_enforces_trusted_checksums("3.9.4"));
+        assert!(maven_enforces_trusted_checksums("3.10.0-rc-1"));
+        assert!(maven_enforces_trusted_checksums("4.0.0"));
+        assert!(!maven_enforces_trusted_checksums("3.8.9"));
+    }
+
     #[test]
     fn maven_pom_trusted_checksums_conflict() {
         let mut files = BTreeMap::new();
@@ -11832,6 +12141,43 @@ mod tests {
         );
     }
 
+    /// #324: the hosted npm rewrite changes only the rewired values and keeps
+    /// the lock's layout: CRLF stays CRLF, a tab indent stays tabs, and a
+    /// UTF-8 BOM lock (npm strips the BOM and installs from it) is rewritten
+    /// with its BOM rather than skipped as unparseable.
+    #[test]
+    fn npm_lock_rewrite_keeps_crlf_tabs_and_bom() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let lf = "{\n  \"name\": \"app\",\n  \"lockfileVersion\": 3,\n  \"packages\": {\n    \"\": {\n      \"name\": \"app\"\n    },\n    \"node_modules/left-pad\": {\n      \"version\": \"1.3.0\",\n      \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\",\n      \"integrity\": \"sha512-UPSTREAM==\"\n    }\n  }\n}\n";
+        let shapes = [
+            ("crlf", lf.replace('\n', "\r\n")),
+            ("tabs", lf.replace("  ", "\t")),
+            ("bom", format!("\u{feff}{lf}")),
+            ("bom+crlf+tabs", format!("\u{feff}{}", lf.replace("  ", "\t").replace('\n', "\r\n"))),
+        ];
+        for (shape, pristine) in shapes {
+            let mut files = BTreeMap::new();
+            files.insert("package-lock.json".to_string(), pristine.clone());
+            let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+            let out = r
+                .files
+                .get("package-lock.json")
+                .unwrap_or_else(|| panic!("{shape}: lock must be rewritten: {:?}", r.warnings));
+            let expected = pristine
+                .replace(
+                    "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "http://patch.test/left-pad-1.3.0.tgz",
+                )
+                .replace("sha512-UPSTREAM==", "sha512-PATCHED==");
+            assert_eq!(out, &expected, "{shape}: only the rewired values may change");
+        }
+    }
+
     /// An unparseable package-lock.json must surface a warning, not silently
     /// skip the npm redirect entirely (missing-lockfile already warns; a
     /// corrupt lockfile is strictly worse).
@@ -11917,6 +12263,199 @@ mod tests {
             !warning_codes(&r).contains(&"redirect_npm_entry_not_found"),
             "a bundled skip is a MATCH — not-found must stay quiet: {:?}",
             r.warnings
+        );
+    }
+
+    /// #326: npm installs a git, remote-tarball or `file:` dependency from
+    /// the dependent's spec and ignores the lock's `resolved`, so rewiring
+    /// that entry would report (and VEX-attest) a patch `npm ci` never
+    /// installs. It must be skipped loudly, like a bundled copy.
+    #[test]
+    fn npm_non_registry_entries_are_skipped_with_loud_warning() {
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        for (spec, resolved) in [
+            (
+                "github:stevemao/left-pad#v1.3.0",
+                "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba",
+            ),
+            (url, url),
+            ("file:../left-pad-1.3.0.tgz", "file:../left-pad-1.3.0.tgz"),
+        ] {
+            let lock = json!({
+                "name": "app",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "app", "version": "0.0.0", "dependencies": { "left-pad": spec } },
+                    "node_modules/left-pad": {
+                        "version": "1.3.0",
+                        "resolved": resolved,
+                        "integrity": "sha512-UPSTREAM=="
+                    }
+                }
+            });
+            let mut files = BTreeMap::new();
+            files.insert(
+                "package-lock.json".to_string(),
+                serde_json::to_string_pretty(&lock).unwrap(),
+            );
+            let overrides = vec![npm_override(
+                "left-pad",
+                "1.3.0",
+                "http://patch.test/lp.tgz",
+                "sha512-PATCHED==",
+            )];
+            let r = rewrite_registry_redirect(&files, &overrides);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{spec}: a non-registry entry must not be rewired: {:?}",
+                r.edits
+            );
+            let skipped = r
+                .warnings
+                .iter()
+                .find(|w| w.code == "redirect_npm_non_registry_entry_skipped")
+                .unwrap_or_else(|| panic!("{spec}: the skip must warn: {:?}", r.warnings));
+            assert!(
+                skipped.detail.contains("UNPATCHED")
+                    && skipped.detail.contains("node_modules/left-pad"),
+                "{spec}: {}",
+                skipped.detail
+            );
+            assert!(
+                !warning_codes(&r).contains(&"redirect_npm_entry_not_found"),
+                "{spec}: the entry was found: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    /// #326, lockfileVersion 2: the legacy `dependencies` mirror of a
+    /// non-registry `packages` entry is left alone too, even when it stores
+    /// the plain version, while the registry copy's mirror is rewired.
+    #[test]
+    fn npm_v2_legacy_mirror_of_a_non_registry_entry_is_not_rewired() {
+        let registry = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let git = "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba";
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 2,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0",
+                      "dependencies": { "a": "^1.0.0", "left-pad": "^1.3.0" } },
+                "node_modules/a": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+                    "integrity": "sha512-A==",
+                    "dependencies": { "left-pad": "stevemao/left-pad#v1.3.0" }
+                },
+                "node_modules/a/node_modules/left-pad": { "version": "1.3.0", "resolved": git },
+                "node_modules/left-pad": {
+                    "version": "1.3.0", "resolved": registry, "integrity": "sha512-UPSTREAM=="
+                }
+            },
+            "dependencies": {
+                "a": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+                    "integrity": "sha512-A==",
+                    "requires": { "left-pad": "stevemao/left-pad#v1.3.0" },
+                    "dependencies": {
+                        "left-pad": { "version": "1.3.0", "resolved": git }
+                    }
+                },
+                "left-pad": {
+                    "version": "1.3.0", "resolved": registry, "integrity": "sha512-UPSTREAM=="
+                }
+            }
+        });
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            serde_json::to_string_pretty(&lock).unwrap(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        let keys: Vec<_> = r
+            .edits
+            .iter()
+            .map(|e| (e.kind.as_str(), e.key.as_deref()))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("redirect_npm_lock_entry", Some("node_modules/left-pad")),
+                ("redirect_npm_lock_dep", Some("left-pad")),
+            ],
+            "only the registry copy and its mirror are rewired"
+        );
+        let out: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+        assert_eq!(
+            out["dependencies"]["a"]["dependencies"]["left-pad"],
+            lock["dependencies"]["a"]["dependencies"]["left-pad"],
+            "the git copy's legacy mirror is byte-untouched"
+        );
+        assert_eq!(
+            out["dependencies"]["left-pad"]["resolved"],
+            "http://patch.test/lp.tgz"
+        );
+    }
+
+    /// #326, transitive: a nested git copy is skipped while the hoisted
+    /// registry copy of the same version is still redirected.
+    #[test]
+    fn npm_nested_git_copy_is_skipped_and_registry_copy_rewired() {
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0",
+                      "dependencies": { "a": "^1.0.0", "left-pad": "^1.3.0" } },
+                "node_modules/a": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+                    "integrity": "sha512-A==",
+                    "dependencies": { "left-pad": "stevemao/left-pad#v1.3.0" }
+                },
+                "node_modules/a/node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba"
+                },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-UPSTREAM=="
+                }
+            }
+        });
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            serde_json::to_string_pretty(&lock).unwrap(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        assert_eq!(r.edits[0].key.as_deref(), Some("node_modules/left-pad"));
+        assert!(
+            warning_codes(&r).contains(&"redirect_npm_non_registry_entry_skipped"),
+            "{:?}",
+            r.warnings
+        );
+        let out: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+        assert_eq!(
+            out["packages"]["node_modules/a/node_modules/left-pad"],
+            lock["packages"]["node_modules/a/node_modules/left-pad"],
+            "the git copy is byte-untouched"
         );
     }
 
