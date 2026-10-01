@@ -914,8 +914,9 @@ fn format_save_summary(
 
 /// The summary after a single-uuid save. `what` is `"Patch"` or `"Patch
 /// record"`. `ends_run` says an unchanged record really ends the run (the
-/// agent path skips apply); the vendored path still runs its vendor step,
-/// so it must not promise "nothing to update".
+/// agent path under `--save-only`); the agent path still re-applies an
+/// unchanged record and the vendored path still runs its vendor step, so
+/// neither may promise "nothing to update".
 fn format_single_save(
     what: &str,
     action: &PatchAction,
@@ -1653,6 +1654,10 @@ struct FetchBatch {
     /// Selection size after installed-release narrowing.
     found: usize,
     skipped: usize,
+    /// Manifest store only: the `skipped` patches whose same uuid is
+    /// already recorded — still owed a nested apply, since the installed
+    /// copy may have been reinstalled since the record was written.
+    already_recorded: usize,
     failed: usize,
     /// Fetched, recordable patches in selection order.
     fetched: Vec<FetchedPatch>,
@@ -1843,6 +1848,7 @@ async fn fetch_selected_patches(
     let mut batch = FetchBatch {
         found: selected.len(),
         skipped: 0,
+        already_recorded: 0,
         failed: 0,
         fetched: Vec::new(),
         reused: Vec::new(),
@@ -1997,6 +2003,7 @@ async fn fetch_selected_patches(
                 "action": "skipped",
             }));
             batch.skipped += 1;
+            batch.already_recorded += 1;
             continue;
         }
 
@@ -2432,10 +2439,16 @@ pub async fn download_and_apply_patches_with(
             return (1, serde_json::json!({ "status": "error", "error": msg }));
         }
     }
+    // Every selected patch that is now recorded is owed the nested apply:
+    // the fetched ones AND the already-recorded (`skipped`) ones, whose
+    // installed copy may be pristine again after a reinstall or a failed
+    // earlier apply (#454). Apply is idempotent on already-patched files,
+    // so an in-sync re-run stays a no-op on disk.
+    let to_apply = downloaded + batch.already_recorded;
     // The lock outlives the manifest write only when a nested apply follows
     // (it is handed the guard and releases it after its last mutation);
     // otherwise nothing more is written and it is released here.
-    let apply_lock = if !params.save_only && downloaded > 0 {
+    let apply_lock = if !params.save_only && to_apply > 0 {
         Some(guard)
     } else {
         drop(guard);
@@ -2476,13 +2489,13 @@ pub async fn download_and_apply_patches_with(
         .await;
     }
 
-    // An apply step that ran (patches were added, not --save-only) but
-    // failed is a partial failure too — not just download failures. The
+    // An apply step that ran (recorded patches selected, not --save-only)
+    // but failed is a partial failure too — not just download failures. The
     // `status` field must agree with `exit_code`; reporting `success`
     // alongside a non-zero exit code misleads JSON consumers (the scan
     // wrapper recomputes status from the exit code for exactly this
     // reason, but `get` surfaces this envelope directly).
-    let apply_failed = !apply_succeeded && downloaded > 0 && !params.save_only;
+    let apply_failed = !apply_succeeded && to_apply > 0 && !params.save_only;
     let (status, exit_code) = run_outcome(batch.failed > 0, apply_failed);
     let mut result_json = serde_json::json!({
         "status": status,
@@ -2490,7 +2503,7 @@ pub async fn download_and_apply_patches_with(
         "downloaded": downloaded,
         "skipped": batch.skipped,
         "failed": batch.failed,
-        "applied": if apply_succeeded { downloaded } else { 0 },
+        "applied": if apply_succeeded { to_apply } else { 0 },
         "updated": updated,
         "patches": batch.patches_json,
     });
@@ -3390,9 +3403,12 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
         Err(code) => return code,
     };
     let changed = action != PatchAction::Skipped;
-    // Carried into the nested apply when one follows (it releases the lock
-    // after its last mutation), released here otherwise.
-    let apply_lock = if !args.save_only && changed {
+    // The record is now in the manifest whatever `action` says, so the
+    // nested apply follows unless `--save-only`: a same-uuid re-get must
+    // still reconcile an installed copy that was reinstalled pristine since
+    // it was recorded (#454). Carried into the nested apply (it releases
+    // the lock after its last mutation), released here otherwise.
+    let apply_lock = if !args.save_only {
         Some(guard)
     } else {
         drop(guard);
@@ -3427,7 +3443,13 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
     if !quiet {
         eprintln!(
             "{}",
-            format_single_save("Patch", &action, &manifest_path, &patch.purl, true)
+            format_single_save(
+                "Patch",
+                &action,
+                &manifest_path,
+                &patch.purl,
+                args.save_only
+            )
         );
     }
 
@@ -3446,11 +3468,11 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
         .await;
     }
 
-    // The apply step ran (patch added, not --save-only) but failed →
+    // The apply step ran (not --save-only) but failed →
     // partial failure. The `status` field must agree with the exit code
     // returned below; a hardcoded `success` alongside a non-zero exit
     // misleads JSON consumers.
-    let apply_failed = !apply_succeeded && changed && !args.save_only;
+    let apply_failed = !apply_succeeded && !args.save_only;
     // No "download failed" concept here — a blob failure early-returns
     // with status `error` above — so only the apply step can degrade us.
     let (status, exit_code) = run_outcome(false, apply_failed);
