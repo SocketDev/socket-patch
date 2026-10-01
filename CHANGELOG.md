@@ -108,6 +108,18 @@ limits, and required install commands.
   scanned project, so a Yarn Berry project's `global` script can't run or pick
   the directory treated as the global install. Composer's global home also
   falls back to `%APPDATA%\Composer` and `$XDG_CONFIG_HOME/composer`.
+- **Agent mode finds Poetry's virtualenv in more setups.** Three cases
+  missed the virtualenv Poetry installed into. Each fell back to the
+  wrong interpreter, skipped the patch as `package_not_installed` and
+  still exited 0:
+  - a nameless `package-mode = false` project (Poetry names its env
+    `non-package-mode-…`);
+  - a Poetry 2 project with both `[project] name` and
+    `[tool.poetry] name` (Poetry uses `[project] name`);
+  - an explicit `virtualenvs.in-project = false` next to a stray `./.venv`.
+
+  Every Windows project missed it too, because the cwd hash included the
+  `\\?\` prefix that path canonicalization adds (#327, #329).
 - Hosted Maven warns `redirect_maven_trusted_checksums_unenforced` when
   `.mvn/wrapper/maven-wrapper.properties` pins a Maven older than 3.9.4. Maven
   3.9.0–3.9.3 never enforce the Trusted Checksums pin that hosted mode writes;
