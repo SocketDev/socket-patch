@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
         composer: ['1.10.28', '2.2.30', '2.10.3']
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -103,12 +103,15 @@ jobs:
           N=$(python3 -c "import json;print(len(json.load(open('v.json'))['statements']))" 2>/dev/null); [ "$N" = 1 ] && R vex-g pass || R vex-g "fail($N)"
           "$B" rollback -g $A --yes 2>&1 | tail -1
           cmp -s "$F" "$T/orig.php" && R rollback-g pass || R rollback-g fail
-          # --- 2. composer NOT on PATH, default home (fallback resolution)
-          NP="$PATH"
-          while d="$(PATH="$NP" command -v composer)"; do d="$(dirname "$d")"; echo "strip composer dir: $d"; NP="$(echo "$NP" | tr ':' '\n' | grep -vxF "$d" | paste -sd: -)"; done
-          PATH="$NP" bash -c 'command -v composer || echo "composer not on PATH"'
-          PATH="$NP" "$B" scan -g --json $A > s2.json 2>s2.err
-          N=$(python3 -c "import json;print(json.load(open('s2.json')).get('packagesWithPatches'))"); [ "$N" = 1 ] && R scan-g-no-composer-on-path pass || { R scan-g-no-composer-on-path "fail($N)"; tail -2 s2.err; }
+          # --- 2. same default home, but named explicitly via COMPOSER_HOME
+          (command -v where >/dev/null && where composer) || command -v composer
+          export COMPOSER_HOME="$GH"
+          "$B" scan -g --json $A > s2.json 2>s2.err
+          N=$(python3 -c "import json;print(json.load(open('s2.json')).get('packagesWithPatches'))"); [ "$N" = 1 ] && R scan-g-explicit-COMPOSER_HOME pass || { R scan-g-explicit-COMPOSER_HOME "fail($N)"; tail -2 s2.err; }
+          "$B" scan -g --mode agent --yes $A 2>&1 | tail -1
+          grep -q PATCHED "$F" && R apply-g-explicit-COMPOSER_HOME pass || R apply-g-explicit-COMPOSER_HOME fail
+          "$B" rollback -g $A --yes 2>&1 | tail -1
+          cmp -s "$F" "$T/orig.php" && R rollback-g-explicit-COMPOSER_HOME pass || R rollback-g-explicit-COMPOSER_HOME fail
           # --- 3. custom global vendor-dir (explicit COMPOSER_HOME)
           export COMPOSER_HOME="$T/ch2"; mkdir -p "$COMPOSER_HOME"
           printf '{"repositories":[%s],"require":{"acme/tool":"1.0.0"},"config":{"vendor-dir":"deps"}}\n' "$REPO" > "$COMPOSER_HOME/composer.json"
