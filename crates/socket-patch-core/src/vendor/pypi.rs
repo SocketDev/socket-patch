@@ -985,6 +985,13 @@ async fn pypi_prelude<'p>(
     })
 }
 
+/// Whether a rebuilt wheel reproduces the in-sync pin. An empty pinned
+/// sha256 comes from an unhashed requirements vendor line, which pins the
+/// wheel path alone.
+fn pin_matches(pin_path: &str, pin_sha: &str, rel_wheel: &str, sha256_hex: &str) -> bool {
+    pin_path == rel_wheel && (pin_sha.is_empty() || pin_sha == sha256_hex)
+}
+
 /// Whether [`vendor_pypi_with_pipenv_version`] — a wet run with the service
 /// enabled — asks the patch service for `record`: past every refusal it
 /// raises first, and answered neither by the in-sync hot path nor by the
@@ -1153,7 +1160,7 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         // `uv sync`, …) the moment vendor reports success. Sweep the
         // mismatched wheel back out and fail loudly instead.
         if let Some((pin_path, pin_sha)) = &expected_pin {
-            if *pin_path != rel_wheel || *pin_sha != artifact.sha256_hex {
+            if !pin_matches(pin_path, pin_sha, &rel_wheel, &artifact.sha256_hex) {
                 let _ = tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await;
                 prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
                 let mut result = result;
@@ -1843,7 +1850,7 @@ async fn try_pypi_service_wheel(
     // Digested on first ask: pypi is the only backend that pins it.
     let sha256_hex = archive.sha256_hex().to_string();
     if let Some((pin_path, pin_sha)) = expected_pin {
-        if *pin_path != rel_wheel || *pin_sha != sha256_hex {
+        if !pin_matches(pin_path, pin_sha, &rel_wheel, &sha256_hex) {
             return policy.miss(
                 warnings,
                 "vendor_prebuilt_pin_mismatch",
@@ -2184,6 +2191,20 @@ mod tests {
         record: PatchRecord,
     }
 
+    /// [`e2e_fixture`] with a hash-pinned requirements.txt: pip's
+    /// hash-checking mode is on, so the vendor line carries the `--hash`
+    /// pin the in-sync rebuild guard reads back (#376).
+    async fn e2e_fixture_hashed() -> E2eFixture {
+        let fx = e2e_fixture().await;
+        touch(
+            &fx.root,
+            "requirements.txt",
+            &format!("six==1.16.0 --hash=sha256:{}\n", "0".repeat(64)),
+        )
+        .await;
+        fx
+    }
+
     /// A requirements-flavor project: requirements.txt at the root, a
     /// six-like install in a venv-ish site-packages, and a blob store.
     async fn e2e_fixture() -> E2eFixture {
@@ -2291,16 +2312,15 @@ mod tests {
             hex::encode(sha2::Sha256::digest(&wheel_bytes))
         );
 
-        // The requirements line was rewritten with that exact hash.
+        // The requirements line was rewritten to the wheel path. The file
+        // had no hashes, so neither does the line (#376): one `--hash`
+        // would put pip in hash-checking mode for every requirement.
         let req = tokio::fs::read_to_string(fx.root.join("requirements.txt"))
             .await
             .unwrap();
         assert_eq!(
             req,
-            format!(
-                "./{wheel_rel} --hash=sha256:{}  # socket-patch vendor: six==1.16.0\n",
-                entry.artifact.sha256
-            )
+            format!("./{wheel_rel}  # socket-patch vendor: six==1.16.0\n")
         );
         assert_eq!(entry.wiring.len(), 1);
         assert_eq!(entry.wiring[0].kind, "requirements_line");
@@ -2927,7 +2947,7 @@ wheels = [
     /// `vendor_prebuilt_downloaded` advisory is emitted.
     #[tokio::test]
     async fn service_success_requirements_writes_wheel_and_wires_sha256() {
-        let fx = e2e_fixture().await;
+        let fx = e2e_fixture_hashed().await;
         let sources = PatchSources::blobs_only(&fx.blobs);
         let bytes: &[u8] = &served_wheel(b"prebuilt wheel bytes from the service");
         let sri = sri_sha512(bytes);
@@ -3358,7 +3378,7 @@ wheels = [
     /// build that reproduces the pin, exactly as with the ledger present.
     #[tokio::test]
     async fn in_sync_ledgerless_service_rebuild_must_not_break_wired_pin() {
-        let fx = e2e_fixture().await;
+        let fx = e2e_fixture_hashed().await;
         let sources = PatchSources::blobs_only(&fx.blobs);
         let VendorOutcome::Done { result, entry, .. } = crate::vendor::test_support::vendor_pypi(
             "pkg:pypi/six@1.16.0",
@@ -3421,13 +3441,87 @@ wheels = [
         );
     }
 
+    /// An unhashed requirements set gets a hashless vendor line, which still
+    /// pins the wheel PATH. With no ledger entry, a service rebuild that
+    /// lands at another filename would leave that line pointing at nothing,
+    /// so the guard refuses it; different bytes at the pinned path break no
+    /// hash and are accepted.
+    #[tokio::test]
+    async fn in_sync_ledgerless_rebuild_of_unhashed_line_keeps_the_wired_path() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let vendor = |cfg: Option<VendorServiceConfig>| {
+            let (fx, sources) = (&fx, &sources);
+            async move {
+                crate::vendor::test_support::vendor_pypi(
+                    "pkg:pypi/six@1.16.0",
+                    &fx.site_packages,
+                    &fx.root,
+                    &fx.record,
+                    sources,
+                    "2026-06-09T00:00:00Z",
+                    false,
+                    false,
+                    cfg.as_ref(),
+                )
+                .await
+            }
+        };
+        let VendorOutcome::Done { result, .. } = vendor(None).await else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let wired = tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+            .await
+            .unwrap();
+        assert!(!wired.contains("--hash"), "{wired}");
+        let uuid_dir = fx.root.join(format!(".socket/vendor/pypi/{UUID}"));
+
+        // Another filename: refused, requirements.txt untouched.
+        tokio::fs::remove_dir_all(&uuid_dir).await.unwrap();
+        let bytes = served_wheel(b"service wheel at another filename");
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_granted(&server, "six-1.16.0-py3-none-any.whl", &sri_sha512(&bytes), &bytes)
+            .await;
+        let cfg = pypi_service_cfg(&server.uri(), VendorSource::Service, false);
+        let error = crate::vendor::test_support::expect_failure(vendor(Some(cfg)).await);
+        assert!(
+            error.contains("does not match the wheel the lockfile still pins"),
+            "{error}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            wired
+        );
+
+        // Same filename, different bytes: rebuilt, requirements.txt untouched.
+        let _ = tokio::fs::remove_dir_all(&uuid_dir).await;
+        let bytes = served_wheel(b"service wheel at the pinned filename");
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_granted(&server, WHEEL_NAME, &sri_sha512(&bytes), &bytes).await;
+        let cfg = pypi_service_cfg(&server.uri(), VendorSource::Service, false);
+        let VendorOutcome::Done { result, .. } = vendor(Some(cfg)).await else {
+            panic!("same-path rebuild must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert!(uuid_dir.join(WHEEL_NAME).is_file());
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            wired
+        );
+    }
+
     /// The ledgerless twin of the loud local failure: a project vendored
     /// FROM THE SERVICE whose ledger entry AND wheel are gone must not
     /// "rebuild" locally into bytes the wired requirements line does not
     /// pin — the wired file itself carries the pin the guard checks.
     #[tokio::test]
     async fn in_sync_ledgerless_local_rebuild_pin_mismatch_fails_loudly() {
-        let fx = e2e_fixture().await;
+        let fx = e2e_fixture_hashed().await;
         let sources = PatchSources::blobs_only(&fx.blobs);
         let bytes: &[u8] = &served_wheel(b"prebuilt wheel bytes from the service");
         let sri = sri_sha512(bytes);
@@ -5972,7 +6066,7 @@ wheels = [
 
     #[tokio::test]
     async fn in_sync_rebuild_with_corrupt_ledger_falls_back_to_wired_pin() {
-        let fx = e2e_fixture().await;
+        let fx = e2e_fixture_hashed().await;
         let sources = PatchSources::blobs_only(&fx.blobs);
         let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
         else {

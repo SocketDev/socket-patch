@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
+use crate::vendor::common::{parse_json_text, JsonLayout};
 use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries};
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
@@ -278,6 +279,17 @@ fn serialize_json(value: &Value) -> String {
         "{}\n",
         serde_json::to_string_pretty(value).expect("serde_json::Value serializes infallibly")
     )
+}
+
+/// `value` pretty-printed in the layout of `original`, the text it replaces
+/// (BOM, indent, line ending and trailer; see [`JsonLayout`]), so a rewrite
+/// and its revert change nothing but the edited values. npm keeps a lock's
+/// CRLF and tab indent on its own rewrites, and so must we.
+fn serialize_json_like(value: &Value, original: &str) -> String {
+    let bytes = JsonLayout::of(original)
+        .render(value)
+        .expect("serde_json::Value serializes infallibly");
+    String::from_utf8(bytes).expect("rendered JSON is UTF-8")
 }
 
 /// The dep's registry override when it is of `kind`. `None` for an absent
@@ -821,7 +833,8 @@ fn rewrite_one_npm_lock(
     npm: &[&DepOverride],
     result: &mut RewriteResult,
 ) {
-    let Ok(mut lock) = serde_json::from_str::<Value>(content) else {
+    // npm reads past a leading UTF-8 BOM; so do we.
+    let Ok(mut lock) = parse_json_text(content) else {
         // A corrupt lockfile is strictly worse than a missing one (which
         // warns in the caller) — never skip the whole npm redirect silently.
         result.warnings.push(RewriteWarning {
@@ -988,7 +1001,9 @@ fn rewrite_one_npm_lock(
                 ),
             });
         }
-        result.files.insert(lockfile.into(), serialize_json(&lock));
+        result
+            .files
+            .insert(lockfile.into(), serialize_json_like(&lock, content));
     }
 }
 
@@ -6419,14 +6434,16 @@ mod tests {
         )];
         let first = rewrite_registry_redirect(&files, &overrides);
         let out = first.files.get("requirements.txt").expect("rewritten");
+        // An unhashed file pins by the url fragment (#376), so the marker
+        // follows it.
         assert_eq!(
-            out.matches("--hash=sha256:").count(),
+            out.matches("sha256").count(),
             1,
             "exactly one hash after the first pass: {out}"
         );
         assert!(
-            out.contains("; python_version >= \"3.7\" --hash="),
-            "marker preserved ahead of the hash: {out}"
+            out.contains("-none-any.whl#sha256=") && out.contains(" ; python_version >= \"3.7\"\n"),
+            "marker preserved after the pinned url: {out}"
         );
 
         let mut again = files.clone();
@@ -6440,10 +6457,11 @@ mod tests {
         );
     }
 
-    /// An inline comment after the marker must not swallow the appended
-    /// `--hash=…` (pip would then treat the hash as comment text and skip
-    /// enforcement). The comment is split off and re-appended AFTER the hash
-    /// so the pin stays active and the user's note survives.
+    /// An inline comment after the marker must not swallow the appended pin
+    /// (pip would then treat it as comment text and skip enforcement). The
+    /// comment is split off and re-appended AFTER the pin — the url's
+    /// `#sha256=` fragment in an unhashed file (#376), `--hash` in a hashed
+    /// one — so the pin stays active and the user's note survives.
     #[test]
     fn requirements_marker_comment_keeps_hash_active() {
         let original = "requests==2.28.1 ; python_version >= \"3.7\" # explanation\n";
@@ -6456,13 +6474,23 @@ mod tests {
         assert_eq!(
             output,
             &format!(
-                "requests @ {url} ; python_version >= \"3.7\" --hash=sha256:{sha256} # explanation\n"
+                "requests @ {url}#sha256={sha256} ; python_version >= \"3.7\" # explanation\n"
             )
         );
         let again = BTreeMap::from([("requirements.txt".to_string(), output.clone())]);
         let second = rewrite_registry_redirect(&again, &overrides);
         assert!(second.files.is_empty());
         assert!(second.edits.is_empty());
+
+        let hashed = original.replace("# explanation", "--hash=sha256:old # explanation");
+        let files = BTreeMap::from([("requirements.txt".to_string(), hashed)]);
+        let first = rewrite_registry_redirect(&files, &overrides);
+        assert_eq!(
+            first.files["requirements.txt"],
+            format!(
+                "requests @ {url} ; python_version >= \"3.7\" --hash=sha256:{sha256} # explanation\n"
+            )
+        );
     }
 
     const MAVEN_SUFFIXED: &str = "1.7.36-socket.aaaaaaaa";
@@ -12101,6 +12129,43 @@ mod tests {
             "a clean shrinkwrap-only success must emit NO warnings: {:?}",
             r.warnings
         );
+    }
+
+    /// #324: the hosted npm rewrite changes only the rewired values and keeps
+    /// the lock's layout: CRLF stays CRLF, a tab indent stays tabs, and a
+    /// UTF-8 BOM lock (npm strips the BOM and installs from it) is rewritten
+    /// with its BOM rather than skipped as unparseable.
+    #[test]
+    fn npm_lock_rewrite_keeps_crlf_tabs_and_bom() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let lf = "{\n  \"name\": \"app\",\n  \"lockfileVersion\": 3,\n  \"packages\": {\n    \"\": {\n      \"name\": \"app\"\n    },\n    \"node_modules/left-pad\": {\n      \"version\": \"1.3.0\",\n      \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\",\n      \"integrity\": \"sha512-UPSTREAM==\"\n    }\n  }\n}\n";
+        let shapes = [
+            ("crlf", lf.replace('\n', "\r\n")),
+            ("tabs", lf.replace("  ", "\t")),
+            ("bom", format!("\u{feff}{lf}")),
+            ("bom+crlf+tabs", format!("\u{feff}{}", lf.replace("  ", "\t").replace('\n', "\r\n"))),
+        ];
+        for (shape, pristine) in shapes {
+            let mut files = BTreeMap::new();
+            files.insert("package-lock.json".to_string(), pristine.clone());
+            let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+            let out = r
+                .files
+                .get("package-lock.json")
+                .unwrap_or_else(|| panic!("{shape}: lock must be rewritten: {:?}", r.warnings));
+            let expected = pristine
+                .replace(
+                    "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "http://patch.test/left-pad-1.3.0.tgz",
+                )
+                .replace("sha512-UPSTREAM==", "sha512-PATCHED==");
+            assert_eq!(out, &expected, "{shape}: only the rewired values may change");
+        }
     }
 
     /// An unparseable package-lock.json must surface a warning, not silently

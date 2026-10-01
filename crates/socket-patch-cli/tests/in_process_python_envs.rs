@@ -525,3 +525,112 @@ async fn pypi_ambient_virtual_env_does_not_hijack_scan() {
     assert_discovered(&bodies, "pkg:pypi/local-pkg@1.0.0");
     assert_not_discovered(&bodies, "pkg:pypi/ambient-decoy@6.6.6");
 }
+
+// ---------------------------------------------------------------------------
+// Pipenv projects: the venv Pipenv resolves, not the generic probe order
+// ---------------------------------------------------------------------------
+
+/// Pipenv's environment knobs, cleared before each Pipenv test and after it
+/// so ambient values (a `pipenv shell`, CI images) cannot leak in or out.
+const PIPENV_VARS: &[&str] = &[
+    "VIRTUAL_ENV",
+    "WORKON_HOME",
+    "PIPENV_ACTIVE",
+    "PIPENV_IGNORE_VIRTUALENVS",
+    "PIPENV_NO_IGNORE_VIRTUALENVS",
+    "PIPENV_VENV_IN_PROJECT",
+    "PIPENV_NO_VENV_IN_PROJECT",
+    "PIPENV_CUSTOM_VENV_NAME",
+    "PIPENV_PIPFILE",
+];
+
+/// Run `scan` with exactly `env` set among [`PIPENV_VARS`].
+async fn scan_with_pipenv_env(args: ScanArgs, env: &[(&str, &Path)]) -> i32 {
+    for name in PIPENV_VARS {
+        std::env::remove_var(name);
+    }
+    for (name, value) in env {
+        std::env::set_var(name, value);
+    }
+    let code = scan_run(args).await;
+    for name in PIPENV_VARS {
+        std::env::remove_var(name);
+    }
+    code
+}
+
+/// A Pipenv project (`<tmp>/proj` with a Pipfile) whose Pipenv venv is
+/// `<tmp>/wh/proj-env` (named through `PIPENV_CUSTOM_VENV_NAME`) holding
+/// `pipenv_pkg 1.0.0`. Returns `(tmp, project, workon_home)`.
+fn pipenv_project() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("Pipfile"), "[packages]\npipenv-pkg = \"*\"\n").unwrap();
+    let workon = tmp.path().join("wh");
+    let site = venv_site_packages(&workon.join("proj-env"), "python3.12");
+    std::fs::create_dir_all(&site).unwrap();
+    write_dist_info(&site, "pipenv_pkg", "1.0.0");
+    (tmp, project, workon)
+}
+
+/// #384: with `PIPENV_IGNORE_VIRTUALENVS` or `PIPENV_ACTIVE` set, Pipenv
+/// ignores the activated `VIRTUAL_ENV`, so scan must look at Pipenv's own
+/// venv and leave the activated one (another project's, a tool venv) alone.
+#[tokio::test]
+#[serial]
+async fn pipenv_opt_outs_keep_activated_virtual_env_from_hijacking_scan() {
+    let other = tempfile::tempdir().unwrap();
+    let decoy = other.path().join("tool-venv");
+    let decoy_site = venv_site_packages(&decoy, "python3.12");
+    std::fs::create_dir_all(&decoy_site).unwrap();
+    write_dist_info(&decoy_site, "activated_decoy", "6.6.6");
+
+    for opt_out in ["PIPENV_IGNORE_VIRTUALENVS", "PIPENV_ACTIVE"] {
+        let (_tmp, project, workon) = pipenv_project();
+        let server = MockServer::start().await;
+        mock_batch_empty(&server).await;
+        let one = Path::new("1");
+        let code = scan_with_pipenv_env(
+            default_args(&project, server.uri()),
+            &[
+                ("VIRTUAL_ENV", &decoy),
+                ("WORKON_HOME", &workon),
+                ("PIPENV_CUSTOM_VENV_NAME", Path::new("proj-env")),
+                (opt_out, one),
+            ],
+        )
+        .await;
+        assert_eq!(code, 0, "{opt_out}");
+        let bodies = batch_bodies(&server).await;
+        assert_discovered(&bodies, "pkg:pypi/pipenv-pkg@1.0.0");
+        assert_not_discovered(&bodies, "pkg:pypi/activated-decoy@6.6.6");
+    }
+}
+
+/// #334: Pipenv never uses `venv/`, and `PIPENV_VENV_IN_PROJECT=0` makes it
+/// ignore a `./.venv` directory, so neither may shadow Pipenv's venv.
+#[tokio::test]
+#[serial]
+async fn pipenv_stray_venv_dirs_do_not_shadow_the_pipenv_venv() {
+    for (stray, opt_out) in [("venv", None), (".venv", Some("0"))] {
+        let (_tmp, project, workon) = pipenv_project();
+        let stray_site = venv_site_packages(&project.join(stray), "python3.12");
+        std::fs::create_dir_all(&stray_site).unwrap();
+        write_dist_info(&stray_site, "stray_decoy", "6.6.6");
+        let server = MockServer::start().await;
+        mock_batch_empty(&server).await;
+        let mut env: Vec<(&str, &Path)> = vec![
+            ("WORKON_HOME", &workon),
+            ("PIPENV_CUSTOM_VENV_NAME", Path::new("proj-env")),
+        ];
+        if let Some(value) = opt_out {
+            env.push(("PIPENV_VENV_IN_PROJECT", Path::new(value)));
+        }
+        let code = scan_with_pipenv_env(default_args(&project, server.uri()), &env).await;
+        assert_eq!(code, 0, "{stray}");
+        let bodies = batch_bodies(&server).await;
+        assert_discovered(&bodies, "pkg:pypi/pipenv-pkg@1.0.0");
+        assert_not_discovered(&bodies, "pkg:pypi/stray-decoy@6.6.6");
+    }
+}
