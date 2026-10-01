@@ -400,10 +400,19 @@ async fn restore_berry(
         let Some(resolution) = resolution_re.captures(block).map(|c| c[1].to_string()) else {
             continue;
         };
-        let Some((_, archive)) = resolution.split_once("::__archiveUrl=") else {
+        // The hosted pin is the tarball-URL locator `name@<url>`; locks
+        // pinned by releases up to 5.0 spell it as an `npm:` locator's
+        // percent-encoded `::__archiveUrl=` binding (#404).
+        let Some((_, reference)) = split_pattern(&resolution) else {
             continue;
         };
-        let archive = archive.split('&').next().unwrap_or(archive);
+        let archive = if reference.starts_with("https://") || reference.starts_with("http://") {
+            reference
+        } else if let Some((_, binding)) = reference.split_once("::__archiveUrl=") {
+            binding.split('&').next().unwrap_or(binding)
+        } else {
+            continue;
+        };
         let Some(uuid) = ctx.hosted_uuid(archive) else {
             continue;
         };

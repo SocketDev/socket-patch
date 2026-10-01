@@ -672,8 +672,9 @@ enum ProbeStep {
 ///   ([`artifact_url_spellings`], raw or the `\/`-escaped slashes an old
 ///   composer.lock spells them with), so a writer's spelling can never be
 ///   one this probe misses.
-/// - The percent-encoded URL: the berry rewriter writes it into the lock's
-///   `::__archiveUrl=` binding, so the raw form is absent.
+/// - The percent-encoded URL: releases up to 5.0 wrote it into a berry
+///   lock's `::__archiveUrl=` binding (today's berry pin is the raw URL), so
+///   a lock pinned by them carries no raw form.
 /// - The registry index URL and the maven suffixed version, when present.
 pub fn candidate_presence_needles(dep: &DepOverride) -> Vec<String> {
     let artifact_url = dep.artifact_url.as_str();

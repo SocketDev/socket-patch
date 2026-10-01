@@ -14,7 +14,7 @@
 //! (`e2e_redirect_yarn_berry_build.rs` / `e2e_vendor_yarn_berry_build.rs`):
 //!
 //!   * hosted — `scan --mode hosted` rewires `yarn.lock` to the hosted
-//!     `__archiveUrl` + `10c0` checksum (bootstrap-resolution trick, see the
+//!     tarball-URL locator + `10c0` checksum (bootstrap-resolution trick, see the
 //!     redirect sibling); a fresh checkout of only the committable files
 //!     passes `yarn install --immutable --check-cache` offline-from-registry
 //!     and serves the patched bytes THROUGH the `.store` symlink layout.
@@ -557,10 +557,13 @@ async fn yarn4_pnpm_linker_hosted_redirect_fresh_checkout_installs_patched_bytes
     );
 
     let lock = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
-    let encoded = socket_patch_core::utils::uri::encode_uri_component(&hosted_url);
     assert!(
-        lock.contains("::__archiveUrl=") && lock.contains(&encoded),
-        "yarn.lock must carry the encoded __archiveUrl; got:\n{lock}"
+        lock.contains(&format!("\n  resolution: \"{DEP}@{hosted_url}\"")),
+        "yarn.lock must pin the hosted tarball locator; got:\n{lock}"
+    );
+    assert!(
+        !lock.contains("__archiveUrl"),
+        "the hosted pin must not be an npm: locator (#404); got:\n{lock}"
     );
     let checksum_line = yarn_berry_common::expected_checksum_line(
         &String::from_utf8_lossy(&registry_lock),

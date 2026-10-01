@@ -948,7 +948,7 @@ async fn berry_hosted_then_vendored_takeover_round_trips_to_registry() {
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
     let lock = read(&proj, "yarn.lock");
     assert!(
-        lock.contains("::__archiveUrl="),
+        lock.contains(&format!("@{hosted_url}\"")),
         "hosted wiring present:\n{lock}"
     );
 
@@ -1240,9 +1240,8 @@ async fn berry_vendored_then_hosted_takeover_leaves_pure_hosted() {
         "the berry resolutions entry must be reverted"
     );
     let lock = read(&proj, "yarn.lock");
-    let encoded = socket_patch_core::utils::uri::encode_uri_component(&hosted_url);
     assert!(
-        lock.contains("::__archiveUrl=") && lock.contains(&encoded) && lock.contains(&checksum),
+        lock.contains(&format!("@{hosted_url}\"")) && lock.contains(&checksum),
         "lock points hosted:\n{lock}"
     );
     assert!(

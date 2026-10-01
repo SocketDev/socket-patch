@@ -1471,12 +1471,12 @@ fn yarn_berry_hosted_install_proof() {
     let env_json = scan_hosted(&fx.proj, &[]);
     assert_redirected(&env_json, "yarn.lock");
     let lock = read(&fx.proj.join("yarn.lock"));
-    // Berry pins the hosted artifact through a percent-encoded `__archiveUrl`
-    // resolution field, so the plain host string is encoded — check both the
-    // encoded host and the (unencoded) patch UUID.
+    // Berry pins the hosted artifact as a plain tarball-URL locator — never
+    // an `npm:` one (`::__archiveUrl=`), whose fetcher would send the npm
+    // registry token to the patch host (#404).
     assert!(
-        lock.contains("__archiveUrl") && lock.contains("patch.socket.dev"),
-        "{LEG}: berry lock carries no __archiveUrl pointing at the patch \
+        lock.contains("@https://patch.socket.dev/") && !lock.contains("__archiveUrl"),
+        "{LEG}: berry lock carries no tarball locator pointing at the patch \
          host:\n{lock}"
     );
     assert!(

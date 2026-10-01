@@ -1281,7 +1281,7 @@ fn carried_sections(lines: &[String]) -> Vec<String> {
 /// cache zip, but a `--immutable` install treats a respelled checksum as a
 /// lockfile modification (YN0028: "The lockfile would have been modified by
 /// this install") — so an entry Socket writes (the vendored `file:` entry,
-/// the hosted `__archiveUrl` rewrite) must follow the lock's own spelling or
+/// the hosted tarball-locator rewrite) must follow the lock's own spelling or
 /// every CI install of a yarn 4.0.x project fails. A lock with no checksum
 /// at all keeps the prefixed form (every yarn since 4.1).
 pub(crate) fn lock_spells_bare_checksums(lock_text: &str) -> bool {
@@ -1378,7 +1378,8 @@ impl<'a> BerryLocator<'a> {
     }
 
     /// The `__archiveUrl=` binding of a registry locator (bindings are
-    /// `&`-joined), still percent-encoded — what the hosted redirect writes.
+    /// `&`-joined), still percent-encoded — what hosted redirects up to 5.0
+    /// wrote (and what yarn itself writes for a custom registry).
     pub(crate) fn archive_url(&self) -> Option<&'a str> {
         self.npm()?
             .1

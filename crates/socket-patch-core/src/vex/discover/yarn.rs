@@ -44,15 +44,17 @@
 //! `version:` line. `workspace:`, `patch:`, `portal:`, `link:`, `exec:`,
 //! `git` and plain registry locators are not ours and are skipped silently.
 //!
-//! * **Hosted** (`patch::redirect::rewrite_yarn_berry`):
-//!   `resolution: "name@npm:X::__archiveUrl=<encodeURIComponent(url)>"` —
-//!   the `__archiveUrl` binding value (bindings are `&`-joined after `::`) is
-//!   handed to [`DiscoverCtx::hosted_uuid`], which decodes a wholly
-//!   percent-encoded url; a custom-registry `__archiveUrl` is not Socket's and
-//!   is skipped. The locator's `npm:` version must equal `version:` (the
-//!   rewriter writes both from the same coordinate). Hand-edit tolerance: a
-//!   direct url locator `name@https://patch.socket.dev/…` (what a
-//!   url-range dependency locks to) is accepted too. Pin: `checksum:`
+//! * **Hosted** (`patch::redirect::rewrite_yarn_berry`): the direct
+//!   tarball-URL locator `resolution: "name@https://patch.socket.dev/…"`,
+//!   whose reference is handed to [`DiscoverCtx::hosted_uuid`]. Locks pinned
+//!   by releases up to 5.0 spell it
+//!   `resolution: "name@npm:X::__archiveUrl=<encodeURIComponent(url)>"` (an
+//!   `npm:` locator, whose fetcher sent registry auth to the patch host —
+//!   #404); that `__archiveUrl` binding value (bindings are `&`-joined after
+//!   `::`) is still recognized, decoded by the same helper; a
+//!   custom-registry `__archiveUrl` is not Socket's and is skipped. That
+//!   locator's `npm:` version must equal `version:` (the rewriter wrote both
+//!   from the same coordinate). Pin: `checksum:`
 //!   (`10c0/<hex>` — the cache-zip checksum, [`LockIntegrity::BerryChecksum`];
 //!   yarn 4.0.x spells it as bare hex under `cacheKey: 10c0`, read as the
 //!   same pin); the rewriter always writes it, so `integrity_required = true`.

@@ -39,7 +39,6 @@ use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::PatchSources;
 use crate::patch::redirect::{rewrite_registry_redirect, DepOverride, Integrity};
-use crate::utils::uri::encode_uri_component;
 use crate::vendor::lock_inventory::{inventory_npm_lock, LockIntegrity};
 use crate::vendor::npm_flavor::NpmLockFlavor;
 use crate::vendor::yarn_berry_lock::revert_yarn_berry;
@@ -907,11 +906,11 @@ async fn berry_vendoring_a_builtin_patched_package_refuses_fail_closed() {
 }
 
 /// Incident guard 4c: the hosted redirect rewriter on a berry lock rewrites
-/// ONLY the targeted npm: entry (gaining yarn's own `::__archiveUrl=`
-/// binding) and leaves the builtin patch: entries byte-identical.
+/// ONLY the targeted npm: entry (its resolution becoming the hosted
+/// tarball-URL locator) and leaves the builtin patch: entries byte-identical.
 ///
 /// RED-verified: asserting BERRY_PATCH_COUNT+1 fails; asserting the fsevents
-/// entry gained an __archiveUrl fails.
+/// entry was redirected fails.
 #[tokio::test]
 async fn berry_hosted_redirect_leaves_builtin_patch_entries_untouched() {
     let hosted_url = format!(
@@ -948,12 +947,9 @@ async fn berry_hosted_redirect_leaves_builtin_patch_entries_untouched() {
     assert_eq!(berry_edits.len(), 1, "{:?}", result.edits);
     assert_eq!(berry_edits[0].key.as_deref(), Some("left-pad@1.3.0"));
 
-    // The target gained yarn's own archive binding…
+    // The target now resolves to the hosted tarball locator…
     assert!(
-        text.contains(&format!(
-            "  resolution: \"left-pad@npm:1.3.0::__archiveUrl={}\"",
-            encode_uri_component(&hosted_url)
-        )),
+        text.contains(&format!("  resolution: \"left-pad@{hosted_url}\"")),
         "target entry redirected: {text}"
     );
     // …and the builtin patch: entries are byte-identical, count unchanged.
@@ -965,7 +961,7 @@ async fn berry_hosted_redirect_leaves_builtin_patch_entries_untouched() {
         "redirect must not introduce or remove patch: strings"
     );
     assert!(
-        !text.contains("fsevents@npm:2.3.2::__archiveUrl"),
+        !text.contains("fsevents@https://"),
         "untargeted packages must not be redirected"
     );
     // left-pad has no builtin patch: entry, so the protocol gate (and every
@@ -986,8 +982,8 @@ async fn berry_hosted_redirect_leaves_builtin_patch_entries_untouched() {
 /// and the builtin `resolve@patch:...#builtin<compat/resolve>` entry at the
 /// same version) rewrites ONLY the npm: entry and leaves the builtin
 /// `patch:` block byte-identical, warning about the block it refused to
-/// touch. Without the protocol gate the rewriter would splice an
-/// `npm:...::__archiveUrl=` resolution under the still-`patch:` key — a
+/// touch. Without the protocol gate the rewriter would splice a hosted
+/// tarball resolution under the still-`patch:` key — a
 /// corrupted key/resolution protocol mismatch in the incident's exact error
 /// family, emitted as a silent second edit.
 ///
@@ -1031,12 +1027,9 @@ async fn berry_hosted_redirect_of_builtin_patched_package_skips_patch_entry() {
     assert_eq!(berry_edits.len(), 1, "{:?}", result.edits);
     assert_eq!(berry_edits[0].key.as_deref(), Some("resolve@1.20.0"));
 
-    // The plain npm: entry gained yarn's archive binding…
+    // The plain npm: entry now resolves to the hosted tarball locator…
     assert!(
-        text.contains(&format!(
-            "  resolution: \"resolve@npm:1.20.0::__archiveUrl={}\"",
-            encode_uri_component(&hosted_url)
-        )),
+        text.contains(&format!("  resolution: \"resolve@{hosted_url}\"")),
         "plain npm: entry redirected: {text}"
     );
     // …the builtin patch: entries survive byte-identically (key AND

@@ -3139,15 +3139,43 @@ fn yarn_classic_block_head(block: &str) -> Option<(String, Option<String>)> {
 }
 
 // ── yarn.lock (berry / v2+) ──────────────────────────────────────────────────
-// Berry derives its fetch URL from the descriptor's `npm:` resolution and
+// Berry fetches each package from its lock entry's `resolution:` locator and
 // verifies the CONVERTED CACHE ZIP against the lock's `checksum:` (a
 // `10c0/<sha512-hex>` over the zip, not the tarball). To redirect ONE dep we
-// rewrite only the lock entry: `resolution:` gains yarn's own
-// `::__archiveUrl=<encodeURIComponent(url)>` binding, and `checksum:` becomes
-// our precomputed `integrity.yarnBerry10c0`. The descriptor KEY + package.json
-// are untouched (the `name@npm:^range` descriptor still satisfies, so
-// `--immutable` passes). Byte-for-byte twin of the TS `rewriteYarnBerry` on
-// LF locks; the CRLF / BOM round trip below has no TS counterpart yet.
+// rewrite only the lock entry: `resolution:` becomes the plain tarball-URL
+// locator `<name>@<hosted tgz url>`, and `checksum:` becomes our precomputed
+// `integrity.yarnBerry10c0`. The descriptor KEY + package.json are untouched
+// (yarn maps the `name@npm:^range` descriptor to the stored locator, so
+// `--immutable` passes).
+//
+// The locator must NOT keep the `npm:` protocol (e.g. yarn's own
+// `npm:<v>::__archiveUrl=<url>` binding, which releases up to 5.0 wrote):
+// yarn fetches `npm:` locators with its npm fetcher, which attaches the npm
+// registry's credentials (`npmAuthToken`, `YARN_NPM_AUTH_TOKEN`, `npmScopes`)
+// to the request for every scoped package, and for every package under
+// `npmAlwaysAuth` — handing the registry token to the patch host (#404). A
+// tarball-URL locator goes through yarn's tarball fetcher, which sends no
+// registry auth and builds the identical cache zip, so the checksum is the
+// same. An old `::__archiveUrl=` pin is re-pinned by the next hosted run.
+
+/// Whether yarn berry fetches `url`, as a `name@<url>` locator, with its
+/// tarball HTTP fetcher: an `http(s)://` URL whose path ends in `.tgz` /
+/// `.tar.gz` (yarn's `TARBALL_REGEXP` + `PROTOCOL_REGEXP`). A query or
+/// fragment is refused too — yarn's regex rejects a `?`, and a `#` would be
+/// read as a range selector — as is anything that could break out of the
+/// lock's double-quoted `resolution:` string or yarn's `::` binding grammar.
+fn yarn_berry_tarball_url_ok(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    matches!(scheme, "https" | "http")
+        && !rest.is_empty()
+        && !url.contains("::")
+        && !url
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\\' | '?' | '#'))
+        && (url.ends_with(".tgz") || url.ends_with(".tar.gz"))
+}
 
 /// Only cacheKey `10c0` (yarn 4, compressionLevel 0 default) has a checksum we
 /// can reproduce offline; matches the vendored backend's `SUPPORTED_CACHE_KEY`.
@@ -3300,6 +3328,18 @@ fn rewrite_yarn_berry(
             });
             continue;
         };
+        if !yarn_berry_tarball_url_ok(&dep.artifact_url) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_yarn_berry_artifact_url_unsupported".into(),
+                detail: format!(
+                    "{fname}@{}: hosted artifact URL {:?} is not an http(s) `.tgz` URL \
+                     without a query or fragment, so yarn could not fetch it as a \
+                     tarball locator; leaving the lock entry untouched",
+                    dep.version, dep.artifact_url
+                ),
+            });
+            continue;
+        }
         // Berry versions are UNQUOTED (`  version: 1.3.0`).
         let version_re =
             Regex::new(&(String::from(r"\n {2}version: ") + &regex::escape(&dep.version) + "\n"))
@@ -3453,13 +3493,12 @@ fn rewrite_yarn_berry(
                 });
                 continue;
             }
-            // Rewrite the resolution wholesale from name+version — handles a
-            // pre-existing `::__archiveUrl=` (custom-registry lock) for free.
-            let resolution = format!(
-                "{fname}@npm:{}::__archiveUrl={}",
-                dep.version,
-                crate::utils::uri::encode_uri_component(&dep.artifact_url)
-            );
+            // Rewrite the resolution wholesale as a tarball-URL locator (see
+            // the section header: never `npm:`, whose fetcher sends registry
+            // auth) — handles a pre-existing `::__archiveUrl=` (a
+            // custom-registry lock, or an older release's hosted pin) and a
+            // stale hosted URL for free.
+            let resolution = format!("{fname}@{}", dep.artifact_url);
             let mut rewritten = resolution_re
                 .replace(block, format!("\n  resolution: \"{resolution}\"").as_str())
                 .to_string();
@@ -7153,6 +7192,132 @@ mod tests {
         )
     }
 
+    /// #404: the hosted pin must be a plain tarball-URL locator, never an
+    /// `npm:` one. Yarn fetches an `npm:` locator (`::__archiveUrl=`
+    /// included) with its npm fetcher, which attaches the npm registry's
+    /// auth (`npmAuthToken`, `YARN_NPM_AUTH_TOKEN`, `npmScopes`) for every
+    /// scoped package and, under `npmAlwaysAuth`, for every package — so
+    /// the registry token went to the patch host. A `name@https://…tgz`
+    /// locator goes through yarn's tarball fetcher, which sends no registry
+    /// auth, and builds the same cache zip (same `10c0` checksum).
+    #[test]
+    fn yarn_berry_hosted_pin_is_a_tarball_locator_not_npm() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let scoped_url = "https://patch.socket.dev/patch/npm/@isaacs/string-locale-compare/1.1.0/\
+                          tok/11111111-1111-4111-8111-111111111111/string-locale-compare-1.1.0.tgz";
+        let plain_url = "https://patch.socket.dev/patch/npm/left-pad/1.3.0/\
+                         tok/11111111-1111-4111-8111-111111111111/left-pad-1.3.0.tgz";
+        let scoped = DepOverride {
+            namespace: Some("@isaacs".into()),
+            ..berry_override("string-locale-compare", "1.1.0", scoped_url, &checksum)
+        };
+        let plain = berry_override("left-pad", "1.3.0", plain_url, &checksum);
+        let lock = format!(
+            "{}\n\"@isaacs/string-locale-compare@npm:^1.1.0\":\n  version: 1.1.0\n  \
+             resolution: \"@isaacs/string-locale-compare@npm:1.1.0\"\n  checksum: 10c0/{}\n  \
+             languageName: node\n  linkType: hard\n",
+            berry_lock("10c0"),
+            "4".repeat(128)
+        );
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), lock);
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, &[scoped, plain], &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = &r.files["yarn.lock"];
+        assert!(
+            out.contains(&format!(
+                "\n  resolution: \"@isaacs/string-locale-compare@{scoped_url}\"\n  checksum: {checksum}\n"
+            )),
+            "scoped pin is a tarball locator: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "\n  resolution: \"left-pad@{plain_url}\"\n  checksum: {checksum}\n"
+            )),
+            "unscoped pin is a tarball locator: {out}"
+        );
+        assert!(!out.contains("__archiveUrl"), "{out}");
+        assert!(!out.contains("resolution: \"left-pad@npm:"), "{out}");
+        // The descriptor keys (what package.json ranges match) stay npm:.
+        assert!(out.contains("\n\"left-pad@npm:^1.3.0\":\n"), "{out}");
+        assert_eq!(r.edits.len(), 2, "{:?}", r.edits);
+    }
+
+    /// A lock written by an earlier release carries the old
+    /// `npm:…::__archiveUrl=` pin; a repeat hosted run re-pins that entry
+    /// to the tarball locator (#404), so upgrading stops the leak.
+    #[test]
+    fn yarn_berry_legacy_archive_url_pin_is_migrated() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/\
+                   11111111-1111-4111-8111-111111111111/left-pad-1.3.0.tgz";
+        let ovr = berry_override("left-pad", "1.3.0", url, &checksum);
+        let legacy = berry_lock("10c0").replace(
+            "resolution: \"left-pad@npm:1.3.0\"",
+            &format!(
+                "resolution: \"left-pad@npm:1.3.0::__archiveUrl={}\"",
+                crate::utils::uri::encode_uri_component(url)
+            ),
+        );
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), legacy);
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = &r.files["yarn.lock"];
+        assert!(
+            out.contains(&format!("\n  resolution: \"left-pad@{url}\"\n")),
+            "{out}"
+        );
+        assert!(!out.contains("__archiveUrl"), "{out}");
+    }
+
+    /// Yarn routes a URL locator to its tarball fetcher only when it is an
+    /// `http(s)://` URL whose path ends in `.tgz`/`.tar.gz` with no query
+    /// (yarn's `TARBALL_REGEXP`). Any other artifact URL would make yarn
+    /// reject the lock, so the entry is refused and left byte-identical.
+    #[test]
+    fn yarn_berry_refuses_artifact_url_yarn_cannot_fetch_as_tarball() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        for url in [
+            "https://p.test/left-pad-1.3.0.zip",
+            "https://p.test/left-pad-1.3.0.tgz?sig=1",
+            "https://p.test/left-pad-1.3.0.tgz#frag",
+            "ftp://p.test/left-pad-1.3.0.tgz",
+            "https://p.test/a b/left-pad-1.3.0.tgz",
+            "https://p.test/a\"b/left-pad-1.3.0.tgz",
+        ] {
+            let ovr = berry_override("left-pad", "1.3.0", url, &checksum);
+            let mut files = BTreeMap::new();
+            files.insert("yarn.lock".to_string(), berry_lock("10c0"));
+            let mut r = RewriteResult::default();
+            rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(!r.files.contains_key("yarn.lock"), "{url}: lock untouched");
+            assert!(r.edits.is_empty(), "{url}: {:?}", r.edits);
+            assert_eq!(
+                r.warnings
+                    .iter()
+                    .map(|w| w.code.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["redirect_yarn_berry_artifact_url_unsupported"],
+                "{url}"
+            );
+        }
+        for url in [
+            "https://p.test/left-pad-1.3.0.tgz",
+            "http://127.0.0.1:8080/patch/npm/@s/n/1.0.0/t/u/n-1.0.0.tar.gz",
+        ] {
+            let ovr = berry_override("left-pad", "1.3.0", url, &checksum);
+            let mut files = BTreeMap::new();
+            files.insert("yarn.lock".to_string(), berry_lock("10c0"));
+            let mut r = RewriteResult::default();
+            rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(r.warnings.is_empty(), "{url}: {:?}", r.warnings);
+            assert!(r.files.contains_key("yarn.lock"), "{url}");
+        }
+    }
+
     /// yarn 4.0.x: a lock that spells its `10c0` checksums bare (yarn
     /// 4.0.0–4.0.2) gets the hosted entry's checksum spelled bare — the
     /// API's prefixed `yarnBerry10c0` would make `yarn install --immutable`
@@ -7178,7 +7343,10 @@ mod tests {
             let mut r = RewriteResult::default();
             rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
             let out = &r.files["yarn.lock"];
-            assert!(out.contains("::__archiveUrl="), "{out}");
+            assert!(
+                out.contains("resolution: \"left-pad@http://p.test/lp.tgz\""),
+                "{out}"
+            );
             assert!(out.contains(&want), "want {want:?} in:\n{out}");
             assert_eq!(out.matches("checksum:").count(), 1, "{out}");
         }
@@ -13792,7 +13960,7 @@ packages:
                 "{label}: BOM kept"
             );
             assert!(
-                out.contains(&crate::utils::uri::encode_uri_component(url)),
+                out.contains(&format!("resolution: \"left-pad@{url}\"")),
                 "{label}: {out}"
             );
 
@@ -13955,7 +14123,10 @@ packages:
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         let out = &r.files["yarn.lock"];
         assert!(out.starts_with("\u{feff}__metadata:"), "{out:?}");
-        assert!(out.contains("::__archiveUrl="), "{out}");
+        assert!(
+            out.contains("resolution: \"left-pad@http://p.test/lp.tgz\""),
+            "{out}"
+        );
     }
 
     /// CRLF locks preserve their newline style through hosted rewriting.
@@ -15725,7 +15896,7 @@ packages:
 
     /// An UNQUOTED single-descriptor berry key (yarn emits unquoted keys for
     /// names that need no YAML quoting) whose entry has no `checksum:` line:
-    /// the resolution gains `::__archiveUrl=` and a checksum line is INSERTED
+    /// the resolution becomes the tarball locator and a checksum line is INSERTED
     /// after it.
     #[test]
     fn yarn_berry_unquoted_key_without_checksum_gains_inserted_line() {
@@ -15739,8 +15910,8 @@ packages:
         let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         let out = r.files.get("yarn.lock").expect("lock rewritten");
         assert!(
-            out.contains("\n  resolution: \"left-pad@npm:1.3.0::__archiveUrl="),
-            "resolution gains the archiveUrl binding: {out}"
+            out.contains("\n  resolution: \"left-pad@http://p.test/lp.tgz\""),
+            "resolution becomes the tarball locator: {out}"
         );
         assert!(
             out.contains(&format!("\"\n  checksum: {checksum}\n  languageName: node")),
@@ -16780,7 +16951,7 @@ packages:
             .get("yarn.lock")
             .expect("explicit level 0 must not refuse");
         assert!(
-            out.contains("__archiveUrl=") && out.contains(&checksum),
+            out.contains("left-pad@http://p.test/lp.tgz") && out.contains(&checksum),
             "{out}"
         );
     }
@@ -16819,7 +16990,7 @@ packages:
             "only the real entry is edited: {:?}",
             r.edits
         );
-        assert!(out.contains("__archiveUrl="), "{out}");
+        assert!(out.contains("left-pad@http://p.test/lp.tgz"), "{out}");
     }
 
     /// A descriptor with NO protocol at all (`left-pad@1.3.0`) is refused

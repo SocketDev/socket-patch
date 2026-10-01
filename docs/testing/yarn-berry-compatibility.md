@@ -2,14 +2,33 @@
 
 socket-patch supports yarn berry at cacheKey `10c0` — yarn 4 with the default
 `compressionLevel: 0`, the one cache-zip checksum recipe it can reproduce
-offline — in both modes: hosted (`scan --mode hosted` rewrites the lock entry
-to the hosted `::__archiveUrl=`) and vendored (`vendor` wires the root
+offline — in both modes: hosted (`scan --mode hosted` rewrites the lock entry's
+`resolution:` to the hosted tarball-URL locator `<name>@https://…/<name>-<v>.tgz`)
+and vendored (`vendor` wires the root
 `package.json` `resolutions` plus the lock's `file:` entry). yarn 2 and 3
 (cacheKeys `7` / `8`) are refused by both modes. The node-modules and pnpm
 linkers are covered end to end; Plug'n'Play keeps packages inside
 `.yarn/cache` zips, so `vendor` refuses it (`vendor_yarn_berry_unsupported`)
 and so does `apply` (`yarn_pnp_unsupported`), while standalone `vex` still
 attests a hosted lock's `checksum:` pin.
+
+## Registry credentials
+
+The hosted pin is a plain tarball-URL locator, never an `npm:` one. Yarn
+fetches an `npm:` locator — including the `npm:<v>::__archiveUrl=<url>` form
+releases up to 5.0 wrote — with its npm fetcher, which attaches the configured
+registry auth (`npmAuthToken`, `YARN_NPM_AUTH_TOKEN`, `npmScopes.<scope>.npmAuthToken`)
+to every scoped package's request, and to every request under
+`npmAlwaysAuth: true`, whatever host the URL names (#404). The tarball fetcher
+sends no registry auth and builds the identical cache zip, so the `10c0`
+checksum is unchanged. Measured on yarn 4.12.0 with a fresh checkout and a cold
+cache: the old form sent `Authorization: Bearer <token>` to the patch host in all
+three configurations, the tarball locator sent none, and `yarn install
+--immutable` left the lock untouched. A lock carrying the old form keeps being
+recognized by `vex`, rollback and the mode takeovers, and the next hosted `scan`
+re-pins it. An artifact URL yarn could not fetch as a tarball (not `http(s)`, not
+ending in `.tgz`/`.tar.gz`, or carrying a query or fragment) is refused with
+`redirect_yarn_berry_artifact_url_unsupported`, leaving the entry untouched.
 
 ## Test matrix
 

@@ -17,8 +17,8 @@
 //! `corepack yarn@4.12.0` (network for fixture setup only) and prove:
 //!
 //!   * hosted — `scan --mode hosted` from the root rewires the member's
-//!     `left-pad@npm:1.3.0` lock entry to the hosted `__archiveUrl` + `10c0`
-//!     checksum (bootstrap-resolution trick, see the redirect sibling)
+//!     `left-pad@npm:1.3.0` lock entry to the hosted tarball-URL locator +
+//!     `10c0` checksum (bootstrap-resolution trick, see the redirect sibling)
 //!     without touching either package.json; a fresh checkout of only the
 //!     committable files installs the patched bytes offline-from-registry,
 //!     and the member resolves them through `yarn node`.
@@ -552,10 +552,13 @@ async fn yarn4_workspaces_hosted_redirect_rewires_member_dep_from_root_scan() {
     // The single root lock carries the member dep's hosted pin; the
     // workspace entries stay workspace-resolved and no package.json moved.
     let lock = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
-    let encoded = socket_patch_core::utils::uri::encode_uri_component(&hosted_url);
     assert!(
-        lock.contains("::__archiveUrl=") && lock.contains(&encoded),
-        "yarn.lock must carry the encoded __archiveUrl; got:\n{lock}"
+        lock.contains(&format!("\n  resolution: \"{DEP}@{hosted_url}\"")),
+        "yarn.lock must pin the hosted tarball locator; got:\n{lock}"
+    );
+    assert!(
+        !lock.contains("__archiveUrl"),
+        "the hosted pin must not be an npm: locator (#404); got:\n{lock}"
     );
     let checksum_line = yarn_berry_common::expected_checksum_line(
         &String::from_utf8_lossy(&registry_lock),
