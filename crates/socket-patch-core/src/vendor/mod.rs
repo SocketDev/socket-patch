@@ -128,7 +128,7 @@ pub use verify::{
 };
 // The hosted→vendored takeover refuses a berry project the backend would
 // refuse BEFORE it reverts the hosted redirect.
-pub use yarn_berry_lock::yarn_berry_vendor_preflight;
+pub use yarn_berry_lock::{yarn_berry_vendor_preflight, yarn_berry_vendor_target_preflight};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

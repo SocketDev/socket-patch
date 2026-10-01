@@ -1637,25 +1637,32 @@ async fn vendored_takeover(
         None
     };
     // The takeover refusal (if any) for one candidate: bun gates every
-    // npm purl, berry and vlt only their own vendored entries. A refused
-    // purl is never dispatched (see the loop), so its wiring is not a
-    // write target here.
+    // npm purl, berry and vlt only their own vendored entries. Berry also
+    // runs the rewriter's per-dep grant gate (a grant without the berry
+    // cache checksum is skipped by the rewriter, so reverting first would
+    // leave the package in neither mode). A refused purl is never
+    // dispatched (see the loop), so its wiring is not a write target here.
     let takeover_refusal = |c: &Candidate,
                             entry: Option<&socket_patch_core::vendor::VendorEntry>|
-     -> Option<&socket_patch_core::patch::redirect::RewriteWarning> {
+     -> Option<socket_patch_core::patch::redirect::RewriteWarning> {
         if !c.purl.starts_with("pkg:npm/") {
             return None;
         }
+        let berry = entry.is_some_and(berry_entry);
         bun_takeover_refusal
-            .as_ref()
+            .clone()
+            .or_else(|| berry_takeover_refusal.clone().filter(|_| berry))
             .or_else(|| {
-                berry_takeover_refusal
-                    .as_ref()
-                    .filter(|_| entry.is_some_and(berry_entry))
+                berry
+                    .then(|| {
+                        socket_patch_core::patch::redirect::preflight_yarn_berry_hosted_dep(&c.dep)
+                            .err()
+                    })
+                    .flatten()
             })
             .or_else(|| {
                 vlt_takeover_refusal
-                    .as_ref()
+                    .clone()
                     .filter(|_| entry.is_some_and(vlt_entry))
             })
     };
@@ -1684,8 +1691,10 @@ async fn vendored_takeover(
         if let Some(entry) = ledger_entry {
             if let Some(warning) = takeover_refusal(candidate, Some(entry)) {
                 refused.push(purl.clone());
-                if !out.pre_warnings.iter().any(|w| w["code"] == warning.code) {
-                    out.pre_warnings.push(serde_json::json!(warning));
+                // Project-level refusals repeat per purl; report each once.
+                let warning = serde_json::json!(warning);
+                if !out.pre_warnings.contains(&warning) {
+                    out.pre_warnings.push(warning);
                 }
                 continue;
             }
@@ -1827,8 +1836,8 @@ async fn vendored_takeover(
     for purl in &refused {
         if let Some((c, entry)) = takeover.iter().find(|(c, _)| &c.purl == purl) {
             let reason = takeover_refusal(c, entry.as_ref())
-                .map_or("vendored_revert_failed", |w| w.code.as_str());
-            skipped.push(SkippedPatch::new(purl, &c.dep.patch_uuid, reason));
+                .map_or_else(|| "vendored_revert_failed".to_string(), |w| w.code);
+            skipped.push(SkippedPatch::new(purl, &c.dep.patch_uuid, &reason));
         }
     }
     // Purls leaving the rewrite set: refused takeovers, plus the dry-run

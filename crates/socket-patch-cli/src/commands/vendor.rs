@@ -2352,12 +2352,23 @@ pub(crate) async fn vendor_records_reusing(
                 // code and detail, in the dry run and the wet run alike —
                 // so the hosted wiring stays untouched.
                 if candidate.starts_with("pkg:npm/") {
-                    let refusal = berry_takeover_refusal
+                    let project = berry_takeover_refusal
                         .get_or_init(|| {
                             socket_patch_core::vendor::yarn_berry_vendor_preflight(&common.cwd)
                         })
-                        .await;
-                    if let Some((code, detail)) = refusal {
+                        .await
+                        .clone();
+                    let refusal = match project {
+                        Some(refusal) => Some(refusal),
+                        None => {
+                            socket_patch_core::vendor::yarn_berry_vendor_target_preflight(
+                                &common.cwd,
+                                candidate,
+                            )
+                            .await
+                        }
+                    };
+                    if let Some((code, detail)) = &refusal {
                         has_errors = true;
                         env.record(
                             PatchEvent::new(PatchAction::Failed, candidate.clone())

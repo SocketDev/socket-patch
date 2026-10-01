@@ -1103,6 +1103,41 @@ pub async fn yarn_berry_vendor_preflight(project_root: &Path) -> Option<(&'stati
         .and_then(into_pair)
 }
 
+/// The per-package twin of [`yarn_berry_vendor_preflight`] for the
+/// hosted→vendored takeover: the backend's `resolutions` conflict gate and
+/// its lock-entry gates for `purl` (another version of the name, a
+/// non-npm protocol, a mixed-descriptor or duplicate entry). Evaluated on
+/// the still-hosted files, which give the same verdict as the restored
+/// ones: the hosted redirect only rewrites the target entry's
+/// `resolution:` / `checksum:` lines, never its descriptor key, any other
+/// entry, or `package.json`. Returns `(code, detail)`, exactly the refusal
+/// the backend would raise after the restore; `None` when it would not
+/// refuse (or the files are unreadable, which the backend reports itself).
+pub async fn yarn_berry_vendor_target_preflight(
+    project_root: &Path,
+    purl: &str,
+) -> Option<(&'static str, String)> {
+    use super::npm_flavor::{detect_npm_lock_flavor, NpmLockFlavor};
+    if !matches!(
+        detect_npm_lock_flavor(project_root).await,
+        Ok((NpmLockFlavor::YarnBerry, _))
+    ) {
+        return None;
+    }
+    let (name, version) = super::npm_common::parse_npm_purl(purl)?;
+    let pkg_bytes = read_regular_to_bytes(&project_root.join(PACKAGE_JSON))
+        .await
+        .ok()?;
+    let pkg = parse_json_manifest(&pkg_bytes).ok()?;
+    if let Err(outcome) = resolutions_gate(pkg.as_object()?, &name, &version) {
+        if let VendorOutcome::Refused { code, detail } = *outcome {
+            return Some((code, detail));
+        }
+    }
+    let lock_text = read_yarn_lock(project_root).await.ok()?;
+    scan_berry_target(&scan_blocks(&lock_text), &name, &version).err()
+}
+
 /// Commit the pair in contract order — package.json first, yarn.lock second
 /// — unwinding package.json to its original bytes when the lock write fails
 /// (a resolutions entry without its lock counterpart would let a plain

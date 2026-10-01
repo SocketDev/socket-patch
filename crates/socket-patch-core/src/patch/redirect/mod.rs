@@ -3233,6 +3233,30 @@ fn berry_cache_key(content: &str) -> Option<String> {
 /// compares the file with its own majority-normalized re-render and fails
 /// (YN0028), while a plain install rewrites every minority line — so it is
 /// refused untouched, `yarn install` normalizes it first.
+/// The per-dep refusal of the yarn berry hosted rewriter that depends only
+/// on the grant, not on the lock: a dep whose grant carries no
+/// `yarnBerry10c0` cache checksum cannot be redirected (berry verifies the
+/// converted cache zip, and only the service can compute that checksum).
+///
+/// Exposed for the vendored→hosted mode takeover, like
+/// [`preflight_yarn_berry_hosted`]: vendored mode only uses the `tarball`
+/// artifact, so a vendorable patch can lack the berry checksum, and the
+/// takeover must keep such a package vendored instead of reverting it and
+/// then skipping the redirect.
+pub fn preflight_yarn_berry_hosted_dep(dep: &DepOverride) -> Result<(), RewriteWarning> {
+    if dep.integrity.yarn_berry10c0.is_some() {
+        return Ok(());
+    }
+    Err(RewriteWarning {
+        code: "redirect_yarn_berry_missing_checksum".into(),
+        detail: format!(
+            "{}@{} has no yarnBerry10c0 cache checksum",
+            full_name(dep),
+            dep.version
+        ),
+    })
+}
+
 pub fn preflight_yarn_berry_hosted(lock: &str, yarnrc: Option<&str>) -> Result<(), RewriteWarning> {
     if !is_berry_lock(lock) {
         return Ok(());
@@ -3325,19 +3349,16 @@ fn rewrite_yarn_berry(
         let fname = full_name(dep);
         // The API hands the prefixed `10c0/<hex>`; a yarn 4.0.x lock spells
         // its checksums bare, and `--immutable` rejects a respelled one.
+        if let Err(warning) = preflight_yarn_berry_hosted_dep(dep) {
+            result.warnings.push(warning);
+            continue;
+        }
         let Some(checksum) = dep
             .integrity
             .yarn_berry10c0
             .as_deref()
             .map(|c| crate::vendor::yarn_berry_lock::checksum_in_lock_spelling(content, c))
         else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_yarn_berry_missing_checksum".into(),
-                detail: format!(
-                    "{fname}@{} has no yarnBerry10c0 cache checksum",
-                    dep.version
-                ),
-            });
             continue;
         };
         // Berry versions are UNQUOTED (`  version: 1.3.0`).
