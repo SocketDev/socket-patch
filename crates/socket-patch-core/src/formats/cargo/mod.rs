@@ -34,6 +34,7 @@ use crate::utils::purl::simple_purl;
 use crate::vendor::cargo_tag;
 use crate::vendor::lock_inventory::{LockIntegrity, LockfileEntry, SourceKind};
 
+
 // ── entry model ──
 
 /// The `[metadata]` key a v1 lock files `name`+`version`'s checksum under.
@@ -331,6 +332,7 @@ pub(crate) fn parse_ref(spelled: &str) -> (&str, Option<&str>, Option<&str>) {
     (name, version, source)
 }
 
+
 // ── the model ──
 
 /// One `Cargo.lock`, parsed once (see the module docs).
@@ -498,13 +500,7 @@ impl CargoLock {
         uuid: &str,
         copy_tagged: bool,
     ) -> CopyClaim<'_> {
-        vendored_copy_claim(
-            &self.packages,
-            &self.unused,
-            name,
-            version,
-            uuid,
-            copy_tagged,
-        )
+        vendored_copy_claim(&self.packages, &self.unused, name, version, uuid, copy_tagged)
     }
 }
+
