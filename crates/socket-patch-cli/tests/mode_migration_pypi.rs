@@ -131,8 +131,9 @@ fn run_cli(root: &Path, args: &[&str], extra: &[(&str, &str)]) -> (i32, Value) {
 
 /// The hosted API: discovery (`batch` / `by-package`), the grant naming the
 /// hosted wheel, and the wheel itself (its METADATA feeds the lock
-/// rewriters). Returns the hosted URL.
-async fn mount_hosted_api(server: &MockServer) -> String {
+/// rewriters) — or, with `wheel_served: false`, a 404 for it. Returns the
+/// hosted URL.
+async fn mount_hosted_api(server: &MockServer, wheel_served: bool) -> String {
     let wheel = hosted_wheel();
     let sha = hex::encode(Sha256::digest(&wheel));
     let route =
@@ -174,20 +175,21 @@ async fn mount_hosted_api(server: &MockServer) -> String {
         })))
         .mount(server)
         .await;
+    let wheel_response = if wheel_served {
+        ResponseTemplate::new(200).set_body_bytes(wheel)
+    } else {
+        ResponseTemplate::new(404)
+    };
     Mock::given(method("GET"))
         .and(path(route))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(wheel))
+        .respond_with(wheel_response)
         .mount(server)
         .await;
     hosted_url
 }
 
-/// Vendor the staged project, then `scan --mode hosted` over it: the
-/// takeover must report `redirect_takeover_reverted_vendored`, redirect the
-/// purl, and leave every wiring file hosted with no `.socket/vendor/`
-/// reference or artifact behind. `files` are the project files that carry
-/// the wiring.
-async fn assert_vendored_to_hosted(root: &Path, files: &[&str]) {
+/// Stage the manifest and vendor the project; `files` carry the wiring.
+fn vendor_project(root: &Path, files: &[&str]) {
     stage_manifest(root);
     let (code, env) = run_cli(root, &["vendor"], &[]);
     assert_eq!(code, 0, "vendor: {env:#}");
@@ -201,10 +203,12 @@ async fn assert_vendored_to_hosted(root: &Path, files: &[&str]) {
             .any(|t| t.contains(&format!(".socket/vendor/pypi/{UUID}/"))),
         "vendored first: {vendored:#?}"
     );
+}
 
-    let server = MockServer::start().await;
-    let hosted_url = mount_hosted_api(&server).await;
-    let (code, env) = run_cli(
+/// `scan --mode hosted` against `server`.
+fn hosted_scan(root: &Path, server: &MockServer) -> (i32, Value) {
+    let uri = server.uri();
+    run_cli(
         root,
         &[
             "scan",
@@ -212,16 +216,28 @@ async fn assert_vendored_to_hosted(root: &Path, files: &[&str]) {
             "hosted",
             "--yes",
             "--api-url",
-            &server.uri(),
+            &uri,
             "--org",
             ORG,
             "--api-token",
             "fake-token",
             "--patch-server-url",
-            &server.uri(),
+            &uri,
         ],
         &[],
-    );
+    )
+}
+
+/// Vendor the staged project, then `scan --mode hosted` over it: the
+/// takeover must report `redirect_takeover_reverted_vendored`, redirect the
+/// purl, and leave every wiring file hosted with no `.socket/vendor/`
+/// reference or artifact behind. `files` are the project files that carry
+/// the wiring.
+async fn assert_vendored_to_hosted(root: &Path, files: &[&str]) {
+    vendor_project(root, files);
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let (code, env) = hosted_scan(root, &server);
     assert_eq!(code, 0, "hosted scan over the vendored project: {env:#}");
     assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
     assert!(
@@ -385,4 +401,81 @@ async fn hatch_vendored_to_hosted() {
     )
     .unwrap();
     assert_vendored_to_hosted(&root, &["pyproject.toml"]).await;
+}
+
+/// The uv lock rewrite needs the hosted wheel's METADATA, fetched only
+/// after the takeover reverted the vendored wiring. When it is unavailable
+/// the package is left on the unpatched registry release in both modes, so
+/// the run must fail loudly instead of reporting success.
+#[tokio::test]
+async fn uv_takeover_without_wheel_metadata_fails_loudly() {
+    let (_tmp, root) = project();
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"demo\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("uv.lock"),
+        UV_LOCK
+            .replace("WHEEL_SHA", WHEEL_SHA)
+            .replace("SDIST_SHA", SDIST_SHA),
+    )
+    .unwrap();
+    vendor_project(&root, &["uv.lock"]);
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, false).await;
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 1, "a stranded takeover is a failure: {env:#}");
+    assert_eq!(env["status"], "partial_failure", "{env:#}");
+    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    assert!(
+        env.to_string().contains("redirect_takeover_unpatched"),
+        "the unpatched package is named: {env:#}"
+    );
+}
+
+/// A vendored requirements line edited since vendoring is left in place by
+/// the revert (the artifact and ledger entry are kept). The takeover must
+/// then refuse — keeping the ledger — rather than drop the entry and leave
+/// the project half vendored with no record of it.
+#[tokio::test]
+async fn drifted_vendored_line_refuses_takeover() {
+    let (_tmp, root) = project();
+    std::fs::write(root.join("requirements.txt"), "idna==3.7\nsix==1.16.0\n").unwrap();
+    vendor_project(&root, &["requirements.txt"]);
+    let reqs = root.join("requirements.txt");
+    let vendored = std::fs::read_to_string(&reqs).unwrap();
+    let drifted = vendored.replacen(
+        &format!("six-1.16.0-py3-none-any.whl"),
+        "six-1.16.0-py3-none-any.whl ; python_version >= \"3\"",
+        1,
+    );
+    assert_ne!(drifted, vendored, "the fixture edits the vendored line");
+    std::fs::write(&reqs, &drifted).unwrap();
+    let state = root.join(".socket/vendor/state.json");
+    assert!(state.exists());
+
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+    let (code, env) = hosted_scan(&root, &server);
+    let text = env.to_string();
+    assert!(
+        !text.contains("redirect_takeover_reverted_vendored"),
+        "no takeover is announced over drifted wiring: {env:#}"
+    );
+    assert!(text.contains("redirect_vendored_revert_failed"), "{env:#}");
+    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    assert_eq!(
+        code, 0,
+        "a refused takeover keeps the package vendored: {env:#}"
+    );
+    assert!(
+        std::fs::read_to_string(&state).unwrap().contains(UUID),
+        "the ledger entry is kept"
+    );
+    assert!(
+        root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
+        "the vendored artifact is kept"
+    );
 }

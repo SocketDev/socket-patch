@@ -1018,6 +1018,11 @@ pub(crate) async fn run_redirect_selected(
     // report that outcome. Populated only under --dry-run.
     let mut confirmed = done.confirmed.clone();
     confirmed.extend(dry_run_takeover);
+    // The takeover already reverted these purls' vendored wiring; one the
+    // rewrite then did not pin (a refused lock, unavailable wheel
+    // metadata) is left on the unpatched registry release in BOTH modes.
+    // That must never pass as success.
+    let stranded = stranded_takeovers(&takeover_migrated, &confirmed, common.dry_run);
 
     // Fetch the full patch view (file hashes + vulnerabilities) for each
     // CONFIRMED redirect and persist it so a post-install `socket-patch vex`
@@ -1294,6 +1299,18 @@ pub(crate) async fn run_redirect_selected(
     warnings.extend(python_stale.warnings.iter().cloned());
     warnings.extend(vlt_stale.warnings.iter().cloned());
     warnings.extend(takeover_pre_warnings.iter().cloned());
+    warnings.extend(stranded.iter().map(|purl| {
+        serde_json::json!({
+            "code": "redirect_takeover_unpatched",
+            "detail": format!(
+                "{purl} was vendored and its vendored wiring was reverted, but the \
+                 hosted rewrite did not pin it (see the warnings above), so the \
+                 project now installs the UNPATCHED registry release — fix the \
+                 reported cause and re-run `scan --mode hosted`, or run `scan \
+                 --mode vendored` to vendor it again"
+            ),
+        })
+    }));
     warnings.extend(takeover_warnings.iter().cloned());
     warnings.extend(prune_warnings.iter().cloned());
 
@@ -1313,6 +1330,9 @@ pub(crate) async fn run_redirect_selected(
             common.dry_run,
         );
         let mut result = build_redirect_json_envelope(scan_result.take(), redirect);
+        if !stranded.is_empty() {
+            result["status"] = serde_json::json!("partial_failure");
+        }
         if let Some(gate) = &rollout {
             super::finish_rollout_json(gate.stage, &mut result);
         }
@@ -1470,7 +1490,32 @@ pub(crate) async fn run_redirect_selected(
             e.print_embedded(common);
         }
     }
+    if vex_code == 0 && !stranded.is_empty() {
+        return 1;
+    }
     vex_code
+}
+
+/// The purls a WET takeover migrated (vendored wiring reverted) that the
+/// rewrite did not confirm as pinned. Empty under `--dry-run`, whose
+/// takeover previews are counted as confirmed without a rewrite.
+fn stranded_takeovers(
+    migrated: &[String],
+    confirmed: &[(String, String)],
+    dry_run: bool,
+) -> Vec<String> {
+    use socket_patch_core::utils::purl::{canonical_purl, strip_purl_qualifiers};
+    if dry_run {
+        return Vec::new();
+    }
+    let key = |purl: &str| canonical_purl(strip_purl_qualifiers(purl));
+    let pinned: std::collections::HashSet<String> =
+        confirmed.iter().map(|(purl, _)| key(purl)).collect();
+    migrated
+        .iter()
+        .filter(|purl| !pinned.contains(&key(purl)))
+        .cloned()
+        .collect()
 }
 
 /// Cross-mode takeover: a purl this run is about to redirect may still be
@@ -1509,8 +1554,15 @@ async fn vendored_takeover(
     // for those locks even though the rewriters never see these purls.
     let mut dry_run_locks: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    // PyPI: every Python rewriter (requirements.txt, Poetry, Pipenv, uv,
+    // Hatch, PDM, pylock) refuses a non-registry source as user-authored,
+    // including the vendored one socket-patch wrote itself, so a vendored
+    // purl must be reverted to its registry entry first (#328).
     let takeover_capable = |p: &str| {
-        p.starts_with("pkg:cargo/") || p.starts_with("pkg:npm/") || p.starts_with("pkg:golang/")
+        p.starts_with("pkg:cargo/")
+            || p.starts_with("pkg:npm/")
+            || p.starts_with("pkg:golang/")
+            || p.starts_with("pkg:pypi/")
     };
     if !candidates.iter().any(|c| takeover_capable(&c.purl)) {
         // No takeover-capable candidates — nothing to reconcile.
@@ -1740,6 +1792,24 @@ async fn vendored_takeover(
                          reverted ({}); NOT switched to hosted — run `socket-patch vendor \
                          --revert` to clean up, then re-run `scan --mode hosted`",
                         outcome.error.as_deref().unwrap_or("unknown error")
+                    ),
+                }));
+                continue;
+            }
+            if outcome.kept_artifact {
+                // A wiring record drifted and was left in place, so the
+                // project may still resolve through the vendored artifact
+                // and the ledger entry holds the only recorded originals
+                // (the RevertOutcome contract): keep both and refuse,
+                // exactly as `vendor --revert` reports it skipped.
+                refused.push(purl.clone());
+                out.pre_warnings.push(serde_json::json!({
+                    "code": "redirect_vendored_revert_failed",
+                    "detail": format!(
+                        "{purl} is vendored and part of its vendored wiring was edited \
+                         since vendoring, so it was left in place; NOT switched to \
+                         hosted — restore or remove that wiring (`socket-patch vendor \
+                         --revert` lists it), then re-run `scan --mode hosted`"
                     ),
                 }));
                 continue;
