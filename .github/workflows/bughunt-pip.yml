@@ -1,0 +1,144 @@
+name: bughunt-pip
+on:
+  push:
+    branches: ['bughunt/pip/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        combo:
+          - { py: '3.8', pip: '20.3.4' }
+          - { py: '3.13', pip: '26.2.1' }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.combo.py }}
+      - run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo build --locked -p socket-patch-cli
+      - name: probe
+        shell: bash
+        run: |
+          cat > probe.py <<'PROBE_EOF'
+          import base64, hashlib, http.server, io, json, os, shutil, subprocess, sys, threading, zipfile, re, urllib.parse
+          BIN = os.path.abspath(sys.argv[1]); PIPV = sys.argv[2]
+          W = os.path.abspath("probe-work"); shutil.rmtree(W, ignore_errors=True); os.makedirs(W)
+          WIN = os.name == "nt"
+          UUID = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1"
+          def run(cmd, cwd=None, env=None):
+              p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+              return p.returncode, p.stdout + p.stderr
+          def vpy(v): return os.path.join(v, "Scripts" if WIN else "bin", "python.exe" if WIN else "python")
+          def mkvenv(path, pipv=PIPV):
+              rc, out = run([sys.executable, "-m", "venv", path]); assert rc == 0, out
+              rc, out = run([vpy(path), "-m", "pip", "install", "-q", f"pip=={pipv}"]); assert rc == 0, out
+              return vpy(path)
+          # build the patched wheel
+          rc, out = run([sys.executable, "-m", "pip", "download", "--no-deps", "six==1.16.0", "-d", W, "-q"]); assert rc == 0, out
+          orig = os.path.join(W, "six-1.16.0-py2.py3-none-any.whl")
+          zin = zipfile.ZipFile(orig); buf = io.BytesIO(); zout = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+          before = None
+          for i in zin.infolist():
+              d = zin.read(i.filename)
+              if i.filename == "six.py": before = d; d = d + b"# SOCKET-PATCHED\n"; after = d
+              zout.writestr(i, d)
+          zout.close(); WHL = buf.getvalue()
+          SHA = hashlib.sha256(WHL).hexdigest(); SRI = "sha512-" + base64.b64encode(hashlib.sha512(WHL).digest()).decode()
+          g = lambda d: hashlib.sha256(b"blob %d\0" % len(d) + d).hexdigest()
+          BLOBS = {g(before): before, g(after): after}
+          WPATH = f"/patch/pypi/six/1.16.0/tok/{UUID}/six-1.16.0-py2.py3-none-any.whl"
+          PORT = 18765; BASE = f"http://127.0.0.1:{PORT}"; URL = BASE + WPATH
+          def key(p):
+              p = urllib.parse.unquote(p).split("?")[0].lower()
+              if "@" not in p: return p
+              n, v = p.split("@", 1); return re.sub(r"[_.-]+", "-", n) + "@" + v
+          MATCH = "pkg:pypi/six@1.16.0"
+          VULN = {"GHSA-test-aaaa-bbbb": {"cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d"}}
+          class H(http.server.BaseHTTPRequestHandler):
+              def log_message(self, *a): pass
+              def send(self, b, ct="application/octet-stream", code=200):
+                  self.send_response(code); self.send_header("content-type", ct); self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
+              def j(self, o, code=200): self.send(json.dumps(o).encode(), "application/json", code)
+              def do_POST(self):
+                  n = int(self.headers.get("content-length") or 0); b = json.loads(self.rfile.read(n) or b"null")
+                  if self.path.endswith("/patches/batch"):
+                      pk = [{"purl": c["purl"], "patches": [{"uuid": UUID, "purl": c["purl"], "tier": "free", "cveIds": [], "ghsaIds": ["GHSA-test-aaaa-bbbb"], "severity": "high", "title": "fixture"}]} for c in b.get("components", []) if key(c["purl"]) == MATCH]
+                      return self.j({"packages": pk, "canAccessPaidPatches": False})
+                  if self.path.endswith("/patches/package"):
+                      r = {u: {"status": "granted", "url": URL, "purl": None, "artifacts": [{"kind": "tarball", "url": URL, "integrity": {"sha256": SHA, "sha512": SRI}}], "registryOverride": None} for u in b.get("uuids", []) if u == UUID}
+                      return self.j({"results": r})
+                  self.j({}, 404)
+              def do_GET(self):
+                  if self.path == WPATH: return self.send(WHL)
+                  if "/by-package/" in self.path:
+                      p = urllib.parse.unquote(self.path.split("/by-package/")[1])
+                      ps = [{"uuid": UUID, "purl": p, "publishedAt": "2024-01-01T00:00:00Z", "description": "fixture", "license": "MIT", "tier": "free", "vulnerabilities": VULN}] if key(p) == MATCH else []
+                      return self.j({"patches": ps, "canAccessPaidPatches": False})
+                  if "/view/" in self.path:
+                      return self.j({"uuid": UUID, "purl": MATCH, "publishedAt": "2024-01-01T00:00:00Z", "files": {"six.py": {"beforeHash": g(before), "afterHash": g(after)}}, "vulnerabilities": VULN, "description": "fixture", "license": "MIT", "tier": "free"})
+                  if "/blob/" in self.path:
+                      h = self.path.rsplit("/", 1)[1]
+                      if h in BLOBS: return self.send(BLOBS[h])
+                  self.j({}, 404)
+          srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), H); threading.Thread(target=srv.serve_forever, daemon=True).start()
+          ENV = dict(os.environ, SOCKET_NO_CONFIG="1", SOCKET_TELEMETRY_DISABLED="1", SOCKET_NO_UPDATE_CHECK="1")
+          ENV.pop("VIRTUAL_ENV", None)
+          A = ["--org", "test-org", "--api-token", "fake-token", "--api-url", BASE, "--patch-server-url", BASE]
+          def sp(args, cwd): return run([BIN] + args + ["--cwd", cwd] + A, env=ENV)
+          def proj(name, content):
+              p = os.path.join(W, name); os.makedirs(os.path.join(p, ".git")); open(os.path.join(p, "requirements.txt"), "w", newline="").write(content); return p
+          def patched(py):
+              rc, out = run([py, "-c", "import six;print(six.__file__);print('PATCHED' if 'SOCKET-PATCHED' in open(six.__file__).read() else 'UNPATCHED')"])
+              return out.strip().splitlines()[-1] if rc == 0 else "NOTINSTALLED"
+          results = []
+          def cell(name, ok, detail=""):
+              results.append((name, "pass" if ok else "FAIL", detail)); print(f"== {name}: {'pass' if ok else 'FAIL'} {detail}", flush=True)
+          # 1. hosted fragment pin
+          p = proj("hosted", "idna==3.7\nsix==1.16.0\n"); o = open(os.path.join(p, "requirements.txt"), "rb").read()
+          rc, out = sp(["scan", "--mode", "hosted", "--yes"], p); txt = open(os.path.join(p, "requirements.txt")).read()
+          cell("hosted scan writes fragment pin", rc == 0 and f"#sha256={SHA}" in txt and "--hash" not in txt, txt.strip().replace("\n", " | ")[:200])
+          py = mkvenv(os.path.join(W, "venv-h")); rc, out = run([py, "-m", "pip", "install", "-q", "--no-cache-dir", "-r", os.path.join(p, "requirements.txt")])
+          cell("pip install -r hosted file", rc == 0 and patched(py) == "PATCHED", f"rc={rc} {patched(py)} {out.strip()[-300:]}")
+          rc, out = sp(["rollback", "--yes"], p)
+          cell("hosted rollback byte-exact", open(os.path.join(p, "requirements.txt"), "rb").read() == o, f"rc={rc} {out.strip()[-200:]}")
+          # 2. agent mode in .venv (dist-info)
+          p = proj("agent", "six==1.16.0\n"); py = mkvenv(os.path.join(p, ".venv"))
+          rc, out = run([py, "-m", "pip", "install", "-q", "--no-cache-dir", "six==1.16.0"]); 
+          rc, out = sp(["scan", "--mode", "agent", "--yes", "--download-mode", "file"], p)
+          cell("agent scan .venv dist-info", rc == 0 and patched(py) == "PATCHED", f"rc={rc} {patched(py)} {out.strip()[-300:]}")
+          rc, out = sp(["vex", "--product", "pkg:pypi/app@1", "--output", os.path.join(p, "vex.json")], p)
+          st = json.load(open(os.path.join(p, "vex.json")))["statements"][0]["status"] if rc == 0 else None
+          cell("agent vex not_affected", st == "not_affected", f"rc={rc} {st} {out.strip()[-200:]}")
+          rc, out = sp(["rollback", "--yes", "--download-mode", "file"], p)
+          cell("agent rollback", rc == 0 and patched(py) == "UNPATCHED", f"rc={rc} {patched(py)} {out.strip()[-200:]}")
+          # 3. agent mode on egg-info (pip < 23.1 only)
+          if tuple(int(x) for x in PIPV.split(".")[:2]) < (23, 1):
+              p = proj("egg", "six==1.16.0\n"); py = mkvenv(os.path.join(p, ".venv"))
+              run([py, "-m", "pip", "uninstall", "-y", "-q", "wheel"])
+              rc, out = run([py, "-m", "pip", "install", "-q", "--no-cache-dir", "--no-binary", "six", "six==1.16.0"])
+              sitep = os.path.join(p, ".venv", "Lib", "site-packages") if WIN else [os.path.join(r, d) for r, ds, _ in os.walk(os.path.join(p, ".venv", "lib")) for d in ds if d == "site-packages"][0]
+              eggs = [n for n in os.listdir(sitep) if n.lower().startswith("six")]
+              rc, out = sp(["scan", "--mode", "agent", "--yes", "--download-mode", "file"], p)
+              cell("agent scan egg-info (#447)", rc == 0 and patched(py) == "PATCHED", f"rc={rc} {eggs} {patched(py)} {out.strip()[-300:]}")
+              rc, out = sp(["rollback", "--yes", "--download-mode", "file"], p)
+              cell("agent rollback egg-info", rc == 0 and patched(py) == "UNPATCHED", f"rc={rc} {patched(py)}")
+          # 4. vendored -> hosted takeover (#328)
+          p = proj("takeover", "idna==3.7\nsix==1.16.0\n"); rc, out = sp(["scan", "--mode", "vendored", "--yes"], p)
+          v = open(os.path.join(p, "requirements.txt")).read()
+          py = mkvenv(os.path.join(W, "venv-v")); rc2, out2 = run([py, "-m", "pip", "install", "-q", "--no-cache-dir", "-r", "requirements.txt"], cwd=p)
+          cell("vendored install from project root", rc == 0 and rc2 == 0 and patched(py) == "PATCHED", f"rc={rc}/{rc2} {patched(py)} {v.strip()[:160]}")
+          rc, out = sp(["scan", "--mode", "hosted", "--yes", "--json"], p)
+          cell("vendored->hosted takeover (#328, expect FAIL)", "#sha256=" in open(os.path.join(p, "requirements.txt")).read(), f"rc={rc} {out.strip()[-250:]}")
+          print("\n| cell | result | detail |\n|---|---|---|")
+          for r in results: print(f"| {r[0]} | {r[1]} | {r[2][:160].replace('|', '/')} |")
+          PROBE_EOF
+          BIN=target/debug/socket-patch
+          if [ "$RUNNER_OS" = Windows ]; then BIN=target/debug/socket-patch.exe; fi
+          python probe.py "$BIN" "${{ matrix.combo.pip }}" 2>&1 | tee probe.log
