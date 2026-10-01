@@ -594,15 +594,9 @@ async fn inventory_requirements_txt(view: &ProjectView<'_>) -> Option<Vec<Lockfi
     // Pipfile.lock `public_index` rule).
     let public_index = lines.iter().all(|line| {
         let code = crate::utils::requirements::strip_comment(&line.text).trim_start();
-        ![
-            "-i",
-            "--index-url",
-            "--extra-index-url",
-            "-f",
-            "--find-links",
-        ]
-        .iter()
-        .any(|opt| code.starts_with(opt))
+        !["-i", "--index-url", "--extra-index-url", "-f", "--find-links"]
+            .iter()
+            .any(|opt| code.starts_with(opt))
     });
     let mut out = Vec::new();
     for line in lines {

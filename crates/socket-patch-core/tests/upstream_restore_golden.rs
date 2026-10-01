@@ -13,11 +13,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serial_test::serial;
+use socket_patch_core::patch::redirect::{rewrite_registry_redirect_with_pipenv_version, DepOverride};
 use socket_patch_core::patch::redirect::upstream::{
     restore_upstream, HostedPin, PinStatus, RestoreOptions,
-};
-use socket_patch_core::patch::redirect::{
-    rewrite_registry_redirect_with_pipenv_version, DepOverride,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -31,10 +29,7 @@ fn walk(dir: &Path) -> BTreeMap<String, String> {
     if !dir.is_dir() {
         return out;
     }
-    for entry in walkdir::WalkDir::new(dir)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
+    for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(Result::ok) {
         if entry.file_type().is_file() {
             let rel = entry
                 .path()
@@ -50,27 +45,16 @@ fn walk(dir: &Path) -> BTreeMap<String, String> {
 
 /// Tokens of `pattern` that `input` holds and `expected` does not: the
 /// upstream values the hosted rewrite replaced.
-fn vanished(
-    input: &BTreeMap<String, String>,
-    expected: &BTreeMap<String, String>,
-    re: &str,
-) -> Vec<String> {
+fn vanished(input: &BTreeMap<String, String>, expected: &BTreeMap<String, String>, re: &str) -> Vec<String> {
     let re = regex::Regex::new(re).unwrap();
     let all = |files: &BTreeMap<String, String>| -> BTreeSet<String> {
         files
             .values()
-            .flat_map(|t| {
-                re.captures_iter(t)
-                    .map(|c| c[1].to_string())
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|t| re.captures_iter(t).map(|c| c[1].to_string()).collect::<Vec<_>>())
             .collect()
     };
     let after = all(expected);
-    let mut out: Vec<String> = all(input)
-        .into_iter()
-        .filter(|t| !after.contains(t))
-        .collect();
+    let mut out: Vec<String> = all(input).into_iter().filter(|t| !after.contains(t)).collect();
     out.sort();
     out
 }
@@ -96,9 +80,10 @@ fn load(flavor: &str) -> Vec<Case> {
             // `expected/` holds only the files the rewrite changed.
             let mut expected = input.clone();
             expected.extend(walk(&dir.join("expected")));
-            let overrides =
-                serde_json::from_str(&fs::read_to_string(dir.join("overrides.json")).unwrap())
-                    .unwrap();
+            let overrides = serde_json::from_str(
+                &fs::read_to_string(dir.join("overrides.json")).unwrap(),
+            )
+            .unwrap();
             Case {
                 dir,
                 input,
@@ -147,23 +132,10 @@ async fn run_case_with(
     (walk(tmp.path()), statuses)
 }
 
-fn assert_round_trip(
-    case: &Case,
-    after: &BTreeMap<String, String>,
-    statuses: &[(String, PinStatus)],
-) {
-    assert!(
-        !statuses.is_empty(),
-        "{}: discovery found no hosted pin",
-        case.dir.display()
-    );
+fn assert_round_trip(case: &Case, after: &BTreeMap<String, String>, statuses: &[(String, PinStatus)]) {
+    assert!(!statuses.is_empty(), "{}: discovery found no hosted pin", case.dir.display());
     for (purl, status) in statuses {
-        assert_eq!(
-            *status,
-            PinStatus::Restored,
-            "{}: {purl}",
-            case.dir.display()
-        );
+        assert_eq!(*status, PinStatus::Restored, "{}: {purl}", case.dir.display());
     }
     for (rel, want) in &case.input {
         assert_eq!(
@@ -173,15 +145,8 @@ fn assert_round_trip(
             case.dir.display()
         );
     }
-    let extra: Vec<&String> = after
-        .keys()
-        .filter(|k| !case.input.contains_key(*k))
-        .collect();
-    assert!(
-        extra.is_empty(),
-        "{}: left behind {extra:?}",
-        case.dir.display()
-    );
+    let extra: Vec<&String> = after.keys().filter(|k| !case.input.contains_key(*k)).collect();
+    assert!(extra.is_empty(), "{}: left behind {extra:?}", case.dir.display());
 }
 
 /// Sets env vars for the guard's lifetime (tests using it are `#[serial]`).
@@ -242,9 +207,10 @@ async fn npm_mock(case: &Case) -> MockServer {
         }
         Mock::given(method("GET"))
             .and(path(format!("/{}/{version}", name.replace('/', "%2f"))))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({ "name": name, "version": version, "dist": dist }),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "name": name, "version": version, "dist": dist })),
+            )
             .mount(&server)
             .await;
     }
@@ -450,12 +416,7 @@ fn assert_refused(
         }
         other => panic!("{}: expected a refusal, got {other:?}", case.dir.display()),
     }
-    assert_eq!(
-        after,
-        &case.expected,
-        "{}: a refused pin must change nothing",
-        case.dir.display()
-    );
+    assert_eq!(after, &case.expected, "{}: a refused pin must change nothing", case.dir.display());
 }
 
 fn offline() -> RestoreOptions {
@@ -547,8 +508,7 @@ fn transitive_lock() -> String {
 #[serial]
 async fn gem_edge_shapes_round_trip() {
     let gemfile = "source \"https://rubygems.org\"\n\ngem \"puma\"\n\ngroup :test do\n  gem \"rails\", \"7.0.0\", require: false\nend\n";
-    let crlf_gemfile =
-        "source \"https://rubygems.org\"\r\n\r\ngem \"rails\", \"7.0.0\"\r\ngem \"puma\"\r\n";
+    let crlf_gemfile = "source \"https://rubygems.org\"\r\n\r\ngem \"rails\", \"7.0.0\"\r\ngem \"puma\"\r\n";
     let two_sources_gemfile = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\nsource \"https://gems.example.com\" do\n  gem \"private-gem\"\nend\n";
     let two_sources_lock = "GEM\n  remote: https://gems.example.com/\n  specs:\n    private-gem (1.0.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  private-gem!\n  rails (= 7.0.0)\n\nCHECKSUMS\n  private-gem (1.0.0) sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n  rails (7.0.0) sha256=2222222222222222222222222222222222222222222222222222222222222222\n\nBUNDLED WITH\n   2.6.2\n";
     // Provably transitive: the rewriter appended after a trailing blank
@@ -576,18 +536,12 @@ async fn gem_edge_shapes_round_trip() {
         ),
         synthetic(
             "multiple-gem-sections",
-            &[
-                ("Gemfile", two_sources_gemfile),
-                ("Gemfile.lock", two_sources_lock),
-            ],
+            &[("Gemfile", two_sources_gemfile), ("Gemfile.lock", two_sources_lock)],
             gem_override("rails", "7.0.0"),
         ),
         synthetic(
             "transitive-appended",
-            &[
-                ("Gemfile", transitive_gemfile),
-                ("Gemfile.lock", &transitive),
-            ],
+            &[("Gemfile", transitive_gemfile), ("Gemfile.lock", &transitive)],
             gem_override("zeitwerk", "2.6.0"),
         ),
     ];
@@ -646,10 +600,7 @@ async fn gem_pre_checksums_states() {
         .replace("  rails (~> 7.0)\n", "  rails (= 7.0.0)!\n");
     mixed.expected.insert("Gemfile.lock".into(), converged);
     let (after, statuses) = run_case_with(&mixed, None, &offline()).await;
-    assert_eq!(
-        statuses,
-        vec![("pkg:gem/rails@7.0.0".to_string(), PinStatus::Restored)]
-    );
+    assert_eq!(statuses, vec![("pkg:gem/rails@7.0.0".to_string(), PinStatus::Restored)]);
     assert_eq!(after["Gemfile.lock"], restored_lock);
     assert_eq!(after["Gemfile"], restored_gemfile);
 
@@ -662,10 +613,7 @@ async fn gem_pre_checksums_states() {
         .replace("  rails (~> 7.0)\n", "  rails (= 7.0.0)!\n");
     mixed.expected.insert("Gemfile.lock".into(), merged);
     let (after, statuses) = run_case_with(&mixed, None, &offline()).await;
-    assert_eq!(
-        statuses,
-        vec![("pkg:gem/rails@7.0.0".to_string(), PinStatus::Restored)]
-    );
+    assert_eq!(statuses, vec![("pkg:gem/rails@7.0.0".to_string(), PinStatus::Restored)]);
     assert_eq!(after["Gemfile.lock"], restored_lock);
     assert_eq!(after["Gemfile"], restored_gemfile);
 }
@@ -684,10 +632,7 @@ async fn gem_transitive_without_proof_stays_declared() {
     );
     let (after, statuses) = gem_run(&case).await;
     assert_eq!(statuses[0].1, PinStatus::Restored);
-    assert_eq!(
-        after["Gemfile"],
-        format!("{gemfile}gem \"zeitwerk\", \"2.6.0\"\n")
-    );
+    assert_eq!(after["Gemfile"], format!("{gemfile}gem \"zeitwerk\", \"2.6.0\"\n"));
     assert_eq!(
         after["Gemfile.lock"],
         lock.replace("  puma\n", "  puma\n  zeitwerk (= 2.6.0)\n")
@@ -716,19 +661,10 @@ async fn gem_refusals_leave_everything_hosted() {
     // The upstream section is another registry's.
     let mut foreign = case.clone_with("foreign-upstream");
     foreign.edit_both("Gemfile.lock", |t| {
-        t.replace(
-            "remote: https://rubygems.org/",
-            "remote: https://gems.example.com/",
-        )
+        t.replace("remote: https://rubygems.org/", "remote: https://gems.example.com/")
     });
     let (after, statuses) = gem_run(&foreign).await;
-    assert_refused(
-        &foreign,
-        &after,
-        &statuses,
-        "Gemfile.lock",
-        "not rubygems.org",
-    );
+    assert_refused(&foreign, &after, &statuses, "Gemfile.lock", "not rubygems.org");
     // Two upstream sections, neither singled out.
     let mut ambiguous = case.clone_with("ambiguous-upstream");
     ambiguous.edit_both("Gemfile.lock", |t| {
@@ -737,38 +673,18 @@ async fn gem_refusals_leave_everything_hosted() {
             "GEM\n  remote: https://gems.example.com/\n  specs:\n    other (1.0.0)\n\nPLATFORMS",
         )
     });
-    ambiguous.edit_both("Gemfile", |t| {
-        t.replace("source \"https://rubygems.org\"\n", "")
-    });
-    ambiguous.edit_both("Gemfile.lock", |t| {
-        t.replace(
-            "remote: https://rubygems.org/",
-            "remote: https://mirror.example.com/",
-        )
-    });
+    ambiguous.edit_both("Gemfile", |t| t.replace("source \"https://rubygems.org\"\n", ""));
+    ambiguous.edit_both("Gemfile.lock", |t| t.replace("remote: https://rubygems.org/", "remote: https://mirror.example.com/"));
     let (after, statuses) = gem_run(&ambiguous).await;
-    assert_refused(
-        &ambiguous,
-        &after,
-        &statuses,
-        "Gemfile.lock",
-        "upstream GEM sections",
-    );
+    assert_refused(&ambiguous, &after, &statuses, "Gemfile.lock", "upstream GEM sections");
     // The Gemfile block was hand-edited.
     let mut edited = case.clone_with("edited-block");
     edited.expected.insert(
         "Gemfile".into(),
-        edited.expected["Gemfile"]
-            .replace("  gem \"rails\", \"7.0.0\"", "  gem \"rails\", \"~> 7.0\""),
+        edited.expected["Gemfile"].replace("  gem \"rails\", \"7.0.0\"", "  gem \"rails\", \"~> 7.0\""),
     );
     let (after, statuses) = gem_run(&edited).await;
-    assert_refused(
-        &edited,
-        &after,
-        &statuses,
-        "Gemfile.lock",
-        "shape other than the source block",
-    );
+    assert_refused(&edited, &after, &statuses, "Gemfile.lock", "shape other than the source block");
 }
 
 // ── composer ────────────────────────────────────────────────────────────────
@@ -937,11 +853,7 @@ async fn composer_edge_shapes_round_trip() {
             &[("composer.lock", &escaped)],
             composer_override("acme/tool", "dev-main"),
         ),
-        synthetic(
-            "crlf",
-            &[("composer.lock", &crlf)],
-            composer_override("psr/log", "1.1.4"),
-        ),
+        synthetic("crlf", &[("composer.lock", &crlf)], composer_override("psr/log", "1.1.4")),
     ];
     for case in &cases {
         let (after, statuses) = composer_run(case, |_| {}).await;
@@ -960,42 +872,20 @@ async fn composer_refusals_leave_everything_hosted() {
     // Packagist now serves another commit for the version.
     let (after, statuses) =
         composer_run(&case, |d| d["dist"]["reference"] = "feedface".into()).await;
-    assert_refused(
-        &case,
-        &after,
-        &statuses,
-        "composer.lock",
-        "packagist now serves",
-    );
+    assert_refused(&case, &after, &statuses, "composer.lock", "packagist now serves");
     // Packagist does not list the version.
     let (after, statuses) = composer_run(&case, |d| d["version"] = "0.0.1".into()).await;
-    assert_refused(
-        &case,
-        &after,
-        &statuses,
-        "composer.lock",
-        "does not list version 1.1.4",
-    );
+    assert_refused(&case, &after, &statuses, "composer.lock", "does not list version 1.1.4");
     // Offline.
     let (after, statuses) = run_case_with(&case, None, &offline()).await;
     assert_refused(&case, &after, &statuses, "composer.lock", "offline");
     // Locked from another repository.
     let mut foreign = case.clone_with("foreign");
     foreign.edit_both("composer.lock", |t| {
-        t.replacen(
-            "https://packagist.org/downloads/",
-            "https://repo.example.com/downloads/",
-            1,
-        )
+        t.replacen("https://packagist.org/downloads/", "https://repo.example.com/downloads/", 1)
     });
     let (after, statuses) = composer_run(&foreign, |_| {}).await;
-    assert_refused(
-        &foreign,
-        &after,
-        &statuses,
-        "composer.lock",
-        "not packagist",
-    );
+    assert_refused(&foreign, &after, &statuses, "composer.lock", "not packagist");
     // No notification-url, and composer.json names custom repositories.
     let mut custom = case.clone_with("custom-repos");
     custom.edit_both("composer.lock", |t| {
@@ -1012,13 +902,7 @@ async fn composer_refusals_leave_everything_hosted() {
         );
     }
     let (after, statuses) = composer_run(&custom, |_| {}).await;
-    assert_refused(
-        &custom,
-        &after,
-        &statuses,
-        "composer.lock",
-        "custom repositories",
-    );
+    assert_refused(&custom, &after, &statuses, "composer.lock", "custom repositories");
 }
 
 // ── PyPI ─────────────────────────────────────────────────────────────────────
@@ -1056,11 +940,7 @@ fn urllib3_dep() -> DepOverride {
 /// PyPI's blake2b-bucketed file URLs, with real urllib3 1.26.18's buckets: the
 /// sdist sorts before the wheel by URL, the reverse of filename order.
 fn pypi_file_url(filename: &str) -> String {
-    let bucket = if filename.ends_with(".tar.gz") {
-        "0c/39"
-    } else {
-        "b0/53"
-    };
+    let bucket = if filename.ends_with(".tar.gz") { "0c/39" } else { "b0/53" };
     format!("https://files.pythonhosted.org/packages/{bucket}/{filename}")
 }
 
@@ -1073,18 +953,8 @@ fn urllib3_release() -> Release<'static> {
         "urllib3",
         "1.26.18",
         vec![
-            (
-                URLLIB3_WHEEL,
-                URLLIB3_WHEEL_SHA,
-                143835,
-                "2023-10-17T17:46:21.184066Z",
-            ),
-            (
-                URLLIB3_SDIST,
-                URLLIB3_SDIST_SHA,
-                305687,
-                "2023-10-17T17:46:24.000000Z",
-            ),
+            (URLLIB3_WHEEL, URLLIB3_WHEEL_SHA, 143835, "2023-10-17T17:46:21.184066Z"),
+            (URLLIB3_SDIST, URLLIB3_SDIST_SHA, 305687, "2023-10-17T17:46:24.000000Z"),
         ],
     )
 }
@@ -1119,10 +989,7 @@ async fn pypi_mock(releases: &[Release<'_>]) -> (MockServer, EnvGuard) {
 }
 
 fn tree(files: &[(&str, String)]) -> BTreeMap<String, String> {
-    files
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.clone()))
-        .collect()
+    files.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
 }
 
 /// `input` as the real hosted rewriter leaves it.
@@ -1169,24 +1036,14 @@ async fn assert_pypi_round_trip(
     pipenv: Option<u32>,
 ) {
     let rewritten = hosted(input, deps, pipenv);
-    assert_ne!(
-        &rewritten, input,
-        "{label}: the hosted rewrite changed nothing"
-    );
+    assert_ne!(&rewritten, input, "{label}: the hosted rewrite changed nothing");
     let (after, statuses) = restore_tree(&rewritten, &RestoreOptions::default()).await;
-    assert!(
-        !statuses.is_empty(),
-        "{label}: discovery found no hosted pin"
-    );
+    assert!(!statuses.is_empty(), "{label}: discovery found no hosted pin");
     for (purl, status) in &statuses {
         assert_eq!(*status, PinStatus::Restored, "{label}: {purl}");
     }
     for (rel, want) in input {
-        assert_eq!(
-            after.get(rel),
-            Some(want),
-            "{label}: {rel} did not round-trip"
-        );
+        assert_eq!(after.get(rel), Some(want), "{label}: {rel} did not round-trip");
     }
     let extra: Vec<&String> = after.keys().filter(|k| !input.contains_key(*k)).collect();
     assert!(extra.is_empty(), "{label}: left behind {extra:?}");
@@ -1209,20 +1066,13 @@ async fn pypi_refusal(
             PinStatus::Restored => None,
         })
         .collect();
-    assert!(
-        !refusals.is_empty() && refusals.len() == statuses.len(),
-        "{statuses:?}"
-    );
+    assert!(!refusals.is_empty() && refusals.len() == statuses.len(), "{statuses:?}");
     (refusals.join("\n"), rewritten, after)
 }
 
 fn fixture(rel: &str) -> String {
-    fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures")
-            .join(rel),
-    )
-    .unwrap()
+    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(rel))
+        .unwrap()
 }
 
 #[tokio::test]
@@ -1235,12 +1085,7 @@ async fn requirements_golden_restores_modulo_name_casing() {
         let (after, statuses) = run_case(&case).await;
         assert!(!statuses.is_empty());
         for (purl, status) in &statuses {
-            assert_eq!(
-                *status,
-                PinStatus::Restored,
-                "{}: {purl}",
-                case.dir.display()
-            );
+            assert_eq!(*status, PinStatus::Restored, "{}: {purl}", case.dir.display());
         }
         assert_eq!(
             after["requirements.txt"].to_ascii_lowercase(),
@@ -1260,12 +1105,7 @@ async fn uv_golden_without_a_registry_sibling_is_refused() {
     let (_server, _env) = pypi_mock(&[(
         "click",
         "8.1.7",
-        vec![(
-            "click-8.1.7-py3-none-any.whl",
-            URLLIB3_WHEEL_SHA,
-            1,
-            "2023-08-17T17:29:10Z",
-        )],
+        vec![("click-8.1.7-py3-none-any.whl", URLLIB3_WHEEL_SHA, 1, "2023-08-17T17:29:10Z")],
     )])
     .await;
     let mut ran = 0;
@@ -1280,10 +1120,7 @@ async fn uv_golden_without_a_registry_sibling_is_refused() {
                 case.dir.display()
             );
         }
-        assert_eq!(
-            after, case.expected,
-            "a refused pin must leave the files untouched"
-        );
+        assert_eq!(after, case.expected, "a refused pin must leave the files untouched");
         ran += 1;
     }
     assert!(ran > 0);
@@ -1390,14 +1227,9 @@ async fn pdm_static_urls_round_trip() {
             &format!("{{url = \"{}\"", pypi_file_url(URLLIB3_SDIST)),
         );
     // PDM writes a static_urls entry's files in URL order (sdist first here).
-    let wheel_line = format!(
-        "    {{url = \"{}\", hash = \"sha256:{URLLIB3_WHEEL_SHA}\"}},\n",
-        pypi_file_url(URLLIB3_WHEEL)
-    );
+    let wheel_line = format!("    {{url = \"{}\", hash = \"sha256:{URLLIB3_WHEEL_SHA}\"}},\n", pypi_file_url(URLLIB3_WHEEL));
     assert!(lock.contains(&wheel_line), "{lock}");
-    let lock =
-        lock.replacen(&wheel_line, "", 1)
-            .replacen("\n]\n", &format!("\n{wheel_line}]\n"), 1);
+    let lock = lock.replacen(&wheel_line, "", 1).replacen("\n]\n", &format!("\n{wheel_line}]\n"), 1);
     assert!(
         lock.find(URLLIB3_SDIST).unwrap() < lock.find(URLLIB3_WHEEL).unwrap(),
         "{lock}"
@@ -1411,17 +1243,12 @@ async fn pdm_static_urls_round_trip() {
 async fn pdm_narrowed_lock_with_platform_wheels_is_refused() {
     let wheel = "urllib3-1.26.18-cp311-cp311-manylinux_2_17_x86_64.whl";
     let mut release = urllib3_release();
-    release
-        .2
-        .push((wheel, URLLIB3_WHEEL_SHA, 1, "2023-10-17T17:46:21Z"));
+    release.2.push((wheel, URLLIB3_WHEEL_SHA, 1, "2023-10-17T17:46:21Z"));
     let (_server, _env) = pypi_mock(&[release]).await;
     let input = tree(&[("pdm.lock", fixture("pdm-native/2.29.2.lock"))]);
     let (why, rewritten, after) =
         pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
-    assert!(
-        why.contains("not derivable") && why.contains("cross_platform"),
-        "{why}"
-    );
+    assert!(why.contains("not derivable") && why.contains("cross_platform"), "{why}");
     assert!(why.contains("git checkout -- pdm.lock"), "{why}");
     assert_eq!(after, rewritten);
     // A cross-platform lock records every file, whatever its tags.
@@ -1481,9 +1308,7 @@ async fn pipfile_lock_fixture_and_every_category_round_trip() {
         assert_pypi_round_trip(&label, &input, &[urllib3_dep()], None).await;
     }
     // Pipenv 7.x–2017 writes `path` (and, before 2018, no `index`).
-    let old = text
-        .replace(",\n            \"index\": \"pypi\"", "")
-        .replace("\"index\": \"pypi\",\n            ", "");
+    let old = text.replace(",\n            \"index\": \"pypi\"", "").replace("\"index\": \"pypi\",\n            ", "");
     assert!(!old.contains("\"index\""), "{old}");
     let input = tree(&[("Pipfile.lock", old), ("Pipfile", "[packages]\n".into())]);
     assert_pypi_round_trip("pipenv 2017", &input, &[urllib3_dep()], Some(11)).await;
@@ -1517,9 +1342,7 @@ async fn pipfile_lock_real_pipenv_shapes_round_trip_their_index() {
         let pipfile = fixture(&format!("{dir}/Pipfile"));
         let pristine: serde_json::Value = serde_json::from_str(&lock).unwrap();
         assert_eq!(
-            pristine["default"]["urllib3"]
-                .get("index")
-                .and_then(|v| v.as_str()),
+            pristine["default"]["urllib3"].get("index").and_then(|v| v.as_str()),
             index,
             "{dir}: fixture drifted from what Pipenv writes"
         );
@@ -1534,16 +1357,9 @@ async fn pipfile_lock_real_pipenv_shapes_round_trip_their_index() {
             let hosted_lock = hosted(&input, &[urllib3_dep()], major)["Pipfile.lock"].clone();
             let entry: serde_json::Value = serde_json::from_str(&hosted_lock).unwrap();
             let entry = &entry["default"]["urllib3"];
-            assert!(
-                entry.get("file").is_some() && entry.get("version").is_none(),
-                "{label}: {entry}"
-            );
+            assert!(entry.get("file").is_some() && entry.get("version").is_none(), "{label}: {entry}");
             for key in ["index", "markers", "extras"] {
-                assert_eq!(
-                    entry.get(key),
-                    pristine["default"]["urllib3"].get(key),
-                    "{label}: {key}"
-                );
+                assert_eq!(entry.get(key), pristine["default"]["urllib3"].get(key), "{label}: {key}");
             }
             assert_pypi_round_trip(&label, &input, &[urllib3_dep()], major).await;
         }
@@ -1567,17 +1383,12 @@ async fn pipfile_lock_marker_excluded_relock_hybrid_restores_the_original() {
         ("Pipfile", fixture(&format!("{dir}/Pipfile"))),
     ]);
     let rewritten = hosted(&input, &[urllib3_dep()], Some(2026));
-    let mut relocked: serde_json::Value = serde_json::from_str(&rewritten["Pipfile.lock"]).unwrap();
+    let mut relocked: serde_json::Value =
+        serde_json::from_str(&rewritten["Pipfile.lock"]).unwrap();
     let pristine: serde_json::Value = serde_json::from_str(&lock).unwrap();
     let entry = relocked["default"]["urllib3"].as_object_mut().unwrap();
-    assert!(
-        entry.contains_key("file") && !entry.contains_key("index"),
-        "{entry:?}"
-    );
-    entry.insert(
-        "hashes".into(),
-        pristine["default"]["urllib3"]["hashes"].clone(),
-    );
+    assert!(entry.contains_key("file") && !entry.contains_key("index"), "{entry:?}");
+    entry.insert("hashes".into(), pristine["default"]["urllib3"]["hashes"].clone());
     entry.insert("version".into(), serde_json::json!("==1.26.18"));
     relocked.sort_all_objects();
     let hybrid = reindent4(&serde_json::to_string_pretty(&relocked).unwrap()) + "\n";
@@ -1588,10 +1399,7 @@ async fn pipfile_lock_marker_excluded_relock_hybrid_restores_the_original() {
     for (purl, status) in &statuses {
         assert_eq!(*status, PinStatus::Restored, "{purl}");
     }
-    assert_eq!(
-        after["Pipfile.lock"], lock,
-        "the hybrid restores the pristine bytes"
-    );
+    assert_eq!(after["Pipfile.lock"], lock, "the hybrid restores the pristine bytes");
 }
 
 #[tokio::test]
@@ -1609,10 +1417,7 @@ async fn pipfile_lock_refusals() {
             ..Default::default()
         };
         let (why, rewritten, after) = pypi_refusal(&input, &[urllib3_dep()], &offline).await;
-        assert!(
-            why.contains("offline") && why.contains("git checkout -- Pipfile.lock"),
-            "{why}"
-        );
+        assert!(why.contains("offline") && why.contains("git checkout -- Pipfile.lock"), "{why}");
         assert_eq!(after, rewritten);
         // A mirror as the only source.
         let mirror = lock.replace("https://pypi.org/simple", "https://mirror.example/simple");
@@ -1665,10 +1470,7 @@ async fn requirements_hash_mode_ambiguity_is_refused() {
     let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
     let input = tree(&[("requirements.txt", "urllib3==1.26.18\n".into())]);
     let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
-    assert!(
-        why.contains("hash-checking mode") && why.contains("not derivable"),
-        "{why}"
-    );
+    assert!(why.contains("hash-checking mode") && why.contains("not derivable"), "{why}");
     let input = tree(&[(
         "requirements.txt",
         "idna==3.4 --hash=sha256:aaaa\nsix==1.16.0\nurllib3==1.26.18\n".into(),
@@ -1686,10 +1488,7 @@ async fn requirements_hash_mode_ambiguity_is_refused() {
         offline: true,
         ..Default::default()
     };
-    let input = tree(&[(
-        "requirements.txt",
-        "flask==2.0.1\nurllib3==1.26.18\n".into(),
-    )]);
+    let input = tree(&[("requirements.txt", "flask==2.0.1\nurllib3==1.26.18\n".into())]);
     let rewritten = hosted(&input, &[urllib3_dep()], None);
     let (after, statuses) = restore_tree(&rewritten, &offline).await;
     assert_eq!(statuses[0].1, PinStatus::Restored);
@@ -1697,9 +1496,7 @@ async fn requirements_hash_mode_ambiguity_is_refused() {
     // …and is refused in hash mode.
     let input = tree(&[(
         "requirements.txt",
-        format!(
-            "idna==3.4 --hash=sha256:aaaa\nurllib3==1.26.18 --hash=sha256:{URLLIB3_WHEEL_SHA}\n"
-        ),
+        format!("idna==3.4 --hash=sha256:aaaa\nurllib3==1.26.18 --hash=sha256:{URLLIB3_WHEEL_SHA}\n"),
     )]);
     let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &offline).await;
     assert!(why.contains("offline"), "{why}");
@@ -1710,12 +1507,7 @@ async fn requirements_hash_mode_ambiguity_is_refused() {
 async fn a_refused_pin_leaves_the_other_pins_restored() {
     // PyPI knows urllib3 only: idna's hashes cannot be re-derived.
     let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
-    let idna = pypi_dep(
-        "idna",
-        "3.4",
-        "idna-3.4-py3-none-any.whl",
-        "44444444-4444-4444-4444-444444444444",
-    );
+    let idna = pypi_dep("idna", "3.4", "idna-3.4-py3-none-any.whl", "44444444-4444-4444-4444-444444444444");
     let input = tree(&[(
         "requirements.txt",
         format!(
@@ -1729,10 +1521,7 @@ async fn a_refused_pin_leaves_the_other_pins_restored() {
     assert!(matches!(status("pkg:pypi/idna@3.4"), PinStatus::Refused(why) if why.contains("404")));
     let lines: Vec<&str> = after["requirements.txt"].lines().collect();
     assert_eq!(lines[0], "six==1.16.0 --hash=sha256:aaaa");
-    assert!(
-        lines[1].starts_with("idna @ https://patch.socket.dev/"),
-        "{lines:?}"
-    );
+    assert!(lines[1].starts_with("idna @ https://patch.socket.dev/"), "{lines:?}");
     assert_eq!(lines[2], input["requirements.txt"].lines().nth(2).unwrap());
 }
 
@@ -1811,13 +1600,7 @@ async fn uv_project_locks_round_trip() {
             ("uv.lock", lock.replace('\n', eol)),
             ("pyproject.toml", pyproject.replace('\n', eol)),
         ]);
-        assert_pypi_round_trip(
-            &format!("uv direct {eol:?}"),
-            &input,
-            &[urllib3_dep()],
-            None,
-        )
-        .await;
+        assert_pypi_round_trip(&format!("uv direct {eol:?}"), &input, &[urllib3_dep()], None).await;
     }
     // A transitive dependency: the override the rewrite pins in the
     // pyproject and the lock's `[manifest]` both go again.
@@ -1890,10 +1673,7 @@ async fn uv_refusals() {
     {
         let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
         // No other entry shows how this uv joins specifier clauses.
-        let input = tree(&[
-            ("uv.lock", direct.clone()),
-            ("pyproject.toml", pyproject.into()),
-        ]);
+        let input = tree(&[("uv.lock", direct.clone()), ("pyproject.toml", pyproject.into())]);
         let (why, rewritten, after) =
             pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
         assert!(why.contains("multi-clause"), "{why}");
@@ -1931,12 +1711,7 @@ async fn uv_refusals() {
     }
     // A release with interpreter-specific wheels.
     let mut release = urllib3_release();
-    release.2.push((
-        "urllib3-1.26.18-cp311-cp311-win_amd64.whl",
-        URLLIB3_WHEEL_SHA,
-        1,
-        "2023-10-17T17:46:21Z",
-    ));
+    release.2.push(("urllib3-1.26.18-cp311-cp311-win_amd64.whl", URLLIB3_WHEEL_SHA, 1, "2023-10-17T17:46:21Z"));
     let (_server, _env) = pypi_mock(&[release]).await;
     let input = tree(&[("uv.lock", direct)]);
     let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
@@ -1990,10 +1765,7 @@ async fn vlt_goldens_round_trip() {
     // refused a package whose package-lock.json entry the rewrite still
     // pinned; with vlt-lock.json upstream that pin is not live wiring, so
     // discovery (rightly) reports no pin to restore there.
-    let not_invertible = [
-        "sibling-package-lock-vlt-installed",
-        "sibling-refused-in-vlt",
-    ];
+    let not_invertible = ["sibling-package-lock-vlt-installed", "sibling-refused-in-vlt"];
     let mut ran = 0;
     for case in load("npm/vlt") {
         let name = case.dir.file_name().unwrap().to_string_lossy().into_owned();
@@ -2038,10 +1810,7 @@ async fn maven_config_merge_keeps_the_resolver_lines() {
         .find(|c| c.dir.ends_with("mvn-config-merge"))
         .unwrap();
     let (after, statuses) = run_case(&case).await;
-    assert!(
-        matches!(statuses[..], [(_, PinStatus::Restored)]),
-        "{statuses:?}"
-    );
+    assert!(matches!(statuses[..], [(_, PinStatus::Restored)]), "{statuses:?}");
     for rel in ["pom.xml", ".mvn/checksums/checksums.sha256"] {
         assert_eq!(after.get(rel), case.input.get(rel), "{rel}");
     }
@@ -2062,9 +1831,7 @@ async fn nuget_mock(case: &Case) -> MockServer {
             let (id, version) = (id.to_lowercase(), entry["resolved"].as_str().unwrap());
             let catalog = format!("{}/catalog0/data/{id}.{version}.json", server.uri());
             Mock::given(method("GET"))
-                .and(path(format!(
-                    "/v3/registration5-gz-semver2/{id}/{version}.json"
-                )))
+                .and(path(format!("/v3/registration5-gz-semver2/{id}/{version}.json")))
                 .respond_with(
                     ResponseTemplate::new(200)
                         .set_body_json(serde_json::json!({ "catalogEntry": catalog })),
@@ -2134,17 +1901,11 @@ async fn nuget_non_invertible_goldens_restore_or_refuse_as_documented() {
             let PinStatus::Refused(why) = status else {
                 panic!("{name}: {status:?}");
             };
-            assert!(
-                why.contains("corp-feed") && why.contains("git checkout"),
-                "{why}"
-            );
+            assert!(why.contains("corp-feed") && why.contains("git checkout"), "{why}");
             assert_eq!(after, case.expected, "{name}: a refusal changes nothing");
         } else {
             assert_eq!(*status, PinStatus::Restored, "{name}");
-            assert_eq!(
-                after.get("packages.lock.json"),
-                case.input.get("packages.lock.json")
-            );
+            assert_eq!(after.get("packages.lock.json"), case.input.get("packages.lock.json"));
             let config = &after["nuget.config"];
             assert!(!config.contains("socket-patch") && !config.contains("packageSourceMapping"));
         }

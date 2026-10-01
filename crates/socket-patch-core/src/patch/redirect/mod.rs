@@ -45,17 +45,16 @@ mod pdm;
 mod pipenv;
 pub mod presence;
 // The pnpm hosted planner lives with the format's model.
-use crate::formats::cargo::hosted::CargoLockPlan;
-#[cfg(test)]
-use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
+use crate::formats::pnpm::plan_hosted;
 use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
+pub(crate) use crate::formats::yarn::is_berry_lock;
+use crate::formats::cargo::hosted::CargoLockPlan;
+#[cfg(test)]
+use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
-use crate::formats::pnpm::plan_hosted;
-pub(crate) use crate::formats::yarn::is_berry_lock;
-mod hosted_url;
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 mod poetry;
@@ -64,17 +63,18 @@ mod python_lock_equivalence_tests;
 mod requirements;
 mod staged;
 mod state;
+mod hosted_url;
 pub mod upstream;
 pub mod vlt;
 pub mod vlt_heal;
 pub mod vlt_preflight;
+pub use state::{
+    load_redirect_state, save_redirect_state,
+    CorruptRedirectState, RedirectState, REDIRECT_STATE_REL,
+};
 /// Hosted-artifact leaf ownership rule, shared with `vex`'s bun lockfile
 /// discovery (which recovers a URL tuple's version from that leaf).
 pub(crate) use hosted_url::{hosted_url_names, hosted_url_version};
-pub use state::{
-    load_redirect_state, save_redirect_state, CorruptRedirectState, RedirectState,
-    REDIRECT_STATE_REL,
-};
 
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -4055,6 +4055,7 @@ fn rewrite_uv_lock(
         }
     }
 }
+
 
 // ── composer.lock ────────────────────────────────────────────────────────────
 /// Whether `text` points at `artifact_url` in any spelling a rewritten file may
@@ -10148,11 +10149,7 @@ mod tests {
                 let out = r.files.get("Gemfile.lock").expect("lock rewritten");
                 let rows: Vec<&str> = out
                     .lines()
-                    .filter(|l| {
-                        l.trim_start().starts_with("rails (7.0.0)")
-                            && l.starts_with("  ")
-                            && !l.starts_with("    ")
-                    })
+                    .filter(|l| l.trim_start().starts_with("rails (7.0.0)") && l.starts_with("  ") && !l.starts_with("    "))
                     .collect();
                 assert_eq!(
                     rows,
@@ -10165,11 +10162,7 @@ mod tests {
                     "{entry}: the entry keeps its line ending: {out:?}"
                 );
                 let model = crate::formats::gem::GemfileLock::parse(out);
-                assert_eq!(
-                    model.checksum("rails", "7.0.0"),
-                    Some(patched.as_str()),
-                    "{entry}"
-                );
+                assert_eq!(model.checksum("rails", "7.0.0"), Some(patched.as_str()), "{entry}");
                 assert!(!out.contains("\r\r"), "line endings kept: {out:?}");
                 let edit = r
                     .edits
@@ -10184,10 +10177,7 @@ mod tests {
                 files.insert("Gemfile.lock".to_string(), out.clone());
                 let again = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
                 assert!(
-                    !again
-                        .edits
-                        .iter()
-                        .any(|e| e.kind == "redirect_gemfile_lock_checksum"),
+                    !again.edits.iter().any(|e| e.kind == "redirect_gemfile_lock_checksum"),
                     "{entry}: rerun is a no-op: {:?}",
                     again.edits
                 );
@@ -10555,19 +10545,11 @@ mod tests {
         let redacted = format!(
             "https://patch.socket.dev/patch/npm/left-pad/1.3.0/<redacted>/{uuid}/left-pad-1.3.0.tgz?x=1"
         );
-        assert_eq!(
-            redact_grant_token(&url, &url, uuid),
-            redacted,
-            "the URL alone"
-        );
+        assert_eq!(redact_grant_token(&url, &url, uuid), redacted, "the URL alone");
         let text = format!("vlt would fail to verify {url}: fetch error GET {url}: reset");
-        let want =
-            format!("vlt would fail to verify {redacted}: fetch error GET {redacted}: reset");
+        let want = format!("vlt would fail to verify {redacted}: fetch error GET {redacted}: reset");
         assert_eq!(redact_grant_token(&text, &url, uuid), want, "every quote");
-        assert!(
-            !redact_grant_token(&text, &url, uuid).contains(token),
-            "no token left"
-        );
+        assert!(!redact_grant_token(&text, &url, uuid).contains(token), "no token left");
         let registry = format!("https://patch.socket.dev/patch-registry/npm/{token}/{uuid}");
         assert_eq!(
             redact_grant_token(&registry, &registry, uuid),

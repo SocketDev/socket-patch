@@ -265,7 +265,8 @@ fn rewrite_environments(
                     .is_some_and(|kind| kind != "virtual")
             {
                 return Err(
-                    "Hatch sources, overrides and custom environments require agent mode".into(),
+                    "Hatch sources, overrides and custom environments require agent mode"
+                        .into(),
                 );
             }
             for key in ["dependencies", "extra-dependencies"] {

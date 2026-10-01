@@ -56,10 +56,7 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
         })))
         .mount(server)
         .await;
-    std::env::set_var(
-        "SOCKET_NPM_REGISTRY",
-        format!("{}/npm-registry", server.uri()),
-    );
+    std::env::set_var("SOCKET_NPM_REGISTRY", format!("{}/npm-registry", server.uri()));
     let code = rollback::run(RollbackArgs {
         targets: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
@@ -767,11 +764,7 @@ async fn hosted_pnpm_manifestless_vex_from_lockfile_legacy_ledger_and_api() {
                         ..VexRun::offline()
                     },
                 );
-                assert_eq!(
-                    out.code,
-                    Some(0),
-                    "[{lock_name}] legacy ledger, offline: {out}"
-                );
+                assert_eq!(out.code, Some(0), "[{lock_name}] legacy ledger, offline: {out}");
                 assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
                 assert_eq!(api.request_count(), seen);
 

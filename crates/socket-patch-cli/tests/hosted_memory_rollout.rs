@@ -237,9 +237,7 @@ async fn memory_selected(
     files: &BTreeMap<String, Vec<u8>>,
     mut o: HostedScanOptions,
 ) -> HostedScanOutput {
-    use socket_patch_cli::hosted_memory::{
-        select_paths, PolicyFileInput, SelectOptions, TreeEntryInput,
-    };
+    use socket_patch_cli::hosted_memory::{select_paths, PolicyFileInput, SelectOptions, TreeEntryInput};
     let entries: Vec<TreeEntryInput> = files
         .iter()
         .map(|(p, bytes)| TreeEntryInput {
@@ -267,11 +265,7 @@ async fn memory_selected(
             ..SelectOptions::default()
         },
     );
-    assert!(
-        selection.policy_error.is_none(),
-        "{:?}",
-        selection.policy_error
-    );
+    assert!(selection.policy_error.is_none(), "{:?}", selection.policy_error);
     let fetched: BTreeMap<String, Vec<u8>> = selection
         .fetch_text
         .iter()
@@ -430,11 +424,7 @@ async fn socket_yml_policy_and_cap_converge_on_disk_and_in_memory() {
         b"version: 2\npatches:\n  includePaths: [\"/apps/\"]\n  minSeverity: high\n  maxNewPatches: 2\n"
             .to_vec(),
     );
-    lock(
-        &mut files,
-        "apps/one",
-        &["mem-a", "mem-b", "mem-c", "mem-d", "mem-e"],
-    );
+    lock(&mut files, "apps/one", &["mem-a", "mem-b", "mem-c", "mem-d", "mem-e"]);
     lock(&mut files, "apps/two", &["mem-b", "mem-c", "mem-d"]);
     lock(&mut files, "legacy", &["mem-b", "mem-e"]);
     let dirs = ["apps/one", "apps/two", "legacy"];
@@ -445,16 +435,8 @@ async fn socket_yml_policy_and_cap_converge_on_disk_and_in_memory() {
     };
     let expected: [Vec<Vec<&str>>; 3] = [
         vec![vec!["mem-e", "mem-b"], vec!["mem-b"], vec![]],
-        vec![
-            vec!["mem-e", "mem-b", "mem-c"],
-            vec!["mem-b", "mem-c"],
-            vec![],
-        ],
-        vec![
-            vec!["mem-e", "mem-b", "mem-c"],
-            vec!["mem-b", "mem-c"],
-            vec![],
-        ],
+        vec![vec!["mem-e", "mem-b", "mem-c"], vec!["mem-b", "mem-c"], vec![]],
+        vec![vec!["mem-e", "mem-b", "mem-c"], vec!["mem-b", "mem-c"], vec![]],
     ];
 
     let mut mem_files = files.clone();
@@ -467,10 +449,7 @@ async fn socket_yml_policy_and_cap_converge_on_disk_and_in_memory() {
             "run {}",
             run + 1
         );
-        assert_eq!(
-            mem.policy.as_ref().map(|p| p["source"].clone()),
-            Some(json!("file"))
-        );
+        assert_eq!(mem.policy.as_ref().map(|p| p["source"].clone()), Some(json!("file")));
         mem_files = apply(&mem_files, &mem);
         assert_eq!(&pins(&mem_files), want, "memory run {}", run + 1);
 
@@ -490,14 +469,7 @@ async fn socket_yml_policy_and_cap_converge_on_disk_and_in_memory() {
     let (code, stdout, changed) = run_disk_args(
         &server,
         &disk_files,
-        &[
-            "--no-socket-yml",
-            "--max-new-patches",
-            "1",
-            "apps/one",
-            "apps/two",
-            "legacy",
-        ],
+        &["--no-socket-yml", "--max-new-patches", "1", "apps/one", "apps/two", "legacy"],
     );
     assert_eq!(code, 0, "{stdout}");
     disk_files.extend(changed);

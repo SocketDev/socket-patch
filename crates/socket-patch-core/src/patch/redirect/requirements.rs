@@ -265,9 +265,7 @@ pub(super) fn rewrite(
                 }
             }
             matched = true;
-            result
-                .confirmed_requirements_uuids
-                .insert(dep.patch_uuid.clone());
+            result.confirmed_requirements_uuids.insert(dep.patch_uuid.clone());
             let options = requirement_tokens(specifier)
                 .into_iter()
                 .skip_while(|token| !token.starts_with("--"))
