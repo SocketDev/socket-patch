@@ -1,16 +1,16 @@
 [agent] Progress ledger for the scheduled Maven bug-hunt routine (label pm:maven).
 
-Last updated: 2026-10-01 (run 5), main `c7af4df`, latest release 4.0.0.
+Last updated: 2026-10-01 (run 6), main `61cfb9b`, latest release 4.0.0.
 
 ## Coverage matrix
 
-Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom). Global `-g` cells use real Maven installs into the local repository and a stub patch API (`/tmp`-local Python stub serving batch / by-package / view / blob). v5 vendored cells use the repo capstones (`e2e_vendor_jvm_build`, `e2e_vendor_maven_build`, `e2e_redirect_maven_build`) and local, uncommitted variants of them. Linux runs use JDK 21; the macOS / Windows probes use the runner's default JDK.
+Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom). Global `-g` cells use real Maven installs into the local repository and a stub patch API (`/tmp`-local Python stub serving batch / by-package / view / blob). v5 vendored cells use the repo capstones (`e2e_vendor_jvm_build`, `e2e_vendor_maven_build`, `e2e_redirect_maven_build`) and local, uncommitted variants of them. Linux runs use JDK 21; the macOS / Windows probes use the runner's default JDK. From run 6, variant fixtures resolve through a local caching mirror of Central (`mirrorOf central`) to avoid 429s.
 
 ### v5 global mode (`-g`)
 
 | OS | Maven | scan -g default | M2_HOME set | settings.xml `<localRepository>` | Windows HOME≠USERPROFILE | `-g --mode hosted` refusal | agent apply / vex / rollback | read-only global dir |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 3.6.3 / 3.8.8 / 3.9.11 / 4.0.0-rc-7 | pass | fail #423 | fail #423 | n/a | pass (3.9.11) | pass (3.9.11); rollback -g under M2_HOME drops the record, fail #423 | human pass / JSON fail #424 |
+| Linux | 3.6.3 / 3.8.8 / 3.9.11 / 4.0.0-rc-7 | pass | fail #423 (re-checked run 6) | fail #423 (re-checked run 6) | n/a | pass (3.9.11) | pass (3.9.11); rollback -g under M2_HOME drops the record, fail #423 | human pass / JSON fail #424 |
 | macOS | 3.6.3 / 3.9.11 / 4.0.0-rc-7 | pass (probe) | fail #423 | fail #423 | n/a | untested | untested | untested |
 | Windows | 3.6.3 / 3.9.11 / 4.0.0-rc-7 | pass (probe) | fail #423 | fail #423 | fail #423 | untested | untested | untested |
 
@@ -18,23 +18,26 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 
 | Maven | reactor capstone (auto) | reactor `--maven-config=none`: `-o` | `none`: `cd module` | `none`: `-f root` from outside | reactor path with `,` / space / `%2F` | reactor + existing `maven.config` (CRLF / no EOL / user tail) | reactor + `aether.checksums.algorithms=SHA-256` | reactor profile-overridden `${prop}` | single-POM `%XX` path | hosted `<repositories/>` |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 3.6.3 | blocked (429) | blocked | blocked | untested | untested | untested | n/a | blocked (429) | untested on v5 | untested on v5 |
+| 3.6.3 | pass (run 6) | blocked | blocked | untested | untested | untested | n/a | blocked (429) | untested on v5 | untested on v5 |
 | 3.8.8 | blocked (429) | blocked | blocked | untested | untested | untested | untested | blocked (429) | untested on v5 | untested on v5 |
 | 3.9.11 | pass | fail #430 | fail #430 | pass | pass (comma: fallback repo) | pass | pass | fail #459 | fail #350 | fail #342 |
 | 4.0.0-rc-7 | pass | fail #430 | pass | pass | untested | untested | pass | fail #459 | untested on v5 | fail #342 |
 
-### v5 vendored reactor: external version management (run 5, Linux)
+### v5 vendored reactor: external version management (runs 5–6, Linux)
 
-| Maven | BOM import = base | BOM import ≠ base | external parent ≠ base | BOM bump after vendoring | #459 reverse (profile = base) | single-POM BOM ≠ base |
-| --- | --- | --- | --- | --- | --- | --- |
-| 3.6.3 / 3.8.8 | blocked (429) | blocked (429) | blocked (429) | untested | untested | untested |
-| 3.9.11 | pass | fail #488 | fail #488 | fail #488 | degraded (unpatched, warned, VEX refuses) | no downgrade |
-| 4.0.0-rc-7 | pass | fail #488 | fail #488 | fail #488 | untested | no downgrade |
+| Maven | BOM import = base | BOM import ≠ base | external parent ≠ base | external `${prop}` overridden ≠ base in local root | BOM bump after vendoring | external-parent `${prop}` = base | 4.1.0 `<parent/>` + root `${prop}` | 4.1.0 `<parent/>` literal / versionless | #459 reverse (profile = base) | single-POM BOM ≠ base |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 3.6.3 | untested | fail #488 | fail #488 | fail #488 | untested | fail #513 | n/a | n/a | untested | untested |
+| 3.8.8 | untested | fail #488 | fail #488 | fail #488 | untested | fail #513 | n/a | n/a | untested | untested |
+| 3.9.11 | pass | fail #488 | fail #488 | fail #488 | fail #488 | fail #513 | n/a | n/a | degraded (unpatched, warned, VEX refuses) | no downgrade |
+| 4.0.0-rc-7 | pass | fail #488 | fail #488 | fail #488 | fail #488 | fail #513 | fail #513 | pass | untested | no downgrade |
 
 ### v5 hosted Trusted Checksums boundary (#258, run 5, Linux)
 
 | Maven | `e2e_redirect_maven_build` (unenforced warning ⇔ tamper enforcement) |
 | --- | --- |
+| 3.6.3 | pass (run 6) |
+| 3.8.8 | pass (run 6) |
 | 3.9.3 | pass |
 | 3.9.4 | pass |
 | 4.0.0-rc-7 | pass |
@@ -52,12 +55,12 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 
 ## Backlog
 
-0. **Maintainer request (global `-g`)**: mostly covered in run 3 (see the matrix and the 20261001T061707Z entry). Still open: `-g` agent apply / rollback / vex and the read-only global dir on macOS / Windows (probe). Keep this item until those cells pass or fail.
-1. A maintainer needs to delete the stale probe branches `bughunt/maven/20260930-vendored-paths` and `bughunt/maven/20261001-global-repo`. `git push --delete` hung up from the sandbox in run 4 and was denied by the session permission policy in run 5. Probe commits must use the default (signed) git identity. Don't override `user.email`.
-2. Re-run the reactor capstone (auto + `none`), the hosted capstone and the #459 / #488 fixtures on 3.6.3 / 3.8.8 when Central isn't throttling (the fallback-repo-only path). Warm the m2 in an early, separate step.
-3. Hosted single-POM + BOM import / external parent managing a different version (a downgrade via the added dM entry, or covered by #265?), and hosted `-o` on a fresh checkout.
-4. #488 sibling: an external parent's `<properties>` overridden in the reactor root, and `spring-boot-starter-parent`-style property-driven management.
-5. Hosted: a pre-existing user `.mvn/maven.config` plus `checksums.sha256` round trip through rollback (`maven_trusted_checksums_left`).
+0. **Maintainer request (global `-g`)**: mostly covered in run 3 (see the matrix and the 20261001T061707Z entry). Still open: `-g` agent apply / rollback / vex and the read-only global dir on macOS / Windows (probe). Keep this item until those cells pass or fail. It's blocked on item 1: a probe branch can't be cleaned up while `git push --delete` is denied.
+1. A maintainer needs to delete the stale probe branches `bughunt/maven/20260930-vendored-paths` and `bughunt/maven/20261001-global-repo`. `git push --delete` hung up in run 4 and was denied by the session permission policy in runs 5 and 6. Probe commits must use the default (signed) git identity. Don't override `user.email`.
+2. Reactor (auto + `none`) and single-POM capstones on 3.8.8, and single-POM on 3.6.3. The harness warm-up has no mirror hook and Central 429s it. A local variant with a `mirrorOf central` → localhost caching mirror works.
+3. Hosted: a pre-existing `.mvn/maven.config` with a user `summaryFile.basedir` / `checksumAlgorithms=SHA-512` / `failIfMissing=true`, plus a rollback round trip with a user `checksums.sha256`, end to end (`maven_trusted_checksums_left`).
+4. Other Maven 4.1.0 model features vs the reactor planner: CI-friendly `${revision}` parents, a parent with only `<relativePath>`, implicit `<subprojects>`.
+5. The #459 reverse case and BOM bump on 3.6.3 / 3.8.8 / 4.0.0-rc-7.
 6. Windows long paths + CRLF checkout of `.socket/vendor/maven2` (the `* -text` `.gitattributes`).
 7. The reactor capstone variants from run 4 on 4.0.0-rc-7 (comma / `%2F` paths, existing CRLF `maven.config`).
 
@@ -79,3 +82,4 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 - v5 `vendor` has no local artifact building: without a patch service it fails `vendor_service_offline_conflict`. Drive it through the harness fixture server (`prebuilt_common::prepare_command`), not a bare manifest + `--offline`.
 - #459 reverse case (top-level version ≠ base, active profile = base): unpatched but warned, and VEX refuses (`vendor_unwired`). Recorded on #459, not re-filed.
 - Single-POM vendored + a BOM managing a different version: no downgrade (repository only). VEX lists the unused base version `not_affected`, which is the #265 family. Not filed.
+- Hosted single-POM with a versionless dep + a BOM managing another version: the hosted dM insertion overrides the BOM (a downgrade), which #265 already names. Don't re-file.
