@@ -445,7 +445,9 @@ pub fn run_scenario(
 
     for _ in 0..opts.warmup {
         for b in bins {
-            let r = results.get_mut(&b.label).unwrap();
+            let r = results
+                .get_mut(&b.label)
+                .expect("results is keyed by every label in bins");
             if r.invalid.is_some() {
                 continue;
             }
@@ -463,7 +465,9 @@ pub fn run_scenario(
             bins.iter().rev().collect()
         };
         for b in order {
-            let r = results.get_mut(&b.label).unwrap();
+            let r = results
+                .get_mut(&b.label)
+                .expect("results is keyed by every label in bins");
             if r.invalid.is_some() {
                 continue;
             }

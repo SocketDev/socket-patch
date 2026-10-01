@@ -353,7 +353,10 @@ fn main_inner() -> Result<i32, String> {
                     )?;
                     opts.runs = common.runs;
                     for (label, extra) in more.binaries {
-                        let entry = r.binaries.get_mut(&label).unwrap();
+                        let entry = r
+                            .binaries
+                            .get_mut(&label)
+                            .expect("both rounds run the same binaries");
                         if entry.invalid.is_none() {
                             entry.invalid = extra.invalid;
                         }

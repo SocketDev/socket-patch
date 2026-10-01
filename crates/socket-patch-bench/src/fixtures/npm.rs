@@ -465,7 +465,7 @@ pub fn build_pnpm(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
             let Some(dep) = g.resolve(p, d, v) else {
                 continue;
             };
-            let up = "../".repeat(1 + p.name.matches('/').count() + d.matches('/').count());
+            let up = "../".repeat(1 + d.matches('/').count());
             let target = format!("{up}../{}/node_modules/{d}", dep.store_key());
             t.symlink(&target, &format!("{entry}/{d}"))?;
         }
@@ -753,7 +753,7 @@ pub fn build_vlt(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
             let Some(dep) = g.resolve(p, d, v) else {
                 continue;
             };
-            let up = "../".repeat(1 + p.name.matches('/').count() + d.matches('/').count());
+            let up = "../".repeat(1 + d.matches('/').count());
             t.symlink(
                 &format!("{up}../{}/node_modules/{d}", vlt_id(dep)),
                 &format!("{entry}/{d}"),
