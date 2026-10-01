@@ -84,9 +84,9 @@ fn defaults_match_contract() {
     assert!(!a.common.verbose);
     assert_eq!(a.common.download_mode, "diff");
 
-    // The remaining global defaults from the contract table. These were
-    // previously unpinned, which let a dangerous default-value drift slip
-    // through silently — e.g. `--yes` defaulting to `true` would make
+    // The remaining global defaults from the contract table, pinned so a
+    // dangerous default-value drift cannot slip through silently — e.g.
+    // `--yes` defaulting to `true` would make
     // `apply` auto-approve every prompt. The API/proxy URLs parse to `None`
     // (no clap default) — the documented production URLs are applied by
     // `get_api_client_with_overrides` after env + socket-cli config fallback.
@@ -116,8 +116,9 @@ fn defaults_match_contract() {
     assert_only_true(&a, &[]);
 }
 
-/// `--check` (cargo redirect audit mode) must parse and flip the flag true.
-/// It uses a `BoolishValueParser`, so the bare flag form is the canonical use.
+/// `--check` (read-only Go replace-redirect audit mode) must parse and flip
+/// the flag true. It uses `parse_bool_flag`, so the bare flag form is the
+/// canonical use.
 #[test]
 fn check_long() {
     let a = parse_apply(&["--check"]);
@@ -492,7 +493,7 @@ fn ecosystems_single_value() {
 }
 
 // ---------------------------------------------------------------------------
-// --download-mode — accepted token values are documented contract.
+// --download-mode — the parse layer passes tokens through verbatim.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -537,7 +538,8 @@ fn download_mode_values_are_not_normalized() {
             .download_mode,
         "DIFF"
     );
-    // The three valid tokens are distinct and round-trip exactly.
+    // diff/file are the valid runtime tokens; `package` (removed) is still
+    // passed through verbatim by the parse layer.
     for token in ["diff", "package", "file"] {
         let got = parse_apply(&["--download-mode", token])
             .common
@@ -550,10 +552,11 @@ fn download_mode_values_are_not_normalized() {
 }
 
 /// CONTRACT GAP (documented, not a hardening of a passing behavior): the
-/// contract types `--download-mode` as `enum: diff | package | file`, but the
-/// arg is a plain `String` with no `value_parser`, so clap accepts ANY value
-/// at parse time. Invalid values are only rejected later by
-/// `DownloadMode::parse` at runtime (see `commands/apply.rs`). This test pins
+/// accepted runtime values are `diff | file` (`blob` is an alias; `package`
+/// is rejected as removed), but the arg is a plain `String` with no
+/// `value_parser`, so clap accepts ANY value at parse time. Invalid values are
+/// only rejected later by `DownloadMode::parse` (socket-patch-core
+/// `api/blob_fetcher.rs`, called from `commands/fetch_stage.rs`). This test pins
 /// the *current* parse-layer behavior so a future move to a real
 /// `value_parser`/enum (which WOULD reject here) is a deliberate, visible
 /// change rather than a silent one. If the enum is enforced at parse, flip the

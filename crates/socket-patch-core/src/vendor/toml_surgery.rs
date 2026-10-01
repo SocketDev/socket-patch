@@ -1,6 +1,6 @@
 //! Pure text-surgery helpers for lockfile-shaped TOML.
 //!
-//! The pypi/uv, poetry, and pdm backends edit locks by TARGETED text
+//! The pypi/uv and poetry backends edit locks by TARGETED text
 //! surgery rather than a TOML re-serialize: the spike
 //! proved a surgical edit reproduces the lock generator's own serializer
 //! output byte-identically, which keeps `--check`-style validations green
@@ -77,9 +77,8 @@ pub(super) fn package_unit_lines(unit_text: &str) -> Vec<&str> {
 
 /// Rewrite the unit's `files = [...]` array (single- or multi-line) to the
 /// single patched-wheel `{file, hash}` element, preserving every other line
-/// verbatim — the splice shape shared by the poetry and pdm locks. `None`
-/// when the unit has no files array (the callers fail closed rather than
-/// guess a placement).
+/// verbatim — the splice shape of the poetry lock. `None` when the unit has
+/// no files array (the caller fails closed rather than guess a placement).
 pub(super) fn replace_files_array(
     unit: &[&str],
     wheel_file_name: &str,
@@ -485,8 +484,8 @@ mod tests {
         assert_eq!(remove_table_if_empty(keep_blanks, "[tool.uv]"), keep_blanks);
         // A section holding ONLY blank lines is empty too — the headline
         // documented case. The splice consumes the section's trailing blanks
-        // up to the next header, so the blank separator that used to sit
-        // before [next] does not survive (pinning current behavior).
+        // up to the next header, so the blank separator before [next] does
+        // not survive (pinning current behavior).
         assert_eq!(
             remove_table_if_empty("x = 1\n\n[tool.uv]\n\n\n[next]\na = 1\n", "[tool.uv]"),
             "x = 1\n[next]\na = 1\n"
@@ -504,11 +503,9 @@ mod tests {
     #[test]
     fn removal_helpers_preserve_foreign_line_endings() {
         // pyproject.toml is user-authored: git autocrlf on Windows makes it
-        // CRLF. The uv wire now renders its inserts in the file's own
-        // convention, but an older wire (or a hand edit) can still leave a
-        // mixed-ending file, so the removal helpers must never normalize:
-        // every byte outside the removed segment survives verbatim (the
-        // go_mod/go_sum CRLF-churn class).
+        // CRLF, and a hand edit can leave a mixed-ending file, so the
+        // removal helpers must never normalize: every byte outside the
+        // removed segment survives verbatim.
         let wired = "[project]\r\nname = \"x\"\r\n\n[tool.uv.sources]\nfoo = { path = \"w.whl\" }\n";
         let after = remove_exact_line(wired, "foo = { path = \"w.whl\" }").unwrap();
         assert_eq!(after, "[project]\r\nname = \"x\"\r\n\n[tool.uv.sources]\n");

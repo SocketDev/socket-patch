@@ -5,7 +5,7 @@
 //!
 //! 1. `pipenv install six==1.16.0` from PyPI (in-project venv) — the native
 //!    Pipfile.lock that release writes;
-//! 2. `socket-patch scan --redirect --vex` (hosted, on the lock-only
+//! 2. `socket-patch scan --mode hosted --vex` (hosted, on the lock-only
 //!    checkout: the CI shape) / `scan --vendor --vendor-source build --vex`
 //!    (vendored, from the pristine install) against a wiremock Socket API
 //!    that also serves the patched wheel — the same-run document attests;
@@ -17,7 +17,7 @@
 //! 4. the manifest-less VEX matrix (`vex_pipenv_pip_real`): manifest
 //!    deleted, ledgers deleted, `--offline` (zero requests), lock reverted
 //!    to the registry (also `--no-verify`), `apply --vex`; plus the
-//!    embedded `scan --redirect --vex` / `scan --vendor --vex` re-run on the
+//!    embedded `scan --mode hosted --vex` / `scan --vendor --vex` re-run on the
 //!    manifest-less checkout.
 //!
 //! Versions: `SOCKET_PATCH_PIPENV_E2E_VERSIONS` (space / comma separated),

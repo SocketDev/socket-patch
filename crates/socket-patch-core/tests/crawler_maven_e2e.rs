@@ -103,7 +103,7 @@ fn parse_pom_empty_string_returns_none() {
 
 /// Parent block supplies groupId when the project block doesn't —
 /// exercise the `in_parent` arm that records `parent_group_id` and the
-/// final `group_id.or(parent_group_id)` fallback (maven_crawler.rs:124).
+/// final `group_id.or(parent_group_id)` fallback.
 #[test]
 #[serial_test::parallel]
 fn parse_pom_parent_groupid_fallback() {
@@ -130,7 +130,7 @@ fn parse_pom_parent_groupid_fallback() {
 
 /// Top-level `<groupId>${env.GROUP_ID}</groupId>` is a property
 /// reference — the parser must bail out instead of treating the
-/// literal placeholder as a value (line 100).
+/// literal placeholder as a value.
 #[test]
 #[serial_test::parallel]
 fn parse_pom_property_reference_groupid_returns_none() {
@@ -167,9 +167,7 @@ fn parse_pom_property_reference_version_returns_none() {
     assert_eq!(parse_pom_group_artifact_version(pom), None);
 }
 
-/// `<parent><groupId>${prop}</groupId></parent>` is a parent property
-/// reference — must NOT be accepted as a fallback groupId (line 86-87
-/// skip arm).
+/// A pom with no `<artifactId>` yields no coordinate.
 #[test]
 #[serial_test::parallel]
 fn parse_pom_missing_artifact_id_returns_none() {
@@ -182,9 +180,9 @@ fn parse_pom_missing_artifact_id_returns_none() {
 }
 
 /// An XML element rendered across two lines (open on one, close on
-/// another) — `extract_xml_value` returns None for both, the parser
-/// can't extract a value, and the function returns None. Drives
-/// `extract_xml_value` line 16 (close-tag not found on same line).
+/// another) — the per-line matcher (`xml_value_needles`) finds no
+/// closing tag on the same line, the parser can't extract a value, and
+/// the function returns None.
 #[test]
 #[serial_test::parallel]
 fn parse_pom_split_tag_returns_none() {
@@ -211,7 +209,7 @@ fn maven_crawler_default_and_new_construct_cleanly() {
 /// `m2_repo_path` falls through to `$HOME/.m2/repository` when neither
 /// MAVEN_REPO_LOCAL nor M2_HOME is set. We can't exercise this directly
 /// (private fn) but can drive it via `get_maven_repo_paths` with a
-/// build.gradle marker and both env vars cleared. The crawler should
+/// pom.xml marker and both env vars cleared. The crawler should
 /// then point at the staged `<HOME>/.m2/repository`.
 #[tokio::test]
 #[serial]
@@ -258,7 +256,7 @@ async fn get_maven_repo_paths_home_dot_m2_fallback() {
 }
 
 /// `get_maven_repo_paths(global=true)` with a real m2 layout under
-/// MAVEN_REPO_LOCAL returns just that repo (lines 205-208).
+/// MAVEN_REPO_LOCAL returns just that repo.
 #[tokio::test]
 #[serial]
 async fn get_maven_repo_paths_global_mode_with_maven_repo_local() {
@@ -288,7 +286,7 @@ async fn get_maven_repo_paths_global_mode_with_maven_repo_local() {
 
 /// `get_maven_repo_paths(global=true)` with no env vars set and no
 /// HOME/.m2 either — `is_dir` check fails and the crawler returns
-/// empty (line 209).
+/// empty.
 #[tokio::test]
 #[serial]
 async fn get_maven_repo_paths_global_mode_no_m2_returns_empty() {
@@ -355,6 +353,8 @@ async fn find_by_purls_version_dir_without_pom_returns_empty() {
     assert!(result.is_empty(), "missing .pom must skip the package");
 }
 
+/// `<parent><groupId>${prop}</groupId></parent>` is a parent property
+/// reference — must NOT be accepted as a fallback groupId.
 #[test]
 #[serial_test::parallel]
 fn parse_pom_parent_property_reference_groupid_skipped() {

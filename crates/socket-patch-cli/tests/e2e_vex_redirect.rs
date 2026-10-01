@@ -1,6 +1,6 @@
 //! End-to-end tests for redirect-patch awareness in `socket-patch vex`.
 //!
-//! `socket-patch scan --redirect` rewrites lockfiles so a patched dependency
+//! `socket-patch scan --mode hosted` rewrites lockfiles so a patched dependency
 //! resolves from Socket's HOSTED vendored patch, and records the patch (file
 //! hashes + vulnerabilities) in `.socket/vendor/redirect-state.json`. After the
 //! package manager installs, the patched bytes land in the installed tree, so
@@ -9,13 +9,13 @@
 //!
 //!   1. redirected PURL attested against the installed tree, `(redirected)`
 //!      marker (the post-install verified path)
-//!   2. property-7 exemption: a redirected patch bypasses the configured/manual
-//!      ecosystem filter (the lockfile rewrite is the persistence), while a
-//!      plain unconfigured control is dropped
+//!   2. a redirected patch and a plain agent-mode control both attest with
+//!      no manifest `setup` section; only the redirected one is marked
+//!      `(redirected)`
 //!   3. tampered installed file → omitted with skip reason `hash_mismatch`
 //!      (fail-closed)
 //!   4. `--no-verify` attests from the ledger records with NO installed tree
-//!      (the same shape as the in-run `scan --redirect --vex` attestation) —
+//!      (the same shape as the in-run `scan --mode hosted --vex` attestation) —
 //!      but only while the lockfile still wires the hosted patch: a stale
 //!      ledger is `redirect_unwired` even under `--no-verify`
 //!   5. every ecosystem attests through the ledger with its real hosted
@@ -25,7 +25,7 @@
 //!      evidence until install, an installed tree that does not verify wins,
 //!      foreign hosts and pin-less entries are refused
 //!
-//! Every ledger fixture carries the lockfile wiring `scan --redirect` wrote
+//! Every ledger fixture carries the lockfile wiring `scan --mode hosted` wrote
 //! next to it: `vex` only attests a redirect-ledger record while some
 //! lockfile still resolves the dependency from its hosted patch (a reverted
 //! lockfile with the ledger left behind must not keep attesting).
@@ -141,7 +141,7 @@ fn make_record(uuid: &str, after_hash: &str, vuln_id: &str, cves: &[&str]) -> Pa
 }
 
 /// Write a `.socket/vendor/redirect-state.json` ledger embedding `record` for
-/// `purl` (the shape `scan --redirect` persists for VEX).
+/// `purl` (the shape `scan --mode hosted` persists for VEX).
 fn write_redirect_state(cwd: &Path, purl: &str, record: PatchRecord) {
     let mut state = RedirectState::new();
     state.records.insert(purl.to_string(), record);
@@ -230,15 +230,15 @@ fn redirected_purl_attested_against_installed_tree() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// 2. property-7 exemption — a redirected patch bypasses the filter
+// 2. redirected + agent-mode patches attest together
 // ──────────────────────────────────────────────────────────────────────
 
 #[test]
-fn redirected_purl_bypasses_property7_filter() {
+fn redirected_and_agent_patches_attest_without_setup_config() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
 
-    // Redirected npm patch: verifies + bypasses property 7.
+    // Redirected npm patch: verifies from the redirect state.
     let patched = b"redirected patched index\n";
     let after = compute_git_sha256_from_bytes(patched);
     let purl = scaffold_npm(cwd, "left-pad", "1.3.0", patched);
@@ -249,9 +249,8 @@ fn redirected_purl_bypasses_property7_filter() {
     );
     write_hosted_package_lock(cwd, &[("left-pad", "1.3.0", UUID)], true);
 
-    // Control: a plain manifest npm patch that VERIFIES against node_modules
-    // but is neither redirected nor set up / manual — property 7 must drop it,
-    // proving the filter ran while the redirected patch sailed through.
+    // Control: a plain manifest (agent-mode) npm patch that VERIFIES against
+    // node_modules, with no install hook — it attests too, unmarked.
     let ctrl_patched = b"control patched index\n";
     let ctrl_after = compute_git_sha256_from_bytes(ctrl_patched);
     let ctrl_pkg = cwd.join("node_modules/control-pkg");
@@ -273,7 +272,6 @@ fn redirected_purl_bypasses_property7_filter() {
             &["CVE-2024-3"],
         ),
     );
-    // NO setup section: nothing configured, nothing manual.
     let dir = cwd.join(".socket");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -288,23 +286,29 @@ fn redirected_purl_bypasses_property7_filter() {
         .expect("invoke vex");
     assert!(
         out.status.success(),
-        "the redirected patch must be attested without setup/manual. stderr:\n{}",
+        "both patches must attest. stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 
     let stdout = String::from_utf8(out.stdout).unwrap();
     let doc: Value = serde_json::from_str(&stdout).unwrap();
     let stmts = doc["statements"].as_array().unwrap();
-    assert_eq!(
-        stmts.len(),
-        1,
-        "only the redirected patch bypasses property 7; the unconfigured npm \
-         control must be dropped. doc:\n{stdout}"
-    );
-    assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-rdir-keep");
+    assert_eq!(stmts.len(), 2, "both patches attest. doc:\n{stdout}");
+    let impact = |vuln: &str| -> String {
+        let hit: Vec<&Value> = stmts
+            .iter()
+            .filter(|s| s["vulnerability"]["name"] == vuln)
+            .collect();
+        assert_eq!(hit.len(), 1, "one statement for {vuln}:\n{stdout}");
+        hit[0]["impact_statement"].as_str().unwrap().to_string()
+    };
     assert!(
-        !stdout.contains("GHSA-npm-control"),
-        "the non-redirected, non-configured control must be filtered:\n{stdout}"
+        impact("GHSA-rdir-keep").contains("(redirected)"),
+        "the redirected patch carries its marker:\n{stdout}"
+    );
+    assert!(
+        !impact("GHSA-npm-control").contains("(redirected)"),
+        "the agent-mode control is not redirected:\n{stdout}"
     );
 }
 
@@ -373,7 +377,7 @@ fn tampered_installed_file_omits_redirected_patch() {
 
 // ──────────────────────────────────────────────────────────────────────
 // 4. --no-verify attests from the ledger with NO installed tree — the same
-// shape as the in-run `scan --redirect --vex` attestation (bytes are remote,
+// shape as the in-run `scan --mode hosted --vex` attestation (bytes are remote,
 // fetched at install time, so there is nothing to hash yet).
 // ──────────────────────────────────────────────────────────────────────
 
@@ -384,9 +388,8 @@ fn redirected_no_verify_attests_without_installed_tree() {
     let purl = "pkg:npm/left-pad@1.3.0";
 
     // No node_modules, no manifest — the redirect ledger is the only record
-    // source. DELIBERATE CHANGE: the ledger alone no longer attests; the
-    // lockfile must still wire the hosted patch (see the gated twin below),
-    // so the fixture carries the rewrite `scan --redirect` recorded.
+    // source. The ledger alone does not attest; the lockfile must still wire the hosted patch (see the gated twin below),
+    // so the fixture carries the rewrite `scan --mode hosted` recorded.
     write_redirect_state(
         cwd,
         purl,
@@ -634,10 +637,9 @@ fn no_verify_attests_redirected_patches_across_ecosystems() {
         ),
     ];
 
-    // The ledger records both halves `scan --redirect` persists: the
+    // The ledger records both halves `scan --mode hosted` persists: the
     // records AND the file edits (whose files still carry each patch's
-    // hosted wiring — the liveness proof for formats lockfile discovery
-    // does not read yet).
+    // hosted wiring — the liveness proof the ledger record needs).
     let mut state = RedirectState::new();
     for (purl, ghsa, eco, uuid) in cases {
         state.records.insert(
@@ -706,11 +708,10 @@ fn no_verify_attests_redirected_patches_across_ecosystems() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// 4b. DELIBERATE CHANGE — the redirect ledger alone no longer attests.
+// 4b. The redirect ledger alone does not attest.
 // A record whose hosted wiring the lockfile no longer carries (no lockfile,
 // or one reverted to the registry) is `redirect_unwired`, INCLUDING under
 // `--no-verify`: the gate is about what the build consumes, not hashing.
-// Before, both shapes attested `(redirected)` — a false `not_affected`.
 // ──────────────────────────────────────────────────────────────────────
 
 /// `vex --json --output` in `cwd` (hermetic: no ambient token or socket-cli
@@ -851,7 +852,7 @@ fn lockfile_hosted_ref_attests_without_manifest_or_ledger() {
     assert_eq!(skipped_reason(&env, purl), "record_unavailable");
 
     // Online: the record is fetched, and the PINNED hosted wiring attests
-    // until install (the in-run `scan --redirect --vex` evidence).
+    // until install (the in-run `scan --mode hosted --vex` evidence).
     let (_rt, server) = serve_patch_views(vec![(UUID.to_string(), left_pad_view(&"b".repeat(64)))]);
     let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
     assert_eq!(code, Some(0), "{env}");
@@ -1277,10 +1278,10 @@ fn hosted_takeover_of_a_vendored_package_attests_the_hosted_patch() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// 8. REGRESSION (core discover rule 11): a redirect ledger record whose
-// patch the lockfiles still MENTION, but only in a shape the package
-// manager does not consume, is dead — the ledger fallback no longer
-// re-derives "live" from the raw text the extractor already rejected.
+// 8. Core discover rule 11: a redirect ledger record whose patch the
+// lockfiles still MENTION, but only in a shape the package manager does not
+// consume, is dead — the ledger fallback never re-derives "live" from the
+// raw text the extractor already rejected.
 // ──────────────────────────────────────────────────────────────────────
 
 /// A committed hosted-rewriter golden (`crates/socket-patch-core/tests/
@@ -1495,15 +1496,15 @@ fn rejected_hosted_wiring_never_keeps_a_redirect_ledger_alive() {
     }
 }
 
-/// REGRESSION (false attestation): the ledger's hosted wiring lives in one
+/// No false attestation: the ledger's hosted wiring lives in one
 /// lock while a SIBLING lock resolves the same version from the registry —
 /// a stale `yarn.lock` beside the hosted `package-lock.json`, a registry
 /// `uv.lock` (what `uv sync --frozen` installs) beside a hosted
 /// `requirements.txt`, a registry `vlt-lock.json` beside a hosted
 /// `package-lock.json`. Which one the build installs from depends on the
 /// package manager that runs, so the record is not attested
-/// (`redirect_unwired`, with a note naming the contesting lock) where it
-/// used to be `not_affected (redirected)`. Without the stale lock it attests.
+/// (`redirect_unwired`, with a note naming the contesting lock). Without the
+/// stale lock it attests.
 #[test]
 fn a_sibling_lock_resolving_the_registry_contests_a_ledger_record() {
     const U: &str = "5e1f0a3c-2b4d-4c6e-8f10-123456789abc";

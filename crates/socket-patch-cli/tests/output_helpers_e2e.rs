@@ -1,6 +1,6 @@
 //! Integration coverage for the `socket_patch_cli::ui` color helpers.
 //! The pub `severity` and `paint` functions are widely used
-//! by `commands/scan.rs` + `commands/list.rs` for human-mode display,
+//! by `commands/scan/` (render.rs + mod.rs) + `commands/list.rs` for human-mode display,
 //! but the integration test suite runs all its scan/list tests in
 //! `--json` mode (which suppresses the colour wrappers entirely), so
 //! every ANSI branch was uncovered. These tests drive each branch

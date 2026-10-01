@@ -50,13 +50,13 @@ use super::{
     DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::constants::npm_family::{NPM_LOCKS, PNPM_LOCK, PNPM_SHRINKWRAP_LEGACY};
-use crate::patch::redirect::pnpm::{entry_field, is_pnpm_lock_text};
-use crate::utils::digest::is_sri_pin;
-use crate::vendor::lock_inventory::pnpm::{
-    classify_pnpm_key, pnpm_packages, rush_lock_rels, PnpmKey, PnpmPackage,
+use crate::formats::pnpm::{
+    classify_pnpm_key, entry_field, pnpm_registry_key, PnpmKey, PnpmLock, PnpmPackage,
 };
+use crate::utils::digest::is_sri_pin;
+use crate::vendor::lock_inventory::pnpm::rush_lock_rels;
 use crate::vendor::lock_inventory::{
-    npm_lock_bundled_nodes, npm_lock_nodes, pnpm_registry_key, LockIntegrity, NpmLockNode,
+    npm_lock_bundled_nodes, npm_lock_nodes, LockIntegrity, NpmLockNode,
 };
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
@@ -309,14 +309,14 @@ fn entry_ref(
 /// `pnpm-workspace.yaml`) is configuration that routes nothing once no
 /// dependency in the graph matches it (rule 10: pins, not definitions). The
 /// entries come from the entry model the lock inventory shares
-/// ([`pnpm_packages`]), which reads the hosted rewriter's own block grammar
+/// ([`PnpmLock::packages`]), which reads the hosted rewriter's own block grammar
 /// (two-space keys, a flat flow or block `resolution:` map), so every shape
 /// it writes is read back identically, CRLF included; keys are classified
 /// by [`classify_pnpm_key`]. An entry is a ref when its `resolution`
 /// `tarball:` is
 ///
 /// * a Socket-HOSTED url ([`DiscoverCtx::hosted_uuid`]) →
-///   [`WiringMode::Hosted`]. The hosted rewriter (`rewrite_pnpm_lock`) keeps
+///   [`WiringMode::Hosted`]. The hosted rewriter (`formats::pnpm::plan_hosted`) keeps
 ///   the registry KEY and replaces only the resolution with `{integrity:
 ///   sha512-…, tarball: <url>}` (or the block-map spelling in pnpm <= 5
 ///   locks), so name@version come from the key in each generation's grammar
@@ -368,7 +368,8 @@ async fn extract_pnpm_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discover
     let Some(text) = ctx.read_text(file, out).await else {
         return;
     };
-    if !is_pnpm_lock_text(&text) {
+    let lock = PnpmLock::parse(&text);
+    if !lock.is_pnpm_lock() {
         out.diag(
             DIAG_LOCKFILE_UNPARSEABLE,
             file,
@@ -376,8 +377,8 @@ async fn extract_pnpm_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discover
         );
         return;
     }
-    for package in pnpm_packages(&text) {
-        pnpm_entry_ref(ctx, file, &package, out);
+    for package in lock.packages() {
+        pnpm_entry_ref(ctx, file, package, out);
     }
 }
 
@@ -1217,7 +1218,6 @@ mod tests {
             token: TOKEN.into(),
             patch_uuid: uuid.into(),
             artifact_url: url,
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha512: Some(PNPM_SRI.into()),

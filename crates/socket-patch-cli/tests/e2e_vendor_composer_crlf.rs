@@ -8,6 +8,9 @@
 //! the pre-vendor bytes exactly. Each test runs the built binary; the
 //! discovery/view routes are a wiremock API, so no composer and no network.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -143,22 +146,24 @@ async fn mount_api(server: &MockServer) {
         })))
         .mount(server)
         .await;
+    let view = json!({
+        "uuid": UUID,
+        "purl": PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            format!("package/{FILE}"): {
+                "beforeHash": compute_git_sha256_from_bytes(ORIGINAL),
+                "afterHash": compute_git_sha256_from_bytes(PATCHED),
+                "blobContent": blob,
+            }
+        },
+        "vulnerabilities": vulnerabilities(),
+        "description": "x", "license": "MIT", "tier": "free"
+    });
+    prebuilt_common::mount_view(server, &view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "uuid": UUID,
-            "purl": PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                format!("package/{FILE}"): {
-                    "beforeHash": compute_git_sha256_from_bytes(ORIGINAL),
-                    "afterHash": compute_git_sha256_from_bytes(PATCHED),
-                    "blobContent": blob,
-                }
-            },
-            "vulnerabilities": vulnerabilities(),
-            "description": "x", "license": "MIT", "tier": "free"
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
         .mount(server)
         .await;
 }
@@ -176,8 +181,9 @@ fn cli() -> Command {
 }
 
 fn run_json(root: &Path, args: &[&str]) -> (i32, Value) {
-    let out = cli()
-        .args(args)
+    let mut command = cli();
+    let _fixture = prebuilt_common::prepare_command(&mut command, root, args, &[]);
+    let out = command
         .args(["--json", "--cwd", root.to_str().unwrap()])
         .output()
         .expect("run socket-patch");
@@ -299,7 +305,7 @@ async fn scan_vendor_keeps_a_crlf_lock_and_reverts_it_byte_identically() {
     let root = tmp.path();
     write_project(root);
     let uri = server.uri();
-    let mut args = vec!["scan", "--vendor", "--vendor-source", "build"];
+    let mut args = vec!["scan", "--vendor", "--vendor-source", "service"];
     args.extend(api_args(&uri));
 
     let (code, env) = run_json(root, &args);
@@ -323,7 +329,7 @@ async fn get_vendored_keeps_a_crlf_lock_and_reverts_it_byte_identically() {
         "--mode",
         "vendored",
         "--vendor-source",
-        "build",
+        "service",
     ];
     args.extend(api_args(&uri));
 

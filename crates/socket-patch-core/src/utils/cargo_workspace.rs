@@ -37,7 +37,10 @@ pub fn member_manifests(root: &Path) -> Vec<String> {
 /// under it; symbolic links are never directories).
 pub fn member_manifests_in(view: &ProjectView<'_>) -> Vec<String> {
     match view {
-        ProjectView::Disk(root) => member_manifests(root),
+        ProjectView::Disk(root)
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot { root, .. }) => {
+            member_manifests(root)
+        }
         ProjectView::Memory(project) => member_manifests_with(&MemoryTree(project)),
     }
 }

@@ -3,9 +3,9 @@
 //!
 //! `scan --mode hosted` rewrites `bun.lock` so the patched dependency's
 //! `packages` entry moves from the registry 4-tuple to the URL 3-tuple
-//! `["<name>@<hosted-url>", {deps}, "sha512-<patched>"]`, and records the
-//! patch in the redirect ledger. This test proves every link against REAL
-//! `bun`:
+//! `["<name>@<hosted-url>", {deps}, "sha512-<patched>"]` — and writes
+//! nothing else (v5: no redirect ledger; the lock IS the hosted state).
+//! This test proves every link against REAL `bun`:
 //!
 //!   1. `bun install` of left-pad@1.3.0 (network for fixture setup only,
 //!      private `BUN_INSTALL_CACHE_DIR`). The text `bun.lock` is the default
@@ -24,8 +24,8 @@
 //!      bootstrap is needed).
 //!   3. `scan --mode hosted --json --vex` (the real binary): bun.lock now
 //!      pins the hosted URL + the patched sha512 and keeps its own
-//!      lockfileVersion line, the ledger embeds the record, the in-run VEX
-//!      is the `(redirected)` attestation.
+//!      lockfileVersion line, no ledger is written, the in-run VEX is the
+//!      `(redirected)` attestation (from this run's fetched record).
 //!   4. FRESH-CHECKOUT PROOF: only package.json + bun.lock + .socket/ travel;
 //!      `bun install --frozen-lockfile` with a fresh `BUN_INSTALL_CACHE_DIR`
 //!      MUST install the patched bytes from the hosted tarball. Then the
@@ -36,8 +36,10 @@
 //!      is the matrix twin) — and land the marker bytes again.
 //!
 //! The rollback leg continues from step 4: `rollback --yes` must restore
-//! bun.lock byte-for-byte to the pre-redirect snapshot, delete the redirect
-//! ledger, and a fresh frozen install of the restored lock must produce the
+//! bun.lock byte-for-byte to the pre-redirect snapshot — v5 re-resolves the
+//! upstream registry 4-tuple (a wiremock mirror of the pristine integrity,
+//! `SOCKET_NPM_REGISTRY`, with the mock origin named the patch server) —
+//! and a fresh frozen install of the restored lock must produce the
 //! ORIGINAL registry bytes (marker gone).
 //!
 //! The negative twin serves TAMPERED tarball bytes (a different, valid
@@ -48,7 +50,7 @@
 //! is pinned from both sides as [`TARBALL_INTEGRITY_ENFORCED_FROM`]. The
 //! vendored twin lives in `e2e_vendor_bun_build.rs`.
 //!
-//! The get-driven twin (v3.6) runs step 3 as `get <uuid> --mode hosted`
+//! The get-driven twin (v4.0) runs step 3 as `get <uuid> --mode hosted`
 //! instead of `scan --mode hosted` — same hosted engine by construction
 //! (get routes through scan's `run_redirect_selected`), so the lock/ledger
 //! assertions and the fresh-checkout proof are shared via [`HostedDriver`].
@@ -293,9 +295,17 @@ fn bun(cwd: &Path, args: &[&str], cache_dir: &Path) -> Output {
 /// The real binary with `--no-telemetry` appended: nothing in this suite
 /// should ever post a telemetry event, mocked API or not.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
+    run_socket_env(cwd, args, &[])
+}
+
+/// [`run_socket`] with extra env applied after the scrub.
+fn run_socket_env(cwd: &Path, args: &[&str], env: &[(String, String)]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
     cmd.args(args).arg("--no-telemetry").current_dir(cwd);
     cache_env::scrub_ambient_bun_env(&mut cmd);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -549,7 +559,7 @@ enum HostedDriver {
     /// `scan --mode hosted --vex …` — the original capstone path, in-run
     /// VEX assertions included.
     ScanVex,
-    /// `get <uuid> --mode hosted` — the v3.6 per-advisory selector. The
+    /// `get <uuid> --mode hosted` — the v4.0 per-advisory selector. The
     /// UUID identifier path is exempt from installed narrowing, so the
     /// fixture's view + reference mocks are all it needs. No manifest, no
     /// blobs, no vex flags (get has none).
@@ -900,7 +910,7 @@ async fn bun_hosted_project(
             assert_eq!(env["vex"]["format"], "openvex-0.2.0", "vex block: {env}");
             assert_eq!(
                 env["vex"]["verified"], false,
-                "in-run redirect VEX is attested from the ledger, not hash-verified: {env}"
+                "in-run redirect VEX is attested from the fetched record, not hash-verified: {env}"
             );
             let vex_doc: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(proj.join("out.vex.json")).unwrap()).unwrap();
@@ -927,7 +937,7 @@ async fn bun_hosted_project(
         }
         HostedDriver::GetUuid => {
             // get's envelope nests the same redirect block into its own base
-            // shape; nothing is downloaded into `.socket/` (the ledger IS the
+            // shape; nothing is downloaded into `.socket/` (the lock IS the
             // persistence — parity with `scan --mode hosted`).
             assert_eq!(env["redirect"]["mode"], "hosted", "envelope: {env}");
             assert_eq!(env["found"], 1, "get keeps its found count: {env}");
@@ -990,10 +1000,9 @@ async fn bun_hosted_project(
         );
     }
 
-    let ledger = std::fs::read_to_string(redirect_ledger(&proj)).unwrap();
     assert!(
-        ledger.contains("\"records\"") && ledger.contains(GHSA),
-        "redirect ledger must embed the patch record + vulnerability: {ledger}"
+        !redirect_ledger(&proj).exists(),
+        "v5 hosted mode writes no redirect ledger — the lock is the hosted state"
     );
 
     Some(BunRedirectFixture {
@@ -1015,6 +1024,42 @@ fn redirect_ledger(proj: &Path) -> PathBuf {
     proj.join(".socket")
         .join("vendor")
         .join("redirect-state.json")
+}
+
+/// The env an unwind of the fixture's hosted pin runs with: the mock origin
+/// named the patch server (so its URL counts as a hosted pin) and an npm
+/// registry mirror serving `left-pad@1.3.0`'s version document with the
+/// integrity the PRISTINE lock recorded — all the v5 upstream restore of a
+/// bun.lock entry reads.
+async fn unwind_env(fx: &BunRedirectFixture) -> Vec<(String, String)> {
+    let server = &fx._server;
+    let lock_before = String::from_utf8(fx.lock_before.clone()).unwrap();
+    let line = packages_line(&lock_before, DEP);
+    let integrity = line
+        .rsplit('"')
+        .nth(1)
+        .filter(|s| s.starts_with("sha512-"))
+        .unwrap_or_else(|| panic!("no integrity in the pristine line {line}"))
+        .to_string();
+    Mock::given(method("GET"))
+        .and(path(format!("/registry/{DEP}/{DEP_VERSION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": DEP,
+            "version": DEP_VERSION,
+            "dist": {
+                "tarball": format!("https://registry.npmjs.org/{DEP}/-/{DEP}-{DEP_VERSION}.tgz"),
+                "integrity": integrity
+            }
+        })))
+        .mount(server)
+        .await;
+    vec![
+        ("SOCKET_PATCH_SERVER_URL".to_string(), server.uri()),
+        (
+            "SOCKET_NPM_REGISTRY".to_string(),
+            format!("{}/registry", server.uri()),
+        ),
+    ]
 }
 
 /// Fresh dir `<tmp>/<name>` with only the committable files (package.json,
@@ -1203,7 +1248,7 @@ async fn bun_redirect_fresh_checkout_installs_patched_bytes() {
     assert_patched_fresh_install(&fx);
 }
 
-/// get-driven twin (v3.6): `get <uuid> --mode hosted` must land the SAME
+/// get-driven twin (v4.0): `get <uuid> --mode hosted` must land the SAME
 /// hosted rewrite as the scan capstone — same engine by construction — and a
 /// fresh checkout carrying only package.json + bun.lock + .socket/ must
 /// install the patched bytes from the hosted tarball. The fixture's GetUuid
@@ -1380,10 +1425,10 @@ async fn bun_redirect_tampered_hosted_tarball_digest_boundary() {
 }
 
 /// Rollback leg: after the hosted rewrite and the fresh-checkout proof,
-/// `rollback --yes` (unscoped — the whole-ledger reverse replay) must
-/// restore bun.lock byte-for-byte to the pre-redirect snapshot and delete
-/// the redirect ledger, and a fresh frozen install of the restored lock
-/// must land the ORIGINAL registry bytes — the marker gone.
+/// `rollback --yes` (the v5 upstream restore of the hosted pin) must
+/// restore bun.lock byte-for-byte to the pre-redirect snapshot, and a
+/// fresh frozen install of the restored lock must land the ORIGINAL
+/// registry bytes — the marker gone.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn bun_redirect_rollback_restores_lock_and_original_install() {
@@ -1401,7 +1446,8 @@ async fn bun_redirect_rollback_restores_lock_and_original_install() {
     assert_patched_fresh_install(&fx);
 
     let proj = &fx.proj;
-    let (code, stdout, stderr) = run_socket(
+    let env = unwind_env(&fx).await;
+    let (code, stdout, stderr) = run_socket_env(
         proj,
         &[
             "rollback",
@@ -1410,6 +1456,7 @@ async fn bun_redirect_rollback_restores_lock_and_original_install() {
             "--cwd",
             proj.to_str().unwrap(),
         ],
+        &env,
     );
     assert_eq!(
         code, 0,
@@ -1425,7 +1472,7 @@ async fn bun_redirect_rollback_restores_lock_and_original_install() {
     );
     assert!(
         !redirect_ledger(proj).exists(),
-        "rollback must delete the redirect ledger"
+        "no hosted ledger exists at any point"
     );
     let restored = std::fs::read_to_string(proj.join("bun.lock")).unwrap();
     assert!(
@@ -1527,11 +1574,11 @@ fn fresh_frozen_install_with_local_dep(
 /// still our wiring — the spec bun installs from is intact — so after a
 /// real re-save: `rollback --dry-run` must resolve, the repeat hosted run
 /// must report `redirected: 1` with no `redirect_bun_entry_not_found` and
-/// heal the line back to the 3-tuple (a second ledger edit), a fresh
-/// frozen install must land the patched bytes, and `rollback` must put the
-/// registry line back inside the GROWN lock and install the original bytes.
-/// On ≥ 1.3.10 the same steps prove the no-regression twin: digest kept,
-/// repeat run a no-op, one ledger edit.
+/// heal the line back to the 3-tuple, a fresh frozen install must land the
+/// patched bytes, and `rollback` must put the registry line back inside the
+/// GROWN lock and install the original bytes. On ≥ 1.3.10 the same steps
+/// prove the no-regression twin: digest kept, repeat run a no-op. No run
+/// writes a ledger.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn bun_redirect_survives_a_digest_dropping_lock_resave() {
@@ -1588,7 +1635,8 @@ async fn bun_redirect_survives_a_digest_dropping_lock_resave() {
     manifestless_vex(&fx, "resaved", grown_registry.as_bytes());
 
     // 2. The unwind must already resolve over the re-saved lock (dry run).
-    let (code, stdout, stderr) = run_socket(
+    let unwind = unwind_env(&fx).await;
+    let (code, stdout, stderr) = run_socket_env(
         proj,
         &[
             "rollback",
@@ -1598,6 +1646,7 @@ async fn bun_redirect_survives_a_digest_dropping_lock_resave() {
             "--cwd",
             proj.to_str().unwrap(),
         ],
+        &unwind,
     );
     assert_eq!(
         code, 0,
@@ -1657,22 +1706,10 @@ async fn bun_redirect_survives_a_digest_dropping_lock_resave() {
         healed.contains("\"local-dep\": ["),
         "the grown entry survives"
     );
-    let ledger: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(redirect_ledger(proj)).unwrap()).unwrap();
-    let edits = ledger["edits"].as_array().unwrap();
-    assert_eq!(
-        edits.len(),
-        if expect_drop { 2 } else { 1 },
-        "the heal is recorded as a second edit exactly when the digest was dropped: {ledger:#}"
+    assert!(
+        !redirect_ledger(proj).exists(),
+        "the repeat run (heal or no-op) writes no ledger"
     );
-    if expect_drop {
-        assert_eq!(
-            edits[1]["original"],
-            serde_json::json!(digestless_spelling),
-            "{ledger:#}"
-        );
-        assert_eq!(edits[1]["new"], serde_json::json!(wired_line), "{ledger:#}");
-    }
     eprintln!("REPEAT HOSTED RUN OK");
 
     // 4. The healed lock installs the patched bytes from an empty cache.
@@ -1682,9 +1719,9 @@ async fn bun_redirect_survives_a_digest_dropping_lock_resave() {
         "the healed lock must install the patched bytes"
     );
 
-    // 5. Rollback: registry line back inside the grown lock, ledger gone,
-    //    original bytes on a fresh install.
-    let (code, stdout, stderr) = run_socket(
+    // 5. Rollback: registry line back inside the grown lock (the upstream
+    //    restore), original bytes on a fresh install.
+    let (code, stdout, stderr) = run_socket_env(
         proj,
         &[
             "rollback",
@@ -1693,6 +1730,7 @@ async fn bun_redirect_survives_a_digest_dropping_lock_resave() {
             "--cwd",
             proj.to_str().unwrap(),
         ],
+        &unwind,
     );
     assert_eq!(
         code, 0,
@@ -1711,10 +1749,7 @@ async fn bun_redirect_survives_a_digest_dropping_lock_resave() {
         restored.contains("\"local-dep\": ["),
         "rollback must not disturb the grown entry:\n{restored}"
     );
-    assert!(
-        !redirect_ledger(proj).exists(),
-        "the emptied ledger is deleted"
-    );
+    assert!(!redirect_ledger(proj).exists(), "no hosted ledger");
     let installed = fresh_frozen_install_with_local_dep(&fx, "fresh-rolled-back", &tgz_name);
     assert_eq!(
         installed, fx.orig,

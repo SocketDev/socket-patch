@@ -180,16 +180,18 @@ pub(super) async fn inventory_package_lock_in(
         {
             continue;
         }
-        let integrity = node
-            .integrity
-            .map(|i| LockIntegrity::Sri(i.to_string()))
-            .unwrap_or(LockIntegrity::None);
-        out.push(LockfileEntry::npm(
-            node.name,
-            version,
-            node.resolved.and_then(http_url),
-            integrity,
-        ));
+        // A non-registry resolution (`file:`, `git+…`) records the integrity
+        // of an artifact no registry serves: nothing a registry fetch could
+        // verify against.
+        let resolved = node.resolved.and_then(http_url);
+        let integrity = match (&resolved, node.resolved) {
+            (None, Some(_)) => LockIntegrity::None,
+            _ => node
+                .integrity
+                .map(|i| LockIntegrity::Sri(i.to_string()))
+                .unwrap_or(LockIntegrity::None),
+        };
+        out.push(LockfileEntry::npm(node.name, version, resolved, integrity));
     }
     Some(out)
 }

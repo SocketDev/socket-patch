@@ -206,7 +206,7 @@ async fn get_module_cache_paths_with_go_mod_returns_cache() {
 #[path = "common/mod.rs"]
 mod common;
 
-/// `scan_dir_recursive` short-circuits when read_dir returns Err.
+/// `scan_cache_sync` short-circuits when read_dir returns Err.
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::parallel]
@@ -267,7 +267,8 @@ async fn go_crawler_default_and_new_construct_cleanly() {
 }
 
 /// A `module` directive with no path (`module`) must not match — the
-/// guard at line 61 (`!rest.is_empty()`) keeps it from being returned.
+/// `!rest.is_empty()` guard in `parse_go_mod_module` keeps it from being
+/// returned.
 #[test]
 #[serial_test::parallel]
 fn parse_go_mod_module_directive_with_empty_path_returns_none() {
@@ -357,7 +358,7 @@ async fn crawl_all_finds_nested_versioned_module() {
 }
 
 /// `cache` directory inside the module cache is metadata, must be
-/// skipped (line 249 second arm).
+/// skipped (the root-level `cache` arm in `scan_cache_sync`).
 #[tokio::test]
 #[serial]
 async fn crawl_all_skips_cache_metadata_dir() {
@@ -395,7 +396,7 @@ async fn crawl_all_skips_cache_metadata_dir() {
 }
 
 /// With GOMODCACHE and GOPATH both unset, `get_gomodcache` falls
-/// through to `$HOME/go/pkg/mod` (lines 194-197).
+/// through to `$HOME/go/pkg/mod`.
 #[tokio::test]
 #[serial]
 async fn get_module_cache_paths_home_go_pkg_mod_fallback() {

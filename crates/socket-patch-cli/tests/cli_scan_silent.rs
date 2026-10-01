@@ -1,14 +1,10 @@
 //! `scan --silent` contract tests.
 //!
-//! CLI_CONTRACT.md defines `--silent` as "Errors only". Regression
-//! guard: `scan` gated all of its human-readable output on `!json`
-//! alone — the "No packages found" hint, the "Found N packages" /
-//! "Found N patches" stderr chatter, the results table, the summary,
-//! the "Patches to apply" listing, and the post-apply GC line all
-//! printed under `--silent` — and the human download path hardcoded
-//! `silent: false` into `DownloadParams`, so the nested apply step's
-//! progress printed too. Same bug class previously fixed in `list`,
-//! `repair`, `get`, and `remove`.
+//! CLI_CONTRACT.md defines `--silent` as "Errors only": the "No packages
+//! found" hint, the "Found N packages" / "Found N patches" stderr chatter,
+//! the results table, the summary, the "Patches to apply" listing, the
+//! post-apply GC line, and the nested apply step's progress must all be
+//! muted under `--silent` (not just gated on `!json`).
 //!
 //! The apply-flow test runs against a wiremock API (same fixture shape
 //! as `scan_sync_e2e.rs`) so the full human-mode scan→select→download→
@@ -18,6 +14,9 @@
 //! warning: it's printed unconditionally by
 //! `get_api_client_with_overrides` in core for every command and is
 //! out of scope for `scan`'s `--silent` gating.
+
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -148,24 +147,26 @@ async fn mount_one_patch_api(mock: &MockServer, purl: &str, before: &[u8]) {
         .await;
 
     // base64 of "after\n" — inline so the apply step needs no blob endpoint.
+    let archive_view = serde_json::json!({
+        "uuid": UUID,
+        "purl": purl,
+        "publishedAt": "2024-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": before_hash,
+                "afterHash": after_hash,
+                "blobContent": "YWZ0ZXIK",
+            }
+        },
+        "vulnerabilities": {},
+        "description": "Silent test patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view(mock, &archive_view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": purl,
-            "publishedAt": "2024-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": before_hash,
-                    "afterHash": after_hash,
-                    "blobContent": "YWZ0ZXIK",
-                }
-            },
-            "vulnerabilities": {},
-            "description": "Silent test patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(archive_view))
         .mount(mock)
         .await;
 }
@@ -225,6 +226,8 @@ async fn scan_silent_apply_flow_produces_no_output_but_still_applies() {
     let (code, stdout, stderr) = run_scan(
         tmp.path(),
         &[
+            "--mode",
+            "agent",
             "--silent",
             "--yes",
             "--api-url",
@@ -274,6 +277,8 @@ async fn scan_silent_apply_flow_produces_no_output_but_still_applies() {
     let (loud_code, loud_stdout, loud_stderr) = run_scan(
         tmp2.path(),
         &[
+            "--mode",
+            "agent",
             "--yes",
             "--api-url",
             &mock.uri(),
@@ -361,9 +366,8 @@ fn seed_manifest_with_gone_entry(root: &Path) {
 
 /// The vendored-mode GC line must honor `--silent` like the apply-mode one
 /// does: `scan --vendor --prune --silent --yes` prints nothing when it
-/// succeeds. Regression guard: `run_vendor_interactive_path` printed
-/// "GC: pruned N manifest entries and removed …" (and the vendored-revert GC line)
-/// unconditionally.
+/// succeeds: `run_vendor_interactive_path` must not print "GC: pruned N
+/// manifest entries and removed …" (or the vendored-revert GC line).
 #[tokio::test]
 async fn scan_vendor_silent_gc_prints_nothing() {
     let purl = "pkg:npm/silent-target@1.0.0";
@@ -515,13 +519,11 @@ fn scan_silent_vex_failure_keeps_error_output() {
 }
 
 /// The redirect flow's embedded-VEX failure path must keep its error
-/// under `--silent` too ("errors only", not "nothing"): `scan --redirect
+/// under `--silent` too ("errors only", not "nothing"): `scan --mode hosted
 /// --vex out.json --silent` with nothing to attest (the reference is
 /// forbidden, no manifest exists) exits 1, and the failure message must
-/// still reach stderr. Regression guard: `run_redirect` printed its
-/// `vex_error` inside the `!silent` human branch, so the run failed with
-/// exit 1 and no output at all — the same bug `embed_vex_human` already
-/// fixed on the non-redirect path (see
+/// still reach stderr: `run_redirect`'s `vex_error` must not sit inside the
+/// `!silent` human branch (the non-redirect twin is
 /// `scan_silent_vex_failure_keeps_error_output` above).
 #[tokio::test]
 async fn scan_redirect_silent_vex_failure_keeps_error_output() {
@@ -547,7 +549,7 @@ async fn scan_redirect_silent_vex_failure_keeps_error_output() {
     let vex_arg = vex_path.to_str().unwrap().to_string();
 
     let args = |silent: bool| {
-        let mut v = vec!["--redirect", "--yes"];
+        let mut v = vec!["--mode=hosted", "--yes"];
         if silent {
             v.push("--silent");
         }

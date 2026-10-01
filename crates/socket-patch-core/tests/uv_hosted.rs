@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
 
 use socket_patch_core::patch::redirect::{
-    revert_remaining_redirect_edits, rewrite_registry_redirect, DepOverride, Integrity,
-    RedirectState,
+    rewrite_registry_redirect, DepOverride, Integrity,
 };
 
 fn patch(name: &str) -> DepOverride {
@@ -14,7 +13,6 @@ fn patch(name: &str) -> DepOverride {
         token: "11111111-1111-4111-8111-111111111111".into(),
         patch_uuid: "22222222-2222-4222-8222-222222222222".into(),
         artifact_url: format!("https://patch.socket.dev/pkg/{name}-1.0.0-py3-none-any.whl"),
-        berry_zip_url: None,
         registry_override: None,
         integrity: Integrity {
             sha256: Some("a".repeat(64)),
@@ -34,8 +32,8 @@ fn files() -> BTreeMap<String, String> {
     ])
 }
 
-#[tokio::test]
-async fn script_redirect_and_revert_restore_every_original_byte() {
+#[test]
+fn script_redirect_is_idempotent() {
     let original = files();
     let overrides = [patch("alpha"), patch("bravo")];
     let result = rewrite_registry_redirect(&original, &overrides);
@@ -45,28 +43,6 @@ async fn script_redirect_and_revert_restore_every_original_byte() {
     assert!(again.warnings.is_empty(), "{:?}", again.warnings);
     assert!(again.files.is_empty());
     assert!(again.edits.is_empty());
-
-    let directory = tempfile::tempdir().unwrap();
-    for (path, contents) in &result.files {
-        tokio::fs::write(directory.path().join(path), contents)
-            .await
-            .unwrap();
-    }
-    let mut state = RedirectState {
-        edits: result.edits,
-        ..RedirectState::default()
-    };
-    let outcome = revert_remaining_redirect_edits(directory.path(), &mut state, false).await;
-    assert!(outcome.fully_reverted(), "{:?}", outcome.refusals);
-    assert!(state.edits.is_empty());
-    for (path, contents) in original {
-        assert_eq!(
-            tokio::fs::read_to_string(directory.path().join(path))
-                .await
-                .unwrap(),
-            contents
-        );
-    }
 }
 
 #[test]
@@ -85,42 +61,8 @@ fn conflicting_or_missing_script_metadata_refuses_lock_changes() {
     assert_eq!(result.warnings[0].code, "redirect_uv_script_missing");
 }
 
-#[tokio::test]
-async fn script_drift_keeps_both_paired_files_during_revert() {
-    let result = rewrite_registry_redirect(&files(), &[patch("alpha")]);
-    let directory = tempfile::tempdir().unwrap();
-    for (path, contents) in &result.files {
-        tokio::fs::write(directory.path().join(path), contents)
-            .await
-            .unwrap();
-    }
-    let changed = result.files["example.py"].replace("dependencies =", "dependencies  =");
-    tokio::fs::write(directory.path().join("example.py"), &changed)
-        .await
-        .unwrap();
-    let mut state = RedirectState {
-        edits: result.edits,
-        ..RedirectState::default()
-    };
-    let outcome = revert_remaining_redirect_edits(directory.path(), &mut state, false).await;
-    assert!(!outcome.fully_reverted());
-    assert_eq!(
-        tokio::fs::read_to_string(directory.path().join("example.py"))
-            .await
-            .unwrap(),
-        changed
-    );
-    assert_eq!(
-        tokio::fs::read_to_string(directory.path().join("example.py.lock"))
-            .await
-            .unwrap(),
-        result.files["example.py.lock"]
-    );
-    assert!(!state.edits.is_empty());
-}
-
-#[tokio::test]
-async fn native_projects_keep_sources_and_metadata_in_sync() {
+#[test]
+fn native_projects_keep_sources_and_metadata_in_sync() {
     use socket_patch_core::patch::redirect::rewrite_registry_redirect_with_python_metadata;
 
     for direct in [true, false] {
@@ -174,26 +116,6 @@ async fn native_projects_keep_sources_and_metadata_in_sync() {
             rewrite_registry_redirect_with_python_metadata(&result.files, &[dep], &metadata);
         assert!(again.files.is_empty(), "{:?}", again.files);
         assert!(again.warnings.is_empty(), "{:?}", again.warnings);
-        let directory = tempfile::tempdir().unwrap();
-        for (file, content) in result.files {
-            tokio::fs::write(directory.path().join(file), content)
-                .await
-                .unwrap();
-        }
-        let mut state = RedirectState {
-            edits: result.edits,
-            ..RedirectState::default()
-        };
-        let outcome = revert_remaining_redirect_edits(directory.path(), &mut state, false).await;
-        assert!(outcome.fully_reverted(), "{:?}", outcome.refusals);
-        for (file, content) in original {
-            assert_eq!(
-                tokio::fs::read_to_string(directory.path().join(file))
-                    .await
-                    .unwrap(),
-                content
-            );
-        }
     }
 }
 

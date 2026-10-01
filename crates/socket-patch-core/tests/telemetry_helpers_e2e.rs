@@ -5,7 +5,7 @@
 //! and the home-dir redaction were uncovered.
 //!
 //! Hardening notes: every disable-gate test runs inside `with_clean_env`,
-//! which scrubs ALL four disabling vars first. Each test then proves
+//! which scrubs ALL three disabling vars first. Each test then proves
 //! *causation*, not mere correlation:
 //!   1. clean env => NOT disabled  (kills an always-`true` impl + ambient
 //!      `SOCKET_OFFLINE=1` masking the result),
@@ -20,7 +20,6 @@ use socket_patch_core::telemetry::{is_telemetry_disabled, sanitize_error_message
 /// Scrubbing the full set is what makes the per-var causation asserts honest.
 const DISABLE_VARS: &[&str] = &[
     "SOCKET_TELEMETRY_DISABLED",
-    "SOCKET_PATCH_TELEMETRY_DISABLED",
     "VITEST",
     "SOCKET_OFFLINE",
 ];
@@ -143,32 +142,6 @@ fn telemetry_not_disabled_when_vitest_is_not_literal_true() {
             assert!(
                 !is_telemetry_disabled(),
                 "VITEST={v:?} must NOT disable telemetry (only literal 'true' does)"
-            );
-        }
-    });
-}
-
-#[test]
-#[serial]
-fn telemetry_disabled_legacy_socket_patch_var_honored() {
-    with_clean_env(|| {
-        assert!(!is_telemetry_disabled(), "baseline must be enabled");
-        // Both accepted spellings of the legacy var must work on their own,
-        // with the new var name absent.
-        for v in ["1", "true"] {
-            std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", v);
-            assert!(
-                std::env::var("SOCKET_TELEMETRY_DISABLED").is_err(),
-                "precondition: new var must be unset so legacy is the only cause"
-            );
-            assert!(
-                is_telemetry_disabled(),
-                "legacy SOCKET_PATCH_TELEMETRY_DISABLED={v:?} must still disable"
-            );
-            std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
-            assert!(
-                !is_telemetry_disabled(),
-                "removing legacy var must re-enable telemetry"
             );
         }
     });

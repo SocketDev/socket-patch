@@ -9,6 +9,9 @@
 //!
 //! `#[serial]`: `get::run` mirrors env toggles into process-global env vars.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::Path;
 
 use serial_test::serial;
@@ -57,9 +60,7 @@ fn get_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
             api_url: Some(api_url),
             json: true,
             download_mode: "diff".to_string(),
-            // Local build so the vendored tests never reach the vendoring
-            // service (no grant/tarball mocks needed).
-            vendor_source: "build".to_string(),
+            vendor_source: "service".to_string(),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         identifier: identifier.to_string(),
@@ -68,42 +69,43 @@ fn get_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
         ghsa: false,
         package: false,
         save_only: false,
-        one_off: false,
         all_releases: false,
-        mode: None,
+        mode: Some(socket_patch_cli::commands::scan::ScanMode::Agent),
     }
 }
 
 /// `view/{uuid}` with REAL git-blob hashes and inline blob content, so the
 /// vendored flow's staging hash-gates pass and the agent flow can apply.
-async fn mock_view(server: &MockServer, uuid: &str, purl: &str) {
+async fn mock_view(server: &MockServer, uuid: &str, purl: &str) -> serde_json::Value {
+    let view = serde_json::json!({
+        "uuid": uuid,
+        "purl": purl,
+        "publishedAt": "2024-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": before_hash(),
+                "afterHash": after_hash(),
+                "blobContent": b64(AFTER_BYTES),
+            }
+        },
+        "vulnerabilities": {
+            GHSA: {
+                "cves": ["CVE-2024-1234"],
+                "summary": "get-modes fixture",
+                "severity": "high",
+                "description": "d"
+            }
+        },
+        "description": "get-modes fixture",
+        "license": "MIT",
+        "tier": "free",
+    });
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": uuid,
-            "purl": purl,
-            "publishedAt": "2024-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": before_hash(),
-                    "afterHash": after_hash(),
-                    "blobContent": b64(AFTER_BYTES),
-                }
-            },
-            "vulnerabilities": {
-                GHSA: {
-                    "cves": ["CVE-2024-1234"],
-                    "summary": "get-modes fixture",
-                    "severity": "high",
-                    "description": "d"
-                }
-            },
-            "description": "get-modes fixture",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
         .mount(server)
         .await;
+    view
 }
 
 /// `by-ghsa/{GHSA}`: the two-version fan-out — the installed 1.0.0 and the
@@ -227,12 +229,12 @@ async fn requests_containing(server: &MockServer, fragment: &str) -> usize {
 // ---------------------------------------------------------------------------
 
 /// `get <uuid> --mode hosted` must produce scan's hosted result: lockfile
-/// repointed at the hosted artifact with the patched integrity, a redirect
-/// ledger with the patch record — and NO manifest, NO blobs (the ledger IS
-/// the persistence; parity with `scan --mode hosted`).
+/// repointed at the hosted artifact with the patched integrity — and NO
+/// manifest, NO blobs, NO redirect ledger (v5: the lockfile pin IS the
+/// persistence; parity with `scan --mode hosted`).
 #[tokio::test]
 #[serial]
-async fn get_uuid_hosted_rewrites_lockfile_and_writes_ledger_not_manifest() {
+async fn get_uuid_hosted_rewrites_lockfile_and_writes_no_ledger_or_manifest() {
     let server = MockServer::start().await;
     mock_view(&server, UUID1, PURL1).await;
     mock_reference(&server).await;
@@ -259,14 +261,11 @@ async fn get_uuid_hosted_rewrites_lockfile_and_writes_ledger_not_manifest() {
         "upstream resolved/integrity must be replaced; got:\n{lock}"
     );
 
-    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
-    assert!(ledger_path.is_file(), "redirect ledger must be written");
-    let ledger: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
-    assert_eq!(ledger["mode"], "hosted");
-    assert_eq!(
-        ledger["records"][PURL1]["uuid"], UUID1,
-        "the ledger must record the redirected patch for VEX; got:\n{ledger}"
+    assert!(
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
+        "v5 hosted mode must NOT write the redirect ledger"
     );
 
     assert!(
@@ -281,8 +280,8 @@ async fn get_uuid_hosted_rewrites_lockfile_and_writes_ledger_not_manifest() {
 
 /// A GHSA fan-out across two versions must be narrowed to the INSTALLED
 /// version before the hosted engine runs: only its uuid is sent to the
-/// reference endpoint, only its lock entry is rewritten, and only its purl
-/// lands in the ledger.
+/// reference endpoint, only its lock entry is rewritten, and no ledger is
+/// written.
 #[tokio::test]
 #[serial]
 async fn get_ghsa_hosted_narrows_to_installed_version() {
@@ -321,14 +320,15 @@ async fn get_ghsa_hosted_narrows_to_installed_version() {
         reference_bodies[0]
     );
 
-    let ledger: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(ledger["records"][PURL1].is_object());
     assert!(
-        ledger["records"][PURL2].is_null(),
-        "no record for the uninstalled version"
+        !lock.contains(UUID2) && !lock.contains(&format!("{NAME}-2.0.0")),
+        "the uninstalled version must not be pinned; got:\n{lock}"
+    );
+    assert!(
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
+        "v5 hosted mode must NOT write the redirect ledger"
     );
     assert!(!tmp.path().join(".socket/manifest.json").exists());
 }
@@ -377,7 +377,8 @@ async fn get_uuid_hosted_dry_run_writes_nothing() {
 #[serial]
 async fn get_uuid_vendored_commits_artifact_and_wires_lock() {
     let server = MockServer::start().await;
-    mock_view(&server, UUID1, PURL1).await;
+    let view = mock_view(&server, UUID1, PURL1).await;
+    prebuilt_common::mount_view(&server, &view, None).await;
 
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
@@ -439,7 +440,8 @@ async fn get_uuid_vendored_commits_artifact_and_wires_lock() {
 #[serial]
 async fn get_uuid_vendored_rerun_is_idempotent() {
     let server = MockServer::start().await;
-    mock_view(&server, UUID1, PURL1).await;
+    let view = mock_view(&server, UUID1, PURL1).await;
+    prebuilt_common::mount_view(&server, &view, None).await;
 
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
@@ -655,7 +657,10 @@ async fn mode_with_save_only_conflicts_exit_one_before_network() {
         args.mode = Some(mode);
         args.save_only = true;
         let code = socket_patch_cli::commands::get::run(args).await;
-        assert_eq!(code, 1, "--save-only + --mode {mode:?} must be rejected");
+        assert_eq!(
+            code, 2,
+            "--save-only + --mode {mode:?} must be rejected (usage, exit 2)"
+        );
     }
     assert!(
         server
@@ -988,7 +993,8 @@ fn write_vlt_project(root: &Path, spec: &str) {
 #[serial]
 async fn get_uuid_vendored_vlt_vendors_refuses_and_agent_bypasses() {
     let server = MockServer::start().await;
-    mock_view(&server, UUID1, PURL1).await;
+    let view = mock_view(&server, UUID1, PURL1).await;
+    prebuilt_common::mount_view(&server, &view, None).await;
 
     let tmp = tempfile::tempdir().unwrap();
     write_vlt_project(tmp.path(), "1.0.0");

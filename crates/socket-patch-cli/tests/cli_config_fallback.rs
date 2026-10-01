@@ -50,7 +50,7 @@ fn write_config(data_dir: &Path, json: &serde_json::Value) {
     std::fs::write(dir.join("config.json"), encoded).unwrap();
 }
 
-/// Build a hermetic `socket-patch scan --json -e npm` command: every
+/// Build a hermetic human-mode `socket-patch scan -e npm --cwd <project>` command: every
 /// ambient `SOCKET_*` var is scrubbed (including the inherited
 /// `SOCKET_NO_CONFIG=1` guard — tests re-add exactly what they need), the
 /// data dir points at `data_dir`, and the project dir is an empty npm
@@ -559,97 +559,6 @@ async fn list_telemetry_honors_no_api_token_veto() {
     assert!(
         !paths.contains(&"/v0/orgs/cfg-org/telemetry"),
         "SOCKET_NO_API_TOKEN must veto the config token for telemetry too; \
-         requests seen: {paths:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// `setup` — the other command that only fires telemetry
-// ---------------------------------------------------------------------------
-
-/// `socket-patch setup --json --yes` against `project`, with the same hermetic
-/// env as [`list_cmd`]. `--json` also skips the confirmation prompt.
-fn setup_cmd(project: &Path, data_dir: &Path) -> Command {
-    let mut cmd = Command::new(BINARY);
-    cmd.args(["setup", "--json", "--yes", "--cwd"]).arg(project);
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env(DATA_DIR_VAR, data_dir);
-    cmd.env("SOCKET_NO_CONFIG", "0");
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
-    cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
-    cmd
-}
-
-/// `setup` fires `patch_setup`, and — like `list` — it builds no API client, so
-/// it has to consult the socket-cli config layer itself. A caller
-/// authenticated by `socket login` alone must have the event POSTed to
-/// `/v0/orgs/<slug>/telemetry` on the config `apiBaseUrl`, never anonymously
-/// to the public proxy.
-///
-/// Regression: `setup` handed the tracker its raw `--api-token` / `--org` flag
-/// values (both `None` here), so the event went out unauthenticated to
-/// `patches-api.socket.dev` — a different host than the one the caller's
-/// client talks to, which for an on-prem `apiBaseUrl` egresses the event
-/// entirely. Exact twin of `list_telemetry_follows_socket_cli_login`.
-#[tokio::test]
-async fn setup_telemetry_follows_socket_cli_login() {
-    let server = MockServer::start().await;
-    let data = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
-    // A plain npm project: setup has real work to do, so telemetry fires.
-    write_empty_project(project.path());
-    write_config(
-        data.path(),
-        &serde_json::json!({
-            "apiToken": token('c'),
-            "apiBaseUrl": server.uri(),
-            "defaultOrg": "cfg-org"
-        }),
-    );
-
-    let mut cmd = setup_cmd(project.path(), data.path());
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "0");
-    // Pin the anonymous fallback at the fixture too, so a run that skips the
-    // config layer is caught here instead of escaping to the real proxy.
-    cmd.env("SOCKET_PROXY_URL", server.uri());
-    let out = run(cmd);
-    assert_eq!(out.code, Some(0), "stderr:\n{}", out.stderr);
-    assert!(
-        std::fs::read_to_string(project.path().join("package.json"))
-            .unwrap()
-            .contains("socket-patch"),
-        "control: the run must actually have configured the project, or the \
-         telemetry event under test never fires"
-    );
-
-    let reqs = server.received_requests().await.unwrap_or_default();
-    let paths: Vec<&str> = reqs.iter().map(|r| r.url.path()).collect();
-    let telemetry = reqs
-        .iter()
-        .find(|r| r.url.path() == "/v0/orgs/cfg-org/telemetry")
-        .unwrap_or_else(|| {
-            panic!(
-                "`setup` telemetry must POST to the org endpoint resolved from \
-                 the socket-cli login; requests seen: {paths:?}"
-            )
-        });
-    assert_eq!(
-        telemetry
-            .headers
-            .get("authorization")
-            .map(|v| v.to_str().unwrap_or_default().to_string())
-            .as_deref(),
-        Some(format!("Bearer {}", token('c')).as_str()),
-        "setup telemetry must carry the config token"
-    );
-    assert!(
-        !paths.contains(&"/patch/telemetry"),
-        "setup must not report anonymously when a login is configured; \
          requests seen: {paths:?}"
     );
 }

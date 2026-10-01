@@ -1,4 +1,6 @@
-//! Path-glob scoping shared by `scan` and `rollback`.
+//! Path-glob scoping shared by agent-mode (and report-only) `scan` and
+//! `rollback`. (Hosted/vendored scan PATHS are project directories instead;
+//! see `run_project_dirs`.)
 //!
 //! A [`PathScope`] holds the user's positional PATH patterns and answers
 //! "is this installed-package directory in scope?". Matching rules
@@ -11,7 +13,7 @@
 //!   absolute patterns match the absolute path (the only way to scope
 //!   packages outside the project tree, e.g. `--global` stores).
 //! * A pattern that matches any ANCESTOR directory of the package path
-//!   also matches, so `scan packages/foo` scopes the whole subtree
+//!   also matches, so `scan --mode agent packages/foo` scopes the whole subtree
 //!   without needing an explicit `packages/foo/**`.
 //! * Matching is purely textual on `/`-normalized paths — no filesystem
 //!   access, no symlink resolution.
@@ -70,9 +72,6 @@ impl PathScope {
     pub fn parse(raw_patterns: &[String]) -> Result<Self, String> {
         let mut patterns = Vec::with_capacity(raw_patterns.len());
         let mut raw = Vec::with_capacity(raw_patterns.len());
-        // Lowercase on purpose: scan and rollback print this after a clap-style
-        // `error: ` usage-error prefix. Capitalize it together with those
-        // call sites if they move to `Error: `.
         for r in raw_patterns {
             let normalized = normalize_pattern(r);
             if normalized.is_empty() {

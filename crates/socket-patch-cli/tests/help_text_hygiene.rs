@@ -147,14 +147,43 @@ fn vex_product_list_renders_one_item_per_line() {
 fn root_command_list_uses_the_verb_form() {
     let text = long_help(&[]);
     assert!(
-        text.contains("Roll back patches to restore original files"),
+        text.contains("Undo patches: restore original files and unwind hosted or vendored lockfile wiring"),
         "{text}"
     );
     assert!(!text.contains("Rollback patches"), "{text}");
+    // v5 removed `setup`; its install-hook summary must not come back.
+    assert!(!text.contains("install hooks"), "{text}");
     assert!(
-        text.contains("Wire install hooks (npm, Python, Bundler, Composer)"),
+        !text.lines().any(|l| l.trim_start().starts_with("setup ")),
         "{text}"
     );
+}
+
+/// v5 leads with scan, vex, vendor and list; the agent-mode commands follow.
+#[test]
+fn root_command_list_leads_with_the_v5_workflow() {
+    let text = long_help(&[]);
+    let order: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("  "))
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|w| {
+            [
+                "scan", "vex", "vendor", "list", "get", "apply", "rollback", "remove", "repair",
+            ]
+            .contains(w)
+        })
+        .collect();
+    assert_eq!(
+        &order[..9],
+        ["scan", "get", "list", "remove", "rollback", "vex", "vendor", "apply", "repair"],
+        "{text}"
+    );
+    assert!(
+        text.contains("Patch a project:") && text.contains("Agent mode ("),
+        "{text}"
+    );
+    assert!(!text.contains("older agent-mode"), "{text}");
 }
 
 #[test]
@@ -167,17 +196,15 @@ fn vendor_and_repair_summaries_read_as_one_line() {
     );
     assert!(
         text.lines().any(|l| l
-            == "  repair    Download missing patch artifacts and clean up unused ones [aliases: gc]"),
+            == "  repair    Agent mode: download missing patch artifacts and clean up unused ones [aliases: gc]"),
         "{text}"
     );
     let repair = long_help(&["repair"]);
     assert!(
         repair.starts_with(
-            "Download missing patch artifacts and clean up unused ones\n\n\
+            "Agent mode: download missing patch artifacts and clean up unused ones\n\n\
              Restores missing blobs and diff/package archives, rebuilds missing or corrupt \
-             vendored artifacts, then deletes the artifacts nothing references. It needs no \
-             scan; for the combined workflow (discover, apply, clean up) use \
-             `scan --sync --json --yes`.\n"
+             vendored artifacts, then deletes the artifacts nothing references.\n"
         ),
         "{repair}"
     );
@@ -205,7 +232,37 @@ fn lock_timeout_help_names_get_and_scan() {
     let text = long_help(&["list"]);
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        flat.contains("`get` and `scan` when they record, apply, vendor or redirect patches"),
+        flat.contains("`get` and `scan` when they record, apply, vendor or host patches"),
         "{flat}"
     );
+}
+
+/// `-h` stays short (about eight options per page); `--help` still lists
+/// every option, and the deprecated `scan --apply`/`--vendor` spellings
+/// are in neither.
+#[test]
+fn short_help_lists_about_eight_options_and_long_help_lists_all() {
+    let mut cmd = socket_patch_cli::cli_command();
+    cmd.build();
+    for sub in cmd.get_subcommands_mut() {
+        if sub.is_hide_set() || sub.get_name() == "help" {
+            continue;
+        }
+        let name = sub.get_name().to_string();
+        let short = sub.render_help().to_string();
+        let long = sub.render_long_help().to_string();
+        // Options only: `-h`/`-V` are on every command.
+        let count = |t: &str| {
+            t.lines()
+                .map(str::trim_start)
+                .filter(|l| l.starts_with('-') && !l.starts_with("-h,") && !l.starts_with("-V,"))
+                .count()
+        };
+        assert!(count(&short) <= 9, "{name} -h lists {} options:\n{short}", count(&short));
+        assert!(count(&long) > count(&short), "{name} --help must list more than -h");
+        assert!(short.contains("--json") && short.contains("--cwd"), "{name}");
+    }
+    let scan = cmd.find_subcommand_mut("scan").expect("scan");
+    let long = scan.render_long_help().to_string();
+    assert!(!long.contains("--apply") && !long.contains("--vendor "), "{long}");
 }

@@ -1,14 +1,10 @@
-//! Package- and diff-archive tarball helpers.
+//! Patch-archive tarball helpers.
 //!
-//! Both package archives (`.socket/packages/<uuid>.tar.gz`) and diff
-//! archives (`.socket/diffs/<uuid>.tar.gz`) use the same on-disk format:
-//! a gzipped tar containing one entry per patched file. The entry's path
-//! matches the **normalized** relative file path (i.e. without the
-//! `package/` prefix used by the API).
-//!
-//! For package archives, each entry holds the patched file's full bytes.
-//! For diff archives, each entry holds a bsdiff delta that transforms the
-//! corresponding `beforeHash` content into the `afterHash` content.
+//! Diff archives (`.socket/diffs/<uuid>.tar.gz`) are a gzipped tar
+//! containing one entry per patched file. The entry's path matches the
+//! **normalized** relative file path (i.e. without the `package/` prefix
+//! used by the API), and each entry holds a bsdiff delta that transforms
+//! the corresponding `beforeHash` content into the `afterHash` content.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -35,7 +31,7 @@ const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 /// the in-memory `HashMap`.
 const MAX_ENTRIES: usize = 10_000;
 
-/// Errors produced while reading a package/diff archive.
+/// Errors produced while reading a patch archive.
 #[derive(Debug, thiserror::Error)]
 pub enum ArchiveError {
     #[error("archive I/O error: {0}")]
@@ -115,7 +111,7 @@ pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8
             format!("archive {} is not a regular file", archive_path.display()),
         )));
     }
-    read_archive_from_reader(file, false)
+    read_archive_from_reader(file, false, true)
 }
 
 /// [`read_archive_to_map`] over an in-memory `.tar.gz` — the same bomb caps,
@@ -123,7 +119,7 @@ pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8
 /// decode the SAME bytes (a committed artifact read once, so no swap between
 /// the whole-file hash and the member check can go unnoticed).
 pub fn read_archive_bytes_to_map(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
-    read_archive_from_reader(bytes, false)
+    read_archive_from_reader(bytes, false, true)
 }
 
 /// [`read_archive_bytes_to_map`] that additionally refuses any archive an
@@ -146,7 +142,15 @@ pub fn read_archive_bytes_to_map(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>
 pub fn read_archive_bytes_to_map_strict(
     bytes: &[u8],
 ) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
-    read_archive_from_reader(bytes, true)
+    read_archive_from_reader(bytes, true, true)
+}
+
+/// Read a source distribution without npm's `package/` prefix convention.
+/// Uses the same strict member checks and decompression limits.
+pub(crate) fn read_sdist_tar_bytes_to_map_strict(
+    bytes: &[u8],
+) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
+    read_archive_from_reader(bytes, true, false)
 }
 
 /// The shared decoder behind [`read_archive_to_map`] and
@@ -156,6 +160,7 @@ pub fn read_archive_bytes_to_map_strict(
 fn read_archive_from_reader<R: Read>(
     reader: R,
     strict: bool,
+    strip_package_prefix: bool,
 ) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
     // Hard-cap decompressed bytes to defuse gzip / tar bombs. Reads
     // beyond the limit yield EOF, which the tar parser surfaces as a
@@ -194,7 +199,12 @@ fn read_archive_from_reader<R: Read>(
                 }
                 // The installers strip the FIRST segment whatever it is;
                 // only `package/` maps onto the decoded key space.
-                let stripped = if is_dir && raw.trim_end_matches('/') == "package" {
+                let stripped = if !strip_package_prefix {
+                    if raw.starts_with(['/', '\\']) || !is_safe_relative_subpath(&raw) {
+                        return Err(ArchiveError::UnsafePath(raw));
+                    }
+                    Some(raw.as_str())
+                } else if is_dir && raw.trim_end_matches('/') == "package" {
                     None
                 } else if let Some(rest) = raw.strip_prefix("package/") {
                     Some(rest)
@@ -237,7 +247,12 @@ fn read_archive_from_reader<R: Read>(
         // absolute path `/etc/passwd`. `Path::join` resolves an absolute
         // right-hand side by discarding the base, so that would escape the
         // package directory entirely. Always validate post-normalization.
-        let normalized = normalize_file_path(&path_str).to_string();
+        let normalized = if strip_package_prefix {
+            normalize_file_path(&path_str)
+        } else {
+            &path_str
+        }
+        .to_string();
         let normalized_path = Path::new(&normalized);
 
         // This is THE path-safety chokepoint for archive entries (see the
@@ -446,12 +461,8 @@ mod tests {
 
     #[test]
     fn test_read_archive_rejects_double_slash_package_escape() {
-        // Regression: validation must run on the POST-strip path. The raw
-        // entry `package//etc/passwd` passes every pre-strip check (not
-        // absolute, no leading separator, the `//` collapses so no `..`),
-        // but `strip_prefix("package/")` yields the absolute path
-        // `/etc/passwd`. `pkg_path.join("/etc/passwd")` discards the base
-        // and writes to `/etc/passwd` — an out-of-tree arbitrary write.
+        // Validation must run on the POST-strip path: `package//etc/passwd`
+        // strips to the absolute `/etc/passwd` (see `read_archive_from_reader`).
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("arc.tar.gz");
         write_raw_archive(&archive, b"package//etc/passwd", b"evil");
@@ -817,8 +828,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("bomb.tar.gz");
 
-        // Two entries of (max - 1) MiB each = 30 MiB declared, but
-        // gzip compresses zeroes ~1000x so the on-disk archive is small.
+        // Five entries of (MAX_ENTRY_BYTES - 1) bytes each (~16 MiB,
+        // ~80 MiB declared in total), but gzip compresses zeroes ~1000x
+        // so the on-disk archive is small.
         // We don't need to *exceed* 64 MiB — the cap is enforced
         // strictly, so an entry that crosses it will be truncated.
         let chunk = vec![0u8; (MAX_ENTRY_BYTES - 1) as usize];
@@ -826,8 +838,8 @@ mod tests {
         let entry2 = raw_entry(b"b.bin", chunk.len() as u64, &chunk);
         let entry3 = raw_entry(b"c.bin", chunk.len() as u64, &chunk);
         let entry4 = raw_entry(b"d.bin", chunk.len() as u64, &chunk);
-        // 4 * 15 MiB = 60 MiB declared, just under the 64 MiB cap.
-        // Add a fifth to push us over.
+        // Four payloads come to 4 bytes under the 64 MiB cap; a fifth
+        // pushes past it.
         let entry5 = raw_entry(b"e.bin", chunk.len() as u64, &chunk);
         write_raw_tar_gz(&archive, &[entry1, entry2, entry3, entry4, entry5]);
 
@@ -835,7 +847,7 @@ mod tests {
         // Either we get an Io error from truncation or the read
         // succeeds with the first ~4 entries — both prove the cap
         // prevented unbounded growth. Failure mode we want to RULE
-        // OUT: reading all 5 entries (~75 MiB) without error.
+        // OUT: reading all 5 entries (~80 MiB) without error.
         match result {
             Err(_) => { /* defused via Io / truncation */ }
             Ok(map) => {

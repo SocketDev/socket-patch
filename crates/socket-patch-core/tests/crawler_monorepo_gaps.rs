@@ -7,7 +7,7 @@
 //! with its own lockfile / installed packages in a subdir — crawling from the
 //! repo root therefore finds none of them.
 //!
-//! Gem is the representative here (the case the request named); python
+//! Gem is the representative here; python
 //! (multiple `.venv`), go (multiple `go.mod`), and composer (multiple
 //! `composer.json`) share the identical cwd-only limitation.
 //!
@@ -17,8 +17,7 @@
 //! discoverable. The second is a GAP pin (`#[ignore]`): crawling from the repo
 //! root should aggregate every subproject's gems. It is the executable spec for
 //! the intended multi-lockfile discovery; un-ignore it when that ships. See
-//! CLI_CONTRACT.md "Setup command contract" → "Monorepo / multi-project
-//! discovery model".
+//! CLI_CONTRACT.md "Monorepo / multi-project discovery model".
 
 use std::path::Path;
 
@@ -83,7 +82,7 @@ async fn gem_crawl_from_subproject_cwd_finds_its_own_gems() {
 // ── GAP: aggregate crawl from the repo root (multi-lockfile) ──────────────
 
 #[tokio::test]
-#[ignore = "gap: non-npm crawlers (gem/python/go/composer) are cwd-only and do not discover per-subproject lockfiles from the repo root; see CLI_CONTRACT 'Setup command contract' → Monorepo / multi-project discovery model"]
+#[ignore = "gap: non-npm crawlers (gem/python/go/composer) are cwd-only and do not discover per-subproject lockfiles from the repo root; see CLI_CONTRACT 'Monorepo / multi-project discovery model'"]
 async fn gem_crawl_from_repo_root_discovers_all_subproject_lockfiles() {
     let tmp = tempfile::tempdir().unwrap();
     let backend = tmp.path().join("backend");

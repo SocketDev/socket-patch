@@ -94,8 +94,8 @@ impl Mode {
     /// The `scan` flags that produce this mode's wiring.
     pub fn scan_flags(self) -> &'static [&'static str] {
         match self {
-            Mode::Hosted => &["--redirect"],
-            Mode::Vendored => &["--vendor", "--vendor-source", "build"],
+            Mode::Hosted => &["--mode=hosted"],
+            Mode::Vendored => &["--vendor", "--vendor-source", "service"],
         }
     }
 }
@@ -473,7 +473,7 @@ impl RealApi {
                     "results": { uuid: {
                         "status": "granted", "url": url, "purl": PURL,
                         "artifacts": [{ "kind": "tarball", "url": url,
-                                        "integrity": { "sha256": api.wheel_sha256 } }],
+                                        "integrity": { "sha256": api.wheel_sha256, "sha512": ({ use base64::Engine as _; use sha2::Digest; format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&wheel))) }) } }],
                         "registryOverride": null
                     } }
                 }))),

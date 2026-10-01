@@ -45,36 +45,27 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_
 [features]
 # Every ecosystem (npm, PyPI, Ruby gems, Go, Cargo, NuGet, Maven, Composer,
 # Deno) is unconditionally compiled in AND enabled at runtime — there are no
-# ecosystem feature gates and no runtime env gates (the old
-# SOCKET_EXPERIMENTAL_MAVEN/NUGET opt-ins are retired).
+# ecosystem feature gates and no runtime env gates.
 # The only features left gate opt-in test suites:
 #
 # Enables the Docker-driven real-package e2e test suite under
 # `tests/docker_e2e_*.rs`. Tests in this suite require either a running
 # Docker daemon OR `SOCKET_PATCH_TEST_HOST=1` (host-toolchain mode).
 docker-e2e = []
-# Enables the experimental `setup` end-to-end test matrix under
-# `tests/setup_matrix_*.rs`, which drives the `socket-patch setup` →
-# native-install → patch-applied flow across every ecosystem/package
-# manager via `tests/setup_matrix/run-case.sh`. Same runtime requirement
-# as docker-e2e (Docker daemon OR `SOCKET_PATCH_TEST_HOST=1`). These
-# tests are ASPIRATIONAL: they assert the ideal (install applies the
-# patch) and are EXPECTED to fail for ecosystems whose install hooks
-# `setup` does not yet configure. Kept off `--all-features`-required CI;
-# the dedicated `setup-matrix` CI job runs them non-blocking.
-setup-e2e = []
 
 [dev-dependencies]
 # vendor_crash_safety_e2e / vendor_group_commit_e2e crash the binary through
 # its failpoints; with this, `cargo test --release` (the test-release job)
 # builds them in too. Dev-only: resolver 2 keeps it out of normal builds.
-socket-patch-core = { workspace = true, features = ["failpoints"] }
+socket-patch-core = { workspace = true, features = ["failpoints", "test-fixtures"] }
 sha2 = { workspace = true }
 # docker_e2e_vendor_maven's host oracle recomputes the maven2 .jar.sha1 sidecar.
 sha1 = { workspace = true }
 # scan_vendor_e2e builds pristine registry tarballs for the auto-fetch tests.
 tar = { workspace = true }
 flate2 = { workspace = true }
+# diff_created_file_e2e builds a real diff archive.
+qbsdiff = { workspace = true }
 # update_fixture builds the Windows-shaped release archive for self-update e2e.
 zip = { workspace = true }
 hex = { workspace = true }

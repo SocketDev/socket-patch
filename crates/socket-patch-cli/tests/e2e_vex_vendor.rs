@@ -10,8 +10,8 @@
 //!      carries the "(vendored)" marker
 //!   2. tampered vendored artifact → omitted, envelope skip reason
 //!      `vendor_hash_mismatch`
-//!   3. Property-7 exemption: a vendored patch needs no install hook by
-//!      construction, so it bypasses the configured/manual ecosystem filter
+//!   3. vendored and agent-mode patches attest side by side with no
+//!      manifest `setup` section, the vendored one marked "(vendored)"
 //!   4. legacy `.socket/go-patches/` redirect regression: an apply-redirected
 //!      Go patch verifies against the redirect copy dir, not the (pristine)
 //!      module cache
@@ -29,7 +29,7 @@ use std::process::Command;
 use serde_json::Value;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{
-    PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
+    PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 use socket_patch_core::vendor::state::{
     VendorArtifact, VendorEntry, VendorState, WiringAction, WiringRecord,
@@ -38,10 +38,6 @@ use socket_patch_core::vendor::state::{
 /// Canonical-grammar patch UUID — the vendored-artifact verifier validates
 /// the uuid path level, so fixtures must use the real shape.
 const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
-
-/// Every setup-supported ecosystem, declared `manual` so the property-7
-/// filter doesn't interfere with the tests that aren't about it.
-const ALL_MANUAL: &[&str] = &["npm", "pypi", "cargo", "golang", "gem", "composer"];
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_socket-patch")
@@ -60,21 +56,13 @@ fn cli() -> Command {
     cmd
 }
 
-/// Write `manifest` to `<cwd>/.socket/manifest.json`, optionally declaring
-/// every ecosystem `manual` (tests of the property-7 exemption pass `false`).
-fn write_manifest(cwd: &Path, manifest: &PatchManifest, declare_manual: bool) {
+/// Write `manifest` to `<cwd>/.socket/manifest.json`.
+fn write_manifest(cwd: &Path, manifest: &PatchManifest) {
     let dir = cwd.join(".socket");
     std::fs::create_dir_all(&dir).unwrap();
-    let mut m = manifest.clone();
-    if declare_manual {
-        m.setup = Some(SetupConfig {
-            exclude: Vec::new(),
-            manual: ALL_MANUAL.iter().map(|s| s.to_string()).collect(),
-        });
-    }
     std::fs::write(
         dir.join("manifest.json"),
-        serde_json::to_string_pretty(&m).unwrap(),
+        serde_json::to_string_pretty(manifest).unwrap(),
     )
     .unwrap();
 }
@@ -166,6 +154,7 @@ fn write_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
             base_purl: purl.to_string(),
             uuid: UUID.to_string(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel_path.to_string(),
                 sha256: String::new(),
                 size: None,
@@ -219,8 +208,8 @@ fn vendored_purl_attested_with_no_installed_tree() {
     let rel = write_vendored_dir(cwd, patched);
     write_vendor_state(cwd, purl, &rel);
 
-    // No Cargo.toml, no target/, no registry copy — the vendored artifact
-    // is the ONLY evidence on disk.
+    // No installed tree (no target/, no registry copy) — only the wiring
+    // Cargo.toml and the vendored artifact are on disk.
     let mut manifest = PatchManifest::new();
     manifest.patches.insert(
         purl.to_string(),
@@ -232,7 +221,7 @@ fn vendored_purl_attested_with_no_installed_tree() {
             &["CVE-2024-1"],
         ),
     );
-    write_manifest(cwd, &manifest, true);
+    write_manifest(cwd, &manifest);
 
     let out = cli()
         .args([
@@ -291,7 +280,7 @@ fn tampered_vendored_artifact_omitted_with_vendor_hash_mismatch() {
             &["CVE-2024-2"],
         ),
     );
-    write_manifest(cwd, &manifest, true);
+    write_manifest(cwd, &manifest);
 
     let vex_path = cwd.join("out.vex.json");
     let out = cli()
@@ -336,11 +325,12 @@ fn tampered_vendored_artifact_omitted_with_vendor_hash_mismatch() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// 3. Property-7 exemption — vendored patches need no install hook
+// 3. vendored + agent-mode patches attest together — no manifest `setup`
+// section is needed for either
 // ──────────────────────────────────────────────────────────────────────
 
 #[test]
-fn property7_vendored_purl_bypasses_setup_manual_filter() {
+fn vendored_and_agent_patches_attest_without_setup_config() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
     let vendored_purl = "pkg:cargo/serde@1.0.0";
@@ -350,10 +340,8 @@ fn property7_vendored_purl_bypasses_setup_manual_filter() {
     let rel = write_vendored_dir(cwd, patched);
     write_vendor_state(cwd, vendored_purl, &rel);
 
-    // Control: an npm patch that VERIFIES against node_modules but whose
-    // ecosystem is neither set up (no postinstall hook anywhere) nor manual
-    // — property 7 must drop it, proving the filter ran while the vendored
-    // patch sailed through.
+    // An agent-mode npm patch that VERIFIES against node_modules, with no
+    // install hook and no manifest `setup` section: it attests too.
     let nm_pkg = cwd.join("node_modules/applied-pkg");
     std::fs::create_dir_all(&nm_pkg).unwrap();
     std::fs::write(
@@ -386,8 +374,7 @@ fn property7_vendored_purl_bypasses_setup_manual_filter() {
             &["CVE-2024-4"],
         ),
     );
-    // NO setup section: nothing configured, nothing manual.
-    write_manifest(cwd, &manifest, false);
+    write_manifest(cwd, &manifest);
 
     let out = cli()
         .args([
@@ -401,7 +388,7 @@ fn property7_vendored_purl_bypasses_setup_manual_filter() {
         .expect("invoke vex");
     assert!(
         out.status.success(),
-        "the vendored patch must be attested without any setup/manual config. stderr:\n{}",
+        "both patches must attest without any manifest setup section. stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -410,26 +397,36 @@ fn property7_vendored_purl_bypasses_setup_manual_filter() {
     let stmts = doc["statements"].as_array().unwrap();
     assert_eq!(
         stmts.len(),
-        1,
-        "only the vendored patch bypasses property 7; the unconfigured npm \
-         control must be dropped. doc:\n{stdout}"
+        2,
+        "the vendored patch and the applied agent-mode npm patch both attest. doc:\n{stdout}"
     );
-    assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-vend-cccc");
+    assert_eq!(
+        impact_for(stmts, "GHSA-vend-cccc"),
+        format!("Patched via Socket patch {UUID} (vendored)")
+    );
     assert!(
-        !stdout.contains("GHSA-npm-control"),
-        "the non-vendored, non-configured npm patch must be filtered:\n{stdout}"
+        !impact_for(stmts, "GHSA-npm-control").contains("(vendored)"),
+        "the agent-mode npm patch is not vendored:\n{stdout}"
     );
 }
 
-/// The property-7 vendored exemption (and the "(vendored)" phrasing) must
-/// survive `--no-verify`: the exemption's rationale — the committed
-/// `.socket/vendor/` artifact + lockfile wiring IS the persistence
-/// mechanism — is about how the patch persists, not about whether this run
-/// hashed it. The vendored classification comes from the committed ledger,
+/// The impact statement of the one statement naming `vuln`.
+fn impact_for(stmts: &[Value], vuln: &str) -> String {
+    let hits: Vec<&Value> = stmts
+        .iter()
+        .filter(|s| s["vulnerability"]["name"] == vuln)
+        .collect();
+    assert_eq!(hits.len(), 1, "exactly one statement for {vuln}: {stmts:?}");
+    hits[0]["impact_statement"].as_str().unwrap().to_string()
+}
+
+/// The "(vendored)" phrasing must survive `--no-verify`: it is about how
+/// the patch persists — the committed `.socket/vendor/` artifact + lockfile
+/// wiring — not about whether this run hashed it. The vendored classification comes from the committed ledger,
 /// which `--no-verify` can read without hashing anything (the artifact dir
 /// is deliberately ABSENT here to pin that no hashing happens).
 #[test]
-fn property7_vendored_exemption_survives_no_verify() {
+fn vendored_marker_survives_no_verify() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
     let vendored_purl = "pkg:cargo/serde@1.0.0";
@@ -451,9 +448,8 @@ fn property7_vendored_exemption_survives_no_verify() {
             &["CVE-2024-6"],
         ),
     );
-    // Control: an npm patch with no hook configured and no `manual`
-    // declaration — property 7 must still drop it under `--no-verify`
-    // (the filter runs regardless of verification mode).
+    // An agent-mode npm patch: `--no-verify` trusts the manifest, so it
+    // attests too — without the vendored marker.
     manifest.patches.insert(
         "pkg:npm/unconfigured-pkg@1.0.0".to_string(),
         make_record(
@@ -464,8 +460,7 @@ fn property7_vendored_exemption_survives_no_verify() {
             &["CVE-2024-7"],
         ),
     );
-    // NO setup section: nothing configured, nothing manual.
-    write_manifest(cwd, &manifest, false);
+    write_manifest(cwd, &manifest);
 
     let out = cli()
         .args([
@@ -480,7 +475,7 @@ fn property7_vendored_exemption_survives_no_verify() {
         .expect("invoke vex");
     assert!(
         out.status.success(),
-        "--no-verify must keep the vendored patch's property-7 exemption. stderr:\n{}",
+        "--no-verify must attest the vendored patch. stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -489,21 +484,17 @@ fn property7_vendored_exemption_survives_no_verify() {
     let stmts = doc["statements"].as_array().unwrap();
     assert_eq!(
         stmts.len(),
-        1,
-        "only the vendored patch bypasses property 7 under --no-verify; the \
-         unconfigured npm control must still be dropped. doc:\n{stdout}"
+        2,
+        "--no-verify attests every manifest patch. doc:\n{stdout}"
     );
-    assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-vend-dddd");
-    let impact = stmts[0]["impact_statement"].as_str().unwrap();
     assert_eq!(
-        impact,
+        impact_for(stmts, "GHSA-vend-dddd"),
         format!("Patched via Socket patch {UUID} (vendored)"),
         "--no-verify must not lose the (vendored) provenance marker"
     );
     assert!(
-        !stdout.contains("GHSA-npm-control"),
-        "the non-vendored, non-configured npm patch must be filtered even \
-         under --no-verify:\n{stdout}"
+        !impact_for(stmts, "GHSA-npm-control").contains("(vendored)"),
+        "the agent-mode npm patch is not vendored:\n{stdout}"
     );
 }
 
@@ -561,7 +552,7 @@ fn golang_go_patches_redirect_attested_without_module_cache() {
             &["CVE-2024-5"],
         ),
     );
-    write_manifest(cwd, &manifest, true);
+    write_manifest(cwd, &manifest);
 
     // Hermetic, EMPTY module cache: the pristine module is nowhere on disk,
     // exactly like a fresh checkout that only ran the redirect apply.
@@ -619,6 +610,7 @@ fn write_detached_vendor_state(cwd: &Path, purl: &str, rel_path: &str, record: P
             base_purl: purl.to_string(),
             uuid: UUID.to_string(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel_path.to_string(),
                 sha256: String::new(),
                 size: None,
@@ -649,8 +641,7 @@ fn write_detached_vendor_state(cwd: &Path, purl: &str, rel_path: &str, record: P
 
 /// A detached vendored patch has NO manifest record — `vex` must attest it
 /// from the ledger's embedded record + the committed artifact, even when
-/// `.socket/manifest.json` does not exist at all. The vendored property-7
-/// exemption applies (no setup/manual declaration anywhere).
+/// `.socket/manifest.json` does not exist at all.
 #[test]
 fn detached_entry_attested_without_manifest() {
     let tmp = tempfile::tempdir().unwrap();
@@ -792,7 +783,7 @@ fn write_member_tgz(dest: &Path, member: &str, bytes: &[u8]) -> Vec<u8> {
 
 /// Minimal STORED-entry (no compression) zip writer — local headers +
 /// central directory + EOCD — and returns the bytes for the ledger sha256.
-/// The production reader (`verify_wheel_members`' bounded `zip::ZipArchive`,
+/// The production reader (`vendor::verify`'s bounded `read_zip_to_map` over `zip::ZipArchive`,
 /// which handles `.whl`/`.nupkg`/`.jar` alike) is the code under test;
 /// hand-rolling the writer keeps this test crate off a zip-writer dependency
 /// while still producing honest zip-family artifacts.
@@ -997,6 +988,7 @@ fn detached_matrix_entry(
         base_purl: purl.to_string(),
         uuid: uuid.to_string(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: rel_path.to_string(),
             sha256,
             size: None,
@@ -1022,8 +1014,7 @@ fn detached_matrix_entry(
 /// maven (maven2-layout `.jar`) — laid down in each ecosystem's REAL
 /// artifact shape (dir / tarball / zip-family) with matching afterHashes,
 /// then ONE `vex` run must attest all of them `(vendored)` from the ledger
-/// alone: no manifest, no installed trees, no setup/manual declarations
-/// (the vendored property-7 exemption covers every row).
+/// alone: no manifest, no installed trees.
 #[test]
 fn detached_vendor_matrix_attests_every_vendor_ecosystem() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1482,28 +1473,21 @@ fn vendored_npm_patch_with_an_unpatched_bundled_copy_is_not_attested() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// 8. property-7 filter drops are machine-visible — a byte-verified applied
-// patch omitted ONLY by the ecosystem-setup filter must surface as a
-// per-purl skipped event (errorCode `ecosystem_not_setup`), and an all-
-// drops failure must say so in the top-level error message instead of the
-// generic (and factually wrong) "No applied patches ... to attest."
-// Confirmed against real pnpm projects 2026-08-18.
+// 8. an applied, byte-verified agent-mode patch attests whether or not its
+// ecosystem has an install hook (there is no setup-state filter).
 // ──────────────────────────────────────────────────────────────────────
 
-/// All-drops case: the ONLY patch is applied + byte-verified but its
-/// ecosystem is neither set up nor `manual`. Exit stays 1 with code
-/// `no_applicable_patches`, but the envelope must carry the skipped event
-/// and the message must name the setup filter. A stale OpenVEX doc parked
-/// at `--output` from a previous run must also be removed — a failed run
-/// leaves no attestation behind.
+/// The ONLY patch is applied + byte-verified in a project with no install
+/// hook and no manifest `setup` section: it attests (exit 0, a `verified`
+/// event), and the fresh doc replaces a stale one parked at `--output`.
 #[test]
-fn setup_filter_drop_surfaces_skipped_event_and_removes_stale_doc() {
+fn agent_patch_without_install_hook_attests_and_replaces_stale_doc() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let cwd = tmp.path();
     let purl = "pkg:npm/applied-pkg@1.0.0";
 
-    // Applied + verifiable in node_modules; no root package.json → no npm
-    // hook configured; manifest carries NO setup section.
+    // Applied + verifiable in node_modules; no root package.json (so no
+    // install hook anywhere); the manifest carries no setup section.
     let nm = cwd.join("node_modules/applied-pkg");
     std::fs::create_dir_all(&nm).expect("create node_modules entry");
     std::fs::write(
@@ -1526,7 +1510,7 @@ fn setup_filter_drop_surfaces_skipped_event_and_removes_stale_doc() {
             &["CVE-2026-20"],
         ),
     );
-    write_manifest(cwd, &manifest, false);
+    write_manifest(cwd, &manifest);
 
     // A previous successful run's doc sits at --output.
     let vex_path = cwd.join("out.vex.json");
@@ -1549,49 +1533,45 @@ fn setup_filter_drop_surfaces_skipped_event_and_removes_stale_doc() {
         ])
         .output()
         .expect("invoke vex");
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "all patches filtered ⇒ soft exit 1. stdout:\n{}",
+    assert!(
+        out.status.success(),
+        "an applied agent-mode patch attests. stdout:\n{}",
         String::from_utf8_lossy(&out.stdout)
     );
 
     let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
-    assert_eq!(env["status"], "error", "{env}");
-    assert_eq!(env["error"]["code"], "no_applicable_patches", "{env}");
-    // The message must name the ACTUAL cause — the patch IS applied with
-    // vulnerability metadata; only the setup filter dropped it.
-    let msg = env["error"]["message"].as_str().unwrap();
-    assert!(
-        msg.contains("not set up") && msg.contains("setup.manual"),
-        "an all-drops failure must name the setup filter, got {msg:?}"
-    );
-    // Machine-visible per-purl drop.
+    assert_eq!(env["status"], "success", "{env}");
     let events = env["events"].as_array().unwrap();
-    let skipped = events
-        .iter()
-        .find(|e| e["action"] == "skipped" && e["purl"] == purl)
-        .unwrap_or_else(|| panic!("expected a skipped event for the filtered purl: {env}"));
-    assert_eq!(
-        skipped["errorCode"], "ecosystem_not_setup",
-        "the filter drop must carry its routing tag: {skipped}"
-    );
-    // Failed-run hygiene: the stale prior doc must be gone.
     assert!(
-        !vex_path.exists(),
-        "a failed run must not leave a previous run's attestation at --output"
+        events
+            .iter()
+            .any(|e| e["action"] == "verified" && e["purl"] == purl),
+        "expected a verified event for {purl}: {env}"
     );
+    assert!(
+        !events.iter().any(|e| e["action"] == "skipped"),
+        "nothing is omitted: {env}"
+    );
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&vex_path).expect("read emitted VEX doc"))
+            .expect("parse emitted VEX doc");
+    assert_ne!(
+        doc["@id"], "urn:uuid:stale",
+        "the stale doc is replaced: {doc}"
+    );
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(stmts.len(), 1, "{doc}");
+    assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-drop-aaaa", "{doc}");
 }
 
-/// Partial case: a vendored patch attests while an npm patch is filter-
-/// dropped. Exit 0 (a doc was produced), envelope `partialFailure`, and the
-/// drop is a skipped event alongside the vendored purl's verified event.
+/// A vendored patch and an applied agent-mode npm patch (no install hook)
+/// both attest: exit 0, envelope `success`, a verified event for each.
 #[test]
-fn setup_filter_drop_alongside_success_is_partial_failure_event() {
+fn agent_patch_alongside_vendored_patch_both_attest() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let cwd = tmp.path();
     let vendored_purl = "pkg:cargo/serde@1.0.0";
-    let dropped_purl = "pkg:npm/applied-pkg@1.0.0";
+    let agent_purl = "pkg:npm/applied-pkg@1.0.0";
 
     let patched = b"patched vendored source\n";
     let after_hash = compute_git_sha256_from_bytes(patched);
@@ -1621,7 +1601,7 @@ fn setup_filter_drop_alongside_success_is_partial_failure_event() {
         ),
     );
     manifest.patches.insert(
-        dropped_purl.to_string(),
+        agent_purl.to_string(),
         make_record(
             "11111111-1111-4111-8111-111111111111",
             "package/index.js",
@@ -1630,7 +1610,7 @@ fn setup_filter_drop_alongside_success_is_partial_failure_event() {
             &["CVE-2026-22"],
         ),
     );
-    write_manifest(cwd, &manifest, false);
+    write_manifest(cwd, &manifest);
 
     let vex_path = cwd.join("out.vex.json");
     let out = cli()
@@ -1648,33 +1628,26 @@ fn setup_filter_drop_alongside_success_is_partial_failure_event() {
         .expect("invoke vex");
     assert!(
         out.status.success(),
-        "a produced doc keeps exit 0 even with filter drops. stdout:\n{}",
+        "both patches attest. stdout:\n{}",
         String::from_utf8_lossy(&out.stdout)
     );
 
     let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
-    assert_eq!(
-        env["status"], "partialFailure",
-        "an omission alongside a success is partialFailure: {env}"
-    );
+    assert_eq!(env["status"], "success", "{env}");
     let events = env["events"].as_array().unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|e| e["action"] == "verified" && e["purl"] == vendored_purl),
-        "the vendored purl must attest: {env}"
-    );
-    let skipped = events
-        .iter()
-        .find(|e| e["action"] == "skipped" && e["purl"] == dropped_purl)
-        .unwrap_or_else(|| panic!("expected a skipped event for the filtered purl: {env}"));
-    assert_eq!(skipped["errorCode"], "ecosystem_not_setup", "{skipped}");
+    for purl in [vendored_purl, agent_purl] {
+        assert!(
+            events
+                .iter()
+                .any(|e| e["action"] == "verified" && e["purl"] == purl),
+            "{purl} must attest: {env}"
+        );
+    }
 
-    // The doc holds exactly the vendored statement.
     let doc: Value =
         serde_json::from_str(&std::fs::read_to_string(&vex_path).expect("read emitted VEX doc"))
             .expect("parse emitted VEX doc");
-    assert_eq!(doc["statements"].as_array().unwrap().len(), 1, "{doc}");
+    assert_eq!(doc["statements"].as_array().unwrap().len(), 2, "{doc}");
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1707,7 +1680,7 @@ fn product_override_non_iri_warns_in_envelope() {
             &["CVE-2026-30"],
         ),
     );
-    write_manifest(cwd, &manifest, true);
+    write_manifest(cwd, &manifest);
 
     let vex_path = cwd.join("out.vex.json");
     let out = cli()
@@ -1794,7 +1767,7 @@ fn standalone_output_write_failure_names_path_and_exits_2() {
             &["CVE-2026-31"],
         ),
     );
-    write_manifest(cwd, &manifest, true);
+    write_manifest(cwd, &manifest);
 
     let bad_path = cwd.join("no-such-dir/out.vex.json");
     let out = cli()
@@ -1898,7 +1871,7 @@ fn unwired_vendor_ledger_entry_is_not_attested() {
             &["CVE-2026-20"],
         ),
     );
-    write_manifest(cwd, &manifest, true);
+    write_manifest(cwd, &manifest);
     // The lockfile/config wiring is reverted by hand; the artifact and the
     // ledger entry stay behind.
     std::fs::write(cwd.join("Cargo.toml"), CARGO_MANIFEST_HEAD).unwrap();
@@ -2119,11 +2092,10 @@ fn lockfile_vendored_ref_whose_record_names_another_package_is_a_mismatch() {
     );
 }
 
-/// REGRESSION: `repair`'s ledger reconstruction writes entries with
+/// `repair`'s ledger reconstruction writes entries with
 /// `wiring: []` (every ecosystem but gem) and says VEX attests them. With
 /// no recorded wiring file, liveness must probe the ecosystem's root locks
-/// — here a pnpm lock (a format lockfile discovery does not read yet) that
-/// still wires the committed tarball — instead of calling the entry
+/// — here a pnpm lock that still wires the committed tarball — instead of calling the entry
 /// `vendor_unwired`. Once that lock is reverted, the entry is unwired.
 #[test]
 fn reconstructed_ledger_entry_without_wiring_attests_from_the_root_lock() {
@@ -2153,6 +2125,7 @@ fn reconstructed_ledger_entry_without_wiring_attests_from_the_root_lock() {
             base_purl: purl.to_string(),
             uuid: uuid.to_string(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel.clone(),
                 sha256: String::new(),
                 size: None,
@@ -2215,10 +2188,10 @@ fn reconstructed_ledger_entry_without_wiring_attests_from_the_root_lock() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// 9. REGRESSION (core discover rule 11): a vendor ledger entry whose
-// artifact the lockfiles still MENTION, but only in a shape the package
-// manager does not consume, is dead — the ledger fallback no longer
-// re-derives "live" from the raw text the extractor already rejected.
+// 9. Core discover rule 11: a vendor ledger entry whose artifact the
+// lockfiles still MENTION, but only in a shape the package manager does not
+// consume, is dead — the ledger fallback never re-derives "live" from the
+// raw text the extractor already rejected.
 // ──────────────────────────────────────────────────────────────────────
 
 /// A detached ledger entry (embedded record) for `purl` → `rel`, recording

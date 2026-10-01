@@ -1,31 +1,15 @@
-//! Equivalence oracle for the Cargo.lock block bound, which now searches the
-//! trailing-table markers only up to the next `[[package]]` instead of to
-//! EOF. The previous implementation is kept as
-//! [`lock_block_end_unbounded`]; every consumer (`plan_cargo_lock`,
-//! `next_lock_block`) is a function of the bound alone, so equality at every
-//! body offset of every lock shape is equality of the rewriter.
+//! Seeded and hand-written Cargo.lock sweeps for the hosted splice, which
+//! edits the byte spans of the lock's one parse ([`CargoLock::parse`] →
+//! [`CargoLock::plan_hosted`]). Every plan is pinned per case by
+//! `tests/equivalence/cargo_lock_*.golden`, blessed while the previous
+//! line-grammar planner still ran beside it as an oracle (identical bytes
+//! and edits wherever that grammar could read the lock).
 
-use super::*;
-
-/// Deterministic xorshift64* — no `rand` dev-dependency.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-    fn chance(&mut self, percent: u64) -> bool {
-        self.next() % 100 < percent
-    }
-}
+use crate::formats::cargo::hosted::CargoLockPlan;
+use crate::formats::cargo::CargoLock;
+use crate::golden::Golden;
+use crate::patch::redirect::FileEdit;
+use crate::test_rng::Rng;
 
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
@@ -113,82 +97,126 @@ fn synth_lock(rng: &mut Rng, blocks: usize, v1: bool) -> String {
     out
 }
 
-fn assert_bound_matches_at(content: &str, body_start: usize, what: &str) {
-    assert_eq!(
-        lock_block_end(content, body_start),
-        lock_block_end_unbounded(content, body_start),
-        "{what}: bound at body offset {body_start}"
-    );
+
+const INDEX: &str = "sparse+https://socket.example/cargo/index/";
+
+fn plan_new(lock: &str, name: &str, version: &str, cksum: &str) -> CargoLockPlan {
+    CargoLock::parse(lock)
+        .expect("synthesized locks parse")
+        .plan_hosted(lock, name, version, INDEX, cksum)
 }
 
-/// Every char boundary is a body offset: the bound must agree even where
-/// the rewriter never asks, so no future caller can find a divergence.
-fn assert_bound_matches_everywhere(content: &str, what: &str) {
-    for (at, _) in content.char_indices() {
-        assert_bound_matches_at(content, at, what);
+/// A plan as comparable data.
+fn shape(plan: &CargoLockPlan) -> (String, Option<String>, Vec<FileEdit>) {
+    match plan {
+        CargoLockPlan::Rewritten { content, edits } => {
+            ("rewritten".into(), Some(content.clone()), edits.clone())
+        }
+        CargoLockPlan::AlreadyRedirected => ("already".into(), None, Vec::new()),
+        CargoLockPlan::NotFound => ("not-found".into(), None, Vec::new()),
+        CargoLockPlan::Ambiguous => ("ambiguous".into(), None, Vec::new()),
     }
-    assert_bound_matches_at(content, content.len(), what);
+}
+
+fn check(g: &mut Golden, lock: &str, name: &str, version: &str, cksum: &str) -> Option<String> {
+    let new = shape(&plan_new(lock, name, version, cksum));
+    g.next(&(lock, name, version, cksum), &new);
+    new.1
+}
+
+/// `(name, version)` of every `[[package]]` the lock holds, in order.
+fn targets(lock: &str) -> Vec<(String, String)> {
+    CargoLock::parse(lock)
+        .expect("synthesized locks parse")
+        .packages()
+        .iter()
+        .map(|p| (p.name.clone(), p.version.clone()))
+        .collect()
+}
+
+/// Every package of `lock`, then a second package planned over the first's
+/// output and a re-run of the first (the no-op path), and an absent package.
+fn sweep_lock(g: &mut Golden, lock: &str, rng: &mut Rng) {
+    let all = targets(lock);
+    for (name, version) in &all {
+        let cksum = format!("{:016x}{:016x}", rng.next(), rng.next());
+        let Some(once) = check(g, lock, name, version, &cksum) else {
+            continue;
+        };
+        check(g, &once, name, version, &cksum);
+        if let Some((other, other_version)) = all.get(rng.below(all.len())) {
+            check(g, &once, other, other_version, "00ff");
+        }
+    }
+    check(g, lock, "absent-crate", "9.9.9", "00");
 }
 
 #[test]
-fn bound_matches_unbounded_at_every_offset_of_random_locks() {
+fn span_splice_matches_golden_on_random_locks() {
+    let mut g = Golden::new(
+        "cargo_lock_random",
+        "One package of a seeded Cargo.lock, planned for the hosted index.",
+    )
+    .chunked(20);
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-    for case in 0..300 {
+    for _ in 0..300 {
         let v1 = rng.chance(50);
         let blocks = rng.below(12);
         let lock = synth_lock(&mut rng, blocks, v1);
-        assert_bound_matches_everywhere(&lock, &format!("case {case} (v1={v1})"));
-        let crlf = lock.replace('\n', "\r\n");
-        assert_bound_matches_everywhere(&crlf, &format!("case {case} crlf"));
+        sweep_lock(&mut g, &lock, &mut rng);
     }
+    g.finish();
 }
 
+/// Hand-written shapes the generator does not produce: multi-source twins
+/// (one at the target index, and none), a v1 `[root]` table, a v1 block with
+/// no source, a source ending the text, and blocks with neither line.
 #[test]
-fn bound_matches_unbounded_on_hand_written_edges() {
-    for lock in [
-        "",
-        "\n",
-        "[[package]]\n",
-        "[[package]]\nname = \"a\"\nversion = \"1.0.0\"",
-        "[[package]]\nname = \"a\"\nversion = \"1.0.0\"\n\n\n",
-        // Trailing tables immediately after the last block, and before it.
-        "[[package]]\nname = \"a\"\n[metadata]\n\"x\" = \"y\"\n",
-        "[[package]]\nname = \"a\"\n\n[patch.crates-io]\n\n[[package]]\nname = \"b\"\n",
-        "[[package]]\nname = \"a\"\n\n[[patch.unused]]\nname = \"u\"\n\n[metadata]\n",
-        // A trailer before a later block (not cargo-shaped, still must agree).
-        "[[package]]\nname = \"a\"\n\n[metadata]\n\n[[package]]\nname = \"b\"\n",
-        // Look-alikes without the leading newline.
-        "[[package]]\nname = \"a [metadata]\"\nx = \" [[package]]\"\n",
-        "\n\n[[package]]\n\n\n[[package]]\n\n",
-    ] {
-        assert_bound_matches_everywhere(lock, &format!("{lock:?}"));
-    }
-}
-
-/// The CG1 guard shape: ≥1k blocks, where the unbounded search was
-/// quadratic. Checked at every block body (what `plan_cargo_lock` asks for)
-/// and along the `next_lock_block` walk its dependents loop takes.
-#[test]
-fn bound_matches_unbounded_at_every_block_of_a_large_lock() {
+fn span_splice_matches_golden_on_hand_written_locks() {
+    let crates_io = CRATES_IO;
+    let twins_ours = format!(
+        "version = 3\n\n[[package]]\nname = \"t\"\nversion = \"1.0.0\"\nsource = \"{crates_io}\"\nchecksum = \"aa\"\n\n[[package]]\nname = \"t\"\nversion = \"1.0.0\"\nsource = \"{INDEX}\"\nchecksum = \"bb\"\n"
+    );
+    let twins_neither = twins_ours.replace(INDEX, "registry+https://other.example/index");
+    let v1_root = format!(
+        "[root]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"d 1.0.0 ({crates_io})\",\n]\n\n[[package]]\nname = \"d\"\nversion = \"1.0.0\"\nsource = \"{crates_io}\"\n\n[[package]]\nname = \"u\"\nversion = \"2.0.0\"\nsource = \"{crates_io}\"\ndependencies = [\n \"d 1.0.0 ({crates_io})\",\n]\n\n[metadata]\n\"checksum d 1.0.0 ({crates_io})\" = \"cc\"\n\"checksum u 2.0.0 ({crates_io})\" = \"dd\"\n"
+    );
+    let sourceless_v1 = "[[package]]\nname = \"s\"\nversion = \"1.0.0\"\n\n[metadata]\n\"checksum s 1.0.0 (registry+x)\" = \"ee\"\n".to_string();
+    let source_at_eof = format!("[[package]]\nname = \"e\"\nversion = \"1.0.0\"\nsource = \"{crates_io}\"");
+    let bare = "version = 3\n\n[[package]]\nname = \"b\"\nversion = \"1.0.0\"\n\n[[package]]\nname = \"c\"\nversion = \"1.0.0\"\n".to_string();
+    let mut g = Golden::new(
+        "cargo_lock_hand_written",
+        "One package of a hand-written Cargo.lock shape, planned for the hosted index.",
+    );
     let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    for (_what, lock) in [
+        ("twins, one ours", twins_ours),
+        ("twins, neither ours", twins_neither),
+        ("v1 [root]", v1_root),
+        ("v1 sourceless", sourceless_v1),
+        ("source at EOF", source_at_eof),
+        ("bare blocks", bare),
+    ] {
+        sweep_lock(&mut g, &lock, &mut rng);
+    }
+    g.finish();
+}
+
+/// The large-lock shape: ≥1k blocks, both formats, a sample of targets.
+#[test]
+fn span_splice_matches_golden_on_a_large_lock() {
+    let mut g = Golden::new(
+        "cargo_lock_large",
+        "One sampled package of a seeded ≥1k-block Cargo.lock, planned for the hosted index.",
+    );
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
     for v1 in [false, true] {
         let lock = synth_lock(&mut rng, 1_200, v1);
-        let mut blocks = 0;
-        for (at, _) in lock.match_indices("[[package]]\n") {
-            assert_bound_matches_at(&lock, at + "[[package]]\n".len(), "large");
-            blocks += 1;
-        }
-        assert!(blocks >= 1_000, "fixture keeps the ≥1k-block shape");
-        // The walk `plan_cargo_lock` does for dependents visits the same
-        // blocks with the same spans under either bound.
-        let mut cursor = 0;
-        while let Some((start, end)) = next_lock_block(&lock, cursor) {
-            assert_eq!(
-                end,
-                lock_block_end_unbounded(&lock, start + "[[package]]\n".len()),
-                "large (v1={v1}): block at {start}"
-            );
-            cursor = end;
+        let all = targets(&lock);
+        assert!(all.len() >= 1_000, "fixture keeps the ≥1k-block shape");
+        for (name, version) in all.iter().step_by(97) {
+            check(&mut g, &lock, name, version, "abcd");
         }
     }
+    g.finish();
 }
