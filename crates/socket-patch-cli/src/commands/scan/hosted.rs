@@ -3596,6 +3596,7 @@ mod tests {
                 "poetry.lock",
                 "pdm.lock",
                 "Pipfile.lock",
+                "Pipfile",
                 "pyproject.toml",
                 "hatch.toml",
                 "Cargo.toml",

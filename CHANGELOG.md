@@ -148,6 +148,9 @@ limits, and required install commands.
 - Python rewrites preserve supported markers, groups, extras, source metadata, and
   integrity pins. Relocks, out-of-tree environments, and lock-only VEX are handled
   consistently with each installer's supported behavior.
+- Hosted Pipenv scans read the `Pipfile`, so a conflicting `Pipfile.lock` entry
+  refuses the patch project-wide instead of half-redirecting a sibling
+  `requirements.txt` (#333).
 - Vendoring reuses valid committed artifacts during service outages. Updates do
   not build from a previous patch's modified bytes. Verified service artifacts
   keep their identity; integrity failures do not fall through to a local rebuild.

@@ -14,6 +14,9 @@
 //!   installer probe would otherwise need a real Pipenv 7–11 on PATH for;
 //! * a stale `Pipfile.lock` that does not pin the package does not veto
 //!   the sibling `requirements.txt` redirect;
+//! * a conflicting entry in a live `Pipfile.lock` (a `Pipfile` beside it)
+//!   vetoes the sibling `requirements.txt` redirect, while the same
+//!   conflict in an abandoned lock (no `Pipfile`) does not (#333);
 //! * a venv still holding the UPSTREAM release is reported stale and kept
 //!   out of the same-run attestation.
 //!
@@ -471,6 +474,70 @@ async fn stale_pipfile_lock_does_not_veto_the_requirements_redirect() {
         REQS
     );
     assert_eq!(read(&tmp.path().join("Pipfile.lock")), stale);
+}
+
+/// The lock entry repointed at the user's own wheel: a `file` source that
+/// is not Socket's, which the Pipenv planner refuses as a conflict.
+fn lock_with_user_file_source() -> String {
+    LOCK.replace(
+        "\"version\": \"==1.26.18\"",
+        "\"file\": \"wheels/urllib3-1.26.18-py2.py3-none-any.whl\"",
+    )
+}
+
+/// #333: a conflicting entry in a LIVE Pipfile.lock (a Pipfile beside it)
+/// means Pipenv never installs the patch, so the patch is refused for the
+/// whole project. The hosted scan must therefore see the Pipfile: the
+/// sibling requirements.txt stays untouched instead of being
+/// half-redirected.
+#[tokio::test]
+#[serial]
+async fn live_pipfile_lock_conflict_vetoes_the_requirements_redirect() {
+    let _major = MajorGuard::set("2026");
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let lock = lock_with_user_file_source();
+    std::fs::write(tmp.path().join("Pipfile.lock"), &lock).unwrap();
+    const REQS: &str = "urllib3==1.26.18\nrequests==2.31.0\n";
+    std::fs::write(tmp.path().join("requirements.txt"), REQS).unwrap();
+
+    run(hosted_args(tmp.path(), server.uri(), None)).await;
+    assert_eq!(
+        read(&tmp.path().join("requirements.txt")),
+        REQS,
+        "a live Pipfile.lock conflict must veto the sibling requirements.txt"
+    );
+    assert_eq!(read(&tmp.path().join("Pipfile.lock")), lock);
+    assert_eq!(read(&tmp.path().join("Pipfile")), PIPFILE);
+}
+
+/// The same conflict in an ABANDONED lock (no Pipfile beside it) says
+/// nothing about the project's install files: the sibling requirements.txt
+/// is still redirected.
+#[tokio::test]
+#[serial]
+async fn abandoned_pipfile_lock_conflict_does_not_veto_the_requirements_redirect() {
+    let _major = MajorGuard::set("2026");
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    std::fs::remove_file(tmp.path().join("Pipfile")).unwrap();
+    let lock = lock_with_user_file_source();
+    std::fs::write(tmp.path().join("Pipfile.lock"), &lock).unwrap();
+    const REQS: &str = "urllib3==1.26.18\nrequests==2.31.0\n";
+    std::fs::write(tmp.path().join("requirements.txt"), REQS).unwrap();
+
+    let code = run(hosted_args(tmp.path(), server.uri(), None)).await;
+    assert_eq!(code, 0);
+    let requirements = read(&tmp.path().join("requirements.txt"));
+    assert!(
+        requirements.contains(HOSTED_URL),
+        "an abandoned lock must not veto requirements.txt: {requirements}"
+    );
+    assert_eq!(read(&tmp.path().join("Pipfile.lock")), lock);
 }
 
 #[tokio::test]
