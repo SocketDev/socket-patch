@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-01 09:34Z, main `2463257` (v5 consolidation #277; CLI 4.0.0).
+Last run: 2026-10-01 15:41Z, main `6e7ef74` (v5 + #330 Poetry venv reorder; CLI 4.0.0).
 
 ## Coverage matrix
 
@@ -25,18 +25,21 @@ Cells marked v5 were re-run on `2463257` (v5: no hosted ledger, upstream-restore
 | macOS / Windows | 7–11 | untested | untested | untested | untested | untested | refused (documented) | n/a | n/a | untested |
 | any | 0–6 | untested | n/a | refused (documented) | n/a | n/a | refused (documented) | n/a | n/a | untested |
 
-Policy (socket.yml) cells, Linux 2026.8.0 hosted monorepo: every filter passes; `get <uuid>` skips the `policy_bypassed` warning (fail #453). Concurrent hosted scans: pass. Mirror / env-var source rollback refusal: pass (documented).
+Policy (socket.yml) cells, Linux 2026.8.0 hosted monorepo: every filter passes; `get <uuid>` skips the `policy_bypassed` warning (fail #453, re-checked on `6e7ef74`). socket.yml × `--package` / `--min-severity` / `--max-new-patches` intersections: pass (`6e7ef74`). Concurrent hosted scans: pass. SIGKILL mid hosted / vendored run: pass. Mirror / env-var source rollback refusal: pass (documented).
+
+Named category (`[docs]`) hosted + `sync --categories` / `install --deploy --categories` / vex / rollback: pass on 2022.12.19, 2023.12.1 and 2026.8.0; vendored: pass on 2022.12.19 and 2023.12.1 (`6e7ef74`). Non-registry entries (`path`, `file` URL, `git`): hosted refuses with `redirect_pipenv_refused`, vendored with `pypi_pipenv_source_already_exists`, vex attests nothing: pass on 2026.8.0.
+
+`-g` / agent on an unwritable prefix or a root-owned `.venv`, as a non-root user (2026.8.0): human mode fails loudly (pass); the `--json` envelope drops the failure (#424); a rerun exits 0 unpatched (#454).
 
 macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-01 09:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
 
-1. **Maintainer request (global `-g` mode):** Linux is covered on 2018.11.26, 2023.12.1 and 2026.8.0 (all pass, except the cross-PM cwd-project leak tracked in #436 / #445 and the no-`-g` fallback below). Still to do: macOS and Windows (blocked: no probe), 2022.12.19, and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry.
+1. **Maintainer request (global `-g` mode):** Linux is covered on 2018.11.26, 2023.12.1 and 2026.8.0, and the unwritable prefix as a non-root user is done (#424 / #454). Still to do: macOS and Windows (blocked: no probe), 2022.12.19 (use `pipenv --python <py3.10>`, not `PIPENV_PYTHON`), and a `--global-prefix` with spaces or unicode. Full checklist in the 20261001T040000Z entry.
 2. A macOS/Windows probe for hosted + VEX under the #334 / #384 shapes, and hosted / vendored on 2018 / 2022 there (CRLF on Windows).
-3. socket.yml with Pipenv 2022+ named categories, and `--package` / `--min-severity` / `--max-new-patches` CLI flags intersecting the file.
-4. Interrupted (SIGKILL) hosted / vendored runs on a Pipfile.lock.
-5. `PIPENV_PIPFILE` / subdirectory runs (a documented limitation; check the refusal message).
-6. Pipenv 7–11 agent mode with an out-of-tree venv (py3.8), and the `PIPENV_PYTHON` venv-name suffix on 11.
+3. Pipenv 7–11 agent mode with an out-of-tree venv (py3.8), and the `PIPENV_PYTHON` venv-name suffix on 11.
+4. A non-normalized `PIPENV_PIPFILE` (`./Pipfile`, `sub/../Pipfile`, another directory): Pipenv hashes `os.path.abspath`, while the crawler hashes `cwd.join(raw)` (`python_crawler.rs:990`).
+5. `pipenv requirements` / `pipenv verify` after a hosted redirect, on 2023.12.1 and 2026.8.0.
 
 ## Known non-bugs
 
@@ -61,3 +64,5 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - Hosted rollback refuses a `_meta.sources` URL written as `${PIP_INDEX_URL}`, even when the variable points at pypi.org; env vars aren't expanded. Documented and fail-closed, with the `git checkout` remedy.
 - `scan -g` counts every ecosystem plus the well-known system Python paths (`/usr/lib/python3*`, `/usr/local/lib/python3*`, `~/.local`). That's by design; Pipenv's WORKON_HOME venvs aren't included.
 - `--prune` warns that it has no effect with `--mode hosted`. Documented.
+- Non-registry Pipfile.lock entries (`path`, `file` URL, `git`) are refused in hosted (warning, exit 0) and vendored (`pypi_pipenv_source_already_exists`, exit 1). By design; the "no Pipfile beside the lock" wording in the hosted detail is #333.
+- Mock-API note: the batch mock must filter by the requested purls, and `by-package` must carry `vulnerabilities[*].severity`, or `--package` / `--min-severity` cells give false failures.
