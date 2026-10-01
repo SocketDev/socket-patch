@@ -630,12 +630,12 @@ async fn pypi_scan_sync_patches_egg_info_install() {
     // (b) the bare distutils / apt `.egg-info` FILE form.
     for bare_file in [false, true] {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let site = tmp
-            .path()
-            .join(".venv")
-            .join("lib")
-            .join("python3.11")
-            .join("site-packages");
+        let venv = tmp.path().join(".venv");
+        let site = if cfg!(windows) {
+            venv.join("Lib").join("site-packages")
+        } else {
+            venv.join("lib").join("python3.11").join("site-packages")
+        };
         std::fs::create_dir_all(&site).unwrap();
         let pkg_info =
             format!("Metadata-Version: 1.2\nName: {PYPI_PACKAGE}\nVersion: {PYPI_VERSION}\n");
