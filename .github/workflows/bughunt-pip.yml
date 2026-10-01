@@ -1,0 +1,113 @@
+name: bughunt-pip
+on:
+  push:
+    branches: ['bughunt/pip/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ['3.8', '3.13']
+        pip: ['20.3.4', 'latest']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: false
+      - run: cargo build --release -p socket-patch-cli
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: probe
+        run: |
+          set -x
+          W="$RUNNER_TEMP/w"; mkdir -p "$W"; cd "$W"
+          BIN="$GITHUB_WORKSPACE/target/release/socket-patch"; [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          python -m venv pv
+          if [ -d pv/Scripts ]; then PY=pv/Scripts/python; else PY=pv/bin/python; fi
+          if [ "${{ matrix.pip }}" = latest ]; then $PY -m pip install -q -U pip; else $PY -m pip install -q "pip==${{ matrix.pip }}"; fi
+          $PY -m pip --version
+          $PY -m pip download -q six==1.16.0 --no-deps -d dl
+          cat > mock.py <<'PYEOF'
+          import base64, hashlib, json, re, sys, zipfile, io
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          PORT=int(sys.argv[1]) if len(sys.argv)>1 else 8765
+          ORG="test-org"; PURL="pkg:pypi/six@1.16.0"; UUID="5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+          TOKEN="11111111-2222-4333-8444-555555555555"; WHEEL="six-1.16.0-py2.py3-none-any.whl"
+          GHSA="GHSA-real-pypi-0001"; CVE="CVE-2026-7201"
+          orig=zipfile.ZipFile("dl/"+WHEEL).read("six.py")
+          patched=orig+b"\n# SOCKET-PATCHED\nSOCKET_PATCHED = 1\n"
+          def d(b): return base64.urlsafe_b64encode(hashlib.sha256(b).digest()).rstrip(b"=").decode()
+          meta=b"Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\nSummary: x\n"
+          wh=b"Wheel-Version: 1.0\nGenerator: t\nRoot-Is-Purelib: true\nTag: py2-none-any\nTag: py3-none-any\n"
+          mem=[("six.py",patched),("six-1.16.0.dist-info/METADATA",meta),("six-1.16.0.dist-info/WHEEL",wh)]
+          rec="".join(f"{n},sha256={d(b)},{len(b)}\n" for n,b in mem)+"six-1.16.0.dist-info/RECORD,,\n"
+          buf=io.BytesIO(); z=zipfile.ZipFile(buf,"w")
+          for n,b in mem+[("six-1.16.0.dist-info/RECORD",rec.encode())]: z.writestr(n,b)
+          z.close(); wheel=buf.getvalue()
+          sha256=hashlib.sha256(wheel).hexdigest(); sha512="sha512-"+base64.b64encode(hashlib.sha512(wheel).digest()).decode()
+          def g(b): return hashlib.sha256(b"blob %d\0"%len(b)+b).hexdigest()
+          BASE=f"http://127.0.0.1:{PORT}"
+          APATH=f"/patch/pypi/six/1.16.0/{TOKEN}/{UUID}/{WHEEL}"
+          view={"uuid":UUID,"purl":PURL,"publishedAt":"Fri, 27 Mar 2026 00:00:00 GMT","files":{"six.py":{"beforeHash":g(orig),"afterHash":g(patched),"blobContent":base64.b64encode(patched).decode()}},
+           "vulnerabilities":{GHSA:{"cves":[CVE],"summary":"s","severity":"high","description":"d"}},"description":"x","license":"MIT","tier":"free"}
+          class H(BaseHTTPRequestHandler):
+              def log_message(self,*a): sys.stderr.write("REQ "+self.command+" "+self.path+"\n")
+              def j(self,o):
+                  b=json.dumps(o).encode(); self.send_response(200); self.send_header("content-type","application/json"); self.send_header("content-length",str(len(b))); self.end_headers(); self.wfile.write(b)
+              def do_HEAD(self):
+                  p=self.path.split("?")[0]
+                  if p==APATH: self.send_response(200); self.send_header("content-length",str(len(wheel))); self.end_headers()
+                  else: self.send_response(404); self.end_headers()
+              def do_GET(self):
+                  p=self.path.split("?")[0]
+                  if p==APATH:
+                      self.send_response(200); self.send_header("content-type","application/octet-stream"); self.send_header("content-length",str(len(wheel))); self.end_headers(); self.wfile.write(wheel)
+                  elif p.endswith("/patches/view/"+UUID) or p=="/patch/view/"+UUID: self.j(view)
+                  elif re.match(f"^/v0/orgs/{ORG}/patches/by-package/.+$",p):
+                      self.j({"patches":[{"uuid":UUID,"purl":PURL,"publishedAt":"2026-03-27T00:00:00Z","description":"x","license":"MIT","tier":"free","vulnerabilities":{}}],"canAccessPaidPatches":False})
+                  else: self.send_response(404); self.end_headers()
+              def do_POST(self):
+                  n=int(self.headers.get("content-length",0)); body=self.rfile.read(n)
+                  p=self.path.split("?")[0]
+                  if p.endswith("/patches/batch"):
+                      want=PURL in body.decode(errors="replace")
+                      self.j({"packages":[{"purl":PURL,"patches":[{"uuid":UUID,"purl":PURL,"tier":"free","cveIds":[CVE],"ghsaIds":[GHSA],"severity":"high","title":"t"}]}] if want else [],"canAccessPaidPatches":False})
+                  elif p.endswith("/patches/package"):
+                      u=BASE+APATH
+                      self.j({"results":{UUID:{"status":"granted","url":u,"purl":PURL,"artifacts":[{"kind":"tarball","url":u,"integrity":{"sha256":sha256,"sha512":sha512}}],"registryOverride":None}}})
+                  else: self.send_response(404); self.end_headers()
+          print("wheel sha256",sha256,flush=True)
+          ThreadingHTTPServer(("127.0.0.1",PORT),H).serve_forever()
+          PYEOF
+          python mock.py 8765 > mock.log 2>&1 &
+          sleep 3; cat mock.log
+          export NO_PROXY=127.0.0.1 SOCKET_TELEMETRY_DISABLED=1 SOCKET_NO_CONFIG=1
+          A="--api-url http://127.0.0.1:8765 --api-token fake --org test-org --patch-server-url http://127.0.0.1:8765"
+          echo "#### C: venv --system-site-packages; six 1.16.0 in the BASE interpreter"
+          python -m pip install -q six==1.16.0
+          for mode in hosted vendored; do
+            d="c-$mode"; rm -rf "$d"; mkdir "$d"; cd "$d"; printf 'six==1.16.0\n' > requirements.txt
+            ../$PY -m venv --system-site-packages .venv
+            if [ -d .venv/Scripts ]; then VP=.venv/Scripts/python; else VP=.venv/bin/python; fi
+            if [ "${{ matrix.pip }}" = latest ]; then $VP -m pip install -q -U pip; else $VP -m pip install -q "pip==${{ matrix.pip }}"; fi
+            "$BIN" scan --mode $mode --json $A --cwd . > scan.json 2> scan.err; src=$?
+            warns=$(python -c "import json;d=json.load(open('scan.json'));print([w.get('code') for w in d.get('redirect',{}).get('warnings',[])], d.get('status'))")
+            $VP -m pip install -q --disable-pip-version-check -r requirements.txt > pip.txt 2>&1; prc=$?
+            six=$($VP -c "import six;print(six.__file__, 'PATCHED' if getattr(six,'SOCKET_PATCHED',0) else 'UNPATCHED')")
+            "$BIN" vex $A --cwd . --product pkg:pypi/app@1 --output vex.json > vex.out 2>&1; vrc=$?
+            st=$(python -c "import json;print([s['status'] for s in json.load(open('vex.json'))['statements']])" 2>/dev/null)
+            oos=$(grep -c 'does not match' vex.out)
+            echo "RESULT C-$mode scan_rc=$src warnings=$warns pip_rc=$prc six=$six vex_rc=$vrc vex=$st out_of_sync_warn=$oos"
+            cat scan.err | grep -v -i token | tail -3
+            cd ..
+          done
