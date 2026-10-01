@@ -1,0 +1,113 @@
+name: bughunt-nuget
+on:
+  push:
+    branches: ['bughunt/nuget/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, sdk: '6.0.x', tool: '2.1.7' }
+          - { os: ubuntu-latest, sdk: '9.0.x', tool: '3.0.3' }
+          - { os: ubuntu-latest, sdk: '10.0.x', tool: '3.0.3' }
+          - { os: macos-latest, sdk: '8.0.x', tool: '3.0.3' }
+          - { os: macos-latest, sdk: '9.0.x', tool: '3.0.3' }
+          - { os: windows-latest, sdk: '8.0.x', tool: '3.0.3' }
+          - { os: windows-latest, sdk: '9.0.x', tool: '3.0.3' }
+          - { os: windows-latest, sdk: '10.0.x', tool: '3.0.3' }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ matrix.sdk }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - run: rustup show
+      - run: cargo build --release -p socket-patch-cli
+      - name: probe
+        shell: bash
+        run: |
+          SP="$GITHUB_WORKSPACE/target/release/socket-patch"
+          [ -f "$SP.exe" ] && SP="$(cygpath -w "$SP.exe")"
+          cat > "$RUNNER_TEMP/probe.py" <<'PYEOF'
+          import hashlib, json, os, subprocess, sys, threading, shutil, platform
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          SP = sys.argv[1]; TOOLVER = sys.argv[2]
+          TMP = os.environ.get('RUNNER_TEMP', '/tmp'); W = os.path.join(TMP, 'bh'); os.makedirs(W, exist_ok=True)
+          HOME = os.path.expanduser('~'); LOG = []
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  b = self.rfile.read(int(self.headers.get('content-length', 0))); LOG.append(b.decode())
+                  try: comps = json.loads(b).get('components', [])
+                  except Exception: comps = []
+                  pk = [{"purl": c['purl'], "patches": [{"uuid": "11111111-1111-4111-8111-%012d" % i, "purl": c['purl'], "tier": "free", "cveIds": ["CVE-2099-0001"], "ghsaIds": [], "severity": "high", "title": "t"}]} for i, c in enumerate(comps) if c.get('purl', '').startswith('pkg:nuget/')]
+                  o = json.dumps({"packages": pk, "canAccessPaidPatches": False}).encode()
+                  self.send_response(200); self.send_header('content-type', 'application/json'); self.send_header('content-length', str(len(o))); self.end_headers(); self.wfile.write(o)
+              def do_GET(self): self.send_response(404); self.end_headers()
+              def log_message(self, *a): pass
+          srv = HTTPServer(('127.0.0.1', 0), H); threading.Thread(target=srv.serve_forever, daemon=True).start()
+          PROXY = 'http://127.0.0.1:%d' % srv.server_port
+          ENV = dict(os.environ, SOCKET_NO_CONFIG='1', SOCKET_TELEMETRY_DISABLED='1', DOTNET_CLI_TELEMETRY_OPTOUT='1', DOTNET_NOLOGO='1')
+          for k in list(ENV):
+              if k.startswith('SOCKET_') and k not in ('SOCKET_NO_CONFIG', 'SOCKET_TELEMETRY_DISABLED'): ENV.pop(k)
+          def run(cmd, cwd=W):
+              r = subprocess.run(cmd, cwd=cwd, env=ENV, capture_output=True, text=True, shell=isinstance(cmd, str))
+              return r.returncode, r.stdout + r.stderr
+          def scan_purls():
+              LOG.clear(); rc, out = run([SP, 'scan', '-g', '-e', 'nuget', '--json', '--proxy-url', PROXY])
+              s = set()
+              for b in LOG:
+                  for c in json.loads(b).get('components', []): s.add(c['purl'])
+              return rc, sorted(s), out
+          def proj(name, refs):
+              d = os.path.join(W, name); os.makedirs(d, exist_ok=True)
+              open(os.path.join(d, name + '.csproj'), 'w').write('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>netstandard2.0</TargetFramework></PropertyGroup><ItemGroup>%s</ItemGroup></Project>' % ''.join('<PackageReference Include="%s" Version="%s" />' % r for r in refs))
+              rc, out = run(['dotnet', 'restore'], cwd=d); print('restore', name, rc, out.strip().splitlines()[-1] if out.strip() else '')
+              return d
+          def gh(b): return hashlib.sha256(b"blob %d\0" % len(b) + b).hexdigest()
+          def stage(purl, src, rel):
+              g = os.path.join(W, 'gm'); shutil.rmtree(g, ignore_errors=True); os.makedirs(os.path.join(g, '.socket', 'blobs'))
+              before = open(src, 'rb').read(); after = before + b"\nSOCKET_MARKER\n"
+              for b in (before, after): open(os.path.join(g, '.socket', 'blobs', gh(b)), 'wb').write(b)
+              m = {"patches": {purl: {"uuid": "11111111-1111-4111-8111-000000000001", "exportedAt": "2024-01-01T00:00:00Z", "files": {rel: {"beforeHash": gh(before), "afterHash": gh(after)}}, "vulnerabilities": {"GHSA-xxxx-xxxx-xxxx": {"cves": ["CVE-2099-0001"], "summary": "s", "severity": "high", "description": "d"}}, "description": "f", "license": "MIT", "tier": "free"}}}
+              json.dump(m, open(os.path.join(g, '.socket', 'manifest.json'), 'w')); return g
+          def marked(p): return os.path.exists(p) and b'SOCKET_MARKER' in open(p, 'rb').read()
+          R = {}
+          print('== os', platform.system(), 'sdk', run(['dotnet', '--version'])[1].strip())
+          # --- A: dotnet global tool
+          rc, out = run(['dotnet', 'tool', 'install', '-g', 'dotnetsay', '--version', TOOLVER]); print('tool install', rc, out.strip()[-200:])
+          store = os.path.join(HOME, '.dotnet', 'tools', '.store', 'dotnetsay', TOOLVER, 'dotnetsay', TOOLVER)
+          print('tool store exists:', os.path.isdir(store), store)
+          proj('warm', [('Newtonsoft.Json', '13.0.3')])
+          rc, purls, out = scan_purls(); print('scan -g rc', rc, 'nuget purls sent:', purls)
+          R['A_scan_g_lists_global_tool'] = any('dotnetsay' in p for p in purls)
+          g = stage('pkg:nuget/dotnetsay@' + TOOLVER, os.path.join(store, 'dotnetsay.nuspec'), 'dotnetsay.nuspec')
+          rc, out = run([SP, 'apply', '-g', '--offline'], cwd=g); print('apply -g tool rc', rc, out.strip().splitlines()[-1:])
+          R['A_apply_g_patches_global_tool'] = marked(os.path.join(store, 'dotnetsay.nuspec'))
+          run([SP, 'rollback', '-g', '--offline'], cwd=g)
+          # --- B: user-level globalPackagesFolder
+          if platform.system() == 'Windows': ucfg = os.path.join(os.environ['APPDATA'], 'NuGet', 'NuGet.Config')
+          else: ucfg = os.path.join(HOME, '.nuget', 'NuGet', 'NuGet.Config')
+          gpf = os.path.join(W, 'gpf'); os.makedirs(os.path.dirname(ucfg), exist_ok=True)
+          open(ucfg, 'w').write('<?xml version="1.0" encoding="utf-8"?>\n<configuration><packageSources><add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" /></packageSources><config><add key="globalPackagesFolder" value="%s" /></config></configuration>\n' % gpf)
+          print('locals:', run(['dotnet', 'nuget', 'locals', 'global-packages', '-l'])[1].strip())
+          proj('relo', [('Newtonsoft.Json', '13.0.3'), ('Humanizer.Core', '2.14.1')])
+          rc, purls, out = scan_purls(); print('scan -g (gpf) rc', rc, 'nuget purls sent:', purls)
+          R['B_scan_g_sees_configured_gpf'] = any('humanizer.core' in p.lower() for p in purls)
+          dflt = os.path.join(HOME, '.nuget', 'packages', 'newtonsoft.json', '13.0.3', 'LICENSE.md'); real = os.path.join(gpf, 'newtonsoft.json', '13.0.3', 'LICENSE.md')
+          g = stage('pkg:nuget/newtonsoft.json@13.0.3', real, 'LICENSE.md')
+          rc, out = run([SP, 'apply', '-g', '--offline'], cwd=g); print('apply -g (gpf) rc', rc, out.strip().splitlines()[-1:])
+          R['B_apply_g_patched_configured_gpf'] = marked(real); R['B_apply_g_patched_default_cache'] = marked(dflt)
+          rc, out = run([SP, 'vex', '-g', '--offline', '--product', 'pkg:nuget/x@1.0.0'], cwd=g); R['B_vex_says_not_affected'] = '"not_affected"' in out
+          run([SP, 'rollback', '-g', '--offline'], cwd=g)
+          print('RESULT', json.dumps(R))
+          PYEOF
+          python "$RUNNER_TEMP/probe.py" "$SP" "${{ matrix.tool }}"
