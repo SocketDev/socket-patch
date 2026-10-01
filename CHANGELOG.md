@@ -183,6 +183,15 @@ limits, and required install commands.
   unparseable (hosted) or refused as `vendor_lockfile_version_unsupported`
   (vendored). The lock now keeps its BOM, indent and line endings, and the
   undo is byte-exact (#324).
+- Agent mode no longer patches other projects through a store they share.
+  PDM 2.0–2.12 with `install.cache` and `cache_method = symlink` links
+  `site-packages/<pkg>` into its package cache, and pnpm's global virtual
+  store (`enableGlobalVirtualStore`) links `node_modules/<dep>` into
+  `<store>/links`. `apply` (also `-g`) wrote the patch into that shared
+  directory, so every project using it was patched, and a `rollback` in one
+  project silently unpatched the rest. `apply` and `rollback` now fail on
+  such a package, naming the store and how to get a private copy
+  (#332, #361).
 
 ### Maintenance
 
