@@ -42,31 +42,9 @@ pub(crate) fn confirm(prompt: &str, default_yes: bool, common: &GlobalArgs) -> b
     )
 }
 
-/// Whether [`confirm`] would stop and wait for a person to answer — a
-/// caller's clue that the world may change while it does (`scan` reuses a
-/// crawl across the prompt only when it does not wait). Derived from
-/// `confirm` itself rather than hand-copied at the call site: the drift
-/// that matters is the unsafe direction, a wait nobody accounted for.
+/// Whether [`confirm`] would stop and wait for a person to answer.
 pub(crate) fn confirm_waits(common: &GlobalArgs) -> bool {
     !(common.yes || common.json) && io::stdin().is_terminal()
-}
-
-/// A default-**no** confirmation that still proceeds when nobody can be
-/// asked (stdin not a terminal): `setup`'s mutation gate. `--yes`/`--json`
-/// proceed without asking.
-pub(crate) fn confirm_or_proceed(prompt: &str, common: &GlobalArgs) -> bool {
-    if common.yes || common.json {
-        return true;
-    }
-    ask(
-        prompt,
-        Ask {
-            default_yes: false,
-            non_interactive_answer: true,
-            interactive: io::stdin().is_terminal(),
-            silent: common.silent,
-        },
-    )
 }
 
 /// How a yes/no question is answered (see [`confirm_with`]).
@@ -189,9 +167,7 @@ pub enum SelectError {
 ///   `Ok(0)` would hand callers an out-of-bounds index.
 /// - stdin not a terminal: the first option, with
 ///   [`NON_INTERACTIVE_SELECT_FIRST`] unless `--silent` or the process is
-///   quiet ([`super::quiet`]; a caller that must never get
-///   `JsonModeNeedsExplicit`, like `scan`, passes its flags with `json`
-///   off, but a `--json` run still keeps the note off stderr).
+///   quiet ([`super::quiet`]).
 /// - Interactive: Esc/q/Ctrl-C cancel; the cursor is always restored.
 pub fn select_one(
     prompt: &str,
@@ -422,7 +398,7 @@ mod tests {
 
     #[test]
     fn eof_declines_even_when_default_is_yes() {
-        // Ctrl-D at "[Y/n]" used to mean yes and mutate the project.
+        // Ctrl-D at "[Y/n]" must not mean yes and mutate the project.
         let (answer, out) = run(b"", at_tty(true));
         assert!(!answer);
         assert_eq!(
@@ -543,8 +519,8 @@ mod tests {
         ));
     }
 
-    /// `confirm_waits` is what `scan` plans its crawl reuse around, so it
-    /// must never say "no wait" for a case `confirm` would stop on. Over
+    /// `confirm_waits` must never say "no wait" for a case `confirm` would
+    /// stop on. Over
     /// the whole `{yes, json}` cube with this process's stdin (a pipe
     /// under the test harness, so never a terminal), it says no wait —
     /// and `confirm` indeed answers from its default without reading a

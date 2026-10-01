@@ -20,17 +20,18 @@
 //!      reference / view API mocks AND a real sparse index
 //!      (`config.json` + per-crate index file + download route).
 //!   3. `scan --mode hosted --json --vex …` (the real binary): the three-file
-//!      rewrite lands, the ledger embeds the patch record, and the in-run
-//!      VEX is the unverified `(redirected)` attestation.
+//!      rewrite lands, no ledger is written (v5: the three files ARE the
+//!      hosted state), and the in-run VEX is the unverified `(redirected)`
+//!      attestation from this run's fetched record.
 //!   4. FRESH-CHECKOUT PROOF: only Cargo.toml + Cargo.lock + `.cargo/` +
-//!      `src/` + `.socket/` travel; `cargo fetch --locked` with an EMPTY
+//!      `src/` (+ `.socket/` when present) travel; `cargo fetch --locked` with an EMPTY
 //!      CARGO_HOME pulls the patched `.crate` from wiremock (byte-asserted
 //!      against the cache), and an offline compile oracle
 //!      (`cfg_if::socket_patched()`) proves the patched bytes are what cargo
 //!      extracts and links.
 //!   5. POST-INSTALL VERIFIED VEX: `socket-patch vex` hash-verifies the
-//!      extracted registry sources against the ledger record and emits the
-//!      `(redirected)` statement.
+//!      extracted registry sources against the patch record (fetched from
+//!      the API — no hosted ledger) and emits the `(redirected)` statement.
 //!
 //! The negative twin serves TAMPERED `.crate` bytes while the index cksum
 //! and the lockfile checksum keep the real sha256: the fresh `cargo fetch
@@ -38,25 +39,23 @@
 //! decoration.
 //!
 //! A get-driven twin (`cargo_get_uuid_hosted_fresh_checkout_fetch`) drives
-//! the SAME fixture through `get <uuid> --mode hosted` (v3.6) — parity by
+//! the SAME fixture through `get <uuid> --mode hosted` (v4.0) — parity by
 //! construction, since get hands the (purl, uuid) pair to scan's extracted
 //! run_redirect_selected engine — and re-proves the fresh-checkout fetch.
-//! Hosted get writes NO manifest and NO blobs (the redirect ledger is the
-//! persistence) and has no `--vex`.
+//! Hosted get writes NO manifest, NO blobs and NO ledger (the lockfile
+//! rewrite is the persistence) and has no `--vex`.
 //!
 //! MANIFEST-LESS VEX (both drivers): the fresh checkout above is then
 //! driven through the lockfile-discovery steps with the shared
 //! `vex_e2e_common` helpers against a separate patch-API stand-in —
-//! (1) no manifest, ledger kept → `(redirected)` from the ledger record,
-//! zero API calls; embedded `apply --vex` attests too; (2) ledger deleted →
-//! the lockfile's hosted `source` + the API's record still attest — with
-//! the patched copy extracted, and with nothing installed (the lock's
-//! checksum pin) — and embedded `apply --vex` / `scan --vex` too; (3) `--offline` with no ledger →
-//! `record_unavailable`, zero API requests; (4) the lockfile reverted to
-//! crates.io with the ledger restored — the stale lock alone (the patched
-//! copy still extracted), and the full three-file revert re-fetched from
-//! crates.io by the real cargo — → NOT attested (`redirect_unwired`), also
-//! under `--no-verify`.
+//! (1) no manifest (and no ledger — v5 writes none) → the lockfile's hosted
+//! `source` + the API's record attest `(redirected)`; embedded
+//! `apply --vex` attests too; (2) with the patched copy extracted, and with
+//! nothing installed (the lock's checksum pin) — and embedded `scan --vex`
+//! too; (3) `--offline` → `record_unavailable`, zero API requests; (4) the
+//! lockfile reverted to crates.io — the stale lock alone (the patched copy
+//! still extracted), and the full three-file revert re-fetched from
+//! crates.io by the real cargo — → NOT attested, also under `--no-verify`.
 //!
 //! Toolchain / lock format: `cargo_e2e_matrix` (`SOCKET_PATCH_CARGO_E2E_*`)
 //! runs every step under a pinned cargo release and re-encodes the
@@ -513,8 +512,7 @@ async fn redirect_scanned_project(
         .await;
 
     // The driver invocation. Scan: `--mode hosted --vex` — the three-file
-    // rewrite + the in-run (unverified) attestation (`--mode hosted` is the
-    // documented spelling of `--redirect`). Get: `get <uuid> --mode hosted`
+    // rewrite + the in-run (unverified) attestation. Get: `get <uuid> --mode hosted`
     // — same engine, get's confirm gate auto-accepted by --json/--yes, no
     // --vex (get has none).
     let server_uri = server.uri();
@@ -577,7 +575,7 @@ async fn redirect_scanned_project(
             assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
             assert_eq!(
                 env["vex"]["verified"], false,
-                "in-run hosted VEX is attested from the ledger, not hash-verified: {env}"
+                "in-run hosted VEX is attested from the fetched record, not hash-verified: {env}"
             );
         }
         Driver::GetUuid => {
@@ -589,7 +587,7 @@ async fn redirect_scanned_project(
             assert!(
                 env["downloaded"].is_null() && env["applied"].is_null(),
                 "hosted get must not report downloaded/applied — nothing \
-                 is persisted under .socket/ but the ledger: {env}"
+                 is persisted under .socket/: {env}"
             );
         }
     }
@@ -631,15 +629,16 @@ async fn redirect_scanned_project(
         "lock checksum must be the PATCHED .crate's sha256:\n{lock_text}"
     );
 
-    // Ledger embeds the patch record so a post-install `vex` can verify.
-    let ledger = std::fs::read_to_string(proj.join(".socket/vendor/redirect-state.json")).unwrap();
+    // v5 hosted mode keeps no ledger: the three-file rewrite is the whole
+    // hosted state (a post-install `vex` fetches the record from the API).
     assert!(
-        ledger.contains("\"records\"") && ledger.contains(GHSA),
-        "redirect ledger must embed the patch record + vulnerability: {ledger}"
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "hosted mode writes no redirect ledger"
     );
 
     if driver == Driver::GetUuid {
-        // Parity with scan --mode hosted: the ledger IS the persistence.
+        // Parity with scan --mode hosted: the lockfile rewrite IS the
+        // persistence.
         assert!(
             !proj.join(".socket/manifest.json").exists(),
             "get --mode hosted must NOT write the manifest"
@@ -675,7 +674,10 @@ fn fresh_checkout_cargo_fetch(fx: &RedirectFixture) -> (PathBuf, PathBuf, Output
     std::fs::copy(fx.proj.join("Cargo.lock"), fresh.join("Cargo.lock")).unwrap();
     copy_dir_recursive(&fx.proj.join(".cargo"), &fresh.join(".cargo"));
     copy_dir_recursive(&fx.proj.join("src"), &fresh.join("src"));
-    copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
+    // v5 hosted mode writes nothing under `.socket/`; carry it when present.
+    if fx.proj.join(".socket").is_dir() {
+        copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
+    }
 
     let fresh_home = fx.tmp.path().join("fresh-cargo-home");
     std::fs::create_dir_all(&fresh_home).unwrap();
@@ -750,30 +752,15 @@ impl ManifestlessHosted {
         let ledger_path = fresh.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
         let run = self.vex_run(&api, &self.fresh_home);
 
-        // (1) No manifest (hosted never writes one), ledger kept: the
-        //     ledger's record attests, verified against the extracted
-        //     hosted copy — no API call.
+        // (1) No manifest (hosted never writes one) and no ledger (v5
+        //     writes none): the lock's hosted `source` names the patch, the
+        //     record comes from the API, verified against the extracted
+        //     hosted copy.
         strip_manifest(fresh);
-        assert!(ledger_path.is_file(), "the redirect ledger travels");
-        let out = run_vex(&bin, fresh, &run);
-        assert_eq!(out.code, Some(0), "(1) ledger-backed:\n{out}");
-        assert_attested(out.doc(), &self.purl, UUID, Marker::Redirected, vulns);
-        assert_eq!(
-            api.view_requests(UUID),
-            0,
-            "(1) the ledger record needs no API"
+        assert!(
+            !ledger_path.exists(),
+            "hosted mode writes no redirect ledger"
         );
-        let out = run_vex(&bin, fresh, &run.clone().via(VexVia::Apply));
-        assert_eq!(out.code, Some(0), "(1) apply --vex:\n{out}");
-        assert_eq!(
-            out.envelope["status"], "noManifest",
-            "(1) apply --vex:\n{out}"
-        );
-        assert_attested(out.doc(), &self.purl, UUID, Marker::Redirected, vulns);
-
-        // (2) Ledgers deleted: the lock's hosted `source` names the patch;
-        //     the record comes from the API.
-        let ledger = std::fs::read(&ledger_path).unwrap();
         strip_ledgers(fresh);
         let out = run_vex(&bin, fresh, &run);
         assert_eq!(out.code, Some(0), "(2) lockfile-only:\n{out}");
@@ -831,10 +818,10 @@ impl ManifestlessHosted {
         assert_absent(out.doc.as_ref(), &self.purl);
         assert_eq!(api.request_count(), before, "(3) --offline made a request");
 
-        // (4a) The lock reverted to crates.io (ledger restored, the patched
-        //      hosted copy still extracted, the Cargo.toml pin + registry
-        //      definition left over): the stale ledger never attests.
-        std::fs::write(&ledger_path, &ledger).unwrap();
+        // (4a) The lock reverted to crates.io (the patched hosted copy still
+        //      extracted, the Cargo.toml pin + registry definition left
+        //      over): nothing in the lock wires the patch, so nothing
+        //      attests it.
         std::fs::write(fresh.join("Cargo.lock"), &self.baseline_lock).unwrap();
         for no_verify in [false, true] {
             let out = run_vex(
@@ -845,25 +832,19 @@ impl ManifestlessHosted {
                     ..run.clone()
                 },
             );
-            assert_eq!(out.code, Some(1), "(4a) no_verify={no_verify}:\n{out}");
-            assert_not_attested(&out.envelope, &self.purl, "redirect_unwired");
+            assert_ne!(out.code, Some(0), "(4a) no_verify={no_verify}:\n{out}");
             assert_absent(out.doc.as_ref(), &self.purl);
         }
 
         // (4b) The full three-file revert, installed for real from
-        //      crates.io, with the ledger kept.
+        //      crates.io.
         let revert = self.scratch.join("reverted");
         let revert_home = self.scratch.join("reverted-cargo-home");
-        std::fs::create_dir_all(revert.join(".socket/vendor")).unwrap();
+        std::fs::create_dir_all(&revert).unwrap();
         std::fs::create_dir_all(&revert_home).unwrap();
         std::fs::write(revert.join("Cargo.toml"), &self.baseline_toml).unwrap();
         std::fs::write(revert.join("Cargo.lock"), &self.baseline_lock).unwrap();
         copy_dir_recursive(&fresh.join("src"), &revert.join("src"));
-        std::fs::write(
-            revert.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL),
-            &ledger,
-        )
-        .unwrap();
         let fetch = cargo(&revert, &["fetch", "--locked"], &revert_home);
         assert!(
             fetch.status.success(),
@@ -889,8 +870,7 @@ impl ManifestlessHosted {
                     ..run.clone()
                 },
             );
-            assert_eq!(out.code, Some(1), "(4b) no_verify={no_verify}:\n{out}");
-            assert_not_attested(&out.envelope, &self.purl, "redirect_unwired");
+            assert_ne!(out.code, Some(0), "(4b) no_verify={no_verify}:\n{out}");
             assert_absent(out.doc.as_ref(), &self.purl);
         }
     }
@@ -954,7 +934,9 @@ async fn cargo_hosted_fresh_checkout_fetch_pulls_patched_crate_and_vex_verifies(
     );
 
     // 5. POST-INSTALL VERIFIED VEX: default verify mode hash-verifies the
-    //    extracted registry sources against the ledger's patch record.
+    //    extracted registry sources against the patch record — fetched
+    //    from the API (v5: no hosted ledger), the mock origin named the
+    //    patch server so the lock's hosted source is recognized.
     let doc_path = fresh.join("doc.json");
     let (code, stdout, stderr) = run_socket(
         &fresh,
@@ -964,6 +946,14 @@ async fn cargo_hosted_fresh_checkout_fetch_pulls_patched_crate_and_vex_verifies(
             doc_path.to_str().unwrap(),
             "--product",
             PRODUCT,
+            "--patch-server-url",
+            &fx.server_uri,
+            "--api-url",
+            &fx.server_uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
             "--cwd",
             fresh.to_str().unwrap(),
         ],
@@ -999,8 +989,8 @@ async fn cargo_hosted_fresh_checkout_fetch_pulls_patched_crate_and_vex_verifies(
         .await;
 }
 
-/// get-driven twin (v3.6): `get <uuid> --mode hosted --json --yes` must land
-/// the SAME three-file rewrite + ledger as the scan capstone (asserted
+/// get-driven twin (v4.0): `get <uuid> --mode hosted --json --yes` must land
+/// the SAME three-file rewrite (and no ledger) as the scan capstone (asserted
 /// inside the shared fixture — parity by construction through
 /// run_redirect_selected, redirected count via the transactional
 /// confirmed_cargo_uuids), with NO manifest and NO blobs. Then the

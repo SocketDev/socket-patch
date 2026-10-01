@@ -1,15 +1,17 @@
 # Releasing socket-patch — publish runbook
 
 One release = one version-bump PR + one dispatch of the **Release** workflow.
-The CLI publishes to five channels, all from that single dispatch:
+The CLI publishes to three channels, all from that single dispatch:
 
 | Channel | Package(s) | Auth |
 |---------|------------|------|
-| GitHub release | prebuilt binaries for 14 targets + `SHA256SUMS` (also feeds `install.socket.dev` / `scripts/install.sh`, `--update`, and the gem launcher) | workflow `GITHUB_TOKEN` |
+| Standalone binary (preferred) | GitHub release archives for 14 targets + `SHA256SUMS`; installed via `install.socket.dev/patch`, updated with `--update` | workflow `GITHUB_TOKEN` |
 | crates.io | `socket-patch-core`, `socket-patch-cli` | OIDC trusted publishing, no environment |
 | npm | `@socketsecurity/socket-patch` + 14 platform packages | OIDC via `npm stage publish`; **manual 2FA approval** |
-| PyPI | `socket-patch`, `socket-patch-hook` | OIDC trusted publishing; environment `pypi` |
-| RubyGems | `socket-patch` (launcher gem), `socket-patch-bundler` | OIDC trusted publishing; environment `rubygems` |
+
+The npm distribution is also required by the official Socket CLI. v5 no longer
+builds or publishes the PyPI and RubyGems CLI packages or their install hooks.
+See the [migration instructions](migrating-to-v5.md#installation-channels).
 
 ## 1. Write the release notes
 
@@ -22,14 +24,13 @@ a release whose CHANGELOG section is missing or empty.
 From a developer machine (preferred — CI runs on the PR normally):
 
 ```sh
-scripts/bump-version.sh 3.4.0 --pr
+scripts/bump-version.sh 5.0.0 --pr
 ```
 
-This stamps `3.4.0` into every packaging site (`scripts/version-sync.sh`:
-`Cargo.toml`, the npm main + platform packages and lockfile, both PyPI
-`pyproject.toml`s, both gemspecs and the gem launcher constant), rolls
-`[Unreleased]` into a dated `## [3.4.0]` section, and opens a
-`release/v3.4.0` PR whose body carries the rolled-over notes.
+This stamps `5.0.0` into every packaging site (`scripts/version-sync.sh`:
+`Cargo.toml`, the npm main + platform packages and lockfile), rolls
+`[Unreleased]` into a dated `## [5.0.0]` section, and opens a
+`release/v5.0.0` PR whose body carries the rolled-over notes.
 
 Alternatively, dispatch the **Version Bump** workflow from the Actions tab
 (input: the new version). Caveat: a PR opened by a workflow's `GITHUB_TOKEN`
@@ -50,12 +51,11 @@ publishing.
 
 The real run: re-verifies the release gate → builds the matrix → creates and
 pushes `v<version>` → creates the GitHub release with `SHA256SUMS` → fans out
-to crates.io, npm, PyPI, and RubyGems in parallel (all OIDC trusted
+to crates.io and npm in parallel (both use OIDC trusted
 publishing; no long-lived registry secrets). Each registry leg is its own
-workflow (`publish-cargo.yml`, `publish-npm.yml`, `publish-pypi.yml`,
-`publish-rubygems.yml`), dispatched at the release tag by the release run
-and watched to completion, so the release run's job graph still reflects
-each registry's outcome (its step summaries link the four leg runs) — and
+workflow (`publish-cargo.yml`, `publish-npm.yml`), dispatched at the release
+tag by the release run and watched to completion, so the job graph still reflects
+each registry's outcome (its step summaries link both leg runs) — and
 each leg can equally be dispatched by hand (see "If a job fails
 mid-release"). The `release.yml` header records why the legs are dispatched
 runs rather than reusable workflows (registry trusted-publisher filename
@@ -71,19 +71,15 @@ release run's `npm-publish` job summary links to that run), the
 [org staged-packages dashboard](https://www.npmjs.com/settings/socketsecurity/staged-packages),
 or the CLI (`npm stage list` / `npm stage approve <stage-id>`, npm 11.15+).
 
-The other channels go live without human action; the RubyGems launcher gem
-fetches its binary from the GitHub release at run time.
+The standalone binaries and Cargo crates go live without human action.
 
 ## 5. Verify
 
 ```sh
-V=3.4.0
+V=5.0.0
 gh release view "v$V" --repo SocketDev/socket-patch          # binaries + SHA256SUMS
 cargo info socket-patch-cli | grep "$V"                      # crates.io
 npm view "@socketsecurity/socket-patch@$V" version           # npm (after approval)
-curl -sf "https://pypi.org/pypi/socket-patch/$V/json" >/dev/null && echo pypi ok
-curl -sf "https://pypi.org/pypi/socket-patch-hook/$V/json" >/dev/null && echo hook ok
-gem list --remote --exact --all socket-patch | grep "$V"     # rubygems
 ```
 
 End-to-end smoke test of the installer path:
@@ -106,12 +102,12 @@ partial release never requires deleting tags or re-bumping.
 2. **Dispatch the failed registry's own workflow** — right when the fix
    needed a change (registry-side config such as a trusted publisher, or a
    workflow edit landed on the default branch): Actions → **Publish
-   crates.io** / **Publish npm** / **Publish PyPI** / **Publish RubyGems** →
+   crates.io** / **Publish npm** →
    Run workflow, entering the release version (`X.Y.Z`, no `v`) and leaving
    the other inputs blank. This runs the publish workflow as it exists on the
    dispatched branch (default: the default branch), so workflow fixes apply.
    Nothing rebuilds: each publish workflow checks out the `v<version>` tag
-   and (npm/PyPI) takes the prebuilt binaries from the GitHub release's
+   and npm takes the prebuilt binaries from the GitHub release's
    assets, verified against `SHA256SUMS` — the same inputs the release run
    would have published. The GitHub release must exist with all assets, so
    failures in `build`, `tag`, or `github-release` itself are still fixed
@@ -119,14 +115,9 @@ partial release never requires deleting tags or re-bumping.
 
 ## One-time registry setup
 
-Deployment environments (`pypi`, `rubygems`) and each registry's trusted
-publisher are listed in the checklist of
-[PR #138](https://github.com/SocketDev/socket-patch/pull/138). All four
-registry channels authenticate via OIDC trusted publishing, so a missing or
-misconfigured trusted publisher (or environment) **fails that channel's
-job** — configure it before dispatching a real release. The one
-non-blocking push is the `socket-patch-bundler` gem (`continue-on-error`
-Phase-2 scaffolding).
+Both registries authenticate via OIDC trusted publishing, so a missing or
+misconfigured trusted publisher **fails that channel's job** — configure it
+before dispatching a real release. Neither workflow uses a deployment environment.
 
 Since the publish legs moved into their own workflow files, each trusted
 publisher is registered against repo `SocketDev/socket-patch` + **the
@@ -134,20 +125,15 @@ publish workflow's filename** (not `release.yml`). The legs only ever run
 as top-level `workflow_dispatch` runs of their own file — whether the
 release run dispatched them or a maintainer did — so the OIDC token's
 `workflow_ref` and `job_workflow_ref` claims both name that file, and one
-registration per package satisfies every registry's matching rule (npm and
-crates.io match the top-level workflow; PyPI and RubyGems match the
-job-defining workflow).
+registration per package satisfies both registries' top-level workflow matching.
 
-| Registry | Publisher workflow | Environment |
-|----------|--------------------|-------------|
-| crates.io (`socket-patch-core`, `socket-patch-cli`) | `publish-cargo.yml` | — |
-| npm (main + 14 platform packages) | `publish-npm.yml` | — |
-| PyPI (`socket-patch`, `socket-patch-hook`) | `publish-pypi.yml` | `pypi` |
-| RubyGems (`socket-patch`, `socket-patch-bundler`) | `publish-rubygems.yml` | `rubygems` |
+| Registry | Publisher workflow |
+|----------|--------------------|
+| crates.io (`socket-patch-core`, `socket-patch-cli`) | `publish-cargo.yml` |
+| npm (main + 14 platform packages) | `publish-npm.yml` |
 
-**Migration from the `release.yml` publishers:** crates.io (up to 5 configs
-per crate), PyPI, and RubyGems (both: multiple publishers per package) can
-carry the old `release.yml` publisher alongside the new one until every
+**Migration from the `release.yml` publishers:** crates.io can carry the
+old `release.yml` publisher alongside the new one until every
 release run predating this split — whose re-run legs still authenticate as
 `release.yml` — has fully landed; then delete the `release.yml` publishers.
 npm allows only **one** trusted publisher per package, so its cutover is

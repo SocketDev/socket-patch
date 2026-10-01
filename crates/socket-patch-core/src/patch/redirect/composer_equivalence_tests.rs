@@ -1,257 +1,17 @@
-//! Equivalence oracle for the hosted composer.lock rewriter, which now tests
-//! each `"name"` occurrence's value before walking its object, walks objects
-//! byte-wise, and splices each edit into the lock in place instead of
-//! re-allocating the whole lock per edit. The previous implementation is kept
-//! here (char walk, walk-then-test name match, fresh copy per edit) and the
-//! production rewriter must produce the identical output bytes, FileEdit list
-//! and warnings on randomized locks. Its composer SEMANTICS track production:
-//! release-identity version matching, and the entry's `source` / the dist's
-//! `mirrors` dropped through the shared `composer_source` helper, so the two
-//! differ only in the mechanics the in-place rewrite changed.
+//! Seeded composer.lock sweep for the hosted rewriter (the in-place,
+//! byte-walking splice): output bytes, FileEdits and warnings are pinned per
+//! case by `tests/equivalence/composer_*.golden`, blessed while the
+//! pre-splice rewriter still ran beside it as an oracle.
 
 use super::*;
+use crate::formats::composer::hosted::*;
+use crate::golden::Golden;
+use crate::test_rng::Rng;
 
-fn json_object_end_from_oracle(text: &str, from: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (offset, ch) in text[from..].char_indices() {
-        if in_string {
-            match ch {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' if depth == 0 => return Some(from + offset),
-            '}' => depth -= 1,
-            _ => {}
-        }
-    }
-    None
-}
-
-fn find_composer_entry_oracle(content: &str, pkg: &str, version: &str) -> ComposerEntry {
-    let mut mismatched: Option<String> = None;
-    for (name_idx, _) in content.match_indices("\"name\": \"") {
-        let Some(end) = json_object_end_from_oracle(content, name_idx) else {
-            continue;
-        };
-        let entry = &content[name_idx..=end];
-        if !json_string_field(entry, "name").is_some_and(|n| n.eq_ignore_ascii_case(pkg)) {
-            continue;
-        }
-        // Every package entry carries `version`; an `authors[]`/`support`
-        // object that happens to have a matching `name` does not.
-        let Some(locked) = json_string_field(entry, "version") else {
-            continue;
-        };
-        if composer_versions_equivalent(locked, version) {
-            return ComposerEntry::Found(name_idx, end);
-        }
-        mismatched = Some(locked.to_string());
-    }
-    match mismatched {
-        Some(locked) => ComposerEntry::VersionMismatch(locked),
-        None => ComposerEntry::NotFound,
-    }
-}
-
-fn rewrite_composer_lock_oracle(
-    files: &BTreeMap<String, String>,
-    overrides: &[DepOverride],
-    result: &mut RewriteResult,
-) {
-    let composer: Vec<&DepOverride> = overrides
-        .iter()
-        .filter(|o| o.ecosystem == "composer")
-        .collect();
-    if composer.is_empty() {
-        return;
-    }
-    // Parity with `redirect_npm_no_lockfile`: a granted dep the project has
-    // no lock to pin must be SAID, not silently dropped from the redirected
-    // count (a composer.json + installed vendor tree without a lock is
-    // discovered and granted like any other).
-    if !files.contains_key("composer.lock") {
-        result.warnings.push(RewriteWarning {
-            code: "redirect_composer_no_lockfile".into(),
-            detail: "no composer.lock present; composer redirect skipped".into(),
-        });
-        return;
-    }
-    const DIST_KEY: &str = "\"dist\": {";
-    let mut content = files["composer.lock"].clone();
-    let type_re: &Regex = &COMPOSER_DIST_TYPE_RE;
-    let url_re: &Regex = &COMPOSER_DIST_URL_RE;
-    let shasum_re: &Regex = &COMPOSER_DIST_SHASUM_RE;
-    let mut changed = false;
-    for dep in &composer {
-        let composer_name = full_name(dep);
-        let Some(sha1) = dep.integrity.sha1.clone() else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_composer_missing_sha1".into(),
-                detail: format!("{composer_name} has no sha1 (dist.shasum) integrity"),
-            });
-            continue;
-        };
-        let (entry_start, entry_end) =
-            match find_composer_entry_oracle(&content, &composer_name, &dep.version) {
-                ComposerEntry::Found(start, end) => (start, end),
-                ComposerEntry::VersionMismatch(locked) => {
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_composer_version_mismatch".into(),
-                        detail: format!(
-                            "composer.lock pins {composer_name}@{locked}, not the patched {}",
-                            dep.version
-                        ),
-                    });
-                    continue;
-                }
-                ComposerEntry::NotFound => {
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_composer_pkg_not_found".into(),
-                        detail: format!(
-                            "no composer.lock package named {composer_name}@{}",
-                            dep.version
-                        ),
-                    });
-                    continue;
-                }
-            };
-        // The dist block MUST belong to the located entry. Scanning forward
-        // from the name for the next `"dist": {` walked into the FOLLOWING
-        // package whenever the target was installed from source, repointing a
-        // bystander's url + shasum — a checksum-clean install of the wrong
-        // code. A target with no dist of its own pins nothing: fail closed.
-        let Some(dist_start) = content[entry_start..=entry_end]
-            .find(DIST_KEY)
-            .map(|offset| entry_start + offset)
-        else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_composer_no_dist".into(),
-                detail: format!("{composer_name} has no dist block"),
-            });
-            continue;
-        };
-        let Some(dist_end) = json_object_end_from_oracle(&content, dist_start + DIST_KEY.len())
-        else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_composer_lock_malformed".into(),
-                detail: format!("{composer_name}'s dist block is unterminated"),
-            });
-            continue;
-        };
-        // The dist's own members only: a `mirrors` entry listed before the
-        // dist `url` would otherwise take the redirected url.
-        let current = &content[dist_start..=dist_end];
-        let block =
-            composer_source::strip_dist_mirrors(current).unwrap_or_else(|| current.to_string());
-        // Already redirected (either slash spelling): only the source/mirrors
-        // heal applies, so a re-run over a healed lock records no edit and
-        // the ledger never grows.
-        let already_redirected =
-            artifact_url_present(&block, &dep.artifact_url) && block.contains(&sha1);
-        if !already_redirected && !block.contains("\"url\": \"") {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_composer_no_dist_url".into(),
-                detail: format!("{composer_name}'s dist block has no url to redirect"),
-            });
-            continue;
-        }
-        let mut rewritten = type_re.replace(&block, "${1}zip${2}").to_string();
-        rewritten = url_re
-            .replace(
-                &rewritten,
-                format!("${{1}}{}${{2}}", dep.artifact_url).as_str(),
-            )
-            .to_string();
-        rewritten = if rewritten.contains("\"shasum\": \"") {
-            shasum_re
-                .replace(&rewritten, format!("${{1}}{sha1}${{2}}").as_str())
-                .to_string()
-        } else {
-            append_composer_shasum(&rewritten, &sha1)
-        };
-        let rewritten = (!already_redirected).then_some(rewritten);
-        // The source/mirrors drop is the one helper both rewriters share
-        // (`composer_source::apply_dist_edit`); the oracle keeps its
-        // fresh-copy-per-edit shape around it.
-        let span = composer_source::DistSpan {
-            entry_start,
-            entry_end,
-            dist_start,
-            dist_end,
-        };
-        let mut next = content.clone();
-        if let Some(edit) = composer_source::apply_dist_edit(
-            &mut next,
-            span,
-            rewritten.as_deref(),
-            &composer_name,
-            &mut result.warnings,
-        ) {
-            content = next;
-            changed = true;
-            result.edits.push(edit);
-        }
-    }
-    if changed {
-        result.files.insert("composer.lock".into(), content);
-    }
-}
-
-fn assert_same(want: &RewriteResult, got: &RewriteResult, what: &str) {
-    assert_eq!(got.files, want.files, "{what}: rewritten bytes");
-    assert_eq!(got.edits.len(), want.edits.len(), "{what}: edit count");
-    for (i, (g, w)) in got.edits.iter().zip(&want.edits).enumerate() {
-        assert_eq!(g, w, "{what}: edit #{i}");
-    }
-    let warnings = |r: &RewriteResult| {
-        r.warnings
-            .iter()
-            .map(|w| (w.code.clone(), w.detail.clone()))
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(warnings(got), warnings(want), "{what}: warnings in order");
-}
-
-fn run_both(
-    files: &BTreeMap<String, String>,
-    overrides: &[DepOverride],
-    what: &str,
-) -> RewriteResult {
-    let mut want = RewriteResult::default();
-    rewrite_composer_lock_oracle(files, overrides, &mut want);
+fn run(files: &BTreeMap<String, String>, overrides: &[DepOverride]) -> RewriteResult {
     let mut got = RewriteResult::default();
     rewrite_composer_lock(files, overrides, &mut got);
-    assert_same(&want, &got, what);
     got
-}
-
-/// Deterministic xorshift64* — no `rand` dev-dependency.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-    fn chance(&mut self, percent: u64) -> bool {
-        self.next() % 100 < percent
-    }
 }
 
 fn pkg(i: usize, rng: &mut Rng) -> String {
@@ -406,7 +166,6 @@ fn dep(rng: &mut Rng, pool: usize, n: usize) -> DepOverride {
         token: String::new(),
         patch_uuid: format!("00000000-0000-4000-8000-{n:012}"),
         artifact_url: url,
-        berry_zip_url: None,
         registry_override: None,
         integrity: Integrity {
             sha1: (!rng.chance(8)).then(|| {
@@ -422,13 +181,18 @@ fn dep(rng: &mut Rng, pool: usize, n: usize) -> DepOverride {
 }
 
 #[test]
-fn in_place_composer_rewrite_matches_oracle() {
+fn in_place_composer_rewrite_matches_golden() {
     let mut rewritten = 0;
     let mut edits = 0;
     let mut reverted = 0;
     let mut codes = std::collections::BTreeSet::new();
+    let mut golden = crate::golden::Golden::new(
+        "composer_lock_rewrite",
+        "One seeded composer.lock + overrides; the output covers a re-run over the result.",
+    )
+    .chunked(10);
     for seed in 1..=3000u64 {
-        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut rng = Rng::new(seed);
         let pool = 3 + rng.below(12);
         let mut files = BTreeMap::new();
         if !rng.chance(3) {
@@ -444,7 +208,7 @@ fn in_place_composer_rewrite_matches_oracle() {
             }
             overrides.push(again);
         }
-        let got = run_both(&files, &overrides, &format!("seed {seed}"));
+        let got = run(&files, &overrides);
         // The ledger's fragment revert: undoing every edit, newest first,
         // restores the input byte for byte (checked when each fragment is
         // unambiguous in the text it is undone from).
@@ -468,7 +232,8 @@ fn in_place_composer_rewrite_matches_oracle() {
         }
         let mut rerun = files.clone();
         rerun.extend(got.files.clone());
-        run_both(&rerun, &overrides, &format!("seed {seed} re-run"));
+        let again = run(&rerun, &overrides);
+        golden.case(seed, &(&files, &overrides), &(&got, &again));
         rewritten += got.files.len();
         edits += got.edits.len();
         codes.extend(got.warnings.iter().map(|w| w.code.clone()));
@@ -487,59 +252,25 @@ fn in_place_composer_rewrite_matches_oracle() {
     ] {
         assert!(codes.contains(code), "no case reached {code}: {codes:?}");
     }
+    golden.finish();
 }
 
 #[test]
-fn byte_walk_matches_the_char_walk() {
+fn json_object_end_matches_golden() {
     let texts = [
         r#"{"a": "}", "b": {"c": "\"}"}, "d": "é\é\\"}"#,
         "{\"x\": \"\\\u{e9}}\"}, \"y\": 1}",
         "\"unterminated {",
         "{{{}}}}",
     ];
+    let mut golden = Golden::new(
+        "composer_json_object_end",
+        "One (text, start) pair: where its JSON object ends.",
+    );
     for text in texts {
         for from in (0..=text.len()).filter(|&i| text.is_char_boundary(i)) {
-            assert_eq!(
-                json_object_end_from(text, from),
-                json_object_end_from_oracle(text, from),
-                "{text:?} from {from}"
-            );
+            golden.next(&(text, from), &json_object_end_from(text, from));
         }
     }
-}
-
-/// Runs the oracle over the Phase 3 benchmark composer.lock (too large to
-/// commit) when `SOCKET_PATCH_COMPOSER_FIXTURE` names it, redirecting every
-/// package; a no-op otherwise.
-#[test]
-fn in_place_composer_rewrite_matches_oracle_on_fixture() {
-    let Some(path) = std::env::var_os("SOCKET_PATCH_COMPOSER_FIXTURE") else {
-        return;
-    };
-    let text = std::fs::read_to_string(path).unwrap();
-    let doc: Value = serde_json::from_str(&text).unwrap();
-    let overrides: Vec<DepOverride> = ["packages", "packages-dev"]
-        .iter()
-        .flat_map(|k| doc[k].as_array().cloned().unwrap_or_default())
-        .enumerate()
-        .map(|(n, p)| DepOverride {
-            ecosystem: "composer".into(),
-            name: p["name"].as_str().unwrap().to_string(),
-            namespace: None,
-            version: p["version"].as_str().unwrap().to_string(),
-            token: String::new(),
-            patch_uuid: format!("00000000-0000-4000-8000-{n:012}"),
-            artifact_url: format!("https://patch.socket.dev/composer/{n}.zip"),
-            berry_zip_url: None,
-            registry_override: None,
-            integrity: Integrity {
-                sha1: Some("0123456789abcdef0123456789abcdef01234567".into()),
-                ..Default::default()
-            },
-        })
-        .collect();
-    let mut files = BTreeMap::new();
-    files.insert("composer.lock".to_string(), text);
-    let got = run_both(&files, &overrides, "fixture");
-    assert!(!got.edits.is_empty());
+    golden.finish();
 }

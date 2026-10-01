@@ -1,5 +1,5 @@
 //! vlt vendor backend: `vlt-lock.json` + importer `package.json` surgery
-//! for a direct dependency (DESIGN §4.5).
+//! for a direct dependency.
 //!
 //! The target's default-registry node becomes a `file` node naming the
 //! directory artifact ([`super::npm_dir`]), without the peer-context extra
@@ -8,7 +8,7 @@
 //! importers' package.json specs move to `file:<path relative to the
 //! importer>`, and its own outgoing edges are re-keyed to the new DepID.
 //! Every other line of the lock stays byte-identical, and the moved entries
-//! are placed where vlt's own serializer puts them (§4.5.4), so `vlt ci`
+//! are placed where vlt's own serializer puts them, so `vlt ci`
 //! keeps the lock byte-stable.
 //!
 //! Transitive targets are refused: vlt re-resolves a non-importer edge to a
@@ -65,7 +65,7 @@ const NOT_CANONICAL: &str =
 /// A refusal: a stable code and its detail.
 pub type Refusal = (&'static str, String);
 
-/// DESIGN §4.1 lock sniff: a BOM-less JSON object with `lockfileVersion` 0
+/// Lock sniff: a BOM-less JSON object with `lockfileVersion` 0
 /// or 1. The `Err` detail goes with `vendor_lockfile_version_unsupported`.
 pub(crate) fn sniff_vendor_lock(text: &str) -> Result<ParsedLock, String> {
     match sniff_lock(text) {
@@ -297,7 +297,7 @@ impl LockDoc {
     }
 }
 
-// ── placement (§4.5.4) ───────────────────────────────────────────────────
+// ── placement ────────────────────────────────────────────────────────────
 
 fn node_cmp(a: &Entry, b: &Entry) -> Option<Ordering> {
     vlt_collate(&a.key, &b.key)
@@ -350,7 +350,7 @@ fn place(
     list
 }
 
-// ── target analysis (§4.5.1) ─────────────────────────────────────────────
+// ── target analysis ──────────────────────────────────────────────────────
 
 /// An importer edge into the target.
 #[derive(Debug, Clone)]
@@ -585,7 +585,7 @@ fn json_string(s: &str) -> String {
     serde_json::to_string(s).expect("a str serializes to JSON infallibly")
 }
 
-/// DESIGN §4.5.1 declaration checks on the importers' package.json files.
+/// Declaration checks on the importers' package.json files.
 fn check_declarations(
     target: &Target,
     pkgs: &BTreeMap<String, String>,
@@ -599,7 +599,7 @@ fn check_declarations(
                 format!("{pkg_rel} is missing; run `vlt install` first"),
             )
         })?;
-        let value: Value = serde_json::from_str(crate::package_json::detect::strip_bom(text))
+        let value: Value = serde_json::from_str(crate::utils::serde::strip_bom(text))
             .map_err(|_| (OUT_OF_SYNC, format!("{pkg_rel} is not valid JSON")))?;
         let declared = ["dependencies", "devDependencies", "optionalDependencies"]
             .iter()
@@ -705,8 +705,8 @@ async fn analyze(
 /// The read-only vendored-mode refusals vlt can decide before any write:
 /// the lock sniff and layout, the target analysis with its declaration
 /// checks, the installed store copy's `bundleDependencies` and duplicate
-/// `devDependencies`, and a git rule ignoring the would-be uuid dir
-/// (DESIGN §4.6, core part). The dir form matches only directory
+/// `devDependencies`, and a git rule ignoring the would-be uuid dir. The
+/// dir form matches only directory
 /// exclusions: every other rule is overridden by the `!*` the engine
 /// writes into that dir.
 pub async fn vlt_vendor_preflight(
@@ -731,9 +731,7 @@ pub async fn vlt_vendor_preflight(
         .join(&name)
         .join(PACKAGE_JSON);
     if let Ok(text) = read_regular_to_string(&store).await {
-        if let Ok(pkg) =
-            serde_json::from_str::<Value>(crate::package_json::detect::strip_bom(&text))
-        {
+        if let Ok(pkg) = serde_json::from_str::<Value>(crate::utils::serde::strip_bom(&text)) {
             if super::npm_common::declares_bundled_deps(&pkg) {
                 return Err((
                     "vendor_bundled_deps_unsupported",
@@ -836,7 +834,7 @@ fn carried(
     }
 }
 
-/// DESIGN §4.5.2–§4.5.4: the records and the new surfaces, or `None` when
+/// The wiring records and the new surfaces, or `None` when
 /// every surface already names `rel`.
 fn plan_wiring(
     analysis: &Analysis,
@@ -1329,6 +1327,7 @@ pub(crate) async fn vendor_vlt<'a>(
         base_purl: coords.base_purl.clone(),
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: staged.rel_dir.clone(),
             sha256: String::new(),
             size: None,
@@ -1421,7 +1420,7 @@ async fn preflight_package(
 }
 
 /// Rewrite a vlt entry's `<uuid>/.gitignore` and `<uuid>/.gitattributes`
-/// when absent or changed (DESIGN §4.8 health: neither is part of the
+/// when absent or changed (health: neither is part of the
 /// artifact, so repairing them is no rebuild).
 pub async fn restore_vlt_uuid_metadata(
     entry: &VendorEntry,
@@ -1434,12 +1433,6 @@ pub async fn restore_vlt_uuid_metadata(
         )));
     };
     super::npm_dir::restore_uuid_metadata(&project_root.join(uuid_dir)).await
-}
-
-/// Whether `text` passes the §4.1 router sniff (a BOM-less JSON object
-/// with `lockfileVersion` 0 or 1).
-pub fn vlt_lock_sniff_ok(text: &str) -> bool {
-    sniff_vendor_lock(text).is_ok()
 }
 
 /// The importer package.json files of the project's canonical
@@ -1493,7 +1486,7 @@ pub async fn vlt_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Optio
     lock_has_file_node_under(&text, &entry.uuid)
 }
 
-// ── revert (§4.7) ────────────────────────────────────────────────────────
+// ── revert ───────────────────────────────────────────────────────────────
 
 fn drifted(detail: impl Into<String>) -> VendorWarning {
     VendorWarning::new("vendor_lock_entry_drifted", detail.into())
@@ -1730,7 +1723,7 @@ fn revert_pkg(pkgs: &mut BTreeMap<String, String>, rec: &WiringRecord) -> Step {
     }
 }
 
-/// The DESIGN §4.7 cross-grammar drift detail: the user re-created the lock
+/// The cross-grammar drift detail: the user re-created the lock
 /// under the other DepID grammar while package.json still names our dir.
 fn cross_grammar_detail(entry: &VendorEntry, doc: &LockDoc) -> Option<String> {
     let node = entry.wiring.iter().find(|r| r.kind == KIND_LOCK_NODE)?;
@@ -1824,7 +1817,7 @@ async fn revert_reinstall_advisory(
     ))
 }
 
-/// Undo one vlt-vendored package: every record through its §4.5.3 inverse,
+/// Undo one vlt-vendored package: every record through its inverse,
 /// all or nothing, then remove the artifact.
 pub async fn revert_vlt_opts(
     entry: &VendorEntry,
@@ -2035,7 +2028,7 @@ fn drop_unrecorded_file_edges(staged: &mut Staged, entry: &VendorEntry) {
 }
 
 /// A block without its merged entries, the restored ones re-placed
-/// (§4.5.4) in the forward record order.
+/// in the forward record order.
 fn restored_block(
     entries: &[Entry],
     touched: &[usize],
@@ -2204,7 +2197,7 @@ mod tests {
 
     async fn run(fx: &Fx, uuid: &str, dry_run: bool) -> VendorOutcome {
         let sources = PatchSources::blobs_only(&fx.blobs);
-        vendor_vlt(
+        crate::vendor::test_support::vendor_vlt(
             PURL,
             &fx.installed,
             &fx.root,
@@ -2291,7 +2284,12 @@ mod tests {
     async fn wires_the_node_edges_and_package_json_in_vlt_order() {
         let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
         let (entry, warnings) = entry_of(run(&fx, UUID, false).await);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
         let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad");
         let file_id =
             format!("file~.socket+vendor+npm+{UUID}+left-pad-1.3.0+node__modules+left-pad");
@@ -3135,7 +3133,7 @@ mod tests {
             },
         );
         let sources = PatchSources::blobs_only(&fx.blobs);
-        let outcome = vendor_vlt(
+        let outcome = crate::vendor::test_support::vendor_vlt(
             PURL,
             &fx.installed,
             &fx.root,
@@ -3205,7 +3203,7 @@ mod tests {
             },
         );
         let sources = PatchSources::blobs_only(&fx.blobs);
-        let outcome = vendor_vlt(
+        let outcome = crate::vendor::test_support::vendor_vlt(
             PURL,
             &fx.installed,
             &fx.root,
@@ -3388,7 +3386,7 @@ mod tests {
 
     async fn run_with(fx: &Fx, cfg: &crate::vendor::VendorServiceConfig) -> VendorOutcome {
         let sources = PatchSources::blobs_only(&fx.blobs);
-        vendor_vlt(
+        crate::vendor::test_support::vendor_vlt(
             PURL,
             &fx.installed,
             &fx.root,
@@ -3418,7 +3416,7 @@ mod tests {
         ]);
         mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &tgz).await;
         let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
-        let cfg = service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = service_cfg(&server.uri(), VendorSource::Service, false);
         let (entry, warnings) = entry_of(run_with(&fx, &cfg).await);
         assert!(
             warnings
@@ -3458,16 +3456,6 @@ mod tests {
 
         let server = wiremock::MockServer::start().await;
         mount_503(&server).await;
-        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
-        let (_, warnings) =
-            entry_of(run_with(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await);
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.code == "vendor_prebuilt_unavailable"),
-            "{warnings:?}"
-        );
-
         let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
         match run_with(
             &fx,
@@ -3490,7 +3478,12 @@ mod tests {
         ]);
         mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &bad).await;
         let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
-        match run_with(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await {
+        match run_with(
+            &fx,
+            &service_cfg(&server.uri(), VendorSource::Service, false),
+        )
+        .await
+        {
             VendorOutcome::Done { result, entry, .. } => {
                 assert!(!result.success && entry.is_none());
                 assert!(result.error.unwrap().contains("unsafe"));
@@ -3526,7 +3519,11 @@ mod tests {
     }
 
     fn codes(warnings: &[VendorWarning]) -> Vec<&str> {
-        warnings.iter().map(|w| w.code).collect()
+        warnings
+            .iter()
+            .filter(|w| w.code != "vendor_prebuilt_downloaded")
+            .map(|w| w.code)
+            .collect()
     }
 
     #[tokio::test]
@@ -3864,8 +3861,19 @@ mod tests {
             codes(&warnings),
             [REINSTALL_REQUIRED, "vendor_artifact_rebuilt"]
         );
-        assert!(warnings[0].detail.contains("run `vlt ci`"), "{warnings:?}");
-        assert!(!warnings[1].detail.contains("vlt install"), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == REINSTALL_REQUIRED && w.detail.contains("run `vlt ci`")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .filter(|w| w.code == "vendor_artifact_rebuilt")
+                .all(|w| !w.detail.contains("vlt install")),
+            "{warnings:?}"
+        );
         assert!(!links.exists());
     }
 
@@ -4027,10 +4035,12 @@ mod tests {
         ]);
         mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &tgz).await;
         let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
-        let cfg = service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = service_cfg(&server.uri(), VendorSource::Service, false);
         let (entry, warnings) = entry_of(run_with(&fx, &cfg).await);
         assert!(
-            codes(&warnings).contains(&"vendor_prebuilt_downloaded"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_downloaded"),
             "{warnings:?}"
         );
         assert!(!fx
@@ -4059,7 +4069,7 @@ mod tests {
         ]);
         mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &tgz).await;
         let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
-        let cfg = service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = service_cfg(&server.uri(), VendorSource::Service, false);
         let (code, _) = refusal(run_with(&fx, &cfg).await);
         assert_eq!(code, "vendor_bundled_deps_unsupported");
         assert!(!fx.root.join(".socket/vendor").exists());
@@ -4084,21 +4094,6 @@ mod tests {
             ),
         ]);
         mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &tgz).await;
-
-        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
-        let cfg = service_cfg(&server.uri(), VendorSource::Auto, false);
-        let (entry, warnings) = entry_of(run_with(&fx, &cfg).await);
-        assert!(
-            codes(&warnings).contains(&"vendor_prebuilt_layout_mismatch"),
-            "{warnings:?}"
-        );
-        assert_eq!(
-            tokio::fs::read(fx.root.join(&entry.artifact.path).join("index.js"))
-                .await
-                .unwrap(),
-            PATCHED,
-            "the local build replaced the service tree"
-        );
 
         let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
         let cfg = service_cfg(&server.uri(), VendorSource::Service, false);

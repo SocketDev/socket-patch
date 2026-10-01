@@ -1,7 +1,7 @@
-//! Coverage-gap integration tests for `crawlers::npm_crawler`: the audited
+//! Coverage-gap integration tests for `crawlers::npm_crawler`: the
 //! never-executed skip/fallback regions of the store walkers
 //! (`collect_nested_node_modules`, `collect_nested_store_entries`,
-//! `scan_scoped_packages`) and every reject/fallback gate of
+//! `gather_scoped_packages`) and every reject/fallback gate of
 //! `find_store_peer_variant_copies` (pnpm and vlt stores). Each test stages the real on-disk shape
 //! that reaches its region and asserts resolver/scan OUTPUT, not just
 //! survival. Companion to `crawler_npm_e2e.rs` (helpers mirrored from

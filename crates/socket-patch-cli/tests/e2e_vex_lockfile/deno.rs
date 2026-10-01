@@ -244,10 +244,10 @@ fn deno_files_naming_socket_urls_never_attest() {
 /// `--no-verify`:
 /// * a redirect ledger recording the lockfile a hosted rewriter WOULD have
 ///   edited (package-lock.json, absent here) — `redirect_unwired`;
-/// * REGRESSION: a (forged / foreign) redirect ledger naming `deno.lock` /
-///   `deno.json` ITSELF — no writer records those, and the Socket url in
-///   them is the user's own import; the liveness fallback used to read any
-///   unknown file as a pin, so `--no-verify` attested it;
+/// * a (forged / foreign) redirect ledger naming `deno.lock` / `deno.json`
+///   ITSELF — no writer records those, and the Socket url in them is the
+///   user's own import; the liveness fallback must not read an unknown file
+///   as a pin, even under `--no-verify`;
 /// * a vendor ledger entry for a jsr package: there is no jsr backend, so
 ///   no committed artifact can be wired — `vendor_unwired`.
 #[test]
@@ -284,6 +284,7 @@ fn deno_ledger_claims_are_dead() {
             base_purl: JSR_PURL.to_string(),
             uuid: UUID.to_string(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel.clone(),
                 sha256: "0".repeat(64),
                 size: None,
@@ -346,10 +347,8 @@ fn deno_jsr_agent_patch_attests_only_with_the_manifest() {
     let (key, before, after) = files()[0];
     put(&pkg, key.strip_prefix("package/").unwrap(), before);
     let rec = record(UUID);
-    let mut manifest = serde_json::json!({
+    let manifest = serde_json::json!({
         "patches": { JSR_PURL: serde_json::to_value(&rec).unwrap() },
-        // Deno has no install hook: declare it manual (property 7).
-        "setup": { "manual": ["deno"] },
     });
     fx.put(".socket/manifest.json", manifest.to_string());
     fx.put(
@@ -404,13 +403,4 @@ fn deno_jsr_agent_patch_attests_only_with_the_manifest() {
         assert_nothing_to_attest(&out, &[JSR_PURL], &format!("no manifest {extra:?}"));
     }
     quiet.assert_no_requests();
-
-    // And a manifest WITHOUT the `setup.manual` declaration keeps the
-    // pre-existing property-7 omission (unchanged by manifest-less VEX:
-    // the Deno patch is not lockfile-persisted, so it does not bypass it).
-    manifest["setup"] = serde_json::json!({});
-    fx.put(".socket/manifest.json", manifest.to_string());
-    let out = fx.vex(&["--offline"]);
-    assert_eq!(out.code, Some(1), "undeclared deno ecosystem: {out}");
-    assert_absent(out.doc.as_ref(), JSR_PURL);
 }

@@ -102,7 +102,10 @@ fn run_vex_hosted_lockfile_only_offline_then_online() {
     assert_absent(out.doc.as_ref(), "pkg:npm/other@1.0.0");
     assert!(api.view_requests(UUID) >= 1, "{:?}", api.requests());
 
-    for via in [VexVia::Apply, VexVia::Vendor] {
+    // `apply --vex` treats the hosted checkout as manifest-less; `vendor`
+    // would EJECT it (v5), which `manifestless_embedded` covers.
+    {
+        let via = VexVia::Apply;
         std::fs::remove_file(p.join(DEFAULT_OUTPUT)).unwrap();
         let out = run_vex(&binary(), p, &VexRun::online(&api).via(via));
         assert_eq!(out.code, Some(0), "{via:?}: {out}");
@@ -115,6 +118,49 @@ fn run_vex_hosted_lockfile_only_offline_then_online() {
             &[(GHSA, &[CVE])],
         );
     }
+}
+
+/// A checkout wired by a PRE-v5 socket-patch still commits
+/// `.socket/vendor/redirect-state.json`. v5 never writes it, but reads it as
+/// an extra local record source: a hosted pin it describes (same purl and
+/// uuid) attests OFFLINE, with zero network, and the ledger is left
+/// byte-identical. A ledger record for another uuid is no record for this
+/// pin.
+#[test]
+fn committed_pre_v5_ledger_lets_a_hosted_pin_attest_offline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let purl = write_hosted_npm_lock(p, "left-pad", "1.3.0", UUID);
+    write_legacy_redirect_ledger(p, &purl, &left_pad_view());
+    let ledger = p.join(LEGACY_REDIRECT_LEDGER);
+    let before = std::fs::read(&ledger).unwrap();
+    let api = PatchApi::empty();
+    for no_verify in [false, true] {
+        let run = VexRun {
+            offline: true,
+            no_verify,
+            ..VexRun::online(&api)
+        };
+        let out = run_vex(&binary(), p, &run);
+        assert_eq!(out.code, Some(0), "nv={no_verify}: {out}");
+        assert_attested(
+            out.doc(),
+            &purl,
+            UUID,
+            Marker::Redirected,
+            &[(GHSA, &[CVE])],
+        );
+    }
+    api.assert_no_requests();
+    assert_eq!(std::fs::read(&ledger).unwrap(), before, "vex never rewrites it");
+
+    let other = "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b";
+    let mut stale = left_pad_view();
+    stale["uuid"] = other.into();
+    write_legacy_redirect_ledger(p, &purl, &stale);
+    let out = run_vex(&binary(), p, &VexRun::offline());
+    assert_eq!(out.code, Some(1), "{out}");
+    assert_not_attested(&out.envelope, &purl, "record_unavailable");
 }
 
 /// With a token the CLI uses the org-scoped route, which the stand-in

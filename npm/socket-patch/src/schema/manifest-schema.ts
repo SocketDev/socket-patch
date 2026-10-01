@@ -30,7 +30,7 @@ export type PatchRecord = z.infer<typeof PatchRecordSchema>
 
 export const PatchManifestSchema = z.object({
   patches: z.record(
-    z.string(), // Package identifier like "npm:simplehttpserver@0.0.6"
+    z.string(), // Package PURL like "pkg:npm/simplehttpserver@0.0.6"
     PatchRecordSchema,
   ),
 })

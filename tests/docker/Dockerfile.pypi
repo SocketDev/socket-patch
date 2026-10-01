@@ -6,8 +6,8 @@
 # user flow.
 #
 # uv/poetry/pdm/hatch/pipenv are installed from PyPI so the one image can
-# drive every Python package manager the setup-matrix suite exercises
-# (tests/setup_matrix/) plus the pypi package-manager vendor suite (pipenv).
+# drive every Python package manager (the pypi package-manager vendor suite
+# uses pipenv).
 # The `--break-system-packages` flag is what Debian-packaged pip3 requires
 # to install into the system site-packages; it's safe inside the disposable
 # test container. Additive: the existing docker_e2e_pypi tests (pip + uv)

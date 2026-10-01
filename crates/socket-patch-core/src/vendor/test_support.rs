@@ -49,6 +49,7 @@ pub(crate) fn service_cfg(
     offline: bool,
 ) -> VendorServiceConfig {
     VendorServiceConfig {
+        maven_config: None,
         source,
         client: Some(
             ApiClient::new(ApiClientOptions {
@@ -78,14 +79,31 @@ pub(crate) async fn mount_granted(
     use wiremock::{Mock, ResponseTemplate};
     let serve_path = format!("/serve/{uuid}/{leaf}");
     let url = format!("{}{serve_path}", server.uri());
+    let mut artifacts = vec![
+        serde_json::json!({ "kind": "tarball", "url": url, "integrity": { "sha512": sri(bytes) } }),
+    ];
+    if let Ok(members) = crate::patch::package::read_archive_bytes_to_map_strict(bytes) {
+        if let Some(name) = members
+            .get("package.json")
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+            .and_then(|p| {
+                p.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+        {
+            if let Ok(checksum) = super::berry_zip::berry_cache_checksum_10c0(bytes, &name) {
+                artifacts.push(serde_json::json!({"kind":"yarn-berry-zip","integrity":{"yarnBerry10c0":checksum}}));
+            }
+        }
+    }
     Mock::given(method("POST"))
         .and(path(PACKAGE_PATH))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "results": { uuid: {
                 "status": "granted",
                 "url": url,
-                "artifacts": [{ "kind": "tarball", "url": url,
-                                "integrity": { "sha512": sri(bytes) } }]
+                "artifacts": artifacts
             }}
         })))
         .mount(server)
@@ -170,12 +188,6 @@ pub(crate) fn empty_patch(
 /// own their purl and record).
 pub(crate) type Borrowed<'e, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'e>>;
 
-/// Pin a backend's download-plan gate to the grants its vendor call really
-/// requests. The gate's verdicts for every case come first — the vendor
-/// loop's plan is built before it vendors anything — then each case is
-/// vendored in order against `server` (answering no result, so `auto` falls
-/// back to the local build). The uuids the gate named must be exactly the
-/// uuids the backend asked grants for, in order; returns them.
 pub(crate) async fn plan_matches_grants<'e>(
     server: &wiremock::MockServer,
     cases: &[(&str, crate::manifest::schema::PatchRecord)],
@@ -281,6 +293,7 @@ pub(crate) fn artifact_leaf(fx: &impl FlipFixture) -> String {
 /// `$suite`: the generated module's name; `$fixture`: `async fn() -> $fx`; `$run`:
 /// `async fn(&$fx, Option<&VendorServiceConfig>) -> VendorOutcome`;
 /// `$fx: FlipFixture`. All three resolve in the invoking module.
+#[cfg(test)]
 macro_rules! npm_flip_suite {
     ($suite:ident, $fx:ident, $fixture:ident, $run:ident) => {
         mod $suite {
@@ -290,7 +303,6 @@ macro_rules! npm_flip_suite {
 
             use super::$fx as Fx;
 
-            /// The deterministic local build's bytes (from a throwaway copy).
             async fn local_bytes() -> Vec<u8> {
                 let probe = $fixture().await;
                 let (r, e, _) = ts::expect_done($run(&probe, None).await);
@@ -359,37 +371,26 @@ macro_rules! npm_flip_suite {
                 let alt = ts::regzip(&local_bytes().await);
                 let server = wiremock::MockServer::start().await;
                 let fx = $fixture().await;
-                let before = first_run(&fx, &server, VendorSource::Auto, Some(&alt)).await;
+                let before = first_run(&fx, &server, VendorSource::Service, Some(&alt)).await;
                 assert_eq!(
                     before[0].1.as_deref(),
                     Some(alt.as_slice()),
                     "run 1 used the service bytes"
                 );
-                assert_noop_rerun(&fx, &server, VendorSource::Auto, false, None, &before).await;
+                assert_noop_rerun(&fx, &server, VendorSource::Service, false, None, &before).await;
             }
 
             #[tokio::test]
-            async fn outage_then_service_rerun_is_in_sync() {
-                let local = local_bytes().await;
-                let alt = ts::regzip(&local);
+            async fn outage_preserves_the_project_then_service_succeeds() {
+                let bytes = local_bytes().await;
                 let server = wiremock::MockServer::start().await;
                 let fx = $fixture().await;
-                let before = first_run(&fx, &server, VendorSource::Auto, None).await;
-                assert_eq!(
-                    before[0].1.as_deref(),
-                    Some(local.as_slice()),
-                    "run 1 built locally"
-                );
-                assert_noop_rerun(&fx, &server, VendorSource::Auto, false, Some(&alt), &before)
-                    .await;
-            }
-
-            #[tokio::test]
-            async fn outage_then_outage_rerun_is_in_sync_and_quiet() {
-                let server = wiremock::MockServer::start().await;
-                let fx = $fixture().await;
-                let before = first_run(&fx, &server, VendorSource::Auto, None).await;
-                assert_noop_rerun(&fx, &server, VendorSource::Auto, false, None, &before).await;
+                let before = ts::tree_snapshot(fx.flip_root());
+                mount(&fx, &server, None).await;
+                let cfg = ts::service_cfg(&server.uri(), VendorSource::Service, false);
+                ts::expect_failure($run(&fx, Some(&cfg)).await);
+                assert_eq!(ts::tree_snapshot(fx.flip_root()), before);
+                first_run(&fx, &server, VendorSource::Service, Some(&bytes)).await;
             }
 
             #[tokio::test]
@@ -409,26 +410,33 @@ macro_rules! npm_flip_suite {
                 let alt = ts::regzip(&local_bytes().await);
                 let server = wiremock::MockServer::start().await;
                 let fx = $fixture().await;
-                let before = first_run(&fx, &server, VendorSource::Auto, Some(&alt)).await;
+                let before = first_run(&fx, &server, VendorSource::Service, Some(&alt)).await;
                 let art = fx.flip_root().join(fx.flip_artifact_rel());
                 let mtime = std::fs::metadata(&art).unwrap().modified().unwrap();
-                assert_noop_rerun(&fx, &server, VendorSource::Auto, false, Some(&alt), &before)
-                    .await;
+                assert_noop_rerun(
+                    &fx,
+                    &server,
+                    VendorSource::Service,
+                    false,
+                    Some(&alt),
+                    &before,
+                )
+                .await;
                 assert_eq!(std::fs::metadata(&art).unwrap().modified().unwrap(), mtime);
             }
 
             /// F5: `--vendor-source build` reuses (it never contacts the
             /// service, and reuse contacts nothing).
             #[tokio::test]
-            async fn build_rerun_after_service_keeps_the_service_bytes() {
+            async fn repeated_service_keeps_the_committed_bytes() {
                 let alt = ts::regzip(&local_bytes().await);
                 let server = wiremock::MockServer::start().await;
                 let fx = $fixture().await;
-                let before = first_run(&fx, &server, VendorSource::Auto, Some(&alt)).await;
+                let before = first_run(&fx, &server, VendorSource::Service, Some(&alt)).await;
                 assert_noop_rerun(
                     &fx,
                     &server,
-                    VendorSource::Build,
+                    VendorSource::Service,
                     false,
                     Some(&alt),
                     &before,
@@ -438,6 +446,7 @@ macro_rules! npm_flip_suite {
         }
     };
 }
+#[cfg(test)]
 pub(crate) use npm_flip_suite;
 
 /// Every regular file under `root` (relative path → bytes), for the
@@ -459,4 +468,527 @@ pub(crate) fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<String, V
     let mut out = std::collections::BTreeMap::new();
     walk(root, root, &mut out);
     out
+}
+
+pub mod service_fixture;
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_pnpm<'a>(
+    purl: &str,
+    source: impl Into<crate::vendor::source::PackageSource<'a>>,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    sources: &crate::patch::apply::PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let source = source.into();
+    let fixture = if service.is_none() {
+        Some(service_fixture::Fixture::new(purl, source, record, sources).await)
+    } else {
+        None
+    };
+    super::pnpm_lock::vendor_pnpm(
+        purl,
+        source,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_yarn_classic<'a>(
+    purl: &str,
+    source: impl Into<crate::vendor::source::PackageSource<'a>>,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    sources: &crate::patch::apply::PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let source = source.into();
+    let fixture = if service.is_none() {
+        Some(service_fixture::Fixture::new(purl, source, record, sources).await)
+    } else {
+        None
+    };
+    super::yarn_classic_lock::vendor_yarn_classic(
+        purl,
+        source,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_npm<'a>(
+    purl: &str,
+    source: impl Into<crate::vendor::source::PackageSource<'a>>,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    sources: &crate::patch::apply::PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let source = source.into();
+    let fixture = if service.is_none() {
+        Some(service_fixture::Fixture::new(purl, source, record, sources).await)
+    } else {
+        None
+    };
+    super::npm_lock::vendor_npm(
+        purl,
+        source,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_composer<'a>(
+    purl: &str,
+    source: impl Into<crate::vendor::source::PackageSource<'a>>,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    sources: &crate::patch::apply::PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let source = source.into();
+    let fixture = if service.is_none() {
+        Some(service_fixture::Fixture::new(purl, source, record, sources).await)
+    } else {
+        None
+    };
+    super::composer_lock::vendor_composer(
+        purl,
+        source,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_cargo_crate<'a>(
+    purl: &str,
+    source: impl Into<crate::vendor::source::PackageSource<'a>>,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    sources: &crate::patch::apply::PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let source = source.into();
+    let fixture = if service.is_none() {
+        Some(service_fixture::Fixture::new(purl, source, record, sources).await)
+    } else {
+        None
+    };
+    super::cargo::vendor_cargo_crate(
+        purl,
+        source,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_vlt<'a>(
+    purl: &str,
+    source: impl Into<crate::vendor::source::PackageSource<'a>>,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    sources: &crate::patch::apply::PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let source = source.into();
+    let fixture = if service.is_none() {
+        Some(service_fixture::Fixture::new(purl, source, record, sources).await)
+    } else {
+        None
+    };
+    super::vlt_lock::vendor_vlt(
+        purl,
+        source,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_maven<'a>(
+    purl: &str,
+    source: impl Into<crate::vendor::source::PackageSource<'a>>,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    sources: &crate::patch::apply::PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let source = source.into();
+    let fixture = if service.is_none() {
+        Some(service_fixture::Fixture::new(purl, source, record, sources).await)
+    } else {
+        None
+    };
+    super::maven_repo::vendor_maven(
+        purl,
+        source.path(),
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_pnpm_legacy<'a>(
+    purl: &str,
+    source: impl Into<crate::vendor::source::PackageSource<'a>>,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    sources: &crate::patch::apply::PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let source = source.into();
+    let fixture = if service.is_none() {
+        Some(service_fixture::Fixture::new(purl, source, record, sources).await)
+    } else {
+        None
+    };
+    super::pnpm_lock_legacy::vendor_pnpm_legacy(
+        purl,
+        source,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_nuget<'a>(
+    purl: &str,
+    source: impl Into<crate::vendor::source::PackageSource<'a>>,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    sources: &crate::patch::apply::PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let source = source.into();
+    let fixture = if service.is_none() {
+        Some(service_fixture::Fixture::new(purl, source, record, sources).await)
+    } else {
+        None
+    };
+    super::nuget_feed::vendor_nuget(
+        purl,
+        source.path(),
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_yarn_berry<'a>(
+    purl: &str,
+    source: impl Into<crate::vendor::source::PackageSource<'a>>,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    sources: &crate::patch::apply::PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let source = source.into();
+    let fixture = if service.is_none() {
+        Some(service_fixture::Fixture::new(purl, source, record, sources).await)
+    } else {
+        None
+    };
+    super::yarn_berry_lock::vendor_yarn_berry(
+        purl,
+        source,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_pypi<'a>(
+    purl: &str,
+    source: impl Into<crate::vendor::source::PackageSource<'a>>,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    sources: &crate::patch::apply::PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let source = source.into();
+    let fixture = if service.is_none() {
+        Some(service_fixture::Fixture::new(purl, source, record, sources).await)
+    } else {
+        None
+    };
+    super::pypi::vendor_pypi(
+        purl,
+        source,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_gem<'a>(
+    purl: &str,
+    source: impl Into<crate::vendor::source::PackageSource<'a>>,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    sources: &crate::patch::apply::PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let source = source.into();
+    let fixture = if service.is_none() {
+        Some(service_fixture::Fixture::new(purl, source, record, sources).await)
+    } else {
+        None
+    };
+    super::gem::vendor_gem(
+        purl,
+        source,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_go_module<'a>(
+    purl: &str,
+    source: impl Into<crate::vendor::source::PackageSource<'a>>,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    sources: &crate::patch::apply::PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let source = source.into();
+    let fixture = if service.is_none() {
+        Some(service_fixture::Fixture::new(purl, source, record, sources).await)
+    } else {
+        None
+    };
+    super::golang::vendor_go_module(
+        purl,
+        source,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_npm_any<'a>(
+    purl: &str,
+    source: impl Into<crate::vendor::source::PackageSource<'a>>,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    sources: &crate::patch::apply::PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let source = source.into();
+    let fixture = if service.is_none() {
+        Some(service_fixture::Fixture::new(purl, source, record, sources).await)
+    } else {
+        None
+    };
+    super::npm_flavor::vendor_npm_any(
+        purl,
+        source,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_bun<'a>(
+    purl: &str,
+    source: impl Into<crate::vendor::source::PackageSource<'a>>,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    sources: &crate::patch::apply::PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let source = source.into();
+    let fixture = if service.is_none() {
+        Some(service_fixture::Fixture::new(purl, source, record, sources).await)
+    } else {
+        None
+    };
+    super::bun_lock::vendor_bun(
+        purl,
+        source,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
+    )
+    .await
+}
+
+pub(crate) fn expect_failure(outcome: VendorOutcome) -> String {
+    match outcome {
+        VendorOutcome::Refused { code, detail } => format!("{code}: {detail}"),
+        VendorOutcome::Done { result, entry, .. } => {
+            assert!(
+                !result.success && entry.is_none(),
+                "expected failure: {result:?}"
+            );
+            result.error.expect("failed result has a reason")
+        }
+    }
+}
+
+pub(crate) fn expect_failed(
+    outcome: VendorOutcome,
+) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
+    match outcome {
+        VendorOutcome::Refused { code, detail } => {
+            match super::npm_common::done_failure("test", format!("{code}: {detail}")) {
+                VendorOutcome::Done {
+                    result,
+                    entry,
+                    warnings,
+                } => (result, entry, warnings),
+                _ => unreachable!(),
+            }
+        }
+        VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } => {
+            assert!(
+                !result.success && entry.is_none(),
+                "expected failure: {result:?}"
+            );
+            (result, entry, warnings)
+        }
+    }
 }

@@ -16,8 +16,6 @@
 //! both apply paths run gated, without `--force`: `scan --sync`'s own
 //! nested apply must patch the file in the same run, and the explicit
 //! `apply` (against restored pristine bytes) must pass the variant gate.
-//! With the old all-zeros placeholder the nested apply failed invisibly
-//! and only the `--force` escape hatch was ever exercised.
 
 #![cfg(feature = "docker-e2e")]
 
@@ -275,13 +273,10 @@ echo "Installed to: $GEM_FILE" >&2
 # after scan --sync's own nested apply has already patched the live file.
 cp "$GEM_FILE" /tmp/pristine.rb
 
-# Pre-seed setup.manual so the agent-mode VEX leg keeps the gem patch through
-# property 7 (this project isn't `socket-patch setup`-configured; agent patches
-# are applied by hand/CI — exactly what `manual` declares). scan --sync merges
-# the downloaded patch into this manifest and preserves the setup block.
+# Pre-seed an empty manifest; scan --sync merges the downloaded patch into it.
 mkdir -p .socket
 cat > .socket/manifest.json <<'MANIFEST'
-{{ "patches": {{}}, "setup": {{ "manual": ["gem"] }} }}
+{{ "patches": {{}} }}
 MANIFEST
 
 # scan exit code is intentionally not gated (see verify_snippet); capture JSON.

@@ -992,13 +992,20 @@ class Cell:
         self.record = ctx['record']
         self.envelopes = []
         self.fresh_patched = {}
+        self.cli_failures = []
 
     # CLI -------------------------------------------------------------------
     def cli(self, args, cwd=None):
         command = [self.ctx['cli'], *args, '--json', '--no-telemetry']
         if self.ctx.get('patch_server_url'):
             command += ['--patch-server-url', self.ctx['patch_server_url']]
-        return run(command, cwd or self.project, self.ctx['cli_env'], self.log)
+        code, out, err = run(command, cwd or self.project, self.ctx['cli_env'], self.log)
+        if code:
+            # --json errors go to stdout, including on repeat/revert calls.
+            # Keep them on the result row so the transport retry sees them.
+            self.cli_failures.append(dict(command=str(args[0]), exitCode=code,
+                                          envelope=parse_envelope(out), stderr=tail(err, 3000)))
+        return code, out, err
 
     def patch_run(self, mode, cwd=None):
         cwd = cwd or self.project
@@ -1195,6 +1202,8 @@ class Cell:
         return clean
 
     def finish(self, row, checks, started):
+        if self.cli_failures:
+            row['cliFailures'] = self.cli_failures
         row['failingChecks'] = [k for k, v in checks.items() if v is False]
         row['notEvaluated'] = [k for k, v in checks.items() if v is None]
         row.setdefault('codes', [])
@@ -1286,19 +1295,22 @@ class Cell:
         self.limitation(row, checks, ['rollbackOriginalBytes'])
 
     def ledger_record(self):
+        """The patch record the mode's state names for PURL. Hosted (v5) keeps
+        no ledger — the lock pin is the whole state — so it is the published
+        record (`ctx['record']`, the API's `/patch/view/<uuid>`) whenever the
+        lock pins UUID; a pre-v5 redirect ledger on disk is a regression."""
         if self.mode == 'hosted':
-            path = self.project / '.socket/vendor/redirect-state.json'
-            key = 'records'
-        else:
-            path = self.project / '.socket/vendor/state.json'
-            key = 'entries'
+            if (self.project / '.socket/vendor/redirect-state.json').exists():
+                return None
+            lock = self.project / 'vlt-lock.json'
+            wired = lock.is_file() and UUID in lock.read_text(encoding='utf-8')
+            return self.record if wired else None
+        path = self.project / '.socket/vendor/state.json'
         if not path.is_file():
             return None
         state = json.loads(path.read_text(encoding='utf-8'))
-        item = (state.get(key) or {}).get(PURL)
-        if item is None:
-            return None
-        return item if self.mode == 'hosted' else item.get('record')
+        item = (state.get('entries') or {}).get(PURL)
+        return None if item is None else item.get('record')
 
     def check_hosted(self, row, checks, before_lock, vlt, original):
         if self.unchanged(row):
@@ -1494,10 +1506,13 @@ def run_with_retries(cell_factory, job, attempts=3):
 # The downgrade scenario (DESIGN §2.4 / §8.4 `downgrade`).
 
 def downgrade(args, ctx, vlt):
-    """vlt ledgers written by this build, then the published release's
+    """vlt state written by this build, then the published release's
     `rollback` and `vendor --revert`: each must leave the project untouched
     (fail closed) or fully reverted, never half-reverted (a dropped record
-    beside a still-redirected lock, a reverted lock with the payload left)."""
+    beside a still-redirected lock, a reverted lock with the payload left).
+    v5 hosted mode writes NO ledger (the lock pin is the state), so the
+    hosted leg asserts exactly that; a pre-v5 published release then has no
+    ledger to replay and must leave the project untouched."""
     out = ctx['out'] / 'downgrade'
     if out.exists():
         shutil.rmtree(out)
@@ -1522,7 +1537,7 @@ def downgrade(args, ctx, vlt):
             if mode == 'hosted' and not probe_artifact(
                     ctx['artifact_url'], ctx['artifact_sha512'], out / 'probe')['verifies']:
                 # The live artifact is content-encoded, so this build refuses to
-                # write a hosted vlt ledger; write it through the identity mirror.
+                # pin it; write the hosted pin through the identity mirror.
                 mirror = IdentityMirror().__enter__()
                 env = dict(env, SOCKET_PROXY_URL=mirror.url)
                 extra = ['--patch-server-url', mirror.url]
@@ -1537,13 +1552,20 @@ def downgrade(args, ctx, vlt):
             written = snapshot(project)
             ledger = '.socket/vendor/redirect-state.json' if mode == 'hosted' \
                 else '.socket/vendor/state.json'
-            state = json.loads(written.get(ledger, b'{}'))
-            kinds = [e.get('kind') for e in state.get('edits', [])] if mode == 'hosted' else [
-                e.get('flavor') for e in (state.get('entries') or {}).values()]
-            row['ledgerKinds'] = kinds
-            if code != 0 or ('redirect_vlt_lock_node' if mode == 'hosted' else 'vlt') not in kinds:
-                raise RuntimeError(f'this build wrote no vlt {mode} ledger (exit {code}): '
-                                   f'{tail(output, 1500)}')
+            if mode == 'hosted':
+                row['ledgerKinds'] = []
+                pinned = UUID.encode() in written.get('vlt-lock.json', b'')
+                if code != 0 or not pinned or ledger in written:
+                    raise RuntimeError(f'this build must pin the hosted vlt lock and write no '
+                                       f'ledger (exit {code}, pinned={pinned}, '
+                                       f'ledger={ledger in written}): {tail(output, 1500)}')
+            else:
+                state = json.loads(written.get(ledger, b'{}'))
+                kinds = [e.get('flavor') for e in (state.get('entries') or {}).values()]
+                row['ledgerKinds'] = kinds
+                if code != 0 or 'vlt' not in kinds:
+                    raise RuntimeError(f'this build wrote no vlt {mode} ledger (exit {code}): '
+                                       f'{tail(output, 1500)}')
             command = ['rollback'] if mode == 'hosted' else ['vendor', '--revert']
             code, output, _ = run([published, *command, '--json', '--yes', '--no-telemetry',
                                    '--cwd', project], project, ctx['cli_env'], log)

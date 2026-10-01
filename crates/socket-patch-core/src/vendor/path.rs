@@ -25,7 +25,7 @@
 //! | golang   | `<module>@<version>/` (nested dirs)    |
 //! | composer | `<vendor>/<name>@<version>/`           |
 //! | gem      | `<name>-<version>/`                    |
-//! | pypi     | `<dist>-<version>-<tags>.whl` (PEP 427)|
+//! | pypi     | `<dist>-<version>-<tags>.whl` (PEP 427); server sdist: `<dist>-<version>.tar.gz` / `.tgz` / `.zip` |
 //! | nuget    | `<idLower>.<versionNorm>.nupkg`        |
 //! | maven    | `<g-as-path>/<a>/<v>/<a>-<v>.jar`      |
 
@@ -264,10 +264,24 @@ pub(crate) fn leaf_to_purl(eco: &str, leaf: &str) -> Option<String> {
             Some(format!("pkg:composer/{vendor}/{name}@{version}"))
         }
         "pypi" => {
+            let Some(stem) = leaf.strip_suffix(".whl") else {
+                // A server sdist: dist-version.(tar.gz|tgz|zip), split at the
+                // last `-` as `pypi_distribution::matches` does.
+                if !super::pypi_distribution::supported(leaf) {
+                    return None;
+                }
+                let stem = [".tar.gz", ".tgz", ".zip"]
+                    .iter()
+                    .find_map(|suffix| leaf.strip_suffix(suffix))?;
+                let (dist, version) = stem.rsplit_once('-')?;
+                if dist.is_empty() || !version.starts_with(|c: char| c.is_ascii_digit()) {
+                    return None;
+                }
+                return Some(format!("pkg:pypi/{dist}@{version}"));
+            };
             // PEP 427 wheel filename: dist-version-(build-)?py-abi-plat.whl;
             // dist and version are the first two `-` segments (dist names
             // normalise `-` to `_`, so the split is unambiguous).
-            let stem = leaf.strip_suffix(".whl")?;
             let mut it = stem.splitn(3, '-');
             let dist = it.next()?;
             let version = it.next()?;
@@ -759,6 +773,33 @@ mod tests {
         assert!(leaf_to_purl("maven", "a:b/x/1.0/x-1.0.jar").is_none());
         // An eco with no vendor backend (deno) never parses.
         assert!(leaf_to_purl("deno", "x-1.0.0").is_none());
+    }
+
+    /// A server sdist is a vendored pypi leaf too: `dist-version` split at
+    /// the last `-`, so a legacy hyphenated dist name keeps its hyphens.
+    #[test]
+    fn leaf_to_purl_names_vendored_pypi_sdists() {
+        for leaf in ["six-1.16.0.tar.gz", "six-1.16.0.tgz", "six-1.16.0.zip"] {
+            assert_eq!(
+                leaf_to_purl("pypi", leaf).as_deref(),
+                Some("pkg:pypi/six@1.16.0"),
+                "{leaf}"
+            );
+        }
+        assert_eq!(
+            leaf_to_purl("pypi", "python-dateutil-2.8.2.tar.gz").as_deref(),
+            Some("pkg:pypi/python-dateutil@2.8.2")
+        );
+        for leaf in [
+            "-1.0.tar.gz",
+            "six-.tar.gz",
+            "six.tar.gz",
+            "six-v1.tar.gz",
+            "six-1.0.tar.bz2",
+            "six 1-1.0.tar.gz",
+        ] {
+            assert!(leaf_to_purl("pypi", leaf).is_none(), "{leaf}");
+        }
     }
 
     #[tokio::test]

@@ -93,7 +93,7 @@ use crate::patch::redirect::{
 };
 use crate::utils::digest::sha256_hex;
 use crate::vendor::lock_inventory::LockIntegrity;
-use crate::vendor::maven_pom::{
+use crate::formats::maven::{
     is_maven_coordinate, is_maven_version_text, parse_pom, split_socket_version, Pom, PomDep,
     PomRepo,
 };
@@ -245,6 +245,15 @@ async fn extract_hosted(
             .map(String::as_str)
             .filter(|uuid| uuid.starts_with(hex8))
             .collect();
+        // A JVM-backend pin: its committed maven2 tree serves it.
+        let jvm_tree = candidates.is_empty()
+            && ctx
+                .exists(&format!(
+                    "{}/{}/{artifact}/{pinned}/{artifact}-{pinned}.jar",
+                    crate::vendor::jvm::maven_reactor::TREE_ROOT,
+                    group.replace('.', "/")
+                ))
+                .await;
         match candidates.as_slice() {
             [uuid] => {
                 ties.entry(*uuid).or_default().insert((
@@ -254,6 +263,7 @@ async fn extract_hosted(
                     pinned.clone(),
                 ));
             }
+            [] if jvm_tree => {}
             [] => out.diag(
                 DIAG_REF_UNATTRIBUTABLE,
                 POM,
@@ -486,6 +496,13 @@ fn classify_repo(ctx: &DiscoverCtx<'_>, repo: &PomRepo, out: &mut Discovery) -> 
     let url_hosted = ctx.hosted_uuid(url);
     let url_vendor_text = names_vendor_dir(url);
     if !id_socket && url_hosted.is_none() && !url_vendor_text {
+        return RepoKind::NotOurs;
+    }
+    // The JVM backend's one shared fallback repository names no patch; its
+    // ledger entries prove their own liveness.
+    if id == crate::vendor::jvm::maven_reactor::REPO_ID
+        && url == crate::vendor::jvm::maven_reactor::REPO_URL
+    {
         return RepoKind::NotOurs;
     }
     let invalid = |out: &mut Discovery, why: &str| {
@@ -1299,7 +1316,7 @@ mod tests {
     /// jar's `.sha1` sidecar is part of the wiring. With it stale or gone,
     /// real Maven (3.6.3 → 4.0.0-rc-6, `e2e_vendor_maven_build`) rejects the
     /// file:// copy and silently resolves Central's pristine jar — while the
-    /// committed members still hash-verify, so this ref used to attest a
+    /// committed members still hash-verify, so the ref must not attest a
     /// build that no longer consumes the patch.
     #[tokio::test]
     async fn vendored_jar_sidecar_must_match_the_jar() {

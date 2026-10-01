@@ -9,7 +9,7 @@
 //!     `dotnet restore` resolves it from nuget.org and writes
 //!     `packages.lock.json` → a marker patch on the extracted `LICENSE.md` is
 //!     hand-staged (manifest + blob; git-blob sha256 from the ACTUAL installed
-//!     bytes) → `socket-patch vendor --json --offline` (the baked binary) →
+//!     bytes) → `socket-patch vendor --json` (the baked binary) →
 //!     asserts: the rebuilt `.nupkg` under
 //!     `.socket/vendor/nuget/<uuid>/`, `socket-patch.vendor.json`, `state.json`,
 //!     the created `nuget.config` (our source + a `packageSourceMapping` for
@@ -25,7 +25,7 @@
 //!     genuinely depends on the vendored feed, and a TAMPER probe (append bytes
 //!     to the vendored nupkg, cold restore) must fail NU1403 (the contentHash
 //!     pin catches it).
-//!   stage 3 (`--network none`): re-vendor is idempotent (already_vendored,
+//!   stage 3 (service available): re-vendor is idempotent (already_vendored,
 //!     lock + nupkg byte-stable) → `vendor --revert` restores
 //!     `packages.lock.json` byte-identical, DELETES the created `nuget.config`,
 //!     and removes `.socket/vendor` → a re-vendor succeeds again.
@@ -38,8 +38,8 @@ mod docker_vendor_common;
 mod vex_e2e_common;
 
 use docker_vendor_common::{
-    assert_stage_markers, bash_prelude, json_assert_fns, run_in_image, run_in_image_network_none,
-    skip_if_no_image, stage_patch_fn,
+    assert_stage_markers, bash_prelude, json_assert_fns, run_in_image_network_none,
+    run_with_fixture, run_with_service, skip_if_no_image, stage_patch_fn,
 };
 
 const IMAGE: &str = "socket-patch-test-nuget:latest";
@@ -64,12 +64,12 @@ fn render(stage_body: &str) -> String {
 }
 
 /// Stage 1: real fixture restore (network OK) + staged marker patch +
-/// `vendor --json --offline` + artifact/config/lock asserts + VEX + fresh
+/// `vendor --json` + artifact/config/lock asserts + VEX + fresh
 /// staging of ONLY the committable files.
 const STAGE1: &str = r#"
 mkdir -p /workspace/proj && cd /workspace/proj
-# Keep the in-container socket-patch fully offline (also gates telemetry).
-export SOCKET_OFFLINE=1
+# Disable telemetry independently of artifact download access.
+export SOCKET_TELEMETRY_DISABLED=1
 # Project-local global package cache so the crawler + rebuild find the nupkg
 # deterministically; stage 2 uses a DIFFERENT cold dir.
 export NUGET_PACKAGES="$PWD/.nuget-packages"
@@ -114,8 +114,9 @@ mkdir -p /workspace/snap
 cp packages.lock.json /workspace/snap/packages.lock.prevendor
 sha256sum /tmp/patched.md | cut -d' ' -f1 > /workspace/snap/patched.sha
 
-# 3. Vendor (fully offline: the blob is staged locally; nupkg rebuilt from cache).
-socket-patch vendor --json --offline > /tmp/vendor.json 2>/tmp/vendor.err
+# 3. Download the artifact published from the staged fixture.
+publish_fixture
+socket-patch vendor --json > /tmp/vendor.json 2>/tmp/vendor.err
 RC=$?; cat /tmp/vendor.err >&2
 [ "$RC" -eq 0 ] || { cat /tmp/vendor.json >&2; fail "vendor exited $RC (expected 0)"; }
 assert_json_field /tmp/vendor.json '"status": "success"'
@@ -232,12 +233,12 @@ echo "===TAMPER NU1403 VERIFIED==="
 exit 0
 "#;
 
-/// Stage 3 (`--network none`): idempotent re-vendor → revert (byte-identical
+/// Stage 3 (service available): idempotent re-vendor → revert (byte-identical
 /// lock restore + created-config deletion + full `.socket/vendor` removal) →
 /// re-vendor works again.
 const STAGE3: &str = r#"
 cd /workspace/proj
-export SOCKET_OFFLINE=1
+export SOCKET_TELEMETRY_DISABLED=1
 export NUGET_PACKAGES="$PWD/.nuget-packages"
 NUPKG=".socket/vendor/nuget/__UUID__/newtonsoft.json.13.0.3.nupkg"
 
@@ -268,7 +269,7 @@ cmp -s packages.lock.json /workspace/snap/packages.lock.prevendor \
 echo "===REVERT VERIFIED==="
 
 # 3. Re-vendor after revert succeeds and rewires again.
-socket-patch vendor --json --offline > /tmp/revendor2.json 2>/tmp/revendor2.err
+socket-patch vendor --json > /tmp/revendor2.json 2>/tmp/revendor2.err
 RC=$?; cat /tmp/revendor2.err >&2
 [ "$RC" -eq 0 ] || { cat /tmp/revendor2.json >&2; fail "post-revert re-vendor exited $RC"; }
 assert_summary /tmp/revendor2.json applied 1
@@ -478,8 +479,8 @@ fn nuget_vendor_fresh_checkout_install_and_revert() {
     // Docker Desktop's file-sharing allowlist.
     let host_dir = tmp.path().canonicalize().expect("canonicalize tempdir");
 
-    // Stage 1 — networked fixture restore + offline vendor + wiring + VEX.
-    let out = run_in_image(IMAGE, &host_dir, &render(STAGE1));
+    // Stage 1 — networked fixture restore + service download + wiring + VEX.
+    let (out, service) = run_with_fixture(IMAGE, &host_dir, &render(STAGE1));
     assert_stage_markers(
         "nuget stage 1 (restore+vendor)",
         &out,
@@ -502,8 +503,8 @@ fn nuget_vendor_fresh_checkout_install_and_revert() {
     );
     assert_manifestless_vex_from_host(&host_dir);
 
-    // Stage 3 — idempotency, revert, re-vendor (still no network).
-    let out = run_in_image_network_none(IMAGE, &host_dir, &render(STAGE3));
+    // Stage 3 — idempotency, revert, redownload after revert.
+    let out = run_with_service(IMAGE, &host_dir, &render(STAGE3), &service.docker_uri());
     assert_stage_markers(
         "nuget stage 3 (idempotent+revert+re-vendor)",
         &out,

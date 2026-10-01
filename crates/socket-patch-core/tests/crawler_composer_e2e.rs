@@ -360,7 +360,7 @@ async fn get_vendor_paths_local_full_setup_returns_vendor() {
 // ── global mode discovery ──────────────────────────────────────
 
 /// `get_vendor_paths(global=true, global_prefix=None)` falls through to
-/// `get_global_vendor_paths` which checks `COMPOSER_HOME` env var.
+/// `get_composer_home`, which checks `COMPOSER_HOME` first.
 /// Stubbing it to a fixture root with `<root>/vendor/` populated must
 /// surface that path.
 #[tokio::test]
@@ -498,9 +498,9 @@ async fn get_vendor_paths_global_via_home_xdg_config_composer_fallback() {
 
 /// `get_composer_home` returns `None` when COMPOSER_HOME is unset,
 /// `composer` is not on PATH, and HOME points at a tempdir without
-/// either `.composer/` or `.config/composer/`. Covers the L194-207
-/// shell-out failure path (via PATH stubbing) plus the final L226
-/// `None` arm.
+/// either `.composer/` or `.config/composer/`. Covers the `composer
+/// global config home` shell-out failure path (via PATH stubbing) plus
+/// the final `None` arm.
 #[tokio::test]
 #[serial_test::serial]
 async fn get_vendor_paths_global_no_composer_no_home_layout_returns_empty() {
@@ -549,7 +549,7 @@ async fn get_vendor_paths_global_no_composer_no_home_layout_returns_empty() {
 /// `.composer` / `.config/composer` platform-default probes into
 /// CWD-relative paths, so a `.composer/vendor/` directory inside the
 /// user's project gets scanned as if it were the global composer home.
-/// Twin of the `utils::fs::home_dir` empty-HOME fix.
+/// Twin of the `utils::fs::home_dir` empty-HOME handling.
 #[tokio::test]
 #[serial_test::serial]
 async fn get_vendor_paths_global_empty_home_not_cwd_relative() {
@@ -665,7 +665,7 @@ async fn find_by_purls_handles_unreadable_installed_json() {
 
 /// `crawl_all` should dedup packages discovered across multiple
 /// vendor paths sharing the same installed package — exercises the
-/// `seen.contains` early-continue arm.
+/// `seen.insert` dedup early-continue arm.
 #[tokio::test]
 #[serial_test::parallel]
 async fn crawl_all_dedups_across_vendor_paths() {
@@ -792,9 +792,8 @@ async fn config_vendor_dir_relocates_discovery() {
 }
 
 /// Composer accepts `./`-prefixed vendor-dir values (`./lib/deps`); refusing
-/// the `.` segment outright regressed such projects to zero discovery, worse
-/// than the old hardcoded `vendor/`. The normalizer reduces the value before
-/// the safety gate.
+/// the `.` segment outright would drop such projects to zero discovery. The
+/// normalizer reduces the value before the safety gate.
 #[tokio::test]
 #[serial_test::parallel]
 async fn config_vendor_dir_dot_prefix_is_normalized() {
@@ -1156,10 +1155,10 @@ async fn rejected_install_path_does_not_fall_back_to_conventional_dir() {
 /// The CLI defaults to `--cwd .`, so production discovery hands the crawler
 /// a RELATIVE vendor path (`./vendor`). `resolve_project_root` then
 /// normalizes the containment boundary to the EMPTY path — and every path,
-/// absolute ones included, `starts_with` the empty path — so the escape gate
-/// was vacuous in exactly the default invocation: a tampered installed.json
-/// entry with an ABSOLUTE `install-path` resolved out of tree and became a
-/// patch write target. `install_path_escaping_project_root_is_rejected`
+/// absolute ones included, `starts_with` the empty path — so a naive escape
+/// gate is vacuous in exactly the default invocation: a tampered
+/// installed.json entry with an ABSOLUTE `install-path` would resolve out of
+/// tree and become a patch write target. `install_path_escaping_project_root_is_rejected`
 /// above never sees this because its staged project root is absolute.
 #[tokio::test]
 #[serial_test::serial]

@@ -76,8 +76,7 @@ fn parse_cargo_toml_malformed_returns_none() {
 
 /// Parser must stop scanning when it leaves the `[package]` table.
 /// A `name =` or `version =` line under a later table must NOT be
-/// picked up. Covers the "left package section" early-break arm
-/// (cargo_crawler.rs:34-36).
+/// picked up. Covers the "left package section" early-break arm.
 #[test]
 #[serial_test::parallel]
 fn parse_cargo_toml_stops_at_next_section() {
@@ -427,7 +426,7 @@ async fn get_crate_source_paths_no_cargo_project_returns_empty() {
 /// Crate directory whose Cargo.toml has `version.workspace = true`
 /// (no concrete `version =` field) — the crawler must fall back to
 /// parsing `<name>-<version>` from the directory name. Exercises
-/// `parse_dir_name_version` (cargo_crawler.rs:357-372).
+/// `parse_dir_name_version`.
 #[tokio::test]
 #[serial_test::parallel]
 async fn crawl_all_falls_back_to_dir_name_when_workspace_version() {
@@ -474,7 +473,7 @@ async fn crawl_all_skips_dir_without_cargo_toml() {
 
 /// `verify_crate_at_path`'s fallback path: Cargo.toml has workspace
 /// version, find_by_purls compares dir name. Exercises the
-/// fallback arm in `verify_crate_at_path` (L335-L348).
+/// fallback arm in `verify_crate_at_path`.
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_by_purls_verify_fallback_via_dir_name() {
@@ -504,7 +503,7 @@ async fn find_by_purls_verify_fallback_via_dir_name() {
 }
 
 /// `version.workspace = true` in a top-level `[package]` block must
-/// bail (line 49-52): the crawler can't infer the actual version from
+/// bail: the crawler can't infer the actual version from
 /// just this file. `find_by_purls` then has to fall back to dir-name
 /// parsing — but `parse_cargo_toml_name_version` itself must return
 /// None up front.
@@ -521,8 +520,7 @@ fn parse_cargo_toml_version_workspace_returns_none() {
 /// staged `sha-1/` dir itself: its manifest bails (workspace version)
 /// and its dir name parses as ("sha", "1") ≠ ("sha-1", "0.10.6"), so
 /// the version cannot be confirmed and the crate must be rejected.
-/// Exercises the `n == name && v == version` false arm
-/// (cargo_crawler.rs:349).
+/// Exercises the `n == name && v == version` false arm.
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_by_purls_verify_fallback_dir_name_mismatch_returns_empty() {
@@ -547,7 +545,7 @@ async fn find_by_purls_verify_fallback_dir_name_mismatch_returns_empty() {
 }
 
 /// Hidden directory entries inside the crate source root must be
-/// skipped by `scan_crate_source` (line 274).
+/// skipped by `scan_crate_source`.
 #[tokio::test]
 #[serial_test::parallel]
 async fn crawl_all_skips_hidden_dirs() {
@@ -579,8 +577,8 @@ async fn crawl_all_skips_hidden_dirs() {
     );
 }
 
-/// `read_crate_cargo_toml` early-returns when the purl has already
-/// been recorded in `seen` (line 310-311). Drive this by staging two
+/// `scan_crate_source` skips a crate whose purl is already in `seen`
+/// (the `seen.insert` continue arm). Drive this by staging two
 /// registry dirs for the same crate — the second one is deduped.
 #[tokio::test]
 #[serial_test::parallel]
@@ -617,7 +615,7 @@ async fn crawl_all_dedups_same_purl() {
 /// `get_crate_source_paths` in local mode without a vendor dir but
 /// with a Cargo.toml falls through to `get_registry_src_paths`. With
 /// CARGO_HOME pointed at an empty tempdir, the registry/src subdir
-/// doesn't exist → returns empty. Covers line 130.
+/// doesn't exist → returns empty.
 #[tokio::test]
 #[serial_test::serial]
 async fn get_crate_source_paths_local_cargo_toml_falls_back_to_registry() {
@@ -649,7 +647,7 @@ async fn get_crate_source_paths_local_cargo_toml_falls_back_to_registry() {
 }
 
 /// `scan_crate_source` must skip plain-file entries inside the source
-/// path — covers `!ft.is_dir()` continue arm (cargo_crawler.rs:266).
+/// path — covers its `!entry.is_dir` continue arm.
 #[tokio::test]
 #[serial_test::parallel]
 async fn crawl_all_skips_top_level_files() {
@@ -673,7 +671,7 @@ async fn crawl_all_skips_top_level_files() {
 /// A crate directory with a broken `Cargo.toml` AND a non-conforming
 /// directory name → `parse_cargo_toml_name_version` returns None
 /// (broken toml) AND `parse_dir_name_version` returns None (no `-`
-/// followed by digit), so the chain short-circuits at line 304 and
+/// followed by digit), so the chain short-circuits and
 /// the package is silently skipped.
 #[tokio::test]
 #[serial_test::parallel]
@@ -737,8 +735,7 @@ async fn crawl_all_handles_unreadable_src_path() {
 /// `pkg:cargo/foo@1.0.0` is the staged `foo/` dir itself: its
 /// Cargo.toml is unparseable and `foo` has no `-<digit>` boundary, so
 /// both parsers fail and the crate must be rejected — exercises the
-/// dir-name-fallback `is_some_and` short-circuit on `None`
-/// (cargo_crawler.rs:346-349).
+/// dir-name-fallback `is_some_and` short-circuit on `None`.
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_by_purls_verify_fails_when_both_parsers_fail() {
@@ -761,7 +758,7 @@ async fn find_by_purls_verify_fails_when_both_parsers_fail() {
 }
 
 /// Same as above but with a registry/src tree staged — the discovered
-/// index dirs must surface. Covers lines 228-235 (entry walk).
+/// index dirs must surface (entry walk).
 #[tokio::test]
 #[serial_test::serial]
 async fn get_crate_source_paths_local_cargo_toml_with_registry_src() {

@@ -130,30 +130,21 @@ fn group_commit_ends_where_per_package_commits_end_for_every_ecosystem() {
     }
 }
 
-/// One package fails (its patch target is missing from the installed copy,
-/// which fails closed without `--force`), the other succeeds: the success is
-/// committed, the failure leaves nothing, and the tree is the per-package
-/// commits' tree.
+/// A service artifact with the wrong patched bytes fails only its package.
 #[test]
 fn a_partial_failure_commits_the_packages_that_succeeded() {
-    for (eco, target) in [
-        ("npm", "proj:node_modules/beta/index.js"),
-        (
-            "cargo",
-            "store:cargo-home/registry/src/index.crates.io-6f17d22bba15001f/beta-1.0.0/src/lib.rs",
-        ),
-        ("gem", "proj:vendor/bundle/gems/beta-1.0.0/lib/beta.rb"),
-        ("golang", "store:modcache/github.com/fx/beta@v1.0.0/beta.go"),
-    ] {
+    for eco in ["npm", "cargo", "gem", "golang"] {
         let grouped = Fixture::new(eco);
         let oracle = Fixture::new(eco);
         for f in [&grouped, &oracle] {
-            let path = match target.split_once(':') {
-                Some(("proj", rel)) => f.root.join(rel),
-                Some((_, rel)) => f.store.join(rel),
-                None => unreachable!(),
-            };
-            std::fs::remove_file(path).unwrap();
+            let hash = socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(
+                &f.patches[1].after,
+            );
+            std::fs::write(
+                f.root.join(".socket/blobs").join(hash),
+                b"wrong service bytes",
+            )
+            .unwrap();
         }
         let (code, stdout, _) = grouped.vendor(&[], &[]);
         let (oracle_code, oracle_stdout, _) = oracle.vendor(&[], &[OFF]);
