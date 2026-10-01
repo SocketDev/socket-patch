@@ -196,6 +196,12 @@ class PipenvTransportRetryTests(unittest.TestCase):
             outcomes = [{"raise": "scan failed: API request failed with status 503: upstream connect error"}, {"passed": True}]
             self.assertEqual(len(self.drive(outcomes, Path(temp))[2]), 2)
 
+    def test_macos_dns_failure_is_a_transport_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            outcomes = [{"passed": False, "log": "NewConnectionError: [Errno 8] nodename nor servname provided, or not known"}, {"passed": True}]
+            self.assertEqual(len(self.drive(outcomes, Path(temp))[2]), 2)
+            self.assertTrue(pipenv.TRANSPORT_FAILURE.search("<urlopen error [Errno 8] nodename nor servname provided, or not known>"))
+
     def test_functional_failures_are_never_retried(self):
         with tempfile.TemporaryDirectory() as temp:
             outcomes = [{"passed": False, "log": "ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE"}]

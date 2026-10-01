@@ -160,7 +160,7 @@ DEFAULT_TIMEOUT = int(os.environ.get("BACKTEST_TIMEOUT", "900"))
 TRANSPORT_FAILURE = re.compile(
     r"too many 5\d\d error responses|Max retries exceeded with url|"
     r"NewConnectionError|ConnectTimeoutError|ReadTimeoutError|"
-    r"Temporary failure in name resolution|Connection reset by peer|RemoteDisconnected|"
+    r"Temporary failure in name resolution|nodename nor servname provided|Connection reset by peer|RemoteDisconnected|"
     r"error sending request for url \(|API request failed with status 5\d\d\b"
 )
 
