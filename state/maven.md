@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Maven bug-hunt routine (label pm:maven).
 
-Last updated: 2026-10-01 (run 3), main `2463257` (v5 consolidation #277; binary still reports 4.0.0), latest release 4.0.0.
+Last updated: 2026-10-01 (run 4), main `2463257` (v5 consolidation #277; binary still reports 4.0.0), latest release 4.0.0.
 
 ## Coverage matrix
 
@@ -16,12 +16,12 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 
 ### v5 vendored / hosted (Linux unless noted)
 
-| Maven | reactor capstone (auto) | reactor `--maven-config=none`: `-o` | `none`: `cd module` | `none`: `-f root` from outside | single-POM `%XX` path | hosted `<repositories/>` |
-| --- | --- | --- | --- | --- | --- | --- |
-| 3.6.3 | blocked (429) | blocked | blocked | untested | untested on v5 | untested on v5 |
-| 3.8.8 | blocked (429) | blocked | blocked | untested | untested on v5 | untested on v5 |
-| 3.9.11 | pass | fail #430 | fail #430 | pass | fail #350 | fail #342 |
-| 4.0.0-rc-7 | pass | fail #430 | pass | pass | untested on v5 | fail #342 |
+| Maven | reactor capstone (auto) | reactor `--maven-config=none`: `-o` | `none`: `cd module` | `none`: `-f root` from outside | reactor path with `,` / space / `%2F` | reactor + existing `maven.config` (CRLF / no EOL / user tail) | reactor + `aether.checksums.algorithms=SHA-256` | reactor profile-overridden `${prop}` | single-POM `%XX` path | hosted `<repositories/>` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 3.6.3 | blocked (429) | blocked | blocked | untested | untested | untested | n/a | blocked (429) | untested on v5 | untested on v5 |
+| 3.8.8 | blocked (429) | blocked | blocked | untested | untested | untested | untested | blocked (429) | untested on v5 | untested on v5 |
+| 3.9.11 | pass | fail #430 | fail #430 | pass | pass (comma: fallback repo) | pass | pass | fail #459 | fail #350 | fail #342 |
+| 4.0.0-rc-7 | pass | fail #430 | pass | pass | untested | untested | pass | fail #459 | untested on v5 | fail #342 |
 
 ### v4.0.0 results (runs 1–2, main `f6b7fb9`; not re-run on v5 unless shown above)
 
@@ -37,12 +37,12 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 ## Backlog
 
 0. **Maintainer request (global `-g`)**: mostly covered in run 3 (see the matrix and the 20261001T061707Z entry). Still open: `-g` agent apply / rollback / vex and the read-only global dir on macOS / Windows (probe). Keep this item until those cells pass or fail.
-1. A maintainer needs to delete the stale probe branches `bughunt/maven/20260930-vendored-paths` and `bughunt/maven/20261001-global-repo`; `git push --delete` hangs up from the sandbox. Probe commits must use the default (signed) git identity. Don't override `user.email`.
-2. Re-run the reactor capstone (auto + `none`) and the hosted capstone on 3.6.3 / 3.8.8 when Central isn't throttling (the fallback-repo-only path).
-3. Reactor backend: `%XX` / comma / space checkout paths (the comma splits `maven.repo.local.tail`), and an existing `.mvn/maven.config` with CRLF / BOM / user tail.
-4. #394 on v5: reactor tree `.sha1`-only versus `aether.checksums.algorithms=SHA-256`.
+1. A maintainer needs to delete the stale probe branches `bughunt/maven/20260930-vendored-paths` and `bughunt/maven/20261001-global-repo`; `git push --delete` still hangs up from the sandbox (run 4). Probe commits must use the default (signed) git identity. Don't override `user.email`.
+2. Re-run the reactor capstone (auto + `none`), the hosted capstone and the #459 fixture on 3.6.3 / 3.8.8 when Central isn't throttling (the fallback-repo-only path). Warm the m2 in an early, separate step.
+3. #459 siblings: top-level 1.11.0 with an active profile setting 1.10.0 (is the warning honest?), and profile `<dependencies>` literals versus a top-level declaration.
+4. Hosted: BOM `import` scope, `-o` on a fresh checkout, and a pre-existing user `.mvn/maven.config` plus `checksums.sha256` round trip through rollback.
 5. Windows long paths + CRLF checkout of `.socket/vendor/maven2` (the new `* -text` `.gitattributes`).
-6. Hosted: BOM `import` scope, exclusion ordering, `-o` on a fresh checkout. VEX online over the #350 fall-through.
+6. The reactor capstone variants from run 4 on 4.0.0-rc-7 (comma / `%2F` paths, existing CRLF `maven.config`).
 
 ## Known non-bugs
 
@@ -56,3 +56,6 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 - `--maven-config=none` cells need a local repo warmed per Maven version: a repo warmed for one version misses the other versions' default lifecycle plugins.
 - Offline `rollback -g` without the before-blob → loud exit 1 "--offline prevents fetching": documented.
 - Already filed elsewhere; don't re-file: #258–#275 (comment/profile/plugin markup #259, multi-module #261, classifier #262, repository order / mirrors #263, crawler lists all of ~/.m2 #265, no re-pin #266, CI matrix #267, no hosted revert #271, lowercased GAV #272, CRLF #273, plugin shadow #274).
+- A UTF-8 BOM in an existing `.mvn/maven.config`: Maven 3.9.11 and 4.0.0-rc-7 refuse the file themselves ("Unrecognized maven.config file entries"). Not caused by socket-patch.
+- Reactor checkout path containing a comma: `maven.repo.local.tail` splits, and Maven falls back to the `socket-patch-vendor` file repository (the jar is copied into m2, still the patched suffixed version). Degraded but fail-closed, not filed.
+- Hosted `merge_checksums` drops non-`<sha>  <path>` lines (`#` comments) and re-sorts a user's `checksums.sha256`. Maven ignores those lines, so this is cosmetic and not filed.
