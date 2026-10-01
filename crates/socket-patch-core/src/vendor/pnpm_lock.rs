@@ -1593,9 +1593,10 @@ struct WorkspaceEdit {
 /// when there is no block-style `overrides:` section.
 fn ws_overrides_section(lines: &[String]) -> Option<(usize, usize, usize)> {
     let (start, end) = workspace::block_section_bounds(lines, "overrides")?;
+    // Comment lines (any indent) say nothing about the entries' indent.
     let indent = lines[start + 1..end]
         .iter()
-        .find(|l| !l.trim().is_empty())
+        .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
         .map(|l| indent_of(l))
         .filter(|&n| n >= 1)
         .unwrap_or(2);
@@ -8582,6 +8583,30 @@ snapshots:
                 lines.join("\n"),
                 "overrides:\n  is-number: 7.0.0\n# ours below\nnext: x\n"
             );
+        }
+
+        /// A leading comment does not decide the entries' indent: a
+        /// 4-space section is still read, edited and reverted as such.
+        #[test]
+        fn leading_comment_does_not_set_the_entry_indent() {
+            for comment in ["# pins", "  # pins"] {
+                let text = format!("overrides:\n{comment}\n    left-pad@1.3.0: 1.3.1\nnext: x\n");
+                let err =
+                    check_workspace_override(Some(&text), "left-pad", "1.3.0", "left-pad@1.3.0")
+                        .unwrap_err();
+                assert!(
+                    err.contains("already carries an override"),
+                    "{comment:?}: {err}"
+                );
+                let text = format!("overrides:\n{comment}\n    is-number: 7.0.0\nnext: x\n");
+                assert_eq!(
+                    apply(&text).unwrap(),
+                    format!(
+                        "overrides:\n{comment}\n    is-number: 7.0.0\n    left-pad@1.3.0: {SPEC}\nnext: x\n"
+                    ),
+                    "{comment:?}"
+                );
+            }
         }
 
         /// #402: the pre-flight conflict check examines a quoted section too.
