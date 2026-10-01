@@ -66,5 +66,5 @@ jobs:
             echo "################ SCENARIO $s"
             BH_SCEN="$RUNNER_TEMP/pkg/scen/$s" BH_WORK="$RUNNER_TEMP/work/$s" BH_REVERT=1 \
               cargo test -q -p socket-patch-cli --test zz_bughunt_gradle bh -- --exact --ignored --nocapture 2>&1 \
-              | grep -E "VENDOR exit|\"status\"|errorCode|\"error\"|CHECK|autocrlf|^0000|GRADLE|CP |What went wrong|socket-patch:|REVERT exit|^ ?[MDA?]{1,2} " || true
+              | grep -v -E '^ +["{}]|^ +\]|^\.$' || true
           done
