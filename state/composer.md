@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Composer bug-hunt routine (label pm:composer).
 
-Last updated: 2026-10-01 (run 5), main `61cfb9b` (after #358 Composer rewriter + hosted-by-default scan/get, #446 `-g` scoping), latest release v4.0.0.
+Last updated: 2026-10-01 (run 6), main `61cfb9b` (after #358 Composer rewriter + hosted-by-default scan/get, #446 `-g` scoping), latest release v4.0.0.
 
 ## Coverage matrix
 
@@ -8,10 +8,10 @@ Cells are "pass", "fail #N" or "untested". Upstream `composer-compatibility.yml`
 
 | OS | Composer (PHP) | Agent: `setup` (LF) | Agent: `setup` CRLF / escapes | Agent: apply (path repo / installed.json) | Scan: custom vendor-dir | Hosted: repo capstones | Hosted: repo `options` → transport-options | Hosted: warm cache | Vendored: dist / path-copy install + revert | Vendored: source install → git clone |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 1.10.28 (8.1/8.3) | untested | untested (OS/version-independent) | pass | untested | CI | fail #399 | pass | pass | untested on v5 (#355 closed) |
-| Linux | 2.2.30 (8.3) | untested | untested | pass | untested | CI | fail #399 | pass | pass | untested on v5 (#355 closed) |
+| Linux | 1.10.28 (8.1/8.3) | untested | untested (OS/version-independent) | pass | untested | CI | fail #399 | pass | pass | pass (v5, run 6) |
+| Linux | 2.2.30 (8.3) | untested | untested | pass | untested | CI | fail #399 | pass | pass | pass (v5, run 6) |
 | Linux | 2.8.12 (8.3/8.4) | removed in v5 | removed in v5 (#351 closed) | pass | pass | pass (5/5) | fail #399 | pass | pass | pass ×2 (v5; #355 closed) |
-| Linux | 2.10.3 (8.3/8.5) | untested | untested | pass | untested | pass (run 5) | untested (expected #399) | untested | pass | untested on v5 (#355 closed) |
+| Linux | 2.10.3 (8.3/8.5) | untested | untested | pass | untested | pass (run 5) | untested (expected #399) | untested | pass | pass (v5, run 6) |
 | macOS | 1.10 / 2.2 / 2.10 | untested | untested | pass | untested | CI | untested | untested | pass | untested on v5 (#355 closed) |
 | Windows | 1.10 / 2.2 / 2.10 | untested | untested | pass (junction) | untested | CI | untested | untested | pass | untested on v5 (#355 closed) |
 
@@ -25,6 +25,16 @@ Cells are "pass", "fail #N" or "untested". Upstream `composer-compatibility.yml`
 | 2.2.30 | pass | untested | pass | untested | pass (PHP 7.2 / 8.3) |
 | 2.8.12 | pass | pass | pass | pass | pass |
 | 2.10.3 | pass | untested | untested | untested | pass |
+
+### Vendored v5 edges (run 6, main `61cfb9b`, Linux PHP 8.3)
+
+| Composer | path-repo entry with existing `transport-options` → install → revert | `require-dev` + space/unicode project path → install / `--no-dev` / vex | deleted uuid dir → `repair` / re-vendor | concurrent `vendor` ×4 | SIGKILL mid-download → re-run |
+| --- | --- | --- | --- | --- | --- |
+| 1.10.28 | pass | pass | fail #515 | untested | untested |
+| 2.2.30 | untested | pass | untested (expected #515) | untested | untested |
+| 2.10.3 | pass | pass | fail #515 | pass | pass |
+
+Hosted packagist-origin psr/log (lockfile-only, 2.10.3): scan → rollback byte-identical: pass. Hand-added `transport-options` kept: #399.
 
 ### Global (`-g`) mode — run 3, main `2463257`
 
@@ -50,11 +60,11 @@ OS-independent (pure path logic). macOS/Windows: untested.
 ## Backlog
 
 1. **Maintainer request (in progress):** global `-g` mode. Remaining: a non-writable global dir must fail loudly (non-root probe), `SOCKET_GLOBAL=1` and space/unicode `--global-prefix` cells, and a re-run after #438/#439 are fixed (PR #442 targets #438), including #446's `-g` scoping inside a hosted Composer project.
-2. Hosted rollback on a packagist-origin entry with a non-default `notification-url` / `ssl` transport option (#399 family). Packagist metadata is reachable from the sandbox; zipballs are not.
-3. Re-run the Composer 1 installers cells when a fix for #463 lands, and add 2.10.3 installers cells. Re-run the path-repo hosted cell when #399 is fixed.
-4. Concurrent `vendor` + `composer install`; an interrupted vendor followed by `repair`.
+2. macOS/Windows probe of vendored path-repo + source-install revert (a Windows junction path repo with existing `transport-options`).
+3. Re-run the Composer 1 installers cells when a fix for #463 lands, and add 2.10.3 installers cells. Re-run the path-repo hosted cell when #399 is fixed, and #515 when it's fixed.
+4. Hosted ↔ vendored takeover on a packagist-origin lockfile-only fixture (psr/log 3.0.2 resolves from packagist metadata; zipballs are unreachable).
 5. `COMPOSER=<other>.json`: the crawler and hosted mode ignore it (scan finds 0 packages). Only the vex gap is documented. Ask maintainers whether to document it or file it.
-6. Delete the leftover probe branches `bughunt/composer/20260930-srconly-probe`, `bughunt/composer/20261001-global-probe` and `bughunt/composer/20261001-c1-topts` (the sandbox git proxy refuses deletes, re-tried in run 5). Needs a maintainer.
+6. Delete the leftover probe branches `bughunt/composer/20260930-srconly-probe`, `bughunt/composer/20261001-global-probe` and `bughunt/composer/20261001-c1-topts` (the sandbox git proxy refuses deletes, re-tried in run 6). Needs a maintainer.
 
 ## Known non-bugs
 
@@ -79,3 +89,6 @@ OS-independent (pure path logic). macOS/Windows: untested.
 - Hosted `vex` attests an uninstalled entry (`--no-dev`, lockfile-only) from the lock's pinned shasum (CLI_CONTRACT "Hosted … With nothing installed … attests from that pin").
 - A hosted pin on a loopback mock origin counts as NEW (not UPGRADE/ALREADY) unless `--patch-server-url` names it. Pass `--patch-server-url` in mock repros of upgrades, `rollback` and `vex`.
 - Probe hygiene: `shell: bash` on Actions runs `bash -e`. Put `set +e` in probes that record failing exit codes.
+- Vendored mode is service-only in v5: `vendor --offline` without a committed artifact is `vendor_service_offline_conflict`. Mock `POST …/patches/package` (granted, sha512 SRI) plus a single-top-dir zip.
+- Hosted rollback restores `dist`/`source` from packagist metadata (`SOCKET_PACKAGIST_URL`), not from the pre-rewrite lock, so hand-added fields such as `dist.mirrors` on a packagist-origin entry aren't restored. Documented. Packagist.org entries carry no mirrors.
+- Mock hygiene: agent-mode `repair` fetches `/patches/diff/<uuid>`. Without that route it reports `download_failed`.
