@@ -1,0 +1,186 @@
+name: bughunt-npm
+on:
+  push:
+    branches: ['bughunt/npm/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        npm: ['10.9.7', '12.1.0']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.11.1'
+      - name: Install npm
+        run: npm install -g npm@${{ matrix.npm }} && npm --version
+      - name: Build CLI
+        run: cargo build --release -p socket-patch-cli
+      - name: Write probe files
+        run: |
+          mkdir -p "$RUNNER_TEMP/probe"
+          cat > "$RUNNER_TEMP/probe/mkpatch.py" <<'PYEOF'
+          # usage: mkpatch.py name version  -> builds /tmp/mock/p/<safe>/ {patched.tgz, meta.json}
+          import sys, os, subprocess, tarfile, io, json, hashlib, base64, uuid, gzip
+          name, ver = sys.argv[1], sys.argv[2]
+          safe = name.replace('/', '__')
+          HERE=os.path.dirname(os.path.abspath(__file__))
+          d = os.path.join(HERE,"p",f"{safe}@{ver}"); os.makedirs(d, exist_ok=True)
+          subprocess.run(["npm.cmd" if os.name=="nt" else "npm","pack",f"{name}@{ver}","--pack-destination",d,"--silent"],check=True,cwd=d,stdout=subprocess.DEVNULL)
+          src = [f for f in os.listdir(d) if f.endswith('.tgz') and f!='patched.tgz'][0]
+          MARK=b"/* SOCKET-PATCHED */\n"
+          tin = tarfile.open(os.path.join(d,src),'r:gz')
+          buf=io.BytesIO(); tout=tarfile.open(fileobj=buf,mode='w',format=tarfile.USTAR_FORMAT)
+          orig=None
+          for m in tin.getmembers():
+              if not m.isfile(): continue
+              data=tin.extractfile(m).read()
+              rel = m.name.split('/',1)[1]
+              if rel=='index.js' or (orig is None and rel.endswith('.js') and rel.count('/')==0 and rel=='index.js'):
+                  orig=data; data=MARK+data
+              ti=tarfile.TarInfo('package/'+rel); ti.size=len(data); ti.mtime=499162500; ti.mode=0o644
+              tout.addfile(ti,io.BytesIO(data))
+          tout.close()
+          assert orig is not None, "no index.js"
+          raw=buf.getvalue(); gz=io.BytesIO()
+          with gzip.GzipFile(fileobj=gz,mode='wb',mtime=0) as g: g.write(raw)
+          tgz=gz.getvalue(); open(os.path.join(d,'patched.tgz'),'wb').write(tgz)
+          def gsha(b): return hashlib.sha256(b"blob %d\0"%len(b)+b).hexdigest()
+          u=str(uuid.uuid5(uuid.NAMESPACE_URL,f"{name}@{ver}"))
+          purl=f"pkg:npm/{name.replace('@','%40')}@{ver}" if name.startswith('@') else f"pkg:npm/{name}@{ver}"
+          meta=dict(name=name,version=ver,uuid=u,purl=purl,sri="sha512-"+base64.b64encode(hashlib.sha512(tgz).digest()).decode(),
+                    before=gsha(orig),after=gsha(MARK+orig))
+          open(os.path.join(d,'before.blob'),'wb').write(orig); open(os.path.join(d,'after.blob'),'wb').write(MARK+orig)
+          json.dump(meta,open(os.path.join(d,'meta.json'),'w'),indent=1); print(json.dumps(meta))
+          PYEOF
+          cat > "$RUNNER_TEMP/probe/server.py" <<'PYEOF'
+          import json, os, re, sys, urllib.parse
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          PORT=int(sys.argv[1]) if len(sys.argv)>1 else 8765
+          BASE=f"http://127.0.0.1:{PORT}"
+          HERE=os.path.dirname(os.path.abspath(__file__))
+          PD=os.path.join(HERE,'p')
+          LOG=open(os.path.join(HERE,'requests.log'),'a')
+          def load():
+              out={}
+              for d in os.listdir(PD):
+                  try: m=json.load(open(os.path.join(PD,d,'meta.json'))); m['dir']=os.path.join(PD,d); out[urllib.parse.unquote(m['purl'])]=m
+                  except Exception: pass
+              return out
+          def norm(p): return urllib.parse.unquote(p).split('?')[0]
+          class H(BaseHTTPRequestHandler):
+              def log_message(self,*a): pass
+              def send(self,code,obj=None,raw=None,ct='application/json'):
+                  b = raw if raw is not None else json.dumps(obj).encode()
+                  self.send_response(code); self.send_header('content-type',ct); self.send_header('content-length',str(len(b))); self.end_headers(); self.wfile.write(b)
+              def body(self):
+                  n=int(self.headers.get('content-length') or 0); return json.loads(self.rfile.read(n) or b'{}')
+              def do_POST(self):
+                  P=load(); b=self.body(); LOG.write(f"POST {self.path} {json.dumps(b)}\n"); LOG.flush()
+                  if self.path.endswith('/batch'):
+                      pk=[]
+                      for c in b.get('components',[]):
+                          m=P.get(urllib.parse.unquote(c['purl']))
+                          if m: pk.append({"purl":c['purl'],"patches":[{"uuid":m['uuid'],"purl":m['purl'],"tier":"free","cveIds":["CVE-2026-1111"],"ghsaIds":["GHSA-aaaa-bbbb-cccc"],"severity":"high","title":"mock"}]})
+                      return self.send(200,{"packages":pk,"canAccessPaidPatches":False})
+                  if self.path.endswith('/package'):
+                      res={}
+                      for u in b.get('uuids',[]):
+                          for m in P.values():
+                              if m['uuid']==u:
+                                  url=f"{BASE}/patch/npm/11111111-1111-4111-8111-111111111111/{m['uuid']}/{m['name'].split('/')[-1]}-{m['version']}.tgz"
+                                  res[u]={"status":"granted","url":url,"purl":m['purl'],"artifacts":[{"kind":"tarball","url":url,"integrity":{"sha512":m['sri']}}],"registryOverride":None}
+                      return self.send(200,{"results":res})
+                  self.send(404,{"error":"nf"})
+              def do_GET(self):
+                  P=load(); p=norm(self.path); LOG.write(f"GET {self.path}\n"); LOG.flush()
+                  if self.path.startswith('/reg/'):
+                      import subprocess
+                      r=subprocess.run(['curl','-sS','-f','https://registry.npmjs.org/'+self.path[5:]],capture_output=True)
+                      return self.send(200 if r.returncode==0 else 404, raw=r.stdout or b'{}')
+                  if p.startswith('/patch/npm/'):
+                      u=p.split('/')[4]
+                      for m in P.values():
+                          if m['uuid']==u: return self.send(200,raw=open(os.path.join(m['dir'],'patched.tgz'),'rb').read(),ct='application/octet-stream')
+                  mm=re.search(r'/patches/view/([0-9a-f-]+)$',p)
+                  if mm:
+                      for m in P.values():
+                          if m['uuid']==mm.group(1):
+                              return self.send(200,{"uuid":m['uuid'],"purl":m['purl'],"publishedAt":"2026-01-01T00:00:00Z","files":{"package/index.js":{"beforeHash":m['before'],"afterHash":m['after']}},
+                                "vulnerabilities":{"GHSA-aaaa-bbbb-cccc":{"cves":["CVE-2026-1111"],"summary":"mock","severity":"high","description":"d"}},"description":"x","license":"MIT","tier":"free"})
+                  mm=re.search(r'/patches/by-package/(.+)$',p)
+                  if mm:
+                      m=P.get(urllib.parse.unquote(mm.group(1)))
+                      pats=[{"uuid":m['uuid'],"purl":m['purl'],"publishedAt":"2026-01-01T00:00:00Z","description":"x","license":"MIT","tier":"free","vulnerabilities":{}}] if m else []
+                      return self.send(200,{"patches":pats,"canAccessPaidPatches":False})
+                  mm=re.search(r'/blob/([0-9a-f]{64})$',p) or re.search(r'/blobs?/([0-9a-f]{64})$',p)
+                  if mm:
+                      for m in P.values():
+                          for k in ('before','after'):
+                              if m[k]==mm.group(1): return self.send(200,raw=open(os.path.join(m['dir'],k+'.blob'),'rb').read(),ct='application/octet-stream')
+                  self.send(404,{"error":"nf"})
+          ThreadingHTTPServer(('127.0.0.1',PORT),H).serve_forever()
+          PYEOF
+          cat > "$RUNNER_TEMP/probe/run.sh" <<'SHEOF'
+          #!/usr/bin/env bash
+          # env: SP (socket-patch binary), PY (python), NPMV (label)
+          set -u
+          HERE=$(cd "$(dirname "$0")" && pwd); cd "$HERE"
+          PORT=8765; SPA="--api-url http://127.0.0.1:$PORT --org o --api-token fake --patch-server-url http://127.0.0.1:$PORT"
+          res(){ echo "RESULT [$NPMV] $1: $2"; }
+          js(){ $PY -c "import sys,json;d=json.load(sys.stdin);print($1)"; }
+          $PY mkpatch.py left-pad 1.3.0 >/dev/null && $PY mkpatch.py is-number 7.0.0 >/dev/null && $PY mkpatch.py is-number 4.0.0 >/dev/null || res setup "FAIL mkpatch"
+          $PY server.py $PORT > server.out 2>&1 & SRV=$!; sleep 2
+          W="$HERE/work dir ü/proj"; mkdir -p "$W"; cd "$W"
+          echo '{"name":"t","version":"1.0.0","private":true,"dependencies":{"lp":"npm:left-pad@1.3.0","is-number":"7.0.0","is-odd":"2.0.0"}}' > package.json
+          npm install --no-audit --no-fund >/dev/null 2>&1 || res install FAIL
+          cp package-lock.json ../orig.lock
+          "$SP" scan $SPA --json > ../scan.json 2>../scan.err; echo "scan exit $?"; js "d['status'],d['rollout']['counts']" < ../scan.json
+          n=$(grep -c 127.0.0.1 package-lock.json); [ "$n" = 3 ] && res hosted-scan PASS || res hosted-scan "FAIL hosted entries=$n"
+          F="$HERE/work dir ü/fresh"; mkdir -p "$F"; cp package.json package-lock.json "$F/"; [ -f .npmrc ] && cp .npmrc "$F/"
+          (cd "$F" && npm ci --no-audit --no-fund >/dev/null 2>&1) || res fresh-ci FAIL
+          ok=1; for p in node_modules/lp node_modules/is-number node_modules/is-odd/node_modules/is-number; do head -c 20 "$F/$p/index.js" | grep -q SOCKET-PATCHED || { ok=0; echo "unpatched $p"; }; done
+          [ $ok = 1 ] && res fresh-ci-patched PASS || res fresh-ci-patched FAIL
+          "$SP" vex $SPA --cwd "$F" -O ../v.json >../vex.out 2>&1 && js "[s['status'] for s in d['statements']]" < ../v.json && res vex PASS || { res vex FAIL; cat ../vex.out; }
+          "$SP" rollback $SPA --json > ../rb.json 2>/dev/null; js "d.get('status'),d.get('hosted')" < ../rb.json
+          cmp -s package-lock.json ../orig.lock && res rollback-byte-exact PASS || { res rollback-byte-exact FAIL; diff ../orig.lock package-lock.json | head -20; }
+          [ -f .npmrc ] && res rollback-npmrc "FAIL .npmrc left: $(cat .npmrc)" || res rollback-npmrc PASS
+          # ---- global
+          GP="$HERE/glob prefix"; mkdir -p "$GP"
+          npm install -g --prefix "$GP" --no-audit --no-fund left-pad@1.3.0 is-number@7.0.0 >/dev/null 2>&1 || res g-install FAIL
+          export npm_config_prefix="$GP"; GR=$(npm root -g); echo "npm root -g: $GR"
+          G="$HERE/gwork"; mkdir -p "$G"; cd "$W"; cp package-lock.json ../pre-g.lock
+          "$SP" scan -g -e npm $SPA --json > ../gscan.json 2>../gscan.err; echo "scan -g exit $?"
+          got=$(js "sorted(p['purl'] for p in d['packages'])" < ../gscan.json); echo "$got"
+          [ "$got" = "['pkg:npm/is-number@7.0.0', 'pkg:npm/left-pad@1.3.0']" ] && res g-scan-report PASS || { res g-scan-report "FAIL $got"; cat ../gscan.err | tail -3; }
+          head -c 20 "$GR/left-pad/index.js" | grep -q SOCKET && res g-scan-readonly "FAIL global patched by report scan" || res g-scan-readonly PASS
+          cmp -s package-lock.json ../pre-g.lock && res g-scan-no-project-write PASS || res g-scan-no-project-write FAIL
+          "$SP" scan -g --mode hosted $SPA >/dev/null 2>&1; e=$?; [ $e != 0 ] && res g-hosted-refuse "PASS exit $e" || res g-hosted-refuse "FAIL exit 0"
+          cd "$G"
+          "$SP" get 1732b55e-2d2d-57b9-95b7-ce027791a596 -g $SPA --json --download-mode file > g.json 2>g.err; echo "get -g exit $?"
+          head -c 20 "$GR/left-pad/index.js" | grep -q SOCKET && res g-get-apply PASS || { res g-get-apply FAIL; tail -5 g.err; cat g.json | head -30; }
+          "$SP" vex -g $SPA --product pkg:npm/tools@1.0.0 -O gv.json >gv.out 2>&1 && res g-vex "PASS $(js "[x.get('@id') for s in d['statements'] for p in s['products'] for x in p.get('subcomponents',[])]" < gv.json)" || { res g-vex FAIL; cat gv.out; }
+          "$SP" rollback -g $SPA --json --download-mode file > grb.json 2>/dev/null; js "d.get('status'),d.get('rolledBack')" < grb.json
+          cmp -s "$GR/left-pad/index.js" "$HERE/p/left-pad@1.3.0/before.blob" && res g-rollback-byte-exact PASS || res g-rollback-byte-exact FAIL
+          SOCKET_GLOBAL=1 "$SP" scan -e npm $SPA --json 2>/dev/null | js "sorted(p['purl'] for p in d['packages'])" | grep -q "left-pad" && res g-env PASS || res g-env FAIL
+          unset npm_config_prefix
+          kill $SRV 2>/dev/null; echo DONE
+          SHEOF
+      - name: Probe
+        run: |
+          export PY=$(command -v python3 || command -v python)
+          export SP="$GITHUB_WORKSPACE/target/release/socket-patch"
+          export NPMV="${{ matrix.os }} npm ${{ matrix.npm }}"
+          bash "$RUNNER_TEMP/probe/run.sh" 2>&1 | tee "$RUNNER_TEMP/probe.log"
+          echo "===== SUMMARY"; grep RESULT "$RUNNER_TEMP/probe.log"
