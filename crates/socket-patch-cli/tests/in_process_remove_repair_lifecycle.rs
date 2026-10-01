@@ -1,9 +1,12 @@
 //! Full-lifecycle tests for `remove` and `repair`.
 //!
 //! `remove` exercises the rollback → manifest delete → blob cleanup
-//! chain. `repair` exercises blob fetching + GC across all three
-//! download modes (file/diff/package). Both are run in-process so
+//! chain. `repair` exercises blob fetching + GC in both download modes
+//! (file/diff) and checks that the removed `package` mode fails hard. Both are run in-process so
 //! coverage is captured.
+
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 
 use std::path::Path;
 
@@ -314,7 +317,7 @@ async fn remove_no_manifest_emits_not_found() {
 }
 
 // ---------------------------------------------------------------------------
-// repair: download in all three modes (file/diff/package)
+// repair: download in both modes (file/diff); `package` fails hard
 // ---------------------------------------------------------------------------
 
 fn make_repair_args(cwd: &Path, mode: &str) -> RepairArgs {
@@ -848,7 +851,6 @@ async fn repair_telemetry_attributed_to_env_credentials() {
     // below would fail for the wrong reason (`is_telemetry_disabled`
     // reads these at runtime — `VITEST=true` included).
     std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
-    std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
     std::env::remove_var("SOCKET_OFFLINE");
     std::env::remove_var("VITEST");
     let code = repair_run(make_repair_args(tmp.path(), "file")).await;
@@ -882,7 +884,7 @@ mod vlt_vendored;
 /// `remove` then reverts the vlt wiring and deletes the artifact.
 #[tokio::test]
 #[serial]
-async fn vlt_repair_rebuilds_the_dir_then_remove_reverts_it() {
+async fn vlt_repair_redownloads_the_dir_then_remove_reverts_it() {
     use vlt_hosted_common as hosted;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -891,7 +893,9 @@ async fn vlt_repair_rebuilds_the_dir_then_remove_reverts_it() {
     std::fs::remove_dir_all(&uuid_dir).unwrap();
 
     let mut args = make_repair_args(root, "diff");
-    args.common.offline = true;
+    let fixture = prebuilt_common::Server::project(root);
+    args.common.offline = false;
+    fixture.configure(&mut args.common);
     assert_eq!(repair_run(args).await, 0);
     assert_eq!(
         std::fs::read(root.join(vlt_vendored::rel()).join("index.js")).unwrap(),

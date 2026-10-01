@@ -54,6 +54,9 @@
 //! older releases, whose lanes run in the `vendored_uv_*` tests. The pip
 //! capstones below keep their own `uv` discovery.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -117,13 +120,14 @@ fn binary() -> PathBuf {
 /// the developer's shell).
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
             cmd.env_remove(&k);
         }
     }
     cmd.env_remove("VIRTUAL_ENV");
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -323,7 +327,8 @@ fn assert_vendored_applied(env: &serde_json::Value) {
 /// `.socket/` manifest + blob fully offline, while `get <uuid> --mode
 /// vendored` fetches the record from the mocked API (the uuid path is
 /// exempt from installed narrowing, so only the `view/{uuid}` route is
-/// needed), writes the manifest itself, and stages patch content in memory
+/// needed), records it in the vendor ledger (detached entry, no manifest),
+/// and stages patch content in memory
 /// — `.socket/blobs` must stay absent. `--vendor-source build` keeps the
 /// get flow off the vendoring service (no grant/tarball mocks needed).
 enum VendorDriver<'a> {
@@ -360,7 +365,7 @@ fn run_vendored(driver: &VendorDriver<'_>, proj: &Path) -> (i32, String, String)
                 "--org",
                 ORG,
                 "--vendor-source",
-                "build",
+                "service",
                 "--cwd",
                 proj.to_str().unwrap(),
             ],
@@ -370,34 +375,36 @@ fn run_vendored(driver: &VendorDriver<'_>, proj: &Path) -> (i32, String, String)
 
 /// Mount `view/{UUID}` on the mock API: the patch record with REAL git-blob
 /// hashes over the ACTUAL installed bytes plus inline base64 `blobContent`,
-/// so `get --mode vendored` both saves the manifest record and stages the
+/// so `get --mode vendored` both records the patch in the vendor ledger and stages the
 /// after-bytes in memory (nothing is staged locally). The purl is the
 /// suite's bare (unqualified) spelling and the file key is
 /// site-packages-relative — exactly what [`stage_patch`]'s manifest carries.
 async fn mount_view_mock(server: &MockServer, before: &[u8], after: &[u8]) {
     use base64::Engine as _;
     let blob_b64 = base64::engine::general_purpose::STANDARD.encode(after);
+    let view = serde_json::json!({
+        "uuid": UUID,
+        "purl": PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": { "six.py": {
+            "beforeHash": git_sha256(before),
+            "afterHash": git_sha256(after),
+            "blobContent": blob_b64,
+        }},
+        "vulnerabilities": { "GHSA-vend-pypi-real": {
+            "cves": ["CVE-2024-88888"],
+            "summary": "capstone vex vuln",
+            "severity": "high",
+            "description": "d",
+        }},
+        "description": "capstone marker patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view(server, &view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": { "six.py": {
-                "beforeHash": git_sha256(before),
-                "afterHash": git_sha256(after),
-                "blobContent": blob_b64,
-            }},
-            "vulnerabilities": { "GHSA-vend-pypi-real": {
-                "cves": ["CVE-2024-88888"],
-                "summary": "capstone vex vuln",
-                "severity": "high",
-                "description": "d",
-            }},
-            "description": "capstone marker patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
         .mount(server)
         .await;
 }
@@ -773,7 +780,7 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
     // `uv sync --frozen --offline` (spike claim 3).
     assert_fresh_checkout_frozen_offline(&uv, tmp.path(), &proj, &lock_wired, python.as_deref());
 
-    // Manifest-less VEX over that fresh checkout (a `vendor --detached` /
+    // Manifest-less VEX over that fresh checkout (a `scan --mode vendored` /
     // depscan checkout's shape once the manifest is gone).
     manifestless_vex_tail(
         &uv,
@@ -825,8 +832,9 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
 /// SAME vendor engine and wiring, driven through get's uuid path — exempt
 /// from installed narrowing, so only the mocked `view/{uuid}` route is
 /// needed. Unlike the capstone, NOTHING is staged locally: the record and
-/// the patched content come from the API mock, get writes
-/// `.socket/manifest.json` itself, and `.socket/blobs` must stay absent
+/// the patched content come from the API mock, get writes NO
+/// `.socket/manifest.json` (the ledger's detached entry is the record), and
+/// `.socket/blobs` must stay absent
 /// (vendored downloads live in memory). Ends with the same fresh-checkout
 /// `uv sync --frozen --offline` committability proof; the revert half stays
 /// with the vendor capstone (same engine, same ledger).
@@ -948,8 +956,8 @@ async fn uv_get_uuid_vendored_fresh_checkout_frozen_offline() {
     let lock_wired = std::fs::read(proj.join("uv.lock")).unwrap();
     assert_fresh_checkout_frozen_offline(&uv, tmp.path(), &proj, &lock_wired, python.as_deref());
 
-    // Manifest-less VEX over the fresh checkout: get wrote the manifest, the
-    // checkout deletes it; the vendor ledger (+ wheel) and the pair remain.
+    // Manifest-less VEX over the fresh checkout: get never wrote a manifest;
+    // the vendor ledger (+ wheel) and the pair remain.
     // Off the async runtime: the matrix's patch API owns its own runtime.
     std::thread::scope(|scope| {
         scope

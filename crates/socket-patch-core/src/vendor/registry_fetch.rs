@@ -1,20 +1,4 @@
-//! Pristine-artifact fetching for lockfile-resolved packages with no
-//! installed copy.
-//!
-//! `vendor` needs an installed package dir to stage from; on a fresh clone
-//! there is none. This module downloads the pristine artifact the lockfile
-//! resolves (the lock-recorded URL when present, the conventional registry
-//! URL otherwise), verifies it against the integrity the lock records
-//! **FAIL-CLOSED and before anything is written to the staging dir**, and
-//! extracts it into a private tempdir the vendor pipeline then treats as
-//! the installed dir. The project tree — node_modules included — is never
-//! touched.
-//!
-//! Trust model: the URL comes from the user's own committed lockfile (or a
-//! conventional construction from it); content trust comes from the
-//! lock-recorded hash, not the transport — which is also why an entry with
-//! no verifier ([`LockIntegrity::None`]) is refused outright
-//! ([`FetchError::Unverifiable`]) without any network I/O.
+//! Bounded archive readers, integrity verification and registry metadata transport.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -24,11 +8,9 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 use crate::constants::USER_AGENT;
-use crate::crawlers::go_crawler::encode_module_path;
 use crate::patch::apply::is_safe_relative_subpath;
-use crate::patch::path_safety::is_safe_single_segment;
 
-use super::lock_inventory::{LockIntegrity, LockfileEntry, SourceKind};
+use super::lock_inventory::LockIntegrity;
 
 /// The default npm registry; override with `SOCKET_NPM_REGISTRY` (the
 /// enterprise-mirror / test escape hatch — `.npmrc` parsing is out of
@@ -38,190 +20,13 @@ pub const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
 /// Whole-package caps — wider than `patch/package.rs`'s patch-archive caps
 /// because these are full upstream packages, but still bounded so a
 /// poisoned lockfile cannot turn the fetch into a disk/memory bomb.
-const MAX_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
 // `pub(crate)`: `common::read_zip_members` is the in-memory twin of
 // [`extract_zip`] and must refuse exactly the same archives, so it reads the
 // one set of caps rather than carrying a copy that can drift.
 pub(crate) const MAX_TOTAL_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MAX_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
 pub(crate) const MAX_ENTRIES: usize = 60_000;
-
-/// A fetched, verified package whose tree is written only when a branch
-/// actually reads it.
-///
-/// The download, the size caps and the SRI / sha / dirhash verification all
-/// stay EAGER, and so does the archive walk: before this value exists the
-/// bytes have been validated against exactly the rules the extractor
-/// enforces ([`Sink::Validate`]), so a truncated, oversized, traversing or
-/// otherwise malformed artifact is still refused at the fetch, at the same
-/// entry and with the same message. What is deferred is the WRITING — the
-/// committed-artifact reuse, the in-sync hot path and the vendoring service
-/// never read the tree, so an idempotent re-run on a lockfile-only checkout
-/// no longer creates and deletes one.
-///
-/// Better still, most of the tree never reaches the tempdir at all: a local
-/// build asks for the vendor stage directly ([`FetchedPackage::stage_into`]),
-/// which the verified bytes write in one pass instead of an extraction and a
-/// whole-tree copy out of it.
-///
-/// The tempdir lives exactly as long as this value — callers must hold it
-/// until the vendor pipeline has finished staging from [`FetchedPackage::dir`].
-pub struct FetchedPackage {
-    dir: PathBuf,
-    /// Where the bytes came from (surfaced in the fetch warning event).
-    pub url: String,
-    /// The verified bytes and the extractor that writes them — the same
-    /// function an eager fetch called, kept so the tree can be produced
-    /// wherever it is first wanted: the private tempdir
-    /// ([`FetchedPackage::dir`]), or a vendor stage directly
-    /// ([`FetchedPackage::stage_into`]).
-    ///
-    /// Dropped as soon as the tempdir holds the tree: from there on every
-    /// caller copies out of it, so the archive is dead weight and a run
-    /// that materialises its sources holds no more of them than the eager
-    /// fetch did. A source NOTHING reads — the case this deferral exists
-    /// for — keeps its bytes until the holder is dropped, which is the
-    /// trade: the eager fetch spent a whole extracted tree on disk instead.
-    extract: std::sync::Mutex<Option<std::sync::Arc<Extractor>>>,
-    /// The tempdir materialisation's outcome, shared by every later caller
-    /// so a failure reads the same each time.
-    extracted: tokio::sync::OnceCell<Result<(), String>>,
-    _tmp: tempfile::TempDir,
-}
-
-/// Writes a verified archive out under a destination, skipping any entry
-/// whose final path component matches (`fresh_copy`'s `skip_file_name`).
-type Extractor = dyn Fn(&Path, Option<&str>) -> Result<(), String> + Send + Sync;
-
-impl std::fmt::Debug for FetchedPackage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FetchedPackage")
-            .field("dir", &self.dir)
-            .field("url", &self.url)
-            .field(
-                "extracted",
-                &self.extracted.get().is_some_and(Result::is_ok),
-            )
-            .finish()
-    }
-}
-
-impl FetchedPackage {
-    fn pending(
-        dir: PathBuf,
-        url: String,
-        tmp: tempfile::TempDir,
-        extract: impl Fn(&Path, Option<&str>) -> Result<(), String> + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            dir,
-            url,
-            extract: std::sync::Mutex::new(Some(std::sync::Arc::new(extract))),
-            extracted: tokio::sync::OnceCell::new(),
-            _tmp: tmp,
-        }
-    }
-
-    /// A tree already written into `tmp` (a committed directory artifact,
-    /// copied and verified up front): nothing left to extract.
-    fn staged(dir: PathBuf, url: String, tmp: tempfile::TempDir) -> Self {
-        Self {
-            dir,
-            url,
-            extract: std::sync::Mutex::new(None),
-            extracted: tokio::sync::OnceCell::new_with(Some(Ok(()))),
-            _tmp: tmp,
-        }
-    }
-
-    /// Where the package root WILL be. Pure — no I/O and no extraction, so
-    /// it answers naming questions (a gem's `<name>-<version>` leaf, whether
-    /// the parent is a gem home's `gems/`) without materialising anything.
-    pub fn dir_path(&self) -> &Path {
-        &self.dir
-    }
-
-    /// The package root (`package.json` at the top for npm) with its content
-    /// on disk, extracted on the first call and kept for the rest of the run.
-    pub async fn dir(&self) -> Result<&Path, String> {
-        let done = self
-            .extracted
-            .get_or_init(|| self.write_tree(self.dir.clone(), None))
-            .await;
-        match done {
-            Ok(()) => {
-                // The tree is on disk; nothing reads the archive again.
-                drop(self.take_extractor());
-                Ok(&self.dir)
-            }
-            Err(detail) => Err(detail.clone()),
-        }
-    }
-
-    /// Let the verified archive go, for a run that has moved past the purl
-    /// this source belongs to. The tree, if one was written, stays.
-    pub fn release(&self) {
-        drop(self.take_extractor());
-    }
-
-    /// Take the extractor out, freeing the archive bytes with the last
-    /// handle. Returns `None` once it is gone.
-    fn take_extractor(&self) -> Option<std::sync::Arc<Extractor>> {
-        self.extract
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-    }
-
-    /// A handle on the extractor, or the failure a caller that needs it
-    /// after the tree is already on disk would see (which no caller does —
-    /// every one of them prefers the tree).
-    fn extractor(&self) -> Result<std::sync::Arc<Extractor>, String> {
-        self.extract
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .ok_or_else(|| format!("the fetched archive for {} is no longer held", self.url))
-    }
-
-    /// Write the tree at `dst` instead of the tempdir: the vendor stage the
-    /// local build patches, which a fetched source used to reach by
-    /// extracting into the tempdir and copying the whole tree out of it
-    /// again. `dst` is removed and recreated first, exactly as `fresh_copy`
-    /// does, and `skip_file_name` drops the same entries it dropped.
-    pub async fn stage_into(&self, dst: &Path, skip_file_name: Option<&str>) -> Result<(), String> {
-        // An earlier branch already wrote the tempdir out (a dry-run
-        // preview, or the release-variant probe the vendor loop runs for
-        // pypi and gem). Copying it is cheaper than inflating the archive a
-        // second time, and it is what this path did before the fetch went
-        // lazy.
-        if self.extracted.get().is_some_and(Result::is_ok) {
-            return crate::patch::copy_tree::fresh_copy(&self.dir, dst, skip_file_name)
-                .await
-                .map_err(|e| e.to_string());
-        }
-        // `fresh_copy`'s own remove/create errors reached the backend's
-        // wrapper bare, so these do too.
-        crate::patch::copy_tree::remove_tree(dst)
-            .await
-            .map_err(|e| e.to_string())?;
-        tokio::fs::create_dir_all(dst)
-            .await
-            .map_err(|e| e.to_string())?;
-        self.write_tree(dst.to_path_buf(), skip_file_name.map(str::to_string))
-            .await
-    }
-
-    /// Extraction is sync CPU + disk work; keep it off the runtime thread so
-    /// the concurrent fetches around it keep moving.
-    async fn write_tree(&self, dst: PathBuf, skip_file_name: Option<String>) -> Result<(), String> {
-        let extract = self.extractor()?;
-        match tokio::task::spawn_blocking(move || extract(&dst, skip_file_name.as_deref())).await {
-            Ok(outcome) => outcome,
-            Err(e) => Err(format!("extraction task failed: {e}")),
-        }
-    }
-}
 
 #[derive(Debug)]
 pub enum FetchError {
@@ -234,9 +39,7 @@ pub enum FetchError {
     Failed(String),
 }
 
-/// One shared client for all fetches in a run.
-/// The registry HTTP client type, nameable by callers that don't depend on
-/// reqwest directly (the CLI's pristine-source ladder).
+/// Shared registry HTTP client for metadata and verified artifact downloads.
 pub type RegistryClient = reqwest::Client;
 
 pub fn build_registry_client() -> RegistryClient {
@@ -262,52 +65,6 @@ pub fn npm_registry_base() -> String {
 pub fn npm_tarball_url(base: &str, name: &str, version: &str) -> String {
     let leaf = name.rsplit('/').next().unwrap_or(name);
     format!("{base}/{name}/-/{leaf}-{version}.tgz")
-}
-
-/// The package-root leaf [`fetch_and_stage`] would stage `purl` under — the
-/// name a [`super::source::DeferredPackage`] answers naming questions with
-/// before (or without) fetching: the canonical `<name>-<version>` for a gem
-/// (the gem backend refuses any other leaf), the fixed per-ecosystem name
-/// otherwise.
-pub fn staged_leaf_for_purl(purl: &str) -> String {
-    let base = crate::utils::purl::strip_purl_qualifiers(purl);
-    match base.strip_prefix("pkg:").and_then(|r| r.split_once('/')) {
-        Some(("gem", rest)) => match rest.rsplit_once('@') {
-            Some((name, version)) => format!("{name}-{version}"),
-            None => "gem".to_string(),
-        },
-        Some(("pypi", _)) => "site-packages".to_string(),
-        Some(("cargo", _)) => "crate".to_string(),
-        Some(("golang", _)) => "module".to_string(),
-        _ => "package".to_string(),
-    }
-}
-
-/// Fetch + verify + extract one lockfile entry. Ecosystems without a
-/// fetcher yet return [`FetchError::Unverifiable`] (callers keep their
-/// not-installed outcome).
-pub async fn fetch_and_stage(
-    entry: &LockfileEntry,
-    client: &reqwest::Client,
-) -> Result<FetchedPackage, FetchError> {
-    if entry.integrity == LockIntegrity::None {
-        return Err(FetchError::Unverifiable(format!(
-            "the lockfile records no integrity hash for {}@{}; refusing to fetch \
-             unverifiable content",
-            entry.name, entry.version
-        )));
-    }
-    match entry.ecosystem {
-        "npm" => fetch_npm(entry, client).await,
-        "cargo" => fetch_cargo(entry, client).await,
-        "golang" => fetch_golang(entry, client).await,
-        "composer" => fetch_composer(entry, client).await,
-        "gem" => fetch_gem(entry, client).await,
-        "pypi" => fetch_pypi(entry, client).await,
-        other => Err(FetchError::Unverifiable(format!(
-            "no registry fetcher for ecosystem `{other}`"
-        ))),
-    }
 }
 
 /// Run one of the extractors on the blocking pool.
@@ -457,20 +214,20 @@ struct DestShape {
     /// Two planned entries may land on ONE file, or a name is used as both
     /// a file and a directory. Either way the entries are not independent:
     /// the pool must not spread them and each parent must be created right
-    /// before its own file, which is what the one-pass walk did.
+    /// before its own file, as a sequential in-order extraction does.
     ///
     /// Besides the exact repeats the plan already resolves, two spellings
     /// meet on a case-insensitive volume (`LICENSE` / `license`) or a
     /// normalization-insensitive one (`café` in NFC / NFD). ASCII case is
     /// checked; for anything non-ASCII the walk gives up on deciding and
-    /// takes the one-at-a-time path, which is what it did before.
+    /// takes the one-at-a-time path.
     in_order: bool,
     /// A name is used as both a file and a directory — a refusal the write
     /// walk raises for every such archive, decided by its entries alone.
     file_dir_conflict: bool,
 }
 
-/// What a one-pass walk has put under the destination so far, by the key a
+/// What a sequential walk has put under the destination so far, by the key a
 /// case-insensitive filesystem compares on — enough to answer the one
 /// refusal a write-free pass cannot: a name used as both a file and a
 /// directory ([`DestShape::file_dir_conflict`]), which a sequential archive
@@ -593,6 +350,7 @@ pub(crate) fn extract_zip_skipping(
 /// the destinations the refusals name, and it is where the write walk takes
 /// over for the one refusal this pass cannot decide on its own (see
 /// [`DestShape::file_dir_conflict`]).
+#[cfg(test)]
 pub(crate) fn validate_zip(
     bytes: &[u8],
     dest: &Path,
@@ -605,12 +363,10 @@ pub(crate) fn validate_zip(
 /// The zip walk, in two passes.
 ///
 /// Pass one reads the central directory alone — no entry is inflated — and
-/// answers everything the one-entry-at-a-time walk decided from headers, in
-/// the same order over the same running total: the traversal guard, the
-/// per-entry and total DECLARED caps, and each entry's destination (with
-/// every parent directory created once, where the old walk re-created them
-/// per entry). It stops at the first refusal, exactly where the single walk
-/// stopped accumulating.
+/// decides everything that comes from headers, in entry order over one
+/// running total: the traversal guard, the per-entry and total DECLARED
+/// caps, and each entry's destination (every parent directory created
+/// once). It stops at the first refusal.
 ///
 /// Pass two inflates the planned entries on a bounded pool of threads, each
 /// with its own reader over the shared bytes. Inflating is the whole cost of
@@ -618,7 +374,7 @@ pub(crate) fn validate_zip(
 /// pass has to serialise is the ANSWER: a repeated name is written by its
 /// last spelling, as an in-order extraction left it, and the refusal
 /// reported is the one at the lowest entry index — which, against pass one's
-/// own index, reproduces the single walk's verdict entry for entry.
+/// own index, reproduces a sequential walk's verdict entry for entry.
 fn walk_zip(
     bytes: &[u8],
     dest: &Path,
@@ -710,8 +466,8 @@ fn plan_zip(
     for i in 0..archive.len() {
         // `by_index`, not the raw reader: an entry the decompressor refuses
         // (an unsupported method, an encrypted member) must be refused HERE,
-        // at the index and with the words the one-pass walk used, rather
-        // than falling through to a later check.
+        // at its index and with the sequential walk's words, rather than
+        // falling through to a later check.
         let file = match archive.by_index(i) {
             Ok(file) => file,
             Err(e) => {
@@ -777,14 +533,13 @@ fn plan_zip(
         return Ok(plan);
     }
 
-    // The destination pass, in entry order — where the one-pass walk did
-    // this work per entry, between its header checks and its inflate.
+    // The destination pass, in entry order.
     let mut out = EntrySink::new(dest, sink).skipping(skip_file_name);
     if plan.in_order {
         // Aliasing destinations: leave the directories to the inflate pass,
         // which creates each one right before its own file, so a name used
-        // as both a file and a directory fails from the syscall it failed
-        // from before, at the entry it failed at.
+        // as both a file and a directory fails from the same syscall at the
+        // same entry as a sequential extraction.
         for entry in &mut plan.entries {
             entry.parent = entry
                 .target
@@ -798,8 +553,8 @@ fn plan_zip(
                 continue;
             };
             if let Err(detail) = out.ensure_parent(&target) {
-                // The one-pass walk stopped here, having written every
-                // entry before this one and nothing after it.
+                // Refuse at this entry: everything before it is written,
+                // nothing after it.
                 let index = plan.entries[at].index;
                 plan.entries.truncate(at);
                 plan.header_refusal = Some((index, detail));
@@ -884,8 +639,8 @@ fn inflate_planned_entries(
             }
         };
         loop {
-            // The verdict is decided; the walk this stands in for had
-            // stopped writing by now, so stop taking work.
+            // The verdict is decided; a sequential walk would have stopped
+            // writing by now, so stop taking work.
             if refused.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
@@ -908,7 +663,7 @@ fn inflate_planned_entries(
         // RLIMIT_NPROC, ENOMEM), and this runs inline on a runtime worker
         // for the fetchers that validate in their async body. Take what the
         // OS gives and let the caller's own thread drain the rest — one
-        // thread is the pre-change walk.
+        // thread is a plain sequential walk.
         for _ in 1..threads {
             if std::thread::Builder::new()
                 .spawn_scoped(scope, worker)
@@ -990,8 +745,8 @@ fn inflate_one<R: std::io::Read + std::io::Seek>(
 
 /// Whether extracting `rel` puts `name` at the root of the destination —
 /// either as the entry itself or as a directory the walk creates for it.
-/// This is exactly what a `metadata(dest.join(name))` probe answered once
-/// the eager extraction had run.
+/// This is exactly what a `metadata(dest.join(name))` probe would answer
+/// after a full extraction.
 fn lands_at_root(rel: &Path, name: &str) -> bool {
     // A leading `./` survives `Path::components` but not `dest.join(rel)`,
     // which is what the probe this replaces ran against.
@@ -1000,262 +755,18 @@ fn lands_at_root(rel: &Path, name: &str) -> bool {
         .is_some_and(|c| c.as_os_str() == name)
 }
 
-/// Composer dist zips: sha1-verified; a variable zipball top dir is
-/// stripped when present, flat `composer archive`-built dists extract
-/// as-is. The extracted dir plays the installed package dir.
-async fn fetch_composer(
-    entry: &LockfileEntry,
-    client: &reqwest::Client,
-) -> Result<FetchedPackage, FetchError> {
-    let Some(url) = entry.resolved.clone() else {
-        return Err(FetchError::Unverifiable(format!(
-            "composer.lock records no dist URL for {}@{}",
-            entry.name, entry.version
-        )));
-    };
-    let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
-    verify_integrity(&bytes, &entry.integrity)?;
-    let tmp = tempfile::tempdir()
-        .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
-    let dir = tmp.path().join("package");
-    // Strip only when the zip actually nests under a lone top dir (the
-    // zipball layout) — flat `composer archive`-built dists carry
-    // composer.json at the root; see [`zip_has_single_top_dir`].
-    let strip_first = zip_has_single_top_dir(&bytes).map_err(FetchError::Failed)?;
-    let has_manifest = validate_zip(&bytes, &dir, strip_first, Some("composer.json"))
-        .map_err(FetchError::Failed)?;
-    if !has_manifest {
-        return Err(FetchError::Failed(format!(
-            "fetched dist for {}@{} carries no composer.json",
-            entry.name, entry.version
-        )));
-    }
-    Ok(FetchedPackage::pending(dir, url, tmp, move |dest, skip| {
-        extract_zip_skipping(&bytes, dest, strip_first, skip)
-    }))
-}
-
-/// `.gem` files are plain tar containers holding `data.tar.gz` (the
-/// package content, no prefix dir) + metadata. The whole `.gem` is
-/// sha256-verified against the Gemfile.lock CHECKSUMS entry first.
-async fn fetch_gem(
-    entry: &LockfileEntry,
-    client: &reqwest::Client,
-) -> Result<FetchedPackage, FetchError> {
-    // The staged leaf must be the canonical `{name}-{version}`: the gem
-    // vendor backend refuses any other leaf as a platform-suffixed install
-    // (`platform_gem_unsupported`), so a generic name would kill the whole
-    // auto-fetch path. The coordinates thereby become a tempdir path
-    // component — `inventory_gemfile_lock` already filters both, but
-    // re-assert locally (defense in depth), before any network I/O.
-    if !is_safe_single_segment(&entry.name) || !is_safe_single_segment(&entry.version) {
-        return Err(FetchError::Failed(format!(
-            "unsafe gem coordinates `{}` @ `{}` — refusing to stage",
-            entry.name, entry.version
-        )));
-    }
-    let Some(url) = entry.resolved.clone() else {
-        return Err(FetchError::Unverifiable(format!(
-            "no download URL for {}@{}",
-            entry.name, entry.version
-        )));
-    };
-    let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
-    verify_integrity(&bytes, &entry.integrity)?;
-
-    let tmp = tempfile::tempdir()
-        .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
-    let dir = tmp.path().join(format!("{}-{}", entry.name, entry.version));
-    validate_gem_data(&bytes, &dir).map_err(FetchError::Failed)?;
-    Ok(FetchedPackage::pending(dir, url, tmp, move |dest, skip| {
-        extract_gem_data_skipping(&bytes, dest, skip)
-    }))
-}
-
-/// Pure-python wheels recorded by uv.lock (URL + sha256): the unzipped
-/// wheel IS a site-packages layout (package dirs + `.dist-info/RECORD` at
-/// the root), which is exactly the shape the pypi vendor backend stages
-/// from.
 /// PyPI's JSON API base; override with `SOCKET_PYPI_JSON_API` (tests point it
 /// at a mock). Used only to turn a lock's file hash into a download URL for
-/// locks that record hashes without URLs (poetry.lock).
+/// locks that record hashes without URLs (poetry.lock, which records one wheel
+/// hash, and Pipfile.lock, which records every release file's hash).
 pub const DEFAULT_PYPI_JSON_API: &str = "https://pypi.org/pypi";
 
-fn pypi_json_api_base() -> String {
+pub(crate) fn pypi_json_api_base() -> String {
     std::env::var("SOCKET_PYPI_JSON_API")
         .ok()
         .map(|v| v.trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| DEFAULT_PYPI_JSON_API.to_string())
-}
-
-/// Resolve the download URL of the release file whose sha256 the lock
-/// records, via `GET <api>/<name>/<version>/json` → `urls[].digests.sha256`.
-/// The hash, not the filename, selects the file, so a lock that names a wheel
-/// PyPI has since re-uploaded under the same name cannot be satisfied by
-/// different bytes — the download is still verified against the same hash.
-///
-/// `candidates` is the lock's digest set: a single digest (poetry.lock names
-/// the wheel) takes the first release file carrying it; several digests
-/// (Pipfile.lock lists every release file's hash) take the pure-Python
-/// `-none-any.whl` whose digest is in the set — a platform wheel or sdist is
-/// never chosen, because the vendored wheel must install everywhere.
-async fn resolve_pypi_url_by_hash(
-    entry: &LockfileEntry,
-    candidates: &[String],
-    client: &reqwest::Client,
-) -> Result<String, FetchError> {
-    let api = format!(
-        "{}/{}/{}/json",
-        pypi_json_api_base(),
-        entry.name,
-        entry.version
-    );
-    let resp = client.get(&api).send().await.map_err(|e| {
-        FetchError::Failed(format!(
-            "PyPI JSON API request for {} failed: {e}",
-            entry.purl
-        ))
-    })?;
-    if !resp.status().is_success() {
-        return Err(FetchError::Failed(format!(
-            "PyPI JSON API returned HTTP {} for {}",
-            resp.status(),
-            entry.purl
-        )));
-    }
-    let body: serde_json::Value = resp.json().await.map_err(|e| {
-        FetchError::Failed(format!(
-            "PyPI JSON API response for {} is not JSON: {e}",
-            entry.purl
-        ))
-    })?;
-    let digest_matches = |file: &serde_json::Value| {
-        file.get("digests")
-            .and_then(|d| d.get("sha256"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|d| candidates.iter().any(|c| d.eq_ignore_ascii_case(c)))
-    };
-    let is_pure_wheel = |file: &serde_json::Value| {
-        file.get("filename")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| file.get("url").and_then(serde_json::Value::as_str))
-            .is_some_and(|name| {
-                name.split(['?', '#'])
-                    .next()
-                    .is_some_and(|n| n.ends_with("-none-any.whl"))
-            })
-    };
-    let files: Vec<&serde_json::Value> = body
-        .get("urls")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|file| digest_matches(file))
-        .collect();
-    let chosen = if candidates.len() == 1 {
-        files.first().copied()
-    } else {
-        files.iter().copied().find(|file| is_pure_wheel(file))
-    };
-    chosen
-        .and_then(|file| file.get("url").and_then(serde_json::Value::as_str))
-        .map(str::to_string)
-        .ok_or_else(|| {
-            FetchError::Unverifiable(if candidates.len() == 1 {
-                format!(
-                    "no PyPI release file for {}@{} matches the lockfile's sha256 {}",
-                    entry.name, entry.version, candidates[0]
-                )
-            } else {
-                format!(
-                    "no platform-independent (`-none-any.whl`) PyPI release file for {}@{} \
-                     matches any of the {} sha256 digests the lockfile records",
-                    entry.name,
-                    entry.version,
-                    candidates.len()
-                )
-            })
-        })
-}
-
-async fn fetch_pypi(
-    entry: &LockfileEntry,
-    client: &reqwest::Client,
-) -> Result<FetchedPackage, FetchError> {
-    let url = match (&entry.resolved, &entry.integrity) {
-        (Some(url), _) => url.clone(),
-        // poetry.lock records the wheel's hash but no URL: look the file up
-        // by that hash (verified again after download).
-        (None, LockIntegrity::Sha256Hex(sha256)) => {
-            resolve_pypi_url_by_hash(entry, std::slice::from_ref(sha256), client).await?
-        }
-        // Pipfile.lock records every release file's hash without filenames:
-        // pick the pure wheel whose digest is in the set (verified again
-        // after download against that set).
-        (None, LockIntegrity::Sha256AnyOf(digests)) => {
-            resolve_pypi_url_by_hash(entry, digests, client).await?
-        }
-        (None, _) => {
-            return Err(FetchError::Unverifiable(format!(
-                "the lockfile records no platform-independent wheel URL or sha256 for {}@{}",
-                entry.name, entry.version
-            )));
-        }
-    };
-    let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
-    verify_integrity(&bytes, &entry.integrity)?;
-    let tmp = tempfile::tempdir()
-        .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
-    let dir = tmp.path().join("site-packages");
-    validate_zip(&bytes, &dir, /*strip_first=*/ false, None).map_err(FetchError::Failed)?;
-    Ok(FetchedPackage::pending(dir, url, tmp, move |dest, skip| {
-        extract_zip_skipping(&bytes, dest, /*strip_first=*/ false, skip)
-    }))
-}
-
-/// crates.io static download host; override with `SOCKET_CRATES_REGISTRY`.
-pub const DEFAULT_CRATES_REGISTRY: &str = "https://static.crates.io/crates";
-
-fn crates_registry_base() -> String {
-    std::env::var("SOCKET_CRATES_REGISTRY")
-        .ok()
-        .map(|v| v.trim_end_matches('/').to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_CRATES_REGISTRY.to_string())
-}
-
-/// `.crate` files are tar.gz with a `{name}-{version}/` top dir — the same
-/// extraction path as npm tarballs. The Cargo.lock `checksum` is the sha256
-/// of the `.crate` bytes.
-async fn fetch_cargo(
-    entry: &LockfileEntry,
-    client: &reqwest::Client,
-) -> Result<FetchedPackage, FetchError> {
-    let url = entry.resolved.clone().unwrap_or_else(|| {
-        format!(
-            "{}/{}/{}-{}.crate",
-            crates_registry_base(),
-            entry.name,
-            entry.name,
-            entry.version
-        )
-    });
-    let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
-    verify_integrity(&bytes, &entry.integrity)?;
-
-    let tmp = tempfile::tempdir()
-        .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
-    let dir = tmp.path().join("crate");
-    if !validate_tgz(&bytes, &dir, Some("Cargo.toml")).map_err(FetchError::Failed)? {
-        return Err(FetchError::Failed(format!(
-            "fetched .crate for {}@{} carries no Cargo.toml — not a crate",
-            entry.name, entry.version
-        )));
-    }
-    Ok(FetchedPackage::pending(dir, url, tmp, move |dest, skip| {
-        extract_tgz_skipping(&bytes, dest, skip)
-    }))
 }
 
 /// go's default module proxy (the first element of go's default
@@ -1267,7 +778,7 @@ pub const DEFAULT_GOPROXY: &str = "https://proxy.golang.org";
 /// the module matches GONOPROXY (defaulting to GOPRIVATE). Falling back to a
 /// public proxy there would send a private module path off the machine.
 /// A non-empty `SOCKET_GOPROXY` is an explicit choice and always wins.
-fn goproxy_base(module: &str) -> Result<String, String> {
+pub(crate) fn goproxy_base(module: &str) -> Result<String, String> {
     if let Ok(v) = std::env::var("SOCKET_GOPROXY") {
         let v = v.trim_end_matches('/').to_string();
         if !v.is_empty() {
@@ -1310,7 +821,7 @@ fn goproxy_base(module: &str) -> Result<String, String> {
 /// glob match a leading path-element prefix of `target`? A glob with
 /// syntax this matcher does not implement (`[...]`, `\`) counts as a
 /// match, so an unrecognized private pattern never leaks a module path.
-fn go_match_prefix_patterns(globs: &str, target: &str) -> bool {
+pub(crate) fn go_match_prefix_patterns(globs: &str, target: &str) -> bool {
     globs
         .split(',')
         .map(str::trim)
@@ -1345,11 +856,12 @@ fn go_glob_match(pattern: &[u8], name: &[u8]) -> bool {
 ///
 /// Runs in the ecosystem-agnostic service-download path whenever the
 /// service reports a `dirhashH1`.
-fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
+pub(crate) fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
     Ok(walk_module_zip(bytes, None)?.h1)
 }
 
 /// What one walk over a module zip learned.
+#[cfg_attr(not(test), allow(dead_code))]
 struct ModuleZipWalk {
     /// The `h1:` dirhash of the entries.
     h1: String,
@@ -1367,18 +879,14 @@ struct ModuleZipWalk {
 /// The dirhash walk, optionally also answering what the extraction walk
 /// would have said about the same entries.
 ///
-/// The golang registry fetch used to inflate every entry twice: once for
-/// the dirhash, once to write the tree. Both walks read the same deflate
-/// streams and both derive everything they check from the entry's name,
-/// its declared size and how many bytes it actually decompresses to — all
-/// of which this walk already has — so the second inflate bought nothing.
+/// One inflate serves both the dirhash and the extraction checks: both
+/// derive everything from the entry's name, its declared size and how many
+/// bytes it actually decompresses to.
 ///
-/// The ORDER the two walks produced is preserved exactly. The dirhash pass
-/// ran to completion first, so its refusal still wins outright and returns
-/// here; the extraction refusal is recorded at the lowest entry index,
-/// where the second walk would have stopped, and handed back for the caller
-/// to raise only after the dirhash has been compared — which is where the
-/// second walk used to start.
+/// Refusal ORDER matches a dirhash-then-extract sequence: a dirhash refusal
+/// wins outright and returns here; the extraction refusal is recorded at
+/// the lowest entry index and handed back for the caller to raise only
+/// after the dirhash has been compared.
 fn walk_module_zip(bytes: &[u8], validate_prefix: Option<&str>) -> Result<ModuleZipWalk, String> {
     use std::io::Read as _;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
@@ -1441,8 +949,8 @@ fn walk_module_zip(bytes: &[u8], validate_prefix: Option<&str>) -> Result<Module
             ));
         }
         // What `extract_zip_with_prefix` would have made of this entry, in
-        // its own order. Only up to the first refusal: past that the walk it
-        // stands in for had already stopped, totals included.
+        // its own order. Only up to the first refusal: past that the
+        // extraction would already have stopped, totals included.
         if let (Some(prefix), None) = (validate_prefix, extract_refusal.as_ref()) {
             extract_refusal =
                 module_entry_refusal(&name, prefix, declared, entry_bytes, &mut declared_total);
@@ -1637,244 +1145,10 @@ fn walk_zip_with_prefix(
     Ok(())
 }
 
-async fn fetch_golang(
-    entry: &LockfileEntry,
-    client: &reqwest::Client,
-) -> Result<FetchedPackage, FetchError> {
-    let LockIntegrity::GoH1(expected) = &entry.integrity else {
-        return Err(FetchError::Unverifiable(
-            "go module entries verify via the go.sum h1 dirhash only".to_string(),
-        ));
-    };
-    let url = match &entry.resolved {
-        Some(url) => url.clone(),
-        None => format!(
-            "{}/{}/@v/{}.zip",
-            goproxy_base(&entry.name).map_err(FetchError::Unverifiable)?,
-            encode_module_path(&entry.name),
-            encode_module_path(&entry.version)
-        ),
-    };
-    let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
-    let prefix = format!("{}@{}/", entry.name, entry.version);
-    // One inflate answers both the dirhash and the extraction rules; see
-    // [`walk_module_zip`] for why that keeps the two refusals' order.
-    let walk = walk_module_zip(&bytes, Some(&prefix)).map_err(FetchError::Failed)?;
-    if walk.h1 != *expected {
-        return Err(FetchError::Failed(format!(
-            "go.sum dirhash mismatch: lockfile records {expected}, the fetched module zip \
-             hashes to {}",
-            walk.h1
-        )));
-    }
-    // The tempdir is created BEFORE the extraction refusal is raised, where
-    // the second walk created it: a run that cannot make one reports that,
-    // as it did, rather than the refusal.
-    let tmp = tempfile::tempdir()
-        .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
-    let dir = tmp.path().join("module");
-    if walk.dest_clash {
-        // A name used as both a file and a directory: the extraction always
-        // refuses it, and only the filesystem can say with which errno at
-        // which entry. Let the walk this one stands in for answer, where it
-        // answered before.
-        extract_zip_with_prefix(&bytes, &dir, &prefix).map_err(FetchError::Failed)?;
-    } else if let Some(detail) = walk.extract_refusal {
-        return Err(FetchError::Failed(detail));
-    }
-    Ok(FetchedPackage::pending(dir, url, tmp, move |dest, skip| {
-        extract_zip_with_prefix_skipping(&bytes, dest, &prefix, skip)
-    }))
-}
-
-async fn fetch_npm(
-    entry: &LockfileEntry,
-    client: &reqwest::Client,
-) -> Result<FetchedPackage, FetchError> {
-    fetch_npm_inner(entry, client, true).await
-}
-
-async fn fetch_npm_inner(
-    entry: &LockfileEntry,
-    client: &reqwest::Client,
-    verify: bool,
-) -> Result<FetchedPackage, FetchError> {
-    // A foreign berry cacheKey is decidable from the lockfile alone: refuse
-    // BEFORE the download, keeping the Unverifiable no-network contract (and
-    // not spending a full tarball download on an entry we could never
-    // verify).
-    if verify {
-        if let LockIntegrity::BerryChecksum(expected) = &entry.integrity {
-            if !expected.starts_with("10c0/") {
-                return Err(FetchError::Unverifiable(format!(
-                    "yarn berry checksum `{expected}` uses a cacheKey other than 10c0; \
-                     the cache-zip recipe is not reproducible for it"
-                )));
-            }
-        }
-    }
-    let url = entry
-        .resolved
-        .clone()
-        .unwrap_or_else(|| npm_tarball_url(&npm_registry_base(), &entry.name, &entry.version));
-    let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
-    if !verify {
-        // fetch_npm_unverified: the caller owns end-to-end verification.
-    } else {
-        match &entry.integrity {
-            // yarn berry locks never hash the tarball itself — the checksum is
-            // sha512 of the deterministic cache zip. Rebuild it from the fetched
-            // bytes (the same spike-pinned recipe the berry wiring uses) and
-            // compare. Only cacheKey 10c0 (yarn 4 default) is reproducible.
-            LockIntegrity::BerryChecksum(expected) => {
-                let actual = super::berry_zip::berry_cache_checksum_10c0(&bytes, &entry.name)
-                    .map_err(FetchError::Failed)?;
-                if &actual != expected {
-                    return Err(FetchError::Failed(format!(
-                        "yarn berry cache checksum mismatch: lockfile records {expected}, \
-                         the fetched tarball rebuilds to {actual}"
-                    )));
-                }
-            }
-            other => verify_integrity(&bytes, other)?,
-        }
-    }
-
-    let tmp = tempfile::tempdir()
-        .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
-    let dir = tmp.path().join("package");
-    if !validate_tgz(&bytes, &dir, Some("package.json")).map_err(FetchError::Failed)? {
-        return Err(FetchError::Failed(format!(
-            "fetched tarball for {}@{} carries no package.json — not an npm package",
-            entry.name, entry.version
-        )));
-    }
-    Ok(FetchedPackage::pending(dir, url, tmp, move |dest, skip| {
-        extract_tgz_skipping(&bytes, dest, skip)
-    }))
-}
-
-/// Stage a package from an on-disk vendored tarball (the fresh-clone
-/// re-vendor path: the project has our committed artifact but no installed
-/// copy). The bytes are verified against the LEDGER-recorded sha256 before
-/// extraction — same fail-closed posture as the registry path; an entry
-/// with no recorded hash is refused.
-pub async fn stage_local_artifact(
-    tgz_path: &Path,
-    expected_sha256_hex: &str,
-) -> Result<FetchedPackage, FetchError> {
-    if expected_sha256_hex.is_empty() {
-        return Err(FetchError::Unverifiable(
-            "the vendor ledger records no sha256 for the artifact".to_string(),
-        ));
-    }
-    // Guarded read (`open_regular_file`): a FIFO squatting at the committed
-    // artifact path must fail fast instead of wedging the fresh-clone
-    // re-vendor forever in an `open(2)` waiting for a writer — the caller's
-    // metadata probe passes for a FIFO, so this is the first open. Same
-    // guard class as the vendor lockfile reads.
-    let bytes = {
-        use tokio::io::AsyncReadExt as _;
-        let (file, metadata) = crate::utils::fs::open_regular_file(tgz_path)
-            .await
-            .map_err(|e| FetchError::Failed(format!("cannot read {}: {e}", tgz_path.display())))?;
-        // Enforce the cap BEFORE the size-matched allocation and read: the
-        // committed artifact path can hold a huge (or sparse, cost-free to
-        // craft) file, and a metadata-sized `with_capacity` would abort or
-        // OOM instead of returning the clean cap error below. Declared size
-        // here + actual bytes below — the same double enforcement as
-        // [`download`]; the `take` holds the memory bound even against a
-        // file that grows between this stat and the read.
-        if metadata.len() > MAX_DOWNLOAD_BYTES {
-            return Err(FetchError::Failed(format!(
-                "{}: artifact exceeds the {MAX_DOWNLOAD_BYTES}-byte cap",
-                tgz_path.display()
-            )));
-        }
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.take(MAX_DOWNLOAD_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|e| FetchError::Failed(format!("cannot read {}: {e}", tgz_path.display())))?;
-        bytes
-    };
-    if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
-        return Err(FetchError::Failed(format!(
-            "{}: artifact exceeds the {MAX_DOWNLOAD_BYTES}-byte cap",
-            tgz_path.display()
-        )));
-    }
-    let actual = hex::encode(Sha256::digest(&bytes));
-    if !actual.eq_ignore_ascii_case(expected_sha256_hex) {
-        return Err(FetchError::Failed(format!(
-            "{}: sha256 mismatch against the vendor ledger (recorded {expected_sha256_hex}, \
-             on-disk bytes hash to {actual})",
-            tgz_path.display()
-        )));
-    }
-    let tmp = tempfile::tempdir()
-        .map_err(|e| FetchError::Failed(format!("cannot create staging tempdir: {e}")))?;
-    let dir = tmp.path().join("package");
-    validate_tgz(&bytes, &dir, None).map_err(FetchError::Failed)?;
-    Ok(FetchedPackage::pending(
-        dir,
-        format!("file:{}", tgz_path.display()),
-        tmp,
-        move |dest, skip| extract_tgz_skipping(&bytes, dest, skip),
-    ))
-}
-
-/// Stage a package from a committed vlt directory artifact (the
-/// fresh-clone re-vendor path): an inventory-verified copy of `dir` without
-/// its `node_modules/`. Refused when the ledger records no inventory, and
-/// on any missing, extra or modified file.
-pub async fn stage_local_dir_artifact(
-    dir: &Path,
-    inventory: Option<&std::collections::BTreeMap<String, String>>,
-) -> Result<FetchedPackage, FetchError> {
-    let Some(inventory) = inventory else {
-        return Err(FetchError::Unverifiable(
-            "the vendor ledger records no file inventory for the artifact".to_string(),
-        ));
-    };
-    let actual = super::verify::compute_package_dir_inventory(dir)
-        .await
-        .map_err(|e| FetchError::Failed(format!("{}: {e}", dir.display())))?;
-    if &actual != inventory {
-        return Err(FetchError::Failed(format!(
-            "{}: the committed dir does not match the vendor ledger's file inventory",
-            dir.display()
-        )));
-    }
-    let tmp = tempfile::tempdir()
-        .map_err(|e| FetchError::Failed(format!("cannot create staging tempdir: {e}")))?;
-    let staged = tmp.path().join("package");
-    crate::patch::copy_tree::fresh_copy(dir, &staged, None)
-        .await
-        .map_err(|e| FetchError::Failed(format!("cannot stage {}: {e}", dir.display())))?;
-    crate::patch::copy_tree::remove_tree(&staged.join("node_modules"))
-        .await
-        .map_err(|e| FetchError::Failed(format!("cannot stage {}: {e}", dir.display())))?;
-    let copied = super::verify::compute_package_dir_inventory(&staged)
-        .await
-        .map_err(|e| FetchError::Failed(format!("{}: {e}", dir.display())))?;
-    if &copied != inventory {
-        return Err(FetchError::Failed(format!(
-            "{}: the staged copy does not match the vendor ledger's file inventory",
-            dir.display()
-        )));
-    }
-    Ok(FetchedPackage::staged(
-        staged,
-        format!("file:{}", dir.display()),
-        tmp,
-    ))
-}
-
 /// Capped download. http(s) only; the cap is enforced on the declared
 /// Content-Length AND the actual stream (a lying server cannot blow past
 /// it).
-async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+pub(crate) async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err(format!("refusing non-http(s) artifact URL `{url}`"));
     }
@@ -1910,66 +1184,24 @@ async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String
     Ok(bytes)
 }
 
-/// Verify downloaded bytes against the lock-recorded verifier. Runs BEFORE
-/// any disk write. Berry cache-zip checksums and go.sum dirhashes have
-/// dedicated verifiers in their ecosystems' fetchers.
-/// Fetch + stage an npm package from its conventional registry URL WITHOUT
-/// content verification. The download/extract caps still apply.
-///
-/// SECURITY: callers MUST end-to-end verify whatever they derive from the
-/// staged copy against an independent trust anchor before committing it —
-/// repair's ledger reconstruction verifies the deterministically REBUILT
-/// vendored tarball against the integrity the rewired lockfile records
-/// (`artifact_matches_integrity`); a tampered pristine source then changes
-/// the rebuilt bytes and fails closed.
-pub async fn fetch_npm_unverified(
-    name: &str,
-    version: &str,
-    client: &reqwest::Client,
-) -> Result<FetchedPackage, FetchError> {
-    let entry = LockfileEntry {
-        ecosystem: "npm",
-        source_kind: SourceKind::Unspecified,
-        name: name.to_string(),
-        version: version.to_string(),
-        purl: format!("pkg:npm/{name}@{version}"),
-        resolved: None,
-        integrity: LockIntegrity::None,
-    };
-    fetch_npm_inner(&entry, client, false).await
-}
-
-/// Whole-artifact verification against a lock-recorded integrity (the same
-/// verifiers the fetch path uses, including the berry cache-zip rebuild).
-/// `name` feeds the berry cache-zip recipe; ignored otherwise.
+/// Verify archive bytes against lock-recorded integrity. Berry cache checksums
+/// require server metadata because they identify a different archive format.
 pub fn artifact_matches_integrity(
     bytes: &[u8],
-    name: &str,
+    _name: &str,
     integrity: &LockIntegrity,
 ) -> Result<(), String> {
     match integrity {
-        LockIntegrity::BerryChecksum(expected) => {
-            if !expected.starts_with("10c0/") {
-                return Err(format!(
-                    "yarn berry checksum `{expected}` uses a cacheKey other than 10c0"
-                ));
-            }
-            let actual = super::berry_zip::berry_cache_checksum_10c0(bytes, name)?;
-            if &actual == expected {
-                Ok(())
-            } else {
-                Err(format!(
-                    "yarn berry cache checksum mismatch: lockfile records {expected}, the \
-                     artifact rebuilds to {actual}"
-                ))
-            }
-        }
+        LockIntegrity::BerryChecksum(_) => Err("a Yarn Berry cache checksum cannot verify tarball bytes; use the archive integrity supplied by the patch service".into()),
         other => verify_integrity(bytes, other).map_err(|e| match e {
             FetchError::Failed(d) | FetchError::Unverifiable(d) => d,
         }),
     }
 }
 
+/// Verify downloaded bytes against the lock-recorded verifier. Runs BEFORE
+/// any disk write. Berry cache-zip checksums and go.sum dirhashes have
+/// dedicated verifiers in their ecosystems' fetchers.
 fn verify_integrity(bytes: &[u8], integrity: &LockIntegrity) -> Result<(), FetchError> {
     match integrity {
         LockIntegrity::Sri(sri) => verify_sri(bytes, sri).map_err(FetchError::Failed),
@@ -2020,10 +1252,10 @@ fn verify_integrity(bytes: &[u8], integrity: &LockIntegrity) -> Result<(), Fetch
 /// the only integrity npm-era lockfile entries carry (yarn classic writes
 /// `integrity sha1-…` for them), and it is the exact guarantee the package
 /// manager itself enforces for those entries — refusing it would make every
-/// legacy package unvendorable whenever the prebuilt-artifact service misses
-/// (the 2026-07 strapi clean-run regression). The bare-hex twin of this trust
+/// legacy package unvendorable whenever the prebuilt-artifact service misses.
+/// The bare-hex twin of this trust
 /// decision already lives in the `LockIntegrity::Sha1Hex` arm above.
-fn verify_sri(bytes: &[u8], sri: &str) -> Result<(), String> {
+pub(crate) fn verify_sri(bytes: &[u8], sri: &str) -> Result<(), String> {
     let mut best: Option<(u8, &str, &str)> = None;
     for token in sri.split_whitespace() {
         let Some((algo, b64)) = token.split_once('-') else {
@@ -2058,32 +1290,6 @@ fn verify_sri(bytes: &[u8], sri: &str) -> Result<(), String> {
              {actual}"
         ))
     }
-}
-
-/// Whether every FILE entry in the zip nests under one shared top-level
-/// directory — the GitHub/GitLab-zipball layout. This is the per-archive
-/// `strip_first` decision Composer itself makes (ArchiveDownloader promotes
-/// a lone top dir, else installs from the extract root): `composer archive`-
-/// built dists (Satis archive builds, Artifactory/Nexus, private Packagist)
-/// store composer.json at the archive ROOT, where an unconditional strip
-/// would drop it and refuse a genuine, integrity-verified artifact.
-fn zip_has_single_top_dir(bytes: &[u8]) -> Result<bool, String> {
-    let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-        .map_err(|e| format!("unreadable zip: {e}"))?;
-    let mut top: Option<&str> = None;
-    for name in archive.file_names() {
-        if name.ends_with('/') {
-            continue; // dir entries: extraction skips them too
-        }
-        let Some((first, _)) = name.split_once('/') else {
-            return Ok(false); // a root-level file — flat layout
-        };
-        if top.is_some_and(|t| t != first) {
-            return Ok(false);
-        }
-        top = Some(first);
-    }
-    Ok(top.is_some())
 }
 
 /// Strip the FIRST path component (npm's tarball semantics — usually
@@ -2147,6 +1353,7 @@ pub(crate) fn extract_tgz_strict(bytes: &[u8], dest: &Path) -> Result<(), String
 /// [`extract_tgz`]'s write-free twin: every refusal, nothing created.
 /// Reports whether `watch` would land at the root (see [`lands_at_root`]).
 /// `dest` is where the tree WOULD go; see [`validate_zip`].
+#[cfg(test)]
 pub(crate) fn validate_tgz(bytes: &[u8], dest: &Path, watch: Option<&str>) -> Result<bool, String> {
     walk_tar_gz(
         bytes,
@@ -2185,6 +1392,7 @@ pub(crate) fn extract_gem_data_skipping(
 
 /// [`extract_gem_data`]'s write-free twin: every refusal, nothing created.
 /// `dest` is where the tree WOULD go; see [`validate_zip`].
+#[cfg(test)]
 pub(crate) fn validate_gem_data(gem_bytes: &[u8], dest: &Path) -> Result<(), String> {
     walk_gem_data(gem_bytes, dest, Sink::Validate, None)
 }
@@ -2328,8 +1536,7 @@ fn walk_tar_gz(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path as url_path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use crate::crawlers::go_crawler::encode_module_path;
 
     /// Build a gzipped tarball with the given `(path, bytes, exec)` entries.
     fn make_tgz(entries: &[(&str, &[u8], bool)]) -> Vec<u8> {
@@ -2352,18 +1559,6 @@ mod tests {
             "sha512-{}",
             base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
         )
-    }
-
-    fn npm_entry(resolved: Option<String>, integrity: LockIntegrity) -> LockfileEntry {
-        LockfileEntry {
-            ecosystem: "npm",
-            source_kind: SourceKind::Unspecified,
-            name: "left-pad".into(),
-            version: "1.3.0".into(),
-            purl: "pkg:npm/left-pad@1.3.0".into(),
-            resolved,
-            integrity,
-        }
     }
 
     #[test]
@@ -2401,8 +1596,7 @@ mod tests {
         use base64::Engine as _;
         let bytes = b"hello";
         let sha1_b64 = base64::engine::general_purpose::STANDARD.encode(Sha1::digest(bytes));
-        // npm-era lockfile entries carry ONLY `sha1-…` (the strapi clean-run
-        // regression: `no usable hash in SRI`); it must verify…
+        // npm-era lockfile entries carry ONLY `sha1-…`; it must verify…
         assert!(
             verify_sri(bytes, &format!("sha1-{sha1_b64}")).is_ok(),
             "sha1-only SRI must be usable"
@@ -2418,108 +1612,6 @@ mod tests {
         let sha512_good = sri_of(bytes);
         assert!(verify_sri(bytes, &format!("sha1-{sha1_b64} sha512-WRONG=")).is_err());
         assert!(verify_sri(bytes, &format!("sha1-{wrong} {sha512_good}")).is_ok());
-    }
-
-    #[tokio::test]
-    async fn fetch_verifies_sri_and_extracts_with_modes() {
-        let tgz = make_tgz(&[
-            ("package/package.json", br#"{"name":"left-pad"}"#, false),
-            ("package/bin/cli.js", b"#!/usr/bin/env node\n", true),
-            ("package/index.js", b"module.exports = 1;\n", false),
-        ]);
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/left-pad/-/left-pad-1.3.0.tgz"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(tgz.clone()))
-            .mount(&mock)
-            .await;
-
-        let entry = npm_entry(
-            Some(format!("{}/left-pad/-/left-pad-1.3.0.tgz", mock.uri())),
-            LockIntegrity::Sri(sri_of(&tgz)),
-        );
-        let fetched = fetch_and_stage(&entry, &build_registry_client())
-            .await
-            .unwrap();
-        assert!(fetched.dir().await.unwrap().join("package.json").is_file());
-        assert_eq!(
-            std::fs::read(fetched.dir().await.unwrap().join("index.js")).unwrap(),
-            b"module.exports = 1;\n"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(fetched.dir().await.unwrap().join("bin/cli.js"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o111, 0o111, "exec bit preserved");
-        }
-        // The tempdir dies with the holder.
-        let dir = fetched.dir().await.unwrap().to_path_buf();
-        drop(fetched);
-        assert!(!dir.exists());
-    }
-
-    #[tokio::test]
-    async fn integrity_mismatch_fails_before_extraction() {
-        let tgz = make_tgz(&[("package/package.json", b"{}", false)]);
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/left-pad/-/left-pad-1.3.0.tgz"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(tgz))
-            .mount(&mock)
-            .await;
-
-        let entry = npm_entry(
-            Some(format!("{}/left-pad/-/left-pad-1.3.0.tgz", mock.uri())),
-            LockIntegrity::Sri(sri_of(b"the lock expects different bytes")),
-        );
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Failed(msg)) => {
-                assert!(msg.contains("mismatch"), "{msg}")
-            }
-            other => panic!("expected integrity failure, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn unverifiable_entry_refuses_without_network() {
-        // A URL that would hard-fail if contacted — Unverifiable proves the
-        // decision happened before any I/O.
-        let entry = npm_entry(
-            Some("http://127.0.0.1:1/nope.tgz".into()),
-            LockIntegrity::None,
-        );
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Unverifiable(msg)) => {
-                assert!(msg.contains("no integrity"), "{msg}")
-            }
-            other => panic!("expected Unverifiable, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn http_error_and_scheme_guard_fail_closed() {
-        let mock = MockServer::start().await;
-        // No mounted route → 404.
-        let entry = npm_entry(
-            Some(format!("{}/missing.tgz", mock.uri())),
-            LockIntegrity::Sri(sri_of(b"x")),
-        );
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Failed(msg)) => assert!(msg.contains("404"), "{msg}"),
-            other => panic!("expected HTTP failure, got {other:?}"),
-        }
-
-        let entry = npm_entry(
-            Some("ftp://example.com/x.tgz".into()),
-            LockIntegrity::Sri(sri_of(b"x")),
-        );
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Failed(msg)) => assert!(msg.contains("non-http"), "{msg}"),
-            other => panic!("expected scheme refusal, got {other:?}"),
-        }
     }
 
     #[test]
@@ -2557,155 +1649,6 @@ mod tests {
                 std::fs::read_dir(tmp.path()).unwrap().next().is_none(),
                 "nothing may extract from a traversal-bearing tarball"
             );
-        }
-    }
-
-    #[tokio::test]
-    async fn berry_checksum_verifies_via_cache_zip_rebuild() {
-        let tgz = make_tgz(&[
-            ("package/package.json", br#"{"name":"left-pad"}"#, false),
-            ("package/index.js", b"module.exports = 1;\n", false),
-        ]);
-        let expected =
-            super::super::berry_zip::berry_cache_checksum_10c0(&tgz, "left-pad").unwrap();
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/left-pad/-/left-pad-1.3.0.tgz"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(tgz))
-            .mount(&mock)
-            .await;
-
-        let entry = npm_entry(
-            Some(format!("{}/left-pad/-/left-pad-1.3.0.tgz", mock.uri())),
-            LockIntegrity::BerryChecksum(expected),
-        );
-        let fetched = fetch_and_stage(&entry, &build_registry_client())
-            .await
-            .unwrap();
-        assert!(fetched.dir().await.unwrap().join("package.json").is_file());
-
-        // Tampered checksum → Failed; foreign cacheKey → Unverifiable.
-        let entry = npm_entry(
-            Some(format!("{}/left-pad/-/left-pad-1.3.0.tgz", mock.uri())),
-            LockIntegrity::BerryChecksum(format!("10c0/{}", "0".repeat(128))),
-        );
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Failed(msg)) => assert!(msg.contains("mismatch"), "{msg}"),
-            other => panic!("expected mismatch, got {other:?}"),
-        }
-        let entry = npm_entry(
-            Some(format!("{}/left-pad/-/left-pad-1.3.0.tgz", mock.uri())),
-            LockIntegrity::BerryChecksum(format!("9/{}", "0".repeat(128))),
-        );
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Unverifiable(msg)) => assert!(msg.contains("cacheKey"), "{msg}"),
-            other => panic!("expected Unverifiable, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn stage_local_artifact_verifies_ledger_sha256() {
-        let tgz = make_tgz(&[("package/package.json", b"{}", false)]);
-        let tmp = tempfile::tempdir().unwrap();
-        let tgz_path = tmp.path().join("left-pad-1.3.0.tgz");
-        std::fs::write(&tgz_path, &tgz).unwrap();
-        let sha = hex::encode(Sha256::digest(&tgz));
-
-        let staged = stage_local_artifact(&tgz_path, &sha).await.unwrap();
-        assert!(staged.dir().await.unwrap().join("package.json").is_file());
-
-        match stage_local_artifact(&tgz_path, &"0".repeat(64)).await {
-            Err(FetchError::Failed(msg)) => assert!(msg.contains("mismatch"), "{msg}"),
-            other => panic!("expected ledger mismatch, got {other:?}"),
-        }
-        match stage_local_artifact(&tgz_path, "").await {
-            Err(FetchError::Unverifiable(_)) => {}
-            other => panic!("expected Unverifiable for empty hash, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn stage_local_dir_artifact_verifies_the_inventory_and_drops_node_modules() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("left-pad");
-        std::fs::create_dir_all(dir.join("node_modules/.bin")).unwrap();
-        std::fs::write(dir.join("package.json"), b"{}").unwrap();
-        std::fs::write(dir.join("index.js"), b"x").unwrap();
-        std::fs::write(dir.join("node_modules/.bin/tool"), b"#!/bin/sh\n").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("../../elsewhere", dir.join("node_modules/dep")).unwrap();
-        let inventory = super::super::verify::compute_package_dir_inventory(&dir)
-            .await
-            .unwrap();
-        assert_eq!(inventory.len(), 2, "{inventory:?}");
-
-        let staged = stage_local_dir_artifact(&dir, Some(&inventory))
-            .await
-            .unwrap();
-        let staged_dir = staged.dir().await.unwrap();
-        assert_eq!(std::fs::read(staged_dir.join("index.js")).unwrap(), b"x");
-        assert!(!staged_dir.join("node_modules").exists());
-        assert_eq!(staged.url, format!("file:{}", dir.display()));
-
-        std::fs::write(dir.join("planted.js"), b"y").unwrap();
-        match stage_local_dir_artifact(&dir, Some(&inventory)).await {
-            Err(FetchError::Failed(msg)) => assert!(msg.contains("file inventory"), "{msg}"),
-            other => panic!("a planted file must fail, got {other:?}"),
-        }
-        std::fs::remove_file(dir.join("planted.js")).unwrap();
-        std::fs::write(dir.join("index.js"), b"modified").unwrap();
-        match stage_local_dir_artifact(&dir, Some(&inventory)).await {
-            Err(FetchError::Failed(msg)) => assert!(msg.contains("file inventory"), "{msg}"),
-            other => panic!("a modified file must fail, got {other:?}"),
-        }
-        match stage_local_dir_artifact(&dir, None).await {
-            Err(FetchError::Unverifiable(_)) => {}
-            other => panic!("no inventory is unverifiable, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn cargo_crate_fetch_verifies_sha256_and_extracts() {
-        // .crate = tar.gz with a {name}-{version}/ top dir.
-        let crate_bytes = make_tgz(&[
-            (
-                "left-pad-1.3.0/Cargo.toml",
-                b"[package]\nname = \"left-pad\"\n",
-                false,
-            ),
-            ("left-pad-1.3.0/src/lib.rs", b"pub fn pad() {}\n", false),
-        ]);
-        let sha = hex::encode(Sha256::digest(&crate_bytes));
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/left-pad/left-pad-1.3.0.crate"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(crate_bytes))
-            .mount(&mock)
-            .await;
-
-        let entry = LockfileEntry {
-            ecosystem: "cargo",
-            source_kind: SourceKind::Unspecified,
-            name: "left-pad".into(),
-            version: "1.3.0".into(),
-            purl: "pkg:cargo/left-pad@1.3.0".into(),
-            resolved: Some(format!("{}/left-pad/left-pad-1.3.0.crate", mock.uri())),
-            integrity: LockIntegrity::Sha256Hex(sha),
-        };
-        let fetched = fetch_and_stage(&entry, &build_registry_client())
-            .await
-            .unwrap();
-        assert!(fetched.dir().await.unwrap().join("Cargo.toml").is_file());
-        assert!(fetched.dir().await.unwrap().join("src/lib.rs").is_file());
-
-        // Tampered checksum fails closed.
-        let entry = LockfileEntry {
-            integrity: LockIntegrity::Sha256Hex("0".repeat(64)),
-            ..entry
-        };
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Failed(msg)) => assert!(msg.contains("mismatch"), "{msg}"),
-            other => panic!("expected mismatch, got {other:?}"),
         }
     }
 
@@ -2747,59 +1690,6 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn golang_module_fetch_verifies_h1_dirhash_and_extracts() {
-        // Out-of-order files prove the sort; nested module path proves the
-        // explicit-prefix strip (a first-component strip would be wrong).
-        let prefix = "github.com/x/y@v1.0.0/";
-        let files: [(&str, &[u8]); 3] = [
-            ("go.mod", b"module github.com/x/y\n"),
-            ("a/b.go", b"package a\n"),
-            ("README.md", b"# y\n"),
-        ];
-        let zip_bytes = make_module_zip(prefix, &files);
-        let expected = spec_h1(&files, prefix);
-        assert_eq!(
-            go_h1_of_zip(&zip_bytes).unwrap(),
-            expected,
-            "production dirhash matches the spec mirror"
-        );
-
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/github.com/x/y/@v/v1.0.0.zip"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
-            .mount(&mock)
-            .await;
-
-        let entry = LockfileEntry {
-            ecosystem: "golang",
-            source_kind: SourceKind::Unspecified,
-            name: "github.com/x/y".into(),
-            version: "v1.0.0".into(),
-            purl: "pkg:golang/github.com/x/y@v1.0.0".into(),
-            resolved: Some(format!("{}/github.com/x/y/@v/v1.0.0.zip", mock.uri())),
-            integrity: LockIntegrity::GoH1(expected),
-        };
-        let fetched = fetch_and_stage(&entry, &build_registry_client())
-            .await
-            .unwrap();
-        assert!(fetched.dir().await.unwrap().join("go.mod").is_file());
-        assert!(fetched.dir().await.unwrap().join("a/b.go").is_file());
-
-        // Tampered h1 fails closed.
-        let entry = LockfileEntry {
-            integrity: LockIntegrity::GoH1(
-                "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-            ),
-            ..entry
-        };
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Failed(msg)) => assert!(msg.contains("mismatch"), "{msg}"),
-            other => panic!("expected mismatch, got {other:?}"),
-        }
-    }
-
     #[test]
     fn go_escape_uppercase_and_zip_prefix_guards() {
         assert_eq!(
@@ -2833,563 +1723,6 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
-    #[tokio::test]
-    async fn composer_dist_fetch_verifies_sha1_and_strips_top_dir() {
-        // GitHub zipballs carry an `owner-repo-sha/` top dir.
-        let zip_bytes = make_zip(&[
-            (
-                "Seldaek-monolog-abc123/composer.json",
-                br#"{"name":"monolog/monolog"}"#,
-            ),
-            ("Seldaek-monolog-abc123/src/Logger.php", b"<?php\n"),
-        ]);
-        let sha1 = hex::encode(Sha1::digest(&zip_bytes));
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/zipball/abc123"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
-            .mount(&mock)
-            .await;
-
-        let entry = LockfileEntry {
-            ecosystem: "composer",
-            source_kind: SourceKind::Unspecified,
-            name: "monolog/monolog".into(),
-            version: "3.5.0".into(),
-            purl: "pkg:composer/monolog/monolog@3.5.0".into(),
-            resolved: Some(format!("{}/zipball/abc123", mock.uri())),
-            integrity: LockIntegrity::Sha1Hex(sha1),
-        };
-        let fetched = fetch_and_stage(&entry, &build_registry_client())
-            .await
-            .unwrap();
-        assert!(fetched.dir().await.unwrap().join("composer.json").is_file());
-        assert!(fetched
-            .dir()
-            .await
-            .unwrap()
-            .join("src/Logger.php")
-            .is_file());
-
-        let entry = LockfileEntry {
-            integrity: LockIntegrity::Sha1Hex("0".repeat(40)),
-            ..entry
-        };
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Failed(msg)) => assert!(msg.contains("mismatch"), "{msg}"),
-            other => panic!("expected mismatch, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn composer_flat_dist_fetch_keeps_root_layout() {
-        // `composer archive`-built dists (Satis archive builds, Artifactory/
-        // Nexus, private Packagist) store composer.json at the archive ROOT —
-        // no zipball top dir. Composer itself auto-detects the layout per
-        // archive (ArchiveDownloader promotes a lone top dir, else installs
-        // from the extract root); an unconditional first-component strip
-        // drops the root composer.json and refuses a genuine, sha1-verified
-        // artifact as "carries no composer.json".
-        let zip_bytes = make_zip(&[
-            ("composer.json", br#"{"name":"acme/flat"}"#),
-            ("src/Flat.php", b"<?php\n"),
-        ]);
-        let sha1 = hex::encode(Sha1::digest(&zip_bytes));
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/dists/acme-flat-1.0.0.zip"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
-            .mount(&mock)
-            .await;
-
-        let entry = LockfileEntry {
-            ecosystem: "composer",
-            source_kind: SourceKind::Unspecified,
-            name: "acme/flat".into(),
-            version: "1.0.0".into(),
-            purl: "pkg:composer/acme/flat@1.0.0".into(),
-            resolved: Some(format!("{}/dists/acme-flat-1.0.0.zip", mock.uri())),
-            integrity: LockIntegrity::Sha1Hex(sha1),
-        };
-        let fetched = fetch_and_stage(&entry, &build_registry_client())
-            .await
-            .expect("a flat-layout dist is a genuine, integrity-verified artifact");
-        assert!(fetched.dir().await.unwrap().join("composer.json").is_file());
-        assert!(
-            fetched.dir().await.unwrap().join("src/Flat.php").is_file(),
-            "flat-layout paths must extract verbatim, not lose their first segment"
-        );
-    }
-
-    #[test]
-    fn zip_single_top_dir_detection() {
-        // Zipball layout: everything nests under one top dir → strip.
-        let zipball = make_zip(&[
-            ("Seldaek-monolog-abc123/composer.json", b"{}".as_slice()),
-            ("Seldaek-monolog-abc123/src/Logger.php", b"<?php\n"),
-        ]);
-        assert!(zip_has_single_top_dir(&zipball).unwrap());
-        // Flat layout: a root-level file → extract as-is.
-        let flat = make_zip(&[
-            ("composer.json", b"{}".as_slice()),
-            ("src/A.php", b"<?php\n"),
-        ]);
-        assert!(!zip_has_single_top_dir(&flat).unwrap());
-        // Two top dirs with no root file: still not a lone-top-dir archive.
-        let two = make_zip(&[("a/x.php", b"1".as_slice()), ("b/y.php", b"2".as_slice())]);
-        assert!(!zip_has_single_top_dir(&two).unwrap());
-        // No file entries at all: nothing to promote.
-        assert!(!zip_has_single_top_dir(&make_zip(&[])).unwrap());
-    }
-
-    #[tokio::test]
-    async fn gem_fetch_verifies_sha256_and_extracts_data_tar() {
-        // .gem = plain tar holding data.tar.gz (content at the ROOT — no
-        // prefix dir) + metadata.gz.
-        let data_tgz = make_tgz(&[
-            ("lib/rails.rb", b"module Rails; end\n", false),
-            ("README.md", b"# rails\n", false),
-        ]);
-        let mut outer = tar::Builder::new(Vec::new());
-        for (name, bytes) in [
-            ("metadata.gz", b"meta".as_slice()),
-            ("data.tar.gz", &data_tgz),
-        ] {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(bytes.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            outer.append_data(&mut header, name, bytes).unwrap();
-        }
-        let gem_bytes = outer.into_inner().unwrap();
-        let sha = hex::encode(Sha256::digest(&gem_bytes));
-
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/downloads/rails-7.1.0.gem"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(gem_bytes))
-            .mount(&mock)
-            .await;
-
-        let entry = LockfileEntry {
-            ecosystem: "gem",
-            source_kind: SourceKind::Unspecified,
-            name: "rails".into(),
-            version: "7.1.0".into(),
-            purl: "pkg:gem/rails@7.1.0".into(),
-            resolved: Some(format!("{}/downloads/rails-7.1.0.gem", mock.uri())),
-            integrity: LockIntegrity::Sha256Hex(sha),
-        };
-        let fetched = fetch_and_stage(&entry, &build_registry_client())
-            .await
-            .unwrap();
-        assert!(
-            fetched.dir().await.unwrap().join("lib/rails.rb").is_file(),
-            "data.tar.gz content extracts at the root (no strip)"
-        );
-        assert!(fetched.dir().await.unwrap().join("README.md").is_file());
-        // The staged leaf must be the canonical `{name}-{version}`:
-        // vendor_gem's platform-suffix guard refuses any other leaf
-        // (`platform_gem_unsupported`), which killed lockfile auto-fetch
-        // when this dir was named `gem`.
-        assert_eq!(
-            fetched
-                .dir()
-                .await
-                .unwrap()
-                .file_name()
-                .unwrap()
-                .to_string_lossy(),
-            "rails-7.1.0",
-            "staged dir leaf must satisfy vendor_gem's `{{name}}-{{version}}` check"
-        );
-    }
-
-    #[tokio::test]
-    async fn gem_fetch_refuses_unsafe_coordinates_without_network() {
-        // The coordinates become the staged-dir leaf, so a separator-bearing
-        // name must refuse — and BEFORE any I/O (the URL would hard-fail if
-        // contacted).
-        let entry = LockfileEntry {
-            ecosystem: "gem",
-            source_kind: SourceKind::Unspecified,
-            name: "ra/ils".into(),
-            version: "7.1.0".into(),
-            purl: "pkg:gem/ra/ils@7.1.0".into(),
-            resolved: Some("http://127.0.0.1:1/nope.gem".into()),
-            integrity: LockIntegrity::Sha256Hex("0".repeat(64)),
-        };
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Failed(msg)) => {
-                assert!(msg.contains("unsafe gem coordinates"), "{msg}")
-            }
-            other => panic!("expected coordinate refusal, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn pypi_wheel_fetch_extracts_site_packages_layout() {
-        let wheel = make_zip(&[
-            ("requests/__init__.py", b"__version__ = '2.28.0'\n"),
-            (
-                "requests-2.28.0.dist-info/RECORD",
-                b"requests/__init__.py,sha256=abc,24\n",
-            ),
-            ("requests-2.28.0.dist-info/WHEEL", b"Wheel-Version: 1.0\n"),
-        ]);
-        let sha = hex::encode(Sha256::digest(&wheel));
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/packages/requests-2.28.0-py3-none-any.whl"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(wheel))
-            .mount(&mock)
-            .await;
-
-        let entry = LockfileEntry {
-            ecosystem: "pypi",
-            source_kind: SourceKind::Unspecified,
-            name: "requests".into(),
-            version: "2.28.0".into(),
-            purl: "pkg:pypi/requests@2.28.0".into(),
-            resolved: Some(format!(
-                "{}/packages/requests-2.28.0-py3-none-any.whl",
-                mock.uri()
-            )),
-            integrity: LockIntegrity::Sha256Hex(sha),
-        };
-        let fetched = fetch_and_stage(&entry, &build_registry_client())
-            .await
-            .unwrap();
-        // Wheel content at the root: a site-packages-shaped dir with the
-        // dist-info RECORD the pypi vendor backend stages from.
-        assert!(fetched
-            .dir()
-            .await
-            .unwrap()
-            .join("requests/__init__.py")
-            .is_file());
-        assert!(fetched
-            .dir()
-            .await
-            .unwrap()
-            .join("requests-2.28.0.dist-info/RECORD")
-            .is_file());
-    }
-
-    /// poetry.lock records wheel hashes but no URLs: the fetcher resolves the
-    /// file through PyPI's JSON API by sha256 and still verifies the bytes.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn pypi_hash_only_entry_is_resolved_through_the_json_api() {
-        let wheel = make_zip(&[
-            ("requests/__init__.py", b"__version__ = '2.28.0'\n"),
-            (
-                "requests-2.28.0.dist-info/RECORD",
-                b"requests/__init__.py,sha256=abc,24\n",
-            ),
-        ]);
-        let sha = hex::encode(Sha256::digest(&wheel));
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/packages/requests-2.28.0-py3-none-any.whl"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(wheel))
-            .mount(&mock)
-            .await;
-        Mock::given(method("GET"))
-            .and(url_path("/pypi/requests/2.28.0/json"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "urls": [
-                    {"filename": "requests-2.28.0.tar.gz", "url": format!("{}/packages/requests-2.28.0.tar.gz", mock.uri()), "digests": {"sha256": "0".repeat(64)}},
-                    {"filename": "requests-2.28.0-py3-none-any.whl", "url": format!("{}/packages/requests-2.28.0-py3-none-any.whl", mock.uri()), "digests": {"sha256": sha.to_uppercase()}},
-                ]
-            })))
-            .mount(&mock)
-            .await;
-        let saved = std::env::var("SOCKET_PYPI_JSON_API").ok();
-        std::env::set_var("SOCKET_PYPI_JSON_API", format!("{}/pypi/", mock.uri()));
-        let restore = || match &saved {
-            Some(v) => std::env::set_var("SOCKET_PYPI_JSON_API", v),
-            None => std::env::remove_var("SOCKET_PYPI_JSON_API"),
-        };
-        let entry = LockfileEntry {
-            ecosystem: "pypi",
-            source_kind: SourceKind::Unspecified,
-            name: "requests".into(),
-            version: "2.28.0".into(),
-            purl: "pkg:pypi/requests@2.28.0".into(),
-            resolved: None,
-            integrity: LockIntegrity::Sha256Hex(sha.clone()),
-        };
-        let fetched = fetch_and_stage(&entry, &build_registry_client()).await;
-        // A hash no release file carries is refused before any download.
-        let unknown = LockfileEntry {
-            integrity: LockIntegrity::Sha256Hex("1".repeat(64)),
-            ..entry.clone()
-        };
-        let missing = fetch_and_stage(&unknown, &build_registry_client()).await;
-        // No hash at all: nothing to resolve by.
-        let bare = LockfileEntry {
-            integrity: LockIntegrity::Sri("sha512-x".into()),
-            ..entry
-        };
-        let bare_result = fetch_and_stage(&bare, &build_registry_client()).await;
-        restore();
-        let fetched = fetched.unwrap();
-        assert!(fetched
-            .dir()
-            .await
-            .unwrap()
-            .join("requests/__init__.py")
-            .is_file());
-        assert!(fetched.url.ends_with("requests-2.28.0-py3-none-any.whl"));
-        match missing {
-            Err(FetchError::Unverifiable(msg)) => assert!(msg.contains("matches"), "{msg}"),
-            other => panic!("expected Unverifiable, got {other:?}"),
-        }
-        match bare_result {
-            Err(FetchError::Unverifiable(msg)) => assert!(msg.contains("sha256"), "{msg}"),
-            other => panic!("expected Unverifiable, got {other:?}"),
-        }
-    }
-
-    /// Pipfile.lock records EVERY release file's digest without filenames:
-    /// the fetcher must pick the pure-Python wheel by digest (never the sdist
-    /// or a platform wheel that also matches), verify the download against
-    /// the set, and refuse when no pure wheel's digest is recorded.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn pypi_digest_set_entry_picks_the_pure_wheel_by_hash() {
-        let wheel = make_zip(&[
-            ("requests/__init__.py", b"__version__ = '2.28.0'\n"),
-            (
-                "requests-2.28.0.dist-info/RECORD",
-                b"requests/__init__.py,sha256=abc,24\n",
-            ),
-        ]);
-        let wheel_sha = hex::encode(Sha256::digest(&wheel));
-        let sdist_sha = "0".repeat(64);
-        let platform_sha = "9".repeat(64);
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/packages/requests-2.28.0-py3-none-any.whl"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(wheel))
-            .mount(&mock)
-            .await;
-        Mock::given(method("GET"))
-            .and(url_path("/packages/requests-2.28.0.tar.gz"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"sdist bytes".to_vec()))
-            .mount(&mock)
-            .await;
-        Mock::given(method("GET"))
-            .and(url_path("/pypi/requests/2.28.0/json"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "urls": [
-                    {"filename": "requests-2.28.0.tar.gz", "url": format!("{}/packages/requests-2.28.0.tar.gz", mock.uri()), "digests": {"sha256": sdist_sha}},
-                    {"filename": "requests-2.28.0-cp312-cp312-manylinux_2_17_x86_64.whl", "url": format!("{}/packages/requests-2.28.0-cp312-cp312-manylinux_2_17_x86_64.whl", mock.uri()), "digests": {"sha256": platform_sha}},
-                    {"filename": "requests-2.28.0-py3-none-any.whl", "url": format!("{}/packages/requests-2.28.0-py3-none-any.whl", mock.uri()), "digests": {"sha256": wheel_sha.to_uppercase()}},
-                ]
-            })))
-            .mount(&mock)
-            .await;
-        let saved = std::env::var("SOCKET_PYPI_JSON_API").ok();
-        std::env::set_var("SOCKET_PYPI_JSON_API", format!("{}/pypi/", mock.uri()));
-        let restore = || match &saved {
-            Some(v) => std::env::set_var("SOCKET_PYPI_JSON_API", v),
-            None => std::env::remove_var("SOCKET_PYPI_JSON_API"),
-        };
-        let entry = LockfileEntry {
-            ecosystem: "pypi",
-            source_kind: SourceKind::Unspecified,
-            name: "requests".into(),
-            version: "2.28.0".into(),
-            purl: "pkg:pypi/requests@2.28.0".into(),
-            resolved: None,
-            // sdist first, like Pipenv writes them: the ORDER must not pick
-            // the sdist.
-            integrity: LockIntegrity::Sha256AnyOf(vec![
-                sdist_sha.clone(),
-                platform_sha.clone(),
-                wheel_sha.clone(),
-            ]),
-        };
-        let fetched = fetch_and_stage(&entry, &build_registry_client()).await;
-        // Only the sdist's and a platform wheel's digests recorded: no pure
-        // wheel to choose → refused before any download.
-        let no_pure = LockfileEntry {
-            integrity: LockIntegrity::Sha256AnyOf(vec![sdist_sha.clone(), platform_sha.clone()]),
-            ..entry.clone()
-        };
-        let no_pure_result = fetch_and_stage(&no_pure, &build_registry_client()).await;
-        // Digests no release file carries → refused.
-        let unknown = LockfileEntry {
-            integrity: LockIntegrity::Sha256AnyOf(vec!["1".repeat(64), "2".repeat(64)]),
-            ..entry.clone()
-        };
-        let unknown_result = fetch_and_stage(&unknown, &build_registry_client()).await;
-        restore();
-        let fetched = fetched.unwrap();
-        assert!(fetched
-            .dir()
-            .await
-            .unwrap()
-            .join("requests/__init__.py")
-            .is_file());
-        assert!(
-            fetched.url.ends_with("requests-2.28.0-py3-none-any.whl"),
-            "{}",
-            fetched.url
-        );
-        for (label, result) in [
-            ("no pure wheel", no_pure_result),
-            ("unknown", unknown_result),
-        ] {
-            match result {
-                Err(FetchError::Unverifiable(msg)) => {
-                    assert!(
-                        msg.contains("none-any.whl") && msg.contains("digests"),
-                        "{label}: {msg}"
-                    )
-                }
-                other => panic!("{label}: expected Unverifiable, got {other:?}"),
-            }
-        }
-        // The verifier itself: bytes matching ANY recorded digest pass, others fail.
-        let set = LockIntegrity::Sha256AnyOf(vec![sdist_sha.clone(), wheel_sha.clone()]);
-        // "sdist bytes" is not the recorded sdist digest ("000…"), so it must fail.
-        assert!(verify_integrity(b"sdist bytes", &set).is_err());
-        let real_sdist = LockIntegrity::Sha256AnyOf(vec![
-            hex::encode(Sha256::digest(b"sdist bytes")),
-            wheel_sha,
-        ]);
-        assert!(verify_integrity(b"sdist bytes", &real_sdist).is_ok());
-        match verify_integrity(b"other", &real_sdist) {
-            Err(FetchError::Failed(msg)) => assert!(msg.contains("none of the 2 digests"), "{msg}"),
-            other => panic!("expected Failed, got {other:?}"),
-        }
-    }
-
-    #[cfg(unix)]
-    fn mkfifo(path: &Path) {
-        use std::os::unix::ffi::OsStrExt;
-        let c_path =
-            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
-        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
-        assert_eq!(
-            rc,
-            0,
-            "mkfifo(2) failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-
-    /// A FIFO squatting at the committed artifact path must fail fast
-    /// instead of wedging the fresh-clone re-vendor forever in an `open(2)`
-    /// waiting for a writer — the caller's metadata probe passes for a FIFO,
-    /// so this read is the first open. Same `open_regular_file` guard class
-    /// as the vendor lockfile reads (lock_inventory.rs, npm_lock.rs).
-    #[cfg(unix)]
-    #[test]
-    fn stage_local_artifact_fifo_fails_fast_instead_of_wedging() {
-        let tmp = tempfile::tempdir().unwrap();
-        let tgz_path = tmp.path().join("left-pad-1.3.0.tgz");
-        mkfifo(&tgz_path);
-        // Own runtime on a detached thread: a wedged open(2) lives in a
-        // spawn_blocking task, and dropping (or #[tokio::test]-finishing) a
-        // runtime with one wedged blocks forever — the timeout must live
-        // OUTSIDE the runtime for the unfixed code to fail instead of hang.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let path = tgz_path.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let res = rt.block_on(stage_local_artifact(&path, &"0".repeat(64)));
-            std::mem::forget(rt);
-            let _ = tx.send(res);
-        });
-        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(Err(FetchError::Failed(msg))) => {
-                assert!(msg.contains(&tgz_path.display().to_string()), "{msg}")
-            }
-            Ok(other) => panic!("expected Failed on a FIFO artifact, got {other:?}"),
-            Err(_) => panic!("stage_local_artifact wedged on a FIFO artifact"),
-        }
-    }
-
-    /// The 128 MB artifact cap must fire BEFORE the size-matched allocation
-    /// and read: a huge file at the ledger-recorded artifact path (a sparse
-    /// `truncate -s 64G` costs the attacker nothing) must get the clean
-    /// FetchError cap message, not a metadata-sized `Vec::with_capacity`
-    /// that aborts or OOMs — the module's documented memory-bomb bound.
-    ///
-    /// Runs in a CHILD PROCESS (the fs.rs RLIMIT_FSIZE precedent): peak RSS
-    /// is process-wide and monotonic, so sibling tests in this binary (the
-    /// 128 MB go_h1 bomb-cap test among them) would poison an in-process
-    /// measurement.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn stage_local_artifact_caps_oversized_artifact_before_buffering() {
-        const CHILD_ENV: &str = "SOCKET_PATCH_CORE_TEST_STAGE_CAP_CHILD";
-        const TEST_NAME: &str = "vendor::registry_fetch::tests::\
-                                 stage_local_artifact_caps_oversized_artifact_before_buffering";
-        if std::env::var_os(CHILD_ENV).is_none() {
-            let exe = std::env::current_exe().expect("test binary path must resolve");
-            let output = std::process::Command::new(exe)
-                .args([TEST_NAME, "--exact", "--test-threads=1", "--nocapture"])
-                .env(CHILD_ENV, "1")
-                .output()
-                .expect("the measured child test process must spawn");
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.status.success(),
-                "the measured child run failed:\nstdout:\n{stdout}\nstderr:\n{}",
-                String::from_utf8_lossy(&output.stderr),
-            );
-            // Anti-vacuity: a renamed test would make the `--exact` filter
-            // match nothing and the child exit 0 having proven nothing.
-            assert!(
-                stdout.contains("1 passed"),
-                "the child run must execute exactly this test — filter drift \
-                 after a rename? child stdout:\n{stdout}"
-            );
-            return;
-        }
-
-        // 1 GiB sparse: zero disk blocks, but 8× the cap — buffering it
-        // before the cap check dirties ~1 GiB of RSS.
-        const HUGE: u64 = 1024 * 1024 * 1024;
-        let tmp = tempfile::tempdir().unwrap();
-        let tgz_path = tmp.path().join("huge.tgz");
-        std::fs::File::create(&tgz_path)
-            .unwrap()
-            .set_len(HUGE)
-            .unwrap();
-
-        match stage_local_artifact(&tgz_path, &"0".repeat(64)).await {
-            Err(FetchError::Failed(msg)) => assert!(msg.contains("cap"), "{msg}"),
-            other => panic!("expected the cap refusal, got {other:?}"),
-        }
-
-        let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-        assert_eq!(
-            unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) },
-            0
-        );
-        let ru = unsafe { ru.assume_init() };
-        // macOS reports ru_maxrss in bytes, Linux in kilobytes.
-        let peak = if cfg!(target_os = "macos") {
-            ru.ru_maxrss as u64
-        } else {
-            (ru.ru_maxrss as u64) * 1024
-        };
-        assert!(
-            peak < HUGE / 2,
-            "peak RSS {peak} bytes — the oversized artifact was buffered into \
-             memory before the cap check"
-        );
-    }
-
     #[test]
     #[serial_test::serial]
     fn goproxy_base_splits_on_pipe_separator() {
@@ -3417,45 +1750,6 @@ mod tests {
         }
         assert_eq!(piped.as_deref(), Ok("https://athens.example"));
         assert_eq!(mixed.as_deref(), Ok("https://mirror.example"));
-    }
-
-    #[tokio::test]
-    async fn berry_foreign_cachekey_refuses_before_network() {
-        // The cacheKey is decidable from the lockfile alone; the refusal must
-        // be the Unverifiable contract's pre-network kind (the URL would
-        // hard-fail if contacted), not a Failed download error — and yarn
-        // 2/3 locks (cacheKey 8/9) must not cost a full tarball download
-        // just to be refused afterwards.
-        let entry = npm_entry(
-            Some("http://127.0.0.1:1/nope.tgz".into()),
-            LockIntegrity::BerryChecksum(format!("9/{}", "0".repeat(128))),
-        );
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Unverifiable(msg)) => assert!(msg.contains("cacheKey"), "{msg}"),
-            other => panic!("expected pre-network Unverifiable, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn pypi_no_wheel_url_message_is_single_spaced() {
-        // No URL and no sha256 to resolve one by (a sha256 would consult the
-        // PyPI JSON API — `pypi_hash_only_entry_is_resolved_through_the_json_api`).
-        let entry = LockfileEntry {
-            ecosystem: "pypi",
-            source_kind: SourceKind::Unspecified,
-            name: "requests".into(),
-            version: "2.28.0".into(),
-            purl: "pkg:pypi/requests@2.28.0".into(),
-            resolved: None,
-            integrity: LockIntegrity::Sri("sha512-x".into()),
-        };
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Unverifiable(msg)) => assert!(
-                !msg.contains("  "),
-                "user-facing message carries an embedded space run: {msg:?}"
-            ),
-            other => panic!("expected Unverifiable, got {other:?}"),
-        }
     }
 
     /// Binary-patch a single-entry zip's DECLARED uncompressed size (local
@@ -3545,331 +1839,6 @@ mod tests {
             err.contains("cap") || err.contains("unreadable"),
             "oversize header fails closed: {err}"
         );
-    }
-
-    #[tokio::test]
-    async fn unknown_ecosystem_refuses_before_network() {
-        // Ecosystems without a fetcher (maven/nuget/deno) keep the caller's
-        // not-installed outcome via Unverifiable — decided BEFORE any I/O
-        // (the poison URL would hard-fail if contacted).
-        let entry = LockfileEntry {
-            ecosystem: "maven",
-            source_kind: SourceKind::Unspecified,
-            name: "org.apache.commons:commons-lang3".into(),
-            version: "3.14.0".into(),
-            purl: "pkg:maven/org.apache.commons/commons-lang3@3.14.0".into(),
-            resolved: Some("http://127.0.0.1:1/x.jar".into()),
-            integrity: LockIntegrity::Sha256Hex("0".repeat(64)),
-        };
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Unverifiable(msg)) => assert!(
-                msg.contains("no registry fetcher for ecosystem `maven`"),
-                "{msg}"
-            ),
-            other => panic!("expected pre-network Unverifiable, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn per_ecosystem_unverifiable_refusals_without_network() {
-        // Each refusal is decidable from the lockfile alone, so each must be
-        // the Unverifiable kind — poison URLs prove no I/O happened.
-        let client = build_registry_client();
-
-        // composer.lock entry with no dist URL.
-        let entry = LockfileEntry {
-            ecosystem: "composer",
-            source_kind: SourceKind::Unspecified,
-            name: "monolog/monolog".into(),
-            version: "3.5.0".into(),
-            purl: "pkg:composer/monolog/monolog@3.5.0".into(),
-            resolved: None,
-            integrity: LockIntegrity::Sha1Hex("0".repeat(40)),
-        };
-        match fetch_and_stage(&entry, &client).await {
-            Err(FetchError::Unverifiable(msg)) => {
-                assert!(msg.contains("no dist URL"), "{msg}")
-            }
-            other => panic!("expected composer Unverifiable, got {other:?}"),
-        }
-
-        // Gem entry (safe coordinates) with no download URL.
-        let entry = LockfileEntry {
-            ecosystem: "gem",
-            source_kind: SourceKind::Unspecified,
-            name: "rails".into(),
-            version: "7.1.0".into(),
-            purl: "pkg:gem/rails@7.1.0".into(),
-            resolved: None,
-            integrity: LockIntegrity::Sha256Hex("0".repeat(64)),
-        };
-        match fetch_and_stage(&entry, &client).await {
-            Err(FetchError::Unverifiable(msg)) => {
-                assert!(msg.contains("no download URL"), "{msg}")
-            }
-            other => panic!("expected gem Unverifiable, got {other:?}"),
-        }
-
-        // Go modules verify via the go.sum h1 dirhash ONLY: any other
-        // integrity kind refuses before the URL is even built.
-        let entry = LockfileEntry {
-            ecosystem: "golang",
-            source_kind: SourceKind::Unspecified,
-            name: "github.com/x/y".into(),
-            version: "v1.0.0".into(),
-            purl: "pkg:golang/github.com/x/y@v1.0.0".into(),
-            resolved: Some("http://127.0.0.1:1/m.zip".into()),
-            integrity: LockIntegrity::Sha256Hex("0".repeat(64)),
-        };
-        match fetch_and_stage(&entry, &client).await {
-            Err(FetchError::Unverifiable(msg)) => {
-                assert!(msg.contains("h1 dirhash"), "{msg}")
-            }
-            other => panic!("expected golang Unverifiable, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn cargo_crate_without_cargo_toml_refuses() {
-        // A sha256-VERIFIED .crate that extracts without a Cargo.toml is not
-        // a crate — the post-extraction shape check must fail the fetch.
-        let crate_bytes = make_tgz(&[("left-pad-1.3.0/src/lib.rs", b"pub fn pad() {}\n", false)]);
-        let sha = hex::encode(Sha256::digest(&crate_bytes));
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/left-pad/left-pad-1.3.0.crate"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(crate_bytes))
-            .mount(&mock)
-            .await;
-
-        let entry = LockfileEntry {
-            ecosystem: "cargo",
-            source_kind: SourceKind::Unspecified,
-            name: "left-pad".into(),
-            version: "1.3.0".into(),
-            purl: "pkg:cargo/left-pad@1.3.0".into(),
-            resolved: Some(format!("{}/left-pad/left-pad-1.3.0.crate", mock.uri())),
-            integrity: LockIntegrity::Sha256Hex(sha),
-        };
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Failed(msg)) => assert!(msg.contains("no Cargo.toml"), "{msg}"),
-            other => panic!("expected shape refusal, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn composer_dist_without_composer_json_refuses() {
-        // sha1-verified zipball whose lone top dir carries no composer.json:
-        // the layout detection strips the top dir, finds nothing, refuses.
-        let zip_bytes = make_zip(&[("pkg-1.0/README.md", b"# not a composer package\n")]);
-        let sha1 = hex::encode(Sha1::digest(&zip_bytes));
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/dists/pkg-1.0.zip"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
-            .mount(&mock)
-            .await;
-
-        let entry = LockfileEntry {
-            ecosystem: "composer",
-            source_kind: SourceKind::Unspecified,
-            name: "acme/pkg".into(),
-            version: "1.0.0".into(),
-            purl: "pkg:composer/acme/pkg@1.0.0".into(),
-            resolved: Some(format!("{}/dists/pkg-1.0.zip", mock.uri())),
-            integrity: LockIntegrity::Sha1Hex(sha1),
-        };
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Failed(msg)) => assert!(msg.contains("no composer.json"), "{msg}"),
-            other => panic!("expected shape refusal, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn npm_tarball_without_package_json_refuses() {
-        // SRI-verified tarball with no package.json — not an npm package.
-        let tgz = make_tgz(&[("package/index.js", b"module.exports = 1;\n", false)]);
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/left-pad/-/left-pad-1.3.0.tgz"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(tgz.clone()))
-            .mount(&mock)
-            .await;
-
-        let entry = npm_entry(
-            Some(format!("{}/left-pad/-/left-pad-1.3.0.tgz", mock.uri())),
-            LockIntegrity::Sri(sri_of(&tgz)),
-        );
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Failed(msg)) => assert!(msg.contains("no package.json"), "{msg}"),
-            other => panic!("expected shape refusal, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn cargo_conventional_url_honors_registry_override() {
-        // Cargo.lock records no `resolved` URL for registry crates — the
-        // conventional `{base}/{name}/{name}-{version}.crate` construction
-        // (and the SOCKET_CRATES_REGISTRY override feeding it) must run.
-        let crate_bytes = make_tgz(&[(
-            "left-pad-1.3.0/Cargo.toml",
-            b"[package]\nname = \"left-pad\"\n",
-            false,
-        )]);
-        let sha = hex::encode(Sha256::digest(&crate_bytes));
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/left-pad/left-pad-1.3.0.crate"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(crate_bytes))
-            .mount(&mock)
-            .await;
-
-        let entry = LockfileEntry {
-            ecosystem: "cargo",
-            source_kind: SourceKind::Unspecified,
-            name: "left-pad".into(),
-            version: "1.3.0".into(),
-            purl: "pkg:cargo/left-pad@1.3.0".into(),
-            resolved: None,
-            integrity: LockIntegrity::Sha256Hex(sha),
-        };
-        let saved = std::env::var("SOCKET_CRATES_REGISTRY").ok();
-        // Trailing slash on purpose: the base must be trimmed before use.
-        std::env::set_var("SOCKET_CRATES_REGISTRY", format!("{}/", mock.uri()));
-        let result = fetch_and_stage(&entry, &build_registry_client()).await;
-        match saved {
-            Some(v) => std::env::set_var("SOCKET_CRATES_REGISTRY", v),
-            None => std::env::remove_var("SOCKET_CRATES_REGISTRY"),
-        }
-        let fetched = result.expect("the conventional crate URL must fetch");
-        assert_eq!(
-            fetched.url,
-            format!("{}/left-pad/left-pad-1.3.0.crate", mock.uri()),
-            "conventional URL: {{base}}/{{name}}/{{name}}-{{version}}.crate"
-        );
-        assert!(fetched.dir().await.unwrap().join("Cargo.toml").is_file());
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn golang_conventional_url_escapes_name_and_version() {
-        // No resolved URL → the conventional GOPROXY zip URL, with the
-        // module-path CASE ESCAPING applied to BOTH the name and the version
-        // (an uppercase letter becomes `!lowercase` in the URL, while the
-        // zip's interior prefix keeps the unescaped coordinates).
-        let prefix = "github.com/Azure/y@v1.0.0-RC1/";
-        let files: [(&str, &[u8]); 1] = [("go.mod", b"module github.com/Azure/y\n")];
-        let zip_bytes = make_module_zip(prefix, &files);
-        let expected_h1 = spec_h1(&files, prefix);
-
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(url_path("/github.com/!azure/y/@v/v1.0.0-!r!c1.zip"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
-            .mount(&mock)
-            .await;
-
-        let entry = LockfileEntry {
-            ecosystem: "golang",
-            source_kind: SourceKind::Unspecified,
-            name: "github.com/Azure/y".into(),
-            version: "v1.0.0-RC1".into(),
-            purl: "pkg:golang/github.com/Azure/y@v1.0.0-RC1".into(),
-            resolved: None,
-            integrity: LockIntegrity::GoH1(expected_h1),
-        };
-        let saved_socket = std::env::var("SOCKET_GOPROXY").ok();
-        let saved = std::env::var("GOPROXY").ok();
-        std::env::set_var("SOCKET_GOPROXY", mock.uri());
-        std::env::remove_var("GOPROXY");
-        let result = fetch_and_stage(&entry, &build_registry_client()).await;
-        match saved_socket {
-            Some(v) => std::env::set_var("SOCKET_GOPROXY", v),
-            None => std::env::remove_var("SOCKET_GOPROXY"),
-        }
-        match saved {
-            Some(v) => std::env::set_var("GOPROXY", v),
-            None => std::env::remove_var("GOPROXY"),
-        }
-        let fetched = result.expect("the conventional module zip URL must fetch");
-        assert_eq!(
-            fetched.url,
-            format!("{}/github.com/!azure/y/@v/v1.0.0-!r!c1.zip", mock.uri()),
-            "case escaping must apply to the name AND the version"
-        );
-        assert!(fetched.dir().await.unwrap().join("go.mod").is_file());
-    }
-
-    /// go never sends a module path to a proxy when GOPROXY starts with
-    /// `off` / `direct`, or when the module matches GONOPROXY (defaulting to
-    /// GOPRIVATE). The pristine fetch must not either: it refuses before any
-    /// network I/O instead of falling back to proxy.golang.org.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn golang_fetch_never_uses_a_proxy_go_would_not() {
-        let mock = MockServer::start().await;
-        let entry = LockfileEntry {
-            ecosystem: "golang",
-            name: "example.com/private/mod".into(),
-            version: "v1.0.0".into(),
-            purl: "pkg:golang/example.com/private/mod@v1.0.0".into(),
-            resolved: None,
-            integrity: LockIntegrity::GoH1("h1:AAAA".into()),
-            source_kind: SourceKind::Unspecified,
-        };
-        let keys = ["SOCKET_GOPROXY", "GOPROXY", "GOPRIVATE", "GONOPROXY"];
-        let saved: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
-        for k in keys {
-            std::env::remove_var(k);
-        }
-        let proxy = mock.uri();
-        let cases: Vec<(String, &str, &str, bool)> = vec![
-            ("off".into(), "", "", false),
-            ("direct".into(), "", "", false),
-            (format!("off,{proxy}"), "", "", false),
-            (format!("direct|{proxy}"), "", "", false),
-            (proxy.clone(), "example.com/private", "", false),
-            (proxy.clone(), "example.com/*", "", false),
-            (proxy.clone(), "*.example", "", true),
-            (proxy.clone(), "example.com/private", "other.example", true),
-        ];
-        let mut outcomes = Vec::new();
-        for (goproxy, goprivate, gonoproxy, uses_proxy) in &cases {
-            std::env::set_var("GOPROXY", goproxy);
-            std::env::set_var("GOPRIVATE", goprivate);
-            std::env::set_var("GONOPROXY", gonoproxy);
-            let result = fetch_and_stage(&entry, &build_registry_client()).await;
-            outcomes.push((
-                goproxy.clone(),
-                *goprivate,
-                *gonoproxy,
-                *uses_proxy,
-                result.err(),
-            ));
-        }
-        for (k, v) in keys.iter().zip(saved) {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-        for (goproxy, goprivate, gonoproxy, uses_proxy, err) in &outcomes {
-            let case = format!("GOPROXY={goproxy} GOPRIVATE={goprivate} GONOPROXY={gonoproxy}");
-            if *uses_proxy {
-                assert!(
-                    matches!(err, Some(FetchError::Failed(_))),
-                    "{case}: {err:?}"
-                );
-            } else {
-                assert!(
-                    matches!(err, Some(FetchError::Unverifiable(d)) if d.contains("GO")),
-                    "{case}: {err:?}"
-                );
-            }
-        }
-        let hits = mock.received_requests().await.unwrap_or_default().len();
-        assert_eq!(hits, 2, "only the two proxy-eligible cases reach the proxy");
     }
 
     #[test]
@@ -4305,8 +2274,7 @@ mod tests {
             // And the golang fetch's fused walk, which answers the same
             // question off the dirhash pass's single inflate.
             match walk_module_zip(&bytes, Some(prefix)) {
-                // The dirhash pass guards the caps too and refuses first —
-                // exactly where the pair of walks did.
+                // The dirhash pass guards the caps too and refuses first.
                 Err(dirhash_refusal) => assert!(
                     dirhash_refusal.contains("cap"),
                     "{label}: {dirhash_refusal}"
@@ -4433,8 +2401,7 @@ mod tests {
     }
 
     /// And on a healthy archive: the pass accepts it, writes nothing, and
-    /// answers the root-file probe the fetchers used to run against the
-    /// extracted tree.
+    /// answers the root-file probe without an extracted tree.
     #[test]
     fn validation_pass_accepts_and_answers_the_root_probe() {
         let tgz = make_tgz(&[
@@ -4482,7 +2449,6 @@ mod tests {
         // did not. A flat `composer archive`-built dist is the shape that
         // reaches this (the zipball layout is stripped first).
         let flat = make_zip(&[("root.txt", b"x"), ("./composer.json", b"{}")]);
-        assert!(!zip_has_single_top_dir(&flat).unwrap());
         let extracted = tempfile::tempdir().unwrap();
         extract_zip(&flat, extracted.path(), /*strip_first=*/ false).unwrap();
         assert!(
@@ -4499,60 +2465,6 @@ mod tests {
         // The tar twin, where the strip leaves the `./` behind.
         let dotted = make_tgz(&[("foo-1.0/./Cargo.toml", b"[package]", false)]);
         assert!(validate_tgz(&dotted, &nowhere, Some("Cargo.toml")).unwrap());
-    }
-
-    /// A deferred source extracts to exactly what the eager fetch wrote —
-    /// same tree, same bytes, same modes — and says so only once.
-    #[tokio::test]
-    async fn deferred_extraction_materializes_the_eager_tree() {
-        let tgz = make_tgz(&[
-            ("package/package.json", br#"{"name":"left-pad"}"#, false),
-            ("package/index.js", b"module.exports=1\n", false),
-            ("package/bin/cli.js", b"#!/usr/bin/env node\n", true),
-        ]);
-        let eager = tempfile::tempdir().unwrap();
-        extract_tgz(&tgz, eager.path()).unwrap();
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("package");
-        let bytes = tgz.clone();
-        let fetched = FetchedPackage::pending(
-            dir.clone(),
-            "https://example.invalid/left-pad.tgz".to_string(),
-            tmp,
-            move |dest, skip| extract_tgz_skipping(&bytes, dest, skip),
-        );
-        // The path is known before anything is written, and nothing is.
-        assert_eq!(fetched.dir_path(), dir);
-        assert!(!dir.exists(), "a pending source writes nothing until read");
-
-        assert_eq!(fetched.dir().await.unwrap(), dir);
-        for rel in ["package.json", "index.js", "bin/cli.js"] {
-            assert_eq!(
-                std::fs::read(dir.join(rel)).unwrap(),
-                std::fs::read(eager.path().join(rel)).unwrap(),
-                "{rel}"
-            );
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                assert_eq!(
-                    std::fs::metadata(dir.join(rel))
-                        .unwrap()
-                        .permissions()
-                        .mode()
-                        & 0o777,
-                    std::fs::metadata(eager.path().join(rel))
-                        .unwrap()
-                        .permissions()
-                        .mode()
-                        & 0o777,
-                    "{rel} mode"
-                );
-            }
-        }
-        // A second read is the same answer, not a second extraction.
-        assert_eq!(fetched.dir().await.unwrap(), dir);
     }
 
     /// A zip with a unix mode per entry, so the parallel walk's `fchmod`
@@ -4798,197 +2710,6 @@ mod tests {
         );
     }
 
-    /// Staging a pending source straight into the vendor stage must leave
-    /// exactly what extracting it and copying the tree out left: same
-    /// files, same bytes, same modes, same skip.
-    #[tokio::test]
-    async fn staging_a_pending_source_equals_extract_then_copy() {
-        let tgz = make_tgz(&[
-            ("crate/Cargo.toml", b"[package]\nname=\"x\"\n", false),
-            ("crate/src/lib.rs", b"pub fn x() {}\n", false),
-            ("crate/build.sh", b"#!/bin/sh\n", true),
-            ("crate/.cargo-checksum.json", b"{}", false),
-            ("crate/vendor/.cargo-checksum.json", b"{}", false),
-        ]);
-        for skip in [None, Some(".cargo-checksum.json")] {
-            // The oracle: what the eager fetch + `fresh_copy` produced.
-            let tmp = tempfile::tempdir().unwrap();
-            let extracted = tmp.path().join("crate");
-            extract_tgz(&tgz, &extracted).unwrap();
-            let oracle = tempfile::tempdir().unwrap();
-            let oracle_stage = oracle.path().join("stage");
-            crate::patch::copy_tree::fresh_copy(&extracted, &oracle_stage, skip)
-                .await
-                .unwrap();
-
-            let holder = tempfile::tempdir().unwrap();
-            let bytes = tgz.clone();
-            let fetched = FetchedPackage::pending(
-                holder.path().join("crate"),
-                "https://example.invalid/x.crate".to_string(),
-                holder,
-                move |dest, skip| extract_tgz_skipping(&bytes, dest, skip),
-            );
-            let staged_root = tempfile::tempdir().unwrap();
-            let staged = staged_root.path().join("stage");
-            fetched.stage_into(&staged, skip).await.unwrap();
-            assert!(
-                !fetched.dir_path().exists(),
-                "a direct stage writes no tempdir tree"
-            );
-            assert_eq!(tree_of(&staged), tree_of(&oracle_stage), "skip: {skip:?}");
-            assert_eq!(dirs_of(&staged), dirs_of(&oracle_stage), "skip: {skip:?}");
-        }
-    }
-
-    /// And when something read the tree first, the stage is still the same
-    /// — it just comes off that tree instead of a second inflate.
-    #[tokio::test]
-    async fn staging_after_materializing_still_matches() {
-        let tgz = make_tgz(&[
-            ("pkg/a.rb", b"A\n", false),
-            ("pkg/bin/run", b"#!/bin/sh\n", true),
-        ]);
-        let holder = tempfile::tempdir().unwrap();
-        let bytes = tgz.clone();
-        let fetched = FetchedPackage::pending(
-            holder.path().join("pkg"),
-            "https://example.invalid/x.gem".to_string(),
-            holder,
-            move |dest, skip| extract_tgz_skipping(&bytes, dest, skip),
-        );
-        let materialized = fetched.dir().await.unwrap().to_path_buf();
-        let staged_root = tempfile::tempdir().unwrap();
-        let staged = staged_root.path().join("stage");
-        fetched.stage_into(&staged, None).await.unwrap();
-        assert_eq!(tree_of(&staged), tree_of(&materialized));
-        assert_eq!(dirs_of(&staged), dirs_of(&materialized));
-    }
-
-    /// Once the tree is on disk the archive is dead weight: a run that
-    /// materialises its sources must not carry every one of them to the end
-    /// of the vendor loop, which is more than the eager fetch ever held.
-    #[tokio::test]
-    async fn materializing_frees_the_archive_bytes() {
-        struct Tattle {
-            bytes: Vec<u8>,
-            freed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        }
-        impl Drop for Tattle {
-            fn drop(&mut self) {
-                self.freed.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        let freed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let tattle = Tattle {
-            bytes: make_tgz(&[("pkg/a.txt", b"hello", false)]),
-            freed: std::sync::Arc::clone(&freed),
-        };
-        let holder = tempfile::tempdir().unwrap();
-        let fetched = FetchedPackage::pending(
-            holder.path().join("pkg"),
-            "https://example.invalid/x.tgz".to_string(),
-            holder,
-            move |dest, skip| extract_tgz_skipping(&tattle.bytes, dest, skip),
-        );
-        assert!(!freed.load(std::sync::atomic::Ordering::SeqCst));
-        fetched.dir().await.unwrap();
-        assert!(
-            freed.load(std::sync::atomic::Ordering::SeqCst),
-            "the archive is still held after its tree reached the tempdir"
-        );
-        // And the tree is still the one thing every later caller reads.
-        let stage_root = tempfile::tempdir().unwrap();
-        let stage = stage_root.path().join("stage");
-        fetched.stage_into(&stage, None).await.unwrap();
-        assert_eq!(tree_of(&stage), tree_of(fetched.dir().await.unwrap()));
-    }
-
-    /// And the source nothing ever reads — the case the deferral exists
-    /// for — is let go when the loop moves past its purl, so a run holds
-    /// one archive rather than every one it fetched.
-    #[test]
-    fn releasing_an_unread_source_frees_the_archive_bytes() {
-        struct Tattle {
-            bytes: Vec<u8>,
-            freed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        }
-        impl Drop for Tattle {
-            fn drop(&mut self) {
-                self.freed.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        let freed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let tattle = Tattle {
-            bytes: make_tgz(&[("pkg/a.txt", b"hello", false)]),
-            freed: std::sync::Arc::clone(&freed),
-        };
-        let holder = tempfile::tempdir().unwrap();
-        let fetched = FetchedPackage::pending(
-            holder.path().join("pkg"),
-            "https://example.invalid/x.tgz".to_string(),
-            holder,
-            move |dest, skip| extract_tgz_skipping(&tattle.bytes, dest, skip),
-        );
-        crate::vendor::source::PackageSource::Pending(&fetched).release();
-        assert!(
-            freed.load(std::sync::atomic::Ordering::SeqCst),
-            "a released source is still holding its archive"
-        );
-        // Releasing twice is the same nothing.
-        fetched.release();
-    }
-
-    /// A stage that cannot be cleared or created reports what the copy out
-    /// of the tempdir reported — the backends wrap it in their own wording.
-    #[tokio::test]
-    async fn a_stage_that_cannot_be_made_reads_as_the_copy_read() {
-        let tgz = make_tgz(&[("pkg/a.txt", b"hello", false)]);
-        let bytes = tgz.clone();
-        let holder = tempfile::tempdir().unwrap();
-        let fetched = FetchedPackage::pending(
-            holder.path().join("pkg"),
-            "https://example.invalid/x.tgz".to_string(),
-            holder,
-            move |dest, skip| extract_tgz_skipping(&bytes, dest, skip),
-        );
-        // A stage whose parent is a FILE: `create_dir_all` fails the same
-        // way for `fresh_copy` and for a direct stage.
-        let root = tempfile::tempdir().unwrap();
-        let blocker = root.path().join("blocked");
-        std::fs::write(&blocker, b"not a dir").unwrap();
-        let stage = blocker.join("stage");
-
-        let installed = tempfile::tempdir().unwrap();
-        let oracle = crate::patch::copy_tree::fresh_copy(installed.path(), &stage, None)
-            .await
-            .unwrap_err()
-            .to_string();
-        let direct = fetched.stage_into(&stage, None).await.unwrap_err();
-        assert_eq!(direct, oracle);
-    }
-
-    /// Every DIRECTORY under `root`, relative. `tree_of` lists files, so it
-    /// cannot see a stage that dropped a directory whose only member was
-    /// skipped — which is exactly what the fixtures below are built to
-    /// catch.
-    fn dirs_of(root: &Path) -> Vec<String> {
-        let mut out: Vec<String> = walkdir::WalkDir::new(root)
-            .into_iter()
-            .flatten()
-            .filter(|e| e.file_type().is_dir() && e.path() != root)
-            .map(|e| {
-                e.path()
-                    .strip_prefix(root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        out.sort();
-        out
-    }
-
     /// Every file under `root`, relative, with its bytes and unix mode.
     fn tree_of(root: &Path) -> Vec<(String, Vec<u8>, u32)> {
         let mut out: Vec<(String, Vec<u8>, u32)> = walkdir::WalkDir::new(root)
@@ -5017,29 +2738,6 @@ mod tests {
         out
     }
 
-    /// An extraction that cannot be written reports the same failure to
-    /// every later caller, and never half-answers.
-    #[tokio::test]
-    async fn deferred_extraction_failure_is_sticky() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("package");
-        let fetched = FetchedPackage::pending(
-            dir.clone(),
-            "https://example.invalid/x.tgz".to_string(),
-            tmp,
-            |_, _| Err("cannot create /nope: nope".to_string()),
-        );
-        assert_eq!(
-            fetched.dir().await.unwrap_err(),
-            "cannot create /nope: nope"
-        );
-        assert_eq!(
-            fetched.dir().await.unwrap_err(),
-            "cannot create /nope: nope",
-            "the outcome is decided once and shared"
-        );
-    }
-
     #[test]
     fn verify_go_h1_accepts_matching_dirhash() {
         // The SUCCESS path is the golang service-download content verifier —
@@ -5066,21 +2764,18 @@ mod tests {
             &LockIntegrity::BerryChecksum(format!("8/{}", "0".repeat(128))),
         )
         .unwrap_err();
-        assert!(err.contains("cacheKey other than 10c0"), "{err}");
+        assert!(err.contains("cannot verify tarball bytes"), "{err}");
 
         // 10c0: the cache-zip rebuild round-trips, and a tampered checksum
         // names the mismatch.
         let tgz = make_tgz(&[("package/package.json", br#"{"name":"left-pad"}"#, false)]);
-        let good = super::super::berry_zip::berry_cache_checksum_10c0(&tgz, "left-pad").unwrap();
-        artifact_matches_integrity(&tgz, "left-pad", &LockIntegrity::BerryChecksum(good))
-            .expect("the rebuilt cache checksum must match");
         let err = artifact_matches_integrity(
             &tgz,
             "left-pad",
             &LockIntegrity::BerryChecksum(format!("10c0/{}", "0".repeat(128))),
         )
         .unwrap_err();
-        assert!(err.contains("mismatch"), "{err}");
+        assert!(err.contains("cannot verify tarball bytes"), "{err}");
 
         // GoH1 has a dedicated fetch-path verifier; None is reachable from a
         // repair against an npm-era lock recording no integrity. Both refuse.

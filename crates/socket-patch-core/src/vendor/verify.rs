@@ -5,9 +5,9 @@
 //! manifest claims the patch modified must hash (git-blob sha256) to its
 //! `afterHash` inside that artifact — the same standard `vex::verify` applies
 //! to installed trees. Dir-shaped ecosystems are hashed in place; npm
-//! tarballs and pypi wheels are decoded in memory (bounded — the artifacts
-//! are committed and tamper-able, so a crafted archive must not OOM an
-//! audit).
+//! tarballs and zip artifacts (`.whl`/`.nupkg`/`.jar`) are decoded in memory
+//! (bounded — the artifacts are committed and tamper-able, so a crafted
+//! archive must not OOM an audit).
 //!
 //! Fail-closed order (each failure is a stable snake_case routing tag):
 //! `no_files` → `vendor_path_unsafe` → `vendor_uuid_mismatch` →
@@ -50,6 +50,13 @@ pub(crate) fn checked_artifact_path(
     entry: &VendorEntry,
     record: &PatchRecord,
 ) -> Result<PathBuf, String> {
+    // The JVM trees are not `<eco>/<uuid>` dirs: the jar must be the
+    // entry's own tree jar for this uuid (checked against the layout and
+    // the marker).
+    if super::jvm::apply::is_jvm_entry(entry) {
+        return super::jvm::apply::checked_tree_jar(project_root, entry, &record.uuid)
+            .map(|rel| project_root.join(rel));
+    }
     let rel = &entry.artifact.path;
     let parts = parse_vendor_path(rel).ok_or_else(|| "vendor_path_unsafe".to_string())?;
     let norm = rel.replace('\\', "/");
@@ -95,6 +102,28 @@ pub async fn verify_vendored_patch_record(
     // key space. Everything else is a dir-shaped copy hashed in place.
     if is_vlt_dir_entry(entry) {
         return verify_vlt_dir(project_root, &artifact, entry, record).await;
+    }
+    if entry.ecosystem == "pypi" {
+        let name = entry.artifact.path.clone();
+        let members = tokio::task::spawn_blocking(move || {
+            let (file, meta) = crate::utils::fs::open_regular_file_sync(&artifact)
+                .map_err(|_| "vendor_artifact_unreadable")?;
+            if meta.len() > MAX_HEALTH_HASH_BYTES {
+                return Err("vendor_artifact_unreadable".into());
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_HEALTH_HASH_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "vendor_artifact_unreadable")?;
+            if bytes.len() as u64 > MAX_HEALTH_HASH_BYTES {
+                return Err("vendor_artifact_unreadable".into());
+            }
+            super::pypi_distribution::read_members(&bytes, &name)
+                .map_err(|_| "vendor_artifact_unreadable".to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        return super::pypi_distribution::verify_members(&members, &entry.artifact.path, record);
     }
     let path_str = artifact.to_string_lossy();
     let is_tarball = path_str.ends_with(".tgz") || path_str.ends_with(".tar.gz");
@@ -167,11 +196,16 @@ async fn verify_dir_members(
     Ok(())
 }
 
-/// A vlt package-dir entry (DESIGN §4.2): npm, flavor `vlt`, not a tarball.
+/// A vlt package-dir entry: npm, flavor `vlt`, not a tarball. The vendored
+/// dir layout decides before the suffix does: the path ends in the package
+/// name, which may itself end in one (`lodash.zip`).
 pub(crate) fn is_vlt_dir_entry(entry: &VendorEntry) -> bool {
     entry.ecosystem == "npm"
         && entry.flavor.as_deref() == Some(super::vlt_lock::FLAVOR)
-        && !artifact_is_file_shaped(&entry.artifact.path)
+        && (!artifact_is_file_shaped(&entry.artifact.path)
+            || parse_vendor_path(&entry.artifact.path)
+                .and_then(|p| super::vlt_lock_text::parse_vendored_dir_leaf(&p.leaf))
+                .is_some())
 }
 
 /// The largest afterHash blob the vlt manifest exemption reads.
@@ -281,7 +315,7 @@ pub(crate) async fn vlt_installed_copy_matches(
     true
 }
 
-/// The vlt manifest exemption (DESIGN §4.4): the committed `package.json`
+/// The vlt manifest exemption: the committed `package.json`
 /// is post-transform, so it verifies iff it hashes to the inventory pin and,
 /// when the afterHash blob is in the local blob store, the blob with its
 /// devDependencies stripped hashes to that pin too.
@@ -391,7 +425,6 @@ fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
 /// [`read_wheel_to_map`] over in-memory zip bytes — the same entry and
 /// decompressed-size caps — for callers that hash and decode the SAME
 /// buffer (a committed wheel read exactly once).
-#[cfg(test)]
 pub(crate) fn read_zip_bytes_to_map(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, String> {
     read_zip_to_map(std::io::Cursor::new(bytes), false)
 }
@@ -495,6 +528,7 @@ pub fn artifact_is_file_shaped(path: &str) -> bool {
     norm.ends_with(".tgz")
         || norm.ends_with(".tar.gz")
         || norm.ends_with(".whl")
+        || norm.ends_with(".zip")
         || norm.ends_with(".nupkg")
         || norm.ends_with(".jar")
 }
@@ -588,7 +622,7 @@ async fn inventory_walk(
 /// before tagged versions keeps verifying once a re-run / repair tags it,
 /// while every other byte (including any other tag) stays pinned. So the
 /// tag step never re-baselines the inventory over bytes nobody verified.
-async fn verify_dir_inventory(
+pub(super) async fn verify_dir_inventory(
     dir: &Path,
     inventory: &BTreeMap<String, String>,
     cargo_uuid: Option<&str>,
@@ -645,7 +679,8 @@ pub enum ArtifactHealth {
     /// Present but failing verification: rebuildable. `reason` is the
     /// stable routing tag (`vendor_hash_mismatch`, `file_not_found`,
     /// `vendor_artifact_unreadable`, `vendor_sha256_mismatch`,
-    /// `vendor_inventory_mismatch`).
+    /// `vendor_inventory_mismatch`, `vendor_workspace_artifact_missing`,
+    /// `vendor_workspace_artifact_corrupt`).
     Corrupt { reason: String },
     /// The ledger/artifact uuid doesn't match the record: a re-vendor is
     /// pending — not repair's job.
@@ -661,7 +696,8 @@ pub enum ArtifactHealth {
 /// Health-check one vendored artifact against its patch record: the
 /// per-file afterHash verification of [`verify_vendored_patch_record`]
 /// (which for dir-shaped artifacts includes the whole-tree fileInventory
-/// cross-check) plus, for file-shaped artifacts (`.tgz`/`.tar.gz`/`.whl`)
+/// cross-check) plus, for file-shaped artifacts
+/// (`.tgz`/`.tar.gz`/`.whl`/`.nupkg`/`.jar`, see [`artifact_is_file_shaped`])
 /// with a recorded ledger sha256, a whole-file hash cross-check — the
 /// rewired lockfile integrity references those exact bytes, so silent
 /// drift breaks the package manager even when the patched members still
@@ -744,7 +780,7 @@ pub async fn file_sha256_hex(path: &Path) -> Option<String> {
 
     // Open, read and hash in ONE blocking hop. The loop below is pure CPU
     // between `read`s, and a wheel or a `.nupkg` is megabytes of it — run on
-    // the async thread it blocked the runtime for the whole digest.
+    // the async thread it would block the runtime for the whole digest.
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let (mut file, meta) = crate::utils::fs::open_regular_file_sync(&path).ok()?;
@@ -822,6 +858,7 @@ mod tests {
             base_purl: "pkg:npm/x@1.0.0".into(),
             uuid: uuid.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel_path.into(),
                 sha256: String::new(),
                 size: None,
@@ -1099,7 +1136,7 @@ mod tests {
 
     /// The whole-tree inventory closes the dir-shaped blindspot: with only
     /// afterHashes, a tampered UNPATCHED file (or stub gemspec), a deleted
-    /// file, or a planted extra file were all blessed Healthy. Each arm of
+    /// file, or a planted extra file would all be blessed Healthy. Each arm of
     /// the tamper matrix is hand-pinned; the legacy no-inventory entry keeps
     /// member-only behavior (backward tolerance).
     #[tokio::test]
@@ -1210,7 +1247,7 @@ mod tests {
             .unwrap();
 
         // 5. LEGACY entry (no inventory recorded): the same unpatched-file
-        //    tamper keeps today's member-only Healthy verdict.
+        //    tamper keeps the member-only Healthy verdict.
         tokio::fs::write(dir.join("rack.gemspec"), b"tampered gemspec\n")
             .await
             .unwrap();
@@ -1728,6 +1765,35 @@ mod tests {
         ));
     }
 
+    /// A vlt package whose name ends in an archive suffix (`lodash.zip`) is
+    /// still a vlt dir: its dependency links pass the vlt structure rule
+    /// instead of failing the generic whole-tree inventory walk.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vlt_dir_named_like_an_archive_is_still_a_vlt_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/npm/{UUID}/lodash.zip-4.2.0/node_modules/lodash.zip");
+        let dir = root.join(&rel);
+        tokio::fs::create_dir_all(dir.join("node_modules"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("index.js"), PATCHED)
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("../../../dep", dir.join("node_modules/dep")).unwrap();
+        let rec = record(UUID, "package/index.js");
+        let mut ent = entry("npm", UUID, &rel);
+        ent.flavor = Some("vlt".into());
+        ent.artifact.file_inventory = Some(compute_package_dir_inventory(&dir).await.unwrap());
+        assert!(artifact_is_file_shaped(&rel));
+        assert!(is_vlt_dir_entry(&ent));
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Healthy
+        );
+    }
+
     #[tokio::test]
     async fn vlt_manifest_blob_pins_the_inventory() {
         use sha2::Digest;
@@ -1984,8 +2050,10 @@ mod tests {
         // Precondition: the zip reader tolerates the prefix, so member
         // verification alone would bless the artifact…
         assert!(
-            verify_vendored_patch_record(root, &ent, &rec).await.is_ok(),
-            "zip reader must resolve the archive offset past the sparse prefix"
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .is_err(),
+            "member verification also refuses oversized archives"
         );
         // …and only the whole-file arm catches it: file_sha256_hex bails
         // on the size cap, so the recorded sha is unverifiable.

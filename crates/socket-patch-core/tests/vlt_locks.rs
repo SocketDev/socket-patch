@@ -547,9 +547,69 @@ fn stage(case: &Case, crlf: bool) -> Staged {
 async fn vendor(case: &Case, staged: &Staged) -> VendorOutcome {
     let sources = PatchSources {
         blobs_path: &staged.blobs,
-        packages_path: None,
         diffs_path: None,
         mem_blobs: None,
+    };
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    use socket_patch_core::api::client::{ApiClient, ApiClientOptions};
+    use socket_patch_core::vendor::{VendorServiceConfig, VendorSource};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    ));
+    for (name, bytes) in [
+        (
+            "package/package.json",
+            fs::read(staged.installed.join("package.json")).unwrap(),
+        ),
+        ("package/index.js", PATCHED_JS.to_vec()),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, name, bytes.as_slice())
+            .unwrap();
+    }
+    let bytes = archive.into_inner().unwrap().finish().unwrap();
+    let integrity = format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&bytes))
+    );
+    let url = format!("{}/artifact.tgz", server.uri());
+    Mock::given(method("POST"))
+        .and(path("/patch/package"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({ "results": { &case.uuid: {
+            "status": "granted", "purl": case.purl, "url": url,
+            "artifacts": [{ "kind": "tarball", "url": url, "integrity": { "sha512": integrity } }]
+        } } }),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/artifact.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+        .mount(&server)
+        .await;
+    let service = VendorServiceConfig {
+        maven_config: None,
+        source: VendorSource::Service,
+        client: Some(ApiClient::new(ApiClientOptions {
+            api_url: server.uri(),
+            api_token: None,
+            org_slug: None,
+            use_public_proxy: true,
+        })),
+        use_public_proxy: true,
+        vendor_url: None,
+        patch_server_url: None,
+        offline: false,
     };
     vendor_npm_any(
         &case.purl,
@@ -560,7 +620,7 @@ async fn vendor(case: &Case, staged: &Staged) -> VendorOutcome {
         "2026-09-26T00:00:00Z",
         false,
         false,
-        None,
+        Some(&service),
     )
     .await
 }

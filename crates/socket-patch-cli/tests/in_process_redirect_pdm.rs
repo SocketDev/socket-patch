@@ -2,20 +2,21 @@
 //! (discovery + reference + view) via wiremock, lays down a native `pdm.lock`
 //! (the committed backtest fixtures) with NO installed package — the lock-only
 //! fresh-checkout / CI shape — and asserts the lock is repointed at the hosted
-//! wheel, the redirect ledger is written, the same-run `--vex` attests the
-//! redirect, a re-scan is idempotent, and `rollback` restores every byte. It
-//! also covers the PDM-specific relock convergence: `pdm lock` un-patches the
-//! lock AND can reflow its line endings (CRLF → LF), so a re-scan must rebase
-//! the ledger onto the relocked bytes — adopting the fresh `original` — for
-//! `rollback` to still land on the relocked lock. The rewriter bytes themselves
-//! are pinned by the core `utils::pdm_lock` tests; this covers the CLI wiring.
+//! wheel, NO redirect ledger is written (v5), the same-run `--vex` attests the
+//! redirect, a re-scan is idempotent, and `rollback` restores every byte by
+//! re-resolving the upstream entry from a mocked PyPI JSON API
+//! (`SOCKET_PYPI_JSON_API`). It also covers the PDM-specific relock
+//! convergence: `pdm lock` un-patches the lock AND can reflow its line
+//! endings (CRLF → LF); a re-scan plans from the relocked bytes and
+//! `rollback` lands on the relocked lock. The rewriter bytes themselves are
+//! pinned by the core `utils::pdm_lock` tests; this covers the CLI wiring.
 //!
 //! Every flow ends with the MANIFEST-LESS VEX step ([`assert_manifestless_vex`],
 //! the shared `vex_e2e_common` helper): a fresh copy of the committed state
-//! (pyproject + lock + `.socket/`, never a manifest in hosted mode) attests the
-//! redirect from the ledger offline, from the lock + patch API with the ledger
-//! gone (`--patch-server-url` admits the fixture's non-Socket host), omits it
-//! `record_unavailable` offline with no ledger (zero requests), and omits it
+//! (pyproject + lock, never a manifest or ledger in v5 hosted mode) attests
+//! the redirect from the lock + patch API (`--patch-server-url` admits the
+//! fixture's non-Socket host), omits it `record_unavailable` offline (zero
+//! requests), attests offline from a pre-v5 ledger's record, and omits it
 //! `redirect_unwired` once the lock is reverted — `--no-verify` included.
 
 use std::path::Path;
@@ -32,15 +33,15 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 use vex_e2e_common::{
-    assert_attested, assert_not_attested, binary, git_sha256, patch_view, run_vex, strip_ledgers,
-    strip_manifest, Marker, PatchApi, VexRun,
+    assert_attested, assert_not_attested, binary, git_sha256, patch_view, run_vex, strip_manifest,
+    Marker, PatchApi, VexRun,
 };
 
 const ORG: &str = "test-org";
 /// Discovery names the base purl (the lock inventory's spelling)…
 const PURL: &str = "pkg:pypi/urllib3@1.26.18";
-/// …while the patch record carries the API's artifact-qualified purl, which is
-/// what the redirect ledger is keyed by.
+/// …while the patch record carries the API's artifact-qualified purl (what a
+/// pre-v5 redirect ledger was keyed by).
 const RECORD_PURL: &str = "pkg:pypi/urllib3@1.26.18?artifact_id=py2-py3-none-any-whl";
 const UUID: &str = "e828efa5-5c6d-43f3-9909-03f5ac232b98";
 const HOSTED_URL: &str = "http://patch.test/patch/pypi/urllib3/1.26.18/22222222-2222-4222-8222-222222222222/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl";
@@ -72,23 +73,100 @@ fn global(cwd: &Path, api_url: String) -> GlobalArgs {
     }
 }
 
+/// The urllib3 1.26.18 release files the PDM fixtures pin, as the PyPI JSON
+/// API serves them (`GET /pypi/urllib3/1.26.18/json`).
+async fn mock_pypi(server: &MockServer) {
+    let file = |filename: &str, sha: &str, size: u64, uploaded: &str| {
+        serde_json::json!({
+            "filename": filename,
+            "url": format!("https://files.pythonhosted.org/packages/ab/cd/{filename}"),
+            "digests": { "sha256": sha },
+            "size": size,
+            "upload_time_iso_8601": uploaded,
+        })
+    };
+    Mock::given(method("GET"))
+        .and(path("/pypi/urllib3/1.26.18/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "urls": [
+                file(
+                    "urllib3-1.26.18-py2.py3-none-any.whl",
+                    "34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07",
+                    143835,
+                    "2023-10-17T17:46:21.184066Z",
+                ),
+                file(
+                    "urllib3-1.26.18.tar.gz",
+                    "f8ecc1bba5667413457c529ab955bf8c67b45db799d159066261719e328580a0",
+                    305687,
+                    "2023-10-17T17:46:24.000000Z",
+                ),
+            ]
+        })))
+        .mount(server)
+        .await;
+}
+
+/// In-process `rollback` of the hosted pin: the mock patch host is named by
+/// `--patch-server-url` (so discovery finds the pin) and the upstream restore
+/// re-resolves the release from the mocked PyPI JSON API.
+async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
+    mock_pypi(server).await;
+    std::env::set_var("SOCKET_PYPI_JSON_API", format!("{}/pypi", server.uri()));
+    let code = rollback::run(RollbackArgs {
+        targets: Vec::new(),
+        common: GlobalArgs {
+            patch_server_url: Some(PATCH_SERVER.to_string()),
+            ..global(cwd, server.uri())
+        },
+        preserve_state: false,
+    })
+    .await;
+    std::env::remove_var("SOCKET_PYPI_JSON_API");
+    code
+}
+
+/// A pre-v5 redirect ledger holding `record` under `purl` (no edits).
+fn write_legacy_ledger(root: &Path, purl: &str, record: serde_json::Value) {
+    let dir = root.join(".socket/vendor");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("redirect-state.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "mode": "hosted",
+            "records": { purl: record },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn assert_no_ledger(root: &Path) {
+    assert!(
+        !root.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode writes no redirect ledger"
+    );
+}
+
 fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: global(cwd, api_url),
         batch_size: Some(100),
         apply: false,
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: true,
-        mode: None,
+        mode: Some(socket_patch_cli::commands::scan::ScanMode::Hosted),
         all_releases: false,
         vex: VexEmbedArgs {
             vex: vex.map(Path::to_path_buf),
             ..Default::default()
         },
+        rollout: Default::default(),
     }
 }
 
@@ -206,15 +284,13 @@ fn assert_manifestless_vex(root: &Path, pristine_lock: &str) {
 
 fn manifestless_vex_steps(root: &Path, pristine_lock: &str) {
     let vulns: &[(&str, &[&str])] = &[(GHSA, &["CVE-2025-66418"])];
-    let api = PatchApi::start(vec![(
-        UUID.to_string(),
-        patch_view(
-            UUID,
-            RECORD_PURL,
-            &[("urllib3/response.py", &git_sha256(PATCHED))],
-            vulns,
-        ),
-    )]);
+    let view = patch_view(
+        UUID,
+        RECORD_PURL,
+        &[("urllib3/response.py", &git_sha256(PATCHED))],
+        vulns,
+    );
+    let api = PatchApi::start(vec![(UUID.to_string(), view.clone())]);
     let online = || VexRun {
         patch_server_url: Some(PATCH_SERVER.to_string()),
         ..VexRun::online(&api)
@@ -227,27 +303,12 @@ fn manifestless_vex_steps(root: &Path, pristine_lock: &str) {
     std::fs::copy(root.join("pyproject.toml"), copy.join("pyproject.toml")).unwrap();
     copy_dir(&root.join(".socket"), &copy.join(".socket"));
     strip_manifest(copy);
+    assert_no_ledger(copy);
 
-    // (1) ledger kept: attested offline from the ledger record (zero
-    // network), and online. Nothing is installed, so the basis is the
-    // lock's sha256 pin — which counts only once `--patch-server-url` makes
-    // the lock's url a discovered hosted reference.
-    let offline_ledger = VexRun {
-        offline: true,
-        patch_server_url: Some(PATCH_SERVER.to_string()),
-        ..VexRun::default()
-    };
-    for (i, run) in [offline_ledger, online()].into_iter().enumerate() {
-        let out = run_vex(&binary(), copy, &run);
-        assert_eq!(out.code, Some(0), "{out}");
-        assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
-        if i == 0 {
-            api.assert_no_requests();
-        }
-    }
-
-    // (2) ledgers gone: the lock alone, the record from the patch API.
-    strip_ledgers(copy);
+    // (1) The lock alone, the record from the patch API. Nothing is
+    // installed, so the basis is the lock's sha256 pin — which counts only
+    // once `--patch-server-url` makes the lock's url a discovered hosted
+    // reference.
     let out = run_vex(&binary(), copy, &online());
     assert_eq!(out.code, Some(0), "{out}");
     assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
@@ -257,7 +318,7 @@ fn manifestless_vex_steps(root: &Path, pristine_lock: &str) {
     assert_eq!(out.code, Some(2), "{out}");
     assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
 
-    // (3) offline with no ledger: nothing local to attest from, no network.
+    // (2) offline with no local record: nothing to attest from, no network.
     let quiet = PatchApi::empty();
     let offline = VexRun {
         offline: true,
@@ -269,12 +330,20 @@ fn manifestless_vex_steps(root: &Path, pristine_lock: &str) {
     assert_not_attested(&out.envelope, PURL, "record_unavailable");
     quiet.assert_no_requests();
 
-    // (4) lock reverted to the registry, ledger kept: dead claim.
+    // (3) a pre-v5 ledger's record is an extra local record source: the
+    // same offline run now attests, still with zero requests.
+    write_legacy_ledger(copy, RECORD_PURL, legacy_record(&view));
+    let out = run_vex(&binary(), copy, &offline);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
+    quiet.assert_no_requests();
+
+    // (4) lock reverted to the registry, that ledger kept: dead claim.
     let tmp2 = tempfile::tempdir().unwrap();
     let reverted = tmp2.path();
     write_project(reverted, pristine_lock);
     std::fs::copy(root.join("pyproject.toml"), reverted.join("pyproject.toml")).unwrap();
-    copy_dir(&root.join(".socket"), &reverted.join(".socket"));
+    copy_dir(&copy.join(".socket"), &reverted.join(".socket"));
     strip_manifest(reverted);
     for no_verify in [false, true] {
         let out = run_vex(
@@ -290,7 +359,25 @@ fn manifestless_vex_steps(root: &Path, pristine_lock: &str) {
     }
 }
 
+/// A pre-v5 ledger record (the `PatchRecord` shape) from a view body.
+fn legacy_record(view: &serde_json::Value) -> serde_json::Value {
+    let mut record = view.clone();
+    let obj = record.as_object_mut().unwrap();
+    obj.remove("purl");
+    let exported = obj
+        .remove("publishedAt")
+        .unwrap_or_else(|| serde_json::json!("2024-01-01T00:00:00Z"));
+    obj.insert("exportedAt".to_string(), exported);
+    obj.entry("description").or_insert_with(|| serde_json::json!("x"));
+    obj.entry("license").or_insert_with(|| serde_json::json!("MIT"));
+    obj.entry("tier").or_insert_with(|| serde_json::json!("free"));
+    record
+}
+
 fn copy_dir(from: &Path, to: &Path) {
+    if !from.is_dir() {
+        return;
+    }
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap().flatten() {
         let target = to.join(entry.file_name());
@@ -337,20 +424,11 @@ async fn lock_only_pdm_project_redirects_attests_rescans_and_rolls_back() {
         PYPROJECT,
         "pyproject untouched"
     );
-    let ledger: serde_json::Value =
-        serde_json::from_str(&read(&tmp.path().join(".socket/vendor/redirect-state.json"))).unwrap();
-    assert!(
-        ledger["records"][RECORD_PURL].is_object(),
-        "ledger keyed by the artifact-qualified purl: {ledger}"
-    );
-    assert_eq!(
-        ledger["edits"][0]["kind"].as_str(),
-        Some("redirect_pdm_lock_package"),
-        "{ledger}"
-    );
-    // The redirect is attested from the ledger even though the base purl the
-    // run confirmed differs from the record's qualified purl only by its
-    // `?artifact_id=` qualifier (the shared qualifier-strip in vex).
+    assert_no_ledger(tmp.path());
+    // The redirect is attested from this run's fetched record even though
+    // the base purl the run confirmed differs from the record's qualified
+    // purl only by its `?artifact_id=` qualifier (the shared qualifier-strip
+    // in vex).
     let vex: serde_json::Value = serde_json::from_str(&read(&vex_path)).unwrap();
     let statements = vex["statements"].as_array().expect("statements");
     assert_eq!(statements.len(), 1, "{vex}");
@@ -368,30 +446,15 @@ async fn lock_only_pdm_project_redirects_attests_rescans_and_rolls_back() {
     // 3. The committed state, manifest-less, attests (and only while wired).
     assert_manifestless_vex(tmp.path(), LOCK);
 
-    // 4. rollback unwinds the redirect and drops the record.
-    let code = rollback::run(RollbackArgs {
-        targets: Vec::new(),
-        common: global(tmp.path(), server.uri()),
-        one_off: false,
-        preserve_state: false,
-    })
-    .await;
+    // 4. rollback restores the upstream registry entry.
+    let code = rollback_hosted(tmp.path(), &server).await;
     assert_eq!(code, 0, "rollback must succeed");
     assert_eq!(
         read(&lock_path),
         LOCK,
         "rollback must restore the pristine lock byte for byte"
     );
-    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
-    if ledger_path.exists() {
-        let ledger: serde_json::Value = serde_json::from_str(&read(&ledger_path)).unwrap();
-        assert!(
-            ledger["records"]
-                .as_object()
-                .is_none_or(|records| records.is_empty()),
-            "no redirect record may survive rollback: {ledger}"
-        );
-    }
+    assert_no_ledger(tmp.path());
 }
 
 /// A PDM project whose `pyproject.toml` names `hatchling` as its build
@@ -399,7 +462,7 @@ async fn lock_only_pdm_project_redirects_attests_rescans_and_rolls_back() {
 /// for such a project and then yields to the lock without confirming any, so
 /// hosted confirmation must key off the pdm rewriter's own report BEFORE the
 /// hatch gate can veto it — otherwise the lock is rewritten but nothing is
-/// recorded or attested.
+/// confirmed or attested.
 #[tokio::test]
 #[serial]
 async fn hatchling_build_backend_does_not_veto_the_pdm_lock_redirect() {
@@ -422,26 +485,19 @@ async fn hatchling_build_backend_does_not_veto_the_pdm_lock_redirect() {
         pyproject,
         "pyproject untouched"
     );
-    let ledger: serde_json::Value =
-        serde_json::from_str(&read(&tmp.path().join(".socket/vendor/redirect-state.json"))).unwrap();
-    assert!(
-        ledger["records"][RECORD_PURL].is_object(),
-        "the pdm redirect must be confirmed and recorded despite the hatch backend: {ledger}"
-    );
-    assert_eq!(
-        ledger["edits"][0]["kind"].as_str(),
-        Some("redirect_pdm_lock_package"),
-        "{ledger}"
-    );
+    assert_no_ledger(tmp.path());
+    // Confirmed despite the hatch backend: the record was fetched.
+    let views = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().ends_with(&format!("/patches/view/{UUID}")))
+        .count();
+    assert_eq!(views, 1, "the pdm redirect must be confirmed despite the hatch backend");
     assert_manifestless_vex(tmp.path(), LOCK);
 
-    let code = rollback::run(RollbackArgs {
-        targets: Vec::new(),
-        common: global(tmp.path(), server.uri()),
-        one_off: false,
-        preserve_state: false,
-    })
-    .await;
+    let code = rollback_hosted(tmp.path(), &server).await;
     assert_eq!(code, 0, "rollback must succeed");
     assert_eq!(read(&lock_path), LOCK, "rollback must restore the pristine lock");
 }
@@ -461,33 +517,32 @@ async fn legacy_metadata_files_lock_redirects_both_fragments_and_warns() {
     assert_eq!(code, 0);
     let redirected = read(&lock_path);
     assert!(redirected.contains(HOSTED_URL), "{redirected}");
-    let ledger: serde_json::Value =
-        serde_json::from_str(&read(&tmp.path().join(".socket/vendor/redirect-state.json"))).unwrap();
-    assert_eq!(
-        ledger["edits"].as_array().unwrap().len(),
-        2,
-        "package unit + [metadata.files] entry: {ledger}"
+    assert!(
+        redirected.contains(&format!("url = \"{HOSTED_URL}\"")),
+        "the package unit gains the hosted url: {redirected}"
     );
+    assert!(
+        redirected.contains(&format!(
+            "\"urllib3 1.26.18\" = [{{ file = \"urllib3-1.26.18-py2.py3-none-any.whl\", \
+             hash = \"sha256:{}\" }}]",
+            sha256()
+        )),
+        "the [metadata.files] entry pins the patched wheel: {redirected}"
+    );
+    assert_no_ledger(tmp.path());
     assert_manifestless_vex(tmp.path(), LOCK_LEGACY);
 
     // rollback restores both fragments byte for byte.
-    let code = rollback::run(RollbackArgs {
-        targets: Vec::new(),
-        common: global(tmp.path(), server.uri()),
-        one_off: false,
-        preserve_state: false,
-    })
-    .await;
+    let code = rollback_hosted(tmp.path(), &server).await;
     assert_eq!(code, 0);
     assert_eq!(read(&lock_path), LOCK_LEGACY, "byte-identical revert");
 }
 
 /// `pdm lock` un-patches the lock (registry source restored) and — this is the
 /// PDM-specific hazard — can reflow its line endings (CRLF → LF). The re-scan
-/// must rebase the ledger onto the relocked bytes, adopting the fresh
-/// `original`, so `rollback` lands on the RELOCKED lock rather than restoring a
-/// stale CRLF fragment into an LF file. Appending instead would leave a chain
-/// whose older link matches nothing and make rollback refuse.
+/// plans from the relocked bytes (v5 keeps no ledger to rebase), and
+/// `rollback` lands on the RELOCKED lock: the upstream entry re-resolved in
+/// the file's current (LF) line endings, never a stale CRLF fragment.
 #[tokio::test]
 #[serial]
 async fn relock_reflow_then_rescan_keeps_rollback_invertible() {
@@ -510,45 +565,28 @@ async fn assert_relock_roundtrip(lock: &str, relocked: &str) {
     assert_eq!(run(hosted_args(tmp.path(), server.uri(), None)).await, 0);
     let redirected = read(&lock_path);
     assert!(redirected.contains(HOSTED_URL));
-    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
-    let before: serde_json::Value = serde_json::from_str(&read(&ledger_path)).unwrap();
-    let n_edits = before["edits"].as_array().unwrap().len();
+    assert_no_ledger(tmp.path());
 
     // The user runs `pdm lock`: the patch is gone and the file is LF now.
     assert!(!relocked.contains(HOSTED_URL), "relock un-patches the lock");
     std::fs::write(&lock_path, relocked).unwrap();
 
-    // Re-scan re-applies and rebases the ledger (no appended chain).
+    // Re-scan re-applies from the relocked bytes.
     assert_eq!(run(hosted_args(tmp.path(), server.uri(), None)).await, 0);
     let rescanned = read(&lock_path);
     assert!(rescanned.contains(HOSTED_URL), "the re-scan re-redirects");
-    let after: serde_json::Value = serde_json::from_str(&read(&ledger_path)).unwrap();
-    let edits = after["edits"].as_array().unwrap();
-    assert_eq!(edits.len(), n_edits, "rebased, not appended: {after}");
-    for edit in edits {
-        let original = edit["original"].as_str().unwrap();
-        assert!(
-            !original.contains(HOSTED_URL),
-            "originals describe the relocked registry lock: {original}"
-        );
-        assert!(
-            rescanned.contains(edit["new"].as_str().unwrap()),
-            "new fragments describe the current lock: {after}"
-        );
-    }
-    // The rebased ledger + re-redirected (relocked) lock attest; reverting
-    // to the relocked registry lock unwires it.
+    assert!(
+        !rescanned.contains('\r'),
+        "the re-scan keeps the relocked LF line endings"
+    );
+    assert_no_ledger(tmp.path());
+    // The re-redirected (relocked) lock attests; reverting to the relocked
+    // registry lock unwires it.
     assert_manifestless_vex(tmp.path(), relocked);
 
     // rollback lands on the relocked (LF, registry) lock — the user's `pdm
     // lock` is preserved, only the Socket patch is unwound.
-    let code = rollback::run(RollbackArgs {
-        targets: Vec::new(),
-        common: global(tmp.path(), server.uri()),
-        one_off: false,
-        preserve_state: false,
-    })
-    .await;
+    let code = rollback_hosted(tmp.path(), &server).await;
     assert_eq!(code, 0, "rollback after relock + re-scan must succeed");
     assert_eq!(
         read(&lock_path),

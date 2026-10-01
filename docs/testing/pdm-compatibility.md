@@ -36,9 +36,10 @@ span-based edits, and produces byte-exact fragments for replay. The
 
 Both modes retain the package version, extras, groups, markers and the
 `content_hash`; no `pyproject.toml` edit is required. A repeated scan leaves the
-lock unchanged (idempotent). Rollback restores the recorded original
-fragments — one per patch, plus the legacy integrity-table entry — so a
-`pdm.lock` the tool rewrote returns byte-for-byte to its pre-scan state.
+lock unchanged (idempotent). Vendored rollback restores recorded fragments.
+Hosted rollback reconstructs
+upstream entries from registry metadata and may refuse after incompatible relocks;
+it does not keep the original lockfile bytes.
 Refused before any write: a `[[package]]` locked at several versions (a marker
 fork), a user-authored `url`/`path`/VCS/`editable` source, an unsupported
 `lock_version` or `strategy`, hash-less `files`, malformed hashes, and a wheel
@@ -61,11 +62,10 @@ Measured details:
   `pdm lock --refresh` and `pdm update <pkg>` re-resolve the entry back to the
   registry source. `content_hash` is unchanged by that, so `pdm lock --check`
   cannot detect the loss: re-run `socket-patch scan --mode …` after any of them,
-  or gate CI on `socket-patch vex`. A re-scan after a relock re-applies the
-  patch and **rebases** the ledger's recorded edits onto the relocked text
-  (pristine → current, never an appended chain), so `rollback` still lands on the
-  pristine lock afterwards. This matters most for CRLF locks, which PDM
-  re-renders to a different byte layout on relock.
+  or gate CI on `socket-patch vex`. Re-scan after a relock to restore patch references.
+  Vendored state records
+  reversible edits; hosted state is the lock itself, and reversal resolves
+  upstream metadata.
 - **Hosted mode verifies the lock's file hash** on install for every supported
   release (tamper the hash and `pdm sync` fails closed). Vendored mode's
   protection is the committed wheel bytes, verified by the same hash.
@@ -105,45 +105,11 @@ the patched `urllib3/response.py` (git-blob SHA-256 matches the ledger
 `afterHash`), ordinary `pdm install` keeps the lock stable, a tampered hash is
 rejected, a relock-then-rescan keeps rollback invertible, and rollback restores
 the lock and `pyproject.toml` byte for byte. `.github/workflows/pdm-compatibility.yml`
-runs it on Linux, Windows and macOS across every PDM major family. The matrix
-needs no Socket API token (the `urllib3@1.26.18` patch is a free tier).
+runs it on Linux and macOS across every PDM major family. It does not run on
+Windows: the harness bootstraps PDM through a POSIX venv layout (`bin/pdm`), so
+every Windows cell used to skip, and a run whose cells all skip or whose PDM
+bootstrap fails is now an error. The matrix needs no Socket API token (the
+`urllib3@1.26.18` patch is a free tier).
 
-> **Note (v5.0):** the "refused vendored scan still writes a `.socket/manifest.json`
-> record" observation in the notes column below describes the 4.0.0 binary the run
-> was captured with. Vendored mode is manifest-free since v5.0 — `scan --mode vendored`
-> never writes `.socket/manifest.json` — so the note disappears on the next regeneration.
-
-<!-- GENERATED:BEGIN — printed by `python3 scripts/backtest-pdm.py --render-doc-table docs/testing/pdm-compatibility/results.json`;
-     regenerate after a matrix run instead of editing by hand. -->
-
-Run captured 2026-09-18 on macOS-26.6.2-arm64-arm-64bit-Mach-O with socket-patch `socket-patch 4.0.0` (source `fixed2`, binary sha256 `b7ac2064ae2a466ab2d2bd74447ba1ae1f47b94943eab9a4310012fc253cac38`), 25 PDM releases, shapes: direct, transitive, dev, optional, extras, marker, marker-excluded, platform-linux, platform-windows, crlf, static-urls, space-unicode, dependency-groups, multi-target, two-versions, custom-lockfile, pep582.
-
-| PDM | Python | lock_version | hosted | vendored | agent | tamper rejected (H/V) | `pdm install` keeps lock (H/V) | relock keeps patch (H/V) | notes |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0.8.7 | 3.8 | — | refused (11 shapes) | 10/11 (11 shapes) | 7/8 (8 shapes) | n/a / n/a | n/a / n/a | n/a / n/a | lock_version absent unsupported: refused before any write, native install intact; `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); agent mode on a `__pypackages__` project patched the PATH interpreter's site-packages; refused vendored scan still writes a `.socket/manifest.json` record; lock-only checkout (nothing installed) is not redirected |
-| 0.12.3 | 3.8 | 2 | pass (12 shapes) | 11/12 (12 shapes) | 8/9 (9 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); agent mode on a `__pypackages__` project patched the PATH interpreter's site-packages; relock dropped urllib3 1.26.18 (`transitive`: pinned resolution, no overrides on this release); re-scan then has nothing to redirect and rollback of the stale ledger exits 0/1; `pdm install` re-locked (extras,marker,marker-excluded,platform-linux,platform-windows): PDM's own freshness check flags its freshly generated lock as stale; patched install afterwards=false/true; use `pdm sync` |
-| 1.0.0 | 3.8 | 2 | pass (12 shapes) | 11/12 (12 shapes) | 8/9 (9 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); agent mode on a `__pypackages__` project patched the PATH interpreter's site-packages; relock dropped urllib3 1.26.18 (`transitive`: pinned resolution, no overrides on this release); re-scan then has nothing to redirect and rollback of the stale ledger exits 0/1 |
-| 1.4.5 | 3.8 | 2 | pass (12 shapes) | 11/12 (12 shapes) | 8/9 (9 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); agent mode on a `__pypackages__` project patched the PATH interpreter's site-packages; relock dropped urllib3 1.26.18 (`transitive`: pinned resolution, no overrides on this release); re-scan then has nothing to redirect and rollback of the stale ledger exits 0/1 |
-| 1.8.5 | 3.8 | 3.1 | refused (11 shapes) | 10/11 (11 shapes) | 7/8 (8 shapes) | n/a / n/a | n/a / n/a | n/a / n/a | lock_version 3.1 unsupported: refused before any write, native install intact; `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); agent mode on a `__pypackages__` project patched the PATH interpreter's site-packages; refused vendored scan still writes a `.socket/manifest.json` record; lock-only checkout (nothing installed) is not redirected |
-| 1.12.8 | 3.8 | 3.1 | refused (12 shapes) | 11/12 (12 shapes) | 8/9 (9 shapes) | n/a / n/a | n/a / n/a | n/a / n/a | lock_version 3.1 unsupported: refused before any write, native install intact; `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); agent mode on a `__pypackages__` project patched the PATH interpreter's site-packages; refused vendored scan still writes a `.socket/manifest.json` record; lock-only checkout (nothing installed) is not redirected |
-| 1.15.5 | 3.8 | 3.1 | refused (12 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | n/a / n/a | n/a / n/a | n/a / n/a | lock_version 3.1 unsupported: refused before any write, native install intact; `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record; lock-only checkout (nothing installed) is not redirected |
-| 2.0.3 | 3.11 | 4.0 | refused (12 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | n/a / n/a | n/a / n/a | n/a / n/a | lock_version 4.0 unsupported: refused before any write, native install intact; `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record; lock-only checkout (nothing installed) is not redirected |
-| 2.1.5 | 3.11 | 4.0 | refused (12 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | n/a / n/a | n/a / n/a | n/a / n/a | lock_version 4.0 unsupported: refused before any write, native install intact; `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record; lock-only checkout (nothing installed) is not redirected |
-| 2.2.1 | 3.11 | 4.0 | refused (12 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | n/a / n/a | n/a / n/a | n/a / n/a | lock_version 4.0 unsupported: refused before any write, native install intact; `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record; lock-only checkout (nothing installed) is not redirected |
-| 2.3.4 | 3.11 | 4.1 | refused (12 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | n/a / n/a | n/a / n/a | n/a / n/a | lock_version 4.1 unsupported: refused before any write, native install intact; `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record; lock-only checkout (nothing installed) is not redirected |
-| 2.6.1 | 3.11 | 4.2 | refused (12 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | n/a / n/a | n/a / n/a | n/a / n/a | lock_version 4.2 unsupported: refused before any write, native install intact; `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record; lock-only checkout (nothing installed) is not redirected |
-| 2.7.4 | 3.11 | 4.2 | refused (12 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | n/a / n/a | n/a / n/a | n/a / n/a | lock_version 4.2 unsupported: refused before any write, native install intact; `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record; lock-only checkout (nothing installed) is not redirected |
-| 2.8.2 | 3.11 | 4.3 | pass (13 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record |
-| 2.9.3 | 3.11 | 4.3 | pass (13 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); agent mode on a `__pypackages__` project patched the PATH interpreter's site-packages; refused vendored scan still writes a `.socket/manifest.json` record |
-| 2.10.4 | 3.11 | 4.4 | pass (13 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record |
-| 2.11.2 | 3.11 | 4.4.1 | pass (14 shapes) | 13/14 (14 shapes) | 9/10 (10 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record |
-| 2.12.4 | 3.11 | 4.4.1 | pass (14 shapes) | 13/14 (14 shapes) | 9/10 (10 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record |
-| 2.15.4 | 3.11 | 4.4.1 | pass (14 shapes) | 13/14 (14 shapes) | 9/10 (10 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record |
-| 2.17.3 | 3.11 | 4.5.0 | pass (16 shapes) | 15/16 (16 shapes) | 10/11 (11 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record |
-| 2.20.1 | 3.11 | 4.5.0 | pass (17 shapes) | 16/17 (17 shapes) | 11/12 (12 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record |
-| 2.22.4 | 3.12 | — | n/a | n/a | n/a | n/a / n/a | n/a / n/a | n/a / n/a | lock_version absent |
-| 2.25.9 | 3.12 | — | n/a | n/a | n/a | n/a / n/a | n/a / n/a | n/a / n/a | lock_version absent |
-| 2.27.0 | 3.13 | 4.5.0 | pass (17 shapes) | 16/17 (17 shapes) | 11/12 (12 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record |
-| 2.29.2 | 3.13 | 4.5.1 | pass (17 shapes) | 16/17 (17 shapes) | 11/12 (12 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record |
-
-<!-- GENERATED:END -->
+Full run results belong with the source revision and toolchain versions in CI
+artifacts or a local output directory. See the [testing guide](README.md#ci-and-results).

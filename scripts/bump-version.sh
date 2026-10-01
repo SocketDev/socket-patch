@@ -7,7 +7,7 @@
 # scripts/release-lint.sh, run by CI on the bump PR and again by the `version`
 # job in release.yml), so this script is the intended way to start a release:
 #
-#   scripts/bump-version.sh 3.4.0 --pr
+#   scripts/bump-version.sh 5.0.0 --pr
 #
 # or dispatch the "Version Bump" workflow (.github/workflows/version-bump.yml),
 # which runs this script on a fresh checkout of main. Running it locally is
@@ -147,7 +147,7 @@ ${NOTES}
 
 1. Dispatch the **Release** workflow on the default branch (optionally with
    \`dry-run: true\` first). It builds all targets, tags \`v${VERSION}\`, creates
-   the GitHub release, and publishes every ecosystem package.
+   the GitHub release, and publishes the crates.io and npm packages.
 2. Approve the staged npm versions with 2FA — platform packages first, then
    \`@socketsecurity/socket-patch\` (link in the run's step summary).
 3. On a partial failure: fix the cause and use "Re-run failed jobs" on the

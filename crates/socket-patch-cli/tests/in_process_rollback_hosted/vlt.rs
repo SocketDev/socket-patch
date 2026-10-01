@@ -2,20 +2,51 @@
 //! then `rollback` / `remove` restoring the registry pins slot by slot
 //! (after vlt re-laid the line) and invalidating the patched installed
 //! copies so the next install extracts the registry bytes.
+//!
+//! v5 hosted mode keeps no ledger: the pins are read from `vlt-lock.json`
+//! (on the mock server's origin, recognized through `--patch-server-url`)
+//! and each is restored to the upstream registry entry re-resolved from the
+//! mock npm registry (`SOCKET_NPM_REGISTRY`).
 
 use std::path::Path;
 
 use serde_json::Value;
-use wiremock::MockServer;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::vlt_hosted_common::*;
 
 const RESTORED: &str = "restored registry pins for 1 packages; removed the patched installed \
      copies, so node_modules is incomplete until you run `vlt install` (or `vlt ci`)";
 
+/// Serve the npm registry's version document for left-pad@1.3.0 (the
+/// registry entry `registry_node` pins) under `/npm-registry`.
+async fn mock_registry(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path(format!("/npm-registry/{NAME}/{VERSION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": NAME,
+            "version": VERSION,
+            "dist": { "tarball": REGISTRY_URL, "integrity": UPSTREAM_SHA512 }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// The node line the upstream restore writes back for `id`: slot [2] is the
+/// registry's `dist.integrity`, and — this lock recording no
+/// `options.registries` and no other default-registry node to read the
+/// convention from — a tilde-era node gets no resolved URL (slot [3]), per
+/// the restore's documented convention. (The URL `registry_node` carries is
+/// what the rewrite discarded; it is not derivable from the lock.)
+fn restored_node(id: &str) -> String {
+    format!("\"{id}\": [0,\"{NAME}\",\"{UPSTREAM_SHA512}\"]")
+}
+
 async fn hosted_vlt_project(root: &Path) -> MockServer {
     let server = MockServer::start().await;
     mock_all(&server).await;
+    mock_registry(&server).await;
     write_vlt_project(root, Era::V1);
     let (_, doc) = scan_hosted(root, &server, &[], &[]);
     assert_eq!(redirected(&doc), 1, "{doc:#}");
@@ -23,6 +54,7 @@ async fn hosted_vlt_project(root: &Path) -> MockServer {
         read(root, "vlt-lock.json"),
         vlt_lock(Era::V1, &[pinned_node(TILDE_ID, &server)])
     );
+    assert!(!ledger_path(root).exists(), "hosted mode keeps no ledger");
     server
 }
 
@@ -33,12 +65,25 @@ fn vlt_install_patched(root: &Path, server: &MockServer) {
     write_hidden_lock(root, &[pinned_node(TILDE_ID, server)]);
 }
 
-fn run_verb(root: &Path, verb: &str, extra: &[&str]) -> (i32, Value) {
+/// `<verb> [extra] --yes --json` online against `server` (registry +
+/// patch host); `(exit code, envelope, stderr)`.
+fn run_verb_raw(
+    root: &Path,
+    server: &MockServer,
+    verb: &str,
+    extra: &[&str],
+) -> (i32, Value, String) {
     let cwd = root.to_str().unwrap().to_string();
+    let uri = server.uri();
+    let registry = format!("{uri}/npm-registry");
     let mut args = vec![verb];
     args.extend_from_slice(extra);
-    args.extend_from_slice(&["--yes", "--offline", "--cwd", &cwd]);
-    let (code, doc, stderr) = run_json(root, &args, &[]);
+    args.extend_from_slice(&["--yes", "--patch-server-url", &uri, "--cwd", &cwd]);
+    run_json(root, &args, &[("SOCKET_NPM_REGISTRY", registry.as_str())])
+}
+
+fn run_verb(root: &Path, server: &MockServer, verb: &str, extra: &[&str]) -> (i32, Value) {
+    let (code, doc, stderr) = run_verb_raw(root, server, verb, extra);
     assert_eq!(code, 0, "{verb} must succeed: {doc:#}\n{stderr}");
     (code, doc)
 }
@@ -58,22 +103,23 @@ async fn vlt_hosted_round_trip() {
     for scoped in [true, false] {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let pristine = vlt_lock(Era::V1, &[registry_node(TILDE_ID)]);
+        let pristine = vlt_lock(Era::V1, &[restored_node(TILDE_ID)]);
         let server = hosted_vlt_project(root).await;
         vlt_install_patched(root, &server);
 
         let targets: &[&str] = if scoped { &[PURL] } else { &[] };
-        let (_, doc) = run_verb(root, "rollback", targets);
+        let (_, doc) = run_verb(root, &server, "rollback", targets);
 
         assert_eq!(read(root, "vlt-lock.json"), pristine, "scoped={scoped}");
+        assert_eq!(
+            doc["hosted"]["reverted"],
+            serde_json::json!([PURL]),
+            "{doc:#}"
+        );
         assert_eq!(advisory_details(&doc), [RESTORED], "{doc:#}");
         assert!(!store_dir(root, TILDE_ID).exists());
         assert!(!root.join("node_modules/.vlt-lock.json").exists());
-        assert!(
-            !ledger_path(root).exists()
-                || !read(root, ".socket/vendor/redirect-state.json")
-                    .contains("redirect_vlt_lock_node")
-        );
+        assert!(!ledger_path(root).exists());
     }
 }
 
@@ -84,31 +130,49 @@ async fn vlt_hosted_remove_restores_and_emits_the_advisory() {
     let server = hosted_vlt_project(root).await;
     vlt_install_patched(root, &server);
 
-    let (_, doc) = run_verb(root, "remove", &[PURL]);
+    let (_, doc) = run_verb(root, &server, "remove", &[PURL]);
 
     assert_eq!(
         read(root, "vlt-lock.json"),
-        vlt_lock(Era::V1, &[registry_node(TILDE_ID)])
+        vlt_lock(Era::V1, &[restored_node(TILDE_ID)])
     );
     assert!(doc.to_string().contains(ADVISORY), "{doc:#}");
     assert!(!store_dir(root, TILDE_ID).exists());
 }
 
+/// Once vlt itself re-locked the package back onto the registry (a `vlt
+/// update`, or a relock to another version, optional or not), no lockfile
+/// pins a hosted patch any more — and v5 hosted mode keeps no ledger that
+/// could remember the patched store copy. Rollback therefore has no hosted
+/// state to act on: the plain "Manifest not found" exit 1, the lock and the
+/// installed copies untouched (`vlt install` / `vlt ci` owns the store).
 #[tokio::test]
-async fn vlt_rollback_after_vlt_update_invalidates_patched_store() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    let _server = hosted_vlt_project(root).await;
-    let registry = vlt_lock(Era::V1, &[registry_node(TILDE_ID)]);
-    std::fs::write(root.join("vlt-lock.json"), &registry).unwrap();
-    install_store(root, TILDE_ID, PATCHED);
-    write_hidden_lock(root, &[registry_node(TILDE_ID)]);
+async fn vlt_rollback_after_a_relock_has_no_hosted_state_left() {
+    for (flags, version) in [(0, "1.3.0"), (0, "1.3.1"), (1, "1.3.1")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let server = hosted_vlt_project(root).await;
+        let relocked = vlt_lock(
+            Era::V1,
+            &[with_flags(&registry_node(TILDE_ID), flags).replace("1.3.0", version)],
+        );
+        std::fs::write(root.join("vlt-lock.json"), &relocked).unwrap();
+        install_store(root, TILDE_ID, PATCHED);
+        write_hidden_lock(root, &[registry_node(TILDE_ID)]);
 
-    let (_, doc) = run_verb(root, "rollback", &[]);
+        let (code, doc, stderr) = run_verb_raw(root, &server, "rollback", &[]);
 
-    assert_eq!(read(root, "vlt-lock.json"), registry);
-    assert_eq!(advisory_details(&doc), [RESTORED], "{doc:#}");
-    assert!(!store_dir(root, TILDE_ID).exists());
+        let what = format!("flags={flags} version={version}");
+        assert_eq!(code, 1, "{what}: {doc:#}\n{stderr}");
+        assert_eq!(doc["error"], "Manifest not found", "{what}: {doc:#}");
+        assert_eq!(read(root, "vlt-lock.json"), relocked, "{what}");
+        assert!(
+            store_dir(root, TILDE_ID).join("index.js").exists(),
+            "{what}"
+        );
+        assert!(root.join("node_modules/.vlt-lock.json").exists(), "{what}");
+        assert!(!root.join(".socket").exists(), "{what}");
+    }
 }
 
 #[tokio::test]
@@ -123,11 +187,11 @@ async fn vlt_rollback_after_comma_move() {
     )
     .unwrap();
 
-    let (_, doc) = run_verb(root, "rollback", &[PURL]);
+    let (_, doc) = run_verb(root, &server, "rollback", &[PURL]);
 
     assert_eq!(
         read(root, "vlt-lock.json"),
-        vlt_lock(Era::V1, &[registry_node(TILDE_ID), sibling])
+        vlt_lock(Era::V1, &[restored_node(TILDE_ID), sibling])
     );
     assert!(
         advisory_details(&doc).is_empty(),
@@ -143,13 +207,13 @@ async fn vlt_rollback_after_e0_flag_change() {
     let relaid = pinned_node(TILDE_ID, &server).replacen("[0,", "[1,", 1);
     std::fs::write(root.join("vlt-lock.json"), vlt_lock(Era::V1, &[relaid])).unwrap();
 
-    run_verb(root, "rollback", &[]);
+    run_verb(root, &server, "rollback", &[]);
 
     assert_eq!(
         read(root, "vlt-lock.json"),
         vlt_lock(
             Era::V1,
-            &[registry_node(TILDE_ID).replacen("[0,", "[1,", 1)]
+            &[restored_node(TILDE_ID).replacen("[0,", "[1,", 1)]
         )
     );
 }
@@ -161,7 +225,7 @@ async fn vlt_rollback_honors_no_vlt_install_cleanup() {
     let server = hosted_vlt_project(root).await;
     vlt_install_patched(root, &server);
 
-    let (_, doc) = run_verb(root, "rollback", &["--no-vlt-install-cleanup"]);
+    let (_, doc) = run_verb(root, &server, "rollback", &["--no-vlt-install-cleanup"]);
 
     assert_eq!(
         advisory_details(&doc),
@@ -179,11 +243,11 @@ async fn vlt_rollback_honors_no_vlt_install_cleanup() {
 async fn vlt_rollback_of_a_pristine_tree_keeps_it() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let _server = hosted_vlt_project(root).await;
+    let server = hosted_vlt_project(root).await;
     install_store(root, TILDE_ID, PRISTINE);
     write_hidden_lock(root, &[registry_node(TILDE_ID)]);
 
-    let (_, doc) = run_verb(root, "rollback", &[]);
+    let (_, doc) = run_verb(root, &server, "rollback", &[]);
 
     assert!(advisory_details(&doc).is_empty(), "{doc:#}");
     assert!(store_dir(root, TILDE_ID).join("index.js").exists());
@@ -201,6 +265,7 @@ async fn hosted_optional_project(root: &Path, flags: u8) -> MockServer {
 async fn hosted_flagged_project(root: &Path, nodes: &[(&str, u8)]) -> MockServer {
     let server = MockServer::start().await;
     mock_all(&server).await;
+    mock_registry(&server).await;
     write_vlt_project(root, Era::V1);
     let registry: Vec<String> = nodes
         .iter()
@@ -233,14 +298,14 @@ async fn vlt_rollback_keeps_a_patched_optional_copy() {
     for (verb, flags) in [("rollback", 1), ("rollback", 3), ("remove", 1)] {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let _server = hosted_optional_project(root, flags).await;
+        let server = hosted_optional_project(root, flags).await;
         let targets: &[&str] = if verb == "remove" { &[PURL] } else { &[] };
 
-        let (_, doc) = run_verb(root, verb, targets);
+        let (_, doc) = run_verb(root, &server, verb, targets);
 
         assert_eq!(
             read(root, "vlt-lock.json"),
-            vlt_lock(Era::V1, &[with_flags(&registry_node(TILDE_ID), flags)]),
+            vlt_lock(Era::V1, &[with_flags(&restored_node(TILDE_ID), flags)]),
             "{verb} flags={flags}"
         );
         assert_eq!(
@@ -279,18 +344,18 @@ async fn vlt_rollback_removes_the_prod_copy_keeps_the_optional_one() {
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let _server = hosted_flagged_project(root, &nodes).await;
+        let server = hosted_flagged_project(root, &nodes).await;
         let expected = if cleaned { &removed } else { &skipped };
 
-        let (_, doc) = run_verb(root, verb, extra);
+        let (_, doc) = run_verb(root, &server, verb, extra);
 
         assert_eq!(
             read(root, "vlt-lock.json"),
             vlt_lock(
                 Era::V1,
                 &[
-                    registry_node(TILDE_ID),
-                    with_flags(&registry_node(optional), 1)
+                    restored_node(TILDE_ID),
+                    with_flags(&restored_node(optional), 1)
                 ]
             ),
             "{verb} {extra:?}"
@@ -318,64 +383,18 @@ async fn vlt_rollback_removes_the_prod_copy_keeps_the_optional_one() {
     }
 }
 
-/// Once vlt re-locked the package, the healed DepID is gone from the lock,
-/// so the heal goes by the flags the ledger recorded for it.
-#[tokio::test]
-async fn vlt_rollback_after_relock_goes_by_the_recorded_flags() {
-    for flags in [0, 1] {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let _server = hosted_optional_project(root, flags).await;
-        let relocked = vlt_lock(
-            Era::V1,
-            &[with_flags(&registry_node(TILDE_ID), flags).replace("1.3.0", "1.3.1")],
-        );
-        std::fs::write(root.join("vlt-lock.json"), &relocked).unwrap();
-        write_hidden_lock(root, &[]);
-
-        let (_, doc) = run_verb(root, "rollback", &[]);
-
-        assert_eq!(read(root, "vlt-lock.json"), relocked);
-        let (advisory, kept) = if flags == 0 {
-            (RESTORED.to_string(), false)
-        } else {
-            (optional_kept(1, 1), true)
-        };
-        assert_eq!(advisory_details(&doc), [advisory], "flags={flags}: {doc:#}");
-        assert_eq!(
-            store_dir(root, TILDE_ID).join("index.js").exists(),
-            kept,
-            "flags={flags}"
-        );
-    }
-}
-
 const OTHER: &str = "right-pad";
 const OTHER_UUID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const OTHER_PURL: &str = "pkg:npm/right-pad@1.3.0";
 
 fn as_other(text: &str) -> String {
     text.replace(NAME, OTHER).replace(UUID, OTHER_UUID)
 }
 
-/// Add a second hosted vlt package to the ledger and the lock by renaming
-/// left-pad's recorded edit, record and pinned node.
+/// Add a second hosted vlt package (right-pad, its own patch uuid) to the
+/// lock by renaming left-pad's pinned node. The lock pin is the whole
+/// hosted state; the mock registry does NOT serve right-pad.
 fn add_second_hosted_package(root: &Path, server: &MockServer) -> String {
-    let path = ledger_path(root);
-    let mut ledger: Value = serde_json::from_str(&read(root, ".socket/vendor/redirect-state.json"))
-        .expect("the hosted run wrote a ledger");
-    let edits: Vec<Value> = ledger["edits"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|e| e["kind"] == "redirect_vlt_lock_node")
-        .map(|e| serde_json::from_str(&as_other(&e.to_string())).unwrap())
-        .collect();
-    assert_eq!(edits.len(), 1);
-    ledger["edits"].as_array_mut().unwrap().extend(edits);
-    let record: Value =
-        serde_json::from_str(&as_other(&ledger["records"][PURL].to_string())).unwrap();
-    ledger["records"][as_other(PURL)] = record;
-    std::fs::write(&path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
     let other_pinned = as_other(&pinned_node(TILDE_ID, server));
     std::fs::write(
         root.join("vlt-lock.json"),
@@ -395,15 +414,13 @@ fn other_store_dir(root: &Path) -> std::path::PathBuf {
         .join(OTHER)
 }
 
-/// A scoped rollback of one of two hosted vlt packages takes the per-purl
-/// path (not a whole-ledger replay): only that package's pin is restored
-/// and only its patched store entry (plus the hidden lock) is removed.
-#[tokio::test]
-async fn vlt_scoped_rollback_of_one_of_two_heals_only_that_package() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    let server = hosted_vlt_project(root).await;
-    let other_pinned = add_second_hosted_package(root, &server);
+/// Both packages installed patched, with the hidden lock recording both
+/// pins.
+fn install_both_patched(
+    root: &Path,
+    server: &MockServer,
+    other_pinned: &str,
+) -> std::path::PathBuf {
     install_store(root, TILDE_ID, PATCHED);
     let other = other_store_dir(root);
     std::fs::create_dir_all(&other).unwrap();
@@ -415,14 +432,32 @@ async fn vlt_scoped_rollback_of_one_of_two_heals_only_that_package() {
     std::fs::write(other.join("index.js"), PATCHED).unwrap();
     write_hidden_lock(
         root,
-        &[pinned_node(TILDE_ID, &server), other_pinned.clone()],
+        &[pinned_node(TILDE_ID, server), other_pinned.to_string()],
     );
+    other
+}
 
-    let (_, doc) = run_verb(root, "rollback", &[PURL]);
+/// A scoped rollback of one of two hosted vlt packages restores only that
+/// package's pin and removes only its patched store entry (plus the hidden
+/// lock); the other package stays pinned and installed.
+#[tokio::test]
+async fn vlt_scoped_rollback_of_one_of_two_heals_only_that_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let server = hosted_vlt_project(root).await;
+    let other_pinned = add_second_hosted_package(root, &server);
+    let other = install_both_patched(root, &server, &other_pinned);
+
+    let (_, doc) = run_verb(root, &server, "rollback", &[PURL]);
 
     assert_eq!(
         read(root, "vlt-lock.json"),
-        vlt_lock(Era::V1, &[registry_node(TILDE_ID), other_pinned])
+        vlt_lock(Era::V1, &[restored_node(TILDE_ID), other_pinned])
+    );
+    assert_eq!(
+        doc["hosted"]["reverted"],
+        serde_json::json!([PURL]),
+        "{doc:#}"
     );
     assert_eq!(advisory_details(&doc), [RESTORED], "{doc:#}");
     assert!(!store_dir(root, TILDE_ID).exists());
@@ -431,22 +466,20 @@ async fn vlt_scoped_rollback_of_one_of_two_heals_only_that_package() {
         other.join("index.js").exists(),
         "the other package's copy stays"
     );
-    let ledger = read(root, ".socket/vendor/redirect-state.json");
-    assert!(ledger.contains(OTHER_UUID), "{ledger}");
 }
 
-/// Hosted rollback reads `vlt-lock.json` before any revert (to find the
-/// store copies to heal). A FIFO planted at that path must fail the read at
-/// once through the FIFO-safe opener, never block the process in open(2)
-/// waiting for a writer, and the rollback then fails closed: the ledger
-/// keeps the record and the FIFO is left as it was.
+/// Hosted rollback reads `vlt-lock.json` (to find the pins and the store
+/// copies to heal). A FIFO planted at that path must fail the read at once
+/// through the FIFO-safe opener, never block the process in open(2)
+/// waiting for a writer; the run then fails closed and the FIFO is left as
+/// it was.
 #[cfg(unix)]
 #[tokio::test]
 async fn vlt_hosted_rollback_fails_fast_on_a_fifo_lock() {
     use std::os::unix::fs::FileTypeExt as _;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let _server = hosted_vlt_project(root).await;
+    let server = hosted_vlt_project(root).await;
     let lock = root.join("vlt-lock.json");
     std::fs::remove_file(&lock).unwrap();
     let status = std::process::Command::new("mkfifo")
@@ -454,11 +487,20 @@ async fn vlt_hosted_rollback_fails_fast_on_a_fifo_lock() {
         .status()
         .unwrap();
     assert!(status.success());
-    let ledger_before = read(root, ".socket/vendor/redirect-state.json");
 
     let cwd = root.to_str().unwrap().to_string();
+    let uri = server.uri();
     let mut child = scrubbed_cli()
-        .args(["rollback", "--json", "--yes", "--offline", "--cwd", &cwd])
+        .env("SOCKET_NPM_REGISTRY", format!("{uri}/npm-registry"))
+        .args([
+            "rollback",
+            "--json",
+            "--yes",
+            "--patch-server-url",
+            &uri,
+            "--cwd",
+            &cwd,
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -486,50 +528,48 @@ async fn vlt_hosted_rollback_fails_fast_on_a_fifo_lock() {
         .unwrap()
         .file_type()
         .is_fifo());
-    assert_eq!(
-        read(root, ".socket/vendor/redirect-state.json"),
-        ledger_before,
-        "nothing is half-reverted"
-    );
+    assert!(!ledger_path(root).exists(), "nothing is written");
 }
 
-/// Replay groups commit on their own: when an unscoped rollback's
-/// package-lock.json group refuses (drifted since the redirect) while the
-/// vlt group restores the registry pins, the patched store copy the
-/// restored vlt-lock.json no longer names is still removed. The heal keys
-/// off the vlt group's own outcome, not off any group's refusal.
+/// Each pin restores or refuses on its own: when an unscoped rollback's
+/// right-pad pin is refused (the registry does not answer for it) while
+/// the left-pad pin is restored, left-pad's patched store copy — which the
+/// restored vlt-lock.json no longer names — is still removed. The heal
+/// follows the restored pins, not the run's overall outcome.
 #[tokio::test]
-async fn vlt_heal_follows_the_vlt_group_when_another_group_refuses() {
+async fn vlt_heal_follows_the_restored_pin_when_another_pin_refuses() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let server = MockServer::start().await;
-    mock_all(&server).await;
-    write_vlt_project(root, Era::V1);
-    std::fs::write(root.join("package-lock.json"), package_lock()).unwrap();
-    let (_, doc) = scan_hosted(root, &server, &["--no-npm-allow-remote-config"], &[]);
-    assert_eq!(redirected(&doc), 1, "the scan redirects both locks");
-    vlt_install_patched(root, &server);
-    let drifted = read(root, "package-lock.json")
-        .replace(&artifact_url(&server), "https://example.invalid/left-pad-1.3.0.tgz");
-    std::fs::write(root.join("package-lock.json"), &drifted).unwrap();
+    let server = hosted_vlt_project(root).await;
+    let other_pinned = add_second_hosted_package(root, &server);
+    let other = install_both_patched(root, &server, &other_pinned);
 
-    let cwd = root.to_str().unwrap().to_string();
-    let (code, doc, _) = run_json(
-        root,
-        &["rollback", "--yes", "--offline", "--cwd", &cwd],
-        &[],
+    let (code, doc, _) = run_verb_raw(root, &server, "rollback", &[]);
+
+    assert_ne!(code, 0, "the refused right-pad pin fails the run");
+    assert_eq!(doc["status"], "partial_failure", "{doc:#}");
+    assert_eq!(
+        doc["hosted"]["reverted"],
+        serde_json::json!([PURL]),
+        "{doc:#}"
     );
-
-    assert_ne!(code, 0, "the refused package-lock.json group fails the run");
+    assert_eq!(doc["hosted"]["failed"][0]["purl"], OTHER_PURL, "{doc:#}");
     assert_eq!(
         read(root, "vlt-lock.json"),
-        vlt_lock(Era::V1, &[registry_node(TILDE_ID)]),
-        "the vlt group restored the registry pins"
+        vlt_lock(Era::V1, &[restored_node(TILDE_ID), other_pinned]),
+        "left-pad restored, the refused right-pad pin untouched"
     );
-    assert_eq!(read(root, "package-lock.json"), drifted, "the refused group wrote nothing");
     assert!(
         !store_dir(root, TILDE_ID).exists(),
-        "the patched store copy is removed for the restored pins"
+        "the patched store copy is removed for the restored pin"
     );
-    assert_eq!(advisory_details(&doc), [RESTORED], "the heal advisory is reported");
+    assert!(
+        other.join("index.js").exists(),
+        "the refused package's copy stays"
+    );
+    assert_eq!(
+        advisory_details(&doc),
+        [RESTORED],
+        "the heal advisory is reported"
+    );
 }

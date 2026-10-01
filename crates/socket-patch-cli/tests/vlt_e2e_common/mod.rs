@@ -1,4 +1,4 @@
-//! The real-vlt capstone harness (DESIGN §8.3), shared by
+//! The real-vlt capstone harness (docs/testing/vlt-compatibility.md, "The capstone registry harness"), shared by
 //! `e2e_redirect_vlt_build`, `e2e_vendor_vlt_build`, `mode_migration_vlt`,
 //! `e2e_safety_vlt`, `e2e_vlt` and the production suites.
 //!
@@ -300,7 +300,7 @@ pub fn legacy_workspaces_file(v: VltVersion) -> bool {
     v <= VltVersion::zero(12)
 }
 
-/// The lockfile grammar a release writes (DESIGN §1.1).
+/// The lockfile grammar a release writes (docs/testing/vlt-compatibility.md, "Formats").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VltEra {
     A0,
@@ -837,7 +837,7 @@ pub struct VltJson {
     pub no_registry: bool,
 }
 
-/// The vlt.json the §8.3 era table prescribes for registry `r`
+/// The per-era vlt.json (docs/testing/vlt-compatibility.md, "The capstone registry harness") for registry `r`
 /// (`http://127.0.0.1:<port>/`).
 pub fn vlt_json(v: VltVersion, r: &str, opts: &VltJson) -> Value {
     let mut config = serde_json::Map::new();
@@ -1819,12 +1819,34 @@ pub fn get_hosted(proj: &Path, svc: &PatchService, uuid: &str, extra: &[&str]) -
     out.json()
 }
 
-/// `rollback --yes --json` (whole ledger) in `proj`.
+/// `rollback --yes --json` in `proj`: every hosted pin the lockfiles wire
+/// (v5 keeps no hosted ledger) plus the vendor ledger / manifest.
 pub fn rollback(proj: &Path, extra: &[&str]) -> SocketOut {
     let cwd = proj.to_str().unwrap().to_string();
     let mut args = vec!["rollback", "--json", "--yes", "--cwd", &cwd];
     args.extend_from_slice(extra);
     socket(proj, &args, &[])
+}
+
+/// [`rollback`] of HOSTED pins against the harness: `--patch-server-url
+/// <patch_server>` (when the pins sit on the mock patch service rather than
+/// `patch.socket.dev`; discovery recognizes no other host) and
+/// `SOCKET_NPM_REGISTRY=<registry>`, the npm registry the v5 upstream
+/// restore re-resolves each pin's integrity from (the harness registry, so
+/// synthetic packages restore too and the run stays hermetic).
+pub fn rollback_upstream(
+    proj: &Path,
+    registry: &str,
+    patch_server: Option<&str>,
+    extra: &[&str],
+) -> SocketOut {
+    let cwd = proj.to_str().unwrap().to_string();
+    let mut args = vec!["rollback", "--json", "--yes", "--cwd", &cwd];
+    if let Some(origin) = patch_server {
+        args.extend(["--patch-server-url", origin]);
+    }
+    args.extend_from_slice(extra);
+    socket(proj, &args, &[("SOCKET_NPM_REGISTRY", registry)])
 }
 
 pub fn redirect_warnings(doc: &Value) -> Vec<(String, String)> {
@@ -1869,7 +1891,7 @@ pub fn lock_bytes(proj: &Path) -> Vec<u8> {
     std::fs::read(proj.join(VLT_LOCK)).expect("vlt-lock.json")
 }
 
-/// vlt's tilde segment decode (DESIGN §1.6).
+/// vlt's tilde segment decode (docs/testing/vlt-compatibility.md, "Formats").
 pub fn tilde_decode(seg: &str) -> String {
     let chars: Vec<char> = seg.chars().collect();
     let mut out = String::new();

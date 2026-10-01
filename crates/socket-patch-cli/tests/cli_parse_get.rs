@@ -59,7 +59,6 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_NO_VLT_INSTALL_CLEANUP",
     // GetArgs-specific
     "SOCKET_SAVE_ONLY",
-    "SOCKET_ONE_OFF",
     "SOCKET_ALL_RELEASES",
 ];
 
@@ -119,7 +118,7 @@ fn parse_get(extra: &[&str]) -> GetArgs {
 /// This is what makes the per-flag tests honest. A field-at-a-time assertion
 /// (`assert!(a.package)`) only proves the flag set *its* field; it says nothing
 /// about whether the same flag also flipped an unrelated one. A clap-derive
-/// copy/paste regression (e.g. `--package` accidentally wired to `one_off`)
+/// copy/paste regression (e.g. `--package` accidentally wired to `save_only`)
 /// would set both and still pass a single-field check. Comparing the whole
 /// snapshot against the independently-declared defaults — with only the field
 /// under test mutated — fails loudly the instant any other field moves.
@@ -154,7 +153,6 @@ struct Snap {
     ghsa: bool,
     package: bool,
     save_only: bool,
-    one_off: bool,
     all_releases: bool,
     mode: Option<socket_patch_cli::commands::scan::ScanMode>,
 }
@@ -190,7 +188,6 @@ fn snapshot(a: &GetArgs) -> Snap {
         ghsa: a.ghsa,
         package: a.package,
         save_only: a.save_only,
-        one_off: a.one_off,
         all_releases: a.all_releases,
         mode: a.mode,
     }
@@ -214,7 +211,7 @@ fn expected_defaults(identifier: &str) -> Snap {
         proxy_url: None, // no clap default — resolved in core
         ecosystems: None,
         download_mode: "diff".to_string(),
-        vendor_source: "auto".to_string(),
+        vendor_source: "service".to_string(),
         vendor_url: None,
         patch_server_url: None,
         offline: false,
@@ -234,7 +231,6 @@ fn expected_defaults(identifier: &str) -> Snap {
         ghsa: false,
         package: false,
         save_only: false,
-        one_off: false,
         all_releases: false,
         mode: None,
     }
@@ -247,7 +243,7 @@ fn expected_defaults(identifier: &str) -> Snap {
 fn defaults_with_only_required_identifier() {
     let a = parse_get(&["some-id"]);
     // Pin the *entire* default surface in one shot against the independent
-    // oracle. This covers fields the old test silently skipped (manifest_path,
+    // oracle. This covers every field (manifest_path,
     // proxy_url, offline, verbose, silent, dry_run, lock_timeout,
     // debug, no_telemetry, ecosystems) — any of which could regress to a
     // non-default and go unnoticed under a field-cherry-picked assertion.
@@ -416,17 +412,6 @@ fn global_prefix_flag_sets_global_prefix() {
 
 #[test]
 #[serial_test::serial]
-fn one_off_flag_sets_one_off() {
-    let a = parse_get(&["some-id", "--one-off"]);
-    let mut want = expected_defaults("some-id");
-    want.one_off = true;
-    // `--one-off` and `--save-only` are semantic opposites; this guards that
-    // setting one does not also flip the other.
-    assert_eq!(snapshot(&a), want);
-}
-
-#[test]
-#[serial_test::serial]
 fn json_flag_sets_json() {
     let a = parse_get(&["some-id", "--json"]);
     let mut want = expected_defaults("some-id");
@@ -491,7 +476,7 @@ fn download_mode_file() {
     assert_eq!(snapshot(&a), want);
 }
 
-// --- `--mode` selector (v3.6) --------------------------------------------
+// --- `--mode` selector (v4.0) --------------------------------------------
 //
 // `get --mode <hosted|vendored|agent>` reuses scan's `ScanMode` value-enum
 // (see cli_parse_scan.rs) so the two commands can never drift on mode
@@ -521,7 +506,7 @@ fn mode_hosted_parses() {
     let mut want = expected_defaults("some-id");
     want.mode = Some(socket_patch_cli::commands::scan::ScanMode::Hosted);
     // Full-snapshot equality: `--mode hosted` sets `mode` and nothing else
-    // (in particular it must NOT flip save_only/one_off or any GlobalArgs
+    // (in particular it must NOT flip save_only or any GlobalArgs
     // field — the runtime conflicts are run()'s job, not the parser's).
     assert_eq!(snapshot(&a), want);
 }
@@ -546,43 +531,32 @@ fn mode_agent_parses() {
 
 #[test]
 #[serial_test::serial]
-fn mode_hidden_value_aliases_parse() {
-    // The hidden value aliases mirror the legacy scan flag spellings:
-    // `host` (old mode name) and `redirect` (the `--redirect` boolean)
-    // for hosted; `vendor` (the `--vendor` boolean) for vendored. Each
-    // must parse byte-identically to its canonical spelling across the
-    // ENTIRE surface, not merely land on the right variant.
-    for (alias, canonical) in [
-        ("host", "hosted"),
-        ("redirect", "hosted"),
-        ("vendor", "vendored"),
-    ] {
-        let via_alias = parse_get(&["some-id", "--mode", alias]);
-        let via_canonical = parse_get(&["some-id", "--mode", canonical]);
-        assert_eq!(
-            snapshot(&via_alias),
-            snapshot(&via_canonical),
-            "--mode {alias} must parse identically to --mode {canonical}"
+fn removed_mode_value_aliases_are_rejected() {
+    // v5.0 dropped the hidden `host` / `redirect` / `vendor` value aliases
+    // (shared with `scan --mode`); only the canonical names parse.
+    let _scrub = EnvScrub::new();
+    for alias in ["host", "redirect", "vendor"] {
+        let err = match Cli::try_parse_from(["socket-patch", "get", "some-id", "--mode", alias]) {
+            Ok(_) => panic!("--mode {alias} should fail to parse"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation | clap::error::ErrorKind::InvalidValue
+            ),
+            "--mode {alias}: expected ValueValidation or InvalidValue, got {:?}",
+            err.kind()
         );
-        // ...and the canonical parse itself is default-everything + mode,
-        // so the alias equality above can't be satisfied by two equally
-        // wrong parses.
-        let mut want = expected_defaults("some-id");
-        want.mode = Some(match canonical {
-            "hosted" => socket_patch_cli::commands::scan::ScanMode::Hosted,
-            _ => socket_patch_cli::commands::scan::ScanMode::Vendored,
-        });
-        assert_eq!(snapshot(&via_canonical), want);
     }
 }
 
 #[test]
 #[serial_test::serial]
 fn mode_rejects_unknown_value() {
-    // The shared value_enum restricts `--mode` to the three known names
-    // (+ hidden aliases). `apply` is deliberately NOT an alias of agent —
-    // applying is not a scan-mode name anywhere else (see ScanMode's doc)
-    // — so it must be rejected exactly like a bogus value.
+    // The shared value_enum restricts `--mode` to the three known names.
+    // `apply` is not a scan-mode name anywhere, so it must be rejected
+    // exactly like a bogus value.
     let _scrub = EnvScrub::new();
     for bad in ["bogus", "apply"] {
         let err = match Cli::try_parse_from(["socket-patch", "get", "some-id", "--mode", bad]) {
@@ -638,6 +612,17 @@ fn unknown_flag_errors() {
     let err = match Cli::try_parse_from(["socket-patch", "get", "some-id", "--bogus"]) {
         Err(e) => e,
         Ok(_) => panic!("expected parse error for unknown flag"),
+    };
+    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+}
+
+#[test]
+#[serial_test::serial]
+fn removed_one_off_flag_is_unknown() {
+    let _scrub = EnvScrub::new();
+    let err = match Cli::try_parse_from(["socket-patch", "get", "some-id", "--one-off"]) {
+        Err(e) => e,
+        Ok(_) => panic!("expected parse error for the v5-removed --one-off"),
     };
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
 }

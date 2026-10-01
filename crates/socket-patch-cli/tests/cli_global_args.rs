@@ -34,7 +34,6 @@ const SUBCOMMANDS_NO_POSITIONAL: &[&str] = &[
     "apply",
     "list",
     "scan",
-    "setup",
     "repair",
     "rollback",
     "vendor",
@@ -88,6 +87,9 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
         ("--download-mode", Some("file"), |c| {
             assert_eq!(c.download_mode, "file")
         }),
+        ("--maven-config", Some("none"), |c| {
+            assert_eq!(c.maven_config.as_deref(), Some("none"))
+        }),
         ("--vendor-source", Some("service"), |c| {
             assert_eq!(c.vendor_source, "service")
         }),
@@ -137,7 +139,6 @@ fn common_of(cli: &Cli) -> &GlobalArgs {
         Scan(a) => &a.common,
         List(a) => &a.common,
         Remove(a) => &a.common,
-        Setup(a) => &a.common,
         Repair(a) => &a.common,
         Vendor(a) => &a.common,
         Vex(a) => &a.common,
@@ -239,13 +240,14 @@ fn global_flag_cases_cover_every_global_field() {
         vendor_source: _,
         vendor_url: _,
         patch_server_url: _,
+        maven_config: _,
     } = common;
 
-    // 26 fields ↔ 26 long-flag cases. Bump both this count and add a case when
+    // 27 fields ↔ 27 long-flag cases. Bump both this count and add a case when
     // the destructure above forces you to add a field.
     assert_eq!(
         global_flag_cases().len(),
-        26,
+        27,
         "every GlobalArgs field needs a long-flag case in global_flag_cases()",
     );
 
@@ -531,12 +533,9 @@ fn env_vars_populate_global_args() {
     }
 }
 
-/// Regression: bool env vars accept "1"/"yes" (the conventional truthy
-/// strings), not just clap's strict "true"/"false". Before
-/// BoolishValueParser was wired onto every bool with env, setting
-/// SOCKET_OFFLINE=1 (or SOCKET_DEBUG=1) crashed clap with
-/// `error: invalid value '1' for '--offline'`, taking down every
-/// downstream CLI run that follows the conventional shell idiom.
+/// Bool env vars accept "1"/"yes" (the conventional truthy strings), not
+/// just clap's strict "true"/"false": `SOCKET_OFFLINE=1` (or
+/// `SOCKET_DEBUG=1`) must not fail with `invalid value '1' for '--offline'`.
 ///
 /// `#[serial]` because env-var state is process-global; without it
 /// these tests race each other (and the existing
@@ -654,14 +653,11 @@ fn bool_env_vars_reject_zero_and_falsey() {
 
 /// An **empty** boolean env var resolves to `false` — it must NOT crash.
 ///
-/// FIXED (2026-06-05): `SOCKET_OFFLINE=` (the conventional shell idiom for
-/// blanking a variable without unsetting it) previously made clap fail with a
-/// `ValueValidation` error via the stock `BoolishValueParser`, which rejects
-/// `""`. That took down *every* CLI invocation, on *every* subcommand, for
-/// *every* boolean global — an operator who blanked the var to disable airgap
-/// mode got a hard crash instead. `args::parse_bool_flag` now maps an empty
-/// (or whitespace-only) value to `false`. This test pins the fixed behavior:
-/// every boolean global parses cleanly to `false` when its env var is empty.
+/// `SOCKET_OFFLINE=` (the conventional shell idiom for blanking a variable
+/// without unsetting it) must not fail validation the way the stock
+/// `BoolishValueParser` does on `""`: `args::parse_bool_flag` maps an empty
+/// (or whitespace-only) value to `false`, so every boolean global parses
+/// cleanly to `false` when its env var is empty.
 #[test]
 #[serial_test::serial]
 fn empty_bool_env_var_resolves_to_false_not_crash() {
@@ -708,10 +704,8 @@ fn empty_bool_env_var_resolves_to_false_not_crash() {
 
 /// Every `SOCKET_*` env var that `GlobalArgs` binds, so tests that need a
 /// clean slate can save/clear/restore them in one place. This is the
-/// production list itself — a private copy already went stale once
-/// (`SOCKET_STRICT` + the vendor knobs were missing, so ambient values
-/// survived the "clean slate" and could taint every parse in this file);
-/// `save_and_clear_covers_every_bound_global_env_var` above pins the fix.
+/// production list itself, so it cannot drift from the bound flags;
+/// `save_and_clear_covers_every_bound_global_env_var` below pins that.
 use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS as GLOBAL_ENV_VARS;
 
 /// An exported-but-**empty** non-bool env var must mean "unset", not crash.
@@ -768,16 +762,20 @@ fn empty_nonbool_env_vars_do_not_crash_the_binary() {
         "blank env vars must not abort the clap parse.\nstderr: {stderr}",
     );
     // The command must reach normal execution: with the blanks treated as
-    // unset, `list --json` in an empty temp dir resolves the default manifest
-    // path and emits the manifest_not_found envelope (exit 1).
+    // unset, `list --json` in an empty temp dir lists an empty project
+    // (success envelope, exit 0).
     let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!("expected a JSON envelope on stdout, got {e}.\nstdout: {stdout}\nstderr: {stderr}")
     });
     assert_eq!(
-        envelope["error"]["code"], "manifest_not_found",
+        envelope["status"], "success",
         "blank env vars must fall back to defaults: {envelope}",
     );
-    assert_eq!(out.status.code(), Some(1), "manifest_not_found exits 1");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an empty project lists with exit 0"
+    );
 }
 
 /// `save_and_clear_global_env` must clear **every** env var `GlobalArgs`
@@ -916,7 +914,7 @@ fn production_defaults_populate_when_unset() {
     assert_eq!(c.api_url, None, "no clap default — resolved in core");
     assert_eq!(c.proxy_url, None, "no clap default — resolved in core");
     assert_eq!(c.download_mode, "diff");
-    assert_eq!(c.vendor_source, "auto");
+    assert_eq!(c.vendor_source, "service");
     assert!(c.vendor_url.is_none());
     assert!(c.patch_server_url.is_none());
     assert!(c.api_token.is_none());

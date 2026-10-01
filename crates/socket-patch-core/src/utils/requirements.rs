@@ -259,7 +259,7 @@ mod tests {
 
     /// The ONE exact-pin rule the lock inventory and lockfile discovery
     /// share: wildcards (`==1.*`) and arbitrary equality (`===`) are not
-    /// exact pins (the inventory used to emit `pkg:pypi/six@1.*`).
+    /// exact pins (the inventory must never emit `pkg:pypi/six@1.*`).
     #[test]
     fn exact_pin_is_the_shared_registry_pin_rule() {
         assert_eq!(exact_pin("six==1.16.0"), Some(("six", "1.16.0")));

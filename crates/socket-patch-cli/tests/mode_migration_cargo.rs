@@ -5,14 +5,16 @@
 //! `.cargo/config.toml` registry block — so both directions edit Cargo.toml
 //! and each must leave none of the other mode's lines behind.
 //!
-//! Adapted from the audit probes that empirically proved findings C1–C7 (the
-//! cargo mode-takeover bug class): both directions used to exit 0 while
-//! leaving the project unbuildable under `--locked` (leftover
+//! Pins the cargo mode-takeover failure class: neither direction may exit 0
+//! while leaving the project unbuildable under `--locked` (a leftover
 //! `[patch.crates-io]` after a hosted takeover; a surviving
 //! `registry = "socket-patch-…"` Cargo.toml pin after a vendored takeover), a
-//! double takeover destroyed the unrecoverable crates.io lock originals in
-//! the vendored ledger, and the takeover classifier then emitted an INVERTED
-//! warning telling the user to delete the live ledger.
+//! double takeover must keep the unrecoverable crates.io lock originals in
+//! the vendored ledger, and the takeover classifier must never tell the user
+//! to delete live hosted state. v5 hosted mode keeps no ledger: vendoring
+//! over a hosted pin first restores the crates.io entry (re-resolved from
+//! the sparse index — a wiremock here via `SOCKET_CRATES_INDEX`), and an
+//! unrestorable pin (offline) is refused.
 //!
 //! Each scenario drives the REAL binary against real cargo (network used for
 //! the crates.io fixture build only; the hosted registry is wiremock) and
@@ -23,8 +25,10 @@
 //! marker: `(redirected)` for the hosted uuid after vendored → hosted,
 //! `(vendored)` for the vendored uuid after hosted → vendored and after the
 //! A → B → A round trip. (0) with the manifest still naming the displaced
-//! patch (the wired uuid wins), (1) manifest deleted / ledger kept (zero
-//! API calls), (2) ledgers deleted (lockfile wiring + API record), (3)
+//! patch (the wired uuid wins), (1) manifest deleted / ledgers kept (zero
+//! API calls for a vendored pin; a hosted pin's record — v5 keeps no hosted
+//! ledger — comes from the API), (2) ledgers deleted (lockfile wiring + API
+//! record), (3)
 //! `--offline` with no ledger → `record_unavailable`, zero requests. The
 //! displaced patch is never attested.
 //!
@@ -33,6 +37,9 @@
 //! Skips (println) when `cargo` is missing or crates.io is unreachable for
 //! the fixture build (a failure instead under
 //! `SOCKET_PATCH_CARGO_E2E_REQUIRED=1`); all assertions after that are hard.
+
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -67,8 +74,18 @@ fn binary() -> PathBuf {
 }
 
 fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, String) {
+    run_socket_env(cwd, args, cargo_home, &[])
+}
+
+/// [`run_socket`] with extra env applied after the scrub.
+fn run_socket_env(
+    cwd: &Path,
+    args: &[&str],
+    cargo_home: &Path,
+    env: &[(&str, &str)],
+) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
             cmd.env_remove(&k);
@@ -76,6 +93,15 @@ fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, Str
     }
     cmd.env_remove("VIRTUAL_ENV");
     cmd.env("CARGO_HOME", cargo_home);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let _fixture = prebuilt_common::prepare_command(
+        &mut cmd,
+        cwd,
+        args,
+        &[("CARGO_HOME", cargo_home.to_str().unwrap())],
+    );
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -270,6 +296,14 @@ async fn mount_hosted_mocks(
     orig: &[u8],
     patched: &[u8],
 ) -> String {
+    prebuilt_common::mount_download(
+        server,
+        purl,
+        UUID_V,
+        &format!("{DEP}-{version}.crate"),
+        crate_bytes,
+    )
+    .await;
     let cksum = sha256_hex(crate_bytes);
     // Production-shaped index path: manifest-less VEX reads the hosted
     // uuid out of the lock's `source` (with `--patch-server-url`).
@@ -387,6 +421,53 @@ async fn mount_hosted_mocks(
     index_url
 }
 
+/// Serve a crates.io sparse-index row for DEP@`version` carrying the
+/// PRISTINE lock's checksum, from `server` under `/crates-index` — what the
+/// v5 upstream restore reads (`SOCKET_CRATES_INDEX`) to put a hosted
+/// Cargo.lock entry back on crates.io. Mirroring the pristine value keeps
+/// the unwind hermetic. Returns the index base.
+async fn mount_crates_index(server: &MockServer, version: &str, pristine_lock: &str) -> String {
+    let cksum = cargo_e2e_matrix::parse_lock(pristine_lock)
+        .into_iter()
+        .find(|p| p.name == DEP)
+        .and_then(|p| p.checksum)
+        .expect("pristine lock has a checksum");
+    let row = serde_json::json!({
+        "name": DEP, "vers": version, "deps": [], "cksum": cksum,
+        "features": {}, "yanked": false,
+    })
+    .to_string();
+    Mock::given(method("GET"))
+        .and(path(format!("/crates-index/{}", sparse_index_rel(DEP))))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(row, "text/plain"))
+        .mount(server)
+        .await;
+    format!("{}/crates-index", server.uri())
+}
+
+/// Plain `vendor --json` ONLINE over a hosted pin on `server`'s origin
+/// (`--patch-server-url`), the crates index mirrored at `index`.
+fn vendor_over_hosted(
+    proj: &Path,
+    cargo_home: &Path,
+    server: &MockServer,
+    index: &str,
+) -> (i32, String, String) {
+    run_socket_env(
+        proj,
+        &[
+            "vendor",
+            "--json",
+            "--patch-server-url",
+            server.uri().as_str(),
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+        cargo_home,
+        &[("SOCKET_CRATES_INDEX", index)],
+    )
+}
+
 /// Manifest-less VEX over a post-takeover fresh checkout: `wired` (uuid +
 /// marker) must attest, `displaced` never. Runs on a blocking thread (the
 /// shared `PatchApi` brings its own runtime).
@@ -453,17 +534,31 @@ impl TakeoverVex {
             assert_eq!(out.code, Some(0), "(0) with manifest:\n{out}");
             only_wired(out.doc(), "(0)");
         }
-        // (1) Manifest deleted, ledger kept.
+        // (1) Manifest deleted, ledgers kept. A vendored pin's record lives
+        //     in the vendor ledger (zero API calls); v5 hosted mode keeps no
+        //     ledger, so a hosted pin's record comes from the API.
         strip_manifest(fresh);
         let before = api.request_count();
         let out = run_vex(&bin, fresh, &run);
-        assert_eq!(out.code, Some(0), "(1) ledger-backed:\n{out}");
+        assert_eq!(out.code, Some(0), "(1) manifest deleted:\n{out}");
         only_wired(out.doc(), "(1)");
-        assert_eq!(
-            api.request_count(),
-            before,
-            "(1) the ledger record needs no API"
-        );
+        if matches!(marker, Marker::Redirected) {
+            assert!(
+                api.view_requests(uuid) >= 1,
+                "(1) the hosted record is fetched from the API"
+            );
+            assert_eq!(
+                api.view_requests(self.displaced),
+                0,
+                "(1) never asked for the displaced one"
+            );
+        } else {
+            assert_eq!(
+                api.request_count(),
+                before,
+                "(1) the vendor ledger record needs no API"
+            );
+        }
         // (2) Ledgers deleted: the lockfile wiring + the API's record.
         strip_ledgers(fresh);
         let out = run_vex(&bin, fresh, &run);
@@ -623,8 +718,8 @@ async fn vendored_then_hosted_takeover_leaves_pure_hosted() {
         "the orphaned committed tree must be removed"
     );
     assert!(
-        proj.join(".socket/vendor/redirect-state.json").exists(),
-        "hosted ledger written"
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "hosted mode writes no ledger"
     );
     let lock_block = package_block(&read(&proj, "Cargo.lock"), DEP).unwrap_or_default();
     assert!(
@@ -655,7 +750,7 @@ async fn vendored_then_hosted_takeover_leaves_pure_hosted() {
     .run()
     .await;
 
-    // D: a later vendored-flow no-op must NOT emit the inverted
+    // D: a later vendored-flow no-op must NOT emit the (removed)
     // vendor_supersedes_redirect warning (C4b: pre-fix it told the user to
     // delete the LIVE hosted ledger while the lock pointed at the sparse
     // index). Empty API + no manifest = the no-manifest no-op path.
@@ -786,8 +881,9 @@ async fn lockless_vendor_then_first_build_then_hosted_takeover() {
 }
 
 // ── C2 / C7: hosted → vendored takeover via the plain `vendor` command ──────
-// The primary migration entry point must revert the hosted edits first (from
-// the redirect ledger), surface the takeover, leave the project PURELY
+// The primary migration entry point must restore the hosted pin's crates.io
+// entry first (v5: from the sparse index), surface the takeover, leave the
+// project PURELY
 // vendored (fresh checkout builds offline under --locked), and a final
 // `vendor --revert` must restore the pristine pre-hosted project.
 #[tokio::test(flavor = "multi_thread")]
@@ -832,19 +928,16 @@ async fn hosted_then_vendored_takeover_leaves_pure_vendored() {
         "hosted pin present"
     );
 
-    // B: plain `vendor` over the hosted state — the takeover.
-    stage_patch(&proj, &purl, &orig, &patched);
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
-            "vendor",
-            "--json",
-            "--offline",
-            "--cwd",
-            proj.to_str().unwrap(),
-        ],
-        &cargo_home,
+    assert!(
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "hosted mode writes no ledger"
     );
+
+    // B: plain `vendor` over the hosted state — the takeover.
+    let index =
+        mount_crates_index(&server, &version, &String::from_utf8_lossy(&lock_pristine)).await;
+    stage_patch(&proj, &purl, &orig, &patched);
+    let (code, stdout, stderr) = vendor_over_hosted(&proj, &cargo_home, &server, &index);
     assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
     assert_eq!(envelope["summary"]["applied"], 1, "{stdout}");
@@ -856,7 +949,7 @@ async fn hosted_then_vendored_takeover_leaves_pure_vendored() {
 
     // The project is FULLY vendored: the hosted Cargo.toml pin and the
     // registries block are gone, [patch.crates-io] + detached lock are in,
-    // and the hosted ledger record is dropped.
+    // and no hosted ledger exists.
     let toml = read(&proj, "Cargo.toml");
     assert!(
         !toml.contains("socket-patch-"),
@@ -876,7 +969,7 @@ async fn hosted_then_vendored_takeover_leaves_pure_vendored() {
     );
     assert!(
         !proj.join(".socket/vendor/redirect-state.json").exists(),
-        "the emptied hosted ledger must be removed: {}",
+        "no hosted ledger may exist: {}",
         read(&proj, ".socket/vendor/redirect-state.json")
     );
     let lock_block = package_block(&read(&proj, "Cargo.lock"), DEP).unwrap_or_default();
@@ -997,18 +1090,11 @@ async fn double_takeover_a_b_a_preserves_lock_originals() {
     );
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
 
-    // A again: vendor back.
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
-            "vendor",
-            "--json",
-            "--offline",
-            "--cwd",
-            proj.to_str().unwrap(),
-        ],
-        &cargo_home,
-    );
+    // A again: vendor back (restoring the hosted pin's crates.io entry
+    // first).
+    let index =
+        mount_crates_index(&server, &version, &String::from_utf8_lossy(&lock_pristine)).await;
+    let (code, stdout, stderr) = vendor_over_hosted(&proj, &cargo_home, &server, &index);
     assert_eq!(code, 0, "re-vendor failed: {stdout}\n{stderr}");
 
     // The vendored ledger's lock originals are the PRISTINE crates.io values
@@ -1074,12 +1160,14 @@ async fn double_takeover_a_b_a_preserves_lock_originals() {
     );
 }
 
-// ── FAIL CLOSED: vendoring over a hosted redirect with no ledger refuses ────
-// When the redirect ledger is gone the hosted originals are unrecoverable —
-// the vendor run must refuse the purl with an actionable error instead of
-// creating the mixed unbuildable state and reporting success.
+// ── FAIL CLOSED: vendoring over an unrestorable hosted pin refuses ─────────
+// When the hosted pin's crates.io entry cannot be re-resolved (here:
+// `--offline`), the vendor run must refuse the purl with an actionable error
+// instead of creating the mixed unbuildable state and reporting success. The
+// cargo backend's `hosted_redirect_live` guard backstops a half-reverted
+// project whose lock is back on crates.io but whose manifest still pins.
 #[tokio::test(flavor = "multi_thread")]
-async fn vendor_over_hosted_without_ledger_is_refused() {
+async fn vendor_over_unrestorable_hosted_pin_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let Some((proj, cargo_home, version, crate_dir)) = stage_fixture(tmp.path()) else {
         return;
@@ -1116,8 +1204,7 @@ async fn vendor_over_hosted_without_ledger_is_refused() {
     );
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
 
-    // The revert data is gone.
-    std::fs::remove_file(proj.join(".socket/vendor/redirect-state.json")).unwrap();
+    assert!(!proj.join(".socket/vendor/redirect-state.json").exists());
     let toml_before = read(&proj, "Cargo.toml");
     let lock_before = read(&proj, "Cargo.lock");
 
@@ -1128,6 +1215,8 @@ async fn vendor_over_hosted_without_ledger_is_refused() {
             "vendor",
             "--json",
             "--offline",
+            "--patch-server-url",
+            server.uri().as_str(),
             "--cwd",
             proj.to_str().unwrap(),
         ],
@@ -1135,8 +1224,10 @@ async fn vendor_over_hosted_without_ledger_is_refused() {
     );
     assert_eq!(code, 1, "must fail closed: {stdout}\n{stderr}");
     assert!(
-        stdout.contains("hosted_redirect_live"),
-        "actionable refusal code missing: {stdout}"
+        stdout.contains("redirect_revert_failed")
+            && stdout.contains("cannot vendor over the live hosted pin")
+            && stdout.contains("git checkout --"),
+        "actionable refusal (with the checkout remedy) missing: {stdout}"
     );
     // Nothing was half-applied: the hosted wiring is untouched and no
     // vendored artifact/wiring was created.
@@ -1186,6 +1277,15 @@ async fn vendor_over_hosted_without_ledger_is_refused() {
     assert!(
         stdout.contains("hosted_redirect_live"),
         "actionable refusal code missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("socket-patch rollback")
+            || stdout.contains("git checkout -- Cargo.toml Cargo.lock"),
+        "the refusal names the v5 remedy, not a ledger: {stdout}"
+    );
+    assert!(
+        !stdout.contains("redirect-state.json"),
+        "no ledger is named: {stdout}"
     );
     assert_eq!(read(&proj, "Cargo.toml"), table_toml);
     assert_eq!(read(&proj, "Cargo.lock"), pristine_lock);

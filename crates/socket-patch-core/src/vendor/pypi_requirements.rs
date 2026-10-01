@@ -460,8 +460,8 @@ async fn plan_requirements(
                     "pypi_extras_unsupported",
                     format!(
                         "{}: the {canon_name} pin declares extras, which a vendored wheel path \
-                         line cannot express; remove the extras or use the `socket-patch setup` \
-                         .pth install hook instead",
+                         line cannot express; remove the extras or use agent mode \
+                         (`scan --mode agent` + `socket-patch apply`) instead",
                         file.rel
                     ),
                 ));
@@ -471,7 +471,7 @@ async fn plan_requirements(
                     "pypi_requirement_not_pinned",
                     format!(
                         "{}: {canon_name} is not pinned to =={version}; pin it exactly or use \
-                         the `socket-patch setup` .pth install hook instead",
+                         agent mode (`scan --mode agent` + `socket-patch apply`) instead",
                         file.rel
                     ),
                 ));
@@ -487,8 +487,8 @@ async fn plan_requirements(
                 "pypi_requirements_outside_root",
                 format!(
                     "{}: {canon_name} is pinned in a requirements include outside the project \
-                     root, which vendor cannot edit; inline it or use the `socket-patch setup` \
-                     .pth install hook instead",
+                     root, which vendor cannot edit; inline it or use agent mode \
+                     (`scan --mode agent` + `socket-patch apply`) instead",
                     file.rel
                 ),
             ));
@@ -545,8 +545,8 @@ async fn plan_requirements(
 
     if !rewrote_any {
         // Transitive: append a managed line at the ROOT file's EOF. pip
-        // treats it as one more requirement; the resolver folds it into the
-        // graph exactly like the spike's mixed-requirements run.
+        // treats it as one more requirement and the resolver folds it into
+        // the graph.
         let root_file = files
             .first()
             .expect("collect_requirements_files always yields the root file first");
@@ -951,6 +951,7 @@ mod tests {
             base_purl: "pkg:pypi/six@1.16.0".into(),
             uuid: UUID.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: REL_WHEEL.into(),
                 sha256: SHA.into(),
                 size: Some(11053),
@@ -1403,12 +1404,11 @@ mod tests {
 
     // ── revert edge cases ────────────────────────────────────────────────
 
-    /// SECURITY regression: a poisoned state.json wiring record naming a
+    /// SECURITY: a poisoned state.json wiring record naming a
     /// `..`/absolute `file` must never make `--revert` read or rewrite a file
     /// outside the project root — the record is skipped with a warning and
-    /// the out-of-tree target stays byte-identical. (Found by adversarial
-    /// review: revert previously joined `rec.file` unvalidated, an arbitrary
-    /// content-injection write.)
+    /// the out-of-tree target stays byte-identical (joining `rec.file`
+    /// unvalidated would be an arbitrary content-injection write).
     #[tokio::test]
     async fn revert_refuses_unsafe_wiring_file_paths() {
         let outer = tempfile::tempdir().unwrap();

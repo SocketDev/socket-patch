@@ -8,7 +8,7 @@
 //! module owns the post-apply rewrites that keep those sidecars
 //! consistent with what we just wrote to disk.
 //!
-//! Coverage in this revision:
+//! Coverage:
 //!
 //! - **Cargo** ([`cargo::fixup`]): rewrite `.cargo-checksum.json` so
 //!   `cargo build` accepts the patched sources.
@@ -19,7 +19,6 @@
 //!   surfaces an advisory ALONGSIDE the metadata deletion.
 //! - **PyPI / gem / Go**: advisory only — emit a structured
 //!   advisory so downstream tooling consequences are programmatic.
-//!   Full sidecar rewrites land in follow-ups.
 //!
 //! All ecosystems return a [`SidecarRecord`] via [`dispatch_fixup`].
 //! The record is the canonical JSON-envelope shape — see
@@ -277,7 +276,7 @@ mod tests {
         assert!(out.is_none());
     }
 
-    /// Regression: an empty `patched` list short-circuits to `None`
+    /// An empty `patched` list short-circuits to `None`
     /// *before* the PURL is classified, even for an ecosystem that
     /// would otherwise always emit an advisory (pypi). Guards the
     /// `patched.is_empty()` early return at the top of `dispatch_fixup`

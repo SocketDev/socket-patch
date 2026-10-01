@@ -112,12 +112,6 @@
       "vendor_vlt_refuses_gitignored_payload",
       "a_gitignored_payload_refuses_and_unwinds",
       "a_root_socket_ignore_refuses_before_any_write"
-    ],
-    "vlt_root_scripts_not_run": [
-      "setup_vlt_before_rc13_emits_the_definite_advisory",
-      "setup_vlt_without_a_usable_vlt_reads_the_lock",
-      "setup_vlt_advisory_prints_on_stderr_in_human_mode",
-      "vlt_pinned_matrix_setup_root_scripts_advisory"
     ]
   },
   "advisoryVariants": {
@@ -206,18 +200,6 @@
     ],
     "redirect_vlt_artifact_unverifiable: left pinned by an earlier run": [
       "scan_redirect_vlt_artifact_already_pinned_failure_left_pinned"
-    ],
-    "vlt_root_scripts_not_run: definite (vlt --version below rc.13)": [
-      "setup_vlt_before_rc13_emits_the_definite_advisory",
-      "vlt_pinned_matrix_setup_root_scripts_advisory"
-    ],
-    "vlt_root_scripts_not_run: may (lock sniff)": [
-      "setup_vlt_without_a_usable_vlt_reads_the_lock",
-      "setup_vlt_rc13_and_later_reads_the_lock_it_would_not_write",
-      "setup_vlt_version_probe_times_out_to_the_lock_sniff"
-    ],
-    "vlt_root_scripts_not_run: none (unparseable --version)": [
-      "setup_vlt_unparseable_version_emits_no_advisory"
     ]
   },
   "modeCommand": {
@@ -260,7 +242,7 @@
     ],
     "vendored/get": [
       "get_uuid_vendored_vlt_vendors_refuses_and_agent_bypasses",
-      "vlt_pinned_matrix_vendored_get_build_fresh_ci",
+      "vlt_pinned_matrix_vendored_get_auto_fresh_ci",
       "vlt_pinned_matrix_vendored_get_service_fresh_ci"
     ],
     "vendored/revert": [
@@ -272,7 +254,7 @@
     ],
     "vendored/repair": [
       "vlt_repair_rebuilds_a_deleted_dir",
-      "vlt_repair_reconstructs_the_ledger_from_the_lock",
+      "vlt_repair_reports_a_missing_ledger",
       "vlt_pinned_matrix_vendored_repair_rebuilds"
     ],
     "vendored/remove": [
@@ -322,13 +304,6 @@
       "find_by_purls_resolves_vlt_store_transitives",
       "crawl_all_inventories_vlt_store_exactly_once",
       "test_decode_vlt_dep_id_table"
-    ],
-    "setup": [
-      "setup_detects_vlt_from_lockfile",
-      "setup_detects_vlt_from_vlt_json",
-      "setup_vlt_workspace_only_updates_root",
-      "vlt_pinned_matrix_setup_hook_fires_per_reify",
-      "vlt_pinned_matrix_setup_hook_failure"
     ]
   },
   "eraOs": {

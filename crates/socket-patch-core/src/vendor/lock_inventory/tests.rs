@@ -39,6 +39,11 @@ const PACKAGE_LOCK: &str = r#"{
       "version": "0.5.0",
       "resolved": "git+ssh://git@github.com/x/git-dep.git#abc"
     },
+    "node_modules/local-tarball": {
+      "version": "1.0.0",
+      "resolved": "file:vendor/local-tarball-1.0.0.tgz",
+      "integrity": "sha512-local=="
+    },
     "node_modules/vendored": {
       "version": "3.0.0",
       "resolved": "file:.socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/vendored-3.0.0.tgz",
@@ -80,6 +85,11 @@ async fn package_lock_inventories_registry_entries() {
     let git = entry(&entries, "git-dep");
     assert_eq!(git.resolved, None);
     assert_eq!(git.integrity, LockIntegrity::None);
+    // Nor does a local tarball: its integrity is of bytes no registry
+    // serves, so no registry fetch may be verified against it.
+    let local = entry(&entries, "local-tarball");
+    assert_eq!(local.resolved, None);
+    assert_eq!(local.integrity, LockIntegrity::None);
 
     // Workspace members, links, bundled deps, our vendored spec, the
     // unsafe-version entry, and the version-less node are all absent.
@@ -194,7 +204,7 @@ async fn pnpm_v9_keys_parse_with_peer_suffix_and_scoped_quoting() {
 
 /// A CRLF checkout of the same lock inventories identically: the
 /// hosted rewriter's pnpm grammar (the one reader) is CRLF-blind, where
-/// an exact `packages:` line match used to see no section at all.
+/// an exact `packages:` line match would see no section at all.
 #[tokio::test]
 async fn pnpm_crlf_lock_inventories_like_its_lf_twin() {
     let tmp = tempfile::tempdir().unwrap();
@@ -280,9 +290,7 @@ async fn pnpm_v5_slash_keys_inventory_with_peer_and_hash_suffixes() {
     write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK_V5).await;
 
     let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
-    // The legacy grammars route to the PnpmLegacy wiring flavor now
-    // (they used to reach here through the version-refusal fallback);
-    // the inventory content is identical either way.
+    // The legacy grammars route to the PnpmLegacy wiring flavor.
     assert_eq!(flavor, NpmLockFlavor::PnpmLegacy);
     assert_eq!(
         sorted_pairs(&entries),
@@ -346,9 +354,7 @@ async fn pnpm_v6_leading_slash_keys_inventory_with_peer_parens() {
     write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK_V6).await;
 
     let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
-    // The legacy grammars route to the PnpmLegacy wiring flavor now
-    // (they used to reach here through the version-refusal fallback);
-    // the inventory content is identical either way.
+    // The legacy grammars route to the PnpmLegacy wiring flavor.
     assert_eq!(flavor, NpmLockFlavor::PnpmLegacy);
     assert_eq!(
         sorted_pairs(&entries),
@@ -630,9 +636,8 @@ async fn stale_pnpm_lock_beside_empty_live_lock_yields_none() {
 
 // ── shrinkwrap.yaml (pnpm 1/2) ──────────────────────────────────────────
 
-/// The exact grammar the 2026-08-18 legacy matrix captured from a real
-/// pnpm 2 install (shrinkwrapVersion 3): v5-style `/name/version` keys,
-/// BLOCK-mapped `resolution:` (integrity nested on its own line — every
+/// The exact grammar a real pnpm 2 install writes (shrinkwrapVersion 3):
+/// v5-style `/name/version` keys, BLOCK-mapped `resolution:` (integrity nested on its own line — every
 /// pnpm-lock.yaml generation writes the inline `{…}` flow map instead),
 /// quoted top-level `registry:`, and a transitive dep (`minimist`)
 /// listed only under `packages:`.
@@ -879,6 +884,69 @@ async fn yarn_classic_blocks_yield_resolved_sha1_and_integrity() {
     // `alias@npm:real@range` resolves to the real name.
     assert!(entries.iter().any(|e| e.name == "real-name"));
     assert_eq!(entry(&entries, "@scope/pkg").version, "2.0.0");
+}
+
+/// A git resolution's `#<commit>` fragment is not a tarball sha1: the
+/// entry carries no integrity, so no registry fetch (or fetch deferred
+/// behind the patch service) treats it as a verifiable registry package.
+#[tokio::test]
+async fn yarn_classic_git_resolution_fragment_is_not_an_integrity() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "yarn.lock",
+        "# yarn lockfile v1\n\n\
+         \"from-git@git+https://github.com/o/from-git.git\":\n\
+         \x20 version \"1.0.0\"\n\
+         \x20 resolved \"git+https://github.com/o/from-git.git#0123456789abcdef0123456789abcdef01234567\"\n",
+    )
+    .await;
+    let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    let e = entry(&entries, "from-git");
+    assert_eq!(e.resolved, None);
+    assert_eq!(e.integrity, LockIntegrity::None);
+}
+
+/// The same holds for a git repository reached over plain https (a
+/// `.git` URL or a codeload tarball), and an `integrity` field on such a
+/// block is not a registry integrity either; a registry tarball keeps
+/// both.
+#[tokio::test]
+async fn yarn_classic_https_git_resolutions_carry_no_integrity() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "yarn.lock",
+        "# yarn lockfile v1\n\n\
+         \"https-git@https://github.com/o/https-git.git\":\n\
+         \x20 version \"1.0.0\"\n\
+         \x20 resolved \"https://github.com/o/https-git.git#0123456789abcdef0123456789abcdef01234567\"\n\
+         \x20 integrity sha512-fromgit==\n\n\
+         \"codeload@o/codeload\":\n\
+         \x20 version \"2.0.0\"\n\
+         \x20 resolved \"https://codeload.github.com/o/codeload/tar.gz/0123456789abcdef0123456789abcdef01234567\"\n\
+         \x20 integrity sha512-codeload==\n\n\
+         registry-pkg@^3.0.0:\n\
+         \x20 version \"3.0.0\"\n\
+         \x20 resolved \"https://registry.yarnpkg.com/registry-pkg/-/registry-pkg-3.0.0.tgz#dddddddddddddddddddddddddddddddddddddddd\"\n\
+         \x20 integrity sha512-registry==\n",
+    )
+    .await;
+    let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    for name in ["https-git", "codeload"] {
+        let e = entry(&entries, name);
+        assert_eq!(e.resolved, None, "{name}");
+        assert_eq!(e.integrity, LockIntegrity::None, "{name}");
+    }
+    let registry = entry(&entries, "registry-pkg");
+    assert_eq!(
+        registry.resolved.as_deref(),
+        Some("https://registry.yarnpkg.com/registry-pkg/-/registry-pkg-3.0.0.tgz")
+    );
+    assert_eq!(
+        registry.integrity,
+        LockIntegrity::Sri("sha512-registry==".into())
+    );
 }
 
 // ── yarn berry ────────────────────────────────────────────────────────
@@ -1611,8 +1679,7 @@ async fn pipfile_lock_inventory_reads_every_category_with_its_digest_set() {
 /// One hosted pypi url grammar (`hosted_artifact_url`, the one lockfile
 /// discovery reads): a hosted SDIST, an `http://` configured origin and a
 /// path-prefixed origin are Socket references too, so the package stays
-/// discoverable instead of vanishing from the inventory (the old
-/// `https://` + exactly-7-segments + `.whl` rule dropped them).
+/// discoverable instead of vanishing from the inventory.
 #[tokio::test]
 async fn pipfile_lock_inventory_reads_hosted_refs_with_the_shared_url_grammar() {
     let uuid = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
@@ -1639,6 +1706,32 @@ async fn pipfile_lock_inventory_reads_hosted_refs_with_the_shared_url_grammar() 
         "a user's own url and a url whose artifact disagrees with its coordinates are not ours"
     );
     assert!(entries.iter().all(|e| e.integrity == LockIntegrity::None));
+}
+
+/// A vendored server sdist is Socket's own reference too: a lock-only
+/// re-scan keeps the package it replaces.
+#[tokio::test]
+async fn pipfile_lock_inventory_keeps_a_vendored_sdist_reference() {
+    let rel = "./.socket/vendor/pypi/00000000-0000-4000-8000-000000000000";
+    assert_eq!(
+        socket_reference_coords(&format!("{rel}/python-dateutil-2.8.2.tar.gz")),
+        Some(("python-dateutil".into(), "2.8.2".into()))
+    );
+    let lock = serde_json::json!({
+        "_meta": {"pipfile-spec": 6, "sources": []},
+        "default": {
+            "Six": {"file": format!("{rel}/six-1.16.0.tar.gz"), "hashes": ["sha256:dd"]},
+        }
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "Pipfile.lock", &lock.to_string()).await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![("six".into(), "1.16.0".into())],
+        "{entries:?}"
+    );
+    assert_eq!(entry(&entries, "six").integrity, LockIntegrity::None);
 }
 
 /// Socket's own references in a Pipfile.lock (a hosted URL, a vendored
@@ -1775,8 +1868,8 @@ async fn pnp_layouts_propagate_the_diagnosis_instead_of_yielding_none() {
     // PnP marker wins over any lockfile — and the diagnosis must
     // PROPAGATE, not collapse into the calm no-lockfile `None`. Under
     // yarn PnP the installed-tree crawl is also structurally empty, so
-    // swallowing this here made `scan` a silent success-0 no-op in
-    // every mode (the P0 this pins).
+    // swallowing this here would make `scan` a silent success-0 no-op in
+    // every mode.
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), ".pnp.cjs", "/* pnp */").await;
     write(tmp.path(), "package-lock.json", PACKAGE_LOCK).await;
@@ -2341,7 +2434,7 @@ async fn depless_poetry_lock_falls_through_to_requirements() {
 /// requirements.txt pins read with the shared exact-pin rule
 /// (`utils::requirements::exact_pin`, the one lockfile discovery uses): a
 /// wildcard or arbitrary-equality pin is no exact version, so it is not
-/// inventoried as one (it used to emit `pkg:pypi/six@1.*`).
+/// inventoried as one (never `pkg:pypi/six@1.*`).
 #[tokio::test]
 async fn requirements_wildcard_pins_are_not_exact_versions() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2415,6 +2508,80 @@ async fn wired_vendor_integrity_reads_rewired_yarn_classic_and_skips_bad_json_lo
     );
 }
 
+/// The yarn / bun branches of `wired_vendor_integrity` read the entry
+/// models lockfile discovery reads, not a line window: a berry block whose
+/// carried sections push `checksum:` far below the reference, yarn 4.0.x's
+/// bare-hex checksum, a CRLF classic lock, a shadowed classic block (yarn
+/// keeps the last one) and bun's digest-less re-save (which must never
+/// borrow the next tuple's sha512).
+#[tokio::test]
+async fn wired_vendor_integrity_reads_yarn_and_bun_entries_structurally() {
+    let rel = ".socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
+    let hex = "ab".repeat(64);
+    let berry = |checksum: &str| {
+        format!(
+            "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"left-pad@file:./{rel}::locator=app%40workspace%3A.\":\n  \
+             version: 1.3.0\n  \
+             resolution: \"left-pad@file:./{rel}#./{rel}::hash=abc&locator=app%40workspace%3A.\"\n  \
+             dependencies:\n    a: \"npm:1.0.0\"\n    b: \"npm:1.0.0\"\n    c: \"npm:1.0.0\"\n    d: \"npm:1.0.0\"\n    e: \"npm:1.0.0\"\n  \
+             checksum: {checksum}\n  \
+             languageName: node\n  \
+             linkType: hard\n"
+        )
+    };
+    for (checksum, want) in [
+        (format!("10c0/{hex}"), format!("10c0/{hex}")),
+        (hex.clone(), format!("10c0/{hex}")),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "yarn.lock", &berry(&checksum)).await;
+        assert_eq!(
+            wired_vendor_integrity(tmp.path(), rel).await,
+            Some(LockIntegrity::BerryChecksum(want)),
+            "{checksum}"
+        );
+    }
+
+    let classic = |key: &str, sri: &str| {
+        format!(
+            "{key}:\n  version \"1.3.0\"\n  resolved \"file:./{rel}#0000000000000000000000000000000000000000\"\n  integrity {sri}\n"
+        )
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let lock = format!(
+        "# yarn lockfile v1\n\n{}\n{}",
+        classic("left-pad@^1.3.0", "sha512-shadowed=="),
+        classic("left-pad@^1.3.0", "sha512-live==")
+    )
+    .replace('\n', "\r\n");
+    write(tmp.path(), "yarn.lock", &lock).await;
+    assert_eq!(
+        wired_vendor_integrity(tmp.path(), rel).await,
+        Some(LockIntegrity::Sri("sha512-live==".into())),
+        "the live (last) block of a CRLF lock"
+    );
+
+    let bun = |ours: &str| {
+        format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {{\n    \"\": {{\n      \"name\": \"app\",\n    }},\n  }},\n  \"packages\": {{\n    \"left-pad\": [\"left-pad@./{rel}\", {{}}{ours}],\n\n    \"right-pad\": [\"right-pad@1.0.0\", \"\", {{}}, \"sha512-theirs==\"],\n  }}\n}}\n"
+        )
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "bun.lock", &bun(", \"sha512-ours==\"")).await;
+    assert_eq!(
+        wired_vendor_integrity(tmp.path(), rel).await,
+        Some(LockIntegrity::Sri("sha512-ours==".into()))
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "bun.lock", &bun("")).await;
+    assert_eq!(
+        wired_vendor_integrity(tmp.path(), rel).await,
+        None,
+        "a digest-less re-save pins nothing"
+    );
+}
+
 /// `PnpmPackage::resolution_tokens` exposes the raw `resolution:` value the
 /// grammar refused (a nested map, a duplicate key, a wrapped flow map), so
 /// lockfile discovery can still tell a Socket-shaped entry from anything
@@ -2425,7 +2592,7 @@ fn pnpm_resolution_tokens_cover_maps_the_grammar_refuses() {
     let lock = format!(
         "lockfileVersion: '9.0'\n\npackages:\n\n  x@1.0.0:\n    resolution:\n      tarball: {url}\n      nested:\n        a: b\n\n  y@1.0.0:\n    resolution: {{integrity: sha512-a}}\n    resolution: {{tarball: '{url}'}}\n\n  z@1.0.0:\n    resolution: {{integrity: sha512-z,\n      tarball: \"{url}\"}}\n\n  ok@1.0.0:\n    resolution: {{integrity: sha512-ok}}\n"
     );
-    let packages = super::pnpm::pnpm_packages(&lock);
+    let packages = crate::formats::pnpm::pnpm_packages(&lock);
     let by_key = |key: &str| packages.iter().find(|p| p.key == key).unwrap();
     for key in ["x@1.0.0", "y@1.0.0", "z@1.0.0"] {
         let package = by_key(key);
@@ -2584,9 +2751,9 @@ async fn vlt_lock_wins_the_sibling_order_behind_a_refused_pnpm_lock() {
 ///
 /// The rewriter turns `name==X` into the PEP 508 direct reference
 /// `name @ <patch-server url> --hash=sha256:…`, which the exact-pin rule
-/// does not match — so every redirected line dropped out of the inventory
-/// and a second hosted run over a wet requirements.txt reported ONE package
-/// with patches instead of twelve. uv.lock keeps its `[[package]]`
+/// does not match — without the direct-reference reader every redirected
+/// line would drop out of the inventory and a second hosted run over a wet
+/// requirements.txt would undercount its patched packages. uv.lock keeps its `[[package]]`
 /// name/version through the same rewrite; requirements.txt must too, the
 /// way Pipfile.lock's own reader already keeps a Socket-written reference
 /// (`socket_reference_coords`).
@@ -2666,7 +2833,6 @@ async fn the_hosted_rewriters_own_output_reinventories() {
             sha256: Some("c".repeat(64)),
             ..Default::default()
         },
-        berry_zip_url: None,
         registry_override: None,
     };
     let rewritten = rewrite_registry_redirect(
@@ -2698,7 +2864,7 @@ async fn the_hosted_rewriters_own_output_reinventories() {
 /// `./<rel wheel>[ ; marker] --hash=sha256:<hex>  # socket-patch vendor:
 /// <name>==<ver>` (`vendor::pypi_requirements::vendor_line`) — with no
 /// `name @` at all, so the direct-reference reader never sees it and the
-/// package drops out of the inventory exactly the way the hosted lines did.
+/// package would drop out of the inventory just like unread hosted lines.
 /// The `socket-patch vendor:` comment tag is the name/version the writer
 /// left for its readers; cross-check it against the path's own coordinates.
 #[tokio::test]

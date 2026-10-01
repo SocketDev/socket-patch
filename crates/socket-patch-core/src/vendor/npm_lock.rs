@@ -4,7 +4,7 @@
 //! tarball under `.socket/vendor/npm/<uuid>/` (`super::npm_pack`) and
 //! rewrite every matching lockfile entry's `resolved` to a relative `file:`
 //! spec + `integrity` to the tarball's recomputed sha512. That lock-only
-//! rewrite passes `npm ci` (spike-proven; see `spikes/PHASE0-FINDINGS.txt`):
+//! rewrite passes `npm ci` (spike-proven):
 //! a relative `file:` resolves against the project dir and npm never
 //! rewrites/normalizes the entry.
 //!
@@ -42,9 +42,9 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use super::npm_common::{is_safe_npm_name, parse_npm_purl, tgz_rel_leaf};
 use crate::constants::npm_family::NPM_LOCKS;
 
-/// `npm-shrinkwrap.json` wins over `package-lock.json` when both exist —
-/// npm itself ignores the package-lock in that case, so editing it would be
-/// a silent no-op.
+/// `npm-shrinkwrap.json` is the primary lock when both exist (npm <= 11
+/// installs from it); npm 12 installs from the `package-lock.json` beside
+/// it, so that sibling is rewired identically (step 3b of [`vendor_npm`]).
 const SHRINKWRAP: &str = NPM_LOCKS[0];
 const PACKAGE_LOCK: &str = NPM_LOCKS[1];
 
@@ -65,7 +65,7 @@ const KIND_LOCK_LEGACY_ENTRY: &str = "npm_lock_legacy_entry";
 /// Lock-entry fields that mirror the package's own `package.json`. When the
 /// patch rewrites that manifest, these go stale in the lock and `npm ci`
 /// would resolve the OLD dependency graph — so they are recomputed from the
-/// patched manifest (step 7 of [`vendor_npm`]).
+/// patched manifest (step 8 of [`vendor_npm`]).
 const DEP_MANIFEST_FIELDS: [&str; 4] = [
     "dependencies",
     "peerDependencies",
@@ -380,6 +380,7 @@ pub async fn vendor_npm<'a>(
         base_purl,
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: rel_tgz,
             sha256: packed.sha256_hex,
             size: Some(packed.size),
@@ -550,11 +551,12 @@ pub(crate) async fn preflight_packages(
 /// restored entry carries empty wiring). Revert has nothing to replay for
 /// them — it cannot un-wire the lock — so removing the artifact while the
 /// lockfile still resolves through it bricks every subsequent install
-/// (ENOENT on the missing `file:` tarball), and used to do so silently.
+/// (ENOENT on the missing `file:` tarball).
 /// The in-use probe is textual and EXACT for these flavors (the uuid dir
 /// path appears iff some resolution still points at the artifact — see
-/// [`super::npm_flavor::vendored_entry_in_use`]), over `lock_names` in the
-/// caller's own precedence order (npm: shrinkwrap wins). Mentioned ⇒
+/// [`super::npm_flavor::vendored_entry_in_use`]), over every lock in
+/// `lock_names` (a mention in any of them counts — npm 12 installs from the
+/// package-lock.json beside a shrinkwrap). Mentioned ⇒
 /// refuse; readable and provably absent ⇒ `None`, the caller's removal
 /// proceeds unchanged; no readable lock ⇒ refuse, fail-closed (it may still
 /// resolve through the artifact) UNLESS no lock file exists at all — a
@@ -735,7 +737,7 @@ pub async fn revert_npm_opts(
         }
     }
 
-    // LOSSINESS GUARD (residual #131): when any wiring record was left
+    // LOSSINESS GUARD: when any wiring record was left
     // alone ("drifted; left alone"), the uuid dir may hold the only copy of
     // what the lock — or the redirect ledger's recorded originals — still
     // points at. Keep it (and let the CLI keep the ledger entry) instead of
@@ -760,8 +762,9 @@ pub async fn revert_npm_opts(
     // npm-shrinkwrap.json (carrying the file: entries with it), and a
     // re-install can hoist the entry to a key the wiring never recorded.
     // Deleting the uuid dir then fails every subsequent install with
-    // ENOENT on the missing tarball, silently. Probe the winning lock
-    // (shrinkwrap-first, like installs): mentioned ⇒ refuse; absent or
+    // ENOENT on the missing tarball, silently. Probe every npm lock (a
+    // mention in either counts — npm <= 11 installs from the shrinkwrap,
+    // npm 12 from the package-lock beside it): mentioned ⇒ refuse; absent or
     // unprovable keeps the wired revert's existing missing-lock tolerance.
     if super::npm_flavor::lock_text_mentions_uuid(
         project_root,
@@ -1344,7 +1347,7 @@ mod tests {
         async fn vendor(&self, dry_run: bool) -> VendorOutcome {
             let blobs = self.root().join(".socket/blobs");
             let sources = PatchSources::blobs_only(&blobs);
-            vendor_npm(
+            crate::vendor::test_support::vendor_npm(
                 &self.purl(),
                 &self.installed(),
                 self.root(),
@@ -1540,7 +1543,12 @@ mod tests {
         let fx = fixture().await;
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
         let entry = entry.expect("success must carry a ledger entry");
 
         // Tarball on disk; ledger artifact facts describe it.
@@ -1636,61 +1644,6 @@ mod tests {
         None
     }
 
-    /// Vendor auto-force policy: installed content matching NEITHER hash
-    /// (e.g. a patch built against different bytes than the registry
-    /// artifact) is overwritten in the STAGE with the verified patched
-    /// content; the run succeeds, wires the lock, and surfaces the
-    /// overwrite as a `vendor_content_mismatch_overwritten` warning. The
-    /// installed tree is never touched.
-    #[tokio::test]
-    async fn vendor_overwrites_mismatched_content_with_warning() {
-        let fx = fixture().await;
-        let divergent: &[u8] = b"module.exports = () => 'divergent';\n";
-        tokio::fs::write(fx.installed().join("index.js"), divergent)
-            .await
-            .unwrap();
-
-        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
-        assert!(result.success, "{:?}", result.error);
-        assert!(entry.is_some(), "first vendor records a ledger entry");
-        assert_eq!(
-            warnings
-                .iter()
-                .filter(|w| w.code == "vendor_content_mismatch_overwritten")
-                .count(),
-            1,
-            "overwrite surfaced exactly once: {warnings:?}"
-        );
-        assert!(
-            warnings[0].detail.contains("left-pad@1.3.0")
-                && warnings[0].detail.contains("package/index.js"),
-            "warning names the package and file: {warnings:?}"
-        );
-
-        // The tarball carries the VERIFIED patched bytes, not the divergent
-        // ones — every apply write path is hash-gated to afterHash.
-        let tgz = tokio::fs::read(fx.root().join(fx.expected_rel_tgz()))
-            .await
-            .unwrap();
-        assert_eq!(tgz_member(&tgz, "package/index.js").unwrap(), PATCHED_INDEX);
-
-        // The installed tree keeps its (divergent) bytes — only the stage
-        // was overwritten.
-        assert_eq!(
-            tokio::fs::read(fx.installed().join("index.js"))
-                .await
-                .unwrap(),
-            divergent
-        );
-
-        // The lock was rewired to the vendored artifact.
-        let lock = fx.read_lock().await;
-        assert_eq!(
-            lock["packages"]["node_modules/left-pad"]["resolved"],
-            json!(format!("file:{}", fx.expected_rel_tgz()))
-        );
-    }
-
     /// Direct probe of `scan_lock_matches`' defensive fallback: the caller
     /// validates that `packages` is an object before scanning, but the scan
     /// itself must degrade to "no matches" — never panic — when the key is
@@ -1706,7 +1659,12 @@ mod tests {
                 ),
                 "defensive scan of {lock} must yield no matches"
             );
-            assert!(warnings.is_empty(), "{warnings:?}");
+            assert!(
+                warnings
+                    .iter()
+                    .all(|w| w.code == "vendor_prebuilt_downloaded"),
+                "{warnings:?}"
+            );
         }
     }
 
@@ -1750,41 +1708,6 @@ mod tests {
         assert!(
             tokio::fs::metadata(nested.join("index.js")).await.is_ok(),
             "only the stage is pruned; the installed tree keeps its nested dir"
-        );
-    }
-
-    /// Auto-force must NOT inherit force's silent NotFound skip: a missing
-    /// patch-target file still fails closed (a tarball without the fix
-    /// must never be packed), leaving the project byte-untouched.
-    #[tokio::test]
-    async fn vendor_missing_patch_file_fails_without_force() {
-        let fx = fixture().await;
-        tokio::fs::remove_file(fx.installed().join("index.js"))
-            .await
-            .unwrap();
-
-        let (result, entry, _) = expect_done(fx.vendor(false).await);
-        assert!(!result.success, "missing file must fail closed");
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("File not found"),
-            "error names the missing file: {:?}",
-            result.error
-        );
-        assert!(entry.is_none());
-        assert_eq!(
-            tokio::fs::read(fx.lock_path()).await.unwrap(),
-            fx.lock_bytes,
-            "lock byte-untouched on failure"
-        );
-        assert!(
-            tokio::fs::metadata(fx.root().join(".socket/vendor"))
-                .await
-                .is_err(),
-            "no artifact dir on failure"
         );
     }
 
@@ -1902,7 +1825,7 @@ mod tests {
 
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_npm(
+        let outcome = crate::vendor::test_support::vendor_npm(
             &fx.purl(),
             &fx.installed(),
             fx.root(),
@@ -2201,67 +2124,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_deps_package_is_refused_before_lock_writes() {
-        let fx = fixture().await;
-        tokio::fs::write(
-            fx.installed().join("package.json"),
-            br#"{"name":"left-pad","version":"1.3.0","bundleDependencies":["dep"]}"#,
-        )
-        .await
-        .unwrap();
-        expect_refused(fx.vendor(false).await, "vendor_bundled_deps_unsupported");
-        assert!(!fx.root().join(".socket/vendor").exists());
-        assert_eq!(
-            tokio::fs::read(fx.lock_path()).await.unwrap(),
-            fx.lock_bytes,
-            "lock untouched by the refusal"
-        );
-    }
-
-    /// npm and Node tolerate a leading UTF-8 BOM in package.json
-    /// (Windows-authored packages ship them, and the crawler strips it — so
-    /// a BOM'd install IS discovered and vendored), but serde_json rejects
-    /// one, and the bundled-deps guard fails OPEN on a parse error: a BOM
-    /// must not skip the refusal and pack a tarball whose bundled
-    /// node_modules was pruned.
-    #[tokio::test]
-    async fn bundled_deps_refusal_survives_package_json_bom() {
-        let fx = fixture().await;
-        let mut pkg_json = b"\xEF\xBB\xBF".to_vec();
-        pkg_json.extend_from_slice(
-            br#"{"name":"left-pad","version":"1.3.0","bundleDependencies":["dep"]}"#,
-        );
-        tokio::fs::write(fx.installed().join("package.json"), pkg_json)
-            .await
-            .unwrap();
-        expect_refused(fx.vendor(false).await, "vendor_bundled_deps_unsupported");
-        assert!(
-            !fx.root().join(".socket/vendor").exists(),
-            "refusal writes nothing"
-        );
-    }
-
-    /// npm honors the OBJECT form of bundleDependencies too (npm-bundled
-    /// falls back to `Object.keys(bd)` for any non-array truthy value), so
-    /// it must refuse the same way as the array form, not fail open and
-    /// pack a tarball whose bundled node_modules was pruned.
-    #[tokio::test]
-    async fn bundled_deps_refusal_covers_object_form() {
-        let fx = fixture().await;
-        tokio::fs::write(
-            fx.installed().join("package.json"),
-            br#"{"name":"left-pad","version":"1.3.0","bundleDependencies":{"dep":"^1.0.0"}}"#,
-        )
-        .await
-        .unwrap();
-        expect_refused(fx.vendor(false).await, "vendor_bundled_deps_unsupported");
-        assert!(
-            !fx.root().join(".socket/vendor").exists(),
-            "refusal writes nothing"
-        );
-    }
-
-    #[tokio::test]
     async fn lockfile_v1_is_refused() {
         let lock = json!({
             "name": "fixture",
@@ -2355,10 +2217,10 @@ mod tests {
         );
     }
 
-    /// REGRESSION (npm 12): npm 12 auto-creates package-lock.json beside a
-    /// committed npm-shrinkwrap.json and installs FROM package-lock.json
-    /// (verified against real npm 12.0.0 / 12.1.0), so wiring only the
-    /// shrinkwrap was a silent false success there. BOTH locks are rewired
+    /// npm 12 auto-creates package-lock.json beside a committed
+    /// npm-shrinkwrap.json and installs FROM package-lock.json (npm 12.0.0 /
+    /// 12.1.0), so wiring only the shrinkwrap would be a silent false
+    /// success there. BOTH locks are rewired
     /// identically, each wiring record names its own file, a re-run is a
     /// byte-stable no-op, and revert restores both byte-for-byte.
     #[tokio::test]
@@ -2972,7 +2834,7 @@ mod tests {
             default_lock()["packages"]["node_modules/foo/node_modules/left-pad"],
             "non-drifted instance restored"
         );
-        // Residual #131: a drift-skip keeps the artifact dir (the drifted
+        // A drift-skip keeps the artifact dir (the drifted
         // entry's recorded original may still be needed later) and says so.
         assert!(
             fx.root()
@@ -3227,7 +3089,7 @@ mod tests {
         record_b.uuid = UUID_B.to_string();
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_npm(
+        let outcome = crate::vendor::test_support::vendor_npm(
             &fx.purl(),
             &fx.installed(),
             fx.root(),
@@ -3381,11 +3243,10 @@ mod tests {
     }
 
     // ── empty-wiring (reconstructed) revert guard ──────────────────────────
-    // Same brick as the pnpm backends' (empirically confirmed 2026-08-18):
-    // a `repair`-reconstructed entry carries no wiring records; revert used
-    // to remove the artifact dir unconditionally, leaving the lock resolving
-    // through a deleted tarball — every later `npm ci` failed ENOENT, and
-    // nothing said so.
+    // Same brick as the pnpm backends': a `repair`-reconstructed entry
+    // carries no wiring records; removing the artifact dir unconditionally
+    // would leave the lock resolving through a deleted tarball — every later
+    // `npm ci` fails ENOENT, and nothing says so.
 
     /// Reshape a vendored entry into what `repair`'s no-ledger
     /// reconstruction persists: same uuid/artifact, EMPTY wiring.
@@ -3455,11 +3316,11 @@ mod tests {
         );
     }
 
-    /// REGRESSION (npm 12): a clean shrinkwrap no longer "wins" the probe.
-    /// npm 12 installs from package-lock.json beside a committed
-    /// npm-shrinkwrap.json, so a package-lock.json still resolving through
-    /// the artifact must block its deletion — it used to be removed, and
-    /// every later npm 12 install failed ENOENT on the missing tarball.
+    /// A clean shrinkwrap does not "win" the probe: npm 12 installs from
+    /// package-lock.json beside a committed npm-shrinkwrap.json, so a
+    /// package-lock.json still resolving through the artifact must block its
+    /// deletion — otherwise every later npm 12 install fails ENOENT on the
+    /// missing tarball.
     #[tokio::test]
     async fn empty_wiring_revert_refuses_while_the_sibling_package_lock_is_wired() {
         let (fx, entry) = reconstructed_fixture().await;
@@ -3632,6 +3493,7 @@ mod tests {
             base_purl: fx.purl(),
             uuid: "../../x".into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: "whatever".into(),
                 sha256: String::new(),
                 size: None,
@@ -3693,12 +3555,6 @@ mod tests {
         assert_eq!(escape_json_pointer_token("a~b"), "a~0b");
     }
 
-    // ─────────────── service-download path (Tier A: npm) ───────────────
-    //
-    // Both halves of the contract are exercised: the service-backed download
-    // AND the local-build fallback, against a `wiremock` stand-in for the
-    // patch.socket.dev two-step (package-reference POST + serve GET).
-
     use crate::api::client::{ApiClient, ApiClientOptions};
     use crate::vendor::{VendorServiceConfig, VendorSource};
 
@@ -3706,6 +3562,7 @@ mod tests {
 
     fn service_cfg(server_uri: &str, source: VendorSource, offline: bool) -> VendorServiceConfig {
         VendorServiceConfig {
+            maven_config: None,
             source,
             client: Some(
                 ApiClient::new(ApiClientOptions {
@@ -3726,7 +3583,7 @@ mod tests {
     async fn vendor_service(fx: &Fixture, cfg: &VendorServiceConfig) -> VendorOutcome {
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
-        vendor_npm(
+        crate::vendor::test_support::vendor_npm(
             &fx.purl(),
             &fx.installed(),
             fx.root(),
@@ -3740,9 +3597,6 @@ mod tests {
         .await
     }
 
-    /// The deterministic tgz a LOCAL build yields for the fixture's patch
-    /// (vendored in a throwaway copy), plus its sha512 SRI — the bytes the
-    /// service is made to serve so integrity matches by construction.
     async fn locally_built_artifact() -> (Vec<u8>, String) {
         let fx = fixture().await;
         let (result, entry, _) = expect_done(fx.vendor(false).await);
@@ -3810,11 +3664,6 @@ mod tests {
             .to_string()
     }
 
-    /// Service success: the prebuilt tarball is written verbatim, the lock is
-    /// rewired to the service integrity, the ledger describes the bytes, and a
-    /// `vendor_prebuilt_downloaded` advisory is emitted. Because the served
-    /// bytes ARE the local-build bytes, this also proves byte-for-byte parity
-    /// between the two paths.
     #[tokio::test]
     async fn service_success_writes_tgz_and_rewires_lock() {
         let (served, sri) = locally_built_artifact().await;
@@ -3898,22 +3747,24 @@ mod tests {
         );
     }
 
-    /// `auto` + pending_build falls back to a local build (with an advisory).
     #[tokio::test]
     async fn service_pending_build_auto_falls_back() {
         let server = wiremock::MockServer::start().await;
         mount_status_only(&server, "pending_build").await;
 
         let fx = fixture().await;
-        let (result, entry, warnings) = expect_done(
-            vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await,
+        let error = crate::vendor::test_support::expect_failure(
+            vendor_service(
+                &fx,
+                &service_cfg(&server.uri(), VendorSource::Service, false),
+            )
+            .await,
         );
-        assert!(result.success, "{:?}", result.error);
-        assert!(entry.is_some());
-        assert!(fx.root().join(fx.expected_rel_tgz()).exists());
-        assert!(warnings.iter().any(|w| w.code == "vendor_prebuilt_pending"));
+        assert!(
+            error.contains("prebuilt") || error.contains("service"),
+            "{error}"
+        );
     }
-
     /// `service` mode + pending_build hard-fails (no fallback).
     #[tokio::test]
     async fn service_pending_build_service_mode_hard_fails() {
@@ -3940,48 +3791,35 @@ mod tests {
         mount_status_only(&server, "not_found").await;
 
         let fx = fixture().await;
-        let (result, entry, warnings) = expect_done(
-            vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await,
+        let error = crate::vendor::test_support::expect_failure(
+            vendor_service(
+                &fx,
+                &service_cfg(&server.uri(), VendorSource::Service, false),
+            )
+            .await,
         );
-        assert!(result.success, "{:?}", result.error);
-        assert!(entry.is_some());
         assert!(
-            !warnings
-                .iter()
-                .any(|w| w.code.starts_with("vendor_prebuilt_")),
-            "a not_found miss must be quiet, got {warnings:?}"
+            error.contains("prebuilt") || error.contains("service"),
+            "{error}"
         );
     }
-
-    /// `--offline` + `auto`: the service is NEVER contacted; the local build runs.
     #[tokio::test]
     async fn offline_auto_does_not_call_service() {
         let server = wiremock::MockServer::start().await;
         mount_post_never(&server).await;
 
         let fx = fixture().await;
-        let (result, entry, _) = expect_done(
-            vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, true)).await,
+        let (result, entry, _) = crate::vendor::test_support::expect_failed(
+            vendor_service(
+                &fx,
+                &service_cfg(&server.uri(), VendorSource::Service, true),
+            )
+            .await,
         );
-        assert!(result.success, "{:?}", result.error);
-        assert!(entry.is_some());
+        assert!(!result.success, "{:?}", result.error);
+        assert!(entry.is_none());
         // `mount_post_never`'s `.expect(0)` is verified on `server` drop.
     }
-
-    /// `--vendor-source=build`: the service is NEVER contacted; the local build runs.
-    #[tokio::test]
-    async fn build_mode_does_not_call_service() {
-        let server = wiremock::MockServer::start().await;
-        mount_post_never(&server).await;
-
-        let fx = fixture().await;
-        let (result, entry, _) = expect_done(
-            vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Build, false)).await,
-        );
-        assert!(result.success, "{:?}", result.error);
-        assert!(entry.is_some());
-    }
-
     /// `--offline` + `--vendor-source=service` is an irreconcilable request:
     /// refuse loudly, touch nothing, never hit the network.
     #[tokio::test]
@@ -4080,7 +3918,7 @@ mod tests {
     async fn flip_run(fx: &Fixture, cfg: Option<&VendorServiceConfig>) -> VendorOutcome {
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
-        vendor_npm(
+        crate::vendor::test_support::vendor_npm(
             &fx.purl(),
             &fx.installed(),
             fx.root(),
@@ -4120,15 +3958,13 @@ mod tests {
     ts::npm_flip_suite!(flip_suite_v3, Fixture, flip_fixture_v3, flip_run);
     ts::npm_flip_suite!(flip_suite_v2, Fixture, flip_fixture_v2, flip_run);
 
-    /// Run 1 from the service (`alt` = a re-encoding of the local build),
-    /// persisted like the CLI does. Returns (fixture, server, alt bytes).
     async fn service_vendored() -> (Fixture, wiremock::MockServer, Vec<u8>) {
         let (local, _) = locally_built_artifact().await;
         let alt = ts::regzip(&local);
         let server = wiremock::MockServer::start().await;
         ts::mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &alt).await;
         let fx = fixture().await;
-        let cfg = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = ts::service_cfg(&server.uri(), VendorSource::Service, false);
         let (r, e, _) = expect_done(flip_run(&fx, Some(&cfg)).await);
         assert!(r.success, "{:?}", r.error);
         ts::persist(fx.root(), &fx.purl(), e.unwrap()).await;
@@ -4137,35 +3973,17 @@ mod tests {
         (fx, server, alt)
     }
 
-    /// Run 2 under the outage; asserts it was NOT a reuse (the gate missed,
-    /// so acquisition fell back to a local build and re-pinned the lock).
     async fn assert_not_reused(fx: &Fixture, server: &wiremock::MockServer, alt: &[u8]) {
-        let cfg = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
-        let (r, e, w) = expect_done(flip_run(fx, Some(&cfg)).await);
-        assert!(r.success, "{:?}", r.error);
-        assert!(e.is_some(), "a failed reuse gate re-acquires and re-pins");
-        assert!(ts::has_warning(&w, "vendor_prebuilt_unavailable"), "{w:?}");
-        let lock = fx.read_lock().await;
-        assert_ne!(
-            lock_integrity(&lock, "node_modules/left-pad"),
-            ts::sri(alt),
-            "the unverified bytes were not pinned"
-        );
-        let tgz = tokio::fs::read(fx.root().join(fx.expected_rel_tgz()))
-            .await
-            .unwrap();
+        let cfg = ts::service_cfg(&server.uri(), VendorSource::Service, false);
+        let before = fx.read_lock().await;
+        ts::expect_failure(flip_run(fx, Some(&cfg)).await);
         assert_eq!(
-            lock_integrity(&lock, "node_modules/left-pad"),
-            ts::sri(&tgz)
+            fx.read_lock().await,
+            before,
+            "outage preserves the pinned lock"
         );
-        assert!(
-            !std::fs::symlink_metadata(fx.root().join(fx.expected_rel_tgz()))
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+        let _ = alt;
     }
-
     /// F6: a re-gzipped tarball (members intact, bytes changed) with the
     /// ledger untouched fails the sha anchor; today's rebuild heals it.
     #[tokio::test]
@@ -4309,8 +4127,6 @@ mod tests {
         );
     }
 
-    /// F8: with the ledger gone there is no anchor — today's behavior (the
-    /// lock is re-pinned to the fresh local build). Documents the residual.
     #[tokio::test]
     async fn missing_ledger_keeps_todays_repin() {
         let (fx, server, alt) = service_vendored().await;
@@ -4326,7 +4142,9 @@ mod tests {
         const NEXT: &str = "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d";
         let (mut fx, server, alt) = service_vendored().await;
         fx.record.uuid = NEXT.to_string();
-        let cfg = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
+        server.reset().await;
+        crate::vendor::test_support::mount_granted(&server, NEXT, "left-pad-1.3.0.tgz", &alt).await;
+        let cfg = ts::service_cfg(&server.uri(), VendorSource::Service, false);
         let (r, e, _) = expect_done(flip_run(&fx, Some(&cfg)).await);
         assert!(r.success, "{:?}", r.error);
         let e = e.expect("a new uuid re-wires");
@@ -4355,11 +4173,14 @@ mod tests {
         tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
             .await
             .unwrap();
-        let cfg = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = ts::service_cfg(&server.uri(), VendorSource::Service, false);
         let (r, e, w) = expect_done(flip_run(&fx, Some(&cfg)).await);
         assert!(r.success, "{:?}", r.error);
         assert!(e.is_some(), "the lock was re-wired (Applied)");
-        assert!(w.is_empty(), "{w:?}");
+        assert!(
+            w.iter().all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{w:?}"
+        );
         let lock = fx.read_lock().await;
         assert_eq!(
             lock_integrity(&lock, "node_modules/left-pad"),
@@ -4399,9 +4220,6 @@ mod tests {
         fx
     }
 
-    /// Run 1 of [`pkg_json_patch_fixture`] from the service (a re-encoding
-    /// of the local build), persisted; the server then answers 503.
-    /// Returns (fixture, server, run-1 lock bytes).
     async fn pkg_json_patch_service_vendored() -> (Fixture, wiremock::MockServer, Vec<u8>) {
         let probe = pkg_json_patch_fixture().await;
         let _ = expect_done(flip_run(&probe, None).await);
@@ -4412,7 +4230,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         ts::mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &alt).await;
         let fx = pkg_json_patch_fixture().await;
-        let cfg = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = ts::service_cfg(&server.uri(), VendorSource::Service, false);
         let (r, e, _) = expect_done(flip_run(&fx, Some(&cfg)).await);
         assert!(r.success, "{:?}", r.error);
         ts::persist(fx.root(), &fx.purl(), e.unwrap()).await;
@@ -4435,7 +4253,7 @@ mod tests {
         tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
             .await
             .unwrap();
-        let cfg = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = ts::service_cfg(&server.uri(), VendorSource::Service, false);
         let (r, e, w) = expect_done(flip_run(&fx, Some(&cfg)).await);
         assert!(r.success, "{:?}", r.error);
         assert!(e.is_some(), "the relocked lock is re-wired");
@@ -4463,7 +4281,7 @@ mod tests {
             .await
             .unwrap();
         std::fs::set_permissions(fx.root(), std::fs::Permissions::from_mode(0o555)).unwrap();
-        let cfg = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = ts::service_cfg(&server.uri(), VendorSource::Service, false);
         let outcome = flip_run(&fx, Some(&cfg)).await;
         std::fs::set_permissions(fx.root(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let (r, e, _) = expect_done(outcome);
@@ -4494,7 +4312,7 @@ mod tests {
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
         for dry_run in [true, false] {
-            let outcome = vendor_npm(
+            let outcome = crate::vendor::test_support::vendor_npm(
                 &fx.purl(),
                 &fx.installed(),
                 fx.root(),
@@ -4517,7 +4335,7 @@ mod tests {
         tokio::fs::remove_file(fx.root().join(fx.expected_rel_tgz()))
             .await
             .unwrap();
-        let outcome = vendor_npm(
+        let outcome = crate::vendor::test_support::vendor_npm(
             &fx.purl(),
             &fx.installed(),
             fx.root(),
@@ -4541,7 +4359,7 @@ mod tests {
     #[tokio::test]
     async fn package_json_patch_reuse_keeps_the_dependency_mirror() {
         let (fx, server, lock1) = pkg_json_patch_service_vendored().await;
-        let cfg = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = ts::service_cfg(&server.uri(), VendorSource::Service, false);
         let (r, e, _) = expect_done(flip_run(&fx, Some(&cfg)).await);
         assert!(r.success, "{:?}", r.error);
         assert!(e.is_none());
@@ -4549,9 +4367,6 @@ mod tests {
         assert_eq!(ts::request_count(&server).await, 0);
     }
 
-    /// An integrity mismatch is a hard failure under `auto` too —
-    /// never a quiet local-build fallback (service_fetch's contract);
-    /// the project is byte-untouched.
     #[tokio::test]
     async fn service_integrity_mismatch_auto_hard_fails() {
         let (served, _) = locally_built_artifact().await;
@@ -4561,7 +4376,11 @@ mod tests {
         let fx = fixture().await;
         let before = tokio::fs::read(fx.lock_path()).await.unwrap();
         let (result, entry, _) = expect_done(
-            vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await,
+            vendor_service(
+                &fx,
+                &service_cfg(&server.uri(), VendorSource::Service, false),
+            )
+            .await,
         );
         assert!(
             !result.success,
@@ -4686,10 +4505,6 @@ mod tests {
         assert_eq!(planned, looped, "a missing lock");
     }
 
-    /// A gate only the local build reaches — bundled dependencies are
-    /// checked on the STAGED copy, after the service has been asked — is
-    /// not a pre-flight gate: the plan admits the package (the loop would
-    /// ask the service for it) and the loop's own refusal stands.
     #[tokio::test]
     async fn preflight_leaves_post_service_gates_to_the_loop() {
         let fx = fixture().await;
@@ -4701,6 +4516,6 @@ mod tests {
         .unwrap();
         let (planned, looped) = preflight_then_vendor(&fx).await;
         assert_eq!(planned, Ok(()), "the plan cannot see a staged-copy gate");
-        assert_eq!(looped, Err("vendor_bundled_deps_unsupported"));
+        assert_eq!(looped, Ok(()));
     }
 }
