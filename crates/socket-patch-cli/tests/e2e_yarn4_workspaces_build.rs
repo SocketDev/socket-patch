@@ -559,7 +559,8 @@ async fn yarn4_workspaces_hosted_redirect_rewires_member_dep_from_root_scan() {
     // #404 option C: the entry is keyed by the tarball descriptor, and the
     // root package.json routes the locked descriptor there.
     assert!(
-        lock.contains(&format!("\n\"{DEP}@{hosted_url}\":\n")),
+        lock.lines()
+            .any(|l| l.trim_end_matches('\r') == format!("\"{DEP}@{hosted_url}\":")),
         "yarn.lock entry must be keyed by the tarball descriptor; got:\n{lock}"
     );
     let root_pkg = std::fs::read_to_string(proj.join("package.json")).unwrap();
