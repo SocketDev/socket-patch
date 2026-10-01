@@ -1,0 +1,89 @@
+name: bughunt uv global probe
+on:
+  push:
+    branches: ['bughunt/uv/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: tar.gz }
+          - { os: macos-latest, target: aarch64-apple-darwin, ext: tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: zip }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: bughunt-uv
+          save-if: false
+      - run: cargo build --release -p socket-patch-cli
+      - name: probe
+        env:
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          set -u
+          W="$RUNNER_TEMP/w"; mkdir -p "$W"
+          SP="$PWD/target/release/socket-patch"
+          PY="$(python -c 'import sys;print(sys.executable)')"
+          cat > "$W/mock.py" <<'PYEOF'
+          import json, sys
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          LOG = sys.argv[1]
+          class H(BaseHTTPRequestHandler):
+              def log_message(self, *a): pass
+              def _send(self, code, obj):
+                  b = json.dumps(obj).encode(); self.send_response(code)
+                  self.send_header('content-type', 'application/json'); self.send_header('content-length', str(len(b))); self.end_headers(); self.wfile.write(b)
+              def do_POST(self):
+                  n = int(self.headers.get('content-length', 0)); body = self.rfile.read(n).decode()
+                  open(LOG, 'a').write(f"POST {self.path} {body}\n")
+                  self._send(200, {"packages": [], "canAccessPaidPatches": False})
+              def do_GET(self):
+                  open(LOG, 'a').write(f"GET {self.path}\n"); self._send(404, {})
+          HTTPServer(('127.0.0.1', 8787), H).serve_forever()
+          PYEOF
+          python "$W/mock.py" "$W/req.log" &
+          sleep 2
+          for V in 0.4.30 0.5.31 0.8.17 0.9.5; do
+            echo "::group::uv $V"
+            D="$W/uv-$V"; mkdir -p "$D"
+            curl -sSLf -o "$D/uv.$EXT" "https://github.com/astral-sh/uv/releases/download/$V/uv-$TARGET.$EXT"
+            if [ "$EXT" = zip ]; then (cd "$D" && unzip -q -o uv.zip); else tar -xzf "$D/uv.$EXT" -C "$D"; fi
+            UV="$(find "$D" -type f \( -name uv -o -name uv.exe \) | head -1)"
+            "$UV" --version
+            DEF_DIR="$("$UV" tool dir)"; echo "default uv tool dir: $DEF_DIR"
+            "$UV" tool uninstall pycowsay >/dev/null 2>&1 || true
+            "$UV" tool install --python "$PY" --with six==1.16.0 pycowsay >/dev/null 2>&1 || echo "default install failed"
+            CUS="$W/custom tools $V"
+            UV_TOOL_DIR="$CUS" UV_TOOL_BIN_DIR="$W/cbin-$V" "$UV" tool install --python "$PY" --with idna==3.7 pycowsay >/dev/null 2>&1 || echo "custom install failed"
+            echo "on disk default: $(find "$DEF_DIR" -name 'six-*.dist-info' 2>/dev/null | head -1)"
+            echo "on disk custom:  $(find "$CUS" -name 'idna-*.dist-info' 2>/dev/null | head -1)"
+            for envset in "none" "UV_TOOL_DIR"; do
+              : > "$W/req.log"
+              if [ "$envset" = none ]; then
+                env -u SOCKET_API_TOKEN SOCKET_PROXY_URL=http://127.0.0.1:8787 "$SP" scan -g --ecosystems pypi --json > "$W/out.json" 2>"$W/err.txt"; rc=$?
+              else
+                env -u SOCKET_API_TOKEN UV_TOOL_DIR="$CUS" SOCKET_PROXY_URL=http://127.0.0.1:8787 "$SP" scan -g --ecosystems pypi --json > "$W/out.json" 2>"$W/err.txt"; rc=$?
+              fi
+              found="$(grep -o 'pkg:pypi/\(six\|idna\)@[0-9.]*' "$W/req.log" | sort -u | tr '\n' ' ')"
+              echo "RESULT os=$RUNNER_OS uv=$V env=$envset exit=$rc queried: $found"
+            done
+            "$UV" tool uninstall pycowsay >/dev/null 2>&1 || true
+            rm -rf "$CUS"
+            echo "::endgroup::"
+          done
+          grep -h "" /dev/null
