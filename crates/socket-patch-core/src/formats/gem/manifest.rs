@@ -81,7 +81,7 @@ impl LoadedManifest {
         match self {
             LoadedManifest::Unsupported { value, by } => Some(format!(
                 "bundler loads `{value}` ({}), not the project's Gemfile or gems.rb; \
-                 socket-patch only wires those, so this gem was left untouched (unset \
+                 socket-patch only wires those, so it left the gem manifests untouched (unset \
                  BUNDLE_GEMFILE, or point it at the project's Gemfile, and re-run)",
                 by.describe()
             )),
