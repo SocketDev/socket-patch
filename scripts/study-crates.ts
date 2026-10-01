@@ -30,7 +30,7 @@
  *     -p 'Inspect {file} for panics and unwraps. Summarize risks.'
  *
  *   # Fully programmatic prompt via a TS module:
- *   npx tsx scripts/study-crates.ts --prompt-file scripts/study-crates.config.example.ts
+ *   npx tsx scripts/study-crates.ts --prompt-file scripts/fix-bugs.config.example.ts
  *
  *   # Audit every test file/harness one at a time for reward-hacked tests:
  *   npx tsx scripts/study-crates.ts --tests \

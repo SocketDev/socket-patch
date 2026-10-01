@@ -1,5 +1,5 @@
 use socket_patch_cli::{commands, parse_argv_with_shortcuts, Commands};
-use socket_patch_core::utils::env_compat::{promote_legacy_env_vars, promote_peer_env_vars};
+use socket_patch_core::utils::env_compat::promote_peer_env_vars;
 use socket_patch_core::utils::socket_cli_config;
 
 /// Restore the default SIGPIPE disposition. The Rust runtime starts every
@@ -23,16 +23,11 @@ fn restore_default_sigpipe() {}
 
 #[tokio::main]
 async fn main() {
-    // Must precede any output: the deprecation warnings and clap help both
-    // write to possibly-already-closed pipes.
+    // Must precede any output: clap help writes to a possibly-already-closed
+    // pipe.
     restore_default_sigpipe();
 
-    // Migrate legacy SOCKET_PATCH_* env vars into the new SOCKET_* names
-    // before clap parses, so downstream code only needs to know the new
-    // names. A one-shot deprecation warning fires per legacy name set.
-    promote_legacy_env_vars();
-
-    // Then accept the JS socket-cli's SOCKET_CLI_* peer names (silently —
+    // Accept the JS socket-cli's SOCKET_CLI_* peer names (silently —
     // they are aliases, not deprecations) so `socket login` / socket-cli
     // env setups work for socket-patch unchanged. Canonical names win.
     promote_peer_env_vars();
@@ -47,8 +42,7 @@ async fn main() {
 
     // Then drop exported-but-empty SOCKET_* flag vars — global and
     // subcommand-local (`SOCKET_CWD=` means "unset", not "crash the
-    // parse"). Must run after the promotion so a blanked legacy name is
-    // scrubbed too.
+    // parse").
     socket_patch_cli::args::scrub_empty_env_vars();
 
     // The parser surface is `String`-typed, but argv is raw bytes on Unix —
@@ -100,7 +94,6 @@ async fn main() {
         Commands::Apply(args) => commands::apply::run(args).await,
         Commands::Vex(args) => commands::vex::run(args).await,
         Commands::Vendor(args) => commands::vendor::run(args).await,
-        Commands::Setup(args) => commands::setup::run(args).await,
         Commands::Rollback(args) => commands::rollback::run(args).await,
         Commands::Get(args) => commands::get::run(args).await,
         Commands::List(args) => commands::list::run(args).await,

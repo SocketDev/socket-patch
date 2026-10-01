@@ -41,11 +41,13 @@ for release in "${releases[@]}"; do
   for entry in "${suites[@]}"; do
     IFS=: read -r suite filter ignored <<<"$entry"
     echo "== yarn@$release $suite ${filter:-}" >&2
+    start_line=$(wc -l < "$log")
     if ! (cd "$root" && SOCKET_PATCH_YARN_CLASSIC_E2E_VERSION="$release" \
       SOCKET_PATCH_YARN_E2E_REQUIRED=1 \
       cargo test -q -p socket-patch-cli --test "$suite" -- ${filter:+"$filter"} \
       ${ignored:+"$ignored"} --nocapture --test-threads=1 >>"$log" 2>&1); then
       echo "FAIL yarn@$release $suite (log: $log)" >&2
+      tail -n "+$((start_line + 1))" "$log" >&2
       echo "VEXCELL leg=$suite yarn=$release mode=- cell=SUITE FAIL" >>"$log"
       status=1
     fi

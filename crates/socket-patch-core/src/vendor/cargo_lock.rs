@@ -3,22 +3,22 @@
 //! A `[patch.crates-io]` path entry alone does NOT survive `cargo build
 //! --locked`: the lock still records the crate's registry `source` +
 //! `checksum`, so cargo wants to re-lock and `--locked` fails closed with a
-//! generic error (spike-verified — `spikes/PHASE0-FINDINGS.txt` cargo claim
-//! 1). Deleting exactly the `source` and `checksum` keys from the crate's
-//! `[[package]]` entry makes cargo accept the path patch as the lock's sole
-//! provider; the edited lock is **byte-stable across builds** (locked and
-//! unlocked, claims 2/4) and the `dependencies` arrays reference the crate by
-//! plain name, so nothing else needs rewriting (claim 8).
+//! generic error (spike-verified with real cargo). Deleting exactly the
+//! `source` and `checksum` keys from the crate's `[[package]]` entry makes
+//! cargo accept the path patch as the lock's sole provider; the edited lock
+//! is **byte-stable across builds** (locked and unlocked) and the
+//! `dependencies` arrays reference the crate by plain name, so nothing else
+//! needs rewriting.
 //!
-//! Claim 8 holds only while `name`+`version` is unique in the lock. When the
-//! same name+version resolves from MULTIPLE sources (a registry entry plus a
-//! same-version git fork — a legal, cargo-generated shape), consumers'
-//! `dependencies` arrays disambiguate with FULL package-id strings
-//! (`"cfg-if 1.0.0 (registry+…)"`); detaching `source`/`checksum` from one
-//! entry dangles those references and breaks `--locked` builds. Vendor
-//! refuses that shape upstream via [`count_lock_entries`]. Once a copy is
-//! vendored, a user's same-version PATH crate may still be locked beside it
-//! (an untagged sourceless `"<name> <version>"` next to the tagged copy):
+//! Plain-name references hold only while `name`+`version` is unique in the
+//! lock. When the same name+version resolves from MULTIPLE sources (a
+//! registry entry plus a same-version git fork — a legal, cargo-generated
+//! shape), consumers' `dependencies` arrays disambiguate with FULL package-id
+//! strings (`"cfg-if 1.0.0 (registry+…)"`); detaching `source`/`checksum`
+//! from one entry dangles those references and breaks `--locked` builds.
+//! Vendor refuses that shape upstream via [`count_lock_entries`]. Once a copy
+//! is vendored, a user's same-version PATH crate may still be locked beside
+//! it (an untagged sourceless `"<name> <version>"` next to the tagged copy):
 //! every helper here selects entries by [`entry_rank`], so the fork is never
 //! mistaken for the copy, and the restore spells the registry entry by its
 //! full id while the fork shares its name+version.
@@ -64,6 +64,9 @@ use std::sync::Arc;
 use toml_edit::{DocumentMut, Item, Table};
 
 use super::cargo_tag;
+use crate::formats::cargo::{
+    locked_packages, metadata_checksum_key, parse_ref, LockedPackage,
+};
 use super::parse_memo::ParseMemo;
 use super::state::CargoLockOriginal;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
@@ -110,8 +113,8 @@ static LOCK_MEMO: ParseMemo<DocumentMut> = ParseMemo::new();
 
 /// The run's [`locked_packages`] of `Cargo.lock`, keyed on the lock bytes
 /// like [`LOCK_MEMO`]: the per-crate probes ([`probe_lock_entry_for`],
-/// [`count_lock_entries`]) each re-derived the whole package list — a few
-/// thousand entries on a workspace lock — several times per patched crate.
+/// [`count_lock_entries`]) would each re-derive the whole package list — a
+/// few thousand entries on a workspace lock — several times per patched crate.
 static PACKAGES_MEMO: ParseMemo<Vec<LockedPackage>> = ParseMemo::new();
 
 /// [`read_lock`]'s parse as its [`locked_packages`], memoized per lock bytes
@@ -211,170 +214,6 @@ fn set_version(table: &mut Table, version: &str) {
     }
 }
 
-/// The `[metadata]` key a v1 lock files `name`+`version`'s checksum under.
-fn metadata_checksum_key(name: &str, version: &str, source: &str) -> String {
-    format!("checksum {name} {version} ({source})")
-}
-
-/// One `[[package]]` of a parsed `Cargo.lock`, as cargo resolves it — the
-/// read model every Cargo.lock reader shares (the lock inventory, the vendor
-/// probes below, lockfile discovery), so a v1 lock's `[metadata]` checksums
-/// and a missing `source` read the same everywhere.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LockedPackage {
-    pub(crate) name: String,
-    pub(crate) version: String,
-    /// `None` for a workspace member, a path dependency, or a `[patch]` path
-    /// copy (the vendored "detached" shape).
-    pub(crate) source: Option<String>,
-    /// The inline `checksum` (v2+), else a v1 lock's `[metadata]`
-    /// `"checksum <name> <version> (<source>)"` entry — the same pin.
-    pub(crate) checksum: Option<String>,
-}
-
-/// Every `[[package]]` of `doc` (lock formats v1–v4), in lock order; an
-/// entry without a string `name` and `version` is skipped. A lock with no
-/// packages has no `package` key and yields nothing.
-pub(crate) fn locked_packages(doc: &DocumentMut) -> Vec<LockedPackage> {
-    let metadata = doc.get("metadata").and_then(Item::as_table_like);
-    let metadata_checksum = |name: &str, version: &str, source: Option<&str>| {
-        let key = metadata_checksum_key(name, version, source?);
-        metadata?.get(&key)?.as_str().map(str::to_string)
-    };
-    doc.get("package")
-        .and_then(Item::as_array_of_tables)
-        .map(|pkgs| {
-            pkgs.iter()
-                .filter_map(|t| {
-                    let name = t.get("name")?.as_str()?.to_string();
-                    let version = t.get("version")?.as_str()?.to_string();
-                    let source = t.get("source").and_then(Item::as_str).map(str::to_string);
-                    let checksum = t
-                        .get("checksum")
-                        .and_then(Item::as_str)
-                        .map(str::to_string)
-                        .or_else(|| metadata_checksum(&name, &version, source.as_deref()));
-                    Some(LockedPackage {
-                        name,
-                        version,
-                        source,
-                        checksum,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// `(name, version)` of every `[[patch.unused]]` entry: a `[patch]` cargo
-/// resolved and then did NOT use in the crate graph — the lock's own record
-/// that a patch (e.g. a vendored copy) is not what builds.
-pub(crate) fn unused_patches(doc: &DocumentMut) -> Vec<(String, String)> {
-    doc.get("patch")
-        .and_then(|patch| patch.get("unused"))
-        .and_then(Item::as_array_of_tables)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|t| {
-                    Some((
-                        t.get("name")?.as_str()?.to_string(),
-                        t.get("version")?.as_str()?.to_string(),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// How `Cargo.lock` relates to the `[patch]` path copy of `name`@`version`
-/// vendored for patch `uuid` ([`vendored_copy_claim`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CopyClaim<'a> {
-    /// The lock builds this copy.
-    Consumed,
-    /// The lock builds the copy tagged for ANOTHER patch uuid (and none
-    /// tagged for this one): a stale lock, or a `[patch]` override
-    /// elsewhere.
-    OtherTag(&'a str),
-    /// The copy is tagged, but the lock holds only UNTAGGED sourceless
-    /// entries: cargo built some other untagged crate (a config-level
-    /// override, a user path dependency), never this copy.
-    UntaggedOverride,
-    /// No sourceless entry for it, or cargo recorded the patch as
-    /// `[[patch.unused]]`.
-    NotConsumed,
-}
-
-/// Whether the lock BUILDS the `[patch]` path copy of `name`@`version`
-/// vendored for patch `uuid`. `copy_tagged`: the copy's own `Cargo.toml`
-/// carries a Socket version tag (every copy vendored since tagged
-/// versions; `false` for a copy vendored before them, or none on disk).
-///
-/// * a SOURCELESS entry at the tagged version `<version>+socket.<uuid>`
-///   (and no `[[patch.unused]]` for it) is this copy — whatever untagged
-///   sourceless siblings exist (real cargo 1.97 locks a member's own path
-///   dependency on a same-version fork beside the tagged copy);
-/// * otherwise a sourceless entry tagged for ANOTHER uuid is another
-///   copy's resolution → [`CopyClaim::OtherTag`], even beside an untagged
-///   sibling;
-/// * an UNTAGGED sourceless entry is the pre-tag legacy shape only while
-///   the copy is untagged too: cargo locks a tagged copy at its tagged
-///   version, so for a tagged copy the untagged entry is something else
-///   cargo built → [`CopyClaim::UntaggedOverride`].
-///
-/// A sourceless entry alone does not prove the copy builds — a path
-/// dependency on the user's own checkout of the crate is sourceless too,
-/// and cargo records the `[patch]` it resolved but left out of the graph as
-/// `[[patch.unused]]` (real cargo 1.97: `serde = { path = "my-serde" }`
-/// beside a stale `[patch]` locks a sourceless serde AND
-/// `[[patch.unused]] serde`).
-pub(crate) fn vendored_copy_claim<'a>(
-    pkgs: &'a [LockedPackage],
-    unused: &[(String, String)],
-    name: &str,
-    version: &str,
-    uuid: &str,
-    copy_tagged: bool,
-) -> CopyClaim<'a> {
-    let mut own = false;
-    let mut other: Option<&'a str> = None;
-    let mut untagged = false;
-    for p in pkgs
-        .iter()
-        .filter(|p| p.name == name && p.source.is_none() && cargo_tag::denotes(&p.version, version))
-    {
-        match cargo_tag::tag_uuid(&p.version) {
-            Some(tag) if tag == uuid => own = true,
-            Some(tag) => {
-                other.get_or_insert(tag);
-            }
-            None => untagged = true,
-        }
-    }
-    let unused_hit = unused
-        .iter()
-        .any(|(n, v)| n == name && cargo_tag::denotes(v, version));
-    if own {
-        return if unused_hit {
-            CopyClaim::NotConsumed
-        } else {
-            CopyClaim::Consumed
-        };
-    }
-    if let Some(tag) = other {
-        return CopyClaim::OtherTag(tag);
-    }
-    if !untagged || unused_hit {
-        return CopyClaim::NotConsumed;
-    }
-    if copy_tagged {
-        CopyClaim::UntaggedOverride
-    } else {
-        CopyClaim::Consumed
-    }
-}
-
 /// A v1 lock: no top-level `version` key and a `[metadata]` table (kept,
 /// even emptied, by [`detach_lock_entry`] — so a detached v1 lock still
 /// reads as v1 on restore).
@@ -404,19 +243,6 @@ fn dependency_tables_mut(doc: &mut DocumentMut) -> Vec<&mut Table> {
         out.extend(pkgs.iter_mut());
     }
     out
-}
-
-/// `(name, version, source)` of a dependency reference string
-/// (`"name"`, `"name version"`, `"name version (source)"`).
-fn parse_ref(spelled: &str) -> (&str, Option<&str>, Option<&str>) {
-    let mut parts = spelled.splitn(3, ' ');
-    let name = parts.next().unwrap_or_default();
-    let version = parts.next();
-    let source = parts
-        .next()
-        .and_then(|s| s.strip_prefix('('))
-        .and_then(|s| s.strip_suffix(')'));
-    (name, version, source)
 }
 
 /// Rewrite every dependency reference to `name` at exactly `version` —
@@ -547,8 +373,7 @@ pub async fn detach_lock_entry(
     dry_run: bool,
 ) -> Result<CargoLockOriginal, LockEditError> {
     let (path, doc, lock_text) = read_lock(project_root).await?;
-    // The shared parse is read-only; this editor takes its own copy — the
-    // allocation the per-crate parse it replaced would have made anyway.
+    // The shared parse is read-only; this editor takes its own copy.
     let mut doc = (*doc).clone();
     // The registry entry is what gets detached (an entry already at the
     // tagged version beside it then refuses in `ensure_consistent`).
@@ -950,6 +775,7 @@ async fn count_lock_entries_unmemoized(project_root: &Path, name: &str, version:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::cargo::{vendored_copy_claim, CopyClaim};
 
     const SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const CHECKSUM: &str = "9d8f4e3bd2c8f1f5d1a3f5e7c9b1d3f5e7a9b1c3d5f7e9a1b3c5d7e9f1a3b5c7";
@@ -957,7 +783,7 @@ mod tests {
     const UUID2: &str = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
 
     /// A realistic cargo-1.93-shaped v4 lock (header comment, version line,
-    /// plain-name dependencies array — spike claim 8).
+    /// plain-name dependencies array).
     fn lock_body() -> String {
         format!(
             "# This file is automatically @generated by Cargo.\n\
@@ -1020,13 +846,10 @@ mod tests {
             .collect()
     }
 
-    /// REGRESSION: `toml_edit` renders LF only, so writing the edited lock
-    /// back rewrote a CRLF `Cargo.lock` as all-LF — and `vendor --revert`
-    /// then "restored" a file that differed from the original in every line
-    /// ending, so the rollback was not byte-identical (the copy's
-    /// `Cargo.toml` already reconciled endings; the lock did not). Covers
-    /// CRLF, LF and a missing trailing newline, in lock formats v1–v4,
-    /// across detach → retag → restore.
+    /// `toml_edit` renders LF only, so the edited lock must be mapped back
+    /// onto its original line endings for `vendor --revert` to restore it
+    /// byte-for-byte. Covers CRLF, LF and a missing trailing newline, in
+    /// lock formats v1–v4, across detach → retag → restore.
     #[tokio::test]
     async fn lock_edits_keep_line_endings_and_revert_byte_identically() {
         for v in 1u8..=4 {
@@ -1088,7 +911,7 @@ mod tests {
     /// file's dominant ending — its original one is not recoverable from
     /// text alone — so a mixed lock is NOT promised a byte-identical
     /// revert, only an unchanged remainder (the same contract
-    /// `Cargo.toml` has had).
+    /// `Cargo.toml` has).
     #[tokio::test]
     async fn a_mixed_ending_lock_keeps_every_untouched_line() {
         for v in 1u8..=4 {
@@ -1150,10 +973,10 @@ mod tests {
     }
 
     /// Cargo.lock v1: checksum in `[metadata]`, dependents referencing the
-    /// crate by full id. REGRESSION: detach removed only the entry's
-    /// `source`, leaving `"cfg-if 1.0.4 (registry+…)"` references (and the
-    /// `[metadata]` checksum) naming a package the lock no longer has —
-    /// real cargo then refuses the vendored lock under `--locked`.
+    /// crate by full id. Detach must also rewrite the
+    /// `"cfg-if 1.0.4 (registry+…)"` references and drop the `[metadata]`
+    /// checksum: left alone they name a package the lock no longer has, and
+    /// real cargo refuses the vendored lock under `--locked`.
     #[tokio::test]
     async fn detach_and_restore_a_v1_lock_follow_metadata_and_full_id_refs() {
         let other = "a".repeat(64);
@@ -1251,7 +1074,7 @@ mod tests {
 
     /// Detach both crates, then restore both — the shape of a two-crate
     /// vendor run and its revert. `cold` drops the memo before every call,
-    /// which is the pre-change path (parse the bytes on disk, every time).
+    /// the uncached path (parse the bytes on disk, every time).
     async fn detach_then_restore_both(body: &str, cold: bool) -> (String, String) {
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("Cargo.lock");
@@ -1703,7 +1526,7 @@ mod tests {
         );
     }
 
-    /// AUDIT B2 helper: the same name+version under multiple sources must be
+    /// The same name+version under multiple sources must be
     /// counted, so vendor can refuse the lock shape whose `dependencies`
     /// arrays reference entries by full package-id string.
     #[tokio::test]
@@ -2069,6 +1892,7 @@ mod tests {
             version: version.into(),
             source: source.map(str::to_string),
             checksum: None,
+            dependencies: Vec::new(),
         };
         let tagged = format!("1.0.4+socket.{UUID}");
         let other = format!("1.0.4+socket.{UUID2}");
@@ -2256,8 +2080,8 @@ mod tests {
         );
     }
 
-    /// V-7: the memoized package list answers every probe exactly as the
-    /// per-call [`locked_packages`] did — over a lock carrying registry,
+    /// The memoized package list answers every probe exactly as the
+    /// per-call [`locked_packages`] does — over a lock carrying registry,
     /// tagged, other-tagged, untagged-sourceless and duplicate entries, a
     /// v1 `[metadata]` lock, a missing lock and a corrupt one, and after
     /// the lock is rewritten between two probes (the memo must miss).

@@ -33,6 +33,9 @@
 //! * hand-wired vendored — pnpm 1-6 locks (which `vendor` refuses) whose
 //!   resolution a user pointed at a committed `.socket/vendor/` tarball.
 
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -188,8 +191,8 @@ fn socket(root: &Path, args: &[&str]) -> (Option<i32>, Value, String) {
             cmd.env_remove(k);
         }
     }
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, root, args, &[]);
     let out = cmd
-        .args(args)
         .arg("--cwd")
         .arg(root)
         .env("SOCKET_TELEMETRY_DISABLED", "1")

@@ -4,14 +4,13 @@
 //! NuGet package layouts.  They do **not** require network access or a real
 //! .NET installation: the scan's patch lookup is pinned to an in-test
 //! [`wiremock`] public-proxy stand-in via `--proxy-url`. That pinning is
-//! load-bearing, not cosmetic — since the all-batches-failed fix, an
-//! unreachable API is a hard scan failure (exit 1, `status: "error"`), so an
+//! load-bearing, not cosmetic — an unreachable API is a hard scan failure (exit 1, `status: "error"`), so an
 //! unpinned scan would phone home to the live proxy on every test run and go
 //! red whenever the network (or an ambient `SOCKET_*` variable) misbehaved.
 //!
 //! # Running
 //! ```sh
-//! cargo test -p socket-patch-cli --test e2e_nuget -- --ignored
+//! cargo test -p socket-patch-cli --test e2e_nuget
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -68,7 +67,6 @@ async fn run(args: &[&str], cwd: &Path, nuget_packages: &Path, proxy_url: &str) 
             .env_remove("SOCKET_API_URL")
             .env_remove("SOCKET_OFFLINE")
             .env_remove("SOCKET_PROXY_URL")
-            .env_remove("SOCKET_PATCH_PROXY_URL")
             .env_remove("SOCKET_BATCH_SIZE")
             .output()
             .expect("Failed to run socket-patch binary")
@@ -160,11 +158,10 @@ async fn assert_json_scanned(
     );
 }
 
-/// Regression guard for the hermeticity fix: every scan in a test must have
-/// routed its patch lookup through the in-test proxy. Fewer recorded requests
-/// than scans means at least one binary invocation talked to the live API (or
-/// skipped the lookup outright) despite the pinning — exactly the bug this
-/// file used to have.
+/// Hermeticity guard: every scan in a test must have routed its patch lookup
+/// through the in-test proxy. Fewer recorded requests than scans means at
+/// least one binary invocation talked to the live API (or skipped the lookup
+/// outright) despite the pinning.
 async fn assert_proxy_served_scans(server: &MockServer, scans: usize) {
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(
@@ -181,7 +178,6 @@ async fn assert_proxy_served_scans(server: &MockServer, scans: usize) {
 
 /// Verify that `socket-patch scan` discovers packages in a fake global cache layout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "experimental ecosystem (nuget): not gating CI until the nuget backend is implemented; run with --ignored"]
 async fn scan_discovers_global_cache_packages() {
     let server = start_proxy().await;
     let proxy_url = server.uri();
@@ -227,9 +223,8 @@ async fn scan_discovers_global_cache_packages() {
         "scan should exit 0 on a clean discovery, got {:?}:\n{combined}",
         output.status.code()
     );
-    // The crawler must NOT fall through to the empty-result message — that is
-    // the bug the old substring check ("packages" ⊂ "No packages found.")
-    // masked.
+    // The crawler must NOT fall through to the empty-result message (which a
+    // "packages" substring check would also match).
     assert!(
         !combined.contains("No packages found")
             && !combined.contains("No packages found") && !combined.contains("No global packages found"),
@@ -250,7 +245,6 @@ async fn scan_discovers_global_cache_packages() {
 
 /// Verify that `socket-patch scan` discovers packages in a fake legacy packages/ layout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "experimental ecosystem (nuget): not gating CI until the nuget backend is implemented; run with --ignored"]
 async fn scan_discovers_legacy_packages() {
     let server = start_proxy().await;
     let proxy_url = server.uri();

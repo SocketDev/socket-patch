@@ -40,6 +40,9 @@
 //! cannot reach the registry — unless `SOCKET_PATCH_YARN_E2E_REQUIRED=1`;
 //! every assertion after that is HARD.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -147,8 +150,9 @@ fn scrub_socket_env(cmd: &mut Command) {
 /// Run the socket-patch binary with a scrubbed environment.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     scrub_socket_env(&mut cmd);
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -547,14 +551,14 @@ fn yarn_classic_vendored_lock_survives_dev_install_resave() {
     eprintln!("MANIFEST-LESS VEX OK");
 }
 
-// ── drift-skipped revert keeps artifacts (residual #131, E1 flow) ─────
+// ── drift-skipped revert keeps artifacts (E1 flow) ─────────────────────
 
 /// The strapi E1 flow, end-to-end with real yarn classic: vendored wiring,
 /// then a hosted overlay re-resolves the lock block to a
 /// `patch.socket.dev` URL (any resolution outside our uuid dir fails the
 /// revert's ownership gate the same way), then `vendor --revert`.
 ///
-/// Contract (residual #131 fixed): the revert drift-skips the lock restore
+/// Contract: the revert drift-skips the lock restore
 /// — and must then ALSO keep the vendored artifacts and the ledger entry,
 /// reporting a counted `Skipped` (`vendor_revert_kept`) instead of a
 /// `Removed`. Previously it deleted `.socket/vendor/npm/<uuid>/` and pruned

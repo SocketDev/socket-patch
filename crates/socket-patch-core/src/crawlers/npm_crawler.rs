@@ -65,7 +65,7 @@ fn parse_package_json_identity(content: &str) -> Option<(String, String)> {
     // (Windows-authored packages ship them), but serde_json rejects it —
     // a BOM'd install would be invisible to scan and unpatchable.
     let pkg: PackageJsonPartial =
-        serde_json::from_str(crate::package_json::detect::strip_bom(content)).ok()?;
+        serde_json::from_str(crate::utils::serde::strip_bom(content)).ok()?;
     let name = pkg.name?;
     let version = pkg.version?;
     if name.is_empty() || version.is_empty() {
@@ -609,10 +609,7 @@ pub fn parse_bun_bin_output(stdout: &str) -> Option<String> {
 ///
 /// Production callers live inside `#[cfg(target_os = "macos")]` blocks of
 /// `get_global_node_modules_paths` (Homebrew/nvm/volta/fnm fallbacks).
-/// `#[allow(dead_code)]` keeps the function visible to the inline
-/// `#[cfg(test)] mod tests` callers on every target without tripping
-/// `-D dead_code` on non-macOS clippy runs.
-#[allow(dead_code)]
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 fn find_node_dirs_sync(base: &Path, segments: &[&str]) -> Vec<PathBuf> {
     if !base.is_dir() {
         return Vec::new();
@@ -659,7 +656,7 @@ pub struct NpmCrawler;
 ///
 /// `purl` is the *verbatim* caller-supplied PURL, including any
 /// `?qualifiers`. The result map is keyed by this exact string: the
-/// dispatcher drives npm with `passthrough_purls` + `merge_first_wins`,
+/// dispatcher drives npm with `passthrough_purls` + `merge_npm_copies`,
 /// so it looks results back up under the PURL it handed in. Keying by a
 /// reconstructed/stripped PURL silently loses every qualified PURL
 /// (e.g. `pkg:npm/foo@1.0.0?vcs_url=...`).
@@ -760,8 +757,8 @@ impl NpmCrawler {
     /// later restore) all of them: patching only one leaves a live,
     /// vulnerable copy while reporting success (a silent partial). The
     /// per-PURL `Vec` is ordered root-copy-first (breadth-first), so callers
-    /// that only need one representative (`vendor`, `vex`, `setup`) can take
-    /// the first and preserve the old root-preference.
+    /// that only need one representative (`vendor`, `vex`) can take
+    /// the first and get the root copy.
     ///
     /// pnpm's and vlt's store peer-variant copies are deliberately NOT
     /// enumerated here for a copy already found in an importer tree (a
@@ -1521,8 +1518,9 @@ impl NpmCrawler {
     }
 
     /// Gather each virtual-store entry's `node_modules` (entries come from
-    /// [`Self::list_pnpm_store_entries_sync`] or
-    /// [`Self::collect_nested_store_entries_sync`]) under the store-entry
+    /// [`Self::list_pnpm_store_entries_sync`],
+    /// [`Self::collect_nested_store_entries_sync`] or
+    /// [`Self::vlt_store_entry_dirs`]) under the store-entry
     /// policy, in parallel, preserving entry order.
     fn gather_store_entries(entries: Vec<StoreEntryDir>) -> Vec<ScanEvent> {
         par_map(entries, |entry| ScanEvent::StoreEntry {
@@ -2338,9 +2336,9 @@ mod tests {
 
     /// Regression: a wildcard segment that matches a *symlinked*
     /// directory must be followed. `DirEntry::metadata()` stats the link
-    /// itself (reports `is_dir == false`), so the resolver previously
-    /// skipped symlinked version dirs — exactly the layout fnm produces
-    /// and the `current`/`default` aliases nvm creates. The fix stats the
+    /// itself (reports `is_dir == false`), which would skip symlinked
+    /// version dirs — exactly the layout fnm produces and the
+    /// `current`/`default` aliases nvm creates. The resolver stats the
     /// joined path with `std::fs::metadata`, which resolves the target.
     #[cfg(unix)]
     #[test]
@@ -2514,12 +2512,12 @@ mod tests {
         );
     }
 
-    /// Regression: a qualified PURL (carrying `?qualifiers`) must resolve and
-    /// be keyed by the *verbatim* input PURL — not a reconstructed, stripped
-    /// form. The dispatcher drives npm with `passthrough_purls` +
-    /// `merge_first_wins`, so it looks the result back up under the exact PURL
-    /// it passed in. Keying by the stripped PURL silently dropped every
-    /// qualified npm PURL from apply/rollback.
+    /// A qualified PURL (carrying `?qualifiers`) must resolve and be keyed by
+    /// the *verbatim* input PURL — not a reconstructed, stripped form. The
+    /// dispatcher drives npm with `passthrough_purls` + `merge_npm_copies`,
+    /// so it looks the result back up under the exact PURL it passed in.
+    /// Keying by the stripped PURL drops every qualified npm PURL from
+    /// apply/rollback.
     #[tokio::test]
     async fn test_find_by_purls_resolves_qualified_purl_keyed_by_input() {
         let dir = tempfile::tempdir().unwrap();
@@ -2887,7 +2885,7 @@ mod tests {
             "both physical copies must be returned; got {copies:?}"
         );
         // Root-copy-first ordering (breadth-first): callers needing one
-        // representative take [0] and keep the old root-preference.
+        // representative take [0] and get the root copy.
         assert_eq!(copies[0].path, root_copy, "root copy must be first");
         let paths: HashSet<&Path> = copies.iter().map(|c| c.path.as_path()).collect();
         assert!(paths.contains(root_copy.as_path()));

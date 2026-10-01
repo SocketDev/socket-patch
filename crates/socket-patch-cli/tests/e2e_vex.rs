@@ -2,7 +2,8 @@
 //!
 //! Validates the OpenVEX document shape produced by a real invocation
 //! of the compiled binary. When `vexctl` is on `PATH` the test also
-//! pipes the output through `vexctl validate` to confirm spec
+//! pipes the output through `vexctl merge` (a single-file parse gate,
+//! since vexctl has no `validate` subcommand) to confirm spec
 //! conformance — the CI workflow installs vexctl before the test
 //! step, so this branch is exercised in CI.
 //!
@@ -20,25 +21,8 @@ use std::process::Command;
 use serde_json::Value;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{
-    PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
+    PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
-
-/// Setup-supported ecosystems, declared `manual` in test fixtures so the
-/// property-7 setup-state filter (`commands/setup::configured_ecosystems`)
-/// does not drop these patches — these tests exercise VEX document
-/// GENERATION, not setup state, so they opt every patch in via the `manual`
-/// escape hatch. The apply-only ecosystems (maven/nuget) are appended by
-/// [`all_manual`].
-const ALL_MANUAL: &[&str] = &["npm", "pypi", "cargo", "golang", "gem", "composer"];
-
-/// [`ALL_MANUAL`] plus the apply-only ecosystems (maven/nuget), so the
-/// all-ecosystem agent matrix below can declare every one of the 8.
-fn all_manual() -> Vec<String> {
-    let mut names: Vec<String> = ALL_MANUAL.iter().map(|s| (*s).to_string()).collect();
-    names.push("maven".to_string());
-    names.push("nuget".to_string());
-    names
-}
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_socket-patch")
@@ -75,14 +59,9 @@ fn cli() -> Command {
 fn write_manifest(cwd: &Path, manifest: &PatchManifest) {
     let dir = cwd.join(".socket");
     std::fs::create_dir_all(&dir).unwrap();
-    let mut m = manifest.clone();
-    m.setup = Some(SetupConfig {
-        exclude: Vec::new(),
-        manual: all_manual(),
-    });
     std::fs::write(
         dir.join("manifest.json"),
-        serde_json::to_string_pretty(&m).unwrap(),
+        serde_json::to_string_pretty(manifest).unwrap(),
     )
     .unwrap();
 }
@@ -271,15 +250,14 @@ fn two_patches_sharing_ghsa_merge_subcomponents() {
 // ──────────────────────────────────────────────────────────────────────
 // Cross-ecosystem AGENT matrix — the agent-mode twin of
 // `e2e_vex_redirect::no_verify_attests_redirected_patches_across_ecosystems`.
-// One manifest patch per official ecosystem (qualified PURLs for the
+// One manifest patch per non-Deno ecosystem (qualified PURLs for the
 // release-variant ones: pypi `?artifact_id=`, gem `?platform=`, maven
-// `?classifier=&ext=`), `setup.manual` declaring every ecosystem (via
-// `all_manual`) so property 7 keeps them all, and `--no-verify` attests
-// straight from the manifest with no installed tree.
+// `?classifier=&ext=`), and `--no-verify` attests straight from the
+// manifest with no installed tree.
 //
-// Unlike the redirect matrix — whose patches bypass BOTH property 7 and
-// `Ecosystem::from_purl` via the `redirected` set — an agent patch routes
-// through `Ecosystem::from_purl` + the `manual` allowlist. Each statement must
+// Unlike the redirect matrix — whose patches bypass `Ecosystem::from_purl`
+// via the `redirected` set — an agent patch routes through
+// `Ecosystem::from_purl`. Each statement must
 // carry a PLAIN impact statement (NO `(vendored)`/`(redirected)` marker — that
 // is what distinguishes agent provenance) and preserve the (possibly
 // qualified) PURL verbatim as the subcomponent id.
@@ -347,8 +325,6 @@ fn no_verify_attests_agent_patches_across_ecosystems() {
             ),
         );
     }
-    // write_manifest stamps setup.manual = all_manual(), which declares
-    // every one of the 8 ecosystems.
     write_manifest(cwd, &manifest);
 
     let out = cli()
@@ -989,7 +965,7 @@ fn verify_mode_resolves_qualified_pypi_purl() {
     let after_hash = compute_git_sha256_from_bytes(patched);
     std::fs::write(site_packages.join("mod.py"), patched).unwrap();
 
-    // Manifest keyed by a *qualified* PyPI PURL, as `get --sync` writes
+    // Manifest keyed by a *qualified* PyPI PURL, as `get` / `scan --mode agent` write
     // for release-variant ecosystems.
     let qualified_purl = "pkg:pypi/examplepkg@1.2.3?artifact_id=sdist";
     let mut manifest = PatchManifest::new();

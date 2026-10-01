@@ -14,7 +14,6 @@ use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurre
 use socket_patch_core::utils::purl::{normalize_purl, purl_eq, strip_purl_qualifiers};
 use socket_patch_core::vendor::lock_inventory::LockfileEntry;
 use socket_patch_core::vendor::VendorState;
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crate::args::GlobalArgs;
@@ -32,57 +31,21 @@ pub(super) struct UpdateInfo {
 /// Lockfile-only packages: dependencies the project's lockfile resolves
 /// that have no crawled (installed) counterpart.
 #[derive(Default)]
-pub(super) struct LockfileSupplement {
-    pub(super) packages: Vec<socket_patch_core::crawlers::types::CrawledPackage>,
+pub(crate) struct LockfileSupplement {
+    pub(crate) packages: Vec<socket_patch_core::crawlers::types::CrawledPackage>,
     /// Literal crawler-form purls, for fast membership tests.
-    pub(super) purls: HashSet<String>,
+    pub(crate) purls: HashSet<String>,
     /// The FULL lockfile inventory the supplement was derived from (installed
     /// packages included), kept so the hosted-wiring probes reuse it instead
     /// of re-parsing every project lockfile. Empty for global scans.
-    pub(super) entries: Vec<LockfileEntry>,
-    /// npm layouts the lockfile inventory REFUSED (Plug'n'Play loaders) —
-    /// packages structurally unreachable, as opposed to nothing-to-inventory.
-    /// Scan surfaces these as explicit refusal warnings: under yarn PnP the
-    /// installed-tree crawl is also empty (no `node_modules/`), so without
-    /// this channel a PnP project scans as a silent success-0 no-op in
-    /// every mode.
-    pub(super) unsupported: Vec<socket_patch_core::vendor::lock_inventory::UnsupportedNpmLayout>,
+    pub(crate) entries: Vec<LockfileEntry>,
+    /// npm layouts the lockfile inventory REFUSED (Plug'n'Play loaders).
+    /// Scan surfaces these as refusal warnings: under PnP the installed-tree
+    /// crawl is empty too, so otherwise the project scans as a silent no-op.
+    pub(crate) unsupported: Vec<socket_patch_core::vendor::lock_inventory::UnsupportedNpmLayout>,
 }
 
-/// Map a core npm-layout refusal onto scan's warning channel as
-/// `(code, detail)`. The yarn code matches apply's refusal errorCode
-/// (`yarn_pnp_unsupported`) so consumers key on ONE name across commands;
-/// the pnpm twin gets the parallel spelling. Details are scan-phrased (what
-/// was NOT scanned + remedy) rather than the probe's vendor-phrased text.
-pub(crate) fn unsupported_layout_warnings(
-    unsupported: &[socket_patch_core::vendor::lock_inventory::UnsupportedNpmLayout],
-) -> Vec<(String, String)> {
-    unsupported
-        .iter()
-        .map(|diag| match diag.code {
-            "vendor_yarn_berry_unsupported" => (
-                "yarn_pnp_unsupported".to_string(),
-                "this project uses yarn Plug'n'Play (a `.pnp.*` loader is present): its npm \
-                 packages live inside `.yarn/cache/*.zip`, not `node_modules/`, so socket-patch \
-                 cannot discover or patch them in ANY mode (agent, hosted, or vendored) — npm \
-                 dependencies were NOT scanned. Use `yarn patch <pkg>` to patch them instead."
-                    .to_string(),
-            ),
-            "vendor_pnpm_pnp_unsupported" => (
-                "pnpm_pnp_unsupported".to_string(),
-                "this project uses pnpm's Plug'n'Play linker (`node-linker=pnp` in .npmrc): \
-                 lockfile discovery is skipped under this layout, so lockfile-only npm \
-                 dependencies were NOT scanned. Switch .npmrc to `node-linker=isolated`, run \
-                 `pnpm install`, and re-run — or use `socket-patch scan --mode hosted`, which \
-                 edits pnpm-lock.yaml in place."
-                    .to_string(),
-            ),
-            // Forward-compat: a new refusal code surfaces verbatim rather
-            // than being swallowed back into silence.
-            other => (other.to_string(), diag.detail.clone()),
-        })
-        .collect()
-}
+pub(crate) use socket_patch_core::vendor::lock_inventory::unsupported_layout_warnings;
 
 /// Inventory the project's lockfile(s) and fabricate crawl entries for
 /// dependencies that are not installed. The fabricated `path` is the
@@ -95,19 +58,19 @@ pub(crate) fn unsupported_layout_warnings(
 /// crawled): an entry of an ecosystem the crawl skipped is never counted
 /// lockfile-only, since there is no crawl to tell whether it is installed.
 /// `entries` still holds the full inventory.
-pub(super) async fn lockfile_supplement(
-    common: &GlobalArgs,
+pub(crate) async fn lockfile_supplement(
+    ctx: &crate::commands::context::ProjectContext<'_>,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     only: Option<&[String]>,
 ) -> LockfileSupplement {
-    use socket_patch_core::vendor::lock_inventory;
-
+    let common = ctx.common;
     let mut out = LockfileSupplement::default();
-    if common.global || common.global_prefix.is_some() {
+    if common.is_global() {
         return out;
     }
-    let (entries, unsupported) = lock_inventory::inventory_project_diagnosed(&common.cwd).await;
-    out.unsupported = unsupported;
+    let locks = ctx.locks().await;
+    out.unsupported = locks.unsupported.clone();
+    let entries = &locks.entries;
     if entries.is_empty() {
         return out;
     }
@@ -118,7 +81,7 @@ pub(super) async fn lockfile_supplement(
                 .is_some_and(|eco| list.iter().any(|name| name == eco.cli_name()))
         })
     };
-    for entry in &entries {
+    for entry in entries {
         if crawled_purls.contains(entry.purl.as_str()) || !in_scope(&entry.purl) {
             continue;
         }
@@ -128,7 +91,7 @@ pub(super) async fn lockfile_supplement(
         out.purls.insert(entry.purl.clone());
         out.packages.push(pkg);
     }
-    out.entries = entries;
+    out.entries = entries.clone();
     out
 }
 
@@ -175,12 +138,12 @@ fn crawled_from_purl(
 /// runs all keep working before any install). They are NOT "lockfile-only"
 /// — nothing needs installing; the artifact satisfies the lock. `state` is
 /// the ledger `run` already loaded (`vendor::load_state`).
-pub(super) async fn vendored_ledger_supplement(
+pub(crate) async fn vendored_ledger_supplement(
     common: &GlobalArgs,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     state: &std::io::Result<VendorState>,
 ) -> Vec<socket_patch_core::crawlers::types::CrawledPackage> {
-    if common.global || common.global_prefix.is_some() {
+    if common.is_global() {
         return Vec::new();
     }
     let base_purls: Vec<String> = match state {
@@ -189,16 +152,10 @@ pub(super) async fn vendored_ledger_supplement(
             .values()
             .map(|entry| strip_purl_qualifiers(&entry.base_purl).to_string())
             .collect(),
-        // Corrupt/unreadable ledger (a MISSING file is Ok(empty) above).
-        // Returning empty here silently dropped every vendored purl from
-        // `scanned_purls` — and since the purl-keys prune
-        // exemption degrades to empty on the same Err (fail-open by its
-        // documented contract), `scan --prune` then deleted still-vendored
-        // packages' manifest entries and blobs while their committed
-        // artifacts remained. Recover the vendored set from the committed
-        // ground truth instead: a manifest entry whose patch uuid owns a
-        // live `.socket/vendor/<eco>/<uuid>` artifact dir is vendored (the
-        // contract-documented recovery convention — see `vendor::path`).
+        // Corrupt/unreadable ledger (a MISSING file is Ok(empty) above):
+        // recover the vendored set from the committed artifacts, or
+        // `scan --prune` (whose ledger exemption also degrades to empty)
+        // would delete still-vendored packages' manifest entries and blobs.
         Err(_) => vendored_purls_from_artifacts(common).await,
     };
     // Composer by release identity: a ledger `@3.0.2.0` is the crawled
@@ -263,31 +220,6 @@ async fn vendored_purls_from_artifacts(common: &GlobalArgs) -> Vec<String> {
     out
 }
 
-/// Vendor-mode pre-prompt check: uuids of selected patches whose installed
-/// files match NEITHER beforeHash nor afterHash — the patch was built
-/// against different bytes than the installed artifact. Vendoring still
-/// succeeds for these (the vendor stage force-applies the verified patched
-/// content; see `force_apply_staged`), but the user should learn it BEFORE
-/// the confirm prompt, not from a post-hoc warning event.
-///
-/// Returns `(mismatched uuids, fetched views by uuid)`: the download phase
-/// serves its records from the views instead of fetching each one a second
-/// time. Only `Ok(Some)` views are cached — an errored or 404'd fetch is
-/// left for the download phase to retry and report per patch.
-///
-/// `vendor` is the run's ledger (`None` when unreadable — fail-open, the
-/// preflight reports the corruption): a purl the ledger already holds
-/// detached at the selected uuid with an embedded record — exactly the
-/// entries the download phase reuses without a view fetch — is compared
-/// against that record's file hashes instead of fetching the view, so an
-/// idempotent re-run performs zero view fetches in the human arm too
-/// (contract: "same-uuid re-runs reuse the embedded record, skip the
-/// patch-view fetch"). Nothing is inserted into `views` for them.
-///
-/// Best-effort and read-only: a detail-fetch failure or an unresolvable
-/// installed path just skips the annotation — it never blocks the flow and
-/// writes nothing. One API round-trip per uncached patch, so progress
-/// shows on `status`.
 pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
     api_client: &socket_patch_core::api::client::ApiClient,
     selected: &[PatchSearchResult],
@@ -413,54 +345,7 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
     (mismatched, views)
 }
 
-/// Fold both ledgers' patch records into the manifest view update detection
-/// consults. Hosted mode persists its purl→uuid records ONLY in
-/// `.socket/vendor/redirect-state.json`, and vendored mode ONLY in
-/// `.socket/vendor/state.json` (each entry embeds its patch `record`) —
-/// neither writes `.socket/manifest.json` — so without this fold a pure
-/// hosted or vendored project's `updates[]` (the documented CI signal, see
-/// CLI_CONTRACT.md) is structurally empty and a superseding patch is never
-/// reported. Precedence on a collision: manifest > redirect ledger > vendor
-/// ledger (a manifest PURL is manifest-owned, matching VEX's candidate merge
-/// in `commands::vex_sources` for purls no lockfile wires to another patch).
-/// Vendor entries are keyed by their ledger map key
-/// (the manifest-form purl, qualifiers included — `detect_updates` bridges
-/// the spellings); a legacy entry without an embedded record contributes its
-/// uuid alone, which is all update detection reads. Borrows the manifest
-/// untouched when neither ledger contributes. Pure / no I/O so it's
-/// unit-testable.
-pub(super) fn merge_ledger_records_for_updates<'a>(
-    manifest: Option<&'a PatchManifest>,
-    redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
-    vendor: Option<&VendorState>,
-) -> Option<Cow<'a, PatchManifest>> {
-    let redirect_records = redirect.map(|s| &s.records).filter(|r| !r.is_empty());
-    let vendor_entries = vendor.map(|s| &s.entries).filter(|e| !e.is_empty());
-    if redirect_records.is_none() && vendor_entries.is_none() {
-        return manifest.map(Cow::Borrowed);
-    }
-    let mut merged = manifest.cloned().unwrap_or_default();
-    for (purl, record) in redirect_records.into_iter().flatten() {
-        merged
-            .patches
-            .entry(purl.clone())
-            .or_insert_with(|| record.clone());
-    }
-    for (purl, entry) in vendor_entries.into_iter().flatten() {
-        merged.patches.entry(purl.clone()).or_insert_with(|| {
-            entry.record.clone().unwrap_or_else(|| PatchRecord {
-                uuid: entry.uuid.clone(),
-                exported_at: String::new(),
-                files: HashMap::new(),
-                vulnerabilities: HashMap::new(),
-                description: String::new(),
-                license: String::new(),
-                tier: String::new(),
-            })
-        });
-    }
-    Some(Cow::Owned(merged))
-}
+pub(super) use socket_patch_core::ledgers::merge_ledger_records_for_updates;
 
 /// Cross-reference an existing manifest against discovery results to find
 /// PURLs whose newest available patch UUID differs from the locally-recorded
@@ -476,24 +361,13 @@ pub(super) fn detect_updates(
     let mut updates = Vec::new();
     for pkg in packages {
         // The candidate is the top-ranked patch — the one the apply path
-        // resolves to. Both sides rank with `api::ranking`, so the
-        // `[UPDATE]` marker and the JSON `updates` array track what
-        // `--apply` installs.
+        // resolves to, so `[UPDATE]` and `updates[]` track what scan
+        // installs. One divergence: the batch response omits `publishedAt`,
+        // so on a merge-status + severity tie this falls to the tier/uuid
+        // tiebreaks where apply (by-package shape) uses the date.
         //
-        // Caveat, and the one place the two can still disagree: we rank
-        // BATCH-shaped patches here, while apply ranks the richer
-        // by-package shape. The batch response currently omits
-        // `publishedAt`, so when a package's top candidates tie on merge
-        // status AND severity, this falls through to the UUID tiebreak
-        // while apply correctly uses the date. `BatchPatchInfo` already
-        // deserializes `publishedAt` when present, so the divergence
-        // disappears the moment the endpoint emits it — no client change.
-        // (Verified live on pkg:npm/axios@1.6.0, two free HIGH patches.)
-        //
-        // `ApiClient` already returns each package's patches best-first, so
-        // `min_by` here is a cheap guard rather than a correction — but it
-        // is load-bearing for callers that build a `BatchPackagePatches`
-        // themselves rather than getting one from the client.
+        // `min_by` is load-bearing for callers that build a
+        // `BatchPackagePatches` themselves (the client already sorts).
         let Some(candidate) = pkg.patches.iter().min_by(|a, b| cmp_batch_infos(a, b)) else {
             continue;
         };
@@ -505,14 +379,9 @@ pub(super) fn detect_updates(
         // first, then a normalized qualifier-stripped comparison (composer
         // by release identity: a `@3.0.2.0` key is the crawler's `@3.0.2`).
         //
-        // Qualifier TWINS (one package recorded under two artifact-pinned
-        // keys, e.g. a pypi wheel + sdist pair) both match the stripped
-        // comparison. `manifest.patches` is a HashMap, so a bare `find`
-        // would pick a per-process-random twin; instead: any stale twin
-        // means an update is available, so prefer the first twin (in
-        // sorted-key order, for run-to-run stability) whose uuid differs
-        // from the candidate, and fall back to the first twin when all
-        // agree.
+        // Qualifier TWINS (e.g. a pypi wheel + sdist pair) all match the
+        // stripped form: any stale twin means an update, so prefer the
+        // first (sorted-key order, for stability) whose uuid differs.
         let existing = manifest.patches.get(&pkg.purl).or_else(|| {
             let want = purl_identity_key(&pkg.purl);
             let mut twins: Vec<(&String, &socket_patch_core::manifest::schema::PatchRecord)> =
@@ -535,22 +404,10 @@ pub(super) fn detect_updates(
         if candidate.uuid == existing.uuid {
             continue;
         }
-        // (b) The candidate out*ranks* the recorded patch, but "outranks"
-        // includes the pure tier/uuid tiebreaks and — because the batch
-        // endpoint routinely omits `publishedAt` — an epoch-0 date that is
-        // NOT real evidence of recency. When the recorded patch is still
-        // among the offered patches, `cmp_batch_infos` can crown an
-        // equal-or-older sibling as the "top" candidate purely on the uuid
-        // tiebreak, which used to nag a vendored project forever with a patch
-        // no newer than the one already committed. Only surface an update
-        // when the candidate GENUINELY supersedes the applied patch on a
-        // meaningful axis (severity, merge coverage, or a real,
-        // strictly-greater publish date).
-        //
-        // If the recorded patch is no longer offered at all, we cannot
-        // compare ages; a different, currently-available candidate is the
-        // best signal we have, so flag it (this is also the only behavior a
-        // manifest-only, no-batch record can produce).
+        // (b) "Outranks" includes the tier/uuid tiebreaks and the batch
+        // endpoint's missing (epoch-0) dates, so when the recorded patch is
+        // still offered, only report a candidate that genuinely supersedes
+        // it. If it is no longer offered, any different candidate is flagged.
         if let Some(applied) = pkg.patches.iter().find(|p| p.uuid == existing.uuid) {
             if !candidate_supersedes(candidate, applied) {
                 continue;
@@ -565,59 +422,11 @@ pub(super) fn detect_updates(
     updates
 }
 
-/// Whether `candidate` genuinely supersedes the already-applied `applied`
-/// patch — strictly better on a MEANINGFUL ranking axis (severity, merge
-/// coverage, or a real, strictly-greater publish date), never on the pure
-/// tier/uuid tiebreaks or an absent-date (epoch-0) artifact.
-///
-/// This is the guard that kills the false `[UPDATE]` nag. Batch responses
-/// omit `publishedAt`, so [`cmp_batch_infos`] falls through to the uuid
-/// tiebreak and can rank an equal-or-older sibling above the applied patch;
-/// flagging that as an update perpetually nags a vendored project. Both
-/// patches are batch-shaped and drawn from the SAME package response, so this
-/// compares like with like, mirroring `api::ranking::rank_batch_info`.
+/// Whether `candidate` genuinely supersedes the applied patch (see
+/// [`socket_patch_core::api::ranking::batch_supersedes`]): the guard that
+/// keeps an equal sibling from showing as a perpetual `[UPDATE]`.
 fn candidate_supersedes(candidate: &BatchPatchInfo, applied: &BatchPatchInfo) -> bool {
-    use socket_patch_core::api::date::parse_timestamp_secs;
-    use socket_patch_core::api::ranking::{merged_coverage, severity_order};
-
-    // Advisory count = inferred merge state: prefer GHSA ids, fall back to
-    // CVE ids only when no GHSA is named (so CVE aliases can't inflate it).
-    let advisories = |p: &BatchPatchInfo| {
-        if p.ghsa_ids.is_empty() {
-            p.cve_ids.len()
-        } else {
-            p.ghsa_ids.len()
-        }
-    };
-
-    // Severity: lower rank number = worse vulnerability. A candidate fixing a
-    // strictly worse advisory supersedes; a less-severe one never does.
-    let cand_sev = severity_order(candidate.severity.as_deref());
-    let applied_sev = severity_order(applied.severity.as_deref());
-    if cand_sev != applied_sev {
-        return cand_sev < applied_sev;
-    }
-
-    // Merge coverage: a patch folding in more advisories is broader.
-    let cand_cov = merged_coverage(advisories(candidate));
-    let applied_cov = merged_coverage(advisories(applied));
-    if cand_cov != applied_cov {
-        return cand_cov > applied_cov;
-    }
-
-    // Recency: only a REAL, strictly-greater publishedAt counts. A missing
-    // date (the batch norm) parses to `None` and is NOT treated as newer, so
-    // an equal-or-older sibling is never surfaced as an update. Parsing stays
-    // on the RFC-2822-aware `api::date` helper.
-    let cand_date = candidate
-        .published_at
-        .as_deref()
-        .and_then(parse_timestamp_secs);
-    let applied_date = applied
-        .published_at
-        .as_deref()
-        .and_then(parse_timestamp_secs);
-    matches!((cand_date, applied_date), (Some(c), Some(a)) if c > a)
+    socket_patch_core::api::ranking::batch_supersedes(candidate, applied)
 }
 
 /// The scan table's VULNERABILITIES data for one package, built from the
@@ -690,6 +499,7 @@ pub(super) fn severity_order(s: &str) -> u8 {
 mod tests {
     use super::*;
     use socket_patch_core::api::types::BatchPatchInfo;
+    use std::borrow::Cow;
 
     use crate::commands::scan::tests::manifest_with;
 
@@ -716,12 +526,8 @@ mod tests {
 
     #[test]
     fn severity_order_moderate_is_medium_tier() {
-        // Regression: GHSA emits `moderate` for the medium tier, and scan
-        // passes raw API severities straight through. get.rs
-        // `severity_rank`, `ui::severity`, and core's
-        // `get_severity_order` all map it to medium; ranking it 4 here
-        // (= unknown, below `low`) made the table's max-severity column
-        // show `low` for a package whose worst vuln is moderate.
+        // GHSA emits `moderate` for the medium tier and scan passes raw API
+        // severities through, so it must rank as medium, not unknown.
         assert_eq!(severity_order("moderate"), severity_order("medium"));
         assert!(severity_order("moderate") < severity_order("low"));
         assert_eq!(severity_order("Moderate"), severity_order("medium"));
@@ -818,8 +624,7 @@ mod tests {
     fn detect_updates_bridges_qualified_manifest_keys() {
         // Manifest keys for artifact-pinned ecosystems carry qualifiers
         // (`?artifact_id=...`); the batch purl is bare. The stripped-purl
-        // bridge must match them — decode-only would silently drop these
-        // packages from `updates[]` again.
+        // bridge must match them, or these packages drop out of `updates[]`.
         let m = manifest_with(&[("pkg:pypi/foo@1.0?artifact_id=foo-1.0.tar.gz", "uuid-a")]);
         let pkgs = vec![batch_with("pkg:pypi/foo@1.0", &["uuid-b"])];
         let updates = detect_updates(Some(&m), &pkgs);
@@ -923,13 +728,8 @@ mod tests {
 
     #[test]
     fn detect_updates_no_update_when_manifest_holds_candidate_despite_other_patches() {
-        // Regression: the human-readable table once flagged `[UPDATE]` (and
-        // bumped `updates_available`) whenever *any* batch patch differed from
-        // the manifest UUID. But the apply path resolves to the top-ranked
-        // patch, so a manifest already holding that candidate is up to date
-        // even when the batch also lists lesser patches. The table and the
-        // JSON `updates` array must agree; both derive from this function,
-        // which compares the ranked candidate only.
+        // A manifest already holding the top-ranked candidate is up to date
+        // even when the batch also lists lesser patches.
         let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-critical")]);
         let pkgs = vec![batch_ranked(
             "pkg:npm/foo@1.0",
@@ -947,15 +747,9 @@ mod tests {
 
     #[test]
     fn detect_updates_no_nag_when_applied_patch_still_offered_and_batch_omits_dates() {
-        // Regression (false-update-nag-batch-ranking / -older-uuid): after
-        // vendoring, the batch endpoint re-lists BOTH the applied patch and a
-        // sibling and OMITS `publishedAt`. With no real date, `cmp_batch_infos`
-        // collapses to the uuid tiebreak and crowns whichever sibling sorts
-        // first. `uuid-a` sorts before the applied `uuid-b`, so it becomes the
-        // ranked candidate — but it is no genuine improvement (same severity,
-        // same coverage, no newer date), so it must NOT be surfaced as an
-        // update. Before the fix this flagged a perpetual `[UPDATE]` pointing
-        // at an equal-or-older patch.
+        // The batch re-lists the applied patch and a sibling with no
+        // `publishedAt`, so `uuid-a` wins only on the uuid tiebreak. That is
+        // no genuine improvement, so it must NOT be surfaced as an update.
         let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-b")]);
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-a", "uuid-b"])];
         assert!(
@@ -1005,21 +799,20 @@ mod tests {
     }
 
     // ---- merge_ledger_records_for_updates -----------------------------------
-    // Hosted mode records patches ONLY in the redirect ledger and vendored
-    // mode ONLY in the vendor ledger — these pin that ledger-only projects
-    // still surface `updates[]` (the documented CI signal) through the
-    // merged manifest view.
+    // Hosted mode records patches ONLY in the lockfiles (the hosted pins) and
+    // vendored mode ONLY in the vendor ledger — these pin that manifest-less
+    // projects still surface `updates[]` (the documented CI signal) through
+    // the merged manifest view.
 
-    fn ledger_with(entries: &[(&str, &str)]) -> socket_patch_core::patch::redirect::RedirectState {
-        let mut state = socket_patch_core::patch::redirect::RedirectState::new();
-        let manifest = crate::commands::scan::tests::manifest_with(entries);
-        state.records.extend(manifest.patches);
-        state
+    fn pins(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(purl, uuid)| (purl.to_string(), uuid.to_string()))
+            .collect()
     }
 
     /// A vendor ledger with one entry per `(key, uuid, detached)`: detached
-    /// entries embed their record (the D2 posture), legacy ones carry only
-    /// the uuid.
+    /// entries embed their record, legacy ones carry only the uuid.
     fn vendor_ledger_with(entries: &[(&str, &str, bool)]) -> VendorState {
         let entries: serde_json::Map<String, serde_json::Value> = entries
             .iter()
@@ -1047,13 +840,12 @@ mod tests {
     }
 
     #[test]
-    fn ledger_only_project_reports_superseding_patch_in_updates() {
-        // Pure hosted project: NO .socket/manifest.json, one redirected patch
-        // recorded in the ledger; discovery now offers a different (newer)
-        // uuid. The merged view must make detect_updates flag it — this was
-        // structurally impossible before the fold (manifest-only detection).
-        let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-old")]);
-        let merged = merge_ledger_records_for_updates(None, Some(&ledger), None);
+    fn hosted_only_project_reports_superseding_patch_in_updates() {
+        // Pure hosted project: NO .socket/manifest.json, one hosted pin in
+        // the lockfile; discovery now offers a different (newer) uuid. The
+        // merged view must make detect_updates flag it.
+        let hosted = pins(&[("pkg:npm/foo@1.0", "uuid-old")]);
+        let merged = merge_ledger_records_for_updates(None, None, &hosted);
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-new"])];
         let updates = detect_updates(merged.as_deref(), &pkgs);
         assert_eq!(updates.len(), 1);
@@ -1064,12 +856,12 @@ mod tests {
 
     #[test]
     fn vendored_only_project_reports_superseding_patch_in_updates() {
-        // Pure vendored project (manifest-free, D2): the ledger entry's
+        // Pure vendored project (manifest-free): the ledger entry's
         // embedded record is the "old" side. A legacy entry with no embedded
         // record still contributes its uuid — all detection reads.
         for detached in [true, false] {
             let vendor = vendor_ledger_with(&[("pkg:npm/foo@1.0", "uuid-old", detached)]);
-            let merged = merge_ledger_records_for_updates(None, None, Some(&vendor));
+            let merged = merge_ledger_records_for_updates(None, Some(&vendor), &[]);
             let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-new"])];
             let updates = detect_updates(merged.as_deref(), &pkgs);
             assert_eq!(updates.len(), 1, "detached={detached}");
@@ -1078,16 +870,16 @@ mod tests {
         }
         // Still the top offer — no nag.
         let vendor = vendor_ledger_with(&[("pkg:npm/foo@1.0", "uuid-a", true)]);
-        let merged = merge_ledger_records_for_updates(None, None, Some(&vendor));
+        let merged = merge_ledger_records_for_updates(None, Some(&vendor), &[]);
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-a"])];
         assert!(detect_updates(merged.as_deref(), &pkgs).is_empty());
     }
 
     #[test]
-    fn ledger_record_matching_the_candidate_is_not_an_update() {
-        // The redirected patch is still the top offer — no nag.
-        let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
-        let merged = merge_ledger_records_for_updates(None, Some(&ledger), None);
+    fn hosted_pin_matching_the_candidate_is_not_an_update() {
+        // The hosted patch is still the top offer — no nag.
+        let hosted = pins(&[("pkg:npm/foo@1.0", "uuid-a")]);
+        let merged = merge_ledger_records_for_updates(None, None, &hosted);
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-a"])];
         assert!(detect_updates(merged.as_deref(), &pkgs).is_empty());
     }
@@ -1096,33 +888,32 @@ mod tests {
     fn manifest_entry_wins_a_collision_with_a_ledger_record() {
         // A PURL present in every store is manifest-owned (same precedence as
         // VEX's candidate merge): the manifest's uuid is the "old" side;
-        // between the ledgers, the redirect record wins.
+        // between the other two, the live hosted pin wins over the vendor
+        // ledger's (possibly superseded) entry.
         let manifest =
             crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-manifest")]);
-        let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-ledger")]);
+        let hosted = pins(&[("pkg:npm/foo@1.0", "uuid-pin")]);
         let vendor = vendor_ledger_with(&[("pkg:npm/foo@1.0", "uuid-vendor", true)]);
-        let merged =
-            merge_ledger_records_for_updates(Some(&manifest), Some(&ledger), Some(&vendor));
+        let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&vendor), &hosted);
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-new"])];
         let updates = detect_updates(merged.as_deref(), &pkgs);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].old_uuid, "uuid-manifest");
-        let merged = merge_ledger_records_for_updates(None, Some(&ledger), Some(&vendor));
+        let merged = merge_ledger_records_for_updates(None, Some(&vendor), &hosted);
         let updates = detect_updates(merged.as_deref(), &pkgs);
-        assert_eq!(updates[0].old_uuid, "uuid-ledger");
+        assert_eq!(updates[0].old_uuid, "uuid-pin");
     }
 
     #[test]
-    fn ledger_and_manifest_cover_disjoint_purls() {
-        // A mixed project (some deps applied via manifest, some hosted via
-        // the redirect ledger, some vendored) gets update detection across
-        // every store.
+    fn hosted_pins_and_manifest_cover_disjoint_purls() {
+        // A mixed project (some deps applied via manifest, some hosted in
+        // the lockfile, some vendored) gets update detection across every
+        // store.
         let manifest =
             crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-f1")]);
-        let ledger = ledger_with(&[("pkg:npm/bar@2.0", "uuid-b1")]);
+        let hosted = pins(&[("pkg:npm/bar@2.0", "uuid-b1")]);
         let vendor = vendor_ledger_with(&[("pkg:npm/baz@3.0", "uuid-z1", true)]);
-        let merged =
-            merge_ledger_records_for_updates(Some(&manifest), Some(&ledger), Some(&vendor));
+        let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&vendor), &hosted);
         let pkgs = vec![
             batch_with("pkg:npm/foo@1.0", &["uuid-f2"]),
             batch_with("pkg:npm/bar@2.0", &["uuid-b2"]),
@@ -1137,39 +928,32 @@ mod tests {
     }
 
     #[test]
-    fn absent_or_empty_ledgers_leave_the_manifest_view_untouched() {
-        assert!(merge_ledger_records_for_updates(None, None, None).is_none());
-        let empty = socket_patch_core::patch::redirect::RedirectState::new();
+    fn absent_or_empty_stores_leave_the_manifest_view_untouched() {
+        assert!(merge_ledger_records_for_updates(None, None, &[]).is_none());
+        let hosted = pins(&[("pkg:npm/foo@1.0.0", "uuid-pin")]);
+        let merged = merge_ledger_records_for_updates(None, None, &hosted).expect("pinned");
+        assert_eq!(merged.patches["pkg:npm/foo@1.0.0"].uuid, "uuid-pin");
         let empty_vendor = VendorState::new();
-        assert!(
-            merge_ledger_records_for_updates(None, Some(&empty), Some(&empty_vendor)).is_none()
-        );
+        assert!(merge_ledger_records_for_updates(None, Some(&empty_vendor), &[]).is_none());
         let manifest =
             crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
-        let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&empty), None)
+        let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&empty_vendor), &[])
             .expect("manifest present");
         assert!(
             matches!(merged, Cow::Borrowed(_)),
-            "empty ledgers must not clone the manifest"
+            "empty stores must not clone the manifest"
         );
         assert_eq!(
             merged.patches.len(),
             manifest.patches.len(),
-            "an empty ledger adds nothing"
+            "an empty vendor ledger adds nothing"
         );
     }
 
     // ---- vendored_ledger_supplement (corrupt-ledger fallback) ---------------
-    // The prune-safety chain for vendored packages: their purls enter
-    // `scanned_purls` via this supplement, which shields their manifest
-    // entries (and blobs) from `scan --prune`'s GC even when the
-    // `VendorState::purl_keys` exemption degrades to empty (fail-open by its
-    // documented contract). A corrupt `.socket/vendor/state.json`
-    // (`load_state` → Err; a MISSING file is Ok(empty)) must therefore fall
-    // back to the committed ground truth — manifest entries whose patch uuid
-    // owns a live `.socket/vendor/<eco>/<uuid>` artifact dir — instead of
-    // silently returning empty and letting the prune delete still-vendored
-    // records.
+    // Vendored purls enter `scanned_purls` via this supplement, which shields
+    // their manifest entries from `scan --prune`. A corrupt ledger must fall
+    // back to the committed artifact dirs rather than return empty.
 
     const VENDORED_UUID: &str = "11111111-1111-4111-8111-111111111111";
 
@@ -1574,12 +1358,10 @@ mod tests {
         assert_ne!(rewritten[0].1, "probe detail text");
     }
 
-    // ---- candidate_supersedes (merge-coverage rung) ----------------------
-    // Production publishes no merged patches yet, so this rung has never run
-    // outside these tests; these pin its polarity for the day one ships.
+    // ---- candidate_supersedes (advisory-count rung) -------------------------
 
     /// A batch-shaped patch with explicit advisory lists and NO publish
-    /// date, so only the severity and merge-coverage rungs can decide.
+    /// date, so only the severity and advisory-count rungs can decide.
     fn info_with_advisories(
         uuid: &str,
         severity: Option<&str>,
@@ -1601,7 +1383,7 @@ mod tests {
     #[test]
     fn candidate_supersedes_on_broader_ghsa_merge_coverage() {
         // Same severity, no dates: only the advisory count separates them.
-        // A patch folding in MORE GHSAs is broader and genuinely supersedes.
+        // A merged patch (>= 2 GHSAs) genuinely supersedes a single one.
         let merged = info_with_advisories(
             "uuid-merged",
             Some("high"),
@@ -1614,10 +1396,7 @@ mod tests {
             candidate_supersedes(&merged, &single),
             "broader merge coverage is a genuine supersede"
         );
-        // Swapped: a NARROWER candidate never supersedes. Only reachable by
-        // direct call — via detect_updates a lower-coverage candidate can
-        // never win `min_by` — but the polarity of the `>` at the coverage
-        // return must be pinned somewhere.
+        // Swapped: fewer advisories at equal severity cannot supersede.
         assert!(
             !candidate_supersedes(&single, &merged),
             "narrower coverage must never supersede"
@@ -1625,11 +1404,35 @@ mod tests {
     }
 
     #[test]
+    fn a_more_severe_single_candidate_supersedes_a_lower_severity_merge() {
+        // Same rule as selection: severity beats advisory count, so the
+        // [UPDATE] marker names the patch scan would install.
+        let merged = info_with_advisories(
+            "uuid-merged",
+            Some("low"),
+            &["GHSA-1111-1111-1111", "GHSA-2222-2222-2222"],
+            &[],
+        );
+        let critical =
+            info_with_advisories("uuid-crit", Some("critical"), &["GHSA-3333-3333-3333"], &[]);
+        assert!(!candidate_supersedes(&merged, &critical));
+        assert!(candidate_supersedes(&critical, &merged));
+    }
+
+    #[test]
+    fn a_larger_merge_supersedes_a_smaller_merge_at_equal_severity() {
+        let smaller = info_with_advisories("small", Some("high"), &["GHSA-a", "GHSA-b"], &[]);
+        let larger =
+            info_with_advisories("large", Some("high"), &["GHSA-a", "GHSA-b", "GHSA-c"], &[]);
+        assert!(candidate_supersedes(&larger, &smaller));
+        assert!(!candidate_supersedes(&smaller, &larger));
+    }
+
+    #[test]
     fn candidate_supersedes_cve_aliases_do_not_inflate_ghsa_coverage() {
         // Both sides name a GHSA, so the CVE lists are aliases and must not
-        // count: 1 == 1 advisory, no date on either side -> not a supersede
-        // in either direction (falls through coverage to the strict-date
-        // rung, which requires two REAL dates).
+        // count: both unmerged, same severity, no dates -> not a supersede
+        // in either direction (the date rung requires two REAL dates).
         let candidate = info_with_advisories(
             "uuid-cand",
             Some("high"),
@@ -1651,8 +1454,7 @@ mod tests {
         // End-to-end through detect_updates: the manifest holds the
         // single-advisory patch; the batch offers it alongside a merged
         // sibling (2 GHSAs, same severity, no dates). The merged patch wins
-        // the ranking on coverage AND genuinely supersedes — the module doc
-        // promises this works the day production ships a merged patch.
+        // the ranking AND genuinely supersedes.
         let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-single")]);
         let pkgs = vec![BatchPackagePatches {
             purl: "pkg:npm/foo@1.0".to_string(),
@@ -1733,12 +1535,9 @@ mod tests {
             search_result("uuid-ghost", "pkg:npm/ghost@1.0.0"),
         ];
         let crawled = vec![
-            // The lockonly purl HAS a crawled counterpart — production
-            // passes `filtered_crawled`, which CONTAINS the fabricated
-            // lockfile-only supplement entries — so the lockfile-only guard
-            // is the deciding branch: were it (or its normalize bridge)
-            // broken, the find below would succeed and the detail fetch
-            // would fire, tripping the request-log assertion.
+            // The lockonly purl HAS a crawled counterpart (production's crawl
+            // includes the fabricated lockfile-only entries), so the
+            // lockfile-only guard is the deciding branch.
             crawled_pkg(
                 "lockonly",
                 "pkg:npm/@scope/lockonly@1.0.0",
@@ -1970,6 +1769,7 @@ mod tests {
             base_purl: "pkg:npm/insync@1.0.0".into(),
             uuid: uuid.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: format!(".socket/vendor/npm/{uuid}/insync-1.0.0.tgz"),
                 sha256: String::new(),
                 size: None,
@@ -2094,7 +1894,11 @@ mod tests {
                 "pkg:npm/lockonly@1.0.0",
                 std::path::PathBuf::from("/nonexistent"),
             ),
-            crawled_pkg("alpha", "pkg:npm/alpha@1.0.0", installed("alpha", "alpha.js")),
+            crawled_pkg(
+                "alpha",
+                "pkg:npm/alpha@1.0.0",
+                installed("alpha", "alpha.js"),
+            ),
             crawled_pkg(
                 "embedded",
                 "pkg:npm/embedded@1.0.0",
@@ -2118,6 +1922,7 @@ mod tests {
                 base_purl: "pkg:npm/embedded@1.0.0".into(),
                 uuid: "u-embedded".into(),
                 artifact: VendorArtifact {
+                    yarn_berry10c0: None,
                     path: ".socket/vendor/npm/u-embedded/embedded-1.0.0.tgz".into(),
                     sha256: String::new(),
                     size: None,

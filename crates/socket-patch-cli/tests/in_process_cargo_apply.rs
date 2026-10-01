@@ -220,7 +220,9 @@ async fn cargo_fetch_scan_sync_patches_real_file() {
     make_writable(&lib_file);
 
     let args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().join("proj"),
             org: Some(ORG.to_string()),
@@ -241,11 +243,10 @@ async fn cargo_fetch_scan_sync_patches_real_file() {
         prune: false,
         sync: true,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     // CARGO_HOME must be set in this process's env so the cargo crawler
     // probes the isolated location (not the developer's real ~/.cargo).
@@ -336,7 +337,9 @@ async fn cargo_apply_refuses_on_before_hash_mismatch() {
     make_writable(&lib_file);
 
     let args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().join("proj"),
             org: Some(ORG.to_string()),
@@ -360,11 +363,10 @@ async fn cargo_apply_refuses_on_before_hash_mismatch() {
         prune: false,
         sync: true,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     std::env::set_var("CARGO_HOME", &cargo_home);
 
@@ -438,7 +440,9 @@ async fn cargo_crawler_finds_real_fetched_crate() {
 
     std::env::set_var("CARGO_HOME", &cargo_home);
     let args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().join("proj"),
             org: Some(ORG.to_string()),
@@ -458,11 +462,10 @@ async fn cargo_crawler_finds_real_fetched_crate() {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     assert_eq!(scan_run(args).await, 0);
 

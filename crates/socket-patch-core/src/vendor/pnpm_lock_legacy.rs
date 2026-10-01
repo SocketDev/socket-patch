@@ -4,8 +4,7 @@
 //! backend ([`super::pnpm_lock`]), with the legacy serialization shapes.
 //!
 //! Every splice below is a faithful port of REAL captured pnpm output
-//! (spike `matrix/vendor-legacy-spike/{p7,p8,t7,t8}`, pnpm 7.33.5 /
-//! 8.15.9, 2026-08-18): a `file:` tarball override was added to
+//! (pnpm 7.33.5 / 8.15.9): a `file:` tarball override was added to
 //! `package.json` and THAT pnpm's own `install` re-serialized the lock; the
 //! unit-test fixtures quote those locks verbatim. Both majors were also
 //! proven byte-stable across an install re-run of the captured shape.
@@ -25,9 +24,9 @@
 //!    bundled `createVersionsOverrider`: `path.join(rootDir, pkgPath)`), so
 //!    the captured locks carry `file:/abs/project/.socket/...`. This makes
 //!    the frozen check path-bound: `pnpm install --frozen-lockfile` only
-//!    passes in a checkout at that exact absolute path (spike probes A/B),
+//!    passes in a checkout at that exact absolute path,
 //!    while a `pnpm install --offline --no-frozen-lockfile` at any path installs the
-//!    patched tarball and re-resolves only that specifier line (probe C).
+//!    patched tarball and re-resolves only that specifier line.
 //!    Vendoring writes the absolute spelling pnpm itself emits and surfaces
 //!    the portability limit as `vendor_pnpm_legacy_absolute_specifier`.
 //! 4. `packages:` — the registry entry (`/name/version` in v5.4,
@@ -43,8 +42,8 @@
 //!    exact version become `name: file:<rel-tgz>`.
 //!
 //! No `pnpm-workspace.yaml` is written for legacy locks: pnpm <= 8 reads
-//! overrides ONLY from package.json `pnpm.overrides` (proven by the spike —
-//! the override applied with no workspace file present), and creating one
+//! overrides ONLY from package.json `pnpm.overrides` (the override applies
+//! with no workspace file present), and creating one
 //! would flip the project into workspace mode. Legacy WORKSPACE locks
 //! (an `importers:` section) are refused fail-closed: the flat-map surgery
 //! has no captured fixtures for them.
@@ -74,9 +73,8 @@ use super::npm_common::{
 use super::path::parse_vendor_path;
 use super::pnpm_lock::{
     apply_pkg_override, check_lock_override, classify_pkg_override, commit_surfaces, drifted,
-    guard_unwired_revert, lines_value, next_block, overrides_record, parse_key_line,
-    revert_overrides_line, revert_pkg_record, section_bounds, split_lines, value_lines,
-    vendor_value_is_for, yaml_key, yaml_key_like, KIND_LOCK_OVERRIDES,
+    guard_unwired_revert, lines_value, overrides_record, revert_overrides_line, revert_pkg_record,
+    value_lines, vendor_value_is_for, KIND_LOCK_OVERRIDES,
 };
 use super::source::PackageSource;
 use super::state::{
@@ -85,6 +83,10 @@ use super::state::{
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use crate::constants::npm_family::PNPM_LOCK;
+use crate::formats::pnpm::lines::{
+    next_block, parse_key_line, section_bounds, split_lines, yaml_key, yaml_key_like,
+};
+use crate::formats::pnpm::{sniff_lock_grammar, PnpmLock, PnpmLockGrammar};
 
 const PACKAGE_JSON: &str = "package.json";
 
@@ -140,7 +142,7 @@ const OVERRIDES_PRECEDING: [&str; 4] = [
 ///
 /// `pub` because the e2e capstone's byte-exact lock oracle must build its
 /// expected absolute specifier with THIS transformation — a hand-copied
-/// oracle drifted on Windows the moment the real spelling differed.
+/// oracle drifts on Windows wherever the real spelling differs.
 pub fn normalize_canonical_root(path: &str) -> String {
     /// Drive-letter (`C:\...` / `C:/...`) or UNC (`\\server\...`) shape.
     fn is_windows_shaped(path: &str) -> bool {
@@ -162,67 +164,6 @@ pub fn normalize_canonical_root(path: &str) -> String {
         path.replace('\\', "/")
     } else {
         path.to_string()
-    }
-}
-
-// ───────────────────────────── grammar sniff ──────────────────────────────
-
-/// Which pnpm lock grammar a `pnpm-lock.yaml` head declares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PnpmLockGrammar {
-    /// `lockfileVersion: '9.0'` — the [`super::pnpm_lock`] backend.
-    V9,
-    /// `lockfileVersion: 5.4` (pnpm 7, bare float spelling).
-    V54,
-    /// `lockfileVersion: '6.0'` (pnpm 8).
-    V60,
-}
-
-/// The full vendor allowlist sniff (5.4 / 6.0 / 9.0) the flavor router
-/// uses; anything else refuses with a version-aware remedy: pre-allowlist
-/// versions (pnpm <= 6's 5.x line) are fixed by upgrading pnpm, but a
-/// FUTURE version means the user's pnpm already outgrew this build —
-/// looping them back to "re-lock with pnpm >= 9" would hand them the lock
-/// they have.
-pub(crate) fn sniff_lock_grammar(text: &str) -> Result<PnpmLockGrammar, String> {
-    let version = text
-        .lines()
-        .take(5)
-        .find_map(|line| line.strip_prefix("lockfileVersion:"))
-        .map(|rest| rest.trim().trim_matches(['\'', '"']).to_string());
-    match version.as_deref() {
-        Some("9.0") => Ok(PnpmLockGrammar::V9),
-        Some("5.4") => Ok(PnpmLockGrammar::V54),
-        Some("6.0") => Ok(PnpmLockGrammar::V60),
-        Some(v) => {
-            let major = v.split('.').next().and_then(|m| m.parse::<u32>().ok());
-            Err(match major {
-                Some(m) if m < 9 => format!(
-                    "{PNPM_LOCK} has lockfileVersion {v}; supported versions are 5.4 \
-                     (pnpm 7), 6.0 (pnpm 8), and 9.0 (pnpm >= 9) — re-lock with pnpm >= 9"
-                ),
-                _ => format!(
-                    "{PNPM_LOCK} has lockfileVersion {v}; this socket-patch build supports \
-                     lockfileVersions 5.4, 6.0, and 9.0 — re-lock with a pnpm release that \
-                     emits one of them, or update socket-patch"
-                ),
-            })
-        }
-        None => Err(format!(
-            "{PNPM_LOCK} has no lockfileVersion in its head; supported versions are 5.4, \
-             6.0, and 9.0 — re-lock with pnpm >= 9"
-        )),
-    }
-}
-
-impl PnpmLockGrammar {
-    /// Human name for diagnostics (`pnpm 7 (lockfileVersion 5.4)`).
-    fn describe(self) -> &'static str {
-        match self {
-            PnpmLockGrammar::V9 => "pnpm >= 9 (lockfileVersion 9.0)",
-            PnpmLockGrammar::V54 => "pnpm 7 (lockfileVersion 5.4)",
-            PnpmLockGrammar::V60 => "pnpm 8 (lockfileVersion 6.0)",
-        }
     }
 }
 
@@ -548,6 +489,7 @@ pub async fn vendor_pnpm_legacy<'a>(
         base_purl: coords.base_purl,
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: rel_tgz,
             sha256: packed.sha256_hex,
             size: Some(packed.size),
@@ -796,27 +738,7 @@ pub async fn pnpm_legacy_entry_in_use(entry: &VendorEntry, project_root: &Path) 
         Ok(PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => {}
         _ => return None,
     }
-    // CRLF (a Windows autocrlf checkout) breaks every structural probe
-    // below: the scan would find nothing and call a lock that still
-    // resolves through the artifact "provably orphaned" — undeterminable,
-    // keep (the unwired-revert guard then refuses, fail-closed).
-    if text.contains('\r') {
-        return None;
-    }
-    let lines = split_lines(&text);
-    let Some((start, end)) = section_bounds(&lines, "packages") else {
-        return Some(false);
-    };
-    let mut i = start + 1;
-    while let Some(block) = next_block(&lines, i, end) {
-        let ours =
-            parse_vendor_path(&block.key).is_some_and(|p| p.eco == "npm" && p.uuid == entry.uuid);
-        if ours {
-            return Some(true);
-        }
-        i = block.end;
-    }
-    Some(false)
+    Some(PnpmLock::parse(&text).vendored_in_use(&entry.uuid))
 }
 
 // ─────────────────────────── pre-flight checks ───────────────────────────
@@ -943,7 +865,7 @@ fn dep_field_lines(
 /// Edit 1: the `overrides:` section — splice our entry into an existing one,
 /// or insert the section at pnpm's ROOT_KEYS_ORDER slot (after
 /// `lockfileVersion:`/`settings:`, before everything else — byte-identical
-/// to the p7/p8 captures).
+/// to the pnpm 7/8 captures).
 fn edit_overrides(
     lines: &mut Vec<String>,
     ctx: &Ctx<'_>,
@@ -1568,7 +1490,7 @@ pub async fn revert_pnpm_legacy_opts(
         }
     }
 
-    // LOSSINESS GUARD (residual #131): when any wiring record was left
+    // LOSSINESS GUARD: when any wiring record was left
     // alone ("drifted; left alone"), the uuid dir may hold the only copy of
     // what the lock still points at. Keep it (and let the CLI keep the
     // ledger entry) instead of deleting evidence out from under a lock we
@@ -1943,7 +1865,7 @@ mod tests {
     // ── normalize_canonical_root (pure string level; no Windows host) ─────
     // The synthetic inputs mirror what `std::fs::canonicalize` returns on
     // Windows (verbatim paths); a real Windows CI leg should confirm pnpm
-    // 7/8's own emission spelling (tracked residual).
+    // 7/8's own emission spelling.
 
     #[test]
     fn normalize_strips_windows_verbatim_drive_prefix_and_forward_slashes() {
@@ -1994,13 +1916,13 @@ mod tests {
         );
     }
 
-    /// The uuid the 2026-08-18 legacy spike vendored under (the captured
-    /// locks quote it verbatim).
+    /// The uuid the captured locks were vendored under (they quote it
+    /// verbatim).
     const UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
     const ORIG_INDEX: &[u8] = b"module.exports = () => 'orig';\n";
     const PATCHED_INDEX: &[u8] = b"module.exports = () => 'patched';\n";
 
-    /// The spike tarball's integrity as the captured after-locks record it.
+    /// The captured tarball's integrity as the after-locks record it.
     /// Our pack pipeline produces a DIFFERENT (deterministic) tarball, so
     /// fixture comparisons substitute the actual integrity for this token —
     /// everything else must be byte-identical.
@@ -2013,11 +1935,11 @@ mod tests {
     const ROOT_TOKEN: &str = "__PROJECT_ROOT__";
 
     // ── tool-generated byte-exact oracles ─────────────────────────────────
-    // Provenance: matrix/vendor-legacy-spike/{t7,t8} — a `file:` tarball
-    // pnpm.overrides entry added to the fixture below, then serialized by
-    // REAL `corepack pnpm@7.33.5` / `pnpm@8.15.9` installs (2026-08-18) and
-    // proven byte-stable across an install re-run. Only the machine path
-    // and the tarball integrity are tokenized.
+    // Provenance: a `file:` tarball pnpm.overrides entry added to the
+    // fixture below, then serialized by REAL `corepack pnpm@7.33.5` /
+    // `pnpm@8.15.9` installs and proven byte-stable across an install
+    // re-run. Only the machine path and the tarball integrity are
+    // tokenized.
     const T_BEFORE_PKG: &str = r#"{
   "name": "legacy-spike2",
   "version": "0.0.0",
@@ -2190,7 +2112,7 @@ packages:
     dev: false
 ";
 
-    // Provenance: matrix/vendor-legacy-spike/x7 — the transitive-ONLY shape
+    // Provenance: a real pnpm 7.33.5 capture of the transitive-ONLY shape
     // (root depends on `consumer` only): pnpm rekeys the packages entry and
     // the consumer's dep ref but touches NO root section — no absolute path
     // appears anywhere.
@@ -2304,7 +2226,7 @@ packages:
             )
         }
 
-        /// Instantiate a captured after-lock for THIS tempdir: the spike's
+        /// Instantiate a captured after-lock for THIS tempdir: the captured
         /// integrity and absolute-root tokens swapped for the live values.
         async fn expected_lock(&self, fixture: &str) -> String {
             fixture
@@ -2315,7 +2237,7 @@ packages:
         async fn vendor(&self, dry_run: bool) -> VendorOutcome {
             let blobs = self.root().join(".socket/blobs");
             let sources = PatchSources::blobs_only(&blobs);
-            vendor_pnpm_legacy(
+            crate::vendor::test_support::vendor_pnpm_legacy(
                 "pkg:npm/left-pad@1.3.0",
                 &self.installed(),
                 self.root(),
@@ -2355,7 +2277,7 @@ packages:
         cfg: Option<&crate::vendor::VendorServiceConfig>,
     ) -> VendorOutcome {
         let blobs = fx.root().join(".socket/blobs");
-        vendor_pnpm_legacy(
+        crate::vendor::test_support::vendor_pnpm_legacy(
             "pkg:npm/left-pad@1.3.0",
             &fx.installed(),
             fx.root(),
@@ -2686,7 +2608,7 @@ packages:
 
     // ── empty-wiring (reconstructed) revert guard ─────────────────────────
 
-    /// Same P1 regression guard as the v9 backend: a `repair`-reconstructed
+    /// Same guard as the v9 backend: a `repair`-reconstructed
     /// entry (empty wiring — the legacy fragments are just as
     /// offline-unrecoverable) must not have its artifact deleted while the
     /// legacy lock still resolves through it; a provably orphaned artifact
@@ -3072,13 +2994,12 @@ packages:
         assert_eq!(pnpm_legacy_entry_in_use(&entry, fx.root()).await, None);
     }
 
-    /// A CRLF-converted lock (a Windows autocrlf checkout) is UNDETERMINABLE
-    /// for the in-use probe — `sniff_lock_grammar` tolerates the `\r` (its
-    /// `trim()` eats it) but every LF-exact section probe misses, so without
-    /// the guard the probe calls a lock that still resolves through the
-    /// artifact "provably orphaned" and the unwired-revert guard deletes it.
+    /// A CRLF-converted lock (a Windows autocrlf checkout) must never read
+    /// as "provably orphaned" while it still resolves through the artifact
+    /// (the unwired-revert guard would delete it): the in-use walk reads
+    /// CRLF like LF and answers `Some(true)`.
     #[tokio::test]
-    async fn crlf_lock_is_undeterminable_for_in_use_and_unwired_revert_refuses() {
+    async fn crlf_lock_reads_as_in_use_and_unwired_revert_refuses() {
         let fx = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let mut entry = entry.unwrap();
@@ -3089,8 +3010,8 @@ packages:
 
         assert_eq!(
             pnpm_legacy_entry_in_use(&entry, fx.root()).await,
-            None,
-            "a CRLF lock is undeterminable, never provably orphaned"
+            Some(true),
+            "a CRLF lock still consuming the artifact reads as in use"
         );
 
         // The empty-wiring (repair-reconstructed) revert rides that verdict.
@@ -3115,8 +3036,8 @@ packages:
     /// Wiring records left alone during a WIRED revert (here: a
     /// CRLF-converted lock whose LF-exact probes all miss) must KEEP the
     /// artifact dir — the lock still resolves through the tarball, and
-    /// deleting it bricks every subsequent install (residual #131's
-    /// lossiness guard, present in the v9/npm/bun backends).
+    /// deleting it bricks every subsequent install (the lossiness guard,
+    /// present in the v9/npm/bun backends).
     #[tokio::test]
     async fn drifted_lock_revert_keeps_the_artifact() {
         let fx = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
@@ -3385,7 +3306,7 @@ packages:
         );
     }
 
-    // ── coverage-audit 2026-09: revert drift/degradation matrices, dry run,
+    // ── revert drift/degradation matrices, dry run,
     //    pre-flight refusal variants, and write-failure paths ──────────────
 
     /// A foreign checkout root every drift fixture below pretends the lock
@@ -3473,22 +3394,12 @@ packages:
             .await
             .unwrap();
         let (result, entry, _) = expect_done(fx.vendor(false).await);
-        assert!(!result.success, "a missing target fails the vendor");
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert!(fx.root().join(fx.rel_tgz()).is_file());
         assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("File not found"),
-            "{:?}",
-            result.error
-        );
-        assert!(entry.is_none());
-        assert_eq!(fx.read(PACKAGE_JSON).await, T_BEFORE_PKG);
-        assert_eq!(fx.read(PNPM_LOCK).await, T7_BEFORE_LOCK);
-        assert!(
-            !fx.root().join(".socket/vendor").exists(),
-            "a failed apply packs nothing"
+            !fx.installed().join("index.js").exists(),
+            "installed bytes are untouched"
         );
     }
 
@@ -3568,27 +3479,6 @@ packages:
         let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
         assert!(detail.contains("does not match"), "{detail}");
         assert_eq!(fx.read(PNPM_LOCK).await, lock, "refusal writes nothing");
-    }
-
-    /// An installed package declaring bundleDependencies refuses before any
-    /// project write (the repack would drop its bundled node_modules).
-    #[tokio::test]
-    async fn bundled_deps_refuse_before_any_write() {
-        let fx = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
-        tokio::fs::write(
-            fx.installed().join("package.json"),
-            br#"{"name":"left-pad","version":"1.3.0","bundleDependencies":["x"]}"#,
-        )
-        .await
-        .unwrap();
-        let detail = expect_refused(fx.vendor(false).await, "vendor_bundled_deps_unsupported");
-        assert!(detail.contains("bundleDependencies"), "{detail}");
-        assert_eq!(fx.read(PACKAGE_JSON).await, T_BEFORE_PKG);
-        assert_eq!(fx.read(PNPM_LOCK).await, T7_BEFORE_LOCK);
-        assert!(
-            !fx.root().join(".socket/vendor").exists(),
-            "refusals write nothing"
-        );
     }
 
     /// A legacy lock with NO packages: section refuses through the
@@ -4615,7 +4505,7 @@ packages:
         );
     }
 
-    // ── coverage mop-up 2026-09: grammar naming, coordinate guard routing,
+    // ── grammar naming, coordinate guard routing,
     //    marker degradation, malformed/hand-edited lock tolerance, and the
     //    remaining revert left-alone shapes ─────────────────────────────────
 
@@ -4648,7 +4538,7 @@ packages:
         let sources = PatchSources::blobs_only(&blobs);
         let mut record = fx.record.clone();
         record.uuid = "../escape".to_string();
-        let outcome = vendor_pnpm_legacy(
+        let outcome = crate::vendor::test_support::vendor_pnpm_legacy(
             "pkg:npm/left-pad@1.3.0",
             &fx.installed(),
             fx.root(),

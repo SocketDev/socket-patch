@@ -36,20 +36,18 @@ pub struct PatchRecord {
     pub tier: String,
 }
 
-/// Persisted `setup` configuration (CLI_CONTRACT property 9). Lives under the
-/// manifest's `setup` key so a fresh clone's `setup` / `setup --check` honors it
-/// without re-passing flags.
+/// Legacy `setup` configuration, written by the `setup` command that v5
+/// removed. Still parsed and kept on rewrite (so a v4 manifest round-trips
+/// byte-stably) but read by nothing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SetupConfig {
     /// Workspace-member paths (relative to the repo root, forward-slashed) that
-    /// `setup` must NOT configure — and `setup --check` must not flag as
-    /// needing configuration.
+    /// the removed `setup` skipped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
-    /// Ecosystems (by `Ecosystem::cli_name`, e.g. `"pypi"`) the user runs
-    /// `socket-patch apply` for by hand, so their patches are still attested in
-    /// VEX even though no auto-install hook is wired (CLI_CONTRACT property 7).
+    /// Ecosystems (by `Ecosystem::cli_name`, e.g. `"pypi"`) the pre-v5 `vex`
+    /// attested with no install hook wired.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub manual: Vec<String>,
 }
@@ -78,7 +76,7 @@ pub struct PatchManifest {
     /// Maps package PURL (e.g., "pkg:npm/lodash@4.17.21") -> patch record.
     #[serde(serialize_with = "serialize_sorted")]
     pub patches: HashMap<String, PatchRecord>,
-    /// Optional persisted `setup` state (e.g. excluded workspace members).
+    /// Optional legacy `setup` state (see [`SetupConfig`]).
     /// Absent on manifests that predate / don't use it (serde default), and
     /// omitted from the serialized form when empty so existing manifests are
     /// byte-stable.
@@ -477,11 +475,10 @@ mod tests {
     // state ──
     //
     // The field doc promises `setup` is "omitted from the serialized form when
-    // empty so existing manifests are byte-stable." Before the fix, the skip
-    // predicate was `Option::is_none`, so a `Some` of an empty `SetupConfig`
-    // (which a load of `"setup": {}` produces, and which the also-then-dead
-    // `SetupConfig::is_empty` was written to detect) leaked a spurious
-    // `"setup":{}` key, breaking that contract.
+    // empty so existing manifests are byte-stable." A `Some` of an empty
+    // `SetupConfig` (which a load of `"setup": {}` produces) must not leak a
+    // spurious `"setup":{}` key, so the skip predicate (`setup_is_absent`)
+    // checks emptiness, not just `Option::is_none`.
 
     // A `Some` of an empty config must serialize byte-identically to `None`:
     // no `setup` key at all.

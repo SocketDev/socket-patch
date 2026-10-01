@@ -11,10 +11,14 @@
 //! 3. `offline`: no manifest, no ledgers, `--offline` →
 //!    `record_unavailable` (and, against the mock, ZERO requests);
 //! 4. `reverted`: the wiring back on the registry, ledgers + artifacts kept
-//!    → NOT attested (`redirect_unwired` / `vendor_unwired`), offline and
-//!    online, with and without `--no-verify`;
+//!    → NOT attested, offline and online, with and without `--no-verify`:
+//!    `redirect_unwired` / `vendor_unwired` while a ledger still names the
+//!    patch; with no ledger at all (v5 hosted mode keeps none, so a reverted
+//!    hosted checkout holds no patch state anywhere) the run is the plain
+//!    `manifest_not_found` error;
 //! 5. `apply-vex`: `apply --vex` on the manifest-less checkout, ledgers
-//!    kept, offline → attested.
+//!    kept → attested: offline (zero requests) when a ledger supplies the
+//!    record, online from the API otherwise (v5 hosted mode).
 //!
 //! Every step runs on a scoped OS thread, so the helper is callable from
 //! `#[tokio::test]`s (the mock patch API owns its own runtime).
@@ -232,6 +236,7 @@ fn steps_inner(s: &Steps<'_>) {
         let p = copy("reverted");
         strip_manifest(&p);
         (s.revert)(&p);
+        let ledgered = has_ledger(&p);
         for (offline, no_verify) in [(true, false), (true, true), (false, false), (false, true)] {
             let out = s.run(
                 &p,
@@ -245,29 +250,54 @@ fn steps_inner(s: &Steps<'_>) {
                 "{} reverted offline={offline} no_verify={no_verify}",
                 s.what
             );
-            assert_eq!(out.code, Some(1), "{what}: {out}");
-            assert_absent(out.doc.as_ref(), s.purl);
-            assert_not_attested(&out.envelope, s.purl, s.unwired());
+            if ledgered {
+                assert_eq!(out.code, Some(1), "{what}: {out}");
+                assert_absent(out.doc.as_ref(), s.purl);
+                assert_not_attested(&out.envelope, s.purl, s.unwired());
+            } else {
+                // Nothing names the patch any more: no manifest, no ledger,
+                // no hosted wiring.
+                assert_eq!(out.code, Some(2), "{what}: {out}");
+                assert_eq!(
+                    out.envelope["error"]["code"], "manifest_not_found",
+                    "{what}: {out}"
+                );
+                assert_absent(out.doc.as_ref(), s.purl);
+            }
         }
     });
 
     s.step("apply-vex", || {
         let p = copy("apply-vex");
         strip_manifest(&p);
-        let silent = PatchApi::empty();
-        let out = s.run(
-            &p,
-            VexRun {
-                offline: true,
-                ..VexRun::online(&silent)
-            }
-            .via(VexVia::Apply),
-        );
-        assert_eq!(out.code, Some(0), "{} apply --vex: {out}", s.what);
-        s.assert_attested(&out, "apply-vex");
+        if has_ledger(&p) {
+            let silent = PatchApi::empty();
+            let out = s.run(
+                &p,
+                VexRun {
+                    offline: true,
+                    ..VexRun::online(&silent)
+                }
+                .via(VexVia::Apply),
+            );
+            assert_eq!(out.code, Some(0), "{} apply --vex: {out}", s.what);
+            s.assert_attested(&out, "apply-vex");
+            silent.assert_no_requests();
+        } else {
+            // No local record (a v5 hosted checkout): the API supplies it.
+            let out = s.run(&p, online().via(VexVia::Apply));
+            assert_eq!(out.code, Some(0), "{} apply --vex: {out}", s.what);
+            s.assert_attested(&out, "apply-vex");
+        }
         assert!(!p.join(".socket/manifest.json").exists(), "{}", s.what);
-        silent.assert_no_requests();
     });
+}
+
+/// Whether the checkout still holds a ledger that can name the patch (the
+/// vendor ledger, or a pre-v5 hosted ledger).
+fn has_ledger(project: &Path) -> bool {
+    project.join(".socket/vendor/state.json").exists()
+        || project.join(".socket/vendor/redirect-state.json").exists()
 }
 
 /// Copy `from` into `to` recursively (symlinks copied as the files they

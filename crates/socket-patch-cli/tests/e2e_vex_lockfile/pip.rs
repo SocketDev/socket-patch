@@ -267,9 +267,8 @@ fn sibling_requirements_file_the_root_never_includes_is_not_read() {
 }
 
 /// A wired line commented out (`# vexdemo @ …` / `# ./.socket/vendor/…`)
-/// is not something pip installs: not wiring, and with the ledger kept the
-/// ledger claim is dead (`redirect_unwired` / `vendor_unwired`), even
-/// under `--no-verify`.
+/// is not something pip installs: not wiring, and with the vendor ledger
+/// kept its claim is dead (`vendor_unwired`), even under `--no-verify`.
 #[test]
 fn commented_out_wiring_is_not_a_reference() {
     let root = &flavors()[0];
@@ -280,7 +279,7 @@ fn commented_out_wiring_is_not_a_reference() {
             .map(|l| format!("# {l}\n"))
             .collect::<String>()
             + "vexdemo==1.2.3\n";
-        for keep in [NOTHING, LEDGERS_ONLY] {
+        for &keep in mode.ledger_keeps() {
             let what = format!("{} commented ledgers={}", wired.what(), keep.ledgers);
             let (_tmp, cwd) = fresh();
             wired.restore(&cwd, keep);

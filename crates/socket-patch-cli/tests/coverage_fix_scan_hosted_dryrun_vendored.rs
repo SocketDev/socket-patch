@@ -1,20 +1,17 @@
-//! Coverage-audit regression: `scan --mode hosted --dry-run` over a VENDORED
-//! project must preview the WET run's takeover outcome.
-//!
-//! Pre-fix, the takeover pre-revert loop's dry-run branch pushed the
-//! `redirect_would_revert_vendored` warning ("will revert … then redirect")
-//! and `continue`d — skipping the revert but LEAVING the purl in the
-//! candidates/overrides handed to the rewriters. The pnpm/berry rewriters
-//! then previewed against the still-vendored lock, fail-closed refused its
-//! `file:.socket/vendor/…` resolution (`redirect_pnpm_entry_vendored`,
-//! "run `vendor --revert` first"), and the envelope reported `redirected: 0`
-//! with BOTH contradictory prescriptions — while the same command WITHOUT
-//! `--dry-run` reverted first and reported `redirected: 1`. A CI gate keying
-//! on the dry-run count concluded the migration would fail when it succeeds.
+//! `scan --mode hosted --dry-run` over a VENDORED project must preview the
+//! WET run's takeover outcome: the rewriters must not preview against the
+//! still-vendored lock (and fail-closed refuse its `file:.socket/vendor/…`
+//! resolution with `redirect_pnpm_entry_vendored`), or the envelope would
+//! report `redirected: 0` with contradictory prescriptions while the wet
+//! run reports `redirected: 1` — and a CI gate keying on the dry-run count
+//! would conclude the migration fails when it succeeds.
 //!
 //! Fixture: a real offline `vendor` run (the `in_process_vendor.rs` harness
 //! shapes) produces the vendored lock + `.socket/vendor/state.json` entry;
 //! the hosted API is wiremock (`in_process_redirect_pnpm.rs` shapes).
+
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 
 use std::path::Path;
 
@@ -88,8 +85,8 @@ async fn mock_hosted_api(server: &MockServer) {
         })))
         .mount(server)
         .await;
-    // `view/{uuid}` — the record the wet run persists into the redirect
-    // ledger after a confirmed redirect.
+    // `view/{uuid}` — the record the wet run fetches (in memory: stale-install
+    // probes, in-run VEX) after a confirmed redirect.
     let before_hash = compute_git_sha256_from_bytes(ORIG_INDEX);
     let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
     Mock::given(method("GET"))
@@ -189,7 +186,13 @@ fn seed_manifest_and_blob(root: &Path) {
 /// stderr)`.
 fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    cmd.args(args).current_dir(cwd);
+    let fixture = (args.first() == Some(&"vendor")).then(|| prebuilt_common::Server::project(cwd));
+    let args: Vec<_> = args
+        .iter()
+        .copied()
+        .filter(|arg| fixture.is_none() || *arg != "--offline")
+        .collect();
+    cmd.args(&args).current_dir(cwd);
     for (key, _) in std::env::vars() {
         if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
             cmd.env_remove(key);
@@ -210,6 +213,9 @@ fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     }
     cmd.env("NPM_CONFIG_ALLOW_REMOTE", "")
         .env("npm_config_allow_remote", "");
+    if let Some(fixture) = &fixture {
+        fixture.command(&mut cmd);
+    }
     let out = cmd.output().expect("spawn socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -336,15 +342,15 @@ async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
         codes.contains(&"redirect_would_revert_vendored"),
         "the takeover plan must be announced: {doc:#}"
     );
-    // THE BUG: the rewriters previewed against the still-vendored lock and
-    // refused it, contradicting the takeover warning above.
+    // Previewing against the still-vendored lock would refuse it,
+    // contradicting the takeover warning above.
     assert!(
         !codes.contains(&"redirect_pnpm_entry_vendored"),
         "the dry-run must not also tell the user to run `vendor --revert` \
          for a purl this run just promised to revert itself: {doc:#}"
     );
-    // THE BUG: the preview reported `redirected: 0` for a migration the wet
-    // run lands (below) — the CI-gate signal this envelope exists for.
+    // The preview must count the migration the wet run lands (below) — the
+    // CI-gate signal this envelope exists for.
     assert_eq!(
         doc["redirect"]["redirected"], 1,
         "the dry-run must preview the wet outcome: {doc:#}"
@@ -490,13 +496,12 @@ fn scan_hosted_human(cwd: &Path, api_url: &str, dry_run: bool) -> (i32, String, 
     run_cli(cwd, &args)
 }
 
-/// The first line of `stdout` (the summary).
 /// The engine's one-line summary. Human hosted `scan` prints the results
 /// table and discovery summary above it, so find it by its lead words.
 fn summary_line(stdout: &str) -> &str {
     stdout
         .lines()
-        .find(|l| l.starts_with("Would redirect ") || l.starts_with("Redirected "))
+        .find(|l| l.starts_with("Would switch ") || l.starts_with("Switched "))
         .unwrap_or_default()
 }
 
@@ -504,8 +509,7 @@ fn summary_line(stdout: &str) -> &str {
 /// the wet run the landed one, each as its own line on stderr, and both
 /// summaries count the same 3 files — the lock and workspace the hosted
 /// rewriter touches plus the package.json `pnpm.overrides` wiring only the
-/// vendored revert touches (the wet count used to omit it: "rewrote 2
-/// files"). The wet run's next steps name `.socket/vendor/` and
+/// vendored revert touches. The wet run's next steps name `.socket/vendor/` and
 /// package.json, so the deleted vendored ledger entry and artifact and the
 /// reverted wiring are committed too.
 #[tokio::test]
@@ -534,7 +538,7 @@ async fn human_takeover_prints_migration_lines_and_matching_file_counts() {
     );
     assert_eq!(
         summary_line(&dry_out),
-        "Would redirect 1 package and rewrite 3 files (--dry-run: nothing was changed).",
+        "Would switch 1 package to hosted patches and rewrite 3 files (--dry-run: nothing was changed).",
         "stdout=\n{dry_out}"
     );
 
@@ -550,14 +554,13 @@ async fn human_takeover_prints_migration_lines_and_matching_file_counts() {
     );
     assert_eq!(
         summary_line(&wet_out),
-        "Redirected 1 package; rewrote 3 files.",
+        "Switched 1 package to hosted patches; rewrote 3 files.",
         "the wet count must equal the dry-run preview; stdout=\n{wet_out}"
     );
     assert!(
         wet_out.contains(
-            "Commit .socket/vendor/ (the redirect ledger, plus the removed vendored ledger \
-             entries and artifacts), package.json, pnpm-lock.yaml, and pnpm-workspace.yaml \
-             to keep the redirect."
+            "  1. Commit .socket/vendor/ (the removed vendored ledger entries and artifacts), \
+             package.json, pnpm-lock.yaml, and pnpm-workspace.yaml to keep the hosted patches."
         ),
         "stdout=\n{wet_out}"
     );
@@ -688,7 +691,12 @@ async fn vlt_dry_run_over_vendored_project_previews_the_wet_takeover() {
     )
     .unwrap();
     let cwd = root.to_str().unwrap().to_string();
-    let (code, env, stderr) = hosted::run_json(root, &["vendor", "--offline", "--cwd", &cwd], &[]);
+    let fixture = prebuilt_common::Server::project(root);
+    let (code, env, stderr) = hosted::run_json(
+        root,
+        &["vendor", "--cwd", &cwd],
+        &[("SOCKET_VENDOR_URL", &fixture.uri)],
+    );
     assert_eq!(code, 0, "{env:#}\n{stderr}");
     std::fs::remove_file(socket.join("manifest.json")).unwrap();
     let vendored_lock = std::fs::read(root.join("vlt-lock.json")).unwrap();

@@ -25,9 +25,10 @@ managers.
 
 Both modes retain the package version, dependencies, groups, markers, extras
 and the pyproject `content-hash`; no pyproject edit is required. A repeated
-scan leaves the lock unchanged. Rollback restores the recorded original
-fragments — one per patch (plus the integrity-table entry on legacy formats),
-so either of two patches can be rolled back first and unrelated edits survive.
+scan leaves the lock unchanged. Vendored rollback restores the recorded original
+fragments. Hosted rollback
+resolves upstream registry entries; it has no replay ledger or guarantee of the
+original byte layout. Both preserve unrelated entries.
 Refused before any write: a `[[package]]` listed at several versions (marker
 fork), a user-authored `[package.source]` on another origin (an earlier Socket
 URL for the same wheel is superseded in place, e.g. after a grant-token
@@ -95,11 +96,9 @@ Other measured details:
   `files` the rewrite added for Poetry ≥ 1.2's hash check; a lock relocked by
   1.1 and then installed by 1.2+ installs the hosted wheel unverified. Re-run
   `socket-patch scan --mode hosted` after relocking on those releases: the
-  re-scan restores the entry and rebases the ledger's recorded edits onto the
-  relocked text (pristine → current, never an appended chain), so `rollback`
-  still lands on the pristine lock afterwards. A relocked-but-not-rescanned
-  lock is refused by `rollback` (its recorded fragments match nothing) rather
-  than reported as already reverted.
+  re-scan restores the source and integrity fields. In v5, hosted rollback
+  reconstructs upstream metadata and may refuse a drifted lock; it does not replay
+  pre-scan fragments.
 - Poetry 0.12 and 1.0 resolve a relative `type = "file"` path against the
   shell's working directory, not the project root; run `poetry install` from
   the project root on those releases.
@@ -150,7 +149,7 @@ python3 scripts/backtest-poetry.py \
   --cli /tmp/socket-patch-under-test \
   --cli-revision "$(git rev-parse --short HEAD)" \
   --output /tmp/socket-patch-poetry-backtest \
-  --modes hosted vendored agent agent-oot setup \
+  --modes hosted vendored agent agent-oot \
   --shapes direct populated crlf pep621
 python3 scripts/backtest-poetry.py --render-doc-table /tmp/socket-patch-poetry-backtest/summary.json
 ```
@@ -167,9 +166,8 @@ verifies, Poetry's own relock keeps the source, and `rollback` restores every
 byte and clears the ledgers. Shapes: `direct` (the committed native fixture),
 `populated` (legacy locks with real upstream hashes filled in — today's PyPI
 JSON API leaves old Poetry's `[metadata.files]` empty), `crlf`, and `pep621`
-(2.x `[project]` tables with `package-mode = false`). Modes `agent-oot`
-(Poetry's default out-of-tree virtualenv via `poetry run`) and `setup`
-(`socket-patch setup` on a Poetry project, then `poetry lock`) are
+(2.x `[project]` tables with `package-mode = false`). Mode `agent-oot`
+(Poetry's default out-of-tree virtualenv via `poetry run`) is
 informational.
 
 Rust coverage of the rewriters: `cargo test -p socket-patch-core --lib
@@ -178,38 +176,5 @@ utils::poetry_lock vendor::pypi_poetry` and `cargo test -p socket-patch-core
 `crates/socket-patch-core/tests/fixtures/poetry/<version>/` are the harness's
 `original/` inputs (same pyproject, same `content-hash`).
 
-## Results
-
-<!-- GENERATED:BEGIN — everything down to GENERATED:END is printed by
-     `python3 scripts/backtest-poetry.py --render-doc-table docs/testing/poetry-compatibility/results.json`;
-     regenerate rather than hand-edit. -->
-| Poetry | hosted | vendored | agent (in-project venv) | agent (`poetry run`, out-of-tree venv) | tamper rejected (hosted / vendored) | warm venv re-installed (hosted / vendored) | relock keeps patch (hosted / vendored) | lock-only vendored |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0.12.17 | refused (0.x ignores URL sources) | pass (crlf,direct,populated) | pass (direct) | n/a | n/a / no | n/a / false | n/a / false | refused |
-| 1.0.10 | pass (crlf,direct,populated) | pass (crlf,direct,populated) | pass (direct) | pass (direct) | yes / no | false / false | false / false | refused (crlf), refused (direct), yes (populated) |
-| 1.1.15 | pass (crlf,direct,populated) | pass (crlf,direct,populated) | pass (direct) | pass (direct) | yes / no | false / false | true / true | refused (crlf), refused (direct), yes (populated) |
-| 1.2.2 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / no | false / false | true / true | yes |
-| 1.3.2 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / no | false / false | true / true | yes |
-| 1.4.2 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
-| 1.5.1 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
-| 1.6.1 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
-| 1.7.1 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
-| 1.8.5 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
-| 2.0.1 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
-| 2.1.4 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
-| 2.2.1 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
-| 2.3.4 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
-| 2.4.3 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
-<!-- GENERATED:END -->
-
-Captured 2026-09-17 on macOS arm64 against the fix-branch head; 108 cases,
-all passing (the `pass`/`refused` cells are the asserted outcomes; the
-`tamper` / `warm venv` / `relock` / `lock-only vendored` columns are the
-measured installer facts the sections above describe). The
-[machine-readable results](poetry-compatibility/results.json) carry every
-check, the CLI envelopes' relevant fields and the per-step exit codes.
-`poetry lock` on 0.12 / 1.0 is bare (no `--no-update`), hence
-`relock keeps patch = false` there; `lock-only vendored = refused` on 0.12 and
-on the unpopulated 1.0/1.1 fixtures (`urllib3 = []`) because those locks name
-no wheel hash. The companion SBOM annotation work and its own capture set live
-in SocketDev/depscan (`tools/pipeline/poetry-patch-backtest.py`).
+Full run results belong with the source revision and toolchain versions in CI
+artifacts or a local output directory. See the [testing guide](README.md#ci-and-results).
