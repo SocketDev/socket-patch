@@ -130,7 +130,10 @@ fn without_hashes(text: &str) -> String {
 }
 
 enum RequirementVersion {
+    /// `==X` (PEP 440 equality), or a direct reference whose archive names X.
     Exact(String),
+    /// `===X`: arbitrary equality, a plain string comparison.
+    Arbitrary(String),
     Unpinned,
     Ambiguous,
 }
@@ -166,14 +169,21 @@ fn requirement_version(specifier: &str, name_re: &Regex, name: &str) -> Requirem
         return archive_version(location.trim(), name)
             .map_or(RequirementVersion::Ambiguous, RequirementVersion::Exact);
     }
-    if let Some(version) = tail.strip_prefix("===").or_else(|| tail.strip_prefix("==")) {
-        let version = version.trim();
+    let (arbitrary, version) = match tail.strip_prefix("===") {
+        Some(version) => (true, Some(version)),
+        None => (false, tail.strip_prefix("==")),
+    };
+    if let Some(version) = version.map(str::trim) {
         if !version.is_empty()
             && !version
                 .chars()
                 .any(|character| character.is_whitespace() || ",*<>=~".contains(character))
         {
-            return RequirementVersion::Exact(version.to_string());
+            return if arbitrary {
+                RequirementVersion::Arbitrary(version.to_string())
+            } else {
+                RequirementVersion::Exact(version.to_string())
+            };
         }
     }
     RequirementVersion::Ambiguous
@@ -245,8 +255,14 @@ pub(super) fn rewrite(
                     (&cleaned[..index], &cleaned[index..])
                 });
             match requirement_version(specifier, &name_re, &target) {
-                RequirementVersion::Exact(version) if version != dep.version => continue,
-                RequirementVersion::Exact(_) => {}
+                // pip resolves `==` under PEP 440 (`==1.16` installs 1.16.0).
+                RequirementVersion::Exact(version)
+                    if !crate::utils::pep440::versions_equal(&version, &dep.version) =>
+                {
+                    continue
+                }
+                RequirementVersion::Arbitrary(version) if version != dep.version => continue,
+                RequirementVersion::Exact(_) | RequirementVersion::Arbitrary(_) => {}
                 RequirementVersion::Unpinned
                     if row_counts.get(&target) == Some(&1)
                         && override_versions
@@ -386,6 +402,41 @@ mod tests {
         let rerun = rewrite_registry_redirect(&input(&expected), &[patch()]);
         assert!(rerun.files.is_empty() && rerun.edits.is_empty());
         assert!(rerun.warnings.is_empty());
+    }
+
+    /// #475: pip resolves `==2.28`, `==2.28.1.0` and `==02.28.1` under
+    /// PEP 440, so each pins exactly the patched 2.28.1 and is rewritten.
+    #[test]
+    fn pep440_equivalent_pins_are_rewritten() {
+        let mut short = patch();
+        short.version = "2.28.0".into();
+        for (source, dep) in [
+            ("requests==2.28\n", short.clone()),
+            ("requests==2.28.1.0\n", patch()),
+            ("Requests==02.28.1\n", patch()),
+            ("requests == 2.28.01 ; python_version >= \"3.7\"\n", patch()),
+        ] {
+            let result = rewrite_registry_redirect(&input(source), std::slice::from_ref(&dep));
+            assert!(
+                result.warnings.is_empty(),
+                "{source}: {:?}",
+                result.warnings
+            );
+            assert!(
+                result.files["requirements.txt"].contains(&format!(" @ {URL}")),
+                "{source}"
+            );
+            assert!(result
+                .confirmed_requirements_uuids
+                .contains(&dep.patch_uuid));
+        }
+        // A different release is still not this patch's entry.
+        let result = rewrite_registry_redirect(&input("requests==2.28.1.1\n"), &[patch()]);
+        assert!(result.files.is_empty());
+        assert_eq!(
+            result.warnings[0].code,
+            "redirect_requirements_entry_not_found"
+        );
     }
 
     #[test]

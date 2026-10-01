@@ -78,7 +78,8 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, b
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        if spec_no_ws == format!("=={version}") {
+        // pip resolves `==` under PEP 440 (`==1.16` installs 1.16.0).
+        if crate::utils::pep440::is_exact_pin_of(&spec_no_ws, version) {
             exact.push((ll.start, ll.physical.len(), req.marker, req.hashed));
         } else {
             found_range = true;
@@ -980,6 +981,22 @@ mod tests {
             find_pin("six == 1.16.0\n", "six", "1.16.0"),
             PinSearch::Exact { .. }
         ));
+        // #475: pip selects the pinned release under PEP 440, so these
+        // spellings all pin exactly 1.16.0.
+        for pin in [
+            "six==1.16\n",
+            "six==1.16.0.0\n",
+            "Six==01.16.0\n",
+            "six == 1.16\n",
+        ] {
+            assert!(
+                matches!(find_pin(pin, "six", "1.16.0"), PinSearch::Exact { .. }),
+                "{pin}"
+            );
+        }
+        // Arbitrary equality is string equality; a wildcard is a range.
+        assert_eq!(find_pin("six===1.16\n", "six", "1.16.0"), PinSearch::Range);
+        assert_eq!(find_pin("six==1.16.*\n", "six", "1.16.0"), PinSearch::Range);
         // PEP 503 name canonicalization on both sides.
         assert!(matches!(
             find_pin("Six_Pkg==1.0\n", "six-pkg", "1.0"),
