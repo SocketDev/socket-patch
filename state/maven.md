@@ -1,30 +1,48 @@
 [agent] Progress ledger for the scheduled Maven bug-hunt routine (label pm:maven).
 
-Last updated: 2026-09-30 (run 2), main `f6b7fb9` (CLI 4.0.0), latest release 4.0.0.
+Last updated: 2026-10-01 (run 3), main `2463257` (v5 consolidation #277; binary still reports 4.0.0), latest release 4.0.0.
 
 ## Coverage matrix
 
-Cells are "pass", "fail #N" or "untested". Every cell uses a real Maven resolve (`maven-dependency-plugin:3.1.2:copy-dependencies`, fresh local repository) plus a jar oracle: the patch appends a marker to `META-INF/NOTICE.txt` of `org.apache.commons:commons-text:1.10.0`. Vendored mode uses a hand-staged `.socket/manifest.json` + blob, then `vendor --offline`, then deletes the manifest and blobs (a fresh checkout). Hosted mode uses a local Python stub of the patch API + Socket maven2 repository. It serves the same grant as `tests/e2e_redirect_maven_build.rs` (suffix `1.10.0-socket.4d5e6f70`), with a `settings.xml` mirror of `socket-patch-<uuid>` onto the stub. Use plugin 3.1.2, not 3.6.1: 3.6.1 itself depends on commons-text 1.10.0 and pollutes the local repo (#274). Linux runs use JDK 21. The macOS / Windows probes use the runner's default JDK (17).
+Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom). Global `-g` cells use real Maven installs into the local repository and a stub patch API (`/tmp`-local Python stub serving batch / by-package / view / blob). v5 vendored cells use the repo capstones (`e2e_vendor_jvm_build`, `e2e_vendor_maven_build`, `e2e_redirect_maven_build`) and local, uncommitted variants of them. Linux runs use JDK 21; the macOS / Windows probes use the runner's default JDK.
+
+### v5 global mode (`-g`)
+
+| OS | Maven | scan -g default | M2_HOME set | settings.xml `<localRepository>` | Windows HOME≠USERPROFILE | `-g --mode hosted` refusal | agent apply / vex / rollback | read-only global dir |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Linux | 3.6.3 / 3.8.8 / 3.9.11 / 4.0.0-rc-7 | pass | fail #423 | fail #423 | n/a | pass (3.9.11) | pass (3.9.11); rollback -g under M2_HOME drops the record, fail #423 | human pass / JSON fail #424 |
+| macOS | 3.6.3 / 3.9.11 / 4.0.0-rc-7 | pass (probe) | fail #423 | fail #423 | n/a | untested | untested | untested |
+| Windows | 3.6.3 / 3.9.11 / 4.0.0-rc-7 | pass (probe) | fail #423 | fail #423 | fail #423 | untested | untested | untested |
+
+### v5 vendored / hosted (Linux unless noted)
+
+| Maven | reactor capstone (auto) | reactor `--maven-config=none`: `-o` | `none`: `cd module` | `none`: `-f root` from outside | single-POM `%XX` path | hosted `<repositories/>` |
+| --- | --- | --- | --- | --- | --- | --- |
+| 3.6.3 | blocked (429) | blocked | blocked | untested | untested on v5 | untested on v5 |
+| 3.8.8 | blocked (429) | blocked | blocked | untested | untested on v5 | untested on v5 |
+| 3.9.11 | pass | fail #430 | fail #430 | pass | fail #350 | fail #342 |
+| 4.0.0-rc-7 | pass | fail #430 | pass | pass | untested on v5 | fail #342 |
+
+### v4.0.0 results (runs 1–2, main `f6b7fb9`; not re-run on v5 unless shown above)
 
 | OS | Maven | Vendored plain / space / unicode path | Vendored `%XX` in path | Vendored `<repositories/>` | Hosted direct / transitive (depMgmt) | Hosted `<repositories/>`, `<dependencyManagement/>`, comment in depMgmt | Hosted re-run idempotent | Hosted → vendored takeover | Vendored + SHA-256/512-only checksums | Vendored re-run / revert / remove / rollback |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 3.6.3 | pass | fail #350 | fail #342 | pass | fail #342 | untested | untested | pass (property ignored) | untested |
 | Linux | 3.8.8 | pass (unicode) | fail #350 | fail #342 | pass | fail #342 | untested | untested | fail #394 | untested |
-| Linux | 3.9.11 | pass | fail #350 | fail #342 | pass | fail #342 | pass | no revert, dead vendored wiring (commented on #271) | fail #394 | pass |
-| Linux | 4.0.0-rc-7 | pass | fail #350 | fail #342 | pass (also wiremock capstone, run 2) | fail #342 | untested | untested | fail #394 (build breaks) | untested |
-| macOS | 3.6.3 / 3.9.11 / 4.0.0-rc-7 | pass (probe; plain + space) | fail #350 (probe) | fail #342 (probe) | untested | untested | untested | untested | untested | untested |
-| Windows | 3.6.3 / 3.9.11 / 4.0.0-rc-7 | pass (probe; plain + space, `file://D:\...` resolves) | fail #350 (probe) | fail #342 (probe) | untested | untested | untested | untested | untested | untested |
+| Linux | 3.9.11 | pass | fail #350 | fail #342 | pass | fail #342 | pass | no revert (#271) | fail #394 | pass |
+| Linux | 4.0.0-rc-7 | pass | fail #350 | fail #342 | pass | fail #342 | untested | untested | fail #394 (build breaks) | untested |
+| macOS | 3.6.3 / 3.9.11 / 4.0.0-rc-7 | pass (probe) | fail #350 | fail #342 | untested | untested | untested | untested | untested | untested |
+| Windows | 3.6.3 / 3.9.11 / 4.0.0-rc-7 | pass (probe) | fail #350 | fail #342 | untested | untested | untested | untested | untested | untested |
 
 ## Backlog
 
-0. **Maintainer request:** test global (`-g`) mode for hosted patches on Linux, macOS and Windows across every major Maven version. `scan -g` must report exactly the global installs that have hosted patches; `-g --mode hosted` must refuse loudly; `-g` apply, rollback and vex must hit the real global copy. Full checklist in the 20261001T040000Z entry on this discussion.
-1. Delete the stale probe branch `bughunt/maven/20260930-vendored-paths`: the git proxy refused `git push --delete` in runs 1 and 2. A maintainer needs to delete it.
-2. Re-run the hosted capstone `e2e_redirect_maven_build` (`SOCKET_PATCH_MAVEN_E2E_MVN=<mvn>`) on 3.6.3 / 3.8.8 with a warm cache. In run 2, 3.8.8 failed once at `e2e_redirect_maven_build.rs:437` (the re-signed-jar resolve that should pass on <3.9). That's probably a Central 429, but it's unconfirmed.
-3. Windows vendored Maven: long paths (> 260 chars) under `.socket/vendor/maven/<uuid>/<group path>/…`, and a CRLF checkout (`core.autocrlf=true`) of the committed `.pom` / `.sha1` sidecars. The probe script is in the run 1 entry.
-4. Hosted Maven on macOS / Windows (a probe running the wiremock capstone).
-5. Hosted: `<dependency>` blocks inside `<exclusions>`-heavy poms with unusual child order, BOM `import` scope for the patched GA, and `-o` offline on a fresh checkout (should fail loudly).
-6. VEX online over the #350 / #394 fall-throughs (offline attests, with only a "live tree differs" warning).
-7. Maven 4 `<subprojects>` aggregators (model 4.1.0): re-check on Maven 4.0.0 GA and with `-pl child` on a cold cache.
+0. **Maintainer request (global `-g`)**: mostly covered in run 3 (see the matrix and the 20261001T061707Z entry). Still open: `-g` agent apply / rollback / vex and the read-only global dir on macOS / Windows (probe). Keep this item until those cells pass or fail.
+1. A maintainer needs to delete the stale probe branches `bughunt/maven/20260930-vendored-paths` and `bughunt/maven/20261001-global-repo`; `git push --delete` hangs up from the sandbox. Probe commits must use the default (signed) git identity. Don't override `user.email`.
+2. Re-run the reactor capstone (auto + `none`) and the hosted capstone on 3.6.3 / 3.8.8 when Central isn't throttling (the fallback-repo-only path).
+3. Reactor backend: `%XX` / comma / space checkout paths (the comma splits `maven.repo.local.tail`), and an existing `.mvn/maven.config` with CRLF / BOM / user tail.
+4. #394 on v5: reactor tree `.sha1`-only versus `aether.checksums.algorithms=SHA-256`.
+5. Windows long paths + CRLF checkout of `.socket/vendor/maven2` (the new `* -text` `.gitattributes`).
+6. Hosted: BOM `import` scope, exclusion ordering, `-o` on a fresh checkout. VEX online over the #350 fall-through.
 
 ## Known non-bugs
 
@@ -34,4 +52,7 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real Maven resolve 
 - Hosted literal version range `<version>[1.10.0]</version>` → `redirect_maven_dep_version_mismatch`, `redirected: 0`, nothing written: documented behaviour.
 - Central 429 bodies cached as `.pom` files ("Non-parseable POM … Your…") are rate-limit artifacts. Delete poms under 200 bytes from the seed repo and retry.
 - Maven 4 `<subprojects>` aggregator not refused by vendored mode: harmless on 4.0.0-rc-7 (see backlog 6).
+- Linux sandbox: Java's `user.home` comes from passwd, not `$HOME`. Pass `-Duser.home=$HOME` to Maven when faking a home directory.
+- `--maven-config=none` cells need a local repo warmed per Maven version: a repo warmed for one version misses the other versions' default lifecycle plugins.
+- Offline `rollback -g` without the before-blob → loud exit 1 "--offline prevents fetching": documented.
 - Already filed elsewhere; don't re-file: #258–#275 (comment/profile/plugin markup #259, multi-module #261, classifier #262, repository order / mirrors #263, crawler lists all of ~/.m2 #265, no re-pin #266, CI matrix #267, no hosted revert #271, lowercased GAV #272, CRLF #273, plugin shadow #274).
