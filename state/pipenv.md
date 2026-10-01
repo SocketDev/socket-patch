@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-01, main `2463257` (v5 consolidation #277; CLI 4.0.0).
+Last run: 2026-10-01 09:34Z, main `2463257` (v5 consolidation #277; CLI 4.0.0).
 
 ## Coverage matrix
 
@@ -19,21 +19,24 @@ Cells marked v5 were re-run on `2463257` (v5: no hosted ledger, upstream-restore
 | Windows | 2023.12.1 | pass | fail #334 | untested | untested | fail #333 | untested | untested | untested | fail #384 |
 | Windows | 2026.8.0 | pass | fail #334 | untested | untested | fail #333 | untested | untested | untested | fail #384 |
 | Linux | 2018.11.26 `-g` (`install --system`) | scan -g report pass; `-g --mode hosted` refused exit 2 pass; `-g --apply` / vex / rollback pass | | | | | | | | |
+| Linux | 2023.12.1 `-g` (`install --system`) | scan -g report (in/out of project), hosted refused exit 2, `-g --apply` / vex / rollback, SOCKET_GLOBAL, `--global-prefix` pass; `rollback -g` / `remove -g` / `get -g --mode hosted\|vendored` unwind or rewire the cwd project's Pipfile.lock (#445 / #436) | | | | | | | | |
 | Linux | 2026.8.0 `-g` (`install --system`) | scan -g report (in/out of project), SOCKET_GLOBAL, `--global-prefix` pass; hosted refused exit 2 pass; `-g --apply` / `get -g` / vex / rollback pass | no-`-g` agent scan in a venv-less project patches the global interpreter (needs a maintainer decision, see Known non-bugs) | | | | | | | |
-| any | 7–11 | untested | untested | untested | untested | untested | refused (documented) | n/a | n/a | untested |
+| Linux | 9.1.0 / 11.10.4 (py3.8) | untested | untested | pass v5 (`path` ref, `--deploy`, rollback; 11 byte-exact) | pass on 11 (stale warning, VEX `not_applied`) | untested | refused (documented) | n/a | n/a | untested |
+| macOS / Windows | 7–11 | untested | untested | untested | untested | untested | refused (documented) | n/a | n/a | untested |
 | any | 0–6 | untested | n/a | refused (documented) | n/a | n/a | refused (documented) | n/a | n/a | untested |
 
-macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy fails; `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
+Policy (socket.yml) cells, Linux 2026.8.0 hosted monorepo: every filter passes; `get <uuid>` skips the `policy_bypassed` warning (fail #453). Concurrent hosted scans: pass. Mirror / env-var source rollback refusal: pass (documented).
+
+macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-01 09:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
 
-1. **Maintainer request (global `-g` mode):** Linux is covered on 2018.11.26 and 2026.8.0 (all pass, except the no-`-g` fallback noted below). Still to do: macOS and Windows (blocked: no probe this run), 2022 / 2023, and an unwritable prefix as a non-root user (the sandbox runs as root). Full checklist in the 20261001T040000Z entry.
-2. Pipenv 7–11 hosted `path` refs on v5 (py3.6 / 3.7) and their rollback, plus the `SOCKET_PIPENV_MAJOR` override.
-3. A macOS/Windows probe for hosted + VEX under the #334 / #384 shapes, and hosted / vendored on 2018 / 2022 there (CRLF on Windows).
-4. v5 `socket.yml` policy, `--package`, `--min-severity` and `--max-new-patches` on Pipenv projects.
-5. Hosted rollback refusal messages when `_meta.sources` is a mirror or an env-var URL.
-6. Concurrent or interrupted scans on a Pipfile.lock.
-7. `PIPENV_PIPFILE` / subdirectory runs (a documented limitation; check the refusal message).
+1. **Maintainer request (global `-g` mode):** Linux is covered on 2018.11.26, 2023.12.1 and 2026.8.0 (all pass, except the cross-PM cwd-project leak tracked in #436 / #445 and the no-`-g` fallback below). Still to do: macOS and Windows (blocked: no probe), 2022.12.19, and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry.
+2. A macOS/Windows probe for hosted + VEX under the #334 / #384 shapes, and hosted / vendored on 2018 / 2022 there (CRLF on Windows).
+3. socket.yml with Pipenv 2022+ named categories, and `--package` / `--min-severity` / `--max-new-patches` CLI flags intersecting the file.
+4. Interrupted (SIGKILL) hosted / vendored runs on a Pipfile.lock.
+5. `PIPENV_PIPFILE` / subdirectory runs (a documented limitation; check the refusal message).
+6. Pipenv 7–11 agent mode with an out-of-tree venv (py3.8), and the `PIPENV_PYTHON` venv-name suffix on 11.
 
 ## Known non-bugs
 
@@ -54,3 +57,7 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - `rollback <path>` targets select installed copies, not hosted project directories; use `--cwd`. Documented, and cross-PM anyway.
 - Mock-API notes: vendoring needs `integrity.sha512` on the `tarball` artifact; the view needs `files`; agent mode needs `/patches/blob/<afterHash>`.
 - **Open question for maintainers (not filed):** with no venv found and a Python project marker present, the crawler deliberately falls back to the global interpreter (`python_crawler.rs` `get_site_packages_paths`). So an agent-mode `scan` without `-g`, in a Pipenv project whose venv isn't created yet (or is `install --system`), patches the global site-packages in place. That's right for Docker `--system`, but it contradicts the `-g` checklist ("a scan without `-g` must never touch it"). Filing waits on a maintainer decision.
+- A Pipenv 9.1.0 lock written with `"hashes": []` (seen in the sandbox) comes back from hosted rollback with PyPI's full hash list: not byte-exact, but a valid and stricter registry entry. The upstream restore re-derives hashes by design.
+- Hosted rollback refuses a `_meta.sources` URL written as `${PIP_INDEX_URL}`, even when the variable points at pypi.org; env vars aren't expanded. Documented and fail-closed, with the `git checkout` remedy.
+- `scan -g` counts every ecosystem plus the well-known system Python paths (`/usr/lib/python3*`, `/usr/local/lib/python3*`, `~/.local`). That's by design; Pipenv's WORKON_HOME venvs aren't included.
+- `--prune` warns that it has no effect with `--mode hosted`. Documented.
