@@ -350,10 +350,15 @@ fn relocated_pnpm_virtual_store_sync(nm: &Path) -> Option<PathBuf> {
     let recorded = parse_modules_yaml_virtual_store_dir(&text)?;
     let importer = normalize_lexically(nm.parent()?);
     let store = normalize_lexically(&nm.join(recorded));
-    if store == normalize_lexically(&nm.join(".pnpm")) || store == normalize_lexically(nm) {
+    let below = store_below_importer(&importer, &store)?;
+    // The default location (or `node_modules` itself), however it is
+    // spelled: compared on the importer-relative tail, so an absolute
+    // recording of `<importer>/node_modules/.pnpm` is not walked a second
+    // time beside the by-name `.pnpm` handling.
+    let nm_name = Path::new(nm.file_name()?);
+    if below == nm_name || below == nm_name.join(".pnpm") {
         return None;
     }
-    let below = store_below_importer(&importer, &store)?;
     let mut dir = importer;
     for component in below.components() {
         dir.push(component);
@@ -4132,5 +4137,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    /// An absolute recording of the DEFAULT store (`node_modules/.pnpm`),
+    /// or of `node_modules` itself, is not a relocated store, however the
+    /// project path is spelled: the by-name `.pnpm` handling already walks
+    /// it, and a second walk would report every store copy twice.
+    #[test]
+    fn test_absolute_default_store_is_not_a_relocated_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real: PathBuf = std::fs::canonicalize(tmp.path())
+            .unwrap()
+            .join("real")
+            .components()
+            .collect();
+        let real_nm = real.join("node_modules");
+        std::fs::create_dir_all(real_nm.join(".pnpm")).unwrap();
+        let alias = tmp.path().join("alias");
+        link_dir(&real, &alias);
+        for recorded in [real_nm.join(".pnpm"), real_nm.clone()] {
+            let abs = format!("{}", recorded.display()).replace('\\', "\\\\");
+            std::fs::write(
+                real_nm.join(".modules.yaml"),
+                format!("{{\"virtualStoreDir\": \"{abs}\"}}"),
+            )
+            .unwrap();
+            for nm in [real_nm.clone(), alias.join("node_modules")] {
+                assert_eq!(
+                    relocated_pnpm_virtual_store_sync(&nm),
+                    None,
+                    "{recorded:?} via {nm:?}"
+                );
+            }
+        }
     }
 }
