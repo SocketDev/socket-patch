@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled NuGet / dotnet bug-hunt routine (label pm:nuget).
 
-Last run: 2026-10-01 05:47 UTC, main `2463257` (v5 consolidation, #277), release v4.0.0.
+Last run: 2026-10-01 12:20 UTC, main `2463257` (v5 consolidation, #277), release v4.0.0.
 
 ## Coverage matrix
 
@@ -10,7 +10,7 @@ Cells: OS × SDK × mode. "warm" means the global packages folder already holds 
 |---|---|---|---|---|---|---|---|---|
 | Linux | 6.0.428 | untested | fail #397 | pass | fail #352 | fail #353 | untested | untested |
 | Linux | 7.0.410 | untested | untested | pass | fail #352 | fail #353 | untested | untested |
-| Linux | 8.0.131 / 8.0.425 | pass (apply, rollback, remove, repair, --json, locked restore) | fail #397 | pass (+ `<clear/>`, CPM, re-run, revert) | fail #352 | fail #353 | fail #354 | cold pass (suite); warm fail #352; sln fail #353; inherited fail #354 |
+| Linux | 8.0.131 / 8.0.425 | pass (apply, rollback, remove, repair, --json, locked restore; unwritable folder fails loudly) | fail #397 | pass (+ `<clear/>`, CPM, re-run, revert); user exact-id mapping: config tie #462 | fail #352 (v5 too) | fail #353 | fail #354 | cold pass (suite); warm fail #352 (v5 too); sln fail #353; inherited fail #354; user exact-id mapping fail #462 |
 | Linux | 9.0.318 | untested | fail #397 | pass | fail #352 | fail #353 | untested | untested |
 | Linux | 10.0.401 | untested | fail #397 | pass | fail #352 | fail #353 | untested | untested |
 | macOS | 8.0.425 | untested | fail #397 | pass | fail #352 | fail #353 | untested | untested |
@@ -27,7 +27,7 @@ Project-mode agent scan (no `-g`) patches unrelated cached packages and VEX atte
 
 | OS | SDK | scan -g default | scan -g tool | scan -g user gpf | apply/rollback/vex -g default | apply -g user gpf | hosted refusal | unwritable dir |
 |---|---|---|---|---|---|---|---|---|
-| Linux | 8.0.131 | pass | fail #426 | fail #397 | pass (build + byte-exact rollback) | fail #397 | pass | blocked (root) |
+| Linux | 8.0.131 | pass | fail #426 (+ `--tool-path`) | fail #397 | pass (build + byte-exact rollback) | fail #397 | pass | pass (non-root user, rc 1, nothing written) |
 | Linux | 6.0.x | pass | fail #426 | fail #397 | untested | fail #397 | untested | untested |
 | Linux | 9.0.x | pass | fail #426 | fail #397 | untested | fail #397 | untested | untested |
 | Linux | 10.0.x | pass | fail #426 | fail #397 | untested | fail #397 | untested | untested |
@@ -41,13 +41,13 @@ Also passed on Linux 8: `SOCKET_GLOBAL=1`, `SOCKET_GLOBAL_PREFIX`, `--global-pre
 
 ## Backlog
 
-1. **Maintainer request (global mode), still open:** an unwritable global packages folder must fail loudly (non-root probe with chmod; Windows Program Files). Also `--tool-path` tools, local tools (`dotnet-tools.json`), and apply/rollback/vex `-g` on macOS / Windows (only scan has been probed there).
-2. Re-run #352 / #353 / #354 under the v5 vendored flow.
-3. Hosted: exact id already mapped to nuget.org in the user's mapping. Two HTTP sources for the same id may race without a lock.
-4. #354 on macOS/Windows (`%APPDATA%\NuGet\NuGet.Config`), plus machine-wide configs.
-5. Vendored/hosted with packages.config (`packages/`, `repositoryPath`), where there is no PackageReference and no lock.
-6. #427 on macOS/Windows; does hosted with a lock touch unrelated packages?
-7. Unicode / space paths and Windows long paths (agent + vendor).
+1. #462 on macOS / Windows and SDK 6/9/10 (probe branch). dot.net installs are blocked in the sandbox.
+2. Re-run #353 / #354 under the v5 flow (a scratch copy of `e2e_nuget_dotnet_build.rs` with the `Backend` stand-in works well).
+3. Unwritable folder on macOS / Windows (Program Files); local tools (`dotnet-tools.json`); apply/rollback/vex `-g` on macOS / Windows.
+4. Mapping edge cases: a prefix pattern on another source (expect pass), a case-variant exact id, and two Socket patches for different ids.
+5. #354 on macOS / Windows (`%APPDATA%\NuGet\NuGet.Config`), plus machine-wide configs.
+6. Vendored/hosted with packages.config (needs nuget.exe / mono, or Windows).
+7. #427 on macOS / Windows; unicode / space paths and Windows long paths.
 
 Also passed on Linux 8 (no issue): vendored with a BOM + CRLF `NuGet.Config` (+ byte-exact revert), multi-TFM + `RestoreLockedMode`, and a transitive-only patched package.
 
@@ -62,3 +62,4 @@ Also passed on Linux 8 (no issue): vendored with a BOM + CRLF `NuGet.Config` (+ 
 - `scan -g --mode hosted` / `--global-prefix --mode hosted` refuse with exit 2 by design (CLI_CONTRACT.md).
 - `apply -g` on a global tool fails loudly (rc 1, not found). The silent part is `scan -g` (#426).
 - A vendored `NuGet.Config` with CRLF gets LF-terminated inserted lines (mixed endings). NuGet parses it fine, and revert is byte-exact, so it's cosmetic.
+- A partial apply (EACCES midway through a multi-file patch) leaves the earlier files patched. That's intended (apply.rs retry design). It's loud (rc 1 `partialFailure`), VEX omits it, and rollback restores it.
