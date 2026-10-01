@@ -56,7 +56,6 @@ impl RedirectState {
             records: BTreeMap::new(),
         }
     }
-
 }
 
 impl Default for RedirectState {
@@ -518,5 +517,4 @@ mod tests {
             "changed bytes still go through the (here refused) atomic write"
         );
     }
-
 }
