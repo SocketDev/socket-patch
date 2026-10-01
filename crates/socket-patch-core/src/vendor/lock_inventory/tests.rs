@@ -998,11 +998,11 @@ async fn yarn_berry_registry_resolutions_inventory_with_checksums() {
     assert!(!entries.iter().any(|e| e.name == "fixture"), "{entries:?}");
 }
 
-/// #404: a hosted berry pin is a tarball-URL locator under the untouched
-/// `npm:` descriptor key — still the registry package, so lock-only
-/// discovery keeps inventorying it (and a later hosted scan can re-pin it).
-/// A user's own URL dependency (its key names the URL) is not a registry
-/// package and stays out.
+/// #404: a hosted berry pin — keyed by its tarball descriptor (the
+/// `resolutions` pin) or, from an earlier release, under the untouched
+/// `npm:` key — is still the registry package, so lock-only discovery keeps
+/// inventorying it (and a later hosted scan can re-pin it). A user's own URL
+/// dependency whose tarball does not name a package version stays out.
 #[tokio::test]
 async fn yarn_berry_hosted_tarball_pin_stays_in_the_inventory() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1012,12 +1012,15 @@ async fn yarn_berry_hosted_tarball_pin_stays_in_the_inventory() {
             "resolution: \"left-pad@https://patch.socket.dev/patch/npm/left-pad/1.3.0/t/u/left-pad-1.3.0.tgz\"",
         )
         .replace(
-            "resolution: \"@scope/pkg@npm:2.0.0\"",
-            "resolution: \"@scope/pkg@https://patch.socket.dev/patch/npm/@scope/pkg/2.0.0/t/u/pkg-2.0.0.tgz\"",
+            "\"@scope/pkg@npm:^2.0.0\":\n  version: 2.0.0\n  resolution: \"@scope/pkg@npm:2.0.0\"",
+            "\"@scope/pkg@https://patch.socket.dev/patch/npm/@scope/pkg/2.0.0/t/u/pkg-2.0.0.tgz\":\n  \
+             version: 2.0.0\n  \
+             resolution: \"@scope/pkg@https://patch.socket.dev/patch/npm/@scope/pkg/2.0.0/t/u/pkg-2.0.0.tgz\"",
         )
-        + "\n\"own@https://example.test/own-1.0.0.tgz\":\n  version: 1.0.0\n  \
-           resolution: \"own@https://example.test/own-1.0.0.tgz\"\n  \
+        + "\n\"own@https://example.test/own-latest.tgz\":\n  version: 1.0.0\n  \
+           resolution: \"own@https://example.test/own-latest.tgz\"\n  \
            checksum: 10c0/own==\n  languageName: node\n  linkType: hard\n";
+    assert!(hosted.contains("\"@scope/pkg@https://"), "{hosted}");
     write(tmp.path(), "yarn.lock", &hosted).await;
 
     let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();

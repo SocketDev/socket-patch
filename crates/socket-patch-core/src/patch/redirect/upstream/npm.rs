@@ -562,7 +562,10 @@ async fn restore_berry(
                 .into_owned();
         }
         if let Some(key) = key {
-            let body_lines = block.split_once('\n').map(|(_, r)| r.to_string()).unwrap_or_default();
+            let body_lines = block
+                .split_once('\n')
+                .map(|(_, r)| r.to_string())
+                .unwrap_or_default();
             block = format!("{key}:\n{body_lines}");
             moved.push(key);
         }

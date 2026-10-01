@@ -75,9 +75,13 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   upstream bytes. Use a clean install tree and an empty store; `--force` is not
   a reliable substitute. Run `socket-patch vex` after installation to verify
   the patched files. See the [compatibility matrix and workflow](testing/pnpm-compatibility.md).
-- **yarn berry** — the redirect edits the `yarn.lock` entry only (cacheKey `10c0` /
-  yarn 4), pinning a plain tarball-URL locator so yarn never sends npm registry
-  credentials to the patch server, and `.yarnrc.yml`'s `compressionLevel` must stay 0. The node-modules linker
+- **yarn berry** — the redirect pins the way yarn does for a root `resolutions`
+  entry (cacheKey `10c0` / yarn 4): `package.json` routes the locked descriptor
+  (`"left-pad@npm:^1.3.0"`) to the hosted tarball and only that `yarn.lock` entry
+  is re-keyed by it. Yarn then fetches it without npm registry credentials and
+  hardened mode accepts it. A user-authored `resolutions` entry for the package
+  is never overwritten (`redirect_yarn_berry_resolutions_conflict`), and
+  `.yarnrc.yml`'s `compressionLevel` must stay 0. The node-modules linker
   is e2e-covered; PnP is untested for hosted — the lock rewrite fires, but PnP's
   `.yarn/cache` resolution isn't exercised. CRLF locks — what yarn writes on Windows,
   and what a `core.autocrlf` checkout produces anywhere — are rewritten in their own

@@ -1019,8 +1019,16 @@ async fn berry_hosted_redirect_of_builtin_patched_package_skips_patch_entry() {
     // Nothing is written: the builtin `patch:` entry wraps the same npm
     // descriptor a `resolutions` pin would move, so the whole package is
     // left alone (both entries byte-identical) with both reasons named.
-    assert!(result.files.get("yarn.lock").is_none(), "{:?}", result.files);
-    assert!(result.files.get("package.json").is_none(), "{:?}", result.files);
+    assert!(
+        result.files.get("yarn.lock").is_none(),
+        "{:?}",
+        result.files
+    );
+    assert!(
+        result.files.get("package.json").is_none(),
+        "{:?}",
+        result.files
+    );
     assert!(
         !result
             .edits

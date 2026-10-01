@@ -64,7 +64,7 @@ mod python_lock_equivalence_tests;
 mod requirements;
 mod staged;
 mod state;
-mod hosted_url;
+pub(crate) mod hosted_url;
 pub mod upstream;
 pub mod vlt;
 pub mod vlt_heal;
