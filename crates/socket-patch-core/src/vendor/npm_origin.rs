@@ -96,9 +96,10 @@ impl NpmOverrides {
     /// A rule applies when its key names `dep_name` with no selector (or
     /// with `spec` itself as the selector), and every enclosing rule names
     /// the dependent or one of its physical ancestors (outermost first),
-    /// with no selector or that package's exact version. The innermost
-    /// applicable rule wins, as in npm. Version-range selectors are not
-    /// evaluated, so a rule that uses one never applies here.
+    /// with no selector or that package's exact version. As in npm, the
+    /// rule scoped to the closest ancestor wins (then the most deeply
+    /// nested one). Two equally close rules that disagree make the answer
+    /// unclear, and so does a version-range selector: neither applies.
     fn replacement(
         &self,
         packages: &Map<String, Value>,
@@ -110,13 +111,13 @@ impl NpmOverrides {
             return None;
         }
         let chain = dependent_chain(packages, from);
-        let mut best: Option<(usize, String)> = None;
+        let mut best: Option<BestRule> = None;
         self.visit(&self.rules, &chain, 0, 0, dep_name, spec, &mut best);
-        best.map(|(_, value)| value)
+        best.filter(|b| !b.contested).map(|b| b.value)
     }
 
     /// Search `rules` (nested `depth` levels deep; the enclosing rules
-    /// matched `chain[..from_ix]`) for the deepest rule for the edge.
+    /// matched ancestors up to `chain[from_ix - 1]`) for the edge's rule.
     #[allow(clippy::too_many_arguments)]
     fn visit(
         &self,
@@ -126,7 +127,7 @@ impl NpmOverrides {
         depth: usize,
         dep_name: &str,
         spec: &str,
-        best: &mut Option<(usize, String)>,
+        best: &mut Option<BestRule>,
     ) {
         for (key, value) in rules {
             if key == "." {
@@ -136,12 +137,11 @@ impl NpmOverrides {
             // A rule for the edge's own package.
             if name == dep_name && selector.is_none_or(|sel| sel == spec) {
                 if let Some(replacement) = self.rule_value(value) {
-                    if best.as_ref().is_none_or(|(d, _)| depth >= *d) {
-                        *best = Some((depth, replacement));
-                    }
+                    BestRule::offer(best, (from_ix, depth), replacement);
                 }
             }
-            // A rule scoped to a package on the dependent's chain.
+            // A rule scoped to a package on the dependent's chain: every
+            // matching ancestor, so the closest one is ranked too.
             if let Some(children) = value.as_object() {
                 for (ix, (anc_name, anc_version)) in chain.iter().enumerate().skip(from_ix) {
                     let version_ok = match selector {
@@ -150,7 +150,6 @@ impl NpmOverrides {
                     };
                     if anc_name == name && version_ok {
                         self.visit(children, chain, ix + 1, depth + 1, dep_name, spec, best);
-                        break;
                     }
                 }
             }
@@ -168,6 +167,32 @@ impl NpmOverrides {
         match raw.strip_prefix('$') {
             Some(reference) => self.root_deps.get(reference)?.as_str().map(str::to_string),
             None => Some(raw.to_string()),
+        }
+    }
+}
+
+/// The winning override rule so far: ranked by how close its innermost
+/// enclosing ancestor is to the dependent (`chain` entries consumed), then
+/// by nesting depth. `contested` when an equally ranked rule disagrees.
+#[derive(Debug)]
+struct BestRule {
+    rank: (usize, usize),
+    value: String,
+    contested: bool,
+}
+
+impl BestRule {
+    fn offer(best: &mut Option<BestRule>, rank: (usize, usize), value: String) {
+        match best {
+            Some(b) if rank < b.rank => {}
+            Some(b) if rank == b.rank => b.contested |= b.value != value,
+            _ => {
+                *best = Some(BestRule {
+                    rank,
+                    value,
+                    contested: false,
+                })
+            }
         }
     }
 }
@@ -647,6 +672,74 @@ mod tests {
             &manifest(json!({
                 "left-pad": "github:someone/left-pad",
                 "pkga": { "left-pad": "1.3.0" }
+            })),
+        );
+        assert!(!found.contains_key("node_modules/left-pad"), "{found:?}");
+    }
+
+    #[test]
+    fn issue_490_the_closest_ancestor_rule_wins_whatever_the_key_order() {
+        // `@scope/b` under `a` depends on left-pad from git. Rules scoped to
+        // `a` (farther) and `@scope/b` (closer) sit at the same nesting
+        // depth; the closer one decides, in either key order.
+        let lock = lock(json!({
+            "": { "dependencies": { "a": "^1.0.0" } },
+            "node_modules/a": { "version": "1.0.0", "resolved": REGISTRY_TGZ },
+            "node_modules/a/node_modules/@scope/b": {
+                "version": "2.0.0",
+                "resolved": REGISTRY_TGZ,
+                "dependencies": { "left-pad": "github:stevemao/left-pad#v1.3.0" }
+            },
+            "node_modules/a/node_modules/left-pad": {
+                "version": "1.3.0",
+                "resolved": REGISTRY_TGZ
+            }
+        }));
+        let key = "node_modules/a/node_modules/left-pad";
+        let found = |overrides: Value| {
+            npm_non_registry_entries(
+                &lock,
+                &NpmOverrides::from_manifest(&json!({ "overrides": overrides })),
+            )
+            .contains_key(key)
+        };
+        for (closer, farther, non_registry) in [
+            ("github:someone/left-pad", "1.3.0", true),
+            ("1.3.0", "github:someone/left-pad", false),
+        ] {
+            // `@scope/b` sorts before `a`, so the farther rule is visited
+            // last; swapping which ancestor holds the registry spec covers
+            // both outcomes.
+            assert_eq!(
+                found(json!({
+                    "@scope/b": { "left-pad": closer },
+                    "a": { "left-pad": farther }
+                })),
+                non_registry,
+                "closer {closer} / farther {farther}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_490_equally_close_rules_that_disagree_keep_the_edge() {
+        let lock = overridden_git_lock(REGISTRY_TGZ);
+        // `pkga` and `pkga@1.0.0` both scope to the dependent at the same
+        // depth: npm's pick between them isn't modelled, so stay cautious.
+        let found = npm_non_registry_entries(
+            &lock,
+            &manifest(json!({
+                "pkga": { "left-pad": "1.3.0" },
+                "pkga@1.0.0": { "left-pad": "github:someone/left-pad" }
+            })),
+        );
+        assert!(found.contains_key("node_modules/left-pad"), "{found:?}");
+        // Agreeing rules are fine.
+        let found = npm_non_registry_entries(
+            &lock,
+            &manifest(json!({
+                "pkga": { "left-pad": "1.3.0" },
+                "pkga@1.0.0": { "left-pad": "1.3.0" }
             })),
         );
         assert!(!found.contains_key("node_modules/left-pad"), "{found:?}");
