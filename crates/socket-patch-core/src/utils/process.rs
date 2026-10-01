@@ -178,7 +178,7 @@ pub(crate) fn neutral_probe_dir() -> Option<PathBuf> {
 pub(crate) fn neutral_probe_dir_with(var: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     let home = ["HOME", "USERPROFILE"]
         .into_iter()
-        .filter_map(|name| var(name))
+        .filter_map(var)
         .map(PathBuf::from)
         .find(|path| path.is_absolute() && path.is_dir());
     home.or_else(|| {
@@ -197,7 +197,16 @@ fn run_resolved(bin: &str, args: &[&str], cwd: Option<&Path>) -> Option<String> 
     let program = if Path::new(bin).components().count() > 1 {
         PathBuf::from(bin)
     } else {
-        resolve_tool(bin)?
+        match resolve_tool(bin) {
+            Some(path) => path,
+            // A Windows App Execution Alias (the Store `python3.exe` in
+            // WindowsApps) is a reparse point the file probe can't stat,
+            // but `std`'s own `.exe` search launches it; keep that path
+            // rather than lose a tool the bare spawn always found. `std`
+            // never searches the cwd on Windows.
+            None if cfg!(windows) => PathBuf::from(bin),
+            None => return None,
+        }
     };
     let mut command = command_for(&program);
     command.args(args);
