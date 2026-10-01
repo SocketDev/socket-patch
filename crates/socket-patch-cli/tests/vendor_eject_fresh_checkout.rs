@@ -370,11 +370,25 @@ async fn pypi_eject_needs_no_virtualenv() {
     )
     .unwrap();
 
+    // Nothing installed for the project: VIRTUAL_ENV names an EMPTY
+    // virtualenv. With no venv at all, a Python project falls back to the
+    // global interpreters, and on Ubuntu those carry apt's python3-six
+    // 1.16.0 (`six-1.16.0.egg-info`), whose bytes are not this fixture's.
+    let empty_venv = tmp.path().join("empty-venv");
+    std::fs::create_dir_all(empty_venv.join(if cfg!(windows) {
+        "Lib/site-packages"
+    } else {
+        "lib/python3.11/site-packages"
+    }))
+    .unwrap();
     let (code, env) = run_json_with(
         &root,
         &server,
         &["vendor"],
-        &[("SOCKET_PYPI_JSON_API", format!("{}/pypi", server.uri()))],
+        &[
+            ("SOCKET_PYPI_JSON_API", format!("{}/pypi", server.uri())),
+            ("VIRTUAL_ENV", empty_venv.display().to_string()),
+        ],
     );
     assert_eq!(code, 0, "a fresh hosted pypi checkout ejects: {env:#}");
     assert!(applied(&env, PURL), "{env:#}");
