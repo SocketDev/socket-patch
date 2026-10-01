@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-01 (run 5), main `2463257` (#277, the v5 consolidation), latest release 4.0.0.
+Last updated: 2026-10-01 (run 6), main `61cfb9b` (#365, #414 merged), latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, package grant, hosted tarball, `/registry/<name>/<ver>` mirror). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -11,17 +11,27 @@ Project modes (cells before run 3 were tested on main `f6b7fb9`; "v5" marks cell
 | OS | pnpm | Agent: default `.pnpm` | Agent: global virtual store | Agent: custom virtualStoreDir | Agent: hoisted | Vendored: plain / hoisted | Vendored: workspace-file edge shapes | Hosted: plain / catalog | Hosted: trustLockfile edge shapes | Takeover vendored ⇄ hosted |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 7.33.7 | untested | n/a | untested | untested | untested | n/a | pass (lock 5.4) | n/a (no trust) | untested |
-| Linux | 8.15.9 | pass | n/a | fail #362 | untested | untested | n/a | pass (lock 6.0) | n/a (no trust) | untested |
-| Linux | 9.15.9 | pass | n/a | fail #362 | untested | untested | untested | pass / pass; v5 rollback pass | untested | untested |
+| Linux | 8.15.9 | pass | n/a | pass (#365) | untested | untested | n/a | pass (lock 6.0) | n/a (no trust) | untested |
+| Linux | 9.15.9 | pass | n/a | pass (#365) | untested | untested | untested | pass / pass; v5 rollback pass | untested | untested |
 | Linux | 10.0.0 | untested | n/a | untested | untested | untested | pass (10.0 ignores user overrides) | untested | untested | untested |
 | Linux | 10.5.2 / 10.12.1 | untested | fail #361 #362 (10.12.1) | untested | untested | untested | fail #360 | untested | untested | untested |
-| Linux | 10.34.5 | pass | fail #361 #362 | fail #362 | untested | pass | fail #360 (v5 too) | pass / pass; v5 rollback pass | fail #400 #402 | untested |
-| Linux | 11.27.0 | pass | fail #361 #362 | fail #362 | pass | pass | fail #400 #402 | pass / pass; v5 rollback pass | fail #400 #402; pass CRLF, no-EOL, comment | v5 pass (#401 closed: `pnpm_trust_lockfile_left` warning) |
-| Linux | 12.8.1 | pass | fail #361 #362 | fail #362 | untested | pass; fail #466 with `packageManager` (two-doc lock) | fail #400 #402 | pass / pass; v5 rollback pass; two-doc lock pass | fail #400 #402 | v5 pass (#401 closed); vendored→hosted on two-doc lock fail #466 |
+| Linux | 10.34.5 | pass | fail #361 #362 | pass (#365) | untested | pass | fail #360 (v5 too) | pass / pass; v5 rollback pass | fail #400 #402 | untested |
+| Linux | 11.27.0 / 11.28.3 | pass | fail #361 #362 | pass (#365) | pass | pass | fail #400 #402 | pass / pass; v5 rollback pass | fail #400 #402; pass CRLF, no-EOL, comment | v5 pass (#401 closed: `pnpm_trust_lockfile_left` warning) |
+| Linux | 12.8.1 | pass | fail #361 #362 | pass (#365) | untested | pass; fail #466 with `packageManager` (two-doc lock) | fail #400 #402 | pass / pass; v5 rollback pass; two-doc lock pass | fail #400 #402 | v5 pass (#401 closed); vendored→hosted on two-doc lock fail #466 |
 | macOS | 10.34.5 | pass | n/a on CI (pnpm 10 disables it) | fail #362 | untested | untested | untested | untested | untested | untested |
 | macOS | 11.27.0 / 12.8.1 | pass | fail #361 #362 | fail #362 | untested | untested | untested | untested | untested | untested |
 | Windows | 10.34.5 | pass | n/a on CI | fail #362 | untested | untested | untested | untested | untested | untested |
 | Windows | 11.27.0 / 12.8.1 | pass | fail #361 #362 | fail #362 | untested | untested | untested | untested | untested | untested |
+
+Run 6 additions (main `61cfb9b`, Linux):
+
+| pnpm | Hosted: `sharedWorkspaceLockfile: false` | Hosted: `configDependencies` (two-doc on 11+) | Vendored: `configDependencies` | Hosted: catalogs / peer-suffixed instances | Hosted: node-linker=hoisted | Agent: hard-linked CAS store |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8.15.9 | fail #492 | untested | untested | untested | untested | untested |
+| 9.15.9 | fail #492 | n/a | n/a | pass / pass | pass | pass (hardlink broken, store pristine) |
+| 10.34.5 | fail #492 | pass (single doc) | pass | pass / untested | untested | untested |
+| 11.28.3 | fail #492 | pass (both docs pinned) | fail #466 (wrong doc, success) | pass / pass | untested | untested |
+| 12.8.1 | fail #492 | pass (both docs pinned) | fail #466 (wrong doc, success) | pass / pass | pass | pass |
 
 Hosted `--frozen-lockfile [--offline]` over an upstream `node_modules` or warm store (run 5): VEX stays honest on 9.15.9 / 10.34.5 / 11.28.3 / 12.8.1 (pass).
 
@@ -41,12 +51,12 @@ Global mode (`-g`, v5 main `2463257`):
 ## Backlog
 
 0. **Maintainer request (global `-g` mode):** the Linux cells are done. Still to do: macOS and Windows (corepack, standalone and npm-installed pnpm; `PNPM_HOME` with spaces or unicode; Windows `%LOCALAPPDATA%\pnpm`), and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry. Needs a probe branch.
-1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` has failed through the git proxy in runs 1 and 3, and was denied by the permission policy in runs 2 and 5, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
-2. Two-doc lock, part 2: pnpm 10/11 `configDependencies` env documents, and hosted two-doc workspaces. Re-verify #466 when fixed.
-3. Hosted on v5: Rush / subspace locks, peer-suffixed workspace instances, and catalogs, using the `SOCKET_PATCH_SERVER_URL` / `SOCKET_NPM_REGISTRY` harness.
+1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1 and 3, and was denied by the permission policy in runs 2, 5 and 6, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
+2. Re-verify #492 (also on pnpm 7 / lock 5.4, plus rollback and vex once member locks are pinned) and #466 (both the `packageManager` and the `configDependencies` triggers) when fixes land.
+3. Hosted Rush / subspace locks with a real `rush install`, including `preventManualShrinkwrapChanges`.
 4. Agent: `dependenciesMeta.injected`, `package-import-method=clone|copy`, and pnpm 1–6 legacy layouts (Node 16).
 5. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout). Needs a probe branch.
-6. Re-verify #360, #361, #362 (PR #365), #400 and #402 (PR #414), and #435 when fixes land.
+6. Re-verify #360, #361, the global-virtual-store half of #362, and #435 when fixes land.
 
 ## Known non-bugs
 
@@ -64,3 +74,6 @@ Global mode (`-g`, v5 main `2463257`):
 - Hosted on pnpm 9 over an existing upstream `node_modules`: a frozen install keeps the upstream bytes. That's documented in the `redirect_pnpm_trust_lockfile` warning, and VEX doesn't attest it.
 - pnpm 12 warns that `package.json` `pnpm.overrides` is ignored on vendored projects. The workspace-file override is what takes effect, so this is noise only.
 - A `vex --output /dev/stdout` hang when stdout is a pipe is not pnpm-specific.
+- Vendored refuses pnpm catalogs (`catalogs:` entry) and peer-suffixed snapshot keys with `vendor_lock_entry_unsupported` ("this lock shape is not supported yet"). It's loud and writes nothing. Hosted handles both.
+- pnpm 10's `configDependencies` copy (`node_modules/.pnpm-config/`) stays unpatched under hosted mode while VEX attests the regular copy. Config deps run only at install time, and pnpm 10 keeps their integrity in `pnpm-workspace.yaml`.
+- On v5, vendoring always downloads its artifact from the patch service (`--vendor-source build` was removed), so offline vendoring with only a staged manifest fails with `vendor_service_offline_conflict`. Fixtures need the mock grant to match the manifest UUID.
