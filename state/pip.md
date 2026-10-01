@@ -1,17 +1,16 @@
 [agent] Progress ledger for the scheduled pip / requirements.txt bug-hunt routine (label pm:pip).
 
-Last run: 2026-10-01 (fourth run), main `6e7ef74`, latest release v4.0.0 (`96df6ae`).
+Last run: 2026-10-01 (fifth run), main `61cfb9b`, latest release v4.0.0 (`96df6ae`). #376 and #447 are fixed on main (verified on all 3 OS).
 
 ## Coverage matrix
 
-| OS | pip / Python | agent | hosted | vendored | rollback / remove / takeover | system-site venv | `-r` include, lock-only | legacy egg-info install | PEP 440-equivalent pin (`==1.16`) | global `-g` (`--user`) |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 20.3.4 / py3.8, py3.10 | untested | fail #376 | fail #376 | fail #410 | fail #409 | fail #412 | fail #447 | fail #475 | untested |
-| Linux | 23.x / py3.8, py3.11 | untested | fail #376 | fail #376 | fail #410 | fail #409 | fail #412 | n/a (dist-info) | fail #475 | untested |
-| Linux | 24.0, 24.3.1 / py3.11, py3.12 | pass (.venv, venv, VIRTUAL_ENV); fail #409 (system-site) | fail #376 (single-line, fully hashed, `-c`, `--no-binary`, marker continuations and duplicate-marker pins pass) | fail #376 (include, duplicate markers, `repair`, `list` pass) | fail #410 (multi-line, hashed, duplicate-marker files restore byte-exact) | fail #409 | fail #412 | n/a (dist-info) | fail #475 | pass (report, hosted refusal, get / rollback / vex, `--global-prefix`, unwritable); egg-info globals fail #447 |
-| Linux | 25.0.1 / py3.8; 26.2.1 / py3.13 | untested | fail #376 | fail #376 | fail #410 | fail #409 | fail #412 | n/a (dist-info) | fail #475 | untested |
-| macOS | 20.3.4 – 26.2.1, py3.8 + py3.13 | untested | fail #376 | fail #376 | fail #410 | fail #409 | fail #412 | fail #447 (≤ 23.0.1) | fail #475 | pass (`--user`, py3.8 / pip 20.3.4 and py3.13); `--global-prefix` egg-info fail #447 |
-| Windows | 20.3.4 – 26.2.1, py3.8 + py3.13 | untested | fail #376 | fail #376 | fail #410 | fail #409 | fail #412 | fail #447 (≤ 23.0.1) | fail #475 | pass (`--user`, `%APPDATA%\Python`, py3.8 / pip 20.3.4 and py3.13 / 26.2.1); `--global-prefix` egg-info fail #447 |
+| OS | pip / Python | agent (.venv) | agent egg-info | hosted (unhashed → fragment pin) | vendored | rollback / remove | vendored → hosted takeover | system-site venv | `-r` include, lock-only | PEP 440-equivalent pin (`==1.16`) | global `-g` (`--user`) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Linux | 20.3.4 / py3.8, py3.11 | pass | pass (#447 fixed) | pass | pass | pass; all-hosted-pins fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | untested |
+| Linux | 23.x, 24.0 / py3.11, py3.12 | pass | n/a (dist-info) | pass | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | pass (report, hosted refusal, get / rollback / vex, `--global-prefix`, unwritable) |
+| Linux | 26.0, 26.2.1 / py3.11, py3.13 | pass | n/a | pass (+ uv 0.8 `pip install` / `pip sync`) | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | untested |
+| macOS | 20.3.4 / py3.8; 26.2.1 / py3.13 | pass | pass (py3.8) | pass | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | pass (`--user`) |
+| Windows | 20.3.4 / py3.8; 26.2.1 / py3.13 | pass (`Scripts/` + `Lib/`) | pass (py3.8) | pass | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | pass (`--user`, `%APPDATA%\Python`) |
 
 pip 20.3.4 on py3.13 is blocked (no `distutils`). `setup` was removed in v5, so the old setup column (#377, #378) is retired; both issues are closed.
 
@@ -19,13 +18,12 @@ Commands covered on Linux: scan (all modes), get (hosted, agent `-g`), rollback,
 
 ## Backlog
 
-1. **Maintainer request (mostly done):** global (`-g`) mode. Done: Linux (all items), plus macOS and Windows `--user` (report, hosted refusal, get, byte-exact rollback). Left: Homebrew / PEP 668 interpreters, py launcher with several interpreters, pipx venvs, non-root unwritable prefixes on CI. Open question for the maintainer: the non-`-g` no-venv fallback to global site-packages (see the 20261001T083942Z entry).
-2. Lock-only discovery of `==X.Y` short pins (purl `six@1.16`) once #475 is fixed; needs a mock that mirrors the real API's version matching.
-3. Agent mode on Windows (`Scripts/` + `Lib/`) and virtualenv (not venv) layouts under v5.
-4. Legacy `pip install -e .` (`.egg-link`) next to a patched pin.
-5. VCS / URL lines after a hosted rewrite; `uv pip install -r` on a pip-hosted file.
-6. `--json` envelopes for rollback / remove failures; interrupted runs.
-7. Re-verify #376 / #409 / #410 / #412 / #447 / #475 as fixes land (#383 needs a rebase onto v5).
+1. Re-verify #475 once #478 merges, then lock-only discovery of `six==1.16` (purl `six@1.16`). That needs a mock that mirrors how the real API matches versions.
+2. **Maintainer request (mostly done):** global (`-g`) mode. Left: Homebrew / PEP 668 interpreters, py launcher with several interpreters, pipx venvs (#418), non-root unwritable prefixes on CI. Open question for the maintainer: the non-`-g` no-venv fallback to global site-packages (see the 20261001T083942Z entry; it also makes a lock-only `vex` omit packages the system Python has unpatched).
+3. virtualenv (not venv) layouts; `pip install --target` / `--prefix` trees.
+4. pip-tools `pip-sync` / `pip-compile --generate-hashes` re-runs over a hosted file.
+5. `--json` envelopes for rollback / remove failures; interrupted runs.
+6. Re-verify #328 / #409 / #410 / #412 / #475 as fixes land.
 
 ## Known non-bugs
 
@@ -42,3 +40,7 @@ Commands covered on Linux: scan (all modes), get (hosted, agent `-g`), rollback,
 - `scan --mode agent` after a failed `get` (unwritable target) skips the recorded entry ("already recorded … run `socket-patch apply`") and exits 0. This is documented, and the failed `get` itself exits 1.
 - Hosted `vex` ignores hosted URLs that aren't on `patch.socket.dev`. Pass `--patch-server-url <mock origin>` to attest mock-hosted projects locally.
 - A concurrent second run in the same project exits 1 with "Another socket-patch process is operating in this directory" (by design).
+- A requirements.txt that v4.0.0 (or a pre-#383 build) hosted with `--hash` in an otherwise unhashed file stays in that shape on a re-scan (exit 0), so pip still fails in hash mode. This is documented in #383; `socket-patch rollback` then a re-scan rewrites it to the fragment form (verified).
+- Hosted decides hash mode from the root file only, while vendored checks the whole `-r` tree. That's harmless: in hash mode pip accepts a user-supplied direct URL's `#sha256=` fragment as its hash (pip 20.3.4–26.0).
+- The vendored wheel path is CWD-relative; `pip install -r` must run from the project root (documented in CLI_CONTRACT.md).
+- Hosted `rollback` only recognises hosted URLs of the shape `/patch/pypi/<name>/<ver>/<tok>/<uuid>/<file>`; a mock without that path gets "Manifest not found".
