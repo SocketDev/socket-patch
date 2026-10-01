@@ -136,6 +136,36 @@ struct GemPrelude {
     copy_ok: bool,
 }
 
+/// Why vendored mode must not wire this project's Gemfile, if it must not:
+/// bundler loads a different manifest. This backend edits the `Gemfile` +
+/// `Gemfile.lock` pair, so a project where bundler loads `gems.rb` (it wins
+/// over a Gemfile twin) or a `BUNDLE_GEMFILE`-configured manifest is refused
+/// before any write: wiring the ignored Gemfile would report success while
+/// bundler installs the upstream gem. The CLI's hosted→vendored takeover
+/// asks this BEFORE it reverts a live hosted pin, so a refused gem keeps
+/// its hosted wiring instead of ending up unpatched in both modes.
+pub async fn gem_manifest_refusal(project_root: &Path) -> Option<(&'static str, String)> {
+    let loaded = crate::formats::gem::manifest::loaded_manifest(project_root).await;
+    let gems_rb_present = tokio::fs::symlink_metadata(project_root.join("gems.rb"))
+        .await
+        .is_ok();
+    match loaded.pair(gems_rb_present) {
+        Some((GEMFILE, GEMFILE_LOCK)) => None,
+        Some((manifest, lock)) => Some((
+            "gemfile_not_loaded",
+            format!(
+                "bundler loads {manifest} + {lock}, not the Gemfile + Gemfile.lock pair \
+                 vendored mode wires (a gems.rb project cannot vendor yet); use hosted \
+                 mode, or remove gems.rb / gems.locked if the Gemfile is the real manifest"
+            ),
+        )),
+        None => Some((
+            "gemfile_not_loaded",
+            loaded.unsupported_detail().unwrap_or_default(),
+        )),
+    }
+}
+
 async fn gem_prelude(
     purl: &str,
     installed_path: &Path,
@@ -238,33 +268,8 @@ async fn gem_prelude(
     }
 
     // ── project files ────────────────────────────────────────────────────
-    // Wire only the manifest bundler actually loads. This backend edits
-    // the `Gemfile` + `Gemfile.lock` pair, so a project where bundler loads
-    // `gems.rb` (it wins over a Gemfile twin) or a `BUNDLE_GEMFILE`-configured
-    // manifest is refused here, before any write: wiring the ignored Gemfile
-    // would report success while bundler installs the upstream gem.
-    let loaded = crate::formats::gem::manifest::loaded_manifest(project_root).await;
-    let gems_rb_present = tokio::fs::symlink_metadata(project_root.join("gems.rb"))
-        .await
-        .is_ok();
-    match loaded.pair(gems_rb_present) {
-        Some((GEMFILE, GEMFILE_LOCK)) => {}
-        Some((manifest, lock)) => {
-            return Err(refused(
-                "gemfile_not_loaded",
-                format!(
-                    "bundler loads {manifest} + {lock}, not the Gemfile + Gemfile.lock pair \
-                     vendored mode wires (a gems.rb project cannot vendor yet); use hosted \
-                     mode, or remove gems.rb / gems.locked if the Gemfile is the real manifest"
-                ),
-            ));
-        }
-        None => {
-            return Err(refused(
-                "gemfile_not_loaded",
-                loaded.unsupported_detail().unwrap_or_default(),
-            ));
-        }
+    if let Some((code, detail)) = gem_manifest_refusal(project_root).await {
+        return Err(refused(code, detail));
     }
     let gemfile_path = project_root.join(GEMFILE);
     let gemfile_text = match read_regular_to_string(&gemfile_path).await {

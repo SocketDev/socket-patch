@@ -1468,6 +1468,67 @@ async fn gem_hosted_gems_rb_spelling_redirects_and_installs() {
     manifestless_vex_matrix(&fx, &fresh).await;
 }
 
+/// #341 follow-through: a CHECKSUMS-converged hosted `gems.rb` pin is a
+/// live hosted pin, so `get --mode vendored` takes it over. Vendored mode
+/// cannot wire `gems.rb`, and the refusal must come before the takeover
+/// reverts the pin.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_gems_rb_pin_survives_a_refused_vendored_takeover() {
+    let Some(fx) = redirect_scanned_project(
+        "gems.rb takeover",
+        Spelling::GemsRb,
+        true,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    vendor_takeover_keeps_the_hosted_gems_rb_pin(&fx);
+}
+
+/// A hosted→vendored takeover of a `gems.rb` project: vendored mode cannot
+/// wire `gems.rb`, so `get --mode vendored` must refuse BEFORE it restores the hosted
+/// pin's upstream entry, or the gem ends up unpatched in both modes.
+fn vendor_takeover_keeps_the_hosted_gems_rb_pin(fx: &RedirectFixture) {
+    let before: Vec<Vec<u8>> = ["gems.rb", "gems.locked"]
+        .iter()
+        .map(|f| std::fs::read(fx.proj.join(f)).unwrap())
+        .collect();
+    let proj = fx.proj.to_str().expect("utf8 tmp path");
+    let api = fx._server.uri();
+    let (code, stdout, stderr) = run_socket(
+        &fx.proj,
+        &[
+            "get", UUID, "--mode", "vendored", "--json", "--yes", "--cwd", proj, "--api-url",
+            &api, "--org", ORG, "--api-token", "fake",
+            // The mock serves the patch registry: its origin is the one a
+            // hosted pin is trusted on.
+            "--patch-server-url", &api,
+        ],
+    );
+    assert_ne!(code, 0, "vendor must refuse.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("gemfile_not_loaded"),
+        "the manifest refusal names its cause:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("vendor_takeover_reverted_redirect"),
+        "the hosted pin must not be reverted first:\n{stdout}"
+    );
+    for (file, before) in ["gems.rb", "gems.locked"].iter().zip(before) {
+        assert_eq!(
+            std::fs::read(fx.proj.join(file)).unwrap(),
+            before,
+            "{file} keeps its hosted wiring"
+        );
+    }
+}
+
 /// #390: bundler's `BUNDLE_GEMFILE` (here a committed `.bundle/config`
 /// naming `Gemfile.next`, the dual-boot layout) picks the manifest it
 /// loads. The hosted scan used to rewrite the ignored `Gemfile`, report
