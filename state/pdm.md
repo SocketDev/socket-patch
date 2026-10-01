@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled PDM bug-hunt routine (label pm:pdm).
 
-Last run: 2026-10-01 15:20Z on main `6e7ef74` (latest tag v4.0.0). Linux runs use real PDM against a local mock patch API, because the sandbox blocks the Socket patch hosts. macOS and Windows runs use probe branches.
+Last run: 2026-10-01 21:18Z on main `61cfb9b` (latest tag v4.0.0). Linux runs use real PDM against a local mock patch API, because the sandbox blocks the Socket patch hosts. macOS and Windows runs use probe branches.
 
 ## Coverage matrix
 | PDM | lock_version | agent (Linux / macOS / Windows) | hosted (Linux) | vendored (Linux) |
@@ -10,11 +10,11 @@ Last run: 2026-10-01 15:20Z on main `6e7ef74` (latest tag v4.0.0). Linux runs us
 | 2.8.2 | 4.3 | fail #332 w/ install.cache symlink (all 3 OS) | pass (stale-install warning) | untested |
 | 2.10.4 | 4.4 | fail #332 w/ install.cache symlink; pth fails closed | pass (stale-install warning) | untested |
 | 2.11.2 | 4.4.1 | fail #332 w/ install.cache symlink | untested | untested |
-| 2.12.4 | 4.4.1 | fail #332 w/ install.cache symlink (all 3 OS; re-confirmed on v5 Linux); hardlink pass | pass (v5: #331/#382 fixed); fail #413 (private index static_urls); post-rollback install fail #477 | pass on v5 (warm sync patched, vex); post-rollback install fail #477 |
+| 2.12.4 | 4.4.1 | fail #332 w/ install.cache symlink (all 3 OS; re-confirmed on v5 Linux); hardlink pass; fail #502 (`venv.in_project=false`) | pass (v5: #331/#382 fixed); fail #413 (private index static_urls); post-rollback install fail #477 | pass on v5 (warm sync patched, vex); post-rollback install fail #477 |
 | 2.15.4 | 4.4.1 | pass (all 3 OS, symlink + hardlink) | untested | untested |
 | 2.20.1 | 4.5.0 | pass | pass (v5: #331/#382 fixed); fail #413 | pass (v4) |
 | 2.26.9 | 4.5.0 | pass (symlink/hardlink/pth) | pass on v4; untested on v5 | untested |
-| 2.29.2 | 4.5.1 | pass (all 3 OS) | pass on v5 (lock-only scan, sync, manifest-less rollback byte-exact, VEX); multi-target fork refused (documented); fail #413; post-rollback install fail #477 | pass on v5 (warm/fresh/frozen, lock --check, idempotent, vex, rollback byte-exact); post-rollback install fail #477 |
+| 2.29.2 | 4.5.1 | pass (all 3 OS, in-project `.venv`); fail #502 Linux (`venv.in_project=false` / `pdm use <venv>`: real env skipped, stray `.venv` or PATH python patched) | pass on v5 (lock-only scan, sync, manifest-less rollback byte-exact, VEX); multi-target fork refused (documented); fail #413 (re-confirmed `61cfb9b`); stale warning + VEX with out-of-tree env fail #502; post-rollback install fail #477 | pass on v5 (warm/fresh/frozen, lock --check, idempotent, vex, rollback byte-exact; private index + `static_urls` rollback byte-exact; nested `services/*` project; agent→vendored takeover); post-rollback / `remove` install fail #477 |
 | 0.12, 1.0, 1.8 – 1.15 | 2 / 3.1 | untested | untested | untested |
 
 Modes × macOS/Windows for hosted and vendored: untested by this routine (the repo's pdm-compatibility.yml covers them).
@@ -33,12 +33,12 @@ Modes × macOS/Windows for hosted and vendored: untested by this routine (the re
 `-g --mode hosted` and `--global-prefix --mode hosted` refuse with exit 2 (pass). `SOCKET_GLOBAL=1` matches `-g` (pass). `--global-prefix <site-packages>` finds both #451 locations (pass).
 
 ## Backlog
-1. **Maintainer request (global `-g`), still open:** PDM 1.4.5 / 2.0.3 global (PEP 582 global project?); `venv.in_project=false` global venv (`<data>/pdm/venvs/global-project-*`); PDM-managed interpreter apply via `--global-prefix`; macOS / Windows. Done this run: system-global apply/rollback/vex, `--global-prefix` venv, unicode path, unwritable prefix, install-cache check (#332).
-2. #477 siblings: `remove <purl>`, `rollback --preserve-state`; agent → vendored takeover on v5.
-3. Vendored v5 with private index + `static_urls` (does vendored rollback keep the mirror URLs, unlike #413?).
-4. Hosted `pdm update --unconstrained` / `lock --update-all`; groups via `pdm sync -G`.
-5. Non-static private index with different bytes (the hash variant of #413); PDM 1.x `feature.install_cache` with agent mode.
-6. macOS / Windows probes, once probe-branch deletion works (`git push --delete` fails through the git proxy; the stale `bughunt/pdm/20260930-cache-symlink` still needs a maintainer to delete it).
+1. #502 on PDM 1.4.5 (`.pdm.toml` `python.path`, PEP 582 default) and 2.0.3; macOS / Windows venv dirs.
+2. **Maintainer request (global `-g`), still open:** PDM 1.4.5 / 2.0.3 global; `venv.in_project=false` global venv (`<data>/pdm/venvs/global-project-*`, overlaps #451/#502); PDM-managed interpreter apply via `--global-prefix`; macOS / Windows.
+3. Hosted `pdm update --unconstrained` / `lock --update-all`; groups via `pdm sync -G` / `--prod` after hosted and vendored.
+4. Non-static private index with different bytes (the hash variant of #413); PDM 1.x `feature.install_cache` with agent mode; `rollback --preserve-state`.
+5. macOS / Windows probes, once probe-branch deletion works (`git push --delete` fails through the git proxy; the stale `bughunt/pdm/20260930-cache-symlink` still needs a maintainer to delete it).
+6. Done: vendored private index + `static_urls` (pass), agent → vendored takeover (pass), `remove <purl>` (#477).
 
 ## Known non-bugs
 - lock_version absent / 3.1 / 4.0–4.2 refused; 2.8.0 accepted-but-crashes (documented).
@@ -59,3 +59,6 @@ Modes × macOS/Windows for hosted and vendored: untested by this routine (the re
 - `scan -g --mode vendored` is accepted (exit 0) while hosted refuses. It isn't PDM-specific, so it's left to maintainers; not filed.
 - `rollback` deletes the manifest entry (documented: it removes local state), so a later `apply` is a no-op.
 - A mode-less `scan` without `-g` / `--prune` defaults to hosted and rewrites `pdm.lock` (documented default).
+- From a monorepo root, `scan 'services/*'` writes per-project `.socket/`, but `rollback` from the root reports `Manifest not found` (use `--cwd services/api`). That's generic, not PDM-specific; left to maintainers.
+- After an agent → vendored takeover, `.socket/manifest.json` stays as `{"patches": {}}` (cosmetic).
+- Test-harness note: PDM's http:// downloads from a 127.0.0.1 mock get a 405 from the agent proxy unless `HTTPS_PROXY` is unset (sandbox artifact, not a bug).
