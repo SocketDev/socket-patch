@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Composer bug-hunt routine (label pm:composer).
 
-Last updated: 2026-10-01 (run 3), main `2463257` (v5 consolidation), latest release v4.0.0.
+Last updated: 2026-10-01 (run 4), main `2463257` (v5 consolidation), latest release v4.0.0.
 
 ## Coverage matrix
 
@@ -8,12 +8,12 @@ Cells are "pass", "fail #N" or "untested". Upstream `composer-compatibility.yml`
 
 | OS | Composer (PHP) | Agent: `setup` (LF) | Agent: `setup` CRLF / escapes | Agent: apply (path repo / installed.json) | Scan: custom vendor-dir | Hosted: repo capstones | Hosted: repo `options` → transport-options | Hosted: warm cache | Vendored: dist / path-copy install + revert | Vendored: source install → git clone |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 1.10.28 (8.1/8.3) | untested | untested (OS/version-independent) | pass | untested | CI | fail #399 | pass | pass | fail #355 |
-| Linux | 2.2.30 (8.3) | untested | untested | pass | untested | CI | fail #399 | pass | pass | fail #355 |
-| Linux | 2.8.12 (8.3/8.4) | removed in v5 | removed in v5 (#351 closed) | pass | pass | pass (5/5) | fail #399 | pass | pass | fail #355 |
-| Linux | 2.10.3 (8.5) | untested | untested | pass | untested | CI | untested (expected #399) | untested | pass | fail #355 |
-| macOS | 1.10 / 2.2 / 2.10 | untested | untested | pass | untested | CI | untested | untested | pass | fail #355 |
-| Windows | 1.10 / 2.2 / 2.10 | untested | untested | pass (junction) | untested | CI | untested | untested | pass | fail #355 |
+| Linux | 1.10.28 (8.1/8.3) | untested | untested (OS/version-independent) | pass | untested | CI | fail #399 | pass | pass | untested on v5 (#355 closed) |
+| Linux | 2.2.30 (8.3) | untested | untested | pass | untested | CI | fail #399 | pass | pass | untested on v5 (#355 closed) |
+| Linux | 2.8.12 (8.3/8.4) | removed in v5 | removed in v5 (#351 closed) | pass | pass | pass (5/5) | fail #399 | pass | pass | pass ×2 (v5; #355 closed) |
+| Linux | 2.10.3 (8.5) | untested | untested | pass | untested | CI | untested (expected #399) | untested | pass | untested on v5 (#355 closed) |
+| macOS | 1.10 / 2.2 / 2.10 | untested | untested | pass | untested | CI | untested | untested | pass | untested on v5 (#355 closed) |
+| Windows | 1.10 / 2.2 / 2.10 | untested | untested | pass (junction) | untested | CI | untested | untested | pass | untested on v5 (#355 closed) |
 
 "Vendored: source install" covers both `--prefer-source` and source-only VCS lock entries (no dist). "Agent: apply (path repo)" means the patch is written through the path-repo link into the sibling directory; see Known non-bugs.
 
@@ -27,14 +27,25 @@ Cells are "pass", "fail #N" or "untested". Upstream `composer-compatibility.yml`
 
 Local agent scan with a user-level `$COMPOSER_HOME/config.json` vendor-dir: fail #439 (Linux 2.8.12). Hosted on v5: #399 still reproduces.
 
+### composer/installers `installer-paths` (run 4, main `2463257`, Linux, installers 1.12.0 / 2.3.0)
+
+| Composer | `install-path` recorded | Agent scan / apply / vex / rollback | Hosted rewrite → fresh install → vex | Hosted vex with pristine live bytes | Vendored → install → vex → rollback |
+| --- | --- | --- | --- | --- | --- |
+| 1.10.28 | no | fail #463 (skipped "not installed", exit 0) | pass (install) | fail #463 (false `not_affected`) | pass (hint names the wrong dir, cosmetic) |
+| 2.2.30 | yes | pass | untested | untested | untested |
+| 2.8.12 | yes | pass | pass | pass (omits `not_applied`) | pass |
+| 2.10.3 | yes (expected) | untested | untested | untested | untested |
+
+OS-independent (pure path logic). macOS/Windows: untested.
+
 ## Backlog
 
-1. **Maintainer request (in progress):** global `-g` mode. Remaining: a non-writable global dir must fail loudly (non-root probe), `SOCKET_GLOBAL=1` and space/unicode `--global-prefix` cells, and a re-run after #438/#439 are fixed.
-2. Hosted on v5: other repo-scoped lock fields (`notification-url`, `ssl` transport options). Re-check #355 on v5 vendored.
-3. composer/installers custom `install-path` (a WordPress plugin) for agent apply and vendored discovery, Composer 2 vs 1.
-4. `COMPOSER=<other>.json` projects (crawler vendor-dir resolution).
-5. Concurrent `vendor` + `composer install`; an interrupted vendor followed by `repair`.
-6. Delete the leftover probe branches `bughunt/composer/20260930-srconly-probe` and `bughunt/composer/20261001-global-probe` (the sandbox git proxy refuses deletes). Needs a maintainer.
+1. **Maintainer request (in progress):** global `-g` mode. Remaining: a non-writable global dir must fail loudly (non-root probe), `SOCKET_GLOBAL=1` and space/unicode `--global-prefix` cells, and a re-run after #438/#439 are fixed (PR #442 targets #438).
+2. Re-run the Composer 1 installers cells when a fix for #463 lands, and add 2.10.3 installers cells.
+3. Hosted: `notification-url` and `ssl` transport options on rewritten entries (#399 family). Hosted → vendored takeover on a packagist-origin entry (probe, because sandbox zipballs fail).
+4. Concurrent `vendor` + `composer install`; an interrupted vendor followed by `repair`.
+5. `COMPOSER=<other>.json`: the crawler and hosted mode ignore it (scan finds 0 packages). Only the vex gap is documented. Ask maintainers whether to document it or file it.
+6. Delete the leftover probe branches `bughunt/composer/20260930-srconly-probe` and `bughunt/composer/20261001-global-probe` (the sandbox git proxy refuses deletes, re-tried in run 4). Needs a maintainer.
 
 ## Known non-bugs
 
@@ -51,3 +62,7 @@ Local agent scan with a user-level `$COMPOSER_HOME/config.json` vendor-dir: fail
 - Agent mode under `-g` keeps `.socket/manifest.json` in the cwd, so run `rollback -g` from the same directory. This is per-cwd manifest design.
 - Mock hygiene: a rollback mock needs `beforeBlobContent` or a `/patches/blob/<hash>` route, or rollback fails with "Before blob could not be downloaded".
 - Windows probe hygiene: `composer global config <key> '<json>'` through `composer.bat` mangles the quotes. Write `$COMPOSER_HOME/composer.json` directly.
+- A `COMPOSER=<other>.json` renamed manifest/lock isn't read (docs/testing/composer-compatibility.md "Not covered", stated for vex). Scan then reports 0 packages.
+- Vendored `vex` still attests when the live installed tree is pristine, with the `vendored_tree_out_of_sync` warning: the committed `.socket/vendor` artifact that the lock consumes is the evidence (docs/usage.md VEX table).
+- Hosted → vendored takeover refuses an entry from an inline `package`/custom repository ("does not record packagist as its origin"; restore with `git checkout -- composer.lock`). That's documented fail-closed behaviour, so use a packagist-origin fixture to test takeovers.
+- Mock hygiene: manifestless hosted vex only recognizes archive URLs in the canonical `/patch/composer/<name>/<ver>/<token>/<uuid>/<leaf>.zip` shape. Vendored mode needs a `/patch/package` route serving a single-top-dir dist zip.
