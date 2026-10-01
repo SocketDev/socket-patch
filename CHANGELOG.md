@@ -102,6 +102,12 @@ limits, and required install commands.
 
 ### Fixed
 
+- Hosted Maven warns `redirect_maven_trusted_checksums_unenforced` when
+  `.mvn/wrapper/maven-wrapper.properties` pins a Maven older than 3.9.4. Maven
+  3.9.0–3.9.3 never enforce the Trusted Checksums pin that hosted mode writes;
+  the 4.0.0 notes and docs wrongly said every 3.9 release does. The version
+  suffix still fails closed. CI runs the real-Maven hosted capstone on 3.9.3 and
+  3.9.4 (#258).
 - Patch application, reversal, and cleanup handle missing files, release variants,
   corrupt state, newer ledger formats, and unsafe manifest paths without silently
   dropping protection. File ownership restoration failures produce warnings.
