@@ -1268,7 +1268,8 @@ fn run_site_query() -> Option<String> {
 /// Get global/system Python `site-packages` directories.
 ///
 /// Queries `python3` for site-packages paths, then checks well-known system
-/// locations including Homebrew, conda, uv tools, pip --user, etc.
+/// locations including Homebrew, conda, uv tools, pipx venvs, pip --user,
+/// etc.
 pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     let mut results = Vec::new();
     let mut seen = HashSet::new();
@@ -1490,6 +1491,26 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         }
     }
 
+    // pipx app venvs (`pipx install hatch`): one venv per app under
+    // `<pipx home>/venvs/<app>`. Every candidate home that exists is
+    // scanned, not just the one pipx would pick today: an app installed
+    // under an older default is still a real install, and `seen` dedups
+    // overlaps (e.g. PIPX_HOME set to the default).
+    for pipx_home in pipx_home_candidates(&home_dir) {
+        let venvs = pipx_home.join("venvs");
+        #[cfg(not(windows))]
+        let mut matches =
+            find_python_dirs(&venvs, &["*", "lib", "python3.*", "site-packages"]).await;
+        #[cfg(not(windows))]
+        matches
+            .extend(find_python_dirs(&venvs, &["*", "lib64", "python3.*", "site-packages"]).await);
+        #[cfg(windows)]
+        let matches = find_python_dirs(&venvs, &["*", "Lib", "site-packages"]).await;
+        for m in matches {
+            add_path(m, &mut seen, &mut results);
+        }
+    }
+
     // uv-managed Python interpreters (`uv python install 3.X`) live at:
     //   Linux/macOS: ~/.local/share/uv/python/cpython-3.X.*/lib/python3.X/site-packages/
     //   Windows:     %LOCALAPPDATA%\uv\python\cpython-3.X.*\Lib\site-packages\
@@ -1523,6 +1544,49 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     }
 
     results
+}
+
+/// The directories pipx may use as its home, most specific first.
+///
+/// pipx (>= 1.3, `pipx/paths.py`) uses `$PIPX_HOME` when set, otherwise
+/// its legacy home `~/.local/pipx` if that exists, otherwise platformdirs'
+/// user data dir: `$XDG_DATA_HOME/pipx` (default `~/.local/share/pipx`) on
+/// Linux, `~/Library/Application Support/pipx` on macOS, and
+/// `%USERPROFILE%\pipx` on Windows (with `%LOCALAPPDATA%\pipx\pipx` as its
+/// platformdirs fallback). All of them are returned; callers skip the ones
+/// that don't exist.
+fn pipx_home_candidates(home_dir: &Path) -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    if let Some(pipx_home) = std::env::var_os("PIPX_HOME").filter(|v| !v.is_empty()) {
+        homes.push(PathBuf::from(pipx_home));
+    }
+    homes.push(home_dir.join(".local").join("pipx"));
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    {
+        // platformdirs ignores a relative XDG_DATA_HOME, per the XDG spec.
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+        {
+            homes.push(xdg.join("pipx"));
+        }
+        homes.push(home_dir.join(".local").join("share").join("pipx"));
+    }
+    #[cfg(target_os = "macos")]
+    homes.push(
+        home_dir
+            .join("Library")
+            .join("Application Support")
+            .join("pipx"),
+    );
+    #[cfg(windows)]
+    {
+        homes.push(home_dir.join("pipx"));
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            homes.push(PathBuf::from(local).join("pipx").join("pipx"));
+        }
+    }
+    homes
 }
 
 /// Returns true if `cwd` looks like a Python project root.
