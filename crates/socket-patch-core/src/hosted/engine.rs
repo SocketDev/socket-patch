@@ -377,6 +377,22 @@ fn rush_repo(view: &ProjectView<'_>) -> bool {
     }
 }
 
+/// Whether `rel` is a [`PRESENCE_ONLY`](crate::formats::registry::PRESENCE_ONLY)
+/// row the in-memory host lists without usable content (a symbolic link,
+/// an oversize or presence-only entry). Its planners only ask whether it
+/// exists — the Pipenv planner tells a live `Pipfile.lock` from an
+/// abandoned one by the `Pipfile` beside it — so it is recorded as present
+/// (empty) rather than dropped. Disk reads such a file through any link.
+fn presence_only_present(view: &ProjectView<'_>, rel: &str) -> bool {
+    let ProjectView::Memory(project) = view else {
+        return false;
+    };
+    project.contains(rel)
+        && crate::formats::registry::registry()
+            .iter()
+            .any(|f| f.path == rel && f.has(crate::formats::registry::PRESENCE_ONLY))
+}
+
 /// Read the project's candidate files: [`REDIRECT_CANDIDATE_FILES`], the
 /// Cargo workspace members (when a cargo candidate meets a root
 /// `Cargo.toml`), the Python locks and their scripts, and the Rush locks.
@@ -399,7 +415,9 @@ pub async fn read_candidate_files(
             }
             continue;
         }
-        out.read(view, unreadable, name).await;
+        if !out.read(view, unreadable, name).await && presence_only_present(view, name) {
+            out.files.insert((*name).to_string(), String::new());
+        }
     }
 
     // Cargo workspace members (and in-root path dependencies) declare
@@ -1556,6 +1574,44 @@ mod tests {
         assert!(read.unreadable_reads.is_empty());
     }
 
+    /// #333: the Pipenv planner keys a live lock on the `Pipfile` beside
+    /// it, so the candidate reads must carry it — read from disk, and kept
+    /// as present in memory even when the host has no content for it.
+    #[tokio::test]
+    async fn the_pipfile_is_read_for_its_presence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Pipfile"), "[packages]\n").unwrap();
+        std::fs::write(tmp.path().join("Pipfile.lock"), "{}").unwrap();
+        let read =
+            read_candidate_files(&ProjectView::Disk(tmp.path()), &BTreeSet::new(), &[]).await;
+        assert_eq!(
+            read.files.get("Pipfile").map(String::as_str),
+            Some("[packages]\n")
+        );
+
+        for entry in [MemoryEntry::Symlink, MemoryEntry::Present] {
+            let mut p = MemoryProject::new();
+            p.insert_text("Pipfile.lock", "{}");
+            p.insert("Pipfile", entry.clone());
+            let unreadable = match entry {
+                MemoryEntry::Present => BTreeSet::from(["Pipfile".to_string()]),
+                _ => BTreeSet::new(),
+            };
+            let read = read_candidate_files(&ProjectView::Memory(&p), &unreadable, &[]).await;
+            assert_eq!(
+                read.files.get("Pipfile").map(String::as_str),
+                Some(""),
+                "{entry:?}"
+            );
+        }
+
+        // Absent stays absent: a lone Pipfile.lock is abandoned.
+        let mut p = MemoryProject::new();
+        p.insert_text("Pipfile.lock", "{}");
+        let read = read_candidate_files(&ProjectView::Memory(&p), &BTreeSet::new(), &[]).await;
+        assert!(!read.files.contains_key("Pipfile"));
+    }
+
     #[test]
     fn file_ecosystems_cover_the_rewrite_targets() {
         assert_eq!(file_ecosystem("package-lock.json"), Some("npm"));
@@ -1566,6 +1622,7 @@ mod tests {
         assert_eq!(file_ecosystem("tool.py.lock"), Some("pypi"));
         assert_eq!(file_ecosystem("crates/a/Cargo.toml"), Some("cargo"));
         assert_eq!(file_ecosystem("build.gradle"), None);
+        assert_eq!(file_ecosystem("Pipfile"), None);
     }
 }
 
