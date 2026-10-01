@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Gradle bug-hunt routine (label pm:gradle).
 
-Last updated: 2026-10-01 (run 4), main `2463257` (#277, v5: Gradle 6.8+ vendoring backend), latest release v4.0.0.
+Last updated: 2026-10-01 (run 5), main `9d718cf` (no Gradle code changes since `2463257` / #277), latest release v4.0.0. #428 and #461 were re-confirmed on `9d718cf`.
 
 ## Coverage matrix
 
@@ -26,19 +26,28 @@ Last updated: 2026-10-01 (run 4), main `2463257` (#277, v5: Gradle 6.8+ vendorin
 | macOS | 6.9.4 / 7.6.6 / 9.8.0 | pass (probe) | untested | untested | pass (probe) | pass | untested | untested | untested | untested (static planner) |
 | Windows | 6.9.4 / 7.6.6 / 9.8.0 | pass (probe: s1, s9, s12, s14) | untested | untested | fail #429 (script left behind) | **fail #429** | untested | untested | untested | untested (static planner) |
 
+**Vendored, run 5 cells (Linux).**
+
+| Gradle (JDK) | `.module` artifact (jackson-core) | Version catalog | Kotlin settings + `includeBuild("build-logic")` | Subproject buildscript classpath | `apply from:` script with exclusiveContent | verify-signatures, pgp-only chain entry | verify-signatures, trusted-keys only | Isolated projects |
+|---|---|---|---|---|---|---|---|---|
+| 8.14.3 (21) | pass | pass | pass | pass | fail #461 | **fail #487** | pass | untested |
+| 9.8.0 (21) | untested | untested | untested | untested | untested | **fail #487** | untested | pass |
+| 6.9.4 / 7.6.6, macOS, Windows | untested | untested | untested | untested | untested | untested | untested | untested |
+
 **Global (`-g`), Linux, 8.14.3 cache.**
 - `scan -g` report: fail. No Gradle-cached purls (#349 comment).
 - `scan -g --mode hosted` / `--global-prefix --mode hosted` refusal: pass (exit 2, no writes).
 - `-g` apply / rollback / vex: blocked (nothing discovered).
+- `-g` commands run inside a vendored Gradle project leave the project byte-unchanged (pass, run 5, after #446).
 - macOS / Windows: untested.
 
 ## Backlog
-1. **Maintainer request (partly done):** global `-g` mode. Linux report and refusal are covered. Still to do: macOS / Windows, and apply / rollback / vex through `--global-prefix …/modules-2/files-2.1` if that's meant to be supported (see the 20261001T040000Z entry).
-2. Kotlin `settings.gradle.kts` + `pluginManagement { includeBuild("build-logic") }` convention plugins: is `build-logic` wired, and are its repositories checked (#461)?
-3. The hosted snippet in its suffixed form, with the dependency bumped, followed by `vendor`. Check the result and VEX.
-4. `apply from: 'gradle/repos.gradle'` script plugins declaring repositories (a likely #461 sibling).
-5. `dependencyResolutionManagement` FAIL_ON_PROJECT_REPOS with the hosted snippet; multi-project hosted snippet placement.
-6. Re-test #347, #348, #349, #395, #396, #428, #429 and #461 when main moves.
+1. **Maintainer request (partly done):** global `-g` mode. Linux is covered (the report, the refusal, and no project leakage). Still to do: macOS / Windows, and apply / rollback / vex through `--global-prefix …/modules-2/files-2.1` if that's meant to be supported (see the 20261001T040000Z entry).
+2. #487 on Gradle 6.9.4 / 7.6.6 (a JDK 11/17 probe), plus `verify-signatures` with `.module` artifacts and imported BOMs.
+3. `vendor --check` / `--revert` byte-exactness on a verification-metadata file that has pgp entries.
+4. The hosted snippet in its suffixed form, with the dependency bumped and then `vendor`. Check the result and VEX.
+5. `dependencyResolutionManagement` FAIL_ON_PROJECT_REPOS with the hosted snippet; IDE `sources` classifier downloads under the vendored exclusiveContent.
+6. Re-test #347, #348, #349, #395, #396, #428, #429, #461 and #487 when `vendor/jvm/`, `maven_crawler.rs` or `gradle_snippet` change.
 
 ## Known non-bugs
 - The sandbox can't reach the Socket API. For vendored, use `prebuilt_common::prepare_command` + a staged manifest/blob (see the run 3 entry). For hosted, use the wiremock shaped like `e2e_redirect_maven_build`.
@@ -54,3 +63,7 @@ Last updated: 2026-10-01 (run 4), main `2463257` (#277, v5: Gradle 6.8+ vendorin
 - The session's git proxy refuses branch deletes, so probe branches need maintainer cleanup.
 - Maven Central (both `repo.maven.apache.org` and `repo1.maven.org`) can 429 Gradle in the sandbox. Point mavenCentral at `file://<seeded m2>` with an init script.
 - Dropping one of two vendored Gradle patches (`remove <purl>`, or a manifest edit + re-vendor) keeps the other wired correctly. Verified in run 4.
+- A UTF-8 BOM in a Groovy `settings.gradle` is rejected by Gradle itself; it isn't a valid fixture.
+- `vex -g` attests the cwd project's vendored or hosted state by design (`vex.rs:1013`).
+- Agent-mode Maven patches whole jar files. A manifest keyed by a jar *member* (the vendored fixture format) fails `apply` with "File not found", which is a fixture error.
+- Under isolated projects, harness init scripts must avoid `allprojects`; the vendored script itself is IP-compatible on 9.8.0.
