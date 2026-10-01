@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-01 (run 4), main `2463257` (the v5 consolidation, #277), latest release v4.0.0. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-01 (run 5), main `61cfb9b`, latest release v4.0.0. Run 5 added the cells in "Run 5 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -24,8 +24,8 @@ Report = `scan -g` report-only + no leakage; refusal = `scan -g/--global-prefix/
 
 | OS | yarn | report | refusal | A apply/vex/rollback | get-mode | RO | custom global-folder (space+unicode) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 1.0.2 | fail #437 | pass | fail #437 | fail #436 | n/a (nothing found) | untested |
-| Linux | 1.10.1 / 1.22.22 | pass | pass | pass | fail #436 | pass (CI runner) | pass (1.22.22) |
+| Linux | 1.0.2 | fail #437 | pass | fail #437 | fixed (#436 closed by #446; not re-run) | n/a (nothing found) | untested |
+| Linux | 1.10.1 / 1.22.22 | pass | pass | pass | fixed (#436 closed by #446; not re-run) | pass (CI runner) | pass (1.22.22) |
 | macOS | 1.0.2 | fail #437 | pass | fail #437 | fail #436 | n/a | untested |
 | macOS | 1.10.1 / 1.22.22 | pass | pass | pass | fail #436 | pass | untested |
 | Windows | 1.0.2 | fail #437 / #434 | pass | fail #434 | fail #436 | untested | untested |
@@ -41,12 +41,20 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - No-`integrity` (1.7-style) locks, H and V: pass (1.7.0 / 1.22.22). Tarball-URL dep, H and V: pass. `file:` dir dep, H: pass.
 - SIGKILL-interrupted scans, H and V: pass (recoverable by `repair` / re-scan).
 
+### Run 5 cells (Linux, `61cfb9b`)
+- `.yarnrc --modules-folder`, agent mode: **fail #493** (1.7.0 / 1.10.1 / 1.22.22).
+- Workspaces with `nohoist`, A/H/V + frozen install + vex: pass (1.22.22).
+- `--max-new-patches` on a workspace, A/H/V + re-run + frozen install: pass (1.22.22).
+- Custom `.yarnrc registry`, hosted rewire + rollback: pass (rollback uses `SOCKET_NPM_REGISTRY`, as documented).
+- Hosted over an installed tree, then an in-place frozen reinstall: pass.
+- #363 re-checked: still fails (1.22.22).
+
 ## Backlog
 
-1. **Maintainer request (global mode), still open:** Windows after #434 (PR #442) / #436 (PR #446) are fixed; yarn via corepack and the Windows MSI; 1.6.0 / 1.9.4 on the probe; a read-only prefix on Windows (Program Files).
-2. `socket.yml` filters and `--max-new-patches` on a yarn workspace; `optionalDependencies` / platform-skipped packages in both modes and vex.
-3. `.yarnrc` `--install.frozen-lockfile true`, `--pure-lockfile`, `yarn import` locks.
-4. Custom `.yarnrc` `registry` (private mirror hosts in `resolved`) through hosted → rollback → frozen install.
+1. **Maintainer request (global mode), still open:** Windows once #442 merges (#434 / #437, and the Berry handover lead about the `.cmd` shim); yarn via corepack and the Windows MSI; 1.6.0 / 1.9.4 on the probe; a read-only prefix on Windows (Program Files). Re-run get-mode cells after #446.
+2. `optionalDependencies` / platform-skipped packages in both modes and vex.
+3. `--modules-folder` in hosted / vendored modes and at workspace level.
+4. `yarn import` locks and `--pure-lockfile`; a `socket.yml` `patches` policy on a workspace member path.
 5. Re-run the v4-only project matrix columns (git dep #363, offline mirror H #364) on macOS/Windows once fixes land.
 
 ## Known non-bugs
@@ -71,3 +79,6 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Vendored mode on yarn ≤ 1.6 installs nothing. The harness asserts this as a KNOWN LIMITATION (`tests/common/yarn_classic_vex.rs:89`); it's not in the user docs.
 - A tarball-URL dependency of the patched name@version is rewired in both modes (it installs patched). Whether a URL "fork" should be refused, as vlt does, is a design question.
 - A SIGKILL can leave the lock wired with no `vendor/state.json`. `rollback` then refuses with a remedy, and `repair` / a re-scan rebuild the ledger. That's intended crash handling.
+- Hosted rollback ignores the `.yarnrc` `registry` and queries `SOCKET_NPM_REGISTRY` (default registry.npmjs.org). That's documented (CLI_CONTRACT Hosted unwind / env table). Set `SOCKET_NPM_REGISTRY` behind a private registry.
+- A nested non-workspace project (its own `yarn.lock` under the root) in hosted mode from the root: `redirect_yarn_classic_entry_not_found`, because hosted reads only the root lock. That's the documented one-project model (run with `--cwd` per project).
+- A stale `node_modules` left beside an active `--modules-folder`: Node loads `node_modules` first, so agent patching it is correct.
