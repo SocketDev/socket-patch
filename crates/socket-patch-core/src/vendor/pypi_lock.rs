@@ -450,6 +450,12 @@ fn bare_table(table: &Table) -> String {
 /// identity. Elements the vendoring left alone are not looked up at all, so
 /// the user may add, drop or reorder them freely. `None` (drift) when a
 /// changed element is gone, ambiguous, or two of them claim one live slot.
+///
+/// An identity match that already reads as the original proves nothing on
+/// its own: the vendored element may have been edited beyond recognition
+/// (renamed) while the user added a sibling equal to the original. So that
+/// "already restored" pairing only stands when no other live element is
+/// unaccounted for, i.e. neither paired nor one of the recorded elements.
 fn pair_changed(
     original: &[String],
     new: &[String],
@@ -459,6 +465,7 @@ fn pair_changed(
 ) -> Option<Vec<(usize, usize)>> {
     let mut pairs = Vec::new();
     let mut claimed = BTreeSet::new();
+    let mut already_original = false;
     for index in (0..new.len()).filter(|&index| original[index] != new[index]) {
         let unique = |found: Vec<usize>| (found.len() == 1).then(|| found[0]);
         let textual: Vec<usize> = (0..live.len())
@@ -466,11 +473,13 @@ fn pair_changed(
             .collect();
         let slot = if textual.is_empty() {
             let identity = new_identity[index].as_ref()?;
-            unique(
+            let slot = unique(
                 (0..live.len())
                     .filter(|&slot| live_identity[slot].as_ref() == Some(identity))
                     .collect(),
-            )?
+            )?;
+            already_original |= live[slot] == original[index];
+            slot
         } else {
             unique(textual)?
         };
@@ -479,7 +488,10 @@ fn pair_changed(
         }
         pairs.push((slot, index));
     }
-    Some(pairs)
+    let unaccounted = (0..live.len()).any(|slot| {
+        !claimed.contains(&slot) && !original.contains(&live[slot]) && !new.contains(&live[slot])
+    });
+    (!(already_original && unaccounted)).then_some(pairs)
 }
 
 fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn TableLike) -> bool {
@@ -577,6 +589,9 @@ fn restore_value(live: &mut Value, original: &Value, new: &Value) -> bool {
         let mut drifted = false;
         for (slot, index) in pairs {
             let current = live.get_mut(slot).expect("paired slot is in range");
+            if bare_value(current) == bare_value(original[index]) {
+                continue;
+            }
             if bare_value(current) == bare_value(new[index]) {
                 replace_value(current, original[index], new[index]);
             } else {
@@ -635,6 +650,9 @@ fn restore_item(live: &mut Item, original: &Item, new: &Item) -> bool {
         let mut drifted = false;
         for (slot, index) in pairs {
             let current = live.get_mut(slot).expect("paired slot is in range");
+            if bare_table(current) == bare_table(original[index]) {
+                continue;
+            }
             drifted |= restore_table(current, original[index], new[index]);
         }
         return drifted;
@@ -1051,11 +1069,33 @@ mod tests {
             "dependencies = [\"one==1\", \"idna==3.7\"]\n",
             "dependencies = [\"one==1\", \"six==1.17.0\", \"idna==3.7\"]\n",
             "dependencies = [\"six @ file:///v/six.whl\", \"six @ file:///v/six.whl\"]\n",
+            // Renamed past recognition, with a sibling equal to the original.
+            "dependencies = [\"one==1\", \"other @ file:///v/six.whl\", \"six==1.16.0\"]\n",
         ] {
             let (restored, drifted) = restore_document(live, original, new).unwrap();
             assert!(drifted, "{live}");
             assert_eq!(restored, live);
         }
+    }
+
+    /// A pin the user already put back by hand still reverts cleanly (the
+    /// rest of the wiring is restored), but not when another, unknown
+    /// element could be the vendored one renamed (Bugbot on #481).
+    #[test]
+    fn already_restored_element_is_trusted_only_without_unknown_siblings() {
+        let original = "dependencies = [\"one==1\", \"six==1.16.0\"]\n";
+        let new = "dependencies = [\"one==1\", \"six @ file:///v/six.whl\"]\n";
+        let (restored, drifted) = restore_document(original, original, new).unwrap();
+        assert!(!drifted);
+        assert_eq!(restored, original);
+        let live = "dependencies = [\"six==1.16.0\", \"one==1\"]\n";
+        let (restored, drifted) = restore_document(live, original, new).unwrap();
+        assert!(!drifted);
+        assert_eq!(restored, live);
+        let live = "dependencies = [\"one==1\", \"six==1.16.0\", \"idna==3.7\"]\n";
+        let (restored, drifted) = restore_document(live, original, new).unwrap();
+        assert!(drifted);
+        assert_eq!(restored, live);
     }
 
     /// A re-resolved package (new version) is not the vendored entry, even
