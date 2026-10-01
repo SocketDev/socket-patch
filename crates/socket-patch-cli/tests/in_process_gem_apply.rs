@@ -199,7 +199,9 @@ async fn gem_install_scan_sync_patches_real_file() {
     .await;
 
     let args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),
@@ -219,11 +221,10 @@ async fn gem_install_scan_sync_patches_real_file() {
         prune: false,
         sync: true,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     let code = scan_run(args).await;
     assert_eq!(
@@ -288,8 +289,8 @@ async fn gem_crawler_finds_real_installed_gem() {
     }
     let tmp = tempfile::tempdir().expect("tempdir");
     let lib_file = install_colorize(tmp.path());
-    // A scan WITHOUT --sync is read-only; capture the installed file so we can
-    // prove it is left byte-for-byte untouched after discovery.
+    // A bare scan (hosted mode) rewires lockfiles only; capture the installed
+    // file so we can prove it is left byte-for-byte untouched.
     let before_scan = std::fs::read(&lib_file).expect("read colorize.rb before scan");
 
     let server = MockServer::start().await;
@@ -311,7 +312,9 @@ async fn gem_crawler_finds_real_installed_gem() {
         .await;
 
     let args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),
@@ -331,11 +334,10 @@ async fn gem_crawler_finds_real_installed_gem() {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     assert_eq!(scan_run(args).await, 0);
 
@@ -356,9 +358,7 @@ async fn gem_crawler_finds_real_installed_gem() {
         "crawler did not discover the installed gem: no batch request carried {purl}"
     );
 
-    // A discovery-only scan (no --sync, no --apply) must not mutate any
-    // installed file. This catches a regression where scan silently writes
-    // patches behind the user's back during a read-only pass.
+    // A bare scan (hosted mode) must never write the installed gem copy.
     let after_scan = std::fs::read(&lib_file).expect("read colorize.rb after scan");
     assert_eq!(
         after_scan,

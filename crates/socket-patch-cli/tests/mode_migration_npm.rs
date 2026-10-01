@@ -1,19 +1,17 @@
 //! Real-yarn mode-migration e2e: hosted ⇄ vendored takeovers on the npm
 //! family must leave the project FULLY in the new mode — or refuse.
 //!
-//! Twin of `mode_migration_cargo.rs` (the file that pins the C1–C7 cargo
-//! takeover bug class from #196) for the yarn classic + berry lock flavors.
-//! Pre-fix, the vendor dispatch loop's cross-mode pre-revert was hard-gated
-//! `candidate.starts_with("pkg:cargo/")`, so vendoring an npm purl over a
-//! LIVE hosted redirect:
-//!   (a) recorded the HOSTED patch.socket.dev lock fragment as the vendor
+//! Twin of `mode_migration_cargo.rs` for the yarn classic + berry lock
+//! flavors. Vendoring an npm purl over a LIVE hosted pin must first restore
+//! the pin's upstream registry entry (v5: re-resolved from the registry;
+//! hosted mode keeps no ledger), or it would:
+//!   (a) record the HOSTED patch.socket.dev lock fragment as the vendor
 //!       ledger's unrecoverable pre-vendor "original" (not the pristine
-//!       registry fragment),
-//!   (b) left the redirect ledger's records + edits in place forever, so the
-//!       `vendor_supersedes_redirect` warning's promised auto-reconcile never
-//!       converged, and
-//!   (c) made `vendor --revert` land back on the (grant-tokenized, expiring)
+//!       registry fragment), and
+//!   (b) make `vendor --revert` land back on the (grant-tokenized, expiring)
 //!       hosted wiring with no CLI path back to registry state.
+//! The reverse direction's hosted state is the lock alone; `rollback`
+//! restores its upstream entry.
 //!
 //! Each scenario drives the REAL binary against a real `corepack yarn`
 //! (network used for the registry fixture install only; the hosted patch
@@ -23,6 +21,9 @@
 //! Skips (println) when `corepack` / the pinned yarn flavor is unavailable or
 //! the registry is unreachable for the fixture install; all assertions after
 //! that are hard.
+
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -114,9 +115,18 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
+    run_socket_env(cwd, args, &[])
+}
+
+/// [`run_socket`] with extra env applied after the scrub.
+fn run_socket_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     scrub_socket_env(&mut cmd);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, env);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -286,6 +296,14 @@ async fn mount_hosted_mocks(
     patched: &[u8],
     berry_checksum: Option<&str>,
 ) -> String {
+    prebuilt_common::mount_download(
+        server,
+        PURL,
+        UUID_V,
+        &format!("{DEP}-{DEP_VERSION}.tgz"),
+        tgz,
+    )
+    .await;
     let hosted_url = format!(
         "{}/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID_H}/{DEP}-{DEP_VERSION}.tgz",
         server.uri()
@@ -325,6 +343,40 @@ async fn mount_hosted_mocks(
         "integrity": { "sha512": sha512_sri(tgz), "sha1": sha1_hex(tgz) }
     })];
     if let Some(checksum) = berry_checksum {
+        let client = reqwest::Client::new();
+        let metadata: serde_json::Value = client
+            .get(format!("https://registry.npmjs.org/{DEP}/{DEP_VERSION}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let upstream = client
+            .get(metadata["dist"]["tarball"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let upstream_checksum =
+            socket_patch_core::vendor::test_support::service_fixture::berry_checksum(
+                &upstream, DEP,
+            )
+            .unwrap();
+        Mock::given(method("GET"))
+            .and(path(format!("/upstream/npm/{UUID_H}.json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": DEP, "version": DEP_VERSION,
+                "integrity": sha512_sri(&upstream), "yarnBerry10c0": upstream_checksum
+            })))
+            .mount(server)
+            .await;
         artifacts.push(serde_json::json!({
             "kind": "yarn-berry-zip", "url": hosted_url,
             "integrity": { "yarnBerry10c0": checksum }
@@ -377,6 +429,68 @@ async fn mount_hosted_mocks(
         .mount(server)
         .await;
     hosted_url
+}
+
+/// Serve, from `server` (as `SOCKET_NPM_REGISTRY`), the npm registry version
+/// document the v5 upstream restore reads for DEP — mirrored from what the
+/// PRISTINE classic lock recorded (`resolved "<tarball>#<sha1>"`,
+/// `integrity`, or the SHA-1 fragment on pre-1.10 releases). The restore must
+/// reproduce the registry entry yarn wrote from that document; mirroring it keeps
+/// the unwind hermetic (the binary's TLS stack need not reach the real
+/// registry). Returns the registry base and expected upstream lock. Hosted
+/// mode adds an integrity line even on pre-1.10 yarn, and v5 restores that
+/// line's registry hash without a saved fragment to recover its absence.
+async fn mount_registry_from_classic_lock(server: &MockServer, lock: &str) -> (String, String) {
+    use base64::Engine as _;
+
+    let block = lock
+        .split("\n\n")
+        .find(|b| {
+            b.contains(&format!("{DEP}@")) && b.contains(&format!("version \"{DEP_VERSION}\""))
+        })
+        .unwrap_or_else(|| panic!("no {DEP} block in the pristine lock:\n{lock}"));
+    let field = |name: &str| {
+        block
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(&format!("{name} ")))
+            .map(|v| v.trim_matches('"').to_string())
+    };
+    let resolved = field("resolved").unwrap_or_else(|| panic!("no `resolved` in {block}"));
+    let (tarball, shasum) = resolved
+        .split_once('#')
+        .map(|(t, s)| (t.to_string(), Some(s.to_string())))
+        .unwrap_or((resolved.clone(), None));
+    let integrity = field("integrity").unwrap_or_else(|| {
+        let sha1 = hex::decode(
+            shasum
+                .as_ref()
+                .expect("pre-1.10 yarn pins a SHA-1 fragment"),
+        )
+        .expect("the resolved fragment is hex SHA-1");
+        format!(
+            "sha1-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha1)
+        )
+    });
+    let upstream_lock = if field("integrity").is_some() {
+        lock.to_string()
+    } else {
+        lock.replacen(
+            &format!("  resolved \"{resolved}\""),
+            &format!("  resolved \"{resolved}\"\n  integrity {integrity}"),
+            1,
+        )
+    };
+    Mock::given(method("GET"))
+        .and(path(format!("/registry/{DEP}/{DEP_VERSION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": DEP,
+            "version": DEP_VERSION,
+            "dist": { "tarball": tarball, "integrity": integrity, "shasum": shasum }
+        })))
+        .mount(server)
+        .await;
+    (format!("{}/registry", server.uri()), upstream_lock)
 }
 
 fn run_hosted_scan(proj: &Path, server_uri: &str) -> (i32, String, String) {
@@ -503,7 +617,7 @@ fn fresh_checkout(proj: &Path, tmp: &Path, tag: &str, berry: bool) -> PathBuf {
 }
 
 /// Assertions shared by the classic and berry hosted→vendored legs:
-/// the redirect ledger is fully reconciled, the vendor ledger's recorded
+/// no hosted ledger exists, the vendor ledger's recorded
 /// originals are the PRISTINE registry fragments, a fresh checkout installs
 /// the patched bytes, and `vendor --revert` restores the registry lock
 /// byte-identically.
@@ -524,12 +638,11 @@ fn assert_pure_vendored_and_round_trip(
         "takeover advisory missing from the vendor envelope ({tag}): {vendor_stdout}"
     );
 
-    // (b) The superseded redirect ledger is DROPPED — records and edits both
-    // — so the vendor_supersedes_redirect warning can never fire again and
-    // no stale hosted originals survive as a revert replay hazard.
+    // v5 hosted mode keeps no ledger: the lock is the only hosted state,
+    // and the takeover's restore removed it.
     assert!(
         !proj.join(".socket/vendor/redirect-state.json").exists(),
-        "the emptied redirect ledger must be removed ({tag}): {}",
+        "no hosted ledger may exist ({tag}): {}",
         read(proj, ".socket/vendor/redirect-state.json")
     );
 
@@ -599,7 +712,7 @@ fn assert_pure_vendored_and_round_trip(
         "fresh vendored install must carry the PATCHED bytes ({tag})"
     );
 
-    // (c) Round trip: `vendor --revert` restores the REGISTRY lock
+    // (b) Round trip: `vendor --revert` restores the expected REGISTRY lock
     // byte-identically (pre-fix it restored the hosted fragment, with no CLI
     // path back to registry state).
     let (code, stdout, stderr) = run_socket(
@@ -616,8 +729,8 @@ fn assert_pure_vendored_and_round_trip(
     assert_eq!(
         std::fs::read(proj.join("yarn.lock")).unwrap(),
         lock_pristine,
-        "yarn.lock must be restored byte-identical to the pre-hosted \
-         REGISTRY pristine ({tag}); got:\n{}",
+        "yarn.lock must be restored byte-identical to the expected \
+         upstream REGISTRY lock ({tag}); got:\n{}",
         read(proj, "yarn.lock")
     );
     assert_eq!(
@@ -758,21 +871,28 @@ async fn classic_hosted_then_vendored_takeover_round_trips_to_registry() {
     let lock = read(&proj, "yarn.lock");
     assert!(lock.contains(&hosted_url), "hosted wiring present:\n{lock}");
     assert!(
-        proj.join(".socket/vendor/redirect-state.json").exists(),
-        "hosted ledger written"
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "hosted mode writes no ledger"
     );
 
-    // B: vendor over the live hosted redirect — the takeover.
+    // B: vendor over the live hosted pin — the takeover. Online: the
+    // upstream restore re-resolves the registry entry (mirrored from the
+    // pristine lock), and the mock origin is named hosted via
+    // --patch-server-url.
+    let (registry, lock_upstream) =
+        mount_registry_from_classic_lock(&server, &String::from_utf8_lossy(&lock_pristine)).await;
     stage_patch(&proj, &fx.orig, &fx.patched);
-    let (code, stdout, stderr) = run_socket(
+    let (code, stdout, stderr) = run_socket_env(
         &proj,
         &[
             "vendor",
             "--json",
-            "--offline",
+            "--patch-server-url",
+            server.uri().as_str(),
             "--cwd",
             proj.to_str().unwrap(),
         ],
+        &[("SOCKET_NPM_REGISTRY", registry.as_str())],
     );
     assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
@@ -797,7 +917,7 @@ async fn classic_hosted_then_vendored_takeover_round_trips_to_registry() {
         "classic",
         false,
         &hosted_url,
-        &lock_pristine,
+        lock_upstream.as_bytes(),
         &pkg_json_pristine,
         &stdout,
     );
@@ -832,14 +952,18 @@ async fn berry_hosted_then_vendored_takeover_round_trips_to_registry() {
         "hosted wiring present:\n{lock}"
     );
 
-    // B: vendor over the live hosted redirect — the takeover.
+    // B: vendor over the live hosted pin — the takeover. Online against the
+    // REAL registry: berry's restore re-derives the 10c0 checksum from the
+    // registry tarball. The mock origin is named hosted via
+    // --patch-server-url.
     stage_patch(&proj, &fx.orig, &fx.patched);
     let (code, stdout, stderr) = run_socket(
         &proj,
         &[
             "vendor",
             "--json",
-            "--offline",
+            "--patch-server-url",
+            server.uri().as_str(),
             "--cwd",
             proj.to_str().unwrap(),
         ],
@@ -898,8 +1022,8 @@ async fn berry_hosted_then_vendored_takeover_round_trips_to_registry() {
 // ── vendored → hosted takeover, yarn classic (reverse direction) ────────────
 // The hosted scan must revert the vendored wiring + ledger entry + committed
 // artifact FIRST (per purl, the exact `vendor --revert` machinery), then
-// redirect — leaving the project purely hosted with the redirect ledger's
-// originals recording the PRISTINE registry fragments.
+// redirect — leaving the project purely hosted (the lock is the only hosted
+// state), from which `rollback` restores the PRISTINE registry lock.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
@@ -944,8 +1068,8 @@ async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
     );
 
     // The project is FULLY hosted: no vendored ledger claim, no committed
-    // artifact, no `file:` lock residue; the hosted wiring is present and its
-    // ledger records the PRISTINE registry originals.
+    // artifact, no `file:` lock residue; the hosted wiring is present and no
+    // hosted ledger is written.
     assert!(
         !read(&proj, ".socket/vendor/state.json").contains(PURL),
         "the displaced vendored ledger entry must be dropped: {}",
@@ -961,11 +1085,9 @@ async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
         !lock.contains(".socket/vendor/"),
         "no vendored residue in the lock:\n{lock}"
     );
-    let ledger = read(&proj, ".socket/vendor/redirect-state.json");
     assert!(
-        ledger.contains("registry.yarnpkg.com") || ledger.contains("registry.npmjs.org"),
-        "the redirect ledger's originals must be the pristine registry \
-         fragments (originals chain intact across migrations): {ledger}"
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "hosted mode writes no ledger"
     );
 
     // Fresh checkout installs the patched bytes from the hosted tarball.
@@ -1002,6 +1124,50 @@ async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
             &lock_pristine,
         )
     });
+
+    // Rollback re-resolves the upstream registry entry. Hosted mode added an
+    // integrity line even on pre-1.10 yarn; v5 has no saved fragment to tell
+    // whether it was originally absent, so it restores the registry hash.
+    let (registry, lock_upstream) =
+        mount_registry_from_classic_lock(&server, &String::from_utf8_lossy(&lock_pristine)).await;
+    let (code, stdout, stderr) = run_socket_env(
+        &proj,
+        &[
+            "rollback",
+            "--json",
+            "--yes",
+            "--patch-server-url",
+            server.uri().as_str(),
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+        &[("SOCKET_NPM_REGISTRY", registry.as_str())],
+    );
+    assert_eq!(code, 0, "rollback failed: {stdout}\n{stderr}");
+    assert_eq!(
+        read(&proj, "yarn.lock"),
+        lock_upstream,
+        "rollback restores the registry lock, allowing the added upstream integrity"
+    );
+    let fresh = fresh_checkout(&proj, fx.tmp.path(), "classic-rollback", false);
+    let fresh_cache = fx.tmp.path().join("fresh-cache-classic-rollback");
+    let ci = corepack(
+        &fresh,
+        &yarn_classic_vex::yarn_classic(),
+        &["install", "--frozen-lockfile", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
+    );
+    assert!(
+        ci.status.success(),
+        "fresh-checkout rollback install must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+        fx.orig,
+        "rollback installs the pristine registry bytes"
+    );
 }
 
 // ── vendored → hosted takeover, yarn berry (reverse direction) ─────────────

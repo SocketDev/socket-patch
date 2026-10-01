@@ -3,8 +3,8 @@
 //!
 //! Mutating subcommands (`apply`, `rollback`, `repair`, `remove`,
 //! `vendor`) all need the same shape: acquire the lock at the top of
-//! `run`, on contention emit a JSON envelope with `errorCode:
-//! "lock_held"` (or stderr in human mode) and exit 1. This module
+//! `run`, on contention emit a JSON envelope with `error.code:
+//! "lock_held"` (status "error") (or stderr in human mode) and exit 1. This module
 //! centralises that emission so the call sites stay one line each.
 //!
 //! The lock itself is in `socket-patch-core` (cross-crate, also used
@@ -337,13 +337,12 @@ mod tests {
 
     /// Regression guard carried over from the `--break-lock` era: the
     /// wrapper must never open a window in which a competitor can be
-    /// robbed of a lock it legitimately acquired. The historical buggy
-    /// shape probed, then `remove_file`d the lock file, then
-    /// re-acquired: a competitor that flocked (or had merely *opened*)
-    /// the file before the unlink kept a valid lock on the orphaned
-    /// inode while the re-acquire locked a fresh one — two live holders
-    /// at once. Today every guard drop unlinks the file, so this is the
-    /// live stress test of the core protocol that makes that safe:
+    /// robbed of a lock it legitimately acquired: a competitor that
+    /// flocked (or had merely *opened*) the file before an unlink keeps a
+    /// valid lock on the orphaned inode while a re-acquire locks a fresh
+    /// one — two live holders at once. Every guard drop unlinks the file,
+    /// so this is the live stress test of the core protocol that makes
+    /// that safe:
     /// unlink WHILE holding the lock, and re-check the locked handle's
     /// identity against the path after every successful lock.
     ///
@@ -566,8 +565,7 @@ mod tests {
         );
     }
 
-    /// The `--json` failure envelope (previously emitted only via
-    /// `println!`, so untested) has the stable error shape downstream
+    /// The `--json` failure envelope has the stable error shape downstream
     /// consumers pattern-match on: top-level `status: "error"` and
     /// `error.code` carrying the lock reason tag.
     #[test]

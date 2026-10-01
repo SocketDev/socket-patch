@@ -4,8 +4,7 @@
 //! Cargo registry layout.  They do **not** require network access or a real
 //! Cargo installation: the scan's patch lookup is pinned to an in-test
 //! [`wiremock`] public-proxy stand-in via `--proxy-url`. That pinning is
-//! load-bearing, not cosmetic — since the all-batches-failed fix, an
-//! unreachable API is a hard scan failure (exit 1, `status: "error"`), so an
+//! load-bearing, not cosmetic — an unreachable API is a hard scan failure (exit 1, `status: "error"`), so an
 //! unpinned scan would phone home to the live proxy on every test run and go
 //! red whenever the network (or an ambient `SOCKET_*` variable) misbehaved.
 //!
@@ -67,7 +66,6 @@ async fn run(args: &[&str], cwd: &Path, proxy_url: &str) -> Output {
             .env_remove("SOCKET_API_URL")
             .env_remove("SOCKET_OFFLINE")
             .env_remove("SOCKET_PROXY_URL")
-            .env_remove("SOCKET_PATCH_PROXY_URL")
             .env_remove("SOCKET_BATCH_SIZE")
             .output()
             .expect("Failed to run socket-patch binary")
@@ -110,11 +108,10 @@ async fn scan_json(cwd: &Path, proxy_url: &str) -> serde_json::Value {
     value
 }
 
-/// Regression guard for the hermeticity fix: every scan in a test must have
-/// routed its patch lookup through the in-test proxy. Fewer recorded requests
-/// than scans means at least one binary invocation talked to the live API (or
-/// skipped the lookup outright) despite the pinning — exactly the bug this
-/// file used to have.
+/// Hermeticity guard: every scan in a test must have routed its patch lookup
+/// through the in-test proxy. Fewer recorded requests than scans means at
+/// least one binary invocation talked to the live API (or skipped the lookup
+/// outright) despite the pinning.
 async fn assert_proxy_served_scans(server: &MockServer, scans: usize) {
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(
@@ -140,10 +137,9 @@ async fn scan_discovers_fake_registry_crates() {
     // The crawler only falls back to scanning the global `$CARGO_HOME`
     // registry when the cwd actually looks like a Rust project (has a
     // `Cargo.toml` / `Cargo.lock`). Without this manifest the registry path
-    // is never exercised and discovery silently returns zero — which the old
-    // `contains("packages")` assertion happily accepted via the
-    // "No packages found" message. Provide the manifest so the registry
-    // branch is genuinely taken.
+    // is never exercised and discovery silently returns zero (whose
+    // "No packages found" message a loose `contains("packages")` check would
+    // accept). Provide the manifest so the registry branch is genuinely taken.
     std::fs::write(
         dir.path().join("Cargo.toml"),
         "[package]\nname = \"myapp\"\nversion = \"0.1.0\"\n",
@@ -185,9 +181,8 @@ async fn scan_discovers_fake_registry_crates() {
 
     // --- Human path: the count must be attributed to the *cargo* ecosystem,
     // proving the registry crawler (not some accidental npm/pypi pickup) is
-    // what found them. This also guards against the old loophole where the
-    // failure message "No packages found" satisfied a `contains("packages")`
-    // check.
+    // what found them (a bare `contains("packages")` would also match the
+    // "No packages found" failure message).
     let output = run(
         &["scan", "--cwd", dir.path().to_str().unwrap()],
         dir.path(),
@@ -249,7 +244,7 @@ async fn scan_discovers_vendor_crates() {
     );
 
     // --- Human path: the discovery must be attributed to the cargo ecosystem,
-    // and must NOT report "No packages found" (the old loophole).
+    // and must NOT report "No packages found".
     let output = run(
         &["scan", "--cwd", dir.path().to_str().unwrap()],
         dir.path(),

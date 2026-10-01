@@ -1,31 +1,25 @@
 //! Shared patch-source staging for the mutating commands (`apply`, `vendor`).
 //!
-//! Resolves where the patch pipeline should read blob/diff/package artifacts
-//! from, downloading what's missing into a transient overlay tempdir. The
-//! persistent `.socket/{blobs,diffs,packages}` cache is only ever *read* —
+//! Resolves where the patch pipeline should read blob/diff artifacts from,
+//! downloading what's missing into a transient overlay tempdir. The
+//! persistent `.socket/{blobs,diffs}` cache is only ever *read* —
 //! downloads land in the tempdir and are discarded when it drops (filling the
 //! cache is `repair`'s job, keeping these commands read-only against
 //! `.socket/`).
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use futures_util::StreamExt;
 use socket_patch_core::api::blob_fetcher::{
     fetch_missing_blobs, fetch_missing_sources, get_missing_archives, get_missing_blobs,
     DownloadMode, FetchMissingBlobsResult,
 };
-use socket_patch_core::api::client::{get_api_client_with_overrides, hold_back_debug, ApiClient};
-use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
-use socket_patch_core::patch::apply::{is_valid_blob_hash, PatchSources};
-use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
+use socket_patch_core::api::client::ApiClient;
+use socket_patch_core::manifest::schema::PatchManifest;
+use socket_patch_core::patch::apply::PatchSources;
 use tempfile::TempDir;
 
-use super::get::base64_decode;
 use crate::args::GlobalArgs;
-use crate::commands::bun_preflight::LedgerLoad;
-use crate::json_envelope::{Envelope, PatchAction, PatchEvent};
 use crate::ui::{plural, StatusLine};
 
 /// Resolved artifact locations for the patch pipeline. Holds the overlay
@@ -33,7 +27,6 @@ use crate::ui::{plural, StatusLine};
 pub(crate) struct StagedSources {
     pub(crate) blobs: PathBuf,
     diffs: PathBuf,
-    packages: PathBuf,
     _stage: Option<TempDir>,
 }
 
@@ -42,7 +35,6 @@ impl StagedSources {
     pub(crate) fn as_patch_sources(&self) -> PatchSources<'_> {
         PatchSources {
             blobs_path: &self.blobs,
-            packages_path: Some(&self.packages),
             diffs_path: Some(&self.diffs),
             mem_blobs: None,
         }
@@ -81,14 +73,6 @@ pub(crate) enum StageOutcome {
 /// The disk stager's remedy: `repair` fills the persistent `.socket/`
 /// cache `apply` reads from.
 const APPLY_OFFLINE_REMEDY: &str = "Run `socket-patch repair` to download missing artifacts.";
-
-/// The memory stager's remedy. Vendored content is fetched into memory and
-/// never lands under `.socket/`; sending a vendored project to `repair`
-/// instead would populate `.socket/blobs/` — exactly the residue vendored
-/// mode promises not to leave (and from inside `repair --offline` the hint
-/// was self-referential).
-const VENDOR_OFFLINE_REMEDY: &str = "Re-run without --offline to fetch the missing patch \
-                                     content (kept in memory; nothing is written under .socket/).";
 
 /// Shared offline diagnostic: patches with no usable local source while
 /// `--offline` is set (first five PURLs, then the caller's `remedy` line).
@@ -175,19 +159,14 @@ fn format_fetch_failures(result: &FetchMissingBlobsResult, (one, many): Noun) ->
     lines
 }
 
+/// The disk stager's status line while it downloads what `.socket/` lacks.
+const DOWNLOADING_ARTIFACTS: &str = "Downloading missing patch artifacts...";
+
 /// Announce the per-file blob top-up that follows a diff-mode fetch. It
 /// runs even when every diff archive arrived — a diff cannot patch a file
 /// whose bytes differ from `beforeHash`, and the pipeline then falls back
 /// to the blob — so it is worded as a complement, not a failure, unless
 /// some archives really were unavailable.
-/// The disk stager's status line while it downloads what `.socket/` lacks.
-const DOWNLOADING_ARTIFACTS: &str = "Downloading missing patch artifacts...";
-
-/// The in-memory stager's status line while it fetches patch views.
-fn format_fetching_content(n: usize) -> String {
-    format!("Fetching content for {}...", plural(n, "patch", "patches"))
-}
-
 fn format_blob_fallback(diff_failed: usize, blobs: usize) -> String {
     let blobs = plural(blobs, "per-file blob", "per-file blobs");
     if diff_failed == 0 {
@@ -201,10 +180,10 @@ fn format_blob_fallback(diff_failed: usize, blobs: usize) -> String {
 }
 
 /// The manifest PURLs with no usable local source. A patch is "locally
-/// applicable" iff at least one of:
-///   - every `after_hash` blob it references is on disk, OR
-///   - its diff archive is on disk, OR
-///   - its package archive is on disk.
+/// applicable" iff every file it touches has its `after_hash` blob on
+/// disk or is covered by the patch's diff archive. A diff covers only files
+/// that exist before the patch: a created file (empty `before_hash`) has
+/// nothing to diff against, so it always needs its blob.
 ///
 /// The patch pipeline picks whichever is present per file. Shared by the
 /// offline gate (probed against `.socket/`) and the post-download gate
@@ -213,25 +192,50 @@ fn patches_without_source<'m>(
     manifest: &'m PatchManifest,
     missing_blobs: &HashSet<String>,
     missing_diff_archives: &HashSet<String>,
-    missing_package_archives: &HashSet<String>,
 ) -> Vec<&'m str> {
     manifest
         .patches
         .iter()
         .filter_map(|(purl, record)| {
-            let all_blobs_present = record
-                .files
-                .values()
-                .all(|f| !missing_blobs.contains(&f.after_hash));
             let diff_present = !missing_diff_archives.contains(&record.uuid);
-            let pkg_present = !missing_package_archives.contains(&record.uuid);
-            if all_blobs_present || diff_present || pkg_present {
+            let files_covered = record.files.values().all(|f| {
+                !missing_blobs.contains(&f.after_hash)
+                    || (diff_present && !f.before_hash.is_empty())
+            });
+            if files_covered {
                 None
             } else {
                 Some(purl.as_str())
             }
         })
         .collect()
+}
+
+/// `manifest` cut down to the files a diff archive cannot patch (created
+/// files, whose `before_hash` is empty): the blobs a diff-mode fetch still
+/// needs even when every diff archive is present.
+pub(crate) fn files_diffs_cannot_cover(manifest: &PatchManifest) -> PatchManifest {
+    let patches = manifest
+        .patches
+        .iter()
+        .filter_map(|(purl, record)| {
+            let files: HashMap<_, _> = record
+                .files
+                .iter()
+                .filter(|(_, f)| f.before_hash.is_empty())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            (!files.is_empty()).then(|| {
+                let mut record = record.clone();
+                record.files = files;
+                (purl.clone(), record)
+            })
+        })
+        .collect();
+    PatchManifest {
+        patches,
+        setup: manifest.setup.clone(),
+    }
 }
 
 /// Mirror `src`'s files into `dst` by hardlink (copy fallback). Pre-seeds the
@@ -276,7 +280,6 @@ pub(crate) async fn stage_patch_sources(
     let quiet = common.silent || common.json;
     let socket_blobs_path = socket_dir.join("blobs");
     let socket_diffs_path = socket_dir.join("diffs");
-    let socket_packages_path = socket_dir.join("packages");
 
     let download_mode = DownloadMode::parse(&common.download_mode).map_err(|e| e.to_string())?;
 
@@ -285,14 +288,8 @@ pub(crate) async fn stage_patch_sources(
     // on disk. These probes are read-only.
     let missing_blobs = get_missing_blobs(manifest, &socket_blobs_path).await;
     let missing_diff_archives = get_missing_archives(manifest, &socket_diffs_path).await;
-    let missing_package_archives = get_missing_archives(manifest, &socket_packages_path).await;
 
-    let no_source_purls = patches_without_source(
-        manifest,
-        &missing_blobs,
-        &missing_diff_archives,
-        &missing_package_archives,
-    );
+    let no_source_purls = patches_without_source(manifest, &missing_blobs, &missing_diff_archives);
 
     if common.offline {
         // Offline: bail only if some patch has no usable local source.
@@ -307,24 +304,24 @@ pub(crate) async fn stage_patch_sources(
 
     // Decide what (if anything) needs downloading.
     //
-    // The patch pipeline tries sources in the order package → diff → blob
+    // The patch pipeline tries sources in the order diff → blob
     // locally. We honor `--download-mode` for the primary fetch when there's
     // actually a gap to close. Skip the archive fetch entirely when all file
     // blobs are already present locally — the pipeline will succeed via the
-    // blob path, and the archive endpoints would just 404 (current server
-    // doesn't serve them yet).
+    // blob path, so an archive fetch would be wasted round-trips. Cached
+    // diff archives can still leave a patch uncovered (a created file), and
+    // the blob top-up below closes that gap.
     let download_needed = !common.offline
         && match download_mode {
             DownloadMode::File => !missing_blobs.is_empty(),
             DownloadMode::Diff if missing_blobs.is_empty() => false,
-            DownloadMode::Diff => !missing_diff_archives.is_empty(),
+            DownloadMode::Diff => !missing_diff_archives.is_empty() || !no_source_purls.is_empty(),
         };
 
     if !download_needed {
         return Ok(StageOutcome::Ready(StagedSources {
             blobs: socket_blobs_path,
             diffs: socket_diffs_path,
-            packages: socket_packages_path,
             _stage: None,
         }));
     }
@@ -337,17 +334,15 @@ pub(crate) async fn stage_patch_sources(
     let staged = StagedSources {
         blobs: stage.path().join("blobs"),
         diffs: stage.path().join("diffs"),
-        packages: stage.path().join("packages"),
         _stage: Some(stage),
     };
-    for dir in [&staged.blobs, &staged.diffs, &staged.packages] {
+    for dir in [&staged.blobs, &staged.diffs] {
         tokio::fs::create_dir_all(dir)
             .await
             .map_err(|e| e.to_string())?;
     }
     overlay_dir(&socket_blobs_path, &staged.blobs).await;
     overlay_dir(&socket_diffs_path, &staged.diffs).await;
-    overlay_dir(&socket_packages_path, &staged.packages).await;
 
     // Progress: a transient status line on stderr (stdout is data); the
     // result lines below are what stays on screen.
@@ -375,15 +370,25 @@ pub(crate) async fn stage_patch_sources(
     // For non-file modes, automatically fetch any still-missing file blobs as
     // a fallback. Patches that lack the requested mode on the server will
     // still apply via the legacy blob path.
+    //
+    // With every diff archive already cached, only the files no diff can
+    // patch are fetched: that is the gap that triggered this download.
     let mut blob_fetch_failed = false;
     if download_mode != DownloadMode::File {
-        let still_missing_blobs = get_missing_blobs(manifest, &staged.blobs).await;
+        let created_only;
+        let blob_scope = if missing_diff_archives.is_empty() {
+            created_only = files_diffs_cannot_cover(manifest);
+            &created_only
+        } else {
+            manifest
+        };
+        let still_missing_blobs = get_missing_blobs(blob_scope, &staged.blobs).await;
         if !still_missing_blobs.is_empty() {
             status.set(format_blob_fallback(
                 fetch_result.failed,
                 still_missing_blobs.len(),
             ));
-            let blob_result = fetch_missing_blobs(manifest, &staged.blobs, client, None).await;
+            let blob_result = fetch_missing_blobs(blob_scope, &staged.blobs, client, None).await;
             status.finish();
             if !quiet {
                 for line in format_fetch_summary(&blob_result, BLOB, true) {
@@ -397,19 +402,11 @@ pub(crate) async fn stage_patch_sources(
     // Download failures only matter per patch: bail iff some patch is left
     // with no usable source at the staged paths — the same coverage rule as
     // the offline gate. Aggregate counters can't decide this (a patch whose
-    // diff failed may be covered by its blobs and vice versa, and a local
-    // package archive covers its patch even though packages are never
-    // downloaded).
+    // diff failed may be covered by its blobs and vice versa).
     if fetch_result.failed > 0 || blob_fetch_failed {
         let missing_blobs = get_missing_blobs(manifest, &staged.blobs).await;
         let missing_diff_archives = get_missing_archives(manifest, &staged.diffs).await;
-        let missing_package_archives = get_missing_archives(manifest, &staged.packages).await;
-        let uncovered = patches_without_source(
-            manifest,
-            &missing_blobs,
-            &missing_diff_archives,
-            &missing_package_archives,
-        );
+        let uncovered = patches_without_source(manifest, &missing_blobs, &missing_diff_archives);
         if !uncovered.is_empty() {
             // An error, not progress chatter: prints even under --silent
             // (same rule as report_offline_missing above).
@@ -438,407 +435,11 @@ pub(crate) async fn stage_patch_sources(
 /// `.socket/blobs` entries and no temporary files. The committed
 /// `.socket/vendor/` artifact is the patch; nothing else should land on
 /// disk.
-pub(crate) struct MemStagedSources {
-    blobs: PathBuf,
-    diffs: PathBuf,
-    packages: PathBuf,
-    mem: HashMap<String, Vec<u8>>,
-    /// The purls this staging could NOT obtain patch content for, each with
-    /// the reason, while at least one other patch staged fine. Each is an
-    /// unsatisfiable package the caller reports per-package (and leaves out
-    /// of the engine run) — see [`stage_vendor_sources_in_memory`]. Sorted
-    /// by purl, so the per-package reports come out in the same order every
-    /// run.
-    unavailable: Vec<(String, String)>,
-}
-
-impl MemStagedSources {
-    /// Borrow as the core pipeline's source set (memory overlay first,
-    /// on-disk artifacts as the read-only fallback).
-    pub(crate) fn as_patch_sources(&self) -> PatchSources<'_> {
-        PatchSources {
-            blobs_path: &self.blobs,
-            packages_path: Some(&self.packages),
-            diffs_path: Some(&self.diffs),
-            mem_blobs: Some(&self.mem),
-        }
-    }
-
-    /// See [`MemStagedSources::unavailable`].
-    pub(crate) fn unavailable(&self) -> &[(String, String)] {
-        &self.unavailable
-    }
-}
-
-/// The in-memory staging outcome (mirror of [`StageOutcome`]).
-pub(crate) enum MemStageOutcome {
-    Ready(MemStagedSources),
-    Unavailable,
-}
-
-/// Does vendoring this file need the patch's after-BLOB?
-///
-/// No, when the patch does not change it (`beforeHash == afterHash`): the
-/// pristine copy already carries the patched bytes, and the apply pipeline
-/// answers `AlreadyPatched` for it without writing anything. The patch view
-/// says the same thing by serving such a file with hashes and no
-/// `blobContent`, so treating it as a failed fetch made any patch with a
-/// zero-delta file permanently unvendorable.
-fn needs_blob(file: &PatchFileInfo) -> bool {
-    file.before_hash != file.after_hash
-}
-
-/// Stage patch sources for a VENDOR run without writing anything:
-/// a record is locally satisfied when all its after-blobs are on disk or
-/// a package archive is (a diff archive is NOT sufficient — vendor's
-/// auto-force policy can need the full after-blob for files a diff cannot
-/// reproduce); anything else has its full per-file content fetched into
-/// memory from the patch view endpoint (`blobContent`), preceded by the
-/// committed-artifact harvest. Offline runs with missing sources are
-/// `Unavailable` with the same diagnostics as the disk stager. Unlike the
-/// disk stager there is no hard-failure mode (no download-mode parse, no
-/// tempdir), so this returns the outcome directly — every failure is the
-/// soft `Unavailable`.
-///
-/// A patch whose content the VIEW cannot supply (a 404, a transport error,
-/// or a file the server serves with no `blobContent` — which is how it
-/// serves a zero-delta file, `beforeHash == afterHash`) is an unsatisfiable
-/// PACKAGE, not a broken run: its purl comes back in
-/// [`MemStagedSources::unavailable`] for the caller to report per-package,
-/// and the patches that did stage still run. `Unavailable` is reserved for
-/// the case it was written for — NOTHING in the manifest can be staged, so
-/// there are no per-package events to report and the caller's pre-event
-/// `no_local_source` error is the whole story.
-///
-/// `ledger` is the caller's single `load_state` outcome (the harvest reads
-/// the committed artifacts it names; an unreadable ledger harvests
-/// nothing). `seed` pre-populates the in-memory blob set — the vendored
-/// download phase already holds every fetched view's `blobContent`, so a
-/// fresh `scan`/`get --mode vendored` never fetches a view a second time
-/// here; manifest-driven callers pass an empty map. `client` is the run's
-/// one API client (every CLI caller has one — building another here
-/// repeated its token advisory and org-slug round-trip, under the apply
-/// lock in `vendor`'s case); `None` builds one on demand, only once a fetch
-/// is actually needed (the unit tests' offline arms never get that far).
-pub(crate) async fn stage_vendor_sources_in_memory(
-    common: &GlobalArgs,
-    manifest: &PatchManifest,
-    socket_dir: &Path,
-    project_root: &Path,
-    ledger: LedgerLoad<'_>,
-    seed: HashMap<String, Vec<u8>>,
-    client: Option<&ApiClient>,
-) -> MemStageOutcome {
-    let blobs = socket_dir.join("blobs");
-    let diffs = socket_dir.join("diffs");
-    let packages = socket_dir.join("packages");
-
-    let missing_blobs = get_missing_blobs(manifest, &blobs).await;
-    let missing_package_archives = get_missing_archives(manifest, &packages).await;
-    let mut mem = seed;
-    let mut unavailable: Vec<(String, String)> = Vec::new();
-
-    // A diff archive alone is NOT a sufficient source here, unlike the disk
-    // stager: vendoring runs the auto-force policy, where a beforeHash
-    // mismatch (already-applied tree, patch built against different bytes)
-    // is overwritten with the FULL after-blob — which a diff cannot
-    // produce. On-disk diffs still serve Strategy 2 for clean files; the
-    // after-blob content must additionally exist (disk, seed/harvest, or
-    // fetch).
-    //
-    // …for the files the patch CHANGES. A ZERO-DELTA file
-    // (`beforeHash == afterHash`) is already at its patched content in the
-    // pristine copy — `verify_file_patch` answers `AlreadyPatched` as soon
-    // as the on-disk hash equals `afterHash` — so it needs no blob, which
-    // is exactly why the view serves it with hashes and no `blobContent`.
-    // Demanding it made such a patch permanently unvendorable (JS-7:
-    // `pkg:npm/tar-fs@2.1.1`, seven zero-delta fixture files). This
-    // predicate is the AUTHORITY the fetch loop below agrees with, so the
-    // two can never disagree about which files a fetch must bring back.
-    let covered = |record: &PatchRecord, mem: &HashMap<String, Vec<u8>>| {
-        record.files.values().all(|f| {
-            !needs_blob(f)
-                || !missing_blobs.contains(&f.after_hash)
-                || mem.contains_key(&f.after_hash)
-        }) || !missing_package_archives.contains(&record.uuid)
-    };
-    let mut to_fetch: Vec<(&str, &str)> = manifest
-        .patches
-        .iter()
-        .filter(|(_, record)| !covered(record, &mem))
-        .map(|(purl, record)| (purl.as_str(), record.uuid.as_str()))
-        .collect();
-
-    if !to_fetch.is_empty() {
-        // The committed vendor artifact IS the patched content: harvest its
-        // afterHash blobs into memory so in-sync re-runs and fresh clones of
-        // already-vendored projects stage with no network and no disk blobs.
-        // Harvested bytes are hash-verified, so they win over a same-hash
-        // seed entry.
-        if let Ok(entries) = ledger {
-            mem.extend(
-                socket_patch_core::vendor::harvest_artifact_blobs_from(
-                    project_root,
-                    entries,
-                    &manifest.patches,
-                )
-                .await,
-            );
-        }
-        to_fetch.retain(|(purl, _)| {
-            manifest
-                .patches
-                .get(*purl)
-                .is_none_or(|record| !covered(record, &mem))
-        });
-    }
-
-    if !to_fetch.is_empty() {
-        if common.offline {
-            let purls: Vec<&str> = to_fetch.iter().map(|(purl, _)| *purl).collect();
-            report_offline_missing(common, &purls, VENDOR_OFFLINE_REMEDY);
-            return MemStageOutcome::Unavailable;
-        }
-
-        let mut status = StatusLine::stderr(common.json, common.silent);
-        status.set(format_fetching_content(to_fetch.len()));
-
-        let built;
-        let client = match client {
-            Some(client) => client,
-            None => {
-                built = get_api_client_with_overrides(common.api_client_overrides())
-                    .await
-                    .0;
-                &built
-            }
-        };
-        // Each dropped purl with WHY it was dropped. The reason is the only
-        // machine-readable explanation the caller can put in that package's
-        // `failed` event, and the human `[error]` lines below are printed
-        // exclusively under `!--json` — so without it a `--json` consumer
-        // learned nothing about which file was contentless.
-        let mut failed: Vec<(&str, String)> = Vec::new();
-        // The views are fetched concurrently (at most `api_concurrency` in
-        // flight) but consumed in `to_fetch` order, each request's `--debug`
-        // lines released at its turn, so `mem`, `failed` and every error
-        // line fold exactly as the serial loop's did.
-        let mut views = std::pin::pin!(ordered_concurrent(
-            to_fetch.iter(),
-            api_concurrency_for(client.uses_public_proxy(), to_fetch.len()),
-            |(_, uuid)| async move { (*uuid, hold_back_debug(client.fetch_patch(uuid)).await) },
-        ));
-        for (i, (purl, uuid)) in to_fetch.iter().enumerate() {
-            if to_fetch.len() > 1 {
-                status.set(format!(
-                    "{} ({}/{})",
-                    format_fetching_content(to_fetch.len()),
-                    i + 1,
-                    to_fetch.len()
-                ));
-            }
-            // The record is what `covered` above judged, so it is also what
-            // decides which of this view's files actually need bytes.
-            let record = manifest.patches.get(*purl);
-            let view = match views.next().await {
-                Some((planned, view)) if planned == *uuid => view.release(),
-                // Unreachable: the plan IS this list. Falling back to the
-                // live request keeps the staging COMPLETE if the two ever
-                // fall out of step — running dry here would otherwise
-                // return `Ready` with blobs missing and nothing in
-                // `failed`.
-                _ => {
-                    debug_assert!(false, "view prefetch plan out of step with the fetch list");
-                    client.fetch_patch(uuid).await
-                }
-            };
-            match view {
-                Ok(Some(patch)) => {
-                    // Named so the per-file report is the same on every run:
-                    // `patch.files` is a `HashMap`, so "the first file with
-                    // no content" is otherwise bucket order.
-                    let mut contentless: Vec<&str> = Vec::new();
-                    let mut malformed: Option<String> = None;
-                    for (file, info) in &patch.files {
-                        let Some(b64) = &info.blob_content else {
-                            // A zero-delta file is served without content
-                            // because it needs none (see `covered` above).
-                            // Anything else the patch changes is genuinely
-                            // unsatisfiable — collect them all rather than
-                            // abandoning the view's remaining files in
-                            // `HashMap` order.
-                            if record
-                                .and_then(|r| r.files.get(file))
-                                .is_some_and(|f| !needs_blob(f))
-                            {
-                                continue;
-                            }
-                            contentless.push(file);
-                            continue;
-                        };
-                        let Some(hash) = &info.after_hash else {
-                            malformed =
-                                Some(format!("the patch view served no afterHash for {file}"));
-                            break;
-                        };
-                        // Same key guard as the disk writer: the hash names the
-                        // lookup key the apply pipeline gates writes on.
-                        if !is_valid_blob_hash(hash) {
-                            malformed = Some(format!(
-                                "the patch view served an invalid afterHash for {file}"
-                            ));
-                            break;
-                        }
-                        match base64_decode(b64) {
-                            Ok(bytes) => {
-                                mem.insert(hash.clone(), bytes);
-                            }
-                            Err(_) => {
-                                malformed = Some(format!(
-                                    "the patch view served undecodable blob content for {file}"
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                    contentless.sort_unstable();
-                    // An error, not progress chatter: prints even under
-                    // --silent (same rule as report_offline_missing above).
-                    if !common.json {
-                        for file in &contentless {
-                            status.println(format!(
-                                "  [error] {purl}: no blob content served for {file}"
-                            ));
-                        }
-                    }
-                    if let Some(reason) = malformed.or_else(|| contentless_reason(&contentless)) {
-                        failed.push((purl, reason));
-                    }
-                }
-                Ok(None) => failed.push((purl, format!("no patch view is served for {uuid}"))),
-                Err(e) => failed.push((purl, format!("the patch view could not be fetched: {e}"))),
-            }
-        }
-        status.finish();
-        if !failed.is_empty() {
-            // An error, not progress chatter: the vendor caller only marks
-            // the envelope (printed exclusively under --json), so muting
-            // this under --silent meant exit 1 with zero output — the
-            // CLI_CONTRACT violation ("errors only", NEVER nothing) fixed
-            // for the disk stager's arms above. It stays the ONE human
-            // channel for these purls in both arms below: the per-package
-            // arm only records events.
-            if !common.json {
-                let purls: Vec<&str> = failed.iter().map(|(purl, _)| *purl).collect();
-                eprintln!(
-                    "Error: Could not fetch patch content for {}:",
-                    plural(failed.len(), "patch", "patches")
-                );
-                for line in format_purl_list(&purls, 5) {
-                    eprintln!("{line}");
-                }
-            }
-            // Nothing in the manifest is usable ⇒ the pre-event bail (no
-            // events to report). Otherwise these purls are unsatisfiable
-            // packages the caller reports one by one, and the rest of the
-            // run continues.
-            if failed.len() == manifest.patches.len() {
-                return MemStageOutcome::Unavailable;
-            }
-            unavailable = failed
-                .into_iter()
-                .map(|(purl, reason)| (purl.to_string(), reason))
-                .collect();
-            unavailable.sort();
-        }
-    }
-
-    MemStageOutcome::Ready(MemStagedSources {
-        blobs,
-        diffs,
-        packages,
-        mem,
-        unavailable,
-    })
-}
-
-/// Record the per-package `failed` event for every purl
-/// [`stage_vendor_sources_in_memory`] could not obtain patch content for,
-/// and hand back the records the run can still vendor. `true` when at least
-/// one purl was dropped (the run has errors). Borrows `records` untouched
-/// on the overwhelmingly common empty path.
-pub(crate) fn drop_unstageable<'a>(
-    env: &mut Envelope,
-    records: &'a HashMap<String, PatchRecord>,
-    unavailable: &[(String, String)],
-) -> (Cow<'a, HashMap<String, PatchRecord>>, bool) {
-    if unavailable.is_empty() {
-        return (Cow::Borrowed(records), false);
-    }
-    for (purl, reason) in unavailable {
-        env.record(
-            PatchEvent::new(PatchAction::Failed, purl.clone())
-                .with_error("no_local_source", reason.clone()),
-        );
-    }
-    let mut kept = records.clone();
-    kept.retain(|purl, _| !unavailable.iter().any(|(dropped, _)| dropped == purl));
-    (Cow::Owned(kept), true)
-}
-
-/// The reason string for a view that came back missing the blob content of
-/// `contentless` (already sorted). `None` when nothing was missing.
-fn contentless_reason(contentless: &[&str]) -> Option<String> {
-    let (first, rest) = contentless.split_first()?;
-    Some(match rest.len() {
-        0 => format!("the patch view served no blob content for {first}"),
-        n => format!(
-            "the patch view served no blob content for {first} (and {n} more file{})",
-            if n == 1 { "" } else { "s" }
-        ),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use socket_patch_core::api::client::get_api_client_with_overrides;
 
-    /// The per-package `no_local_source` detail is the ONE machine-readable
-    /// explanation a `--json` consumer gets (every human channel in the
-    /// stager is gated on `!--json`), so its wording is pinned here —
-    /// including the count, which `plural` already carries.
-    #[test]
-    fn contentless_reason_names_the_file_and_counts_the_rest() {
-        assert_eq!(contentless_reason(&[]), None);
-        assert_eq!(
-            contentless_reason(&["package/index.js"]).as_deref(),
-            Some("the patch view served no blob content for package/index.js")
-        );
-        assert_eq!(
-            contentless_reason(&["a.js", "b.js"]).as_deref(),
-            Some("the patch view served no blob content for a.js (and 1 more file)")
-        );
-        assert_eq!(
-            contentless_reason(&["a.js", "b.js", "c.js"]).as_deref(),
-            Some("the patch view served no blob content for a.js (and 2 more files)")
-        );
-    }
-
-    #[test]
-    fn progress_lines_name_no_internal_tags() {
-        assert_eq!(
-            DOWNLOADING_ARTIFACTS,
-            "Downloading missing patch artifacts..."
-        );
-        assert_eq!(
-            format_fetching_content(1),
-            "Fetching content for 1 patch..."
-        );
-        assert_eq!(
-            format_fetching_content(3),
-            "Fetching content for 3 patches..."
-        );
-    }
     use socket_patch_core::manifest::schema::{PatchFileInfo, PatchRecord};
 
     const UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -973,12 +574,12 @@ mod tests {
         );
     }
 
-    /// The vendor (in-memory) stager documents the opposite policy: a diff
-    /// archive is NOT sufficient (auto-force can need the full after-blob),
-    /// so the same fixture that satisfies the disk stager is Unavailable
-    /// offline here. Pins the asymmetry both module docs describe.
+    /// A diff archive cannot patch a file the patch creates (nothing to diff
+    /// against), so it covers such a patch only together with the created
+    /// file's blob: without it, offline staging is Unavailable up front
+    /// instead of passing the gate and failing mid-apply.
     #[tokio::test]
-    async fn mem_stage_offline_rejects_diff_archive_as_sole_source() {
+    async fn stage_offline_diff_archive_does_not_cover_a_created_file() {
         let tmp = tempfile::tempdir().unwrap();
         let socket_dir = tmp.path().join(".socket");
         std::fs::create_dir_all(socket_dir.join("diffs")).unwrap();
@@ -987,70 +588,7 @@ mod tests {
             b"x",
         )
         .unwrap();
-        let project_root = tmp.path().join("proj");
-        std::fs::create_dir_all(&project_root).unwrap();
-
-        let outcome = stage_vendor_sources_in_memory(
-            &offline_args(),
-            &manifest_with_one_patch(),
-            &socket_dir,
-            &project_root,
-            Ok(&HashMap::new()),
-            HashMap::new(),
-            None,
-        )
-        .await;
-        assert!(
-            matches!(outcome, MemStageOutcome::Unavailable),
-            "vendor staging must not treat a diff archive as a usable source"
-        );
-    }
-
-    /// The download phase's blob seed IS a source: with every after-hash
-    /// seeded, an offline run with no disk blobs, no archives and no
-    /// committed artifact is Ready and stages the seeded bytes (no fetch,
-    /// no harvest needed) — the vendored flows never fetch a view twice.
-    #[tokio::test]
-    async fn mem_stage_seeded_blobs_are_ready_offline_without_any_disk_source() {
-        let tmp = tempfile::tempdir().unwrap();
-        let socket_dir = tmp.path().join(".socket");
-        let project_root = tmp.path().join("proj");
-        std::fs::create_dir_all(&project_root).unwrap();
-        let seed: HashMap<String, Vec<u8>> = [(HASH.to_string(), b"seeded".to_vec())].into();
-
-        let outcome = stage_vendor_sources_in_memory(
-            &offline_args(),
-            &manifest_with_one_patch(),
-            &socket_dir,
-            &project_root,
-            Ok(&HashMap::new()),
-            seed,
-            None,
-        )
-        .await;
-        let MemStageOutcome::Ready(staged) = outcome else {
-            panic!("a fully seeded stage must be Ready");
-        };
-        assert_eq!(
-            staged.mem.get(HASH).map(Vec::as_slice),
-            Some(&b"seeded"[..]),
-            "the seeded bytes are the staged content"
-        );
-        assert!(
-            !socket_dir.exists(),
-            "in-memory staging must not create .socket/"
-        );
-    }
-
-    /// A seed covering only SOME hashes still leaves the rest to the
-    /// ladder: offline with nothing else, the record is Unavailable (the
-    /// seed is merged, never treated as complete coverage).
-    #[tokio::test]
-    async fn mem_stage_partial_seed_still_needs_the_missing_hash() {
-        let tmp = tempfile::tempdir().unwrap();
-        let socket_dir = tmp.path().join(".socket");
-        let project_root = tmp.path().join("proj");
-        std::fs::create_dir_all(&project_root).unwrap();
+        let created = "c".repeat(64);
         let mut manifest = manifest_with_one_patch();
         manifest
             .patches
@@ -1058,51 +596,46 @@ mod tests {
             .unwrap()
             .files
             .insert(
-                "other.js".to_string(),
+                "new.js".to_string(),
                 PatchFileInfo {
-                    before_hash: "d".repeat(64),
-                    after_hash: "e".repeat(64),
+                    before_hash: String::new(),
+                    after_hash: created.clone(),
                 },
             );
-        let seed: HashMap<String, Vec<u8>> = [(HASH.to_string(), b"seeded".to_vec())].into();
 
-        let outcome = stage_vendor_sources_in_memory(
-            &offline_args(),
-            &manifest,
-            &socket_dir,
-            &project_root,
-            Ok(&HashMap::new()),
-            seed,
-            None,
-        )
-        .await;
+        let outcome =
+            stage_patch_sources(&offline_args(), &manifest, &socket_dir, &offline_client())
+                .await
+                .expect("no hard failure");
+        assert!(matches!(outcome, StageOutcome::Unavailable));
+
+        std::fs::create_dir_all(socket_dir.join("blobs")).unwrap();
+        std::fs::write(socket_dir.join("blobs").join(&created), b"new").unwrap();
+        let outcome =
+            stage_patch_sources(&offline_args(), &manifest, &socket_dir, &offline_client())
+                .await
+                .expect("no hard failure");
         assert!(
-            matches!(outcome, MemStageOutcome::Unavailable),
-            "one seeded hash out of two is not coverage"
+            matches!(outcome, StageOutcome::Ready(_)),
+            "diff for the modified file + blob for the created one covers the patch"
         );
     }
 
-    /// An unreadable ledger (`Err`) harvests nothing — and is not an
-    /// error here: the caller reports the corrupt ledger itself.
-    #[tokio::test]
-    async fn mem_stage_unreadable_ledger_skips_the_harvest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let socket_dir = tmp.path().join(".socket");
-        let project_root = tmp.path().join("proj");
-        std::fs::create_dir_all(&project_root).unwrap();
-        let err = std::io::Error::other("corrupt state.json");
-
-        let outcome = stage_vendor_sources_in_memory(
-            &offline_args(),
-            &manifest_with_one_patch(),
-            &socket_dir,
-            &project_root,
-            Err(&err),
-            HashMap::new(),
-            None,
-        )
-        .await;
-        assert!(matches!(outcome, MemStageOutcome::Unavailable));
+    #[test]
+    fn files_diffs_cannot_cover_keeps_only_created_files() {
+        let mut manifest = manifest_with_one_patch();
+        assert!(files_diffs_cannot_cover(&manifest).patches.is_empty());
+        let record = manifest.patches.get_mut("pkg:npm/left-pad@1.3.0").unwrap();
+        record.files.insert(
+            "new.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: "c".repeat(64),
+            },
+        );
+        let cut = files_diffs_cannot_cover(&manifest);
+        let files: Vec<&String> = cut.patches["pkg:npm/left-pad@1.3.0"].files.keys().collect();
+        assert_eq!(files, ["new.js"]);
     }
 
     /// GlobalArgs wired to a guaranteed-unreachable API endpoint: explicit
@@ -1124,14 +657,10 @@ mod tests {
         }
     }
 
-    /// A local package archive is a usable source (the pipeline's Strategy 1,
-    /// and exactly what the offline gate rules), so an online run whose
-    /// downloads all fail must still be Ready when the package archive covers
-    /// every patch. Regression: the failure gate used aggregate fetch
-    /// counters and never consulted package archives, so this cache state was
-    /// Unavailable online while succeeding with --offline.
+    /// A leftover legacy `.socket/packages/<uuid>.tar.gz` is not a source:
+    /// nothing reads it, so it must not mask failed downloads.
     #[tokio::test]
-    async fn stage_online_fetch_failure_accepts_local_package_archive() {
+    async fn stage_online_fetch_failure_ignores_legacy_package_archive() {
         let tmp = tempfile::tempdir().unwrap();
         let socket_dir = tmp.path().join(".socket");
         std::fs::create_dir_all(socket_dir.join("packages")).unwrap();
@@ -1151,8 +680,8 @@ mod tests {
         .await
         .expect("no hard failure");
         assert!(
-            matches!(outcome, StageOutcome::Ready(_)),
-            "a local package archive covers the patch even when every download fails"
+            matches!(outcome, StageOutcome::Unavailable),
+            "a legacy package archive must not cover the patch"
         );
     }
 

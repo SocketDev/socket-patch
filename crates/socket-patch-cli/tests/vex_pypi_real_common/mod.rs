@@ -360,6 +360,8 @@ pub struct RealApi {
 
 impl RealApi {
     pub fn start(uuid: &str, pristine: &[u8], patched: &[u8]) -> Self {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha512};
         use wiremock::matchers::{method, path, path_regex};
         use wiremock::{Mock, ResponseTemplate};
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -369,6 +371,10 @@ impl RealApi {
             .unwrap();
         let server = rt.block_on(wiremock::MockServer::start());
         let wheel = build_wheel(patched);
+        let wheel_sha512 = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&wheel))
+        );
         let api = RealApi {
             rt,
             server,
@@ -405,7 +411,8 @@ impl RealApi {
                     "results": { uuid: {
                         "status": "granted", "url": url, "purl": PURL,
                         "artifacts": [{ "kind": "tarball", "url": url,
-                                        "integrity": { "sha256": api.wheel_sha256 } }],
+                                        "integrity": { "sha256": api.wheel_sha256,
+                                                       "sha512": wheel_sha512 } }],
                         "registryOverride": null
                     } }
                 }))),
@@ -625,17 +632,29 @@ impl VexMatrix<'_> {
         );
         let uuid = self.mode.uuid();
 
-        // (1) manifest deleted, ledgers kept: offline from the ledger
-        // record (zero network), then online.
+        // (1) manifest deleted, ledgers kept: offline from the vendor
+        // ledger's record (zero network), then online. v5 hosted mode keeps
+        // no ledger, so a hosted checkout has no local record to go offline
+        // from (step 3 pins its `record_unavailable`).
         let api = self.api();
-        let offline = VexRun {
-            offline: true,
-            ..self.run_for(&api)
-        };
-        let out = run_vex(&bin, checkout, &offline);
-        assert_eq!(out.code, Some(0), "{}: {out}", self.what("ledger offline"));
-        assert_attested(out.doc(), PURL, uuid, self.mode.marker(), VULNS);
-        api.assert_no_requests();
+        if matches!(self.mode, Mode::Hosted) {
+            assert!(
+                !checkout
+                    .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL)
+                    .exists(),
+                "{}: v5 hosted mode writes no redirect ledger",
+                self.what("no ledger")
+            );
+        } else {
+            let offline = VexRun {
+                offline: true,
+                ..self.run_for(&api)
+            };
+            let out = run_vex(&bin, checkout, &offline);
+            assert_eq!(out.code, Some(0), "{}: {out}", self.what("ledger offline"));
+            assert_attested(out.doc(), PURL, uuid, self.mode.marker(), VULNS);
+            api.assert_no_requests();
+        }
         let out = run_vex(&bin, checkout, &self.run_for(&api));
         assert_eq!(
             out.code,
@@ -689,7 +708,14 @@ impl VexMatrix<'_> {
         self.done("ledgers-deleted");
 
         // Embedded forms on the same manifest-less, ledgerless checkout.
-        for via in [VexVia::Apply, VexVia::Vendor] {
+        // Hosted: `apply --vex` only — a manifest-less `vendor` over hosted
+        // pins EJECTS them into `.socket/vendor/` (v5), which is a rewire,
+        // not an attestation of the hosted wiring.
+        let embedded: &[VexVia] = match self.mode {
+            Mode::Hosted => &[VexVia::Apply],
+            Mode::Vendored => &[VexVia::Apply, VexVia::Vendor],
+        };
+        for &via in embedded {
             let out = run_vex(&bin, checkout, &self.run_for(&api).via(via));
             assert_eq!(
                 out.code,
@@ -742,8 +768,17 @@ impl VexMatrix<'_> {
             };
             let out = run_vex(&bin, checkout, &run);
             let what = self.what(&format!("reverted offline={offline} no_verify={no_verify}"));
-            assert_eq!(out.code, Some(1), "{what}: {out}");
-            assert_not_attested(&out.envelope, PURL, self.mode.unwired());
+            if matches!(self.mode, Mode::Hosted) {
+                // No ledger and no wiring: nothing names the patch any more.
+                assert_eq!(out.code, Some(2), "{what}: {out}");
+                assert_eq!(
+                    out.envelope["error"]["code"], "manifest_not_found",
+                    "{what}: {out}"
+                );
+            } else {
+                assert_eq!(out.code, Some(1), "{what}: {out}");
+                assert_not_attested(&out.envelope, PURL, self.mode.unwired());
+            }
             assert!(out.doc.is_none(), "{what}: {out}");
         }
         self.done("reverted");

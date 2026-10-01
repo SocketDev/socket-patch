@@ -1031,6 +1031,35 @@ mod tests {
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 
+    /// `vendor::pypi_uv`'s shape for a vendored server sdist (`sdist = {
+    /// hash }`, no `wheels`) names its package like a wheel does.
+    #[tokio::test]
+    async fn uv_vendored_server_sdist_is_discovered() {
+        let rel = format!(".socket/vendor/pypi/{UUID_A}/six-1.16.0.tar.gz");
+        let lock = format!(
+            "version = 1\nrevision = 3\nrequires-python = \">=3.8\"\n\n\
+             [[package]]\nname = \"app\"\nversion = \"0.1.0\"\nsource = {{ virtual = \".\" }}\n\
+             dependencies = [\n    {{ name = \"six\" }},\n]\n\n\
+             [package.metadata]\nrequires-dist = [{{ name = \"six\", path = \"{rel}\" }}]\n\n\
+             [[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = {{ path = \"{rel}\" }}\n\
+             sdist = {{ hash = \"sha256:{SHA}\" }}\n"
+        );
+        let pyproject = format!(
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n\n\
+             [tool.uv.sources]\nsix = {{ path = \"{rel}\" }}\n"
+        );
+        let p = Project::new();
+        p.write("uv.lock", &lock)
+            .write("pyproject.toml", &pyproject);
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:pypi/six@1.16.0", UUID_A, WiringMode::Vendored)],
+        );
+        assert_eq!(out.refs[0].artifact_rel.as_deref(), Some(rel.as_str()));
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
     /// A half-reverted pair: uv would re-resolve the lock from the pyproject
     /// on a plain `uv sync`, so the lock alone is not trusted.
     #[tokio::test]

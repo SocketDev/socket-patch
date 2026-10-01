@@ -211,13 +211,9 @@ impl RubyCrawler {
     ///
     /// Bundler accepts two spellings of the pair — the usual
     /// `Gemfile`/`Gemfile.lock` and the alternate `gems.rb`/`gems.locked`
-    /// (`Bundler::SharedHelpers.default_gemfile`). Both count: the project
-    /// gate must recognize every project `setup` can wire, and
-    /// `setup::gem::discover_bundler_project` already walks up for `gems.rb`.
-    /// Gating on `Gemfile` alone left a `gems.rb` project with a
-    /// non-deployment `bundle install` undiscoverable — the bundler plugin
-    /// `setup` installs would run `apply` on every `bundle install` and
-    /// silently find zero gems.
+    /// (`Bundler::SharedHelpers.default_gemfile`). Both count: gating on
+    /// `Gemfile` alone left a `gems.rb` project with a non-deployment
+    /// `bundle install` undiscoverable, so `apply` silently found zero gems.
     async fn has_bundler_manifest(cwd: &Path) -> bool {
         for name in ["Gemfile", "Gemfile.lock", "gems.rb", "gems.locked"] {
             if tokio::fs::metadata(cwd.join(name)).await.is_ok() {
@@ -447,9 +443,9 @@ impl RubyCrawler {
     /// The `BUNDLE_PATH` recorded in bundler's app config file — the value
     /// `bundle config set --local path <dir>` writes. The file lives at
     /// `$BUNDLE_APP_CONFIG/config`, else `<cwd>/.bundle/config`, resolved by
-    /// the shared [`crate::setup::gem::bundler_app_config_dir`] rule.
+    /// the shared [`bundler_app_config_dir`] rule.
     async fn app_config_bundle_path(cwd: &Path, app_config_env: Option<&OsStr>) -> Option<String> {
-        let config = crate::setup::gem::bundler_app_config_dir(cwd, app_config_env).join("config");
+        let config = bundler_app_config_dir(cwd, app_config_env).join("config");
         // The config lives inside the (untrusted) project tree: a planted
         // FIFO would make a plain `read_to_string` open block forever
         // waiting for a writer, wedging scan (crawl_all) and apply/get
@@ -531,8 +527,8 @@ impl RubyCrawler {
     /// caller that swaps `PATH` or `GEM_HOME` still asks afresh. Only a
     /// complete answer is kept: a failed ask (spawn error under fd pressure,
     /// a non-zero exit from a racing shim, empty output) is asked again by
-    /// the next caller, as every caller used to ask — and so is an answer
-    /// the environment changed under, which the key would misfile.
+    /// the next caller — and so is an answer the environment changed under,
+    /// which the key would misfile.
     async fn gem_env_homes() -> GemEnvHomes {
         static MEMO: once_cell::sync::Lazy<GemEnvMemo> =
             once_cell::sync::Lazy::new(Default::default);
@@ -948,11 +944,29 @@ fn expand_tilde(value: &Path, home: Option<&Path>) -> PathBuf {
     value.to_path_buf()
 }
 
+/// Bundler's app-config dir for `root`, following `Bundler.app_config_path`
+/// exactly: `$BUNDLE_APP_CONFIG` when set (a relative value resolves against
+/// the project root, NOT the process cwd), else `<root>/.bundle` — e.g. the
+/// official ruby Docker images export `BUNDLE_APP_CONFIG=/usr/local/bundle`.
+fn bundler_app_config_dir(root: &Path, env_value: Option<&OsStr>) -> PathBuf {
+    match env_value {
+        Some(v) if !v.is_empty() => {
+            let p = PathBuf::from(v);
+            if p.is_absolute() {
+                p
+            } else {
+                root.join(p)
+            }
+        }
+        _ => root.join(".bundle"),
+    }
+}
+
 /// Resolve a trusted (ENV-sourced) `BUNDLE_PATH` value against the project
 /// root. Bundler `File.expand_path`s the value: a leading `~` expands to
 /// the user's home, and a relative path resolves against the directory of
 /// the Gemfile (`Bundler.root`), not the process cwd — the same rule
-/// [`crate::setup::gem::bundler_app_config_dir`] follows for
+/// [`bundler_app_config_dir`] follows for
 /// `BUNDLE_APP_CONFIG`. `.`/`..` segments are folded lexically so the same
 /// physical root spelled two ways dedups to one probe; a value that pops
 /// above its own root keeps its unnormalized spelling (it is only ever
@@ -980,8 +994,7 @@ fn resolve_bundle_path(root: &Path, value: &Path, home: Option<&Path>) -> PathBu
 /// writes outside the project. Policy: after `~` expansion and lexical
 /// `.`/`..` normalization, the root must stay contained in the project
 /// root — the same containment posture as the composer crawler's
-/// `install-path` guard and the gem plugin-index cleanup in
-/// `setup/gem/mod.rs`. Out-of-tree bundle paths stay reachable via the
+/// `install-path` guard. Out-of-tree bundle paths stay reachable via the
 /// trusted env `BUNDLE_PATH`.
 fn resolve_config_bundle_path(
     project_root: &Path,
@@ -1232,16 +1245,15 @@ mod tests {
         assert_eq!(found, HashSet::from([ruby_gems, jruby_gems, truffle_gems]));
     }
 
-    // ── bundler-1 flat BUNDLE_PATH layout (gem live-matrix D1) ─────
+    // ── bundler-1 flat BUNDLE_PATH layout ─────
 
     /// Bundler 1 with `BUNDLE_PATH` set via the ENVIRONMENT installs
     /// GEM_HOME-style into the flat `<BUNDLE_PATH>/gems/` — no
     /// `<engine>/<abi>` scope segment, sibling `specifications/` dir
-    /// present (bundler >= 2 appends the scope even for env installs).
-    /// The crawler only enumerated the scoped layout, so such projects
-    /// scanned as `notInstalled` and `get` downloaded 1 / applied 0
-    /// (live-verified 2026-08-19: activestorage@6.0.3 under bundler
-    /// 1.17.3 at `vendor/bundle/gems/activestorage-6.0.3`).
+    /// present (bundler >= 2 appends the scope even for env installs),
+    /// e.g. activestorage@6.0.3 under bundler 1.17.3 at
+    /// `vendor/bundle/gems/activestorage-6.0.3`. Enumerating only the
+    /// scoped layout would scan such projects as `notInstalled`.
     #[tokio::test]
     async fn get_vendor_bundle_paths_flat_bundler1_layout() {
         let dir = tempfile::tempdir().unwrap();
@@ -1582,8 +1594,7 @@ mod tests {
     /// `.bundle/config` `BUNDLE_PATH:` first, then the `BUNDLE_PATH`
     /// environment variable, then the implicit `vendor/bundle` default —
     /// so the stores come back highest-precedence first and first-wins
-    /// consumers pick the copy bundler actually loads. The pre-fix order
-    /// (default → env → config) was bundler's precedence inverted.
+    /// consumers pick the copy bundler actually loads.
     #[tokio::test]
     async fn bundle_roots_probe_in_bundler_precedence_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -1889,8 +1900,8 @@ mod tests {
     // ── env BUNDLE_PATH `~` expansion + normalization ──────────────
 
     /// A leading `~/` in the env `BUNDLE_PATH` expands against HOME
-    /// (bundler `File.expand_path`s the value); it used to resolve as a
-    /// literal `<cwd>/~/...` relative path and discover nothing.
+    /// (bundler `File.expand_path`s the value), not as a literal
+    /// `<cwd>/~/...` relative path.
     #[tokio::test]
     async fn bundle_path_env_tilde_expands_against_home() {
         let dir = tempfile::tempdir().unwrap();

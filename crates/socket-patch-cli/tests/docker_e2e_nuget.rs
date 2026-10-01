@@ -174,13 +174,10 @@ LICENSE_FILE="$NUGET_PACKAGES/newtonsoft.json/13.0.3/LICENSE.md"
 [ -f "$LICENSE_FILE" ] || {{ echo "FAIL: $LICENSE_FILE missing" >&2; ls "$NUGET_PACKAGES/newtonsoft.json/13.0.3/" >&2 || true; exit 1; }}
 echo "Installed to: $LICENSE_FILE" >&2
 
-# Pre-seed setup.manual so the agent-mode VEX leg keeps the nuget patch through
-# property 7 (nuget has no auto-install setup hook; agent patches are applied
-# by hand/CI — exactly what `manual` declares). scan --sync merges the
-# downloaded patch into this manifest and preserves the setup block.
+# Pre-seed an empty manifest; scan --sync merges the downloaded patch into it.
 mkdir -p .socket
 cat > .socket/manifest.json <<'MANIFEST'
-{{ "patches": {{}}, "setup": {{ "manual": ["nuget"] }} }}
+{{ "patches": {{}} }}
 MANIFEST
 
 # The unpatched LICENSE must NOT already contain our synthetic marker —

@@ -15,8 +15,7 @@
 //! `go mod verify` keeps passing and other projects are unaffected), and removal
 //! is clean (drop the directive → the build falls back to the cache). A
 //! local-path `replace` target is **not** `go.sum` content-verified, so the
-//! patched bytes build cleanly under the default `-mod=readonly` (validated
-//! empirically — see project memory).
+//! patched bytes build cleanly under the default `-mod=readonly`.
 //!
 //! The copy is produced by **delegating to the hardened
 //! [`apply_package_patch`] pipeline** pointed at the fresh copy, reusing all the
@@ -243,19 +242,7 @@ pub async fn apply_go_redirect<'a>(
     if dry_run {
         // Verify (read-only) against the pristine source for an accurate
         // "would patch" report, without creating the copy or editing go.mod.
-        // The verify reads it, so a lazily-fetched source materialises here.
-        let pristine_src = match pristine_src.materialize().await {
-            Ok(dir) => dir,
-            Err(e) => {
-                return synthesized_result(
-                    purl,
-                    &copy_dir,
-                    Vec::new(),
-                    false,
-                    Some(format!("failed to copy pristine source: {e}")),
-                )
-            }
-        };
+        let pristine_src = pristine_src.path();
         let mut result =
             apply_package_patch(purl, pristine_src, files, sources, uuid, true, policy).await;
         result.package_path = copy_dir.display().to_string();
@@ -270,11 +257,8 @@ pub async fn apply_go_redirect<'a>(
         return already_patched_result(purl, &copy_dir, files);
     }
 
-    // Materialise pristine → copy_dir: a module-cache source is copied, a
-    // fetched one is written straight here from the verified module zip
-    // (unless an earlier branch already extracted it, which `stage_into`
-    // copies from instead).
-    if let Err(e) = pristine_src.stage_into(&copy_dir, None).await {
+    if let Err(e) = crate::patch::copy_tree::fresh_copy(pristine_src.path(), &copy_dir, None).await
+    {
         teardown_failed_redirect(project_root, &copy_dir, module, version, base_rel).await;
         return synthesized_result(
             purl,
@@ -658,11 +642,7 @@ pub(crate) async fn ensure_module_go_mod(copy_dir: &Path, module: &str) -> std::
         return Ok(());
     }
     let body = format!("module {module}\n");
-    if crate::utils::durability::in_artifact_scope() {
-        crate::utils::fs::atomic_write_artifact(&go_mod, body.as_bytes()).await
-    } else {
-        crate::utils::fs::atomic_write_bytes(&go_mod, body.as_bytes()).await
-    }
+    crate::utils::fs::atomic_write_bytes(&go_mod, body.as_bytes()).await
 }
 
 /// Recursively find every patched-copy module dir under `go_patches_root`,

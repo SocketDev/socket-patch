@@ -67,7 +67,6 @@ async fn uuid_get_with_corrupt_manifest_fails_without_clobbering() {
         package: false,
         // save_only isolates the save path from the apply step.
         save_only: true,
-        one_off: false,
         all_releases: false,
         mode: None,
     };

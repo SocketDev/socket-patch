@@ -215,10 +215,11 @@ pub async fn applied_patches_with_vendor(
 /// "omit when unconfirmed" contract — it is reported as `no_files` and
 /// dropped from the VEX document rather than vacuously attested.
 ///
-/// `pub`: this is the ONE "is this installed tree patched?" oracle — the
-/// CLI's gem stale-install probe (`scan --mode hosted`) reuses it rather
-/// than growing a second copy of the all-files-AlreadyPatched + zero-file
-/// semantics that would inevitably drift.
+/// `pub`: this is the reference "is this installed tree patched?" oracle
+/// (all-files-AlreadyPatched + zero-file semantics); `vendor::pypi` calls it
+/// directly. The CLI's gem/python stale-install probes use its one-pass
+/// equivalent [`judge_installed_record`], which
+/// `judge_installed_record_matches_verify_and_evidence_scan` pins to it.
 pub async fn verify_patch_record(pkg_path: &Path, record: &PatchRecord) -> Result<(), String> {
     if record.files.is_empty() {
         return Err("no_files".to_string());
@@ -252,8 +253,7 @@ pub struct InstalledRecordJudgment {
 }
 
 /// [`verify_patch_record`] and the stale-evidence scan in ONE blocking-pool
-/// task, hashing each record file at most once (the pair used to hash the
-/// same files twice, each 8 KiB read its own runtime hop). Stops at the
+/// task, hashing each record file at most once. Stops at the
 /// first file that proves staleness — which also settles `patched` —
 /// exactly where both scans agree.
 pub async fn judge_installed_record(
@@ -1104,6 +1104,7 @@ mod tests {
             base_purl: purl.to_string(),
             uuid: VUUID.to_string(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel_path.to_string(),
                 sha256: String::new(),
                 size: None,

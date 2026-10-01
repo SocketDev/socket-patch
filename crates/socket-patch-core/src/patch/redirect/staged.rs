@@ -33,22 +33,6 @@ pub(super) async fn read_rel(project_root: &Path, rel: &str) -> Result<Option<St
     }
 }
 
-/// Read a project file through the staged writes, so each unwind step sees
-/// what the earlier steps decided. Both the re-redirect chain (a step's
-/// `original` is the previous step's `new`) and the cargo registry block's
-/// still-referenced probe depend on that view, and neither may depend on the
-/// bytes having landed.
-pub(super) async fn staged_read(
-    staged: &Staged,
-    project_root: &Path,
-    rel: &str,
-) -> Result<Option<String>, String> {
-    match staged.get(rel) {
-        Some(pending) => Ok(pending.clone()),
-        None => read_rel(project_root, rel).await,
-    }
-}
-
 /// Commit the staged files. Only reached once every inverse resolved, so a
 /// drift refusal never gets here; an I/O fault partway through is the one
 /// remaining way to stop mid-set, and it surfaces as `Err` naming the path

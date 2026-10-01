@@ -51,8 +51,9 @@
 //! A get-driven twin (`cargo_get_uuid_vendored_fresh_checkout_locked_build`,
 //! v3.6) reaches the same committed state through `get <uuid> --mode
 //! vendored` with the patch record + blob content served from a wiremock
-//! view endpoint instead of a pre-staged `.socket/` — proving the manifest
-//! write, the NO-blobs posture (content stays in memory), and the same
+//! view endpoint instead of a pre-staged `.socket/` — proving the
+//! manifest-free posture (the ledger's detached entry is the record), the
+//! NO-blobs posture (content stays in memory), and the same
 //! fresh-checkout `--locked --offline` build (the revert half is covered by
 //! the capstone: get rides the identical vendor engine).
 //!
@@ -77,6 +78,9 @@
 //! Skips (println) when `cargo` is missing or crates.io is unreachable for
 //! the fixture build (a failure instead under
 //! `SOCKET_PATCH_CARGO_E2E_REQUIRED=1`); all assertions after that are hard.
+
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -205,7 +209,7 @@ fn binary() -> PathBuf {
 /// source tree through it).
 fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
             cmd.env_remove(&k);
@@ -213,6 +217,12 @@ fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, Str
     }
     cmd.env_remove("VIRTUAL_ENV");
     cmd.env("CARGO_HOME", cargo_home);
+    let _fixture = prebuilt_common::prepare_command(
+        &mut cmd,
+        cwd,
+        args,
+        &[("CARGO_HOME", cargo_home.to_str().unwrap())],
+    );
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -638,10 +648,8 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
-    // NOTE: summary.applied / the event action are asserted in the
-    // `cargo_vendor_reports_applied_event` below — a successful
-    // cargo vendor is currently misreported as skipped/`vendored` (see the
-    // BUG note there). The on-disk + build assertions here are unaffected.
+    // summary.applied / the event action are pinned by
+    // `cargo_vendor_reports_applied_event` below.
 
     // The patched copy, without a `.cargo-checksum.json` (path deps must
     // never carry one).
@@ -896,15 +904,10 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
 /// cargo vendor must surface as an `applied` event with `summary.applied == 1`
 /// (CLI_CONTRACT.md: vendor events are `Applied` (= vendored)).
 ///
-/// Currently it is misreported as `skipped` with errorCode `vendored` and
-/// `summary.applied == 0`: the shared `result_to_event` (apply.rs) routes any
-/// result whose `package_path` contains `.socket/vendor/` to the
-/// Skipped/`vendored` event — that check exists for APPLY's yield-to-vendor
-/// path, but the cargo/golang/composer/gem vendor backends set their
-/// `ApplyResult.package_path` to the vendor copy dir itself, so vendor's own
-/// successes trip it (npm/pypi report `applied` correctly because their
-/// package_path is a stage tempdir / site-packages). Human output says
-/// "Vendored 0 package(s); 1 skipped" and `track_patch_vendored` reports 0.
+/// The cargo/golang/composer/gem vendor backends set
+/// `ApplyResult.package_path` to the `.socket/vendor/` copy dir itself;
+/// `result_to_event` must classify only the exact `VENDOR_OWNED_MARKER`
+/// sentinel as Skipped/`vendored`, never a path under `.socket/vendor/`.
 #[test]
 fn cargo_vendor_reports_applied_event() {
     if !cargo_e2e_matrix::cargo_available("e2e_vendor_cargo_build (applied-event)") {
@@ -954,7 +957,7 @@ fn cargo_vendor_reports_applied_event() {
 
 /// get-driven twin (v3.6): `get <uuid> --mode vendored --vendor-source build`
 /// must reach the capstone's committed state through scan's vendored engine —
-/// the manifest record, the patched copy under `.socket/vendor/cargo/<uuid>/`,
+/// no manifest (the ledger records the patch), the patched copy under `.socket/vendor/cargo/<uuid>/`,
 /// the `[patch.crates-io]` wiring + surgical lock detach — with NO
 /// `.socket/blobs` (the download phase holds content in memory; the vendor
 /// step re-fetches `blobContent` from the same view mock). Then the
@@ -980,7 +983,7 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
 
     // The view endpoint serves the record with REAL hashes computed from the
     // ACTUAL extracted registry bytes + inline blobContent — no `.socket/`
-    // pre-staging: `get` writes the manifest itself and the vendor step
+    // pre-staging: `get` writes no manifest (the ledger records the patch) and the vendor step
     // fetches the after-blob into memory from this same mock.
     let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
     assert!(
@@ -990,29 +993,31 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
     let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
 
     let server = MockServer::start().await;
+    let view = serde_json::json!({
+        "uuid": UUID,
+        "purl": purl,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            "src/lib.rs": {
+                "beforeHash": git_sha256(&orig),
+                "afterHash": git_sha256(&patched),
+                "blobContent": b64(&patched),
+            }
+        },
+        "vulnerabilities": { "GHSA-vend-cargo-real": {
+            "cves": ["CVE-2024-88888"],
+            "summary": "capstone vex vuln",
+            "severity": "high",
+            "description": "d",
+        }},
+        "description": "capstone marker patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view(&server, &view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": purl,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "src/lib.rs": {
-                    "beforeHash": git_sha256(&orig),
-                    "afterHash": git_sha256(&patched),
-                    "blobContent": b64(&patched),
-                }
-            },
-            "vulnerabilities": { "GHSA-vend-cargo-real": {
-                "cves": ["CVE-2024-88888"],
-                "summary": "capstone vex vuln",
-                "severity": "high",
-                "description": "d",
-            }},
-            "description": "capstone marker patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
         .mount(&server)
         .await;
 
@@ -1035,7 +1040,7 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
             "--api-token",
             "fake",
             "--vendor-source",
-            "build",
+            "service",
         ],
         &cargo_home,
     );
@@ -1173,8 +1178,8 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
         "the detach must keep the lock format:\n{lock_text}"
     );
 
-    // Manifest-less VEX on the fresh checkout (get wrote a manifest; the
-    // steps delete it).
+    // Manifest-less VEX on the fresh checkout (get wrote no manifest; the
+    // steps' strip is a no-op for it).
     ManifestlessVendored {
         fresh,
         fresh_home,
@@ -1573,16 +1578,9 @@ fn dir_inventory(dir: &Path) -> serde_json::Map<String, serde_json::Value> {
     out
 }
 
-/// `repair` over a pre-tag cargo vendor whose ledger carries a whole-tree
-/// inventory of ANOTHER build source's tree (an extra file the local
-/// rebuild does not reproduce) and whose copy is gone: the rebuild (tagged,
-/// with its lock retag) comes back from the backend as a fresh entry with
-/// the recorded inventory carried forward, the patched members verify, and
-/// the tree mismatch is refreshed from the verified rebuild
-/// (`vendor_inventory_refreshed`) — never a deleted rebuild stranding the
-/// wiring on a dead dir. The result builds `--locked --offline`.
+/// Redownload refuses an artifact that cannot reproduce the committed inventory.
 #[test]
-fn cargo_repair_refreshes_a_carried_inventory_over_a_verified_rebuild() {
+fn cargo_repair_refuses_a_different_recorded_inventory() {
     if !cargo_e2e_matrix::cargo_available("e2e_vendor_cargo_build (repair-inventory)") {
         return;
     }
@@ -1598,7 +1596,6 @@ fn cargo_repair_refreshes_a_carried_inventory_over_a_verified_rebuild() {
     let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
     stage_patch(&proj, &purl, "src/lib.rs", &orig, &patched);
     vendor_ok(&proj, &cargo_home, "repair-inventory");
-    untag_project(&proj, &version, UUID);
 
     let copy = proj.join(&copy_rel);
     std::fs::write(copy.join("PREBUILT_STUB"), "service-only file\n").unwrap();
@@ -1609,6 +1606,8 @@ fn cargo_repair_refreshes_a_carried_inventory_over_a_verified_rebuild() {
     state["entries"][purl.as_str()]["artifact"]["fileInventory"] =
         serde_json::Value::Object(recorded.clone());
     std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    let recorded_state = std::fs::read(&state_path).unwrap();
+    let recorded_lock = std::fs::read(proj.join("Cargo.lock")).unwrap();
     std::fs::remove_dir_all(&copy).unwrap();
 
     let (code, stdout, stderr) = run_socket(
@@ -1622,32 +1621,16 @@ fn cargo_repair_refreshes_a_carried_inventory_over_a_verified_rebuild() {
         ],
         &cargo_home,
     );
-    assert_eq!(
-        code, 0,
-        "repair failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert!(stdout.contains("vendor_inventory_refreshed"), "{stdout}");
-    assert!(stdout.contains("cargo_version_tagged"), "{stdout}");
-    assert_tagged(&proj, &version, UUID, "repair-inventory");
-    assert_eq!(std::fs::read(copy.join("src/lib.rs")).unwrap(), patched);
-    let state: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
-    let inventory = state["entries"][purl.as_str()]["artifact"]["fileInventory"]
-        .as_object()
-        .unwrap_or_else(|| panic!("the refreshed inventory is persisted: {state}"));
-    assert!(!inventory.contains_key("PREBUILT_STUB"), "{inventory:?}");
-    assert_eq!(
-        inventory,
-        &dir_inventory(&copy),
-        "the verified rebuild's tree"
-    );
-
-    std::fs::write(proj.join("src/main.rs"), ORACLE_MAIN).unwrap();
-    let run = cargo(&proj, &["run", "-q", "--locked", "--offline"], &cargo_home);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
     assert!(
-        String::from_utf8_lossy(&run.stdout).contains(&oracle_line(&version, UUID)),
-        "the repaired copy builds: {}",
-        String::from_utf8_lossy(&run.stderr)
+        stdout.contains("vendor_artifact_redownload_failed"),
+        "{stdout}"
+    );
+    assert!(!copy.exists());
+    assert_eq!(std::fs::read(&state_path).unwrap(), recorded_state);
+    assert_eq!(
+        std::fs::read(proj.join("Cargo.lock")).unwrap(),
+        recorded_lock
     );
 }
 

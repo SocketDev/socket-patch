@@ -65,7 +65,7 @@
 //! when any exist ("installed evidence wins") and otherwise, for a
 //! DISCOVERED Socket-host reference with a lockfile pin, attests from the
 //! pinned wiring (the in-run `scan --mode hosted --vex` evidence);
-//! `Installed` is the pre-existing agent-mode path.
+//! `Installed` is the agent-mode path.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -80,7 +80,7 @@ use socket_patch_core::patch::redirect::RedirectState;
 use socket_patch_core::utils::composer_version::composer_purls_equivalent;
 use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
-use socket_patch_core::vendor::state::{lookup_entry_kv, VendorArtifact, VendorEntry, VendorState};
+use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry, VendorState};
 use socket_patch_core::vex::discover::{
     canonical_base_purl, vendor_ref, Discovery, LedgerLiveness, PatchedRef, WiringMode,
 };
@@ -112,14 +112,9 @@ pub(crate) const WIRING_CONFLICT: &str = "wiring_conflict";
 /// carries blob content, so it is heavy).
 const FETCH_CONCURRENCY: usize = 10;
 
-/// The in-flight cap for the record fetch.
-///
-/// These are patch-API requests — `scan --vex` makes them too — so the
-/// documented escape hatch has to reach them like it reaches every other
-/// window: an operator behind something that caps in-flight requests per
-/// client sets `SOCKET_API_CONCURRENCY=1` and gets one view at a time.
-/// [`FETCH_CONCURRENCY`] is this window's own ceiling on top of that, for
-/// the size of a view.
+/// The in-flight cap for the record fetch: `SOCKET_API_CONCURRENCY` applies
+/// here like every other patch-API window, with [`FETCH_CONCURRENCY`] as
+/// this window's own ceiling on top (a view is heavy).
 fn fetch_concurrency(use_public_proxy: bool) -> usize {
     api_concurrency(use_public_proxy).min(FETCH_CONCURRENCY)
 }
@@ -147,8 +142,8 @@ impl Sources {
 
 /// The resolved attestation inputs.
 pub(crate) struct Plan {
-    /// purl → record for every candidate that passed the gates (with the
-    /// manifest file's `setup` block, which property 7 reads).
+    /// purl → record for every candidate that passed the gates (carrying
+    /// the manifest file's legacy `setup` block through unchanged).
     pub view: PatchManifest,
     /// Vendored-basis entries, keyed by view purl — the verification
     /// routing for `applied_patches_with_vendor`.
@@ -213,7 +208,7 @@ pub(crate) struct HostedWiring {
 
 /// How one view purl is verified.
 enum Basis {
-    /// The pre-existing agent-mode path: installed tree / go-patches copy.
+    /// The agent-mode path: installed tree / go-patches copy.
     Installed,
     /// The committed `.socket/vendor` artifact named by this entry.
     Vendored(Box<VendorEntry>),
@@ -287,7 +282,7 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
 
     let mut notes = Vec::new();
     let mut gated: Vec<FailedPatch> = Vec::new();
-    let mut cands = build_candidates(&manifest, &vendor, &redirect_records);
+    let mut cands = build_candidates(&manifest, &vendor, redirect.as_ref());
     let conflicts = wiring_conflicts(&discovery);
     if !conflicts.is_empty() {
         // Gate every candidate for a conflicting package BEFORE anything can
@@ -343,6 +338,23 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
     let mut liveness = LedgerLiveness::new(root, &discovery, redirect.as_ref());
     let mut based: Vec<(Cand, Basis)> = Vec::new();
     for mut cand in cands {
+        if let Some(entry) = cand
+            .vendor_entry
+            .as_ref()
+            .filter(|e| socket_patch_core::vendor::jvm::apply::is_jvm_entry(e))
+        {
+            if let Err(detail) =
+                socket_patch_core::vendor::jvm::apply::entry_wired_checked(root, entry)
+            {
+                const CODE: &str = "vendor_jvm_shape_unsupported";
+                gated.push(failed(&cand.key, CODE));
+                notes.push(note(
+                    CODE,
+                    format!("{}: cannot establish JVM wiring: {detail}", cand.key),
+                ));
+                continue;
+            }
+        }
         let basis = if let Some(vref) = cand
             .discovered
             .iter()
@@ -370,7 +382,7 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
                         &cand.key,
                         &[
                             (&entry.uuid, WiringMode::Vendored, "vendor ledger"),
-                            (&hosted.uuid, WiringMode::Hosted, "redirect ledger"),
+                            (&hosted.uuid, WiringMode::Hosted, "hosted ledger"),
                         ],
                     ));
                     gated.push(failed(&cand.key, VENDOR_UNWIRED));
@@ -406,7 +418,7 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
                 notes.extend(dead_claim_notes(
                     &discovery,
                     &cand.key,
-                    &[(&cand.uuid, WiringMode::Hosted, "redirect ledger")],
+                    &[(&cand.uuid, WiringMode::Hosted, "hosted ledger")],
                 ));
                 gated.push(failed(&cand.key, REDIRECT_UNWIRED));
                 continue;
@@ -565,76 +577,35 @@ fn expected_package(cand: &Cand) -> String {
     }
 }
 
-/// One candidate per manifest key, then per unclaimed vendor-ledger key,
-/// then per unclaimed redirect-ledger key — the pre-existing collision rule
-/// (the manifest owns a key it records; ledgers fill the rest), in sorted
-/// order so the output is deterministic.
+/// One candidate per owner key under the shared owner rule
+/// ([`socket_patch_core::ledgers::Ledgers::owned`]): the manifest keys, then
+/// the unclaimed vendor-ledger keys, then the redirect-ledger keys neither
+/// owns, each sorted, with the losing copies' records as `alts`.
 fn build_candidates(
     manifest: &PatchManifest,
     vendor: &VendorState,
-    redirect_records: &BTreeMap<String, PatchRecord>,
+    redirect: Option<&RedirectState>,
 ) -> Vec<Cand> {
-    let mut cands = Vec::new();
-    let mut claimed_entries: HashSet<&str> = HashSet::new();
-    let mut manifest_keys: Vec<&String> = manifest.patches.keys().collect();
-    manifest_keys.sort();
-    for key in manifest_keys {
-        let record = &manifest.patches[key];
-        let entry = lookup_entry_kv(&vendor.entries, key);
-        let mut alts = Vec::new();
-        if let Some((entry_key, e)) = entry {
-            claimed_entries.insert(entry_key.as_str());
-            alts.extend(e.record.clone());
-        }
-        alts.extend(redirect_records.get(key).cloned());
-        cands.push(Cand {
-            key: key.clone(),
-            uuid: record.uuid.clone(),
-            record: Some(record.clone()),
-            alts,
-            manifest_owned: true,
-            redirected: redirect_records.contains_key(key),
-            vendor_entry: entry.map(|(_, e)| e.clone()),
-            discovered: Vec::new(),
-            lockfile_only: false,
-        });
+    use socket_patch_core::ledgers::{Ledgers, Store};
+    Ledgers {
+        manifest: Some(manifest),
+        vendor: Some(vendor),
+        redirect,
     }
-    let mut vendor_keys: Vec<&String> = vendor.entries.keys().collect();
-    vendor_keys.sort();
-    for key in vendor_keys {
-        if claimed_entries.contains(key.as_str()) || manifest.patches.contains_key(key) {
-            continue;
-        }
-        let entry = &vendor.entries[key];
-        cands.push(Cand {
-            key: key.clone(),
-            uuid: entry.uuid.clone(),
-            record: entry.record.clone(),
-            alts: redirect_records.get(key).cloned().into_iter().collect(),
-            manifest_owned: false,
-            redirected: redirect_records.contains_key(key),
-            vendor_entry: Some(entry.clone()),
-            discovered: Vec::new(),
-            lockfile_only: false,
-        });
-    }
-    for (purl, record) in redirect_records {
-        if cands.iter().any(|c| c.key == *purl) {
-            continue;
-        }
-        cands.push(Cand {
-            key: purl.clone(),
-            uuid: record.uuid.clone(),
-            record: Some(record.clone()),
-            alts: Vec::new(),
-            manifest_owned: false,
-            redirected: true,
-            vendor_entry: None,
-            discovered: Vec::new(),
-            lockfile_only: false,
-        });
-    }
-    cands
+    .owned()
+    .into_iter()
+    .map(|o| Cand {
+        key: o.key.to_string(),
+        uuid: o.uuid.to_string(),
+        record: o.record.cloned(),
+        alts: o.alts.into_iter().cloned().collect(),
+        manifest_owned: o.store == Store::Manifest,
+        redirected: o.hosted,
+        vendor_entry: o.vendor.map(|(_, e)| e.clone()),
+        discovered: Vec::new(),
+        lockfile_only: false,
+    })
+    .collect()
 }
 
 /// Packages the discovered references wire to MORE than one patch uuid
@@ -788,6 +759,7 @@ fn vendored_entry_for(cand: &Cand, vref: &PatchedRef) -> VendorEntry {
         base_purl: strip_purl_qualifiers(&cand.key).to_string(),
         uuid: vref.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: wired.to_string(),
             sha256: String::new(),
             size: None,
@@ -934,16 +906,9 @@ async fn fetch_records(
     loop {
         let mut auth_refused: Vec<String> = Vec::new();
         let mut auth_error: Option<String> = None;
-        // A sliding window of at most FETCH_CONCURRENCY views in flight
-        // (it used to wait for each whole chunk of that size to drain
-        // before starting the next), consumed in `pending` order.
-        //
-        // That IS an observable change, the one in this area: the chunked
-        // JoinSet folded each chunk in COMPLETION order, so which refusal
-        // was reported as `auth_error` (printed in the fallback note) and
-        // the order of the retried `pending` list were a race. They now
-        // follow `pending` order — deterministic, and the same order the
-        // notes above already came out in.
+        // A sliding window of views in flight, consumed in `pending` order,
+        // so the reported `auth_error` and the retried `pending` list are
+        // deterministic.
         {
             let client = &client;
             let mut views = std::pin::pin!(ordered_concurrent(
@@ -1068,9 +1033,8 @@ mod tests {
         }
     }
 
-    /// `scan --vex` reaches this window, so the documented escape hatch
-    /// has to reach it too: `SOCKET_API_CONCURRENCY=1` means one view at a
-    /// time here as well. Serial: `SOCKET_*` is process-global.
+    /// `SOCKET_API_CONCURRENCY=1` means one view at a time here as well.
+    /// Serial: `SOCKET_*` is process-global.
     #[test]
     #[serial_test::serial]
     fn socket_api_concurrency_paces_the_record_fetch() {
@@ -1100,8 +1064,6 @@ mod tests {
     /// server happens to answer: the FIRST refusal in `pending` is the one
     /// reported in the fallback note, even when it answers last, and the
     /// refused uuids are retried against the proxy in that same order.
-    /// (The chunked JoinSet this replaced folded by completion, so which
-    /// refusal was reported was a race.)
     #[tokio::test]
     #[serial_test::serial]
     async fn refused_records_fold_in_pending_order_not_completion_order() {
@@ -1346,6 +1308,7 @@ mod tests {
                 base_purl: key.into(),
                 uuid: U1.into(),
                 artifact: VendorArtifact {
+                    yarn_berry10c0: None,
                     path: format!(".socket/vendor/npm/{U1}/x-1.0.0.tgz"),
                     sha256: String::new(),
                     size: None,
@@ -1390,8 +1353,7 @@ mod tests {
     /// `redirect_unwired`, with a note naming the file and the extractor's
     /// reason — although the raw-text fallbacks would call both live (the
     /// files hold each uuid in pin position; the unrecognized control run
-    /// proves it). Before, exactly this re-derivation from raw text attested
-    /// an orphaned berry entry and a reverted cargo pin.
+    /// proves it).
     #[tokio::test]
     async fn recognized_but_rejected_uuids_are_dead_whatever_the_raw_text_says() {
         use socket_patch_core::vendor::state::{WiringAction, WiringRecord};
@@ -1420,6 +1382,7 @@ mod tests {
                 base_purl: "pkg:npm/x@1.0.0".into(),
                 uuid: U1.into(),
                 artifact: VendorArtifact {
+                    yarn_berry10c0: None,
                     path: rel.clone(),
                     sha256: String::new(),
                     size: None,
@@ -1523,7 +1486,7 @@ mod tests {
         );
         assert!(
             dead.notes.iter().any(|n| n.detail.contains("Cargo.lock")
-                && n.detail.contains("redirect ledger")
+                && n.detail.contains("hosted ledger")
                 && n.detail.contains(U2)),
             "{:?}",
             dead.notes
@@ -1600,14 +1563,12 @@ mod tests {
         );
     }
 
-    /// REGRESSION: the bundler < 2.6 hosted rewrite leaves the pair MIXED —
-    /// the Gemfile's `source "<patch registry>" do` block pins the patch, the
+    /// The bundler < 2.6 hosted rewrite leaves the pair MIXED — the
+    /// Gemfile's `source "<patch registry>" do` block pins the patch, the
     /// CHECKSUMS-less lock still resolves the gem from rubygems.org until
-    /// the next unfrozen `bundle install` converges it. The lock inventory
-    /// reads `Gemfile.lock`'s registry url and used to call the redirect
-    /// record dead (while the identical `gems.rb` / `gems.locked` pair was
-    /// live, the inventory not reading `gems.locked`). Reverting the
-    /// Gemfile too kills it under both spellings.
+    /// the next unfrozen `bundle install` converges it. That keeps the
+    /// redirect record live under both spellings (`Gemfile`/`gems.rb`);
+    /// reverting the Gemfile too kills it.
     #[tokio::test]
     async fn gemfile_source_block_keeps_a_mixed_gem_pair_live() {
         let purl = "pkg:gem/vexprobe@1.2.3";

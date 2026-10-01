@@ -1,11 +1,8 @@
 //! `remove --silent` contract tests.
 //!
-//! CLI_CONTRACT.md defines `--silent` as "Errors only". Regression
-//! guard: `remove` gated all of its human-readable chatter on `!json`
-//! alone, and passed only `json` as `rollback_patches`' silent param —
-//! so `remove --silent` printed everything. Same bug class previously
-//! fixed in `list`, `repair`, and `get`. Runs fully offline: the patch
-//! record has no
+//! CLI_CONTRACT.md defines `--silent` as "Errors only": `remove`'s
+//! human-readable chatter (and the nested rollback's) must be muted, not
+//! just gated on `!json`. Runs fully offline: the patch record has no
 //! files (so rollback fetches no blobs) and the project dir has no
 //! installed packages, so the internal rollback takes the
 //! "not installed" path and the manifest mutation needs no network.
@@ -360,7 +357,7 @@ fn remove_silent_suppresses_detached_revert_output() {
 }
 
 /// Backend revert warnings are chatter, not errors: `vendor --revert`
-/// gates the identical "Warning (code): detail" stderr line on
+/// gates the identical "Warning: detail" stderr line on
 /// `!silent && !json` (`record_warning`), but remove's vendor block
 /// printed it under `--silent` (gated on `!json` alone).
 #[test]
@@ -387,7 +384,7 @@ fn remove_silent_suppresses_vendor_revert_warnings() {
         "the drift-kept error must print even under --silent; got {stderr:?}"
     );
     assert!(
-        !stderr.contains("Warning ("),
+        !stderr.contains("Warning:"),
         "--silent must suppress backend revert warnings; got {stderr:?}"
     );
 
@@ -398,7 +395,7 @@ fn remove_silent_suppresses_vendor_revert_warnings() {
     let (loud_code, _loud_stdout, loud_stderr) = run_remove(tmp2.path(), &[purl, "--yes"]);
     assert_eq!(loud_code, 1);
     assert!(
-        loud_stderr.contains("Warning (vendor_lock_entry_drifted)"),
+        loud_stderr.contains("Warning: "),
         "non-silent run must print the backend warning; got {loud_stderr:?}"
     );
     // The drift-keep must leave BOTH stores intact: ledger entry and
@@ -530,7 +527,7 @@ fn remove_silent_suppresses_detached_revert_warnings() {
         "an all-kept detached remove is a partial failure; stderr={stderr:?}"
     );
     assert!(
-        !stderr.contains("Warning ("),
+        !stderr.contains("Warning:"),
         "--silent must suppress detached revert warnings; got {stderr:?}"
     );
     assert!(
@@ -552,7 +549,7 @@ fn remove_silent_suppresses_detached_revert_warnings() {
     let (loud_code, _loud_stdout, loud_stderr) = run_remove(tmp2.path(), &[purl, "--yes"]);
     assert_eq!(loud_code, 1);
     assert!(
-        loud_stderr.contains("Warning (vendor_lock_entry_drifted)"),
+        loud_stderr.contains("Warning: "),
         "non-silent detached run must print the backend warning; got {loud_stderr:?}"
     );
     assert!(

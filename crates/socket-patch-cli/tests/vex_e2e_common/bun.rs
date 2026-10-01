@@ -21,15 +21,17 @@
 //!    `(vendored)` marker and exactly the expected vulnerability ids (+ CVE
 //!    aliases); the embedded `apply --vex` (and, vendored, `vendor --vex`)
 //!    attest the same without touching the lock.
-//! 2. `ledgers-deleted` — `.socket/vendor/state.json` and
-//!    `redirect-state.json` deleted too: still attested, now from lockfile
-//!    discovery + the patch API (the view route is hit).
+//! 2. `ledgers-deleted` — `.socket/vendor/state.json` deleted too (a hosted
+//!    flow wrote no ledger at all in v5 — asserted up front): still
+//!    attested, now from lockfile discovery + the patch API (the view route
+//!    is hit).
 //! 3. `offline` — `--offline` with no ledgers: `record_unavailable`, exit 1,
 //!    ZERO requests to the API.
 //! 4. `reverted` — the lock put back to the registry version (ledgers and
 //!    committed artifacts kept, the patched install left in node_modules):
-//!    NOT attested (`redirect_unwired` / `vendor_unwired`), also under
-//!    `--no-verify`.
+//!    NOT attested, also under `--no-verify` — vendored: `vendor_unwired`;
+//!    hosted: nothing is discovered (exit 2 `manifest_not_found`), since the
+//!    lock was the only hosted state.
 //!
 //! Each passed step prints `BUN-VEX <tag> <mode> <step> ok` so a matrix log
 //! reads as a per-version results table.
@@ -61,7 +63,8 @@ impl BunMode {
     }
 
     /// The omission a ledger-backed record gets once the lock no longer
-    /// references it.
+    /// references it (hosted: only a PRE-v5 redirect ledger still earns
+    /// it; v5 hosted flows write no ledger).
     pub fn unwired_reason(self) -> &'static str {
         match self {
             BunMode::Hosted => "redirect_unwired",
@@ -200,6 +203,15 @@ fn matrix<F: FnOnce(&Path)>(project: &Path, scratch: &Path, case: &BunVexCase<'_
     let what = format!("{} {}", case.tag, mode.label());
     let ok = |step: &str| eprintln!("BUN-VEX {} {} {step} ok", case.tag, mode.label());
     let checkout = manifestless_checkout(project, &scratch.join(format!("vex-{}", case.tag)));
+    match mode {
+        BunMode::Hosted => assert_no_hosted_ledger(&checkout, &what),
+        BunMode::Vendored => assert!(
+            checkout
+                .join(socket_patch_core::vendor::VENDOR_STATE_REL)
+                .is_file(),
+            "{what}: the vendored flow must have written its ledger"
+        ),
+    }
     install(&checkout);
     let lock_path = checkout.join(case.lock);
     let wired_lock = std::fs::read(&lock_path).unwrap();
@@ -296,10 +308,6 @@ fn matrix<F: FnOnce(&Path)>(project: &Path, scratch: &Path, case: &BunVexCase<'_
             std::fs::write(path, bytes).unwrap();
         }
     }
-    assert!(
-        ledgers.iter().any(|(_, b)| b.is_some()),
-        "{what}: the flow left no ledger — the reverted step would be vacuous"
-    );
     std::fs::write(&lock_path, &case.registry_lock).unwrap();
     for no_verify in [false, true] {
         let run = VexRun {
@@ -307,12 +315,27 @@ fn matrix<F: FnOnce(&Path)>(project: &Path, scratch: &Path, case: &BunVexCase<'_
             ..online()
         };
         let out = run_vex(&bin, &checkout, &run);
-        assert_eq!(
-            out.code,
-            Some(1),
-            "{what} reverted (no_verify={no_verify}): {out}"
-        );
-        assert_skipped(&out.envelope, case.purl, mode.unwired_reason());
+        match mode {
+            BunMode::Vendored => {
+                assert_eq!(
+                    out.code,
+                    Some(1),
+                    "{what} reverted (no_verify={no_verify}): {out}"
+                );
+                assert_skipped(&out.envelope, case.purl, mode.unwired_reason());
+            }
+            BunMode::Hosted => {
+                assert_eq!(
+                    out.code,
+                    Some(2),
+                    "{what} reverted (no_verify={no_verify}): {out}"
+                );
+                assert_eq!(
+                    out.envelope["error"]["code"], "manifest_not_found",
+                    "{what} reverted (no_verify={no_verify}): no hosted state is left: {out}"
+                );
+            }
+        }
         assert_absent(out.doc.as_ref(), case.purl);
     }
     ok("reverted");

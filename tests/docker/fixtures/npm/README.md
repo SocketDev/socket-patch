@@ -8,7 +8,7 @@ with the bytes in `blobs/<after_hash>`. The test uses `--force` to skip the
 beforeHash check (we don't bother synthesizing a believable beforeHash —
 the goal is to validate the install + scan + apply dispatch end to end,
 not to test the hash-verification logic which is already covered by
-`apply_invariants.rs`).
+`apply/apply_invariants.rs`).
 
 To regenerate after editing the patched-content marker:
 

@@ -31,8 +31,9 @@
 //!      `vendor --vex`.
 //!
 //! The detached twin (`yarn_classic_detached_scan_vendored_…`) produces the
-//! state with `scan --mode vendored --detached` against a wiremock Socket
-//! API instead — the vendored shape that never has a manifest — and runs the
+//! state with `scan --mode vendored` against a wiremock Socket API
+//! instead — the manifest-free
+//! shape every vendored run has — and runs the
 //! same fresh-checkout install + manifest-less VEX matrix (plus the embedded
 //! re-scan).
 //!
@@ -44,6 +45,9 @@
 //! when `corepack` (yarn classic) is unavailable or the fixture install
 //! cannot reach the registry — unless `SOCKET_PATCH_YARN_E2E_REQUIRED=1`;
 //! every assertion after that is HARD.
+
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -121,8 +125,9 @@ fn scrub_socket_env(cmd: &mut Command) {
 /// Run the socket-patch binary with a scrubbed environment.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     scrub_socket_env(&mut cmd);
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -621,8 +626,8 @@ fn sha512_sri_b64(bytes: &[u8]) -> String {
 
 // ── detached vendoring from the patch API (the manifest-less shape) ────
 
-/// `scan --mode vendored --detached` against a wiremock Socket API: the
-/// vendored posture that NEVER has a `.socket/manifest.json` (the vendor
+/// `scan --mode vendored` against a
+/// wiremock Socket API: vendored mode NEVER writes `.socket/manifest.json` (the vendor
 /// ledger embeds the record) — the shape a depscan-opened PR commits. The
 /// scan discovers the dep (batch search), the record (with `blobContent`)
 /// comes from the mocked `view/<uuid>` and the tarball is built locally
@@ -714,6 +719,7 @@ fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
             })))
             .mount(&server)
             .await;
+        prebuilt_common::mount_view(&server, &view, None).await;
         Mock::given(method("GET"))
             .and(path(format!("/v0/orgs/test-org/patches/view/{UUID}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
@@ -731,7 +737,6 @@ fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
             "scan",
             "--mode",
             "vendored",
-            "--detached",
             "--json",
             "--yes",
             "--cwd",
@@ -743,12 +748,12 @@ fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
             "--org",
             "test-org",
             "--vendor-source",
-            "build",
+            "service",
         ],
     );
     assert_eq!(
         code, 0,
-        "scan --mode vendored --detached failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "scan --mode vendored failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
@@ -758,7 +763,7 @@ fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
     );
     assert!(
         !proj.join(".socket/manifest.json").exists(),
-        "--detached must never write the manifest"
+        "vendored mode must never write the manifest"
     );
     let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
     assert!(proj.join(&tgz_rel).is_file(), "vendored tarball missing");
@@ -832,15 +837,14 @@ fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
             ("vendor --vex", via_vendor()),
             // The command that produced the state, re-run manifest-less.
             (
-                "scan --mode vendored --detached --vex",
+                "scan --mode vendored --vex",
                 Box::new(|run: vex_e2e_common::VexRun| {
                     let mut run = run
                         .via(vex_e2e_common::VexVia::Scan)
                         .arg("--mode")
                         .arg("vendored")
-                        .arg("--detached")
                         .arg("--vendor-source")
-                        .arg("build")
+                        .arg("service")
                         .arg("--yes");
                     run.proxy_url = None;
                     run.api_url = Some(api_url.clone());

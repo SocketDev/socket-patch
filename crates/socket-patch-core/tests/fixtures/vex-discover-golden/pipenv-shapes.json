@@ -1,0 +1,92 @@
+{
+  "pipenv-shapes/2018.11.26/extras": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/pysocks@1.7.1",
+        "file": "Pipfile.lock"
+      },
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "Pipfile.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "pipenv-shapes/2018.11.26/marker-excluded": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "Pipfile.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "pipenv-shapes/2022.12.19/extras": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/pysocks@1.7.1",
+        "file": "Pipfile.lock"
+      },
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "Pipfile.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "pipenv-shapes/2022.12.19/marker-excluded": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "Pipfile.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "pipenv-shapes/2026.8.0/extras": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/pysocks@1.7.1",
+        "file": "Pipfile.lock"
+      },
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "Pipfile.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "pipenv-shapes/2026.8.0/marker-excluded": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "Pipfile.lock"
+      }
+    ],
+    "live_claims": []
+  }
+}

@@ -89,10 +89,8 @@ async fn roots_sharing_a_purl_share_every_lookup() {
         paths,
         vec![
             "a/.npmrc",
-            "a/.socket/vendor/redirect-state.json",
             "a/package-lock.json",
             "b/.npmrc",
-            "b/.socket/vendor/redirect-state.json",
             "b/package-lock.json"
         ]
     );
@@ -276,7 +274,16 @@ async fn malformed_and_deeply_nested_inputs_never_panic() {
         .iter()
         .find(|p| p.root == "deepjson")
         .unwrap();
-    assert_eq!(deepjson.error.as_ref().unwrap().code, "corrupt_ledger");
+    // The deep pre-v5 ledger is never parsed: whatever the project reports,
+    // it is not a ledger fault.
+    assert!(
+        deepjson
+            .error
+            .as_ref()
+            .is_none_or(|e| e.code != "corrupt_ledger"),
+        "{:?}",
+        deepjson.error
+    );
 }
 
 #[test]
@@ -484,7 +491,7 @@ async fn unauthorized_is_a_project_error_without_proxy_fallback() {
 }
 
 #[tokio::test]
-async fn dry_run_previews_without_records_or_ledger() {
+async fn dry_run_previews_without_records() {
     let server = npm_server().await;
     let output = run_engine(&server, build_input(&npm_files(), &[], options(true))).await;
     let paths: Vec<&str> = output
@@ -584,8 +591,11 @@ async fn vendored_takeover_is_refused() {
     assert!(output.changed_files.is_empty());
 }
 
+/// A pre-v5 redirect ledger (`.socket/vendor/redirect-state.json`) is
+/// never read by the v5 engine: a torn one neither fails its project nor
+/// changes its plan, and the engine never emits (or rewrites) the file.
 #[tokio::test]
-async fn corrupt_ledger_fails_only_its_project() {
+async fn corrupt_pre_v5_ledger_is_ignored() {
     let server = npm_server().await;
     let mut repo = prefixed("good", &npm_files());
     repo.extend(prefixed("bad", &npm_files()));
@@ -596,14 +606,25 @@ async fn corrupt_ledger_fails_only_its_project() {
     let output = run_engine(&server, build_input(&repo, &[], options(false))).await;
     let bad = output.projects.iter().find(|p| p.root == "bad").unwrap();
     let good = output.projects.iter().find(|p| p.root == "good").unwrap();
-    assert_eq!(bad.error.as_ref().unwrap().code, "corrupt_ledger");
-    assert_eq!(bad.redirect, serde_json::json!({ "mode": "hosted" }));
-    assert!(good.error.is_none());
+    assert!(bad.error.is_none(), "{:?}", bad.error);
+    assert!(good.error.is_none(), "{:?}", good.error);
+    assert_eq!(bad.redirected.len(), 1);
     assert_eq!(good.redirected.len(), 1);
-    assert!(output
+    let paths: Vec<&str> = output
         .changed_files
         .iter()
-        .all(|f| !f.path.starts_with("bad/")));
+        .map(|f| f.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            "bad/.npmrc",
+            "bad/package-lock.json",
+            "good/.npmrc",
+            "good/package-lock.json"
+        ],
+        "the ledger is neither consumed nor emitted"
+    );
 }
 
 #[tokio::test]
