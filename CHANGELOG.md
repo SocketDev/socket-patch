@@ -169,6 +169,11 @@ limits, and required install commands.
 - Transient apply locks are removed on normal command exit; no-op scans and full
   reversal avoid leaving unused `.socket/` state. Terminal output, telemetry
   timeouts, and update-check handling are more consistent.
+- Agent mode finds transitive npm packages in npm's linked store
+  (`install-strategy=linked`, `node_modules/.store`) and in a relocated pnpm
+  `virtualStoreDir`, instead of reporting them `package_not_installed` (#359,
+  #362). A store outside the project, such as pnpm's global virtual store, is
+  shared with other projects and is still not patched in place.
 - npm locks keep their own layout when edited. `scan --mode hosted`,
   `scan --mode vendored`, `rollback` and `vendor --revert`
   re-serialized `package-lock.json` / `npm-shrinkwrap.json` with LF line
