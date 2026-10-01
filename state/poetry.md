@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-01 (run 5), main `6e7ef74` (includes #330, the #327/#329 venv-discovery fix), latest release 4.0.0 (previous 3.3.0).
+Last updated: 2026-10-01 (run 6), main `61cfb9b` (includes #330, #446, #452, #456), latest release 4.0.0 (previous 3.3.0).
 
 ## Coverage matrix
 
@@ -34,29 +34,32 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 | OS | Cell | Result |
 | --- | --- | --- |
 | Linux | `scan -g` report-only (`--json`): global user-site `six` found, project `.venv` and lock-only packages don't leak in | pass |
-| Linux | `scan -g` sees Debian/apt `.egg-info` installs | fail #447 (pip sibling; all PyPI) |
+| Linux | `scan -g` sees Debian/apt `.egg-info` installs | fixed by #452 (but see #501) |
 | Linux | `scan -g` sees Poetry's official-installer venv (`~/.local/share/pypoetry/venv`) | fail (commented on #415) |
 | Linux | `scan -g --mode hosted`, `--global-prefix --mode hosted`, `SOCKET_GLOBAL=1 --mode hosted`: exit 2, poetry.lock untouched | pass |
 | Linux | `scan -g --mode agent`, re-run idempotent, `get <uuid> -g`, `SOCKET_GLOBAL=1 get`: global copy patched, `.venv` and lock untouched | pass |
 | Linux | `vex -g` attests applied global patch; plain `vex` refuses (`not_applied`) | pass |
 | Linux | `rollback -g` restores the global copy byte for byte | pass |
-| Linux | Cross-scope rollback (project apply + `rollback -g`, or `-g` apply + `rollback`) | fail #450 (still on `6e7ef74`, r5) |
+| Linux | Cross-scope rollback (project apply + `rollback -g`, or `-g` apply + `rollback`) | fail #450 (still on `61cfb9b`, r6) |
+| Linux | `scan -g` / `create = false` project scan with the same release in user site **and** a system dir (apt egg-info or `/usr/local` dist-info) | fail #501 (patches the shadowed system copy; apt case regressed in #452) |
+| Linux | #436/#445 on a hosted Poetry project: `get -g --mode hosted\|vendored`, `scan -g --mode hosted\|vendored` refuse; `rollback -g` / `remove -g` leave `poetry.lock` alone | pass (r6) |
+| Linux | Poetry `virtualenvs.create = false`, single system copy | pass (r6: 1.8.5, 2.0.1, 2.2.1, 2.5.1) |
 | Linux | `vex -g` from a hosted, synced Poetry project with an unpatched global copy: refuses (`not_applied`) | pass (r5) |
 | Linux | `list -g` from a hosted Poetry project lists the project's hosted pin | not filed (PR #446 notes it) |
 | Linux | Read-only `--global-prefix` (non-root user, path with space + `é`): human mode shows the error, exit 1 | pass; JSON drops the error (#424) |
-| Linux | Project scan without `-g`, Poetry venv undiscovered / not created yet: falls back to and **patches** the global interpreter | #327 layouts fixed by #330 (r5); still happens for `in-project = true` + no `.venv` (#476) |
+| Linux | Project scan without `-g`, Poetry venv undiscovered / not created yet: falls back to and **patches** the global interpreter | #327 layouts fixed by #330 (r5); still happens for `in-project = true` + no `.venv` (#476, re-confirmed r6 on `61cfb9b`; now lands in apt's dist-packages) |
 | macOS / Windows | all of the above | untested (probe branches blocked) |
 
 ## Backlog
 
-1. **Maintainer request (global mode), continued:** run the global-mode table on macOS and Windows and on Poetry 1.x installer venvs (needs probe branches). `-g` with `virtualenvs.create = false` is blocked in the sandbox (apt `six` egg-info, #447); try it in a probe container. `vex -g` refusal: pass (r5). `list -g` shows cwd hosted pins (noted in PR #446, not filed).
-2. macOS / Windows: verify #330 (#329 Windows hash; macOS case-preserving `realpath` vs Rust `canonicalize`), plus hosted/vendored on 2.5.1 and long paths (> 260 chars) under `.socket/vendor/pypi/`. This needs probe branches.
-3. Probe branches are blocked: `git push --delete` still fails ("remote end hung up", runs 1–5). A maintainer needs to delete `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes`.
-4. Re-test #436 / #445 on a Poetry project once PR #446 merges (`get -g --mode hosted|vendored`, `scan -g --mode vendored`, `rollback -g` on a hosted/vendored poetry.lock).
-5. Venv precedence corners: `VIRTUAL_ENV` set while `envs.toml` has an entry for the project (Poetry then ignores `VIRTUAL_ENV`), conda `CONDA_PREFIX` as the active env, several `poetry env use` minors.
-6. `socket.yml` policy (`minSeverity`, package filters, `maxNewPatches`) on a Poetry project with several patches. The run-5 mocks are parameterized by package, so they can be combined.
-7. Poetry 0.12 / 1.0 agent mode with an out-of-tree venv (pre-1.2 hash of the unnormalized cwd).
-8. Hosted rollback when PyPI's file list differs from the lock (documented "may refuse a drifted lock"; confirm the refusal is loud).
+1. **Global mode on macOS / Windows** (maintainer request), including #501's ordering on macOS (user site `~/Library/Python/3.X/...` vs Homebrew / python.org framework site-packages). This needs probe branches.
+2. macOS / Windows: verify #330 (#329 Windows hash; macOS case-preserving `realpath`), plus hosted/vendored on 2.5.1 and long paths (> 260 chars). This needs probe branches.
+3. Probe branches are blocked: `git push --delete` still fails (runs 1–6). A maintainer needs to delete `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes`.
+4. Venv precedence corners: `VIRTUAL_ENV` set while `envs.toml` has an entry for the project, conda `CONDA_PREFIX`, several `poetry env use` minors.
+5. `socket.yml` policy (`minSeverity`, package filters, `maxNewPatches`) on a Poetry project with several patches.
+6. Poetry 0.12 / 1.0 agent mode with an out-of-tree venv (pre-1.2 hash).
+7. Hosted rollback when PyPI's file list differs from the lock (confirm the refusal is loud).
+8. #456 on Poetry: after a `poetry sync` reinstall, `scan --mode agent` re-applies the recorded patch.
 
 ## Known non-bugs
 
@@ -86,3 +89,5 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 - The CLI's PyPI requests (hosted rollback, hosted → vendored takeover) need `SOCKET_PYPI_JSON_API` pointed at a local forwarder in the sandbox. Without it the takeover fails closed with `redirect_revert_failed`. A forwarder script that rewrites `files.pythonhosted.org` works.
 - Concurrent `scan` runs in one project: the extra runs exit 1 with "Another socket-patch process is operating in this directory" (use `--lock-timeout`). This is by design.
 - Dotted names (`jaraco.context`): Poetry 1.1 keeps the dotted name in the lock (quoted `[metadata.files]` key), Poetry ≥ 1.8 canonicalizes it. Hosted rewrite, install, vex and rollback all work with both purl spellings (r5).
+- `rollback -g --json` with no manifest returns `error` as a plain string ("Manifest not found"), not a `{code, message}` object. This is a shape nit, not Poetry-specific, and not filed.
+- Poetry 1.8 – 2.2 with `virtualenvs.create = false` running as root in this image reinstall a user-site package into `/usr/local/lib/python3.11/dist-packages`. That's Poetry's behaviour, not socket-patch.
