@@ -1,16 +1,16 @@
 [agent] Progress ledger for the scheduled Go modules bug-hunt routine (label pm:go).
 
-Last updated: 2026-10-01 (run 5), main `6e7ef74` (no Go changes since `2463257`; CLI still reports 4.0.0), latest release 4.0.0 (previous 3.3.0). On `6e7ef74`, #391 and #458 still reproduce. On `2463257`, #343, #392 and #393 did.
+Last updated: 2026-10-01 (run 6), main `61cfb9b` (no Go code changes since `2463257`; CLI still reports 4.0.0), latest release 4.0.0 (previous 3.3.0). On `61cfb9b`, #392 and #393 still reproduce, and #343 / #458 reproduce in hosted mode. On `6e7ef74`, #391 and #458 did (agent).
 
 ## Coverage matrix
 
-Cells are "pass", "fail #N" or "untested". Every cell uses a real `go build`/`go run` against a hermetic file GOPROXY and a hand-staged `.socket/manifest.json` plus blob (the `tests/e2e_golang_build.rs` shape). Hosted mode needs the wiremock harness (`e2e_golang_hosted_build.rs`) and hasn't been exercised by this routine yet. Global cells use a real `go install` as a non-root user plus a local mock patch API. Rows before run 3 were tested on `f6b7fb9`. Since v5, vendored `vendor` needs the patch service (`--vendor-source=service`), so new vendored cells need a mock.
+Cells are "pass", "fail #N" or "untested". Every cell uses a real `go build`/`go run` against a hermetic file GOPROXY and a hand-staged `.socket/manifest.json` plus blob (the `tests/e2e_golang_build.rs` shape). Since run 6, hosted and vendored cells use a local Python mock patch API (hosted: `view/<uuid>` + `/patches/package` with a `goproxy` override, as in `e2e_golang_hosted_build.rs`; vendored: a granted tarball with `sha512`, as in `vendor/golang.rs` `mount_go_granted`). The module proxy is served over http so hosted rollback works. Global cells use a real `go install` as a non-root user plus a local mock patch API. Rows before run 3 were tested on `f6b7fb9`. Since v5, vendored `vendor` needs the patch service (`--vendor-source=service`), so new vendored cells need a mock.
 
-| OS | go | Agent `apply` (plain) | Agent edge shapes (uppercase, /v2, pseudo, gopkg.in, CRLF, replace block/exclude/retract/toolchain, tidy, idempotent, rollback, remove) | `+incompatible` / no-go.mod module (`%2B` key) | Vendored `vendor` (plain) | Committed `vendor/` dir | `go env -w` settings | Upgrade drift → VEX | Transitive / unselected version | go.work user replace | go.work without `use .` | Hosted |
+| OS | go | Agent `apply` (plain) | Agent edge shapes (uppercase, /v2, pseudo, gopkg.in, CRLF, replace block/exclude/retract/toolchain, godebug/tool, nested module paths, new-file patches, tidy, idempotent, rollback, remove) | `+incompatible` / no-go.mod module (`%2B` key) | Vendored `vendor` (plain) | Committed `vendor/` dir | `go env -w` settings | Upgrade drift → VEX | Transitive / unselected version | go.work user replace | go.work without `use .` | Hosted |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 1.16.15 | untested | untested | untested | untested | fail #343 | fail #344 | untested | untested | n/a (no go.work) | n/a | untested |
 | Linux | 1.21.13 | pass (probe) | untested | untested | pass (probe) | fail #343 | fail #344 | untested | untested | untested | untested | untested |
-| Linux | 1.24.7 (+1.22.12) | pass | pass | apply/check/rollback pass; vex fail #484 | pass | fail #343 | fail #344 | fail #391 (agent) / vendored pass | fail #392 | fail #393 (agent + vendored) | fail #458 (agent; vendored blocked) | untested |
+| Linux | 1.24.7 (+1.22.12) | pass | pass | apply/check/rollback pass; vex fail #484 (agent only; vendored + takeover pass) | pass | fail #343 (agent, vendored, hosted) | fail #344 | fail #391 (agent) / vendored pass / hosted pass (vex exits 2) | fail #392 (agent + vendored), fail #509 (hosted, go 1.16) | fail #393 (agent, vendored, hosted) | fail #458 (agent, vendored, hosted) | plain get/day-2/idempotent/rollback/CRLF pass; `+incompatible` blocked (server contract) |
 | Linux | 1.26.3 | pass (probe) | untested | untested | pass (probe) | fail #343 | fail #344 | untested | untested | untested | fail #458 (agent, 1.26.8) | untested |
 | macOS | 1.24.13 / 1.26.3 | untested (plain; the vendor/-dir cell got as far as apply exit 0) | untested | untested | untested | fail #343 | fail #344 | untested | untested | untested | untested | untested |
 | Windows | 1.16.15 / 1.21.13 / 1.26.3 | fail #346 | blocked by #346 | blocked by #346 | fail #346 | blocked by #346 | fail #344 | blocked by #346 | blocked by #346 | blocked by #346 | blocked by #346 | untested |
@@ -28,17 +28,21 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real `go build`/`go
 ## Backlog
 
 0. **Maintainer request (partly covered, keep it on top):** global (`-g`) mode on macOS and Windows and across go 1.21 / 1.26. Linux 1.24/1.25 is done (see the table and #422). Linux 1.22.12 / 1.26.8 toolchains can be fetched from proxy.golang.org (`golang.org/toolchain/@v/v0.0.1-go<ver>.linux-amd64.zip`); `dl.google.com` (needed for 1.16–1.20) is blocked. The full checklist is in the 20261001T040000Z entry.
-1. Delete the stale probe branches `bughunt/go/20260930-goenv-vendor`, `bughunt/go/20260930-windows-apply` and `bughunt/go/20260930-windows-bisect`. `git push --delete` still fails from the sandbox (run 4), and this blocks new probe branches.
-2. A local mock of the patch service (also for #484 in vendored mode: `lookup_entry` has the same `+` vs `%2B` exposure) for vendored (now `--vendor-source=service` only) and hosted cells: #458 in vendored/hosted, go.work user replace, upgrade drift, `/v2`, `+incompatible`, CRLF/BOM go.sum, `go.work.sum`.
-3. `--global-prefix` shapes: GOPATH root instead of `pkg/mod`, multi-entry GOPATH, empty or relative GOMODCACHE.
-4. `GOWORK=<path>` / `GOWORK=off` (socket-patch never reads GOWORK); a nested module inside a parent module.
-5. Toolchain matrix (1.22 / 1.26) for #391, #392 and #393 on Linux via the proxy toolchains.
-6. Windows cells once #346 is fixed.
-7. Other `%XX` PURL spellings for Go: the `%2B` key in hosted mode, `vex -g` with a `+incompatible` global module, and `get`/`scan` JSON output.
+1. **Needs a maintainer:** delete the stale probe branches `bughunt/go/20260930-goenv-vendor`, `bughunt/go/20260930-windows-apply` and `bughunt/go/20260930-windows-bisect`. `git push --delete` from the sandbox fails (runs 4–5) or is denied by the permission classifier (run 6). Until they're gone, no new probe branches get pushed.
+2. Hosted `+incompatible` and `/v2+` modules (needs the gopatch version spelling the service uses for `+incompatible`), and `scan --mode hosted` with a `%2B` purl.
+3. Vendored and hosted with GOPRIVATE / GONOSUMDB / `GOFLAGS=-mod=vendor`, `go.work.sum`, and a CRLF go.sum in vendored mode.
+4. `--global-prefix` shapes: GOPATH root instead of `pkg/mod`, multi-entry GOPATH, empty or relative GOMODCACHE.
+5. `GOWORK=<path>` / `GOWORK=off` (socket-patch never reads GOWORK).
+6. Toolchain matrix (1.22 / 1.26) for #391, #392, #393 and #509 on Linux via the proxy toolchains.
+7. Windows cells once #346 is fixed.
 
 ## Known non-bugs
 
 - `patches-api.socket.dev` is blocked by the sandbox proxy. Stage `.socket/manifest.json` plus blobs locally. `proxy.golang.org` IS reachable from the sandbox.
+- `patches-api.socket.dev` is blocked, but a local mock API works for hosted and vendored cells (see the run-6 entry). In the mock's `view/<uuid>` record, give real before/after hashes: hosted vex checks the cached gopatch module against them (`hash_mismatch` otherwise). Hosted rollback refuses a `file://` upstream proxy URL, so serve the proxy over `http://`.
+- Running `apply` from a package subdirectory (no go.mod in cwd) fails closed with "matched no installed package". Use `--cwd <module root>`.
+- Hosted rollback with a go.sum that lists ONLY the patched module rewrites the restored lines as LF even when the file was CRLF. Cosmetic (go accepts both); with other modules present, CRLF is kept. Not filed.
+- Hosted rollback after an upgrade (`go get M@newer`) refuses with `patched_ref_invalid` and points at `git checkout -- go.mod`: fails closed by design.
 - 3.3.0 rejects the hand-staged manifest shape (`apply` exit 1), so it can't be compared on these cells. 4.0.0 `vex` needs an explicit `--product` in these fixtures (there's no git remote).
 - `apply` refuses (exit 1) when go.mod has a user-authored `replace M => …` for the patched module: intended. (The same line in go.work is NOT refused, which is #393.)
 - Agent-mode `repair` doesn't rebuild a deleted `.socket/go-patches/` copy. `repair --help` scopes rebuilding to vendored artifacts; re-run `apply`.
