@@ -405,10 +405,81 @@ fn equal_item(left: Option<&Item>, right: Option<&Item>) -> bool {
     left.map(item_text) == right.map(item_text)
 }
 
-fn same_identity(live: &dyn TableLike, expected: &dyn TableLike) -> bool {
-    ["name", "version"]
-        .iter()
-        .all(|key| equal_item(live.get(key), expected.get(key)))
+/// What makes an array element "the same entry" across the three
+/// documents: the canonical name plus `version` for a `name`d table (a lock
+/// package, a `[manifest] requirements` element), the PEP 508 project name
+/// for a requirement string. `None` means only an exact textual match can
+/// pair the element.
+fn table_identity(table: &dyn TableLike) -> Option<String> {
+    let name = table.get("name")?.as_str()?;
+    let version = table.get("version").and_then(Item::as_str).unwrap_or("");
+    Some(format!("{}\0{version}", canonicalize_pypi_name(name)))
+}
+
+fn value_identity(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let text = text.value().trim_start();
+            let end = text
+                .find(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+                .unwrap_or(text.len());
+            (end > 0).then(|| canonicalize_pypi_name(&text[..end]))
+        }
+        Value::InlineTable(table) => table_identity(table),
+        _ => None,
+    }
+}
+
+/// `value` without its own surrounding whitespace and comments, so an
+/// element reads the same wherever it sits in a (re)flowed array.
+fn bare_value(value: &Value) -> String {
+    let mut value = value.clone();
+    value.decor_mut().clear();
+    value.to_string()
+}
+
+fn bare_table(table: &Table) -> String {
+    let mut table = table.clone();
+    table.decor_mut().clear();
+    item_text(&Item::Table(table))
+}
+
+/// Pairs every element the vendoring changed (`original[i] != new[i]`)
+/// with the one live element that still is that entry: the unique live
+/// element textually equal to `new[i]`, else the unique one with its
+/// identity. Elements the vendoring left alone are not looked up at all, so
+/// the user may add, drop or reorder them freely. `None` (drift) when a
+/// changed element is gone, ambiguous, or two of them claim one live slot.
+fn pair_changed(
+    original: &[String],
+    new: &[String],
+    new_identity: &[Option<String>],
+    live: &[String],
+    live_identity: &[Option<String>],
+) -> Option<Vec<(usize, usize)>> {
+    let mut pairs = Vec::new();
+    let mut claimed = BTreeSet::new();
+    for index in (0..new.len()).filter(|&index| original[index] != new[index]) {
+        let unique = |found: Vec<usize>| (found.len() == 1).then(|| found[0]);
+        let textual: Vec<usize> = (0..live.len())
+            .filter(|&slot| live[slot] == new[index])
+            .collect();
+        let slot = if textual.is_empty() {
+            let identity = new_identity[index].as_ref()?;
+            unique(
+                (0..live.len())
+                    .filter(|&slot| live_identity[slot].as_ref() == Some(identity))
+                    .collect(),
+            )?
+        } else {
+            unique(textual)?
+        };
+        if !claimed.insert(slot) {
+            return None;
+        }
+        pairs.push((slot, index));
+    }
+    Some(pairs)
 }
 
 fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn TableLike) -> bool {
@@ -454,6 +525,16 @@ fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn T
     drifted
 }
 
+/// `original` in place of `live`, keeping the live element's own spacing
+/// and comments unless they are still the vendored ones.
+fn replace_value(live: &mut Value, original: &Value, new: &Value) {
+    let decor = live.decor().clone();
+    *live = original.clone();
+    if decor != *new.decor() {
+        *live.decor_mut() = decor;
+    }
+}
+
 fn restore_value(live: &mut Value, original: &Value, new: &Value) -> bool {
     if original.to_string() == new.to_string() || live.to_string() == original.to_string() {
         return false;
@@ -467,20 +548,40 @@ fn restore_value(live: &mut Value, original: &Value, new: &Value) -> bool {
         original.as_inline_table(),
         new.as_inline_table(),
     ) {
-        if !same_identity(live, new) {
-            return true;
-        }
         return restore_table(live, original, new);
     }
     if let (Some(live), Some(original), Some(new)) =
         (live.as_array_mut(), original.as_array(), new.as_array())
     {
-        if live.len() != new.len() || original.len() != new.len() {
+        if original.len() != new.len() {
             return true;
         }
+        let original: Vec<&Value> = original.iter().collect();
+        let new: Vec<&Value> = new.iter().collect();
+        let Some(pairs) = pair_changed(
+            &original
+                .iter()
+                .map(|value| bare_value(value))
+                .collect::<Vec<_>>(),
+            &new.iter()
+                .map(|value| bare_value(value))
+                .collect::<Vec<_>>(),
+            &new.iter()
+                .map(|value| value_identity(value))
+                .collect::<Vec<_>>(),
+            &live.iter().map(bare_value).collect::<Vec<_>>(),
+            &live.iter().map(value_identity).collect::<Vec<_>>(),
+        ) else {
+            return true;
+        };
         let mut drifted = false;
-        for ((live, original), new) in live.iter_mut().zip(original.iter()).zip(new.iter()) {
-            drifted |= restore_value(live, original, new);
+        for (slot, index) in pairs {
+            let current = live.get_mut(slot).expect("paired slot is in range");
+            if bare_value(current) == bare_value(new[index]) {
+                replace_value(current, original[index], new[index]);
+            } else {
+                drifted |= restore_value(current, original[index], new[index]);
+            }
         }
         return drifted;
     }
@@ -500,9 +601,6 @@ fn restore_item(live: &mut Item, original: &Item, new: &Item) -> bool {
         original.as_table_like(),
         new.as_table_like(),
     ) {
-        if !same_identity(live, new) {
-            return true;
-        }
         return restore_table(live, original, new);
     }
     if let (Some(live), Some(original), Some(new)) = (
@@ -510,16 +608,34 @@ fn restore_item(live: &mut Item, original: &Item, new: &Item) -> bool {
         original.as_array_of_tables(),
         new.as_array_of_tables(),
     ) {
-        if live.len() != new.len() || original.len() != new.len() {
+        if original.len() != new.len() {
             return true;
         }
+        let original: Vec<&Table> = original.iter().collect();
+        let new: Vec<&Table> = new.iter().collect();
+        let Some(pairs) = pair_changed(
+            &original
+                .iter()
+                .map(|table| bare_table(table))
+                .collect::<Vec<_>>(),
+            &new.iter()
+                .map(|table| bare_table(table))
+                .collect::<Vec<_>>(),
+            &new.iter()
+                .map(|table| table_identity(*table))
+                .collect::<Vec<_>>(),
+            &live.iter().map(bare_table).collect::<Vec<_>>(),
+            &live
+                .iter()
+                .map(|table| table_identity(table))
+                .collect::<Vec<_>>(),
+        ) else {
+            return true;
+        };
         let mut drifted = false;
-        for ((live, original), new) in live.iter_mut().zip(original.iter()).zip(new.iter()) {
-            if same_identity(live, new) {
-                drifted |= restore_table(live, original, new);
-            } else {
-                drifted = true;
-            }
+        for (slot, index) in pairs {
+            let current = live.get_mut(slot).expect("paired slot is in range");
+            drifted |= restore_table(current, original[index], new[index]);
         }
         return drifted;
     }
@@ -865,6 +981,110 @@ mod tests {
         let (restored, drifted) = restore_document(&edited, LOCK, &patched).unwrap();
         assert!(drifted);
         assert_eq!(restored, edited);
+    }
+
+    /// #474: `uv add --script` after vendoring adds a sibling element to the
+    /// script lock's `[manifest] requirements` array (and a `[[package]]`).
+    /// Only the vendored element is restored; the user's additions stay.
+    #[test]
+    fn added_sibling_requirement_does_not_block_script_lock_revert() {
+        let original = "version = 1\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [\n    { name = \"python-dateutil\", specifier = \"==2.8.2\" },\n    { name = \"six\", specifier = \"==1.16.0\" },\n]\n\n[[package]]\nname = \"python-dateutil\"\nversion = \"2.8.2\"\nsource = { registry = \"https://pypi.org/simple\" }\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\n";
+        let new = original
+            .replace(
+                "{ name = \"six\", specifier = \"==1.16.0\" }",
+                "{ name = \"six\", path = \".socket/vendor/pypi/u/six-1.16.0-py2.py3-none-any.whl\" }",
+            )
+            .replace(
+                "name = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }",
+                "name = \"six\"\nversion = \"1.16.0\"\nsource = { path = \".socket/vendor/pypi/u/six-1.16.0-py2.py3-none-any.whl\" }",
+            );
+        let add_idna = |text: &str| {
+            text.replace(
+                "    { name = \"python-dateutil\", specifier = \"==2.8.2\" },\n",
+                "    { name = \"idna\", specifier = \"==3.7\" },\n    { name = \"python-dateutil\", specifier = \"==2.8.2\" },\n",
+            )
+            .replacen(
+                "[[package]]\nname = \"python-dateutil\"",
+                "[[package]]\nname = \"idna\"\nversion = \"3.7\"\nsource = { registry = \"https://pypi.org/simple\" }\n\n[[package]]\nname = \"python-dateutil\"",
+                1,
+            )
+        };
+        let live = add_idna(&new);
+        let (restored, drifted) = restore_document(&live, original, &new).unwrap();
+        assert!(!drifted, "{restored}");
+        assert_eq!(restored, add_idna(original));
+    }
+
+    /// Appending to (or prepending to) a recorded array of strings keeps the
+    /// user's element and restores only the vendored one.
+    #[test]
+    fn sibling_strings_added_or_removed_around_the_vendored_element() {
+        let original = "dependencies = [\"one==1\", \"six==1.16.0\", \"two==2\"]\n";
+        let new = "dependencies = [\"one==1\", \"six @ file:///v/six.whl\", \"two==2\"]\n";
+        for (live, expected) in [
+            (
+                "dependencies = [\"idna==3.7\", \"one==1\", \"six @ file:///v/six.whl\", \"two==2\"]\n",
+                "dependencies = [\"idna==3.7\", \"one==1\", \"six==1.16.0\", \"two==2\"]\n",
+            ),
+            (
+                "dependencies = [\"six @ file:///v/six.whl\", \"two==2\"]\n",
+                "dependencies = [\"six==1.16.0\", \"two==2\"]\n",
+            ),
+            (
+                "dependencies = [\"one==1\", \"six @ file:///v/six.whl\", \"two==2\", \"idna==3.7\"]\n",
+                "dependencies = [\"one==1\", \"six==1.16.0\", \"two==2\", \"idna==3.7\"]\n",
+            ),
+        ] {
+            let (restored, drifted) = restore_document(live, original, new).unwrap();
+            assert!(!drifted, "{live}");
+            assert_eq!(restored, expected);
+        }
+    }
+
+    /// The vendored element itself changed or vanished: still drift, and the
+    /// live text is kept.
+    #[test]
+    fn vendored_element_edited_or_removed_is_still_drift() {
+        let original = "dependencies = [\"one==1\", \"six==1.16.0\"]\n";
+        let new = "dependencies = [\"one==1\", \"six @ file:///v/six.whl\"]\n";
+        for live in [
+            "dependencies = [\"one==1\", \"idna==3.7\"]\n",
+            "dependencies = [\"one==1\", \"six==1.17.0\", \"idna==3.7\"]\n",
+            "dependencies = [\"six @ file:///v/six.whl\", \"six @ file:///v/six.whl\"]\n",
+        ] {
+            let (restored, drifted) = restore_document(live, original, new).unwrap();
+            assert!(drifted, "{live}");
+            assert_eq!(restored, live);
+        }
+    }
+
+    /// A re-resolved package (new version) is not the vendored entry, even
+    /// when siblings were added too.
+    #[test]
+    fn re_resolved_package_with_added_sibling_is_drift() {
+        let patched = rewrite_python_lock(
+            LOCK,
+            "one",
+            "1",
+            ArtifactSource::Path(".socket/vendor/one-1-py3-none-any.whl"),
+            "first",
+        )
+        .unwrap()
+        .unwrap();
+        let edited = format!(
+            "{}\n[[packages]]\nname = \"three\"\nversion = \"3\"\n",
+            patched.replace("version = \"1\"", "version = \"1.1\"")
+        );
+        let (restored, drifted) = restore_document(&edited, LOCK, &patched).unwrap();
+        assert!(drifted);
+        assert_eq!(restored, edited);
+        let added = format!("{patched}\n[[packages]]\nname = \"three\"\nversion = \"3\"\n");
+        let (restored, drifted) = restore_document(&added, LOCK, &patched).unwrap();
+        assert!(!drifted);
+        assert_eq!(
+            restored,
+            format!("{LOCK}\n[[packages]]\nname = \"three\"\nversion = \"3\"\n")
+        );
     }
 
     #[test]

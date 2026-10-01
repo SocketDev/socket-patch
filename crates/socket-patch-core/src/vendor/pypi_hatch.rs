@@ -464,4 +464,54 @@ mod tests {
             ORIGINAL
         );
     }
+
+    /// #385: ordinary pyproject edits after vendoring (a release bump, a
+    /// comment on `name`, a new sibling dependency) must not block rollback.
+    #[tokio::test]
+    async fn revert_keeps_unrelated_project_edits() {
+        let original =
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n";
+        let edits: [(&str, &str); 4] = [
+            ("version = \"0.1.0\"", "version = \"0.2.0\""),
+            ("name = \"app\"", "name = \"app\" # renamed soon"),
+            ("dependencies = [", "dependencies = [\"idna==3.7\", "),
+            (
+                "version = \"0.1.0\"\n",
+                "version = \"0.3.0\"\ndescription = \"x\"\n",
+            ),
+        ];
+        for (from, to) in edits {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            tokio::fs::write(root.join("pyproject.toml"), original)
+                .await
+                .unwrap();
+            let project = load(root, "six", "1.16.0", UUID).await.unwrap();
+            let wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+            let wiring = wire(&project, root, "six", "1.16.0", &wheel, &"0".repeat(64))
+                .await
+                .unwrap();
+            let entry = entry(UUID, "six", &wheel, &"0".repeat(64), wiring);
+            let mut state = VendorState::default();
+            state.entries.insert("six".into(), entry.clone());
+            save_state(root, &state).await.unwrap();
+            let patched = tokio::fs::read_to_string(root.join("pyproject.toml"))
+                .await
+                .unwrap();
+            assert!(patched.contains(&wheel));
+            assert!(patched.contains(from), "{patched}");
+            tokio::fs::write(root.join("pyproject.toml"), patched.replacen(from, to, 1))
+                .await
+                .unwrap();
+            let outcome = revert(&entry, root, false).await;
+            assert!(outcome.success, "{from} -> {to}: {:?}", outcome.error);
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("pyproject.toml"))
+                    .await
+                    .unwrap(),
+                original.replacen(from, to, 1),
+                "{from} -> {to}"
+            );
+        }
+    }
 }
