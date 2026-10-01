@@ -150,6 +150,102 @@ struct RedirectFixture {
     flavor: LockFlavor,
     locks: Vec<&'static str>,
     pristine_locks: Vec<(&'static str, Vec<u8>)>,
+    /// Project files beyond package.json / the locks / `.socket/` that a
+    /// checkout carries (the #490 fixture's local `pkga` tarball).
+    extra_files: Vec<&'static str>,
+}
+
+/// How the fixture project depends on [`DEP`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Setup {
+    /// `npm install left-pad@1.3.0`: a direct registry dependency.
+    Direct,
+    /// #490: a local `pkga` depends on left-pad from git, and the project's
+    /// `overrides` send it back to the registry release, which is what npm
+    /// installs (the lock records the registry tarball; `pkga`'s entry
+    /// keeps its git spec).
+    OverriddenGitDep,
+}
+
+/// The local tarball the [`Setup::OverriddenGitDep`] project depends on.
+const PKGA_TGZ: &str = "pkga-1.0.0.tgz";
+
+/// Install the [`Setup::OverriddenGitDep`] project; `false` after a skip.
+fn install_overridden_git_dep(suite: &str, tmp: &Path, proj: &Path, cache: &Path) -> bool {
+    let pkga = tmp.join("pkga");
+    std::fs::create_dir_all(&pkga).unwrap();
+    std::fs::write(
+        pkga.join("package.json"),
+        format!(
+            r#"{{"name":"pkga","version":"1.0.0","dependencies":{{"{DEP}":"github:stevemao/left-pad#v{DEP_VERSION}"}}}}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pkga.join("index.js"),
+        format!("module.exports = require('{DEP}');\n"),
+    )
+    .unwrap();
+    let packed = npm_e2e_common::npm(&pkga, &["pack", "--cache", cache.to_str().unwrap()]);
+    assert!(
+        packed.status.success(),
+        "npm pack pkga: {}",
+        npm_e2e_common::output_text(&packed)
+    );
+    std::fs::rename(pkga.join(PKGA_TGZ), proj.join(PKGA_TGZ)).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        format!(
+            r#"{{"name":"redirect-capstone","version":"0.0.0","private":true,"dependencies":{{"pkga":"file:{PKGA_TGZ}"}},"overrides":{{"{DEP}":"{DEP_VERSION}"}}}}"#
+        ),
+    )
+    .unwrap();
+    let out = npm_e2e_common::npm(
+        proj,
+        &[
+            "install",
+            "--no-audit",
+            "--no-fund",
+            "--cache",
+            cache.to_str().unwrap(),
+        ],
+    );
+    if !out.status.success() {
+        npm_e2e_common::skip(
+            suite,
+            &format!(
+                "`npm install` of the overrides fixture failed (registry unreachable?):\n{}",
+                npm_e2e_common::output_text(&out)
+            ),
+        );
+        return false;
+    }
+    // The #490 premise: the registry release is installed, and the
+    // dependent's entry still carries its git spec.
+    let lock: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(proj.join("package-lock.json")).unwrap()).unwrap();
+    assert_eq!(
+        lock["packages"][format!("node_modules/{DEP}")]["resolved"],
+        format!("https://registry.npmjs.org/{DEP}/-/{DEP}-{DEP_VERSION}.tgz"),
+        "npm installs the override's registry release: {lock}"
+    );
+    assert!(
+        lock["packages"]["node_modules/pkga"]["dependencies"][DEP]
+            .as_str()
+            .is_some_and(|spec| spec.starts_with("github:")),
+        "pkga keeps its git spec: {lock}"
+    );
+    true
+}
+
+/// Whether the npm under test honors `overrides` (added in npm 8.3).
+fn npm_supports_overrides() -> bool {
+    let Some(version) = npm_e2e_common::npm_version() else {
+        return false;
+    };
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    (major, minor) >= (8, 3)
 }
 
 /// Which CLI invocation drives step 3 (the redirect itself). The scan
@@ -180,6 +276,7 @@ async fn redirect_scanned_project(
     tamper_served_tarball: bool,
     cli: RedirectCli,
     flavor: LockFlavor,
+    setup: Setup,
 ) -> Option<RedirectFixture> {
     let suite = format!("e2e_redirect_npm_build ({tag})");
     let Some(major) = npm_e2e_common::npm_major() else {
@@ -198,8 +295,28 @@ async fn redirect_scanned_project(
 
     // 1. REAL fixture: npm install (network allowed here, private cache).
     let cache = tmp.path().join("npm-cache");
-    if !npm_e2e_common::install_fixture(&suite, &proj, &cache, &format!("{DEP}@{DEP_VERSION}")) {
-        return None;
+    let mut extra_files = Vec::new();
+    match setup {
+        Setup::Direct => {
+            if !npm_e2e_common::install_fixture(
+                &suite,
+                &proj,
+                &cache,
+                &format!("{DEP}@{DEP_VERSION}"),
+            ) {
+                return None;
+            }
+        }
+        Setup::OverriddenGitDep => {
+            if !npm_supports_overrides() {
+                npm_e2e_common::skip(&suite, "this npm predates `overrides` (npm 8.3)");
+                return None;
+            }
+            if !install_overridden_git_dep(&suite, tmp.path(), &proj, &cache) {
+                return None;
+            }
+            extra_files.push(PKGA_TGZ);
+        }
     }
     let expected_lock_version = match major {
         ..=6 => 1,
@@ -566,7 +683,16 @@ async fn redirect_scanned_project(
         flavor,
         locks,
         pristine_locks,
+        extra_files,
     })
+}
+
+/// [`npm_e2e_common::fresh_checkout`] plus the fixture's extra files.
+fn checkout(fx: &RedirectFixture, dst: &Path) {
+    npm_e2e_common::fresh_checkout(&fx.proj, dst, &fx.locks);
+    for extra in &fx.extra_files {
+        std::fs::copy(fx.proj.join(extra), dst.join(extra)).unwrap();
+    }
 }
 
 /// New dir holding ONLY what a git checkout would carry — package.json, the
@@ -580,7 +706,7 @@ async fn redirect_scanned_project(
 /// twin checkout without it is refused EALLOWREMOTE and installs nothing.
 fn fresh_checkout_npm_ci(fx: &RedirectFixture) -> (PathBuf, Output) {
     let fresh = fx.tmp.path().join("fresh");
-    npm_e2e_common::fresh_checkout(&fx.proj, &fresh, &fx.locks);
+    checkout(fx, &fresh);
     assert_eq!(
         std::fs::read_to_string(fresh.join(".npmrc")).unwrap(),
         "allow-remote=all\n",
@@ -588,7 +714,7 @@ fn fresh_checkout_npm_ci(fx: &RedirectFixture) -> (PathBuf, Output) {
     );
     if npm_e2e_common::needs_allow_remote(fx.major) {
         let bare = fx.tmp.path().join("fresh-without-npmrc");
-        npm_e2e_common::fresh_checkout(&fx.proj, &bare, &fx.locks);
+        checkout(fx, &bare);
         std::fs::remove_file(bare.join(".npmrc")).unwrap();
         let refused = npm_e2e_common::npm_ci(&bare, &fx.tmp.path().join("refused-npm-cache"));
         let text = npm_e2e_common::output_text(&refused);
@@ -755,6 +881,7 @@ async fn npm_redirect_fresh_checkout_npm_ci_installs_patched_bytes_and_vex_verif
         false,
         RedirectCli::ScanRedirectVex,
         LockFlavor::PackageLock,
+        Setup::Direct,
     )
     .await
     else {
@@ -780,6 +907,31 @@ async fn npm_redirect_fresh_checkout_npm_ci_installs_patched_bytes_and_vex_verif
     // 7. MANIFEST-LESS VEX over the fresh checkout: lockfile + API,
     //    offline, reverted — standalone and via the embedded `apply --vex`.
     manifestless_tail(&fx, &fresh, installed, &[VexVia::Apply]);
+}
+
+/// #490: a git dependency the project's `overrides` send back to the
+/// registry is what npm installs from the registry, so the hosted scan
+/// redirects it (the shared steps assert `redirected: 1`, the lock pin and
+/// the in-run VEX statement), a fresh `npm ci` installs the patched bytes,
+/// the hash-verified `vex` attests it, and `rollback` restores the lock.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn npm_redirect_overridden_git_dependency_installs_patched_bytes() {
+    let Some(fx) = redirect_scanned_project(
+        "overrides",
+        false,
+        RedirectCli::ScanRedirectVex,
+        LockFlavor::PackageLock,
+        Setup::OverriddenGitDep,
+    )
+    .await
+    else {
+        return;
+    };
+    let (fresh, installed) = fresh_install_patched(&fx);
+    assert!(installed, "npm >= 8.3 installs the hosted pin");
+    post_install_vex(&fresh, &fx.server.uri());
+    rollback_removes_npmrc(&fx);
 }
 
 /// Step 5 of the capstone: the hash-verified `vex`. v5 hosted mode keeps no
@@ -843,6 +995,7 @@ async fn npm_redirect_shrinkwrap_fresh_checkout_and_manifestless_vex() {
         false,
         RedirectCli::ScanRedirectVex,
         LockFlavor::Shrinkwrap,
+        Setup::Direct,
     )
     .await
     else {
@@ -865,6 +1018,7 @@ async fn npm_redirect_tampered_hosted_tarball_fails_fresh_npm_ci() {
         true,
         RedirectCli::ScanRedirectVex,
         LockFlavor::PackageLock,
+        Setup::Direct,
     )
     .await
     else {
@@ -904,6 +1058,7 @@ async fn npm_get_uuid_hosted_fresh_checkout_npm_ci_installs_patched_bytes() {
         false,
         RedirectCli::GetUuidHosted,
         LockFlavor::PackageLock,
+        Setup::Direct,
     )
     .await
     else {
@@ -929,6 +1084,7 @@ async fn npm_get_ghsa_hosted_narrows_and_installs() {
         false,
         RedirectCli::GetGhsaHosted,
         LockFlavor::PackageLock,
+        Setup::Direct,
     )
     .await
     else {
