@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-01 (run 5), main `6e7ef74`, latest release tag v4.0.0.
+Last updated: 2026-10-01 (run 6), main `61cfb9b`, latest release tag v4.0.0.
 
 ## Coverage matrix
 
@@ -11,9 +11,9 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | OS | Ruby | Bundler | Hosted: single-line decl | Hosted: multi-line decl / `if` modifier | Hosted: decl in `group` block | Hosted: platform gem, no CHECKSUMS | Hosted: CHECKSUMS lock | Hosted: stale-install guard | Hosted: `BUNDLE_GEMFILE` in `.bundle/config` | Vendored: `Gemfile` only | Vendored: `gems.rb` + `Gemfile` twin | Vendored: `BUNDLE_GEMFILE` | Vendored: `gems.rb` only | Agent: multi-home `vex` |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 3.3.6 | 1.17.x | untested | untested | untested | untested | n/a | untested | untested | untested | untested | untested | untested | untested |
-| Linux | 3.3.6 | 2.2–2.4 | untested | fail #340 (2.4) | untested | untested | n/a | untested | fail #390 (2.4) | untested | fail #341 (2.4) | untested | untested | untested |
+| Linux | 3.3.6 | 2.2–2.4 | untested | fail #340 (2.4) | untested | untested | n/a | untested | fixed #390 (#431) | untested | fixed #341 (#431) | untested | untested | untested |
 | Linux | 3.3.6 | 2.6.9 | pass | untested | untested | untested | pass | untested | untested | untested | untested | untested | untested | untested |
-| Linux | 3.3.6 | 4.0.17 | pass | fail #340 | pass | pass (switches to patched ruby gem) | pass | pass | fail #390 | pass | fail #341 | fail #390 | refused (documented) | fail #420 |
+| Linux | 3.3.6 | 4.0.17 | pass | fail #340 | pass | pass (switches to patched ruby gem) | pass | pass | fixed #390 (#431) | pass | fixed #341 (#431) | fixed #390 (#431) | refused (documented) | fail #420 |
 | Linux (CI) | 2.7 / 3.3 / 3.4 | 2.4 / 2.5 / 2.6 | untested | untested (OS-independent) | untested | untested | untested | untested | untested (OS-independent) | untested | untested (OS-independent) | untested | untested | fail #420 |
 | macOS (CI) | 2.7 / 3.3 / 3.4 | 2.4 / 2.5 / 2.6 | untested | untested (OS-independent) | untested | untested | untested | untested | untested (OS-independent) | untested | untested (OS-independent) | untested | untested | fail #420 |
 | Windows (CI) | 2.7 / 3.3 / 3.4 | 2.4 / 4.0 | untested | untested (OS-independent) | untested | untested | untested | untested | untested (OS-independent) | untested | untested (OS-independent) | untested | untested | blocked by #421 |
@@ -22,8 +22,8 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 
 | OS | Ruby | Bundler | Direct dep (`~>`) | Transitive dep | Transitive, Gemfile ends in a blank line | `group` block + options | CRLF Gemfile | Non-rubygems.org upstream refused | Mixed (no-CHECKSUMS) lock |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 3.3.6 | 4.0.17 | pass (exact pin, documented) | fail #457 | pass | pass | pass | pass | n/a |
-| Linux | 3.3.6 | 2.6.9 | untested | fail #457 | untested | untested | untested | untested | documented (Gemfile-only pin is out of reach) |
+| Linux | 3.3.6 | 4.0.17 | pass (exact pin, documented) | fixed #457 (#460) | pass | pass | pass | pass | n/a |
+| Linux | 3.3.6 | 2.6.9 | untested | fixed #457 (#460) | untested | untested | untested | untested | documented (Gemfile-only pin is out of reach) |
 | macOS / Windows | any | any | untested | untested (OS-independent) | untested | untested | untested | untested | untested |
 
 ### Other hosted shapes (run 4)
@@ -40,6 +40,14 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | 2.6.9 | fail #482 | untested | untested | untested | pass | fail #483 | untested |
 | 2.4.22 | fail #482 | untested | untested | untested | pass (warns; install stays unpatched per the remedy) | fail #483 (silent unpatched install) | untested |
 
+### `BUNDLE_GEMFILE` env vs `.bundle/config` (run 6, Linux, Ruby 3.3.6)
+
+| Bundler | Hosted: config `Gemfile.next` + env `Gemfile` | Vendored: same | Env only `Gemfile.next` | Config only `Gemfile.next` |
+| --- | --- | --- | --- | --- |
+| 4.0.17 | fail #507 | untested | untested | pass (e2e suite) |
+| 2.6.9 | fail #507 | untested | untested | untested |
+| 2.4.22 | fail #507 | untested | untested | untested |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -54,12 +62,13 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 ## Backlog
 
 1. **Maintainer request (still open):** global (`-g`) mode on every major version and OS. Remaining: macOS system Ruby and Homebrew Ruby; rbenv / rvm / chruby / asdf layouts; unicode or space-containing `--global-prefix`; a non-writable dir on macOS and Windows (Program Files); `-g` from inside a project on macOS and Windows. Re-check #421 once #442 merges.
-2. Vendored `eval_gemfile` / loop declaration (the sibling of #482 at `vendor/gem.rs:1304`), driven through a copy of `e2e_vendor_gem_build.rs`.
-3. `BUNDLE_CACHE_PATH` from the environment (#483's variant); `vendor/cache` + `rollback`.
-4. #340 / #341 on Bundler 2.2–2.5 (Linux). Re-check #457 after #460 merges.
-5. Windows local mode for a Bundler project on system gems (no `BUNDLE_PATH`): does #421 hide the project's gems too?
-6. Windows hosted cells: CRLF Gemfile / lock, a `BUNDLE_PATH` with a drive letter or spaces, `x64-mingw-ucrt` platform gems, and `vendor/bundle` deployment mode.
-7. Ruby 3.4 + Bundler 2.2 can't boot. Check the floor messaging, and run `scan` from a subdirectory of a Bundler project.
+2. The vendored arm of #507 (`vendor/gem.rs:149`), driven through a copy of `e2e_vendor_gem_build.rs`.
+3. Vendored `eval_gemfile` / loop declaration (the sibling of #482 at `vendor/gem.rs`).
+4. `BUNDLE_CACHE_PATH` from the environment (#483's variant); `vendor/cache` + `rollback`.
+5. #340 on Bundler 2.2–2.5 (Linux); re-run #340 / #482 once the Gemfile rewriter changes.
+6. Windows local mode for a Bundler project on system gems (no `BUNDLE_PATH`): does #421 hide the project's gems too?
+7. Windows hosted cells: CRLF Gemfile / lock, a `BUNDLE_PATH` with a drive letter or spaces, `x64-mingw-ucrt` platform gems, and `vendor/bundle` deployment mode.
+8. Ruby 3.4 + Bundler 2.2 can't boot. Check the floor messaging, and run `scan` from a subdirectory of a Bundler project.
 
 ## Known non-bugs
 
@@ -82,3 +91,4 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 - Probe branches can't be deleted from the cloud sandbox (`git push --delete` gets 403 from the git proxy). `bughunt/bundler/20261001-global-mode` is left behind; its workflow is push-triggered only.
 - `scan --vex` takes `--vex-product`, not `--product` (that's `vex`'s flag). Without either, a gem project fails with `product_undetected`.
 - A committed `vendor/cache` with a stale archive still installs unpatched on Bundler 2.4 after the hosted scan. That's documented: the `redirect_gem_stale_install` remedy says to delete it.
+- Bundler's runtime `require "bundler/setup"` (without `bundle exec`) reads only the `BUNDLE_GEMFILE` env var, not `.bundle/config`; the CLI commands (`install`, `lock`, `exec`) let `.bundle/config` win. #507 is about the CLI order, which decides what gets installed.
