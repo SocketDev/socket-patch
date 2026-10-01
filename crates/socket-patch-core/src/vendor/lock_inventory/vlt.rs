@@ -6,8 +6,8 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 
-use super::view::ProjectView;
 use crate::constants::npm_family::VLT_LOCK;
+use super::view::ProjectView;
 use crate::vendor::vlt_lock_text::{
     is_default_registry, sniff_lock, split_dep_id, DepId, DepIdKind, LockSniff,
 };

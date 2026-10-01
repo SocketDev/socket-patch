@@ -164,14 +164,8 @@ pub fn batch_supersedes(candidate: &BatchPatchInfo, applied: &BatchPatchInfo) ->
 /// classify a recorded patch (ALREADY vs UPGRADE) and to report
 /// `updates[]`, on the same records that pick the patch, so selection,
 /// classification and reporting cannot disagree.
-pub fn search_result_supersedes(
-    candidate: &PatchSearchResult,
-    recorded: &PatchSearchResult,
-) -> bool {
-    key_supersedes(
-        &rank_search_result(candidate),
-        &rank_search_result(recorded),
-    )
+pub fn search_result_supersedes(candidate: &PatchSearchResult, recorded: &PatchSearchResult) -> bool {
+    key_supersedes(&rank_search_result(candidate), &rank_search_result(recorded))
 }
 
 fn key_supersedes(c: &RankKey<'_>, a: &RankKey<'_>) -> bool {
@@ -377,7 +371,12 @@ mod tests {
                     "2020-01-01T00:00:00Z",
                     &["critical", "high"]
                 ),
-                search_multi("z_new_low", "free", "2026-08-01T00:00:00Z", &["low", "low"]),
+                search_multi(
+                    "z_new_low",
+                    "free",
+                    "2026-08-01T00:00:00Z",
+                    &["low", "low"]
+                ),
             ]),
             "a_old_critical"
         );

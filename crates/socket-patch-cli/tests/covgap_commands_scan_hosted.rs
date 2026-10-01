@@ -566,7 +566,8 @@ async fn wet_takeover_refuses_unrevertable_vendored_flavor_fail_closed() {
         "the human skipped line must name purl + reason; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Warning: ") && stderr.contains("could not be reverted"),
+        stderr.contains("Warning: ")
+            && stderr.contains("could not be reverted"),
         "the takeover pre-warning must reach human stderr; stderr=\n{stderr}"
     );
 }
@@ -813,10 +814,7 @@ async fn zero_grant_wet_run_ignores_a_malformed_pre_v5_ledger() {
     let lock_before = std::fs::read(root.join("package-lock.json")).unwrap();
 
     let assert_ignored = |code: i32, doc: &Value, label: &str| {
-        assert_eq!(
-            code, 0,
-            "{label}: a pre-v5 ledger is never an error: {doc:#}"
-        );
+        assert_eq!(code, 0, "{label}: a pre-v5 ledger is never an error: {doc:#}");
         assert_eq!(doc["status"], "success", "{label}: {doc:#}");
         assert!(
             !doc.to_string().contains("redirect-state.json"),
@@ -1019,10 +1017,7 @@ async fn hosted_human_empty_discovery_ignores_a_malformed_pre_v5_ledger() {
 
     for extra in [&[][..], &["--silent"][..]] {
         let (code, stdout, stderr) = scan_hosted(root, &server.uri(), extra, &[]);
-        assert_eq!(
-            code, 0,
-            "{extra:?}: an empty discovery exits 0; stderr=\n{stderr}"
-        );
+        assert_eq!(code, 0, "{extra:?}: an empty discovery exits 0; stderr=\n{stderr}");
         if extra.is_empty() {
             assert!(
                 stdout.contains("No patches available for installed packages."),
@@ -1409,22 +1404,16 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
         ],
         &env,
     );
-    assert_eq!(
-        code, 1,
-        "a binary bun.lockb pin is refused: {stdout}\n{stderr}"
-    );
+    assert_eq!(code, 1, "a binary bun.lockb pin is refused: {stdout}\n{stderr}");
     let doc: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
     assert_eq!(doc["status"], "partial_failure", "{doc:#}");
-    let failed = doc["hosted"]["failed"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{doc:#}"));
+    let failed = doc["hosted"]["failed"].as_array().unwrap_or_else(|| panic!("{doc:#}"));
     assert_eq!(failed.len(), 1, "{doc:#}");
     assert_eq!(failed[0]["purl"], purl, "{doc:#}");
     let error = failed[0]["error"].as_str().unwrap_or_default();
     assert!(
-        error.starts_with(&format!(
-            "cannot restore {purl} to its upstream registry entry: "
-        )) && error.contains("bun.lockb")
+        error.starts_with(&format!("cannot restore {purl} to its upstream registry entry: "))
+            && error.contains("bun.lockb")
             && error.contains("git checkout"),
         "{error}"
     );
@@ -1830,9 +1819,7 @@ async fn unreadable_pnpm_workspace_gets_warning_only_guidance_in_a_live_run() {
         "the unreadable workspace file must be left byte-identical"
     );
     assert!(
-        !tmp.path()
-            .join(".socket/vendor/redirect-state.json")
-            .exists(),
+        !tmp.path().join(".socket/vendor/redirect-state.json").exists(),
         "v5 hosted mode writes no redirect ledger"
     );
 }
@@ -1944,8 +1931,9 @@ async fn live_hosted_overlap_fires_redirect_supersedes_vendored() {
     let (code, _stdout, stderr) = scan_hosted(root, &server.uri(), &psu, &[]);
     assert_eq!(code, 0, "human overlap run exits 0; stderr=\n{stderr}");
     assert!(
-        stderr.contains("Warning: Hosted wiring superseded the vendored ledger for:")
-            && stderr.contains(XPURL),
+        stderr.contains(
+            "Warning: Hosted wiring superseded the vendored ledger for:"
+        ) && stderr.contains(XPURL),
         "the supersedes warning must reach human stderr; stderr=\n{stderr}"
     );
 }
@@ -1993,7 +1981,8 @@ async fn human_dry_run_prints_would_rewrite_pnpm_guidance_and_vex_skip() {
         "the requested-but-skipped VEX must be announced; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Warning: ") && stderr.contains("trustLockfile"),
+        stderr.contains("Warning: ")
+            && stderr.contains("trustLockfile"),
         "the pnpm trust guidance must reach human stderr; stderr=\n{stderr}"
     );
     assert!(
@@ -2431,8 +2420,7 @@ async fn human_pnpm_rerun_prints_only_the_reminder_and_heal_restores_guidance() 
     let (code, stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        engine_stdout(&stdout)
-            .starts_with("Switched 1 package to hosted patches; rewrote 2 files.\n"),
+        engine_stdout(&stdout).starts_with("Switched 1 package to hosted patches; rewrote 2 files.\n"),
         "{stdout}"
     );
     // Everything from the pnpm warning on (the lines above it are the

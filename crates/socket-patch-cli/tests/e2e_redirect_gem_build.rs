@@ -1504,30 +1504,14 @@ fn vendor_takeover_keeps_the_hosted_gems_rb_pin(fx: &RedirectFixture) {
     let (code, stdout, stderr) = run_socket(
         &fx.proj,
         &[
-            "get",
-            UUID,
-            "--mode",
-            "vendored",
-            "--json",
-            "--yes",
-            "--cwd",
-            proj,
-            "--api-url",
-            &api,
-            "--org",
-            ORG,
-            "--api-token",
-            "fake",
+            "get", UUID, "--mode", "vendored", "--json", "--yes", "--cwd", proj, "--api-url",
+            &api, "--org", ORG, "--api-token", "fake",
             // The mock serves the patch registry: its origin is the one a
             // hosted pin is trusted on.
-            "--patch-server-url",
-            &api,
+            "--patch-server-url", &api,
         ],
     );
-    assert_ne!(
-        code, 0,
-        "vendor must refuse.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
+    assert_ne!(code, 0, "vendor must refuse.\nstdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         stdout.contains("gemfile_not_loaded"),
         "the manifest refusal names its cause:\n{stdout}"
