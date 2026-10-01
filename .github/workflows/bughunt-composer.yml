@@ -34,7 +34,7 @@ jobs:
           V: ${{ matrix.composer }}
           SHA: ${{ matrix.sha256 }}
         run: |
-          set -uo pipefail
+          set +e -u
           W="$RUNNER_TEMP/w"; command -v cygpath >/dev/null && W="$(cygpath -m "$RUNNER_TEMP")/w"
           mkdir -p "$W/srv" "$W/pkgs/tool/src" "$W/app"
           curl -fsSL --retry 3 -o "$W/composer.phar" "https://github.com/composer/composer/releases/download/$V/composer.phar"
