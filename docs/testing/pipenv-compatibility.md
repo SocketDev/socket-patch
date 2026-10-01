@@ -107,6 +107,13 @@ fixture dependency is `urllib3 1.26.18`, which has a public free-tier
 patch). Copy the binary out of `target/` first — a rebuild would swap it
 under the run. Concurrent invocations must use disjoint version/shape sets.
 
+A case that fails with a transport error in its error text or logs (pip
+giving up on PyPI, e.g. `too many 503 error responses`, a connection error,
+or a CLI request error / patch API 5xx) is re-run from a fresh case
+directory, at most three attempts in total. The failed attempts' logs stay
+under `attempts/<case>/<n>/` and the final row lists them in
+`transportRetries`. Functional failures are never retried.
+
 Per (release, shape, mode) the harness checks: the lock-only fresh checkout,
 `--dry-run` parity (hosted; the vendored preview is ledger-only by design and
 is recorded), an idempotent re-scan, the untouched Pipfile and `_meta`, the
