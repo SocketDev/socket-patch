@@ -13,7 +13,7 @@
 //!     (`$M2`, bind-mounted) with commons-text + commons-lang3 + the plugin
 //!     machinery → a marker patch on the extracted-jar's `META-INF/NOTICE.txt`
 //!     is hand-staged (manifest + blob; git-blob sha256 from the ACTUAL cached
-//!     bytes) → `socket-patch vendor --json --offline` (baked binary) →
+//!     bytes) → `socket-patch vendor --json` (baked binary) →
 //!     asserts: the rebuilt `.jar` under the
 //!     maven2 leaf `.socket/vendor/maven/<uuid>/…`, the verbatim upstream pom
 //!     beside it (carrying the commons-lang3 transitive), the `.sha1` sidecars,
@@ -44,7 +44,7 @@
 //!     the transitive was freshly fetched — it is resolved from the warm `$M2`
 //!     cache. That is the point: the pom must DECLARE it, which a minimal pom
 //!     would not.
-//!   stage 3 (`--network none`): re-warm commons-text into `$M2` from the
+//!   stage 3 (service available): re-warm commons-text into `$M2` from the
 //!     project's own clean file:// repo (stage 2 left `$M2` cold for it) →
 //!     idempotent re-vendor (`already_vendored`, pom.xml + jar byte-stable) →
 //!     `vendor --revert` restores `pom.xml` byte-identical and removes
@@ -58,8 +58,8 @@ mod docker_vendor_common;
 mod vex_e2e_common;
 
 use docker_vendor_common::{
-    assert_stage_markers, bash_prelude, json_assert_fns, run_in_image, run_in_image_network_none,
-    skip_if_no_image, stage_patch_fn,
+    assert_stage_markers, bash_prelude, json_assert_fns, run_in_image_network_none,
+    run_with_fixture, run_with_service, skip_if_no_image, stage_patch_fn,
 };
 
 const IMAGE: &str = "socket-patch-test-maven:latest";
@@ -87,7 +87,7 @@ fn render(stage_body: &str) -> String {
 }
 
 /// Stage 1: real fixture warm (network OK) + staged marker patch inside the jar,
-///   then `vendor --json --offline`, artifact/pom/sidecar/pom.xml asserts, VEX,
+///   then `vendor --json`, artifact/pom/sidecar/pom.xml asserts, VEX,
 ///   and fresh staging of ONLY the committable files.
 const STAGE1: &str = r#"
 # The shared local Maven repo (bind-mounted, survives across stages). Both the
@@ -95,8 +95,8 @@ const STAGE1: &str = r#"
 # point at it so warming, vendoring, and consumption all agree on one cache.
 export M2=/workspace/m2
 export MAVEN_REPO_LOCAL="$M2"
-# Keep socket-patch fully offline (also gates telemetry).
-export SOCKET_OFFLINE=1
+# Disable telemetry independently of artifact download access.
+export SOCKET_TELEMETRY_DISABLED=1
 MVN="mvn -q -Dmaven.repo.local=$M2 -Dmaven.test.skip=true -Dstyle.color=never"
 
 mkdir -p /workspace/proj && cd /workspace/proj
@@ -147,8 +147,9 @@ mkdir -p /workspace/snap
 cp pom.xml /workspace/snap/pom.prevendor
 sha256sum /tmp/patched.txt | cut -d' ' -f1 > /workspace/snap/patched.sha
 
-# 3. Vendor (fully offline: blob staged locally, jar rebuilt from the cache).
-socket-patch vendor --json --offline > /tmp/vendor.json 2>/tmp/vendor.err
+# 3. Download the artifact published from the staged fixture.
+publish_fixture
+socket-patch vendor --json > /tmp/vendor.json 2>/tmp/vendor.err
 RC=$?; cat /tmp/vendor.err >&2
 [ "$RC" -eq 0 ] || { cat /tmp/vendor.json >&2; fail "vendor exited $RC (expected 0)"; }
 assert_json_field /tmp/vendor.json '"status": "success"'
@@ -267,7 +268,8 @@ echo "===FRESH INSTALL VERIFIED==="
 
 # TAMPER PROBE: mutate the vendored jar (leaving its .sha1 stale), purge the
 # target from $M2, and force a cold re-resolve → checksumPolicy=fail must reject
-# it. Restore the pristine jar + re-warm $M2 afterward so stage 3 is clean.
+# it. Restore the pristine jar afterward (stage 3 re-warms $M2 from the clean
+# vendored repo).
 cp "$VJAR" /tmp/vjar.pristine
 printf 'TAMPER' >> "$VJAR"
 rm -rf "$M2/org/apache/commons/commons-text"
@@ -281,13 +283,13 @@ echo "===TAMPER CHECKSUM VERIFIED==="
 exit 0
 "#;
 
-/// Stage 3 (`--network none`): re-warm the target from the project's own clean
+/// Stage 3 (service available): re-warm the target from the project's own clean
 /// vendored repo, then idempotent re-vendor → revert (byte-identical pom.xml
 /// restore + full `.socket/vendor` removal) → re-vendor works again.
 const STAGE3: &str = r#"
 export M2=/workspace/m2
 export MAVEN_REPO_LOCAL="$M2"
-export SOCKET_OFFLINE=1
+export SOCKET_TELEMETRY_DISABLED=1
 MVN="mvn -q -Dmaven.repo.local=$M2 -Dmaven.test.skip=true -Dstyle.color=never"
 cd /workspace/proj
 LEAF=".socket/vendor/maven/__UUID__/org/apache/commons/commons-text/1.10.0"
@@ -326,7 +328,7 @@ cmp -s pom.xml /workspace/snap/pom.prevendor \
 echo "===REVERT VERIFIED==="
 
 # 3. Re-vendor after revert succeeds and rewires again.
-socket-patch vendor --json --offline > /tmp/revendor2.json 2>/tmp/revendor2.err
+socket-patch vendor --json > /tmp/revendor2.json 2>/tmp/revendor2.err
 RC=$?; cat /tmp/revendor2.err >&2
 [ "$RC" -eq 0 ] || { cat /tmp/revendor2.json >&2; fail "post-revert re-vendor exited $RC"; }
 assert_summary /tmp/revendor2.json applied 1
@@ -526,8 +528,8 @@ fn maven_vendor_fresh_checkout_install_and_revert() {
     // Docker Desktop's file-sharing allowlist.
     let host_dir = tmp.path().canonicalize().expect("canonicalize tempdir");
 
-    // Stage 1 — networked fixture warm + offline vendor + wiring + VEX.
-    let out = run_in_image(IMAGE, &host_dir, &with_purl_env(&render(STAGE1)));
+    // Stage 1 — networked fixture warm + service download + wiring + VEX.
+    let (out, service) = run_with_fixture(IMAGE, &host_dir, &with_purl_env(&render(STAGE1)));
     assert_stage_markers(
         "maven stage 1 (warm+vendor)",
         &out,
@@ -547,8 +549,13 @@ fn maven_vendor_fresh_checkout_install_and_revert() {
     // The consumed fresh checkout, attested with no manifest (host side).
     assert_manifestless_vex_from_host(&host_dir);
 
-    // Stage 3 — idempotency, revert, re-vendor (still no network).
-    let out = run_in_image_network_none(IMAGE, &host_dir, &with_purl_env(&render(STAGE3)));
+    // Stage 3 — idempotency, revert, redownload after revert.
+    let out = run_with_service(
+        IMAGE,
+        &host_dir,
+        &with_purl_env(&render(STAGE3)),
+        &service.docker_uri(),
+    );
     assert_stage_markers(
         "maven stage 3 (idempotent+revert+re-vendor)",
         &out,

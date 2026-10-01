@@ -5,7 +5,7 @@
 //! byte-identical `expected/` files + `expected-edits.json`. A fixture's
 //! `expected/` bytes were authored by the TS backend, so a match here proves a
 //! customer gets the same lockfile whether Socket opens the PR (backend) or
-//! they run `socket-patch scan --redirect` locally (this CLI).
+//! they run `socket-patch scan` (hosted mode) locally (this CLI).
 //!
 //! `RUST_IMPLEMENTED` lists the eco/flavor pairs this CLI rewrites today —
 //! covering JSON round-trip (npm, nuget), text-line (requirements, yarn), the

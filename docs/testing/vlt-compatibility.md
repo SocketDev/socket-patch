@@ -20,6 +20,14 @@ vlt project, and the caveats users meet, are in
 | E | 1.0.8 … 1.1.1 | `1` | as C, `peer.<16 hex>` | the registry URL |
 | F | 1.2.0 | `1` | as E; the global store (`store-linker`) | the registry URL |
 
+On every release that writes slot [3], it is omitted when the project
+configures `registry` and the node's tarball URL starts with it (vlt's
+`lockfile/save.ts`; the lock then records `options.registry`): with
+`config.registry` and `registries.npm` both set to the default registry,
+1.0.0-rc.33, 1.0.4, 1.0.10 and 1.2.0 all write a byte-identical 3-tuple lock
+(fixture `capture-1.2.0-config-registry`). The upstream restore follows the
+same rule.
+
 Hosted mode writes the patched sha512 into slot [2] and the hosted URL into
 slot [3] of every default-registry node (appending slot [3] to a 3-tuple);
 vendored mode turns the node into a `file` node for the D19 directory
@@ -32,8 +40,8 @@ socket-patch alike.
 | Layer | Where | What it proves |
 |---|---|---|
 | Unit and golden | `socket-patch-core` lib tests; `tests/redirect_golden.rs` (`npm/vlt/*`, shared with depscan's TS rewriter), `tests/redirect_golden_reverse_replay.rs`, `tests/vlt_locks.rs` (captured locks of every era, and vendored wiring byte for byte against what real `vlt ci`, `vlt install --frozen-lockfile` and `vlt install <new>` keep on 1.2.0, 1.0.10, 1.0.4, 1.0.0-rc.32 and 1.0.0-rc.14) | DepID codec, collation (`tests/fixtures/vlt/collation-golden.json`), the node-line grammar, the hosted slot rewrite and its slot revert, vendored lock surgery and its inverse, lock inventory, VEX discovery |
-| Hermetic suites | `in_process_redirect`, `in_process_vendor`, `in_process_rollback_hosted`, `in_process_vendor_bun_takeover`, `repair_vendor_flavors_e2e`, `e2e_vex_lockfile`, `setup_invariants`, … (the 3-OS `test` job) | every code of the vlt support, the artifact preflight against a wiremock server, the heal, takeovers, repair, the CLI surface |
-| Real-vlt capstones | the five binaries below plus the vlt legs of `e2e_hosted_production` / `e2e_vendored_production` | real installs: `vlt ci` and frozen installs of patched locks, byte-stable locks, integrity enforcement, the heal on a warm tree, re-saves, upgrades, the hardlinked global store, the setup hook |
+| Hermetic suites | `in_process_redirect`, `in_process_vendor`, `in_process_rollback_hosted`, `in_process_vendor_bun_takeover`, `repair::repair_vendor_flavors_e2e`, `e2e_vex_lockfile`, … (the 3-OS `test` job) | every code of the vlt support, the artifact preflight against a wiremock server, the heal, takeovers, repair, the CLI surface |
+| Real-vlt capstones | the five binaries below plus the vlt legs of `e2e_hosted_production` / `e2e_vendored_production` | real installs: `vlt ci` and frozen installs of patched locks, byte-stable locks, integrity enforcement, the heal on a warm tree, re-saves, upgrades, the hardlinked global store |
 | Native backtest | `scripts/backtest-vlt.py` | the production service end to end, per release, mode and project shape, against an oracle of the documented boundaries |
 
 `docs/testing/vlt-coverage.json` maps every vlt code and advisory variant,
@@ -65,8 +73,12 @@ asserted and each named test or row exists.
   `install-proof` (every capstone on 31 Linux, 11 macOS and 15 Windows
   releases, the Node floors 22.22.0 / 22.13.0 / 22.7.0 / 22.0.0 with the
   collation golden, and the store linkers auto / hardlink / copy / unpack / a `/dev/shm`
-  cache root); `native` (the backtest against production, artifacts
-  `vlt-results-<os>-<vlt>` in depscan's capture `result.json` shape);
+  cache root; a cell `ci.yml`'s `e2e` rows run identically is left to them,
+  see `scripts/ci-vlt-proof-suites.py`, except on dispatch); `native` (the backtest against production, artifacts
+  `vlt-results-<os>-<vlt>` in depscan's capture `result.json` shape; on macOS
+  it first pins the TLS-verified patch hosts in `/etc/hosts` through
+  `.github/actions/pin-socket-hosts`, because the hosted macOS resolver
+  intermittently loses `patch.socket.dev` for minutes while the service is up);
   `lock-diff` (the same cell's `vlt-lock.json` must be byte-identical on Linux,
   macOS and Windows); `matrix-coverage` (every era × suite × OS).
 - **Nightly:** `canary` runs every capstone on `vlt@latest` on 3 OS (only the
@@ -121,6 +133,13 @@ The capstones serve npmjs bytes from a local wiremock registry `R` and write
 | rc.7 … rc.29 | `{"config":{"registry": "https://registry.npmjs.org/"}}` | no: lock-driven installs reach public npm | the dead-registry assertions log `skip:non-hermetic-registry`; the patch service stays local |
 | rc.30 … rc.32 | `{"config":{"registry": R}}` | yes | URL-segment DepIDs |
 | ≥ rc.33 | `{"config":{"registries":{"npm": R}}}` (+ `config.registry = R` for rc.33 … 1.0.4) | yes | |
+
+The 0.0.0-1 and 0.0.0-11 writers can record an explicit npmjs tarball URL
+despite the configured harness registry. v5 rollback reconstructs the upstream
+pin without a saved lock fragment, so the rollback assertions allow that target
+URL to be omitted or restored on the harness registry. They still compare every
+other byte, including bystanders and CRLF line endings, and verify pristine
+package contents after a real install from the restored lock.
 
 `scripts/backtest-vlt.py`'s `write_vlt_json` follows the same table against
 public npm (a `registry` equal to vlt's npmjs default is left out: vlt strips
@@ -199,11 +218,10 @@ them per OS).
 | Binary | Suite | Legs |
 |---|---|---|
 | `e2e_redirect_vlt_build` | `hosted` | `scan_fresh_ci`, `frozen_dead_registry`, `ordinary_install_stable`, `get_uuid_fresh_ci`, `tamper_cold_eintegrity`, `rollback_byte_exact`, `rerun_noop`, `warm_tree_invalidates`, `no_cleanup_stays_stale`, `heal_rule_b_hidden_lock_without_node`, `heal_rule_c_no_hidden_lock`, `heal_rule_c_no_record`, `scoped`, `peer_workspace_instances`, `peer_rekey_rollback`, `install_newdep_preserves`, `update_drops`, `resave_install_rollback`, `resave_crlf_rollback`, `resave_update_rollback`, `crlf_lock`, `mirror_registries_npm`, `scalar_registry`, `named_alias_untouched`, `scoped_registry_untouched`, `jsr_untouched`, `default_registry_alias`, `registry_from_env`, `registry_from_user_config`, `content_encoding_refused`, `old_lockfile_ignored`, `warm_cache_hazard`, `idempotence`, `manifestless_vex`, `ts_written_lock`, `optional_dependency_heal`, `then_vendored_optional_takeover`, `platform_optional_skipped` |
-| `e2e_vendor_vlt_build` | `vendored` | `scan_fresh_ci`, `get_build_fresh_ci`, `get_service_fresh_ci`, `durability`, `workspace_member_selfref`, `alias_selfref`, `peer_root_selfref`, `peer_member_selfref`, `single_peer_context`, `optional_warm_reinstall`, `dep_with_deps`, `hostile_gitignore`, `autocrlf_checkout`, `bin_bearing`, `package_json_devdeps_patch`, `repair_rebuilds`, `idempotency`, `revert_byte_exact`, `resave_install_revert`, `resave_uninstall_revert`, `resave_crlf_revert`, `tamper_planted_file`, `tamper_file_content`, `tamper_payload_package_json`, `tamper_symlink_outside`, `tamper_deleted_gitignore`, `tamper_lock_file_node_path`, `transitive_refused`, `legacy_lockfile_warning`, `absent_version_refused`, `lockless_reinstall`, `manifestless_vex` |
+| `e2e_vendor_vlt_build` | `vendored` | `scan_fresh_ci`, `get_auto_fresh_ci`, `get_service_fresh_ci`, `durability`, `workspace_member_selfref`, `alias_selfref`, `peer_root_selfref`, `peer_member_selfref`, `single_peer_context`, `optional_warm_reinstall`, `dep_with_deps`, `hostile_gitignore`, `autocrlf_checkout`, `bin_bearing`, `package_json_devdeps_patch`, `repair_rebuilds`, `idempotency`, `revert_byte_exact`, `resave_install_revert`, `resave_uninstall_revert`, `resave_crlf_revert`, `tamper_planted_file`, `tamper_file_content`, `tamper_payload_package_json`, `tamper_symlink_outside`, `tamper_deleted_gitignore`, `tamper_lock_file_node_path`, `transitive_refused`, `legacy_lockfile_warning`, `absent_version_refused`, `lockless_reinstall`, `manifestless_vex` |
 | `mode_migration_vlt` | `migration` | `vendored_then_hosted`, `hosted_then_vendored`, `dry_run_parity`, `scoped_unwind_one_of_two`, `rollback_from_mixed`, `agent_apply_yields_to_vendored`, `agent_apply_after_hosted`, `hosted_scan_keeps_agent_patched_tree`, `agent_rollback_after_takeovers`, `pm_switch_npm_to_vlt`, `pm_switch_vlt_to_npm`, `flavor_changed`, `upgrade_hosted`, `upgrade_vendored` |
 | `e2e_safety_vlt` | `safety` | `linux_auto`, `explicit_hardlink`, `private_copies`, `cross_device_cache`, `agent_rollback`, `peer_fanout`, `hosted_heal`, `vendored_build`, `vendor_revert_and_repair`, `layout_note` |
 | `e2e_vlt` | `agent` | `scan_apply_rollback_list`, `get_and_remove`, `install_then_apply_patches_file`, `transitive_only_dep_apply_patches_store`, `lockfile_supplement`, `launcher`, `persistence_survives`, `persistence_reverted_by_reinstall`, `reruns_and_vex` |
-| `e2e_vlt` | `setup` | `hook_fires_per_reify`, `root_scripts_advisory`, `workspace_root_only`, `twice_no_duplicate`, `hook_failure`, `hook_abort_leaves_no_staging` |
 | `e2e_hosted_production` | `production` | `hosted_install_proof` |
 | `e2e_vendored_production` | `production` | `vendored_install_proof` |
 
@@ -264,9 +282,6 @@ store-linker knob, `unset` when not given), `cache_root` and `upgrade`
 | as above | `all` | `cache_root=unset` | safety | `cross_device_cache` | `no-cache-root` |
 | a scalar `registry` makes lock-driven installs re-resolve from public npm | `1.0.0-rc.7 … 1.0.0-rc.29` | — | agent | `scan_apply_rollback_list`, `launcher` | `non-hermetic-registry` |
 | `npm:` alias specs resolve against public npm even with `registries.npm` | `1.0.0-rc.30 … 1.0.0-rc.32` | — | agent | `scan_apply_rollback_list` | `non-hermetic-registry` |
-| root `pre*`/`post*` scripts run without an `install` script | `< 1.0.0-rc.13` | — | setup | `hook_fires_per_reify`, `workspace_root_only`, `hook_failure` | `root-postinstall-not-run` |
-| a failing hook's abort on Windows (rollback EBUSY fix from 1.0.5) | `all` | `os!=windows` | setup | `hook_abort_leaves_no_staging` | `windows-only` |
-| as above | `< 1.0.5` | — | setup | `hook_abort_leaves_no_staging` | `pre-ebusy-fix` |
 | `lockfileVersion` 0 with legacy (`·`/`§`) DepIDs | `0.0.0-19 … 1.0.0-rc.14` | — | — | — | — |
 | `lockfileVersion` 1, tilde DepIDs | `>= 1.0.0-rc.15` | — | — | — | — |
 | a plain `vlt install` re-extracts a stale installed copy (`no_cleanup_stays_stale` expects the patch there) | `== 0.0.0-14` | — | — | — | — |
@@ -291,6 +306,5 @@ The legs run on Linux, macOS and Windows. The Linux-default `auto` store
 linker (hardlinks, `safety/linux_auto`) cannot run on macOS or Windows; it is
 covered on Linux by the CI `e2e` row `e2e_safety_vlt` on ubuntu with vlt
 1.2.0 and by `vlt-compatibility.yml`'s store-linker rows, and was also run
-locally in `node:24-slim` under Docker. Windows-only legs
-(`setup/hook_abort_leaves_no_staging`, the junction and dir-symlink store
-cases) run on the Windows rows.
+locally in `node:24-slim` under Docker. Windows-only cases
+(the junction and dir-symlink store cases) run on the Windows rows.

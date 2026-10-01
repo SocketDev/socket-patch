@@ -6,8 +6,8 @@
 //! non-Unicode argument: the binary died with a Rust panic message and exit
 //! code 101 ("please report this bug" territory) before clap ever saw the
 //! command line. The contract treats malformed invocations as clap usage
-//! errors (exit `2`, message on stderr) — see `setup --check --remove` in
-//! `CLI_CONTRACT.md` — so a bad byte in argv must take that path too.
+//! errors (exit `2`, message on stderr; see `CLI_CONTRACT.md`) — so a bad
+//! byte in argv must take that path too.
 //!
 //! These tests run the compiled binary as a subprocess because the bug lives
 //! in `main.rs` itself (the argv collection step), upstream of everything the

@@ -109,7 +109,7 @@ fn wrong_source_does_not_panic() {
     }
 }
 
-/// Security regression (mirrors the lib's
+/// Security (mirrors the lib's
 /// `test_apply_diff_forged_oversize_header_is_safe`): a hostile delta can
 /// claim an arbitrary target size in header bytes 24..32. qbsdiff does NOT
 /// validate that field against the real payload, so feeding it straight into
@@ -118,8 +118,7 @@ fn wrong_source_does_not_panic() {
 /// `apply_diff` must clamp the hint and still produce correct output.
 ///
 /// Without the clamp this test panics/aborts on the allocation, so it fails
-/// loudly if the bound is ever removed. This is the protection the rest of
-/// this "mirror" file was missing.
+/// loudly if the bound is ever removed.
 #[test]
 fn forged_oversize_header_is_safe() {
     let before = b"the quick brown fox jumps over the lazy dog";
@@ -163,7 +162,7 @@ fn forged_max_u64_header_is_safe() {
     );
 }
 
-/// Security regression (mirrors the lib's
+/// Security (mirrors the lib's
 /// `test_apply_diff_forged_negative_block_length_does_not_panic`): the
 /// compressed control/diff block lengths in header bytes 8..24 are decoded
 /// with a sign-magnitude scheme. A field with the sign bit set decodes to a

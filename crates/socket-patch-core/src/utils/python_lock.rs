@@ -5,10 +5,6 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Tab
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::digest::{sha256_hex, sha256_prefixed};
 
-#[cfg(test)]
-#[path = "python_lock_oracle.rs"]
-pub(crate) mod oracle;
-
 #[derive(Clone, Copy, Debug)]
 pub enum ArtifactSource<'a> {
     Url(&'a str),
@@ -241,6 +237,32 @@ pub fn preserve_line_endings(original: &str, rendered: String) -> String {
         previous = character;
     }
     output
+}
+
+/// Whether `existing` is an earlier hosted redirect of the SAME artifact:
+/// same origin (`scheme://host[:port]`) and same trailing filename as the
+/// current artifact URL, fragments ignored. Grant tokens and patch uuids live
+/// in the path between them, so a rotated token or a superseded patch (new
+/// uuid) takes over the stale pin in place instead of being refused as a
+/// foreign source or stranding it on a URL that no longer serves.
+pub(crate) fn is_prior_hosted_url(existing: &str, current: &str) -> bool {
+    fn origin_and_leaf(url: &str) -> Option<(&str, &str)> {
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return None;
+        }
+        let url = url.split('#').next()?;
+        let scheme_end = url.find("://")? + 3;
+        let path_start = url[scheme_end..].find('/')? + scheme_end;
+        let leaf = url[path_start..]
+            .rsplit('/')
+            .next()
+            .filter(|leaf| !leaf.is_empty())?;
+        Some((&url[..path_start], leaf))
+    }
+    match (origin_and_leaf(existing), origin_and_leaf(current)) {
+        (Some(old), Some(new)) => old == new,
+        _ => false,
+    }
 }
 
 fn inline(entries: &[(&str, Value)]) -> Value {

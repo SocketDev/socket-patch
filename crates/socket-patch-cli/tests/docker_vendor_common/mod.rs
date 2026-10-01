@@ -11,7 +11,7 @@
 //!   stage 2 (--network none): fresh-checkout copy of ONLY the committable
 //!                           files + strictest native install with cold
 //!                           caches → patched bytes prove out
-//!   stage 3 (offline-safe): idempotent re-vendor / `--revert` / re-vendor
+//!   stage 3 (service available): offline reuse / `--revert` / redownload
 //!
 //! So instead of a throwaway container filesystem, every stage runs with the
 //! same host tempdir bind-mounted at `/workspace`. The socket-patch binary
@@ -26,6 +26,12 @@
 //! `#![allow(dead_code)]`: each suite uses a different subset.
 
 #![allow(dead_code)]
+
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
+use std::io::{BufRead, Read, Write};
+use std::process::Stdio;
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -89,7 +95,7 @@ pub fn skip_or_require_image(image: &str, required: bool) -> bool {
     true
 }
 
-fn docker_run(image: &str, host_dir: &Path, script: &str, extra: &[&str]) -> Output {
+fn docker_command(image: &str, host_dir: &Path, script: &str, extra: &[&str]) -> Command {
     let mut cmd = Command::new("docker");
     cmd.args(["run", "--rm", "-i"]);
     cmd.args(extra);
@@ -101,7 +107,94 @@ fn docker_run(image: &str, host_dir: &Path, script: &str, extra: &[&str]) -> Out
     ]);
     cmd.args(cov_docker_args());
     cmd.args([image, "bash", "-c", script]);
-    cmd.output().expect("docker run")
+    cmd
+}
+
+fn docker_run(image: &str, host_dir: &Path, script: &str, extra: &[&str]) -> Output {
+    docker_command(image, host_dir, script, extra)
+        .output()
+        .expect("docker run")
+}
+
+/// Freeze the real installed fixture when the container reaches
+/// `publish_fixture`, then serve its artifact to the CLI. Stdin carries the
+/// service URL back into the same shell, preserving its variables and /tmp.
+/// The returned server stays alive for the later redownload/revert stages.
+pub fn run_with_fixture(
+    image: &str,
+    host_dir: &Path,
+    script: &str,
+) -> (Output, prebuilt_common::Server) {
+    let mut child = docker_command(
+        image,
+        host_dir,
+        script,
+        &["--add-host=host.docker.internal:host-gateway"],
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("docker fixture setup");
+    let mut stderr = child.stderr.take().unwrap();
+    let stderr_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = Vec::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            let result = child.wait().unwrap();
+            let stderr = stderr_thread.join().unwrap();
+            panic!(
+                "fixture setup exited {result} before publication:\n{}\n{}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        stdout.extend_from_slice(line.as_bytes());
+        if line.trim() == "===FIXTURE READY===" {
+            break;
+        }
+    }
+    let m2 = host_dir.join("m2");
+    let env = if m2.is_dir() {
+        vec![("MAVEN_REPO_LOCAL", m2.to_str().unwrap())]
+    } else {
+        Vec::new()
+    };
+    let server = prebuilt_common::Server::docker_project(&host_dir.join("proj"), &env);
+    writeln!(child.stdin.take().unwrap(), "{}", server.docker_uri()).unwrap();
+    reader.read_to_end(&mut stdout).unwrap();
+    let status = child.wait().unwrap();
+    let stderr = stderr_thread.join().unwrap();
+    (
+        Output {
+            status,
+            stdout,
+            stderr,
+        },
+        server,
+    )
+}
+
+/// Run a later lifecycle stage against the same immutable artifact service.
+pub fn run_with_service(image: &str, host_dir: &Path, script: &str, uri: &str) -> Output {
+    docker_run(
+        image,
+        host_dir,
+        script,
+        &[
+            "--add-host=host.docker.internal:host-gateway",
+            "-e",
+            &format!("SOCKET_VENDOR_URL={uri}"),
+            "-e",
+            &format!("SOCKET_PATCH_SERVER_URL={uri}"),
+        ],
+    )
 }
 
 /// Run `script` (bash) inside `image` with `host_dir` bind-mounted at
@@ -148,6 +241,12 @@ pub fn assert_stage_markers(label: &str, out: &Output, markers: &[&str]) {
 pub fn bash_prelude() -> &'static str {
     r#"set -u
 fail() { echo "FAIL: $*" >&2; exit 1; }
+publish_fixture() {
+  echo "===FIXTURE READY==="
+  read -r SOCKET_VENDOR_URL || fail "fixture service did not start"
+  export SOCKET_VENDOR_URL
+  export SOCKET_PATCH_SERVER_URL="$SOCKET_VENDOR_URL"
+}
 git_blob_sha() {
   # git blob sha256: sha256("blob <len>\0" + bytes)
   local f="$1"
@@ -164,11 +263,11 @@ git_blob_sha() {
 /// Bash snippet defining `stage_patch <purl> <uuid> <file_key> <before_file>
 /// <after_file> [<ghsa> <cve>]`: writes `.socket/manifest.json` + the
 /// after-hash blob into `.socket/blobs/` (relative to the CURRENT directory —
-/// call from the project root) so `socket-patch vendor --offline` runs with
-/// zero network. The optional trailing `<ghsa> <cve>` pair records one
+/// call from the project root) as input to the artifact fixture service.
+/// The optional trailing `<ghsa> <cve>` pair records one
 /// high-severity vulnerability so a generated VEX document has a statement
 /// to emit; omitted, `vulnerabilities` stays empty. Shape mirrors
-/// `e2e_vendor_npm_build.rs::stage_patch` / `stage_patch_with_vuln`.
+/// `e2e_vendor_npm_build.rs::stage_patch_with_vuln`.
 /// Requires [`bash_prelude`] (uses `git_blob_sha`).
 pub fn stage_patch_fn() -> &'static str {
     r#"stage_patch() {

@@ -19,7 +19,7 @@ A build backend alone does not change which existing pip inputs are wired.
 
 A range, transitive-only declaration, dynamic dependency metadata, custom
 environment plugin, source table or conditional override is refused before
-writing. Use the install hook for these shapes. Hosted PEP 735 groups are
+writing. Use agent mode (`scan --mode agent` + `socket-patch apply` in CI) for these shapes. Hosted PEP 735 groups are
 supported; vendored groups are refused because Hatch does not expand
 `{root:uri}` within dependency groups. Unknown direct sources require an
 explicit revert before patching.

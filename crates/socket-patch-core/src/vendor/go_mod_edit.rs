@@ -27,7 +27,7 @@
 //! `apply`'s reconcile can never prune a vendored module and vice versa).
 //! Policy about *when* an owner may take over lives in the callers.
 //!
-//! ## Why `replace` (validated empirically — see project memory)
+//! ## Why `replace` (validated empirically)
 //! A local-path `replace` target is **not** `go.sum` content-verified, so
 //! patched bytes build cleanly under the default `-mod=readonly`. The directive
 //! is keyed by *module + version*: a stale pin (the graph resolved a different
@@ -687,7 +687,7 @@ pub(crate) fn scan_hosted_replace(
 }
 
 /// [`upsert_hosted_replace_entry`] from a [`scan_hosted_replace`] of the
-/// same `content`, editing it in place (an append no longer copies the
+/// same `content`, editing it in place (an append does not copy the
 /// file). `Ok(true)` when it changed.
 pub(crate) fn apply_hosted_replace(
     content: &mut String,
@@ -1679,8 +1679,7 @@ replace (
     }
 
     /// `go.mod` is user-owned: editing it must not reset its permission bits
-    /// (a 0600 private go.mod silently becoming umask-default 0644 is the
-    /// `package_json/update.rs` mode-reset bug, same class).
+    /// (a 0600 private go.mod must not silently become umask-default 0644).
     #[cfg(unix)]
     #[tokio::test]
     async fn test_ensure_preserves_go_mod_mode() {

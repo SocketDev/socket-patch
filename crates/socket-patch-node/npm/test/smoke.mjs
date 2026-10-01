@@ -210,8 +210,8 @@ test('streamed session redirects the package-lock fixture', async () => {
   const paths = result.changedFiles.map((f) => f.path)
   assert.deepEqual(paths, [...paths].sort())
   assert.ok(
-    paths.some((p) => p.startsWith('.socket/')),
-    `a wet run writes the ledger (changed: ${paths.join(', ')})`,
+    !paths.some((p) => p.startsWith('.socket/')),
+    `v5 hosted mode writes only lockfile/config edits, no ledger (changed: ${paths.join(', ')})`,
   )
   assert.deepEqual(result.changedBinaryFiles, [])
   assert.deepEqual(result.deletedFiles, [])
@@ -222,7 +222,7 @@ test('streamed session redirects the package-lock fixture', async () => {
   assert.ok(calls.fetchPatch >= 1)
 })
 
-test('dry run previews the lockfile without a ledger or patch fetches', async () => {
+test('dry run previews the lockfile without patch fetches', async () => {
   const { provider, calls } = fakeProvider()
   const selection = addon.selectHostedScanPaths(tree)
   const session = new addon.HostedScanSession({ orgSlug: 'test-org', dryRun: true }, provider)
@@ -232,6 +232,24 @@ test('dry run previews the lockfile without a ledger or patch fetches', async ()
   assert.ok(paths.includes('package-lock.json'))
   assert.ok(!paths.some((p) => p.startsWith('.socket/')))
   assert.equal(calls.fetchPatch, 0)
+})
+
+test('maxNewPatches defers new patches and reports the rollout block', async () => {
+  const { provider } = fakeProvider()
+  const selection = addon.selectHostedScanPaths(tree)
+  const session = new addon.HostedScanSession({ orgSlug: 'test-org', maxNewPatches: 0 }, provider)
+  streamSelection(session, selection)
+  const result = await session.finish()
+  const [project] = result.projects
+  assert.deepEqual(project.redirected, [])
+  assert.deepEqual(
+    project.deferred.map((d) => [d.purl, d.rank]),
+    [['pkg:npm/left-pad@1.3.0', 1]],
+  )
+  assert.ok(project.skipped.some((s) => s.reason === 'rollout_deferred'))
+  assert.deepEqual(result.rollout.maxNewPatches, { value: 0, source: 'flag' })
+  assert.deepEqual(result.rollout.counts, { new: 0, deferred: 1, upgrade: 0, already: 0 })
+  assert.deepEqual(result.changedFiles, [])
 })
 
 test('provider failures become project errors, never rejections', async () => {

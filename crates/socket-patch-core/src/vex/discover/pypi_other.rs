@@ -22,8 +22,9 @@
 //!   of a lock entry, not attestation;
 //! * a root-anchored `.socket/vendor/pypi/<uuid>/<wheel>` path
 //!   ([`vendor_ref`]) → [`WiringMode::Vendored`]. The wheel must be a single
-//!   PEP 427 filename naming the entry's own dist (PEP 503-canonical on both
-//!   sides), and its version is the ref's.
+//!   PEP 427 filename (or a server sdist's `dist-version.tar.gz`) naming the
+//!   entry's own dist (PEP 503-canonical on both sides), and its version is
+//!   the ref's.
 //!
 //! Anything else Socket-SHAPED (a `.socket/vendor/` path that escapes the
 //! root or is not a pypi wheel, a patch-server url with no patch uuid) is a
@@ -537,7 +538,7 @@ fn vendored_ref(
         .flatten()
         .ok_or_else(|| {
             format!(
-                "{:?} is not a single PEP 427 wheel filename",
+                "{:?} is not a single PEP 427 wheel or sdist filename",
                 vref.artifact_rel
             )
         })?;
@@ -998,6 +999,43 @@ mod tests {
             &[("pkg:pypi/six@1.16.0", UUID_A, WiringMode::Vendored)],
         );
         assert_eq!(only_ref(&out).locked_integrity, None);
+    }
+
+    /// A vendored server sdist is wired like a wheel (requirements line,
+    /// Pipfile.lock `file`) and names its package the same way.
+    #[tokio::test]
+    async fn vendored_server_sdist_references_are_discovered() {
+        let six = vendored_wheel(UUID_A, "six-1.16.0.tar.gz");
+        let p = Project::new();
+        p.write(
+            "requirements.txt",
+            format!("./{six} --hash=sha256:{SHA}  # socket-patch vendor: six==1.16.0\n"),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:pypi/six@1.16.0", UUID_A, WiringMode::Vendored)],
+        );
+        assert_eq!(only_ref(&out).artifact_rel.as_deref(), Some(six.as_str()));
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+
+        let p = Project::new();
+        p.write(
+            "Pipfile.lock",
+            pipfile_lock(serde_json::json!({ "default": {
+                "six": { "file": format!("./{six}"), "hashes": [format!("sha256:{SHA}")] },
+            }})),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:pypi/six@1.16.0", UUID_A, WiringMode::Vendored)],
+        );
+        assert_eq!(
+            only_ref(&out).locked_integrity,
+            Some(LockIntegrity::Sha256Hex(SHA.into()))
+        );
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 
     #[tokio::test]

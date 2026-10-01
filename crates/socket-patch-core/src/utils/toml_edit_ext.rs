@@ -1,7 +1,5 @@
 //! Small structured-TOML helpers shared by every module that edits or sniffs
-//! TOML (`setup::pypi`, `vendor::cargo_config`, `vendor::pypi`,
-//! `vendor::pypi_uv`). Extracted from the pypi setup backend (now `setup::pypi`) so it no
-//! longer owns the crate's generic TOML seam.
+//! TOML (`vendor::cargo_config`, `vendor::pypi`, `vendor::pypi_uv`).
 
 use toml_edit::{Item, Table};
 

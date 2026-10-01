@@ -9,6 +9,9 @@
 //! `scan --redirect` repoints the lock entry. Each test runs the built binary
 //! against a wiremock API that serves only the padded spelling.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -93,7 +96,7 @@ fn write_project(root: &Path, version: &str) {
 /// hosted package reference — every patch record in the padded spelling.
 /// The batch response's outer package purl echoes the crawler's query, as
 /// production does.
-async fn mount_api(server: &MockServer) {
+async fn mount_api(server: &MockServer, prebuilt: bool) {
     let before_hash = compute_git_sha256_from_bytes(ORIGINAL);
     let after_hash = compute_git_sha256_from_bytes(PATCHED);
     let blob = base64::engine::general_purpose::STANDARD.encode(PATCHED);
@@ -127,29 +130,33 @@ async fn mount_api(server: &MockServer) {
         })))
         .mount(server)
         .await;
+    let view = json!({
+        "uuid": UUID,
+        "purl": API_PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            format!("package/{FILE}"): {
+                "beforeHash": before_hash,
+                "afterHash": after_hash,
+                "blobContent": blob,
+            }
+        },
+        "vulnerabilities": {
+            GHSA: {
+                "cves": ["CVE-2026-0003"],
+                "summary": "composer padded version fixture",
+                "severity": "high",
+                "description": "d"
+            }
+        },
+        "description": "x", "license": "MIT", "tier": "free"
+    });
+    if prebuilt {
+        prebuilt_common::mount_view(server, &view, None).await;
+    }
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "uuid": UUID,
-            "purl": API_PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                format!("package/{FILE}"): {
-                    "beforeHash": before_hash,
-                    "afterHash": after_hash,
-                    "blobContent": blob,
-                }
-            },
-            "vulnerabilities": {
-                GHSA: {
-                    "cves": ["CVE-2026-0003"],
-                    "summary": "composer padded version fixture",
-                    "severity": "high",
-                    "description": "d"
-                }
-            },
-            "description": "x", "license": "MIT", "tier": "free"
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
         .mount(server)
         .await;
     Mock::given(method("POST"))
@@ -229,7 +236,7 @@ fn read_json(file: &Path) -> Value {
 #[tokio::test]
 async fn agent_sync_applies_and_keeps_a_padded_composer_patch() {
     let server = MockServer::start().await;
-    mount_api(&server).await;
+    mount_api(&server, false).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path(), "v3.0.2");
 
@@ -260,7 +267,7 @@ async fn agent_sync_applies_and_keeps_a_padded_composer_patch() {
 #[tokio::test]
 async fn vendor_wires_and_attests_a_padded_composer_patch() {
     let server = MockServer::start().await;
-    mount_api(&server).await;
+    mount_api(&server, true).await;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write_project(root, "3.0.2");
@@ -268,7 +275,7 @@ async fn vendor_wires_and_attests_a_padded_composer_patch() {
     let (code, env) = run_json(
         root,
         &server.uri(),
-        &["scan", "--vendor", "--vendor-source", "build"],
+        &["scan", "--vendor", "--vendor-source", "service"],
     );
     assert_eq!(code, 0, "scan --vendor must succeed: {env:#}");
     assert_eq!(env["vendor"]["summary"]["applied"], 1, "{env:#}");
@@ -343,16 +350,16 @@ async fn vendor_wires_and_attests_a_padded_composer_patch() {
 }
 
 /// Hosted mode: the package reference names `@3.0.2.0`, the lock `3.0.2`;
-/// the redirect repoints the entry, is confirmed, and is recorded.
+/// the redirect repoints the entry and is confirmed without a hosted ledger.
 #[tokio::test]
 async fn hosted_redirect_repoints_a_padded_composer_patch() {
     let server = MockServer::start().await;
-    mount_api(&server).await;
+    mount_api(&server, false).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path(), "3.0.2");
 
-    let (code, env) = run_json(tmp.path(), &server.uri(), &["scan", "--redirect"]);
-    assert_eq!(code, 0, "scan --redirect must succeed: {env:#}");
+    let (code, env) = run_json(tmp.path(), &server.uri(), &["scan", "--mode", "hosted"]);
+    assert_eq!(code, 0, "scan --mode hosted must succeed: {env:#}");
     assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
     let codes: Vec<&str> = env["redirect"]["warnings"]
         .as_array()
@@ -371,10 +378,10 @@ async fn hosted_redirect_repoints_a_padded_composer_patch() {
     );
     assert_eq!(entry["dist"]["url"], hosted_url().as_str(), "{lock:#}");
     assert_eq!(entry["dist"]["shasum"], SHA1, "{lock:#}");
-    let ledger = std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json"))
-        .expect("redirect ledger written");
     assert!(
-        ledger.contains(API_PURL) && ledger.contains("redirect_composer_dist"),
-        "the ledger records the redirected patch and its revert edit: {ledger}"
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
+        "v5 hosted state is carried by the lockfile"
     );
 }

@@ -1,8 +1,8 @@
-//! Coverage-gap tests for `commands/get.rs` (coverage audit 2026-09).
+//! Coverage-gap tests for `commands/get.rs`.
 //!
-//! Targets the audited never-executed branches: `run()`'s flag/package-path
+//! Targets otherwise-untested branches: `run()`'s flag/package-path
 //! edges, the `save_patch_record` failure ladder on the uuid path, the
-//! `download_and_apply_patches` engine failure branches, the release-variant
+//! `download_and_apply_patches_with` engine failure branches, the release-variant
 //! narrowing fallbacks (fabricated PyPI venv — no real python needed), the
 //! search-path `--mode vendored` flow, the vendor-step error arms, and every
 //! human-mode (non `--json`) output path the existing suites left to
@@ -12,6 +12,9 @@
 //! mirrors flags into process-global env vars). Subprocess tests use
 //! `common::run_with_env`, which scrubs the ambient `SOCKET_*` surface and
 //! spawns a hermetic child, so they need no serialization.
+
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -103,9 +106,8 @@ fn default_args(identifier: &str, cwd: &Path) -> GetArgs {
         ghsa: false,
         package: false,
         save_only: true,
-        one_off: false,
         all_releases: false,
-        mode: None,
+        mode: Some(socket_patch_cli::commands::scan::ScanMode::Agent),
     }
 }
 
@@ -132,15 +134,10 @@ async fn mount_view_files(server: &MockServer, uuid: &str, purl: &str, files: se
         .await;
 }
 
-/// `view/{uuid}` served exactly ONCE: the get's own fetch succeeds, and the
-/// vendor step's in-memory staging — which fetches the view again — then
-/// 404s, tripping the `no_local_source` staging refusal.
 /// A view whose files carry hashes but NO `blobContent`: the download
 /// phase records it fine (hashes only), but the vendor step has nothing to
 /// stage from — not in the download phase's blob seed, not on disk, and not
-/// from the view it re-fetches — so it dies `no_local_source`. (Serving a
-/// good view exactly once no longer produces that: the step stages from
-/// the seed and never fetches the view a second time.)
+/// from the view it re-fetches — so it dies `no_local_source`.
 async fn mount_contentless_view(server: &MockServer, uuid: &str, purl: &str) {
     let mut files = good_files();
     files["package/index.js"]
@@ -299,6 +296,7 @@ fn engine_params(root: &Path) -> DownloadParams {
         strict: false,
         ecosystems: None,
         persist_blobs: true,
+        patch_server_url: None,
         all_releases: true,
     }
 }
@@ -402,6 +400,8 @@ fn write_project(root: &Path) {
 /// `view/{uuid}` with REAL git-blob hashes over the project fixture's bytes,
 /// so the vendored staging hash-gates pass.
 async fn mount_real_view(server: &MockServer, uuid: &str, purl: &str) {
+    let files = serde_json::json!({"package/index.js":{"beforeHash":git_hash(BEFORE_BYTES),"afterHash":git_hash(AFTER_BYTES),"blobContent":b64(AFTER_BYTES)}});
+    prebuilt_common::mount_view(server, &view_json(uuid, purl, files), None).await;
     mount_view_files(
         server,
         uuid,
@@ -444,6 +444,10 @@ async fn mount_ghsa_fanout(server: &MockServer) {
 fn run_get_bin(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, String) {
     let mut args = vec!["get"];
     args.extend_from_slice(extra);
+    // v5 `get` defaults to hosted; these fixtures drive agent mode.
+    if !extra.contains(&"--mode") {
+        args.extend_from_slice(&["--mode", "agent"]);
+    }
     args.extend_from_slice(&[
         "--api-url",
         api_url,
@@ -473,9 +477,7 @@ fn parse_single_json_doc(stdout: &str) -> serde_json::Value {
 // ===========================================================================
 
 /// Two identifier type flags together must be rejected up front: exit 1,
-/// nothing fetched, nothing written. This branch (line-level: the
-/// `type_flags > 1` guard) had never executed — every caller passes at most
-/// one flag.
+/// nothing fetched, nothing written (the `type_flags > 1` guard).
 #[tokio::test]
 #[serial]
 async fn get_conflicting_type_flags_rejected_before_any_network() {
@@ -490,7 +492,7 @@ async fn get_conflicting_type_flags_rejected_before_any_network() {
     args.cve = true;
 
     let code = run(args).await;
-    assert_eq!(code, 1, "conflicting --id/--cve must exit 1");
+    assert_eq!(code, 2, "conflicting --id/--cve is a usage error (exit 2)");
     assert_no_manifest(tmp.path());
     assert!(
         received_paths(&server).await.is_empty(),
@@ -614,7 +616,7 @@ async fn get_uuid_socket_path_occupied_by_file_fails_closed() {
         args.common.api_url = Some(uri.clone());
         args.save_only = false;
         args.mode = Some(ScanMode::Vendored);
-        args.common.vendor_source = "build".to_string();
+        args.common.vendor_source = "service".to_string();
         let code = run(args).await;
         assert_eq!(code, 1, "vendored run must fail when .socket is a file");
         assert_eq!(
@@ -1382,7 +1384,7 @@ async fn engine_variant_view_fetch_error_keeps_errored_variant() {
 fn vendored_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
     let mut args = default_args(identifier, cwd);
     args.common.api_url = Some(api_url);
-    args.common.vendor_source = "build".to_string();
+    args.common.vendor_source = "service".to_string();
     args.save_only = false;
     args.mode = Some(ScanMode::Vendored);
     args
@@ -1467,7 +1469,7 @@ fn vendored_json_args(uuid: &str) -> [&str; 6] {
         "--mode",
         "vendored",
         "--vendor-source",
-        "build",
+        "service",
         "--json",
     ]
 }
@@ -1618,10 +1620,10 @@ fn assert_legacy_state_untouched(root: &Path, manifest_before: &str, state_befor
 }
 
 fn assert_vendor_error_envelope(v: &serde_json::Value) {
-    assert_eq!(v["status"], "error", "envelope={v}");
+    assert_eq!(v["status"], "partial_failure", "envelope={v}");
     assert_eq!(
-        v["error"]["code"], "no_local_source",
-        "the staging refusal must be the error code; envelope={v}"
+        v["vendor"]["events"][0]["errorCode"], "vendor_lockfile_missing",
+        "{v}"
     );
     assert_eq!(
         v["vendor"]["status"], "partialFailure",
@@ -1679,7 +1681,7 @@ async fn get_search_vendored_vendor_step_error_leaves_legacy_state_alone() {
             "--mode",
             "vendored",
             "--vendor-source",
-            "build",
+            "service",
             "--all-releases",
             "--json",
         ],
@@ -1705,7 +1707,7 @@ async fn human_vendored_uuid_prints_fetch_and_vendor_error_without_manifest_note
     let (code, stdout, stderr) = run_get_bin(
         tmp.path(),
         &server.uri(),
-        &[UUID, "--mode", "vendored", "--vendor-source", "build"],
+        &[UUID, "--mode", "vendored", "--vendor-source", "service"],
     );
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     assert!(
@@ -1721,8 +1723,8 @@ async fn human_vendored_uuid_prints_fetch_and_vendor_error_without_manifest_note
         "there is no whole-manifest scope to warn about; stderr={stderr}"
     );
     assert!(
-        stderr.contains("Error (no_local_source):"),
-        "the vendor-step error must print with its code; stderr={stderr}"
+        stderr.contains("no package-lock.json"),
+        "the vendor-step error must explain the missing lockfile; stderr={stderr}"
     );
     assert_legacy_state_untouched(tmp.path(), &manifest_before, &state_before);
 }
@@ -1753,12 +1755,12 @@ async fn human_uuid_paid_via_proxy_prints_upgrade_message() {
     let tmp = tempfile::tempdir().unwrap();
     let uri = mock.uri();
     // No --api-token / --org: the scrubbed child env falls back to the
-    // public proxy seeded via the legacy env var (get_invariants' recipe).
+    // public proxy seeded via `SOCKET_PROXY_URL` (get_invariants' recipe).
     let (code, stdout, stderr) = common::run_with_env(
         tmp.path(),
         &["get", UUID, "--save-only", "--yes", "--api-url", &uri],
         &[
-            ("SOCKET_PATCH_PROXY_URL", uri.as_str()),
+            ("SOCKET_PROXY_URL", uri.as_str()),
             ("SOCKET_TELEMETRY_DISABLED", "1"),
         ],
     );
@@ -1767,7 +1769,7 @@ async fn human_uuid_paid_via_proxy_prints_upgrade_message() {
         "paid_required is exit 0; stdout={stdout}\nstderr={stderr}"
     );
     assert!(
-        stdout.contains("requires a paid subscription"),
+        stdout.contains("requires a paid Socket plan"),
         "stdout={stdout}"
     );
     assert!(
@@ -1800,9 +1802,9 @@ async fn human_uuid_not_found_prints_message() {
     assert_no_manifest(tmp.path());
 }
 
-/// Human CVE search with no results: both the search label and the
-/// per-type not-found message (the `IdentifierType` Display impl's only
-/// consumer) must print.
+/// Human CVE search with no results: the per-type not-found message prints
+/// on stdout, while the transient `Searching patches for …` status line
+/// never reaches a pipe.
 #[tokio::test]
 async fn human_cve_search_empty_prints_search_label_and_not_found() {
     let server = MockServer::start().await;
@@ -1908,7 +1910,7 @@ async fn human_paid_only_search_prints_subscription_message() {
     let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[cve, "--save-only"]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        stdout.contains("All available patches require a paid subscription."),
+        stdout.contains("All available patches require a paid Socket plan."),
         "stdout={stdout}"
     );
     assert!(
@@ -2174,7 +2176,7 @@ async fn human_vendored_search_success_commits_artifact_without_blast_radius_not
     let (code, stdout, stderr) = run_get_bin(
         tmp.path(),
         &server.uri(),
-        &[GHSA, "--mode", "vendored", "--vendor-source", "build"],
+        &[GHSA, "--mode", "vendored", "--vendor-source", "service"],
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let artifact = tmp
@@ -2221,7 +2223,7 @@ async fn vendored_search_ignores_corrupt_manifest_and_vendors() {
             "--mode",
             "vendored",
             "--vendor-source",
-            "build",
+            "service",
             "--all-releases",
             "--json",
         ],
@@ -2263,7 +2265,7 @@ async fn vendored_search_json_download_failure_with_clean_vendor_is_partial_fail
             "--mode",
             "vendored",
             "--vendor-source",
-            "build",
+            "service",
             "--all-releases",
             "--json",
         ],
@@ -2340,7 +2342,7 @@ async fn vendored_lock_held_vendor_step_errors_without_vendor_envelope() {
                 "--mode",
                 "vendored",
                 "--vendor-source",
-                "build",
+                "service",
                 "--all-releases",
                 "--json",
             ],
@@ -2370,7 +2372,7 @@ async fn vendored_lock_held_vendor_step_errors_without_vendor_envelope() {
                 "--mode",
                 "vendored",
                 "--vendor-source",
-                "build",
+                "service",
                 "--all-releases",
             ],
         );
@@ -2529,7 +2531,7 @@ async fn human_vendored_uuid_supersede_prints_replacing_and_vendors() {
     let (code, stdout, stderr) = run_get_bin(
         tmp.path(),
         &server.uri(),
-        &[UUID, "--mode", "vendored", "--vendor-source", "build"],
+        &[UUID, "--mode", "vendored", "--vendor-source", "service"],
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
@@ -2566,7 +2568,7 @@ async fn human_vendored_uuid_rerun_prints_already_vendored_skip() {
     let (code, stdout, stderr) = run_get_bin(
         tmp.path(),
         &server.uri(),
-        &[UUID, "--mode", "vendored", "--vendor-source", "build"],
+        &[UUID, "--mode", "vendored", "--vendor-source", "service"],
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
@@ -2816,7 +2818,7 @@ async fn nested_apply_block_starts_stdout_without_a_blank_line() {
 }
 
 /// A forced `--id` / `--cve` / `--ghsa` identifier is shape-checked before
-/// any network call: a readable error, exit 1, zero requests.
+/// any network call: a readable error, exit 2 (usage), zero requests.
 #[tokio::test]
 async fn forced_identifier_type_is_validated_locally() {
     let server = MockServer::start().await;
@@ -2827,13 +2829,13 @@ async fn forced_identifier_type_is_validated_locally() {
         ("--ghsa", "is not a valid GHSA ID"),
     ] {
         let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &["lodash", flag]);
-        assert_eq!(code, 1, "{flag}: stdout={stdout}\nstderr={stderr}");
+        assert_eq!(code, 2, "{flag}: stdout={stdout}\nstderr={stderr}");
         assert!(
             stderr.contains(&format!("Error: \"lodash\" {what} (expected ")),
             "{flag}: stderr={stderr}"
         );
         let (code, stdout, _) = run_get_bin(tmp.path(), &server.uri(), &["lodash", flag, "--json"]);
-        assert_eq!(code, 1);
+        assert_eq!(code, 2);
         let v = parse_single_json_doc(&stdout);
         assert_eq!(v["status"], "error", "{v}");
         assert!(v["error"].as_str().unwrap().contains(what), "{v}");
@@ -2864,7 +2866,7 @@ async fn proxy_403_on_uuid_is_paid_required() {
             tmp.path(),
             &args,
             &[
-                ("SOCKET_PATCH_PROXY_URL", uri.as_str()),
+                ("SOCKET_PROXY_URL", uri.as_str()),
                 ("SOCKET_TELEMETRY_DISABLED", "1"),
             ],
         )
@@ -2881,8 +2883,8 @@ async fn proxy_403_on_uuid_is_paid_required() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
         stdout.contains(&format!(
-            "This patch requires a paid subscription to download.\n  Patch: {UUID}\n  \
-             Upgrade at: https://socket.dev/pricing"
+            "This patch requires a paid Socket plan.\n  Patch: {UUID}\n\
+             Upgrade to a paid Socket plan to access all patches: https://socket.dev/pricing"
         )),
         "stdout={stdout}"
     );
@@ -3001,6 +3003,8 @@ async fn agent_dry_run_previews_only_the_installed_release_variant() {
         &[
             "get",
             GHSA,
+            "--mode",
+            "agent",
             "--dry-run",
             "--json",
             "--api-url",
@@ -3051,7 +3055,7 @@ async fn human_vendored_search_all_downloads_failed_prints_empty_run_line() {
             "--mode",
             "vendored",
             "--vendor-source",
-            "build",
+            "service",
             "--all-releases",
         ],
     );

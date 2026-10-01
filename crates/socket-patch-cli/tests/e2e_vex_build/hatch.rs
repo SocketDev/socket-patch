@@ -14,7 +14,7 @@
 //!    hosted rewriter reads the exact pin from the declaration);
 //! 2. the synthetic patch appends a marker to `six.py`; a wiremock Socket
 //!    API serves discovery, the grant, the view and the patched wheel;
-//! 3. hosted: `scan --redirect --vex`; vendored: `scan --vendor
+//! 3. hosted: `scan --mode hosted --vex`; vendored: `scan --vendor
 //!    --vendor-source build --vex` — the same-run VEX attests, and the
 //!    declaration becomes `six @ <url>#sha256=…` /
 //!    `six @ {root:uri}/.socket/vendor/pypi/<uuid>/<wheel>#sha256=…`;
@@ -25,9 +25,10 @@
 //! 5. manifest-less VEX there (`vex_pypi_real_common::VexMatrix`, with
 //!    `VIRTUAL_ENV` naming Hatch's out-of-tree environment so the crawler
 //!    hashes the real install): manifest deleted, tampered install (hosted),
-//!    ledgers deleted, embedded `apply --vex` / `vendor --vex`, offline with
-//!    no ledger → `record_unavailable`, declaration reverted →
-//!    `redirect_unwired` / `vendor_unwired` (`--no-verify` too); plus the
+//!    ledgers deleted (v5 hosted writes none), embedded `apply --vex` /
+//!    `vendor --vex`, offline with no ledger → `record_unavailable`,
+//!    declaration reverted → `vendor_unwired` / hosted: nothing names the
+//!    patch (`--no-verify` too); plus the
 //!    manifest-less `scan --vex` re-run and, hosted, the not-installed
 //!    (pin) basis.
 //!
@@ -199,8 +200,8 @@ fn hatch() -> Option<Hatch> {
 
 fn scan_mode_args(mode: Mode) -> Vec<&'static str> {
     match mode {
-        Mode::Hosted => vec!["--redirect"],
-        Mode::Vendored => vec!["--vendor", "--vendor-source", "build"],
+        Mode::Hosted => vec!["--mode=hosted"],
+        Mode::Vendored => vec!["--vendor", "--vendor-source", "service"],
     }
 }
 
@@ -290,6 +291,12 @@ fn flow(flavor: Flavor, mode: Mode) {
         Flavor::HatchTomlEnv => "hatch.toml",
     };
     let wired = std::fs::read_to_string(project.join(wired_file)).unwrap();
+    assert!(
+        !project
+            .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL)
+            .exists(),
+        "{what}: v5 writes no redirect ledger"
+    );
     match mode {
         Mode::Hosted => assert!(
             wired.contains(&format!(

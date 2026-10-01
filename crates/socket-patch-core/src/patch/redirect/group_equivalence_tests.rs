@@ -1,4 +1,4 @@
-//! H4 equivalence: the rewriter groups run concurrently and merged in order
+//! Group equivalence: the rewriter groups run concurrently and merged in order
 //! produce the same [`RewriteResult`] — every channel, edits and warnings in
 //! order — as the serial chain they replaced.
 
@@ -23,7 +23,7 @@ fn serial_oracle(
     let overrides = withhold(&overrides, &result.refused_pipenv_uuids);
     let overrides: &[DepOverride] = &overrides;
     rewrite_npm_lock(files, overrides, &mut result);
-    rewrite_pnpm_lock(files, overrides, &mut result);
+    plan_hosted(files, overrides, &mut result);
     rewrite_yarn_classic(files, overrides, &mut result);
     rewrite_yarn_berry(files, overrides, &mut result);
     rewrite_bun_lock(files, overrides, &mut result);
@@ -297,7 +297,6 @@ fn pypi_dep(name: &str, uuid: &str) -> DepOverride {
         token: String::new(),
         patch_uuid: uuid.into(),
         artifact_url: format!("https://patch.test/{name}-1.0.0-py3-none-any.whl"),
-        berry_zip_url: None,
         registry_override: None,
         integrity: Integrity {
             sha256: Some("a".repeat(64)),

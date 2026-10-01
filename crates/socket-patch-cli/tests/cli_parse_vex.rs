@@ -71,6 +71,7 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_FORCE",
     // ScanArgs-specific
     "SOCKET_BATCH_SIZE",
+    "SOCKET_SCAN_PACKAGES",
     "SOCKET_ALL_RELEASES",
 ];
 
@@ -158,7 +159,7 @@ fn truthy_vex_compact_env_sets_flag_on_vex() {
 /// `VexEmbedArgs` shares the env var names with the standalone flags, so an
 /// ambient `SOCKET_VEX_NO_VERIFY=1` must also parse (and set
 /// `--vex-no-verify`) on `apply` — this is the postinstall-hook blast
-/// radius: before the fix the env var aborted every `apply` run.
+/// radius: a parse failure here would abort every `apply` run.
 #[test]
 #[serial_test::serial]
 fn truthy_vex_no_verify_env_sets_embedded_flag_on_apply() {
@@ -278,7 +279,7 @@ fn expected_defaults() -> Snap {
         proxy_url: None, // no clap default — resolved in core
         ecosystems: None,
         download_mode: "diff".to_string(),
-        vendor_source: "auto".to_string(),
+        vendor_source: "service".to_string(),
         vendor_url: None,
         patch_server_url: None,
         offline: false,

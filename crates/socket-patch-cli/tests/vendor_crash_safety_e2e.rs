@@ -11,6 +11,9 @@
 //! artifact, rebuilds it and wires the project exactly as an uninterrupted
 //! run would have.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -96,8 +99,7 @@ fn binary() -> PathBuf {
 /// at `failpoint`. Returns the exit code and stdout.
 fn vendor(root: &Path, failpoint: Option<&str>) -> (i32, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(["vendor", "--json", "--offline"])
-        .current_dir(root);
+    cmd.args(["vendor", "--json"]).current_dir(root);
     for (key, _) in std::env::vars() {
         if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
             cmd.env_remove(key);
@@ -107,6 +109,8 @@ fn vendor(root: &Path, failpoint: Option<&str>) -> (i32, String) {
     if let Some(point) = failpoint {
         cmd.env("SOCKET_PATCH_FAILPOINT", point);
     }
+    let fixture = prebuilt_common::Server::project(root);
+    fixture.command(&mut cmd);
     let out = cmd.output().expect("run socket-patch vendor");
     (
         out.status.code().unwrap_or(-1),
@@ -295,7 +299,7 @@ fn crash_before_the_barrier_repairs_a_copy_dir_artifact() {
 
     let run = |failpoint: Option<&str>| {
         let mut cmd = Command::new(binary());
-        cmd.args(["vendor", "--json", "--offline"])
+        cmd.args(["vendor", "--json"])
             .current_dir(&root)
             .env("CARGO_HOME", &cargo_home)
             .env("SOCKET_TELEMETRY_DISABLED", "1");
@@ -307,6 +311,11 @@ fn crash_before_the_barrier_repairs_a_copy_dir_artifact() {
         if let Some(point) = failpoint {
             cmd.env("SOCKET_PATCH_FAILPOINT", point);
         }
+        let fixture = prebuilt_common::Server::project_with_env(
+            &root,
+            &[("CARGO_HOME", cargo_home.to_str().unwrap())],
+        );
+        fixture.command(&mut cmd);
         let out = cmd.output().unwrap();
         (
             out.status.code().unwrap_or(-1),

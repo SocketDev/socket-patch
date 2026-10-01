@@ -222,6 +222,7 @@ pub(crate) async fn vendor(
             base_purl: coords.base_purl,
             uuid: record.uuid.clone(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: staged.rel_tgz,
                 sha256: staged.packed.sha256_hex,
                 size: Some(staged.packed.size),
@@ -747,9 +748,9 @@ mod rebuild_tests {
 
     pub(super) async fn flip_run(fx: &Fixture, cfg: Option<&VendorServiceConfig>) -> VendorOutcome {
         let blobs = fx.root().join(".socket/blobs");
-        vendor(
+        crate::vendor::test_support::vendor_bun(
             PURL,
-            (&fx.installed()).into(),
+            &fx.installed(),
             fx.root(),
             &fx.record,
             &PatchSources::blobs_only(&blobs),
@@ -779,7 +780,7 @@ mod rebuild_tests {
             .await
             .remove(0);
         let blobs = fx.root().join(".socket/blobs");
-        let looped = match super::super::bun_lock::vendor_bun(
+        let looped = match crate::vendor::test_support::vendor_bun(
             purl,
             &fx.installed(),
             fx.root(),
@@ -879,8 +880,6 @@ mod rebuild_tests {
         assert_eq!(planned, looped, "no lock: routed alike");
     }
 
-    /// A prebuilt archive whose tar headers deliberately differ from the
-    /// local packer's (so its bytes never equal a local build's).
     fn prebuilt_archive() -> Vec<u8> {
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
             Vec::new(),
@@ -890,7 +889,6 @@ mod rebuild_tests {
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
             header.set_mode(0o644);
-            // Deliberately differ from the local packer's deterministic mtime.
             header.set_mtime(123);
             header.set_cksum();
             tar.append_data(&mut header, format!("package/{name}"), bytes)
@@ -911,14 +909,14 @@ mod rebuild_tests {
     /// A service outage (here a 403) after a prebuilt vendor: the committed
     /// prebuilt archive is anchored by the ledger, so the re-run reuses it —
     /// entry `None`, bun.lockb and every workspace mirror byte-unchanged, no
-    /// request (the flip no longer re-pins).
+    /// request.
     #[tokio::test]
     async fn same_uuid_prebuilt_then_outage_reuses_the_committed_archive() {
         let archive = prebuilt_archive();
         let server = MockServer::start().await;
         ts::mount_granted(&server, UUID, "minimist-1.2.2.tgz", &archive).await;
         let fx = flip_fixture().await;
-        let config = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
+        let config = ts::service_cfg(&server.uri(), VendorSource::Service, false);
         let (result, entry, warnings) = ts::expect_done(flip_run(&fx, Some(&config)).await);
         assert!(result.success, "{result:?}");
         assert!(ts::has_warning(&warnings, "vendor_prebuilt_downloaded"));
@@ -934,7 +932,12 @@ mod rebuild_tests {
         let (result, entry, warnings) = ts::expect_done(flip_run(&fx, Some(&config)).await);
         assert!(result.success, "{result:?}");
         assert!(entry.is_none(), "in sync: nothing re-pinned");
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
         assert_eq!(ts::snapshot(&fx).await, before);
         assert_eq!(ts::request_count(&server).await, 0);
     }
@@ -944,17 +947,18 @@ mod rebuild_tests {
     /// bytes must advance the integrity snapshot without losing the pristine
     /// registry predecessor, and revert must restore everything exactly.
     #[tokio::test]
-    async fn same_uuid_prebuilt_then_local_fallback_reverts_exact_binary_and_mirrors() {
+    async fn same_uuid_redownload_reverts_exact_binary_and_mirrors() {
         let archive = prebuilt_archive();
         let server = MockServer::start().await;
         ts::mount_granted(&server, UUID, "minimist-1.2.2.tgz", &archive).await;
         let fx = flip_fixture().await;
         let root = fx.tmp.path();
-        let config = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
+        let config = ts::service_cfg(&server.uri(), VendorSource::Service, false);
         let mut prior: Option<VendorEntry> = None;
         for prebuilt in [true, false] {
             if !prebuilt {
-                mount_403(&server).await;
+                server.reset().await;
+                ts::mount_granted(&server, UUID, "minimist-1.2.2.tgz", &ts::regzip(&archive)).await;
                 // The committed artifact is missing (deleted, never
                 // committed): reuse cannot apply, so acquisition runs.
                 std::fs::remove_file(
@@ -975,7 +979,7 @@ mod rebuild_tests {
                 == if prebuilt {
                     "vendor_prebuilt_downloaded"
                 } else {
-                    "vendor_prebuilt_unavailable"
+                    "vendor_prebuilt_downloaded"
                 }));
             if let Some(previous) = prior.as_ref() {
                 assert_ne!(entry.artifact.sha256, previous.artifact.sha256);

@@ -9,21 +9,24 @@
 //! when it fails). NOTE: because the fixture uses a placeholder all-zero
 //! beforeHash and serves no before-blob, an --offline rollback cannot
 //! actually restore the original bytes here — that path is the offline
-//! guard, not a genuine restore. See the summary in the audit notes.
+//! guard, not a genuine restore.
 //!
 //! Run modes:
 //!   - Default (Docker): requires Docker daemon. Pulls `socket-patch-test-
 //!     npm:latest` (built from `tests/docker/Dockerfile.npm` — base built
 //!     from `tests/docker/Dockerfile.base`). If the image isn't present
-//!     the test fails with a clear build-instruction error.
+//!     the test prints a skip notice and passes vacuously.
 //!   - Host mode: set `SOCKET_PATCH_TEST_HOST=1`. Skips Docker; runs npm
-//!     and socket-patch on the host. Requires host-installed npm + a
-//!     debug socket-patch binary at `target/debug/socket-patch`.
+//!     and socket-patch on the host. Requires npm and `socket-patch` on
+//!     PATH.
 //!
 //! Run command:
 //!   `cargo test -p socket-patch-cli --features docker-e2e --test docker_e2e_npm`
 
 #![cfg(feature = "docker-e2e")]
+
+#[path = "docker_vendor_common/mod.rs"]
+mod docker_vendor_common;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -166,9 +169,10 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
                     // bytes, so apply's hash-verify reports HashMismatch.
                     // We pass --force to the apply step to override and
                     // exercise the blob-write path against real on-disk
-                    // content. (`get.rs::download_and_apply_patches`
-                    // requires both hashes to be Some, so we can't send
-                    // null here.)
+                    // content. (A null beforeHash would mark the file as a
+                    // new-file insert — see get.rs `files_for_manifest` —
+                    // so a placeholder hash is needed to exercise the
+                    // overwrite path.)
                     "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
                     "afterHash":  after_hash,
                     "blobContent": blob_b64,
@@ -225,14 +229,10 @@ mkdir -p /workspace/proj && cd /workspace/proj
 echo '{{ "name": "e2e-proj", "version": "0.0.0" }}' > package.json
 npm install --silent --no-audit --no-fund minimist@1.2.2
 
-# Pre-seed setup.manual so the agent-mode VEX leg (step 5b) keeps the npm
-# patch through property 7: this project isn't `socket-patch setup`-configured,
-# and an agent patch is applied by hand/CI — exactly what `manual` declares.
-# scan --sync merges the downloaded patch into this manifest and preserves the
-# setup block, so the manifest the VEX leg reads carries both.
+# Pre-seed an empty manifest; scan --sync merges the downloaded patch into it.
 mkdir -p .socket
 cat > .socket/manifest.json <<'MANIFEST'
-{{ "patches": {{}}, "setup": {{ "manual": ["npm"] }} }}
+{{ "patches": {{}} }}
 MANIFEST
 
 # 2. scan --json: must discover the patch via the real batch API. A
@@ -674,8 +674,8 @@ async fn npm_install_scan_apply_rollback_cycle() {
     );
     assert_vex_agent_attested(&stdout, PURL);
 
-    // Keep the workspace_root reference alive — used by host mode to
-    // resolve the in-tree binary. Without this clippy warns unused.
+    // Keep the workspace_root reference alive; without this clippy warns
+    // unused.
     let _ = workspace_root();
 
     // The mock must have served BOTH the metadata discovery (batch) and
@@ -834,10 +834,10 @@ yarn install >/tmp/yi.out 2>/tmp/yi.err || {{ echo "FAIL: yarn berry install"; c
 TARGET=node_modules/minimist/index.js
 [ -f "$TARGET" ] || {{ echo "FAIL: $TARGET missing after berry install (PnP layout?)" >&2; ls -la node_modules >&2; exit 1; }}
 
-# Pre-seed setup.manual so the patch survives property-7 filtering.
+# Pre-seed an empty manifest; scan --sync merges the downloaded patch into it.
 mkdir -p .socket
 cat > .socket/manifest.json <<'MANIFEST'
-{{ "patches": {{}}, "setup": {{ "manual": ["npm"] }} }}
+{{ "patches": {{}} }}
 MANIFEST
 
 # 2. scan --sync then forced offline apply (placeholder beforeHash fixture).
@@ -862,10 +862,10 @@ exit 0
 
 /// Vendored berry leg: the container twin of `e2e_vendor_yarn_berry_build.rs`.
 /// Real yarn 4 install → stage a `.socket/` manifest + blob from the ACTUAL
-/// installed bytes (no API) → `vendor --offline` → fresh-checkout
+/// installed bytes → service download → fresh-checkout
 /// `yarn install --immutable --check-cache` (offline global cache) must
 /// install the PATCHED bytes from the vendored tarball. This proves the
-/// vendored `10c0/<hex>` checksum the CLI computes offline is exactly what a
+/// vendored `10c0/<hex>` checksum served with the artifact is exactly what a
 /// real yarn 4 accepts under `--check-cache`.
 fn make_berry_vendor_script() -> String {
     // git-sha256 in bash: sha256("blob <len>\0" ++ bytes).
@@ -914,8 +914,9 @@ LOCK_BEFORE=$(sha256sum yarn.lock | cut -d' ' -f1)
 cp yarn.lock /tmp/registry-yarn.lock
 cp package.json /tmp/registry-package.json
 
-# 3. Vendor (offline: builds the tarball + rewrites yarn.lock + package.json).
-socket-patch vendor --json --offline --cwd "$PWD" >/tmp/vendor.out 2>/tmp/vendor.err
+# 3. Download the published tarball and wire yarn.lock + package.json.
+publish_fixture
+socket-patch vendor --json --cwd "$PWD" >/tmp/vendor.out 2>/tmp/vendor.err
 VRC=$?
 echo "vendor exit=$VRC" >&2; cat /tmp/vendor.out >&2 || true; cat /tmp/vendor.err >&2 || true
 if [ "$VRC" -ne 0 ]; then echo "FAIL: berry vendor exited $VRC" >&2; exit 1; fi
@@ -1005,8 +1006,8 @@ async fn npm_berry_agent_install_apply_chain() {
 }
 
 /// Vendored berry offline-frozen-install chain in Docker (container twin of
-/// `e2e_vendor_yarn_berry_build.rs`). No API — the manifest is staged from the
-/// installed bytes in-container.
+/// `e2e_vendor_yarn_berry_build.rs`). The fixture service publishes the staged
+/// patch from the actual installed bytes in-container.
 #[tokio::test]
 async fn npm_berry_vendor_frozen_install_chain() {
     if host_mode() {
@@ -1015,7 +1016,15 @@ async fn npm_berry_vendor_frozen_install_chain() {
     if skip_if_no_docker_image() {
         return;
     }
-    let out = run_in_container(&make_berry_vendor_script());
+    let tmp = tempfile::tempdir().unwrap();
+    let host = tmp.path().canonicalize().unwrap();
+    let script = format!(
+        "{}\n{}",
+        docker_vendor_common::bash_prelude(),
+        make_berry_vendor_script()
+    );
+    let (out, _service) =
+        docker_vendor_common::run_with_fixture("socket-patch-test-npm:latest", &host, &script);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1037,9 +1046,8 @@ async fn npm_berry_vendor_frozen_install_chain() {
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
 }
 
-/// The npm image carries vlt 1.2.0 for the setup-matrix `pm: vlt` cases
-/// (a non-gating extra: the gating vlt assertions are the real-vlt
-/// capstones).
+/// The npm image carries vlt 1.2.0 (a non-gating extra: the gating vlt
+/// assertions are the real-vlt capstones).
 #[test]
 fn npm_image_vlt_smoke() {
     let out = if host_mode() {
