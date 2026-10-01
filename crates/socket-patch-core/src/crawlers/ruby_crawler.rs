@@ -948,7 +948,7 @@ fn expand_tilde(value: &Path, home: Option<&Path>) -> PathBuf {
 /// exactly: `$BUNDLE_APP_CONFIG` when set (a relative value resolves against
 /// the project root, NOT the process cwd), else `<root>/.bundle` — e.g. the
 /// official ruby Docker images export `BUNDLE_APP_CONFIG=/usr/local/bundle`.
-fn bundler_app_config_dir(root: &Path, env_value: Option<&OsStr>) -> PathBuf {
+pub(crate) fn bundler_app_config_dir(root: &Path, env_value: Option<&OsStr>) -> PathBuf {
     match env_value {
         Some(v) if !v.is_empty() => {
             let p = PathBuf::from(v);
@@ -1070,7 +1070,7 @@ fn parse_bundle_config_path(contents: &str) -> Option<String> {
 
 /// Unwrap one bundler app-config scalar: trim, then strip one matching
 /// pair of double or single quotes (bundler double-quotes what it writes).
-fn unquote_bundle_config_value(rest: &str) -> &str {
+pub(crate) fn unquote_bundle_config_value(rest: &str) -> &str {
     let v = rest.trim();
     v.strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
