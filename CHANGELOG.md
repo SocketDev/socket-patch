@@ -102,6 +102,17 @@ limits, and required install commands.
 
 ### Fixed
 
+- **npm dependencies installed from git, a URL or `file:` are no longer
+  reported patched.** npm installs such a dependency from the dependent's
+  spec (`github:user/repo`, `https://…/x.tgz`, `file:…`) and ignores the
+  lock entry's `resolved`, so `npm ci` kept installing the original bytes
+  after `scan --mode hosted` or `vendor` rewired the entry and `vex`
+  attested it. Both modes now skip such an entry with a loud
+  stays-UNPATCHED warning (`redirect_npm_non_registry_entry_skipped` /
+  `vendor_non_registry_entry_skipped`; vendoring refuses with
+  `vendor_lock_entry_not_rewritable` when no registry copy is left), and
+  `vex` attests nothing for a `name@version` while such a copy is in the
+  lock (#326).
 - **Agent mode finds Poetry's virtualenv in more setups.** Three cases
   missed the virtualenv Poetry installed into. Each fell back to the
   wrong interpreter, skipped the patch as `package_not_installed` and
