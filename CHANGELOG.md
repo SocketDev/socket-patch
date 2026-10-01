@@ -183,6 +183,13 @@ limits, and required install commands.
   unparseable (hosted) or refused as `vendor_lockfile_version_unsupported`
   (vendored). The lock now keeps its BOM, indent and line endings, and the
   undo is byte-exact (#324).
+- `vendor` under `--global` / `--global-prefix` (or `SOCKET_GLOBAL` /
+  `SOCKET_GLOBAL_PREFIX`) is now a usage error (exit 2,
+  `global_scope_unsupported`), like `scan` and `get` with `--mode vendored`.
+  Run inside a project, `vendor -g` vendored the manifest's records into that
+  project and rewired its lockfile, and `vendor --revert -g` unwound the
+  project's vendoring, so its next frozen install was silently unpatched.
+  Global installs have no project lockfile to vendor into (#498).
 
 ### Maintenance
 
