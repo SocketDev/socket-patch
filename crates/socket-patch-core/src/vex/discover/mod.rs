@@ -873,6 +873,13 @@ impl<'a> DiscoverCtx<'a> {
         }
     }
 
+    /// `rel`'s text when it can be read, with no diagnostic and no
+    /// recognition: for advisory inputs that never carry wiring (the root
+    /// `package.json`'s npm `overrides`).
+    pub(crate) async fn read_advisory_text(&self, rel: &str) -> Option<String> {
+        self.view.read_text(rel).await.ok()
+    }
+
     /// Bytes twin of [`DiscoverCtx::read_text`] (JSON and binary locks). A
     /// binary lock is swept through its lossy UTF-8 view: string pools store
     /// resolutions verbatim, and a stale string an older patch generation

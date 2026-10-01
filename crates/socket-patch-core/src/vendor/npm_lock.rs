@@ -29,7 +29,7 @@ use super::common::{already_patched_result, done, parse_json_manifest, refused, 
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
 };
-use super::npm_origin::{legacy_packages_key, npm_non_registry_entries};
+use super::npm_origin::{legacy_packages_key, npm_non_registry_entries, NpmOverrides};
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
@@ -147,11 +147,16 @@ pub async fn vendor_npm<'a>(
         Err(outcome) => return *outcome,
     };
 
+    // The root manifest's `overrides` (#490): which git / url / `file:`
+    // dependent specs npm really installs from.
+    let overrides = NpmOverrides::read(project_root).await;
+
     // ── 3. Find the rewritable lock instances ───────────────────────────
-    let matches = match rewritable_matches(&lock, name, version, &lock_name, &mut warnings) {
-        Ok(matches) => matches,
-        Err(outcome) => return *outcome,
-    };
+    let matches =
+        match rewritable_matches(&lock, &overrides, name, version, &lock_name, &mut warnings) {
+            Ok(matches) => matches,
+            Err(outcome) => return *outcome,
+        };
 
     // ── 3b. Sibling lock (npm 12) ───────────────────────────────────────
     // npm 12 removed `npm shrinkwrap`, auto-creates a package-lock.json
@@ -164,7 +169,14 @@ pub async fn vendor_npm<'a>(
     // rewriter's rule), and one that cannot be is SAID.
     let mut siblings: Vec<SiblingLock> = Vec::new();
     for (sib_name, sib_bytes) in sibling_locks {
-        match sibling_lock_target(sib_name, sib_bytes, name, version, &mut warnings) {
+        match sibling_lock_target(
+            sib_name,
+            sib_bytes,
+            &overrides,
+            name,
+            version,
+            &mut warnings,
+        ) {
             Ok(sib) => siblings.push(sib),
             Err(why) => warnings.push(VendorWarning::new(
                 "vendor_npm_sibling_lock_unwired",
@@ -231,6 +243,7 @@ pub async fn vendor_npm<'a>(
         resolved: &resolved,
         integrity: &packed.integrity,
         staged_pkg_json: staged_pkg_json.as_ref(),
+        overrides: &overrides,
     };
     if let Err(e) = rewire.apply(
         &mut lock,
@@ -430,12 +443,13 @@ fn lock_version_gate(lock: &Value, lock_name: &str) -> Result<Option<u64>, Box<V
 /// plan evaluates it ahead of the loop ([`preflight_packages`]).
 fn rewritable_matches(
     lock: &Value,
+    overrides: &NpmOverrides,
     name: &str,
     version: &str,
     lock_name: &str,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<Vec<LockMatch>, Box<VendorOutcome>> {
-    let matches = match scan_lock_matches(lock, name, version, warnings) {
+    let matches = match scan_lock_matches(lock, overrides, name, version, warnings) {
         LockScan::Matches(m) => m,
         LockScan::WorkspaceMember { key } => {
             // A matching key outside node_modules/ is the user's own
@@ -500,6 +514,7 @@ fn rewritable_matches(
 pub(super) struct NpmLockProject {
     lock_name: String,
     lock: std::sync::Arc<Value>,
+    overrides: NpmOverrides,
 }
 
 /// Read the lock as [`vendor_npm`]'s step 2 does — selected, parsed,
@@ -515,7 +530,12 @@ pub(super) async fn read_project(project_root: &Path) -> Result<NpmLockProject, 
         .parse(&lock_bytes, || parse_json_manifest(&lock_bytes))
         .map_err(|_| "vendor_lockfile_version_unsupported")?;
     lock_version_gate(&lock, &lock_name).map_err(|o| super::npm_common::refusal_code(&o))?;
-    Ok(NpmLockProject { lock_name, lock })
+    let overrides = NpmOverrides::read(project_root).await;
+    Ok(NpmLockProject {
+        lock_name,
+        lock,
+        overrides,
+    })
 }
 
 /// Which of `packages` [`vendor_npm`] would refuse before its first
@@ -533,6 +553,7 @@ pub(crate) async fn preflight_packages(
             let mut warnings = Vec::new();
             rewritable_matches(
                 &project.lock,
+                &project.overrides,
                 &coords.name,
                 &coords.version,
                 &project.lock_name,
@@ -832,6 +853,7 @@ enum LockScan {
 /// for the link / inBundle instances that cannot be rewritten.
 fn scan_lock_matches(
     lock: &Value,
+    overrides: &NpmOverrides,
     name: &str,
     version: &str,
     warnings: &mut Vec<VendorWarning>,
@@ -840,7 +862,7 @@ fn scan_lock_matches(
     let Some(packages) = lock.get("packages").and_then(Value::as_object) else {
         return LockScan::Matches(matches); // validated earlier; defensive
     };
-    let non_registry = npm_non_registry_entries(lock);
+    let non_registry = npm_non_registry_entries(lock, overrides);
     for (key, entry) in packages {
         // The root "" entry is the project itself, never a dependency.
         if key.is_empty() {
@@ -1203,6 +1225,7 @@ struct SiblingLock {
 fn sibling_lock_target(
     sib_name: &str,
     sib_bytes: std::io::Result<Vec<u8>>,
+    overrides: &NpmOverrides,
     name: &str,
     version: &str,
     warnings: &mut Vec<VendorWarning>,
@@ -1220,7 +1243,7 @@ fn sibling_lock_target(
             "lockfileVersion {lock_version:?}; only v2/v3 locks are supported"
         ));
     }
-    match scan_lock_matches(&lock, name, version, warnings) {
+    match scan_lock_matches(&lock, overrides, name, version, warnings) {
         LockScan::Matches(matches) if !matches.is_empty() => Ok(SiblingLock {
             name: sib_name.to_string(),
             bytes,
@@ -1242,6 +1265,7 @@ struct LockRewire<'a> {
     resolved: &'a str,
     integrity: &'a str,
     staged_pkg_json: Option<&'a Value>,
+    overrides: &'a NpmOverrides,
 }
 
 impl LockRewire<'_> {
@@ -1258,7 +1282,7 @@ impl LockRewire<'_> {
         warnings: &mut Vec<VendorWarning>,
     ) -> Result<(), String> {
         // Taken before any rewrite, for the legacy mirror below.
-        let non_registry = npm_non_registry_entries(lock);
+        let non_registry = npm_non_registry_entries(lock, self.overrides);
         let Some(packages) = lock.get_mut("packages").and_then(Value::as_object_mut) else {
             return Err("lock `packages` object vanished mid-rewrite".to_string());
         };
@@ -1692,7 +1716,7 @@ mod tests {
             let mut warnings = Vec::new();
             assert!(
                 matches!(
-                    scan_lock_matches(&lock, "left-pad", "1.3.0", &mut warnings),
+                    scan_lock_matches(&lock, &NpmOverrides::default(), "left-pad", "1.3.0", &mut warnings),
                     LockScan::Matches(m) if m.is_empty()
                 ),
                 "defensive scan of {lock} must yield no matches"
@@ -2068,6 +2092,52 @@ mod tests {
     /// the dependent's spec, not the lock's `resolved`, so vendoring it
     /// would report `applied` while `npm ci` installs the original bytes.
     /// With no other copy the vendor refuses and writes nothing.
+    #[tokio::test]
+    async fn issue_490_a_git_edge_overridden_to_the_registry_is_vendored() {
+        // `pkga` depends on left-pad from git; the project's `overrides`
+        // send it to the registry release, which is what npm installs.
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "version": "1.0.0",
+                      "dependencies": { "pkga": "file:pkga-1.0.0.tgz" } },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-orig=="
+                },
+                "node_modules/pkga": {
+                    "version": "1.0.0",
+                    "resolved": "file:pkga-1.0.0.tgz",
+                    "dependencies": { "left-pad": "github:stevemao/left-pad#v1.3.0" }
+                }
+            }
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock).await;
+        // Without the override the #326 refusal still applies.
+        expect_refused(fx.vendor(true).await, "vendor_lock_entry_not_rewritable");
+        tokio::fs::write(
+            fx.root().join("package.json"),
+            r#"{"name":"fixture","version":"1.0.0","dependencies":{"pkga":"file:pkga-1.0.0.tgz"},"overrides":{"left-pad":"1.3.0"}}"#,
+        )
+        .await
+        .unwrap();
+        let (result, entry, _warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let rewritten: Value =
+            serde_json::from_slice(&tokio::fs::read(fx.lock_path()).await.unwrap()).unwrap();
+        let resolved = rewritten["packages"]["node_modules/left-pad"]["resolved"]
+            .as_str()
+            .unwrap();
+        assert!(
+            resolved.starts_with("file:.socket/vendor/npm/"),
+            "{resolved}"
+        );
+    }
+
     #[tokio::test]
     async fn non_registry_only_instances_refuse_and_write_nothing() {
         let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
