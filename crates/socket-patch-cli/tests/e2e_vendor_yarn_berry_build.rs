@@ -265,7 +265,20 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn yarn_berry_vendor_fresh_checkout_immutable_check_cache_and_revert() {
-    run_berry_capstone(VendorDriver::VendorCli).await;
+    run_berry_capstone(VendorDriver::VendorCli, "").await;
+}
+
+/// #370: `compressionLevel: 0` with a trailing YAML comment is the default
+/// to yarn (cacheKey `10c0`), so vendor must not refuse it as a
+/// checksum-changing level. The whole capstone runs against that
+/// `.yarnrc.yml`, fresh-checkout `--immutable` proof included.
+#[tokio::test(flavor = "multi_thread")]
+async fn yarn_berry_vendor_commented_default_compression_level() {
+    run_berry_capstone(
+        VendorDriver::VendorCli,
+        "compressionLevel: 0 # keep yarn default\n",
+    )
+    .await;
 }
 
 /// get-driven twin (v3.6): `get <uuid> --mode vendored` consumes the SAME
@@ -277,10 +290,11 @@ async fn yarn_berry_vendor_fresh_checkout_immutable_check_cache_and_revert() {
 /// the `vendor` front door's contract (the capstone above).
 #[tokio::test(flavor = "multi_thread")]
 async fn berry_get_uuid_vendored_fresh_checkout_immutable() {
-    run_berry_capstone(VendorDriver::GetUuid).await;
+    run_berry_capstone(VendorDriver::GetUuid, "").await;
 }
 
-async fn run_berry_capstone(driver: VendorDriver) {
+/// `yarnrc_extra` is appended to the capstone's `.yarnrc.yml`.
+async fn run_berry_capstone(driver: VendorDriver, yarnrc_extra: &str) {
     if !has_corepack_pm(yarn_berry()) {
         skip!(
             "SKIP e2e_vendor_yarn_berry_build ({driver:?}): `corepack {}` unavailable \
@@ -304,7 +318,7 @@ async fn run_berry_capstone(driver: VendorDriver) {
     // (the only checksum recipe vendor reproduces offline — spike B4).
     std::fs::write(
         proj.join(".yarnrc.yml"),
-        "nodeLinker: node-modules\nenableGlobalCache: false\n",
+        format!("nodeLinker: node-modules\nenableGlobalCache: false\n{yarnrc_extra}"),
     )
     .unwrap();
 

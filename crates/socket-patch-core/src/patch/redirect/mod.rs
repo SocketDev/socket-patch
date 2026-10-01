@@ -14450,6 +14450,15 @@ packages:
             Err("redirect_yarn_berry_cache_unsupported".to_string())
         );
         assert_eq!(code(&crlf, Some("compressionLevel: 0\n")), Ok(()));
+        // #370: a trailing YAML comment is not part of the value.
+        assert_eq!(
+            code(&crlf, Some("compressionLevel: 0 # keep yarn default\n")),
+            Ok(())
+        );
+        assert_eq!(
+            code(&crlf, Some("compressionLevel: mixed # smaller cache\n")),
+            Err("redirect_yarn_berry_cache_unsupported".to_string())
+        );
     }
 
     /// The whole-file gates read the NORMALIZED lock: a CRLF lock at an
