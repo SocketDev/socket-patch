@@ -1254,7 +1254,6 @@ async fn scan_vendor_prune_reconciles_unwired_entry_on_an_empty_crawl() {
     mount_patch_api(&mock, UUID).await;
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path());
-    let original_lock = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
 
@@ -1268,8 +1267,11 @@ async fn scan_vendor_prune_reconciles_unwired_entry_on_an_empty_crawl() {
             "": { "name": "scan-vendor-test", "version": "0.0.0" }
         }
     });
-    let uninstalled_lock = serde_json::to_vec_pretty(&lock).unwrap();
-    std::fs::write(tmp.path().join("package-lock.json"), &uninstalled_lock).unwrap();
+    std::fs::write(
+        tmp.path().join("package-lock.json"),
+        serde_json::to_vec_pretty(&lock).unwrap(),
+    )
+    .unwrap();
     std::fs::remove_dir_all(tmp.path().join("node_modules/left-pad")).unwrap();
     let unwired = |v: &serde_json::Value| {
         v["warnings"]
@@ -1301,8 +1303,8 @@ async fn scan_vendor_prune_reconciles_unwired_entry_on_an_empty_crawl() {
     );
 
     // The drift-kept entry is still unwired, so the next plain rescan warns
-    // again, and its detail names the way out a drift-keep needs: `--prune`
-    // alone cannot clear it.
+    // again; its detail names the purl and the prune's `GC: kept` report
+    // instead of a lock edit that could unwire other vendored entries.
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
@@ -1315,50 +1317,9 @@ async fn scan_vendor_prune_reconciles_unwired_entry_on_an_empty_crawl() {
         .unwrap_or_else(|| panic!("envelope={v}"))
         .to_string();
     assert!(
-        detail.contains(&format!("({PURL})")) && detail.contains("from before vendoring"),
+        detail.contains(&format!("({PURL})")) && detail.contains("`GC: kept`"),
         "{detail}"
     );
-
-    // Following that advice converges: restore the pre-vendor lock, prune
-    // (report mode, so the restored dependency is not re-vendored), then
-    // the package manager's install drops the dependency again. No entry,
-    // no artifact, no warning.
-    std::fs::write(tmp.path().join("package-lock.json"), &original_lock).unwrap();
-    let out = Command::new(binary())
-        .args([
-            "scan",
-            "--json",
-            "--prune",
-            "--yes",
-            "--api-url",
-            &mock.uri(),
-            "--api-token",
-            "fake-token",
-            "--org",
-            ORG_SLUG,
-        ])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert_eq!(out.status.code(), Some(0), "stdout={stdout}");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(
-        v["gc"]["revertedVendoredEntries"],
-        serde_json::json!([PURL]),
-        "envelope={v}"
-    );
-    std::fs::write(tmp.path().join("package-lock.json"), &uninstalled_lock).unwrap();
-    assert!(
-        !tmp.path()
-            .join(format!(".socket/vendor/npm/{UUID}"))
-            .exists(),
-        "artifact dir removed"
-    );
-    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
-    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(unwired(&v), 0, "converged: {v}");
 }
 
 /// Interactive (non-JSON) `scan --vendor` pre-verifies patch baselines:

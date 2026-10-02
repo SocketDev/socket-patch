@@ -225,19 +225,18 @@ pub(super) const PRUNE_SKIPPED_EMPTY: &str = "Warning: --prune skipped: no insta
 
 /// The `vendor_ledger_entry_unwired` warning: vendored entries whose
 /// dependency left the lockfile (upgraded or removed), so the scan no
-/// longer discovers them. `--prune` reverts them, unless their lock entries
-/// were re-resolved since vendoring: the GC then drift-keeps them, and only
-/// restoring the pre-vendor lock lets the same prune converge (the
-/// drift-keep contract), so the detail names that way out too.
+/// longer discovers them, and `--prune` reverts them. A prune that
+/// drift-keeps an entry (its lock entries were re-resolved since vendoring)
+/// explains that on its own `GC: kept` line, so the detail points there
+/// rather than suggesting a lock edit whose reach it cannot bound.
 pub(super) fn unwired_vendored_detail(purls: &[String]) -> String {
     let one = purls.len() == 1;
     let them = if one { "it" } else { "them" };
     format!(
         "{} no longer used by the lockfile (the dependency was upgraded or removed) and {} \
-         skipped ({}); run `socket-patch scan --prune` to revert {them}. If that run keeps \
-         {them} because the lock entries were re-resolved since vendoring, restore the lockfile \
-         from before vendoring, run `socket-patch scan --prune` again, then re-run your package \
-         manager's install",
+         skipped ({}); run `socket-patch scan --prune` to revert {them} (a prune that keeps \
+         {them} because the lock entries were re-resolved since vendoring says so on its \
+         `GC: kept` line)",
         crate::ui::plural(purls.len(), "vendored entry is", "vendored entries are"),
         if one { "was" } else { "were" },
         purls.join(", "),
