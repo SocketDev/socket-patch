@@ -102,6 +102,12 @@ limits, and required install commands.
 
 ### Fixed
 
+- Global mode (`-g`) finds npm, yarn, pnpm, bun, RubyGems and Composer on
+  Windows, where they install as `.cmd` / `.bat` shims, instead of reporting
+  an empty scan. The yarn and npm-family global lookups no longer run from the
+  scanned project, so a Yarn Berry project's `global` script can't run or pick
+  the directory treated as the global install. Composer's global home also
+  falls back to `%APPDATA%\Composer` and `$XDG_CONFIG_HOME/composer`.
 - Agent-mode PyPI `apply` patches every installed copy of a release, not just
   the first one found. A Pipenv project with both a WORKON_HOME venv and a
   `./.venv`, or a global install with the same release in the user site and a
