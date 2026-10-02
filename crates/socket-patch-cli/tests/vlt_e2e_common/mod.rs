@@ -1584,12 +1584,25 @@ impl PatchService {
                 })
             })
             .collect();
+        // Like the production API, answer only for the purls the batch asks
+        // about: a leg that moves a dependency to another release must not
+        // be offered the old release's patch.
         Mock::given(method("POST"))
             .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "packages": packages,
-                "canAccessPaidPatches": false,
-            })))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                let asked: Vec<&Value> = packages
+                    .iter()
+                    .filter(|p| {
+                        let purl = p["purl"].as_str().unwrap_or_default();
+                        body.contains(purl) || body.contains(&purl.replace("%40", "@"))
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "packages": asked,
+                    "canAccessPaidPatches": false,
+                }))
+            })
             .mount(&self.server)
             .await;
         for t in &self.targets {
