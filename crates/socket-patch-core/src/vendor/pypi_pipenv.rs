@@ -1094,7 +1094,7 @@ mod tests {
             } else {
                 "user-declared"
             };
-            assert!(err.1.contains(expected), "{url}: {}", err.1);
+            assert!(err.1.contains(expected), "{url}: expected {expected:?}");
         }
     }
 
