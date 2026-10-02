@@ -38,12 +38,17 @@ mod prebuilt_common;
 #[path = "gradle_build_common/mod.rs"]
 mod gradle_build_common;
 
+#[path = "jvm_fixture_repo/mod.rs"]
+mod jvm_fixture_repo;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use gradle_build_common::{
-    fixture_root, gradle_classpath, gradle_skip, lockfiles, snapshot, write_project, Gradle,
+    assert_patched, fixture_root, gradle_classpath, gradle_skip, init_script, lockfiles,
+    mirror_init_script, print_cp_task, probe_report, snapshot, write_both_dsls, write_project, Dsl,
+    Gradle,
 };
 use maven_build_common::*;
 
@@ -877,4 +882,141 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
         !proj.join(".socket/gradle").exists(),
         ".socket/gradle residue"
     );
+}
+
+// ── P3: the fake Central through the mirror init script ─────────────────
+
+/// Settings with a buildscript-classpath library whose class prints a
+/// marker from build logic, and `FAIL_ON_PROJECT_REPOS` + `mavenCentral()`.
+fn smoke_settings(dsl: Dsl) -> String {
+    let (classpath, mode) = match dsl {
+        Dsl::Groovy => (
+            "classpath 'com.socketfixture:buildlogic-plugin:1.0'",
+            "repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)",
+        ),
+        Dsl::Kotlin => (
+            "classpath(\"com.socketfixture:buildlogic-plugin:1.0\")",
+            "repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)",
+        ),
+    };
+    let (name, include) = match dsl {
+        Dsl::Groovy => ("rootProject.name = 'smoke'", "include 'app'"),
+        Dsl::Kotlin => ("rootProject.name = \"smoke\"", "include(\"app\")"),
+    };
+    format!(
+        "buildscript {{\n    repositories {{ mavenCentral() }}\n    dependencies {{ {classpath} }}\n}}\n\
+         com.socketfixture.buildlogic.BuildLogic.print()\n\
+         dependencyResolutionManagement {{\n    {mode}\n    repositories {{ mavenCentral() }}\n}}\n\
+         {name}\n{include}\n"
+    )
+}
+
+/// `:app` reaches the victim only through `consumer-range`'s pom range
+/// `[1.9,1.11)`, so Gradle lists versions from the artifact-level
+/// `maven-metadata.xml` and must pick 1.10.0 (the settings classpath
+/// requests it literally, through `buildlogic-plugin`).
+fn smoke_app(dsl: Dsl) -> String {
+    let body = match dsl {
+        Dsl::Groovy => {
+            "plugins { id 'java' }\n\ndependencies {\n    \
+             implementation 'com.socketfixture:consumer-range:2.0'\n}\n"
+        }
+        Dsl::Kotlin => {
+            "plugins { java }\n\ndependencies {\n    \
+             implementation(\"com.socketfixture:consumer-range:2.0\")\n}\n"
+        }
+    };
+    format!("{body}\n{}", print_cp_task(dsl, "runtimeClasspath"))
+}
+
+#[test]
+#[ignore = "real Gradle (the fake Central, no network); run with --ignored"]
+fn gradle_multi_project_fake_central_mirror_smoke_both_dsls() {
+    use jvm_fixture_repo::*;
+    const SUITE: &str = "e2e_vendor_jvm_build::fake_central";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fixture_root(&tmp);
+    let home = root.join("gradle-home");
+    let Some(gradle) = Gradle::detect(SUITE, &home) else {
+        return;
+    };
+    let central = FakeCentral::start();
+    let init = init_script(
+        &root.join("init"),
+        "mirror.gradle",
+        &mirror_init_script(&central.uri(), None),
+    );
+    let projects = write_both_dsls(&root.join("proj"), |dsl| {
+        vec![
+            (dsl.settings_file(), smoke_settings(dsl)),
+            (format!("app/{}", dsl.build_file()), smoke_app(dsl)),
+        ]
+    });
+    let pristine = notice(&format!("{GROUP}:{VICTIM}:{VICTIM_VERSION}"), "pristine");
+    let jar = generate()[&repo_path(VICTIM, VICTIM_VERSION, None, "jar")].clone();
+    for (dsl, proj) in projects {
+        let what = format!("Gradle {} {} DSL", gradle.version, dsl.name());
+        let out = gradle.run(
+            &proj,
+            &home,
+            &[&init[0], &init[1], ":app:printRuntimeClasspath"],
+        );
+        let consumed = assert_patched(&out, VICTIM, NOTICE, pristine.as_bytes(), &what);
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&format!(
+                "{BUILDLOGIC_MARKER}{}",
+                victim_marker(VICTIM_VERSION, "pristine")
+            )),
+            "{what}: the settings buildscript class prints the victim marker:\n{}",
+            gradle_build_common::dump(&out)
+        );
+        let files21 = home.join("caches/modules-2/files-2.1");
+        assert!(
+            consumed.starts_with(&files21),
+            "{what}: resolved into the per-test Gradle cache: {}",
+            consumed.display()
+        );
+        assert_eq!(
+            std::fs::read(&consumed).unwrap(),
+            jar,
+            "{what}: the fixture bytes"
+        );
+        let hash_dir = consumed
+            .parent()
+            .and_then(|p| p.file_name())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let sha1 = sha1_hex(&jar);
+        assert_eq!(
+            format!("{hash_dir:0>40}"),
+            sha1,
+            "{what}: the hash dir names the jar's sha1 (leading zeros may be dropped)"
+        );
+        probe_report(
+            &format!("fake-central-smoke-{}-{}", gradle.version, dsl.name()),
+            &serde_json::json!({
+                "gradle": gradle.version,
+                "jvm": gradle.jvm,
+                "dsl": dsl.name(),
+                "resolved": consumed.to_string_lossy(),
+                "sha256": sha256_hex(&jar),
+                "sha1": sha1,
+                "hashDir": hash_dir,
+                "leadingZeroKept": hash_dir.len() == 40,
+            }),
+        );
+    }
+    let requests = central.requests();
+    for leaf in [
+        repo_path(VICTIM, VICTIM_VERSION, None, "jar"),
+        repo_path(BUILDLOGIC, BUILDLOGIC_VERSION, None, "jar"),
+        format!("{GROUP_PATH}/{VICTIM}/maven-metadata.xml"),
+    ] {
+        assert!(
+            requests.contains(&format!("/{leaf}")),
+            "the fake Central served {leaf}: {requests:?}"
+        );
+    }
+    println!("{SUITE}: Gradle {} green", gradle.version);
 }
