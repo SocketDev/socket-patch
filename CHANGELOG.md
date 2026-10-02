@@ -130,7 +130,10 @@ limits, and required install commands.
   `vendor_non_registry_entry_skipped`; vendoring refuses with
   `vendor_lock_entry_not_rewritable` when no registry copy is left), and
   `vex` attests nothing for a `name@version` while such a copy is in the
-  lock (#326).
+  lock (#326). A dependency the project's `overrides` send back to a
+  registry version is not one of these: npm installs the override's
+  registry release, so hosted and vendored modes patch it again, and
+  `vex` attests it (#490).
 - **Agent mode finds Poetry's virtualenv in more setups.** Three cases
   missed the virtualenv Poetry installed into. Each fell back to the
   wrong interpreter, skipped the patch as `package_not_installed` and

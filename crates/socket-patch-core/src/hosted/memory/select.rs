@@ -45,8 +45,18 @@ pub(crate) const VENDOR_STATE_REL: &str = ".socket/vendor/state.json";
 /// classifies against (a package it records is not NEW).
 pub(crate) const MANIFEST_REL: &str = ".socket/manifest.json";
 
+/// The root manifest: its `overrides` decide which npm lock entries are
+/// registry installs (#490). Read as advisory input, never edited.
+pub(crate) const NPM_MANIFEST_REL: &str = "package.json";
+
 /// Root-relative text files read beyond `REDIRECT_CANDIDATE_FILES`.
-const EXTRA_TEXT_FILES: [&str; 4] = [PNPM_WORKSPACE_REL, NPMRC_REL, VENDOR_STATE_REL, MANIFEST_REL];
+const EXTRA_TEXT_FILES: [&str; 5] = [
+    PNPM_WORKSPACE_REL,
+    NPMRC_REL,
+    VENDOR_STATE_REL,
+    MANIFEST_REL,
+    NPM_MANIFEST_REL,
+];
 
 /// The one directory name the disk Cargo member walk never enters (it
 /// follows `members`, `exclude`, path dependencies and `[patch]` paths
@@ -482,6 +492,7 @@ mod tests {
             vec![
                 ".npmrc",
                 "package-lock.json",
+                "package.json",
                 "tool.py",
                 "tool.py.lock",
                 "web/.yarnrc.yml",

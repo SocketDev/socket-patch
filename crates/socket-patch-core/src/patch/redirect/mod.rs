@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
 use crate::vendor::common::{parse_json_text, JsonLayout};
-use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries};
+use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries, NpmOverrides};
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 mod bun_binary;
@@ -832,8 +832,21 @@ fn rewrite_npm_lock(
         }
         return;
     }
+    // The root manifest's `overrides` decide which git / url / `file:`
+    // dependent specs npm actually installs from (#490); the engine reads
+    // it as advisory input only.
+    let manifest_overrides = files
+        .get("package.json")
+        .map(|text| NpmOverrides::from_manifest_text(text))
+        .unwrap_or_default();
     for lockfile in present {
-        rewrite_one_npm_lock(&files[lockfile], lockfile, &npm, result);
+        rewrite_one_npm_lock(
+            &files[lockfile],
+            lockfile,
+            &npm,
+            &manifest_overrides,
+            result,
+        );
     }
 }
 
@@ -844,6 +857,7 @@ fn rewrite_one_npm_lock(
     content: &str,
     lockfile: &str,
     npm: &[&DepOverride],
+    manifest_overrides: &NpmOverrides,
     result: &mut RewriteResult,
 ) {
     // npm reads past a leading UTF-8 BOM; so do we.
@@ -892,7 +906,7 @@ fn rewrite_one_npm_lock(
         .unwrap_or_default();
     // Entries npm installs from a git / url / `file:` spec: see
     // `vendor::npm_origin` (#326).
-    let non_registry = npm_non_registry_entries(&lock);
+    let non_registry = npm_non_registry_entries(&lock, manifest_overrides);
     let mut changed = false;
     for dep in npm {
         let fname = full_name(dep);
@@ -12359,6 +12373,116 @@ mod tests {
     /// the dependent's spec and ignores the lock's `resolved`, so rewiring
     /// that entry would report (and VEX-attest) a patch `npm ci` never
     /// installs. It must be skipped loudly, like a bundled copy.
+    #[test]
+    fn issue_490_unclear_overrides_leave_a_url_dependency_unredirected() {
+        // The review probes: npm keeps the URL spec for a `*` override, and
+        // picks the narrower rule under a range selector, so `npm ci` still
+        // fetches the URL. The rewriter must skip the entry loudly.
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0", "dependencies": { "pkga": "^1.0.0" } },
+                "node_modules/pkga": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/pkga/-/pkga-1.0.0.tgz",
+                    "dependencies": { "left-pad": url }
+                },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": url,
+                    "integrity": "sha512-UPSTREAM=="
+                }
+            }
+        });
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        for manifest_overrides in [
+            json!({ "left-pad": "*" }),
+            json!({ "left-pad": "1.3.0", "pkga@^1": { "left-pad": url } }),
+            json!({ "left-pad": "1.3.0", "pkga@1.0.0+build.1": { "left-pad": url } }),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "package-lock.json".to_string(),
+                serde_json::to_string_pretty(&lock).unwrap(),
+            );
+            files.insert(
+                "package.json".to_string(),
+                json!({ "name": "app", "dependencies": { "pkga": "^1.0.0" }, "overrides": manifest_overrides })
+                    .to_string(),
+            );
+            let r = rewrite_registry_redirect(&files, &overrides);
+            assert!(r.files.is_empty(), "{manifest_overrides}: {:?}", r.edits);
+            assert!(
+                warning_codes(&r).contains(&"redirect_npm_non_registry_entry_skipped"),
+                "{manifest_overrides}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn issue_490_a_git_edge_overridden_to_the_registry_is_redirected() {
+        // `pkga` depends on left-pad from git; the project's `overrides`
+        // send it to the registry release, which is what npm installs.
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0", "dependencies": { "pkga": "file:pkga-1.0.0.tgz" } },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-UPSTREAM=="
+                },
+                "node_modules/pkga": {
+                    "version": "1.0.0",
+                    "resolved": "file:pkga-1.0.0.tgz",
+                    "dependencies": { "left-pad": "github:stevemao/left-pad#v1.3.0" }
+                }
+            }
+        });
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            serde_json::to_string_pretty(&lock).unwrap(),
+        );
+        // Without the manifest's override the #326 skip still applies.
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty(), "{:?}", r.edits);
+        assert!(warning_codes(&r).contains(&"redirect_npm_non_registry_entry_skipped"));
+
+        files.insert(
+            "package.json".to_string(),
+            r#"{"name":"app","dependencies":{"pkga":"file:pkga-1.0.0.tgz"},"overrides":{"left-pad":"1.3.0"}}"#
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            !warning_codes(&r).contains(&"redirect_npm_non_registry_entry_skipped"),
+            "{:?}",
+            r.warnings
+        );
+        let rewritten: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+        let entry = &rewritten["packages"]["node_modules/left-pad"];
+        assert_eq!(entry["resolved"], "http://patch.test/lp.tgz");
+        assert_eq!(entry["integrity"], "sha512-PATCHED==");
+        // The manifest is input only: never written.
+        assert!(!r.files.contains_key("package.json"));
+    }
+
     #[test]
     fn npm_non_registry_entries_are_skipped_with_loud_warning() {
         let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
