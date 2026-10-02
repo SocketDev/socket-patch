@@ -1072,7 +1072,13 @@ fn layout_refusal_json(refusals: &[(String, String)]) -> serde_json::Value {
     serde_json::Value::Array(
         refusals
             .iter()
-            .map(|(code, detail)| serde_json::json!({ "code": code, "detail": detail }))
+            .map(|(code, detail)| {
+                let mut entry = serde_json::json!({ "code": code, "detail": detail });
+                if let Some(level) = warning_level(code) {
+                    entry["level"] = serde_json::json!(level);
+                }
+                entry
+            })
             .collect(),
     )
 }
@@ -1141,8 +1147,35 @@ struct GradleScan {
     notes: Vec<(String, String)>,
     /// Base purls (normalized) of the packages crawled from a Gradle cache.
     gradle_purls: HashSet<String>,
-    /// Base purls the build's lock files name.
-    locked: HashSet<String>,
+    /// Base purls the build's lock files name; `None` when they were not
+    /// read (no Gradle build at the cwd, or no Gradle-cached package to
+    /// annotate), so no `inLock` is reported.
+    locked: Option<HashSet<String>>,
+}
+
+/// The level of a run-level warning code: `info` for the Gradle advisories
+/// that need no action, `warn` for the Gradle warning, `None` (no `level`
+/// field, printed as a warning) for every other code.
+fn warning_level(code: &str) -> Option<&'static str> {
+    match code {
+        GRADLE_MAVEN_LOCAL_UNDETERMINED | GRADLE_USER_HOME_DIFFERS => Some("info"),
+        GRADLE_BUILD_IGNORES_M2 => Some("warn"),
+        _ => None,
+    }
+}
+
+/// Print the run-level warnings to stderr: advisories as `Note:` (not
+/// under `--silent`), everything else as `Warning:`.
+fn print_layout_refusals(refusals: &[(String, String)], silent: bool) {
+    for (code, detail) in refusals {
+        if warning_level(code) == Some("info") {
+            if !silent {
+                eprintln!("Note: {detail}");
+            }
+        } else {
+            eprintln!("Warning: {detail}");
+        }
+    }
 }
 
 /// The Gradle discovery notes and the lock-membership annotation for a
@@ -1171,6 +1204,8 @@ async fn gradle_scan(
     }
     let cwd = common.cwd.clone();
     let global = common.is_global();
+    // An explicit cache root makes the user home Gradle would pick moot.
+    let prefixed = common.global_prefix.is_some();
     let manifest_gavs: Vec<String> = manifest
         .map(|m| {
             m.patches
@@ -1185,15 +1220,17 @@ async fn gradle_scan(
         let gradle_build = gradle_cache::has_gradle_marker(&cwd);
         let env = JvmEnv::from_process();
         let gate = (!global && gradle_build).then(|| m2_gate(&cwd, &env));
-        let locked: HashSet<String> = if !global && (want_locks || gate == Some(M2Gate::Ignored)) {
-            gradle_cache::locked_gavs(&cwd)
-                .into_iter()
-                .map(|(g, a, v)| format!("pkg:maven/{g}/{a}@{v}"))
-                .collect()
-        } else {
-            HashSet::new()
-        };
-        let mismatch = (global || gradle_build)
+        // The cwd's build locks annotate Gradle-cached packages in a global
+        // run too; without a Gradle build at the cwd there is nothing to
+        // say, so no annotation at all.
+        let locked: Option<HashSet<String>> =
+            (gradle_build && (want_locks || gate == Some(M2Gate::Ignored))).then(|| {
+                gradle_cache::locked_gavs(&cwd)
+                    .into_iter()
+                    .map(|(g, a, v)| format!("pkg:maven/{g}/{a}@{v}"))
+                    .collect()
+            });
+        let mismatch = (!prefixed && (global || gradle_build))
             .then(gradle_cache::home_mismatch)
             .flatten();
         (gate, locked, mismatch, env)
@@ -1214,6 +1251,7 @@ async fn gradle_scan(
         Some(M2Gate::Ignored) => {
             let mut candidates: Vec<String> = locked
                 .iter()
+                .flatten()
                 .cloned()
                 .chain(manifest_gavs)
                 .filter(|p| !scanned.contains(p))
@@ -1264,7 +1302,7 @@ async fn gradle_scan(
             ),
         ));
     }
-    out.locked = locked;
+    out.locked = want_locks.then_some(locked).flatten();
     out
 }
 
@@ -1919,9 +1957,7 @@ async fn run_scan(
     if package_count == 0 {
         status.finish();
         if human {
-            for (_, detail) in &layout_refusals {
-                eprintln!("Warning: {detail}");
-            }
+            print_layout_refusals(&layout_refusals, args.common.silent);
             policy.print_warnings(args.common.silent);
             // Hosted mode already printed its own prune-ignored warning.
             if prune && !hosted {
@@ -2051,9 +2087,7 @@ async fn run_scan(
         if !lockfile_only.purls.is_empty() {
             eprintln!("{}", render::lockfile_only_note(lockfile_only.purls.len()));
         }
-        for (_, detail) in &layout_refusals {
-            eprintln!("Warning: {detail}");
-        }
+        print_layout_refusals(&layout_refusals, args.common.silent);
         policy.print_warnings(args.common.silent);
     }
 
@@ -2314,7 +2348,9 @@ async fn run_scan(
                     .map(|p| normalize_purl(strip_purl_qualifiers(p)).into_owned())
                     .filter(|base| gradle.gradle_purls.contains(base))
                 {
-                    pkg["inLock"] = serde_json::json!(gradle.locked.contains(&base));
+                    if let Some(locked) = &gradle.locked {
+                        pkg["inLock"] = serde_json::json!(locked.contains(&base));
+                    }
                 }
             }
         }

@@ -87,6 +87,16 @@ impl Scan {
             .map(str::to_string)
     }
 
+    /// The `level` of the run-level warning `code`.
+    fn warning_level(&self, code: &str) -> Option<String> {
+        self.env["warnings"]
+            .as_array()?
+            .iter()
+            .find(|w| w["code"] == code)
+            .and_then(|w| w["level"].as_str())
+            .map(str::to_string)
+    }
+
     fn package(&self, purl: &str) -> Option<&serde_json::Value> {
         self.env["packages"]
             .as_array()?
@@ -96,9 +106,10 @@ impl Scan {
 }
 
 /// `socket-patch scan --json` in `cwd` with the Gradle user home `gradle_home`
-/// and the Maven local repository `m2`, against a mock API; every other JVM
-/// cache scrubbed (`prebuilt_common::prepare_command`).
-fn scan(cwd: &Path, gradle_home: &Path, m2: &Path) -> Scan {
+/// (`None` = no `GRADLE_USER_HOME`) and the Maven local repository `m2`,
+/// plus `extra` arguments, against a mock API; every other JVM cache
+/// scrubbed (`prebuilt_common::prepare_command`).
+fn scan(cwd: &Path, gradle_home: Option<&Path>, m2: &Path, extra: &[&str]) -> Scan {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -116,7 +127,7 @@ fn scan(cwd: &Path, gradle_home: &Path, m2: &Path) -> Scan {
         }
     }
     let uri = server.uri();
-    let args = [
+    let mut args = vec![
         "scan",
         "--json",
         "--api-url",
@@ -126,12 +137,12 @@ fn scan(cwd: &Path, gradle_home: &Path, m2: &Path) -> Scan {
         "--org",
         ORG,
     ];
-    prebuilt_common::prepare_command(
-        &mut cmd,
-        cwd,
-        &args,
-        &[("GRADLE_USER_HOME", gradle_home.to_str().unwrap())],
-    );
+    args.extend_from_slice(extra);
+    let env: Vec<(&str, &str)> = gradle_home
+        .map(|h| ("GRADLE_USER_HOME", h.to_str().unwrap()))
+        .into_iter()
+        .collect();
+    prebuilt_common::prepare_command(&mut cmd, cwd, &args, &env);
     let out = cmd
         .current_dir(cwd)
         .env("SOCKET_TELEMETRY_DISABLED", "1")
@@ -198,7 +209,11 @@ impl Fixture {
     }
 
     fn scan(&self) -> Scan {
-        scan(&self.project, &self.gradle_home, &self.m2)
+        self.scan_with(&[])
+    }
+
+    fn scan_with(&self, extra: &[&str]) -> Scan {
+        scan(&self.project, Some(&self.gradle_home), &self.m2, extra)
     }
 
     fn cache_commons_text(&self) -> PathBuf {
@@ -236,7 +251,8 @@ fn scan_reports_gradle_user_home_packages_with_empty_m2() {
     let fx = Fixture::new();
     fx.write("settings.gradle", "rootProject.name = 'p'\n");
     fx.write("build.gradle", BUILD);
-    fx.cache_commons_text();
+    let version_dir = fx.cache_commons_text();
+    assert_eq!(crawled_path(&fx, COMMONS_TEXT), Some(version_dir));
 
     let scan = fx.scan();
     assert_eq!(scan.env["scannedPackages"], 1, "{}", scan.env);
@@ -292,6 +308,64 @@ fn scan_annotates_lock_membership_without_filtering() {
         "{}",
         scan.env
     );
+
+    // A global run in the same build reads its locks too: `inLock` is
+    // never a lock membership that was not computed.
+    let files21 = fx.gradle_home.join(prebuilt_common::GRADLE_FILES21);
+    for extra in [
+        &["--global", "--ecosystems", "maven"][..],
+        &["--global-prefix", files21.to_str().unwrap()],
+    ] {
+        let scan = fx.scan_with(extra);
+        assert_eq!(
+            scan.package(COMMONS_TEXT).unwrap()["inLock"],
+            true,
+            "{extra:?}: {}",
+            scan.env
+        );
+        assert_eq!(
+            scan.package(BUILD_PLUGIN).unwrap()["inLock"],
+            false,
+            "{extra:?}: {}",
+            scan.env
+        );
+    }
+
+    // Outside any Gradle build there are no locks to consult: no `inLock`.
+    let elsewhere = fx.project.parent().unwrap().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let scan = crate::scan(
+        &elsewhere,
+        Some(&fx.gradle_home),
+        &fx.m2,
+        &["--global-prefix", files21.to_str().unwrap()],
+    );
+    let pkg = scan.package(COMMONS_TEXT).unwrap();
+    assert_eq!(pkg.get("inLock"), None, "{}", scan.env);
+}
+
+/// With `--global-prefix` the cache is named outright, so the user home
+/// Gradle would pick (here the passwd home, not the scrubbed `$HOME`) is
+/// never mentioned.
+#[test]
+fn global_prefix_scan_says_nothing_about_the_user_home() {
+    let fx = Fixture::new();
+    fx.write("build.gradle", BUILD);
+    let version_dir = fx.cache_commons_text();
+    let files21 = version_dir.ancestors().nth(3).unwrap();
+    let scan = scan(
+        &fx.project,
+        None,
+        &fx.m2,
+        &["--global-prefix", files21.to_str().unwrap()],
+    );
+    assert_eq!(scan.queried, vec![COMMONS_TEXT.to_string()], "{}", scan.env);
+    assert_eq!(
+        scan.warning("gradle_user_home_differs"),
+        None,
+        "{}",
+        scan.env
+    );
 }
 
 /// #551: a Gradle-only build without mavenLocal() does not scan m2, and a
@@ -321,6 +395,10 @@ fn gradle_only_build_ignores_m2_and_says_so() {
         .unwrap_or_else(|| panic!("no gradle_build_ignores_m2: {}", scan.env));
     assert!(detail.contains(M2_ONLY), "{detail}");
     assert!(!detail.contains(COMMONS_TEXT), "{detail}");
+    assert_eq!(
+        scan.warning_level("gradle_build_ignores_m2").as_deref(),
+        Some("warn")
+    );
 
     fx.write(
         "build.gradle",
@@ -352,9 +430,54 @@ fn undetermined_maven_local_keeps_m2_with_a_note() {
         .warning("gradle_maven_local_undetermined")
         .unwrap_or_else(|| panic!("no gradle_maven_local_undetermined: {}", scan.env));
     assert!(detail.contains("mavenLocal()"), "{detail}");
+    assert_eq!(
+        scan.warning_level("gradle_maven_local_undetermined")
+            .as_deref(),
+        Some("info")
+    );
 }
 
 // ── real Gradle ─────────────────────────────────────────────────────────
+
+/// The path the crawler reports for `purl` in `fx`'s project: the first
+/// root, in scan order, of `get_jvm_cache_roots_with` (under the fixture's
+/// `GRADLE_USER_HOME` and m2, never the process env) that resolves it.
+fn crawled_path(fx: &Fixture, purl: &str) -> Option<PathBuf> {
+    use socket_patch_core::crawlers::maven_crawler::JvmEnv;
+    use socket_patch_core::crawlers::types::CrawlerOptions;
+    use socket_patch_core::crawlers::MavenCrawler;
+    use socket_patch_core::gradle::Os;
+
+    let env: std::collections::HashMap<String, String> = [
+        ("GRADLE_USER_HOME", &fx.gradle_home),
+        ("MAVEN_REPO_LOCAL", &fx.m2),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string_lossy().into_owned()))
+    .collect();
+    let env = JvmEnv::resolve(&env, Os::current(), None);
+    let options = CrawlerOptions {
+        cwd: fx.project.clone(),
+        global: false,
+        global_prefix: None,
+    };
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            for root in MavenCrawler.get_jvm_cache_roots_with(&options, &env).await {
+                let found = MavenCrawler
+                    .find_by_purls(&root.path, &[purl.to_string()])
+                    .await
+                    .unwrap_or_default();
+                if let Some(pkg) = found.get(purl) {
+                    return Some(pkg.path.clone());
+                }
+            }
+            None
+        })
+}
 
 /// #349 on real Gradle: Gradle resolves the fixture into a fresh user home,
 /// `scan` reports the module from it (with an empty m2), and the version
@@ -418,13 +541,17 @@ fn gradle_agent_349_scan_finds_gradle_cache() {
     assert!(scan.package(&victim).is_some(), "{}", scan.env);
     assert_eq!(scan.warning("gradle_build_ignores_m2"), None);
 
-    // The crawler's package path is the version dir; installed_copies
-    // expands it to the hash dir Gradle wrote and the build consumed.
+    // The crawler, over the roots this build scans (the fixture's caches,
+    // in scan order), reports the version dir; installed_copies expands
+    // it to the hash dir Gradle wrote and the build consumed.
     let files21 = fx.gradle_home.join(prebuilt_common::GRADLE_FILES21);
-    let version_dir = files21
+    let expected_dir = files21
         .join(jvm_fixture_repo::GROUP)
         .join(jvm_fixture_repo::VICTIM)
         .join(jvm_fixture_repo::VICTIM_VERSION);
+    let version_dir = crawled_path(&fx, &victim)
+        .unwrap_or_else(|| panic!("the crawler does not resolve {victim}"));
+    assert_eq!(version_dir, expected_dir);
     assert!(gradle_cache::is_gradle_version_dir(&version_dir));
     let files = std::collections::HashMap::from([(
         leaf.clone(),
