@@ -124,6 +124,7 @@ async fn extract_text(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         }
     };
     let mut bundled = Bundled::default();
+    let mut unwired = Unwired::default();
     for entry in &entries {
         let elems = &entry.elems;
         let Some(spec) = elems.first().and_then(|e| decode_json_string(e)) else {
@@ -153,10 +154,11 @@ async fn extract_text(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         if is_bundled_entry(entry) {
             bundled.record(ctx, BUN_LOCK, classified, out);
         } else {
-            classify(ctx, BUN_LOCK, classified, out);
+            unwired.record(classify(ctx, BUN_LOCK, classified, out), &entry.key);
         }
     }
     bundled.contest(BUN_LOCK, out);
+    unwired.contest(BUN_LOCK, out);
 }
 
 // ── bundled copies ───────────────────────────────────────────────────────
@@ -259,6 +261,7 @@ async fn extract_binary(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         }
     };
     let mut bundled = Bundled::default();
+    let mut unwired = Unwired::default();
     for p in &packages {
         let integrity = p
             .integrity
@@ -283,10 +286,11 @@ async fn extract_binary(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         if p.bundled {
             bundled.record(ctx, BUN_LOCKB, classified, out);
         } else {
-            classify(ctx, BUN_LOCKB, classified, out);
+            unwired.record(classify(ctx, BUN_LOCKB, classified, out), &label);
         }
     }
     bundled.contest(BUN_LOCKB, out);
+    unwired.contest(BUN_LOCKB, out);
 }
 
 // ── shared classification ────────────────────────────────────────────────
@@ -309,8 +313,15 @@ struct Entry<'a> {
 }
 
 /// Push `entry`'s ref when it is Socket-wired (see the module docs); stay
-/// silent for anything else.
-fn classify(ctx: &DiscoverCtx<'_>, file: &str, entry: Entry<'_>, out: &mut Discovery) {
+/// silent for anything else. Returns the purl of a registry entry (an exact
+/// version resolved from a non-Socket source), which contests a ref for the
+/// same version in this lock ([`Unwired::contest`]) and in any other.
+fn classify(
+    ctx: &DiscoverCtx<'_>,
+    file: &str,
+    entry: Entry<'_>,
+    out: &mut Discovery,
+) -> Option<String> {
     let Entry {
         label,
         name,
@@ -334,7 +345,7 @@ fn classify(ctx: &DiscoverCtx<'_>, file: &str, entry: Entry<'_>, out: &mut Disco
                  .socket/vendor/npm/<uuid>/<tarball> path; it is ignored"
             ),
         );
-        return;
+        return None;
     }
     if vendored.is_none() && hosted_uuid.is_none() {
         // Registry / git / workspace / user tarball dependency: not ours. A
@@ -345,10 +356,9 @@ fn classify(ctx: &DiscoverCtx<'_>, file: &str, entry: Entry<'_>, out: &mut Disco
                 .starts_with(|c: char| c.is_ascii_digit())
                 .then_some(target)
         });
-        if let Some(version) = version {
-            out.resolved_elsewhere(file, npm_purl(name, version));
-        }
-        return;
+        let purl = version.and_then(|version| npm_purl(name, version));
+        out.resolved_elsewhere(file, purl.clone());
+        return purl;
     }
     let invalid = |out: &mut Discovery, why: String| {
         out.diag(DIAG_REF_INVALID, file, format!("{file}: {label}: {why}"));
@@ -360,12 +370,12 @@ fn classify(ctx: &DiscoverCtx<'_>, file: &str, entry: Entry<'_>, out: &mut Disco
                 "{name}@{target} is not in bun's tarball tuple shape [spec, {{meta}}, integrity]"
             ),
         );
-        return;
+        return None;
     }
     let version = match &vendored {
         Some(vref) if vref.eco != "npm" => {
             invalid(out, format!("{target:?} is not a vendored npm tarball"));
-            return;
+            return None;
         }
         Some(vref) => tgz_leaf_version(name, &vref.leaf)
             .filter(|version| semver::Version::parse(version).is_ok()),
@@ -376,7 +386,7 @@ fn classify(ctx: &DiscoverCtx<'_>, file: &str, entry: Entry<'_>, out: &mut Disco
             out,
             format!("{target:?} is not an artifact of {name:?} (its leaf must be the package's own <name>-<version>.tgz)"),
         );
-        return;
+        return None;
     };
     if recorded_version.is_some_and(|recorded| recorded != version) {
         invalid(
@@ -386,14 +396,14 @@ fn classify(ctx: &DiscoverCtx<'_>, file: &str, entry: Entry<'_>, out: &mut Disco
                 recorded_version.unwrap_or_default()
             ),
         );
-        return;
+        return None;
     }
     let Some(purl) = npm_purl(name, version) else {
         invalid(
             out,
             format!("Socket-wired entry {name:?}@{version:?} has unsafe coordinates"),
         );
-        return;
+        return None;
     };
     // Hosted: both bun rewriters always write the sha512 (see module docs).
     if let Some(vref) = vendored {
@@ -407,6 +417,56 @@ fn classify(ctx: &DiscoverCtx<'_>, file: &str, entry: Entry<'_>, out: &mut Disco
             integrity,
             true,
         ));
+    }
+    None
+}
+
+/// The registry copies one lock records, keyed by purl (#588): bun installs
+/// every entry, so a second entry resolving a wired `name@version` from the
+/// registry (e.g. a workspace member added after the rewire, then `bun
+/// install`) installs unpatched beside the rewired one.
+#[derive(Default)]
+struct Unwired {
+    /// purl → the first such entry's label.
+    copies: std::collections::BTreeMap<String, String>,
+}
+
+impl Unwired {
+    fn record(&mut self, purl: Option<String>, label: &str) {
+        if let Some(purl) = purl {
+            self.copies
+                .entry(purl)
+                .or_insert_with(|| label.to_string());
+        }
+    }
+
+    /// Withdraw every ref of `file` whose `name@version` another entry of
+    /// the same lock resolves from the registry.
+    fn contest(&self, file: &str, out: &mut Discovery) {
+        if self.copies.is_empty() {
+            return;
+        }
+        let refs = std::mem::take(&mut out.refs);
+        for r in refs {
+            let unwired_at = (r.source_file == std::path::Path::new(file))
+                .then(|| self.copies.get(&r.purl))
+                .flatten();
+            let Some(label) = unwired_at else {
+                out.refs.push(r);
+                continue;
+            };
+            out.diag(
+                DIAG_REF_UNATTRIBUTABLE,
+                file,
+                format!(
+                    "{file}: {} is wired to a Socket patch but another entry of the same lock, \
+                     {label:?}, still resolves that version elsewhere; bun installs both, so \
+                     that copy stays unpatched and the patch is not attested — re-run \
+                     `socket-patch vendor` / `scan --mode hosted` to rewire every copy",
+                    r.purl,
+                ),
+            );
+        }
     }
 }
 
@@ -651,6 +711,62 @@ mod tests {
             .find(|r| r.purl == "pkg:npm/minimist@1.2.2")
             .expect("digest-less ref");
         assert_eq!(minimist.locked_integrity, None);
+    }
+
+    /// REGRESSION (#588, the Bun twin): `bun.lock` rewires one copy of
+    /// `left-pad@1.3.0` (`a/left-pad`), but a second entry for the SAME
+    /// version (`b/left-pad`, a workspace member added after the rewire)
+    /// still resolves from the registry. bun installs that copy unpatched,
+    /// so the ref is not attested in either mode; a registry copy of a
+    /// DIFFERENT version contests nothing.
+    #[tokio::test]
+    async fn issue_588_registry_copy_in_the_same_lock_contests_the_ref() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("left-pad@.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz");
+        let registry = |key: &str, version: &str| {
+            format!("\"{key}\": [\"left-pad@{version}\", \"\", {{}}, \"{SRI}\"]")
+        };
+        let contests = |out: &Discovery| {
+            out.diagnostics
+                .iter()
+                .filter(|d| {
+                    d.code == DIAG_REF_UNATTRIBUTABLE
+                        && d.detail.contains("another entry")
+                        && d.detail.contains("b/left-pad")
+                })
+                .count()
+        };
+        for (label, spec) in [("hosted", format!("left-pad@{hosted}")), ("vendored", vendored)] {
+            let p = Project::new();
+            p.write(
+                "bun.lock",
+                text_lock(
+                    1,
+                    &[
+                        tuple("a/left-pad", &spec, Some(SRI)),
+                        registry("b/left-pad", "1.3.0"),
+                    ],
+                ),
+            );
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{label}: {:#?}", out.refs);
+            assert_eq!(contests(&out), 1, "{label}: {:#?}", out.diagnostics);
+
+            let p = Project::new();
+            p.write(
+                "bun.lock",
+                text_lock(
+                    1,
+                    &[
+                        tuple("a/left-pad", &spec, Some(SRI)),
+                        registry("b/left-pad", "1.2.0"),
+                    ],
+                ),
+            );
+            let out = run(&p).await;
+            assert_eq!(out.refs.len(), 1, "{label} control: {:#?}", out.refs);
+            assert_eq!(contests(&out), 0, "{label} control: {:#?}", out.diagnostics);
+        }
     }
 
     /// The `DIAG_REF_UNATTRIBUTABLE` diagnostics that name a bundled copy.
