@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-02 (run 8), main `61cfb9b`, latest release v4.0.0. Runs 5–8 added the cells in "Run 5 cells" through "Run 8 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-02 (run 9), main `203e092`, latest release v4.0.0. Runs 5–9 added the cells in "Run 5 cells" through "Run 9 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -12,9 +12,9 @@ Cells are "pass", "fail #N", "n/a", "CI" or "untested". H = hosted, V = vendored
 | Linux | 1.6.0 | pass | n/a (yarn limitation) | untested | H pass | untested | untested | n/a (yarn ≤1.6) | n/a | untested |
 | Linux | 1.7.0 | CI | fail #364 (`--offline`) | fail #363 | pass | untested | untested | pass | untested | untested |
 | Linux | 1.9.4 | CI | fail #364 (`--offline`) | untested | untested | untested | untested | CI | untested | untested |
-| Linux | 1.10.1 | pass | fail #364 | fail #363 | pass | pass | untested | pass | pass | pass |
+| Linux | 1.10.1 | pass | fail #364 | fail #363 | pass | pass | untested | pass | pass | pass (+ `--install.modules-folder`, run 9) |
 | Linux | 1.17.3 | pass (in-place) | fail #364 | untested | untested | untested | untested | pass (in-place) | untested | untested |
-| Linux | 1.22.22 | pass (v5, + hosted rollback pass) | fail #364 (v5) | fail #363 (v5; rollback also wrong) | pass | pass | pass | pass | pass | pass |
+| Linux | 1.22.22 | pass (v5, + hosted rollback pass) | fail #364 (v5) | fail #363 (v5; rollback also wrong; still fails on `203e092`) | pass | pass | pass | pass | pass | pass |
 | macOS | 1.7.0 | untested | untested | fail #363 | pass | pass | pass | pass | untested | untested |
 | macOS | 1.10.1 / 1.22.22 | pass (probe) | fail #364 | fail #363 | pass | pass | pass | pass | untested | untested |
 | Windows | 1.7.0 / 1.10.1 / 1.22.22 | pass (probe) | fail #364 (1.10.1/1.22.22) | fail #363 (vendored: `Couldn't find the binary git`) | pass | pass | pass | pass | untested | untested |
@@ -24,12 +24,12 @@ Report = `scan -g` report-only + no leakage; refusal = `scan -g/--global-prefix/
 
 | OS | yarn | report | refusal | A apply/vex/rollback | get-mode | RO | custom global-folder (space+unicode) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 1.0.2 | fail #437 | pass | fail #437 | fixed (#436 closed by #446; not re-run) | n/a (nothing found) | untested |
+| Linux | 1.0.2 | fail #437 (still on `203e092`) | pass | fail #437 | fixed (#436 closed by #446; not re-run) | n/a (nothing found) | untested |
 | Linux | 1.10.1 / 1.22.22 | pass | pass | pass | fixed (#436 closed by #446; not re-run) | pass (CI runner) | pass (1.22.22) |
 | macOS | 1.0.2 | fail #437 | pass | fail #437 | fail #436 | n/a | untested |
 | macOS | 1.10.1 / 1.22.22 | pass | pass | pass | fail #436 | pass | untested |
-| Windows | 1.0.2 | fail #437 / #434 | pass | fail #434 | fail #436 | untested | untested |
-| Windows | 1.10.1 / 1.22.22 | fail #434 | pass | fail #434 | fail #436 | untested | untested |
+| Windows | 1.0.2 | fail #437 / #434 (#434 closed by #442; re-run) | pass | fail #434 (closed; re-run) | fail #436 | untested | untested |
+| Windows | 1.10.1 / 1.22.22 | fail #434 (closed by #442; re-run) | pass | fail #434 (closed; re-run) | fail #436 | untested | untested |
 
 Other cells that pass on Linux 1.22.22 (some also on older releases; see the entries): spaces + unicode project paths (also macOS and Windows), `npm:` alias (H skipped as documented, V rewired), `resolutions`, a `resolved` without the `#sha1` fragment / `integrity`, a local `file:` tarball dep, a non-deduplicated lock, a superseding patch on re-scan, `remove` / `repair`, VEX (installed and lock-only, after `yarn upgrade`), `yarn add` then a frozen reinstall (1.7.0 too), `yarn check --integrity` / `--verify-tree`, in-place reinstalls on 1.7–1.22, concurrent scans (`lock_held`), the GitHub shorthand dep on all 3 OSes.
 
@@ -42,7 +42,7 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - SIGKILL-interrupted scans, H and V: pass (recoverable by `repair` / re-scan).
 
 ### Run 5 cells (Linux, `61cfb9b`)
-- `.yarnrc --modules-folder`, agent mode: **fail #493** (1.7.0 / 1.10.1 / 1.22.22).
+- `.yarnrc --modules-folder`, agent mode: fail #493 (1.7.0 / 1.10.1 / 1.22.22); fixed by #520 (see run 9).
 - Workspaces with `nohoist`, A/H/V + frozen install + vex: pass (1.22.22).
 - `--max-new-patches` on a workspace, A/H/V + re-run + frozen install: pass (1.22.22).
 - Custom `.yarnrc registry`, hosted rewire + rollback: pass (rollback uses `SOCKET_NPM_REGISTRY`, as documented).
@@ -67,13 +67,20 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Merge-conflict markers in yarn.lock (target outside the conflict), H: pass. `--focus` workspace install, H: pass. `yarn audit` on hosted / alias locks: pass. `.yarnclean`, H + vex: pass (1.22.22).
 - Hosted rollback on an `integrity sha1-` lock: restores sha512 integrity + npmjs host (documented), frozen install OK: pass (1.10.1).
 
+### Run 9 cells (Linux, `203e092`)
+- Patch rewriting the package's own `package.json` (adds a dependency): **fail #591**. Vendored leaves a dangling `dependencies:` entry (offline frozen install fails, lock churns) on 1.7.0 / 1.10.1 / 1.22.22. Hosted never installs the new dep, and vex attests (1.10.1 / 1.22.22).
+- #493 follow-ups after #520: workspace root `--modules-folder` + non-hoisted members (agent, 1.22.22) and `--install.modules-folder "./my deps"` (agent + vex + frozen-reinstall omission, 1.10.1): pass.
+- Agent vex with multiple installed copies across workspaces (#517): pass (1.22.22).
+- Repo suites (redirect / vendor / dev-flow, REQUIRED=1): pass on 1.0.2 / 1.7.0 / 1.22.22.
+- Superseding hosted patch followed by an in-place frozen install: pass on 1.10.1 / 1.17.3 / 1.22.22. 1.0.2 / 1.7.0 skip the copy only when size+mtime match (yarn limitation, see Known non-bugs).
+
 ## Backlog
 
-1. **Maintainer request (global mode), still open:** Windows once #442 merges (#434 / #437, and the Berry handover lead about the `.cmd` shim); yarn via corepack and the Windows MSI; 1.6.0 / 1.9.4 on the probe; a read-only prefix on Windows (Program Files). Re-run get-mode cells after #446.
-2. Re-check #493 after #520 merges: workspace-level and `--install.modules-folder` forms.
-3. Patches that rewrite the package's own `package.json` dependencies: vendored (`staged_pkg` recompute) vs hosted (lock `dependencies:` untouched).
-4. Superseding hosted patch with sha1 on yarn ≤1.17 in-place installs (`.yarn-integrity` short-circuit).
-5. Re-run the v4-only project matrix columns (git dep #363, offline mirror H #364) on macOS/Windows once fixes land; re-check #558 once fixed.
+1. **Maintainer request (global mode):** re-run the Windows global cells now that #442 has merged (#434 closed); also the get-mode cells after #446 (#436 closed); yarn via corepack and the Windows MSI; 1.6.0 / 1.9.4 on the probe; a read-only prefix on Windows (Program Files). #437 (1.0.x) still open.
+2. Same-size patched files on yarn ≤1.9 in-place installs: find out which mtime the vendored packer and the Socket hosted tarballs use (the npm 1985 constant would make an upstream→patched same-size change a silent no-op in place).
+3. A manifest-rewriting patch that *changes* an existing dep range (#591 follow-up).
+4. Re-run the v4-only project columns (git dep #363, offline mirror H #364) on macOS/Windows once fixes land; re-check #558 / #519 / #467 once fixed.
+5. `vendor --check` / `repair` on a #591-shaped lock (dangling dependency).
 
 ## Known non-bugs
 
@@ -111,3 +118,6 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - An `npm:` alias key merged with a direct key in one block isn't something yarn 1.22.22 writes (it emits two blocks), so don't test that shape.
 - Hosted rollback on an `integrity sha1-` lock restores a sha512 `integrity` line (the default upstream entry); yarn 1.10 installs it frozen.
 - `patch.socket.dev` / `patches-api.socket.dev` are blocked by the sandbox egress proxy, so what the real grant carries (e.g. whether `sha1` is present) can't be checked from here.
+- yarn 1.0.x–1.9.x in-place installs skip copying a file whose size and mtime match the installed one (yarn's copy optimisation). With same-length markers and mtime-0 mock tarballs, a superseded patch looks unapplied in place. Fresh installs and 1.10+ are fine. Use different-length markers in harnesses.
+- A `.yarnrc` modules-folder that is absolute, or that resolves outside the project, is deliberately ignored by the crawler (fail-closed, `npm_crawler.rs` `resolve_modules_folder`).
+- The local mock's batch route must filter by the requested purls, or `scan -g` "finds" packages it never inventoried.
