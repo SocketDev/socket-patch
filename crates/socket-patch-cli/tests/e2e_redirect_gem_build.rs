@@ -1651,7 +1651,10 @@ async fn gem_hosted_gem_declared_in_two_groups_is_refused_and_still_installs() {
         Driver::ScanVexDuplicateDeclaration,
     )
     .await;
-    assert!(fx.is_none(), "the duplicate-declaration driver asserts in place");
+    assert!(
+        fx.is_none(),
+        "the duplicate-declaration driver asserts in place"
+    );
 }
 
 /// #482: a direct dependency declared through `eval_gemfile` must not get a
