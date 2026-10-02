@@ -319,13 +319,14 @@ pub struct DerivedCopies {
 /// `instrumented-<jar_leaf>`), or under a directory, or with a stem, that
 /// [`hash_eq`]s `pristine_sha1`. A name match counts as stale only when its
 /// bytes are the pristine jar's; otherwise it is [`DerivedCopies::unknown`].
-/// Symlinks are not followed.
+/// Symlinks are not followed. One query of a fresh [`DerivedIndex`]; a
+/// caller checking several jars builds the index once instead.
 pub fn stale_derived_copies(
     user_home: &Path,
     jar_leaf: &str,
     pristine_sha1: &str,
 ) -> DerivedCopies {
-    stale_derived_copies_bounded(user_home, jar_leaf, pristine_sha1, DERIVED_ENTRIES)
+    DerivedIndex::build(user_home).query(jar_leaf, pristine_sha1)
 }
 
 /// [`stale_derived_copies`] visiting at most `max_entries` entries per root
@@ -337,55 +338,115 @@ pub fn stale_derived_copies_bounded(
     pristine_sha1: &str,
     max_entries: usize,
 ) -> DerivedCopies {
-    use sha1::{Digest, Sha1};
+    DerivedIndex::build_bounded(user_home, max_entries).query(jar_leaf, pristine_sha1)
+}
 
-    let caches = user_home.join("caches");
-    let mut roots = Vec::new();
-    for (name, is_dir) in children(&caches) {
-        if !is_dir {
-            continue;
-        }
-        if name.starts_with("jars-") || name.starts_with("transforms-") {
-            roots.push(caches.join(&name));
-        } else if name.starts_with(|c: char| c.is_ascii_digit()) {
-            let transforms = caches.join(&name).join("transforms");
-            if transforms.is_dir() {
-                roots.push(transforms);
-            }
-        }
+/// One walk of a Gradle user home's derived-cache roots, answering
+/// [`stale_derived_copies`] for any number of jars. It keeps only the files
+/// a query can match — `*.jar` files, and files whose stem or some
+/// directory below the root looks like a sha1 (33–40 hex digits; Gradle's
+/// own 32-digit workspace hashes do not) — so an Android home's extracted
+/// resource trees cost the walk, not memory.
+#[derive(Debug, Default)]
+pub struct DerivedIndex {
+    /// `(root, file)` of every candidate.
+    files: Vec<(PathBuf, PathBuf)>,
+    incomplete: bool,
+}
+
+impl DerivedIndex {
+    /// Walk `user_home`'s derived-cache roots (bounded per root).
+    pub fn build(user_home: &Path) -> Self {
+        Self::build_bounded(user_home, DERIVED_ENTRIES)
     }
-    let instrumented = format!("instrumented-{jar_leaf}");
-    let mut out = DerivedCopies::default();
-    for root in roots {
-        let mut visited = 0usize;
-        for entry in walkdir::WalkDir::new(&root)
-            .follow_links(false)
-            .max_depth(DERIVED_DEPTH)
-            .sort_by_file_name()
-        {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => {
-                    out.incomplete = true;
-                    continue;
-                }
-            };
-            visited += 1;
-            if visited > max_entries {
-                out.incomplete = true;
-                break;
-            }
-            if !entry.file_type().is_file() {
+
+    /// [`DerivedIndex::build`] visiting at most `max_entries` per root.
+    #[doc(hidden)]
+    pub fn build_bounded(user_home: &Path, max_entries: usize) -> Self {
+        let sha1_like = |name: &str| name.len() >= 33 && is_hash_dir_name(name);
+        let caches = user_home.join("caches");
+        let mut roots = Vec::new();
+        for (name, is_dir) in children(&caches) {
+            if !is_dir {
                 continue;
             }
-            let Some(name) = entry.file_name().to_str() else {
+            if name.starts_with("jars-") || name.starts_with("transforms-") {
+                roots.push(caches.join(&name));
+            } else if name.starts_with(|c: char| c.is_ascii_digit()) {
+                let transforms = caches.join(&name).join("transforms");
+                if transforms.is_dir() {
+                    roots.push(transforms);
+                }
+            }
+        }
+        let mut out = Self::default();
+        for root in roots {
+            let mut visited = 0usize;
+            for entry in walkdir::WalkDir::new(&root)
+                .follow_links(false)
+                .max_depth(DERIVED_DEPTH)
+                .sort_by_file_name()
+            {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        out.incomplete = true;
+                        continue;
+                    }
+                };
+                visited += 1;
+                if visited > max_entries {
+                    out.incomplete = true;
+                    break;
+                }
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str() else {
+                    continue;
+                };
+                let keep = name.ends_with(".jar")
+                    || sha1_like(name.split('.').next().unwrap_or(name))
+                    || entry
+                        .path()
+                        .strip_prefix(&root)
+                        .ok()
+                        .and_then(Path::parent)
+                        .is_some_and(|rel| {
+                            rel.components()
+                                .any(|c| c.as_os_str().to_str().is_some_and(sha1_like))
+                        });
+                if keep {
+                    out.files.push((root.clone(), entry.into_path()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the walk did not cover every derived-cache root.
+    pub fn incomplete(&self) -> bool {
+        self.incomplete
+    }
+
+    /// The [`DerivedCopies`] of the jar `jar_leaf` whose pristine bytes
+    /// hash to `pristine_sha1`.
+    pub fn query(&self, jar_leaf: &str, pristine_sha1: &str) -> DerivedCopies {
+        use sha1::{Digest, Sha1};
+
+        let instrumented = format!("instrumented-{jar_leaf}");
+        let mut out = DerivedCopies {
+            incomplete: self.incomplete,
+            ..DerivedCopies::default()
+        };
+        for (root, path) in &self.files {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
             let stem = name.split('.').next().unwrap_or(name);
             let by_hash = hash_eq(stem, pristine_sha1)
-                || entry
-                    .path()
-                    .strip_prefix(&root)
+                || path
+                    .strip_prefix(root)
                     .ok()
                     .and_then(Path::parent)
                     .is_some_and(|rel| {
@@ -396,24 +457,24 @@ pub fn stale_derived_copies_bounded(
                         })
                     });
             if by_hash {
-                out.stale.push(entry.into_path());
+                out.stale.push(path.clone());
             } else if name == jar_leaf || name == instrumented {
-                match std::fs::read(entry.path()) {
+                match std::fs::read(path) {
                     Ok(bytes) if hash_eq(&hex::encode(Sha1::digest(&bytes)), pristine_sha1) => {
-                        out.stale.push(entry.into_path())
+                        out.stale.push(path.clone())
                     }
-                    Ok(_) => out.unknown.push(entry.into_path()),
+                    Ok(_) => out.unknown.push(path.clone()),
                     Err(_) => {
                         out.incomplete = true;
-                        out.unknown.push(entry.into_path());
+                        out.unknown.push(path.clone());
                     }
                 }
             }
         }
+        out.stale.sort();
+        out.unknown.sort();
+        out
     }
-    out.stale.sort();
-    out.unknown.sort();
-    out
 }
 
 // ── process environment ─────────────────────────────────────────────────

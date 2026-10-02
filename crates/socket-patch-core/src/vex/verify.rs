@@ -51,6 +51,10 @@ pub struct VerifyOutcome {
     /// manager re-installs. An ABSENT installed tree is the expected
     /// post-vendor state and is never flagged.
     pub vendored_out_of_sync: Vec<String>,
+    /// Maven / Gradle: `(purl, copy)` for every installed copy of a failed
+    /// purl that does not verify — the copy a build may still load
+    /// unpatched. Callers name them (`vex_gradle_unpatched_copy`).
+    pub unpatched_copies: Vec<(String, PathBuf)>,
 }
 
 /// Vendored-patch context for [`applied_patches_with_vendor`].
@@ -120,6 +124,26 @@ pub async fn applied_patches(
     applied_patches_with_vendor(manifest, package_paths, None).await
 }
 
+/// The installed copies [`applied_patches_with_vendor`] judges, per purl:
+/// one path per purl (`HashMap<String, PathBuf>`) or every copy found
+/// (`HashMap<String, Vec<PathBuf>>`).
+pub trait PackageCopies {
+    /// The copies of `purl`, in lookup order (empty when none).
+    fn copies_of(&self, purl: &str) -> &[PathBuf];
+}
+
+impl PackageCopies for HashMap<String, PathBuf> {
+    fn copies_of(&self, purl: &str) -> &[PathBuf] {
+        self.get(purl).map(std::slice::from_ref).unwrap_or_default()
+    }
+}
+
+impl PackageCopies for HashMap<String, Vec<PathBuf>> {
+    fn copies_of(&self, purl: &str) -> &[PathBuf] {
+        self.get(purl).map(Vec::as_slice).unwrap_or_default()
+    }
+}
+
 /// [`applied_patches`] with vendored-patch awareness.
 ///
 /// Per-PURL precedence:
@@ -138,10 +162,14 @@ pub async fn applied_patches(
 /// 3. A `hosted` entry verifies exactly the copies the hosted build consumes
 ///    ([`HostedCopies`]) — no fallback to `package_paths` either, whose
 ///    representative may be the pristine sibling the build never reads.
-/// 4. Otherwise the installed-tree behavior of [`applied_patches`], verbatim.
+/// 4. Otherwise the installed tree: the first copy of `package_copies`,
+///    except for Maven, where EVERY copy listed (`~/.m2` and each Gradle
+///    cache, version dirs expanded into their hash dirs) is re-hashed and
+///    must verify — the caller lists only the copies some build consumes.
+///    The failing Maven copies land in [`VerifyOutcome::unpatched_copies`].
 pub async fn applied_patches_with_vendor(
     manifest: &PatchManifest,
-    package_paths: &HashMap<String, PathBuf>,
+    package_copies: &impl PackageCopies,
     vendor: Option<&VendorContext>,
 ) -> VerifyOutcome {
     let mut out = VerifyOutcome::default();
@@ -149,14 +177,26 @@ pub async fn applied_patches_with_vendor(
     for (purl, record) in &manifest.patches {
         let vendor_entry =
             vendor.and_then(|ctx| lookup_entry(&ctx.entries, purl).map(|e| (ctx, e)));
+        let copies = Some(package_copies.copies_of(purl)).filter(|c| !c.is_empty());
         let result = if let Some((ctx, entry)) = vendor_entry {
             verify_vendored_patch_record(&ctx.project_root, entry, record).await
         } else if let Some(copy_dir) = vendor.and_then(|ctx| ctx.go_patches.get(purl)) {
             verify_patch_record(copy_dir, record).await
         } else if let Some(copies) = vendor.and_then(|ctx| ctx.hosted.get(purl)) {
-            verify_hosted_copies(copies, record).await
-        } else if let Some(pkg_path) = package_paths.get(purl) {
-            verify_patch_record(pkg_path, record).await
+            verify_hosted_copies(purl, copies, record).await
+        } else if let Some(copies) = copies {
+            if purl.starts_with("pkg:maven/") {
+                let mut first_failure = None;
+                for copy in copies {
+                    if let Err(reason) = verify_patch_record_for(purl, copy, record).await {
+                        out.unpatched_copies.push((purl.clone(), copy.clone()));
+                        first_failure.get_or_insert(reason);
+                    }
+                }
+                first_failure.map_or(Ok(()), Err)
+            } else {
+                verify_patch_record_for(purl, &copies[0], record).await
+            }
         } else {
             Err("package_not_found".to_string())
         };
@@ -181,13 +221,24 @@ pub async fn applied_patches_with_vendor(
                     // pristine BY CONSTRUCTION — its "drift" is no
                     // bypassing build, and "re-run your install to resync
                     // it" is advice no `go` command can follow.
+                    //
+                    // So is a Gradle `files-2.1` copy: a vendored Gradle
+                    // build resolves the GAV from the committed repository
+                    // only (exclusiveContent), so the cache copy is a
+                    // pristine sibling the build never reads.
                     let go_cache_copy = purl.starts_with("pkg:golang/");
-                    if let Some(pkg_path) = package_paths.get(purl).filter(|_| !go_cache_copy) {
+                    let installed = package_copies
+                        .copies_of(purl)
+                        .iter()
+                        .find(|p| !crate::crawlers::gradle_cache::is_gradle_version_dir(p));
+                    if let Some(pkg_path) = installed.filter(|_| !go_cache_copy) {
                         let in_sync = if is_vlt_dir_entry(entry) {
                             vlt_installed_copy_matches(&ctx.project_root, pkg_path, entry, record)
                                 .await
                         } else {
-                            verify_patch_record(pkg_path, record).await.is_ok()
+                            verify_patch_record_for(purl, pkg_path, record)
+                                .await
+                                .is_ok()
                         };
                         if !in_sync {
                             out.vendored_out_of_sync.push(purl.clone());
@@ -220,19 +271,70 @@ pub async fn applied_patches_with_vendor(
 /// directly. The CLI's gem/python stale-install probes use its one-pass
 /// equivalent [`judge_installed_record`], which
 /// `judge_installed_record_matches_verify_and_evidence_scan` pins to it.
+///
+/// A Gradle `files-2.1` version dir is expanded through
+/// [`installed_copies`](crate::crawlers::gradle_cache::installed_copies):
+/// every hash directory holding a record file must verify.
 pub async fn verify_patch_record(pkg_path: &Path, record: &PatchRecord) -> Result<(), String> {
     if record.files.is_empty() {
         return Err("no_files".to_string());
     }
-
-    for (file_name, file_info) in &record.files {
-        let result = verify_file_patch(pkg_path, file_name, file_info).await;
-        match result.status {
-            VerifyStatus::AlreadyPatched => continue,
-            VerifyStatus::Ready => return Err("not_applied".to_string()),
-            VerifyStatus::HashMismatch => return Err("hash_mismatch".to_string()),
-            VerifyStatus::NotFound => return Err("file_not_found".to_string()),
+    for (dir, files) in crate::crawlers::gradle_cache::installed_copies(pkg_path, &record.files) {
+        let mut keys: Vec<&String> = files.keys().collect();
+        keys.sort();
+        for file_name in keys {
+            let result = verify_file_patch(&dir, file_name, &files[file_name]).await;
+            status_verdict(result.status)?;
         }
+    }
+    Ok(())
+}
+
+/// The routing tag of a non-`AlreadyPatched` file status.
+fn status_verdict(status: VerifyStatus) -> Result<(), String> {
+    match status {
+        VerifyStatus::AlreadyPatched => Ok(()),
+        VerifyStatus::Ready => Err("not_applied".to_string()),
+        VerifyStatus::HashMismatch => Err("hash_mismatch".to_string()),
+        VerifyStatus::NotFound => Err("file_not_found".to_string()),
+    }
+}
+
+/// [`verify_patch_record`] for a record of `purl`: a member-keyed Maven
+/// record ([`jvm_jar::classify`](crate::patch::jvm_jar::classify)) is
+/// checked against the members of every copy of its jar under `pkg_path`
+/// (each Gradle hash dir holding it, or the `~/.m2` version dir).
+pub async fn verify_patch_record_for(
+    purl: &str,
+    pkg_path: &Path,
+    record: &PatchRecord,
+) -> Result<(), String> {
+    use crate::patch::jvm_jar::{self, RecordShape};
+    match jvm_jar::classify(purl, &record.files) {
+        RecordShape::Members { jar_leaf } => {
+            verify_member_copies(pkg_path, &jar_leaf, record).await
+        }
+        RecordShape::Leaf => verify_patch_record(pkg_path, record).await,
+    }
+}
+
+/// Every copy of `jar_leaf` under `pkg_path` must carry the record's
+/// patched members; no copy at all is `file_not_found`.
+async fn verify_member_copies(
+    pkg_path: &Path,
+    jar_leaf: &str,
+    record: &PatchRecord,
+) -> Result<(), String> {
+    use crate::patch::jvm_jar;
+    if record.files.is_empty() {
+        return Err("no_files".to_string());
+    }
+    let copies = jvm_jar::jar_copies(pkg_path, jar_leaf);
+    if copies.is_empty() {
+        return Err("file_not_found".to_string());
+    }
+    for dir in copies {
+        status_verdict(jvm_jar::verify_members(&dir, jar_leaf, &record.files).await)?;
     }
     Ok(())
 }
@@ -256,17 +358,43 @@ pub struct InstalledRecordJudgment {
 /// task, hashing each record file at most once. Stops at the
 /// first file that proves staleness — which also settles `patched` —
 /// exactly where both scans agree.
+///
+/// A Gradle `files-2.1` version dir is judged in every hash directory
+/// holding a record file ([`installed_copies`]): patched only when every
+/// copy is, stale when any copy proves it.
+///
+/// [`installed_copies`]: crate::crawlers::gradle_cache::installed_copies
 pub async fn judge_installed_record(
     pkg_path: &Path,
     record: &PatchRecord,
 ) -> InstalledRecordJudgment {
-    let pkg_path = pkg_path.to_path_buf();
-    let files: Vec<(String, String)> = record
-        .files
-        .iter()
-        .map(|(name, info)| (name.clone(), info.after_hash.clone()))
-        .collect();
-    crate::utils::fs::run_blocking(move || judge_installed_files(&pkg_path, &files)).await
+    let copies: Vec<(PathBuf, Vec<(String, String)>)> =
+        crate::crawlers::gradle_cache::installed_copies(pkg_path, &record.files)
+            .into_iter()
+            .map(|(dir, files)| {
+                let files = files
+                    .into_iter()
+                    .map(|(name, info)| (name, info.after_hash))
+                    .collect();
+                (dir, files)
+            })
+            .collect();
+    let has_files = !record.files.is_empty();
+    crate::utils::fs::run_blocking(move || {
+        let mut out = InstalledRecordJudgment {
+            patched: has_files,
+            stale_evidence: false,
+        };
+        for (dir, files) in &copies {
+            let judged = judge_installed_files(dir, files);
+            if judged.stale_evidence {
+                return judged;
+            }
+            out.patched &= judged.patched;
+        }
+        out
+    })
+    .await
 }
 
 fn judge_installed_files(pkg_path: &Path, files: &[(String, String)]) -> InstalledRecordJudgment {
@@ -299,10 +427,27 @@ fn judge_installed_files(pkg_path: &Path, files: &[(String, String)]) -> Install
 
 /// [`HostedCopies`] verdict: no consumed copy is `package_not_found`; every
 /// listed copy must pass [`verify_patch_record`] (under the maven file
-/// rename, when set), the first failure's tag wins.
-async fn verify_hosted_copies(copies: &HostedCopies, record: &PatchRecord) -> Result<(), String> {
+/// rename, when set — a Gradle version dir expanded into its hash dirs),
+/// the first failure's tag wins. A member-keyed Maven record is checked
+/// against the members of the jar under its RENAMED (suffixed) name.
+async fn verify_hosted_copies(
+    purl: &str,
+    copies: &HostedCopies,
+    record: &PatchRecord,
+) -> Result<(), String> {
+    use crate::patch::jvm_jar::{self, RecordShape};
     if copies.paths.is_empty() {
         return Err("package_not_found".to_string());
+    }
+    if let RecordShape::Members { jar_leaf } = jvm_jar::classify(purl, &record.files) {
+        let jar_leaf = match &copies.rename {
+            Some((from, to)) => rename_leaf(&jar_leaf, from, to),
+            None => jar_leaf,
+        };
+        for path in &copies.paths {
+            verify_member_copies(path, &jar_leaf, record).await?;
+        }
+        return Ok(());
     }
     let renamed;
     let record = match &copies.rename {
@@ -318,28 +463,42 @@ async fn verify_hosted_copies(copies: &HostedCopies, record: &PatchRecord) -> Re
     Ok(())
 }
 
+/// Whether `rest` (what follows a matched `from` prefix) starts a new name
+/// component: a classifier (`-`) or an extension (`.` not followed by a
+/// digit, so `lib-1.0` + `.1.jar` is a different version).
+fn whole_component(rest: &str) -> bool {
+    rest.starts_with('-')
+        || rest
+            .strip_prefix('.')
+            .is_some_and(|ext| !ext.is_empty() && !ext.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// `name` re-prefixed `to` when it starts with the whole component `from`.
+fn rename_leaf(name: &str, from: &str, to: &str) -> String {
+    match name.strip_prefix(from).filter(|rest| whole_component(rest)) {
+        Some(rest) => format!("{to}{rest}"),
+        None => name.to_string(),
+    }
+}
+
 /// `record` with every file key whose name starts with the whole component
 /// `from` — followed by `-` (a classifier) or by a `.` that opens an
 /// extension, not a version continuation (`lib-1.0` + `.jar`, never
 /// `lib-1.0` + `.1.jar`) — re-prefixed `to`; other keys are kept as they
 /// are (and so still verify as-is).
 fn rename_record_files(record: &PatchRecord, from: &str, to: &str) -> PatchRecord {
-    let whole_component = |rest: &str| {
-        rest.starts_with('-')
-            || rest.strip_prefix('.').is_some_and(|ext| {
-                !ext.is_empty() && !ext.starts_with(|c: char| c.is_ascii_digit())
-            })
-    };
     let mut renamed = record.clone();
     renamed.files = record
         .files
         .iter()
-        .map(
-            |(key, info)| match key.strip_prefix(from).filter(|rest| whole_component(rest)) {
-                Some(rest) => (format!("{to}{rest}"), info.clone()),
-                None => (key.clone(), info.clone()),
-            },
-        )
+        .map(|(key, info)| {
+            // An API key's `package/` prefix is kept around the renamed name.
+            let (prefix, name) = match key.strip_prefix("package/") {
+                Some(name) => ("package/", name),
+                None => ("", key.as_str()),
+            };
+            (format!("{prefix}{}", rename_leaf(name, from, to)), info.clone())
+        })
         .collect();
     renamed
 }
@@ -1199,6 +1358,54 @@ mod tests {
         );
     }
 
+    /// A vendored Maven entry's Gradle `files-2.1` copy is a pristine
+    /// sibling the vendored build never reads (exclusiveContent on the
+    /// committed repository), never `vendored_out_of_sync`; a pristine
+    /// `~/.m2` copy still is.
+    #[tokio::test]
+    async fn vendored_gradle_cache_copy_is_not_out_of_sync() {
+        let root = tempfile::tempdir().unwrap();
+        let purl = "pkg:maven/com.example/lib@1.0";
+        let rel = format!(".socket/vendor/maven/{VUUID}/lib-1.0");
+        let patched = b"patched-content";
+        let dir = root.path().join(&rel);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("index.js"), patched)
+            .await
+            .unwrap();
+        let mut rec = record_with_one_file(&compute_git_sha256_from_bytes(patched));
+        rec.uuid = VUUID.to_string();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(purl.to_string(), rec);
+        let ctx = VendorContext {
+            project_root: root.path().to_path_buf(),
+            entries: HashMap::from([(purl.to_string(), vendor_entry(purl, &rel))]),
+            go_patches: HashMap::new(),
+            hosted: HashMap::new(),
+        };
+        let version = root
+            .path()
+            .join("home/.gradle/caches/modules-2/files-2.1/com.example/lib/1.0");
+        let hash_dir = version.join("a".repeat(40));
+        tokio::fs::create_dir_all(&hash_dir).await.unwrap();
+        tokio::fs::write(hash_dir.join("index.js"), b"pristine")
+            .await
+            .unwrap();
+        let copies = HashMap::from([(purl.to_string(), vec![version.clone()])]);
+        let out = applied_patches_with_vendor(&manifest, &copies, Some(&ctx)).await;
+        assert_eq!(out.vendored, vec![purl.to_string()]);
+        assert!(out.vendored_out_of_sync.is_empty(), "{out:?}");
+
+        let m2 = root.path().join("home/.m2/repository/com/example/lib/1.0");
+        tokio::fs::create_dir_all(&m2).await.unwrap();
+        tokio::fs::write(m2.join("index.js"), b"pristine")
+            .await
+            .unwrap();
+        let copies = HashMap::from([(purl.to_string(), vec![version, m2])]);
+        let out = applied_patches_with_vendor(&manifest, &copies, Some(&ctx)).await;
+        assert_eq!(out.vendored_out_of_sync, vec![purl.to_string()]);
+    }
+
     /// A manifest PURL matches a vendor entry recorded under a different map
     /// key when `entry.base_purl` equals it (qualified-key manifests resolve
     /// to the base-PURL ledger entry).
@@ -1233,7 +1440,9 @@ mod tests {
             hosted: HashMap::new(),
         };
 
-        let out = applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
+        let out =
+            applied_patches_with_vendor(&manifest, &HashMap::<String, PathBuf>::new(), Some(&ctx))
+                .await;
         assert_eq!(out.applied, vec![purl.to_string()]);
         assert_eq!(out.vendored, vec![purl.to_string()]);
     }
@@ -1494,7 +1703,9 @@ mod tests {
 
         // No installed tree (module cache absent) — the redirect copy is
         // the consumed bytes.
-        let out = applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
+        let out =
+            applied_patches_with_vendor(&manifest, &HashMap::<String, PathBuf>::new(), Some(&ctx))
+                .await;
         assert_eq!(out.applied, vec![purl.to_string()]);
         assert!(
             out.vendored.is_empty(),
@@ -1507,7 +1718,9 @@ mod tests {
         tokio::fs::write(copy_dir.join("index.js"), b"tampered")
             .await
             .unwrap();
-        let out = applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
+        let out =
+            applied_patches_with_vendor(&manifest, &HashMap::<String, PathBuf>::new(), Some(&ctx))
+                .await;
         assert!(out.applied.is_empty());
         assert_eq!(out.failed.len(), 1);
         assert_eq!(out.failed[0].reason, "hash_mismatch");
@@ -1596,14 +1809,18 @@ mod tests {
                 rename: None,
             },
         );
-        let out = applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
+        let out =
+            applied_patches_with_vendor(&manifest, &HashMap::<String, PathBuf>::new(), Some(&ctx))
+                .await;
         assert!(out.applied.is_empty());
         assert_eq!(out.failed[0].reason, "hash_mismatch");
 
         tokio::fs::write(nested.join("index.js"), patched)
             .await
             .unwrap();
-        let out = applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
+        let out =
+            applied_patches_with_vendor(&manifest, &HashMap::<String, PathBuf>::new(), Some(&ctx))
+                .await;
         assert_eq!(out.applied, vec![purl.to_string()]);
     }
 
@@ -1636,7 +1853,9 @@ mod tests {
                 rename: Some(("lib-1.0".into(), "lib-1.0-socket.abcdef12".into())),
             },
         );
-        let out = applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
+        let out =
+            applied_patches_with_vendor(&manifest, &HashMap::<String, PathBuf>::new(), Some(&ctx))
+                .await;
         assert_eq!(out.applied, vec![purl.to_string()], "{:?}", out.failed);
 
         let renamed = rename_record_files(&record, "lib-1.0", "lib-1.0-socket.abcdef12");
@@ -1816,6 +2035,164 @@ mod tests {
         assert!(
             seen_patched > 10 && seen_stale > 10,
             "{seen_patched}/{seen_stale}"
+        );
+    }
+
+    // ── Maven / Gradle copy sets ────────────────────────────────────
+
+    fn stored_jar(members: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in members {
+            out.start_file(*name, opts).unwrap();
+            out.write_all(bytes).unwrap();
+        }
+        out.finish().unwrap().into_inner()
+    }
+
+    fn sha1_hex(bytes: &[u8]) -> String {
+        use sha1::Digest as _;
+        hex::encode(sha1::Sha1::digest(bytes))
+    }
+
+    fn maven_record(files: &[(&str, &[u8], &[u8])]) -> PatchRecord {
+        let mut record = record_with_one_file("unused");
+        record.files = files
+            .iter()
+            .map(|(k, before, after)| {
+                (
+                    k.to_string(),
+                    PatchFileInfo {
+                        before_hash: compute_git_sha256_from_bytes(before),
+                        after_hash: compute_git_sha256_from_bytes(after),
+                    },
+                )
+            })
+            .collect();
+        record
+    }
+
+    /// A Gradle version dir holding the patched jar in one hash dir and a
+    /// pristine re-download in another, plus a patched `~/.m2` copy: the
+    /// copy set fails as a whole and names the unpatched copy — no
+    /// statement while any consumed copy is pristine.
+    #[tokio::test]
+    async fn maven_copy_set_with_one_pristine_copy_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:maven/com.example/lib@1.0";
+        let record = maven_record(&[("package/lib-1.0.pom", b"<pristine/>", b"<patched/>")]);
+        let m2 = tmp.path().join("m2/com/example/lib/1.0");
+        std::fs::create_dir_all(&m2).unwrap();
+        std::fs::write(m2.join("lib-1.0.pom"), b"<patched/>").unwrap();
+        let version = tmp
+            .path()
+            .join(".gradle/caches/modules-2/files-2.1/com.example/lib/1.0");
+        for dir in [sha1_hex(b"<pristine/>"), sha1_hex(b"<pristine again/>")] {
+            std::fs::create_dir_all(version.join(&dir)).unwrap();
+        }
+        std::fs::write(
+            version.join(sha1_hex(b"<pristine/>")).join("lib-1.0.pom"),
+            b"<patched/>",
+        )
+        .unwrap();
+        let stale = version.join(sha1_hex(b"<pristine again/>"));
+        std::fs::write(stale.join("lib-1.0.pom"), b"<pristine/>").unwrap();
+
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(purl.to_string(), record);
+        let copies = HashMap::from([(purl.to_string(), vec![m2.clone(), version.clone()])]);
+        let out = applied_patches_with_vendor(&manifest, &copies, None).await;
+        assert!(out.applied.is_empty(), "{out:?}");
+        assert_eq!(out.failed[0].reason, "not_applied");
+        assert_eq!(out.unpatched_copies, [(purl.to_string(), version.clone())]);
+
+        // Patch the re-download too: every copy verifies.
+        std::fs::write(stale.join("lib-1.0.pom"), b"<patched/>").unwrap();
+        let out = applied_patches_with_vendor(&manifest, &copies, None).await;
+        assert_eq!(out.applied, [purl.to_string()]);
+        assert!(out.unpatched_copies.is_empty());
+
+        // Only the first copy of a non-Maven purl is judged.
+        let npm = "pkg:npm/x@1.0.0";
+        let good = tempfile::tempdir().unwrap();
+        std::fs::write(good.path().join("index.js"), b"patched").unwrap();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            npm.to_string(),
+            record_with_one_file(&compute_git_sha256_from_bytes(b"patched")),
+        );
+        let copies = HashMap::from([(
+            npm.to_string(),
+            vec![good.path().to_path_buf(), tmp.path().join("absent")],
+        )]);
+        let out = applied_patches_with_vendor(&manifest, &copies, None).await;
+        assert_eq!(out.applied, [npm.to_string()]);
+    }
+
+    /// A member-keyed record verifies against the jar's members, in every
+    /// hash dir holding the jar.
+    #[tokio::test]
+    async fn maven_member_record_verifies_every_jar_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:maven/com.example/lib@1.0";
+        let record = maven_record(&[("META-INF/NOTICE.txt", b"pristine", b"patched")]);
+        let pristine = stored_jar(&[("META-INF/NOTICE.txt", b"pristine")]);
+        let patched = stored_jar(&[("META-INF/NOTICE.txt", b"patched")]);
+        let version = tmp
+            .path()
+            .join(".gradle/caches/modules-2/files-2.1/com.example/lib/1.0");
+        let dir = version.join(sha1_hex(&pristine));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib-1.0.jar"), &patched).unwrap();
+        assert_eq!(
+            verify_patch_record_for(purl, &version, &record).await,
+            Ok(())
+        );
+        // A second (pristine) hash dir of the same jar fails the set.
+        let again = version.join("1".repeat(40));
+        std::fs::create_dir_all(&again).unwrap();
+        std::fs::write(again.join("lib-1.0.jar"), &pristine).unwrap();
+        assert_eq!(
+            verify_patch_record_for(purl, &version, &record).await,
+            Err("not_applied".to_string())
+        );
+        // No jar at all.
+        assert_eq!(
+            verify_patch_record_for(purl, tmp.path(), &record).await,
+            Err("file_not_found".to_string())
+        );
+    }
+
+    /// Hosted: a member-keyed record is checked in the jar under its
+    /// SUFFIXED name, in a Gradle version dir of the suffixed version.
+    #[tokio::test]
+    async fn hosted_member_record_verifies_under_suffixed_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:maven/com.example/lib@1.0";
+        let record = maven_record(&[("META-INF/NOTICE.txt", b"pristine", b"patched")]);
+        let patched = stored_jar(&[("META-INF/NOTICE.txt", b"patched")]);
+        let version = tmp
+            .path()
+            .join(".gradle/caches/modules-2/files-2.1/com.example/lib/1.0-socket.0123abcd");
+        let dir = version.join(sha1_hex(&patched));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib-1.0-socket.0123abcd.jar"), &patched).unwrap();
+        let copies = HostedCopies {
+            paths: vec![version.clone()],
+            rename: Some(("lib-1.0".to_string(), "lib-1.0-socket.0123abcd".to_string())),
+        };
+        assert_eq!(verify_hosted_copies(purl, &copies, &record).await, Ok(()));
+        // The base-named jar is never what a hosted build reads.
+        std::fs::rename(
+            dir.join("lib-1.0-socket.0123abcd.jar"),
+            dir.join("lib-1.0.jar"),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_hosted_copies(purl, &copies, &record).await,
+            Err("file_not_found".to_string())
         );
     }
 

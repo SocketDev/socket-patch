@@ -353,32 +353,87 @@ pub async fn select_installed_variants(
     variants: &[(&str, &HashMap<String, PatchFileInfo>)],
 ) -> Vec<usize> {
     let mut matched = Vec::new();
-    for (idx, (_key, files)) in variants.iter().enumerate() {
-        // Representative file: only a file that modifies existing content
-        // (non-empty `beforeHash`) can discriminate between distributions —
-        // a NEW file (empty `beforeHash`) verifies Ready against any
-        // environment, so it can neither identify nor disqualify a variant.
-        // Take the lexicographically smallest such key so the choice is
-        // deterministic (`HashMap` iteration order is randomized per
-        // instance). No discriminating file (no files at all, or only new
-        // files) — nothing to disqualify the variant.
-        let representative = files
-            .iter()
-            .filter(|(_, info)| !info.before_hash.is_empty())
-            .min_by(|(a, _), (b, _)| a.cmp(b));
-        let Some((file_name, file_info)) = representative else {
-            matched.push(idx);
-            continue;
-        };
-        let verify = verify_file_patch(pkg_path, file_name, file_info).await;
-        if matches!(
-            verify.status,
-            VerifyStatus::Ready | VerifyStatus::AlreadyPatched
-        ) {
+    for (idx, (key, files)) in variants.iter().enumerate() {
+        if variant_installed_at(pkg_path, key, files).await {
             matched.push(idx);
         }
     }
     matched
+}
+
+/// [`select_installed_variants`] over every copy in `pkg_paths`: a variant
+/// matches when ANY copy holds its distribution (`~/.m2` and the Gradle
+/// cache can hold different classifiers of one version). Indices ascend.
+pub async fn select_installed_variants_any(
+    pkg_paths: &[std::path::PathBuf],
+    variants: &[(&str, &HashMap<String, PatchFileInfo>)],
+) -> Vec<usize> {
+    let mut matched = Vec::new();
+    for (idx, (key, files)) in variants.iter().enumerate() {
+        for pkg_path in pkg_paths {
+            if variant_installed_at(pkg_path, key, files).await {
+                matched.push(idx);
+                break;
+            }
+        }
+    }
+    matched
+}
+
+/// Whether the variant `key` (its qualified purl) with `files` describes a
+/// distribution installed at `pkg_path` (see [`select_installed_variants`]).
+///
+/// The representative file is joined through
+/// [`installed_copies`](crate::crawlers::gradle_cache::installed_copies),
+/// so a Gradle `files-2.1` version dir is checked in every hash directory
+/// holding it (the identity for any other layout). A member-keyed Maven
+/// record ([`jvm_jar::classify`](crate::patch::jvm_jar::classify)) is checked
+/// against the members of its jar instead.
+async fn variant_installed_at(
+    pkg_path: &Path,
+    key: &str,
+    files: &HashMap<String, PatchFileInfo>,
+) -> bool {
+    use crate::patch::jvm_jar::{self, RecordShape};
+    if let RecordShape::Members { jar_leaf } = jvm_jar::classify(key, files) {
+        for dir in jvm_jar::jar_copies(pkg_path, &jar_leaf) {
+            if matches!(
+                jvm_jar::verify_members(&dir, &jar_leaf, files).await,
+                VerifyStatus::Ready | VerifyStatus::AlreadyPatched
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }
+    // Representative file: only a file that modifies existing content
+    // (non-empty `beforeHash`) can discriminate between distributions —
+    // a NEW file (empty `beforeHash`) verifies Ready against any
+    // environment, so it can neither identify nor disqualify a variant.
+    // Take the lexicographically smallest such key so the choice is
+    // deterministic (`HashMap` iteration order is randomized per
+    // instance). No discriminating file (no files at all, or only new
+    // files) — nothing to disqualify the variant.
+    let representative = files
+        .iter()
+        .filter(|(_, info)| !info.before_hash.is_empty())
+        .min_by(|(a, _), (b, _)| a.cmp(b));
+    let Some((file_name, file_info)) = representative else {
+        return true;
+    };
+    let single = HashMap::from([(file_name.clone(), file_info.clone())]);
+    for (dir, copy_files) in crate::crawlers::gradle_cache::installed_copies(pkg_path, &single) {
+        for (name, info) in &copy_files {
+            let verify = verify_file_patch(&dir, name, info).await;
+            if matches!(
+                verify.status,
+                VerifyStatus::Ready | VerifyStatus::AlreadyPatched
+            ) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Apply a patch to a single file.
@@ -899,6 +954,23 @@ async fn apply_package_patch_at(
         return result;
     }
 
+    // Maven `~/.m2` checksum files can only be judged against the
+    // PRE-patch bytes, so they are read before anything is written (see
+    // `sidecars::maven`). A Gradle hash dir has none.
+    let maven_pre = if package_key.starts_with("pkg:maven/")
+        && !crate::patch::sidecars::maven::is_gradle_hash_dir(pkg_path)
+    {
+        let to_write: Vec<String> = result
+            .files_verified
+            .iter()
+            .filter(|v| v.status == VerifyStatus::Ready)
+            .map(|v| v.file.clone())
+            .collect();
+        Some(crate::patch::sidecars::maven::snapshot(pkg_path, &to_write).await)
+    } else {
+        None
+    };
+
     // Eagerly load the diff archive (if any) into memory so we don't
     // reparse the tar.gz once per file.
     let diff_entries = match (uuid, sources.diffs_path) {
@@ -967,6 +1039,21 @@ async fn apply_package_patch_at(
         {
             Ok(warning) => warnings.extend(warning),
             Err(e) => {
+                // A Windows daemon holding a cached jar open: say which
+                // process to stop instead of a bare sharing violation.
+                let target = pkg_path.join(normalized);
+                if package_key.starts_with("pkg:maven/")
+                    && crate::patch::sidecars::maven::is_locked_by_daemon(&e, &target)
+                {
+                    result.sidecar = Some(crate::patch::sidecars::SidecarRecord {
+                        purl: package_key.to_string(),
+                        ecosystem: "maven".to_string(),
+                        files: Vec::new(),
+                        advisory: Some(crate::patch::sidecars::maven::locked_by_daemon_advisory(
+                            &target,
+                        )),
+                    });
+                }
                 result.error = Some(e.to_string());
                 return result;
             }
@@ -984,7 +1071,7 @@ async fn apply_package_patch_at(
     // consumers see a uniform shape regardless of whether the
     // fixup succeeded, was advisory-only, or raised an error.
     if !result.files_patched.is_empty() {
-        use crate::patch::sidecars::{dispatch_fixup, fixup_failed_record};
+        use crate::patch::sidecars::{dispatch_fixup_with, fixup_failed_record};
         // Include files verified `AlreadyPatched` alongside the ones
         // written this run: a previous apply that failed partway left
         // them patched on disk but returned before this boundary, so
@@ -1004,7 +1091,7 @@ async fn apply_package_patch_at(
                     .map(|v| v.file.clone()),
             )
             .collect();
-        match dispatch_fixup(package_key, pkg_path, &fixup_files).await {
+        match dispatch_fixup_with(package_key, pkg_path, &fixup_files, maven_pre.as_ref()).await {
             Ok(Some(record)) => result.sidecar = Some(record),
             Ok(None) => {}
             Err(e) => {
@@ -2523,6 +2610,64 @@ mod tests {
             vec![("pkg:pypi/x@1.0.0?artifact_id=only", &variant)];
         let matched = select_installed_variants(dir.path(), &variants).await;
         assert_eq!(matched, vec![0]);
+    }
+
+    /// A Gradle `files-2.1` version dir: each classifier jar sits in its
+    /// own hash dir, and the variant whose jar is there matches through
+    /// `installed_copies`; `_any` matches across copies (one classifier in
+    /// `~/.m2`, the other in the Gradle cache).
+    #[tokio::test]
+    async fn test_select_installed_variants_expands_gradle_hash_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let version = tmp
+            .path()
+            .join(".gradle/caches/modules-2/files-2.1/org.example/native-lib/1.0.0");
+        let linux = b"linux jar".as_slice();
+        let osx = b"osx jar".as_slice();
+        let linux_dir = version.join("1".repeat(40));
+        tokio::fs::create_dir_all(&linux_dir).await.unwrap();
+        tokio::fs::write(linux_dir.join("native-lib-1.0.0-linux.jar"), linux)
+            .await
+            .unwrap();
+        let variant = |leaf: &str, before: &[u8]| {
+            HashMap::from([(
+                format!("package/{leaf}"),
+                PatchFileInfo {
+                    before_hash: compute_git_sha256_from_bytes(before),
+                    after_hash: "a".repeat(64),
+                },
+            )])
+        };
+        let linux_v = variant("native-lib-1.0.0-linux.jar", linux);
+        let osx_v = variant("native-lib-1.0.0-osx.jar", osx);
+        let variants: Vec<(&str, &HashMap<String, PatchFileInfo>)> = vec![
+            (
+                "pkg:maven/org.example/native-lib@1.0.0?classifier=linux",
+                &linux_v,
+            ),
+            (
+                "pkg:maven/org.example/native-lib@1.0.0?classifier=osx",
+                &osx_v,
+            ),
+        ];
+        assert_eq!(
+            select_installed_variants(&version, &variants).await,
+            vec![0]
+        );
+
+        let m2 = tmp.path().join("m2/org/example/native-lib/1.0.0");
+        tokio::fs::create_dir_all(&m2).await.unwrap();
+        tokio::fs::write(m2.join("native-lib-1.0.0-osx.jar"), osx)
+            .await
+            .unwrap();
+        assert_eq!(
+            select_installed_variants_any(&[m2.clone(), version.clone()], &variants).await,
+            vec![0, 1]
+        );
+        assert_eq!(
+            select_installed_variants_any(&[m2], &variants).await,
+            vec![1]
+        );
     }
 
     #[test]
