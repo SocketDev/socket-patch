@@ -1793,7 +1793,7 @@ mod tests {
     fn hosted_script_snapshot() {
         let digest = hex::encode(Sha256::digest(HOSTED_SCRIPT.as_bytes()));
         assert_eq!(
-            digest, "13a8c540d184ca3ab24fcb450980c7ca1ea7156ea844ae43ad330563d2f42e43",
+            digest, "98ac3cb22b45d2445215b1afb6492669be1638f849fbf3328c4f5cec7c77353e",
             "update the snapshot after reviewing the script change"
         );
         assert!(!HOSTED_SCRIPT.contains('\r'));

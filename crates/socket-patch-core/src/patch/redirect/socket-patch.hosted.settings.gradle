@@ -207,7 +207,9 @@ def socketHostedPin = { Configuration conf ->
       pinned |= m.version == p.suffixed
     }
     if (!pinned) { return }
+    // Lenient: a resolution failure is Gradle's to report, not the tripwire's.
     def view = rd.artifactView { v ->
+      v.lenient(true)
       v.componentFilter { id ->
         id instanceof org.gradle.api.artifacts.component.ModuleComponentIdentifier &&
           socketHostedPins["${id.group}:${id.module}".toString()]?.suffixed == id.version

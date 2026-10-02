@@ -1063,7 +1063,13 @@ impl EjectSnapshot {
         for (rel, bytes) in &self.files {
             let path = self.root.join(rel);
             let result = match bytes {
+                // The upstream restore may have removed the file's
+                // directory with it (the hosted Gradle files under
+                // `.socket/gradle/`).
                 Some(bytes) => {
+                    if let Some(parent) = path.parent() {
+                        let _ = tokio::fs::create_dir_all(parent).await;
+                    }
                     socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(&path, bytes)
                         .await
                 }
