@@ -5,7 +5,7 @@ use socket_patch_core::api::blob_fetcher::{
 };
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::manifest::cleanup_blobs::{
-    format_all_in_use, format_cleanup_result_for, CleanupResult,
+    format_all_in_use, format_cleanup_result_for, ArtifactReferences, CleanupResult,
 };
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::patch::apply::PatchSources;
@@ -16,7 +16,7 @@ use std::time::Duration;
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::fetch_stage::files_diffs_cannot_cover;
 use crate::commands::lock_cli::{acquire_or_emit, error_envelope};
-use crate::commands::rollback::{sweep_failure, sweep_unused_artifacts};
+use crate::commands::rollback::sweep_failure;
 use crate::json_envelope::{Command, Envelope, PatchAction, PatchEvent, Status};
 
 #[derive(Args)]
@@ -627,7 +627,9 @@ async fn repair_inner(
     // summary prints once all three passes are in, so "nothing to clean
     // up" is only said when all three really are empty.
     if let (false, Some(manifest)) = (args.download_only, manifest.as_ref()) {
-        let sweep = sweep_unused_artifacts(manifest, &socket_dir, args.common.dry_run).await;
+        let sweep = ArtifactReferences::for_apply(manifest)
+            .sweep(&socket_dir, args.common.dry_run)
+            .await;
         let passes = [
             ("blob", BLOB, sweep.blobs),
             ("diff", DIFF_ARCHIVE, sweep.diffs),
