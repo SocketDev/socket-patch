@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-02 (run 8), main `61cfb9b` (#365, #414 merged), latest release 4.0.0.
+Last updated: 2026-10-02 (run 9), main `61cfb9b` (#365, #414 merged), latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, package grant, hosted tarball, `/registry/<name>/<ver>` mirror). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -60,6 +60,15 @@ Run 8 additions (main `61cfb9b`, Linux):
 | 11.28.3 | untested | n/a (package.json field ignored) | pass / pass | untested | pass | n/a | n/a |
 | 12.8.1 | fail #356 | n/a (package.json field ignored) | pass / pass | pass | untested | n/a | n/a |
 
+Run 9 additions (main `61cfb9b`, Linux):
+
+| pnpm | Hosted: `gitBranchLockfile` (both locks / branch lock only) | Hosted: `lockfileIncludeTarballUrl` pin + fresh frozen | Rollback byte-exact with tarball URLs | Hosted: catalog + patchedDependencies + overrides | Hosted from workspace member cwd |
+| --- | --- | --- | --- | --- | --- |
+| 9.15.9 | n/a (no branch lock written) | pass | fail #557 | untested | untested |
+| 10.34.5 | fail #556 / untested | pass | untested | untested | untested |
+| 11.28.3 | fail #556 / untested | untested | untested | untested | untested |
+| 12.8.1 | fail #556 / fail #556 | pass | fail #557 | pass (vex, rollback) | no-op + `redirect_npm_no_lockfile` (not filed; see #417) |
+
 Default isolated linker + alias: pass on 7.33.7 / 9.15.9 / 10.34.5 / 11.28.3 / 12.8.1 (one shared `.pnpm` copy).
 
 #492 also reproduces on pnpm 7.33.7 (there's no root lock at all, only `redirect_pnpm_no_lockfile`).
@@ -82,12 +91,13 @@ Global mode (`-g`, v5 main `2463257`):
 ## Backlog
 
 0. **Maintainer request (global `-g` mode):** the Linux cells are done. Still to do: macOS and Windows (corepack, standalone and npm-installed pnpm; `PNPM_HOME` with spaces or unicode; Windows `%LOCALAPPDATA%\pnpm`), and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry. Needs a probe branch.
-1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1 and 3, and was denied by the permission policy in runs 2 and 5–8, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
-2. Re-verify #518 (with #493) when draft PR #520 lands. Then Rush subspaces (`common/config/subspaces/*`) and Rush + pnpm 10.
-3. Agent hoisted with nested duplicate copies (the pnpm side of #516), and `package-import-method=clone` on a reflink filesystem (needs CI).
-4. Hosted on 11/12 with `patchedDependencies` plus catalogs plus `configDependencies` together, and `pnpm patch-commit` after a hosted pin.
-5. Re-verify #492 (also with rollback and vex once member locks are pinned), #466 (both triggers), #360, #361, the global-virtual-store half of #362, and #435 when fixes land.
-6. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout).
+1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1 and 3, and was denied by the permission policy in runs 2 and 5–9, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
+2. #556 follow-ups: vendored mode with `gitBranchLockfile`, merging branch lockfiles after a hosted pin, and agent `vex` on the branch.
+3. Hosted and vendored from a workspace member cwd, and `lockfile-dir` / `lockfileDir` pointing at a parent directory.
+4. Re-verify #518 (with #493) when PR #520 lands. Then Rush subspaces (`common/config/subspaces/*`) and Rush + pnpm 10.
+5. `pnpm patch-commit` after a hosted pin, then rollback. Agent hoisted with nested duplicate copies (pnpm side of #516). `package-import-method=clone` on reflink (needs CI).
+6. Re-verify #492, #466, #360, #361, the global-virtual-store half of #362, #435, #556 and #557 when fixes land.
+7. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout).
 
 ## Known non-bugs
 
@@ -115,3 +125,4 @@ Global mode (`-g`, v5 main `2463257`):
 - Hosted on pnpm 11/12 respects an explicit `trustLockfile: false` (any YAML spelling) and warns `redirect_pnpm_trust_lockfile` with the remedy. The following frozen install fails, which is documented.
 - Vendored refuses pnpm ≤ 6 locks (5.x up to 5.3) with `vendor_lockfile_version_unsupported`, and pnpm 7/8 workspace locks with `vendor_lock_entry_unsupported`. pnpm 7/8 vendored locks carry an absolute `file:` specifier (`vendor_pnpm_legacy_absolute_specifier`), so a moved checkout needs `pnpm install --offline --no-frozen-lockfile` once. Both are documented.
 - pnpm 11+ ignores `package.json` `pnpm.patchedDependencies`. Put it in `pnpm-workspace.yaml`.
+- A dead-registry fresh install fails when the fixture has any unpatched dependency (it still needs the registry). Use the live registry for those fixtures, or patch every dependency.
