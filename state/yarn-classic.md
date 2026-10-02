@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-02 (run 7), main `61cfb9b`, latest release v4.0.0. Runs 5–7 added the cells in "Run 5 cells", "Run 6 cells" and "Run 7 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-02 (run 8), main `61cfb9b`, latest release v4.0.0. Runs 5–8 added the cells in "Run 5 cells" through "Run 8 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -62,13 +62,18 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Odd range keys (`">= a < b"`, `||`, `x`, hyphen, `latest`, `v`-prefix), H: pass. Workspace member under `tests/` + `socket.yml` policies (A/H): pass.
 - `yarn set version classic` layout (`.yarnrc.yml` yarnPath + `packageManager`), A/H/V: pass. `vendor --revert` on LF / CRLF / BOM+CRLF (1.7.0 / 1.22.22): byte-exact.
 
+### Run 8 cells (Linux, `61cfb9b`)
+- Hosted grant without `integrity.sha1` → fragmentless `resolved` → yarn cache-slot collision: **fail #558**. Warm-cache frozen install: 1.0.2 / 1.7.0 / 1.10.1 / 1.17.3 silently install unpatched bytes; 1.19.0 / 1.21.1 / 1.22.22 fail `Incorrect integrity when fetching from the cache`. v4.0.0 is affected too.
+- Merge-conflict markers in yarn.lock (target outside the conflict), H: pass. `--focus` workspace install, H: pass. `yarn audit` on hosted / alias locks: pass. `.yarnclean`, H + vex: pass (1.22.22).
+- Hosted rollback on an `integrity sha1-` lock: restores sha512 integrity + npmjs host (documented), frozen install OK: pass (1.10.1).
+
 ## Backlog
 
 1. **Maintainer request (global mode), still open:** Windows once #442 merges (#434 / #437, and the Berry handover lead about the `.cmd` shim); yarn via corepack and the Windows MSI; 1.6.0 / 1.9.4 on the probe; a read-only prefix on Windows (Program Files). Re-run get-mode cells after #446.
 2. Re-check #493 after #520 merges: workspace-level and `--install.modules-folder` forms.
-3. Hosted rollback on `integrity sha1-` locks (what integrity the restored entry gets).
-4. `.yarnclean` / `yarn autoclean` vs agent / hosted patched files and VEX hash verification.
-5. Re-run the v4-only project matrix columns (git dep #363, offline mirror H #364) on macOS/Windows once fixes land.
+3. Patches that rewrite the package's own `package.json` dependencies: vendored (`staged_pkg` recompute) vs hosted (lock `dependencies:` untouched).
+4. Superseding hosted patch with sha1 on yarn ≤1.17 in-place installs (`.yarn-integrity` short-circuit).
+5. Re-run the v4-only project matrix columns (git dep #363, offline mirror H #364) on macOS/Windows once fixes land; re-check #558 once fixed.
 
 ## Known non-bugs
 
@@ -103,3 +108,6 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - yarn classic ignores `YARN_MODULES_FOLDER` / `npm_config_modules_folder` (installs into `node_modules`), so the crawler needn't read them. A `~/.yarnrc` `--modules-folder` resolves relative to `$HOME`, not the project.
 - v5 has no `setup` subcommand. Agent cells use `apply`.
 - Probe branch `bughunt/yarn-classic/20261002-dev-flow` is also left on the remote (the proxy blocks deletion).
+- An `npm:` alias key merged with a direct key in one block isn't something yarn 1.22.22 writes (it emits two blocks), so don't test that shape.
+- Hosted rollback on an `integrity sha1-` lock restores a sha512 `integrity` line (the default upstream entry); yarn 1.10 installs it frozen.
+- `patch.socket.dev` / `patches-api.socket.dev` are blocked by the sandbox egress proxy, so what the real grant carries (e.g. whether `sha1` is present) can't be checked from here.
