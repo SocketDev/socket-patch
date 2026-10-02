@@ -1174,6 +1174,76 @@ async fn scan_prune_reverts_unused_vendored_entry() {
     );
 }
 
+/// #541, npm package-lock flavor: after `npm uninstall left-pad` re-locks
+/// the project without the vendored dependency, a vendored rescan skips
+/// the stale ledger entry with a `vendor_ledger_entry_unwired` warning
+/// and exits 0. Before, the ledger supplement re-added the entry and the
+/// vendor step failed to re-vendor a package the lock no longer has.
+#[tokio::test]
+async fn scan_vendor_skips_ledger_entry_the_lock_no_longer_wires() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+    let other = tmp.path().join("node_modules/keeper");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        other.join("package.json"),
+        br#"{"name":"keeper","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+
+    // `npm uninstall left-pad`: the lock and the installed copy are gone.
+    let lock = serde_json::json!({
+        "name": "scan-vendor-test",
+        "version": "0.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": { "name": "scan-vendor-test", "version": "0.0.0" }
+        }
+    });
+    std::fs::write(
+        tmp.path().join("package-lock.json"),
+        serde_json::to_vec_pretty(&lock).unwrap(),
+    )
+    .unwrap();
+    std::fs::remove_dir_all(tmp.path().join("node_modules/left-pad")).unwrap();
+    // The patch API answers by requested purl: it has nothing for keeper.
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [],
+            "canAccessPaidPatches": false,
+        })))
+        .with_priority(1)
+        .mount(&mock)
+        .await;
+
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let warned: Vec<&serde_json::Value> = v["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|w| w["code"] == "vendor_ledger_entry_unwired")
+        .collect();
+    assert_eq!(warned.len(), 1, "envelope={v}");
+    assert!(
+        warned[0]["detail"].as_str().unwrap().contains(PURL),
+        "envelope={v}"
+    );
+    // A plain rescan reverts nothing: the entry waits for `--prune`.
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(state["entries"][PURL].is_object(), "{state}");
+}
+
 /// Interactive (non-JSON) `scan --vendor` pre-verifies patch baselines:
 /// installed content matching NEITHER hash is annotated before vendoring
 /// starts, and the run still vendors (auto-force) with the
