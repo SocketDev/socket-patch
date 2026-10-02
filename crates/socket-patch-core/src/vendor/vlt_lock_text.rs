@@ -442,8 +442,9 @@ pub(crate) fn default_registry_alias(options: Option<&Map<String, Value>>) -> Op
 }
 
 /// The registry base URL (with a trailing `/`) a decoded DepID registry
-/// segment names, given the lock's `options`, as vlt hydrates the DepID
+/// segment names for `name`, given the lock's `options`, as vlt hydrates the DepID
 /// (`@vltpkg/dep-id` `hydrateTuple`, `@vltpkg/spec`):
+/// First resolve the segment's base:
 /// - an http(s) URL segment is its own base;
 /// - a named segment is its `options.registries` URL when the lock maps it;
 /// - the empty segment, and an unmapped segment that still names the
@@ -451,7 +452,14 @@ pub(crate) fn default_registry_alias(options: Option<&Map<String, Value>>) -> Op
 ///   else the default alias's `options.registries` URL, else the public
 ///   npm registry (`registry ?? registries[default-registry-alias]`);
 /// - any other segment is `None`: the lock names an alias it never maps.
-pub(crate) fn registry_base(segment: &str, options: Option<&Map<String, Value>>) -> Option<String> {
+/// Once the segment resolves, a configured scope registry takes precedence,
+/// including in a named/URL registry spec's final subspec. Unknown aliases
+/// still fail before scope lookup, as `hydrateTuple` does.
+pub(crate) fn registry_base(
+    segment: &str,
+    name: &str,
+    options: Option<&Map<String, Value>>,
+) -> Option<String> {
     let string = |value: Option<&Value>| {
         value
             .and_then(Value::as_str)
@@ -465,21 +473,32 @@ pub(crate) fn registry_base(segment: &str, options: Option<&Map<String, Value>>)
                 .and_then(|r| r.get(alias)),
         )
     };
-    if reqwest::Url::parse(segment).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
-        return Some(with_trailing_slash(segment));
-    }
-    if let Some(base) = Some(segment).filter(|s| !s.is_empty()).and_then(alias_url) {
-        return Some(base);
-    }
-    if !is_default_registry(segment, options) {
+    let base = if reqwest::Url::parse(segment)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+    {
+        with_trailing_slash(segment)
+    } else if let Some(base) = Some(segment).filter(|s| !s.is_empty()).and_then(alias_url) {
+        base
+    } else if is_default_registry(segment, options) {
+        string(options.and_then(|o| o.get("registry")))
+            .or_else(|| default_registry_alias(options).and_then(alias_url))
+            .unwrap_or_else(|| {
+                with_trailing_slash(crate::vendor::registry_fetch::DEFAULT_NPM_REGISTRY)
+            })
+    } else {
         return None;
-    }
-    let base = string(options.and_then(|o| o.get("registry")))
-        .or_else(|| default_registry_alias(options).and_then(alias_url))
-        .unwrap_or_else(|| {
-            with_trailing_slash(crate::vendor::registry_fetch::DEFAULT_NPM_REGISTRY)
-        });
-    Some(base)
+    };
+    name.split_once('/')
+        .map(|(scope, _)| scope)
+        .filter(|scope| scope.starts_with('@'))
+        .and_then(|scope| {
+            string(
+                options
+                    .and_then(|o| o.get("scoped-registries"))
+                    .and_then(|registries| registries.get(scope)),
+            )
+        })
+        .or(Some(base))
 }
 
 /// Is `segment` an http(s) URL naming `options.registry` (a trailing `/`
@@ -541,6 +560,12 @@ pub(crate) const REGISTRY_BASE_CASES: &[(&str, &str, Option<&str>)] = &[
     ("corp", "{}", None),
     ("https://u.example", "{}", Some("https://u.example/")),
 ];
+
+/// @vltpkg/spec + dep-id 1.3.5 produce `~npm~@s+a@1.0.0` for
+/// `@s/a@npm:@s/a@1.0.0` under these options. Its final registry is `a`,
+/// while an unscoped `npm:` package uses `b`.
+#[cfg(test)]
+pub(crate) const SCOPED_REGISTRY_OPTIONS: &str = r#"{"registry":"https://a.example/","registries":{"npm":"https://b.example/","corp":"https://corp.example/"},"scoped-registries":{"@s":"https://a.example/"}}"#;
 
 // ── lock-level sniff ─────────────────────────────────────────────────────
 
@@ -1773,16 +1798,42 @@ mod tests {
         for (segment, opts, want) in REGISTRY_BASE_CASES {
             let opts = options(opts);
             assert_eq!(
-                registry_base(segment, Some(&opts)).as_deref(),
+                registry_base(segment, "left-pad", Some(&opts)).as_deref(),
                 *want,
                 "{segment:?} with {opts:?}"
             );
         }
         assert_eq!(
-            registry_base("npm", None).as_deref(),
+            registry_base("npm", "left-pad", None).as_deref(),
             Some("https://registry.npmjs.org/")
         );
-        assert_eq!(registry_base("corp", None), None);
+        assert_eq!(registry_base("corp", "left-pad", None), None);
+    }
+
+    #[test]
+    fn registry_base_applies_scope_after_resolving_the_segment() {
+        let opts = options(SCOPED_REGISTRY_OPTIONS);
+        for (segment, unscoped) in [
+            ("", "https://a.example/"),
+            ("npm", "https://b.example/"),
+            ("corp", "https://corp.example/"),
+            ("https://explicit.example/npm", "https://explicit.example/npm/"),
+        ] {
+            assert_eq!(
+                registry_base(segment, "@s/a", Some(&opts)).as_deref(),
+                Some("https://a.example/"),
+                "{segment}"
+            );
+            for name in ["a", "@other/a"] {
+                assert_eq!(
+                    registry_base(segment, name, Some(&opts)).as_deref(),
+                    Some(unscoped),
+                    "{segment}: {name}"
+                );
+            }
+        }
+        // A scope mapping must not make an unknown registry alias valid.
+        assert_eq!(registry_base("unmapped", "@s/a", Some(&opts)), None);
     }
 
     fn readable(text: &str) -> ParsedLock {

@@ -52,6 +52,7 @@ fn tarball_url(base: &str, name: &str, version: &str) -> String {
 fn records_url(
     era: DepIdEra,
     segment: &str,
+    name: &str,
     siblings: &[(DepIdEra, bool)],
     options: Option<&Map<String, Value>>,
 ) -> bool {
@@ -69,14 +70,18 @@ fn records_url(
             .and_then(|o| o.get("registries"))
             .is_some_and(Value::is_object)
         && (segment.is_empty() || default_registry_alias(options) == Some(segment))
-        && !under_configured_registry(segment, options)
+        && !under_configured_registry(segment, name, options)
 }
 
 /// Would a default-registry node on `segment` resolve under the lock's
 /// recorded `options.registry`? vlt omits slot [3] for such a node
 /// (`lockfile/save.ts`: `customRegistry = resolved && (!registry ||
 /// !resolved.startsWith(registry))`).
-fn under_configured_registry(segment: &str, options: Option<&Map<String, Value>>) -> bool {
+fn under_configured_registry(
+    segment: &str,
+    name: &str,
+    options: Option<&Map<String, Value>>,
+) -> bool {
     let Some(registry) = options
         .and_then(|o| o.get("registry"))
         .and_then(Value::as_str)
@@ -84,7 +89,7 @@ fn under_configured_registry(segment: &str, options: Option<&Map<String, Value>>
     else {
         return false;
     };
-    registry_base(segment, options).is_some_and(|base| base.starts_with(registry))
+    registry_base(segment, name, options).is_some_and(|base| base.starts_with(registry))
 }
 
 pub(crate) async fn restore(
@@ -246,8 +251,8 @@ pub(crate) async fn restore(
             };
             let line = parse_node_line(lines[hit.line]).expect("the hit line parsed above");
             let json = |s: &str| serde_json::to_string(s).expect("a str serializes to JSON");
-            let slot3 = if records_url(hit.era, &hit.segment, &siblings, options) {
-                let Some(base) = registry_base(&hit.segment, options) else {
+            let slot3 = if records_url(hit.era, &hit.segment, &hit.name, &siblings, options) {
+                let Some(base) = registry_base(&hit.segment, &hit.name, options) else {
                     result.refuse(
                         &hit.uuid,
                         format!("{rel} maps no registry for the `{}` segment", hit.segment),
@@ -323,12 +328,14 @@ mod tests {
         assert!(!records_url(
             DepIdEra::Tilde,
             "npm",
+            "left-pad",
             &[(DepIdEra::Tilde, false)],
             Some(&with_registries)
         ));
         assert!(records_url(
             DepIdEra::Tilde,
             "npm",
+            "left-pad",
             &[(DepIdEra::Tilde, true)],
             None
         ));
@@ -336,6 +343,7 @@ mod tests {
         assert!(!records_url(
             DepIdEra::Legacy,
             "npm",
+            "left-pad",
             &[(DepIdEra::Tilde, true)],
             Some(&with_registries)
         ));
@@ -343,29 +351,31 @@ mod tests {
         assert!(records_url(
             DepIdEra::Tilde,
             "npm",
+            "left-pad",
             &[],
             Some(&with_registries)
         ));
-        assert!(!records_url(DepIdEra::Tilde, "npm", &[], None));
+        assert!(!records_url(DepIdEra::Tilde, "npm", "left-pad", &[], None));
         assert!(!records_url(
             DepIdEra::Tilde,
             "https://registry.example.com/",
+            "left-pad",
             &[],
             Some(&with_registries)
         ));
         let alias = opts(r#"{"default-registry-alias":"corp","registries":{"corp":"https://c/"}}"#);
-        assert!(records_url(DepIdEra::Tilde, "corp", &[], Some(&alias)));
+        assert!(records_url(DepIdEra::Tilde, "corp", "left-pad", &[], Some(&alias)));
         // A recorded `registry` the node resolves under: vlt (rc.33 … 1.2.0
         // with `config.registry`) writes no slot [3].
         let configured = opts(
             r#"{"registry":"http://127.0.0.1:4873/","registries":{"npm":"http://127.0.0.1:4873/"}}"#,
         );
-        assert!(!records_url(DepIdEra::Tilde, "npm", &[], Some(&configured)));
+        assert!(!records_url(DepIdEra::Tilde, "npm", "left-pad", &[], Some(&configured)));
         // ...but a node on another registry than the configured one does.
         let elsewhere = opts(
             r#"{"registry":"https://registry.npmjs.org/","registries":{"npm":"http://127.0.0.1:4873/"}}"#,
         );
-        assert!(records_url(DepIdEra::Tilde, "npm", &[], Some(&elsewhere)));
+        assert!(records_url(DepIdEra::Tilde, "npm", "left-pad", &[], Some(&elsewhere)));
     }
 
     use super::super::{restore_upstream, RestoreOptions, RestoreOutcome};
@@ -412,7 +422,7 @@ mod tests {
                 dist["integrity"] = (*i).into();
             }
             Mock::given(method("GET"))
-                .and(path(format!("/{name}/{version}")))
+                .and(path(format!("/{}/{version}", name.replace('/', "%2f"))))
                 .respond_with(
                     ResponseTemplate::new(200).set_body_json(serde_json::json!({ "dist": dist })),
                 )
@@ -526,6 +536,38 @@ mod tests {
                 );
                 assert_eq!(after, text);
             }
+        }
+        std::env::remove_var("SOCKET_NPM_REGISTRY");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_honors_scope_for_slot3_and_configured_registry_omission() {
+        use crate::vendor::vlt_lock_text::SCOPED_REGISTRY_OPTIONS;
+        let server = registry(&[("@s/a", "1.0.0", Some(LP_UPSTREAM))]).await;
+        std::env::set_var("SOCKET_NPM_REGISTRY", server.uri());
+        let url = hosted(LP_UUID, "a-1.0.0.tgz");
+        for records_url in [false, true] {
+            let sibling = if records_url {
+                ",\n    \"~npm~ms@2.1.3\": [0,\"ms\",\"sha512-M==\",\"https://b.example/ms/-/ms-2.1.3.tgz\"]"
+            } else {
+                ""
+            };
+            let text = format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"options\": {SCOPED_REGISTRY_OPTIONS},\n  \"nodes\": {{\n    \"~npm~@s+a@1.0.0\": [0,\"@s/a\",\"sha512-AA==\",\"{url}\"]{sibling}\n  }},\n  \"edges\": {{}}\n}}\n"
+            );
+            let (outcome, after) =
+                run(&text, &[pin("pkg:npm/@s/a@1.0.0", LP_UUID)], false).await;
+            assert!(refused(&outcome).is_empty(), "{:?}", refused(&outcome));
+            let after: Value = serde_json::from_str(&after).unwrap();
+            let expected = if records_url {
+                serde_json::json!([0, "@s/a", LP_UPSTREAM, "https://a.example/@s/a/-/a-1.0.0.tgz"])
+            } else {
+                // The scoped URL is under options.registry, even though
+                // registries.npm names a different base: vlt omits slot 3.
+                serde_json::json!([0, "@s/a", LP_UPSTREAM])
+            };
+            assert_eq!(after["nodes"]["~npm~@s+a@1.0.0"], expected);
         }
         std::env::remove_var("SOCKET_NPM_REGISTRY");
     }

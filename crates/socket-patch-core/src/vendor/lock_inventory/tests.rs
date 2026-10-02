@@ -2726,6 +2726,33 @@ async fn vlt_inventory_resolves_registries_through_the_shared_registry_base() {
 }
 
 #[tokio::test]
+async fn vlt_inventory_honors_scope_for_named_and_url_registry_segments() {
+    use crate::vendor::vlt_lock_text::{
+        encode_segment, DepIdEra, SCOPED_REGISTRY_OPTIONS,
+    };
+    for segment in ["npm", "corp", "https://explicit.example/npm"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = format!(
+            r#""~{}~@s+a@1.0.0": [0,"@s/a","sha512-a=="]"#,
+            encode_segment(segment, DepIdEra::Tilde)
+        );
+        write(
+            tmp.path(),
+            "vlt-lock.json",
+            &vlt_lock(SCOPED_REGISTRY_OPTIONS, &[&node]),
+        )
+        .await;
+        let entries = inventory_vlt(tmp.path()).await.unwrap();
+        assert_eq!(entries.len(), 1, "{segment}");
+        assert_eq!(
+            entries[0].resolved.as_deref(),
+            Some("https://a.example/@s/a/-/a-1.0.0.tgz"),
+            "{segment}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn unreadable_vlt_locks_inventory_to_nothing() {
     let good = vlt_lock("{}", &[r#""~npm~a@1.0.0": [0,"a","sha512-a=="]"#]);
     for lock in [

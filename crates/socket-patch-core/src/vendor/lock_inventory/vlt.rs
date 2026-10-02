@@ -106,7 +106,7 @@ pub(crate) fn vlt_registry_entries(lock: &VltLock) -> Vec<LockfileEntry> {
                 return None;
             }
             let resolved = node.location.as_deref().and_then(http_url).or_else(|| {
-                registry_base(&node.dep_id.first, options)
+                registry_base(&node.dep_id.first, name, options)
                     .map(|base| npm_tarball_url(base.trim_end_matches('/'), name, version))
             });
             let integrity = node
