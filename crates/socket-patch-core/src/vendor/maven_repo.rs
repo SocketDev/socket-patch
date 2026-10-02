@@ -67,7 +67,7 @@ const MAVEN_USER_AGENT: &str = "Apache-Maven/3.9.11 (Java 17.0.16; Linux 6.8.0)"
 /// The maven2 registry base for the (fallback) pom download, overridable with
 /// `SOCKET_MAVEN_REGISTRY` (the private-mirror / test escape hatch). Default is
 /// Maven Central's maven2 endpoint.
-fn maven_registry_base() -> String {
+pub(crate) fn maven_registry_base() -> String {
     std::env::var("SOCKET_MAVEN_REGISTRY")
         .ok()
         .map(|v| v.trim_end_matches('/').to_string())
@@ -1399,7 +1399,7 @@ async fn fetch_pom_bytes(url: &str) -> Result<Vec<u8>, String> {
     fetch_registry_bytes(url, MAX_POM_BYTES as u64).await
 }
 
-async fn fetch_registry_bytes(url: &str, cap: u64) -> Result<Vec<u8>, String> {
+pub(crate) async fn fetch_registry_bytes(url: &str, cap: u64) -> Result<Vec<u8>, String> {
     let client = reqwest::Client::builder()
         .user_agent(MAVEN_USER_AGENT)
         .timeout(Duration::from_secs(60))
