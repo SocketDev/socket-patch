@@ -45,8 +45,18 @@ pub(crate) const VENDOR_STATE_REL: &str = ".socket/vendor/state.json";
 /// classifies against (a package it records is not NEW).
 pub(crate) const MANIFEST_REL: &str = ".socket/manifest.json";
 
+/// The root manifest: its `overrides` decide which npm lock entries are
+/// registry installs (#490). Read as advisory input, never edited.
+pub(crate) const NPM_MANIFEST_REL: &str = "package.json";
+
 /// Root-relative text files read beyond `REDIRECT_CANDIDATE_FILES`.
-const EXTRA_TEXT_FILES: [&str; 4] = [PNPM_WORKSPACE_REL, NPMRC_REL, VENDOR_STATE_REL, MANIFEST_REL];
+const EXTRA_TEXT_FILES: [&str; 5] = [
+    PNPM_WORKSPACE_REL,
+    NPMRC_REL,
+    VENDOR_STATE_REL,
+    MANIFEST_REL,
+    NPM_MANIFEST_REL,
+];
 
 /// The one directory name the disk Cargo member walk never enters (it
 /// follows `members`, `exclude`, path dependencies and `[patch]` paths
@@ -140,11 +150,6 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
         return Some(Need::Binary);
     }
     if REDIRECT_CANDIDATE_FILES.contains(&rel) || EXTRA_TEXT_FILES.contains(&rel) {
-        return Some(Need::Text);
-    }
-    // The yarn berry hosted pin routes through the root manifest's
-    // `resolutions`; the engine reads it only beside a `yarn.lock`.
-    if rel == "package.json" && root_files.contains("yarn.lock") {
         return Some(Need::Text);
     }
     if PNP_MARKERS.contains(&rel) || rel == "rush.json" {
@@ -428,7 +433,6 @@ pub fn candidate_files() -> Vec<String> {
         "common/config/subspaces/*/pnpm-lock.yaml",
         "*.py.lock",
         "*.py (beside *.py.lock)",
-        "package.json (beside yarn.lock)",
         "pylock.toml",
         "pylock.*.toml",
         "**/Cargo.toml (Cargo workspaces)",
@@ -488,6 +492,7 @@ mod tests {
             vec![
                 ".npmrc",
                 "package-lock.json",
+                "package.json",
                 "tool.py",
                 "tool.py.lock",
                 "web/.yarnrc.yml",

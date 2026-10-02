@@ -130,7 +130,10 @@ limits, and required install commands.
   `vendor_non_registry_entry_skipped`; vendoring refuses with
   `vendor_lock_entry_not_rewritable` when no registry copy is left), and
   `vex` attests nothing for a `name@version` while such a copy is in the
-  lock (#326).
+  lock (#326). A dependency the project's `overrides` send back to a
+  registry version is not one of these: npm installs the override's
+  registry release, so hosted and vendored modes patch it again, and
+  `vex` attests it (#490).
 - **Agent mode finds Poetry's virtualenv in more setups.** Three cases
   missed the virtualenv Poetry installed into. Each fell back to the
   wrong interpreter, skipped the patch as `package_not_installed` and
@@ -206,6 +209,15 @@ limits, and required install commands.
   unparseable (hosted) or refused as `vendor_lockfile_version_unsupported`
   (vendored). The lock now keeps its BOM, indent and line endings, and the
   undo is byte-exact (#324).
+- Agent mode no longer patches other projects through a store they share.
+  PDM 2.0–2.12 with `install.cache` and `cache_method = symlink` links
+  `site-packages/<pkg>` into its package cache, and pnpm's global virtual
+  store (`enableGlobalVirtualStore`) links `node_modules/<dep>` into
+  `<store>/links`. `apply` (also `-g`) wrote the patch into that shared
+  directory, so every project using it was patched, and a `rollback` in one
+  project silently unpatched the rest. `apply` and `rollback` now fail on
+  such a package, naming the store and how to get a private copy
+  (#332, #361).
 - `vendor` under `--global` / `--global-prefix` (or `SOCKET_GLOBAL` /
   `SOCKET_GLOBAL_PREFIX`) is now a usage error (exit 2,
   `global_scope_unsupported`), like `scan` and `get` with `--mode vendored`.
