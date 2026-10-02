@@ -1509,8 +1509,21 @@ async fn vendored_takeover(
     // for those locks even though the rewriters never see these purls.
     let mut dry_run_locks: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    // Maven takes over only a Gradle build's vendored JVM entry (its revert
+    // unplans the vendored Gradle wiring); a pom-only vendored entry stays.
     let takeover_capable = |p: &str| {
-        p.starts_with("pkg:cargo/") || p.starts_with("pkg:npm/") || p.starts_with("pkg:golang/")
+        p.starts_with("pkg:cargo/")
+            || p.starts_with("pkg:npm/")
+            || p.starts_with("pkg:golang/")
+            || p.starts_with("pkg:maven/")
+    };
+    let gradle_jvm_entry = |entry: &socket_patch_core::vendor::VendorEntry| {
+        entry.ecosystem == "jvm"
+            && entry.wiring.iter().any(|w| {
+                w.file.ends_with(".gradle")
+                    || w.file.ends_with(".gradle.kts")
+                    || w.file == socket_patch_core::vendor::jvm::gradle::INDEX_REL
+            })
     };
     if !candidates.iter().any(|c| takeover_capable(&c.purl)) {
         // No takeover-capable candidates — nothing to reconcile.
@@ -1535,7 +1548,13 @@ async fn vendored_takeover(
                 .cloned();
             (c, entry)
         })
+        .filter(|(c, entry)| {
+            !c.purl.starts_with("pkg:maven/") || entry.as_ref().is_some_and(gradle_jvm_entry)
+        })
         .collect();
+    if takeover.is_empty() {
+        return Ok(out);
+    }
     // Compatibility must be known before the takeover removes a live
     // patch. In particular, a v0 workspace can keep an existing local
     // tuple even though hosted mode cannot replace it with a URL. Only

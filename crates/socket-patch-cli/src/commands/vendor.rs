@@ -979,9 +979,9 @@ fn hosted_pins_in_scope(common: &GlobalArgs, pins: Vec<HostedPin>) -> Vec<Hosted
 
 /// What a wet eject can touch, captured before it touches anything: every
 /// regular file directly in the project root, the hosted pins' files and
-/// the restore's files (nested locks included), the project's cargo and
-/// maven config files, the vendor ledger, and the set of vendored uuid
-/// directories. [`EjectSnapshot::restore`] puts all of it back and removes
+/// the restore's files (nested locks included), the project's cargo,
+/// maven and Gradle config and owned files, the vendor ledger, and the set
+/// of vendored uuid directories. [`EjectSnapshot::restore`] puts all of it back and removes
 /// what the eject created.
 struct EjectSnapshot {
     root: std::path::PathBuf,
@@ -991,12 +991,21 @@ struct EjectSnapshot {
 }
 
 impl EjectSnapshot {
-    const EXTRA: [&'static str; 5] = [
+    const EXTRA: [&'static str; 12] = [
         ".cargo/config",
         ".cargo/config.toml",
         ".mvn/maven.config",
         ".mvn/checksums/checksums.sha256",
         socket_patch_core::vendor::VENDOR_STATE_REL,
+        // The Gradle owned files: the hosted ones the restore removes and
+        // the vendored ones the vendor step writes.
+        socket_patch_core::patch::redirect::gradle::HOSTED_INDEX_REL,
+        socket_patch_core::patch::redirect::gradle::HOSTED_SCRIPT_REL,
+        socket_patch_core::patch::redirect::gradle::GITATTRIBUTES_REL,
+        socket_patch_core::vendor::jvm::gradle::SCRIPT_REL,
+        socket_patch_core::vendor::jvm::gradle::INDEX_REL,
+        socket_patch_core::vendor::jvm::gradle::VENDOR_GITATTRIBUTES_REL,
+        socket_patch_core::vendor::jvm::gradle::VERIFICATION_REL,
     ];
 
     async fn root_file_names(root: &Path) -> std::io::Result<std::collections::BTreeSet<String>> {
