@@ -1679,15 +1679,22 @@ async fn berry_hosted_to_vendored_takeover_runs_package_gates_first() {
         );
         std::fs::write(root.join("yarn.lock"), lock + &extra).unwrap();
     };
-    // A user-authored range override for the name.
+    // A user-authored range override for the name, merged into any
+    // `resolutions` table the hosted wiring already wrote.
     let user_resolution: Break = |root| {
         let pkg = std::fs::read_to_string(root.join("package.json")).unwrap();
-        let pkg = pkg.replacen(
-            "\"private\": true,",
-            "\"private\": true,\n  \"resolutions\": {\n    \"left-pad\": \"^1.0.0\"\n  },",
-            1,
-        );
-        std::fs::write(root.join("package.json"), pkg).unwrap();
+        let mut pkg: Value = serde_json::from_str(&pkg).unwrap();
+        let table = pkg
+            .as_object_mut()
+            .unwrap()
+            .entry("resolutions")
+            .or_insert_with(|| json!({}));
+        table
+            .as_object_mut()
+            .unwrap()
+            .insert("left-pad".into(), json!("^1.0.0"));
+        let text = serde_json::to_string_pretty(&pkg).unwrap() + "\n";
+        std::fs::write(root.join("package.json"), text).unwrap();
     };
     for (label, breakage) in [
         ("other locked version", other_version),
