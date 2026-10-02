@@ -7,6 +7,8 @@
 //! - [`JvmCacheLayout`] / [`JvmCacheRoot`]: an installed-artifact cache
 //!   and how its directories spell coordinates. [`MavenCrawler`] crawls
 //!   and resolves PURLs per root, dispatching on the layout.
+//! - [`locate_artifact`] / [`all_local_roots`]: every installed copy of
+//!   one artifact file across the local caches, for sourcing its bytes.
 //! - [`project_dependency_set`]: the coordinates a project actually
 //!   resolves, from one provider per build tool (Gradle lock state, an sbt
 //!   lock, …). `None` means no provider could tell, so callers fall back to

@@ -698,8 +698,10 @@ pub fn maven_local_undetermined(cwd: &Path) -> Option<String> {
 // MavenCrawler
 // ---------------------------------------------------------------------------
 
-/// Maven/Java ecosystem crawler for discovering packages in the local
-/// Maven repository (`~/.m2/repository/`).
+/// Maven/Java ecosystem crawler for discovering packages in the JVM
+/// artifact caches: the local Maven repository (`~/.m2/repository/`) and
+/// Gradle's module cache (`~/.gradle/caches/modules-2/files-2.1`, plus the
+/// read-only `$GRADLE_RO_DEP_CACHE`).
 pub struct MavenCrawler;
 
 impl MavenCrawler {
@@ -779,8 +781,10 @@ impl MavenCrawler {
     /// [`Self::get_jvm_cache_roots`] plus the Maven local repository even
     /// when a Gradle build does not read it. Its bytes are still a valid
     /// source for vendoring, and an agent apply that patches every copy
-    /// patches that one too. Each path's layout is recovered by
-    /// [`JvmCacheLayout::classify`] in [`Self::find_by_purls`].
+    /// patches that one too. The Maven local repository comes first, so a
+    /// caller that takes the first copy keeps resolving where it always
+    /// did. Each path's layout is recovered by [`JvmCacheLayout::classify`]
+    /// in [`Self::find_by_purls`].
     pub async fn get_maven_repo_paths(
         &self,
         options: &CrawlerOptions,
@@ -795,16 +799,16 @@ impl MavenCrawler {
         options: &CrawlerOptions,
         env: &JvmEnv,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
-        let mut paths: Vec<PathBuf> = self
-            .get_jvm_cache_roots_with(options, env)
-            .await
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
         let jvm = options.global_prefix.is_none()
             && (options.global || jvm_cache::is_jvm_project(&options.cwd).await);
-        if jvm && !paths.contains(&env.m2_repo) && is_dir(&env.m2_repo).await {
+        let mut paths = Vec::new();
+        if jvm && is_dir(&env.m2_repo).await {
             paths.push(env.m2_repo.clone());
+        }
+        for root in self.get_jvm_cache_roots_with(options, env).await {
+            if !paths.contains(&root.path) {
+                paths.push(root.path);
+            }
         }
         Ok(paths)
     }

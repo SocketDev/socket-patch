@@ -624,7 +624,7 @@ async fn gradle_only_without_maven_local_has_no_m2() {
         .get_maven_repo_paths_with(&m.options(false), &m.jvm_env())
         .await
         .unwrap();
-    assert_eq!(lookup, vec![m.gradle_files21(), m.m2()]);
+    assert_eq!(lookup, vec![m.m2(), m.gradle_files21()]);
 }
 
 /// #551: mavenLocal() in a buildSrc convention plugin counts.
