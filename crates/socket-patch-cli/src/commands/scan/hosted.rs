@@ -3622,6 +3622,13 @@ mod tests {
                 "settings.gradle.kts",
                 "build.gradle",
                 "build.gradle.kts",
+                "gradle.lockfile",
+                "buildscript-gradle.lockfile",
+                "settings-gradle.lockfile",
+                "gradle/verification-metadata.xml",
+                "gradle/wrapper/gradle-wrapper.properties",
+                ".socket/gradle/hosted-index.tsv",
+                ".socket/gradle/socket-patch.hosted.settings.gradle",
             ]
         );
     }

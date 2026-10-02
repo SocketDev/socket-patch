@@ -465,11 +465,74 @@ pub async fn read_candidate_files(
     if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
         keep_bundler_loaded_gem_files(view, &mut out).await;
     }
+    // A Gradle build: every script, catalog and lock file its script graph
+    // reaches, for the hosted Gradle planner.
+    if candidates.iter().any(|c| c.dep.ecosystem == "maven")
+        && crate::patch::redirect::gradle::gradle_build_present(&out.files)
+    {
+        read_gradle_files(view, unreadable, &mut out).await;
+    }
     out.symlinked_reads.sort();
     out.symlinked_reads.dedup();
     out.unreadable_reads.sort();
     out.unreadable_reads.dedup();
     out
+}
+
+/// Read what the hosted Gradle planner needs into `out` (see
+/// [`crate::patch::redirect::gradle::GradleFiles`]): the script graph is
+/// re-walked over what was read so far until it asks for nothing new
+/// (bounded by its own caps and [`MAX_ROUNDS`] rounds). A file that cannot
+/// be read is absent to the graph, which records it as unresolved; a
+/// directory that cannot be listed lists as empty.
+///
+/// [`MAX_ROUNDS`]: crate::patch::redirect::gradle::MAX_ROUNDS
+async fn read_gradle_files(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    out: &mut CandidateFiles,
+) {
+    use crate::patch::redirect::gradle::{GradleFiles, MAX_ROUNDS};
+    let mut gradle = GradleFiles::default();
+    for (rel, text) in &out.files {
+        gradle.found(rel, text.clone());
+    }
+    for _ in 0..MAX_ROUNDS {
+        let (reads, lists) = gradle.misses();
+        if reads.is_empty() && lists.is_empty() {
+            break;
+        }
+        for rel in reads {
+            match out
+                .read(view, unreadable, &rel)
+                .await
+                .then(|| out.files.get(&rel).cloned())
+                .flatten()
+            {
+                Some(text) => gradle.found(&rel, text),
+                None => gradle.absent(&rel),
+            }
+        }
+        for dir in lists {
+            let children = view
+                .list_dir(&dir)
+                .await
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|e| {
+                            if e.is_dir {
+                                format!("{}/", e.name)
+                            } else {
+                                e.name
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            gradle.listed(&dir, children);
+        }
+    }
 }
 
 /// The Bundler manifest/lock spellings among the candidate files.
@@ -1317,6 +1380,14 @@ fn confirm(
                 .map(|(name, content)| (name.as_str(), content)),
         )
         .collect();
+    // Gradle scripts, locks and owned files never confirm by substring: a
+    // pasted snippet or a stale lock line pins nothing (the Gradle planner
+    // decides its own uuids above the needles).
+    let needle_texts: Vec<&String> = final_texts
+        .iter()
+        .filter(|(name, _)| !is_gradle_file(name))
+        .map(|(_, text)| *text)
+        .collect();
     // Every non-substring rule decides a candidate outright; the rest are
     // confirmed by substring presence of their needles in the final texts.
     // All needle groups are answered in ONE multi-needle pass per text
@@ -1393,6 +1464,23 @@ fn confirm(
             if purl.starts_with("pkg:golang/") {
                 return ProbeStep::Decided(rewrite.confirmed_golang_uuids.contains(uuid));
             }
+            // A Gradle build: the hosted Gradle planner decides (a snippet
+            // pasted into a build script pins nothing it can check). A
+            // pom.xml beside it must pin the patch as well.
+            if purl.starts_with("pkg:maven/") && rewrite.gradle_uuids.contains(uuid) {
+                let gradle = rewrite.confirmed_gradle_uuids.contains(uuid)
+                    && !rewrite.refused_gradle_uuids.contains(uuid);
+                if !gradle || !files.contains_key("pom.xml") {
+                    return ProbeStep::Decided(gradle);
+                }
+                let needles = candidate_presence_needles(&c.dep);
+                return ProbeStep::Decided(
+                    final_texts
+                        .iter()
+                        .filter(|(name, _)| *name == "pom.xml" || name.starts_with(".mvn/"))
+                        .any(|(_, text)| needles.iter().any(|n| text.contains(n.as_str()))),
+                );
+            }
             let needles = candidate_presence_needles(&c.dep);
             if withheld_from_vlt.contains(uuid) {
                 ProbeStep::NeedlesOutsideVlt(needles)
@@ -1411,15 +1499,14 @@ fn confirm(
             })
             .collect()
     };
-    let all_texts: Vec<&String> = final_texts.iter().map(|(_, text)| *text).collect();
-    let mut present = groups_present(&all_texts, &groups(false)).into_iter();
+    let mut present = groups_present(&needle_texts, &groups(false)).into_iter();
     let outside_vlt_groups = groups(true);
     let mut present_outside_vlt = if outside_vlt_groups.is_empty() {
         Vec::new()
     } else {
         let texts: Vec<&String> = final_texts
             .iter()
-            .filter(|(name, _)| *name != VLT_LOCK)
+            .filter(|(name, _)| *name != VLT_LOCK && !is_gradle_file(name))
             .map(|(_, text)| *text)
             .collect();
         groups_present(&texts, &outside_vlt_groups)
@@ -1441,6 +1528,16 @@ fn confirm(
         .collect()
 }
 
+/// A Gradle script, lock file or hosted-Gradle owned file (the hosted
+/// Gradle planner's inputs).
+fn is_gradle_file(rel: &str) -> bool {
+    crate::gradle::dsl::dsl_of(rel).is_some()
+        || rel.ends_with(".lockfile")
+        || rel.starts_with(".socket/gradle/")
+        || rel == "gradle/verification-metadata.xml"
+        || rel.ends_with("gradle-wrapper.properties")
+}
+
 /// The ecosystem a candidate file's rewriter belongs to (`None` for files
 /// no rewriter edits), for the in-memory symlinked/unreadable-read refusal.
 fn file_ecosystem(rel: &str) -> Option<&'static str> {
@@ -1448,6 +1545,10 @@ fn file_ecosystem(rel: &str) -> Option<&'static str> {
         return Some(eco);
     }
     let base = rel.rsplit('/').next().unwrap_or(rel);
+    // A legacy Gradle lock (`gradle/dependency-locks/<conf>.lockfile`).
+    if base.ends_with(".lockfile") {
+        return Some("maven");
+    }
     (crate::utils::python_lock::is_python_lock_name(base) || base.ends_with(".py"))
         .then_some("pypi")
 }
@@ -1668,6 +1769,165 @@ mod tests {
                 integrity: Integrity::default(),
             },
         }
+    }
+
+    const GRADLE_UUID: &str = "4d5e6f70-8192-4a3b-9c4d-5e6f708192a3";
+
+    fn gradle_candidate() -> Candidate {
+        use crate::patch::redirect::{Integrity, RegistryOverride, RegistryOverrideIdentifiers};
+        let token = "22222222-3333-4444-8555-666666666666";
+        Candidate {
+            purl: "pkg:maven/com.socketfixture/victim@1.10.0".into(),
+            dep: DepOverride {
+                ecosystem: "maven".into(),
+                name: "victim".into(),
+                namespace: Some("com.socketfixture".into()),
+                version: "1.10.0".into(),
+                token: token.into(),
+                patch_uuid: GRADLE_UUID.into(),
+                artifact_url: format!(
+                    "https://patch.socket.dev/patch/maven/com.socketfixture/victim/1.10.0/{token}/{GRADLE_UUID}/victim-1.10.0-socket.4d5e6f70.jar"
+                ),
+                registry_override: Some(RegistryOverride {
+                    kind: "maven2".into(),
+                    index_url: format!(
+                        "https://patch.socket.dev/patch-registry/maven/{token}/{GRADLE_UUID}/maven2"
+                    ),
+                    identifiers: RegistryOverrideIdentifiers {
+                        name: "com.socketfixture/victim".into(),
+                        version: "1.10.0".into(),
+                        maven_group_id: Some("com.socketfixture".into()),
+                        maven_artifact_id: Some("victim".into()),
+                        maven_suffixed_version: Some("1.10.0-socket.4d5e6f70".into()),
+                        maven_pom_sha256: Some("b".repeat(64)),
+                        ..Default::default()
+                    },
+                }),
+                integrity: Integrity {
+                    sha256: Some("a".repeat(64)),
+                    ..Default::default()
+                },
+            },
+        }
+    }
+
+    async fn gradle_rewrite(p: &MemoryProject) -> (CandidateFiles, Rewritten) {
+        let outer = OuterAllowRemote::default;
+        let options = RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: true,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            blocking: false,
+        };
+        let candidates = vec![gradle_candidate()];
+        let view = ProjectView::Memory(p);
+        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        let done = rewrite(
+            &view,
+            read.clone(),
+            &candidates,
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            &[],
+            options,
+        )
+        .await;
+        (read, done)
+    }
+
+    /// The Gradle pass reads the script graph's scripts and every build's
+    /// lock files (nested ones included), and the planner pins them.
+    #[tokio::test]
+    async fn the_gradle_pass_reads_the_script_graph_and_its_locks() {
+        let mut p = MemoryProject::new();
+        p.insert_text(
+            "settings.gradle",
+            "include 'app'\napply from: 'gradle/more.gradle'\n",
+        );
+        p.insert_text("gradle/more.gradle", "include 'lib'\n");
+        p.insert_text("build.gradle", "");
+        p.insert_text(
+            "app/build.gradle",
+            "dependencies { implementation 'com.socketfixture:victim:1.10.0' }\n",
+        );
+        p.insert_text("lib/build.gradle", "");
+        p.insert_text(
+            "lib/gradle.lockfile",
+            "com.socketfixture:victim:1.10.0=runtimeClasspath\nempty=\n",
+        );
+        p.insert_text(
+            "samples/x/gradle.lockfile",
+            "com.socketfixture:victim:1.10.0=c\n",
+        );
+        let (read, done) = gradle_rewrite(&p).await;
+        assert!(read.files.contains_key("gradle/more.gradle"));
+        assert!(read.files.contains_key("app/build.gradle"));
+        assert!(read.files.contains_key("lib/gradle.lockfile"));
+        assert!(!read.files.contains_key("samples/x/gradle.lockfile"));
+        assert!(done.rewrite.files["lib/gradle.lockfile"].contains("1.10.0-socket.4d5e6f70"));
+        assert_eq!(
+            done.confirmed,
+            vec![(
+                "pkg:maven/com.socketfixture/victim@1.10.0".to_string(),
+                GRADLE_UUID.to_string()
+            )]
+        );
+    }
+
+    /// A refused Gradle build is never confirmed by a snippet pasted into a
+    /// build script, though it names the suffixed version and the index url.
+    #[tokio::test]
+    async fn a_pasted_gradle_snippet_is_not_confirmed() {
+        let c = gradle_candidate();
+        let ov = c.dep.registry_override.as_ref().unwrap();
+        let snippet = crate::patch::redirect::gradle::fallback_snippet(
+            &[crate::gradle::dsl::Dsl::Groovy],
+            &ov.index_url,
+            "com.socketfixture",
+            "victim",
+            "1.10.0",
+            Some("1.10.0-socket.4d5e6f70"),
+            GRADLE_UUID,
+            false,
+        );
+        let mut p = MemoryProject::new();
+        p.insert_text("settings.gradle", "");
+        p.insert_text(
+            "build.gradle",
+            format!("plugins {{ id 'com.android.application' }}\n{snippet}\n").as_str(),
+        );
+        let (_, done) = gradle_rewrite(&p).await;
+        assert!(done.rewrite.refused_gradle_uuids.contains(GRADLE_UUID));
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+    }
+
+    /// A pom.xml beside a Gradle build: both must pin the patch.
+    #[tokio::test]
+    async fn a_mixed_pom_and_gradle_build_needs_both() {
+        let pom = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>x</groupId>\n  <artifactId>y</artifactId>\n  <version>1</version>\n  <dependencies>\n    <dependency>\n      <groupId>com.socketfixture</groupId>\n      <artifactId>victim</artifactId>\n      <version>1.10.0</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        let mut p = MemoryProject::new();
+        p.insert_text("settings.gradle", "");
+        p.insert_text("pom.xml", pom);
+        let (_, done) = gradle_rewrite(&p).await;
+        assert!(done.rewrite.confirmed_gradle_uuids.contains(GRADLE_UUID));
+        assert!(done.rewrite.files["pom.xml"].contains("1.10.0-socket.4d5e6f70"));
+        assert_eq!(done.confirmed.len(), 1);
+
+        // The pom names another version: the Gradle half alone is not enough.
+        let mut p = MemoryProject::new();
+        p.insert_text("settings.gradle", "");
+        p.insert_text(
+            "pom.xml",
+            pom.replace("<version>1.10.0</version>", "<version>2.0</version>")
+                .as_str(),
+        );
+        let (_, done) = gradle_rewrite(&p).await;
+        assert!(done.rewrite.confirmed_gradle_uuids.contains(GRADLE_UUID));
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
     }
 
     const GEMFILE: &str = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n";

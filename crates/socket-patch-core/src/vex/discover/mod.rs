@@ -2990,7 +2990,18 @@ mod tests {
             ("golang", &["go.mod"]),
             ("gem", &["Gemfile.lock"]),
             ("composer", &["composer.lock"]),
-            ("maven", &["pom.xml"]),
+            (
+                "maven",
+                &[
+                    ".socket/gradle/hosted-index.tsv",
+                    ".socket/gradle/socket-patch.hosted.settings.gradle",
+                    ".socket/vendor/gradle-index.tsv",
+                    "buildscript-gradle.lockfile",
+                    "gradle.lockfile",
+                    "pom.xml",
+                    "settings-gradle.lockfile",
+                ],
+            ),
             ("nuget", &["NuGet.Config", "NuGet.config", "nuget.config"]),
             ("deno", &[]),
         ];
