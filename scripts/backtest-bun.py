@@ -161,16 +161,28 @@ def save(path, data):
 # the patch API (e.g. "API request failed with status 503: upstream connect
 # error or disconnect/reset before headers").
 CLI_TRANSPORT_FAILURE = re.compile(r'error sending request for url \(|API request failed with status 5\d\d\b')
+# bun's own report of a failed fetch (e.g. the hosted tarball from
+# patch.socket.dev): `error: ConnectionRefused downloading tarball <spec>`,
+# or `error: GET <url> - 503` for a server error.
+BUN_TRANSPORT_FAILURE = re.compile(
+    r'^error: (?:Connection\w+|FailedToOpenSocket|Timeout|TLSHandshakeTimeout) downloading '
+    r'|^error: GET \S+ - 5\d\d\b', re.M)
+
+
+def bun_transport_failures(output):
+    """The lines of a bun install's output that report a transport failure."""
+    return [line for line in output.splitlines() if BUN_TRANSPORT_FAILURE.match(line)]
 
 
 def has_transport_failure(value):
     """Only explicit request transport errors (a request error or a patch API
-    5xx) qualify for a fresh-cell retry."""
+    5xx, from the CLI or from bun's fetch) qualify for a fresh-cell retry."""
     if isinstance(value, dict):
         return any(has_transport_failure(item) for item in value.values())
     if isinstance(value, list):
         return any(has_transport_failure(item) for item in value)
-    return isinstance(value, str) and bool(CLI_TRANSPORT_FAILURE.search(value))
+    return isinstance(value, str) and bool(CLI_TRANSPORT_FAILURE.search(value)
+                                           or BUN_TRANSPORT_FAILURE.search(value))
 
 
 def retry_network_cell(run_case, job, root, attempts=3):
@@ -1093,9 +1105,11 @@ def main():
                 # Manifest-less VEX on a fresh checkout of the committed state.
                 checkout = manifestless_checkout(project, case / 'vex-checkout')
                 vex_flags = ['--frozen-lockfile', *(['--production'] if shape == 'production' else [])]
-                code, _ = run([bun, 'install', '--ignore-scripts', *vex_flags], checkout,
-                              env_for(bun, 'cache-vex'), case / 'vex-install.log', False)
+                code, output = run([bun, 'install', '--ignore-scripts', *vex_flags], checkout,
+                                   env_for(bun, 'cache-vex'), case / 'vex-install.log', False)
                 checks['vexCheckoutPatchedBytes'] = code == 0 and oracle(checkout, record, 'after')[0]
+                # Kept so a fetch failure here qualifies the cell for a retry.
+                row['vexInstallTransport'] = bun_transport_failures(output)
                 marker = 'redirected' if main_mode == 'hosted' else 'vendored'
                 vulns = {vid: list(v.get('cves', []))
                          for vid, v in (record.get('vulnerabilities') or {}).items()}
@@ -1113,8 +1127,12 @@ def main():
                                        checkout, env, case / f'vex-{label}.log', False)
                     envelope = parse_envelope(output)
                     doc = load_json(out)
+                    # `warnings` carries a record fetch's transport error
+                    # ("Could not fetch patch <uuid>: ...") so it can
+                    # qualify the cell for a retry.
                     vex_row[label] = dict(exit=code, skip=vex_skip_reason(envelope, PURL),
-                                          attested=vex_attested(doc, PURL, record['uuid'], marker, vulns))
+                                          attested=vex_attested(doc, PURL, record['uuid'], marker, vulns),
+                                          warnings=[w.get('detail') for w in envelope.get('warnings') or []])
                     return code, envelope, doc
 
                 code, _, doc = vex('manifestDeleted')
