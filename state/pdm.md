@@ -1,21 +1,23 @@
 [agent] Progress ledger for the scheduled PDM bug-hunt routine (label pm:pdm).
 
-Last run: 2026-10-01 21:18Z on main `61cfb9b` (latest tag v4.0.0). Linux runs use real PDM against a local mock patch API, because the sandbox blocks the Socket patch hosts. macOS and Windows runs use probe branches.
+Last run: 2026-10-02 03:34Z on main `61cfb9b` (latest tag v4.0.0; PR #522 head `e5ab4b5` also tested). Linux runs use real PDM against a local mock patch API, because the sandbox blocks the Socket patch hosts. macOS and Windows runs use probe branches.
 
 ## Coverage matrix
 | PDM | lock_version | agent (Linux / macOS / Windows) | hosted (Linux) | vendored (Linux) |
 | --- | --- | --- | --- | --- |
 | 1.4.5 | 2 | untested | pass on v5 (`__pypackages__` sync, legacy `[metadata.files]`, rollback byte-exact); post-rollback install fail #477 | untested |
-| 2.0.3 | 4.0 | fail #332 w/ install.cache symlink / untested / untested | refused (documented) | refused (documented) |
+| 2.0.3 | 4.0 | fail #332 w/ install.cache symlink; fail #502 (`.pdm.toml` `python.path`) / untested / untested | refused (documented) | refused (documented) |
 | 2.8.2 | 4.3 | fail #332 w/ install.cache symlink (all 3 OS) | pass (stale-install warning) | untested |
 | 2.10.4 | 4.4 | fail #332 w/ install.cache symlink; pth fails closed | pass (stale-install warning) | untested |
 | 2.11.2 | 4.4.1 | fail #332 w/ install.cache symlink | untested | untested |
-| 2.12.4 | 4.4.1 | fail #332 w/ install.cache symlink (all 3 OS; re-confirmed on v5 Linux); hardlink pass; fail #502 (`venv.in_project=false`) | pass (v5: #331/#382 fixed); fail #413 (private index static_urls); post-rollback install fail #477 | pass on v5 (warm sync patched, vex); post-rollback install fail #477 |
+| 2.12.4 | 4.4.1 | fail #332 w/ install.cache symlink (all 3 OS; re-confirmed on v5 Linux); hardlink pass; fail #502 (`venv.in_project=false`) | pass (v5: #331/#382 fixed; dev/optional groups, relocks, `pdm add` repair); fail #528 (PEP 582 stale warning + VEX); fail #413 (private index static_urls); post-rollback install fail #477 | pass on v5 (warm sync patched, vex); post-rollback install fail #477 |
 | 2.15.4 | 4.4.1 | pass (all 3 OS, symlink + hardlink) | untested | untested |
 | 2.20.1 | 4.5.0 | pass | pass (v5: #331/#382 fixed); fail #413 | pass (v4) |
 | 2.26.9 | 4.5.0 | pass (symlink/hardlink/pth) | pass on v4; untested on v5 | untested |
-| 2.29.2 | 4.5.1 | pass (all 3 OS, in-project `.venv`); fail #502 Linux (`venv.in_project=false` / `pdm use <venv>`: real env skipped, stray `.venv` or PATH python patched) | pass on v5 (lock-only scan, sync, manifest-less rollback byte-exact, VEX); multi-target fork refused (documented); fail #413 (re-confirmed `61cfb9b`); stale warning + VEX with out-of-tree env fail #502; post-rollback install fail #477 | pass on v5 (warm/fresh/frozen, lock --check, idempotent, vex, rollback byte-exact; private index + `static_urls` rollback byte-exact; nested `services/*` project; agent→vendored takeover); post-rollback / `remove` install fail #477 |
-| 0.12, 1.0, 1.8 – 1.15 | 2 / 3.1 | untested | untested | untested |
+| 2.29.2 | 4.5.1 | pass (all 3 OS, in-project `.venv`); fail #502 Linux (`venv.in_project=false` / `pdm use <venv>`: real env skipped, stray `.venv` or PATH python patched) | fail #528 (PEP 582 `__pypackages__`: no stale warning, VEX attests); pass on v5 (dev/optional groups, `update --update-all/--update-reuse/--unconstrained`, `lock --refresh` keeps patch, lock-only scan, sync, manifest-less rollback byte-exact, VEX); multi-target fork refused (documented); fail #413 (re-confirmed `61cfb9b`); stale warning + VEX with out-of-tree env fail #502; post-rollback install fail #477 | pass on v5 (warm/fresh/frozen, lock --check, idempotent, vex, rollback byte-exact; private index + `static_urls` rollback byte-exact; nested `services/*` project; agent→vendored takeover); post-rollback / `remove` install fail #477 |
+| 1.15.5 | 3.1 | fail #502 (`.pdm.toml` `python.path` external venv) | refused (documented) | refused (documented) |
+| 2.15.4, 2.20.1 | 4.4.1 / 4.5.0 | — | `pdm add` → uninstallable lock (PDM reuse, #331); re-scan repairs (pass) | `pdm add` → rollback fails closed; `pdm lock` → re-scan → rollback (pass) |
+| 0.12, 1.0, 1.8 – 1.14 | 2 / 3.1 | untested | untested | untested |
 
 Modes × macOS/Windows for hosted and vendored: untested by this routine (the repo's pdm-compatibility.yml covers them).
 
@@ -23,27 +25,30 @@ Modes × macOS/Windows for hosted and vendored: untested by this routine (the re
 | PDM | global location | scan -g report (Linux) | apply / rollback / vex -g (Linux) | macOS / Windows |
 | --- | --- | --- | --- | --- |
 | 2.29.2 | system interpreter (default) | pass | pass (apply, idempotent, vex, rollback byte-exact) | untested |
-| 2.29.2 | `pdm use -g` → `global-project/.venv` | fail #451 | pass via `--global-prefix` (incl. space/unicode path, install.cache symlink per-file) | untested |
-| 2.29.2 | PDM-managed `cpython@3.12` | fail #451 | untested | untested |
+| 2.29.2 | `pdm use -g` → `global-project/.venv` | fail #451 (pass on PR #522) | pass via `--global-prefix` (incl. space/unicode path, install.cache symlink per-file) | untested |
+| 2.29.2 | PDM-managed `cpython@3.12` | fail #451 (pass on PR #522, apply + rollback) | untested |
+| 2.29.2 / 2.12.4 | `venv.in_project=false` → `<data>/pdm/venvs/global-project-*` | fail #451 (pass on PR #522, apply + rollback) | untested |
+| any | same release also in an earlier global env (system / pipx) | — | only the first copy patched (#501, generic) | untested |
 | 2.12.4 | system interpreter (default) | pass | pass without install.cache; **fail #332** with install.cache symlink (writes PDM cache) | untested |
-| 2.12.4 | `pdm use -g <pdm python>` (no venv) | fail #451 | untested | untested |
+| 2.12.4 | `pdm use -g <pdm python>` (no venv) | fail #451 | untested |
+| 2.12.4 | `global-project/.venv` | fail #451 (pass on PR #522) | — | untested |
 | any | unwritable prefix (non-root) | — | exit 1, file untouched (pass); `scan --json` drops the reason (#424) | untested |
 | 0.12 – 2.0.3 | — | untested | untested | untested |
 
 `-g --mode hosted` and `--global-prefix --mode hosted` refuse with exit 2 (pass). `SOCKET_GLOBAL=1` matches `-g` (pass). `--global-prefix <site-packages>` finds both #451 locations (pass).
 
 ## Backlog
-1. #502 on PDM 1.4.5 (`.pdm.toml` `python.path`, PEP 582 default) and 2.0.3; macOS / Windows venv dirs.
-2. **Maintainer request (global `-g`), still open:** PDM 1.4.5 / 2.0.3 global; `venv.in_project=false` global venv (`<data>/pdm/venvs/global-project-*`, overlaps #451/#502); PDM-managed interpreter apply via `--global-prefix`; macOS / Windows.
-3. Hosted `pdm update --unconstrained` / `lock --update-all`; groups via `pdm sync -G` / `--prod` after hosted and vendored.
-4. Non-static private index with different bytes (the hash variant of #413); PDM 1.x `feature.install_cache` with agent mode; `rollback --preserve-state`.
+1. #528 on PDM 1.4.5 / 1.15.5 (PEP 582 default) and agent `-g` with PEP 582.
+2. Once PR #522 merges: re-run the `-g` matrix on main; PDM 1.4.5 / 2.0.3 global projects; macOS / Windows global dirs.
+3. Hash variant of #413 (private index serving different bytes); `rollback --preserve-state`; PDM 1.x `feature.install_cache` with agent mode.
+4. CRLF / BOM `pdm.lock` hosted + vendored on 2.12 / 2.29; concurrent `scan` runs (`--lock-timeout`).
 5. macOS / Windows probes, once probe-branch deletion works (`git push --delete` fails through the git proxy; the stale `bughunt/pdm/20260930-cache-symlink` still needs a maintainer to delete it).
-6. Done: vendored private index + `static_urls` (pass), agent → vendored takeover (pass), `remove <purl>` (#477).
+6. Done: groups (`-G` dev/optional, `--prod`), relocks (`update --unconstrained/--update-all/--update-reuse`, `lock --refresh`), vendored relocks, `pdm add` after hosted/vendored on 2.12–2.29, #502 on 1.15.5 / 2.0.3.
 
 ## Known non-bugs
 - lock_version absent / 3.1 / 4.0–4.2 refused; 2.8.0 accepted-but-crashes (documented).
 - `__pypackages__` (PEP 582) not crawled; agent mode falls through to the PATH interpreter (documented). Hosted mode installs into `__pypackages__` fine.
-- A plain relock (`pdm lock`, `--refresh`, `pdm update <pkg>`) drops the hosted redirect (documented; re-scan). Rollback still works when the package stays at the same version.
+- A plain relock (`pdm lock`, `pdm update <pkg>`) drops the hosted / vendored patch (documented; re-scan). Measured: `pdm lock --refresh` actually **keeps** it on 2.12.4 and 2.29.2 (the doc's claim is conservative drift, not a bug). Rollback still works when the package stays at the same version.
 - PDM < 2.11 keeps an already-installed same-version package after a hosted rewrite (`redirect_pdm_stale_install_risk`, documented).
 - Vendored refuses lock-only checkouts (`vendor_fetch_unverifiable`), by design.
 - Hosted never takes over a vendored `path` (`redirect_pdm_refused`), by design (hosted-direction takeover is warn-only). Hosted→vendored for PyPI fails closed with `pypi_pdm_source_already_exists` (the same for uv/poetry): run `rollback` first.
@@ -62,3 +67,7 @@ Modes × macOS/Windows for hosted and vendored: untested by this routine (the re
 - From a monorepo root, `scan 'services/*'` writes per-project `.socket/`, but `rollback` from the root reports `Manifest not found` (use `--cwd services/api`). That's generic, not PDM-specific; left to maintainers.
 - After an agent → vendored takeover, `.socket/manifest.json` stays as `{"patches": {}}` (cosmetic).
 - Test-harness note: PDM's http:// downloads from a 127.0.0.1 mock get a 405 from the agent proxy unless `HTTPS_PROXY` is unset (sandbox artifact, not a bug).
+- PDM 2.12 – 2.20 `pdm add <other>` after hosted/vendored keeps the patched hash but drops the `url`/`path` (an uninstallable lock, PDM reuse behaviour, known from #331). Hosted re-scan repairs it. Vendored re-scan refuses (`pypi_pdm_source_already_exists`, "run `pdm lock`") and rollback fails closed (drift); the `pdm lock` → re-scan → rollback path works. 2.29.2 keeps the source.
+- `pdm sync --prod --clean` leaves dev/optional-only packages installed: identical without socket-patch (PDM behaviour).
+- The hosted stale-install warning mentions "Poetry before 1.4" on PDM projects (generic text, cosmetic).
+- Test-harness note: VEX resolves the hosted patch uuid from the URL's second uuid segment, so a mock `view` must answer for it. Don't `pkill -f mock`, which kills the calling shell.
