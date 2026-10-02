@@ -282,28 +282,8 @@ pub async fn vendor_maven(
     force: bool,
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
-    for ancestor in project_root.ancestors().skip(1) {
-        let reader = super::jvm::apply::ProjectReader::new(ancestor);
-        let rel = project_root
-            .join("pom.xml")
-            .strip_prefix(ancestor)
-            .ok()
-            .map(|p| p.to_string_lossy().replace('\\', "/"));
-        if rel
-            .as_ref()
-            .is_some_and(|rel| super::jvm::maven_reactor::contains_module(&|p| reader.read(p), rel))
-        {
-            return refused(
-                "vendor_jvm_shape_unsupported",
-                format!(
-                    "reason: not_build_root: run vendor from reactor root {}",
-                    ancestor.display()
-                ),
-            );
-        }
-        if ancestor.join(".git").exists() {
-            break;
-        }
+    if let Some(detail) = not_build_root(project_root) {
+        return refused("vendor_jvm_shape_unsupported", detail);
     }
     if let Some(shape) = jvm_shape(project_root).await {
         return vendor_maven_jvm(
@@ -674,22 +654,188 @@ pub async fn revert_maven_opts(
 
 // ── v5 JVM backend (reactors, Gradle) ─────────────────────────────────
 
-/// Route reactors and Gradle builds to the JVM backend.
+/// Route reactors, Gradle builds and mixed roots to the JVM backend.
 async fn jvm_shape(project_root: &Path) -> Option<super::jvm::Shape> {
     let reader = super::jvm::apply::ProjectReader::new(project_root);
     let shape = super::jvm::detect(&|rel: &str| reader.read(rel));
     (shape != super::jvm::Shape::Other).then_some(shape)
 }
 
-/// The committed tree bytes for `record` (jar, upstream pom, module) when
-/// the jar's patched members hash to the record's `afterHash`es: a re-run
-/// then needs no jar source at all (the in-sync hot path).
+/// The `not_build_root` refusal detail when `project_root` is a module of a
+/// Maven reactor or a project of a Gradle build rooted above it: vendoring
+/// there would wire a build nobody runs and leave the real one unpatched
+/// (#428). Ancestors are searched up to the enclosing git checkout.
+pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
+    let own_settings = ["settings.gradle", "settings.gradle.kts"]
+        .iter()
+        .any(|f| project_root.join(f).is_file());
+    let own_build = ["build.gradle", "build.gradle.kts"]
+        .iter()
+        .any(|f| project_root.join(f).is_file());
+    for ancestor in project_root.ancestors().skip(1) {
+        let reader = super::jvm::apply::ProjectReader::new(ancestor);
+        let rel = project_root
+            .strip_prefix(ancestor)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"));
+        let Some(rel) = rel else { break };
+        if super::jvm::maven_reactor::contains_module(
+            &|p| reader.read(p),
+            &format!("{rel}/pom.xml"),
+        ) {
+            return Some(format!(
+                "reason: not_build_root: run vendor from reactor root {}",
+                ancestor.display()
+            ));
+        }
+        let read_text = |p: &str| crate::gradle::dsl::decode(&reader.read(p)?);
+        // Gradle reads the Groovy settings first.
+        let settings = ["settings.gradle", "settings.gradle.kts"]
+            .into_iter()
+            .find(|f| reader.read(f).is_some());
+        if let Some(settings) = settings {
+            let owner = crate::gradle::graph::subproject_owner(&read_text, settings, &rel);
+            // A Gradle project with no settings of its own is configured
+            // by the nearest ancestor settings, whatever it includes.
+            if owner.is_some() || (own_build && !own_settings) {
+                return Some(format!(
+                    "reason: not_build_root: run vendor from Gradle root {}",
+                    ancestor.display()
+                ));
+            }
+        }
+        if ancestor.join(".git").exists() {
+            break;
+        }
+    }
+    None
+}
+
+/// Where an upstream file of a vendored GAV is looked for locally: the
+/// crawler's version directory first (read directly), then every copy
+/// [`locate_artifact`] finds over the cache that directory belongs to and
+/// every local JVM cache of the machine.
+///
+/// [`locate_artifact`]: crate::crawlers::jvm_cache::locate_artifact
+pub(super) struct LocalSources {
+    installed_dir: Option<PathBuf>,
+    roots: Vec<crate::crawlers::jvm_cache::JvmCacheRoot>,
+}
+
+impl LocalSources {
+    /// No local copy at all (repair downloads and verifies everything).
+    pub(super) fn none() -> Self {
+        Self {
+            installed_dir: None,
+            roots: Vec::new(),
+        }
+    }
+
+    /// The crawler's `installed_dir` for `group_id`, its cache root and
+    /// every local cache of the machine (see [`all_local_roots`]).
+    ///
+    /// [`all_local_roots`]: crate::crawlers::jvm_cache::all_local_roots
+    fn new(project_root: &Path, installed_dir: &Path, group_id: &str) -> Self {
+        use crate::crawlers::jvm_cache::{all_local_roots, JvmCacheLayout, JvmCacheRoot};
+        let mut roots = Vec::new();
+        if crate::crawlers::gradle_cache::is_gradle_version_dir(installed_dir) {
+            if let Some(root) = installed_dir.ancestors().nth(3) {
+                roots.push(JvmCacheRoot::new(
+                    root.to_path_buf(),
+                    JvmCacheLayout::GradleModules2,
+                ));
+            }
+        } else if let Some(root) = installed_dir
+            .ancestors()
+            .nth(group_id.split('.').count() + 2)
+        {
+            roots.push(JvmCacheRoot::new(
+                root.to_path_buf(),
+                JvmCacheLayout::Maven2,
+            ));
+        }
+        for root in all_local_roots(project_root) {
+            if !roots.iter().any(|r| r.path == root.path) {
+                roots.push(root);
+            }
+        }
+        Self {
+            installed_dir: Some(installed_dir.to_path_buf()),
+            roots,
+        }
+    }
+
+    /// The first local copy of `<a>-<v>[-<classifier>].<ext>`. A Gradle
+    /// copy must hash to its hash directory, an m2 copy with a `.sha1`
+    /// sidecar must match it; with `authenticated`, an m2 copy without a
+    /// sidecar does not count either.
+    async fn find(
+        &self,
+        gav: &crate::crawlers::jvm_cache::Gav,
+        classifier: Option<&str>,
+        ext: &str,
+        authenticated: bool,
+    ) -> Result<Option<Vec<u8>>, String> {
+        use crate::crawlers::jvm_cache::{locate_artifact, JvmCacheLayout};
+        let (_, a, v) = gav;
+        let leaf = match classifier {
+            Some(c) => format!("{a}-{v}-{c}.{ext}"),
+            None => format!("{a}-{v}.{ext}"),
+        };
+        let mut candidates: Vec<(PathBuf, JvmCacheLayout)> = Vec::new();
+        if let Some(dir) = &self.installed_dir {
+            candidates.push((dir.join(&leaf), JvmCacheLayout::Maven2));
+        }
+        for root in &self.roots {
+            for path in locate_artifact(root, gav, classifier, ext) {
+                if !candidates.iter().any(|(p, _)| *p == path) {
+                    candidates.push((path, root.layout));
+                }
+            }
+        }
+        for (path, layout) in candidates {
+            let bytes = match read_regular_to_bytes(&path).await {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("unreadable {}: {e}", path.display())),
+            };
+            let hash_dir = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str())
+                .filter(|n| crate::crawlers::gradle_cache::is_hash_dir_name(n));
+            let trusted = match (layout, hash_dir) {
+                (JvmCacheLayout::GradleModules2, Some(dir)) => {
+                    crate::crawlers::gradle_cache::pristine(dir, &bytes)
+                }
+                (JvmCacheLayout::GradleModules2, None) => false,
+                _ => {
+                    let sidecar = path.with_file_name(format!("{leaf}.sha1"));
+                    match read_regular_to_string(&sidecar).await {
+                        Ok(text) => sha1_sidecar_matches(&bytes, &text),
+                        Err(_) => !authenticated,
+                    }
+                }
+            };
+            if trusted {
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// The committed tree bytes for `record` (jar, upstream pom, module, and
+/// the classifier artifacts) when the jar's patched members hash to the
+/// record's `afterHash`es: a re-run then needs no jar source at all (the
+/// in-sync hot path). A mixed root needs both trees in sync.
 async fn jvm_committed_patch(
     shape: super::jvm::Shape,
     purl: &str,
     project_root: &Path,
     record: &PatchRecord,
-) -> Option<super::jvm::CommittedTree> {
+) -> Option<(super::jvm::CommittedTree, Vec<super::jvm::ExtraArtifact>)> {
+    use super::jvm::Shape;
     let (g, a, v) = parse_maven_purl(purl)?;
     let coords = super::jvm::Coords {
         group_id: &g,
@@ -699,48 +845,61 @@ async fn jvm_committed_patch(
     };
     let reader = super::jvm::apply::ProjectReader::new(project_root);
     let read = |rel: &str| reader.read(rel);
-    let dir = match shape {
-        super::jvm::Shape::MavenReactor => super::jvm::maven_reactor::tree_dir(&coords),
-        super::jvm::Shape::Gradle => super::jvm::gradle::tree_dir(&coords),
-        super::jvm::Shape::Other => return None,
+    let trees: Vec<(String, String)> = match shape {
+        Shape::MavenReactor => vec![(
+            super::jvm::maven_reactor::tree_dir(&coords),
+            coords.suffixed_version(),
+        )],
+        Shape::Gradle => vec![(super::jvm::gradle::tree_dir(&coords), v.to_string())],
+        Shape::Mixed => vec![
+            (
+                super::jvm::maven_reactor::tree_dir(&coords),
+                coords.suffixed_version(),
+            ),
+            (super::jvm::gradle::tree_dir(&coords), v.to_string()),
+        ],
+        Shape::Other => return None,
     };
-    let marker: serde_json::Value =
-        serde_json::from_slice(&read(&format!("{dir}/socket-patch.vendor.json"))?).ok()?;
-    if marker.get("uuid")?.as_str()? != record.uuid {
-        return None;
-    }
-    let files = marker.get("files")?.as_object()?;
-    let tree_version = match shape {
-        super::jvm::Shape::MavenReactor => coords.suffixed_version(),
-        _ => v.to_string(),
-    };
-    for ext in ["jar", "pom"] {
-        files.get(&format!("{a}-{tree_version}.{ext}"))?;
-    }
-    for (name, file) in files {
-        if name.contains('/') || name.contains('\\') || name == ".." {
+    for (dir, tree_version) in &trees {
+        let marker: serde_json::Value =
+            serde_json::from_slice(&read(&format!("{dir}/socket-patch.vendor.json"))?).ok()?;
+        if marker.get("uuid")?.as_str()? != record.uuid {
             return None;
         }
-        let bytes = read(&format!("{dir}/{name}"))?;
-        if file.get("sha256")?.as_str()? != super::jvm::sha256_hex(&bytes) {
-            return None;
+        let files = marker.get("files")?.as_object()?;
+        for ext in ["jar", "pom"] {
+            files.get(&format!("{a}-{tree_version}.{ext}"))?;
+        }
+        for (name, file) in files {
+            if name.contains('/') || name.contains('\\') || name == ".." {
+                return None;
+            }
+            let bytes = read(&format!("{dir}/{name}"))?;
+            if file.get("sha256")?.as_str()? != super::jvm::sha256_hex(&bytes) {
+                return None;
+            }
         }
     }
-    let committed = match shape {
-        super::jvm::Shape::MavenReactor => {
-            super::jvm::maven_reactor::committed(&read, &coords).map(|(jar, pom)| (jar, pom, None))
-        }
-        super::jvm::Shape::Gradle => super::jvm::gradle::committed(&read, &coords),
-        super::jvm::Shape::Other => None,
-    }?;
+    let (committed, extras) = match shape {
+        Shape::MavenReactor => (
+            super::jvm::maven_reactor::committed(&read, &coords)
+                .map(|(jar, pom)| (jar, pom, None))?,
+            Vec::new(),
+        ),
+        _ => (
+            super::jvm::gradle::committed(&read, &coords)?,
+            super::jvm::gradle::committed_extras(&read, &coords)?,
+        ),
+    };
     (!record.files.is_empty() && zip_bytes_match_after_hashes(&committed.0, &record.files))
-        .then_some(committed)
+        .then_some((committed, extras))
 }
 
-/// Vendor into a multi-module reactor or a Gradle build through the
-/// [`super::jvm`] backend. The jar and pom come from the committed
-/// tree when it already holds this patch, otherwise from the service and
-/// authenticated upstream metadata; nothing is written for a refused plan.
+/// Vendor into a multi-module reactor, a Gradle build or a mixed root
+/// through the [`super::jvm`] backend. The jar and pom come from the
+/// committed tree when it already holds this patch, otherwise from the
+/// service and authenticated upstream metadata; nothing is written for a
+/// refused plan.
 #[allow(clippy::too_many_arguments)]
 async fn vendor_maven_jvm(
     shape: super::jvm::Shape,
@@ -753,6 +912,7 @@ async fn vendor_maven_jvm(
     _force: bool,
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
+    use super::jvm::Shape;
     let Some((group_id, artifact_id, version)) = parse_maven_purl(purl) else {
         return refused("unsafe_coordinates", format!("not a maven purl: {purl}"));
     };
@@ -777,6 +937,7 @@ async fn vendor_maven_jvm(
         Ok(state) => Some(state),
         Err(e) => return refused("vendor_state_unreadable", e.to_string()),
     };
+    let gradle = matches!(shape, Shape::Gradle | Shape::Mixed);
     let display_path = project_root.join(".socket/vendor");
     if record.files.is_empty() {
         let reader = super::jvm::apply::ProjectReader::new(project_root);
@@ -789,16 +950,25 @@ async fn vendor_maven_jvm(
             jar: &[],
             upstream_pom: probe_pom.as_bytes(),
             upstream_module: None,
+            extra_artifacts: &[],
         };
-        let plan = super::jvm::plan(shape, &|rel| reader.read(rel), &patch);
+        let plan = super::jvm::plan(
+            shape,
+            &|rel| reader.read(rel),
+            &|dir| reader.list(dir),
+            &patch,
+        );
         if let Some(rel) = reader.escaped() {
             return refused(
                 "vendor_jvm_shape_unsupported",
                 super::jvm::apply::outside_root_detail(&rel),
             );
         }
+        // A declared classifier is sourced only for a real patch.
         if let Err(e) = plan {
-            return refused(e.code, e.detail);
+            if !e.detail.starts_with("reason: classifier_unavailable:") {
+                return refused(e.code, e.detail);
+            }
         }
         return done(
             synthesized_result(purl, &display_path, Vec::new(), true, None),
@@ -807,14 +977,17 @@ async fn vendor_maven_jvm(
         );
     }
 
+    let local = LocalSources::new(project_root, installed_dir, &group_id);
+    let gav = (group_id.clone(), artifact_id.clone(), version.clone());
     let mut warnings: Vec<VendorWarning> = Vec::new();
     let committed = jvm_committed_patch(shape, purl, project_root, record).await;
     let was_committed = committed.is_some();
-    let (jar_bytes, mut pom_bytes, mut module_bytes, mut result) = match committed {
-        Some((jar, pom, module)) => (
+    let (jar_bytes, mut pom_bytes, mut module_bytes, mut extras, mut result) = match committed {
+        Some(((jar, pom, module), extras)) => (
             jar,
             pom,
             module,
+            Some(extras),
             already_patched_result(purl, &display_path, &record.files),
         ),
         None => {
@@ -831,16 +1004,7 @@ async fn vendor_maven_jvm(
             if !result.success {
                 return done(result, None, warnings);
             }
-            let pom = match acquire_jvm_metadata(
-                installed_dir,
-                &group_id,
-                &artifact_id,
-                &version,
-                "pom",
-                service,
-            )
-            .await
-            {
+            let pom = match acquire_jvm_artifact(&local, &gav, None, "pom", service).await {
                 Ok(bytes) => bytes,
                 Err(detail) => {
                     return refused(
@@ -849,65 +1013,95 @@ async fn vendor_maven_jvm(
                     )
                 }
             };
-            let module = read_regular_to_bytes(
-                &installed_dir.join(format!("{artifact_id}-{version}.module")),
-            )
-            .await
-            .ok();
-            (jar, pom, module, result)
+            let module = local.find(&gav, None, "module", false).await.ok().flatten();
+            (jar, pom, module, None, result)
         }
     };
 
     let online = service.is_some_and(|s| !s.offline);
     if online && was_committed {
-        let upstream = match acquire_jvm_metadata(
-            installed_dir,
-            &group_id,
-            &artifact_id,
-            &version,
-            "jar",
-            service,
-        )
-        .await
-        {
+        let upstream = match acquire_jvm_artifact(&local, &gav, None, "jar", service).await {
             Ok(bytes) => bytes,
             Err(e) => return refused("vendor_jvm_upstream_unavailable", e),
         };
         if let Err(e) = verify_unpatched_jar_members(&upstream, &jar_bytes, record) {
             return refused("vendor_prebuilt_integrity_mismatch", e);
         }
-        pom_bytes = match acquire_jvm_metadata(
-            installed_dir,
-            &group_id,
-            &artifact_id,
-            &version,
-            "pom",
-            service,
-        )
-        .await
-        {
+        pom_bytes = match acquire_jvm_artifact(&local, &gav, None, "pom", service).await {
             Ok(bytes) => bytes,
             Err(e) => return refused("vendor_jvm_upstream_unavailable", e),
         };
     }
-    if shape == super::jvm::Shape::Gradle
+    if gradle
         && (module_bytes.is_some()
             || String::from_utf8_lossy(&pom_bytes).contains("published-with-gradle-metadata"))
         && (module_bytes.is_none() || online)
     {
-        module_bytes = match acquire_jvm_metadata(
-            installed_dir,
-            &group_id,
-            &artifact_id,
-            &version,
-            "module",
-            service,
-        )
-        .await
-        {
+        module_bytes = match acquire_jvm_artifact(&local, &gav, None, "module", service).await {
             Ok(bytes) => Some(bytes),
             Err(e) => return refused("vendor_jvm_upstream_unavailable", e),
         };
+    }
+    let reader = super::jvm::apply::ProjectReader::new(project_root);
+    let read = |rel: &str| reader.read(rel);
+    let list = |dir: &str| reader.list(dir);
+    // Classifier artifacts the tree serves beside the jar (#533): every
+    // declared classifier, and the sources jar when any copy is at hand.
+    if gradle && (extras.is_none() || online) {
+        let mut found = Vec::new();
+        let declared =
+            super::jvm::gradle::declared_classifiers(&read, &list, &group_id, &artifact_id);
+        let mut wanted: Vec<(String, bool)> = declared.into_iter().map(|c| (c, true)).collect();
+        if !wanted.iter().any(|(c, _)| c == "sources") {
+            wanted.push(("sources".to_string(), false));
+        }
+        for (classifier, required) in wanted {
+            match acquire_classifier(&local, &gav, &classifier, service).await {
+                Ok(Some(bytes)) => found.push(super::jvm::ExtraArtifact {
+                    classifier,
+                    extension: "jar".to_string(),
+                    bytes,
+                }),
+                // The planner refuses a declared one it is not handed.
+                Ok(None) => {}
+                Err(e) if required => {
+                    return refused(
+                        "vendor_jvm_upstream_unavailable",
+                        format!("reason: classifier_unavailable: {e}"),
+                    )
+                }
+                Err(_) => {}
+            }
+        }
+        if !found.iter().any(|x| x.classifier == "sources") {
+            warnings.push(VendorWarning::new(
+                "vendor_jvm_note",
+                format!(
+                    "reason: ide_sources_unavailable: {artifact_id}-{version}-sources.jar is in \
+                     no local cache{}, so IDEs attach no sources to the vendored \
+                     {group_id}:{artifact_id}:{version}",
+                    if online {
+                        " and the registry has none"
+                    } else {
+                        ""
+                    }
+                ),
+            ));
+        }
+        extras = Some(found);
+    }
+    let extras = extras.unwrap_or_default();
+    for x in &extras {
+        if let Some(member) = unpatched_member(&x.bytes, record) {
+            warnings.push(VendorWarning::new(
+                "vendor_jvm_degraded",
+                format!(
+                    "reason: classifier_unpatched_copy: {} carries an unpatched copy of {member}; \
+                     a build consuming that classifier stays unpatched",
+                    x.file_name(&artifact_id, &version)
+                ),
+            ));
+        }
     }
     let patch = super::jvm::JvmPatch {
         group_id: &group_id,
@@ -917,8 +1111,8 @@ async fn vendor_maven_jvm(
         jar: &jar_bytes,
         upstream_pom: &pom_bytes,
         upstream_module: module_bytes.as_deref(),
+        extra_artifacts: &extras,
     };
-    let reader = super::jvm::apply::ProjectReader::new(project_root);
     let prior_disabled = state.as_ref().is_some_and(|s| {
         s.entries.values().any(|e| {
             e.wiring
@@ -940,13 +1134,7 @@ async fn vendor_maven_jvm(
     {
         return refused("vendor_jvm_shape_unsupported", "reason: maven_config_changed: revert the existing Maven wiring before selecting --maven-config=none");
     }
-    let read = |rel: &str| reader.read(rel);
-    let planned = match shape {
-        super::jvm::Shape::MavenReactor => {
-            super::jvm::maven_reactor::plan_with_config(&read, &patch, config_enabled)
-        }
-        _ => super::jvm::plan(shape, &read, &patch),
-    };
+    let planned = super::jvm::plan_with_config(shape, &read, &list, &patch, config_enabled);
     if let Some(rel) = reader.escaped() {
         return refused(
             "vendor_jvm_shape_unsupported",
@@ -957,7 +1145,7 @@ async fn vendor_maven_jvm(
         Ok(plan) => plan,
         Err(refusal) => return refused(refusal.code, refusal.detail),
     };
-    if shape == super::jvm::Shape::Gradle
+    if gradle
         && reader
             .read(super::jvm::gradle::VERIFICATION_REL)
             .is_some_and(|b| super::jvm::gradle::verifies_metadata(&String::from_utf8_lossy(&b)))
@@ -993,10 +1181,6 @@ async fn vendor_maven_jvm(
                     .starts_with("reason: verification_parent_chain_unhandled:")
             });
         } else {
-            let mut repo = installed_dir.to_path_buf();
-            for _ in 0..group_id.split('.').count() + 2 {
-                repo.pop();
-            }
             let mut metadata = vec![super::jvm::gradle::MetadataArtifact {
                 group: group_id.clone(),
                 artifact: artifact_id.clone(),
@@ -1018,7 +1202,7 @@ async fn vendor_maven_jvm(
             for propagate_properties in [false, true] {
                 if let Err(e) = collect_gradle_metadata(
                     &pom_bytes,
-                    &repo,
+                    &local,
                     service,
                     &mut metadata,
                     0,
@@ -1090,6 +1274,57 @@ async fn vendor_maven_jvm(
     done(result, Some(entry), warnings)
 }
 
+/// The first patched member of `record` that the classifier jar `bytes`
+/// holds with other content than the patch's: that copy stays unpatched.
+fn unpatched_member(bytes: &[u8], record: &PatchRecord) -> Option<String> {
+    let members = super::verify::read_zip_bytes_to_map(bytes).ok()?;
+    let mut names: Vec<&String> = record.files.keys().collect();
+    names.sort();
+    names.into_iter().find_map(|name| {
+        let content = members.get(name)?;
+        let hash = crate::hash::git_sha256::compute_git_sha256_from_bytes(content);
+        (record.files[name].after_hash != hash).then(|| name.clone())
+    })
+}
+
+/// A classifier jar of `gav`: an authenticated local copy, else (online) a
+/// registry download checked against its upstream checksum. `Ok(None)` when
+/// it exists nowhere (offline: in no local cache; online: the registry
+/// does not publish it).
+async fn acquire_classifier(
+    local: &LocalSources,
+    gav: &crate::crawlers::jvm_cache::Gav,
+    classifier: &str,
+    service: Option<&VendorServiceConfig>,
+) -> Result<Option<Vec<u8>>, String> {
+    let (g, a, v) = gav;
+    let leaf = format!("{a}-{v}-{classifier}.jar");
+    let local_copy = local.find(gav, Some(classifier), "jar", true).await?;
+    let online = service.is_some_and(|s| !s.offline);
+    let bytes = match local_copy {
+        Some(bytes) => bytes,
+        None if online => {
+            let url = format!(
+                "{}/{}/{a}/{v}/{leaf}",
+                maven_registry_base(),
+                group_id_to_path(g)
+            );
+            match fetch_registry_bytes(&url, super::registry_fetch::MAX_DOWNLOAD_BYTES).await {
+                Ok(bytes) => bytes,
+                Err(e) if e.contains("HTTP 404") => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+        None => {
+            return Err(format!(
+                "{leaf} is in no local cache with a verifiable checksum and vendoring is offline"
+            ))
+        }
+    };
+    verify_jvm_upstream(&bytes, g, a, v, &format!("{classifier}.jar"), service).await?;
+    Ok(Some(bytes))
+}
+
 /// Verify upstream cache/registry bytes against checksums fetched independently over TLS.
 fn verify_unpatched_jar_members(
     upstream: &[u8],
@@ -1111,7 +1346,9 @@ fn verify_unpatched_jar_members(
     Ok(())
 }
 
-/// Check registry sidecars independently of any checksum in the local cache.
+/// Check registry sidecars independently of any checksum in the local
+/// cache. `ext` is the leaf's tail after `<a>-<v>` (`jar`, `pom`, a
+/// classifier's `tests.jar` is spelled `-tests.jar` there).
 async fn verify_jvm_upstream(
     bytes: &[u8],
     g: &str,
@@ -1124,8 +1361,13 @@ async fn verify_jvm_upstream(
         return Ok(());
     }
     use sha2::Digest;
+    // `tests.jar` is the `tests` classifier's jar.
+    let tail = match ext.split_once('.') {
+        Some((classifier, ext)) => format!("-{classifier}.{ext}"),
+        None => format!(".{ext}"),
+    };
     let url = format!(
-        "{}/{gpath}/{a}/{v}/{a}-{v}.{ext}",
+        "{}/{gpath}/{a}/{v}/{a}-{v}{tail}",
         maven_registry_base(),
         gpath = group_id_to_path(g)
     );
@@ -1142,28 +1384,33 @@ async fn verify_jvm_upstream(
         .next()
         .ok_or("upstream checksum is empty")?;
     if !expected.eq_ignore_ascii_case(&actual) {
-        return Err(format!("upstream checksum mismatch for {g}:{a}:{v}.{ext}"));
+        return Err(format!("upstream checksum mismatch for {g}:{a}:{v}{tail}"));
     }
     Ok(())
 }
 
-pub(super) async fn acquire_jvm_metadata(
-    dir: &Path,
-    g: &str,
-    a: &str,
-    v: &str,
+/// One upstream file of `gav` (`classifier`, `ext`): a local copy (see
+/// [`LocalSources::find`]), else a registry download when the service is
+/// online; online, the bytes are checked against the registry's checksum
+/// either way.
+pub(super) async fn acquire_jvm_artifact(
+    local: &LocalSources,
+    gav: &crate::crawlers::jvm_cache::Gav,
+    classifier: Option<&str>,
     ext: &str,
     service: Option<&VendorServiceConfig>,
 ) -> Result<Vec<u8>, String> {
-    let path = dir.join(format!("{a}-{v}.{ext}"));
-    let bytes = match read_regular_to_bytes(&path).await {
-        Ok(bytes) => bytes,
-        Err(e)
-            if e.kind() == std::io::ErrorKind::NotFound && service.is_some_and(|s| !s.offline) =>
-        {
+    let (g, a, v) = gav;
+    let leaf = match classifier {
+        Some(c) => format!("{a}-{v}-{c}.{ext}"),
+        None => format!("{a}-{v}.{ext}"),
+    };
+    let bytes = match local.find(gav, classifier, ext, false).await? {
+        Some(bytes) => bytes,
+        None if service.is_some_and(|s| !s.offline) => {
             fetch_registry_bytes(
                 &format!(
-                    "{}/{}/{a}/{v}/{a}-{v}.{ext}",
+                    "{}/{}/{a}/{v}/{leaf}",
                     maven_registry_base(),
                     group_id_to_path(g)
                 ),
@@ -1175,17 +1422,50 @@ pub(super) async fn acquire_jvm_metadata(
             )
             .await?
         }
-        Err(e) => return Err(format!("upstream {g}:{a}:{v}.{ext} unavailable: {e}")),
+        None => {
+            return Err(format!(
+                "upstream {g}:{a}:{v}{} unavailable: in no local cache",
+                &leaf[a.len() + v.len() + 1..]
+            ))
+        }
     };
-    verify_jvm_upstream(&bytes, g, a, v, ext, service).await?;
+    let tail = match classifier {
+        Some(c) => format!("{c}.{ext}"),
+        None => ext.to_string(),
+    };
+    verify_jvm_upstream(&bytes, g, a, v, &tail, service).await?;
     Ok(bytes)
+}
+
+/// [`acquire_jvm_artifact`] of a metadata file from `dir` alone (or the
+/// registry), for callers with no local caches.
+pub(super) async fn acquire_jvm_metadata(
+    dir: &Path,
+    g: &str,
+    a: &str,
+    v: &str,
+    ext: &str,
+    service: Option<&VendorServiceConfig>,
+) -> Result<Vec<u8>, String> {
+    let local = LocalSources {
+        installed_dir: Some(dir.to_path_buf()),
+        roots: Vec::new(),
+    };
+    acquire_jvm_artifact(
+        &local,
+        &(g.to_string(), a.to_string(), v.to_string()),
+        None,
+        ext,
+        service,
+    )
+    .await
 }
 
 /// Collect effective parent/BOM metadata. Descendant properties override parent
 /// import versions, but do not leak into a separately imported BOM's own model.
 async fn collect_gradle_metadata(
     bytes: &[u8],
-    repo: &Path,
+    local: &LocalSources,
     service: Option<&VendorServiceConfig>,
     out: &mut Vec<super::jvm::gradle::MetadataArtifact>,
     depth: usize,
@@ -1200,8 +1480,7 @@ async fn collect_gradle_metadata(
     let model = metadata_model(bytes, &empty, descendant, false)?;
     let mut properties = empty;
     if let Some((g, a, v)) = model.parent {
-        let path = repo.join(group_id_to_path(&g)).join(&a).join(&v);
-        let parent = acquire_jvm_metadata(&path, &g, &a, &v, "pom", service).await?;
+        let parent = acquire_upstream_metadata(local, &g, &a, &v, "pom", service).await?;
         let child_properties = model
             .properties
             .into_iter()
@@ -1215,7 +1494,7 @@ async fn collect_gradle_metadata(
             .collect();
         properties = Box::pin(collect_gradle_metadata(
             &parent,
-            repo,
+            local,
             service,
             out,
             depth + 1,
@@ -1223,7 +1502,7 @@ async fn collect_gradle_metadata(
             propagate_properties,
         ))
         .await?;
-        collect_metadata_artifacts(repo, &g, &a, &v, parent, service, out).await?;
+        collect_metadata_artifacts(local, &g, &a, &v, parent, service, out).await?;
     }
     let model = metadata_model(bytes, &properties, descendant, true)?;
     for (g, a, v) in model.imports {
@@ -1233,11 +1512,10 @@ async fn collect_gradle_metadata(
         {
             continue;
         }
-        let path = repo.join(group_id_to_path(&g)).join(&a).join(&v);
-        let bom = acquire_jvm_metadata(&path, &g, &a, &v, "pom", service).await?;
+        let bom = acquire_upstream_metadata(local, &g, &a, &v, "pom", service).await?;
         Box::pin(collect_gradle_metadata(
             &bom,
-            repo,
+            local,
             service,
             out,
             depth + 1,
@@ -1245,13 +1523,37 @@ async fn collect_gradle_metadata(
             propagate_properties,
         ))
         .await?;
-        collect_metadata_artifacts(repo, &g, &a, &v, bom, service, out).await?;
+        collect_metadata_artifacts(local, &g, &a, &v, bom, service, out).await?;
     }
     Ok(model.properties)
 }
 
+/// A parent's or BOM's metadata file: the local caches only (never the
+/// patched GAV's own directory), else the registry.
+async fn acquire_upstream_metadata(
+    local: &LocalSources,
+    g: &str,
+    a: &str,
+    v: &str,
+    ext: &str,
+    service: Option<&VendorServiceConfig>,
+) -> Result<Vec<u8>, String> {
+    let roots = LocalSources {
+        installed_dir: None,
+        roots: local.roots.clone(),
+    };
+    acquire_jvm_artifact(
+        &roots,
+        &(g.to_string(), a.to_string(), v.to_string()),
+        None,
+        ext,
+        service,
+    )
+    .await
+}
+
 async fn collect_metadata_artifacts(
-    repo: &Path,
+    local: &LocalSources,
     g: &str,
     a: &str,
     v: &str,
@@ -1266,8 +1568,7 @@ async fn collect_metadata_artifacts(
         return Ok(());
     }
     let module = if String::from_utf8_lossy(&pom).contains("published-with-gradle-metadata") {
-        let path = repo.join(group_id_to_path(g)).join(a).join(v);
-        Some(acquire_jvm_metadata(&path, g, a, v, "module", service).await?)
+        Some(acquire_upstream_metadata(local, g, a, v, "module", service).await?)
     } else {
         None
     };
@@ -4811,6 +5112,76 @@ mod tests {
             assert!(!out.success, "{out:?}");
         }
         assert!(root.join("src/Main.java").is_file());
+    }
+
+    /// #428: vendoring from a project of a Gradle build rooted above it
+    /// (a literal or relocated include, includes that cannot be read, or a
+    /// project with no settings of its own) refuses with `not_build_root`
+    /// and writes nothing; a separate build below the root does not.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn gradle_subproject_refuses_not_build_root_and_writes_nothing() {
+        for (settings, body, project, own) in [
+            (
+                "settings.gradle",
+                "include 'app'\n",
+                "app",
+                vec![("build.gradle", "plugins { id 'java' }\n")],
+            ),
+            (
+                "settings.gradle.kts",
+                "include(\":lib\")\nproject(\":lib\").projectDir = file(\"modules/lib\")\n",
+                "modules/lib",
+                vec![
+                    ("build.gradle.kts", "plugins { java }\n"),
+                    ("settings.gradle.kts", ""),
+                ],
+            ),
+            (
+                "settings.gradle",
+                "include computedName\n",
+                "app",
+                vec![("settings.gradle", ""), ("build.gradle", "")],
+            ),
+            (
+                "settings.gradle",
+                "rootProject.name = 'x'\n",
+                "tool",
+                vec![("build.gradle", "")],
+            ),
+        ] {
+            let (dir, blobs, installed, record) = fixture(None, true, true).await;
+            let root = dir.path();
+            std::fs::create_dir_all(root.join(".git")).unwrap();
+            std::fs::write(root.join(settings), body).unwrap();
+            let project = root.join(project);
+            std::fs::create_dir_all(&project).unwrap();
+            for (name, text) in &own {
+                std::fs::write(project.join(name), text).unwrap();
+            }
+            let before = crate::vendor::test_support::tree_snapshot(root);
+            let (code, detail) =
+                unwrap_refused(run_vendor(&project, &blobs, &installed, &record, false).await);
+            assert_eq!(code, "vendor_jvm_shape_unsupported", "{body}");
+            assert!(
+                detail.starts_with("reason: not_build_root: run vendor from Gradle root "),
+                "{body}: {detail}"
+            );
+            assert_eq!(
+                crate::vendor::test_support::tree_snapshot(root),
+                before,
+                "{body}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("settings.gradle"), "include 'app'\n").unwrap();
+        std::fs::create_dir_all(root.join("tools/gen")).unwrap();
+        std::fs::write(root.join("tools/gen/settings.gradle"), "").unwrap();
+        std::fs::write(root.join("tools/gen/build.gradle"), "").unwrap();
+        assert_eq!(not_build_root(&root.join("tools/gen")), None);
+        assert_eq!(not_build_root(root), None);
     }
 
     fn fixture_record() -> PatchRecord {

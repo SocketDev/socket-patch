@@ -8,16 +8,29 @@
 //! `exclusiveContent`. Each wired settings file gets one apply line, plus an
 //! in-block `pluginManagement` entry when it has settings-level `plugins{}`.
 //! An existing `gradle/verification-metadata.xml` gets the patched jar hash.
+//!
+//! The artifact-level `maven-metadata.xml` of every vendored GA is derived
+//! from the index (a range or dynamic selector lists versions from it), and
+//! classifier artifacts a build declares are served beside the jar.
+//! The settings-wiring and verification helpers are shared with the hosted
+//! planner through [`WiringTarget`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::json;
 
+use crate::gradle::dsl::{
+    self, all_blocks, is_ident, is_punct, matching_close, strings, Dsl, Tok, Token,
+};
+use crate::gradle::graph::{filter_claims_group, DeclKind, ScriptGraph, Site};
+use crate::gradle::selector::{admits, gradle_version_cmp, parse_selector, Selector};
+
 use super::super::state::{WiringAction, WiringRecord};
 use super::{
-    adopt, changes_between, finish_writes, fragment, op_of, op_str, owned_file, replace_op,
-    sha256_hex, undo_replace, Coords, FileWrite, JvmPatch, JvmPlan, JvmRefusal, JvmUnplan,
-    JvmWarning, ReadFn, OWNED_FILE_KIND, SETTINGS_FRAGMENT_KIND, VERIFICATION_FRAGMENT_KIND,
+    adopt, changes_between, finish_writes, fragment, is_ours, op_of, op_str, owned_file,
+    replace_op, sha256_hex, text_reader, undo_replace, Coords, ExtraArtifact, FileWrite, JvmPatch,
+    JvmPlan, JvmRefusal, JvmUnplan, JvmWarning, ListFn, ReadFn, DERIVED_METADATA_KIND,
+    OWNED_FILE_KIND, SETTINGS_FRAGMENT_KIND, VERIFICATION_FRAGMENT_KIND,
 };
 
 pub use super::safe_coordinates;
@@ -30,6 +43,18 @@ pub const SCRIPT_REL: &str = ".socket/gradle/socket-patch.settings.gradle";
 pub const TREE_ROOT: &str = ".socket/vendor/gradle";
 /// The tree root's `.gitattributes`, shared by every Gradle patch.
 pub const GITATTRIBUTES_REL: &str = ".socket/vendor/gradle/.gitattributes";
+/// `.socket/gradle/`'s `.gitattributes` (`* -text`): the settings scripts
+/// there stay byte-exact on a `core.autocrlf` checkout (#429). Shared with
+/// the hosted script.
+pub const SCRIPT_GITATTRIBUTES_REL: &str = ".socket/gradle/.gitattributes";
+/// `.socket/vendor/.gitattributes`: keeps the index out of EOL conversion.
+/// Merged into (and adopted) when the user already has one.
+pub const VENDOR_GITATTRIBUTES_REL: &str = ".socket/vendor/.gitattributes";
+/// The line [`VENDOR_GITATTRIBUTES_REL`] needs.
+pub const VENDOR_GITATTRIBUTES_LINE: &str = "gradle-index.tsv -text";
+/// The hosted planner's script: while it remains, the shared
+/// [`SCRIPT_GITATTRIBUTES_REL`] stays.
+const HOSTED_SCRIPT_REL: &str = ".socket/gradle/socket-patch.hosted.settings.gradle";
 /// The derived index the script reads.
 pub const INDEX_REL: &str = ".socket/vendor/gradle-index.tsv";
 pub const INDEX_HEADER: &str = "#socket-patch-gradle-index 1";
@@ -41,6 +66,46 @@ const REPO_NAME: &str = "socketPatchVendor";
 /// Upstream poms of Gradle-published modules carry this; Gradle then follows
 /// the `.module`, so vendoring the pom alone changes the graph.
 const GRADLE_METADATA_MARKER: &str = "published-with-gradle-metadata";
+/// A derived artifact-level metadata file's name.
+const METADATA_NAME: &str = "maven-metadata.xml";
+
+/// Which owned settings script a settings file's apply line names, and how
+/// its line and repositories are spelled. [`WiringTarget::vendored`] is the
+/// vendored backend's own (the defaults keep its output byte-identical);
+/// the hosted planner passes its script, repository name and a digest
+/// comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WiringTarget {
+    /// The owned script, project-relative.
+    pub script_rel: String,
+    /// The repository name of the in-block entries (`<prefix>_<hash>`); the
+    /// script skips a handler that already holds one.
+    pub repo_name_prefix: String,
+    /// What follows the apply line's path (`None`: `// socket-patch`).
+    /// [`has_apply_line`] ignores it, so a changed digest still matches.
+    pub apply_line_suffix: Option<String>,
+}
+
+impl WiringTarget {
+    pub(crate) fn vendored() -> Self {
+        Self {
+            script_rel: SCRIPT_REL.to_string(),
+            repo_name_prefix: REPO_NAME.to_string(),
+            apply_line_suffix: None,
+        }
+    }
+
+    /// Whether `name` is a repository this target's wiring declares.
+    pub(crate) fn owns_repository(&self, name: &str) -> bool {
+        name == self.repo_name_prefix || name.starts_with(&format!("{}_", self.repo_name_prefix))
+    }
+
+    fn suffix(&self) -> &str {
+        self.apply_line_suffix
+            .as_deref()
+            .unwrap_or("// socket-patch")
+    }
+}
 
 /// The tree directory of `c` (same GAV).
 pub fn tree_dir(c: &Coords<'_>) -> String {
@@ -50,6 +115,22 @@ pub fn tree_dir(c: &Coords<'_>) -> String {
         c.artifact_id,
         c.version
     )
+}
+
+/// The derived artifact-level `maven-metadata.xml` of `group:artifact`.
+pub fn derived_metadata_rel(group_id: &str, artifact_id: &str) -> String {
+    format!(
+        "{TREE_ROOT}/{}/{artifact_id}/{METADATA_NAME}",
+        group_id.replace('.', "/")
+    )
+}
+
+/// Whether `rel` is shaped like a derived `maven-metadata.xml` (a GA
+/// directory of the tree, at least a group and an artifact segment deep).
+pub(crate) fn is_derived_metadata_path(rel: &str) -> bool {
+    rel.strip_prefix(&format!("{TREE_ROOT}/"))
+        .and_then(|r| r.strip_suffix(&format!("/{METADATA_NAME}")))
+        .is_some_and(|ga| ga.split('/').count() >= 2 && ga.split('/').all(|s| !s.is_empty()))
 }
 
 /// The committed tree of `c` as `(jar, pom, module)`: the tree holds the
@@ -64,8 +145,82 @@ pub fn committed(read: ReadFn<'_>, c: &Coords<'_>) -> Option<super::CommittedTre
     ))
 }
 
+/// The classifier artifacts `c`'s committed tree serves, from its marker:
+/// every listed `<a>-<v>-<classifier>.<ext>`. `None` when a listed file is
+/// missing or the marker is unreadable.
+pub fn committed_extras(read: ReadFn<'_>, c: &Coords<'_>) -> Option<Vec<ExtraArtifact>> {
+    let dir = tree_dir(c);
+    let marker: serde_json::Value =
+        serde_json::from_slice(&read(&format!("{dir}/{MARKER_NAME}"))?).ok()?;
+    let mut out = Vec::new();
+    for name in marker.get("files")?.as_object()?.keys() {
+        let Some((classifier, extension)) = classifier_of(name, c.artifact_id, c.version) else {
+            continue;
+        };
+        out.push(ExtraArtifact {
+            classifier,
+            extension,
+            bytes: read(&format!("{dir}/{name}"))?,
+        });
+    }
+    Some(out)
+}
+
+/// `(classifier, extension)` of a tree file name `<a>-<v>-<c>.<ext>`.
+fn classifier_of(name: &str, a: &str, v: &str) -> Option<(String, String)> {
+    let rest = name.strip_prefix(&format!("{a}-{v}-"))?;
+    let (classifier, ext) = rest.rsplit_once('.')?;
+    (safe_segment(classifier) && safe_segment(ext))
+        .then(|| (classifier.to_string(), ext.to_string()))
+}
+
+/// A classifier or extension every written file accepts unescaped.
+fn safe_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
+        && !s.contains("--")
+}
+
+/// The classifiers of `group:artifact` the checkout's scripts and catalogs
+/// declare, sorted: the extra artifacts the tree must serve (#533).
+pub fn declared_classifiers(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    group_id: &str,
+    artifact_id: &str,
+) -> Vec<String> {
+    let text = text_reader(read);
+    let graph = ScriptGraph::collect(&text, list, "", &[]);
+    let mut out: Vec<String> = graph
+        .declarations_of(group_id, artifact_id)
+        .into_iter()
+        .filter(|d| d.kind == DeclKind::Classifier)
+        .filter_map(|d| d.classifier)
+        .filter(|c| safe_segment(c))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The derived `maven-metadata.xml` of `group:artifact` over the current
+/// index, for a repair that restores a deleted one.
+pub(crate) fn derived_metadata_of(
+    read: ReadFn<'_>,
+    group_id: &str,
+    artifact_id: &str,
+) -> Option<String> {
+    let index = String::from_utf8(read(INDEX_REL)?).ok()?;
+    derived_metadata(&index_rows(&index)?, group_id, artifact_id)
+}
+
 /// Plan vendoring `patch` into the Gradle build rooted at the project root.
-pub fn plan(read: ReadFn<'_>, patch: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusal> {
+pub fn plan(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    patch: &JvmPatch<'_>,
+) -> Result<JvmPlan, JvmRefusal> {
     if super::wrapper_version(read, "gradle").is_some_and(|v| v < (6, 8, 0)) {
         return Err(shape_refusal(
             "gradle_below_6_8",
@@ -90,6 +245,19 @@ pub fn plan(read: ReadFn<'_>, patch: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusa
             detail: format!("non-canonical patch uuid {:?}", patch.uuid),
         });
     }
+    if let Some(x) = patch
+        .extra_artifacts
+        .iter()
+        .find(|x| !safe_segment(&x.classifier) || !safe_segment(&x.extension))
+    {
+        return Err(JvmRefusal {
+            code: "unsafe_coordinates",
+            detail: format!(
+                "unsafe classifier artifact `{}.{}` of {g}:{a}:{v}",
+                x.classifier, x.extension
+            ),
+        });
+    }
     let pom_text = String::from_utf8_lossy(patch.upstream_pom);
     if patch.upstream_module.is_none() && pom_text.contains(GRADLE_METADATA_MARKER) {
         return Err(JvmRefusal {
@@ -112,13 +280,26 @@ pub fn plan(read: ReadFn<'_>, patch: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusa
     let mut warnings = Vec::new();
     let mut writes = Vec::new();
     let mut records = Vec::new();
+    let wiring = WiringTarget::vendored();
 
     let root = read_settings(read, "")?;
-    let root_build = read_build_script(read, "")?;
-    if let Some((rel, text)) = &root_build {
-        check_android(rel, text)?;
-        check_exclusive_content(rel, text, patch)?;
-    }
+    read_build_script(read, "")?;
+
+    // Every script Gradle evaluates that can be found statically: settings,
+    // every project's build script, buildSrc and included builds with their
+    // convention plugins, `apply from` targets and version catalogs (#461).
+    // A script that is not UTF-8 is unparseable, never decoded lossily.
+    let undecodable = std::cell::RefCell::new(Vec::new());
+    let text = |rel: &str| {
+        let bytes = read(rel)?;
+        let decoded = dsl::decode(&bytes);
+        if decoded.is_none() {
+            undecodable.borrow_mut().push(rel.to_string());
+        }
+        decoded
+    };
+    let graph = ScriptGraph::collect(&text, list, "", &[]);
+    check_graph(&graph, &undecodable.borrow(), patch, &mut warnings)?;
 
     let mut targets = vec![root];
     if let Some(bs) = read_buildsrc(read)? {
@@ -201,8 +382,8 @@ pub fn plan(read: ReadFn<'_>, patch: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusa
                 }
             }
         }
-        let line = apply_line(t.kotlin, &prefix);
-        if has_apply_line(&text, &prefix) {
+        let line = apply_line(&wiring, t.kotlin, &prefix);
+        if has_apply_line(&text, t.dsl(), &wiring, &prefix) {
             records.push(adopt(&t.rel, SETTINGS_FRAGMENT_KIND, "apply"));
         } else {
             let appended = append_line(&text, &line);
@@ -231,12 +412,18 @@ pub fn plan(read: ReadFn<'_>, patch: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusa
     let jar_name = format!("{a}-{v}.jar");
     let pom_name = format!("{a}-{v}.pom");
     let module_name = format!("{a}-{v}.module");
-    let mut files: Vec<(&str, &[u8])> =
-        vec![(&jar_name, patch.jar), (&pom_name, patch.upstream_pom)];
+    let mut files: Vec<(String, &[u8])> = vec![
+        (jar_name.clone(), patch.jar),
+        (pom_name, patch.upstream_pom),
+    ];
     if let Some(module) = patch.upstream_module {
-        files.push((&module_name, module));
+        files.push((module_name, module));
     }
-    files.sort_by(|x, y| x.0.cmp(y.0));
+    for x in patch.extra_artifacts {
+        files.push((x.file_name(a, v), &x.bytes));
+    }
+    files.sort_by(|x, y| x.0.cmp(&y.0));
+    files.dedup_by(|x, y| x.0 == y.0);
     let gav = format!("{g}:{a}:{v}");
     let mut rows = Vec::new();
     for (name, bytes) in &files {
@@ -261,10 +448,27 @@ pub fn plan(read: ReadFn<'_>, patch: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusa
     let existing_index = read(INDEX_REL);
     let index = merge_index(existing_index.as_deref(), &gav, rows)?;
     records.push(created_or_adopted(INDEX_REL, existing_index.is_some()));
+    // The artifact-level metadata a range or dynamic selector lists
+    // versions from (#511): every vendored version of the GA.
+    let metadata_rel = derived_metadata_rel(g, a);
+    let metadata = index_rows(&index)
+        .and_then(|rows| derived_metadata(&rows, g, a))
+        .expect("the merged index lists this GAV");
+    records.push(fragment(
+        &metadata_rel,
+        DERIVED_METADATA_KIND,
+        "derived",
+        WiringAction::Added,
+        None,
+        json!({ "op": "derive" }),
+    ));
+    writes.push(text_write(&metadata_rel, metadata.into_bytes()));
     writes.push(text_write(INDEX_REL, index.into_bytes()));
     records.push(created_or_adopted(SCRIPT_REL, read(SCRIPT_REL).is_some()));
     writes.push(text_write(SCRIPT_REL, SCRIPT.as_bytes().to_vec()));
     records.push(owned_file(read, GITATTRIBUTES_REL, &mut writes));
+    records.push(owned_file(read, SCRIPT_GITATTRIBUTES_REL, &mut writes));
+    records.push(vendor_gitattributes(read, &mut writes));
 
     if let Some(bytes) = read(VERIFICATION_REL) {
         let text = String::from_utf8(bytes).map_err(|_| {
@@ -344,6 +548,143 @@ pub fn plan(read: ReadFn<'_>, patch: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusa
         jar_rel: format!("{tree_dir}/{jar_name}"),
         tree_dir,
     })
+}
+
+/// The whole-graph checks: Android / KMP and a user `exclusiveContent`
+/// claiming the GA anywhere refuse, naming the file (#461); a declaration
+/// shape the tree cannot serve refuses or warns (#511, #533); build logic
+/// the graph cannot follow is degraded.
+fn check_graph(
+    graph: &ScriptGraph,
+    undecodable: &[String],
+    patch: &JvmPatch<'_>,
+    warnings: &mut Vec<JvmWarning>,
+) -> Result<(), JvmRefusal> {
+    let (g, a, v) = (patch.group_id, patch.artifact_id, patch.version);
+    if let Some((rel, id)) = graph.android_or_kmp() {
+        return Err(shape_refusal(
+            "android_or_kmp",
+            format!("{rel} uses {id}; Android and Kotlin Multiplatform builds need hosted mode"),
+        ));
+    }
+    let wiring = WiringTarget::vendored();
+    let own = |s: &String| wiring.owns_repository(s);
+    if let Some(f) = graph.exclusive_content_filters().into_iter().find(|f| {
+        // The owned scripts under .socket/ route through our own repository.
+        !f.rel.starts_with(".socket/")
+            && !f.repo_strings.iter().any(own)
+            && filter_claims_group(f, g, a)
+    }) {
+        return Err(shape_refusal(
+            "gradle_exclusive_content_conflict",
+            format!(
+                "{}:{} has an exclusiveContent rule for {g}; drop {g}:{a} from it",
+                f.rel, f.line
+            ),
+        ));
+    }
+
+    let decls = graph.declarations_of(g, a);
+    // #511: a range or dynamic selector picks from the versions every
+    // repository lists; the derived metadata lists the vendored one, so the
+    // selection is unchanged unless no selector admits it at all.
+    let mut ranged = Vec::new();
+    let mut admitted = false;
+    for d in &decls {
+        let selector = d
+            .rich
+            .as_ref()
+            .and_then(|r| r.strictly.clone().or_else(|| r.require.clone()))
+            .or_else(|| d.version.clone());
+        let Some(selector) = selector else { continue };
+        match parse_selector(&selector) {
+            sel @ (Selector::Range { .. } | Selector::Prefix(_) | Selector::Latest(_)) => {
+                admitted |= admits(&sel, v) != Some(false);
+                ranged.push(format!("{}:{} `{selector}`", d.rel, d.line));
+            }
+            sel => admitted |= admits(&sel, v) == Some(true),
+        }
+    }
+    if !ranged.is_empty() && !admitted {
+        return Err(shape_refusal(
+            "gradle_range_excludes_vendored",
+            format!(
+                "no declaration of {g}:{a} admits the vendored {v} ({}); the build resolves \
+                 another version, so vendoring {v} would patch nothing",
+                ranged.join(", ")
+            ),
+        ));
+    }
+    if !ranged.is_empty() {
+        warnings.push(note(
+            "range_declared",
+            format!(
+                "{} selects {g}:{a} by range; the vendored tree lists {v} in its \
+                 maven-metadata.xml, and a newer upstream release the range admits still wins",
+                ranged.join(", ")
+            ),
+        ));
+    }
+
+    // #533: `exclusiveContent` claims every file of the GAV, so a declared
+    // classifier the tree does not hold stops resolving.
+    let mut classifiers: Vec<String> = decls
+        .iter()
+        .filter(|d| d.kind == DeclKind::Classifier)
+        .filter_map(|d| d.classifier.clone())
+        .collect();
+    classifiers.sort();
+    classifiers.dedup();
+    for c in &classifiers {
+        if !patch
+            .extra_artifacts
+            .iter()
+            .any(|x| &x.classifier == c && x.extension == "jar")
+        {
+            return Err(JvmRefusal {
+                code: "vendor_jvm_upstream_unavailable",
+                detail: format!(
+                    "reason: classifier_unavailable: a build script declares {g}:{a}:{v}:{c}, and \
+                     {a}-{v}-{c}.jar is in no local cache and could not be downloaded; run one \
+                     online build (`./gradlew dependencies`) or vendor online"
+                ),
+            });
+        }
+    }
+    // References the graph could not follow (an included build is
+    // reported by the wiring above).
+    let unscanned: Vec<String> = undecodable
+        .iter()
+        .map(|rel| format!("{rel}: not UTF-8"))
+        .chain(
+            graph
+                .unresolved
+                .iter()
+                .filter(|u| u.site != Site::IncludeBuild)
+                .filter(|u| !u.rel.starts_with(".socket/"))
+                .map(|u| {
+                    if u.snippet.is_empty() {
+                        format!("{}: {:?}", u.rel, u.reason)
+                    } else {
+                        format!("{}:{}: {}", u.rel, u.line, u.snippet)
+                    }
+                }),
+        )
+        .collect();
+    if let Some(first) = unscanned.first() {
+        warnings.push(degraded(
+            "gradle_unscanned_build_logic",
+            format!(
+                "{first}{} could not be followed; a repository or declaration there is \
+                 unchecked",
+                match unscanned.len() {
+                    1 => String::new(),
+                    n => format!(" (and {} more)", n - 1),
+                }
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// `../` once per segment of `dir`: the script path from that build.
@@ -438,8 +779,11 @@ fn in_block_records(
 }
 
 /// Plan the revert of `c`'s wiring: its in-block entries, index
-/// rows and verification hash go now; apply lines, the script, the index
-/// and the tree `.gitattributes` once no other patch has an index row.
+/// rows and verification hash go now, and the derived `maven-metadata.xml`
+/// is recomputed from the rows left (deleted with the GA's last one);
+/// apply lines, the script, the index and the owned `.gitattributes` once
+/// no other patch has an index row. Owned text is compared line-ending
+/// blind, so a `core.autocrlf` checkout reverts clean (#429).
 pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> JvmUnplan {
     let mut drifted = Vec::new();
     let mut files: BTreeSet<String> = records
@@ -486,7 +830,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
                 continue;
             }
             if let (Some(from), Some(to)) = (op_str(w, "from"), op_str(w, "to")) {
-                if let Some(undone) = undo_replace(t, from, to) {
+                if let Some(undone) = undo_replace_eol(t, from, to) {
                     *t = undone;
                 }
             }
@@ -500,7 +844,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
                 Some("in_block_section" | "buildscript_section")
             ) {
                 if let (Some(from), Some(to)) = (op_str(w, "from"), op_str(w, "to")) {
-                    if let Some(undone) = undo_replace(t, from, to) {
+                    if let Some(undone) = undo_replace_eol(t, from, to) {
                         *t = undone;
                     }
                 }
@@ -557,9 +901,38 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
         };
     };
     let others: Vec<String> = rows
-        .into_iter()
+        .iter()
         .filter(|r| r.split('\t').nth(3) != Some(c.uuid))
+        .cloned()
         .collect();
+
+    // The derived metadata follows the rows: recomputed, or gone with the
+    // GA's last one. A file that is no longer what the rows derive was
+    // edited, and is left alone.
+    if records.iter().any(|w| w.kind == DERIVED_METADATA_KIND) {
+        let rel = derived_metadata_rel(c.group_id, c.artifact_id);
+        let current = read(&rel);
+        let derived_now = derived_metadata(&rows, c.group_id, c.artifact_id);
+        let ours = match (&current, &derived_now) {
+            (Some(cur), Some(d)) => is_ours(Some(cur), d),
+            (None, _) => false,
+            (Some(_), None) => false,
+        };
+        if ours {
+            let next = derived_metadata(&others, c.group_id, c.artifact_id);
+            let cur = String::from_utf8_lossy(current.as_deref().unwrap_or_default()).into_owned();
+            if next
+                .as_deref()
+                .is_none_or(|n| !is_ours(current.as_deref(), n))
+            {
+                before.insert(rel.clone(), Some(cur));
+                after.insert(rel, next);
+            }
+        } else if current.is_some() {
+            drifted.push(format!("{rel} was modified"));
+        }
+    }
+
     if others.is_empty() {
         after.insert(INDEX_REL.to_string(), None);
         for (rel, text) in after.iter_mut() {
@@ -572,13 +945,21 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
             {
                 let Some(t) = text.as_deref() else { break };
                 let written = op_str(w, "text").unwrap_or_default();
+                let crlf = crate::gradle::eol::sniff_crlf(t.as_bytes());
+                let written_here = crate::gradle::eol::apply_eol(written, crlf);
                 *text = match op_of(w) {
-                    "create" if t == written => None,
+                    "create" if is_ours(Some(t.as_bytes()), written) => None,
                     "create" => {
-                        Some(remove_line(t, written.trim()).unwrap_or_else(|| t.to_string()))
+                        let rest = remove_line(t, written.trim()).unwrap_or_else(|| t.to_string());
+                        // A file vendor created holds nothing else of value
+                        // once only whitespace is left.
+                        (!rest.trim().is_empty()).then_some(rest)
                     }
                     "line" => Some(
-                        match t.strip_suffix(written).filter(|_| !written.is_empty()) {
+                        match t
+                            .strip_suffix(written_here.as_str())
+                            .filter(|_| !written.is_empty())
+                        {
                             Some(cut) => cut.to_string(),
                             None => remove_line(t, op_str(w, "line").unwrap_or_default())
                                 .unwrap_or_else(|| t.to_string()),
@@ -588,22 +969,61 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
                 };
             }
         }
-        for rel in [SCRIPT_REL, GITATTRIBUTES_REL] {
+        let hosted_left = read(HOSTED_SCRIPT_REL).is_some();
+        for (rel, expected) in [
+            (SCRIPT_REL, SCRIPT),
+            (GITATTRIBUTES_REL, super::TREE_GITATTRIBUTES),
+            (SCRIPT_GITATTRIBUTES_REL, super::TREE_GITATTRIBUTES),
+        ] {
+            if rel == SCRIPT_GITATTRIBUTES_REL && hosted_left {
+                continue;
+            }
             let created = records
                 .iter()
                 .any(|w| w.kind == OWNED_FILE_KIND && w.file == rel && op_of(w) == "create");
             let current = read(rel);
-            let expected = if rel == SCRIPT_REL {
-                SCRIPT
-            } else {
-                super::TREE_GITATTRIBUTES
-            };
-            let ours = current.as_deref() == Some(expected.as_bytes());
-            if created && ours && current.is_some() {
+            if created && is_ours(current.as_deref(), expected) {
                 before.insert(rel.to_string(), Some(String::new()));
                 after.insert(rel.to_string(), None);
-            } else if created && current.is_some() && !ours {
+            } else if created && current.is_some() {
                 drifted.push(format!("{rel} was modified"));
+            }
+        }
+        if let Some(w) = records
+            .iter()
+            .find(|w| w.kind == OWNED_FILE_KIND && w.file == VENDOR_GITATTRIBUTES_REL)
+        {
+            let current = read(VENDOR_GITATTRIBUTES_REL);
+            let text = current
+                .as_deref()
+                .map(|b| String::from_utf8_lossy(b).into_owned());
+            let next = match (op_of(w), &text) {
+                (_, None) => None,
+                ("create", Some(t)) => match remove_line(t, VENDOR_GITATTRIBUTES_LINE) {
+                    Some(rest) if rest.trim().is_empty() => None,
+                    Some(rest) => Some(rest),
+                    None => Some(t.clone()),
+                },
+                ("line", Some(t)) => {
+                    let written = op_str(w, "text").unwrap_or_default();
+                    let crlf = crate::gradle::eol::sniff_crlf(t.as_bytes());
+                    let here = crate::gradle::eol::apply_eol(written, crlf);
+                    Some(
+                        match t
+                            .strip_suffix(here.as_str())
+                            .filter(|_| !written.is_empty())
+                        {
+                            Some(cut) => cut.to_string(),
+                            None => remove_line(t, VENDOR_GITATTRIBUTES_LINE)
+                                .unwrap_or_else(|| t.clone()),
+                        },
+                    )
+                }
+                (_, Some(t)) => Some(t.clone()),
+            };
+            if next != text {
+                before.insert(VENDOR_GITATTRIBUTES_REL.to_string(), text);
+                after.insert(VENDOR_GITATTRIBUTES_REL.to_string(), next);
             }
         }
     } else {
@@ -612,7 +1032,18 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
             index.push_str(row);
             index.push('\n');
         }
-        after.insert(INDEX_REL.to_string(), Some(index));
+        // A CRLF checkout keeps its index unless a row actually went.
+        if !is_ours(
+            before
+                .get(INDEX_REL)
+                .cloned()
+                .flatten()
+                .as_deref()
+                .map(str::as_bytes),
+            &index,
+        ) {
+            after.insert(INDEX_REL.to_string(), Some(index));
+        }
     }
     JvmUnplan {
         changes: changes_between(&before, &after),
@@ -621,9 +1052,22 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
     }
 }
 
+/// [`undo_replace`] that also matches `to` with CRLF line breaks (a
+/// `core.autocrlf` checkout of a settings file vendor edited with LF).
+fn undo_replace_eol(text: &str, from: &str, to: &str) -> Option<String> {
+    undo_replace(text, from, to).or_else(|| {
+        let crlf = crate::gradle::eol::sniff_crlf(text.as_bytes());
+        let (from, to) = (
+            crate::gradle::eol::apply_eol(from, crlf),
+            crate::gradle::eol::apply_eol(to, crlf),
+        );
+        undo_replace(text, &from, &to)
+    })
+}
+
 /// Whether the root settings file applies the script and the index lists
-/// `c`'s rows: the liveness proof `vex` needs for this layout.
-pub fn wired(read: ReadFn<'_>, c: &Coords<'_>) -> bool {
+/// `c`'s rows (the wiring revert and peers rely on).
+pub fn references(read: ReadFn<'_>, c: &Coords<'_>) -> bool {
     let gav = format!("{}:{}:{}", c.group_id, c.artifact_id, c.version);
     let indexed = read(INDEX_REL)
         .and_then(|b| String::from_utf8(b).ok())
@@ -634,17 +1078,56 @@ pub fn wired(read: ReadFn<'_>, c: &Coords<'_>) -> bool {
                 cols.first() == Some(&gav.as_str()) && cols.get(3) == Some(&c.uuid)
             })
         });
+    let wiring = WiringTarget::vendored();
     let applied = ["settings.gradle", "settings.gradle.kts"]
         .iter()
         .any(|rel| {
             read(rel)
                 .and_then(|b| String::from_utf8(b).ok())
-                .is_some_and(|text| has_apply_line(&text, ""))
+                .is_some_and(|text| {
+                    let dsl = dsl::dsl_of(rel).unwrap_or(Dsl::Groovy);
+                    has_apply_line(&text, dsl, &wiring, "")
+                })
         });
     indexed && applied
 }
 
-pub fn wired_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<bool, JvmRefusal> {
+/// The liveness proof `vex` needs for this layout: `c` is
+/// [`references`]d, the script is ours (line endings aside), and a re-plan
+/// over the committed tree is refused nowhere and degraded nowhere.
+pub fn wired(read: ReadFn<'_>, list: ListFn<'_>, c: &Coords<'_>) -> bool {
+    if !references(read, c) || !is_ours(read(SCRIPT_REL).as_deref(), SCRIPT) {
+        return false;
+    }
+    let (Some((jar, pom, module)), Some(extras)) = (committed(read, c), committed_extras(read, c))
+    else {
+        return false;
+    };
+    let patch = JvmPatch {
+        group_id: c.group_id,
+        artifact_id: c.artifact_id,
+        version: c.version,
+        uuid: c.uuid,
+        jar: &jar,
+        upstream_pom: &pom,
+        upstream_module: module.as_deref(),
+        extra_artifacts: &extras,
+    };
+    plan(read, list, &patch).is_ok_and(|p| {
+        p.warnings.iter().all(|w| {
+            w.code != DEGRADED
+                // Added by the caller from the upstream chain; `--check`
+                // verifies those entries.
+                || w.detail.starts_with("reason: verification_parent_chain_unhandled:")
+        })
+    })
+}
+
+pub fn wired_checked(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    c: &Coords<'_>,
+) -> Result<bool, JvmRefusal> {
     read_settings(read, "")?;
     if let Some(bytes) = read(INDEX_REL) {
         let index = std::str::from_utf8(&bytes).ok().and_then(index_rows);
@@ -655,7 +1138,7 @@ pub fn wired_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<bool, JvmRefusa
             ));
         }
     }
-    Ok(wired(read, c))
+    Ok(wired(read, list, c))
 }
 
 fn is_settings_file(rel: &str) -> bool {
@@ -664,7 +1147,7 @@ fn is_settings_file(rel: &str) -> bool {
 }
 
 /// `text` without its first whole line whose trimmed body is `line`.
-fn remove_line(text: &str, line: &str) -> Option<String> {
+pub(crate) fn remove_line(text: &str, line: &str) -> Option<String> {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let i = lines.iter().position(|l| l.trim() == line)?;
     Some(format!(
@@ -705,9 +1188,21 @@ fn shape_refusal(reason: &str, msg: String) -> JvmRefusal {
     }
 }
 
+/// The code of a warning that withholds VEX attestation.
+pub(crate) const DEGRADED: &str = "vendor_jvm_degraded";
+/// The code of an informational note.
+pub(crate) const NOTE: &str = "vendor_jvm_note";
+
 fn degraded(reason: &str, msg: String) -> JvmWarning {
     JvmWarning {
-        code: "vendor_jvm_degraded",
+        code: DEGRADED,
+        detail: format!("reason: {reason}: {msg}"),
+    }
+}
+
+fn note(reason: &str, msg: String) -> JvmWarning {
+    JvmWarning {
+        code: NOTE,
         detail: format!("reason: {reason}: {msg}"),
     }
 }
@@ -716,12 +1211,23 @@ fn degraded(reason: &str, msg: String) -> JvmWarning {
 
 /// One settings file to wire: `dir` is the build directory ("" = root).
 #[derive(Debug, Clone)]
-struct Target {
-    dir: String,
-    rel: String,
-    /// Current text; `None` when vendor creates the file.
-    text: Option<String>,
-    kotlin: bool,
+pub(crate) struct Target {
+    pub dir: String,
+    pub rel: String,
+    /// Current text (a leading BOM kept); `None` when vendor creates the
+    /// file.
+    pub text: Option<String>,
+    pub kotlin: bool,
+}
+
+impl Target {
+    pub(crate) fn dsl(&self) -> Dsl {
+        if self.kotlin {
+            Dsl::Kotlin
+        } else {
+            Dsl::Groovy
+        }
+    }
 }
 
 fn join_rel(dir: &str, name: &str) -> String {
@@ -732,6 +1238,9 @@ fn join_rel(dir: &str, name: &str) -> String {
     }
 }
 
+/// A build file as text. Bytes that are not UTF-8 are refused, never
+/// decoded lossily; a leading BOM stays in the text (the tokenizer skips
+/// it, edits keep it).
 fn read_text(read: ReadFn<'_>, rel: &str) -> Result<Option<String>, JvmRefusal> {
     match read(rel) {
         None => Ok(None),
@@ -762,7 +1271,7 @@ fn read_build_script(read: ReadFn<'_>, dir: &str) -> Result<Option<(String, Stri
 
 /// The settings file of `dir`, or the one to create there. A created file
 /// takes its DSL from the build's own build script, else `default_kotlin`.
-fn settings_target(
+pub(crate) fn settings_target(
     read: ReadFn<'_>,
     dir: &str,
     default_kotlin: bool,
@@ -799,7 +1308,8 @@ fn read_settings(read: ReadFn<'_>, dir: &str) -> Result<Target, JvmRefusal> {
     settings_target(read, dir, false)
 }
 
-fn read_buildsrc(read: ReadFn<'_>) -> Result<Option<Target>, JvmRefusal> {
+/// The settings target of `buildSrc`, when the checkout has one.
+pub(crate) fn read_buildsrc(read: ReadFn<'_>) -> Result<Option<Target>, JvmRefusal> {
     let present = [
         "build.gradle",
         "build.gradle.kts",
@@ -817,53 +1327,78 @@ fn read_buildsrc(read: ReadFn<'_>) -> Result<Option<Target>, JvmRefusal> {
 /// The settings target of an included build, `None` when the directory
 /// holds neither a settings nor a build script (nothing to wire, and no
 /// directory is created for it).
-fn read_included(read: ReadFn<'_>, dir: &str) -> Result<Option<Target>, JvmRefusal> {
+pub(crate) fn read_included(read: ReadFn<'_>, dir: &str) -> Result<Option<Target>, JvmRefusal> {
     if read_script(read, dir, "settings")?.is_none() && read_build_script(read, dir)?.is_none() {
         return Ok(None);
     }
     settings_target(read, dir, false).map(Some)
 }
 
-fn apply_line(kotlin: bool, prefix: &str) -> String {
+/// The apply line of `t`'s script for a build `prefix` (`../` per level)
+/// below the root.
+pub(crate) fn apply_line(t: &WiringTarget, kotlin: bool, prefix: &str) -> String {
+    let path = format!("{prefix}{}", t.script_rel);
     if kotlin {
-        format!("apply(from = \"{prefix}{SCRIPT_REL}\") // socket-patch")
+        format!("apply(from = \"{path}\") {}", t.suffix())
     } else {
-        format!("apply from: '{prefix}{SCRIPT_REL}' // socket-patch")
+        format!("apply from: '{path}' {}", t.suffix())
     }
 }
 
-/// Any live `apply from` naming our script at this prefix, in either DSL,
-/// counts (a user who reformatted the line keeps it); one inside a comment
-/// does not.
-fn has_apply_line(text: &str, prefix: &str) -> bool {
-    let path = format!("{prefix}{SCRIPT_REL}");
-    let toks = lex(text);
-    (0..toks.len()).any(|i| {
-        if !is_ident(toks.get(i), "apply") {
-            return false;
-        }
-        let mut j = i + 1;
-        if is_punct(toks.get(j), b'(') {
-            j += 1;
-        }
-        is_ident(toks.get(j), "from")
-            && (is_punct(toks.get(j + 1), b':') || is_punct(toks.get(j + 1), b'='))
-            && matches!(toks.get(j + 2), Some(Token { tok: Tok::Str { value, .. }, .. }) if *value == path)
-    })
+/// Any live `apply from` naming `t`'s script at this prefix, in either
+/// DSL, counts (a user who reformatted the line keeps it, and a trailing
+/// comment such as a digest is ignored); one inside a comment does not.
+pub(crate) fn has_apply_line(text: &str, dsl: Dsl, t: &WiringTarget, prefix: &str) -> bool {
+    apply_line_token(text, dsl, t, prefix).is_some()
+}
+
+/// The `apply` token of the first live apply line of `t`'s script.
+fn apply_line_token(text: &str, dsl: Dsl, t: &WiringTarget, prefix: &str) -> Option<usize> {
+    let path = format!("{prefix}{}", t.script_rel);
+    let toks = dsl::tokens(text, dsl);
+    (0..toks.len())
+        .find(|&i| {
+            if !is_ident(toks.get(i), "apply") {
+                return false;
+            }
+            let mut j = i + 1;
+            if is_punct(toks.get(j), b'(') {
+                j += 1;
+            }
+            is_ident(toks.get(j), "from")
+                && (is_punct(toks.get(j + 1), b':') || is_punct(toks.get(j + 1), b'='))
+                && matches!(toks.get(j + 2), Some(Token { tok: Tok::Str { value, .. }, .. }) if *value == path)
+        })
+        .map(|i| toks[i].start)
+}
+
+/// `text` without the whole line holding the first live apply line of
+/// `t`'s script (whatever follows it on that line, e.g. an older digest).
+#[allow(dead_code)] // The hosted planner's digest rewrite.
+pub(crate) fn remove_apply_line(
+    text: &str,
+    dsl: Dsl,
+    t: &WiringTarget,
+    prefix: &str,
+) -> Option<String> {
+    let at = apply_line_token(text, dsl, t, prefix)?;
+    let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    if !text[start..at].trim().is_empty() {
+        return None;
+    }
+    let end = text[at..].find('\n').map_or(text.len(), |i| at + i + 1);
+    Some(format!("{}{}", &text[..start], &text[end..]))
 }
 
 /// The newline the file already uses (CRLF when its first line ends so).
 fn newline_of(text: &str) -> &'static str {
-    match text.find('\n') {
-        Some(i) if i > 0 && text.as_bytes()[i - 1] == b'\r' => "\r\n",
-        _ => "\n",
-    }
+    crate::gradle::eol::newline_of(text)
 }
 
 fn append_line(text: &str, line: &str) -> String {
     let nl = newline_of(text);
     let mut out = text.to_string();
-    if !out.is_empty() && !out.ends_with('\n') {
+    if !out.is_empty() && !out.ends_with('\n') && out != "\u{feff}" {
         out.push_str(nl);
     }
     out.push_str(line);
@@ -871,136 +1406,12 @@ fn append_line(text: &str, line: &str) -> String {
     out
 }
 
-// ── a small Groovy/Kotlin lexer ─────────────────────────────────────────────────
+// ── tokens (crate::gradle::dsl) ──────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Tok {
-    Ident(String),
-    /// A string literal. `literal` is false when it interpolates (`$`) or
-    /// uses an escape we do not decode.
-    Str {
-        value: String,
-        literal: bool,
-    },
-    Punct(u8),
-}
-
-#[derive(Debug, Clone)]
-struct Token {
-    tok: Tok,
-    start: usize,
-    end: usize,
-}
-
-/// Tokenize enough of a build script to find blocks, calls and string
-/// literals: comments are skipped, strings (including triple-quoted) are one
-/// token, everything else is an identifier or a single punctuation byte.
-/// Slashy strings are not recognised (a `/` is punctuation).
-fn lex(src: &str) -> Vec<Token> {
-    let b = src.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        if c.is_ascii_whitespace() {
-            i += 1;
-        } else if b[i..].starts_with(b"//") {
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-        } else if b[i..].starts_with(b"/*") {
-            i = src[i + 2..].find("*/").map_or(b.len(), |j| i + 2 + j + 2);
-        } else if c == b'\'' || c == b'"' {
-            let start = i;
-            let triple = b[i..].starts_with(&[c, c, c]);
-            i += if triple { 3 } else { 1 };
-            let mut value = String::new();
-            let mut literal = true;
-            loop {
-                if i >= b.len() {
-                    literal = false;
-                    break;
-                }
-                if triple {
-                    if b[i..].starts_with(&[c, c, c]) {
-                        i += 3;
-                        break;
-                    }
-                } else if b[i] == c {
-                    i += 1;
-                    break;
-                } else if b[i] == b'\n' {
-                    literal = false;
-                    break;
-                }
-                if b[i] == b'\\' && !triple {
-                    match b.get(i + 1) {
-                        Some(&e @ (b'\\' | b'\'' | b'"')) => value.push(e as char),
-                        _ => literal = false,
-                    }
-                    i += 2;
-                    continue;
-                }
-                if b[i] == b'$' && c == b'"' {
-                    literal = false;
-                }
-                let ch = src[i..].chars().next().unwrap_or('\u{fffd}');
-                value.push(ch);
-                i += ch.len_utf8().max(1);
-            }
-            out.push(Token {
-                tok: Tok::Str { value, literal },
-                start,
-                end: i.min(b.len()),
-            });
-        } else if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
-            let start = i;
-            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
-                i += 1;
-            }
-            out.push(Token {
-                tok: Tok::Ident(src[start..i].to_string()),
-                start,
-                end: i,
-            });
-        } else if c.is_ascii() {
-            out.push(Token {
-                tok: Tok::Punct(c),
-                start: i,
-                end: i + 1,
-            });
-            i += 1;
-        } else {
-            i += src[i..].chars().next().map_or(1, char::len_utf8);
-        }
-    }
-    out
-}
-
-fn is_ident(t: Option<&Token>, name: &str) -> bool {
-    matches!(t, Some(Token { tok: Tok::Ident(n), .. }) if n == name)
-}
-
-fn is_punct(t: Option<&Token>, p: u8) -> bool {
-    matches!(t, Some(Token { tok: Tok::Punct(c), .. }) if *c == p)
-}
-
-/// Index of the `}` matching the `{` at `open`.
-fn matching_close(toks: &[Token], open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (i, t) in toks.iter().enumerate().skip(open) {
-        match t.tok {
-            Tok::Punct(b'{') => depth += 1,
-            Tok::Punct(b'}') => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+/// The tokens of a settings or build script in its own DSL (`rel` names
+/// it; Groovy when unknown).
+fn lex_rel(rel: &str, text: &str) -> Vec<Token> {
+    dsl::tokens(text, dsl::dsl_of(rel).unwrap_or(Dsl::Groovy))
 }
 
 /// A `name {` block directly inside `toks[from..to]` (brace depth 0 there):
@@ -1023,25 +1434,11 @@ fn find_block(toks: &[Token], from: usize, to: usize, name: &str) -> Option<(usi
     None
 }
 
-/// Every `name {` block at any depth: `(open index, close index)`.
-fn all_blocks(toks: &[Token], name: &str) -> Vec<(usize, usize)> {
-    (0..toks.len())
-        .filter(|&i| is_ident(toks.get(i), name) && is_punct(toks.get(i + 1), b'{'))
-        .filter_map(|i| matching_close(toks, i + 1).map(|c| (i + 1, c)))
-        .collect()
-}
-
-fn strings(toks: &[Token]) -> impl Iterator<Item = &str> {
-    toks.iter().filter_map(|t| match &t.tok {
-        Tok::Str { value, .. } => Some(value.as_str()),
-        _ => None,
-    })
-}
-
 // ── refusals ────────────────────────────────────────────────────────────────────
 
-fn check_android(rel: &str, text: &str) -> Result<(), JvmRefusal> {
-    let toks = lex(text);
+/// Refuse an Android or Kotlin Multiplatform build script `rel`.
+pub(crate) fn check_android(rel: &str, text: &str) -> Result<(), JvmRefusal> {
+    let toks = lex_rel(rel, text);
     let hit = strings(&toks)
         .find(|s| {
             s.starts_with("com.android.") || s.starts_with("org.jetbrains.kotlin.multiplatform")
@@ -1068,7 +1465,7 @@ fn check_android(rel: &str, text: &str) -> Result<(), JvmRefusal> {
 /// A user `exclusiveContent` that claims the patched group for another
 /// repository would make ours unreachable ("Could not find").
 fn check_exclusive_content(rel: &str, text: &str, patch: &JvmPatch<'_>) -> Result<(), JvmRefusal> {
-    let toks = lex(text);
+    let toks = lex_rel(rel, text);
     for (open, close) in all_blocks(&toks, "exclusiveContent") {
         let body = &toks[open..close];
         if strings(body).any(|s| s == REPO_NAME || s.starts_with(&format!("{REPO_NAME}_"))) {
@@ -1092,8 +1489,8 @@ fn check_exclusive_content(rel: &str, text: &str, patch: &JvmPatch<'_>) -> Resul
 
 /// Literal `includeBuild` targets of the settings file of `dir`, as
 /// project-relative directories; non-literal or escaping ones are warned.
-fn included_builds(rel: &str, dir: &str, text: &str) -> (Vec<String>, Vec<JvmWarning>) {
-    let toks = lex(text);
+pub(crate) fn included_builds(rel: &str, dir: &str, text: &str) -> (Vec<String>, Vec<JvmWarning>) {
+    let toks = lex_rel(rel, text);
     let mut found = Vec::new();
     let mut warns = Vec::new();
     for (i, t) in toks.iter().enumerate() {
@@ -1211,7 +1608,7 @@ fn scoped_in_block_entry(
     patch: &Coords<'_>,
     scope: &str,
 ) -> InBlock {
-    let toks = lex(text);
+    let toks = dsl::tokens(text, if kotlin { Dsl::Kotlin } else { Dsl::Groovy });
     if scope == "pluginManagement" && find_block(&toks, 0, toks.len(), "plugins").is_none() {
         return InBlock::Unneeded;
     }
@@ -1356,8 +1753,10 @@ fn first_statement_offset(text: &str, toks: &[Token]) -> usize {
             i += 1;
         }
     }
+    // Never in front of a byte-order mark.
+    let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
     match toks.get(i) {
-        Some(t) => text[..t.start].rfind('\n').map_or(0, |j| j + 1),
+        Some(t) => text[..t.start].rfind('\n').map_or(0, |j| j + 1).max(bom),
         None => text.len(),
     }
 }
@@ -1369,7 +1768,7 @@ fn json_str(s: &str) -> String {
 }
 
 /// The marker: sorted keys, 2-space indent, trailing newline.
-fn marker_json(patch: &JvmPatch<'_>, files: &[(&str, &[u8])]) -> String {
+fn marker_json(patch: &JvmPatch<'_>, files: &[(String, &[u8])]) -> String {
     let mut out = String::from("{\n  \"files\": {");
     for (n, (name, bytes)) in files.iter().enumerate() {
         out.push_str(if n == 0 { "\n" } else { ",\n" });
@@ -1457,12 +1856,119 @@ fn merge_index(
     Ok(out)
 }
 
+/// The artifact-level `maven-metadata.xml` of `group:artifact` over the
+/// index `rows`: every vendored version in Gradle's version order, the
+/// highest as `latest` and `release`, LF, and no `lastUpdated` (so it is a
+/// pure function of the rows). `None` when no row is for the GA.
+fn derived_metadata(rows: &[String], group_id: &str, artifact_id: &str) -> Option<String> {
+    let prefix = format!("{group_id}:{artifact_id}:");
+    let mut versions: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.split('\t').next()?.strip_prefix(&prefix))
+        .collect();
+    versions.sort_by(|a, b| gradle_version_cmp(a, b).then_with(|| a.cmp(b)));
+    versions.dedup();
+    let latest = *versions.last()?;
+    let mut out = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata>\n  <groupId>{group_id}</groupId>\n  <artifactId>{artifact_id}</artifactId>\n  <versioning>\n    <latest>{latest}</latest>\n    <release>{latest}</release>\n    <versions>\n"
+    );
+    for v in &versions {
+        out.push_str(&format!("      <version>{v}</version>\n"));
+    }
+    out.push_str("    </versions>\n  </versioning>\n</metadata>\n");
+    Some(out)
+}
+
+/// `.socket/vendor/.gitattributes` with [`VENDOR_GITATTRIBUTES_LINE`]:
+/// created when absent, adopted when it already has the line, otherwise
+/// the line is appended (and cut again on revert).
+fn vendor_gitattributes(read: ReadFn<'_>, writes: &mut Vec<FileWrite>) -> WiringRecord {
+    let rel = VENDOR_GITATTRIBUTES_REL;
+    let Some(bytes) = read(rel) else {
+        writes.push(text_write(
+            rel,
+            format!("{VENDOR_GITATTRIBUTES_LINE}\n").into_bytes(),
+        ));
+        return fragment(
+            rel,
+            OWNED_FILE_KIND,
+            "owned",
+            WiringAction::Added,
+            None,
+            json!({ "op": "create" }),
+        );
+    };
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let want: Vec<&str> = VENDOR_GITATTRIBUTES_LINE.split_whitespace().collect();
+    if text
+        .lines()
+        .any(|l| l.split_whitespace().collect::<Vec<_>>() == want)
+    {
+        return adopt(rel, OWNED_FILE_KIND, "owned");
+    }
+    let appended = append_line(&text, VENDOR_GITATTRIBUTES_LINE);
+    let record = fragment(
+        rel,
+        OWNED_FILE_KIND,
+        "owned",
+        WiringAction::Rewritten,
+        None,
+        json!({ "op": "line", "text": &appended[text.len()..] }),
+    );
+    writes.push(text_write(rel, appended.into_bytes()));
+    record
+}
+
 // ── gradle/verification-metadata.xml ─────────────────────────────────────
 
-struct ArtifactHashes {
-    jar: String,
-    pom: String,
-    module: Option<String>,
+/// The sha256s a verification component gets for the patched GAV.
+pub(crate) struct ArtifactHashes {
+    pub jar: String,
+    pub pom: String,
+    pub module: Option<String>,
+}
+
+/// The checksum elements Gradle accepts for an artifact. A `<pgp>`-only
+/// entry verifies nothing served from the vendored repository (it has no
+/// signatures), so Gradle falls back to these (#487).
+const CHECKSUM_ELEMENTS: [&str; 4] = ["sha256", "sha512", "sha1", "md5"];
+
+/// Whether the artifact element `masked[start..end]` holds a checksum.
+fn has_checksum(masked: &str, start: usize, end: usize) -> bool {
+    CHECKSUM_ELEMENTS
+        .iter()
+        .any(|name| !xml_elements(masked, start, end, name).is_empty())
+}
+
+/// The artifact element `text[start..end]` (`tag_end` ends its start tag)
+/// with `<sha256 value=sha origin="socket-patch"/>` added after its other
+/// children, kept otherwise byte for byte.
+fn with_sha256(
+    text: &str,
+    masked: &str,
+    (start, tag_end, end): (usize, usize, usize),
+    sha: &str,
+) -> String {
+    const UNIT: &str = "   ";
+    let nl = newline_of(text);
+    let indent = line_indent(text, start);
+    let name = xml_attr(&masked[start..tag_end], "name").unwrap_or_default();
+    if tag_end == end {
+        return artifact_element(name, sha, &indent, UNIT, nl);
+    }
+    let el = format!("<sha256 value=\"{sha}\" origin=\"socket-patch\"/>");
+    let close = end - "</artifact>".len();
+    let at = line_start(text, close);
+    if at == close {
+        // `</artifact>` follows other content on its line.
+        return format!("{}{el}{}", &text[start..at], &text[at..end]);
+    }
+    let child = masked[tag_end..close]
+        .find('<')
+        .map(|i| line_indent(text, tag_end + i))
+        .filter(|i| i.len() > indent.len())
+        .unwrap_or_else(|| format!("{indent}{UNIT}"));
+    format!("{}{child}{el}{nl}{}", &text[start..at], &text[at..end])
 }
 
 /// Whether Gradle may verify metadata of the vendored pom's parent chain or
@@ -1504,13 +2010,22 @@ fn unverified_parent_chain(verification: &str, pom: &str, module: Option<&[u8]>)
     else {
         return true;
     };
+    // Listed means a checksum for the parent pom: a pgp-only entry cannot
+    // verify the copy Gradle reads through the vendored repository.
+    let pom = format!("{a}-{v}.pom");
     !xml_elements(&vm, 0, vm.len(), "component")
         .iter()
-        .any(|&(s, t, _)| {
+        .any(|&(s, t, e)| {
             let tag = &vm[s..t];
             xml_attr(tag, "group") == Some(g.as_str())
                 && xml_attr(tag, "name") == Some(a.as_str())
                 && xml_attr(tag, "version") == Some(v.as_str())
+                && xml_elements(&vm, t, e, "artifact")
+                    .iter()
+                    .any(|&(as_, at, ae)| {
+                        xml_attr(&vm[as_..at], "name") == Some(pom.as_str())
+                            && has_checksum(&vm, at, ae)
+                    })
         })
 }
 
@@ -1604,7 +2119,7 @@ fn update_verification(
     update_verification_component(text, patch, h, None)
 }
 
-fn update_verification_component(
+pub(crate) fn update_verification_component(
     text: &str,
     patch: &JvmPatch<'_>,
     h: &ArtifactHashes,
@@ -1654,7 +2169,13 @@ fn update_verification_component(
         for &(as_, at_end, ae) in &arts {
             if xml_attr(&masked[as_..at_end], "name") == Some(jar_name.as_str()) {
                 if metadata_extension.is_some() {
-                    return Ok((as_, ae, text[as_..ae].to_string()));
+                    // The user's entry is kept; a pgp-only one gets the
+                    // checksum Gradle needs for the vendored repository.
+                    if has_checksum(&masked, at_end, ae) {
+                        return Ok((as_, ae, text[as_..ae].to_string()));
+                    }
+                    let el = with_sha256(text, &masked, (as_, at_end, ae), &h.jar);
+                    return Ok((as_, ae, el));
                 }
                 let indent = line_indent(text, as_);
                 let el = artifact_element(&jar_name, &h.jar, &indent, UNIT, nl);
@@ -1748,6 +2269,7 @@ pub(crate) fn metadata_record_present(text: &str, record: &WiringRecord) -> bool
         return false;
     }
     let masked = mask_xml_comments(text);
+    let verifies = verifies_metadata(&masked);
     let name = format!(
         "{}-{}.{}",
         parts[1],
@@ -1768,6 +2290,11 @@ pub(crate) fn metadata_record_present(text: &str, record: &WiringRecord) -> bool
                 .iter()
                 .any(|&(s, t, e)| {
                     if xml_attr(&masked[s..t], "name") != Some(name.as_str()) {
+                        return false;
+                    }
+                    // With metadata verification on, a pgp-only entry fails
+                    // the build (#487): trees vendored before the fix too.
+                    if verifies && !has_checksum(&masked, t, e) {
                         return false;
                     }
                     match op_str(record, "to") {
@@ -1820,6 +2347,7 @@ pub(crate) fn add_verification_metadata(
             jar: &[],
             upstream_pom: &m.bytes,
             upstream_module: None,
+            extra_artifacts: &[],
         };
         let sha = sha256_hex(&m.bytes);
         let h = ArtifactHashes {
@@ -1889,6 +2417,7 @@ mod tests {
             jar: b"PATCHED-JAR",
             upstream_pom: b"<project></project>\n",
             upstream_module: None,
+            extra_artifacts: &[],
         }
     }
 
@@ -1901,7 +2430,34 @@ mod tests {
 
     fn run(files: &BTreeMap<String, Vec<u8>>, p: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusal> {
         let read = |rel: &str| files.get(rel).cloned();
-        plan(&read, p)
+        plan(&read, &|dir: &str| list_of(files, dir), p)
+    }
+
+    /// The children of `dir` in an in-memory tree (the planner's ListFn).
+    fn list_of(files: &BTreeMap<String, Vec<u8>>, dir: &str) -> Vec<String> {
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", dir.trim_end_matches('/'))
+        };
+        let mut out: Vec<String> = Vec::new();
+        for key in files.keys() {
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let child = match rest.find('/') {
+                Some(i) => format!("{}/", &rest[..i]),
+                None => rest.to_string(),
+            };
+            if !out.contains(&child) {
+                out.push(child);
+            }
+        }
+        out
+    }
+
+    fn vendored_line(kotlin: bool, prefix: &str) -> String {
+        apply_line(&WiringTarget::vendored(), kotlin, prefix)
     }
 
     /// Apply `plan` onto `files`, returning the new file map.
@@ -1972,14 +2528,29 @@ mod tests {
         assert_eq!(
             rels,
             vec![
+                (".socket/gradle/.gitattributes", false),
                 (".socket/gradle/socket-patch.settings.gradle", false),
+                (".socket/vendor/.gitattributes", false),
                 (".socket/vendor/gradle-index.tsv", false),
                 (".socket/vendor/gradle/.gitattributes", false),
                 (".socket/vendor/gradle/com/google/code/gson/gson/2.10.1/gson-2.10.1.jar", true),
                 (".socket/vendor/gradle/com/google/code/gson/gson/2.10.1/gson-2.10.1.pom", true),
                 (".socket/vendor/gradle/com/google/code/gson/gson/2.10.1/socket-patch.vendor.json", true),
+                (".socket/vendor/gradle/com/google/code/gson/gson/maven-metadata.xml", false),
                 ("settings.gradle", false),
             ]
+        );
+        assert_eq!(text_of(&plan, SCRIPT_GITATTRIBUTES_REL), "* -text\n");
+        assert_eq!(
+            text_of(&plan, VENDOR_GITATTRIBUTES_REL),
+            "gradle-index.tsv -text\n"
+        );
+        assert_eq!(
+            text_of(
+                &plan,
+                ".socket/vendor/gradle/com/google/code/gson/gson/maven-metadata.xml"
+            ),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata>\n  <groupId>com.google.code.gson</groupId>\n  <artifactId>gson</artifactId>\n  <versioning>\n    <latest>2.10.1</latest>\n    <release>2.10.1</release>\n    <versions>\n      <version>2.10.1</version>\n    </versions>\n  </versioning>\n</metadata>\n"
         );
         assert_eq!(
             plan.tree_dir,
@@ -2014,7 +2585,7 @@ mod tests {
         let files = fs(&[("settings.gradle", src)]);
         let plan = run(&files, &patch()).unwrap();
         let out = text_of(&plan, "settings.gradle");
-        assert_eq!(out, format!("{src}{}\n", apply_line(false, "")));
+        assert_eq!(out, format!("{src}{}\n", vendored_line(false, "")));
     }
 
     #[test]
@@ -2023,13 +2594,13 @@ mod tests {
         let plan = run(&files, &patch()).unwrap();
         assert_eq!(
             text_of(&plan, "settings.gradle.kts"),
-            format!("{}\n", apply_line(true, ""))
+            format!("{}\n", vendored_line(true, ""))
         );
         let files = fs(&[("build.gradle", "apply plugin: 'java'\n")]);
         let plan = run(&files, &patch()).unwrap();
         assert_eq!(
             text_of(&plan, "settings.gradle"),
-            format!("{}\n", apply_line(false, ""))
+            format!("{}\n", vendored_line(false, ""))
         );
         assert!(!plan.writes.iter().any(|w| w.rel == "settings.gradle.kts"));
     }
@@ -2104,7 +2675,7 @@ mod tests {
         );
         assert_eq!(
             text_of(&plan, "nested/settings.gradle.kts"),
-            format!("{}\n", apply_line(true, "../"))
+            format!("{}\n", vendored_line(true, "../"))
         );
         for bogus in ["commented", "block", "in-string"] {
             assert!(
@@ -2153,7 +2724,7 @@ mod tests {
         let expect = format!(
             "pluginManagement {{\n  repositories {{\n    {}\n    gradlePluginPortal()\n  }}\n}}\nplugins {{\n  id 'org.gradle.toolchains.foojay-resolver-convention' version '0.8.0'\n}}\n{}\n",
             in_block_line(false, "", &patch().coords()),
-            apply_line(false, "")
+            vendored_line(false, "")
         );
         assert_eq!(text_of(&plan, "settings.gradle"), expect);
         assert!(plan.warnings.is_empty());
@@ -2185,7 +2756,7 @@ mod tests {
         let entry = in_block_line(true, "", &patch().coords());
         let expect = format!(
             "import java.io.File\n\npluginManagement {{\n  repositories {{\n    {entry}\n    gradlePluginPortal()\n  }}\n}}\nplugins {{\n  id(\"x\") version \"1\"\n}}\nrootProject.name = \"r\"\n{}\n",
-            apply_line(true, "")
+            vendored_line(true, "")
         );
         assert_eq!(text_of(&plan, "settings.gradle.kts"), expect);
         assert_idempotent(&files, &patch());
@@ -2237,7 +2808,7 @@ mod tests {
         let plan = run(&files, &patch()).unwrap();
         assert_eq!(reasons(&plan), vec!["settings_plugins_unwired"]);
         assert!(
-            text_of(&plan, "settings.gradle").ends_with(&format!("{}\n", apply_line(false, "")))
+            text_of(&plan, "settings.gradle").ends_with(&format!("{}\n", vendored_line(false, "")))
         );
     }
 
@@ -2640,7 +3211,10 @@ mod tests {
 
     #[test]
     fn lexer_handles_strings_comments_and_escapes() {
-        let toks = lex("a '''x\n'y''' \"\\\"q\" /* } */ 'it\\'s' \"${b}\" // }\n{");
+        let toks = dsl::tokens(
+            "a '''x\n'y''' \"\\\"q\" /* } */ 'it\\'s' \"${b}\" // }\n{",
+            Dsl::Groovy,
+        );
         let kinds: Vec<Tok> = toks.into_iter().map(|t| t.tok).collect();
         assert_eq!(
             kinds,
@@ -2673,10 +3247,11 @@ mod tests {
         let root = dir.path();
         std::fs::write(root.join("settings.gradle"), "rootProject.name = 'x'\r\n").unwrap();
         let read = |rel: &str| apply::read_project_file(root, rel);
-        let p = plan(&read, &patch()).unwrap();
+        let list = |dir: &str| apply::ProjectReader::new(root).list(dir);
+        let p = plan(&read, &list, &patch()).unwrap();
         let records = apply::write_plan(root, &p).await.unwrap();
         assert!(root.join(&p.jar_rel).is_file());
-        let again = plan(&read, &patch()).unwrap();
+        let again = plan(&read, &list, &patch()).unwrap();
         assert!(again.writes.is_empty());
         let entry = super::super::testing::entry(&patch(), records);
         let out = apply::revert(root, &entry, crate::vendor::RevertOpts::new(false)).await;
@@ -2703,17 +3278,22 @@ mod tests {
             jar: b"B-JAR",
             upstream_pom: b"<project></project>\n",
             upstream_module: None,
+            extra_artifacts: &[],
         }
     }
 
     fn replan_writes(root: &std::path::Path, p: &JvmPatch<'_>) -> Vec<String> {
         let reader = apply::ProjectReader::new(root);
-        plan(&|rel: &str| reader.read(rel), p)
-            .unwrap()
-            .writes
-            .into_iter()
-            .map(|w| w.rel)
-            .collect()
+        plan(
+            &|rel: &str| reader.read(rel),
+            &|dir: &str| reader.list(dir),
+            p,
+        )
+        .unwrap()
+        .writes
+        .into_iter()
+        .map(|w| w.rel)
+        .collect()
     }
 
     /// Reverting either of two patches leaves the other fully wired (apply
@@ -2852,7 +3432,7 @@ mod tests {
 
     #[test]
     fn an_apply_line_inside_a_comment_does_not_count() {
-        let line = apply_line(false, "");
+        let line = vendored_line(false, "");
         for commented in [
             format!("rootProject.name = 'x'\n/*\n{line}\n*/\n"),
             format!("// {line}\n"),
@@ -2870,10 +3450,20 @@ mod tests {
             "apply(from = \".socket/gradle/socket-patch.settings.gradle\")\n",
             "apply   from :  \".socket/gradle/socket-patch.settings.gradle\" // mine\n",
         ] {
-            assert!(has_apply_line(live, ""), "{live}");
+            let dsl = if live.starts_with("apply(") {
+                Dsl::Kotlin
+            } else {
+                Dsl::Groovy
+            };
+            assert!(
+                has_apply_line(live, dsl, &WiringTarget::vendored(), ""),
+                "{live}"
+            );
         }
         assert!(!has_apply_line(
             "apply from: '../.socket/gradle/socket-patch.settings.gradle'\n",
+            Dsl::Groovy,
+            &WiringTarget::vendored(),
             ""
         ));
     }
@@ -2906,7 +3496,11 @@ mod tests {
         );
         std::os::unix::fs::symlink(outside.path(), dir.path().join("build-logic")).unwrap();
         let reader = apply::ProjectReader::new(dir.path());
-        let _ = plan(&|rel: &str| reader.read(rel), &patch());
+        let _ = plan(
+            &|rel: &str| reader.read(rel),
+            &|dir: &str| reader.list(dir),
+            &patch(),
+        );
         assert_eq!(reader.escaped().as_deref(), Some("build-logic"));
     }
 
@@ -2935,5 +3529,681 @@ mod tests {
         let undo = unplan(&read, &patch().coords(), &[]);
         assert!(undo.still_wired && !undo.drifted.is_empty());
         assert!(undo.changes.is_empty(), "{:?}", undo.changes);
+    }
+
+    // ── WP3: shared wiring API, #429, #461, #487, #511, #533 ──
+
+    /// The script's bytes are pinned: a change must be deliberate (it
+    /// changes every vendored checkout and the configuration-cache inputs).
+    #[test]
+    fn script_snapshot_sha256_is_pinned() {
+        assert_eq!(
+            sha256_hex(SCRIPT.as_bytes()),
+            "3f02dc0c3fd175627a3f3f20a6956cf7927bf9c61ff2015a1ec96178356fb2e1"
+        );
+    }
+
+    /// The vendored defaults keep the historic line; the hosted target's
+    /// digest comment is ignored by the match and cut with its line.
+    #[test]
+    fn wiring_target_spells_and_finds_apply_lines() {
+        let vendored = WiringTarget::vendored();
+        assert_eq!(
+            apply_line(&vendored, false, "../"),
+            "apply from: '../.socket/gradle/socket-patch.settings.gradle' // socket-patch"
+        );
+        let hosted = |digest: &str| WiringTarget {
+            script_rel: HOSTED_SCRIPT_REL.to_string(),
+            repo_name_prefix: "socketPatchHosted".to_string(),
+            apply_line_suffix: Some(format!("// socket-patch-hosted {digest}")),
+        };
+        let line = apply_line(&hosted("0123456789abcdef"), true, "");
+        assert_eq!(
+            line,
+            "apply(from = \".socket/gradle/socket-patch.hosted.settings.gradle\") // socket-patch-hosted 0123456789abcdef"
+        );
+        let text = format!("rootProject.name = \"x\"\r\n{line}\r\ninclude(\"a\")\r\n");
+        let newer = hosted("fedcba9876543210");
+        assert!(has_apply_line(&text, Dsl::Kotlin, &newer, ""));
+        assert!(!has_apply_line(&text, Dsl::Kotlin, &vendored, ""));
+        assert_eq!(
+            remove_apply_line(&text, Dsl::Kotlin, &newer, "").as_deref(),
+            Some("rootProject.name = \"x\"\r\ninclude(\"a\")\r\n")
+        );
+        assert!(newer.owns_repository("socketPatchHosted_abc"));
+        assert!(!newer.owns_repository("socketPatchHostedX"));
+        assert_eq!(remove_line("a\n  b  \nc\n", "b").as_deref(), Some("a\nc\n"));
+    }
+
+    /// `files` with every listed path's line breaks turned into CRLF: what
+    /// a `core.autocrlf=true` clone checks out for text files.
+    fn crlf(files: &BTreeMap<String, Vec<u8>>, rels: &[&str]) -> BTreeMap<String, Vec<u8>> {
+        let mut out = files.clone();
+        for rel in rels {
+            let text = String::from_utf8(out[*rel].clone()).unwrap();
+            out.insert(
+                rel.to_string(),
+                crate::gradle::eol::apply_eol(&text, true).into_bytes(),
+            );
+        }
+        out
+    }
+
+    /// `files` after `undo` (the tree files the disk side deletes are left
+    /// out).
+    fn reverted(files: &BTreeMap<String, Vec<u8>>, undo: &JvmUnplan) -> BTreeMap<String, Vec<u8>> {
+        let mut out = files.clone();
+        out.retain(|rel, _| {
+            !rel.starts_with(&format!("{TREE_ROOT}/"))
+                || rel.ends_with(METADATA_NAME)
+                || rel == GITATTRIBUTES_REL
+        });
+        for (rel, bytes) in &undo.changes {
+            match bytes {
+                Some(b) => out.insert(rel.clone(), b.clone()),
+                None => out.remove(rel),
+            };
+        }
+        out
+    }
+
+    /// #429: on a CRLF checkout the owned script, index, `.gitattributes`
+    /// and derived metadata still re-plan to nothing (`--check` passes),
+    /// and a full revert removes them and restores the settings files in
+    /// the checkout's own line endings (a vendor-created one goes).
+    #[test]
+    fn crlf_checkout_of_the_owned_files_checks_and_reverts_clean() {
+        let files = fs(&[
+            (
+                "settings.gradle",
+                "rootProject.name = 'x'\nplugins { id 'a' version '1' }\n",
+            ),
+            (
+                "buildSrc/build.gradle",
+                "plugins { id 'groovy-gradle-plugin' }\n",
+            ),
+        ]);
+        let p = patch();
+        let plan = run(&files, &p).unwrap();
+        let after = applied(&files, &plan);
+        let metadata = derived_metadata_rel(p.group_id, p.artifact_id);
+        let win = crlf(
+            &after,
+            &[
+                SCRIPT_REL,
+                INDEX_REL,
+                GITATTRIBUTES_REL,
+                SCRIPT_GITATTRIBUTES_REL,
+                VENDOR_GITATTRIBUTES_REL,
+                &metadata,
+                "settings.gradle",
+                "buildSrc/settings.gradle",
+            ],
+        );
+        let again = run(&win, &p).unwrap();
+        assert!(
+            again.writes.is_empty(),
+            "a CRLF checkout re-plans to nothing: {:?}",
+            again.writes.iter().map(|w| &w.rel).collect::<Vec<_>>()
+        );
+        let undo = unplan(&|rel| win.get(rel).cloned(), &p.coords(), &plan.records);
+        assert!(undo.drifted.is_empty(), "{:?}", undo.drifted);
+        let out = reverted(&win, &undo);
+        for rel in [
+            SCRIPT_REL,
+            INDEX_REL,
+            SCRIPT_GITATTRIBUTES_REL,
+            GITATTRIBUTES_REL,
+            VENDOR_GITATTRIBUTES_REL,
+            metadata.as_str(),
+            "buildSrc/settings.gradle",
+        ] {
+            assert!(!out.contains_key(rel), "{rel} left behind");
+        }
+        assert_eq!(
+            out["settings.gradle"],
+            crlf(&files, &["settings.gradle"])["settings.gradle"]
+        );
+    }
+
+    /// A settings file vendor created is deleted once only whitespace is
+    /// left of it (a CRLF clone, or a blank line someone added).
+    #[test]
+    fn a_created_settings_file_with_only_whitespace_left_is_deleted() {
+        let files = fs(&[("build.gradle", "plugins { id 'java' }\n")]);
+        let p = patch();
+        let plan = run(&files, &p).unwrap();
+        let mut after = applied(&files, &plan);
+        let created = String::from_utf8(after["settings.gradle"].clone()).unwrap();
+        after.insert(
+            "settings.gradle".into(),
+            format!("{}\r\n\r\n", created.trim_end()).into_bytes(),
+        );
+        let undo = unplan(&|rel| after.get(rel).cloned(), &p.coords(), &plan.records);
+        assert!(undo
+            .changes
+            .iter()
+            .any(|(rel, b)| rel == "settings.gradle" && b.is_none()));
+        // Anything else the user wrote there is kept.
+        after.insert(
+            "settings.gradle".into(),
+            format!("{}\r\ninclude 'app'\r\n", created.trim_end()).into_bytes(),
+        );
+        let undo = unplan(&|rel| after.get(rel).cloned(), &p.coords(), &plan.records);
+        let out = reverted(&after, &undo);
+        assert_eq!(out["settings.gradle"], b"include 'app'\r\n");
+    }
+
+    /// An existing `.socket/vendor/.gitattributes` gets the index line
+    /// appended (and cut on revert), or is adopted when it has it.
+    #[test]
+    fn vendor_gitattributes_are_merged_and_adopted() {
+        let files = fs(&[
+            ("settings.gradle", ""),
+            (VENDOR_GITATTRIBUTES_REL, "*.bin binary"),
+        ]);
+        let p = patch();
+        let plan = run(&files, &p).unwrap();
+        assert_eq!(
+            text_of(&plan, VENDOR_GITATTRIBUTES_REL),
+            "*.bin binary\ngradle-index.tsv -text\n"
+        );
+        let after = applied(&files, &plan);
+        let undo = unplan(&|rel| after.get(rel).cloned(), &p.coords(), &plan.records);
+        assert_eq!(reverted(&after, &undo), files);
+        let files = fs(&[
+            ("settings.gradle", ""),
+            (VENDOR_GITATTRIBUTES_REL, "gradle-index.tsv  -text\n"),
+        ]);
+        let plan = run(&files, &p).unwrap();
+        assert!(!plan
+            .writes
+            .iter()
+            .any(|w| w.rel == VENDOR_GITATTRIBUTES_REL));
+        let after = applied(&files, &plan);
+        let undo = unplan(&|rel| after.get(rel).cloned(), &p.coords(), &plan.records);
+        assert_eq!(reverted(&after, &undo), files);
+    }
+
+    /// The shared `.socket/gradle/.gitattributes` outlives the vendored
+    /// script while the hosted one remains.
+    #[test]
+    fn script_gitattributes_stay_for_the_hosted_script() {
+        let files = fs(&[("settings.gradle", "")]);
+        let p = patch();
+        let plan = run(&files, &p).unwrap();
+        let mut after = applied(&files, &plan);
+        after.insert(HOSTED_SCRIPT_REL.into(), b"// hosted\n".to_vec());
+        let undo = unplan(&|rel| after.get(rel).cloned(), &p.coords(), &plan.records);
+        let out = reverted(&after, &undo);
+        assert!(out.contains_key(SCRIPT_GITATTRIBUTES_REL));
+        assert!(!out.contains_key(SCRIPT_REL));
+    }
+
+    fn refusal_reason(err: &JvmRefusal) -> &str {
+        err.detail
+            .strip_prefix("reason: ")
+            .and_then(|d| d.split(':').next())
+            .unwrap_or_default()
+    }
+
+    /// #461: a user `exclusiveContent` claiming the group anywhere Gradle
+    /// evaluates (a subproject, a buildSrc convention plugin, an `apply
+    /// from` script; regex and subgroup rules too) refuses and names the
+    /// file; one for another group or our own repository does not.
+    #[test]
+    fn exclusive_content_anywhere_in_the_build_refuses_naming_the_file() {
+        let rule = |filter: &str| {
+            format!(
+                "repositories {{\n  exclusiveContent {{\n    forRepository {{ mavenCentral() }}\n    filter {{ {filter} }}\n  }}\n}}\n"
+            )
+        };
+        let group = rule("includeGroup 'com.google.code.gson'");
+        let cases: Vec<(&str, Vec<(&str, String)>)> = vec![
+            (
+                "app/build.gradle",
+                vec![
+                    ("settings.gradle", "include 'app'\n".into()),
+                    ("app/build.gradle", group.clone()),
+                ],
+            ),
+            (
+                "buildSrc/src/main/groovy/bh.repos.gradle",
+                vec![
+                    ("settings.gradle", "include 'app'\n".into()),
+                    ("buildSrc/build.gradle", "plugins { id 'groovy-gradle-plugin' }\n".into()),
+                    ("buildSrc/src/main/groovy/bh.repos.gradle", group.clone()),
+                    ("app/build.gradle", "plugins { id 'bh.repos' }\n".into()),
+                ],
+            ),
+            (
+                "gradle/repos.gradle",
+                vec![
+                    ("settings.gradle", "".into()),
+                    ("build.gradle", "apply from: 'gradle/repos.gradle'\n".into()),
+                    ("gradle/repos.gradle", group.clone()),
+                ],
+            ),
+            (
+                "app/build.gradle.kts",
+                vec![
+                    ("settings.gradle.kts", "include(\"app\")\n".into()),
+                    (
+                        "app/build.gradle.kts",
+                        "repositories { exclusiveContent { forRepository { mavenCentral() }; filter { includeGroupByRegex(\"com\\\\.google\\\\..*\") } } }\n".into(),
+                    ),
+                ],
+            ),
+            (
+                "app/build.gradle",
+                vec![
+                    ("settings.gradle", "include 'app'\n".into()),
+                    ("app/build.gradle", rule("includeGroupAndSubgroups 'com.google'")),
+                ],
+            ),
+            (
+                "app/build.gradle",
+                vec![
+                    ("settings.gradle", "include 'app'\n".into()),
+                    (
+                        "app/build.gradle",
+                        rule("includeVersion('com.google.code.gson', 'gson', '2.10.1')"),
+                    ),
+                ],
+            ),
+        ];
+        for (named, tree) in cases {
+            let borrowed: Vec<(&str, &str)> = tree.iter().map(|(r, b)| (*r, b.as_str())).collect();
+            let err = run(&fs(&borrowed), &patch()).unwrap_err();
+            assert_eq!(
+                refusal_reason(&err),
+                "gradle_exclusive_content_conflict",
+                "{named}"
+            );
+            assert!(err.detail.contains(named), "{named}: wrong file named");
+        }
+        for ok in [
+            rule("includeGroup 'org.other'"),
+            rule("includeGroupAndSubgroups 'com.googlex'"),
+            "repositories { exclusiveContent { forRepository { maven { name = 'socketPatchVendor_x' } }; filter { includeGroup 'com.google.code.gson' } } }\n".to_string(),
+        ] {
+            let files = fs(&[("settings.gradle", "include 'app'\n"), ("app/build.gradle", &ok)]);
+            assert!(run(&files, &patch()).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn android_anywhere_in_the_build_refuses_naming_the_file() {
+        for (named, tree) in [
+            (
+                "app/build.gradle",
+                vec![
+                    ("settings.gradle", "include 'app'\n"),
+                    ("app/build.gradle", "plugins { id 'com.android.application' }\n"),
+                ],
+            ),
+            (
+                "gradle/libs.versions.toml",
+                vec![
+                    ("settings.gradle.kts", "include(\"app\")\n"),
+                    ("app/build.gradle.kts", "plugins { alias(libs.plugins.android.app) }\n"),
+                    (
+                        "gradle/libs.versions.toml",
+                        "[plugins]\nandroid-app = { id = \"com.android.application\", version = \"8.5.0\" }\n",
+                    ),
+                ],
+            ),
+        ] {
+            let err = run(&fs(&tree), &patch()).unwrap_err();
+            assert_eq!(refusal_reason(&err), "android_or_kmp", "{named}");
+            assert!(err.detail.contains(named), "{named}");
+        }
+    }
+
+    /// Build logic the graph cannot follow (a computed `apply from`, a
+    /// script that is not UTF-8) degrades the plan instead of being
+    /// silently skipped.
+    #[test]
+    fn unscanned_build_logic_is_degraded() {
+        let mut files = fs(&[
+            ("settings.gradle", "include 'app'\n"),
+            ("app/build.gradle", "apply from: someScript\n"),
+        ]);
+        let plan = run(&files, &patch()).unwrap();
+        assert_eq!(reasons(&plan), ["gradle_unscanned_build_logic"]);
+        files.insert("app/build.gradle".into(), b"// \xff\xfe\n".to_vec());
+        let plan = run(&files, &patch()).unwrap();
+        assert_eq!(reasons(&plan), ["gradle_unscanned_build_logic"]);
+        assert!(plan.warnings[0]
+            .detail
+            .contains("app/build.gradle: not UTF-8"));
+    }
+
+    /// A BOM stays first in an edited settings file; a settings file that
+    /// is not UTF-8 is refused, never decoded lossily.
+    #[test]
+    fn bom_settings_keep_their_bom_and_non_utf8_settings_are_refused() {
+        let files = fs(&[(
+            "settings.gradle",
+            "\u{feff}plugins { id 'a' version '1' }\n",
+        )]);
+        let plan = run(&files, &patch()).unwrap();
+        let out = text_of(&plan, "settings.gradle");
+        assert!(out.starts_with("\u{feff}pluginManagement {\n"), "{out:?}");
+        assert!(out.ends_with(&format!("{}\n", vendored_line(false, ""))));
+        assert_idempotent(&files, &patch());
+        let files = fs(&[("settings.gradle.kts", "\u{feff}")]);
+        let plan = run(&files, &patch()).unwrap();
+        assert_eq!(
+            text_of(&plan, "settings.gradle.kts"),
+            format!("\u{feff}{}\n", vendored_line(true, ""))
+        );
+        let mut files = fs(&[]);
+        files.insert(
+            "settings.gradle".into(),
+            b"rootProject.name = '\xe9'\n".to_vec(),
+        );
+        let err = run(&files, &patch()).unwrap_err();
+        assert_eq!(refusal_reason(&err), "build_file_unreadable");
+    }
+
+    const PGP_VM_HEAD: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<verification-metadata xmlns=\"https://schema.gradle.org/dependency-verification\">\n   <configuration>\n      <verify-metadata>true</verify-metadata>\n      <verify-signatures>true</verify-signatures>\n   </configuration>\n   <components>\n";
+
+    fn pgp_component(g: &str, a: &str, v: &str, names: &[&str]) -> String {
+        let mut s = format!("      <component group=\"{g}\" name=\"{a}\" version=\"{v}\">\n");
+        for n in names {
+            s.push_str(&format!("         <artifact name=\"{n}\">\n            <pgp value=\"84789D24DF77A32433CE1F079EB80E92EB2135B1\"/>\n         </artifact>\n"));
+        }
+        s.push_str("      </component>\n");
+        s
+    }
+
+    /// #487: pgp-only entries of the vendored pom and of its parent get a
+    /// `sha256` beside the `<pgp>` (Gradle cannot check a signature the
+    /// vendored repository does not have), the parent no longer counts as
+    /// listed until then, and the revert is byte-exact.
+    #[test]
+    fn pgp_only_metadata_entries_get_a_checksum_and_revert_byte_exact() {
+        let before = format!(
+            "{PGP_VM_HEAD}{}{}{VM_TAIL}",
+            pgp_component(
+                "com.google.code.gson",
+                "gson",
+                "2.10.1",
+                &["gson-2.10.1.jar", "gson-2.10.1.pom"]
+            ),
+            pgp_component(
+                "com.google.code.gson",
+                "gson-parent",
+                "2.10.1",
+                &["gson-parent-2.10.1.pom"]
+            ),
+        );
+        assert!(unverified_parent_chain(
+            &before,
+            std::str::from_utf8(GSON_POM).unwrap(),
+            None
+        ));
+        let files = fs(&[("settings.gradle", ""), (VERIFICATION_REL, &before)]);
+        let p = JvmPatch {
+            upstream_pom: GSON_POM,
+            ..patch()
+        };
+        let read = |rel: &str| files.get(rel).cloned();
+        let mut plan = plan(&read, &|d: &str| list_of(&files, d), &p).unwrap();
+        let parent_pom = b"<project><artifactId>gson-parent</artifactId></project>\n";
+        let metadata = [
+            MetadataArtifact {
+                group: "com.google.code.gson".into(),
+                artifact: "gson".into(),
+                version: "2.10.1".into(),
+                bytes: GSON_POM.to_vec(),
+                extension: "pom",
+            },
+            MetadataArtifact {
+                group: "com.google.code.gson".into(),
+                artifact: "gson-parent".into(),
+                version: "2.10.1".into(),
+                bytes: parent_pom.to_vec(),
+                extension: "pom",
+            },
+        ];
+        add_verification_metadata(&read, &mut plan, &metadata).unwrap();
+        let after = text_of(&plan, VERIFICATION_REL).to_string();
+        for (name, bytes) in [
+            ("gson-2.10.1.pom", GSON_POM),
+            ("gson-parent-2.10.1.pom", &parent_pom[..]),
+        ] {
+            let want = format!(
+                "         <artifact name=\"{name}\">\n            <pgp value=\"84789D24DF77A32433CE1F079EB80E92EB2135B1\"/>\n            <sha256 value=\"{}\" origin=\"socket-patch\"/>\n         </artifact>\n",
+                sha256_hex(bytes)
+            );
+            assert!(after.contains(&want), "{name}:\n{after}");
+        }
+        assert!(!unverified_parent_chain(
+            &after,
+            std::str::from_utf8(GSON_POM).unwrap(),
+            None
+        ));
+        for w in plan
+            .records
+            .iter()
+            .filter(|w| w.key.as_deref().is_some_and(|k| k.starts_with("metadata:")))
+        {
+            assert_eq!(op_of(w), "replace", "{:?}", w.key);
+            assert!(metadata_record_present(&after, w), "{:?}", w.key);
+        }
+        let disk = applied(&files, &plan);
+        let undo = unplan(&|rel| disk.get(rel).cloned(), &p.coords(), &plan.records);
+        assert_eq!(
+            reverted(&disk, &undo)[VERIFICATION_REL],
+            before.as_bytes(),
+            "byte-exact revert"
+        );
+    }
+
+    /// A tree vendored before the fix (the parent's pgp-only entry adopted
+    /// as is) fails `--check` while metadata verification is on.
+    #[test]
+    fn a_pre_fix_pgp_only_metadata_record_is_not_present() {
+        let vm = format!(
+            "{PGP_VM_HEAD}{}{VM_TAIL}",
+            pgp_component("org.apache", "apache", "27", &["apache-27.pom"])
+        );
+        let adopted = adopt(
+            VERIFICATION_REL,
+            VERIFICATION_FRAGMENT_KIND,
+            "metadata:org.apache:apache:27:pom",
+        );
+        assert!(!metadata_record_present(&vm, &adopted));
+        let off = vm.replace("<verify-metadata>true", "<verify-metadata>false");
+        assert!(metadata_record_present(&off, &adopted));
+        let fixed = vm.replace(
+            "            <pgp value=\"84789D24DF77A32433CE1F079EB80E92EB2135B1\"/>\n",
+            "            <pgp value=\"84789D24DF77A32433CE1F079EB80E92EB2135B1\"/>\n            <sha256 value=\"aa\" origin=\"x\"/>\n",
+        );
+        assert!(metadata_record_present(&fixed, &adopted));
+    }
+
+    /// #511: the derived `maven-metadata.xml` lists every vendored version
+    /// of the GA in Gradle order, follows the rows on revert, and goes
+    /// with the last one.
+    #[tokio::test]
+    async fn derived_metadata_follows_the_index_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        testing::populate(root, &[("settings.gradle", "rootProject.name = 'x'\n")]);
+        let pristine = testing::snapshot(root);
+        let mut ledger = BTreeMap::new();
+        let older = JvmPatch {
+            version: "2.9.0",
+            uuid: UUID_B,
+            ..patch()
+        };
+        testing::vendor(root, Shape::Gradle, &patch(), &mut ledger)
+            .await
+            .unwrap();
+        testing::vendor(root, Shape::Gradle, &older, &mut ledger)
+            .await
+            .unwrap();
+        let rel = derived_metadata_rel("com.google.code.gson", "gson");
+        let text = std::fs::read_to_string(root.join(&rel)).unwrap();
+        assert!(
+            text.contains("<latest>2.10.1</latest>\n    <release>2.10.1</release>\n    <versions>\n      <version>2.9.0</version>\n      <version>2.10.1</version>\n    </versions>"),
+            "{text}"
+        );
+        assert!(!text.contains("lastUpdated") && !text.contains('\r'));
+        let out = testing::revert(root, &patch(), &mut ledger).await;
+        assert!(out.success && out.warnings.is_empty(), "{out:?}");
+        let text = std::fs::read_to_string(root.join(&rel)).unwrap();
+        assert!(
+            text.contains("<latest>2.9.0</latest>") && !text.contains("2.10.1"),
+            "{text}"
+        );
+        assert!(replan_writes(root, &older).is_empty());
+        let out = testing::revert(root, &older, &mut ledger).await;
+        assert!(out.success && out.warnings.is_empty(), "{out:?}");
+        assert_eq!(testing::snapshot(root), pristine);
+    }
+
+    /// #511: a range or rich selector that admits the vendored version is
+    /// noted; one that admits no vendored version refuses (the build would
+    /// resolve another version, so nothing would be patched).
+    #[test]
+    fn ranges_are_noted_and_ranges_excluding_the_version_refuse() {
+        for (rel, src) in [
+            ("build.gradle", "dependencies { implementation 'com.google.code.gson:gson:[2.9,2.10.1]' }"),
+            ("build.gradle", "dependencies { implementation('com.google.code.gson:gson') { version { strictly '[2.9,2.11)'; prefer '2.10.1' } } }"),
+            ("build.gradle.kts", "dependencies { implementation(\"com.google.code.gson:gson:2.+\") }"),
+        ] {
+            let files = fs(&[("settings.gradle", ""), (rel, src)]);
+            let plan = run(&files, &patch()).unwrap();
+            assert!(
+                plan.warnings
+                    .iter()
+                    .any(|w| w.code == NOTE && w.detail.starts_with("reason: range_declared:")),
+                "{src}: {:?}",
+                plan.warnings
+            );
+            assert!(reasons(&plan).iter().all(|r| r == "range_declared"), "{src}");
+        }
+        for (rel, src) in [
+            ("build.gradle", "dependencies { implementation 'com.google.code.gson:gson:[2.11,3)' }"),
+            ("build.gradle", "dependencies { implementation('com.google.code.gson:gson') { version { strictly '[2.8,2.10)' } } }"),
+            ("gradle/libs.versions.toml", "[libraries]\ngson = { module = \"com.google.code.gson:gson\", version = { strictly = \"[2.11,)\" } }\n"),
+        ] {
+            let files = fs(&[("settings.gradle", ""), (rel, src)]);
+            let err = run(&files, &patch()).unwrap_err();
+            assert_eq!(refusal_reason(&err), "gradle_range_excludes_vendored", "{src}");
+        }
+        // A literal request of the version next to the range keeps it.
+        let files = fs(&[
+            ("settings.gradle", ""),
+            (
+                "build.gradle",
+                "dependencies { implementation 'com.google.code.gson:gson:[2.11,3)'; runtimeOnly 'com.google.code.gson:gson:2.10.1' }",
+            ),
+        ]);
+        assert!(run(&files, &patch()).is_ok());
+    }
+
+    fn extra(classifier: &str, bytes: &[u8]) -> ExtraArtifact {
+        ExtraArtifact {
+            classifier: classifier.into(),
+            extension: "jar".into(),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    /// #533: a declared classifier (string, Kotlin named-argument) is
+    /// served from the tree, indexed and listed in the marker; without its
+    /// bytes the plan refuses rather than break resolution.
+    #[test]
+    fn declared_classifiers_are_vendored_or_refused() {
+        let extras = [
+            extra("tests", b"TESTS-JAR"),
+            extra("sources", b"SOURCES-JAR"),
+        ];
+        for (rel, src) in [
+            ("build.gradle", "dependencies { testImplementation 'com.google.code.gson:gson:2.10.1:tests' }"),
+            ("build.gradle.kts", "dependencies { testImplementation(group = \"com.google.code.gson\", name = \"gson\", version = \"2.10.1\", classifier = \"tests\") }"),
+        ] {
+            let files = fs(&[("settings.gradle", ""), (rel, src)]);
+            let read = |r: &str| files.get(r).cloned();
+            assert_eq!(
+                declared_classifiers(&read, &|d: &str| list_of(&files, d), "com.google.code.gson", "gson"),
+                ["tests"],
+                "{src}"
+            );
+            let err = run(&files, &patch()).unwrap_err();
+            assert_eq!(err.code, "vendor_jvm_upstream_unavailable", "{src}");
+            assert_eq!(refusal_reason(&err), "classifier_unavailable", "{src}");
+            let p = JvmPatch {
+                extra_artifacts: &extras,
+                ..patch()
+            };
+            let plan = run(&files, &p).unwrap();
+            let tree = plan.tree_dir.clone();
+            for name in ["gson-2.10.1-tests.jar", "gson-2.10.1-sources.jar"] {
+                assert!(plan.writes.iter().any(|w| w.tree && w.rel == format!("{tree}/{name}")), "{name}");
+                assert!(text_of(&plan, INDEX_REL).contains(&format!("/2.10.1/{name}\t")), "{name}");
+            }
+            let after = applied(&files, &plan);
+            let c = p.coords();
+            let committed = committed_extras(&|r: &str| after.get(r).cloned(), &c).unwrap();
+            assert_eq!(committed.len(), 2);
+            assert!(committed.contains(&extras[0]) && committed.contains(&extras[1]));
+            let again = run(&after, &p).unwrap();
+            assert!(again.writes.is_empty());
+        }
+        let bad = [extra("../x", b"x")];
+        let p = JvmPatch {
+            extra_artifacts: &bad,
+            ..patch()
+        };
+        let files = fs(&[("settings.gradle", "")]);
+        assert_eq!(run(&files, &p).unwrap_err().code, "unsafe_coordinates");
+    }
+
+    /// VEX liveness: an intact wiring is live; a CRLF script still is; a
+    /// conflicting rule added since vendoring or unchecked build logic
+    /// withdraws it, and so does an edited script.
+    #[test]
+    fn vex_liveness_requires_a_clean_replan() {
+        let files = fs(&[
+            ("settings.gradle", "include 'app'\n"),
+            ("app/build.gradle", ""),
+        ]);
+        let p = patch();
+        let plan = run(&files, &p).unwrap();
+        let after = applied(&files, &plan);
+        let live = |files: &BTreeMap<String, Vec<u8>>| {
+            wired(
+                &|r: &str| files.get(r).cloned(),
+                &|d: &str| list_of(files, d),
+                &p.coords(),
+            )
+        };
+        assert!(live(&after));
+        assert!(live(&crlf(&after, &[SCRIPT_REL, INDEX_REL])));
+        let mut conflict = after.clone();
+        conflict.insert(
+            "app/build.gradle".into(),
+            b"repositories { exclusiveContent { forRepository { mavenCentral() }; filter { includeGroup 'com.google.code.gson' } } }\n".to_vec(),
+        );
+        assert!(!live(&conflict));
+        let mut unscanned = after.clone();
+        unscanned.insert(
+            "app/build.gradle".into(),
+            b"apply from: computed\n".to_vec(),
+        );
+        assert!(!live(&unscanned));
+        let mut edited = after.clone();
+        edited
+            .get_mut(SCRIPT_REL)
+            .unwrap()
+            .extend_from_slice(b"// x\n");
+        assert!(!live(&edited));
+        assert!(references(&|r: &str| edited.get(r).cloned(), &p.coords()));
     }
 }

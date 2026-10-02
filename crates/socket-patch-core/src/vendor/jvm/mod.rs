@@ -33,6 +33,9 @@ pub const SETTINGS_FRAGMENT_KIND: &str = "gradle_settings_fragment";
 pub const VERIFICATION_FRAGMENT_KIND: &str = "gradle_verification_fragment";
 /// A file the backend owns outright (script, index, tree `.gitattributes`).
 pub const OWNED_FILE_KIND: &str = "jvm_owned_file";
+/// The Gradle tree's artifact-level `maven-metadata.xml`, derived from the
+/// index rows of the GA (shared by every vendored version of it).
+pub const DERIVED_METADATA_KIND: &str = "gradle_derived_metadata";
 /// One vendored artifact file; `new` = its sha256.
 pub const TREE_KIND: &str = "jvm_vendor_tree";
 /// A directory vendor created; removed on revert once empty.
@@ -46,6 +49,7 @@ pub const KINDS: &[&str] = &[
     SETTINGS_FRAGMENT_KIND,
     VERIFICATION_FRAGMENT_KIND,
     OWNED_FILE_KIND,
+    DERIVED_METADATA_KIND,
     TREE_KIND,
     CREATED_DIR_KIND,
     UPSTREAM_KIND,
@@ -75,6 +79,21 @@ pub fn wrapper_version(read: ReadFn<'_>, tool: &str) -> Option<(u32, u32, u32)> 
 /// Reads a project-relative, forward-slash path. `None` = missing or
 /// unreadable.
 pub type ReadFn<'a> = &'a dyn Fn(&str) -> Option<Vec<u8>>;
+
+/// Lists a project-relative directory (`""` = the root) the way
+/// [`crate::gradle::ListFn`] does: bare names, directories ending in `/`.
+pub type ListFn<'a> = crate::gradle::ListFn<'a>;
+
+/// A directory listing that knows nothing (for callers with no tree).
+pub fn no_list(_: &str) -> Vec<String> {
+    Vec::new()
+}
+
+/// Project text for the script graph: a BOM is dropped and bytes that are
+/// not UTF-8 read as missing (unparseable), never decoded lossily.
+pub(crate) fn text_reader<'a>(read: ReadFn<'a>) -> impl Fn(&str) -> Option<String> + 'a {
+    move |rel: &str| crate::gradle::dsl::decode(&read(rel)?)
+}
 
 /// The identity of one patch: enough to find (and revert) its wiring.
 #[derive(Debug, Clone, Copy)]
@@ -109,6 +128,29 @@ impl Coords<'_> {
     }
 }
 
+/// An extra artifact of the patched GAV the Gradle tree also serves
+/// unchanged (`<a>-<v>-<classifier>.<extension>`): a classifier variant a
+/// build script declares, or the `sources` jar IDEs ask for. Gradle's
+/// `exclusiveContent` claims every file of the GAV, so one the tree lacks
+/// stops resolving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraArtifact {
+    pub classifier: String,
+    pub extension: String,
+    /// The upstream bytes, verbatim.
+    pub bytes: Vec<u8>,
+}
+
+impl ExtraArtifact {
+    /// `<a>-<v>-<classifier>.<extension>`.
+    pub fn file_name(&self, artifact_id: &str, version: &str) -> String {
+        format!(
+            "{artifact_id}-{version}-{}.{}",
+            self.classifier, self.extension
+        )
+    }
+}
+
 /// One patched artifact, fully materialised.
 #[derive(Debug, Clone)]
 pub struct JvmPatch<'a> {
@@ -123,6 +165,8 @@ pub struct JvmPatch<'a> {
     pub upstream_pom: &'a [u8],
     /// The upstream Gradle module metadata, verbatim, when published.
     pub upstream_module: Option<&'a [u8]>,
+    /// Classifier artifacts served beside the jar (Gradle only).
+    pub extra_artifacts: &'a [ExtraArtifact],
 }
 
 impl<'a> JvmPatch<'a> {
@@ -151,6 +195,9 @@ pub enum Shape {
     MavenReactor,
     /// No root `pom.xml`, and a Gradle settings or build script.
     Gradle,
+    /// A root `pom.xml` (a reactor or a single module) next to a Gradle
+    /// build: both are planned (see [`Detected`]).
+    Mixed,
     /// Anything else (including a single-module pom, which stays legacy).
     Other,
 }
@@ -215,40 +262,123 @@ pub struct JvmUnplan {
     pub still_wired: bool,
 }
 
-/// Classify the project root.
-pub fn detect(read: ReadFn<'_>) -> Shape {
-    if let Some(pom) = read("pom.xml") {
-        let text = String::from_utf8_lossy(&pom);
-        // Single-pom projects stay on the legacy path until Phase 4.
-        return if maven_reactor::declares_modules(&text) {
-            Shape::MavenReactor
-        } else {
-            Shape::Other
-        };
-    }
-    const GRADLE_FILES: &[&str] = &[
-        "settings.gradle",
-        "settings.gradle.kts",
-        "build.gradle",
-        "build.gradle.kts",
-    ];
-    if GRADLE_FILES.iter().any(|f| read(f).is_some()) {
-        Shape::Gradle
-    } else {
-        Shape::Other
+/// The Maven half of a project root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MavenShape {
+    /// A root `pom.xml` that declares `<modules>`.
+    Reactor,
+    /// A root `pom.xml` without `<modules>`.
+    Single,
+}
+
+/// Every JVM build the project root holds. A root can hold both a
+/// `pom.xml` and a Gradle build (a migration, or a repository publishing
+/// with both): each build resolves on its own, so both are vendored, in
+/// one transaction (#395).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Detected {
+    pub maven: Option<MavenShape>,
+    /// A Gradle settings or build script.
+    pub gradle: bool,
+}
+
+impl Detected {
+    /// The backend's planner shape: a single pom alone stays on the legacy
+    /// backend; next to a Gradle build it is planned as a one-pom reactor,
+    /// so both halves share one ledger entry.
+    pub fn shape(&self) -> Shape {
+        match (self.maven, self.gradle) {
+            (Some(_), true) => Shape::Mixed,
+            (Some(MavenShape::Reactor), false) => Shape::MavenReactor,
+            (None, true) => Shape::Gradle,
+            _ => Shape::Other,
+        }
     }
 }
 
+const GRADLE_FILES: &[&str] = &[
+    "settings.gradle",
+    "settings.gradle.kts",
+    "build.gradle",
+    "build.gradle.kts",
+];
+
+/// Every build the project root holds.
+pub fn detect_builds(read: ReadFn<'_>) -> Detected {
+    let maven = read("pom.xml").map(|pom| {
+        if maven_reactor::declares_modules(&String::from_utf8_lossy(&pom)) {
+            MavenShape::Reactor
+        } else {
+            MavenShape::Single
+        }
+    });
+    Detected {
+        maven,
+        gradle: GRADLE_FILES.iter().any(|f| read(f).is_some()),
+    }
+}
+
+/// Classify the project root (see [`Detected::shape`]).
+pub fn detect(read: ReadFn<'_>) -> Shape {
+    detect_builds(read).shape()
+}
+
 /// Plan the vendoring of `patch` for a project of `shape`.
-pub fn plan(shape: Shape, read: ReadFn<'_>, patch: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusal> {
+pub fn plan(
+    shape: Shape,
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    patch: &JvmPatch<'_>,
+) -> Result<JvmPlan, JvmRefusal> {
+    plan_with_config(shape, read, list, patch, true)
+}
+
+/// [`plan`] with an explicit Maven config policy (reactor and mixed roots).
+pub fn plan_with_config(
+    shape: Shape,
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    patch: &JvmPatch<'_>,
+    config_enabled: bool,
+) -> Result<JvmPlan, JvmRefusal> {
     match shape {
-        Shape::MavenReactor => maven_reactor::plan(read, patch),
-        Shape::Gradle => gradle::plan(read, patch),
+        Shape::MavenReactor => maven_reactor::plan_with_config(read, patch, config_enabled),
+        Shape::Gradle => gradle::plan(read, list, patch),
+        Shape::Mixed => {
+            // Both halves or neither: a refusal of either writes nothing.
+            let maven = maven_reactor::plan_with_config(read, patch, config_enabled)?;
+            let gradle = gradle::plan(read, list, patch)?;
+            Ok(compose(maven, gradle))
+        }
         Shape::Other => Err(JvmRefusal {
             code: "vendor_jvm_shape_unsupported",
             detail: "reason: no_build_file: not a multi-module Maven reactor or a Gradle build"
                 .to_string(),
         }),
+    }
+}
+
+/// One plan for a mixed root: the Maven tree's jar is the entry's artifact
+/// (the Gradle tree holds the same bytes under the base version).
+fn compose(maven: JvmPlan, gradle: JvmPlan) -> JvmPlan {
+    let mut writes = maven.writes;
+    writes.extend(gradle.writes);
+    writes.sort_by(|a, b| a.rel.cmp(&b.rel));
+    let mut records = maven.records;
+    records.extend(gradle.records);
+    let mut tree_files = maven.tree_files;
+    tree_files.extend(gradle.tree_files);
+    tree_files.sort();
+    tree_files.dedup();
+    let mut warnings = maven.warnings;
+    warnings.extend(gradle.warnings);
+    JvmPlan {
+        writes,
+        records,
+        tree_files,
+        warnings,
+        tree_dir: maven.tree_dir,
+        jar_rel: maven.jar_rel,
     }
 }
 
@@ -384,7 +514,9 @@ pub(crate) fn tree_files(writes: &[FileWrite]) -> Vec<(String, String)> {
 }
 
 /// Keep only writes that change a file, sorted and de-duplicated by path
-/// (the last write for a path wins).
+/// (the last write for a path wins). An owned text file ([`eol_blind`])
+/// that differs only in line endings is unchanged: a `core.autocrlf`
+/// checkout holds it with CRLF (#429).
 pub(crate) fn finish_writes(read: ReadFn<'_>, writes: Vec<FileWrite>) -> Vec<FileWrite> {
     let mut by_rel = std::collections::BTreeMap::new();
     for w in writes {
@@ -392,8 +524,31 @@ pub(crate) fn finish_writes(read: ReadFn<'_>, writes: Vec<FileWrite>) -> Vec<Fil
     }
     by_rel
         .into_values()
-        .filter(|w| read(&w.rel).as_deref() != Some(w.bytes.as_slice()))
+        .filter(|w| match read(&w.rel) {
+            None => true,
+            Some(cur) if !w.tree && eol_blind(&w.rel) => {
+                !crate::gradle::eol::eol_eq(&cur, &w.bytes)
+            }
+            Some(cur) => cur != w.bytes,
+        })
         .collect()
+}
+
+/// The text files the backend owns or derives whole (script, index,
+/// `.gitattributes`, derived `maven-metadata.xml`, `.mvn/maven.config`):
+/// compared line-ending-blind. Tree files stay byte-exact.
+pub(crate) fn eol_blind(rel: &str) -> bool {
+    [
+        gradle::SCRIPT_REL,
+        gradle::INDEX_REL,
+        gradle::GITATTRIBUTES_REL,
+        gradle::SCRIPT_GITATTRIBUTES_REL,
+        gradle::VENDOR_GITATTRIBUTES_REL,
+        maven_reactor::GITATTRIBUTES_REL,
+        maven_reactor::MAVEN_CONFIG,
+    ]
+    .contains(&rel)
+        || gradle::is_derived_metadata_path(rel)
 }
 
 /// `sha1` hex of `bytes`, the bare-40-hex sidecar body Maven reads.
@@ -411,6 +566,11 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 /// `.gitattributes` for an owned tree root: keeps git from rewriting line
 /// endings in vendored poms and module files (layer-1 hashes are exact).
 pub(crate) const TREE_GITATTRIBUTES: &str = "* -text\n";
+
+/// Whether `current` is still the owned text `ours` (line endings aside).
+pub(crate) fn is_ours(current: Option<&[u8]>, ours: &str) -> bool {
+    current.is_some_and(|c| crate::gradle::eol::eol_eq(c, ours.as_bytes()))
+}
 
 /// A disk round-trip harness for the planners' tests: vendor and revert
 /// the way the CLI does (ledger peers, carry-forward, stale sweep).
@@ -443,7 +603,12 @@ pub(crate) mod testing {
         ledger: &mut BTreeMap<String, VendorEntry>,
     ) -> Result<JvmPlan, JvmRefusal> {
         let reader = apply::ProjectReader::new(root);
-        let plan = super::plan(shape, &|rel: &str| reader.read(rel), patch)?;
+        let plan = super::plan(
+            shape,
+            &|rel: &str| reader.read(rel),
+            &|dir: &str| reader.list(dir),
+            patch,
+        )?;
         assert_eq!(reader.escaped(), None);
         if plan.writes.is_empty() {
             return Ok(plan);
@@ -545,6 +710,7 @@ mod tests {
             jar: b"jar",
             upstream_pom: b"pom",
             upstream_module: None,
+            extra_artifacts: &[],
         }
     }
 
@@ -604,6 +770,193 @@ mod tests {
         assert_eq!(detect(&gradle), Shape::Gradle);
         let empty = |_: &str| None;
         assert_eq!(detect(&empty), Shape::Other);
+    }
+
+    /// #395: a `pom.xml` next to a Gradle build is both, whichever kind of
+    /// pom it is; a single pom alone stays on the legacy backend.
+    #[test]
+    fn detect_reports_both_builds_of_a_mixed_root() {
+        let files = |pom: &'static [u8], gradle: Option<&'static str>| {
+            move |p: &str| {
+                if p == "pom.xml" {
+                    Some(pom.to_vec())
+                } else {
+                    (Some(p) == gradle).then(Vec::new)
+                }
+            }
+        };
+        let reactor = b"<project><modules><module>a</module></modules></project>";
+        let single = b"<project></project>";
+        for (pom, gradle, maven, shape) in [
+            (
+                &single[..],
+                Some("build.gradle"),
+                MavenShape::Single,
+                Shape::Mixed,
+            ),
+            (
+                &single[..],
+                Some("settings.gradle.kts"),
+                MavenShape::Single,
+                Shape::Mixed,
+            ),
+            (
+                &reactor[..],
+                Some("build.gradle.kts"),
+                MavenShape::Reactor,
+                Shape::Mixed,
+            ),
+            (&reactor[..], None, MavenShape::Reactor, Shape::MavenReactor),
+            (&single[..], None, MavenShape::Single, Shape::Other),
+        ] {
+            let read = files(pom, gradle);
+            let d = detect_builds(&read);
+            assert_eq!(d.maven, Some(maven), "{gradle:?}");
+            assert_eq!(d.gradle, gradle.is_some(), "{gradle:?}");
+            assert_eq!(d.shape(), shape, "{gradle:?}");
+        }
+    }
+
+    const MIXED_UUID: &str = "1d3c1fd2-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+
+    fn mixed_patch() -> JvmPatch<'static> {
+        JvmPatch {
+            group_id: "org.apache.commons",
+            artifact_id: "commons-text",
+            version: "1.10.0",
+            uuid: MIXED_UUID,
+            jar: b"PATCHED-JAR",
+            upstream_pom: b"<project><modelVersion>4.0.0</modelVersion><groupId>org.apache.commons</groupId><artifactId>commons-text</artifactId><version>1.10.0</version></project>\n",
+            upstream_module: None,
+            extra_artifacts: &[],
+        }
+    }
+
+    const MIXED_POM: &str = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>com.x</groupId>\n  <artifactId>app</artifactId>\n  <version>1</version>\n  <dependencies>\n    <dependency>\n      <groupId>org.apache.commons</groupId>\n      <artifactId>commons-text</artifactId>\n      <version>1.10.0</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+
+    /// #395: a single pom next to a Gradle build vendors both in one
+    /// transaction (the suffixed Maven tree and pin, the Gradle tree and
+    /// apply line), re-plans to nothing, and reverts every byte.
+    #[tokio::test]
+    async fn mixed_root_vendors_both_builds_and_reverts_byte_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        testing::populate(
+            root,
+            &[
+                ("pom.xml", MIXED_POM),
+                ("settings.gradle", "rootProject.name = 'app'\r\n"),
+                (
+                    "build.gradle",
+                    "plugins { id 'java' }\nrepositories { mavenCentral() }\ndependencies { implementation 'org.apache.commons:commons-text:1.10.0' }\n",
+                ),
+            ],
+        );
+        let (pristine, pristine_dirs) = (testing::snapshot(root), testing::dirs(root));
+        let read = |rel: &str| apply::read_project_file(root, rel);
+        assert_eq!(detect(&read), Shape::Mixed);
+        let mut ledger = std::collections::BTreeMap::new();
+        let p = mixed_patch();
+        let plan = testing::vendor(root, Shape::Mixed, &p, &mut ledger)
+            .await
+            .unwrap();
+        let sv = p.suffixed_version();
+        assert_eq!(
+            plan.jar_rel,
+            format!(
+                ".socket/vendor/maven2/org/apache/commons/commons-text/{sv}/commons-text-{sv}.jar"
+            )
+        );
+        let on_disk = testing::snapshot(root);
+        assert_eq!(
+            on_disk[".socket/vendor/gradle/org/apache/commons/commons-text/1.10.0/commons-text-1.10.0.jar"],
+            b"PATCHED-JAR"
+        );
+        assert_eq!(on_disk[&plan.jar_rel], b"PATCHED-JAR");
+        assert!(String::from_utf8_lossy(&on_disk["pom.xml"]).contains(&sv));
+        assert!(
+            String::from_utf8_lossy(&on_disk["settings.gradle"]).ends_with(
+                "apply from: '.socket/gradle/socket-patch.settings.gradle' // socket-patch\r\n"
+            )
+        );
+        let entry = ledger.values().next().unwrap().clone();
+        assert!(apply::entry_wired_checked(root, &entry).unwrap());
+        apply::check_entry(root, &entry, None).unwrap();
+        let again = plan_with_config(
+            Shape::Mixed,
+            &read,
+            &|d: &str| apply::ProjectReader::new(root).list(d),
+            &p,
+            true,
+        )
+        .unwrap();
+        assert!(again.writes.is_empty(), "{:?}", again.writes);
+        let out = testing::revert(root, &p, &mut ledger).await;
+        assert!(out.success && out.warnings.is_empty(), "{out:?}");
+        assert_eq!(testing::snapshot(root), pristine);
+        assert_eq!(testing::dirs(root), pristine_dirs);
+    }
+
+    /// #395: a refusal by either half writes nothing for the other.
+    #[tokio::test]
+    async fn mixed_root_refusal_on_either_side_writes_nothing() {
+        for (rel, body, pom) in [
+            (
+                "build.gradle",
+                "plugins { id 'com.android.application' }\n",
+                MIXED_POM,
+            ),
+            (
+                "build.gradle",
+                "plugins { id 'java' }\n",
+                "<project><modules></project>",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            testing::populate(
+                root,
+                &[("pom.xml", pom), ("settings.gradle", ""), (rel, body)],
+            );
+            let pristine = testing::snapshot(root);
+            let mut ledger = std::collections::BTreeMap::new();
+            assert!(
+                testing::vendor(root, Shape::Mixed, &mixed_patch(), &mut ledger)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(testing::snapshot(root), pristine, "{rel}: {pom}");
+            assert!(ledger.is_empty());
+        }
+    }
+
+    #[test]
+    fn owned_text_compares_ignore_only_line_endings() {
+        let read = |rel: &str| match rel {
+            ".socket/vendor/gradle-index.tsv" => Some(b"#h\r\nrow\r\n".to_vec()),
+            ".socket/vendor/gradle/g/a/1/a-1.pom" => Some(b"<p>\r\n".to_vec()),
+            _ => None,
+        };
+        let writes = vec![
+            FileWrite {
+                rel: ".socket/vendor/gradle-index.tsv".into(),
+                bytes: b"#h\nrow\n".to_vec(),
+                tree: false,
+            },
+            FileWrite {
+                rel: ".socket/vendor/gradle/g/a/1/a-1.pom".into(),
+                bytes: b"<p>\n".to_vec(),
+                tree: true,
+            },
+        ];
+        let kept: Vec<String> = finish_writes(&read, writes)
+            .into_iter()
+            .map(|w| w.rel)
+            .collect();
+        assert_eq!(kept, [".socket/vendor/gradle/g/a/1/a-1.pom"]);
+        assert!(is_ours(Some(b"* -text\r\n"), TREE_GITATTRIBUTES));
+        assert!(!is_ours(Some(b"* -text \n"), TREE_GITATTRIBUTES));
+        assert!(!is_ours(None, TREE_GITATTRIBUTES));
     }
 }
 
