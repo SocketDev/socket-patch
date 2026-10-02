@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Composer bug-hunt routine (label pm:composer).
 
-Last updated: 2026-10-01 (run 6), main `61cfb9b` (after #358 Composer rewriter + hosted-by-default scan/get, #446 `-g` scoping), latest release v4.0.0.
+Last updated: 2026-10-02 (run 7), main `61cfb9b` (after #358 Composer rewriter + hosted-by-default scan/get, #446 `-g` scoping), latest release v4.0.0.
 
 ## Coverage matrix
 
@@ -36,6 +36,17 @@ Cells are "pass", "fail #N" or "untested". Upstream `composer-compatibility.yml`
 
 Hosted packagist-origin psr/log (lockfile-only, 2.10.3): scan → rollback byte-identical: pass. Hand-added `transport-options` kept: #399.
 
+### Mode takeovers (run 7, main `61cfb9b`, Linux PHP 8.3, packagist-origin psr/log 3.0.2)
+
+| Composer | hosted → vendored → install → vex | vendored → hosted → install | vendored → hosted → `rollback` | `vendor --revert` → hosted (control) |
+| --- | --- | --- | --- | --- |
+| 1.10.28 | pass | **fail #536** (ValueError) | **fail #536** (refused) | pass |
+| 2.2.30 | pass | pass | **fail #536** | untested |
+| 2.8.12 | untested | pass | **fail #536** | untested |
+| 2.10.3 | pass | pass | **fail #536** | untested |
+
+macOS/Windows: untested (pure lock logic; Composer 1's `transport-options` crash is cross-OS per #399's probe).
+
 ### Global (`-g`) mode — run 3, main `2463257`
 
 | OS | Composer | `scan -g` report (default home) | hosted `-g` refusal | `-g` apply / vex / rollback | custom global vendor-dir | composer not on PATH |
@@ -59,12 +70,12 @@ OS-independent (pure path logic). macOS/Windows: untested.
 
 ## Backlog
 
-1. **Maintainer request (in progress):** global `-g` mode. Remaining: a non-writable global dir must fail loudly (non-root probe), `SOCKET_GLOBAL=1` and space/unicode `--global-prefix` cells, and a re-run after #438/#439 are fixed (PR #442 targets #438), including #446's `-g` scoping inside a hosted Composer project.
-2. macOS/Windows probe of vendored path-repo + source-install revert (a Windows junction path repo with existing `transport-options`).
-3. Re-run the Composer 1 installers cells when a fix for #463 lands, and add 2.10.3 installers cells. Re-run the path-repo hosted cell when #399 is fixed, and #515 when it's fixed.
-4. Hosted ↔ vendored takeover on a packagist-origin lockfile-only fixture (psr/log 3.0.2 resolves from packagist metadata; zipballs are unreachable).
+1. Re-run #536 once Composer joins the vendored → hosted `takeover_capable` set (PR #503 adds only pypi). Also `get <uuid> --mode hosted` over a vendored entry.
+2. **Maintainer request (in progress):** global `-g` mode. Remaining: a non-writable global dir must fail loudly (non-root probe), `SOCKET_GLOBAL=1` and space/unicode `--global-prefix` cells, and a re-run after #438/#439 are fixed (PR #442 targets #438), including #446's `-g` scoping inside a hosted Composer project.
+3. macOS/Windows probe of vendored path-repo + source-install revert (a Windows junction path repo with existing `transport-options`).
+4. Re-run the Composer 1 installers cells when a fix for #463 lands, and add 2.10.3 installers cells. Re-run the path-repo hosted cell when #399 is fixed, and #515 when it's fixed.
 5. `COMPOSER=<other>.json`: the crawler and hosted mode ignore it (scan finds 0 packages). Only the vex gap is documented. Ask maintainers whether to document it or file it.
-6. Delete the leftover probe branches `bughunt/composer/20260930-srconly-probe`, `bughunt/composer/20261001-global-probe` and `bughunt/composer/20261001-c1-topts` (the sandbox git proxy refuses deletes, re-tried in run 6). Needs a maintainer.
+6. Delete the leftover probe branches `bughunt/composer/20260930-srconly-probe`, `bughunt/composer/20261001-global-probe` and `bughunt/composer/20261001-c1-topts` (the sandbox git proxy refuses deletes). Needs a maintainer.
 
 ## Known non-bugs
 
@@ -92,3 +103,5 @@ OS-independent (pure path logic). macOS/Windows: untested.
 - Vendored mode is service-only in v5: `vendor --offline` without a committed artifact is `vendor_service_offline_conflict`. Mock `POST …/patches/package` (granted, sha512 SRI) plus a single-top-dir zip.
 - Hosted rollback restores `dist`/`source` from packagist metadata (`SOCKET_PACKAGIST_URL`), not from the pre-rewrite lock, so hand-added fields such as `dist.mirrors` on a packagist-origin entry aren't restored. Documented. Packagist.org entries carry no mirrors.
 - Mock hygiene: agent-mode `repair` fetches `/patches/diff/<uuid>`. Without that route it reports `download_failed`.
+- A hosted rewrite of a dist-only entry (no `source`) doesn't reinstall over an existing `vendor/` on Composer 2 (Composer compares only version and dist/source references). The CLI's next steps say to remove `vendor/<v>/<n>` first, and `vex` omits it as `not_applied`.
+- Mock hygiene: on Composer 2, a loopback `http://` mock needs `secure-http: false`. Put it in `$COMPOSER_HOME/config.json`, not composer.json.
