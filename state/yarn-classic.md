@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-02 (run 6), main `61cfb9b`, latest release v4.0.0. Runs 5 and 6 added the cells in "Run 5 cells" and "Run 6 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-02 (run 7), main `61cfb9b`, latest release v4.0.0. Runs 5–7 added the cells in "Run 5 cells", "Run 6 cells" and "Run 7 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -56,12 +56,18 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Uppercase names (`JSONStream`), A/H/V + frozen + vex + rollback: pass. `yarn import` locks, H/V: pass.
 - Hosted pin `Authorization` leakage (6 `.npmrc` auth configs): none on 1.0.2 / 1.6.0 / 1.9.4 / 1.12.3 / 1.17.3 / 1.22.22: pass.
 
+### Run 7 cells (`61cfb9b`)
+- Dev flow after scan (`yarn add`, then a frozen fresh install, `vex`, `vendor --check`, `--pure-lockfile` reinstall), H and V: pass on Linux 1.0.2 / 1.6.0 (H) and 1.7.0 / 1.10.1 / 1.22.22, Windows 1.7.0 / 1.10.1 / 1.22.22, macOS 1.7.0 / 1.22.22 (probe).
+- `--production` install, hosted + vex: pass (1.22.22). `integrity sha1-` locks, H / V + rollback: pass (1.10.1 / 1.22.22).
+- Odd range keys (`">= a < b"`, `||`, `x`, hyphen, `latest`, `v`-prefix), H: pass. Workspace member under `tests/` + `socket.yml` policies (A/H): pass.
+- `yarn set version classic` layout (`.yarnrc.yml` yarnPath + `packageManager`), A/H/V: pass. `vendor --revert` on LF / CRLF / BOM+CRLF (1.7.0 / 1.22.22): byte-exact.
+
 ## Backlog
 
 1. **Maintainer request (global mode), still open:** Windows once #442 merges (#434 / #437, and the Berry handover lead about the `.cmd` shim); yarn via corepack and the Windows MSI; 1.6.0 / 1.9.4 on the probe; a read-only prefix on Windows (Program Files). Re-run get-mode cells after #446.
-2. `--modules-folder` at workspace level and via env (`YARN_MODULES_FOLDER`, `npm_config_modules_folder`).
-3. `--production` installs: hosted vex on devDependencies that are locked but not installed.
-4. `socket.yml` `patches` policy on a workspace member path; `--pure-lockfile` dev flows.
+2. Re-check #493 after #520 merges: workspace-level and `--install.modules-folder` forms.
+3. Hosted rollback on `integrity sha1-` locks (what integrity the restored entry gets).
+4. `.yarnclean` / `yarn autoclean` vs agent / hosted patched files and VEX hash verification.
 5. Re-run the v4-only project matrix columns (git dep #363, offline mirror H #364) on macOS/Windows once fixes land.
 
 ## Known non-bugs
@@ -94,3 +100,6 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - `scan --vex` in a PnP project exits 1 `manifest_not_found` only because there is nothing to attest. Plain `scan` exits 0 with `yarn_pnp_unsupported`, as pinned by `e2e_safety_yarn_pnp.rs`.
 - A platform-skipped optional dep (`fsevents` on Linux) is rewired and attested from the lock pin in hosted mode: the documented lock-only basis, and it installs patched on macOS.
 - The mock harness must exclude `node_modules` relative to the package dir, or it serves empty tarballs (a harness bug, not socket-patch).
+- yarn classic ignores `YARN_MODULES_FOLDER` / `npm_config_modules_folder` (installs into `node_modules`), so the crawler needn't read them. A `~/.yarnrc` `--modules-folder` resolves relative to `$HOME`, not the project.
+- v5 has no `setup` subcommand. Agent cells use `apply`.
+- Probe branch `bughunt/yarn-classic/20261002-dev-flow` is also left on the remote (the proxy blocks deletion).
