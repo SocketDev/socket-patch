@@ -4946,20 +4946,30 @@ fn rewrite_gem(
         // written or already present) — the lock pin below is gated on it.
         let mut source_placed = false;
         if let Some(gf) = gemfile.as_mut() {
-            // Looser "declared at all?" probe: counts every `gem` call that
-            // names the gem, in any form (indented in a group, parenthesized,
-            // our own source block). It gates the append branch (appending
-            // next to a declaration the recognizer below cannot parse would
-            // leave the gem declared twice) and catches a gem declared more
-            // than once: rewriting only one of them leaves `= x.y.z` next to
-            // the other requirement, and bundler refuses the Gemfile (#548).
+            // Looser "declared at all?" probe: matches every `gem` call that
+            // names the gem anywhere in its arguments, in any form. It gates
+            // the append branch: appending next to a declaration the
+            // recognizer below cannot parse would leave the gem declared
+            // twice. Too loose to count declarations with, since it also
+            // matches `gem "rails", require: "rack"` or a trailing comment.
             let declared_re = Regex::new(
                 &(String::from(r#"(?m)^[ \t]*gem\b[^\n]*["']"#)
                     + &regex::escape(&dep.name)
                     + r#"["']"#),
             )
             .expect("declaration probe regex from the escaped gem name is valid");
-            if declared_re.find_iter(gf).nth(1).is_some() {
+            // Declarations proper: `gem` calls whose FIRST argument is the
+            // gem (indented in a group, parenthesized, `gem"x"`, our own
+            // source block). More than one means rewriting only one leaves
+            // `= x.y.z` next to the other requirement, and bundler refuses
+            // the Gemfile (#548).
+            let declaration_re = Regex::new(
+                &(String::from(r#"(?m)^[ \t]*gem[ \t]*\(?[ \t]*["']"#)
+                    + &regex::escape(&dep.name)
+                    + r#"["']"#),
+            )
+            .expect("declaration regex from the escaped gem name is valid");
+            if declaration_re.find_iter(gf).nth(1).is_some() {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_gem_declared_more_than_once".into(),
                     detail: format!(
@@ -11097,6 +11107,7 @@ mod tests {
             "source \"https://rubygems.org\"\n\ngem \"vuln-gem\"\n\n\
              group :test do\n  gem \"vuln-gem\"\nend\n",
             "source \"https://rubygems.org\"\n\ngem \"vuln-gem\"\ngem(\"vuln-gem\")\n",
+            "source \"https://rubygems.org\"\n\ngem \"vuln-gem\"\ngem\"vuln-gem\"\n",
         ] {
             let mut files = BTreeMap::new();
             files.insert("Gemfile".to_string(), gemfile.to_string());
@@ -11113,6 +11124,41 @@ mod tests {
                 vec!["redirect_gem_declared_more_than_once"],
                 "{gemfile}: {:?}",
                 r.warnings
+            );
+        }
+    }
+
+    /// #548 follow-up: only `gem` calls whose FIRST argument is the gem
+    /// count as declarations. A different gem's `require:` option or a
+    /// trailing comment that quotes the name must not turn one editable
+    /// declaration into a refusal.
+    #[test]
+    fn gemfile_name_quoted_by_another_gem_call_still_rewrites() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    vuln-gem (1.0.0)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  vuln-gem\n\n\
+                    BUNDLED WITH\n   4.0.17\n";
+        for gemfile in [
+            "source \"https://rubygems.org\"\n\ngem \"vuln-gem\"\ngem \"other\", require: \"vuln-gem\"\n",
+            "source \"https://rubygems.org\"\n\ngem \"vuln-gem\"\ngem \"other\" # wraps \"vuln-gem\"\n",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.to_string());
+            files.insert("Gemfile.lock".to_string(), lock.to_string());
+            let r = rewrite_registry_redirect(&files, &[gem_override("vuln-gem", "1.0.0")]);
+            assert!(
+                !warning_codes(&r).contains(&"redirect_gem_declared_more_than_once"),
+                "{gemfile}: {:?}",
+                r.warnings
+            );
+            let out = r.files.get("Gemfile").expect("declaration rewritten");
+            assert!(
+                out.contains("gem \"other\""),
+                "the other gem call is left alone: {out}"
+            );
+            assert_eq!(
+                out.matches("gem \"vuln-gem\"").count(),
+                1,
+                "the one declaration is rewritten, nothing appended: {out}"
             );
         }
     }
