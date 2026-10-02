@@ -165,9 +165,13 @@ impl NpmOverrides {
                     }
                     let applies = match selector {
                         None => true,
-                        Some(sel) if anc_version.as_deref() == Some(sel) => true,
-                        // Another exact version: the rule can't apply.
-                        Some(sel) if is_exact_version(sel) && anc_version.is_some() => false,
+                        // An exact version applies when it equals the
+                        // ancestor's under semver, which ignores build
+                        // metadata (`1.0.0+build.1` matches `1.0.0`), and
+                        // can't apply otherwise.
+                        Some(sel) if is_exact_version(sel) && anc_version.is_some() => anc_version
+                            .as_deref()
+                            .is_some_and(|v| without_build(v) == without_build(sel)),
                         // A range (or an unknown ancestor version): it may
                         // apply, so a rule for the edge beneath it may be
                         // the one npm picks.
@@ -231,6 +235,12 @@ fn mentions(rules: &Map<String, Value>, dep_name: &str) -> bool {
                 .as_object()
                 .is_some_and(|children| mentions(children, dep_name))
     })
+}
+
+/// `version` without its `+build` metadata, which semver ignores when
+/// comparing.
+fn without_build(version: &str) -> &str {
+    version.split_once('+').map_or(version, |(core, _)| core)
 }
 
 /// A plain `major.minor.patch` version, optionally with a prerelease or
@@ -894,6 +904,40 @@ mod tests {
             &manifest(json!({ "left-pad": "1.3.0", "left-pad@^1": "github:x/y" })),
         );
         assert!(found.contains_key("node_modules/left-pad"), "{found:?}");
+    }
+
+    #[test]
+    fn issue_490_exact_selectors_compare_without_build_metadata() {
+        // The follow-up review probe: npm matches `pkga@1.0.0+build.1` to
+        // the installed `pkga@1.0.0`, so its narrower URL rule wins over
+        // the top-level registry rule and the edge stays non-registry.
+        let lock = overridden_git_lock(REGISTRY_TGZ);
+        let tgz = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        for scoped in ["pkga@1.0.0+build.1", "pkga@1.0.0+other"] {
+            let found = npm_non_registry_entries(
+                &lock,
+                &manifest(json!({ "left-pad": "1.3.0", scoped: { "left-pad": tgz } })),
+            );
+            assert!(
+                found.contains_key("node_modules/left-pad"),
+                "{scoped}: {found:?}"
+            );
+            // And a registry rule under it applies as the exact match.
+            let found = npm_non_registry_entries(
+                &lock,
+                &manifest(json!({ scoped: { "left-pad": "1.3.0" } })),
+            );
+            assert!(
+                !found.contains_key("node_modules/left-pad"),
+                "{scoped}: {found:?}"
+            );
+        }
+        // A prerelease is a different version, so its rule can't apply.
+        let found = npm_non_registry_entries(
+            &lock,
+            &manifest(json!({ "left-pad": "1.3.0", "pkga@1.0.0-beta.1": { "left-pad": tgz } })),
+        );
+        assert!(!found.contains_key("node_modules/left-pad"), "{found:?}");
     }
 
     #[test]

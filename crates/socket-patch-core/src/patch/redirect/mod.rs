@@ -12316,6 +12316,7 @@ mod tests {
         for manifest_overrides in [
             json!({ "left-pad": "*" }),
             json!({ "left-pad": "1.3.0", "pkga@^1": { "left-pad": url } }),
+            json!({ "left-pad": "1.3.0", "pkga@1.0.0+build.1": { "left-pad": url } }),
         ] {
             let mut files = BTreeMap::new();
             files.insert(
