@@ -3,13 +3,15 @@
 //! `MavenCrawler`). Every fixture is a tempdir tree laid out the way
 //! Gradle caches downloads, each file under the hex sha1 of its own bytes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use sha1::{Digest, Sha1};
 use socket_patch_core::crawlers::gradle_cache;
+use socket_patch_core::crawlers::jvm_cache::{self, JvmCacheLayout, JvmCacheRoot};
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::MavenCrawler;
+use socket_patch_core::manifest::schema::PatchFileInfo;
 
 const COMMONS_TEXT: &str = "pkg:maven/org.apache.commons/commons-text@1.10.0";
 
@@ -246,4 +248,215 @@ async fn walk_reports_every_entry_in_walk_order() {
             &std::fs::read(e.path(&files21)).unwrap()
         ));
     }
+}
+
+// ── installed copies ────────────────────────────────────────────────────
+
+fn info(before: &[u8]) -> PatchFileInfo {
+    PatchFileInfo {
+        before_hash: sha1_hex(before),
+        after_hash: "after".into(),
+    }
+}
+
+/// A jar present in two hash dirs (a re-download whose bytes changed)
+/// expands to two targets; the pom's own hash dir is a third; the
+/// `package/` prefix is dropped from the keys.
+#[test]
+fn duplicate_leaf_gives_two_installed_copies() {
+    let home = tempfile::tempdir().unwrap();
+    let files21 = files21_of(home.path());
+    let gav = ("org.apache.commons", "commons-text", "1.10.0");
+    let version_dir = cache(
+        &files21,
+        gav,
+        &[
+            ("commons-text-1.10.0.jar", b"first download"),
+            ("commons-text-1.10.0.pom", b"<project/>"),
+        ],
+    );
+    cache(
+        &files21,
+        gav,
+        &[("commons-text-1.10.0.jar", b"second download")],
+    );
+    let files = HashMap::from([
+        ("package/commons-text-1.10.0.jar".to_string(), info(b"x")),
+        ("commons-text-1.10.0.pom".to_string(), info(b"y")),
+    ]);
+
+    let copies = gradle_cache::installed_copies(&version_dir, &files);
+    let jar_dirs: Vec<&PathBuf> = copies
+        .iter()
+        .filter(|(_, f)| f.contains_key("commons-text-1.10.0.jar"))
+        .map(|(d, _)| d)
+        .collect();
+    assert_eq!(jar_dirs.len(), 2, "{copies:?}");
+    let mut want = vec![
+        version_dir.join(sha1_hex(b"first download")),
+        version_dir.join(sha1_hex(b"second download")),
+    ];
+    want.sort();
+    let mut got: Vec<PathBuf> = jar_dirs.into_iter().cloned().collect();
+    got.sort();
+    assert_eq!(got, want);
+    let pom_dir = version_dir.join(sha1_hex(b"<project/>"));
+    assert!(copies
+        .iter()
+        .any(|(d, f)| *d == pom_dir && f.contains_key("commons-text-1.10.0.pom")));
+    assert_eq!(copies.len(), 3);
+    for (dir, files) in &copies {
+        for leaf in files.keys() {
+            assert!(dir.join(leaf).is_file(), "{}", dir.join(leaf).display());
+        }
+    }
+}
+
+/// Keys no hash dir holds (a jar member, a file the cache lacks) are
+/// reported as missing, and the plain form keeps them on the version dir.
+#[test]
+fn missing_keys_are_reported_and_kept_on_the_version_dir() {
+    let home = tempfile::tempdir().unwrap();
+    let files21 = files21_of(home.path());
+    let version_dir = cache_commons_text(&files21);
+    let files = HashMap::from([
+        ("commons-text-1.10.0.jar".to_string(), info(b"x")),
+        ("META-INF/NOTICE.txt".to_string(), info(b"y")),
+        ("commons-text-1.10.0-tests.jar".to_string(), info(b"z")),
+    ]);
+    let detailed = gradle_cache::installed_copies_detailed(&version_dir, &files);
+    assert_eq!(
+        detailed.missing,
+        vec![
+            "META-INF/NOTICE.txt".to_string(),
+            "commons-text-1.10.0-tests.jar".to_string()
+        ]
+    );
+    assert_eq!(detailed.targets.len(), 1);
+
+    let plain = gradle_cache::installed_copies(&version_dir, &files);
+    let (dir, rest) = plain.last().unwrap();
+    assert_eq!(*dir, version_dir);
+    assert_eq!(rest.len(), 2);
+    assert!(rest.contains_key("META-INF/NOTICE.txt"));
+}
+
+/// An m2 (or any non-Gradle) package path is its own single target.
+#[test]
+fn installed_copies_is_the_identity_for_an_m2_path() {
+    let repo = tempfile::tempdir().unwrap();
+    let pkg = repo.path().join("org/apache/commons/commons-text/1.10.0");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let files = HashMap::from([("package/commons-text-1.10.0.jar".to_string(), info(b"x"))]);
+    assert!(!gradle_cache::is_gradle_version_dir(&pkg));
+    assert_eq!(
+        gradle_cache::installed_copies(&pkg, &files),
+        vec![(pkg.clone(), files.clone())]
+    );
+    let detailed = gradle_cache::installed_copies_detailed(&pkg, &files);
+    assert_eq!(detailed.targets, vec![(pkg, files)]);
+    assert!(detailed.missing.is_empty());
+}
+
+#[test]
+fn is_gradle_version_dir_reads_the_spelling() {
+    assert!(gradle_cache::is_gradle_version_dir(Path::new(
+        "/h/.gradle/caches/modules-2/files-2.1/org.x/a/1.0"
+    )));
+    assert!(!gradle_cache::is_gradle_version_dir(Path::new(
+        "/h/.gradle/caches/modules-2/files-2.1/org.x/a"
+    )));
+    assert!(!gradle_cache::is_gradle_version_dir(Path::new(
+        "/h/.m2/repository/org/x/a/1.0"
+    )));
+}
+
+// ── locate_artifact ─────────────────────────────────────────────────────
+
+/// Every hash-dir copy in a Gradle cache, the one path in m2, classifier
+/// jars by their own name.
+#[test]
+fn locate_artifact_finds_every_copy() {
+    let home = tempfile::tempdir().unwrap();
+    let files21 = files21_of(home.path());
+    let gav = ("org.apache.commons", "commons-text", "1.10.0");
+    let version_dir = cache(
+        &files21,
+        gav,
+        &[
+            ("commons-text-1.10.0.jar", b"one"),
+            ("commons-text-1.10.0-sources.jar", b"src"),
+        ],
+    );
+    cache(&files21, gav, &[("commons-text-1.10.0.jar", b"two")]);
+    let gav = (
+        "org.apache.commons".to_string(),
+        "commons-text".to_string(),
+        "1.10.0".to_string(),
+    );
+    let gradle = JvmCacheRoot::new(files21.clone(), JvmCacheLayout::GradleModules2);
+    let mut want = vec![
+        version_dir
+            .join(sha1_hex(b"one"))
+            .join("commons-text-1.10.0.jar"),
+        version_dir
+            .join(sha1_hex(b"two"))
+            .join("commons-text-1.10.0.jar"),
+    ];
+    want.sort();
+    assert_eq!(jvm_cache::locate_artifact(&gradle, &gav, None, "jar"), want);
+    assert_eq!(
+        jvm_cache::locate_artifact(&gradle, &gav, Some("sources"), "jar"),
+        vec![version_dir
+            .join(sha1_hex(b"src"))
+            .join("commons-text-1.10.0-sources.jar")]
+    );
+    assert!(jvm_cache::locate_artifact(&gradle, &gav, None, "pom").is_empty());
+
+    let repo = tempfile::tempdir().unwrap();
+    let m2_dir = repo.path().join("org/apache/commons/commons-text/1.10.0");
+    std::fs::create_dir_all(&m2_dir).unwrap();
+    std::fs::write(m2_dir.join("commons-text-1.10.0.jar"), b"m2").unwrap();
+    let m2 = JvmCacheRoot::new(repo.path().to_path_buf(), JvmCacheLayout::Maven2);
+    assert_eq!(
+        jvm_cache::locate_artifact(&m2, &gav, None, "jar"),
+        vec![m2_dir.join("commons-text-1.10.0.jar")]
+    );
+    let evil = ("..".to_string(), "x".to_string(), "1".to_string());
+    assert!(jvm_cache::locate_artifact(&gradle, &evil, None, "jar").is_empty());
+    assert!(jvm_cache::locate_artifact(&m2, &gav, Some("../x"), "jar").is_empty());
+}
+
+// ── derived copies ──────────────────────────────────────────────────────
+
+/// Instrumented / transformed copies of the jar outside files-2.1, by name
+/// or by the pristine sha1, are found; unrelated files are not.
+#[test]
+fn stale_derived_copies_finds_transforms_and_instrumented_jars() {
+    let home = tempfile::tempdir().unwrap();
+    let caches = home.path().join("caches");
+    let leaf = "victim-1.10.0.jar";
+    let sha1 = sha1_hex(b"pristine");
+    let hits = [
+        caches.join("jars-9/abc123/victim-1.10.0.jar"),
+        caches.join("transforms-3/f00d/transformed/instrumented-victim-1.10.0.jar"),
+        caches.join(format!("8.14.3/transforms/{sha1}/transformed/renamed.jar")),
+        caches.join(format!("transforms-4/{}.jar", sha1.trim_start_matches('0'))),
+    ];
+    let misses = [
+        caches.join("jars-9/abc123/other-1.0.jar"),
+        caches.join("8.14.3/kotlin-dsl/victim-1.10.0.jar"),
+        caches.join("modules-2/files-2.1/g/victim/1.10.0/aa/victim-1.10.0.jar"),
+    ];
+    for p in hits.iter().chain(&misses) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"x").unwrap();
+    }
+    let mut want = hits.to_vec();
+    want.sort();
+    assert_eq!(
+        gradle_cache::stale_derived_copies(home.path(), leaf, &sha1),
+        want
+    );
+    assert!(gradle_cache::stale_derived_copies(&home.path().join("none"), leaf, &sha1).is_empty());
 }

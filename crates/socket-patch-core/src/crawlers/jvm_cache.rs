@@ -102,6 +102,66 @@ pub fn project_dependency_set(root: &Path) -> Option<ProjectDependencySet> {
     providers.iter().find_map(|provider| provider(root))
 }
 
+/// Every installed copy of one artifact file
+/// (`<artifact>-<version>[-<classifier>].<ext>`) under `root`: the one
+/// repository path for [`JvmCacheLayout::Maven2`], every hash directory's
+/// copy for [`JvmCacheLayout::GradleModules2`] (sorted). Only existing
+/// regular files are returned; unsafe coordinates resolve to nothing.
+pub fn locate_artifact(
+    root: &JvmCacheRoot,
+    gav: &Gav,
+    classifier: Option<&str>,
+    ext: &str,
+) -> Vec<PathBuf> {
+    let (group, artifact, version) = gav;
+    let classifier_ok = classifier.is_none_or(crate::patch::path_safety::is_safe_single_segment);
+    let ext_ok = crate::patch::path_safety::is_safe_single_segment(ext);
+    if !super::maven_crawler::is_safe_maven_coordinate(group, artifact, version)
+        || !classifier_ok
+        || !ext_ok
+    {
+        return Vec::new();
+    }
+    let leaf = match classifier {
+        Some(c) => format!("{artifact}-{version}-{c}.{ext}"),
+        None => format!("{artifact}-{version}.{ext}"),
+    };
+    match root.layout {
+        JvmCacheLayout::Maven2 => {
+            let path = root
+                .path
+                .join(group.replace('.', "/"))
+                .join(artifact)
+                .join(version)
+                .join(&leaf);
+            if path.is_file() {
+                vec![path]
+            } else {
+                Vec::new()
+            }
+        }
+        JvmCacheLayout::GradleModules2 => {
+            let version_dir = root.path.join(group).join(artifact).join(version);
+            let mut copies: Vec<PathBuf> = std::fs::read_dir(&version_dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(super::gradle_cache::is_hash_dir_name)
+                })
+                .map(|e| e.path().join(&leaf))
+                .filter(|p| p.is_file())
+                .collect();
+            copies.sort();
+            copies
+        }
+        // sbt: Coursier / Ivy plug in here.
+        JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
