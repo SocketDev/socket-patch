@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-01 (run 6), main `61cfb9b` (includes #330, #446, #452, #456), latest release 4.0.0 (previous 3.3.0).
+Last updated: 2026-10-02 (run 7), main `61cfb9b` (includes #330, #446, #452, #456), latest release 4.0.0 (previous 3.3.0).
 
 ## Coverage matrix
 
@@ -26,6 +26,17 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | Windows | 2.0.1 | untested | fail #329 | fail #327 | untested | untested | untested | untested | untested | untested |
 | Windows | 2.4.3 | untested | fail #329 | fail #327 | untested | pass (LF + CRLF) | untested (likely #327/#329) | pass (LF + CRLF) | untested | untested |
 | Windows | 2.5.1 | untested | untested | untested | untested | untested | untested | untested | untested | untested |
+
+### Venv selection and policy (run 7, Linux, main `61cfb9b`)
+
+| Poetry | Cell | Result |
+| --- | --- | --- |
+| 1.8.5, 2.5.1 | Several per-minor envs (`poetry env use`), active env sorts after an older one (3.11→3.12, 3.10→3.13), custom and default `virtualenvs.path` | fail #526 (patches the first-sorted env, VEX attests) |
+| 1.8.5, 2.5.1 | Several per-minor envs, active env sorts first | pass (by luck) |
+| 2.5.1 | `VIRTUAL_ENV` set to another venv + `envs.toml` entry for the project | fail #526 (comment) |
+| 2.5.1 | #456: reinstall wipes the patch, `scan --mode agent` re-applies | pass |
+| 2.5.1 | Agent `socket.yml`: `minSeverity`, `ignorePackages` (purl, name, case), `maxNewPatches: 0`, `ecosystems`, `ignorePaths`, `enabled: false`, retain-on-narrow | pass |
+| 2.5.1 | Hosted `socket.yml` | untested (mock has no grant route) |
 
 ### Global mode (`-g` / `--global-prefix` / `SOCKET_GLOBAL=1`), agent patches (run 4)
 
@@ -54,12 +65,12 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 
 1. **Global mode on macOS / Windows** (maintainer request), including #501's ordering on macOS (user site `~/Library/Python/3.X/...` vs Homebrew / python.org framework site-packages). This needs probe branches.
 2. macOS / Windows: verify #330 (#329 Windows hash; macOS case-preserving `realpath`), plus hosted/vendored on 2.5.1 and long paths (> 260 chars). This needs probe branches.
-3. Probe branches are blocked: `git push --delete` still fails (runs 1–6). A maintainer needs to delete `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes`.
-4. Venv precedence corners: `VIRTUAL_ENV` set while `envs.toml` has an entry for the project, conda `CONDA_PREFIX`, several `poetry env use` minors.
-5. `socket.yml` policy (`minSeverity`, package filters, `maxNewPatches`) on a Poetry project with several patches.
-6. Poetry 0.12 / 1.0 agent mode with an out-of-tree venv (pre-1.2 hash).
-7. Hosted rollback when PyPI's file list differs from the lock (confirm the refusal is loud).
-8. #456 on Poetry: after a `poetry sync` reinstall, `scan --mode agent` re-applies the recorded patch.
+3. Probe branches are blocked: `git push --delete` still fails (runs 1–7). A maintainer needs to delete `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes`.
+4. Conda `CONDA_PREFIX` (with `CONDA_DEFAULT_ENV != base`) as Poetry's env; socket-patch doesn't read it. Needs conda / micromamba.
+5. `virtualenvs.prefer-active-python` / `use-poetry-python` with no `envs.toml` entry vs the first-sorted env (a #526 follow-on).
+6. Hosted `socket.yml` policy on Poetry (add a grant route to the mock).
+7. Poetry 0.12 / 1.0 agent mode with an out-of-tree venv (pre-1.2 hash).
+8. Hosted rollback when PyPI's file list differs from the lock (confirm the refusal is loud).
 
 ## Known non-bugs
 
@@ -91,3 +102,5 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 - Dotted names (`jaraco.context`): Poetry 1.1 keeps the dotted name in the lock (quoted `[metadata.files]` key), Poetry ≥ 1.8 canonicalizes it. Hosted rewrite, install, vex and rollback all work with both purl spellings (r5).
 - `rollback -g --json` with no manifest returns `error` as a plain string ("Manifest not found"), not a `{code, message}` object. This is a shape nit, not Poetry-specific, and not filed.
 - Poetry 1.8 – 2.2 with `virtualenvs.create = false` running as root in this image reinstall a user-site package into `/usr/local/lib/python3.11/dist-packages`. That's Poetry's behaviour, not socket-patch.
+- The uv-tool-installed Poetry in this image builds `poetry env use python3.12` envs on its own 3.11 interpreter (`pyvenv.cfg` says 3.11.15). That's a sandbox quirk; use pip-installed Poetry for multi-interpreter cells.
+- In agent `scan --json`, `ecosystems: [npm]` reports `policy.counts.filtered: 2` for a single `six` (likely the lock and the installed copy). Cosmetic, not filed.
