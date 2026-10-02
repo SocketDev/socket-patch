@@ -51,6 +51,43 @@ async fn stalled_server() -> String {
     format!("http://{addr}")
 }
 
+/// Send successful JSON headers and a partial body, then keep the socket
+/// open. This stalls after `send()` has returned, while `json()` reads.
+async fn stalled_json_body_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                if sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                while let Ok(n) = sock.read(&mut buf).await {
+                    if n == 0 {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
 /// A server that answers `200` with a `total`-byte body, sent in `chunks`
 /// pieces `gap` apart (each gap shorter than [`READ`], the sum longer).
 async fn trickling_server(total: usize, chunks: usize, gap: Duration) -> String {
@@ -160,6 +197,56 @@ async fn public_proxy_calls_fail_as_network_on_a_stalled_server() {
     .await;
     assert_stall_is_network("fetch_blob", api.fetch_blob(HASH)).await;
     assert_stall_is_network("fetch_diff", api.fetch_diff(UUID)).await;
+}
+
+#[tokio::test]
+async fn stalled_json_bodies_are_network_errors_on_both_clients() {
+    let uri = stalled_json_body_server().await;
+    let mut errors = Vec::new();
+    for proxy in [false, true] {
+        let api = client(&uri, proxy);
+        let patch = tokio::time::timeout(GUARD, api.fetch_patch(UUID))
+            .await
+            .expect("stalled patch body must time out")
+            .expect_err("partial patch body must fail");
+        errors.push((format!("fetch_patch proxy={proxy}"), patch));
+        let batch = tokio::time::timeout(
+            GUARD,
+            api.search_patches_batch(&["pkg:npm/left-pad@1.3.0".to_string()]),
+        )
+        .await
+        .expect("stalled batch body must time out")
+        .expect_err("partial batch body must fail");
+        errors.push((format!("search_patches_batch proxy={proxy}"), batch));
+    }
+    assert!(
+        errors.iter().all(|(_, error)| matches!(
+            error,
+            ApiError::Network(message) if message.contains("timed out")
+        )),
+        "stalled JSON bodies must retain the timeout cause as network errors: {errors:?}"
+    );
+}
+
+#[tokio::test]
+async fn completed_malformed_json_remains_a_parse_error() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+        .mount(&server)
+        .await;
+    for proxy in [false, true] {
+        let api = client(&server.uri(), proxy);
+        assert!(matches!(
+            api.fetch_patch(UUID).await,
+            Err(ApiError::Parse(_))
+        ));
+        assert!(matches!(
+            api.search_patches_batch(&["pkg:npm/left-pad@1.3.0".to_string()])
+                .await,
+            Err(ApiError::Parse(_))
+        ));
+    }
 }
 
 #[tokio::test]
