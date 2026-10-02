@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::jvm_cache::{self, JvmCacheLayout, JvmCacheRoot};
 use super::types::{CrawledPackage, CrawlerOptions};
 use super::walk_pool::{par_map, run_walk};
 use crate::patch::path_safety;
@@ -554,56 +555,45 @@ impl MavenCrawler {
     // Public API
     // ------------------------------------------------------------------
 
-    /// Get Maven repository paths based on options.
+    /// Every JVM artifact cache to crawl, tagged with its layout.
     ///
-    /// In global mode, returns `~/.m2/repository/` (respects `$M2_HOME`,
-    /// `$MAVEN_REPO_LOCAL`, `--global-prefix`).
-    ///
-    /// In local mode, only returns the Maven repo if the cwd contains
-    /// `pom.xml`, `build.gradle`, `build.gradle.kts`, `settings.gradle`,
-    /// or `settings.gradle.kts` (prevents scanning for non-Java projects).
+    /// In global mode (or with `--global-prefix`) returns the caches
+    /// regardless of the cwd; in local mode only when the cwd is a JVM
+    /// project ([`jvm_cache::is_jvm_project`]), so non-Java projects are
+    /// never scanned against a shared cache. A `--global-prefix` names one
+    /// root whose layout is [`JvmCacheLayout::classify`]'d from its path.
+    pub async fn get_jvm_cache_roots(&self, options: &CrawlerOptions) -> Vec<JvmCacheRoot> {
+        if let Some(ref custom) = options.global_prefix {
+            return vec![JvmCacheRoot::new(
+                custom.clone(),
+                JvmCacheLayout::classify(custom),
+            )];
+        }
+        if !options.global && !jvm_cache::is_jvm_project(&options.cwd).await {
+            return Vec::new();
+        }
+        let mut roots = Vec::new();
+        let repo = Self::m2_repo_path();
+        if is_dir(&repo).await {
+            roots.push(JvmCacheRoot::new(repo, JvmCacheLayout::Maven2));
+        }
+        roots
+    }
+
+    /// Get the paths of [`Self::get_jvm_cache_roots`] (`~/.m2/repository/`
+    /// respects `$M2_HOME`, `$MAVEN_REPO_LOCAL`, `--global-prefix`). Each
+    /// path's layout is recovered by [`JvmCacheLayout::classify`] in
+    /// [`Self::find_by_purls`].
     pub async fn get_maven_repo_paths(
         &self,
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
-        if options.global || options.global_prefix.is_some() {
-            if let Some(ref custom) = options.global_prefix {
-                return Ok(vec![custom.clone()]);
-            }
-            let repo = Self::m2_repo_path();
-            if is_dir(&repo).await {
-                return Ok(vec![repo]);
-            }
-            return Ok(Vec::new());
-        }
-
-        // Local mode: only return Maven repo if this looks like a Java/Maven/Gradle project
-        let java_markers = [
-            "pom.xml",
-            "build.gradle",
-            "build.gradle.kts",
-            "settings.gradle",
-            "settings.gradle.kts",
-        ];
-
-        let mut is_java_project = false;
-        for marker in &java_markers {
-            if tokio::fs::metadata(options.cwd.join(marker)).await.is_ok() {
-                is_java_project = true;
-                break;
-            }
-        }
-
-        if !is_java_project {
-            return Ok(Vec::new());
-        }
-
-        let repo = Self::m2_repo_path();
-        if is_dir(&repo).await {
-            Ok(vec![repo])
-        } else {
-            Ok(Vec::new())
-        }
+        Ok(self
+            .get_jvm_cache_roots(options)
+            .await
+            .into_iter()
+            .map(|root| root.path)
+            .collect())
     }
 
     /// Crawl all discovered Maven repository paths and return every
@@ -612,14 +602,12 @@ impl MavenCrawler {
         let mut packages = Vec::new();
         let mut seen = HashSet::new();
 
-        let repo_paths = self.get_maven_repo_paths(options).await.unwrap_or_default();
-
-        for repo_path in repo_paths {
+        for root in self.get_jvm_cache_roots(options).await {
             // The walkdir walk and POM reads are blocking: run each repo
             // on the walk pool so concurrently crawled ecosystems keep
             // making progress (the dedup set rides along and comes back).
             let (found, returned_seen) = run_walk(move || {
-                let found = MavenCrawler.scan_maven_repo(&repo_path, &mut seen);
+                let found = MavenCrawler.scan_cache_root(&root, &mut seen);
                 (found, seen)
             })
             .await;
@@ -640,6 +628,13 @@ impl MavenCrawler {
         src_path: &Path,
         purls: &[String],
     ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
+        match JvmCacheLayout::classify(src_path) {
+            JvmCacheLayout::Maven2 => {}
+            // Other layouts plug in here; until then they resolve nothing.
+            JvmCacheLayout::GradleModules2 | JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => {
+                return Ok(HashMap::new())
+            }
+        }
         let mut result: HashMap<String, CrawledPackage> = HashMap::new();
 
         for purl in purls {
@@ -740,6 +735,21 @@ impl MavenCrawler {
     /// packages come out exactly as the one-at-a-time scan's did.
     fn scan_maven_repo(&self, repo_path: &Path, seen: &mut HashSet<String>) -> Vec<CrawledPackage> {
         self.scan_maven_repo_chunked(repo_path, seen, POM_PARSE_CHUNK)
+    }
+
+    /// Crawl one cache root according to its layout.
+    fn scan_cache_root(
+        &self,
+        root: &JvmCacheRoot,
+        seen: &mut HashSet<String>,
+    ) -> Vec<CrawledPackage> {
+        match root.layout {
+            JvmCacheLayout::Maven2 => self.scan_maven_repo(&root.path, seen),
+            // Other layouts plug in here; until then they crawl nothing.
+            JvmCacheLayout::GradleModules2 | JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => {
+                Vec::new()
+            }
+        }
     }
 
     /// [`Self::scan_maven_repo`] over an explicit chunk size, so tests can
