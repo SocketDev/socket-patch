@@ -102,6 +102,11 @@ limits, and required install commands.
 
 ### Fixed
 
+- Agent-mode PyPI `apply` patches every installed copy of a release, not just
+  the first one found. A Pipenv project with both a WORKON_HOME venv and a
+  `./.venv`, or a global install with the same release in the user site and a
+  system dir, no longer keeps the copy Python imports unpatched while `vex`
+  attests it (#529, #501).
 - Gem hosted and vendored modes wire only the manifest Bundler loads. A `gems.rb`
   twin or a `BUNDLE_GEMFILE` setting (environment or `.bundle/config`) no longer
   leads to an edit of an ignored `Gemfile` that reports success and attests an
@@ -183,6 +188,13 @@ limits, and required install commands.
   unparseable (hosted) or refused as `vendor_lockfile_version_unsupported`
   (vendored). The lock now keeps its BOM, indent and line endings, and the
   undo is byte-exact (#324).
+- `vendor` under `--global` / `--global-prefix` (or `SOCKET_GLOBAL` /
+  `SOCKET_GLOBAL_PREFIX`) is now a usage error (exit 2,
+  `global_scope_unsupported`), like `scan` and `get` with `--mode vendored`.
+  Run inside a project, `vendor -g` vendored the manifest's records into that
+  project and rewired its lockfile, and `vendor --revert -g` unwound the
+  project's vendoring, so its next frozen install was silently unpatched.
+  Global installs have no project lockfile to vendor into (#498).
 
 ### Maintenance
 
