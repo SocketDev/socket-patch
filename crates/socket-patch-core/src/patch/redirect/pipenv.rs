@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::vendor::lock_inventory::pypi::hosted_pypi_reference;
 
 pub(super) struct Property {
     pub(super) name: String,
@@ -242,40 +243,16 @@ pub(super) fn rewrite(
     }
 }
 
-/// Whether `value` is a Socket-issued hosted reference for `dep` — served
-/// from the same origin as the grant's own artifact URL (patch.socket.dev,
-/// or a `--patch-server-url` host), with the `/patch/pypi/<name>/<version>/
-/// <grant>/<uuid>/<wheel>` shape for this package and version. Such an entry
-/// is ours to rotate; anything else is a user's or a fork's source.
+/// Whether `value` is a Socket-issued hosted reference for `dep`: the shared
+/// recognizer ([`hosted_pypi_reference`]) accepts it on the grant's own
+/// origin (patch.socket.dev, or a `--patch-server-url` host, path prefix
+/// included), and it names this package and version. Such an entry is ours
+/// to rotate; anything else is a user's or a fork's source.
 fn owned_url(value: &str, dep: &DepOverride) -> bool {
-    let Ok(url) = reqwest::Url::parse(value) else {
-        return false;
-    };
-    let Ok(ours) = reqwest::Url::parse(&dep.artifact_url) else {
-        return false;
-    };
-    let same_origin = url.scheme() == ours.scheme()
-        && url.host_str() == ours.host_str()
-        && url.port_or_known_default() == ours.port_or_known_default();
-    let parts: Vec<_> = url.path().split('/').collect();
-    (same_origin
-        || (url.scheme() == "https" && url.host_str() == Some(super::SOCKET_PATCH_SERVER_HOST)))
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.query().is_none()
-        && parts.len() == 8
-        && parts[1] == "patch"
-        && parts[2] == "pypi"
-        && canonicalize_pypi_name(parts[3]) == canonicalize_pypi_name(&dep.name)
-        && parts[4] == dep.version
-        && !parts[5].is_empty()
-        && !parts[6].is_empty()
-        && parts[7].ends_with(".whl")
-        && parts[7]
-            .split('-')
-            .next()
-            .is_some_and(|name| canonicalize_pypi_name(name) == canonicalize_pypi_name(&dep.name))
-        && parts[7].split('-').nth(1) == Some(dep.version.as_str())
+    hosted_pypi_reference(value, std::slice::from_ref(&dep.artifact_url)).is_some_and(|coords| {
+        canonicalize_pypi_name(&coords.name) == canonicalize_pypi_name(&dep.name)
+            && coords.version == dep.version
+    })
 }
 
 /// Why a Pipfile.lock plan did not happen. Only a [`PlanError::Conflict`]
@@ -651,6 +628,30 @@ mod tests {
         assert!(second.contains("/rotated/") && !second.contains("/tok/"));
     }
 
+
+    /// Hosted Pipenv recognizes its own pins through the shared recognizer
+    /// (#563): a path-prefixed `--patch-server-url` deployment rotates its
+    /// grant instead of refusing its own previous reference, and a hosted
+    /// sdist pin is ours too.
+    #[test]
+    fn owned_url_accepts_path_prefixed_origins_and_sdists() {
+        let mut dep = dependency("urllib3", "1.26.18", "patch-one");
+        dep.artifact_url = "https://patches.internal.example/socket/patch/pypi/urllib3/1.26.18/tok/patch-one/urllib3-1.26.18-py3-none-any.whl".into();
+        assert!(
+            owned_url(&dep.artifact_url, &dep),
+            "the URL hosted mode just wrote is ours"
+        );
+        assert!(owned_url("https://patch.socket.dev/patch/pypi/urllib3/1.26.18/tok/patch-one/urllib3-1.26.18.tar.gz", &dep));
+        assert!(!owned_url("https://patches.internal.example.org/socket/patch/pypi/urllib3/1.26.18/tok/patch-one/urllib3-1.26.18-py3-none-any.whl", &dep));
+        assert!(!owned_url("https://user@patch.socket.dev/patch/pypi/urllib3/1.26.18/tok/patch-one/urllib3-1.26.18-py3-none-any.whl", &dep));
+        assert!(!owned_url("https://patch.socket.dev/patch/pypi/requests/2.28.1/tok/patch-one/requests-2.28.1-py3-none-any.whl", &dep));
+        let (first, _) = plan(&lock(), &dep, None).unwrap();
+        dep.artifact_url = dep.artifact_url.replace("/tok/", "/rotated/");
+        let (second, rotation) =
+            plan(&first, &dep, None).expect("rotation on a path-prefixed origin");
+        assert!(!rotation.is_empty());
+        assert!(second.contains("/rotated/") && !second.contains("/tok/"));
+    }
 }
 
 #[cfg(test)]
