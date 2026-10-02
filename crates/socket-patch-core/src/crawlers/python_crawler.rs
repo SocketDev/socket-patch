@@ -365,7 +365,7 @@ async fn find_local_venv_site_packages_with(
     // it once `poetry env use` recorded an env for the project (see
     // [`poetry_active_prefix`]). PDM likewise skips an activated venv under
     // `PDM_IGNORE_ACTIVE_VENV`.
-    let pdm_ignores_active = var("PDM_IGNORE_ACTIVE_VENV").is_some_and(|v| !v.is_empty())
+    let pdm_ignores_active = pdm_env_flag(var, "PDM_IGNORE_ACTIVE_VENV")
         && pdm_drives_project(cwd).await;
     let active_prefix = match &poetry {
         Some(project) => poetry_active_prefix(project, var),
@@ -462,7 +462,7 @@ async fn pdm_project_site_packages(
     let overridden = var("PDM_PYTHON")
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
-    let ignore_saved = var("PDM_IGNORE_SAVED_PYTHON").is_some_and(|v| !v.is_empty());
+    let ignore_saved = pdm_env_flag(var, "PDM_IGNORE_SAVED_PYTHON");
     let interpreter = match overridden {
         Some(python) => Some(cwd.join(python)),
         None if ignore_saved => None,
@@ -473,6 +473,14 @@ async fn pdm_project_site_packages(
         None => pdm_pep582_dirs(cwd).await,
     };
     (!found.is_empty()).then_some(found)
+}
+
+/// A boolean PDM environment setting, parsed like PDM's `ensure_boolean`:
+/// set and non-empty, and not `false` / `no` / `0` (any case).
+fn pdm_env_flag(var: &impl Fn(&str) -> Option<String>, name: &str) -> bool {
+    var(name).is_some_and(|v| {
+        !v.is_empty() && !matches!(v.to_ascii_lowercase().as_str(), "false" | "no" | "0")
+    })
 }
 
 /// Whether PDM installs the project at `cwd`: a PDM project (see
@@ -2553,6 +2561,15 @@ mod tests {
             find_local_venv_site_packages_with(&project, &ignored).await,
             vec![stray.clone()]
         );
+        // ...a boolean PDM parses: false values keep `.pdm-python`.
+        for falsy in ["0", "false", "NO"] {
+            let kept = env_of(&[("PDM_IGNORE_SAVED_PYTHON", falsy.to_string())]);
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &kept).await,
+                vec![pdm_site.clone()],
+                "PDM_IGNORE_SAVED_PYTHON={falsy:?}"
+            );
+        }
 
         // `PDM_PYTHON` outranks `.pdm-python`.
         let (ci_python, ci_site) = fake_venv_root(&tmp.path().join("ci-venv"));
@@ -2644,7 +2661,7 @@ mod tests {
         )]);
         assert_eq!(
             find_local_venv_site_packages_with(&project, &active).await,
-            vec![active_site]
+            vec![active_site.clone()]
         );
         // ...unless PDM_IGNORE_ACTIVE_VENV tells PDM to skip it.
         let opted_out = env_of(&[
@@ -2658,6 +2675,21 @@ mod tests {
             find_local_venv_site_packages_with(&project, &opted_out).await,
             vec![lib.clone()]
         );
+        // PDM parses the flag as a boolean: false values keep the venv.
+        for falsy in ["0", "false", "No", ""] {
+            let kept = env_of(&[
+                (
+                    "VIRTUAL_ENV",
+                    other.path().join("active").to_string_lossy().into_owned(),
+                ),
+                ("PDM_IGNORE_ACTIVE_VENV", falsy.to_string()),
+            ]);
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &kept).await,
+                vec![active_site.clone()],
+                "PDM_IGNORE_ACTIVE_VENV={falsy:?}"
+            );
+        }
         let dot_venv = fake_venv(&project, ".venv");
         assert_eq!(
             find_local_venv_site_packages_with(&project, &no_env).await,
