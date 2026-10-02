@@ -5,7 +5,9 @@
 //! Gradle picks its user home from, in order: the `gradle.user.home`
 //! system property (`-Dgradle.user.home=…` in `GRADLE_OPTS`, which the
 //! launcher places after `JAVA_OPTS`, so it wins), `GRADLE_USER_HOME`, and
-//! `<home>/.gradle`. Downloaded modules live in
+//! `<JVM user.home>/.gradle`. The JVM's `user.home` on Linux and macOS is
+//! the account's passwd entry, not `$HOME` (they differ in, for example,
+//! container CI jobs that set `HOME`). Downloaded modules live in
 //! `<user home>/caches/modules-2/files-2.1`; a read-only shared cache can
 //! sit beside it at `$GRADLE_RO_DEP_CACHE/modules-2/files-2.1`.
 
@@ -21,7 +23,9 @@ pub struct GradleHome {
     pub files21: PathBuf,
     /// `$GRADLE_RO_DEP_CACHE/modules-2/files-2.1`; scanned, never written.
     pub ro_files21: Option<PathBuf>,
-    /// `$GRADLE_HOME` (a Gradle distribution), for its `init.d`.
+    /// `$GRADLE_HOME` (a Gradle distribution), for its `init.d`. A wrapper
+    /// build runs its own distribution's instead (see
+    /// [`GradleHome::wrapper_init_dirs`]).
     pub gradle_home: Option<PathBuf>,
 }
 
@@ -38,9 +42,13 @@ fn var(env: &dyn Env, k: &str) -> Option<String> {
 }
 
 impl GradleHome {
-    /// Resolve the user home from `env`. `home_dir` is the account's home
-    /// directory, used when the environment names none (`HOME`; on
-    /// Windows `USERPROFILE` first). `None` when no home can be found.
+    /// Resolve the user home from `env`. `home_dir` must be what the JVM
+    /// would report as `user.home`: on Unix the passwd entry's home
+    /// directory (`getpwuid(getuid())->pw_dir`), NOT `$HOME`. When neither
+    /// system property nor `GRADLE_USER_HOME` names the home, it is
+    /// `<home>/.gradle` with `<home>` = on Unix `home_dir`, else `$HOME`;
+    /// on Windows `USERPROFILE`, else `HOME`, else `home_dir`. `None` when
+    /// no home can be found.
     pub fn resolve(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Option<Self> {
         let user_home = ["GRADLE_OPTS", "JAVA_OPTS"]
             .iter()
@@ -53,12 +61,16 @@ impl GradleHome {
             .or_else(|| var(env, "GRADLE_USER_HOME").map(PathBuf::from))
             .or_else(|| {
                 let home = match os {
-                    Os::Windows => var(env, "USERPROFILE").or_else(|| var(env, "HOME")),
-                    Os::Unix => var(env, "HOME"),
+                    Os::Windows => var(env, "USERPROFILE")
+                        .or_else(|| var(env, "HOME"))
+                        .map(PathBuf::from)
+                        .or_else(|| home_dir.map(Path::to_path_buf)),
+                    Os::Unix => home_dir
+                        .filter(|h| !h.as_os_str().is_empty())
+                        .map(Path::to_path_buf)
+                        .or_else(|| var(env, "HOME").map(PathBuf::from)),
                 };
-                home.map(PathBuf::from)
-                    .or_else(|| home_dir.map(Path::to_path_buf))
-                    .map(|h| h.join(".gradle"))
+                home.map(|h| h.join(".gradle"))
             })?;
         Some(Self {
             files21: files21_of_user_home(&user_home),
@@ -89,13 +101,83 @@ impl GradleHome {
         dirs
     }
 
+    /// Where the wrapper unpacks distributions in this user home
+    /// (`distributionBase=GRADLE_USER_HOME`, `distributionPath=wrapper/dists`).
+    pub fn wrapper_dists_dir(&self) -> PathBuf {
+        self.user_home.join("wrapper").join("dists")
+    }
+
+    /// The `init.d` directories of the wrapper distributions unpacked in
+    /// this user home: `<dists>/<name>/<url hash>/<unpacked dir>/init.d`.
+    /// A wrapper build runs the `init.d` of its own distribution (custom
+    /// corporate distributions ship scripts there). `distribution_url`
+    /// (the `distributionUrl` of `gradle-wrapper.properties`, `\:`
+    /// escapes allowed) narrows the search to that distribution's `<name>`
+    /// (the URL's file name without `.zip`); `None` searches them all.
+    /// Only directories `list` shows are returned.
+    pub fn wrapper_init_dirs(
+        &self,
+        list: &dyn Fn(&Path) -> Vec<String>,
+        distribution_url: Option<&str>,
+    ) -> Vec<PathBuf> {
+        let dists = self.wrapper_dists_dir();
+        let wanted = distribution_url.map(|u| {
+            let u = u.trim().replace('\\', "");
+            let file = u.rsplit('/').next().unwrap_or(&u).to_string();
+            file.strip_suffix(".zip")
+                .map_or(file.clone(), str::to_string)
+        });
+        let subdirs = |d: &Path| -> Vec<String> {
+            let mut names: Vec<String> = list(d)
+                .into_iter()
+                .filter_map(|n| n.strip_suffix('/').map(str::to_string))
+                .filter(|n| !n.is_empty())
+                .collect();
+            names.sort();
+            names
+        };
+        let mut out = Vec::new();
+        for name in subdirs(&dists) {
+            if wanted.as_ref().is_some_and(|w| *w != name) {
+                continue;
+            }
+            let dist = dists.join(&name);
+            for hash in subdirs(&dist) {
+                let unpacked = dist.join(&hash);
+                for top in subdirs(&unpacked) {
+                    let dir = unpacked.join(&top);
+                    if list(&dir).iter().any(|c| c == "init.d/") {
+                        out.push(dir.join("init.d"));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Every init-script candidate in Gradle's order: the fixed files,
-    /// then each init directory's scripts sorted by name. `list` returns a
-    /// directory's child names (directories ending in `/`); whether the
-    /// fixed files exist is the caller's to check.
+    /// then each init directory's scripts sorted by name: the user home's
+    /// `init.d`, every unpacked wrapper distribution's `init.d` (see
+    /// [`Self::init_scripts_for`] to narrow that to the build's own) and
+    /// `$GRADLE_HOME/init.d`. `list` returns a directory's child names
+    /// (directories ending in `/`); whether the fixed files exist is the
+    /// caller's to check.
     pub fn init_scripts_with(&self, list: &dyn Fn(&Path) -> Vec<String>) -> Vec<PathBuf> {
+        self.init_scripts_for(list, None)
+    }
+
+    /// [`Self::init_scripts_with`] with the wrapper distributions narrowed
+    /// to `distribution_url`'s (see [`Self::wrapper_init_dirs`]).
+    pub fn init_scripts_for(
+        &self,
+        list: &dyn Fn(&Path) -> Vec<String>,
+        distribution_url: Option<&str>,
+    ) -> Vec<PathBuf> {
         let mut out = self.init_script_paths();
-        for dir in self.init_dirs() {
+        let mut dirs = vec![self.user_home.join("init.d")];
+        dirs.extend(self.wrapper_init_dirs(list, distribution_url));
+        dirs.extend(self.gradle_home.as_ref().map(|g| g.join("init.d")));
+        for dir in dirs {
             let mut names: Vec<String> = list(&dir)
                 .into_iter()
                 .filter(|n| is_init_script_name(n))
@@ -198,7 +280,9 @@ mod tests {
         // (env, os, expected user home)
         type Row<'a> = (&'a [(&'a str, &'a str)], Os, Option<&'a str>);
         let table: &[Row<'_>] = &[
-            (&[("HOME", "/h")], Os::Unix, Some("/h/.gradle")),
+            // Unix: the passwd home (`home_dir`) beats `$HOME`, like the
+            // JVM's user.home.
+            (&[("HOME", "/h")], Os::Unix, Some("/fallback/.gradle")),
             (&[], Os::Unix, Some("/fallback/.gradle")),
             (&[("HOME", "")], Os::Unix, Some("/fallback/.gradle")),
             (
@@ -209,7 +293,7 @@ mod tests {
             (
                 &[("GRADLE_USER_HOME", ""), ("HOME", "/h")],
                 Os::Unix,
-                Some("/h/.gradle"),
+                Some("/fallback/.gradle"),
             ),
             (
                 &[
@@ -269,7 +353,7 @@ mod tests {
             (
                 &[("GRADLE_OPTS", "-Dgradle.user.homeX=/x"), ("HOME", "/h")],
                 Os::Unix,
-                Some("/h/.gradle"),
+                Some("/fallback/.gradle"),
             ),
             (
                 &[("USERPROFILE", "C:\\Users\\u"), ("HOME", "/h")],
@@ -284,7 +368,7 @@ mod tests {
             (
                 &[("USERPROFILE", "C:\\Users\\u"), ("HOME", "/h")],
                 Os::Unix,
-                Some("/h/.gradle"),
+                Some("/fallback/.gradle"),
             ),
             (
                 &[("GRADLE_OPTS", "\"-Dgradle.user.home=C:\\Gradle Home\"")],
@@ -312,6 +396,101 @@ mod tests {
         assert_eq!(
             GradleHome::resolve(&VecEnv(Vec::new()), Os::Unix, None),
             None
+        );
+    }
+
+    #[test]
+    fn unix_home_prefers_the_passwd_entry() {
+        // A container CI job: HOME=/github/home, passwd home /root.
+        let e = VecEnv(env(&[("HOME", "/github/home")]));
+        let user_home = |os, home_dir: Option<&str>| {
+            GradleHome::resolve(&e, os, home_dir.map(Path::new)).map(|h| h.user_home)
+        };
+        assert_eq!(
+            user_home(Os::Unix, Some("/root")),
+            Some(Path::new("/root").join(".gradle"))
+        );
+        // `$HOME` only stands in when the passwd home is unknown.
+        assert_eq!(
+            user_home(Os::Unix, None),
+            Some(Path::new("/github/home").join(".gradle"))
+        );
+        assert_eq!(
+            user_home(Os::Unix, Some("")),
+            Some(Path::new("/github/home").join(".gradle"))
+        );
+        // Windows keeps USERPROFILE, then HOME, then the account home.
+        assert_eq!(
+            user_home(Os::Windows, Some("C:\\Users\\u")),
+            Some(Path::new("/github/home").join(".gradle"))
+        );
+        let none = VecEnv(Vec::new());
+        assert_eq!(
+            GradleHome::resolve(&none, Os::Windows, Some(Path::new("C:\\U"))).map(|h| h.user_home),
+            Some(Path::new("C:\\U").join(".gradle"))
+        );
+    }
+
+    #[test]
+    fn wrapper_distribution_init_dirs() {
+        let e = VecEnv(env(&[("GRADLE_USER_HOME", "/g")]));
+        let h = GradleHome::resolve(&e, Os::Unix, None).unwrap();
+        let dists = Path::new("/g").join("wrapper").join("dists");
+        let corp = dists.join("gradle-8.14.3-corp-bin");
+        let stock = dists.join("gradle-8.14.3-bin");
+        let list = |d: &Path| -> Vec<String> {
+            let names: &[&str] = if d == dists {
+                &["gradle-8.14.3-corp-bin/", "gradle-8.14.3-bin/", "x.lck"]
+            } else if d == corp {
+                &["abc123/"]
+            } else if d == corp.join("abc123") {
+                &["gradle-8.14.3/", "gradle-8.14.3-corp-bin.zip.ok"]
+            } else if d == corp.join("abc123").join("gradle-8.14.3") {
+                &["bin/", "init.d/", "lib/"]
+            } else if d == corp.join("abc123").join("gradle-8.14.3").join("init.d") {
+                &["repos.gradle", "README"]
+            } else if d == stock {
+                &["def456/"]
+            } else if d == stock.join("def456") {
+                &["gradle-8.14.3/"]
+            } else if d == stock.join("def456").join("gradle-8.14.3") {
+                &["bin/", "lib/"]
+            } else {
+                &[]
+            };
+            names.iter().map(|n| n.to_string()).collect()
+        };
+        let corp_init = corp.join("abc123").join("gradle-8.14.3").join("init.d");
+        assert_eq!(
+            h.wrapper_init_dirs(&list, None),
+            std::slice::from_ref(&corp_init)
+        );
+        assert_eq!(
+            h.wrapper_init_dirs(
+                &list,
+                Some("https\\://corp.example/dist/gradle-8.14.3-corp-bin.zip")
+            ),
+            std::slice::from_ref(&corp_init)
+        );
+        assert!(h
+            .wrapper_init_dirs(
+                &list,
+                Some("https://services.gradle.org/distributions/gradle-8.14.3-bin.zip")
+            )
+            .is_empty());
+        let scripts = h.init_scripts_with(&list);
+        assert_eq!(
+            scripts,
+            [
+                Path::new("/g").join("init.gradle"),
+                Path::new("/g").join("init.gradle.kts"),
+                corp_init.join("repos.gradle"),
+            ]
+        );
+        assert_eq!(
+            h.init_scripts_for(&list, Some("https://x/gradle-8.14.3-bin.zip"))
+                .len(),
+            2
         );
     }
 
