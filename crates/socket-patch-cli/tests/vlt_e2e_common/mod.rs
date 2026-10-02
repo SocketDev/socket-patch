@@ -177,6 +177,13 @@ pub fn npm_alias_to_public_npm(v: VltVersion) -> bool {
     (VltVersion::rc(30)..=VltVersion::rc(32)).contains(&v)
 }
 
+/// A dependency removed from package.json stays locked: `vlt uninstall`
+/// leaves a `file:` spec declared, and `vlt install` keeps the removed
+/// dependency's lock edge and node.
+pub fn removed_dependency_stays_locked(v: VltVersion) -> bool {
+    (VltVersion::zero(30)..=VltVersion::zero(32)).contains(&v)
+}
+
 /// A lockless install cannot resolve a `file:` directory dependency.
 pub fn lockless_file_dir_broken(v: VltVersion) -> bool {
     (VltVersion::zero(31)..LOCKLESS_FILE_DIR_FROM).contains(&v)
@@ -1584,12 +1591,25 @@ impl PatchService {
                 })
             })
             .collect();
+        // Like the production API, answer only for the purls the batch asks
+        // about: a leg that moves a dependency to another release must not
+        // be offered the old release's patch.
         Mock::given(method("POST"))
             .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "packages": packages,
-                "canAccessPaidPatches": false,
-            })))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body);
+                let asked: Vec<&Value> = packages
+                    .iter()
+                    .filter(|p| {
+                        let purl = p["purl"].as_str().unwrap_or_default();
+                        body.contains(purl) || body.contains(&purl.replace("%40", "@"))
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "packages": asked,
+                    "canAccessPaidPatches": false,
+                }))
+            })
             .mount(&self.server)
             .await;
         for t in &self.targets {

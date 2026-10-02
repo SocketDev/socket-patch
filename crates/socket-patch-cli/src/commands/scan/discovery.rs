@@ -132,48 +132,89 @@ fn crawled_from_purl(
     })
 }
 
+/// What [`vendored_ledger_supplement`] adds to discovery, and what it
+/// deliberately left out.
+#[derive(Debug, Default)]
+pub(crate) struct LedgerSupplement {
+    /// Ledger packages to discover (decoded purls, sorted).
+    pub(crate) packages: Vec<socket_patch_core::crawlers::types::CrawledPackage>,
+    /// Ledger keys whose lock provably no longer resolves through their
+    /// committed artifact (the dependency was upgraded or removed), so they
+    /// are not discoverable packages. `scan --prune` reverts them. Sorted.
+    pub(crate) unwired: Vec<String>,
+}
+
 /// Vendored-ledger packages with no crawled counterpart: on a fresh clone
 /// the committed artifact IS the dependency, so these stay discoverable
 /// (updates[] detection, the table, and `scan --vendor` re-vendor/in-sync
 /// runs all keep working before any install). They are NOT "lockfile-only"
 /// — nothing needs installing; the artifact satisfies the lock. `state` is
 /// the ledger `run` already loaded (`vendor::load_state`).
+///
+/// That holds only while the lock still wires the artifact. An entry the
+/// lockfile in-use probe (the one the prune GC reverts by) answers
+/// `Some(false)` for is the dependency having left the lock — bumped or
+/// uninstalled — and is reported in [`LedgerSupplement::unwired`] instead:
+/// re-vendoring it would fail against a lock that no longer has it. `None`
+/// (no probe for the ecosystem, or no readable lock) keeps the entry.
 pub(crate) async fn vendored_ledger_supplement(
     common: &GlobalArgs,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     state: &std::io::Result<VendorState>,
-) -> Vec<socket_patch_core::crawlers::types::CrawledPackage> {
+) -> LedgerSupplement {
+    let mut out = LedgerSupplement::default();
     if common.is_global() {
-        return Vec::new();
+        return out;
     }
-    let base_purls: Vec<String> = match state {
-        Ok(state) => state
-            .entries
-            .values()
-            .map(|entry| strip_purl_qualifiers(&entry.base_purl).to_string())
-            .collect(),
-        // Corrupt/unreadable ledger (a MISSING file is Ok(empty) above):
-        // recover the vendored set from the committed artifacts, or
-        // `scan --prune` (whose ledger exemption also degrades to empty)
-        // would delete still-vendored packages' manifest entries and blobs.
-        Err(_) => vendored_purls_from_artifacts(common).await,
-    };
+    // `(ledger key, base purl, entry)`; the artifact fallback has no
+    // entries to probe, so it never reports unwired keys.
+    let candidates: Vec<(String, String, Option<&socket_patch_core::vendor::VendorEntry>)> =
+        match state {
+            Ok(state) => state
+                .entries
+                .iter()
+                .map(|(key, entry)| {
+                    (
+                        key.clone(),
+                        strip_purl_qualifiers(&entry.base_purl).to_string(),
+                        Some(entry),
+                    )
+                })
+                .collect(),
+            // Corrupt/unreadable ledger (a MISSING file is Ok(empty) above):
+            // recover the vendored set from the committed artifacts, or
+            // `scan --prune` (whose ledger exemption also degrades to empty)
+            // would delete still-vendored packages' manifest entries and blobs.
+            Err(_) => vendored_purls_from_artifacts(common)
+                .await
+                .into_iter()
+                .map(|base| (base.clone(), base, None))
+                .collect(),
+        };
     // Composer by release identity: a ledger `@3.0.2.0` is the crawled
     // `@3.0.2`, not a second package to supplement.
     let key = |p: &str| composer_purl_identity(p).unwrap_or_else(|| normalize_purl(p).into_owned());
     let crawled_norm: HashSet<String> = crawled.iter().map(|p| key(&p.purl)).collect();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut out = Vec::new();
-    for base in &base_purls {
+    for (ledger_key, base, entry) in &candidates {
         let norm = key(base);
-        if crawled_norm.contains(&norm) || !seen.insert(norm) {
+        if crawled_norm.contains(&norm) || seen.contains(&norm) {
             continue;
         }
+        if let Some(entry) = entry {
+            if crate::commands::vendor::dispatch_in_use_one(entry, &common.cwd).await == Some(false)
+            {
+                out.unwired.push(ledger_key.clone());
+                continue;
+            }
+        }
+        seen.insert(norm);
         if let Some(pkg) = crawled_from_purl(base, &common.cwd) {
-            out.push(pkg);
+            out.packages.push(pkg);
         }
     }
-    out.sort_by(|a, b| a.purl.cmp(&b.purl));
+    out.packages.sort_by(|a, b| a.purl.cmp(&b.purl));
+    out.unwired.sort();
     out
 }
 
@@ -997,7 +1038,7 @@ mod tests {
             ..GlobalArgs::default()
         };
         let state = socket_patch_core::vendor::load_state(root).await;
-        vendored_ledger_supplement(&args, crawled, &state).await
+        vendored_ledger_supplement(&args, crawled, &state).await.packages
     }
 
     /// A ledger entry vendored as `@3.0.2.0` is the crawled composer
@@ -1023,18 +1064,124 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             ..GlobalArgs::default()
         };
-        let out = vendored_ledger_supplement(&args, &[crawled], &Ok(state.clone())).await;
+        let out = vendored_ledger_supplement(&args, &[crawled], &Ok(state.clone()))
+            .await
+            .packages;
         assert!(
             out.is_empty(),
             "{:?}",
             out.iter().map(|p| &p.purl).collect::<Vec<_>>()
         );
 
-        let out = vendored_ledger_supplement(&args, &[], &Ok(state)).await;
+        let out = vendored_ledger_supplement(&args, &[], &Ok(state)).await.packages;
         assert_eq!(
             out.iter().map(|p| p.purl.as_str()).collect::<Vec<_>>(),
             vec!["pkg:composer/psr/log@3.0.2.0"]
         );
+    }
+
+    /// An npm (package-lock flavor) ledger entry for `left-pad@1.3.0`
+    /// vendored under [`VENDORED_UUID`], with `lock` as the project's
+    /// package-lock.json (`None`: no lock at all).
+    async fn npm_ledger_with_lock(
+        root: &std::path::Path,
+        lock: Option<&str>,
+    ) -> std::io::Result<VendorState> {
+        let mut state = VendorState::new();
+        let entry: socket_patch_core::vendor::VendorEntry =
+            serde_json::from_value(serde_json::json!({
+                "ecosystem": "npm",
+                "basePurl": "pkg:npm/left-pad@1.3.0",
+                "uuid": VENDORED_UUID,
+                "artifact": {"path": format!(".socket/vendor/npm/{VENDORED_UUID}/left-pad-1.3.0/node_modules/left-pad"), "sha256": ""},
+                "wiring": [],
+            }))
+            .unwrap();
+        state
+            .entries
+            .insert("pkg:npm/left-pad@1.3.0".to_string(), entry);
+        if let Some(lock) = lock {
+            std::fs::write(root.join("package-lock.json"), lock).unwrap();
+        }
+        Ok(state)
+    }
+
+    fn npm_lock_resolving(left_pad: &str) -> String {
+        serde_json::json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app", "dependencies": {"left-pad": "*"}},
+                "node_modules/left-pad": {"version": "1.3.0", "resolved": left_pad},
+            }
+        })
+        .to_string()
+    }
+
+    /// #541: once the dependency left the lock (bumped to another release,
+    /// or uninstalled), the ledger entry is no longer a discoverable
+    /// package: supplementing it made the vendor step re-vendor a package
+    /// the lock no longer has and fail the whole scan.
+    #[tokio::test]
+    async fn ledger_supplement_skips_entries_the_lock_no_longer_wires() {
+        let args = |root: &std::path::Path| GlobalArgs {
+            cwd: root.to_path_buf(),
+            ..GlobalArgs::default()
+        };
+        // Bumped: the lock resolves left-pad from the registry again.
+        let tmp = tempfile::tempdir().unwrap();
+        let bumped = serde_json::json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "app", "dependencies": {"left-pad": "1.2.0"}},
+                "node_modules/left-pad": {
+                    "version": "1.2.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.2.0.tgz",
+                },
+            }
+        })
+        .to_string();
+        let state = npm_ledger_with_lock(tmp.path(), Some(&bumped)).await;
+        let out = vendored_ledger_supplement(&args(tmp.path()), &[], &state).await;
+        assert!(out.packages.is_empty(), "{:?}", out.packages);
+        assert_eq!(out.unwired, vec!["pkg:npm/left-pad@1.3.0".to_string()]);
+
+        // Uninstalled: the lock has no left-pad at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let removed = r#"{"name":"app","lockfileVersion":3,"packages":{"":{"name":"app"}}}"#;
+        let state = npm_ledger_with_lock(tmp.path(), Some(removed)).await;
+        let out = vendored_ledger_supplement(&args(tmp.path()), &[], &state).await;
+        assert!(out.packages.is_empty(), "{:?}", out.packages);
+        assert_eq!(out.unwired, vec!["pkg:npm/left-pad@1.3.0".to_string()]);
+    }
+
+    /// The fresh-clone case the supplement exists for: the lock still
+    /// resolves through the committed artifact, so the entry stays
+    /// discoverable. With no lock at all, nothing proves the entry unused,
+    /// so it is kept (fail-safe, like the prune GC).
+    #[tokio::test]
+    async fn ledger_supplement_keeps_wired_and_undecidable_entries() {
+        for lock in [
+            Some(npm_lock_resolving(&format!(
+                "file:.socket/vendor/npm/{VENDORED_UUID}/left-pad-1.3.0/node_modules/left-pad"
+            ))),
+            None,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let args = GlobalArgs {
+                cwd: tmp.path().to_path_buf(),
+                ..GlobalArgs::default()
+            };
+            let state = npm_ledger_with_lock(tmp.path(), lock.as_deref()).await;
+            let out = vendored_ledger_supplement(&args, &[], &state).await;
+            assert_eq!(
+                out.packages.iter().map(|p| p.purl.as_str()).collect::<Vec<_>>(),
+                vec!["pkg:npm/left-pad@1.3.0"],
+                "lock={lock:?}"
+            );
+            assert!(out.unwired.is_empty(), "lock={lock:?}: {:?}", out.unwired);
+        }
     }
 
     #[tokio::test]
