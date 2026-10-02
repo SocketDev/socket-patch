@@ -1,7 +1,8 @@
 {
  "done": [
   "20261002T172142Z-janitor.json",
-  "20261002T182800Z-janitor.json"
+  "20261002T182800Z-janitor.json",
+  "20261002T192021Z-janitor.json"
  ],
  "failed": {
   "00000000T000000Z-bridge-test.json": [
