@@ -1048,9 +1048,11 @@ fn yarn4_pnpm_linker_agent_apply_patches_bundled_copy_inside_store_package() {
         &["node", "-p", "require('parent')"],
         &[],
     );
-    assert!(
-        String::from_utf8_lossy(&loaded_path.stdout)
-            .contains("package/node_modules/is-number/index.js"),
+    // Compared as canonical paths: Node prints the platform's separators.
+    let loaded = PathBuf::from(String::from_utf8_lossy(&loaded_path.stdout).trim());
+    assert_eq!(
+        std::fs::canonicalize(&loaded).ok(),
+        std::fs::canonicalize(&bundled_index).ok(),
         "parent must load its bundled is-number:\n{}",
         yarn_berry_common::yarn_output(&loaded_path)
     );
