@@ -200,6 +200,7 @@ pub(crate) mod composer;
 pub(crate) mod deno;
 pub(crate) mod gem;
 pub(crate) mod golang;
+pub(crate) mod gradle;
 pub(crate) mod maven;
 pub(crate) mod npm;
 pub(crate) mod nuget;
@@ -735,6 +736,7 @@ async fn discover_with_ctx(ctx: DiscoverCtx<'_>) -> Discovery {
     gem::extract(&ctx, &mut out).await;
     composer::extract(&ctx, &mut out).await;
     maven::extract(&ctx, &mut out).await;
+    gradle::extract(&ctx, &mut out).await;
     nuget::extract(&ctx, &mut out).await;
     deno::extract(&ctx, &mut out).await;
     out.contest_across_locks();
