@@ -1225,6 +1225,12 @@ fn restore_metadata(meta: &mut Metadata, hit: &Hit, ctx: &Ctx<'_>) -> bool {
             uv.remove("sources");
         }
     }
+    // Adding a key to a header-less parent (one only implied by
+    // `[tool.uv.sources.<pkg>]` sub-tables) printed its header; once just
+    // sub-tables remain, the header is the rewrite's own bytes (#524).
+    if let Some(Item::Table(sources)) = uv.get_mut("sources") {
+        hide_header_over_sub_tables(sources);
+    }
     let mut removed = false;
     if let Some(index) = pushed {
         if let Some(overrides) = uv
@@ -1241,10 +1247,27 @@ fn restore_metadata(meta: &mut Metadata, hit: &Hit, ctx: &Ctx<'_>) -> bool {
     if uv.is_empty() {
         tool.remove("uv");
     }
+    if let Some(Item::Table(uv)) = tool.get_mut("uv") {
+        hide_header_over_sub_tables(uv);
+    }
     if tool.is_empty() {
         meta.doc.remove("tool");
     }
     removed
+}
+
+/// Make a standard table implicit again when it holds only sub-tables, so
+/// it renders as the `[parent.<sub>]` headers alone — the spelling it had
+/// before the hosted rewrite added (and restore removed) a key under it.
+fn hide_header_over_sub_tables(table: &mut toml_edit::Table) {
+    if !table.is_dotted()
+        && !table.is_empty()
+        && table
+            .iter()
+            .all(|(_, item)| matches!(item, Item::Table(t) if !t.is_dotted()))
+    {
+        table.set_implicit(true);
+    }
 }
 
 #[cfg(test)]
@@ -1297,6 +1320,88 @@ mod tests {
         assert!(spec_clauses("x===1.0").is_err());
         assert!(spec_clauses("x>=1.0+local").is_err());
         assert!(spec_clauses("x @ https://h/x.whl").is_err());
+    }
+
+    const HOSTED_SIX: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/g/e828efa5-5c6d-43f3-9909-03f5ac232b98/six-1.16.0-py2.py3-none-any.whl";
+
+    /// Hosted rewrite of `six` into `original`, then `restore_metadata`:
+    /// the pyproject must come back byte-identically (#524).
+    fn assert_metadata_round_trips(original: &str) {
+        use crate::utils::python_lock::ArtifactSource;
+        let rewritten = crate::utils::python_script::rewrite_project_metadata(
+            original,
+            "six",
+            "1.16.0",
+            ArtifactSource::Url(HOSTED_SIX),
+        )
+        .unwrap()
+        .expect("the rewrite adds a source");
+        assert!(rewritten.contains(HOSTED_SIX), "{rewritten}");
+        let mut meta = Metadata {
+            rel: "pyproject.toml".into(),
+            text: rewritten.clone(),
+            script: false,
+            doc: rewritten.parse().unwrap(),
+        };
+        let hit = Hit {
+            index: 0,
+            uuid: "e828efa5-5c6d-43f3-9909-03f5ac232b98".into(),
+            name: "six".into(),
+            version: "1.16.0".into(),
+        };
+        let client = super::super::UpstreamClient::new(true);
+        let ctx = Ctx {
+            client: &client,
+            origins: &[],
+            bun_lockb: false,
+        };
+        restore_metadata(&mut meta, &hit, &ctx);
+        assert_eq!(
+            meta.render().unwrap(),
+            original,
+            "rewritten was:\n{rewritten}"
+        );
+    }
+
+    const SUB_TABLE_SOURCES: &str = "[tool.uv.sources.idna]\nurl = \"https://files.pythonhosted.org/packages/e5/3e/idna-3.7-py3-none-any.whl\"\n";
+
+    #[test]
+    fn restore_drops_sources_header_made_explicit_over_sub_tables() {
+        assert_metadata_round_trips(&format!(
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\", \"idna==3.7\"]\n\n{SUB_TABLE_SOURCES}"
+        ));
+    }
+
+    #[test]
+    fn restore_drops_headers_made_explicit_over_sub_tables_transitive() {
+        // six is transitive, so the rewrite also adds an override under the
+        // header-less `[tool.uv]` parent.
+        assert_metadata_round_trips(&format!(
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"idna==3.7\"]\n\n{SUB_TABLE_SOURCES}"
+        ));
+    }
+
+    #[test]
+    fn restore_drops_sources_header_made_explicit_over_sub_tables_crlf() {
+        assert_metadata_round_trips(
+            &format!(
+                "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\", \"idna==3.7\"]\n\n{SUB_TABLE_SOURCES}"
+            )
+            .replace('\n', "\r\n"),
+        );
+    }
+
+    #[test]
+    fn restore_keeps_user_sources_spellings() {
+        let head = "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\", \"idna==3.7\"]\n\n";
+        for sources in [
+            "[tool.uv.sources]\nidna = { url = \"https://h/idna-3.7-py3-none-any.whl\" }\n",
+            "[tool.uv]\nsources.idna = { url = \"https://h/idna-3.7-py3-none-any.whl\" }\n",
+            "[tool.uv]\nsources.idna.url = \"https://h/idna-3.7-py3-none-any.whl\"\n",
+            "[tool.uv]\ndev-dependencies = []\n\n[tool.uv.sources.idna]\nurl = \"https://h/idna-3.7-py3-none-any.whl\"\n",
+        ] {
+            assert_metadata_round_trips(&format!("{head}{sources}"));
+        }
     }
 
     #[test]
