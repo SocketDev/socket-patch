@@ -132,7 +132,7 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
   - `wire_*`
   - `revert_*`
 - Pipfile.lock is read through one shared parser but **written two ways**: vendored reserializes canonically, hosted splices spans.
-- Hosted-URL recognition is duplicated: `pypi_pipenv.rs:614` accepts *any host*, while `redirect/mod.rs:4627 hosted_patch_uuid` takes an origin allowlist.
+- Hosted-URL recognition is duplicated: `pypi_pipenv.rs:614` accepts *any host*, while `redirect/mod.rs:4627 hosted_patch_uuid` takes an origin allowlist. {{E04}}
 
 **Cargo:**
 - `crawlers/cargo_crawler.rs:13-21` has its own line-based Cargo.toml parser ("no TOML crate dependency"), although `toml_edit` is a dependency of the same crate.

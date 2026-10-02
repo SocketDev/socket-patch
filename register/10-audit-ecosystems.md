@@ -6,7 +6,7 @@ _Last updated 2026-10-02T19:30Z · main @ d63ae5f_
 | E01 | 1 | Hosted NuGet source mapping (`nuget_package_source_keys`) regex-scans raw XML, so a commented-out `<add key>` changes which sources get mapped. The vendored reader and `formats::nuget` both mask comments. | §1 #5; 5.4 | #561 | filed #561 |
 | E02 | 1 | `bun.lockb` vendoring hard-codes `registry.npmjs.org` and ignores `SOCKET_NPM_REGISTRY`. The npm tarball URL is re-implemented in `lock_inventory/vlt.rs`, and there are two `NPM_REGISTRY` constants. | §1 #7; 4.4 | #562 | partly not a defect; rest filed #562 |
 | E03 | 1 | vlt `registry_base` has two implementations (`upstream/vlt.rs`, `lock_inventory/vlt.rs`) with different fallback orders and different unknown-alias behavior. | §1 #7; 4.4 | #562 | filed #562 |
-| E04 | 1 | Pipenv hosted-URL recognition accepts any host (`pypi_pipenv.rs`), but `redirect` `hosted_patch_uuid` uses an origin allowlist. | 5.4 | #563 | filed #563 |
+| E04 | 1 | Pipenv hosted-URL recognition accepts any host (`pypi_pipenv.rs`), but `redirect` `hosted_patch_uuid` uses an origin allowlist. | 5.4 | #563 | in PR #572 |
 | E05 | 1 | Cache crawls aren't project-scoped: cargo, go, maven, nuget and deno enumerate the whole machine cache, and scan sends all of it to the API (#265). | 6.6 | | to verify |
 | E06 | 1 | Some crawler reads aren't FIFO-safe: `nuget_crawler.rs` and `python_crawler.rs` use a plain `read_to_string` on files in the project tree. | 6.6 | | to verify |
 | E07 | 2 | package-lock has four entry walks and three JSON re-serialization strategies (`redirect::serialize_json`, `common::serialize_json`, `JsonLayout`). Target: one `NpmLockDoc` model. #357 fixed part of this. | 4.4; 4.7 E | | to verify |
@@ -51,7 +51,7 @@ _Last updated 2026-10-02T19:30Z · main @ d63ae5f_
 | E46 | 2 | Decide: VEX evidence. Should `not_affected` require consumed evidence by default, so that wired-only evidence (`lockfile_basis_ok`) needs an opt-in? This is behind 29 open issues. | §6 Q4; 2.2; 6.5 | | to verify |
 | E47 | 3 | Decide: support tiers for `bun.lockb` writes, vendored pnpm 7/8, vlt pre-1.0 encodings and hosted pnpm ≤ 6, and whether hosted JVM ships as beta. | §5; §6 Q3; 4.6 | | to verify |
 | E48 | 3 | Discovery re-implements package-manager layouts (venv-name hashing, global prefixes, the pnpm store). Target: ask the package manager (`poetry env info -p`, `pipenv --venv`, `npm query`, …). | 2.2 #2; 6.6 | | to verify |
-| E49 | 2 | Hosted Pipenv `owned_url` rejects path-prefixed `--patch-server-url` origins and sdists, so it refuses to rotate its own pin; there are four hosted-PyPI-URL grammars (`hosted_patch_uuid`, `hosted_artifact_url`, `owned_url`, `is_socket_hosted_reference`). | new finding | #563 | filed #563 |
+| E49 | 2 | Hosted Pipenv `owned_url` rejects path-prefixed `--patch-server-url` origins and sdists, so it refuses to rotate its own pin; there are four hosted-PyPI-URL grammars (`hosted_patch_uuid`, `hosted_artifact_url`, `owned_url`, `is_socket_hosted_reference`). | new finding | #563 | in PR #572 |
 
 **Handed off:** none yet.
 
