@@ -373,7 +373,7 @@ async fn get_gem_paths_with_gemfile_no_vendor_returns_gemdir() {
     // Hermetic seam: a developer's ambient BUNDLE_PATH/BUNDLE_APP_CONFIG
     // must not add install roots to this assertion.
     let result = crawler
-        .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+        .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None, None)
         .await;
 
     if let Some(v) = prev {
@@ -415,7 +415,7 @@ async fn get_gem_paths_with_gemfile_lock_only_returns_gemdir() {
     // Hermetic seam: a developer's ambient BUNDLE_PATH/BUNDLE_APP_CONFIG
     // must not add install roots to this assertion.
     let result = crawler
-        .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+        .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None, None)
         .await;
 
     if let Some(v) = prev {
@@ -461,7 +461,7 @@ async fn get_gem_paths_with_gems_rb_manifest_returns_gemdir() {
     // install roots to this assertion.
     let paths = with_path(bin.path(), || async {
         crawler
-            .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+            .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None, None)
             .await
     })
     .await
@@ -497,7 +497,7 @@ async fn get_gem_paths_with_gems_locked_only_returns_gemdir() {
     // install roots to this assertion.
     let paths = with_path(bin.path(), || async {
         crawler
-            .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+            .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None, None)
             .await
     })
     .await
@@ -553,14 +553,14 @@ async fn get_gem_paths_local_includes_every_gempath_home() {
         // Hermetic seam: ambient BUNDLE_PATH/BUNDLE_APP_CONFIG must not
         // add install roots to this assertion.
         let paths = crawler
-            .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+            .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None, None)
             .await
             .unwrap();
         // Control: the gate still holds with `gem env` answerable — a
         // non-Ruby cwd must not pull in the ambient gem homes.
         let non_ruby = tempfile::tempdir().unwrap();
         let decoy = crawler
-            .get_gem_paths_with_env(&options_at(non_ruby.path()), None, None, None)
+            .get_gem_paths_with_env(&options_at(non_ruby.path()), None, None, None, None)
             .await
             .unwrap();
         let crawled = crawler.crawl_all(&options_at(tmp.path())).await;
@@ -644,6 +644,7 @@ async fn get_gem_paths_env_root_still_includes_gempath_homes() {
             .get_gem_paths_with_env(
                 &options_at(tmp.path()),
                 Some(env_root.as_os_str()),
+                None,
                 None,
                 None,
             )
@@ -755,7 +756,7 @@ async fn get_gem_paths_local_gemfile_no_gem_binary_returns_empty() {
     // Hermetic seam: ambient BUNDLE_PATH/BUNDLE_APP_CONFIG must not add
     // install roots to this assertion.
     let paths = crawler
-        .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+        .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None, None)
         .await
         .unwrap();
 

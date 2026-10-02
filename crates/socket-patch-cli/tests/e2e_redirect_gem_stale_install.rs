@@ -634,6 +634,219 @@ async fn gem_hosted_stale_archive_at_configured_cache_path_warns_and_is_not_atte
     }
 }
 
+/// #577: Bundler reads settings local → env → GLOBAL → default, and the
+/// global tier is the file `bundle config set --global …` writes:
+/// `$BUNDLE_CONFIG`, else `$BUNDLE_USER_CONFIG`, else
+/// `$BUNDLE_USER_HOME/config`, else `~/.bundle/config`. A global
+/// `cache_path` moves bundler's install-from cache exactly like a local
+/// one, so the stale archive there must warn and must not be attested.
+/// A local `cache_path` still beats the global one, and under
+/// `BUNDLE_IGNORE_CONFIG` neither file counts.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_stale_archive_at_global_cache_path_warns_and_is_not_attested() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    let moved = "---\nBUNDLE_CACHE_PATH: \"vendor/gems\"\n";
+    // (label, env var naming the global file or its dir, local config,
+    // extra env, cache dir the archive sits in)
+    for (label, global_var, local, extra, cache_dir) in [
+        ("home", "HOME", None, None, "gems"),
+        ("user-config", "BUNDLE_USER_CONFIG", None, None, "gems"),
+        ("user-home", "BUNDLE_USER_HOME", None, None, "gems"),
+        ("bundle-config", "BUNDLE_CONFIG", None, None, "gems"),
+        // The local tier beats the global one: the global `vendor/gems`
+        // is shadowed by the local `vendor/other`.
+        (
+            "local-wins",
+            "HOME",
+            Some("---\nBUNDLE_CACHE_PATH: \"vendor/other\"\n"),
+            None,
+            "other",
+        ),
+        // Bundler skips every config file: `vendor/cache` stays in force.
+        (
+            "ignore-config",
+            "HOME",
+            None,
+            Some(("BUNDLE_IGNORE_CONFIG", "1")),
+            "cache",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        if let Some(local) = local {
+            std::fs::create_dir_all(proj.join(".bundle")).unwrap();
+            std::fs::write(proj.join(".bundle").join("config"), local).unwrap();
+        }
+        // Lay the global config down where `global_var` points bundler.
+        let user = tmp.path().join("user");
+        let (global_value, global_file) = match global_var {
+            "HOME" => (user.clone(), user.join(".bundle").join("config")),
+            "BUNDLE_USER_HOME" => (user.clone(), user.join("config")),
+            _ => (user.join("bundle-config"), user.join("bundle-config")),
+        };
+        std::fs::create_dir_all(global_file.parent().unwrap()).unwrap();
+        std::fs::write(&global_file, moved).unwrap();
+        let archive = proj
+            .join("vendor")
+            .join(cache_dir)
+            .join(format!("{DEP}-{DEP_VERSION}.gem"));
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(&archive, b"upstream-gem-archive-bytes").unwrap();
+
+        let global_value = global_value.to_str().unwrap().to_string();
+        let mut env: Vec<(&str, &str)> = vec![(global_var, &global_value)];
+        // HOME keeps pointing somewhere empty for the non-HOME rows, so an
+        // ambient ~/.bundle/config cannot leak in.
+        let empty_home = tmp.path().join("empty-home");
+        let empty_home = empty_home.to_str().unwrap().to_string();
+        if global_var != "HOME" {
+            env.push(("HOME", &empty_home));
+        }
+        env.extend(extra);
+
+        let vex_path = proj.join("out.vex.json");
+        let (code, stdout, stderr) = common::run_with_env(
+            &proj,
+            &[
+                "scan",
+                "--mode",
+                "hosted",
+                "--json",
+                "--yes",
+                "--cwd",
+                proj.to_str().unwrap(),
+                "--api-url",
+                &server.uri(),
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+                "--vex",
+                vex_path.to_str().unwrap(),
+                "--vex-product",
+                "pkg:gem/app@1.0.0",
+            ],
+            &env,
+        );
+        let envelope = common::parse_json_envelope(&stdout);
+        let warnings = stale_warnings(&envelope);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "{label}: the globally configured cache archive must warn: {envelope}\nstderr:\n{stderr}"
+        );
+        assert!(
+            warnings[0].contains(&archive.display().to_string()),
+            "{label}: the warning must name the archive bundler installs from: {}",
+            warnings[0]
+        );
+        if let Ok(doc) = std::fs::read_to_string(&vex_path) {
+            assert!(
+                !doc.contains(PURL),
+                "{label}: a stale purl must never be attested by the same run's VEX:\n{doc}"
+            );
+        }
+        assert_ne!(
+            code, 0,
+            "{label}: an all-stale --vex run must fail, not attest.\nstdout:\n{stdout}"
+        );
+    }
+}
+
+/// #577: a global `gemfile` setting (`bundle config set --global gemfile
+/// Gemfile.next`) makes bundler load `Gemfile.next`, exactly like the local
+/// one #507 covers. The hosted scan must refuse with
+/// `redirect_gem_bundle_gemfile_unsupported`, leave the `Gemfile` pair
+/// untouched, and attest nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_global_gemfile_setting_is_refused() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    std::fs::write(
+        proj.join("Gemfile.next"),
+        format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n"),
+    )
+    .unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".bundle")).unwrap();
+    std::fs::write(
+        home.join(".bundle").join("config"),
+        "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n",
+    )
+    .unwrap();
+    let pristine_gemfile = std::fs::read(proj.join("Gemfile")).unwrap();
+    let pristine_lock = std::fs::read(proj.join("Gemfile.lock")).unwrap();
+
+    let vex_path = proj.join("out.vex.json");
+    let (code, stdout, stderr) = common::run_with_env(
+        &proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--vex",
+            vex_path.to_str().unwrap(),
+            "--vex-product",
+            "pkg:gem/app@1.0.0",
+        ],
+        &[("HOME", home.to_str().unwrap())],
+    );
+    let envelope = common::parse_json_envelope(&stdout);
+    let warnings: Vec<&serde_json::Value> = envelope["redirect"]["warnings"]
+        .as_array()
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let refusal = warnings
+        .iter()
+        .find(|w| w["code"] == "redirect_gem_bundle_gemfile_unsupported")
+        .unwrap_or_else(|| {
+            panic!("the global gemfile setting must be refused: {envelope}\nstderr:\n{stderr}")
+        });
+    let detail = refusal["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("global bundler config") && detail.contains("--global"),
+        "the refusal must name the global setting and its remedy: {detail}"
+    );
+    assert_eq!(
+        envelope["redirect"]["redirected"], 0,
+        "nothing redirected: {envelope}"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("Gemfile")).unwrap(),
+        pristine_gemfile,
+        "the Gemfile bundler ignores must be byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("Gemfile.lock")).unwrap(),
+        pristine_lock,
+        "the lock must be byte-identical"
+    );
+    if let Ok(doc) = std::fs::read_to_string(&vex_path) {
+        assert!(
+            !doc.contains(PURL),
+            "nothing may be attested for a gem bundler installs unpatched:\n{doc}"
+        );
+    }
+    assert_ne!(code, 0, "nothing was patched or attested: {envelope}");
+}
+
 /// 7. Manifest-less VEX (no `.socket/manifest.json` — hosted never writes
 /// one) over the stale-install scenario, before and after the prescribed
 /// fix. The two post-install lock shapes are the ones REAL bundler writes
