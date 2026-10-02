@@ -205,7 +205,8 @@ pub struct DerivedVerdict {
     /// bytes.
     pub stale: Vec<PathBuf>,
     /// Same-named copies whose bytes are neither the pristine jar nor the
-    /// jar now in the hash dir: nothing says which they came from.
+    /// jar now in the hash dir, and that are older than that jar: Gradle
+    /// may have derived them from the pristine jar.
     pub unverified: Vec<PathBuf>,
     /// The walk did not cover every derived-cache root.
     pub incomplete: bool,
@@ -219,29 +220,64 @@ impl DerivedVerdict {
     }
 }
 
+/// The [`gradle_cache::DerivedIndex`] of each Gradle user home a run
+/// checks, built on first use: one walk per home however many jars are
+/// checked. Cheap to clone (shared).
+#[derive(Debug, Clone, Default)]
+pub struct DerivedCache(
+    std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<gradle_cache::DerivedIndex>>>>,
+);
+
+impl DerivedCache {
+    fn index(&self, home: &Path) -> std::sync::Arc<gradle_cache::DerivedIndex> {
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(home.to_path_buf())
+            .or_insert_with(|| std::sync::Arc::new(gradle_cache::DerivedIndex::build(home)))
+            .clone()
+    }
+}
+
 /// The copies Gradle derived (outside `files-2.1`) from the jar `jar_leaf`
 /// of the hash dir `hash_dir`, whose name is the PRISTINE jar's sha1:
-/// [`gradle_cache::stale_derived_copies`] over the dir's user home, with
-/// the same-named copies that are byte-identical to the jar now in the
-/// hash dir (a copy Gradle rebuilt from the patched jar) dropped from
-/// `unverified`. `None` for anything but a writable Gradle hash dir.
-/// Blocking.
+/// [`gradle_cache::stale_derived_copies`] over the dir's user home. A
+/// same-named copy is dropped from `unverified` when it is byte-identical
+/// to the jar now in the hash dir, or no older than it: Gradle keys its
+/// derived caches by the input's content, so a copy made after the jar was
+/// rewritten was made from the rewritten jar — that is how an instrumented
+/// build-logic jar (never byte-equal to its input) rebuilt after the patch
+/// is told from one left over from the pristine jar. `None` for anything
+/// but a writable Gradle hash dir. Blocking.
 pub fn derived_copies(hash_dir: &Path, jar_leaf: &str) -> Option<DerivedVerdict> {
+    derived_copies_in(&DerivedCache::default(), hash_dir, jar_leaf)
+}
+
+/// [`derived_copies`] over `cache`'s index of the user home.
+pub fn derived_copies_in(
+    cache: &DerivedCache,
+    hash_dir: &Path,
+    jar_leaf: &str,
+) -> Option<DerivedVerdict> {
     if !maven_sidecars::is_gradle_hash_dir(hash_dir) {
         return None;
     }
     let home = maven_sidecars::gradle_user_home_of(hash_dir)?;
     let pristine_sha1 = hash_dir.file_name()?.to_str()?;
-    let found = gradle_cache::stale_derived_copies(&home, jar_leaf, pristine_sha1);
-    let current = std::fs::read(hash_dir.join(jar_leaf))
-        .ok()
-        .map(|b| sha1_hex(&b));
+    let found = cache.index(&home).query(jar_leaf, pristine_sha1);
+    let jar = hash_dir.join(jar_leaf);
+    let current = std::fs::read(&jar).ok().map(|b| sha1_hex(&b));
+    let written = std::fs::metadata(&jar).and_then(|m| m.modified()).ok();
     let unverified = found
         .unknown
         .into_iter()
         .filter(|p| {
-            let copy = std::fs::read(p).ok().map(|b| sha1_hex(&b));
-            copy.is_none() || copy != current
+            let Ok(copy) = std::fs::read(p) else {
+                return true;
+            };
+            if Some(sha1_hex(&copy)) == current {
+                return false;
+            }
+            let made = std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            !matches!((made, written), (Some(made), Some(written)) if made >= written)
         })
         .collect();
     Some(DerivedVerdict {
@@ -507,7 +543,7 @@ pub async fn apply_jar_swap(
                     ));
                 }
                 results[*i].error = Some(format!("{}: {e}", dir.join(swap.jar_leaf).display()));
-                if maven_sidecars::is_locked_by_daemon(&e) {
+                if maven_sidecars::is_locked_by_daemon(&e, &dir.join(swap.jar_leaf)) {
                     results[*i].sidecar = Some(sidecars::SidecarRecord {
                         purl: swap.purl.to_string(),
                         ecosystem: "maven".to_string(),
@@ -587,11 +623,15 @@ async fn find_backup(restore: &JarRestore<'_>, dir: &Path, current: &[u8]) -> Op
                 continue;
             }
         }
+        // Each member at its `beforeHash`; a member the patch adds (empty
+        // `beforeHash`) must be absent from the original.
         let originals = verify_member_bytes(&bytes, restore.files);
         if originals.iter().all(|v| {
             v.status == VerifyStatus::Ready
-                && v.current_hash.as_deref()
-                    == restore.files.get(&v.file).map(|i| i.before_hash.as_str())
+                && restore
+                    .files
+                    .get(&v.file)
+                    .is_some_and(|i| v.current_hash.as_deref().unwrap_or("") == i.before_hash)
         }) && unpatched_members(&bytes, restore.files).is_ok_and(|m| m == rest)
         {
             return Some(bytes);
@@ -753,7 +793,17 @@ pub async fn rollback_jar_swap(
                     };
                 }
             }
-            Err(e) => result.error = Some(format!("{}: {e}", path.display())),
+            Err(e) => {
+                result.error = Some(format!("{}: {e}", path.display()));
+                if maven_sidecars::is_locked_by_daemon(&e, &path) {
+                    result.sidecar = Some(sidecars::SidecarRecord {
+                        purl: restore.purl.to_string(),
+                        ecosystem: "maven".to_string(),
+                        files: Vec::new(),
+                        advisory: Some(maven_sidecars::locked_by_daemon_advisory(&path)),
+                    });
+                }
+            }
         }
         out.push(result);
     }
@@ -943,23 +993,23 @@ mod tests {
         assert!(out[0].success && out[0].files_patched.is_empty());
     }
 
-    /// The swap through a mocked patch service: the original is backed up
-    /// under jvm-originals, the copy carries the service jar, a matching
-    /// `.sha1` follows it; rollback restores both byte for byte.
-    #[tokio::test]
-    async fn swap_backs_up_and_rollback_is_byte_exact() {
+    /// A patch service granting `uuid` and serving `served` under an SRI
+    /// computed over `sri_of`, and a config pointing at it.
+    async fn mock_service(
+        served: &[u8],
+        sri_of: &[u8],
+    ) -> (wiremock::MockServer, VendorServiceConfig) {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         let uuid = "11111111-1111-4111-8111-111111111111";
-        let service = patched_jar();
         let sri = {
             use base64::Engine as _;
             use sha2::Digest as _;
             format!(
                 "sha512-{}",
-                base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&service))
+                base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(sri_of))
             )
         };
         let url = format!("{}/artifacts/{uuid}/lib-1.0.jar", server.uri());
@@ -975,19 +1025,9 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path(format!("/artifacts/{uuid}/lib-1.0.jar")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(service.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(served.to_vec()))
             .mount(&server)
             .await;
-
-        let d = tempfile::tempdir().unwrap();
-        let socket = d.path().join(".socket");
-        let copy = d.path().join("m2/com/example/lib/1.0");
-        std::fs::create_dir_all(&copy).unwrap();
-        let original = pristine_jar();
-        std::fs::write(copy.join("lib-1.0.jar"), &original).unwrap();
-        let sha1_text = format!("{}\n", sha1_hex(&original));
-        std::fs::write(copy.join("lib-1.0.jar.sha1"), &sha1_text).unwrap();
-
         let client = crate::api::client::ApiClient::new(crate::api::client::ApiClientOptions {
             api_url: server.uri(),
             api_token: None,
@@ -1003,6 +1043,26 @@ mod tests {
             patch_server_url: None,
             offline: false,
         };
+        (server, cfg)
+    }
+
+    /// The swap through a mocked patch service: the original is backed up
+    /// under jvm-originals, the copy carries the service jar, a matching
+    /// `.sha1` follows it; rollback restores both byte for byte.
+    #[tokio::test]
+    async fn swap_backs_up_and_rollback_is_byte_exact() {
+        let service = patched_jar();
+        let (_server, cfg) = mock_service(&service, &service).await;
+
+        let d = tempfile::tempdir().unwrap();
+        let socket = d.path().join(".socket");
+        let copy = d.path().join("m2/com/example/lib/1.0");
+        std::fs::create_dir_all(&copy).unwrap();
+        let original = pristine_jar();
+        std::fs::write(copy.join("lib-1.0.jar"), &original).unwrap();
+        let sha1_text = format!("{}\n", sha1_hex(&original));
+        std::fs::write(copy.join("lib-1.0.jar.sha1"), &sha1_text).unwrap();
+
         let files = record();
         let out = apply_jar_swap(&swap(&files, &socket, false), &[copy.clone()], Some(&cfg))
             .await
@@ -1110,5 +1170,106 @@ mod tests {
             std::fs::read(wrong.join("lib-1.0.jar")).unwrap(),
             patched_jar()
         );
+    }
+
+    /// A service jar that fails the integrity checks is refused before
+    /// anything is written: (a) its patched member is not at `afterHash`,
+    /// (b) a member the patch does not touch differs from the installed
+    /// jar's, or one is added, (c) its bytes fail the grant's SRI.
+    #[tokio::test]
+    async fn tampered_service_jar_is_refused_with_nothing_written() {
+        let altered = jar(&[("META-INF/NOTICE.txt", b"patched"), ("a/B.class", b"evil")]);
+        let extra = jar(&[
+            ("META-INF/NOTICE.txt", b"patched"),
+            ("a/B.class", b"code"),
+            ("a/Backdoor.class", b"evil"),
+        ]);
+        let wrong_after = jar(&[("META-INF/NOTICE.txt", b"other"), ("a/B.class", b"code")]);
+        // (served, sri over, whole-swap refusal code or None for a per-copy error)
+        let cases: Vec<(Vec<u8>, Vec<u8>, Option<&str>)> = vec![
+            (
+                wrong_after.clone(),
+                wrong_after,
+                Some("jvm_agent_service_jar_mismatch"),
+            ),
+            (altered.clone(), altered, None),
+            (extra.clone(), extra, None),
+            (
+                patched_jar(),
+                b"not the served bytes".to_vec(),
+                Some("jvm_agent_service_integrity"),
+            ),
+        ];
+        for (served, sri_of, refusal) in cases {
+            let (_server, cfg) = mock_service(&served, &sri_of).await;
+            let d = tempfile::tempdir().unwrap();
+            let socket = d.path().join(".socket");
+            let copy = d.path().join("m2/com/example/lib/1.0");
+            std::fs::create_dir_all(&copy).unwrap();
+            std::fs::write(copy.join("lib-1.0.jar"), pristine_jar()).unwrap();
+            let files = record();
+            let out =
+                apply_jar_swap(&swap(&files, &socket, false), &[copy.clone()], Some(&cfg)).await;
+            match refusal {
+                Some(code) => assert_eq!(out.unwrap_err().code, code),
+                None => {
+                    let out = out.unwrap();
+                    assert!(!out[0].success);
+                    assert!(
+                        out[0]
+                            .error
+                            .as_deref()
+                            .unwrap()
+                            .contains("differs from the installed jar"),
+                        "{:?}",
+                        out[0].error
+                    );
+                }
+            }
+            assert_eq!(
+                std::fs::read(copy.join("lib-1.0.jar")).unwrap(),
+                pristine_jar()
+            );
+            assert!(!socket.exists(), "no backup may be written");
+        }
+    }
+
+    /// A record that ADDS a member (empty `beforeHash`) rolls back from its
+    /// backup: the original, which lacks the member, is the right one.
+    #[tokio::test]
+    async fn added_member_rolls_back_from_backup() {
+        let d = tempfile::tempdir().unwrap();
+        let socket = d.path().join(".socket");
+        let copy = d.path().join("m2/com/example/lib/1.0");
+        std::fs::create_dir_all(&copy).unwrap();
+        let original = pristine_jar();
+        let patched = jar(&[
+            ("META-INF/NOTICE.txt", b"patched"),
+            ("a/B.class", b"code"),
+            ("a/Helper.class", b"helper"),
+        ]);
+        std::fs::write(copy.join("lib-1.0.jar"), &patched).unwrap();
+        let backup = backup_path(&socket, &original);
+        std::fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        std::fs::write(&backup, &original).unwrap();
+        let mut files = record();
+        files.insert(
+            "a/Helper.class".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: compute_git_sha256_from_bytes(b"helper"),
+            },
+        );
+        let restore = JarRestore {
+            purl: PURL,
+            jar_leaf: "lib-1.0.jar",
+            files: &files,
+            socket_dir: &socket,
+            dry_run: false,
+            offline: true,
+        };
+        let back = rollback_jar_swap(&restore, &[copy.clone()]).await;
+        assert!(back[0].success, "{:?}", back[0].error);
+        assert_eq!(std::fs::read(copy.join("lib-1.0.jar")).unwrap(), original);
     }
 }

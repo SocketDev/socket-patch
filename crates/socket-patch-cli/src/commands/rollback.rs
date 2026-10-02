@@ -2296,8 +2296,11 @@ pub(crate) async fn rollback_patches_inner(
             .as_ref()
             .filter(|_| Ecosystem::from_purl(purl) == Some(Ecosystem::Maven))
         {
-            // The read-only cache is never written, so never restored.
-            for pkg_path in pkg_paths.iter().filter(|p| !scope.is_read_only(p)) {
+            // Only the copies apply writes (`JvmScope::split`'s consumed
+            // ones): the read-only cache is never written, and a `~/.m2`
+            // copy this Gradle-only build never reads belongs to some
+            // other build — restoring it would unpatch that build.
+            for pkg_path in &scope.split(pkg_paths).consumed {
                 let key = (strip_purl_qualifiers(purl).to_string(), pkg_path.clone());
                 match maven_groups.iter_mut().find(|(k, _)| *k == key) {
                     Some((_, purls)) => purls.push(purl),

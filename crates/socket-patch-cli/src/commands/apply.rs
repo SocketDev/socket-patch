@@ -19,7 +19,7 @@ use socket_patch_core::telemetry::{track_patch_applied, track_patch_apply_failed
 use socket_patch_core::utils::purl::parse_golang_purl;
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::vendor::purl_keys_cover;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1872,6 +1872,8 @@ async fn apply_patches_inner(
             .vendor_service_config(Some(client.clone()), client.uses_public_proxy())
     });
 
+    let jvm_derived = socket_patch_core::patch::jvm_jar::DerivedCache::default();
+
     // PURL order, so the per-package Error/Warning lines, the results and
     // the `Patched packages:` block read the same on every run (the map is
     // a `HashMap`).
@@ -1926,6 +1928,7 @@ async fn apply_patches_inner(
                     policy,
                     service: jvm_service.as_ref(),
                     socket_dir: &socket_dir,
+                    derived: &jvm_derived,
                 };
                 let out = Box::pin(apply_maven_base(&maven)).await;
                 has_errors |= out.failed;
@@ -2282,6 +2285,8 @@ struct MavenBase<'a> {
     policy: MismatchPolicy,
     service: Option<&'a socket_patch_core::vendor::VendorServiceConfig>,
     socket_dir: &'a Path,
+    /// The run's derived-cache walks, one per Gradle user home.
+    derived: &'a socket_patch_core::patch::jvm_jar::DerivedCache,
 }
 
 /// What [`apply_maven_base`] reports back to the apply loop.
@@ -2371,7 +2376,8 @@ impl MavenApplied {
 ///   copies are patched, the run still fails.
 /// * `gradle_copy_unexpected_bytes` — a hash dir's file is the pristine
 ///   download (its sha1 names the dir) but not the bytes the record was
-///   made for: that copy is left alone.
+///   made for, or a hash dir holds files no release variant matches: that
+///   copy is left alone and the run fails (the build still loads it).
 /// * `gradle_transform_copy_stale` — after the write, Gradle still holds a
 ///   copy derived from the pristine jar (`caches/transforms-*`, `jars-*`):
 ///   that copy's result fails until it is cleared.
@@ -2450,48 +2456,64 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
     let multi = variants.len() > 1 || variants.first().is_some_and(|v| **v != m.base_purl);
     let gate_variants = !args.force && multi;
     let mut attempted = false;
-    for copy in &copies.consumed {
-        for variant in &variants {
-            let patch = &m.manifest.patches[*variant];
-            if let RecordShape::Members { jar_leaf } = jvm_jar::classify(variant, &patch.files) {
-                let dirs = jvm_jar::jar_copies(copy, &jar_leaf);
-                if dirs.is_empty() {
-                    continue;
-                }
-                if gate_variants {
-                    let mut installed = false;
-                    for dir in &dirs {
-                        installed |= matches!(
-                            jvm_jar::verify_members(dir, &jar_leaf, &patch.files).await,
-                            VerifyStatus::Ready | VerifyStatus::AlreadyPatched
-                        );
+    // Gradle hash dirs holding some variant's files, with those variants,
+    // and the ones some variant was attempted on: a dir held but never
+    // attempted holds bytes no variant was made for.
+    let mut held: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    let mut hit: HashSet<PathBuf> = HashSet::new();
+    for variant in &variants {
+        let patch = &m.manifest.patches[*variant];
+        if let RecordShape::Members { jar_leaf } = jvm_jar::classify(variant, &patch.files) {
+            // Every consumed copy's jar in ONE swap: one download, one
+            // backup, and a failed write puts every copy already swapped
+            // back — `~/.m2` and the Gradle cache alike.
+            let mut dirs = Vec::new();
+            for copy in &copies.consumed {
+                for dir in jvm_jar::jar_copies(copy, &jar_leaf) {
+                    if maven_sidecars::is_gradle_hash_dir(&dir) {
+                        held.entry(dir.clone())
+                            .or_default()
+                            .push((*variant).clone());
                     }
-                    if !installed {
+                    if gate_variants
+                        && !matches!(
+                            jvm_jar::verify_members(&dir, &jar_leaf, &patch.files).await,
+                            VerifyStatus::Ready | VerifyStatus::AlreadyPatched
+                        )
+                    {
                         continue;
                     }
+                    hit.insert(dir.clone());
+                    dirs.push(dir);
                 }
-                attempted = true;
-                out.matched.push((*variant).clone());
-                let swap = JarSwap {
-                    purl: variant,
-                    uuid: &patch.uuid,
-                    jar_leaf: &jar_leaf,
-                    files: &patch.files,
-                    socket_dir: m.socket_dir,
-                    dry_run: args.common.dry_run,
-                };
-                match Box::pin(jvm_jar::apply_jar_swap(&swap, &dirs, m.service)).await {
-                    Err(refusal) => out.refuse(variant, copy, refusal.code, refusal.message),
-                    Ok(results) => {
-                        for mut result in results {
-                            check_derived_copies(&mut out, &mut result, &jar_leaf, args).await;
-                            out.record(args, result);
-                        }
-                    }
-                }
+            }
+            if dirs.is_empty() {
                 continue;
             }
+            attempted = true;
+            out.matched.push((*variant).clone());
+            let swap = JarSwap {
+                purl: variant,
+                uuid: &patch.uuid,
+                jar_leaf: &jar_leaf,
+                files: &patch.files,
+                socket_dir: m.socket_dir,
+                dry_run: args.common.dry_run,
+            };
+            match Box::pin(jvm_jar::apply_jar_swap(&swap, &dirs, m.service)).await {
+                Err(refusal) => out.refuse(variant, &dirs[0], refusal.code, refusal.message),
+                Ok(results) => {
+                    for mut result in results {
+                        check_derived_copies(&mut out, &mut result, &jar_leaf, args, m.derived)
+                            .await;
+                        out.record(args, result);
+                    }
+                }
+            }
+            continue;
+        }
 
+        for copy in &copies.consumed {
             // Leaf record: the hash dirs holding its files (the copy itself
             // for `~/.m2`). A key no hash dir holds means this Gradle copy
             // does not hold the variant.
@@ -2499,6 +2521,11 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
                 let detailed = gradle_cache::installed_copies_detailed(copy, &patch.files);
                 if !detailed.missing.is_empty() {
                     continue;
+                }
+                for (dir, _) in &detailed.targets {
+                    held.entry(dir.clone())
+                        .or_default()
+                        .push((*variant).clone());
                 }
                 detailed.targets
             } else {
@@ -2516,12 +2543,13 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
                         continue;
                     }
                 }
+                hit.insert(dir.clone());
+                out.matched.push((*variant).clone());
                 if let Some(detail) = unexpected_gradle_bytes(&dir, &files).await {
-                    out.warn("gradle_copy_unexpected_bytes", detail);
+                    out.refuse(variant, &dir, "gradle_copy_unexpected_bytes", detail);
                     continue;
                 }
                 attempted = true;
-                out.matched.push((*variant).clone());
                 let mut result = apply_package_patch(
                     variant,
                     &dir,
@@ -2533,11 +2561,38 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
                 )
                 .await;
                 for leaf in files.keys().filter(|k| k.ends_with(".jar")) {
-                    check_derived_copies(&mut out, &mut result, leaf, args).await;
+                    check_derived_copies(&mut out, &mut result, leaf, args, m.derived).await;
                 }
                 out.record(args, result);
             }
         }
+    }
+    // A Gradle hash dir that holds a variant's files but whose bytes no
+    // variant was made for: the build loads it unpatched.
+    for (dir, holders) in held {
+        if hit.contains(&dir) {
+            continue;
+        }
+        let mut holders = holders;
+        holders.sort();
+        holders.dedup();
+        out.matched.extend(holders.iter().cloned());
+        out.refuse(
+            &holders[0],
+            &dir,
+            "gradle_copy_unexpected_bytes",
+            format!(
+                "{}: the Gradle cache copy {} holds bytes none of the manifest's variants ({}) \
+                 was made for; it was left unpatched.",
+                normalize_purl(m.base_purl),
+                dir.display(),
+                holders
+                    .iter()
+                    .map(|v| normalize_purl(v))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
     }
     out.matched.sort();
     out.matched.dedup();
@@ -2601,13 +2656,15 @@ async fn check_derived_copies(
     result: &mut ApplyResult,
     jar_leaf: &str,
     args: &ApplyArgs,
+    derived: &socket_patch_core::patch::jvm_jar::DerivedCache,
 ) {
     let dir = PathBuf::from(&result.package_path);
     let leaf = jar_leaf.trim_start_matches("package/").to_string();
     if args.common.dry_run || !result.success || !maven_sidecars::is_gradle_hash_dir(&dir) {
         return;
     }
-    let probe = move || socket_patch_core::patch::jvm_jar::derived_copies(&dir, &leaf);
+    let derived = derived.clone();
+    let probe = move || socket_patch_core::patch::jvm_jar::derived_copies_in(&derived, &dir, &leaf);
     let Some(verdict) = tokio::task::spawn_blocking(probe).await.ok().flatten() else {
         return;
     };

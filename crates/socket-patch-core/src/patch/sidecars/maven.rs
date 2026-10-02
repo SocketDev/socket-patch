@@ -278,10 +278,25 @@ pub fn gradle_extra_records(package_key: &str, hash_dir: &Path) -> Vec<super::Si
         .collect()
 }
 
-/// The Windows "file in use" errors (`ERROR_SHARING_VIOLATION`,
-/// `ERROR_LOCK_VIOLATION`): a Gradle daemon holding the jar open.
-pub fn is_locked_by_daemon(e: &std::io::Error) -> bool {
-    cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33))
+/// The Windows "file in use" errors of a write to `target`: a Gradle
+/// daemon holding the jar open. `ERROR_SHARING_VIOLATION` (32),
+/// `ERROR_LOCK_VIOLATION` (33) and `ERROR_DELETE_PENDING` (303) always;
+/// `ERROR_ACCESS_DENIED` (5) when `target` exists and is not read-only —
+/// the stage-and-rename write fails with it when another process holds
+/// the target open without `FILE_SHARE_DELETE`, as a JVM `ZipFile` does
+/// (the same codes `apply_lock` treats as "in use"). Always false
+/// elsewhere.
+pub fn is_locked_by_daemon(e: &std::io::Error, target: &Path) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    match e.raw_os_error() {
+        Some(32 | 33 | 303) => true,
+        Some(5) => {
+            std::fs::metadata(target).is_ok_and(|m| m.is_file() && !m.permissions().readonly())
+        }
+        _ => false,
+    }
 }
 
 /// The advisory for a write [`is_locked_by_daemon`] refused.

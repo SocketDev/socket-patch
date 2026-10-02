@@ -636,7 +636,9 @@ fn stale_transform_copy_fails_apply_and_vex_withholds() {
 }
 
 /// A hash dir whose file is the pristine download of OTHER bytes than the
-/// record expects is left alone (`gradle_copy_unexpected_bytes`).
+/// record expects is left alone (`gradle_copy_unexpected_bytes`) and fails
+/// the run: the build may load it, unpatched. The other hash dir is still
+/// patched.
 #[test]
 fn unexpected_pristine_bytes_are_left_alone() {
     let f = fx(CENTRAL);
@@ -645,10 +647,55 @@ fn unexpected_pristine_bytes_are_left_alone() {
     f.gradle(&[(JAR, &other)]);
     f.leaf_manifest();
     f.run(&["apply", "--offline"])
+        .failed()
         .has("gradle_copy_unexpected_bytes");
     let jars = hash_copies(&version, JAR);
     assert!(jars.iter().any(|(_, b)| *b == other));
     assert!(jars.iter().any(|(_, b)| *b == patched_jar()));
+}
+
+/// The only hash dir holds the genuine download of other bytes: the copy is
+/// installed and consumed, so the run fails with the code instead of
+/// calling the patch `package_not_installed`.
+#[test]
+fn unexpected_bytes_in_the_only_copy_fail_the_run() {
+    let f = fx(CENTRAL);
+    let other = jar(&[(NOTICE, b"some other build\n")]);
+    let version = f.gradle(&[(JAR, &other), (POM, PRISTINE_POM)]);
+    f.leaf_manifest();
+    let out = f.run(&["apply", "--offline"]);
+    out.failed().has("gradle_copy_unexpected_bytes");
+    assert!(
+        !out.json.to_string().contains("package_not_installed"),
+        "{}",
+        out.json
+    );
+    assert_eq!(hash_copies(&version, JAR)[0].1, other);
+}
+
+/// A qualified manifest key (`?ext=jar`) turns on the release-variant gate
+/// even for one variant: a hash dir holding the jar with bytes the variant
+/// was not made for is still a consumed, unpatched copy — the run fails
+/// (`gradle_copy_unexpected_bytes`), it is not `package_not_installed`.
+#[test]
+fn qualified_variant_mismatch_fails_the_run() {
+    let f = fx(CENTRAL);
+    let other = jar(&[(NOTICE, b"some other build\n")]);
+    let version = f.gradle(&[(JAR, &other)]);
+    let pristine = pristine_jar();
+    let patched = patched_jar();
+    f.manifest(&[(
+        &format!("{PURL}?ext=jar"),
+        &[(&format!("package/{JAR}"), &pristine, &patched)],
+    )]);
+    let out = f.run(&["apply", "--offline"]);
+    out.failed().has("gradle_copy_unexpected_bytes");
+    assert!(
+        !out.json.to_string().contains("package_not_installed"),
+        "{}",
+        out.json
+    );
+    assert_eq!(hash_copies(&version, JAR)[0].1, other);
 }
 
 /// A Gradle version dir holding none of a record's files (here only the
@@ -681,6 +728,112 @@ fn gradle_copy_without_the_patched_file_is_not_installed() {
         "{}",
         out.json
     );
+    // VEX agrees: the pom-only dir is no copy of the patch.
+    let (out, statements) = f.vex(&[]);
+    assert!(statements > 0, "{}", out.json);
+    assert!(
+        !out.warning_codes()
+            .iter()
+            .any(|c| c == "vex_gradle_unpatched_copy"),
+        "{}",
+        out.json
+    );
+}
+
+// ── derived copies ──────────────────────────────────────────────────────
+
+/// Set `path`'s mtime `secs` seconds into the past.
+fn age(path: &Path, secs: u64) {
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+        .unwrap();
+}
+
+/// An instrumented build-logic copy (never byte-equal to its input) left
+/// from BEFORE the apply withholds the statement; one Gradle made AFTER
+/// the apply was made from the patched jar and does not — so clearing the
+/// old one and rebuilding leads to a statement.
+#[test]
+fn instrumented_copy_made_after_the_apply_does_not_withhold() {
+    let f = fx(CENTRAL);
+    f.gradle(&as_refs(&pristine_files()));
+    let old = f
+        .home
+        .join("caches/jars-9/0a1b2c3d4e5f60718293a4b5c6d7e8f9")
+        .join(JAR);
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::write(&old, b"instrumented from the pristine jar").unwrap();
+    age(&old, 3600);
+    f.leaf_manifest();
+
+    f.run(&["apply", "--offline"])
+        .ok()
+        .has("gradle_transform_copy_unverified");
+    let (out, statements) = f.vex(&[]);
+    assert_eq!(statements, 0, "{}", out.json);
+    out.has("vex_gradle_unpatched_copy");
+
+    // Cleared and rebuilt: Gradle instruments the patched jar anew.
+    std::fs::remove_file(&old).unwrap();
+    let new = f
+        .home
+        .join("caches/8.14.3/transforms/fedcba98765432100123456789abcdef/transformed")
+        .join(format!("instrumented-{JAR}"));
+    std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+    std::fs::write(&new, b"instrumented from the patched jar").unwrap();
+    let (out, statements) = f.vex(&[]);
+    out.ok();
+    assert!(statements > 0, "{}", out.json);
+}
+
+// ── rollback scope and checks ───────────────────────────────────────────
+
+/// A Gradle-only build's rollback restores only what its apply wrote: the
+/// `~/.m2` copy another (Maven) build patched stays patched.
+#[test]
+fn rollback_leaves_an_m2_copy_the_build_never_reads() {
+    let f = fx(CENTRAL);
+    let m2 = f.m2(&[(JAR, &patched_jar()), (POM, PATCHED_POM)]);
+    let version = f.gradle(&as_refs(&pristine_files()));
+    f.leaf_manifest();
+    f.run(&["apply", "--offline"]).ok();
+    assert_eq!(hash_copies(&version, JAR)[0].1, patched_jar());
+    f.run(&["rollback", "--offline"]).ok();
+    assert_eq!(hash_copies(&version, JAR)[0].1, pristine_jar());
+    assert_eq!(
+        std::fs::read(m2.join(JAR)).unwrap(),
+        patched_jar(),
+        "another build's ~/.m2 copy must stay patched"
+    );
+}
+
+/// A before-blob that does not hash to the Gradle hash dir it is restored
+/// into fails the rollback (`gradle_rollback_hash_mismatch`).
+#[test]
+fn rollback_before_blob_not_matching_the_hash_dir_fails() {
+    let f = fx(CENTRAL);
+    let downloaded = pristine_jar();
+    let before = jar(&[(NOTICE, b"what the record calls pristine\n")]);
+    let patched = patched_jar();
+    let dir = f
+        .home
+        .join(prebuilt_common::GRADLE_FILES21)
+        .join(GROUP)
+        .join(ARTIFACT)
+        .join(VERSION)
+        .join(sha1_hex(&downloaded));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(JAR), &patched).unwrap();
+    f.manifest(&[(PURL, &[(&format!("package/{JAR}"), &before, &patched)])]);
+    let out = f.run(&["rollback", "--offline"]);
+    out.failed();
+    assert!(
+        out.json
+            .to_string()
+            .contains("gradle_rollback_hash_mismatch"),
+        "{}",
+        out.json
+    );
 }
 
 // ── member-keyed records (#264) ─────────────────────────────────────────
@@ -698,6 +851,98 @@ fn offline_member_record_writes_nothing() {
         .has("jvm_agent_service_required");
     assert_eq!(f.snapshot(), before);
     assert!(!f.proj.join(".socket/jvm-originals").exists());
+}
+
+/// A service jar carrying a member the installed jar does not have is not
+/// the installed jar plus the patch: refused, nothing written, no backup.
+#[test]
+fn tampered_service_jar_writes_nothing() {
+    let f = fx("    mavenLocal()\n    mavenCentral()\n");
+    f.m2(&as_refs(&pristine_files()));
+    f.gradle(&as_refs(&pristine_files()));
+    f.member_manifest();
+    let before = f.snapshot();
+    let mut tampered = zip::ZipArchive::new(std::io::Cursor::new(service_jar())).unwrap();
+    let mut members = Vec::new();
+    for i in 0..tampered.len() {
+        use std::io::Read as _;
+        let mut entry = tampered.by_index(i).unwrap();
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf).unwrap();
+        members.push((entry.name().to_string(), buf));
+    }
+    members.push(("com/example/Backdoor.class".to_string(), b"evil".to_vec()));
+    let refs: Vec<(&str, &[u8])> = members
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.as_slice()))
+        .collect();
+    let (_rt, server) = service(&jar(&refs));
+    f.run(&["apply", "--vendor-url", &server.uri()]).failed();
+    assert_eq!(f.snapshot(), before);
+    assert!(!f.proj.join(".socket/jvm-originals").exists());
+}
+
+/// A swap is one transaction across every consumed copy: when the write of
+/// one copy fails, the copies already swapped are put back — `~/.m2` and
+/// the Gradle cache alike — whichever copy is written first.
+#[cfg(target_os = "macos")]
+#[test]
+fn failed_swap_restores_every_copy() {
+    for locked_m2 in [false, true] {
+        let f = fx("    mavenLocal()\n    mavenCentral()\n");
+        let m2 = f.m2(&as_refs(&pristine_files()));
+        let version = f.gradle(&as_refs(&pristine_files()));
+        f.member_manifest();
+        let before = f.snapshot();
+        let (_rt, server) = service(&service_jar());
+        // A user-immutable jar: the rename over it fails with EPERM.
+        let locked = if locked_m2 {
+            m2.join(JAR)
+        } else {
+            version.join(&hash_copies(&version, JAR)[0].0).join(JAR)
+        };
+        let flag = |f: &str| {
+            assert!(Command::new("chflags")
+                .args([f, locked.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success())
+        };
+        flag("uchg");
+        let out = f.run(&["apply", "--vendor-url", &server.uri()]);
+        flag("nouchg");
+        out.failed();
+        let after: BTreeMap<String, String> = f
+            .snapshot()
+            .into_iter()
+            .filter(|(k, _)| !k.contains(".socket/jvm-originals"))
+            .collect();
+        assert_eq!(after, before, "locked_m2={locked_m2}: every copy restored");
+    }
+}
+
+/// Windows: a hash-dir jar held open without delete sharing (how a Gradle
+/// daemon's `JarFile` holds it) refuses the write with
+/// `gradle_jar_locked_by_daemon` — the rename fails with
+/// `ERROR_ACCESS_DENIED`, not a sharing violation.
+#[cfg(windows)]
+#[test]
+fn windows_held_jar_reports_daemon_lock() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let f = fx(CENTRAL);
+    let version = f.gradle(&as_refs(&pristine_files()));
+    f.leaf_manifest();
+    let jar_path = version.join(&hash_copies(&version, JAR)[0].0).join(JAR);
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1) // FILE_SHARE_READ only
+        .open(&jar_path)
+        .unwrap();
+    let out = f.run(&["apply", "--offline"]);
+    drop(held);
+    out.failed().has("gradle_jar_locked_by_daemon");
+    f.run(&["apply", "--offline"]).ok();
+    assert_eq!(hash_copies(&version, JAR)[0].1, patched_jar());
 }
 
 /// A patch service answering the vendoring route with `jar`.

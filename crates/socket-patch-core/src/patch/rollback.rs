@@ -556,6 +556,21 @@ async fn rollback_package_patch_at(
         {
             Ok(warning) => warnings.extend(warning),
             Err(e) => {
+                // A Windows daemon holding a cached jar open: say which
+                // process to stop (apply's twin).
+                let target = pkg_path.join(normalize_file_path(file_name));
+                if package_key.starts_with("pkg:maven/")
+                    && crate::patch::sidecars::maven::is_locked_by_daemon(&e, &target)
+                {
+                    result.sidecar = Some(crate::patch::sidecars::SidecarRecord {
+                        purl: package_key.to_string(),
+                        ecosystem: "maven".to_string(),
+                        files: Vec::new(),
+                        advisory: Some(crate::patch::sidecars::maven::locked_by_daemon_advisory(
+                            &target,
+                        )),
+                    });
+                }
                 result.error = Some(e.to_string());
                 return result;
             }

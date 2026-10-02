@@ -948,6 +948,16 @@ fn gradle_agent_cache_semantics_canaries() {
         code == Some(0) || stale,
         "apply may only fail over derived copies it names: {json}"
     );
+    // The warm daemon is the measured hazard; `gradle_daemon_stale` is its
+    // only mitigation, so the apply must say it.
+    if use_daemon {
+        let daemon_stale = json["sidecars"].to_string().contains("gradle_daemon_stale");
+        report.insert("d_applyReportsDaemonStale".into(), daemon_stale.into());
+        assert!(
+            daemon_stale,
+            "(d) a daemon was running: apply must report gradle_daemon_stale: {json}"
+        );
+    }
 
     // (d) the warm daemon, then after --stop.
     if use_daemon {
@@ -1030,6 +1040,40 @@ fn gradle_agent_cache_semantics_canaries() {
         String::from_utf8_lossy(&fat_notice),
         String::from_utf8_lossy(&patched_notice()),
         "(g) the build-cache jar task must pick up the patched member"
+    );
+
+    // (f) VEX over the build-logic copies. Gradle instrumented the
+    // buildscript jar before the apply; that copy, left in its derived
+    // cache, may withhold the statement — but clearing the derived caches
+    // (what the warning says) and rebuilding must lead to one: Gradle
+    // instruments the patched jar anew.
+    let (statements, vex_json) = c.vex(&[]);
+    report.insert("f_vexStatementsBeforeClear".into(), statements.into());
+    report.insert("f_vexWarningsBeforeClear".into(), codes(&vex_json).into());
+    let caches = c.home.join("caches");
+    for entry in std::fs::read_dir(&caches).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if name.starts_with("jars-") || name.starts_with("transforms-") {
+            std::fs::remove_dir_all(&path).unwrap();
+        } else if name.starts_with(|c: char| c.is_ascii_digit()) && path.join("transforms").is_dir()
+        {
+            std::fs::remove_dir_all(path.join("transforms")).unwrap();
+        }
+    }
+    let rebuilt = run(&["--offline", "buildLogicMarker", "printRuntimeClasspath"]);
+    assert!(ok(&rebuilt), "{}", dump(&rebuilt));
+    assert_eq!(
+        marker(&rebuilt).as_deref(),
+        Some(victim_marker(VICTIM_VERSION, "patched").as_str())
+    );
+    let (statements, vex_json) = c.vex(&[]);
+    report.insert("f_vexStatementsAfterClear".into(), statements.into());
+    report.insert("f_vexWarningsAfterClear".into(), codes(&vex_json).into());
+    assert!(
+        statements > 0 && !has(&vex_json, "vex_gradle_unpatched_copy"),
+        "(f) VEX must attest every record once the derived caches are rebuilt from the patched \
+         jar: {vex_json}"
     );
 
     probe_report(&c.cell_name("canaries"), &serde_json::Value::Object(report));

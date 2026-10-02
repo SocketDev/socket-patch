@@ -1041,10 +1041,10 @@ async fn apply_package_patch_at(
             Err(e) => {
                 // A Windows daemon holding a cached jar open: say which
                 // process to stop instead of a bare sharing violation.
+                let target = pkg_path.join(normalized);
                 if package_key.starts_with("pkg:maven/")
-                    && crate::patch::sidecars::maven::is_locked_by_daemon(&e)
+                    && crate::patch::sidecars::maven::is_locked_by_daemon(&e, &target)
                 {
-                    let target = pkg_path.join(normalized);
                     result.sidecar = Some(crate::patch::sidecars::SidecarRecord {
                         purl: package_key.to_string(),
                         ecosystem: "maven".to_string(),
