@@ -28,8 +28,9 @@ name: Gradle patch compatibility
 # scripts/ci-e2e-bundle.py --check enforces): agent = e2e_gradle_discovery_build
 # + e2e_gradle_agent_build (`gradle_agent_`), hosted = e2e_redirect_gradle_build
 # (`gradle_hosted_`), vendor = e2e_vendor_gradle_build + e2e_vendor_jvm_build
-# (`gradle_vendor_`, `gradle_multi_project`). A suite whose test file has not
-# landed yet is skipped; a cell with a landed suite that runs zero tests fails.
+# (`gradle_vendor_`, `gradle_multi_project`); a row's `suites` / `test_filter`
+# narrow that. A suite whose test file has not landed yet is skipped; every
+# landed suite a cell runs must run at least one test.
 #
 # Unlike ci.yml's e2e-build (scripts/ci-e2e-bundle.py reads ci.yml's rows),
 # `build` compiles exactly the Gradle suites once per OS and the cells
@@ -153,10 +154,10 @@ jobs:
         # Each line's LTS JDK (extends every cell of that line); the empty
         # keys are the `extras` knobs the shared steps read.
         include:
-          - {gradle: '6.9.4', java: '11', label: '', gradle_args: '', real_central: '', test_filter: ''}
-          - {gradle: '7.6.6', java: '17', label: '', gradle_args: '', real_central: '', test_filter: ''}
-          - {gradle: '8.14.3', java: '21', label: '', gradle_args: '', real_central: '', test_filter: ''}
-          - {gradle: '9.8.0', java: '21', label: '', gradle_args: '', real_central: '', test_filter: ''}
+          - {gradle: '6.9.4', java: '11', label: '', gradle_args: '', real_central: '', suites: '', test_filter: ''}
+          - {gradle: '7.6.6', java: '17', label: '', gradle_args: '', real_central: '', suites: '', test_filter: ''}
+          - {gradle: '8.14.3', java: '21', label: '', gradle_args: '', real_central: '', suites: '', test_filter: ''}
+          - {gradle: '9.8.0', java: '21', label: '', gradle_args: '', real_central: '', suites: '', test_filter: ''}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps: &cell-steps
@@ -258,6 +259,7 @@ jobs:
           SOCKET_PATCH_GRADLE_E2E_REAL_CENTRAL: ${{ matrix.real_central }}
           SOCKET_PATCH_GRADLE_E2E_PROBE_DIR: ${{ github.workspace }}/target/gradle-probe
           CELL_MODE: ${{ matrix.mode }}
+          CELL_SUITES: ${{ matrix.suites }}
           CELL_FILTER: ${{ matrix.test_filter }}
         run: |
           set -uo pipefail
@@ -269,28 +271,30 @@ jobs:
             vendor) suites='e2e_vendor_gradle_build e2e_vendor_jvm_build'; filter='gradle_vendor_ gradle_multi_project' ;;
             *) echo "::error::unknown mode $CELL_MODE"; exit 1 ;;
           esac
+          if [ -n "$CELL_SUITES" ]; then suites="$CELL_SUITES"; fi
           if [ -n "$CELL_FILTER" ]; then filter="$CELL_FILTER"; fi
           cd crates/socket-patch-cli
           export CARGO_MANIFEST_DIR="$PWD"
           status=0
-          ran=0
-          landed=0
           for suite in $suites; do
             if [ ! -f "tests/$suite.rs" ] && [ ! -f "tests/$suite/main.rs" ]; then
               echo "::notice::$suite has not landed yet; skipped"
               continue
             fi
-            landed=1
             log="../../target/gradle-$suite.log"
             # shellcheck disable=SC2086 # the filter is several libtest arguments
-            "../../target/gradle-bin/$suite$exe" --ignored --nocapture $filter 2>&1 | tee "$log" || status=1
+            if ! "../../target/gradle-bin/$suite$exe" --ignored --nocapture $filter 2>&1 | tee "$log"; then
+              status=1
+              continue
+            fi
+            # Per suite: another suite's tests must not hide one whose
+            # filter selects nothing.
             passed=$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed;.*/\1/p' "$log" | head -n 1)
-            ran=$((ran + ${passed:-0}))
+            if [ "${passed:-0}" = 0 ]; then
+              echo "::error::$suite ran no test in the $CELL_MODE cell ($filter)"
+              status=1
+            fi
           done
-          if [ "$status" = 0 ] && [ "$landed" = 1 ] && [ "$ran" = 0 ]; then
-            echo "::error::the $CELL_MODE cell ran no test ($suites: $filter)"
-            status=1
-          fi
           exit "$status"
 
       - name: Upload the probe reports
@@ -325,7 +329,9 @@ jobs:
           # Isolated Projects (recording only).
           - {os: ubuntu-latest, gradle: '9.8.0', java: '21', mode: hosted, label: isolated-projects, gradle_args: '-Dorg.gradle.unsafe.isolated-projects=true', record_only: 'true'}
           # The real Maven Central (#511, #487).
-          - {os: ubuntu-latest, gradle: '8.14.3', java: '21', mode: vendor, label: real-central, real_central: '1', test_filter: 'gradle_vendor_511 gradle_vendor_487'}
+          # Only the suite that owns those tests: e2e_vendor_jvm_build has none,
+          # and every landed suite a cell runs must run a test.
+          - {os: ubuntu-latest, gradle: '8.14.3', java: '21', mode: vendor, label: real-central, real_central: '1', suites: 'e2e_vendor_gradle_build', test_filter: 'gradle_vendor_511 gradle_vendor_487'}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     continue-on-error: ${{ matrix.record_only == 'true' }}

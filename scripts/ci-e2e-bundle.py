@@ -11,9 +11,10 @@ skipped until their test file exists. `--suites` bundles an explicit list
 instead (gradle-compatibility.yml's own build).
 
 Every run also enforces the per-suite test-name prefix contract
-(`PREFIX_GUARDS`): each `#[ignore]` test of a guarded suite must match its
-suite's pattern, because the CI rows select those tests by name prefix and a
-test outside every prefix would silently run nowhere. `--check` runs only
+(`PREFIX_GUARDS`): each `#[ignore]` test of a guarded suite must start with
+one of the prefixes the rows running that suite select, because the CI rows
+select those tests by name prefix and any other test would silently run
+nowhere. `--check` runs only
 the guard.
 """
 
@@ -40,15 +41,25 @@ CARGO_VEX_SUITES = (
 
 
 # The real-Gradle suites (one per package of the Gradle campaign) and the
-# libtest prefixes their CI rows filter on. sbt registers its own suites here.
-GRADLE_SUITES = (
-    "e2e_gradle_discovery_build",
-    "e2e_gradle_agent_build",
-    "e2e_redirect_gradle_build",
-    "e2e_vendor_gradle_build",
-)
-GRADLE_PREFIX = re.compile(r"^(?:gradle_(?:agent|hosted|vendor)_|gradle_multi_project)")
-PREFIX_GUARDS = {suite: GRADLE_PREFIX for suite in GRADLE_SUITES}
+# libtest prefixes the CI rows that run each suite filter on (ci.yml's PR
+# tier and gradle-compatibility.yml's modes). A suite admits only the
+# prefixes its own rows select: a `gradle_vendor_` test in the agent suite
+# would match the global vocabulary yet run in no row. sbt registers its own
+# suites here.
+GRADLE_SUITE_PREFIXES = {
+    "e2e_gradle_discovery_build": ("gradle_agent_",),
+    "e2e_gradle_agent_build": ("gradle_agent_",),
+    "e2e_redirect_gradle_build": ("gradle_hosted_",),
+    "e2e_vendor_gradle_build": ("gradle_vendor_", "gradle_multi_project"),
+}
+GRADLE_SUITES = tuple(GRADLE_SUITE_PREFIXES)
+
+
+def prefix_pattern(prefixes):
+    return re.compile("^(?:" + "|".join(re.escape(p) for p in prefixes) + ")")
+
+
+PREFIX_GUARDS = {suite: prefix_pattern(prefixes) for suite, prefixes in GRADLE_SUITE_PREFIXES.items()}
 
 IGNORED_FN = re.compile(
     r"#\[\s*ignore\b(?:\s*=\s*\"(?:[^\"\\]|\\.)*\")?\s*\]"

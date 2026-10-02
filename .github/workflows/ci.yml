@@ -1092,8 +1092,8 @@ jobs:
           # runs (space-separated); the libtest filters select by the prefix
           # contract ci-e2e-bundle.py enforces. `allow_empty: 'true'` marks a
           # leg whose owning suites have not all landed: unlanded suites are
-          # skipped and zero selected tests is not a failure (without it a
-          # Gradle leg that ran nothing fails). test_ci_gradle_prefixes.py
+          # skipped (without it a missing suite fails the leg). Every landed
+          # suite must still run at least one test. test_ci_gradle_prefixes.py
           # makes the last package drop it. Maven is installed only where a
           # selected test seeds through it (gradle_vendor_395, multi-project).
           - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_agent_ gradle_hosted_', allow_empty: 'true'}
@@ -1473,7 +1473,8 @@ jobs:
         # Runs from the package root with CARGO_MANIFEST_DIR set, as
         # `cargo test` would. `suite` may name several binaries; an
         # `allow_empty` row skips the ones whose test file has not landed.
-        # A Gradle leg must run at least one test unless `allow_empty`.
+        # Every suite a Gradle leg runs must run at least one test (per
+        # suite, so one suite's tests never hide another's empty filter).
         run: |
           set -uo pipefail
           exe=''
@@ -1481,7 +1482,6 @@ jobs:
           cd crates/socket-patch-cli
           export CARGO_MANIFEST_DIR="$PWD"
           status=0
-          ran=0
           for suite in $E2E_SUITE; do
             if [ "$E2E_ALLOW_EMPTY" = true ] && [ ! -f "tests/$suite.rs" ] && [ ! -f "tests/$suite/main.rs" ]; then
               echo "::notice::$suite has not landed yet; skipped (allow_empty)"
@@ -1489,14 +1489,16 @@ jobs:
             fi
             log="../../target/e2e-$suite.log"
             # shellcheck disable=SC2086 # the filter is several libtest arguments
-            "../../target/e2e-bin/$suite$exe" $E2E_TEST_FILTER 2>&1 | tee "$log" || status=1
+            if ! "../../target/e2e-bin/$suite$exe" $E2E_TEST_FILTER 2>&1 | tee "$log"; then
+              status=1
+              continue
+            fi
             passed=$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed;.*/\1/p' "$log" | head -n 1)
-            ran=$((ran + ${passed:-0}))
+            if [ "$E2E_JVM_TOOL" = gradle ] && [ "${passed:-0}" = 0 ]; then
+              echo "::error::$suite ran no test in this Gradle leg ($E2E_TEST_FILTER)"
+              status=1
+            fi
           done
-          if [ "$status" = 0 ] && [ "$E2E_JVM_TOOL" = gradle ] && [ "$ran" = 0 ] && [ "$E2E_ALLOW_EMPTY" != true ]; then
-            echo "::error::the Gradle leg ran no test ($E2E_SUITE: $E2E_TEST_FILTER)"
-            status=1
-          fi
           exit "$status"
 
       - name: Upload the Gradle probe reports

@@ -16,6 +16,10 @@
 //! * `SOCKET_PATCH_GRADLE_E2E_ARGS` — extra whitespace-separated arguments
 //!   for every Gradle run (the CI grid's `--configuration-cache` and
 //!   Isolated Projects cells).
+//! * `SOCKET_PATCH_GRADLE_E2E_REAL_CENTRAL` — when set and non-empty
+//!   ([`real_central`]), tests that have a real-Central variant resolve
+//!   from Maven Central instead of the fake (gradle-compatibility.yml's
+//!   `real-central` row).
 //!
 //! Every Gradle run is hermetic: a per-test `GRADLE_USER_HOME`, no daemon,
 //! plain console, and the ambient JVM / Gradle options ([`AMBIENT_ENV`]) and
@@ -36,6 +40,10 @@ pub const GRADLE_VERSION_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_VERSION";
 pub const GRADLE_REQUIRED_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_REQUIRED";
 pub const GRADLE_PROBE_DIR_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_PROBE_DIR";
 pub const GRADLE_ARGS_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_ARGS";
+pub const GRADLE_REAL_CENTRAL_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_REAL_CENTRAL";
+
+/// The real Maven Central, for [`real_central`] runs.
+pub const MAVEN_CENTRAL: &str = "https://repo.maven.apache.org/maven2";
 
 /// Ambient settings that would change what a Gradle child resolves or where
 /// it caches: JVM options (a `-Dgradle.user.home` there beats the per-test
@@ -73,6 +81,13 @@ pub fn gradle_flag(name: &str) -> bool {
 /// CI legs set `SOCKET_PATCH_GRADLE_E2E_REQUIRED`: never skip there.
 pub fn gradle_required() -> bool {
     gradle_flag(GRADLE_REQUIRED_ENV)
+}
+
+/// The leg targets the real Maven Central ([`GRADLE_REAL_CENTRAL_ENV`]):
+/// a test with a real-Central variant mirrors to [`MAVEN_CENTRAL`] instead
+/// of its fake origin; the others ignore it.
+pub fn real_central() -> bool {
+    gradle_flag(GRADLE_REAL_CENTRAL_ENV)
 }
 
 /// Skip (println) locally; fail when the leg is required.
