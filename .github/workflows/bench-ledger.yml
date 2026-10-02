@@ -1,0 +1,33 @@
+name: bench ledger to discussion
+
+# Cloud agent sessions can't use GitHub GraphQL, so the benchmark routine
+# commits its progress here and this workflow mirrors it into discussion
+# #575 (see discussions.json). tools/mirror.py reconciles the whole branch
+# tip on every run, so a run cancelled by the concurrency group below loses
+# nothing: the next one posts whatever is missing.
+
+on:
+  push:
+    branches: [bench/ledger]
+
+permissions:
+  contents: read
+  discussions: write
+
+concurrency:
+  group: bench-ledger
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: bench/ledger
+          persist-credentials: false
+      - name: Mirror entries and state to discussions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/mirror.py
