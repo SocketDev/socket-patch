@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Deno bug-hunt routine (label pm:deno).
 
-Last updated: 2026-10-02 (run 8), main `61cfb9b`, latest release 4.0.0 (previous 3.3.0). Newest Deno is 2.9.7. Fix PR #496 for #373 passes against real layouts. Fix PR #517 for #516 misses Deno `_1` copies even with #496 (commented on #516).
+Last updated: 2026-10-02 (run 9), main `b1f9818`, latest release 4.0.0 (previous 3.3.0). Newest Deno is 2.9.7. #373 is fixed on main (#496) and verified. #516 was closed by #517, but the Deno `.deno/<name>@<ver>_1` VEX case still fails, filed as #603.
 
 Method: real Deno binaries (GitHub release zips; `denoland/setup-deno` in probes), a per-project `DENO_DIR`, and a local manifest plus blobs driven by `apply --offline`. The patched bytes record themselves in `globalThis.__SP`, so `deno run` shows which patched modules actually loaded. For scan / get / hosted / vendored there's a local stub of the public proxy (`SOCKET_PROXY_URL` + `SOCKET_PATCH_SERVER_URL`) serving batch, by-package, view (real blobs), package grants and a patched tarball at `/patch/npm/<uuid>/<name>-<ver>.tgz`. Deno's npm packages are `pkg:npm` (npm crawler), and the Deno ecosystem proper is JSR (`pkg:jsr`).
 
@@ -8,21 +8,21 @@ Method: real Deno binaries (GitHub release zips; `denoland/setup-deno` in probes
 
 | OS | Deno | Agent: direct npm dep (incl. scoped, alias, workspace member) | Agent: transitive npm dep (`node_modules/.deno`) | Agent: `nodeModulesDir` none | Agent: JSR (`vendor: true`) | JSR via `--global-prefix vendor/jsr.io` | vendored refusal | hosted / vendored (npm deps via package-lock.json) | VEX |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 1.46.3 | pass | fail #373 | known limitation | fail #374 | pass | pass for `pkg:npm` (deno.lock v3 only: `vendor_lockfile_missing`, rc 1) | hosted fail #406 | pass (agent), fail #406 (hosted) |
-| Linux | 2.0.6 | pass (run 1) | fail #373 | known limitation | fail #374 | untested | untested | untested | untested |
-| Linux | 2.2.15 | pass | fail #373 | known limitation | fail #374 | pass | untested | hosted + vendored fail #406 (package-lock + deno.lock) | fail #406 |
-| Linux | 2.9.6 | pass | fail #373 (also `--prune` drops records) | known limitation | fail #374 | pass (scan + apply; unsafe with npm deps, see #374) | pass for `pkg:jsr` (`vendor_unsupported_ecosystem`) | hosted + vendored fail #406 | pass (agent), fail #406 (hosted) |
-| macOS | 1.46.3 / 2.2.15 / 2.9.6 | pass (scoped; apply / vex / rollback) | fail #373 | untested | fail #374 | pass | untested | untested | pass (agent) |
-| Windows | 1.46.3 / 2.2.15 / 2.9.6 | pass (scoped via junctions; apply / vex / rollback) | fail #373 | untested | fail #374 | pass | untested | untested | pass (agent) |
-| Linux | 2.9.7 | pass (also `links`) | fail #373 (re-checked on `61cfb9b`) | untested | untested | untested | pass for `pkg:npm` in a deno.lock-only project (`vendor_lockfile_missing`, exit 1, files untouched) | fail #406 (lockfile-only vex) | pass (agent) |
+| Linux | 1.46.3 | pass | fail #373 on `61cfb9b` (fixed on main, not re-run on 1.46.3) | known limitation | fail #374 | pass | pass for `pkg:npm` (deno.lock v3 only: `vendor_lockfile_missing`, rc 1) | hosted fail #406 | pass (agent), fail #406 (hosted) |
+| Linux | 2.0.6 | pass (run 1) | fail #373 on `61cfb9b` (fixed on main, not re-run on 2.0.6) | known limitation | fail #374 | untested | untested | untested | untested |
+| Linux | 2.2.15 | pass | fail #373 on `61cfb9b` (fixed on main) | known limitation | fail #374 | pass | pass for `pkg:npm` (deno.lock v4: `vendor_lockfile_missing`, rc 1) | hosted + vendored fail #406 (package-lock + deno.lock) | fail #406 |
+| Linux | 2.9.6 | pass | fail #373 on `61cfb9b` (also `--prune` drops records); fixed on main | known limitation | fail #374 | pass (scan + apply; unsafe with npm deps, see #374) | pass for `pkg:jsr` (`vendor_unsupported_ecosystem`) | hosted + vendored fail #406 | pass (agent), fail #406 (hosted) |
+| macOS | 1.46.3 / 2.2.15 / 2.9.6 | pass (scoped; apply / vex / rollback) | fail #373 on `61cfb9b` (fixed on main, not re-probed) | untested | fail #374 | pass | untested | untested | pass (agent) |
+| Windows | 1.46.3 / 2.2.15 / 2.9.6 | pass (scoped via junctions; apply / vex / rollback) | fail #373 on `61cfb9b` (fixed on main, not re-probed) | untested | fail #374 | pass | untested | untested | pass (agent) |
+| Linux | 2.9.7 | pass (also `links`) | pass on `b1f9818` (#373 fixed) | untested | untested | untested | pass for `pkg:npm` in a deno.lock-only project (`vendor_lockfile_missing`, exit 1, files untouched) | fail #406 (lockfile-only vex) | pass (agent) |
 
 ### Isolated `.deno` store edge cases (agent mode, Linux)
 
 | Deno | copy-index peer variant `<name>@<ver>_1` of a direct dep | hashed mixed-case name `_<base32>@<ver>` | scoped transitive `@scope+name@ver` | isolated workspace (deno.json + package.json members) |
 | --- | --- | --- | --- | --- |
 | 1.46.3 | n/a (single copy) | untested | fail #373 | untested |
-| 2.0.6 / 2.2.15 | fail #373 (`_1` left unpatched, apply success, VEX not_affected); pass with #496 | untested | fail #373 | untested |
-| 2.9.7 | fail #373 (same); pass with #496; VEX partial-revert hits #516, still fails with #517 + #496 (`find_by_purls` skips peer variants) | fail #373 when transitive (direct passes); pass with #496 | fail #373; pass with #496 | pass |
+| 2.0.6 / 2.2.15 | apply: fail #373 on `61cfb9b`, fixed on main; VEX partial revert of `_1`: fail #603 (2.2.15) | untested | fail #373 on `61cfb9b` | untested |
+| 2.9.7 | apply / runtime / rollback: pass on `b1f9818`; VEX partial revert of `_1`: fail #603 | pass on `b1f9818` | pass on `b1f9818` | pass |
 
 ### `nodeModulesLinker: "hoisted"` (Deno ≥ 2.8, needs `nodeModulesDir: manual`), agent mode
 
@@ -46,13 +46,13 @@ Other passes (Linux): interrupted `apply` (SIGKILL mid-run; the hardlinked `DENO
 
 ## Backlog
 
-0. **Maintainer request (global mode), partly covered.** Filed #444 (still open on `61cfb9b`, no fix PR). Still to do: an unwritable global prefix (read-only `DENO_INSTALL_ROOT` / `DENO_DIR`) on macOS / Windows, `rollback -g` after #444 is fixed, and `DENO_DIR` with spaces or unicode.
+0. **Maintainer request (global mode), partly covered.** Filed #444 (still open on `b1f9818`, no fix PR). Still to do: an unwritable global prefix (read-only `DENO_INSTALL_ROOT` / `DENO_DIR`) on macOS / Windows, `rollback -g` after #444 is fixed, and `DENO_DIR` with spaces or unicode.
 1. A maintainer needs to delete the stale probe branches `bughunt/deno/20260930-deno-store`, `bughunt/deno/20261001-scoped-jsr`, `bughunt/deno/20261001-global` and `bughunt/deno/20261001-hoisted`. The git proxy and the session permission policy both refuse `push --delete`.
-2. When #496 merges, re-test #373 on main: copy-index `_1`, hashed `_<base32>` names, scoped transitive, scan discovery and `scan --prune`. Close it if everything passes.
-3. When #517 merges, re-test the `.deno/<name>@<ver>_1` partial-revert VEX case. As of `0f45d24` + #496 it still attests `not_affected` (#516 comment).
-4. Probe macOS / Windows for the `.deno` `_1` / `_<base32>` folders (case-insensitive FS) once #496 lands.
+2. #603 once a fix lands: re-test the `_1` partial-revert VEX case.
+3. Probe macOS / Windows for the `.deno` `_1` / `_<base32>` folders (case-insensitive FS): apply, vex and rollback, now that #496 is on main.
+4. `scan --mode agent` discovery and `scan --prune` on `.deno` layouts on main. This needs the local proxy stub rebuilt.
 5. #406 follow-ups: pnpm-lock / yarn.lock / bun.lock beside deno.lock.
-6. Vendored refusal on Deno 2.0.6 / 2.2.15, and `nodeModulesDir: none` on macOS / Windows. Hoisted + `vendor: true` JSR is low value (it's just #374).
+6. Vendored refusal on Deno 2.0.6, and `nodeModulesDir: none` on macOS / Windows. Hoisted + `vendor: true` JSR is low value (it's just #374).
 
 ## Known non-bugs
 
@@ -73,6 +73,8 @@ Other passes (Linux): interrupted `apply` (SIGKILL mid-run; the hardlinked `DENO
 - `vex` without `--product` in a deno.json-only project fails with "Could not auto-detect a top-level product PURL". deno.json isn't in the documented auto-detect list.
 - Deno `"links"` copies the linked package into `node_modules/.deno/<name>@<ver>`. An agent patch only touches that copy, never the linked source.
 - Agent-mode VEX checking only the first of several copies of a `name@version` is a generic npm-family defect (`commands/vex.rs:556`), handed over to npm. Don't re-file it from Deno; comment on the npm issue instead.
-- Deno names a second peer resolution `.deno/<name>@<ver>_N` (copy index) and a mixed-case package `.deno/_<base32 hash>@<ver>` (in `$DENO_DIR` too). Those are real installs, not junk; #496 decodes both.
+- Deno names a second peer resolution `.deno/<name>@<ver>_N` (copy index) and a mixed-case package `.deno/_<base32 hash>@<ver>` (in `$DENO_DIR` too). Those are real installs, not junk; #496 (on main) decodes both.
+- `rollback` removes the manifest entries it restores (`manifest.removedEntries`), so a later `apply` is a no-op. That's by design.
+- Offline VEX fixtures: give each patch its own GHSA. A shared vulnerability ID lets one verified PURL keep the statement alive and hides per-PURL failures.
 - The duplicate `applied` + `already_patched` events for one PURL in an isolated Deno workspace come from the member `node_modules/<dep>` symlink reaching the same file. Cosmetic.
 - SIGKILL / SIGTERM during `apply` leaves one `.socket-stage-*` file in the package dir that later runs never remove. This is generic to the atomic writer, harmless (never loaded), and SIGINT exits cleanly.
