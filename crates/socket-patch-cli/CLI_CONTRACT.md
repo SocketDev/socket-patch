@@ -477,7 +477,7 @@ the model is **not uniform** today:
   `workspaces`). One repo-root invocation discovers every member. A member that is itself a
   workspace root is recursed into (bounded depth).
 - **cwd-only (single project):** gem, pypi, composer. The crawler inspects only the project
-  rooted at `--cwd` (pypi looks at `$VIRTUAL_ENV`, `<cwd>/.venv` / `venv`, then a Poetry project's out-of-tree virtualenv(s) under Poetry's `virtualenvs.path`; composer at the vendor tree); it does **not**
+  rooted at `--cwd` (pypi first takes the env the project's manager records: PDM's `.pdm-python` interpreter, meaning its venv or, for a base interpreter, PEP 582 `__pypackages__/<X.Y>/lib`, and uv's `UV_PROJECT_ENVIRONMENT`. Otherwise it looks at `$VIRTUAL_ENV`, `<cwd>/.venv` / `venv`, then a Poetry project's out-of-tree virtualenv(s) under Poetry's `virtualenvs.path`; composer at the vendor tree); it does **not**
   descend into sibling subprojects. A monorepo with several independent lockfiles in subdirectories
   (`backend/Gemfile.lock` + `frontend/Gemfile.lock`, multiple `.venv`, multiple `go.mod` /
   `composer.json`) is handled by invoking the tool **once per subproject** (`--cwd` each), as a

@@ -69,11 +69,14 @@ Measured details:
 - **Hosted mode verifies the lock's file hash** on install for every supported
   release (tamper the hash and `pdm sync` fails closed). Vendored mode's
   protection is the committed wheel bytes, verified by the same hash.
-- **`__pypackages__` (PEP 582) projects are not covered.** PDM 0.x/1.x default
-  to `__pypackages__`, and 2.x does so under `python.use_venv = false`; the
-  installed-set crawler probes virtualenvs (`VIRTUAL_ENV`, `./.venv`), so agent
-  and vendored mode need a virtualenv install. Run PDM with `python.use_venv`
-  on, or use hosted mode.
+- **The installed env is the one PDM records.** The crawler follows the
+  interpreter in `.pdm-python` (`[python] path` in `.pdm.toml` on older PDM),
+  ahead of an activated venv or a stray `./.venv`. That covers an out-of-tree
+  venv (`venv.in_project = false`) and one bound with `pdm use <venv>`. When
+  the interpreter is a base Python, or a PDM 0.x/1.x project saved none, the
+  env is `__pypackages__/<X.Y>/lib` (PEP 582; PDM 2.x under
+  `python.use_venv = false`). Agent mode patches it there, and the hosted
+  stale-install warning and `vex` check it.
 - **A non-default lock filename (`pdm lock -L custom.lock`) is invisible** to the
   scan, which only reads `pdm.lock`. A package locked at two versions (a marker
   fork) is refused (`pypi_pdm_lock_forked_package` / a version-mismatch refusal),
