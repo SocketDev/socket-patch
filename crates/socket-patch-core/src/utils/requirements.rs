@@ -96,14 +96,38 @@ pub(crate) fn strip_comment(text: &str) -> &str {
 /// The `(name as spelled, version)` of an exact `name[extras]==X` registry
 /// requirement (a logical line's code part; an optional `; marker` and
 /// options may follow), `None` for anything else — ranges, `===`, wildcards
-/// (`==1.*`), a version not starting with a digit. The ONE exact-pin rule
-/// the lock inventory and lockfile discovery read requirements with.
+/// (`==1.*`), a version not starting with a digit. Spelled as pip reads it:
+/// whitespace may surround the extras and the `==` (`six == 1.0`,
+/// `six[x] ==1.0`), and the legacy parenthesised form `six (==1.0)` is the
+/// same pin. The ONE exact-pin rule the lock inventory and lockfile
+/// discovery read requirements with.
 pub(crate) fn exact_pin(code: &str) -> Option<(&str, &str)> {
-    let spec = code.split(';').next()?.split_whitespace().next()?;
-    let (name, version) = spec.split_once("==")?;
-    let name = name.split('[').next()?.trim();
-    let version = version.trim();
+    let spec = code.split(';').next()?.trim_start();
+    let name_end = spec
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+        .unwrap_or(spec.len());
+    let (name, mut rest) = spec.split_at(name_end);
+    rest = rest.trim_start();
+    if rest.starts_with('[') {
+        rest = rest[rest.find(']')? + 1..].trim_start();
+    }
+    let parenthesised = rest.starts_with('(');
+    if parenthesised {
+        rest = rest[1..].trim_start();
+    }
+    rest = rest.strip_prefix("==")?.trim_start();
+    let version_end = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, ')' | ','))
+        .unwrap_or(rest.len());
+    let (version, mut rest) = rest.split_at(version_end);
+    rest = rest.trim_start();
+    if parenthesised {
+        rest = rest.strip_prefix(')')?.trim_start();
+    }
+    // Only options (`--hash=…`) may follow the specifier; anything else
+    // (`,<2`, a stray `)`, a second token) is not one exact pin.
     if name.is_empty()
+        || !(rest.is_empty() || rest.starts_with("--"))
         || version.starts_with('=')
         || version.contains('*')
         || !version.starts_with(|c: char| c.is_ascii_digit())
@@ -157,6 +181,25 @@ pub(crate) fn hash_options(code: &str) -> Vec<String> {
     hashes
 }
 
+/// Whether a requirements file puts pip into hash-checking mode for the whole
+/// install: pip turns it on as soon as ANY requirement carries a `--hash`
+/// option (of any algorithm), or the file sets `--require-hashes`. The mode
+/// is all or nothing: once on, every requirement — and every transitive
+/// dependency — must be `==`-pinned and hashed, so a writer must match it
+/// rather than add the first `--hash` (#376) or an unhashed line (#378).
+///
+/// Every line counts, socket-patch's own included: a line this writer
+/// emitted keeps the mode it was written for, so a re-scan is a no-op. A
+/// url's `#sha256=` fragment is not a hash option: pip verifies it without
+/// turning the mode on.
+pub(crate) fn requires_hashes(content: &str) -> bool {
+    logical_lines(content).iter().any(|line| {
+        strip_comment(&line.text).split_whitespace().any(|token| {
+            token == "--hash" || token.starts_with("--hash=") || token == "--require-hashes"
+        })
+    })
+}
+
 /// `(distribution, version)` a Python artifact filename names: a PEP 427
 /// wheel (`dist-version-…-tags.whl`) or an sdist (`dist-version.tar.gz` /
 /// `.zip` / `.tar.bz2` / `.tar.xz`). Names are returned as spelled (callers
@@ -194,6 +237,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn requires_hashes_reads_pip_hash_checking_mode() {
+        for hashed in [
+            "six==1.16.0 --hash=sha256:aa\nidna==3.7\n",
+            "six==1.16.0 \\\n    --hash sha256:aa\n",
+            "six==1.16.0 --hash=sha512:aa\n",
+            "--require-hashes\nsix==1.16.0\n",
+            "\u{feff}--require-hashes\r\nsix==1.16.0\r\n",
+        ] {
+            assert!(requires_hashes(hashed), "{hashed:?}");
+        }
+        for unhashed in [
+            "",
+            "six==1.16.0\nidna==3.7\n",
+            // Comments and url fragments are not hash options.
+            "six==1.16.0  # --hash=sha256:aa\n# --require-hashes\n",
+            "six @ https://example.test/six-1.16.0-py2.py3-none-any.whl#sha256=aa\n",
+        ] {
+            assert!(!requires_hashes(unhashed), "{unhashed:?}");
+        }
+    }
+
+    #[test]
     fn lexer_joins_continuations_and_strips_comments_correctly() {
         let lines = logical_lines("six==1.16.0 \\\n    --hash=sha256:abc\nrequests\n");
         assert_eq!(lines.len(), 2);
@@ -226,6 +291,23 @@ mod tests {
             exact_pin("requests[socks]==2.31.0; python_version < \"3.12\" --hash=sha256:ab"),
             Some(("requests", "2.31.0"))
         );
+        // #523: pip's whitespace around `==` and the legacy parenthesised
+        // form are the same exact pin.
+        for code in [
+            "six == 1.16.0",
+            "six ==1.16.0",
+            "six== 1.16.0",
+            "six\t==\t1.16.0",
+            "six (==1.16.0)",
+            "six ( == 1.16.0 )",
+            "six(==1.16.0)",
+            "six [x] == 1.16.0",
+            "six[x] == 1.16.0 ; python_version >= \"3.8\"",
+            "six == 1.16.0 --hash=sha256:ab",
+            "six (==1.16.0) --hash sha256:ab",
+        ] {
+            assert_eq!(exact_pin(code), Some(("six", "1.16.0")), "{code}");
+        }
         for code in [
             "six==1.*",
             "six==1.16.*",
@@ -234,7 +316,13 @@ mod tests {
             "six>=1.0",
             "six",
             "==1.0",
-            "six == 1.0",
+            "six == 1.*",
+            "six (==1.0",
+            "six ==1.0)",
+            "six==1.0,<2",
+            "six == 1.0, <2",
+            "six==1.0 extra",
+            "six @ https://h/six-1.0-py3-none-any.whl",
         ] {
             assert_eq!(exact_pin(code), None, "{code}");
         }

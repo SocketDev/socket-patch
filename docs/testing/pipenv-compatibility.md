@@ -17,7 +17,7 @@ requirements.txt lanes of the same ecosystem.
 
 | Input | Hosted | Vendored | Agent |
 |-------|--------|----------|-------|
-| `Pipfile.lock`, `pipfile-spec: 6` (Pipenv 7 and later) | Every category (`default`, `develop`, Pipenv 2022+ named categories) that pins the patched release becomes `{"file" \| "path": "<url>#sha256=<hex>", "hashes": ["sha256:<hex>"]}` with `markers`/`extras`/`index` kept as Pipenv wrote them and `version` dropped. `path` for Pipenv 7–11, `file` from 2018. `_meta` (the Pipfile content hash) and the Pipfile are untouched. | Every matching category refers to the committed wheel under `.socket/vendor/pypi/<uuid>/`; wheels with extras use `path` (Pipenv 2022's file-URL bug). Requires Pipenv 2018 or later (`pypi_pipenv_installer_unsupported`). | Independent of the lock: patches the installed distribution in the project's venv — in-project `.venv`, `VIRTUAL_ENV`, or Pipenv's default `$WORKON_HOME/<dir>-<hash>[-<python>]` (discovered without running Pipenv). |
+| `Pipfile.lock`, `pipfile-spec: 6` (Pipenv 7 and later) | Every category (`default`, `develop`, Pipenv 2022+ named categories) that pins the patched release becomes `{"file" \| "path": "<url>#sha256=<hex>", "hashes": ["sha256:<hex>"]}` with `markers`/`extras`/`index` kept as Pipenv wrote them and `version` dropped. `path` for Pipenv 7–11, `file` from 2018. `_meta` (the Pipfile content hash) and the Pipfile are untouched. | Every matching category refers to the committed wheel under `.socket/vendor/pypi/<uuid>/`; wheels with extras use `path` (Pipenv 2022's file-URL bug). Requires Pipenv 2018 or later (`pypi_pipenv_installer_unsupported`). | Independent of the lock: patches the installed distribution in the venv Pipenv resolves for the project — `VIRTUAL_ENV` unless `PIPENV_ACTIVE` / `PIPENV_IGNORE_VIRTUALENVS` is set, in-project `.venv` subject to `PIPENV_VENV_IN_PROJECT` and the Pipfile's `[pipenv] venv_in_project`, or Pipenv's default `$WORKON_HOME/<dir>-<hash>[-<python>]`; never `venv/` (discovered without running Pipenv). With an auto-detected `.venv` and an existing WORKON_HOME venv, both are patched, since Pipenv 2026.2+ uses the WORKON_HOME venv and older releases use `.venv`. |
 | `Pipfile.lock`, `pipfile-spec` < 6 (Pipenv 0–6) | Refused (`redirect_pipenv_skipped`), lock untouched. | Refused (`pypi_pipenv_spec_unsupported`). | Works. |
 | Lock-only checkout (nothing installed) | Discovered from the lock and redirected. | Discovered from the lock; the patched wheel or source distribution is downloaded and verified from the service without a local install. | Nothing to patch (no installed distribution); the lock's pins are listed as lockfile-only packages. |
 
@@ -106,6 +106,13 @@ wrapper, so the CLI's installer probe sees them) and no Socket token (the
 fixture dependency is `urllib3 1.26.18`, which has a public free-tier
 patch). Copy the binary out of `target/` first — a rebuild would swap it
 under the run. Concurrent invocations must use disjoint version/shape sets.
+
+A case that fails with a transport error in its error text or logs (pip
+giving up on PyPI, e.g. `too many 503 error responses`, a connection error,
+or a CLI request error / patch API 5xx) is re-run from a fresh case
+directory, at most three attempts in total. The failed attempts' logs stay
+under `attempts/<case>/<n>/` and the final row lists them in
+`transportRetries`. Functional failures are never retried.
 
 Per (release, shape, mode) the harness checks: the lock-only fresh checkout,
 `--dry-run` parity (hosted; the vendored preview is ledger-only by design and

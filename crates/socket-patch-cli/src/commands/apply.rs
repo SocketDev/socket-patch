@@ -207,10 +207,11 @@ fn format_mismatch_fetch_result(downloaded: usize, needed: usize) -> String {
 /// duplicates of one `name@version`, the apply loop patches each of them,
 /// and copies drift independently — a pristine (or already-patched) root
 /// copy says nothing about a locally-modified nested duplicate, whose
-/// mismatched files still need their afterHash blobs. The variant gate,
-/// by contrast, mirrors the apply loop's representative check against the
-/// FIRST copy (release-variant ecosystems install one directory per
-/// `package@version`).
+/// mismatched files still need their afterHash blobs. The variant gate
+/// mirrors the apply loop's representative check PER COPY for gem and
+/// PyPI (which patch every copy, and two envs can hold different wheels
+/// of one release), and against the FIRST copy for Maven: a variant's
+/// files are probed only on the copies it is attempted on.
 ///
 /// Only a mismatched file whose afterHash blob is NOT staged can queue a
 /// fetch, so the probe first decides that with metadata probes alone and
@@ -263,25 +264,45 @@ async fn mismatch_blob_gaps(
                 || records
                     .first()
                     .is_some_and(|(key, _)| key.as_str() != stripped));
+        // The copies the apply loop gates per copy: gem and PyPI patch
+        // every copy, each against its own representative check; Maven
+        // gates (and patches) only the first.
+        let gate_copies: &[PathBuf] = if matches!(
+            Ecosystem::from_purl(purl),
+            Some(Ecosystem::Gem | Ecosystem::Pypi)
+        ) {
+            pkg_paths.as_slice()
+        } else {
+            std::slice::from_ref(first_path)
+        };
         for (_, record) in records {
             if !can_queue(record) {
                 continue;
             }
-            if gated {
-                if let Some((file_name, file_info)) = representative_file(&record.files) {
-                    let status = verify_file_patch(first_path, file_name, file_info)
-                        .await
-                        .status;
-                    if !variant_matches_installed(Some(&status)) {
-                        continue;
+            // Copies this variant is attempted on: a copy whose installed
+            // distribution is another variant (two envs can hold different
+            // wheels of one release) is skipped there by the apply loop.
+            let probe_copies: Vec<&PathBuf> = match representative_file(&record.files) {
+                Some((file_name, file_info)) if gated => {
+                    let mut matched = Vec::new();
+                    for copy in gate_copies {
+                        let status = verify_file_patch(copy, file_name, file_info).await.status;
+                        if variant_matches_installed(Some(&status)) {
+                            matched.push(copy);
+                        }
                     }
+                    matched
                 }
+                _ => pkg_paths.iter().collect(),
+            };
+            if probe_copies.is_empty() {
+                continue;
             }
             for (file_name, info) in &record.files {
                 if info.before_hash.is_empty() || !missing.contains(&info.after_hash) {
                     continue;
                 }
-                for pkg_path in pkg_paths {
+                for pkg_path in &probe_copies {
                     let verify = verify_file_patch(pkg_path, file_name, info).await;
                     if verify.status == VerifyStatus::HashMismatch {
                         needed.insert(info.after_hash.clone());
@@ -625,6 +646,25 @@ pub(crate) fn variant_matches_installed(first_file_status: Option<&VerifyStatus>
         None => true,
         Some(status) => *status == VerifyStatus::Ready || *status == VerifyStatus::AlreadyPatched,
     }
+}
+
+/// `paths` in order with every path that resolves to an already-listed
+/// directory dropped: two discovered site-packages paths can name ONE
+/// directory (a `lib64 -> lib` symlink, a symlinked venv), and patching it
+/// twice would report the second pass `already_patched`. A path that can't
+/// be canonicalized is kept as-is.
+async fn distinct_install_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let key = tokio::fs::canonicalize(path)
+            .await
+            .unwrap_or_else(|_| path.clone());
+        if seen.insert(key) {
+            out.push(path.clone());
+        }
+    }
+    out
 }
 
 /// The file whose verify status decides whether a release variant
@@ -1714,7 +1754,14 @@ async fn apply_patches_inner(
     // by ledger key, resolved base purl, or qualifier-stripped key so
     // release-variant manifest keys (pypi `?artifact_id=`…) hit too;
     // unreadable state degrades to "nothing vendored" (fail-open).
-    let vendored_purls = socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await;
+    // The ledger owns the PROJECT's copies only: a global apply restores
+    // and patches the global copy even when the cwd project vendors the
+    // same purl (see `project_state_in_scope`).
+    let vendored_purls = if crate::commands::project_state_in_scope(&args.common) {
+        socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await
+    } else {
+        Default::default()
+    };
     let is_vendored = |p: &str| purl_keys_cover(&vendored_purls, p);
     let (mut results, mut matched_manifest_purls, vendored_bases) =
         synthesize_vendor_owned_results(&target_manifest_purls, &vendored_purls);
@@ -1874,22 +1921,31 @@ async fn apply_patches_inner(
                 continue;
             }
 
-            // Patch EVERY coexisting gem store copy (the npm multi-copy
-            // precedent): leaving the other store pristine is a silent
-            // false "applied" for whichever bundler loads it, and the
-            // per-copy results below make the JSON summary count each
-            // patched copy — the signal a second copy exists. PyPI/Maven
-            // keep the one-representative contract: their crawlers resolve
-            // one install dir per version, and a second path can only
-            // alias the same logical install (re-patching it would produce
-            // the spurious `already_patched` double-patch the nuget
-            // first-wins restoration fixed).
-            let copy_paths: &[PathBuf] =
-                if matches!(Ecosystem::from_purl(purl), Some(Ecosystem::Gem)) {
-                    pkg_paths.as_slice()
-                } else {
-                    std::slice::from_ref(pkg_path)
-                };
+            // Patch EVERY coexisting gem store copy and every PyPI
+            // site-packages copy (the npm multi-copy precedent): leaving
+            // the other copy pristine is a silent false "applied" for
+            // whichever bundler / interpreter loads it, and the per-copy
+            // results below make the JSON summary count each patched copy
+            // — the signal a second copy exists. The Python crawler
+            // resolves one release in several candidate envs when it
+            // can't tell which one the project's tool runs (a Pipenv
+            // WORKON_HOME venv beside `./.venv`, #529) or which one
+            // `sys.path` shadows (the user site beside a system dir in
+            // global scope, #501), and rollback already restores every
+            // copy. A PyPI path that only ALIASES another (a symlinked
+            // site-packages) is collapsed by canonical path, so one
+            // install is never patched twice. Maven keeps the
+            // one-representative contract: its crawler resolves one
+            // install dir per version.
+            let pypi_copies: Vec<PathBuf>;
+            let copy_paths: &[PathBuf] = match Ecosystem::from_purl(purl) {
+                Some(Ecosystem::Gem) => pkg_paths.as_slice(),
+                Some(Ecosystem::Pypi) => {
+                    pypi_copies = distinct_install_dirs(pkg_paths).await;
+                    pypi_copies.as_slice()
+                }
+                _ => std::slice::from_ref(pkg_path),
+            };
 
             // Copy CLASS decides FAILURE semantics (never write scope —
             // patching a shared home's vulnerable copy is fine when it
@@ -2870,6 +2926,90 @@ mod tests {
             needed,
             HashSet::from(["8".repeat(64)]),
             "the drifted second copy must queue the blob even though the first copy is clean"
+        );
+    }
+
+    /// Regression (#538 review): two PyPI copies of one release holding
+    /// DIFFERENT wheels. The apply loop gates each variant per copy, so the
+    /// variant installed only in the SECOND copy is attempted there; its
+    /// locally-modified non-representative file needs the full afterHash
+    /// blob. Gating against the first copy alone skipped that variant and
+    /// left the blob unfetched, so warn-and-apply failed on the second copy.
+    #[tokio::test]
+    async fn mismatch_blob_gaps_gates_pypi_variants_per_copy() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Copy A: the wheel's distribution, pristine.
+        let copy_a = dir.path().join("a");
+        tokio::fs::create_dir_all(&copy_a).await.unwrap();
+        tokio::fs::write(copy_a.join("aaa.py"), b"wheel\n")
+            .await
+            .unwrap();
+        // Copy B: the sdist's distribution, with a locally modified
+        // non-representative file.
+        let copy_b = dir.path().join("b");
+        tokio::fs::create_dir_all(&copy_b).await.unwrap();
+        tokio::fs::write(copy_b.join("aaa.py"), b"sdist\n")
+            .await
+            .unwrap();
+        tokio::fs::write(copy_b.join("zzz.py"), b"locally modified\n")
+            .await
+            .unwrap();
+        let blobs = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+
+        let mut wheel_files = HashMap::new();
+        wheel_files.insert(
+            "aaa.py".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"wheel\n"),
+                after_hash: "1".repeat(64),
+            },
+        );
+        let mut manifest = manifest_with_record(
+            "pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0-py3-none-any.whl",
+            wheel_files,
+        );
+        let mut sdist_files = HashMap::new();
+        sdist_files.insert(
+            "aaa.py".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"sdist\n"),
+                after_hash: "2".repeat(64),
+            },
+        );
+        sdist_files.insert(
+            "zzz.py".to_string(),
+            PatchFileInfo {
+                before_hash: "3".repeat(64),
+                after_hash: "4".repeat(64),
+            },
+        );
+        manifest.patches.insert(
+            "pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0.tar.gz".to_string(),
+            PatchRecord {
+                uuid: "22222222-2222-4222-8222-222222222222".to_string(),
+                exported_at: "2024-01-01T00:00:00Z".to_string(),
+                files: sdist_files,
+                vulnerabilities: HashMap::new(),
+                description: "fixture".to_string(),
+                license: "MIT".to_string(),
+                tier: "free".to_string(),
+            },
+        );
+        let mut all_packages = HashMap::new();
+        all_packages.insert(
+            "pkg:pypi/foo@1.0.0".to_string(),
+            vec![copy_a.clone(), copy_b.clone()],
+        );
+
+        let needed =
+            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
+        assert_eq!(
+            needed,
+            HashSet::from(["4".repeat(64)]),
+            "the second copy's variant must queue its mismatched file's blob"
         );
     }
 

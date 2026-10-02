@@ -345,13 +345,24 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // must not see `.socket/` created and pruned again). The vendor ledger
     // is loaded under the lock below; the hosted pins come from read-only
     // lockfile discovery (the restore re-reads every file under the lock).
+    //
+    // Under global scope the project's hosted pins and vendor ledger are
+    // not this run's to unwind (see `project_state_in_scope`): a global
+    // remove restores the global copies and drops their manifest records
+    // only.
+    let project_state = crate::commands::project_state_in_scope(&args.common);
     let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
-    let hosted_inventory = crate::commands::hosted_inventory(&args.common, cwd).await;
+    let hosted_inventory = if project_state {
+        crate::commands::hosted_inventory(&args.common, cwd).await
+    } else {
+        Default::default()
+    };
     let hosted_pins: Vec<HostedPin> = hosted_inventory.pins.clone();
     if manifest_missing {
-        let vendor_ledger_exists = tokio::fs::metadata(cwd.join(VENDOR_STATE_REL))
-            .await
-            .is_ok();
+        let vendor_ledger_exists = project_state
+            && tokio::fs::metadata(cwd.join(VENDOR_STATE_REL))
+                .await
+                .is_ok();
         if !vendor_ledger_exists && hosted_pins.is_empty() {
             // Contested hosted wiring is still hosted state: name it
             // instead of reporting a bare project.
@@ -440,7 +451,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // the vendored leg. An unreadable ledger degrades to "nothing vendored"
     // for the rollback and fails closed at the vendored leg — exactly where
     // the run is about to mutate vendored state.
-    let vendor_state_result = load_state(cwd).await;
+    let vendor_state_result = if project_state {
+        load_state(cwd).await
+    } else {
+        Ok(VendorState::default())
+    };
 
     if matching.is_empty() {
         // Ledger-only entries (vendored mode keeps no manifest record) —

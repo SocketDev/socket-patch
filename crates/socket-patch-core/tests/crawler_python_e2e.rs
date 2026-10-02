@@ -518,6 +518,530 @@ async fn get_global_python_site_packages_discovers_uv_python_install() {
     );
 }
 
+// ── pipx venv discovery ───────────────────────────────────────
+
+/// Run `get_global_python_site_packages` with HOME, PIPX_HOME and
+/// XDG_DATA_HOME rebound (`None` unsets), restoring all three after.
+/// pipx resolves its home from these, so every pipx test has to pin
+/// them or an ambient value on the host would decide the result.
+async fn global_site_packages_with_env(
+    home: &Path,
+    pipx_home: Option<&Path>,
+    xdg_data_home: Option<&Path>,
+) -> Vec<std::path::PathBuf> {
+    let saved: Vec<(&str, Option<String>)> = ["HOME", "PIPX_HOME", "XDG_DATA_HOME"]
+        .into_iter()
+        .map(|k| (k, std::env::var(k).ok()))
+        .collect();
+    std::env::set_var("HOME", home);
+    for (key, value) in [("PIPX_HOME", pipx_home), ("XDG_DATA_HOME", xdg_data_home)] {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+    let result = get_global_python_site_packages().await;
+    for (key, value) in saved {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+    result
+}
+
+/// The site-packages of a pipx app venv under `pipx_home`, in the
+/// platform's venv layout (`lib/python3.X/site-packages` on Unix,
+/// `Lib\site-packages` on Windows).
+fn pipx_venv_site_packages(pipx_home: &Path, app: &str) -> std::path::PathBuf {
+    let venv = pipx_home.join("venvs").join(app);
+    if cfg!(windows) {
+        venv.join("Lib").join("site-packages")
+    } else {
+        venv.join("lib").join("python3.11").join("site-packages")
+    }
+}
+
+/// `pipx install hatch` on Linux (pipx >= 1.3) puts the app venv at
+/// `~/.local/share/pipx/venvs/hatch` (#415). Every app venv must surface,
+/// not just the first.
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pipx_venvs_linux() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pipx_home = tmp.path().join(".local").join("share").join("pipx");
+    let staged: Vec<_> = ["hatch", "black"]
+        .iter()
+        .map(|app| pipx_venv_site_packages(&pipx_home, app))
+        .collect();
+    for sp in &staged {
+        tokio::fs::create_dir_all(sp).await.unwrap();
+    }
+
+    let result = global_site_packages_with_env(tmp.path(), None, None).await;
+    for sp in &staged {
+        assert!(
+            result.iter().any(|p| p == sp),
+            "pipx venv {} must surface; got {result:?}",
+            sp.display()
+        );
+    }
+}
+
+/// pipx's Linux default follows `$XDG_DATA_HOME` (platformdirs'
+/// `user_data_dir`), so a relocated data home moves the venvs too.
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pipx_venvs_under_xdg_data_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path().join("xdg-data");
+    let sp = pipx_venv_site_packages(&xdg.join("pipx"), "hatch");
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_env(tmp.path(), None, Some(&xdg)).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "pipx venv under XDG_DATA_HOME must surface; got {result:?}"
+    );
+}
+
+/// Native (C-extension) packages land in `lib64` on RHEL/Fedora/SUSE
+/// venvs, the same split the other well-known scans already handle.
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pipx_venv_lib64() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pipx_home = tmp.path().join("pipx-home");
+    let sp = pipx_home
+        .join("venvs")
+        .join("hatch")
+        .join("lib64")
+        .join("python3.11")
+        .join("site-packages");
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_env(tmp.path(), Some(&pipx_home), None).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "pipx venv lib64 site-packages must surface; got {result:?}"
+    );
+}
+
+/// pipx's legacy home `~/.local/pipx` is still used when it exists
+/// (pipx < 1.3 installs, and pipx's fallback on every OS), and is
+/// what macOS runners use in the #415 probe.
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pipx_venvs_legacy_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sp = pipx_venv_site_packages(&tmp.path().join(".local").join("pipx"), "hatch");
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_env(tmp.path(), None, None).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "legacy ~/.local/pipx venv must surface; got {result:?}"
+    );
+}
+
+/// platformdirs' macOS data dir is `~/Library/Application Support`,
+/// which pipx 1.3–1.4 used as its default home.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pipx_venvs_macos_app_support() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pipx_home = tmp
+        .path()
+        .join("Library")
+        .join("Application Support")
+        .join("pipx");
+    let sp = pipx_venv_site_packages(&pipx_home, "hatch");
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_env(tmp.path(), None, None).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "macOS Application Support pipx venv must surface; got {result:?}"
+    );
+}
+
+/// pipx's Windows default home is `%USERPROFILE%\pipx`, with venvs in
+/// the Windows layout `venvs\<app>\Lib\site-packages`.
+#[cfg(windows)]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pipx_venvs_windows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sp = pipx_venv_site_packages(&tmp.path().join("pipx"), "hatch");
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_env(tmp.path(), None, None).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "%USERPROFILE%\\pipx venv must surface; got {result:?}"
+    );
+}
+
+/// An explicit `PIPX_HOME` relocates every pipx venv, on every OS.
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pipx_venvs_under_pipx_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pipx_home = tmp.path().join("custom pipx");
+    let sp = pipx_venv_site_packages(&pipx_home, "hatch");
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_env(tmp.path(), Some(&pipx_home), None).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "pipx venv under PIPX_HOME must surface; got {result:?}"
+    );
+}
+
+// ── uv and PDM global dirs (#449, #451) ───────────────────────
+
+/// Env vars that relocate a Python tool's global dirs. Each
+/// `global_site_packages_with_vars` call unsets the ones it isn't given,
+/// so an ambient value on the host can't decide the result.
+const TOOL_DIR_VARS: &[&str] = &[
+    "PIPX_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CONFIG_HOME",
+    "UV_TOOL_DIR",
+    "UV_PYTHON_INSTALL_DIR",
+    "PDM_CONFIG_FILE",
+];
+
+/// Run `get_global_python_site_packages` with HOME and `vars` bound and
+/// every other [`TOOL_DIR_VARS`] entry unset, restoring all of them after.
+async fn global_site_packages_with_vars(
+    home: &Path,
+    vars: &[(&str, &Path)],
+) -> Vec<std::path::PathBuf> {
+    let mut keys: Vec<&str> = vec!["HOME"];
+    keys.extend(TOOL_DIR_VARS);
+    keys.extend(
+        vars.iter()
+            .map(|(k, _)| *k)
+            .filter(|k| !TOOL_DIR_VARS.contains(k)),
+    );
+    let saved: Vec<(&str, Option<String>)> =
+        keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+    std::env::set_var("HOME", home);
+    for key in TOOL_DIR_VARS {
+        std::env::remove_var(key);
+    }
+    for (key, value) in vars {
+        std::env::set_var(key, value);
+    }
+    let result = get_global_python_site_packages().await;
+    for (key, value) in saved {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+    result
+}
+
+/// The site-packages of the environment at `prefix` in the platform's
+/// layout (`lib/python3.12/site-packages` on Unix, `Lib\site-packages`
+/// on Windows), created on disk.
+async fn stage_env(prefix: &Path) -> std::path::PathBuf {
+    let sp = if cfg!(windows) {
+        prefix.join("Lib").join("site-packages")
+    } else {
+        prefix.join("lib").join("python3.12").join("site-packages")
+    };
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+    sp
+}
+
+fn assert_surfaces(result: &[std::path::PathBuf], sp: &Path, what: &str) {
+    assert!(
+        result.iter().any(|p| p == sp),
+        "{what} ({}) must surface; got {result:?}",
+        sp.display()
+    );
+}
+
+/// `UV_TOOL_DIR` relocates every `uv tool install` env, on every OS
+/// (#449).
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_uv_tools_under_uv_tool_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tools = tmp.path().join("custom-tools");
+    let sp = stage_env(&tools.join("pycowsay")).await;
+
+    let result = global_site_packages_with_vars(tmp.path(), &[("UV_TOOL_DIR", &tools)]).await;
+    assert_surfaces(&result, &sp, "uv tool env under UV_TOOL_DIR");
+}
+
+/// uv's data dir follows an absolute `$XDG_DATA_HOME` on Linux and macOS
+/// (`uv tool dir` → `$XDG_DATA_HOME/uv/tools`) (#449).
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_uv_tools_under_xdg_data_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path().join("xdg");
+    let sp = stage_env(&xdg.join("uv").join("tools").join("pycowsay")).await;
+
+    let result = global_site_packages_with_vars(tmp.path(), &[("XDG_DATA_HOME", &xdg)]).await;
+    assert_surfaces(&result, &sp, "uv tool env under XDG_DATA_HOME");
+}
+
+/// On Windows uv keeps tool envs under `%APPDATA%\uv\tools` (the roaming
+/// profile), not `%LOCALAPPDATA%` (#449).
+#[cfg(windows)]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_uv_tools_under_appdata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let appdata = tmp.path().join("Roaming");
+    let sp = stage_env(&appdata.join("uv").join("tools").join("pycowsay")).await;
+
+    let result = global_site_packages_with_vars(tmp.path(), &[("APPDATA", &appdata)]).await;
+    assert_surfaces(&result, &sp, "uv tool env under %APPDATA%");
+}
+
+/// `UV_PYTHON_INSTALL_DIR` relocates every `uv python install`
+/// interpreter, on every OS (#449).
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_uv_python_under_install_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pyinst = tmp.path().join("pyinst");
+    let sp = stage_env(&pyinst.join("cpython-3.12.11-linux-x86_64-gnu")).await;
+
+    let result =
+        global_site_packages_with_vars(tmp.path(), &[("UV_PYTHON_INSTALL_DIR", &pyinst)]).await;
+    assert_surfaces(&result, &sp, "uv python under UV_PYTHON_INSTALL_DIR");
+}
+
+/// uv-managed interpreters follow `$XDG_DATA_HOME` like tool envs (#449).
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_uv_python_under_xdg_data_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path().join("xdg");
+    let sp = stage_env(&xdg.join("uv").join("python").join("cpython-3.12.11")).await;
+
+    let result = global_site_packages_with_vars(tmp.path(), &[("XDG_DATA_HOME", &xdg)]).await;
+    assert_surfaces(&result, &sp, "uv python under XDG_DATA_HOME");
+}
+
+/// On Windows uv-managed interpreters live under `%APPDATA%\uv\python`
+/// (#449).
+#[cfg(windows)]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_uv_python_under_appdata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let appdata = tmp.path().join("Roaming");
+    let sp = stage_env(&appdata.join("uv").join("python").join("cpython-3.12.11")).await;
+
+    let result = global_site_packages_with_vars(tmp.path(), &[("APPDATA", &appdata)]).await;
+    assert_surfaces(&result, &sp, "uv python under %APPDATA%");
+}
+
+/// PDM's per-user config dir (platformdirs `user_config_dir("pdm")`)
+/// under `home`, with the env var Windows needs to find it.
+fn pdm_config_dir(home: &Path) -> (std::path::PathBuf, Vec<(&'static str, std::path::PathBuf)>) {
+    if cfg!(windows) {
+        let local = home.join("Local");
+        (local.join("pdm").join("pdm"), vec![("LOCALAPPDATA", local)])
+    } else if cfg!(target_os = "macos") {
+        (
+            home.join("Library").join("Application Support").join("pdm"),
+            vec![],
+        )
+    } else {
+        (home.join(".config").join("pdm"), vec![])
+    }
+}
+
+/// PDM's per-user data dir (platformdirs `user_data_dir("pdm")`).
+fn pdm_data_dir(home: &Path) -> (std::path::PathBuf, Vec<(&'static str, std::path::PathBuf)>) {
+    if cfg!(windows) || cfg!(target_os = "macos") {
+        pdm_config_dir(home)
+    } else {
+        (home.join(".local").join("share").join("pdm"), vec![])
+    }
+}
+
+async fn global_site_packages_with_owned_vars(
+    home: &Path,
+    vars: &[(&'static str, std::path::PathBuf)],
+) -> Vec<std::path::PathBuf> {
+    let borrowed: Vec<(&str, &Path)> = vars.iter().map(|(k, v)| (*k, v.as_path())).collect();
+    global_site_packages_with_vars(home, &borrowed).await
+}
+
+/// `pdm use -g <python>` creates the global project's `.venv` and every
+/// later `pdm add -g` installs there (#451).
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pdm_global_project_venv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, vars) = pdm_config_dir(tmp.path());
+    let sp = stage_env(&config.join("global-project").join(".venv")).await;
+
+    let result = global_site_packages_with_owned_vars(tmp.path(), &vars).await;
+    assert_surfaces(&result, &sp, "PDM global project .venv");
+}
+
+/// platformdirs moves PDM's config dir, and with it the global project,
+/// under an absolute `$XDG_CONFIG_HOME` (#451).
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pdm_global_project_under_xdg_config_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path().join("xdg-config");
+    let sp = stage_env(&xdg.join("pdm").join("global-project").join(".venv")).await;
+
+    let result = global_site_packages_with_vars(tmp.path(), &[("XDG_CONFIG_HOME", &xdg)]).await;
+    assert_surfaces(&result, &sp, "PDM global project under XDG_CONFIG_HOME");
+}
+
+/// `pdm python install 3.12` puts CPython under
+/// `<user data dir>/pdm/python/cpython@3.12.N`, which PDM 2.12's
+/// `pdm add -g` installs straight into (#451).
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pdm_managed_interpreters() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (data, vars) = pdm_data_dir(tmp.path());
+    let sp = stage_env(&data.join("python").join("cpython@3.12.14")).await;
+
+    let result = global_site_packages_with_owned_vars(tmp.path(), &vars).await;
+    assert_surfaces(&result, &sp, "PDM-managed interpreter");
+}
+
+/// `global_project.path` and `python.install_root` in PDM's global
+/// config (`$PDM_CONFIG_FILE` here) relocate both, with `~` expanded the
+/// way PDM's `expanduser` does: from USERPROFILE on Windows, where a Git
+/// Bash HOME is ignored, and from HOME elsewhere (#451).
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_follows_pdm_config_overrides() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = if cfg!(windows) {
+        tmp.path().join("msys-home")
+    } else {
+        tmp.path().to_path_buf()
+    };
+    let config_file = tmp.path().join("pdm-config.toml");
+    tokio::fs::write(
+        &config_file,
+        "[global_project]\npath = \"~/gp\"\n\n[python]\ninstall_root = \"~/pyroot\"\n",
+    )
+    .await
+    .unwrap();
+    let project_sp = stage_env(&tmp.path().join("gp").join(".venv")).await;
+    let python_sp = stage_env(&tmp.path().join("pyroot").join("cpython@3.12.14")).await;
+
+    let mut vars: Vec<(&str, &Path)> = vec![("PDM_CONFIG_FILE", &config_file)];
+    if cfg!(windows) {
+        vars.push(("USERPROFILE", tmp.path()));
+    }
+    let result = global_site_packages_with_vars(&home, &vars).await;
+    assert_surfaces(
+        &result,
+        &project_sp,
+        "PDM global project at global_project.path",
+    );
+    assert_surfaces(
+        &result,
+        &python_sp,
+        "PDM interpreter under python.install_root",
+    );
+}
+
+/// The settings are also read from PDM's default global config file,
+/// `<user config dir>/pdm/config.toml` (#451).
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_reads_pdm_default_config_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, vars) = pdm_config_dir(tmp.path());
+    tokio::fs::create_dir_all(&config).await.unwrap();
+    let gp = tmp.path().join("elsewhere").join("global");
+    tokio::fs::write(
+        config.join("config.toml"),
+        format!("[global_project]\npath = '{}'\n", gp.display()),
+    )
+    .await
+    .unwrap();
+    let sp = stage_env(&gp.join(".venv")).await;
+
+    let result = global_site_packages_with_owned_vars(tmp.path(), &vars).await;
+    assert_surfaces(&result, &sp, "PDM global project from config.toml");
+}
+
+/// `pdm use -g <interpreter>` records the interpreter in the global
+/// project's `.pdm-python`; with no venv, `pdm add -g` installs into
+/// that interpreter's own site-packages (#451).
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_follows_pdm_global_project_interpreter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, vars) = pdm_config_dir(tmp.path());
+    let project = config.join("global-project");
+    tokio::fs::create_dir_all(&project).await.unwrap();
+    let prefix = tmp.path().join("some-python");
+    let sp = stage_env(&prefix).await;
+    let interpreter = if cfg!(windows) {
+        prefix.join("python.exe")
+    } else {
+        prefix.join("bin").join("python3")
+    };
+    tokio::fs::write(
+        project.join(".pdm-python"),
+        format!("{}\n", interpreter.display()),
+    )
+    .await
+    .unwrap();
+
+    let result = global_site_packages_with_owned_vars(tmp.path(), &vars).await;
+    assert_surfaces(&result, &sp, "interpreter named by the global .pdm-python");
+}
+
+/// With `venv.in_project = false` the global project's venv is created
+/// under `venv.location` as `global-project-<hash>-<python>`. Other
+/// projects' venvs in the same dir are not global installs (#451).
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_pdm_global_project_out_of_tree_venv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, vars) = pdm_config_dir(tmp.path());
+    tokio::fs::create_dir_all(&config).await.unwrap();
+    let venvs = tmp.path().join("pdm-venvs");
+    tokio::fs::write(
+        config.join("config.toml"),
+        format!("[venv]\nlocation = '{}'\n", venvs.display()),
+    )
+    .await
+    .unwrap();
+    let sp = stage_env(&venvs.join("global-project-Vt4hK2Zp-3.12")).await;
+    let other = stage_env(&venvs.join("webapp-Q9xLm3Rd-3.12")).await;
+
+    let result = global_site_packages_with_owned_vars(tmp.path(), &vars).await;
+    assert_surfaces(&result, &sp, "PDM global project venv under venv.location");
+    assert!(
+        !result.iter().any(|p| p == &other),
+        "another project's PDM venv is not a global install; got {result:?}"
+    );
+}
+
 // ── project-marker fallback in get_site_packages_paths ────────
 
 /// A project with `pyproject.toml` but no `.venv` must fall through

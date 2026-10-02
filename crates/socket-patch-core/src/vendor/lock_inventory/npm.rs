@@ -164,7 +164,7 @@ pub(super) async fn inventory_package_lock_in(
             break;
         }
     }
-    let doc: Value = serde_json::from_slice(&bytes?).ok()?;
+    let doc: Value = crate::vendor::common::parse_json_manifest(&bytes?).ok()?;
     // v1 legacy locks have no `packages` map — no inventory (documented).
     doc.get("packages")?.as_object()?;
 

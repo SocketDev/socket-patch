@@ -34,6 +34,50 @@ pub(crate) const HOSTED_MODE_LABEL: &str = "hosted";
 /// `record`, so the ledger is the only place those records live.
 pub(crate) const VENDORED_MODE_LABEL: &str = "vendored";
 
+/// Whether the run's target includes the `--cwd` project's own
+/// lockfile-backed state: its hosted pins and its vendor ledger. Global
+/// scope (`--global` / `--global-prefix`) targets globally installed
+/// packages, which have no project lockfile (CLI_CONTRACT.md, Mode
+/// resolution). The project a global run happens to start in is not its
+/// target, so that project's hosted and vendored state is never rewired,
+/// unwound, or consulted for ownership of a global copy.
+pub(crate) fn project_state_in_scope(common: &crate::args::GlobalArgs) -> bool {
+    !common.is_global()
+}
+
+/// The usage error for a mode that rewires the project (`hosted`,
+/// `vendored`) under global scope, or `None` when `mode` is allowed.
+/// Shared by `scan` and `get` so both refuse the same combinations with
+/// the same wording.
+pub(crate) fn global_mode_conflict(
+    common: &crate::args::GlobalArgs,
+    mode: scan::ScanMode,
+) -> Option<String> {
+    if project_state_in_scope(common) {
+        return None;
+    }
+    let why = match mode {
+        scan::ScanMode::Agent => return None,
+        scan::ScanMode::Hosted => "redirect",
+        scan::ScanMode::Vendored => "wire vendored artifacts into",
+    };
+    Some(format!(
+        "{} cannot be used with --mode {}: global installs have no project lockfile to {why}",
+        global_scope_flag(common),
+        mode.cli_name(),
+    ))
+}
+
+/// The flag that put a run in global scope, as usage errors name it
+/// (`SOCKET_GLOBAL` / `SOCKET_GLOBAL_PREFIX` set the same fields).
+pub(crate) fn global_scope_flag(common: &crate::args::GlobalArgs) -> &'static str {
+    if common.global {
+        "--global"
+    } else {
+        "--global-prefix"
+    }
+}
+
 /// Lockfile discovery of `root` (core `vex::discover`): the hosted and
 /// vendored patch references its lockfiles and configs wire, with hosted
 /// references counted on Socket's public patch server plus the operator's

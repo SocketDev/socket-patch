@@ -495,6 +495,115 @@ fn npm_vendor_fresh_checkout_npm_ci_and_revert() {
     );
 }
 
+/// #324 with the real npm: a CRLF lock with a UTF-8 BOM (npm installs from
+/// both) is vendored in its own layout, a fresh `npm ci` installs the
+/// patched bytes from it, and `vendor --revert` restores its exact bytes.
+#[test]
+fn npm_vendor_keeps_a_crlf_bom_lock_and_reverts_it_byte_for_byte() {
+    let Some(major) = npm_major_or_skip("e2e_vendor_npm_build") else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"vendor-crlf-bom","version":"0.0.0","private":true}"#,
+    )
+    .unwrap();
+    let cache = tmp.path().join("npm-cache");
+    if !npm_e2e_common::install_fixture(
+        "e2e_vendor_npm_build",
+        &proj,
+        &cache,
+        &format!("{DEP}@{DEP_VERSION}"),
+    ) {
+        return;
+    }
+    let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js")).unwrap();
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    stage_patch_with_vuln(&proj, &purl, "package/index.js", &orig, &patched, TAIL_GHSA);
+    if v1_lock_is_refused(&proj, major) {
+        return;
+    }
+
+    let lock_path = proj.join("package-lock.json");
+    let lf = std::fs::read_to_string(&lock_path).unwrap();
+    let pristine = format!("\u{feff}{}", lf.replace('\n', "\r\n"));
+    std::fs::write(&lock_path, &pristine).unwrap();
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
+    let wired = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(wired.starts_with('\u{feff}'), "the BOM is kept");
+    assert!(
+        !wired.replace("\r\n", "").contains('\n'),
+        "every line stays CRLF:\n{wired:?}"
+    );
+
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
+    std::fs::copy(&lock_path, fresh.join("package-lock.json")).unwrap();
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    let fresh_cache = tmp.path().join("fresh-npm-cache");
+    let ci = npm(
+        &fresh,
+        &[
+            "ci",
+            "--cache",
+            fresh_cache.to_str().unwrap(),
+            "--no-audit",
+            "--no-fund",
+        ],
+    );
+    assert!(
+        ci.status.success(),
+        "`npm ci` must install from the CRLF/BOM lock.\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+        patched,
+        "npm ci installs the PATCHED bytes"
+    );
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        pristine,
+        "revert restores the CRLF/BOM lock byte for byte"
+    );
+}
+
 /// Real-toolchain VEX capstone for npm: after a REAL install + `vendor`, the
 /// vendored `.tgz` is the on-disk evidence. `socket-patch vex` must attest the
 /// patch against that vendored tarball with the `(vendored)` marker — proving
@@ -1162,5 +1271,126 @@ fn npm6_installs_a_vendored_v2_lock_from_its_legacy_mirror() {
         TAIL_GHSA,
         vec![("package-lock.json", lock_before)],
         &[VexVia::Apply, VexVia::Vendor],
+    );
+}
+
+/// The one real package dir npm's linked store holds for `name@version`
+/// (`node_modules/.store/<name>@<version>-<hash>/node_modules/<name>`).
+fn linked_store_copy(proj: &Path, name: &str, version: &str) -> Option<PathBuf> {
+    let prefix = format!("{name}@{version}-");
+    std::fs::read_dir(proj.join("node_modules/.store"))
+        .ok()?
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|e| e.path().join("node_modules").join(name))
+}
+
+/// What Node loads for `dep` when `from` requires it.
+fn node_loads(proj: &Path, from: &str, dep: &str) -> String {
+    let script = format!(
+        "const p=require('path');process.stdout.write(require('fs').readFileSync(\
+         require.resolve('{dep}',{{paths:[p.dirname(require.resolve('{from}'))]}}),'utf8'))"
+    );
+    let out = Command::new("node")
+        .args(["-e", &script])
+        .current_dir(proj)
+        .output()
+        .expect("node runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        npm_e2e_common::output_text(&out)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// #359: with `install-strategy=linked` (npm 9.4+), a transitive package
+/// is a real dir ONLY in `node_modules/.store`. `apply` must patch the
+/// copy Node loads, `rollback` must restore it, and `vendor` must build
+/// its tarball from it; before the fix all three reported
+/// `package_not_installed`.
+#[test]
+fn npm_linked_strategy_transitive_package_is_patched_rolled_back_and_vendored() {
+    let suite = "e2e_vendor_npm_build (linked)";
+    let Some(major) = npm_major_or_skip(suite) else {
+        return;
+    };
+    // `install-strategy=linked` arrived in npm 9.4.0 (measured: 9.0-9.3
+    // ignore it and install the hoisted tree).
+    let minor: u32 = npm_e2e_common::npm_version()
+        .and_then(|v| v.split('.').nth(1)?.parse().ok())
+        .unwrap_or(0);
+    if major < 9 || (major == 9 && minor < 4) {
+        println!("SKIP {suite}: npm {major}.{minor} has no install-strategy=linked");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"linked-capstone","version":"0.0.0","private":true}"#,
+    )
+    .unwrap();
+    std::fs::write(proj.join(".npmrc"), "install-strategy=linked\n").unwrap();
+    let cache = tmp.path().join("npm-cache");
+    // is-odd@3.0.1 depends on is-number@6.0.0: transitive, so store-only.
+    if !npm_e2e_common::install_fixture(suite, &proj, &cache, "is-odd@3.0.1") {
+        return;
+    }
+    let copy = linked_store_copy(&proj, "is-number", "6.0.0")
+        .expect("npm's linked strategy put is-number in node_modules/.store");
+    assert!(!proj.join("node_modules/is-number").exists());
+    let index = copy.join("index.js");
+    let orig = std::fs::read(&index).unwrap();
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    stage_patch_with_vuln(
+        &proj,
+        "pkg:npm/is-number@6.0.0",
+        "package/index.js",
+        &orig,
+        &patched,
+        "GHSA-link-npm-real",
+    );
+    // Rollback restores from the before-blob.
+    std::fs::write(proj.join(".socket/blobs").join(git_sha256(&orig)), &orig).unwrap();
+    let cwd = proj.to_str().unwrap();
+
+    let (code, stdout, stderr) = run_socket(&proj, &["apply", "--json", "--offline", "--cwd", cwd]);
+    assert_eq!(code, 0, "apply failed.\n{stdout}\n{stderr}");
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "success", "{env}");
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    assert_eq!(std::fs::read(&index).unwrap(), patched);
+    assert!(node_loads(&proj, "is-odd", "is-number").starts_with(MARKER));
+
+    let (code, stdout, stderr) = run_socket(&proj, &["rollback", "--json", "--cwd", cwd]);
+    assert_eq!(code, 0, "rollback failed.\n{stdout}\n{stderr}");
+    assert_eq!(std::fs::read(&index).unwrap(), orig);
+
+    // Rollback drops the record from the manifest; stage it again.
+    stage_patch_with_vuln(
+        &proj,
+        "pkg:npm/is-number@6.0.0",
+        "package/index.js",
+        &orig,
+        &patched,
+        "GHSA-link-npm-real",
+    );
+    let lock_before = std::fs::read(proj.join("package-lock.json")).unwrap();
+    let (code, stdout, stderr) =
+        run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+    assert_eq!(code, 0, "vendor failed.\n{stdout}\n{stderr}");
+    assert_eq!(parse_envelope(&stdout)["status"], "success", "{stdout}");
+    assert_ne!(
+        std::fs::read(proj.join("package-lock.json")).unwrap(),
+        lock_before,
+        "vendor must rewire the lock: {stdout}"
+    );
+    let (code, stdout, stderr) = run_socket(&proj, &["vendor", "--revert", "--json", "--cwd", cwd]);
+    assert_eq!(code, 0, "vendor --revert failed.\n{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read(proj.join("package-lock.json")).unwrap(),
+        lock_before
     );
 }
