@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Composer bug-hunt routine (label pm:composer).
 
-Last updated: 2026-10-02 (run 7), main `61cfb9b` (after #358 Composer rewriter + hosted-by-default scan/get, #446 `-g` scoping), latest release v4.0.0.
+Last updated: 2026-10-02 (run 8), main `61cfb9b` (after #358 Composer rewriter + hosted-by-default scan/get, #446 `-g` scoping), latest release v4.0.0.
 
 ## Coverage matrix
 
@@ -68,14 +68,23 @@ Local agent scan with a user-level `$COMPOSER_HOME/config.json` vendor-dir: fail
 
 OS-independent (pure path logic). macOS/Windows: untested.
 
+### Re-resolution, install flags, exec bits and plugins (run 8, main `61cfb9b`, Linux PHP 8.3)
+
+| Composer | hosted → `require <other>` keeps rewrite | hosted → `--prefer-source` / `reinstall` / `preferred-install: source` | exec bits (bin + non-bin) hosted / vendored | `composer-plugin` activates patched (hosted / vendored) | `get <uuid> --mode hosted` over vendored |
+| --- | --- | --- | --- | --- | --- |
+| 1.10.28 | no (inline repo; Composer 1 behaviour, docs gap) | untested | pass / pass | pass / pass | untested (expected #536) |
+| 2.2.30 | pass (packagist + inline) | pass | pass / pass | pass / pass | untested (expected #536) |
+| 2.10.3 | pass (packagist + inline) | pass | pass / pass | pass / pass | **fail #536** |
+
 ## Backlog
 
-1. Re-run #536 once Composer joins the vendored → hosted `takeover_capable` set (PR #503 adds only pypi). Also `get <uuid> --mode hosted` over a vendored entry.
+1. Re-run #536 once Composer joins the vendored → hosted `takeover_capable` set (PR #503 adds only pypi). Cover both `scan` and `get <uuid> --mode hosted`.
 2. **Maintainer request (in progress):** global `-g` mode. Remaining: a non-writable global dir must fail loudly (non-root probe), `SOCKET_GLOBAL=1` and space/unicode `--global-prefix` cells, and a re-run after #438/#439 are fixed (PR #442 targets #438), including #446's `-g` scoping inside a hosted Composer project.
-3. macOS/Windows probe of vendored path-repo + source-install revert (a Windows junction path repo with existing `transport-options`).
+3. macOS/Windows probe of vendored path-repo + source-install revert (a Windows junction path repo with existing `transport-options`), plus Windows long-path depth of `.socket/vendor/composer/<uuid>/<v>/<n>@<ver>`.
 4. Re-run the Composer 1 installers cells when a fix for #463 lands, and add 2.10.3 installers cells. Re-run the path-repo hosted cell when #399 is fixed, and #515 when it's fixed.
-5. `COMPOSER=<other>.json`: the crawler and hosted mode ignore it (scan finds 0 packages). Only the vex gap is documented. Ask maintainers whether to document it or file it.
-6. Delete the leftover probe branches `bughunt/composer/20260930-srconly-probe`, `bughunt/composer/20261001-global-probe` and `bughunt/composer/20261001-c1-topts` (the sandbox git proxy refuses deletes). Needs a maintainer.
+5. Ask maintainers whether to document `COMPOSER=<other>.json` (the crawler and hosted mode ignore it; scan finds 0 packages) and Composer 1's `composer require <other>` re-resolving custom-repo entries (it drops a hosted rewrite).
+6. PHP 7.2 / 7.4 cells for Composer 2.2 LTS (probe with setup-php).
+7. Delete the leftover probe branches `bughunt/composer/20260930-srconly-probe`, `bughunt/composer/20261001-global-probe` and `bughunt/composer/20261001-c1-topts` (the sandbox git proxy refuses deletes). Needs a maintainer.
 
 ## Known non-bugs
 
@@ -105,3 +114,7 @@ OS-independent (pure path logic). macOS/Windows: untested.
 - Mock hygiene: agent-mode `repair` fetches `/patches/diff/<uuid>`. Without that route it reports `download_failed`.
 - A hosted rewrite of a dist-only entry (no `source`) doesn't reinstall over an existing `vendor/` on Composer 2 (Composer compares only version and dist/source references). The CLI's next steps say to remove `vendor/<v>/<n>` first, and `vex` omits it as `not_applied`.
 - Mock hygiene: on Composer 2, a loopback `http://` mock needs `secure-http: false`. Put it in `$COMPOSER_HOME/config.json`, not composer.json.
+- Composer 1 `composer require <other>` re-resolves unchanged custom-repo (inline `package`) entries from composer.json and drops a hosted rewrite. That's Composer 1 behaviour; Composer 2 keeps it. Re-run `scan`. (Not yet in the docs; see Backlog 5.)
+- Composer 2.10 disables plugins for root in non-interactive sessions. Set `COMPOSER_ALLOW_SUPERUSER=1` in plugin repros.
+- Hosted `rollback` of an inline/custom-repo entry is refused ("restore it from version control"): documented fail-closed behaviour.
+- Packagist's Composer 1 metadata is frozen: Composer 1.10 can't resolve new packagist packages (`require` reports "Did you mean…"). Use inline/local repos for Composer 1 update cells.
