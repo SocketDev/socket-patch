@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Maven bug-hunt routine (label pm:maven).
 
-Last updated: 2026-10-02 (run 9), main `bf0e0d1`, latest release 4.0.0. Maven 3.9.16 (newest 3.9) and 4.0.0-rc-7 (newest 4.x) are still the newest releases.
+Last updated: 2026-10-02 (run 10), main `045d7ec`, latest release 4.0.0. Maven 3.9.16 (newest 3.9) and 4.0.0-rc-7 (newest 4.x) are still the newest releases.
 
 ## Coverage matrix
 
@@ -60,6 +60,16 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 | 3.9.16 | pass (drift detected) | fail #584 | pass | pass |
 | 4.0.0-rc-7 | pass (drift detected) | fail #584 | pass | untested |
 
+### v5 vendored reactor: version boundaries, CI-friendly versions, implicit subprojects, #584 siblings (run 10, Linux)
+
+| Maven | stock reactor capstone | `${revision}` root + `-Drevision` in maven.config | #584 sibling: literal added to `b` | #584 sibling: module under second local root added later | second local root at vendor time | 4.1.0 implicit subprojects (no `<subprojects>`) | explicit `<subprojects>` control |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 3.6.3 | pass | blocked (429) | untested | fail #584 | pass | n/a | n/a |
+| 3.8.8 | pass | untested | untested | untested | untested | n/a | n/a |
+| 3.9.0 / 3.9.1 / 3.9.2 | pass | untested | untested | untested | untested | n/a | n/a |
+| 3.9.16 | pass | pass | fail #584 | fail #584 | pass | n/a | n/a |
+| 4.0.0-rc-7 | pass | pass | untested | fail #584 | pass | fail #622 | pass |
+
 ### v5 hosted Trusted Checksums boundary (#258, run 5, Linux)
 
 | Maven | `e2e_redirect_maven_build` (unenforced warning ⇔ tamper enforcement) |
@@ -85,15 +95,14 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 
 0. **Maintainer request (global `-g`)**: mostly covered in run 3 (see the matrix and the 20261001T061707Z entry). Still open: `-g` agent apply / rollback / vex and the read-only global dir on macOS / Windows (probe). Keep this item until those cells pass or fail. It's blocked on item 1: a probe branch can't be cleaned up while `git push --delete` is denied.
 1. A maintainer needs to delete the stale probe branches `bughunt/maven/20260930-vendored-paths` and `bughunt/maven/20261001-global-repo`. `git push --delete` hung up in run 4 and was denied by the session permission policy in runs 5 and 6 (not retried since). Probe commits must use the default (signed) git identity. Don't override `user.email`.
-2. #584 siblings: a literal base added to an existing module, and a second local root (a module whose parent isn't the pinned root), through `vex` vs `vendor --check`. Also the #584 cells on 3.6.3.
+2. #622 follow-ups: `scan --mode vendored` / `get --mode vendored` on the implicit-subproject layout; an implicit layout with a nested aggregator; `vendor --revert` on it.
 3. Hosted: a pre-existing `.mvn/maven.config` with `failIfMissing=true` plus a user `checksums.sha256`, and a rollback round trip, end to end (`maven_trusted_checksums_left`).
-4. Other Maven 4.1.0 model features vs the reactor planner: CI-friendly `${revision}` parents, implicit `<subprojects>`.
-5. Other user-property sources vs the reactor planner (#535 / #550 family): `-D` values containing `${...}` (Maven 4 interpolation).
-6. Single-POM vendored capstone on 3.6.3 / 3.8.8 via the caching mirror (the harness warm-up has no mirror hook; a local variant with `mirrorOf central` → localhost works).
-7. The #459 reverse case and BOM bump on 3.6.3 / 3.8.8 / 4.0.0-rc-7.
-8. Windows long paths + CRLF checkout of `.socket/vendor/maven2` (the `* -text` `.gitattributes`).
-9. The reactor capstone variants from run 4 on 4.0.0-rc-7 (comma / `%2F` paths, existing CRLF `maven.config`).
-10. The v4.0.0-era cells on 3.9.16 (hosted re-run idempotency, `%XX` path, `<repositories/>`).
+4. Other user-property sources vs the reactor planner (#535 / #550 family): `-D` values containing `${...}` (Maven 4 interpolation).
+5. `${revision}`, the #584-sibling cells and the single-POM vendored capstone on 3.6.3 / 3.8.8 through a caching mirror (the harness warm-up has no mirror hook; a local variant with `mirrorOf central` → localhost works).
+6. The #459 reverse case and BOM bump on 3.6.3 / 3.8.8 / 4.0.0-rc-7.
+7. Windows long paths + CRLF checkout of `.socket/vendor/maven2` (the `* -text` `.gitattributes`).
+8. The reactor capstone variants from run 4 on 4.0.0-rc-7 (comma / `%2F` paths, existing CRLF `maven.config`).
+9. The v4.0.0-era cells on 3.9.16 (hosted re-run idempotency, `%XX` path, `<repositories/>`).
 
 ## Known non-bugs
 
@@ -102,7 +111,7 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 - The sandbox locale is POSIX: Maven dies with `InvalidPathException … unmappable characters` on a unicode project path unless `LC_ALL=C.UTF-8`. That's a sandbox artifact, not a socket-patch bug.
 - Hosted literal version range `<version>[1.10.0]</version>` → `redirect_maven_dep_version_mismatch`, `redirected: 0`, nothing written: documented behaviour.
 - Central 429 bodies cached as `.pom` files ("Non-parseable POM … Your…") are rate-limit artifacts. Delete poms under 200 bytes from the seed repo and retry.
-- Maven 4 `<subprojects>` aggregator not refused by vendored mode: harmless on 4.0.0-rc-7 (see backlog 6).
+- Maven 4 explicit `<subprojects>` aggregator: planned as a reactor on v5 (pass, run 10). The *implicit* case (no `<subprojects>`) is #622.
 - Linux sandbox: Java's `user.home` comes from passwd, not `$HOME`. Pass `-Duser.home=$HOME` to Maven when faking a home directory.
 - `--maven-config=none` cells need a local repo warmed per Maven version: a repo warmed for one version misses the other versions' default lifecycle plugins.
 - Offline `rollback -g` without the before-blob → loud exit 1 "--offline prevents fetching": documented.
@@ -118,3 +127,5 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 - maven.config `-D k=v` (separate tokens) is ignored by Maven 4.0.0-rc-7 itself, so the #535 cell is n/a on Maven 4.
 - `#` comment lines in `.mvn/maven.config` on Maven 3.6.3 / 3.8.8: Maven itself rejects them. Only 3.9+ / 4.x treat them as comments (#550).
 - Hosted `merge_mvn_config`: a user's own `trustedChecksums=false`, `checksumAlgorithms=SHA-512` or `summaryFile.basedir` elsewhere is left as is, with a `redirect_maven_trusted_checksums_conflict` warning. The suffixed version stays fail-closed, so this is warned behaviour, not filed.
+- Harness: in one test process, a second `vendor` through `prebuilt_common::prepare_command` can fail `vendor_prebuilt_required` ("package response missing a result"). Run each fixture case in its own process.
+- `cd <module>` offline in a reactor whose module depends on an uninstalled sibling fails in Maven itself (the sibling isn't in the local repo). Pick a leaf module for `cd` oracles.
