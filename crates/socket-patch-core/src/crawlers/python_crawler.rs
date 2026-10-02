@@ -355,8 +355,11 @@ async fn find_local_venv_site_packages_with(
     // 1. Check VIRTUAL_ENV env var. Pipenv ignores it under `PIPENV_ACTIVE`
     // (a `pipenv shell` started in another project) and
     // `PIPENV_IGNORE_VIRTUALENVS`, so for a Pipenv project the activated venv
-    // then belongs to something else and must not be patched.
-    if !pipenv || pipenv_uses_virtual_env(var) {
+    // then belongs to something else and must not be patched. PDM likewise
+    // skips an activated venv under `PDM_IGNORE_ACTIVE_VENV`.
+    let pdm_ignores_active = var("PDM_IGNORE_ACTIVE_VENV").is_some_and(|v| !v.is_empty())
+        && pdm_drives_project(cwd).await;
+    if (!pipenv || pipenv_uses_virtual_env(var)) && !pdm_ignores_active {
         if let Some(virtual_env) = var("VIRTUAL_ENV") {
             let venv_path = PathBuf::from(&virtual_env);
             let matches = find_site_packages_under(&venv_path, "site-packages").await;
@@ -2397,6 +2400,18 @@ mod tests {
         assert_eq!(
             find_local_venv_site_packages_with(&project, &active).await,
             vec![active_site]
+        );
+        // ...unless PDM_IGNORE_ACTIVE_VENV tells PDM to skip it.
+        let opted_out = env_of(&[
+            (
+                "VIRTUAL_ENV",
+                other.path().join("active").to_string_lossy().into_owned(),
+            ),
+            ("PDM_IGNORE_ACTIVE_VENV", "1".to_string()),
+        ]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &opted_out).await,
+            vec![lib.clone()]
         );
         let dot_venv = fake_venv(&project, ".venv");
         assert_eq!(
