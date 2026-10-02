@@ -51,6 +51,7 @@ use crate::formats::pnpm::plan_hosted;
 use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
+use crate::formats::gem::lock_lists_direct_dependency;
 pub(crate) use crate::formats::yarn::is_berry_lock;
 use crate::formats::cargo::hosted::CargoLockPlan;
 #[cfg(test)]
@@ -4945,6 +4946,31 @@ fn rewrite_gem(
         // written or already present) — the lock pin below is gated on it.
         let mut source_placed = false;
         if let Some(gf) = gemfile.as_mut() {
+            // Looser "declared at all?" probe: counts every `gem` call that
+            // names the gem, in any form (indented in a group, parenthesized,
+            // our own source block). It gates the append branch (appending
+            // next to a declaration the recognizer below cannot parse would
+            // leave the gem declared twice) and catches a gem declared more
+            // than once: rewriting only one of them leaves `= x.y.z` next to
+            // the other requirement, and bundler refuses the Gemfile (#548).
+            let declared_re = Regex::new(
+                &(String::from(r#"(?m)^[ \t]*gem\b[^\n]*["']"#)
+                    + &regex::escape(&dep.name)
+                    + r#"["']"#),
+            )
+            .expect("declaration probe regex from the escaped gem name is valid");
+            if declared_re.find_iter(gf).nth(1).is_some() {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_gem_declared_more_than_once".into(),
+                    detail: format!(
+                        "`gem \"{}\"` is declared more than once in {gemfile_name}; \
+                         rewriting one declaration would leave conflicting requirements \
+                         bundler refuses — merge them into one declaration and re-run",
+                        dep.name
+                    ),
+                });
+                continue;
+            }
             // Grant-agnostic idempotency guard: the grant-token (and patch
             // uuid) segments of the index URL rotate per request, so an
             // exact-URL check misses the block a previous run wrote and this
@@ -4994,16 +5020,6 @@ fn rewrite_gem(
                         + r#"["']([^\n]*)$"#),
                 )
                 .expect("gem-line regex from the escaped gem name is valid");
-                // Looser "declared at all?" probe: gates the append branch —
-                // appending next to a declaration the recognizer above cannot
-                // parse would leave the gem declared twice (bundler
-                // hard-fails on the duplicate).
-                let declared_re = Regex::new(
-                    &(String::from(r#"(?m)^[ \t]*gem\b[^\n]*["']"#)
-                        + &regex::escape(&dep.name)
-                        + r#"["']"#),
-                )
-                .expect("declaration probe regex from the escaped gem name is valid");
                 if let Some(m) = gem_line_re.captures(gf) {
                     let range = m.get(0).expect("group 0 is the whole match").range();
                     let original = m
@@ -5112,6 +5128,26 @@ fn rewrite_gem(
                         detail: format!(
                             "the `gem \"{}\"` declaration is in a form the rewriter \
                              cannot safely edit; redirect skipped",
+                            dep.name
+                        ),
+                    });
+                    continue;
+                } else if files
+                    .get(lock_name)
+                    .is_some_and(|lk| lock_lists_direct_dependency(lk, &dep.name))
+                {
+                    // Not declared where the rewriter can see it, yet bundler
+                    // resolved it as a DIRECT dependency: the Gemfile declares
+                    // it out of sight (`eval_gemfile`, a loop, a gemspec).
+                    // Appending a block would declare it twice (#482).
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_gem_declaration_not_visible".into(),
+                        detail: format!(
+                            "{lock_name} lists {} as a direct dependency, but {gemfile_name} \
+                             declares it somewhere the rewriter cannot edit (an \
+                             `eval_gemfile`d file, a loop, a gemspec); appending a second \
+                             declaration would make bundler refuse the Gemfile — redirect \
+                             skipped",
                             dep.name
                         ),
                     });
@@ -11039,6 +11075,97 @@ mod tests {
                 .any(|w| w.code == "redirect_gem_unrecognized_declaration"),
             "skip must warn: {:?}",
             r.warnings
+        );
+    }
+
+    /// #548: bundler accepts a gem declared more than once with the same
+    /// requirement (two `group` blocks, or top level plus a group).
+    /// Rewriting only the first declaration leaves `= 1.0.0` next to
+    /// `>= 0`, which bundler refuses on every install. Fail closed before
+    /// any write, like vendored mode's `gemfile_declaration_not_editable`.
+    #[test]
+    fn gemfile_gem_declared_twice_fails_closed() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    vuln-gem (1.0.0)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  vuln-gem\n\n\
+                    CHECKSUMS\n  vuln-gem (1.0.0) sha256="
+            .to_string()
+            + &"2".repeat(64)
+            + "\n\nBUNDLED WITH\n   4.0.17\n";
+        for gemfile in [
+            "source \"https://rubygems.org\"\n\ngroup :development do\n  gem \"vuln-gem\"\nend\n\n\
+             group :test do\n  gem \"vuln-gem\"\nend\n",
+            "source \"https://rubygems.org\"\n\ngem \"vuln-gem\"\n\n\
+             group :test do\n  gem \"vuln-gem\"\nend\n",
+            "source \"https://rubygems.org\"\n\ngem \"vuln-gem\"\ngem(\"vuln-gem\")\n",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.to_string());
+            files.insert("Gemfile.lock".to_string(), lock.clone());
+            let r = rewrite_registry_redirect(&files, &[gem_override("vuln-gem", "1.0.0")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "a gem declared twice must not be half-rewritten: {gemfile}\nfiles={:?} edits={:?}",
+                r.files,
+                r.edits
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_declared_more_than_once"],
+                "{gemfile}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    /// #482: a DIRECT dependency the root Gemfile declares out of the
+    /// rewriter's sight (`eval_gemfile`, a loop) is listed under the lock's
+    /// DEPENDENCIES. Appending a source block for it declares it twice and
+    /// bundler refuses every install, so fail closed instead.
+    #[test]
+    fn gemfile_direct_dependency_declared_out_of_sight_is_not_appended() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.1.8)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (~> 3.1)\n\n\
+                    BUNDLED WITH\n   4.0.17\n";
+        for gemfile in [
+            "source \"https://rubygems.org\"\neval_gemfile \"Gemfile.common\"\n",
+            "source \"https://rubygems.org\"\n%w[rack].each { |g| gem g, \"~> 3.1\" }\n",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.to_string());
+            files.insert("Gemfile.lock".to_string(), lock.to_string());
+            let r = rewrite_registry_redirect(&files, &[gem_override("rack", "3.1.8")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "a direct dep declared out of sight must not be appended: {gemfile}\n\
+                 files={:?} edits={:?}",
+                r.files,
+                r.edits
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_declaration_not_visible"],
+                "{gemfile}: {:?}",
+                r.warnings
+            );
+        }
+        // Control: a genuinely transitive gem (absent from DEPENDENCIES) is
+        // still appended.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\ngem \"rails\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            lock.replace("DEPENDENCIES\n  rack (~> 3.1)", "DEPENDENCIES\n  rails"),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rack", "3.1.8")]);
+        let out = r.files.get("Gemfile").expect("transitive gem appended");
+        assert!(
+            out.ends_with(
+                "source \"https://patch.test/gem/tok/uuid/\" do\n  gem \"rack\", \"3.1.8\"\nend\n"
+            ),
+            "{out}"
         );
     }
 
