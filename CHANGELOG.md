@@ -102,6 +102,15 @@ limits, and required install commands.
 
 ### Fixed
 
+- Hosted `scan` / `get` run from a workspace member no longer reports
+  success while pinning nothing or the wrong files. From a pnpm workspace
+  member, or a pnpm project whose `lockfile-dir` puts `pnpm-lock.yaml` in
+  another directory, the run now refuses with
+  `redirect_pnpm_lockfile_elsewhere` (#590). From a cargo workspace member,
+  it refuses with `cargo_manifest_not_workspace_root`, as vendored mode
+  does, instead of rewriting the member's manifest and breaking the
+  workspace build (#417). Both exit 1 and write nothing; run from the
+  directory holding the lock.
 - Global mode (`-g`) finds npm, yarn, pnpm, bun, RubyGems and Composer on
   Windows, where they install as `.cmd` / `.bat` shims, instead of reporting
   an empty scan. The yarn and npm-family global lookups no longer run from the

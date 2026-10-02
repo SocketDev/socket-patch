@@ -731,6 +731,14 @@ pub(crate) async fn run_redirect_selected(
             &engine::bun_lockb_symlink_refusal(),
         );
     }
+    // A workspace member whose lock lives in an ancestor directory (pnpm
+    // workspace / `lockfile-dir`, cargo workspace): the rewriters would
+    // read only the member, so refuse before any takeover or write.
+    if let Some(refusal) =
+        socket_patch_core::hosted::governing_root::refusal(&view, &candidates).await
+    {
+        return refuse(common, scan_result.take(), &refusal);
+    }
 
     // vlt artifact preflight: before any takeover or rewrite (dry runs
     // included), each in-scope artifact is fetched as vlt fetches it. A

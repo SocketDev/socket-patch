@@ -5,6 +5,8 @@
 //!   [`ProjectView`](crate::vendor::lock_inventory::ProjectView), shared by
 //!   the disk flow (`scan`/`get --mode hosted` in the CLI) and the
 //!   in-memory engine.
+//! - [`governing_root`] — the workspace-member pre-check (a lock in an
+//!   ancestor directory governs the project).
 //! - [`guidance`] — the pnpm `trustLockfile` / npm `allow-remote`
 //!   auto-config planners and their warning texts.
 //! - [`vlt`] — the vlt artifact preflight.
@@ -13,6 +15,7 @@
 //!   (`socket-patch-node`) and the CLI's hidden `hosted-bundle` harness.
 
 pub mod engine;
+pub mod governing_root;
 pub mod guidance;
 pub mod memory;
 pub mod render;
