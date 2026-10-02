@@ -28,7 +28,6 @@ mod gradle_build_common;
 mod jvm_fixture_repo;
 
 #[path = "maven_build_common/mod.rs"]
-#[allow(dead_code)]
 mod maven_build_common;
 
 use std::path::{Path, PathBuf};
@@ -310,6 +309,7 @@ fn prepare(world: &World, proj: &Path, task: &str) {
 /// (markup stripped), for a failure message.
 fn verification_report(proj: &Path) -> String {
     let reports = proj.join("build/reports/dependency-verification");
+    let markup = regex::Regex::new(r"<[^>]*>").unwrap();
     let mut out = String::new();
     for dir in std::fs::read_dir(&reports).into_iter().flatten().flatten() {
         for file in std::fs::read_dir(dir.path())
@@ -318,8 +318,7 @@ fn verification_report(proj: &Path) -> String {
             .flatten()
         {
             let text = std::fs::read_to_string(file.path()).unwrap_or_default();
-            let stripped = regex::Regex::new(r"<[^>]*>")
-                .unwrap()
+            let stripped = markup
                 .replace_all(&text, " ")
                 .split_whitespace()
                 .collect::<Vec<_>>()
