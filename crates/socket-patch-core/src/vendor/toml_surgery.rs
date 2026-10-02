@@ -264,6 +264,9 @@ pub(super) fn remove_exact_line(text: &str, line: &str) -> Option<String> {
 
 /// Drop a `[header]` whose section holds only blank lines, plus its
 /// preceding blank separator. A non-empty section is left untouched.
+/// Blank lines before a following header are that header's own separator
+/// and stay, so a header made explicit above `[header.<sub>]` sub-tables
+/// comes out without eating the sub-table's spacing.
 /// Spliced by byte span so every other byte — including CRLF endings in a
 /// user-authored pyproject.toml — survives verbatim.
 pub(super) fn remove_table_if_empty(text: &str, header: &str) -> String {
@@ -277,6 +280,9 @@ pub(super) fn remove_table_if_empty(text: &str, header: &str) -> String {
             return text.to_string();
         }
         end += 1;
+    }
+    if end < index.len() {
+        end = h + 1;
     }
     let mut start = h;
     if start > 0 && index[start - 1].1.trim().is_empty() {
@@ -483,12 +489,19 @@ mod tests {
         let keep_blanks = "x = 1\n\n[tool.uv]\n\ndev = true\n";
         assert_eq!(remove_table_if_empty(keep_blanks, "[tool.uv]"), keep_blanks);
         // A section holding ONLY blank lines is empty too — the headline
-        // documented case. The splice consumes the section's trailing blanks
-        // up to the next header, so the blank separator before [next] does
-        // not survive (pinning current behavior).
+        // documented case. The blanks before [next] are its separator and
+        // survive; the header and its own preceding separator go.
         assert_eq!(
             remove_table_if_empty("x = 1\n\n[tool.uv]\n\n\n[next]\na = 1\n", "[tool.uv]"),
-            "x = 1\n[next]\na = 1\n"
+            "x = 1\n\n\n[next]\na = 1\n"
+        );
+        // A header made explicit above its own sub-table (#524).
+        assert_eq!(
+            remove_table_if_empty(
+                "x = 1\n\n[tool.uv.sources]\n\n[tool.uv.sources.a]\npath = \"a\"\n",
+                "[tool.uv.sources]"
+            ),
+            "x = 1\n\n[tool.uv.sources.a]\npath = \"a\"\n"
         );
         // Blank-only section at EOF: header, its blanks, and the preceding
         // separator are all dropped.
