@@ -1492,7 +1492,7 @@ async fn filter_to_installed_purls(
             let vendored =
                 super::scan::project_vendored_supplement(common, &[], &ctx.loaded().await.vendor)
                     .await;
-            present.extend(vendored.iter().map(|p| canon(&p.purl)));
+            present.extend(vendored.packages.iter().map(|p| canon(&p.purl)));
         }
     }
 

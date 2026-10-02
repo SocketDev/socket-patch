@@ -66,6 +66,8 @@
         "resave_install_revert",
         "resave_uninstall_revert",
         "resave_crlf_revert",
+        "dependency_bumped_rescan",
+        "dependency_uninstalled_rescan",
         "tamper_planted_file",
         "tamper_file_content",
         "tamper_payload_package_json",
@@ -198,6 +200,8 @@
       "resave_install_revert",
       "resave_uninstall_revert",
       "resave_crlf_revert",
+      "dependency_bumped_rescan",
+      "dependency_uninstalled_rescan",
       "tamper_planted_file",
       "tamper_file_content",
       "tamper_payload_package_json",
@@ -306,6 +310,21 @@
       },
       "conditions": [],
       "reason": "no-global-store"
+    },
+    {
+      "boundary": "a dependency removed from package.json leaves the lock: `vlt uninstall` keeps a `file:` spec declared and `vlt install` keeps the removed dependency's edge and node, so the vendored node stays wired (socket-patch correctly keeps the entry)",
+      "suite": "vendored",
+      "legs": [
+        "dependency_uninstalled_rescan"
+      ],
+      "except": [],
+      "versions": {
+        "op": "range",
+        "a": "0.0.0-30",
+        "b": "0.0.0-32"
+      },
+      "conditions": [],
+      "reason": "removed-dependency-stays-locked"
     },
     {
       "boundary": "`vlt ci`, `--frozen-lockfile`, `--expect-lockfile` exist",
