@@ -540,6 +540,88 @@ async fn gem_hosted_stale_purl_is_not_vex_attested_in_the_same_run() {
     assert_eq!(env["status"], "error", "envelope: {env}");
 }
 
+/// #483: bundler's cache dir is the `cache_path` setting — `bundle config
+/// set --local cache_path vendor/gems` (a committed `.bundle/config`) or a
+/// `BUNDLE_CACHE_PATH` export. A fresh checkout whose committed archive at
+/// that path is the UNPATCHED upstream `.gem` installs those bytes, so the
+/// standalone cache warning must name it and the same run's `--vex` must
+/// not attest the purl — exactly as for the default `vendor/cache`.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_stale_archive_at_configured_cache_path_warns_and_is_not_attested() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    for (label, config, env) in [
+        (
+            "app-config",
+            Some("---\nBUNDLE_CACHE_PATH: \"vendor/gems\"\n"),
+            &[][..],
+        ),
+        ("env", None, &[("BUNDLE_CACHE_PATH", "vendor/gems")][..]),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        if let Some(config) = config {
+            std::fs::create_dir_all(proj.join(".bundle")).unwrap();
+            std::fs::write(proj.join(".bundle").join("config"), config).unwrap();
+        }
+        let archive = proj
+            .join("vendor")
+            .join("gems")
+            .join(format!("{DEP}-{DEP_VERSION}.gem"));
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(&archive, b"upstream-gem-archive-bytes").unwrap();
+
+        let vex_path = proj.join("out.vex.json");
+        let (code, stdout, stderr) = common::run_with_env(
+            &proj,
+            &[
+                "scan",
+                "--mode",
+                "hosted",
+                "--json",
+                "--yes",
+                "--cwd",
+                proj.to_str().unwrap(),
+                "--api-url",
+                &server.uri(),
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+                "--vex",
+                vex_path.to_str().unwrap(),
+                "--vex-product",
+                "pkg:gem/app@1.0.0",
+            ],
+            env,
+        );
+        let env = common::parse_json_envelope(&stdout);
+        let warnings = stale_warnings(&env);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "{label}: the configured cache archive must warn: {env}\nstderr:\n{stderr}"
+        );
+        assert!(
+            warnings[0].contains(&archive.display().to_string()),
+            "{label}: the warning must name the configured archive: {}",
+            warnings[0]
+        );
+        if let Ok(doc) = std::fs::read_to_string(&vex_path) {
+            assert!(
+                !doc.contains(PURL),
+                "{label}: a stale purl must never be attested by the same run's VEX:\n{doc}"
+            );
+        }
+        assert_ne!(
+            code, 0,
+            "{label}: an all-stale --vex run must fail, not attest.\nstdout:\n{stdout}"
+        );
+    }
+}
+
 /// 7. Manifest-less VEX (no `.socket/manifest.json` — hosted never writes
 /// one) over the stale-install scenario, before and after the prescribed
 /// fix. The two post-install lock shapes are the ones REAL bundler writes
