@@ -2,7 +2,7 @@
 _Last updated 2026-10-02T19:05Z · main @ 203e092_
 
 **In flight:**
-- [#574](https://github.com/SocketDev/socket-patch/pull/574): one vlt `registry_base` following vlt's DepID hydration. Issues #562 (E02, E03). State: blocked until CI and Bugbot pass on `ae7a035`. All review findings are fixed (scoped registries, `~~` as `npm`, restore admission matching the rewrite), and clippy and the vlt tests pass locally.
+- [#574](https://github.com/SocketDev/socket-patch/pull/574): one vlt `registry_base` following vlt's DepID hydration. Issues #562 (E02, E03). State: ready (Ready for review) on `ae7a035`. CI is green (485 checks), Bugbot is clean, and every review finding is fixed. It awaits human approval.
 - [#581](https://github.com/SocketDev/socket-patch/pull/581): one `ApiTimeouts` policy (10 s connect, 60 s idle read) on both `ApiClient` reqwest clients. Issue #570 (C02). State: ready, handed to the PR burn-down.
 
 **Merged:**
