@@ -237,6 +237,11 @@ limits, and required install commands.
   project and rewired its lockfile, and `vendor --revert -g` unwound the
   project's vendoring, so its next frozen install was silently unpatched.
   Global installs have no project lockfile to vendor into (#498).
+- Patch API requests (`scan`, `get`, `apply` and `vex` lookups, and blob and
+  diff downloads) no longer hang forever on a stalled proxy, load balancer or
+  half-open connection. A connect now fails after 10 s, and a connection that
+  sends nothing for 60 s fails as a network error. Downloads that keep
+  streaming are not cut off (#570).
 
 ### Maintenance
 

@@ -413,6 +413,17 @@ enum Driver {
     /// `Gemfile.next`, so the run must redirect nothing and attest nothing.
     /// The fixture asserts that contract itself and yields `None`.
     ScanVexDualBoot,
+    /// [`Driver::ScanVex`] on a Gemfile that declares the gem in two `group`
+    /// blocks (#548): bundler accepts the duplicate, but rewriting only one
+    /// declaration would leave conflicting requirements. The run must
+    /// refuse, write nothing and attest nothing; the fixture asserts that
+    /// and yields `None`.
+    ScanVexDuplicateDeclaration,
+    /// [`Driver::ScanVex`] on a Gemfile that declares the gem through
+    /// `eval_gemfile` (#482): the lock lists it as a direct dependency, so
+    /// appending a source block would declare it twice. Same contract as
+    /// [`Driver::ScanVexDuplicateDeclaration`].
+    ScanVexEvalGemfile,
     /// [`Driver::ScanVexDualBoot`] with `BUNDLE_GEMFILE=Gemfile` exported to
     /// socket-patch too (#507): bundler's local app config outranks the
     /// environment, so bundler still loads `Gemfile.next` and the run must
@@ -426,6 +437,8 @@ impl Driver {
             Driver::ScanVex => "scan --mode hosted",
             Driver::GetUuid => "get <uuid> --mode hosted",
             Driver::ScanVexDualBoot => "scan --mode hosted (BUNDLE_GEMFILE=Gemfile.next)",
+            Driver::ScanVexDuplicateDeclaration => "scan --mode hosted (gem in two groups)",
+            Driver::ScanVexEvalGemfile => "scan --mode hosted (gem via eval_gemfile)",
             Driver::ScanVexDualBootEnvGemfile => {
                 "scan --mode hosted (config Gemfile.next, env BUNDLE_GEMFILE=Gemfile)"
             }
@@ -691,11 +704,22 @@ async fn redirect_scanned_project(
     // 3. The fixture project, installed from the MOCK upstream (hermetic).
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
-    std::fs::write(
-        proj.join(gemfile_name),
-        format!("source \"{}/upstream\"\n\ngem \"{DEP}\"\n", server.uri()),
-    )
-    .unwrap();
+    let gemfile_body = match driver {
+        Driver::ScanVexDuplicateDeclaration => format!(
+            "source \"{}/upstream\"\n\ngroup :development do\n  gem \"{DEP}\"\nend\n\n\
+             group :test do\n  gem \"{DEP}\"\nend\n",
+            server.uri()
+        ),
+        Driver::ScanVexEvalGemfile => {
+            std::fs::write(proj.join("Gemfile.common"), format!("gem \"{DEP}\"\n")).unwrap();
+            format!(
+                "source \"{}/upstream\"\n\neval_gemfile \"Gemfile.common\"\n",
+                server.uri()
+            )
+        }
+        _ => format!("source \"{}/upstream\"\n\ngem \"{DEP}\"\n", server.uri()),
+    };
+    std::fs::write(proj.join(gemfile_name), gemfile_body).unwrap();
     let config_args = bundler.config_local_args("path", "vendor/bundle");
     let config_args: Vec<&str> = config_args.iter().map(String::as_str).collect();
     let config = bundle(&proj, &config_args);
@@ -795,7 +819,11 @@ async fn redirect_scanned_project(
         );
     }
     let argv: Vec<&str> = match driver {
-        Driver::ScanVex | Driver::ScanVexDualBoot | Driver::ScanVexDualBootEnvGemfile => vec![
+        Driver::ScanVex
+        | Driver::ScanVexDualBoot
+        | Driver::ScanVexDualBootEnvGemfile
+        | Driver::ScanVexDuplicateDeclaration
+        | Driver::ScanVexEvalGemfile => vec![
             "scan",
             "--mode",
             "hosted",
@@ -847,6 +875,21 @@ async fn redirect_scanned_project(
             "envelope: {env}"
         );
         assert_dual_boot_redirects_nothing(&env, &proj, &pristine_gemfile, &pristine_lock);
+        return None;
+    }
+    if let Some(warning) = match driver {
+        Driver::ScanVexDuplicateDeclaration => Some("redirect_gem_declared_more_than_once"),
+        Driver::ScanVexEvalGemfile => Some("redirect_gem_declaration_not_visible"),
+        _ => None,
+    } {
+        assert_unwirable_declaration_redirects_nothing(
+            &proj,
+            &bundler,
+            warning,
+            (code, &stdout, &stderr),
+            &pristine_gemfile,
+            &pristine_lock,
+        );
         return None;
     }
     assert_eq!(
@@ -922,9 +965,10 @@ async fn redirect_scanned_project(
                 "in-run hosted VEX is attested from this run's fetched record, not hash-verified: {env}"
             );
         }
-        Driver::ScanVexDualBoot | Driver::ScanVexDualBootEnvGemfile => {
-            unreachable!("asserted and returned above")
-        }
+        Driver::ScanVexDualBoot
+        | Driver::ScanVexDualBootEnvGemfile
+        | Driver::ScanVexDuplicateDeclaration
+        | Driver::ScanVexEvalGemfile => unreachable!("asserted and returned above"),
         Driver::GetUuid => {
             // get's hosted envelope (CLI_CONTRACT.md "get --mode and
             // installed narrowing"): `found` counts the resolved patch;
@@ -976,6 +1020,49 @@ async fn redirect_scanned_project(
         bundler,
         _server: server,
     })
+}
+
+/// #482 / #548: a Gemfile whose declarations of the gem the rewriter cannot
+/// edit as one (two `group` blocks, an `eval_gemfile`d file). The scan names
+/// the refusal, leaves the pair byte-identical and attests nothing, and the
+/// real bundler still installs the project (before the fix the Gemfile was
+/// left declaring the gem twice and every install exited 4).
+fn assert_unwirable_declaration_redirects_nothing(
+    proj: &Path,
+    bundler: &bundler_e2e::Bundler,
+    warning: &str,
+    (code, stdout, stderr): (i32, &str, &str),
+    pristine_gemfile: &[u8],
+    pristine_lock: &[u8],
+) {
+    let env: serde_json::Value = serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"));
+    assert!(
+        stdout.contains(warning),
+        "the refusal must be named ({warning}): {env}"
+    );
+    assert_ne!(code, 0, "nothing was patched or attested: {env}");
+    assert!(
+        env["vex"]["statements"].as_u64().unwrap_or(0) == 0,
+        "nothing may be attested: {env}"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("Gemfile")).unwrap(),
+        pristine_gemfile,
+        "the Gemfile must be byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("Gemfile.lock")).unwrap(),
+        pristine_lock,
+        "the lock must be byte-identical"
+    );
+    let install = bundle(proj, &["install"]);
+    assert!(
+        install.status.success(),
+        "bundler {} must still install the untouched project:\n{}",
+        bundler.version,
+        String::from_utf8_lossy(&install.stderr)
+    );
 }
 
 /// #390's contract on a `BUNDLE_GEMFILE: Gemfile.next` project: the hosted
@@ -1530,14 +1617,30 @@ fn vendor_takeover_keeps_the_hosted_gems_rb_pin(fx: &RedirectFixture) {
     let (code, stdout, stderr) = run_socket(
         &fx.proj,
         &[
-            "get", UUID, "--mode", "vendored", "--json", "--yes", "--cwd", proj, "--api-url",
-            &api, "--org", ORG, "--api-token", "fake",
+            "get",
+            UUID,
+            "--mode",
+            "vendored",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj,
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
             // The mock serves the patch registry: its origin is the one a
             // hosted pin is trusted on.
-            "--patch-server-url", &api,
+            "--patch-server-url",
+            &api,
         ],
     );
-    assert_ne!(code, 0, "vendor must refuse.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_ne!(
+        code, 0,
+        "vendor must refuse.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(
         stdout.contains("gemfile_not_loaded"),
         "the manifest refusal names its cause:\n{stdout}"
@@ -1573,6 +1676,45 @@ async fn gem_hosted_bundle_gemfile_dual_boot_redirects_nothing() {
     )
     .await;
     assert!(fx.is_none(), "the dual-boot driver asserts in place");
+}
+
+/// #548: a gem declared in two `group` blocks must not be half-rewritten
+/// (bundler refuses `= 1.0.0` next to `>= 0` on every install).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_gem_declared_in_two_groups_is_refused_and_still_installs() {
+    let fx = redirect_scanned_project(
+        "two-groups",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVexDuplicateDeclaration,
+    )
+    .await;
+    assert!(
+        fx.is_none(),
+        "the duplicate-declaration driver asserts in place"
+    );
+}
+
+/// #482: a direct dependency declared through `eval_gemfile` must not get a
+/// second, appended declaration.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_eval_gemfile_direct_dep_is_refused_and_still_installs() {
+    let fx = redirect_scanned_project(
+        "eval-gemfile",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVexEvalGemfile,
+    )
+    .await;
+    assert!(fx.is_none(), "the eval_gemfile driver asserts in place");
 }
 
 /// #507: the same dual boot with `BUNDLE_GEMFILE=Gemfile` exported. Bundler

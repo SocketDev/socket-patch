@@ -694,6 +694,7 @@ async fn pypi_prelude<'p>(
     dry_run: bool,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
     installed_sites: &InstalledSiteListings,
+    hosted_origins: &[String],
 ) -> Result<PypiPrelude<'p>, VendorOutcome> {
     // The purl may carry `?artifact_id=` variant qualifiers; everything here
     // keys off the qualifier-free base.
@@ -866,6 +867,7 @@ async fn pypi_prelude<'p>(
                 &canon_name,
                 &record.uuid,
                 version,
+                hosted_origins,
             ) {
                 Ok(target) => target,
                 // A refusal carries no warnings: probe nothing for it.
@@ -1011,6 +1013,9 @@ pub(crate) async fn service_preflight(
         false,
         pipenv_version,
         installed_sites,
+        // Only the verdict matters here, and the hosted-reference refusal
+        // carries the same code as the user-declared one.
+        &[],
     )
     .await
     .ok()
@@ -1038,6 +1043,10 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
     installed_sites: &InstalledSiteListings,
 ) -> VendorOutcome {
     let site_packages = site_packages.into();
+    let hosted_origins: Vec<String> = service
+        .and_then(|s| s.patch_server_url.clone())
+        .into_iter()
+        .collect();
     let PypiPrelude {
         base,
         raw_name,
@@ -1058,6 +1067,7 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         dry_run,
         pipenv_version,
         installed_sites,
+        &hosted_origins,
     )
     .await
     {
@@ -1283,6 +1293,7 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
             &rel_wheel,
             &artifact.sha256_hex,
             &record.uuid,
+            &hosted_origins,
         )
         .await
         .map(|(wiring, meta)| (wiring, MetaSlot::Pipenv(meta))),
@@ -4214,10 +4225,18 @@ wheels = [
             .unwrap();
         let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
         let p = load_pipenv_project(root).await.unwrap();
-        let (wiring, _meta) =
-            wire_pipenv(&p, root, "six", "1.16.0", &rel_wheel, &"0".repeat(64), UUID)
-                .await
-                .unwrap();
+        let (wiring, _meta) = wire_pipenv(
+            &p,
+            root,
+            "six",
+            "1.16.0",
+            &rel_wheel,
+            &"0".repeat(64),
+            UUID,
+            &[],
+        )
+        .await
+        .unwrap();
         let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
         let wheel = uuid_dir.join("six-1.16.0-py2.py3-none-any.whl");
@@ -4279,6 +4298,7 @@ wheels = [
             &rel_wheel,
             &"0".repeat(64),
             UUID,
+            &[],
         )
         .await
         .unwrap_or_else(|_| panic!("rewire"));
@@ -4354,10 +4374,18 @@ wheels = [
             .unwrap();
         let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
         let p = load_pipenv_project(root).await.unwrap();
-        let (wiring, _meta) =
-            wire_pipenv(&p, root, "six", "1.16.0", &rel_wheel, &"0".repeat(64), UUID)
-                .await
-                .unwrap();
+        let (wiring, _meta) = wire_pipenv(
+            &p,
+            root,
+            "six",
+            "1.16.0",
+            &rel_wheel,
+            &"0".repeat(64),
+            UUID,
+            &[],
+        )
+        .await
+        .unwrap();
         let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
         let wheel = uuid_dir.join("six-1.16.0-py2.py3-none-any.whl");
@@ -4489,10 +4517,18 @@ wheels = [
             .unwrap();
         let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
         let p = load_pipenv_project(root).await.unwrap();
-        let (wiring, _meta) =
-            wire_pipenv(&p, root, "six", "1.16.0", &rel_wheel, &"0".repeat(64), UUID)
-                .await
-                .unwrap();
+        let (wiring, _meta) = wire_pipenv(
+            &p,
+            root,
+            "six",
+            "1.16.0",
+            &rel_wheel,
+            &"0".repeat(64),
+            UUID,
+            &[],
+        )
+        .await
+        .unwrap();
         let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
         tokio::fs::write(uuid_dir.join("six-1.16.0-py2.py3-none-any.whl"), b"wheel")
