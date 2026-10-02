@@ -674,6 +674,18 @@ pub async fn revert_npm_any(
     revert_npm_any_opts(entry, project_root, RevertOpts::new(dry_run)).await
 }
 
+/// `vendor --check`'s wiring audit for an npm-family entry: `Err` (the
+/// human reason) when the lock installs a copy of the entry's
+/// `name@version` the vendored artifact does not reach (#588). Only the
+/// package-lock flavor audits its lock today; the other flavors' wiring is
+/// left to the artifact check and `vex`.
+pub async fn check_npm_wiring(entry: &VendorEntry, project_root: &Path) -> Result<(), String> {
+    match NpmLockFlavor::from_recorded(entry.flavor.as_deref()) {
+        Some(NpmLockFlavor::PackageLock) => npm_lock::check_wiring(entry, project_root).await,
+        _ => Ok(()),
+    }
+}
+
 /// [`revert_npm_any`] with full [`RevertOpts`], threaded through to the
 /// flavor backend that wired the entry.
 pub async fn revert_npm_any_opts(

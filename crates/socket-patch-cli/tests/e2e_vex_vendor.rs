@@ -1472,6 +1472,136 @@ fn vendored_npm_patch_with_an_unpatched_bundled_copy_is_not_attested() {
     }
 }
 
+/// REGRESSION (#588): the lock rewires the hoisted `lodash@4.17.21` to the
+/// vendored tarball, but a workspace member added after vendoring (then
+/// `npm install`) put a SECOND `lodash@4.17.21` entry in the same lock
+/// that still resolves from the registry. `npm ci` installs that copy
+/// unpatched, so `vex` must not attest the purl and `vendor --check` must
+/// report the drift (re-running the install cannot heal it). The same lock
+/// without the second entry is the control: it attests and checks clean.
+#[test]
+fn vendored_npm_patch_with_an_unwired_registry_copy_in_the_same_lock() {
+    let purl = "pkg:npm/lodash@4.17.21";
+    let uuid = "0a0a0a0a-2222-4222-8222-0a0a0a0a0a0a";
+    let patched = b"patched npm bytes\n";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    for (label, second_copy) in [("control", false), ("second registry copy", true)] {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let cwd = tmp.path();
+        let rel = format!(".socket/vendor/npm/{uuid}/lodash-4.17.21.tgz");
+        let sha256 = sha256_hex(&write_member_tgz(
+            &cwd.join(&rel),
+            "package/index.js",
+            patched,
+        ));
+        let record = make_record(
+            uuid,
+            "package/index.js",
+            &after_hash,
+            "GHSA-dupe-aaaa",
+            &["CVE-2026-588"],
+        );
+        let wiring = write_matrix_wiring(cwd, "npm", uuid, &rel);
+        if second_copy {
+            let lock_path = cwd.join("package-lock.json");
+            let mut lock: Value =
+                serde_json::from_str(&std::fs::read_to_string(&lock_path).unwrap()).unwrap();
+            let packages = lock["packages"].as_object_mut().unwrap();
+            packages.insert(
+                "packages/b".to_string(),
+                serde_json::json!({ "name": "b", "version": "1.0.0" }),
+            );
+            packages.insert(
+                "node_modules/b".to_string(),
+                serde_json::json!({ "resolved": "packages/b", "link": true }),
+            );
+            packages.insert(
+                "packages/b/node_modules/lodash".to_string(),
+                serde_json::json!({
+                    "version": "4.17.21",
+                    "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                    "integrity": "sha512-T1JJR0lOQUw="
+                }),
+            );
+            std::fs::write(&lock_path, lock.to_string()).unwrap();
+        }
+        let mut state = VendorState::new();
+        state.entries.insert(
+            purl.to_string(),
+            detached_matrix_entry("npm", purl, uuid, &rel, sha256, record, wiring),
+        );
+        let dir = cwd.join(".socket/vendor");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let vex_path = cwd.join("out.vex.json");
+        let out = cli()
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--json",
+                "--output",
+                vex_path.to_str().unwrap(),
+                "--product",
+                "pkg:npm/app@1.0.0",
+            ])
+            .output()
+            .expect("invoke vex");
+        let env: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{label}: vex envelope JSON on stdout ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        });
+        let check = cli()
+            .args(["vendor", "--check", "--cwd", cwd.to_str().unwrap(), "--json"])
+            .output()
+            .expect("invoke vendor --check");
+        let check_env: Value = serde_json::from_slice(&check.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{label}: vendor --check envelope JSON on stdout ({e}): {}",
+                String::from_utf8_lossy(&check.stdout)
+            )
+        });
+        if !second_copy {
+            assert!(out.status.success(), "{label}: {env}");
+            let doc: Value =
+                serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+            assert_eq!(
+                doc["statements"].as_array().unwrap().len(),
+                1,
+                "{label}: {doc}"
+            );
+            assert!(check.status.success(), "{label}: {check_env}");
+            continue;
+        }
+        assert_eq!(out.status.code(), Some(1), "{label}: {env}");
+        assert!(
+            !vex_path.exists(),
+            "{label}: no VEX document may attest the purl: {env}"
+        );
+        assert!(
+            env.to_string().contains("packages/b/node_modules/lodash"),
+            "{label}: the envelope names the unwired copy: {env}"
+        );
+        assert_eq!(check.status.code(), Some(1), "{label}: {check_env}");
+        let event = &check_env["events"][0];
+        assert_eq!(event["errorCode"], "vendor_check_failed", "{check_env}");
+        assert!(
+            event["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("packages/b/node_modules/lodash")
+                    && r.contains("re-run `socket-patch vendor`")),
+            "{label}: the check names the unwired copy: {check_env}"
+        );
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // 8. an applied, byte-verified agent-mode patch attests whether or not its
 // ecosystem has an install hook (there is no setup-state filter).
