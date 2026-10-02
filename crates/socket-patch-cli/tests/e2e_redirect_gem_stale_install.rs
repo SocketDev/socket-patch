@@ -545,18 +545,30 @@ async fn gem_hosted_stale_purl_is_not_vex_attested_in_the_same_run() {
 /// `BUNDLE_CACHE_PATH` export. A fresh checkout whose committed archive at
 /// that path is the UNPATCHED upstream `.gem` installs those bytes, so the
 /// standalone cache warning must name it and the same run's `--vex` must
-/// not attest the purl — exactly as for the default `vendor/cache`.
+/// not attest the purl — exactly as for the default `vendor/cache`. Under
+/// `BUNDLE_IGNORE_CONFIG` the committed setting is ignored, by bundler and
+/// by the guard alike, so the default `vendor/cache` archive still counts.
 #[tokio::test(flavor = "multi_thread")]
 async fn gem_hosted_stale_archive_at_configured_cache_path_warns_and_is_not_attested() {
     let server = MockServer::start().await;
     mount_api(&server, None).await;
-    for (label, config, env) in [
+    let moved = "---\nBUNDLE_CACHE_PATH: \"vendor/gems\"\n";
+    for (label, config, env, cache_dir) in [
+        ("app-config", Some(moved), &[][..], "gems"),
         (
-            "app-config",
-            Some("---\nBUNDLE_CACHE_PATH: \"vendor/gems\"\n"),
-            &[][..],
+            "env",
+            None,
+            &[("BUNDLE_CACHE_PATH", "vendor/gems")][..],
+            "gems",
         ),
-        ("env", None, &[("BUNDLE_CACHE_PATH", "vendor/gems")][..]),
+        // BUNDLE_IGNORE_CONFIG: bundler skips the file, so the ignored
+        // `cache_path` moves nothing and `vendor/cache` is still installed.
+        (
+            "ignore-config",
+            Some(moved),
+            &[("BUNDLE_IGNORE_CONFIG", "1")][..],
+            "cache",
+        ),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let proj = tmp.path().join("proj");
@@ -568,7 +580,7 @@ async fn gem_hosted_stale_archive_at_configured_cache_path_warns_and_is_not_atte
         }
         let archive = proj
             .join("vendor")
-            .join("gems")
+            .join(cache_dir)
             .join(format!("{DEP}-{DEP_VERSION}.gem"));
         std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
         std::fs::write(&archive, b"upstream-gem-archive-bytes").unwrap();

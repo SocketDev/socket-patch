@@ -113,6 +113,8 @@ limits, and required install commands.
   the committed archive in Bundler's configured cache dir (`cache_path` /
   `BUNDLE_CACHE_PATH`) instead of always `vendor/cache`, so a stale archive
   there now warns and keeps the same run's VEX from attesting it (#483).
+  Both settings skip `.bundle/config` under `BUNDLE_IGNORE_CONFIG`, as Bundler
+  does.
 - **npm dependencies installed from git, a URL or `file:` are no longer
   reported patched.** npm installs such a dependency from the dependent's
   spec (`github:user/repo`, `https://…/x.tgz`, `file:…`) and ignores the
