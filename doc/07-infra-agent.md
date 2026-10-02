@@ -41,11 +41,10 @@ The vendor policy also has three separate hand-written retry loops, plus a first
 
 **Three URL builders with two different policies.** `patches_path` sends an authenticated client without an org slug to `/v0/orgs/default/...`, but `binary_url` and `vendor_package_url` send the same client to the public proxy. Telemetry has a fourth copy of the decision. So when org auto-resolve fails, JSON calls go to the "default" org while blob downloads silently go to the proxy.
 
-**No timeouts on the main paths (verified).**
-- `ApiClient::new` (`client.rs:393-396`) and `plain_client()` (`:1912`) build reqwest clients with no timeout, and reqwest's default is none.
-- All six timeouts in `api/` are on vendoring-service paths. Re-verified on `1169ae6` by execution: `fetch_patch` and `fetch_blob` against a server that never answers were still pending after 120 s. {{C02}}
-- The CLI has no wrapper around `get_json`, `post_json`, `proxy_batch_post` or `fetch_binary`.
-- So `scan`, `get` and `apply` can hang indefinitely on a stalled server. **That is a real CI risk.**
+**Timeouts on the main paths (#581).**
+- `ApiClient::new` and `plain_client()` build both reqwest clients through one policy, `api::retry::ApiTimeouts`: `API_CONNECT_TIMEOUT` (10 s) and `API_READ_TIMEOUT` (60 s of silence, reset per chunk), with no total deadline. Tests override it with `ApiClient::with_api_timeouts`. {{C02}}
+- A stall before the headers or mid-body fails as `ApiError::Network`; the three JSON readers share `json_response_error`, so a stalled body keeps its transport cause and only complete malformed JSON is `Parse`.
+- The vendoring service keeps its own per-attempt deadlines and retries on top. Blob/diff fetches still have no retry (C15).
 
 **Batching is split across two crates.** The CLI owns the batch sizes (500 authenticated, 100 proxy, the 256 KiB body cap). `search_patches_batch` documents "Maximum 500" but does not enforce it.
 

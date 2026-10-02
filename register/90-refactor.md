@@ -1,11 +1,11 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-02T19:05Z · main @ 203e092_
+_Last updated 2026-10-02T20:05Z · main @ 045d7ec_
 
 **In flight:**
 - [#574](https://github.com/SocketDev/socket-patch/pull/574): one vlt `registry_base` following vlt's DepID hydration. Issues #562 (E02, E03). State: ready (Ready for review) on `ae7a035`. CI is green (485 checks), Bugbot is clean, and every review finding is fixed. It awaits human approval.
-- [#581](https://github.com/SocketDev/socket-patch/pull/581): one `ApiTimeouts` policy (10 s connect, 60 s idle read) on both `ApiClient` reqwest clients. Issue #570 (C02). State: ready, handed to the PR burn-down.
 
 **Merged:**
+- [#581](https://github.com/SocketDev/socket-patch/pull/581) (merge `045d7ec`): one `ApiTimeouts` policy on both `ApiClient` clients, plus stalled-JSON-body → `Network` (reviewer fix). Issue #570 (C02). Production +173 / −31, tests +283; also carried the Berry bench fixture fix from #587.
 - [#572](https://github.com/SocketDev/socket-patch/pull/572): one hosted-PyPI-URL recognizer for hosted and vendored Pipenv. Issues #563 (E04, E49). Production +31 / −48, tests +174 / −37 (approx.).
 
 **Queue** (B bugs closed, U unblocks, D duplication removed, R risk; score = 3B + 2U + D − risk):
