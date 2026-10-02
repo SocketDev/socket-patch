@@ -34,9 +34,8 @@ const SKIP_DIRS: &[&str] = &[
 /// install the project at `start_path` into, which the workspace walk
 /// cannot find by name (it only collects dirs literally named
 /// `node_modules`, and prunes `temp`):
-/// - yarn classic's `--modules-folder <dir>` from the nearest `.yarnrc`
-///   (the project's or an ancestor's — yarn reads them all, nearest wins),
-///   resolved against the project like yarn resolves it against its cwd;
+/// - yarn classic's effective modules folder from the `.yarnrc` files at
+///   or above the project (see [`yarnrc_modules_folder`]);
 /// - Rush's `common/temp/node_modules` when `rush.json` is at the root:
 ///   rush runs pnpm there, so every transitive dep lives in its `.pnpm`
 ///   store and the projects' own `node_modules` hold only links to their
@@ -45,10 +44,7 @@ const SKIP_DIRS: &[&str] = &[
 /// Only existing directories are returned.
 pub(super) fn configured_install_roots(start_path: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(folder) = yarnrc_modules_folder(start_path)
-        .as_deref()
-        .and_then(normalize_modules_folder)
-    {
+    if let Some(folder) = yarnrc_modules_folder(start_path) {
         roots.push(start_path.join(folder));
     }
     if start_path.join("rush.json").is_file() {
@@ -80,26 +76,64 @@ pub(super) fn merge_configured_install_roots(
     walked
 }
 
-/// The `--modules-folder` value from the nearest `.yarnrc` at or above
-/// `start_path`, if any `.yarnrc` sets it. Read with
-/// [`crate::utils::fs::read_regular_to_string_sync`]: the file belongs to
+/// The modules folder yarn classic installs the project at `start_path`
+/// into, as a path relative to the project, from the `.yarnrc` files at or
+/// above it. Mirrors yarn 1.x's rc handling:
+/// - each key merges through the rc hierarchy on its own, the nearest
+///   `.yarnrc` defining it winning;
+/// - a path value is resolved against the directory of the `.yarnrc` that
+///   defines it, not the project (`/repo/.yarnrc` with
+///   `--modules-folder project/deps` installs `/repo/project` into
+///   `/repo/project/deps`);
+/// - `--install.modules-folder` wins over `--modules-folder` wherever
+///   either is defined, since yarn appends command-scoped args after the
+///   general ones.
+///
+/// The resolved folder must lie strictly inside the project (see
+/// [`resolve_modules_folder`]), else `None`. Read with
+/// [`crate::utils::fs::read_regular_to_string_sync`]: the files belong to
 /// the (untrusted) project, and a FIFO planted there would wedge a plain
 /// read forever.
 fn yarnrc_modules_folder(start_path: &Path) -> Option<String> {
-    start_path.ancestors().find_map(|dir| {
-        let rc = crate::utils::fs::read_regular_to_string_sync(&dir.join(".yarnrc")).ok()?;
-        parse_yarnrc_modules_folder(&rc)
-    })
+    let mut general: Option<(&Path, String)> = None;
+    let mut install: Option<(&Path, String)> = None;
+    for dir in start_path.ancestors() {
+        if general.is_some() && install.is_some() {
+            break;
+        }
+        let Ok(rc) = crate::utils::fs::read_regular_to_string_sync(&dir.join(".yarnrc")) else {
+            continue;
+        };
+        let found = parse_yarnrc_modules_folder(&rc);
+        if general.is_none() {
+            general = found.general.map(|value| (dir, value));
+        }
+        if install.is_none() {
+            install = found.install.map(|value| (dir, value));
+        }
+    }
+    let (rc_dir, value) = install.or(general)?;
+    let project_in_rc_dir = start_path
+        .strip_prefix(rc_dir)
+        .ok()?
+        .components()
+        .map(|c| c.as_os_str().to_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    resolve_modules_folder(&project_in_rc_dir, &value)
 }
 
-/// Reduce a `--modules-folder` value to plain `a/b` segments under the
-/// project, or `None`. The value comes from the project being scanned and
-/// names a tree apply later WRITES patch content into, so (like composer's
-/// `config.vendor-dir`) only a relative subpath is honored: `./deps` and
-/// `lib/./deps` resolve, `..` is resolved lexically, and a value that is
-/// absolute, drive-qualified, climbs above the project root or reduces to
-/// it fails closed — the project then discovers nothing there, as before.
-fn normalize_modules_folder(raw: &str) -> Option<String> {
+/// Resolve a `.yarnrc` modules-folder `raw` value against the directory of
+/// the `.yarnrc` that defines it, given the project's path below that
+/// directory (`project_in_rc_dir`, empty when the `.yarnrc` is the
+/// project's own), into plain `a/b` segments relative to the project, or
+/// `None`. The value comes from the project being scanned and names a
+/// tree apply later WRITES patch content into, so (like composer's
+/// `config.vendor-dir`) only a relative value resolving strictly inside
+/// the project is honored: `./deps` and `lib/./deps` resolve, `..` is
+/// resolved lexically, and a value that is absolute, drive-qualified, or
+/// resolves outside the project or to the project itself fails closed —
+/// the project then discovers nothing there, as before.
+fn resolve_modules_folder(project_in_rc_dir: &[String], raw: &str) -> Option<String> {
     if raw.starts_with(['/', '\\']) {
         return None;
     }
@@ -113,16 +147,32 @@ fn normalize_modules_folder(raw: &str) -> Option<String> {
             other => segments.push(other),
         }
     }
-    let joined = segments.join("/");
-    (!segments.is_empty() && path_safety::is_safe_multi_segment(&joined)).then_some(joined)
+    let inside = segments.get(project_in_rc_dir.len()..)?;
+    let at_project = segments.iter().zip(project_in_rc_dir).all(|(s, p)| s == p);
+    if !at_project || inside.is_empty() {
+        return None;
+    }
+    let joined = inside.join("/");
+    path_safety::is_safe_multi_segment(&joined).then_some(joined)
 }
 
-/// The `--modules-folder` (or command-scoped `--install.modules-folder`)
-/// value of a yarn classic `.yarnrc`. The file is yarn's lockfile syntax:
-/// one `key value` pair per line, either side optionally double-quoted, an
-/// optional `:` after the key, `#` comment lines. The last setting wins.
-fn parse_yarnrc_modules_folder(rc: &str) -> Option<String> {
-    let mut found = None;
+/// The modules-folder settings of one yarn classic `.yarnrc`, kept apart
+/// because yarn merges and applies them separately.
+#[derive(Debug, Default, PartialEq)]
+struct YarnrcModulesFolder {
+    /// `--modules-folder`.
+    general: Option<String>,
+    /// `--install.modules-folder`.
+    install: Option<String>,
+}
+
+/// The `--modules-folder` and command-scoped `--install.modules-folder`
+/// values of a yarn classic `.yarnrc`. The file is yarn's lockfile
+/// syntax: one `key value` pair per line, either side optionally
+/// double-quoted, an optional `:` after the key, `#` comment lines. For
+/// each key the last setting wins.
+fn parse_yarnrc_modules_folder(rc: &str) -> YarnrcModulesFolder {
+    let mut found = YarnrcModulesFolder::default();
     for line in rc.trim_start_matches('\u{feff}').lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -131,14 +181,16 @@ fn parse_yarnrc_modules_folder(rc: &str) -> Option<String> {
         let Some((key, rest)) = split_yarnrc_token(line, true) else {
             continue;
         };
-        if key != "--modules-folder" && key != "--install.modules-folder" {
-            continue;
-        }
+        let slot = match key.as_str() {
+            "--modules-folder" => &mut found.general,
+            "--install.modules-folder" => &mut found.install,
+            _ => continue,
+        };
         let rest = rest.trim_start();
         let rest = rest.strip_prefix(':').unwrap_or(rest).trim_start();
         if let Some((value, _)) = split_yarnrc_token(rest, false) {
             if !value.is_empty() {
-                found = Some(value);
+                *slot = Some(value);
             }
         }
     }
@@ -4319,16 +4371,39 @@ mod tests {
     /// CRLF, a Windows drive path, and last-setting-wins.
     #[test]
     fn test_parse_yarnrc_modules_folder() {
-        let parse = parse_yarnrc_modules_folder;
+        let parse = |rc: &str| parse_yarnrc_modules_folder(rc).general;
         assert_eq!(parse("--modules-folder deps\n").as_deref(), Some("deps"));
         assert_eq!(
             parse("\"--modules-folder\" \"./my deps\"\n").as_deref(),
             Some("./my deps")
         );
         assert_eq!(parse("--modules-folder: lib\n").as_deref(), Some("lib"));
+        // The command-scoped key is kept apart from the general one, in
+        // either line order: yarn merges and applies them separately.
+        for rc in [
+            "--install.modules-folder specific\n--modules-folder general\n",
+            "--modules-folder general\n--install.modules-folder specific\n",
+        ] {
+            assert_eq!(
+                parse_yarnrc_modules_folder(rc),
+                YarnrcModulesFolder {
+                    general: Some("general".into()),
+                    install: Some("specific".into()),
+                },
+                "{rc:?}"
+            );
+        }
         assert_eq!(
-            parse("--install.modules-folder vendor_modules").as_deref(),
-            Some("vendor_modules")
+            parse_yarnrc_modules_folder("--install.modules-folder vendor_modules"),
+            YarnrcModulesFolder {
+                general: None,
+                install: Some("vendor_modules".into()),
+            }
+        );
+        // Other command scopes are not the install's.
+        assert_eq!(
+            parse_yarnrc_modules_folder("--add.modules-folder x\n"),
+            YarnrcModulesFolder::default()
         );
         assert_eq!(
             parse("\u{feff}# comment\r\nyarn-offline-mirror \"./m\"\r\n--modules-folder deps\r\n")
@@ -4356,7 +4431,11 @@ mod tests {
             "--modules-folder\n",
             "--modules-folder \"unterminated\n",
         ] {
-            assert_eq!(parse(rc), None, "{rc:?}");
+            assert_eq!(
+                parse_yarnrc_modules_folder(rc),
+                YarnrcModulesFolder::default(),
+                "{rc:?}"
+            );
         }
     }
 
@@ -4418,11 +4497,16 @@ mod tests {
             .unwrap();
         assert_eq!(found.len(), 1);
 
-        // An ancestor's .yarnrc applies too; the nearest one wins.
+        // An ancestor's .yarnrc applies too (its value resolved against
+        // its own directory); the nearest one wins.
         let member = root.join("packages/member");
         write_pkg(&member.join("lib/ms"), "ms", "2.1.3");
         std::fs::write(member.join("package.json"), r#"{"name":"member"}"#).unwrap();
-        std::fs::write(root.join(".yarnrc"), "--modules-folder lib\n").unwrap();
+        std::fs::write(
+            root.join(".yarnrc"),
+            "--modules-folder packages/member/lib\n",
+        )
+        .unwrap();
         let roots = crawler
             .get_node_modules_paths(&local_options(&member))
             .await
@@ -4522,8 +4606,8 @@ mod tests {
     /// `.`/`..` resolve lexically, and an absolute, drive-qualified,
     /// escaping or empty value is refused.
     #[test]
-    fn test_normalize_modules_folder() {
-        let n = normalize_modules_folder;
+    fn test_resolve_modules_folder() {
+        let n = |raw: &str| resolve_modules_folder(&[], raw);
         assert_eq!(n("deps").as_deref(), Some("deps"));
         assert_eq!(n("./deps/").as_deref(), Some("deps"));
         assert_eq!(n("lib/./deps").as_deref(), Some("lib/deps"));
@@ -4542,6 +4626,104 @@ mod tests {
             "C:deps",
         ] {
             assert_eq!(n(raw), None, "{raw:?}");
+        }
+        // Defined by an ancestor `.yarnrc`: resolved against that file's
+        // directory, then kept only when strictly inside the project.
+        let project = ["project".to_string()];
+        let a = |raw: &str| resolve_modules_folder(&project, raw);
+        assert_eq!(a("project/deps").as_deref(), Some("deps"));
+        assert_eq!(a("./project/./lib\\deps").as_deref(), Some("lib/deps"));
+        assert_eq!(a("x/../project/deps").as_deref(), Some("deps"));
+        for raw in [
+            "deps",
+            "project",
+            "project/..",
+            "../project/deps",
+            "projectx/deps",
+            "..",
+        ] {
+            assert_eq!(a(raw), None, "{raw:?}");
+        }
+    }
+
+    /// REVIEW (#520): a modules folder inherited from an ancestor
+    /// `.yarnrc` resolves against that file's directory, as yarn 1.x does:
+    /// `/repo/.yarnrc` `--modules-folder project/deps` installs
+    /// `/repo/project` into `/repo/project/deps`, not
+    /// `/repo/project/project/deps`. A value resolving outside the project
+    /// (here the sibling `/repo/deps`) is still refused.
+    #[tokio::test]
+    async fn test_inherited_yarnrc_modules_folder_resolves_against_its_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let project = repo.join("project");
+        write_pkg(&project.join("deps/ms"), "ms", "2.1.3");
+        write_pkg(&repo.join("deps/ms"), "ms", "2.1.3");
+        let crawler = NpmCrawler::new();
+
+        std::fs::write(repo.join(".yarnrc"), "--modules-folder project/deps\n").unwrap();
+        let roots = crawler
+            .get_node_modules_paths(&local_options(&project))
+            .await
+            .unwrap();
+        assert_eq!(roots, vec![project.join("deps")]);
+
+        std::fs::write(repo.join(".yarnrc"), "--modules-folder deps\n").unwrap();
+        let roots = crawler
+            .get_node_modules_paths(&local_options(&project))
+            .await
+            .unwrap();
+        assert!(roots.is_empty(), "{roots:?}");
+    }
+
+    /// REVIEW (#520): `--install.modules-folder` wins over
+    /// `--modules-folder` whatever their line order, and when they come
+    /// from different `.yarnrc` files (yarn merges each key through the
+    /// hierarchy on its own, then appends install-scoped args after the
+    /// general ones).
+    #[test]
+    fn test_install_scoped_modules_folder_takes_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let project = repo.join("project");
+        write_pkg(&project.join("specific/ms"), "ms", "2.1.3");
+        write_pkg(&project.join("general/ms"), "ms", "2.1.3");
+        let roots_for = |project_rc: Option<&str>, repo_rc: Option<&str>| {
+            for (dir, rc) in [(&project, project_rc), (&repo.to_path_buf(), repo_rc)] {
+                let path = dir.join(".yarnrc");
+                match rc {
+                    Some(rc) => std::fs::write(&path, rc).unwrap(),
+                    None => {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+            NpmCrawler::find_local_node_modules_dirs(&project)
+        };
+        let want = vec![project.join("specific")];
+        for (project_rc, repo_rc) in [
+            (
+                Some("--install.modules-folder specific\n--modules-folder general\n"),
+                None,
+            ),
+            (
+                Some("--modules-folder general\n--install.modules-folder specific\n"),
+                None,
+            ),
+            (
+                Some("--modules-folder general\n"),
+                Some("--install.modules-folder project/specific\n"),
+            ),
+            (
+                Some("--install.modules-folder specific\n"),
+                Some("--modules-folder project/general\n"),
+            ),
+        ] {
+            assert_eq!(
+                roots_for(project_rc, repo_rc),
+                want,
+                "{project_rc:?} / {repo_rc:?}"
+            );
         }
     }
 
