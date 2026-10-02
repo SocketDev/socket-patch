@@ -411,12 +411,7 @@ pub(crate) fn is_default_registry(segment: &str, options: Option<&Map<String, Va
     if segment.is_empty() {
         return true;
     }
-    let alias = match options.and_then(|o| o.get("default-registry-alias")) {
-        None | Some(Value::Null) => Some("npm"),
-        Some(Value::String(alias)) => Some(alias.as_str()),
-        Some(_) => None,
-    };
-    if alias == Some(segment) {
+    if default_registry_alias(options) == Some(segment) {
         return true;
     }
     let Some(registry) = options
@@ -435,6 +430,58 @@ pub(crate) fn is_default_registry(segment: &str, options: Option<&Map<String, Va
     is_registry_url_segment(segment, options)
 }
 
+/// The lock's default registry alias: `default-registry-alias`, else
+/// `npm` (vlt's `defaultRegistryName`). `None` when the option is not a
+/// string.
+pub(crate) fn default_registry_alias(options: Option<&Map<String, Value>>) -> Option<&str> {
+    match options.and_then(|o| o.get("default-registry-alias")) {
+        None | Some(Value::Null) => Some("npm"),
+        Some(Value::String(alias)) => Some(alias.as_str()),
+        Some(_) => None,
+    }
+}
+
+/// The registry base URL (with a trailing `/`) a decoded DepID registry
+/// segment names, given the lock's `options`, as vlt hydrates the DepID
+/// (`@vltpkg/dep-id` `hydrateTuple`, `@vltpkg/spec`):
+/// - an http(s) URL segment is its own base;
+/// - a named segment is its `options.registries` URL when the lock maps it;
+/// - the empty segment, and an unmapped segment that still names the
+///   default registry ([`is_default_registry`]), is `options.registry`,
+///   else the default alias's `options.registries` URL, else the public
+///   npm registry (`registry ?? registries[default-registry-alias]`);
+/// - any other segment is `None`: the lock names an alias it never maps.
+pub(crate) fn registry_base(segment: &str, options: Option<&Map<String, Value>>) -> Option<String> {
+    let string = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+            .map(with_trailing_slash)
+    };
+    let alias_url = |alias: &str| {
+        string(
+            options
+                .and_then(|o| o.get("registries"))
+                .and_then(|r| r.get(alias)),
+        )
+    };
+    if reqwest::Url::parse(segment).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
+        return Some(with_trailing_slash(segment));
+    }
+    if let Some(base) = Some(segment).filter(|s| !s.is_empty()).and_then(alias_url) {
+        return Some(base);
+    }
+    if !is_default_registry(segment, options) {
+        return None;
+    }
+    let base = string(options.and_then(|o| o.get("registry")))
+        .or_else(|| default_registry_alias(options).and_then(alias_url))
+        .unwrap_or_else(|| {
+            with_trailing_slash(crate::vendor::registry_fetch::DEFAULT_NPM_REGISTRY)
+        });
+    Some(base)
+}
+
 /// Is `segment` an http(s) URL naming `options.registry` (a trailing `/`
 /// aside)?
 pub(crate) fn is_registry_url_segment(segment: &str, options: Option<&Map<String, Value>>) -> bool {
@@ -447,6 +494,53 @@ pub(crate) fn is_registry_url_segment(segment: &str, options: Option<&Map<String
     reqwest::Url::parse(segment).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
         && with_trailing_slash(segment) == with_trailing_slash(registry)
 }
+
+/// `(segment, lock options, registry_base)` over the inputs where the two
+/// former private copies (lock inventory and hosted restore) disagreed.
+/// Every caller's tests assert against this one table.
+#[cfg(test)]
+pub(crate) const REGISTRY_BASE_CASES: &[(&str, &str, Option<&str>)] = &[
+    ("", "{}", Some("https://registry.npmjs.org/")),
+    ("npm", "{}", Some("https://registry.npmjs.org/")),
+    (
+        "",
+        r#"{"registry":"https://a.example"}"#,
+        Some("https://a.example/"),
+    ),
+    (
+        "",
+        r#"{"registry":"https://a.example/","registries":{"npm":"https://b.example/"}}"#,
+        Some("https://a.example/"),
+    ),
+    (
+        "npm",
+        r#"{"registry":"https://a.example/","registries":{"npm":"https://b.example/"}}"#,
+        Some("https://b.example/"),
+    ),
+    (
+        "npm",
+        r#"{"registries":{"npm":"https://b.example/npm"}}"#,
+        Some("https://b.example/npm/"),
+    ),
+    (
+        "corp",
+        r#"{"default-registry-alias":"corp","registries":{"corp":"https://c.example/"}}"#,
+        Some("https://c.example/"),
+    ),
+    (
+        "",
+        r#"{"default-registry-alias":"corp","registries":{"corp":"https://c.example/"}}"#,
+        Some("https://c.example/"),
+    ),
+    (
+        "corp",
+        r#"{"registries":{"corp":"https://c.example/"}}"#,
+        Some("https://c.example/"),
+    ),
+    ("corp", r#"{"registry":"https://a.example/"}"#, None),
+    ("corp", "{}", None),
+    ("https://u.example", "{}", Some("https://u.example/")),
+];
 
 // ── lock-level sniff ─────────────────────────────────────────────────────
 
@@ -1672,6 +1766,23 @@ mod tests {
                 "{registry}"
             );
         }
+    }
+
+    #[test]
+    fn registry_base_follows_vlt_dep_id_hydration() {
+        for (segment, opts, want) in REGISTRY_BASE_CASES {
+            let opts = options(opts);
+            assert_eq!(
+                registry_base(segment, Some(&opts)).as_deref(),
+                *want,
+                "{segment:?} with {opts:?}"
+            );
+        }
+        assert_eq!(
+            registry_base("npm", None).as_deref(),
+            Some("https://registry.npmjs.org/")
+        );
+        assert_eq!(registry_base("corp", None), None);
     }
 
     fn readable(text: &str) -> ParsedLock {

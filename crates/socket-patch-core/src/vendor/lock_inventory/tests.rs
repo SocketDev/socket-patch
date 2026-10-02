@@ -2699,6 +2699,33 @@ async fn vlt_default_registry_base_follows_the_lock_options() {
 }
 
 #[tokio::test]
+async fn vlt_inventory_resolves_registries_through_the_shared_registry_base() {
+    use crate::vendor::vlt_lock_text::REGISTRY_BASE_CASES;
+    for (segment, options, want) in REGISTRY_BASE_CASES {
+        // A URL segment is percent-encoded in a DepID; the table's other
+        // rows cover every precedence rule.
+        if segment.starts_with("http") {
+            continue;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let node = format!(r#""~{segment}~@s/a@1.0.0": [0,"@s/a","sha512-a=="]"#);
+        write(
+            tmp.path(),
+            "vlt-lock.json",
+            &vlt_lock(options, &[node.as_str()]),
+        )
+        .await;
+        let entries = inventory_vlt(tmp.path()).await.unwrap();
+        assert_eq!(entries.len(), 1, "{segment:?} {options}");
+        assert_eq!(
+            entries[0].resolved,
+            want.map(|base| format!("{base}@s/a/-/a-1.0.0.tgz")),
+            "{segment:?} {options}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn unreadable_vlt_locks_inventory_to_nothing() {
     let good = vlt_lock("{}", &[r#""~npm~a@1.0.0": [0,"a","sha512-a=="]"#]);
     for lock in [

@@ -9,8 +9,10 @@ use serde_json::{Map, Value};
 use crate::constants::npm_family::VLT_LOCK;
 use super::view::ProjectView;
 use crate::vendor::vlt_lock_text::{
-    is_default_registry, sniff_lock, split_dep_id, DepId, DepIdKind, LockSniff,
+    registry_base, sniff_lock, split_dep_id, DepId, DepIdKind, LockSniff,
 };
+
+use crate::vendor::registry_fetch::npm_tarball_url;
 
 use super::{http_url, LockIntegrity, LockfileEntry};
 
@@ -89,38 +91,6 @@ pub(crate) fn vlt_lock_model(text: &str) -> Result<VltLock, String> {
     })
 }
 
-fn with_slash(url: &str) -> String {
-    if url.ends_with('/') {
-        url.to_string()
-    } else {
-        format!("{url}/")
-    }
-}
-
-/// The registry base a node's segment names: the segment URL itself, the
-/// alias's `options.registries` URL, or for the default registry
-/// `options.registry`, `options.registries.npm`, else the public registry.
-/// `None` for an alias the options do not map.
-fn registry_base(segment: &str, options: Option<&Map<String, Value>>) -> Option<String> {
-    let option = |path: &[&str]| {
-        let mut value = options.map(|o| Value::Object(o.clone()))?;
-        for key in path {
-            value = value.get(*key)?.clone();
-        }
-        value.as_str().map(str::to_string)
-    };
-    if segment.starts_with("https://") || segment.starts_with("http://") {
-        return Some(with_slash(segment));
-    }
-    if is_default_registry(segment, options) {
-        let base = option(&["registry"])
-            .or_else(|| option(&["registries", "npm"]))
-            .unwrap_or_else(|| "https://registry.npmjs.org/".to_string());
-        return Some(with_slash(&base));
-    }
-    option(&["registries", segment]).map(|base| with_slash(&base))
-}
-
 /// The registry entries of a readable lock: every registry node whose slot
 /// [1] is its DepID name. The location is slot [3] when it is an http(s)
 /// URL (a Socket-hosted pin included: it is the installed pair), else the
@@ -135,10 +105,9 @@ pub(crate) fn vlt_registry_entries(lock: &VltLock) -> Vec<LockfileEntry> {
             if node.name != name {
                 return None;
             }
-            let bare = name.rsplit('/').next().unwrap_or(name);
             let resolved = node.location.as_deref().and_then(http_url).or_else(|| {
                 registry_base(&node.dep_id.first, options)
-                    .map(|base| format!("{base}{name}/-/{bare}-{version}.tgz"))
+                    .map(|base| npm_tarball_url(base.trim_end_matches('/'), name, version))
             });
             let integrity = node
                 .integrity

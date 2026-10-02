@@ -25,12 +25,10 @@ use serde_json::{Map, Value};
 use super::npm::{by_uuid, fetch_dists, read_or_refuse, refuse_all_in};
 use super::{Ctx, FormatResult, HostedPin, View};
 use crate::vendor::vlt_lock_text::{
-    entry_text, is_default_registry, nodes_block, parse_node_line, render_entry_line,
-    render_tuple_with_slots, sniff_lock, split_dep_id, split_lines, DepIdEra, DepIdKind, LockSniff,
+    default_registry_alias, entry_text, is_default_registry, nodes_block, parse_node_line,
+    registry_base, render_entry_line, render_tuple_with_slots, sniff_lock, split_dep_id,
+    split_lines, DepIdEra, DepIdKind, LockSniff,
 };
-
-/// The public npm registry, the default registry of an unconfigured lock.
-const NPM_REGISTRY: &str = "https://registry.npmjs.org/";
 
 /// One hosted node line to restore.
 struct Hit {
@@ -41,34 +39,6 @@ struct Hit {
     era: DepIdEra,
     /// The decoded registry segment of the DepID.
     segment: String,
-}
-
-/// The default alias of a lock (`default-registry-alias`, else `npm`).
-fn default_alias(options: Option<&Map<String, Value>>) -> &str {
-    options
-        .and_then(|o| o.get("default-registry-alias"))
-        .and_then(Value::as_str)
-        .unwrap_or("npm")
-}
-
-/// The registry base URL a default-registry segment resolves to.
-fn registry_base(segment: &str, options: Option<&Map<String, Value>>) -> String {
-    if reqwest::Url::parse(segment).is_ok_and(|u| matches!(u.scheme(), "http" | "https")) {
-        return segment.to_string();
-    }
-    let alias = if segment.is_empty() {
-        default_alias(options)
-    } else {
-        segment
-    };
-    let str_opt = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_string);
-    str_opt(
-        options
-            .and_then(|o| o.get("registries"))
-            .and_then(|r| r.get(alias)),
-    )
-    .or_else(|| str_opt(options.and_then(|o| o.get("registry"))))
-    .unwrap_or_else(|| NPM_REGISTRY.to_string())
 }
 
 /// The conventional tarball URL of `name@version` on `base`.
@@ -98,7 +68,7 @@ fn records_url(
         && options
             .and_then(|o| o.get("registries"))
             .is_some_and(Value::is_object)
-        && (segment.is_empty() || segment == default_alias(options))
+        && (segment.is_empty() || default_registry_alias(options) == Some(segment))
         && !under_configured_registry(segment, options)
 }
 
@@ -114,8 +84,7 @@ fn under_configured_registry(segment: &str, options: Option<&Map<String, Value>>
     else {
         return false;
     };
-    let resolved_prefix = format!("{}/", registry_base(segment, options).trim_end_matches('/'));
-    resolved_prefix.starts_with(registry)
+    registry_base(segment, options).is_some_and(|base| base.starts_with(registry))
 }
 
 pub(crate) async fn restore(
@@ -277,13 +246,18 @@ pub(crate) async fn restore(
             };
             let line = parse_node_line(lines[hit.line]).expect("the hit line parsed above");
             let json = |s: &str| serde_json::to_string(s).expect("a str serializes to JSON");
-            let slot3 = records_url(hit.era, &hit.segment, &siblings, options).then(|| {
-                json(&tarball_url(
-                    &registry_base(&hit.segment, options),
-                    &hit.name,
-                    &hit.version,
-                ))
-            });
+            let slot3 = if records_url(hit.era, &hit.segment, &siblings, options) {
+                let Some(base) = registry_base(&hit.segment, options) else {
+                    result.refuse(
+                        &hit.uuid,
+                        format!("{rel} maps no registry for the `{}` segment", hit.segment),
+                    );
+                    continue;
+                };
+                Some(json(&tarball_url(&base, &hit.name, &hit.version)))
+            } else {
+                None
+            };
             let tuple = render_tuple_with_slots(
                 &line.entry.elems,
                 Some(&json(&integrity)),
@@ -335,22 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_base_follows_the_segment() {
-        let o =
-            opts(r#"{"registries":{"npm":"https://mirror.example/npm/","corp":"https://corp/"}}"#);
-        assert_eq!(registry_base("", Some(&o)), "https://mirror.example/npm/");
-        assert_eq!(
-            registry_base("npm", Some(&o)),
-            "https://mirror.example/npm/"
-        );
-        assert_eq!(registry_base("corp", Some(&o)), "https://corp/");
-        assert_eq!(
-            registry_base("https://registry.example.com/", Some(&o)),
-            "https://registry.example.com/"
-        );
-        assert_eq!(registry_base("npm", None), NPM_REGISTRY);
-        let scalar = opts(r#"{"registry":"https://r.example/"}"#);
-        assert_eq!(registry_base("", Some(&scalar)), "https://r.example/");
+    fn tarball_url_keeps_the_scope_in_the_path() {
         assert_eq!(
             tarball_url("https://mirror.example/npm/", "@a/b", "1.0.0"),
             "https://mirror.example/npm/@a/b/-/b-1.0.0.tgz"
@@ -524,6 +483,51 @@ mod tests {
         );
         assert_eq!(after.matches(&upstream).count(), 2, "{after}");
         assert!(!after.contains("patch.socket.dev"));
+    }
+
+    /// Restore rebuilds slot [3] on the base the shared `registry_base`
+    /// resolves, for every default-registry row of the table, and refuses
+    /// every other row (the lock does not name vlt's default registry).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_resolves_registries_through_the_shared_registry_base() {
+        use crate::vendor::vlt_lock_text::REGISTRY_BASE_CASES;
+        let server = registry(&[("left-pad", "1.3.0", Some(LP_UPSTREAM))]).await;
+        std::env::set_var("SOCKET_NPM_REGISTRY", server.uri());
+        let url = hosted(LP_UUID, "left-pad-1.3.0.tgz");
+        for (segment, options, want) in REGISTRY_BASE_CASES {
+            if segment.starts_with("http") {
+                continue;
+            }
+            // A same-era sibling that records slot [3] makes restore write
+            // one for the pin.
+            let text = format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"options\": {options},\n  \"nodes\": {{\n    \"~{segment}~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-AA==\",\"{url}\"],\n    \"~{segment}~ms@2.1.3\": [0,\"ms\",\"sha512-M==\",\"https://x.example/ms/-/ms-2.1.3.tgz\"]\n  }},\n  \"edges\": {{}}\n}}\n"
+            );
+            let (outcome, after) =
+                run(&text, &[pin("pkg:npm/left-pad@1.3.0", LP_UUID)], false).await;
+            let opts = opts(options);
+            if is_default_registry(segment, Some(&opts)) {
+                let want = want.expect("a default registry always has a base");
+                assert!(
+                    refused(&outcome).is_empty(),
+                    "{segment:?} {options}: {:?}",
+                    refused(&outcome)
+                );
+                let upstream = format!(
+                    "[0,\"left-pad\",\"{LP_UPSTREAM}\",\"{want}left-pad/-/left-pad-1.3.0.tgz\"]"
+                );
+                assert!(after.contains(&upstream), "{segment:?} {options}: {after}");
+            } else {
+                let why = refused(&outcome);
+                assert!(
+                    why[0].contains("not on vlt's default registry"),
+                    "{segment:?} {options}: {why:?}"
+                );
+                assert_eq!(after, text);
+            }
+        }
+        std::env::remove_var("SOCKET_NPM_REGISTRY");
     }
 
     #[tokio::test]
