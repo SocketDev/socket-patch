@@ -17,9 +17,9 @@
       "cron": "40 3,9,15,21 * * *"
     },
     "refactor": {
-      "trigger_id": "trig_01NTdy2rEpze5NfvsG6RNs4v",
-      "name": "socket-patch architecture refactor",
-      "cron": "45 1,5,9,13,17,21 * * *"
+      "trigger_id": "trig_01YJDeWJdcV9oqp7vBEdYMAe",
+      "name": "socket-patch architecture refactor: highest leverage (hourly)",
+      "cron": "55 * * * *"
     }
   },
   "doc_targets": {
@@ -59,5 +59,8 @@
       "kind": "comment",
       "id": "DC_kwDOQS_zEM4BHZii"
     }
+  },
+  "retired_routines": {
+    "trig_01NTdy2rEpze5NfvsG6RNs4v": "socket-patch architecture refactor (every 4h); disabled 2026-10-02, replaced by the hourly highest-leverage routine"
   }
 }
