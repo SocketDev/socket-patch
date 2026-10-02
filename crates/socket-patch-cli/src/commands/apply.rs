@@ -2541,7 +2541,12 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
     }
     out.matched.sort();
     out.matched.dedup();
-    if !attempted && !out.failed {
+    // Nothing attempted. Gradle version dirs that hold none of a record's
+    // files (a pom-only entry, another classifier) are not installs of it:
+    // the variants stay unmatched (`package_not_installed`). A `~/.m2` copy
+    // no variant matches is a different distribution: an error, as before.
+    let gradle_only = copies.consumed.iter().all(|c| is_gradle_version_dir(c));
+    if !attempted && !out.failed && !gradle_only {
         out.failed = true;
         if args.prints_errors() {
             eprintln!(

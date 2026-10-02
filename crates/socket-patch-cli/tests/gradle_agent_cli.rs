@@ -651,6 +651,38 @@ fn unexpected_pristine_bytes_are_left_alone() {
     assert!(jars.iter().any(|(_, b)| *b == patched_jar()));
 }
 
+/// A Gradle version dir holding none of a record's files (here only the
+/// pom of a jar patch) is not an install of it: that patch is
+/// `package_not_installed`, the other one applies, and the run succeeds.
+#[test]
+fn gradle_copy_without_the_patched_file_is_not_installed() {
+    let f = fx(CENTRAL);
+    let version = f.gradle(&as_refs(&pristine_files()));
+    let other_pom: &[u8] = b"<project><artifactId>other</artifactId></project>\n";
+    prebuilt_common::fabricate_files21(
+        &f.home,
+        "com.example:other:1.0",
+        &[("other-1.0.pom", other_pom)],
+    );
+    let pristine = pristine_jar();
+    let patched = patched_jar();
+    f.manifest(&[
+        (PURL, &[(&format!("package/{JAR}"), &pristine, &patched)]),
+        (
+            "pkg:maven/com.example/other@1.0",
+            &[("package/other-1.0.jar", b"other jar", b"patched other jar")],
+        ),
+    ]);
+    let out = f.run(&["apply", "--offline"]);
+    out.ok();
+    assert_eq!(hash_copies(&version, JAR)[0].1, patched_jar());
+    assert!(
+        out.json.to_string().contains("package_not_installed"),
+        "{}",
+        out.json
+    );
+}
+
 // ── member-keyed records (#264) ─────────────────────────────────────────
 
 /// Offline, a member-keyed record cannot get the service-built jar:
