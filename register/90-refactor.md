@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-02T17:10Z · main @ bf0e0d1_
+_Last updated 2026-10-02T18:00Z · main @ 203e092_
 
 **In flight:**
 - [#572](https://github.com/SocketDev/socket-patch/pull/572): one hosted-PyPI-URL recognizer for hosted and vendored Pipenv. Issues #563 (E04, E49). State: ready, handed to the PR burn-down.
@@ -12,9 +12,9 @@ _Last updated 2026-10-02T17:10Z · main @ bf0e0d1_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #561 (E01): hosted NuGet sources via `formats::nuget` | 1 | 1 | 1 | L | 6 | skipped: `redirect/mod.rs` is changed by open PRs #552, #470, #465 |
-| 2 | #568 (C03): takeover honors `kept_artifact` via `vendored_backend`'s revert step | 1 | 0 | 1 | L | 4 | skipped: `scan/hosted.rs` is changed by open PRs #503, #470 |
-| 3 | E37: byte-identical `is_safe_{cargo,gem,nuget}_coordinate` + `normalize_version` copy | 0 | 0 | 4 | L | 4 | next; to verify (holds on `bf0e0d1`), no issue yet |
+| 1 | #561 (E01): hosted NuGet sources via `formats::nuget` | 1 | 1 | 1 | L | 6 | skipped: `redirect/mod.rs` is changed by open PR #552 (#470, #465 merged) |
+| 2 | #568 (C03): takeover honors `kept_artifact` via `vendored_backend`'s revert step | 1 | 0 | 1 | L | 4 | skipped: `scan/hosted.rs` is changed by open PR #503 |
+| 3 | E37: byte-identical `is_safe_{cargo,gem,nuget}_coordinate` + `normalize_version` copy | 0 | 0 | 4 | L | 4 | next when capacity frees; to verify, no issue yet; `vendor/gem.rs` also changed by open PR #552 |
 | 4 | #571 (C37): stream blob/diff bodies | 1 | 0 | 0 | M | 1 | maintainer: no size cap, stream instead; changes `fetch_binary`'s return shape |
 | 5 | #569 (C01): stream zip entry comparison | 1 | 0 | 0 | M | 1 | maintainer: data is trusted, stream for performance instead of capping |
 
