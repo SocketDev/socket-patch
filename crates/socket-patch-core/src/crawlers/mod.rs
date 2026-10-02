@@ -52,7 +52,11 @@ mod architecture_tests {
                 continue;
             }
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            let src = std::fs::read_to_string(&path).expect("read crawler source");
+            // A Windows (core.autocrlf) checkout has CRLF lines; normalize so
+            // the `\n`-joined test-module markers below still match.
+            let src = std::fs::read_to_string(&path)
+                .expect("read crawler source")
+                .replace("\r\n", "\n");
             // Production code ends at the first in-file test module
             // (`mod tests`, or this guard in `mod.rs`); earlier
             // `#[cfg(test)] mod oracle;` declarations are only one line.
