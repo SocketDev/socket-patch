@@ -1396,6 +1396,13 @@ fn confirm(
             if rewrite.refused_pnpm_uuids.contains(uuid) {
                 return ProbeStep::Decided(false);
             }
+            // A yarn berry pin is the URL-keyed lock entry AND the manifest
+            // `resolutions` routing to it; the URL in `yarn.lock` alone (the
+            // routing removed, a refused re-pin) installs nothing, so the
+            // berry rewriter's own report decides every dep its lock holds.
+            if rewrite.yarn_berry_uuids.contains(uuid) {
+                return ProbeStep::Decided(rewrite.confirmed_yarn_berry_uuids.contains(uuid));
+            }
             // Cargo is transactional: the rewriter reports exactly which
             // patch uuids FULLY landed (manifest pin + lock + registry
             // block). Substring presence must never confirm a cargo dep —
@@ -1714,6 +1721,88 @@ mod tests {
             &BTreeSet::new(),
         );
         assert_eq!(confirmed.len(), 1, "{confirmed:?}");
+    }
+
+    /// Review of #465: a hosted berry pin whose `resolutions` routing was
+    /// removed keeps its URL-keyed lock entry. The rewriter refuses to re-pin
+    /// it (the routing is not ours to recreate silently), so nothing
+    /// installs the patch — and the URL in `yarn.lock` must not confirm it
+    /// (a confirmed dep feeds the in-run VEX `not_affected` exemption).
+    #[test]
+    fn an_orphaned_berry_lock_pin_is_not_confirmed() {
+        use crate::patch::redirect::{rewrite_registry_redirect, Integrity};
+        let url = "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/uuid/left-pad-1.3.0.tgz";
+        let candidate = Candidate {
+            purl: "pkg:npm/left-pad@1.3.0".into(),
+            dep: DepOverride {
+                ecosystem: "npm".into(),
+                name: "left-pad".into(),
+                namespace: None,
+                version: "1.3.0".into(),
+                token: "tok".into(),
+                patch_uuid: "uuid".into(),
+                artifact_url: url.into(),
+                registry_override: None,
+                integrity: Integrity {
+                    yarn_berry10c0: Some(format!("10c0/{}", "7".repeat(128))),
+                    ..Default::default()
+                },
+            },
+        };
+        let manifest = "{\n  \"name\": \"app\"\n}\n".to_string();
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            format!(
+                "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\"left-pad@npm:^1.3.0\":\n  \
+                 version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n  \
+                 languageName: node\n  linkType: hard\n",
+                "3".repeat(128)
+            ),
+        );
+        files.insert("package.json".to_string(), manifest.clone());
+        let run = |files: &BTreeMap<String, String>| {
+            let rewrite = rewrite_registry_redirect(files, std::slice::from_ref(&candidate.dep));
+            let confirmed = confirm(
+                files,
+                &rewrite,
+                std::slice::from_ref(&candidate),
+                false,
+                &BTreeSet::new(),
+            );
+            (rewrite, confirmed)
+        };
+        let (first, confirmed) = run(&files);
+        assert_eq!(confirmed.len(), 1, "{:?}", first.warnings);
+        let pinned_lock = first.files["yarn.lock"].clone();
+        assert!(
+            pinned_lock.contains(&format!("\"left-pad@{url}\":")),
+            "{pinned_lock}"
+        );
+
+        // Rescan with the pin intact: still confirmed.
+        let mut pinned = files.clone();
+        pinned.insert("yarn.lock".to_string(), pinned_lock.clone());
+        pinned.insert(
+            "package.json".to_string(),
+            first.files["package.json"].clone(),
+        );
+        assert_eq!(run(&pinned).1.len(), 1);
+
+        // The routing removed: the URL is still in the lock, nothing installs it.
+        let mut orphan = files;
+        orphan.insert("yarn.lock".to_string(), pinned_lock);
+        orphan.insert("package.json".to_string(), manifest);
+        let (rewrite, confirmed) = run(&orphan);
+        assert!(
+            rewrite
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_yarn_berry_resolutions_conflict"),
+            "{:?}",
+            rewrite.warnings
+        );
+        assert!(confirmed.is_empty(), "{confirmed:?}");
     }
 
     fn gem_candidate() -> Candidate {

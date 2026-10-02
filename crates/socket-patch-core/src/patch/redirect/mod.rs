@@ -239,6 +239,24 @@ pub struct RewriteResult {
     /// An incomplete pnpm rewrite must not be confirmed by finding its URL
     /// in another instance, a comment, or another lockfile.
     pub refused_pnpm_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids whose package version a yarn berry `yarn.lock` locks, so
+    /// the berry rewriter alone decides them: the hosted pin is the
+    /// URL-keyed lock entry AND the root `package.json` `resolutions`
+    /// routing to it, and a URL found in the lock proves only the first half.
+    // Unserialized when empty, so the blessed rewrite goldens (which hash the
+    // whole result) are unchanged by these fields for every non-berry case.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub yarn_berry_uuids: std::collections::BTreeSet<String>,
+    /// The [`Self::yarn_berry_uuids`] whose pin is complete — lock entry and
+    /// manifest routing — written by this run or already in place.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub confirmed_yarn_berry_uuids: std::collections::BTreeSet<String>,
     pub python_lock_uuids: std::collections::BTreeSet<String>,
     pub confirmed_python_lock_uuids: std::collections::BTreeSet<String>,
     pub refused_python_lock_uuids: std::collections::BTreeSet<String>,
@@ -527,6 +545,8 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         confirmed_pdm_uuids,
         refused_pdm_uuids,
         refused_pnpm_uuids,
+        yarn_berry_uuids,
+        confirmed_yarn_berry_uuids,
         python_lock_uuids,
         confirmed_python_lock_uuids,
         refused_python_lock_uuids,
@@ -552,6 +572,10 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.confirmed_pdm_uuids.extend(confirmed_pdm_uuids);
     result.refused_pdm_uuids.extend(refused_pdm_uuids);
     result.refused_pnpm_uuids.extend(refused_pnpm_uuids);
+    result.yarn_berry_uuids.extend(yarn_berry_uuids);
+    result
+        .confirmed_yarn_berry_uuids
+        .extend(confirmed_yarn_berry_uuids);
     result.python_lock_uuids.extend(python_lock_uuids);
     result
         .confirmed_python_lock_uuids
@@ -3383,6 +3407,10 @@ fn rewrite_yarn_berry(
     let mut changed = false;
     for dep in &npm {
         let fname = full_name(dep);
+        // This rewriter alone decides the dep from here on (see
+        // [`RewriteResult::yarn_berry_uuids`]); only a lock that does not
+        // lock its version at all hands it back to the other lockfiles.
+        result.yarn_berry_uuids.insert(dep.patch_uuid.clone());
         // The API hands the prefixed `10c0/<hex>`; a yarn 4.0.x lock spells
         // its checksums bare, and `--immutable` rejects a respelled one.
         let Some(checksum) = dep
@@ -3630,6 +3658,9 @@ fn rewrite_yarn_berry(
                     detail: format!("no npm: lock entry resolving {fname}@{}", dep.version),
                 });
             }
+            if !matched_any && !shared_descriptor {
+                result.yarn_berry_uuids.remove(&dep.patch_uuid);
+            }
             continue;
         };
         let Some(manifest_obj) = manifest.as_mut().and_then(Value::as_object_mut) else {
@@ -3722,6 +3753,9 @@ fn rewrite_yarn_berry(
             moved_keys.push(new_key);
             changed = true;
         }
+        result
+            .confirmed_yarn_berry_uuids
+            .insert(dep.patch_uuid.clone());
     }
     if changed {
         berry_reposition_blocks(&mut blocks, &moved_keys, was_sorted);
@@ -3747,6 +3781,9 @@ fn rewrite_yarn_berry(
                         e.kind != "redirect_yarn_berry_entry"
                             && e.kind != "redirect_yarn_berry_resolution"
                     });
+                    for dep in &npm {
+                        result.confirmed_yarn_berry_uuids.remove(&dep.patch_uuid);
+                    }
                     result.warnings.push(RewriteWarning {
                         code: "redirect_yarn_berry_manifest_missing".into(),
                         detail: "the root package.json could not be re-serialized; nothing \
@@ -8045,10 +8082,13 @@ mod tests {
             first.files["yarn.lock"].clone(),
             first.files["package.json"].clone(),
         );
+        assert!(first.confirmed_yarn_berry_uuids.contains(BERRY_UUID));
         let mut again = RewriteResult::default();
         rewrite_yarn_berry(&pinned, std::slice::from_ref(&ovr), &mut again);
         assert!(again.warnings.is_empty(), "{:?}", again.warnings);
         assert!(again.files.is_empty(), "repeat run rewrites nothing: {:?}", again.files);
+        // A pin already complete is confirmed without a write.
+        assert!(again.confirmed_yarn_berry_uuids.contains(BERRY_UUID));
 
         let new_url = url.replace(BERRY_UUID, "22222222-2222-4222-8222-222222222222");
         let newer = berry_override("left-pad", "1.3.0", &new_url, &checksum);
@@ -8060,6 +8100,47 @@ mod tests {
         assert!(!out.contains(BERRY_UUID), "{out}");
         let manifest: Value = serde_json::from_str(&repin.files["package.json"]).unwrap();
         assert_eq!(manifest["resolutions"], json!({"left-pad@npm:^1.3.0": new_url}));
+    }
+
+    /// The URL-keyed lock entry alone is half a pin: with its manifest
+    /// `resolutions` routing removed, yarn installs nothing from it, so the
+    /// rewriter owns the dep yet never confirms it — a URL in the lock must
+    /// not let hosted confirmation (and the in-run VEX) attest the patch.
+    #[test]
+    fn yarn_berry_pin_without_its_routing_is_owned_but_never_confirmed() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let mut first = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut first,
+        );
+        let orphan = berry_files(first.files["yarn.lock"].clone(), berry_manifest());
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&orphan, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty(), "{:?}", r.files);
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_yarn_berry_resolutions_conflict"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.yarn_berry_uuids.contains(BERRY_UUID));
+        assert!(r.confirmed_yarn_berry_uuids.is_empty());
+
+        // A lock that does not lock the version hands the dep back.
+        let other = berry_override("left-pad", "9.9.9", &url, &checksum);
+        let mut none = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), berry_manifest()),
+            std::slice::from_ref(&other),
+            &mut none,
+        );
+        assert!(none.yarn_berry_uuids.is_empty());
+        assert!(none.confirmed_yarn_berry_uuids.is_empty());
     }
 
     /// A lock written by an earlier release carries the old
