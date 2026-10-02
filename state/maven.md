@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Maven bug-hunt routine (label pm:maven).
 
-Last updated: 2026-10-02 (run 7), main `61cfb9b`, latest release 4.0.0.
+Last updated: 2026-10-02 (run 8), main `61cfb9b`, latest release 4.0.0. Maven 3.9.16 (newest 3.9) joined the matrix in run 8.
 
 ## Coverage matrix
 
@@ -41,6 +41,16 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 | 3.9.11 | fail #535 | fail #535 | pass | fail #534 | fail #534 | pass |
 | 4.0.0-rc-7 | fail #535 | n/a (Maven 4 ignores the form) | pass | fail #534 | untested | untested |
 
+### v5 vendored reactor: maven.config `#` comment lines (run 8, Linux)
+
+| Maven | `# -Dct.version=<base>` over newer pom prop | `# -Dct.version=<newer>` over base pom prop | controls (no config / `# note`) | stock capstones (reactor, single-POM, hosted) |
+| --- | --- | --- | --- | --- |
+| 3.6.3 | n/a (Maven rejects `#`) | n/a | n/a | reactor pass; single-POM blocked (network) |
+| 3.8.8 | n/a (Maven rejects `#`) | n/a | n/a | reactor blocked (network) |
+| 3.9.11 | fail #550 | fail #550 | pass | pass (earlier runs) |
+| 3.9.16 | fail #550 | fail #550 | pass | pass / pass / pass |
+| 4.0.0-rc-7 | fail #550 | fail #550 | pass | pass (earlier runs) |
+
 ### v5 hosted Trusted Checksums boundary (#258, run 5, Linux)
 
 | Maven | `e2e_redirect_maven_build` (unenforced warning ⇔ tamper enforcement) |
@@ -66,13 +76,14 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 
 0. **Maintainer request (global `-g`)**: mostly covered in run 3 (see the matrix and the 20261001T061707Z entry). Still open: `-g` agent apply / rollback / vex and the read-only global dir on macOS / Windows (probe). Keep this item until those cells pass or fail. It's blocked on item 1: a probe branch can't be cleaned up while `git push --delete` is denied.
 1. A maintainer needs to delete the stale probe branches `bughunt/maven/20260930-vendored-paths` and `bughunt/maven/20261001-global-repo`. `git push --delete` hung up in run 4 and was denied by the session permission policy in runs 5 and 6 (not retried in run 7). Probe commits must use the default (signed) git identity. Don't override `user.email`.
-2. Other user-property sources vs the reactor planner (#535 family): `MAVEN_ARGS` (Maven 4), `#` comment lines in maven.config on Maven 4, and `-D` values containing `${...}`.
+2. Other user-property sources vs the reactor planner (#535 / #550 family): `-D` values containing `${...}` (Maven 4 interpolation). `#` comments are done (#550). `MAVEN_ARGS` / command-line `-D` can't be seen statically, so they're out of scope unless documented otherwise.
 3. Hosted: a pre-existing `.mvn/maven.config` with a user `summaryFile.basedir` / `checksumAlgorithms=SHA-512` / `failIfMissing=true`, plus a rollback round trip with a user `checksums.sha256`, end to end (`maven_trusted_checksums_left`).
 4. Other Maven 4.1.0 model features vs the reactor planner: CI-friendly `${revision}` parents, implicit `<subprojects>`.
 5. Reactor (auto + `none`) and single-POM capstones on 3.8.8, and single-POM on 3.6.3. The harness warm-up has no mirror hook and Central 429s it. A local variant with a `mirrorOf central` → localhost caching mirror works.
 6. The #459 reverse case and BOM bump on 3.6.3 / 3.8.8 / 4.0.0-rc-7.
 7. Windows long paths + CRLF checkout of `.socket/vendor/maven2` (the `* -text` `.gitattributes`).
 8. The reactor capstone variants from run 4 on 4.0.0-rc-7 (comma / `%2F` paths, existing CRLF `maven.config`).
+9. The v4.0.0-era cells on 3.9.16 (hosted re-run idempotency, `%XX` path, `<repositories/>`).
 
 ## Known non-bugs
 
@@ -95,3 +106,4 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 - Hosted single-POM with a versionless dep + a BOM managing another version: the hosted dM insertion overrides the BOM (a downgrade), which #265 already names. Don't re-file.
 - `.mvn/maven.config` `--define k=v` on one line: Maven 3.9.11 / 4.0.0-rc-7 reject it themselves ("Unrecognized option"). A quoted `-Dk="v"` fails the build on every Maven line. Not socket-patch.
 - maven.config `-D k=v` (separate tokens) is ignored by Maven 4.0.0-rc-7 itself, so the #535 cell is n/a on Maven 4.
+- `#` comment lines in `.mvn/maven.config` on Maven 3.6.3 / 3.8.8: Maven itself rejects them. Only 3.9+ / 4.x treat them as comments (#550).
