@@ -102,10 +102,24 @@ limits, and required install commands.
 
 ### Fixed
 
+- Agent-mode PyPI `apply` patches every installed copy of a release, not just
+  the first one found. A Pipenv project with both a WORKON_HOME venv and a
+  `./.venv`, or a global install with the same release in the user site and a
+  system dir, no longer keeps the copy Python imports unpatched while `vex`
+  attests it (#529, #501).
 - Gem hosted and vendored modes wire only the manifest Bundler loads. A `gems.rb`
   twin or a `BUNDLE_GEMFILE` setting (environment or `.bundle/config`) no longer
   leads to an edit of an ignored `Gemfile` that reports success and attests an
   unpatched gem; unsupported layouts are refused before any write (#341, #390).
+- Gem modes read Bundler settings in Bundler's own priority. A `BUNDLE_GEMFILE`
+  in `.bundle/config` now outranks the environment variable, so a dual-boot
+  project with an exported `BUNDLE_GEMFILE=Gemfile` is no longer wired through
+  the `Gemfile` Bundler ignores (#507). The hosted stale-install guard checks
+  the committed archive in Bundler's configured cache dir (`cache_path` /
+  `BUNDLE_CACHE_PATH`) instead of always `vendor/cache`, so a stale archive
+  there now warns and keeps the same run's VEX from attesting it (#483).
+  Both settings skip `.bundle/config` under `BUNDLE_IGNORE_CONFIG`, as Bundler
+  does.
 - **npm dependencies installed from git, a URL or `file:` are no longer
   reported patched.** npm installs such a dependency from the dependent's
   spec (`github:user/repo`, `https://…/x.tgz`, `file:…`) and ignores the
@@ -178,6 +192,11 @@ limits, and required install commands.
 - Transient apply locks are removed on normal command exit; no-op scans and full
   reversal avoid leaving unused `.socket/` state. Terminal output, telemetry
   timeouts, and update-check handling are more consistent.
+- Agent mode finds transitive npm packages in npm's linked store
+  (`install-strategy=linked`, `node_modules/.store`) and in a relocated pnpm
+  `virtualStoreDir`, instead of reporting them `package_not_installed` (#359,
+  #362). A store outside the project, such as pnpm's global virtual store, is
+  shared with other projects and is still not patched in place.
 - npm locks keep their own layout when edited. `scan --mode hosted`,
   `scan --mode vendored`, `rollback` and `vendor --revert`
   re-serialized `package-lock.json` / `npm-shrinkwrap.json` with LF line
@@ -187,6 +206,13 @@ limits, and required install commands.
   unparseable (hosted) or refused as `vendor_lockfile_version_unsupported`
   (vendored). The lock now keeps its BOM, indent and line endings, and the
   undo is byte-exact (#324).
+- `vendor` under `--global` / `--global-prefix` (or `SOCKET_GLOBAL` /
+  `SOCKET_GLOBAL_PREFIX`) is now a usage error (exit 2,
+  `global_scope_unsupported`), like `scan` and `get` with `--mode vendored`.
+  Run inside a project, `vendor -g` vendored the manifest's records into that
+  project and rewired its lockfile, and `vendor --revert -g` unwound the
+  project's vendoring, so its next frozen install was silently unpatched.
+  Global installs have no project lockfile to vendor into (#498).
 
 ### Maintenance
 

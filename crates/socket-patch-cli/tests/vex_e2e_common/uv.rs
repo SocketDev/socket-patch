@@ -688,7 +688,10 @@ struct Built {
 
 /// Build the lane's project with the real uv (network: PyPI). `Err` is a
 /// skip reason (PyPI unreachable, fixture command failed).
-fn build(uv: &Uv, lane: Lane, tmp: &Path) -> Result<Built, String> {
+/// `mode` hosted: the uv pylock lanes also lock a pure-Python PyPI sibling
+/// (`idna`), which shows the hosted rollback the lock's registry and
+/// artifact shape.
+fn build(uv: &Uv, lane: Lane, mode: Mode, tmp: &Path) -> Result<Built, String> {
     let proj = tmp.join("proj");
     std::fs::create_dir_all(&proj).unwrap();
     let cache = tmp.join("uv-cache");
@@ -754,10 +757,16 @@ fn build(uv: &Uv, lane: Lane, tmp: &Path) -> Result<Built, String> {
         Lane::ExportPylock => {
             let src = tmp.join("export-src");
             std::fs::create_dir_all(&src).unwrap();
+            let deps = match mode {
+                Mode::Hosted => "\"six==1.16.0\", \"idna==3.7\"",
+                Mode::Vendored => "\"six==1.16.0\"",
+            };
             std::fs::write(
                 src.join("pyproject.toml"),
-                "[project]\nname = \"uv-vex-capstone\"\nversion = \"0.1.0\"\n\
-                 requires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\"]\n",
+                format!(
+                    "[project]\nname = \"uv-vex-capstone\"\nversion = \"0.1.0\"\n\
+                     requires-python = \">=3.9\"\ndependencies = [{deps}]\n"
+                ),
             )
             .unwrap();
             need(uv.run_py(&src, &["lock"], &cache), "uv lock")?;
@@ -773,7 +782,13 @@ fn build(uv: &Uv, lane: Lane, tmp: &Path) -> Result<Built, String> {
             pylock_sync(uv, &proj, &cache)?;
         }
         Lane::CompilePylock => {
-            std::fs::write(proj.join("requirements.in"), "six==1.16.0\n").unwrap();
+            // Hosted: `idna` is a sibling with no `index` (uv pip compile
+            // writes none).
+            let reqs = match mode {
+                Mode::Hosted => "six==1.16.0\nidna==3.7\n",
+                Mode::Vendored => "six==1.16.0\n",
+            };
+            std::fs::write(proj.join("requirements.in"), reqs).unwrap();
             need(
                 uv.run_py(
                     &proj,
@@ -1171,7 +1186,7 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let built = match build(uv, lane, tmp.path()) {
+    let built = match build(uv, lane, mode, tmp.path()) {
         Ok(b) => b,
         Err(why) => {
             skip(suite, &format!("{}: {why}", report.what("setup")));
@@ -1611,6 +1626,11 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
         ),
     };
     if mode == Mode::Hosted {
+        // The uv pylock lanes lock a PyPI sibling, which shows the registry
+        // (an `index`, or for `uv pip compile` PyPI files with none, #407)
+        // and the artifact shape, so they restore to the bytes uv wrote
+        // (#408).
+        let byte_exact = matches!(lane, Lane::ExportPylock | Lane::CompilePylock);
         let env: Value = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|e| panic!("{}: ({e})\n{}", report.what("revert"), dump(&out)));
         let still_wired =
@@ -1624,15 +1644,28 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
                     report.what("revert"),
                     dump(&out)
                 );
-                for (f, _) in &built.registry {
+                for (f, bytes) in &built.registry {
                     assert!(
                         !still_wired(f),
                         "{}: {f} still names the hosted patch",
                         report.what("revert")
                     );
+                    if byte_exact {
+                        assert_eq!(
+                            String::from_utf8_lossy(&std::fs::read(proj.join(f)).unwrap()),
+                            String::from_utf8_lossy(bytes),
+                            "{}: {f} not byte-restored",
+                            report.what("revert")
+                        );
+                    }
                 }
                 report.row("revert", "restored to the upstream registry entry");
             }
+            _ if byte_exact => panic!(
+                "{}: a uv pylock must restore:\n{}",
+                report.what("revert"),
+                dump(&out)
+            ),
             _ => {
                 let error = env["hosted"]["failed"][0]["error"]
                     .as_str()

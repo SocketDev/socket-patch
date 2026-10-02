@@ -318,8 +318,9 @@ async fn find_site_packages_under(
 /// Find local virtual environment `site-packages` directories.
 ///
 /// Checks (in order):
-/// 1. `VIRTUAL_ENV` environment variable (for a Pipenv project, only when
-///    Pipenv itself would use it)
+/// 1. `VIRTUAL_ENV` environment variable (for a Pipenv or Poetry project,
+///    only when that tool itself would use it; Poetry also takes a conda
+///    `CONDA_PREFIX`)
 /// 2. For a Pipenv project, the venv(s) Pipenv resolves for it (see
 ///    [`pipenv_project_site_packages`]), and nothing else
 /// 3. Poetry's out-of-tree virtualenv(s), when Poetry itself would not use
@@ -339,19 +340,29 @@ async fn find_local_venv_site_packages_with(
 ) -> Vec<PathBuf> {
     let mut results = Vec::new();
     let pipenv = is_pipenv_project(cwd);
+    let poetry = if pipenv {
+        None
+    } else {
+        load_poetry_project(cwd, var).await
+    };
 
     // 1. Check VIRTUAL_ENV env var. Pipenv ignores it under `PIPENV_ACTIVE`
     // (a `pipenv shell` started in another project) and
     // `PIPENV_IGNORE_VIRTUALENVS`, so for a Pipenv project the activated venv
-    // then belongs to something else and must not be patched.
-    if !pipenv || pipenv_uses_virtual_env(var) {
-        if let Some(virtual_env) = var("VIRTUAL_ENV") {
-            let venv_path = PathBuf::from(&virtual_env);
-            let matches = find_site_packages_under(&venv_path, "site-packages").await;
-            results.extend(matches);
-            if !results.is_empty() {
-                return results;
-            }
+    // then belongs to something else and must not be patched. Poetry ignores
+    // it once `poetry env use` recorded an env for the project (see
+    // [`poetry_active_prefix`]).
+    let active_prefix = match &poetry {
+        Some(project) => poetry_active_prefix(project, var),
+        None if !pipenv || pipenv_uses_virtual_env(var) => var("VIRTUAL_ENV"),
+        None => None,
+    };
+    if let Some(virtual_env) = active_prefix {
+        let venv_path = PathBuf::from(&virtual_env);
+        let matches = find_site_packages_under(&venv_path, "site-packages").await;
+        results.extend(matches);
+        if !results.is_empty() {
+            return results;
         }
     }
 
@@ -365,13 +376,13 @@ async fn find_local_venv_site_packages_with(
     }
 
     // 3. Poetry decides for itself whether `./.venv` is the project's env
-    // (`EnvManager.use_in_project_venv`): an explicit `virtualenvs.in-project`
-    // wins, and only when it is unset does an existing `./.venv` count. When
+    // (`EnvManager.in_project_venv_exists`): only an existing `./.venv`, and
+    // only when `virtualenvs.in-project` is not explicitly `false`. When
     // Poetry would NOT use `./.venv` (`in-project = false`, or no `.venv` at
-    // all), its out-of-tree env is probed first so a stray `.venv` / `venv`
-    // left by another tool does not shadow the env Poetry installed into.
-    let poetry = load_poetry_project(cwd).await;
-    if let Some(project) = poetry.as_ref().filter(|p| !p.uses_in_project_venv(cwd)) {
+    // all, even with `in-project = true`), its out-of-tree env is probed
+    // first so a stray `.venv` / `venv` left by another tool does not shadow
+    // the env Poetry installed into.
+    if let Some(project) = poetry.as_ref().filter(|p| !p.in_project_venv_exists(cwd)) {
         let found = poetry_virtualenv_site_packages(cwd, project, var).await;
         if !found.is_empty() {
             return found;
@@ -500,7 +511,8 @@ struct PoetryVirtualenvConfig {
     /// interpreter it runs under (a container's system Python), which the
     /// project-marker global fallback already covers.
     create: Option<bool>,
-    /// `virtualenvs.in-project` — `true` means `./.venv`, already probed.
+    /// `virtualenvs.in-project` — `true` means `./.venv` once it exists;
+    /// until then Poetry keeps using its out-of-tree env.
     in_project: Option<bool>,
     /// `virtualenvs.path` — may carry Poetry's `{cache-dir}` /
     /// `{project-dir}` placeholders and a leading `~`.
@@ -737,15 +749,27 @@ fn poetry_project_names(pyproject: &str) -> Vec<String> {
 
 /// The root directory Poetry would place this project's virtualenvs under,
 /// or `None` when Poetry would not create one (`virtualenvs.create = false`,
-/// `virtualenvs.in-project = true`, or no home to resolve the default against).
+/// or no home to resolve the default against). `virtualenvs.in-project`
+/// does not change it: with no `./.venv`, Poetry keeps using the env here.
 fn poetry_virtualenvs_root(
     cwd: &Path,
     config: &PoetryVirtualenvConfig,
     var: &impl Fn(&str) -> Option<String>,
 ) -> Option<PathBuf> {
-    if config.create == Some(false) || config.in_project == Some(true) {
+    if config.create == Some(false) {
         return None;
     }
+    poetry_virtualenvs_path(cwd, config, var)
+}
+
+/// Poetry's `config.virtualenvs_path`: `virtualenvs.path` with its
+/// placeholders and `~` expanded, else `<cache-dir>/virtualenvs`. Also where
+/// `envs.toml` lives, which Poetry reads whatever `virtualenvs.create` says.
+fn poetry_virtualenvs_path(
+    cwd: &Path,
+    config: &PoetryVirtualenvConfig,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
     let cache_dir = config
         .cache_dir
         .as_deref()
@@ -789,34 +813,76 @@ fn expand_home(raw: &str, var: &impl Fn(&str) -> Option<String>) -> PathBuf {
 /// executed, no `poetry` binary is needed.
 pub async fn find_poetry_virtualenv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     let var = |name: &str| std::env::var(name).ok();
-    match load_poetry_project(cwd).await {
+    match load_poetry_project(cwd, &var).await {
         Some(project) => poetry_virtualenv_site_packages(cwd, &project, &var).await,
         None => Vec::new(),
     }
 }
 
 /// What venv discovery needs to know about a Poetry project: the candidate
-/// env names and the layered `virtualenvs.*` configuration.
+/// env names, the layered `virtualenvs.*` configuration, and the env
+/// `poetry env use` activated for it, if any.
 struct PoetryProject {
     names: Vec<String>,
     config: PoetryVirtualenvConfig,
+    /// The `<name>-<hash>-py<minor>` directory `envs.toml` records for the
+    /// project (see [`poetry_activated_env`]).
+    activated: Option<String>,
 }
 
 impl PoetryProject {
-    /// Poetry's `EnvManager.use_in_project_venv`: an explicit
-    /// `virtualenvs.in-project` decides; unset means "if `./.venv` is a
-    /// directory".
-    fn uses_in_project_venv(&self, cwd: &Path) -> bool {
-        self.config
-            .in_project
-            .unwrap_or_else(|| cwd.join(".venv").is_dir())
+    /// Poetry's `EnvManager.in_project_venv_exists`: `./.venv` is the env
+    /// only when it is a directory and `virtualenvs.in-project` is not an
+    /// explicit `false` (`use_in_project_venv`). `in-project = true` with no
+    /// `./.venv` falls through to the out-of-tree env like an unset one.
+    fn in_project_venv_exists(&self, cwd: &Path) -> bool {
+        self.config.in_project != Some(false) && cwd.join(".venv").is_dir()
     }
+}
+
+/// The prefix of the venv Poetry would take from the shell instead of the
+/// project's own env, per `EnvManager.get()`: `VIRTUAL_ENV`, else
+/// `CONDA_PREFIX`, but not inside conda's `base` env, and only when
+/// `envs.toml` has no entry for the project (`poetry env use` wins over an
+/// activated venv).
+fn poetry_active_prefix(
+    project: &PoetryProject,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if project.activated.is_some() {
+        return None;
+    }
+    let prefix = var("VIRTUAL_ENV").or_else(|| var("CONDA_PREFIX"))?;
+    (var("CONDA_DEFAULT_ENV").as_deref() != Some("base")).then_some(prefix)
+}
+
+/// The env directory `envs.toml` (under `virtualenvs.path`) records for the
+/// project: `[<name>-<hash>] minor = "X.Y"` names `<name>-<hash>-pyX.Y`,
+/// what `poetry env use` writes and `EnvManager.get()` reads first. Takes
+/// the first candidate name (in Poetry's precedence order) with an entry.
+async fn poetry_activated_env(
+    cwd: &Path,
+    names: &[String],
+    config: &PoetryVirtualenvConfig,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let root = poetry_virtualenvs_path(cwd, config, var)?;
+    let text = read_regular_to_string(&root.join("envs.toml")).await.ok()?;
+    let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+    let normalized = poetry_normalized_cwd(cwd);
+    names.iter().find_map(|name| {
+        let base = poetry_env_name_prefix(name, &normalized);
+        let minor = doc.get(&base)?.get("minor")?.as_str()?.trim().to_string();
+        (!minor.is_empty()).then(|| format!("{base}-py{minor}"))
+    })
 }
 
 /// `None` for a non-Poetry project (no `poetry.lock`, `poetry.toml` or
 /// `[tool.poetry`) or an unreadable / unparseable `pyproject.toml`.
-async fn load_poetry_project(cwd: &Path) -> Option<PoetryProject> {
-    let var = |name: &str| std::env::var(name).ok();
+async fn load_poetry_project(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Option<PoetryProject> {
     let has = |leaf: &str| cwd.join(leaf).is_file();
     let pyproject = read_regular_to_string(&cwd.join("pyproject.toml"))
         .await
@@ -834,7 +900,7 @@ async fn load_poetry_project(cwd: &Path) -> Option<PoetryProject> {
         Ok(text) => PoetryVirtualenvConfig::from_toml(&text),
         Err(_) => PoetryVirtualenvConfig::default(),
     };
-    let user = match poetry_user_config_path(&var) {
+    let user = match poetry_user_config_path(var) {
         Some(path) => match read_regular_to_string(&path).await {
             Ok(text) => PoetryVirtualenvConfig::from_toml(&text),
             Err(_) => PoetryVirtualenvConfig::default(),
@@ -842,11 +908,18 @@ async fn load_poetry_project(cwd: &Path) -> Option<PoetryProject> {
         None => PoetryVirtualenvConfig::default(),
     };
     let config = PoetryVirtualenvConfig::from_env(var).or(local).or(user);
-    Some(PoetryProject { names, config })
+    let activated = poetry_activated_env(cwd, &names, &config, var).await;
+    Some(PoetryProject {
+        names,
+        config,
+        activated,
+    })
 }
 
-/// The out-of-tree venvs for `project`, taking the first candidate name (in
-/// Poetry's precedence order) that has at least one `<name>-<hash>-py*` dir.
+/// The out-of-tree venvs for `project`: the env `envs.toml` activated when
+/// there is one (Poetry uses nothing else), otherwise the first candidate
+/// name (in Poetry's precedence order) that has at least one
+/// `<name>-<hash>-py*` dir.
 async fn poetry_virtualenv_site_packages(
     cwd: &Path,
     project: &PoetryProject,
@@ -855,6 +928,9 @@ async fn poetry_virtualenv_site_packages(
     let Some(root) = poetry_virtualenvs_root(cwd, &project.config, var) else {
         return Vec::new();
     };
+    if let Some(activated) = &project.activated {
+        return find_site_packages_under(&root.join(activated), "site-packages").await;
+    }
     let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
         return Vec::new();
     };
@@ -1321,8 +1397,8 @@ fn run_site_query() -> Option<String> {
 /// Get global/system Python `site-packages` directories.
 ///
 /// Queries `python3` for site-packages paths, then checks well-known system
-/// locations including Homebrew, conda, uv tools, pipx venvs, pip --user,
-/// etc.
+/// locations including Homebrew, conda, uv tools and interpreters, pipx
+/// venvs, PDM's global project and interpreters, pip --user, etc.
 pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     let mut results = Vec::new();
     let mut seen = HashSet::new();
@@ -1498,48 +1574,10 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     let miniconda = home_dir.join("miniconda3");
     scan_well_known(&miniconda, "site-packages", &mut seen, &mut results).await;
 
-    // uv tools — platform-specific install root.
-    #[cfg(target_os = "macos")]
-    {
-        // Legacy/secondary location only: uv follows XDG conventions on
-        // macOS (`uv tool dir` → ~/.local/share/uv/tools, covered by the
-        // not(windows) scan below), but older layouts used the platform
-        // data dir, so keep scanning it too.
-        let uv_base = home_dir
-            .join("Library")
-            .join("Application Support")
-            .join("uv")
-            .join("tools");
-        let uv_matches =
-            find_python_dirs(&uv_base, &["*", "lib", "python3.*", "site-packages"]).await;
-        for m in uv_matches {
-            add_path(m, &mut seen, &mut results);
-        }
-    }
-    #[cfg(windows)]
-    {
-        // %LOCALAPPDATA%\uv\tools
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            let uv_base = PathBuf::from(local).join("uv").join("tools");
-            let uv_matches = find_python_dirs(&uv_base, &["*", "Lib", "site-packages"]).await;
-            for m in uv_matches {
-                add_path(m, &mut seen, &mut results);
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        // uv uses XDG paths on BOTH Linux and macOS (`uv tool dir` →
-        // ~/.local/share/uv/tools; verified against a real uv install —
-        // macOS does NOT get an Application Support tool dir).
-        let uv_base = home_dir
-            .join(".local")
-            .join("share")
-            .join("uv")
-            .join("tools");
-        let uv_matches =
-            find_python_dirs(&uv_base, &["*", "lib", "python3.*", "site-packages"]).await;
-        for m in uv_matches {
+    // uv tool envs (`uv tool install`): one venv per tool under every
+    // root uv may use (see `uv_dir_candidates`).
+    for tools in uv_dir_candidates(&home_dir, "UV_TOOL_DIR", "tools") {
+        for m in find_child_env_site_packages(&tools).await {
             add_path(m, &mut seen, &mut results);
         }
     }
@@ -1564,38 +1602,244 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         }
     }
 
-    // uv-managed Python interpreters (`uv python install 3.X`) live at:
-    //   Linux/macOS: ~/.local/share/uv/python/cpython-3.X.*/lib/python3.X/site-packages/
-    //   Windows:     %LOCALAPPDATA%\uv\python\cpython-3.X.*\Lib\site-packages\
-    // The typical flow is `uv venv` + `uv pip install`, where the venv layout
-    // is already covered by `find_local_venv_site_packages`. But power users
+    // uv-managed Python interpreters (`uv python install 3.X`), one per
+    // child of uv's python dir (`cpython-3.X.*-<platform>`). The typical
+    // flow is `uv venv` + `uv pip install`, where the venv layout is
+    // already covered by `find_local_venv_site_packages`. But power users
     // can install packages directly into the managed interpreter (e.g. via
-    // `<uv-python>/bin/pip install ...`), and globally-discovered crawls
-    // should surface those.
-    #[cfg(not(windows))]
-    {
-        let uv_python = home_dir
-            .join(".local")
-            .join("share")
-            .join("uv")
-            .join("python");
-        let uv_matches =
-            find_python_dirs(&uv_python, &["*", "lib", "python3.*", "site-packages"]).await;
-        for m in uv_matches {
+    // `uv pip install --system --python <uv-python>`), and globally
+    // discovered crawls should surface those.
+    for python in uv_dir_candidates(&home_dir, "UV_PYTHON_INSTALL_DIR", "python") {
+        for m in find_child_env_site_packages(&python).await {
             add_path(m, &mut seen, &mut results);
         }
     }
+
+    // PDM's global project (`pdm add -g`) and PDM-managed interpreters
+    // (`pdm python install`).
+    for m in pdm_global_site_packages(&home_dir).await {
+        add_path(m, &mut seen, &mut results);
+    }
+
+    results
+}
+
+/// `site-packages` of every environment directly under `parent`:
+/// `<parent>/<env>/lib{,64}/python3.X/site-packages` on Unix and
+/// `<parent>\<env>\Lib\site-packages` on Windows.
+async fn find_child_env_site_packages(parent: &Path) -> Vec<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        let mut matches =
+            find_python_dirs(parent, &["*", "lib", "python3.*", "site-packages"]).await;
+        matches
+            .extend(find_python_dirs(parent, &["*", "lib64", "python3.*", "site-packages"]).await);
+        matches
+    }
     #[cfg(windows)]
     {
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            let uv_python = PathBuf::from(local).join("uv").join("python");
-            let uv_matches = find_python_dirs(&uv_python, &["*", "Lib", "site-packages"]).await;
-            for m in uv_matches {
-                add_path(m, &mut seen, &mut results);
+        find_python_dirs(parent, &["*", "Lib", "site-packages"]).await
+    }
+}
+
+/// `site-packages` of the one environment (venv or interpreter) whose
+/// prefix is `prefix`, in the same layouts as
+/// [`find_child_env_site_packages`].
+async fn find_env_site_packages(prefix: &Path) -> Vec<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        let mut matches = find_python_dirs(prefix, &["lib", "python3.*", "site-packages"]).await;
+        matches.extend(find_python_dirs(prefix, &["lib64", "python3.*", "site-packages"]).await);
+        matches
+    }
+    #[cfg(windows)]
+    {
+        find_python_dirs(prefix, &["Lib", "site-packages"]).await
+    }
+}
+
+/// `$var` as a directory when it is set to an absolute path. platformdirs
+/// and uv both ignore a relative `XDG_*` value, per the XDG spec.
+#[cfg(not(windows))]
+fn absolute_env_dir(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// The directories uv may keep `bucket` (`tools` or `python`) in, most
+/// specific first.
+///
+/// uv (`StateStore::from_settings`) uses `$override_var` (`UV_TOOL_DIR`
+/// or `UV_PYTHON_INSTALL_DIR`) when set, made absolute against the cwd.
+/// Otherwise it uses `<data dir>/uv/<bucket>`, where the data dir is
+/// `$XDG_DATA_HOME` (absolute only) or `~/.local/share` on Linux and
+/// macOS, and `%APPDATA%` on Windows (`uv tool dir` prints
+/// `%APPDATA%\uv\tools` there). The legacy roots that older layouts used
+/// are returned too: `~/Library/Application Support/uv` on macOS, and
+/// `%LOCALAPPDATA%\uv`, which earlier socket-patch releases scanned, on
+/// Windows. Callers skip the ones that don't exist.
+#[cfg_attr(windows, allow(unused_variables))]
+fn uv_dir_candidates(home_dir: &Path, override_var: &str, bucket: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = std::env::var_os(override_var).filter(|v| !v.is_empty()) {
+        let dir = PathBuf::from(dir);
+        dirs.push(std::path::absolute(&dir).unwrap_or(dir));
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = absolute_env_dir("XDG_DATA_HOME") {
+            dirs.push(xdg.join("uv").join(bucket));
+        }
+        dirs.push(
+            home_dir
+                .join(".local")
+                .join("share")
+                .join("uv")
+                .join(bucket),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    dirs.push(
+        home_dir
+            .join("Library")
+            .join("Application Support")
+            .join("uv")
+            .join(bucket),
+    );
+    #[cfg(windows)]
+    for var in ["APPDATA", "LOCALAPPDATA"] {
+        if let Some(base) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+            dirs.push(PathBuf::from(base).join("uv").join(bucket));
+        }
+    }
+    dirs
+}
+
+/// The directories platformdirs may resolve for PDM's per-user config
+/// (`xdg_var` = `XDG_CONFIG_HOME`, `unix_default` = `.config`) or data
+/// (`XDG_DATA_HOME`, `.local/share`) dir, most specific first:
+/// `$xdg_var/pdm` (absolute only; platformdirs 4.4+ also honors it on
+/// macOS), `~/<unix_default>/pdm` on Linux,
+/// `~/Library/Application Support/pdm` on macOS, and
+/// `%LOCALAPPDATA%\pdm\pdm` on Windows.
+#[cfg_attr(windows, allow(unused_variables))]
+fn pdm_dir_candidates(home_dir: &Path, xdg_var: &str, unix_default: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    #[cfg(not(windows))]
+    if let Some(xdg) = absolute_env_dir(xdg_var) {
+        dirs.push(xdg.join("pdm"));
+    }
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    dirs.push(home_dir.join(unix_default).join("pdm"));
+    #[cfg(target_os = "macos")]
+    dirs.push(
+        home_dir
+            .join("Library")
+            .join("Application Support")
+            .join("pdm"),
+    );
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+        dirs.push(PathBuf::from(local).join("pdm").join("pdm"));
+    }
+    dirs
+}
+
+/// `site-packages` of PDM's global installs:
+///
+/// - The global project's environment (`pdm add -g`). The project lives
+///   at the `global_project.path` setting, by default
+///   `<user config dir>/pdm/global-project`. Its environment is the
+///   in-project `.venv`, an out-of-tree venv under `venv.location`
+///   (default `<user data dir>/pdm/venvs`) named
+///   `<project dir name>-<hash>-<python>`, or whatever interpreter
+///   `pdm use -g` recorded in its `.pdm-python`.
+/// - PDM-managed interpreters (`pdm python install`), one per child of
+///   `python.install_root` (default `<user data dir>/pdm/python`).
+///
+/// The settings come from PDM's global config file, `$PDM_CONFIG_FILE`
+/// or `<user config dir>/pdm/config.toml`. Every candidate is collected,
+/// and the ones that don't exist yield nothing.
+async fn pdm_global_site_packages(home_dir: &Path) -> Vec<PathBuf> {
+    let config_dirs = pdm_dir_candidates(home_dir, "XDG_CONFIG_HOME", Path::new(".config"));
+    let data_dirs = pdm_dir_candidates(
+        home_dir,
+        "XDG_DATA_HOME",
+        &Path::new(".local").join("share"),
+    );
+
+    let mut config_files: Vec<PathBuf> = std::env::var_os("PDM_CONFIG_FILE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    config_files.extend(config_dirs.iter().map(|d| d.join("config.toml")));
+
+    let mut projects = Vec::new();
+    let mut install_roots = Vec::new();
+    let mut venv_roots = Vec::new();
+    // PDM expands `~` with Python's `expanduser`, which reads USERPROFILE
+    // on Windows and ignores HOME there (Python 3.8+), so a Git Bash HOME
+    // must not decide where a relocated setting points.
+    let var = |name: &str| {
+        if cfg!(windows) && name == "HOME" {
+            return None;
+        }
+        std::env::var(name).ok()
+    };
+    for file in &config_files {
+        let Ok(text) = read_regular_to_string(file).await else {
+            continue;
+        };
+        let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+            continue;
+        };
+        let setting = |table: &str, key: &str| {
+            doc.get(table)
+                .and_then(|t| t.get(key))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(|v| expand_home(v, &var))
+        };
+        projects.extend(setting("global_project", "path"));
+        install_roots.extend(setting("python", "install_root"));
+        venv_roots.extend(setting("venv", "location"));
+    }
+    projects.extend(config_dirs.iter().map(|d| d.join("global-project")));
+    install_roots.extend(data_dirs.iter().map(|d| d.join("python")));
+    venv_roots.extend(data_dirs.iter().map(|d| d.join("venvs")));
+
+    let mut results = Vec::new();
+    for project in &projects {
+        results.extend(find_env_site_packages(&project.join(".venv")).await);
+        if let Some(name) = project.file_name().and_then(|n| n.to_str()) {
+            let prefix = format!("{name}-");
+            for root in &venv_roots {
+                for entry in crate::utils::fs::list_dir_entries(root).await {
+                    if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                        results.extend(find_env_site_packages(&root.join(entry.file_name())).await);
+                    }
+                }
+            }
+        }
+        // `.pdm-python` names the interpreter: `<prefix>/bin/python3` in a
+        // venv or Unix install, `<prefix>\Scripts\python.exe` in a Windows
+        // venv, `<prefix>\python.exe` in a Windows install.
+        if let Ok(text) = read_regular_to_string(&project.join(".pdm-python")).await {
+            let interpreter = PathBuf::from(text.trim());
+            let prefixes = interpreter.is_absolute().then_some(&interpreter);
+            for prefix in prefixes
+                .into_iter()
+                .flat_map(|i| i.ancestors().skip(1).take(2))
+            {
+                results.extend(find_env_site_packages(prefix).await);
             }
         }
     }
-
+    for root in &install_roots {
+        results.extend(find_child_env_site_packages(root).await);
+    }
     results
 }
 
@@ -2650,18 +2894,21 @@ mod tests {
             poetry_virtualenvs_root(cwd, &tilde, &var),
             Some(PathBuf::from("/home/dev/venvs"))
         );
-        for disabled in [
-            PoetryVirtualenvConfig {
-                create: Some(false),
-                ..Default::default()
-            },
-            PoetryVirtualenvConfig {
-                in_project: Some(true),
-                ..Default::default()
-            },
-        ] {
+        for disabled in [PoetryVirtualenvConfig {
+            create: Some(false),
+            ..Default::default()
+        }] {
             assert_eq!(poetry_virtualenvs_root(cwd, &disabled, &var), None);
         }
+        // `in-project = true` does not move the root (#476).
+        let in_project = PoetryVirtualenvConfig {
+            in_project: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            poetry_virtualenvs_root(cwd, &in_project, &var),
+            poetry_virtualenvs_root(cwd, &PoetryVirtualenvConfig::default(), &var)
+        );
         // Defaults resolve against the platform cache dir; with no home at all
         // there is nothing to resolve against.
         let default = PoetryVirtualenvConfig::default();
@@ -2760,14 +3007,18 @@ mod tests {
         );
         std::fs::remove_dir_all(project.join(".venv")).unwrap();
 
-        // `poetry.toml` opting into in-project venvs (or disabling creation)
-        // means Poetry never used the shared root: nothing is probed.
+        // `poetry.toml` opting into in-project venvs with no `./.venv` yet
+        // keeps Poetry on its existing out-of-tree env (#476); disabling
+        // creation means Poetry never used the shared root.
         std::fs::write(
             project.join("poetry.toml"),
             "[virtualenvs]\nin-project = true\n",
         )
         .unwrap();
-        assert!(find_local_venv_site_packages(&project).await.is_empty());
+        assert_eq!(
+            find_local_venv_site_packages(&project).await,
+            vec![site(&venv311, "3.11"), site(&venv312, "3.12")]
+        );
         std::fs::write(
             project.join("poetry.toml"),
             "[virtualenvs]\ncreate = false\n",
@@ -2861,6 +3112,193 @@ mod tests {
         .unwrap();
         std::fs::remove_file(project.join("poetry.lock")).unwrap();
         assert!(find_local_venv_site_packages(&project).await.is_empty());
+    }
+
+    /// A Poetry project at `<tmp>/proj` whose `poetry.toml` points
+    /// `virtualenvs.path` at `<tmp>/venvs` (plus `extra_config` lines under
+    /// `[virtualenvs]`), with one out-of-tree env per minor in `minors`.
+    /// Returns `(project, venvs root, env name prefix)`.
+    fn poetry_fixture(
+        tmp: &Path,
+        extra_config: &str,
+        minors: &[&str],
+    ) -> (PathBuf, PathBuf, String) {
+        let project = tmp.join("proj");
+        let venvs = tmp.join("venvs");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[tool.poetry]\nname = \"envmulti\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("poetry.toml"),
+            format!(
+                "[virtualenvs]\npath = {:?}\n{extra_config}",
+                venvs.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let prefix = poetry_env_name_prefix("envmulti", &poetry_normalized_cwd(&project));
+        for minor in minors {
+            std::fs::create_dir_all(poetry_site(
+                &venvs.join(format!("{prefix}-py{minor}")),
+                minor,
+            ))
+            .unwrap();
+        }
+        (project, venvs, prefix)
+    }
+
+    fn poetry_site(venv: &Path, minor: &str) -> PathBuf {
+        if cfg!(windows) {
+            venv.join("Lib").join("site-packages")
+        } else {
+            venv.join("lib")
+                .join(format!("python{minor}"))
+                .join("site-packages")
+        }
+    }
+
+    /// An environment with nothing set but a home that holds no Poetry
+    /// config, so only the fixture's `poetry.toml` decides.
+    fn poetry_env<'a>(
+        tmp: &'a Path,
+        extra: &'a [(&'a str, String)],
+    ) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name: &str| {
+            if let Some((_, v)) = extra.iter().find(|(k, _)| *k == name) {
+                return Some(v.clone());
+            }
+            match name {
+                "HOME" => Some(tmp.join("home").to_string_lossy().into_owned()),
+                "POETRY_CONFIG_DIR" => Some(tmp.join("no-config").to_string_lossy().into_owned()),
+                _ => None,
+            }
+        }
+    }
+
+    /// #526: with several `<name>-<hash>-py*` envs, Poetry uses the one
+    /// `poetry env use` recorded in `<virtualenvs.path>/envs.toml`, not the
+    /// alphabetically first one.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn poetry_envs_toml_activated_env_is_the_only_one_probed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, venvs, prefix) =
+            poetry_fixture(tmp.path(), "", &["3.10", "3.11", "3.12", "3.9"]);
+        let var = poetry_env(tmp.path(), &[]);
+        for minor in ["3.12", "3.9", "3.11"] {
+            std::fs::write(
+                venvs.join("envs.toml"),
+                format!("[{prefix}]\nminor = \"{minor}\"\npatch = \"{minor}.4\"\n\n[other-AAAAAAAA]\nminor = \"3.10\"\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &var).await,
+                vec![poetry_site(
+                    &venvs.join(format!("{prefix}-py{minor}")),
+                    minor
+                )],
+                "activated {minor}"
+            );
+        }
+        // An envs.toml that names other projects only changes nothing: every
+        // env of this project is still a candidate.
+        std::fs::write(
+            venvs.join("envs.toml"),
+            "[other-AAAAAAAA]\nminor = \"3.10\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var)
+                .await
+                .len(),
+            4
+        );
+    }
+
+    /// #526 (second trigger): once `envs.toml` names the project, Poetry
+    /// ignores an unrelated activated `VIRTUAL_ENV`; without an entry it
+    /// still uses it. A conda `base` env does not count as "in a venv".
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn poetry_envs_toml_entry_overrides_virtual_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, venvs, prefix) = poetry_fixture(tmp.path(), "", &["3.11", "3.12"]);
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(poetry_site(&other, "3.11")).unwrap();
+        let active = [("VIRTUAL_ENV", other.to_string_lossy().into_owned())];
+        let var = poetry_env(tmp.path(), &active);
+        std::fs::write(
+            venvs.join("envs.toml"),
+            format!("[{prefix}]\nminor = \"3.12\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![poetry_site(&venvs.join(format!("{prefix}-py3.12")), "3.12")]
+        );
+        std::fs::remove_file(venvs.join("envs.toml")).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![poetry_site(&other, "3.11")]
+        );
+        // Poetry treats `CONDA_PREFIX` like `VIRTUAL_ENV`, except in conda's
+        // `base` env.
+        let conda = [
+            ("CONDA_PREFIX", other.to_string_lossy().into_owned()),
+            ("CONDA_DEFAULT_ENV", "work".to_string()),
+        ];
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &poetry_env(tmp.path(), &conda)).await,
+            vec![poetry_site(&other, "3.11")]
+        );
+        let base = [
+            ("CONDA_PREFIX", other.to_string_lossy().into_owned()),
+            ("CONDA_DEFAULT_ENV", "base".to_string()),
+        ];
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &poetry_env(tmp.path(), &base))
+                .await
+                .len(),
+            2,
+            "conda base is not an activated venv for Poetry"
+        );
+    }
+
+    /// #476: `virtualenvs.in-project = true` only means `./.venv` when it
+    /// exists (`EnvManager.in_project_venv_exists`); otherwise Poetry keeps
+    /// installing into its existing out-of-tree env.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn poetry_in_project_true_without_dot_venv_keeps_the_out_of_tree_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, venvs, prefix) = poetry_fixture(tmp.path(), "in-project = true\n", &["3.11"]);
+        let env311 = poetry_site(&venvs.join(format!("{prefix}-py3.11")), "3.11");
+        let var = poetry_env(tmp.path(), &[]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![env311.clone()]
+        );
+        // The same through POETRY_VIRTUALENVS_IN_PROJECT.
+        std::fs::write(
+            project.join("poetry.toml"),
+            format!("[virtualenvs]\npath = {:?}\n", venvs.to_string_lossy()),
+        )
+        .unwrap();
+        let flag = [("POETRY_VIRTUALENVS_IN_PROJECT", "true".to_string())];
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &poetry_env(tmp.path(), &flag)).await,
+            vec![env311.clone()]
+        );
+        // Once `./.venv` exists it is the project's env.
+        let dot_venv = poetry_site(&project.join(".venv"), "3.12");
+        std::fs::create_dir_all(&dot_venv).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &poetry_env(tmp.path(), &flag)).await,
+            vec![dot_venv]
+        );
     }
 
     #[test]

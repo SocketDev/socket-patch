@@ -1,0 +1,8 @@
+{
+  "bun": "1.3.14",
+  "os": "linux",
+  "arch": "x86_64",
+  "command": "bun install (install.saveTextLockfile = false; @bh scope on a local mock registry at 127.0.0.1:18765)",
+  "note": "@bh/bund@1.0.0 declares bundleDependencies [\"is-number\"] and ships is-number@7.0.0 inside its tarball; the root also depends on is-number@7.0.0",
+  "sha256": "fb962561790710fee7e9a7629f213d8df1a8ed82a603838d23b31cef57894e4e"
+}
