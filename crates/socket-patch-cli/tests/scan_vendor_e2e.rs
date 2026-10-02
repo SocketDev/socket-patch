@@ -1301,6 +1301,25 @@ async fn scan_vendor_prune_reconciles_unwired_entry_on_an_empty_crawl() {
         serde_json::json!([PURL]),
         "envelope={v}"
     );
+
+    // The drift-kept entry is still unwired, so the next plain rescan warns
+    // again, and its detail names the way out a drift-keep needs: `--prune`
+    // alone cannot clear it.
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let detail = v["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|w| w["code"] == "vendor_ledger_entry_unwired")
+        .and_then(|w| w["detail"].as_str())
+        .unwrap_or_else(|| panic!("envelope={v}"))
+        .to_string();
+    assert!(
+        detail.contains("--prune") && detail.contains("vendor --revert"),
+        "{detail}"
+    );
 }
 
 /// Interactive (non-JSON) `scan --vendor` pre-verifies patch baselines:
