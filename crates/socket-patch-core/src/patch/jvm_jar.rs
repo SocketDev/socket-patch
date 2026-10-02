@@ -194,6 +194,63 @@ pub fn jar_copies(pkg_path: &Path, jar_leaf: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+// ── derived copies ──────────────────────────────────────────────────────
+
+/// What [`derived_copies`] found of the copies Gradle derived from a
+/// cached jar.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DerivedVerdict {
+    /// Copies proven derived from the PRISTINE jar (see
+    /// [`gradle_cache::DerivedCopies::stale`]): they still serve the old
+    /// bytes.
+    pub stale: Vec<PathBuf>,
+    /// Same-named copies whose bytes are neither the pristine jar nor the
+    /// jar now in the hash dir: nothing says which they came from.
+    pub unverified: Vec<PathBuf>,
+    /// The walk did not cover every derived-cache root.
+    pub incomplete: bool,
+}
+
+impl DerivedVerdict {
+    /// Whether every derived copy is proven to carry the hash dir's
+    /// current bytes (or there is none).
+    pub fn clean(&self) -> bool {
+        self.stale.is_empty() && self.unverified.is_empty() && !self.incomplete
+    }
+}
+
+/// The copies Gradle derived (outside `files-2.1`) from the jar `jar_leaf`
+/// of the hash dir `hash_dir`, whose name is the PRISTINE jar's sha1:
+/// [`gradle_cache::stale_derived_copies`] over the dir's user home, with
+/// the same-named copies that are byte-identical to the jar now in the
+/// hash dir (a copy Gradle rebuilt from the patched jar) dropped from
+/// `unverified`. `None` for anything but a writable Gradle hash dir.
+/// Blocking.
+pub fn derived_copies(hash_dir: &Path, jar_leaf: &str) -> Option<DerivedVerdict> {
+    if !maven_sidecars::is_gradle_hash_dir(hash_dir) {
+        return None;
+    }
+    let home = maven_sidecars::gradle_user_home_of(hash_dir)?;
+    let pristine_sha1 = hash_dir.file_name()?.to_str()?;
+    let found = gradle_cache::stale_derived_copies(&home, jar_leaf, pristine_sha1);
+    let current = std::fs::read(hash_dir.join(jar_leaf))
+        .ok()
+        .map(|b| sha1_hex(&b));
+    let unverified = found
+        .unknown
+        .into_iter()
+        .filter(|p| {
+            let copy = std::fs::read(p).ok().map(|b| sha1_hex(&b));
+            copy.is_none() || copy != current
+        })
+        .collect();
+    Some(DerivedVerdict {
+        stale: found.stale,
+        unverified,
+        incomplete: found.incomplete,
+    })
+}
+
 // ── swap ────────────────────────────────────────────────────────────────
 
 /// A refusal of the whole swap: nothing was written. `code` is a stable

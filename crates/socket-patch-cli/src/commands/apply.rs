@@ -14,6 +14,7 @@ use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::patch::redirect::golang_local::{
     apply_go_redirect, reconcile_go_redirects, verify_go_redirect_state,
 };
+use socket_patch_core::patch::sidecars::{maven as maven_sidecars, SidecarAdvisoryCode};
 use socket_patch_core::telemetry::{track_patch_applied, track_patch_apply_failed};
 use socket_patch_core::utils::purl::parse_golang_purl;
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
@@ -28,7 +29,7 @@ use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{
     generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
 };
-use crate::ecosystem_dispatch::{find_all_packages_for_purls, partition_purls};
+use crate::ecosystem_dispatch::{find_all_packages_for_purls, partition_purls, JvmScope};
 use crate::json_envelope::{
     AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile,
     RunWarning, Status, VexSummary,
@@ -1123,6 +1124,19 @@ pub(crate) async fn run_locked(
                     // `events[]` by `purl` for per-package context.
                     if let Some(ref sidecar) = result.sidecar {
                         env.sidecars.push(sidecar.clone());
+                        // A Gradle cache copy's other Info advisories
+                        // (daemon, shared user home) ride their own
+                        // records.
+                        if sidecar
+                            .advisory
+                            .as_ref()
+                            .is_some_and(|a| a.code == SidecarAdvisoryCode::GradleRefreshReverts)
+                        {
+                            env.sidecars.extend(maven_sidecars::gradle_extra_records(
+                                &result.package_key,
+                                Path::new(&result.package_path),
+                            ));
+                        }
                     }
                 }
                 // Manifest entries that targeted in-scope ecosystems but
@@ -1845,6 +1859,19 @@ async fn apply_patches_inner(
 
     let mut applied_base_purls: HashSet<String> = HashSet::new();
 
+    // Maven: the run's JVM caches (which copies a build consumes) and the
+    // patch service a member-keyed record's whole-jar swap downloads from,
+    // resolved once and only when a Maven patch is in scope.
+    let jvm_scope = if partitioned.contains_key(&Ecosystem::Maven) {
+        Some(JvmScope::of(&args.common).await)
+    } else {
+        None
+    };
+    let jvm_service = jvm_scope.as_ref().map(|_| {
+        args.common
+            .vendor_service_config(Some(client.clone()), client.uses_public_proxy())
+    });
+
     // PURL order, so the per-package Error/Warning lines, the results and
     // the `Patched packages:` block read the same on every run (the map is
     // a `HashMap`).
@@ -1878,6 +1905,36 @@ async fn apply_patches_inner(
             if vendored_bases.contains(base_purl.as_str())
                 || variants.iter().any(|v| is_vendored(v))
             {
+                continue;
+            }
+
+            // Maven: every copy a build consumes (`~/.m2` and each Gradle
+            // cache, version dirs expanded into their hash dirs), with the
+            // Gradle guards — see `apply_maven_base`.
+            if let Some(scope) = jvm_scope
+                .as_ref()
+                .filter(|_| Ecosystem::from_purl(purl) == Some(Ecosystem::Maven))
+            {
+                let maven = MavenBase {
+                    args,
+                    manifest: &manifest,
+                    base_purl: &base_purl,
+                    variants: &variants,
+                    pkg_paths,
+                    scope,
+                    sources: &sources,
+                    policy,
+                    service: jvm_service.as_ref(),
+                    socket_dir: &socket_dir,
+                };
+                let out = Box::pin(apply_maven_base(&maven)).await;
+                has_errors |= out.failed;
+                matched_manifest_purls.extend(out.matched);
+                run_warnings.extend(out.warnings);
+                if out.applied {
+                    applied_base_purls.insert(base_purl.clone());
+                }
+                results.extend(out.results);
                 continue;
             }
 
@@ -2209,6 +2266,385 @@ async fn apply_patches_inner(
         targeted: target_manifest_purls.len(),
         show_summary: true,
     })
+}
+
+/// One Maven base purl for [`apply_maven_base`].
+struct MavenBase<'a> {
+    args: &'a ApplyArgs,
+    manifest: &'a PatchManifest,
+    base_purl: &'a str,
+    /// The manifest's (qualified) purls of this base.
+    variants: &'a [String],
+    /// Every installed copy the resolver found.
+    pkg_paths: &'a [PathBuf],
+    scope: &'a JvmScope,
+    sources: &'a PatchSources<'a>,
+    policy: MismatchPolicy,
+    service: Option<&'a socket_patch_core::vendor::VendorServiceConfig>,
+    socket_dir: &'a Path,
+}
+
+/// What [`apply_maven_base`] reports back to the apply loop.
+#[derive(Default)]
+struct MavenApplied {
+    results: Vec<ApplyResult>,
+    /// Variants that reached apply (or a refusal naming them).
+    matched: Vec<String>,
+    warnings: Vec<RunWarning>,
+    /// The run fails (exit 1).
+    failed: bool,
+    /// Some copy ended patched.
+    applied: bool,
+}
+
+impl MavenApplied {
+    /// A refusal of `purl` with nothing written: a Failed event carrying
+    /// `code` and a run warning with the same code.
+    fn refuse(&mut self, purl: &str, path: &Path, code: &str, detail: String) {
+        self.results.push(ApplyResult {
+            package_key: purl.to_string(),
+            package_path: path.display().to_string(),
+            success: false,
+            files_verified: Vec::new(),
+            files_patched: Vec::new(),
+            applied_via: HashMap::new(),
+            error: Some(format!("{code}: {detail}")),
+            sidecar: None,
+        });
+        self.warn(code, detail);
+        self.failed = true;
+    }
+
+    fn warn(&mut self, code: &str, detail: String) {
+        self.warnings.push(RunWarning {
+            code: code.to_string(),
+            detail,
+        });
+    }
+
+    /// Record one copy's result: printed when it failed, a Windows
+    /// daemon lock surfaced as its own code.
+    fn record(&mut self, args: &ApplyArgs, result: ApplyResult) {
+        warn_mismatch_overwrites(&result, &args.common);
+        if let Some(advisory) = result
+            .sidecar
+            .as_ref()
+            .and_then(|s| s.advisory.as_ref())
+            .filter(|a| a.code == SidecarAdvisoryCode::GradleJarLockedByDaemon)
+        {
+            self.warn("gradle_jar_locked_by_daemon", advisory.message.clone());
+        }
+        if result.success {
+            self.applied = true;
+        } else {
+            self.failed = true;
+            if args.prints_errors() {
+                eprintln!(
+                    "{}",
+                    format_patch_failure(
+                        &result.package_key,
+                        result.error.as_deref().unwrap_or("unknown error")
+                    )
+                );
+            }
+        }
+        self.results.push(result);
+    }
+}
+
+/// Apply one Maven base purl's manifest variants to every installed copy a
+/// build consumes (#551): each `~/.m2` version dir and each Gradle
+/// `files-2.1` version dir, the latter expanded into the hash directories
+/// holding the record's files (`gradle_cache::installed_copies`). A
+/// member-keyed record swaps the whole jar instead (`jvm_jar`).
+///
+/// Gradle guards, each with its own run-warning code:
+///
+/// * `gradle_verification_metadata_present` — the build verifies its
+///   dependencies (`gradle/verification-metadata.xml`), which rewritten
+///   cache bytes would fail or, with key-only trust, slip past: every
+///   variant is refused, nothing written.
+/// * `gradle_build_ignores_m2` — the only copy is in `~/.m2`, which this
+///   Gradle-only build never reads: nothing applied, exit 1.
+/// * `gradle_ro_cache_shadows` — a copy sits in the read-only cache,
+///   which is never written and which Gradle may read first: the writable
+///   copies are patched, the run still fails.
+/// * `gradle_copy_unexpected_bytes` — a hash dir's file is the pristine
+///   download (its sha1 names the dir) but not the bytes the record was
+///   made for: that copy is left alone.
+/// * `gradle_transform_copy_stale` — after the write, Gradle still holds a
+///   copy derived from the pristine jar (`caches/transforms-*`, `jars-*`):
+///   that copy's result fails until it is cleared.
+async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
+    use socket_patch_core::crawlers::gradle_cache::{self, is_gradle_version_dir};
+    use socket_patch_core::patch::jvm_jar::{self, JarSwap, RecordShape};
+
+    let args = m.args;
+    let mut out = MavenApplied::default();
+    let variants: Vec<&String> = m
+        .variants
+        .iter()
+        .filter(|v| m.manifest.patches.contains_key(*v))
+        .collect();
+    let copies = m.scope.split(m.pkg_paths);
+
+    if let Some(metadata) = &m.scope.verification_metadata {
+        for variant in &variants {
+            out.refuse(
+                variant,
+                metadata,
+                "gradle_verification_metadata_present",
+                format!(
+                    "{}: {} turns on Gradle dependency verification, which checks the bytes \
+                     agent mode would rewrite in the Gradle cache; nothing was written. Use \
+                     `--mode vendored` or `--mode hosted` for this build.",
+                    normalize_purl(variant),
+                    metadata.display()
+                ),
+            );
+            out.matched.push((*variant).clone());
+        }
+        return out;
+    }
+
+    if !copies.read_only.is_empty() {
+        let list: Vec<String> = copies
+            .read_only
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        out.warn(
+            "gradle_ro_cache_shadows",
+            format!(
+                "{}: the read-only Gradle cache holds a copy ({}) that socket-patch never \
+                 writes and Gradle may resolve before the patched user-home copy; rebuild \
+                 the read-only cache from a patched user home.",
+                normalize_purl(m.base_purl),
+                list.join(", ")
+            ),
+        );
+        out.failed = true;
+    }
+    if copies.consumed.is_empty() {
+        if copies.read_only.is_empty() {
+            if let Some(m2) = copies.m2_ignored.first() {
+                out.refuse(
+                    m.base_purl,
+                    m2,
+                    "gradle_build_ignores_m2",
+                    format!(
+                        "{}: the only installed copy is in the Maven local repository ({}), \
+                         which this Gradle build never reads (no mavenLocal()); nothing was \
+                         patched. Run the build once so Gradle caches the artifact, then apply \
+                         again.",
+                        normalize_purl(m.base_purl),
+                        m2.display()
+                    ),
+                );
+            }
+        }
+        out.matched.extend(variants.iter().map(|v| (*v).clone()));
+        return out;
+    }
+
+    let multi = variants.len() > 1 || variants.first().is_some_and(|v| **v != m.base_purl);
+    let gate_variants = !args.force && multi;
+    let mut attempted = false;
+    for copy in &copies.consumed {
+        for variant in &variants {
+            let patch = &m.manifest.patches[*variant];
+            if let RecordShape::Members { jar_leaf } = jvm_jar::classify(variant, &patch.files) {
+                let dirs = jvm_jar::jar_copies(copy, &jar_leaf);
+                if dirs.is_empty() {
+                    continue;
+                }
+                if gate_variants {
+                    let mut installed = false;
+                    for dir in &dirs {
+                        installed |= matches!(
+                            jvm_jar::verify_members(dir, &jar_leaf, &patch.files).await,
+                            VerifyStatus::Ready | VerifyStatus::AlreadyPatched
+                        );
+                    }
+                    if !installed {
+                        continue;
+                    }
+                }
+                attempted = true;
+                out.matched.push((*variant).clone());
+                let swap = JarSwap {
+                    purl: variant,
+                    uuid: &patch.uuid,
+                    jar_leaf: &jar_leaf,
+                    files: &patch.files,
+                    socket_dir: m.socket_dir,
+                    dry_run: args.common.dry_run,
+                };
+                match Box::pin(jvm_jar::apply_jar_swap(&swap, &dirs, m.service)).await {
+                    Err(refusal) => out.refuse(variant, copy, refusal.code, refusal.message),
+                    Ok(results) => {
+                        for mut result in results {
+                            check_derived_copies(&mut out, &mut result, &jar_leaf, args).await;
+                            out.record(args, result);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Leaf record: the hash dirs holding its files (the copy itself
+            // for `~/.m2`). A key no hash dir holds means this Gradle copy
+            // does not hold the variant.
+            let targets = if is_gradle_version_dir(copy) {
+                let detailed = gradle_cache::installed_copies_detailed(copy, &patch.files);
+                if !detailed.missing.is_empty() {
+                    continue;
+                }
+                detailed.targets
+            } else {
+                vec![(copy.clone(), patch.files.clone())]
+            };
+            for (dir, files) in targets {
+                if gate_variants {
+                    let status = match representative_file(&files) {
+                        Some((name, info)) => {
+                            Some(verify_file_patch(&dir, name, info).await.status)
+                        }
+                        None => None,
+                    };
+                    if !variant_matches_installed(status.as_ref()) {
+                        continue;
+                    }
+                }
+                if let Some(detail) = unexpected_gradle_bytes(&dir, &files).await {
+                    out.warn("gradle_copy_unexpected_bytes", detail);
+                    continue;
+                }
+                attempted = true;
+                out.matched.push((*variant).clone());
+                let mut result = apply_package_patch(
+                    variant,
+                    &dir,
+                    &files,
+                    m.sources,
+                    Some(&patch.uuid),
+                    args.common.dry_run,
+                    m.policy,
+                )
+                .await;
+                for leaf in files.keys().filter(|k| k.ends_with(".jar")) {
+                    check_derived_copies(&mut out, &mut result, leaf, args).await;
+                }
+                out.record(args, result);
+            }
+        }
+    }
+    out.matched.sort();
+    out.matched.dedup();
+    if !attempted && !out.failed {
+        out.failed = true;
+        if args.prints_errors() {
+            eprintln!(
+                "{}",
+                format_patch_failure(m.base_purl, "no matching variant found")
+            );
+        }
+    }
+    out
+}
+
+/// `gradle_copy_unexpected_bytes`: a hash dir's file IS the pristine
+/// download (its sha1 names the dir) but hashes to neither side of the
+/// record — the record was made for other bytes. `None` when every file
+/// is expected (or the dir is not a Gradle hash dir).
+async fn unexpected_gradle_bytes(
+    dir: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> Option<String> {
+    use socket_patch_core::crawlers::gradle_cache::pristine;
+    use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+    if !maven_sidecars::is_gradle_hash_dir(dir) {
+        return None;
+    }
+    let hash_dir = dir.file_name()?.to_str()?;
+    for (leaf, info) in files {
+        let Ok(bytes) = tokio::fs::read(dir.join(leaf)).await else {
+            continue;
+        };
+        let git = compute_git_sha256_from_bytes(&bytes);
+        if pristine(hash_dir, &bytes) && git != info.before_hash && git != info.after_hash {
+            return Some(format!(
+                "{}: the Gradle cache's pristine download is not the file this patch was made \
+                 for (its hash matches neither side of the patch); this copy was left \
+                 unpatched.",
+                dir.join(leaf).display()
+            ));
+        }
+    }
+    None
+}
+
+/// After a Gradle hash dir's jar `jar_leaf` ends patched: the copies Gradle
+/// derived from the PRISTINE jar (`caches/transforms-*`, `jars-*`,
+/// instrumented jars) still serve the old bytes. Any proven one fails the
+/// copy's result (`gradle_transform_copy_stale`); a same-named copy whose
+/// bytes are neither the pristine nor the patched jar, or a walk cut short,
+/// is reported unverified (`gradle_transform_copy_unverified`). Skipped on
+/// a dry run and for any other directory.
+async fn check_derived_copies(
+    out: &mut MavenApplied,
+    result: &mut ApplyResult,
+    jar_leaf: &str,
+    args: &ApplyArgs,
+) {
+    let dir = PathBuf::from(&result.package_path);
+    let leaf = jar_leaf.trim_start_matches("package/").to_string();
+    if args.common.dry_run || !result.success || !maven_sidecars::is_gradle_hash_dir(&dir) {
+        return;
+    }
+    let probe = move || socket_patch_core::patch::jvm_jar::derived_copies(&dir, &leaf);
+    let Some(verdict) = tokio::task::spawn_blocking(probe).await.ok().flatten() else {
+        return;
+    };
+    let (stale, unknown, incomplete) = (verdict.stale, verdict.unverified, verdict.incomplete);
+    let list = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !stale.is_empty() {
+        let detail = format!(
+            "{}: Gradle keeps copies derived from the unpatched jar that builds may still \
+             load ({}); run `gradle --stop`, delete those directories, and apply again.",
+            normalize_purl(&result.package_key),
+            list(&stale)
+        );
+        result.success = false;
+        result.error = Some(format!("gradle_transform_copy_stale: {detail}"));
+        out.warn("gradle_transform_copy_stale", detail);
+    }
+    if !unknown.is_empty() || incomplete {
+        out.warn(
+            "gradle_transform_copy_unverified",
+            format!(
+                "{}: Gradle keeps copies derived from this jar that could not be matched to \
+                 the patched bytes{}{}; until they are cleared they may serve the old code.",
+                normalize_purl(&result.package_key),
+                if unknown.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", list(&unknown))
+                },
+                if incomplete {
+                    " (the cache walk was incomplete)"
+                } else {
+                    ""
+                }
+            ),
+        );
+    }
 }
 
 /// `Error: Failed to patch <purl>: <why>` (stderr, even under --silent).
