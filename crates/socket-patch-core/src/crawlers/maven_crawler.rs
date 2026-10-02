@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::gradle_cache;
 use super::jvm_cache::{self, JvmCacheLayout, JvmCacheRoot};
 use super::types::{CrawledPackage, CrawlerOptions};
 use super::walk_pool::{par_map, run_walk};
@@ -630,10 +631,13 @@ impl MavenCrawler {
     ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
         match JvmCacheLayout::classify(src_path) {
             JvmCacheLayout::Maven2 => {}
-            // Other layouts plug in here; until then they resolve nothing.
-            JvmCacheLayout::GradleModules2 | JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => {
-                return Ok(HashMap::new())
+            JvmCacheLayout::GradleModules2 => {
+                let src = src_path.to_path_buf();
+                let purls = purls.to_vec();
+                return Ok(run_walk(move || Self::find_in_files21(&src, &purls)).await);
             }
+            // Other layouts plug in here; until then they resolve nothing.
+            JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => return Ok(HashMap::new()),
         }
         let mut result: HashMap<String, CrawledPackage> = HashMap::new();
 
@@ -745,11 +749,72 @@ impl MavenCrawler {
     ) -> Vec<CrawledPackage> {
         match root.layout {
             JvmCacheLayout::Maven2 => self.scan_maven_repo(&root.path, seen),
+            JvmCacheLayout::GradleModules2 => Self::scan_files21(&root.path, seen),
             // Other layouts plug in here; until then they crawl nothing.
-            JvmCacheLayout::GradleModules2 | JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => {
-                Vec::new()
+            JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => Vec::new(),
+        }
+    }
+
+    /// Crawl a Gradle `files-2.1` tree: one package per version directory
+    /// that holds `<artifact>-<version>.{jar,pom,module}` in some hash
+    /// directory ([`gradle_cache::has_module_file`]), its path the VERSION
+    /// directory ([`gradle_cache::installed_copies`] expands it). The
+    /// coordinates are the directory names; no POM is read. Lock files never
+    /// narrow this: a dependency of an unlocked configuration (buildscript,
+    /// plugins) is as installed as a locked one.
+    fn scan_files21(root: &Path, seen: &mut HashSet<String>) -> Vec<CrawledPackage> {
+        let mut results = Vec::new();
+        for ((group_id, artifact_id, version), entries) in gradle_cache::walk_versions(root) {
+            if !gradle_cache::has_module_file(&entries) {
+                continue;
+            }
+            let purl = crate::utils::purl::build_maven_purl(&group_id, &artifact_id, &version);
+            if seen.insert(purl.clone()) {
+                results.push(CrawledPackage {
+                    path: root.join(&group_id).join(&artifact_id).join(&version),
+                    name: artifact_id,
+                    version,
+                    namespace: Some(group_id),
+                    purl,
+                });
             }
         }
+        results
+    }
+
+    /// [`Self::find_by_purls`] over a Gradle `files-2.1` tree: the version
+    /// directory `<root>/<group.id>/<artifact>/<version>` when it is
+    /// installed ([`gradle_cache::is_installed`]).
+    fn find_in_files21(root: &Path, purls: &[String]) -> HashMap<String, CrawledPackage> {
+        let mut result = HashMap::new();
+        for purl in purls {
+            let Some((group_id, artifact_id, version)) = crate::utils::purl::parse_maven_purl(purl)
+            else {
+                continue;
+            };
+            let gav = (
+                group_id.into_owned(),
+                artifact_id.into_owned(),
+                version.into_owned(),
+            );
+            // SECURITY: `is_installed` refuses unsafe coordinates before
+            // joining them onto the root (see `is_safe_maven_coordinate`).
+            if !gradle_cache::is_installed(root, &gav) {
+                continue;
+            }
+            let (group_id, artifact_id, version) = gav;
+            result.insert(
+                purl.clone(),
+                CrawledPackage {
+                    path: root.join(&group_id).join(&artifact_id).join(&version),
+                    name: artifact_id,
+                    version,
+                    namespace: Some(group_id),
+                    purl: purl.clone(),
+                },
+            );
+        }
+        result
     }
 
     /// [`Self::scan_maven_repo`] over an explicit chunk size, so tests can
