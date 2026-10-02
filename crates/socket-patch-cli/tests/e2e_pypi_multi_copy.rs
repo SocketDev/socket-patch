@@ -150,7 +150,10 @@ fn assert_every_copy_patched(
     let with = |base: &[&'static str]| -> Vec<&str> { base.iter().chain(g).copied().collect() };
 
     let (code, stdout, stderr) = run(cwd, &with(&["apply", "--offline", "--json"]), env);
-    assert_eq!(code, 0, "apply failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "apply failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let env_json = envelope(&stdout, &stderr);
     for (label, module) in copies {
         assert_eq!(
@@ -161,16 +164,16 @@ fn assert_every_copy_patched(
              stdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
-    let applied = env_json["results"]
+    let applied = env_json["events"]
         .as_array()
-        .expect("results array")
+        .expect("envelope events array")
         .iter()
-        .filter(|r| r["purl"] == json!(PURL) && r["success"] == json!(true))
+        .filter(|e| e["purl"] == json!(PURL) && e["action"] == json!("applied"))
         .count();
     assert_eq!(
         applied,
         copies.len(),
-        "one successful result per patched copy\nstdout:\n{stdout}"
+        "one `applied` event per patched copy\nstdout:\n{stdout}"
     );
 
     // A re-run sees every copy already patched: nothing fails.
@@ -186,7 +189,11 @@ fn assert_every_copy_patched(
     let doc = envelope(&stdout, &stderr);
     let stmts = doc["statements"].as_array().expect("statements");
     assert_eq!(stmts.len(), 1, "vex doc:\n{stdout}");
-    assert_eq!(stmts[0]["status"], json!("not_affected"), "vex doc:\n{stdout}");
+    assert_eq!(
+        stmts[0]["status"],
+        json!("not_affected"),
+        "vex doc:\n{stdout}"
+    );
 
     let (code, stdout, stderr) = run(
         cwd,
@@ -213,7 +220,11 @@ fn pipenv_workon_home_and_dot_venv_copies_are_all_patched() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
-    std::fs::write(project.join("Pipfile"), "[packages]\ndupkit = \"==1.0.0\"\n").unwrap();
+    std::fs::write(
+        project.join("Pipfile"),
+        "[packages]\ndupkit = \"==1.0.0\"\n",
+    )
+    .unwrap();
     let workon = tmp.path().join("wh");
     let workon_copy = install_dupkit(&venv_site_packages(&workon.join("proj-env")));
     let in_tree_copy = install_dupkit(&venv_site_packages(&project.join(".venv")));
