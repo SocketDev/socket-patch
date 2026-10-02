@@ -27,7 +27,7 @@
 //! (`maven_build_common`), Gradle via `SOCKET_PATCH_GRADLE_E2E_GRADLE` (the
 //! launcher; default `gradle` on `PATH`), `SOCKET_PATCH_GRADLE_E2E_VERSION`
 //! (the version it must report) and `SOCKET_PATCH_GRADLE_E2E_REQUIRED` (no
-//! SKIP). Scratch trees go under `TMPDIR`.
+//! SKIP) (`gradle_build_common`). Scratch trees go under `TMPDIR`.
 
 #[path = "maven_build_common/mod.rs"]
 mod maven_build_common;
@@ -35,47 +35,28 @@ mod maven_build_common;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
+#[path = "gradle_build_common/mod.rs"]
+mod gradle_build_common;
+
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use gradle_build_common::{
+    fixture_root, gradle_classpath, gradle_skip, lockfiles, snapshot, write_project, Gradle,
+};
 use maven_build_common::*;
 
 const UUID: &str = "1d3c1fd2-7b4e-4c1a-9f0e-2a3b4c5d6e7f";
 const SV: &str = "1.10.0-socket.1d3c1fd2";
-
-const GRADLE_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_GRADLE";
-const GRADLE_VERSION_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_VERSION";
-const GRADLE_REQUIRED_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_REQUIRED";
 
 /// The classpath probe. Not [`DEPENDENCY_PLUGIN`]: 3.6.x itself depends on
 /// `commons-text:1.10.0` (3.5.0 on 1.3), so purging the fixture version from
 /// the local repository would break the plugin realm, not the project.
 const CLASSPATH_PLUGIN: &str = "org.apache.maven.plugins:maven-dependency-plugin:3.5.0";
 
-/// Directories a build writes that a checkout never carries.
-const BUILD_OUTPUT_DIRS: &[&str] = &["target", "build", ".gradle", ".kotlin"];
-
 fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
-/// Java rejects the extended Windows paths returned by canonicalize.
-/// Keep a canonical root for symlinked macOS temp directories, but use the
-/// ordinary drive/UNC spelling when handing paths to Maven and Gradle.
-fn fixture_root(tmp: &tempfile::TempDir) -> PathBuf {
-    let root = tmp.path().canonicalize().unwrap();
-    #[cfg(windows)]
-    if let Some(path) = root.to_str() {
-        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-            return format!(r"\\{rest}").into();
-        }
-        if let Some(rest) = path.strip_prefix(r"\\?\") {
-            return rest.into();
-        }
-    }
-    root
 }
 
 fn git_sha256(bytes: &[u8]) -> String {
@@ -174,33 +155,6 @@ fn stage_manifest(proj: &Path, member_before: &[u8], member_after: &[u8]) {
         member_after,
     )
     .unwrap();
-}
-
-/// Every committable file under `root` (build output skipped), keyed by its
-/// forward-slash relative path.
-fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
-    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let entry = entry.unwrap();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let path = entry.path();
-            if entry.file_type().unwrap().is_dir() {
-                if !BUILD_OUTPUT_DIRS.contains(&name.as_str()) {
-                    walk(root, &path, out);
-                }
-                continue;
-            }
-            let rel = path
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            out.insert(rel, std::fs::read(&path).unwrap());
-        }
-    }
-    let mut out = BTreeMap::new();
-    walk(root, root, &mut out);
-    out
 }
 
 /// `(changed, added, removed)` paths from `before` to `after`.
@@ -578,109 +532,6 @@ fn maven_reactor_vendor_fresh_checkout_offline_build_and_byte_exact_revert() {
 
 // ── P2: Gradle multi-project with dependency locking ────────────────────
 
-fn gradle_flag(name: &str) -> bool {
-    std::env::var_os(name).is_some_and(|v| !v.is_empty())
-}
-
-fn gradle_skip(suite: &str, why: &str) {
-    assert!(
-        !gradle_flag(GRADLE_REQUIRED_ENV),
-        "{suite}: {GRADLE_REQUIRED_ENV} is set but the Gradle capstone cannot run: {why}"
-    );
-    println!("SKIP {suite}: {why}");
-}
-
-/// The selected Gradle launcher, run hermetically: a per-test
-/// `GRADLE_USER_HOME`, no daemon, plain console, ambient options scrubbed.
-struct Gradle {
-    program: OsString,
-    version: String,
-}
-
-impl Gradle {
-    fn command(program: &OsString, home: Option<&Path>) -> Command {
-        let mut cmd = Command::new(program);
-        for key in ["GRADLE_OPTS", "JAVA_OPTS", "GRADLE_USER_HOME"] {
-            cmd.env_remove(key);
-        }
-        for key in CI_DETECTOR_ENV {
-            cmd.env_remove(key);
-        }
-        if let Some(home) = home {
-            cmd.env("GRADLE_USER_HOME", home);
-        }
-        cmd
-    }
-
-    fn detect(suite: &str, home: &Path) -> Option<Gradle> {
-        let program: OsString = std::env::var_os(GRADLE_ENV)
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| {
-                if cfg!(windows) {
-                    "gradle.bat"
-                } else {
-                    "gradle"
-                }
-                .into()
-            });
-        let out = match Self::command(&program, Some(home))
-            .args(["--version", "--no-daemon"])
-            .output()
-        {
-            Ok(out) => out,
-            Err(e) => {
-                gradle_skip(
-                    suite,
-                    &format!("`{}` did not run: {e}", program.to_string_lossy()),
-                );
-                return None;
-            }
-        };
-        let banner = String::from_utf8_lossy(&out.stdout).into_owned();
-        let Some(version) = banner.lines().find_map(|l| {
-            l.trim()
-                .strip_prefix("Gradle ")
-                .map(|v| v.trim().to_string())
-        }) else {
-            gradle_skip(
-                suite,
-                &format!(
-                    "`{} --version` printed no `Gradle <v>` banner:\n{}{}",
-                    program.to_string_lossy(),
-                    banner,
-                    String::from_utf8_lossy(&out.stderr)
-                ),
-            );
-            return None;
-        };
-        if let Some(pin) = std::env::var(GRADLE_VERSION_ENV)
-            .ok()
-            .filter(|v| !v.is_empty())
-        {
-            assert_eq!(
-                version,
-                pin,
-                "{GRADLE_VERSION_ENV} pins Gradle {pin} but `{}` is Gradle {version}",
-                program.to_string_lossy()
-            );
-        }
-        println!(
-            "{suite}: driving Gradle {version} ({})",
-            program.to_string_lossy()
-        );
-        Some(Gradle { program, version })
-    }
-
-    fn run(&self, cwd: &Path, home: &Path, args: &[&str]) -> Output {
-        Self::command(&self.program, Some(home))
-            .current_dir(cwd)
-            .args(["--no-daemon", "--console=plain", "--stacktrace"])
-            .args(args)
-            .output()
-            .expect("spawn gradle")
-    }
-}
-
 const GRADLE_SETTINGS: &str = r#"buildscript {
     repositories { mavenCentral() }
     dependencies { classpath("org.apache.commons:commons-text:1.10.0") }
@@ -737,33 +588,14 @@ const APPLY_LINE: &str =
     r#"apply(from = ".socket/gradle/socket-patch.settings.gradle") // socket-patch"#;
 
 fn write_gradle_project(proj: &Path) {
-    for (rel, body) in [
-        ("settings.gradle.kts", GRADLE_SETTINGS),
-        ("lib/build.gradle.kts", GRADLE_LIB),
-        ("app/build.gradle.kts", GRADLE_APP),
-    ] {
-        let path = proj.join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
-    }
-}
-
-/// The `SOCKET-CP` lines `:app:printRuntimeClasspath` printed.
-fn gradle_classpath(out: &Output) -> Vec<PathBuf> {
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.strip_prefix("SOCKET-CP "))
-        .map(PathBuf::from)
-        .collect()
-}
-
-/// Every Gradle lockfile under `root`: `<project>/gradle.lockfile` on 7+,
-/// `<project>/gradle/dependency-locks/<configuration>.lockfile` on 6.x.
-fn lockfiles(root: &Path) -> BTreeMap<String, Vec<u8>> {
-    snapshot(root)
-        .into_iter()
-        .filter(|(rel, _)| rel.ends_with(".lockfile"))
-        .collect()
+    write_project(
+        proj,
+        &[
+            ("settings.gradle.kts", GRADLE_SETTINGS),
+            ("lib/build.gradle.kts", GRADLE_LIB),
+            ("app/build.gradle.kts", GRADLE_APP),
+        ],
+    );
 }
 
 fn gradle_tree_rel() -> String {
