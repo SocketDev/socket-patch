@@ -226,20 +226,21 @@ pub(super) const PRUNE_SKIPPED_EMPTY: &str = "Warning: --prune skipped: no insta
 /// The `vendor_ledger_entry_unwired` warning: vendored entries whose
 /// dependency left the lockfile (upgraded or removed), so the scan no
 /// longer discovers them. `--prune` reverts them, unless their lock entries
-/// were re-resolved since vendoring: the GC then drift-keeps them and the
-/// warning recurs, so the detail names that way out too.
+/// were re-resolved since vendoring: the GC then drift-keeps them, and only
+/// restoring the pre-vendor lock lets the same prune converge (the
+/// drift-keep contract), so the detail names that way out too.
 pub(super) fn unwired_vendored_detail(purls: &[String]) -> String {
     let one = purls.len() == 1;
+    let them = if one { "it" } else { "them" };
     format!(
         "{} no longer used by the lockfile (the dependency was upgraded or removed) and {} \
-         skipped; run `socket-patch scan --mode vendored --prune` to revert {}. If that run \
-         keeps {} because the lock entries were re-resolved since vendoring, restore the \
-         vendored dependency and run `socket-patch vendor --revert`: {}",
+         skipped ({}); run `socket-patch scan --prune` to revert {them}. If that run keeps \
+         {them} because the lock entries were re-resolved since vendoring, restore the lockfile \
+         from before vendoring, run `socket-patch scan --prune` again, then re-run your package \
+         manager's install",
         crate::ui::plural(purls.len(), "vendored entry is", "vendored entries are"),
         if one { "was" } else { "were" },
-        if one { "it" } else { "them" },
-        if one { "it" } else { "them" },
-        purls.join(", ")
+        purls.join(", "),
     )
 }
 
