@@ -40,12 +40,14 @@ def job_text(job):
 
 class Tiers(unittest.TestCase):
     def test_every_row_is_a_test_target(self):
+        # `suite` may list several binaries; an `allow_empty` row may name
+        # suites that have not landed yet (test_ci_gradle_prefixes.py).
         for job in ("e2e", "e2e-full"):
             for row in rows(job):
-                with self.subTest(job=job, row=row):
-                    suite = row["suite"]
-                    self.assertTrue((TESTS / f"{suite}.rs").is_file() or (TESTS / suite / "main.rs").is_file(),
-                                    f"no test target {suite}")
+                for suite in bundle.row_suites(row):
+                    with self.subTest(job=job, row=row, suite=suite):
+                        self.assertTrue((TESTS / f"{suite}.rs").is_file() or (TESTS / suite / "main.rs").is_file(),
+                                        f"no test target {suite}")
 
     def test_full_rows_only_add_releases_to_pr_suites(self):
         pr = {(r["suite"], r["os"], r.get("test_filter", "")) for r in rows("e2e")}
@@ -98,7 +100,8 @@ class Tiers(unittest.TestCase):
                 for job in ("e2e", "e2e-full"):
                     for row in rows(job):
                         if row["os"] == os_name:
-                            self.assertIn(row["suite"], suites)
+                            for suite in bundle.row_suites(row):
+                                self.assertIn(suite, suites)
 
     def test_bundle_reads_cargo_json(self):
         json_lines = "\n".join([
@@ -112,6 +115,140 @@ class Tiers(unittest.TestCase):
         ])
         self.assertEqual({k: str(v) for k, v in bundle.executables(json_lines).items()},
                          {"e2e_vlt": "/t/deps/e2e_vlt-abc"})
+
+
+GRADLE_COMPAT = ROOT / ".github" / "workflows" / "gradle-compatibility.yml"
+GRADLE_LINES = {"6.9.4": "11", "7.6.6": "17", "8.14.3": "21", "9.8.0": "21"}
+AGENT_HOSTED = ("e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build",
+                "--ignored gradle_agent_ gradle_hosted_")
+VENDOR = ("e2e_vendor_gradle_build e2e_vendor_jvm_build", "--ignored gradle_vendor_ gradle_multi_project")
+
+
+def matrix_axes(job_lines):
+    """`{axis: [values]}` of a job's flow-list matrix axes (`os: [a, b]`)."""
+    axes = {}
+    for line in job_lines:
+        match = re.match(r"^        ([a-z_]+): \[(.*)\]\s*$", rows_mod.strip_comment(line))
+        if match:
+            axes[match.group(1)] = [rows_mod.scalar(v) for v in rows_mod.split_top(match.group(2))]
+    return axes
+
+
+def expand(job_lines):
+    """GitHub's matrix expansion for axes + an `include` that only extends."""
+    axes = matrix_axes(job_lines)
+    names = list(axes)
+    cells = [dict(zip(names, combo)) for combo in itertools.product(*(axes[n] for n in names))]
+    for extra in rows_mod.matrix_include(job_lines):
+        matched = [c for c in cells if all(c.get(k, v) == v for k, v in extra.items() if k in names)]
+        assert matched, f"include {extra} would add a cell"
+        for cell in matched:
+            for key, value in extra.items():
+                cell.setdefault(key, value)
+    return cells
+
+
+class GradleRows(unittest.TestCase):
+    """The PR-tier Gradle rows are the lean table the campaign decided on, the
+    JVM-tool steps key on `jvm_tool`, and gradle-compatibility.yml expands to
+    the full grid."""
+
+    def test_pr_rows_are_the_lean_table(self):
+        gradle = [r for r in rows("e2e") if r.get("jvm_tool") == "gradle"]
+        want = []
+        for line, java in GRADLE_LINES.items():
+            for suite, test_filter in (AGENT_HOSTED, VENDOR):
+                want.append({"os": "ubuntu-latest", "suite": suite, "jvm_tool": "gradle", "gradle": line,
+                             "java": java, "test_filter": test_filter, "allow_empty": "true"})
+        want.append({"os": "windows-latest", "suite": "e2e_vendor_jvm_build", "jvm_tool": "gradle",
+                     "gradle": "8.14.3", "java": "17", "test_filter": "--ignored gradle_multi_project"})
+        self.assertEqual(len(gradle), 9)
+        self.assertEqual(sorted(map(str, gradle)), sorted(map(str, want)))
+        self.assertFalse([r for r in rows("e2e-full") if "gradle" in r or "jvm_tool" in r])
+
+    def test_jvm_tool_marks_every_jvm_row(self):
+        for job in ("e2e", "e2e-full"):
+            for row in rows(job):
+                with self.subTest(row=row):
+                    if "gradle" in row:
+                        self.assertEqual(row.get("jvm_tool"), "gradle")
+                    elif "maven" in row:
+                        self.assertEqual(row.get("jvm_tool"), "maven")
+                    else:
+                        self.assertNotIn("jvm_tool", row)
+                    self.assertIn(row.get("jvm_tool", "gradle"), ("gradle", "maven", "sbt"))
+
+    def test_steps_key_on_jvm_tool_and_maven_only_where_seeded(self):
+        steps = dict(rows_mod.steps(JOBS["e2e"]))
+        select = steps["Select the JVM toolchain (JVM legs)"]
+        self.assertIn("if: matrix.jvm_tool != ''", select)
+        self.assertIn('var="JAVA_HOME_${JAVA_FEATURE}_${arch}"', select)
+        self.assertIn("maven) maven=true ;;", select)
+        self.assertIn("gradle) case \" $TEST_FILTER \" in *gradle_vendor_*|*gradle_multi_project*) maven=true ;; esac ;;",
+                      select)
+        self.assertIn("if: matrix.jvm_tool != '' && steps.jvm.outputs.runner-jdk != 'true'",
+                      steps["Setup Java (JDK not on the runner image)"])
+        self.assertIn("if: steps.jvm.outputs.maven == 'true'", steps["Install Maven ${{ matrix.maven || '3.9.16' }}"])
+        run = steps["Run e2e tests"]
+        self.assertIn("SOCKET_PATCH_MAVEN_E2E_REQUIRED: ${{ steps.jvm.outputs.maven == 'true' && '1' || '' }}", run)
+        self.assertIn("SOCKET_PATCH_MAVEN_E2E_VERSION: ${{ steps.jvm.outputs.maven == 'true' && "
+                      "(matrix.maven || '3.9.16') || '' }}", run)
+        self.assertNotIn("matrix.gradle != '') && '1'", run)
+
+    def test_maven_seeding_follows_the_filter(self):
+        def needs_maven(row):
+            if row.get("jvm_tool") == "maven":
+                return True
+            words = row.get("test_filter", "").split()
+            return row.get("jvm_tool") == "gradle" and any(
+                w.startswith("gradle_vendor_") or w.startswith("gradle_multi_project") for w in words)
+        gradle = [r for r in rows("e2e") if r.get("jvm_tool") == "gradle"]
+        self.assertEqual(sum(needs_maven(r) for r in gradle), 5, "the vendor legs + the windows multi-project leg")
+        for row in gradle:
+            self.assertEqual(needs_maven(row), "gradle_hosted_" not in row["test_filter"], row)
+
+    def test_compat_grid_expands_to_36_cells_plus_extras(self):
+        compat = rows_mod.jobs(GRADLE_COMPAT.read_text(encoding="utf-8"))
+        cells = expand(compat["cells"])
+        self.assertEqual(len(cells), 36)
+        self.assertEqual({(c["os"], c["gradle"], c["java"], c["mode"]) for c in cells},
+                         {(o, g, j, m) for o in ("ubuntu-latest", "macos-latest", "windows-latest")
+                          for g, j in GRADLE_LINES.items() for m in ("agent", "hosted", "vendor")})
+        extras = rows_mod.matrix_include(compat["extras"])
+        self.assertEqual(len(extras), 13)
+        labels = {}
+        for row in extras:
+            labels.setdefault(row["label"], []).append(row)
+            self.assertEqual(row["os"], "ubuntu-latest")
+        ceilings = {(r["gradle"], r["java"]) for r in labels["jdk-ceiling"]}
+        self.assertEqual(ceilings, {("6.9.4", "16"), ("7.6.6", "19"), ("8.14.3", "24")})
+        self.assertEqual(len(labels["jdk-ceiling"]), 9)
+        self.assertEqual({(r["gradle"], r["mode"]) for r in labels["configuration-cache"]},
+                         {("9.8.0", "hosted"), ("9.8.0", "vendor")})
+        self.assertEqual([(r["gradle"], r["mode"], r.get("record_only")) for r in labels["isolated-projects"]],
+                         [("9.8.0", "hosted", "true")])
+        self.assertEqual([(r["gradle"], r["real_central"]) for r in labels["real-central"]], [("8.14.3", "1")])
+        self.assertEqual(set(GRADLE_LINES), {r["gradle"] for r in rows("e2e") if r.get("jvm_tool") == "gradle"},
+                         "both tiers run the same Gradle lines")
+
+    def test_compat_workflow_builds_its_own_binaries(self):
+        text = GRADLE_COMPAT.read_text(encoding="utf-8")
+        compat = rows_mod.jobs(text)
+        self.assertIn("fail-fast: false", "\n".join(compat["cells"]))
+        self.assertIn("timeout-minutes: 60", "\n".join(compat["cells"]))
+        self.assertIn("--suites $BUNDLE_SUITES", "\n".join(compat["build"]))
+        self.assertIn("python3 scripts/ci-e2e-bundle.py --check", "\n".join(compat["build"]))
+        self.assertNotIn("e2e-bin", text, "the grid never reuses ci.yml's bundle")
+        for trigger in ("pull_request:", "schedule:", "workflow_dispatch:"):
+            self.assertIn(trigger, text)
+        for path in ("crates/socket-patch-core/src/gradle/**", "crates/socket-patch-core/src/crawlers/gradle_cache.rs",
+                     "crates/socket-patch-core/src/vendor/jvm/**", "crates/socket-patch-core/src/patch/jvm_jar.rs",
+                     "crates/socket-patch-cli/tests/jvm_fixture_repo/**", "crates/socket-patch-cli/tests/e2e_*gradle*"):
+            self.assertIn(f"'{path}'", text)
+        self.assertIn("6.9 <= 16", text)
+        self.assertIn("7.6 <= 19", text)
+        self.assertIn("8.14 <= 24", text)
+        self.assertIn("gradle-probe", text)
 
 
 class PdmCapstone(unittest.TestCase):

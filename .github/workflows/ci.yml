@@ -1065,30 +1065,46 @@ jobs:
           # 3.9 (trusted checksums), 4.0 rc. Hosted also runs both sides of
           # the trusted-checksums floor: 3.9.3 (last release that ignores
           # the .mvn/checksums pin) and 3.9.4 (first that enforces it).
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '3.6.3'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '3.8.9'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '3.9.3'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '3.9.4'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '3.9.16'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '4.0.0-rc-6'}
-          - {os: macos-latest, suite: e2e_redirect_maven_build, maven: '3.9.16'}
-          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, maven: '3.6.3'}
-          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, maven: '3.8.9'}
-          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, maven: '3.9.16'}
-          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, maven: '4.0.0-rc-6'}
-          - {os: macos-latest, suite: e2e_vendor_maven_build, maven: '3.9.16'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, maven: '3.6.3', test_filter: '--ignored maven_reactor'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, maven: '3.8.9', test_filter: '--ignored maven_reactor'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, maven: '3.9.2', test_filter: '--ignored maven_reactor'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, maven: '4.0.0-rc-6', test_filter: '--ignored maven_reactor'}
-          - {os: macos-latest, suite: e2e_vendor_jvm_build, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
-          - {os: windows-latest, suite: e2e_vendor_jvm_build, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_multi_project'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, gradle: '7.6.4', java: '17', test_filter: '--ignored gradle_multi_project'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, gradle: '8.14.3', java: '17', test_filter: '--ignored gradle_multi_project'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, gradle: '9.8.0', java: '17', test_filter: '--ignored gradle_multi_project'}
-          - {os: windows-latest, suite: e2e_vendor_jvm_build, gradle: '8.14.3', java: '17', test_filter: '--ignored gradle_multi_project'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.6.3'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.8.9'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.3'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.4'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.16'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '4.0.0-rc-6'}
+          - {os: macos-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.16'}
+          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.6.3'}
+          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.8.9'}
+          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
+          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '4.0.0-rc-6'}
+          - {os: macos-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.6.3', test_filter: '--ignored maven_reactor'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.8.9', test_filter: '--ignored maven_reactor'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.2', test_filter: '--ignored maven_reactor'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
+          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '4.0.0-rc-6', test_filter: '--ignored maven_reactor'}
+          - {os: macos-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
+          - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
+          # Real-Gradle capstones, PR tier: one leg per Gradle line x {agent +
+          # hosted, vendor + multi-project} on ubuntu, each on its line's LTS
+          # JDK. Every other OS x line x mode cell (and the JDK-ceiling,
+          # configuration-cache, Isolated Projects and real-Central rows) runs
+          # in gradle-compatibility.yml. `suite` lists every binary the leg
+          # runs (space-separated); the libtest filters select by the prefix
+          # contract ci-e2e-bundle.py enforces. `allow_empty: 'true'` marks a
+          # leg whose owning suites have not all landed: unlanded suites are
+          # skipped and zero selected tests is not a failure (without it a
+          # Gradle leg that ran nothing fails). test_ci_gradle_prefixes.py
+          # makes the last package drop it. Maven is installed only where a
+          # selected test seeds through it (gradle_vendor_395, multi-project).
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_agent_ gradle_hosted_', allow_empty: 'true'}
+          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_vendor_ gradle_multi_project', allow_empty: 'true'}
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_agent_ gradle_hosted_', allow_empty: 'true'}
+          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_vendor_ gradle_multi_project', allow_empty: 'true'}
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_', allow_empty: 'true'}
+          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_vendor_ gradle_multi_project', allow_empty: 'true'}
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_', allow_empty: 'true'}
+          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_vendor_ gradle_multi_project', allow_empty: 'true'}
+          - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: gradle, gradle: '8.14.3', java: '17', test_filter: '--ignored gradle_multi_project'}
           # Real .NET SDK capstones: hosted + vendored nuget, one leg per SDK
           # major (the suite pins the major through a sandbox global.json):
           # the oldest and newest here, 7-9 on ubuntu in e2e-full.
@@ -1258,15 +1274,54 @@ jobs:
           php-version: '8.2'
           tools: composer:${{ matrix.composer }}
 
-      - name: Setup Java (Maven and Gradle legs)
-        if: matrix.maven != '' || matrix.gradle != ''
+      - name: Select the JVM toolchain (JVM legs)
+        id: jvm
+        if: matrix.jvm_tool != ''
+        # `jvm_tool` (gradle | maven | sbt) marks a JVM leg. The JDK comes
+        # from the runner image (JAVA_HOME_<N>_X64 / _arm64: 8, 11, 17 and 21
+        # on every hosted OS) when it has the pinned feature release, else
+        # from setup-java below. Maven is needed by the Maven legs and by the
+        # Gradle legs whose filter selects a Maven-seeded test
+        # (gradle_vendor_*, which covers gradle_vendor_395, and the
+        # multi-project capstone); agent / hosted Gradle legs run without it.
+        shell: bash
+        env:
+          JVM_TOOL: ${{ matrix.jvm_tool }}
+          JAVA_FEATURE: ${{ matrix.java || '17' }}
+          TEST_FILTER: ${{ matrix.test_filter }}
+        run: |
+          set -euo pipefail
+          home=''
+          for arch in X64 arm64 ARM64; do
+            var="JAVA_HOME_${JAVA_FEATURE}_${arch}"
+            if [ -n "${!var:-}" ]; then home="${!var}"; break; fi
+          done
+          if [ -n "$home" ]; then
+            bin="$home/bin"
+            if [ "$RUNNER_OS" = Windows ]; then bin="$home\\bin"; fi
+            echo "JAVA_HOME=$home" >> "$GITHUB_ENV"
+            echo "$bin" >> "$GITHUB_PATH"
+            echo "runner-jdk=true" >> "$GITHUB_OUTPUT"
+            echo "JDK $JAVA_FEATURE from the runner image: $home"
+          else
+            echo "runner-jdk=false" >> "$GITHUB_OUTPUT"
+          fi
+          maven=false
+          case "$JVM_TOOL" in
+            maven) maven=true ;;
+            gradle) case " $TEST_FILTER " in *gradle_vendor_*|*gradle_multi_project*) maven=true ;; esac ;;
+          esac
+          echo "maven=$maven" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Java (JDK not on the runner image)
+        if: matrix.jvm_tool != '' && steps.jvm.outputs.runner-jdk != 'true'
         uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: ${{ matrix.java || '17' }}
 
       - name: Install Maven ${{ matrix.maven || '3.9.16' }}
-        if: matrix.maven != '' || matrix.gradle != ''
+        if: steps.jvm.outputs.maven == 'true'
         # Straight from the Apache archive (sha512-verified), so a leg gets
         # exactly the release it names rather than the runner's Maven.
         shell: bash
@@ -1401,26 +1456,57 @@ jobs:
           SOCKET_PATCH_BUNDLER_E2E_VERSION: ${{ matrix.bundler }}
           SOCKET_PATCH_COMPOSER_E2E_REQUIRED: ${{ matrix.composer != '' && '1' || '' }}
           SOCKET_PATCH_COMPOSER_E2E_VERSION: ${{ matrix.composer }}
-          SOCKET_PATCH_MAVEN_E2E_REQUIRED: ${{ (matrix.maven != '' || matrix.gradle != '') && '1' || '' }}
-          SOCKET_PATCH_MAVEN_E2E_VERSION: ${{ matrix.maven || (matrix.gradle != '' && '3.9.16') || '' }}
+          SOCKET_PATCH_MAVEN_E2E_REQUIRED: ${{ steps.jvm.outputs.maven == 'true' && '1' || '' }}
+          SOCKET_PATCH_MAVEN_E2E_VERSION: ${{ steps.jvm.outputs.maven == 'true' && (matrix.maven || '3.9.16') || '' }}
           SOCKET_PATCH_GRADLE_E2E_REQUIRED: ${{ matrix.gradle != '' && '1' || '' }}
           SOCKET_PATCH_GRADLE_E2E_VERSION: ${{ matrix.gradle }}
+          SOCKET_PATCH_GRADLE_E2E_PROBE_DIR: ${{ matrix.gradle != '' && format('{0}/target/gradle-probe', github.workspace) || '' }}
           SOCKET_PATCH_DOTNET_E2E_REQUIRED: ${{ matrix.dotnet != '' && '1' || '' }}
           SOCKET_PATCH_DOTNET_E2E_VERSION: ${{ matrix.dotnet }}
           SOCKET_PATCH_DENO_E2E_REQUIRED: ${{ matrix.deno != '' && '1' || '' }}
           SOCKET_PATCH_DENO_E2E_VERSION: ${{ matrix.deno }}
           E2E_SUITE: ${{ matrix.suite }}
           E2E_TEST_FILTER: ${{ matrix.test_filter || '--ignored' }}
+          E2E_JVM_TOOL: ${{ matrix.jvm_tool }}
+          E2E_ALLOW_EMPTY: ${{ matrix.allow_empty }}
         shell: bash
         # Runs from the package root with CARGO_MANIFEST_DIR set, as
-        # `cargo test` would.
+        # `cargo test` would. `suite` may name several binaries; an
+        # `allow_empty` row skips the ones whose test file has not landed.
+        # A Gradle leg must run at least one test unless `allow_empty`.
         run: |
+          set -uo pipefail
           exe=''
           if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
           cd crates/socket-patch-cli
           export CARGO_MANIFEST_DIR="$PWD"
-          # shellcheck disable=SC2086 # the filter is several libtest arguments
-          "../../target/e2e-bin/$E2E_SUITE$exe" $E2E_TEST_FILTER
+          status=0
+          ran=0
+          for suite in $E2E_SUITE; do
+            if [ "$E2E_ALLOW_EMPTY" = true ] && [ ! -f "tests/$suite.rs" ] && [ ! -f "tests/$suite/main.rs" ]; then
+              echo "::notice::$suite has not landed yet; skipped (allow_empty)"
+              continue
+            fi
+            log="../../target/e2e-$suite.log"
+            # shellcheck disable=SC2086 # the filter is several libtest arguments
+            "../../target/e2e-bin/$suite$exe" $E2E_TEST_FILTER 2>&1 | tee "$log" || status=1
+            passed=$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed;.*/\1/p' "$log" | head -n 1)
+            ran=$((ran + ${passed:-0}))
+          done
+          if [ "$status" = 0 ] && [ "$E2E_JVM_TOOL" = gradle ] && [ "$ran" = 0 ] && [ "$E2E_ALLOW_EMPTY" != true ]; then
+            echo "::error::the Gradle leg ran no test ($E2E_SUITE: $E2E_TEST_FILTER)"
+            status=1
+          fi
+          exit "$status"
+
+      - name: Upload the Gradle probe reports
+        if: always() && matrix.gradle != ''
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: gradle-probe-pr-${{ matrix.os }}-${{ matrix.gradle }}-${{ strategy.job-index }}
+          path: target/gradle-probe/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Run vlt e2e tests
         if: matrix.vlt != ''
