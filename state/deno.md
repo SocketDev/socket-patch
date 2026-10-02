@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Deno bug-hunt routine (label pm:deno).
 
-Last updated: 2026-10-02 (run 6), main `61cfb9b`, latest release 4.0.0 (previous 3.3.0). Newest Deno is 2.9.7. Fix PR #496 for #373 was checked against real layouts and passes.
+Last updated: 2026-10-02 (run 7), main `61cfb9b`, latest release 4.0.0 (previous 3.3.0). Newest Deno is 2.9.7. Fix PR #496 for #373 passes against real layouts. Fix PR #517 for #516 misses Deno `_1` copies even with #496 (commented on #516).
 
 Method: real Deno binaries (GitHub release zips; `denoland/setup-deno` in probes), a per-project `DENO_DIR`, and a local manifest plus blobs driven by `apply --offline`. The patched bytes record themselves in `globalThis.__SP`, so `deno run` shows which patched modules actually loaded. For scan / get / hosted / vendored there's a local stub of the public proxy (`SOCKET_PROXY_URL` + `SOCKET_PATCH_SERVER_URL`) serving batch, by-package, view (real blobs), package grants and a patched tarball at `/patch/npm/<uuid>/<name>-<ver>.tgz`. Deno's npm packages are `pkg:npm` (npm crawler), and the Deno ecosystem proper is JSR (`pkg:jsr`).
 
@@ -22,7 +22,7 @@ Method: real Deno binaries (GitHub release zips; `denoland/setup-deno` in probes
 | --- | --- | --- | --- | --- |
 | 1.46.3 | n/a (single copy) | untested | fail #373 | untested |
 | 2.0.6 / 2.2.15 | fail #373 (`_1` left unpatched, apply success, VEX not_affected); pass with #496 | untested | fail #373 | untested |
-| 2.9.7 | fail #373 (same); pass with #496; VEX partial-revert hits #516 | fail #373 when transitive (direct passes); pass with #496 | fail #373; pass with #496 | pass |
+| 2.9.7 | fail #373 (same); pass with #496; VEX partial-revert hits #516, still fails with #517 + #496 (`find_by_purls` skips peer variants) | fail #373 when transitive (direct passes); pass with #496 | fail #373; pass with #496 | pass |
 
 ### `nodeModulesLinker: "hoisted"` (Deno ≥ 2.8, needs `nodeModulesDir: manual`), agent mode
 
@@ -31,6 +31,7 @@ Method: real Deno binaries (GitHub release zips; `denoland/setup-deno` in probes
 | Linux / macOS / Windows | 2.8.3, 2.9.7 | pass | pass | pass | pass | pass | pass | pass (Linux 2.9.7) |
 | Linux | 2.9.7, `workspace` members | pass (doubly nested too) | pass | — | — | pass | pass | — |
 | Linux | 2.9.7, duplicate copies of one `name@version` | pass (both patched) | — | — | — | fail (only the first copy is hashed; handed over to npm) | — | — |
+| Linux | 2.9.7, `deno install` after apply, then rollback | — | — | — | — | — | pass (`alreadyOriginal`, rc 0, manifest emptied) | — |
 
 ### Global mode (`-g` / `--global-prefix` / `SOCKET_GLOBAL`), `deno install -g` of a tool with an `npm:` dep
 
@@ -41,17 +42,17 @@ Method: real Deno binaries (GitHub release zips; `denoland/setup-deno` in probes
 | Linux | 2.7.0 → 2.9.7 (layout only) | — | — | — | per-tool dir from 2.7.0; decoy `node_modules` for local tools by 2.7.14 (#444 comment) | — | — | — |
 | Linux / macOS / Windows | 1.46.3, 2.0.6, 2.2.15, 2.4.5, 2.9.6 (probe) | Windows also #434 | fail #444 | fail #444 | 2.9.6 only: fail #444 | untested | 2.9.6 decoy: false `not_affected` | untested |
 
-Other passes (Linux): an immutable (`chattr +i`) target fails loudly (`apply_failed`, exit 1), `list --json`, re-apply idempotency, rollback, `remove`, breaking cache hardlinks, end-to-end `scan --mode agent` via the stub, unicode / space paths, and deno.lock v3 / v5 never edited (`--frozen` still OK).
+Other passes (Linux): an immutable (`chattr +i`) target fails loudly (`apply_failed`, exit 1), `list --json`, re-apply idempotency, rollback, `remove`, breaking cache hardlinks, end-to-end `scan --mode agent` via the stub, unicode / space paths, and deno.lock v3 / v4 (2.2.15) / v5 never edited (`--frozen` still OK, patched copy loads).
 
 ## Backlog
 
 0. **Maintainer request (global mode), partly covered.** Filed #444 (still open on `61cfb9b`, no fix PR). Still to do: an unwritable global prefix (read-only `DENO_INSTALL_ROOT` / `DENO_DIR`) on macOS / Windows, `rollback -g` after #444 is fixed, and `DENO_DIR` with spaces or unicode.
-1. A maintainer needs to delete the stale probe branches `bughunt/deno/20260930-deno-store`, `bughunt/deno/20261001-scoped-jsr`, `bughunt/deno/20261001-global` and `bughunt/deno/20261001-hoisted`. The git proxy refuses `push --delete`.
+1. A maintainer needs to delete the stale probe branches `bughunt/deno/20260930-deno-store`, `bughunt/deno/20261001-scoped-jsr`, `bughunt/deno/20261001-global` and `bughunt/deno/20261001-hoisted`. The git proxy and the session permission policy both refuse `push --delete`.
 2. When #496 merges, re-test #373 on main: copy-index `_1`, hashed `_<base32>` names, scoped transitive, scan discovery and `scan --prune`. Close it if everything passes.
-3. Probe macOS / Windows for the `.deno` `_1` / `_<base32>` folders (case-insensitive FS) once #496 lands.
-4. #406 follow-ups: pnpm-lock / yarn.lock / bun.lock beside deno.lock.
-5. Hoisted + `vendor: true` JSR. Hosted `get` / `scan` for `pkg:jsr` against the real proxy. CRLF / BOM `deno.jsonc` is low value: socket-patch only checks deno.json / deno.jsonc / deno.lock exist and never parses them.
-6. Re-check #516 on the Deno `.deno/<name>@<ver>_1` layout and the hoisted duplicate-copy layout once it's fixed.
+3. When #517 merges, re-test the `.deno/<name>@<ver>_1` partial-revert VEX case. As of `0f45d24` + #496 it still attests `not_affected` (#516 comment).
+4. Probe macOS / Windows for the `.deno` `_1` / `_<base32>` folders (case-insensitive FS) once #496 lands.
+5. #406 follow-ups: pnpm-lock / yarn.lock / bun.lock beside deno.lock.
+6. Interrupted / concurrent `apply` on a hardlinked `.deno` store. Hoisted + `vendor: true` JSR is low value (it's just #374).
 
 ## Known non-bugs
 
