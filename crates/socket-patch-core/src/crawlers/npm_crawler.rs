@@ -1430,7 +1430,7 @@ impl NpmCrawler {
     /// project. The one exception is pnpm's virtual store (see below),
     /// whose entries are returned whole: which of them get enqueued is
     /// decided by the caller's pending-name filter
-    /// ([`Self::pending_store_entries`]) at replay time.
+    /// ([`Self::store_entry_may_hold`]) at replay time.
     ///
     /// Entries are examined in parallel; their contributions keep listing
     /// order.
@@ -1561,7 +1561,7 @@ impl NpmCrawler {
         }
     }
 
-    /// The virtual-store entries that can still hold a pending target.
+    /// Whether a virtual-store entry can still hold a pending target.
     /// A manifest routinely lists packages that simply aren't installed
     /// here, and probing every entry of a large monorepo store for them
     /// would add a readdir+stat storm to every apply/rollback run. The
@@ -1576,21 +1576,9 @@ impl NpmCrawler {
     /// only advertises the entry's OWN package, so a target present solely
     /// as a bundled dependency INSIDE another package's entry hides behind
     /// a non-matching name — `find_by_purls`' pass-2 fallback probes every
-    /// entry for exactly those. Both enumerators only yield entries whose
-    /// `node_modules` exists, so no re-stat here.
-    fn pending_store_entries(
-        entries: Vec<StoreEntry>,
-        pending_names: Option<&HashSet<&str>>,
-    ) -> Vec<PathBuf> {
-        entries
-            .into_iter()
-            .filter(|entry| Self::store_entry_may_hold(entry, pending_names))
-            .map(|entry| entry.node_modules)
-            .collect()
-    }
-
-    /// Whether [`Self::pending_store_entries`] keeps `entry`: no filter, an
-    /// undecodable name, or an advertised package that is still pending.
+    /// entry for exactly those. (An entry skipped here still has its own
+    /// package's bundled tree walked, see
+    /// [`Self::skipped_entry_bundled_tree`].)
     fn store_entry_may_hold(entry: &StoreEntry, pending_names: Option<&HashSet<&str>>) -> bool {
         match (pending_names, &entry.advertised) {
             (Some(filter), Some((entry_pkg, _version))) => filter.contains(entry_pkg.as_str()),
@@ -3989,8 +3977,15 @@ mod tests {
             ]
         };
         let pending: HashSet<&str> = ["foo", "@s/p"].into_iter().collect();
+        let kept = |entries: Vec<StoreEntry>| -> Vec<PathBuf> {
+            entries
+                .into_iter()
+                .filter(|e| NpmCrawler::store_entry_may_hold(e, Some(&pending)))
+                .map(|e| e.node_modules)
+                .collect()
+        };
         assert_eq!(
-            NpmCrawler::pending_store_entries(StoreEntry::vlt(entries()), Some(&pending)),
+            kept(StoreEntry::vlt(entries())),
             vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")]
         );
         let as_pnpm = entries()
@@ -3998,8 +3993,7 @@ mod tests {
             .map(|(n, p)| (n.into_string().unwrap(), p))
             .collect();
         assert!(
-            !NpmCrawler::pending_store_entries(StoreEntry::pnpm(as_pnpm), Some(&pending))
-                .contains(&PathBuf::from("a")),
+            !kept(StoreEntry::pnpm(as_pnpm)).contains(&PathBuf::from("a")),
             "the pnpm decoder misreads the legacy name"
         );
     }
