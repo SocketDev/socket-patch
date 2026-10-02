@@ -13,6 +13,9 @@
 //!   toolchain or an unreachable origin is a hard failure, not a SKIP.
 //! * `SOCKET_PATCH_GRADLE_E2E_PROBE_DIR` — where [`probe_report`] writes the
 //!   per-cell JSON (default `<CARGO_TARGET_TMPDIR>/gradle-probe`).
+//! * `SOCKET_PATCH_GRADLE_E2E_ARGS` — extra whitespace-separated arguments
+//!   for every Gradle run (the CI grid's `--configuration-cache` and
+//!   Isolated Projects cells).
 //!
 //! Every Gradle run is hermetic: a per-test `GRADLE_USER_HOME`, no daemon,
 //! plain console, and the ambient JVM / Gradle options ([`AMBIENT_ENV`]) and
@@ -32,6 +35,7 @@ pub const GRADLE_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_GRADLE";
 pub const GRADLE_VERSION_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_VERSION";
 pub const GRADLE_REQUIRED_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_REQUIRED";
 pub const GRADLE_PROBE_DIR_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_PROBE_DIR";
+pub const GRADLE_ARGS_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_ARGS";
 
 /// Ambient settings that would change what a Gradle child resolves or where
 /// it caches: JVM options (a `-Dgradle.user.home` there beats the per-test
@@ -196,15 +200,20 @@ impl Gradle {
             );
         }
         let jvm = jvm_banner(&banner).unwrap_or_default();
+        let extra_args: Vec<String> = std::env::var(GRADLE_ARGS_ENV)
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
         println!(
-            "{suite}: driving Gradle {version} on JVM {jvm} ({})",
+            "{suite}: driving Gradle {version} on JVM {jvm} ({}) {extra_args:?}",
             program.to_string_lossy()
         );
         Some(Gradle {
             program,
             version,
             jvm,
-            extra_args: Vec::new(),
+            extra_args,
         })
     }
 
@@ -267,11 +276,15 @@ fn version_part(version: &str, index: usize) -> u32 {
         .unwrap_or(0)
 }
 
-/// The `JVM:` line of a `gradle --version` banner.
+/// The `JVM:` line of a `gradle --version` banner (`Launcher JVM:` on
+/// Gradle >= 9, which also prints a `Daemon JVM:` line).
 pub fn jvm_banner(banner: &str) -> Option<String> {
-    banner
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("JVM:").map(|v| v.trim().to_string()))
+    banner.lines().find_map(|l| {
+        let l = l.trim();
+        l.strip_prefix("JVM:")
+            .or_else(|| l.strip_prefix("Launcher JVM:"))
+            .map(|v| v.trim().to_string())
+    })
 }
 
 /// `21.0.8 (…)` → 21; `1.8.0_412 (…)` → 8; `11 (…)` → 11.
@@ -648,6 +661,13 @@ mod gradle_build_common_selftests {
             jvm_banner(banner).as_deref(),
             Some("21.0.8 (Eclipse Adoptium 21.0.8+9-LTS)")
         );
+        let nine = "Gradle 9.8.0\nLauncher JVM:  21.0.12.1 (Homebrew 21.0.12.1)\n\
+                    Daemon JVM:    /x (no Daemon JVM specified)\n";
+        assert_eq!(
+            jvm_banner(nine).as_deref(),
+            Some("21.0.12.1 (Homebrew 21.0.12.1)")
+        );
+        assert_eq!(jdk_feature(&jvm_banner(nine).unwrap()), Some(21));
     }
 
     #[test]
