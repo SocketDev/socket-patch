@@ -215,17 +215,47 @@ impl Mvn {
         settings: &Path,
         out_rel: &str,
     ) -> Output {
-        let _ = std::fs::remove_dir_all(cwd.join(out_rel));
-        self.run(
-            cwd,
-            m2,
-            settings,
-            &[
-                &format!("{DEPENDENCY_PLUGIN}:copy-dependencies"),
-                &format!("-DoutputDirectory={out_rel}"),
-            ],
-        )
+        self.copy_dependencies_with(cwd, m2, settings, out_rel, &[])
     }
+
+    fn copy_dependencies_with(
+        &self,
+        cwd: &Path,
+        m2: &Path,
+        settings: &Path,
+        out_rel: &str,
+        extra: &[&str],
+    ) -> Output {
+        let _ = std::fs::remove_dir_all(cwd.join(out_rel));
+        let goal = format!("{DEPENDENCY_PLUGIN}:copy-dependencies");
+        let out_dir = format!("-DoutputDirectory={out_rel}");
+        let mut args = vec![goal.as_str(), out_dir.as_str()];
+        args.extend_from_slice(extra);
+        self.run(cwd, m2, settings, &args)
+    }
+}
+
+/// How many times the warm-up asks Maven Central before giving up.
+const WARM_ATTEMPTS: u32 = 3;
+
+/// Whether a failed Maven run failed to FETCH from the remote repository
+/// (a CDN blip that briefly serves a released plugin/artifact as absent, a
+/// dropped connection), as opposed to any other build failure.
+fn is_resolution_failure(out: &Output) -> bool {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    [
+        "could not be resolved",
+        "Could not resolve dependencies",
+        "Could not find artifact",
+        "Could not transfer artifact",
+        "Failed to read artifact descriptor",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 /// A user `settings.xml` with the given `(mirrorOf, url)` mirrors (none =
@@ -288,7 +318,24 @@ pub fn warm_fixture(
 ) -> Option<(Vec<u8>, Vec<u8>)> {
     std::fs::create_dir_all(proj).unwrap();
     std::fs::write(proj.join("pom.xml"), consumer_pom(VERSION)).unwrap();
-    let out = mvn.copy_dependencies(proj, m2, settings, "target/warm");
+    // The warm-up is the one step that fetches from Maven Central, and it
+    // asks only for fixed, long-published releases, so a resolution failure
+    // here is transient: Central's CDN has served `maven-dependency-plugin`
+    // 3.6.1 as absent for a moment (CI run 36899218369). Maven records that
+    // miss in the local repository and refuses to re-ask until the update
+    // interval elapses, so a retry must force the check with `-U`.
+    let mut out = mvn.copy_dependencies(proj, m2, settings, "target/warm");
+    for attempt in 2..=WARM_ATTEMPTS {
+        if ok(&out) || !is_resolution_failure(&out) {
+            break;
+        }
+        println!(
+            "{suite}: fixture warm-up could not resolve from Maven Central; \
+             retrying with -U ({attempt}/{WARM_ATTEMPTS})"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(5 * u64::from(attempt - 1)));
+        out = mvn.copy_dependencies_with(proj, m2, settings, "target/warm", &["-U"]);
+    }
     if !ok(&out) {
         skip(
             suite,

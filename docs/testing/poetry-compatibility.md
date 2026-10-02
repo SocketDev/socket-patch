@@ -108,11 +108,16 @@ Other measured details:
 
 ## Mode notes
 
-- **Agent mode** patches the interpreter the crawler finds: `VIRTUAL_ENV`;
-  then, for a Poetry project whose `./.venv` Poetry would not use (an explicit
-  `virtualenvs.in-project = false`, or no `./.venv` at all), the virtualenv(s)
-  Poetry placed under its `virtualenvs.path` (`<name>-<hash>-py<X.Y>`; every
-  interpreter minor); then `./.venv`, `./venv`; else, for a project
+- **Agent mode** patches the interpreter the crawler finds, following
+  Poetry's `EnvManager.get()`: `VIRTUAL_ENV` (or a non-`base` conda
+  `CONDA_PREFIX`), unless `poetry env use` recorded an env for the project in
+  `<virtualenvs.path>/envs.toml`, which Poetry prefers over an activated
+  venv; then, for a Poetry project whose `./.venv` Poetry would not use (an
+  explicit `virtualenvs.in-project = false`, or no `./.venv` at all, even
+  with `in-project = true`), the virtualenv Poetry placed under its
+  `virtualenvs.path`: the `envs.toml` env (`<name>-<hash>-py<minor>`) when
+  there is one, else every `<name>-<hash>-py<X.Y>` env; then `./.venv`,
+  `./venv`; else, for a project
   directory, the global interpreter's site-packages. Poetry's placement is
   reproduced without running Poetry, from `POETRY_*`, the project's
   `poetry.toml`, the user `config.toml` and the platform default cache dir.

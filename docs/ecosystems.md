@@ -139,6 +139,17 @@ other tools that follow the convention: neither that directory's own
 crawled, even when it is tagged itself. A `CACHEDIR.TAG` that lacks the
 signature, is a directory or is a symlink prunes nothing.
 
+Inside each `node_modules`, the package stores of isolated layouts are
+walked too, since they are the only home of transitive dependencies:
+pnpm's virtual store (`node_modules/.pnpm`, pnpm <= 3's
+`node_modules/.registry.*`, or the directory a `virtualStoreDir` setting
+moved it to, as recorded in `node_modules/.modules.yaml`), vlt's
+`node_modules/.vlt`, and npm's `install-strategy=linked` store
+`node_modules/.store`. A recorded virtual store outside the project,
+notably pnpm's global virtual store (`enableGlobalVirtualStore`, under the
+pnpm store directory), is not walked: other projects on the machine load
+the same files, so patching it in place would patch them as well.
+
 Every command that looks for installed npm copies walks these same trees, not
 only `scan`. A package installed only under a pruned directory is therefore
 "not installed" to `scan --prune` / `--sync`, which garbage-collect its

@@ -13,7 +13,10 @@
 //! 3. `rollback -g` and `remove -g` leave a vendored project's wiring,
 //!    artifact and ledger as they were (#445);
 //! 4. `apply -g` and `scan -g --mode agent` patch the global copy of a purl
-//!    the project vendors (#445, the reverse direction).
+//!    the project vendors (#445, the reverse direction);
+//! 5. the standalone `vendor` command (plain, `--revert`, `--check`) is a
+//!    usage error under global scope, so it neither vendors into nor
+//!    reverts the project (#498).
 //!
 //! Binary-driven, `SOCKET_*`-scrubbed child processes (`common::run`).
 //! Everything is offline except `scan`, which talks to a wiremock API.
@@ -280,7 +283,10 @@ fn write_left_pad(dir: &Path, index: &[u8]) {
     std::fs::write(dir.join("index.js"), index).unwrap();
 }
 
-fn vendored_project() -> VendoredProject {
+/// The npm project `vendored_project` starts from: `left-pad` installed
+/// from the registry, its patch recorded in the manifest, nothing vendored
+/// yet. Returns the project and its original lockfile bytes.
+fn manifest_project() -> (tempfile::TempDir, Vec<u8>) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
     write_left_pad(&root.join("node_modules/left-pad"), ORIG_INDEX);
@@ -344,7 +350,12 @@ fn vendored_project() -> VendoredProject {
         ORIG_INDEX,
     )
     .unwrap();
+    (tmp, original_lock)
+}
 
+fn vendored_project() -> VendoredProject {
+    let (tmp, original_lock) = manifest_project();
+    let root = tmp.path();
     let service = prebuilt_common::Server::project(root);
     let (code, stdout, stderr) = common::run_with_env(
         root,
@@ -544,4 +555,167 @@ async fn global_agent_scan_patches_a_purl_the_project_vendors() {
         "the global copy must be patched: {v}"
     );
     project.assert_untouched("scan --global-prefix --mode agent");
+}
+
+// ═══════════════════ 5. the vendor command under global scope ═══════════════════
+
+/// Every way to ask for global scope: the flags and their env vars.
+fn global_scopes(prefix: &str) -> Vec<(Vec<&str>, Vec<(&'static str, String)>, &'static str)> {
+    vec![
+        (vec!["--global"], vec![], "--global"),
+        (vec!["-g"], vec![], "--global"),
+        (vec!["--global-prefix", prefix], vec![], "--global-prefix"),
+        (vec![], vec![("SOCKET_GLOBAL", "1".to_string())], "--global"),
+        (
+            vec![],
+            vec![("SOCKET_GLOBAL_PREFIX", prefix.to_string())],
+            "--global-prefix",
+        ),
+    ]
+}
+
+/// Run `vendor <extra>` under every global scope, human and `--json`, and
+/// assert each is the exit-2 usage error naming `why`.
+fn assert_vendor_refused(root: &Path, extra: &[&str], why: &str, mut after_each: impl FnMut(&str)) {
+    let prefix = empty_prefix();
+    let prefix = prefix.path().to_str().unwrap();
+    for (flags, env, flag) in global_scopes(prefix) {
+        for json in [false, true] {
+            let mut args = vec!["vendor", "--yes", "--offline", "--lock-timeout", "5"];
+            args.extend(extra.iter().copied());
+            args.extend(flags.iter().copied());
+            if json {
+                args.push("--json");
+            }
+            let mut envs: Vec<(&str, &str)> = vec![("SOCKET_PATCH_SERVER_URL", PATCH_HOST)];
+            envs.extend(env.iter().map(|(k, v)| (*k, v.as_str())));
+            let (code, stdout, stderr) = common::run_with_env(root, &args, &envs);
+            let what = format!("{args:?} {env:?}");
+            assert_eq!(code, 2, "{what}: stdout={stdout}\nstderr={stderr}");
+            let expected = format!(
+                "{flag} cannot be used with vendor{}: global installs have no project \
+                 lockfile to {why}",
+                extra.first().map(|f| format!(" {f}")).unwrap_or_default()
+            );
+            if json {
+                let v = parse(&stdout, &stderr);
+                assert_eq!(v["status"], "error", "{what}: {v}");
+                assert_eq!(
+                    v["error"]["code"], "global_scope_unsupported",
+                    "{what}: {v}"
+                );
+                assert_eq!(v["error"]["message"], expected.as_str(), "{what}: {v}");
+            } else {
+                assert_eq!(stderr.trim_end(), format!("Error: {expected}"), "{what}");
+                assert!(stdout.is_empty(), "{what}: {stdout:?}");
+            }
+            after_each(&what);
+        }
+    }
+}
+
+/// `vendor --revert -g` inside a vendored project must not revert the
+/// project's vendoring (#498): that silently unpatched it on the next
+/// frozen install.
+#[test]
+fn global_vendor_revert_leaves_vendored_project_state() {
+    let project = vendored_project();
+    assert_vendor_refused(
+        project.root(),
+        &["--revert"],
+        "revert vendored artifacts from",
+        |what| project.assert_untouched(what),
+    );
+    // Control: the same revert without global scope does unwind it.
+    let (code, stdout, stderr) = run(
+        project.root(),
+        &[
+            "vendor",
+            "--revert",
+            "--yes",
+            "--json",
+            "--lock-timeout",
+            "5",
+        ],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(!project.tgz().exists(), "control: project revert unwinds");
+}
+
+/// `vendor -g` inside a project whose manifest holds a record (e.g. one
+/// `get -g` wrote) must not vendor into the project (#498).
+#[test]
+fn global_vendor_does_not_vendor_into_the_project() {
+    let (tmp, original_lock) = manifest_project();
+    let root = tmp.path();
+    let service = prebuilt_common::Server::project(root);
+    let manifest = std::fs::read(root.join(".socket/manifest.json")).unwrap();
+    let prefix = empty_prefix();
+    let prefix = prefix.path().to_str().unwrap();
+    for (flags, env, flag) in global_scopes(prefix) {
+        let mut args = vec!["vendor", "--json", "--lock-timeout", "5"];
+        args.extend(flags.iter().copied());
+        let mut envs: Vec<(&str, &str)> = vec![("SOCKET_VENDOR_URL", &service.uri)];
+        envs.extend(env.iter().map(|(k, v)| (*k, v.as_str())));
+        let (code, stdout, stderr) = common::run_with_env(root, &args, &envs);
+        let what = format!("{args:?} {env:?}");
+        assert_eq!(code, 2, "{what}: stdout={stdout}\nstderr={stderr}");
+        let v = parse(&stdout, &stderr);
+        assert_eq!(
+            v["error"]["code"], "global_scope_unsupported",
+            "{what}: {v}"
+        );
+        assert_eq!(
+            v["error"]["message"],
+            format!(
+                "{flag} cannot be used with vendor: global installs have no project lockfile \
+                 to wire vendored artifacts into"
+            )
+            .as_str(),
+            "{what}: {v}"
+        );
+        assert_eq!(
+            std::fs::read(root.join("package-lock.json")).unwrap(),
+            original_lock,
+            "{what}: the project's lockfile must stay"
+        );
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "{what}: nothing vendored into the project"
+        );
+        assert_eq!(
+            std::fs::read(root.join(".socket/manifest.json")).unwrap(),
+            manifest,
+            "{what}: the manifest must stay"
+        );
+    }
+    // The human path refuses the same way.
+    assert_vendor_refused(root, &[], "wire vendored artifacts into", |what| {
+        assert!(!root.join(".socket/vendor").exists(), "{what}");
+    });
+    // Control: without global scope the same project vendors.
+    let (code, stdout, stderr) = common::run_with_env(
+        root,
+        &["vendor", "--json", "--silent", "--lock-timeout", "5"],
+        &[("SOCKET_VENDOR_URL", &service.uri)],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert_ne!(
+        std::fs::read(root.join("package-lock.json")).unwrap(),
+        original_lock,
+        "control: project vendor rewires the lock"
+    );
+}
+
+/// `vendor --check -g` checks no project either: the project's vendored
+/// state is not a global run's target.
+#[test]
+fn global_vendor_check_is_refused() {
+    let project = vendored_project();
+    assert_vendor_refused(
+        project.root(),
+        &["--check"],
+        "check vendored artifacts in",
+        |what| project.assert_untouched(what),
+    );
 }
