@@ -63,7 +63,9 @@
 //!   those packages, and abandoning them would make it re-issue requests
 //!   the plan has already paid for.
 //! * It never requests PAST a position whose own fetch was an
-//!   availability failure until the loop has consumed that position. So
+//!   availability failure until the loop has consumed that position, and
+//!   once it has, only the loop's own position until the service answers
+//!   well again (the loop's breaker is then one failure from opening). So
 //!   an outage part-way down a list the window has already widened over
 //!   costs what the serial loop paid, as long as the task is running
 //!   ahead of the loop (the usual case: the loop stops to write between
@@ -188,7 +190,8 @@ struct Lookahead {
     at: AtomicUsize,
     /// How far past `at` the task may run: one until the service has
     /// answered once, then [`SLOW_START`], growing by one per good answer
-    /// up to the whole window and falling back on availability failures.
+    /// up to the whole window, falling back on availability failures and
+    /// to one when the loop passes a failure.
     reach: AtomicUsize,
     /// Lowest position whose own fetch was an availability failure and
     /// that the loop has not consumed yet; nothing past it is started
@@ -233,10 +236,16 @@ impl Lookahead {
     fn arrive(&self, position: usize) {
         // Past the failure the barrier stands at: the loop consumed that
         // package and went on, so its breaker did not end the run and the
-        // task may speculate again. (A failure landing concurrently just
-        // re-sets the line; all of this is advisory, and every outcome is
-        // still decided at the loop's own call.)
+        // task may speculate again — but only from one position. The loop's
+        // breaker is now a failure from opening, so a reach still sized by
+        // the answers from BEFORE the failure would aim retry ladders at
+        // packages the serial loop never asks for; only the position the
+        // loop is at may start until the service answers well again. (A
+        // failure landing concurrently just re-sets the line; all of this
+        // is advisory, and every outcome is still decided at the loop's own
+        // call.)
         if position > self.barrier.load(Ordering::Relaxed) {
+            self.reach.store(1, Ordering::Relaxed);
             self.barrier.store(usize::MAX, Ordering::Relaxed);
         }
         self.at.store(position, Ordering::Relaxed);
@@ -839,6 +848,50 @@ mod tests {
         (out, c.vendor_outage_count())
     }
 
+    /// [`run`] with `plan` attached and the loop pausing before each call
+    /// after the first — as the real loop stops to write between packages
+    /// — until `ready` holds for the plan's lookahead. That pins where the
+    /// task stands relative to the loop, instead of leaving it to how the
+    /// runner schedules the mock server's delays.
+    async fn run_paced(
+        server: &MockServer,
+        plan: &[usize],
+        calls: &[usize],
+        ready: impl Fn(&Lookahead) -> bool,
+    ) -> (Vec<String>, u32) {
+        let c = client(&server.uri());
+        let guard = c.prefetch_vendor_packages(
+            plan.iter().map(|&i| uuid(i)).collect(),
+            false,
+            None,
+            None,
+            4,
+        );
+        let look = Arc::clone(&guard.plan.look);
+        let mut out = Vec::new();
+        for (n, &i) in calls.iter().enumerate() {
+            if n > 0 {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        let notified = look.moved.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        if ready(&look) {
+                            return;
+                        }
+                        notified.await;
+                    }
+                })
+                .await
+                .expect("the prefetch never reached the state the loop waits for");
+            }
+            out.push(summary(
+                &c.fetch_vendor_package(&uuid(i), false, None, None).await,
+            ));
+        }
+        (out, c.vendor_outage_count())
+    }
+
     async fn assert_matches_serial(scripts: &[Script], plan: &[usize], calls: &[usize]) {
         let server = serve(scripts).await;
         let serial = run(&server, None, calls).await;
@@ -861,10 +914,12 @@ mod tests {
     /// whose download the prefetch had already started.
     ///
     /// And it costs the service the same REQUESTS, not only the same
-    /// outcomes. The task here is running ahead of a loop still on the
-    /// granted packages, so nothing past the failure is ever started, and
-    /// what was in flight when the task stopped is delivered instead of
-    /// being dropped and re-issued live by the loop.
+    /// outcomes. The task here runs ahead of the loop: before each call the
+    /// loop waits until the task has seen the failure it is about to meet.
+    /// So nothing past the failure is started while the loop is still on
+    /// the granted packages, and once the loop has consumed it and moved
+    /// on, only the package it is at is requested — the serial loop's next
+    /// ladder, which opens both breakers.
     #[tokio::test]
     async fn an_outage_mid_list_opens_the_breaker_at_the_same_package() {
         use Script::*;
@@ -890,7 +945,11 @@ mod tests {
         assert_eq!(count, 2);
         let serial_requests = request_log(&server).await.len();
 
-        assert_eq!(run(&server, Some(&all), &all).await, (serial, count));
+        let failure_landed = |look: &Lookahead| look.barrier.load(Ordering::Relaxed) != usize::MAX;
+        assert_eq!(
+            run_paced(&server, &all, &all, failure_landed).await,
+            (serial, count)
+        );
         assert_eq!(
             request_log(&server).await.len() - serial_requests,
             serial_requests,
