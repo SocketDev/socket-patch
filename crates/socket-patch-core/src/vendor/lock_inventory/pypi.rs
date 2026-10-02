@@ -584,19 +584,34 @@ async fn inventory_pdm_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>
 ///
 /// A user's OWN file/url/path reference is not ours to resolve and stays
 /// out.
+///
+/// The pins are read from the root `requirements.txt` AND every in-root
+/// `-r` / `--requirement` include it reaches ([`requirements_tree`]) — the
+/// tree the vendored writer edits, so a pin there is discovered on a fresh
+/// checkout too (#412).
 async fn inventory_requirements_txt(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
-    let text = view.read_text("requirements.txt").await.ok()?;
-    let lines = crate::utils::requirements::logical_lines(&text);
+    let files = requirements_tree(view).await?;
+    let lines: Vec<_> = files
+        .iter()
+        .flat_map(|text| crate::utils::requirements::logical_lines(text))
+        .collect();
     // An exact pin's `--hash=sha256:` digests verify a PyPI download only
     // while the file resolves from the public index: an index option
     // (`-i` / `--index-url` / `--extra-index-url` / `-f`) may serve other
     // bytes under the same name, so it keeps every pin unverifiable (the
-    // Pipfile.lock `public_index` rule).
+    // Pipfile.lock `public_index` rule). pip applies an option from any
+    // file of the tree globally, so the rule spans the whole tree.
     let public_index = lines.iter().all(|line| {
         let code = crate::utils::requirements::strip_comment(&line.text).trim_start();
-        !["-i", "--index-url", "--extra-index-url", "-f", "--find-links"]
-            .iter()
-            .any(|opt| code.starts_with(opt))
+        ![
+            "-i",
+            "--index-url",
+            "--extra-index-url",
+            "-f",
+            "--find-links",
+        ]
+        .iter()
+        .any(|opt| code.starts_with(opt))
     });
     let mut out = Vec::new();
     for line in lines {
@@ -659,4 +674,37 @@ async fn inventory_requirements_txt(view: &ProjectView<'_>) -> Option<Vec<Lockfi
         return None;
     }
     Some(out)
+}
+
+/// The text of the root `requirements.txt` (first) and of each in-root
+/// `-r` / `--requirement` include it reaches: depth-first, each target
+/// resolved against the INCLUDING file's directory, visited-set cycle
+/// guard — the vendored planner's include grammar
+/// ([`crate::vendor::pypi_requirements::requirements_includes`]) over a
+/// [`ProjectView`], so the in-memory engine reads the same tree. `-c`
+/// constraints never introduce requirements and are not followed;
+/// out-of-root and absolute includes are not ours to edit and are not
+/// read; an unreadable include is pip's error to report and is skipped.
+/// `None` when the root file itself cannot be read.
+async fn requirements_tree(view: &ProjectView<'_>) -> Option<Vec<String>> {
+    use crate::vendor::pypi_requirements::{is_in_root_rel, requirements_includes};
+    const ROOT: &str = "requirements.txt";
+    let root = view.read_text(ROOT).await.ok()?;
+    let mut visited = std::collections::HashSet::from([ROOT.to_string()]);
+    let mut stack: Vec<String> = requirements_includes(ROOT, &root);
+    stack.reverse();
+    let mut files = vec![root];
+    while let Some(rel) = stack.pop() {
+        if !is_in_root_rel(&rel) || !visited.insert(rel.clone()) {
+            continue;
+        }
+        let Ok(text) = view.read_text(&rel).await else {
+            continue;
+        };
+        let mut includes = requirements_includes(&rel, &text);
+        includes.reverse();
+        stack.extend(includes);
+        files.push(text);
+    }
+    Some(files)
 }

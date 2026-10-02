@@ -155,6 +155,11 @@ fn binary() -> PathBuf {
 /// (a developer's `SOCKET_DRY_RUN=1` must not steer the assertions) and
 /// `VIRTUAL_ENV` (crawler discovery input) removed.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
+    run_socket_env(cwd, args, &[])
+}
+
+/// [`run_socket`] with extra environment on top of the scrubbed surface.
+fn run_socket_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
     cmd.args(args).current_dir(cwd);
     for (k, _) in std::env::vars_os() {
@@ -163,6 +168,9 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         }
     }
     cmd.env_remove("VIRTUAL_ENV");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -405,6 +413,11 @@ enum Driver {
     /// `Gemfile.next`, so the run must redirect nothing and attest nothing.
     /// The fixture asserts that contract itself and yields `None`.
     ScanVexDualBoot,
+    /// [`Driver::ScanVexDualBoot`] with `BUNDLE_GEMFILE=Gemfile` exported to
+    /// socket-patch too (#507): bundler's local app config outranks the
+    /// environment, so bundler still loads `Gemfile.next` and the run must
+    /// still redirect and attest nothing.
+    ScanVexDualBootEnvGemfile,
 }
 
 impl Driver {
@@ -413,6 +426,9 @@ impl Driver {
             Driver::ScanVex => "scan --mode hosted",
             Driver::GetUuid => "get <uuid> --mode hosted",
             Driver::ScanVexDualBoot => "scan --mode hosted (BUNDLE_GEMFILE=Gemfile.next)",
+            Driver::ScanVexDualBootEnvGemfile => {
+                "scan --mode hosted (config Gemfile.next, env BUNDLE_GEMFILE=Gemfile)"
+            }
         }
     }
 }
@@ -760,7 +776,11 @@ async fn redirect_scanned_project(
     //    --vex (get has none), get's envelope with the nested `redirect`.
     let api = server.uri();
     let proj_str = proj.to_str().expect("utf8 tmp path");
-    if driver == Driver::ScanVexDualBoot {
+    let dual_boot = matches!(
+        driver,
+        Driver::ScanVexDualBoot | Driver::ScanVexDualBootEnvGemfile
+    );
+    if dual_boot {
         // The next-Rails dual boot: a `Gemfile.next` pair that bundler loads
         // through the committed `.bundle/config`.
         std::fs::copy(proj.join(gemfile_name), proj.join("Gemfile.next")).unwrap();
@@ -775,7 +795,7 @@ async fn redirect_scanned_project(
         );
     }
     let argv: Vec<&str> = match driver {
-        Driver::ScanVex | Driver::ScanVexDualBoot => vec![
+        Driver::ScanVex | Driver::ScanVexDualBoot | Driver::ScanVexDualBootEnvGemfile => vec![
             "scan",
             "--mode",
             "hosted",
@@ -811,8 +831,12 @@ async fn redirect_scanned_project(
             "fake",
         ],
     };
-    let (code, stdout, stderr) = run_socket(&proj, &argv);
-    if driver == Driver::ScanVexDualBoot {
+    let socket_env: &[(&str, &str)] = match driver {
+        Driver::ScanVexDualBootEnvGemfile => &[("BUNDLE_GEMFILE", "Gemfile")],
+        _ => &[],
+    };
+    let (code, stdout, stderr) = run_socket_env(&proj, &argv, socket_env);
+    if dual_boot {
         let env: serde_json::Value = serde_json::from_str(&stdout)
             .unwrap_or_else(|e| panic!("not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"));
         // `--vex` with nothing to attest is an error: the run must not
@@ -898,7 +922,9 @@ async fn redirect_scanned_project(
                 "in-run hosted VEX is attested from this run's fetched record, not hash-verified: {env}"
             );
         }
-        Driver::ScanVexDualBoot => unreachable!("asserted and returned above"),
+        Driver::ScanVexDualBoot | Driver::ScanVexDualBootEnvGemfile => {
+            unreachable!("asserted and returned above")
+        }
         Driver::GetUuid => {
             // get's hosted envelope (CLI_CONTRACT.md "get --mode and
             // installed narrowing"): `found` counts the resolved patch;
@@ -1544,6 +1570,26 @@ async fn gem_hosted_bundle_gemfile_dual_boot_redirects_nothing() {
         true,
         None,
         Driver::ScanVexDualBoot,
+    )
+    .await;
+    assert!(fx.is_none(), "the dual-boot driver asserts in place");
+}
+
+/// #507: the same dual boot with `BUNDLE_GEMFILE=Gemfile` exported. Bundler
+/// ranks the committed `.bundle/config` above the environment (it still
+/// loads `Gemfile.next`), so socket-patch must not follow the env value and
+/// wire the `Gemfile` bundler ignores.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_bundle_gemfile_config_outranks_env_redirects_nothing() {
+    let fx = redirect_scanned_project(
+        "dual-boot-env",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVexDualBootEnvGemfile,
     )
     .await;
     assert!(fx.is_none(), "the dual-boot driver asserts in place");

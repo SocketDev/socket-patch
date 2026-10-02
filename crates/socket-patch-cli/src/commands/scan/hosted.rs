@@ -253,7 +253,7 @@ fn gem_stale_cache_warning(purl: &str, cache_path: &Path) -> serde_json::Value {
         "detail": format!(
             "{purl} was switched to its hosted patch, but the \
              project's committed bundler cache still holds an UNPATCHED \
-             archive at {} — bundler installs from vendor/cache in preference \
+             archive at {} — bundler installs from its cache dir in preference \
              to fetching, so installs (fresh checkouts included) keep \
              materializing the vulnerable upstream bytes. Remove that file, \
              run `bundle install` so bundler fetches the patched gem, and \
@@ -378,6 +378,9 @@ async fn gem_stale_install_warnings(
     }
     let mut dir_state: std::collections::BTreeMap<std::path::PathBuf, DirJudgment> =
         std::collections::BTreeMap::new();
+    // Bundler's configured cache dir (`cache_path`, default vendor/cache):
+    // the committed archives `bundle install` installs from (#483).
+    let app_cache = socket_patch_core::crawlers::ruby_crawler::bundler_app_cache_dir(cwd).await;
     for (index, (purl, record)) in candidates.iter().enumerate() {
         for found in &found_per_home {
             let Some(pkg) = &found[index] else {
@@ -418,10 +421,7 @@ async fn gem_stale_install_warnings(
         }
         let mut folded_cache: Option<std::path::PathBuf> = None;
         if dir.starts_with(cwd) {
-            let project_cache = cwd
-                .join("vendor")
-                .join("cache")
-                .join(format!("{}.gem", j.leaf));
+            let project_cache = app_cache.join(format!("{}.gem", j.leaf));
             if project_cache.is_file() {
                 let proven_patched = match (
                     gem_artifact_shas.get(&gem_sha_key(&j.purl)),
@@ -467,10 +467,7 @@ async fn gem_stale_install_warnings(
         let Some((_, name, version)) = purl_parts(purl) else {
             continue;
         };
-        let cache_path = cwd
-            .join("vendor")
-            .join("cache")
-            .join(format!("{name}-{version}.gem"));
+        let cache_path = app_cache.join(format!("{name}-{version}.gem"));
         if !cache_path.is_file() {
             continue;
         }
@@ -1257,8 +1254,12 @@ pub(crate) async fn run_redirect_selected(
         // installed materialization unpatched, so attesting that purl from
         // the ledger would contradict the run's own warning. Excluded purls
         // fall back to `vex`'s normal installed-tree verification.
+        // A confirmed uuid whose bundled instance the rewriter had to skip
+        // (#469) leaves that copy unpatched, so it too is verified, never
+        // assumed.
         params.assume_applied = confirmed
             .iter()
+            .filter(|(_, uuid)| !rewrite.bundled_skipped_uuids.contains(uuid))
             .map(|(purl, _)| purl.clone())
             .filter(|purl| {
                 !gem_stale.stale_purls.contains(purl)
@@ -3577,6 +3578,102 @@ mod tests {
         )
         .await;
         assert!(out.warnings.is_empty());
+    }
+
+    /// #483: bundler's cache dir is a setting (`bundle config set --local
+    /// cache_path vendor/gems` → `BUNDLE_CACHE_PATH` in `.bundle/config`).
+    /// A committed archive at the CONFIGURED path is what `bundle install`
+    /// installs from, so it warns standalone (fresh checkout, no installed
+    /// dir) and joins a stale install's delete list (folded) — and the
+    /// default `vendor/cache`, which bundler no longer reads, is ignored.
+    #[tokio::test]
+    async fn gem_stale_probe_follows_the_configured_bundle_cache_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".bundle")).unwrap();
+        std::fs::write(
+            tmp.path().join(".bundle/config"),
+            "---\nBUNDLE_PATH: \"vendor/bundle\"\nBUNDLE_CACHE_PATH: \"vendor/gems\"\n",
+        )
+        .unwrap();
+        let configured = tmp
+            .path()
+            .join("vendor")
+            .join("gems")
+            .join(format!("{GEM_LEAF}.gem"));
+        std::fs::create_dir_all(configured.parent().unwrap()).unwrap();
+        std::fs::write(&configured, b"upstream archive bytes").unwrap();
+        let mut shas = std::collections::BTreeMap::new();
+        shas.insert(
+            ("stale-unit".to_string(), "1.0.0".to_string()),
+            "0".repeat(64), // the patched artifact's sha — differs
+        );
+
+        // Standalone: a fresh checkout with only the configured cache.
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &one_confirmed(),
+            &one_record(),
+            &shas,
+        )
+        .await;
+        assert_eq!(out.warnings.len(), 1, "configured cache must warn");
+        let detail = detail_of(&out.warnings[0]);
+        assert!(
+            detail.contains(&configured.display().to_string()),
+            "{detail}"
+        );
+        assert_eq!(
+            out.stale_purls,
+            std::collections::BTreeSet::from([GEM_PURL.to_string()]),
+            "the in-run VEX must withhold the attestation"
+        );
+
+        // Folded: a stale install beside it gets the configured archive in
+        // its delete list, in one warning.
+        materialize_gem(tmp.path(), GEM_UPSTREAM);
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &one_confirmed(),
+            &one_record(),
+            &shas,
+        )
+        .await;
+        assert_eq!(out.warnings.len(), 1, "one warning, cache folded in");
+        let detail = detail_of(&out.warnings[0]);
+        assert!(
+            detail.contains(&configured.display().to_string()),
+            "the configured archive must join the delete list: {detail}"
+        );
+
+        // A leftover default vendor/cache archive is not what bundler reads
+        // once cache_path moves it: it neither warns nor joins the list.
+        std::fs::remove_file(&configured).unwrap();
+        let default = tmp
+            .path()
+            .join("vendor")
+            .join("cache")
+            .join(format!("{GEM_LEAF}.gem"));
+        std::fs::create_dir_all(default.parent().unwrap()).unwrap();
+        std::fs::write(&default, b"upstream archive bytes").unwrap();
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &one_confirmed(),
+            &one_record(),
+            &shas,
+        )
+        .await;
+        assert_eq!(out.warnings.len(), 1, "the stale install still warns");
+        let detail = detail_of(&out.warnings[0]);
+        assert!(
+            !detail.contains(&default.display().to_string()),
+            "vendor/cache is not bundler's cache dir here: {detail}"
+        );
     }
 
     /// Committed `vendor/cache` fold, UNKNOWN-sha arm (`_ => false`): when

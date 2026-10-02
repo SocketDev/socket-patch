@@ -47,6 +47,7 @@ pub fn rewrite_bun_binary(content: &[u8], overrides: &[DepOverride], result: &mu
             Ok(v) => v,
             Err(_) => unreachable!("validated lock"),
         };
+        let mut skipped: Vec<RewriteWarning> = Vec::new();
         let attempt = (|| {
             let mut edits = Vec::new();
             let packages = candidate.packages()?;
@@ -69,7 +70,29 @@ pub fn rewrite_bun_binary(content: &[u8], overrides: &[DepOverride], result: &mu
                     dep.version
                 ));
             }
+            let mut wired = false;
             for p in matching {
+                // A bundled edge's copy is unpacked from its parent's
+                // tarball, which no redirect reaches (#469). A record ONLY
+                // bundled edges reach is skipped; one Bun shares with a
+                // regular install is still redirected for that install.
+                if p.bundled {
+                    skipped.push(RewriteWarning {
+                        code: "redirect_bun_bundled_instance_skipped".into(),
+                        detail: format!(
+                            "bun.lockb package #{} ({name}@{}) is {}bundled inside its \
+                             parent's tarball and CANNOT be redirected there — that copy \
+                             stays UNPATCHED; vendor or update the bundling parent to cover it",
+                            p.id,
+                            dep.version,
+                            if p.bundled_only { "" } else { "also " },
+                        ),
+                    });
+                    if p.bundled_only {
+                        continue;
+                    }
+                }
+                wired = true;
                 if p.resolution == dep.artifact_url && p.integrity.as_deref() == Some(integrity) {
                     continue;
                 }
@@ -84,10 +107,15 @@ pub fn rewrite_bun_binary(content: &[u8], overrides: &[DepOverride], result: &mu
                     new: Some(candidate.snapshot(p.id)?),
                 });
             }
-            Ok::<_, String>(edits)
+            Ok::<_, String>((edits, wired))
         })();
+        if !skipped.is_empty() {
+            result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+        }
+        result.warnings.append(&mut skipped);
         match attempt {
-            Ok(edits) => {
+            Ok((_, false)) => {}
+            Ok((edits, true)) => {
                 lock = candidate;
                 result.edits.extend(edits);
                 result
@@ -132,6 +160,63 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    fn bundled_fixture(shape: &str) -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/bun-lockb-bundled")
+                .join(shape)
+                .join("bun.lockb"),
+        )
+        .unwrap()
+    }
+
+    fn is_number() -> DepOverride {
+        DepOverride {
+            name: "is-number".into(),
+            artifact_url: "https://patch.example.test/7.0.0/is-number-7.0.0.tgz".into(),
+            ..dep("7.0.0")
+        }
+    }
+
+    /// REGRESSION (#469): a record only a bundled edge reaches is unpacked
+    /// from the parent's tarball, so redirecting it installs nothing: it is
+    /// skipped loudly, not counted, and the uuid is not confirmed. A record
+    /// Bun shares between a regular and a bundled install IS redirected
+    /// (the regular copy gets the patch) with the same loud warning, since
+    /// the bundled copy stays unpatched.
+    #[test]
+    fn bundled_records_are_not_redirected_silently() {
+        let only = bundled_fixture("only");
+        let mut result = RewriteResult::default();
+        rewrite_bun_binary(&only, &[is_number()], &mut result);
+        assert!(result.binary_files.is_empty(), "lock untouched");
+        assert!(result.edits.is_empty(), "{:?}", result.edits);
+        assert!(result.confirmed_bun_binary_uuids.is_empty());
+        let codes: Vec<_> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            ["redirect_bun_bundled_instance_skipped"],
+            "{:?}",
+            result.warnings
+        );
+        assert!(result.warnings[0].detail.contains("UNPATCHED"));
+        assert!(result.bundled_skipped_uuids.contains("7.0.0"));
+
+        let both = bundled_fixture("both");
+        let mut result = RewriteResult::default();
+        rewrite_bun_binary(&both, &[is_number()], &mut result);
+        assert_eq!(result.edits.len(), 1, "{:?}", result.edits);
+        assert!(result.binary_files.contains_key("bun.lockb"));
+        let codes: Vec<_> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            ["redirect_bun_bundled_instance_skipped"],
+            "{:?}",
+            result.warnings
+        );
+        assert!(result.bundled_skipped_uuids.contains("7.0.0"));
     }
 
     #[test]

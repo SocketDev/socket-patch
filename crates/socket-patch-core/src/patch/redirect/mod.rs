@@ -256,6 +256,17 @@ pub struct RewriteResult {
     /// Patch uuids with a same-`name@version` vlt node under a named alias,
     /// a scoped registry or jsr, which hosted mode leaves unpatched.
     pub vlt_foreign_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids with a same-`name@version` bundled instance the rewriter
+    /// skipped (Bun's `bundled` entries/records, #469): that copy is
+    /// unpacked from its parent's tarball and stays unpatched, so a
+    /// confirmation of the uuid must never stand in for the installed tree
+    /// (in-run VEX verifies it instead). Left out of the golden digests
+    /// while empty, so the blessed oracle outputs predating it still hold.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub bundled_skipped_uuids: std::collections::BTreeSet<String>,
     /// [`vlt::vlt_drives`] over the rewriter's input files and the
     /// caller's `bun_lockb_present`.
     pub vlt_drives: bool,
@@ -536,6 +547,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         confirmed_vlt_uuids,
         refused_vlt_uuids,
         vlt_foreign_uuids,
+        bundled_skipped_uuids,
         vlt_drives: _,
     } = delta;
     result.files.extend(files);
@@ -567,6 +579,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.confirmed_vlt_uuids.extend(confirmed_vlt_uuids);
     result.refused_vlt_uuids.extend(refused_vlt_uuids);
     result.vlt_foreign_uuids.extend(vlt_foreign_uuids);
+    result.bundled_skipped_uuids.extend(bundled_skipped_uuids);
 }
 
 /// [`rewrite_groups_serial`], with the groups run concurrently under
@@ -3641,7 +3654,7 @@ fn rewrite_bun_lock(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    use crate::vendor::bun_lock_text::decode_json_string;
+    use crate::vendor::bun_lock_text::{decode_json_string, is_bundled_entry};
 
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     if npm.is_empty() {
@@ -3689,6 +3702,28 @@ fn rewrite_bun_lock(
             let Some(spec) = entry.elems.first().and_then(|e| decode_json_string(e)) else {
                 continue;
             };
+            // Bun unpacks a bundled copy from its PARENT's tarball and never
+            // reads the entry's spec (#469), so a rewrite here would count
+            // as redirected (and VEX-attest the patch) while the unpatched
+            // bundled bytes keep installing. Mirrors npm's `inBundle` guard.
+            if is_bundled_entry(entry)
+                && (spec == target_spec
+                    || spec == url_spec
+                    || is_prior_hosted_bun_spec(&spec, &fname, &dep.artifact_url))
+            {
+                matched_any = true;
+                result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_bun_bundled_instance_skipped".into(),
+                    detail: format!(
+                        "bun.lock entry `{}` is bundled inside its parent's tarball and \
+                         CANNOT be redirected — that copy stays UNPATCHED; vendor or update \
+                         the bundling parent to cover it",
+                        entry.key
+                    ),
+                });
+                continue;
+            }
             let deps_verbatim: String;
             if entry.elems.len() == 4
                 && spec == target_spec
@@ -8425,6 +8460,60 @@ mod tests {
         rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.contains_key("bun.lock"));
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// REGRESSION (#469): Bun records a `bundleDependencies` copy as its own
+    /// `parent/child` entry flagged `{ "bundled": true }` and unpacks it
+    /// from the PARENT's tarball, never fetching it. Rewriting that entry
+    /// would count it `redirected` (and let VEX attest it) while the copy
+    /// the parent loads stays unpatched — the Bun twin of npm's `inBundle`
+    /// guard (#325). The bundled entry is skipped loudly; a regular entry of
+    /// the same version beside it is still rewritten.
+    #[test]
+    fn bun_lock_bundled_entry_is_skipped_with_loud_warning() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override("is-number", "7.0.0", "http://p.test/isn.tgz", &sha512);
+        let bundled = "\"@bh/bund/is-number\": [\"is-number@7.0.0\", \"\", { \"bundled\": true }, \"sha512-UP==\"],";
+        let regular = "\"is-number\": [\"is-number@7.0.0\", \"\", {}, \"sha512-UP==\"],";
+
+        // Bundled copy only: nothing is rewritten, and the warning names the
+        // real reason instead of `redirect_bun_entry_not_found`.
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), bun_lock_file(bundled, 1));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_bun_bundled_instance_skipped"],
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings[0].detail.contains("@bh/bund/is-number")
+                && r.warnings[0].detail.contains("UNPATCHED"),
+            "{}",
+            r.warnings[0].detail
+        );
+        assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+
+        // Both: only the regular entry is rewired; the bundled line keeps
+        // its registry bytes.
+        let both = format!("{regular}\n    {bundled}");
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), bun_lock_file(&both, 1));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        assert_eq!(r.edits[0].key.as_deref(), Some("is-number"));
+        let out = r.files.get("bun.lock").expect("lock rewritten");
+        assert!(out.contains(bundled), "bundled line untouched: {out}");
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_bun_bundled_instance_skipped"],
+            "{:?}",
+            r.warnings
+        );
     }
 
     /// A CRLF bun.lock (Windows `core.autocrlf` checkout) must keep CRLF on
@@ -14450,6 +14539,15 @@ packages:
             Err("redirect_yarn_berry_cache_unsupported".to_string())
         );
         assert_eq!(code(&crlf, Some("compressionLevel: 0\n")), Ok(()));
+        // #370: a trailing YAML comment is not part of the value.
+        assert_eq!(
+            code(&crlf, Some("compressionLevel: 0 # keep yarn default\n")),
+            Ok(())
+        );
+        assert_eq!(
+            code(&crlf, Some("compressionLevel: mixed # smaller cache\n")),
+            Err("redirect_yarn_berry_cache_unsupported".to_string())
+        );
     }
 
     /// The whole-file gates read the NORMALIZED lock: a CRLF lock at an
