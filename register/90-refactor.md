@@ -2,11 +2,11 @@
 _Last updated 2026-10-02T19:05Z · main @ 203e092_
 
 **In flight:**
-- [#572](https://github.com/SocketDev/socket-patch/pull/572): one hosted-PyPI-URL recognizer for hosted and vendored Pipenv. Issues #563 (E04, E49). State: ready, handed to the PR burn-down.
 - [#574](https://github.com/SocketDev/socket-patch/pull/574): one vlt `registry_base` following vlt's DepID hydration. Issues #562 (E02, E03). State: blocked; Bugbot found on `faade96` that restore and the hosted rewrite decide differently which nodes are on the default registry (`~~` under a non-`npm` default alias). A fix is proposed in the PR thread.
 - [#581](https://github.com/SocketDev/socket-patch/pull/581): one `ApiTimeouts` policy (10 s connect, 60 s idle read) on both `ApiClient` reqwest clients. Issue #570 (C02). State: ready, handed to the PR burn-down.
 
-**Merged:** none yet.
+**Merged:**
+- [#572](https://github.com/SocketDev/socket-patch/pull/572): one hosted-PyPI-URL recognizer for hosted and vendored Pipenv. Issues #563 (E04, E49). Production +31 / −48, tests +174 / −37 (approx.).
 
 **Queue** (B bugs closed, U unblocks, D duplication removed, R risk; score = 3B + 2U + D − risk):
 
