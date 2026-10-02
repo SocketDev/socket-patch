@@ -1289,7 +1289,17 @@ impl NpmCrawler {
         // Each dir is tagged `true` when it is a pnpm or vlt store entry's
         // `node_modules`.
         let mut level: Vec<(PathBuf, bool)> = vec![(node_modules_path.to_path_buf(), false)];
+        let mut visited = HashSet::new();
         while !level.is_empty() {
+            // A bundled node_modules may link back to an ancestor (or to
+            // another already-visited tree). Keep the first/root-first
+            // spelling without traversing the same physical tree again.
+            // Store and importer visits have different link policies, so
+            // retain both modes; each resolution pass gets its own set.
+            level.retain(|(path, store_entry)| {
+                let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                visited.insert((canonical, *store_entry))
+            });
             let visits: Vec<ResolverVisit> = par_map(level, |(nm_path, store_entry)| {
                 Self::visit_resolver_dir(nm_path, store_entry, &pending)
             });
@@ -2499,7 +2509,7 @@ impl Default for NpmCrawler {
 // ---------------------------------------------------------------------------
 
 /// Which store layout a candidate store directory uses.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum StoreLayout {
     Pnpm,
     Bun,
@@ -2564,6 +2574,17 @@ impl StoreLayout {
 /// which breaks content-store hardlinks per copy — CoW safety holds for
 /// every copy independently.
 pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
+    find_store_peer_variant_copies_reusing(pkg_path, &mut HashSet::new()).await
+}
+
+/// Discover candidate stores for every input path, but enumerate a
+/// physical store only once per layout and package identity in one
+/// aggregate expansion. Alias ancestry can expose additional stores even
+/// when the input's canonical package was already seen.
+async fn find_store_peer_variant_copies_reusing(
+    pkg_path: &Path,
+    scanned: &mut HashSet<(PathBuf, StoreLayout, String, String)>,
+) -> Vec<PathBuf> {
     // 1. Candidate stores from both ancestor chains (cheap stats only —
     //    no file reads until a store is actually found).
     let canonical_pkg = tokio::fs::canonicalize(pkg_path).await.ok();
@@ -2666,6 +2687,16 @@ pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
     let mut copies: Vec<PathBuf> = Vec::new();
     let mut seen_copies: HashSet<PathBuf> = HashSet::new();
     for (layout, store) in stores {
+        let canonical_store = tokio::fs::canonicalize(&store)
+            .await
+            .unwrap_or_else(|_| store.clone());
+        if !scanned.insert((canonical_store, layout, full_name.clone(), version.clone())) {
+            continue;
+        }
+        #[cfg(test)]
+        let _ = tests::VARIANT_STORE_SCANS.try_with(|scans| {
+            scans.borrow_mut().push(store.clone());
+        });
         let entries = match layout {
             StoreLayout::Pnpm | StoreLayout::Bun | StoreLayout::Deno => {
                 NpmCrawler::list_pnpm_shaped_store_entries(&store, layout).await
@@ -2735,8 +2766,11 @@ pub async fn with_store_peer_variant_copies(paths: Vec<PathBuf>) -> Vec<PathBuf>
         seen.insert(tokio::fs::canonicalize(path).await.unwrap_or(path.clone()));
     }
     let mut out = paths.clone();
+    // `out` already holds every primary, including the primary excluded
+    // by a store's first scan. Sharing scan state therefore loses no copy.
+    let mut scanned = HashSet::new();
     for path in &paths {
-        for copy in find_store_peer_variant_copies(path).await {
+        for copy in find_store_peer_variant_copies_reusing(path, &mut scanned).await {
             let canonical = tokio::fs::canonicalize(&copy).await.unwrap_or(copy.clone());
             if seen.insert(canonical) {
                 out.push(copy);
@@ -2833,6 +2867,20 @@ fn is_safe_npm_component(component: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    tokio::task_local! {
+        pub(super) static VARIANT_STORE_SCANS: std::cell::RefCell<Vec<PathBuf>>;
+    }
+
+    async fn tracked_store_expansion(paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        VARIANT_STORE_SCANS
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                let expanded = with_store_peer_variant_copies(paths).await;
+                let scans = VARIANT_STORE_SCANS.with(|scans| scans.borrow().clone());
+                (expanded, scans)
+            })
+            .await
+    }
 
     fn listing_of(names: &[&str], complete: bool) -> Listing {
         Listing {
@@ -4187,6 +4235,105 @@ mod tests {
             want.sort();
             assert_eq!(got, want, "from {}", start.display());
         }
+    }
+
+    #[tokio::test]
+    async fn test_store_expansion_scans_transitive_peer_store_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().canonicalize().unwrap().join("node_modules");
+        let store = nm.join(".pnpm");
+        let peers: Vec<_> = (0..8)
+            .map(|i| store.join(format!("foo@1.0.0(peer@1.0.{i})/node_modules/foo")))
+            .collect();
+        for path in &peers {
+            write_pkg(path, "foo", "1.0.0");
+        }
+        // Without an importer link the resolver already returns every
+        // peer. Agent VEX passes this entire set to variant expansion.
+        let purl = "pkg:npm/foo@1.0.0".to_string();
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, std::slice::from_ref(&purl))
+            .await
+            .unwrap();
+        let paths: Vec<_> = found[&purl].iter().map(|pkg| pkg.path.clone()).collect();
+        assert_eq!(paths.len(), peers.len());
+        let (expanded, scans) = tracked_store_expansion(paths.clone()).await;
+        assert_eq!(
+            expanded, paths,
+            "all original copies and their order survive"
+        );
+        assert_eq!(
+            scans.len(),
+            1,
+            "one enumeration per store/identity: {scans:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_expansion_keeps_distinct_identities_and_alias_stores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let store = root.join("main/node_modules/.pnpm");
+        let mut inputs = Vec::new();
+        let mut expected = HashSet::new();
+        for (name, version) in [("foo", "1.0.0"), ("foo", "2.0.0"), ("bar", "1.0.0")] {
+            for i in 0..2 {
+                let path = store.join(format!(
+                    "{name}@{version}(peer@1.0.{i})/node_modules/{name}"
+                ));
+                write_pkg(&path, name, version);
+                expected.insert(path.canonicalize().unwrap());
+                if i == 0 {
+                    inputs.push(path);
+                }
+            }
+        }
+        let alias_nm = root.join("alias/node_modules");
+        let alias_store = alias_nm.join(".pnpm");
+        for i in 0..2 {
+            let path = alias_store.join(format!("foo@1.0.0(peer@1.0.{i})/node_modules/foo"));
+            write_pkg(&path, "foo", "1.0.0");
+            expected.insert(path.canonicalize().unwrap());
+        }
+        let alias = alias_nm.join("foo");
+        link_dir(&inputs[0], &alias);
+        inputs.push(alias);
+        // Another lexical route to the same primary AND alias store.
+        // Candidate discovery must run, but this physical store/identity
+        // has already been scanned through the preceding alias.
+        let linked_nm = root.join("linked/node_modules");
+        std::fs::create_dir_all(&linked_nm).unwrap();
+        link_dir(&alias_store, &linked_nm.join(".pnpm"));
+        let linked_alias = linked_nm.join("foo");
+        link_dir(&inputs[0], &linked_alias);
+        inputs.push(linked_alias);
+
+        let (expanded, scans) = tracked_store_expansion(inputs.clone()).await;
+        assert_eq!(&expanded[..inputs.len()], inputs);
+        assert_eq!(
+            expanded.len(),
+            expected.len() + 2,
+            "retain initial alias paths"
+        );
+        assert_eq!(
+            expanded
+                .iter()
+                .map(|p| p.canonicalize().unwrap())
+                .collect::<HashSet<_>>(),
+            expected
+        );
+        let scans: Vec<_> = scans.iter().map(|p| p.canonicalize().unwrap()).collect();
+        assert_eq!(scans.iter().filter(|p| **p == store).count(), 3);
+        assert_eq!(scans.iter().filter(|p| **p == alias_store).count(), 1);
+
+        // Standalone apply/rollback discovery gets a fresh scan and still
+        // excludes only its own primary copy.
+        let copies = find_store_peer_variant_copies(&inputs[0]).await;
+        assert_eq!(copies.len(), 1);
+        assert_ne!(
+            copies[0].canonicalize().unwrap(),
+            inputs[0].canonicalize().unwrap()
+        );
     }
 
     /// D19: a vendored copy's `.socket/vendor/npm/<uuid>/<leaf>/node_modules`

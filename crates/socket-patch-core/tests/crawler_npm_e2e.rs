@@ -2390,6 +2390,111 @@ async fn find_by_purls_returns_bundled_copy_of_an_already_found_target() {
     }
 }
 
+/// Skipped store entries can link their bundled tree back to the importer.
+/// Bound this regression in a child process: a broken walk must fail the
+/// test instead of leaving a blocking-pool traversal running indefinitely.
+#[cfg(unix)]
+#[test]
+fn find_by_purls_bounds_bundled_store_cycles_and_keeps_linked_copies() {
+    const CHILD: &str = "SOCKET_TEST_BUNDLED_STORE_CYCLE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "find_by_purls_bounds_bundled_store_cycles_and_keeps_linked_copies",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let timed_out = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                break true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !timed_out && output.status.success(),
+            "cycle resolution timed_out={timed_out}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let nm = root.join("node_modules");
+        stage_npm_pkg(&nm, "target", "1.0.0").await;
+        for host in ["host-a", "host-b"] {
+            let entry_nm = nm.join(format!(".pnpm/{host}@1.0.0/node_modules"));
+            stage_npm_pkg(&entry_nm, host, "1.0.0").await;
+            std::os::unix::fs::symlink(&nm, entry_nm.join(host).join("node_modules")).unwrap();
+        }
+        // This link reaches another physical copy, rather than an ancestor;
+        // cycle protection must not discard legitimate linked nested trees.
+        let linked = root.join("linked-bundle");
+        stage_npm_pkg(&linked, "target", "1.0.0").await;
+        let entry_nm = nm.join(".pnpm/host-c@1.0.0/node_modules");
+        stage_npm_pkg(&entry_nm, "host-c", "1.0.0").await;
+        std::os::unix::fs::symlink(&linked, entry_nm.join("host-c/node_modules")).unwrap();
+        let purl = "pkg:npm/target@1.0.0".to_string();
+        let found = NpmCrawler
+            .find_by_purls(&nm, std::slice::from_ref(&purl))
+            .await
+            .unwrap();
+        let copies = &found[&purl];
+        assert_eq!(copies.len(), 2);
+        assert_eq!(copies[0].path, nm.join("target"));
+        assert_eq!(
+            std::fs::canonicalize(&copies[1].path).unwrap(),
+            linked.join("target")
+        );
+        assert_ne!(
+            std::fs::canonicalize(&copies[0].path).unwrap(),
+            std::fs::canonicalize(&copies[1].path).unwrap()
+        );
+    });
+}
+
+/// The same physical directory can be a store entry and an ordinary
+/// nested tree. The latter may resolve a dependency link that the former
+/// intentionally skips; deduplication must preserve both visit policies.
+#[cfg(unix)]
+#[tokio::test]
+async fn find_by_purls_preserves_importer_mode_after_store_visit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let nm = root.join("node_modules");
+    let physical = root.join("physical");
+    stage_npm_pkg(&physical, "only-linked", "1.0.0").await;
+    let opaque_nm = nm.join(".pnpm/opaque/node_modules");
+    std::fs::create_dir_all(&opaque_nm).unwrap();
+    std::os::unix::fs::symlink(physical.join("only-linked"), opaque_nm.join("only-linked"))
+        .unwrap();
+    let host_nm = nm.join(".pnpm/host@1.0.0/node_modules");
+    stage_npm_pkg(&host_nm, "host", "1.0.0").await;
+    std::os::unix::fs::symlink(&opaque_nm, host_nm.join("host/node_modules")).unwrap();
+    let purl = "pkg:npm/only-linked@1.0.0".to_string();
+    let found = NpmCrawler
+        .find_by_purls(&nm, std::slice::from_ref(&purl))
+        .await
+        .unwrap();
+    assert_eq!(found[&purl].len(), 1);
+    assert_eq!(
+        std::fs::canonicalize(&found[&purl][0].path).unwrap(),
+        physical.join("only-linked")
+    );
+}
+
 // ── vlt store (.vlt), staged from captured real layouts ────────
 
 /// The eras with a captured `vlt install` layout under
