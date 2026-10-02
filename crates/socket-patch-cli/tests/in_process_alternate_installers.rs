@@ -1060,3 +1060,119 @@ async fn rush_pnpm_symlink_farm_apply_patches_through_both_projects() {
         );
     }
 }
+
+/// REGRESSION (#518): a Rush TRANSITIVE dependency lives only in the pnpm
+/// store under `common/temp/node_modules/.pnpm` (no project links it), and
+/// the crawler pruned `temp`, so agent-mode apply reported it
+/// `package_not_installed` and left it unpatched. It is now found through
+/// the `common/temp/node_modules` root and patched in place.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn rush_transitive_dep_in_common_temp_store_is_patched() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(root.join("rush.json"), r#"{ "rushVersion": "5.180.0" }"#).unwrap();
+    let store = root.join("common/temp/node_modules/.pnpm");
+    let transitive = store.join("is-number@7.0.0/node_modules/is-number");
+    let direct = store.join("to-regex-range@5.0.1/node_modules/to-regex-range");
+    for (dir, name, version) in [
+        (&transitive, "is-number", "7.0.0"),
+        (&direct, "to-regex-range", "5.0.1"),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!(r#"{{ "name": "{name}", "version": "{version}" }}"#),
+        )
+        .unwrap();
+    }
+    symlink(&transitive, direct.parent().unwrap().join("is-number")).unwrap();
+    let app = root.join("apps/app");
+    std::fs::create_dir_all(app.join("node_modules")).unwrap();
+    std::fs::write(
+        app.join("package.json"),
+        r#"{ "name": "app", "version": "1.0.0", "dependencies": { "to-regex-range": "5.0.1" } }"#,
+    )
+    .unwrap();
+    symlink(&direct, app.join("node_modules/to-regex-range")).unwrap();
+
+    let original = b"module.exports = function isNumber() {}\n".to_vec();
+    std::fs::write(transitive.join("index.js"), &original).unwrap();
+    let before_hash = git_sha256(&original);
+    let mut patched = original.clone();
+    patched.extend_from_slice(b"\n// SOCKET-PATCH-RUSH-TRANSITIVE-MARKER\n");
+    let after_hash = git_sha256(&patched);
+    let socket = root.join(".socket");
+    write_manifest(
+        &socket,
+        "pkg:npm/is-number@7.0.0",
+        &before_hash,
+        &after_hash,
+    );
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&after_hash), &patched).unwrap();
+
+    let code = apply_run(default_apply(root)).await;
+    assert_eq!(
+        code, 0,
+        "apply must find the Rush transitive dep in common/temp"
+    );
+    assert_patched(
+        &transitive.join("index.js"),
+        &patched,
+        &before_hash,
+        &after_hash,
+    );
+    assert_eq!(
+        std::fs::read(direct.parent().unwrap().join("is-number/index.js")).unwrap(),
+        patched,
+        "the dependent's store link sees the patched bytes"
+    );
+}
+
+/// REGRESSION (#493): with `.yarnrc` `--modules-folder deps`, yarn classic
+/// installs into `deps/` and there is no `node_modules`. Agent-mode apply
+/// reported the package `package_not_installed` (exit 0 from `scan`,
+/// unpatched); it is now patched at `deps/<name>`.
+#[tokio::test]
+#[serial]
+async fn yarn_modules_folder_install_is_patched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "app", "version": "1.0.0", "dependencies": { "left-pad": "1.3.0" } }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join(".yarnrc"), "--modules-folder \"deps\"\n").unwrap();
+    let pkg = root.join("deps/left-pad");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{ "name": "left-pad", "version": "1.3.0" }"#,
+    )
+    .unwrap();
+    let original = b"module.exports = leftPad;\n".to_vec();
+    std::fs::write(pkg.join("index.js"), &original).unwrap();
+    let before_hash = git_sha256(&original);
+    let mut patched = original.clone();
+    patched.extend_from_slice(b"\n// SOCKET-PATCH-MODULES-FOLDER-MARKER\n");
+    let after_hash = git_sha256(&patched);
+    let socket = root.join(".socket");
+    write_manifest(&socket, "pkg:npm/left-pad@1.3.0", &before_hash, &after_hash);
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&after_hash), &patched).unwrap();
+
+    let code = apply_run(default_apply(root)).await;
+    assert_eq!(
+        code, 0,
+        "apply must find the package in the yarn modules folder"
+    );
+    assert_patched(&pkg.join("index.js"), &patched, &before_hash, &after_hash);
+    assert!(!root.join("node_modules").exists());
+}
