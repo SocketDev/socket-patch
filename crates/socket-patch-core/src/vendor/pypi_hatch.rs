@@ -113,17 +113,37 @@ pub(super) async fn load(
 }
 
 async fn require_environment_context_support(root: &Path) -> Result<(), Failure> {
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::process::Command::new("hatch")
-            .arg("--version")
-            .current_dir(root)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await;
-    if let Ok(Ok(output)) = output {
+    require_environment_context_support_with(root, &|var| std::env::var_os(var)).await
+}
+
+/// [`require_environment_context_support`] over an injected environment
+/// reader (tests).
+///
+/// `hatch` is looked up on ABSOLUTE `PATH` entries only and the RESOLVED path
+/// is spawned: the probe runs from the scanned project, so a bare
+/// `Command::new("hatch")` under a relative `PATH` entry (`.`, an empty
+/// component) would execute a `hatch` committed to that repository. No
+/// `hatch` found takes the same refusal as one too old.
+async fn require_environment_context_support_with(
+    root: &Path,
+    var: &impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<(), Failure> {
+    let output = match crate::utils::process::resolve_tool_with("hatch", var) {
+        Some(program) => Some(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tokio::process::Command::from(crate::utils::process::command_for(&program))
+                    .arg("--version")
+                    .current_dir(root)
+                    .stdin(std::process::Stdio::null())
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await,
+        ),
+        None => None,
+    };
+    if let Some(Ok(Ok(output))) = output {
         if output.status.success()
             && String::from_utf8_lossy(&output.stdout)
                 .split_whitespace()
@@ -576,5 +596,61 @@ mod tests {
                 .unwrap(),
             edited
         );
+    }
+
+    /// An executable `hatch` script in `dir` that touches `marker` and prints
+    /// a Hatch version banner that passes the >=1.2 gate.
+    #[cfg(unix)]
+    fn fake_hatch(dir: &Path, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("hatch");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n: > '{}'\necho 'Hatch, version 1.13.0'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planted_hatch_in_the_project_is_never_executed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let marker = temp.path().join("PWNED");
+        fake_hatch(&root, &marker);
+        // `.` and an empty component both resolve against the child's cwd,
+        // which is the scanned project.
+        for path in [".", "", ":/nonexistent-socket-patch-bin"] {
+            let result = require_environment_context_support_with(&root, &|var| {
+                (var == "PATH").then(|| path.into())
+            })
+            .await;
+            assert!(!marker.exists(), "planted hatch ran with PATH={path:?}");
+            assert_eq!(result.unwrap_err().0, "pypi_hatch_unsupported");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hatch_on_an_absolute_path_entry_passes_the_version_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        let marker = temp.path().join("ran");
+        fake_hatch(&bin, &marker);
+        let path = std::env::join_paths([bin.as_path()]).unwrap();
+        require_environment_context_support_with(&root, &|var| {
+            (var == "PATH").then(|| path.clone())
+        })
+        .await
+        .unwrap();
+        assert!(marker.exists(), "the resolved hatch was not run");
     }
 }
