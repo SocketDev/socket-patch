@@ -299,6 +299,44 @@ pub async fn vendor_maven(
         )
         .await;
     }
+    let mut outcome = vendor_maven_single(
+        purl,
+        installed_dir,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service,
+    )
+    .await;
+    if legacy_mixed_root(project_root).await {
+        if let VendorOutcome::Done { warnings, .. } = &mut outcome {
+            warnings.push(VendorWarning::new(
+                super::jvm::gradle::DEGRADED,
+                "reason: legacy_maven_root: pom.xml is vendored through its <repository>, which \
+                 the Gradle build beside it never reads, so that build stays unpatched; run \
+                 `socket-patch vendor --revert` and vendor again to wire both builds",
+            ));
+        }
+    }
+    outcome
+}
+
+/// The single-pom backend of [`vendor_maven`].
+#[allow(clippy::too_many_arguments)]
+async fn vendor_maven_single(
+    purl: &str,
+    installed_dir: &Path,
+    project_root: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
     let MavenPrelude {
         group_id,
         artifact_id,
@@ -658,7 +696,33 @@ pub async fn revert_maven_opts(
 async fn jvm_shape(project_root: &Path) -> Option<super::jvm::Shape> {
     let reader = super::jvm::apply::ProjectReader::new(project_root);
     let shape = super::jvm::detect(&|rel: &str| reader.read(rel));
-    (shape != super::jvm::Shape::Other).then_some(shape)
+    if shape == super::jvm::Shape::Other || legacy_mixed_root(project_root).await {
+        return None;
+    }
+    Some(shape)
+}
+
+/// A single-pom root beside a Gradle build whose ledger already holds a
+/// single-pom (`<repository>`) entry. Such roots routed to the single-pom
+/// backend before mixed roots were planned as one JVM entry (#395), and
+/// nothing migrates that wiring: a JVM entry would carry the legacy record
+/// forward (same uuid) or orphan its `<repository>` and tree (new uuid). The
+/// whole root stays on the single-pom backend until it is reverted.
+async fn legacy_mixed_root(project_root: &Path) -> bool {
+    let reader = super::jvm::apply::ProjectReader::new(project_root);
+    let builds = super::jvm::detect_builds(&|rel: &str| reader.read(rel));
+    if builds.maven != Some(super::jvm::MavenShape::Single) || !builds.gradle {
+        return false;
+    }
+    // An unreadable ledger is refused by the JVM backend itself.
+    super::state::load_state(project_root)
+        .await
+        .is_ok_and(|state| {
+            state
+                .entries
+                .values()
+                .any(|e| e.wiring.iter().any(|w| w.kind == REPO_WIRING_KIND))
+        })
 }
 
 /// The `not_build_root` refusal detail when `project_root` is a module of a
@@ -696,9 +760,12 @@ pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
         // Only a Gradle project can belong to an ancestor Gradle build.
         if let Some(settings) = settings.filter(|_| own_build || own_settings) {
             let owner = crate::gradle::graph::subproject_owner(&read_text, settings, &rel);
+            // Settings that are not UTF-8 are unparseable, never "absent":
+            // their includes cannot be ruled out.
+            let undecodable = read_text(settings).is_none();
             // A Gradle project with no settings of its own is configured
             // by the nearest ancestor settings, whatever it includes.
-            if owner.is_some() || (own_build && !own_settings) {
+            if owner.is_some() || undecodable || (own_build && !own_settings) {
                 return Some(format!(
                     "reason: not_build_root: run vendor from Gradle root {}",
                     ancestor.display()
@@ -952,6 +1019,7 @@ async fn vendor_maven_jvm(
             upstream_pom: probe_pom.as_bytes(),
             upstream_module: None,
             extra_artifacts: &[],
+            patched_members: &[],
         };
         let plan = super::jvm::plan(
             shape,
@@ -1102,18 +1170,7 @@ async fn vendor_maven_jvm(
         extras = Some(found);
     }
     let extras = extras.unwrap_or_default();
-    for x in &extras {
-        if let Some(member) = unpatched_member(&x.bytes, record) {
-            warnings.push(VendorWarning::new(
-                "vendor_jvm_degraded",
-                format!(
-                    "reason: classifier_unpatched_copy: {} carries an unpatched copy of {member}; \
-                     a build consuming that classifier stays unpatched",
-                    x.file_name(&artifact_id, &version)
-                ),
-            ));
-        }
-    }
+    let patched: Vec<String> = record.files.keys().cloned().collect();
     let patch = super::jvm::JvmPatch {
         group_id: &group_id,
         artifact_id: &artifact_id,
@@ -1123,6 +1180,7 @@ async fn vendor_maven_jvm(
         upstream_pom: &pom_bytes,
         upstream_module: module_bytes.as_deref(),
         extra_artifacts: &extras,
+        patched_members: &patched,
     };
     let prior_disabled = state.as_ref().is_some_and(|s| {
         s.entries.values().any(|e| {
@@ -1285,19 +1343,6 @@ async fn vendor_maven_jvm(
     );
     entry.ecosystem = "jvm".to_string();
     done(result, Some(entry), warnings)
-}
-
-/// The first patched member of `record` that the classifier jar `bytes`
-/// holds with other content than the patch's: that copy stays unpatched.
-fn unpatched_member(bytes: &[u8], record: &PatchRecord) -> Option<String> {
-    let members = super::verify::read_zip_bytes_to_map(bytes).ok()?;
-    let mut names: Vec<&String> = record.files.keys().collect();
-    names.sort();
-    names.into_iter().find_map(|name| {
-        let content = members.get(name)?;
-        let hash = crate::hash::git_sha256::compute_git_sha256_from_bytes(content);
-        (record.files[name].after_hash != hash).then(|| name.clone())
-    })
 }
 
 /// A classifier jar of `gav`: an authenticated local copy, else (online) a
@@ -5195,6 +5240,18 @@ mod tests {
         std::fs::write(root.join("tools/gen/build.gradle"), "").unwrap();
         assert_eq!(not_build_root(&root.join("tools/gen")), None);
         assert_eq!(not_build_root(root), None);
+        // Root settings that are not UTF-8 (a Latin-1 `©`) cannot rule out
+        // an include: a project with settings of its own still refuses.
+        std::fs::write(
+            root.join("settings.gradle"),
+            b"// \xa9 2026\ninclude 'tools:gen'\n",
+        )
+        .unwrap();
+        let detail = not_build_root(&root.join("tools/gen")).unwrap();
+        assert!(
+            detail.starts_with("reason: not_build_root: run vendor from Gradle root "),
+            "{detail}"
+        );
     }
 
     fn fixture_record() -> PatchRecord {
@@ -5248,5 +5305,137 @@ mod tests {
             jvm_shape(root).await,
             Some(super::super::jvm::Shape::MavenReactor)
         );
+    }
+
+    /// A single-pom root vendored on the single-pom backend before mixed
+    /// roots were planned as one JVM entry keeps that backend once a Gradle
+    /// build sits beside it: the re-run warns that the Gradle build stays
+    /// unpatched and writes no JVM wiring, and the revert restores pom.xml
+    /// exactly. Without such an entry the same root is mixed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_single_pom_entry_keeps_a_mixed_root_on_its_backend() {
+        use super::super::jvm::Shape;
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let (_, entry, _) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let entry = entry.unwrap();
+        assert_eq!(entry.ecosystem, "maven");
+        let mut state = super::super::state::VendorState::new();
+        state.entries.insert(PURL.to_string(), entry.clone());
+        super::super::state::save_state(root, &state).await.unwrap();
+        std::fs::write(root.join("settings.gradle"), "rootProject.name = 'app'\n").unwrap();
+        assert_eq!(jvm_shape(root).await, None);
+
+        let (result, _, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{result:?}");
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_jvm_degraded"
+                && w.detail.starts_with("reason: legacy_maven_root: ")),
+            "{warnings:?}"
+        );
+        assert!(!root.join(".socket/gradle").exists());
+        assert!(!root.join(".socket/vendor/gradle").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("settings.gradle")).unwrap(),
+            "rootProject.name = 'app'\n"
+        );
+
+        let outcome = revert_maven(&entry, root, false).await;
+        assert!(outcome.success, "{outcome:?}");
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            std::fs::read_to_string(root.join(PROJECT_POM)).unwrap(),
+            project_pom()
+        );
+        super::super::state::save_state(root, &super::super::state::VendorState::new())
+            .await
+            .unwrap();
+        assert_eq!(jvm_shape(root).await, Some(Shape::Mixed));
+    }
+
+    /// Offline sourcing (#533, #511): a Gradle copy counts only in the hash
+    /// directory its bytes name, an m2 copy only when its `.sha1` sidecar
+    /// matches (or, unauthenticated, when it has none), and the crawler's
+    /// Gradle version directory makes its whole `files-2.1` tree a source.
+    #[tokio::test]
+    async fn local_sources_trust_only_verifiable_copies() {
+        use crate::crawlers::jvm_cache::{JvmCacheLayout, JvmCacheRoot};
+        let sha1 = |b: &[u8]| {
+            use sha1::Digest as _;
+            hex::encode(sha1::Sha1::digest(b))
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let gav: crate::crawlers::jvm_cache::Gav = ("com.x".into(), "lib".into(), "1.0".into());
+        let only = |path: PathBuf, layout| LocalSources {
+            installed_dir: None,
+            roots: vec![JvmCacheRoot::new(path, layout)],
+        };
+
+        let files21 = dir.path().join("gradle/caches/modules-2/files-2.1");
+        let version = files21.join("com.x/lib/1.0");
+        let put = |rel: PathBuf, bytes: &[u8]| {
+            std::fs::create_dir_all(rel.parent().unwrap()).unwrap();
+            std::fs::write(rel, bytes).unwrap();
+        };
+        put(version.join(sha1(b"POM")).join("lib-1.0.pom"), b"POM");
+        put(
+            version.join(sha1(b"other")).join("lib-1.0.jar"),
+            b"TAMPERED",
+        );
+        put(
+            version.join(sha1(b"SRC")).join("lib-1.0-sources.jar"),
+            b"SRC",
+        );
+        let gradle = only(files21.clone(), JvmCacheLayout::GradleModules2);
+        assert_eq!(
+            gradle.find(&gav, None, "pom", true).await.unwrap(),
+            Some(b"POM".to_vec())
+        );
+        assert_eq!(gradle.find(&gav, None, "jar", false).await.unwrap(), None);
+        // From the crawler's version dir: the root is its files-2.1 tree.
+        let crawled = LocalSources::new(dir.path(), &version, "com.x");
+        assert!(crawled.roots.iter().any(|r| r.path == files21));
+        assert_eq!(
+            crawled
+                .find(&gav, Some("sources"), "jar", true)
+                .await
+                .unwrap(),
+            Some(b"SRC".to_vec())
+        );
+
+        let m2 = dir.path().join("m2");
+        let leaf = m2.join("com/x/lib/1.0");
+        put(leaf.join("lib-1.0.pom"), b"POM");
+        put(leaf.join("lib-1.0.pom.sha1"), sha1(b"POM").as_bytes());
+        put(leaf.join("lib-1.0.jar"), b"JAR");
+        put(leaf.join("lib-1.0.jar.sha1"), sha1(b"other").as_bytes());
+        put(leaf.join("lib-1.0-tests.jar"), b"TESTS");
+        let maven = only(m2.clone(), JvmCacheLayout::Maven2);
+        assert_eq!(
+            maven.find(&gav, None, "pom", true).await.unwrap(),
+            Some(b"POM".to_vec())
+        );
+        assert_eq!(maven.find(&gav, None, "jar", false).await.unwrap(), None);
+        assert_eq!(
+            maven.find(&gav, Some("tests"), "jar", true).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            maven.find(&gav, Some("tests"), "jar", false).await.unwrap(),
+            Some(b"TESTS".to_vec())
+        );
+        // The crawler's own m2 dir is read directly, under the same rules.
+        let crawled = LocalSources::new(dir.path(), &leaf, "com.x");
+        assert!(crawled.roots.iter().any(|r| r.path == m2));
+        assert_eq!(
+            crawled
+                .find(&gav, Some("tests"), "jar", true)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(crawled.find(&gav, None, "jar", false).await.unwrap(), None);
     }
 }

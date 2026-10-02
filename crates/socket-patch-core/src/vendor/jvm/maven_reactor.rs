@@ -2402,6 +2402,7 @@ mod tests {
             upstream_pom: pom.as_bytes(),
             upstream_module: None,
             extra_artifacts: &[],
+            patched_members: &[],
         }
     }
 
@@ -3402,6 +3403,7 @@ mod tests {
             upstream_pom: b"<project><groupId>org.example</groupId><artifactId>lib</artifactId><version>2.0</version></project>\n",
             upstream_module: None,
             extra_artifacts: &[],
+            patched_members: &[],
         }
     }
 

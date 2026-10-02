@@ -322,6 +322,18 @@ pub async fn restore(
             if stage_dir == uuid_dir || !stage_dir.is_dir() {
                 continue;
             }
+            // Same guard as the artifact's own path: never swap a tree
+            // reached through a link (the swap deletes what it replaces).
+            let mut cursor = root.to_path_buf();
+            for part in rel.split('/') {
+                cursor.push(part);
+                if tokio::fs::symlink_metadata(&cursor)
+                    .await
+                    .is_ok_and(|m| m.file_type().is_symlink())
+                {
+                    return Err("vendor_path_unsafe: artifact path contains a symlink".into());
+                }
+            }
             tokio::fs::create_dir_all(target.parent().ok_or("tree has no parent")?)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -330,7 +342,7 @@ pub async fn restore(
                 .map_err(|e| e.to_string())?;
         }
         if entry.ecosystem == "jvm" {
-            restore_gradle_owned_files(root, entry).await?;
+            restore_jvm_owned_files(root, entry).await?;
         }
     } else {
         if let Some(parent) = artifact.parent() {
@@ -464,6 +476,7 @@ async fn restore_maven_metadata(
             bytes,
         });
     }
+    let patched: Vec<String> = record.files.keys().cloned().collect();
     let patch = super::jvm::JvmPatch {
         group_id: &group,
         artifact_id: &artifact,
@@ -473,6 +486,7 @@ async fn restore_maven_metadata(
         upstream_pom: &pom,
         upstream_module: module.as_deref(),
         extra_artifacts: &extras,
+        patched_members: &patched,
     };
     let reader = super::jvm::apply::ProjectReader::new(root);
     let read = |rel: &str| {
@@ -534,8 +548,9 @@ async fn restore_maven_metadata(
 
 /// The owned files a Gradle tree needs beside its directory: the derived
 /// `maven-metadata.xml` (recomputed from the committed index) and the
-/// `.gitattributes` the entry created, rewritten when missing.
-async fn restore_gradle_owned_files(root: &Path, entry: &VendorEntry) -> Result<(), String> {
+/// `.gitattributes` the entry created, rewritten when missing. Needs no
+/// download, so `repair` also runs it for a healthy entry.
+pub async fn restore_jvm_owned_files(root: &Path, entry: &VendorEntry) -> Result<(), String> {
     use super::jvm::gradle;
     let Some((group, artifact, _)) = parse_maven_purl(&entry.base_purl) else {
         return Ok(());

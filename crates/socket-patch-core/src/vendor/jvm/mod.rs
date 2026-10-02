@@ -167,6 +167,10 @@ pub struct JvmPatch<'a> {
     pub upstream_module: Option<&'a [u8]>,
     /// Classifier artifacts served beside the jar (Gradle only).
     pub extra_artifacts: &'a [ExtraArtifact],
+    /// The jar members the patch rewrote (the record's files): a classifier
+    /// artifact holding one with other bytes than the patched jar's is an
+    /// unpatched copy (#533).
+    pub patched_members: &'a [String],
 }
 
 impl<'a> JvmPatch<'a> {
@@ -711,6 +715,7 @@ mod tests {
             upstream_pom: b"pom",
             upstream_module: None,
             extra_artifacts: &[],
+            patched_members: &[],
         }
     }
 
@@ -829,6 +834,7 @@ mod tests {
             upstream_pom: b"<project><modelVersion>4.0.0</modelVersion><groupId>org.apache.commons</groupId><artifactId>commons-text</artifactId><version>1.10.0</version></project>\n",
             upstream_module: None,
             extra_artifacts: &[],
+            patched_members: &[],
         }
     }
 

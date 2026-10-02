@@ -856,6 +856,11 @@ pub fn check_entry(
     } else {
         Vec::new()
     };
+    let patched = if gradle {
+        gradle::committed_patched(&read, &c)
+    } else {
+        Vec::new()
+    };
     let patch = super::JvmPatch {
         group_id: &g,
         artifact_id: &a,
@@ -865,6 +870,7 @@ pub fn check_entry(
         upstream_pom: &pom,
         upstream_module: module.as_deref(),
         extra_artifacts: &extras,
+        patched_members: &patched,
     };
     let config = !entry.wiring.iter().any(|w| op_of(w) == "config_none");
     let plan = super::plan_with_config(shape_of(&entry.wiring), &read, &list, &patch, config)
@@ -976,6 +982,11 @@ pub fn checked_tree_jar(root: &Path, entry: &VendorEntry, uuid: &str) -> Result<
     for w in &entry.wiring {
         let needed = w.kind == TREE_KIND || w.kind == DERIVED_METADATA_KIND;
         if needed && record_allowed(w, &c) && reader.read(&w.file).is_none() {
+            // A tree reached through a link out of the checkout is no
+            // missing file a repair may restore there.
+            if reader.escaped().is_some() {
+                return Err("vendor_path_unsafe".into());
+            }
             return Err("vendor_artifact_missing".into());
         }
     }

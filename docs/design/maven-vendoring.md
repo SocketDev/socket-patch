@@ -96,7 +96,10 @@ written, and `repair` refuses there too. A root holding both a `pom.xml` and a
 Gradle build vendors both, in one ledger entry: the Maven half as a one-POM
 reactor (suffixed tree, pin, `maven.config`), the Gradle half as below. A
 refusal of either half writes nothing, and `--check`, `vex`, revert and repair
-always handle both.
+always handle both. A single-POM root whose ledger already holds a single-POM
+(`<repository>`) entry stays on the single-POM backend, with a
+`legacy_maven_root` degraded warning that the Gradle build stays unpatched:
+nothing migrates that wiring, so revert and vendor again to wire both builds.
 
 The original GAV is retained under
 `.socket/vendor/gradle/<group-path>/<artifact>/<version>/`, with the jar, the
@@ -106,6 +109,8 @@ source attachment keeps working). A declared classifier that cannot be sourced
 refuses with `classifier_unavailable`: `exclusiveContent` claims every file of
 the GAV, so a missing one would stop resolving. A classifier jar that carries
 an unpatched copy of a patched member is degraded (`classifier_unpatched_copy`).
+The tree marker lists the patched members beside classifier jars, so `vex`
+re-runs that check from the committed tree and withholds attestation.
 
 Each vendored GA also gets `.socket/vendor/gradle/<group-path>/<artifact>/maven-metadata.xml`,
 derived from the index: every vendored version in Gradle's version order, the
@@ -198,7 +203,7 @@ ledger. Patch updates remove superseded Maven trees after the new wiring is
 committed. Gradle updates keep the same artifact paths. Unrecognized or forged
 paths cannot direct writes outside the backend's allowed files.
 
-`repair` redownloads the exact recorded jar and checks regenerated repository metadata against the ledger, preserving project wiring. A missing classifier jar, POM or derived `maven-metadata.xml` also triggers it: classifier jars are downloaded and checked against registry checksums, a mixed root's two trees come back from one download, and the derived metadata and the owned `.gitattributes` are rewritten when missing. Offline repair cannot restore missing or corrupt artifacts. The
+`repair` redownloads the exact recorded jar and checks regenerated repository metadata against the ledger, preserving project wiring. A missing classifier jar, POM or derived `maven-metadata.xml` also triggers it: classifier jars are downloaded and checked against registry checksums, a mixed root's two trees come back from one download, and the derived metadata and the owned `.gitattributes` are rewritten when missing (for an otherwise healthy entry too, without a download). Tree directories reached through a link out of the checkout are refused (`vendor_path_unsafe`). Offline repair cannot restore missing or corrupt artifacts. The
 ledger is required for exact reversal; restore a deleted ledger from version
 control. In-place ledger reconstruction remains outside v5's repair contract.
 

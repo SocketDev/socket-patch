@@ -166,6 +166,42 @@ pub fn committed_extras(read: ReadFn<'_>, c: &Coords<'_>) -> Option<Vec<ExtraArt
     Some(out)
 }
 
+/// The patched jar members `c`'s committed marker lists (written only
+/// beside classifier artifacts); empty when it lists none.
+pub fn committed_patched(read: ReadFn<'_>, c: &Coords<'_>) -> Vec<String> {
+    let marker: Option<serde_json::Value> = read(&format!("{}/{MARKER_NAME}", tree_dir(c)))
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    marker
+        .as_ref()
+        .and_then(|m| m.get("patched")?.as_array())
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|n| n.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The first patched member (sorted) that the classifier artifact `bytes`
+/// holds with other content than the patched `jar`: a build consuming that
+/// classifier stays unpatched (#533).
+fn unpatched_copy(bytes: &[u8], jar: &[u8], patched: &[String]) -> Option<String> {
+    use crate::vendor::verify::read_zip_bytes_to_map;
+    let members = read_zip_bytes_to_map(bytes).ok()?;
+    let patched_jar = read_zip_bytes_to_map(jar).ok()?;
+    let mut names: Vec<&String> = patched.iter().collect();
+    names.sort();
+    names
+        .into_iter()
+        .find(|name| {
+            members
+                .get(*name)
+                .is_some_and(|copy| patched_jar.get(*name) != Some(copy))
+        })
+        .cloned()
+}
+
 /// `(classifier, extension)` of a tree file name `<a>-<v>-<c>.<ext>`.
 fn classifier_of(name: &str, a: &str, v: &str) -> Option<(String, String)> {
     let rest = name.strip_prefix(&format!("{a}-{v}-"))?;
@@ -421,6 +457,16 @@ pub fn plan(
     }
     for x in patch.extra_artifacts {
         files.push((x.file_name(a, v), &x.bytes));
+        if let Some(member) = unpatched_copy(&x.bytes, patch.jar, patch.patched_members) {
+            warnings.push(degraded(
+                "classifier_unpatched_copy",
+                format!(
+                    "{} carries an unpatched copy of {member}; a build consuming that \
+                     classifier stays unpatched",
+                    x.file_name(a, v)
+                ),
+            ));
+        }
     }
     files.sort_by(|x, y| x.0.cmp(&y.0));
     files.dedup_by(|x, y| x.0 == y.0);
@@ -1103,6 +1149,12 @@ pub fn wired(read: ReadFn<'_>, list: ListFn<'_>, c: &Coords<'_>) -> bool {
     else {
         return false;
     };
+    // Classifier copies are checked against the marker's patched members:
+    // without them an unpatched copy could not be ruled out.
+    let patched = committed_patched(read, c);
+    if !extras.is_empty() && patched.is_empty() {
+        return false;
+    }
     let patch = JvmPatch {
         group_id: c.group_id,
         artifact_id: c.artifact_id,
@@ -1112,6 +1164,7 @@ pub fn wired(read: ReadFn<'_>, list: ListFn<'_>, c: &Coords<'_>) -> bool {
         upstream_pom: &pom,
         upstream_module: module.as_deref(),
         extra_artifacts: &extras,
+        patched_members: &patched,
     };
     plan(read, list, &patch).is_ok_and(|p| {
         p.warnings.iter().all(|w| {
@@ -1780,12 +1833,22 @@ fn marker_json(patch: &JvmPatch<'_>, files: &[(String, &[u8])]) -> String {
             bytes.len()
         ));
     }
+    out.push_str("\n  },");
+    // Beside classifier artifacts, the patched members, so liveness can
+    // re-check the classifier copies without the patch record.
+    if !patch.extra_artifacts.is_empty() && !patch.patched_members.is_empty() {
+        let mut names: Vec<&String> = patch.patched_members.iter().collect();
+        names.sort();
+        names.dedup();
+        let names: Vec<String> = names.into_iter().map(|n| json_str(n)).collect();
+        out.push_str(&format!("\n  \"patched\": [{}],", names.join(", ")));
+    }
     let purl = format!(
         "pkg:maven/{}/{}@{}",
         patch.group_id, patch.artifact_id, patch.version
     );
     out.push_str(&format!(
-        "\n  }},\n  \"purl\": {},\n  \"schema\": 1,\n  \"tool\": \"gradle\",\n  \"uuid\": {},\n  \"version\": {}\n}}\n",
+        "\n  \"purl\": {},\n  \"schema\": 1,\n  \"tool\": \"gradle\",\n  \"uuid\": {},\n  \"version\": {}\n}}\n",
         json_str(&purl),
         json_str(patch.uuid),
         json_str(patch.version)
@@ -2349,6 +2412,7 @@ pub(crate) fn add_verification_metadata(
             upstream_pom: &m.bytes,
             upstream_module: None,
             extra_artifacts: &[],
+            patched_members: &[],
         };
         let sha = sha256_hex(&m.bytes);
         let h = ArtifactHashes {
@@ -2419,6 +2483,7 @@ mod tests {
             upstream_pom: b"<project></project>\n",
             upstream_module: None,
             extra_artifacts: &[],
+            patched_members: &[],
         }
     }
 
@@ -3280,6 +3345,7 @@ mod tests {
             upstream_pom: b"<project></project>\n",
             upstream_module: None,
             extra_artifacts: &[],
+            patched_members: &[],
         }
     }
 
@@ -4164,6 +4230,80 @@ mod tests {
         };
         let files = fs(&[("settings.gradle", "")]);
         assert_eq!(run(&files, &p).unwrap_err().code, "unsafe_coordinates");
+    }
+
+    fn zip_of(members: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes) in members {
+            zw.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(bytes).unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    }
+
+    /// #533: a declared classifier holding its own copy of a patched member
+    /// is degraded by the planner itself, so VEX liveness (which re-plans
+    /// from the committed tree and the marker's patched members) withholds
+    /// attestation; a copy equal to the patched one, or a classifier that
+    /// lacks the member, is not. A marker without its patched list beside
+    /// classifier artifacts is not live either.
+    #[test]
+    fn classifier_unpatched_copy_withholds_liveness() {
+        const VULN: &str = "com/google/gson/Vuln.class";
+        let jar = zip_of(&[(VULN, b"PATCHED"), ("A.class", b"A")]);
+        let patched = [VULN.to_string()];
+        let files = fs(&[
+            ("settings.gradle", ""),
+            (
+                "build.gradle",
+                "dependencies { implementation 'com.google.code.gson:gson:2.10.1:all' }",
+            ),
+        ]);
+        let live = |files: &BTreeMap<String, Vec<u8>>, p: &JvmPatch<'_>| {
+            wired(
+                &|r: &str| files.get(r).cloned(),
+                &|d: &str| list_of(files, d),
+                &p.coords(),
+            )
+        };
+        for (all, unpatched) in [
+            (zip_of(&[(VULN, b"VULNERABLE"), ("A.class", b"A")]), true),
+            (zip_of(&[(VULN, b"PATCHED")]), false),
+            (zip_of(&[("A.class", b"other")]), false),
+        ] {
+            let extras = [extra("all", &all)];
+            let p = JvmPatch {
+                jar: &jar,
+                extra_artifacts: &extras,
+                patched_members: &patched,
+                ..patch()
+            };
+            let plan = run(&files, &p).unwrap();
+            let degraded = plan.warnings.iter().any(|w| {
+                w.code == DEGRADED && w.detail.starts_with("reason: classifier_unpatched_copy: ")
+            });
+            assert_eq!(degraded, unpatched);
+            let after = applied(&files, &plan);
+            let c = p.coords();
+            assert_eq!(
+                committed_patched(&|r: &str| after.get(r).cloned(), &c),
+                patched
+            );
+            assert_eq!(live(&after, &p), !unpatched);
+            // The re-run from the committed tree is in sync.
+            assert!(run(&after, &p).unwrap().writes.is_empty());
+            if !unpatched {
+                let marker = format!("{}/{MARKER_NAME}", plan.tree_dir);
+                let mut stripped = after.clone();
+                let text = String::from_utf8(after[&marker].clone()).unwrap();
+                let text = text.replace(&format!("\n  \"patched\": [\"{VULN}\"],"), "");
+                assert_ne!(text.as_bytes(), &after[&marker][..]);
+                stripped.insert(marker, text.into_bytes());
+                assert!(!live(&stripped, &p));
+            }
+        }
     }
 
     /// VEX liveness: an intact wiring is live; a CRLF script still is; a
