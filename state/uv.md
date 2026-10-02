@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled uv bug-hunt routine (label pm:uv).
 
-Last run: 2026-10-02 (run 6) on main `61cfb9b` (unchanged; this run added the dotted-name, sources-spelling, lock-only and UV_PROJECT_ENVIRONMENT cells). Run 5 was also on main `61cfb9b` (v5; CLI reports 4.0.0, and the released 4.0.0 predates both the v4 uv rewriter and the v5 upstream restore). Earlier cells are from `2463257` / `6e7ef74`. Linux runs use real uv against a local mock patch API (with `integrity.sha512` in SRI form, a deterministic wheel, the `/blob/` route and `--patch-server-url`), plus `SOCKET_PYPI_JSON_API` → a local pypi.org pass-through that must not rewrite file URLs. uv 0.1.x needs `SSL_CERT_FILE`; uv 0.0.5 needs `PUFFIN_INDEX_URL` → a local `/simple/` proxy. macOS and Windows runs use probe branches.
+Last run: 2026-10-02 (run 7) on main `61cfb9b` (unchanged; this run added path/git siblings, legacy dev-dependencies, constraint-dependencies, vendored sources spellings and uv 0.12.22). Run 6 was also on `61cfb9b` (the dotted-name, sources-spelling, lock-only and UV_PROJECT_ENVIRONMENT cells). Run 5 was also on main `61cfb9b` (v5; CLI reports 4.0.0, and the released 4.0.0 predates both the v4 uv rewriter and the v5 upstream restore). Earlier cells are from `2463257` / `6e7ef74`. Linux runs use real uv against a local mock patch API (with `integrity.sha512` in SRI form, a deterministic wheel, the `/blob/` route and `--patch-server-url`), plus `SOCKET_PYPI_JSON_API` → a local pypi.org pass-through that must not rewrite file URLs. uv 0.1.x needs `SSL_CERT_FILE`; uv 0.0.5 needs `PUFFIN_INDEX_URL` → a local `/simple/` proxy. macOS and Windows runs use probe branches.
 
 ## Coverage matrix
 H = hosted, V = vendored, A = agent. "pass/fail" is Linux unless an OS is named. Results are from v5 main (`2463257` / `6e7ef74`) unless marked (v4).
@@ -15,6 +15,7 @@ H = hosted, V = vendored, A = agent. "pass/fail" is Linux unless an OS is named.
 | 0.8.18 – 0.12.0 (bisect) | – | `uv sync` after rollback reinstalls upstream (uv-side fix in 0.8.18) | – | – | – | |
 | 0.12.21 | pass (requirements lane on 3 OS, `--locked`/`--frozen`/plain, inline sources, BOM, odd-case name, idempotent, VEX, pylock, script lock, CRLF, hashed requirements, markers, ranges, groups, extras, transitive override) | pass after edit / `uv add` (3 OS), script lock, hashed requirements, CRLF, multi-file; **fail #411** (3 OS); **fail #407**; **fail #408**; **fail #473** (3 OS); `uv pip sync` after requirements unwind **fail #477** (3 OS) | pass; **fail #474** (3 OS) | pass (3 OS, venv + lock-only) | pass (v5: hardlink apply / VEX / rollback / re-apply) | H→V pass (v5); V→H warn-only |
 | 0.8.17 (run 6) | pass: dotted name `backports.tarfile` in 3 spellings; dotted / root / inline sources spellings; lock-only checkout with space + unicode path, `--frozen` cold cache, idempotent re-scan | **fail #524** `[tool.uv.sources.<name>]` sub-table leaves an empty header (rollback, remove; also 0.5.31) | pass (dotted name); **fail #524** (vendor --revert) | – | **fail #525** `UV_PROJECT_ENVIRONMENT` ignored (abs + relative) | forks refused (documented) |
+| 0.4.30 / 0.5.31 / 0.8.17 / 0.9.5 / 0.12.22 (run 7) | pass: editable path sibling, legacy `dev-dependencies` (0.4.30 / 0.5.31 / 0.8.17), `constraint-dependencies` (0.8.17 / 0.9.5 / 0.12.22), inline `[tool] uv = {…}` / root `tool = {…}` / `sources.x.path` | pass byte-identical (path sibling, dev-deps, constraints, inline / dotted sources); git-only sibling refused (documented) | pass: dev-deps on 0.4.30 / 0.5.31 (incl. cold `--frozen --offline`), `[tool.uv.sources]` before `[project]`, CRLF; **fail #544** dotted `[tool.uv] sources.x` / `[tool] uv.sources.x`: revert / remove half-revert (0.5.31, 0.8.17, 0.12.22) | – | – | vendored inline sources refused (`not a standard table`) |
 
 
 ### Global (`-g`) mode
@@ -27,14 +28,14 @@ H = hosted, V = vendored, A = agent. "pass/fail" is Linux unless an OS is named.
 `SOCKET_GLOBAL=1`, `--global-prefix` / `SOCKET_GLOBAL_PREFIX` with space and unicode paths, and project isolation (`-g` skips `.venv`) all pass on Linux.
 
 ## Backlog
-0. #525 on macOS / Windows probes, plus a stray `./.venv` next to a `UV_PROJECT_ENVIRONMENT` env.
-1. **Maintainer request (still open):** global `-g` apply / rollback / vex against a live free pypi patch (the e2e UUID `725a5343-…` returns `not_found`), plus the unwritable-prefix cell. Checklist in the 20261001T040000Z entry.
-2. After #481 merges: re-check #474, plus vendored `[manifest] constraints` / `overrides` growth and vendored project `uv remove` of a sibling.
-3. Windows uv-managed Python root under `-g`, and re-check #449 on a Windows probe.
-4. After #512: `pylock.<name>.toml` mixed index / no-index siblings (the #407 rule); Windows CRLF checkout + vendored `repair` on uv.lock.
-5. Hosted uv.lock on Windows with space / unicode project paths; `uv sync --frozen` from a lock-only checkout.
-6. Re-triage #407, #408, #411, #449, #473, #474, #477 (uv part), #524 and #525 once main moves.
-7. Git / path / editable sibling sources next to a hosted pin; legacy `[tool.uv] dev-dependencies` on 0.4 / 0.5.
+0. Re-triage #544 together with #524 once a fix lands. Also check vendored root-level `tool.uv.sources.x = …`, and vendored `repair` on dotted spellings.
+1. After #540, #512 and #481 merge: re-check #525, #407, #408 and #474. Run macOS / Windows probes for #525 (plus a stray `./.venv` next to `UV_PROJECT_ENVIRONMENT`).
+2. **Maintainer request (still open):** global `-g` apply / rollback / vex against a live free pypi patch (the e2e UUID `725a5343-…` returns `not_found`), plus the unwritable-prefix cell. Checklist in the 20261001T040000Z entry.
+3. Vendored PEP 723 script lock whose script block carries `[tool.uv]` dotted sources.
+4. Windows uv-managed Python root under `-g`, and re-check #449 on a Windows probe.
+5. `pylock.<name>.toml` mixed index / no-index siblings (after #512). Windows CRLF checkout + vendored `repair` on uv.lock.
+6. Hosted uv.lock on Windows with space / unicode project paths.
+7. Re-triage #407, #408, #411, #449, #473, #474, #477 (uv part), #524, #525 and #544 once main moves.
 
 ## Known non-bugs
 - uv workspaces (`[tool.uv.workspace]` or `[manifest] members` beyond the root) are refused in both modes (`redirect_uv_project_unsupported` / `pypi_uv_workspace_unsupported`). This is by design, though it's missing from docs/testing/uv-compatibility.md.
@@ -56,3 +57,7 @@ H = hosted, V = vendored, A = agent. "pass/fail" is Linux unless an OS is named.
 - uv marker forks (one package at several versions in uv.lock) are refused: hosted is warn-only `redirect_uv_project_unsupported` ("marker-specific source mappings are required"), vendored is `pypi_uv_lock_forked_package` (exit 1). Documented in uv-compatibility.md:135.
 - A lock-only uv project with no env at all: agent mode patches the global interpreter and uv tool envs. That's the generic fallback tracked in #504 (Pipenv); don't re-file it for uv.
 - uv cache `archive-v0` entries containing patched bytes after hosted runs are the hosted wheels uv unpacked, not agent-mode pollution (agent apply breaks the hardlinks).
+- Vendored mode refuses inline-table sources (`[tool.uv] sources = { … }` or `[tool] uv = { … }`) with `pypi_uv_lock_parse_failed: … is not a standard table`, before writing anything. Hosted mode grows the inline table in place. This is intentional (unit-tested in pypi_uv.rs) but undocumented.
+- Hosted requirements only rewrite `requirements.txt` itself. A pin that lives only in a `-c constraints.txt` or `-r base.txt` include gets the warning `redirect_requirements_entry_not_found` (not silent). This is pip-generic, so don't file it under uv.
+- Hosted rollback with only git / path siblings (no other registry package) refuses "no sibling registry package…" (documented).
+- The mock must answer HEAD for the hosted wheel URL. uv 0.9+ sends HEAD first, and a 501 there looks like a lock-time fetch failure.
