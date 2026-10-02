@@ -1159,6 +1159,9 @@ impl NpmCrawler {
     /// a sibling entry, whose own visit records that copy, so only a real
     /// directory there matches, or a link to the entry's own `package` dir
     /// (Yarn 4, see [`store_entry_own_package_sync`]), recorded at that dir.
+    /// That `package` dir's own `node_modules` (its bundled dependencies,
+    /// which the scan reaches through the same link) is enqueued too: the
+    /// link-free walk below would never descend into it.
     fn visit_resolver_dir(
         nm_path: PathBuf,
         store_entry: bool,
@@ -1191,7 +1194,10 @@ impl NpmCrawler {
                     .then_some((index, pkg_path))
             })
             .collect();
-        let nested = Self::collect_nested_node_modules(&nm_path, listing);
+        let mut nested = Self::collect_nested_node_modules(&nm_path, listing);
+        if store_entry {
+            nested.extend(own_package_nested_node_modules_sync(&nm_path));
+        }
         ResolverVisit {
             store_entry,
             matched,
@@ -2514,6 +2520,23 @@ fn store_entry_own_package_sync(entry_nm: &Path, dir_key: &str) -> Option<PathBu
     let (own, canonical_own) = store_entry_package_dir_sync(entry_nm)?;
     let target = std::fs::canonicalize(entry_nm.join(dir_key)).ok()?;
     (target == canonical_own).then_some(own)
+}
+
+/// The `node_modules` inside a store entry's own `package` dir (Yarn 4),
+/// where that package's bundled dependencies live. The entry's
+/// `node_modules/<name>` is a link to `package`, so a walk that never
+/// follows links misses this tree, though Node loads a bundled copy from
+/// it. `None` on every other layout, or when the entry holds no link to
+/// its own package.
+fn own_package_nested_node_modules_sync(entry_nm: &Path) -> Option<NestedNodeModules> {
+    let (own, _) = store_entry_package_dir_sync(entry_nm)?;
+    let (name, _version) = read_package_json_sync(&own.join("package.json"))?;
+    if !name.split('/').all(is_safe_npm_component) {
+        return None;
+    }
+    store_entry_own_package_sync(entry_nm, &name)?;
+    let nested = own.join("node_modules");
+    is_dir_sync(&nested).then_some(NestedNodeModules::Dir(nested))
 }
 
 /// A store entry's real `package` dir beside `entry_nm` (Yarn 4's
@@ -4527,6 +4550,94 @@ mod tests {
         assert_eq!(
             find_store_peer_variant_copies(&nm.join("is-odd")).await,
             Vec::<PathBuf>::new()
+        );
+    }
+
+    /// #496 review: a Yarn 4 store entry's `package` dir carries the
+    /// package's bundled dependencies in `package/node_modules`, which Node
+    /// loads in preference to the regular store copy. The entry reaches
+    /// that tree only through its `node_modules/<name> -> ../package`
+    /// link, so the resolver must enqueue it like the scan does, or apply
+    /// patches the regular copy and leaves the loaded one untouched.
+    #[tokio::test]
+    async fn test_yarn4_pnpm_linker_bundled_copy_inside_store_package_is_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        let store = nm.join(".store");
+
+        let number_entry = store.join("is-number-npm-7.0.0-9f8e7d6c5b");
+        let number = number_entry.join("package");
+        write_pkg(&number, "is-number", "7.0.0");
+        link_own_package(&number_entry, "is-number");
+        let parent_entry = store.join("parent-file-1.0.0-1234567890");
+        let parent = parent_entry.join("package");
+        write_pkg(&parent, "parent", "1.0.0");
+        link_own_package(&parent_entry, "parent");
+        let bundled = parent.join("node_modules/is-number");
+        write_pkg(&bundled, "is-number", "7.0.0");
+        let scoped_entry = store.join("@acme-tool-file-2.0.0-abcdef0123");
+        let scoped = scoped_entry.join("package");
+        write_pkg(&scoped, "@acme/tool", "2.0.0");
+        link_own_package(&scoped_entry, "@acme/tool");
+        let scoped_bundled = scoped.join("node_modules/is-number");
+        write_pkg(&scoped_bundled, "is-number", "7.0.0");
+        link_dir(&parent, &nm.join("parent"));
+        link_dir(&number, &nm.join("is-number"));
+
+        let scanned = scan_paths(&root).await;
+        let mut scan_purls: Vec<&str> = scanned.iter().map(|(p, _)| p.as_str()).collect();
+        scan_purls.sort();
+        assert_eq!(
+            scan_purls,
+            [
+                "pkg:npm/@acme/tool@2.0.0",
+                "pkg:npm/is-number@7.0.0",
+                "pkg:npm/parent@1.0.0",
+            ],
+            "{scanned:?}"
+        );
+
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, &["pkg:npm/is-number@7.0.0".to_string()])
+            .await
+            .unwrap();
+        let mut got: Vec<PathBuf> = found["pkg:npm/is-number@7.0.0"]
+            .iter()
+            .map(|p| p.path.clone())
+            .collect();
+        got.sort();
+        let mut want = vec![nm.join("is-number"), bundled, scoped_bundled];
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    /// A sibling `package` dir alone does not make an entry Yarn 4's: with
+    /// no link from the entry's `node_modules` to it, its tree is not
+    /// walked.
+    #[tokio::test]
+    async fn test_store_package_dir_without_own_link_is_not_walked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        let entry = nm.join(".store/parent-file-1.0.0-1234567890");
+        write_pkg(&entry.join("node_modules/parent"), "parent", "1.0.0");
+        write_pkg(
+            &entry.join("package/node_modules/is-number"),
+            "is-number",
+            "7.0.0",
+        );
+        write_pkg(&entry.join("package"), "parent", "1.0.0");
+
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, &["pkg:npm/is-number@7.0.0".to_string()])
+            .await
+            .unwrap();
+        assert!(
+            found
+                .get("pkg:npm/is-number@7.0.0")
+                .is_none_or(|copies| copies.is_empty()),
+            "{found:?}"
         );
     }
 }
