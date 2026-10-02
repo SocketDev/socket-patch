@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-01 (run 5), main `61cfb9b`, latest release 4.0.0, latest Bun 1.4.2.
+Last updated: 2026-10-02 (run 6), main `61cfb9b`, latest release 4.0.0, latest Bun 1.4.2.
 
 Method: real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` to the mock. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -49,8 +49,20 @@ Untested: a non-writable global dir, a symlinked `BUN_INSTALL`, and Bun 1.0.x.
 | 1.2.23 | text v1 | fail #497 | fail #497 | fail #497 | pass | fail #497 | untested |
 | 1.3.14 | text v1 | fail #497 | fail #497 | fail #497 | pass | untested | untested |
 | 1.4.2 | text v2 (URL and `file:` tgz) | fail #497 | fail #497 | fail #497 | pass | fail #497 | pass |
-| any | `bun.lockb`, `github:` tuples | untested | untested | untested | untested | untested | untested |
+| 1.1.45 (read by 1.1.45 / 1.2.23 / 1.4.2) | `bun.lockb` (URL tgz; run 6) | fail #497 | fail #497 | fail #497 | pass | fail #497 | untested |
+| any | `github:` tuples | untested | untested | untested | untested | untested | untested |
 | macOS, Windows | all | untested | untested | untested | untested | untested | untested |
+
+### `socket.yml` policy and staged rollout (run 6, Linux)
+
+| Bun | lock | hosted `maxNewPatches: 1` advance | vendored `maxNewPatches: 1` advance | vendored → hosted takeover under cap | `ignorePackages` keeps pin | `enabled: false` writes nothing | hosted upgrade (new uuid) | rollback after upgrade |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1.1.45 | lockb (workspace) | pass | untested | untested | pass | pass | pass | n/a (refuses, documented) |
+| 1.3.14 | text v1 (workspace) | pass | untested | untested | untested | untested | pass | pass (byte-exact) |
+| 1.4.2 | text v2 (workspace) | pass | pass | pass | pass | pass | untested | untested |
+| macOS, Windows | all | untested | untested | untested | untested | untested | untested | untested |
+
+Also passing in run 6: a dual-lock checkout (`bun.lock` + a stale `bun.lockb`, where Bun ≥ 1.2 reads `bun.lock` and hosted rewrites only it), and global mode with a symlinked `BUN_INSTALL` (1.4.2: agent scan, `vex -g`, `rollback -g`).
 
 ### Lock-shape edge cases (run 5, Linux)
 - CRLF `bun.lock` + CRLF `package.json` (1.1.45 v0, 1.3.14, 1.4.2): hosted scan → frozen install → `rollback`, and vendored → `vendor --revert`. Both byte-exact: pass.
@@ -76,13 +88,13 @@ Other passes (Linux, 1.4.2 unless noted):
 
 ## Backlog
 
-0. **Maintainer request (partly covered in run 3):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly; a symlinked `BUN_INSTALL`; Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. Re-test #443 (still reproduces on `61cfb9b`) and #434 (`bun.cmd`) once PR #442 lands. Checklist: the 20261001T040000Z entry.
-1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. The sandbox can't delete branches (still denied in run 5), so no new probes until that's fixed.
-2. #497 variants: `github:` tuples (unresolvable in the sandbox, needs a probe) and a binary `bun.lockb` with a URL dependency. Re-test when fixed.
-3. #469 follow-ups: macOS/Windows cells; `bundled` inside a workspace member; `rollback` / `remove` of a rewired bundled entry; re-test when fixed.
+0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. A symlinked `BUN_INSTALL` passes (run 6). Still to do: a non-writable global dir must fail loudly (the sandbox runs as root, so it needs a probe); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. Re-test #443 and #434 (`bun.cmd`) once PR #442 lands. Checklist: the 20261001T040000Z entry.
+1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still blocked from the sandbox (run 6), so no new probes until then.
+2. #497 `github:` tuples (unresolvable in the sandbox, needs a probe). The lockb variant was confirmed in run 6. Re-test when fixed.
+3. #469 follow-ups: macOS/Windows cells; `bundled` inside a workspace member; `rollback` / `remove` of a rewired bundled entry; re-test when PR #472 lands.
 4. Re-test #366 once `.bun` joins the crawler walks (#365 landed without it). Then re-check the #405 vendored warning and Windows agent mode with the isolated linker (junctions).
-5. v5 `socket.yml` policy and per-run limits in a Bun workspace.
-6. Hosted rollback on real macOS and Windows checkouts (Linux CRLF analog passes, run 5).
+5. `socket.yml` `includePaths` / `ignorePaths` across several independent Bun projects in one repo (shared budget, sorted visit order); `minSeverity` via `SOCKET_MIN_SEVERITY`.
+6. Hosted rollback on real macOS and Windows checkouts (the Linux CRLF analog passes, run 5).
 7. Digest boundary with a valid substitute tarball, 1.3.9 text lock vs 1.3.10. Low priority: Bun < 1.3.10 is a documented limitation.
 
 ## Known non-bugs
@@ -107,3 +119,7 @@ Other passes (Linux, 1.4.2 unless noted):
 - On a `bun install --yarn` project, hosted `rollback` restores `bun.lock` byte-exact but adds a `#<sha1>` fragment to Bun's `yarn.lock` `resolved` lines. It's semantically equivalent and yarn-classic's rewriter, so it isn't filed as a Bun bug.
 - Mock fixture: build the patched tarball with a fixed gzip mtime. Otherwise a mock restart changes its sha512 and later installs fail `IntegrityCheckFailed`.
 - `link:` deps need `bun link` registration, and `github:` deps don't resolve in the sandbox. Both are environment limits.
+- `scan <workspace-member>` (e.g. `scan packages/a`): hosted reports `success` with 0 redirected and `redirect_npm_no_lockfile`; vendored refuses with `vendor_lockfile_missing`. Pinned as today's behaviour in bun-compatibility.md ("Not measured"); scan the root instead.
+- Mode-less `scan -g` is report-only. Use `--mode agent` to patch global copies. `-g` agent runs record the global copies in the cwd's `.socket/manifest.json` (by design).
+- A v1/v2 text `bun.lock` can't be read by Bun 1.1.45 (`lockfile had changes, but lockfile is frozen`) even without socket-patch. When `bun.lock` and `bun.lockb` are both present, Bun ≥ 1.2 reads `bun.lock`.
+- Mock fixture: `SOCKET_PATCH_SERVER_URL` must name the same origin across runs. A mock on another port makes the earlier pins non-hosted.
