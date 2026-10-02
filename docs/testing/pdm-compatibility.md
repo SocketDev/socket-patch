@@ -70,8 +70,9 @@ Measured details:
   release (tamper the hash and `pdm sync` fails closed). Vendored mode's
   protection is the committed wheel bytes, verified by the same hash.
 - **The installed env is the one PDM records.** The crawler follows the
-  interpreter in `.pdm-python` (`[python] path` in `.pdm.toml` on older PDM),
-  ahead of an activated venv or a stray `./.venv`. That covers an out-of-tree
+  interpreter in `PDM_PYTHON`, else `.pdm-python` (`[python] path` in
+  `.pdm.toml` on older PDM), ahead of an activated venv or a stray `./.venv`.
+  A project with `uv.lock` or `poetry.lock` is not treated as PDM's. That covers an out-of-tree
   venv (`venv.in_project = false`) and one bound with `pdm use <venv>`. When
   the interpreter is a base Python, or a PDM 0.x/1.x project saved none, the
   env is `__pypackages__/<X.Y>/lib` (PEP 582; PDM 2.x under

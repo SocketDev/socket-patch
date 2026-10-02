@@ -425,7 +425,8 @@ async fn package_manager_recorded_site_packages(
 }
 
 /// PDM's env for `cwd` (see [`package_manager_recorded_site_packages`]).
-/// `PDM_IGNORE_SAVED_PYTHON` makes PDM disregard the saved interpreter.
+/// `PDM_PYTHON` outranks the saved interpreter, and
+/// `PDM_IGNORE_SAVED_PYTHON` makes PDM disregard the saved one.
 async fn pdm_project_site_packages(
     cwd: &Path,
     var: &impl Fn(&str) -> Option<String>,
@@ -434,13 +435,27 @@ async fn pdm_project_site_packages(
         let found = find_python_dirs(&cwd.join("__pypackages__"), &["*", "lib"]).await;
         (!found.is_empty()).then_some(found)
     };
+    // `uv.lock` and `poetry.lock` drive installs ahead of `pdm.lock` (the
+    // hosted rewriters' precedence), so a leftover PDM record next to one
+    // is not where the project is installed.
+    if cwd.join("uv.lock").is_file() || cwd.join("poetry.lock").is_file() {
+        return None;
+    }
+    let pdm_project = cwd.join(".pdm-python").is_file() || is_pdm_project(cwd).await;
+    if !pdm_project {
+        return None;
+    }
+    // `PDM_PYTHON` outranks the saved interpreter.
+    let overridden = var("PDM_PYTHON")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
     let ignore_saved = var("PDM_IGNORE_SAVED_PYTHON").is_some_and(|v| !v.is_empty());
-    let saved = if ignore_saved {
-        None
-    } else {
-        pdm_saved_interpreter(cwd).await
+    let interpreter = match overridden {
+        Some(python) => Some(cwd.join(python)),
+        None if ignore_saved => None,
+        None => pdm_saved_interpreter(cwd).await,
     };
-    match saved {
+    match interpreter {
         Some(python) => match venv_root_of_interpreter(&python) {
             Some(root) => {
                 let found = find_site_packages_under(&root, "site-packages").await;
@@ -448,8 +463,7 @@ async fn pdm_project_site_packages(
             }
             None => pep582().await,
         },
-        None if is_pdm_project(cwd).await => pep582().await,
-        None => None,
+        None => pep582().await,
     }
 }
 
@@ -2271,6 +2285,26 @@ mod tests {
             vec![stray.clone()]
         );
 
+        // `PDM_PYTHON` outranks `.pdm-python`.
+        let (ci_python, ci_site) = fake_venv_root(&tmp.path().join("ci-venv"));
+        let pinned = env_of(&[("PDM_PYTHON", ci_python.to_string_lossy().into_owned())]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &pinned).await,
+            vec![ci_site]
+        );
+
+        // Next to `uv.lock` or `poetry.lock` (which drive installs ahead of
+        // `pdm.lock`) a leftover PDM record is not the project's env.
+        for lock in ["uv.lock", "poetry.lock"] {
+            std::fs::write(project.join(lock), "").unwrap();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &no_env).await,
+                vec![stray.clone()],
+                "{lock}"
+            );
+            std::fs::remove_file(project.join(lock)).unwrap();
+        }
+
         // Legacy PDM (`.pdm.toml` `[python] path`) records the same thing.
         std::fs::remove_file(project.join(".pdm-python")).unwrap();
         let mut doc = toml_edit::DocumentMut::new();
@@ -2330,6 +2364,13 @@ mod tests {
             find_local_venv_site_packages_with(&project, &no_env).await,
             vec![lib.clone()]
         );
+
+        // A uv project with a leftover PDM lock is uv's, not PEP 582.
+        std::fs::write(project.join("uv.lock"), "version = 1\n").unwrap();
+        assert!(find_local_venv_site_packages_with(&project, &no_env)
+            .await
+            .is_empty());
+        std::fs::remove_file(project.join("uv.lock")).unwrap();
 
         // `__pypackages__` outside a PDM project is not PDM's.
         std::fs::remove_file(project.join("pdm.lock")).unwrap();
