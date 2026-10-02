@@ -1097,3 +1097,170 @@ async fn hosted_partial_pnpm_redirect_is_not_confirmed_by_url_presence() {
         .join(".socket/vendor/redirect-state.json")
         .exists());
 }
+
+/// A pnpm workspace: the root holds `pnpm-workspace.yaml` and the only
+/// `pnpm-lock.yaml` (importer `packages/a`); the member `packages/a` holds
+/// its manifest and the installed copy, as pnpm lays it out.
+fn write_pnpm_workspace(root: &Path) -> std::path::PathBuf {
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "private": true }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pnpm-lock.yaml"),
+        format!(
+            "lockfileVersion: '9.0'
+
+importers:
+  .: {{}}
+  packages/a:
+    dependencies:
+      {NAME}:
+        specifier: {VERSION}
+        version: {VERSION}
+
+packages:
+  {NAME}@{VERSION}:
+    resolution: {{integrity: {UPSTREAM_SHA512}}}
+
+snapshots:
+  {NAME}@{VERSION}: {{}}
+"
+        ),
+    )
+    .unwrap();
+    let member = root.join("packages/a");
+    let pkg = member.join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        format!(
+            r#"{{ "name": "a", "version": "1.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    member
+}
+
+/// Assert the run refused with `redirect_pnpm_lockfile_elsewhere`, naming
+/// the governing lock, and wrote nothing anywhere.
+fn assert_refused_lock_elsewhere(
+    code: Option<i32>,
+    doc: &serde_json::Value,
+    lock: &Path,
+    lock_before: &str,
+    cwd: &Path,
+) {
+    assert_eq!(
+        code,
+        Some(1),
+        "a found-but-unpinnable patch is not success: {doc}"
+    );
+    assert_eq!(doc["status"], "error", "{doc}");
+    assert_eq!(
+        doc["errorCode"], "redirect_pnpm_lockfile_elsewhere",
+        "{doc}"
+    );
+    let message = doc["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("pnpm-lock.yaml") && message.contains("nothing was written"),
+        "the error names the governing lock: {message}"
+    );
+    assert_eq!(std::fs::read_to_string(lock).unwrap(), lock_before);
+    assert!(
+        !cwd.join(".socket").exists(),
+        "nothing written in the member"
+    );
+    assert!(!cwd.join("pnpm-workspace.yaml").exists());
+}
+
+/// #590: `scan --mode hosted` from a pnpm workspace member saw no lock in
+/// the member, pinned nothing, and exited 0 with `success` and an npm
+/// "no package-lock.json" warning while pnpm installs the unpatched copy
+/// from the root lock. It now refuses and names the root.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_pnpm_workspace_member_refuses() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let member = write_pnpm_workspace(tmp.path());
+    let lock = tmp.path().join("pnpm-lock.yaml");
+    let before = std::fs::read_to_string(&lock).unwrap();
+
+    let (code, doc) = run_hosted_json(&member, &server.uri());
+    assert_refused_lock_elsewhere(code, &doc, &lock, &before, &member);
+
+    // `get <uuid> --mode hosted` takes the same path.
+    let out = scrubbed_cli()
+        .args([
+            "get",
+            UUID,
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            member.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "get --json output is not JSON ({e}):\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    assert_refused_lock_elsewhere(out.status.code(), &doc, &lock, &before, &member);
+
+    // From the workspace root the same patch is pinned.
+    let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    assert!(std::fs::read_to_string(&lock).unwrap().contains(HOSTED_URL));
+}
+
+/// #590, `lockfile-dir=..` variant: pnpm writes the project's lock to the
+/// parent directory, so the project directory has none.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_with_pnpm_lockfile_dir_elsewhere_refuses() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_pnpm_project(&proj);
+    std::fs::rename(
+        proj.join("pnpm-lock.yaml"),
+        tmp.path().join("pnpm-lock.yaml"),
+    )
+    .unwrap();
+    std::fs::write(proj.join(".npmrc"), "lockfile-dir=..\n").unwrap();
+    let lock = tmp.path().join("pnpm-lock.yaml");
+    let before = std::fs::read_to_string(&lock).unwrap();
+
+    let (code, doc) = run_hosted_json(&proj, &server.uri());
+    assert_refused_lock_elsewhere(code, &doc, &lock, &before, &proj);
+}

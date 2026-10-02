@@ -4327,3 +4327,111 @@ async fn in_process_hosted_scan_state_attests_manifest_less() {
             .expect("manifest-less VEX tail panicked");
     });
 }
+
+/// #417: hosted `scan` from a cargo workspace MEMBER treated it as a
+/// lockless project, wrote `registry = …` into the member's Cargo.toml and
+/// a `[registries]` block into the member's `.cargo/config.toml`, left the
+/// root Cargo.lock alone, and exited 0, breaking every build of the
+/// workspace. It now refuses with vendored mode's
+/// `cargo_manifest_not_workspace_root` and writes nothing.
+#[tokio::test]
+#[serial]
+async fn cargo_hosted_scan_from_workspace_member_refuses() {
+    const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.4";
+    const CARGO_UUID: &str = "33333333-3333-4333-8333-333333333333";
+    let cksum = "cd".repeat(32);
+    let index_url = format!("sparse+http://patch.test/registry/cargo/{CARGO_UUID}/index/");
+    let server = MockServer::start().await;
+    mock_cargo_patch(
+        &server,
+        CARGO_PURL,
+        CARGO_UUID,
+        "cfg-if",
+        "1.0.4",
+        &index_url,
+        &cksum,
+        "GHSA-carg-wsmb-wsmb",
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"inherits\", \"direct\"]\n\n\
+         [workspace.dependencies]\ncfg-if = \"1.0.4\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+         checksum = \"ee\"\n\n[[package]]\nname = \"direct\"\nversion = \"0.1.0\"\n\
+         dependencies = [\n \"cfg-if\",\n]\n\n[[package]]\nname = \"inherits\"\n\
+         version = \"0.1.0\"\ndependencies = [\n \"cfg-if\",\n]\n",
+    )
+    .unwrap();
+    for (member, dep) in [
+        ("inherits", "cfg-if = { workspace = true }"),
+        ("direct", "cfg-if = \"1.0.4\""),
+    ] {
+        std::fs::create_dir_all(root.join(member).join("src")).unwrap();
+        std::fs::write(
+            root.join(member).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2018\"\n\n\
+                 [dependencies]\n{dep}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join(member).join("src/lib.rs"), "").unwrap();
+    }
+    let member = root.join("direct");
+    write_vendored_crate(&member, "cfg-if", "1.0.4");
+    let manifest_before = std::fs::read(member.join("Cargo.toml")).unwrap();
+    let lock_before = std::fs::read(root.join("Cargo.lock")).unwrap();
+
+    let out = scrubbed_cli()
+        .args([
+            "scan",
+            "--mode=hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            member.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "scan --json output is not JSON ({e}):\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    assert_eq!(out.status.code(), Some(1), "{doc}");
+    assert_eq!(doc["status"], "error", "{doc}");
+    assert_eq!(
+        doc["errorCode"], "cargo_manifest_not_workspace_root",
+        "{doc}"
+    );
+    assert!(
+        doc["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("workspace root") && m.contains("nothing was written")),
+        "{doc}"
+    );
+    assert_eq!(
+        std::fs::read(member.join("Cargo.toml")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(std::fs::read(root.join("Cargo.lock")).unwrap(), lock_before);
+    assert!(!member.join(".cargo").exists(), "no member registry block");
+    assert!(!member.join(".socket").exists());
+}
