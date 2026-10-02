@@ -308,7 +308,7 @@ async fn pypi_requirements_hosted_rewrites_pep440_equivalent_pin() {
         let reqs = std::fs::read_to_string(tmp.path().join("requirements.txt")).unwrap();
         assert_eq!(
             reqs,
-            format!("flask==2.0.1\nrequests @ {url} --hash=sha256:{SHA256}\n"),
+            format!("flask==2.0.1\nrequests @ {url}#sha256={SHA256}\n"),
             "{pin}: the PEP 440-equivalent pin must be redirected"
         );
         assert_no_manifest_no_blobs(tmp.path());
