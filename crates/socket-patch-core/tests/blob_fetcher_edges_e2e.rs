@@ -341,7 +341,7 @@ async fn fetch_blobs_by_hash_mixes_skip_and_download_attempt() {
 
 // ── Content-hash verification (mock-server driven) ──────────────────
 //
-// These drive the success and mismatch branches of `download_hashes`'s
+// These drive the success and mismatch branches of `download_entries`'s
 // content verification, which the closed-port tests above can never reach
 // (they fail before any body is returned). The blob's name IS its
 // git-sha256, so the server must serve bytes that hash to the requested
@@ -363,7 +363,7 @@ fn proxy_client(base: &str) -> ApiClient {
 }
 
 /// A blob whose content hashes to the requested name is written to disk
-/// and counted as downloaded. Proves the happy path of `download_hashes`'s
+/// and counted as downloaded. Proves the happy path of `download_entries`'s
 /// verify-then-write logic end to end.
 #[tokio::test]
 async fn fetch_missing_blobs_accepts_and_writes_matching_content() {
@@ -917,5 +917,38 @@ async fn failed_streams_leave_no_stage_and_no_created_cache_dir() {
         dir_entry_count(tmp.path()),
         0,
         "a rejected blob must leave neither .socket/ nor .socket/blobs/ behind"
+    );
+}
+
+/// A cache directory `create_dir_all` only partly creates (here a new
+/// `.socket/` under which the 300-byte leaf name is too long for the
+/// filesystem) is removed again, like any other failed download's.
+#[tokio::test]
+async fn partly_created_cache_dirs_are_removed_on_failure() {
+    let content = b"the genuine patched file body";
+    let hash = compute_git_sha256_from_bytes(content);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_matcher(format!("/patch/blob/{hash}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let blobs = tmp.path().join(".socket").join("x".repeat(300));
+    let result = fetch_missing_blobs(
+        &manifest_with_after_hashes(&[&hash]),
+        &blobs,
+        &proxy_client(&server.uri()),
+        None,
+    )
+    .await;
+    assert_eq!(result.failed, 1, "{:?}", result.results);
+    let error = result.results[0].error.as_deref().unwrap();
+    assert!(error.starts_with("Failed to write blob to disk"), "{error}");
+    assert_eq!(
+        dir_entry_count(tmp.path()),
+        0,
+        "the .socket/ that create_dir_all made before failing must be removed"
     );
 }

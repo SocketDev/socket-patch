@@ -442,14 +442,16 @@ async fn stream_cache_entry_atomic(
         }
         created_dirs.push(dir);
     }
-    tokio::fs::create_dir_all(parent)
-        .await
-        .map_err(EntryError::Write)?;
     // Leading dot keeps the stage out of editor/glob views; the uuid suffix
     // keeps concurrent writers of the same entry from colliding.
     let stage = parent.join(format!(".socket-dl-{}-{}", stem, uuid::Uuid::new_v4()));
 
     let result = async {
+        // Inside the cleanup scope: a `create_dir_all` that makes some
+        // ancestors and then fails must not leave them behind either.
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(EntryError::Write)?;
         let size = stage_body(&stage, body).await?;
         if let Some(expected) = expected_hash {
             let file = tokio::fs::File::open(&stage)
