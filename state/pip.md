@@ -1,27 +1,28 @@
 [agent] Progress ledger for the scheduled pip / requirements.txt bug-hunt routine (label pm:pip).
 
-Last run: 2026-10-02 (sixth run), main `61cfb9b`, latest release v4.0.0 (`96df6ae`). New this run: #523 (lock-only discovery misses spaced exact pins).
+Last run: 2026-10-02 (seventh run), main `61cfb9b`, latest release v4.0.0 (`96df6ae`). New this run: #542 (hosted rewrite claims a user's own direct-reference source).
 
 ## Coverage matrix
 
-| OS | pip / Python | agent (.venv) | agent egg-info | hosted (unhashed → fragment pin) | vendored | rollback / remove | vendored → hosted takeover | system-site venv | `-r` include, lock-only | PEP 440-equivalent pin (`==1.16`) | global `-g` (`--user`) | lock-only spaced pin (`six == X`) |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 20.3.4 / py3.8, py3.11 | pass | pass (#447 fixed) | pass | pass | pass; all-hosted-pins fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | untested | fail #523 |
-| Linux | 23.x, 24.0 / py3.11, py3.12 | pass | n/a (dist-info) | pass | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | pass (report, hosted refusal, get / rollback / vex, `--global-prefix`, unwritable) | fail #523 (pip 24.0) |
-| Linux | 26.0, 26.2.1 / py3.11, py3.13 | pass | n/a | pass (+ uv 0.8 `pip install` / `pip sync`) | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | untested | fail #523 |
-| macOS | 20.3.4 / py3.8; 26.2.1 / py3.13 | pass | pass (py3.8) | pass | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | pass (`--user`) | fail #523 |
-| Windows | 20.3.4 / py3.8; 26.2.1 / py3.13 | pass (`Scripts/` + `Lib/`) | pass (py3.8) | pass | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | pass (`--user`, `%APPDATA%\Python`) | fail #523 |
+| OS | pip / Python | agent (.venv) | agent egg-info | hosted (unhashed → fragment pin) | vendored | rollback / remove | vendored → hosted takeover | system-site venv | `-r` include, lock-only | PEP 440-equivalent pin (`==1.16`) | global `-g` (`--user`) | lock-only spaced pin (`six == X`) | hosted foreign direct ref (`six @ mirror`) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Linux | 20.3.4 / py3.8, py3.11 | pass | pass (#447 fixed) | pass | pass | pass; all-hosted-pins fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | untested | fail #523 | untested (OS-independent) |
+| Linux | 23.x, 24.0 / py3.11, py3.12 | pass | n/a (dist-info) | pass | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | pass (report, hosted refusal, get / rollback / vex, `--global-prefix`, unwritable) | fail #523 (pip 24.0) | fail #542 (pip 24.0) |
+| Linux | 26.0, 26.2.1 / py3.11, py3.13 | pass | n/a | pass (+ uv 0.8 `pip install` / `pip sync`) | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | untested | fail #523 | untested (OS-independent) |
+| macOS | 20.3.4 / py3.8; 26.2.1 / py3.13 | pass | pass (py3.8) | pass | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | pass (`--user`) | fail #523 | untested (OS-independent) |
+| Windows | 20.3.4 / py3.8; 26.2.1 / py3.13 | pass (`Scripts/` + `Lib/`) | pass (py3.8) | pass | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | pass (`--user`, `%APPDATA%\Python`) | fail #523 | untested (OS-independent) |
 
 pip 20.3.4 on py3.13 is blocked (no `distutils`). `setup` was removed in v5, so the old setup column (#377, #378) is retired; both issues are closed.
 
-Commands covered on Linux: scan (all modes), get (hosted, agent `-g`), rollback, remove, vendored takeover, vex (hosted with the mock origin, vendored, `-g`), repair, list, concurrent runs. Also covered (2026-10-02): virtualenv layouts, pip-tools `pip-compile --generate-hashes` / `pip-sync` over a hosted file plus rollback, `-c` constraints with an unpinned root, `pip install --target` trees, `--json` envelopes of rollback / remove failures, and interrupted (SIGTERM / SIGKILL) hosted scans.
+Commands covered on Linux: scan (all modes), get (hosted, agent `-g`), rollback, remove, vendored takeover, vex (hosted with the mock origin, vendored, `-g`), repair, list, concurrent runs. Also covered (2026-10-02): free-threaded CPython 3.13t venvs, a `.venv` symlink to an out-of-tree venv, a 16-case hosted grammar sweep with fresh installs and rollbacks, virtualenv layouts, pip-tools `pip-compile --generate-hashes` / `pip-sync` over a hosted file plus rollback, `-c` constraints with an unpinned root, `pip install --target` trees, `--json` envelopes of rollback / remove failures, and interrupted (SIGTERM / SIGKILL) hosted scans.
 
 ## Backlog
 
+0. Re-verify #542 when fixed (foreign direct references in hosted requirements.txt). Vendored on such a fork says "no installed package found on disk"; check whether that's accurate.
 1. Re-verify #475 (after #478), #328 (after #503) and #523 as fixes land; check lock-only `vex` with spaced pins (`vex/discover/pypi_other.rs` shares `exact_pin`). Then lock-only discovery of `six==1.16` once #475 is fixed.
 2. **Maintainer request (mostly done):** global (`-g`) mode. Left: Homebrew / PEP 668 interpreters, py launcher with several interpreters, pipx venvs (#418), non-root unwritable prefixes on CI. Open question for the maintainer: the non-`-g` no-venv fallback to global site-packages (see the 20261001T083942Z entry; it also makes a lock-only `vex` omit packages the system Python has unpatched, and it confounds lock-only tests when the system has the same version).
-3. Other lock-only grammar gaps near #523: spaced `==` on `\` continuations, `--hash` before the marker, `${VAR}` lines, `-e` / VCS lines next to a patched pin.
-4. `pip install --prefix` trees; a `.venv` symlink to an out-of-tree venv.
+3. Other lock-only grammar gaps near #523 (PR #530 may cover these): spaced `==` on `\` continuations, `--hash` before the marker, `-e` / VCS lines next to a patched pin.
+4. `pip install --prefix` trees (needs a host without a system six; the `.venv` symlink passes).
 5. Re-verify #409 / #410 / #412 as fixes land.
 
 ## Known non-bugs
@@ -47,3 +48,6 @@ Commands covered on Linux: scan (all modes), get (hosted, agent `-g`), rollback,
 - In the sandbox, the CLI can't reach pypi.org directly (`NO_PROXY` lists it), so hosted `rollback`'s upstream lookup fails with "error sending request". Run with `NO_PROXY=localhost,127.0.0.1`.
 - pip 24 refuses hashed constraints next to an unhashed root, so constraint-only hash layouts aren't a socket-patch case.
 - A SIGKILLed scan can leave `.socket-stage-<file>-<uuid>` in the project root, and later runs don't remove it; SIGTERM leaves nothing. Not filed (inherent to SIGKILL, cross-ecosystem).
+
+- Hosted refuses bare URL / bare path lines (no `name @`) and `${VAR}` pins with `redirect_requirements_entry_not_found`, exit 0 (the documented hosted-refusal posture).
+- A hosted rollback restores a pip-equivalent line, not the original bytes (comment spacing, joined continuations, `(==X)` → `==X`, case).
