@@ -85,8 +85,8 @@ Each shares 55-67 distinct lines with `vendor_pnpm`. `read_project`, `preflight_
   - `common::JsonLayout`: keeps BOM, indent, EOL and trailer, but only `yarn_berry_lock.rs` uses it.
 - **Wiring lines ↔ JSON:** three copies with different handling of malformed input (`pnpm_lock.rs:3162`, `yarn_classic_lock.rs:1088`, `recover.rs::lines_of`).
 - **sha512 SRI formatting** is inlined at `npm_pack.rs:27`, `bun_lock.rs:388` and `vlt_preflight.rs:70`. `utils/digest.rs` has no SRI helper.
-- **npm tarball URLs:** the canonical `registry_fetch::npm_tarball_url` is re-implemented at `lock_inventory/vlt.rs:141` and `bun_lockb.rs:235`. The latter hard-codes `registry.npmjs.org` and **ignores `SOCKET_NPM_REGISTRY`**. There are two `NPM_REGISTRY` constants, one with a trailing slash and one without.
-- **vlt `registry_base`:** two divergent implementations (`upstream/vlt.rs:55` vs `lock_inventory/vlt.rs:104`) with different fallback orders and unknown-alias behavior.
+- **npm tarball URLs:** the canonical `registry_fetch::npm_tarball_url` is re-implemented at `lock_inventory/vlt.rs:141` and `bun_lockb.rs:235`. The latter hard-codes `registry.npmjs.org` and **ignores `SOCKET_NPM_REGISTRY`**. There are two `NPM_REGISTRY` constants, one with a trailing slash and one without. {{E02}}
+- **vlt `registry_base`:** two divergent implementations (`upstream/vlt.rs:55` vs `lock_inventory/vlt.rs:104`) with different fallback orders and unknown-alias behavior. {{E03}}
 - **"Is a bun lock present":** four predicates with different symlink semantics (`lock_inventory/bun.rs:40` uses lstat; `hosted/engine.rs:255`, `hosted/vlt.rs:53` and `bun_lock.rs:623` follow symlinks). A dangling `bun.lock` symlink is "present" to one and "absent" to the others.
 - **`name@spec` splitting** is written twice (`yarn_classic_lock::split_pattern`, `bun_lock_text::split_name_spec`). npm purl → (name, version) is parsed three more times outside `utils/purl.rs`.
 - **Wiring `KIND_*` constants** are private to each backend but re-spelled as string literals in `recover.rs` (7 sites), `state.rs` and `bun_lock.rs`.

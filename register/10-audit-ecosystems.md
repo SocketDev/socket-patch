@@ -4,8 +4,8 @@ _Last updated 2026-10-02T19:30Z · main @ d63ae5f_
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
 | E01 | 1 | Hosted NuGet source mapping (`nuget_package_source_keys`) regex-scans raw XML, so a commented-out `<add key>` changes which sources get mapped. The vendored reader and `formats::nuget` both mask comments. | §1 #5; 5.4 | #561 | filed #561 |
-| E02 | 1 | `bun.lockb` vendoring hard-codes `registry.npmjs.org` and ignores `SOCKET_NPM_REGISTRY`. The npm tarball URL is re-implemented in `lock_inventory/vlt.rs`, and there are two `NPM_REGISTRY` constants. | §1 #7; 4.4 | #562 | partly not a defect; rest filed #562 |
-| E03 | 1 | vlt `registry_base` has two implementations (`upstream/vlt.rs`, `lock_inventory/vlt.rs`) with different fallback orders and different unknown-alias behavior. | §1 #7; 4.4 | #562 | filed #562 |
+| E02 | 1 | `bun.lockb` vendoring hard-codes `registry.npmjs.org` and ignores `SOCKET_NPM_REGISTRY`. The npm tarball URL is re-implemented in `lock_inventory/vlt.rs`, and there are two `NPM_REGISTRY` constants. | §1 #7; 4.4 | #562 | in PR #574; partly not a defect |
+| E03 | 1 | vlt `registry_base` has two implementations (`upstream/vlt.rs`, `lock_inventory/vlt.rs`) with different fallback orders and different unknown-alias behavior. | §1 #7; 4.4 | #562 | in PR #574 |
 | E04 | 1 | Pipenv hosted-URL recognition accepts any host (`pypi_pipenv.rs`), but `redirect` `hosted_patch_uuid` uses an origin allowlist. | 5.4 | #563 | in PR #572 |
 | E05 | 1 | Cache crawls aren't project-scoped: cargo, go, maven, nuget and deno enumerate the whole machine cache, and scan sends all of it to the API (#265). | 6.6 | | to verify |
 | E06 | 1 | Some crawler reads aren't FIFO-safe: `nuget_crawler.rs` and `python_crawler.rs` use a plain `read_to_string` on files in the project tree. | 6.6 | | to verify |
