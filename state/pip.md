@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pip / requirements.txt bug-hunt routine (label pm:pip).
 
-Last run: 2026-10-02 (seventh run), main `61cfb9b`, latest release v4.0.0 (`96df6ae`). New this run: #542 (hosted rewrite claims a user's own direct-reference source).
+Last run: 2026-10-02 (eighth run), main `61cfb9b`, latest release v4.0.0 (`96df6ae`). No new issues this run (grammar sweep 2, name normalisation, symlinks, `--prefix`, vex drift). #542 was filed in run seven.
 
 ## Coverage matrix
 
@@ -14,16 +14,15 @@ Last run: 2026-10-02 (seventh run), main `61cfb9b`, latest release v4.0.0 (`96df
 
 pip 20.3.4 on py3.13 is blocked (no `distutils`). `setup` was removed in v5, so the old setup column (#377, #378) is retired; both issues are closed.
 
-Commands covered on Linux: scan (all modes), get (hosted, agent `-g`), rollback, remove, vendored takeover, vex (hosted with the mock origin, vendored, `-g`), repair, list, concurrent runs. Also covered (2026-10-02): free-threaded CPython 3.13t venvs, a `.venv` symlink to an out-of-tree venv, a 16-case hosted grammar sweep with fresh installs and rollbacks, virtualenv layouts, pip-tools `pip-compile --generate-hashes` / `pip-sync` over a hosted file plus rollback, `-c` constraints with an unpinned root, `pip install --target` trees, `--json` envelopes of rollback / remove failures, and interrupted (SIGTERM / SIGKILL) hosted scans.
+Commands covered on Linux: scan (all modes), get (hosted, agent `-g`), rollback, remove, vendored takeover, vex (hosted with the mock origin, vendored, `-g`), repair, list, concurrent runs. Also covered (2026-10-02): free-threaded CPython 3.13t venvs, a `.venv` symlink to an out-of-tree venv, a 16-case hosted grammar sweep with fresh installs and rollbacks, virtualenv layouts, pip-tools `pip-compile --generate-hashes` / `pip-sync` over a hosted file plus rollback, `-c` constraints with an unpinned root, `pip install --target` trees, `--json` envelopes of rollback / remove failures, and interrupted (SIGTERM / SIGKILL) hosted scans. Run eight (pip 24.0 / py3.11 and pip 20.3.4 / py3.8): PEP 503 name normalisation (`_` / `-` / `.` / case, venv and lock-only), duplicate and marker-split pins, BOM, no trailing newline, `--no-index` + `--find-links`, per-line `--config-settings`, `--require-hashes` with multiple and sha384 hashes, `-e` / VCS neighbours (lock-only + `vex`), symlinked root and include files, out-of-root includes, `--prefix` trees: all pass or refuse explicitly.
 
 ## Backlog
 
-0. Re-verify #542 when fixed (foreign direct references in hosted requirements.txt). Vendored on such a fork says "no installed package found on disk"; check whether that's accurate.
-1. Re-verify #475 (after #478), #328 (after #503) and #523 as fixes land; check lock-only `vex` with spaced pins (`vex/discover/pypi_other.rs` shares `exact_pin`). Then lock-only discovery of `six==1.16` once #475 is fixed.
-2. **Maintainer request (mostly done):** global (`-g`) mode. Left: Homebrew / PEP 668 interpreters, py launcher with several interpreters, pipx venvs (#418), non-root unwritable prefixes on CI. Open question for the maintainer: the non-`-g` no-venv fallback to global site-packages (see the 20261001T083942Z entry; it also makes a lock-only `vex` omit packages the system Python has unpatched, and it confounds lock-only tests when the system has the same version).
-3. Other lock-only grammar gaps near #523 (PR #530 may cover these): spaced `==` on `\` continuations, `--hash` before the marker, `-e` / VCS lines next to a patched pin.
-4. `pip install --prefix` trees (needs a host without a system six; the `.venv` symlink passes).
-5. Re-verify #409 / #410 / #412 as fixes land.
+0. **Open question for the maintainer:** `vex` attests a hosted pin (six@1.16.0) from the lockfile basis when the venv holds a different version (six 1.15.0), with no warning. The copy lookup is keyed by name@version, so the drifted copy reads as "not installed". Likely cross-ecosystem (see the 20261002T142728Z entry). Also the non-`-g` no-venv fallback to global site-packages (20261001T083942Z).
+1. Re-verify #542, #475 (after #478), #328 (after #503), #412 / #523 (after #530); then lock-only `vex` with spaced pins.
+2. Finish global (`-g`) mode: Homebrew / PEP 668 interpreters, the py launcher with several interpreters, pipx venvs (#418), non-root unwritable prefixes on CI.
+3. pip 26.x on the run-eight grammar sweep; a Windows / macOS probe for BOM + CRLF on the patched line.
+4. Re-verify #409 / #410 as fixes land.
 
 ## Known non-bugs
 
@@ -51,3 +50,7 @@ Commands covered on Linux: scan (all modes), get (hosted, agent `-g`), rollback,
 
 - Hosted refuses bare URL / bare path lines (no `name @`) and `${VAR}` pins with `redirect_requirements_entry_not_found`, exit 0 (the documented hosted-refusal posture).
 - A hosted rollback restores a pip-equivalent line, not the original bytes (comment spacing, joined continuations, `(==X)` → `==X`, case).
+- Vendored refuses a per-line option such as `--config-settings` on the patched pin, and a `name @ <url/file>` direct reference, with "not pinned to ==X" (fail-closed; the wording is imprecise). Hosted rewrites `--config-settings` lines fine.
+- A symlinked `requirements.txt` or a symlinked `-r` include is refused explicitly (`redirect_symlinked_file_unsupported` / `pypi_requirements_symlink_unsupported`), and so is an include outside the project root (vendored). Nothing is written.
+- Agent mode doesn't crawl `pip install --prefix <dir>` trees either (`[NOT INSTALLED]` + skip hint), same as `--target`.
+- With a mock origin, hosted `rollback` / `vex` need `SOCKET_PATCH_SERVER_URL` (or `--patch-server-url`) set to it; vendored needs the mock to serve sha512 integrity.
