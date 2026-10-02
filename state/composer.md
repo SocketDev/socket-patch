@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Composer bug-hunt routine (label pm:composer).
 
-Last updated: 2026-10-02 (run 8), main `61cfb9b` (after #358 Composer rewriter + hosted-by-default scan/get, #446 `-g` scoping), latest release v4.0.0.
+Last updated: 2026-10-02 (run 9), main `203e092` (after #442 global-probe / Composer home fix for #438, #555), latest release v4.0.0.
 
 ## Coverage matrix
 
@@ -51,9 +51,9 @@ macOS/Windows: untested (pure lock logic; Composer 1's `transport-options` crash
 
 | OS | Composer | `scan -g` report (default home) | hosted `-g` refusal | `-g` apply / vex / rollback | custom global vendor-dir | composer not on PATH |
 | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 1.10.28 / 2.2.30 / 2.8.12 / 2.10.3 | pass | pass | pass | fail #439 | pass (`~/.config`), fail #438 with `XDG_CONFIG_HOME` |
+| Linux | 1.10.28 / 2.2.30 / 2.8.12 / 2.10.3 | pass | pass | pass | fail #439 | pass (`~/.config`; `XDG_CONFIG_HOME` pass on `203e092`); **fail #586** on 2.x when a stale `~/.composer` also exists |
 | macOS | 1.10.28 / 2.2.30 / 2.10.3 | pass | pass | pass | fail #439 | untested |
-| Windows | 1.10.28 / 2.2.30 / 2.10.3 | fail #438 | pass | fail #438 (pass with explicit `COMPOSER_HOME`) | fail #439 | fail #438 |
+| Windows | 1.10.28 / 2.2.30 / 2.10.3 | fail #438 (closed by #442; re-probe pending) | pass | fail #438 (pass with explicit `COMPOSER_HOME`) | fail #439 | fail #438 |
 
 Local agent scan with a user-level `$COMPOSER_HOME/config.json` vendor-dir: fail #439 (Linux 2.8.12). Hosted on v5: #399 still reproduces.
 
@@ -78,13 +78,15 @@ OS-independent (pure path logic). macOS/Windows: untested.
 
 ## Backlog
 
-1. Re-run #536 once Composer joins the vendored → hosted `takeover_capable` set (PR #503 adds only pypi). Cover both `scan` and `get <uuid> --mode hosted`.
-2. **Maintainer request (in progress):** global `-g` mode. Remaining: a non-writable global dir must fail loudly (non-root probe), `SOCKET_GLOBAL=1` and space/unicode `--global-prefix` cells, and a re-run after #438/#439 are fixed (PR #442 targets #438), including #446's `-g` scoping inside a hosted Composer project.
-3. macOS/Windows probe of vendored path-repo + source-install revert (a Windows junction path repo with existing `transport-options`), plus Windows long-path depth of `.socket/vendor/composer/<uuid>/<v>/<n>@<ver>`.
-4. Re-run the Composer 1 installers cells when a fix for #463 lands, and add 2.10.3 installers cells. Re-run the path-repo hosted cell when #399 is fixed, and #515 when it's fixed.
-5. Ask maintainers whether to document `COMPOSER=<other>.json` (the crawler and hosted mode ignore it; scan finds 0 packages) and Composer 1's `composer require <other>` re-resolving custom-repo entries (it drops a hosted rewrite).
-6. PHP 7.2 / 7.4 cells for Composer 2.2 LTS (probe with setup-php).
-7. Delete the leftover probe branches `bughunt/composer/20260930-srconly-probe`, `bughunt/composer/20261001-global-probe` and `bughunt/composer/20261001-c1-topts` (the sandbox git proxy refuses deletes). Needs a maintainer.
+1. #555 composer cell: agent `apply` with a manifest entry for a lock-only (not installed) package, including a `v`-prefixed lock version. Expected: skip with exit 0.
+2. Re-run #536 once Composer joins the vendored → hosted `takeover_capable` set (PR #503 adds only pypi). Cover both `scan` and `get <uuid> --mode hosted`.
+3. Windows probe: re-verify #438 on `203e092` (`composer.bat` probe and the `%APPDATA%\Composer` fallback), plus the macOS-with-`XDG_*`-var variant of #586. Re-run #586 once fixed.
+4. Global `-g` leftovers: a non-writable global dir must fail loudly (non-root probe), `SOCKET_GLOBAL=1`, a space/unicode `--global-prefix`, and #446's `-g` scoping inside a hosted Composer project.
+5. macOS/Windows probe of vendored path-repo + source-install revert (a Windows junction path repo with existing `transport-options`), plus the Windows long-path depth of `.socket/vendor/composer/<uuid>/<v>/<n>@<ver>`.
+6. Re-run the Composer 1 installers cells when #463 is fixed, and add 2.10.3 installers cells. Re-run #399 and #515 when they're fixed.
+7. Ask maintainers whether to document `COMPOSER=<other>.json` and Composer 1's `composer require <other>` re-resolving custom-repo entries.
+8. PHP 7.2 / 7.4 cells for Composer 2.2 LTS (probe with setup-php).
+9. Delete the leftover probe branches `bughunt/composer/20260930-srconly-probe`, `bughunt/composer/20261001-global-probe` and `bughunt/composer/20261001-c1-topts` (the sandbox git proxy refuses deletes). Needs a maintainer.
 
 ## Known non-bugs
 
@@ -118,3 +120,4 @@ OS-independent (pure path logic). macOS/Windows: untested.
 - Composer 2.10 disables plugins for root in non-interactive sessions. Set `COMPOSER_ALLOW_SUPERUSER=1` in plugin repros.
 - Hosted `rollback` of an inline/custom-repo entry is refused ("restore it from version control"): documented fail-closed behaviour.
 - Packagist's Composer 1 metadata is frozen: Composer 1.10 can't resolve new packagist packages (`require` reports "Did you mean…"). Use inline/local repos for Composer 1 update cells.
+- Composer 1.x prefers `~/.composer` over the XDG home even when both exist (`global config home` on 1.10.28). socket-patch's `~/.composer`-first fallback is correct for Composer 1. #586 is about Composer 2 only.
