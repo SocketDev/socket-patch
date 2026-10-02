@@ -457,10 +457,10 @@ async fn pdm_project_site_packages(
 /// `[python] path` in the legacy `.pdm.toml`. A relative path is taken
 /// against the project.
 async fn pdm_saved_interpreter(cwd: &Path) -> Option<PathBuf> {
-    let saved = match tokio::fs::read_to_string(cwd.join(".pdm-python")).await {
+    let saved = match read_regular_to_string(&cwd.join(".pdm-python")).await {
         Ok(text) => text.trim().to_string(),
         Err(_) => {
-            let text = tokio::fs::read_to_string(cwd.join(".pdm.toml"))
+            let text = read_regular_to_string(&cwd.join(".pdm.toml"))
                 .await
                 .ok()?;
             let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
@@ -476,7 +476,7 @@ async fn is_pdm_project(cwd: &Path) -> bool {
     if cwd.join("pdm.lock").is_file() || cwd.join(".pdm.toml").is_file() {
         return true;
     }
-    let Ok(text) = tokio::fs::read_to_string(cwd.join("pyproject.toml")).await else {
+    let Ok(text) = read_regular_to_string(&cwd.join("pyproject.toml")).await else {
         return false;
     };
     text.parse::<toml_edit::DocumentMut>()
