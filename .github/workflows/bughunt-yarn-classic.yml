@@ -1,0 +1,219 @@
+name: bughunt yarn-classic probe
+on:
+  push:
+    branches: ['bughunt/yarn-classic/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    name: probe ${{ matrix.os }} yarn ${{ matrix.yarn }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        yarn: ['1.7.0', '1.10.1', '1.22.22']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup show
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.x'
+      - name: Build socket-patch
+        run: cargo build -p socket-patch-cli
+      - name: Probe
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+          YARN_V: ${{ matrix.yarn }}
+        run: |
+          cat > "$RUNNER_TEMP/probe.sh" <<'PROBE_EOF'
+          #!/usr/bin/env bash
+          # probe.sh SP_BIN YARN_VERSION -- prints RESULT lines
+          set -u
+          SP=$1; V=$2; W="$(pwd)/probe work ü"; rm -rf "$W"; mkdir -p "$W"; cd "$W"
+          export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+          PY=python3; python3 -c 1 2>/dev/null || PY=python
+          PORT=18999; API=http://127.0.0.1:$PORT
+          winpath() { if command -v cygpath >/dev/null; then cygpath -m "$1"; else echo "$1"; fi; }
+          Y() { corepack yarn@$V "$@"; }
+          sp() { "$SP" "$@" --api-url $API --org test-org --api-token fake; }
+          result() { echo "RESULT os=${RUNNER_OS:-local} yarn=$V $*"; }
+          markers() { (cd "$1" && find . -path '*node_modules/*' -maxdepth 5 -name index.js | sort | while read -r f; do case "$f" in *left-pad*|*is-number*|*string-locale*) if head -c 22 "$f" | grep -q SOCKET-PATCHED; then printf '%s=P,' "$(dirname "$f" | sed 's#.*node_modules/##')"; else printf '%s=UNPATCHED,' "$(dirname "$f" | sed 's#.*node_modules/##')"; fi;; esac; done); }
+          fresh() { rm -rf "$2"; mkdir -p "$2"; (cd "$1" && tar cf - --exclude=node_modules --exclude=.c . ) | (cd "$2" && tar xf -); }
+          mkdir pk && (cd pk && for s in left-pad@1.3.0 left-pad@1.2.0 is-number@7.0.0 @isaacs/string-locale-compare@1.1.0; do npm pack $s --silent >/dev/null; done; ls)
+          cat > pkbuild.py <<'PY'
+          # pkbuild.py OUTCFG UUID UPSTREAM_TGZ [UUID TGZ ...] -> patched tarballs + cfg.json (prepends marker to index.js)
+          import io, json, os, sys, tarfile
+          out = sys.argv[1]; args = sys.argv[2:]; cfg = []
+          for i in range(0, len(args), 2):
+              uuid, up = args[i], os.path.abspath(args[i+1])
+              d = os.path.dirname(up); src = tarfile.open(up); pj = None
+              dst_path = up[:-4] + ".patched.tgz"; dst = tarfile.open(dst_path, "w:gz")
+              for m in src.getmembers():
+                  if not m.isfile(): continue
+                  data = src.extractfile(m).read(); rel = m.name.split('/', 1)[1]
+                  if rel == "package.json": pj = json.loads(data)
+                  if rel == "index.js":
+                      open(up + ".orig", "wb").write(data); data = b"/* SOCKET-PATCHED */\n" + data; open(up + ".new", "wb").write(data)
+                  t = tarfile.TarInfo("package/" + rel); t.size = len(data); t.mode = 0o644; t.mtime = 0
+                  dst.addfile(t, io.BytesIO(data))
+              dst.close()
+              cfg.append({"name": pj["name"], "version": pj["version"], "uuid": uuid, "tgz": dst_path,
+                          "files": {"package/index.js": [up + ".orig", up + ".new"]}})
+          json.dump(cfg, open(out, "w"), indent=1)
+
+          PY
+          cat > mock.py <<'PY'
+          #!/usr/bin/env python3
+          """Mock socket patch API. Config: JSON list of pkgs
+          {name, version, uuid, tgz (patched tarball path), files: {"package/index.js": [orig_path, patched_path]}}
+          Usage: mock.py CONFIG PORT
+          """
+          import base64, hashlib, json, re, sys, urllib.parse
+          from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+          CFG = json.load(open(sys.argv[1]))
+          PORT = int(sys.argv[2])
+          ORG = "test-org"
+          TOKEN = "33333333-3333-4333-8333-333333333333"
+          BASE = f"http://127.0.0.1:{PORT}"
+          LOG = open(sys.argv[1] + ".log", "a")
+
+          def gsha(b):
+              return hashlib.sha256(b"blob %d\0" % len(b) + b).hexdigest()
+
+          def purl(p):
+              return f"pkg:npm/{p['name']}@{p['version']}"
+
+          def base(p):
+              return p['name'].split('/')[-1]
+
+          def hosted(p):
+              return f"{BASE}/patch/npm/{p['name']}/{p['version']}/{TOKEN}/{p['uuid']}/{base(p)}-{p['version']}.tgz"
+
+          def tgz(p):
+              return open(p['tgz'], 'rb').read()
+
+          def summary(p):
+              return {"uuid": p['uuid'], "purl": purl(p), "tier": "free", "cveIds": ["CVE-2026-1111"],
+                      "ghsaIds": ["GHSA-aaaa-bbbb-cccc"], "severity": "high", "title": "fixture",
+                      "publishedAt": "2026-01-01T00:00:00Z", "description": "x", "license": "MIT",
+                      "vulnerabilities": {}}
+
+          def view(p):
+              files = {}
+              for k, (o, n) in p['files'].items():
+                  ob, nb = open(o, 'rb').read(), open(n, 'rb').read()
+                  files[k] = {"beforeHash": gsha(ob), "afterHash": gsha(nb),
+                              "blobContent": base64.b64encode(nb).decode()}
+              return {"uuid": p['uuid'], "purl": purl(p), "publishedAt": "2026-01-01T00:00:00Z",
+                      "files": files,
+                      "vulnerabilities": {"GHSA-aaaa-bbbb-cccc": {"cves": ["CVE-2026-1111"], "summary": "s",
+                                                                   "severity": "high", "description": "d"}},
+                      "description": "x", "license": "MIT", "tier": "free"}
+
+          class H(BaseHTTPRequestHandler):
+              def log_message(self, *a):
+                  LOG.write("%s %s\n" % (self.command, self.path)); LOG.flush()
+
+              def send(self, code, body, ctype="application/json"):
+                  if not isinstance(body, bytes):
+                      body = json.dumps(body).encode()
+                  self.send_response(code)
+                  self.send_header("Content-Type", ctype)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def body(self):
+                  n = int(self.headers.get('Content-Length') or 0)
+                  return json.loads(self.rfile.read(n) or b"{}")
+
+              def do_POST(self):
+                  path = urllib.parse.unquote(self.path.split('?')[0])
+                  b = self.body()
+                  if path == f"/v0/orgs/{ORG}/patches/batch":
+                      want = set(b.get("components") and [c.get("purl") for c in b["components"]] or [])
+                      pk = [{"purl": purl(p), "patches": [summary(p)]} for p in CFG if not want or purl(p) in want]
+                      return self.send(200, {"packages": pk, "canAccessPaidPatches": False})
+                  if path == f"/v0/orgs/{ORG}/patches/package":
+                      res = {}
+                      for p in CFG:
+                          h = hosted(p); t = tgz(p)
+                          res[p['uuid']] = {"status": "granted", "url": h, "purl": purl(p),
+                              "artifacts": [{"kind": "tarball", "url": h, "integrity": {
+                                  "sha512": "sha512-" + base64.b64encode(hashlib.sha512(t).digest()).decode(),
+                                  "sha1": hashlib.sha1(t).hexdigest()}}],
+                              "registryOverride": None}
+                      return self.send(200, {"results": res})
+                  self.send(404, {"error": "nf"})
+
+              def do_GET(self):
+                  path = urllib.parse.unquote(self.path.split('?')[0])
+                  m = re.match(rf"^/v0/orgs/{ORG}/patches/by-package/(.+)$", path)
+                  if m:
+                      q = m.group(1)
+                      ps = [summary(p) for p in CFG if purl(p) == q or q.startswith(purl(p))]
+                      return self.send(200, {"patches": ps, "canAccessPaidPatches": False})
+                  m = re.match(rf"^/v0/orgs/{ORG}/patches/view/(.+)$", path)
+                  if m:
+                      for p in CFG:
+                          if p['uuid'] == m.group(1):
+                              return self.send(200, view(p))
+                  for p in CFG:
+                      if path == urllib.parse.unquote(hosted(p)[len(BASE):]):
+                          return self.send(200, tgz(p), "application/octet-stream")
+                  self.send(404, {"error": "nf"})
+
+          ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+
+          PY
+          $PY pkbuild.py cfg.json 7c8d9e0f-1a2b-4c3d-8e4f-5a6b7c8d9e01 pk/left-pad-1.3.0.tgz 7c8d9e0f-1a2b-4c3d-8e4f-5a6b7c8d9e02 pk/left-pad-1.2.0.tgz 7c8d9e0f-1a2b-4c3d-8e4f-5a6b7c8d9e03 pk/is-number-7.0.0.tgz 7c8d9e0f-1a2b-4c3d-8e4f-5a6b7c8d9e04 pk/isaacs-string-locale-compare-1.1.0.tgz
+          $PY mock.py cfg.json $PORT > mock.out 2>&1 &
+          MOCKPID=$!; sleep 3; curl -s -o /dev/null -w "mock %{http_code}\n" $API/v0/orgs/test-org/patches/view/7c8d9e0f-1a2b-4c3d-8e4f-5a6b7c8d9e01
+          scan() { # scan DIR MODE TAG
+                       sp scan --mode $2 --json --yes --cwd "$(winpath "$1")" > "$W/$3.scan.json" 2>"$W/$3.scan.err"; local rc=$?
+            result "case=$3-scan rc=$rc $($PY -c "import json,sys;e=json.load(open(sys.argv[1]));print('status='+str(e.get('status')),'redir='+str(e.get('redirect',{}).get('redirected')),'warn='+','.join(w.get('code','') for w in e.get('warnings',[])+e.get('redirect',{}).get('warnings',[])),'err='+str((e.get('error') or {}).get('code')))" "$W/$3.scan.json" 2>&1 | tail -1)"
+          }
+          check() { # check DIR TAG [flags]
+            fresh "$1" "$W/$2.f"; (cd "$W/$2.f" && YARN_CACHE_FOLDER="$W/c.$2.$RANDOM" Y install --frozen-lockfile ${3:-} --no-progress > "$W/$2.f.log" 2>&1); local rc=$?
+            result "case=$2-fresh-frozen${3:-} rc=$rc $(markers "$W/$2.f") err=$(grep -m1 -i '^error' "$W/$2.f.log" | cut -c1-90 | tr ' ' _)"
+          }
+          # --- case D: dev flow after scan: yarn add / pure-lockfile reinstall, then frozen fresh + vex / vendor --check ---
+          for m in hosted vendored; do
+            P="$W/dev-$m"; mkdir -p "$P"
+            echo '{"name":"root","version":"1.0.0","private":true,"dependencies":{"left-pad":"1.3.0","is-number":"7.0.0"}}' > "$P/package.json"
+            (cd "$P" && YARN_CACHE_FOLDER="$P/.c" Y install --no-progress >/dev/null 2>&1) || result "case=dev-$m fixture-install-failed"
+            scan "$P" $m dev-$m; check "$P" dev-$m
+            grep -E '^  resolved' "$P/yarn.lock" | sed 's/^/  LOCK0 /' | cut -c1-140
+            cp "$P/yarn.lock" "$W/dev-$m.scanned"
+            (cd "$P" && YARN_CACHE_FOLDER="$P/.c2" Y add @isaacs/string-locale-compare@1.1.0 --no-progress > "$W/dev-$m.add.log" 2>&1); rc=$?
+            grep -E '^  resolved' "$P/yarn.lock" | sed 's/^/  LOCK1 /' | cut -c1-140
+            n=$(grep -c "127.0.0.1\|file:" "$P/yarn.lock")
+            result "case=dev-$m-add rc=$rc wired-lines=$n err=$(grep -m1 -i '^error' "$W/dev-$m.add.log" | cut -c1-90 | tr ' ' _) installed=$(markers "$P")"
+            check "$P" dev-$m-after-add
+            (cd "$P" && SOCKET_PATCH_SERVER_URL=$API "$SP" vex --product pkg:npm/root@1.0.0 -O "$W/dev-$m.vex.json" > /dev/null 2>"$W/dev-$m.vex.err"); rc=$?
+            result "case=dev-$m-vex rc=$rc subs=$($PY -c "import json,sys;d=json.load(open(sys.argv[1]));print(','.join(sorted(c['@id'] for s in d['statements'] for c in s['products'][0].get('subcomponents',[]))))" "$W/dev-$m.vex.json" 2>&1 | tail -1)"
+            if [ $m = vendored ]; then (cd "$P" && "$SP" vendor --check --json > "$W/dev-$m.chk.json" 2>&1); result "case=dev-$m-vendor-check rc=$? $(head -c 300 "$W/dev-$m.chk.json" | tr -d '\n ' )"; fi
+            # pure-lockfile reinstall from scratch must not change the lock
+            rm -rf "$P/node_modules"; cp "$P/yarn.lock" "$W/dev-$m.pre"
+            (cd "$P" && YARN_CACHE_FOLDER="$P/.c3" Y install --pure-lockfile --no-progress > /dev/null 2>&1); rc=$?
+            (cd "$P" && YARN_CACHE_FOLDER="$P/.c4" Y install --no-progress > /dev/null 2>&1)
+            cmp -s "$P/yarn.lock" "$W/dev-$m.pre" && same=stable || { same=CHANGED; diff "$W/dev-$m.pre" "$P/yarn.lock" | head -20; }
+            result "case=dev-$m-reinstall rc=$rc lock=$same installed=$(markers "$P")"
+          done
+          kill $MOCKPID 2>/dev/null
+          PROBE_EOF
+          BIN="$PWD/target/debug/socket-patch"; [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          cd "$RUNNER_TEMP" && bash probe.sh "$BIN" "$YARN_V" > probe.log 2>&1 || true
+          grep RESULT probe.log || true
+          echo '--- tail ---'; tail -60 probe.log
