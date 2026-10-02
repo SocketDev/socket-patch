@@ -1,0 +1,36 @@
+{
+  "bun-lockb-bundled/both": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/@bh/bund@1.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb-bundled/only": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/@bh/bund@1.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  }
+}

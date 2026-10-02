@@ -63,13 +63,19 @@ pub(crate) fn global_mode_conflict(
     };
     Some(format!(
         "{} cannot be used with --mode {}: global installs have no project lockfile to {why}",
-        if common.global {
-            "--global"
-        } else {
-            "--global-prefix"
-        },
+        global_scope_flag(common),
         mode.cli_name(),
     ))
+}
+
+/// The flag that put a run in global scope, as usage errors name it
+/// (`SOCKET_GLOBAL` / `SOCKET_GLOBAL_PREFIX` set the same fields).
+pub(crate) fn global_scope_flag(common: &crate::args::GlobalArgs) -> &'static str {
+    if common.global {
+        "--global"
+    } else {
+        "--global-prefix"
+    }
 }
 
 /// Lockfile discovery of `root` (core `vex::discover`): the hosted and

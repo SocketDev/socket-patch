@@ -594,3 +594,114 @@ async fn assert_relock_roundtrip(lock: &str, relocked: &str) {
         "rollback restores the relocked lock byte for byte"
     );
 }
+
+/// Spawn `scan --mode hosted --json` on `root` with a scrubbed environment
+/// (no ambient `SOCKET_*`, `PDM_*` or `VIRTUAL_ENV`).
+async fn scan_json(
+    root: &Path,
+    server: &MockServer,
+    extra: &[&str],
+) -> (Option<i32>, serde_json::Value) {
+    let mut cmd = tokio::process::Command::new(binary());
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_")
+            || name.starts_with("PDM_")
+            || name == "VIRTUAL_ENV"
+            || name == "UV_PROJECT_ENVIRONMENT"
+        {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
+        .args(["scan", "--mode", "hosted", "--yes", "--json", "--cwd"])
+        .arg(root)
+        .args([
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .args(extra);
+    let out = cmd.output().await.unwrap();
+    let json = serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{error}: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.code(), json)
+}
+
+fn stale_warning(json: &serde_json::Value) -> bool {
+    json["redirect"]["warnings"]
+        .as_array()
+        .is_some_and(|warnings| {
+            warnings
+                .iter()
+                .any(|warning| warning["code"] == "redirect_pypi_stale_install")
+        })
+}
+
+/// Lay `urllib3 1.26.18` with `bytes` as its `response.py` into `site`.
+fn install_urllib3(site: &Path, bytes: &[u8]) {
+    std::fs::create_dir_all(site.join("urllib3-1.26.18.dist-info")).unwrap();
+    std::fs::create_dir_all(site.join("urllib3")).unwrap();
+    std::fs::write(site.join("urllib3").join("response.py"), bytes).unwrap();
+}
+
+/// #502 / #528: the env PDM installs into is the one its `.pdm-python`
+/// records: an out-of-tree venv, or `__pypackages__/<X.Y>/lib` when the
+/// interpreter is a base Python (PEP 582). A warm, still-upstream copy there
+/// must raise the stale-install warning and block the VEX attestation, as an
+/// in-project `.venv` does; the empty stray `.venv` from `write_project`
+/// must not stand in for it. Once PDM's env holds the patched bytes, the
+/// warning is gone and the redirect attests.
+#[tokio::test]
+async fn pdm_recorded_env_is_probed_for_stale_hosted_installs() {
+    for pep582 in [false, true] {
+        let server = MockServer::start().await;
+        mock_api(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        std::fs::create_dir_all(&root).unwrap();
+        write_project(&root, LOCK);
+        let site = if pep582 {
+            let base = tmp.path().join("usr").join("bin").join("python3.11");
+            std::fs::write(root.join(".pdm-python"), base.display().to_string()).unwrap();
+            std::fs::write(root.join("pdm.toml"), "[python]\nuse_venv = false\n").unwrap();
+            root.join("__pypackages__").join("3.11").join("lib")
+        } else {
+            let venv = tmp.path().join("pdm-venvs").join("app-AbCd-3.12");
+            std::fs::create_dir_all(&venv).unwrap();
+            std::fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+            let python = if cfg!(windows) {
+                venv.join("Scripts").join("python.exe")
+            } else {
+                venv.join("bin").join("python")
+            };
+            std::fs::write(root.join(".pdm-python"), python.display().to_string()).unwrap();
+            if cfg!(windows) {
+                venv.join("Lib").join("site-packages")
+            } else {
+                venv.join("lib").join("python3.12").join("site-packages")
+            }
+        };
+        install_urllib3(&site, UPSTREAM);
+
+        let vex = tmp.path().join("out.vex.json");
+        let (code, json) = scan_json(&root, &server, &["--vex", vex.to_str().unwrap()]).await;
+        assert_eq!(code, Some(1), "pep582={pep582}: {json}");
+        assert!(stale_warning(&json), "pep582={pep582}: {json}");
+        assert!(!vex.exists(), "stale bytes cannot produce a VEX file");
+
+        install_urllib3(&site, PATCHED);
+        let (code, json) = scan_json(&root, &server, &["--vex", vex.to_str().unwrap()]).await;
+        assert_eq!(code, Some(0), "pep582={pep582}: {json}");
+        assert!(!stale_warning(&json), "pep582={pep582}: {json}");
+        assert_eq!(json["vex"]["statements"], 1, "pep582={pep582}: {json}");
+    }
+}

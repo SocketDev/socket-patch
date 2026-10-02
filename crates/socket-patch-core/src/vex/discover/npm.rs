@@ -58,7 +58,7 @@ use crate::vendor::lock_inventory::pnpm::rush_lock_rels;
 use crate::vendor::lock_inventory::{
     npm_lock_bundled_nodes, npm_lock_nodes, LockIntegrity, NpmLockNode,
 };
-use crate::vendor::npm_origin::npm_non_registry_entries;
+use crate::vendor::npm_origin::{npm_non_registry_entries, NpmOverrides};
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let mut locks: Vec<NpmLockRefs> = Vec::new();
@@ -189,7 +189,14 @@ async fn extract_package_lock(
             read.bundled.entry(purl).or_insert(location);
         }
     }
-    drop_non_registry_installs(file, &doc, &mut read, out);
+    // The root manifest's `overrides` (#490): which git / url / `file:`
+    // dependent specs npm really installs from.
+    let overrides = ctx
+        .read_advisory_text("package.json")
+        .await
+        .map(|text| NpmOverrides::from_manifest_text(&text))
+        .unwrap_or_default();
+    drop_non_registry_installs(file, &doc, &overrides, &mut read, out);
     Some(read)
 }
 
@@ -202,10 +209,11 @@ async fn extract_package_lock(
 fn drop_non_registry_installs(
     file: &str,
     doc: &Value,
+    overrides: &NpmOverrides,
     read: &mut NpmLockRefs,
     out: &mut Discovery,
 ) {
-    let non_registry = npm_non_registry_entries(doc);
+    let non_registry = npm_non_registry_entries(doc, overrides);
     if non_registry.is_empty() {
         return;
     }
@@ -1088,6 +1096,53 @@ mod tests {
         let out = run(&p).await;
         assert!(out.refs.is_empty(), "{:#?}", out.refs);
         assert_eq!(bundled_contests(&out).len(), 2, "{:#?}", out.diagnostics);
+    }
+
+    /// #490: a git edge the project's `overrides` send to the registry is
+    /// a registry install, so its Socket wiring is attested.
+    #[tokio::test]
+    async fn issue_490_a_git_edge_overridden_to_the_registry_is_attested() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        for (wiring, resolved) in [("hosted", &hosted), ("vendored", &vendored)] {
+            for (overrides, attested) in [
+                (None, false),
+                (Some(r#"{"left-pad":"1.3.0"}"#), true),
+                (Some(r#"{"left-pad":"github:someone/left-pad"}"#), false),
+            ] {
+                let p = Project::new();
+                p.write(
+                    "package-lock.json",
+                    lock_with_packages(serde_json::json!({
+                        "": { "name": "app", "version": "1.0.0",
+                              "dependencies": { "pkga": "file:pkga-1.0.0.tgz" } },
+                        "node_modules/pkga": {
+                            "version": "1.0.0",
+                            "resolved": "file:pkga-1.0.0.tgz",
+                            "dependencies": { "left-pad": "github:stevemao/left-pad#v1.3.0" }
+                        },
+                        "node_modules/left-pad": {
+                            "version": "1.3.0", "resolved": resolved, "integrity": SRI
+                        },
+                    })),
+                );
+                if let Some(overrides) = overrides {
+                    p.write(
+                        "package.json",
+                        format!(
+                            r#"{{"name":"app","dependencies":{{"pkga":"file:pkga-1.0.0.tgz"}},"overrides":{overrides}}}"#
+                        ),
+                    );
+                }
+                let out = run(&p).await;
+                assert_eq!(
+                    out.refs.len(),
+                    usize::from(attested),
+                    "{wiring} / {overrides:?}: {:#?}",
+                    out.diagnostics
+                );
+            }
+        }
     }
 
     /// #326: a Socket-wired entry npm installs from a git / url / `file:`

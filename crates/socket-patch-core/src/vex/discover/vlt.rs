@@ -88,6 +88,7 @@ use crate::utils::digest::is_sri_pin;
 use crate::utils::purl::percent_decode_purl_component;
 use crate::vendor::lock_inventory::vlt::{vlt_lock_model, VltLockNode};
 use crate::vendor::lock_inventory::LockIntegrity;
+use crate::vendor::vlt_bundled::store_bundled_copies;
 use crate::vendor::vlt_lock_text::{installs_outside_registry, parse_vendored_path, DepIdKind};
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
@@ -208,6 +209,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             Classified::Other => {}
         }
     }
+    contest_bundled_copies(ctx, &lock.nodes, out).await;
     if !discarded_pins.is_empty() {
         let why: Vec<&str> = discards
             .iter()
@@ -225,6 +227,57 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                 why.join("; ")
             ),
         );
+    }
+}
+
+// ── bundled copies ───────────────────────────────────────────────────────
+
+/// Withdraw every ref whose `name@version` vlt ALSO installs as a bundled
+/// copy (#471). vlt unpacks a `bundleDependencies` entry from the parent's
+/// tarball into the parent's own store entry
+/// (`node_modules/.vlt/<parent id>/node_modules/<parent>/node_modules/
+/// <name>`) and records no lock node for it, so no hosted or vendored
+/// rewire reaches it and it stays unpatched beside the wired instance. Only
+/// the installed store shows it: the lock carries neither the copy nor the
+/// parent's `bundleDependencies`. A dependency vlt links is a SYMLINK
+/// beside the package (`.vlt/<id>/node_modules/<dep>`), never a real
+/// directory inside it, so every real package directory under the
+/// package's own `node_modules` is a bundled copy. Each copy also counts as
+/// resolved elsewhere (another lock's wiring of the same version is
+/// contested, as for npm's `inBundle` copies).
+async fn contest_bundled_copies(ctx: &DiscoverCtx<'_>, nodes: &[VltLockNode], out: &mut Discovery) {
+    let copies = store_bundled_copies(
+        ctx.root,
+        nodes.iter().map(|n| (n.key.as_str(), n.name.as_str())),
+    )
+    .await;
+    if copies.is_empty() {
+        return;
+    }
+    let refs = std::mem::take(&mut out.refs);
+    for r in refs {
+        let copy = (r.source_file == std::path::Path::new(VLT_LOCK))
+            .then(|| copies.get(&r.purl))
+            .flatten();
+        let Some(location) = copy else {
+            out.refs.push(r);
+            continue;
+        };
+        out.diag(
+            DIAG_REF_UNATTRIBUTABLE,
+            VLT_LOCK,
+            format!(
+                "{VLT_LOCK}: {} is wired to a Socket patch but vlt also installs a bundled \
+                 copy of it at {location:?} (vlt unpacks bundled dependencies from the parent \
+                 package's tarball and records no lock node for them, so no rewire reaches it \
+                 and that copy stays unpatched); the patch is not attested while the build \
+                 ships unpatched bytes of this version",
+                r.purl,
+            ),
+        );
+    }
+    for purl in copies.into_keys() {
+        out.resolved_elsewhere(VLT_LOCK, Some(purl));
     }
 }
 
@@ -922,6 +975,73 @@ mod tests {
         let id = format!("file·{}", path.replace('/', "§"));
         let out = discover(&lock(Some(0), &[node(&id, "left-pad", None, Some(&path))])).await;
         assert_refs(&out, &[(PURL, UUID_B, WiringMode::Vendored)]);
+    }
+
+    /// REGRESSION (#471): vlt unpacks a `bundleDependencies` copy into its
+    /// PARENT's store entry (`node_modules/.vlt/<parent id>/node_modules/
+    /// <parent>/node_modules/<name>`), and `vlt-lock.json` has no node for
+    /// it, so no rewire reaches it. An installed bundled copy of the ref's
+    /// `name@version` contests a hosted and a vendored ref alike; one of
+    /// another version, or a sibling dependency symlink, contests nothing.
+    #[tokio::test]
+    async fn an_installed_bundled_copy_contests_the_ref() {
+        let bundled_contests = |out: &Discovery| {
+            out.diagnostics
+                .iter()
+                .filter(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("bundled"))
+                .count()
+        };
+        let parent = "node_modules/.vlt/~npm~@bh+bund@1.0.0/node_modules/@bh/bund";
+        let hosted = url(UUID_A, "left-pad-1.3.0.tgz");
+        let path = dir_path(UUID_B);
+        let wired = [
+            (
+                node("~npm~left-pad@1.3.0", "left-pad", Some(SRI), Some(&hosted)),
+                UUID_A,
+                WiringMode::Hosted,
+            ),
+            (
+                node(&file_id(&path), "left-pad", None, Some(&path)),
+                UUID_B,
+                WiringMode::Vendored,
+            ),
+        ];
+        for (wired_node, uuid, mode) in wired {
+            let nodes = [
+                node("~npm~@bh+bund@1.0.0", "@bh/bund", Some(UPSTREAM), None),
+                wired_node,
+            ];
+            for (bundled_version, contested) in [("1.3.0", true), ("1.2.0", false)] {
+                let p = Project::new();
+                p.write("vlt-lock.json", lock(Some(1), &nodes));
+                p.write(
+                    &format!("{parent}/package.json"),
+                    r#"{"name":"@bh/bund","version":"1.0.0"}"#,
+                );
+                p.write(
+                    &format!("{parent}/node_modules/left-pad/package.json"),
+                    format!(r#"{{"name":"left-pad","version":"{bundled_version}"}}"#),
+                );
+                let out = p.run(|c, o| Box::pin(super::extract(c, o))).await;
+                if contested {
+                    assert_refs(&out, &[]);
+                    assert_eq!(
+                        bundled_contests(&out),
+                        1,
+                        "{mode:?}: {:?}",
+                        diag_codes(&out)
+                    );
+                    assert!(
+                        out.diagnostics.iter().any(|d| d.detail.contains(parent)),
+                        "the diagnostic names the copy: {:?}",
+                        diag_codes(&out)
+                    );
+                } else {
+                    assert_refs(&out, &[(PURL, uuid, mode)]);
+                    assert_eq!(bundled_contests(&out), 0, "{:?}", diag_codes(&out));
+                }
+            }
+        }
     }
 
     #[tokio::test]

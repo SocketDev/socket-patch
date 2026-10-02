@@ -43,8 +43,8 @@ use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::vendor::bun_lock_text::{
-    decode_json_string, has_workspace_packages, lock_version, packages_bounds, parse_entry_line,
-    split_name_spec, BunEntry,
+    decode_json_string, has_workspace_packages, is_bundled_entry, lock_version, packages_bounds,
+    parse_entry_line, split_name_spec, BunEntry,
 };
 
 use super::common::{already_patched_result, refused};
@@ -263,7 +263,11 @@ pub async fn wired_instances_all_ours(
                 })?;
             let leaf = tgz_rel_leaf(&name, &version);
             let mut matched = false;
-            for package in packages.into_iter().filter(|package| package.name == name) {
+            // A record only bundled edges reach is never rewired (#469).
+            for package in packages
+                .into_iter()
+                .filter(|package| package.name == name && !package.bundled_only)
+            {
                 let ours = parse_vendor_path(&package.resolution)
                     .is_some_and(|path| path.eco == "npm" && path.leaf == leaf);
                 if ours {
@@ -283,7 +287,7 @@ pub async fn wired_instances_all_ours(
     let target_leaf = tgz_rel_leaf(&name, &version);
     let mut matched = 0usize;
     for entry in &entries {
-        match classify(entry, &target_spec, &name, &target_leaf) {
+        match classify_rewritable(entry, &target_spec, &name, &target_leaf) {
             Some(TupleShape::Ours { .. }) => matched += 1,
             Some(TupleShape::Registry) => return Ok(false),
             None => {}
@@ -357,6 +361,18 @@ pub(crate) async fn vendor_bun<'a>(
         Ok(target) => target,
         Err(outcome) => return *outcome,
     };
+    for key in bundled_matches(&project.entries, &target_spec, name, &target_leaf) {
+        // LOUD: this copy ships inside its PARENT's tarball, which we do not
+        // repack — it stays the unpatched bytes after vendor (#469).
+        warnings.push(VendorWarning::new(
+            "vendor_bundled_instance_skipped",
+            format!(
+                "{BUN_LOCK} entry `{key}` is bundled inside its parent's tarball and CANNOT be \
+                 rewritten — that copy stays UNPATCHED; vendor or update the bundling parent \
+                 to cover it"
+            ),
+        ));
+    }
     let BunProject {
         mut lines, entries, ..
     } = project;
@@ -377,7 +393,7 @@ pub(crate) async fn vendor_bun<'a>(
     let has_digestless_own_tuple = entries.iter().any(|e| {
         e.elems.len() == 2
             && matches!(
-                classify(e, &target_spec, name, &target_leaf),
+                classify_rewritable(e, &target_spec, name, &target_leaf),
                 Some(TupleShape::Ours { path }) if path == rel_tgz
             )
     });
@@ -448,7 +464,7 @@ pub(crate) async fn vendor_bun<'a>(
     // while ≥ 1.3.10 consumers of the committed lock regain verification.
     let mut healed = false;
     for entry in &entries {
-        let Some(shape) = classify(entry, &target_spec, name, &target_leaf) else {
+        let Some(shape) = classify_rewritable(entry, &target_spec, name, &target_leaf) else {
             continue;
         };
         let original_line = lines[entry.line_idx].clone();
@@ -686,8 +702,23 @@ pub(super) fn preflight_package(
     let has_match = project
         .entries
         .iter()
-        .any(|e| classify(e, &target_spec, name, &target_leaf).is_some());
+        .any(|e| classify_rewritable(e, &target_spec, name, &target_leaf).is_some());
     if !has_match {
+        let bundled = bundled_matches(&project.entries, &target_spec, name, &target_leaf);
+        if !bundled.is_empty() {
+            // The entry IS in the lock, so "run `bun install`" would be
+            // wrong twice over: name the real reason (#469).
+            return Err(Box::new(refused(
+                "vendor_lock_entry_not_rewritable",
+                format!(
+                    "every {BUN_LOCK} entry for {name}@{version} ({}) is bundled inside a \
+                     parent's tarball and cannot be rewritten — those copies stay UNPATCHED \
+                     and `bun install` will not help; vendor or update the bundling parent \
+                     to cover them",
+                    bundled.join(", ")
+                ),
+            )));
+        }
         return Err(Box::new(refused(
             "vendor_lock_entry_not_found",
             format!(
@@ -709,7 +740,7 @@ pub(super) fn preflight_package(
     // refusal precedes every write.
     let writes_new_local_tuple = project.entries.iter().any(|e| {
         matches!(
-            classify(e, &target_spec, name, &target_leaf),
+            classify_rewritable(e, &target_spec, name, &target_leaf),
             Some(TupleShape::Registry)
         )
     });
@@ -988,6 +1019,35 @@ enum TupleShape {
     /// 3-tuple we write, or the digest-less 2-tuple Bun 1.1.39–1.3.9 re-save
     /// it as (`elems.len()` tells them apart; only a 3-tuple has `elems[2]`).
     Ours { path: String },
+}
+
+/// [`classify`] for the instances vendoring may rewrite: a bundled entry
+/// ([`is_bundled_entry`]) is unpacked from its parent's tarball and never
+/// read, so it is no rewrite target whatever its spec says (#469).
+fn classify_rewritable(
+    entry: &BunEntry,
+    target_spec: &str,
+    name: &str,
+    target_leaf: &str,
+) -> Option<TupleShape> {
+    if is_bundled_entry(entry) {
+        return None;
+    }
+    classify(entry, target_spec, name, target_leaf)
+}
+
+/// Keys of the bundled entries that resolve the target `name@version`.
+fn bundled_matches(
+    entries: &[BunEntry],
+    target_spec: &str,
+    name: &str,
+    target_leaf: &str,
+) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| is_bundled_entry(e) && classify(e, target_spec, name, target_leaf).is_some())
+        .map(|e| e.key.clone())
+        .collect()
 }
 
 /// Classify an entry against the target: `Some(Registry)` for the exact
@@ -1929,6 +1989,118 @@ mod tests {
         );
         assert_eq!(fx.read_lock().await, lock, "refusal writes nothing");
         assert!(!fx.root().join(".socket/vendor").exists());
+    }
+
+    /// REGRESSION (#469): a `{ "bundled": true }` entry is unpacked from
+    /// its PARENT's tarball, so Bun never reads its spec. Vendoring must
+    /// not rewrite it: alone it refuses with the real reason (not the
+    /// generic "run `bun install`" advice, which cannot help), and beside a
+    /// regular entry only the regular one is wired, with a loud warning
+    /// that the bundled copy stays unpatched.
+    #[tokio::test]
+    async fn bundled_entry_is_never_rewired() {
+        let bundled_line = r#"    "haspad/left-pad": ["left-pad@1.3.0", "", { "bundled": true }, "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="],"#;
+
+        // Bundled copy only.
+        let regular_line = BN3_BEFORE_LOCK
+            .lines()
+            .find(|l| l.contains("\"left-pad\": ["))
+            .unwrap();
+        let lock = BN3_BEFORE_LOCK.replace(regular_line, bundled_line);
+        let fx = fixture_with(&lock, "node_modules/haspad/node_modules/left-pad").await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_rewritable");
+        assert!(
+            detail.contains("haspad/left-pad") && detail.contains("UNPATCHED"),
+            "{detail}"
+        );
+        assert_eq!(fx.read_lock().await, lock, "refusal writes nothing");
+        assert!(!fx.root().join(".socket/vendor").exists());
+
+        // Bundled copy beside a regular entry of the same version.
+        let lock =
+            BN3_BEFORE_LOCK.replace(regular_line, &format!("{regular_line}\n\n{bundled_line}"));
+        let fx = fixture_with(&lock, "node_modules/left-pad").await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        assert_eq!(entry.wiring.len(), 1);
+        assert_eq!(entry.wiring[0].key.as_deref(), Some("left-pad"));
+        assert!(
+            fx.read_lock().await.contains(bundled_line),
+            "the bundled line keeps its registry bytes"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_bundled_instance_skipped"
+                    && w.detail.contains("haspad/left-pad")),
+            "{warnings:?}"
+        );
+    }
+
+    /// REGRESSION (#469), `bun.lockb`: a record only a bundled edge
+    /// reaches refuses with the real reason; a record Bun shares between a
+    /// regular and a bundled install is vendored for the regular install,
+    /// with a loud warning that the bundled copy stays unpatched.
+    #[tokio::test]
+    async fn binary_bundled_records_are_never_silently_rewired() {
+        async fn binary_fixture(shape: &str, installed_rel: &str) -> Fixture {
+            let fx = fixture_with("", installed_rel).await;
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/bun-lockb-bundled")
+                .join(shape);
+            tokio::fs::remove_file(fx.root().join(BUN_LOCK))
+                .await
+                .unwrap();
+            for file in ["bun.lockb", "package.json"] {
+                tokio::fs::copy(dir.join(file), fx.root().join(file))
+                    .await
+                    .unwrap();
+            }
+            tokio::fs::write(
+                fx.installed.join("package.json"),
+                br#"{"name":"is-number","version":"7.0.0"}"#,
+            )
+            .await
+            .unwrap();
+            fx
+        }
+        async fn vendor(fx: &Fixture) -> VendorOutcome {
+            let blobs = fx.root().join(".socket/blobs");
+            crate::vendor::test_support::vendor_bun(
+                "pkg:npm/is-number@7.0.0",
+                &fx.installed,
+                fx.root(),
+                &fx.record,
+                &PatchSources::blobs_only(&blobs),
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                None,
+            )
+            .await
+        }
+
+        let fx = binary_fixture("only", "node_modules/@bh/bund/node_modules/is-number").await;
+        let before = tokio::fs::read(fx.root().join("bun.lockb")).await.unwrap();
+        let detail = expect_refused(vendor(&fx).await, "vendor_lock_entry_not_rewritable");
+        assert!(detail.contains("UNPATCHED"), "{detail}");
+        assert_eq!(
+            tokio::fs::read(fx.root().join("bun.lockb")).await.unwrap(),
+            before,
+            "refusal writes nothing"
+        );
+
+        let fx = binary_fixture("both", "node_modules/is-number").await;
+        let (result, entry, warnings) = expect_done(vendor(&fx).await);
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(entry.unwrap().wiring.len(), 1);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_bundled_instance_skipped"),
+            "{warnings:?}"
+        );
     }
 
     #[tokio::test]

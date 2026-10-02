@@ -9,11 +9,15 @@
 //! * the entry's `source = { registry = R }` became `{ url = <artifact> }`
 //!   (pylock: `index = R` was dropped) — R is the ONE registry every other
 //!   registry package of the lock names, and must be PyPI's simple index;
-//!   no sibling, or several registries, refuses;
+//!   no sibling, or several registries, refuses. A pylock from
+//!   `uv pip compile` records no `index` at all: siblings without one whose
+//!   files are all on `files.pythonhosted.org` show PyPI, and the entry is
+//!   restored without one too;
 //! * `sdist` / `wheels` were replaced by the patched wheel (pylock: an
 //!   `archive`) — re-derived from PyPI's JSON API in the artifact shape a
 //!   sibling registry package shows (which of `size` / `upload-time` /
-//!   `hashes` this uv release records, one wheel per line or not). uv keeps
+//!   `hashes` this uv release records, one wheel per line or not; pylock
+//!   `upload-time`s in whole seconds unless a sibling shows a fraction). uv keeps
 //!   only the wheels its `requires-python` and environments can install, so
 //!   a release with any wheel that is not pure Python 3 is refused, as is a
 //!   lock whose `[options]` / `[tool.uv]` filter files (`exclude-newer`,
@@ -61,6 +65,12 @@ struct Hit {
 struct Shape {
     /// The one registry index they name.
     registry: String,
+    /// pylock: they record that registry in an `index` key (`uv export`
+    /// does, `uv pip compile` does not).
+    index: bool,
+    /// pylock: their `upload-time`s are whole seconds (uv truncates them
+    /// in pylock files; uv.lock keeps milliseconds).
+    whole_seconds: bool,
     /// Artifact table keys, in order (`url`, `hash`, `size`, …).
     keys: Vec<String>,
     /// `upload-time` is a TOML datetime (pylock), not a string (uv.lock).
@@ -293,6 +303,68 @@ fn lock_hits(
     hits
 }
 
+/// The registry a sibling package resolves from.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum SiblingRegistry<'a> {
+    /// Its `source = { registry }` (uv.lock) or `index` (pylock).
+    Named(&'a str),
+    /// A pylock entry with no `index` whose artifacts are all PyPI files.
+    PypiFiles,
+    /// A pylock entry with no `index` whose artifacts come from this host.
+    Files(String),
+}
+
+impl SiblingRegistry<'_> {
+    fn describe(&self) -> String {
+        match self {
+            Self::Named(r) => r.to_string(),
+            Self::PypiFiles => "PyPI files with no `index`".to_string(),
+            Self::Files(host) => format!("files on {host}"),
+        }
+    }
+}
+
+/// A package's `wheels` and `sdist` artifact tables.
+fn artifact_tables(package: &toml_edit::Table) -> impl Iterator<Item = &toml_edit::InlineTable> {
+    let wheels = package
+        .get("wheels")
+        .and_then(Item::as_array)
+        .into_iter()
+        .flat_map(|a| a.iter());
+    let sdist = package.get("sdist").and_then(Item::as_value);
+    wheels.chain(sdist).filter_map(Value::as_inline_table)
+}
+
+/// The lowercased host of `url`.
+fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority
+        .rsplit('@')
+        .next()
+        .unwrap_or(authority)
+        .to_ascii_lowercase()
+}
+
+/// Where a pylock entry without an `index` resolves from: PyPI when every
+/// artifact is a PyPI file (what `uv pip compile` writes for the default
+/// index); `None` for an entry with no registry artifacts (a `vcs`,
+/// `directory` or `archive` package).
+fn pylock_unindexed_registry(package: &toml_edit::Table) -> Option<SiblingRegistry<'static>> {
+    let urls: Vec<&str> = artifact_tables(package)
+        .filter_map(|a| a.get("url")?.as_str())
+        .collect();
+    let other = urls
+        .iter()
+        .map(|u| url_host(u))
+        .find(|host| host != "files.pythonhosted.org");
+    match (urls.is_empty(), other) {
+        (true, _) => None,
+        (false, None) => Some(SiblingRegistry::PypiFiles),
+        (false, Some(host)) => Some(SiblingRegistry::Files(host)),
+    }
+}
+
 /// The registry and artifact shape the lock's other registry packages show.
 fn lock_shape(
     doc: &DocumentMut,
@@ -305,21 +377,32 @@ fn lock_shape(
         .get(collection)
         .and_then(Item::as_array_of_tables)
         .ok_or("the lock has no package array")?;
-    let mut registries: BTreeSet<&str> = BTreeSet::new();
+    let mut registries: BTreeSet<SiblingRegistry> = BTreeSet::new();
     let mut shape: Option<(Vec<String>, bool, bool, Vec<String>)> = None;
+    let mut fractional_seconds = false;
     for (i, package) in packages.iter().enumerate() {
         if hit_indices.contains(&i) {
             continue;
         }
         let registry = if pep751 {
-            package.get("index").and_then(Item::as_str)
+            match package.get("index").and_then(Item::as_str) {
+                Some(index) => Some(SiblingRegistry::Named(index)),
+                None => pylock_unindexed_registry(package),
+            }
         } else {
-            UvSource::of(package).and_then(UvSource::registry)
+            UvSource::of(package)
+                .and_then(UvSource::registry)
+                .map(SiblingRegistry::Named)
         };
         let Some(registry) = registry else {
             continue;
         };
         registries.insert(registry);
+        fractional_seconds |= artifact_tables(package).any(|a| {
+            a.get("upload-time")
+                .and_then(Value::as_datetime)
+                .is_some_and(|t| t.to_string().contains('.'))
+        });
         if shape.is_some() {
             continue;
         }
@@ -342,24 +425,31 @@ fn lock_shape(
         let package_keys = package.iter().map(|(k, _)| k.to_string()).collect();
         shape = Some((keys, datetime, multiline, package_keys));
     }
-    let registry = match registries.len() {
-        0 => {
+    if registries.len() > 1 {
+        return Err(format!(
+            "the lock's packages come from several registries ({}); the entry's is \
+             ambiguous",
+            registries
+                .iter()
+                .map(SiblingRegistry::describe)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let (registry, index) = match registries.pop_first() {
+        None => {
             return Err(
                 "no sibling registry package shows the registry and artifact fields this uv \
                  release records"
                     .to_string(),
             )
         }
-        1 => registries
-            .into_iter()
-            .next()
-            .unwrap_or_default()
-            .to_string(),
-        _ => {
+        Some(SiblingRegistry::Named(registry)) => (registry.to_string(), true),
+        Some(SiblingRegistry::PypiFiles) => ("https://pypi.org/simple".to_string(), false),
+        Some(SiblingRegistry::Files(host)) => {
             return Err(format!(
-                "the lock's packages come from several registries ({}); the entry's is \
-                 ambiguous",
-                registries.into_iter().collect::<Vec<_>>().join(", ")
+                "the lock's packages record no `index` and carry files from {host}, which is \
+                 not PyPI, so its release files cannot be re-derived"
             ))
         }
     };
@@ -381,6 +471,8 @@ fn lock_shape(
     }
     Ok(Shape {
         registry,
+        index,
+        whole_seconds: pep751 && !fractional_seconds,
         keys,
         datetime,
         multiline,
@@ -388,14 +480,18 @@ fn lock_shape(
     })
 }
 
-/// uv's millisecond timestamp of a PyPI `upload_time_iso_8601`
-/// (`2023-10-17T17:46:21.184066Z` → `2023-10-17T17:46:21.184Z`; trailing
-/// fractional zeros are not printed).
-fn upload_time(iso: &str) -> Option<String> {
+/// uv's timestamp of a PyPI `upload_time_iso_8601`: milliseconds in
+/// uv.lock (`2023-10-17T17:46:21.184066Z` → `2023-10-17T17:46:21.184Z`;
+/// trailing fractional zeros are not printed), truncated to whole seconds
+/// in pylock files (`2023-10-17T17:46:21Z`).
+fn upload_time(iso: &str, whole_seconds: bool) -> Option<String> {
     let iso = iso.strip_suffix('Z')?;
     let (seconds, fraction) = iso.split_once('.').unwrap_or((iso, ""));
     if seconds.len() != 19 || !fraction.bytes().all(|b| b.is_ascii_digit()) {
         return None;
+    }
+    if whole_seconds {
+        return Some(format!("{seconds}Z"));
     }
     let mut millis: String = fraction.chars().take(3).collect();
     while millis.ends_with('0') {
@@ -425,7 +521,7 @@ fn render_artifact(file: &PypiFile, shape: &Shape) -> Result<String, String> {
                 let time = file
                     .upload_time
                     .as_deref()
-                    .and_then(upload_time)
+                    .and_then(|iso| upload_time(iso, shape.whole_seconds))
                     .ok_or_else(|| format!("PyPI reports no upload time for {}", file.filename))?;
                 if shape.datetime {
                     time
@@ -587,7 +683,9 @@ fn restore_pylock_entry(
         .and_then(|p| p.get_mut(hit.index))
         .ok_or("the package entry vanished")?;
     package.remove("archive");
-    package.insert("index", toml_edit::value(shape.registry.clone()));
+    if shape.index {
+        package.insert("index", toml_edit::value(shape.registry.clone()));
+    }
     if let Some(sdist) = sdist {
         package.insert("sdist", Item::Value(sdist));
     }
@@ -1127,6 +1225,12 @@ fn restore_metadata(meta: &mut Metadata, hit: &Hit, ctx: &Ctx<'_>) -> bool {
             uv.remove("sources");
         }
     }
+    // Adding a key to a header-less parent (one only implied by
+    // `[tool.uv.sources.<pkg>]` sub-tables) printed its header; once just
+    // sub-tables remain, the header is the rewrite's own bytes (#524).
+    if let Some(Item::Table(sources)) = uv.get_mut("sources") {
+        hide_header_over_sub_tables(sources);
+    }
     let mut removed = false;
     if let Some(index) = pushed {
         if let Some(overrides) = uv
@@ -1143,10 +1247,27 @@ fn restore_metadata(meta: &mut Metadata, hit: &Hit, ctx: &Ctx<'_>) -> bool {
     if uv.is_empty() {
         tool.remove("uv");
     }
+    if let Some(Item::Table(uv)) = tool.get_mut("uv") {
+        hide_header_over_sub_tables(uv);
+    }
     if tool.is_empty() {
         meta.doc.remove("tool");
     }
     removed
+}
+
+/// Make a standard table implicit again when it holds only sub-tables, so
+/// it renders as the `[parent.<sub>]` headers alone — the spelling it had
+/// before the hosted rewrite added (and restore removed) a key under it.
+fn hide_header_over_sub_tables(table: &mut toml_edit::Table) {
+    if !table.is_dotted()
+        && !table.is_empty()
+        && table
+            .iter()
+            .all(|(_, item)| matches!(item, Item::Table(t) if !t.is_dotted()))
+    {
+        table.set_implicit(true);
+    }
 }
 
 #[cfg(test)]
@@ -1156,22 +1277,35 @@ mod tests {
     #[test]
     fn upload_times_are_milliseconds_without_trailing_zeros() {
         assert_eq!(
-            upload_time("2023-10-17T17:46:21.184066Z").as_deref(),
+            upload_time("2023-10-17T17:46:21.184066Z", false).as_deref(),
             Some("2023-10-17T17:46:21.184Z")
         );
         assert_eq!(
-            upload_time("2023-10-17T17:46:21.100Z").as_deref(),
+            upload_time("2023-10-17T17:46:21.100Z", false).as_deref(),
             Some("2023-10-17T17:46:21.1Z")
         );
         assert_eq!(
-            upload_time("2023-10-17T17:46:21.000400Z").as_deref(),
+            upload_time("2023-10-17T17:46:21.000400Z", false).as_deref(),
             Some("2023-10-17T17:46:21Z")
         );
         assert_eq!(
-            upload_time("2023-10-17T17:46:21Z").as_deref(),
+            upload_time("2023-10-17T17:46:21Z", false).as_deref(),
             Some("2023-10-17T17:46:21Z")
         );
-        assert_eq!(upload_time("2023-10-17 17:46"), None);
+        assert_eq!(upload_time("2023-10-17 17:46", false), None);
+    }
+
+    #[test]
+    fn pylock_upload_times_truncate_to_whole_seconds() {
+        assert_eq!(
+            upload_time("2021-05-05T14:18:17.237000Z", true).as_deref(),
+            Some("2021-05-05T14:18:17Z")
+        );
+        assert_eq!(
+            upload_time("2021-05-05T14:18:18.999Z", true).as_deref(),
+            Some("2021-05-05T14:18:18Z")
+        );
+        assert_eq!(upload_time("2023-10-17 17:46", true), None);
     }
 
     #[test]
@@ -1186,6 +1320,88 @@ mod tests {
         assert!(spec_clauses("x===1.0").is_err());
         assert!(spec_clauses("x>=1.0+local").is_err());
         assert!(spec_clauses("x @ https://h/x.whl").is_err());
+    }
+
+    const HOSTED_SIX: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/g/e828efa5-5c6d-43f3-9909-03f5ac232b98/six-1.16.0-py2.py3-none-any.whl";
+
+    /// Hosted rewrite of `six` into `original`, then `restore_metadata`:
+    /// the pyproject must come back byte-identically (#524).
+    fn assert_metadata_round_trips(original: &str) {
+        use crate::utils::python_lock::ArtifactSource;
+        let rewritten = crate::utils::python_script::rewrite_project_metadata(
+            original,
+            "six",
+            "1.16.0",
+            ArtifactSource::Url(HOSTED_SIX),
+        )
+        .unwrap()
+        .expect("the rewrite adds a source");
+        assert!(rewritten.contains(HOSTED_SIX), "{rewritten}");
+        let mut meta = Metadata {
+            rel: "pyproject.toml".into(),
+            text: rewritten.clone(),
+            script: false,
+            doc: rewritten.parse().unwrap(),
+        };
+        let hit = Hit {
+            index: 0,
+            uuid: "e828efa5-5c6d-43f3-9909-03f5ac232b98".into(),
+            name: "six".into(),
+            version: "1.16.0".into(),
+        };
+        let client = super::super::UpstreamClient::new(true);
+        let ctx = Ctx {
+            client: &client,
+            origins: &[],
+            bun_lockb: false,
+        };
+        restore_metadata(&mut meta, &hit, &ctx);
+        assert_eq!(
+            meta.render().unwrap(),
+            original,
+            "rewritten was:\n{rewritten}"
+        );
+    }
+
+    const SUB_TABLE_SOURCES: &str = "[tool.uv.sources.idna]\nurl = \"https://files.pythonhosted.org/packages/e5/3e/idna-3.7-py3-none-any.whl\"\n";
+
+    #[test]
+    fn restore_drops_sources_header_made_explicit_over_sub_tables() {
+        assert_metadata_round_trips(&format!(
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\", \"idna==3.7\"]\n\n{SUB_TABLE_SOURCES}"
+        ));
+    }
+
+    #[test]
+    fn restore_drops_headers_made_explicit_over_sub_tables_transitive() {
+        // six is transitive, so the rewrite also adds an override under the
+        // header-less `[tool.uv]` parent.
+        assert_metadata_round_trips(&format!(
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"idna==3.7\"]\n\n{SUB_TABLE_SOURCES}"
+        ));
+    }
+
+    #[test]
+    fn restore_drops_sources_header_made_explicit_over_sub_tables_crlf() {
+        assert_metadata_round_trips(
+            &format!(
+                "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\", \"idna==3.7\"]\n\n{SUB_TABLE_SOURCES}"
+            )
+            .replace('\n', "\r\n"),
+        );
+    }
+
+    #[test]
+    fn restore_keeps_user_sources_spellings() {
+        let head = "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\", \"idna==3.7\"]\n\n";
+        for sources in [
+            "[tool.uv.sources]\nidna = { url = \"https://h/idna-3.7-py3-none-any.whl\" }\n",
+            "[tool.uv]\nsources.idna = { url = \"https://h/idna-3.7-py3-none-any.whl\" }\n",
+            "[tool.uv]\nsources.idna.url = \"https://h/idna-3.7-py3-none-any.whl\"\n",
+            "[tool.uv]\ndev-dependencies = []\n\n[tool.uv.sources.idna]\nurl = \"https://h/idna-3.7-py3-none-any.whl\"\n",
+        ] {
+            assert_metadata_round_trips(&format!("{head}{sources}"));
+        }
     }
 
     #[test]

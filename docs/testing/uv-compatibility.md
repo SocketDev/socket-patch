@@ -32,6 +32,13 @@ frozen, locked, and ordinary installation outcomes separately where supported.
 
 ## Limits
 
+- The installed env is the one uv syncs into. With `UV_PROJECT_ENVIRONMENT` set
+  (absolute, or relative to the project), the crawler uses that env in place of
+  `./.venv` or an activated `VIRTUAL_ENV`, as `uv sync` / `uv run` do. This
+  holds for a project with `uv.lock`, or a `pyproject.toml` that no other
+  manager's lock claims. Agent mode patches that env, and the hosted
+  stale-install warning and `vex` check it. Run the scan with the same
+  `UV_PROJECT_ENVIRONMENT` that `uv sync` used.
 - uv 0.0 has no native `uv.lock`; its compatibility lane is compiled requirements.
   `uv pip sync` rejects the bare local wheel paths emitted by vendored
   requirements through uv 0.1.23 (`Unexpected '.', expected '-c', '-e', '-r'
