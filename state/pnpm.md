@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-02 (run 7), main `61cfb9b` (#365, #414 merged), latest release 4.0.0.
+Last updated: 2026-10-02 (run 8), main `61cfb9b` (#365, #414 merged), latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, package grant, hosted tarball, `/registry/<name>/<ver>` mirror). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -48,6 +48,20 @@ Run 7 additions (main `61cfb9b`, Linux):
 | 11.28.3 | untested | pass | untested | untested / pass | untested | untested |
 | 12.8.1 | pass | pass | pass | pass / pass | pass | untested |
 
+Run 8 additions (main `61cfb9b`, Linux):
+
+| pnpm (lock) | Agent: hoisted + npm alias (two copies) | Agent: patchedDependencies instance | Hosted: patchedDependencies (other file / same file) | Hosted: scoped pkg | Agent: import-method copy / hardlink, hoisted, alias | Vendored: legacy lock | Hosted: legacy workspace (member dep) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 5.18.10 (5.2) / 6.35.1 (5.3) | untested | untested | untested | untested | untested | pass (loud `vendor_lockfile_version_unsupported`) | untested |
+| 7.33.7 (5.4) | untested | pass | untested | pass | pass | pass; moved checkout: documented recovery + byte-exact rollback; workspace refused as documented | pass |
+| 8.15.9 (6.0) | untested | pass | pass / pass | pass | untested | pass, same as 7 | pass |
+| 9.15.9 | fail #356 | pass | pass / pass (vex declines same-file) | pass | untested | n/a | n/a |
+| 10.34.5 | fail #356 | pass | pass / pass | untested | pass | n/a | n/a |
+| 11.28.3 | untested | n/a (package.json field ignored) | pass / pass | untested | pass | n/a | n/a |
+| 12.8.1 | fail #356 | n/a (package.json field ignored) | pass / pass | pass | untested | n/a | n/a |
+
+Default isolated linker + alias: pass on 7.33.7 / 9.15.9 / 10.34.5 / 11.28.3 / 12.8.1 (one shared `.pnpm` copy).
+
 #492 also reproduces on pnpm 7.33.7 (there's no root lock at all, only `redirect_pnpm_no_lockfile`).
 
 Hosted `--frozen-lockfile [--offline]` over an upstream `node_modules` or warm store (run 5): VEX stays honest on 9.15.9 / 10.34.5 / 11.28.3 / 12.8.1 (pass).
@@ -68,12 +82,12 @@ Global mode (`-g`, v5 main `2463257`):
 ## Backlog
 
 0. **Maintainer request (global `-g` mode):** the Linux cells are done. Still to do: macOS and Windows (corepack, standalone and npm-installed pnpm; `PNPM_HOME` with spaces or unicode; Windows `%LOCALAPPDATA%\pnpm`), and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry. Needs a probe branch.
-1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1 and 3, and was denied by the permission policy in runs 2, 5, 6 and 7, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
-2. Rush follow-ups: subspaces (`common/config/subspaces/*`), Rush + pnpm 10, and re-verify #518 when it's fixed.
-3. Re-verify #492 (also with rollback and vex once member locks are pinned) and #466 (both the `packageManager` and the `configDependencies` triggers) when fixes land.
-4. Agent: `package-import-method=clone|copy`; aliases, peers and injected deps on pnpm 7 / 10 / 11.
-5. Vendored on legacy locks (pnpm ≤ 6), and vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout).
-6. Re-verify #360, #361, the global-virtual-store half of #362, and #435 when fixes land.
+1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1 and 3, and was denied by the permission policy in runs 2 and 5–8, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
+2. Re-verify #518 (with #493) when draft PR #520 lands. Then Rush subspaces (`common/config/subspaces/*`) and Rush + pnpm 10.
+3. Agent hoisted with nested duplicate copies (the pnpm side of #516), and `package-import-method=clone` on a reflink filesystem (needs CI).
+4. Hosted on 11/12 with `patchedDependencies` plus catalogs plus `configDependencies` together, and `pnpm patch-commit` after a hosted pin.
+5. Re-verify #492 (also with rollback and vex once member locks are pinned), #466 (both triggers), #360, #361, the global-virtual-store half of #362, and #435 when fixes land.
+6. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout).
 
 ## Known non-bugs
 
@@ -97,3 +111,7 @@ Global mode (`-g`, v5 main `2463257`):
 - `rush update --full` re-resolves the Rush lock and drops the hosted pin, like `pnpm update`. VEX then honestly reports nothing to attest.
 - pnpm 9.15.9's frozen install fails on its own unmodified lock when a workspace uses `dependenciesMeta.injected` ("importer dependencies meta (undefined) doesn't match"). That's upstream pnpm, not socket-patch.
 - Old pnpm needs an old Node (≤ 6 needs Node 16, ≤ 2 needs Node 10), and pnpm 3 takes `--store` rather than `--store-dir`. Fixture notes.
+- Agent apply over a pnpm `patchedDependencies` edit to the same file overwrites it with the verified patched content and warns `content_mismatch_overwritten` (documented default mismatch policy; `--strict` refuses). Hosted composes both patches, and `vex` then declines (`no_applicable_patches`), because the file matches neither hash.
+- Hosted on pnpm 11/12 respects an explicit `trustLockfile: false` (any YAML spelling) and warns `redirect_pnpm_trust_lockfile` with the remedy. The following frozen install fails, which is documented.
+- Vendored refuses pnpm ≤ 6 locks (5.x up to 5.3) with `vendor_lockfile_version_unsupported`, and pnpm 7/8 workspace locks with `vendor_lock_entry_unsupported`. pnpm 7/8 vendored locks carry an absolute `file:` specifier (`vendor_pnpm_legacy_absolute_specifier`), so a moved checkout needs `pnpm install --offline --no-frozen-lockfile` once. Both are documented.
+- pnpm 11+ ignores `package.json` `pnpm.patchedDependencies`. Put it in `pnpm-workspace.yaml`.
