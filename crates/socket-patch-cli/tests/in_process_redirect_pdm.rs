@@ -187,7 +187,9 @@ async fn mock_api(server: &MockServer) {
         .mount(server)
         .await;
     Mock::given(method("GET"))
-        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
                 "uuid": UUID, "purl": RECORD_PURL,
@@ -368,9 +370,12 @@ fn legacy_record(view: &serde_json::Value) -> serde_json::Value {
         .remove("publishedAt")
         .unwrap_or_else(|| serde_json::json!("2024-01-01T00:00:00Z"));
     obj.insert("exportedAt".to_string(), exported);
-    obj.entry("description").or_insert_with(|| serde_json::json!("x"));
-    obj.entry("license").or_insert_with(|| serde_json::json!("MIT"));
-    obj.entry("tier").or_insert_with(|| serde_json::json!("free"));
+    obj.entry("description")
+        .or_insert_with(|| serde_json::json!("x"));
+    obj.entry("license")
+        .or_insert_with(|| serde_json::json!("MIT"));
+    obj.entry("tier")
+        .or_insert_with(|| serde_json::json!("free"));
     record
 }
 
@@ -441,7 +446,11 @@ async fn lock_only_pdm_project_redirects_attests_rescans_and_rolls_back() {
     // 2. Idempotent re-scan: no further edits, lock byte-identical.
     let code = run(hosted_args(tmp.path(), server.uri(), None)).await;
     assert_eq!(code, 0);
-    assert_eq!(read(&lock_path), redirected, "re-scan must not touch the lock");
+    assert_eq!(
+        read(&lock_path),
+        redirected,
+        "re-scan must not touch the lock"
+    );
 
     // 3. The committed state, manifest-less, attests (and only while wired).
     assert_manifestless_vex(tmp.path(), LOCK);
@@ -494,12 +503,19 @@ async fn hatchling_build_backend_does_not_veto_the_pdm_lock_redirect() {
         .iter()
         .filter(|r| r.url.path().ends_with(&format!("/patches/view/{UUID}")))
         .count();
-    assert_eq!(views, 1, "the pdm redirect must be confirmed despite the hatch backend");
+    assert_eq!(
+        views, 1,
+        "the pdm redirect must be confirmed despite the hatch backend"
+    );
     assert_manifestless_vex(tmp.path(), LOCK);
 
     let code = rollback_hosted(tmp.path(), &server).await;
     assert_eq!(code, 0, "rollback must succeed");
-    assert_eq!(read(&lock_path), LOCK, "rollback must restore the pristine lock");
+    assert_eq!(
+        read(&lock_path),
+        LOCK,
+        "rollback must restore the pristine lock"
+    );
 }
 
 /// The legacy `[metadata.files]` lock (lock_version 2) redirects the package
