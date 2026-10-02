@@ -27,6 +27,10 @@ use sha2::{Digest, Sha256};
 /// `#[path = "common/cache_env.rs"] mod cache_env;`.
 pub mod cache_env;
 
+/// JVM build-tool env scrub + stand-in home for the CLI children (shared
+/// with `prebuilt_common`).
+pub mod jvm_env;
+
 // ── Binary discovery + invocation ─────────────────────────────────────
 
 /// Absolute path to the built `socket-patch` binary that cargo
@@ -135,6 +139,10 @@ pub fn run_bin_with_env(
     // this force-set is the layer that holds there. Notifier tests opt back
     // in via caller env (which lands last).
     cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
+    // No ambient Gradle / JVM options and no real home: the JVM crawlers
+    // would otherwise read the developer's `~/.gradle` / `~/.m2` (and any
+    // `GRADLE_USER_HOME` / `GRADLE_RO_DEP_CACHE`) into every test.
+    jvm_env::isolate_cli(&mut cmd);
     // Caller-supplied env lands last so explicit injections (runtime
     // gates, discovery roots) survive the scrub.
     for (k, v) in env {
