@@ -364,18 +364,36 @@ mod tests {
             Some(&with_registries)
         ));
         let alias = opts(r#"{"default-registry-alias":"corp","registries":{"corp":"https://c/"}}"#);
-        assert!(records_url(DepIdEra::Tilde, "corp", "left-pad", &[], Some(&alias)));
+        assert!(records_url(
+            DepIdEra::Tilde,
+            "corp",
+            "left-pad",
+            &[],
+            Some(&alias)
+        ));
         // A recorded `registry` the node resolves under: vlt (rc.33 … 1.2.0
         // with `config.registry`) writes no slot [3].
         let configured = opts(
             r#"{"registry":"http://127.0.0.1:4873/","registries":{"npm":"http://127.0.0.1:4873/"}}"#,
         );
-        assert!(!records_url(DepIdEra::Tilde, "npm", "left-pad", &[], Some(&configured)));
+        assert!(!records_url(
+            DepIdEra::Tilde,
+            "npm",
+            "left-pad",
+            &[],
+            Some(&configured)
+        ));
         // ...but a node on another registry than the configured one does.
         let elsewhere = opts(
             r#"{"registry":"https://registry.npmjs.org/","registries":{"npm":"http://127.0.0.1:4873/"}}"#,
         );
-        assert!(records_url(DepIdEra::Tilde, "npm", "left-pad", &[], Some(&elsewhere)));
+        assert!(records_url(
+            DepIdEra::Tilde,
+            "npm",
+            "left-pad",
+            &[],
+            Some(&elsewhere)
+        ));
     }
 
     use super::super::{restore_upstream, RestoreOptions, RestoreOutcome};
@@ -556,12 +574,16 @@ mod tests {
             let text = format!(
                 "{{\n  \"lockfileVersion\": 1,\n  \"options\": {SCOPED_REGISTRY_OPTIONS},\n  \"nodes\": {{\n    \"~npm~@s+a@1.0.0\": [0,\"@s/a\",\"sha512-AA==\",\"{url}\"]{sibling}\n  }},\n  \"edges\": {{}}\n}}\n"
             );
-            let (outcome, after) =
-                run(&text, &[pin("pkg:npm/@s/a@1.0.0", LP_UUID)], false).await;
+            let (outcome, after) = run(&text, &[pin("pkg:npm/@s/a@1.0.0", LP_UUID)], false).await;
             assert!(refused(&outcome).is_empty(), "{:?}", refused(&outcome));
             let after: Value = serde_json::from_str(&after).unwrap();
             let expected = if records_url {
-                serde_json::json!([0, "@s/a", LP_UPSTREAM, "https://a.example/@s/a/-/a-1.0.0.tgz"])
+                serde_json::json!([
+                    0,
+                    "@s/a",
+                    LP_UPSTREAM,
+                    "https://a.example/@s/a/-/a-1.0.0.tgz"
+                ])
             } else {
                 // The scoped URL is under options.registry, even though
                 // registries.npm names a different base: vlt omits slot 3.

@@ -452,6 +452,7 @@ pub(crate) fn default_registry_alias(options: Option<&Map<String, Value>>) -> Op
 ///   else the default alias's `options.registries` URL, else the public
 ///   npm registry (`registry ?? registries[default-registry-alias]`);
 /// - any other segment is `None`: the lock names an alias it never maps.
+///
 /// Once the segment resolves, a configured scope registry takes precedence,
 /// including in a named/URL registry spec's final subspec. Unknown aliases
 /// still fail before scope lookup, as `hydrateTuple` does.
@@ -473,21 +474,20 @@ pub(crate) fn registry_base(
                 .and_then(|r| r.get(alias)),
         )
     };
-    let base = if reqwest::Url::parse(segment)
-        .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
-    {
-        with_trailing_slash(segment)
-    } else if let Some(base) = Some(segment).filter(|s| !s.is_empty()).and_then(alias_url) {
-        base
-    } else if is_default_registry(segment, options) {
-        string(options.and_then(|o| o.get("registry")))
-            .or_else(|| default_registry_alias(options).and_then(alias_url))
-            .unwrap_or_else(|| {
-                with_trailing_slash(crate::vendor::registry_fetch::DEFAULT_NPM_REGISTRY)
-            })
-    } else {
-        return None;
-    };
+    let base =
+        if reqwest::Url::parse(segment).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
+            with_trailing_slash(segment)
+        } else if let Some(base) = Some(segment).filter(|s| !s.is_empty()).and_then(alias_url) {
+            base
+        } else if is_default_registry(segment, options) {
+            string(options.and_then(|o| o.get("registry")))
+                .or_else(|| default_registry_alias(options).and_then(alias_url))
+                .unwrap_or_else(|| {
+                    with_trailing_slash(crate::vendor::registry_fetch::DEFAULT_NPM_REGISTRY)
+                })
+        } else {
+            return None;
+        };
     name.split_once('/')
         .map(|(scope, _)| scope)
         .filter(|scope| scope.starts_with('@'))
@@ -1817,7 +1817,10 @@ mod tests {
             ("", "https://a.example/"),
             ("npm", "https://b.example/"),
             ("corp", "https://corp.example/"),
-            ("https://explicit.example/npm", "https://explicit.example/npm/"),
+            (
+                "https://explicit.example/npm",
+                "https://explicit.example/npm/",
+            ),
         ] {
             assert_eq!(
                 registry_base(segment, "@s/a", Some(&opts)).as_deref(),
