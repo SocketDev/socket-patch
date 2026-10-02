@@ -537,6 +537,21 @@ fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn T
     drifted
 }
 
+/// Whether `live` still holds at least one field exactly as the vendoring
+/// wrote it. A table paired only by its name (a requirement's identity
+/// ignores `specifier`) may be a namesake the user added after removing
+/// the vendored row: filling the original fields into that one would
+/// rewrite the user's entry and report a clean revert.
+fn keeps_a_vendored_field(
+    live: &dyn TableLike,
+    original: &dyn TableLike,
+    new: &dyn TableLike,
+) -> bool {
+    new.iter().any(|(key, after)| {
+        !equal_item(original.get(key), Some(after)) && equal_item(live.get(key), Some(after))
+    })
+}
+
 /// `original` in place of `live`, keeping the live element's own spacing
 /// and comments unless they are still the vendored ones.
 fn replace_value(live: &mut Value, original: &Value, new: &Value) {
@@ -594,6 +609,16 @@ fn restore_value(live: &mut Value, original: &Value, new: &Value) -> bool {
             }
             if bare_value(current) == bare_value(new[index]) {
                 replace_value(current, original[index], new[index]);
+            } else if let (Some(live), Some(before), Some(after)) = (
+                current.as_inline_table(),
+                original[index].as_inline_table(),
+                new[index].as_inline_table(),
+            ) {
+                if !keeps_a_vendored_field(live, before, after) {
+                    drifted = true;
+                    continue;
+                }
+                drifted |= restore_value(current, original[index], new[index]);
             } else {
                 drifted |= restore_value(current, original[index], new[index]);
             }
@@ -651,6 +676,10 @@ fn restore_item(live: &mut Item, original: &Item, new: &Item) -> bool {
         for (slot, index) in pairs {
             let current = live.get_mut(slot).expect("paired slot is in range");
             if bare_table(current) == bare_table(original[index]) {
+                continue;
+            }
+            if !keeps_a_vendored_field(current, original[index], new[index]) {
+                drifted = true;
                 continue;
             }
             drifted |= restore_table(current, original[index], new[index]);
@@ -1049,6 +1078,41 @@ mod tests {
         let (restored, drifted) = restore_document(&live, original, &new).unwrap();
         assert!(!drifted, "{restored}");
         assert_eq!(restored, add_idna(original));
+    }
+
+    /// Bugbot on #481: with the vendored row removed, a namesake the user
+    /// added (identity ignores `specifier`) must not be filled in with the
+    /// original fields and reported as a clean revert.
+    #[test]
+    fn removed_vendored_table_does_not_restore_into_a_namesake() {
+        let original =
+            "requirements = [{ name = \"one\" }, { name = \"six\", specifier = \"==1.16.0\" }]\n";
+        let new = "requirements = [{ name = \"one\" }, { name = \"six\", path = \".socket/vendor/pypi/u/six.whl\" }]\n";
+        for live in [
+            "requirements = [{ name = \"one\" }, { name = \"six\" }]\n",
+            "requirements = [{ name = \"one\" }, { name = \"six\", marker = \"python_version >= '3.8'\" }]\n",
+        ] {
+            let (restored, drifted) = restore_document(live, original, new).unwrap();
+            assert!(drifted, "{live}");
+            assert_eq!(restored, live);
+        }
+        let tables = |six: &str| {
+            format!("[[package]]\nname = \"one\"\n\n[[package]]\nname = \"six\"\n{six}")
+        };
+        let original = tables("specifier = \"==1.16.0\"\n");
+        let new = tables("path = \".socket/vendor/pypi/u/six.whl\"\n");
+        let live = tables("");
+        let (restored, drifted) = restore_document(&live, &original, &new).unwrap();
+        assert!(drifted);
+        assert_eq!(restored, live);
+        // The vendored row itself, edited only elsewhere, still reverts.
+        let live = tables("path = \".socket/vendor/pypi/u/six.whl\"\nmarker = \"x\"\n");
+        let (restored, drifted) = restore_document(&live, &original, &new).unwrap();
+        assert!(!drifted, "{restored}");
+        assert_eq!(
+            restored,
+            tables("marker = \"x\"\nspecifier = \"==1.16.0\"\n")
+        );
     }
 
     /// Review on #481: an added copy of the vendored element survives the
