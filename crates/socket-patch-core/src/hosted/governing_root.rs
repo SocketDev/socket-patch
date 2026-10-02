@@ -99,10 +99,10 @@ async fn cargo_member_refusal(root: &Path) -> Option<Refusal> {
 /// The `pnpm-lock.yaml` pnpm reads for a project directory that holds no
 /// npm-family lock of its own, when it lives elsewhere and exists:
 ///
-/// 1. a `lockfile-dir` in the project's `.npmrc`, or `lockfileDir` in its
-///    `pnpm-workspace.yaml`, naming another directory;
-/// 2. otherwise the nearest ancestor holding `pnpm-workspace.yaml` (pnpm's
-///    workspace root lookup), when the project has none of its own.
+/// The nearest `pnpm-workspace.yaml` supplies `lockfileDir`, ahead of the
+/// project's `.npmrc` and then the workspace root's `.npmrc`. A configured
+/// relative directory is resolved from the invocation cwd, as pnpm does;
+/// without an override, the workspace's lock lives at its root.
 async fn pnpm_lock_elsewhere(root: &Path) -> Option<PathBuf> {
     let has_own_lock = OWN_LOCKS
         .iter()
@@ -117,31 +117,49 @@ async fn pnpm_lock_elsewhere(root: &Path) -> Option<PathBuf> {
         .await
         .unwrap_or_else(|_| root.to_path_buf());
 
-    let workspace_yaml = read_regular_to_string(&root.join(PNPM_WORKSPACE))
-        .await
-        .ok();
-    let configured = match read_regular_to_string(&root.join(".npmrc")).await {
-        Ok(npmrc) => npmrc_top_level_value(&npmrc, "lockfile-dir"),
-        Err(_) => None,
+    let mut workspace = None;
+    for ancestor in canonical.ancestors() {
+        let path = ancestor.join(PNPM_WORKSPACE);
+        if let Ok(yaml) = read_regular_to_string(&path).await {
+            workspace = Some((ancestor.to_path_buf(), yaml));
+            break;
+        }
+        if ancestor == canonical && path.exists() {
+            // An unreadable local workspace file still bounds the project.
+            break;
+        }
     }
-    .or_else(|| workspace_yaml.as_deref().and_then(workspace_lockfile_dir));
+
+    // Native pnpm 10: workspace YAML beats both npmrc files; the member's
+    // npmrc beats the workspace root's. A member inherits root npmrc settings
+    // even when its own directory has no pnpm-workspace.yaml.
+    let mut configured = workspace
+        .as_ref()
+        .and_then(|(_, yaml)| workspace_lockfile_dir(yaml));
+    if configured.is_none() {
+        configured = npmrc_lockfile_dir(&canonical).await;
+    }
+    if configured.is_none() {
+        if let Some((workspace_root, _)) = &workspace {
+            if workspace_root != &canonical {
+                configured = npmrc_lockfile_dir(workspace_root).await;
+            }
+        }
+    }
     if let Some(dir) = configured {
+        // Even an inherited relative override is based on the invocation
+        // directory, not on the directory containing the setting.
         return lock_elsewhere(&canonical, &canonical, &dir).await;
     }
-    if workspace_yaml.is_some() || root.join(PNPM_WORKSPACE).exists() {
-        // The project is its own workspace root.
-        return None;
-    }
-    for ancestor in canonical.ancestors().skip(1) {
-        let Ok(yaml) = read_regular_to_string(&ancestor.join(PNPM_WORKSPACE)).await else {
-            continue;
-        };
-        // The workspace root may relocate the lock with its own
-        // `lockfileDir`, relative to the root.
-        let dir = workspace_lockfile_dir(&yaml).unwrap_or_else(|| ".".to_string());
-        return lock_elsewhere(&canonical, ancestor, &dir).await;
+    if let Some((workspace_root, _)) = workspace {
+        return lock_elsewhere(&canonical, &workspace_root, ".").await;
     }
     None
+}
+
+async fn npmrc_lockfile_dir(root: &Path) -> Option<String> {
+    let npmrc = read_regular_to_string(&root.join(".npmrc")).await.ok()?;
+    npmrc_top_level_value(&npmrc, "lockfile-dir")
 }
 
 /// `<base>/<dir>/pnpm-lock.yaml` when it exists and `<base>/<dir>` is not
@@ -286,12 +304,16 @@ mod tests {
         assert_eq!(code(tmp.path(), "npm").await, None);
     }
 
-    /// A workspace root that relocates its lock with `lockfileDir` still
-    /// governs its members (Bugbot on #598).
+    /// An inherited relative `lockfileDir` is resolved from the member cwd,
+    /// verified with native pnpm, rather than from the workspace root.
     #[tokio::test]
     async fn pnpm_member_of_workspace_with_relocated_lock_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
-        write(tmp.path(), "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        write(
+            tmp.path(),
+            "ws/packages/pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n",
+        );
         write(
             tmp.path(),
             "ws/pnpm-workspace.yaml",
@@ -303,6 +325,71 @@ mod tests {
             code(&member, "npm").await.as_deref(),
             Some(PNPM_LOCKFILE_ELSEWHERE)
         );
+    }
+
+    #[tokio::test]
+    async fn pnpm_config_precedence_matches_native_workspace_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        let member = root.join("packages/a");
+        write(&root, "packages/a/package.json", "{}");
+        write(&root, PNPM_LOCK, "lockfileVersion: '9.0'\n");
+        for dir in ["yaml-locks", "root-rc-locks", "member-rc-locks"] {
+            write(
+                tmp.path(),
+                &format!("{dir}/{PNPM_LOCK}"),
+                "lockfileVersion: '9.0'\n",
+            );
+        }
+        let yaml_lock = tmp.path().join("yaml-locks");
+        let root_rc_lock = tmp.path().join("root-rc-locks");
+        let member_rc_lock = tmp.path().join("member-rc-locks");
+        write(
+            &root,
+            PNPM_WORKSPACE,
+            &format!(
+                "packages:\n  - packages/*\nlockfileDir: '{}'\n",
+                yaml_lock.display()
+            ),
+        );
+        write(
+            &root,
+            ".npmrc",
+            &format!("lockfile-dir={}\n", root_rc_lock.display()),
+        );
+        write(
+            &member,
+            ".npmrc",
+            &format!("lockfile-dir={}\n", member_rc_lock.display()),
+        );
+        for expected in [&yaml_lock, &member_rc_lock, &root_rc_lock, &root] {
+            let found = pnpm_lock_elsewhere(&member).await.expect("governing lock");
+            assert_eq!(
+                std::fs::canonicalize(found).unwrap(),
+                std::fs::canonicalize(expected.join(PNPM_LOCK)).unwrap()
+            );
+            if expected == &yaml_lock {
+                write(&root, PNPM_WORKSPACE, "packages:\n  - packages/*\n");
+            } else if expected == &member_rc_lock {
+                std::fs::remove_file(member.join(".npmrc")).unwrap();
+            } else if expected == &root_rc_lock {
+                std::fs::remove_file(root.join(".npmrc")).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pnpm_member_own_workspace_bounds_ancestor_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), PNPM_WORKSPACE, "packages:\n  - packages/*\n");
+        write(tmp.path(), PNPM_LOCK, "lockfileVersion: '9.0'\n");
+        write(tmp.path(), "packages/a/package.json", "{}");
+        write(
+            tmp.path(),
+            "packages/a/pnpm-workspace.yaml",
+            "packages: []\n",
+        );
+        assert_eq!(code(&tmp.path().join("packages/a"), "npm").await, None);
     }
 
     /// #417: a cargo workspace member is refused with the vendored code; the

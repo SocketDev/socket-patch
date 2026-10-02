@@ -1264,3 +1264,68 @@ async fn hosted_scan_with_pnpm_lockfile_dir_elsewhere_refuses() {
     let (code, doc) = run_hosted_json(&proj, &server.uri());
     assert_refused_lock_elsewhere(code, &doc, &lock, &before, &proj);
 }
+
+/// pnpm inherits workspace-root config even when
+/// invoked from a member. Absolute npmrc paths isolate inheritance; relative
+/// YAML paths are resolved from the member cwd by pnpm 10.34.5 itself.
+async fn assert_workspace_configured_lock_refused(case: &str) {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    let member = write_pnpm_workspace(&root);
+    let lock_dir = if case == "root-npmrc-absolute" {
+        let dir = tmp.path().join("locks");
+        std::fs::write(
+            root.join(".npmrc"),
+            format!("lockfile-dir={}\n", dir.display()),
+        )
+        .unwrap();
+        dir
+    } else if case == "root-yaml-relative" {
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\nlockfileDir: ../locks\n",
+        )
+        .unwrap();
+        root.join("packages/locks")
+    } else {
+        let dir = tmp.path().join("yaml-locks");
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            format!(
+                "packages:\n  - packages/*\nlockfileDir: {}\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(member.join(".npmrc"), "lockfile-dir=../unused-locks\n").unwrap();
+        dir
+    };
+    std::fs::create_dir_all(&lock_dir).unwrap();
+    let lock = lock_dir.join("pnpm-lock.yaml");
+    std::fs::rename(root.join("pnpm-lock.yaml"), &lock).unwrap();
+    let before = std::fs::read_to_string(&lock).unwrap();
+    let (code, doc) = run_hosted_json(&member, &server.uri());
+    assert_refused_lock_elsewhere(code, &doc, &lock, &before, &member);
+}
+
+#[tokio::test]
+#[serial]
+async fn hosted_scan_inherits_workspace_npmrc_lockfile_dir() {
+    assert_workspace_configured_lock_refused("root-npmrc-absolute").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn hosted_scan_resolves_inherited_lockfile_dir_from_cwd() {
+    assert_workspace_configured_lock_refused("root-yaml-relative").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn hosted_scan_workspace_yaml_overrides_member_npmrc() {
+    assert_workspace_configured_lock_refused("root-yaml-precedence").await;
+}
