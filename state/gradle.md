@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Gradle bug-hunt routine (label pm:gradle).
 
-Last updated: 2026-10-02 (run 8), main `61cfb9b` (no Gradle code changes since `2463257` / #277), latest release v4.0.0. #461 and #487 were re-confirmed on `61cfb9b`, and #428 on `9d718cf`. Run 8 filed #551.
+Last updated: 2026-10-02 (run 9), main `bf0e0d1` (no Gradle/JVM code changes since `2463257` / #277), latest release v4.0.0. #551 was re-confirmed on `bf0e0d1`, #461 and #487 on `61cfb9b`, and #428 on `9d718cf`. Run 8 filed #551; run 9 filed nothing.
 
 ## Coverage matrix
 
@@ -52,9 +52,16 @@ Last updated: 2026-10-02 (run 8), main `61cfb9b` (no Gradle code changes since `
 | 9.8.0 (21) | **fail #533** | **fail #533** | untested | untested | untested |
 | 6.9.4 / 7.6.6, macOS, Windows | untested | untested | untested | untested | untested |
 
+**Vendored vs corporate init scripts, run 9 (Linux, 8.14.3, fresh clone).**
+- Gradle-docs enterprise-repository plugin (removes non-mirror repos): pass (fail-closed, exclusivity survives the removal).
+- `afterEvaluate { repositories.clear() }`: pass (fail-closed). `repositories.clear()` before the build script: pass (patched).
+- Repositories only from init.d (`allprojects`, `settingsEvaluated` / `beforeSettings` → settings DRM): pass (patched).
+- Gradle 6 / 7 / 9, macOS, Windows: untested.
+
 **Agent mode, run 8 (Linux, 8.14.3).**
 - Gradle-only project (`mavenCentral()`) with the same GAV in `~/.m2`: `apply` patches m2, `vex` says `not_affected`, and the build uses the unpatched cache jar. **fail #551**.
 - The same with `mavenLocal()` first (+ `-Dmaven.repo.local`): pass (control).
+- Re-confirmed on `bf0e0d1` (run 9), after #486's shared-store refusal: still **fail #551**.
 - `apply --global-prefix …/modules-2/files-2.1`: loud `package_not_installed`, exit 1 (pass, fail-loud; #349 layout gap).
 - macOS / Windows, Gradle 6 / 7 / 9: untested.
 
@@ -71,7 +78,8 @@ Last updated: 2026-10-02 (run 8), main `61cfb9b` (no Gradle code changes since `
 3. #511 with a transitive range from a dependency's POM, and with catalog `strictly` / `prefer`.
 4. The hosted snippet in its suffixed form, with the dependency bumped and then `vendor`. Check the result and VEX. Also the hosted snippet plus a classifier dependency (the hosted analogue of #533).
 5. Agent `apply` + `vex` when `GRADLE_USER_HOME` and `~/.m2` hold different versions (a #551 variant).
-6. Re-test #347, #348, #349, #395, #396, #428, #429, #461, #487, #511, #533 and #551 when `vendor/jvm/`, `maven_crawler.rs` or `gradle_snippet` change.
+6. The run 9 init-script cells on Gradle 6.9.4 / 9.8.0.
+7. Re-test #347, #348, #349, #395, #396, #428, #429, #461, #487, #511, #533 and #551 when `vendor/jvm/`, `maven_crawler.rs` or `gradle_snippet` change.
 
 ## Known non-bugs
 - The sandbox can't reach the Socket API. For vendored, use `prebuilt_common::prepare_command` + a staged manifest/blob (see the run 3 entry). For hosted, use the wiremock shaped like `e2e_redirect_maven_build`.
@@ -97,3 +105,5 @@ Last updated: 2026-10-02 (run 8), main `61cfb9b` (no Gradle code changes since `
 - A `mvn`-seeded `file://` m2 has no `maven-metadata.xml`, so range or dynamic-version cells fail before vendoring too. Use real Central for those.
 - A `gradle.lockfile` written before vendoring masks #511: the range resolves to the locked, vendored version (run 7).
 - Gradle's `mavenLocal()` ignores the `MAVEN_REPO_LOCAL` env var. It uses `-Dmaven.repo.local` or settings.xml, so a harness must pass the system property (run 8).
+- A repository-stripping corporate init script (the Gradle-docs enterprise plugin, or `repositories.clear()`) doesn't make vendored Gradle fail open. Gradle keeps the exclusiveContent exclusivity after the vendored repository is removed, so the build fails loudly (run 9).
+- In init scripts, compare repository URLs via `File.toURI()`, not `file://` strings: Gradle normalizes `file:///x` to `file:/x/` (run 9 harness note).
