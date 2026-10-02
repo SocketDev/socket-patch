@@ -43,8 +43,9 @@
 //!   the manifest's last line produces the same bytes. The block and entry
 //!   are removed only when that is provable: an option-less block the
 //!   rewriter could not have written in place (a blank line before it —
-//!   the in-place match swallows every blank line before the declaration)
-//!   that another locked spec depends on. Otherwise the gem is kept as a
+//!   the in-place match swallows every blank line before the declaration,
+//!   and the append always writes one; it goes with the block) that
+//!   another locked spec depends on. Otherwise the gem is kept as a
 //!   direct pin: a stray exact pin installs the same bytes, while dropping
 //!   a real declaration would stop `Bundler.require` loading the gem.
 //! * a `CHECKSUMS` entry the rewriter ADDED is only recognizable next to
@@ -521,10 +522,26 @@ enum Decl {
     Direct(String),
 }
 
+/// Byte offset of the start of the line before byte `at` (`at` itself at
+/// the start of the text).
+fn line_before_start(text: &str, at: usize) -> usize {
+    match text[..at].strip_suffix('\n') {
+        Some(before) => before.rfind('\n').map_or(0, |i| i + 1),
+        None => at,
+    }
+}
+
 fn restore_manifest(text: &str, block: &Block, gem: &Gem<'_>, decl: &Decl) -> String {
     let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut start = block.start;
     let replacement = match decl {
-        Decl::Transitive => String::new(),
+        // The append's own blank separator goes with it.
+        Decl::Transitive => {
+            if provably_appended(text, block) {
+                start = line_before_start(text, block.start);
+            }
+            String::new()
+        }
         Decl::Direct(args) => {
             let opts = block
                 .opts
@@ -543,11 +560,7 @@ fn restore_manifest(text: &str, block: &Block, gem: &Gem<'_>, decl: &Decl) -> St
             )
         }
     };
-    format!(
-        "{}{replacement}{}",
-        &text[..block.start],
-        &text[block.end..]
-    )
+    format!("{}{replacement}{}", &text[..start], &text[block.end..])
 }
 
 /// The manifest's global `source "<url>"` declarations (no block).
@@ -898,12 +911,17 @@ mod tests {
             run(&t, &direct),
             "source \"https://rubygems.org\"\r\ngem \"puma\"\r\ngem \"rails\", \"7.0.0\"\r\n"
         );
-        // Transitive append removed; mixed-state constraint kept.
+        // Transitive append removed with the blank line the rewriter puts
+        // before it; mixed-state constraint kept.
         let t = format!("source \"https://rubygems.org\"\n\ngem \"puma\"\n\n{block}\n");
         assert_eq!(
             run(&t, &Decl::Transitive),
-            "source \"https://rubygems.org\"\n\ngem \"puma\"\n\n"
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\n"
         );
+        // An append from before that separator existed (no blank line):
+        // only the block goes.
+        let t = format!("gem \"puma\"\n{block}\n");
+        assert_eq!(run(&t, &Decl::Transitive), "gem \"puma\"\n");
         let t = format!("gem \"puma\"\n{block}\n");
         assert_eq!(
             run(&t, &Decl::Direct(constraint_args("rails (>= 6, ~> 7.0)"))),
@@ -944,6 +962,187 @@ mod tests {
             "rails"
         ));
         assert!(!is_subdependency(&["    rails (7.0.0)"], "rails"));
+    }
+
+    /// #457: what the hosted rewriter itself writes for a TRANSITIVE gem
+    /// (an appended block, converged CHECKSUMS lock) must be recognized as
+    /// its append, and undoing it must give the manifest back byte for
+    /// byte, whatever its trailing newlines. A hand-built fixture is not
+    /// enough: the rewriter used to append with no blank line before the
+    /// block, so rollback re-added the gem as a direct exact pin.
+    #[test]
+    fn rewriter_transitive_append_restores_byte_identically() {
+        use crate::patch::redirect::{
+            rewrite_registry_redirect, DepOverride, Integrity, RegistryOverride,
+            RegistryOverrideIdentifiers,
+        };
+        let client = super::super::UpstreamClient::new(true);
+        let ctx = ctx_with(&client);
+        let ov = DepOverride {
+            ecosystem: "gem".into(),
+            name: "rails".into(),
+            namespace: None,
+            version: "7.0.0".into(),
+            token: "tok".into(),
+            patch_uuid: UUID.into(),
+            artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
+            registry_override: Some(RegistryOverride {
+                kind: "rubygems-compact-index".into(),
+                index_url: IDX.into(),
+                identifiers: RegistryOverrideIdentifiers {
+                    name: "rails".into(),
+                    version: "7.0.0".into(),
+                    gem_checksum_sha256: Some("f".repeat(64)),
+                    ..Default::default()
+                },
+            }),
+            integrity: Integrity::default(),
+        };
+        let lock = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n      rails (>= 7)\n    \
+             rails (7.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  puma\n\nCHECKSUMS\n  puma (6.0.0) \
+             sha256={}\n  rails (7.0.0) sha256={}\n\nBUNDLED WITH\n   4.0.17\n",
+            "a".repeat(64),
+            "2".repeat(64)
+        );
+        let lf = "source \"https://rubygems.org\"\n\ngem \"puma\"\n";
+        let crlf = lf.replace('\n', "\r\n");
+        let unterminated = lf.trim_end_matches('\n');
+        for (original, restored) in [
+            // The issue's shape: the manifest ends with a declaration + LF.
+            (lf.to_string(), lf.to_string()),
+            // A trailing blank line (the issue's passing control).
+            (format!("{lf}\n"), format!("{lf}\n")),
+            (crlf.clone(), crlf.clone()),
+            // No final line break: it comes back with one.
+            (unterminated.to_string(), lf.to_string()),
+        ] {
+            let files = BTreeMap::from([
+                ("Gemfile".to_string(), original.clone()),
+                ("Gemfile.lock".to_string(), lock.clone()),
+            ]);
+            let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ov));
+            let gemfile = &r.files["Gemfile"];
+            let lock_out = &r.files["Gemfile.lock"];
+            assert!(
+                lock_out.contains("  rails (= 7.0.0)!"),
+                "converged lock: {lock_out}"
+            );
+            let b = find_block(gemfile, &gem(), "Gemfile", &ctx)
+                .unwrap()
+                .expect("the appended block is found");
+            assert!(b.opts.is_none());
+            assert!(
+                provably_appended(gemfile, &b),
+                "the rewriter's append must be provably an append: {gemfile:?}"
+            );
+            let lines: Vec<&str> = lock_out.split('\n').collect();
+            assert!(is_subdependency(&lines, "rails"));
+            assert_eq!(
+                restore_manifest(gemfile, &b, &gem(), &Decl::Transitive),
+                restored,
+                "from {gemfile:?}"
+            );
+        }
+
+        // Two transitive appends (two patches) unwind in either order.
+        const RACK_UUID: &str = "88888888-8888-8888-8888-888888888888";
+        let rack_ov = DepOverride {
+            name: "rack".into(),
+            version: "3.0.0".into(),
+            patch_uuid: RACK_UUID.into(),
+            registry_override: ov.registry_override.clone().map(|mut ro| {
+                ro.index_url = IDX.replace(UUID, RACK_UUID);
+                ro.identifiers.name = "rack".into();
+                ro.identifiers.version = "3.0.0".into();
+                ro
+            }),
+            ..ov.clone()
+        };
+        let files = BTreeMap::from([("Gemfile".to_string(), lf.to_string())]);
+        let gemfile =
+            rewrite_registry_redirect(&files, &[ov.clone(), rack_ov]).files["Gemfile"].clone();
+        let rack = || Gem {
+            uuid: RACK_UUID,
+            name: "rack".into(),
+            version: "3.0.0".into(),
+        };
+        for (first, second) in [(gem(), rack()), (rack(), gem())] {
+            let b = find_block(&gemfile, &first, "Gemfile", &ctx)
+                .unwrap()
+                .unwrap();
+            assert!(provably_appended(&gemfile, &b), "{gemfile:?}");
+            let half = restore_manifest(&gemfile, &b, &first, &Decl::Transitive);
+            let b = find_block(&half, &second, "Gemfile", &ctx)
+                .unwrap()
+                .unwrap();
+            assert!(provably_appended(&half, &b), "{half:?}");
+            assert_eq!(restore_manifest(&half, &b, &second, &Decl::Transitive), lf);
+        }
+    }
+
+    /// #457, the whole restore: `scan --mode hosted` on a converged
+    /// (CHECKSUMS) lock redirects a transitive gem, and `rollback` /
+    /// `remove` must give the pair back byte for byte: no new `gem` line in
+    /// the manifest, no `(= version)` DEPENDENCIES pin in the lock (which
+    /// would freeze the vulnerable version against `bundle update`).
+    #[tokio::test]
+    async fn transitive_redirect_round_trips_through_restore() {
+        let client = super::super::UpstreamClient::new(true);
+        let upstream_sha = "2".repeat(64);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let ctx = ctx_with(&client);
+        let manifest = "source \"https://rubygems.org\"\n\ngem \"puma\", \"6.0.0\"\n";
+        let lock = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n      rails (>= 7)\n    \
+             rails (7.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  puma (= 6.0.0)\n\nCHECKSUMS\n  \
+             puma (6.0.0) sha256={}\n  rails (7.0.0) sha256={upstream_sha}\n\nBUNDLED WITH\n   4.0.17\n",
+            "a".repeat(64)
+        );
+        let files = BTreeMap::from([
+            ("Gemfile".to_string(), manifest.to_string()),
+            ("Gemfile.lock".to_string(), lock.clone()),
+        ]);
+        let r = crate::patch::redirect::rewrite_registry_redirect(
+            &files,
+            &[crate::patch::redirect::DepOverride {
+                ecosystem: "gem".into(),
+                name: "rails".into(),
+                namespace: None,
+                version: "7.0.0".into(),
+                token: "tok".into(),
+                patch_uuid: UUID.into(),
+                artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
+                registry_override: Some(crate::patch::redirect::RegistryOverride {
+                    kind: "rubygems-compact-index".into(),
+                    index_url: IDX.into(),
+                    identifiers: crate::patch::redirect::RegistryOverrideIdentifiers {
+                        name: "rails".into(),
+                        version: "7.0.0".into(),
+                        gem_checksum_sha256: Some("f".repeat(64)),
+                        ..Default::default()
+                    },
+                }),
+                integrity: Default::default(),
+            }],
+        );
+        let (hosted_manifest, hosted_lock) = (&r.files["Gemfile"], &r.files["Gemfile.lock"]);
+        assert!(hosted_lock.contains("  rails (= 7.0.0)!"), "{hosted_lock}");
+        let (next_lock, next_manifest) = restore_one(
+            &gem(),
+            Some(hosted_lock),
+            Some(hosted_manifest),
+            "Gemfile",
+            &global_sources(hosted_manifest),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .expect("the redirect is found");
+        assert_eq!(next_manifest.as_deref(), Some(manifest));
+        assert_eq!(next_lock.as_deref(), Some(lock.as_str()));
     }
 
     #[test]

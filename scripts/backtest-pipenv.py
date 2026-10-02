@@ -154,6 +154,52 @@ def save(path, data):
 
 DEFAULT_TIMEOUT = int(os.environ.get("BACKTEST_TIMEOUT", "900"))
 
+# A transport failure, never a functional one: pip/Pipenv giving up on PyPI
+# ("too many 503 error responses", connection errors) or the CLI's own report
+# of a request error or a patch API 5xx.
+TRANSPORT_FAILURE = re.compile(
+    r"too many 5\d\d error responses|Max retries exceeded with url|"
+    r"NewConnectionError|ConnectTimeoutError|ReadTimeoutError|"
+    r"Temporary failure in name resolution|nodename nor servname provided|Connection reset by peer|RemoteDisconnected|"
+    r"error sending request for url \(|API request failed with status 5\d\d\b"
+)
+
+
+def has_transport_failure(case, payload):
+    """Whether a failed case's error text or any of its logs shows a transport failure."""
+    if TRANSPORT_FAILURE.search(json.dumps(payload)):
+        return True
+    logs = sorted(case.glob("*.log*")) if case.is_dir() else []
+    return any(TRANSPORT_FAILURE.search(log.read_text(errors="replace")) for log in logs if log.is_file())
+
+
+def retry_transport(run_case, job, case, root, attempts=3, sleep=time.sleep):
+    """("row"|"error", payload) for one case, re-run from a clean case dir while
+    it fails for transport reasons. A failed attempt's logs are kept under
+    <root>/attempts/<case>/<n>/ and listed on the final payload."""
+    history = []
+    for attempt in range(1, attempts + 1):
+        try:
+            kind, payload = "row", run_case(job)
+        except Exception as e:
+            version, shape, mode, invocation = job
+            kind, payload = "error", {"pipenv": version, "shape": shape, "mode": mode, "invocation": invocation, "error": str(e)[-3000:], "trace": traceback.format_exc()[-1500:]}
+        failed = kind == "error" or not payload.get("passed")
+        if not failed or attempt == attempts or not has_transport_failure(case, payload):
+            if history:
+                payload["transportRetries"] = history
+                if case.is_dir():
+                    save(case / "result.json", payload)
+            return kind, payload
+        evidence = root / "attempts" / case.name / str(attempt)
+        evidence.mkdir(parents=True, exist_ok=True)
+        for log in case.glob("*.log*") if case.is_dir() else []:
+            if log.is_file():
+                shutil.copy2(log, evidence / log.name)
+        history.append({"attempt": attempt, "evidence": evidence.relative_to(root).as_posix(), "error": (payload.get("error") or "")[-300:], "failedChecks": [k for k, ok in payload.get("checks", {}).items() if not ok]})
+        print(f"{case.name}: transport failure; retrying fresh case ({attempt}/{attempts})", flush=True)
+        sleep(10 * attempt)
+
 
 class Run:
     """Run a command in its own process group, capture output, write a log.
@@ -680,11 +726,15 @@ def main():
         return sorted({k for _, _, e in lock_entries(text) if isinstance(e, dict) for k in ("file", "path") if k in e})
 
     # -------------------------------------------------------------- one case
+    def case_dir(job):
+        version, shape, mode, invocation = job
+        suffix = "" if invocation == "in-dir" else "-" + invocation
+        return root / "captures" / f"{version}-{shape}-{mode}{suffix}"
+
     def backtest(job):
         """Run one case; persist its row (or error) as <case>/result.json."""
         version, shape, mode, invocation = job
-        suffix = "" if invocation == "in-dir" else "-" + invocation
-        case = root / "captures" / f"{version}-{shape}-{mode}{suffix}"
+        case = case_dir(job)
         try:
             row = backtest_case(job)
         except Exception as e:
@@ -699,8 +749,7 @@ def main():
         legacy = is_legacy(version)
         major = major_of(version)
         tool = tool_dir(version)
-        suffix = "" if invocation == "in-dir" else "-" + invocation
-        case = root / "captures" / f"{version}-{shape}-{mode}{suffix}"
+        case = case_dir(job)
         if case.exists():
             shutil.rmtree(case)
         case.mkdir(parents=True)
@@ -1277,11 +1326,8 @@ def main():
         out = []
         for m, inv in groups[key]:
             job = (v, s, m, inv)
-            try:
-                row = backtest(job)
-                out.append(("row", job, row))
-            except Exception as e:
-                out.append(("error", job, {"pipenv": v, "shape": s, "mode": m, "invocation": inv, "error": str(e)[-3000:], "trace": traceback.format_exc()[-1500:]}))
+            kind, payload = retry_transport(backtest, job, case_dir(job), root)
+            out.append((kind, job, payload))
             yield out[-1]
 
     def flush():

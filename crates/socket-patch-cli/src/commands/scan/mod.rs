@@ -234,20 +234,13 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
         // stays report-only (neither has a project lockfile to rewire).
         args.mode = Some(ScanMode::Hosted);
     }
-    if args.mode == Some(ScanMode::Hosted)
-        && args.common.is_global()
+    // Global installs have no project lockfile: hosted and vendored mode
+    // would rewire the cwd project instead of the global copy.
+    if let Some(conflict) = args
+        .mode
+        .and_then(|mode| crate::commands::global_mode_conflict(&args.common, mode))
     {
-        // Global installs have no project lockfile to repoint: the hosted
-        // flow would "redirect 0 packages" and exit 0, a silent no-op.
-        return Err(format!(
-            "{} cannot be used with --mode hosted: global installs have no project \
-             lockfile to redirect",
-            if args.common.global {
-                "--global"
-            } else {
-                "--global-prefix"
-            },
-        ));
+        return Err(conflict);
     }
     Ok(())
 }
@@ -1631,13 +1624,28 @@ async fn run_scan(
     let vendor_state = &ctx.loaded().await.vendor;
     let ledger_supplement =
         vendored_ledger_supplement(&args.common, &all_crawled, vendor_state).await;
-    for pkg in &ledger_supplement {
+    for pkg in &ledger_supplement.packages {
         if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
             *eco_counts.entry(eco).or_insert(0) += 1;
         }
         supplement_purls.insert(pkg.purl.clone());
     }
-    all_crawled.extend(ledger_supplement);
+    all_crawled.extend(ledger_supplement.packages);
+    // Ledger entries whose dependency left the lock: not discovered (see
+    // `vendored_ledger_supplement`). A pruning run reverts them in its GC;
+    // every other run says how to.
+    let unwired_vendored: Vec<String> = ledger_supplement
+        .unwired
+        .into_iter()
+        .filter(|purl| args.common.purl_ecosystem_selected(purl))
+        .collect();
+    let prune_reverts_unwired = prune && !hosted;
+    if !unwired_vendored.is_empty() && !prune_reverts_unwired {
+        layout_refusals.push((
+            "vendor_ledger_entry_unwired".to_string(),
+            render::unwired_vendored_detail(&unwired_vendored),
+        ));
+    }
 
     // Every PURL the crawl found, captured BEFORE the `--ecosystems` /
     // `--package` / PATH filters: prune must judge manifest entries against
@@ -1653,6 +1661,15 @@ async fn run_scan(
         .as_ref()
         .map(VendorState::purl_keys)
         .unwrap_or_default();
+    // The ledger owns and records the PROJECT's copies only: a global
+    // scan's agent leg patches the global copy even when the cwd project
+    // vendors the same purl (see `project_state_in_scope`).
+    let project_state = crate::commands::project_state_in_scope(&args.common);
+    let vendor_owned_purls: HashSet<String> = if project_state {
+        vendored_purls.clone()
+    } else {
+        HashSet::new()
+    };
 
     // Read existing manifest once for update detection.
     let existing_manifest = ctx.ledgers().await.manifest;
@@ -1676,7 +1693,7 @@ async fn run_scan(
         .collect();
     let update_manifest = merge_ledger_records_for_updates(
         existing_manifest,
-        vendor_state.as_ref().ok(),
+        vendor_state.as_ref().ok().filter(|_| project_state),
         &hosted_pins,
     );
     policy.set_recorded(update_manifest.as_deref());
@@ -1761,8 +1778,22 @@ async fn run_scan(
             }
             policy.print_warnings(args.common.silent);
             // Hosted mode already printed its own prune-ignored warning.
-            if prune && !hosted {
+            if prune && !hosted && unwired_vendored.is_empty() {
                 eprintln!("{}", render::PRUNE_SKIPPED_EMPTY);
+            }
+        }
+        // The manifest half of the GC is skipped on an empty crawl, but
+        // reverting vendored entries the lock no longer wires asks the
+        // lockfile, not the crawl: run that half alone, or a project whose
+        // last vendored dependency was removed could never reconcile.
+        let unwired_gc = if prune_reverts_unwired && !unwired_vendored.is_empty() {
+            Some(gc::run_vendor_only_gc(&args.common, &manifest_path, &socket_dir).await)
+        } else {
+            None
+        };
+        if human {
+            if let Some(gc) = &unwired_gc {
+                gc::print_human_gc(gc, args.common.dry_run);
             }
         }
         // Telemetry: empty-scan still counts as a successful scan.
@@ -1806,6 +1837,9 @@ async fn run_scan(
             // empty one.
             if !layout_refusals.is_empty() {
                 result["warnings"] = layout_refusal_json(&layout_refusals);
+            }
+            if let Some(gc) = &unwired_gc {
+                result["gc"] = gc.to_json(args.common.dry_run);
             }
             policy.fold_into_json(&mut result);
             // Hosted mode: a no-op `redirect` block keeps the envelope
@@ -2245,7 +2279,7 @@ async fn run_scan(
                 skip_records: vendored_records,
                 vendored_purls: vendored_skip_purls,
                 ..
-            } = partition_agent_selection(writers_of(&rows), &vendored_purls, &lockfile_only);
+            } = partition_agent_selection(writers_of(&rows), &vendor_owned_purls, &lockfile_only);
             let selected = plan_kept_rows(&mut stage, rows, kept);
 
             if dry {
@@ -2665,7 +2699,7 @@ async fn run_scan(
     let selected = if vendor {
         selected
     } else {
-        let split = partition_agent_selection(selected, &vendored_purls, &lockfile_only);
+        let split = partition_agent_selection(selected, &vendor_owned_purls, &lockfile_only);
         if !silent {
             for purl in &split.vendored_purls {
                 open_paragraph(&mut skip_paragraph);

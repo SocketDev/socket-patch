@@ -27,15 +27,13 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::formats::composer::hosted::{
-    find_composer_entry, json_object_end_from, json_string_field, ComposerEntry,
-};
 use super::{Ctx, FormatResult, HostedPin, View};
 use crate::crawlers::composer_crawler::normalize_version;
+use crate::formats::composer::hosted::{
+    find_composer_entry, find_composer_member, json_string_field, ComposerEntry,
+};
 
 const COMPOSER_LOCK: &str = "composer.lock";
-const DIST_KEY: &str = "\"dist\": {";
-const SOURCE_KEY: &str = "\"source\": {";
 /// The `notification-url` composer records for packagist packages.
 const PACKAGIST_NOTIFY: &str = "https://packagist.org/downloads/";
 
@@ -61,9 +59,9 @@ fn is_dev_version(version: &str) -> bool {
 
 /// The `[start, end]` byte range of the entry's `"dist": {…}` object.
 fn dist_range(content: &str, entry: (usize, usize)) -> Option<(usize, usize)> {
-    let start = entry.0 + content[entry.0..=entry.1].find(DIST_KEY)?;
-    let end = json_object_end_from(content, start + DIST_KEY.len())?;
-    Some((start, end))
+    let member = find_composer_member(content, entry, "dist")
+        .filter(|member| content.as_bytes()[member.value_start] == b'{')?;
+    Some((member.key_start, member.value_end))
 }
 
 /// A JSON string literal in the lock's style: `\/` when the lock escapes
@@ -337,7 +335,7 @@ pub(crate) async fn restore(
         // Re-insert the source the rewriter dropped — unless the entry
         // still carries one (a lock redirected before the drop, or a
         // source it could not remove).
-        let has_source = content[start..d_start].contains(SOURCE_KEY);
+        let has_source = find_composer_member(&content, (start, end), "source").is_some();
         let source_text = match upstream.get("source").and_then(Value::as_object) {
             Some(source) if !has_source => {
                 match render_block(

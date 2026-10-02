@@ -460,8 +460,20 @@ fn flow(flavor: Flavor, mode: Mode) {
     );
 
     if mode == Mode::Hosted {
-        // Not installed as far as the crawler knows (no VIRTUAL_ENV, no
-        // in-project venv): the declaration's sha256 pin is the basis.
+        // Not installed as far as the crawler knows: the declaration's
+        // sha256 pin is the basis. The run points VIRTUAL_ENV at an EMPTY
+        // virtualenv. With no venv at all, a Python project falls back to
+        // the global interpreters, and on Ubuntu runners those carry apt's
+        // python3-six 1.16.0 (`six-1.16.0.egg-info` in
+        // /usr/lib/python3/dist-packages) — a real unpatched copy that vex
+        // rightly refuses to attest over.
+        let empty_venv = tmp.path().join("empty-venv");
+        std::fs::create_dir_all(empty_venv.join(if cfg!(windows) {
+            "Lib/site-packages"
+        } else {
+            "lib/python3.11/site-packages"
+        }))
+        .unwrap();
         let patch_api = vex_e2e_common::PatchApi::start(vec![(
             mode.uuid().to_string(),
             view(mode.uuid(), &pristine, &patched),
@@ -469,6 +481,7 @@ fn flow(flavor: Flavor, mode: Mode) {
         let run = vex_e2e_common::VexRun {
             patch_server_url: Some(api.uri()),
             product: Some(PRODUCT.into()),
+            envs: vec![("VIRTUAL_ENV".into(), empty_venv.into_os_string())],
             ..vex_e2e_common::VexRun::online(&patch_api)
         };
         let out = vex_e2e_common::run_vex(&vex_e2e_common::binary(), &fresh, &run);

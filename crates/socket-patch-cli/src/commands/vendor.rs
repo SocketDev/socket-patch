@@ -257,7 +257,10 @@ pub(crate) async fn dispatch_revert_one_opts(
 /// dependency graph? `None` = cannot determine — callers must keep the
 /// entry (fail-safe): ecosystems other than npm and cargo have no in-use
 /// probe yet, and a missing/unreadable lockfile proves nothing.
-async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
+pub(crate) async fn dispatch_in_use_one(
+    entry: &VendorEntry,
+    project_root: &Path,
+) -> Option<bool> {
     match entry.ecosystem.as_str() {
         "npm" => vendor::npm_flavor::vendored_entry_in_use(entry, project_root).await,
         // Cargo probes the lock entry's shape: detached + `[patch]` pointing
@@ -2351,6 +2354,21 @@ pub(crate) async fn vendor_records_reusing(
                 // restore, raised HERE instead — the same `failed` event,
                 // code and detail, in the dry run and the wet run alike —
                 // so the hosted wiring stays untouched.
+                // The gem backend's manifest refusal, likewise raised before
+                // the restore (a hosted `gems.rb` project cannot vendor).
+                if candidate.starts_with("pkg:gem/") {
+                    if let Some((code, detail)) =
+                        socket_patch_core::vendor::gem::gem_manifest_refusal(&common.cwd).await
+                    {
+                        has_errors = true;
+                        env.record(
+                            PatchEvent::new(PatchAction::Failed, candidate.clone())
+                                .with_error(code, detail.clone()),
+                        );
+                        report_vendor_failure(common, candidate, &detail);
+                        continue;
+                    }
+                }
                 if candidate.starts_with("pkg:npm/") {
                     let refusal = berry_takeover_refusal
                         .get_or_init(|| {

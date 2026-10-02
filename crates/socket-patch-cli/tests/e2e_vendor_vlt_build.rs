@@ -1167,6 +1167,113 @@ async fn vlt_pinned_matrix_vendored_resave_crlf_revert() {
     resave_revert("resave_crlf_revert", "install", true).await;
 }
 
+/// #541: the vendored dependency leaves the lock (`vlt install` of another
+/// release, or `vlt uninstall`). A plain vendored rescan skips the stale
+/// ledger entry with a `vendor_ledger_entry_unwired` warning instead of
+/// failing to re-vendor it; `--prune` reverts it and exits 0; the next run
+/// is clean. The ms bystander keeps a dependency in the project (the
+/// empty-crawl `--prune` path is covered by `scan_vendor_e2e`).
+async fn dependency_left_lock(name: &'static str, step: &'static str) {
+    let Some(leg) = vendored_leg(name) else {
+        return;
+    };
+    if step == "uninstall" && removed_dependency_stays_locked(leg.version()) {
+        return leg.skip("removed-dependency-stays-locked");
+    }
+    let mut shape = Shape::with_bystander();
+    shape.pins.push(LP_OLDER);
+    let fx = Fixture::build(leg, shape).await;
+    vendor_scan(&fx);
+    fx.vlt_ok(&fx.proj, &fx.leg.locked_install_args());
+    match step {
+        "bump" => {
+            fx.vlt_ok(&fx.proj, &["install", "left-pad@1.2.0"]);
+        }
+        _ => {
+            fx.vlt_ok(&fx.proj, &["uninstall", LP.0]);
+            // Should `vlt uninstall` leave the `file:` spec declared, drop
+            // it by hand and re-lock: the end state every other release
+            // reaches.
+            let pkg_path = fx.proj.join("package.json");
+            let mut pkg: Value =
+                serde_json::from_slice(&std::fs::read(&pkg_path).unwrap()).unwrap();
+            if pkg["dependencies"].get(LP.0).is_some() {
+                pkg["dependencies"].as_object_mut().unwrap().remove(LP.0);
+                std::fs::write(&pkg_path, serde_json::to_vec_pretty(&pkg).unwrap()).unwrap();
+                fx.vlt_ok(&fx.proj, &["install"]);
+            }
+        }
+    }
+    let purl = format!("pkg:npm/{}@{}", LP.0, LP.1);
+    let unwired = |doc: &Value| -> Vec<String> {
+        doc["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|w| w["code"] == "vendor_ledger_entry_unwired")
+            .map(|w| w["detail"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    let rescan = |extra: &[&str]| {
+        let mut args = vec!["--vendor-source", "service"];
+        args.extend_from_slice(extra);
+        socket_api(&fx.proj, &fx.svc, &["scan", "--mode", "vendored"], &args)
+    };
+
+    let out = rescan(&[]);
+    assert_eq!(out.code, 0, "{step}: rescan: {out}");
+    let doc = out.json();
+    let warned = unwired(&doc);
+    assert!(
+        warned.len() == 1 && warned[0].contains(&purl) && warned[0].contains("--prune"),
+        "{step}: {doc:#}"
+    );
+    assert!(
+        uuid_dir(&fx.proj, fx.t()).exists(),
+        "{step}: a plain rescan reverts nothing"
+    );
+
+    let out = rescan(&["--prune"]);
+    assert_eq!(out.code, 0, "{step}: --prune: {out}");
+    let doc = out.json();
+    assert_eq!(
+        doc["gc"]["revertedVendoredEntries"],
+        json!([purl]),
+        "{step}: {doc:#}"
+    );
+    assert!(unwired(&doc).is_empty(), "{step}: {doc:#}");
+    assert!(
+        !uuid_dir(&fx.proj, fx.t()).exists(),
+        "{step}: --prune removes the payload"
+    );
+    assert!(
+        !lock_bytes(&fx.proj)
+            .windows(b".socket/vendor".len())
+            .any(|w| w == b".socket/vendor"),
+        "{step}: no vendored wiring left"
+    );
+
+    let out = rescan(&[]);
+    assert_eq!(out.code, 0, "{step}: after prune: {out}");
+    assert!(unwired(&out.json()).is_empty(), "{step}: {out}");
+    fx.leg.ran();
+}
+
+/// The release a [`dependency_left_lock`] bump moves to.
+const LP_OLDER: (&str, &str) = ("left-pad", "1.2.0");
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
+async fn vlt_pinned_matrix_vendored_dependency_bumped_rescan() {
+    dependency_left_lock("dependency_bumped_rescan", "bump").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
+async fn vlt_pinned_matrix_vendored_dependency_uninstalled_rescan() {
+    dependency_left_lock("dependency_uninstalled_rescan", "uninstall").await;
+}
+
 // ── tamper (T33) ──────────────────────────────────────────────────────────
 
 /// Vendor, install, tamper with the committed state, then: standalone VEX

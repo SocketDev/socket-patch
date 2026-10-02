@@ -136,6 +136,50 @@ struct GemPrelude {
     copy_ok: bool,
 }
 
+/// Why vendored mode must not wire this project's Gemfile, if it must not:
+/// bundler loads a different manifest. This backend edits the `Gemfile` +
+/// `Gemfile.lock` pair, so a project where bundler loads `gems.rb` (it wins
+/// over a Gemfile twin) or a `BUNDLE_GEMFILE`-configured manifest is refused
+/// before any write: wiring the ignored Gemfile would report success while
+/// bundler installs the upstream gem. The CLI's hosted→vendored takeover
+/// asks this BEFORE it reverts a live hosted pin, so a refused gem keeps
+/// its hosted wiring instead of ending up unpatched in both modes.
+pub async fn gem_manifest_refusal(project_root: &Path) -> Option<(&'static str, String)> {
+    use crate::formats::gem::manifest::LoadedManifest;
+    let loaded = crate::crawlers::ruby_crawler::bundler_loaded_manifest(project_root).await;
+    let gems_rb_present = tokio::fs::symlink_metadata(project_root.join("gems.rb"))
+        .await
+        .is_ok();
+    match loaded.pair(gems_rb_present) {
+        Some((GEMFILE, GEMFILE_LOCK)) => None,
+        // A `gems.rb` twin is refused whatever bundler runs: bundler >= 2
+        // loads `gems.rb` (with a "Multiple gemfiles" warning) while 1.x
+        // still reads the Gemfile first, so wiring the Gemfile is only
+        // right on a bundler this backend cannot see.
+        Some((manifest, lock)) if matches!(loaded, LoadedManifest::Default) => Some((
+            "gemfile_not_loaded",
+            format!(
+                "a {manifest} sits beside the Gemfile and bundler >= 2 loads {manifest} + \
+                 {lock} instead of the Gemfile + Gemfile.lock pair vendored mode wires (a \
+                 gems.rb project cannot vendor yet); use hosted mode, or remove gems.rb / \
+                 gems.locked if the Gemfile is the real manifest"
+            ),
+        )),
+        Some((manifest, lock)) => Some((
+            "gemfile_not_loaded",
+            format!(
+                "BUNDLE_GEMFILE makes bundler load {manifest} + {lock}, not the Gemfile + \
+                 Gemfile.lock pair vendored mode wires (a gems.rb project cannot vendor yet); \
+                 use hosted mode"
+            ),
+        )),
+        None => Some((
+            "gemfile_not_loaded",
+            loaded.unsupported_detail().unwrap_or_default(),
+        )),
+    }
+}
+
 async fn gem_prelude(
     purl: &str,
     installed_path: &Path,
@@ -238,6 +282,9 @@ async fn gem_prelude(
     }
 
     // ── project files ────────────────────────────────────────────────────
+    if let Some((code, detail)) = gem_manifest_refusal(project_root).await {
+        return Err(refused(code, detail));
+    }
     let gemfile_path = project_root.join(GEMFILE);
     let gemfile_text = match read_regular_to_string(&gemfile_path).await {
         Ok(t) => t,
@@ -2605,6 +2652,112 @@ mod tests {
             "PATH\n  remote: {rel}\n  specs:\n    rack (3.2.6)\n      base64 (>= 0.1.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.4.2)\n      nio4r (~> 2.0)\n\nPLATFORMS\n  arm64-darwin-23\n  ruby\n\nDEPENDENCIES\n  puma\n  rack (= 3.2.6)!\n\nBUNDLED WITH\n   2.5.22\n",
             rel = copy_rel()
         )
+    }
+
+    /// #341: a `gems.rb` beside the Gemfile is the manifest bundler loads
+    /// ("Multiple gemfiles ... ignoring them in favor of gems.rb"). Wiring
+    /// the ignored Gemfile reported success while bundler installed the
+    /// upstream gem; vendor must refuse before any write instead.
+    #[tokio::test]
+    async fn gems_rb_twin_is_refused_before_any_write() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        tokio::fs::write(root.join("gems.rb"), GEMFILE_DIRECT)
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("gems.locked"), LOCK_DIRECT)
+            .await
+            .unwrap();
+
+        let (code, detail) =
+            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "gemfile_not_loaded");
+        assert!(detail.contains("gems.rb"), "{detail}");
+        for (file, want) in [
+            (GEMFILE, GEMFILE_DIRECT),
+            (GEMFILE_LOCK, LOCK_DIRECT),
+            ("gems.rb", GEMFILE_DIRECT),
+            ("gems.locked", LOCK_DIRECT),
+        ] {
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(file)).await.unwrap(),
+                want
+            );
+        }
+        assert!(!root.join(".socket/vendor").exists());
+    }
+
+    /// #390: `bundle config set --local gemfile Gemfile.next` makes bundler
+    /// load `Gemfile.next` (+ `Gemfile.next.lock`); wiring `Gemfile` left the
+    /// loaded manifest unpatched. Refused before any write.
+    #[tokio::test]
+    async fn bundle_gemfile_naming_another_manifest_is_refused() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        tokio::fs::write(root.join("Gemfile.next"), GEMFILE_DIRECT)
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("Gemfile.next.lock"), LOCK_DIRECT)
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join(".bundle"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join(".bundle/config"),
+            "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n",
+        )
+        .await
+        .unwrap();
+
+        let (code, detail) =
+            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "gemfile_not_loaded");
+        assert!(detail.contains("Gemfile.next"), "{detail}");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+        assert!(!root.join(".socket/vendor").exists());
+    }
+
+    /// `BUNDLE_GEMFILE` naming the project's own Gemfile beside a `gems.rb`
+    /// makes bundler load the Gemfile, so vendoring wires it as usual.
+    #[tokio::test]
+    async fn bundle_gemfile_naming_the_gemfile_overrides_a_gems_rb_twin() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        tokio::fs::write(root.join("gems.rb"), GEMFILE_DIRECT)
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join(".bundle"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join(".bundle/config"),
+            "---\nBUNDLE_GEMFILE: \"Gemfile\"\n",
+        )
+        .await
+        .unwrap();
+
+        let (result, _entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            expected_lock_direct()
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("gems.rb"))
+                .await
+                .unwrap(),
+            GEMFILE_DIRECT
+        );
     }
 
     #[tokio::test]

@@ -102,6 +102,10 @@ limits, and required install commands.
 
 ### Fixed
 
+- Gem hosted and vendored modes wire only the manifest Bundler loads. A `gems.rb`
+  twin or a `BUNDLE_GEMFILE` setting (environment or `.bundle/config`) no longer
+  leads to an edit of an ignored `Gemfile` that reports success and attests an
+  unpatched gem; unsupported layouts are refused before any write (#341, #390).
 - **npm dependencies installed from git, a URL or `file:` are no longer
   reported patched.** npm installs such a dependency from the dependent's
   spec (`github:user/repo`, `https://…/x.tgz`, `file:…`) and ignores the
@@ -148,6 +152,9 @@ limits, and required install commands.
 - Python rewrites preserve supported markers, groups, extras, source metadata, and
   integrity pins. Relocks, out-of-tree environments, and lock-only VEX are handled
   consistently with each installer's supported behavior.
+- Hosted Pipenv scans read the `Pipfile`, so a conflicting `Pipfile.lock` entry
+  refuses the patch project-wide instead of half-redirecting a sibling
+  `requirements.txt` (#333).
 - Vendoring reuses valid committed artifacts during service outages. Updates do
   not build from a previous patch's modified bytes. Verified service artifacts
   keep their identity; integrity failures do not fall through to a local rebuild.
@@ -162,6 +169,20 @@ limits, and required install commands.
 - Transient apply locks are removed on normal command exit; no-op scans and full
   reversal avoid leaving unused `.socket/` state. Terminal output, telemetry
   timeouts, and update-check handling are more consistent.
+- Agent mode finds transitive npm packages in npm's linked store
+  (`install-strategy=linked`, `node_modules/.store`) and in a relocated pnpm
+  `virtualStoreDir`, instead of reporting them `package_not_installed` (#359,
+  #362). A store outside the project, such as pnpm's global virtual store, is
+  shared with other projects and is still not patched in place.
+- npm locks keep their own layout when edited. `scan --mode hosted`,
+  `scan --mode vendored`, `rollback` and `vendor --revert`
+  re-serialized `package-lock.json` / `npm-shrinkwrap.json` with LF line
+  endings (and, in hosted mode, a fixed 2-space indent), so a CRLF or
+  tab-indented lock got a whole-file diff and the undo did not restore its
+  bytes. A lock with a UTF-8 BOM, which npm installs from, was skipped as
+  unparseable (hosted) or refused as `vendor_lockfile_version_unsupported`
+  (vendored). The lock now keeps its BOM, indent and line endings, and the
+  undo is byte-exact (#324).
 
 ### Maintenance
 

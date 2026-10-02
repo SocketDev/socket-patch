@@ -148,6 +148,82 @@ class BunManifestlessVexHelperTests(unittest.TestCase):
                                    'packages/c/package.json'])
 
 
+class PipenvTransportRetryTests(unittest.TestCase):
+    JOB = ("2023.12.1", "direct", "hosted", "in-dir")
+    PYPI_503 = ("pip._vendor.urllib3.exceptions.MaxRetryError: HTTPSConnectionPool(host='files.pythonhosted.org', "
+                "port=443): Max retries exceeded with url: /packages/urllib3-1.26.18-py2.py3-none-any.whl "
+                "(Caused by ResponseError('too many 503 error responses'))")
+
+    def drive(self, outcomes, root):
+        """Drive retry_transport with one scripted outcome per attempt."""
+        case = root / "captures" / "2023.12.1-direct-hosted"
+        calls = []
+
+        def run_case(_job):
+            outcome = outcomes[len(calls)]
+            calls.append(outcome)
+            if case.exists():
+                pipenv.shutil.rmtree(case)
+            case.mkdir(parents=True)
+            (case / "install.log").write_text(outcome.get("log", ""))
+            if "raise" in outcome:
+                raise RuntimeError(outcome["raise"])
+            return {"passed": outcome["passed"], "checks": {"installedPatched": outcome["passed"]}}
+
+        sleeps = []
+        kind, payload = pipenv.retry_transport(run_case, self.JOB, case, root, sleep=sleeps.append)
+        return kind, payload, calls, sleeps
+
+    def test_pypi_503_error_is_retried_from_a_fresh_case_and_keeps_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            kind, payload, calls, sleeps = self.drive([{"raise": "pipenv install failed (exit 1):\n" + self.PYPI_503}, {"passed": True}], root)
+            self.assertEqual((kind, payload["passed"], len(calls), sleeps), ("row", True, 2, [10]))
+            retry = payload["transportRetries"][0]
+            self.assertIn("too many 503 error responses", retry["error"])
+            self.assertTrue((root / retry["evidence"] / "install.log").is_file())
+            saved = json.loads((root / "captures/2023.12.1-direct-hosted/result.json").read_text())
+            self.assertEqual(saved["transportRetries"], payload["transportRetries"])
+
+    def test_failed_check_with_transport_failure_in_a_log_is_retried(self):
+        with tempfile.TemporaryDirectory() as temp:
+            kind, payload, calls, _ = self.drive([{"passed": False, "log": self.PYPI_503}, {"passed": True}], Path(temp))
+            self.assertEqual((kind, payload["passed"], len(calls)), ("row", True, 2))
+            self.assertEqual(payload["transportRetries"][0]["failedChecks"], ["installedPatched"])
+
+    def test_patch_api_5xx_is_a_transport_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            outcomes = [{"raise": "scan failed: API request failed with status 503: upstream connect error"}, {"passed": True}]
+            self.assertEqual(len(self.drive(outcomes, Path(temp))[2]), 2)
+
+    def test_macos_dns_failure_is_a_transport_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            outcomes = [{"passed": False, "log": "NewConnectionError: [Errno 8] nodename nor servname provided, or not known"}, {"passed": True}]
+            self.assertEqual(len(self.drive(outcomes, Path(temp))[2]), 2)
+            self.assertTrue(pipenv.TRANSPORT_FAILURE.search("<urlopen error [Errno 8] nodename nor servname provided, or not known>"))
+
+    def test_functional_failures_are_never_retried(self):
+        with tempfile.TemporaryDirectory() as temp:
+            outcomes = [{"passed": False, "log": "ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE"}]
+            kind, payload, calls, sleeps = self.drive(outcomes, Path(temp))
+            self.assertEqual((kind, payload["passed"], len(calls), sleeps), ("row", False, 1, []))
+            self.assertNotIn("transportRetries", payload)
+            kind, payload, calls, _ = self.drive([{"raise": "pipenv lock failed (exit 1): ResolutionFailure"}], Path(temp))
+            self.assertEqual((kind, len(calls)), ("error", 1))
+
+    def test_a_persistent_transport_failure_stays_red_after_three_attempts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            kind, payload, calls, sleeps = self.drive([{"raise": self.PYPI_503}] * 3, Path(temp))
+            self.assertEqual((kind, len(calls), sleeps), ("error", 3, [10, 20]))
+            self.assertEqual([r["attempt"] for r in payload["transportRetries"]], [1, 2])
+
+    def test_a_passing_case_runs_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            kind, payload, calls, _ = self.drive([{"passed": True, "log": self.PYPI_503}], Path(temp))
+            self.assertEqual((kind, len(calls)), ("row", 1))
+            self.assertNotIn("transportRetries", payload)
+
+
 class PipenvShimTests(unittest.TestCase):
     def test_parallel_first_use(self):
         # Force every worker to reach symlink creation before any can create
