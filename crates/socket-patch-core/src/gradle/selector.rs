@@ -39,8 +39,10 @@ pub struct Bound {
 /// A parsed version selector (the version part of a dependency request).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selector {
-    /// A plain version (`1.10.0`), also the single-value range `[1.10.0]`.
-    /// Like Gradle, anything that is not a well-formed range, prefix or
+    /// A plain version (`1.10.0`), admitting only itself by string
+    /// equality. Gradle turns a single-value range `[1.10.0]` (and
+    /// `[1.10.0,1.10.0]`) into this too, so `[1.01]` does not admit `1.1`
+    /// although the two order equal. Like Gradle, anything that is not a well-formed range, prefix or
     /// `latest.*` selector is an exact (string-equality) selector, so
     /// `[1.0` or `[1,2),[3,4)` only admit themselves.
     Exact(String),
@@ -69,8 +71,10 @@ struct RangeRes {
 fn range_res() -> &'static RangeRes {
     static RES: OnceLock<RangeRes> = OnceLock::new();
     RES.get_or_init(|| {
-        // Gradle's VersionRangeSelector patterns.
-        const ANY: &str = r"[^\[\]\(\),]+?";
+        // Gradle's VersionRangeSelector patterns (identical from 6.9 to
+        // 9.x): a bound holds no whitespace, and the single-value form
+        // allows whitespace only after its `[`.
+        const ANY: &str = r"[^\s,\[\]\(\)]+";
         let re = |p: String| regex::Regex::new(&p).expect("static range pattern");
         RangeRes {
             finite: re(format!(
@@ -78,7 +82,7 @@ fn range_res() -> &'static RangeRes {
             )),
             lower_infinite: re(format!(r"^\(\s*,\s*({ANY})\s*([\]\[\)])$")),
             upper_infinite: re(format!(r"^([\[\]\(])\s*({ANY})\s*,\s*\)$")),
-            single: re(format!(r"^\[\s*({ANY})\s*\]$")),
+            single: re(format!(r"^\[\s*({ANY})\]$")),
         }
     })
 }
@@ -110,6 +114,10 @@ fn parse_range(s: &str) -> Option<Selector> {
         return Some(Selector::Exact(c[1].to_string()));
     }
     if let Some(c) = res.finite.captures(s) {
+        // DefaultVersionSelectorScheme: `[a,a]` is the exact selector `a`.
+        if c[2] == c[3] && &c[1] == "[" && &c[4] == "]" {
+            return Some(Selector::Exact(c[3].to_string()));
+        }
         return Some(Selector::Range {
             lower: Some(bound(&c[2], &c[1] == "[")),
             upper: Some(bound(&c[3], &c[4] == "]")),
@@ -384,6 +392,20 @@ pub const GOLDEN_ADMITS: &[(&str, &str, Option<bool>)] = &[
     ("]1.9,)", "1.10.0", Some(true)),
     ("[1.10.0]", "1.10.0", Some(true)),
     ("[1.10.0]", "1.10.0-socket.4d5e6f70", Some(false)),
+    // A single-value range is an exact selector: string equality, even
+    // between versions that order equal.
+    ("[1.01]", "1.1", Some(false)),
+    ("[1.0a]", "1.0-a", Some(false)),
+    ("[1.01,1.01]", "1.1", Some(false)),
+    ("[1.01,1.01]", "1.01", Some(true)),
+    ("[1.01,1.01)", "1.01", Some(false)),
+    ("[1.1]", "1.1.0", Some(false)),
+    ("1.01", "1.1", Some(false)),
+    // Whitespace: only after a single-value range's `[`, and never inside
+    // a bound.
+    ("[ 1.1]", "1.1", Some(true)),
+    ("[ 1.1 ]", "1.1", Some(false)),
+    ("[1.9 x,2]", "1.9.5", Some(false)),
     ("[1.0,2.0)", "2-rc1", Some(true)),
     ("[1.0,2.0-rc1)", "2.0-rc0", Some(true)),
     // Not ranges to Gradle: exact selectors that only admit themselves.
@@ -491,6 +513,11 @@ mod tests {
         assert_eq!(parse_selector("1.+"), Selector::Prefix("1.".into()));
         assert_eq!(parse_selector("1.10.0"), Selector::Exact("1.10.0".into()));
         assert_eq!(parse_selector("[1.10.0]"), Selector::Exact("1.10.0".into()));
+        assert_eq!(
+            parse_selector("[1.10.0,1.10.0]"),
+            Selector::Exact("1.10.0".into())
+        );
+        assert_eq!(parse_selector("[ 1.1 ]"), Selector::Exact("[ 1.1 ]".into()));
         assert_eq!(
             parse_selector("latest.release"),
             Selector::Latest("latest.release".into())
