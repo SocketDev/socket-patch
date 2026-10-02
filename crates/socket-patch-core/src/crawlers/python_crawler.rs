@@ -365,8 +365,8 @@ async fn find_local_venv_site_packages_with(
     // it once `poetry env use` recorded an env for the project (see
     // [`poetry_active_prefix`]). PDM likewise skips an activated venv under
     // `PDM_IGNORE_ACTIVE_VENV`.
-    let pdm_ignores_active = pdm_env_flag(var, "PDM_IGNORE_ACTIVE_VENV")
-        && pdm_drives_project(cwd).await;
+    let pdm_ignores_active =
+        pdm_env_flag(var, "PDM_IGNORE_ACTIVE_VENV") && pdm_drives_project(cwd).await;
     let active_prefix = match &poetry {
         Some(project) => poetry_active_prefix(project, var),
         None if pdm_ignores_active => None,
@@ -426,13 +426,13 @@ async fn find_local_venv_site_packages_with(
 /// `cwd`, when that env exists. `None` means the manager records nothing
 /// (or nothing installed yet), and the generic probes decide.
 ///
-/// - **PDM** installs into the interpreter saved in `.pdm-python` (PDM
-///   2.x; `[python] path` in `.pdm.toml` before that), ahead of an
-///   activated venv. That interpreter's venv is the env (an out-of-tree
-///   `venv.in_project = false` venv, or one picked with `pdm use`). An
-///   interpreter that is not a venv means PEP 582: PDM installs into
-///   `__pypackages__/<X.Y>/lib`, which PDM 1.x also uses with no saved
-///   interpreter at all.
+/// - **PDM** picks the interpreter from `PDM_PYTHON` or `.pdm-python` (PDM
+///   2.x; `[python] path` in `.pdm.toml` before that). If that interpreter
+///   is already a venv (including conda), PDM installs there. Otherwise,
+///   with the default `python.use_venv = true`, PDM still creates or uses
+///   the project venv (`.venv` or an out-of-tree location). PEP 582
+///   (`__pypackages__/<X.Y>/lib`) is only used when no interpreter is
+///   saved and `use_venv = false`.
 /// - **uv** syncs a project into `UV_PROJECT_ENVIRONMENT` (absolute, or
 ///   relative to the project) instead of `./.venv`, and ignores an
 ///   activated `VIRTUAL_ENV` for project commands.
@@ -468,9 +468,12 @@ async fn pdm_project_site_packages(
         None if ignore_saved => None,
         None => pdm_saved_interpreter(cwd).await,
     };
-    let found = match venv_root_of_interpreter(&interpreter?) {
-        Some(root) => find_site_packages_under(&root, "site-packages").await,
+    let found = match interpreter {
         None => pdm_pep582_dirs(cwd).await,
+        Some(ref path) => match venv_root_of_interpreter(path) {
+            Some(root) => find_site_packages_under(&root, "site-packages").await,
+            None => return None,
+        },
     };
     (!found.is_empty()).then_some(found)
 }
@@ -506,9 +509,7 @@ async fn pdm_saved_interpreter(cwd: &Path) -> Option<PathBuf> {
     let saved = match read_regular_to_string(&cwd.join(".pdm-python")).await {
         Ok(text) => text.trim().to_string(),
         Err(_) => {
-            let text = read_regular_to_string(&cwd.join(".pdm.toml"))
-                .await
-                .ok()?;
+            let text = read_regular_to_string(&cwd.join(".pdm.toml")).await.ok()?;
             let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
             doc.get("python")?.get("path")?.as_str()?.trim().to_string()
         }
@@ -2720,7 +2721,11 @@ mod tests {
         fake_venv(&tmp.path().join("uv-env"), "venv");
         let uv_env = env_of(&[(
             "UV_PROJECT_ENVIRONMENT",
-            tmp.path().join("uv-env").join("venv").to_string_lossy().into_owned(),
+            tmp.path()
+                .join("uv-env")
+                .join("venv")
+                .to_string_lossy()
+                .into_owned(),
         )]);
         assert_eq!(
             find_local_venv_site_packages_with(&project, &uv_env).await,
