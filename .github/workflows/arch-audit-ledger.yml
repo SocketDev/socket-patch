@@ -8,6 +8,8 @@ on:
 permissions:
   contents: read
   discussions: write
+  issues: read
+  pull-requests: read
 
 jobs:
   mirror:
@@ -19,55 +21,19 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       # No concurrency group: GitHub cancels a queued run when a newer one
-      # arrives, which would silently drop that push's entries. Each run only
-      # posts the entries its own push added, so runs never overlap.
-      - name: Post new run entries as discussion comments
-        if: github.event_name == 'push'
+      # arrives, which would drop that push's entries. Each run posts only the
+      # entries its own push added, and renders from the latest branch tip.
+      - name: Post entries and render the register and living document
         env:
           GH_TOKEN: ${{ github.token }}
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
-            BEFORE=$(git hash-object -t tree /dev/null)
-          fi
-          discussion=$(git show "$AFTER:ledger.json" | jq -r '.discussion_node_id')
-          body=$(mktemp)
-          git diff --name-only --diff-filter=A -z "$BEFORE" "$AFTER" -- 'entries/*/*.md' |
-            sort -z | while IFS= read -r -d '' f; do
-              { git show "$AFTER:$f"; printf '\n\n<!-- arch-audit-entry: %s -->\n' "$f"; } > "$body"
-              gh api graphql -F d="$discussion" -F b=@"$body" \
-                -f query='mutation($d:ID!,$b:String!){addDiscussionComment(input:{discussionId:$d,body:$b}){comment{url}}}' \
-                --jq '.data.addDiscussionComment.comment.url'
-            done
-      - name: Refresh the register comment
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # Build from the branch tip, not this run's commit, so a slow run
-          # can't overwrite a newer register.
           git fetch --quiet origin arch-audit/ledger
-          tip=$(git rev-parse FETCH_HEAD)
-          comment=$(git show "$tip:ledger.json" | jq -r '.register_comment_id')
-          out=$(mktemp)
-          git ls-tree -z --name-only "$tip" register/ | sort -z |
-            while IFS= read -r -d '' f; do
-              case "$f" in *.md) git show "$tip:$f"; printf '\n\n' ;; esac
-            done > "$out"
-          python3 - "$out" <<'PY'
-          import sys
-          path = sys.argv[1]
-          text = open(path, encoding='utf-8').read().rstrip() + '\n'
-          limit = 64000
-          if len(text) > limit:
-              print(f'::warning::register is {len(text)} characters; truncating to fit a discussion comment')
-              text = text[:limit].rsplit('\n', 1)[0] + (
-                  '\n\n**[truncated: the full register is in `register/` on the '
-                  '`arch-audit/ledger` branch]**\n')
-          open(path, 'w', encoding='utf-8').write(text)
-          PY
-          gh api graphql -F c="$comment" -F b=@"$out" \
-            -f query='mutation($c:ID!,$b:String!){updateDiscussionComment(input:{commentId:$c,body:$b}){comment{url}}}' \
-            --jq '.data.updateDiscussionComment.comment.url'
+          git show FETCH_HEAD:tools/mirror.py > "$RUNNER_TEMP/mirror.py"
+          if [ "${{ github.event_name }}" = push ]; then
+            python3 "$RUNNER_TEMP/mirror.py" --ref FETCH_HEAD --entries "$BEFORE" "$AFTER"
+          else
+            python3 "$RUNNER_TEMP/mirror.py" --ref FETCH_HEAD
+          fi

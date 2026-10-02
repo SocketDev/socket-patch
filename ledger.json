@@ -21,5 +21,43 @@
       "name": "socket-patch architecture refactor",
       "cron": "45 1,5,9,13,17,21 * * *"
     }
+  },
+  "doc_targets": {
+    "doc/01-summary.md": {
+      "kind": "discussion_body",
+      "id": "D_kwDOQS_zEM4ApuI_"
+    },
+    "doc/02-cli.md": {
+      "kind": "comment",
+      "id": "DC_kwDOQS_zEM4BHZiU"
+    },
+    "doc/03-hosted.md": {
+      "kind": "comment",
+      "id": "DC_kwDOQS_zEM4BHZiX"
+    },
+    "doc/04-js-lockfiles.md": {
+      "kind": "comment",
+      "id": "DC_kwDOQS_zEM4BHZiZ"
+    },
+    "doc/05-vendored.md": {
+      "kind": "comment",
+      "id": "DC_kwDOQS_zEM4BHZib"
+    },
+    "doc/06-discovery-vex.md": {
+      "kind": "comment",
+      "id": "DC_kwDOQS_zEM4BHZie"
+    },
+    "doc/07-infra-agent.md": {
+      "kind": "comment",
+      "id": "DC_kwDOQS_zEM4BHZig"
+    },
+    "doc/08-tests-ci-docs.md": {
+      "kind": "comment",
+      "id": "DC_kwDOQS_zEM4BHZih"
+    },
+    "doc/09-appendix.md": {
+      "kind": "comment",
+      "id": "DC_kwDOQS_zEM4BHZii"
+    }
   }
 }
