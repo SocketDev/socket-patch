@@ -149,6 +149,15 @@ moved it to, as recorded in `node_modules/.modules.yaml`), vlt's
 notably pnpm's global virtual store (`enableGlobalVirtualStore`, under the
 pnpm store directory), is not walked: other projects on the machine load
 the same files, so patching it in place would patch them as well.
+For the same reason, agent-mode `apply` and `rollback` fail on a direct
+dependency whose `node_modules/<dep>` link resolves into that store
+(`<store>/v<N>/links`) instead of writing through it. PDM's symlink install
+cache gets the same treatment: with `install.cache` and
+`cache_method = symlink` (PDM 2.0–2.12), `site-packages/<pkg>` links into
+`<cache>/packages/<wheel>/lib`, and that package is refused too. The error
+names the store and how to get a private copy (disable the global virtual
+store, or `pdm config install.cache_method hardlink`, then reinstall), or
+use hosted or vendored mode.
 
 Every command that looks for installed npm copies walks these same trees, not
 only `scan`. A package installed only under a pruned directory is therefore

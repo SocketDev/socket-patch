@@ -811,6 +811,21 @@ async fn apply_package_patch_at(
         sidecar: None,
     };
 
+    // A package dir that resolves into a store other projects link to
+    // (PDM's symlink cache, pnpm's global virtual store) is not ours to
+    // patch: the rename below would land in the shared dir and patch every
+    // project using it. Refused in every state, dry run and already-patched
+    // included, so this project never records the shared copy as its patch.
+    if let Some(store) = crate::patch::shared_store::shared_store_of_patch_dirs(
+        pkg_path,
+        files.keys().map(String::as_str),
+    )
+    .await
+    {
+        result.error = Some(store.refusal("patch"));
+        return result;
+    }
+
     // First, verify all files
     for (file_name, file_info) in files_in_order(files) {
         // SECURITY: reject any manifest key that would escape the package dir
@@ -3488,5 +3503,163 @@ mod tests {
             primary.error.as_deref(),
             Some("store copy /store/pkg@1.0.0_peer failed to patch: boom")
         );
+    }
+
+    /// Lay out one shared store package with `index.js` (original bytes)
+    /// and link it into two projects' install dirs, the way pnpm's global
+    /// virtual store (#361) and PDM's symlink cache (#332) do. Returns
+    /// (root, [project A, project B] package roots, file key, blobs dir,
+    /// files, original, patched). The package root is what the crawlers
+    /// hand apply: the linked `node_modules/<dep>` for npm, but the
+    /// `site-packages` dir for PyPI, whose keys are `<pkg>/<file>`.
+    #[cfg(unix)]
+    fn shared_store_fixture(
+        pdm: bool,
+    ) -> (
+        tempfile::TempDir,
+        [std::path::PathBuf; 2],
+        String,
+        std::path::PathBuf,
+        HashMap<String, PatchFileInfo>,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        use crate::patch::shared_store::test_support::{make_pdm_cache_entry, make_pnpm_gvs};
+        let root = tempfile::tempdir().unwrap();
+        let store_pkg = if pdm {
+            make_pdm_cache_entry(root.path())
+        } else {
+            make_pnpm_gvs(root.path())
+        };
+        let original = b"original shared bytes".to_vec();
+        let patched = b"PATCHED shared bytes".to_vec();
+        std::fs::write(store_pkg.join("index.js"), &original).unwrap();
+        let roots = ["a", "b"].map(|p| {
+            let install_dir = if pdm {
+                root.path()
+                    .join(p)
+                    .join(".venv/lib/python3.11/site-packages")
+            } else {
+                root.path().join(p).join("node_modules")
+            };
+            std::fs::create_dir_all(&install_dir).unwrap();
+            let link = install_dir.join(store_pkg.file_name().unwrap());
+            std::os::unix::fs::symlink(&store_pkg, &link).unwrap();
+            if pdm {
+                install_dir
+            } else {
+                link
+            }
+        });
+        let key = if pdm { "urllib3/index.js" } else { "index.js" }.to_string();
+        let blobs = root.path().join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let before_hash = compute_git_sha256_from_bytes(&original);
+        let after_hash = compute_git_sha256_from_bytes(&patched);
+        std::fs::write(blobs.join(&before_hash), &original).unwrap();
+        std::fs::write(blobs.join(&after_hash), &patched).unwrap();
+        let mut files = HashMap::new();
+        files.insert(
+            key.clone(),
+            PatchFileInfo {
+                before_hash,
+                after_hash,
+            },
+        );
+        (root, roots, key, blobs, files, original, patched)
+    }
+
+    /// #361 / #332: agent apply must not write through a package directory
+    /// that is a link into a store shared with other projects. It fails
+    /// closed (dry run included), and the other project keeps its bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_refuses_shared_store_package_dir() {
+        for (pdm, purl) in [
+            (false, "pkg:npm/left-pad@1.3.0"),
+            (true, "pkg:pypi/urllib3@1.26.18"),
+        ] {
+            let (_root, [a, b], key, blobs, files, original, _patched) = shared_store_fixture(pdm);
+            let sources = PatchSources::blobs_only(&blobs);
+            for dry_run in [true, false] {
+                let result = apply_package_patch(
+                    purl,
+                    &a,
+                    &files,
+                    &sources,
+                    None,
+                    dry_run,
+                    MismatchPolicy::Warn,
+                )
+                .await;
+                assert!(!result.success, "{purl} dry_run={dry_run}: must refuse");
+                let err = result.error.unwrap_or_default();
+                assert!(
+                    err.contains(crate::patch::shared_store::SHARED_STORE_REFUSAL_MARKER),
+                    "{purl}: {err}"
+                );
+                assert!(result.files_patched.is_empty());
+            }
+            assert_eq!(std::fs::read(b.join(&key)).unwrap(), original, "{purl}");
+        }
+    }
+
+    /// The same store package already patched (by another project, or by
+    /// an apply before this guard existed) is refused too: this project
+    /// does not own the shared copy, so it must not record it as patched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_refuses_already_patched_shared_store_package_dir() {
+        let (_root, [a, _b], key, blobs, files, _original, patched) = shared_store_fixture(false);
+        std::fs::write(a.join(key), &patched).unwrap();
+        let result = apply_package_patch(
+            "pkg:npm/left-pad@1.3.0",
+            &a,
+            &files,
+            &PatchSources::blobs_only(&blobs),
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(!result.success);
+    }
+
+    /// A per-project pnpm store reached through a symlink is still patched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_patches_through_per_project_pnpm_link() {
+        let root = tempfile::tempdir().unwrap();
+        let nm = root.path().join("node_modules");
+        let real = nm.join(".pnpm/left-pad@1.3.0/node_modules/left-pad");
+        std::fs::create_dir_all(&real).unwrap();
+        let original = b"original".to_vec();
+        let patched = b"patched!".to_vec();
+        std::fs::write(real.join("index.js"), &original).unwrap();
+        std::os::unix::fs::symlink(&real, nm.join("left-pad")).unwrap();
+        let blobs = root.path().join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let after_hash = compute_git_sha256_from_bytes(&patched);
+        std::fs::write(blobs.join(&after_hash), &patched).unwrap();
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(&original),
+                after_hash,
+            },
+        );
+        let result = apply_package_patch(
+            "pkg:npm/left-pad@1.3.0",
+            &nm.join("left-pad"),
+            &files,
+            &PatchSources::blobs_only(&blobs),
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(std::fs::read(real.join("index.js")).unwrap(), patched);
     }
 }
