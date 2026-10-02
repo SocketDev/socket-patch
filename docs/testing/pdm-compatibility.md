@@ -76,12 +76,18 @@ Measured details:
   `venv.in_project = false` venv, or one bound with `pdm use <venv>`) or a
   conda env. A project with `uv.lock` or `poetry.lock` is not treated as
   PDM's. A base interpreter means PEP 582 (`__pypackages__/<X.Y>/lib`) only
-  when `python.use_venv` is off (`PDM_USE_VENV`, or `[python] use_venv` in
-  `pdm.toml` / `.pdm.toml`; off by default only for PDM 1.x). Otherwise the
+  when `python.use_venv` is off (`PDM_USE_VENV`, else `[python] use_venv` in
+  the first of the project's `pdm.toml` / `.pdm.toml`, the user config
+  (`$PDM_CONFIG_FILE` or `<user config dir>/pdm/config.toml`) and the site
+  config (`/etc/xdg/pdm/config.toml` or the first `$XDG_CONFIG_DIRS` entry,
+  `/Library/Application Support/pdm`, `%PROGRAMDATA%\pdm\pdm`), as a bool or
+  the string PDM 2.27+ writes; off by default only for PDM 1.x). Otherwise the
   activated or in-project venv is used, with `__pypackages__` as the last
   resort. `PDM_IGNORE_SAVED_PYTHON` and `PDM_IGNORE_ACTIVE_VENV` are
   honored, parsed as PDM parses booleans. Agent mode patches the env found,
-  and the hosted stale-install warning and `vex` check it.
+  and the hosted stale-install warning and `vex` check it. Global mode (`-g`)
+  reads `global_project.path`, `venv.location` and `python.install_root` from
+  the user and site configs alike.
 - **A non-default lock filename (`pdm lock -L custom.lock`) is invisible** to the
   scan, which only reads `pdm.lock`. A package locked at two versions (a marker
   fork) is refused (`pypi_pdm_lock_forked_package` / a version-mismatch refusal),

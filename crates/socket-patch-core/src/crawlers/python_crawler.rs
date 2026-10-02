@@ -486,27 +486,71 @@ async fn pdm_project_site_packages(
     (!found.is_empty()).then_some(found)
 }
 
-/// PDM's `python.use_venv` for `cwd`: `PDM_USE_VENV`, else `[python]
-/// use_venv` in the project's `pdm.toml` (PDM 2.x) or legacy `.pdm.toml`.
-/// Unset, it is on, except for a legacy PDM 1.x project (a `.pdm.toml` and
-/// no `.pdm-python`), where it defaulted to off.
+/// PDM's `python.use_venv` for `cwd`, resolved through PDM's config
+/// layers (see [`pdm_project_setting`]): `PDM_USE_VENV`, then `[python]
+/// use_venv` in the project, user and site configs. Unset, it is on,
+/// except for a legacy PDM 1.x project (a `.pdm.toml` and no
+/// `.pdm-python`), where it defaulted to off.
 async fn pdm_uses_venv(cwd: &Path, var: &impl Fn(&str) -> Option<String>) -> bool {
     if var("PDM_USE_VENV").is_some() {
         return pdm_env_flag(var, "PDM_USE_VENV");
     }
-    for config in ["pdm.toml", ".pdm.toml"] {
-        let Ok(text) = read_regular_to_string(&cwd.join(config)).await else {
+    if let Some(on) = pdm_project_setting(cwd, var, "python", "use_venv")
+        .await
+        .as_ref()
+        .and_then(pdm_config_bool)
+    {
+        return on;
+    }
+    !cwd.join(".pdm.toml").is_file() || cwd.join(".pdm-python").is_file()
+}
+
+/// The first `[table] key` set in PDM's file-backed config for the project
+/// at `cwd`, highest precedence first: the project's `pdm.toml` (PDM 2.x)
+/// or legacy `.pdm.toml`, then the user config ([`pdm_user_config_files`]),
+/// then the site config ([`pdm_site_config_dirs`]), the defaults layer PDM
+/// puts under the user config. Environment overrides are the caller's.
+async fn pdm_project_setting(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+    table: &str,
+    key: &str,
+) -> Option<toml_edit::Item> {
+    let home = var("HOME")
+        .or_else(|| var("USERPROFILE"))
+        .map(PathBuf::from);
+    let files = [cwd.join("pdm.toml"), cwd.join(".pdm.toml")]
+        .into_iter()
+        .chain(pdm_user_config_files(home.as_deref(), var))
+        .chain(
+            pdm_site_config_dirs(var)
+                .into_iter()
+                .map(|d| d.join("config.toml")),
+        );
+    for file in files {
+        let Ok(text) = read_regular_to_string(&file).await else {
             continue;
         };
         let setting = text
             .parse::<toml_edit::DocumentMut>()
             .ok()
-            .and_then(|doc| doc.get("python")?.get("use_venv")?.as_bool());
-        if let Some(on) = setting {
-            return on;
+            .and_then(|doc| doc.get(table)?.get(key).cloned());
+        if setting.is_some() {
+            return setting;
         }
     }
-    !cwd.join(".pdm.toml").is_file() || cwd.join(".pdm-python").is_file()
+    None
+}
+
+/// A boolean PDM config value as PDM reads it: a TOML bool, or a string
+/// parsed like PDM's `ensure_boolean` (PDM 2.27+ writes `pdm config`
+/// values as strings, e.g. `use_venv = "false"`).
+fn pdm_config_bool(item: &toml_edit::Item) -> Option<bool> {
+    item.as_bool().or_else(|| {
+        item.as_str().map(|v| {
+            !v.is_empty() && !matches!(v.to_ascii_lowercase().as_str(), "false" | "no" | "0")
+        })
+    })
 }
 
 /// A boolean PDM environment setting, parsed like PDM's `ensure_boolean`:
@@ -1947,26 +1991,78 @@ fn uv_dir_candidates(home_dir: &Path, override_var: &str, bucket: &str) -> Vec<P
 /// `~/Library/Application Support/pdm` on macOS, and
 /// `%LOCALAPPDATA%\pdm\pdm` on Windows.
 #[cfg_attr(windows, allow(unused_variables))]
-fn pdm_dir_candidates(home_dir: &Path, xdg_var: &str, unix_default: &Path) -> Vec<PathBuf> {
+fn pdm_dir_candidates(
+    home_dir: Option<&Path>,
+    var: &impl Fn(&str) -> Option<String>,
+    xdg_var: &str,
+    unix_default: &Path,
+) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     #[cfg(not(windows))]
-    if let Some(xdg) = absolute_env_dir(xdg_var) {
+    if let Some(xdg) = var(xdg_var).map(PathBuf::from).filter(|p| p.is_absolute()) {
         dirs.push(xdg.join("pdm"));
     }
     #[cfg(all(not(target_os = "macos"), not(windows)))]
-    dirs.push(home_dir.join(unix_default).join("pdm"));
+    dirs.extend(home_dir.map(|h| h.join(unix_default).join("pdm")));
     #[cfg(target_os = "macos")]
-    dirs.push(
-        home_dir
-            .join("Library")
-            .join("Application Support")
-            .join("pdm"),
-    );
+    dirs.extend(home_dir.map(|h| h.join("Library").join("Application Support").join("pdm")));
     #[cfg(windows)]
-    if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+    if let Some(local) = var("LOCALAPPDATA").filter(|v| !v.is_empty()) {
         dirs.push(PathBuf::from(local).join("pdm").join("pdm"));
     }
     dirs
+}
+
+/// PDM's user config file, as PDM picks it: `$PDM_CONFIG_FILE` when set,
+/// otherwise `config.toml` in the per-user config dir
+/// ([`pdm_dir_candidates`]).
+fn pdm_user_config_files(
+    home_dir: Option<&Path>,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    if let Some(custom) = var("PDM_CONFIG_FILE").filter(|v| !v.is_empty()) {
+        return vec![PathBuf::from(custom)];
+    }
+    pdm_dir_candidates(home_dir, var, "XDG_CONFIG_HOME", Path::new(".config"))
+        .into_iter()
+        .map(|d| d.join("config.toml"))
+        .collect()
+}
+
+/// PDM's site config dir (platformdirs' `site_config_path("pdm")`), whose
+/// `config.toml` PDM reads as the defaults under the user config: the
+/// first `$XDG_CONFIG_DIRS` entry (default `/etc/xdg`) + `/pdm` on Linux,
+/// `/Library/Application Support/pdm` on macOS, and
+/// `%PROGRAMDATA%\pdm\pdm` on Windows.
+#[cfg_attr(target_os = "macos", allow(unused_variables))]
+fn pdm_site_config_dirs(var: &impl Fn(&str) -> Option<String>) -> Vec<PathBuf> {
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    {
+        let dirs = var("XDG_CONFIG_DIRS").filter(|v| !v.trim().is_empty());
+        let first = dirs
+            .as_deref()
+            .unwrap_or("/etc/xdg")
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        (!first.is_empty())
+            .then(|| PathBuf::from(first).join("pdm"))
+            .into_iter()
+            .collect()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        vec![PathBuf::from("/Library/Application Support/pdm")]
+    }
+    #[cfg(windows)]
+    {
+        let base = var("PROGRAMDATA")
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| r"C:\ProgramData".to_string());
+        vec![PathBuf::from(base).join("pdm").join("pdm")]
+    }
 }
 
 /// `site-packages` of PDM's global installs:
@@ -1982,22 +2078,38 @@ fn pdm_dir_candidates(home_dir: &Path, xdg_var: &str, unix_default: &Path) -> Ve
 ///   `python.install_root` (default `<user data dir>/pdm/python`).
 ///
 /// The settings come from PDM's global config file, `$PDM_CONFIG_FILE`
-/// or `<user config dir>/pdm/config.toml`. Every candidate is collected,
-/// and the ones that don't exist yield nothing.
+/// or `<user config dir>/pdm/config.toml`, and from the site config
+/// ([`pdm_site_config_dirs`]) PDM layers under it. Every candidate is
+/// collected, and the ones that don't exist yield nothing.
 async fn pdm_global_site_packages(home_dir: &Path) -> Vec<PathBuf> {
-    let config_dirs = pdm_dir_candidates(home_dir, "XDG_CONFIG_HOME", Path::new(".config"));
+    pdm_global_site_packages_with(home_dir, &|name: &str| std::env::var(name).ok()).await
+}
+
+/// [`pdm_global_site_packages`] with the environment read through `env`.
+async fn pdm_global_site_packages_with(
+    home_dir: &Path,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    let config_dirs =
+        pdm_dir_candidates(Some(home_dir), env, "XDG_CONFIG_HOME", Path::new(".config"));
     let data_dirs = pdm_dir_candidates(
-        home_dir,
+        Some(home_dir),
+        env,
         "XDG_DATA_HOME",
         &Path::new(".local").join("share"),
     );
 
-    let mut config_files: Vec<PathBuf> = std::env::var_os("PDM_CONFIG_FILE")
+    let mut config_files: Vec<PathBuf> = env("PDM_CONFIG_FILE")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .into_iter()
         .collect();
     config_files.extend(config_dirs.iter().map(|d| d.join("config.toml")));
+    config_files.extend(
+        pdm_site_config_dirs(env)
+            .into_iter()
+            .map(|d| d.join("config.toml")),
+    );
 
     let mut projects = Vec::new();
     let mut install_roots = Vec::new();
@@ -2009,7 +2121,7 @@ async fn pdm_global_site_packages(home_dir: &Path) -> Vec<PathBuf> {
         if cfg!(windows) && name == "HOME" {
             return None;
         }
-        std::env::var(name).ok()
+        env(name)
     };
     for file in &config_files {
         let Ok(text) = read_regular_to_string(file).await else {
@@ -2838,6 +2950,220 @@ mod tests {
         assert!(find_local_venv_site_packages_with(&project, &no_env)
             .await
             .is_empty());
+    }
+
+    /// A PEP 582 PDM project (a saved base interpreter) beside a stray
+    /// `./.venv` PDM ignores, for the `python.use_venv` layer tests.
+    /// Returns `(project, __pypackages__ lib, stray .venv site)`.
+    fn pdm_pep582_fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let project = root.join("demo");
+        let lib = project.join("__pypackages__").join("3.12").join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"demo\"\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("pdm.lock"), "[metadata]\n").unwrap();
+        let base = root.join("usr").join("bin").join("python3.12");
+        std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+        std::fs::write(project.join(".pdm-python"), base.display().to_string()).unwrap();
+        let stray = fake_venv(&project, ".venv");
+        (project, lib, stray)
+    }
+
+    /// #609: PDM 2.27+ writes `pdm config -l python.use_venv false` as the
+    /// string `"false"`, which PDM parses like `ensure_boolean`.
+    #[tokio::test]
+    async fn pdm_use_venv_string_values_parse_like_pdm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, lib, stray) = pdm_pep582_fixture(tmp.path());
+        let no_env = env_of(&[]);
+        for off in ["\"false\"", "\"False\"", "\"no\"", "\"0\"", "\"\"", "false"] {
+            std::fs::write(
+                project.join("pdm.toml"),
+                format!("[python]\nuse_venv = {off}\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &no_env).await,
+                vec![lib.clone()],
+                "use_venv = {off}"
+            );
+        }
+        for on in ["\"true\"", "\"1\"", "true"] {
+            std::fs::write(
+                project.join("pdm.toml"),
+                format!("[python]\nuse_venv = {on}\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &no_env).await,
+                vec![stray.clone()],
+                "use_venv = {on}"
+            );
+        }
+    }
+
+    /// #609: `pdm config python.use_venv false` (no `-l`) writes the user
+    /// config, which PDM reads under the project's `pdm.toml`; so does a
+    /// `$PDM_CONFIG_FILE`.
+    #[tokio::test]
+    async fn pdm_use_venv_is_read_from_the_user_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, lib, stray) = pdm_pep582_fixture(tmp.path());
+        let config_home = tmp.path().join("config-home");
+        let local_app_data = tmp.path().join("local-app-data");
+        let user_config = if cfg!(windows) {
+            local_app_data.join("pdm").join("pdm").join("config.toml")
+        } else {
+            config_home.join("pdm").join("config.toml")
+        };
+        std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+        std::fs::write(&user_config, "[python]\nuse_venv = \"false\"\n").unwrap();
+        let user_env = env_of(&[
+            (
+                "XDG_CONFIG_HOME",
+                config_home.to_string_lossy().into_owned(),
+            ),
+            (
+                "LOCALAPPDATA",
+                local_app_data.to_string_lossy().into_owned(),
+            ),
+        ]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &user_env).await,
+            vec![lib.clone()]
+        );
+        // The project config outranks the user config...
+        std::fs::write(project.join("pdm.toml"), "[python]\nuse_venv = true\n").unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &user_env).await,
+            vec![stray.clone()]
+        );
+        std::fs::remove_file(project.join("pdm.toml")).unwrap();
+        // ...and PDM_USE_VENV outranks both.
+        let forced_on = env_of(&[
+            (
+                "XDG_CONFIG_HOME",
+                config_home.to_string_lossy().into_owned(),
+            ),
+            (
+                "LOCALAPPDATA",
+                local_app_data.to_string_lossy().into_owned(),
+            ),
+            ("PDM_USE_VENV", "1".to_string()),
+        ]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &forced_on).await,
+            vec![stray.clone()]
+        );
+        // `$PDM_CONFIG_FILE` replaces the user config file.
+        let custom = tmp.path().join("custom.toml");
+        std::fs::write(&custom, "[python]\nuse_venv = false\n").unwrap();
+        let custom_env = env_of(&[("PDM_CONFIG_FILE", custom.to_string_lossy().into_owned())]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &custom_env).await,
+            vec![lib.clone()]
+        );
+        let custom_over_user = env_of(&[
+            (
+                "XDG_CONFIG_HOME",
+                config_home.to_string_lossy().into_owned(),
+            ),
+            (
+                "LOCALAPPDATA",
+                local_app_data.to_string_lossy().into_owned(),
+            ),
+            (
+                "PDM_CONFIG_FILE",
+                tmp.path()
+                    .join("missing.toml")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &custom_over_user).await,
+            vec![stray]
+        );
+    }
+
+    /// The platformdirs site config dir a test can relocate: the first
+    /// `$XDG_CONFIG_DIRS` entry on Linux, `%PROGRAMDATA%\pdm\pdm` on
+    /// Windows. (macOS's `/Library/Application Support/pdm` is fixed.)
+    #[cfg(not(target_os = "macos"))]
+    fn pdm_test_site_config(root: &Path) -> (PathBuf, Vec<(&'static str, String)>) {
+        let xdg = root.join("etc").join("xdg");
+        let program_data = root.join("program-data");
+        let file = if cfg!(windows) {
+            program_data.join("pdm").join("pdm").join("config.toml")
+        } else {
+            xdg.join("pdm").join("config.toml")
+        };
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let other = root.join("etc").join("other-xdg");
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let env = vec![
+            (
+                "XDG_CONFIG_DIRS",
+                format!("{}{sep}{}", xdg.display(), other.display()),
+            ),
+            ("PROGRAMDATA", program_data.to_string_lossy().into_owned()),
+        ];
+        (file, env)
+    }
+
+    /// #609: the site config is PDM's lowest config layer, so a
+    /// machine-wide `python.use_venv = false` means PEP 582 too.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn pdm_use_venv_is_read_from_the_site_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, lib, stray) = pdm_pep582_fixture(tmp.path());
+        let (site, pairs) = pdm_test_site_config(tmp.path());
+        std::fs::write(&site, "[python]\nuse_venv = false\n").unwrap();
+        let env = env_of(&pairs);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &env).await,
+            vec![lib]
+        );
+        // The user config outranks it.
+        let custom = tmp.path().join("user.toml");
+        std::fs::write(&custom, "[python]\nuse_venv = true\n").unwrap();
+        let mut pairs = pairs;
+        pairs.push(("PDM_CONFIG_FILE", custom.to_string_lossy().into_owned()));
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &env_of(&pairs)).await,
+            vec![stray]
+        );
+    }
+
+    /// #566: `-g` reads PDM's global-project, venv and interpreter
+    /// locations from the site config as well as the user config.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn pdm_global_settings_are_read_from_the_site_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let (site, pairs) = pdm_test_site_config(tmp.path());
+        let global = tmp.path().join("opt").join("global");
+        let project_site = fake_venv(&global, ".venv");
+        let installs = tmp.path().join("opt").join("pythons");
+        let managed_site = fake_venv(&installs, "cpython@3.12.4");
+        std::fs::write(
+            &site,
+            format!(
+                "[global_project]\npath = {:?}\n[python]\ninstall_root = {:?}\n",
+                global.to_string_lossy(),
+                installs.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let found = pdm_global_site_packages_with(&home, &env_of(&pairs)).await;
+        assert!(found.contains(&project_site), "{found:?}");
+        assert!(found.contains(&managed_site), "{found:?}");
     }
 
     /// #525: uv syncs a project into `UV_PROJECT_ENVIRONMENT` (absolute, or
