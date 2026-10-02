@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-02 (run 7), main `61cfb9b`, latest release tag v4.0.0.
+Last updated: 2026-10-02 (run 8), main `61cfb9b`, latest release tag v4.0.0.
 
 ## Coverage matrix
 
@@ -55,6 +55,14 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | 4.0.17 | pass (refused) | pass (refused) | pass (refused) | pass (refused) | pass | pass |
 | 2.4.22 | untested | untested | untested | untested | pass | pass |
 
+### Run 8 (Linux, Ruby 3.3.6)
+
+| Bundler | Hosted: gem in two `group` blocks | Hosted: top-level + `group` dup | Vendored: dup decl | Vendored: CHECKSUMS lock (direct / transitive) | Vendored: `gemspec` transitive | Vendored: multi-platform lock | Vendored: native platform gem | Hosted: env `BUNDLE_CACHE_PATH` | Hosted: `BUNDLE_APP_CONFIG` + `Gemfile.next` | Hosted: `source … do` / `platforms:` / `install_if` / `group:` / quotes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 4.0.17 | fail #548 | fail #548 | pass (refused) | pass | pass | pass | refused (documented) | fail #483 (fixed in PR #532) | pass (refused) | pass |
+| 2.6.9 | fail #548 | untested | untested | pass | pass | untested | untested | untested | untested | untested |
+| 2.4.22 | fail #548 | untested | untested | n/a | pass | untested | untested | fail #483 (silent unpatched) | untested | untested |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -69,12 +77,11 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 ## Backlog
 
 1. **Maintainer request (still open):** global (`-g`) mode on every major version and OS. Remaining: macOS system Ruby and Homebrew Ruby; rbenv / rvm / chruby / asdf layouts; unicode or space-containing `--global-prefix`; a non-writable dir on macOS and Windows (Program Files); `-g` from inside a project on macOS and Windows. Re-check #421 once #442 merges.
-2. `BUNDLE_CACHE_PATH` from the environment (#483's variant); `vendor/cache` + `rollback`.
-3. #340 on Bundler 2.2–2.5 (Linux); re-run #340 / #482 / #507 once the Gemfile rewriter or `manifest::classify` changes.
+2. Re-verify #483 / #507 when PR #532 merges; re-run #548 / #340 / #482 when the hosted Gemfile rewriter changes (including `rollback` on a doubly-declared gem).
+3. #340 on Bundler 2.2–2.5 (Linux).
 4. Windows hosted and vendored cells: CRLF Gemfile / lock, a `BUNDLE_PATH` with a drive letter or spaces, `x64-mingw-ucrt` platform gems, and `vendor/bundle` deployment mode.
-5. Vendored transitive dep in a `gemspec` (PATH) project; vendored on a multi-platform CHECKSUMS lock.
-6. Windows local mode for a Bundler project on system gems (no `BUNDLE_PATH`): does #421 hide the project's gems too?
-7. Ruby 3.4 + Bundler 2.2 can't boot. Check the floor messaging, and run `scan` from a subdirectory of a Bundler project.
+5. Windows local mode for a Bundler project on system gems (no `BUNDLE_PATH`): does #421 hide the project's gems too?
+6. Ruby 3.4 + Bundler 2.2 can't boot. Check the floor messaging.
 
 ## Known non-bugs
 
@@ -100,3 +107,6 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 - Bundler's runtime `require "bundler/setup"` (without `bundle exec`) reads only the `BUNDLE_GEMFILE` env var, not `.bundle/config`; the CLI commands (`install`, `lock`, `exec`) let `.bundle/config` win. #507 is about the CLI order, which decides what gets installed.
 - Vendored mode refuses multi-line, conditional (`if`/`unless`), indented (`group`) and parenthesized `gem(...)` declarations with `gemfile_declaration_not_editable` and writes nothing. That's fail-closed by design, unlike the hosted rewriter (#340).
 - The vendor probes need `BUNDLER_VERSION=<v>` alongside `SOCKET_PATCH_BUNDLER_E2E_VERSION=<v>` to pick a Bundler older than the Ruby default (2.5.22 on 3.3.6).
+- `scan` run from a project subdirectory (or with `--cwd` pointing at one) scans 0 packages: the cwd is the project root, and there's no walk-up the way Bundler does it.
+- Vendoring a native platform gem (`ffi-…-x86_64-linux-gnu`) is refused with `platform_gem_unsupported`. Documented.
+- Hosted refuses a declaration with an inline `source:` option (`redirect_gem_source_option`). With `--vex` the scan exits 1 and writes no VEX. That's fail-closed by design.
