@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::vendor::lock_inventory::pypi::hosted_pypi_reference;
 
 use super::common::{ensure_unchanged, refuse_symlinked, serialize_json};
 use super::parse_memo::ParseMemo;
@@ -158,12 +159,16 @@ pub(super) async fn load_pipenv_project(
 /// Target-specific guards (also re-run by [`wire_pipenv`] right before
 /// writing). Entries match by PEP 503 canonical NAME in every package
 /// category. Registry pins and existing vendored wheel identities
-/// must both match the selected patch version.
+/// must both match the selected patch version. `hosted_origins` are the
+/// run's `--patch-server-url` origins: a hosted reference on one of them
+/// (or on patch.socket.dev) is refused with the rollback remedy, any other
+/// file reference as user-declared.
 pub(super) fn check_target_guards(
     p: &PipenvProject,
     canon_name: &str,
     record_uuid: &str,
     version: &str,
+    hosted_origins: &[String],
 ) -> Result<PipenvTarget, (&'static str, String)> {
     let entries = find_entries(&p.lock, canon_name);
     if entries.is_empty() {
@@ -229,7 +234,7 @@ pub(super) fn check_target_guards(
                 // Socket's own HOSTED reference (`scan --mode hosted`): the
                 // two modes do not take each other over for Pipenv yet — name
                 // the remedy instead of calling our wiring user-declared.
-                _ if is_socket_hosted_reference(file_ref) => {
+                _ if hosted_pypi_reference(file_ref, hosted_origins).is_some() => {
                     return Err((
                         "pypi_pipenv_source_already_exists",
                         format!(
@@ -282,6 +287,7 @@ pub(super) fn check_target_guards(
 /// pinned pipenv serialization). `rel_wheel` is the project-relative wheel
 /// path (`.socket/vendor/pypi/<uuid>/<wheel>`, no `./` prefix — the
 /// fixture's `./` spelling is applied here).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn wire_pipenv(
     p: &PipenvProject,
     root: &Path,
@@ -290,10 +296,11 @@ pub(super) async fn wire_pipenv(
     rel_wheel: &str,
     wheel_sha256_hex: &str,
     record_uuid: &str,
+    hosted_origins: &[String],
 ) -> Result<(Vec<WiringRecord>, PipenvMeta), (&'static str, String)> {
     // Before ANY write: a symlinked lock would be replaced by the rename-over.
     refuse_symlinked(root, &[LOCK_FILE], "pypi_pipenv_symlink_unsupported").await?;
-    match check_target_guards(p, canon_name, record_uuid, version)? {
+    match check_target_guards(p, canon_name, record_uuid, version, hosted_origins)? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
         // "original").
@@ -609,18 +616,6 @@ fn find_entries<'a>(lock: &'a Value, canon_name: &str) -> Vec<(&'a str, String, 
     out
 }
 
-/// A hosted Socket patch reference as `scan --mode hosted` writes it:
-/// `https://<host>/patch/pypi/<name>/<version>/<grant>/<uuid>/<wheel>[#sha256=…]`.
-fn is_socket_hosted_reference(value: &str) -> bool {
-    let Some(rest) = value.strip_prefix("https://") else {
-        return false;
-    };
-    let path = rest.split_once('/').map(|(_, path)| path).unwrap_or("");
-    let path = path.split('#').next().unwrap_or("");
-    let parts: Vec<&str> = path.split('/').collect();
-    parts.len() == 7 && parts[0] == "patch" && parts[1] == "pypi" && parts[6].ends_with(".whl")
-}
-
 /// Pipenv preserves a lock's CRLF line endings; so do we, on both writes.
 fn with_line_ending(text: String, crlf: bool) -> String {
     if crlf {
@@ -865,7 +860,7 @@ mod tests {
     }
 
     async fn wire_default(p: &PipenvProject, root: &Path) -> (Vec<WiringRecord>, PipenvMeta) {
-        wire_pipenv(p, root, "six", "1.16.0", REL_WHEEL, WHEEL_SHA, UUID)
+        wire_pipenv(p, root, "six", "1.16.0", REL_WHEEL, WHEEL_SHA, UUID, &[])
             .await
             .unwrap()
     }
@@ -887,7 +882,7 @@ mod tests {
             let tmp = write_lock(before).await;
             let p = load_pipenv_project(tmp.path()).await.unwrap();
             assert_eq!(
-                check_target_guards(&p, "six", UUID, "1.16.0").unwrap(),
+                check_target_guards(&p, "six", UUID, "1.16.0", &[]).unwrap(),
                 PipenvTarget::Fresh
             );
 
@@ -1023,7 +1018,7 @@ mod tests {
         // package missing from both sections
         let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
-        let err = check_target_guards(&p, "absent-pkg", UUID, "1.16.0").unwrap_err();
+        let err = check_target_guards(&p, "absent-pkg", UUID, "1.16.0", &[]).unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_lock_package_missing");
 
         // user-declared file reference
@@ -1033,7 +1028,7 @@ mod tests {
         );
         let tmp = write_lock(&user).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
-        let err = check_target_guards(&p, "six", UUID, "1.16.0").unwrap_err();
+        let err = check_target_guards(&p, "six", UUID, "1.16.0", &[]).unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_source_already_exists");
         assert!(err.1.contains("user-declared"), "{}", err.1);
 
@@ -1044,21 +1039,63 @@ mod tests {
         );
         let tmp = write_lock(&git).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
-        let err = check_target_guards(&p, "six", UUID, "1.16.0").unwrap_err();
+        let err = check_target_guards(&p, "six", UUID, "1.16.0", &[]).unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_source_already_exists");
         assert!(err.1.contains("git"), "{}", err.1);
 
         // wire re-runs the guards itself (refusal before any write)
         let before = read_lock(tmp.path()).await;
-        let err = wire_pipenv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_SHA, UUID)
-            .await
-            .unwrap_err();
+        let err = wire_pipenv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_SHA,
+            UUID,
+            &[],
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_source_already_exists");
         assert_eq!(
             read_lock(tmp.path()).await,
             before,
             "refusal writes nothing"
         );
+    }
+
+    /// The hosted-reference remedy follows the shared recognizer
+    /// (`hosted_pypi_reference`, #563): a `/patch/pypi/…` URL on a foreign
+    /// host is user-declared, while a hosted sdist, a hosted wheel on a
+    /// path-prefixed `--patch-server-url` origin and the public service are
+    /// Socket's own (the private segment-count grammar got all three wrong).
+    #[tokio::test]
+    async fn hosted_reference_remedy_follows_the_shared_recognizer() {
+        const VENDORED: &str =
+            "./.socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl";
+        const TAIL: &str = "patch/pypi/six/1.16.0/grant/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+        let custom = vec!["https://patches.internal.example/socket".to_string()];
+        let cases: [(String, &[String], bool); 5] = [
+            (format!("https://evil.example/{TAIL}/six-1.16.0-py2.py3-none-any.whl"), &custom, false),
+            (format!("https://patch.socket.dev/{TAIL}/six-1.16.0.tar.gz"), &[], true),
+            (format!("https://patch.socket.dev/{TAIL}/six-1.16.0-py2.py3-none-any.whl"), &[], true),
+            (format!("https://patches.internal.example/socket/{TAIL}/six-1.16.0-py2.py3-none-any.whl"), &custom, true),
+            // A configured origin is only trusted when the run configures it.
+            (format!("https://patches.internal.example/socket/{TAIL}/six-1.16.0-py2.py3-none-any.whl"), &[], false),
+        ];
+        for (url, origins, hosted) in cases {
+            let tmp = write_lock(&LOCK_DIRECT_VENDORED.replace(VENDORED, &url)).await;
+            let p = load_pipenv_project(tmp.path()).await.unwrap();
+            let err = check_target_guards(&p, "six", UUID, "1.16.0", origins).unwrap_err();
+            assert_eq!(err.0, "pypi_pipenv_source_already_exists", "{url}");
+            let expected = if hosted {
+                "HOSTED Socket patch"
+            } else {
+                "user-declared"
+            };
+            assert!(err.1.contains(expected), "{url}: {}", err.1);
+        }
     }
 
     /// Re-running vendor on an already-wired lock with the SAME uuid is the
@@ -1069,12 +1106,12 @@ mod tests {
         let tmp = write_lock(LOCK_DIRECT_VENDORED).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
         assert_eq!(
-            check_target_guards(&p, "six", UUID, "1.16.0").unwrap(),
+            check_target_guards(&p, "six", UUID, "1.16.0", &[]).unwrap(),
             PipenvTarget::InSync
         );
 
         let stale_uuid = "00000000-0000-4000-8000-000000000000";
-        let err = check_target_guards(&p, "six", stale_uuid, "1.16.0").unwrap_err();
+        let err = check_target_guards(&p, "six", stale_uuid, "1.16.0", &[]).unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_source_already_exists");
         assert!(err.1.contains("--revert"), "{}", err.1);
         assert!(err.1.contains(UUID), "names the wired uuid: {}", err.1);
@@ -1086,7 +1123,7 @@ mod tests {
     async fn load_and_guards_write_nothing() {
         let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
-        let _ = check_target_guards(&p, "six", UUID, "1.16.0").unwrap();
+        let _ = check_target_guards(&p, "six", UUID, "1.16.0", &[]).unwrap();
         assert_eq!(read_lock(tmp.path()).await, LOCK_DIRECT_REGISTRY);
     }
 
@@ -1379,7 +1416,7 @@ mod tests {
         let tmp = write_lock(&to_canonical_json(&lock)).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
 
-        let err = check_target_guards(&p, "six", UUID, "1.16.0").unwrap_err();
+        let err = check_target_guards(&p, "six", UUID, "1.16.0", &[]).unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_lock_parse_failed");
         assert!(
             err.1.contains("default.six is not a JSON object"),
@@ -1397,9 +1434,18 @@ mod tests {
         let tmp = write_lock(LOCK_DIRECT_VENDORED).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
 
-        let err = wire_pipenv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_SHA, UUID)
-            .await
-            .unwrap_err();
+        let err = wire_pipenv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_SHA,
+            UUID,
+            &[],
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_source_already_exists");
         assert!(err.1.contains("nothing to wire"), "{}", err.1);
         assert_eq!(
@@ -1420,7 +1466,7 @@ mod tests {
         let tmp = write_lock(&before_text).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
         assert_eq!(
-            check_target_guards(&p, "six", UUID, "1.16.0").unwrap(),
+            check_target_guards(&p, "six", UUID, "1.16.0", &[]).unwrap(),
             PipenvTarget::Fresh,
             "the absent develop section is skipped, not an error"
         );
@@ -1453,7 +1499,7 @@ mod tests {
         let tmp = write_lock(&before_text).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
         assert_eq!(
-            check_target_guards(&p, "six", UUID, "1.16.0").unwrap(),
+            check_target_guards(&p, "six", UUID, "1.16.0", &[]).unwrap(),
             PipenvTarget::Fresh,
             "the registry-shaped develop entry keeps the target Fresh"
         );
@@ -1499,9 +1545,18 @@ mod tests {
             .await
             .unwrap();
 
-        let err = wire_pipenv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_SHA, UUID)
-            .await
-            .unwrap_err();
+        let err = wire_pipenv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_SHA,
+            UUID,
+            &[],
+        )
+        .await
+        .unwrap_err();
         tokio::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))
             .await
             .unwrap();
@@ -1745,7 +1800,7 @@ mod tests {
         let before = to_canonical_json(&lock);
         let tmp = write_lock(&before).await;
         let project = load_pipenv_project(tmp.path()).await.unwrap();
-        assert!(check_target_guards(&project, "six", UUID, "1.17.0").is_err());
+        assert!(check_target_guards(&project, "six", UUID, "1.17.0", &[]).is_err());
         let (wiring, meta) = wire_default(&project, tmp.path()).await;
         let rewritten: Value = serde_json::from_str(&read_lock(tmp.path()).await).unwrap();
         assert_eq!(
@@ -1773,7 +1828,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, root.join(LOCK_FILE)).unwrap();
 
         let p = load_pipenv_project(&root).await.unwrap();
-        let err = wire_pipenv(&p, &root, "six", "1.16.0", REL_WHEEL, WHEEL_SHA, UUID)
+        let err = wire_pipenv(&p, &root, "six", "1.16.0", REL_WHEEL, WHEEL_SHA, UUID, &[])
             .await
             .unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_symlink_unsupported");
@@ -1820,9 +1875,18 @@ mod tests {
             .await
             .unwrap();
 
-        let err = wire_pipenv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_SHA, UUID)
-            .await
-            .unwrap_err();
+        let err = wire_pipenv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_SHA,
+            UUID,
+            &[],
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_changed");
         assert!(err.1.contains("changed during vendoring"), "{}", err.1);
         assert_eq!(
