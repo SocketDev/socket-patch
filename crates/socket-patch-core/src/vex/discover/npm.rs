@@ -56,7 +56,7 @@ use crate::formats::pnpm::{
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::pnpm::rush_lock_rels;
 use crate::vendor::lock_inventory::{
-    npm_lock_bundled_nodes, npm_lock_nodes, LockIntegrity, NpmLockNode,
+    npm_lock_bundled_nodes, npm_lock_located_nodes, LockIntegrity, NpmLockNode,
 };
 use crate::vendor::npm_origin::{npm_non_registry_entries, NpmOverrides};
 
@@ -73,11 +73,11 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 
 /// What one parsed npm lock wires, plus the packages it resolves ELSEWHERE
 /// (an entry whose `resolved` is not a Socket reference) and the packages it
-/// installs BUNDLED (purl → the first bundled entry's lock location).
+/// installs BUNDLED (each purl → the first such entry's lock location).
 struct NpmLockRefs {
     file: &'static str,
     refs: Vec<PatchedRef>,
-    unwired: BTreeSet<String>,
+    unwired: BTreeMap<String, String>,
     bundled: BTreeMap<String, String>,
 }
 
@@ -95,7 +95,11 @@ struct NpmLockRefs {
 ///
 /// A bundled copy of the ref's `name@version` in either lock contests it
 /// too, the same lock included (#325): the rewired entry and the bundled
-/// copy install side by side, and the bundled one stays unpatched.
+/// copy install side by side, and the bundled one stays unpatched. So does
+/// another entry of the ref's OWN lock that resolves the same
+/// `name@version` elsewhere (#588 — e.g. a workspace member added after
+/// the rewire, then `npm install`): npm installs every entry, and that one
+/// fetches the unpatched registry bytes.
 fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
     let wired: Vec<BTreeSet<String>> = locks
         .iter()
@@ -124,8 +128,23 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
                 );
                 continue;
             }
+            if let Some(location) = lock.unwired.get(&r.purl) {
+                out.diag(
+                    DIAG_REF_UNATTRIBUTABLE,
+                    lock.file,
+                    format!(
+                        "{}: {} is wired to Socket patch {} but another entry of the same \
+                         lock, {location:?}, still resolves that version elsewhere; npm \
+                         installs both, so that copy stays unpatched and the patch is not \
+                         attested — re-run `socket-patch vendor` / `scan --mode hosted` to \
+                         rewire every copy",
+                        lock.file, r.purl, r.uuid,
+                    ),
+                );
+                continue;
+            }
             let contested_by = locks.iter().enumerate().find(|(j, other)| {
-                *j != i && other.unwired.contains(&r.purl) && !wired[*j].contains(&r.purl)
+                *j != i && other.unwired.contains_key(&r.purl) && !wired[*j].contains(&r.purl)
             });
             if let Some((_, other)) = contested_by {
                 out.diag(
@@ -159,7 +178,7 @@ async fn extract_package_lock(
     let mut read = NpmLockRefs {
         file,
         refs: Vec::new(),
-        unwired: BTreeSet::new(),
+        unwired: BTreeMap::new(),
         bundled: BTreeMap::new(),
     };
     let doc: Value = match parse_json(file, &bytes) {
@@ -175,8 +194,8 @@ async fn extract_package_lock(
     // registry must not become a ref (with no install it would attest from
     // the lockfile basis) — the shared walk reads the mirror only for a v1
     // lock.
-    for node in npm_lock_nodes(&doc) {
-        entry_ref(ctx, file, &node, &mut read, out);
+    for (location, node) in npm_lock_located_nodes(&doc) {
+        entry_ref(ctx, file, &location, &node, &mut read, out);
     }
     // Bundled entries are never refs (a Socket url written there wires
     // nothing), but each one IS an install of that `name@version` from a
@@ -233,7 +252,7 @@ fn drop_non_registry_installs(
             continue;
         };
         out.resolved_elsewhere(file, Some(purl.clone()));
-        read.unwired.insert(purl.clone());
+        read.unwired.entry(purl.clone()).or_insert_with(|| key.clone());
         unpatched.push((purl, key, reason));
     }
     read.refs.retain(|r| {
@@ -259,6 +278,7 @@ fn drop_non_registry_installs(
 fn entry_ref(
     ctx: &DiscoverCtx<'_>,
     file: &str,
+    location: &str,
     node: &NpmLockNode<'_>,
     read: &mut NpmLockRefs,
     out: &mut Discovery,
@@ -292,7 +312,9 @@ fn entry_ref(
         // (the npm pair here, any other lock by the orchestrator).
         if let Some(purl) = node.version.and_then(|v| npm_purl(name, v)) {
             out.resolved_elsewhere(file, Some(purl.clone()));
-            read.unwired.insert(purl);
+            read.unwired
+                .entry(purl)
+                .or_insert_with(|| location.to_string());
         }
         return;
     };
@@ -1096,6 +1118,78 @@ mod tests {
         let out = run(&p).await;
         assert!(out.refs.is_empty(), "{:#?}", out.refs);
         assert_eq!(bundled_contests(&out).len(), 2, "{:#?}", out.diagnostics);
+    }
+
+    /// The `DIAG_REF_UNATTRIBUTABLE` diagnostics that name an unwired copy
+    /// in the ref's own lock.
+    fn same_lock_contests(out: &Discovery) -> Vec<&Diag> {
+        out.diagnostics
+            .iter()
+            .filter(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("another entry"))
+            .collect()
+    }
+
+    /// REGRESSION (#588): the lock rewires one copy of `name@version`
+    /// (`packages/a/node_modules/is-number`), but a second entry for the
+    /// SAME `name@version` in the SAME lock (a workspace member added after
+    /// vendoring, then `npm install`) still resolves from the registry.
+    /// `npm ci` installs that copy unpatched, so the ref is not attested, in
+    /// either mode, and the uuid stays recognized (the ledger record is dead
+    /// too). A registry copy of a DIFFERENT version contests nothing.
+    #[tokio::test]
+    async fn issue_588_unwired_registry_copy_in_the_same_lock_contests_the_ref() {
+        let hosted = hosted_url("npm", "is-number", "6.0.0", UUID_A, "is-number-6.0.0.tgz");
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/is-number-6.0.0.tgz");
+        let registry = |v: &str| format!("https://registry.npmjs.org/is-number/-/is-number-{v}.tgz");
+        for (label, resolved, uuid, mode) in [
+            ("hosted", hosted.clone(), UUID_A, WiringMode::Hosted),
+            ("vendored", vendored.clone(), UUID_B, WiringMode::Vendored),
+        ] {
+            let p = Project::new();
+            p.write(
+                "package-lock.json",
+                lock_with_packages(serde_json::json!({
+                    "packages/a": { "name": "a", "version": "1.0.0" },
+                    "packages/b": { "name": "b", "version": "1.0.0" },
+                    "node_modules/a": { "resolved": "packages/a", "link": true },
+                    "node_modules/b": { "resolved": "packages/b", "link": true },
+                    "node_modules/is-number": { "version": "7.0.0", "resolved": registry("7.0.0"), "integrity": "sha512-SEVEN" },
+                    "packages/a/node_modules/is-number": { "version": "6.0.0", "resolved": resolved, "integrity": SRI },
+                    "packages/b/node_modules/is-number": { "version": "6.0.0", "resolved": registry("6.0.0"), "integrity": "sha512-ORIG" },
+                })),
+            );
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{label}: {:#?}", out.refs);
+            let contested = same_lock_contests(&out);
+            assert_eq!(contested.len(), 1, "{label}: {:#?}", out.diagnostics);
+            assert!(
+                contested[0].detail.contains("pkg:npm/is-number@6.0.0")
+                    && contested[0]
+                        .detail
+                        .contains("packages/b/node_modules/is-number")
+                    && contested[0].detail.contains("re-run"),
+                "{label}: {:#?}",
+                contested[0]
+            );
+            assert!(out.recognizes(uuid, mode), "{label}: {:#?}", out.recognized);
+        }
+
+        // Control: the only other copy is a different version (7.0.0 above),
+        // so the wired 6.0.0 entry is still attested.
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({
+                "node_modules/is-number": { "version": "7.0.0", "resolved": registry("7.0.0"), "integrity": "sha512-SEVEN" },
+                "packages/a/node_modules/is-number": { "version": "6.0.0", "resolved": hosted, "integrity": SRI },
+            })),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:npm/is-number@6.0.0", UUID_A, WiringMode::Hosted)],
+        );
+        assert!(same_lock_contests(&out).is_empty(), "{:#?}", out.diagnostics);
     }
 
     /// #490: a git edge the project's `overrides` send to the registry is
