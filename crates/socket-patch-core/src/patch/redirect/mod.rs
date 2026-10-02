@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use regex::Regex;
+use regex::{NoExpand, Regex};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -3389,6 +3389,15 @@ fn rewrite_yarn_berry(
         preflight_yarn_berry_hosted(raw, files.get(".yarnrc.yml").map(String::as_str))
     {
         result.warnings.push(warning);
+        // Nothing is verified, so nothing is confirmed — but a dep this lock
+        // locks is still this rewriter's to decide: an earlier run's URL in
+        // the lock must not confirm it through the text probe.
+        let lf = to_lf(body);
+        for dep in &npm {
+            if berry_lock_locks(&lf, &full_name(dep), &dep.version) {
+                result.yarn_berry_uuids.insert(dep.patch_uuid.clone());
+            }
+        }
         return;
     }
     let eol = LineEndings::of(body);
@@ -3731,21 +3740,27 @@ fn rewrite_yarn_berry(
         let resolution = format!("{fname}@{}", dep.artifact_url);
         let body_lines = block.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
         let mut rewritten = format!("\n{new_key}:\n{body_lines}");
+        // `NoExpand`: the URL is literal text, and a `$` in it (a patch
+        // server path) must never be read as a capture-group reference.
         rewritten = resolution_re
-            .replace(&rewritten, format!("\n  resolution: \"{resolution}\"").as_str())
+            .replace(
+                &rewritten,
+                NoExpand(&format!("\n  resolution: \"{resolution}\"")),
+            )
             .to_string();
         match &checksum {
             Some(checksum) if checksum_re.is_match(&rewritten) => {
                 rewritten = checksum_re
-                    .replace(&rewritten, format!("\n  checksum: {checksum}").as_str())
+                    .replace(&rewritten, NoExpand(&format!("\n  checksum: {checksum}")))
                     .to_string();
             }
             Some(checksum) => {
                 rewritten = resolution_re
                     .replace(
                         &rewritten,
-                        format!("\n  resolution: \"{resolution}\"\n  checksum: {checksum}")
-                            .as_str(),
+                        NoExpand(&format!(
+                            "\n  resolution: \"{resolution}\"\n  checksum: {checksum}"
+                        )),
                     )
                     .to_string();
             }
@@ -3838,6 +3853,25 @@ fn berry_sort_key(block: &str) -> Option<&str> {
 pub(crate) fn berry_entries_sorted(blocks: &[String]) -> bool {
     let keys: Vec<&str> = blocks.iter().filter_map(|b| berry_sort_key(b)).collect();
     keys.windows(2).all(|w| w[0] <= w[1])
+}
+
+/// Whether an LF-normalized berry lock holds an entry for `name` at
+/// `version`, under any descriptor (npm, tarball, `patch:`, …).
+fn berry_lock_locks(content: &str, name: &str, version: &str) -> bool {
+    use crate::vendor::yarn_classic_lock::{split_berry_key_patterns, split_pattern};
+    let version_line = format!("\n  version: {version}\n");
+    content.split("\n\n").any(|block| {
+        let Some(key) = block.lines().next().and_then(|l| l.strip_suffix(':')) else {
+            return false;
+        };
+        if key.starts_with([' ', '\t', '#']) || key == "__metadata" {
+            return false;
+        }
+        format!("{block}\n").contains(&version_line)
+            && split_berry_key_patterns(key)
+                .iter()
+                .any(|p| split_pattern(p).is_some_and(|(n, _)| n == name))
+    })
 }
 
 /// The root manifest the yarn berry hosted pin edits.
@@ -8212,6 +8246,78 @@ mod tests {
             );
             assert!(r.yarn_berry_uuids.is_empty(), "{:?}", r.warnings);
         }
+    }
+
+    /// A berry lock the preflight refuses (here an unsupported cacheKey)
+    /// verifies nothing, so it confirms nothing — yet the deps it locks stay
+    /// the berry rewriter's: an earlier run's URL in the lock must not
+    /// confirm them through the hosted text probe.
+    #[test]
+    fn yarn_berry_preflight_refusal_owns_locked_deps_without_confirming() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let mut first = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut first,
+        );
+        let refused = berry_files(
+            first.files["yarn.lock"].replace("cacheKey: 10c0", "cacheKey: 8c0"),
+            berry_manifest(),
+        );
+        let unlocked = berry_override("right-pad", "1.0.0", &url, &checksum);
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&refused, &[ovr, unlocked], &mut r);
+        assert_eq!(r.warnings[0].code, "redirect_yarn_berry_cache_unsupported");
+        assert!(r.files.is_empty());
+        assert_eq!(
+            r.yarn_berry_uuids.iter().collect::<Vec<_>>(),
+            vec![BERRY_UUID],
+            "only the locked dep is owned"
+        );
+        assert!(r.confirmed_yarn_berry_uuids.is_empty());
+    }
+
+    /// The artifact URL is spliced as literal text: a `$` in it (legal in a
+    /// URL path) must not be expanded as a regex capture reference.
+    #[test]
+    fn yarn_berry_artifact_url_dollar_is_written_literally() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = "https://patch.socket.dev/patch/npm/left-pad/1.3.0/t$0k$1/u/left-pad-1.3.0.tgz";
+        let ovr = berry_override("left-pad", "1.3.0", url, &checksum);
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut r,
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = &r.files["yarn.lock"];
+        assert!(
+            out.contains(&format!(
+                "\"left-pad@{url}\":\n  version: 1.3.0\n  resolution: \"left-pad@{url}\"\n  \
+                 checksum: {checksum}\n"
+            )),
+            "{out}"
+        );
+        // ... and the checksum-line insertion path, for a lock without one.
+        let no_checksum_line =
+            berry_lock("10c0").replace(&format!("  checksum: 10c0/{}\n", "3".repeat(128)), "");
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(no_checksum_line, berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut r,
+        );
+        let out = &r.files["yarn.lock"];
+        assert!(
+            out.contains(&format!(
+                "  resolution: \"left-pad@{url}\"\n  checksum: {checksum}\n"
+            )),
+            "{out}"
+        );
     }
 
     /// A rescan whose grant lacks the `yarnBerry10c0` checksum still
