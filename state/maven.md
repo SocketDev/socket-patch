@@ -62,13 +62,13 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 
 ### v5 vendored reactor: version boundaries, CI-friendly versions, implicit subprojects, #584 siblings (run 10, Linux)
 
-| Maven | stock reactor capstone | `${revision}` root + `-Drevision` in maven.config | #584 sibling: literal added to `b` | #584 sibling: module under second local root added later | second local root at vendor time | 4.1.0 implicit subprojects (no `<subprojects>`) | explicit `<subprojects>` control |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 3.6.3 | pass | blocked (429) | untested | fail #584 | pass | n/a | n/a |
-| 3.8.8 | pass | untested | untested | untested | untested | n/a | n/a |
-| 3.9.0 / 3.9.1 / 3.9.2 | pass | untested | untested | untested | untested | n/a | n/a |
-| 3.9.16 | pass | pass | fail #584 | fail #584 | pass | n/a | n/a |
-| 4.0.0-rc-7 | pass | pass | untested | fail #584 | pass | fail #622 | pass |
+| Maven | `.gitignore *.jar` (handover from gradle) | stock reactor capstone | `${revision}` root + `-Drevision` in maven.config | #584 sibling: literal added to `b` | #584 sibling: module under second local root added later | second local root at vendor time | 4.1.0 implicit subprojects (no `<subprojects>`) | explicit `<subprojects>` control |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 3.6.3 | untested | pass | blocked (429) | untested | fail #584 | pass | n/a | n/a |
+| 3.8.8 | untested | pass | untested | untested | untested | untested | n/a | n/a |
+| 3.9.0 / 3.9.1 / 3.9.2 | untested | pass | untested | untested | untested | untested | n/a | n/a |
+| 3.9.16 | fail #620 (comment) | pass | pass | fail #584 | fail #584 | pass | n/a | n/a |
+| 4.0.0-rc-7 | untested | pass | pass | untested | fail #584 | pass | fail #622 | pass |
 
 ### v5 hosted Trusted Checksums boundary (#258, run 5, Linux)
 
