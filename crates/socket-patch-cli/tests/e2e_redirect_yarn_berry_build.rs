@@ -3,8 +3,8 @@
 //! `e2e_redirect_npm_build.rs`.
 //!
 //! `scan --mode hosted` never lands patched bytes in the repo: it rewrites
-//! `yarn.lock` so the patched dependency resolves via
-//! `npm:<v>::__archiveUrl=<hosted-tgz>` with `checksum: 10c0/<hex>` (yarn's
+//! `yarn.lock` so the patched dependency resolves via the tarball-URL
+//! locator `<name>@<hosted-tgz>` with `checksum: 10c0/<hex>` (yarn's
 //! cache-zip sha512); v5 keeps no redirect ledger — the lock pin is the
 //! whole hosted state. This test proves every link against the REAL
 //! `corepack yarn@4.12.0`:
@@ -16,16 +16,19 @@
 //!      extract the EXACT `10c0/<hex>` checksum yarn computes for that
 //!      tarball's cache zip — the value the redirect mock must hand back
 //!      (yarn recomputes the same zip checksum whether the locator is `file:`
-//!      or `::__archiveUrl=`, so `--check-cache` will accept it).
+//!      or a tarball URL, so `--check-cache` will accept it).
 //!   3. `scan --mode hosted --json --vex` (the real binary): yarn.lock now
-//!      pins the hosted `__archiveUrl` + the `10c0` checksum, NO ledger is
+//!      pins the hosted tarball URL + the `10c0` checksum, NO ledger is
 //!      written, the in-run VEX is the `(redirected)` attestation.
 //!   4. FRESH-CHECKOUT PROOF: only package.json + yarn.lock + .yarnrc.yml +
 //!      .socket/ travel; `yarn install --immutable --check-cache` (offline
 //!      from the registry, `unsafeHttpWhitelist` for the wiremock host) MUST
-//!      install the patched bytes from the hosted tarball.
+//!      install the patched bytes from the hosted tarball — with an npm
+//!      registry token configured (`YARN_NPM_AUTH_TOKEN` + `npmAlwaysAuth`)
+//!      that the patch host must never receive (#404: an `npm:` locator made
+//!      yarn's npm fetcher send it).
 //!
-//! The negative twin serves a DIFFERENT tarball at the archiveUrl while the
+//! The negative twin serves a DIFFERENT tarball at the hosted URL while the
 //! lock keeps the real `10c0` checksum: the fresh `--check-cache` install MUST
 //! fail with a YN0018 checksum error — the lock pin is enforcement.
 //!
@@ -267,6 +270,9 @@ struct BerryRedirectFixture {
     host: String,
     /// `yarn.lock` as the real yarn wrote it, BEFORE the hosted rewrite.
     registry_lock: Vec<u8>,
+    /// The root `package.json` BEFORE the hosted rewrite (#404 option C
+    /// pins through its `resolutions`, so a revert restores both files).
+    registry_pkg: Vec<u8>,
     _server: MockServer,
 }
 
@@ -286,7 +292,7 @@ enum HostedDriver {
 /// Steps 1–3: real install, patched tarball + bootstrap checksum + API mocks,
 /// the hosted rewrite (per `driver`: `scan --mode hosted --vex` or
 /// `get <uuid> --mode hosted`), and the envelope/lockfile/ledger assertions.
-/// `tamper_served_tarball` serves DIFFERENT bytes at the archiveUrl than the
+/// `tamper_served_tarball` serves DIFFERENT bytes at the hosted URL than the
 /// checksum pins. `None` = skip (message printed).
 async fn berry_hosted_project(
     tag: &str,
@@ -347,6 +353,7 @@ async fn berry_hosted_project(
     let installed_dir = proj.join("node_modules").join(DEP);
     let orig = std::fs::read(installed_dir.join("index.js")).expect("installed index.js");
     let registry_lock = std::fs::read(proj.join("yarn.lock")).expect("registry yarn.lock");
+    let registry_pkg = std::fs::read(proj.join("package.json")).expect("registry package.json");
     assert!(
         !orig.starts_with(MARKER.as_bytes()),
         "pristine install must not carry the marker"
@@ -549,12 +556,33 @@ async fn berry_hosted_project(
         );
     }
 
-    // Lockfile pin: the encoded __archiveUrl + the 10c0 checksum.
+    // Lockfile pin: the tarball-URL locator + the 10c0 checksum. Never an
+    // `npm:` locator (`::__archiveUrl=`): yarn's npm fetcher sends registry
+    // auth to whatever host that locator names (#404).
     let lock = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
-    let encoded = socket_patch_core::utils::uri::encode_uri_component(&hosted_url);
     assert!(
-        lock.contains("::__archiveUrl=") && lock.contains(&encoded),
-        "yarn.lock must carry the encoded __archiveUrl; got:\n{lock}"
+        lock.contains(&format!("\n  resolution: \"{DEP}@{hosted_url}\"")),
+        "yarn.lock must pin the hosted tarball locator; got:\n{lock}"
+    );
+    // #404 option C: the entry is keyed by the tarball descriptor, and the
+    // root package.json routes the locked descriptor there.
+    assert!(
+        lock.lines()
+            .any(|l| l.trim_end_matches('\r') == format!("\"{DEP}@{hosted_url}\":")),
+        "yarn.lock entry must be keyed by the tarball descriptor; got:\n{lock}"
+    );
+    let root_pkg = std::fs::read_to_string(proj.join("package.json")).unwrap();
+    let root_pkg: serde_json::Value = serde_json::from_str(&root_pkg).unwrap();
+    assert!(
+        root_pkg["resolutions"]
+            .as_object()
+            .is_some_and(|r| r.iter().any(|(sel, v)| sel.starts_with(&format!("{DEP}@npm:"))
+                && v.as_str() == Some(hosted_url.as_str()))),
+        "package.json must route {DEP} to the hosted tarball: {root_pkg}"
+    );
+    assert!(
+        !lock.contains("__archiveUrl"),
+        "the hosted pin must not be an npm: locator; got:\n{lock}"
     );
     let checksum_line = yarn_berry_common::expected_checksum_line(
         &String::from_utf8_lossy(&registry_lock),
@@ -579,6 +607,7 @@ async fn berry_hosted_project(
         patched,
         host,
         registry_lock,
+        registry_pkg,
         _server: server,
     })
 }
@@ -598,7 +627,11 @@ fn fresh_yarnrc(fx: &BerryRedirectFixture) -> String {
 
 /// Fresh dir with only the committable files, then `yarn install --immutable
 /// --check-cache` offline-from-registry (the wiremock host is whitelisted for
-/// http). Returns the fresh dir + the install output.
+/// http). The install runs with an npm registry token that yarn must apply to
+/// every registry request (`YARN_NPM_AUTH_TOKEN` + `YARN_NPM_ALWAYS_AUTH`),
+/// the CI shape #404 leaked to the patch host: [`assert_patch_host_got_no_auth`]
+/// checks the hosted tarball request carried none. Returns the fresh dir +
+/// the install output.
 fn fresh_checkout_yarn_install(fx: &BerryRedirectFixture) -> (PathBuf, Output) {
     let fresh = fx.tmp.path().join("fresh");
     std::fs::create_dir_all(&fresh).unwrap();
@@ -619,9 +652,60 @@ fn fresh_checkout_yarn_install(fx: &BerryRedirectFixture) -> (PathBuf, Output) {
         &[
             ("YARN_GLOBAL_FOLDER", fresh_global.to_str().unwrap()),
             ("YARN_ENABLE_GLOBAL_CACHE", "false"),
+            ("YARN_NPM_AUTH_TOKEN", REGISTRY_TOKEN),
+            ("YARN_NPM_ALWAYS_AUTH", "true"),
+            // Hardened mode (yarn enables it on its own for public-PR CI)
+            // re-validates every lock resolution against its descriptor; a
+            // tarball locator under an `npm:` key fails it with YN0078 —
+            // why the pin routes through `resolutions` (#404).
+            ("YARN_ENABLE_HARDENED_MODE", "true"),
         ],
     );
     (fresh, ci)
+}
+
+/// The npm registry token the fresh install is configured with.
+const REGISTRY_TOKEN: &str = "SOCKET-E2E-REGISTRY-TOKEN";
+
+/// #404: the patch host fetched the hosted tarball, and no request it
+/// received carried an `Authorization` header (or the registry token in any
+/// header) — the hosted pin must never hand registry credentials to it.
+async fn assert_patch_host_got_no_auth(fx: &BerryRedirectFixture) {
+    let requests = fx
+        ._server
+        .received_requests()
+        .await
+        .expect("wiremock request recording is on");
+    let tarball_gets: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.path().ends_with(".tgz"))
+        .collect();
+    assert!(
+        !tarball_gets.is_empty(),
+        "the fresh install must fetch the hosted tarball from the patch host"
+    );
+    // The same wiremock also plays the Socket API, whose requests carry the
+    // CLI's own API token — only the yarn-made tarball fetches are judged
+    // for an Authorization header; the registry token must appear nowhere.
+    for r in &tarball_gets {
+        assert!(
+            !r.headers.contains_key("authorization"),
+            "{} {} carried an Authorization header to the patch host: {:?}",
+            r.method,
+            r.url,
+            r.headers.get("authorization")
+        );
+    }
+    for r in &requests {
+        for (name, value) in r.headers.iter() {
+            assert!(
+                !value.to_str().unwrap_or("").contains(REGISTRY_TOKEN),
+                "{} {} leaked the registry token in header {name}",
+                r.method,
+                r.url
+            );
+        }
+    }
 }
 
 /// The manifest-less VEX matrix over the hosted rewrite `driver` produced
@@ -631,7 +715,10 @@ fn fresh_checkout_yarn_install(fx: &BerryRedirectFixture) -> (PathBuf, Output) {
 /// the REAL binary against a mock patch API.
 fn hosted_manifestless_vex_matrix(fx: &BerryRedirectFixture, driver: HostedDriver) {
     let yarnrc = fresh_yarnrc(fx);
-    let registry_state = [("yarn.lock", fx.registry_lock.clone())];
+    let registry_state = [
+        ("yarn.lock", fx.registry_lock.clone()),
+        ("package.json", fx.registry_pkg.clone()),
+    ];
     let yarn =
         |cwd: &Path, args: &[&str], env: &[(&str, &str)]| corepack(cwd, yarn_berry(), args, env);
     let api_url = fx._server.uri();
@@ -698,6 +785,7 @@ async fn berry_redirect_fresh_checkout_installs_patched_bytes() {
         installed, fx.patched,
         "fresh install must be byte-identical to the patched content"
     );
+    assert_patch_host_got_no_auth(&fx).await;
 
     hosted_manifestless_vex_matrix(&fx, HostedDriver::Scan);
 }
@@ -706,7 +794,7 @@ async fn berry_redirect_fresh_checkout_installs_patched_bytes() {
 /// routes through the SAME hosted engine as `scan --mode hosted`, so the
 /// berry chain must hold unchanged — including the `10c0` cacheKey bootstrap
 /// (the fixture still resolves the patched tarball with a real yarn to pin
-/// the exact cache-zip checksum) and the lock's `::__archiveUrl=` +
+/// the exact cache-zip checksum) and the lock's tarball-URL locator +
 /// `checksum: 10c0/<hex>` splice — and the fresh `yarn install --immutable
 /// --check-cache` pulls the patched bytes from the hosted tarball. The uuid
 /// identifier path is exempt from installed narrowing, so only the view +
@@ -740,7 +828,7 @@ async fn berry_get_uuid_hosted_fresh_checkout_installs() {
     hosted_manifestless_vex_matrix(&fx, HostedDriver::GetUuid);
 }
 
-/// Negative twin: the archiveUrl serves a DIFFERENT tarball while the lock
+/// Negative twin: the hosted URL serves a DIFFERENT tarball while the lock
 /// pins the real `10c0` checksum — the fresh `--check-cache` install must fail
 /// with YN0018.
 #[tokio::test(flavor = "multi_thread")]

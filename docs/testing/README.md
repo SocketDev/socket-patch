@@ -15,6 +15,7 @@ Rust and Python checks.
 | Production suites | [Hosted](hosted-production-e2e.md), [vendored](vendored-production-e2e.md) | Real patch-service responses and artifact delivery |
 | Release compatibility backtests | Package-manager guides below and `scripts/backtest-*.py` | Format and installer boundaries across published releases |
 | Container suites | [Docker guide](../../tests/docker/README.md) | Toolchain isolation and offline installs |
+| Performance benchmarks | [`crates/socket-patch-bench`](../../crates/socket-patch-bench/README.md), `.github/workflows/bench.yml` | `scan` timings, memory and API request counts per package manager, compared against the base on every PR |
 
 Native suites require the tools named in their guide. Opt-in or unavailable-toolchain
 skips are not installation evidence. Use the suite's `*_REQUIRED` or `*_STRICT`

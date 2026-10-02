@@ -6,7 +6,7 @@ use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::composer_version::composer_versions_equivalent;
 use crate::utils::fs::{is_dir, is_dir_sync, is_file, normalize_lexically, run_blocking};
-use crate::utils::process::{CommandRunner, SystemCommandRunner};
+use crate::utils::process::{CommandRunner, GlobalProbeRunner};
 
 #[cfg(test)]
 mod oracle;
@@ -371,7 +371,7 @@ async fn get_composer_home() -> Option<PathBuf> {
     // memoized for an unchanged environment, see `COMPOSER_GLOBAL_HOME`)
     let stdout = run_blocking(|| {
         COMPOSER_GLOBAL_HOME
-            .get_or_run(|| SystemCommandRunner.run("composer", &["global", "config", "home"]))
+            .get_or_run(|| GlobalProbeRunner.run("composer", &["global", "config", "home"]))
     })
     .await;
     if let Some(stdout) = stdout {
@@ -382,28 +382,56 @@ async fn get_composer_home() -> Option<PathBuf> {
         }
     }
 
-    // Platform defaults. A set-but-empty HOME counts as unset: honoring
-    // `""` would turn the `.composer`/`.config/composer` probes below into
-    // CWD-relative paths inside the user's project (same rule as
-    // `utils::fs::home_dir`).
-    let home_dir = std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()))?;
-    let home = PathBuf::from(home_dir);
-
-    let candidates = [
-        home.join(".composer"),
-        home.join(".config").join("composer"),
-    ];
-
-    for candidate in &candidates {
-        if is_dir(candidate).await {
-            return Some(candidate.clone());
+    // Platform defaults (see `composer_home_candidates`).
+    let var = |name: &str| std::env::var_os(name);
+    for candidate in composer_home_candidates(&var, cfg!(windows)) {
+        if is_dir(&candidate).await {
+            return Some(candidate);
         }
     }
 
     None
+}
+
+/// The directories Composer itself uses as its home when `COMPOSER_HOME`
+/// is unset, in the order to probe them (`Factory::getHomeDir`):
+///
+/// - Windows: `%APPDATA%\Composer` — the only default there; the
+///   `~/.composer` probe is kept after it for older layouts.
+/// - elsewhere: `~/.composer` when it exists, else the XDG location,
+///   `$XDG_CONFIG_HOME/composer` or `~/.config/composer`.
+///
+/// A set-but-empty or relative variable counts as unset: honoring `""`
+/// would turn these probes into CWD-relative paths inside the user's
+/// project (same rule as `utils::fs::home_dir`).
+pub(crate) fn composer_home_candidates(
+    var: &impl Fn(&str) -> Option<std::ffi::OsString>,
+    windows: bool,
+) -> Vec<PathBuf> {
+    let absolute = |name: &str| {
+        var(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    let home = absolute("HOME").or_else(|| absolute("USERPROFILE"));
+    let mut candidates = Vec::new();
+    if windows {
+        if let Some(app_data) = absolute("APPDATA") {
+            candidates.push(app_data.join("Composer"));
+        }
+    }
+    if let Some(home) = &home {
+        candidates.push(home.join(".composer"));
+    }
+    if !windows {
+        if let Some(xdg) = absolute("XDG_CONFIG_HOME") {
+            candidates.push(xdg.join("composer"));
+        }
+    }
+    if let Some(home) = &home {
+        candidates.push(home.join(".config").join("composer"));
+    }
+    candidates
 }
 
 /// Normalize a Composer version string for PURL identity.

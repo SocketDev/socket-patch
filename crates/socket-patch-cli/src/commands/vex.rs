@@ -32,7 +32,7 @@ use crate::commands::vex_sources::{
     self, Plan, Sources, RECORD_MISMATCH, RECORD_UNAVAILABLE, REDIRECT_UNWIRED, VENDOR_UNWIRED,
     WIRING_CONFLICT,
 };
-use crate::ecosystem_dispatch::{collapse_to_first, find_manifest_package_copies_reusing};
+use crate::ecosystem_dispatch::find_manifest_package_copies_reusing;
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning};
 use crate::ui::plural;
 
@@ -548,12 +548,14 @@ async fn generate_vex(
         // mirroring apply/rollback's `silent || json` gating.
         let quiet = common.silent || common.json || params.output.is_none();
         let purls: Vec<String> = manifest.patches.keys().cloned().collect();
-        // ONE installed-tree lookup: the first copy of every purl for the
-        // record check, every copy of the hosted ones below.
+        // ONE installed-tree lookup: every copy of every purl, for the
+        // record check and the hosted ones below alike. `apply` patches
+        // every copy, so an agent record is attested only when EVERY copy
+        // verifies; the first copy alone would vouch for a later install's
+        // unpatched nested duplicate.
         let copies =
             find_manifest_package_copies_reusing(&purls, common, quiet, params.npm_prior.as_ref())
                 .await;
-        let package_paths = collapse_to_first(copies.clone());
         let go_patches = synthesize_go_patches(common, manifest, &plan.vendor_entries).await;
         // Hosted-basis purls are judged by the copies their build CONSUMES
         // (the Go replacement module, the Socket registry's cargo src dir,
@@ -573,12 +575,9 @@ async fn generate_vex(
             go_patches,
             hosted,
         };
-        let mut outcome = socket_patch_core::vex::applied_patches_with_vendor(
-            manifest,
-            &package_paths,
-            Some(&vendor),
-        )
-        .await;
+        let mut outcome =
+            socket_patch_core::vex::applied_patches_with_copies(manifest, &copies, Some(&vendor))
+                .await;
         // Hosted lockfile basis: a DISCOVERED Socket-host reference whose
         // lock pins the artifact attests from that wiring when no installed
         // tree exists yet (a lockfile-only CI checkout) — the evidence the

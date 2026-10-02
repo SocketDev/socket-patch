@@ -885,6 +885,112 @@ fn verify_mode_includes_applied_omits_unapplied() {
     maybe_validate_with_vexctl(&stdout);
 }
 
+/// Lay down `node_modules/<parent>/node_modules/dup-pkg@1.0.0` for every
+/// `(parent, index.js bytes)` pair: nested duplicates of ONE `name@version`,
+/// the layout a later `npm install` of a new dependent produces.
+fn lay_down_nested_dups(cwd: &Path, copies: &[(&str, &[u8])]) {
+    for (parent, content) in copies {
+        let parent_dir = cwd.join("node_modules").join(parent);
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        std::fs::write(
+            parent_dir.join("package.json"),
+            format!(r#"{{"name":"{parent}","version":"1.0.0"}}"#),
+        )
+        .unwrap();
+        let dup = parent_dir.join("node_modules").join("dup-pkg");
+        std::fs::create_dir_all(&dup).unwrap();
+        std::fs::write(
+            dup.join("package.json"),
+            r#"{"name":"dup-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(dup.join("index.js"), content).unwrap();
+    }
+}
+
+/// Regression (#516): an agent record is attested only when EVERY
+/// installed copy of its `name@version` is patched. `apply` patches every
+/// copy, but `vex` used to hash only the crawler's FIRST copy, so a fresh,
+/// unpatched nested copy (added by a later install) was attested
+/// `not_affected` whenever the patched copy happened to be crawled first.
+/// Both crawl orders must omit the purl; all copies patched attests it.
+#[test]
+fn verify_mode_requires_every_installed_copy_patched() {
+    let patched: &[u8] = b"patched dup index";
+    let pristine: &[u8] = b"pristine dup index";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    let before_hash = compute_git_sha256_from_bytes(pristine);
+
+    let run = |copies: &[(&str, &[u8])]| {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        lay_down_nested_dups(cwd, copies);
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/dup-pkg@1.0.0".to_string(),
+            make_record(
+                "44444444-4444-4444-8444-444444444444",
+                "package/index.js",
+                before_hash.as_str(),
+                after_hash.as_str(),
+                "GHSA-dup",
+                &["CVE-DUP"],
+            ),
+        );
+        write_manifest(cwd, &manifest);
+        let out = cli()
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--product",
+                "pkg:npm/test-app@1.0.0",
+            ])
+            .output()
+            .expect("invoke vex");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    // One copy patched, the other pristine — in both orders, so the
+    // verdict cannot depend on which copy the crawler meets first.
+    for copies in [
+        [("aaa-parent", patched), ("zzz-parent", pristine)],
+        [("aaa-parent", pristine), ("zzz-parent", patched)],
+    ] {
+        let (ok, stdout, stderr) = run(&copies);
+        assert!(
+            !ok,
+            "an unpatched installed copy must keep the purl out of the VEX \
+             doc (nothing left to attest → non-zero exit). copies: {:?}\n\
+             stdout:\n{stdout}\nstderr:\n{stderr}",
+            copies.map(|(p, _)| p)
+        );
+        assert!(
+            !stdout.contains("GHSA-dup"),
+            "must not attest while a copy is unpatched:\n{stdout}"
+        );
+        assert!(
+            stderr.contains("Warning: omitting pkg:npm/dup-pkg@1.0.0 from VEX")
+                && stderr.contains("(not_applied)"),
+            "the omission must name the unpatched copy's not_applied tag. \
+             got: {stderr}"
+        );
+    }
+
+    // Control: every copy patched → attested.
+    let (ok, stdout, stderr) = run(&[("aaa-parent", patched), ("zzz-parent", patched)]);
+    assert!(ok, "all copies patched must attest. stderr:\n{stderr}");
+    let doc: Value = serde_json::from_str(&stdout).unwrap();
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(stmts.len(), 1, "doc:\n{stdout}");
+    assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-dup");
+    assert_eq!(stmts[0]["status"], "not_affected");
+}
+
 #[test]
 fn verify_mode_all_failed_exits_non_zero() {
     let tmp = tempfile::tempdir().unwrap();

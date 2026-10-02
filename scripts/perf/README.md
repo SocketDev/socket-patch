@@ -1,5 +1,9 @@
 # Network benchmark harness
 
+For regression benchmarks of `scan` on synthetic projects (run in CI on every
+pull request), see [`crates/socket-patch-bench`](../../crates/socket-patch-bench/README.md).
+This harness is for measuring a real project against recorded API traffic.
+
 Most `scan` time is spent waiting on API round trips. Live timings are noisy
 and can't be repeated, so this harness records the API traffic of one real run
 and then replays it locally. That makes timing deterministic and gives a
