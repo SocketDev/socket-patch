@@ -405,7 +405,40 @@ fn is_legacy_pnpm_store_dir_name(name: &str) -> bool {
 /// The `node_modules` child that is vlt's per-project package store.
 const VLT_STORE_NAME: &str = ".vlt";
 
-/// The `node_modules` child that is npm's `install-strategy=linked` store.
+/// The `node_modules` children that are pnpm-shaped isolated stores:
+/// every package lives at `<store>/<name>@<version><suffix>/node_modules/<name>`
+/// (a scoped name's `/` written `+`), the importer links direct deps only,
+/// and a transitive dependency's only physical home is its entry. pnpm's
+/// virtual store, Bun's isolated linker (`.bun`, Bun >= 1.2) and Deno's
+/// isolated `nodeModulesDir` (`.deno`) all write this shape; each store
+/// also holds a `node_modules` hoist dir of links and hidden metadata,
+/// which the entry enumeration skips.
+const PNPM_SHAPED_STORES: [(&str, StoreLayout); 3] = [
+    (".pnpm", StoreLayout::Pnpm),
+    (".bun", StoreLayout::Bun),
+    (".deno", StoreLayout::Deno),
+];
+
+/// The pnpm-shaped store layout a `node_modules` child named `name` is.
+fn pnpm_shaped_store_layout(name: &str) -> Option<StoreLayout> {
+    PNPM_SHAPED_STORES
+        .iter()
+        .find(|(store, _)| *store == name)
+        .map(|(_, layout)| *layout)
+}
+
+/// Decode a `.bun` store entry name (`<name>@<version>`, a peer set
+/// appended as `+<hash>`, scoped `@scope+leaf@…`). The pnpm decoder reads
+/// the name exactly, but would keep a `+<hash>` tail as part of the
+/// version, and a `+` is also how a real build-metadata version is
+/// spelled: such names are left undecoded (probeable), never guessed.
+fn decode_bun_store_entry_name(entry_name: &str) -> Option<(String, String)> {
+    decode_pnpm_store_entry_name(entry_name).filter(|(_, version)| !version.contains('+'))
+}
+
+/// The `node_modules` child that is npm's `install-strategy=linked` store,
+/// also written by Yarn 4's pnpm linker (see
+/// [`store_entry_own_package_sync`]).
 const NPM_LINKED_STORE_NAME: &str = ".store";
 
 /// Length of the hash suffix npm's linked strategy appends to a store key:
@@ -779,10 +812,11 @@ impl ProbeFilter {
 /// targets this dir holds a copy of, in target order — sparse, because
 /// every dir of a BFS level carries one of these at once.
 struct ResolverVisit {
-    nm_path: PathBuf,
-    /// `nm_path` is a pnpm or vlt store entry's `node_modules`.
+    /// The visited dir is a store entry's `node_modules`.
     store_entry: bool,
-    matched: Vec<usize>,
+    /// Each matched target's index and the path of its copy: below the
+    /// visited dir, or its store entry's own `package` dir (Yarn 4).
+    matched: Vec<(usize, PathBuf)>,
     nested: Vec<NestedNodeModules>,
 }
 
@@ -1257,10 +1291,8 @@ impl NpmCrawler {
             });
             let mut next_level: Vec<(PathBuf, bool)> = Vec::new();
             for visit in visits {
-                let nm_path = visit.nm_path;
-                for index in visit.matched {
+                for (index, pkg_path) in visit.matched {
                     let target = &pending[index];
-                    let pkg_path = nm_path.join(&target.dir_key);
                     let copies = result.entry(target.purl.clone()).or_default();
                     // Record each physical copy once — a path reached twice
                     // (defensive against overlapping walks) is not
@@ -1325,35 +1357,48 @@ impl NpmCrawler {
     ///
     /// Inside a store entry (`store_entry`) a link is a dependency edge into
     /// a sibling entry, whose own visit records that copy, so only a real
-    /// directory there matches.
-    fn visit_resolver_dir(nm_path: PathBuf, store_entry: bool, pending: &[Target]) -> ResolverVisit {
+    /// directory there matches, or a link to the entry's own `package` dir
+    /// (Yarn 4, see [`store_entry_own_package_sync`]), recorded at that dir.
+    /// That `package` dir's own `node_modules` (its bundled dependencies,
+    /// which the scan reaches through the same link) is enqueued too: the
+    /// link-free walk below would never descend into it.
+    fn visit_resolver_dir(
+        nm_path: PathBuf,
+        store_entry: bool,
+        pending: &[Target],
+    ) -> ResolverVisit {
         let listing = list_dir_sync(&nm_path);
         let probe_filter = ProbeFilter::new(&listing);
         let matched = pending
             .iter()
             .enumerate()
-            .filter(|(_, target)| {
+            .filter_map(|(index, target)| {
                 let first_component = target.namespace.as_deref().unwrap_or(&target.name);
                 if !probe_filter.may_resolve(first_component) {
-                    return false;
+                    return None;
                 }
-                if store_entry && !is_real_package_dir_sync(&nm_path, &target.dir_key) {
-                    return false;
-                }
+                let pkg_path =
+                    if !store_entry || is_real_package_dir_sync(&nm_path, &target.dir_key) {
+                        nm_path.join(&target.dir_key)
+                    } else {
+                        store_entry_own_package_sync(&nm_path, &target.dir_key)?
+                    };
                 // The on-disk *name* must match too: an alias install
                 // (`npm i foo@npm:bar@1.0.0`) puts a different package in
                 // `node_modules/foo`, so matching on version alone would
                 // misidentify it and patch the wrong package's files.
-                read_package_json_sync(&nm_path.join(&target.dir_key).join("package.json"))
+                read_package_json_sync(&pkg_path.join("package.json"))
                     .is_some_and(|(found_name, found_version)| {
                         found_name == target.dir_key && found_version == target.version
                     })
+                    .then_some((index, pkg_path))
             })
-            .map(|(index, _)| index)
             .collect();
-        let nested = Self::collect_nested_node_modules(&nm_path, listing);
+        let mut nested = Self::collect_nested_node_modules(&nm_path, listing);
+        if store_entry {
+            nested.extend(own_package_nested_node_modules_sync(&nm_path));
+        }
         ResolverVisit {
-            nm_path,
             store_entry,
             matched,
             nested,
@@ -1395,11 +1440,14 @@ impl NpmCrawler {
         // BFS order guarantees a root-linked install has already been
         // probed (and removed from `pending`) before these are
         // dequeued, so a package is never resolved twice.
-        if name_str == ".pnpm" {
+        // Bun's `.bun` and Deno's `.deno` stores share the shape and the
+        // property (see `PNPM_SHAPED_STORES`).
+        if let Some(layout) = pnpm_shaped_store_layout(name_str) {
             if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
                 return Vec::new();
             }
-            let entries = Self::list_pnpm_store_entries_sync(&nm_path.join(&entry.name), false)
+            let store = nm_path.join(&entry.name);
+            let entries = Self::list_pnpm_shaped_store_entries_sync(&store, layout, false)
                 .into_iter()
                 .map(|e| StoreEntry {
                     advertised: e.advertised,
@@ -1741,12 +1789,15 @@ impl NpmCrawler {
         store_entry: bool,
     ) -> Vec<ScanEvent> {
         let listing = listing.unwrap_or_else(|| list_dir_sync(node_modules_path));
-        let mut pnpm_store: Option<PathBuf> = None;
+        let mut pnpm_shaped_stores: Vec<(PathBuf, StoreLayout)> = Vec::new();
         let mut vlt_store: Option<PathBuf> = None;
         let mut npm_store: Option<PathBuf> = None;
         let mut relocated_pnpm_store: Option<PathBuf> = None;
         let mut legacy_stores: Vec<PathBuf> = Vec::new();
         let mut children: Vec<(PathBuf, String, FileType)> = Vec::new();
+        // A store entry's links, kept only to find a link to the entry's
+        // own `package` dir (Yarn 4, see `store_entry_own_package_sync`).
+        let mut own_packages: Vec<String> = Vec::new();
 
         for entry in listing.entries {
             let name_str = entry.name_str;
@@ -1761,9 +1812,11 @@ impl NpmCrawler {
             // importer-root paths. (A store entry's own children never
             // include a nested `.pnpm`; under the store-entry policy the
             // name falls through to the hidden-entry skip below.)
-            if !store_entry && name_str == ".pnpm" {
+            // Bun's `.bun` and Deno's `.deno` share both the shape and
+            // the property (see `PNPM_SHAPED_STORES`).
+            if let Some(layout) = pnpm_shaped_store_layout(&name_str).filter(|_| !store_entry) {
                 if entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                    pnpm_store = Some(node_modules_path.join(&name_str));
+                    pnpm_shaped_stores.push((node_modules_path.join(&name_str), layout));
                 }
                 continue;
             }
@@ -1816,6 +1869,9 @@ impl NpmCrawler {
                 continue;
             };
             if !Self::acceptable_package_entry(file_type, store_entry) {
+                if store_entry && file_type.is_symlink() {
+                    own_packages.push(name_str);
+                }
                 continue;
             }
 
@@ -1837,9 +1893,10 @@ impl NpmCrawler {
         .into_iter()
         .flatten()
         .collect();
+        events.extend(Self::gather_own_packages(node_modules_path, own_packages));
 
-        if let Some(store_path) = pnpm_store {
-            let entries = Self::list_pnpm_store_entries_sync(&store_path, true);
+        for (store_path, layout) in pnpm_shaped_stores {
+            let entries = Self::list_pnpm_shaped_store_entries_sync(&store_path, layout, true);
             events.extend(Self::gather_store_entries(entries));
         }
         for store_path in legacy_stores {
@@ -1922,6 +1979,7 @@ impl NpmCrawler {
         scope_name: &str,
         store_entry: bool,
     ) -> Vec<ScanEvent> {
+        let mut own_packages: Vec<String> = Vec::new();
         let children: Vec<(String, FileType)> = list_dir_sync(scope_path)
             .entries
             .into_iter()
@@ -1930,12 +1988,17 @@ impl NpmCrawler {
                     return None;
                 }
                 let file_type = entry.file_type?;
-                Self::acceptable_package_entry(file_type, store_entry)
-                    .then_some((entry.name_str, file_type))
+                if !Self::acceptable_package_entry(file_type, store_entry) {
+                    if store_entry && file_type.is_symlink() {
+                        own_packages.push(format!("{scope_name}/{}", entry.name_str));
+                    }
+                    return None;
+                }
+                Some((entry.name_str, file_type))
             })
             .collect();
 
-        par_map(children, |(name_str, file_type)| {
+        let mut events: Vec<ScanEvent> = par_map(children, |(name_str, file_type)| {
             Self::gather_package(
                 scope_path.join(&name_str),
                 store_entry.then(|| format!("{scope_name}/{name_str}")),
@@ -1944,7 +2007,29 @@ impl NpmCrawler {
         })
         .into_iter()
         .flatten()
-        .collect()
+        .collect();
+        if let Some(entry_nm) = scope_path.parent() {
+            events.extend(Self::gather_own_packages(entry_nm, own_packages));
+        }
+        events
+    }
+
+    /// The store entry's own package (Yarn 4): of the links `dir_keys`
+    /// found in the entry's `node_modules`, the one that resolves to the
+    /// entry's `package` dir is gathered there, a real dir, with its key;
+    /// the rest are dependency edges into other entries.
+    fn gather_own_packages(entry_nm: &Path, dir_keys: Vec<String>) -> Vec<ScanEvent> {
+        if dir_keys.is_empty() {
+            return Vec::new();
+        }
+        let Some((own, canonical_own)) = store_entry_package_dir_sync(entry_nm) else {
+            return Vec::new();
+        };
+        dir_keys
+            .into_iter()
+            .find(|key| std::fs::canonicalize(entry_nm.join(key)).is_ok_and(|t| t == canonical_own))
+            .map(|key| Self::gather_package(own, Some(key), true))
+            .unwrap_or_default()
     }
 
     /// Gather each virtual-store entry's `node_modules` (entries come from
@@ -2039,6 +2124,17 @@ impl NpmCrawler {
     /// the `is_dir` stat so an unreadable-but-present dir keeps its
     /// flat-entry classification.
     fn list_pnpm_store_entries_sync(store_path: &Path, read_listings: bool) -> Vec<StoreEntryDir> {
+        Self::list_pnpm_shaped_store_entries_sync(store_path, StoreLayout::Pnpm, read_listings)
+    }
+
+    /// [`Self::list_pnpm_store_entries_sync`] for any pnpm-shaped store
+    /// (see [`PNPM_SHAPED_STORES`]), entry names decoded under `layout`.
+    fn list_pnpm_shaped_store_entries_sync(
+        store_path: &Path,
+        layout: StoreLayout,
+        read_listings: bool,
+    ) -> Vec<StoreEntryDir> {
+        let decode = |name: &str| layout.decode_pnpm_shaped(name);
         let candidates: Vec<ListedEntry> = list_dir_sync(store_path)
             .entries
             .into_iter()
@@ -2054,7 +2150,7 @@ impl NpmCrawler {
             if read_listings {
                 if let Some((entries, complete)) = read_dir_entries_sync(&entry_nm) {
                     return vec![StoreEntryDir {
-                        advertised: decode_pnpm_store_entry_name(&entry.name_str),
+                        advertised: decode(&entry.name_str),
                         name: entry.name_str,
                         node_modules: entry_nm,
                         listing: Some(Listing::from_entries(entries, complete)),
@@ -2063,7 +2159,7 @@ impl NpmCrawler {
             }
             if is_dir_sync(&entry_nm) {
                 vec![StoreEntryDir {
-                    advertised: decode_pnpm_store_entry_name(&entry.name_str),
+                    advertised: decode(&entry.name_str),
                     name: entry.name_str,
                     node_modules: entry_nm,
                     listing: None,
@@ -2072,7 +2168,7 @@ impl NpmCrawler {
                 Self::collect_nested_store_entries_sync(&entry_path)
                     .into_iter()
                     .map(|(name, node_modules)| StoreEntryDir {
-                        advertised: decode_pnpm_store_entry_name(&name),
+                        advertised: decode(&name),
                         name,
                         node_modules,
                         listing: None,
@@ -2086,13 +2182,33 @@ impl NpmCrawler {
     }
 
     /// Async `(name, node_modules)` view of
-    /// [`Self::list_pnpm_store_entries_sync`] for the async callers.
+    /// [`Self::list_pnpm_store_entries_sync`] (the oracle tests' view).
+    #[cfg(test)]
     async fn list_pnpm_store_entries(store_path: &Path) -> Vec<(String, PathBuf)> {
         let store_path = store_path.to_path_buf();
         run_walk(move || {
             Self::list_pnpm_store_entries_sync(&store_path, false)
                 .into_iter()
                 .map(|entry| (entry.name, entry.node_modules))
+                .collect()
+        })
+        .await
+    }
+
+    /// Async [`StoreEntry`] view of
+    /// [`Self::list_pnpm_shaped_store_entries_sync`].
+    async fn list_pnpm_shaped_store_entries(
+        store_path: &Path,
+        layout: StoreLayout,
+    ) -> Vec<StoreEntry> {
+        let store_path = store_path.to_path_buf();
+        run_walk(move || {
+            Self::list_pnpm_shaped_store_entries_sync(&store_path, layout, false)
+                .into_iter()
+                .map(|entry| StoreEntry {
+                    advertised: entry.advertised,
+                    node_modules: entry.node_modules,
+                })
                 .collect()
         })
         .await
@@ -2168,7 +2284,10 @@ impl NpmCrawler {
                 continue;
             }
             let path = store_path.join(&entry.name);
-            if entry.name_str.starts_with('@') {
+            // Yarn 4 names a scoped entry `@scope-leaf-npm-<v>-<h>`: an
+            // entry itself (it has a `node_modules`, which an npm scope
+            // dir never holds, `node_modules` being no valid package name).
+            if entry.name_str.starts_with('@') && !is_dir_sync(&path.join("node_modules")) {
                 for scoped in list_dir_sync(&path).entries {
                     if is_candidate(&scoped) && !scoped.name_str.starts_with('@') {
                         let name = format!("{}/{}", entry.name_str, scoped.name_str);
@@ -2351,11 +2470,24 @@ impl Default for NpmCrawler {
 // ---------------------------------------------------------------------------
 
 /// Which store layout a candidate store directory uses.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StoreLayout {
     Pnpm,
+    Bun,
+    Deno,
     Vlt,
     NpmLinked,
+}
+
+impl StoreLayout {
+    /// The `(name, version)` a pnpm-shaped store's entry name advertises
+    /// (see [`PNPM_SHAPED_STORES`]); `None` = unknowable, stays probeable.
+    fn decode_pnpm_shaped(self, entry_name: &str) -> Option<(String, String)> {
+        match self {
+            StoreLayout::Bun => decode_bun_store_entry_name(entry_name),
+            _ => decode_pnpm_store_entry_name(entry_name),
+        }
+    }
 }
 
 /// Find every OTHER physical copy of the package installed at `pkg_path`
@@ -2412,12 +2544,15 @@ pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
     for start in chains.into_iter().flatten() {
         let mut cur = start.parent();
         while let Some(dir) = cur {
-            match dir.file_name().and_then(OsStr::to_str) {
-                Some(".pnpm") => {
-                    if seen_stores.insert(dir.to_path_buf()) {
-                        stores.push((StoreLayout::Pnpm, dir.to_path_buf()));
-                    }
+            let name = dir.file_name().and_then(OsStr::to_str);
+            if let Some(layout) = name.and_then(pnpm_shaped_store_layout) {
+                if seen_stores.insert(dir.to_path_buf()) {
+                    stores.push((layout, dir.to_path_buf()));
                 }
+                cur = dir.parent();
+                continue;
+            }
+            match name {
                 Some(VLT_STORE_NAME) => {
                     if seen_stores.insert(dir.to_path_buf()) {
                         stores.push((StoreLayout::Vlt, dir.to_path_buf()));
@@ -2433,11 +2568,11 @@ pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
                     }
                 }
                 Some("node_modules") => {
-                    for (child, layout) in [
-                        (".pnpm", StoreLayout::Pnpm),
+                    let others = [
                         (VLT_STORE_NAME, StoreLayout::Vlt),
                         (NPM_LINKED_STORE_NAME, StoreLayout::NpmLinked),
-                    ] {
+                    ];
+                    for (child, layout) in PNPM_SHAPED_STORES.into_iter().chain(others) {
                         let store = dir.join(child);
                         if is_dir(&store).await && seen_stores.insert(store.clone()) {
                             stores.push((layout, store));
@@ -2503,8 +2638,8 @@ pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
     let mut seen_copies: HashSet<PathBuf> = HashSet::new();
     for (layout, store) in stores {
         let entries = match layout {
-            StoreLayout::Pnpm => {
-                StoreEntry::pnpm(NpmCrawler::list_pnpm_store_entries(&store).await)
+            StoreLayout::Pnpm | StoreLayout::Bun | StoreLayout::Deno => {
+                NpmCrawler::list_pnpm_shaped_store_entries(&store, layout).await
             }
             StoreLayout::Vlt => StoreEntry::vlt(NpmCrawler::list_vlt_store_entries(&store).await),
             StoreLayout::NpmLinked => {
@@ -2525,14 +2660,19 @@ pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
             }
             // `full_name` may be scoped (`@s/n`) — Path::join handles the
             // two-segment relative form.
-            let candidate = entry_nm.join(&full_name);
+            let mut candidate = entry_nm.join(&full_name);
             // Real dirs only: a link here is another entry's physical
-            // copy, reached via that entry.
+            // copy, reached via that entry, unless it is the entry's own
+            // `package` dir (Yarn 4), the physical copy itself.
             let Ok(meta) = tokio::fs::symlink_metadata(&candidate).await else {
                 continue;
             };
             if !meta.is_dir() {
-                continue;
+                let (nm, key) = (entry_nm.clone(), full_name.clone());
+                match run_walk(move || store_entry_own_package_sync(&nm, &key)).await {
+                    Some(own) => candidate = own,
+                    None => continue,
+                }
             }
             match read_package_json(&candidate.join("package.json")).await {
                 Some((n, v)) if n == full_name && v == version => {}
@@ -2567,6 +2707,47 @@ fn is_real_package_dir_sync(nm_path: &Path, dir_key: &str) -> bool {
         }
     }
     true
+}
+
+/// The physical copy behind a store entry's link to its OWN package, the
+/// way Yarn 4's pnpm linker lays out `node_modules/.store`: the entry
+/// holds the package at `<entry>/package` (its only physical copy) and
+/// `<entry>/node_modules/<dir_key>` is a link to it, beside links to the
+/// entry's dependencies in OTHER entries. Returns `<entry>/package` when
+/// it is a real dir that `entry_nm/<dir_key>` resolves to; any other link
+/// (a dependency edge, inventoried via its own entry) gives `None`.
+fn store_entry_own_package_sync(entry_nm: &Path, dir_key: &str) -> Option<PathBuf> {
+    let (own, canonical_own) = store_entry_package_dir_sync(entry_nm)?;
+    let target = std::fs::canonicalize(entry_nm.join(dir_key)).ok()?;
+    (target == canonical_own).then_some(own)
+}
+
+/// The `node_modules` inside a store entry's own `package` dir (Yarn 4),
+/// where that package's bundled dependencies live. The entry's
+/// `node_modules/<name>` is a link to `package`, so a walk that never
+/// follows links misses this tree, though Node loads a bundled copy from
+/// it. `None` on every other layout, or when the entry holds no link to
+/// its own package.
+fn own_package_nested_node_modules_sync(entry_nm: &Path) -> Option<NestedNodeModules> {
+    let (own, _) = store_entry_package_dir_sync(entry_nm)?;
+    let (name, _version) = read_package_json_sync(&own.join("package.json"))?;
+    if !name.split('/').all(is_safe_npm_component) {
+        return None;
+    }
+    store_entry_own_package_sync(entry_nm, &name)?;
+    let nested = own.join("node_modules");
+    is_dir_sync(&nested).then_some(NestedNodeModules::Dir(nested))
+}
+
+/// A store entry's real `package` dir beside `entry_nm` (Yarn 4's
+/// layout), with its canonical path; `None` on every other layout.
+fn store_entry_package_dir_sync(entry_nm: &Path) -> Option<(PathBuf, PathBuf)> {
+    let own = entry_nm.parent()?.join("package");
+    if !std::fs::symlink_metadata(&own).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(&own).ok()?;
+    Some((own, canonical))
 }
 
 /// Whether `pkg_path` is the physical dir one of `copies` resolves to.
@@ -2690,8 +2871,8 @@ mod tests {
         pending.push(target_of("present", "1.0.0"));
         let matched_index = pending.len() - 1;
 
-        let visit = NpmCrawler::visit_resolver_dir(nm, false, &pending);
-        assert_eq!(visit.matched, vec![matched_index]);
+        let visit = NpmCrawler::visit_resolver_dir(nm.clone(), false, &pending);
+        assert_eq!(visit.matched, vec![(matched_index, nm.join("present"))]);
     }
 
     #[test]
@@ -4370,6 +4551,294 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The scan, the resolver and the peer-variant fan-out over one store
+    /// tree: every expected purl is scanned, each `targets` purl resolves to
+    /// exactly its `want` copies, and the fan-out from `primary` finds
+    /// `twins`.
+    async fn assert_store_copies_found(
+        root: &Path,
+        want_scan: &[&str],
+        targets: &[(&str, Vec<PathBuf>)],
+        primary: &Path,
+        twins: Vec<PathBuf>,
+    ) {
+        let nm = root.join("node_modules");
+        let scanned = scan_paths(root).await;
+        let purls: Vec<&str> = scanned.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(purls, want_scan, "{scanned:?}");
+
+        let purls: Vec<String> = targets.iter().map(|(p, _)| p.to_string()).collect();
+        let found = NpmCrawler::new().find_by_purls(&nm, &purls).await.unwrap();
+        for (purl, want) in targets {
+            let mut got: Vec<PathBuf> = found
+                .get(*purl)
+                .map(|copies| copies.iter().map(|p| p.path.clone()).collect())
+                .unwrap_or_default();
+            got.sort();
+            let mut want = want.clone();
+            want.sort();
+            assert_eq!(got, want, "{purl}");
+        }
+
+        assert_eq!(find_store_peer_variant_copies(primary).await, twins);
+    }
+
+    /// #366 / #405: Bun's isolated linker keeps every package in
+    /// `node_modules/.bun/<name>@<version>[+<hash>]/node_modules/<name>`
+    /// (scoped `@scope+leaf@…/node_modules/@scope/leaf`), pnpm-shaped. The
+    /// importer links direct deps only, so a transitive package is a real
+    /// dir ONLY in the store; `.bun/node_modules` is Bun's hoist dir of
+    /// links, and a hosted tarball entry's name (`is-number@http+++…`)
+    /// does not decode but must stay probeable.
+    #[tokio::test]
+    async fn test_bun_isolated_store_transitive_packages_are_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        let store = nm.join(".bun");
+
+        let odd_entry = store.join("is-odd@3.0.1/node_modules");
+        write_pkg(&odd_entry.join("is-odd"), "is-odd", "3.0.1");
+        let number = store.join("is-number@6.0.0/node_modules/is-number");
+        write_pkg(&number, "is-number", "6.0.0");
+        let number_twin = store.join("is-number@6.0.0+3c4e1d2a/node_modules/is-number");
+        write_pkg(&number_twin, "is-number", "6.0.0");
+        let hosted =
+            store.join("to-regex-range@http+++127.0.0.1+t.tgz/node_modules/to-regex-range");
+        write_pkg(&hosted, "to-regex-range", "5.0.1");
+        link_dir(&number, &odd_entry.join("is-number"));
+        let frame = store.join("@babel+code-frame@7.0.0/node_modules/@babel/code-frame");
+        write_pkg(&frame, "@babel/code-frame", "7.0.0");
+        std::fs::create_dir_all(store.join("node_modules")).unwrap();
+        link_dir(&number, &store.join("node_modules/is-number"));
+        link_dir(&odd_entry.join("is-odd"), &nm.join("is-odd"));
+
+        assert_store_copies_found(
+            &root,
+            &[
+                "pkg:npm/@babel/code-frame@7.0.0",
+                "pkg:npm/is-number@6.0.0",
+                "pkg:npm/is-odd@3.0.1",
+                "pkg:npm/to-regex-range@5.0.1",
+            ],
+            &[
+                (
+                    "pkg:npm/is-number@6.0.0",
+                    vec![number.clone(), number_twin.clone()],
+                ),
+                ("pkg:npm/@babel/code-frame@7.0.0", vec![frame.clone()]),
+                ("pkg:npm/to-regex-range@5.0.1", vec![hosted.clone()]),
+                ("pkg:npm/is-odd@3.0.1", vec![nm.join("is-odd")]),
+            ],
+            &number,
+            vec![number_twin.clone()],
+        )
+        .await;
+    }
+
+    /// #373: Deno's isolated `nodeModulesDir` keeps every npm package in
+    /// `node_modules/.deno/<name>@<version>[_<peers>]/node_modules/<name>`
+    /// (scoped `@scope+leaf@…`), beside `.deno/.deno.lock` and the
+    /// `.deno/node_modules` hoist dir of links.
+    #[tokio::test]
+    async fn test_deno_node_modules_store_transitive_packages_are_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        let store = nm.join(".deno");
+
+        let odd_entry = store.join("is-odd@3.0.1/node_modules");
+        write_pkg(&odd_entry.join("is-odd"), "is-odd", "3.0.1");
+        let number = store.join("is-number@6.0.0/node_modules/is-number");
+        write_pkg(&number, "is-number", "6.0.0");
+        let number_twin = store.join("is-number@6.0.0_react@18.2.0/node_modules/is-number");
+        write_pkg(&number_twin, "is-number", "6.0.0");
+        link_dir(&number, &odd_entry.join("is-number"));
+        let frame = store.join("@babel+code-frame@7.0.0/node_modules/@babel/code-frame");
+        write_pkg(&frame, "@babel/code-frame", "7.0.0");
+        std::fs::write(store.join(".deno.lock"), "").unwrap();
+        std::fs::create_dir_all(store.join("node_modules")).unwrap();
+        link_dir(&number, &store.join("node_modules/is-number"));
+        link_dir(&odd_entry.join("is-odd"), &nm.join("is-odd"));
+
+        assert_store_copies_found(
+            &root,
+            &[
+                "pkg:npm/@babel/code-frame@7.0.0",
+                "pkg:npm/is-number@6.0.0",
+                "pkg:npm/is-odd@3.0.1",
+            ],
+            &[
+                (
+                    "pkg:npm/is-number@6.0.0",
+                    vec![number.clone(), number_twin.clone()],
+                ),
+                ("pkg:npm/@babel/code-frame@7.0.0", vec![frame.clone()]),
+            ],
+            &number,
+            vec![number_twin.clone()],
+        )
+        .await;
+    }
+
+    /// A store-entry self-link the way Yarn 4 writes it: relative
+    /// (`../package`) on Unix, a junction on Windows.
+    fn link_own_package(entry: &Path, dir_key: &str) {
+        let link = entry.join("node_modules").join(dir_key);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            let up = "../".repeat(dir_key.split('/').count());
+            std::os::unix::fs::symlink(format!("{up}package"), &link).unwrap();
+        }
+        #[cfg(windows)]
+        link_dir(&entry.join("package"), &link);
+    }
+
+    /// #495: Yarn 4's pnpm linker reuses npm's `.store` name, but the only
+    /// physical copy is `.store/<slug>-npm-<version>-<hash>/package`; the
+    /// entry's `node_modules/<name>` is a link to that sibling `package`
+    /// dir, and its other `node_modules` links are edges into other
+    /// entries. The copy is found at its `package` path, never twice.
+    #[tokio::test]
+    async fn test_yarn4_pnpm_linker_store_transitive_packages_are_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        let store = nm.join(".store");
+
+        let odd_entry = store.join("is-odd-npm-3.0.1-3e1a2b4c5d");
+        write_pkg(&odd_entry.join("package"), "is-odd", "3.0.1");
+        link_own_package(&odd_entry, "is-odd");
+        let number_entry = store.join("is-number-npm-6.0.0-9f8e7d6c5b");
+        let number = number_entry.join("package");
+        write_pkg(&number, "is-number", "6.0.0");
+        link_own_package(&number_entry, "is-number");
+        let twin_entry = store.join("is-number-npm-6.0.0-0a1b2c3d4e");
+        let number_twin = twin_entry.join("package");
+        write_pkg(&number_twin, "is-number", "6.0.0");
+        link_own_package(&twin_entry, "is-number");
+        link_dir(&number, &odd_entry.join("node_modules/is-number"));
+        let frame_entry = store.join("@babel-code-frame-npm-7.0.0-1234567890");
+        let frame = frame_entry.join("package");
+        write_pkg(&frame, "@babel/code-frame", "7.0.0");
+        link_own_package(&frame_entry, "@babel/code-frame");
+        link_dir(&odd_entry.join("package"), &nm.join("is-odd"));
+
+        assert_store_copies_found(
+            &root,
+            &[
+                "pkg:npm/@babel/code-frame@7.0.0",
+                "pkg:npm/is-number@6.0.0",
+                "pkg:npm/is-odd@3.0.1",
+            ],
+            &[
+                (
+                    "pkg:npm/is-number@6.0.0",
+                    vec![number.clone(), number_twin.clone()],
+                ),
+                ("pkg:npm/@babel/code-frame@7.0.0", vec![frame.clone()]),
+                ("pkg:npm/is-odd@3.0.1", vec![nm.join("is-odd")]),
+            ],
+            &number,
+            vec![number_twin.clone()],
+        )
+        .await;
+        // The fan-out from the importer link reaches the same store.
+        assert_eq!(
+            find_store_peer_variant_copies(&nm.join("is-odd")).await,
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    /// #496 review: a Yarn 4 store entry's `package` dir carries the
+    /// package's bundled dependencies in `package/node_modules`, which Node
+    /// loads in preference to the regular store copy. The entry reaches
+    /// that tree only through its `node_modules/<name> -> ../package`
+    /// link, so the resolver must enqueue it like the scan does, or apply
+    /// patches the regular copy and leaves the loaded one untouched.
+    #[tokio::test]
+    async fn test_yarn4_pnpm_linker_bundled_copy_inside_store_package_is_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        let store = nm.join(".store");
+
+        let number_entry = store.join("is-number-npm-7.0.0-9f8e7d6c5b");
+        let number = number_entry.join("package");
+        write_pkg(&number, "is-number", "7.0.0");
+        link_own_package(&number_entry, "is-number");
+        let parent_entry = store.join("parent-file-1.0.0-1234567890");
+        let parent = parent_entry.join("package");
+        write_pkg(&parent, "parent", "1.0.0");
+        link_own_package(&parent_entry, "parent");
+        let bundled = parent.join("node_modules/is-number");
+        write_pkg(&bundled, "is-number", "7.0.0");
+        let scoped_entry = store.join("@acme-tool-file-2.0.0-abcdef0123");
+        let scoped = scoped_entry.join("package");
+        write_pkg(&scoped, "@acme/tool", "2.0.0");
+        link_own_package(&scoped_entry, "@acme/tool");
+        let scoped_bundled = scoped.join("node_modules/is-number");
+        write_pkg(&scoped_bundled, "is-number", "7.0.0");
+        link_dir(&parent, &nm.join("parent"));
+        link_dir(&number, &nm.join("is-number"));
+
+        let scanned = scan_paths(&root).await;
+        let mut scan_purls: Vec<&str> = scanned.iter().map(|(p, _)| p.as_str()).collect();
+        scan_purls.sort();
+        assert_eq!(
+            scan_purls,
+            [
+                "pkg:npm/@acme/tool@2.0.0",
+                "pkg:npm/is-number@7.0.0",
+                "pkg:npm/parent@1.0.0",
+            ],
+            "{scanned:?}"
+        );
+
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, &["pkg:npm/is-number@7.0.0".to_string()])
+            .await
+            .unwrap();
+        let mut got: Vec<PathBuf> = found["pkg:npm/is-number@7.0.0"]
+            .iter()
+            .map(|p| p.path.clone())
+            .collect();
+        got.sort();
+        let mut want = vec![nm.join("is-number"), bundled, scoped_bundled];
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    /// A sibling `package` dir alone does not make an entry Yarn 4's: with
+    /// no link from the entry's `node_modules` to it, its tree is not
+    /// walked.
+    #[tokio::test]
+    async fn test_store_package_dir_without_own_link_is_not_walked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        let entry = nm.join(".store/parent-file-1.0.0-1234567890");
+        write_pkg(&entry.join("node_modules/parent"), "parent", "1.0.0");
+        write_pkg(
+            &entry.join("package/node_modules/is-number"),
+            "is-number",
+            "7.0.0",
+        );
+        write_pkg(&entry.join("package"), "parent", "1.0.0");
+
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, &["pkg:npm/is-number@7.0.0".to_string()])
+            .await
+            .unwrap();
+        assert!(
+            found
+                .get("pkg:npm/is-number@7.0.0")
+                .is_none_or(|copies| copies.is_empty()),
+            "{found:?}"
+        );
     }
 
     /// `.yarnrc` `--modules-folder` parsing: bare and quoted keys and

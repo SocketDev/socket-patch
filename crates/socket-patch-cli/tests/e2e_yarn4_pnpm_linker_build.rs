@@ -803,3 +803,326 @@ fn yarn4_pnpm_linker_vendor_fresh_checkout_installs_patched_bytes_and_reverts() 
     );
     eprintln!("REVERT OK");
 }
+
+// ── agent-mode transitive capstone (#495) ─────────────────────────────
+
+/// #495: under the pnpm linker a TRANSITIVE dependency exists only at
+/// `node_modules/.store/<slug>-npm-<v>-<hash>/package`, reachable through
+/// the entry's own `node_modules/<name> -> ../package` link (yarn 4; yarn 3
+/// wrote a real dir there). Agent-mode `apply` must find and patch that
+/// copy, the code yarn's runtime loads must carry the patch, and
+/// `rollback` must restore it.
+#[test]
+fn yarn4_pnpm_linker_agent_apply_patches_transitive_store_copy() {
+    if !has_corepack_pm(yarn_berry()) {
+        skip!(
+            "SKIP e2e_yarn4_pnpm_linker_build (agent transitive): `corepack {}` unavailable",
+            yarn_berry()
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"yarn4-pnpm-linker-transitive","version":"0.0.0","private":true,"dependencies":{"is-odd":"3.0.1"}}"#,
+    )
+    .unwrap();
+    std::fs::write(proj.join(".yarnrc.yml"), YARNRC_PNPM).unwrap();
+    let global = tmp.path().join("yarn-global");
+    let install = corepack(
+        &proj,
+        yarn_berry(),
+        &["install"],
+        &[("YARN_GLOBAL_FOLDER", global.to_str().unwrap())],
+    );
+    if !install.status.success() {
+        skip!(
+            "SKIP e2e_yarn4_pnpm_linker_build (agent transitive): fixture `yarn install` \
+             failed (registry unreachable?):\n{}",
+            yarn_berry_common::yarn_output(&install)
+        );
+        return;
+    }
+
+    // The layout under test: no importer-level `is-number`, one store
+    // entry whose package dir is the only physical copy.
+    let nm = proj.join("node_modules");
+    assert!(
+        std::fs::symlink_metadata(nm.join("is-number")).is_err(),
+        "is-number must be transitive-only (not linked at the importer root)"
+    );
+    let entry = std::fs::read_dir(nm.join(".store"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("is-number-npm-6.0.0-"))
+        })
+        .expect(".store must hold an is-number-npm-6.0.0 entry");
+    let index = entry.join("package").join("index.js");
+    let orig = std::fs::read(&index).expect("store copy of is-number/index.js");
+    assert!(!orig.starts_with(MARKER.as_bytes()));
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    stage_patch(&proj, "pkg:npm/is-number@6.0.0", &orig, &patched);
+    // The before blob too, so the offline rollback can restore.
+    std::fs::write(proj.join(".socket/blobs").join(git_sha256(&orig)), &orig).unwrap();
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "apply",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "apply failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("apply --json output is not JSON: {e}\nstdout:\n{stdout}"));
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        env["summary"]["applied"], 1,
+        "transitive copy applied: {env}"
+    );
+    assert_eq!(
+        std::fs::read(&index).unwrap(),
+        patched,
+        "store copy patched"
+    );
+
+    // RUNTIME PROOF: is-odd's own require of is-number loads the patch.
+    let resolve = "process.stdout.write(require('fs').readFileSync(require.resolve('is-number', \
+                   {paths: [require('path').dirname(require.resolve('is-odd'))]})))";
+    let out = corepack(&proj, yarn_berry(), &["node", "-e", resolve], &[]);
+    assert!(
+        out.status.success(),
+        "`yarn node` failed:\n{}",
+        yarn_berry_common::yarn_output(&out)
+    );
+    assert_eq!(
+        out.stdout, patched,
+        "is-odd must load the patched is-number"
+    );
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "rollback",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "rollback failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&index).unwrap(),
+        orig,
+        "rollback restores the store copy"
+    );
+}
+
+/// #496 review: a package bundling is-number@7.0.0 lands in the pnpm
+/// linker's store as `.store/parent-…/package/node_modules/is-number`,
+/// beside the regular `.store/is-number-npm-7.0.0-…/package`, and Node
+/// loads the BUNDLED copy for `parent`. That copy is reachable only
+/// through the entry's `node_modules/parent -> ../package` link, so apply
+/// must still find it: both copies get patched, `parent` loads the patch,
+/// and rollback restores both.
+#[test]
+fn yarn4_pnpm_linker_agent_apply_patches_bundled_copy_inside_store_package() {
+    if !has_corepack_pm(yarn_berry()) || !has_command("tar") {
+        skip!(
+            "SKIP e2e_yarn4_pnpm_linker_build (agent bundled): `corepack {}` or `tar` unavailable",
+            yarn_berry()
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join(".yarnrc.yml"), YARNRC_PNPM).unwrap();
+    let global = tmp.path().join("yarn-global");
+    let install = |manifest: &str| {
+        std::fs::write(proj.join("package.json"), manifest).unwrap();
+        corepack(
+            &proj,
+            yarn_berry(),
+            &["install"],
+            &[("YARN_GLOBAL_FOLDER", global.to_str().unwrap())],
+        )
+    };
+
+    // The registry copy first, so the bundled one can be byte-identical:
+    // one patch's before-hashes then fit both.
+    let out = install(
+        r#"{"name":"yarn4-pnpm-linker-bundled","version":"0.0.0","private":true,"dependencies":{"is-number":"7.0.0"}}"#,
+    );
+    if !out.status.success() {
+        skip!(
+            "SKIP e2e_yarn4_pnpm_linker_build (agent bundled): fixture `yarn install` \
+             failed (registry unreachable?):\n{}",
+            yarn_berry_common::yarn_output(&out)
+        );
+        return;
+    }
+    let nm = proj.join("node_modules");
+    let registry_copy = nm.join("is-number");
+
+    let stage = tmp.path().join("parent-stage").join("package");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(
+        stage.join("package.json"),
+        r#"{"name":"parent","version":"1.0.0","main":"index.js","bundleDependencies":["is-number"],"dependencies":{"is-number":"7.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        stage.join("index.js"),
+        "module.exports = require.resolve('is-number');\n",
+    )
+    .unwrap();
+    copy_dir_recursive(
+        &registry_copy,
+        &stage.join("node_modules").join("is-number"),
+    );
+    let tgz = proj.join("parent-1.0.0.tgz");
+    let tar = Command::new("tar")
+        .args(["-czf", tgz.to_str().unwrap(), "package"])
+        .current_dir(stage.parent().unwrap())
+        .output()
+        .expect("failed to run tar");
+    assert!(
+        tar.status.success(),
+        "tar: {}",
+        String::from_utf8_lossy(&tar.stderr)
+    );
+
+    let out = install(
+        r#"{"name":"yarn4-pnpm-linker-bundled","version":"0.0.0","private":true,"dependencies":{"is-number":"7.0.0","parent":"file:./parent-1.0.0.tgz"}}"#,
+    );
+    assert!(
+        out.status.success(),
+        "`yarn install` with the bundling tarball failed:\n{}",
+        yarn_berry_common::yarn_output(&out)
+    );
+
+    // The layout under test: two physical is-number@7.0.0 copies in the
+    // store, the bundled one inside parent's `package` dir.
+    let store_entry = |prefix: &str| {
+        std::fs::read_dir(nm.join(".store"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(prefix))
+            })
+            .unwrap_or_else(|| panic!(".store must hold a {prefix}* entry"))
+    };
+    let regular_index = store_entry("is-number-npm-7.0.0-").join("package/index.js");
+    let bundled_index = store_entry("parent-").join("package/node_modules/is-number/index.js");
+    let orig = std::fs::read(&regular_index).expect("regular store copy of is-number/index.js");
+    assert_eq!(
+        std::fs::read(&bundled_index).expect("bundled copy inside parent's package dir"),
+        orig,
+        "the bundled copy is byte-identical to the registry copy"
+    );
+
+    // Which copy Node loads for `parent`: the bundled one.
+    let load = "process.stdout.write(require('fs').readFileSync(require('parent')))";
+    let loaded_path = corepack(
+        &proj,
+        yarn_berry(),
+        &["node", "-p", "require('parent')"],
+        &[],
+    );
+    // Compared as canonical paths: Node prints the platform's separators.
+    let loaded = PathBuf::from(String::from_utf8_lossy(&loaded_path.stdout).trim());
+    assert_eq!(
+        std::fs::canonicalize(&loaded).ok(),
+        std::fs::canonicalize(&bundled_index).ok(),
+        "parent must load its bundled is-number:\n{}",
+        yarn_berry_common::yarn_output(&loaded_path)
+    );
+
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    stage_patch(&proj, "pkg:npm/is-number@7.0.0", &orig, &patched);
+    std::fs::write(proj.join(".socket/blobs").join(git_sha256(&orig)), &orig).unwrap();
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "apply",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "apply failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("apply --json output is not JSON: {e}\nstdout:\n{stdout}"));
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        std::fs::read(&regular_index).unwrap(),
+        patched,
+        "regular copy patched"
+    );
+    assert_eq!(
+        std::fs::read(&bundled_index).unwrap(),
+        patched,
+        "bundled copy patched"
+    );
+
+    // RUNTIME PROOF: the copy `parent` actually loads carries the patch.
+    let out = corepack(&proj, yarn_berry(), &["node", "-e", load], &[]);
+    assert!(
+        out.status.success(),
+        "`yarn node` failed:\n{}",
+        yarn_berry_common::yarn_output(&out)
+    );
+    assert_eq!(
+        out.stdout, patched,
+        "parent must load the patched is-number"
+    );
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "rollback",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "rollback failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&regular_index).unwrap(),
+        orig,
+        "rollback restores the regular copy"
+    );
+    assert_eq!(
+        std::fs::read(&bundled_index).unwrap(),
+        orig,
+        "rollback restores the bundled copy"
+    );
+}

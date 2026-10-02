@@ -2162,6 +2162,69 @@ fn vlt_redirect_ledger_is_judged_by_the_vlt_store_copy_while_the_lock_pins_it() 
     }
 }
 
+/// #405: Bun's isolated linker installs a transitive package only in its
+/// store (`node_modules/.bun/<entry>/node_modules/<name>`; the entry is
+/// `<name>@<version>` for a stale pre-reinstall tree, a mangled URL for a
+/// fresh install of the hosted tarball). While `bun.lock` pins the hosted
+/// tarball, that store copy is the evidence: a pristine copy is unpatched
+/// code (`not_applied`), never a "nothing installed" lockfile attestation.
+#[test]
+fn bun_hosted_ref_is_judged_by_the_bun_store_copy() {
+    let (pristine, patched) = (
+        &b"module.exports = 'pristine'\n"[..],
+        &b"module.exports = 'patched'\n"[..],
+    );
+    let purl = "pkg:npm/left-pad@1.3.0";
+    let url = hosted_npm_url("left-pad", "1.3.0", UUID);
+    let entries = [
+        "left-pad@1.3.0".to_string(),
+        format!("left-pad@{}", url.replace([':', '/'], "+")),
+    ];
+    for entry in entries {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        put(
+            cwd,
+            "package.json",
+            br#"{ "name": "app", "version": "1.0.0", "dependencies": { "dep": "1.0.0" } }"#,
+        );
+        put(
+            cwd,
+            "bun.lock",
+            format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {{\n    \"\": {{\n      \
+                 \"name\": \"app\",\n      \"dependencies\": {{\n        \"dep\": \"1.0.0\",\n      \
+                 }},\n    }},\n  }},\n  \"packages\": {{\n    \
+                 \"dep\": [\"dep@1.0.0\", \"\", {{ \"dependencies\": {{ \"left-pad\": \"1.3.0\" }} }}, \
+                 \"sha512-{dep}==\"],\n\n    \
+                 \"left-pad\": [\"left-pad@{url}\", {{}}, \"{SRI}\"],\n  }}\n}}\n",
+                dep = "D".repeat(86),
+            )
+            .as_bytes(),
+        );
+        let store = format!("node_modules/.bun/{entry}/node_modules/left-pad");
+        put(
+            cwd,
+            &format!("{store}/package.json"),
+            br#"{ "name": "left-pad", "version": "1.3.0" }"#,
+        );
+        put(cwd, &format!("{store}/index.js"), pristine);
+        let (_rt, server) = serve_patch_views(vec![(
+            UUID.to_string(),
+            one_file_view(UUID, purl, "package/index.js", pristine, patched),
+        )]);
+        let args = ["--proxy-url", &server.uri()];
+
+        let (code, env) = vex_json(cwd, &args);
+        assert_eq!(code, Some(1), "{entry}: a pristine store copy: {env}");
+        assert_eq!(skipped_reason(&env, purl), "not_applied", "{entry}: {env}");
+
+        put(cwd, &format!("{store}/index.js"), patched);
+        let (code, env) = vex_json(cwd, &args);
+        assert_attested(cwd, code, &env, UUID, "the store copy verifies");
+    }
+}
+
 /// The patch view for `name@version` (the [`left_pad_view`] shape).
 fn npm_view(name: &str, version: &str, after_hash: &str) -> Value {
     let mut view = left_pad_view(after_hash);
