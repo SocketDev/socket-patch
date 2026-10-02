@@ -79,8 +79,8 @@ Measured details:
   when `python.use_venv` is off (`PDM_USE_VENV`, else `[python] use_venv` in
   the first of the project's `pdm.toml` / `.pdm.toml`, the user config
   (`$PDM_CONFIG_FILE` or `<user config dir>/pdm/config.toml`) and the site
-  config (`/etc/xdg/pdm/config.toml` or the first `$XDG_CONFIG_DIRS` entry,
-  `/Library/Application Support/pdm`, `%PROGRAMDATA%\pdm\pdm`), as a bool or
+  config (`/etc/xdg/pdm/config.toml` or the first absolute `$XDG_CONFIG_DIRS`
+  entry, `/Library/Application Support/pdm`, `%PROGRAMDATA%\pdm\pdm`), as a bool or
   the string PDM 2.27+ writes; off by default only for PDM 1.x). Otherwise the
   activated or in-project venv is used, with `__pypackages__` as the last
   resort. `PDM_IGNORE_SAVED_PYTHON` and `PDM_IGNORE_ACTIVE_VENV` are

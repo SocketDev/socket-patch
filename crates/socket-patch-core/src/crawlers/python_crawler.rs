@@ -2014,8 +2014,10 @@ fn pdm_dir_candidates(
 }
 
 /// PDM's user config file, as PDM picks it: `$PDM_CONFIG_FILE` when set,
-/// otherwise `config.toml` in the per-user config dir
-/// ([`pdm_dir_candidates`]).
+/// otherwise `config.toml` in the per-user config dir. platformdirs
+/// resolves that to one directory, the most specific of
+/// [`pdm_dir_candidates`], so only that file is a layer: a setting missing
+/// from it must not fall through to another candidate.
 fn pdm_user_config_files(
     home_dir: Option<&Path>,
     var: &impl Fn(&str) -> Option<String>,
@@ -2025,6 +2027,7 @@ fn pdm_user_config_files(
     }
     pdm_dir_candidates(home_dir, var, "XDG_CONFIG_HOME", Path::new(".config"))
         .into_iter()
+        .take(1)
         .map(|d| d.join("config.toml"))
         .collect()
 }
@@ -2038,19 +2041,16 @@ fn pdm_user_config_files(
 fn pdm_site_config_dirs(var: &impl Fn(&str) -> Option<String>) -> Vec<PathBuf> {
     #[cfg(all(not(target_os = "macos"), not(windows)))]
     {
-        let dirs = var("XDG_CONFIG_DIRS").filter(|v| !v.trim().is_empty());
+        // The first absolute entry: an empty or relative one (a leading
+        // `:` from `$XDG_CONFIG_DIRS:/other` with the variable unset) is
+        // not a config dir, per the XDG spec.
+        let dirs = var("XDG_CONFIG_DIRS").unwrap_or_default();
         let first = dirs
-            .as_deref()
-            .unwrap_or("/etc/xdg")
             .split(':')
-            .next()
-            .unwrap_or_default()
-            .trim_end_matches('/')
-            .to_string();
-        (!first.is_empty())
-            .then(|| PathBuf::from(first).join("pdm"))
-            .into_iter()
-            .collect()
+            .map(|d| d.trim_end_matches('/'))
+            .find(|d| Path::new(d).is_absolute())
+            .unwrap_or("/etc/xdg");
+        vec![PathBuf::from(first).join("pdm")]
     }
     #[cfg(target_os = "macos")]
     {
@@ -3086,6 +3086,67 @@ mod tests {
         assert_eq!(
             find_local_venv_site_packages_with(&project, &custom_over_user).await,
             vec![stray]
+        );
+    }
+
+    /// platformdirs resolves PDM's user config dir to ONE directory, so a
+    /// `use_venv` in a less specific candidate (`~/.config/pdm` while
+    /// `$XDG_CONFIG_HOME` is set) is not a layer PDM reads.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn pdm_user_config_is_one_file_not_every_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, lib, stray) = pdm_pep582_fixture(tmp.path());
+        let home = tmp.path().join("home");
+        let shadowed = if cfg!(target_os = "macos") {
+            home.join("Library").join("Application Support").join("pdm")
+        } else {
+            home.join(".config").join("pdm")
+        };
+        std::fs::create_dir_all(&shadowed).unwrap();
+        std::fs::write(shadowed.join("config.toml"), "[python]\nuse_venv = false\n").unwrap();
+        let home_only = env_of(&[("HOME", home.to_string_lossy().into_owned())]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &home_only).await,
+            vec![lib]
+        );
+        let config_home = tmp.path().join("config-home");
+        std::fs::create_dir_all(config_home.join("pdm")).unwrap();
+        std::fs::write(config_home.join("pdm").join("config.toml"), "[venv]\n").unwrap();
+        let relocated = env_of(&[
+            ("HOME", home.to_string_lossy().into_owned()),
+            (
+                "XDG_CONFIG_HOME",
+                config_home.to_string_lossy().into_owned(),
+            ),
+        ]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &relocated).await,
+            vec![stray]
+        );
+    }
+
+    /// The site config dir is the first ABSOLUTE `$XDG_CONFIG_DIRS` entry:
+    /// a leading empty segment (`:/etc/xdg`) does not drop the site layer.
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    #[test]
+    fn pdm_site_config_dir_skips_empty_and_relative_xdg_entries() {
+        let dirs = |value: &str| {
+            let value = value.to_string();
+            pdm_site_config_dirs(&move |name: &str| {
+                (name == "XDG_CONFIG_DIRS").then(|| value.clone())
+            })
+        };
+        assert_eq!(dirs(":/etc/site"), vec![PathBuf::from("/etc/site/pdm")]);
+        assert_eq!(
+            dirs("relative:/etc/site/:/etc/other"),
+            vec![PathBuf::from("/etc/site/pdm")]
+        );
+        assert_eq!(dirs(""), vec![PathBuf::from("/etc/xdg/pdm")]);
+        assert_eq!(dirs(":"), vec![PathBuf::from("/etc/xdg/pdm")]);
+        assert_eq!(
+            pdm_site_config_dirs(&|_: &str| None),
+            vec![PathBuf::from("/etc/xdg/pdm")]
         );
     }
 
