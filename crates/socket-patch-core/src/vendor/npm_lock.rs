@@ -849,6 +849,56 @@ enum LockScan {
     },
 }
 
+/// `vendor --check`'s wiring audit for a package-lock entry (#588): every
+/// rewritable `packages` instance of the entry's `name@version` (the set
+/// [`vendor_npm`] rewires) in each present npm lock must resolve to the
+/// vendored artifact. Another entry for the same version — e.g. a
+/// workspace member added after vendoring, then `npm install` — resolves
+/// from the registry and installs unpatched, and a fresh install cannot
+/// heal it: the lock itself names the unpatched source. `Err` is the
+/// human reason.
+pub(super) async fn check_wiring(entry: &VendorEntry, project_root: &Path) -> Result<(), String> {
+    // Unparseable coordinates never vendored; the artifact check owns that.
+    let Some((name, version)) = super::npm_common::parse_npm_purl(&entry.base_purl) else {
+        return Ok(());
+    };
+    let wired = format!("file:{}", entry.artifact.path);
+    let overrides = NpmOverrides::read(project_root).await;
+    let mut unwired = Vec::new();
+    for lock_name in NPM_LOCKS {
+        let bytes = match read_regular_to_bytes(&project_root.join(lock_name)).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{lock_name} cannot be read: {e}")),
+        };
+        let lock = parse_json_manifest(&bytes)
+            .map_err(|e| format!("{lock_name} is not parseable JSON: {e}"))?;
+        // The skip advisories are vendor's to raise; a bundled / link /
+        // non-registry copy is not one vendor can rewire.
+        let mut skipped = Vec::new();
+        let LockScan::Matches(matches) =
+            scan_lock_matches(&lock, &overrides, &name, &version, &mut skipped)
+        else {
+            continue;
+        };
+        unwired.extend(
+            matches
+                .iter()
+                .filter(|m| m.original.get("resolved").and_then(Value::as_str) != Some(&wired))
+                .map(|m| format!("{lock_name} `{}`", m.key)),
+        );
+    }
+    if unwired.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "vendored wiring drifted: {} still resolve {name}@{version} outside the vendored \
+         artifact, so that copy installs unpatched; re-run `socket-patch vendor` to rewire \
+         every copy",
+        unwired.join(", ")
+    ))
+}
+
 /// Scan `packages` for instances of `name@version`, pushing skip warnings
 /// for the link / inBundle instances that cannot be rewritten.
 fn scan_lock_matches(

@@ -102,6 +102,12 @@ limits, and required install commands.
 
 ### Fixed
 
+- `vex` no longer attests an npm or Bun patch as `not_affected` while a
+  second entry for the same `name@version` in the same lockfile still
+  resolves from the registry (for example a workspace member added after
+  vendoring). That copy installs unpatched, so the patch is now reported
+  as contested. `vendor --check` reports the same lockfile entry as drift
+  (#588).
 - Global mode (`-g`) finds npm, yarn, pnpm, bun, RubyGems and Composer on
   Windows, where they install as `.cmd` / `.bat` shims, instead of reporting
   an empty scan. The yarn and npm-family global lookups no longer run from the
