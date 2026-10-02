@@ -1657,6 +1657,15 @@ async fn berry_vendored_to_hosted_takeover_keeps_vendored_without_berry_checksum
 async fn berry_hosted_to_vendored_takeover_runs_package_gates_first() {
     let server = wiremock::MockServer::start().await;
     mount_berry_hosted_api(&server).await;
+    // The upstream entry the takeover's restore reads: the gates are
+    // evaluated on the restored files, so the restore itself must succeed.
+    mount_npm_registry(
+        &server,
+        "left-pad",
+        "1.3.0",
+        npm_tgz("left-pad", "1.3.0", ORIG_INDEX),
+    )
+    .await;
     type Break = fn(&Path);
     // A workspace member's lock entry for another version of the name: a
     // name-keyed `resolutions` entry would move it too.
@@ -1708,9 +1717,10 @@ async fn berry_hosted_to_vendored_takeover_runs_package_gates_first() {
             if dry {
                 args.push("--dry-run");
             }
-            let (exit, stdout, stderr) = run_cli(root, &args, &[]);
+            let env = online_env(&uri, &uri);
+            let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let (exit, stdout, stderr) = run_cli(root, &args, &env);
             let text = format!("{stdout}\n{stderr}");
-            eprintln!("DBG {ctx} exit={exit} {text}");
             assert_ne!(exit, 0, "{ctx}: the refusal fails the run: {text}");
             assert!(
                 text.contains("vendor_override_conflict"),

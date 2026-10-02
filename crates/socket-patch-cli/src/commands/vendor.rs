@@ -2347,6 +2347,13 @@ pub(crate) async fn vendor_records_reusing(
             // whose upstream entry cannot be restored is REFUSED; the cargo
             // backend's `hosted_redirect_live` guard backstops the rest.
             if let Some(pin) = hosted_pin_of(candidate) {
+                let origins = crate::commands::rollback::patch_server_origins(common);
+                let restore_opts = socket_patch_core::patch::redirect::upstream::RestoreOptions {
+                    dry_run: common.dry_run,
+                    offline: common.offline,
+                    patch_server_origins: origins.clone(),
+                    bun_lockb: true,
+                };
                 // The refusal the berry backend would raise after the
                 // restore, raised HERE instead — the same `failed` event,
                 // code and detail, in the dry run and the wet run alike —
@@ -2364,6 +2371,8 @@ pub(crate) async fn vendor_records_reusing(
                             socket_patch_core::vendor::yarn_berry_vendor_target_preflight(
                                 &common.cwd,
                                 candidate,
+                                pin,
+                                &restore_opts,
                             )
                             .await
                         }
@@ -2378,7 +2387,6 @@ pub(crate) async fn vendor_records_reusing(
                         continue;
                     }
                 }
-                let origins = crate::commands::rollback::patch_server_origins(common);
                 let vlt_lock = socket_patch_core::utils::fs::read_regular_to_string(
                     &common
                         .cwd
@@ -2399,12 +2407,7 @@ pub(crate) async fn vendor_records_reusing(
                 let restore = socket_patch_core::patch::redirect::upstream::restore_upstream(
                     &common.cwd,
                     std::slice::from_ref(pin),
-                    &socket_patch_core::patch::redirect::upstream::RestoreOptions {
-                        dry_run: common.dry_run,
-                        offline: common.offline,
-                        patch_server_origins: origins,
-                        bun_lockb: true,
-                    },
+                    &restore_opts,
                 )
                 .await;
                 let refusal = restore
