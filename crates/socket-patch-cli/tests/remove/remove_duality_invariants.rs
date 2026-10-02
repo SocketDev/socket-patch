@@ -111,7 +111,7 @@ fn make_preserve_fixture(root: &Path) -> (PathBuf, String, String) {
 /// rollback data (#559). Exercise both commands against the same lifecycle.
 #[test]
 fn scoped_removal_preserves_other_patches_for_offline_rollback() {
-    for command in ["remove", "rollback"] {
+    for (command, skip_rollback) in [("remove", false), ("remove", true), ("rollback", false)] {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let (socket, before_hash, after_hash) = make_preserve_fixture(root);
@@ -143,11 +143,11 @@ fn scoped_removal_preserves_other_patches_for_offline_rollback() {
         std::fs::write(socket.join("blobs").join(&other_before), original).unwrap();
         std::fs::write(socket.join("blobs").join(&other_after), patched).unwrap();
 
-        let (code, stdout, stderr) = common::run_with_env(
-            root,
-            &[command, PRESERVE_PURL, "--json", "--yes", "--offline"],
-            &[],
-        );
+        let mut args = vec![command, PRESERVE_PURL, "--json", "--yes", "--offline"];
+        if skip_rollback {
+            args.push("--skip-rollback");
+        }
+        let (code, stdout, stderr) = common::run_with_env(root, &args, &[]);
         assert_eq!(code, 0, "{command}: {stdout}\n{stderr}");
         let remaining = read_manifest(&socket);
         assert_eq!(remaining["patches"].as_object().unwrap().len(), 1);
