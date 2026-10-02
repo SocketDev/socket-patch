@@ -2,9 +2,13 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::gradle_cache;
 use super::jvm_cache::{self, JvmCacheLayout, JvmCacheRoot};
 use super::types::{CrawledPackage, CrawlerOptions};
 use super::walk_pool::{par_map, run_walk};
+use crate::gradle::graph::MavenLocal;
+use crate::gradle::home::GradleHome;
+use crate::gradle::{Env, Os};
 use crate::patch::path_safety;
 use crate::utils::fs::is_dir;
 
@@ -538,11 +542,166 @@ pub(crate) fn is_safe_maven_coordinate(group_id: &str, artifact_id: &str, versio
 }
 
 // ---------------------------------------------------------------------------
+// Cache roots
+// ---------------------------------------------------------------------------
+
+/// The JVM caches a run resolves against: the Maven local repository and
+/// the Gradle user home. [`JvmEnv::from_process`] reads the process
+/// environment; [`JvmEnv::resolve`] an explicit one (tests).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JvmEnv {
+    /// The Maven local repository (see [`MavenCrawler::get_maven_repo_paths`]).
+    pub m2_repo: PathBuf,
+    /// The Gradle user home; `None` when none can be resolved.
+    pub gradle: Option<GradleHome>,
+}
+
+impl JvmEnv {
+    /// The caches of this process: `$MAVEN_REPO_LOCAL` / `$M2_HOME` /
+    /// `~/.m2`, and [`gradle_cache::home_from_process_env`].
+    pub fn from_process() -> Self {
+        Self {
+            m2_repo: MavenCrawler::m2_repo_path(),
+            gradle: gradle_cache::home_from_process_env(),
+        }
+    }
+
+    /// The caches `env` names. `home_dir` is the account's home (on Unix
+    /// the passwd entry's), which Gradle prefers to `$HOME`.
+    pub fn resolve(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Self {
+        Self {
+            m2_repo: m2_repo_path_with(env, home_dir),
+            gradle: GradleHome::resolve(env, os, home_dir),
+        }
+    }
+
+    /// The existing Gradle `files-2.1` caches: the user home's, then the
+    /// read-only one.
+    async fn gradle_roots(&self) -> Vec<JvmCacheRoot> {
+        let mut roots = Vec::new();
+        let Some(home) = &self.gradle else {
+            return roots;
+        };
+        for dir in std::iter::once(&home.files21).chain(&home.ro_files21) {
+            if is_dir(dir).await {
+                roots.push(JvmCacheRoot::new(
+                    dir.clone(),
+                    JvmCacheLayout::GradleModules2,
+                ));
+            }
+        }
+        roots
+    }
+
+    /// Whether `path` is the read-only Gradle cache
+    /// (`$GRADLE_RO_DEP_CACHE/modules-2/files-2.1`), which is scanned but
+    /// never written.
+    pub fn is_ro_root(&self, path: &Path) -> bool {
+        self.gradle
+            .as_ref()
+            .and_then(|h| h.ro_files21.as_deref())
+            .is_some_and(|ro| ro == path)
+    }
+}
+
+/// Whether `path` is the read-only Gradle cache of this process
+/// ([`JvmEnv::is_ro_root`]).
+pub fn is_ro_root(path: &Path) -> bool {
+    JvmEnv::from_process().is_ro_root(path)
+}
+
+/// The Maven local repository `env` names: `$MAVEN_REPO_LOCAL`, else
+/// `$M2_HOME/repository`, else `<home>/.m2/repository` with `<home>` =
+/// `$HOME`, `$USERPROFILE`, `home_dir`, or `~`. A set-but-empty variable
+/// counts as unset (see [`MavenCrawler::m2_repo_path`]).
+pub fn m2_repo_path_with(env: &dyn Env, home_dir: Option<&Path>) -> PathBuf {
+    let set = |k: &str| env.var(k).filter(|v| !v.is_empty());
+    if let Some(repo_local) = set("MAVEN_REPO_LOCAL") {
+        return PathBuf::from(repo_local);
+    }
+    if let Some(m2_home) = set("M2_HOME") {
+        return PathBuf::from(m2_home).join("repository");
+    }
+    let home = set("HOME")
+        .or_else(|| set("USERPROFILE"))
+        .map(PathBuf::from)
+        .or_else(|| home_dir.map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("~"));
+    home.join(".m2").join("repository")
+}
+
+/// A `--global-prefix` as the cache root it names: a Gradle user home
+/// (`.gradle`), its `caches/modules-2`, or a read-only cache's `modules-2`
+/// stands for the existing `files-2.1` inside it. Anything else (a
+/// `files-2.1` itself, a Maven repository — even one named `caches`) is
+/// returned unchanged.
+pub fn normalize_prefix(prefix: &Path) -> PathBuf {
+    let inner = match prefix.file_name().and_then(|n| n.to_str()) {
+        Some(".gradle") => prefix
+            .join("caches")
+            .join("modules-2")
+            .join(gradle_cache::FILES21),
+        Some("modules-2") => prefix.join(gradle_cache::FILES21),
+        _ => return prefix.to_path_buf(),
+    };
+    if inner.is_dir() {
+        inner
+    } else {
+        prefix.to_path_buf()
+    }
+}
+
+/// Whether a local scan of `cwd` counts the Maven local repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum M2Gate {
+    /// Not a Gradle-only project (a `pom.xml`, or no Gradle marker): m2
+    /// counts as always.
+    NotGradleOnly,
+    /// A Gradle build that declares `mavenLocal()` (in this script).
+    Declared(String),
+    /// A Gradle build whose scripts or init scripts could not all be read
+    /// literally, so `mavenLocal()` cannot be ruled out: m2 is kept.
+    Undetermined(String),
+    /// A Gradle-only build that never reads m2.
+    Ignored,
+}
+
+/// See [`M2Gate`]. Reads the build's scripts and the init scripts of
+/// `env`'s Gradle user home.
+pub fn m2_gate(cwd: &Path, env: &JvmEnv) -> M2Gate {
+    if cwd.join("pom.xml").exists() || !gradle_cache::has_gradle_marker(cwd) {
+        return M2Gate::NotGradleOnly;
+    }
+    match gradle_cache::maven_local(cwd, env.gradle.as_ref()) {
+        MavenLocal::Declared(at) => M2Gate::Declared(at),
+        MavenLocal::Undetermined(why) => M2Gate::Undetermined(why),
+        MavenLocal::NotDeclared => M2Gate::Ignored,
+    }
+}
+
+/// Whether a Gradle-only build at `cwd` ignores the Maven local repository
+/// (process environment; see [`m2_gate`]).
+pub fn gradle_m2_ignored(cwd: &Path) -> bool {
+    m2_gate(cwd, &JvmEnv::from_process()) == M2Gate::Ignored
+}
+
+/// Why `mavenLocal()` could not be ruled out for the Gradle build at
+/// `cwd`, when m2 is kept for that reason (process environment).
+pub fn maven_local_undetermined(cwd: &Path) -> Option<String> {
+    match m2_gate(cwd, &JvmEnv::from_process()) {
+        M2Gate::Undetermined(why) => Some(why),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MavenCrawler
 // ---------------------------------------------------------------------------
 
-/// Maven/Java ecosystem crawler for discovering packages in the local
-/// Maven repository (`~/.m2/repository/`).
+/// Maven/Java ecosystem crawler for discovering packages in the JVM
+/// artifact caches: the local Maven repository (`~/.m2/repository/`) and
+/// Gradle's module cache (`~/.gradle/caches/modules-2/files-2.1`, plus the
+/// read-only `$GRADLE_RO_DEP_CACHE`).
 pub struct MavenCrawler;
 
 impl MavenCrawler {
@@ -555,45 +714,131 @@ impl MavenCrawler {
     // Public API
     // ------------------------------------------------------------------
 
-    /// Every JVM artifact cache to crawl, tagged with its layout.
-    ///
-    /// In global mode (or with `--global-prefix`) returns the caches
-    /// regardless of the cwd; in local mode only when the cwd is a JVM
-    /// project ([`jvm_cache::is_jvm_project`]), so non-Java projects are
-    /// never scanned against a shared cache. A `--global-prefix` names one
-    /// root whose layout is [`JvmCacheLayout::classify`]'d from its path.
+    /// Every JVM artifact cache whose packages a scan reports, tagged with
+    /// its layout ([`Self::get_jvm_cache_roots_with`] over the process
+    /// environment).
     pub async fn get_jvm_cache_roots(&self, options: &CrawlerOptions) -> Vec<JvmCacheRoot> {
+        self.get_jvm_cache_roots_with(options, &JvmEnv::from_process())
+            .await
+    }
+
+    /// Every JVM artifact cache whose packages a scan reports, under the
+    /// caches `env` names. Order: Gradle's `files-2.1`, the read-only
+    /// Gradle cache, the Maven local repository.
+    ///
+    /// - `--global-prefix` names one root, its layout
+    ///   [`JvmCacheLayout::classify`]'d after [`normalize_prefix`] (a Gradle
+    ///   user home, `caches/modules-2` or `modules-2` stands for the
+    ///   `files-2.1` inside it).
+    /// - In local mode nothing is returned unless the cwd is a JVM project
+    ///   ([`jvm_cache::is_jvm_project`]), so non-Java projects are never
+    ///   scanned against a shared cache.
+    /// - The Gradle caches count for a Gradle build (a Gradle marker in the
+    ///   cwd) or in global mode.
+    /// - The Maven local repository counts in global mode, for a `pom.xml`
+    ///   or a cwd with no Gradle marker, and for a Gradle build that reads
+    ///   it: `mavenLocal()` declared in the build's scripts or an init
+    ///   script, or not ruled out ([`m2_gate`]). A Gradle-only build that
+    ///   never declares it does not resolve from `~/.m2`, so its contents
+    ///   are not that build's packages (#551).
+    ///
+    /// Lock files never narrow any of this.
+    pub async fn get_jvm_cache_roots_with(
+        &self,
+        options: &CrawlerOptions,
+        env: &JvmEnv,
+    ) -> Vec<JvmCacheRoot> {
         if let Some(ref custom) = options.global_prefix {
-            return vec![JvmCacheRoot::new(
-                custom.clone(),
-                JvmCacheLayout::classify(custom),
-            )];
+            let path = normalize_prefix(custom);
+            let layout = JvmCacheLayout::classify(&path);
+            return vec![JvmCacheRoot::new(path, layout)];
         }
         if !options.global && !jvm_cache::is_jvm_project(&options.cwd).await {
             return Vec::new();
         }
+        let gradle_build = !options.global && {
+            let cwd = options.cwd.clone();
+            run_walk(move || gradle_cache::has_gradle_marker(&cwd)).await
+        };
         let mut roots = Vec::new();
-        let repo = Self::m2_repo_path();
-        if is_dir(&repo).await {
-            roots.push(JvmCacheRoot::new(repo, JvmCacheLayout::Maven2));
+        if options.global || gradle_build {
+            roots.extend(env.gradle_roots().await);
+        }
+        let m2 = options.global || {
+            let (cwd, env) = (options.cwd.clone(), env.clone());
+            run_walk(move || m2_gate(&cwd, &env)).await != M2Gate::Ignored
+        };
+        if m2 && is_dir(&env.m2_repo).await {
+            roots.push(JvmCacheRoot::new(
+                env.m2_repo.clone(),
+                JvmCacheLayout::Maven2,
+            ));
         }
         roots
     }
 
-    /// Get the paths of [`Self::get_jvm_cache_roots`] (`~/.m2/repository/`
-    /// respects `$M2_HOME`, `$MAVEN_REPO_LOCAL`, `--global-prefix`). Each
-    /// path's layout is recovered by [`JvmCacheLayout::classify`] in
-    /// [`Self::find_by_purls`].
+    /// The caches the existing PURL join sites (apply, rollback, vendor,
+    /// VEX) resolve against ([`Self::find_by_purls`]): the Maven local
+    /// repository, even when a Gradle build does not read it (its bytes are
+    /// still a valid source for vendoring), and any other non-Gradle root
+    /// of [`Self::get_jvm_cache_roots`]. Gradle `files-2.1` roots are left
+    /// out: their packages are version directories that only a caller
+    /// expanding them through [`gradle_cache::installed_copies`] can join
+    /// file keys onto, so they come from [`Self::get_maven_copy_paths`]
+    /// instead. Each path's layout is recovered by
+    /// [`JvmCacheLayout::classify`] in [`Self::find_by_purls`].
     pub async fn get_maven_repo_paths(
         &self,
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
-        Ok(self
-            .get_jvm_cache_roots(options)
+        self.get_maven_repo_paths_with(options, &JvmEnv::from_process())
             .await
-            .into_iter()
-            .map(|root| root.path)
-            .collect())
+    }
+
+    /// [`Self::get_maven_repo_paths`] under the caches `env` names.
+    pub async fn get_maven_repo_paths_with(
+        &self,
+        options: &CrawlerOptions,
+        env: &JvmEnv,
+    ) -> Result<Vec<PathBuf>, std::io::Error> {
+        let mut paths = self.get_maven_copy_paths_with(options, env).await?;
+        paths.retain(|p| JvmCacheLayout::classify(p) != JvmCacheLayout::GradleModules2);
+        Ok(paths)
+    }
+
+    /// Every cache holding installed copies of a PURL, for callers that
+    /// expand Gradle version directories through
+    /// [`gradle_cache::installed_copies`]: [`Self::get_maven_repo_paths`]'s
+    /// roots plus the Gradle `files-2.1` caches of
+    /// [`Self::get_jvm_cache_roots`]. The Maven local repository comes
+    /// first, so a caller that takes the first copy keeps resolving where
+    /// it always did.
+    pub async fn get_maven_copy_paths(
+        &self,
+        options: &CrawlerOptions,
+    ) -> Result<Vec<PathBuf>, std::io::Error> {
+        self.get_maven_copy_paths_with(options, &JvmEnv::from_process())
+            .await
+    }
+
+    /// [`Self::get_maven_copy_paths`] under the caches `env` names.
+    pub async fn get_maven_copy_paths_with(
+        &self,
+        options: &CrawlerOptions,
+        env: &JvmEnv,
+    ) -> Result<Vec<PathBuf>, std::io::Error> {
+        let jvm = options.global_prefix.is_none()
+            && (options.global || jvm_cache::is_jvm_project(&options.cwd).await);
+        let mut paths = Vec::new();
+        if jvm && is_dir(&env.m2_repo).await {
+            paths.push(env.m2_repo.clone());
+        }
+        for root in self.get_jvm_cache_roots_with(options, env).await {
+            if !paths.contains(&root.path) {
+                paths.push(root.path);
+            }
+        }
+        Ok(paths)
     }
 
     /// Crawl all discovered Maven repository paths and return every
@@ -630,10 +875,13 @@ impl MavenCrawler {
     ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
         match JvmCacheLayout::classify(src_path) {
             JvmCacheLayout::Maven2 => {}
-            // Other layouts plug in here; until then they resolve nothing.
-            JvmCacheLayout::GradleModules2 | JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => {
-                return Ok(HashMap::new())
+            JvmCacheLayout::GradleModules2 => {
+                let src = src_path.to_path_buf();
+                let purls = purls.to_vec();
+                return Ok(run_walk(move || Self::find_in_files21(&src, &purls)).await);
             }
+            // Other layouts plug in here; until then they resolve nothing.
+            JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => return Ok(HashMap::new()),
         }
         let mut result: HashMap<String, CrawledPackage> = HashMap::new();
 
@@ -702,17 +950,7 @@ impl MavenCrawler {
     /// Same rule as `nuget_home()`, `deno_dir()`, `go_crawler`'s
     /// `get_gomodcache`, and `utils::fs::home_dir`.
     fn m2_repo_path() -> PathBuf {
-        if let Ok(repo_local) = std::env::var("MAVEN_REPO_LOCAL") {
-            if !repo_local.is_empty() {
-                return PathBuf::from(repo_local);
-            }
-        }
-        if let Ok(m2_home) = std::env::var("M2_HOME") {
-            if !m2_home.is_empty() {
-                return PathBuf::from(m2_home).join("repository");
-            }
-        }
-        crate::utils::fs::home_dir().join(".m2").join("repository")
+        m2_repo_path_with(&gradle_cache::ProcessEnv, None)
     }
 
     /// Scan a Maven repository directory and return all valid packages found.
@@ -745,11 +983,72 @@ impl MavenCrawler {
     ) -> Vec<CrawledPackage> {
         match root.layout {
             JvmCacheLayout::Maven2 => self.scan_maven_repo(&root.path, seen),
+            JvmCacheLayout::GradleModules2 => Self::scan_files21(&root.path, seen),
             // Other layouts plug in here; until then they crawl nothing.
-            JvmCacheLayout::GradleModules2 | JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => {
-                Vec::new()
+            JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => Vec::new(),
+        }
+    }
+
+    /// Crawl a Gradle `files-2.1` tree: one package per version directory
+    /// that holds `<artifact>-<version>.{jar,pom,module}` in some hash
+    /// directory ([`gradle_cache::has_module_file`]), its path the VERSION
+    /// directory ([`gradle_cache::installed_copies`] expands it). The
+    /// coordinates are the directory names; no POM is read. Lock files never
+    /// narrow this: a dependency of an unlocked configuration (buildscript,
+    /// plugins) is as installed as a locked one.
+    fn scan_files21(root: &Path, seen: &mut HashSet<String>) -> Vec<CrawledPackage> {
+        let mut results = Vec::new();
+        for ((group_id, artifact_id, version), entries) in gradle_cache::walk_versions(root) {
+            if !gradle_cache::has_module_file(&entries) {
+                continue;
+            }
+            let purl = crate::utils::purl::build_maven_purl(&group_id, &artifact_id, &version);
+            if seen.insert(purl.clone()) {
+                results.push(CrawledPackage {
+                    path: root.join(&group_id).join(&artifact_id).join(&version),
+                    name: artifact_id,
+                    version,
+                    namespace: Some(group_id),
+                    purl,
+                });
             }
         }
+        results
+    }
+
+    /// [`Self::find_by_purls`] over a Gradle `files-2.1` tree: the version
+    /// directory `<root>/<group.id>/<artifact>/<version>` when it is
+    /// installed ([`gradle_cache::is_installed`]).
+    fn find_in_files21(root: &Path, purls: &[String]) -> HashMap<String, CrawledPackage> {
+        let mut result = HashMap::new();
+        for purl in purls {
+            let Some((group_id, artifact_id, version)) = crate::utils::purl::parse_maven_purl(purl)
+            else {
+                continue;
+            };
+            let gav = (
+                group_id.into_owned(),
+                artifact_id.into_owned(),
+                version.into_owned(),
+            );
+            // SECURITY: `is_installed` refuses unsafe coordinates before
+            // joining them onto the root (see `is_safe_maven_coordinate`).
+            if !gradle_cache::is_installed(root, &gav) {
+                continue;
+            }
+            let (group_id, artifact_id, version) = gav;
+            result.insert(
+                purl.clone(),
+                CrawledPackage {
+                    path: root.join(&group_id).join(&artifact_id).join(&version),
+                    name: artifact_id,
+                    version,
+                    namespace: Some(group_id),
+                    purl: purl.clone(),
+                },
+            );
+        }
+        result
     }
 
     /// [`Self::scan_maven_repo`] over an explicit chunk size, so tests can

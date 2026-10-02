@@ -228,6 +228,7 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
     vendor: Option<&HashMap<String, socket_patch_core::vendor::VendorEntry>>,
     status: &mut crate::ui::StatusLine<W>,
 ) -> (HashSet<String>, HashMap<String, PatchResponse>) {
+    use socket_patch_core::crawlers::gradle_cache;
     use socket_patch_core::manifest::schema::PatchFileInfo;
     use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
     use socket_patch_core::vendor::lookup_entry;
@@ -331,13 +332,19 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
                 files
             }
         };
-        for (file, info) in &files {
-            if info.before_hash.is_empty() {
-                continue; // a new file has no baseline to compare
-            }
-            if verify_file_patch(&pkg.path, file, info).await.status == VerifyStatus::HashMismatch {
-                mismatched.insert(patch.uuid.clone());
-                break;
+        // A new file has no baseline to compare.
+        let files: HashMap<String, PatchFileInfo> = files
+            .into_iter()
+            .filter(|(_, info)| !info.before_hash.is_empty())
+            .collect();
+        // A Gradle version dir stands for every hash-dir copy of its files;
+        // any copy off the baseline is a mismatch.
+        'copies: for (dir, files) in gradle_cache::installed_copies(&pkg.path, &files) {
+            for (file, info) in &files {
+                if verify_file_patch(&dir, file, info).await.status == VerifyStatus::HashMismatch {
+                    mismatched.insert(patch.uuid.clone());
+                    break 'copies;
+                }
             }
         }
     }
@@ -1679,6 +1686,63 @@ mod tests {
             "it did try"
         );
         assert!(views.is_empty(), "a 404'd view must not be cached");
+    }
+
+    /// A Gradle version dir is checked through every hash-dir copy of the
+    /// patched file: one copy off the baseline flags the patch, where the
+    /// version dir itself (no files of its own) would only be NotFound.
+    #[tokio::test]
+    async fn preverify_checks_every_gradle_hash_dir_copy() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+
+        let leaf = "commons-text-1.10.0.jar";
+        let before = compute_git_sha256_from_bytes(b"pristine jar");
+        let mock = wiremock::MockServer::start().await;
+        mount_patch_view(
+            &mock,
+            "u-gradle",
+            serde_json::json!({
+                leaf: { "beforeHash": before, "afterHash": "c".repeat(64) },
+            }),
+        )
+        .await;
+        let client = api_client_for(&mock.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let version_dir = tmp
+            .path()
+            .join("caches/modules-2/files-2.1/org.apache.commons/commons-text/1.10.0");
+        for (hash, bytes) in [("0a1b", &b"pristine jar"[..]), ("ffee", b"other bytes")] {
+            std::fs::create_dir_all(version_dir.join(hash)).unwrap();
+            std::fs::write(version_dir.join(hash).join(leaf), bytes).unwrap();
+        }
+        let purl = "pkg:maven/org.apache.commons/commons-text@1.10.0";
+        let crawled = vec![crawled_pkg("commons-text", purl, version_dir.clone())];
+        let selected = vec![search_result("u-gradle", purl)];
+        let run = |crawled: Vec<socket_patch_core::crawlers::types::CrawledPackage>| {
+            let (client, selected) = (&client, &selected);
+            async move {
+                preverify_vendor_baselines(
+                    client,
+                    selected,
+                    &crawled,
+                    &HashSet::new(),
+                    None,
+                    &mut crate::ui::StatusLine::new(Vec::new(), false, false, 80),
+                )
+                .await
+                .0
+            }
+        };
+        assert_eq!(
+            run(crawled).await,
+            HashSet::from(["u-gradle".to_string()]),
+            "the off-baseline hash-dir copy flags the patch"
+        );
+
+        std::fs::write(version_dir.join("ffee").join(leaf), b"pristine jar").unwrap();
+        let crawled = vec![crawled_pkg("commons-text", purl, version_dir)];
+        assert!(run(crawled).await.is_empty(), "every copy on the baseline");
     }
 
     #[tokio::test]

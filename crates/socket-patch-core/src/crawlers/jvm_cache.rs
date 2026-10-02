@@ -7,6 +7,8 @@
 //! - [`JvmCacheLayout`] / [`JvmCacheRoot`]: an installed-artifact cache
 //!   and how its directories spell coordinates. [`MavenCrawler`] crawls
 //!   and resolves PURLs per root, dispatching on the layout.
+//! - [`locate_artifact`] / [`all_local_roots`]: every installed copy of
+//!   one artifact file across the local caches, for sourcing its bytes.
 //! - [`project_dependency_set`]: the coordinates a project actually
 //!   resolves, from one provider per build tool (Gradle lock state, an sbt
 //!   lock, …). `None` means no provider could tell, so callers fall back to
@@ -100,6 +102,102 @@ pub fn project_dependency_set(root: &Path) -> Option<ProjectDependencySet> {
     // own or cannot read.
     let providers: &[fn(&Path) -> Option<ProjectDependencySet>] = &[];
     providers.iter().find_map(|provider| provider(root))
+}
+
+/// Every local JVM cache that exists on this machine (process environment),
+/// whatever the build at `cwd` resolves from: for sourcing an artifact's
+/// bytes ([`locate_artifact`]), never for discovery. See
+/// [`all_local_roots_with`].
+pub fn all_local_roots(cwd: &Path) -> Vec<JvmCacheRoot> {
+    all_local_roots_with(cwd, &super::maven_crawler::JvmEnv::from_process())
+}
+
+/// [`all_local_roots`] under the caches `env` names: the Gradle user home's
+/// `files-2.1`, the read-only Gradle cache and the Maven local repository,
+/// each when it is a directory. A Gradle build at `cwd` lists the Gradle
+/// caches first; anything else the Maven local repository first.
+pub fn all_local_roots_with(cwd: &Path, env: &super::maven_crawler::JvmEnv) -> Vec<JvmCacheRoot> {
+    let mut gradle = Vec::new();
+    if let Some(home) = &env.gradle {
+        for dir in std::iter::once(&home.files21).chain(&home.ro_files21) {
+            if dir.is_dir() {
+                gradle.push(JvmCacheRoot::new(
+                    dir.clone(),
+                    JvmCacheLayout::GradleModules2,
+                ));
+            }
+        }
+    }
+    let m2 = env
+        .m2_repo
+        .is_dir()
+        .then(|| JvmCacheRoot::new(env.m2_repo.clone(), JvmCacheLayout::Maven2));
+    if super::gradle_cache::has_gradle_marker(cwd) {
+        gradle.extend(m2);
+        gradle
+    } else {
+        m2.into_iter().chain(gradle).collect()
+    }
+}
+
+/// Every installed copy of one artifact file
+/// (`<artifact>-<version>[-<classifier>].<ext>`) under `root`: the one
+/// repository path for [`JvmCacheLayout::Maven2`], every hash directory's
+/// copy for [`JvmCacheLayout::GradleModules2`] (sorted). Only existing
+/// regular files are returned; unsafe coordinates resolve to nothing.
+pub fn locate_artifact(
+    root: &JvmCacheRoot,
+    gav: &Gav,
+    classifier: Option<&str>,
+    ext: &str,
+) -> Vec<PathBuf> {
+    let (group, artifact, version) = gav;
+    let classifier_ok = classifier.is_none_or(crate::patch::path_safety::is_safe_single_segment);
+    let ext_ok = crate::patch::path_safety::is_safe_single_segment(ext);
+    if !super::maven_crawler::is_safe_maven_coordinate(group, artifact, version)
+        || !classifier_ok
+        || !ext_ok
+    {
+        return Vec::new();
+    }
+    let leaf = match classifier {
+        Some(c) => format!("{artifact}-{version}-{c}.{ext}"),
+        None => format!("{artifact}-{version}.{ext}"),
+    };
+    match root.layout {
+        JvmCacheLayout::Maven2 => {
+            let path = root
+                .path
+                .join(group.replace('.', "/"))
+                .join(artifact)
+                .join(version)
+                .join(&leaf);
+            if path.is_file() {
+                vec![path]
+            } else {
+                Vec::new()
+            }
+        }
+        JvmCacheLayout::GradleModules2 => {
+            let version_dir = root.path.join(group).join(artifact).join(version);
+            let mut copies: Vec<PathBuf> = std::fs::read_dir(&version_dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(super::gradle_cache::is_hash_dir_name)
+                })
+                .map(|e| e.path().join(&leaf))
+                .filter(|p| p.is_file())
+                .collect();
+            copies.sort();
+            copies
+        }
+        // sbt: Coursier / Ivy plug in here.
+        JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => Vec::new(),
+    }
 }
 
 #[cfg(test)]
