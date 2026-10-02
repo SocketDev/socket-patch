@@ -9,6 +9,9 @@
 //! in-memory fixtures on every OS.
 //!
 //! - [`dsl`]: a comment- and string-aware Groovy/Kotlin tokenizer.
+//! - [`graph`]: the script graph of a checkout (settings, build scripts,
+//!   `buildSrc`, included builds, convention plugins, `apply from` targets,
+//!   the version catalog, init scripts) and the queries over it.
 //! - [`locks`]: dependency-lock files: where they are, what they hold and a
 //!   one-entry rewrite.
 //! - [`home`]: the Gradle user home and the caches inside it.
@@ -17,6 +20,7 @@
 
 pub mod dsl;
 pub mod eol;
+pub mod graph;
 pub mod home;
 pub mod locks;
 pub mod selector;
@@ -213,6 +217,7 @@ mod tests {
             ("mod.rs", include_str!("mod.rs")),
             ("dsl.rs", include_str!("dsl.rs")),
             ("eol.rs", include_str!("eol.rs")),
+            ("graph.rs", include_str!("graph.rs")),
             ("home.rs", include_str!("home.rs")),
             ("locks.rs", include_str!("locks.rs")),
             ("selector.rs", include_str!("selector.rs")),
