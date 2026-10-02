@@ -1,3 +1,8 @@
+//! Shared pnpm vendor/revert lifecycle, with dialect-specific lock splices.
+//! Legacy lockfileVersion 5.4/6.0 splices live in [`super::pnpm_lock_legacy`];
+//! both dialects use this module's preflight, staging, commit, ledger and
+//! revert drivers. The modern (9.0) wiring is described below.
+//!
 //! pnpm vendor backend: `package.json` + `pnpm-workspace.yaml` +
 //! `pnpm-lock.yaml` surgery.
 //!
@@ -94,7 +99,7 @@ pub(super) const KIND_PKG_OVERRIDE: &str = "pnpm_pkg_override";
 const KIND_WS_OVERRIDE: &str = "pnpm_ws_override";
 pub(super) const KIND_LOCK_OVERRIDES: &str = "pnpm_lock_overrides";
 const KIND_LOCK_IMPORTER_DEP: &str = "pnpm_lock_importer_dep";
-const KIND_LOCK_PACKAGE: &str = "pnpm_lock_package";
+pub(super) const KIND_LOCK_PACKAGE: &str = "pnpm_lock_package";
 const KIND_LOCK_SNAPSHOT: &str = "pnpm_lock_snapshot";
 const KIND_LOCK_SNAPSHOT_REF: &str = "pnpm_lock_snapshot_ref";
 
@@ -120,7 +125,55 @@ pub async fn vendor_pnpm<'a>(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
-    let installed_dir = installed_dir.into();
+    vendor_pnpm_dialect(
+        purl,
+        installed_dir.into(),
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service,
+        PnpmDialect::V9,
+    )
+    .await
+}
+
+/// The dialect selects format-specific gates and splices. Staging, commits,
+/// ledger construction and artifact retention are shared across pnpm versions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PnpmDialect {
+    V9,
+    Legacy,
+}
+
+impl PnpmDialect {
+    fn flavor(self) -> &'static str {
+        match self {
+            Self::V9 => "pnpm",
+            Self::Legacy => super::pnpm_lock_legacy::FLAVOR,
+        }
+    }
+
+    fn allows_revert_file(self, file: &str) -> bool {
+        REVERT_ALLOWLIST.contains(&file) && (self == Self::V9 || file != PNPM_WORKSPACE)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn vendor_pnpm_dialect(
+    purl: &str,
+    installed_dir: PackageSource<'_>,
+    project_root: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&super::VendorServiceConfig>,
+    dialect: PnpmDialect,
+) -> VendorOutcome {
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
     // ── 1. Coordinates (shared fail-closed guard) ─────────────────────────
@@ -136,7 +189,7 @@ pub async fn vendor_pnpm<'a>(
     let override_key = format!("{name}@{version}");
 
     // ── 2. Read the pair (refuse before any write) ───────────────────────
-    let project = match read_project(project_root).await {
+    let project = match read_project(project_root, dialect).await {
         Ok(project) => project,
         Err(outcome) => return *outcome,
     };
@@ -149,7 +202,7 @@ pub async fn vendor_pnpm<'a>(
     let PnpmProject {
         pkg_bytes,
         mut pkg,
-        mut lines,
+        mut lock,
         ws_text,
     } = project;
 
@@ -216,33 +269,23 @@ pub async fn vendor_pnpm<'a>(
                 .await
             }
         };
-    let mut lock_changed = false;
-    for edit in [
-        edit_overrides::<LockLines>,
-        edit_importers::<LockLines>,
-        edit_packages::<LockLines>,
-        edit_snapshot_rekey::<LockLines>,
-        edit_snapshot_refs::<LockLines>,
-    ] {
-        match edit(&mut lines, &ctx, &mut wiring) {
-            Ok(changed) => lock_changed |= changed,
-            Err(e) => {
-                return done_failure_unstage(
-                    purl,
-                    format!("{PNPM_LOCK} surgery failed: {e}"),
-                    project_root,
-                    &coords.uuid_dir_rel,
-                    uuid_dir_preexisted,
-                )
-                .await
-            }
+    let (lock_changed, lock_warning) = match lock.edit(&ctx, &mut wiring) {
+        Ok(edit) => edit,
+        Err(e) => {
+            return done_failure_unstage(
+                purl,
+                format!("{PNPM_LOCK} surgery failed: {e}"),
+                project_root,
+                &coords.uuid_dir_rel,
+                uuid_dir_preexisted,
+            )
+            .await
         }
-    }
+    };
 
-    // The pnpm >= 11 override surface. Mirrors the package.json override
-    // key-for-key so whichever surface the installed pnpm reads matches the
-    // lock's `overrides:` section.
-    let ws_edit =
+    // Only modern locks mirror overrides into pnpm-workspace.yaml. Legacy
+    // pnpm reads package.json alone; creating a workspace changes its mode.
+    let ws_edit = if dialect == PnpmDialect::V9 {
         match apply_workspace_override(ws_text.as_deref(), &effective_key, &spec, &mut wiring) {
             Ok(edit) => edit,
             Err(e) => {
@@ -255,7 +298,10 @@ pub async fn vendor_pnpm<'a>(
                 )
                 .await
             }
-        };
+        }
+    } else {
+        WorkspaceEdit::default()
+    };
 
     if !pkg_changed && !lock_changed && ws_edit.new_text.is_none() {
         // Everything already carries this uuid + the packed integrity: the
@@ -269,6 +315,10 @@ pub async fn vendor_pnpm<'a>(
             None,
             warnings,
         );
+    }
+
+    if let Some(warning) = lock_warning {
+        warnings.push(warning);
     }
 
     // ── 6. Commit: package.json + pnpm-workspace.yaml FIRST, lock second,
@@ -287,7 +337,7 @@ pub async fn vendor_pnpm<'a>(
             .await
         }
     };
-    let lock_out = lines.join("\n");
+    let lock_out = lock.lines().join("\n");
     if let Err(e) = commit_surfaces(
         project_root,
         pkg_changed.then_some(new_pkg_bytes.as_slice()),
@@ -313,7 +363,7 @@ pub async fn vendor_pnpm<'a>(
         // reads it back without re-splitting it. Only when the split of
         // those bytes is provably these lines (no line carries a `\n`);
         // otherwise the next read simply misses.
-        if let LockLines::Owned(written) = lines {
+        if let ProjectLock::V9(LockLines::Owned(written)) = lock {
             if !written.iter().any(|l| l.contains('\n')) {
                 LOCK_MEMO.store(lock_out.into_bytes(), LockDoc::new(written));
             }
@@ -346,7 +396,7 @@ pub async fn vendor_pnpm<'a>(
         took_over_go_patches: false,
         detached: false,
         record: None,
-        flavor: Some("pnpm".to_string()),
+        flavor: Some(dialect.flavor().to_string()),
         uv: None,
         pnpm: Some(PnpmMeta {
             created_overrides_table,
@@ -367,16 +417,56 @@ pub async fn vendor_pnpm<'a>(
 /// `pnpm-workspace.yaml`. [`vendor_pnpm`] reads it per package; the vendor
 /// loop's download plan reads it once and gates every package against the
 /// same parse ([`preflight_packages`]).
-pub(super) struct PnpmProject {
+struct PnpmProject {
     pkg_bytes: Vec<u8>,
     pkg: Value,
-    lines: LockLines,
+    lock: ProjectLock,
     ws_text: Option<String>,
+}
+
+enum ProjectLock {
+    V9(LockLines),
+    Legacy(super::pnpm_lock_legacy::LegacyLock),
+}
+
+impl ProjectLock {
+    fn lines(&self) -> &[String] {
+        match self {
+            Self::V9(lines) => lines,
+            Self::Legacy(lock) => &lock.lines,
+        }
+    }
+
+    fn edit(
+        &mut self,
+        ctx: &EditCtx<'_>,
+        wiring: &mut Vec<WiringRecord>,
+    ) -> Result<(bool, Option<VendorWarning>), String> {
+        match self {
+            Self::V9(lines) => {
+                let mut changed = false;
+                for edit in [
+                    edit_overrides::<LockLines>,
+                    edit_importers::<LockLines>,
+                    edit_packages::<LockLines>,
+                    edit_snapshot_rekey::<LockLines>,
+                    edit_snapshot_refs::<LockLines>,
+                ] {
+                    changed |= edit(lines, ctx, wiring)?;
+                }
+                Ok((changed, None))
+            }
+            Self::Legacy(lock) => lock.edit(ctx, wiring),
+        }
+    }
 }
 
 /// Read the pair, refusing (before any write) a file that is missing,
 /// unreadable, not the shape the surgery has fixtures for, or CRLF.
-pub(super) async fn read_project(project_root: &Path) -> Result<PnpmProject, Box<VendorOutcome>> {
+async fn read_project(
+    project_root: &Path,
+    dialect: PnpmDialect,
+) -> Result<PnpmProject, Box<VendorOutcome>> {
     let pkg_bytes = match read_regular_to_bytes(&project_root.join(PACKAGE_JSON)).await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -408,12 +498,21 @@ pub(super) async fn read_project(project_root: &Path) -> Result<PnpmProject, Box
             )));
         }
     };
-    if let Err(detail) = check_lock_version(&lock_text) {
-        return Err(Box::new(refused(
-            "vendor_lockfile_version_unsupported",
-            detail,
-        )));
-    }
+    let grammar = match dialect {
+        PnpmDialect::V9 => {
+            check_lock_version(&lock_text).map(|()| crate::formats::pnpm::PnpmLockGrammar::V9)
+        }
+        PnpmDialect::Legacy => super::pnpm_lock_legacy::check_lock_version(&lock_text),
+    };
+    let grammar = match grammar {
+        Ok(grammar) => grammar,
+        Err(detail) => {
+            return Err(Box::new(refused(
+                "vendor_lockfile_version_unsupported",
+                detail,
+            )));
+        }
+    };
     // CRLF line endings (Windows autocrlf checkouts) break every structural
     // probe below — `split_lines` keeps the trailing `\r`, so section headers
     // like `packages:` never match — which would otherwise surface as a
@@ -430,6 +529,18 @@ pub(super) async fn read_project(project_root: &Path) -> Result<PnpmProject, Box
                  and retry"
             ),
         )));
+    }
+    if dialect == PnpmDialect::Legacy {
+        return Ok(PnpmProject {
+            pkg_bytes,
+            pkg,
+            lock: ProjectLock::Legacy(super::pnpm_lock_legacy::read_lock(
+                &lock_text,
+                project_root,
+                grammar,
+            )?),
+            ws_text: None,
+        });
     }
     // The split (and its section index) is the run's, while the bytes just
     // read are the ones it came from; see [`LOCK_MEMO`].
@@ -473,7 +584,7 @@ pub(super) async fn read_project(project_root: &Path) -> Result<PnpmProject, Box
     Ok(PnpmProject {
         pkg_bytes,
         pkg,
-        lines,
+        lock: ProjectLock::V9(lines),
         ws_text,
     })
 }
@@ -483,7 +594,7 @@ pub(super) async fn read_project(project_root: &Path) -> Result<PnpmProject, Box
 /// reference to it rewritable. `Ok` is the override key both surfaces
 /// edit. Nothing here reads the package's source or asks the service, so
 /// the download plan evaluates it ahead of the loop.
-pub(super) fn preflight_package(
+fn preflight_package(
     project: &PnpmProject,
     name: &str,
     version: &str,
@@ -497,28 +608,35 @@ pub(super) fn preflight_package(
         Err(detail) => return Err(Box::new(refused("vendor_override_conflict", detail))),
     };
     let effective_key = disposition.effective_key(override_key).to_string();
-    project.lines.note_probe();
-    if let Err(detail) = check_lock_override(&project.lines, name, version, &effective_key) {
+    if let ProjectLock::V9(lines) = &project.lock {
+        lines.note_probe();
+    }
+    if let Err(detail) = check_lock_override(project.lock.lines(), name, version, &effective_key) {
         return Err(Box::new(refused("vendor_override_conflict", detail)));
     }
-    if let Err(detail) =
-        check_workspace_override(project.ws_text.as_deref(), name, version, &effective_key)
-    {
-        return Err(Box::new(refused("vendor_override_conflict", detail)));
-    }
-    if !lock_has_target_package_in(&project.lines, name, version) {
-        return Err(Box::new(refused(
-            "vendor_lock_entry_not_found",
-            format!(
-                "{PNPM_LOCK} has no packages entry for {name}@{version} — make sure the \
+    match &project.lock {
+        ProjectLock::V9(lines) => {
+            if let Err(detail) =
+                check_workspace_override(project.ws_text.as_deref(), name, version, &effective_key)
+            {
+                return Err(Box::new(refused("vendor_override_conflict", detail)));
+            }
+            if !lock_has_target_package_in(lines, name, version) {
+                return Err(Box::new(refused(
+                    "vendor_lock_entry_not_found",
+                    format!(
+                        "{PNPM_LOCK} has no packages entry for {name}@{version} — make sure the \
                  package is installed and locked (`pnpm install`) before vendoring"
-            ),
-        )));
-    }
-    if let Err(detail) =
-        check_rewritable_refs_with(&project.lines, name, version, project.lines.index())
-    {
-        return Err(Box::new(refused("vendor_lock_entry_unsupported", detail)));
+                    ),
+                )));
+            }
+            if let Err(detail) = check_rewritable_refs_with(lines, name, version, lines.index()) {
+                return Err(Box::new(refused("vendor_lock_entry_unsupported", detail)));
+            }
+        }
+        ProjectLock::Legacy(lock) => {
+            super::pnpm_lock_legacy::preflight_package(lock, name, version)?;
+        }
     }
     Ok(effective_key)
 }
@@ -530,8 +648,16 @@ pub(crate) async fn preflight_packages(
     project_root: &Path,
     packages: &[(&str, &PatchRecord)],
 ) -> Vec<Result<(), &'static str>> {
+    preflight_packages_dialect(project_root, packages, PnpmDialect::V9).await
+}
+
+pub(super) async fn preflight_packages_dialect(
+    project_root: &Path,
+    packages: &[(&str, &PatchRecord)],
+    dialect: PnpmDialect,
+) -> Vec<Result<(), &'static str>> {
     gate_packages(
-        read_project(project_root)
+        read_project(project_root, dialect)
             .await
             .map_err(|o| refusal_code(&o)),
         packages,
@@ -639,6 +765,15 @@ pub async fn revert_pnpm_opts(
     project_root: &Path,
     opts: RevertOpts,
 ) -> RevertOutcome {
+    revert_pnpm_dialect(entry, project_root, opts, PnpmDialect::V9).await
+}
+
+pub(super) async fn revert_pnpm_dialect(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+    dialect: PnpmDialect,
+) -> RevertOutcome {
     let RevertOpts {
         dry_run,
         keep_artifact,
@@ -658,7 +793,12 @@ pub async fn revert_pnpm_opts(
     // under `keep_artifact`: the refusal exists only to protect the
     // deletion, which a preserve-state revert never performs.
     if !keep_artifact && entry.wiring.is_empty() {
-        let in_use = pnpm_entry_in_use(entry, project_root).await;
+        let in_use = match dialect {
+            PnpmDialect::V9 => pnpm_entry_in_use(entry, project_root).await,
+            PnpmDialect::Legacy => {
+                super::pnpm_lock_legacy::pnpm_legacy_entry_in_use(entry, project_root).await
+            }
+        };
         if let Some(blocked) = guard_unwired_revert(project_root, in_use, &uuid_dir_rel).await {
             return blocked;
         }
@@ -673,7 +813,7 @@ pub async fn revert_pnpm_opts(
     let mut touches_pkg = false;
     let mut touches_lock = false;
     for rec in &entry.wiring {
-        if !REVERT_ALLOWLIST.contains(&rec.file.as_str()) {
+        if !dialect.allows_revert_file(&rec.file) {
             outcome.warnings.push(VendorWarning::new(
                 "vendor_lock_entry_drifted",
                 format!(
@@ -737,7 +877,11 @@ pub async fn revert_pnpm_opts(
         match rec.file.as_str() {
             PNPM_LOCK => {
                 if let Some(lines) = lock_lines.as_mut() {
-                    revert_lock_record(
+                    let revert = match dialect {
+                        PnpmDialect::V9 => revert_lock_record,
+                        PnpmDialect::Legacy => super::pnpm_lock_legacy::revert_lock_record,
+                    };
+                    revert(
                         lines,
                         rec,
                         &entry.uuid,
@@ -817,11 +961,9 @@ pub async fn revert_pnpm_opts(
 
     // pnpm-workspace.yaml override surface (pnpm >= 11): delete a file we
     // created, or splice our override back out of one we edited.
-    if let Some(rec) = entry
-        .wiring
-        .iter()
-        .find(|r| r.file == PNPM_WORKSPACE && r.kind == KIND_WS_OVERRIDE)
-    {
+    if let Some(rec) = entry.wiring.iter().find(|r| {
+        dialect == PnpmDialect::V9 && r.file == PNPM_WORKSPACE && r.kind == KIND_WS_OVERRIDE
+    }) {
         let (created_file, created_overrides) = match &entry.pnpm {
             Some(meta) => (
                 meta.created_workspace_file,
@@ -1027,20 +1169,20 @@ fn remove_empty_ws_overrides_section(lines: &mut Vec<String>) {
 
 // ───────────────────────────── edit context ──────────────────────────────
 
-struct EditCtx<'a> {
-    name: &'a str,
-    version: &'a str,
+pub(super) struct EditCtx<'a> {
+    pub(super) name: &'a str,
+    pub(super) version: &'a str,
     /// `.socket/vendor/npm/<uuid>/<leaf>` (forward slashes, root-relative).
-    rel_tgz: &'a str,
+    pub(super) rel_tgz: &'a str,
     /// `file:<rel_tgz>` — the exact override/lock value spelling (no `./`).
-    spec: &'a str,
+    pub(super) spec: &'a str,
     /// `sha512-<base64>` of the packed tarball.
-    integrity: &'a str,
+    pub(super) integrity: &'a str,
     /// The override key BOTH surfaces edit (see
     /// [`OverrideDisposition::effective_key`]): our canonical
     /// `name@version` on a fresh insert, or the user's existing key on a
     /// takeover / re-run over a taken-over key.
-    override_key: &'a str,
+    pub(super) override_key: &'a str,
 }
 
 impl EditCtx<'_> {
@@ -1474,7 +1616,7 @@ fn check_rewritable_refs_with(
                     k += 1;
                     continue;
                 }
-                let (spec, ver, f) = dep_field_lines(lines, k + 1, importer.end);
+                let (spec, ver, f) = dep_field_lines(lines, k + 1, importer.end, 8);
                 if let Some((_, v)) = ver {
                     if v == reg_key || v.starts_with(&key_peer_prefix) {
                         return refuse("an aliased importer version", &v);
@@ -1577,6 +1719,7 @@ fn ws_scaffold_text(key: &str, spec: &str) -> String {
 }
 
 /// The outcome of applying the override to pnpm-workspace.yaml.
+#[derive(Default)]
 struct WorkspaceEdit {
     /// New file content to write (`None` ⇒ already in sync, nothing to do).
     new_text: Option<String>,
@@ -1774,8 +1917,27 @@ fn edit_overrides<L: EditLines>(
     ctx: &EditCtx<'_>,
     wiring: &mut Vec<WiringRecord>,
 ) -> Result<bool, String> {
-    let our_key = ctx.override_key.to_string();
-    let entry_line = format!("  {}: {}", yaml_key(&our_key), ctx.spec);
+    edit_lock_overrides(lines, ctx.override_key, ctx.spec, wiring, PnpmDialect::V9)
+}
+
+pub(super) fn edit_legacy_overrides(
+    lines: &mut Vec<String>,
+    key: &str,
+    spec: &str,
+    wiring: &mut Vec<WiringRecord>,
+) -> Result<bool, String> {
+    edit_lock_overrides(lines, key, spec, wiring, PnpmDialect::Legacy)
+}
+
+fn edit_lock_overrides<L: EditLines>(
+    lines: &mut L,
+    key: &str,
+    spec: &str,
+    wiring: &mut Vec<WiringRecord>,
+    dialect: PnpmDialect,
+) -> Result<bool, String> {
+    let our_key = key.to_string();
+    let entry_line = format!("  {}: {}", yaml_key(&our_key), spec);
     if let Some((start, end)) = lines.bounds("overrides") {
         // Immutable scan first: our line's position (if present) + the last
         // entry line (the append anchor).
@@ -1792,46 +1954,56 @@ fn edit_overrides<L: EditLines>(
             }
         }
         if let Some((i, repr, rest)) = ours {
-            if rest == ctx.spec {
+            if rest == spec {
                 return Ok(false); // in sync
             }
             // Ours with a stale uuid (no original), or the user's pinned
             // value being TAKEN OVER (recorded as original; the live key
             // repr/quoting is preserved so revert is byte-faithful).
             let original = (!is_vendor_value(&rest)).then(|| rest.clone());
-            lines.write()[i] = format!("  {}: {}", yaml_key_like(&our_key, &repr), ctx.spec);
+            lines.write()[i] = format!("  {}: {}", yaml_key_like(&our_key, &repr), spec);
             wiring.push(overrides_record(
                 &our_key,
-                ctx.spec,
+                spec,
                 WiringAction::Rewritten,
                 original,
             ));
             return Ok(true);
         }
         lines.write().insert(last_entry + 1, entry_line);
-        wiring.push(overrides_record(
-            &our_key,
-            ctx.spec,
-            WiringAction::Added,
-            None,
-        ));
+        wiring.push(overrides_record(&our_key, spec, WiringAction::Added, None));
         return Ok(true);
     }
-    // No overrides section: insert one right before `importers:` (with the
-    // blank separator pnpm emits — byte-identical to the P1/P4 fixtures).
-    let (importers, _) = lines
-        .bounds("importers")
-        .ok_or("no importers: section to anchor on")?;
+    // pnpm 9 inserts before importers; pnpm 7/8 uses ROOT_KEYS_ORDER,
+    // before the flat root dependency sections. Keep the captured ordering.
+    let anchor = match dialect {
+        PnpmDialect::V9 => {
+            lines
+                .bounds("importers")
+                .ok_or("no importers: section to anchor on")?
+                .0
+        }
+        PnpmDialect::Legacy => lines
+            .read()
+            .iter()
+            .position(|line| {
+                !line.is_empty()
+                    && !line.starts_with(' ')
+                    && ![
+                        "lockfileVersion",
+                        "settings",
+                        "neverBuiltDependencies",
+                        "onlyBuiltDependencies",
+                    ]
+                    .contains(&line.split(':').next().unwrap_or(""))
+            })
+            .unwrap_or(lines.read().len()),
+    };
     lines.write().splice(
-        importers..importers,
+        anchor..anchor,
         ["overrides:".to_string(), entry_line, String::new()],
     );
-    wiring.push(overrides_record(
-        &our_key,
-        ctx.spec,
-        WiringAction::Added,
-        None,
-    ));
+    wiring.push(overrides_record(&our_key, spec, WiringAction::Added, None));
     Ok(true)
 }
 
@@ -1853,19 +2025,20 @@ pub(super) fn overrides_record(
     }
 }
 
-/// Locate a dep entry's `specifier:`/`version:` field lines (8-space
-/// indent) starting at `f`. Returns the two `(line_idx, value)` pairs plus
+/// Locate a dep entry's `specifier:`/`version:` field lines at `indent`
+/// (4 for legacy root deps, 8 for modern importers). Returns their values plus
 /// the index of the first non-field line.
 #[allow(clippy::type_complexity)]
-fn dep_field_lines(
+pub(super) fn dep_field_lines(
     lines: &[String],
     mut f: usize,
     end: usize,
+    indent: usize,
 ) -> (Option<(usize, String)>, Option<(usize, String)>, usize) {
     let mut spec = None;
     let mut ver = None;
     while f < end {
-        let Some((field, _repr, fval)) = parse_key_line(&lines[f], 8) else {
+        let Some((field, _repr, fval)) = parse_key_line(&lines[f], indent) else {
             break;
         };
         match field {
@@ -1905,7 +2078,7 @@ fn edit_importers<L: EditLines>(
                 k += 1;
                 continue;
             }
-            let (spec_idx, ver_idx, f) = dep_field_lines(lines.read(), k + 1, importer.end);
+            let (spec_idx, ver_idx, f) = dep_field_lines(lines.read(), k + 1, importer.end, 8);
             if let (Some((si, old_spec)), Some((vi, old_ver))) = (spec_idx, ver_idx) {
                 let target =
                     old_ver == ctx.version || (old_ver != ctx.spec && ctx.is_ours(&old_ver));
@@ -2558,7 +2731,7 @@ impl LockIndex {
                         k += 1;
                         continue;
                     }
-                    let (spec, ver, f) = dep_field_lines(lines, k + 1, importer.end);
+                    let (spec, ver, f) = dep_field_lines(lines, k + 1, importer.end, 8);
                     if let Some((_, v)) = &ver {
                         let at = index.importer_deps.len();
                         index.first_importer_ver.entry(v.clone()).or_insert(at);
@@ -2883,7 +3056,7 @@ fn revert_importer_dep(
                 k += 1;
                 continue;
             }
-            let (spec_idx, ver_idx, _) = dep_field_lines(lines, k + 1, importer.end);
+            let (spec_idx, ver_idx, _) = dep_field_lines(lines, k + 1, importer.end, 8);
             let (Some((si, live_spec)), Some((vi, live_ver))) = (spec_idx, ver_idx) else {
                 break;
             };
@@ -7721,7 +7894,7 @@ snapshots:
         let lines = split_lines(
             "        specifier: ^1.0.0\n        engines: whatever\n        version: 1.0.0\n      other:",
         );
-        let (spec, ver, f) = dep_field_lines(&lines, 0, lines.len());
+        let (spec, ver, f) = dep_field_lines(&lines, 0, lines.len(), 8);
         assert_eq!(spec, Some((0, "^1.0.0".to_string())));
         assert_eq!(ver, Some((2, "1.0.0".to_string())));
         assert_eq!(f, 3, "cursor stops at the first non-field line");
@@ -8446,12 +8619,14 @@ snapshots:
         let project = || PnpmProject {
             pkg_bytes: b"{}".to_vec(),
             pkg: serde_json::json!({}),
-            lines: LockLines::Shared(Arc::new(LockDoc::new(split_lines(P1_BEFORE_LOCK)))),
+            lock: ProjectLock::V9(LockLines::Shared(Arc::new(LockDoc::new(split_lines(
+                P1_BEFORE_LOCK,
+            ))))),
             ws_text: None,
         };
-        let doc_of = |p: &PnpmProject| match &p.lines {
-            LockLines::Shared(doc) => Arc::clone(doc),
-            LockLines::Owned(_) => unreachable!(),
+        let doc_of = |p: &PnpmProject| match &p.lock {
+            ProjectLock::V9(LockLines::Shared(doc)) => Arc::clone(doc),
+            _ => unreachable!(),
         };
 
         // One package: the pre-flight passes on the scans alone.
@@ -8461,7 +8636,7 @@ snapshots:
             .map_err(|_| ())
             .unwrap();
         assert_eq!(key, "left-pad@1.3.0");
-        assert!(fresh.lines.index().is_none());
+        assert!(matches!(&fresh.lock, ProjectLock::V9(lines) if lines.index().is_none()));
         assert!(
             doc.index.get().is_none(),
             "one probe must not build the index"
@@ -8475,7 +8650,9 @@ snapshots:
             integrity: "sha512-x",
             override_key: "left-pad@1.3.0",
         };
-        let mut lines = fresh.lines;
+        let ProjectLock::V9(mut lines) = fresh.lock else {
+            unreachable!()
+        };
         let mut wiring = Vec::new();
         assert_eq!(edit_overrides(&mut lines, &ctx, &mut wiring), Ok(true));
         assert!(doc.index.get().is_none());
@@ -8500,26 +8677,27 @@ snapshots:
         let root = tmp.path();
         std::fs::write(root.join(PACKAGE_JSON), "{\"name\":\"fx\"}\n").unwrap();
         std::fs::write(root.join(PNPM_LOCK), P1_BEFORE_LOCK).unwrap();
-        let first = read_project(root).await.map_err(|_| ()).unwrap();
+        let first = read_project(root, PnpmDialect::V9)
+            .await
+            .map_err(|_| ())
+            .unwrap();
         // (The memo is process-wide and tests run concurrently, so which
         // document the slot holds is not asserted — only what a read sees.)
-        assert!(matches!(first.lines, LockLines::Shared(_)));
-        assert_eq!(first.lines.read(), &split_lines(P1_BEFORE_LOCK));
+        assert!(matches!(first.lock, ProjectLock::V9(LockLines::Shared(_))));
+        assert_eq!(first.lock.lines(), &split_lines(P1_BEFORE_LOCK));
         let edited = P1_BEFORE_LOCK.replace("left-pad", "right-pad");
         std::fs::write(root.join(PNPM_LOCK), &edited).unwrap();
-        let second = read_project(root).await.map_err(|_| ()).unwrap();
-        assert_eq!(second.lines.read(), &split_lines(&edited));
-        assert_ne!(first.lines.read(), second.lines.read());
-        assert!(!lock_has_target_package_in(
-            &second.lines,
-            "left-pad",
-            "1.3.0"
-        ));
-        assert!(lock_has_target_package_in(
-            &second.lines,
-            "right-pad",
-            "1.3.0"
-        ));
+        let second = read_project(root, PnpmDialect::V9)
+            .await
+            .map_err(|_| ())
+            .unwrap();
+        assert_eq!(second.lock.lines(), &split_lines(&edited));
+        assert_ne!(first.lock.lines(), second.lock.lines());
+        let ProjectLock::V9(lines) = &second.lock else {
+            unreachable!()
+        };
+        assert!(!lock_has_target_package_in(lines, "left-pad", "1.3.0"));
+        assert!(lock_has_target_package_in(lines, "right-pad", "1.3.0"));
     }
 
     /// pnpm-workspace.yaml spellings and document shapes the overrides surgery

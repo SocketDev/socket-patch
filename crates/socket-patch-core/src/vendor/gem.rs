@@ -415,7 +415,9 @@ fn gem_edits(
 ) -> Result<(GemfilePlan, LockEdit), Box<VendorOutcome>> {
     let (name, version) = (prelude.name.as_str(), prelude.version.as_str());
     // ── Gemfile edit plan (refusals before any write) ────────────────────
-    let plan = match plan_gemfile_edit(&prelude.gemfile_text, name, version, &prelude.copy_rel) {
+    let plan = match plan_gemfile_edit(&prelude.gemfile_text, name, version, &prelude.copy_rel)
+        .and_then(|plan| refuse_append_of_direct_dependency(plan, &prelude.lock_text, name))
+    {
         Ok(p) => p,
         Err(detail) => {
             return Err(Box::new(refused(
@@ -1426,6 +1428,29 @@ fn plan_gemfile_edit(
         original_line: lines[idx].to_string(),
         new_line,
     })
+}
+
+/// Refuse an [`GemfilePlan::Append`] for a gem the lock lists under
+/// `DEPENDENCIES`: bundler resolved it as a DIRECT dependency, so the Gemfile
+/// declares it somewhere the line grammar cannot see (`eval_gemfile`, a
+/// loop, a gemspec). The managed block would declare it a second time and
+/// bundler refuses every install (#482). Every other plan passes through.
+fn refuse_append_of_direct_dependency(
+    plan: GemfilePlan,
+    lock_text: &str,
+    name: &str,
+) -> Result<GemfilePlan, String> {
+    if matches!(plan, GemfilePlan::Append { .. })
+        && crate::formats::gem::lock_lists_direct_dependency(lock_text, name)
+    {
+        return Err(format!(
+            "Gemfile.lock lists \"{name}\" as a direct dependency, but the Gemfile declares \
+             it somewhere the line grammar cannot edit (an `eval_gemfile`d file, a loop, a \
+             gemspec); refusing to append a second declaration (bundler hard-fails on \
+             duplicates)"
+        ));
+    }
+    Ok(plan)
 }
 
 /// Looser "declared at all?" probe — the redirect rewriter's `declared_re`
@@ -5486,6 +5511,36 @@ mod tests {
             plan_gemfile_edit(spaced, "rack", "3.2.6", &copy_rel()).is_err(),
             "a space-before-paren declaration must refuse, not Append"
         );
+    }
+
+    /// #482: a DIRECT dependency declared where the line grammar cannot see
+    /// it (`eval_gemfile`, a loop) is listed under the lock's DEPENDENCIES.
+    /// Appending the managed block would declare it twice and bundler
+    /// refuses every install, so the plan must refuse before any write.
+    #[tokio::test]
+    async fn direct_dependency_declared_out_of_sight_refuses_instead_of_appending() {
+        for gemfile in [
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\neval_gemfile \"Gemfile.common\"\n",
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\n%w[rack].each { |g| gem g, \"~> 3.1\" }\n",
+        ] {
+            let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_DIRECT).await;
+            let (code, detail) =
+                unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+            assert_eq!(code, "gemfile_declaration_not_editable", "{gemfile}");
+            assert!(detail.contains("direct dependency"), "{detail}");
+            assert!(!root.join(".socket").exists());
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                gemfile,
+                "refusal must write nothing: {detail}"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                    .await
+                    .unwrap(),
+                LOCK_DIRECT
+            );
+        }
     }
 
     /// Re-vendor (new uuid) over a lock whose CHECKSUMS entry was ALREADY
