@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled NuGet / dotnet bug-hunt routine (label pm:nuget).
 
-Last run: 2026-10-01 23:45 UTC, main `61cfb9b`, release v4.0.0.
+Last run: 2026-10-02 05:58 UTC, main `61cfb9b`, release v4.0.0.
 
 ## Coverage matrix
 
@@ -19,7 +19,9 @@ Cells: OS × SDK × mode. "warm" means the global packages folder already holds 
 | Windows | 9.0.318 | untested | fail #397 | pass | fail #352 | fail #353 | untested | untested |
 | Windows | nuget.exe 7.9 / packages.config | pass (`packages/`) | fail #398 (`repositoryPath`) | untested | untested | untested | untested | untested |
 
-Per-project lock `packages.<Project>.lock.json` (vendored + hosted): fail #514 (Linux 8). Self-closing `<packageSourceMapping />` and a `Newtonsoft.*` prefix mapping: pass (Linux 8, vendored + hosted).
+Per-project lock `packages.<Project>.lock.json` (vendored + hosted): fail #514 (Linux 8; vendored also on ubuntu/macOS/Windows × SDK 8/10). Custom `NuGetLockFilePath` (vendored): fail #514 (all 3 OSes × SDK 8/10).
+
+Vendored revert on a `core.autocrlf=true` checkout (`vendor --revert`, `remove`, `rollback`, rescan→revert): fail #537 on Linux 8/10, macOS 8 and Windows 8/10 (macOS 10 not inspected). Without autocrlf: pass. Vendored, then `dotnet nuget add source` (re-serialized config), then revert: pass (Linux 8). Self-closing `<packageSourceMapping />` and a `Newtonsoft.*` prefix mapping: pass (Linux 8, vendored + hosted).
 
 Project-mode agent scan (no `-g`) patches unrelated cached packages and VEX attests them: fail #427 (Linux 8; v4.0.0 too).
 
@@ -45,15 +47,14 @@ Also passed on Linux 8: `SOCKET_GLOBAL=1`, `SOCKET_GLOBAL_PREFIX`, `--global-pre
 
 ## Backlog
 
-0. #514 on macOS / Windows and SDK 6/9/10, plus the custom `NuGetLockFilePath` variant.
-1. #489 on macOS / Windows and SDK 6/9/10 (probe branch; inline the harness). Also `apply -g` / `remove -g <purl>` from a vendored project.
-2. #462 on macOS / Windows and SDK 6/9/10 (probe branch). dot.net installs are blocked in the sandbox.
-3. Re-run #353 / #354 under the v5 flow (a scratch copy of `e2e_nuget_dotnet_build.rs` with the `Backend` stand-in works well).
-4. Unwritable folder on macOS / Windows (Program Files); local tools (`dotnet-tools.json`); apply/rollback/vex `-g` on macOS / Windows.
-5. Mapping edge cases: a prefix pattern on another source (expect pass), a case-variant exact id, and two Socket patches for different ids.
-6. #354 on macOS / Windows (`%APPDATA%\NuGet\NuGet.Config`), plus machine-wide configs.
-7. Vendored/hosted with packages.config (needs nuget.exe / mono, or Windows).
-8. #427 on macOS / Windows; unicode / space paths and Windows long paths.
+0. Autocrlf class (#537) in takeovers: hosted→vendored and vendored→hosted on a CRLF checkout.
+1. #489 on macOS / Windows and SDK 6/9/10. The probe harness from 2026-10-02 works for this: `scratch_serve` plus `SCRATCH_SCRIPT`, inlined through heredocs.
+2. #462 / #353 / #354 on macOS / Windows and SDK 6/9 (same harness).
+3. Local tools (`dotnet-tools.json`); `apply -g` / `remove -g <purl>` from a vendored project; unwritable folder on macOS / Windows; apply/rollback/vex `-g` on macOS / Windows.
+4. Mapping edge cases: a prefix pattern on another source (expect pass), a case-variant exact id, and two Socket patches for different ids.
+5. Vendored/hosted with packages.config (windows-latest probe with nuget.exe).
+6. #427 on macOS / Windows; unicode / space paths and Windows long paths.
+7. Probe-branch cleanup: deleting branches is blocked from the sandbox, so 5 `bughunt/nuget/*` branches are still on the remote and need a maintainer.
 
 Also passed on Linux 8 (no issue): vendored with a BOM + CRLF `NuGet.Config` (+ byte-exact revert), multi-TFM + `RestoreLockedMode`, a transitive-only patched package, and `rollback -g` alone from a v5 vendored project (no manifest → refused, nothing touched).
 
@@ -71,3 +72,5 @@ Also passed on Linux 8 (no issue): vendored with a BOM + CRLF `NuGet.Config` (+ 
 - A partial apply (EACCES midway through a multi-file patch) leaves the earlier files patched. That's intended (apply.rs retry design). It's loud (rc 1 `partialFailure`), VEX omits it, and rollback restores it.
 - Vendored/hosted with a self-closing `<packageSourceMapping />` appends a second mapping section. NuGet merges them, so it's cosmetic.
 - `vex -o` is `--org`; the output flag is `-O` / `--output`. Not a bug.
+- After a drift-path (excision) vendored revert, the `*`→nuget.org catch-all mapping that vendor created stays in `nuget.config`. That's intentional (`revert_config_record` doc) and harmless.
+- `vendor -g` / `vendor --revert -g` rewiring the cwd project is the generic #498, not NuGet-specific.
