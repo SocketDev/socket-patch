@@ -125,36 +125,49 @@ async fn pnpm_lock_elsewhere(root: &Path) -> Option<PathBuf> {
         Err(_) => None,
     }
     .or_else(|| workspace_yaml.as_deref().and_then(workspace_lockfile_dir));
-    if let Some(dir) = configured.filter(|d| !d.trim().is_empty()) {
-        let dir = canonical.join(dir.trim());
-        let lock = dir.join(PNPM_LOCK);
-        let same_dir = tokio::fs::canonicalize(&dir)
-            .await
-            .is_ok_and(|d| d == canonical);
-        if !same_dir && lock.is_file() {
-            return Some(lock);
-        }
-        return None;
+    if let Some(dir) = configured {
+        return lock_elsewhere(&canonical, &canonical, &dir).await;
     }
     if workspace_yaml.is_some() || root.join(PNPM_WORKSPACE).exists() {
         // The project is its own workspace root.
         return None;
     }
     for ancestor in canonical.ancestors().skip(1) {
-        if ancestor.join(PNPM_WORKSPACE).is_file() {
-            let lock = ancestor.join(PNPM_LOCK);
-            return lock.is_file().then_some(lock);
-        }
+        let Ok(yaml) = read_regular_to_string(&ancestor.join(PNPM_WORKSPACE)).await else {
+            continue;
+        };
+        // The workspace root may relocate the lock with its own
+        // `lockfileDir`, relative to the root.
+        let dir = workspace_lockfile_dir(&yaml).unwrap_or_else(|| ".".to_string());
+        return lock_elsewhere(&canonical, ancestor, &dir).await;
     }
     None
 }
 
+/// `<base>/<dir>/pnpm-lock.yaml` when it exists and `<base>/<dir>` is not
+/// the project directory itself.
+async fn lock_elsewhere(project: &Path, base: &Path, dir: &str) -> Option<PathBuf> {
+    let dir = dir.trim();
+    if dir.is_empty() {
+        return None;
+    }
+    let dir = base.join(dir);
+    let lock = dir.join(PNPM_LOCK);
+    let same_dir = tokio::fs::canonicalize(&dir)
+        .await
+        .is_ok_and(|d| d == project);
+    (!same_dir && lock.is_file()).then_some(lock)
+}
+
 /// The top-level `lockfileDir:` scalar of a `pnpm-workspace.yaml`, read
-/// line-wise (a block key at column 0, an optional quoted value, an
-/// optional trailing comment).
+/// line-wise (a block key at column 0, bare or quoted, an optional quoted
+/// value, an optional trailing comment).
 fn workspace_lockfile_dir(yaml: &str) -> Option<String> {
     yaml.lines().find_map(|line| {
-        let rest = line.strip_prefix("lockfileDir")?.trim_start();
+        let rest = ["lockfileDir", "\"lockfileDir\"", "'lockfileDir'"]
+            .iter()
+            .find_map(|key| line.strip_prefix(key))?
+            .trim_start();
         let value = rest.strip_prefix(':')?.trim();
         let value = match value.chars().next() {
             Some(q @ ('"' | '\'')) => value[1..].split(q).next().unwrap_or(""),
@@ -273,6 +286,25 @@ mod tests {
         assert_eq!(code(tmp.path(), "npm").await, None);
     }
 
+    /// A workspace root that relocates its lock with `lockfileDir` still
+    /// governs its members (Bugbot on #598).
+    #[tokio::test]
+    async fn pnpm_member_of_workspace_with_relocated_lock_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        write(
+            tmp.path(),
+            "ws/pnpm-workspace.yaml",
+            "packages:\n  - packages/*\nlockfileDir: ..\n",
+        );
+        write(tmp.path(), "ws/packages/a/package.json", "{}");
+        let member = tmp.path().join("ws/packages/a");
+        assert_eq!(
+            code(&member, "npm").await.as_deref(),
+            Some(PNPM_LOCKFILE_ELSEWHERE)
+        );
+    }
+
     /// #417: a cargo workspace member is refused with the vendored code; the
     /// root and a standalone crate are not.
     #[tokio::test]
@@ -313,6 +345,14 @@ mod tests {
         );
         assert_eq!(
             workspace_lockfile_dir("packages: []\nlockfileDir: \"../x\"\n").as_deref(),
+            Some("../x")
+        );
+        assert_eq!(
+            workspace_lockfile_dir("\"lockfileDir\": \"..\"\n").as_deref(),
+            Some("..")
+        );
+        assert_eq!(
+            workspace_lockfile_dir("'lockfileDir': ../x\n").as_deref(),
             Some("../x")
         );
         assert_eq!(workspace_lockfile_dir("  lockfileDir: ..\n"), None);
