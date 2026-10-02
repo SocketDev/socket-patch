@@ -7575,6 +7575,94 @@ mod tests {
         }
     }
 
+    #[test]
+    fn nuget_shared_model_ignores_commented_sources() {
+        for sources in [
+            r#"<packageSources><!-- <add key="old" value="https://old.test" /> --></packageSources>"#,
+            r#"<!-- <packageSources><add key="old" value="https://old.test" /></packageSources> -->
+  <packageSources><add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+    <!-- <add key="other" value="https://other.test" /> -->
+  </packageSources>"#,
+        ] {
+            let config = format!("<configuration>\n  {sources}\n</configuration>\n");
+            let files = BTreeMap::from([("nuget.config".into(), config)]);
+            let result = rewrite_registry_redirect(&files, &[nuget_override()]);
+            let out = result.files.get("nuget.config").expect("config rewritten");
+            let parsed = crate::formats::nuget::parse_config(out).unwrap();
+            assert_eq!(
+                parsed
+                    .sources
+                    .iter()
+                    .map(|(key, _)| key.as_str())
+                    .collect::<Vec<_>>(),
+                ["socket-patch-uuid", "nuget.org"],
+                "only live sources receive mappings: {out}"
+            );
+            assert_eq!(
+                parsed.mappings,
+                [
+                    ("socket-patch-uuid".into(), vec!["Newtonsoft.Json".into()]),
+                    ("nuget.org".into(), vec!["*".into()]),
+                ],
+                "every catch-all must name a source NuGet reads: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn nuget_shared_model_never_splices_into_inert_markup() {
+        let fake = "<packageSources></packageSources><packageSourceMapping></packageSourceMapping>";
+        for inert in [
+            format!("<!-- é {fake} -->"),
+            format!("<![CDATA[{fake}]]>"),
+            format!("<?example {fake}?>"),
+        ] {
+            let config = format!(
+                "<configuration>\n  {inert}\n  <packageSources>\n    \
+                 <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  \
+                 </packageSources>\n</configuration>\n"
+            );
+            let files = BTreeMap::from([("nuget.config".into(), config)]);
+            let result = rewrite_registry_redirect(&files, &[nuget_override()]);
+            let out = result.files.get("nuget.config").expect("config rewritten");
+            assert!(out.contains(&inert), "inert bytes must be preserved: {out}");
+            let parsed = crate::formats::nuget::parse_config(out).unwrap();
+            assert!(parsed
+                .sources
+                .iter()
+                .any(|(key, _)| key == "socket-patch-uuid"));
+            assert!(parsed.mappings.iter().any(|(key, patterns)| {
+                key == "socket-patch-uuid" && patterns == &["Newtonsoft.Json"]
+            }));
+            let rerun = rewrite_registry_redirect(&result.files, &[nuget_override()]);
+            assert!(
+                rerun.files.is_empty() && rerun.edits.is_empty(),
+                "idempotent: {rerun:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nuget_shared_model_refuses_malformed_config_without_repinning_lock() {
+        for config in [
+            "<configuration><packageSources></configuration>",
+            "<configuration><!-- unterminated </configuration>",
+            // Even an apparently existing Socket source cannot bypass validation.
+            r#"<configuration><packageSources><add key="socket-patch-uuid" value="https://patch.test/nuget/index.json" /></packageSources>"#,
+        ] {
+            let files = BTreeMap::from([
+                ("nuget.config".into(), config.into()),
+                ("packages.lock.json".into(), r#"{"version":1,"dependencies":{"net8.0":{"Newtonsoft.Json":{"type":"Direct","resolved":"13.0.3","contentHash":"ORIGINAL"}}}}"#.into()),
+            ]);
+            let result = rewrite_registry_redirect(&files, &[nuget_override()]);
+            assert!(
+                result.files.is_empty() && result.edits.is_empty(),
+                "no half-write: {result:?}"
+            );
+            assert!(warning_codes(&result).contains(&"redirect_nuget_config_unwritable"));
+        }
+    }
+
     /// Creating a `<packageSourceMapping>` from scratch: once ANY mapping
     /// exists NuGet requires EVERY package to match some source's pattern, so
     /// the rewriter must fan a `pattern="*"` mapping out to every pre-existing
