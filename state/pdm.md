@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled PDM bug-hunt routine (label pm:pdm).
 
-Last run: 2026-10-02 15:19Z on main `d63ae5f` (latest tag v4.0.0; #522 merged; PR #540 head `60dfb81` tested 09:23Z). Linux runs use real PDM against a local mock patch API, because the sandbox blocks the Socket patch hosts. macOS and Windows runs use probe branches.
+Last run: 2026-10-02 21:12Z on main `045d7ec` (latest tag v4.0.0; #522 and #540 merged; #332/#451/#502/#528 closed by maintainers). Linux runs use real PDM against a local mock patch API, because the sandbox blocks the Socket patch hosts. macOS and Windows runs use probe branches.
 
 ## Coverage matrix
 | PDM | lock_version | agent (Linux / macOS / Windows) | hosted (Linux) | vendored (Linux) |
@@ -17,6 +17,9 @@ Last run: 2026-10-02 15:19Z on main `d63ae5f` (latest tag v4.0.0; #522 merged; P
 | 2.29.2 | 4.5.1 | pass (all 3 OS, in-project `.venv`); fail #502 Linux (`venv.in_project=false` / `pdm use <venv>`: real env skipped, stray `.venv` or PATH python patched; pass on PR #540); space/unicode path pass | fail #528 (PEP 582 `__pypackages__`: no stale warning, VEX attests; pass on PR #540); CRLF lock pass, mixed-ending rollback LF-normalizes (cosmetic); extras `[socks]` pass; concurrent scans `lock_held` pass; space/unicode path pass; pass on v5 (dev/optional groups, `update --update-all/--update-reuse/--unconstrained`, `lock --refresh` keeps patch, lock-only scan, sync, manifest-less rollback byte-exact, VEX); multi-target fork refused (documented); fail #413 (re-confirmed `61cfb9b`); stale warning + VEX with out-of-tree env fail #502; post-rollback install fail #477 | pass on v5 (warm/fresh/frozen, lock --check, idempotent, vex, rollback byte-exact; private index + `static_urls` rollback byte-exact; nested `services/*` project; agent→vendored takeover; CRLF / mixed-ending lock; extras `[socks]`; `rollback --preserve-state` → re-scan; concurrent scans; space/unicode path); post-rollback / `remove` install fail #477 |
 | 1.15.5 | 3.1 | fail #502 (`.pdm.toml` `python.path` external venv) | refused (documented) | refused (documented) |
 | 2.15.4, 2.20.1 | 4.4.1 / 4.5.0 | — | `pdm add` → uninstallable lock (PDM reuse, #331); re-scan repairs (pass) | `pdm add` → rollback fails closed; `pdm lock` → re-scan → rollback (pass) |
+| 1.4.5 / 1.15.5 / 2.0.3 | 2 / 3.1 / 4.0 | agent PEP 582 (`.pdm.toml` `python.path`; plain, activated venv, stray `.venv`) pass on `045d7ec` | — | — |
+| 2.27.0 – 2.29.2 | 4.5.x | agent PEP 582 with `pdm.toml` `use_venv = "false"` (PDM-written string) + activated / stray venv: **fail #609**; bool form and `PDM_USE_VENV` pass | — | — |
+| all (2.26.9, 2.29.2 run) | — | agent PEP 582 with `use_venv` false in the **user** config + stray venv: **fail #609** | — | — |
 | 0.12, 1.0, 1.8 – 1.14 | 2 / 3.1 | untested | untested | untested |
 
 Modes × macOS/Windows for hosted and vendored: untested by this routine (the repo's pdm-compatibility.yml covers them).
@@ -39,12 +42,12 @@ Modes × macOS/Windows for hosted and vendored: untested by this routine (the re
 `-g --mode hosted` and `--global-prefix --mode hosted` refuse with exit 2 (pass). `SOCKET_GLOBAL=1` matches `-g` (pass). `--global-prefix <site-packages>` finds both #451 locations (pass).
 
 ## Backlog
-1. #566 on macOS / Windows site-config paths and for site-config `venv.location` / `python.install_root` (use a non-3.11 interpreter: the sandbox system 3.11 now carries urllib3 1.26.18). PDM 1.x global project (`~/.pdm/global-project`) under `-g`.
-2. Once #540 merges: re-run the #502 / #528 matrix on main (incl. `.pdm.toml` PDM < 2.5, the PATH-python false negative, PDM 1.4.5 / 2.0.3 global projects).
-3. #528 on PDM 1.4.5 (PEP 582 default) and agent `-g` with PEP 582.
-4. Hash variant of #413 (private index serving different bytes); PDM 1.x `feature.install_cache` with agent mode; agent mode on 1.4.5 / 1.15.5.
-5. macOS / Windows probes, once probe-branch deletion works (`git push --delete` still fails through the git proxy; the stale `bughunt/pdm/20260930-cache-symlink` needs a maintainer to delete it).
-6. Done: CRLF lock_version 2 (1.4.5 hosted + vendored), SIGKILL-interrupted scans, groups, relocks, vendored relocks, `pdm add` after hosted/vendored, #502 on 1.15.5 / 2.0.3, CRLF / mixed / BOM locks (2.12 / 2.29), extras entries, `rollback --preserve-state`, concurrent scans, space/unicode paths.
+1. #609 on macOS / Windows user-config paths, site config, `PDM_CONFIG_FILE`; other PDM ≥ 2.27 string-valued settings (e.g. `venv.in_project = "false"`) in hosted / vendored stale checks.
+2. #566 on macOS / Windows site-config paths and site-config `venv.location` / `python.install_root` (use a non-3.11 interpreter: the sandbox system 3.11 may carry urllib3 1.26.18). PDM 1.x global project (`~/.pdm/global-project`) under `-g`.
+3. Re-run #477 / #413 on main once `patch/redirect/pdm.rs` or `upstream/pypi_locks.rs` change (hosted mock: references + view).
+4. Hash variant of #413 (private index serving different bytes); PDM 1.x `feature.install_cache` with agent mode.
+5. macOS / Windows probes (branch deletion through the proxy / permission policy still fails; the stale `bughunt/pdm/20260930-cache-symlink` needs a maintainer to delete it).
+6. Done: #502/#528 on main for 1.4.5 / 1.15.5 / 2.0.3 agent PEP 582; CRLF lock_version 2, SIGKILL-interrupted scans, groups, relocks, `pdm add` after hosted/vendored, CRLF / mixed / BOM locks, extras, `rollback --preserve-state`, concurrent scans, space/unicode paths.
 
 ## Known non-bugs
 - lock_version absent / 3.1 / 4.0–4.2 refused; 2.8.0 accepted-but-crashes (documented).
@@ -77,3 +80,5 @@ Modes × macOS/Windows for hosted and vendored: untested by this routine (the re
 - Test-harness note: hosted refs on a mock origin need `SOCKET_PATCH_SERVER_URL`; vendored grants need `integrity.sha512` as SRI. `pdm use` in a fresh dir can pick another project's interpreter, so write `.pdm-python` explicitly. Out-of-tree PDM venvs are shared between copies of a project dir, so reset them (`pdm sync --reinstall`) between builds.
 - A SIGKILLed hosted/vendored scan leaves `.socket-stage-pdm.lock-<uuid>` files in the project root that re-scan / rollback never sweep. The lock itself is always original or fully rewritten (85 kills, 2.29.2). Generic staging behaviour and crash-only, so it's left to maintainers.
 - Test-harness note: the sandbox's `/usr/local/lib/python3.11/dist-packages` now carries urllib3 1.26.18 (from a `pdm add -g` with no global venv), which masks `-g` scan counts on python3.11; check the file bytes of the target copy instead.
+- PDM 2.0–2.4 treat a `.pdm.toml` with a base `python.path` (from `pdm use -f <base>`) as PEP 582, and discovery agrees (verified on 2.0.3).
+- Agent `vex` after a #609 mis-patch fails closed (`not_applied`), so there's no false attestation there.
