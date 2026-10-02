@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled NuGet / dotnet bug-hunt routine (label pm:nuget).
 
-Last run: 2026-10-02 17:42 UTC, main `6cd3754`, release v4.0.0.
+Last run: 2026-10-02 23:50 UTC, main `045d7ec`, release v4.0.0.
 
 ## Coverage matrix
 
@@ -27,6 +27,12 @@ Mode takeovers (Linux 8): hosted → vendored via `scan --mode vendored`: fail #
 
 Hosted with a commented-out `<packageSources>` or `<packageSourceMapping>` block (Linux 8): fail #585 (splice lands inside the comment; v4.0.0 too). Vendored with the same configs: pass. `get --mode vendored` over a hosted project: fail #553.
 
+CPM with `CentralPackageTransitivePinningEnabled` (`CentralTransitive` lock entry), Linux 8: hosted pass, vendored pass.
+
+BOM `packages.lock.json`, Linux 8: hosted fail #623 (exit 0, nothing wired), vendored fail #623 (`apply_failed`). Hosted BOM + CRLF `nuget.config`: pass.
+
+Hosted unwind (`remove`, `rollback <purl>`, hosted → `vendor` takeover → `vendor --revert`), Linux 8: fail #624 (lock gets the catalog `packageHash`, NU1403 on every restore; since `de316b4`). Config side is byte-exact for LF / CRLF / BOM. Vendored `remove`/`rollback` with a lowercase purl: `not_found` (the inverse of #553; commented there).
+
 Project-mode agent scan (no `-g`) patches unrelated cached packages and VEX attests them: fail #427 (Linux 8; v4.0.0 too).
 
 ### Global mode (`-g`)
@@ -51,20 +57,21 @@ Also passed on Linux 8: `SOCKET_GLOBAL=1`, `SOCKET_GLOBAL_PREFIX`, `--global-pre
 
 ## Backlog
 
-0. #553's case sensitivity in `vex --package`, `vendor --revert <Mixed.Case purl>` and `list`.
-1. #585 follow-ups: a real `<packageSourceMapping>` placed after a commented one (expect NU1403 with a lock), plus hosted revert after a hand-fixed config.
-2. #489 / #462 / #353 / #354 on macOS / Windows and SDK 6/9/10 (probe harness: `scratch_serve` + `SCRATCH_SCRIPT`; vendored legs now need `--vendor-source service --patch-server-url`). Local SDK installs are blocked (dotnet-install 403), so this needs a probe branch.
-3. Local tools (`dotnet-tools.json`); `apply -g` / `remove -g <purl>` from a vendored project; unwritable folder on macOS / Windows; apply/rollback/vex `-g` on macOS / Windows.
-4. Mapping edge cases: a prefix pattern on another source (expect pass), a case-variant exact id, and two Socket patches for different ids.
-5. Vendored/hosted with packages.config (windows-latest probe with nuget.exe).
-6. #427 on macOS / Windows; unicode / space paths and Windows long paths.
-7. Probe-branch cleanup: deleting branches is blocked from the sandbox, so 5 `bughunt/nuget/*` branches are still on the remote and need a maintainer.
+0. #624 follow-ups: an unsigned-package hash path and the `--offline` refusal; #623 on Windows with a PowerShell-written lock.
+1. #553's case sensitivity in `vex` (no `--package` flag exists; check `vex` output purls) and `list`.
+2. #585 follow-ups: a real `<packageSourceMapping>` placed after a commented one (expect NU1403 with a lock), plus hosted revert after a hand-fixed config.
+3. #489 / #462 / #353 / #354 on macOS / Windows and SDK 6/9/10 (probe harness: `scratch_serve` + `SCRATCH_SCRIPT`; vendored legs need `--vendor-source service --patch-server-url`; hosted unwind probes must sed the feed URL to `https://patch.socket.dev`). Local SDK installs beyond apt 8.0 are blocked (dotnet-install 403), so this needs a probe branch.
+4. Local tools (`dotnet-tools.json`); `apply -g` / `remove -g <purl>` from a vendored project; unwritable folder on macOS / Windows; apply/rollback/vex `-g` on macOS / Windows.
+5. Mapping edge cases: a case-variant exact id, and two Socket patches for different ids.
+6. Vendored/hosted with packages.config (windows-latest probe with nuget.exe).
+7. #427 on macOS / Windows; unicode / space paths and Windows long paths.
+8. Probe-branch cleanup: deleting branches is blocked from the sandbox, so 5 `bughunt/nuget/*` branches are still on the remote and need a maintainer.
 
 Also passed on Linux 8 (no issue): vendored with a BOM + CRLF `NuGet.Config` (+ byte-exact revert), multi-TFM + `RestoreLockedMode`, a transitive-only patched package, and `rollback -g` alone from a v5 vendored project (no manifest → refused, nothing touched).
 
 ## Known non-bugs
 
-- Hosted maven/nuget per-purl rollback is refused (`hosted_revert_unsupported`, CLI_CONTRACT.md). This is documented.
+- (Superseded in v5.0: hosted NuGet `remove`/`rollback` now unwind manifest-less, see #624.) A hosted unwind probe against the `http://127.0.0.1` stand-in gives `manifest_not_found`, because lockfile discovery only recognises `https://patch.socket.dev` feeds. That's a harness artifact; sed the URL first.
 - Without a lockfile there's no client-side content pin (`vendor_nuget_no_lockfile`). The missing pin is documented. The false claim that the feed "forces" the patched copy is not; that's #352.
 - Hosted and VEX read only the project-root `nuget.config` / `packages.lock.json` (CLI_CONTRACT.md, README VEX table). Root-only scope is documented. Wiring the root config without pinning the member locks is #353.
 - Staged manifests must use sha256 git-blob hashes (64 hex). A sha1 blob is refused on purpose.
@@ -80,3 +87,4 @@ Also passed on Linux 8 (no issue): vendored with a BOM + CRLF `NuGet.Config` (+ 
 - `vendor -g` / `vendor --revert -g` rewiring the cwd project is the generic #498, not NuGet-specific.
 - `scan --mode hosted` over a vendored NuGet project doesn't take over (`takeover_capable` = cargo/npm/golang): `redirected: 0`, `already: 1`, and it stays vendored and patched. Not a bug. On an autocrlf checkout, a later revert hits #537.
 - #486's shared-store guard (PDM cache, pnpm GVS) doesn't cover `~/.nuget/packages`. NuGet agent mode patches the global packages folder by design, so that's not a bug.
+- A version bump after vendoring/hosting fails NU1102: the exclusive id-level `packageSourceMapping` routes the id only to a feed holding the patched version. This is a design limitation; unwind first.
