@@ -45,7 +45,10 @@ const SKIP_DIRS: &[&str] = &[
 /// Only existing directories are returned.
 pub(super) fn configured_install_roots(start_path: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(folder) = yarnrc_modules_folder(start_path) {
+    if let Some(folder) = yarnrc_modules_folder(start_path)
+        .as_deref()
+        .and_then(normalize_modules_folder)
+    {
         roots.push(start_path.join(folder));
     }
     if start_path.join("rush.json").is_file() {
@@ -78,12 +81,40 @@ pub(super) fn merge_configured_install_roots(
 }
 
 /// The `--modules-folder` value from the nearest `.yarnrc` at or above
-/// `start_path`, if any `.yarnrc` sets it.
+/// `start_path`, if any `.yarnrc` sets it. Read with
+/// [`crate::utils::fs::read_regular_to_string_sync`]: the file belongs to
+/// the (untrusted) project, and a FIFO planted there would wedge a plain
+/// read forever.
 fn yarnrc_modules_folder(start_path: &Path) -> Option<String> {
     start_path.ancestors().find_map(|dir| {
-        let rc = std::fs::read_to_string(dir.join(".yarnrc")).ok()?;
+        let rc = crate::utils::fs::read_regular_to_string_sync(&dir.join(".yarnrc")).ok()?;
         parse_yarnrc_modules_folder(&rc)
     })
+}
+
+/// Reduce a `--modules-folder` value to plain `a/b` segments under the
+/// project, or `None`. The value comes from the project being scanned and
+/// names a tree apply later WRITES patch content into, so (like composer's
+/// `config.vendor-dir`) only a relative subpath is honored: `./deps` and
+/// `lib/./deps` resolve, `..` is resolved lexically, and a value that is
+/// absolute, drive-qualified, climbs above the project root or reduces to
+/// it fails closed — the project then discovers nothing there, as before.
+fn normalize_modules_folder(raw: &str) -> Option<String> {
+    if raw.starts_with(['/', '\\']) {
+        return None;
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in raw.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            other => segments.push(other),
+        }
+    }
+    let joined = segments.join("/");
+    (!segments.is_empty() && path_safety::is_safe_multi_segment(&joined)).then_some(joined)
 }
 
 /// The `--modules-folder` (or command-scoped `--install.modules-folder`)
@@ -4484,5 +4515,81 @@ mod tests {
                 p("/r/deps"),
             ]
         );
+    }
+
+    /// `--modules-folder` names a patch WRITE target, so only a relative
+    /// subpath of the project is honored (the composer `vendor-dir` rule):
+    /// `.`/`..` resolve lexically, and an absolute, drive-qualified,
+    /// escaping or empty value is refused.
+    #[test]
+    fn test_normalize_modules_folder() {
+        let n = normalize_modules_folder;
+        assert_eq!(n("deps").as_deref(), Some("deps"));
+        assert_eq!(n("./deps/").as_deref(), Some("deps"));
+        assert_eq!(n("lib/./deps").as_deref(), Some("lib/deps"));
+        assert_eq!(n("lib\\deps").as_deref(), Some("lib/deps"));
+        assert_eq!(n("a/../deps").as_deref(), Some("deps"));
+        for raw in [
+            "/abs/deps",
+            "\\abs",
+            "..",
+            "../outside",
+            "a/../..",
+            ".",
+            "./",
+            "",
+            "C:\\deps",
+            "C:deps",
+        ] {
+            assert_eq!(n(raw), None, "{raw:?}");
+        }
+    }
+
+    /// An escaping or absolute `--modules-folder` is not a crawl root
+    /// even when the directory exists: the crawl (and apply's writes)
+    /// stays inside the project.
+    #[tokio::test]
+    async fn test_escaping_modules_folder_is_not_a_crawl_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        write_pkg(&outside.join("left-pad"), "left-pad", "1.3.0");
+        std::fs::create_dir_all(&root).unwrap();
+        let crawler = NpmCrawler::new();
+        let abs = format!("{}", outside.display()).replace('\\', "\\\\");
+        for rc in [
+            "--modules-folder ../outside\n".to_string(),
+            format!("--modules-folder \"{abs}\"\n"),
+        ] {
+            std::fs::write(root.join(".yarnrc"), &rc).unwrap();
+            let roots = crawler
+                .get_node_modules_paths(&local_options(&root))
+                .await
+                .unwrap();
+            assert!(roots.is_empty(), "{rc:?}: {roots:?}");
+            assert!(crawler.crawl_all(&local_options(&root)).await.is_empty());
+        }
+    }
+
+    /// A FIFO planted at `.yarnrc` must not wedge the crawl: it is read
+    /// with the regular-file guard and ignored.
+    #[cfg(unix)]
+    #[test]
+    fn test_fifo_yarnrc_does_not_block_the_crawl() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_pkg(&root.join("node_modules/ms"), "ms", "2.1.3");
+        let c_path = std::ffi::CString::new(root.join(".yarnrc").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = root.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(NpmCrawler::find_local_node_modules_dirs(&probe));
+        });
+        let roots = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a FIFO .yarnrc must not block root discovery");
+        assert_eq!(roots, vec![root.join("node_modules")]);
     }
 }
