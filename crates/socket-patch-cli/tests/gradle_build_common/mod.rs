@@ -553,8 +553,15 @@ fn git(cwd: &Path) -> Command {
             cmd.env_remove(&key);
         }
     }
+    // No system or global config (a developer's commit signing, hooks or
+    // autocrlf must not change the fixture): an empty global file.
+    let global = std::env::temp_dir().join("socket-patch-e2e-empty.gitconfig");
+    if !global.is_file() {
+        let _ = std::fs::write(&global, "");
+    }
     cmd.current_dir(cwd)
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &global)
         .args(["-c", "user.name=socket-patch-e2e"])
         .args(["-c", "user.email=e2e@socket.invalid"])
         .args(["-c", "init.defaultBranch=main"]);
@@ -698,6 +705,31 @@ mod gradle_build_common_selftests {
         assert!(script.contains("gradle.lifecycle.beforeProject"));
         assert!(script.contains("repo.allowInsecureProtocol = true"));
         assert!(mirror_init_script("http://h", None).contains("def socketHosted = ''"));
+    }
+
+    /// LF as committed, CRLF in the autocrlf clone; `-text` files stay LF.
+    #[test]
+    fn git_autocrlf_clone_checks_out_crlf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        write_project(
+            &src,
+            &[
+                ("settings.gradle", "include 'app'\nrootProject.name = 'x'\n"),
+                (".gitattributes", "*.bin -text\n"),
+                ("data.bin", "a\nb\n"),
+            ],
+        );
+        let dst = git_autocrlf_clone(&src, &tmp.path().join("clone"));
+        assert_eq!(
+            std::fs::read(dst.join("settings.gradle")).unwrap(),
+            b"include 'app'\r\nrootProject.name = 'x'\r\n"
+        );
+        assert_eq!(std::fs::read(dst.join("data.bin")).unwrap(), b"a\nb\n");
+        assert_eq!(
+            std::fs::read(src.join("settings.gradle")).unwrap(),
+            b"include 'app'\nrootProject.name = 'x'\n"
+        );
     }
 
     #[test]
