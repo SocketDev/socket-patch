@@ -1,14 +1,14 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-02T16:20Z · main @ 1169ae6_
+_Last updated 2026-10-02T22:30Z · main @ 045d7ec_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
-| C01 | 1 | Unbounded zip inflate on tamperable input. `zip_bytes_match_after_hashes` pre-allocates from the archive's declared size and reads with no cap, and it runs on committed `.nupkg`/`.jar` files and service archives. There are three archive caps (512/256/128 MiB). | #569 | filed #569 |
+| C01 | 1 | Unbounded zip inflate on tamperable input. `zip_bytes_match_after_hashes` pre-allocates from the archive's declared size and reads with no cap, and it runs on committed `.nupkg`/`.jar` files and service archives. There are three archive caps (512/256/128 MiB). | #569 | fixed (#587); streams members, no cap per maintainer |
 | C02 | 1 | `ApiClient::new` and `plain_client()` set no HTTP timeout, and blob and diff fetches have no retry, so `scan`, `get` and `apply` can hang in CI. | #570 | fixed (#581) |
 | C03 | 1 | `vendored_takeover` ignores `RevertOutcome.kept_artifact`. It deletes the ledger entry and reports the artifact as reverted on a drift-keep, while every other revert caller honors the flag. | #568 | filed #568 |
-| C04 | 1 | Planted-binary spawn: `vendor/pypi_hatch.rs` runs `Command::new("hatch").current_dir(root)` instead of `process::resolve_tool`. Check open PR #442 first. | §1 #4; 7.3 | | to verify |
-| C05 | 1 | `SOCKET_FORCE` is bound to `vendor --force`, `apply --force` and `--update --force`, so forcing a self-update also forces past hash checks. | §1 #6 | | to verify |
-| C06 | 1 | `get` round-trips its arguments through `DownloadParams` and `..GlobalArgs::default()`, which silently resets `offline`, `patch_server_url` and more. `get` also builds a fake `ApplyArgs`, and `get` and `scan` call each other. | 2.1; 2.3; R7 | | to verify |
+| C04 | 1 | Planted-binary spawn: `vendor/pypi_hatch.rs` runs `Command::new("hatch").current_dir(root)` instead of `process::resolve_tool`. #442 didn't cover it. | §1 #4; 7.3 | #613 | filed #613 |
+| C05 | 1 | `SOCKET_FORCE` is bound to `vendor --force`, `apply --force` and `--update --force`, so forcing a self-update also forces past hash checks. | §1 #6 | #615 | decision #615 |
+| C06 | 1 | `get` round-trips its arguments through `DownloadParams` and `..GlobalArgs::default()`, which silently resets `offline`, `patch_server_url` and more. `get` also builds a fake `ApplyArgs`, and `get` and `scan` call each other. | 2.1; 2.3; R7 | | rejected; resets inert on 045d7ec, cycle folded into C12 |
 | C07 | 1 | The URL builders disagree. When org auto-resolve fails, `patches_path` sends JSON calls to `/v0/orgs/default/…`, while `binary_url` and `vendor_package_url` send the same client to the public proxy. Telemetry has a fourth copy of this logic. | 7.2 | | to verify |
 | C08 | 2 | Repo hygiene: a stray `.github/actions/actions/cache/<sha>/.vscode/launch.json`, a README that documents v5 but whose installer installs v4, and 39 references to a "DESIGN §" document that doesn't exist. (The dead CI path filters go to the CI janitor.) | §1 #8; 8.5 J | | to verify |
 | C09 | 2 | There is no shared `with_proxy_fallback` helper: scan, get (both paths) and vex each handle the proxy fallback themselves, and get's handling has a gap. | 2.10 R2 | | to verify |
@@ -37,12 +37,13 @@ _Last updated 2026-10-02T16:20Z · main @ 1169ae6_
 | C32 | 3 | 328 exact-sentence assertions should become `--json`/`errorCode` checks plus snapshots. Triage the 402 covgap tests, 136 of which assert human text. | 2.5; 8.5 G/H | | to verify |
 | C33 | 3 | `CLI_CONTRACT.md` (332 KB) should be a generated reference (flags, env vars, codes, exit codes) plus ≤300 lines of prose, with a freshness test. Also decouple `docs/testing` from the validation scripts. | 8.3; 8.5 F/I | | to verify |
 | C34 | 3 | Decide: the command model. A read-only `scan`, plus `fix`, `undo`, `sync` and `check`, with mode inferred from project state. This folds `remove`, `rollback` and `vendor --revert`, and per-command flags replace the 27 globals. | §4; 2.9; R6/R8 | | to verify |
-| C35 | 3 | Decide: drop the deprecated spellings and embedded `--vex`, and give `SOCKET_FORCE` per-command names. | R9; R10 | | to verify |
+| C35 | 3 | Decide: drop the deprecated spellings and embedded `--vex`, and give `SOCKET_FORCE` per-command names. | R9; R10 | | to verify; `SOCKET_FORCE` part is #615 |
 | C36 | 3 | Decide: the futures of agent mode and of the self-update binary swap. | §6 Q2; 7.5 | | to verify |
 | C37 | 2 | Patch blob/diff downloads (`fetch_binary`) buffer the whole body with no size cap; vendor and self-update use the shared `read_capped`. | new finding | #571 | in PR #607 |
+| C38 | 2 | The public-proxy per-package fallback keeps a private cap of 10, ignoring `SOCKET_API_CONCURRENCY`, the proxy cap of 4 and the fd-limit rule; `registry_concurrency()` has no caller. | new finding | #614 | filed #614 |
 
 **Handed off** (to the CI janitor): report-only coverage and LTO `docker-base` off PRs; e2e from 148 to ~50 legs; a reusable compat workflow; no per-leg compiles; dead CI path filters (review 8.2, 8.5 B/C/E).
 
-**Rejected / not a defect:** none yet.
+**Rejected / not a defect:** C06. On `045d7ec`, the nested apply reads none of the fields `..GlobalArgs::default()` resets except `offline`, which `get`/`scan` refuse up front; the hosted opt-outs reach core through process env. The `get` ↔ `scan` cycle and the fake `ApplyArgs` stay in C12.
 
 **Already fixed:** none yet.

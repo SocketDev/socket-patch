@@ -78,7 +78,6 @@
    A seven-verb model (`scan` read-only, `fix`, `undo`, `sync`, `check`, `list`, `vex`) with mode inferred from the project would cover everything (§4).
 
 6. **There are a few real defects to fix now** (§1), regardless of any refactor:
-   - an unbounded zip inflate on committed artifacts;
    - no HTTP timeouts on the main API client;
    - a ledger-loss bug in the vendored→hosted takeover;
    - a planted-binary spawn;
@@ -110,12 +109,12 @@
 
 | # | Defect | Evidence | Fix | Status |
 |---|---|---|---|---|
-| 1 | **Unbounded zip inflate on tamperable input** | `vendor/common.rs:305-330` `zip_bytes_match_after_hashes` runs `Vec::with_capacity(entry.size())` from the archive's *declared* size, then `read_to_end` with no cap. It runs on committed `.nupkg`/`.jar` files (`nuget_feed.rs:266`, `maven_repo.rs:736`, `:1464`) and on service archives (`service_fetch.rs:312`). Its twin `vendor/mod.rs:526 capped()` already caps at 64 MiB. | Route all zip reads through one capped reader with one cap constant. There are three different caps today: 512, 256 and 128 MiB. | {{C01}} |
+| 1 | **Zip member inflate on committed artifacts** (fixed) | `zip_bytes_match_after_hashes` now streams each member through the Git SHA-256 reader with an 8 KiB buffer and checks the declared length against the bytes read, instead of inflating it into a `Vec` (#587). The maintainer ruled that this data is trusted not to be too big, so the goal was streaming, not a cap. | The three archive caps (512/256/128 MiB) remain; see C15/C21. | {{C01}} |
 | 2 | **No HTTP timeouts on the main API paths** (fixed) | Both `ApiClient` reqwest clients now take `api::retry::ApiTimeouts` (10 s connect, 60 s idle read), and a stalled JSON body reports `ApiError::Network` (#581). Blob/diff downloads still have **no retry**. | One retry and timeout primitive for every HTTP path (Part 7). | {{C02}} |
 | 3 | **Vendored→hosted takeover drops the ledger entry on a drift-keep** | `RevertOutcome.kept_artifact` says callers "must ALSO keep the state.json entry" (`core/vendor/mod.rs:664-673`). `vendored_takeover` (`cli/scan/hosted.rs:1732-1790`) never reads it, deletes the entry, and tells the user that the "committed artifact" was reverted. Every other revert caller honors the flag. | Route takeover through `VendoredBackend`, and add a regression test. | {{C03}} |
-| 4 | **Planted-binary spawn** | `vendor/pypi_hatch.rs:118` runs `Command::new("hatch").current_dir(root)`. That is exactly the pattern `utils/process.rs:23-33` documents as unsafe: a relative `PATH` entry executes a `hatch` planted in the scanned repo. It is the only production bare-name spawn. | Use `process::resolve_tool`. | {{C04}} |
+| 4 | **Planted-binary spawn** | `vendor/pypi_hatch.rs:118` runs `Command::new("hatch").current_dir(root)`. That is exactly the pattern `utils/process.rs:23-33` documents as unsafe: a relative `PATH` entry executes a `hatch` planted in the scanned repo. It is the only production bare-name spawn. Reproduced on `045d7ec`: with `PATH=.:…`, a planted `hatch` runs and its fake version passes the `>=1.2` gate. | Use `process::resolve_tool`. | {{C04}} |
 | 5 | **Comment-blind NuGet config reader in hosted mode** | `redirect/mod.rs:4302 nuget_package_source_keys` regex-scans raw XML without masking `<!-- -->`. A commented-out `<add key>` changes which sources get mapped. The vendored and `formats::nuget` readers both mask comments. | Use `formats::nuget::parse_config`. | {{E01}} |
-| 6 | **`SOCKET_FORCE` is bound to three unrelated flags** | `vendor --force`, `apply --force` and `--update --force` (`vendor.rs:80`, `apply.rs:318`, `update.rs:61`). Exporting it to force a self-update also forces `apply`/`vendor` past hash checks. | Per-command env names. | {{C05}} |
+| 6 | **`SOCKET_FORCE` is bound to three unrelated flags** | `vendor --force`, `apply --force` and `--update --force` (`vendor.rs:80`, `apply.rs:339`, `update.rs:61` at `045d7ec`). Exporting it to force a self-update also forces `apply`/`vendor` past hash checks. | Per-command env names. | {{C05}} |
 | 7 | **`bun.lockb` ignores the registry override** | `vendor/bun_lockb.rs:235` hard-codes `registry.npmjs.org` instead of `registry_fetch::npm_tarball_url`, ignoring `SOCKET_NPM_REGISTRY`. vlt has two divergent `registry_base` implementations. | Use the shared helpers. | {{E02,E03}} |
 | 8 | **Repo hygiene** | A stray `.github/actions/actions/cache/<sha>/.vscode/launch.json` (accidentally committed in #201); 2 dead CI path filters; `README` documents v5 while its install one-liner installs v4 (disclosed in a note, but easy to miss); 39 references to a "DESIGN §x.y" document that doesn't exist. | Delete or fix. | {{C08}} |
 
@@ -155,7 +154,7 @@ Other examples:
 **Commands call each other as libraries.**
 - There is a `get` ↔ `scan` cycle.
 - `get` builds a fake `ApplyArgs` and calls `apply::run_locked`.
-- Arguments round-trip GlobalArgs → `DownloadParams` → `..GlobalArgs::default()`, silently resetting `offline`, `patch_server_url` and more.
+- Arguments round-trip GlobalArgs → `DownloadParams` → `..GlobalArgs::default()`. On `045d7ec` the reset fields are inert: the nested apply reads none of them except `offline`, which `get` and `scan` refuse up front.
 
 ### 2.2 The correctness model: "wired" is treated as "consumed"
 
