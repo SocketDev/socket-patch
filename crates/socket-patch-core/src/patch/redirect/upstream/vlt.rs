@@ -19,6 +19,9 @@
 //!
 //! Every hosted instance of a pin is restored together, and every other
 //! byte of the lock (flags, trailing slots, indent, comma, `\r`) is kept.
+//! Default-registry admission and sibling conventions use the same raw
+//! segment policy as forward rewrite, heal and vendor. Only the shared
+//! `registry_base` normalizes a modern empty segment when resolving a URL.
 
 use serde_json::{Map, Value};
 
@@ -26,8 +29,8 @@ use super::npm::{by_uuid, fetch_dists, read_or_refuse, refuse_all_in};
 use super::{Ctx, FormatResult, HostedPin, View};
 use crate::vendor::vlt_lock_text::{
     default_registry_alias, entry_text, is_default_registry, nodes_block, parse_node_line,
-    registry_base, registry_segment, render_entry_line, render_tuple_with_slots, sniff_lock,
-    split_dep_id, split_lines, DepIdEra, DepIdKind, LockSniff,
+    registry_base, render_entry_line, render_tuple_with_slots, sniff_lock, split_dep_id,
+    split_lines, DepIdEra, DepIdKind, LockSniff,
 };
 
 /// One hosted node line to restore.
@@ -56,7 +59,6 @@ fn records_url(
     siblings: &[(DepIdEra, bool)],
     options: Option<&Map<String, Value>>,
 ) -> bool {
-    let segment = registry_segment(era, segment);
     let same_era: Vec<bool> = siblings
         .iter()
         .filter(|(e, _)| *e == era)
@@ -175,8 +177,7 @@ pub(crate) async fn restore(
             let hosted = slot3.as_deref().and_then(|u| ctx.hosted_uuid(u));
             let Some(uuid) = hosted else {
                 if let Some(dep_id) = dep_id.filter(|d| {
-                    d.kind == DepIdKind::Registry
-                        && is_default_registry(registry_segment(d.era, &d.first), options)
+                    d.kind == DepIdKind::Registry && is_default_registry(&d.first, options)
                 }) {
                     siblings.push((dep_id.era, slot3.is_some()));
                 }
@@ -208,7 +209,7 @@ pub(crate) async fn restore(
                 );
                 continue;
             };
-            if !is_default_registry(registry_segment(dep_id.era, &dep_id.first), options) {
+            if !is_default_registry(&dep_id.first, options) {
                 result.refuse(
                     &uuid,
                     format!(
@@ -540,8 +541,8 @@ mod tests {
             let (outcome, after) =
                 run(&text, &[pin("pkg:npm/left-pad@1.3.0", LP_UUID)], false).await;
             let opts = opts(options);
-            if is_default_registry(registry_segment(*era, segment), Some(&opts)) {
-                let want = want.expect("a default registry always has a base");
+            let admitted = is_default_registry(segment, Some(&opts));
+            if let (true, Some(want)) = (admitted, *want) {
                 assert!(
                     refused(&outcome).is_empty(),
                     "{segment:?} {options}: {:?}",
@@ -553,10 +554,12 @@ mod tests {
                 assert!(after.contains(&upstream), "{segment:?} {options}: {after}");
             } else {
                 let why = refused(&outcome);
-                assert!(
-                    why[0].contains("not on vlt's default registry"),
-                    "{segment:?} {options}: {why:?}"
-                );
+                let reason = if admitted {
+                    "maps no registry"
+                } else {
+                    "not on vlt's default registry"
+                };
+                assert!(why[0].contains(reason), "{segment:?} {options}: {why:?}");
                 assert_eq!(after, text);
             }
         }
@@ -565,7 +568,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn restore_empty_tilde_resolution_and_sibling_admission() {
+    async fn restore_empty_tilde_resolution_and_raw_sibling_convention() {
         let server = registry(&[("left-pad", "1.3.0", Some(LP_UPSTREAM))]).await;
         std::env::set_var("SOCKET_NPM_REGISTRY", server.uri());
         let url = hosted(LP_UUID, "left-pad-1.3.0.tgz");
@@ -574,21 +577,21 @@ mod tests {
                 "",
                 r#"{"registry":"https://a.example/","registries":{"npm":"https://b.example/"}}"#,
                 "",
-                "https://b.example/",
+                Some("https://b.example/"),
             ),
             (
                 "npm",
                 r#"{"registry":"https://a.example/","registries":{"npm":"https://b.example/"}}"#,
                 "",
-                "https://b.example/",
+                Some("https://b.example/"),
             ),
             (
                 "corp",
                 r#"{"default-registry-alias":"corp","registries":{"npm":"https://b.example/","corp":"https://c.example/"}}"#,
-                // Empty tilde means npm, which is foreign here. Its lack
-                // of slot 3 must not determine the corp node's convention.
+                // Keep forward rewrite's raw-empty admission policy when
+                // choosing siblings, so its 3-tuple convention is retained.
                 ",\n    \"~~ms@2.1.3\": [0,\"ms\",\"sha512-M==\"]",
-                "https://c.example/",
+                None,
             ),
         ] {
             let key = format!("~{segment}~left-pad@1.3.0");
@@ -599,16 +602,61 @@ mod tests {
                 run(&text, &[pin("pkg:npm/left-pad@1.3.0", LP_UUID)], false).await;
             assert!(refused(&outcome).is_empty(), "{:?}", refused(&outcome));
             let after: Value = serde_json::from_str(&after).unwrap();
-            assert_eq!(
-                after["nodes"][&key],
-                serde_json::json!([
+            let expected = match base {
+                Some(base) => serde_json::json!([
                     0,
                     "left-pad",
                     LP_UPSTREAM,
                     format!("{base}left-pad/-/left-pad-1.3.0.tgz")
                 ]),
-                "{segment:?} {options}"
+                None => serde_json::json!([0, "left-pad", LP_UPSTREAM]),
+            };
+            assert_eq!(after["nodes"][&key], expected, "{segment:?} {options}");
+        }
+        std::env::remove_var("SOCKET_NPM_REGISTRY");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rewritten_empty_tilde_under_custom_alias_restores_byte_for_byte() {
+        use crate::patch::redirect::{DepOverride, RewriteResult};
+
+        let server = registry(&[("left-pad", "1.3.0", Some(LP_UPSTREAM))]).await;
+        std::env::set_var("SOCKET_NPM_REGISTRY", server.uri());
+        let url = hosted(LP_UUID, "left-pad-1.3.0.tgz");
+        let dep: DepOverride = serde_json::from_value(serde_json::json!({
+            "ecosystem": "npm",
+            "name": "left-pad",
+            "version": "1.3.0",
+            "token": "t",
+            "patchUuid": LP_UUID,
+            "artifactUrl": url,
+            "integrity": { "sha512": "sha512-PATCHED==" },
+        }))
+        .unwrap();
+        for sibling in [
+            "",
+            ",\n    \"~~ms@2.1.3\": [0,\"ms\",\"sha512-M==\",\"https://b.example/ms/-/ms-2.1.3.tgz\"]",
+        ] {
+            let original = format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{\"default-registry-alias\":\"corp\",\"registry\":\"https://a.example/\",\"registries\":{{\"corp\":\"https://a.example/\",\"npm\":\"https://b.example/\"}}}},\n  \"nodes\": {{\n    \"~~left-pad@1.3.0\": [0,\"left-pad\",\"{LP_UPSTREAM}\",\"https://b.example/left-pad/-/left-pad-1.3.0.tgz\"]{sibling}\n  }},\n  \"edges\": {{}}\n}}\n"
             );
+            let files = [("vlt-lock.json".to_string(), original.clone())]
+                .into_iter()
+                .collect();
+            let mut rewritten = RewriteResult::default();
+            crate::patch::redirect::vlt::rewrite_vlt_lock(
+                &files,
+                std::slice::from_ref(&dep),
+                false,
+                &mut rewritten,
+            );
+            let pinned = rewritten.files.get("vlt-lock.json").expect("forward rewrite admits the raw empty segment");
+            assert!(pinned.contains(&url), "{pinned}");
+            let (outcome, restored) =
+                run(pinned, &[pin("pkg:npm/left-pad@1.3.0", LP_UUID)], false).await;
+            assert!(refused(&outcome).is_empty(), "{:?}", refused(&outcome));
+            assert_eq!(restored, original);
         }
         std::env::remove_var("SOCKET_NPM_REGISTRY");
     }
