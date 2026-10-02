@@ -12285,6 +12285,59 @@ mod tests {
     /// that entry would report (and VEX-attest) a patch `npm ci` never
     /// installs. It must be skipped loudly, like a bundled copy.
     #[test]
+    fn issue_490_unclear_overrides_leave_a_url_dependency_unredirected() {
+        // The review probes: npm keeps the URL spec for a `*` override, and
+        // picks the narrower rule under a range selector, so `npm ci` still
+        // fetches the URL. The rewriter must skip the entry loudly.
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0", "dependencies": { "pkga": "^1.0.0" } },
+                "node_modules/pkga": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/pkga/-/pkga-1.0.0.tgz",
+                    "dependencies": { "left-pad": url }
+                },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": url,
+                    "integrity": "sha512-UPSTREAM=="
+                }
+            }
+        });
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        for manifest_overrides in [
+            json!({ "left-pad": "*" }),
+            json!({ "left-pad": "1.3.0", "pkga@^1": { "left-pad": url } }),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "package-lock.json".to_string(),
+                serde_json::to_string_pretty(&lock).unwrap(),
+            );
+            files.insert(
+                "package.json".to_string(),
+                json!({ "name": "app", "dependencies": { "pkga": "^1.0.0" }, "overrides": manifest_overrides })
+                    .to_string(),
+            );
+            let r = rewrite_registry_redirect(&files, &overrides);
+            assert!(r.files.is_empty(), "{manifest_overrides}: {:?}", r.edits);
+            assert!(
+                warning_codes(&r).contains(&"redirect_npm_non_registry_entry_skipped"),
+                "{manifest_overrides}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    #[test]
     fn issue_490_a_git_edge_overridden_to_the_registry_is_redirected() {
         // `pkga` depends on left-pad from git; the project's `overrides`
         // send it to the registry release, which is what npm installs.

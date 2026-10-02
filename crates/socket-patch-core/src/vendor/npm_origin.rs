@@ -98,8 +98,14 @@ impl NpmOverrides {
     /// the dependent or one of its physical ancestors (outermost first),
     /// with no selector or that package's exact version. As in npm, the
     /// rule scoped to the closest ancestor wins (then the most deeply
-    /// nested one). Two equally close rules that disagree make the answer
-    /// unclear, and so does a version-range selector: neither applies.
+    /// nested one), and a winning `*` or empty value is a no-op that leaves
+    /// the dependent's own spec in effect.
+    ///
+    /// Anything this can't decide exactly makes the answer unclear, and
+    /// then no override applies: two equally close rules that disagree, a
+    /// target selector other than `spec`, or an enclosing selector that is
+    /// a range (it may match the ancestor, so a rule beneath it may be the
+    /// one npm picks).
     fn replacement(
         &self,
         packages: &Map<String, Value>,
@@ -111,9 +117,15 @@ impl NpmOverrides {
             return None;
         }
         let chain = dependent_chain(packages, from);
-        let mut best: Option<BestRule> = None;
-        self.visit(&self.rules, &chain, 0, 0, dep_name, spec, &mut best);
-        best.filter(|b| !b.contested).map(|b| b.value)
+        let mut search = RuleSearch::default();
+        self.visit(&self.rules, &chain, 0, 0, dep_name, spec, &mut search);
+        if search.unclear {
+            return None;
+        }
+        let best = search.best.filter(|b| !b.contested)?;
+        // npm ignores a `*` (or empty) replacement: the raw spec stays.
+        let value = best.value.trim();
+        (!value.is_empty() && value != "*").then(|| best.value)
     }
 
     /// Search `rules` (nested `depth` levels deep; the enclosing rules
@@ -127,7 +139,7 @@ impl NpmOverrides {
         depth: usize,
         dep_name: &str,
         spec: &str,
-        best: &mut Option<BestRule>,
+        search: &mut RuleSearch,
     ) {
         for (key, value) in rules {
             if key == "." {
@@ -135,24 +147,56 @@ impl NpmOverrides {
             }
             let (name, selector) = split_selector(key);
             // A rule for the edge's own package.
-            if name == dep_name && selector.is_none_or(|sel| sel == spec) {
-                if let Some(replacement) = self.rule_value(value) {
-                    BestRule::offer(best, (from_ix, depth), replacement);
+            if name == dep_name {
+                match selector {
+                    None => self.offer(value, (from_ix, depth), search),
+                    Some(sel) if sel == spec => self.offer(value, (from_ix, depth), search),
+                    // npm matches other selectors against the spec by
+                    // semver intersection, which isn't modelled here.
+                    Some(_) => search.unclear = true,
                 }
             }
             // A rule scoped to a package on the dependent's chain: every
             // matching ancestor, so the closest one is ranked too.
             if let Some(children) = value.as_object() {
                 for (ix, (anc_name, anc_version)) in chain.iter().enumerate().skip(from_ix) {
-                    let version_ok = match selector {
+                    if anc_name != name {
+                        continue;
+                    }
+                    let applies = match selector {
                         None => true,
-                        Some(sel) => anc_version.as_deref() == Some(sel),
+                        Some(sel) if anc_version.as_deref() == Some(sel) => true,
+                        // Another exact version: the rule can't apply.
+                        Some(sel) if is_exact_version(sel) && anc_version.is_some() => false,
+                        // A range (or an unknown ancestor version): it may
+                        // apply, so a rule for the edge beneath it may be
+                        // the one npm picks.
+                        Some(_) => {
+                            if mentions(children, dep_name) {
+                                search.unclear = true;
+                            }
+                            false
+                        }
                     };
-                    if anc_name == name && version_ok {
-                        self.visit(children, chain, ix + 1, depth + 1, dep_name, spec, best);
+                    if applies {
+                        self.visit(children, chain, ix + 1, depth + 1, dep_name, spec, search);
                     }
                 }
             }
+        }
+    }
+
+    /// Rank a rule for the edge; one whose value can't be resolved (a
+    /// `$name` the root doesn't declare, a non-string) makes it unclear.
+    fn offer(&self, value: &Value, rank: (usize, usize), search: &mut RuleSearch) {
+        match self.rule_value(value) {
+            Some(replacement) => BestRule::offer(&mut search.best, rank, replacement),
+            // An object with only nested rules overrides nothing itself,
+            // but still shadows a farther rule: a no-op, like `*`.
+            None if value.as_object().is_some_and(|o| !o.contains_key(".")) => {
+                BestRule::offer(&mut search.best, rank, String::new())
+            }
+            None => search.unclear = true,
         }
     }
 
@@ -169,6 +213,39 @@ impl NpmOverrides {
             None => Some(raw.to_string()),
         }
     }
+}
+
+/// What [`NpmOverrides::visit`] has found for one edge.
+#[derive(Debug, Default)]
+struct RuleSearch {
+    best: Option<BestRule>,
+    /// A rule that may apply couldn't be evaluated exactly.
+    unclear: bool,
+}
+
+/// Whether `rules` (at any depth) holds a rule keyed by `dep_name`.
+fn mentions(rules: &Map<String, Value>, dep_name: &str) -> bool {
+    rules.iter().any(|(key, value)| {
+        split_selector(key).0 == dep_name
+            || value
+                .as_object()
+                .is_some_and(|children| mentions(children, dep_name))
+    })
+}
+
+/// A plain `major.minor.patch` version, optionally with a prerelease or
+/// build suffix: never a range.
+fn is_exact_version(selector: &str) -> bool {
+    let core_end = selector.find(['-', '+']).unwrap_or(selector.len());
+    let (core, suffix) = selector.split_at(core_end);
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.'))
 }
 
 /// The winning override rule so far: ranked by how close its innermost
@@ -743,6 +820,100 @@ mod tests {
             })),
         );
         assert!(!found.contains_key("node_modules/left-pad"), "{found:?}");
+    }
+
+    #[test]
+    fn issue_490_wildcard_and_empty_overrides_leave_the_raw_spec() {
+        // npm ignores a `*` (or empty) replacement, so the dependent's URL
+        // or git spec stays in effect (npm 10.9.4 `edge.js`). Covered for a
+        // remote-tarball spec and a git spec, with `"."` objects too.
+        let url = REGISTRY_TGZ;
+        let url_lock = lock(json!({
+            "": { "dependencies": { "left-pad": url } },
+            "node_modules/left-pad": { "version": "1.3.0", "resolved": url }
+        }));
+        let git_lock = overridden_git_lock(REGISTRY_TGZ);
+        for value in [json!("*"), json!(""), json!(" * "), json!({ ".": "*" })] {
+            for (lock, label) in [(&url_lock, "url"), (&git_lock, "git")] {
+                let found =
+                    npm_non_registry_entries(lock, &manifest(json!({ "left-pad": value.clone() })));
+                assert!(
+                    found.contains_key("node_modules/left-pad"),
+                    "{label} / {value}: {found:?}"
+                );
+            }
+        }
+        // A closer no-op shadows a farther registry rule, as in npm.
+        let found = npm_non_registry_entries(
+            &git_lock,
+            &manifest(json!({ "left-pad": "1.3.0", "pkga": { "left-pad": "*" } })),
+        );
+        assert!(found.contains_key("node_modules/left-pad"), "{found:?}");
+        let found = npm_non_registry_entries(
+            &git_lock,
+            &manifest(json!({
+                "left-pad": "1.3.0",
+                "pkga": { "left-pad": { "nested": "1.0.0" } }
+            })),
+        );
+        assert!(found.contains_key("node_modules/left-pad"), "{found:?}");
+    }
+
+    #[test]
+    fn issue_490_range_selectors_that_may_apply_keep_the_edge() {
+        let lock = overridden_git_lock(REGISTRY_TGZ);
+        let tgz = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        for scoped in ["pkga@^1", "pkga@1.x", "pkga@>=1", "pkga@*", "pkga@1"] {
+            // npm picks the narrower rule under `pkga@^1` (here a URL) over
+            // the top-level registry rule, so the broader one can't clear
+            // the edge while the selector is unevaluated.
+            let found = npm_non_registry_entries(
+                &lock,
+                &manifest(json!({ "left-pad": "1.3.0", scoped: { "left-pad": tgz } })),
+            );
+            assert!(
+                found.contains_key("node_modules/left-pad"),
+                "{scoped}: {found:?}"
+            );
+        }
+        // A range selector whose subtree never names the dependency, and an
+        // exact selector for another version, don't block the clear.
+        for overrides in [
+            json!({ "left-pad": "1.3.0", "pkga@^1": { "other": "1.0.0" } }),
+            json!({ "left-pad": "1.3.0", "pkga@2.0.0": { "left-pad": tgz } }),
+        ] {
+            let found = npm_non_registry_entries(&lock, &manifest(overrides.clone()));
+            assert!(
+                !found.contains_key("node_modules/left-pad"),
+                "{overrides}: {found:?}"
+            );
+        }
+        // A target selector other than the edge's own spec is unclear too.
+        let found = npm_non_registry_entries(
+            &lock,
+            &manifest(json!({ "left-pad": "1.3.0", "left-pad@^1": "github:x/y" })),
+        );
+        assert!(found.contains_key("node_modules/left-pad"), "{found:?}");
+    }
+
+    #[test]
+    fn exact_versions_are_told_from_ranges() {
+        for exact in ["1.0.0", "10.2.33", "1.0.0-beta.1", "1.0.0+build.5"] {
+            assert!(is_exact_version(exact), "{exact}");
+        }
+        for range in [
+            "^1",
+            "1",
+            "1.x",
+            "1.0",
+            "~1.0.0",
+            ">=1.0.0",
+            "*",
+            "1.0.0 || 2.0.0",
+            "v1.0.0",
+        ] {
+            assert!(!is_exact_version(range), "{range}");
+        }
     }
 
     #[test]
