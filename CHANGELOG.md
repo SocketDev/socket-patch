@@ -111,6 +111,15 @@ limits, and required install commands.
   twin or a `BUNDLE_GEMFILE` setting (environment or `.bundle/config`) no longer
   leads to an edit of an ignored `Gemfile` that reports success and attests an
   unpatched gem; unsupported layouts are refused before any write (#341, #390).
+- Gem modes read Bundler settings in Bundler's own priority. A `BUNDLE_GEMFILE`
+  in `.bundle/config` now outranks the environment variable, so a dual-boot
+  project with an exported `BUNDLE_GEMFILE=Gemfile` is no longer wired through
+  the `Gemfile` Bundler ignores (#507). The hosted stale-install guard checks
+  the committed archive in Bundler's configured cache dir (`cache_path` /
+  `BUNDLE_CACHE_PATH`) instead of always `vendor/cache`, so a stale archive
+  there now warns and keeps the same run's VEX from attesting it (#483).
+  Both settings skip `.bundle/config` under `BUNDLE_IGNORE_CONFIG`, as Bundler
+  does.
 - **npm dependencies installed from git, a URL or `file:` are no longer
   reported patched.** npm installs such a dependency from the dependent's
   spec (`github:user/repo`, `https://…/x.tgz`, `file:…`) and ignores the
