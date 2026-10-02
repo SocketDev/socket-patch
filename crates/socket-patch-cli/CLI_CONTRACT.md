@@ -502,7 +502,11 @@ the model is **not uniform** today:
   **coexisting physical copies of one `gem@version`** (bundler-2's scoped store beside bundler-1's
   flat store), `apply`/`rollback` patch/restore **every copy** — one summary event per copy,
   mirroring npm's multi-copy fan-out — while single-representative consumers (`get`, `vendor`,
-  `vex`) use the highest-precedence copy.
+  `vex`) use the highest-precedence copy. PyPI follows the same rule: when the crawler resolves
+  one release in several site-packages dirs (a Pipenv WORKON_HOME venv beside an auto-detected
+  `./.venv`, or the user site beside a system dir in global scope), agent `apply` patches **every**
+  copy, one summary event per copy, because any of them may be the one the interpreter imports.
+  Paths that resolve to the same directory (a symlinked site-packages) count as one copy.
 
   *Copy classes (additive to the multi-copy vocabulary):* a copy under a **bundle-path store**
   (config/env/default root) is PRIMARY — a variant mismatch or write failure there fails the run,

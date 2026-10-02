@@ -627,6 +627,25 @@ pub(crate) fn variant_matches_installed(first_file_status: Option<&VerifyStatus>
     }
 }
 
+/// `paths` in order with every path that resolves to an already-listed
+/// directory dropped: two discovered site-packages paths can name ONE
+/// directory (a `lib64 -> lib` symlink, a symlinked venv), and patching it
+/// twice would report the second pass `already_patched`. A path that can't
+/// be canonicalized is kept as-is.
+async fn distinct_install_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let key = tokio::fs::canonicalize(path)
+            .await
+            .unwrap_or_else(|_| path.clone());
+        if seen.insert(key) {
+            out.push(path.clone());
+        }
+    }
+    out
+}
+
 /// The file whose verify status decides whether a release variant
 /// describes the installed distribution (fed to
 /// [`variant_matches_installed`]).
@@ -1881,22 +1900,31 @@ async fn apply_patches_inner(
                 continue;
             }
 
-            // Patch EVERY coexisting gem store copy (the npm multi-copy
-            // precedent): leaving the other store pristine is a silent
-            // false "applied" for whichever bundler loads it, and the
-            // per-copy results below make the JSON summary count each
-            // patched copy — the signal a second copy exists. PyPI/Maven
-            // keep the one-representative contract: their crawlers resolve
-            // one install dir per version, and a second path can only
-            // alias the same logical install (re-patching it would produce
-            // the spurious `already_patched` double-patch the nuget
-            // first-wins restoration fixed).
-            let copy_paths: &[PathBuf] =
-                if matches!(Ecosystem::from_purl(purl), Some(Ecosystem::Gem)) {
-                    pkg_paths.as_slice()
-                } else {
-                    std::slice::from_ref(pkg_path)
-                };
+            // Patch EVERY coexisting gem store copy and every PyPI
+            // site-packages copy (the npm multi-copy precedent): leaving
+            // the other copy pristine is a silent false "applied" for
+            // whichever bundler / interpreter loads it, and the per-copy
+            // results below make the JSON summary count each patched copy
+            // — the signal a second copy exists. The Python crawler
+            // resolves one release in several candidate envs when it
+            // can't tell which one the project's tool runs (a Pipenv
+            // WORKON_HOME venv beside `./.venv`, #529) or which one
+            // `sys.path` shadows (the user site beside a system dir in
+            // global scope, #501), and rollback already restores every
+            // copy. A PyPI path that only ALIASES another (a symlinked
+            // site-packages) is collapsed by canonical path, so one
+            // install is never patched twice. Maven keeps the
+            // one-representative contract: its crawler resolves one
+            // install dir per version.
+            let pypi_copies: Vec<PathBuf>;
+            let copy_paths: &[PathBuf] = match Ecosystem::from_purl(purl) {
+                Some(Ecosystem::Gem) => pkg_paths.as_slice(),
+                Some(Ecosystem::Pypi) => {
+                    pypi_copies = distinct_install_dirs(pkg_paths).await;
+                    pypi_copies.as_slice()
+                }
+                _ => std::slice::from_ref(pkg_path),
+            };
 
             // Copy CLASS decides FAILURE semantics (never write scope —
             // patching a shared home's vulnerable copy is fine when it
