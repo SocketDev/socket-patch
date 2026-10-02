@@ -216,11 +216,7 @@ async fn paths_scope_narrows_the_query() {
     let tmp = tempfile::tempdir().unwrap();
     write_two_subtree_project(tmp.path());
 
-    let (code, stdout, stderr) = run_scan(
-        tmp.path(),
-        &server.uri(),
-        &["packages/app", "--mode", "agent", "--dry-run"],
-    );
+    let (code, stdout, stderr) = run_scan(tmp.path(), &server.uri(), &["packages/app", "--mode", "agent", "--dry-run"]);
     assert_eq!(
         code, 0,
         "scoped scan must exit 0; stdout={stdout}; stderr={stderr}"
@@ -481,11 +477,7 @@ async fn supplements_excluded_with_warning() {
     // purl reaches the API.
     let scoped_server = MockServer::start().await;
     mock_batch_empty(&scoped_server).await;
-    let (code, stdout, stderr) = run_scan(
-        tmp.path(),
-        &scoped_server.uri(),
-        &["packages/app", "--mode", "agent", "--dry-run"],
-    );
+    let (code, stdout, stderr) = run_scan(tmp.path(), &scoped_server.uri(), &["packages/app", "--mode", "agent", "--dry-run"]);
     assert_eq!(
         code, 0,
         "scoped scan must exit 0; stdout={stdout}; stderr={stderr}"

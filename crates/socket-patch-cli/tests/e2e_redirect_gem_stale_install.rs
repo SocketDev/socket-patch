@@ -327,8 +327,7 @@ async fn gem_hosted_redirect_over_stale_install_warns_loudly() {
     );
     assert_eq!(code, 0, "human re-scan must succeed:\n{stderr}");
     assert!(
-        stderr.contains("Warning: ")
-            && stderr.contains("was switched to its hosted patch, but a stale"),
+        stderr.contains("Warning: ") && stderr.contains("was switched to its hosted patch, but a stale"),
         "human mode must print the stale-install warning on stderr:\n{stderr}"
     );
     assert!(

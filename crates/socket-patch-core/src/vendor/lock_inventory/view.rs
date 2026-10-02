@@ -15,10 +15,10 @@ use std::sync::Arc;
 use crate::constants::npm_family::{
     BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS, VLT_LOCK,
 };
-use crate::formats::pnpm::{sniff_lock_grammar, PnpmLockGrammar};
-use crate::formats::yarn::{sniff_grammar, YarnLockGrammar, UNIDENTIFIED_DETAIL};
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 use crate::vendor::npm_flavor::NpmLockFlavor;
+use crate::formats::pnpm::{sniff_lock_grammar, PnpmLockGrammar};
+use crate::formats::yarn::{sniff_grammar, YarnLockGrammar, UNIDENTIFIED_DETAIL};
 use crate::vendor::VendorWarning;
 
 /// One in-memory file.

@@ -35,17 +35,17 @@ use crate::ui::{self, plural, print_json, StatusLine};
 
 use super::get::{download_and_apply_patches_with, DownloadParams, DownloadRun};
 
-use self::policy::{load_invocation_policy, InvocationPolicy, PolicyLoadError, ScanPolicy};
 pub use self::socket_yml_args::{SocketYmlArgs, MIN_SEVERITY_ENV};
+use self::policy::{load_invocation_policy, InvocationPolicy, PolicyLoadError, ScanPolicy};
 
 mod discovery;
 mod gc;
 pub(crate) mod hosted;
 pub(crate) mod policy;
+mod socket_yml_args;
 pub(crate) mod render;
 pub(crate) mod rollout;
 pub mod rollout_args;
-mod socket_yml_args;
 pub(crate) mod vendor_flow;
 
 use self::discovery::{
@@ -65,12 +65,12 @@ use self::gc::gc_json;
 pub(crate) use self::hosted::boxed_run_redirect_selected;
 use self::hosted::run_redirect;
 pub(crate) use self::hosted::{vlt_rollback_heal, vlt_takeover_heal};
+pub(crate) use self::vendor_flow::{
+    boxed_vendor_step, preview_vendor_json, print_dry_run_refusals, VendorStep,
+};
 use self::vendor_flow::{
     boxed_vendor_interactive_path, boxed_vendor_json_path, fold_vendored_skips_into_apply,
     partition_skipped_selected,
-};
-pub(crate) use self::vendor_flow::{
-    boxed_vendor_step, preview_vendor_json, print_dry_run_refusals, VendorStep,
 };
 
 /// Packages per batch request on the authenticated API when `--batch-size`
@@ -318,7 +318,11 @@ pub struct ScanArgs {
     /// `requests`), or a purl with or without its version
     /// (`pkg:npm/lodash`, `pkg:pypi/requests@2.31.0`). Repeat the flag or
     /// separate with commas
-    #[arg(long = "package", env = "SOCKET_SCAN_PACKAGES", value_delimiter = ',')]
+    #[arg(
+        long = "package",
+        env = "SOCKET_SCAN_PACKAGES",
+        value_delimiter = ','
+    )]
     pub packages: Vec<String>,
 
     /// On a successful scan, also generate an OpenVEX 0.2.0 document.
@@ -496,10 +500,9 @@ async fn discover_selected(
     telemetry.flush().await;
     let error_count = failures.len();
     if error_count > 0 && error_count == packages.len() {
-        let err = failures.last().map_or_else(
-            || "all patch-detail queries failed".to_string(),
-            |(_, e)| e.clone(),
-        );
+        let err = failures
+            .last()
+            .map_or_else(|| "all patch-detail queries failed".to_string(), |(_, e)| e.clone());
         let message = format!("all {error_count} patch-detail queries failed: {err}");
         if detail_error_line {
             eprintln!("{}", render::fetch_details_failed(&failures));
@@ -565,11 +568,7 @@ fn classified_rows(
     packages: &[BatchPackagePatches],
     result: Option<&mut serde_json::Value>,
 ) -> Vec<rollout::Row> {
-    let failed: Vec<String> = discovered
-        .failed
-        .iter()
-        .map(|(purl, _)| purl.clone())
-        .collect();
+    let failed: Vec<String> = discovered.failed.iter().map(|(purl, _)| purl.clone()).collect();
     stage.incomplete = rollout::lookup_incomplete(&recorded.index, &failed, batch_failed);
     let rows = rollout::classify(&discovered.offers, &recorded.index, &stage.project);
     if let Some(result) = result {
@@ -1318,8 +1317,7 @@ fn project_dirs(cwd: &Path, paths: &[String]) -> Result<Vec<(PathBuf, bool)>, St
         let joined = cwd.join(raw);
         if raw.contains(['*', '?', '[']) {
             let pattern = joined.to_string_lossy().into_owned();
-            let matches =
-                glob::glob(&pattern).map_err(|e| format!("invalid path pattern `{raw}`: {e}"))?;
+            let matches = glob::glob(&pattern).map_err(|e| format!("invalid path pattern `{raw}`: {e}"))?;
             let before = dirs.len();
             dirs.extend(
                 matches
@@ -1392,10 +1390,7 @@ async fn run_project_dirs(
     }
     // One budget per invocation (§5.2): the directories spend it in sorted
     // order, and a package admitted in one is admitted free in the next.
-    let configured = match args
-        .rollout
-        .resolve_from_env(invocation.policy.max_new_patches())
-    {
+    let configured = match args.rollout.resolve_from_env(invocation.policy.max_new_patches()) {
         Ok(max) => max,
         Err(message) => {
             eprintln!("Error: {message}");
@@ -1496,10 +1491,7 @@ async fn run_scan(
     // error.
     let configured_cap = match args.rollout.carry.as_ref() {
         Some(carry) => carry.lock().configured,
-        None => match args
-            .rollout
-            .resolve_from_env(invocation.policy.max_new_patches())
-        {
+        None => match args.rollout.resolve_from_env(invocation.policy.max_new_patches()) {
             Ok(max) => max,
             Err(message) => {
                 eprintln!("Error: {message}");
@@ -1507,8 +1499,11 @@ async fn run_scan(
             }
         },
     };
-    let mut stage =
-        rollout::Stage::new(configured_cap, args.rollout.carry.clone(), &args.common.cwd);
+    let mut stage = rollout::Stage::new(
+        configured_cap,
+        args.rollout.carry.clone(),
+        &args.common.cwd,
+    );
 
     // Strict airgap (CLI_CONTRACT.md `--offline`): scan's patch discovery
     // is remote data, so refuse before the crawl and before the API client
@@ -1694,11 +1689,8 @@ async fn run_scan(
         .filter(|pkg| args.common.purl_ecosystem_selected(&pkg.purl))
         .collect();
 
-    let package_specs: Vec<&String> = args
-        .packages
-        .iter()
-        .filter(|s| !s.trim().is_empty())
-        .collect();
+    let package_specs: Vec<&String> =
+        args.packages.iter().filter(|s| !s.trim().is_empty()).collect();
     let filtered_crawled: Vec<_> = if package_specs.is_empty() {
         filtered_crawled
     } else {
@@ -1836,12 +1828,13 @@ async fn run_scan(
                 // `redirectState` rides the empty-discovery envelope too
                 // (same rule as the ≥1-package path). `wiringLive` is empty
                 // by construction: this run covered zero packages.
-                let redirect_state =
-                    (!args.common.is_global()).then_some(crate::commands::hosted_state_from_pins(
+                let redirect_state = (!args.common.is_global()).then_some(
+                    crate::commands::hosted_state_from_pins(
                         &socket_patch_core::patch::redirect::upstream::HostedPin::all(
                             ctx.discovery().await,
                         ),
-                    ));
+                    ),
+                );
                 if let Some(state) = redirect_state_json(redirect_state.as_ref(), &[]) {
                     result["redirectState"] = state;
                 }
@@ -2197,8 +2190,7 @@ async fn run_scan(
         // A report-only run selects nothing, but a severity floor or
         // `enabled: false` still hides candidates; report them like the
         // human arm does (the detail fetch runs only then).
-        if !apply && !vendor && policy.reports_selection() && !all_packages_with_patches.is_empty()
-        {
+        if !apply && !vendor && policy.reports_selection() && !all_packages_with_patches.is_empty() {
             if let Err((code, message)) = discover_selected(
                 &api_client,
                 &all_packages_with_patches,
@@ -2491,7 +2483,12 @@ async fn run_scan(
                     &all_packages_with_patches,
                     None,
                 );
-                updates = offer_updates(&rows, &discovered, &recorded, &all_packages_with_patches);
+                updates = offer_updates(
+                    &rows,
+                    &discovered,
+                    &recorded,
+                    &all_packages_with_patches,
+                );
                 rows
             }
             // `discover_selected` already printed the failure to stderr.
@@ -2953,20 +2950,14 @@ mod tests {
             dirs.iter()
                 .map(|(d, explicit)| {
                     (
-                        d.strip_prefix(tmp.path())
-                            .unwrap()
-                            .to_string_lossy()
-                            .replace('\\', "/"),
+                        d.strip_prefix(tmp.path()).unwrap().to_string_lossy().replace('\\', "/"),
                         *explicit,
                     )
                 })
                 .collect()
         };
-        let got = project_dirs(
-            tmp.path(),
-            &["apps/*".into(), "libs/core".into(), "apps/web".into()],
-        )
-        .unwrap();
+        let got = project_dirs(tmp.path(), &["apps/*".into(), "libs/core".into(), "apps/web".into()])
+            .unwrap();
         // Named literally = explicit (also when a glob matches it too).
         assert_eq!(
             rel(got),
