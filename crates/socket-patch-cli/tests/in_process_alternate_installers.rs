@@ -207,6 +207,70 @@ async fn yarn_install_then_apply_patches_file() {
     assert_patched(&ms_index, &patched, &before_hash, &after_hash);
 }
 
+/// REGRESSION (#493), real yarn classic: `.yarnrc` `--modules-folder deps`
+/// makes `yarn install` write `deps/` and no `node_modules`. Agent-mode
+/// apply must find and patch the package there. Yarn berry ignores
+/// `.yarnrc`, so the leg needs a 1.x `yarn` on PATH.
+#[tokio::test]
+#[serial]
+async fn yarn_classic_modules_folder_install_then_apply_patches_file() {
+    let classic = pm_command("yarn", &["npm_config_", "YARN_"])
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).starts_with("1."));
+    if !classic || !has("npm") {
+        println!("SKIP: yarn classic (1.x) or npm not on PATH");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{ "name": "yarn-mf-test", "version": "0.0.0", "dependencies": { "ms": "2.1.3" } }"#,
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join(".yarnrc"), "--modules-folder deps\n").unwrap();
+
+    let status = pm_command("yarn", &["npm_config_", "YARN_"])
+        .args(["install", "--silent", "--no-progress"])
+        .current_dir(tmp.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("yarn install");
+    if !status.status.success() {
+        println!(
+            "SKIP: yarn install failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        return;
+    }
+    let ms_index = tmp.path().join("deps/ms/index.js");
+    assert!(
+        ms_index.exists(),
+        "yarn install succeeded but deps/ms/index.js is missing at {ms_index:?}"
+    );
+    assert!(!tmp.path().join("node_modules").exists());
+
+    let original = std::fs::read(&ms_index).expect("read ms/index.js");
+    let before_hash = git_sha256(&original);
+    let mut patched = original.clone();
+    patched.extend_from_slice(b"\n// SOCKET-PATCH-YARN-MODULES-FOLDER-MARKER\n");
+    let after_hash = git_sha256(&patched);
+
+    let socket = tmp.path().join(".socket");
+    write_manifest(&socket, "pkg:npm/ms@2.1.3", &before_hash, &after_hash);
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&after_hash), &patched).unwrap();
+
+    let code = apply_run(default_apply(tmp.path())).await;
+    assert_eq!(code, 0, "apply must patch the yarn modules-folder install");
+    assert_patched(&ms_index, &patched, &before_hash, &after_hash);
+}
+
 // ---------------------------------------------------------------------------
 // pnpm install layout
 // ---------------------------------------------------------------------------
