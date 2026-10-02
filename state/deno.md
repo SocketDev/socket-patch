@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Deno bug-hunt routine (label pm:deno).
 
-Last updated: 2026-10-02 (run 7), main `61cfb9b`, latest release 4.0.0 (previous 3.3.0). Newest Deno is 2.9.7. Fix PR #496 for #373 passes against real layouts. Fix PR #517 for #516 misses Deno `_1` copies even with #496 (commented on #516).
+Last updated: 2026-10-02 (run 8), main `61cfb9b`, latest release 4.0.0 (previous 3.3.0). Newest Deno is 2.9.7. Fix PR #496 for #373 passes against real layouts. Fix PR #517 for #516 misses Deno `_1` copies even with #496 (commented on #516).
 
 Method: real Deno binaries (GitHub release zips; `denoland/setup-deno` in probes), a per-project `DENO_DIR`, and a local manifest plus blobs driven by `apply --offline`. The patched bytes record themselves in `globalThis.__SP`, so `deno run` shows which patched modules actually loaded. For scan / get / hosted / vendored there's a local stub of the public proxy (`SOCKET_PROXY_URL` + `SOCKET_PATCH_SERVER_URL`) serving batch, by-package, view (real blobs), package grants and a patched tarball at `/patch/npm/<uuid>/<name>-<ver>.tgz`. Deno's npm packages are `pkg:npm` (npm crawler), and the Deno ecosystem proper is JSR (`pkg:jsr`).
 
@@ -8,7 +8,7 @@ Method: real Deno binaries (GitHub release zips; `denoland/setup-deno` in probes
 
 | OS | Deno | Agent: direct npm dep (incl. scoped, alias, workspace member) | Agent: transitive npm dep (`node_modules/.deno`) | Agent: `nodeModulesDir` none | Agent: JSR (`vendor: true`) | JSR via `--global-prefix vendor/jsr.io` | vendored refusal | hosted / vendored (npm deps via package-lock.json) | VEX |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 1.46.3 | pass | fail #373 | known limitation | fail #374 | pass | untested | hosted fail #406 | pass (agent), fail #406 (hosted) |
+| Linux | 1.46.3 | pass | fail #373 | known limitation | fail #374 | pass | pass for `pkg:npm` (deno.lock v3 only: `vendor_lockfile_missing`, rc 1) | hosted fail #406 | pass (agent), fail #406 (hosted) |
 | Linux | 2.0.6 | pass (run 1) | fail #373 | known limitation | fail #374 | untested | untested | untested | untested |
 | Linux | 2.2.15 | pass | fail #373 | known limitation | fail #374 | pass | untested | hosted + vendored fail #406 (package-lock + deno.lock) | fail #406 |
 | Linux | 2.9.6 | pass | fail #373 (also `--prune` drops records) | known limitation | fail #374 | pass (scan + apply; unsafe with npm deps, see #374) | pass for `pkg:jsr` (`vendor_unsupported_ecosystem`) | hosted + vendored fail #406 | pass (agent), fail #406 (hosted) |
@@ -42,7 +42,7 @@ Method: real Deno binaries (GitHub release zips; `denoland/setup-deno` in probes
 | Linux | 2.7.0 → 2.9.7 (layout only) | — | — | — | per-tool dir from 2.7.0; decoy `node_modules` for local tools by 2.7.14 (#444 comment) | — | — | — |
 | Linux / macOS / Windows | 1.46.3, 2.0.6, 2.2.15, 2.4.5, 2.9.6 (probe) | Windows also #434 | fail #444 | fail #444 | 2.9.6 only: fail #444 | untested | 2.9.6 decoy: false `not_affected` | untested |
 
-Other passes (Linux): an immutable (`chattr +i`) target fails loudly (`apply_failed`, exit 1), `list --json`, re-apply idempotency, rollback, `remove`, breaking cache hardlinks, end-to-end `scan --mode agent` via the stub, unicode / space paths, and deno.lock v3 / v4 (2.2.15) / v5 never edited (`--frozen` still OK, patched copy loads).
+Other passes (Linux): interrupted `apply` (SIGKILL mid-run; the hardlinked `DENO_DIR` cache stays pristine and a re-run completes), concurrent `apply` / `rollback` (`lock_held`), an immutable (`chattr +i`) target fails loudly (`apply_failed`, exit 1), `list --json`, re-apply idempotency, rollback, `remove`, breaking cache hardlinks, end-to-end `scan --mode agent` via the stub, unicode / space paths, and deno.lock v3 / v4 (2.2.15) / v5 never edited (`--frozen` still OK, patched copy loads).
 
 ## Backlog
 
@@ -52,7 +52,7 @@ Other passes (Linux): an immutable (`chattr +i`) target fails loudly (`apply_fai
 3. When #517 merges, re-test the `.deno/<name>@<ver>_1` partial-revert VEX case. As of `0f45d24` + #496 it still attests `not_affected` (#516 comment).
 4. Probe macOS / Windows for the `.deno` `_1` / `_<base32>` folders (case-insensitive FS) once #496 lands.
 5. #406 follow-ups: pnpm-lock / yarn.lock / bun.lock beside deno.lock.
-6. Interrupted / concurrent `apply` on a hardlinked `.deno` store. Hoisted + `vendor: true` JSR is low value (it's just #374).
+6. Vendored refusal on Deno 2.0.6 / 2.2.15, and `nodeModulesDir: none` on macOS / Windows. Hoisted + `vendor: true` JSR is low value (it's just #374).
 
 ## Known non-bugs
 
@@ -75,3 +75,4 @@ Other passes (Linux): an immutable (`chattr +i`) target fails loudly (`apply_fai
 - Agent-mode VEX checking only the first of several copies of a `name@version` is a generic npm-family defect (`commands/vex.rs:556`), handed over to npm. Don't re-file it from Deno; comment on the npm issue instead.
 - Deno names a second peer resolution `.deno/<name>@<ver>_N` (copy index) and a mixed-case package `.deno/_<base32 hash>@<ver>` (in `$DENO_DIR` too). Those are real installs, not junk; #496 decodes both.
 - The duplicate `applied` + `already_patched` events for one PURL in an isolated Deno workspace come from the member `node_modules/<dep>` symlink reaching the same file. Cosmetic.
+- SIGKILL / SIGTERM during `apply` leaves one `.socket-stage-*` file in the package dir that later runs never remove. This is generic to the atomic writer, harmless (never loaded), and SIGINT exits cleanly.
