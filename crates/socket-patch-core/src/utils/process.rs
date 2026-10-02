@@ -76,6 +76,24 @@ pub(crate) fn resolve_tool_with(
     None
 }
 
+/// `name.exe` as a directory entry of any kind (an App Execution Alias is a
+/// reparse point `is_file` can't follow) on an ABSOLUTE `PATH` entry, or
+/// `None`. The Windows fallback when [`resolve_tool`] finds nothing; same
+/// relative-entry rule, so a project-local executable is never chosen.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn resolve_app_alias_with(
+    name: &str,
+    var: &impl Fn(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
+    let path = var("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(format!("{name}.exe")))
+        .find(|candidate| {
+            std::fs::symlink_metadata(candidate).is_ok_and(|meta| !meta.is_dir())
+        })
+}
+
 /// A plain file that cannot be executed (a stray `bun` data file on PATH)
 /// is skipped in favour of the next entry, like execvp does; Windows has no
 /// mode bits, PATHEXT is the executability rule there.
@@ -200,11 +218,13 @@ fn run_resolved(bin: &str, args: &[&str], cwd: Option<&Path>) -> Option<String> 
         match resolve_tool(bin) {
             Some(path) => path,
             // A Windows App Execution Alias (the Store `python3.exe` in
-            // WindowsApps) is a reparse point the file probe can't stat,
-            // but `std`'s own `.exe` search launches it; keep that path
-            // rather than lose a tool the bare spawn always found. `std`
-            // never searches the cwd on Windows.
-            None if cfg!(windows) => PathBuf::from(bin),
+            // WindowsApps) is a reparse point the file probe can't stat;
+            // look for it on absolute PATH entries only. Never hand the bare
+            // name back to `std`: its Windows search also walks relative
+            // PATH entries such as `.` (against the PARENT's cwd, before the
+            // child's `current_dir` applies), so a `yarn.exe` planted in the
+            // scanned project would run.
+            None if cfg!(windows) => resolve_app_alias_with(bin, &|var| std::env::var_os(var))?,
             None => return None,
         }
     };
@@ -398,6 +418,28 @@ mod tests {
 
     /// The name is honoured exactly: a `bunx` beside no `bun` is not `bun`,
     /// and a directory named `bun` is not a program.
+    /// The Windows App Execution Alias fallback takes the same absolute-only
+    /// rule as `resolve_tool`: a `yarn.exe` reached only through a relative
+    /// entry (`.`, the empty component, a bare dir name) is never chosen;
+    /// one on an absolute entry is.
+    #[test]
+    fn resolve_app_alias_skips_relative_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let safe = tmp.path().join("bin");
+        std::fs::create_dir_all(&safe).unwrap();
+        let relative = [PathBuf::from("."), PathBuf::from(""), PathBuf::from("planted")];
+
+        let only_relative = std::env::join_paths(&relative).unwrap();
+        let var = |name: &str| (name == "PATH").then(|| only_relative.clone());
+        assert_eq!(resolve_app_alias_with("yarn", &var), None);
+
+        std::fs::write(safe.join("yarn.exe"), b"").unwrap();
+        let with_safe =
+            std::env::join_paths(relative.iter().cloned().chain([safe.clone()])).unwrap();
+        let var = |name: &str| (name == "PATH").then(|| with_safe.clone());
+        assert_eq!(resolve_app_alias_with("yarn", &var), Some(safe.join("yarn.exe")));
+    }
+
     #[test]
     fn resolve_tool_matches_the_exact_leaf_only() {
         let tmp = tempfile::tempdir().unwrap();

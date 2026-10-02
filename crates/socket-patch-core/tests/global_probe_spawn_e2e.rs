@@ -233,6 +233,36 @@ fn global_probe_ignores_a_tool_planted_on_a_relative_path_entry() {
     );
 }
 
+/// #440 on Windows: with no safe `npm` installed and `.` on PATH, a real
+/// executable planted in the project as `npm.exe` must not run. The
+/// fallback for App Execution Aliases used to hand the bare name to `std`,
+/// whose Windows search walks relative PATH entries against the parent's
+/// cwd (the project), before the child's neutral `current_dir` applies.
+/// The plant is a copy of `cmd.exe`, which prints its banner and exits 0 on
+/// a null stdin, so running it would yield a "prefix".
+#[cfg(windows)]
+#[test]
+#[serial]
+fn global_probe_never_runs_an_executable_planted_in_the_project() {
+    let l = layout();
+    let system_root = std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows");
+    std::fs::copy(
+        PathBuf::from(system_root).join("System32").join("cmd.exe"),
+        l.proj.join("npm.exe"),
+    )
+    .unwrap();
+    let mut env = Env::new();
+    point_env_at(&mut env, &l);
+    env.set("PATH", Some(std::ffi::OsStr::new(".")));
+    env.chdir(&l.proj);
+
+    let prefix = get_npm_global_prefix();
+    assert!(
+        prefix.is_err(),
+        "the project's npm.exe must never be spawned; got {prefix:?}"
+    );
+}
+
 // ───────────────────────────────── RubyGems (#421) ─────────────────────────────────
 
 /// #421: `gem env gemdir` / `gem env gempath` are answered through the
