@@ -70,7 +70,7 @@ The question "which lockfile drives installs?" is also answered in **five places
 
 **The vendor driver skeleton is copied eight times.** npm_lock, pnpm, pnpm-legacy, yarn-berry, yarn-classic, bun_lock, bun_binary and vlt all repeat the same sequence:
 `guard_coordinates` → `read_project` → `stage_patch_pack` (×2) → `already_patched_result` → `write_marker_or_warn` → a literal `VendorEntry { … pdm: None, pipenv: None, poetry: None, uv: None, … }`.
-Each shares 55-67 distinct lines with `vendor_pnpm`. `read_project`, `preflight_package(s)` and `revert_*_opts` exist in 7-9 files each.
+Each shares 55-67 distinct lines with `vendor_pnpm`. `read_project`, `preflight_package(s)` and `revert_*_opts` exist in 7-9 files each. {{E12}}
 
 **Yarn berry project gates are written twice.**
 - cacheKey `10c0` appears as `SUPPORTED_CACHE_KEY` (`yarn_berry_lock.rs:89`) and as `YARN_BERRY_SUPPORTED_CACHE_KEY` (`redirect/mod.rs:3154`).

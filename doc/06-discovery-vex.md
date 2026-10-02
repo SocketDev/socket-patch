@@ -2,7 +2,7 @@
 
 ## Part 6: Discovery, inventory and VEX
 
-_Last checked against `main`: not yet re-checked; the content is as of `2463257`. Owner: `audit-ecosystems`._
+_Last checked against main @ 203e092 on 2026-10-02 by audit-ecosystems. Owner: `audit-ecosystems`._
 
 > Scope: `vex/**` (incl. `vex/discover/*`), `crawlers/**`, `formats/**`, `vendor/lock_inventory/*`, and the CLI consumers `vex.rs`, `vex_sources.rs`, `vex_consumed.rs`, `scan/discovery.rs`, `context.rs`, `list.rs`, `ecosystem_dispatch.rs`.
 
@@ -131,10 +131,10 @@ Across the repo that is **eight hand-rolled XML scanners**, 4–5 independent wa
   - a **fallback to global site-packages** when no venv exists.
 
   The open issues #327, #329, #334 and #384 are all this re-implementation diverging from the real tools. Asking the tool instead (`poetry env info -p`, `pipenv --venv`, `uv python find`) is cheaper and correct by construction.
-- **Cache crawls are not project-scoped.** In local mode, cargo, go, maven, nuget and deno enumerate the **entire machine cache** as soon as a marker file exists (`cargo_crawler.rs:144-190`, `go_crawler.rs:133-157`, `maven_crawler.rs:565-605`, `nuget_crawler.rs:37-90`). Scan then sends all of it to the API.
+- **Cache crawls are not project-scoped.** In local mode, cargo, go, maven, nuget and deno enumerate the **entire machine cache** as soon as a marker file exists (`cargo_crawler.rs:144-183`, `go_crawler.rs:133-158`, `maven_crawler.rs:565-607`, `nuget_crawler.rs:37-90`, `deno_crawler.rs:65-81`). Scan then sends all of it to the API. {{E05}}
   - Hosted mode can only act on lock entries, so the rest becomes "unconfirmed" noise.
   - For Maven and NuGet this crawl is the *only* discovery. Issue #265 ("Maven hosted scan pins, and VEX attests, artifacts the project doesn't depend on, because the crawler lists all of `~/.m2`") is this bug.
-- **FIFO safety.** Some crawler reads predate the FIFO-safe read discipline: `nuget_crawler.rs:506` and `python_crawler.rs:660` use plain `read_to_string` on project-tree files.
+- **FIFO safety.** Three project-tree reads predate the FIFO-safe read discipline and hang on a planted FIFO (verified by execution): `nuget_crawler.rs:506` (`obj/project.assets.json`) and the cargo `vendor/<crate>/Cargo.toml` reads at `cargo_crawler.rs:289` and `:401`. The Python `.venv` read is guarded by `is_file()`. {{E06}}
 
 **Are crawlers needed in hosted and vendored modes? Only as *locators*, not enumerators.**
 - **Vendored:** artifacts come from the service ("backends never construct an archive locally"); the installed tree is an "optional installed location used for identity and release-variant probes".

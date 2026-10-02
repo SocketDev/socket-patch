@@ -1,5 +1,5 @@
 ### Ecosystems and formats (`audit-ecosystems`)
-_Last updated 2026-10-02T19:30Z · main @ d63ae5f_
+_Last updated 2026-10-02T18:55Z · main @ 203e092_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -7,14 +7,14 @@ _Last updated 2026-10-02T19:30Z · main @ d63ae5f_
 | E02 | 1 | `bun.lockb` vendoring hard-codes `registry.npmjs.org` and ignores `SOCKET_NPM_REGISTRY`. The npm tarball URL is re-implemented in `lock_inventory/vlt.rs`, and there are two `NPM_REGISTRY` constants. | §1 #7; 4.4 | #562 | in PR #574; partly not a defect |
 | E03 | 1 | vlt `registry_base` has two implementations (`upstream/vlt.rs`, `lock_inventory/vlt.rs`) with different fallback orders and different unknown-alias behavior. | §1 #7; 4.4 | #562 | in PR #574 |
 | E04 | 1 | Pipenv hosted-URL recognition accepts any host (`pypi_pipenv.rs`), but `redirect` `hosted_patch_uuid` uses an origin allowlist. | 5.4 | #563 | in PR #572 |
-| E05 | 1 | Cache crawls aren't project-scoped: cargo, go, maven, nuget and deno enumerate the whole machine cache, and scan sends all of it to the API (#265). | 6.6 | | to verify |
-| E06 | 1 | Some crawler reads aren't FIFO-safe: `nuget_crawler.rs` and `python_crawler.rs` use a plain `read_to_string` on files in the project tree. | 6.6 | | to verify |
+| E05 | 1 | Cache crawls aren't project-scoped: cargo, go, maven, nuget and deno enumerate the whole machine cache, and scan sends all of it to the API (#265). | 6.6 | #595 | filed #595; tracking, children #427, #265 |
+| E06 | 1 | Some crawler reads aren't FIFO-safe: `nuget_crawler.rs` (`obj/project.assets.json`) and the cargo `vendor/<crate>/Cargo.toml` reads use a plain `read_to_string` on project-tree files. The Python `.venv` read is guarded. | 6.6 | #592 | filed #592 |
 | E07 | 2 | package-lock has four entry walks and three JSON re-serialization strategies (`redirect::serialize_json`, `common::serialize_json`, `JsonLayout`). Target: one `NpmLockDoc` model. #357 fixed part of this. | 4.4; 4.7 E | | to verify |
 | E08 | 2 | yarn has five `split("\n\n")` + regex grammars beside `scan_blocks`. Target: hosted yarn writers and restorers built on `LockBlock`. | 3.7 #3; 4.7 D | | to verify |
 | E09 | 2 | Yarn berry gates are written twice: the cacheKey constant, cacheKey extraction, and the mixed-EOL and `compressionLevel` refusals, which use different codes. #370 needs fixing twice. | 4.4 | | to verify |
 | E10 | 2 | XML has eight hand-rolled scanners and four attribute extractors with three tokenization rules. The writers (`nuget_feed.rs`, `maven_repo.rs`) never use the shared readers, so reader and writer can disagree. | 5.4 | | to verify |
-| E11 | 2 | NuGet config has three readers. Target: `formats::nuget::parse_config` everywhere. Fixing E01 is the first step. | 3.7 #3; 5.4 | | to verify |
-| E12 | 2 | pnpm v9 and legacy 5.4/6.0 are near-copies (`revert_*_opts`, `vendor_pnpm*`, `read_project`, `edit_overrides`, `dep_field_lines`, the KIND constant), and v9 has two lookup paths (a linear scan and `LockIndex`). | 4.4; 4.5 #4; 4.7 B/G | | to verify |
+| E11 | 2 | NuGet config has three readers. Target: `formats::nuget::parse_config` everywhere. Fixing E01 is the first step. | 3.7 #3; 5.4 | #594 | filed #594 |
+| E12 | 2 | pnpm v9 and legacy 5.4/6.0 are near-copies (`revert_*_opts`, `vendor_pnpm*`, `read_project`, `edit_overrides`, `dep_field_lines`, the KIND constant), and v9 has two lookup paths (a linear scan and `LockIndex`). | 4.4; 4.5 #4; 4.7 B/G | #583 | in PR #583 |
 | E13 | 2 | `utils/poetry_lock.rs` ≈ `utils/pdm_lock.rs`: the `*_lock_edits` functions are identical, and the `pair_*` functions differ by one shape check, which is a latent bug in one of them. | 5.4 | | to verify |
 | E14 | 2 | Pipfile.lock is written two ways: vendored mode re-serializes it, while hosted mode splices spans. | 5.4 | | to verify |
 | E15 | 2 | Cargo.toml has a line-based parser in `cargo_crawler.rs` even though the crate depends on `toml_edit`. `cargo_tag.rs` finds the version textually, and `plan_cargo_toml` uses a regex scanner and `toml_edit` in one rewriter. | 5.4; 3.7 #3 | | to verify |
@@ -52,6 +52,7 @@ _Last updated 2026-10-02T19:30Z · main @ d63ae5f_
 | E47 | 3 | Decide: support tiers for `bun.lockb` writes, vendored pnpm 7/8, vlt pre-1.0 encodings and hosted pnpm ≤ 6, and whether hosted JVM ships as beta. | §5; §6 Q3; 4.6 | | to verify |
 | E48 | 3 | Discovery re-implements package-manager layouts (venv-name hashing, global prefixes, the pnpm store). Target: ask the package manager (`poetry env info -p`, `pipenv --venv`, `npm query`, …). | 2.2 #2; 6.6 | | to verify |
 | E49 | 2 | Hosted Pipenv `owned_url` rejects path-prefixed `--patch-server-url` origins and sdists, so it refuses to rotate its own pin; there are four hosted-PyPI-URL grammars (`hosted_patch_uuid`, `hosted_artifact_url`, `owned_url`, `is_socket_hosted_reference`). | new finding | #563 | in PR #572 |
+| E50 | 2 | Hosted `rewrite_nuget` and upstream restore rewrite `packages.lock.json` entries of the patched id at other versions (every framework); vendored `locked_at` filters by version. Four lock walkers. | new finding | #593 | filed #593 |
 
 **Handed off:** none yet.
 

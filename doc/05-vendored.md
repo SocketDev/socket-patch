@@ -118,7 +118,7 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
   - `redirect/upstream/nuget.rs:39` uses a regex;
   - `jvm/gradle.rs:1538` checks for preceding whitespace;
   - `formats/nuget/mod.rs:41` does a real tag parse.
-- The writers (`nuget_feed.rs`, `maven_repo.rs`) never use the shared readers (`formats::nuget::parse_config`, `formats::maven::parse_pom`) that VEX and redirect use, **so reader and writer can disagree about what a file contains**.
+- The writers (`nuget_feed.rs`, `maven_repo.rs`) never use the shared readers (`formats::nuget::parse_config`, `formats::maven::parse_pom`) that VEX and redirect use, **so reader and writer can disagree about what a file contains**. {{E11}}
 - The Maven/Gradle share of the open backlog (22 of 88 issues, for example #259 "edits commented-out, plugin and profile markup", #342 "adds a second section when the existing one is self-closed or has a comment") is mostly this.
 
 **Python:**
