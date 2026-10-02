@@ -158,8 +158,12 @@ class GradleRows(unittest.TestCase):
         want = []
         for line, java in GRADLE_LINES.items():
             for suite, test_filter in (AGENT_HOSTED, VENDOR):
-                want.append({"os": "ubuntu-latest", "suite": suite, "jvm_tool": "gradle", "gradle": line,
-                             "java": java, "test_filter": test_filter, "allow_empty": "true"})
+                row = {"os": "ubuntu-latest", "suite": suite, "jvm_tool": "gradle", "gradle": line,
+                       "java": java, "test_filter": test_filter}
+                # The allowance lasts only while a suite of the row is unlanded.
+                if not all(bundle.landed(s) for s in suite.split()):
+                    row["allow_empty"] = "true"
+                want.append(row)
         want.append({"os": "windows-latest", "suite": "e2e_vendor_jvm_build", "jvm_tool": "gradle",
                      "gradle": "8.14.3", "java": "17", "test_filter": "--ignored gradle_multi_project"})
         self.assertEqual(len(gradle), 9)
