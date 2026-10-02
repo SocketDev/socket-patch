@@ -2336,6 +2336,60 @@ async fn find_by_purls_resolves_bundled_only_target_via_fallback_pass() {
     );
 }
 
+/// #601: a bundled copy inside ANOTHER package's store entry
+/// (`.vlt/~npm~bundler@1.0.0/node_modules/bundler/node_modules/left-pad`)
+/// is a physical copy the host loads, so it must be returned even when the
+/// same `name@version` is also installed normally. Pass 1's store filter
+/// drops the host's entry once the normal copy matched, and the unfiltered
+/// pass 2 only re-probes targets with no copy at all, so apply patched only
+/// the normal copy and vex attested it. Covers every pnpm-shaped store and
+/// vlt's, with the normal copy reached through an importer link and as a
+/// transitive-only store copy.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_returns_bundled_copy_of_an_already_found_target() {
+    for (store_name, normal_entry, host_entry) in [
+        (".pnpm", "left-pad@1.3.0", "bundler@1.0.0"),
+        (".vlt", "~npm~left-pad@1.3.0", "~npm~bundler@1.0.0"),
+        (".bun", "left-pad@1.3.0", "bundler@1.0.0"),
+        (".deno", "left-pad@1.3.0", "bundler@1.0.0"),
+    ] {
+        for importer_link in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let nm = root.join("node_modules");
+            let store = nm.join(store_name);
+
+            let normal_nm = store.join(normal_entry).join("node_modules");
+            stage_npm_pkg(&normal_nm, "left-pad", "1.3.0").await;
+            let host_nm = store.join(host_entry).join("node_modules");
+            stage_npm_pkg(&host_nm, "bundler", "1.0.0").await;
+            let bundled_nm = host_nm.join("bundler").join("node_modules");
+            stage_npm_pkg(&bundled_nm, "left-pad", "1.3.0").await;
+            std::os::unix::fs::symlink(host_nm.join("bundler"), nm.join("bundler")).unwrap();
+            let normal = if importer_link {
+                std::os::unix::fs::symlink(normal_nm.join("left-pad"), nm.join("left-pad"))
+                    .unwrap();
+                nm.join("left-pad")
+            } else {
+                normal_nm.join("left-pad")
+            };
+
+            let purl = "pkg:npm/left-pad@1.3.0".to_string();
+            let result = NpmCrawler
+                .find_by_purls(&nm, std::slice::from_ref(&purl))
+                .await
+                .unwrap();
+            let mut got: Vec<_> = result[&purl].iter().map(|p| p.path.clone()).collect();
+            got.sort();
+            let mut want = vec![normal, bundled_nm.join("left-pad")];
+            want.sort();
+            assert_eq!(got, want, "{store_name} importer_link={importer_link}");
+        }
+    }
+}
+
 // ── vlt store (.vlt), staged from captured real layouts ────────
 
 /// The eras with a captured `vlt install` layout under
