@@ -1170,13 +1170,17 @@ async fn vlt_pinned_matrix_vendored_resave_crlf_revert() {
 /// #541: the vendored dependency leaves the lock (`vlt install` of another
 /// release, or `vlt uninstall`). A plain vendored rescan skips the stale
 /// ledger entry with a `vendor_ledger_entry_unwired` warning instead of
-/// failing to re-vendor it; `--prune` reverts it and exits 0 (also when
-/// the project has no dependency left); the next run is clean.
+/// failing to re-vendor it; `--prune` reverts it and exits 0; the next run
+/// is clean. The ms bystander keeps a dependency in the project (the
+/// empty-crawl `--prune` path is covered by `scan_vendor_e2e`).
 async fn dependency_left_lock(name: &'static str, step: &'static str) {
     let Some(leg) = vendored_leg(name) else {
         return;
     };
-    let mut shape = Shape::left_pad();
+    if step == "uninstall" && removed_dependency_stays_locked(leg.version()) {
+        return leg.skip("removed-dependency-stays-locked");
+    }
+    let mut shape = Shape::with_bystander();
     shape.pins.push(LP_OLDER);
     let fx = Fixture::build(leg, shape).await;
     vendor_scan(&fx);
@@ -1187,6 +1191,17 @@ async fn dependency_left_lock(name: &'static str, step: &'static str) {
         }
         _ => {
             fx.vlt_ok(&fx.proj, &["uninstall", LP.0]);
+            // Should `vlt uninstall` leave the `file:` spec declared, drop
+            // it by hand and re-lock: the end state every other release
+            // reaches.
+            let pkg_path = fx.proj.join("package.json");
+            let mut pkg: Value =
+                serde_json::from_slice(&std::fs::read(&pkg_path).unwrap()).unwrap();
+            if pkg["dependencies"].get(LP.0).is_some() {
+                pkg["dependencies"].as_object_mut().unwrap().remove(LP.0);
+                std::fs::write(&pkg_path, serde_json::to_vec_pretty(&pkg).unwrap()).unwrap();
+                fx.vlt_ok(&fx.proj, &["install"]);
+            }
         }
     }
     let purl = format!("pkg:npm/{}@{}", LP.0, LP.1);

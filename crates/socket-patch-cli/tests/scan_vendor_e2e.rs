@@ -1244,6 +1244,65 @@ async fn scan_vendor_skips_ledger_entry_the_lock_no_longer_wires() {
     assert!(state["entries"][PURL].is_object(), "{state}");
 }
 
+/// #541 with no dependency left: the crawl is empty, so the manifest half
+/// of the GC is skipped, but a vendored `--prune` still runs the vendored
+/// half (it asks the lockfile, not the crawl) instead of skipping the
+/// reconcile forever. A plain rescan of the same project warns.
+#[tokio::test]
+async fn scan_vendor_prune_reconciles_unwired_entry_on_an_empty_crawl() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+
+    // `npm uninstall left-pad` of the only dependency.
+    let lock = serde_json::json!({
+        "name": "scan-vendor-test",
+        "version": "0.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": { "name": "scan-vendor-test", "version": "0.0.0" }
+        }
+    });
+    std::fs::write(
+        tmp.path().join("package-lock.json"),
+        serde_json::to_vec_pretty(&lock).unwrap(),
+    )
+    .unwrap();
+    std::fs::remove_dir_all(tmp.path().join("node_modules/left-pad")).unwrap();
+    let unwired = |v: &serde_json::Value| {
+        v["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|w| w["code"] == "vendor_ledger_entry_unwired")
+            .count()
+    };
+
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["scannedPackages"], 0, "envelope={v}");
+    assert_eq!(unwired(&v), 1, "envelope={v}");
+    assert!(v.get("gc").is_none(), "no --prune, no GC: {v}");
+
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--prune"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(unwired(&v), 0, "the pruning run reconciles instead: {v}");
+    // npm re-locked the entry away, so the wet revert drift-keeps it (see
+    // `scan_prune_reverts_unused_vendored_entry`): the point here is that
+    // the vendored GC ran at all on an empty crawl.
+    assert_eq!(
+        v["gc"]["keptVendoredEntries"],
+        serde_json::json!([PURL]),
+        "envelope={v}"
+    );
+}
+
 /// Interactive (non-JSON) `scan --vendor` pre-verifies patch baselines:
 /// installed content matching NEITHER hash is annotated before vendoring
 /// starts, and the run still vendors (auto-force) with the

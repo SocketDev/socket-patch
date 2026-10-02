@@ -177,6 +177,13 @@ pub fn npm_alias_to_public_npm(v: VltVersion) -> bool {
     (VltVersion::rc(30)..=VltVersion::rc(32)).contains(&v)
 }
 
+/// A dependency removed from package.json stays locked: `vlt uninstall`
+/// leaves a `file:` spec declared, and `vlt install` keeps the removed
+/// dependency's lock edge and node.
+pub fn removed_dependency_stays_locked(v: VltVersion) -> bool {
+    (VltVersion::zero(30)..=VltVersion::zero(32)).contains(&v)
+}
+
 /// A lockless install cannot resolve a `file:` directory dependency.
 pub fn lockless_file_dir_broken(v: VltVersion) -> bool {
     (VltVersion::zero(31)..LOCKLESS_FILE_DIR_FROM).contains(&v)

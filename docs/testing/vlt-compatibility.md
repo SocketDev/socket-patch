@@ -245,6 +245,7 @@ store-linker knob, `unset` when not given), `cache_root` and `upgrade`
 | A0 locks are refused by vendored mode | `<= 0.0.0-18` | — | migration | `*` | `a0-vendored-unsupported` |
 | A0 locks are refused by vendored mode | `<= 0.0.0-18` | — | production | `vendored_install_proof` | `a0-vendored-unsupported` |
 | the global store and `store-linker` | `< 1.2.0` | — | safety | `*` | `no-global-store` |
+| a dependency removed from package.json leaves the lock: `vlt uninstall` keeps a `file:` spec declared and `vlt install` keeps the removed dependency's edge and node, so the vendored node stays wired (socket-patch correctly keeps the entry) | `0.0.0-30 … 0.0.0-32` | — | vendored | `dependency_uninstalled_rescan` | `removed-dependency-stays-locked` |
 | `vlt install` needs Node >= 22.7.0, above `engines` (`>=22`): the CLI is ESM without `"type": "module"`, and Node detects module syntax unflagged only from 22.7.0 (22.6.0: `SyntaxError: Cannot use import statement outside a module`); `install-proof` runs 0.0.0-30 on 22.7.0 | `0.0.0-11 … 0.0.0-30` | — | — | — | — |
 | `vlt install` loads `node:sqlite`, unflagged from Node 22.13.0, above `engines` (`>=22` through rc.9, `>=22.9.0` for rc.10 … rc.18; 22.12.0: `ERR_UNKNOWN_BUILTIN_MODULE`); `install-proof` runs rc.18 on 22.13.0 | `0.0.0-31 … 1.0.0-rc.18` | — | — | — | — |
 | `vlt ci`, `--frozen-lockfile`, `--expect-lockfile` exist | `< 0.0.0-19` | — | hosted | `frozen_dead_registry`, `optional_dependency_heal`, `then_vendored_optional_takeover` | `no-vlt-ci` |
