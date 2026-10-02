@@ -1,0 +1,121 @@
+name: bughunt-nuget
+on:
+  push:
+    branches: ['bughunt/nuget/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        dotnet: ['8', '10']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: rustup show
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ matrix.dotnet }}.0.x
+      - name: Write probe files
+        shell: bash
+        run: |
+          src=crates/socket-patch-cli/tests/e2e_nuget_dotnet_build.rs
+          head -n $(($(grep -n '^// ── hosted ──' $src | cut -d: -f1)-1)) $src > crates/socket-patch-cli/tests/e2e_scratch_nuget.rs
+          cat >> crates/socket-patch-cli/tests/e2e_scratch_nuget.rs <<'RSEOF'
+          #[test]
+          #[ignore]
+          fn scratch_serve() {
+              let sb = Sandbox::new();
+              let dn = Dotnet::probe("scratch", &sb).unwrap();
+              let out = PathBuf::from(std::env::var("SCRATCH_OUT").unwrap());
+              std::fs::create_dir_all(&out).unwrap();
+              let fixture = sb.dir("fixture");
+              let store_fx = sb.dir("store-fixture");
+              let _ = restore_fixture(&dn, &sb, &fixture, &store_fx);
+              let pristine = std::fs::read(pkg_dir(&store_fx).join(FILE_KEY)).unwrap();
+              let mut patched = pristine.clone();
+              patched.extend_from_slice(MARKER);
+              let upstream = std::fs::read(pkg_dir(&store_fx).join(NUPKG_NAME)).unwrap();
+              let nupkg = patched_nupkg(&upstream, &patched);
+              let uuid = std::env::var("SCRATCH_UUID").unwrap_or(VENDORED_UUID.to_string());
+              let backend = Backend::start(&uuid, &pristine, &patched, Some(&nupkg));
+              std::fs::write(out.join("pristine"), &pristine).unwrap();
+              std::fs::write(out.join("patched"), &patched).unwrap();
+              std::fs::write(out.join("patched.nupkg"), &nupkg).unwrap();
+              std::fs::write(out.join("hash_patched"), content_hash(&nupkg)).unwrap();
+              std::fs::write(out.join("hash_upstream"), content_hash(&upstream)).unwrap();
+              std::fs::write(out.join("uri"), backend.uri()).unwrap();
+              if let Ok(script) = std::env::var("SCRATCH_SCRIPT") {
+                  let bash = std::env::var("SCRATCH_BASH").unwrap_or("bash".into());
+                  let st = Command::new(bash).arg(script)
+                      .env("SCRATCH_SP", binary()).env("SCRATCH_WORK", sb.root())
+                      .env("SCRATCH_MAJOR", dn.major.to_string())
+                      .status().unwrap();
+                  println!("probe script exit {st:?}");
+                  return;
+              }
+              while !out.join("stop").exists() {
+                  std::thread::sleep(std::time::Duration::from_millis(500));
+              }
+          }
+          RSEOF
+          mkdir -p "$RUNNER_TEMP/probe"
+          cat > "$RUNNER_TEMP/probe/probe.sh" <<'SHEOF'
+          #!/usr/bin/env bash
+          # Probe cells: (A) vendored + autocrlf checkout -> vendor --revert/remove; (B) #514 named lock.
+          set -u
+          up(){ if command -v cygpath >/dev/null 2>&1; then cygpath -u "$1"; else echo "$1"; fi; }
+          O="$(up "$SCRATCH_OUT")"; URI=$(cat "$O/uri"); SP="$(up "$SCRATCH_SP")"; W="$(up "$SCRATCH_WORK")"; MAJ="$SCRATCH_MAJOR"
+          wp(){ if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else echo "$1"; fi; }
+          export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 SOCKET_TELEMETRY_DISABLED=1 SOCKET_NO_CONFIG=1
+          export NUGET_HTTP_CACHE_PATH="$(wp "$W/httpcache")"
+          mkproj(){ rm -rf "$1"; mkdir -p "$1"; cd "$1"
+          printf '<Project Sdk="Microsoft.NET.Sdk">\n  <PropertyGroup>\n    <TargetFramework>net%s.0</TargetFramework>\n    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>\n    <NuGetAudit>false</NuGetAudit>\n  </PropertyGroup>\n  <ItemGroup>\n    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />\n  </ItemGroup>\n</Project>\n' "$MAJ" > app.csproj
+          printf '<?xml version="1.0" encoding="utf-8"?>\n<configuration>\n  <packageSources>\n    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />\n  </packageSources>\n</configuration>\n' > nuget.config
+          cp "$W/global.json" . 2>/dev/null || true; }
+          rst(){ local st="$1"; shift; NUGET_PACKAGES="$(wp "$st")" dotnet restore -p:NuGetAudit=false "$@" > "$W/r.log" 2>&1; local rc=$?; grep -E "error NU[0-9]+" "$W/r.log" | head -1; echo "restore $* rc=$rc"; }
+          chk(){ local f="$1/newtonsoft.json/13.0.3/LICENSE.md"; if cmp -s "$f" "$O/patched"; then echo "INSTALLED: PATCHED"; elif cmp -s "$f" "$O/pristine"; then echo "INSTALLED: PRISTINE"; else echo "INSTALLED: none"; fi; }
+          sp(){ NUGET_PACKAGES="$(wp "$STORE")" "$SP" "$@" --api-url "$URI" --org test-org --api-token fake-token; }
+          spn(){ NUGET_PACKAGES="$(wp "$STORE")" "$SP" "$@"; }
+          codes(){ grep -oE '"(errorCode|status|code)": *"[a-zA-Z_]*"' "$1" | tr '\n' ' '; echo; }
+          echo "### OS=${RUNNER_OS:-local} SDK=$(dotnet --version) git autocrlf(global/system)=$(git config --get core.autocrlf || echo unset)"
+          git config --global user.email a@b; git config --global user.name a
+          # (A)
+          STORE="$W/stA"; mkproj "$W/A"; rst "$STORE"
+          sp scan --mode vendored --vendor-source service --json --yes > "$W/A.scan.json" 2>/dev/null; echo "A scan rc=$?"; codes "$W/A.scan.json"
+          printf 'bin/\nobj/\n' > .gitignore; git init -q . && git add -A && git commit -qm v
+          for c in revert remove rollback rescan-revert; do
+            echo "--- A/$c"; cd "$W"; rm -rf "$W/A-$c"; git clone -q -c core.autocrlf=true "$W/A" "$W/A-$c"; cd "$W/A-$c"
+            file nuget.config | sed 's/.*: //'
+            rm -rf "$W/stA0"; rst "$W/stA0" --locked-mode; chk "$W/stA0"
+            case $c in
+              revert) spn vendor --revert --json;; remove) spn remove pkg:nuget/Newtonsoft.Json@13.0.3 --json;; rollback) spn rollback --json;;
+              rescan-revert) sp scan --mode vendored --vendor-source service --json --yes >/dev/null 2>&1; echo "rescan rc=$?"; spn vendor --revert --json;;
+            esac > "$W/A-$c.json" 2>/dev/null; echo "$c rc=$?"; codes "$W/A-$c.json"
+            echo "git status: $(git status --short | tr '\n' ' ')"; echo "socket-patch refs in nuget.config: $(grep -c socket-patch nuget.config)"
+            rm -rf obj "$W/stA1"; rst "$W/stA1" --locked-mode; chk "$W/stA1"
+          done
+          # (B) #514 named lock, vendored
+          echo "--- B named lock"; STORE="$W/stB"; mkproj "$W/B"; rst "$STORE"; mv packages.lock.json packages.app.lock.json; rm -rf obj; rst "$STORE" --locked-mode; ls packages*.json
+          sp scan --mode vendored --vendor-source service --json --yes > "$W/B.json" 2>/dev/null; echo "B scan rc=$?"; codes "$W/B.json"
+          mkdir -p "$W/B2"; cp -r app.csproj nuget.config packages.app.lock.json .socket "$W/B2/"; cd "$W/B2"; rm -rf "$W/stB2"; rst "$W/stB2" --locked-mode; chk "$W/stB2"; rm -rf obj; rst "$W/stB2"
+          # (B') custom NuGetLockFilePath
+          echo "--- B' NuGetLockFilePath"; STORE="$W/stC"; mkproj "$W/C"; sed -i.bak 's#<NuGetAudit>false</NuGetAudit>#<NuGetAudit>false</NuGetAudit>\n    <NuGetLockFilePath>locks/app.lock.json</NuGetLockFilePath>#' app.csproj; rm -f app.csproj.bak; rst "$STORE"; ls locks packages*.json 2>&1 | tr '\n' ' '; echo
+          sp scan --mode vendored --vendor-source service --json --yes > "$W/C.json" 2>/dev/null; echo "C scan rc=$?"; codes "$W/C.json"
+          mkdir -p "$W/C2"; cp -r app.csproj nuget.config locks .socket "$W/C2/"; cd "$W/C2"; rm -rf "$W/stC2"; rst "$W/stC2" --locked-mode; chk "$W/stC2"
+          echo "### done"
+          SHEOF
+      - name: Run probe
+        shell: bash
+        env:
+          SOCKET_PATCH_DOTNET_E2E_REQUIRED: '1'
+          SOCKET_PATCH_DOTNET_E2E_VERSION: ${{ matrix.dotnet }}
+        run: |
+          wp(){ if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else echo "$1"; fi; }
+          echo "system autocrlf: $(git config --system --get core.autocrlf || echo unset)"
+          mkdir -p "$RUNNER_TEMP/out"
+          export SCRATCH_OUT="$(wp "$RUNNER_TEMP/out")" SCRATCH_SCRIPT="$(wp "$RUNNER_TEMP/probe/probe.sh")" SCRATCH_BASH="$(wp "$(command -v bash)")"
+          cargo test --release -p socket-patch-cli --test e2e_scratch_nuget -- --ignored --nocapture 2>&1 | sed -n '/^running 1 test/,$p'
