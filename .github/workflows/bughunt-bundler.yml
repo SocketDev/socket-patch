@@ -1,0 +1,110 @@
+name: bughunt-bundler
+on:
+  push:
+    branches: ['bughunt/bundler/**']
+permissions:
+  contents: read
+jobs:
+  global:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        ruby: ['2.7', '3.3', '3.4']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: false
+          key: bughunt-${{ matrix.os }}
+      - uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Build CLI
+        run: cargo build --release -p socket-patch-cli
+      - name: Probe global mode
+        run: |
+          set +e
+          W="$RUNNER_TEMP/bh"; mkdir -p "$W/empty"; cd "$W"
+          BIN="$GITHUB_WORKSPACE/target/release/socket-patch"
+          R(){ echo "RESULT ${{ matrix.os }} ruby-${{ matrix.ruby }} $1=$2"; }
+          ruby -v; gem -v; bundle -v; which gem; ls "$(dirname "$(which gem)")" | grep -i '^gem' ; gem env gempath
+          gem install colorize -v 0.8.1 --no-document
+          gem install --user-install colorize -v 0.8.1 --no-document
+          SYS=$(ruby -e 'print File.join(Gem.dir,"gems","colorize-0.8.1","lib","colorize.rb")')
+          USR=$(ruby -e 'print File.join(Gem.user_dir,"gems","colorize-0.8.1","lib","colorize.rb")')
+          ruby -e 'p Gem.path'
+          echo "SYS=$SYS USR=$USR"; ls -la "$SYS" "$USR"
+          LOADED=$(ruby -e 'require "colorize"; print $LOADED_FEATURES.grep(/colorize\.rb/)[0]')
+          echo "LOADED=$LOADED"
+          cp "$SYS" before.rb; cp "$SYS" after.rb; echo '# SOCKET-PATCHED' >> after.rb
+          cat > mock.py <<'PY'
+          import json, sys, base64, hashlib, re
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from urllib.parse import unquote
+          UUID="11111111-2222-4333-8444-555555555555"; PURL="pkg:gem/colorize@0.8.1"
+          def gsha(b): return hashlib.sha256(b"blob %d\0"%len(b)+b).hexdigest()
+          B=open('before.rb','rb').read(); A=open('after.rb','rb').read()
+          VULN={"GHSA-aaaa-bbbb-cccc":{"cves":["CVE-2026-1111"],"summary":"s","severity":"high","description":"d"}}
+          class H(BaseHTTPRequestHandler):
+              def log_message(self,*a): pass
+              def send(self,c,o):
+                  b=json.dumps(o).encode(); self.send_response(c); self.send_header('content-type','application/json'); self.send_header('content-length',str(len(b))); self.end_headers(); self.wfile.write(b)
+              def do_POST(self):
+                  body=self.rfile.read(int(self.headers.get('content-length',0))).decode()
+                  if self.path.endswith('/patches/batch'):
+                      purls=[c['purl'] for c in json.loads(body).get('components',[])]
+                      pk=[{"purl":u,"patches":[{"uuid":UUID,"purl":PURL,"tier":"free","cveIds":["CVE-2026-1111"],"ghsaIds":["GHSA-aaaa-bbbb-cccc"],"severity":"high","title":"t"}]} for u in purls if u.split('?')[0]==PURL]
+                      return self.send(200,{"packages":pk,"canAccessPaidPatches":False})
+                  self.send(404,{})
+              def do_GET(self):
+                  if '/patches/view/' in self.path:
+                      return self.send(200,{"uuid":UUID,"purl":PURL,"publishedAt":"2026-01-01T00:00:00Z","files":{"package/lib/colorize.rb":{"beforeHash":gsha(B),"afterHash":gsha(A),"blobContent":base64.b64encode(A).decode(),"beforeBlobContent":base64.b64encode(B).decode()}},"vulnerabilities":VULN,"description":"x","license":"MIT","tier":"free"})
+                  if '/patches/by-' in self.path:
+                      return self.send(200,{"patches":[{"uuid":UUID,"purl":PURL,"publishedAt":"2026-01-01T00:00:00Z","description":"x","license":"MIT","tier":"free","vulnerabilities":VULN}],"canAccessPaidPatches":False})
+                  self.send(404,{})
+          ThreadingHTTPServer(('127.0.0.1',18999),H).serve_forever()
+          PY
+          python mock.py & sleep 3
+          sp(){ (cd "$W/empty" && SOCKET_NO_CONFIG=true "$BIN" "$@" --api-url http://127.0.0.1:18999 --api-token fake --org org --no-telemetry); }
+          has(){ grep -q 'SOCKET-PATCHED' "$1" && echo PATCHED || echo UNPATCHED; }
+          echo "::group::scan -g"; OUT=$(sp scan -g --ecosystems gem --json 2>&1); C=$?; echo "$OUT" | head -40; echo "::endgroup::"
+          R scan_g_exit $C; R scan_g_found_colorize $(echo "$OUT" | grep -c '"purl": "pkg:gem/colorize@0.8.1"')
+          OUT=$(SOCKET_GLOBAL=1 sp scan --ecosystems gem --json 2>&1); R socket_global_env_found $(echo "$OUT" | grep -c '"purl": "pkg:gem/colorize@0.8.1"')
+          GP=$(ruby -e 'print File.join(Gem.dir,"gems")'); OUT=$(sp scan --global-prefix "$GP" --ecosystems gem --json 2>&1); R prefix_gemsdir_found $(echo "$OUT" | grep -c '"purl": "pkg:gem/colorize@0.8.1"')
+          sp scan -g --mode hosted --ecosystems gem >/dev/null 2>&1; R scan_g_hosted_exit $?
+          echo "::group::get -g"; sp get -g 11111111-2222-4333-8444-555555555555 --yes 2>&1 | tail -8; R get_g_exit ${PIPESTATUS[0]}; echo "::endgroup::"
+          R after_get_sys $(has "$SYS"); R after_get_usr $(has "$USR"); R after_get_loaded $(has "$LOADED")
+          sp rollback -g --yes 2>&1 | tail -4; cmp -s "$SYS" before.rb && R rollback_sys bytes_exact || R rollback_sys DIFF; cmp -s "$USR" before.rb && R rollback_usr bytes_exact || R rollback_usr DIFF
+          sp get -g 11111111-2222-4333-8444-555555555555 --yes >/dev/null 2>&1
+          gem install --user-install colorize -v 0.8.1 --no-document >/dev/null 2>&1
+          R reinstall_user_loaded $(has "$LOADED"); R reinstall_user_sys $(has "$SYS")
+          echo "::group::vex -g"; sp vex -g --product pkg:gem/myapp@1.0.0 --output "$W/vex.json" 2>&1; VC=$?; echo "::endgroup::"
+          R vex_g_exit $VC; R vex_g_status "$(grep -o '"status": *"[a-z_]*"' "$W/vex.json" 2>/dev/null | head -1 | tr -d ' "' )"
+          echo "::group::bundler project, agent mode, system gems"
+          sp rollback -g --yes >/dev/null 2>&1; rm -rf "$W/empty/.socket"
+          gem uninstall --user-install -x colorize -v 0.8.1 >/dev/null 2>&1
+          P="$W/proj dir"; mkdir -p "$P"; cd "$P"
+          printf 'source "https://rubygems.org"\ngem "colorize", "0.8.1"\n' > Gemfile
+          bundle install 2>&1 | tail -3; R proj_bundle_install $?
+          PL=$(bundle exec ruby -e 'require "colorize"; print $LOADED_FEATURES.grep(/colorize\.rb/)[0]'); echo "PL=$PL"
+          psp(){ (cd "$P" && SOCKET_NO_CONFIG=true "$BIN" "$@" --api-url http://127.0.0.1:18999 --api-token fake --org org --no-telemetry); }
+          OUT=$(psp scan --json 2>&1); echo "$OUT" | head -30; R proj_scan_found $(echo "$OUT" | grep -c '"purl": "pkg:gem/colorize@0.8.1"')
+          psp get 11111111-2222-4333-8444-555555555555 --mode agent --yes 2>&1 | tail -6; R proj_get_exit ${PIPESTATUS[0]}
+          R proj_loaded_after_get $(has "$PL")
+          psp vex --product pkg:gem/myapp@1.0.0 --output "$W/pvex.json" 2>&1 | tail -3; R proj_vex_exit ${PIPESTATUS[0]}
+          R proj_vex_status "$(grep -o '"status": *"[a-z_]*"' "$W/pvex.json" 2>/dev/null | head -1 | tr -d ' "' )"
+          psp rollback --yes 2>&1 | tail -3; cmp -s "$PL" "$W/before.rb" && R proj_rollback bytes_exact || R proj_rollback DIFF
+          echo "::endgroup::"
+          echo ==== SUMMARY; true
