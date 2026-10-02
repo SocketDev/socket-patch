@@ -3275,6 +3275,32 @@ fn berry_cache_key(content: &str) -> Option<String> {
 /// compares the file with its own majority-normalized re-render and fails
 /// (YN0028), while a plain install rewrites every minority line — so it is
 /// refused untouched, `yarn install` normalizes it first.
+/// The grant prerequisite for creating a new yarn berry hosted pin: a dep
+/// whose grant carries no `yarnBerry10c0` cache checksum cannot be redirected
+/// (berry verifies the converted cache zip, and only the service can compute
+/// that checksum).
+///
+/// Exposed for the vendored→hosted mode takeover, like
+/// [`preflight_yarn_berry_hosted`]: vendored mode only uses the `tarball`
+/// artifact, so a vendorable patch can lack the berry checksum, and the
+/// takeover must keep such a package vendored instead of reverting it and
+/// then skipping the redirect.
+/// Keep this unconditional gate at the takeover boundary: a lock-aware
+/// rewriter may retain an already complete pin's stored checksum.
+pub fn preflight_yarn_berry_hosted_dep(dep: &DepOverride) -> Result<(), RewriteWarning> {
+    if dep.integrity.yarn_berry10c0.is_some() {
+        return Ok(());
+    }
+    Err(RewriteWarning {
+        code: "redirect_yarn_berry_missing_checksum".into(),
+        detail: format!(
+            "{}@{} has no yarnBerry10c0 cache checksum",
+            full_name(dep),
+            dep.version
+        ),
+    })
+}
+
 pub fn preflight_yarn_berry_hosted(lock: &str, yarnrc: Option<&str>) -> Result<(), RewriteWarning> {
     if !is_berry_lock(lock) {
         return Ok(());

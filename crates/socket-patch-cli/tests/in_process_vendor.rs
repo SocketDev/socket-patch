@@ -1031,6 +1031,13 @@ async fn berry_mixed_line_endings_fail_closed_with_code() {
 /// reference carrying the yarn-berry-zip checksum, the patch view) for the
 /// berry takeover legs. Returns the hosted tarball URL.
 async fn mount_berry_hosted_api(server: &wiremock::MockServer) -> String {
+    mount_berry_hosted_api_opts(server, true).await
+}
+
+/// [`mount_berry_hosted_api`], with the grant's `yarn-berry-zip` artifact
+/// (the `yarnBerry10c0` cache checksum) present or not. Vendored mode only
+/// uses the `tarball` artifact, so a vendorable grant can lack it.
+async fn mount_berry_hosted_api_opts(server: &wiremock::MockServer, berry_zip: bool) -> String {
     use wiremock::matchers::{method, path, path_regex};
     use wiremock::{Mock, ResponseTemplate};
     let org = "test-org";
@@ -1062,17 +1069,18 @@ async fn mount_berry_hosted_api(server: &wiremock::MockServer) -> String {
         })))
         .mount(server)
         .await;
+    let mut artifacts = vec![json!({ "kind": "tarball", "url": hosted_url,
+                                    "integrity": { "sha512": "sha512-unused-by-berry==" } })];
+    if berry_zip {
+        artifacts.push(json!({ "kind": "yarn-berry-zip", "url": hosted_url,
+            "integrity": { "yarnBerry10c0": format!("10c0/{}", "7".repeat(128)) } }));
+    }
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{org}/patches/package")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "results": { UUID: {
                 "status": "granted", "url": hosted_url, "purl": PURL,
-                "artifacts": [
-                    { "kind": "tarball", "url": hosted_url,
-                      "integrity": { "sha512": "sha512-unused-by-berry==" } },
-                    { "kind": "yarn-berry-zip", "url": hosted_url,
-                      "integrity": { "yarnBerry10c0": format!("10c0/{}", "7".repeat(128)) } }
-                ],
+                "artifacts": artifacts,
                 "registryOverride": null
             }}
         })))
@@ -1577,6 +1585,161 @@ async fn berry_takeovers_refuse_before_reverting_the_old_mode() {
                 assert!(
                     !text.contains(announced),
                     "{ctx}: no takeover ({announced}): {env:#}"
+                );
+            }
+            assert_eq!(
+                berry_wiring_snapshot(root),
+                before,
+                "{ctx}: the hosted lock edits stay byte-identical"
+            );
+        }
+    }
+}
+
+/// #468: a vendored→hosted takeover whose grant has no `yarnBerry10c0`
+/// cache checksum (vendored mode never needs it) must keep the package
+/// vendored. The berry rewriter skips such a dep with
+/// `redirect_yarn_berry_missing_checksum`; reverting the vendored wiring
+/// first left it patched in neither mode while the run exited 0 announcing
+/// "now fully hosted".
+#[tokio::test]
+async fn berry_vendored_to_hosted_takeover_keeps_vendored_without_berry_checksum() {
+    let server = wiremock::MockServer::start().await;
+    mount_berry_hosted_api_opts(&server, false).await;
+    let code = "redirect_yarn_berry_missing_checksum";
+    for dry in [true, false] {
+        let ctx = format!("dry={dry}");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        stage_berry_project(root, BERRY_WIN_PKG, &berry_win_lock());
+        let (exit, env) = vendor_cli(root, &[]);
+        assert_eq!(exit, 0, "{ctx}: vendor: {env:#}");
+        let before = berry_wiring_snapshot(root);
+        let extra: &[&str] = if dry { &["--dry-run"] } else { &[] };
+        let (_, env) = hosted_scan_cli_with(root, &server.uri(), extra);
+        let text = env.to_string();
+        assert!(text.contains(code), "{ctx}: refused with {code}: {env:#}");
+        for announced in [
+            "redirect_takeover_reverted_vendored",
+            "redirect_would_revert_vendored",
+        ] {
+            assert!(
+                !text.contains(announced),
+                "{ctx}: no takeover ({announced}): {env:#}"
+            );
+        }
+        assert_eq!(env["redirect"]["redirected"], 0, "{ctx}: {env:#}");
+        let skipped = env["redirect"]["skipped"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s["purl"] == PURL && s["reason"] == code),
+            "{ctx}: the purl is skipped with the gate's code: {env:#}"
+        );
+        assert_eq!(
+            berry_wiring_snapshot(root),
+            before,
+            "{ctx}: the vendored wiring, ledger and artifact stay byte-identical"
+        );
+    }
+}
+
+/// #369: a hosted→vendored takeover must run the berry backend's
+/// per-package gates (another locked version of the name, a user-authored
+/// `resolutions` override) BEFORE restoring the upstream registry entry.
+/// Restoring first left the package patched in neither mode: the hosted
+/// redirect was gone and vendoring then refused with
+/// `vendor_override_conflict`.
+#[tokio::test]
+async fn berry_hosted_to_vendored_takeover_runs_package_gates_first() {
+    let server = wiremock::MockServer::start().await;
+    mount_berry_hosted_api(&server).await;
+    // The upstream entry the takeover's restore reads: the gates are
+    // evaluated on the restored files, so the restore itself must succeed.
+    mount_npm_registry(
+        &server,
+        "left-pad",
+        "1.3.0",
+        npm_tgz("left-pad", "1.3.0", ORIG_INDEX),
+    )
+    .await;
+    type Break = fn(&Path);
+    // A workspace member's lock entry for another version of the name: a
+    // name-keyed `resolutions` entry would move it too.
+    let other_version: Break = |root| {
+        let lock = std::fs::read_to_string(root.join("yarn.lock")).unwrap();
+        let extra = format!(
+            "\n\"left-pad@npm:1.1.3\":\n  version: 1.1.3\n  \
+             resolution: \"left-pad@npm:1.1.3\"\n  checksum: 10c0/{}\n  \
+             languageName: node\n  linkType: hard\n",
+            "5".repeat(128)
+        );
+        std::fs::write(root.join("yarn.lock"), lock + &extra).unwrap();
+    };
+    // A user-authored range override for the name, merged into any
+    // `resolutions` table the hosted wiring already wrote.
+    let user_resolution: Break = |root| {
+        let pkg = std::fs::read_to_string(root.join("package.json")).unwrap();
+        let mut pkg: Value = serde_json::from_str(&pkg).unwrap();
+        let table = pkg
+            .as_object_mut()
+            .unwrap()
+            .entry("resolutions")
+            .or_insert_with(|| json!({}));
+        table
+            .as_object_mut()
+            .unwrap()
+            .insert("left-pad".into(), json!("^1.0.0"));
+        let text = serde_json::to_string_pretty(&pkg).unwrap() + "\n";
+        std::fs::write(root.join("package.json"), text).unwrap();
+    };
+    for (label, breakage) in [
+        ("other locked version", other_version),
+        ("user resolutions", user_resolution),
+    ] {
+        for dry in [true, false] {
+            let ctx = format!("{label} dry={dry}");
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            stage_berry_project(root, BERRY_WIN_PKG, &berry_win_lock());
+            let (exit, env) = hosted_scan_cli_with(root, &server.uri(), &[]);
+            assert_eq!(exit, 0, "{ctx}: hosted scan: {env:#}");
+            assert_eq!(env["redirect"]["redirected"], 1, "{ctx}: {env:#}");
+            breakage(root);
+            let before = berry_wiring_snapshot(root);
+            // The hosted pin's origin must count as the patch server, or
+            // the vendor run never sees it as a takeover.
+            let uri = server.uri();
+            let mut args = vec![
+                "vendor",
+                "--json",
+                "--cwd",
+                root.to_str().unwrap(),
+                "--patch-server-url",
+                &uri,
+            ];
+            if dry {
+                args.push("--dry-run");
+            }
+            let env = online_env(&uri, &uri);
+            let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let (exit, stdout, stderr) = run_cli(root, &args, &env);
+            let text = format!("{stdout}\n{stderr}");
+            assert_ne!(exit, 0, "{ctx}: the refusal fails the run: {text}");
+            assert!(
+                text.contains("vendor_override_conflict"),
+                "{ctx}: refused with the gate's code: {text}"
+            );
+            for announced in [
+                "vendor_takeover_reverted_redirect",
+                "vendor_would_revert_redirect",
+            ] {
+                assert!(
+                    !text.contains(announced),
+                    "{ctx}: no takeover ({announced}): {text}"
                 );
             }
             assert_eq!(

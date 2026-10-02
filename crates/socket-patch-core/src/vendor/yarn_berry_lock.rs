@@ -1103,6 +1103,64 @@ pub async fn yarn_berry_vendor_preflight(project_root: &Path) -> Option<(&'stati
         .and_then(into_pair)
 }
 
+/// The per-package twin of [`yarn_berry_vendor_preflight`] for the
+/// hosted→vendored takeover: the backend's `resolutions` conflict gate and
+/// its lock-entry gates for `purl` (another version of the name, a
+/// non-npm protocol, a mixed-descriptor or duplicate entry). Evaluated on
+/// the files as the takeover's restore of `pin` will leave them — a dry-run
+/// [`restore_upstream`] supplies the restored `package.json` / `yarn.lock`
+/// text, so hosted wiring socket-patch itself wrote (a lock rewrite, or a
+/// Socket-owned `resolutions` pin) is never mistaken for a user override.
+/// Returns `(code, detail)`, exactly the refusal the backend would raise
+/// after the restore; `None` when it would not refuse, when the restore
+/// itself would refuse (the takeover reports that), or when the files are
+/// unreadable (which the backend reports itself).
+///
+/// [`restore_upstream`]: crate::patch::redirect::upstream::restore_upstream
+pub async fn yarn_berry_vendor_target_preflight(
+    project_root: &Path,
+    purl: &str,
+    pin: &crate::patch::redirect::upstream::HostedPin,
+    opts: &crate::patch::redirect::upstream::RestoreOptions,
+) -> Option<(&'static str, String)> {
+    use super::npm_flavor::{detect_npm_lock_flavor, NpmLockFlavor};
+    use crate::patch::redirect::upstream::{restore_upstream, RestoreOptions};
+    if !matches!(
+        detect_npm_lock_flavor(project_root).await,
+        Ok((NpmLockFlavor::YarnBerry, _))
+    ) {
+        return None;
+    }
+    let (name, version) = super::npm_common::parse_npm_purl(purl)?;
+    let dry = RestoreOptions {
+        dry_run: true,
+        ..opts.clone()
+    };
+    let restore = restore_upstream(project_root, std::slice::from_ref(pin), &dry).await;
+    if restore.refused().next().is_some() {
+        return None;
+    }
+    let pkg_bytes = match restore.staged_text.get(PACKAGE_JSON) {
+        Some(Some(text)) => text.clone().into_bytes(),
+        Some(None) => return None,
+        None => read_regular_to_bytes(&project_root.join(PACKAGE_JSON))
+            .await
+            .ok()?,
+    };
+    let pkg = parse_json_manifest(&pkg_bytes).ok()?;
+    if let Err(outcome) = resolutions_gate(pkg.as_object()?, &name, &version) {
+        if let VendorOutcome::Refused { code, detail } = *outcome {
+            return Some((code, detail));
+        }
+    }
+    let lock_text = match restore.staged_text.get(YARN_LOCK) {
+        Some(Some(text)) => text.clone(),
+        Some(None) => return None,
+        None => read_yarn_lock(project_root).await.ok()?,
+    };
+    scan_berry_target(&scan_blocks(&lock_text), &name, &version).err()
+}
+
 /// Commit the pair in contract order — package.json first, yarn.lock second
 /// — unwinding package.json to its original bytes when the lock write fails
 /// (a resolutions entry without its lock counterpart would let a plain
