@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled NuGet / dotnet bug-hunt routine (label pm:nuget).
 
-Last run: 2026-10-02 11:44 UTC, main `61cfb9b`, release v4.0.0.
+Last run: 2026-10-02 17:42 UTC, main `6cd3754`, release v4.0.0.
 
 ## Coverage matrix
 
@@ -25,6 +25,8 @@ Vendored revert on a `core.autocrlf=true` checkout (`vendor --revert`, `remove`,
 
 Mode takeovers (Linux 8): hosted → vendored via `scan --mode vendored`: fail #553 (no takeover, purl case mismatch; autocrlf on and off; http and patch.socket.dev URLs). Via `vendor`: pass. `remove`/`rollback` with the mixed-case purl on a hosted project: fail #553. Vendored → hosted: no NuGet takeover by design (stays vendored, patched).
 
+Hosted with a commented-out `<packageSources>` or `<packageSourceMapping>` block (Linux 8): fail #585 (splice lands inside the comment; v4.0.0 too). Vendored with the same configs: pass. `get --mode vendored` over a hosted project: fail #553.
+
 Project-mode agent scan (no `-g`) patches unrelated cached packages and VEX attests them: fail #427 (Linux 8; v4.0.0 too).
 
 ### Global mode (`-g`)
@@ -43,15 +45,15 @@ Project-mode agent scan (no `-g`) patches unrelated cached packages and VEX atte
 | Windows | 9.0.x | pass | fail #426 | fail #397 | untested | fail #397 | untested | untested |
 | Windows | 10.0.x | pass | fail #426 | fail #397 | untested | fail #397 | untested | untested |
 
-`-g` run from inside a vendored project (`scan -g --mode agent` → `rollback -g`): Linux 8 fail #489 (vendored: regression from #446, `551c362`; hosted: pre-existing). macOS / Windows untested.
+`-g` run from inside a vendored project (`scan -g --mode agent` → `rollback -g`): Linux 8 fail #489 (vendored: regression from #446, `551c362`; hosted: pre-existing; still failing on `6cd3754`). macOS / Windows untested.
 
 Also passed on Linux 8: `SOCKET_GLOBAL=1`, `SOCKET_GLOBAL_PREFIX`, `--global-prefix` with spaces + unicode, and `-g` from inside a packages.config project (no leak).
 
 ## Backlog
 
-0. `get --mode vendored` over a hosted project (expect #553), and #553's case-sensitivity in `vendor --revert <purl>`, `--package`, `vex`.
-1. #489 on macOS / Windows and SDK 6/9/10. The probe harness from 2026-10-02 works for this: `scratch_serve` plus `SCRATCH_SCRIPT`, inlined through heredocs.
-2. #462 / #353 / #354 on macOS / Windows and SDK 6/9 (same harness).
+0. #553's case sensitivity in `vex --package`, `vendor --revert <Mixed.Case purl>` and `list`.
+1. #585 follow-ups: a real `<packageSourceMapping>` placed after a commented one (expect NU1403 with a lock), plus hosted revert after a hand-fixed config.
+2. #489 / #462 / #353 / #354 on macOS / Windows and SDK 6/9/10 (probe harness: `scratch_serve` + `SCRATCH_SCRIPT`; vendored legs now need `--vendor-source service --patch-server-url`). Local SDK installs are blocked (dotnet-install 403), so this needs a probe branch.
 3. Local tools (`dotnet-tools.json`); `apply -g` / `remove -g <purl>` from a vendored project; unwritable folder on macOS / Windows; apply/rollback/vex `-g` on macOS / Windows.
 4. Mapping edge cases: a prefix pattern on another source (expect pass), a case-variant exact id, and two Socket patches for different ids.
 5. Vendored/hosted with packages.config (windows-latest probe with nuget.exe).
@@ -77,3 +79,4 @@ Also passed on Linux 8 (no issue): vendored with a BOM + CRLF `NuGet.Config` (+ 
 - After a drift-path (excision) vendored revert, the `*`→nuget.org catch-all mapping that vendor created stays in `nuget.config`. That's intentional (`revert_config_record` doc) and harmless.
 - `vendor -g` / `vendor --revert -g` rewiring the cwd project is the generic #498, not NuGet-specific.
 - `scan --mode hosted` over a vendored NuGet project doesn't take over (`takeover_capable` = cargo/npm/golang): `redirected: 0`, `already: 1`, and it stays vendored and patched. Not a bug. On an autocrlf checkout, a later revert hits #537.
+- #486's shared-store guard (PDM cache, pnpm GVS) doesn't cover `~/.nuget/packages`. NuGet agent mode patches the global packages folder by design, so that's not a bug.
