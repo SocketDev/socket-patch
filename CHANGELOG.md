@@ -102,6 +102,11 @@ limits, and required install commands.
 
 ### Fixed
 
+- Agent-mode PyPI `apply` patches every installed copy of a release, not just
+  the first one found. A Pipenv project with both a WORKON_HOME venv and a
+  `./.venv`, or a global install with the same release in the user site and a
+  system dir, no longer keeps the copy Python imports unpatched while `vex`
+  attests it (#529, #501).
 - Gem hosted and vendored modes wire only the manifest Bundler loads. A `gems.rb`
   twin or a `BUNDLE_GEMFILE` setting (environment or `.bundle/config`) no longer
   leads to an edit of an ignored `Gemfile` that reports success and attests an
