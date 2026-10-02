@@ -144,6 +144,62 @@ class Run:
             return {}
 
 
+# A transport failure, never a functional one: Poetry/pip giving up on PyPI
+# (requests/urllib3 connection errors, "too many 503 error responses") or the
+# CLI's own report of a request error, a patch API 5xx, or a 429 its retry
+# loop gave up on.
+TRANSPORT_FAILURE = re.compile(
+    r"too many 5\d\d error responses|Max retries exceeded with url|"
+    r"NewConnectionError|ConnectTimeoutError|ReadTimeoutError|ProtocolError\(|"
+    r"raise ConnectionError\(|requests\.exceptions\.ConnectionError|ClosedPoolError|"
+    r"Temporary failure in name resolution|nodename nor servname provided|Connection reset by peer|RemoteDisconnected|"
+    r"error sending request for url \(|API request failed with status 5\d\d\b|Rate limit exceeded \(HTTP 429"
+)
+
+
+def has_transport_failure(case, payload):
+    """Whether a failed case's error text or any of its logs shows a transport failure."""
+    if TRANSPORT_FAILURE.search(json.dumps(payload)):
+        return True
+    logs = sorted(case.glob("*.log*")) if case.is_dir() else []
+    return any(TRANSPORT_FAILURE.search(log.read_text(errors="replace")) for log in logs if log.is_file())
+
+
+def retry_transport(run_case, job, case, root, attempts=3, sleep=time.sleep):
+    """("row"|"error", payload) for one case, re-run from a clean case dir while
+    it fails for transport reasons. A failed attempt's logs are kept under
+    <root>/attempts/<case>/<n>/ and listed on the final payload."""
+    history = []
+    for attempt in range(1, attempts + 1):
+        try:
+            kind, payload = "row", run_case(job)
+        except Exception as e:
+            version, shape, mode = job
+            kind, payload = "error", {"poetry": version, "shape": shape, "mode": mode, "error": str(e)[-3000:], "trace": traceback.format_exc()[-1500:]}
+        failed = kind == "error" or not payload.get("passed")
+        if not failed or attempt == attempts or not has_transport_failure(case, payload):
+            if history:
+                payload["transportRetries"] = history
+                if case.is_dir():
+                    save(case / "result.json", payload)
+            return kind, payload
+        evidence = root / "attempts" / case.name / str(attempt)
+        evidence.mkdir(parents=True, exist_ok=True)
+        for log in case.glob("*.log*") if case.is_dir() else []:
+            if log.is_file():
+                shutil.copy2(log, evidence / log.name)
+        history.append({"attempt": attempt, "evidence": evidence.relative_to(root).as_posix(), "error": (payload.get("error") or "")[-300:], "failedChecks": [k for k, ok in payload.get("checks", {}).items() if not ok]})
+        print(f"{case.name}: transport failure; retrying fresh case ({attempt}/{attempts})", flush=True)
+        sleep(10 * attempt)
+
+
+def failure_details(row):
+    """One line per failed check with the note it recorded, so a job log
+    shows why a case failed without downloading the capture artifact."""
+    info = row.get("info", {})
+    return [f"  {k}: {json.dumps(info[k], default=str)[:500]}" for k, ok in row.get("checks", {}).items() if not ok and k in info]
+
+
 def require(r, what):
     if not r.ok():
         raise RuntimeError(f"{what} failed (exit {r.rc}):\n{(r.out + r.err)[-4000:]}")
@@ -449,11 +505,15 @@ def main():
             return [poetry, "install", "-n", "--no-root", "--sync"]
         return None
 
+    def case_dir(job):
+        version, shape, mode = job
+        return root / "captures" / f"{version}-{shape}-{mode}"
+
     def backtest(job):
         version, shape, mode = job
         tool = root / "tools" / version
         poetry = tool / "bin/poetry"
-        case = root / "captures" / f"{version}-{shape}-{mode}"
+        case = case_dir(job)
         if case.exists():
             shutil.rmtree(case)
         case.mkdir(parents=True)
@@ -770,17 +830,20 @@ def main():
                     say("LOCK GENERATION FAILED", v, shape, str(e)[-800:])
                     errors.append({"poetry": v, "shape": shape, "error": "lock generation: " + str(e)[-1500:]})
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        pending = {pool.submit(backtest, job): job for job in jobs}
+        pending = {pool.submit(retry_transport, backtest, job, case_dir(job), root): job for job in jobs}
         for fut in concurrent.futures.as_completed(pending):
             job = pending[fut]
-            try:
-                row = fut.result()
-                results.append(row)
-                failed = [k for k, ok in row["checks"].items() if not ok]
-                say(*job, "PASS" if row["passed"] else "FAIL", ",".join(failed))
-            except Exception as e:
-                errors.append({"poetry": job[0], "shape": job[1], "mode": job[2], "error": str(e)[-3000:], "trace": traceback.format_exc()[-1500:]})
-                say(*job, "ERROR", str(e)[-300:].replace("\n", " "))
+            kind, payload = fut.result()
+            if kind == "row":
+                results.append(payload)
+                failed = [k for k, ok in payload["checks"].items() if not ok]
+                say(*job, "PASS" if payload["passed"] else "FAIL", ",".join(failed))
+                details = [] if payload["passed"] else failure_details(payload)
+                if details:
+                    say("\n".join(details))
+            else:
+                errors.append(payload)
+                say(*job, "ERROR", payload["error"][-300:].replace("\n", " "))
             save(root / "summary.json", {"provenance": provenance, "results": sorted(results, key=lambda r: (vtuple(r["poetry"]), r["shape"], r["mode"])), "errors": errors})
     summary = json.loads((root / "summary.json").read_text()) if (root / "summary.json").exists() else {"provenance": provenance, "results": results, "errors": errors}
     (root / "summary.md").write_text(render_table(summary))
