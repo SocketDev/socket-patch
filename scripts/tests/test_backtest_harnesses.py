@@ -244,9 +244,16 @@ class PoetryTransportRetryTests(unittest.TestCase):
                 poetry.shutil.rmtree(case)
             case.mkdir(parents=True)
             (case / "scan.log").write_text(outcome.get("log", ""))
+            operation = object.__new__(poetry.Run)
+            operation.cmd = ["poetry", "install"]
+            operation.rc = 0 if outcome.get("passed") else 1
+            operation.out = ""
+            operation.err = outcome.get("raise", outcome.get("log", ""))
             if "raise" in outcome:
-                raise RuntimeError(outcome["raise"])
-            return {"passed": outcome["passed"], "checks": {"appliedExactlyOne": outcome["passed"]}, "info": {}}
+                raise poetry.CommandFailure(operation, "fixture operation")
+            row = {"passed": outcome["passed"], "checks": {}, "info": {}}
+            poetry.record_check(row, "appliedExactlyOne", outcome["passed"], operation=operation)
+            return row
 
         sleeps = []
         kind, payload = poetry.retry_transport(run_case, self.JOB, case, root, sleep=sleeps.append)
@@ -263,7 +270,7 @@ class PoetryTransportRetryTests(unittest.TestCase):
             saved = json.loads((root / "captures/1.8.5-direct-hosted/result.json").read_text())
             self.assertEqual(saved["transportRetries"], payload["transportRetries"])
 
-    def test_cli_transport_errors_in_a_log_are_retried(self):
+    def test_required_cli_transport_errors_are_retried(self):
         for log in ("error sending request for url (https://patches-api.socket.dev/v0/orgs)",
                     "API request failed with status 502: bad gateway",
                     "Rate limit exceeded (HTTP 429, gave up after 3 retries). Please try again later."):
