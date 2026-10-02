@@ -1,16 +1,16 @@
 [agent] Progress ledger for the scheduled pip / requirements.txt bug-hunt routine (label pm:pip).
 
-Last run: 2026-10-02 (eighth run), main `61cfb9b`, latest release v4.0.0 (`96df6ae`). No new issues this run (grammar sweep 2, name normalisation, symlinks, `--prefix`, vex drift). #542 was filed in run seven.
+Last run: 2026-10-02 (ninth run), main `045d7ec`, latest release v4.0.0 (`96df6ae`). Filed #604 (lock-only PEP 440-equivalent pins). #328, #412, #475 and #523 were fixed on main (#503 / #530 / #478); #410 and #542 still reproduce.
 
 ## Coverage matrix
 
-| OS | pip / Python | agent (.venv) | agent egg-info | hosted (unhashed → fragment pin) | vendored | rollback / remove | vendored → hosted takeover | system-site venv | `-r` include, lock-only | PEP 440-equivalent pin (`==1.16`) | global `-g` (`--user`) | lock-only spaced pin (`six == X`) | hosted foreign direct ref (`six @ mirror`) |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 20.3.4 / py3.8, py3.11 | pass | pass (#447 fixed) | pass | pass | pass; all-hosted-pins fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | untested | fail #523 | untested (OS-independent) |
-| Linux | 23.x, 24.0 / py3.11, py3.12 | pass | n/a (dist-info) | pass | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | pass (report, hosted refusal, get / rollback / vex, `--global-prefix`, unwritable) | fail #523 (pip 24.0) | fail #542 (pip 24.0) |
-| Linux | 26.0, 26.2.1 / py3.11, py3.13 | pass | n/a | pass (+ uv 0.8 `pip install` / `pip sync`) | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | untested | fail #523 | untested (OS-independent) |
-| macOS | 20.3.4 / py3.8; 26.2.1 / py3.13 | pass | pass (py3.8) | pass | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | pass (`--user`) | fail #523 | untested (OS-independent) |
-| Windows | 20.3.4 / py3.8; 26.2.1 / py3.13 | pass (`Scripts/` + `Lib/`) | pass (py3.8) | pass | pass | pass; fail #410 | fail #328 | fail #409 | fail #412 | fail #475 | pass (`--user`, `%APPDATA%\Python`) | fail #523 | untested (OS-independent) |
+| OS | pip / Python | agent (.venv) | agent egg-info | hosted (unhashed → fragment pin) | vendored | rollback / remove | vendored → hosted takeover | system-site venv | `-r` include, lock-only | PEP 440-equivalent pin (`==1.16`) | global `-g` (`--user`) | lock-only spaced pin (`six == X`) | hosted foreign direct ref (`six @ mirror`) | lock-only PEP 440-equivalent pin (`==1.16`) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Linux | 20.3.4 / py3.8, py3.11 | pass | pass (#447 fixed) | pass | pass | pass; all-hosted-pins fail #410 | fixed on main #328 (re-verify) | fail #409 | fixed on main #412 (re-verify) | fixed on main #475 (re-verify) | untested | fixed on main #523 (re-verify) | untested (OS-independent) | untested (OS-independent) |
+| Linux | 23.x, 24.0 / py3.11, py3.12 | pass | n/a (dist-info) | pass | pass | pass; fail #410 | fixed on main #328 (re-verify) | fail #409 | fixed on main #412 (re-verify) | fixed on main #475 (re-verify) | pass (report, hosted refusal, get / rollback / vex, `--global-prefix`, unwritable) | fixed on main #523 (re-verify) | fail #542 (pip 24.0) | fail #604 (pip 24.0) |
+| Linux | 26.0, 26.2.1 / py3.11, py3.13 | pass | n/a | pass (+ uv 0.8 `pip install` / `pip sync`) | pass | pass; fail #410 | fixed on main #328 (re-verify) | fail #409 | fixed on main #412 (re-verify) | fixed on main #475 (re-verify) | untested | fixed on main #523 (re-verify) | untested (OS-independent) | untested (OS-independent) |
+| macOS | 20.3.4 / py3.8; 26.2.1 / py3.13 | pass | pass (py3.8) | pass | pass | pass; fail #410 | fixed on main #328 (re-verify) | fail #409 | fixed on main #412 (re-verify) | fixed on main #475 (re-verify) | pass (`--user`) | fixed on main #523 (re-verify) | untested (OS-independent) | untested (OS-independent) |
+| Windows | 20.3.4 / py3.8; 26.2.1 / py3.13 | pass (`Scripts/` + `Lib/`) | pass (py3.8) | pass | pass | pass; fail #410 | fixed on main #328 (re-verify) | fail #409 | fixed on main #412 (re-verify) | fixed on main #475 (re-verify) | pass (`--user`, `%APPDATA%\Python`) | fixed on main #523 (re-verify) | untested (OS-independent) | untested (OS-independent) |
 
 pip 20.3.4 on py3.13 is blocked (no `distutils`). `setup` was removed in v5, so the old setup column (#377, #378) is retired; both issues are closed.
 
@@ -19,10 +19,11 @@ Commands covered on Linux: scan (all modes), get (hosted, agent `-g`), rollback,
 ## Backlog
 
 0. **Open question for the maintainer:** `vex` attests a hosted pin (six@1.16.0) from the lockfile basis when the venv holds a different version (six 1.15.0), with no warning. The copy lookup is keyed by name@version, so the drifted copy reads as "not installed". Likely cross-ecosystem (see the 20261002T142728Z entry). Also the non-`-g` no-venv fallback to global site-packages (20261001T083942Z).
-1. Re-verify #542, #475 (after #478), #328 (after #503), #412 / #523 (after #530); then lock-only `vex` with spaced pins.
-2. Finish global (`-g`) mode: Homebrew / PEP 668 interpreters, the py launcher with several interpreters, pipx venvs (#418), non-root unwritable prefixes on CI.
-3. pip 26.x on the run-eight grammar sweep; a Windows / macOS probe for BOM + CRLF on the patched line.
-4. Re-verify #409 / #410 as fixes land.
+1. Re-verify #604, #542, #410 and #409 as fixes land. The fixed columns (#328, #412, #475, #523) were checked on Linux only (repo tests plus the venv cells); re-run them on pip 20.3.4 / 26.x.
+2. Rebuild the mock with `view` / `blob` routes; vendored lock-only PEP 440 pins; vendored → hosted takeover with real pip.
+3. pip 26.x / 20.3.4 grammar sweep against the #572 shared grammar.
+4. Finish global (`-g`) mode: Homebrew / PEP 668 interpreters, the py launcher with several interpreters, pipx venvs (#418), non-root unwritable prefixes on CI.
+5. A Windows / macOS probe for BOM + CRLF on the patched line.
 
 ## Known non-bugs
 
@@ -54,3 +55,4 @@ Commands covered on Linux: scan (all modes), get (hosted, agent `-g`), rollback,
 - A symlinked `requirements.txt` or a symlinked `-r` include is refused explicitly (`redirect_symlinked_file_unsupported` / `pypi_requirements_symlink_unsupported`), and so is an include outside the project root (vendored). Nothing is written.
 - Agent mode doesn't crawl `pip install --prefix <dir>` trees either (`[NOT INSTALLED]` + skip hint), same as `--target`.
 - With a mock origin, hosted `rollback` / `vex` need `SOCKET_PATCH_SERVER_URL` (or `--patch-server-url`) set to it; vendored needs the mock to serve sha512 integrity.
+- Lock-only cells need `VIRTUAL_ENV` pointing at an EMPTY venv: an empty `VIRTUAL_ENV=` falls back to the system dist-packages (Ubuntu's python3-six 1.16.0) and masks lock-only behaviour.
