@@ -397,6 +397,13 @@ async fn find_local_venv_site_packages_with(
         results.extend(matches);
     }
 
+    // 5. A PDM project with no recorded interpreter and no venv for PDM to
+    // pick (an activated one, `./.venv`) is a PEP 582 project (PDM 1.x's
+    // default): its packages live in `__pypackages__/<X.Y>/lib`.
+    if results.is_empty() && pdm_drives_project(cwd).await {
+        results = pdm_pep582_dirs(cwd).await;
+    }
+
     results
 }
 
@@ -424,25 +431,16 @@ async fn package_manager_recorded_site_packages(
     uv_project_environment_site_packages(cwd, var).await
 }
 
-/// PDM's env for `cwd` (see [`package_manager_recorded_site_packages`]).
-/// `PDM_PYTHON` outranks the saved interpreter, and
-/// `PDM_IGNORE_SAVED_PYTHON` makes PDM disregard the saved one.
+/// The env of PDM's interpreter for `cwd` (see
+/// [`package_manager_recorded_site_packages`]): `PDM_PYTHON`, else the saved
+/// one unless `PDM_IGNORE_SAVED_PYTHON`. With neither, PDM picks an active
+/// or project venv first, so the generic probes decide (PEP 582 is their
+/// last resort, see [`find_local_venv_site_packages_with`]).
 async fn pdm_project_site_packages(
     cwd: &Path,
     var: &impl Fn(&str) -> Option<String>,
 ) -> Option<Vec<PathBuf>> {
-    let pep582 = || async {
-        let found = find_python_dirs(&cwd.join("__pypackages__"), &["*", "lib"]).await;
-        (!found.is_empty()).then_some(found)
-    };
-    // `uv.lock` and `poetry.lock` drive installs ahead of `pdm.lock` (the
-    // hosted rewriters' precedence), so a leftover PDM record next to one
-    // is not where the project is installed.
-    if cwd.join("uv.lock").is_file() || cwd.join("poetry.lock").is_file() {
-        return None;
-    }
-    let pdm_project = cwd.join(".pdm-python").is_file() || is_pdm_project(cwd).await;
-    if !pdm_project {
+    if !pdm_drives_project(cwd).await {
         return None;
     }
     // `PDM_PYTHON` outranks the saved interpreter.
@@ -455,16 +453,27 @@ async fn pdm_project_site_packages(
         None if ignore_saved => None,
         None => pdm_saved_interpreter(cwd).await,
     };
-    match interpreter {
-        Some(python) => match venv_root_of_interpreter(&python) {
-            Some(root) => {
-                let found = find_site_packages_under(&root, "site-packages").await;
-                (!found.is_empty()).then_some(found)
-            }
-            None => pep582().await,
-        },
-        None => pep582().await,
+    let found = match venv_root_of_interpreter(&interpreter?) {
+        Some(root) => find_site_packages_under(&root, "site-packages").await,
+        None => pdm_pep582_dirs(cwd).await,
+    };
+    (!found.is_empty()).then_some(found)
+}
+
+/// Whether PDM installs the project at `cwd`: a PDM project (see
+/// [`is_pdm_project`], or a `.pdm-python`) with no `uv.lock` or
+/// `poetry.lock`, which drive installs ahead of `pdm.lock` (the hosted
+/// rewriters' precedence).
+async fn pdm_drives_project(cwd: &Path) -> bool {
+    if cwd.join("uv.lock").is_file() || cwd.join("poetry.lock").is_file() {
+        return false;
     }
+    cwd.join(".pdm-python").is_file() || is_pdm_project(cwd).await
+}
+
+/// PEP 582 package dirs: `__pypackages__/<X.Y>/lib`.
+async fn pdm_pep582_dirs(cwd: &Path) -> Vec<PathBuf> {
+    find_python_dirs(&cwd.join("__pypackages__"), &["*", "lib"]).await
 }
 
 /// The interpreter PDM saved for `cwd`: `.pdm-python` (PDM 2.x), else
@@ -518,8 +527,9 @@ async fn uv_project_environment_site_packages(
     var: &impl Fn(&str) -> Option<String>,
 ) -> Option<Vec<PathBuf>> {
     let env = var("UV_PROJECT_ENVIRONMENT").filter(|v| !v.trim().is_empty())?;
-    let other_manager = [
+    let other_lock = [
         "poetry.lock",
+        "poetry.toml",
         "pdm.lock",
         ".pdm-python",
         "Pipfile",
@@ -527,6 +537,11 @@ async fn uv_project_environment_site_packages(
     ]
     .iter()
     .any(|marker| cwd.join(marker).exists());
+    // A lockless Poetry project is still Poetry's (`[tool.poetry]`).
+    let other_manager = other_lock
+        || read_regular_to_string(&cwd.join("pyproject.toml"))
+            .await
+            .is_ok_and(|text| text.contains("[tool.poetry"));
     let uv_project =
         cwd.join("uv.lock").is_file() || (cwd.join("pyproject.toml").is_file() && !other_manager);
     if !uv_project {
@@ -2365,6 +2380,37 @@ mod tests {
             vec![lib.clone()]
         );
 
+        // With no saved interpreter (or one PDM ignores), PDM picks an
+        // activated venv or `./.venv` before PEP 582.
+        let other = tempfile::tempdir().unwrap();
+        let active_site = fake_venv(other.path(), "active");
+        let active = env_of(&[(
+            "VIRTUAL_ENV",
+            other.path().join("active").to_string_lossy().into_owned(),
+        )]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &active).await,
+            vec![active_site]
+        );
+        let dot_venv = fake_venv(&project, ".venv");
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &no_env).await,
+            vec![dot_venv]
+        );
+        std::fs::write(project.join(".pdm-python"), base.display().to_string()).unwrap();
+        let ignored = env_of(&[("PDM_IGNORE_SAVED_PYTHON", "1".to_string())]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &ignored).await,
+            vec![fake_venv(&project, ".venv")]
+        );
+        // ...while a saved base interpreter still means PEP 582.
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &no_env).await,
+            vec![lib.clone()]
+        );
+        std::fs::remove_file(project.join(".pdm-python")).unwrap();
+        std::fs::remove_dir_all(project.join(".venv")).unwrap();
+
         // A uv project with a leftover PDM lock is uv's, not PEP 582.
         std::fs::write(project.join("uv.lock"), "version = 1\n").unwrap();
         assert!(find_local_venv_site_packages_with(&project, &no_env)
@@ -2425,6 +2471,29 @@ mod tests {
             find_local_venv_site_packages_with(&project, &abs_env).await,
             vec![abs_site]
         );
+
+        // A lockless Poetry project (`[tool.poetry]`, or `poetry.toml`) is
+        // Poetry's: an ambient UV_PROJECT_ENVIRONMENT does not take it over.
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[tool.poetry]\nname = \"app\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &abs_env).await,
+            vec![stray.clone()]
+        );
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"app\"\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("poetry.toml"), "").unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &abs_env).await,
+            vec![stray.clone()]
+        );
+        std::fs::remove_file(project.join("poetry.toml")).unwrap();
 
         // ...but not a project another manager drives, nor a non-project.
         std::fs::write(project.join("poetry.lock"), "").unwrap();
