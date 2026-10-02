@@ -3407,39 +3407,15 @@ fn rewrite_yarn_berry(
     let mut changed = false;
     for dep in &npm {
         let fname = full_name(dep);
-        // This rewriter alone decides the dep from here on (see
-        // [`RewriteResult::yarn_berry_uuids`]); only a lock that does not
-        // lock its version at all hands it back to the other lockfiles.
-        result.yarn_berry_uuids.insert(dep.patch_uuid.clone());
         // The API hands the prefixed `10c0/<hex>`; a yarn 4.0.x lock spells
         // its checksums bare, and `--immutable` rejects a respelled one.
-        let Some(checksum) = dep
+        // Only needed when the entry must change (checked below): a pin
+        // already complete keeps the checksum it was written with.
+        let checksum: Option<String> = dep
             .integrity
             .yarn_berry10c0
             .as_deref()
-            .map(|c| crate::vendor::yarn_berry_lock::checksum_in_lock_spelling(content, c))
-        else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_yarn_berry_missing_checksum".into(),
-                detail: format!(
-                    "{fname}@{} has no yarnBerry10c0 cache checksum",
-                    dep.version
-                ),
-            });
-            continue;
-        };
-        if !yarn_berry_tarball_url_ok(&dep.artifact_url) {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_yarn_berry_artifact_url_unsupported".into(),
-                detail: format!(
-                    "{fname}@{}: hosted artifact URL {:?} is not an http(s) `.tgz` URL \
-                     without a query or fragment, so yarn could not fetch it as a \
-                     tarball locator; leaving the lock entry untouched",
-                    dep.version, dep.artifact_url
-                ),
-            });
-            continue;
-        }
+            .map(|c| crate::vendor::yarn_berry_lock::checksum_in_lock_spelling(content, c));
         // Berry versions are UNQUOTED (`  version: 1.3.0`).
         let version_re =
             Regex::new(&(String::from(r"\n {2}version: ") + &regex::escape(&dep.version) + "\n"))
@@ -3625,6 +3601,12 @@ fn rewrite_yarn_berry(
         if !targets.is_empty() {
             matched_any = true;
         }
+        // This lock locks the package version, so this rewriter alone decides
+        // the dep from here on (see [`RewriteResult::yarn_berry_uuids`]); a
+        // lock that does not lock it leaves the dep to the other lockfiles.
+        if matched_any || shared_descriptor {
+            result.yarn_berry_uuids.insert(dep.patch_uuid.clone());
+        }
         if shared_descriptor && !targets.is_empty() {
             result.warnings.push(RewriteWarning {
                 code: "redirect_yarn_berry_shared_descriptor".into(),
@@ -3658,11 +3640,37 @@ fn rewrite_yarn_berry(
                     detail: format!("no npm: lock entry resolving {fname}@{}", dep.version),
                 });
             }
-            if !matched_any && !shared_descriptor {
-                result.yarn_berry_uuids.remove(&dep.patch_uuid);
-            }
             continue;
         };
+        if !yarn_berry_tarball_url_ok(&dep.artifact_url) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_yarn_berry_artifact_url_unsupported".into(),
+                detail: format!(
+                    "{fname}@{}: hosted artifact URL {:?} is not an http(s) `.tgz` URL \
+                     without a query or fragment, so yarn could not fetch it as a \
+                     tarball locator; leaving the lock entry untouched",
+                    dep.version, dep.artifact_url
+                ),
+            });
+            continue;
+        }
+        // Without a checksum only an entry already keyed by this artifact
+        // (an earlier run wrote its checksum) can be kept; any other needs
+        // the checksum written.
+        let already_keyed = blocks[target_idx]
+            .lines()
+            .next()
+            .is_some_and(|l| l == format!("\"{fname}@{}\":", dep.artifact_url));
+        if checksum.is_none() && !already_keyed {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_yarn_berry_missing_checksum".into(),
+                detail: format!(
+                    "{fname}@{} has no yarnBerry10c0 cache checksum",
+                    dep.version
+                ),
+            });
+            continue;
+        }
         let Some(manifest_obj) = manifest.as_mut().and_then(Value::as_object_mut) else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_yarn_berry_manifest_missing".into(),
@@ -3713,17 +3721,22 @@ fn rewrite_yarn_berry(
         rewritten = resolution_re
             .replace(&rewritten, format!("\n  resolution: \"{resolution}\"").as_str())
             .to_string();
-        if checksum_re.is_match(&rewritten) {
-            rewritten = checksum_re
-                .replace(&rewritten, format!("\n  checksum: {checksum}").as_str())
-                .to_string();
-        } else {
-            rewritten = resolution_re
-                .replace(
-                    &rewritten,
-                    format!("\n  resolution: \"{resolution}\"\n  checksum: {checksum}").as_str(),
-                )
-                .to_string();
+        match &checksum {
+            Some(checksum) if checksum_re.is_match(&rewritten) => {
+                rewritten = checksum_re
+                    .replace(&rewritten, format!("\n  checksum: {checksum}").as_str())
+                    .to_string();
+            }
+            Some(checksum) => {
+                rewritten = resolution_re
+                    .replace(
+                        &rewritten,
+                        format!("\n  resolution: \"{resolution}\"\n  checksum: {checksum}")
+                            .as_str(),
+                    )
+                    .to_string();
+            }
+            None => {}
         }
         let rewritten = rewritten[1..].to_string();
         for (selector, original) in pin.apply(manifest_obj, &dep.artifact_url) {
@@ -8141,6 +8154,73 @@ mod tests {
         );
         assert!(none.yarn_berry_uuids.is_empty());
         assert!(none.confirmed_yarn_berry_uuids.is_empty());
+        // ... before any per-grant gate: a grant this rewriter cannot use
+        // (no checksum, an unfetchable URL) still leaves an unlocked
+        // package to the other lockfiles.
+        for bad in [
+            DepOverride {
+                integrity: Integrity::default(),
+                ..other.clone()
+            },
+            berry_override(
+                "left-pad",
+                "9.9.9",
+                "https://patch.socket.dev/x.zip",
+                &checksum,
+            ),
+        ] {
+            let mut r = RewriteResult::default();
+            rewrite_yarn_berry(
+                &berry_files(berry_lock("10c0"), berry_manifest()),
+                std::slice::from_ref(&bad),
+                &mut r,
+            );
+            assert!(r.yarn_berry_uuids.is_empty(), "{:?}", r.warnings);
+        }
+    }
+
+    /// A rescan whose grant lacks the `yarnBerry10c0` checksum still
+    /// confirms a pin an earlier run completed (the lock already holds the
+    /// checksum it was written with); an entry that would need the checksum
+    /// written is owned and refused, never confirmed.
+    #[test]
+    fn yarn_berry_checksumless_grant_keeps_a_complete_pin_only() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let mut first = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut first,
+        );
+        let pinned = berry_files(
+            first.files["yarn.lock"].clone(),
+            first.files["package.json"].clone(),
+        );
+        let checksumless = DepOverride {
+            integrity: Integrity::default(),
+            ..ovr.clone()
+        };
+        let mut again = RewriteResult::default();
+        rewrite_yarn_berry(&pinned, std::slice::from_ref(&checksumless), &mut again);
+        assert!(again.warnings.is_empty(), "{:?}", again.warnings);
+        assert!(again.files.is_empty(), "{:?}", again.files);
+        assert!(again.confirmed_yarn_berry_uuids.contains(BERRY_UUID));
+
+        let mut fresh = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), berry_manifest()),
+            std::slice::from_ref(&checksumless),
+            &mut fresh,
+        );
+        assert_eq!(
+            fresh.warnings[0].code,
+            "redirect_yarn_berry_missing_checksum"
+        );
+        assert!(fresh.files.is_empty());
+        assert!(fresh.yarn_berry_uuids.contains(BERRY_UUID));
+        assert!(fresh.confirmed_yarn_berry_uuids.is_empty());
     }
 
     /// A lock written by an earlier release carries the old
