@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-02 (run 7), main `61cfb9b`, latest release 4.0.0, latest Bun 1.4.2.
+Last updated: 2026-10-02 (run 8), main `61cfb9b`, latest release 4.0.0, latest Bun 1.4.2.
 
 Method: real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` to the mock. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -10,7 +10,7 @@ Method: real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a l
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 1.1.45 | untested | n/a | untested | pass | n/a | pass (v0) | untested |
 | Linux | 1.2.23 | pass | fail #366 (opt-in) | fail #367 | pass | fail #405 (opt-in) | untested | untested |
-| Linux | 1.3.0–1.3.4 | untested | untested | untested | pass | untested | untested | untested |
+| Linux | 1.3.0–1.3.4 | pass (1.3.0, 1.3.4) | untested | untested | pass | untested | pass (single: hosted + vendored; workspace: hosted, vendored refuses as documented) | untested |
 | Linux | 1.3.5–1.3.9 | untested | untested | fail #367 (1.3.9) | fail #371 | untested | untested | untested |
 | Linux | 1.3.14 | pass | fail #366 (default for workspaces) | fail #367 | fail #371 | fail #405 | pass (v1, workspace, catalog) | untested |
 | Linux | 1.4.2 | pass | fail #366 (default for workspaces) | fail #367 (text + lockb) | fail #371 | fail #405 | pass (v2, alias, overrides) | pass (semantic; not byte-exact, see Known non-bugs) |
@@ -72,6 +72,17 @@ Untested: a non-writable global dir, a symlinked `BUN_INSTALL`, and Bun 1.0.x.
 
 Agent mode applies path policy only at the scan root, so nested independent projects are always patched. That's generic, not Bun-specific: handed to npm (`entries/npm/20261002T072532Z-from-bun.md`).
 
+### Workspace members under ignored paths, and growth after a scan (run 8, Linux)
+
+| Bun | lock | `tests/` member: agent | `tests/` member: hosted (frozen patched) | `ignorePaths` over members keeps them (agent / hosted / vendored) | rollback / revert byte-exact | re-run rewires a newly added registry copy | dual `package-lock.json` + `bun.lock` hosted |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1.4.2 | text v2 | pass | pass | pass | pass | pass | pass (rollback byte-exact, `.npmrc` removed) |
+| 1.3.14 | text v1 | untested | pass | untested | untested | untested | untested |
+| 1.1.45 | lockb | untested | pass | untested | n/a (refuses, documented) | pass | untested |
+| macOS, Windows | all | untested | untested | untested | untested | untested | untested |
+
+Between a scan and its re-run, an unwired registry copy of a patched `name@version` in the same lock is still attested by vendored `vex` and by hosted `vex --no-verify`. npm does the same, so it's handed to npm (`entries/npm/20261002T133747Z-from-bun.md`), not filed as a Bun bug.
+
 Also passing in run 6: a dual-lock checkout (`bun.lock` + a stale `bun.lockb`, where Bun ≥ 1.2 reads `bun.lock` and hosted rewrites only it), and global mode with a symlinked `BUN_INSTALL` (1.4.2: agent scan, `vex -g`, `rollback -g`).
 
 ### Lock-shape edge cases (run 5, Linux)
@@ -99,11 +110,11 @@ Other passes (Linux, 1.4.2 unless noted):
 ## Backlog
 
 0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. A symlinked `BUN_INSTALL` passes (run 6). Still to do: a non-writable global dir must fail loudly (the sandbox runs as root, so it needs a probe); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. Re-test #443 and #434 (`bun.cmd`) once PR #442 lands. Checklist: the 20261001T040000Z entry.
-1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still blocked from the sandbox (run 7), so no new probes until then.
+1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still blocked from the sandbox (runs 7 and 8), so no new probes until then.
 2. #497 `github:` tuples (unresolvable in the sandbox, needs a probe). Re-test when fixed.
 3. #469 follow-ups: macOS/Windows cells; `bundled` inside a workspace member; `rollback` / `remove` of a rewired bundled entry; re-test when PR #472 lands.
 4. Re-test #366 once `.bun` joins the crawler walks. Then re-check the #405 vendored warning and Windows agent mode with the isolated linker (junctions).
-5. Bun workspace with a member under `tests/` or an ignored path: hosted and vendored must keep the member's deps (the policy says to use `ignorePackages`). Also the multi-project policy cells on a 1.1.45 lockb repo.
+5. The multi-project policy cells on a 1.1.45 lockb repo; `ignorePaths` over workspace members on 1.3.14 / 1.1.45 (1.4.2 passes, run 8). Also 1.3.0–1.3.4 with the isolated linker: hosted → `vex` (under #405).
 6. Hosted rollback on real macOS and Windows checkouts (the Linux CRLF analog passes, run 5).
 7. Digest boundary with a valid substitute tarball, 1.3.9 text lock vs 1.3.10. Low priority: Bun < 1.3.10 is a documented limitation.
 
@@ -135,3 +146,5 @@ Other passes (Linux, 1.4.2 unless noted):
 - Mock fixture: `SOCKET_PATCH_SERVER_URL` must name the same origin across runs. A mock on another port makes the earlier pins non-hosted.
 - A hosted scan at a repo root that is itself a Bun project crawls nested independent projects' `node_modules` and warns `redirect_bun_entry_not_found` for their packages (exit 0). They have their own locks: scan them by PATH (`scan '*/*' --mode hosted`).
 - Mock fixture: agent mode needs a `blob/<hash>` route. Without it the result is `partial_failure`.
+- Vendored scan on a Bun 1.3.x workspace (lockfileVersion 1) refuses `vendor_bun_workspace_unsupported`. That's the documented pre-v2 workspace limitation, and the lock is untouched.
+- `vex` exit 2 `product_undetected` in a fixture without a package version or git origin: pass `--product` (fixture limit).
