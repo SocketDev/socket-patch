@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-02 (run 9), main `61cfb9b` (#365, #414 merged), latest release 4.0.0.
+Last updated: 2026-10-02 (run 10), main `203e092` (#486, #520, #555 merged), latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, package grant, hosted tarball, `/registry/<name>/<ver>` mirror). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -14,14 +14,14 @@ Project modes (cells before run 3 were tested on main `f6b7fb9`; "v5" marks cell
 | Linux | 8.15.9 | pass | n/a | pass (#365) | untested | untested | n/a | pass (lock 6.0) | n/a (no trust) | untested |
 | Linux | 9.15.9 | pass | n/a | pass (#365) | untested | untested | untested | pass / pass; v5 rollback pass | untested | untested |
 | Linux | 10.0.0 | untested | n/a | untested | untested | untested | pass (10.0 ignores user overrides) | untested | untested | untested |
-| Linux | 10.5.2 / 10.12.1 | untested | fail #361 #362 (10.12.1) | untested | untested | untested | fail #360 | untested | untested | untested |
-| Linux | 10.34.5 | pass | fail #361 #362 | pass (#365) | untested | pass | fail #360 (v5 too) | pass / pass; v5 rollback pass | fail #400 #402 | untested |
-| Linux | 11.27.0 / 11.28.3 | pass | fail #361 #362 | pass (#365) | pass | pass | fail #400 #402 | pass / pass; v5 rollback pass | fail #400 #402; pass CRLF, no-EOL, comment | v5 pass (#401 closed: `pnpm_trust_lockfile_left` warning) |
-| Linux | 12.8.1 | pass | fail #361 #362 | pass (#365) | untested | pass; fail #466 with `packageManager` (two-doc lock) | fail #400 #402 | pass / pass; v5 rollback pass; two-doc lock pass | fail #400 #402 | v5 pass (#401 closed); vendored→hosted on two-doc lock fail #466 |
+| Linux | 10.5.2 / 10.12.1 | untested | fail #362 (10.12.1; #361 fixed) | untested | untested | untested | fail #360 | untested | untested | untested |
+| Linux | 10.34.5 | pass | #361 fixed (refusal); fail #362 | pass (#365) | untested | pass | fail #360 (v5 too) | pass / pass; v5 rollback pass | fail #400 #402 | untested |
+| Linux | 11.27.0 / 11.28.3 | pass | #361 fixed (refusal); fail #362 | pass (#365) | pass | pass | fail #400 #402 | pass / pass; v5 rollback pass | fail #400 #402; pass CRLF, no-EOL, comment | v5 pass (#401 closed: `pnpm_trust_lockfile_left` warning) |
+| Linux | 12.8.1 | pass | #361 fixed (refusal); fail #362 | pass (#365) | untested | pass; fail #466 with `packageManager` (two-doc lock) | fail #400 #402 | pass / pass; v5 rollback pass; two-doc lock pass | fail #400 #402 | v5 pass (#401 closed); vendored→hosted on two-doc lock fail #466 |
 | macOS | 10.34.5 | pass | n/a on CI (pnpm 10 disables it) | fail #362 | untested | untested | untested | untested | untested | untested |
-| macOS | 11.27.0 / 12.8.1 | pass | fail #361 #362 | fail #362 | untested | untested | untested | untested | untested | untested |
+| macOS | 11.27.0 / 12.8.1 | pass | #361 fixed (refusal); fail #362 | fail #362 | untested | untested | untested | untested | untested | untested |
 | Windows | 10.34.5 | pass | n/a on CI | fail #362 | untested | untested | untested | untested | untested | untested |
-| Windows | 11.27.0 / 12.8.1 | pass | fail #361 #362 | fail #362 | untested | untested | untested | untested | untested | untested |
+| Windows | 11.27.0 / 12.8.1 | pass | #361 fixed (refusal); fail #362 | fail #362 | untested | untested | untested | untested | untested | untested |
 
 Run 6 additions (main `61cfb9b`, Linux):
 
@@ -69,6 +69,16 @@ Run 9 additions (main `61cfb9b`, Linux):
 | 11.28.3 | fail #556 / untested | untested | untested | untested | untested |
 | 12.8.1 | fail #556 / fail #556 | pass | fail #557 | pass (vex, rollback) | no-op + `redirect_npm_no_lockfile` (not filed; see #417) |
 
+Run 10 additions (main `203e092`, Linux):
+
+| pnpm | Agent: isolated / hoisted transitive (post-#486/#555) | Agent: GVS direct | Agent: GVS transitive | Hosted: member cwd / `lockfile-dir=..` | Vendored: member cwd | Vendored: `gitBranchLockfile` | Rush hosted / vex / agent transitive |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 8.15.9 | pass / pass | n/a | n/a | untested | untested | n/a | untested |
+| 9.15.9 | pass / pass | n/a | n/a | fail #590 / fail #590 | pass (fails closed) | n/a | pass / pass (#518 fixed) / pass |
+| 10.34.5 | pass / pass | untested | untested | fail #590 / fail #590 | untested | fail #556 (frozen install breaks) | untested |
+| 11.28.3 | pass / pass | untested | untested | fail #590 / n/a | untested | fail #556 | untested |
+| 12.8.1 | pass / pass | pass (#361 fixed: loud refusal) | fail #362 (now exit 0 since #555) | fail #590 / fail #590 | pass (fails closed) | fail #556 | untested |
+
 Default isolated linker + alias: pass on 7.33.7 / 9.15.9 / 10.34.5 / 11.28.3 / 12.8.1 (one shared `.pnpm` copy).
 
 #492 also reproduces on pnpm 7.33.7 (there's no root lock at all, only `redirect_pnpm_no_lockfile`).
@@ -91,12 +101,12 @@ Global mode (`-g`, v5 main `2463257`):
 ## Backlog
 
 0. **Maintainer request (global `-g` mode):** the Linux cells are done. Still to do: macOS and Windows (corepack, standalone and npm-installed pnpm; `PNPM_HOME` with spaces or unicode; Windows `%LOCALAPPDATA%\pnpm`), and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry. Needs a probe branch.
-1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1 and 3, and was denied by the permission policy in runs 2 and 5–9, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
-2. #556 follow-ups: vendored mode with `gitBranchLockfile`, merging branch lockfiles after a hosted pin, and agent `vex` on the branch.
-3. Hosted and vendored from a workspace member cwd, and `lockfile-dir` / `lockfileDir` pointing at a parent directory.
-4. Re-verify #518 (with #493) when PR #520 lands. Then Rush subspaces (`common/config/subspaces/*`) and Rush + pnpm 10.
-5. `pnpm patch-commit` after a hosted pin, then rollback. Agent hoisted with nested duplicate copies (pnpm side of #516). `package-import-method=clone` on reflink (needs CI).
-6. Re-verify #492, #466, #360, #361, the global-virtual-store half of #362, #435, #556 and #557 when fixes land.
+1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3 and 10, and was denied by the permission policy in runs 2 and 5–9, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
+2. #362 GVS transitive and #435 global `-g`: re-check exit codes under #555's skip semantics on 11.28.3 / 12.8.1.
+3. Rush subspaces (`common/config/subspaces/*`), and Rush + pnpm 8 / 10.
+4. `pnpm patch-commit` after a hosted pin, then rollback. Agent hoisted with nested duplicate copies (#516 / #517). `package-import-method=clone` on reflink (needs CI).
+5. #556 follow-ups: merging branch lockfiles after a hosted pin, and agent `vex` on the branch.
+6. Re-verify #360, #362, #435, #466, #492, #556, #557 and #590 when fixes land.
 7. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout).
 
 ## Known non-bugs
@@ -126,3 +136,4 @@ Global mode (`-g`, v5 main `2463257`):
 - Vendored refuses pnpm ≤ 6 locks (5.x up to 5.3) with `vendor_lockfile_version_unsupported`, and pnpm 7/8 workspace locks with `vendor_lock_entry_unsupported`. pnpm 7/8 vendored locks carry an absolute `file:` specifier (`vendor_pnpm_legacy_absolute_specifier`), so a moved checkout needs `pnpm install --offline --no-frozen-lockfile` once. Both are documented.
 - pnpm 11+ ignores `package.json` `pnpm.patchedDependencies`. Put it in `pnpm-workspace.yaml`.
 - A dead-registry fresh install fails when the fixture has any unpatched dependency (it still needs the registry). Use the live registry for those fixtures, or patch every dependency.
+- Vendored from a workspace member cwd fails closed with `vendor_lockfile_missing` (`partial_failure`). Hosted's silent success in the same layout is #590.
