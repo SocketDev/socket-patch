@@ -33,6 +33,7 @@ use super::dsl::{
     self, all_blocks, call_at, call_sites, command_end, is_ident, is_punct, literal_of,
     matching_close, Dsl, Tok, Token,
 };
+use super::locks;
 use super::selector::{parse_selector, Selector};
 use super::{join_rel, line_of, parent_rel, resolve_rel, ListFn, TextReadFn};
 
@@ -43,12 +44,25 @@ pub const MAX_FILES: usize = 512;
 /// Bytes per file.
 pub const MAX_FILE_BYTES: usize = 1 << 20;
 
+/// Build-script text marking a project that builds Gradle plugins.
+const PLUGIN_PROJECT_MARKERS: &[&str] = &[
+    "java-gradle-plugin",
+    "groovy-gradle-plugin",
+    "kotlin-dsl",
+    "gradlePlugin",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScriptKind {
     Settings,
     Build,
     /// A precompiled script plugin of `buildSrc` or an included build.
     ConventionPlugin,
+    /// A binary plugin's source (`.kt`, `.java`, `.groovy`) in `buildSrc`
+    /// or a plugin project of an included build. Lexed with the Kotlin
+    /// (`.kt`) or Groovy (`.java`, `.groovy`) tokenizer, which is enough to
+    /// find `mavenLocal()`, plugin ids and coordinates in it.
+    PluginSource,
     /// The target of an `apply from`.
     Applied,
     Init,
@@ -265,7 +279,7 @@ pub struct ScriptGraph {
     pub init_unparseable: Vec<String>,
 }
 
-/// What one settings script says about its build.
+/// What a build's settings (with the scripts it applies) says about it.
 #[derive(Debug, Default)]
 struct SettingsInfo {
     /// `(gradle path, dir)` of every included project, parents included.
@@ -277,6 +291,19 @@ struct SettingsInfo {
     /// Literal catalog files.
     catalogs: Vec<String>,
     unresolved: Vec<Unresolved>,
+}
+
+/// A project statement of a settings script. Gradle applies them in
+/// order: an included child's default directory is its parent's directory
+/// at the time of the `include`.
+#[derive(Debug)]
+enum SettingsEvent {
+    /// The path segments of an `include`.
+    Include(Vec<String>),
+    /// `(gradle path, dir)`.
+    ProjectDir(String, String),
+    /// `(gradle path, build file name)`.
+    BuildFile(String, String),
 }
 
 fn snippet(text: &str, toks: &[Token], first: usize, last: usize) -> String {
@@ -453,10 +480,23 @@ fn resolve_path(
 }
 
 /// The `include` / `projectDir` / `buildFileName` / `includeBuild` /
-/// catalog content of one settings script of the build at `dir`.
-fn parse_settings(rel: &str, text: &str, dsl: Dsl, dir: &str, floor: &str) -> SettingsInfo {
+/// catalog content of one settings script (or a script it applies) of
+/// the build at `dir`. `here` is the directory the script's own relative
+/// paths resolve against: the settings directory for the settings script,
+/// the script's directory for an applied one. The project statements come
+/// back as byte-offset-ordered events for [`fold_settings`]; `info` holds
+/// the rest.
+fn parse_settings(
+    rel: &str,
+    text: &str,
+    dsl: Dsl,
+    dir: &str,
+    here: &str,
+    floor: &str,
+) -> (SettingsInfo, Vec<(usize, SettingsEvent)>) {
     let toks = dsl::tokens(text, dsl);
     let mut info = SettingsInfo::default();
+    let mut events = Vec::new();
     let unresolved = |info: &mut SettingsInfo, line, site, reason, snip: String| {
         info.unresolved.push(Unresolved {
             rel: rel.to_string(),
@@ -489,8 +529,12 @@ fn parse_settings(rel: &str, text: &str, dsl: Dsl, dir: &str, floor: &str) -> Se
                 continue;
             };
             for p in paths {
-                let segs: Vec<&str> = p.split(':').filter(|s| !s.is_empty()).collect();
-                if segs.iter().any(|s| *s == ".." || s.contains(['/', '\\'])) {
+                let segs: Vec<String> = p
+                    .split(':')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if segs.iter().any(|s| s == ".." || s.contains(['/', '\\'])) {
                     unresolved(
                         &mut info,
                         call.line,
@@ -500,13 +544,8 @@ fn parse_settings(rel: &str, text: &str, dsl: Dsl, dir: &str, floor: &str) -> Se
                     );
                     continue;
                 }
-                for k in 1..=segs.len() {
-                    let path = format!(":{}", segs[..k].join(":"));
-                    if info.projects.iter().any(|(q, _)| *q == path) {
-                        continue;
-                    }
-                    info.projects
-                        .push((path, join_rel(dir, &segs[..k].join("/"))));
+                if !segs.is_empty() {
+                    events.push((toks[call.callee].start, SettingsEvent::Include(segs)));
                 }
             }
         }
@@ -544,14 +583,11 @@ fn parse_settings(rel: &str, text: &str, dsl: Dsl, dir: &str, floor: &str) -> Se
             continue;
         };
         match site {
-            Site::ProjectDir => match resolve_path(floor, dir, dir, value) {
-                Ok(new_dir) => {
-                    if let Some(p) = info.projects.iter_mut().find(|(q, _)| *q == path) {
-                        p.1 = new_dir;
-                    } else if path == ":" {
-                        unresolved(&mut info, line, site, Reason::NonLiteral, snip);
-                    }
-                }
+            Site::ProjectDir if path == ":" => {
+                unresolved(&mut info, line, site, Reason::NonLiteral, snip)
+            }
+            Site::ProjectDir => match resolve_path(floor, dir, here, value) {
+                Ok(new_dir) => events.push((t.start, SettingsEvent::ProjectDir(path, new_dir))),
                 Err(reason) => unresolved(&mut info, line, site, reason, snip),
             },
             _ => match value {
@@ -560,13 +596,14 @@ fn parse_settings(rel: &str, text: &str, dsl: Dsl, dir: &str, floor: &str) -> Se
                     if name.contains(['/', '\\']) {
                         unresolved(&mut info, line, site, Reason::Escapes, snip);
                     } else {
-                        info.build_files.push((path, name));
+                        events.push((t.start, SettingsEvent::BuildFile(path, name)));
                     }
                 }
                 _ => unresolved(&mut info, line, site, Reason::NonLiteral, snip),
             },
         }
     }
+    events.sort_by_key(|(at, _)| *at);
 
     for call in call_sites(text, &toks, "includeBuild") {
         if !settings_receiver(&call.receiver) {
@@ -583,7 +620,17 @@ fn parse_settings(rel: &str, text: &str, dsl: Dsl, dir: &str, floor: &str) -> Se
             );
             continue;
         };
-        match resolve_path(floor, dir, dir, &toks[arg.first..arg.last]) {
+        // A bare string is a settings path (relative to the settings
+        // directory); `file(…)` is the script's own.
+        let arg_toks = &toks[arg.first..arg.last];
+        let base = match arg_toks {
+            [Token {
+                tok: Tok::Str { .. },
+                ..
+            }] => dir,
+            _ => here,
+        };
+        match resolve_path(floor, dir, base, arg_toks) {
             Ok(d) if d != dir => info.included_builds.push(d),
             Ok(_) => {}
             Err(reason) => unresolved(&mut info, call.line, Site::IncludeBuild, reason, snip),
@@ -595,7 +642,7 @@ fn parse_settings(rel: &str, text: &str, dsl: Dsl, dir: &str, floor: &str) -> Se
         for call in call_sites(text, body, "files") {
             let snip = snippet(text, body, call.callee, call.end);
             match call.literals().as_deref() {
-                Some([p]) => match resolve_rel(floor, dir, p) {
+                Some([p]) => match resolve_rel(floor, here, p) {
                     Some(r) => info.catalogs.push(r),
                     None => unresolved(&mut info, call.line, Site::Catalog, Reason::Escapes, snip),
                 },
@@ -609,6 +656,130 @@ fn parse_settings(rel: &str, text: &str, dsl: Dsl, dir: &str, floor: &str) -> Se
             }
         }
     }
+    (info, events)
+}
+
+/// `(gradle path, value)` pairs.
+type PathPairs = Vec<(String, String)>;
+
+/// Apply project statements in order: `(projects, build files)`.
+fn fold_settings(dir: &str, events: &[SettingsEvent]) -> (PathPairs, PathPairs) {
+    let mut projects: Vec<(String, String)> = Vec::new();
+    let mut build_files = Vec::new();
+    for ev in events {
+        match ev {
+            SettingsEvent::Include(segs) => {
+                // Gradle creates each missing ancestor under its parent's
+                // directory as it stands now.
+                let mut parent_dir = dir.to_string();
+                for k in 1..=segs.len() {
+                    let path = format!(":{}", segs[..k].join(":"));
+                    if let Some((_, d)) = projects.iter().find(|(q, _)| *q == path) {
+                        parent_dir = d.clone();
+                        continue;
+                    }
+                    let d = join_rel(&parent_dir, &segs[k - 1]);
+                    projects.push((path, d.clone()));
+                    parent_dir = d;
+                }
+            }
+            SettingsEvent::ProjectDir(path, d) => {
+                if let Some(p) = projects.iter_mut().find(|(q, _)| q == path) {
+                    p.1 = d.clone();
+                }
+            }
+            SettingsEvent::BuildFile(path, name) => build_files.push((path.clone(), name.clone())),
+        }
+    }
+    (projects, build_files)
+}
+
+/// A settings-side script as [`settings_info`] reads it: its text, DSL and
+/// the `(byte offset, target)` of each `apply from` that was followed.
+type SettingsSource = (String, Dsl, Vec<(usize, String)>);
+
+/// Everything the settings script `root` of the build at `dir` says,
+/// including the scripts it applies (spliced in at the `apply from`, as
+/// Gradle runs them). `source` yields each script; a target it cannot
+/// yield is recorded as a missing `apply from`.
+fn settings_info(
+    root: &str,
+    dir: &str,
+    floor: &str,
+    source: &mut dyn FnMut(&str) -> Option<SettingsSource>,
+) -> SettingsInfo {
+    #[allow(clippy::too_many_arguments)]
+    fn walk(
+        rel: &str,
+        dir: &str,
+        floor: &str,
+        source: &mut dyn FnMut(&str) -> Option<SettingsSource>,
+        visited: &mut BTreeSet<String>,
+        info: &mut SettingsInfo,
+        events: &mut Vec<SettingsEvent>,
+        depth: usize,
+    ) -> bool {
+        if !visited.insert(rel.to_string()) {
+            return true;
+        }
+        let Some((text, dsl, applies)) = source(rel) else {
+            return false;
+        };
+        let (mut own, own_events) = parse_settings(rel, &text, dsl, dir, parent_rel(rel), floor);
+        info.included_builds.append(&mut own.included_builds);
+        info.catalogs.append(&mut own.catalogs);
+        info.unresolved.append(&mut own.unresolved);
+        let mut own_events = own_events.into_iter().peekable();
+        for (at, target) in applies {
+            while let Some((_, ev)) = own_events.next_if(|(e, _)| *e < at) {
+                events.push(ev);
+            }
+            let line = line_of(&text, at);
+            if depth >= MAX_DEPTH {
+                info.unresolved.push(Unresolved {
+                    rel: rel.to_string(),
+                    line,
+                    site: Site::ApplyFrom,
+                    reason: Reason::DepthCap,
+                    snippet: target,
+                });
+                continue;
+            }
+            if !walk(
+                &target,
+                dir,
+                floor,
+                source,
+                visited,
+                info,
+                events,
+                depth + 1,
+            ) {
+                info.unresolved.push(Unresolved {
+                    rel: rel.to_string(),
+                    line,
+                    site: Site::ApplyFrom,
+                    reason: Reason::Missing,
+                    snippet: target,
+                });
+            }
+        }
+        events.extend(own_events.map(|(_, ev)| ev));
+        true
+    }
+    let mut info = SettingsInfo::default();
+    let mut events = Vec::new();
+    walk(
+        root,
+        dir,
+        floor,
+        source,
+        &mut BTreeSet::new(),
+        &mut info,
+        &mut events,
+        0,
+    );
+    (info.projects, info.build_files) = fold_settings(dir, &events);
     info
 }
 
@@ -649,6 +820,9 @@ struct Collector<'a> {
     floor: String,
     graph: ScriptGraph,
     seen: BTreeSet<String>,
+    /// `(script, byte offset of the apply, target)` of every followed
+    /// `apply from`.
+    applied: Vec<(String, usize, String)>,
     files: usize,
     capped: bool,
 }
@@ -700,7 +874,11 @@ impl Collector<'_> {
 
     /// Record a script and follow its `apply from` targets. `here` is the
     /// directory relative targets resolve against (`None` when that is
-    /// only known at the point of use).
+    /// only known at the point of use). Under a settings script
+    /// (`script_relative`) each applied script resolves against its own
+    /// directory, as Gradle does for a non-project target; under a project
+    /// they all resolve against the project directory.
+    #[allow(clippy::too_many_arguments)]
     fn add_script(
         &mut self,
         rel: String,
@@ -709,16 +887,21 @@ impl Collector<'_> {
         build: &str,
         here: Option<&str>,
         depth: usize,
+        script_relative: bool,
     ) {
         if !self.seen.insert(rel.clone()) {
             return;
         }
-        let dsl = dsl::dsl_of(&rel).unwrap_or(Dsl::Groovy);
+        let dsl = if rel.ends_with(".kt") {
+            Dsl::Kotlin
+        } else {
+            dsl::dsl_of(&rel).unwrap_or(Dsl::Groovy)
+        };
         if !dsl::well_formed(&text, dsl) {
             self.unresolved(&rel, 0, Site::Script, Reason::Unparseable, String::new());
         }
         let toks = dsl::tokens(&text, dsl);
-        let targets: Vec<(usize, String, Result<String, Reason>)> =
+        let targets: Vec<(usize, usize, String, Result<String, Reason>)> =
             apply_from_targets(&text, &toks)
                 .into_iter()
                 .map(|(line, first, last)| {
@@ -726,7 +909,8 @@ impl Collector<'_> {
                         None => Err(Reason::Contextual),
                         Some(here) => resolve_path(&self.floor, build, here, &toks[first..last]),
                     };
-                    (line, snippet(&text, &toks, first, last), resolved)
+                    let at = toks[first].start;
+                    (line, at, snippet(&text, &toks, first, last), resolved)
                 })
                 .collect();
         self.graph.scripts.push(Script {
@@ -736,7 +920,7 @@ impl Collector<'_> {
             build: build.to_string(),
             text,
         });
-        for (line, snip, resolved) in targets {
+        for (line, at, snip, resolved) in targets {
             let target = match resolved {
                 Ok(t) => t,
                 Err(reason) => {
@@ -752,7 +936,23 @@ impl Collector<'_> {
                 continue;
             }
             match self.read_capped(&target) {
-                Some(t) => self.add_script(target, t, ScriptKind::Applied, build, here, depth + 1),
+                Some(t) => {
+                    self.applied.push((rel.clone(), at, target.clone()));
+                    let child_here = if script_relative {
+                        Some(parent_rel(&target).to_string())
+                    } else {
+                        here.map(str::to_string)
+                    };
+                    self.add_script(
+                        target,
+                        t,
+                        ScriptKind::Applied,
+                        build,
+                        child_here.as_deref(),
+                        depth + 1,
+                        script_relative,
+                    )
+                }
                 None => {
                     if !self.capped {
                         self.unresolved(&rel, line, Site::ApplyFrom, Reason::Missing, snip)
@@ -782,9 +982,11 @@ impl Collector<'_> {
         (self.list)(parent).iter().any(|c| c == &format!("{name}/"))
     }
 
-    /// Precompiled script plugins under `<dir>/src/main/{groovy,kotlin}`.
-    fn convention_plugins(&mut self, build: &str, dir: &str) {
-        for lang in ["groovy", "kotlin"] {
+    /// Precompiled script plugins under `<dir>/src/main/{groovy,kotlin}`
+    /// and, with `sources`, binary plugin sources under
+    /// `<dir>/src/main/{groovy,kotlin,java}`.
+    fn convention_plugins(&mut self, build: &str, dir: &str, sources: bool) {
+        for lang in ["groovy", "kotlin", "java"] {
             let mut stack = vec![(join_rel(dir, &format!("src/main/{lang}")), 0usize)];
             while let Some((d, depth)) = stack.pop() {
                 for child in (self.list)(&d) {
@@ -792,20 +994,24 @@ impl Collector<'_> {
                         if depth < MAX_DEPTH {
                             stack.push((join_rel(&d, name), depth + 1));
                         }
-                    } else if child.ends_with(".gradle") || child.ends_with(".gradle.kts") {
+                    } else {
+                        let kind = if child.ends_with(".gradle") || child.ends_with(".gradle.kts") {
+                            ScriptKind::ConventionPlugin
+                        } else if sources
+                            && [".kt", ".java", ".groovy"]
+                                .iter()
+                                .any(|e| child.ends_with(e))
+                        {
+                            ScriptKind::PluginSource
+                        } else {
+                            continue;
+                        };
                         let rel = join_rel(&d, &child);
                         if self.seen.contains(&rel) {
                             continue;
                         }
                         if let Some(text) = self.read_capped(&rel) {
-                            self.add_script(
-                                rel,
-                                text,
-                                ScriptKind::ConventionPlugin,
-                                build,
-                                None,
-                                0,
-                            );
+                            self.add_script(rel, text, kind, build, None, 0, false);
                         }
                     }
                 }
@@ -821,9 +1027,25 @@ impl Collector<'_> {
         let mut info = SettingsInfo::default();
         let settings_rel = settings.as_ref().map(|(rel, _)| rel.clone());
         if let Some((rel, text)) = settings {
-            let dsl = dsl::dsl_of(&rel).unwrap_or(Dsl::Groovy);
-            info = parse_settings(&rel, &text, dsl, dir, &self.floor);
-            self.add_script(rel, text, ScriptKind::Settings, dir, Some(dir), 0);
+            self.add_script(
+                rel.clone(),
+                text,
+                ScriptKind::Settings,
+                dir,
+                Some(dir),
+                0,
+                true,
+            );
+            let (scripts, applied) = (&self.graph.scripts, &self.applied);
+            info = settings_info(&rel, dir, &self.floor, &mut |r: &str| {
+                let s = scripts.iter().find(|s| s.rel == r)?;
+                let applies = applied
+                    .iter()
+                    .filter(|(from, _, _)| from == r)
+                    .map(|(_, at, to)| (*at, to.clone()))
+                    .collect();
+                Some((s.text.clone(), s.dsl, applies))
+            });
         }
         self.graph.unresolved.append(&mut info.unresolved);
 
@@ -854,12 +1076,21 @@ impl Collector<'_> {
             if let Some((rel, text)) = found {
                 p.build_script = Some(rel.clone());
                 let here = p.dir.clone();
-                self.add_script(rel, text, ScriptKind::Build, dir, Some(&here), 0);
+                self.add_script(rel, text, ScriptKind::Build, dir, Some(&here), 0, false);
             }
         }
         if kind != BuildKind::Root {
             for p in &projects {
-                self.convention_plugins(dir, &p.dir);
+                // Binary plugins live in buildSrc and in the plugin
+                // projects of included builds; other included builds are
+                // product code.
+                let sources = kind == BuildKind::BuildSrc
+                    || p.build_script.as_ref().is_some_and(|b| {
+                        self.graph.scripts.iter().any(|s| {
+                            s.rel == *b && PLUGIN_PROJECT_MARKERS.iter().any(|m| s.text.contains(m))
+                        })
+                    });
+                self.convention_plugins(dir, &p.dir, sources);
             }
         }
         let default_catalog = join_rel(dir, "gradle/libs.versions.toml");
@@ -943,6 +1174,7 @@ impl ScriptGraph {
                 ..Self::default()
             },
             seen: BTreeSet::new(),
+            applied: Vec::new(),
             files: 0,
             capped: false,
         };
@@ -960,7 +1192,7 @@ impl ScriptGraph {
             }
             // Relative `apply from` in an init script is relative to the
             // init script, which is outside the checkout.
-            c.add_script(tag.clone(), text, ScriptKind::Init, "", None, 0);
+            c.add_script(tag.clone(), text, ScriptKind::Init, "", None, 0, false);
         }
         c.graph
     }
@@ -977,12 +1209,15 @@ impl ScriptGraph {
     }
 
     /// The scripts that configure projects: build scripts, convention
-    /// plugins and `apply from` targets.
+    /// plugins (and binary plugin sources) and `apply from` targets.
     pub fn build_scripts(&self) -> impl Iterator<Item = &Script> {
         self.scripts.iter().filter(|s| {
             matches!(
                 s.kind,
-                ScriptKind::Build | ScriptKind::ConventionPlugin | ScriptKind::Applied
+                ScriptKind::Build
+                    | ScriptKind::ConventionPlugin
+                    | ScriptKind::PluginSource
+                    | ScriptKind::Applied
             )
         })
     }
@@ -1001,6 +1236,14 @@ impl ScriptGraph {
             .iter()
             .flat_map(|b| b.projects.iter().map(|p| p.dir.as_str()))
             .collect()
+    }
+
+    /// The lock files of every project of every build (root, subprojects,
+    /// `buildSrc`, included builds and theirs), legacy layout included;
+    /// nested builds the checkout does not include are left out. See
+    /// [`locks::lockfile_paths_in`].
+    pub fn lockfile_paths(&self, list: ListFn<'_>) -> Vec<String> {
+        locks::lockfile_paths_in(list, &self.project_dirs())
     }
 
     /// Every declaration of `group:artifact` in the checkout's scripts and
@@ -1022,15 +1265,14 @@ impl ScriptGraph {
     }
 
     /// The first Android or Kotlin Multiplatform plugin reference:
-    /// `(script, plugin id)`.
+    /// `(script or catalog, plugin id)`. A version catalog's `[plugins]`
+    /// entry counts, since `alias(libs.plugins.…)` names the plugin only
+    /// there.
     pub fn android_or_kmp(&self) -> Option<(String, String)> {
-        self.checkout_scripts().find_map(|s| {
+        let in_scripts = self.checkout_scripts().find_map(|s| {
             let toks = dsl::tokens(&s.text, s.dsl);
             let by_id = dsl::strings(&toks)
-                .find(|v| {
-                    v.starts_with("com.android.")
-                        || v.starts_with("org.jetbrains.kotlin.multiplatform")
-                })
+                .find(|v| is_android_or_kmp_id(v))
                 .map(str::to_string);
             let by_kotlin = || {
                 toks.windows(4).find_map(|w| {
@@ -1042,6 +1284,14 @@ impl ScriptGraph {
                 })
             };
             by_id.or_else(by_kotlin).map(|id| (s.rel.clone(), id))
+        });
+        in_scripts.or_else(|| {
+            self.catalogs.iter().find_map(|c| {
+                catalog_plugin_ids(c)
+                    .into_iter()
+                    .find(|id| is_android_or_kmp_id(id))
+                    .map(|id| (c.rel.clone(), id))
+            })
         })
     }
 
@@ -1066,13 +1316,15 @@ impl ScriptGraph {
             })
     }
 
-    /// Whether `mavenLocal()` (or a repository URL into `.m2/repository`)
-    /// is declared anywhere, init scripts included.
+    /// Whether `mavenLocal()` / `mavenLocal { … }` (or a repository URL
+    /// into `.m2/repository`) is declared anywhere, init scripts included.
     pub fn maven_local(&self) -> MavenLocal {
         for s in &self.scripts {
             let toks = dsl::tokens(&s.text, s.dsl);
-            let call = (0..toks.len())
-                .any(|i| is_ident(toks.get(i), "mavenLocal") && is_punct(toks.get(i + 1), b'('));
+            let call = (0..toks.len()).any(|i| {
+                is_ident(toks.get(i), "mavenLocal")
+                    && (is_punct(toks.get(i + 1), b'(') || is_punct(toks.get(i + 1), b'{'))
+            });
             let url = dsl::strings(&toks).any(|v| {
                 v.contains(".m2/repository")
                     || v.contains(".m2\\\\repository")
@@ -1129,29 +1381,69 @@ pub enum Owner {
 }
 
 /// See [`Owner`]. `None` when the ancestor's settings is missing, or names
-/// every project literally and none of them lives at `rel_dir`.
+/// every project literally (in itself and the scripts it applies) and none
+/// of them lives at `rel_dir`.
 pub fn subproject_owner(
     read: TextReadFn<'_>,
     ancestor_settings: &str,
     rel_dir: &str,
 ) -> Option<Owner> {
-    let text = read(ancestor_settings)?;
-    let text = dsl::strip_bom(&text);
-    let dsl = dsl::dsl_of(ancestor_settings).unwrap_or(Dsl::Groovy);
+    read(ancestor_settings)?;
     let dir = parent_rel(ancestor_settings);
-    let info = parse_settings(ancestor_settings, text, dsl, "", "");
-    let want = resolve_rel("", "", rel_dir)?;
-    if want.is_empty() {
+    let want = resolve_rel(dir, dir, rel_dir)?;
+    if want == dir {
         return None;
     }
+    let mut problems: Vec<Unresolved> = Vec::new();
+    let mut files = 0usize;
+    let info = settings_info(ancestor_settings, dir, "", &mut |r: &str| {
+        let issue = |reason| Unresolved {
+            rel: r.to_string(),
+            line: 0,
+            site: Site::Script,
+            reason,
+            snippet: String::new(),
+        };
+        let text = read(r)?;
+        files += 1;
+        if files > MAX_FILES {
+            problems.push(issue(Reason::FileCap));
+            return None;
+        }
+        if text.len() > MAX_FILE_BYTES {
+            problems.push(issue(Reason::TooLarge));
+            return None;
+        }
+        let text = dsl::strip_bom(&text).to_string();
+        let dsl = dsl::dsl_of(r).unwrap_or(Dsl::Groovy);
+        if !dsl::well_formed(&text, dsl) {
+            problems.push(issue(Reason::Unparseable));
+        }
+        let toks = dsl::tokens(&text, dsl);
+        let mut applies = Vec::new();
+        for (line, first, last) in apply_from_targets(&text, &toks) {
+            match resolve_path("", dir, parent_rel(r), &toks[first..last]) {
+                Ok(target) => applies.push((toks[first].start, target)),
+                Err(reason) => problems.push(Unresolved {
+                    rel: r.to_string(),
+                    line,
+                    site: Site::ApplyFrom,
+                    reason,
+                    snippet: snippet(&text, &toks, first, last),
+                }),
+            }
+        }
+        Some((text, dsl, applies))
+    });
     if info.projects.iter().any(|(_, d)| *d == want) {
         return Some(Owner::Owned(dir.to_string()));
     }
-    let unparseable = !dsl::well_formed(text, dsl)
-        || info
-            .unresolved
-            .iter()
-            .any(|u| matches!(u.site, Site::Include | Site::ProjectDir));
+    let unparseable = problems.iter().chain(&info.unresolved).any(|u| {
+        matches!(
+            u.site,
+            Site::Include | Site::ProjectDir | Site::ApplyFrom | Site::Script
+        )
+    });
     unparseable.then(|| Owner::Unparseable(dir.to_string()))
 }
 
@@ -1414,6 +1706,32 @@ fn enclosing_call(text: &str, toks: &[Token], i: usize) -> Option<dsl::CallSite>
     (call.args.iter().any(|a| a.first <= i + 2 && i < a.last)).then_some(call)
 }
 
+fn is_android_or_kmp_id(id: &str) -> bool {
+    id.starts_with("com.android.") || id.starts_with("org.jetbrains.kotlin.multiplatform")
+}
+
+/// The plugin ids of a catalog's `[plugins]` (`{ id = "…" }` or `"id:version"`).
+fn catalog_plugin_ids(c: &Catalog) -> Vec<String> {
+    use toml_edit::{Document, Item};
+    let Ok(doc) = Document::parse(c.text.as_str()) else {
+        return Vec::new();
+    };
+    let Some(plugins) = doc.get("plugins").and_then(Item::as_table_like) else {
+        return Vec::new();
+    };
+    plugins
+        .iter()
+        .filter_map(|(_, item)| match item.as_str() {
+            Some(s) => Some(s.split(':').next().unwrap_or(s).to_string()),
+            None => item
+                .as_table_like()
+                .and_then(|t| t.get("id"))
+                .and_then(Item::as_str)
+                .map(str::to_string),
+        })
+        .collect()
+}
+
 fn catalog_decls(c: &Catalog, g: &str, a: &str) -> Vec<Decl> {
     use toml_edit::{Document, Item, Value};
     let Ok(doc) = Document::parse(c.text.as_str()) else {
@@ -1658,6 +1976,96 @@ mod tests {
             (Site::Include, Reason::NonLiteral, 4)
         );
         assert_eq!(u.snippet, "include(listOf(\"x\"))");
+    }
+
+    #[test]
+    fn settings_applied_scripts_include_projects() {
+        let files: &[(&str, &str)] = &[
+            (
+                "settings.gradle",
+                "apply from: 'gradle/modules.gradle'\nproject(':lib').projectDir = file('libs/lib')\n",
+            ),
+            // Relative paths in a script applied to settings resolve
+            // against that script's directory.
+            (
+                "gradle/modules.gradle",
+                "include ':app', ':lib'\nproject(':app').projectDir = file('../apps/app')\napply from: 'more.gradle'\nincludeBuild 'tools'\n",
+            ),
+            ("gradle/more.gradle", "include ':extra'\n"),
+            (
+                "apps/app/build.gradle",
+                "dependencies { implementation 'com.socketfixture:victim:1.10.0' }\n",
+            ),
+            ("tools/settings.gradle", ""),
+        ];
+        let g = graph(files);
+        assert!(g.unresolved.is_empty(), "{:?}", g.unresolved);
+        assert_eq!(
+            projects(&g),
+            [
+                pair(":app", "apps/app"),
+                pair(":lib", "libs/lib"),
+                pair(":extra", "extra"),
+            ]
+        );
+        assert_eq!(g.declarations_of(G, A).len(), 1);
+        assert_eq!(
+            g.builds.iter().map(|b| b.dir.as_str()).collect::<Vec<_>>(),
+            ["", "tools"]
+        );
+        let fs = MemFs::new(files);
+        let read = |r: &str| fs.read(r);
+        assert_eq!(
+            subproject_owner(&read, "settings.gradle", "apps/app"),
+            Some(Owner::Owned(String::new()))
+        );
+        assert_eq!(
+            subproject_owner(&read, "settings.gradle", "extra"),
+            Some(Owner::Owned(String::new()))
+        );
+        assert_eq!(subproject_owner(&read, "settings.gradle", "app"), None);
+
+        // A settings-level `apply from` that cannot be followed hides
+        // projects: the graph is undetermined and ownership unknown.
+        let files: &[(&str, &str)] = &[
+            (
+                "settings.gradle",
+                "apply from: \"$gradleDir/modules.gradle\"\n",
+            ),
+            ("nested/settings.gradle", "apply from: 'missing.gradle'\n"),
+        ];
+        let g = graph(files);
+        assert!(matches!(g.maven_local(), MavenLocal::Undetermined(_)));
+        let fs = MemFs::new(files);
+        let read = |r: &str| fs.read(r);
+        assert_eq!(
+            subproject_owner(&read, "settings.gradle", "app"),
+            Some(Owner::Unparseable(String::new()))
+        );
+        assert_eq!(
+            subproject_owner(&read, "nested/settings.gradle", "app"),
+            Some(Owner::Unparseable("nested".into()))
+        );
+    }
+
+    #[test]
+    fn includes_follow_the_parent_directory_in_order() {
+        // Measured on Gradle 6.9.4 and 8.14.3: a child included after its
+        // parent moved lives under the parent's new directory; one
+        // included before stays where it was created.
+        let g = graph(&[(
+            "settings.gradle",
+            "include ':a'\nproject(':a').projectDir = file('modules/a')\ninclude ':a:b'\ninclude ':x:y'\nproject(':x').projectDir = file('xx')\n",
+        )]);
+        assert_eq!(
+            projects(&g),
+            [
+                pair(":a", "modules/a"),
+                pair(":a:b", "modules/a/b"),
+                pair(":x", "xx"),
+                pair(":x:y", "x/y"),
+            ]
+        );
     }
 
     #[test]
@@ -2107,9 +2515,66 @@ other = { group = \"x\", name = \"y\", version = \"1\" }
                 &[],
                 "build.gradle",
             ),
+            // The closure (trailing-lambda) form, used to scope it.
+            (
+                &[(
+                    "build.gradle.kts",
+                    "repositories {\n    mavenLocal {\n        content { includeGroup(\"com.socketfixture\") }\n    }\n    mavenCentral()\n}\n",
+                )],
+                &[],
+                "build.gradle.kts",
+            ),
+            (
+                &[("build.gradle", "repositories {\n  mavenLocal {\n  }\n}\n")],
+                &[],
+                "build.gradle",
+            ),
+            // A binary convention plugin in buildSrc.
+            (
+                &[
+                    ("buildSrc/build.gradle.kts", "plugins { `kotlin-dsl` }\n"),
+                    (
+                        "buildSrc/src/main/kotlin/Conv.kt",
+                        "class Conv : Plugin<Project> {\n    override fun apply(p: Project) { p.repositories.mavenLocal() }\n}\n",
+                    ),
+                    ("a/build.gradle", "plugins { id 'conv' }\n"),
+                    ("settings.gradle", "include 'a'\n"),
+                ],
+                &[],
+                "buildSrc/src/main/kotlin/Conv.kt",
+            ),
+            // A Java plugin in a plugin project of an included build.
+            (
+                &[
+                    ("settings.gradle", "pluginManagement { includeBuild 'logic' }\n"),
+                    ("logic/settings.gradle", "include 'plugins'\n"),
+                    (
+                        "logic/plugins/build.gradle",
+                        "plugins { id 'java-gradle-plugin' }\n",
+                    ),
+                    (
+                        "logic/plugins/src/main/java/x/RepoPlugin.java",
+                        "public class RepoPlugin implements Plugin<Project> {\n  public void apply(Project p) { char q = '\\''; p.getRepositories().mavenLocal(); }\n}\n",
+                    ),
+                ],
+                &[],
+                "logic/plugins/src/main/java/x/RepoPlugin.java",
+            ),
+            // A settings script that includes its projects from an applied
+            // script.
+            (
+                &[
+                    ("settings.gradle", "apply from: 'gradle/modules.gradle'\n"),
+                    ("gradle/modules.gradle", "include ':app'\n"),
+                    ("app/build.gradle", "repositories { mavenLocal() }\n"),
+                ],
+                &[],
+                "app/build.gradle",
+            ),
         ];
         for (files, init, want) in cases {
             let g = graph_with_init(files, init);
+            assert!(g.unresolved.is_empty(), "{files:?}: {:?}", g.unresolved);
             assert_eq!(
                 g.maven_local(),
                 MavenLocal::Declared(want.to_string()),
@@ -2121,6 +2586,23 @@ other = { group = \"x\", name = \"y\", version = \"1\" }
             "build.gradle",
             "// mavenLocal()\nrepositories { mavenCentral() }\ndef s = 'mavenLocal'\n",
         )]);
+        assert_eq!(g.maven_local(), MavenLocal::NotDeclared);
+    }
+
+    #[test]
+    fn product_sources_of_included_builds_are_not_build_logic() {
+        // An included library build is product code: its sources are not
+        // read (only plugin projects' and buildSrc's are).
+        let g = graph(&[
+            ("settings.gradle", "includeBuild 'lib'\n"),
+            ("lib/build.gradle", "plugins { id 'java-library' }\n"),
+            (
+                "lib/src/main/java/Lib.java",
+                "class Lib { String s = \"com.android.application\"; }\n",
+            ),
+        ]);
+        assert!(rels(&g, ScriptKind::PluginSource).is_empty());
+        assert_eq!(g.android_or_kmp(), None);
         assert_eq!(g.maven_local(), MavenLocal::NotDeclared);
     }
 
@@ -2258,6 +2740,35 @@ other = { group = \"x\", name = \"y\", version = \"1\" }
             "plugins { kotlin(\"jvm\") }\n// com.android.application\n",
         )]);
         assert_eq!(g.android_or_kmp(), None);
+        // Applied by catalog alias: the id is only in the catalog.
+        for (catalog, id) in [
+            (
+                "[plugins]\nandroid-application = { id = \"com.android.application\", version = \"8.5.0\" }\n",
+                "com.android.application",
+            ),
+            (
+                "[plugins]\nkotlinMultiplatform = \"org.jetbrains.kotlin.multiplatform:2.0.0\"\n",
+                "org.jetbrains.kotlin.multiplatform",
+            ),
+        ] {
+            let g = graph(&[
+                ("settings.gradle.kts", "include(\"app\")\n"),
+                (
+                    "app/build.gradle.kts",
+                    "plugins { alias(libs.plugins.android.application) }\n",
+                ),
+                ("gradle/libs.versions.toml", catalog),
+            ]);
+            assert_eq!(
+                g.android_or_kmp(),
+                Some(("gradle/libs.versions.toml".to_string(), id.to_string()))
+            );
+        }
+        let g = graph(&[(
+            "gradle/libs.versions.toml",
+            "[plugins]\njvm = { id = \"org.jetbrains.kotlin.jvm\", version = \"2.0.0\" }\n",
+        )]);
+        assert_eq!(g.android_or_kmp(), None);
 
         let fs = MemFs::new(&[
             (
@@ -2270,6 +2781,46 @@ other = { group = \"x\", name = \"y\", version = \"1\" }
         assert_eq!(wrapper_version(&read, ""), Some((8, 14, 3)));
         assert_eq!(wrapper_version(&read, "w"), Some((9, 0, 0)));
         assert_eq!(wrapper_version(&read, "none"), None);
+    }
+
+    #[test]
+    fn lockfile_paths_keep_to_the_builds_projects() {
+        let g = {
+            let fs = MemFs::new(&[
+                (
+                    "settings.gradle",
+                    "include 'app'\nincludeBuild 'build-logic'\n",
+                ),
+                ("gradle.lockfile", ""),
+                ("settings-gradle.lockfile", ""),
+                ("app/gradle.lockfile", ""),
+                ("app/gradle/dependency-locks/compileClasspath.lockfile", ""),
+                ("buildSrc/build.gradle", ""),
+                ("buildSrc/buildscript-gradle.lockfile", ""),
+                ("build-logic/settings.gradle", "include 'convention'\n"),
+                ("build-logic/convention/gradle.lockfile", ""),
+                // Not part of the build: a standalone sample and a test
+                // fixture build.
+                ("samples/demo/settings.gradle", ""),
+                ("samples/demo/gradle.lockfile", ""),
+                ("src/test/resources/projects/x/gradle.lockfile", ""),
+            ]);
+            let g = ScriptGraph::collect(&|r: &str| fs.read(r), &|d: &str| fs.list(d), "", &[]);
+            (g.lockfile_paths(&|d: &str| fs.list(d)), fs)
+        };
+        assert_eq!(
+            g.0,
+            [
+                "app/gradle.lockfile",
+                "app/gradle/dependency-locks/compileClasspath.lockfile",
+                "build-logic/convention/gradle.lockfile",
+                "buildSrc/buildscript-gradle.lockfile",
+                "gradle.lockfile",
+                "settings-gradle.lockfile",
+            ]
+        );
+        // The inventory walk still sees every one.
+        assert_eq!(locks::lockfile_paths(&|d: &str| g.1.list(d), "").len(), 8);
     }
 
     #[test]

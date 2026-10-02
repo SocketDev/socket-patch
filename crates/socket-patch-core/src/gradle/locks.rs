@@ -31,11 +31,16 @@ const MAX_DEPTH: usize = 8;
 const MAX_DIRS: usize = 20_000;
 
 /// Every lock file in the tree under `root` (in `list`'s path space, so
-/// the results join `root`): the per-project files of the root build,
-/// its subprojects, `buildSrc` and included builds (with their own
-/// subprojects), and every legacy `gradle/dependency-locks/*.lockfile`.
+/// the results join `root`), whichever build it belongs to: the
+/// per-project files and every legacy `gradle/dependency-locks/*.lockfile`.
 /// `build/`, `.gradle/`, `node_modules/`, `.socket/` and `.git/` are not
 /// searched, nor anything deeper than eight directories. Sorted.
+///
+/// This is an inventory (discovery, reports): it also finds the lock files
+/// of nested builds the root build does not include (samples, test
+/// fixtures). Anything that rewrites lock files for a build uses
+/// [`lockfile_paths_in`] with that build's project directories
+/// (`ScriptGraph::lockfile_paths`).
 pub fn lockfile_paths(list: ListFn<'_>, root: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![(root.to_string(), 0usize)];
@@ -64,6 +69,29 @@ pub fn lockfile_paths(list: ListFn<'_>, root: &str) -> Vec<String> {
                 }
             } else if LOCKFILE_NAMES.contains(&child.as_str()) {
                 out.push(join_rel(&dir, &child));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The lock files of the given project directories (in `list`'s path
+/// space): each one's per-project files and its legacy
+/// `gradle/dependency-locks/*.lockfile`. Sorted.
+pub fn lockfile_paths_in(list: ListFn<'_>, project_dirs: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in project_dirs {
+        for child in list(dir) {
+            if LOCKFILE_NAMES.contains(&child.as_str()) {
+                out.push(join_rel(dir, &child));
+            }
+        }
+        let legacy = join_rel(dir, LEGACY_LOCK_DIR);
+        for f in list(&legacy) {
+            if !f.ends_with('/') && f.ends_with(".lockfile") {
+                out.push(join_rel(&legacy, &f));
             }
         }
     }
