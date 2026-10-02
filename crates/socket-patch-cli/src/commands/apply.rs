@@ -16,7 +16,7 @@ use socket_patch_core::patch::redirect::golang_local::{
 };
 use socket_patch_core::telemetry::{track_patch_applied, track_patch_apply_failed};
 use socket_patch_core::utils::purl::parse_golang_purl;
-use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{normalize_purl, purl_eq, strip_purl_qualifiers};
 use socket_patch_core::vendor::purl_keys_cover;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -999,6 +999,7 @@ pub(crate) async fn run_locked(
             success,
             results,
             unmatched,
+            lockfile_only,
             run_warnings,
             fallback_skips,
             targeted,
@@ -1129,11 +1130,14 @@ pub(crate) async fn run_locked(
                 // had no installed package on disk — emit one Skipped
                 // event per purl so downstream consumers can surface them.
                 for purl in &unmatched {
+                    let detail = if lockfile_only.contains(purl) {
+                        LOCKFILE_ONLY_DETAIL
+                    } else {
+                        "No installed package matches this PURL"
+                    };
                     env.record(
-                        PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
-                            "package_not_installed",
-                            "No installed package matches this PURL",
-                        ),
+                        PatchEvent::new(PatchAction::Skipped, purl.clone())
+                            .with_reason("package_not_installed", detail),
                     );
                 }
                 // Best-effort gem-env fallback-home copies left unpatched:
@@ -1351,6 +1355,11 @@ struct ApplyOutcome {
     results: Vec<ApplyResult>,
     /// In-scope manifest purls with no installed package on disk.
     unmatched: Vec<String>,
+    /// The subset of [`Self::unmatched`] the project's own lockfiles
+    /// resolve: deliberately not installed on this host (a platform-gated
+    /// optional dependency, a devDependency under `--omit=dev`), so a calm
+    /// skip that never fails the run (#403).
+    lockfile_only: HashSet<String>,
     /// Run-level advisories: JSON `warnings[]`, and one gated stderr line
     /// each on the human path (`--silent` = errors only) except the
     /// sources-unavailable codes (already printed by the stager): the gem
@@ -1669,6 +1678,7 @@ async fn apply_patches_inner(
                 success: false,
                 results: Vec::new(),
                 unmatched: Vec::new(),
+                lockfile_only: HashSet::new(),
                 run_warnings: vec![stage_failure_warning(args.common.offline)],
                 fallback_skips: Vec::new(),
                 targeted: target_manifest_purls.len(),
@@ -1700,6 +1710,7 @@ async fn apply_patches_inner(
             success: true,
             results: Vec::new(),
             unmatched: Vec::new(),
+            lockfile_only: HashSet::new(),
             run_warnings: Vec::new(),
             fallback_skips: Vec::new(),
             targeted: 0,
@@ -1791,20 +1802,24 @@ async fn apply_patches_inner(
         );
         let mut unmatched = unmatched;
         unmatched.sort();
+        let lockfile_only = Box::pin(lockfile_resolved(&args.common, &unmatched)).await;
+        let unresolved = unresolved_purls(&unmatched, &lockfile_only);
         // This diagnostic flips the exit code, so it is an error — and it
         // prints even under --silent ("errors only", never a mute exit 1);
         // `--json`
         // mutes stderr and the envelope's `package_not_installed` events
-        // are the channel.
-        if !unmatched.is_empty() && args.prints_errors() {
-            for line in format_none_installed_error(&unmatched) {
+        // are the channel. Lockfile-resolved purls never flip it (#403).
+        if !unresolved.is_empty() && args.prints_errors() {
+            for line in format_none_installed_error(&unresolved) {
                 eprintln!("{line}");
             }
         }
+        print_lockfile_only_note(args, &unmatched, &lockfile_only);
         return Ok(ApplyOutcome {
-            success: unmatched.is_empty(),
+            success: unresolved.is_empty(),
             results,
             unmatched,
+            lockfile_only,
             run_warnings,
             fallback_skips,
             targeted: target_manifest_purls.len(),
@@ -2169,28 +2184,38 @@ async fn apply_patches_inner(
         &vendored_bases,
     );
     unmatched.sort();
+    let lockfile_only = if unmatched.is_empty() {
+        HashSet::new()
+    } else {
+        Box::pin(lockfile_resolved(&args.common, &unmatched)).await
+    };
+    let unresolved = unresolved_purls(&unmatched, &lockfile_only);
 
+    // Nothing matched and some purl has no lock evidence either: this
+    // fails the run, so it is an error — and errors print even under
+    // --silent. Lockfile-resolved purls are deliberately not installed
+    // here, so they never fail it (#403).
     let none_matched = !target_manifest_purls.is_empty()
         && matched_manifest_purls.is_empty()
-        && !all_packages.is_empty();
+        && !all_packages.is_empty()
+        && !unresolved.is_empty();
     if none_matched {
-        // Nothing matched: this fails the run, so it is an error — and
-        // errors print even under --silent.
         has_errors = true;
         if args.prints_errors() {
-            for line in format_none_installed_error(&unmatched) {
+            for line in format_none_installed_error(&unresolved) {
                 eprintln!("{line}");
             }
         }
-    } else if !unmatched.is_empty() && !args.common.silent && !args.common.json {
+    } else if !unresolved.is_empty() && !args.common.silent && !args.common.json {
         eprintln!(
             "Warning: {} had no matching installed package:",
-            plural(unmatched.len(), "manifest patch", "manifest patches")
+            plural(unresolved.len(), "manifest patch", "manifest patches")
         );
-        for purl in &unmatched {
+        for purl in &unresolved {
             eprintln!("  - {}", normalize_purl(purl));
         }
     }
+    print_lockfile_only_note(args, &unmatched, &lockfile_only);
 
     // The human summary is printed by `run`, after the per-package list.
 
@@ -2204,11 +2229,78 @@ async fn apply_patches_inner(
         success: !has_errors,
         results,
         unmatched,
+        lockfile_only,
         run_warnings,
         fallback_skips,
         targeted: target_manifest_purls.len(),
         show_summary: true,
     })
+}
+
+/// The `package_not_installed` detail of a lockfile-resolved purl.
+const LOCKFILE_ONLY_DETAIL: &str =
+    "Resolved by the project lockfile but not installed on this host (lockfile-only)";
+
+/// The `unmatched` purls the project's own lockfiles resolve (#403): the
+/// package manager resolved them but deliberately did not install them on
+/// this host — an `os`/`cpu`-gated optional dependency (`fsevents`,
+/// `@esbuild/<os>-<cpu>`), a devDependency under `npm ci --omit=dev`. The
+/// tree is in its correct end state, so they are calm skips, as `scan
+/// --apply` treats lockfile-only packages. Global runs have no project
+/// lock, so nothing is lockfile-resolved there.
+async fn lockfile_resolved(common: &GlobalArgs, unmatched: &[String]) -> HashSet<String> {
+    if unmatched.is_empty() || common.is_global() {
+        return HashSet::new();
+    }
+    let ctx = crate::commands::context::ProjectContext::new(common);
+    let entries = &ctx.locks().await.entries;
+    let lock_purls: HashSet<String> = entries
+        .iter()
+        .map(|e| normalize_purl(strip_purl_qualifiers(&e.purl)).into_owned())
+        .collect();
+    unmatched
+        .iter()
+        .filter(|p| {
+            let base = strip_purl_qualifiers(p);
+            lock_purls.contains(normalize_purl(base).as_ref())
+                || (base.starts_with("pkg:composer/")
+                    && entries.iter().any(|e| purl_eq(&e.purl, base)))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The `unmatched` purls with no lock evidence (sorted input, sorted
+/// output): the ones that can still fail an all-miss run.
+fn unresolved_purls(unmatched: &[String], lockfile_only: &HashSet<String>) -> Vec<String> {
+    unmatched
+        .iter()
+        .filter(|p| !lockfile_only.contains(*p))
+        .cloned()
+        .collect()
+}
+
+/// The human note for lockfile-resolved purls (never an error; muted by
+/// `--silent` and `--json`).
+fn print_lockfile_only_note(
+    args: &ApplyArgs,
+    unmatched: &[String],
+    lockfile_only: &HashSet<String>,
+) {
+    if lockfile_only.is_empty() || args.common.silent || args.common.json {
+        return;
+    }
+    eprintln!(
+        "Note: {} not installed on this host (resolved by the project lockfile; skipped):",
+        plural(
+            lockfile_only.len(),
+            "manifest patch targets a package",
+            "manifest patches target packages"
+        )
+    );
+    for purl in unmatched.iter().filter(|p| lockfile_only.contains(*p)) {
+        eprintln!("  - {}", normalize_purl(purl));
+    }
 }
 
 /// `Error: Failed to patch <purl>: <why>` (stderr, even under --silent).
