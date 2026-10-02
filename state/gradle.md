@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Gradle bug-hunt routine (label pm:gradle).
 
-Last updated: 2026-10-02 (run 7), main `61cfb9b` (no Gradle code changes since `2463257` / #277), latest release v4.0.0. #461 and #487 were re-confirmed on `61cfb9b`, and #428 on `9d718cf`.
+Last updated: 2026-10-02 (run 8), main `61cfb9b` (no Gradle code changes since `2463257` / #277), latest release v4.0.0. #461 and #487 were re-confirmed on `61cfb9b`, and #428 on `9d718cf`. Run 8 filed #551.
 
 ## Coverage matrix
 
@@ -52,6 +52,12 @@ Last updated: 2026-10-02 (run 7), main `61cfb9b` (no Gradle code changes since `
 | 9.8.0 (21) | **fail #533** | **fail #533** | untested | untested | untested |
 | 6.9.4 / 7.6.6, macOS, Windows | untested | untested | untested | untested | untested |
 
+**Agent mode, run 8 (Linux, 8.14.3).**
+- Gradle-only project (`mavenCentral()`) with the same GAV in `~/.m2`: `apply` patches m2, `vex` says `not_affected`, and the build uses the unpatched cache jar. **fail #551**.
+- The same with `mavenLocal()` first (+ `-Dmaven.repo.local`): pass (control).
+- `apply --global-prefix …/modules-2/files-2.1`: loud `package_not_installed`, exit 1 (pass, fail-loud; #349 layout gap).
+- macOS / Windows, Gradle 6 / 7 / 9: untested.
+
 **Global (`-g`), Linux, 8.14.3 cache.**
 - `scan -g` report: fail. No Gradle-cached purls (#349 comment).
 - `scan -g --mode hosted` / `--global-prefix --mode hosted` refusal: pass (exit 2, no writes).
@@ -60,11 +66,12 @@ Last updated: 2026-10-02 (run 7), main `61cfb9b` (no Gradle code changes since `
 - macOS / Windows: untested.
 
 ## Backlog
-1. **Maintainer request (partly done):** global `-g` mode. Linux is covered (the report, the refusal, and no project leakage). Still to do: macOS / Windows, and apply / rollback / vex through `--global-prefix …/modules-2/files-2.1` if that's meant to be supported (see the 20261001T040000Z entry).
+1. **Maintainer request (partly done):** global `-g` mode. Linux is covered (the report, the refusal, no project leakage, and `--global-prefix` apply failing loudly). Still to do: macOS / Windows, and `apply -g` / `rollback -g` / `vex -g` with the GAV in `~/.m2` (see the 20261001T040000Z entry).
 2. #487, #511 and #533 on Gradle 6.9.4 / 7.6.6 (a JDK 11/17 probe), plus `verify-signatures` with `.module` artifacts and imported BOMs.
 3. #511 with a transitive range from a dependency's POM, and with catalog `strictly` / `prefer`.
 4. The hosted snippet in its suffixed form, with the dependency bumped and then `vendor`. Check the result and VEX. Also the hosted snippet plus a classifier dependency (the hosted analogue of #533).
-5. Re-test #347, #348, #349, #395, #396, #428, #429, #461, #487, #511 and #533 when `vendor/jvm/`, `maven_crawler.rs` or `gradle_snippet` change.
+5. Agent `apply` + `vex` when `GRADLE_USER_HOME` and `~/.m2` hold different versions (a #551 variant).
+6. Re-test #347, #348, #349, #395, #396, #428, #429, #461, #487, #511, #533 and #551 when `vendor/jvm/`, `maven_crawler.rs` or `gradle_snippet` change.
 
 ## Known non-bugs
 - The sandbox can't reach the Socket API. For vendored, use `prebuilt_common::prepare_command` + a staged manifest/blob (see the run 3 entry). For hosted, use the wiremock shaped like `e2e_redirect_maven_build`.
@@ -89,3 +96,4 @@ Last updated: 2026-10-02 (run 7), main `61cfb9b` (no Gradle code changes since `
 - `vendor --revert` is byte-exact on a verification-metadata file with pgp entries (run 6).
 - A `mvn`-seeded `file://` m2 has no `maven-metadata.xml`, so range or dynamic-version cells fail before vendoring too. Use real Central for those.
 - A `gradle.lockfile` written before vendoring masks #511: the range resolves to the locked, vendored version (run 7).
+- Gradle's `mavenLocal()` ignores the `MAVEN_REPO_LOCAL` env var. It uses `-Dmaven.repo.local` or settings.xml, so a harness must pass the system property (run 8).
