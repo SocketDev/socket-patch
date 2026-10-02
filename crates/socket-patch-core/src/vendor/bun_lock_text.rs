@@ -95,6 +95,24 @@ pub(crate) fn has_workspace_packages(entries: &[BunEntry]) -> bool {
     })
 }
 
+/// True when `entry` is a `bundleDependencies` copy: bun records it as its
+/// own `parent/child` entry whose `{meta}` object carries `"bundled": true`,
+/// and unpacks it from the PARENT's tarball without ever reading the
+/// entry's spec (#469). No rewire of it reaches the installed bytes, so the
+/// rewriters skip it and lockfile discovery never takes it as a ref. The
+/// meta is the first object element (index 2 of a registry 4-tuple, 1 of a
+/// tarball tuple). A meta that does not parse as JSON but mentions
+/// `"bundled"` counts as bundled: fail closed, never rewire or attest it.
+pub(crate) fn is_bundled_entry(entry: &BunEntry) -> bool {
+    let Some(meta) = entry.elems.iter().skip(1).find(|e| e.starts_with('{')) else {
+        return false;
+    };
+    match serde_json::from_str::<serde_json::Value>(meta) {
+        Ok(value) => value.get("bundled").and_then(serde_json::Value::as_bool) == Some(true),
+        Err(_) => meta.contains("\"bundled\""),
+    }
+}
+
 /// `(header_idx, close_idx)` of the `"packages": {` section.
 pub(crate) fn packages_bounds(lines: &[String]) -> Option<(usize, usize)> {
     let start = lines
@@ -276,6 +294,29 @@ pub(crate) fn decode_json_string(token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `bundled` meta flag, in the shapes real Bun 1.3.14 writes, the
+    /// rewritten tarball tuple, and a meta that is not plain JSON.
+    #[test]
+    fn bundled_meta_flag_is_detected() {
+        let bundled = |line: &str| is_bundled_entry(&parse_entry_line(line).unwrap());
+        assert!(bundled(
+            r#"    "@bh/bund/is-number": ["is-number@7.0.0", "", { "bundled": true }, "sha512-X=="],"#
+        ));
+        assert!(bundled(
+            r#"    "p/is-number": ["is-number@https://p.test/is-number-7.0.0.tgz", { "bundled": true }, "sha512-X=="],"#
+        ));
+        assert!(bundled(
+            r#"    "p/q": ["q@1.0.0", "", { "bundled": true, }, "sha512-X=="],"#
+        ));
+        assert!(!bundled(r#"    "q": ["q@1.0.0", "", {}, "sha512-X=="],"#));
+        assert!(!bundled(
+            r#"    "q": ["q@1.0.0", "", { "dependencies": { "bundled": "1.0.0" } }, "sha512-X=="],"#
+        ));
+        assert!(!bundled(
+            r#"    "q": ["q@1.0.0", "", { "bundled": false }, "sha512-X=="],"#
+        ));
+    }
 
     #[test]
     fn line_grammar_parses_the_fixture_shapes() {

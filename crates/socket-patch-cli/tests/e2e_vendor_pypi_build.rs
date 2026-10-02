@@ -828,6 +828,124 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
     );
 }
 
+/// Vendor then revert six on a REAL uv project whose existing sources use
+/// `sources_spelling`; the unwind must be silent, byte-identical, and leave
+/// a pair `uv lock --check` accepts (#544 dotted keys, #524 sub-tables).
+fn uv_sources_spelling_round_trip(tag: &str, sources_spelling: &str) {
+    let Some((uv, python)) = capstone_uv(tag) else {
+        return;
+    };
+    bake_leak_guards();
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let cache = tmp.path().join("uv-cache");
+    let mut cache_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", cache.to_str().unwrap())];
+    if let Some(py) = python.as_deref() {
+        cache_env.push(("UV_PYTHON", py));
+    }
+    if !setup_uv_six_project(&uv, &proj, &cache_env, tag) {
+        return;
+    }
+    // Re-lock with a second, user-authored source in the spelling under
+    // test (a direct wheel URL, so no local build backend is needed).
+    let idna = "https://files.pythonhosted.org/packages/e5/3e/741d8c82801c347547f8a2a06aa57dbb1992be9e948df2ea0eda2c8b79e8/idna-3.7-py3-none-any.whl";
+    std::fs::write(
+        proj.join("pyproject.toml"),
+        format!(
+            "[project]\nname = \"vendor-capstone\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\", \"idna\"]\n\n{}",
+            sources_spelling.replace("{IDNA}", idna)
+        ),
+    )
+    .unwrap();
+    let relock = tool(&uv, &proj, &["lock", "-q"], &cache_env);
+    if !relock.status.success() {
+        println!(
+            "SKIP e2e_vendor_pypi_build({tag}): `uv lock` with the idna source failed:\n{}",
+            String::from_utf8_lossy(&relock.stderr)
+        );
+        return;
+    }
+    assert_tool_ok(&tool(&uv, &proj, &["sync", "-q"], &cache_env), "uv sync");
+    let installed_six = site_packages(&proj.join(".venv")).join("six.py");
+    stage_patch(&proj, &installed_six);
+    let pyproject_before = std::fs::read(proj.join("pyproject.toml")).unwrap();
+    let uvlock_before = std::fs::read(proj.join("uv.lock")).unwrap();
+
+    let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_vendored_applied(&parse_envelope(&stdout));
+    let check = tool(&uv, &proj, &["lock", "--check"], &cache_env);
+    assert_tool_ok(&check, "`uv lock --check` on the wired pair");
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let renv = parse_envelope(&stdout);
+    assert_eq!(renv["status"], "success", "revert envelope: {renv}");
+    assert!(
+        !stdout.contains("vendor_lock_entry_drifted"),
+        "socket-patch's own sources line is not drift: {renv}"
+    );
+    assert_eq!(
+        String::from_utf8(std::fs::read(proj.join("pyproject.toml")).unwrap()).unwrap(),
+        String::from_utf8(pyproject_before).unwrap(),
+        "revert must restore pyproject.toml byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("uv.lock")).unwrap(),
+        uvlock_before,
+        "revert must restore uv.lock byte-identical"
+    );
+    let check = tool(&uv, &proj, &["lock", "--check"], &cache_env);
+    assert_tool_ok(&check, "`uv lock --check` after the revert");
+    assert!(
+        !proj.join(".socket/vendor").exists(),
+        ".socket/vendor must be fully removed after revert"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_dotted_sources_key() {
+    uv_sources_spelling_round_trip(
+        "uv-dotted-sources",
+        "[tool.uv]\nsources.idna = { url = \"{IDNA}\" }\n",
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_dotted_sources_url_key() {
+    uv_sources_spelling_round_trip(
+        "uv-dotted-sources-url",
+        "[tool.uv]\nsources.idna.url = \"{IDNA}\"\n",
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_sub_table_sources() {
+    uv_sources_spelling_round_trip(
+        "uv-sub-table-sources",
+        "[tool.uv.sources.idna]\nurl = \"{IDNA}\"\n",
+    );
+}
+
 /// `get <uuid> --mode vendored` twin of the uv capstone above (v3.6): the
 /// SAME vendor engine and wiring, driven through get's uuid path — exempt
 /// from installed narrowing, so only the mocked `view/{uuid}` route is

@@ -49,13 +49,32 @@ pub(crate) async fn vendor(
         Err(o) => return *o,
     };
     let leaf = tgz_rel_leaf(&coords.name, &coords.version);
-    let BinaryTargets { matches, mirrors } = match preflight_package(&project, root, &coords, &leaf)
-    {
+    let BinaryTargets {
+        matches,
+        mirrors,
+        bundled,
+    } = match preflight_package(&project, root, &coords, &leaf) {
         Ok(v) => v,
         Err(o) => return *o,
     };
     let BinaryProject { mut lock, .. } = project;
     let mut warnings = Vec::new();
+    for package in bundled {
+        // LOUD: this copy ships inside its PARENT's tarball, which we do not
+        // repack — it stays the unpatched bytes after vendor (#469).
+        warnings.push(super::VendorWarning::new(
+            "vendor_bundled_instance_skipped",
+            format!(
+                "{LOCK} package #{} ({}@{}) is {}bundled inside its parent's tarball and \
+                 CANNOT be rewritten there — that copy stays UNPATCHED; vendor or update the \
+                 bundling parent to cover it",
+                package.id,
+                coords.name,
+                coords.version,
+                if package.bundled_only { "" } else { "also " },
+            ),
+        ));
+    }
     let preexisted = root.join(&coords.uuid_dir_rel).exists();
     let (staged, result) = match stage_patch_pack(
         purl,
@@ -284,6 +303,9 @@ pub(super) async fn read_project(root: &Path) -> Result<BinaryProject, Box<Vendo
 pub(super) struct BinaryTargets {
     matches: Vec<BinaryPackage>,
     mirrors: Vec<(String, String)>,
+    /// Matching records some bundled edge reaches (#469): each one's
+    /// bundled copy stays unpatched, which vendoring reports loudly.
+    bundled: Vec<BinaryPackage>,
 }
 
 /// The per-package pre-flight against an already-read lock: the records
@@ -297,7 +319,7 @@ pub(super) fn preflight_package(
     coords: &NpmCoords,
     leaf: &str,
 ) -> Result<BinaryTargets, Box<VendorOutcome>> {
-    let matches: Vec<_> = project
+    let (bundled_only, matches): (Vec<_>, Vec<_>) = project
         .packages
         .iter()
         .filter(|p| {
@@ -305,7 +327,27 @@ pub(super) fn preflight_package(
                 || is_ours(p, &coords.name, leaf)
         })
         .cloned()
+        .partition(|p| p.bundled_only);
+    let bundled: Vec<_> = matches
+        .iter()
+        .filter(|p| p.bundled)
+        .chain(&bundled_only)
+        .cloned()
         .collect();
+    if matches.is_empty() && !bundled_only.is_empty() {
+        // Only a bundled edge reaches the record: Bun unpacks that copy
+        // from the parent's tarball, so rewiring the record installs
+        // nothing, and "run `bun install`" would not help either.
+        return Err(Box::new(refused(
+            "vendor_lock_entry_not_rewritable",
+            format!(
+                "every {LOCK} record for {}@{} is bundled inside a parent's tarball and \
+                 cannot be rewritten — those copies stay UNPATCHED and `bun install` will not \
+                 help; vendor or update the bundling parent to cover them",
+                coords.name, coords.version
+            ),
+        )));
+    }
     if matches.is_empty() {
         return Err(Box::new(refused(
             "vendor_lock_entry_not_found",
@@ -333,7 +375,11 @@ pub(super) fn preflight_package(
         Ok(v) => v,
         Err(e) => return Err(Box::new(refused("vendor_bun_lockb_invalid", e))),
     };
-    Ok(BinaryTargets { matches, mirrors })
+    Ok(BinaryTargets {
+        matches,
+        mirrors,
+        bundled,
+    })
 }
 
 /// Which of `packages` [`vendor`] would refuse before its first service

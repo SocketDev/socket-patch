@@ -1256,11 +1256,37 @@ pub(crate) async fn vendor_vlt<'a>(
         Err(outcome) => return *outcome,
     };
     let (name, version) = (coords.name.as_str(), coords.version.as_str());
+    // A bundled copy of the package (#471) has no lock node, so no rewire
+    // reaches it: it stays unpatched beside whatever this run wires.
+    let bundled = match crate::utils::purl::npm_purl(name, version) {
+        Some(key) => super::vlt_bundled::bundled_copies(project_root)
+            .await
+            .remove(&key),
+        None => None,
+    };
     let analysis = match analyze(project_root, name, version, &record.uuid).await {
         Ok(analysis) => analysis,
+        Err(("vendor_lock_entry_not_found", _)) if bundled.is_some() => {
+            // The package IS installed, so "run `vlt install`" would be
+            // wrong twice over: name the real reason.
+            return refused(
+                "vendor_lock_entry_not_rewritable",
+                super::vlt_bundled::bundled_copy_detail(
+                    name,
+                    version,
+                    bundled.as_deref().unwrap_or_default(),
+                ),
+            );
+        }
         Err((code, detail)) => return refused(code, detail),
     };
     let mut warnings = Vec::new();
+    if let Some(location) = &bundled {
+        warnings.push(VendorWarning::new(
+            "vendor_bundled_instance_skipped",
+            super::vlt_bundled::bundled_copy_detail(name, version, location),
+        ));
+    }
     if analysis.doc.is_era_a() {
         warnings.push(VendorWarning::new(
             "vendor_vlt_legacy_lockfile",
@@ -2278,6 +2304,45 @@ mod tests {
             importer_spec(".socket", &rel),
             format!("file:./{}", &rel[8..])
         );
+    }
+
+    /// REGRESSION (#471): package `a` bundles `left-pad@1.3.0`, which vlt
+    /// unpacks into `a`'s store entry with no lock node. Vendoring wires
+    /// the regular node but must say loudly that the bundled copy stays
+    /// unpatched; with the bundled copy as the only install, it refuses
+    /// with that reason instead of "run `vlt install`".
+    #[tokio::test]
+    async fn a_bundled_store_copy_is_reported_not_silently_left_unpatched() {
+        let bundled = (
+            "node_modules/.vlt/~npm~a@1.0.0/node_modules/a/node_modules/left-pad/package.json",
+            r#"{"name":"left-pad","version":"1.3.0"}"#,
+        );
+        let parent = (
+            "node_modules/.vlt/~npm~a@1.0.0/node_modules/a/package.json",
+            r#"{"name":"a","version":"1.0.0","bundleDependencies":["left-pad"]}"#,
+        );
+        let both = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG), parent, bundled]).await;
+        let (entry, warnings) = entry_of(run(&both, UUID, false).await);
+        assert!(!entry.wiring.is_empty());
+        let warning = warnings
+            .iter()
+            .find(|w| w.code == "vendor_bundled_instance_skipped")
+            .unwrap_or_else(|| panic!("{warnings:?}"));
+        assert!(
+            warning.detail.contains("~npm~a@1.0.0") && warning.detail.contains("UNPATCHED"),
+            "{}",
+            warning.detail
+        );
+
+        let only_bundled = render(
+            1,
+            &[r#""~npm~a@1.0.0": [0,"a","sha512-A=="]"#],
+            &[r#""file~_d a": "prod 1.0.0 ~npm~a@1.0.0""#],
+        );
+        let only = fx(&only_bundled, &[(PACKAGE_JSON, ROOT_PKG), parent, bundled]).await;
+        let (code, detail) = refusal(run(&only, UUID, false).await);
+        assert_eq!(code, "vendor_lock_entry_not_rewritable", "{detail}");
+        assert!(detail.contains("UNPATCHED"), "{detail}");
     }
 
     #[tokio::test]

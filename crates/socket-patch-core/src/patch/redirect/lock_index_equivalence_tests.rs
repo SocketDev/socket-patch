@@ -163,7 +163,7 @@ fn indexed_npm_lock_rewrite_matches_golden() {
         let refs: Vec<&DepOverride> = deps.iter().collect();
         for lockfile in ["package-lock.json", "npm-shrinkwrap.json"] {
             let mut got = RewriteResult::default();
-            rewrite_one_npm_lock(&text, lockfile, &refs, &mut got);
+            rewrite_one_npm_lock(&text, lockfile, &refs, &NpmOverrides::default(), &mut got);
             record(&(&text, lockfile, &deps), &got);
             edits += got.edits.len();
             codes.extend(got.warnings.iter().map(|w| w.code.clone()));

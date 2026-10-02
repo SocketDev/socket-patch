@@ -1624,13 +1624,28 @@ async fn run_scan(
     let vendor_state = &ctx.loaded().await.vendor;
     let ledger_supplement =
         vendored_ledger_supplement(&args.common, &all_crawled, vendor_state).await;
-    for pkg in &ledger_supplement {
+    for pkg in &ledger_supplement.packages {
         if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
             *eco_counts.entry(eco).or_insert(0) += 1;
         }
         supplement_purls.insert(pkg.purl.clone());
     }
-    all_crawled.extend(ledger_supplement);
+    all_crawled.extend(ledger_supplement.packages);
+    // Ledger entries whose dependency left the lock: not discovered (see
+    // `vendored_ledger_supplement`). A pruning run reverts them in its GC;
+    // every other run says how to.
+    let unwired_vendored: Vec<String> = ledger_supplement
+        .unwired
+        .into_iter()
+        .filter(|purl| args.common.purl_ecosystem_selected(purl))
+        .collect();
+    let prune_reverts_unwired = prune && !hosted;
+    if !unwired_vendored.is_empty() && !prune_reverts_unwired {
+        layout_refusals.push((
+            "vendor_ledger_entry_unwired".to_string(),
+            render::unwired_vendored_detail(&unwired_vendored),
+        ));
+    }
 
     // Every PURL the crawl found, captured BEFORE the `--ecosystems` /
     // `--package` / PATH filters: prune must judge manifest entries against
@@ -1763,8 +1778,22 @@ async fn run_scan(
             }
             policy.print_warnings(args.common.silent);
             // Hosted mode already printed its own prune-ignored warning.
-            if prune && !hosted {
+            if prune && !hosted && unwired_vendored.is_empty() {
                 eprintln!("{}", render::PRUNE_SKIPPED_EMPTY);
+            }
+        }
+        // The manifest half of the GC is skipped on an empty crawl, but
+        // reverting vendored entries the lock no longer wires asks the
+        // lockfile, not the crawl: run that half alone, or a project whose
+        // last vendored dependency was removed could never reconcile.
+        let unwired_gc = if prune_reverts_unwired && !unwired_vendored.is_empty() {
+            Some(gc::run_vendor_only_gc(&args.common, &manifest_path, &socket_dir).await)
+        } else {
+            None
+        };
+        if human {
+            if let Some(gc) = &unwired_gc {
+                gc::print_human_gc(gc, args.common.dry_run);
             }
         }
         // Telemetry: empty-scan still counts as a successful scan.
@@ -1808,6 +1837,9 @@ async fn run_scan(
             // empty one.
             if !layout_refusals.is_empty() {
                 result["warnings"] = layout_refusal_json(&layout_refusals);
+            }
+            if let Some(gc) = &unwired_gc {
+                result["gc"] = gc.to_json(args.common.dry_run);
             }
             policy.fold_into_json(&mut result);
             // Hosted mode: a no-op `redirect` block keeps the envelope

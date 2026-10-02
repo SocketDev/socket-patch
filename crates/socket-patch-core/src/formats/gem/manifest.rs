@@ -2,16 +2,19 @@
 //! hosted rewriter's caller and the vendored backend, so neither can wire a
 //! file Bundler ignores.
 //!
-//! Bundler's own order (`Bundler::SharedHelpers#default_gemfile` and the CLI's
-//! `gemfile` setting):
+//! Bundler's own order (`Bundler::Settings` priority — local app config
+//! over ENV — read by `Bundler::CLI#initialize`, which re-exports the
+//! winning `gemfile` setting into `BUNDLE_GEMFILE`):
 //!
-//! 1. `BUNDLE_GEMFILE` from the environment (a relative value is read
-//!    against the project root: bundler expands it against the directory
-//!    `bundle` runs in, which is the project, not socket-patch's own
-//!    cwd when it runs with `--cwd`);
-//! 2. `BUNDLE_GEMFILE:` in the app config file, `$BUNDLE_APP_CONFIG/config`
+//! 1. `BUNDLE_GEMFILE:` in the app config file, `$BUNDLE_APP_CONFIG/config`
 //!    else `<root>/.bundle/config` (what `bundle config set --local gemfile
 //!    Gemfile.next` writes; relative to the project root);
+//! 2. `BUNDLE_GEMFILE` from the environment (a relative value is read
+//!    against the project root: bundler expands it against the directory
+//!    `bundle` runs in, which is the project, not socket-patch's own
+//!    cwd when it runs with `--cwd`). An environment value naming a file in
+//!    ANOTHER directory moves `Bundler.root` there, and bundler then reads
+//!    that root's app config, never this project's — so it decides alone;
 //! 3. otherwise `gems.rb` when present, else `Gemfile` (bundler >= 2; 1.x
 //!    reads a `Gemfile` first, so callers treat a twin as ambiguous or
 //!    follow the >= 2 order, as the hosted rewriter does).
@@ -28,7 +31,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use crate::crawlers::ruby_crawler::unquote_bundle_config_value;
+use crate::crawlers::ruby_crawler::bundle_config_setting;
 use crate::utils::fs::normalize_lexically;
 
 /// Where a configured `BUNDLE_GEMFILE` came from.
@@ -112,42 +115,47 @@ impl LoadedManifest {
 /// The `BUNDLE_GEMFILE:` value of a bundler app config file (flat YAML that
 /// bundler writes itself; an empty value counts as unset).
 pub fn config_gemfile(contents: &str) -> Option<String> {
-    let mut found = None;
-    for line in contents.lines() {
-        if let Some(rest) = line.strip_prefix("BUNDLE_GEMFILE:") {
-            let v = unquote_bundle_config_value(rest);
-            found = (!v.is_empty()).then(|| v.to_string());
-        }
-    }
-    found
+    bundle_config_setting(contents, "BUNDLE_GEMFILE")
 }
 
-/// Classify the configured `BUNDLE_GEMFILE` (environment first, then the
-/// app config value) against `root`, which also anchors a relative value.
+/// `value` resolved against `root` (an absolute value stands alone), made
+/// absolute and lexically normalized; `None` when that is impossible.
+fn resolve_against(root: &Path, value: &Path) -> Option<PathBuf> {
+    let joined = if value.is_absolute() {
+        value.to_path_buf()
+    } else {
+        root.join(value)
+    };
+    std::path::absolute(joined)
+        .ok()
+        .and_then(|p| normalize_lexically(&p))
+}
+
+/// Classify the configured `BUNDLE_GEMFILE` against `root`, which also
+/// anchors a relative value: the app config value first, then the
+/// environment — unless the environment names a manifest outside `root`,
+/// which moves bundler's root (and with it the app config bundler reads)
+/// away from this project. See the module doc.
 pub fn classify(
     root: &Path,
     gemfile_env: Option<&OsStr>,
     config_value: Option<&str>,
 ) -> LoadedManifest {
-    let (value, by) = match gemfile_env.filter(|v| !v.is_empty()) {
-        Some(v) => (PathBuf::from(v), GemfileSetting::Env),
-        None => match config_value.filter(|v| !v.is_empty()) {
-            Some(v) => (PathBuf::from(v), GemfileSetting::AppConfig),
-            None => return LoadedManifest::Default,
-        },
+    let env = gemfile_env.filter(|v| !v.is_empty()).map(PathBuf::from);
+    let config = config_value.filter(|v| !v.is_empty()).map(PathBuf::from);
+    let env_keeps_root = |env: &Path| {
+        let dir = resolve_against(root, env).and_then(|p| p.parent().map(Path::to_path_buf));
+        dir.is_some() && dir == resolve_against(root, Path::new(""))
+    };
+    let (value, by) = match (env, config) {
+        (Some(env), Some(config)) if env_keeps_root(&env) => (config, GemfileSetting::AppConfig),
+        (Some(env), _) => (env, GemfileSetting::Env),
+        (None, Some(config)) => (config, GemfileSetting::AppConfig),
+        (None, None) => return LoadedManifest::Default,
     };
     let display = value.display().to_string();
-    let absolute = |p: &Path| {
-        std::path::absolute(p)
-            .ok()
-            .and_then(|p| normalize_lexically(&p))
-    };
-    let target = if value.is_absolute() {
-        absolute(&value)
-    } else {
-        absolute(&root.join(&value))
-    };
-    let root = absolute(root);
+    let target = resolve_against(root, &value);
+    let root = resolve_against(root, Path::new(""));
     if let (Some(target), Some(root)) = (target, root) {
         for manifest in ["Gemfile", "gems.rb"] {
             if target == root.join(manifest) {
@@ -206,13 +214,48 @@ mod tests {
         assert_eq!(m.pair(true), Some(("Gemfile", "Gemfile.lock")));
     }
 
-    /// The environment wins over the app config, and a relative value is
-    /// read against the project root even when socket-patch runs elsewhere
-    /// with `--cwd` (Bugbot on #431: `BUNDLE_GEMFILE=Gemfile` must select
-    /// the project's Gemfile, not a file under the process cwd).
+    /// The app config wins over the environment, as in `Bundler::Settings`
+    /// (local config has a higher priority than ENV, and `Bundler::CLI`
+    /// re-exports the winning `gemfile` setting into `BUNDLE_GEMFILE`):
+    /// `bundle config set --local gemfile Gemfile.next` plus an exported
+    /// `BUNDLE_GEMFILE=Gemfile` makes bundler load `Gemfile.next` (#507).
     #[test]
-    fn env_wins_over_config_and_is_anchored_at_the_project_root() {
+    fn config_wins_over_env_like_bundler_settings() {
         let m = classify(&root(), Some(OsStr::new("Gemfile")), Some("Gemfile.next"));
+        assert_eq!(
+            m,
+            LoadedManifest::Unsupported {
+                value: "Gemfile.next".into(),
+                by: GemfileSetting::AppConfig
+            }
+        );
+        // The remedy names the setting bundler actually uses.
+        let detail = m.unsupported_detail().unwrap();
+        assert!(
+            detail.contains("bundle config unset --local gemfile"),
+            "{detail}"
+        );
+        // Both naming supported spellings: the config's pair is wired.
+        let m = classify(&root(), Some(OsStr::new("gems.rb")), Some("Gemfile"));
+        assert_eq!(
+            m,
+            LoadedManifest::Configured {
+                manifest: "Gemfile",
+                by: GemfileSetting::AppConfig
+            }
+        );
+        let m = classify(&root(), Some(OsStr::new("Gemfile")), Some("gems.rb"));
+        assert_eq!(m.pair(false), Some(("gems.rb", "gems.locked")));
+    }
+
+    /// The environment applies when the app config sets nothing, and a
+    /// relative value is read against the project root even when
+    /// socket-patch runs elsewhere with `--cwd` (Bugbot on #431:
+    /// `BUNDLE_GEMFILE=Gemfile` must select the project's Gemfile, not a
+    /// file under the process cwd).
+    #[test]
+    fn env_applies_without_config_and_is_anchored_at_the_project_root() {
+        let m = classify(&root(), Some(OsStr::new("Gemfile")), None);
         assert_eq!(
             m,
             LoadedManifest::Configured {
@@ -228,6 +271,30 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// An environment `BUNDLE_GEMFILE` in ANOTHER directory moves bundler's
+    /// root there (`Bundler.root` is the Gemfile's directory), so bundler
+    /// reads that root's app config, never this project's: the project's
+    /// `.bundle/config` cannot win, and the run refuses on the env value.
+    #[test]
+    fn env_gemfile_in_another_directory_is_never_overridden_by_project_config() {
+        for env in ["../other/Gemfile", "sub/Gemfile", "/elsewhere/Gemfile"] {
+            let m = classify(&root(), Some(OsStr::new(env)), Some("Gemfile"));
+            assert_eq!(
+                m,
+                LoadedManifest::Unsupported {
+                    value: env.into(),
+                    by: GemfileSetting::Env
+                },
+                "{env}"
+            );
+        }
+        // An absolute env value naming the root's own directory is the
+        // same root: the config still wins.
+        let abs = root().join("Gemfile.next");
+        let m = classify(&root(), Some(abs.as_os_str()), Some("Gemfile"));
+        assert_eq!(m.pair(false), Some(("Gemfile", "Gemfile.lock")));
     }
 
     /// The refusal names the remedy for the knob that set it: unsetting the

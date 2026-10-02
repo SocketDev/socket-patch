@@ -495,12 +495,12 @@ pub(super) async fn wire_uv(
 
     // ── pyproject.toml (computed in memory; committed before the lock) ────
     let mut doc = (*p.pyproject).clone();
-    let had_uv_table = doc.get("tool").and_then(|t| item_get(t, "uv")).is_some();
-    let created_sources_table = doc
-        .get("tool")
-        .and_then(|t| item_get(t, "uv"))
-        .and_then(|u| item_get(u, "sources"))
-        .is_none();
+    let uv_item = doc.get("tool").and_then(|t| item_get(t, "uv"));
+    let had_uv_table = uv_item.is_some();
+    // A header-less parent (implied by `[tool.uv.sources.<pkg>]` sub-tables)
+    // prints its own header once we add a key to it, so that header is ours
+    // to remove on revert exactly as if we had created the table (#524).
+    let created_sources_table = header_is_ours(uv_item.and_then(|u| item_get(u, "sources")));
 
     if class == UvDepClass::Transitive {
         // uv 0.2.35–0.5.3 do NOT apply [tool.uv.sources] to
@@ -611,6 +611,21 @@ pub(super) async fn wire_uv(
     // toml_edit re-emits every newline as LF; a CRLF pyproject would come
     // back all-LF (whole-file churn, and revert splices never restore it).
     let new_pyproject = preserve_line_endings(&p.pyproject_text, doc.to_string());
+    // toml_edit writes each added key in the spelling its parent already
+    // uses (`sources.six = …` under a dotted `[tool.uv]` key, `uv.…` under
+    // `[tool]`), so record the line as it actually rendered: revert splices
+    // it out by exact match (#544).
+    for rec in wiring
+        .iter_mut()
+        .filter(|r| r.file == "pyproject.toml" && r.action == WiringAction::Added)
+    {
+        let Some(fragment) = rec.new.as_ref().and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if let Some(line) = rendered_key_line(&p.pyproject_text, &new_pyproject, fragment) {
+            rec.new = Some(serde_json::Value::String(line));
+        }
+    }
 
     // ── uv.lock text surgery (fully computed before any write) ────────────
     let mut new_lock = p.lock_text.clone();
@@ -999,6 +1014,34 @@ fn newline_of(text: &str) -> &'static str {
     } else {
         "\n"
     }
+}
+
+/// Whether a header for this `[tool.uv…]` table would be socket-patch's own
+/// bytes once a key is added: the table is absent, or exists only
+/// implicitly (no header of its own, just `[….<sub>]` sub-tables). A dotted
+/// or explicit table already has the user's spelling and is never ours.
+fn header_is_ours(item: Option<&Item>) -> bool {
+    match item {
+        None => true,
+        Some(Item::Table(t)) => t.is_implicit() && !t.is_dotted(),
+        Some(_) => false,
+    }
+}
+
+/// The line of `new` that renders the added `fragment` (`key = value`),
+/// including any dotted-key prefix toml_edit gave it, without its line
+/// ending. Only lines absent from `old` count, so a user's identical line
+/// is never mistaken for ours.
+fn rendered_key_line(old: &str, new: &str, fragment: &str) -> Option<String> {
+    // `str::lines` drops a trailing `\r` with the `\n`.
+    let old_lines: std::collections::HashSet<&str> = old.lines().collect();
+    new.lines()
+        .find(|line| {
+            line.strip_suffix(fragment)
+                .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('.'))
+                && !old_lines.contains(line)
+        })
+        .map(str::to_string)
 }
 
 /// Walk/create the table chain, marking CREATED intermediates implicit so
@@ -5685,5 +5728,183 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
             "pyproject never written"
         );
         assert_eq!(lock, relocked, "the live lock is left alone");
+    }
+
+    /// Wire `pyproject` against `lock`, check the sources entry landed in
+    /// the file's own spelling, then revert and require a silent,
+    /// byte-identical round trip (#544, #524).
+    async fn assert_sources_spelling_round_trips(pyproject: &str, lock: &str, wired_line: &str) {
+        let tmp = write_pair(pyproject, lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
+        )
+        .await
+        .unwrap();
+        let (wired, _) = read_pair(tmp.path()).await;
+        assert!(
+            wired
+                .lines()
+                .any(|l| l.trim_end_matches('\r') == wired_line),
+            "expected {wired_line:?} in the wired pyproject:\n{wired}"
+        );
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "socket-patch's own line is not drift: {:?}",
+            outcome.warnings
+        );
+        let (reverted, reverted_lock) = read_pair(tmp.path()).await;
+        assert_eq!(
+            reverted, pyproject,
+            "pyproject.toml must round-trip byte-identically"
+        );
+        assert_eq!(reverted_lock, lock);
+    }
+
+    fn six_source_line(prefix: &str) -> String {
+        format!("{prefix}six = {{ path = \"{REL_WHEEL}\" }}")
+    }
+
+    /// #544: `[tool.uv]` + `sources.<pkg> = { … }` makes the vendored entry
+    /// print as `sources.six = { … }`; revert must find that line.
+    #[tokio::test]
+    async fn revert_round_trips_dotted_sources_under_tool_uv() {
+        let pyproject = format!(
+            "{DIRECT_REGISTRY_PYPROJECT}\n[tool.uv]\nsources.localpkg = {{ path = \"./localpkg\" }}\n"
+        );
+        assert_sources_spelling_round_trips(
+            &pyproject,
+            DIRECT_REGISTRY_LOCK,
+            &six_source_line("sources."),
+        )
+        .await;
+    }
+
+    /// #544: the fully dotted `sources.<pkg>.path = …` spelling.
+    #[tokio::test]
+    async fn revert_round_trips_dotted_sources_path_key() {
+        let pyproject = format!(
+            "{DIRECT_REGISTRY_PYPROJECT}\n[tool.uv]\nsources.localpkg.path = \"./localpkg\"\n"
+        );
+        assert_sources_spelling_round_trips(
+            &pyproject,
+            DIRECT_REGISTRY_LOCK,
+            &six_source_line("sources."),
+        )
+        .await;
+    }
+
+    /// #544 (follow-up comment): `[tool]` + `uv.sources.<pkg> = { … }`.
+    #[tokio::test]
+    async fn revert_round_trips_dotted_uv_sources_under_tool() {
+        let pyproject = format!(
+            "{DIRECT_REGISTRY_PYPROJECT}\n[tool]\nuv.sources.localpkg = {{ path = \"./localpkg\" }}\n"
+        );
+        assert_sources_spelling_round_trips(
+            &pyproject,
+            DIRECT_REGISTRY_LOCK,
+            &six_source_line("uv.sources."),
+        )
+        .await;
+    }
+
+    /// #544: a root-level `tool.uv.sources.<pkg>` dotted key.
+    #[tokio::test]
+    async fn revert_round_trips_root_dotted_tool_uv_sources() {
+        let pyproject = format!(
+            "tool.uv.sources.localpkg = {{ path = \"./localpkg\" }}\n\n{DIRECT_REGISTRY_PYPROJECT}"
+        );
+        assert_sources_spelling_round_trips(
+            &pyproject,
+            DIRECT_REGISTRY_LOCK,
+            &six_source_line("tool.uv.sources."),
+        )
+        .await;
+    }
+
+    /// #544 on a CRLF checkout: the recorded line must still match.
+    #[tokio::test]
+    async fn revert_round_trips_dotted_sources_crlf() {
+        let pyproject = format!(
+            "{DIRECT_REGISTRY_PYPROJECT}\n[tool.uv]\nsources.localpkg = {{ path = \"./localpkg\" }}\n"
+        )
+        .replace('\n', "\r\n");
+        assert_sources_spelling_round_trips(
+            &pyproject,
+            DIRECT_REGISTRY_LOCK,
+            &six_source_line("sources."),
+        )
+        .await;
+    }
+
+    /// #544, transitive leg: with a dotted `uv` key under `[tool]`, the
+    /// override prints as `uv.override-dependencies = […]` and must revert.
+    #[tokio::test]
+    async fn revert_round_trips_dotted_override_under_tool() {
+        let pyproject = format!(
+            "{TRANSITIVE_REGISTRY_PYPROJECT}\n[tool]\nuv.sources.localpkg = {{ path = \"./localpkg\" }}\n"
+        );
+        assert_sources_spelling_round_trips(
+            &pyproject,
+            TRANSITIVE_REGISTRY_LOCK,
+            "uv.override-dependencies = [\"six==1.16.0\"]",
+        )
+        .await;
+    }
+
+    /// #524: only `[tool.uv.sources.<pkg>]` sub-tables, no header. Wiring
+    /// prints an explicit `[tool.uv.sources]` header; revert must drop it.
+    #[tokio::test]
+    async fn revert_drops_header_made_explicit_over_sub_tables() {
+        let pyproject = format!(
+            "{DIRECT_REGISTRY_PYPROJECT}\n[tool.uv.sources.localpkg]\npath = \"./localpkg\"\n"
+        );
+        assert_sources_spelling_round_trips(&pyproject, DIRECT_REGISTRY_LOCK, &six_source_line(""))
+            .await;
+    }
+
+    /// #524, transitive leg with a sub-table-only sources parent.
+    #[tokio::test]
+    async fn revert_drops_header_made_explicit_over_sub_tables_override() {
+        let pyproject = format!(
+            "{TRANSITIVE_REGISTRY_PYPROJECT}\n[tool.uv.sources.localpkg]\npath = \"./localpkg\"\n"
+        );
+        assert_sources_spelling_round_trips(
+            &pyproject,
+            TRANSITIVE_REGISTRY_LOCK,
+            &six_source_line(""),
+        )
+        .await;
+    }
+
+    /// #524 on a CRLF checkout.
+    #[tokio::test]
+    async fn revert_drops_header_made_explicit_over_sub_tables_crlf() {
+        let pyproject = format!(
+            "{DIRECT_REGISTRY_PYPROJECT}\n[tool.uv.sources.localpkg]\npath = \"./localpkg\"\n"
+        )
+        .replace('\n', "\r\n");
+        assert_sources_spelling_round_trips(&pyproject, DIRECT_REGISTRY_LOCK, &six_source_line(""))
+            .await;
+    }
+
+    /// Control: a user-authored explicit `[tool.uv.sources]` header stays.
+    #[tokio::test]
+    async fn revert_keeps_user_authored_sources_header() {
+        let pyproject = format!(
+            "{DIRECT_REGISTRY_PYPROJECT}\n[tool.uv.sources]\nlocalpkg = {{ path = \"./localpkg\" }}\n"
+        );
+        assert_sources_spelling_round_trips(&pyproject, DIRECT_REGISTRY_LOCK, &six_source_line(""))
+            .await;
     }
 }

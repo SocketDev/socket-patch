@@ -1348,11 +1348,25 @@ fn root_workspace_name(blocks: &[LockBlock]) -> Option<String> {
 /// skipped the way yarn's YAML parser skips it — otherwise a knob on the
 /// first line of a BOM'd file would read as unset (the offline-reproducible
 /// default) while yarn applies it and every install fails YN0018.
+///
+/// The value is read as a YAML scalar: a quoted value ends at its closing
+/// quote, and a plain value ends before a whitespace-separated `#` comment
+/// (`compressionLevel: 0 # keep yarn default` is `0`, #370). A `#` with no
+/// whitespace before it stays part of a plain value, as in YAML.
 pub(crate) fn yarnrc_compression_level(rc: &str) -> Option<&str> {
     let rc = rc.strip_prefix('\u{feff}').unwrap_or(rc);
     rc.lines().find_map(|line| {
-        let rest = line.strip_prefix("compressionLevel:")?;
-        Some(rest.trim().trim_matches(['\'', '"']))
+        let rest = line.strip_prefix("compressionLevel:")?.trim();
+        if let Some(quote) = rest.chars().next().filter(|c| matches!(c, '\'' | '"')) {
+            if let Some(end) = rest[1..].find(quote) {
+                return Some(&rest[1..1 + end]);
+            }
+        }
+        let value = rest
+            .char_indices()
+            .find(|&(i, c)| c == '#' && rest[..i].ends_with([' ', '\t']))
+            .map_or(rest, |(i, _)| &rest[..i]);
+        Some(value.trim_end().trim_matches(['\'', '"']))
     })
 }
 
@@ -1851,6 +1865,21 @@ __metadata:
         tokio::fs::write(
             fx.root().join(YARNRC),
             "nodeLinker: node-modules\ncompressionLevel: 0\n",
+        )
+        .await
+        .unwrap();
+        let (result, _, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+    }
+
+    /// #370: `compressionLevel: 0` with a trailing YAML comment is the
+    /// default yarn reads as `0`, so vendoring proceeds rather than refusing.
+    #[tokio::test]
+    async fn commented_default_compression_level_vendors() {
+        let fx = fixture().await;
+        tokio::fs::write(
+            fx.root().join(YARNRC),
+            "nodeLinker: node-modules\ncompressionLevel: 0 # keep yarn default\n",
         )
         .await
         .unwrap();
@@ -3960,6 +3989,37 @@ __metadata:
         assert_eq!(
             yarnrc_compression_level("\u{feff}nodeLinker: pnp\r\n"),
             None
+        );
+    }
+
+    /// A trailing YAML comment is not part of the scalar (#370): yarn reads
+    /// `compressionLevel: 0 # keep yarn default` as `0`, quoted or not.
+    #[test]
+    fn yarnrc_compression_level_drops_a_trailing_comment() {
+        for (rc, level) in [
+            ("compressionLevel: 0 # keep yarn default\n", "0"),
+            ("compressionLevel: 0\t# tab-separated\r\n", "0"),
+            ("compressionLevel: 0   #\n", "0"),
+            ("compressionLevel: \"0\" # quoted\n", "0"),
+            ("compressionLevel: '0'# quoted, no gap\n", "0"),
+            ("compressionLevel: mixed # not the default\n", "mixed"),
+            ("compressionLevel: 9 #\r\n", "9"),
+        ] {
+            assert_eq!(yarnrc_compression_level(rc), Some(level), "{rc:?}");
+        }
+    }
+
+    /// A `#` with no whitespace before it is part of a plain scalar in YAML,
+    /// so `0#x` is not the default and must still refuse (fail closed).
+    #[test]
+    fn yarnrc_compression_level_keeps_an_unseparated_hash() {
+        assert_eq!(
+            yarnrc_compression_level("compressionLevel: 0#x\n"),
+            Some("0#x")
+        );
+        assert_eq!(
+            yarnrc_compression_level("compressionLevel: \"0 # in quotes\"\n"),
+            Some("0 # in quotes")
         );
     }
 

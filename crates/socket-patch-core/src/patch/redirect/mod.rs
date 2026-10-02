@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
 use crate::vendor::common::{parse_json_text, JsonLayout};
-use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries};
+use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries, NpmOverrides};
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 mod bun_binary;
@@ -256,6 +256,17 @@ pub struct RewriteResult {
     /// Patch uuids with a same-`name@version` vlt node under a named alias,
     /// a scoped registry or jsr, which hosted mode leaves unpatched.
     pub vlt_foreign_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids with a same-`name@version` bundled instance the rewriter
+    /// skipped (Bun's `bundled` entries/records, #469): that copy is
+    /// unpacked from its parent's tarball and stays unpatched, so a
+    /// confirmation of the uuid must never stand in for the installed tree
+    /// (in-run VEX verifies it instead). Left out of the golden digests
+    /// while empty, so the blessed oracle outputs predating it still hold.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub bundled_skipped_uuids: std::collections::BTreeSet<String>,
     /// [`vlt::vlt_drives`] over the rewriter's input files and the
     /// caller's `bun_lockb_present`.
     pub vlt_drives: bool,
@@ -536,6 +547,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         confirmed_vlt_uuids,
         refused_vlt_uuids,
         vlt_foreign_uuids,
+        bundled_skipped_uuids,
         vlt_drives: _,
     } = delta;
     result.files.extend(files);
@@ -567,6 +579,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.confirmed_vlt_uuids.extend(confirmed_vlt_uuids);
     result.refused_vlt_uuids.extend(refused_vlt_uuids);
     result.vlt_foreign_uuids.extend(vlt_foreign_uuids);
+    result.bundled_skipped_uuids.extend(bundled_skipped_uuids);
 }
 
 /// [`rewrite_groups_serial`], with the groups run concurrently under
@@ -819,8 +832,21 @@ fn rewrite_npm_lock(
         }
         return;
     }
+    // The root manifest's `overrides` decide which git / url / `file:`
+    // dependent specs npm actually installs from (#490); the engine reads
+    // it as advisory input only.
+    let manifest_overrides = files
+        .get("package.json")
+        .map(|text| NpmOverrides::from_manifest_text(text))
+        .unwrap_or_default();
     for lockfile in present {
-        rewrite_one_npm_lock(&files[lockfile], lockfile, &npm, result);
+        rewrite_one_npm_lock(
+            &files[lockfile],
+            lockfile,
+            &npm,
+            &manifest_overrides,
+            result,
+        );
     }
 }
 
@@ -831,6 +857,7 @@ fn rewrite_one_npm_lock(
     content: &str,
     lockfile: &str,
     npm: &[&DepOverride],
+    manifest_overrides: &NpmOverrides,
     result: &mut RewriteResult,
 ) {
     // npm reads past a leading UTF-8 BOM; so do we.
@@ -879,7 +906,7 @@ fn rewrite_one_npm_lock(
         .unwrap_or_default();
     // Entries npm installs from a git / url / `file:` spec: see
     // `vendor::npm_origin` (#326).
-    let non_registry = npm_non_registry_entries(&lock);
+    let non_registry = npm_non_registry_entries(&lock, manifest_overrides);
     let mut changed = false;
     for dep in npm {
         let fname = full_name(dep);
@@ -3641,7 +3668,7 @@ fn rewrite_bun_lock(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    use crate::vendor::bun_lock_text::decode_json_string;
+    use crate::vendor::bun_lock_text::{decode_json_string, is_bundled_entry};
 
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     if npm.is_empty() {
@@ -3689,6 +3716,28 @@ fn rewrite_bun_lock(
             let Some(spec) = entry.elems.first().and_then(|e| decode_json_string(e)) else {
                 continue;
             };
+            // Bun unpacks a bundled copy from its PARENT's tarball and never
+            // reads the entry's spec (#469), so a rewrite here would count
+            // as redirected (and VEX-attest the patch) while the unpatched
+            // bundled bytes keep installing. Mirrors npm's `inBundle` guard.
+            if is_bundled_entry(entry)
+                && (spec == target_spec
+                    || spec == url_spec
+                    || is_prior_hosted_bun_spec(&spec, &fname, &dep.artifact_url))
+            {
+                matched_any = true;
+                result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_bun_bundled_instance_skipped".into(),
+                    detail: format!(
+                        "bun.lock entry `{}` is bundled inside its parent's tarball and \
+                         CANNOT be redirected — that copy stays UNPATCHED; vendor or update \
+                         the bundling parent to cover it",
+                        entry.key
+                    ),
+                });
+                continue;
+            }
             let deps_verbatim: String;
             if entry.elems.len() == 4
                 && spec == target_spec
@@ -8427,6 +8476,60 @@ mod tests {
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
 
+    /// REGRESSION (#469): Bun records a `bundleDependencies` copy as its own
+    /// `parent/child` entry flagged `{ "bundled": true }` and unpacks it
+    /// from the PARENT's tarball, never fetching it. Rewriting that entry
+    /// would count it `redirected` (and let VEX attest it) while the copy
+    /// the parent loads stays unpatched — the Bun twin of npm's `inBundle`
+    /// guard (#325). The bundled entry is skipped loudly; a regular entry of
+    /// the same version beside it is still rewritten.
+    #[test]
+    fn bun_lock_bundled_entry_is_skipped_with_loud_warning() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override("is-number", "7.0.0", "http://p.test/isn.tgz", &sha512);
+        let bundled = "\"@bh/bund/is-number\": [\"is-number@7.0.0\", \"\", { \"bundled\": true }, \"sha512-UP==\"],";
+        let regular = "\"is-number\": [\"is-number@7.0.0\", \"\", {}, \"sha512-UP==\"],";
+
+        // Bundled copy only: nothing is rewritten, and the warning names the
+        // real reason instead of `redirect_bun_entry_not_found`.
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), bun_lock_file(bundled, 1));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_bun_bundled_instance_skipped"],
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings[0].detail.contains("@bh/bund/is-number")
+                && r.warnings[0].detail.contains("UNPATCHED"),
+            "{}",
+            r.warnings[0].detail
+        );
+        assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+
+        // Both: only the regular entry is rewired; the bundled line keeps
+        // its registry bytes.
+        let both = format!("{regular}\n    {bundled}");
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), bun_lock_file(&both, 1));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        assert_eq!(r.edits[0].key.as_deref(), Some("is-number"));
+        let out = r.files.get("bun.lock").expect("lock rewritten");
+        assert!(out.contains(bundled), "bundled line untouched: {out}");
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_bun_bundled_instance_skipped"],
+            "{:?}",
+            r.warnings
+        );
+    }
+
     /// A CRLF bun.lock (Windows `core.autocrlf` checkout) must keep CRLF on
     /// the REWRITTEN line too — the vendored engine already does — so the
     /// file never ends up mixed-EOL, and the ledger `new` fragment carries
@@ -12271,6 +12374,116 @@ mod tests {
     /// that entry would report (and VEX-attest) a patch `npm ci` never
     /// installs. It must be skipped loudly, like a bundled copy.
     #[test]
+    fn issue_490_unclear_overrides_leave_a_url_dependency_unredirected() {
+        // The review probes: npm keeps the URL spec for a `*` override, and
+        // picks the narrower rule under a range selector, so `npm ci` still
+        // fetches the URL. The rewriter must skip the entry loudly.
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0", "dependencies": { "pkga": "^1.0.0" } },
+                "node_modules/pkga": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/pkga/-/pkga-1.0.0.tgz",
+                    "dependencies": { "left-pad": url }
+                },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": url,
+                    "integrity": "sha512-UPSTREAM=="
+                }
+            }
+        });
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        for manifest_overrides in [
+            json!({ "left-pad": "*" }),
+            json!({ "left-pad": "1.3.0", "pkga@^1": { "left-pad": url } }),
+            json!({ "left-pad": "1.3.0", "pkga@1.0.0+build.1": { "left-pad": url } }),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "package-lock.json".to_string(),
+                serde_json::to_string_pretty(&lock).unwrap(),
+            );
+            files.insert(
+                "package.json".to_string(),
+                json!({ "name": "app", "dependencies": { "pkga": "^1.0.0" }, "overrides": manifest_overrides })
+                    .to_string(),
+            );
+            let r = rewrite_registry_redirect(&files, &overrides);
+            assert!(r.files.is_empty(), "{manifest_overrides}: {:?}", r.edits);
+            assert!(
+                warning_codes(&r).contains(&"redirect_npm_non_registry_entry_skipped"),
+                "{manifest_overrides}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn issue_490_a_git_edge_overridden_to_the_registry_is_redirected() {
+        // `pkga` depends on left-pad from git; the project's `overrides`
+        // send it to the registry release, which is what npm installs.
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0", "dependencies": { "pkga": "file:pkga-1.0.0.tgz" } },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-UPSTREAM=="
+                },
+                "node_modules/pkga": {
+                    "version": "1.0.0",
+                    "resolved": "file:pkga-1.0.0.tgz",
+                    "dependencies": { "left-pad": "github:stevemao/left-pad#v1.3.0" }
+                }
+            }
+        });
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            serde_json::to_string_pretty(&lock).unwrap(),
+        );
+        // Without the manifest's override the #326 skip still applies.
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty(), "{:?}", r.edits);
+        assert!(warning_codes(&r).contains(&"redirect_npm_non_registry_entry_skipped"));
+
+        files.insert(
+            "package.json".to_string(),
+            r#"{"name":"app","dependencies":{"pkga":"file:pkga-1.0.0.tgz"},"overrides":{"left-pad":"1.3.0"}}"#
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            !warning_codes(&r).contains(&"redirect_npm_non_registry_entry_skipped"),
+            "{:?}",
+            r.warnings
+        );
+        let rewritten: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+        let entry = &rewritten["packages"]["node_modules/left-pad"];
+        assert_eq!(entry["resolved"], "http://patch.test/lp.tgz");
+        assert_eq!(entry["integrity"], "sha512-PATCHED==");
+        // The manifest is input only: never written.
+        assert!(!r.files.contains_key("package.json"));
+    }
+
+    #[test]
     fn npm_non_registry_entries_are_skipped_with_loud_warning() {
         let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
         for (spec, resolved) in [
@@ -14450,6 +14663,15 @@ packages:
             Err("redirect_yarn_berry_cache_unsupported".to_string())
         );
         assert_eq!(code(&crlf, Some("compressionLevel: 0\n")), Ok(()));
+        // #370: a trailing YAML comment is not part of the value.
+        assert_eq!(
+            code(&crlf, Some("compressionLevel: 0 # keep yarn default\n")),
+            Ok(())
+        );
+        assert_eq!(
+            code(&crlf, Some("compressionLevel: mixed # smaller cache\n")),
+            Err("redirect_yarn_berry_cache_unsupported".to_string())
+        );
     }
 
     /// The whole-file gates read the NORMALIZED lock: a CRLF lock at an

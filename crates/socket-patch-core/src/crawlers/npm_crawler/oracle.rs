@@ -9,8 +9,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::{
-    build_npm_purl, is_legacy_pnpm_store_dir_name,
-    is_safe_npm_component, parse_package_name, read_package_json, NpmCrawler, StoreEntry,
+    build_npm_purl, configured_install_roots, is_legacy_pnpm_store_dir_name, is_safe_npm_component,
+    merge_configured_install_roots, parse_package_name, read_package_json, NpmCrawler, StoreEntry,
     Target, NESTED_STORE_MAX_DEPTH, NESTED_STORE_MAX_DIRS, SKIP_DIRS, VLT_STORE_NAME,
 };
 use crate::crawlers::types::{CrawledPackage, CrawlerOptions};
@@ -415,7 +415,9 @@ impl LegacyNpmCrawler {
         // Recursively search for workspace node_modules
         Self::find_workspace_node_modules(start_path, &mut results).await;
 
-        results
+        // The package-manager-configured roots are shared with the parent
+        // module (not part of the walk this oracle checks).
+        merge_configured_install_roots(results, configured_install_roots(start_path))
     }
 
     /// Recursively find `node_modules` in subdirectories (for monorepos / workspaces).
