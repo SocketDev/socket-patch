@@ -11,6 +11,7 @@
 //! attribute or a mismatched close tag makes the whole file `None`.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 
 // ── pure reader ──
 
@@ -28,6 +29,47 @@ pub(crate) struct NugetConfig {
     pub(crate) mappings: Vec<(String, Vec<String>)>,
     /// Keys `configuration/disabledPackageSources` turns off.
     pub(crate) disabled: BTreeSet<String>,
+    /// Live XML locations for writers. Routing readers and writers share
+    /// the same treatment of comments, quoted attributes and element scope.
+    pub(crate) configuration: Option<ConfigSection>,
+    pub(crate) package_sources: Option<ConfigSection>,
+    pub(crate) source_mapping: Option<ConfigSection>,
+    /// Preserve the routing reader's behavior on repeated sections, but do
+    /// not let a writer guess which occurrence should receive an edit.
+    pub(crate) repeated_sections: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct ConfigSection {
+    pub(crate) open: Range<usize>,
+    /// `None` for a self-closing element (unclosed XML fails parsing).
+    pub(crate) close_start: Option<usize>,
+    /// After the last direct `<clear>` child, or the opening tag otherwise.
+    pub(crate) insert_at: usize,
+}
+
+fn section_mut<'a>(
+    cfg: &'a mut NugetConfig,
+    parents: &[&str],
+    name: &str,
+) -> Option<&'a mut Option<ConfigSection>> {
+    match (parents, name) {
+        ([], "configuration") => Some(&mut cfg.configuration),
+        (["configuration"], "packageSources") => Some(&mut cfg.package_sources),
+        (["configuration"], "packageSourceMapping") => Some(&mut cfg.source_mapping),
+        _ => None,
+    }
+}
+
+fn record_clear(cfg: &mut NugetConfig, parents: &[&str], end: usize) {
+    let section = match parents {
+        ["configuration", "packageSources"] => cfg.package_sources.as_mut(),
+        ["configuration", "packageSourceMapping"] => cfg.source_mapping.as_mut(),
+        _ => None,
+    };
+    if let Some(section) = section {
+        section.insert_at = end;
+    }
 }
 
 /// One open (or self-closing) tag.
@@ -68,13 +110,33 @@ pub(crate) fn parse_config(text: &str) -> Option<NugetConfig> {
             i = at + rest.find('>')? + 1;
         } else if let Some(close) = rest.strip_prefix("</") {
             let end = close.find('>')?;
-            if stack.pop()? != close[..end].trim() {
+            let name = stack.pop()?;
+            if name != close[..end].trim() {
                 return None;
             }
             i = at + 2 + end + 1;
+            if let Some(Some(section)) = section_mut(&mut cfg, &stack, name) {
+                section.close_start = Some(at);
+            }
+            if name == "clear" {
+                record_clear(&mut cfg, &stack, i);
+            }
         } else {
             let (tag, consumed) = parse_open_tag(&rest[1..])?;
             i = at + 1 + consumed;
+            if let Some(slot) = section_mut(&mut cfg, &stack, tag.name) {
+                let repeated = slot
+                    .replace(ConfigSection {
+                        open: at..i,
+                        close_start: None,
+                        insert_at: i,
+                    })
+                    .is_some();
+                cfg.repeated_sections |= repeated;
+            }
+            if tag.name == "clear" && tag.self_closing {
+                record_clear(&mut cfg, &stack, i);
+            }
             visit(&stack, &tag, &mut cfg, &mut open_mapping);
             if !tag.self_closing {
                 if stack.len() >= MAX_XML_DEPTH {
