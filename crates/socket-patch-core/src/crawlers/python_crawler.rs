@@ -1321,8 +1321,8 @@ fn run_site_query() -> Option<String> {
 /// Get global/system Python `site-packages` directories.
 ///
 /// Queries `python3` for site-packages paths, then checks well-known system
-/// locations including Homebrew, conda, uv tools, pipx venvs, pip --user,
-/// etc.
+/// locations including Homebrew, conda, uv tools and interpreters, pipx
+/// venvs, PDM's global project and interpreters, pip --user, etc.
 pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     let mut results = Vec::new();
     let mut seen = HashSet::new();
@@ -1498,48 +1498,10 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     let miniconda = home_dir.join("miniconda3");
     scan_well_known(&miniconda, "site-packages", &mut seen, &mut results).await;
 
-    // uv tools — platform-specific install root.
-    #[cfg(target_os = "macos")]
-    {
-        // Legacy/secondary location only: uv follows XDG conventions on
-        // macOS (`uv tool dir` → ~/.local/share/uv/tools, covered by the
-        // not(windows) scan below), but older layouts used the platform
-        // data dir, so keep scanning it too.
-        let uv_base = home_dir
-            .join("Library")
-            .join("Application Support")
-            .join("uv")
-            .join("tools");
-        let uv_matches =
-            find_python_dirs(&uv_base, &["*", "lib", "python3.*", "site-packages"]).await;
-        for m in uv_matches {
-            add_path(m, &mut seen, &mut results);
-        }
-    }
-    #[cfg(windows)]
-    {
-        // %LOCALAPPDATA%\uv\tools
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            let uv_base = PathBuf::from(local).join("uv").join("tools");
-            let uv_matches = find_python_dirs(&uv_base, &["*", "Lib", "site-packages"]).await;
-            for m in uv_matches {
-                add_path(m, &mut seen, &mut results);
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        // uv uses XDG paths on BOTH Linux and macOS (`uv tool dir` →
-        // ~/.local/share/uv/tools; verified against a real uv install —
-        // macOS does NOT get an Application Support tool dir).
-        let uv_base = home_dir
-            .join(".local")
-            .join("share")
-            .join("uv")
-            .join("tools");
-        let uv_matches =
-            find_python_dirs(&uv_base, &["*", "lib", "python3.*", "site-packages"]).await;
-        for m in uv_matches {
+    // uv tool envs (`uv tool install`): one venv per tool under every
+    // root uv may use (see `uv_dir_candidates`).
+    for tools in uv_dir_candidates(&home_dir, "UV_TOOL_DIR", "tools") {
+        for m in find_child_env_site_packages(&tools).await {
             add_path(m, &mut seen, &mut results);
         }
     }
@@ -1564,38 +1526,236 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         }
     }
 
-    // uv-managed Python interpreters (`uv python install 3.X`) live at:
-    //   Linux/macOS: ~/.local/share/uv/python/cpython-3.X.*/lib/python3.X/site-packages/
-    //   Windows:     %LOCALAPPDATA%\uv\python\cpython-3.X.*\Lib\site-packages\
-    // The typical flow is `uv venv` + `uv pip install`, where the venv layout
-    // is already covered by `find_local_venv_site_packages`. But power users
+    // uv-managed Python interpreters (`uv python install 3.X`), one per
+    // child of uv's python dir (`cpython-3.X.*-<platform>`). The typical
+    // flow is `uv venv` + `uv pip install`, where the venv layout is
+    // already covered by `find_local_venv_site_packages`. But power users
     // can install packages directly into the managed interpreter (e.g. via
-    // `<uv-python>/bin/pip install ...`), and globally-discovered crawls
-    // should surface those.
-    #[cfg(not(windows))]
-    {
-        let uv_python = home_dir
-            .join(".local")
-            .join("share")
-            .join("uv")
-            .join("python");
-        let uv_matches =
-            find_python_dirs(&uv_python, &["*", "lib", "python3.*", "site-packages"]).await;
-        for m in uv_matches {
+    // `uv pip install --system --python <uv-python>`), and globally
+    // discovered crawls should surface those.
+    for python in uv_dir_candidates(&home_dir, "UV_PYTHON_INSTALL_DIR", "python") {
+        for m in find_child_env_site_packages(&python).await {
             add_path(m, &mut seen, &mut results);
         }
     }
+
+    // PDM's global project (`pdm add -g`) and PDM-managed interpreters
+    // (`pdm python install`).
+    for m in pdm_global_site_packages(&home_dir).await {
+        add_path(m, &mut seen, &mut results);
+    }
+
+    results
+}
+
+/// `site-packages` of every environment directly under `parent`:
+/// `<parent>/<env>/lib{,64}/python3.X/site-packages` on Unix and
+/// `<parent>\<env>\Lib\site-packages` on Windows.
+async fn find_child_env_site_packages(parent: &Path) -> Vec<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        let mut matches =
+            find_python_dirs(parent, &["*", "lib", "python3.*", "site-packages"]).await;
+        matches
+            .extend(find_python_dirs(parent, &["*", "lib64", "python3.*", "site-packages"]).await);
+        matches
+    }
     #[cfg(windows)]
     {
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            let uv_python = PathBuf::from(local).join("uv").join("python");
-            let uv_matches = find_python_dirs(&uv_python, &["*", "Lib", "site-packages"]).await;
-            for m in uv_matches {
-                add_path(m, &mut seen, &mut results);
+        find_python_dirs(parent, &["*", "Lib", "site-packages"]).await
+    }
+}
+
+/// `site-packages` of the one environment (venv or interpreter) whose
+/// prefix is `prefix`, in the same layouts as
+/// [`find_child_env_site_packages`].
+async fn find_env_site_packages(prefix: &Path) -> Vec<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        let mut matches = find_python_dirs(prefix, &["lib", "python3.*", "site-packages"]).await;
+        matches.extend(find_python_dirs(prefix, &["lib64", "python3.*", "site-packages"]).await);
+        matches
+    }
+    #[cfg(windows)]
+    {
+        find_python_dirs(prefix, &["Lib", "site-packages"]).await
+    }
+}
+
+/// `$var` as a directory when it is set to an absolute path. platformdirs
+/// and uv both ignore a relative `XDG_*` value, per the XDG spec.
+#[cfg(not(windows))]
+fn absolute_env_dir(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// The directories uv may keep `bucket` (`tools` or `python`) in, most
+/// specific first.
+///
+/// uv (`StateStore::from_settings`) uses `$override_var` (`UV_TOOL_DIR`
+/// or `UV_PYTHON_INSTALL_DIR`) when set, made absolute against the cwd.
+/// Otherwise it uses `<data dir>/uv/<bucket>`, where the data dir is
+/// `$XDG_DATA_HOME` (absolute only) or `~/.local/share` on Linux and
+/// macOS, and `%APPDATA%` on Windows (`uv tool dir` prints
+/// `%APPDATA%\uv\tools` there). The legacy roots that older layouts used
+/// are returned too: `~/Library/Application Support/uv` on macOS, and
+/// `%LOCALAPPDATA%\uv`, which earlier socket-patch releases scanned, on
+/// Windows. Callers skip the ones that don't exist.
+#[cfg_attr(windows, allow(unused_variables))]
+fn uv_dir_candidates(home_dir: &Path, override_var: &str, bucket: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = std::env::var_os(override_var).filter(|v| !v.is_empty()) {
+        let dir = PathBuf::from(dir);
+        dirs.push(std::path::absolute(&dir).unwrap_or(dir));
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = absolute_env_dir("XDG_DATA_HOME") {
+            dirs.push(xdg.join("uv").join(bucket));
+        }
+        dirs.push(
+            home_dir
+                .join(".local")
+                .join("share")
+                .join("uv")
+                .join(bucket),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    dirs.push(
+        home_dir
+            .join("Library")
+            .join("Application Support")
+            .join("uv")
+            .join(bucket),
+    );
+    #[cfg(windows)]
+    for var in ["APPDATA", "LOCALAPPDATA"] {
+        if let Some(base) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+            dirs.push(PathBuf::from(base).join("uv").join(bucket));
+        }
+    }
+    dirs
+}
+
+/// The directories platformdirs may resolve for PDM's per-user config
+/// (`xdg_var` = `XDG_CONFIG_HOME`, `unix_default` = `.config`) or data
+/// (`XDG_DATA_HOME`, `.local/share`) dir, most specific first:
+/// `$xdg_var/pdm` (absolute only; platformdirs 4.4+ also honors it on
+/// macOS), `~/<unix_default>/pdm` on Linux,
+/// `~/Library/Application Support/pdm` on macOS, and
+/// `%LOCALAPPDATA%\pdm\pdm` on Windows.
+#[cfg_attr(windows, allow(unused_variables))]
+fn pdm_dir_candidates(home_dir: &Path, xdg_var: &str, unix_default: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    #[cfg(not(windows))]
+    if let Some(xdg) = absolute_env_dir(xdg_var) {
+        dirs.push(xdg.join("pdm"));
+    }
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    dirs.push(home_dir.join(unix_default).join("pdm"));
+    #[cfg(target_os = "macos")]
+    dirs.push(
+        home_dir
+            .join("Library")
+            .join("Application Support")
+            .join("pdm"),
+    );
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+        dirs.push(PathBuf::from(local).join("pdm").join("pdm"));
+    }
+    dirs
+}
+
+/// `site-packages` of PDM's global installs:
+///
+/// - The global project's environment (`pdm add -g`). The project lives
+///   at the `global_project.path` setting, by default
+///   `<user config dir>/pdm/global-project`. Its environment is the
+///   in-project `.venv`, an out-of-tree venv under `venv.location`
+///   (default `<user data dir>/pdm/venvs`) named
+///   `<project dir name>-<hash>-<python>`, or whatever interpreter
+///   `pdm use -g` recorded in its `.pdm-python`.
+/// - PDM-managed interpreters (`pdm python install`), one per child of
+///   `python.install_root` (default `<user data dir>/pdm/python`).
+///
+/// The settings come from PDM's global config file, `$PDM_CONFIG_FILE`
+/// or `<user config dir>/pdm/config.toml`. Every candidate is collected,
+/// and the ones that don't exist yield nothing.
+async fn pdm_global_site_packages(home_dir: &Path) -> Vec<PathBuf> {
+    let config_dirs = pdm_dir_candidates(home_dir, "XDG_CONFIG_HOME", Path::new(".config"));
+    let data_dirs = pdm_dir_candidates(
+        home_dir,
+        "XDG_DATA_HOME",
+        &Path::new(".local").join("share"),
+    );
+
+    let mut config_files: Vec<PathBuf> = std::env::var_os("PDM_CONFIG_FILE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    config_files.extend(config_dirs.iter().map(|d| d.join("config.toml")));
+
+    let mut projects = Vec::new();
+    let mut install_roots = Vec::new();
+    let mut venv_roots = Vec::new();
+    let var = |name: &str| std::env::var(name).ok();
+    for file in &config_files {
+        let Ok(text) = read_regular_to_string(file).await else {
+            continue;
+        };
+        let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+            continue;
+        };
+        let setting = |table: &str, key: &str| {
+            doc.get(table)
+                .and_then(|t| t.get(key))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(|v| expand_home(v, &var))
+        };
+        projects.extend(setting("global_project", "path"));
+        install_roots.extend(setting("python", "install_root"));
+        venv_roots.extend(setting("venv", "location"));
+    }
+    projects.extend(config_dirs.iter().map(|d| d.join("global-project")));
+    install_roots.extend(data_dirs.iter().map(|d| d.join("python")));
+    venv_roots.extend(data_dirs.iter().map(|d| d.join("venvs")));
+
+    let mut results = Vec::new();
+    for project in &projects {
+        results.extend(find_env_site_packages(&project.join(".venv")).await);
+        if let Some(name) = project.file_name().and_then(|n| n.to_str()) {
+            let prefix = format!("{name}-");
+            for root in &venv_roots {
+                for entry in crate::utils::fs::list_dir_entries(root).await {
+                    if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                        results.extend(find_env_site_packages(&root.join(entry.file_name())).await);
+                    }
+                }
+            }
+        }
+        // `.pdm-python` names the interpreter: `<prefix>/bin/python3` in a
+        // venv or Unix install, `<prefix>\Scripts\python.exe` in a Windows
+        // venv, `<prefix>\python.exe` in a Windows install.
+        if let Ok(text) = read_regular_to_string(&project.join(".pdm-python")).await {
+            let interpreter = PathBuf::from(text.trim());
+            let prefixes = interpreter.is_absolute().then_some(&interpreter);
+            for prefix in prefixes
+                .into_iter()
+                .flat_map(|i| i.ancestors().skip(1).take(2))
+            {
+                results.extend(find_env_site_packages(prefix).await);
             }
         }
     }
-
+    for root in &install_roots {
+        results.extend(find_child_env_site_packages(root).await);
+    }
     results
 }
 
