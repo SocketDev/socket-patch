@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-02 03:42Z, main `61cfb9b` (unchanged; CLI 4.0.0). Filed #529: the `.venv` + WORKON_HOME "patch both" case patches only WORKON_HOME, a regression from #388 on Pipenv 2018–2025.
+Last run: 2026-10-02 09:41Z, main `61cfb9b` (unchanged; CLI 4.0.0). Filed #546: Pipenv settings in the project's `.env` (`PIPENV_CUSTOM_VENV_NAME`, `WORKON_HOME`) are ignored by venv discovery, so agent mode patches the system Python and VEX attests `not_affected` (Pipenv 2022–2026; not a regression).
 
 ## Coverage matrix
 
@@ -14,16 +14,21 @@ Cells marked v5 were re-run on `2463257` (v5: no hosted ledger, upstream-restore
 | Linux | 2022.12.19 | untested | .venv + WORKON venv, nothing explicit: fail #529 | pass v5 (+relock); `[docs]`-only + rollback pass `61cfb9b` | untested | fail #333 | untested | untested | untested | untested |
 | Linux | 2023.12.1 | pass | .venv + WORKON venv, nothing explicit: fail #529 | pass v5 (+relock); verify / requirements / deploy pass `61cfb9b` | pass; fail #334/#384 shapes (false VEX) | fail #333 | untested | untested | untested | fail #384 (agent + hosted VEX) |
 | Linux | 2026.8.0 | pass `61cfb9b` | pass `61cfb9b` (#334 fixed); no-Pipenv-venv shapes patch the system Python, fail #504 | pass v5 (+CRLF); verify / requirements / deploy pass `61cfb9b` | pass; #334/#384 shapes untested since the fix | pass `61cfb9b` (#333 fixed) | pass v5 | pass v5 | fail #328 v5 | pass `61cfb9b` (#384 fixed) |
+| Linux | 2024.4.1 | pass `61cfb9b` | untested | pass `61cfb9b` (default + `[docs]`, verify / requirements / sync / --deploy / vex / byte-exact rollback) | untested | untested | pass `61cfb9b` (both categories, sync / --deploy / vex / repair / rollback) | untested | untested | untested |
+| Linux | 2025.1.3 | untested | untested | pass `61cfb9b` (same as 2024.4.1) | untested | untested | pass `61cfb9b` (same as 2024.4.1) | untested | untested | untested |
 | macOS | 2023.12.1 | pass | fail #334 | untested | untested | fail #333 | untested | untested | untested | fail #384 |
 | macOS | 2026.8.0 | pass | fail #334 | untested | untested | fail #333 | untested | untested | untested | fail #384 |
 | Windows | 2023.12.1 | pass | fail #334 | untested | untested | fail #333 | untested | untested | untested | fail #384 |
 | Windows | 2026.8.0 | pass | fail #334 | untested | untested | fail #333 | untested | untested | untested | fail #384 |
+| Linux | 2022.12.19 `-g` (`install --system --deploy`, py3.10) | `-g --global-prefix <site-packages> --apply` / `rollback -g` pass, lock untouched; hosted refused exit 2 pass (`61cfb9b`) | | | | | | | | |
 | Linux | 2018.11.26 `-g` (`install --system`) | scan -g report pass; `-g --mode hosted` refused exit 2 pass; `-g --apply` / vex / rollback pass | | | | | | | | |
 | Linux | 2023.12.1 `-g` (`install --system`) | scan -g report (in/out of project), hosted refused exit 2, `-g --apply` / vex / rollback, SOCKET_GLOBAL, `--global-prefix` pass; `rollback -g` / `remove -g` / `get -g --mode hosted\|vendored` unwind or rewire the cwd project's Pipfile.lock (#445 / #436) | | | | | | | | |
 | Linux | 2026.8.0 `-g` (`install --system`) | scan -g report (in/out of project), SOCKET_GLOBAL, `--global-prefix` pass; hosted refused exit 2 pass; `-g --apply` / `get -g` / vex / rollback pass | no-`-g` agent scan in a venv-less project patches the global interpreter (needs a maintainer decision, see Known non-bugs) | | | | | | | |
 | Linux | 9.1.0 / 11.10.4 (py3.8) | pass on 11 `61cfb9b` (unicode/space/paren names, PIPENV_PYTHON suffix) | untested | pass v5 (`path` ref, `--deploy`, rollback; 11 byte-exact) | pass on 11 (stale warning, VEX `not_applied`) | untested | refused (documented) | n/a | n/a | untested |
 | macOS / Windows | 7–11 | untested | untested | untested | untested | untested | refused (documented) | n/a | n/a | untested |
 | any | 0–6 | untested | n/a | refused (documented) | n/a | n/a | refused (documented) | n/a | n/a | untested |
+
+`.env`-borne Pipenv settings (agent + hosted stale warning): `PIPENV_CUSTOM_VENV_NAME` in `.env` fails #546 on 2022.12.19 / 2023.12.1 / 2024.4.1 / 2025.1.3 / 2026.8.0 (the exported control passes); `WORKON_HOME` in `.env` fails #546 on 2023 / 2026. `--global-prefix` with spaces and unicode (site-packages path, 2026.8.0): pass.
 
 Agent rerun after a reinstall (2026.8.0, `61cfb9b`): `--json` pass; human-mode `scan --apply` / `--mode agent` / `--sync` fail, #454 incomplete (commented). `PIPENV_PIPFILE` spellings with `--cwd`: pass.
 
@@ -37,11 +42,11 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 
 ## Backlog
 
-1. Re-verify #529 once it's fixed (`.venv` + WORKON_HOME, nothing explicit) on 2018 / 2022 / 2023 / 2026, plus the `PIPENV_PYTHON`-suffix twin-venv shape (2026.8.0 patches the unsuffixed venv while `pipenv --venv` reports `-python3.11`; what `pipenv run` imports there is unverified).
-2. Re-verify #504 (a no-Pipenv-venv agent scan patches the system Python) and the #454 human-mode gap once they're fixed, on 2018 / 2023 / 2026.
-3. **Maintainer request (global `-g` mode):** still to do: macOS / Windows (blocked: no probe), 2022.12.19 (`pipenv --python <py3.10>`), and a `--global-prefix` with spaces or unicode. Full checklist in the 20261001T040000Z entry.
-4. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked until branch deletion through the git proxy works.
-5. Pipenv 2024.4.1 / 2025.1.3 spot-checks (the #529 shape, hosted named categories).
+1. Re-verify #529 (PR #538) once it merges (`.venv` + WORKON_HOME, nothing explicit) on 2018 / 2022 / 2023 / 2024 / 2025 / 2026, plus the `PIPENV_PYTHON`-suffix twin-venv shape.
+2. Re-verify #546 once it's fixed: `.env` with `PIPENV_CUSTOM_VENV_NAME`, `WORKON_HOME`, `PIPENV_VENV_IN_PROJECT=0` + `.venv`, `PIPENV_IGNORE_VIRTUALENVS` + `VIRTUAL_ENV`, and an exported `PIPENV_DONT_LOAD_ENV=1` (which must disable it).
+3. Re-verify #504 (a no-Pipenv-venv agent scan patches the system Python) and the #454 human-mode gap once they're fixed.
+4. **Maintainer request (global `-g` mode):** still to do: macOS / Windows (blocked: no probe), `-g` on 2018 / 11, and `--global-prefix` given as a venv / interpreter root (scans 0 today; the semantics are undocumented). Full checklist in the 20261001T040000Z entry.
+5. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked until branch deletion through the git proxy works.
 
 ## Known non-bugs
 
@@ -60,6 +65,8 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - v5 hosted rollback refuses when the entry's index isn't PyPI, or when offline. Documented (the upstream-restore refusals).
 - Vendored drops the Pipfile.lock entry's `index` key. Harmless for a local wheel, and rollback restores it.
 - `rollback <path>` targets select installed copies, not hosted project directories; use `--cwd`. Documented, and cross-PM anyway.
+- Mock-API note: a hosted artifact URL must have the `/patch/pypi/<name>/<ver>/<token>/<uuid>/<wheel>` shape, and `SOCKET_PATCH_SERVER_URL` must name the mock origin, or vex / rollback see no hosted reference.
+- `scan -g --mode hosted --json` prints a plain-text usage error with exit 2 (a clap-level refusal, documented).
 - Mock-API notes: vendoring needs `integrity.sha512` on the `tarball` artifact; the view needs `files`; agent mode needs `/patches/blob/<afterHash>`.
 - **Filed as #504 (2026-10-01), formerly an open question:** with no venv found and a Python project marker present, the crawler deliberately falls back to the global interpreter (`python_crawler.rs` `get_site_packages_paths`). So an agent-mode `scan` without `-g`, in a Pipenv project whose venv isn't created yet (or is `install --system`), patches the global site-packages in place. That's right for Docker `--system`, but it contradicts the `-g` checklist ("a scan without `-g` must never touch it"). Filing waits on a maintainer decision.
 - A Pipenv 9.1.0 lock written with `"hashes": []` (seen in the sandbox) comes back from hosted rollback with PyPI's full hash list: not byte-exact, but a valid and stricter registry entry. The upstream restore re-derives hashes by design.
