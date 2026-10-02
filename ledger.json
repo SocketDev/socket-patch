@@ -5,5 +5,21 @@
   "register_comment_id": "DC_kwDOQS_zEM4BHZiT",
   "register_comment_url": "https://github.com/SocketDev/socket-patch/discussions/560#discussioncomment-18716819",
   "review_snapshot": "2463257",
-  "routines": {}
+  "routines": {
+    "audit-ecosystems": {
+      "trigger_id": "trig_011c8MKh4EpUVLRoY9utrxKc",
+      "name": "socket-patch architecture audit: ecosystems and formats",
+      "cron": "40 0,6,12,18 * * *"
+    },
+    "audit-core": {
+      "trigger_id": "trig_01MwFn5EYKHCD1FNYAdbC1xN",
+      "name": "socket-patch architecture audit: CLI and core",
+      "cron": "40 3,9,15,21 * * *"
+    },
+    "refactor": {
+      "trigger_id": "trig_01NTdy2rEpze5NfvsG6RNs4v",
+      "name": "socket-patch architecture refactor",
+      "cron": "45 1,5,9,13,17,21 * * *"
+    }
+  }
 }
