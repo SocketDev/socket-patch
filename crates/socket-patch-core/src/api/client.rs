@@ -14,7 +14,7 @@ use crate::api::ranking::severity_order as get_severity_order;
 use crate::api::ranking::{cmp_batch_infos, cmp_search_results};
 use crate::api::retry::{
     is_retryable_status, jitter_sample as retry_jitter, parse_retry_after, ApiRetry,
-    ApiRetryPolicy, RetryHooks,
+    ApiRetryPolicy, ApiTimeouts, RetryHooks,
 };
 use crate::api::types::*;
 use crate::api::vendor_prefetch::VendorPrefetch;
@@ -376,28 +376,11 @@ impl ApiClient {
     /// (User-Agent, Accept, and optionally Authorization).
     pub fn new(options: ApiClientOptions) -> Self {
         let api_url = options.api_url.trim_end_matches('/').to_string();
-
-        let mut default_headers = HeaderMap::new();
-        default_headers.insert(
-            header::USER_AGENT,
-            HeaderValue::from_static(USER_AGENT_VALUE),
-        );
-        default_headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
-
-        if let Some(ref token) = options.api_token {
-            if let Ok(hv) = HeaderValue::from_str(&format!("Bearer {}", token)) {
-                default_headers.insert(header::AUTHORIZATION, hv);
-            }
-        }
-
-        let client = reqwest::Client::builder()
-            .default_headers(default_headers)
-            .build()
-            .expect("failed to build reqwest client");
+        let timeouts = ApiTimeouts::default();
 
         Self {
-            client,
-            plain: plain_client(),
+            client: api_client(options.api_token.as_deref(), &timeouts),
+            plain: plain_client(&timeouts),
             api_url,
             api_token: options.api_token,
             use_public_proxy: options.use_public_proxy,
@@ -417,6 +400,15 @@ impl ApiClient {
     /// retries off.
     pub fn with_api_retry(mut self, policy: ApiRetryPolicy, hooks: RetryHooks) -> Self {
         self.api_retry = ApiRetry::with_policy(policy, hooks);
+        self
+    }
+
+    /// Override the connect and stalled-read bounds of both HTTP clients
+    /// (tests use short ones). Rebuilds the clients, so call it before
+    /// cloning the client.
+    pub fn with_api_timeouts(mut self, timeouts: ApiTimeouts) -> Self {
+        self.client = api_client(self.api_token.as_deref(), &timeouts);
+        self.plain = plain_client(&timeouts);
         self
     }
 
@@ -1905,18 +1897,42 @@ enum ServeDownload {
     Failed(ApiError),
 }
 
+/// Build the authenticated `reqwest::Client` ([`ApiClient`]'s `client`
+/// field): User-Agent, `Accept: application/json` and, given a token, the
+/// Socket bearer, bounded by `timeouts`.
+fn api_client(api_token: Option<&str>, timeouts: &ApiTimeouts) -> reqwest::Client {
+    let mut default_headers = HeaderMap::new();
+    default_headers.insert(
+        header::USER_AGENT,
+        HeaderValue::from_static(USER_AGENT_VALUE),
+    );
+    default_headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+
+    if let Some(token) = api_token {
+        if let Ok(hv) = HeaderValue::from_str(&format!("Bearer {}", token)) {
+            default_headers.insert(header::AUTHORIZATION, hv);
+        }
+    }
+
+    timeouts
+        .apply(reqwest::Client::builder().default_headers(default_headers))
+        .build()
+        .expect("failed to build reqwest client")
+}
+
 /// Build a plain `reqwest::Client` carrying only the User-Agent — no
 /// Authorization. Built once per [`ApiClient`] (its `plain` field) for the
 /// public-proxy POST and the grant-tokenized serve GETs, where sending the
-/// Socket bearer would leak it to a third party.
-fn plain_client() -> reqwest::Client {
+/// Socket bearer would leak it to a third party. Bounded by `timeouts`,
+/// like the authenticated client.
+fn plain_client(timeouts: &ApiTimeouts) -> reqwest::Client {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::USER_AGENT,
         HeaderValue::from_static(USER_AGENT_VALUE),
     );
-    reqwest::Client::builder()
-        .default_headers(headers)
+    timeouts
+        .apply(reqwest::Client::builder().default_headers(headers))
         .build()
         .expect("failed to build plain reqwest client")
 }
