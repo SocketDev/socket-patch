@@ -1,8 +1,8 @@
 [agent] Progress ledger for the scheduled vlt bug-hunt routine (label pm:vlt).
 
-Last updated: 2026-10-01 (run 5), main `61cfb9b`, latest release 4.0.0 (no vlt support; previous 3.3.0). Newest vlt: 1.3.3 (2026-10-01). Locally, run `vlt ci --allow-scripts :scripts` (otherwise vlt ≥ rc.24 POSTs to api.socket.dev; see #448).
+Last updated: 2026-10-02 (run 6), main `61cfb9b`, latest release 4.0.0 (no vlt support; previous 3.3.0). Newest vlt: 1.3.3 (2026-10-01). Locally, run `vlt ci --allow-scripts :scripts` (otherwise vlt ≥ rc.24 POSTs to api.socket.dev; see #448).
 
-Method: real vlt installs (`scripts/install-vlt.sh`) against a local Node mock of the npm registry plus the patch API. It's a pure-JS tar writer, so it runs on every OS. The registry is on :18555 and the patch server on :18556 via `SOCKET_PATCH_SERVER_URL`; set `SOCKET_NPM_REGISTRY` to the registry for v5 rollback. The oracle is `require('left-pad')` printing `patched` / `pristine`. The 3-OS probe scripts are in the run-2 workflow (run 36803186961), the run-3 global-mode workflow (run 36834317384) and the run-4 bundled-copy workflow (run 36871535059, whose mock adds a `bundler@1.0.0` that bundles left-pad). The mock's `/patches/batch` must answer only for purls in the request body, or `scan -g` shows false hits. CI already runs the capstones and the native backtest on 57 releases × 3 OS.
+Method: real vlt installs (`scripts/install-vlt.sh`) against a local Node mock of the npm registry plus the patch API. It's a pure-JS tar writer, so it runs on every OS. The registry is on :18555 and the patch server on :18556 via `SOCKET_PATCH_SERVER_URL`; set `SOCKET_NPM_REGISTRY` to the registry for v5 rollback. The oracle is `require('left-pad')` printing `patched` / `pristine`. The 3-OS probe scripts are in the run-2 workflow (run 36803186961), the run-3 global-mode workflow (run 36834317384) and the run-4 bundled-copy workflow (run 36871535059, whose mock adds a `bundler@1.0.0` that bundles left-pad). Run 6 mock adds `PKG=` (scoped names) and `CDN=1` (non-conventional `dist.tarball`); the patch artifact leaf must be the unscoped basename. The mock's `/patches/batch` must answer only for purls in the request body, or `scan -g` shows false hits. CI already runs the capstones and the native backtest on 57 releases × 3 OS.
 
 ## Coverage matrix
 
@@ -18,6 +18,7 @@ Method: real vlt installs (`scripts/install-vlt.sh`) against a local Node mock o
 | macOS | 1.2.0 / 1.3.2 | pass (probe run 2) | pass (probe run 2) | pass (probe run 2) | brotli untested |
 | Windows | 1.2.0 / 1.3.2 | pass (probe run 2) | pass (probe run 2) | pass (probe run 2) | brotli untested |
 | Linux / macOS / Windows | 1.3.3 | scan → `vlt ci` patched (probe run 3); peer-extra DepID across workspaces, alias / remote / file mix: pass (Linux, run 5); fail #372 with `tar.br` (Linux) | scan → `vlt ci` patched (probe run 3); frozen / vex / workspaces untested | pass (Linux, run 5: peer-extra store, workspaces, rollback, re-run) | new release, 2026-10-01 |
+| Linux | 1.0.10 / 1.2.0 / 1.3.3 | non-conventional `dist.tarball` rollback / remove: **fail #521** (run 6); scoped target scan / vex: pass (1.3.3) | scoped target: pass (1.3.3) | scoped target via store symlink: pass (1.3.3) | concurrent scans / SIGKILL mid-run: pass (1.3.3) |
 
 ### Bundled copies (a package bundling the patched name@version; vlt-lock.json never records the bundled copy)
 
@@ -35,15 +36,14 @@ Method: real vlt installs (`scripts/install-vlt.sh`) against a local Node mock o
 
 ## Backlog
 
-1. **Maintainer `-g` request** (20261001T040000Z): covered except Windows with the default prefix (#434 / PR #442), the Windows unwritable prefix, and the macOS / Windows re-check of `rollback -g` after #446.
-2. #498 (`vendor -g` / `vendor --revert -g`) on macOS / Windows, and a re-test once fixed.
-3. #471 follow-ups once PR #472 lands: a bundled copy at a different version (must not contest), a nested bundle, and agent mode on the bundled store copy.
-4. #372 follow-ups once fixed: a mixed brotli / non-brotli lock, a brotli dev node (flag 6) heal, the restore putting bit 4 back, and VEX on brotli nodes.
-5. v5 upstream restore against a registry with non-conventional `dist.tarball` (Artifactory scoped `/-/@scope/name-ver.tgz`).
+1. #521 follow-ups: macOS / Windows, the 3-tuple (`config.registry`) project, and the hosted→vendored takeover with a non-conventional tarball. Re-test once fixed.
+2. **Maintainer `-g` request** (20261001T040000Z): covered except Windows with the default prefix (#434 / PR #442), the Windows unwritable prefix, and the macOS / Windows re-check of `rollback -g` after #446.
+3. #498 (`vendor -g` / `vendor --revert -g`) on macOS / Windows, and a re-test once PR #499 lands.
+4. #471 follow-ups once PR #472 lands: a bundled copy at a different version (must not contest), a nested bundle, and agent mode on the bundled store copy.
+5. #372 follow-ups once fixed: a mixed brotli / non-brotli lock, a brotli dev node (flag 6) heal, the restore putting bit 4 back, and VEX on brotli nodes.
 6. A real multi-instance peer shape (two DepIDs of one name@version). A `*` peer across workspaces still dedupes to one instance (run 5), so try conflicting peer ranges.
-7. Concurrent or interrupted `scan` / `rollback` on vlt projects.
-8. vlt 1.3.3 frozen / workspaces cells on macOS and Windows.
-9. Probe branches are blocked: branch deletion is denied, and 3 old `bughunt/vlt/*` branches still need a maintainer to delete them.
+7. vlt 1.3.3 frozen / workspaces cells on macOS and Windows.
+8. Probe branches are blocked: branch deletion is denied, and 3 old `bughunt/vlt/*` branches still need a maintainer to delete them.
 
 ## Known non-bugs
 
@@ -64,3 +64,5 @@ Method: real vlt installs (`scripts/install-vlt.sh`) against a local Node mock o
 - vlt-lock.json has no node for a bundled copy (1.0.10 … 1.3.3). That's vlt's format, not a socket-patch parse bug. The bug is #471 (not detecting it).
 - vlt 1.0.10 `vlt ci` fails EINTEGRITY on a `remote~` (tarball URL) dependency whenever vlt's machine cache is warm, with or without socket-patch. It's a vlt bug that's gone by 1.2.0.
 - vlt dedupes a peer-dependent package to one `~peer.<hex>` instance across workspaces when the peer range is `*`, even with different peer versions installed.
+- A mock patch artifact whose leaf keeps the scope (`@sc/name-ver.tgz`) is refused as `patched_ref_invalid`. The real service uses the unscoped leaf, so that's a mock artifact.
+- Concurrent socket-patch runs in one directory: the losers fail with "Another socket-patch process is operating in this directory" (`.socket/apply.lock`, `--lock-timeout`). That's by design.
