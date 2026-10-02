@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-02 (run 7), main `61cfb9b` (includes #330, #446, #452, #456), latest release 4.0.0 (previous 3.3.0).
+Last updated: 2026-10-02 (run 8), main `61cfb9b` (includes #330, #446, #452, #456), latest release 4.0.0 (previous 3.3.0).
 
 ## Coverage matrix
 
@@ -9,8 +9,8 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | OS | Poetry | Agent (in-project `.venv`) | Agent (default out-of-tree venv) | Agent: nameless `package-mode=false` / `[project].name` override / `in-project=false` + stray `.venv` | Agent + hosted VEX: `in-project=true`, no `.venv`, existing out-of-tree env | Hosted (scan, install, rollback) | Hosted VEX with undiscovered venv | Vendored | Mode switch hosted ⇄ vendored | Vendored `repair` (lock-only, wheel deleted) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 0.12.17 | untested | untested | n/a | untested | pass v5 (refused, `redirect_poetry_lock_unsupported`) | n/a | pass v5 (`[metadata.hashes]`) | n/a | untested |
-| Linux | 1.0.10 | untested | untested | n/a | untested | pass v5 (lock 1.0 native-empty + populated; pip ≥ 23.1) | untested | pass v5 (populated lock 1.0) | untested | untested |
-| Linux | 1.1.15 | pass v5 | untested | n/a | fail #476 | pass v5 (lock 1.1, extras + dev); r5 dotted name `jaraco.context` rewrite/install/vex/rollback | untested | pass v5 (LF + CRLF, unicode/space path) | untested | untested |
+| Linux | 1.0.10 | untested | pass r8 (scan, re-run, vex, rollback) | n/a | untested | pass v5 (lock 1.0 native-empty + populated; pip ≥ 23.1) | untested | pass v5 (populated lock 1.0) | untested | untested |
+| Linux | 1.1.15 | pass v5 | pass r8 (scan, re-run, vex, rollback) | n/a | fail #476 | pass v5 (lock 1.1, extras + dev); r5 dotted name `jaraco.context` rewrite/install/vex/rollback | untested | pass v5 (LF + CRLF, unicode/space path) | untested | untested |
 | Linux | 1.2.2 | untested | untested | n/a | untested | pass v5 (lock 1.1, extras + dev, warm-venv stale check) | untested | pass (lock 1.1) | untested | untested |
 | Linux | 1.8.5 | untested | pass | pass r5 (fixed by #330; nameless, in-project=false, unicode path) | fail #476 | pass v5 (LF + CRLF) | pass r5 (#330) | pass v5 (LF + CRLF, unicode/space path) | untested | pass v5 (#380 fixed) |
 | Linux | 2.0.1 | untested | pass | pass r5 (fixed by #330; nameless, in-project=false, unicode path, both names) | fail #476 | pass v5 (LF + CRLF) | pass r5 (#330) | untested | untested | untested |
@@ -61,16 +61,30 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 | Linux | Project scan without `-g`, Poetry venv undiscovered / not created yet: falls back to and **patches** the global interpreter | #327 layouts fixed by #330 (r5); still happens for `in-project = true` + no `.venv` (#476, re-confirmed r6 on `61cfb9b`; now lands in apt's dist-packages) |
 | macOS / Windows | all of the above | untested (probe branches blocked) |
 
+### Run 8 cells (Linux, main `61cfb9b`)
+
+| Poetry | Cell | Result |
+| --- | --- | --- |
+| 2.5.1 | Hosted, then `poetry export` (plugin), then `pip install -r` | pass |
+| 2.5.1 | Hosted with a `supplemental` / `explicit` mirror source, six from PyPI | pass (install, `check --lock`, vex) |
+| 2.5.1 | Forked lock (six at two versions by marker) | hosted and vendored refuse before writing (documented) |
+| 2.5.1 | Agent, `virtualenvs.options.system-site-packages = true`, six in system site | fail #409 (comment): Poetry 2 skips installing into `.venv`, agent says `package_not_installed`, exit 0 |
+| 1.8.5 | Same, agent | pass (Poetry 1.8 installs into `.venv`) |
+| 1.8.5, 2.5.1 | Same, hosted, then install, then vex | pass |
+| 1.8.5, 2.5.1 | Hosted, then install with `installer.no-binary` = `six` / `:all:` | pass |
+| 1.8.5, 2.5.1 | Hosted `rollback` (PyPI forwarder), `check --lock`, reinstall | pass |
+| macOS 1.2–2.x | `XDG_CACHE_HOME` / `XDG_CONFIG_HOME` set (platformdirs ≥ 4.6 honours them on macOS; socket-patch doesn't) | untested, suspected fail (needs probe) |
+| Windows 1.0/1.1 | Out-of-tree env-name hash (Poetry < 1.2 doesn't `normcase`; socket-patch lowercases) | untested, suspected fail (needs probe) |
+
 ## Backlog
 
-1. **Global mode on macOS / Windows** (maintainer request), including #501's ordering on macOS (user site `~/Library/Python/3.X/...` vs Homebrew / python.org framework site-packages). This needs probe branches.
-2. macOS / Windows: verify #330 (#329 Windows hash; macOS case-preserving `realpath`), plus hosted/vendored on 2.5.1 and long paths (> 260 chars). This needs probe branches.
-3. Probe branches are blocked: `git push --delete` still fails (runs 1–7). A maintainer needs to delete `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes`.
-4. Conda `CONDA_PREFIX` (with `CONDA_DEFAULT_ENV != base`) as Poetry's env; socket-patch doesn't read it. Needs conda / micromamba.
-5. `virtualenvs.prefer-active-python` / `use-poetry-python` with no `envs.toml` entry vs the first-sorted env (a #526 follow-on).
-6. Hosted `socket.yml` policy on Poetry (add a grant route to the mock).
-7. Poetry 0.12 / 1.0 agent mode with an out-of-tree venv (pre-1.2 hash).
-8. Hosted rollback when PyPI's file list differs from the lock (confirm the refusal is loud).
+1. **macOS XDG** (run 8 lead): with `XDG_CACHE_HOME` / `XDG_CONFIG_HOME` set and platformdirs ≥ 4.6.0 (2026-02-12; Poetry 1.2–2.x pull 4.12.x), Poetry uses `$XDG_CACHE_HOME/pypoetry/virtualenvs` and `$XDG_CONFIG_HOME/pypoetry/config.toml`. `python_crawler.rs` `poetry_default_cache_dir` / `poetry_user_config_path` only look in `~/Library/...` on macOS. This needs a macOS probe.
+2. **Windows Poetry 1.0/1.1 env hash** (run 8 lead): Poetry < 1.2 hashes the raw cwd, while socket-patch lowercases it (`windows_normcase`). This needs a Windows probe.
+3. Global mode on macOS / Windows (maintainer request), including #501's ordering on macOS, plus #330 verification (#329 Windows hash; macOS case-preserving `realpath`) and long paths. This needs probe branches.
+4. Probe branches are blocked: `git push --delete` and `git push origin :refs/heads/...` still fail (runs 1–8). A maintainer needs to delete `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes`.
+5. Conda `CONDA_PREFIX` (with `CONDA_DEFAULT_ENV != base`) as Poetry's env. Needs micromamba.
+6. `virtualenvs.use-poetry-python` / `prefer-active-python` with no `envs.toml` entry (a #526 follow-on).
+7. Hosted `socket.yml` policy on Poetry (the mock now has a grant route).
 
 ## Known non-bugs
 
@@ -104,3 +118,8 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 - Poetry 1.8 – 2.2 with `virtualenvs.create = false` running as root in this image reinstall a user-site package into `/usr/local/lib/python3.11/dist-packages`. That's Poetry's behaviour, not socket-patch.
 - The uv-tool-installed Poetry in this image builds `poetry env use python3.12` envs on its own 3.11 interpreter (`pyvenv.cfg` says 3.11.15). That's a sandbox quirk; use pip-installed Poetry for multi-interpreter cells.
 - In agent `scan --json`, `ecosystems: [npm]` reports `policy.counts.filtered: 2` for a single `six` (likely the lock and the installed copy). Cosmetic, not filed.
+- Forked Poetry locks (one package at several versions by marker) are refused by hosted (`redirect_poetry_lock_unsupported`, "forked Poetry package requires an unambiguous source") and vendored ("forked resolution"). Documented in CLI_CONTRACT.md.
+- Hosted `vex` attests a lock pin for a package that isn't installed (for example an optional group left uninstalled). Documented ("with nothing installed, attests a discovered lockfile reference from its integrity pin").
+- `rollback` on a project with no manifest, ledger or hosted pin gives "Manifest not found", exit 1. Documented (truly-empty project).
+- Hosted-only `rollback --json` reports `rolledBack: 0` while it restores the lock. Cosmetic, not filed.
+- uv can't install from `poetry export` output against the sandbox mock (it sends `HEAD`, which the mock doesn't answer). Mock artifact.
