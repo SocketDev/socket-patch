@@ -4856,6 +4856,10 @@ fn nuget_xml_attribute(value: &str) -> String {
         .replace('&', "&amp;")
         .replace('"', "&quot;")
         .replace('<', "&lt;")
+        // Literal XML attribute whitespace would be normalized to spaces.
+        .replace('\t', "&#x9;")
+        .replace('\n', "&#xA;")
+        .replace('\r', "&#xD;")
 }
 
 fn rewrite_nuget(
@@ -7597,6 +7601,43 @@ mod tests {
                 "no half-write: {result:?}"
             );
             assert!(warning_codes(&result).contains(&"redirect_nuget_config_unwritable"));
+        }
+    }
+
+    #[test]
+    fn nuget_shared_model_preserves_source_key_attribute_whitespace() {
+        for (raw, decoded, encoded) in [
+            ("corp&#x9;feed", "corp\tfeed", "corp&#x9;feed"),
+            ("corp&#10;feed", "corp\nfeed", "corp&#xA;feed"),
+            ("corp&#13;feed", "corp\rfeed", "corp&#xD;feed"),
+            ("corp\tfeed", "corp feed", "corp feed"),
+            ("corp\nfeed", "corp feed", "corp feed"),
+            ("corp\rfeed", "corp feed", "corp feed"),
+            ("corp\r\nfeed", "corp feed", "corp feed"),
+            (
+                "corp\r\n&#x9;&#xD;&#xA;feed",
+                "corp \t\r\nfeed",
+                "corp &#x9;&#xD;&#xA;feed",
+            ),
+        ] {
+            let source = format!("<add key=\"{raw}\" value=\"https://corp.test/index.json\" />");
+            let config = format!(
+                "<configuration><packageSources><clear/>{source}</packageSources></configuration>"
+            );
+            let files = BTreeMap::from([("nuget.config".into(), config)]);
+            let result = rewrite_registry_redirect(&files, &[nuget_override()]);
+            let out = result.files.get("nuget.config").expect("config rewritten");
+            assert!(out.contains(&source), "original source bytes preserved: {out}");
+            // XML normalizes literal attribute whitespace to spaces, but
+            // preserves character references. The fallback must keep the
+            // same source identity under a real XML reader, not just ours.
+            assert!(
+                out.contains(&format!("<packageSource key=\"{encoded}\">")),
+                "source {raw:?} needs an equivalent mapping: {out}"
+            );
+            let parsed = crate::formats::nuget::parse_config(out).unwrap();
+            assert_eq!(parsed.sources[1].0, decoded);
+            assert_eq!(parsed.mappings[1], (decoded.into(), vec!["*".into()]));
         }
     }
 

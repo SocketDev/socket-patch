@@ -232,7 +232,14 @@ fn parse_open_tag(s: &str) -> Option<(Tag<'_>, usize)> {
         if raw.contains('<') {
             return None;
         }
-        attrs.push((attr, decode_entities(raw)));
+        // XML first normalizes literal CRLF to one line break, then literal
+        // attribute whitespace to spaces. Character references preserve their
+        // referenced whitespace, so normalize before decoding entities.
+        let normalized = raw
+            .bytes()
+            .any(|b| matches!(b, b'\t' | b'\r' | b'\n'))
+            .then(|| raw.replace("\r\n", "\n").replace(['\t', '\r', '\n'], " "));
+        attrs.push((attr, decode_entities(normalized.as_deref().unwrap_or(raw))));
         j += 1 + close + 1;
     }
 }
