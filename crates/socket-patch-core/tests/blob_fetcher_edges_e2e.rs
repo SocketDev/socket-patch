@@ -782,13 +782,17 @@ async fn split_body_server(
 }
 
 /// The size of the `.socket-dl-*` stage file in `dir`, if one exists.
+///
+/// Sized through `std::fs::metadata(path)`, not `DirEntry::metadata`: on
+/// Windows the latter reports the directory entry's cached size, which
+/// NTFS does not update while the writer's handle is still open.
 fn stage_len(dir: &Path) -> Option<u64> {
     std::fs::read_dir(dir).ok()?.find_map(|e| {
         let e = e.ok()?;
         e.file_name()
             .to_string_lossy()
             .starts_with(".socket-dl-")
-            .then(|| e.metadata().ok().map(|m| m.len()))
+            .then(|| std::fs::metadata(e.path()).ok().map(|m| m.len()))
             .flatten()
     })
 }
