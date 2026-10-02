@@ -109,6 +109,7 @@ fn assert_not_discovered(bodies: &[String], needle: &str) {
 /// `scan_run` directly.
 async fn scan_scrubbed(args: ScanArgs) -> i32 {
     std::env::remove_var("VIRTUAL_ENV");
+    std::env::remove_var("UV_PROJECT_ENVIRONMENT");
     scan_run(args).await
 }
 
@@ -635,5 +636,115 @@ async fn pipenv_stray_venv_dirs_do_not_shadow_the_pipenv_venv() {
         let bodies = batch_bodies(&server).await;
         assert_discovered(&bodies, "pkg:pypi/pipenv-pkg@1.0.0");
         assert_not_discovered(&bodies, "pkg:pypi/stray-decoy@6.6.6");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Package-manager-recorded envs: PDM's saved interpreter / PEP 582, and uv's
+// UV_PROJECT_ENVIRONMENT, ahead of a stray `./.venv` the manager never uses
+// ---------------------------------------------------------------------------
+
+/// A project at `<tmp>/app` with `pyproject` and an in-project `.venv`
+/// holding `stray_decoy 6.6.6` that the project's manager does not use.
+fn project_with_stray_venv(pyproject: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("app");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("pyproject.toml"), pyproject).unwrap();
+    let stray = venv_site_packages(&project.join(".venv"), "python3.12");
+    std::fs::create_dir_all(&stray).unwrap();
+    write_dist_info(&stray, "stray_decoy", "6.6.6");
+    (tmp, project)
+}
+
+/// A venv at `root` holding `pkg 1.0.0`; returns its interpreter path.
+fn venv_with(root: &Path, pkg: &str) -> std::path::PathBuf {
+    let site = venv_site_packages(root, "python3.12");
+    std::fs::create_dir_all(&site).unwrap();
+    write_dist_info(&site, pkg, "1.0.0");
+    std::fs::write(root.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    if cfg!(windows) {
+        root.join("Scripts").join("python.exe")
+    } else {
+        root.join("bin").join("python")
+    }
+}
+
+async fn assert_scan_finds(project: &Path, wanted: &str) {
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    assert_eq!(scan_scrubbed(default_args(project, server.uri())).await, 0);
+    let bodies = batch_bodies(&server).await;
+    assert_discovered(&bodies, wanted);
+    assert_not_discovered(&bodies, "pkg:pypi/stray-decoy@6.6.6");
+}
+
+/// #502: PDM's `.pdm-python` names an out-of-tree venv
+/// (`venv.in_project = false`, or `pdm use <venv>`); that is the env scanned.
+#[tokio::test]
+#[serial]
+async fn pdm_saved_interpreter_venv_is_scanned_not_a_stray_dot_venv() {
+    let (tmp, project) =
+        project_with_stray_venv("[project]\nname = \"app\"\n[tool.pdm]\ndistribution = false\n");
+    std::fs::write(project.join("pdm.lock"), "[metadata]\n").unwrap();
+    let python = venv_with(
+        &tmp.path().join("pdm").join("venvs").join("app-AbCd-3.12"),
+        "pdm_pkg",
+    );
+    std::fs::write(project.join(".pdm-python"), python.display().to_string()).unwrap();
+    assert_scan_finds(&project, "pkg:pypi/pdm-pkg@1.0.0").await;
+}
+
+/// #528: a PEP 582 PDM project installs into `__pypackages__/<X.Y>/lib`.
+#[tokio::test]
+#[serial]
+async fn pdm_pep582_pypackages_is_scanned_not_a_stray_dot_venv() {
+    let (tmp, project) = project_with_stray_venv("[project]\nname = \"app\"\n");
+    std::fs::write(project.join("pdm.lock"), "[metadata]\n").unwrap();
+    let lib = project.join("__pypackages__").join("3.11").join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    write_dist_info(&lib, "pep582_pkg", "1.0.0");
+    // The saved interpreter is a base Python, not a venv.
+    let base = tmp.path().join("usr").join("bin").join("python3.11");
+    std::fs::write(project.join(".pdm-python"), base.display().to_string()).unwrap();
+    assert_scan_finds(&project, "pkg:pypi/pep582-pkg@1.0.0").await;
+}
+
+/// #525: uv syncs into `UV_PROJECT_ENVIRONMENT`, absolute or relative to the
+/// project, and ignores an activated `VIRTUAL_ENV` for project commands.
+#[tokio::test]
+#[serial]
+async fn uv_project_environment_is_scanned_not_a_stray_dot_venv() {
+    let other = tempfile::tempdir().unwrap();
+    let decoy = other.path().join("tool-venv");
+    let decoy_site = venv_site_packages(&decoy, "python3.12");
+    std::fs::create_dir_all(&decoy_site).unwrap();
+    write_dist_info(&decoy_site, "activated_decoy", "6.6.6");
+
+    for relative in [false, true] {
+        let (tmp, project) = project_with_stray_venv("[project]\nname = \"app\"\n");
+        std::fs::write(project.join("uv.lock"), "version = 1\n").unwrap();
+        let env = if relative {
+            project.join(".venv-ci")
+        } else {
+            tmp.path().join("opt").join("venv")
+        };
+        venv_with(&env, "uv_pkg");
+        let server = MockServer::start().await;
+        mock_batch_empty(&server).await;
+        std::env::set_var("VIRTUAL_ENV", &decoy);
+        if relative {
+            std::env::set_var("UV_PROJECT_ENVIRONMENT", ".venv-ci");
+        } else {
+            std::env::set_var("UV_PROJECT_ENVIRONMENT", &env);
+        }
+        let code = scan_run(default_args(&project, server.uri())).await;
+        std::env::remove_var("VIRTUAL_ENV");
+        std::env::remove_var("UV_PROJECT_ENVIRONMENT");
+        assert_eq!(code, 0);
+        let bodies = batch_bodies(&server).await;
+        assert_discovered(&bodies, "pkg:pypi/uv-pkg@1.0.0");
+        assert_not_discovered(&bodies, "pkg:pypi/stray-decoy@6.6.6");
+        assert_not_discovered(&bodies, "pkg:pypi/activated-decoy@6.6.6");
     }
 }

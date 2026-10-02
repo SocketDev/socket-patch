@@ -318,6 +318,11 @@ async fn find_site_packages_under(
 /// Find local virtual environment `site-packages` directories.
 ///
 /// Checks (in order):
+/// 0. The env the project's package manager records for it, which that
+///    manager uses ahead of an activated venv or a stray `./.venv` (see
+///    [`package_manager_recorded_site_packages`]): PDM's `.pdm-python`
+///    interpreter (its venv, or `__pypackages__` for PEP 582) and uv's
+///    `UV_PROJECT_ENVIRONMENT`
 /// 1. `VIRTUAL_ENV` environment variable (for a Pipenv project, only when
 ///    Pipenv itself would use it)
 /// 2. For a Pipenv project, the venv(s) Pipenv resolves for it (see
@@ -338,6 +343,13 @@ async fn find_local_venv_site_packages_with(
     var: &impl Fn(&str) -> Option<String>,
 ) -> Vec<PathBuf> {
     let mut results = Vec::new();
+
+    // 0. PDM and uv record where they install a project, and that record
+    // beats both an activated `VIRTUAL_ENV` and a `./.venv` they don't use.
+    if let Some(found) = package_manager_recorded_site_packages(cwd, var).await {
+        return found;
+    }
+
     let pipenv = is_pipenv_project(cwd);
 
     // 1. Check VIRTUAL_ENV env var. Pipenv ignores it under `PIPENV_ACTIVE`
@@ -386,6 +398,118 @@ async fn find_local_venv_site_packages_with(
     }
 
     results
+}
+
+/// The `site-packages` of the env the project's package manager records for
+/// `cwd`, when that env exists. `None` means the manager records nothing
+/// (or nothing installed yet), and the generic probes decide.
+///
+/// - **PDM** installs into the interpreter saved in `.pdm-python` (PDM
+///   2.x; `[python] path` in `.pdm.toml` before that), ahead of an
+///   activated venv. That interpreter's venv is the env (an out-of-tree
+///   `venv.in_project = false` venv, or one picked with `pdm use`). An
+///   interpreter that is not a venv means PEP 582: PDM installs into
+///   `__pypackages__/<X.Y>/lib`, which PDM 1.x also uses with no saved
+///   interpreter at all.
+/// - **uv** syncs a project into `UV_PROJECT_ENVIRONMENT` (absolute, or
+///   relative to the project) instead of `./.venv`, and ignores an
+///   activated `VIRTUAL_ENV` for project commands.
+async fn package_manager_recorded_site_packages(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Option<Vec<PathBuf>> {
+    if let Some(found) = pdm_project_site_packages(cwd).await {
+        return Some(found);
+    }
+    uv_project_environment_site_packages(cwd, var).await
+}
+
+/// PDM's env for `cwd` (see [`package_manager_recorded_site_packages`]).
+async fn pdm_project_site_packages(cwd: &Path) -> Option<Vec<PathBuf>> {
+    let pep582 = || async {
+        let found = find_python_dirs(&cwd.join("__pypackages__"), &["*", "lib"]).await;
+        (!found.is_empty()).then_some(found)
+    };
+    match pdm_saved_interpreter(cwd).await {
+        Some(python) => match venv_root_of_interpreter(&python) {
+            Some(root) => {
+                let found = find_site_packages_under(&root, "site-packages").await;
+                (!found.is_empty()).then_some(found)
+            }
+            None => pep582().await,
+        },
+        None if is_pdm_project(cwd).await => pep582().await,
+        None => None,
+    }
+}
+
+/// The interpreter PDM saved for `cwd`: `.pdm-python` (PDM 2.x), else
+/// `[python] path` in the legacy `.pdm.toml`. A relative path is taken
+/// against the project.
+async fn pdm_saved_interpreter(cwd: &Path) -> Option<PathBuf> {
+    let saved = match tokio::fs::read_to_string(cwd.join(".pdm-python")).await {
+        Ok(text) => text.trim().to_string(),
+        Err(_) => {
+            let text = tokio::fs::read_to_string(cwd.join(".pdm.toml"))
+                .await
+                .ok()?;
+            let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+            doc.get("python")?.get("path")?.as_str()?.trim().to_string()
+        }
+    };
+    (!saved.is_empty()).then(|| cwd.join(saved))
+}
+
+/// Whether `cwd` is a PDM project: `pdm.lock`, `.pdm.toml`, or a
+/// `[tool.pdm]` table in `pyproject.toml`.
+async fn is_pdm_project(cwd: &Path) -> bool {
+    if cwd.join("pdm.lock").is_file() || cwd.join(".pdm.toml").is_file() {
+        return true;
+    }
+    let Ok(text) = tokio::fs::read_to_string(cwd.join("pyproject.toml")).await else {
+        return false;
+    };
+    text.parse::<toml_edit::DocumentMut>()
+        .ok()
+        .and_then(|doc| doc.get("tool")?.get("pdm").map(|_| ()))
+        .is_some()
+}
+
+/// The venv a Python interpreter path belongs to: `<root>/bin/python…` or
+/// `<root>\Scripts\python.exe` with a `<root>/pyvenv.cfg`. The path is not
+/// resolved, since a venv's interpreter is a symlink to its base Python.
+fn venv_root_of_interpreter(python: &Path) -> Option<PathBuf> {
+    let root = python.parent()?.parent()?;
+    root.join("pyvenv.cfg")
+        .is_file()
+        .then(|| root.to_path_buf())
+}
+
+/// uv's `UV_PROJECT_ENVIRONMENT` for a uv project at `cwd` (see
+/// [`package_manager_recorded_site_packages`]). Ambient in shells and
+/// images, so it only counts for a project uv drives: one with `uv.lock`,
+/// or a `pyproject.toml` that no other manager's lock or record claims.
+async fn uv_project_environment_site_packages(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Option<Vec<PathBuf>> {
+    let env = var("UV_PROJECT_ENVIRONMENT").filter(|v| !v.trim().is_empty())?;
+    let other_manager = [
+        "poetry.lock",
+        "pdm.lock",
+        ".pdm-python",
+        "Pipfile",
+        "Pipfile.lock",
+    ]
+    .iter()
+    .any(|marker| cwd.join(marker).exists());
+    let uv_project =
+        cwd.join("uv.lock").is_file() || (cwd.join("pyproject.toml").is_file() && !other_manager);
+    if !uv_project {
+        return None;
+    }
+    let found = find_site_packages_under(&cwd.join(env), "site-packages").await;
+    (!found.is_empty()).then_some(found)
 }
 
 /// Whether `cwd` is a Pipenv project: a `Pipfile` or a `Pipfile.lock`.
@@ -2047,6 +2171,227 @@ mod tests {
         };
         std::fs::create_dir_all(&site).unwrap();
         site
+    }
+
+    /// A venv at `root` as the crawler sees it: `pyvenv.cfg`, an interpreter
+    /// path under `bin/` (`Scripts\\` on Windows), and its site-packages.
+    /// Returns `(interpreter, site_packages)`.
+    fn fake_venv_root(root: &Path) -> (PathBuf, PathBuf) {
+        let parent = root.parent().unwrap();
+        let leaf = root.file_name().unwrap().to_str().unwrap();
+        let site = fake_venv(parent, leaf);
+        std::fs::write(root.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        let python = if cfg!(windows) {
+            root.join("Scripts").join("python.exe")
+        } else {
+            root.join("bin").join("python")
+        };
+        (python, site)
+    }
+
+    fn env_of(pairs: &[(&str, String)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    /// #502: PDM installs into the interpreter saved in `.pdm-python` (an
+    /// out-of-tree `venv.in_project = false` venv, or one bound with
+    /// `pdm use`), ahead of a stray `./.venv` and an activated venv.
+    #[tokio::test]
+    async fn pdm_saved_interpreter_venv_is_the_project_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"app\"\n[tool.pdm]\ndistribution = false\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("pdm.lock"), "[metadata]\n").unwrap();
+        let (python, pdm_site) =
+            fake_venv_root(&tmp.path().join("pdm-venvs").join("app-AbCd-3.12"));
+        std::fs::write(
+            project.join(".pdm-python"),
+            format!("{}\n", python.display()),
+        )
+        .unwrap();
+        let no_env = env_of(&[]);
+
+        // Out-of-tree venv, nothing else around: found (was: skipped).
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &no_env).await,
+            vec![pdm_site.clone()]
+        );
+
+        // A stray `./.venv` PDM does not use is not patched.
+        let stray = fake_venv(&project, ".venv");
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &no_env).await,
+            vec![pdm_site.clone()]
+        );
+
+        // PDM prefers its saved interpreter over an activated venv.
+        let other = tempfile::tempdir().unwrap();
+        fake_venv(other.path(), "tool-venv");
+        let activated = env_of(&[(
+            "VIRTUAL_ENV",
+            other
+                .path()
+                .join("tool-venv")
+                .to_string_lossy()
+                .into_owned(),
+        )]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &activated).await,
+            vec![pdm_site.clone()]
+        );
+
+        // Legacy PDM (`.pdm.toml` `[python] path`) records the same thing.
+        std::fs::remove_file(project.join(".pdm-python")).unwrap();
+        let mut doc = toml_edit::DocumentMut::new();
+        doc["python"]["path"] = toml_edit::value(python.to_string_lossy().into_owned());
+        std::fs::write(project.join(".pdm.toml"), doc.to_string()).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &no_env).await,
+            vec![pdm_site.clone()]
+        );
+        std::fs::remove_file(project.join(".pdm.toml")).unwrap();
+
+        // Saved interpreter whose venv is gone: the generic probes decide.
+        std::fs::write(
+            project.join(".pdm-python"),
+            tmp.path()
+                .join("gone")
+                .join("bin")
+                .join("python")
+                .display()
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &no_env).await,
+            vec![stray]
+        );
+    }
+
+    /// #528: a PDM interpreter that is not a venv means PEP 582, and PDM
+    /// installs into `__pypackages__/<X.Y>/lib` (PDM 1.x does so with no
+    /// saved interpreter at all). The PATH Python is never the env.
+    #[tokio::test]
+    async fn pdm_pep582_pypackages_is_the_project_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("demo");
+        let lib = project.join("__pypackages__").join("3.11").join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"demo\"\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("pdm.lock"), "[metadata]\n").unwrap();
+        // A base interpreter: no pyvenv.cfg next to it.
+        let base = tmp.path().join("usr").join("bin").join("python3.11");
+        std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+        std::fs::write(project.join(".pdm-python"), base.display().to_string()).unwrap();
+        let no_env = env_of(&[]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &no_env).await,
+            vec![lib.clone()]
+        );
+
+        // PDM 1.x: no saved interpreter, still a PDM project.
+        std::fs::remove_file(project.join(".pdm-python")).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &no_env).await,
+            vec![lib.clone()]
+        );
+
+        // `__pypackages__` outside a PDM project is not PDM's.
+        std::fs::remove_file(project.join("pdm.lock")).unwrap();
+        assert!(find_local_venv_site_packages_with(&project, &no_env)
+            .await
+            .is_empty());
+    }
+
+    /// #525: uv syncs a project into `UV_PROJECT_ENVIRONMENT` (absolute, or
+    /// relative to the project) instead of `./.venv`, ignoring an
+    /// activated venv; the variable means nothing outside a uv project.
+    #[tokio::test]
+    async fn uv_project_environment_is_the_project_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"app\"\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("uv.lock"), "version = 1\n").unwrap();
+        let abs_site = fake_venv(&tmp.path().join("opt"), "venv");
+        let abs = tmp.path().join("opt").join("venv");
+        let rel_site = fake_venv(&project, ".venv-ci");
+        let stray = fake_venv(&project, ".venv");
+        let other = tempfile::tempdir().unwrap();
+        fake_venv(other.path(), "tool-venv");
+        let activated = other
+            .path()
+            .join("tool-venv")
+            .to_string_lossy()
+            .into_owned();
+
+        let abs_env = env_of(&[("UV_PROJECT_ENVIRONMENT", abs.to_string_lossy().into_owned())]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &abs_env).await,
+            vec![abs_site.clone()]
+        );
+        let rel_env = env_of(&[
+            ("UV_PROJECT_ENVIRONMENT", ".venv-ci".to_string()),
+            ("VIRTUAL_ENV", activated.clone()),
+        ]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &rel_env).await,
+            vec![rel_site.clone()]
+        );
+
+        // Lock-less uv project (just pyproject.toml) counts too.
+        std::fs::remove_file(project.join("uv.lock")).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &abs_env).await,
+            vec![abs_site]
+        );
+
+        // ...but not a project another manager drives, nor a non-project.
+        std::fs::write(project.join("poetry.lock"), "").unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &abs_env).await,
+            vec![stray.clone()]
+        );
+        std::fs::remove_file(project.join("poetry.lock")).unwrap();
+        std::fs::remove_file(project.join("pyproject.toml")).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &abs_env).await,
+            vec![stray.clone()]
+        );
+
+        // An env that does not exist yet leaves the generic probes in charge.
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"app\"\n",
+        )
+        .unwrap();
+        let missing = env_of(&[("UV_PROJECT_ENVIRONMENT", "not-synced".to_string())]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &missing).await,
+            vec![stray]
+        );
     }
 
     /// The end-to-end shape: a Pipenv project with NO in-project venv and
