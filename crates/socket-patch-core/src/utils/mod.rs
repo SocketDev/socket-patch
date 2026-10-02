@@ -11,6 +11,7 @@ pub mod notice;
 pub(crate) mod http;
 pub(crate) mod line_endings;
 pub mod pdm_lock;
+pub(crate) mod pep440;
 pub mod pipenv;
 pub mod poetry_lock;
 pub mod process;

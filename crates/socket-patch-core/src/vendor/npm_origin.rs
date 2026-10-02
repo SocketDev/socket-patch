@@ -23,12 +23,309 @@
 //! * or its own `resolved` names a git or `file:` source. socket-patch's own
 //!   vendored wiring (`file:.socket/vendor/…`) is not one: the vendored
 //!   backend only rewrites `resolved`, never the dependent's spec.
+//!
+//! An inbound spec the project's `overrides` replace with a registry spec
+//! does not count (#490): npm installs the override, and the lock records
+//! the registry tarball while the dependent's entry keeps its own raw
+//! spec. npm doesn't record `overrides` in the lock, so they come from the
+//! root `package.json` ([`NpmOverrides`]). Only overrides that clearly apply
+//! to the edge clear it (see [`NpmOverrides::replacement`]). In any unclear
+//! case the edge keeps counting, which leaves the copy unpatched and
+//! reported rather than wrongly attested.
 
 use std::collections::BTreeMap;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::constants::SOCKET_DIR;
+
+/// The root `package.json` fields that decide what npm installs for an
+/// overridden edge: its `overrides` and its own dependency specs (for the
+/// `$name` references an override value may use). Empty (no override
+/// applies) when the manifest is absent or unparseable.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NpmOverrides {
+    rules: Map<String, Value>,
+    root_deps: Map<String, Value>,
+}
+
+impl NpmOverrides {
+    /// From the parsed root `package.json`.
+    pub(crate) fn from_manifest(manifest: &Value) -> Self {
+        let rules = manifest
+            .get("overrides")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut root_deps = Map::new();
+        // npm resolves `$name` against the root's direct dependencies.
+        for field in EDGE_FIELDS {
+            if let Some(deps) = manifest.get(field).and_then(Value::as_object) {
+                for (name, spec) in deps {
+                    root_deps
+                        .entry(name.clone())
+                        .or_insert_with(|| spec.clone());
+                }
+            }
+        }
+        NpmOverrides { rules, root_deps }
+    }
+
+    /// From the root `package.json` text (a leading BOM is skipped, as npm
+    /// does); empty when it isn't valid JSON.
+    pub(crate) fn from_manifest_text(text: &str) -> Self {
+        super::common::parse_json_text(text)
+            .map(|manifest| Self::from_manifest(&manifest))
+            .unwrap_or_default()
+    }
+
+    /// From `<project_root>/package.json`; empty when it can't be read.
+    pub(crate) async fn read(project_root: &std::path::Path) -> Self {
+        match crate::utils::fs::read_regular_to_bytes(&project_root.join("package.json")).await {
+            Ok(bytes) => super::common::parse_json_manifest(&bytes)
+                .map(|manifest| Self::from_manifest(&manifest))
+                .unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// The spec an override makes npm install for the edge `dep_name@spec`
+    /// whose dependent sits at the lock key `from`, or `None` when no
+    /// override clearly applies.
+    ///
+    /// A rule applies when its key names `dep_name` with no selector (or
+    /// with `spec` itself as the selector), and every enclosing rule names
+    /// the dependent or one of its physical ancestors (outermost first),
+    /// with no selector or that package's exact version. As in npm, the
+    /// rule scoped to the closest ancestor wins (then the most deeply
+    /// nested one), and a winning `*` or empty value is a no-op that leaves
+    /// the dependent's own spec in effect.
+    ///
+    /// Anything this can't decide exactly makes the answer unclear, and
+    /// then no override applies: two equally close rules that disagree, a
+    /// target selector other than `spec`, or an enclosing selector that is
+    /// a range (it may match the ancestor, so a rule beneath it may be the
+    /// one npm picks).
+    fn replacement(
+        &self,
+        packages: &Map<String, Value>,
+        from: &str,
+        dep_name: &str,
+        spec: &str,
+    ) -> Option<String> {
+        if self.rules.is_empty() {
+            return None;
+        }
+        let chain = dependent_chain(packages, from);
+        let mut search = RuleSearch::default();
+        self.visit(&self.rules, &chain, 0, 0, dep_name, spec, &mut search);
+        if search.unclear {
+            return None;
+        }
+        let best = search.best.filter(|b| !b.contested)?;
+        // npm ignores a `*` (or empty) replacement: the raw spec stays.
+        let value = best.value.trim();
+        (!value.is_empty() && value != "*").then_some(best.value)
+    }
+
+    /// Search `rules` (nested `depth` levels deep; the enclosing rules
+    /// matched ancestors up to `chain[from_ix - 1]`) for the edge's rule.
+    #[allow(clippy::too_many_arguments)]
+    fn visit(
+        &self,
+        rules: &Map<String, Value>,
+        chain: &[(String, Option<String>)],
+        from_ix: usize,
+        depth: usize,
+        dep_name: &str,
+        spec: &str,
+        search: &mut RuleSearch,
+    ) {
+        for (key, value) in rules {
+            if key == "." {
+                continue;
+            }
+            let (name, selector) = split_selector(key);
+            // A rule for the edge's own package.
+            if name == dep_name {
+                match selector {
+                    None => self.offer(value, (from_ix, depth), search),
+                    Some(sel) if sel == spec => self.offer(value, (from_ix, depth), search),
+                    // npm matches other selectors against the spec by
+                    // semver intersection, which isn't modelled here.
+                    Some(_) => search.unclear = true,
+                }
+            }
+            // A rule scoped to a package on the dependent's chain: every
+            // matching ancestor, so the closest one is ranked too.
+            if let Some(children) = value.as_object() {
+                for (ix, (anc_name, anc_version)) in chain.iter().enumerate().skip(from_ix) {
+                    if anc_name != name {
+                        continue;
+                    }
+                    let applies = match selector {
+                        None => true,
+                        // An exact version applies when it equals the
+                        // ancestor's under semver, which ignores build
+                        // metadata (`1.0.0+build.1` matches `1.0.0`), and
+                        // can't apply otherwise.
+                        Some(sel) if is_exact_version(sel) && anc_version.is_some() => anc_version
+                            .as_deref()
+                            .is_some_and(|v| without_build(v) == without_build(sel)),
+                        // A range (or an unknown ancestor version): it may
+                        // apply, so a rule for the edge beneath it may be
+                        // the one npm picks.
+                        Some(_) => {
+                            if mentions(children, dep_name) {
+                                search.unclear = true;
+                            }
+                            false
+                        }
+                    };
+                    if applies {
+                        self.visit(children, chain, ix + 1, depth + 1, dep_name, spec, search);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rank a rule for the edge; one whose value can't be resolved (a
+    /// `$name` the root doesn't declare, a non-string) makes it unclear.
+    fn offer(&self, value: &Value, rank: (usize, usize), search: &mut RuleSearch) {
+        match self.rule_value(value) {
+            Some(replacement) => BestRule::offer(&mut search.best, rank, replacement),
+            // An object with only nested rules overrides nothing itself,
+            // but still shadows a farther rule: a no-op, like `*`.
+            None if value.as_object().is_some_and(|o| !o.contains_key(".")) => {
+                BestRule::offer(&mut search.best, rank, String::new())
+            }
+            None => search.unclear = true,
+        }
+    }
+
+    /// A rule's replacement spec: the string itself, or an object's `"."`,
+    /// with a `$name` reference resolved against the root's dependencies.
+    fn rule_value(&self, value: &Value) -> Option<String> {
+        let raw = match value {
+            Value::String(s) => s.as_str(),
+            Value::Object(obj) => obj.get(".")?.as_str()?,
+            _ => return None,
+        };
+        match raw.strip_prefix('$') {
+            Some(reference) => self.root_deps.get(reference)?.as_str().map(str::to_string),
+            None => Some(raw.to_string()),
+        }
+    }
+}
+
+/// What [`NpmOverrides::visit`] has found for one edge.
+#[derive(Debug, Default)]
+struct RuleSearch {
+    best: Option<BestRule>,
+    /// A rule that may apply couldn't be evaluated exactly.
+    unclear: bool,
+}
+
+/// Whether `rules` (at any depth) holds a rule keyed by `dep_name`.
+fn mentions(rules: &Map<String, Value>, dep_name: &str) -> bool {
+    rules.iter().any(|(key, value)| {
+        split_selector(key).0 == dep_name
+            || value
+                .as_object()
+                .is_some_and(|children| mentions(children, dep_name))
+    })
+}
+
+/// `version` without its `+build` metadata, which semver ignores when
+/// comparing.
+fn without_build(version: &str) -> &str {
+    version.split_once('+').map_or(version, |(core, _)| core)
+}
+
+/// A plain `major.minor.patch` version, optionally with a prerelease or
+/// build suffix: never a range.
+fn is_exact_version(selector: &str) -> bool {
+    let core_end = selector.find(['-', '+']).unwrap_or(selector.len());
+    let (core, suffix) = selector.split_at(core_end);
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.'))
+}
+
+/// The winning override rule so far: ranked by how close its innermost
+/// enclosing ancestor is to the dependent (`chain` entries consumed), then
+/// by nesting depth. `contested` when an equally ranked rule disagrees.
+#[derive(Debug)]
+struct BestRule {
+    rank: (usize, usize),
+    value: String,
+    contested: bool,
+}
+
+impl BestRule {
+    fn offer(best: &mut Option<BestRule>, rank: (usize, usize), value: String) {
+        match best {
+            Some(b) if rank < b.rank => {}
+            Some(b) if rank == b.rank => b.contested |= b.value != value,
+            _ => {
+                *best = Some(BestRule {
+                    rank,
+                    value,
+                    contested: false,
+                })
+            }
+        }
+    }
+}
+
+/// `name` or `name@selector` (a scoped `@scope/name` keeps its leading `@`).
+fn split_selector(key: &str) -> (&str, Option<&str>) {
+    let (scope_at, rest) = match key.strip_prefix('@') {
+        Some(rest) => (1, rest),
+        None => (0, key),
+    };
+    match rest.split_once('@') {
+        Some((name, selector)) => (&key[..scope_at + name.len()], Some(selector)),
+        None => (key, None),
+    }
+}
+
+/// The packages on the path from the project root to the lock key `from`,
+/// outermost first, as `(name, version)`: each `node_modules/<name>`
+/// segment's entry (its `name` field for an alias, else the segment). The
+/// root and workspace members contribute nothing.
+fn dependent_chain(packages: &Map<String, Value>, from: &str) -> Vec<(String, Option<String>)> {
+    let mut chain = Vec::new();
+    let mut rest = from;
+    let mut prefix = String::new();
+    while let Some(ix) = rest.find("node_modules/") {
+        let after = &rest[ix + "node_modules/".len()..];
+        // A package segment runs to the next nested `node_modules/`.
+        let seg_len = after.find("/node_modules/").unwrap_or(after.len());
+        let consumed = ix + "node_modules/".len() + seg_len;
+        prefix.push_str(&rest[..consumed]);
+        let segment = &after[..seg_len];
+        let entry = packages.get(&prefix);
+        let name = entry
+            .and_then(|e| e.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or(segment)
+            .to_string();
+        let version = entry
+            .and_then(|e| e.get("version"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        chain.push((name, version));
+        rest = &rest[consumed..];
+    }
+    chain
+}
 
 /// The dependency maps whose specs npm resolves against `packages` entries.
 const EDGE_FIELDS: [&str; 4] = [
@@ -53,7 +350,10 @@ pub(crate) fn legacy_packages_key(parent: &str, name: &str) -> String {
 /// the reason (for the skip warnings). Empty for a lock without `packages`:
 /// in a lockfileVersion 1 `dependencies` tree a git / URL / `file:` entry's
 /// `version` is that spec, so it never matches a patch's `name@version`.
-pub(crate) fn npm_non_registry_entries(lock: &Value) -> BTreeMap<String, String> {
+pub(crate) fn npm_non_registry_entries(
+    lock: &Value,
+    overrides: &NpmOverrides,
+) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let Some(packages) = lock.get("packages").and_then(Value::as_object) else {
         return out;
@@ -78,6 +378,14 @@ pub(crate) fn npm_non_registry_entries(lock: &Value) -> BTreeMap<String, String>
                     continue;
                 };
                 if npm_spec_is_registry(spec) {
+                    continue;
+                }
+                // An override that swaps the spec for a registry one makes
+                // npm install the registry release instead (#490).
+                if overrides
+                    .replacement(packages, from, dep_name, spec)
+                    .is_some_and(|replacement| npm_spec_is_registry(&replacement))
+                {
                     continue;
                 }
                 let Some(target) = resolve_edge(packages, from, dep_name) else {
@@ -244,7 +552,7 @@ mod tests {
                 "resolved": "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba"
             }
         }));
-        let found = npm_non_registry_entries(&lock);
+        let found = npm_non_registry_entries(&lock, &NpmOverrides::default());
         assert!(found.contains_key("node_modules/left-pad"), "{found:?}");
     }
 
@@ -260,7 +568,8 @@ mod tests {
                 "": { "dependencies": { "left-pad": "github:stevemao/left-pad#v1.3.0" } },
                 "node_modules/left-pad": { "version": "1.3.0", "resolved": resolved }
             }));
-            assert!(npm_non_registry_entries(&lock).contains_key("node_modules/left-pad"));
+            assert!(npm_non_registry_entries(&lock, &NpmOverrides::default())
+                .contains_key("node_modules/left-pad"));
         }
     }
 
@@ -273,7 +582,8 @@ mod tests {
             "": { "dependencies": { "left-pad": url } },
             "node_modules/left-pad": { "version": "1.3.0", "resolved": url }
         }));
-        assert!(npm_non_registry_entries(&lock).contains_key("node_modules/left-pad"));
+        assert!(npm_non_registry_entries(&lock, &NpmOverrides::default())
+            .contains_key("node_modules/left-pad"));
     }
 
     #[test]
@@ -285,7 +595,8 @@ mod tests {
                 "resolved": "file:../left-pad-1.3.0.tgz"
             }
         }));
-        assert!(npm_non_registry_entries(&lock).contains_key("node_modules/left-pad"));
+        assert!(npm_non_registry_entries(&lock, &NpmOverrides::default())
+            .contains_key("node_modules/left-pad"));
     }
 
     #[test]
@@ -308,7 +619,7 @@ mod tests {
                 "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
             }
         }));
-        let found = npm_non_registry_entries(&lock);
+        let found = npm_non_registry_entries(&lock, &NpmOverrides::default());
         assert!(found.contains_key("node_modules/a/node_modules/left-pad"));
         assert!(!found.contains_key("node_modules/left-pad"), "{found:?}");
         assert!(!found.contains_key("node_modules/a"));
@@ -323,7 +634,8 @@ mod tests {
             "node_modules/app": { "resolved": "packages/app", "link": true },
             "node_modules/left-pad": { "version": "1.3.0", "resolved": url }
         }));
-        assert!(npm_non_registry_entries(&lock).contains_key("node_modules/left-pad"));
+        assert!(npm_non_registry_entries(&lock, &NpmOverrides::default())
+            .contains_key("node_modules/left-pad"));
     }
 
     #[test]
@@ -340,6 +652,361 @@ mod tests {
                 "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
             }
         }));
-        assert!(npm_non_registry_entries(&lock).is_empty());
+        assert!(npm_non_registry_entries(&lock, &NpmOverrides::default()).is_empty());
+    }
+
+    /// The #490 lock: `pkga` depends on left-pad from git, the project
+    /// overrides it, and npm installs the registry release.
+    fn overridden_git_lock(left_pad_resolved: &str) -> Value {
+        lock(json!({
+            "": { "dependencies": { "pkga": "file:pkga-1.0.0.tgz" } },
+            "node_modules/left-pad": {
+                "version": "1.3.0",
+                "resolved": left_pad_resolved,
+                "integrity": "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="
+            },
+            "node_modules/pkga": {
+                "version": "1.0.0",
+                "resolved": "file:pkga-1.0.0.tgz",
+                "dependencies": { "left-pad": "github:stevemao/left-pad#v1.3.0" }
+            }
+        }))
+    }
+
+    fn manifest(overrides: Value) -> NpmOverrides {
+        NpmOverrides::from_manifest(&json!({
+            "name": "app",
+            "dependencies": { "pkga": "file:pkga-1.0.0.tgz", "left-pad": "1.3.0" },
+            "overrides": overrides
+        }))
+    }
+
+    const REGISTRY_TGZ: &str = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+
+    #[test]
+    fn issue_490_a_registry_override_of_a_git_edge_is_a_registry_install() {
+        // Fresh lock, and the lock after a hosted redirect.
+        for resolved in [
+            REGISTRY_TGZ,
+            "https://patch.socket.dev/npm/left-pad/-/left-pad-1.3.0.tgz",
+        ] {
+            let lock = overridden_git_lock(resolved);
+            for overrides in [
+                json!({ "left-pad": "1.3.0" }),
+                json!({ "left-pad": "^1.3.0" }),
+                json!({ "left-pad": { ".": "1.3.0" } }),
+                json!({ "left-pad": "$left-pad" }),
+                json!({ "pkga": { "left-pad": "1.3.0" } }),
+                json!({ "pkga@1.0.0": { "left-pad": "1.3.0" } }),
+                json!({ "left-pad@github:stevemao/left-pad#v1.3.0": "1.3.0" }),
+            ] {
+                let found = npm_non_registry_entries(&lock, &manifest(overrides.clone()));
+                assert!(
+                    !found.contains_key("node_modules/left-pad"),
+                    "{overrides} / {resolved}: {found:?}"
+                );
+                // The dependent itself is still a `file:` install.
+                assert!(found.contains_key("node_modules/pkga"), "{found:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn issue_490_overrides_that_do_not_clearly_apply_keep_the_edge() {
+        let lock = overridden_git_lock(REGISTRY_TGZ);
+        for overrides in [
+            // No override at all (the #326 case).
+            json!({}),
+            // Scoped under a package that isn't on the dependent's chain.
+            json!({ "other": { "left-pad": "1.3.0" } }),
+            // A parent selector for another version of the dependent.
+            json!({ "pkga@2.0.0": { "left-pad": "1.3.0" } }),
+            // A selector naming a different spec.
+            json!({ "left-pad@1.2.0": "1.3.0" }),
+            // An override to another non-registry source.
+            json!({ "left-pad": "github:someone/left-pad" }),
+            json!({ "left-pad": "file:../left-pad" }),
+            // A `$` reference to a dependency the root doesn't declare.
+            json!({ "left-pad": "$missing" }),
+            // An object rule without its own `"."` spec.
+            json!({ "left-pad": { "other": "1.0.0" } }),
+            // A different package's override.
+            json!({ "right-pad": "1.0.0" }),
+        ] {
+            let found = npm_non_registry_entries(&lock, &manifest(overrides.clone()));
+            assert!(
+                found.contains_key("node_modules/left-pad"),
+                "{overrides}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_490_the_innermost_override_wins() {
+        let lock = overridden_git_lock(REGISTRY_TGZ);
+        // Top level says registry, but the rule scoped to pkga says git.
+        let found = npm_non_registry_entries(
+            &lock,
+            &manifest(json!({
+                "left-pad": "1.3.0",
+                "pkga": { "left-pad": "github:someone/left-pad" }
+            })),
+        );
+        assert!(found.contains_key("node_modules/left-pad"), "{found:?}");
+        // And the other way round.
+        let found = npm_non_registry_entries(
+            &lock,
+            &manifest(json!({
+                "left-pad": "github:someone/left-pad",
+                "pkga": { "left-pad": "1.3.0" }
+            })),
+        );
+        assert!(!found.contains_key("node_modules/left-pad"), "{found:?}");
+    }
+
+    #[test]
+    fn issue_490_the_closest_ancestor_rule_wins_whatever_the_key_order() {
+        // `@scope/b` under `a` depends on left-pad from git. Rules scoped to
+        // `a` (farther) and `@scope/b` (closer) sit at the same nesting
+        // depth; the closer one decides, in either key order.
+        let lock = lock(json!({
+            "": { "dependencies": { "a": "^1.0.0" } },
+            "node_modules/a": { "version": "1.0.0", "resolved": REGISTRY_TGZ },
+            "node_modules/a/node_modules/@scope/b": {
+                "version": "2.0.0",
+                "resolved": REGISTRY_TGZ,
+                "dependencies": { "left-pad": "github:stevemao/left-pad#v1.3.0" }
+            },
+            "node_modules/a/node_modules/left-pad": {
+                "version": "1.3.0",
+                "resolved": REGISTRY_TGZ
+            }
+        }));
+        let key = "node_modules/a/node_modules/left-pad";
+        let found = |overrides: Value| {
+            npm_non_registry_entries(
+                &lock,
+                &NpmOverrides::from_manifest(&json!({ "overrides": overrides })),
+            )
+            .contains_key(key)
+        };
+        for (closer, farther, non_registry) in [
+            ("github:someone/left-pad", "1.3.0", true),
+            ("1.3.0", "github:someone/left-pad", false),
+        ] {
+            // `@scope/b` sorts before `a`, so the farther rule is visited
+            // last; swapping which ancestor holds the registry spec covers
+            // both outcomes.
+            assert_eq!(
+                found(json!({
+                    "@scope/b": { "left-pad": closer },
+                    "a": { "left-pad": farther }
+                })),
+                non_registry,
+                "closer {closer} / farther {farther}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_490_equally_close_rules_that_disagree_keep_the_edge() {
+        let lock = overridden_git_lock(REGISTRY_TGZ);
+        // `pkga` and `pkga@1.0.0` both scope to the dependent at the same
+        // depth: npm's pick between them isn't modelled, so stay cautious.
+        let found = npm_non_registry_entries(
+            &lock,
+            &manifest(json!({
+                "pkga": { "left-pad": "1.3.0" },
+                "pkga@1.0.0": { "left-pad": "github:someone/left-pad" }
+            })),
+        );
+        assert!(found.contains_key("node_modules/left-pad"), "{found:?}");
+        // Agreeing rules are fine.
+        let found = npm_non_registry_entries(
+            &lock,
+            &manifest(json!({
+                "pkga": { "left-pad": "1.3.0" },
+                "pkga@1.0.0": { "left-pad": "1.3.0" }
+            })),
+        );
+        assert!(!found.contains_key("node_modules/left-pad"), "{found:?}");
+    }
+
+    #[test]
+    fn issue_490_wildcard_and_empty_overrides_leave_the_raw_spec() {
+        // npm ignores a `*` (or empty) replacement, so the dependent's URL
+        // or git spec stays in effect (npm 10.9.4 `edge.js`). Covered for a
+        // remote-tarball spec and a git spec, with `"."` objects too.
+        let url = REGISTRY_TGZ;
+        let url_lock = lock(json!({
+            "": { "dependencies": { "left-pad": url } },
+            "node_modules/left-pad": { "version": "1.3.0", "resolved": url }
+        }));
+        let git_lock = overridden_git_lock(REGISTRY_TGZ);
+        for value in [json!("*"), json!(""), json!(" * "), json!({ ".": "*" })] {
+            for (lock, label) in [(&url_lock, "url"), (&git_lock, "git")] {
+                let found =
+                    npm_non_registry_entries(lock, &manifest(json!({ "left-pad": value.clone() })));
+                assert!(
+                    found.contains_key("node_modules/left-pad"),
+                    "{label} / {value}: {found:?}"
+                );
+            }
+        }
+        // A closer no-op shadows a farther registry rule, as in npm.
+        let found = npm_non_registry_entries(
+            &git_lock,
+            &manifest(json!({ "left-pad": "1.3.0", "pkga": { "left-pad": "*" } })),
+        );
+        assert!(found.contains_key("node_modules/left-pad"), "{found:?}");
+        let found = npm_non_registry_entries(
+            &git_lock,
+            &manifest(json!({
+                "left-pad": "1.3.0",
+                "pkga": { "left-pad": { "nested": "1.0.0" } }
+            })),
+        );
+        assert!(found.contains_key("node_modules/left-pad"), "{found:?}");
+    }
+
+    #[test]
+    fn issue_490_range_selectors_that_may_apply_keep_the_edge() {
+        let lock = overridden_git_lock(REGISTRY_TGZ);
+        let tgz = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        for scoped in ["pkga@^1", "pkga@1.x", "pkga@>=1", "pkga@*", "pkga@1"] {
+            // npm picks the narrower rule under `pkga@^1` (here a URL) over
+            // the top-level registry rule, so the broader one can't clear
+            // the edge while the selector is unevaluated.
+            let found = npm_non_registry_entries(
+                &lock,
+                &manifest(json!({ "left-pad": "1.3.0", scoped: { "left-pad": tgz } })),
+            );
+            assert!(
+                found.contains_key("node_modules/left-pad"),
+                "{scoped}: {found:?}"
+            );
+        }
+        // A range selector whose subtree never names the dependency, and an
+        // exact selector for another version, don't block the clear.
+        for overrides in [
+            json!({ "left-pad": "1.3.0", "pkga@^1": { "other": "1.0.0" } }),
+            json!({ "left-pad": "1.3.0", "pkga@2.0.0": { "left-pad": tgz } }),
+        ] {
+            let found = npm_non_registry_entries(&lock, &manifest(overrides.clone()));
+            assert!(
+                !found.contains_key("node_modules/left-pad"),
+                "{overrides}: {found:?}"
+            );
+        }
+        // A target selector other than the edge's own spec is unclear too.
+        let found = npm_non_registry_entries(
+            &lock,
+            &manifest(json!({ "left-pad": "1.3.0", "left-pad@^1": "github:x/y" })),
+        );
+        assert!(found.contains_key("node_modules/left-pad"), "{found:?}");
+    }
+
+    #[test]
+    fn issue_490_exact_selectors_compare_without_build_metadata() {
+        // The follow-up review probe: npm matches `pkga@1.0.0+build.1` to
+        // the installed `pkga@1.0.0`, so its narrower URL rule wins over
+        // the top-level registry rule and the edge stays non-registry.
+        let lock = overridden_git_lock(REGISTRY_TGZ);
+        let tgz = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        for scoped in ["pkga@1.0.0+build.1", "pkga@1.0.0+other"] {
+            let found = npm_non_registry_entries(
+                &lock,
+                &manifest(json!({ "left-pad": "1.3.0", scoped: { "left-pad": tgz } })),
+            );
+            assert!(
+                found.contains_key("node_modules/left-pad"),
+                "{scoped}: {found:?}"
+            );
+            // And a registry rule under it applies as the exact match.
+            let found = npm_non_registry_entries(
+                &lock,
+                &manifest(json!({ scoped: { "left-pad": "1.3.0" } })),
+            );
+            assert!(
+                !found.contains_key("node_modules/left-pad"),
+                "{scoped}: {found:?}"
+            );
+        }
+        // A prerelease is a different version, so its rule can't apply.
+        let found = npm_non_registry_entries(
+            &lock,
+            &manifest(json!({ "left-pad": "1.3.0", "pkga@1.0.0-beta.1": { "left-pad": tgz } })),
+        );
+        assert!(!found.contains_key("node_modules/left-pad"), "{found:?}");
+    }
+
+    #[test]
+    fn exact_versions_are_told_from_ranges() {
+        for exact in ["1.0.0", "10.2.33", "1.0.0-beta.1", "1.0.0+build.5"] {
+            assert!(is_exact_version(exact), "{exact}");
+        }
+        for range in [
+            "^1",
+            "1",
+            "1.x",
+            "1.0",
+            "~1.0.0",
+            ">=1.0.0",
+            "*",
+            "1.0.0 || 2.0.0",
+            "v1.0.0",
+        ] {
+            assert!(!is_exact_version(range), "{range}");
+        }
+    }
+
+    #[test]
+    fn issue_490_a_nested_dependent_matches_its_physical_ancestors() {
+        // `@scope/b` under `a` depends on left-pad from git; the override is
+        // scoped to `a`, two levels up.
+        let lock = lock(json!({
+            "": { "dependencies": { "a": "^1.0.0" } },
+            "node_modules/a": { "version": "1.0.0", "resolved": REGISTRY_TGZ },
+            "node_modules/a/node_modules/@scope/b": {
+                "version": "2.0.0",
+                "resolved": REGISTRY_TGZ,
+                "dependencies": { "left-pad": "github:stevemao/left-pad#v1.3.0" }
+            },
+            "node_modules/a/node_modules/left-pad": {
+                "version": "1.3.0",
+                "resolved": REGISTRY_TGZ
+            }
+        }));
+        let scoped = |overrides: Value| {
+            npm_non_registry_entries(
+                &lock,
+                &NpmOverrides::from_manifest(&json!({ "overrides": overrides })),
+            )
+        };
+        let key = "node_modules/a/node_modules/left-pad";
+        assert!(!scoped(json!({ "a": { "left-pad": "1.3.0" } })).contains_key(key));
+        assert!(!scoped(json!({ "a": { "@scope/b": { "left-pad": "1.3.0" } } })).contains_key(key));
+        assert!(!scoped(json!({ "@scope/b@2.0.0": { "left-pad": "1.3.0" } })).contains_key(key));
+        // Out of order: `@scope/b` isn't an ancestor of `a`.
+        assert!(scoped(json!({ "@scope/b": { "a": { "left-pad": "1.3.0" } } })).contains_key(key));
+    }
+
+    #[test]
+    fn overrides_parse_from_manifest_text() {
+        let lock = overridden_git_lock(REGISTRY_TGZ);
+        let text = "\u{feff}{\"overrides\":{\"left-pad\":\"1.3.0\"}}";
+        let found = npm_non_registry_entries(&lock, &NpmOverrides::from_manifest_text(text));
+        assert!(!found.contains_key("node_modules/left-pad"), "{found:?}");
+        // Unparseable: no overrides.
+        let found = npm_non_registry_entries(&lock, &NpmOverrides::from_manifest_text("{"));
+        assert!(found.contains_key("node_modules/left-pad"), "{found:?}");
+    }
+
+    #[test]
+    fn selectors_split_scoped_names() {
+        assert_eq!(split_selector("left-pad"), ("left-pad", None));
+        assert_eq!(split_selector("left-pad@1"), ("left-pad", Some("1")));
+        assert_eq!(split_selector("@s/pad"), ("@s/pad", None));
+        assert_eq!(split_selector("@s/pad@^2"), ("@s/pad", Some("^2")));
     }
 }

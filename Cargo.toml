@@ -3,6 +3,7 @@ members = [
     "crates/socket-patch-core",
     "crates/socket-patch-cli",
     "crates/socket-patch-node",
+    "crates/socket-patch-bench",
 ]
 # Bare `cargo build` (release.yml's per-target builds) skips the Node addon,
 # which no release artifact ships; `--workspace` and `-p` still build it.
@@ -77,6 +78,16 @@ opt-level = "s"
 inherits = "release"
 lto = false
 strip = "none" # unstripped test binaries => usable backtraces on failure
+
+# The benchmark gate's build (crates/socket-patch-bench, .github/workflows/
+# bench.yml): the shipped profile's codegen (opt-level = "s", no debug
+# assertions) so timings track what users run, with thin instead of full
+# LTO so CI can afford to build both sides of a comparison. Unstripped, so
+# a profiler can symbolize it.
+[profile.perf]
+inherits = "release"
+lto = "thin"
+strip = "none"
 
 # The Node addon (crates/socket-patch-node) for hosts that load it
 # in-process: release semantics without the slow full-LTO link.

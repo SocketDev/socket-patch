@@ -30,6 +30,7 @@ persisted login.
 | [`socket-patch-cli`](../crates/socket-patch-cli/src/) | Arguments, command orchestration, terminal output, and JSON responses |
 | [`socket-patch-core`](../crates/socket-patch-core/src/) | API access, discovery, selection policy, patching, format handling, vendoring, and VEX |
 | [`socket-patch-node`](../crates/socket-patch-node/) | Node bindings for the in-memory hosted engine |
+| [`socket-patch-bench`](../crates/socket-patch-bench/) | `scan` benchmarks and the CI performance gate (not published) |
 | [`scripts/`](../scripts/) | Installers, release tooling, compatibility runners, and performance tools |
 | [`tests/docker/`](../tests/docker/README.md) | Container fixtures for native package-manager integration tests |
 
@@ -93,6 +94,10 @@ particular, the vlt tables and `vlt-coverage.json` are inputs to validation scri
 keep them in sync with tests and workflows. Store individual experiment logs and
 full backtest results as run artifacts, not as new product documentation.
 
-For performance work, use the [record/replay harness](../scripts/perf/README.md).
+For performance work, use the [`scan` benchmarks](../crates/socket-patch-bench/README.md):
+synthetic projects for every package manager against a local patch API, with each
+run validated. CI compares every pull request against its base with them and fails
+on a significant slowdown, more API requests, or a scan that stops doing its work.
+To measure against real API traffic, use the [record/replay harness](../scripts/perf/README.md).
 For publishing, follow the [release runbook](releasing.md) and
 [installer hosting guide](installer-hosting.md).

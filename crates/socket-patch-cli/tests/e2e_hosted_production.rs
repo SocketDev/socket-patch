@@ -1467,16 +1467,19 @@ fn yarn_berry_hosted_install_proof() {
     }
     assert_pristine(&minimist_entry(&fx.proj), PATCH_MARKER, LEG);
     let registry_lock = std::fs::read(fx.proj.join("yarn.lock")).expect("registry yarn.lock");
+    // The hosted pin also routes through package.json `resolutions` (#404),
+    // so a revert to the registry restores both files.
+    let registry_pkg = std::fs::read(fx.proj.join("package.json")).expect("registry package.json");
 
     let env_json = scan_hosted(&fx.proj, &[]);
     assert_redirected(&env_json, "yarn.lock");
     let lock = read(&fx.proj.join("yarn.lock"));
-    // Berry pins the hosted artifact through a percent-encoded `__archiveUrl`
-    // resolution field, so the plain host string is encoded — check both the
-    // encoded host and the (unencoded) patch UUID.
+    // Berry pins the hosted artifact as a plain tarball-URL locator — never
+    // an `npm:` one (`::__archiveUrl=`), whose fetcher would send the npm
+    // registry token to the patch host (#404).
     assert!(
-        lock.contains("__archiveUrl") && lock.contains("patch.socket.dev"),
-        "{LEG}: berry lock carries no __archiveUrl pointing at the patch \
+        lock.contains("@https://patch.socket.dev/") && !lock.contains("__archiveUrl"),
+        "{LEG}: berry lock carries no tarball locator pointing at the patch \
          host:\n{lock}"
     );
     assert!(
@@ -1497,7 +1500,7 @@ fn yarn_berry_hosted_install_proof() {
     );
     assert_patched(&minimist_entry(&fx.proj), PATCH_MARKER, LEG);
 
-    yarn_berry_hosted_manifestless_vex(&fx, &registry_lock, &env);
+    yarn_berry_hosted_manifestless_vex(&fx, &registry_lock, &registry_pkg, &env);
 }
 
 /// One `vex --json --output <tmp>/berry.vex.json` run in `proj` (production
@@ -1582,7 +1585,12 @@ fn berry_skip_code(env: &serde_json::Value) -> String {
 /// `--offline` (`record_unavailable`), and not once the lock is reverted to
 /// the registry and reinstalled (nothing names the patch, even with
 /// `--no-verify`).
-fn yarn_berry_hosted_manifestless_vex(fx: &NpmFixture, registry_lock: &[u8], env: &[(&str, &str)]) {
+fn yarn_berry_hosted_manifestless_vex(
+    fx: &NpmFixture,
+    registry_lock: &[u8],
+    registry_pkg: &[u8],
+    env: &[(&str, &str)],
+) {
     const LEG: &str = "yarn_berry_hosted_install_proof (manifest-less vex)";
     let proj = &fx.proj;
     assert!(
@@ -1600,8 +1608,10 @@ fn yarn_berry_hosted_manifestless_vex(fx: &NpmFixture, registry_lock: &[u8], env
     assert_eq!(berry_skip_code(&env_json), "record_unavailable", "{LEG}");
     assert!(doc.is_none(), "{LEG}: no document");
 
-    // Revert the lock to the registry and reinstall.
+    // Revert the lock and the package.json `resolutions` pin to the
+    // registry and reinstall.
     std::fs::write(proj.join("yarn.lock"), registry_lock).unwrap();
+    std::fs::write(proj.join("package.json"), registry_pkg).unwrap();
     std::fs::remove_dir_all(proj.join("node_modules")).ok();
     let reinstall = tool(proj, "yarn", &["install", "--immutable"], env);
     assert!(

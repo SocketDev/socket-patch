@@ -76,6 +76,24 @@ pub(crate) fn resolve_tool_with(
     None
 }
 
+/// `name.exe` as a directory entry of any kind (an App Execution Alias is a
+/// reparse point `is_file` can't follow) on an ABSOLUTE `PATH` entry, or
+/// `None`. The Windows fallback when [`resolve_tool`] finds nothing; same
+/// relative-entry rule, so a project-local executable is never chosen.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn resolve_app_alias_with(
+    name: &str,
+    var: &impl Fn(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
+    let path = var("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(format!("{name}.exe")))
+        .find(|candidate| {
+            std::fs::symlink_metadata(candidate).is_ok_and(|meta| !meta.is_dir())
+        })
+}
+
 /// A plain file that cannot be executed (a stray `bun` data file on PATH)
 /// is skipped in favour of the next entry, like execvp does; Windows has no
 /// mode bits, PATHEXT is the executability rule there.
@@ -127,6 +145,17 @@ pub trait CommandRunner {
 
 /// Default runner: spawns the real binary via `std::process::Command`.
 ///
+/// The program is looked up with [`resolve_tool`] and the RESOLVED path is
+/// spawned, never the bare name: on Windows `std` appends only `.exe`, so a
+/// bare `Command::new("npm")` never finds the `npm.cmd` / `yarn.cmd` /
+/// `gem.cmd` / `composer.bat` shim those tools install as, and every probe
+/// silently answered "not installed". The lookup also skips relative `PATH`
+/// entries, so a tool planted in the scanned project is never run.
+///
+/// The child inherits the caller's working directory: some probes must ask
+/// from the project (`gem env` follows rbenv's `.ruby-version` there). A
+/// probe about the machine-wide install uses [`GlobalProbeRunner`].
+///
 /// `output()` nulls stdin so the child can't block waiting for
 /// input. stdout is captured; stderr is captured and dropped (we
 /// don't surface CLI diagnostics — the helpers fall back to other
@@ -135,16 +164,84 @@ pub(crate) struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
     fn run(&self, bin: &str, args: &[&str]) -> Option<String> {
-        let output = Command::new(bin).args(args).output().ok()?;
-        if !output.status.success() {
-            return None;
+        run_resolved(bin, args, None)
+    }
+}
+
+/// [`SystemCommandRunner`] for a question about a package manager's GLOBAL
+/// install (`npm root -g`, `yarn global dir`, ...): the child runs from
+/// [`neutral_probe_dir`], never from the scanned project. From inside a
+/// project the tool reads that project's configuration — Yarn Berry has no
+/// `global` command and runs the project's `"global"` package.json script
+/// instead, whose stdout then picked the directory scanned (and patched) as
+/// the global install; a `.yarnrc.yml` `yarnPath` runs a project-supplied
+/// JS file for any `yarn` call.
+pub(crate) struct GlobalProbeRunner;
+
+impl CommandRunner for GlobalProbeRunner {
+    fn run(&self, bin: &str, args: &[&str]) -> Option<String> {
+        run_resolved(bin, args, Some(&neutral_probe_dir()?))
+    }
+}
+
+/// Where global probes run: the user's home directory (theirs, not a
+/// checkout's, and never world-writable like the temp dir), else the root
+/// of the current drive. `None` only when neither can be determined, and
+/// then the probe is not run at all rather than run from the project.
+pub(crate) fn neutral_probe_dir() -> Option<PathBuf> {
+    neutral_probe_dir_with(&|var| std::env::var_os(var))
+}
+
+/// [`neutral_probe_dir`] over an injected environment reader (tests).
+pub(crate) fn neutral_probe_dir_with(var: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let home = ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(var)
+        .map(PathBuf::from)
+        .find(|path| path.is_absolute() && path.is_dir());
+    home.or_else(|| {
+        std::env::current_dir()
+            .ok()?
+            .ancestors()
+            .last()
+            .map(Path::to_path_buf)
+    })
+}
+
+/// Spawn `bin` (looked up with [`resolve_tool`]; a value that already
+/// names a path is spawned as given) with `args`, optionally from `cwd`,
+/// and return its trimmed stdout under the [`CommandRunner`] contract.
+fn run_resolved(bin: &str, args: &[&str], cwd: Option<&Path>) -> Option<String> {
+    let program = if Path::new(bin).components().count() > 1 {
+        PathBuf::from(bin)
+    } else {
+        match resolve_tool(bin) {
+            Some(path) => path,
+            // A Windows App Execution Alias (the Store `python3.exe` in
+            // WindowsApps) is a reparse point the file probe can't stat;
+            // look for it on absolute PATH entries only. Never hand the bare
+            // name back to `std`: its Windows search also walks relative
+            // PATH entries such as `.` (against the PARENT's cwd, before the
+            // child's `current_dir` applies), so a `yarn.exe` planted in the
+            // scanned project would run.
+            None if cfg!(windows) => resolve_app_alias_with(bin, &|var| std::env::var_os(var))?,
+            None => return None,
         }
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if stdout.is_empty() {
-            None
-        } else {
-            Some(stdout)
-        }
+    };
+    let mut command = command_for(&program);
+    command.args(args);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        None
+    } else {
+        Some(stdout)
     }
 }
 
@@ -246,6 +343,28 @@ mod tests {
         assert_eq!(out.as_deref(), Some("forwarded"));
     }
 
+    /// Global probes run from the home dir; a relative or missing HOME is
+    /// never used (it would resolve against the project), and with no
+    /// usable home the probe falls back to the drive root, not the cwd.
+    #[test]
+    fn neutral_probe_dir_prefers_an_absolute_home_and_never_the_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let env = |name: &str| (name == "HOME").then(|| home.clone().into_os_string());
+        assert_eq!(neutral_probe_dir_with(&env), Some(home.clone()));
+
+        let profile = |name: &str| match name {
+            "HOME" => Some(OsString::from("relative/home")),
+            "USERPROFILE" => Some(home.clone().into_os_string()),
+            _ => None,
+        };
+        assert_eq!(neutral_probe_dir_with(&profile), Some(home.clone()));
+
+        let none = |_: &str| None::<OsString>;
+        let root = neutral_probe_dir_with(&none).expect("the drive root");
+        assert!(root.is_absolute() && root.parent().is_none(), "{root:?}");
+    }
+
     // ───────────────────────── resolve_tool / command_for ─────────────────────────
 
     /// Mark an existing file executable (no-op off Unix: PATHEXT rules there).
@@ -299,6 +418,28 @@ mod tests {
 
     /// The name is honoured exactly: a `bunx` beside no `bun` is not `bun`,
     /// and a directory named `bun` is not a program.
+    /// The Windows App Execution Alias fallback takes the same absolute-only
+    /// rule as `resolve_tool`: a `yarn.exe` reached only through a relative
+    /// entry (`.`, the empty component, a bare dir name) is never chosen;
+    /// one on an absolute entry is.
+    #[test]
+    fn resolve_app_alias_skips_relative_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let safe = tmp.path().join("bin");
+        std::fs::create_dir_all(&safe).unwrap();
+        let relative = [PathBuf::from("."), PathBuf::from(""), PathBuf::from("planted")];
+
+        let only_relative = std::env::join_paths(&relative).unwrap();
+        let var = |name: &str| (name == "PATH").then(|| only_relative.clone());
+        assert_eq!(resolve_app_alias_with("yarn", &var), None);
+
+        std::fs::write(safe.join("yarn.exe"), b"").unwrap();
+        let with_safe =
+            std::env::join_paths(relative.iter().cloned().chain([safe.clone()])).unwrap();
+        let var = |name: &str| (name == "PATH").then(|| with_safe.clone());
+        assert_eq!(resolve_app_alias_with("yarn", &var), Some(safe.join("yarn.exe")));
+    }
+
     #[test]
     fn resolve_tool_matches_the_exact_leaf_only() {
         let tmp = tempfile::tempdir().unwrap();

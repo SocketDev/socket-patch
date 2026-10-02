@@ -19,14 +19,14 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use regex::Regex;
+use regex::{NoExpand, Regex};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
 use crate::vendor::common::{parse_json_text, JsonLayout};
-use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries};
+use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries, NpmOverrides};
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 mod bun_binary;
@@ -65,7 +65,7 @@ mod python_lock_equivalence_tests;
 mod requirements;
 mod staged;
 mod state;
-mod hosted_url;
+pub(crate) mod hosted_url;
 pub mod upstream;
 pub mod vlt;
 pub mod vlt_heal;
@@ -239,6 +239,24 @@ pub struct RewriteResult {
     /// An incomplete pnpm rewrite must not be confirmed by finding its URL
     /// in another instance, a comment, or another lockfile.
     pub refused_pnpm_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids whose package version a yarn berry `yarn.lock` locks, so
+    /// the berry rewriter alone decides them: the hosted pin is the
+    /// URL-keyed lock entry AND the root `package.json` `resolutions`
+    /// routing to it, and a URL found in the lock proves only the first half.
+    // Unserialized when empty, so the blessed rewrite goldens (which hash the
+    // whole result) are unchanged by these fields for every non-berry case.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub yarn_berry_uuids: std::collections::BTreeSet<String>,
+    /// The [`Self::yarn_berry_uuids`] whose pin is complete — lock entry and
+    /// manifest routing — written by this run or already in place.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub confirmed_yarn_berry_uuids: std::collections::BTreeSet<String>,
     pub python_lock_uuids: std::collections::BTreeSet<String>,
     pub confirmed_python_lock_uuids: std::collections::BTreeSet<String>,
     pub refused_python_lock_uuids: std::collections::BTreeSet<String>,
@@ -538,6 +556,8 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         confirmed_pdm_uuids,
         refused_pdm_uuids,
         refused_pnpm_uuids,
+        yarn_berry_uuids,
+        confirmed_yarn_berry_uuids,
         python_lock_uuids,
         confirmed_python_lock_uuids,
         refused_python_lock_uuids,
@@ -564,6 +584,10 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.confirmed_pdm_uuids.extend(confirmed_pdm_uuids);
     result.refused_pdm_uuids.extend(refused_pdm_uuids);
     result.refused_pnpm_uuids.extend(refused_pnpm_uuids);
+    result.yarn_berry_uuids.extend(yarn_berry_uuids);
+    result
+        .confirmed_yarn_berry_uuids
+        .extend(confirmed_yarn_berry_uuids);
     result.python_lock_uuids.extend(python_lock_uuids);
     result
         .confirmed_python_lock_uuids
@@ -832,8 +856,21 @@ fn rewrite_npm_lock(
         }
         return;
     }
+    // The root manifest's `overrides` decide which git / url / `file:`
+    // dependent specs npm actually installs from (#490); the engine reads
+    // it as advisory input only.
+    let manifest_overrides = files
+        .get("package.json")
+        .map(|text| NpmOverrides::from_manifest_text(text))
+        .unwrap_or_default();
     for lockfile in present {
-        rewrite_one_npm_lock(&files[lockfile], lockfile, &npm, result);
+        rewrite_one_npm_lock(
+            &files[lockfile],
+            lockfile,
+            &npm,
+            &manifest_overrides,
+            result,
+        );
     }
 }
 
@@ -844,6 +881,7 @@ fn rewrite_one_npm_lock(
     content: &str,
     lockfile: &str,
     npm: &[&DepOverride],
+    manifest_overrides: &NpmOverrides,
     result: &mut RewriteResult,
 ) {
     // npm reads past a leading UTF-8 BOM; so do we.
@@ -892,7 +930,7 @@ fn rewrite_one_npm_lock(
         .unwrap_or_default();
     // Entries npm installs from a git / url / `file:` spec: see
     // `vendor::npm_origin` (#326).
-    let non_registry = npm_non_registry_entries(&lock);
+    let non_registry = npm_non_registry_entries(&lock, manifest_overrides);
     let mut changed = false;
     for dep in npm {
         let fname = full_name(dep);
@@ -3207,15 +3245,43 @@ fn yarn_classic_block_head(block: &str) -> Option<(String, Option<String>)> {
 }
 
 // ── yarn.lock (berry / v2+) ──────────────────────────────────────────────────
-// Berry derives its fetch URL from the descriptor's `npm:` resolution and
+// Berry fetches each package from its lock entry's `resolution:` locator and
 // verifies the CONVERTED CACHE ZIP against the lock's `checksum:` (a
 // `10c0/<sha512-hex>` over the zip, not the tarball). To redirect ONE dep we
-// rewrite only the lock entry: `resolution:` gains yarn's own
-// `::__archiveUrl=<encodeURIComponent(url)>` binding, and `checksum:` becomes
-// our precomputed `integrity.yarnBerry10c0`. The descriptor KEY + package.json
-// are untouched (the `name@npm:^range` descriptor still satisfies, so
-// `--immutable` passes). Byte-for-byte twin of the TS `rewriteYarnBerry` on
-// LF locks; the CRLF / BOM round trip below has no TS counterpart yet.
+// rewrite only the lock entry: `resolution:` becomes the plain tarball-URL
+// locator `<name>@<hosted tgz url>`, and `checksum:` becomes our precomputed
+// `integrity.yarnBerry10c0`. The descriptor KEY + package.json are untouched
+// (yarn maps the `name@npm:^range` descriptor to the stored locator, so
+// `--immutable` passes).
+//
+// The locator must NOT keep the `npm:` protocol (e.g. yarn's own
+// `npm:<v>::__archiveUrl=<url>` binding, which releases up to 5.0 wrote):
+// yarn fetches `npm:` locators with its npm fetcher, which attaches the npm
+// registry's credentials (`npmAuthToken`, `YARN_NPM_AUTH_TOKEN`, `npmScopes`)
+// to the request for every scoped package, and for every package under
+// `npmAlwaysAuth` — handing the registry token to the patch host (#404). A
+// tarball-URL locator goes through yarn's tarball fetcher, which sends no
+// registry auth and builds the identical cache zip, so the checksum is the
+// same. An old `::__archiveUrl=` pin is re-pinned by the next hosted run.
+
+/// Whether yarn berry fetches `url`, as a `name@<url>` locator, with its
+/// tarball HTTP fetcher: an `http(s)://` URL whose path ends in `.tgz` /
+/// `.tar.gz` (yarn's `TARBALL_REGEXP` + `PROTOCOL_REGEXP`). A query or
+/// fragment is refused too — yarn's regex rejects a `?`, and a `#` would be
+/// read as a range selector — as is anything that could break out of the
+/// lock's double-quoted `resolution:` string or yarn's `::` binding grammar.
+fn yarn_berry_tarball_url_ok(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    matches!(scheme, "https" | "http")
+        && !rest.is_empty()
+        && !url.contains("::")
+        && !url
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\\' | '?' | '#'))
+        && (url.ends_with(".tgz") || url.ends_with(".tar.gz"))
+}
 
 /// Only cacheKey `10c0` (yarn 4, compressionLevel 0 default) has a checksum we
 /// can reproduce offline; matches the vendored backend's `SUPPORTED_CACHE_KEY`.
@@ -3261,6 +3327,32 @@ fn berry_cache_key(content: &str) -> Option<String> {
 /// compares the file with its own majority-normalized re-render and fails
 /// (YN0028), while a plain install rewrites every minority line — so it is
 /// refused untouched, `yarn install` normalizes it first.
+/// The grant prerequisite for creating a new yarn berry hosted pin: a dep
+/// whose grant carries no `yarnBerry10c0` cache checksum cannot be redirected
+/// (berry verifies the converted cache zip, and only the service can compute
+/// that checksum).
+///
+/// Exposed for the vendored→hosted mode takeover, like
+/// [`preflight_yarn_berry_hosted`]: vendored mode only uses the `tarball`
+/// artifact, so a vendorable patch can lack the berry checksum, and the
+/// takeover must keep such a package vendored instead of reverting it and
+/// then skipping the redirect.
+/// Keep this unconditional gate at the takeover boundary: a lock-aware
+/// rewriter may retain an already complete pin's stored checksum.
+pub fn preflight_yarn_berry_hosted_dep(dep: &DepOverride) -> Result<(), RewriteWarning> {
+    if dep.integrity.yarn_berry10c0.is_some() {
+        return Ok(());
+    }
+    Err(RewriteWarning {
+        code: "redirect_yarn_berry_missing_checksum".into(),
+        detail: format!(
+            "{}@{} has no yarnBerry10c0 cache checksum",
+            full_name(dep),
+            dep.version
+        ),
+    })
+}
+
 pub fn preflight_yarn_berry_hosted(lock: &str, yarnrc: Option<&str>) -> Result<(), RewriteWarning> {
     if !is_berry_lock(lock) {
         return Ok(());
@@ -3337,13 +3429,39 @@ fn rewrite_yarn_berry(
         preflight_yarn_berry_hosted(raw, files.get(".yarnrc.yml").map(String::as_str))
     {
         result.warnings.push(warning);
+        // Nothing is verified, so nothing is confirmed — but a dep this lock
+        // locks is still this rewriter's to decide: an earlier run's URL in
+        // the lock must not confirm it through the text probe.
+        let lf = to_lf(body);
+        for dep in &npm {
+            if berry_lock_locks(&lf, &full_name(dep), &dep.version) {
+                result.yarn_berry_uuids.insert(dep.patch_uuid.clone());
+            }
+        }
         return;
     }
     let eol = LineEndings::of(body);
     let normalized = to_lf(body);
     let content: &str = &normalized;
 
-    let mut blocks: Vec<String> = content.split("\n\n").map(String::from).collect();
+    // The trailing newline(s) ride outside the blocks, so an entry moved to
+    // its sorted position (see [`berry_reposition_blocks`]) never carries
+    // the file's final newline into the middle of the lock.
+    let trimmed = content.trim_end_matches('\n');
+    let trailing_newlines = &content[trimmed.len()..];
+    let mut blocks: Vec<String> = trimmed.split("\n\n").map(String::from).collect();
+    let was_sorted = berry_entries_sorted(&blocks);
+    // The root manifest whose `resolutions` route each pinned descriptor to
+    // the hosted tarball (see the section header). Parsed once; written back
+    // in its own layout when a pin changes it.
+    let manifest_text = files.get(BERRY_MANIFEST).map(String::as_str);
+    let mut manifest: Option<Value> = manifest_text
+        .and_then(|t| serde_json::from_str::<Value>(t.strip_prefix('\u{feff}').unwrap_or(t)).ok())
+        .filter(Value::is_object);
+    let mut manifest_changed = false;
+    // Keys of the entries re-keyed to a tarball descriptor; yarn sorts lock
+    // entries by key, so each one moves to its sorted position at the end.
+    let mut moved_keys: Vec<String> = Vec::new();
     let resolution_re =
         Regex::new(r#"\n {2}resolution: "[^"]*""#).expect("static resolution-line regex is valid");
     let checksum_re =
@@ -3353,28 +3471,28 @@ fn rewrite_yarn_berry(
         let fname = full_name(dep);
         // The API hands the prefixed `10c0/<hex>`; a yarn 4.0.x lock spells
         // its checksums bare, and `--immutable` rejects a respelled one.
-        let Some(checksum) = dep
+        // Only needed when the entry must change (checked below): a pin
+        // already complete keeps the checksum it was written with.
+        let checksum: Option<String> = dep
             .integrity
             .yarn_berry10c0
             .as_deref()
-            .map(|c| crate::vendor::yarn_berry_lock::checksum_in_lock_spelling(content, c))
-        else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_yarn_berry_missing_checksum".into(),
-                detail: format!(
-                    "{fname}@{} has no yarnBerry10c0 cache checksum",
-                    dep.version
-                ),
-            });
-            continue;
-        };
+            .map(|c| crate::vendor::yarn_berry_lock::checksum_in_lock_spelling(content, c));
         // Berry versions are UNQUOTED (`  version: 1.3.0`).
         let version_re =
             Regex::new(&(String::from(r"\n {2}version: ") + &regex::escape(&dep.version) + "\n"))
                 .expect("version regex from the escaped version is valid");
         let mut matched_any = false;
         let mut alias_skipped = false;
-        for block in blocks.iter_mut() {
+        // Every entry this dep's pin would re-key: `(index, npm ranges)` —
+        // the ranges are empty for an entry an earlier hosted run already
+        // keyed by its tarball URL (they are recovered from the manifest).
+        let mut targets: Vec<(usize, Vec<String>)> = Vec::new();
+        // A non-npm entry of the same package version (yarn's builtin
+        // `patch:` compat entries, `workspace:`, …): its descriptor wraps or
+        // shares the npm one, so re-keying the npm entry would break it.
+        let mut shared_descriptor = false;
+        for (block_idx, block) in blocks.iter().enumerate() {
             // A block's key is its first line up to a trailing colon; skip
             // header comment blocks and the leading `__metadata` block.
             let Some(first_line) = block.lines().next() else {
@@ -3449,6 +3567,23 @@ fn rewrite_yarn_berry(
             // under such a key corrupts the key/resolution protocol pairing.
             // Mirrors the vendor backend's fail-closed gate
             // (vendor/yarn_berry_lock.rs).
+            // A fork alias (`<fname>@npm:<other>@<range>`) installs another
+            // package under this name: its entry is not the patched package,
+            // whatever its version, so it is never re-keyed.
+            if parsed.iter().any(|p| {
+                p.and_then(|(_, range)| berry_npm_alias_target(range))
+                    .is_some_and(|real| real != fname)
+            }) {
+                continue;
+            }
+            // An entry an earlier hosted run already keyed by its tarball
+            // descriptor (`"<name>@<hosted url>"`): ours to re-pin.
+            if let [Some((_, range))] = parsed.as_slice() {
+                if berry_hosted_pin_is_ours(range, &fname, Some(&dep.version), &dep.artifact_url) {
+                    targets.push((block_idx, Vec::new()));
+                    continue;
+                }
+            }
             if !parsed.iter().all(|p| {
                 p.expect("every pattern parsed — None-bearing keys are skipped above")
                     .1
@@ -3507,6 +3642,7 @@ fn rewrite_yarn_berry(
                     .collect();
                 protocols.sort();
                 protocols.dedup();
+                shared_descriptor = true;
                 result.warnings.push(RewriteWarning {
                     code: "redirect_yarn_berry_unsupported_protocol".into(),
                     detail: format!(
@@ -3521,60 +3657,488 @@ fn rewrite_yarn_berry(
                 });
                 continue;
             }
-            // Rewrite the resolution wholesale from name+version — handles a
-            // pre-existing `::__archiveUrl=` (custom-registry lock) for free.
-            let resolution = format!(
-                "{fname}@npm:{}::__archiveUrl={}",
-                dep.version,
-                crate::utils::uri::encode_uri_component(&dep.artifact_url)
-            );
-            let mut rewritten = resolution_re
-                .replace(block, format!("\n  resolution: \"{resolution}\"").as_str())
-                .to_string();
-            if checksum_re.is_match(&rewritten) {
+            targets.push((
+                block_idx,
+                parsed
+                    .iter()
+                    .map(|p| {
+                        p.expect("every pattern parsed — None-bearing keys are skipped above")
+                            .1
+                            .to_string()
+                    })
+                    .collect(),
+            ));
+        }
+        if !targets.is_empty() {
+            matched_any = true;
+        }
+        // This lock locks the package version, so this rewriter alone decides
+        // the dep from here on (see [`RewriteResult::yarn_berry_uuids`]); a
+        // lock that does not lock it leaves the dep to the other lockfiles.
+        if matched_any || shared_descriptor {
+            result.yarn_berry_uuids.insert(dep.patch_uuid.clone());
+        }
+        if shared_descriptor && !targets.is_empty() {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_yarn_berry_shared_descriptor".into(),
+                detail: format!(
+                    "{fname}@{} is also locked through a non-npm entry (e.g. yarn's builtin \
+                     `patch:` compatibility entry) that wraps the same npm descriptor; pinning \
+                     that descriptor to the hosted tarball would change the other entry too, \
+                     so the hosted redirect leaves {fname} untouched — use `scan --mode \
+                     vendored` or `--mode agent` for this package",
+                    dep.version
+                ),
+            });
+            continue;
+        }
+        if targets.len() > 1 {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_yarn_berry_ambiguous_entry".into(),
+                detail: format!(
+                    "yarn.lock holds {} separate entries resolving {fname}@{}; run `yarn \
+                     install` once to dedupe the lock, then re-run",
+                    targets.len(),
+                    dep.version
+                ),
+            });
+            continue;
+        }
+        let Some((target_idx, key_ranges)) = targets.pop() else {
+            if !matched_any && !alias_skipped {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_yarn_berry_entry_not_found".into(),
+                    detail: format!("no npm: lock entry resolving {fname}@{}", dep.version),
+                });
+            }
+            continue;
+        };
+        if !yarn_berry_tarball_url_ok(&dep.artifact_url) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_yarn_berry_artifact_url_unsupported".into(),
+                detail: format!(
+                    "{fname}@{}: hosted artifact URL {:?} is not an http(s) `.tgz` URL \
+                     without a query or fragment, so yarn could not fetch it as a \
+                     tarball locator; leaving the lock entry untouched",
+                    dep.version, dep.artifact_url
+                ),
+            });
+            continue;
+        }
+        // Without a checksum only an entry already keyed by this artifact
+        // (an earlier run wrote its checksum) can be kept; any other needs
+        // the checksum written.
+        let already_keyed = blocks[target_idx]
+            .lines()
+            .next()
+            .is_some_and(|l| l == format!("\"{fname}@{}\":", dep.artifact_url));
+        if checksum.is_none() && !already_keyed {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_yarn_berry_missing_checksum".into(),
+                detail: format!(
+                    "{fname}@{} has no yarnBerry10c0 cache checksum",
+                    dep.version
+                ),
+            });
+            continue;
+        }
+        let Some(manifest_obj) = manifest.as_mut().and_then(Value::as_object_mut) else {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_yarn_berry_manifest_missing".into(),
+                detail: format!(
+                    "the root package.json is missing or is not a JSON object; the hosted \
+                     redirect pins {fname}@{} through its `resolutions` field, so the lock \
+                     entry is left untouched",
+                    dep.version
+                ),
+            });
+            continue;
+        };
+        let block = blocks[target_idx].clone();
+        // An entry keyed by its tarball URL (an earlier hosted run) recovers
+        // its ranges from the manifest selectors routed to that URL.
+        let current_url = if key_ranges.is_empty() {
+            block
+                .lines()
+                .next()
+                .and_then(|l| l.strip_suffix(':'))
+                .map(|k| k.trim_matches('"'))
+                .and_then(split_pattern)
+                .map(|(_, r)| r.to_string())
+        } else {
+            None
+        };
+        let pin = match berry_resolutions_pin(
+            manifest_obj,
+            &fname,
+            &dep.version,
+            &key_ranges,
+            current_url.as_deref(),
+            &dep.artifact_url,
+        ) {
+            Ok(pin) => pin,
+            Err(warning) => {
+                result.warnings.push(warning);
+                continue;
+            }
+        };
+        // The entry yarn writes for those resolutions: only the key and the
+        // resolution change (plus our checksum); every other line — version,
+        // dependencies, bin, languageName — carries over verbatim.
+        let new_key = format!("\"{fname}@{}\"", dep.artifact_url);
+        let resolution = format!("{fname}@{}", dep.artifact_url);
+        let body_lines = block.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+        let mut rewritten = format!("\n{new_key}:\n{body_lines}");
+        // `NoExpand`: the URL is literal text, and a `$` in it (a patch
+        // server path) must never be read as a capture-group reference.
+        rewritten = resolution_re
+            .replace(
+                &rewritten,
+                NoExpand(&format!("\n  resolution: \"{resolution}\"")),
+            )
+            .to_string();
+        match &checksum {
+            Some(checksum) if checksum_re.is_match(&rewritten) => {
                 rewritten = checksum_re
-                    .replace(&rewritten, format!("\n  checksum: {checksum}").as_str())
+                    .replace(&rewritten, NoExpand(&format!("\n  checksum: {checksum}")))
                     .to_string();
-            } else {
+            }
+            Some(checksum) => {
                 rewritten = resolution_re
                     .replace(
                         &rewritten,
-                        format!("\n  resolution: \"{resolution}\"\n  checksum: {checksum}")
-                            .as_str(),
+                        NoExpand(&format!(
+                            "\n  resolution: \"{resolution}\"\n  checksum: {checksum}"
+                        )),
                     )
                     .to_string();
             }
-            matched_any = true;
-            if rewritten != *block {
-                // The ledger records the lock's on-disk bytes (CRLF lines for
-                // a CRLF lock), so every revert's byte-exact `replacen`
-                // matches what the file really holds.
-                result.edits.push(FileEdit {
-                    path: "yarn.lock".into(),
-                    kind: "redirect_yarn_berry_entry".into(),
-                    action: "rewritten".into(),
-                    key: Some(format!("{fname}@{}", dep.version)),
-                    original: Some(Value::String(eol.restore(block).into_owned())),
-                    new: Some(Value::String(eol.restore(&rewritten).into_owned())),
-                });
-                *block = rewritten;
-                changed = true;
-            }
+            None => {}
         }
-        if !matched_any && !alias_skipped {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_yarn_berry_entry_not_found".into(),
-                detail: format!("no npm: lock entry resolving {fname}@{}", dep.version),
+        let rewritten = rewritten[1..].to_string();
+        for (selector, original) in pin.apply(manifest_obj, &dep.artifact_url) {
+            manifest_changed = true;
+            result.edits.push(FileEdit {
+                path: BERRY_MANIFEST.into(),
+                kind: "redirect_yarn_berry_resolution".into(),
+                action: if original.is_some() { "rewritten" } else { "added" }.into(),
+                key: Some(selector),
+                original: original.map(Value::String),
+                new: Some(Value::String(dep.artifact_url.clone())),
             });
         }
+        if rewritten != block {
+            // The ledger records the lock's on-disk bytes (CRLF lines for a
+            // CRLF lock), so every revert's byte-exact `replacen` matches
+            // what the file really holds.
+            result.edits.push(FileEdit {
+                path: "yarn.lock".into(),
+                kind: "redirect_yarn_berry_entry".into(),
+                action: "rewritten".into(),
+                key: Some(format!("{fname}@{}", dep.version)),
+                original: Some(Value::String(eol.restore(&block).into_owned())),
+                new: Some(Value::String(eol.restore(&rewritten).into_owned())),
+            });
+            blocks[target_idx] = rewritten;
+            moved_keys.push(new_key);
+            changed = true;
+        }
+        result
+            .confirmed_yarn_berry_uuids
+            .insert(dep.patch_uuid.clone());
     }
     if changed {
-        let out = blocks.join("\n\n");
+        berry_reposition_blocks(&mut blocks, &moved_keys, was_sorted);
+        let out = format!("{}{trailing_newlines}", blocks.join("\n\n"));
         result
             .files
             .insert("yarn.lock".into(), format!("{bom}{}", eol.restore(&out)));
     }
+    if manifest_changed {
+        if let (Some(text), Some(value)) = (manifest_text, manifest.as_ref()) {
+            match crate::vendor::common::JsonLayout::of(text)
+                .render(value)
+                .map(String::from_utf8)
+            {
+                Ok(Ok(rendered)) => {
+                    result.files.insert(BERRY_MANIFEST.into(), rendered);
+                }
+                _ => {
+                    // Unreachable for a parsed object; fail closed anyway: a
+                    // lock pin without its resolutions is not installable.
+                    result.files.remove("yarn.lock");
+                    result.edits.retain(|e| {
+                        e.kind != "redirect_yarn_berry_entry"
+                            && e.kind != "redirect_yarn_berry_resolution"
+                    });
+                    for dep in &npm {
+                        result.confirmed_yarn_berry_uuids.remove(&dep.patch_uuid);
+                    }
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_yarn_berry_manifest_missing".into(),
+                        detail: "the root package.json could not be re-serialized; nothing \
+                                 was redirected"
+                            .into(),
+                    });
+                }
+            }
+        }
+    }
 }
+
+/// A berry lock block's sort key: its unquoted key, or `None` for header
+/// comment blocks and `__metadata`.
+fn berry_sort_key(block: &str) -> Option<&str> {
+    let first = block.lines().next()?;
+    if first.starts_with([' ', '\t', '#']) || !first.ends_with(':') {
+        return None;
+    }
+    let key = first[..first.len() - 1].trim_matches('"');
+    (key != "__metadata").then_some(key)
+}
+
+/// Whether a berry lock's entries are in yarn's key order (see
+/// [`berry_reposition_blocks`]).
+pub(crate) fn berry_entries_sorted(blocks: &[String]) -> bool {
+    let keys: Vec<&str> = blocks.iter().filter_map(|b| berry_sort_key(b)).collect();
+    keys.windows(2).all(|w| w[0] <= w[1])
+}
+
+/// Whether an LF-normalized berry lock holds an entry for `name` at
+/// `version`, under any descriptor (npm, tarball, `patch:`, …).
+fn berry_lock_locks(content: &str, name: &str, version: &str) -> bool {
+    use crate::vendor::yarn_classic_lock::{split_berry_key_patterns, split_pattern};
+    let version_line = format!("\n  version: {version}\n");
+    content.split("\n\n").any(|block| {
+        let Some(key) = block.lines().next().and_then(|l| l.strip_suffix(':')) else {
+            return false;
+        };
+        if key.starts_with([' ', '\t', '#']) || key == "__metadata" {
+            return false;
+        }
+        format!("{block}\n").contains(&version_line)
+            && split_berry_key_patterns(key).iter().any(|p| {
+                split_pattern(p).is_some_and(|(n, range)| {
+                    n == name && berry_npm_alias_target(range).is_none_or(|real| real == name)
+                })
+            })
+    })
+}
+
+/// The package an `npm:<name>@<range>` alias range installs (`None` for a
+/// plain `npm:<range>` or any other protocol).
+fn berry_npm_alias_target(range: &str) -> Option<&str> {
+    let body = range.strip_prefix("npm:")?;
+    crate::vendor::yarn_classic_lock::split_pattern(body).map(|(real, _)| real)
+}
+
+/// The root manifest the yarn berry hosted pin edits.
+const BERRY_MANIFEST: &str = "package.json";
+
+/// Whether `url` (a URL lock key or `resolutions` value) is a hosted
+/// tarball pin socket-patch wrote for `name` (at `version`, when given):
+/// this run's own artifact URL, or a URL on the same patch server (scheme,
+/// host and port of `artifact_url`) whose leaf names the package version.
+/// A user's own tarball for the package — a mirror, a fork — is on another
+/// origin and is never ours to rewrite.
+fn berry_hosted_pin_is_ours(
+    url: &str,
+    name: &str,
+    version: Option<&str>,
+    artifact_url: &str,
+) -> bool {
+    if url == artifact_url {
+        return true;
+    }
+    let names_it = match version {
+        Some(v) => hosted_url::hosted_url_names(url, name, v),
+        None => hosted_url::hosted_url_version(url, name).is_some(),
+    };
+    let same_origin = match (reqwest::Url::parse(url), reqwest::Url::parse(artifact_url)) {
+        (Ok(a), Ok(b)) => {
+            a.scheme() == b.scheme()
+                && a.host_str().is_some()
+                && a.host_str() == b.host_str()
+                && a.port_or_known_default() == b.port_or_known_default()
+        }
+        _ => false,
+    };
+    names_it && same_origin
+}
+
+/// Whether `value` (a `resolutions` value) is a hosted tarball pin written
+/// for some version of `name` — ours to rewrite or drop (see
+/// [`berry_hosted_pin_is_ours`]).
+fn berry_resolution_is_ours(value: &Value, name: &str, artifact_url: &str) -> bool {
+    value
+        .as_str()
+        .is_some_and(|v| berry_hosted_pin_is_ours(v, name, None, artifact_url))
+}
+
+/// The manifest side of one berry hosted pin, computed by
+/// [`berry_resolutions_pin`] and written by [`BerryResolutionsPin::apply`].
+struct BerryResolutionsPin {
+    /// `<name>@<range>` selectors to route to the hosted tarball, one per
+    /// descriptor the lock entry carries (yarn's own `npm:<range>` form).
+    selectors: Vec<String>,
+    /// Our selectors left by an earlier pin of the same version that no
+    /// longer name a locked descriptor: dropped.
+    stale: Vec<String>,
+}
+
+impl BerryResolutionsPin {
+    /// Write the pin into `manifest`: every selector routed to `url`, stale
+    /// ones dropped, and an emptied `resolutions` table removed. Returns
+    /// `(selector, previous value)` for each selector it added or changed.
+    fn apply(
+        &self,
+        manifest: &mut serde_json::Map<String, Value>,
+        url: &str,
+    ) -> Vec<(String, Option<String>)> {
+        let table = manifest
+            .entry("resolutions".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        let Some(table) = table.as_object_mut() else {
+            return Vec::new();
+        };
+        for selector in &self.stale {
+            table.shift_remove(selector);
+        }
+        let mut changed = Vec::new();
+        for selector in &self.selectors {
+            let previous = table.get(selector).and_then(Value::as_str).map(str::to_string);
+            if previous.as_deref() != Some(url) {
+                table.insert(selector.clone(), Value::String(url.to_string()));
+                changed.push((selector.clone(), previous));
+            }
+        }
+        if table.is_empty() {
+            manifest.shift_remove("resolutions");
+        }
+        changed
+    }
+}
+
+/// Plan the `resolutions` entries that route `name@version`'s locked
+/// descriptors to the hosted tarball. `key_ranges` are the lock entry's npm
+/// ranges (`npm:^1.3.0`); for an entry an earlier run already keyed by its
+/// tarball URL they are empty and recovered from our selectors routed to
+/// `current_url`.
+///
+/// Refuses (fail closed, nothing written) when the manifest already carries
+/// a user-authored `resolutions` entry for the package — any selector whose
+/// target is `name`, bare or scoped — since yarn would apply it alongside
+/// (or instead of) ours, and overwriting it would silently change what the
+/// user pinned.
+fn berry_resolutions_pin(
+    manifest: &serde_json::Map<String, Value>,
+    name: &str,
+    version: &str,
+    key_ranges: &[String],
+    current_url: Option<&str>,
+    artifact_url: &str,
+) -> Result<BerryResolutionsPin, RewriteWarning> {
+    use crate::vendor::yarn_berry_lock::resolution_selector_target;
+    let empty = serde_json::Map::new();
+    let table = match manifest.get("resolutions") {
+        None => &empty,
+        Some(Value::Object(table)) => table,
+        Some(_) => {
+            return Err(RewriteWarning {
+                code: "redirect_yarn_berry_resolutions_conflict".into(),
+                detail: "package.json `resolutions` is not an object; the hosted redirect \
+                         will not rewrite it"
+                    .into(),
+            })
+        }
+    };
+    let mut ours: Vec<(&String, &Value)> = Vec::new();
+    for (selector, value) in table {
+        if resolution_selector_target(selector) != Some(name) {
+            continue;
+        }
+        if berry_resolution_is_ours(value, name, artifact_url) {
+            ours.push((selector, value));
+            continue;
+        }
+        return Err(RewriteWarning {
+            code: "redirect_yarn_berry_resolutions_conflict".into(),
+            detail: format!(
+                "package.json already has a user-authored resolutions entry for `{selector}` \
+                 ({value}); the hosted redirect pins {name}@{version} through `resolutions` \
+                 and will not overwrite it — remove that entry (or use `scan --mode \
+                 vendored`) and re-run"
+            ),
+        });
+    }
+    let selectors: Vec<String> = if key_ranges.is_empty() {
+        ours.iter()
+            .filter(|(_, value)| value.as_str().is_some() && value.as_str() == current_url)
+            .map(|(selector, _)| (*selector).clone())
+            .collect()
+    } else {
+        key_ranges.iter().map(|r| format!("{name}@{r}")).collect()
+    };
+    if selectors.is_empty() {
+        return Err(RewriteWarning {
+            code: "redirect_yarn_berry_resolutions_conflict".into(),
+            detail: format!(
+                "yarn.lock pins {name}@{version} to a hosted tarball but package.json has no \
+                 resolutions entry routing a descriptor to it, so the original descriptor is \
+                 unknown and neither this run nor `socket-patch rollback` can rebuild the \
+                 entry — restore yarn.lock and package.json from version control (or delete \
+                 the entry and run `yarn install`), then re-run"
+            ),
+        });
+    }
+    let stale = ours
+        .iter()
+        .filter(|(selector, value)| {
+            !selectors.contains(selector)
+                && value
+                    .as_str()
+                    .is_some_and(|v| berry_hosted_pin_is_ours(v, name, Some(version), artifact_url))
+        })
+        .map(|(selector, _)| (*selector).clone())
+        .collect();
+    Ok(BerryResolutionsPin { selectors, stale })
+}
+
+/// Move each entry keyed `moved` to where yarn sorts it. Yarn writes lock
+/// entries sorted by their (unquoted) key — `__metadata` first — so an entry
+/// re-keyed from `name@npm:…` to `name@<url>` can move past a sibling (e.g.
+/// `name@npm:7.0.0` now sorts after `name@https://…`); a lock in any other
+/// order is rewritten by yarn and fails `--immutable`. Header comment blocks
+/// and `__metadata` keep their place; the moved entry is inserted before the
+/// first entry whose key sorts after it. A lock that was not in yarn's
+/// order before the edit (`was_sorted`, from [`berry_entries_sorted`]; a
+/// hand-edited lock) keeps the entry in place, so a pin and its rollback
+/// still round-trip byte-exactly.
+pub(crate) fn berry_reposition_blocks(blocks: &mut Vec<String>, moved: &[String], was_sorted: bool) {
+    if !was_sorted {
+        return;
+    }
+    for key in moved {
+        let line = format!("{key}:");
+        let Some(from) = blocks
+            .iter()
+            .position(|b| b.lines().next() == Some(line.as_str()))
+        else {
+            continue;
+        };
+        let block = blocks.remove(from);
+        let Some(own) = berry_sort_key(&block).map(str::to_string) else {
+            blocks.insert(from, block);
+            continue;
+        };
+        let to = blocks
+            .iter()
+            .position(|b| berry_sort_key(b).is_some_and(|k| k > own.as_str()))
+            .unwrap_or(blocks.len());
+        blocks.insert(to, block);
+    }
+}
+
 
 // ── bun.lock (text lockfile) ─────────────────────────────────────────────────
 // A registry 4-tuple `["name@version", "<registry>", {deps}, "sha512-…"]` is
@@ -7488,6 +8052,12 @@ mod tests {
         }
     }
 
+    /// A minimal root manifest: the berry hosted pin writes its
+    /// `resolutions` into it.
+    fn berry_manifest() -> String {
+        "{\n  \"name\": \"app\",\n  \"version\": \"1.0.0\"\n}\n".to_string()
+    }
+
     fn berry_lock(cache_key: &str) -> String {
         format!(
             "# header\n\n__metadata:\n  version: 8\n  cacheKey: {cache_key}\n\n\
@@ -7495,6 +8065,549 @@ mod tests {
              checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n",
             "3".repeat(128)
         )
+    }
+
+    /// Files for a berry hosted rewrite: the lock plus the root manifest.
+    fn berry_files(lock: String, manifest: String) -> BTreeMap<String, String> {
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), lock);
+        files.insert("package.json".to_string(), manifest);
+        files
+    }
+
+    const BERRY_UUID: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn berry_hosted_url(path_name: &str, leaf: &str, version: &str) -> String {
+        format!("https://patch.socket.dev/patch/npm/{path_name}/{version}/tok/{BERRY_UUID}/{leaf}-{version}.tgz")
+    }
+
+    /// #404: the hosted pin must never be an `npm:` locator. Yarn fetches an
+    /// `npm:` locator (`::__archiveUrl=` included) with its npm fetcher,
+    /// which attaches the npm registry's auth (`npmAuthToken`,
+    /// `YARN_NPM_AUTH_TOKEN`, `npmScopes`) for every scoped package and,
+    /// under `npmAlwaysAuth`, for every package — the registry token went to
+    /// the patch host. A tarball locator under the untouched `npm:` key is
+    /// rejected by yarn's hardened mode (YN0078, on by default for public PR
+    /// CI), so the pin is what yarn itself writes for a root `resolutions`
+    /// entry: a `<name>@npm:<range>` selector routed to the tarball, and the
+    /// lock entry re-keyed `<name>@<url>`, fetched with the tarball fetcher
+    /// (no registry auth, identical cache zip and `10c0` checksum).
+    #[test]
+    fn yarn_berry_hosted_pin_routes_resolutions_to_a_tarball_entry() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let scoped_url = berry_hosted_url("@isaacs/string-locale-compare", "string-locale-compare", "1.1.0");
+        let plain_url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let scoped = DepOverride {
+            namespace: Some("@isaacs".into()),
+            ..berry_override("string-locale-compare", "1.1.0", &scoped_url, &checksum)
+        };
+        let plain = berry_override("left-pad", "1.3.0", &plain_url, &checksum);
+        let lock = format!(
+            "{}\n\"@isaacs/string-locale-compare@npm:^1.1.0\":\n  version: 1.1.0\n  \
+             resolution: \"@isaacs/string-locale-compare@npm:1.1.0\"\n  checksum: 10c0/{}\n  \
+             languageName: node\n  linkType: hard\n",
+            berry_lock("10c0"),
+            "4".repeat(128)
+        );
+        let files = berry_files(lock, berry_manifest());
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, &[scoped, plain], &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = &r.files["yarn.lock"];
+        assert!(
+            out.contains(&format!(
+                "\n\"@isaacs/string-locale-compare@{scoped_url}\":\n  version: 1.1.0\n  \
+                 resolution: \"@isaacs/string-locale-compare@{scoped_url}\"\n  checksum: {checksum}\n"
+            )),
+            "scoped entry re-keyed to its tarball: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "\n\"left-pad@{plain_url}\":\n  version: 1.3.0\n  \
+                 resolution: \"left-pad@{plain_url}\"\n  checksum: {checksum}\n"
+            )),
+            "unscoped entry re-keyed to its tarball: {out}"
+        );
+        assert!(!out.contains("__archiveUrl") && !out.contains("@npm:"), "{out}");
+        assert!(out.ends_with("linkType: hard\n"), "trailing newline kept: {out:?}");
+        let manifest: Value = serde_json::from_str(&r.files["package.json"]).unwrap();
+        assert_eq!(
+            manifest["resolutions"],
+            json!({
+                "@isaacs/string-locale-compare@npm:^1.1.0": scoped_url,
+                "left-pad@npm:^1.3.0": plain_url,
+            }),
+            "{manifest}"
+        );
+        assert_eq!(manifest["name"], "app", "the rest of the manifest is kept");
+        assert_eq!(
+            r.edits.iter().filter(|e| e.kind == "redirect_yarn_berry_entry").count(),
+            2
+        );
+        assert_eq!(
+            r.edits.iter().filter(|e| e.kind == "redirect_yarn_berry_resolution").count(),
+            2
+        );
+    }
+
+    /// The selectors are descriptor-specific: another locked version of the
+    /// same package keeps its registry entry, a multi-range key gets one
+    /// selector per range, and the re-keyed entry moves to where yarn sorts
+    /// it (`is-number@https://…` sorts before `is-number@npm:7.0.0`), or
+    /// `yarn install --immutable` would rewrite the lock.
+    #[test]
+    fn yarn_berry_pin_is_descriptor_specific_and_resorted() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("is-number", "is-number", "6.0.0");
+        let ovr = berry_override("is-number", "6.0.0", &url, &checksum);
+        let lock = format!(
+            "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"is-number@npm:7.0.0\":\n  version: 7.0.0\n  resolution: \"is-number@npm:7.0.0\"\n  \
+             checksum: 10c0/{a}\n  languageName: node\n  linkType: hard\n\n\
+             \"is-number@npm:^6.0.0, is-number@npm:~6.0.0\":\n  version: 6.0.0\n  \
+             resolution: \"is-number@npm:6.0.0\"\n  checksum: 10c0/{b}\n  languageName: node\n  \
+             linkType: hard\n\n\
+             \"is-odd@npm:3.0.1\":\n  version: 3.0.1\n  resolution: \"is-odd@npm:3.0.1\"\n  \
+             dependencies:\n    is-number: \"npm:^6.0.0\"\n  checksum: 10c0/{c}\n  \
+             languageName: node\n  linkType: hard\n",
+            a = "1".repeat(128),
+            b = "2".repeat(128),
+            c = "3".repeat(128)
+        );
+        let files = berry_files(lock, berry_manifest());
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = &r.files["yarn.lock"];
+        let keys: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with('"'))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                format!("\"is-number@{url}\":").as_str(),
+                "\"is-number@npm:7.0.0\":",
+                "\"is-odd@npm:3.0.1\":",
+            ],
+            "{out}"
+        );
+        assert!(
+            out.contains("resolution: \"is-number@npm:7.0.0\""),
+            "the other version is untouched: {out}"
+        );
+        assert!(
+            out.contains("    is-number: \"npm:^6.0.0\""),
+            "dependents keep their descriptors: {out}"
+        );
+        let manifest: Value = serde_json::from_str(&r.files["package.json"]).unwrap();
+        assert_eq!(
+            manifest["resolutions"],
+            json!({"is-number@npm:^6.0.0": url, "is-number@npm:~6.0.0": url}),
+            "{manifest}"
+        );
+    }
+
+    /// A repeat run over its own pin is a no-op; a superseding patch (new
+    /// uuid) re-pins the tarball-keyed entry and its selectors in place.
+    #[test]
+    fn yarn_berry_repeat_run_is_stable_and_a_new_uuid_repins() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let files = berry_files(berry_lock("10c0"), berry_manifest());
+        let mut first = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut first);
+        let pinned = berry_files(
+            first.files["yarn.lock"].clone(),
+            first.files["package.json"].clone(),
+        );
+        assert!(first.confirmed_yarn_berry_uuids.contains(BERRY_UUID));
+        let mut again = RewriteResult::default();
+        rewrite_yarn_berry(&pinned, std::slice::from_ref(&ovr), &mut again);
+        assert!(again.warnings.is_empty(), "{:?}", again.warnings);
+        assert!(again.files.is_empty(), "repeat run rewrites nothing: {:?}", again.files);
+        // A pin already complete is confirmed without a write.
+        assert!(again.confirmed_yarn_berry_uuids.contains(BERRY_UUID));
+
+        let new_url = url.replace(BERRY_UUID, "22222222-2222-4222-8222-222222222222");
+        let newer = berry_override("left-pad", "1.3.0", &new_url, &checksum);
+        let mut repin = RewriteResult::default();
+        rewrite_yarn_berry(&pinned, std::slice::from_ref(&newer), &mut repin);
+        assert!(repin.warnings.is_empty(), "{:?}", repin.warnings);
+        let out = &repin.files["yarn.lock"];
+        assert!(out.contains(&format!("\"left-pad@{new_url}\":")), "{out}");
+        assert!(!out.contains(BERRY_UUID), "{out}");
+        let manifest: Value = serde_json::from_str(&repin.files["package.json"]).unwrap();
+        assert_eq!(manifest["resolutions"], json!({"left-pad@npm:^1.3.0": new_url}));
+    }
+
+    /// The URL-keyed lock entry alone is half a pin: with its manifest
+    /// `resolutions` routing removed, yarn installs nothing from it, so the
+    /// rewriter owns the dep yet never confirms it — a URL in the lock must
+    /// not let hosted confirmation (and the in-run VEX) attest the patch.
+    #[test]
+    fn yarn_berry_pin_without_its_routing_is_owned_but_never_confirmed() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let mut first = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut first,
+        );
+        let orphan = berry_files(first.files["yarn.lock"].clone(), berry_manifest());
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&orphan, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty(), "{:?}", r.files);
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_yarn_berry_resolutions_conflict"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.yarn_berry_uuids.contains(BERRY_UUID));
+        assert!(r.confirmed_yarn_berry_uuids.is_empty());
+
+        // A lock that does not lock the version hands the dep back.
+        let other = berry_override("left-pad", "9.9.9", &url, &checksum);
+        let mut none = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), berry_manifest()),
+            std::slice::from_ref(&other),
+            &mut none,
+        );
+        assert!(none.yarn_berry_uuids.is_empty());
+        assert!(none.confirmed_yarn_berry_uuids.is_empty());
+        // ... before any per-grant gate: a grant this rewriter cannot use
+        // (no checksum, an unfetchable URL) still leaves an unlocked
+        // package to the other lockfiles.
+        for bad in [
+            DepOverride {
+                integrity: Integrity::default(),
+                ..other.clone()
+            },
+            berry_override(
+                "left-pad",
+                "9.9.9",
+                "https://patch.socket.dev/x.zip",
+                &checksum,
+            ),
+        ] {
+            let mut r = RewriteResult::default();
+            rewrite_yarn_berry(
+                &berry_files(berry_lock("10c0"), berry_manifest()),
+                std::slice::from_ref(&bad),
+                &mut r,
+            );
+            assert!(r.yarn_berry_uuids.is_empty(), "{:?}", r.warnings);
+        }
+    }
+
+    /// A berry lock the preflight refuses (here an unsupported cacheKey)
+    /// verifies nothing, so it confirms nothing — yet the deps it locks stay
+    /// the berry rewriter's: an earlier run's URL in the lock must not
+    /// confirm them through the hosted text probe.
+    #[test]
+    fn yarn_berry_preflight_refusal_owns_locked_deps_without_confirming() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let mut first = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut first,
+        );
+        let refused = berry_files(
+            first.files["yarn.lock"].replace("cacheKey: 10c0", "cacheKey: 8c0"),
+            berry_manifest(),
+        );
+        let unlocked = berry_override("right-pad", "1.0.0", &url, &checksum);
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&refused, &[ovr, unlocked], &mut r);
+        assert_eq!(r.warnings[0].code, "redirect_yarn_berry_cache_unsupported");
+        assert!(r.files.is_empty());
+        assert_eq!(
+            r.yarn_berry_uuids.iter().collect::<Vec<_>>(),
+            vec![BERRY_UUID],
+            "only the locked dep is owned"
+        );
+        assert!(r.confirmed_yarn_berry_uuids.is_empty());
+    }
+
+    /// A fork alias key (`left-pad@npm:other@^1.3.0`) installs `other`
+    /// under the `left-pad` name: even at the patched version it is not the
+    /// patched package, so it is never re-keyed nor makes the real entry
+    /// ambiguous.
+    #[test]
+    fn yarn_berry_fork_alias_entry_is_never_re_keyed() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let fork = format!(
+            "\"left-pad@npm:other@^1.3.0\":\n  version: 1.3.0\n  resolution: \"other@npm:1.3.0\"\n  \
+             checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n",
+            "4".repeat(128)
+        );
+        let fork_only =
+            format!("# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n{fork}");
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(fork_only, berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut r,
+        );
+        assert!(r.files.is_empty(), "{:?}", r.files);
+        assert_eq!(r.warnings[0].code, "redirect_yarn_berry_entry_not_found");
+        assert!(r.yarn_berry_uuids.is_empty());
+
+        // Beside the real entry: only the real one is pinned.
+        let both = format!("{}\n{fork}", berry_lock("10c0"));
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(both, berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut r,
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = &r.files["yarn.lock"];
+        assert!(out.contains(&format!("\"left-pad@{url}\":")), "{out}");
+        assert!(
+            out.contains(&fork),
+            "the fork entry is byte-identical: {out}"
+        );
+        assert!(r.confirmed_yarn_berry_uuids.contains(BERRY_UUID));
+    }
+
+    /// The artifact URL is spliced as literal text: a `$` in it (legal in a
+    /// URL path) must not be expanded as a regex capture reference.
+    #[test]
+    fn yarn_berry_artifact_url_dollar_is_written_literally() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = "https://patch.socket.dev/patch/npm/left-pad/1.3.0/t$0k$1/u/left-pad-1.3.0.tgz";
+        let ovr = berry_override("left-pad", "1.3.0", url, &checksum);
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut r,
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = &r.files["yarn.lock"];
+        assert!(
+            out.contains(&format!(
+                "\"left-pad@{url}\":\n  version: 1.3.0\n  resolution: \"left-pad@{url}\"\n  \
+                 checksum: {checksum}\n"
+            )),
+            "{out}"
+        );
+        // ... and the checksum-line insertion path, for a lock without one.
+        let no_checksum_line =
+            berry_lock("10c0").replace(&format!("  checksum: 10c0/{}\n", "3".repeat(128)), "");
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(no_checksum_line, berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut r,
+        );
+        let out = &r.files["yarn.lock"];
+        assert!(
+            out.contains(&format!(
+                "  resolution: \"left-pad@{url}\"\n  checksum: {checksum}\n"
+            )),
+            "{out}"
+        );
+    }
+
+    /// A rescan whose grant lacks the `yarnBerry10c0` checksum still
+    /// confirms a pin an earlier run completed (the lock already holds the
+    /// checksum it was written with); an entry that would need the checksum
+    /// written is owned and refused, never confirmed.
+    #[test]
+    fn yarn_berry_checksumless_grant_keeps_a_complete_pin_only() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let mut first = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut first,
+        );
+        let pinned = berry_files(
+            first.files["yarn.lock"].clone(),
+            first.files["package.json"].clone(),
+        );
+        let checksumless = DepOverride {
+            integrity: Integrity::default(),
+            ..ovr.clone()
+        };
+        let mut again = RewriteResult::default();
+        rewrite_yarn_berry(&pinned, std::slice::from_ref(&checksumless), &mut again);
+        assert!(again.warnings.is_empty(), "{:?}", again.warnings);
+        assert!(again.files.is_empty(), "{:?}", again.files);
+        assert!(again.confirmed_yarn_berry_uuids.contains(BERRY_UUID));
+
+        let mut fresh = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), berry_manifest()),
+            std::slice::from_ref(&checksumless),
+            &mut fresh,
+        );
+        assert_eq!(
+            fresh.warnings[0].code,
+            "redirect_yarn_berry_missing_checksum"
+        );
+        assert!(fresh.files.is_empty());
+        assert!(fresh.yarn_berry_uuids.contains(BERRY_UUID));
+        assert!(fresh.confirmed_yarn_berry_uuids.is_empty());
+    }
+
+    /// A lock written by an earlier release carries the old
+    /// `npm:…::__archiveUrl=` pin; a repeat hosted run re-pins it (#404).
+    #[test]
+    fn yarn_berry_legacy_archive_url_pin_is_migrated() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let legacy = berry_lock("10c0").replace(
+            "resolution: \"left-pad@npm:1.3.0\"",
+            &format!(
+                "resolution: \"left-pad@npm:1.3.0::__archiveUrl={}\"",
+                crate::utils::uri::encode_uri_component(&url)
+            ),
+        );
+        let files = berry_files(legacy, berry_manifest());
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = &r.files["yarn.lock"];
+        assert!(
+            out.contains(&format!("\"left-pad@{url}\":\n  version: 1.3.0\n  resolution: \"left-pad@{url}\"\n")),
+            "{out}"
+        );
+        assert!(!out.contains("__archiveUrl"), "{out}");
+        assert!(r.files["package.json"].contains("\"left-pad@npm:^1.3.0\""));
+    }
+
+    /// The pin never overwrites a user-authored `resolutions` entry for the
+    /// package (bare, ranged or nested), never runs without a root
+    /// manifest, and leaves a package yarn also locks through a builtin
+    /// `patch:` entry alone (that entry wraps the same npm descriptor).
+    /// Each is a skip with a warning, nothing written.
+    #[test]
+    fn yarn_berry_pin_refusals_leave_everything_untouched() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        for (label, selector) in [
+            ("bare", "left-pad"),
+            ("ranged", "left-pad@npm:^1.3.0"),
+            ("nested", "app/left-pad"),
+        ] {
+            let manifest = format!(
+                "{{\n  \"name\": \"app\",\n  \"resolutions\": {{\n    \"{selector}\": \"1.3.0\"\n  }}\n}}\n"
+            );
+            let mut r = RewriteResult::default();
+            rewrite_yarn_berry(&berry_files(berry_lock("10c0"), manifest), std::slice::from_ref(&ovr), &mut r);
+            assert!(r.files.is_empty(), "{label}: {:?}", r.files);
+            assert_eq!(
+                r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
+                vec!["redirect_yarn_berry_resolutions_conflict"],
+                "{label}"
+            );
+        }
+        // A user's own tarball for the package — same `<name>-<version>.tgz`
+        // leaf, another origin (a mirror, a fork) — is user-authored too.
+        let manifest = "{\n  \"name\": \"app\",\n  \"resolutions\": {\n    \
+             \"left-pad@npm:^1.3.0\": \"https://mirror.example/left-pad-1.3.0.tgz\"\n  }\n}\n";
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), manifest.into()),
+            std::slice::from_ref(&ovr),
+            &mut r,
+        );
+        assert!(r.files.is_empty(), "mirror tarball: {:?}", r.files);
+        assert_eq!(
+            r.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["redirect_yarn_berry_resolutions_conflict"],
+            "mirror tarball"
+        );
+        // An unrelated user entry is kept as-is next to ours.
+        let manifest = "{\n  \"name\": \"app\",\n  \"resolutions\": {\n    \"other\": \"2.0.0\"\n  }\n}\n";
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&berry_files(berry_lock("10c0"), manifest.into()), std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let m: Value = serde_json::from_str(&r.files["package.json"]).unwrap();
+        assert_eq!(m["resolutions"], json!({"other": "2.0.0", "left-pad@npm:^1.3.0": url}));
+
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), berry_lock("10c0"));
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
+            vec!["redirect_yarn_berry_manifest_missing"]
+        );
+
+        let with_patch = format!(
+            "{}\n\"left-pad@patch:left-pad@npm%3A^1.3.0#~builtin<compat/left-pad>\":\n  \
+             version: 1.3.0\n  resolution: \"left-pad@patch:left-pad@npm%3A1.3.0#~builtin<compat/left-pad>::version=1.3.0&hash=abc\"\n  \
+             languageName: node\n  linkType: hard\n",
+            berry_lock("10c0")
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&berry_files(with_patch, berry_manifest()), std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty(), "{:?}", r.files);
+        let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert!(codes.contains(&"redirect_yarn_berry_shared_descriptor"), "{codes:?}");
+    }
+
+    /// Yarn routes a URL locator to its tarball fetcher only when it is an
+    /// `http(s)://` URL whose path ends in `.tgz`/`.tar.gz` with no query
+    /// (yarn's `TARBALL_REGEXP`). Any other artifact URL would make yarn
+    /// reject the lock, so the entry is refused and left byte-identical.
+    #[test]
+    fn yarn_berry_refuses_artifact_url_yarn_cannot_fetch_as_tarball() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        for url in [
+            "https://p.test/left-pad-1.3.0.zip",
+            "https://p.test/left-pad-1.3.0.tgz?sig=1",
+            "https://p.test/left-pad-1.3.0.tgz#frag",
+            "ftp://p.test/left-pad-1.3.0.tgz",
+            "https://p.test/a b/left-pad-1.3.0.tgz",
+            "https://p.test/a\"b/left-pad-1.3.0.tgz",
+        ] {
+            let ovr = berry_override("left-pad", "1.3.0", url, &checksum);
+            let files = berry_files(berry_lock("10c0"), berry_manifest());
+            let mut r = RewriteResult::default();
+            rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(r.files.is_empty(), "{url}: nothing written");
+            assert!(r.edits.is_empty(), "{url}: {:?}", r.edits);
+            assert_eq!(
+                r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
+                vec!["redirect_yarn_berry_artifact_url_unsupported"],
+                "{url}"
+            );
+        }
+        for url in [
+            "https://p.test/left-pad-1.3.0.tgz",
+            "http://127.0.0.1:8080/patch/npm/@s/n/1.0.0/t/u/n-1.0.0.tar.gz",
+        ] {
+            let ovr = berry_override("left-pad", "1.3.0", url, &checksum);
+            let files = berry_files(berry_lock("10c0"), berry_manifest());
+            let mut r = RewriteResult::default();
+            rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(r.warnings.is_empty(), "{url}: {:?}", r.warnings);
+            assert!(r.files.contains_key("yarn.lock"), "{url}");
+        }
     }
 
     /// yarn 4.0.x: a lock that spells its `10c0` checksums bare (yarn
@@ -7519,10 +8632,14 @@ mod tests {
         ] {
             let mut files = BTreeMap::new();
             files.insert("yarn.lock".to_string(), lock.clone());
+            files.insert("package.json".to_string(), berry_manifest());
             let mut r = RewriteResult::default();
             rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
             let out = &r.files["yarn.lock"];
-            assert!(out.contains("::__archiveUrl="), "{out}");
+            assert!(
+                out.contains("resolution: \"left-pad@http://p.test/lp.tgz\""),
+                "{out}"
+            );
             assert!(out.contains(&want), "want {want:?} in:\n{out}");
             assert_eq!(out.matches("checksum:").count(), 1, "{out}");
         }
@@ -12360,6 +13477,116 @@ mod tests {
     /// that entry would report (and VEX-attest) a patch `npm ci` never
     /// installs. It must be skipped loudly, like a bundled copy.
     #[test]
+    fn issue_490_unclear_overrides_leave_a_url_dependency_unredirected() {
+        // The review probes: npm keeps the URL spec for a `*` override, and
+        // picks the narrower rule under a range selector, so `npm ci` still
+        // fetches the URL. The rewriter must skip the entry loudly.
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0", "dependencies": { "pkga": "^1.0.0" } },
+                "node_modules/pkga": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/pkga/-/pkga-1.0.0.tgz",
+                    "dependencies": { "left-pad": url }
+                },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": url,
+                    "integrity": "sha512-UPSTREAM=="
+                }
+            }
+        });
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        for manifest_overrides in [
+            json!({ "left-pad": "*" }),
+            json!({ "left-pad": "1.3.0", "pkga@^1": { "left-pad": url } }),
+            json!({ "left-pad": "1.3.0", "pkga@1.0.0+build.1": { "left-pad": url } }),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "package-lock.json".to_string(),
+                serde_json::to_string_pretty(&lock).unwrap(),
+            );
+            files.insert(
+                "package.json".to_string(),
+                json!({ "name": "app", "dependencies": { "pkga": "^1.0.0" }, "overrides": manifest_overrides })
+                    .to_string(),
+            );
+            let r = rewrite_registry_redirect(&files, &overrides);
+            assert!(r.files.is_empty(), "{manifest_overrides}: {:?}", r.edits);
+            assert!(
+                warning_codes(&r).contains(&"redirect_npm_non_registry_entry_skipped"),
+                "{manifest_overrides}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn issue_490_a_git_edge_overridden_to_the_registry_is_redirected() {
+        // `pkga` depends on left-pad from git; the project's `overrides`
+        // send it to the registry release, which is what npm installs.
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0", "dependencies": { "pkga": "file:pkga-1.0.0.tgz" } },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-UPSTREAM=="
+                },
+                "node_modules/pkga": {
+                    "version": "1.0.0",
+                    "resolved": "file:pkga-1.0.0.tgz",
+                    "dependencies": { "left-pad": "github:stevemao/left-pad#v1.3.0" }
+                }
+            }
+        });
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            serde_json::to_string_pretty(&lock).unwrap(),
+        );
+        // Without the manifest's override the #326 skip still applies.
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty(), "{:?}", r.edits);
+        assert!(warning_codes(&r).contains(&"redirect_npm_non_registry_entry_skipped"));
+
+        files.insert(
+            "package.json".to_string(),
+            r#"{"name":"app","dependencies":{"pkga":"file:pkga-1.0.0.tgz"},"overrides":{"left-pad":"1.3.0"}}"#
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            !warning_codes(&r).contains(&"redirect_npm_non_registry_entry_skipped"),
+            "{:?}",
+            r.warnings
+        );
+        let rewritten: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+        let entry = &rewritten["packages"]["node_modules/left-pad"];
+        assert_eq!(entry["resolved"], "http://patch.test/lp.tgz");
+        assert_eq!(entry["integrity"], "sha512-PATCHED==");
+        // The manifest is input only: never written.
+        assert!(!r.files.contains_key("package.json"));
+    }
+
+    #[test]
     fn npm_non_registry_entries_are_skipped_with_loud_warning() {
         let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
         for (spec, resolved) in [
@@ -14378,9 +15605,16 @@ packages:
         let lf = berry_lock_two_entries();
         let mut lf_files = BTreeMap::new();
         lf_files.insert("yarn.lock".to_string(), lf.clone());
+        lf_files.insert("package.json".to_string(), berry_manifest());
         let mut lf_result = RewriteResult::default();
         rewrite_yarn_berry(&lf_files, std::slice::from_ref(&ovr), &mut lf_result);
         let lf_out = lf_result.files["yarn.lock"].clone();
+        let lf_edit = lf_result
+            .edits
+            .iter()
+            .find(|e| e.path == "yarn.lock")
+            .expect("the LF lock edit")
+            .clone();
 
         for (label, bom, crlf) in [
             ("crlf", "", true),
@@ -14398,6 +15632,7 @@ packages:
             let input = respell(&lf);
             let mut files = BTreeMap::new();
             files.insert("yarn.lock".to_string(), input.clone());
+            files.insert("package.json".to_string(), berry_manifest());
             let mut r = RewriteResult::default();
             rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
             assert!(r.warnings.is_empty(), "{label}: {:?}", r.warnings);
@@ -14420,13 +15655,14 @@ packages:
                 "{label}: BOM kept"
             );
             assert!(
-                out.contains(&crate::utils::uri::encode_uri_component(url)),
+                out.contains(&format!("resolution: \"left-pad@{url}\"")),
                 "{label}: {out}"
             );
 
             // One edit; its fragments are the on-disk bytes of the entry.
-            assert_eq!(r.edits.len(), 1, "{label}");
-            let edit = &r.edits[0];
+            let lock_edits: Vec<&FileEdit> = r.edits.iter().filter(|e| e.path == "yarn.lock").collect();
+            assert_eq!(lock_edits.len(), 1, "{label}");
+            let edit = lock_edits[0];
             let (orig, new) = (
                 edit.original.as_ref().and_then(Value::as_str).unwrap(),
                 edit.new.as_ref().and_then(Value::as_str).unwrap(),
@@ -14435,7 +15671,7 @@ packages:
                 (orig, new),
                 (
                     respell(
-                        lf_result.edits[0]
+                        lf_edit
                             .original
                             .as_ref()
                             .unwrap()
@@ -14443,7 +15679,7 @@ packages:
                             .unwrap()
                     )
                     .trim_start_matches('\u{feff}'),
-                    respell(lf_result.edits[0].new.as_ref().unwrap().as_str().unwrap())
+                    respell(lf_edit.new.as_ref().unwrap().as_str().unwrap())
                         .trim_start_matches('\u{feff}'),
                 ),
                 "{label}: fragments in the lock's on-disk form"
@@ -14462,6 +15698,7 @@ packages:
             // Re-run over the rewritten lock: nothing to do.
             let mut files = BTreeMap::new();
             files.insert("yarn.lock".to_string(), out.clone());
+            files.insert("package.json".to_string(), r.files["package.json"].clone());
             let mut again = RewriteResult::default();
             rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut again);
             assert!(
@@ -14588,11 +15825,15 @@ packages:
         assert!(is_berry_lock(&lock));
         let mut files = BTreeMap::new();
         files.insert("yarn.lock".to_string(), lock);
+        files.insert("package.json".to_string(), berry_manifest());
         let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         let out = &r.files["yarn.lock"];
         assert!(out.starts_with("\u{feff}__metadata:"), "{out:?}");
-        assert!(out.contains("::__archiveUrl="), "{out}");
+        assert!(
+            out.contains("resolution: \"left-pad@http://p.test/lp.tgz\""),
+            "{out}"
+        );
     }
 
     /// CRLF locks preserve their newline style through hosted rewriting.
@@ -16362,7 +17603,7 @@ packages:
 
     /// An UNQUOTED single-descriptor berry key (yarn emits unquoted keys for
     /// names that need no YAML quoting) whose entry has no `checksum:` line:
-    /// the resolution gains `::__archiveUrl=` and a checksum line is INSERTED
+    /// the resolution becomes the tarball locator and a checksum line is INSERTED
     /// after it.
     #[test]
     fn yarn_berry_unquoted_key_without_checksum_gains_inserted_line() {
@@ -16373,18 +17614,19 @@ packages:
                     resolution: \"left-pad@npm:1.3.0\"\n  languageName: node\n  linkType: hard\n";
         let mut files = BTreeMap::new();
         files.insert("yarn.lock".to_string(), lock.to_string());
+        files.insert("package.json".to_string(), berry_manifest());
         let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         let out = r.files.get("yarn.lock").expect("lock rewritten");
         assert!(
-            out.contains("\n  resolution: \"left-pad@npm:1.3.0::__archiveUrl="),
-            "resolution gains the archiveUrl binding: {out}"
+            out.contains("\n  resolution: \"left-pad@http://p.test/lp.tgz\""),
+            "resolution becomes the tarball locator: {out}"
         );
         assert!(
             out.contains(&format!("\"\n  checksum: {checksum}\n  languageName: node")),
             "checksum inserted right after the resolution: {out}"
         );
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
-        assert_eq!(r.edits.len(), 1);
+        assert_eq!(r.edits.iter().filter(|e| e.path == "yarn.lock").count(), 1);
     }
 
     /// A bun URL 3-tuple already at the CURRENT artifact URL but with a stale
@@ -17405,6 +18647,7 @@ packages:
         let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
         let mut files = BTreeMap::new();
         files.insert("yarn.lock".to_string(), berry_lock("10c0"));
+        files.insert("package.json".to_string(), berry_manifest());
         files.insert(
             ".yarnrc.yml".to_string(),
             "compressionLevel: 0\n".to_string(),
@@ -17417,7 +18660,7 @@ packages:
             .get("yarn.lock")
             .expect("explicit level 0 must not refuse");
         assert!(
-            out.contains("__archiveUrl=") && out.contains(&checksum),
+            out.contains("left-pad@http://p.test/lp.tgz") && out.contains(&checksum),
             "{out}"
         );
     }
@@ -17437,6 +18680,7 @@ packages:
         );
         let mut files = BTreeMap::new();
         files.insert("yarn.lock".to_string(), lock);
+        files.insert("package.json".to_string(), berry_manifest());
         let mut r = RewriteResult::default();
         rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
@@ -17451,12 +18695,12 @@ packages:
             "the rangeless key stays byte-identical: {out}"
         );
         assert_eq!(
-            r.edits.len(),
+            r.edits.iter().filter(|e| e.path == "yarn.lock").count(),
             1,
             "only the real entry is edited: {:?}",
             r.edits
         );
-        assert!(out.contains("__archiveUrl="), "{out}");
+        assert!(out.contains("left-pad@http://p.test/lp.tgz"), "{out}");
     }
 
     /// A descriptor with NO protocol at all (`left-pad@1.3.0`) is refused
