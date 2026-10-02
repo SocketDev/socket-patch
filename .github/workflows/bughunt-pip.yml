@@ -1,0 +1,113 @@
+name: bughunt-pip
+on:
+  push:
+    branches: ['bughunt/pip/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        combo:
+          - { py: '3.8', pip: '20.3.4' }
+          - { py: '3.13', pip: '26.2.1' }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.combo.py }}
+      - run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo build --locked -p socket-patch-cli
+      - name: probe
+        shell: bash
+        run: |
+          cat > probe.py <<'PROBE_EOF'
+          import base64, hashlib, http.server, io, json, os, shutil, subprocess, sys, threading, zipfile, re, urllib.parse
+          BIN = os.path.abspath(sys.argv[1]); PIPV = sys.argv[2]
+          W = os.path.abspath("probe-work"); shutil.rmtree(W, ignore_errors=True); os.makedirs(W)
+          WIN = os.name == "nt"
+          UUID = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1"
+          VER = "1.15.0"
+          def run(cmd, cwd=None, env=None):
+              p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+              return p.returncode, p.stdout + p.stderr
+          def vpy(v): return os.path.join(v, "Scripts" if WIN else "bin", "python.exe" if WIN else "python")
+          def mkvenv(path, pipv=PIPV):
+              rc, out = run([sys.executable, "-m", "venv", path]); assert rc == 0, out
+              rc, out = run([vpy(path), "-m", "pip", "install", "-q", f"pip=={pipv}"]); assert rc == 0, out
+              return vpy(path)
+          rc, out = run([sys.executable, "-m", "pip", "download", "--no-deps", f"six=={VER}", "-d", W, "-q"]); assert rc == 0, out
+          WN = f"six-{VER}-py2.py3-none-any.whl"
+          zin = zipfile.ZipFile(os.path.join(W, WN)); buf = io.BytesIO(); zout = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+          for i in zin.infolist():
+              d = zin.read(i.filename)
+              if i.filename == "six.py": before = d; d = d + b"# SOCKET-PATCHED\n"; after = d
+              zout.writestr(i, d)
+          zout.close(); WHL = buf.getvalue()
+          SHA = hashlib.sha256(WHL).hexdigest(); SRI = "sha512-" + base64.b64encode(hashlib.sha512(WHL).digest()).decode()
+          g = lambda d: hashlib.sha256(b"blob %d\0" % len(d) + d).hexdigest()
+          WPATH = f"/patch/pypi/six/{VER}/tok/{UUID}/{WN}"
+          PORT = 18765; BASE = f"http://127.0.0.1:{PORT}"; URL = BASE + WPATH
+          MATCH = f"pkg:pypi/six@{VER}"; SEEN = []
+          def key(p):
+              p = urllib.parse.unquote(p).split("?")[0].lower()
+              if "@" not in p: return p
+              n, v = p.split("@", 1); return re.sub(r"[_.-]+", "-", n) + "@" + v
+          VULN = {"GHSA-test-aaaa-bbbb": {"cves": ["CVE-2024-0001"], "summary": "s", "severity": "high", "description": "d"}}
+          class H(http.server.BaseHTTPRequestHandler):
+              def log_message(self, *a): pass
+              def send(self, b, ct="application/octet-stream", code=200):
+                  self.send_response(code); self.send_header("content-type", ct); self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
+              def j(self, o, code=200): self.send(json.dumps(o).encode(), "application/json", code)
+              def do_POST(self):
+                  n = int(self.headers.get("content-length") or 0); b = json.loads(self.rfile.read(n) or b"null")
+                  if self.path.endswith("/patches/batch"):
+                      SEEN.extend(c["purl"] for c in b.get("components", []) if "six" in c["purl"])
+                      pk = [{"purl": c["purl"], "patches": [{"uuid": UUID, "purl": c["purl"], "tier": "free", "cveIds": [], "ghsaIds": ["GHSA-test-aaaa-bbbb"], "severity": "high", "title": "fixture"}]} for c in b.get("components", []) if key(c["purl"]) == MATCH]
+                      return self.j({"packages": pk, "canAccessPaidPatches": False})
+                  if self.path.endswith("/patches/package"):
+                      r = {u: {"status": "granted", "url": URL, "purl": None, "artifacts": [{"kind": "tarball", "url": URL, "integrity": {"sha256": SHA, "sha512": SRI}}], "registryOverride": None} for u in b.get("uuids", []) if u == UUID}
+                      return self.j({"results": r})
+                  self.j({}, 404)
+              def do_GET(self):
+                  if self.path == WPATH: return self.send(WHL)
+                  if "/by-package/" in self.path:
+                      p = urllib.parse.unquote(self.path.split("/by-package/")[1])
+                      ps = [{"uuid": UUID, "purl": p, "publishedAt": "2024-01-01T00:00:00Z", "description": "fixture", "license": "MIT", "tier": "free", "vulnerabilities": VULN}] if key(p) == MATCH else []
+                      return self.j({"patches": ps, "canAccessPaidPatches": False})
+                  if "/view/" in self.path:
+                      return self.j({"uuid": UUID, "purl": MATCH, "publishedAt": "2024-01-01T00:00:00Z", "files": {"six.py": {"beforeHash": g(before), "afterHash": g(after)}}, "vulnerabilities": VULN, "description": "fixture", "license": "MIT", "tier": "free"})
+                  self.j({}, 404)
+          srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), H); threading.Thread(target=srv.serve_forever, daemon=True).start()
+          ENV = dict(os.environ, SOCKET_NO_CONFIG="1", SOCKET_TELEMETRY_DISABLED="1", SOCKET_NO_UPDATE_CHECK="1")
+          ENV.pop("VIRTUAL_ENV", None)
+          A = ["--org", "test-org", "--api-token", "fake-token", "--api-url", BASE, "--patch-server-url", BASE]
+          def sp(args, cwd): return run([BIN] + args + ["--cwd", cwd] + A, env=ENV)
+          def patched(py):
+              rc, out = run([py, "-c", "import six;print('PATCHED' if 'SOCKET-PATCHED' in open(six.__file__).read() else 'UNPATCHED')"])
+              return out.strip().splitlines()[-1] if rc == 0 else "NOTINSTALLED"
+          results = []
+          FORMS = [f"six=={VER}", f"six == {VER}", f"six =={VER}", f"six== {VER}", f"six[x] == {VER}", f"six (=={VER})"]
+          for i, form in enumerate(FORMS):
+              p = os.path.join(W, f"p{i}"); os.makedirs(os.path.join(p, ".git"))
+              open(os.path.join(p, "requirements.txt"), "w", newline="").write(form + "\nidna==3.7\n")
+              del SEEN[:]
+              rc, out = sp(["scan", "--mode", "hosted", "--yes"], p)
+              txt = open(os.path.join(p, "requirements.txt")).read()
+              rewritten = "#sha256=" in txt
+              py = mkvenv(os.path.join(W, f"v{i}"))
+              rc2, out2 = run([py, "-m", "pip", "install", "-q", "--no-cache-dir", "-r", os.path.join(p, "requirements.txt")])
+              st = patched(py)
+              results.append((form, rc, rewritten, sorted(set(SEEN)), rc2, st))
+              print(f"== [{form}] scan rc={rc} rewritten={rewritten} discovered={sorted(set(SEEN))} pip rc={rc2} {st}\n{out.strip()[-400:]}\n{out2.strip()[-300:]}", flush=True)
+          print("\n| pin | scan exit | rewritten | six purl sent to batch | pip install -r | six |\n|---|---|---|---|---|---|")
+          for r in results: print("| `%s` | %s | %s | %s | %s | %s |" % r)
+          PROBE_EOF
+          BIN=target/debug/socket-patch
+          if [ "$RUNNER_OS" = Windows ]; then BIN=target/debug/socket-patch.exe; fi
+          python probe.py "$BIN" "${{ matrix.combo.pip }}" 2>&1 | tee probe.log
