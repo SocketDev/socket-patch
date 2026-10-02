@@ -431,36 +431,97 @@ fn locate_artifact_finds_every_copy() {
 
 // ── derived copies ──────────────────────────────────────────────────────
 
-/// Instrumented / transformed copies of the jar outside files-2.1, by name
-/// or by the pristine sha1, are found; unrelated files are not.
+/// Copies of the jar outside files-2.1 that are provably pristine-derived
+/// (identical bytes, or the pristine sha1 in a dir or stem) are stale;
+/// same-named copies of other bytes (an instrumented jar, a copy Gradle
+/// rebuilt from the patched jar) are only unknown; unrelated files are
+/// neither.
 #[test]
 fn stale_derived_copies_finds_transforms_and_instrumented_jars() {
     let home = tempfile::tempdir().unwrap();
     let caches = home.path().join("caches");
     let leaf = "victim-1.10.0.jar";
     let sha1 = sha1_hex(b"pristine");
-    let hits = [
-        caches.join("jars-9/abc123/victim-1.10.0.jar"),
-        caches.join("transforms-3/f00d/transformed/instrumented-victim-1.10.0.jar"),
-        caches.join(format!("8.14.3/transforms/{sha1}/transformed/renamed.jar")),
-        caches.join(format!("transforms-4/{}.jar", sha1.trim_start_matches('0'))),
+    let stale = [
+        (
+            caches.join("jars-9/abc123/victim-1.10.0.jar"),
+            &b"pristine"[..],
+        ),
+        (
+            caches.join(format!("8.14.3/transforms/{sha1}/transformed/renamed.jar")),
+            b"x",
+        ),
+        (
+            caches.join(format!("transforms-4/{}.jar", sha1.trim_start_matches('0'))),
+            b"x",
+        ),
+    ];
+    let unknown = [
+        (
+            caches.join("jars-9/def456/victim-1.10.0.jar"),
+            &b"patched"[..],
+        ),
+        (
+            caches.join("transforms-3/f00d/transformed/instrumented-victim-1.10.0.jar"),
+            b"instrumented",
+        ),
     ];
     let misses = [
-        caches.join("jars-9/abc123/other-1.0.jar"),
-        caches.join("8.14.3/kotlin-dsl/victim-1.10.0.jar"),
-        caches.join("modules-2/files-2.1/g/victim/1.10.0/aa/victim-1.10.0.jar"),
+        (caches.join("jars-9/abc123/other-1.0.jar"), &b"pristine"[..]),
+        (
+            caches.join("8.14.3/kotlin-dsl/victim-1.10.0.jar"),
+            b"pristine",
+        ),
+        (
+            caches.join("modules-2/files-2.1/g/victim/1.10.0/aa/victim-1.10.0.jar"),
+            b"pristine",
+        ),
     ];
-    for p in hits.iter().chain(&misses) {
+    for (p, bytes) in stale.iter().chain(&unknown).chain(&misses) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    }
+    let sorted = |v: &[(PathBuf, &[u8])]| {
+        let mut v: Vec<PathBuf> = v.iter().map(|(p, _)| p.clone()).collect();
+        v.sort();
+        v
+    };
+    let found = gradle_cache::stale_derived_copies(home.path(), leaf, &sha1);
+    assert_eq!(found.stale, sorted(&stale));
+    assert_eq!(found.unknown, sorted(&unknown));
+    assert!(!found.incomplete);
+    assert_eq!(
+        gradle_cache::stale_derived_copies(&home.path().join("none"), leaf, &sha1),
+        gradle_cache::DerivedCopies::default()
+    );
+}
+
+/// A derived-cache walk cut short by its entry bound says so: an empty
+/// `stale` from it is not evidence that no stale copy exists.
+#[test]
+fn stale_derived_copies_reports_a_truncated_walk() {
+    let home = tempfile::tempdir().unwrap();
+    let leaf = "victim-1.10.0.jar";
+    let sha1 = sha1_hex(b"pristine");
+    let deep = home
+        .path()
+        .join("caches/transforms-3/zz/transformed/victim-1.10.0.jar");
+    for i in 0..8 {
+        let p = home
+            .path()
+            .join(format!("caches/transforms-3/a{i}/transformed/x.jar"));
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, b"x").unwrap();
     }
-    let mut want = hits.to_vec();
-    want.sort();
-    assert_eq!(
-        gradle_cache::stale_derived_copies(home.path(), leaf, &sha1),
-        want
-    );
-    assert!(gradle_cache::stale_derived_copies(&home.path().join("none"), leaf, &sha1).is_empty());
+    std::fs::create_dir_all(deep.parent().unwrap()).unwrap();
+    std::fs::write(&deep, b"pristine").unwrap();
+
+    let full = gradle_cache::stale_derived_copies(home.path(), leaf, &sha1);
+    assert_eq!(full.stale, vec![deep]);
+    assert!(!full.incomplete);
+    let cut = gradle_cache::stale_derived_copies_bounded(home.path(), leaf, &sha1, 4);
+    assert!(cut.stale.is_empty(), "{cut:?}");
+    assert!(cut.incomplete);
 }
 
 // ── cache roots: the Gradle user home, the read-only cache, #551 ────────
@@ -619,12 +680,52 @@ async fn gradle_only_without_maven_local_has_no_m2() {
     assert_eq!(m.gate(), M2Gate::Ignored);
     assert_eq!(m.roots(false).await, vec![m.gradle_files21()]);
     // PURL lookups (vendor sourcing, apply's every-copy fan-out) still see
-    // the m2 bytes.
+    // the m2 bytes; the Gradle caches only through the copy lookup, whose
+    // callers expand version dirs.
+    let copies = MavenCrawler
+        .get_maven_copy_paths_with(&m.options(false), &m.jvm_env())
+        .await
+        .unwrap();
+    assert_eq!(copies, vec![m.m2(), m.gradle_files21()]);
     let lookup = MavenCrawler
         .get_maven_repo_paths_with(&m.options(false), &m.jvm_env())
         .await
         .unwrap();
-    assert_eq!(lookup, vec![m.m2(), m.gradle_files21()]);
+    assert_eq!(lookup, vec![m.m2()]);
+}
+
+/// The PURL lookup the existing join sites use (apply, rollback, vendor,
+/// VEX) never hands out a Gradle version dir, which they would join file
+/// keys onto as if it were an m2 package dir: a GAV only Gradle caches
+/// stays "not installed" for them, also under `--global-prefix`.
+#[tokio::test]
+async fn repo_paths_leave_out_gradle_caches() {
+    let m = Machine::new();
+    m.write("build.gradle", GRADLE_ONLY);
+    cache_commons_text(&m.gradle_files21());
+    for options in [
+        m.options(false),
+        m.options(true),
+        global_prefix(&m.gradle_files21()),
+    ] {
+        let lookup = MavenCrawler
+            .get_maven_repo_paths_with(&options, &m.jvm_env())
+            .await
+            .unwrap();
+        assert!(!lookup.contains(&m.gradle_files21()), "{lookup:?}");
+        for root in lookup {
+            let found = MavenCrawler
+                .find_by_purls(&root, &[COMMONS_TEXT.to_string()])
+                .await
+                .unwrap();
+            assert!(found.is_empty(), "{root:?}: {found:?}");
+        }
+    }
+    let copies = MavenCrawler
+        .get_maven_copy_paths_with(&global_prefix(&m.gradle_files21()), &m.jvm_env())
+        .await
+        .unwrap();
+    assert_eq!(copies, vec![m.gradle_files21()]);
 }
 
 /// #551: mavenLocal() in a buildSrc convention plugin counts.
@@ -731,6 +832,51 @@ async fn wrapper_distribution_init_d() {
         "distributionUrl=https\\://services.gradle.org/distributions/gradle-9.8.0-bin.zip\n",
     );
     assert_eq!(m.gate(), M2Gate::Ignored);
+}
+
+/// Wrapper properties are read as `java.util.Properties` reads them
+/// (ISO-8859-1, whitespace separator, escapes): a Latin-1 comment or a
+/// `distributionUrl <url>` line still names the custom distribution, so it
+/// stays undetermined until unpacked. Properties that name no distribution
+/// at all keep the gate undetermined too.
+#[tokio::test]
+async fn wrapper_properties_latin1_and_unparseable() {
+    let m = Machine::new();
+    m.write("build.gradle", GRADLE_ONLY);
+    let props = m.project.join("gradle/wrapper/gradle-wrapper.properties");
+    std::fs::create_dir_all(props.parent().unwrap()).unwrap();
+    std::fs::write(
+        &props,
+        b"# \xa9 ACME\ndistributionUrl=https\\://repo.acme/gradle-8.5-acme.zip\n",
+    )
+    .unwrap();
+    assert!(matches!(m.gate(), M2Gate::Undetermined(why) if why.contains("repo.acme")));
+    m.write(
+        "gradle/wrapper/gradle-wrapper.properties",
+        "distributionUrl   https\\://repo.acme/gradle-8.5-acme.zip\n",
+    );
+    assert!(matches!(m.gate(), M2Gate::Undetermined(why) if why.contains("repo.acme")));
+    let init_d = m
+        .home
+        .join(".gradle/wrapper/dists/gradle-8.5-acme/h/gradle-8.5/init.d");
+    std::fs::create_dir_all(&init_d).unwrap();
+    std::fs::write(
+        init_d.join("acme.gradle"),
+        "allprojects { repositories { mavenLocal() } }",
+    )
+    .unwrap();
+    assert!(matches!(m.gate(), M2Gate::Declared(at) if at.ends_with("acme.gradle")));
+
+    std::fs::remove_dir_all(m.home.join(".gradle/wrapper")).unwrap();
+    m.write(
+        "gradle/wrapper/gradle-wrapper.properties",
+        "distributionBase=GRADLE_USER_HOME\n",
+    );
+    assert!(
+        matches!(m.gate(), M2Gate::Undetermined(why) if why.contains("no distributionUrl")),
+        "{:?}",
+        m.gate()
+    );
 }
 
 /// A subproject cwd (no settings of its own) is judged with the settings

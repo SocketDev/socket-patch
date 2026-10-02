@@ -289,16 +289,56 @@ pub fn installed_copies_detailed(
 
 /// How deep below a derived-cache root [`stale_derived_copies`] looks.
 const DERIVED_DEPTH: usize = 8;
-/// A bound on the entries [`stale_derived_copies`] visits per root.
+/// A bound on the entries [`stale_derived_copies`] visits per root; a walk
+/// cut short by it is reported [`DerivedCopies::incomplete`].
 const DERIVED_ENTRIES: usize = 200_000;
+
+/// What [`stale_derived_copies`] found of the copies Gradle derived from a
+/// cached jar.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DerivedCopies {
+    /// Copies proven derived from the pristine jar: byte-identical to it,
+    /// or under a directory, or with a stem, that [`hash_eq`]s its sha1.
+    /// Sorted.
+    pub stale: Vec<PathBuf>,
+    /// Files named after the jar (`jar_leaf`, `instrumented-<jar_leaf>`)
+    /// whose bytes are not the pristine jar's: Gradle may have derived
+    /// them from the pristine jar or from the patched one, and nothing in
+    /// the file says which. Sorted.
+    pub unknown: Vec<PathBuf>,
+    /// The walk did not cover every derived-cache root (an unreadable
+    /// directory or file, or more entries under one than the walk visits), so
+    /// an empty `stale` does not prove there is no stale copy.
+    pub incomplete: bool,
+}
 
 /// Copies of a cached jar that Gradle derived from it and keeps apart
 /// (outside `files-2.1`), so patching the cached jar does not reach them:
 /// files under `<user home>/caches/jars-*`, `caches/transforms-*` and
 /// `caches/<version>/transforms` named `jar_leaf` (or
 /// `instrumented-<jar_leaf>`), or under a directory, or with a stem, that
-/// [`hash_eq`]s `pristine_sha1`. Symlinks are not followed. Sorted.
-pub fn stale_derived_copies(user_home: &Path, jar_leaf: &str, pristine_sha1: &str) -> Vec<PathBuf> {
+/// [`hash_eq`]s `pristine_sha1`. A name match counts as stale only when its
+/// bytes are the pristine jar's; otherwise it is [`DerivedCopies::unknown`].
+/// Symlinks are not followed.
+pub fn stale_derived_copies(
+    user_home: &Path,
+    jar_leaf: &str,
+    pristine_sha1: &str,
+) -> DerivedCopies {
+    stale_derived_copies_bounded(user_home, jar_leaf, pristine_sha1, DERIVED_ENTRIES)
+}
+
+/// [`stale_derived_copies`] visiting at most `max_entries` entries per root
+/// (tests).
+#[doc(hidden)]
+pub fn stale_derived_copies_bounded(
+    user_home: &Path,
+    jar_leaf: &str,
+    pristine_sha1: &str,
+    max_entries: usize,
+) -> DerivedCopies {
+    use sha1::{Digest, Sha1};
+
     let caches = user_home.join("caches");
     let mut roots = Vec::new();
     for (name, is_dir) in children(&caches) {
@@ -315,15 +355,26 @@ pub fn stale_derived_copies(user_home: &Path, jar_leaf: &str, pristine_sha1: &st
         }
     }
     let instrumented = format!("instrumented-{jar_leaf}");
-    let mut out = Vec::new();
+    let mut out = DerivedCopies::default();
     for root in roots {
+        let mut visited = 0usize;
         for entry in walkdir::WalkDir::new(&root)
             .follow_links(false)
             .max_depth(DERIVED_DEPTH)
-            .into_iter()
-            .filter_map(Result::ok)
-            .take(DERIVED_ENTRIES)
+            .sort_by_file_name()
         {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    out.incomplete = true;
+                    continue;
+                }
+            };
+            visited += 1;
+            if visited > max_entries {
+                out.incomplete = true;
+                break;
+            }
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -331,27 +382,37 @@ pub fn stale_derived_copies(user_home: &Path, jar_leaf: &str, pristine_sha1: &st
                 continue;
             };
             let stem = name.split('.').next().unwrap_or(name);
-            let by_hash = || {
-                hash_eq(stem, pristine_sha1)
-                    || entry
-                        .path()
-                        .strip_prefix(&root)
-                        .ok()
-                        .and_then(Path::parent)
-                        .is_some_and(|rel| {
-                            rel.components().any(|c| {
-                                c.as_os_str()
-                                    .to_str()
-                                    .is_some_and(|c| hash_eq(c, pristine_sha1))
-                            })
+            let by_hash = hash_eq(stem, pristine_sha1)
+                || entry
+                    .path()
+                    .strip_prefix(&root)
+                    .ok()
+                    .and_then(Path::parent)
+                    .is_some_and(|rel| {
+                        rel.components().any(|c| {
+                            c.as_os_str()
+                                .to_str()
+                                .is_some_and(|c| hash_eq(c, pristine_sha1))
                         })
-            };
-            if name == jar_leaf || name == instrumented || by_hash() {
-                out.push(entry.into_path());
+                    });
+            if by_hash {
+                out.stale.push(entry.into_path());
+            } else if name == jar_leaf || name == instrumented {
+                match std::fs::read(entry.path()) {
+                    Ok(bytes) if hash_eq(&hex::encode(Sha1::digest(&bytes)), pristine_sha1) => {
+                        out.stale.push(entry.into_path())
+                    }
+                    Ok(_) => out.unknown.push(entry.into_path()),
+                    Err(_) => {
+                        out.incomplete = true;
+                        out.unknown.push(entry.into_path());
+                    }
+                }
             }
         }
     }
-    out.sort();
+    out.stale.sort();
+    out.unknown.sort();
     out
 }
 
@@ -535,6 +596,92 @@ pub fn read_init_scripts(home: &GradleHome) -> InitScripts {
     out
 }
 
+/// Where a build keeps its wrapper's properties, relative to its root.
+const WRAPPER_PROPERTIES: &str = "gradle/wrapper/gradle-wrapper.properties";
+
+/// The key/value pairs of a `.properties` file, read the way
+/// `java.util.Properties.load(InputStream)` reads it: bytes are ISO-8859-1
+/// (a leading UTF-8 BOM is dropped), `#`/`!` lines are comments, a line
+/// ending in an odd number of backslashes continues on the next, the key
+/// ends at the first unescaped `=`, `:` or whitespace, and `\t`, `\n`,
+/// `\r`, `\f`, `\uXXXX` and `\<char>` escapes are resolved. A later key
+/// wins.
+fn parse_properties(bytes: &[u8]) -> HashMap<String, String> {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let text: String = bytes.iter().map(|&b| b as char).collect();
+    let text = text.replace("\r\n", "\n");
+    let is_ws = |c: char| matches!(c, ' ' | '\t' | '\x0c');
+    let mut out = HashMap::new();
+    let mut lines = text.split(['\n', '\r']);
+    while let Some(first) = lines.next() {
+        let first = first.trim_start_matches(is_ws);
+        if first.is_empty() || first.starts_with(['#', '!']) {
+            continue;
+        }
+        // Join continuation lines (an odd run of trailing backslashes).
+        let mut logical = String::new();
+        let mut line = first.to_string();
+        loop {
+            let trailing = line.chars().rev().take_while(|&c| c == '\\').count();
+            if trailing % 2 == 0 {
+                logical.push_str(&line);
+                break;
+            }
+            logical.push_str(&line[..line.len() - 1]);
+            match lines.next() {
+                Some(next) => line = next.trim_start_matches(is_ws).to_string(),
+                None => break,
+            }
+        }
+        let mut chars = logical.chars().peekable();
+        let mut key = String::new();
+        let mut value = String::new();
+        let mut in_key = true;
+        while let Some(c) = chars.next() {
+            if in_key && (c == '=' || c == ':' || is_ws(c)) {
+                in_key = false;
+                while chars.peek().is_some_and(|&c| is_ws(c)) {
+                    chars.next();
+                }
+                // Whitespace then `=`/`:` is one separator.
+                if is_ws(c) && chars.peek().is_some_and(|&c| c == '=' || c == ':') {
+                    chars.next();
+                    while chars.peek().is_some_and(|&c| is_ws(c)) {
+                        chars.next();
+                    }
+                }
+                continue;
+            }
+            let c = if c == '\\' {
+                match chars.next() {
+                    Some('t') => '\t',
+                    Some('n') => '\n',
+                    Some('r') => '\r',
+                    Some('f') => '\x0c',
+                    Some('u') => {
+                        let hex: String = (0..4).filter_map(|_| chars.next()).collect();
+                        u32::from_str_radix(&hex, 16)
+                            .ok()
+                            .and_then(char::from_u32)
+                            .unwrap_or('\u{fffd}')
+                    }
+                    Some(other) => other,
+                    None => continue,
+                }
+            } else {
+                c
+            };
+            if in_key {
+                key.push(c);
+            } else {
+                value.push(c);
+            }
+        }
+        out.insert(key, value);
+    }
+    out
+}
+
 /// What `gradle/wrapper/gradle-wrapper.properties` says about where the
 /// wrapper's distribution unpacks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -549,30 +696,43 @@ pub struct WrapperProps {
 }
 
 impl WrapperProps {
-    /// The properties of the wrapper of the build at `root`.
-    pub fn of(root: &Path) -> Option<Self> {
-        let text = fs_text_read(root)("gradle/wrapper/gradle-wrapper.properties")?;
-        let mut props: HashMap<&str, String> = HashMap::new();
-        for line in text.lines() {
-            let line = line.trim_start();
-            if line.is_empty() || line.starts_with(['#', '!']) {
-                continue;
-            }
-            let Some(at) = line.find(['=', ':']) else {
-                continue;
-            };
-            props.insert(line[..at].trim(), line[at + 1..].trim().replace('\\', ""));
+    /// The properties of the wrapper of the build at `root`: `None` when it
+    /// has no `gradle/wrapper/gradle-wrapper.properties`, an error naming
+    /// the file when it exists but names no distribution (unreadable, too
+    /// large, or no `distributionUrl`). Read as `java.util.Properties`
+    /// does: ISO-8859-1, `=`, `:` or whitespace between key and value,
+    /// backslash escapes and continuation lines.
+    pub fn of(root: &Path) -> Option<Result<Self, String>> {
+        let path = root.join(WRAPPER_PROPERTIES);
+        let meta = std::fs::metadata(&path).ok()?;
+        let unusable = |why: &str| Some(Err(format!("{} ({why})", path.display())));
+        if !meta.is_file() {
+            return unusable("not a file");
         }
-        Some(Self {
-            url: props.remove("distributionUrl")?,
+        if meta.len() > graph::MAX_FILE_BYTES as u64 {
+            return unusable("too large");
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            return unusable("unreadable");
+        };
+        let mut props = parse_properties(&bytes);
+        let Some(url) = props
+            .remove("distributionUrl")
+            .filter(|u| !u.trim().is_empty())
+        else {
+            return unusable("no distributionUrl");
+        };
+        Some(Ok(Self {
+            url: url.trim().to_string(),
             project_base: props
                 .get("distributionBase")
-                .is_some_and(|b| b == "PROJECT"),
+                .is_some_and(|b| b.trim() == "PROJECT"),
             path: props
                 .remove("distributionPath")
+                .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty())
                 .unwrap_or_else(|| "wrapper/dists".to_string()),
-        })
+        }))
     }
 
     /// The distribution's directory name: the URL's file name without
@@ -627,8 +787,16 @@ fn dist_init_dirs(dists: &Path, name: &str) -> Option<Vec<PathBuf>> {
 /// is not unpacked yet cannot be read: it is reported unreadable, so
 /// `mavenLocal()` stays undetermined.
 pub fn init_scripts_for_build(home: &GradleHome, build_root: &Path) -> InitScripts {
-    let Some(wrapper) = WrapperProps::of(build_root) else {
-        return read_init_scripts(home);
+    let wrapper = match WrapperProps::of(build_root) {
+        None => return read_init_scripts(home),
+        Some(Ok(wrapper)) => wrapper,
+        Some(Err(why)) => {
+            // A wrapper names a distribution this run cannot identify: its
+            // init.d may declare anything.
+            let mut out = read_init_scripts(home);
+            out.unreadable.push(format!("wrapper properties {why}"));
+            return out;
+        }
     };
     let mut out = InitScripts::default();
     for path in home.init_script_paths() {

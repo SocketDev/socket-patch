@@ -777,14 +777,16 @@ impl MavenCrawler {
         roots
     }
 
-    /// The caches to resolve PURLs against ([`Self::find_by_purls`]):
-    /// [`Self::get_jvm_cache_roots`] plus the Maven local repository even
-    /// when a Gradle build does not read it. Its bytes are still a valid
-    /// source for vendoring, and an agent apply that patches every copy
-    /// patches that one too. The Maven local repository comes first, so a
-    /// caller that takes the first copy keeps resolving where it always
-    /// did. Each path's layout is recovered by [`JvmCacheLayout::classify`]
-    /// in [`Self::find_by_purls`].
+    /// The caches the existing PURL join sites (apply, rollback, vendor,
+    /// VEX) resolve against ([`Self::find_by_purls`]): the Maven local
+    /// repository, even when a Gradle build does not read it (its bytes are
+    /// still a valid source for vendoring), and any other non-Gradle root
+    /// of [`Self::get_jvm_cache_roots`]. Gradle `files-2.1` roots are left
+    /// out: their packages are version directories that only a caller
+    /// expanding them through [`gradle_cache::installed_copies`] can join
+    /// file keys onto, so they come from [`Self::get_maven_copy_paths`]
+    /// instead. Each path's layout is recovered by
+    /// [`JvmCacheLayout::classify`] in [`Self::find_by_purls`].
     pub async fn get_maven_repo_paths(
         &self,
         options: &CrawlerOptions,
@@ -795,6 +797,32 @@ impl MavenCrawler {
 
     /// [`Self::get_maven_repo_paths`] under the caches `env` names.
     pub async fn get_maven_repo_paths_with(
+        &self,
+        options: &CrawlerOptions,
+        env: &JvmEnv,
+    ) -> Result<Vec<PathBuf>, std::io::Error> {
+        let mut paths = self.get_maven_copy_paths_with(options, env).await?;
+        paths.retain(|p| JvmCacheLayout::classify(p) != JvmCacheLayout::GradleModules2);
+        Ok(paths)
+    }
+
+    /// Every cache holding installed copies of a PURL, for callers that
+    /// expand Gradle version directories through
+    /// [`gradle_cache::installed_copies`]: [`Self::get_maven_repo_paths`]'s
+    /// roots plus the Gradle `files-2.1` caches of
+    /// [`Self::get_jvm_cache_roots`]. The Maven local repository comes
+    /// first, so a caller that takes the first copy keeps resolving where
+    /// it always did.
+    pub async fn get_maven_copy_paths(
+        &self,
+        options: &CrawlerOptions,
+    ) -> Result<Vec<PathBuf>, std::io::Error> {
+        self.get_maven_copy_paths_with(options, &JvmEnv::from_process())
+            .await
+    }
+
+    /// [`Self::get_maven_copy_paths`] under the caches `env` names.
+    pub async fn get_maven_copy_paths_with(
         &self,
         options: &CrawlerOptions,
         env: &JvmEnv,
