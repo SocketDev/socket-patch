@@ -491,12 +491,14 @@ fn rename_record_files(record: &PatchRecord, from: &str, to: &str) -> PatchRecor
     renamed.files = record
         .files
         .iter()
-        .map(
-            |(key, info)| match key.strip_prefix(from).filter(|rest| whole_component(rest)) {
-                Some(rest) => (format!("{to}{rest}"), info.clone()),
-                None => (key.clone(), info.clone()),
-            },
-        )
+        .map(|(key, info)| {
+            // An API key's `package/` prefix is kept around the renamed name.
+            let (prefix, name) = match key.strip_prefix("package/") {
+                Some(name) => ("package/", name),
+                None => ("", key.as_str()),
+            };
+            (format!("{prefix}{}", rename_leaf(name, from, to)), info.clone())
+        })
         .collect();
     renamed
 }

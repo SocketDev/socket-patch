@@ -32,7 +32,7 @@ use crate::commands::vex_sources::{
     self, Plan, Sources, RECORD_MISMATCH, RECORD_UNAVAILABLE, REDIRECT_UNWIRED, VENDOR_UNWIRED,
     WIRING_CONFLICT,
 };
-use crate::ecosystem_dispatch::{collapse_to_first, find_manifest_package_copies_reusing};
+use crate::ecosystem_dispatch::{find_manifest_package_copies_reusing, JvmScope};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning};
 use crate::ui::plural;
 
@@ -553,7 +553,11 @@ async fn generate_vex(
         let copies =
             find_manifest_package_copies_reusing(&purls, common, quiet, params.npm_prior.as_ref())
                 .await;
-        let package_paths = collapse_to_first(copies.clone());
+        // The record check: the first copy of each purl, except Maven,
+        // whose every consumed copy (`~/.m2` unless the Gradle build never
+        // reads it, each Gradle cache, the read-only cache) is re-hashed
+        // (`vex_copy_sets`).
+        let package_paths = vex_copy_sets(common, &copies).await;
         let go_patches = synthesize_go_patches(common, manifest, &plan.vendor_entries).await;
         // Hosted-basis purls are judged by the copies their build CONSUMES
         // (the Go replacement module, the Socket registry's cargo src dir,
@@ -610,6 +614,15 @@ async fn generate_vex(
             !excused
         });
         outcome.applied.extend(lockfile_attested);
+        withhold_unpatched_jvm_copies(
+            &mut outcome,
+            manifest,
+            &package_paths,
+            &plan.hosted,
+            common,
+            warnings,
+        )
+        .await;
         outcome
     };
 
@@ -794,6 +807,124 @@ async fn generate_vex(
 /// envelope — which silences stderr — carries it in `warnings[]` instead.
 /// Under `--silent` only the envelope copy survives (warnings are not
 /// errors).
+/// The installed copies VEX judges per purl: the first copy, except for a
+/// Maven purl, whose copies are every one a build consumes ([`JvmScope`]):
+/// `~/.m2` (unless this Gradle-only build never reads it — `mavenLocal()`
+/// declared or undetermined keeps it), each Gradle cache and the read-only
+/// cache, all re-hashed at VEX time.
+async fn vex_copy_sets(
+    common: &GlobalArgs,
+    copies: &HashMap<String, Vec<PathBuf>>,
+) -> HashMap<String, Vec<PathBuf>> {
+    let maven = copies.keys().any(|p| p.starts_with("pkg:maven/"));
+    let scope = if maven {
+        Some(JvmScope::of(common).await)
+    } else {
+        None
+    };
+    copies
+        .iter()
+        .map(|(purl, paths)| {
+            let paths = match scope.as_ref().filter(|_| purl.starts_with("pkg:maven/")) {
+                Some(scope) => {
+                    let split = scope.split(paths);
+                    split.consumed.into_iter().chain(split.read_only).collect()
+                }
+                None => paths.iter().take(1).cloned().collect(),
+            };
+            (purl.clone(), paths)
+        })
+        .collect()
+}
+
+/// Maven / Gradle: withhold the statement of every purl a build may still
+/// load unpatched, naming the copy (`vex_gradle_unpatched_copy`): a copy
+/// the record check found unpatched while others are patched, and — for
+/// an attested purl — any copy Gradle derived from the pristine jar outside
+/// `files-2.1` (`caches/transforms-*`, `jars-*`) or one that cannot be
+/// matched to the patched jar.
+async fn withhold_unpatched_jvm_copies(
+    outcome: &mut VerifyOutcome,
+    manifest: &PatchManifest,
+    copies: &HashMap<String, Vec<PathBuf>>,
+    hosted: &std::collections::BTreeMap<String, crate::commands::vex_sources::HostedWiring>,
+    common: &GlobalArgs,
+    warnings: &mut Vec<RunWarning>,
+) {
+    use socket_patch_core::crawlers::gradle_cache::is_gradle_version_dir;
+    use socket_patch_core::patch::jvm_jar::{self, RecordShape};
+
+    let mut unpatched = std::mem::take(&mut outcome.unpatched_copies);
+    unpatched.retain(|(purl, path)| {
+        is_gradle_version_dir(path) || copies.get(purl).is_some_and(|c| c.len() > 1)
+    });
+    let mut derived: Vec<(String, PathBuf)> = Vec::new();
+    for purl in &outcome.applied {
+        let (Some(record), Some(paths)) = (manifest.patches.get(purl), copies.get(purl)) else {
+            continue;
+        };
+        if !purl.starts_with("pkg:maven/") || hosted.contains_key(purl) {
+            continue;
+        }
+        let leaves: Vec<String> = match jvm_jar::classify(purl, &record.files) {
+            RecordShape::Members { jar_leaf } => vec![jar_leaf],
+            RecordShape::Leaf => record
+                .files
+                .keys()
+                .map(|k| k.trim_start_matches("package/").to_string())
+                .filter(|k| k.ends_with(".jar"))
+                .collect(),
+        };
+        for path in paths.iter().filter(|p| is_gradle_version_dir(p)) {
+            for leaf in &leaves {
+                for dir in jvm_jar::jar_copies(path, leaf) {
+                    let leaf = leaf.clone();
+                    let check = move || jvm_jar::derived_copies(&dir, &leaf);
+                    let Some(verdict) = tokio::task::spawn_blocking(check).await.ok().flatten()
+                    else {
+                        continue;
+                    };
+                    derived.extend(
+                        verdict
+                            .stale
+                            .into_iter()
+                            .chain(verdict.unverified)
+                            .map(|p| (purl.clone(), p)),
+                    );
+                    if verdict.incomplete {
+                        derived.push((purl.clone(), path.join("(derived-cache walk incomplete)")));
+                    }
+                }
+            }
+        }
+    }
+    let withheld: std::collections::BTreeSet<String> =
+        derived.iter().map(|(purl, _)| purl.clone()).collect();
+    outcome.applied.retain(|purl| !withheld.contains(purl));
+    outcome
+        .failed
+        .extend(withheld.iter().map(|purl| FailedPatch {
+            purl: purl.clone(),
+            reason: "gradle_unpatched_copy".to_string(),
+        }));
+    unpatched.extend(derived);
+    unpatched.sort();
+    unpatched.dedup();
+    for (purl, path) in unpatched {
+        note_warning(
+            warnings,
+            common,
+            "vex_gradle_unpatched_copy",
+            format!(
+                "{purl}: {} is a copy a build may still load and it does not carry the patch; \
+                 no statement is emitted until every copy does (run `socket-patch apply`, or \
+                 `gradle --stop` and clear Gradle's derived caches).",
+                path.display()
+            ),
+        );
+    }
+}
+
 fn note_warning(warnings: &mut Vec<RunWarning>, common: &GlobalArgs, code: &str, detail: String) {
     if !common.silent && !common.json {
         eprintln!("Warning: {detail}");
