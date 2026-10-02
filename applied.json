@@ -1,4 +1,8 @@
 {
  "done": [],
- "failed": {}
+ "failed": {
+  "00000000T000000Z-bridge-test.json": [
+   "#1: #575 is not in owned.json; only owned discussion bodies may be rewritten"
+  ]
+ }
 }
