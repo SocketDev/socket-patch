@@ -39,7 +39,7 @@ _Last updated 2026-10-02T16:20Z · main @ 1169ae6_
 | C34 | 3 | Decide: the command model. A read-only `scan`, plus `fix`, `undo`, `sync` and `check`, with mode inferred from project state. This folds `remove`, `rollback` and `vendor --revert`, and per-command flags replace the 27 globals. | §4; 2.9; R6/R8 | | to verify |
 | C35 | 3 | Decide: drop the deprecated spellings and embedded `--vex`, and give `SOCKET_FORCE` per-command names. | R9; R10 | | to verify |
 | C36 | 3 | Decide: the futures of agent mode and of the self-update binary swap. | §6 Q2; 7.5 | | to verify |
-| C37 | 2 | Patch blob/diff downloads (`fetch_binary`) buffer the whole body with no size cap; vendor and self-update use the shared `read_capped`. | new finding | #571 | filed #571 |
+| C37 | 2 | Patch blob/diff downloads (`fetch_binary`) buffer the whole body with no size cap; vendor and self-update use the shared `read_capped`. | new finding | #571 | in PR #607 |
 
 **Handed off** (to the CI janitor): report-only coverage and LTO `docker-base` off PRs; e2e from 148 to ~50 legs; a reusable compat workflow; no per-leg compiles; dead CI path filters (review 8.2, 8.5 B/C/E).
 
