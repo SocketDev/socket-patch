@@ -2481,3 +2481,61 @@ fn vex_attests_a_vlt_vendored_dir_and_omits_a_tampered_one() {
         "a tampered dir is never attested"
     );
 }
+
+/// REGRESSION (#493): the vendored out-of-sync disclosure for a yarn
+/// classic project installed with `.yarnrc` `--modules-folder deps`. The
+/// crawler never looked in `deps/`, so the drifted live tree went
+/// unreported (the attestation itself stands, from the committed
+/// artifact, as in [`vendored_live_tree_out_of_sync_warns_but_attests`]).
+#[test]
+fn vendored_modules_folder_tree_out_of_sync_warns() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let cwd = tmp.path();
+    let purl = "pkg:npm/lodash@4.17.21";
+    let uuid = "0a0a0a0a-1111-4111-8111-0a0a0a0a0a0b";
+
+    let patched = b"patched npm bytes\n";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    let rel = format!(".socket/vendor/npm/{uuid}/lodash-4.17.21.tgz");
+    let sha256 = sha256_hex(&write_member_tgz(
+        &cwd.join(&rel),
+        "package/index.js",
+        patched,
+    ));
+    let record = make_record(
+        uuid,
+        "package/index.js",
+        &after_hash,
+        "GHSA-sync-bbbb",
+        &["CVE-2026-11"],
+    );
+    let wiring = write_matrix_wiring(cwd, "npm", uuid, &rel);
+    let mut state = VendorState::new();
+    state.entries.insert(
+        purl.to_string(),
+        detached_matrix_entry("npm", purl, uuid, &rel, sha256, record, wiring),
+    );
+    std::fs::write(
+        cwd.join(".socket/vendor/state.json"),
+        serde_json::to_string_pretty(&state).expect("serialize vendor state"),
+    )
+    .expect("write vendor state.json");
+
+    std::fs::write(cwd.join(".yarnrc"), "--modules-folder deps\n").unwrap();
+    let installed = cwd.join("deps/lodash");
+    std::fs::create_dir_all(&installed).unwrap();
+    std::fs::write(
+        installed.join("package.json"),
+        r#"{"name":"lodash","version":"4.17.21"}"#,
+    )
+    .unwrap();
+    std::fs::write(installed.join("index.js"), b"original unpatched bytes\n").unwrap();
+
+    let (code, env) = vex_json(cwd, &[]);
+    assert_eq!(code, Some(0), "{env}");
+    let w = env["warnings"]
+        .as_array()
+        .and_then(|ws| ws.iter().find(|w| w["code"] == "vendored_tree_out_of_sync"))
+        .unwrap_or_else(|| panic!("expected a vendored_tree_out_of_sync warning: {env}"));
+    assert!(w["detail"].as_str().unwrap().contains(purl), "{w}");
+}

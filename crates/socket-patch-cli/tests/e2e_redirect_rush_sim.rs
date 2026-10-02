@@ -460,6 +460,56 @@ async fn rush_hosted_scan_then_simulated_pnpm_install_lands_patched_bytes() {
         String::from_utf8_lossy(&installed[..installed.len().min(120)])
     );
     assert_rush_manifestless_vex(root, &server.uri(), &patched, rush_common_lock().as_bytes());
+    assert_rush_stale_store_not_attested(root, &server.uri(), &patched, orig);
+}
+
+/// REGRESSION (#518): the copy rush installs lives under
+/// `common/temp/node_modules`, which the crawler used to prune (`temp`), so
+/// an UNPATCHED installed copy read as "nothing installed" and the pinned
+/// hosted lock attested it anyway. Revert the real pnpm-installed file to
+/// the upstream bytes (a stale or tampered install): installed evidence
+/// wins, and the patch is omitted with `hash_mismatch`.
+fn assert_rush_stale_store_not_attested(
+    root: &Path,
+    patch_server: &str,
+    patched: &[u8],
+    upstream: &[u8],
+) {
+    let installed = std::fs::canonicalize(
+        root.join("common/temp/node_modules")
+            .join(DEP)
+            .join("index.js"),
+    )
+    .unwrap();
+    // pnpm hardlinks from its store: replace the file rather than writing
+    // through the link.
+    std::fs::remove_file(&installed).unwrap();
+    std::fs::write(&installed, upstream).unwrap();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let api = PatchApi::start(vec![(
+                UUID.to_string(),
+                patch_view(
+                    UUID,
+                    PURL,
+                    &[("package/index.js", &git_sha256(patched))],
+                    VULNS,
+                ),
+            )]);
+            let out = run_vex(
+                &binary(),
+                root,
+                &VexRun {
+                    patch_server_url: Some(patch_server.to_string()),
+                    ..VexRun::online(&api)
+                },
+            );
+            assert_eq!(out.code, Some(1), "rush, unpatched store copy: {out}");
+            assert_not_attested(&out.envelope, PURL, "hash_mismatch");
+        })
+        .join()
+        .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    });
 }
 
 /// Tamper twin: the hosted route serves DIFFERENT bytes than the pinned
