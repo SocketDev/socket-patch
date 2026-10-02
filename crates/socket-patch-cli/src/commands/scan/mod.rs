@@ -4344,6 +4344,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_direction_provable_for_berry_tarball_locator() {
+        // Today's berry pin is the plain tarball-URL locator (#404).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_vendor_ledger_wired(root, &["pkg:npm/minimist@1.2.2"]).await;
+        tokio::fs::write(
+            root.join("yarn.lock"),
+            format!(
+                "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                 \"minimist@npm:1.2.2\":\n  version: 1.2.2\n  \
+                 resolution: \"minimist@https://patch.socket.dev/patch/npm/{TAKEOVER_TOKEN}/{TAKEOVER_UUID}/minimist-1.2.2.tgz\"\n"
+            ),
+        )
+        .await
+        .unwrap();
+
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
+        assert_eq!(
+            takeover.redirect,
+            vec!["pkg:npm/minimist@1.2.2".to_string()],
+            "a berry tarball locator must prove hosted is live"
+        );
+        assert!(takeover.vendored.is_empty(), "{takeover:?}");
+    }
+
+    #[tokio::test]
     async fn vendored_path_uuid_is_not_a_hosted_pin() {
         // The vendored wiring embeds the SAME patch uuid in its
         // `.socket/vendor/<eco>/<uuid>/` path. That occurrence must NOT read

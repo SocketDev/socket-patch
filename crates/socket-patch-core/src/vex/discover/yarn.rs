@@ -44,15 +44,17 @@
 //! `version:` line. `workspace:`, `patch:`, `portal:`, `link:`, `exec:`,
 //! `git` and plain registry locators are not ours and are skipped silently.
 //!
-//! * **Hosted** (`patch::redirect::rewrite_yarn_berry`):
-//!   `resolution: "name@npm:X::__archiveUrl=<encodeURIComponent(url)>"` —
-//!   the `__archiveUrl` binding value (bindings are `&`-joined after `::`) is
-//!   handed to [`DiscoverCtx::hosted_uuid`], which decodes a wholly
-//!   percent-encoded url; a custom-registry `__archiveUrl` is not Socket's and
-//!   is skipped. The locator's `npm:` version must equal `version:` (the
-//!   rewriter writes both from the same coordinate). Hand-edit tolerance: a
-//!   direct url locator `name@https://patch.socket.dev/…` (what a
-//!   url-range dependency locks to) is accepted too. Pin: `checksum:`
+//! * **Hosted** (`patch::redirect::rewrite_yarn_berry`): the direct
+//!   tarball-URL locator `resolution: "name@https://patch.socket.dev/…"`,
+//!   whose reference is handed to [`DiscoverCtx::hosted_uuid`]. Locks pinned
+//!   by releases up to 5.0 spell it
+//!   `resolution: "name@npm:X::__archiveUrl=<encodeURIComponent(url)>"` (an
+//!   `npm:` locator, whose fetcher sent registry auth to the patch host —
+//!   #404); that `__archiveUrl` binding value (bindings are `&`-joined after
+//!   `::`) is still recognized, decoded by the same helper; a
+//!   custom-registry `__archiveUrl` is not Socket's and is skipped. That
+//!   locator's `npm:` version must equal `version:` (the rewriter wrote both
+//!   from the same coordinate). Pin: `checksum:`
 //!   (`10c0/<hex>` — the cache-zip checksum, [`LockIntegrity::BerryChecksum`];
 //!   yarn 4.0.x spells it as bare hex under `cacheKey: 10c0`, read as the
 //!   same pin); the rewriter always writes it, so `integrity_required = true`.
@@ -216,12 +218,99 @@ struct BerryVendored {
     key: String,
 }
 
+/// A berry hosted entry keyed by its own tarball descriptor (the
+/// `resolutions` pin, #404), awaiting its `package.json` confirmation.
+struct BerryHostedKeyed {
+    name: String,
+    version: String,
+    url: String,
+    wiring: Wired,
+    integrity: Option<LockIntegrity>,
+    key: String,
+}
+
 async fn extract_berry(ctx: &DiscoverCtx<'_>, lock: BerryLock, out: &mut Discovery) {
     let mut vendored: Vec<BerryVendored> = Vec::new();
+    let mut hosted_keyed: Vec<BerryHostedKeyed> = Vec::new();
     for entry in lock.entries.iter().filter(|e| e.live) {
-        berry_block(ctx, entry, lock.cache_key.as_deref(), &mut vendored, out);
+        berry_block(
+            ctx,
+            entry,
+            lock.cache_key.as_deref(),
+            &mut vendored,
+            &mut hosted_keyed,
+            out,
+        );
     }
+    confirm_berry_hosted_keyed(ctx, hosted_keyed, out).await;
     confirm_berry_vendored(ctx, vendored, out).await;
+}
+
+/// Emit each berry hosted entry keyed by its tarball descriptor only when
+/// the root `package.json` `resolutions` routes a descriptor of the package
+/// to that same URL: yarn reaches the entry through that selector alone, so
+/// without it the entry is orphaned (an `--immutable` install fails, a
+/// plain install re-resolves the registry package) and is diagnosed
+/// instead.
+async fn confirm_berry_hosted_keyed(
+    ctx: &DiscoverCtx<'_>,
+    hosted: Vec<BerryHostedKeyed>,
+    out: &mut Discovery,
+) {
+    if hosted.is_empty() {
+        return;
+    }
+    let routes: Vec<(String, String)> = match ctx.read_bytes(PACKAGE_JSON, out).await {
+        None => Vec::new(),
+        Some(bytes) => {
+            let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+            match parse_json(PACKAGE_JSON, bytes) {
+                Ok(doc) => doc
+                    .get("resolutions")
+                    .and_then(Value::as_object)
+                    .map(|res| {
+                        res.iter()
+                            .filter_map(|(selector, value)| {
+                                let target = resolution_selector_target(selector)?;
+                                Some((target.to_string(), value.as_str()?.to_string()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                Err(detail) => {
+                    out.diag(DIAG_LOCKFILE_UNPARSEABLE, PACKAGE_JSON, detail);
+                    Vec::new()
+                }
+            }
+        }
+    };
+    for entry in hosted {
+        if routes
+            .iter()
+            .any(|(target, url)| *target == entry.name && *url == entry.url)
+        {
+            emit(
+                &entry.name,
+                &entry.version,
+                &entry.url,
+                entry.wiring,
+                entry.integrity,
+                &entry.key,
+                out,
+            );
+        } else {
+            out.diag(
+                DIAG_REF_INVALID,
+                YARN_LOCK,
+                format!(
+                    "{YARN_LOCK}: hosted entry `{}` is orphaned: no {PACKAGE_JSON} \
+                     `resolutions` entry routes a {} descriptor to {}, so yarn does not \
+                     install it",
+                    entry.key, entry.name, entry.url
+                ),
+            );
+        }
+    }
 }
 
 fn berry_block(
@@ -229,6 +318,7 @@ fn berry_block(
     entry: &YarnEntry,
     cache_key: Option<&str>,
     vendored: &mut Vec<BerryVendored>,
+    hosted_keyed: &mut Vec<BerryHostedKeyed>,
     out: &mut Discovery,
 ) {
     let block = &entry.block;
@@ -308,6 +398,18 @@ fn berry_block(
                 name: name.to_string(),
                 purl,
                 vref,
+                integrity,
+                key: block.key.clone(),
+            });
+        }
+        // Keyed by its own tarball descriptor: the `resolutions` pin, live
+        // only through its package.json selector.
+        hosted if entry.patterns.len() == 1 && entry.patterns[0] == format!("{name}@{spec}") => {
+            hosted_keyed.push(BerryHostedKeyed {
+                name: name.to_string(),
+                version: version.to_string(),
+                url: spec.to_string(),
+                wiring: hosted,
                 integrity,
                 key: block.key.clone(),
             });
@@ -1114,27 +1216,54 @@ mod tests {
         );
     }
 
-    /// Hand-edit tolerance: a direct url locator on the patch server (what a
-    /// url-range dependency locks to) and CRLF line endings (a
-    /// `core.autocrlf` checkout of an LF lock).
+    /// The `resolutions` pin (#404): an entry keyed by its own tarball
+    /// descriptor on the patch server, with CRLF line endings (a
+    /// `core.autocrlf` checkout of an LF lock), attests only while the root
+    /// `package.json` routes a descriptor of the package to that URL — yarn
+    /// reaches the entry through that selector alone. Without it (no
+    /// manifest, no selector, a selector to another URL) the entry is an
+    /// orphan: diagnosed, never attested.
     #[tokio::test]
     async fn berry_hosted_direct_url_locator_and_crlf() {
         let url = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let lock = berry(&[berry_block(
+            &format!("left-pad@{url}"),
+            "1.3.0",
+            &format!("left-pad@{url}"),
+            Some(CHECKSUM),
+        )])
+        .replace('\n', "\r\n");
         let p = Project::new();
+        p.write("yarn.lock", &lock);
         p.write(
-            "yarn.lock",
-            berry(&[berry_block(
-                &format!("left-pad@{url}"),
-                "1.3.0",
-                &format!("left-pad@{url}"),
-                Some(CHECKSUM),
-            )])
-            .replace('\n', "\r\n"),
+            "package.json",
+            serde_json::json!({"resolutions": {"left-pad@npm:^1.3.0": url}}).to_string(),
         );
         assert_refs(
             &run(&p).await,
             &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
         );
+        let other = hosted_url("npm", "left-pad", "1.3.0", UUID_B, "left-pad-1.3.0.tgz");
+        for pkg in [
+            None,
+            Some(serde_json::json!({"name": "app"}).to_string()),
+            Some(serde_json::json!({"resolutions": {"left-pad@npm:^1.3.0": other}}).to_string()),
+        ] {
+            let p = Project::new();
+            p.write("yarn.lock", &lock);
+            if let Some(pkg) = &pkg {
+                p.write("package.json", pkg);
+            }
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{pkg:?}: {:#?}", out.refs);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_INVALID && d.detail.contains("orphaned")),
+                "{pkg:?}: {:#?}",
+                out.diagnostics
+            );
+        }
     }
 
     /// Negative berry shapes: an `__archiveUrl` on a foreign host carrying

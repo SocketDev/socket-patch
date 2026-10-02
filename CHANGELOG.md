@@ -169,6 +169,15 @@ limits, and required install commands.
   fetches honor `GOPROXY` and private-module settings.
 - Yarn Berry preserves supported line endings and checksum spellings. Mode
   preflights, including Bun's, run before discarding existing protection.
+- Yarn Berry hosted references no longer send npm registry credentials to the
+  patch server. The old `npm:` locator made yarn attach `npmAuthToken` /
+  `YARN_NPM_AUTH_TOKEN` to scoped packages (and to every package under
+  `npmAlwaysAuth`). Hosted mode now pins the way yarn does for a root
+  `resolutions` entry: `package.json` routes the locked descriptor to the
+  hosted tarball and the lock entry is keyed by it, which also passes yarn's
+  hardened mode (on by default for public pull request CI). A user-authored
+  `resolutions` entry for the package is never overwritten. Locks pinned by
+  earlier releases are re-pinned on the next hosted `scan`.
 - Composer hosted references remove upstream source fallbacks and mirrors;
   RubyGems hosted locks preserve source order; NuGet edits use the active config
   and survive `<clear />` entries.

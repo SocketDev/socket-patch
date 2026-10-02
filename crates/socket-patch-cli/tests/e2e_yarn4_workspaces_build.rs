@@ -17,8 +17,8 @@
 //! `corepack yarn@4.12.0` (network for fixture setup only) and prove:
 //!
 //!   * hosted — `scan --mode hosted` from the root rewires the member's
-//!     `left-pad@npm:1.3.0` lock entry to the hosted `__archiveUrl` + `10c0`
-//!     checksum (bootstrap-resolution trick, see the redirect sibling)
+//!     `left-pad@npm:1.3.0` lock entry to the hosted tarball-URL locator +
+//!     `10c0` checksum (bootstrap-resolution trick, see the redirect sibling)
 //!     without touching either package.json; a fresh checkout of only the
 //!     committable files installs the patched bytes offline-from-registry,
 //!     and the member resolves them through `yarn node`.
@@ -552,10 +552,29 @@ async fn yarn4_workspaces_hosted_redirect_rewires_member_dep_from_root_scan() {
     // The single root lock carries the member dep's hosted pin; the
     // workspace entries stay workspace-resolved and no package.json moved.
     let lock = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
-    let encoded = socket_patch_core::utils::uri::encode_uri_component(&hosted_url);
     assert!(
-        lock.contains("::__archiveUrl=") && lock.contains(&encoded),
-        "yarn.lock must carry the encoded __archiveUrl; got:\n{lock}"
+        lock.contains(&format!("\n  resolution: \"{DEP}@{hosted_url}\"")),
+        "yarn.lock must pin the hosted tarball locator; got:\n{lock}"
+    );
+    // #404 option C: the entry is keyed by the tarball descriptor, and the
+    // root package.json routes the locked descriptor there.
+    assert!(
+        lock.lines()
+            .any(|l| l.trim_end_matches('\r') == format!("\"{DEP}@{hosted_url}\":")),
+        "yarn.lock entry must be keyed by the tarball descriptor; got:\n{lock}"
+    );
+    let root_pkg = std::fs::read_to_string(proj.join("package.json")).unwrap();
+    let root_pkg: serde_json::Value = serde_json::from_str(&root_pkg).unwrap();
+    assert!(
+        root_pkg["resolutions"]
+            .as_object()
+            .is_some_and(|r| r.iter().any(|(sel, v)| sel.starts_with(&format!("{DEP}@npm:"))
+                && v.as_str() == Some(hosted_url.as_str()))),
+        "package.json must route {DEP} to the hosted tarball: {root_pkg}"
+    );
+    assert!(
+        !lock.contains("__archiveUrl"),
+        "the hosted pin must not be an npm: locator (#404); got:\n{lock}"
     );
     let checksum_line = yarn_berry_common::expected_checksum_line(
         &String::from_utf8_lossy(&registry_lock),
@@ -570,11 +589,15 @@ async fn yarn4_workspaces_hosted_redirect_rewires_member_dep_from_root_scan() {
         lock.contains("\"app@workspace:packages/app\""),
         "the workspace member entry must stay workspace-resolved:\n{lock}"
     );
-    assert_eq!(
-        std::fs::read(proj.join("package.json")).unwrap(),
-        root_pkg_before,
-        "hosted redirect must not touch the root package.json"
-    );
+    // #404 option C: the root package.json gains only the `resolutions` pin
+    // (it is the one yarn reads resolutions from); the member is untouched.
+    {
+        let mut after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(proj.join("package.json")).unwrap()).unwrap();
+        let before: serde_json::Value = serde_json::from_slice(&root_pkg_before).unwrap();
+        after.as_object_mut().unwrap().shift_remove("resolutions");
+        assert_eq!(after, before, "the hosted pin only adds `resolutions` to the root package.json");
+    }
     assert_eq!(
         std::fs::read(proj.join("packages/app/package.json")).unwrap(),
         member_pkg_before,
@@ -607,7 +630,7 @@ async fn yarn4_workspaces_hosted_redirect_rewires_member_dep_from_root_scan() {
     eprintln!("FRESH INSTALL + MEMBER RESOLUTION OK");
 
     // MANIFEST-LESS VEX over the hosted wiring (see `yarn_berry_common`).
-    let registry_state = [("yarn.lock", registry_lock)];
+    let registry_state = [("yarn.lock", registry_lock), ("package.json", root_pkg_before.clone())];
     let yarn =
         |cwd: &Path, args: &[&str], env: &[(&str, &str)]| corepack(cwd, yarn_berry(), args, env);
     let api_url = server.uri();

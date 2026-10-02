@@ -14,7 +14,7 @@
 //! (`e2e_redirect_yarn_berry_build.rs` / `e2e_vendor_yarn_berry_build.rs`):
 //!
 //!   * hosted — `scan --mode hosted` rewires `yarn.lock` to the hosted
-//!     `__archiveUrl` + `10c0` checksum (bootstrap-resolution trick, see the
+//!     tarball-URL locator + `10c0` checksum (bootstrap-resolution trick, see the
 //!     redirect sibling); a fresh checkout of only the committable files
 //!     passes `yarn install --immutable --check-cache` offline-from-registry
 //!     and serves the patched bytes THROUGH the `.store` symlink layout.
@@ -557,10 +557,29 @@ async fn yarn4_pnpm_linker_hosted_redirect_fresh_checkout_installs_patched_bytes
     );
 
     let lock = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
-    let encoded = socket_patch_core::utils::uri::encode_uri_component(&hosted_url);
     assert!(
-        lock.contains("::__archiveUrl=") && lock.contains(&encoded),
-        "yarn.lock must carry the encoded __archiveUrl; got:\n{lock}"
+        lock.contains(&format!("\n  resolution: \"{DEP}@{hosted_url}\"")),
+        "yarn.lock must pin the hosted tarball locator; got:\n{lock}"
+    );
+    // #404 option C: the entry is keyed by the tarball descriptor, and the
+    // root package.json routes the locked descriptor there.
+    assert!(
+        lock.lines()
+            .any(|l| l.trim_end_matches('\r') == format!("\"{DEP}@{hosted_url}\":")),
+        "yarn.lock entry must be keyed by the tarball descriptor; got:\n{lock}"
+    );
+    let root_pkg = std::fs::read_to_string(proj.join("package.json")).unwrap();
+    let root_pkg: serde_json::Value = serde_json::from_str(&root_pkg).unwrap();
+    assert!(
+        root_pkg["resolutions"]
+            .as_object()
+            .is_some_and(|r| r.iter().any(|(sel, v)| sel.starts_with(&format!("{DEP}@npm:"))
+                && v.as_str() == Some(hosted_url.as_str()))),
+        "package.json must route {DEP} to the hosted tarball: {root_pkg}"
+    );
+    assert!(
+        !lock.contains("__archiveUrl"),
+        "the hosted pin must not be an npm: locator (#404); got:\n{lock}"
     );
     let checksum_line = yarn_berry_common::expected_checksum_line(
         &String::from_utf8_lossy(&registry_lock),
@@ -571,11 +590,14 @@ async fn yarn4_pnpm_linker_hosted_redirect_fresh_checkout_installs_patched_bytes
         "yarn.lock must carry the cache checksum in yarn's own spelling \
          ({checksum_line:?}); got:\n{lock}"
     );
-    assert_eq!(
-        std::fs::read(proj.join("package.json")).unwrap(),
-        pkg_before,
-        "hosted redirect must not touch package.json"
-    );
+    // #404 option C: the only package.json change is the `resolutions` pin.
+    {
+        let mut after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(proj.join("package.json")).unwrap()).unwrap();
+        let before: serde_json::Value = serde_json::from_slice(&pkg_before).unwrap();
+        after.as_object_mut().unwrap().shift_remove("resolutions");
+        assert_eq!(after, before, "the hosted pin only adds `resolutions` to package.json");
+    }
     eprintln!("HOSTED REWIRE OK");
 
     // FRESH-CHECKOUT PROOF: committable files only, offline from the
@@ -603,7 +625,7 @@ async fn yarn4_pnpm_linker_hosted_redirect_fresh_checkout_installs_patched_bytes
     eprintln!("FRESH INSTALL + YARN NODE RESOLUTION OK");
 
     // MANIFEST-LESS VEX over the hosted wiring (see `yarn_berry_common`).
-    let registry_state = [("yarn.lock", registry_lock)];
+    let registry_state = [("yarn.lock", registry_lock), ("package.json", pkg_before.clone())];
     let yarn =
         |cwd: &Path, args: &[&str], env: &[(&str, &str)]| corepack(cwd, yarn_berry(), args, env);
     let api_url = server.uri();
