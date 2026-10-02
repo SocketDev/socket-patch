@@ -458,21 +458,55 @@ async fn pdm_project_site_packages(
     if !pdm_drives_project(cwd).await {
         return None;
     }
-    // `PDM_PYTHON` outranks the saved interpreter.
+    // `PDM_PYTHON` outranks the saved interpreter. The first of them that
+    // is an environment (a venv, or a conda env PDM reuses) is where PDM
+    // installs; a base interpreter (CI often points `PDM_PYTHON` at the
+    // system Python) only picks the Python a venv is made from.
     let overridden = var("PDM_PYTHON")
         .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
-    let ignore_saved = pdm_env_flag(var, "PDM_IGNORE_SAVED_PYTHON");
-    let interpreter = match overridden {
-        Some(python) => Some(cwd.join(python)),
-        None if ignore_saved => None,
-        None => pdm_saved_interpreter(cwd).await,
+        .filter(|v| !v.is_empty())
+        .map(|python| cwd.join(python));
+    let saved = if pdm_env_flag(var, "PDM_IGNORE_SAVED_PYTHON") {
+        None
+    } else {
+        pdm_saved_interpreter(cwd).await
     };
-    let found = match venv_root_of_interpreter(&interpreter?) {
-        Some(root) => find_site_packages_under(&root, "site-packages").await,
-        None => pdm_pep582_dirs(cwd).await,
-    };
+    let interpreters: Vec<PathBuf> = overridden.into_iter().chain(saved).collect();
+    if let Some(root) = interpreters.iter().find_map(|i| env_root_of_interpreter(i)) {
+        let found = find_site_packages_under(&root, "site-packages").await;
+        return (!found.is_empty()).then_some(found);
+    }
+    // A base interpreter means PEP 582 only with `python.use_venv` off;
+    // with it on (PDM 2.x's default) PDM uses a venv the generic probes
+    // find, with `__pypackages__` as their last resort.
+    if interpreters.is_empty() || pdm_uses_venv(cwd, var).await {
+        return None;
+    }
+    let found = pdm_pep582_dirs(cwd).await;
     (!found.is_empty()).then_some(found)
+}
+
+/// PDM's `python.use_venv` for `cwd`: `PDM_USE_VENV`, else `[python]
+/// use_venv` in the project's `pdm.toml` (PDM 2.x) or legacy `.pdm.toml`.
+/// Unset, it is on, except for a legacy PDM 1.x project (a `.pdm.toml` and
+/// no `.pdm-python`), where it defaulted to off.
+async fn pdm_uses_venv(cwd: &Path, var: &impl Fn(&str) -> Option<String>) -> bool {
+    if var("PDM_USE_VENV").is_some() {
+        return pdm_env_flag(var, "PDM_USE_VENV");
+    }
+    for config in ["pdm.toml", ".pdm.toml"] {
+        let Ok(text) = read_regular_to_string(&cwd.join(config)).await else {
+            continue;
+        };
+        let setting = text
+            .parse::<toml_edit::DocumentMut>()
+            .ok()
+            .and_then(|doc| doc.get("python")?.get("use_venv")?.as_bool());
+        if let Some(on) = setting {
+            return on;
+        }
+    }
+    !cwd.join(".pdm.toml").is_file() || cwd.join(".pdm-python").is_file()
 }
 
 /// A boolean PDM environment setting, parsed like PDM's `ensure_boolean`:
@@ -536,14 +570,22 @@ async fn is_pdm_project(cwd: &Path) -> bool {
         .is_some()
 }
 
-/// The venv a Python interpreter path belongs to: `<root>/bin/python…` or
-/// `<root>\Scripts\python.exe` with a `<root>/pyvenv.cfg`. The path is not
-/// resolved, since a venv's interpreter is a symlink to its base Python.
-fn venv_root_of_interpreter(python: &Path) -> Option<PathBuf> {
-    let root = python.parent()?.parent()?;
-    root.join("pyvenv.cfg")
-        .is_file()
-        .then(|| root.to_path_buf())
+/// The environment a Python interpreter path belongs to: a venv
+/// (`<root>/bin/python…` or `<root>\Scripts\python.exe` with a
+/// `<root>/pyvenv.cfg`), or a conda env (`conda-meta/` at `<root>`, whose
+/// interpreter is `<root>/bin/python…` or `<root>\python.exe`). The path is
+/// not resolved, since a venv's interpreter is a symlink to its base Python.
+fn env_root_of_interpreter(python: &Path) -> Option<PathBuf> {
+    let parent = python.parent()?;
+    let grandparent = parent.parent();
+    if let Some(root) = grandparent.filter(|root| root.join("pyvenv.cfg").is_file()) {
+        return Some(root.to_path_buf());
+    }
+    grandparent
+        .into_iter()
+        .chain(std::iter::once(parent))
+        .find(|root| root.join("conda-meta").is_dir())
+        .map(Path::to_path_buf)
 }
 
 /// uv's `UV_PROJECT_ENVIRONMENT` for a uv project at `cwd` (see
@@ -2571,6 +2613,30 @@ mod tests {
             );
         }
 
+        // A base `PDM_PYTHON` (CI's system Python) does not displace the
+        // saved venv PDM installs into.
+        let system = tmp.path().join("usr").join("bin").join("python3");
+        let base_override = env_of(&[("PDM_PYTHON", system.to_string_lossy().into_owned())]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &base_override).await,
+            vec![pdm_site.clone()]
+        );
+
+        // A conda env PDM reuses (`conda-meta/`, no pyvenv.cfg) is an env.
+        let conda = tmp.path().join("conda").join("envs").join("app");
+        let conda_site = fake_venv(conda.parent().unwrap(), "app");
+        std::fs::create_dir_all(conda.join("conda-meta")).unwrap();
+        let conda_python = if cfg!(windows) {
+            conda.join("python.exe")
+        } else {
+            conda.join("bin").join("python")
+        };
+        let conda_env = env_of(&[("PDM_PYTHON", conda_python.to_string_lossy().into_owned())]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &conda_env).await,
+            vec![conda_site]
+        );
+
         // `PDM_PYTHON` outranks `.pdm-python`.
         let (ci_python, ci_site) = fake_venv_root(&tmp.path().join("ci-venv"));
         let pinned = env_of(&[("PDM_PYTHON", ci_python.to_string_lossy().into_owned())]);
@@ -2634,15 +2700,42 @@ mod tests {
         )
         .unwrap();
         std::fs::write(project.join("pdm.lock"), "[metadata]\n").unwrap();
-        // A base interpreter: no pyvenv.cfg next to it.
+        // A base interpreter (no pyvenv.cfg next to it) with
+        // `pdm config -l python.use_venv false`, as in #528.
         let base = tmp.path().join("usr").join("bin").join("python3.11");
         std::fs::create_dir_all(base.parent().unwrap()).unwrap();
         std::fs::write(project.join(".pdm-python"), base.display().to_string()).unwrap();
+        std::fs::write(project.join("pdm.toml"), "[python]\nuse_venv = false\n").unwrap();
         let no_env = env_of(&[]);
         assert_eq!(
             find_local_venv_site_packages_with(&project, &no_env).await,
             vec![lib.clone()]
         );
+        // ...even beside a `./.venv` PDM does not use.
+        let unused = fake_venv(&project, ".venv");
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &no_env).await,
+            vec![lib.clone()]
+        );
+        // With `use_venv` on (PDM 2.x's default, or PDM_USE_VENV), a base
+        // interpreter only seeds the venv: `./.venv` is the env.
+        std::fs::remove_file(project.join("pdm.toml")).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &no_env).await,
+            vec![unused.clone()]
+        );
+        let env_off = env_of(&[("PDM_USE_VENV", "0".to_string())]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &env_off).await,
+            vec![lib.clone()]
+        );
+        std::fs::write(project.join("pdm.toml"), "[python]\nuse_venv = false\n").unwrap();
+        let env_on = env_of(&[("PDM_USE_VENV", "1".to_string())]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &env_on).await,
+            vec![unused]
+        );
+        std::fs::remove_dir_all(project.join(".venv")).unwrap();
 
         // PDM 1.x: no saved interpreter, still a PDM project.
         std::fs::remove_file(project.join(".pdm-python")).unwrap();

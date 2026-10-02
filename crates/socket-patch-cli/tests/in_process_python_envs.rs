@@ -704,9 +704,11 @@ async fn pdm_pep582_pypackages_is_scanned_not_a_stray_dot_venv() {
     let lib = project.join("__pypackages__").join("3.11").join("lib");
     std::fs::create_dir_all(&lib).unwrap();
     write_dist_info(&lib, "pep582_pkg", "1.0.0");
-    // The saved interpreter is a base Python, not a venv.
+    // The saved interpreter is a base Python, not a venv, and the project
+    // turned PDM's venvs off (`pdm config -l python.use_venv false`).
     let base = tmp.path().join("usr").join("bin").join("python3.11");
     std::fs::write(project.join(".pdm-python"), base.display().to_string()).unwrap();
+    std::fs::write(project.join("pdm.toml"), "[python]\nuse_venv = false\n").unwrap();
     assert_scan_finds(&project, "pkg:pypi/pep582-pkg@1.0.0").await;
 }
 

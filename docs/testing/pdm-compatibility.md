@@ -72,12 +72,16 @@ Measured details:
 - **The installed env is the one PDM records.** The crawler follows the
   interpreter in `PDM_PYTHON`, else `.pdm-python` (`[python] path` in
   `.pdm.toml` on older PDM), ahead of an activated venv or a stray `./.venv`.
-  A project with `uv.lock` or `poetry.lock` is not treated as PDM's. That covers an out-of-tree
-  venv (`venv.in_project = false`) and one bound with `pdm use <venv>`. When
-  the interpreter is a base Python, or a PDM 0.x/1.x project saved none and
-  has no activated or in-project venv, the env is `__pypackages__/<X.Y>/lib` (PEP 582; PDM 2.x under
-  `python.use_venv = false`). Agent mode patches it there, and the hosted
-  stale-install warning and `vex` check it.
+  The first of them that is an environment wins: a venv (an out-of-tree
+  `venv.in_project = false` venv, or one bound with `pdm use <venv>`) or a
+  conda env. A project with `uv.lock` or `poetry.lock` is not treated as
+  PDM's. A base interpreter means PEP 582 (`__pypackages__/<X.Y>/lib`) only
+  when `python.use_venv` is off (`PDM_USE_VENV`, or `[python] use_venv` in
+  `pdm.toml` / `.pdm.toml`; off by default only for PDM 1.x). Otherwise the
+  activated or in-project venv is used, with `__pypackages__` as the last
+  resort. `PDM_IGNORE_SAVED_PYTHON` and `PDM_IGNORE_ACTIVE_VENV` are
+  honored, parsed as PDM parses booleans. Agent mode patches the env found,
+  and the hosted stale-install warning and `vex` check it.
 - **A non-default lock filename (`pdm lock -L custom.lock`) is invisible** to the
   scan, which only reads `pdm.lock`. A package locked at two versions (a marker
   fork) is refused (`pypi_pdm_lock_forked_package` / a version-mismatch refusal),

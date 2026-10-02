@@ -672,6 +672,7 @@ async fn pdm_recorded_env_is_probed_for_stale_hosted_installs() {
         let site = if pep582 {
             let base = tmp.path().join("usr").join("bin").join("python3.11");
             std::fs::write(root.join(".pdm-python"), base.display().to_string()).unwrap();
+            std::fs::write(root.join("pdm.toml"), "[python]\nuse_venv = false\n").unwrap();
             root.join("__pypackages__").join("3.11").join("lib")
         } else {
             let venv = tmp.path().join("pdm-venvs").join("app-AbCd-3.12");
