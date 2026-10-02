@@ -223,6 +223,21 @@ pub(super) const PRUNE_SKIPPED_EMPTY: &str = "Warning: --prune skipped: no insta
      were found, and pruning every manifest entry is too destructive to do implicitly; run \
      `socket-patch repair` to clean up .socket/ explicitly.";
 
+/// The `vendor_ledger_entry_unwired` warning: vendored entries whose
+/// dependency left the lockfile (upgraded or removed), so the scan no
+/// longer discovers them and `--prune` is what reverts them.
+pub(super) fn unwired_vendored_detail(purls: &[String]) -> String {
+    let one = purls.len() == 1;
+    format!(
+        "{} no longer used by the lockfile (the dependency was upgraded or removed) and {} \
+         skipped; run `socket-patch scan --mode vendored --prune` to revert {}: {}",
+        crate::ui::plural(purls.len(), "vendored entry is", "vendored entries are"),
+        if one { "was" } else { "were" },
+        if one { "it" } else { "them" },
+        purls.join(", ")
+    )
+}
+
 /// What the dry-run line says the run would do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Plan {
