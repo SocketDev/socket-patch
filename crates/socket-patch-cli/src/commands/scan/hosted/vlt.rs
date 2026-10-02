@@ -19,6 +19,8 @@ use socket_patch_core::vendor::lock_inventory::ProjectView;
 use super::StaleInstallOutcome;
 
 pub(super) const REINSTALL_REQUIRED: &str = "redirect_vlt_reinstall_required";
+/// A bundled copy of a redirected package that no rewire reaches (#471).
+pub(super) const BUNDLED_INSTANCE_SKIPPED: &str = "redirect_vlt_bundled_instance_skipped";
 
 /// The uuids of `deps` whose purl a vlt vendored ledger entry claims: a
 /// hosted takeover reverts them to a registry node before the rewrite.
@@ -365,6 +367,32 @@ pub(super) async fn heal_after_rewrite(
             || tally.stale_uuids.contains(uuid)
             || tally.undeterminable_uuids.contains(uuid)
         {
+            out.stale_purls.insert(purl.clone());
+        }
+    }
+    // A bundled copy of a patched package (#471) has no lock node, so the
+    // redirect never reaches it: say so, and keep its purl out of the
+    // in-run attestation (lockfile discovery contests it the same way).
+    if inputs.final_lock.is_some() {
+        let copies = socket_patch_core::vendor::vlt_bundled::bundled_copies(&common.cwd).await;
+        for purl in inputs.records.keys() {
+            let base = socket_patch_core::utils::purl::strip_purl_qualifiers(purl);
+            let Some(location) = copies.get(base) else {
+                continue;
+            };
+            let Some((name, version)) = base
+                .strip_prefix("pkg:npm/")
+                .and_then(|rest| rest.rsplit_once('@'))
+            else {
+                continue;
+            };
+            let name = socket_patch_core::utils::purl::percent_decode_purl_component(name);
+            out.warnings.push(serde_json::json!({
+                "code": BUNDLED_INSTANCE_SKIPPED,
+                "detail": socket_patch_core::vendor::vlt_bundled::bundled_copy_detail(
+                    &name, version, location,
+                ),
+            }));
             out.stale_purls.insert(purl.clone());
         }
     }

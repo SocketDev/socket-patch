@@ -1244,8 +1244,12 @@ pub(crate) async fn run_redirect_selected(
         // installed materialization unpatched, so attesting that purl from
         // the ledger would contradict the run's own warning. Excluded purls
         // fall back to `vex`'s normal installed-tree verification.
+        // A confirmed uuid whose bundled instance the rewriter had to skip
+        // (#469) leaves that copy unpatched, so it too is verified, never
+        // assumed.
         params.assume_applied = confirmed
             .iter()
+            .filter(|(_, uuid)| !rewrite.bundled_skipped_uuids.contains(uuid))
             .map(|(purl, _)| purl.clone())
             .filter(|purl| {
                 !gem_stale.stale_purls.contains(purl)

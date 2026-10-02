@@ -1033,6 +1033,63 @@ async fn scan_redirect_rewrites_bun_lock() {
     bun_manifestless_vex(tmp.path(), &lock_before, "bun-v1");
 }
 
+/// REGRESSION (#469): the project also gets a BUNDLED copy of the patched
+/// `name@version` (`parent` bundles it; Bun unpacks it from parent's
+/// tarball, so no rewire reaches it). The regular entry is redirected, but
+/// the in-run `--vex` must not attest the purl while that copy stays
+/// unpatched, exactly like a standalone `vex` run.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_bun_bundled_copy_is_not_attested_in_run() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_project(tmp.path(), 1);
+    let lock = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
+    let bundled = format!(
+        "    \"parent/{NAME}\": [\"{NAME}@{VERSION}\", \"\", {{ \"bundled\": true }},          \"sha512-UPSTREAMupstream==\"],\n  }}\n}}\n"
+    );
+    let lock = lock.replacen("  }\n}\n", &bundled, 1);
+    std::fs::write(tmp.path().join("bun.lock"), &lock).unwrap();
+    let copy = tmp
+        .path()
+        .join("node_modules/parent/node_modules")
+        .join(NAME);
+    std::fs::create_dir_all(&copy).unwrap();
+    std::fs::write(
+        copy.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+
+    let out = tmp.path().join("out.vex.json");
+    let mut args = redirect_args(tmp.path(), server.uri());
+    args.vex.vex = Some(out.clone());
+    args.vex.vex_product = Some("pkg:npm/consumer@0.0.0".into());
+    let _ = run(args).await;
+
+    let rewritten = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
+    assert!(
+        rewritten.contains(&format!("\"{NAME}@{HOSTED_URL}\"")),
+        "the regular entry is redirected"
+    );
+    assert!(
+        rewritten.contains(&format!("\"parent/{NAME}\": [\"{NAME}@{VERSION}\"")),
+        "the bundled entry keeps its registry spec"
+    );
+    let attested = std::fs::read_to_string(&out)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .is_some_and(|doc| doc.to_string().contains(PURL));
+    assert!(
+        !attested,
+        "in-run VEX must not attest a purl whose bundled copy stays unpatched"
+    );
+}
+
 /// The bun 1.4 leg: `"lockfileVersion": 2` is the SAME emitted grammar as 1
 /// (bun 1.4 bumped the integer to gate stricter parse checks — oven-sh/bun
 /// PR #31539 — same-fixture locks are byte-identical except the integer), so
