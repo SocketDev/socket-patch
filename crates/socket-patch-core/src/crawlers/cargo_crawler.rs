@@ -1256,7 +1256,14 @@ version = "fake"
         match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
             Ok(out) => out,
             Err(_) => {
-                let _ = std::fs::OpenOptions::new().write(true).open(fifo);
+                // O_NONBLOCK: with no reader blocked on the FIFO (the
+                // timeout had another cause) a blocking writer open would
+                // itself hang; non-blocking it just fails with ENXIO.
+                use std::os::unix::fs::OpenOptionsExt;
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(fifo);
                 panic!("{what} must not block on a FIFO at {}", fifo.display());
             }
         }
