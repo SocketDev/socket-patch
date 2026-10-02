@@ -93,15 +93,15 @@
 |---|---|
 | Production code (non-blank, non-comment) | **117.6K lines** + 34.8K comment lines + 9K blank |
 | Inline `#[cfg(test)]` code in `src/` | ~194K lines |
-| Integration tests (`crates/*/tests`) | ~255K lines in **207 separate test executables** |
+| Integration tests (`crates/*/tests`) | ~255K lines in **209 separate test executables** (198 top-level files + 11 directory binaries; recounted at `1169ae6`, 2026-10-02) |
 | Test : production ratio | ~2.8 : 1 overall; ~7 : 1 for the CLI crate |
-| Largest file | `patch/redirect/mod.rs`: 17,517 lines (6.2K production) |
+| Largest file | `patch/redirect/mod.rs`: 18,154 lines at `1169ae6` (2026-10-02; 17,517 at the snapshot, 6.2K production then) |
 | Functions > 200 / > 500 lines | 61 / 9 (`run_scan` 1,499, `rollback::run` 984, `vendor_records_reusing` 962, `run_redirect_selected` 836, `remove::run` 797, `get::run` 635, memory `engine` 604, …) |
 | CLI surface | 9 visible + 2 hidden subcommands; 57 visible long flags; 27 globals on every command; 43 env bindings (84 `SOCKET_*` names in source); 156 documented `errorCode`s; ~570 code-like strings in source |
 | `--help` | 150–219 lines per subcommand; `list --help` lists 27 options, most of which do nothing for `list` |
 | CI per push | ~516 jobs; the CI workflow alone is 237 jobs and 348 runner-minutes; Windows `test` is the 28-minute critical path |
-| `CLI_CONTRACT.md` | 332 KB; the longest *line* is 9,320 characters |
-| Open issues | 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
+| `CLI_CONTRACT.md` | 340 KB; the longest *line* is 9,491 characters (at `1169ae6`, 2026-10-02; 332 KB / 9,320 at the snapshot) |
+| Open issues | 156 on 2026-10-02 (155 labelled `bug`). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
 | PR size | Recent squash merges of +53K, +85K and +94K lines |
 
 ---

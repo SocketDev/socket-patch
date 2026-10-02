@@ -1,11 +1,11 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-02 (seeded from the review) · main @ 61cfb9b_
+_Last updated 2026-10-02T16:20Z · main @ 1169ae6_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
-| C01 | 1 | Unbounded zip inflate on tamperable input. `zip_bytes_match_after_hashes` pre-allocates from the archive's declared size and reads with no cap, and it runs on committed `.nupkg`/`.jar` files and service archives. There are three archive caps (512/256/128 MiB). | §1 #1; 5.5 | | to verify |
-| C02 | 1 | `ApiClient::new` and `plain_client()` set no HTTP timeout, and blob and diff fetches have no retry, so `scan`, `get` and `apply` can hang in CI. | §1 #2; 7.2 | | to verify |
-| C03 | 1 | `vendored_takeover` ignores `RevertOutcome.kept_artifact`. It deletes the ledger entry and reports the artifact as reverted on a drift-keep, while every other revert caller honors the flag. | §1 #3; 2.10 R1 | | to verify |
+| C01 | 1 | Unbounded zip inflate on tamperable input. `zip_bytes_match_after_hashes` pre-allocates from the archive's declared size and reads with no cap, and it runs on committed `.nupkg`/`.jar` files and service archives. There are three archive caps (512/256/128 MiB). | #569 | filed #569 |
+| C02 | 1 | `ApiClient::new` and `plain_client()` set no HTTP timeout, and blob and diff fetches have no retry, so `scan`, `get` and `apply` can hang in CI. | #570 | filed #570 |
+| C03 | 1 | `vendored_takeover` ignores `RevertOutcome.kept_artifact`. It deletes the ledger entry and reports the artifact as reverted on a drift-keep, while every other revert caller honors the flag. | #568 | filed #568 |
 | C04 | 1 | Planted-binary spawn: `vendor/pypi_hatch.rs` runs `Command::new("hatch").current_dir(root)` instead of `process::resolve_tool`. Check open PR #442 first. | §1 #4; 7.3 | | to verify |
 | C05 | 1 | `SOCKET_FORCE` is bound to `vendor --force`, `apply --force` and `--update --force`, so forcing a self-update also forces past hash checks. | §1 #6 | | to verify |
 | C06 | 1 | `get` round-trips its arguments through `DownloadParams` and `..GlobalArgs::default()`, which silently resets `offline`, `patch_server_url` and more. `get` also builds a fake `ApplyArgs`, and `get` and `scan` call each other. | 2.1; 2.3; R7 | | to verify |
@@ -39,6 +39,7 @@ _Last updated 2026-10-02 (seeded from the review) · main @ 61cfb9b_
 | C34 | 3 | Decide: the command model. A read-only `scan`, plus `fix`, `undo`, `sync` and `check`, with mode inferred from project state. This folds `remove`, `rollback` and `vendor --revert`, and per-command flags replace the 27 globals. | §4; 2.9; R6/R8 | | to verify |
 | C35 | 3 | Decide: drop the deprecated spellings and embedded `--vex`, and give `SOCKET_FORCE` per-command names. | R9; R10 | | to verify |
 | C36 | 3 | Decide: the futures of agent mode and of the self-update binary swap. | §6 Q2; 7.5 | | to verify |
+| C37 | 2 | Patch blob/diff downloads (`fetch_binary`) buffer the whole body with no size cap; vendor and self-update use the shared `read_capped`. | new finding | #571 | filed #571 |
 
 **Handed off** (to the CI janitor): report-only coverage and LTO `docker-base` off PRs; e2e from 148 to ~50 legs; a reusable compat workflow; no per-leg compiles; dead CI path filters (review 8.2, 8.5 B/C/E).
 

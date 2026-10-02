@@ -2,7 +2,7 @@
 
 ## Part 2: CLI command layer and user experience
 
-_Last checked against `main`: not yet re-checked; the content is as of `2463257`. Owner: `audit-core`._
+_Last checked against main @ 1169ae6 on 2026-10-02 by audit-core. Owner: audit-core._
 
 > Scope: `crates/socket-patch-cli/src/` — `args.rs`, `lib.rs`/`main.rs`, `ecosystem_dispatch.rs`, `json_envelope.rs`, `ui/*`, `update_notifier.rs`, and every `commands/*` module.
 
@@ -59,7 +59,7 @@ Command modules double as libraries and form a dense web:
 - **`VendoredBackend`** ("the one vendored-mode backend") has 8 users, but `run_vendor_gc` (`vendor.rs:3400, 3436`) and the hosted takeover (`scan/hosted.rs:1700, 1733`) call `dispatch_revert_one` directly.
 - **A bug caused by the bypass (verified by reading).**
   - Core's `RevertOutcome.kept_artifact` (`core/vendor/mod.rs:664–673`) says that after a drift-keep, callers "must ALSO keep the state.json entry".
-  - `vendored_takeover` (`scan/hosted.rs:1732–1790`) never reads `kept_artifact`. On success it drops the ledger entry, saves, and emits `redirect_takeover_reverted_vendored` ("reverted its vendored wiring, ledger entry, and committed artifact").
+  - `vendored_takeover` (`scan/hosted.rs:1732–1790`) never reads `kept_artifact`. On success it drops the ledger entry, saves, and emits `redirect_takeover_reverted_vendored` ("reverted its vendored wiring, ledger entry, and committed artifact"). Reproduced on `1169ae6`: after the takeover the ledger entry is gone and the artifact dir is still there. {{C03}}
   - On a drifted lock this orphans the artifact and loses the only recorded originals.
   - Every other revert caller handles the flag (vendor.rs ×6, gc.rs, `vendored_backend`).
   - Needs a regression test.
