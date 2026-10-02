@@ -2701,20 +2701,23 @@ async fn vlt_default_registry_base_follows_the_lock_options() {
 #[tokio::test]
 async fn vlt_inventory_resolves_registries_through_the_shared_registry_base() {
     use crate::vendor::vlt_lock_text::REGISTRY_BASE_CASES;
-    for (segment, options, want) in REGISTRY_BASE_CASES {
+    for (era, segment, options, want) in REGISTRY_BASE_CASES {
         // A URL segment is percent-encoded in a DepID; the table's other
         // rows cover every precedence rule.
         if segment.starts_with("http") {
             continue;
         }
         let tmp = tempfile::tempdir().unwrap();
-        let node = format!(r#""~{segment}~@s/a@1.0.0": [0,"@s/a","sha512-a=="]"#);
-        write(
-            tmp.path(),
-            "vlt-lock.json",
-            &vlt_lock(options, &[node.as_str()]),
-        )
-        .await;
+        let delimiter = era.delimiter();
+        let name = crate::vendor::vlt_lock_text::encode_segment("@s/a@1.0.0", *era);
+        let node = format!(r#""{delimiter}{segment}{delimiter}{name}": [0,"@s/a","sha512-a=="]"#);
+        let lock = vlt_lock(options, &[node.as_str()]);
+        let lock = if *era == crate::vendor::vlt_lock_text::DepIdEra::Legacy {
+            lock.replacen("\"lockfileVersion\": 1", "\"lockfileVersion\": 0", 1)
+        } else {
+            lock
+        };
+        write(tmp.path(), "vlt-lock.json", &lock).await;
         let entries = inventory_vlt(tmp.path()).await.unwrap();
         assert_eq!(entries.len(), 1, "{segment:?} {options}");
         assert_eq!(
@@ -2728,7 +2731,7 @@ async fn vlt_inventory_resolves_registries_through_the_shared_registry_base() {
 #[tokio::test]
 async fn vlt_inventory_honors_scope_for_named_and_url_registry_segments() {
     use crate::vendor::vlt_lock_text::{encode_segment, DepIdEra, SCOPED_REGISTRY_OPTIONS};
-    for segment in ["npm", "corp", "https://explicit.example/npm"] {
+    for segment in ["", "npm", "corp", "https://explicit.example/npm"] {
         let tmp = tempfile::tempdir().unwrap();
         let node = format!(
             r#""~{}~@s+a@1.0.0": [0,"@s/a","sha512-a=="]"#,

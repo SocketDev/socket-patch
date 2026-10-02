@@ -26,8 +26,8 @@ use super::npm::{by_uuid, fetch_dists, read_or_refuse, refuse_all_in};
 use super::{Ctx, FormatResult, HostedPin, View};
 use crate::vendor::vlt_lock_text::{
     default_registry_alias, entry_text, is_default_registry, nodes_block, parse_node_line,
-    registry_base, render_entry_line, render_tuple_with_slots, sniff_lock, split_dep_id,
-    split_lines, DepIdEra, DepIdKind, LockSniff,
+    registry_base, registry_segment, render_entry_line, render_tuple_with_slots, sniff_lock,
+    split_dep_id, split_lines, DepIdEra, DepIdKind, LockSniff,
 };
 
 /// One hosted node line to restore.
@@ -56,6 +56,7 @@ fn records_url(
     siblings: &[(DepIdEra, bool)],
     options: Option<&Map<String, Value>>,
 ) -> bool {
+    let segment = registry_segment(era, segment);
     let same_era: Vec<bool> = siblings
         .iter()
         .filter(|(e, _)| *e == era)
@@ -70,7 +71,7 @@ fn records_url(
             .and_then(|o| o.get("registries"))
             .is_some_and(Value::is_object)
         && (segment.is_empty() || default_registry_alias(options) == Some(segment))
-        && !under_configured_registry(segment, name, options)
+        && !under_configured_registry(era, segment, name, options)
 }
 
 /// Would a default-registry node on `segment` resolve under the lock's
@@ -78,6 +79,7 @@ fn records_url(
 /// (`lockfile/save.ts`: `customRegistry = resolved && (!registry ||
 /// !resolved.startsWith(registry))`).
 fn under_configured_registry(
+    era: DepIdEra,
     segment: &str,
     name: &str,
     options: Option<&Map<String, Value>>,
@@ -89,7 +91,7 @@ fn under_configured_registry(
     else {
         return false;
     };
-    registry_base(segment, name, options).is_some_and(|base| base.starts_with(registry))
+    registry_base(era, segment, name, options).is_some_and(|base| base.starts_with(registry))
 }
 
 pub(crate) async fn restore(
@@ -173,7 +175,8 @@ pub(crate) async fn restore(
             let hosted = slot3.as_deref().and_then(|u| ctx.hosted_uuid(u));
             let Some(uuid) = hosted else {
                 if let Some(dep_id) = dep_id.filter(|d| {
-                    d.kind == DepIdKind::Registry && is_default_registry(&d.first, options)
+                    d.kind == DepIdKind::Registry
+                        && is_default_registry(registry_segment(d.era, &d.first), options)
                 }) {
                     siblings.push((dep_id.era, slot3.is_some()));
                 }
@@ -205,7 +208,7 @@ pub(crate) async fn restore(
                 );
                 continue;
             };
-            if !is_default_registry(&dep_id.first, options) {
+            if !is_default_registry(registry_segment(dep_id.era, &dep_id.first), options) {
                 result.refuse(
                     &uuid,
                     format!(
@@ -252,7 +255,7 @@ pub(crate) async fn restore(
             let line = parse_node_line(lines[hit.line]).expect("the hit line parsed above");
             let json = |s: &str| serde_json::to_string(s).expect("a str serializes to JSON");
             let slot3 = if records_url(hit.era, &hit.segment, &hit.name, &siblings, options) {
-                let Some(base) = registry_base(&hit.segment, &hit.name, options) else {
+                let Some(base) = registry_base(hit.era, &hit.segment, &hit.name, options) else {
                     result.refuse(
                         &hit.uuid,
                         format!("{rel} maps no registry for the `{}` segment", hit.segment),
@@ -523,19 +526,21 @@ mod tests {
         let server = registry(&[("left-pad", "1.3.0", Some(LP_UPSTREAM))]).await;
         std::env::set_var("SOCKET_NPM_REGISTRY", server.uri());
         let url = hosted(LP_UUID, "left-pad-1.3.0.tgz");
-        for (segment, options, want) in REGISTRY_BASE_CASES {
+        for (era, segment, options, want) in REGISTRY_BASE_CASES {
             if segment.starts_with("http") {
                 continue;
             }
             // A same-era sibling that records slot [3] makes restore write
             // one for the pin.
+            let delimiter = era.delimiter();
+            let lock_version = u8::from(*era == DepIdEra::Tilde);
             let text = format!(
-                "{{\n  \"lockfileVersion\": 1,\n  \"options\": {options},\n  \"nodes\": {{\n    \"~{segment}~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-AA==\",\"{url}\"],\n    \"~{segment}~ms@2.1.3\": [0,\"ms\",\"sha512-M==\",\"https://x.example/ms/-/ms-2.1.3.tgz\"]\n  }},\n  \"edges\": {{}}\n}}\n"
+                "{{\n  \"lockfileVersion\": {lock_version},\n  \"options\": {options},\n  \"nodes\": {{\n    \"{delimiter}{segment}{delimiter}left-pad@1.3.0\": [0,\"left-pad\",\"sha512-AA==\",\"{url}\"],\n    \"{delimiter}{segment}{delimiter}ms@2.1.3\": [0,\"ms\",\"sha512-M==\",\"https://x.example/ms/-/ms-2.1.3.tgz\"]\n  }},\n  \"edges\": {{}}\n}}\n"
             );
             let (outcome, after) =
                 run(&text, &[pin("pkg:npm/left-pad@1.3.0", LP_UUID)], false).await;
             let opts = opts(options);
-            if is_default_registry(segment, Some(&opts)) {
+            if is_default_registry(registry_segment(*era, segment), Some(&opts)) {
                 let want = want.expect("a default registry always has a base");
                 assert!(
                     refused(&outcome).is_empty(),
@@ -554,6 +559,56 @@ mod tests {
                 );
                 assert_eq!(after, text);
             }
+        }
+        std::env::remove_var("SOCKET_NPM_REGISTRY");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_empty_tilde_resolution_and_sibling_admission() {
+        let server = registry(&[("left-pad", "1.3.0", Some(LP_UPSTREAM))]).await;
+        std::env::set_var("SOCKET_NPM_REGISTRY", server.uri());
+        let url = hosted(LP_UUID, "left-pad-1.3.0.tgz");
+        for (segment, options, sibling, base) in [
+            (
+                "",
+                r#"{"registry":"https://a.example/","registries":{"npm":"https://b.example/"}}"#,
+                "",
+                "https://b.example/",
+            ),
+            (
+                "npm",
+                r#"{"registry":"https://a.example/","registries":{"npm":"https://b.example/"}}"#,
+                "",
+                "https://b.example/",
+            ),
+            (
+                "corp",
+                r#"{"default-registry-alias":"corp","registries":{"npm":"https://b.example/","corp":"https://c.example/"}}"#,
+                // Empty tilde means npm, which is foreign here. Its lack
+                // of slot 3 must not determine the corp node's convention.
+                ",\n    \"~~ms@2.1.3\": [0,\"ms\",\"sha512-M==\"]",
+                "https://c.example/",
+            ),
+        ] {
+            let key = format!("~{segment}~left-pad@1.3.0");
+            let text = format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"options\": {options},\n  \"nodes\": {{\n    \"{key}\": [0,\"left-pad\",\"sha512-AA==\",\"{url}\"]{sibling}\n  }},\n  \"edges\": {{}}\n}}\n"
+            );
+            let (outcome, after) =
+                run(&text, &[pin("pkg:npm/left-pad@1.3.0", LP_UUID)], false).await;
+            assert!(refused(&outcome).is_empty(), "{:?}", refused(&outcome));
+            let after: Value = serde_json::from_str(&after).unwrap();
+            assert_eq!(
+                after["nodes"][&key],
+                serde_json::json!([
+                    0,
+                    "left-pad",
+                    LP_UPSTREAM,
+                    format!("{base}left-pad/-/left-pad-1.3.0.tgz")
+                ]),
+                "{segment:?} {options}"
+            );
         }
         std::env::remove_var("SOCKET_NPM_REGISTRY");
     }

@@ -6,8 +6,8 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 
-use crate::constants::npm_family::VLT_LOCK;
 use super::view::ProjectView;
+use crate::constants::npm_family::VLT_LOCK;
 use crate::vendor::vlt_lock_text::{
     registry_base, sniff_lock, split_dep_id, DepId, DepIdKind, LockSniff,
 };
@@ -106,7 +106,7 @@ pub(crate) fn vlt_registry_entries(lock: &VltLock) -> Vec<LockfileEntry> {
                 return None;
             }
             let resolved = node.location.as_deref().and_then(http_url).or_else(|| {
-                registry_base(&node.dep_id.first, name, options)
+                registry_base(node.dep_id.era, &node.dep_id.first, name, options)
                     .map(|base| npm_tarball_url(base.trim_end_matches('/'), name, version))
             });
             let integrity = node
