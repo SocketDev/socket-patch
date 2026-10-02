@@ -9,8 +9,10 @@ use std::path::{Path, PathBuf};
 use sha1::{Digest, Sha1};
 use socket_patch_core::crawlers::gradle_cache;
 use socket_patch_core::crawlers::jvm_cache::{self, JvmCacheLayout, JvmCacheRoot};
+use socket_patch_core::crawlers::maven_crawler::{m2_gate, normalize_prefix, JvmEnv, M2Gate};
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::MavenCrawler;
+use socket_patch_core::gradle::Os;
 use socket_patch_core::manifest::schema::PatchFileInfo;
 
 const COMMONS_TEXT: &str = "pkg:maven/org.apache.commons/commons-text@1.10.0";
@@ -459,4 +461,493 @@ fn stale_derived_copies_finds_transforms_and_instrumented_jars() {
         want
     );
     assert!(gradle_cache::stale_derived_copies(&home.path().join("none"), leaf, &sha1).is_empty());
+}
+
+// ── cache roots: the Gradle user home, the read-only cache, #551 ────────
+
+/// A fake machine: a user home holding `.gradle` and `.m2/repository`, and
+/// a project dir. Everything comes from an explicit env, never the
+/// process's.
+struct Machine {
+    _tmp: tempfile::TempDir,
+    home: PathBuf,
+    project: PathBuf,
+    env: HashMap<String, String>,
+}
+
+impl Machine {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(home.join(".m2/repository")).unwrap();
+        files21_of(&home.join(".gradle"));
+        std::fs::create_dir_all(&project).unwrap();
+        Self {
+            _tmp: tmp,
+            env: HashMap::from([("HOME".to_string(), home.to_string_lossy().into_owned())]),
+            home,
+            project,
+        }
+    }
+
+    fn set(&mut self, k: &str, v: &Path) {
+        self.env
+            .insert(k.to_string(), v.to_string_lossy().into_owned());
+    }
+
+    fn jvm_env(&self) -> JvmEnv {
+        JvmEnv::resolve(&self.env, Os::current(), Some(&self.home))
+    }
+
+    fn gradle_files21(&self) -> PathBuf {
+        self.home.join(".gradle/caches/modules-2/files-2.1")
+    }
+
+    fn m2(&self) -> PathBuf {
+        self.home.join(".m2/repository")
+    }
+
+    fn write(&self, rel: &str, text: &str) {
+        let path = self.project.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn options(&self, global: bool) -> CrawlerOptions {
+        CrawlerOptions {
+            cwd: self.project.clone(),
+            global,
+            global_prefix: None,
+        }
+    }
+
+    async fn roots(&self, global: bool) -> Vec<PathBuf> {
+        MavenCrawler
+            .get_jvm_cache_roots_with(&self.options(global), &self.jvm_env())
+            .await
+            .into_iter()
+            .map(|r| r.path)
+            .collect()
+    }
+
+    fn gate(&self) -> M2Gate {
+        m2_gate(&self.project, &self.jvm_env())
+    }
+}
+
+const GRADLE_ONLY: &str = "plugins { id 'java' }\nrepositories { mavenCentral() }\n";
+
+/// Gradle's user home: `-Dgradle.user.home` in GRADLE_OPTS beats JAVA_OPTS,
+/// which beats GRADLE_USER_HOME, which beats `<home>/.gradle`; Maven's
+/// local repository keeps its own precedence.
+#[test]
+fn home_precedence() {
+    let m = Machine::new();
+    let base = m.jvm_env();
+    assert_eq!(base.gradle.as_ref().unwrap().files21, m.gradle_files21());
+    assert_eq!(base.m2_repo, m.m2());
+
+    let mut env = m.env.clone();
+    env.insert("GRADLE_USER_HOME".into(), "/guh".into());
+    env.insert("JAVA_OPTS".into(), "-Dgradle.user.home=/java".into());
+    env.insert(
+        "GRADLE_OPTS".into(),
+        "-Xmx1g \"-Dgradle.user.home=/gradle opts\"".into(),
+    );
+    let home = |env: &HashMap<String, String>| {
+        JvmEnv::resolve(env, Os::Unix, Some(&m.home))
+            .gradle
+            .unwrap()
+            .user_home
+    };
+    assert_eq!(home(&env), PathBuf::from("/gradle opts"));
+    env.remove("GRADLE_OPTS");
+    assert_eq!(home(&env), PathBuf::from("/java"));
+    env.remove("JAVA_OPTS");
+    assert_eq!(home(&env), PathBuf::from("/guh"));
+    env.insert("GRADLE_USER_HOME".into(), String::new());
+    assert_eq!(home(&env), m.home.join(".gradle"));
+
+    let mut env = m.env.clone();
+    env.insert("MAVEN_REPO_LOCAL".into(), "/mrl".into());
+    env.insert("M2_HOME".into(), "/m2home".into());
+    assert_eq!(
+        JvmEnv::resolve(&env, Os::Unix, None).m2_repo,
+        PathBuf::from("/mrl")
+    );
+    env.remove("MAVEN_REPO_LOCAL");
+    assert_eq!(
+        JvmEnv::resolve(&env, Os::Unix, None).m2_repo,
+        PathBuf::from("/m2home/repository")
+    );
+}
+
+/// The read-only cache is scanned after the user home's, and is reported as
+/// read-only.
+#[tokio::test]
+async fn ro_cache_is_a_root_after_the_user_home() {
+    let mut m = Machine::new();
+    let ro = m.home.join("ro-cache");
+    let ro_files21 = ro.join("modules-2/files-2.1");
+    std::fs::create_dir_all(&ro_files21).unwrap();
+    let ro_version_dir = cache_commons_text(&ro_files21);
+    m.set("GRADLE_RO_DEP_CACHE", &ro);
+    m.write("build.gradle", GRADLE_ONLY);
+
+    assert_eq!(
+        m.roots(false).await,
+        vec![m.gradle_files21(), ro_files21.clone()]
+    );
+    let env = m.jvm_env();
+    assert!(env.is_ro_root(&ro_files21));
+    assert!(!env.is_ro_root(&m.gradle_files21()));
+
+    let found = MavenCrawler
+        .find_by_purls(&ro_files21, &[COMMONS_TEXT.to_string()])
+        .await
+        .unwrap();
+    assert_eq!(found[COMMONS_TEXT].path, ro_version_dir);
+}
+
+/// #551: a Gradle-only build without mavenLocal() does not read ~/.m2.
+#[tokio::test]
+async fn gradle_only_without_maven_local_has_no_m2() {
+    let m = Machine::new();
+    m.write("settings.gradle", "rootProject.name = 'p'\n");
+    m.write("build.gradle", GRADLE_ONLY);
+    assert_eq!(m.gate(), M2Gate::Ignored);
+    assert_eq!(m.roots(false).await, vec![m.gradle_files21()]);
+    // PURL lookups (vendor sourcing, apply's every-copy fan-out) still see
+    // the m2 bytes.
+    let lookup = MavenCrawler
+        .get_maven_repo_paths_with(&m.options(false), &m.jvm_env())
+        .await
+        .unwrap();
+    assert_eq!(lookup, vec![m.gradle_files21(), m.m2()]);
+}
+
+/// #551: mavenLocal() in a buildSrc convention plugin counts.
+#[tokio::test]
+async fn maven_local_in_buildsrc_convention_plugin_keeps_m2() {
+    let m = Machine::new();
+    m.write("settings.gradle.kts", "rootProject.name = \"p\"\n");
+    m.write("build.gradle.kts", "plugins { id(\"conv\") }\n");
+    m.write(
+        "buildSrc/build.gradle.kts",
+        "plugins { `kotlin-dsl` }\nrepositories { gradlePluginPortal() }\n",
+    );
+    m.write(
+        "buildSrc/src/main/kotlin/conv.gradle.kts",
+        "repositories {\n    mavenLocal()\n    mavenCentral()\n}\n",
+    );
+    assert!(matches!(m.gate(), M2Gate::Declared(at) if at.contains("conv.gradle.kts")));
+    assert_eq!(m.roots(false).await, vec![m.gradle_files21(), m.m2()]);
+}
+
+/// #551: mavenLocal() in a Gradle user-home init script counts.
+#[tokio::test]
+async fn maven_local_in_user_home_init_d_keeps_m2() {
+    let m = Machine::new();
+    m.write("build.gradle", GRADLE_ONLY);
+    let init_d = m.home.join(".gradle/init.d");
+    std::fs::create_dir_all(&init_d).unwrap();
+    std::fs::write(
+        init_d.join("local.gradle"),
+        "allprojects { repositories { mavenLocal() } }\n",
+    )
+    .unwrap();
+    assert!(matches!(m.gate(), M2Gate::Declared(at) if at.ends_with("local.gradle")));
+    assert_eq!(m.roots(false).await, vec![m.gradle_files21(), m.m2()]);
+}
+
+/// #551: a non-literal `apply from` might add mavenLocal(): m2 is kept and
+/// the gate says why.
+#[tokio::test]
+async fn non_literal_apply_from_keeps_m2_undetermined() {
+    let m = Machine::new();
+    m.write(
+        "build.gradle",
+        "def common = rootProject.file('gradle/' + 'repos.gradle')\napply from: common\n",
+    );
+    assert!(
+        matches!(m.gate(), M2Gate::Undetermined(_)),
+        "{:?}",
+        m.gate()
+    );
+    assert_eq!(m.roots(false).await, vec![m.gradle_files21(), m.m2()]);
+}
+
+/// An init script that is not UTF-8 cannot be ruled out either.
+#[tokio::test]
+async fn unreadable_init_script_keeps_m2_undetermined() {
+    let m = Machine::new();
+    m.write("build.gradle", GRADLE_ONLY);
+    std::fs::write(m.home.join(".gradle/init.gradle"), b"\xff\xfe mavenLocal()").unwrap();
+    assert!(matches!(m.gate(), M2Gate::Undetermined(why) if why.contains("init.gradle")));
+}
+
+/// The wrapper's own distribution: a custom one that is not unpacked yet
+/// cannot be read (undetermined); once unpacked, its init.d is read; a
+/// stock distribution ships no init scripts.
+#[tokio::test]
+async fn wrapper_distribution_init_d() {
+    let m = Machine::new();
+    m.write("build.gradle", GRADLE_ONLY);
+    m.write(
+        "gradle/wrapper/gradle-wrapper.properties",
+        "distributionBase=GRADLE_USER_HOME\ndistributionPath=wrapper/dists\n\
+         distributionUrl=https\\://corp.example/dists/gradle-8.14.3-corp.zip\n",
+    );
+    assert!(matches!(m.gate(), M2Gate::Undetermined(why) if why.contains("corp.example")));
+
+    let init_d = m
+        .home
+        .join(".gradle/wrapper/dists/gradle-8.14.3-corp/abc123/gradle-8.14.3/init.d");
+    std::fs::create_dir_all(&init_d).unwrap();
+    assert_eq!(m.gate(), M2Gate::Ignored);
+    std::fs::write(
+        init_d.join("corp.gradle"),
+        "allprojects { repositories { mavenLocal() } }",
+    )
+    .unwrap();
+    assert!(matches!(m.gate(), M2Gate::Declared(at) if at.ends_with("corp.gradle")));
+
+    // distributionBase=PROJECT unpacks under the build itself.
+    m.write(
+        "gradle/wrapper/gradle-wrapper.properties",
+        "distributionBase=PROJECT\ndistributionPath=.dists\n\
+         distributionUrl=https\\://corp.example/dists/gradle-9.8.0-corp.zip\n",
+    );
+    assert!(matches!(m.gate(), M2Gate::Undetermined(_)));
+    m.write(
+        ".dists/gradle-9.8.0-corp/h/gradle-9.8.0/init.d/x.gradle.kts",
+        "repositories { mavenLocal() }",
+    );
+    assert!(matches!(m.gate(), M2Gate::Declared(at) if at.ends_with("x.gradle.kts")));
+
+    m.write(
+        "gradle/wrapper/gradle-wrapper.properties",
+        "distributionUrl=https\\://services.gradle.org/distributions/gradle-9.8.0-bin.zip\n",
+    );
+    assert_eq!(m.gate(), M2Gate::Ignored);
+}
+
+/// A subproject cwd (no settings of its own) is judged with the settings
+/// of the build above it.
+#[tokio::test]
+async fn subproject_cwd_reads_the_root_settings() {
+    let mut m = Machine::new();
+    m.write(
+        "settings.gradle",
+        "dependencyResolutionManagement { repositories { mavenLocal() } }\ninclude 'app'\n",
+    );
+    m.write("app/build.gradle", "plugins { id 'java' }\n");
+    m.project = m.project.join("app");
+    assert!(matches!(m.gate(), M2Gate::Declared(at) if at == "settings.gradle"));
+}
+
+/// #551: a pom.xml beside the Gradle build reads m2 as always; both roots.
+#[tokio::test]
+async fn pom_and_gradle_get_both_roots() {
+    let m = Machine::new();
+    m.write("build.gradle", GRADLE_ONLY);
+    m.write("pom.xml", "<project/>");
+    assert_eq!(m.gate(), M2Gate::NotGradleOnly);
+    assert_eq!(m.roots(false).await, vec![m.gradle_files21(), m.m2()]);
+}
+
+/// A pom-only project never reads the Gradle cache; a non-JVM cwd gets no
+/// root at all unless the scan is global.
+#[tokio::test]
+async fn non_jvm_cwd_gets_no_gradle_root_unless_global() {
+    let m = Machine::new();
+    assert!(m.roots(false).await.is_empty());
+    assert_eq!(m.roots(true).await, vec![m.gradle_files21(), m.m2()]);
+    m.write("pom.xml", "<project/>");
+    assert_eq!(m.roots(false).await, vec![m.m2()]);
+}
+
+/// `--global-prefix` with a Gradle user home, its `caches/modules-2`, a
+/// read-only cache's `modules-2`, or `files-2.1` itself finds the cached
+/// PURLs. A Maven repository that happens to be named `caches` stays one.
+#[tokio::test]
+async fn global_prefix_spellings_of_the_gradle_cache() {
+    let m = Machine::new();
+    let version_dir = cache_commons_text(&m.gradle_files21());
+    let gradle_home = m.home.join(".gradle");
+    for prefix in [
+        gradle_home.clone(),
+        gradle_home.join("caches/modules-2"),
+        m.gradle_files21(),
+    ] {
+        assert_eq!(
+            normalize_prefix(&prefix),
+            m.gradle_files21(),
+            "{}",
+            prefix.display()
+        );
+        assert_eq!(
+            crawl_purls(&global_prefix(&prefix)).await,
+            vec![(COMMONS_TEXT.to_string(), version_dir.clone())],
+            "{}",
+            prefix.display()
+        );
+    }
+    let ro = m.home.join("ro");
+    let ro_files21 = ro.join("modules-2/files-2.1");
+    std::fs::create_dir_all(&ro_files21).unwrap();
+    let ro_dir = cache_commons_text(&ro_files21);
+    assert_eq!(
+        crawl_purls(&global_prefix(&ro.join("modules-2"))).await,
+        vec![(COMMONS_TEXT.to_string(), ro_dir)]
+    );
+
+    // A Maven repository named `caches`: m2 layout, read as m2.
+    let caches = m.home.join("caches");
+    let pkg = caches.join("org/example/m2lib/1.0");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("m2lib-1.0.pom"),
+        "<project><groupId>org.example</groupId><artifactId>m2lib</artifactId>\
+         <version>1.0</version></project>",
+    )
+    .unwrap();
+    assert_eq!(normalize_prefix(&caches), caches);
+    assert_eq!(
+        crawl_purls(&global_prefix(&caches)).await,
+        vec![("pkg:maven/org.example/m2lib@1.0".to_string(), pkg)]
+    );
+}
+
+/// Lock files never narrow discovery: with a lock file present, a cached
+/// module no lock names (a buildscript classpath entry) is still reported;
+/// the lock set only annotates.
+#[tokio::test]
+async fn unlocked_buildscript_dependency_is_reported_with_lockfiles() {
+    let m = Machine::new();
+    m.write(
+        "build.gradle",
+        "buildscript { dependencies { classpath 'com.example:build-plugin:1.0' } }\n\
+         dependencies { implementation 'org.apache.commons:commons-text:1.10.0' }\n\
+         dependencyLocking { lockAllConfigurations() }\n",
+    );
+    m.write(
+        "gradle.lockfile",
+        "# lock\norg.apache.commons:commons-text:1.10.0=compileClasspath,runtimeClasspath\nempty=\n",
+    );
+    cache_commons_text(&m.gradle_files21());
+    cache(
+        &m.gradle_files21(),
+        ("com.example", "build-plugin", "1.0"),
+        &[("build-plugin-1.0.jar", b"plugin")],
+    );
+    // The roots a scan of this build crawls, each crawled in full.
+    let roots = m.roots(false).await;
+    assert_eq!(roots, vec![m.gradle_files21()]);
+    let mut purls: Vec<String> = Vec::new();
+    for root in &roots {
+        purls.extend(
+            crawl_purls(&global_prefix(root))
+                .await
+                .into_iter()
+                .map(|(p, _)| p),
+        );
+    }
+    assert_eq!(
+        purls,
+        vec![
+            "pkg:maven/com.example/build-plugin@1.0".to_string(),
+            COMMONS_TEXT.to_string(),
+        ]
+    );
+    let locked = gradle_cache::locked_gavs(&m.project);
+    assert!(locked.contains(&(
+        "org.apache.commons".to_string(),
+        "commons-text".to_string(),
+        "1.10.0".to_string()
+    )));
+    assert!(!locked.iter().any(|(_, a, _)| a == "build-plugin"));
+}
+
+/// A stray GRADLE_OPTS / GRADLE_USER_HOME in the process env does not reach
+/// a fixture built from an explicit env.
+#[tokio::test]
+#[serial_test::serial]
+async fn stray_process_gradle_opts_does_not_affect_fixtures() {
+    let m = Machine::new();
+    m.write("build.gradle", GRADLE_ONLY);
+    let before = m.roots(false).await;
+    let saved: Vec<(&str, Option<std::ffi::OsString>)> = ["GRADLE_OPTS", "GRADLE_USER_HOME"]
+        .into_iter()
+        .map(|k| (k, std::env::var_os(k)))
+        .collect();
+    std::env::set_var("GRADLE_OPTS", "-Dgradle.user.home=/nonexistent/stray");
+    std::env::set_var("GRADLE_USER_HOME", "/nonexistent/stray2");
+    let after = m.roots(false).await;
+    let gate = m.gate();
+    for (k, v) in saved {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+    assert_eq!(before, vec![m.gradle_files21()]);
+    assert_eq!(after, before);
+    assert_eq!(gate, M2Gate::Ignored);
+}
+
+/// `$HOME` and the passwd home: the mismatch is reported only when Gradle
+/// actually falls back to the account's home.
+#[test]
+fn home_mismatch_only_on_fallback() {
+    use socket_patch_core::crawlers::gradle_cache::home_mismatch_with;
+    let env = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let pw = Path::new("/nonexistent/passwd-home");
+    assert_eq!(
+        home_mismatch_with(&env(&[("HOME", "/nonexistent/h")]), Os::Unix, Some(pw)),
+        Some((PathBuf::from("/nonexistent/h"), pw.to_path_buf()))
+    );
+    assert_eq!(
+        home_mismatch_with(
+            &env(&[("HOME", "/nonexistent/passwd-home")]),
+            Os::Unix,
+            Some(pw)
+        ),
+        None
+    );
+    assert_eq!(
+        home_mismatch_with(
+            &env(&[("HOME", "/nonexistent/h"), ("GRADLE_USER_HOME", "/g")]),
+            Os::Unix,
+            Some(pw)
+        ),
+        None
+    );
+    assert_eq!(
+        home_mismatch_with(&env(&[("HOME", "/nonexistent/h")]), Os::Windows, Some(pw)),
+        None
+    );
+}
+
+/// Every existing local cache, Gradle first for a Gradle build, m2 first
+/// otherwise, mavenLocal() or not.
+#[test]
+fn all_local_roots_lists_every_cache() {
+    let m = Machine::new();
+    let env = m.jvm_env();
+    let paths = |cwd: &Path| -> Vec<PathBuf> {
+        jvm_cache::all_local_roots_with(cwd, &env)
+            .into_iter()
+            .map(|r| r.path)
+            .collect()
+    };
+    assert_eq!(paths(&m.project), vec![m.m2(), m.gradle_files21()]);
+    m.write("build.gradle", GRADLE_ONLY);
+    assert_eq!(paths(&m.project), vec![m.gradle_files21(), m.m2()]);
 }

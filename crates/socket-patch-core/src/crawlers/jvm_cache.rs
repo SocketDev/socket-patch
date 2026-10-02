@@ -102,6 +102,42 @@ pub fn project_dependency_set(root: &Path) -> Option<ProjectDependencySet> {
     providers.iter().find_map(|provider| provider(root))
 }
 
+/// Every local JVM cache that exists on this machine (process environment),
+/// whatever the build at `cwd` resolves from: for sourcing an artifact's
+/// bytes ([`locate_artifact`]), never for discovery. See
+/// [`all_local_roots_with`].
+pub fn all_local_roots(cwd: &Path) -> Vec<JvmCacheRoot> {
+    all_local_roots_with(cwd, &super::maven_crawler::JvmEnv::from_process())
+}
+
+/// [`all_local_roots`] under the caches `env` names: the Gradle user home's
+/// `files-2.1`, the read-only Gradle cache and the Maven local repository,
+/// each when it is a directory. A Gradle build at `cwd` lists the Gradle
+/// caches first; anything else the Maven local repository first.
+pub fn all_local_roots_with(cwd: &Path, env: &super::maven_crawler::JvmEnv) -> Vec<JvmCacheRoot> {
+    let mut gradle = Vec::new();
+    if let Some(home) = &env.gradle {
+        for dir in std::iter::once(&home.files21).chain(&home.ro_files21) {
+            if dir.is_dir() {
+                gradle.push(JvmCacheRoot::new(
+                    dir.clone(),
+                    JvmCacheLayout::GradleModules2,
+                ));
+            }
+        }
+    }
+    let m2 = env
+        .m2_repo
+        .is_dir()
+        .then(|| JvmCacheRoot::new(env.m2_repo.clone(), JvmCacheLayout::Maven2));
+    if super::gradle_cache::has_gradle_marker(cwd) {
+        gradle.extend(m2);
+        gradle
+    } else {
+        m2.into_iter().chain(gradle).collect()
+    }
+}
+
 /// Every installed copy of one artifact file
 /// (`<artifact>-<version>[-<classifier>].<ext>`) under `root`: the one
 /// repository path for [`JvmCacheLayout::Maven2`], every hash directory's

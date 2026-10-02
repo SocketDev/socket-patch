@@ -9,9 +9,11 @@
 //! does not.
 //!
 //! [`isolate_cli`] scrubs [`AMBIENT`] and points `HOME` / `USERPROFILE` at
-//! [`stand_in_home`], an empty directory nothing writes to. A test that
-//! wants a cache passes it as explicit env AFTER this call (the caller's
-//! env lands last; see [`EXPLICIT`]).
+//! [`stand_in_home`], an empty directory nothing writes to. On Unix Gradle
+//! (and so the CLI) takes the user home from the passwd entry, not `$HOME`,
+//! so `GRADLE_USER_HOME` is pinned to the stand-in's `.gradle` as well. A
+//! test that wants a cache passes it as explicit env AFTER this call (the
+//! caller's env lands last; see [`EXPLICIT`]).
 //!
 //! Shared by `common/mod.rs` and `prebuilt_common/mod.rs` (the latter pulls
 //! it in with `#[path]`), so the two harnesses cannot drift.
@@ -73,8 +75,9 @@ pub fn stand_in_home() -> PathBuf {
 }
 
 /// Scrub [`AMBIENT`] from `cmd` and pin `HOME` / `USERPROFILE` to
-/// [`stand_in_home`], carrying the version-manager roots over. Call it
-/// before applying a test's own env.
+/// [`stand_in_home`] (and `GRADLE_USER_HOME` to its `.gradle`, which nothing
+/// creates), carrying the version-manager roots over. Call it before
+/// applying a test's own env.
 pub fn isolate_cli(cmd: &mut Command) -> &mut Command {
     for key in AMBIENT {
         cmd.env_remove(key);
@@ -95,7 +98,9 @@ pub fn isolate_cli(cmd: &mut Command) -> &mut Command {
         }
     }
     let home = stand_in_home();
-    cmd.env("HOME", &home).env("USERPROFILE", &home)
+    cmd.env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("GRADLE_USER_HOME", home.join(".gradle"))
 }
 
 mod jvm_env_selftests {
@@ -137,5 +142,21 @@ mod jvm_env_selftests {
             Some("/explicit/gradle-home")
         );
         assert!(std::path::Path::new(&home).is_dir());
+    }
+
+    /// Without an explicit cache the Gradle user home is the stand-in's
+    /// `.gradle`: the CLI resolves Gradle's home from the passwd entry on
+    /// Unix, so pinning `HOME` alone would leak the real `~/.gradle`.
+    #[test]
+    fn isolate_cli_pins_the_gradle_user_home() {
+        let mut cmd = Command::new("socket-patch");
+        cmd.env("GRADLE_USER_HOME", "/real/.gradle");
+        isolate_cli(&mut cmd);
+        let home = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "GRADLE_USER_HOME")
+            .and_then(|(_, v)| v)
+            .map(PathBuf::from);
+        assert_eq!(home, Some(stand_in_home().join(".gradle")));
     }
 }

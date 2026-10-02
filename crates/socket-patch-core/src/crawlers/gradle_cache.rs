@@ -13,11 +13,14 @@
 //! [`installed_copies`] expands it into the hash directories every join
 //! site patches, verifies and rolls back.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::crawlers::jvm_cache::Gav;
 use crate::crawlers::maven_crawler::is_safe_maven_coordinate;
+use crate::gradle::graph::{self, MavenLocal, ScriptGraph};
+use crate::gradle::home::{is_init_script_name, GradleHome};
+use crate::gradle::{Env, Os};
 use crate::manifest::schema::PatchFileInfo;
 
 /// The leaf directory name of a Gradle module cache.
@@ -349,5 +352,410 @@ pub fn stale_derived_copies(user_home: &Path, jar_leaf: &str, pristine_sha1: &st
         }
     }
     out.sort();
+    out
+}
+
+// ── process environment ─────────────────────────────────────────────────
+
+/// The process environment behind [`Env`].
+pub struct ProcessEnv;
+
+impl Env for ProcessEnv {
+    fn var(&self, k: &str) -> Option<String> {
+        std::env::var(k).ok()
+    }
+}
+
+/// The account's home directory from the passwd database
+/// (`getpwuid_r(getuid())->pw_dir`): what the JVM reports as `user.home`
+/// on Linux and macOS, whatever `$HOME` says. `None` on Windows, and when
+/// there is no entry or it names no directory.
+#[cfg(unix)]
+pub fn passwd_home() -> Option<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let uid = unsafe { libc::getuid() };
+    let mut buf: Vec<libc::c_char> = vec![0; 4096];
+    // SAFETY: an all-zero `passwd` is a valid out-parameter; it is only
+    // read when `getpwuid_r` reports a result, and its strings point into
+    // `buf`, which outlives every read below.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    loop {
+        // SAFETY: `buf` is writable for `buf.len()` bytes.
+        let rc =
+            unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+        if rc == libc::ERANGE && buf.len() < (1 << 20) {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        break;
+    }
+    if result.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null `pw_dir` is a NUL-terminated string inside `buf`.
+    let dir = unsafe { CStr::from_ptr(pwd.pw_dir) }.to_bytes();
+    (!dir.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(dir)))
+}
+
+#[cfg(not(unix))]
+pub fn passwd_home() -> Option<PathBuf> {
+    None
+}
+
+/// The Gradle user home this process's Gradle would use
+/// ([`GradleHome::resolve`] over the process environment and, on Unix,
+/// [`passwd_home`]).
+pub fn home_from_process_env() -> Option<GradleHome> {
+    GradleHome::resolve(&ProcessEnv, Os::current(), passwd_home().as_deref())
+}
+
+/// `($HOME, passwd home)` when the Gradle user home came from the account's
+/// home directory (no `gradle.user.home`, no `GRADLE_USER_HOME`) and `$HOME`
+/// names another directory: Gradle follows the passwd entry, so its cache
+/// is not under `$HOME/.gradle`. `None` on Windows and when they agree.
+pub fn home_mismatch() -> Option<(PathBuf, PathBuf)> {
+    home_mismatch_with(&ProcessEnv, Os::current(), passwd_home().as_deref())
+}
+
+/// [`home_mismatch`] over an explicit environment.
+pub fn home_mismatch_with(
+    env: &dyn Env,
+    os: Os,
+    passwd: Option<&Path>,
+) -> Option<(PathBuf, PathBuf)> {
+    if os != Os::Unix {
+        return None;
+    }
+    let set = |k: &str| env.var(k).filter(|v| !v.is_empty());
+    let explicit = set("GRADLE_USER_HOME").is_some()
+        || ["GRADLE_OPTS", "JAVA_OPTS"].iter().any(|k| {
+            set(k).is_some_and(|opts| {
+                crate::gradle::home::system_property(&opts, "gradle.user.home", os)
+                    .is_some_and(|v| !v.is_empty())
+            })
+        });
+    let home = PathBuf::from(set("HOME")?);
+    let passwd = passwd?.to_path_buf();
+    let same = home == passwd
+        || home
+            .canonicalize()
+            .ok()
+            .is_some_and(|h| passwd.canonicalize().ok() == Some(h));
+    (!explicit && !same).then_some((home, passwd))
+}
+
+// ── filesystem adapters ─────────────────────────────────────────────────
+
+/// A [`crate::gradle::TextReadFn`] over the directory `root`: reads the
+/// forward-slash path relative to it as strict UTF-8 with a leading BOM
+/// dropped. Missing, non-regular, unreadable and non-UTF-8 files are
+/// `None`. A file larger than [`graph::MAX_FILE_BYTES`] is not read: it
+/// comes back as that many spaces plus one, so the graph records it as too
+/// large rather than missing.
+pub fn fs_text_read(root: &Path) -> impl Fn(&str) -> Option<String> + '_ {
+    move |rel: &str| {
+        let path = root.join(rel);
+        let meta = std::fs::metadata(&path).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        if meta.len() > graph::MAX_FILE_BYTES as u64 {
+            return Some(" ".repeat(graph::MAX_FILE_BYTES + 1));
+        }
+        crate::gradle::dsl::decode(&std::fs::read(&path).ok()?)
+    }
+}
+
+/// A [`crate::gradle::ListFn`] over the directory `root`: the UTF-8 child
+/// names of the forward-slash directory relative to it, directories
+/// (symlinks followed) ending in `/`, sorted. Missing = empty.
+pub fn fs_list(root: &Path) -> impl Fn(&str) -> Vec<String> + '_ {
+    move |rel: &str| list_dir(&root.join(rel))
+}
+
+/// [`fs_list`] for an absolute directory (the shape `GradleHome`'s
+/// listing callbacks take).
+pub fn list_dir(dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let is_dir = std::fs::metadata(e.path()).is_ok_and(|m| m.is_dir());
+            Some(if is_dir { format!("{name}/") } else { name })
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+// ── init scripts ────────────────────────────────────────────────────────
+
+/// The Gradle init scripts that apply to a build, read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InitScripts {
+    /// `(path, text)` of each readable script, BOM dropped.
+    pub scripts: Vec<(String, String)>,
+    /// Scripts (or whole init-script sources) that exist or may exist but
+    /// could not be read: not UTF-8, unreadable, or a wrapper distribution
+    /// that is not unpacked yet.
+    pub unreadable: Vec<String>,
+}
+
+impl InitScripts {
+    fn read(&mut self, path: &Path) {
+        let Ok(meta) = std::fs::metadata(path) else {
+            return;
+        };
+        if !meta.is_file() {
+            return;
+        }
+        let tag = path.to_string_lossy().into_owned();
+        match std::fs::read(path)
+            .ok()
+            .and_then(|b| crate::gradle::dsl::decode(&b))
+        {
+            Some(text) => self.scripts.push((tag, text)),
+            None => self.unreadable.push(tag),
+        }
+    }
+}
+
+/// Every init script of the user home, `$GRADLE_HOME` and every unpacked
+/// wrapper distribution ([`GradleHome::init_scripts_with`]), read.
+pub fn read_init_scripts(home: &GradleHome) -> InitScripts {
+    let mut out = InitScripts::default();
+    for path in home.init_scripts_with(&list_dir) {
+        out.read(&path);
+    }
+    out
+}
+
+/// What `gradle/wrapper/gradle-wrapper.properties` says about where the
+/// wrapper's distribution unpacks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrapperProps {
+    /// `distributionUrl`, property escapes removed.
+    pub url: String,
+    /// `distributionBase=PROJECT`: relative to the build root instead of
+    /// the Gradle user home.
+    pub project_base: bool,
+    /// `distributionPath` (default `wrapper/dists`).
+    pub path: String,
+}
+
+impl WrapperProps {
+    /// The properties of the wrapper of the build at `root`.
+    pub fn of(root: &Path) -> Option<Self> {
+        let text = fs_text_read(root)("gradle/wrapper/gradle-wrapper.properties")?;
+        let mut props: HashMap<&str, String> = HashMap::new();
+        for line in text.lines() {
+            let line = line.trim_start();
+            if line.is_empty() || line.starts_with(['#', '!']) {
+                continue;
+            }
+            let Some(at) = line.find(['=', ':']) else {
+                continue;
+            };
+            props.insert(line[..at].trim(), line[at + 1..].trim().replace('\\', ""));
+        }
+        Some(Self {
+            url: props.remove("distributionUrl")?,
+            project_base: props
+                .get("distributionBase")
+                .is_some_and(|b| b == "PROJECT"),
+            path: props
+                .remove("distributionPath")
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| "wrapper/dists".to_string()),
+        })
+    }
+
+    /// The distribution's directory name: the URL's file name without
+    /// `.zip`.
+    pub fn name(&self) -> &str {
+        let file = self.url.rsplit('/').next().unwrap_or(&self.url);
+        file.strip_suffix(".zip").unwrap_or(file)
+    }
+
+    /// A stock Gradle distribution (which ships no init scripts).
+    pub fn is_stock(&self) -> bool {
+        let url = self.url.trim();
+        [
+            "https://services.gradle.org/distributions/",
+            "https://services.gradle.org/distributions-snapshots/",
+        ]
+        .iter()
+        .any(|p| url.starts_with(p))
+    }
+}
+
+/// The `init.d` directories of one wrapper distribution unpacked under
+/// `dists` (`<dists>/<name>/<url hash>/<dir>/init.d`). `None` when it is not
+/// unpacked at all.
+fn dist_init_dirs(dists: &Path, name: &str) -> Option<Vec<PathBuf>> {
+    let subdirs = |d: &Path| -> Vec<PathBuf> {
+        list_dir(d)
+            .into_iter()
+            .filter_map(|n| n.strip_suffix('/').map(|n| d.join(n)))
+            .collect()
+    };
+    let mut unpacked = false;
+    let mut out = Vec::new();
+    for hash in subdirs(&dists.join(name)) {
+        for top in subdirs(&hash) {
+            unpacked = true;
+            let init = top.join("init.d");
+            if init.is_dir() {
+                out.push(init);
+            }
+        }
+    }
+    unpacked.then_some(out)
+}
+
+/// The init scripts that apply to the build rooted at `build_root`: the user
+/// home's fixed scripts and `init.d`, `$GRADLE_HOME/init.d`, and the
+/// `init.d` of the distribution its wrapper names (wherever
+/// `distributionBase` / `distributionPath` unpack it). Without a wrapper,
+/// every unpacked wrapper distribution's `init.d` counts (the build may run
+/// any of them). A wrapper whose distribution is not a stock Gradle one and
+/// is not unpacked yet cannot be read: it is reported unreadable, so
+/// `mavenLocal()` stays undetermined.
+pub fn init_scripts_for_build(home: &GradleHome, build_root: &Path) -> InitScripts {
+    let Some(wrapper) = WrapperProps::of(build_root) else {
+        return read_init_scripts(home);
+    };
+    let mut out = InitScripts::default();
+    for path in home.init_script_paths() {
+        out.read(&path);
+    }
+    let base = if wrapper.project_base {
+        build_root
+    } else {
+        home.user_home.as_path()
+    };
+    let dists = base.join(&wrapper.path);
+    let mut dirs = vec![home.user_home.join("init.d")];
+    match dist_init_dirs(&dists, wrapper.name()) {
+        Some(found) => dirs.extend(found),
+        None if !wrapper.is_stock() => out.unreadable.push(format!(
+            "wrapper distribution {} (not unpacked under {})",
+            wrapper.url,
+            dists.display()
+        )),
+        None => {}
+    }
+    dirs.extend(home.gradle_home.as_ref().map(|g| g.join("init.d")));
+    for dir in dirs {
+        for name in list_dir(&dir) {
+            if is_init_script_name(&name) {
+                out.read(&dir.join(name));
+            }
+        }
+    }
+    out
+}
+
+// ── the build and mavenLocal() ──────────────────────────────────────────
+
+/// Gradle build files (the Gradle half of `jvm_cache::JVM_PROJECT_MARKERS`).
+pub const GRADLE_MARKERS: &[&str] = &[
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+];
+
+const SETTINGS: &[&str] = &["settings.gradle", "settings.gradle.kts"];
+
+/// Whether `dir` holds a Gradle build or settings script.
+pub fn has_gradle_marker(dir: &Path) -> bool {
+    GRADLE_MARKERS.iter().any(|m| dir.join(m).is_file())
+}
+
+/// The Gradle build roots to analyse for a cwd that is a Gradle project:
+/// the cwd itself and, when it has no settings script, the nearest ancestor
+/// that has one (Gradle searches upwards for the settings of a
+/// subproject). Empty when the cwd has no Gradle marker.
+pub fn build_roots(cwd: &Path) -> Vec<PathBuf> {
+    if !has_gradle_marker(cwd) {
+        return Vec::new();
+    }
+    let mut roots = vec![cwd.to_path_buf()];
+    if !SETTINGS.iter().any(|s| cwd.join(s).is_file()) {
+        if let Some(up) = cwd
+            .ancestors()
+            .skip(1)
+            .find(|d| SETTINGS.iter().any(|s| d.join(s).is_file()))
+        {
+            roots.push(up.to_path_buf());
+        }
+    }
+    roots
+}
+
+/// The script graph of the build at `root`, with the init scripts that
+/// apply to it (unreadable ones noted).
+pub fn script_graph(root: &Path, init: &InitScripts) -> ScriptGraph {
+    let read = fs_text_read(root);
+    let list = fs_list(root);
+    let mut graph = ScriptGraph::collect(&read, &list, "", &init.scripts);
+    for tag in &init.unreadable {
+        graph.note_unreadable_init_script(tag);
+    }
+    graph
+}
+
+/// Whether the Gradle build at `cwd` reads the Maven local repository
+/// (`mavenLocal()`), across every build root ([`build_roots`]) and the init
+/// scripts that apply. `home` is the Gradle user home (`None` = unknown,
+/// so the init scripts are too). Declared wins over undetermined, which
+/// wins over not declared.
+pub fn maven_local(cwd: &Path, home: Option<&GradleHome>) -> MavenLocal {
+    let mut verdict = MavenLocal::NotDeclared;
+    for root in build_roots(cwd) {
+        let init = match home {
+            Some(home) => init_scripts_for_build(home, &root),
+            None => InitScripts {
+                unreadable: vec!["(no Gradle user home could be resolved)".to_string()],
+                ..InitScripts::default()
+            },
+        };
+        match script_graph(&root, &init).maven_local() {
+            declared @ MavenLocal::Declared(_) => return declared,
+            undetermined @ MavenLocal::Undetermined(_) => {
+                if verdict == MavenLocal::NotDeclared {
+                    verdict = undetermined;
+                }
+            }
+            MavenLocal::NotDeclared => {}
+        }
+    }
+    verdict
+}
+
+/// The modules locked by the lock files of the Gradle build at `cwd`
+/// (every build root's graph-scoped lock files,
+/// `ScriptGraph::lockfile_paths`). An annotation only: locks never narrow
+/// discovery.
+pub fn locked_gavs(cwd: &Path) -> BTreeSet<Gav> {
+    let mut out = BTreeSet::new();
+    for root in build_roots(cwd) {
+        let graph = script_graph(&root, &InitScripts::default());
+        let read = fs_text_read(&root);
+        for rel in graph.lockfile_paths(&fs_list(&root)) {
+            let Some(text) = read(&rel) else {
+                continue;
+            };
+            for e in crate::gradle::locks::parse(&text).entries {
+                out.insert((e.group, e.artifact, e.version));
+            }
+        }
+    }
     out
 }
