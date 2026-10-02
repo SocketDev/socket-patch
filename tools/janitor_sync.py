@@ -22,6 +22,7 @@ after a crash doesn't post it twice. Closing an already-closed discussion
 or setting an identical body does nothing. Ops that fail are listed in
 applied.json under "failed" with the error, and are not retried.
 """
+import base64
 import datetime
 import glob
 import json
@@ -42,6 +43,40 @@ def gql(query, **vars):
     if r.returncode or data.get("errors"):
         raise RuntimeError(data.get("errors") or r.stderr.strip())
     return data["data"]
+
+
+BRANCH = "janitor/ledger"
+
+
+def commit_files(paths, message):
+    """Commit files to BRANCH via createCommitOnBranch.
+
+    The repo requires verified signatures, and GitHub signs commits it creates
+    through the API, whereas a plain `git push` from the runner is rejected.
+    Retries when the branch moved under us (the routine pushed meanwhile)."""
+    import tempfile
+    for attempt in range(6):
+        head = subprocess.run(["gh", "api", f"repos/{OWNER}/{REPO}/git/ref/heads/{BRANCH}", "--jq", ".object.sha"],
+                              check=True, capture_output=True, text=True).stdout.strip()
+        payload = {
+            "query": "mutation($i:CreateCommitOnBranchInput!){createCommitOnBranch(input:$i){commit{oid}}}",
+            "variables": {"i": {
+                "branch": {"repositoryNameWithOwner": f"{OWNER}/{REPO}", "branchName": BRANCH},
+                "expectedHeadOid": head,
+                "message": {"headline": message},
+                "fileChanges": {"additions": [
+                    {"path": p, "contents": base64.b64encode(open(p, "rb").read()).decode()} for p in paths]},
+            }},
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(payload, f)
+        r = subprocess.run(["gh", "api", "graphql", "--input", f.name], capture_output=True, text=True)
+        data = json.loads(r.stdout or "{}")
+        if r.returncode == 0 and not data.get("errors"):
+            print("committed", data["data"]["createCommitOnBranch"]["commit"]["oid"])
+            return
+        print(f"::warning::commit attempt {attempt + 1} failed: {data.get('errors') or r.stderr.strip()}")
+    raise RuntimeError("could not commit the snapshot")
 
 
 COMMENT_FIELDS = "id url author{login} createdAt updatedAt body isAnswer"
@@ -167,6 +202,9 @@ def main():
     with open("applied.json", "w") as f:
         json.dump(applied, f, indent=1)
         f.write("\n")
+    meta = json.load(open("snapshot/meta.json"))
+    commit_files(["snapshot/discussions.json", "snapshot/meta.json", "applied.json"],
+                 f"snapshot: {meta['generated_at']}")
 
 
 if __name__ == "__main__":

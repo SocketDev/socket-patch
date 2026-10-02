@@ -3,7 +3,8 @@ name: janitor ledger to discussions
 # Cloud agent sessions can't use GitHub GraphQL. The issue & discussion
 # janitor routine pushes ops/*.json here. This workflow applies them with
 # the Actions token, then commits a fresh snapshot of every discussion
-# (snapshot/) back to this branch for the routine to read with git. Pushes
+# (snapshot/) back to this branch through createCommitOnBranch: the repo
+# requires signed commits, and GitHub signs API-created commits. Commits
 # made with GITHUB_TOKEN don't trigger workflows, so there's no loop. Ops
 # are idempotent and tracked in applied.json, so a cancelled run is
 # recovered by the next one.
@@ -28,20 +29,8 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: janitor/ledger
-      - name: Apply ops and snapshot discussions
+          persist-credentials: false
+      - name: Apply ops, snapshot discussions and commit the snapshot
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 tools/janitor_sync.py
-      - name: Commit the snapshot
-        run: |
-          set -euo pipefail
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add snapshot applied.json
-          git diff --cached --quiet && exit 0
-          git commit -q -m "snapshot: $(jq -r .generated_at snapshot/meta.json)"
-          for i in 1 2 3 4 5; do
-            git push -q origin HEAD:janitor/ledger && exit 0
-            git pull -q --rebase origin janitor/ledger
-          done
-          exit 1
