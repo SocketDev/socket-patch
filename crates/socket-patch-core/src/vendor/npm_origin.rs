@@ -125,7 +125,7 @@ impl NpmOverrides {
         let best = search.best.filter(|b| !b.contested)?;
         // npm ignores a `*` (or empty) replacement: the raw spec stays.
         let value = best.value.trim();
-        (!value.is_empty() && value != "*").then(|| best.value)
+        (!value.is_empty() && value != "*").then_some(best.value)
     }
 
     /// Search `rules` (nested `depth` levels deep; the enclosing rules
