@@ -418,19 +418,29 @@ async fn package_manager_recorded_site_packages(
     cwd: &Path,
     var: &impl Fn(&str) -> Option<String>,
 ) -> Option<Vec<PathBuf>> {
-    if let Some(found) = pdm_project_site_packages(cwd).await {
+    if let Some(found) = pdm_project_site_packages(cwd, var).await {
         return Some(found);
     }
     uv_project_environment_site_packages(cwd, var).await
 }
 
 /// PDM's env for `cwd` (see [`package_manager_recorded_site_packages`]).
-async fn pdm_project_site_packages(cwd: &Path) -> Option<Vec<PathBuf>> {
+/// `PDM_IGNORE_SAVED_PYTHON` makes PDM disregard the saved interpreter.
+async fn pdm_project_site_packages(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Option<Vec<PathBuf>> {
     let pep582 = || async {
         let found = find_python_dirs(&cwd.join("__pypackages__"), &["*", "lib"]).await;
         (!found.is_empty()).then_some(found)
     };
-    match pdm_saved_interpreter(cwd).await {
+    let ignore_saved = var("PDM_IGNORE_SAVED_PYTHON").is_some_and(|v| !v.is_empty());
+    let saved = if ignore_saved {
+        None
+    } else {
+        pdm_saved_interpreter(cwd).await
+    };
+    match saved {
         Some(python) => match venv_root_of_interpreter(&python) {
             Some(root) => {
                 let found = find_site_packages_under(&root, "site-packages").await;
@@ -2252,6 +2262,13 @@ mod tests {
         assert_eq!(
             find_local_venv_site_packages_with(&project, &activated).await,
             vec![pdm_site.clone()]
+        );
+
+        // `PDM_IGNORE_SAVED_PYTHON` makes PDM disregard `.pdm-python`.
+        let ignored = env_of(&[("PDM_IGNORE_SAVED_PYTHON", "1".to_string())]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &ignored).await,
+            vec![stray.clone()]
         );
 
         // Legacy PDM (`.pdm.toml` `[python] path`) records the same thing.
