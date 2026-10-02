@@ -693,7 +693,8 @@ pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
         let settings = ["settings.gradle", "settings.gradle.kts"]
             .into_iter()
             .find(|f| reader.read(f).is_some());
-        if let Some(settings) = settings {
+        // Only a Gradle project can belong to an ancestor Gradle build.
+        if let Some(settings) = settings.filter(|_| own_build || own_settings) {
             let owner = crate::gradle::graph::subproject_owner(&read_text, settings, &rel);
             // A Gradle project with no settings of its own is configured
             // by the nearest ancestor settings, whatever it includes.
@@ -1048,6 +1049,7 @@ async fn vendor_maven_jvm(
     // Classifier artifacts the tree serves beside the jar (#533): every
     // declared classifier, and the sources jar when any copy is at hand.
     if gradle && (extras.is_none() || online) {
+        let committed = extras.take().unwrap_or_default();
         let mut found = Vec::new();
         let declared =
             super::jvm::gradle::declared_classifiers(&read, &list, &group_id, &artifact_id);
@@ -1062,7 +1064,8 @@ async fn vendor_maven_jvm(
                     extension: "jar".to_string(),
                     bytes,
                 }),
-                // The planner refuses a declared one it is not handed.
+                // The planner refuses a declared one it is not handed (a
+                // committed copy is kept below).
                 Ok(None) => {}
                 Err(e) if required => {
                     return refused(
@@ -1073,9 +1076,17 @@ async fn vendor_maven_jvm(
                 Err(_) => {}
             }
         }
+        // A classifier the committed tree already serves stays (the re-run
+        // checked its hash against the marker): dropping it would leave an
+        // unindexed file the script refuses.
+        for x in committed {
+            if !found.iter().any(|f| f.classifier == x.classifier) {
+                found.push(x);
+            }
+        }
         if !found.iter().any(|x| x.classifier == "sources") {
             warnings.push(VendorWarning::new(
-                "vendor_jvm_note",
+                super::jvm::gradle::NOTE,
                 format!(
                     "reason: ide_sources_unavailable: {artifact_id}-{version}-sources.jar is in \
                      no local cache{}, so IDEs attach no sources to the vendored \
@@ -1241,6 +1252,8 @@ async fn vendor_maven_jvm(
     let jar_path = project_root.join(&plan.jar_rel);
     result.package_path = jar_path.display().to_string();
     if plan.writes.is_empty() && (previous.is_none() || registry_verified == prior_verified) {
+        // Notes describe what a vendoring did; an in-sync run did nothing.
+        warnings.retain(|w| w.code != super::jvm::gradle::NOTE);
         return done(
             already_patched_result(purl, &jar_path, &record.files),
             None,

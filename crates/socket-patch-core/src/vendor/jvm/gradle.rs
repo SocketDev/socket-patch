@@ -1190,7 +1190,8 @@ fn shape_refusal(reason: &str, msg: String) -> JvmRefusal {
 
 /// The code of a warning that withholds VEX attestation.
 pub(crate) const DEGRADED: &str = "vendor_jvm_degraded";
-/// The code of an informational note.
+/// The code of an informational note (reported by a run that vendors,
+/// not by an in-sync re-run).
 pub(crate) const NOTE: &str = "vendor_jvm_note";
 
 fn degraded(reason: &str, msg: String) -> JvmWarning {
