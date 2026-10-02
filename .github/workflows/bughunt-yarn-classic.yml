@@ -201,7 +201,7 @@ jobs:
             n=$(grep -c "127.0.0.1\|file:" "$P/yarn.lock")
             result "case=dev-$m-add rc=$rc wired-lines=$n err=$(grep -m1 -i '^error' "$W/dev-$m.add.log" | cut -c1-90 | tr ' ' _) installed=$(markers "$P")"
             check "$P" dev-$m-after-add
-            (cd "$P" && SOCKET_PATCH_SERVER_URL=$API "$SP" vex --product pkg:npm/root@1.0.0 -O "$W/dev-$m.vex.json" > /dev/null 2>"$W/dev-$m.vex.err"); rc=$?
+            (cd "$P" && SOCKET_PATCH_SERVER_URL=$API sp vex --product pkg:npm/root@1.0.0 -O "$W/dev-$m.vex.json" > /dev/null 2>"$W/dev-$m.vex.err"); rc=$?
             result "case=dev-$m-vex rc=$rc subs=$($PY -c "import json,sys;d=json.load(open(sys.argv[1]));print(','.join(sorted(c['@id'] for s in d['statements'] for c in s['products'][0].get('subcomponents',[]))))" "$W/dev-$m.vex.json" 2>&1 | tail -1)"
             if [ $m = vendored ]; then (cd "$P" && "$SP" vendor --check --json > "$W/dev-$m.chk.json" 2>&1); result "case=dev-$m-vendor-check rc=$? $(head -c 300 "$W/dev-$m.chk.json" | tr -d '\n ' )"; fi
             # pure-lockfile reinstall from scratch must not change the lock
