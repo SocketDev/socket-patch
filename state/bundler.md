@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-01 (run 6), main `61cfb9b`, latest release tag v4.0.0.
+Last updated: 2026-10-02 (run 7), main `61cfb9b`, latest release tag v4.0.0.
 
 ## Coverage matrix
 
@@ -36,17 +36,24 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 
 | Bundler | `eval_gemfile` declaration | loop-generated `gem g` | Transitive, no trailing newline | Transitive, CRLF | Committed `vendor/cache` guard | Committed cache at configured `cache_path` | Vendored `eval_gemfile` |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 4.0.17 | fail #482 | fail #482 | pass | pass | pass | fail #483 | blocked (service artifact) |
-| 2.6.9 | fail #482 | untested | untested | untested | pass | fail #483 | untested |
-| 2.4.22 | fail #482 | untested | untested | untested | pass (warns; install stays unpatched per the remedy) | fail #483 (silent unpatched install) | untested |
+| 4.0.17 | fail #482 | fail #482 | pass | pass | pass | fail #483 | fail #482 |
+| 2.6.9 | fail #482 | untested | untested | untested | pass | fail #483 | fail #482 |
+| 2.4.22 | fail #482 | untested | untested | untested | pass (warns; install stays unpatched per the remedy) | fail #483 (silent unpatched install) | fail #482 |
 
 ### `BUNDLE_GEMFILE` env vs `.bundle/config` (run 6, Linux, Ruby 3.3.6)
 
 | Bundler | Hosted: config `Gemfile.next` + env `Gemfile` | Vendored: same | Env only `Gemfile.next` | Config only `Gemfile.next` |
 | --- | --- | --- | --- | --- |
-| 4.0.17 | fail #507 | untested | untested | pass (e2e suite) |
-| 2.6.9 | fail #507 | untested | untested | untested |
-| 2.4.22 | fail #507 | untested | untested | untested |
+| 4.0.17 | fail #507 | fail #507 | vendored pass (refused) | pass (e2e suite) |
+| 2.6.9 | fail #507 | fail #507 | untested | untested |
+| 2.4.22 | fail #507 | fail #507 | untested | untested |
+
+### Vendored declaration shapes and lifecycle (run 7, Linux, Ruby 3.3.6)
+
+| Bundler | Multi-line decl | `if` modifier | `group` + `platforms:` | CRLF + `gem(...)` | Re-run idempotent | Double `--revert` byte-exact |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4.0.17 | pass (refused) | pass (refused) | pass (refused) | pass (refused) | pass | pass |
+| 2.4.22 | untested | untested | untested | untested | pass | pass |
 
 ### Global mode (`-g`)
 
@@ -62,13 +69,12 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 ## Backlog
 
 1. **Maintainer request (still open):** global (`-g`) mode on every major version and OS. Remaining: macOS system Ruby and Homebrew Ruby; rbenv / rvm / chruby / asdf layouts; unicode or space-containing `--global-prefix`; a non-writable dir on macOS and Windows (Program Files); `-g` from inside a project on macOS and Windows. Re-check #421 once #442 merges.
-2. The vendored arm of #507 (`vendor/gem.rs:149`), driven through a copy of `e2e_vendor_gem_build.rs`.
-3. Vendored `eval_gemfile` / loop declaration (the sibling of #482 at `vendor/gem.rs`).
-4. `BUNDLE_CACHE_PATH` from the environment (#483's variant); `vendor/cache` + `rollback`.
-5. #340 on Bundler 2.2–2.5 (Linux); re-run #340 / #482 once the Gemfile rewriter changes.
+2. `BUNDLE_CACHE_PATH` from the environment (#483's variant); `vendor/cache` + `rollback`.
+3. #340 on Bundler 2.2–2.5 (Linux); re-run #340 / #482 / #507 once the Gemfile rewriter or `manifest::classify` changes.
+4. Windows hosted and vendored cells: CRLF Gemfile / lock, a `BUNDLE_PATH` with a drive letter or spaces, `x64-mingw-ucrt` platform gems, and `vendor/bundle` deployment mode.
+5. Vendored transitive dep in a `gemspec` (PATH) project; vendored on a multi-platform CHECKSUMS lock.
 6. Windows local mode for a Bundler project on system gems (no `BUNDLE_PATH`): does #421 hide the project's gems too?
-7. Windows hosted cells: CRLF Gemfile / lock, a `BUNDLE_PATH` with a drive letter or spaces, `x64-mingw-ucrt` platform gems, and `vendor/bundle` deployment mode.
-8. Ruby 3.4 + Bundler 2.2 can't boot. Check the floor messaging, and run `scan` from a subdirectory of a Bundler project.
+7. Ruby 3.4 + Bundler 2.2 can't boot. Check the floor messaging, and run `scan` from a subdirectory of a Bundler project.
 
 ## Known non-bugs
 
@@ -92,3 +98,5 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 - `scan --vex` takes `--vex-product`, not `--product` (that's `vex`'s flag). Without either, a gem project fails with `product_undetected`.
 - A committed `vendor/cache` with a stale archive still installs unpatched on Bundler 2.4 after the hosted scan. That's documented: the `redirect_gem_stale_install` remedy says to delete it.
 - Bundler's runtime `require "bundler/setup"` (without `bundle exec`) reads only the `BUNDLE_GEMFILE` env var, not `.bundle/config`; the CLI commands (`install`, `lock`, `exec`) let `.bundle/config` win. #507 is about the CLI order, which decides what gets installed.
+- Vendored mode refuses multi-line, conditional (`if`/`unless`), indented (`group`) and parenthesized `gem(...)` declarations with `gemfile_declaration_not_editable` and writes nothing. That's fail-closed by design, unlike the hosted rewriter (#340).
+- The vendor probes need `BUNDLER_VERSION=<v>` alongside `SOCKET_PATCH_BUNDLER_E2E_VERSION=<v>` to pick a Bundler older than the Ruby default (2.5.22 on 3.3.6).
