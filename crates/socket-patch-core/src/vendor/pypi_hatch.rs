@@ -251,8 +251,20 @@ pub(super) async fn revert(entry: &VendorEntry, root: &Path, dry_run: bool) -> R
             return RevertOutcome::failed("missing Hatch wiring document");
         };
         match super::pypi_lock::restore_document(live, original, new) {
-            Ok((restored, false)) => {
+            Ok((restored, false))
+                if !super::pypi_lock::still_references_artifact(
+                    &restored,
+                    original,
+                    &entry.uuid,
+                ) =>
+            {
                 edits.insert(record.file.clone(), restored);
+            }
+            Ok((_, false)) => {
+                return RevertOutcome::failed(format!(
+                "{} still references the vendored artifact after restoring the recorded entries",
+                record.file
+            ))
             }
             Ok((_, true)) => {
                 return RevertOutcome::failed(format!("{} changed since patching", record.file))
@@ -513,5 +525,56 @@ mod tests {
                 "{from} -> {to}"
             );
         }
+    }
+
+    /// Review on #481: a user-added copy of the vendored requirement (here
+    /// with an environment marker) survives the merge as a sibling, so the
+    /// revert must refuse rather than delete the wheel it installs from.
+    #[tokio::test]
+    async fn revert_refuses_while_an_added_line_references_the_artifact() {
+        let original =
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n";
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        tokio::fs::write(root.join("pyproject.toml"), original)
+            .await
+            .unwrap();
+        let project = load(root, "six", "1.16.0", UUID).await.unwrap();
+        let wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let wiring = wire(&project, root, "six", "1.16.0", &wheel, &"0".repeat(64))
+            .await
+            .unwrap();
+        let entry = entry(UUID, "six", &wheel, &"0".repeat(64), wiring);
+        let patched = tokio::fs::read_to_string(root.join("pyproject.toml"))
+            .await
+            .unwrap();
+        let start = patched.find("\"six @").unwrap();
+        let end = start + 1 + patched[start + 1..].find('"').unwrap();
+        let requirement = &patched[start + 1..end];
+        let edited = patched.replacen(
+            "dependencies = [",
+            &format!("dependencies = [\"{requirement} ; python_version >= '3.8'\", "),
+            1,
+        );
+        tokio::fs::write(root.join("pyproject.toml"), &edited)
+            .await
+            .unwrap();
+        let outcome = revert(&entry, root, false).await;
+        assert!(!outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("still references the vendored artifact"),
+            "{:?}",
+            outcome.error
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("pyproject.toml"))
+                .await
+                .unwrap(),
+            edited
+        );
     }
 }

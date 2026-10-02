@@ -700,6 +700,16 @@ fn allowed_file(file: &str, kind: &str) -> bool {
             || (kind == SCRIPT_KIND && file.ends_with(".py")))
 }
 
+/// Whether `restored` still points at this patch's vendored artifact
+/// directory although `original` did not. The merge keeps elements it did
+/// not record (a user's added sibling), and one of those may be a copy of
+/// the vendored requirement: reporting the revert complete would delete a
+/// wheel that line still installs from.
+pub(super) fn still_references_artifact(restored: &str, original: &str, uuid: &str) -> bool {
+    let needle = format!("vendor/pypi/{uuid}");
+    restored.contains(&needle) && !original.contains(&needle)
+}
+
 pub(super) async fn revert_python_locks(
     entry: &VendorEntry,
     root: &Path,
@@ -756,6 +766,14 @@ pub(super) async fn revert_python_locks(
                 "vendor_lock_entry_drifted",
                 format!(
                     "{} changed since vendoring; conflicting fields were preserved",
+                    record.file
+                ),
+            ));
+        } else if still_references_artifact(&restored, original, &entry.uuid) {
+            warnings.push(VendorWarning::new(
+                "vendor_lock_entry_drifted",
+                format!(
+                    "{} still references the vendored artifact after restoring the recorded entries",
                     record.file
                 ),
             ));
@@ -1031,6 +1049,21 @@ mod tests {
         let (restored, drifted) = restore_document(&live, original, &new).unwrap();
         assert!(!drifted, "{restored}");
         assert_eq!(restored, add_idna(original));
+    }
+
+    /// Review on #481: an added copy of the vendored element survives the
+    /// merge, so the revert must see the leftover artifact reference.
+    #[test]
+    fn leftover_artifact_reference_is_detected() {
+        let original = "dependencies = [\"six==1.16.0\"]\n";
+        let new = "dependencies = [\"six @ file:///p/.socket/vendor/pypi/u/six.whl\"]\n";
+        let live = "dependencies = [\"six @ file:///p/.socket/vendor/pypi/u/six.whl ; python_version >= '3.8'\", \"six @ file:///p/.socket/vendor/pypi/u/six.whl\"]\n";
+        let (restored, drifted) = restore_document(live, original, new).unwrap();
+        assert!(!drifted, "{restored}");
+        assert!(still_references_artifact(&restored, original, "u"));
+        assert!(!still_references_artifact(original, original, "u"));
+        // Another patch's artifact (a stacked vendoring) is not this one's.
+        assert!(!still_references_artifact(&restored, original, "v"));
     }
 
     /// Appending to (or prepending to) a recorded array of strings keeps the

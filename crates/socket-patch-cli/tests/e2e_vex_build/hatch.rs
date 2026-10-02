@@ -367,6 +367,52 @@ fn flow(flavor: Flavor, mode: Mode) {
             "revert-after-project-edits",
             "pass",
         );
+
+        // Review on #481: an added, marked copy of the vendored requirement
+        // still installs from the wheel, so the revert must refuse and keep
+        // both the file and the artifact.
+        let copied = tmp.path().join("copied");
+        copy_tree(&project, &copied, &[]);
+        let start = wired.find("\"six @").unwrap() + 1;
+        let requirement = &wired[start..start + wired[start..].find('"').unwrap()];
+        let with_copy = wired.replacen(
+            "dependencies = [",
+            &format!("dependencies = [\"{requirement} ; python_version >= '3.8'\", "),
+            1,
+        );
+        std::fs::write(copied.join("pyproject.toml"), &with_copy).unwrap();
+        let out = std::process::Command::new(vex_e2e_common::binary())
+            .args(["vendor", "--revert", "--json", "--cwd"])
+            .arg(&copied)
+            .current_dir(&copied)
+            .output()
+            .unwrap();
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "{what}: revert with a copied vendored requirement: {}",
+            out_text(&out)
+        );
+        assert_eq!(
+            std::fs::read_to_string(copied.join("pyproject.toml")).unwrap(),
+            with_copy,
+            "{what}: revert with a copied vendored requirement"
+        );
+        assert!(
+            copied
+                .join(".socket/vendor/pypi")
+                .join(mode.uuid())
+                .exists(),
+            "{what}: the still-referenced artifact was deleted: {}",
+            out_text(&out)
+        );
+        record(
+            "hatch",
+            &version,
+            &format!("{cell}/{}", mode.label()),
+            "revert-refuses-copied-reference",
+            "pass",
+        );
     }
 
     // ── fresh checkout, real `hatch env create` ───────────────────────
