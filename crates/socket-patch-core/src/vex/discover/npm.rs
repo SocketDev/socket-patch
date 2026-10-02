@@ -252,7 +252,9 @@ fn drop_non_registry_installs(
             continue;
         };
         out.resolved_elsewhere(file, Some(purl.clone()));
-        read.unwired.entry(purl.clone()).or_insert_with(|| key.clone());
+        read.unwired
+            .entry(purl.clone())
+            .or_insert_with(|| key.clone());
         unpatched.push((purl, key, reason));
     }
     read.refs.retain(|r| {
@@ -1140,7 +1142,8 @@ mod tests {
     async fn issue_588_unwired_registry_copy_in_the_same_lock_contests_the_ref() {
         let hosted = hosted_url("npm", "is-number", "6.0.0", UUID_A, "is-number-6.0.0.tgz");
         let vendored = format!("file:.socket/vendor/npm/{UUID_B}/is-number-6.0.0.tgz");
-        let registry = |v: &str| format!("https://registry.npmjs.org/is-number/-/is-number-{v}.tgz");
+        let registry =
+            |v: &str| format!("https://registry.npmjs.org/is-number/-/is-number-{v}.tgz");
         for (label, resolved, uuid, mode) in [
             ("hosted", hosted.clone(), UUID_A, WiringMode::Hosted),
             ("vendored", vendored.clone(), UUID_B, WiringMode::Vendored),
@@ -1189,7 +1192,11 @@ mod tests {
             &out,
             &[("pkg:npm/is-number@6.0.0", UUID_A, WiringMode::Hosted)],
         );
-        assert!(same_lock_contests(&out).is_empty(), "{:#?}", out.diagnostics);
+        assert!(
+            same_lock_contests(&out).is_empty(),
+            "{:#?}",
+            out.diagnostics
+        );
     }
 
     /// #490: a git edge the project's `overrides` send to the registry is

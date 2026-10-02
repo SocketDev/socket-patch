@@ -434,9 +434,7 @@ struct Unwired {
 impl Unwired {
     fn record(&mut self, purl: Option<String>, label: &str) {
         if let Some(purl) = purl {
-            self.copies
-                .entry(purl)
-                .or_insert_with(|| label.to_string());
+            self.copies.entry(purl).or_insert_with(|| label.to_string());
         }
     }
 
@@ -736,7 +734,10 @@ mod tests {
                 })
                 .count()
         };
-        for (label, spec) in [("hosted", format!("left-pad@{hosted}")), ("vendored", vendored)] {
+        for (label, spec) in [
+            ("hosted", format!("left-pad@{hosted}")),
+            ("vendored", vendored),
+        ] {
             let p = Project::new();
             p.write(
                 "bun.lock",

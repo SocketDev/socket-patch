@@ -1559,7 +1559,13 @@ fn vendored_npm_patch_with_an_unwired_registry_copy_in_the_same_lock() {
             )
         });
         let check = cli()
-            .args(["vendor", "--check", "--cwd", cwd.to_str().unwrap(), "--json"])
+            .args([
+                "vendor",
+                "--check",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--json",
+            ])
             .output()
             .expect("invoke vendor --check");
         let check_env: Value = serde_json::from_slice(&check.stdout).unwrap_or_else(|e| {
