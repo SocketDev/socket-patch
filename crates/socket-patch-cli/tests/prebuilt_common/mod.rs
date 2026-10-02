@@ -848,7 +848,7 @@ mod prebuilt_common_selftests {
         // The version dir resolves to the jar's hash dir, and the pom is
         // found beside it in its own hash dir.
         let purl = "pkg:maven/com.socketfixture/victim@1.10.0";
-        let found = source_dir(tmp.path(), &[version_dir.clone()], purl);
+        let found = source_dir(tmp.path(), std::slice::from_ref(&version_dir), purl);
         assert_eq!(found, jar_dir);
         assert_eq!(
             maven_sibling(&found, "victim-1.10.0.pom"),

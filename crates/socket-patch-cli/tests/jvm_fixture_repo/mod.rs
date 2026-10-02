@@ -291,7 +291,7 @@ fn parent_pom() -> String {
 /// A jar pom under `fixture-parent` (the project's own `<version>` follows
 /// `</parent>`, the shape `hosted_maven_common::Hosted::served_pom` rewrites).
 fn jar_pom(artifact: &str, version: &str, gradle_metadata: bool, deps: &[(&str, &str)]) -> String {
-    let mut pom = format!("{POM_HEAD}");
+    let mut pom = POM_HEAD.to_string();
     if gradle_metadata {
         pom.push_str(GRADLE_METADATA_HINT);
     }
@@ -314,7 +314,7 @@ fn jar_pom(artifact: &str, version: &str, gradle_metadata: bool, deps: &[(&str, 
 /// A `pom`-packaged pom managing `victim:1.10.0` (the BOM, and the
 /// platform's Maven face).
 fn managing_pom(artifact: &str, version: &str, gradle_metadata: bool) -> String {
-    let mut pom = format!("{POM_HEAD}");
+    let mut pom = POM_HEAD.to_string();
     if gradle_metadata {
         pom.push_str(GRADLE_METADATA_HINT);
     }
