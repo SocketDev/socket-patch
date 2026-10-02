@@ -40,7 +40,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use socket_patch_core::crawlers::npm_crawler::find_store_peer_variant_copies;
+use socket_patch_core::crawlers::npm_crawler::with_store_peer_variant_copies;
 use socket_patch_core::crawlers::{
     CargoCrawler, CrawlerOptions, Ecosystem, GoCrawler, MavenCrawler, NpmCrawler,
 };
@@ -109,7 +109,7 @@ pub(crate) async fn hosted_consumed_copies(
             let mut paths = all.remove(purl).unwrap_or_default();
             paths.extend(aliases.remove(purl).unwrap_or_default());
             if npm.contains(&purl) {
-                paths = with_store_variants(paths).await;
+                paths = with_store_peer_variant_copies(paths).await;
             }
             out.insert(
                 purl.clone(),
@@ -313,28 +313,6 @@ async fn npm_identity_fallback_reusing(
         Some(installed) => all.extend(npm_paths_by_identity_in(installed, &missing)),
         None => all.extend(npm_paths_by_identity(options, &missing).await),
     }
-}
-
-/// `paths` plus every store variant of each (a pnpm peer suffix, a vlt peer
-/// or modifier extra, a vlt registry-alias instance of the same
-/// `name@version`): the crawler resolves a store copy only for a package
-/// with no importer copy, leaving the variants to apply's fan-out, but each
-/// variant is what some dependent loads.
-async fn with_store_variants(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    for path in &paths {
-        seen.insert(tokio::fs::canonicalize(path).await.unwrap_or(path.clone()));
-    }
-    let mut out = paths.clone();
-    for path in &paths {
-        for copy in find_store_peer_variant_copies(path).await {
-            let canonical = tokio::fs::canonicalize(&copy).await.unwrap_or(copy.clone());
-            if seen.insert(canonical) {
-                out.push(copy);
-            }
-        }
-    }
-    out
 }
 
 // ── golang ───────────────────────────────────────────────────────────────
@@ -851,7 +829,7 @@ mod tests {
             nm.join("left-pad"),
         )
         .unwrap();
-        let mut got = with_store_variants(vec![nm.join("left-pad")]).await;
+        let mut got = with_store_peer_variant_copies(vec![nm.join("left-pad")]).await;
         got.sort();
         let mut want = vec![
             nm.join("left-pad"),
@@ -860,7 +838,7 @@ mod tests {
         ];
         want.sort();
         assert_eq!(got, want);
-        assert!(with_store_variants(Vec::new()).await.is_empty());
+        assert!(with_store_peer_variant_copies(Vec::new()).await.is_empty());
     }
 
     /// vlt twin of the `.pnpm` case: every importer entry is a link into

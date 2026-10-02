@@ -1165,9 +1165,13 @@ impl NpmCrawler {
     /// pnpm's and vlt's store peer-variant copies are deliberately NOT
     /// enumerated here for a copy already found in an importer tree (a
     /// symlinked direct dep): those are handled by the apply engine's
-    /// [`find_store_peer_variant_copies`] fan-out. A transitive-only package
+    /// [`find_store_peer_variant_copies`] fan-out, and a caller that checks
+    /// every copy without applying (`vex`) adds them with
+    /// [`with_store_peer_variant_copies`]. A transitive-only package
     /// that lives ONLY in the store is still resolved (its store copies are
-    /// probed because no importer-tree copy was found).
+    /// probed because no importer-tree copy was found). A copy BUNDLED
+    /// inside another package's store entry is always returned, found or
+    /// not elsewhere: no fan-out reaches it (#601).
     pub async fn find_by_purls(
         &self,
         node_modules_path: &Path,
@@ -1328,11 +1332,24 @@ impl NpmCrawler {
                 for nested in visit.nested {
                     match nested {
                         NestedNodeModules::Dir(dir) => next_level.push((dir, false)),
-                        NestedNodeModules::StoreEntries(entries) => next_level.extend(
-                            Self::pending_store_entries(entries, filter)
+                        NestedNodeModules::StoreEntries(entries) => {
+                            let (probed, skipped): (Vec<StoreEntry>, Vec<StoreEntry>) = entries
                                 .into_iter()
-                                .map(|dir| (dir, true)),
-                        ),
+                                .partition(|entry| Self::store_entry_may_hold(entry, filter));
+                            next_level.extend(probed.into_iter().map(|e| (e.node_modules, true)));
+                            // A skipped entry's own package can still
+                            // carry a BUNDLED copy of a target that was
+                            // already found elsewhere (#601): Node loads
+                            // that copy for the host, so apply and vex
+                            // need it too. Only the bundled tree is
+                            // walked, and only where one exists.
+                            next_level.extend(
+                                par_map(skipped, Self::skipped_entry_bundled_tree)
+                                    .into_iter()
+                                    .flatten()
+                                    .map(|dir| (dir, false)),
+                            );
+                        }
                     }
                 }
             }
@@ -1565,17 +1582,41 @@ impl NpmCrawler {
         entries: Vec<StoreEntry>,
         pending_names: Option<&HashSet<&str>>,
     ) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        for entry in entries {
-            if let (Some(filter), Some((entry_pkg, _version))) = (pending_names, &entry.advertised)
-            {
-                if !filter.contains(entry_pkg.as_str()) {
-                    continue;
-                }
-            }
-            out.push(entry.node_modules);
+        entries
+            .into_iter()
+            .filter(|entry| Self::store_entry_may_hold(entry, pending_names))
+            .map(|entry| entry.node_modules)
+            .collect()
+    }
+
+    /// Whether [`Self::pending_store_entries`] keeps `entry`: no filter, an
+    /// undecodable name, or an advertised package that is still pending.
+    fn store_entry_may_hold(entry: &StoreEntry, pending_names: Option<&HashSet<&str>>) -> bool {
+        match (pending_names, &entry.advertised) {
+            (Some(filter), Some((entry_pkg, _version))) => filter.contains(entry_pkg.as_str()),
+            _ => true,
         }
-        out
+    }
+
+    /// The bundled-dependency tree of a store entry the pending-name filter
+    /// skipped: `<entry>/node_modules/<own package>/node_modules`, the same
+    /// dir an unfiltered visit of the entry would enqueue. The entry's own
+    /// package is the one its name advertises, a real dir there (pnpm, vlt,
+    /// Bun, Deno) or a link to the entry's `package` dir (Yarn 4). One stat
+    /// for an entry without bundled dependencies, which is nearly all of
+    /// them.
+    fn skipped_entry_bundled_tree(entry: StoreEntry) -> Option<PathBuf> {
+        let (own_name, _version) = entry.advertised?;
+        if !own_name.split('/').all(is_safe_npm_component) {
+            return None;
+        }
+        let own = if is_real_package_dir_sync(&entry.node_modules, &own_name) {
+            entry.node_modules.join(&own_name)
+        } else {
+            store_entry_own_package_sync(&entry.node_modules, &own_name)?
+        };
+        let nested = own.join("node_modules");
+        is_dir_sync(&nested).then_some(nested)
     }
 
     // ------------------------------------------------------------------
@@ -2690,6 +2731,31 @@ pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
         }
     }
     copies
+}
+
+/// `paths` plus every store variant of each (a pnpm peer suffix, a Deno
+/// copy index, a vlt peer or modifier extra, a vlt registry-alias instance
+/// of the same `name@version`), deduped by canonical path. This is the
+/// copy set `apply` writes: [`NpmCrawler::find_by_purls`] resolves a store
+/// copy only for a package with no importer copy and leaves the variants
+/// to apply's [`find_store_peer_variant_copies`] fan-out, but each variant
+/// is what some dependent loads, so a check of "every installed copy"
+/// (`vex`) must see them too.
+pub async fn with_store_peer_variant_copies(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for path in &paths {
+        seen.insert(tokio::fs::canonicalize(path).await.unwrap_or(path.clone()));
+    }
+    let mut out = paths.clone();
+    for path in &paths {
+        for copy in find_store_peer_variant_copies(path).await {
+            let canonical = tokio::fs::canonicalize(&copy).await.unwrap_or(copy.clone());
+            if seen.insert(canonical) {
+                out.push(copy);
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
