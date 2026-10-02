@@ -1,0 +1,338 @@
+name: Gradle patch compatibility
+
+# The full real-Gradle grid: every hosted OS x every supported Gradle line x
+# every socket-patch mode (agent, hosted, vendored), plus rows the PR tier
+# never runs. ci.yml's `e2e` job keeps a lean ubuntu-only PR tier (one leg
+# per Gradle line x {agent + hosted, vendor + multi-project}).
+#
+# Grid (`cells`, 36): {ubuntu, macos (arm64), windows} x
+#   6.9.4 / JDK 11, 7.6.6 / JDK 17, 8.14.3 / JDK 21, 9.8.0 / JDK 21
+#   x {agent, hosted, vendor}.
+# Extra ubuntu rows (`extras`):
+#   * JDK ceilings — the newest JDK each line runs on: 6.9 <= 16,
+#     7.6 <= 19, 8.14 <= 24 (9.x runs on 17-25; the grid's 21 is its LTS).
+#   * Configuration cache — 9.8.0 with --configuration-cache, hosted and
+#     vendor.
+#   * Isolated Projects — 9.8.0 with
+#     -Dorg.gradle.unsafe.isolated-projects=true, hosted; recording only
+#     (continue-on-error), the probe report is the deliverable.
+#   * Real Central — 8.14.3 against the real Maven Central (#511 derived
+#     maven-metadata.xml, #487 pgp-only verification entries).
+#
+# 9.8.0 is the current release on services.gradle.org (re-checked
+# 2026-10-02; bump it here and in ci.yml together when a newer 9.x ships).
+# 7.6.6 is the last 7.x. Every distribution is sha256-checked against
+# services.gradle.org before use.
+#
+# Each mode runs its suites' `#[ignore]` tests by name prefix (the contract
+# scripts/ci-e2e-bundle.py --check enforces): agent = e2e_gradle_discovery_build
+# + e2e_gradle_agent_build (`gradle_agent_`), hosted = e2e_redirect_gradle_build
+# (`gradle_hosted_`), vendor = e2e_vendor_gradle_build + e2e_vendor_jvm_build
+# (`gradle_vendor_`, `gradle_multi_project`); a row's `suites` / `test_filter`
+# narrow that. A suite whose test file has not landed yet is skipped; every
+# landed suite a cell runs must run at least one test.
+#
+# Unlike ci.yml's e2e-build (scripts/ci-e2e-bundle.py reads ci.yml's rows),
+# `build` compiles exactly the Gradle suites once per OS and the cells
+# download them. Every cell uploads its JSON probe reports
+# (gradle_build_common::probe_report: Gradle / JDK version, resolved jar path
+# and sha256, hash-dir naming, refresh / RO-cache / transform canaries).
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/gradle-compatibility.yml'
+      - 'scripts/ci-e2e-bundle.py'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'crates/socket-patch-core/src/gradle/**'
+      - 'crates/socket-patch-core/src/crawlers/jvm_cache.rs'
+      - 'crates/socket-patch-core/src/crawlers/maven_crawler.rs'
+      - 'crates/socket-patch-core/src/crawlers/gradle_cache.rs'
+      - 'crates/socket-patch-core/src/vendor/jvm/**'
+      - 'crates/socket-patch-core/src/vendor/maven_repo.rs'
+      - 'crates/socket-patch-core/src/vendor/redownload.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/gradle.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/*.gradle'
+      - 'crates/socket-patch-core/src/patch/jvm_jar.rs'
+      - 'crates/socket-patch-cli/tests/gradle_*'
+      - 'crates/socket-patch-cli/tests/gradle_*/**'
+      - 'crates/socket-patch-cli/tests/e2e_*gradle*'
+      - 'crates/socket-patch-cli/tests/e2e_*gradle*/**'
+      - 'crates/socket-patch-cli/tests/e2e_vendor_jvm_build.rs'
+      - 'crates/socket-patch-cli/tests/jvm_fixture_repo/**'
+      - 'crates/socket-patch-cli/tests/hosted_maven_common/**'
+  schedule:
+    # Nightly, off ci.yml's 05:41.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gradle-compat-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SOCKET_NO_CONFIG: '1'
+  SOCKET_NO_UPDATE_CHECK: '1'
+
+jobs:
+  build:
+    name: build ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: gradle-compat
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check the Gradle test-name prefixes
+        run: python3 scripts/ci-e2e-bundle.py --check
+
+      - name: Compile the CLI and the landed Gradle suites
+        id: compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          suites=''
+          targets=()
+          for suite in e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build e2e_vendor_gradle_build e2e_vendor_jvm_build; do
+            if [ -f "crates/socket-patch-cli/tests/$suite.rs" ] || [ -f "crates/socket-patch-cli/tests/$suite/main.rs" ]; then
+              suites="$suites $suite"
+              targets+=(--test "$suite")
+            fi
+          done
+          echo "suites=$suites" >> "$GITHUB_OUTPUT"
+          cargo build --locked -p socket-patch-cli --bin socket-patch
+          cargo test --locked -p socket-patch-cli --no-run --message-format=json-render-diagnostics "${targets[@]}" > target-build.json
+
+      - name: Bundle the binaries the cells run
+        shell: bash
+        env:
+          BUNDLE_OS: ${{ matrix.os }}
+          BUNDLE_SUITES: ${{ steps.compile.outputs.suites }}
+        run: |
+          # shellcheck disable=SC2086 # the suite list is several arguments
+          python3 scripts/ci-e2e-bundle.py --os "$BUNDLE_OS" --cargo-json target-build.json --dest target/gradle-bin --suites $BUNDLE_SUITES
+
+      - uses: ./.github/actions/upload-artifact
+        with:
+          name: gradle-bin-${{ matrix.os }}
+          path: target/gradle-bin/
+          if-no-files-found: error
+          retention-days: 3
+
+  cells:
+    name: gradle ${{ matrix.gradle }} / jdk ${{ matrix.java }} / ${{ matrix.mode }} / ${{ matrix.os }}
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        gradle: ['6.9.4', '7.6.6', '8.14.3', '9.8.0']
+        mode: [agent, hosted, vendor]
+        # Each line's LTS JDK (extends every cell of that line); the empty
+        # keys are the `extras` knobs the shared steps read.
+        include:
+          - {gradle: '6.9.4', java: '11', label: '', gradle_args: '', real_central: '', suites: '', test_filter: ''}
+          - {gradle: '7.6.6', java: '17', label: '', gradle_args: '', real_central: '', suites: '', test_filter: ''}
+          - {gradle: '8.14.3', java: '21', label: '', gradle_args: '', real_central: '', suites: '', test_filter: ''}
+          - {gradle: '9.8.0', java: '21', label: '', gradle_args: '', real_central: '', suites: '', test_filter: ''}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps: &cell-steps
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download the Gradle suites
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: gradle-bin-${{ matrix.os }}*
+          merge-multiple: true
+          path: target/gradle-bin
+
+      - name: Stage the CLI where the test binaries expect it
+        # `CARGO_BIN_EXE_socket-patch` was baked in at compile time as
+        # <checkout>/target/debug/socket-patch.
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=''
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
+          chmod +x target/gradle-bin/* || true
+          mkdir -p target/debug target/tmp target/gradle-probe
+          cp "target/gradle-bin/socket-patch$exe" "target/debug/socket-patch$exe"
+
+      - name: Select the JDK
+        id: jdk
+        # The runner image's JDK when it has the feature release (8, 11, 17
+        # and 21 on every hosted OS), else setup-java (the ceiling rows).
+        shell: bash
+        env:
+          JAVA_FEATURE: ${{ matrix.java }}
+        run: |
+          set -euo pipefail
+          home=''
+          for arch in X64 arm64 ARM64; do
+            var="JAVA_HOME_${JAVA_FEATURE}_${arch}"
+            if [ -n "${!var:-}" ]; then home="${!var}"; break; fi
+          done
+          if [ -n "$home" ]; then
+            bin="$home/bin"
+            if [ "$RUNNER_OS" = Windows ]; then bin="$home\\bin"; fi
+            echo "JAVA_HOME=$home" >> "$GITHUB_ENV"
+            echo "$bin" >> "$GITHUB_PATH"
+            echo "runner-jdk=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "runner-jdk=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Java ${{ matrix.java }}
+        if: steps.jdk.outputs.runner-jdk != 'true'
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+
+      - name: Install Maven 3.9.16 (vendor cells)
+        # gradle_vendor_395 and the multi-project capstone seed through Maven.
+        if: matrix.mode == 'vendor'
+        shell: bash
+        env:
+          MAVEN_VERSION: '3.9.16'
+        run: |
+          url="https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/maven.tgz"
+          curl -fsSL --retry 3 "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
+          python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
+          python -m tarfile -e "$RUNNER_TEMP/maven.tgz" "$RUNNER_TEMP"
+          launcher="$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin/mvn"
+          if [ "$RUNNER_OS" = Windows ]; then launcher="${launcher}.cmd"; fi
+          {
+            echo "SOCKET_PATCH_MAVEN_E2E_MVN=$launcher"
+            echo "SOCKET_PATCH_MAVEN_E2E_VERSION=$MAVEN_VERSION"
+            echo "SOCKET_PATCH_MAVEN_E2E_REQUIRED=1"
+          } >> "$GITHUB_ENV"
+
+      - name: Install Gradle ${{ matrix.gradle }}
+        shell: bash
+        env:
+          GRADLE_VERSION: ${{ matrix.gradle }}
+        run: |
+          url="https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+          curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/gradle.zip"
+          curl -fsSL --retry 3 "$url.sha256" -o "$RUNNER_TEMP/gradle.sha256"
+          python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha256((p/"gradle.zip").read_bytes()).hexdigest() == (p/"gradle.sha256").read_text().strip()'
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+          launcher="$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin/gradle"
+          if [ "$RUNNER_OS" = Windows ]; then launcher="${launcher}.bat"; fi
+          echo "SOCKET_PATCH_GRADLE_E2E_GRADLE=$launcher" >> "$GITHUB_ENV"
+
+      - name: Run the ${{ matrix.mode }} suites
+        shell: bash
+        env:
+          SOCKET_PATCH_GRADLE_E2E_REQUIRED: '1'
+          SOCKET_PATCH_GRADLE_E2E_VERSION: ${{ matrix.gradle }}
+          SOCKET_PATCH_GRADLE_E2E_ARGS: ${{ matrix.gradle_args }}
+          SOCKET_PATCH_GRADLE_E2E_REAL_CENTRAL: ${{ matrix.real_central }}
+          SOCKET_PATCH_GRADLE_E2E_PROBE_DIR: ${{ github.workspace }}/target/gradle-probe
+          CELL_MODE: ${{ matrix.mode }}
+          CELL_SUITES: ${{ matrix.suites }}
+          CELL_FILTER: ${{ matrix.test_filter }}
+        run: |
+          set -uo pipefail
+          exe=''
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
+          case "$CELL_MODE" in
+            agent) suites='e2e_gradle_discovery_build e2e_gradle_agent_build'; filter='gradle_agent_' ;;
+            hosted) suites='e2e_redirect_gradle_build'; filter='gradle_hosted_' ;;
+            vendor) suites='e2e_vendor_gradle_build e2e_vendor_jvm_build'; filter='gradle_vendor_ gradle_multi_project' ;;
+            *) echo "::error::unknown mode $CELL_MODE"; exit 1 ;;
+          esac
+          if [ -n "$CELL_SUITES" ]; then suites="$CELL_SUITES"; fi
+          if [ -n "$CELL_FILTER" ]; then filter="$CELL_FILTER"; fi
+          cd crates/socket-patch-cli
+          export CARGO_MANIFEST_DIR="$PWD"
+          status=0
+          for suite in $suites; do
+            if [ ! -f "tests/$suite.rs" ] && [ ! -f "tests/$suite/main.rs" ]; then
+              echo "::notice::$suite has not landed yet; skipped"
+              continue
+            fi
+            log="../../target/gradle-$suite.log"
+            # shellcheck disable=SC2086 # the filter is several libtest arguments
+            if ! "../../target/gradle-bin/$suite$exe" --ignored --nocapture $filter 2>&1 | tee "$log"; then
+              status=1
+              continue
+            fi
+            # Per suite: another suite's tests must not hide one whose
+            # filter selects nothing.
+            passed=$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed;.*/\1/p' "$log" | head -n 1)
+            if [ "${passed:-0}" = 0 ]; then
+              echo "::error::$suite ran no test in the $CELL_MODE cell ($filter)"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: Upload the probe reports
+        if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: gradle-probe-${{ matrix.os }}-${{ matrix.gradle }}-jdk${{ matrix.java }}-${{ matrix.mode }}${{ matrix.label && format('-{0}', matrix.label) || '' }}
+          path: target/gradle-probe/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  extras:
+    name: gradle ${{ matrix.gradle }} / jdk ${{ matrix.java }} / ${{ matrix.mode }} / ${{ matrix.label }}
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # JDK ceilings.
+          - {os: ubuntu-latest, gradle: '6.9.4', java: '16', mode: agent, label: jdk-ceiling}
+          - {os: ubuntu-latest, gradle: '6.9.4', java: '16', mode: hosted, label: jdk-ceiling}
+          - {os: ubuntu-latest, gradle: '6.9.4', java: '16', mode: vendor, label: jdk-ceiling}
+          - {os: ubuntu-latest, gradle: '7.6.6', java: '19', mode: agent, label: jdk-ceiling}
+          - {os: ubuntu-latest, gradle: '7.6.6', java: '19', mode: hosted, label: jdk-ceiling}
+          - {os: ubuntu-latest, gradle: '7.6.6', java: '19', mode: vendor, label: jdk-ceiling}
+          - {os: ubuntu-latest, gradle: '8.14.3', java: '24', mode: agent, label: jdk-ceiling}
+          - {os: ubuntu-latest, gradle: '8.14.3', java: '24', mode: hosted, label: jdk-ceiling}
+          - {os: ubuntu-latest, gradle: '8.14.3', java: '24', mode: vendor, label: jdk-ceiling}
+          # Configuration cache.
+          - {os: ubuntu-latest, gradle: '9.8.0', java: '21', mode: hosted, label: configuration-cache, gradle_args: '--configuration-cache'}
+          - {os: ubuntu-latest, gradle: '9.8.0', java: '21', mode: vendor, label: configuration-cache, gradle_args: '--configuration-cache'}
+          # Isolated Projects (recording only).
+          - {os: ubuntu-latest, gradle: '9.8.0', java: '21', mode: hosted, label: isolated-projects, gradle_args: '-Dorg.gradle.unsafe.isolated-projects=true', record_only: 'true'}
+          # The real Maven Central (#511, #487).
+          # Only the suite that owns those tests: e2e_vendor_jvm_build has none,
+          # and every landed suite a cell runs must run a test.
+          - {os: ubuntu-latest, gradle: '8.14.3', java: '21', mode: vendor, label: real-central, real_central: '1', suites: 'e2e_vendor_gradle_build', test_filter: 'gradle_vendor_511 gradle_vendor_487'}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    continue-on-error: ${{ matrix.record_only == 'true' }}
+    steps: *cell-steps
