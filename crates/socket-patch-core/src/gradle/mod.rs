@@ -9,11 +9,16 @@
 //! in-memory fixtures on every OS.
 //!
 //! - [`dsl`]: a comment- and string-aware Groovy/Kotlin tokenizer.
+//! - [`locks`]: dependency-lock files: where they are, what they hold and a
+//!   one-entry rewrite.
+//! - [`home`]: the Gradle user home and the caches inside it.
 //! - [`eol`]: line-ending sniffing and line-ending-blind comparison.
 //! - [`selector`]: Gradle version ordering and version selectors.
 
 pub mod dsl;
 pub mod eol;
+pub mod home;
+pub mod locks;
 pub mod selector;
 
 use std::collections::{BTreeMap, HashMap};
@@ -125,6 +130,55 @@ pub(crate) fn line_of(text: &str, at: usize) -> usize {
 }
 
 #[cfg(test)]
+pub(crate) mod test_fs {
+    //! An in-memory tree behind [`TextReadFn`] / [`ListFn`] for the tests.
+
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    pub struct MemFs {
+        pub files: BTreeMap<String, String>,
+    }
+
+    impl MemFs {
+        pub fn new(files: &[(&str, &str)]) -> Self {
+            Self {
+                files: files
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }
+        }
+
+        pub fn read(&self, rel: &str) -> Option<String> {
+            self.files.get(rel).cloned()
+        }
+
+        pub fn list(&self, dir: &str) -> Vec<String> {
+            let prefix = if dir.is_empty() {
+                String::new()
+            } else {
+                format!("{}/", dir.trim_end_matches('/'))
+            };
+            let mut out: Vec<String> = Vec::new();
+            for key in self.files.keys() {
+                let Some(rest) = key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                let child = match rest.find('/') {
+                    Some(i) => format!("{}/", &rest[..i]),
+                    None => rest.to_string(),
+                };
+                if !out.contains(&child) {
+                    out.push(child);
+                }
+            }
+            out
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -159,6 +213,8 @@ mod tests {
             ("mod.rs", include_str!("mod.rs")),
             ("dsl.rs", include_str!("dsl.rs")),
             ("eol.rs", include_str!("eol.rs")),
+            ("home.rs", include_str!("home.rs")),
+            ("locks.rs", include_str!("locks.rs")),
             ("selector.rs", include_str!("selector.rs")),
         ];
         // Spelled in pieces so this test does not match itself.
