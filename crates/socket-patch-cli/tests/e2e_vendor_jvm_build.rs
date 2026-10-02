@@ -46,9 +46,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use gradle_build_common::{
-    assert_patched, fixture_root, gradle_classpath, gradle_skip, init_script, lockfiles,
-    mirror_init_script, print_cp_task, probe_report, snapshot, write_both_dsls, write_project, Dsl,
-    Gradle,
+    assert_patched, configuration_reused, fixture_root, gradle_classpath, gradle_skip, init_script,
+    lockfiles, mirror_init_script, print_cp_task, probe_report, snapshot, write_both_dsls,
+    write_project, Dsl, Gradle,
 };
 use maven_build_common::*;
 
@@ -582,9 +582,9 @@ dependencyLocking {
 }
 
 tasks.register("printRuntimeClasspath") {
-    val runtime = configurations.named("runtimeClasspath")
+    val runtime: FileCollection = files(configurations.named("runtimeClasspath"))
     doLast {
-        runtime.get().files.forEach { println("SOCKET-CP " + it.absolutePath) }
+        runtime.files.forEach { println("SOCKET-CP " + it.absolutePath) }
     }
 }
 "#;
@@ -609,8 +609,11 @@ fn gradle_tree_rel() -> String {
 
 fn assert_gradle_vendored(out: &Output, checkout: &Path, patched: &[u8], what: &str) {
     assert!(ok(out), "{what}:\n{}", dump(out));
+    // A configuration-cache reuse (the CI `configuration-cache` rows) skips
+    // the settings script; the run that stored the entry asserted it.
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("SOCKET-SETTINGS-PATCHED true"),
+        configuration_reused(out)
+            || String::from_utf8_lossy(&out.stdout).contains("SOCKET-SETTINGS-PATCHED true"),
         "{what}: settings buildscript must load the patched jar:\n{}",
         dump(out)
     );
@@ -1017,6 +1020,80 @@ fn gradle_multi_project_fake_central_mirror_smoke_both_dsls() {
             requests.contains(&format!("/{leaf}")),
             "the fake Central served {leaf}: {requests:?}"
         );
+    }
+    println!("{SUITE}: Gradle {} green", gradle.version);
+}
+
+/// [`print_cp_task`] is configuration-cache safe in both DSLs: the store run
+/// and the reuse run each print the classpath. This is what the
+/// gradle-compatibility.yml `configuration-cache` rows rely on for every
+/// suite's printRuntimeClasspath assertion.
+#[test]
+#[ignore = "real Gradle (the fake Central, no network); run with --ignored"]
+fn gradle_multi_project_print_cp_configuration_cache_both_dsls() {
+    use jvm_fixture_repo::*;
+    const SUITE: &str = "e2e_vendor_jvm_build::print_cp_configuration_cache";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fixture_root(&tmp);
+    let home = root.join("gradle-home");
+    let Some(gradle) = Gradle::detect(SUITE, &home) else {
+        return;
+    };
+    // Stable (and warning-free for the `java` plugin) from 8.1.
+    if !gradle.at_least(8, 1) {
+        println!(
+            "{SUITE}: Gradle {} predates the stable configuration cache; nothing to check",
+            gradle.version
+        );
+        return;
+    }
+    let central = FakeCentral::start();
+    let init = init_script(
+        &root.join("init"),
+        "mirror.gradle",
+        &mirror_init_script(&central.uri(), None),
+    );
+    let projects = write_both_dsls(&root.join("proj"), |dsl| {
+        vec![
+            (dsl.settings_file(), smoke_settings(dsl)),
+            (format!("app/{}", dsl.build_file()), smoke_app(dsl)),
+        ]
+    });
+    let pristine = notice(&format!("{GROUP}:{VICTIM}:{VICTIM_VERSION}"), "pristine");
+    for (dsl, proj) in projects {
+        for run in ["store", "reuse"] {
+            let what = format!(
+                "Gradle {} {} DSL configuration cache {run}",
+                gradle.version,
+                dsl.name()
+            );
+            let out = gradle.run(
+                &proj,
+                &home,
+                &[
+                    &init[0],
+                    &init[1],
+                    "--configuration-cache",
+                    ":app:printRuntimeClasspath",
+                ],
+            );
+            assert_patched(&out, VICTIM, NOTICE, pristine.as_bytes(), &what);
+            let log = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let want = if run == "store" {
+                "Configuration cache entry stored"
+            } else {
+                "Configuration cache entry reused"
+            };
+            assert!(
+                log.contains(want),
+                "{what}: expected `{want}`:\n{}",
+                gradle_build_common::dump(&out)
+            );
+        }
     }
     println!("{SUITE}: Gradle {} green", gradle.version);
 }

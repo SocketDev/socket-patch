@@ -370,20 +370,22 @@ pub fn write_both_dsls(
     })
 }
 
-/// A `printRuntimeClasspath` task (configuration-cache safe: it captures a
-/// file collection, not the project) printing one [`CP_MARKER`] line per
-/// resolved file of `configuration`.
+/// A `printRuntimeClasspath` task printing one [`CP_MARKER`] line per
+/// resolved file of `configuration`. Configuration-cache safe: the action
+/// captures a task-local file collection, never a script-level property (a
+/// Kotlin script `val` drags the unserializable script object along) nor the
+/// configuration provider itself.
 pub fn print_cp_task(dsl: Dsl, configuration: &str) -> String {
     match dsl {
         Dsl::Groovy => format!(
-            "def socketCp = files(configurations.named('{configuration}'))\n\
-             tasks.register('printRuntimeClasspath') {{\n    \
+            "tasks.register('printRuntimeClasspath') {{\n    \
+             def socketCp = files(configurations.named('{configuration}'))\n    \
              doLast {{ socketCp.files.each {{ println('{CP_MARKER}' + it.absolutePath) }} }}\n\
              }}\n"
         ),
         Dsl::Kotlin => format!(
-            "val socketCp = files(configurations.named(\"{configuration}\"))\n\
-             tasks.register(\"printRuntimeClasspath\") {{\n    \
+            "tasks.register(\"printRuntimeClasspath\") {{\n    \
+             val socketCp: FileCollection = files(configurations.named(\"{configuration}\"))\n    \
              doLast {{ socketCp.files.forEach {{ println(\"{CP_MARKER}\" + it.absolutePath) }} }}\n\
              }}\n"
         ),
@@ -439,6 +441,13 @@ pub fn assert_patched(
         hits[0].display()
     );
     hits[0].clone()
+}
+
+/// The run reused a configuration-cache entry: settings and build scripts
+/// were not evaluated, so nothing they print at configuration time appears
+/// (the entry's store run printed it; reuse proves its inputs are unchanged).
+pub fn configuration_reused(out: &Output) -> bool {
+    String::from_utf8_lossy(&out.stdout).contains("Reusing configuration cache.")
 }
 
 /// One member's bytes from a jar.
