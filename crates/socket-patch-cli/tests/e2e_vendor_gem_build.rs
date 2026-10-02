@@ -1562,3 +1562,78 @@ fn gem_vendor_refuses_a_bundle_gemfile_dual_boot() {
         ],
     );
 }
+
+/// #482: a direct dependency declared through `eval_gemfile` is invisible to
+/// the Gemfile line grammar. Vendor used to treat it as transitive, append a
+/// managed `path:` declaration, exit 0, and leave every `bundle install`
+/// failing on the duplicate; it must refuse before any write.
+#[test]
+#[ignore = "host capstone: shells out to a real bundler >= 1.17; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+fn gem_vendor_refuses_an_eval_gemfile_direct_dep() {
+    let Some((_tmp, proj, _bundler, purl)) = staged_rack_project("eval_gemfile") else {
+        return;
+    };
+    std::fs::write(proj.join("Gemfile.common"), "gem \"rack\", \"~> 3.1\"\n").unwrap();
+    std::fs::write(
+        proj.join("Gemfile"),
+        "source \"https://rubygems.org\"\n\neval_gemfile \"Gemfile.common\"\n",
+    )
+    .unwrap();
+    let relock = bundle(&proj, &["install"], false);
+    assert!(
+        relock.status.success(),
+        "the eval_gemfile layout installs (test premise):\n{}",
+        String::from_utf8_lossy(&relock.stderr)
+    );
+    let files = ["Gemfile", "Gemfile.common", "Gemfile.lock"];
+    let before: Vec<Vec<u8>> = files
+        .iter()
+        .map(|f| std::fs::read(proj.join(f)).unwrap())
+        .collect();
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_ne!(
+        code, 0,
+        "vendor must not succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["summary"]["applied"], 0, "nothing vendored: {env}");
+    let event = env["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["purl"] == purl)
+        .unwrap_or_else(|| panic!("an event for {purl}: {env}"));
+    assert_eq!(
+        event["errorCode"], "gemfile_declaration_not_editable",
+        "event: {event}"
+    );
+    for (file, before) in files.iter().zip(before) {
+        assert_eq!(
+            std::fs::read(proj.join(file)).unwrap(),
+            before,
+            "{file} must be byte-untouched"
+        );
+    }
+    assert!(
+        !proj.join(".socket/vendor/gem").exists(),
+        "no vendored copy is written"
+    );
+    for frozen in [false, true] {
+        let install = bundle(&proj, &["install"], frozen);
+        assert!(
+            install.status.success(),
+            "bundle install (frozen: {frozen}) must still succeed:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+    }
+}

@@ -114,6 +114,10 @@ pub(crate) struct GemfileLock<'t> {
     pub(crate) checksums: Option<HashMap<(&'t str, &'t str), Option<String>>>,
     /// `DEPENDENCIES` entries bundler marks source-pinned (`name …!`).
     pub(crate) pinned: BTreeSet<&'t str>,
+    /// Every `DEPENDENCIES` entry: the gems bundler treats as DIRECT
+    /// dependencies, however the Gemfile declares them (`eval_gemfile`, a
+    /// loop, a `gemspec` development dependency, a plain `gem` line).
+    pub(crate) direct: BTreeSet<&'t str>,
     /// Why bundler would refuse this lock, first problem first.
     pub(crate) problems: Vec<String>,
 }
@@ -222,6 +226,7 @@ pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
     let mut in_checksums = false;
     let mut in_dependencies = false;
     let mut pinned: BTreeSet<&str> = BTreeSet::new();
+    let mut direct: BTreeSet<&str> = BTreeSet::new();
     let mut seen_header = false;
     let mut bundler_shaped = false;
 
@@ -281,6 +286,10 @@ pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
                 _ => {}
             }
         } else if in_dependencies && indent == 2 {
+            let name = trimmed.split([' ', '(', '!']).next().unwrap_or_default();
+            if !name.is_empty() {
+                direct.insert(name);
+            }
             if let Some(entry) = trimmed.strip_suffix('!') {
                 let name = entry.split([' ', '(']).next().unwrap_or_default();
                 if !name.is_empty() {
@@ -306,8 +315,19 @@ pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
         sections,
         checksums,
         pinned,
+        direct,
         problems,
     }
+}
+
+/// Whether the Bundler lock `lock` lists `name` under `DEPENDENCIES`, i.e.
+/// bundler resolved it as a DIRECT dependency of the Gemfile. The Gemfile
+/// rewriters consult it before treating a gem they cannot see declared as
+/// transitive: appending a declaration for a gem the Gemfile already
+/// declares out of sight (`eval_gemfile`, a loop) leaves it declared twice,
+/// and bundler refuses every install (#482).
+pub(crate) fn lock_lists_direct_dependency(lock: &str, name: &str) -> bool {
+    parse(lock).direct.contains(name)
 }
 
 /// The plain gem-token charset (letters, digits, `.`, `_`, `-`). The vendor
