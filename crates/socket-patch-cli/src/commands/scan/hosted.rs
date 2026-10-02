@@ -797,6 +797,7 @@ pub(crate) async fn run_redirect_selected(
         pre_warnings: takeover_pre_warnings,
         dry_run: dry_run_takeover,
         migrated: takeover_migrated,
+        unrecorded: takeover_unrecorded,
         files: takeover_files,
         previews: dry_run_takeover_urls,
     } = match vendored_takeover(common, &mut candidates, &mut vendor_state, &mut skipped).await {
@@ -1022,7 +1023,11 @@ pub(crate) async fn run_redirect_selected(
     // rewrite then did not pin (a refused lock, unavailable wheel
     // metadata) is left on the unpatched registry release in BOTH modes.
     // That must never pass as success.
-    let stranded = stranded_takeovers(&takeover_migrated, &confirmed, common.dry_run);
+    let mut stranded = stranded_takeovers(&takeover_migrated, &confirmed, common.dry_run);
+    // A takeover whose revert succeeded but whose ledger update failed is
+    // refused (never redirected), yet its vendored wiring and artifact are
+    // already gone: it is unpatched in both modes all the same.
+    stranded.extend(takeover_unrecorded);
 
     // Fetch the full patch view (file hashes + vulnerabilities) for each
     // CONFIRMED redirect and persist it so a post-install `socket-patch vex`
@@ -1303,8 +1308,8 @@ pub(crate) async fn run_redirect_selected(
         serde_json::json!({
             "code": "redirect_takeover_unpatched",
             "detail": format!(
-                "{purl} was vendored and its vendored wiring was reverted, but the \
-                 hosted rewrite did not pin it (see the warnings above), so the \
+                "{purl} was vendored and its vendored wiring was reverted, but it \
+                 was not pinned to hosted (see the warnings above), so the \
                  project now installs the UNPATCHED registry release — fix the \
                  reported cause and re-run `scan --mode hosted`, or run `scan \
                  --mode vendored` to vendor it again"
@@ -1844,8 +1849,10 @@ async fn vendored_takeover(
             if let Err(e) = socket_patch_core::vendor::save_state(&common.cwd, state).await {
                 // The wiring is reverted but the ledger still claims it;
                 // redirecting now would leave a ledger asserting wiring
-                // that is gone. Fail closed for this purl.
+                // that is gone. Fail closed for this purl — and since its
+                // vendored wiring is already gone, report it as stranded.
                 refused.push(purl.clone());
+                out.unrecorded.push(purl.clone());
                 out.pre_warnings.push(serde_json::json!({
                     "code": "redirect_vendored_revert_failed",
                     "detail": format!(
@@ -1982,6 +1989,10 @@ struct Takeover {
     /// Human output: the purls migrated (or, on --dry-run, to be migrated)
     /// from vendored to hosted.
     migrated: Vec<String>,
+    /// Wet takeovers whose vendored wiring was reverted but whose ledger
+    /// update then failed: refused (never redirected), so unpatched in
+    /// both modes.
+    unrecorded: Vec<String>,
     /// The files their revert touches (or would touch). Both modes count
     /// `rewritten ∪ files`, so the preview's file count matches the wet
     /// run's even for wiring files the hosted rewriter does not also

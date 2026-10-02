@@ -559,3 +559,41 @@ async fn dry_run_predicts_drifted_takeover_refusal() {
         "dry run writes nothing"
     );
 }
+
+/// The revert succeeds but the vendored ledger cannot be updated (a
+/// read-only `.socket/vendor/`): the wiring and wheel are already gone,
+/// so the package is unpatched in both modes. That is a stranded takeover
+/// (exit 1, `partial_failure`, `redirect_takeover_unpatched`), never a
+/// success.
+#[cfg(unix)]
+#[tokio::test]
+async fn ledger_update_failure_after_revert_is_stranded() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (_tmp, root) = project();
+    std::fs::write(root.join("requirements.txt"), "six==1.16.0\n").unwrap();
+    vendor_project(&root, &["requirements.txt"]);
+    let vendor_dir = root.join(".socket/vendor");
+    let set_mode = |mode| {
+        std::fs::set_permissions(&vendor_dir, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    set_mode(0o555);
+    let probe = vendor_dir.join(".probe");
+    if std::fs::write(&probe, b"").is_ok() {
+        // Permissions are not enforced (running as root): the ledger write
+        // cannot be made to fail this way.
+        let _ = std::fs::remove_file(&probe);
+        set_mode(0o755);
+        eprintln!("skipped: directory permissions are not enforced for this user");
+        return;
+    }
+
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+    let (code, env) = hosted_scan(&root, &server);
+    set_mode(0o755);
+    let text = env.to_string();
+    assert!(text.contains("redirect_vendored_revert_failed"), "{env:#}");
+    assert!(text.contains("redirect_takeover_unpatched"), "{env:#}");
+    assert_eq!(env["status"], "partial_failure", "{env:#}");
+    assert_eq!(code, 1, "{env:#}");
+}
