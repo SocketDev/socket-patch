@@ -3541,6 +3541,15 @@ fn rewrite_yarn_berry(
             // under such a key corrupts the key/resolution protocol pairing.
             // Mirrors the vendor backend's fail-closed gate
             // (vendor/yarn_berry_lock.rs).
+            // A fork alias (`<fname>@npm:<other>@<range>`) installs another
+            // package under this name: its entry is not the patched package,
+            // whatever its version, so it is never re-keyed.
+            if parsed.iter().any(|p| {
+                p.and_then(|(_, range)| berry_npm_alias_target(range))
+                    .is_some_and(|real| real != fname)
+            }) {
+                continue;
+            }
             // An entry an earlier hosted run already keyed by its tarball
             // descriptor (`"<name>@<hosted url>"`): ours to re-pin.
             if let [Some((_, range))] = parsed.as_slice() {
@@ -3882,10 +3891,19 @@ fn berry_lock_locks(content: &str, name: &str, version: &str) -> bool {
             return false;
         }
         format!("{block}\n").contains(&version_line)
-            && split_berry_key_patterns(key)
-                .iter()
-                .any(|p| split_pattern(p).is_some_and(|(n, _)| n == name))
+            && split_berry_key_patterns(key).iter().any(|p| {
+                split_pattern(p).is_some_and(|(n, range)| {
+                    n == name && berry_npm_alias_target(range).is_none_or(|real| real == name)
+                })
+            })
     })
+}
+
+/// The package an `npm:<name>@<range>` alias range installs (`None` for a
+/// plain `npm:<range>` or any other protocol).
+fn berry_npm_alias_target(range: &str) -> Option<&str> {
+    let body = range.strip_prefix("npm:")?;
+    crate::vendor::yarn_classic_lock::split_pattern(body).map(|(real, _)| real)
 }
 
 /// The root manifest the yarn berry hosted pin edits.
@@ -8292,6 +8310,50 @@ mod tests {
             "only the locked dep is owned"
         );
         assert!(r.confirmed_yarn_berry_uuids.is_empty());
+    }
+
+    /// A fork alias key (`left-pad@npm:other@^1.3.0`) installs `other`
+    /// under the `left-pad` name: even at the patched version it is not the
+    /// patched package, so it is never re-keyed nor makes the real entry
+    /// ambiguous.
+    #[test]
+    fn yarn_berry_fork_alias_entry_is_never_re_keyed() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let fork = format!(
+            "\"left-pad@npm:other@^1.3.0\":\n  version: 1.3.0\n  resolution: \"other@npm:1.3.0\"\n  \
+             checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n",
+            "4".repeat(128)
+        );
+        let fork_only =
+            format!("# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n{fork}");
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(fork_only, berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut r,
+        );
+        assert!(r.files.is_empty(), "{:?}", r.files);
+        assert_eq!(r.warnings[0].code, "redirect_yarn_berry_entry_not_found");
+        assert!(r.yarn_berry_uuids.is_empty());
+
+        // Beside the real entry: only the real one is pinned.
+        let both = format!("{}\n{fork}", berry_lock("10c0"));
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(
+            &berry_files(both, berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut r,
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = &r.files["yarn.lock"];
+        assert!(out.contains(&format!("\"left-pad@{url}\":")), "{out}");
+        assert!(
+            out.contains(&fork),
+            "the fork entry is byte-identical: {out}"
+        );
+        assert!(r.confirmed_yarn_berry_uuids.contains(BERRY_UUID));
     }
 
     /// The artifact URL is spliced as literal text: a `$` in it (legal in a
