@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::api::client::ApiClient;
+use crate::api::client::{ApiClient, ApiError, BinaryBody};
+use crate::hash::git_sha256::compute_git_sha256_from_reader;
 use crate::manifest::operations::get_after_hash_blobs;
 use crate::manifest::schema::PatchManifest;
 use crate::patch::apply::PatchSources;
@@ -113,10 +114,10 @@ pub async fn fetch_missing_blobs(
     }
 
     // `blobs_path` is created by the first successful write
-    // (`write_cache_entry_atomic`), never up front: a fetch that lands
+    // (`stream_cache_entry_atomic`), never up front: a fetch that lands
     // nothing leaves no `.socket/blobs/` husk behind.
     let hashes: Vec<String> = missing.into_iter().collect();
-    download_hashes(&hashes, blobs_path, client, on_progress).await
+    download_entries(&hashes, blobs_path, client, on_progress, Entry::Blob).await
 }
 
 /// Download specific blobs identified by their hashes.
@@ -166,7 +167,8 @@ pub async fn fetch_blobs_by_hash(
         };
     }
 
-    let download_result = download_hashes(&to_download, blobs_path, client, on_progress).await;
+    let download_result =
+        download_entries(&to_download, blobs_path, client, on_progress, Entry::Blob).await;
     results.extend(download_result.results);
 
     FetchMissingBlobsResult {
@@ -239,66 +241,7 @@ async fn fetch_missing_diff_archives(
     // `archives_dir` is created by the first successful write, never up
     // front (see `fetch_missing_blobs`).
     let uuids: Vec<String> = missing.into_iter().collect();
-    let total = uuids.len();
-    let mut downloaded = 0usize;
-    let mut failed = 0usize;
-    let mut results = Vec::with_capacity(total);
-
-    for (i, uuid) in uuids.iter().enumerate() {
-        if let Some(ref cb) = on_progress {
-            cb(uuid, i + 1, total);
-        }
-
-        let fetch_result = client.fetch_diff(uuid).await;
-
-        match fetch_result {
-            Ok(Some(data)) => {
-                let archive_path = archives_dir.join(format!("{}.tar.gz", uuid));
-                match write_cache_entry_atomic(&archive_path, &data).await {
-                    Ok(()) => {
-                        results.push(BlobFetchResult {
-                            hash: uuid.clone(),
-                            success: true,
-                            error: None,
-                        });
-                        downloaded += 1;
-                    }
-                    Err(e) => {
-                        results.push(BlobFetchResult {
-                            hash: uuid.clone(),
-                            success: false,
-                            error: Some(format!("Failed to write archive to disk: {}", e)),
-                        });
-                        failed += 1;
-                    }
-                }
-            }
-            Ok(None) => {
-                results.push(BlobFetchResult {
-                    hash: uuid.clone(),
-                    success: false,
-                    error: Some("Diff archive not found on server".to_string()),
-                });
-                failed += 1;
-            }
-            Err(e) => {
-                results.push(BlobFetchResult {
-                    hash: uuid.clone(),
-                    success: false,
-                    error: Some(e.to_string()),
-                });
-                failed += 1;
-            }
-        }
-    }
-
-    FetchMissingBlobsResult {
-        total,
-        downloaded,
-        failed,
-        skipped: 0,
-        results,
-    }
+    download_entries(&uuids, archives_dir, client, on_progress, Entry::Diff).await
 }
 
 /// What kind of artifact a fetch or cleanup result counts, for human
@@ -448,8 +391,10 @@ fn concise_fetch_error<'a>(err: &'a str, id: &str) -> std::borrow::Cow<'a, str> 
 
 // ── Internal helpers ──────────────────────────────────────────────────
 
-/// Write `bytes` to `dest` atomically: stage a temp file in the same
-/// directory, then `rename(2)` it over `dest`.
+/// Stream `body` to `dest` atomically: copy it chunk by chunk into a temp
+/// file in the same directory, check it against `expected_hash` (a blob's
+/// git-sha256 name) when given, then `rename(2)` it over `dest`. The body is
+/// never held in memory whole (#571).
 ///
 /// The destinations here are *content-addressed* cache entries —
 /// `blobs/<hash>` and `archives/<uuid>.tar.gz`. A plain `tokio::fs::write`
@@ -468,127 +413,187 @@ fn concise_fetch_error<'a>(err: &'a str, id: &str) -> std::borrow::Cow<'a, str> 
 /// content-addressed cache entries, not user-owned files — post-crash loss
 /// of a cache entry is harmless, so the extra durability isn't worth the
 /// I/O. Do not "consolidate" this into the hardened writer.
-async fn write_cache_entry_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+async fn stream_cache_entry_atomic(
+    dest: &Path,
+    body: &mut BinaryBody,
+    expected_hash: Option<&str>,
+) -> Result<(), EntryError> {
     let parent = dest.parent().ok_or_else(|| {
-        std::io::Error::new(
+        EntryError::Write(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "cache entry path has no parent directory",
-        )
+        ))
     })?;
     let stem = dest
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "blob".to_string());
     // The cache directory (`.socket/blobs/`, `.socket/diffs/`) is created
-    // here, on the first verified download, and nowhere earlier: a fetch
-    // that lands nothing (all 404, offline, every hash mismatched) must not
-    // leave an empty directory behind for the user to commit. An
-    // uncreatable parent surfaces as this entry's write failure, like any
-    // other disk error.
-    tokio::fs::create_dir_all(parent).await?;
+    // here, by the first download, and nowhere earlier. A fetch that lands
+    // nothing (all 404, offline, every hash mismatched, every body cut
+    // short) must not leave an empty directory behind for the user to
+    // commit, so a failure removes the directories this call created, while
+    // they are still empty. An uncreatable parent surfaces as this entry's
+    // write failure, like any other disk error.
+    let mut created_dirs = Vec::new();
+    for dir in parent.ancestors() {
+        if dir.as_os_str().is_empty() || tokio::fs::symlink_metadata(dir).await.is_ok() {
+            break;
+        }
+        created_dirs.push(dir);
+    }
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(EntryError::Write)?;
     // Leading dot keeps the stage out of editor/glob views; the uuid suffix
     // keeps concurrent writers of the same entry from colliding.
     let stage = parent.join(format!(".socket-dl-{}-{}", stem, uuid::Uuid::new_v4()));
 
-    if let Err(e) = tokio::fs::write(&stage, bytes).await {
+    let result = async {
+        let size = stage_body(&stage, body).await?;
+        if let Some(expected) = expected_hash {
+            let file = tokio::fs::File::open(&stage)
+                .await
+                .map_err(EntryError::Write)?;
+            let actual = compute_git_sha256_from_reader(size, file)
+                .await
+                .map_err(EntryError::Write)?;
+            if !blob_hash_matches(expected, &actual) {
+                return Err(EntryError::HashMismatch(actual));
+            }
+        }
+        tokio::fs::rename(&stage, dest)
+            .await
+            .map_err(EntryError::Write)
+    }
+    .await;
+    if result.is_err() {
         // A partial stage would otherwise leak as a `.socket-dl-*` turd.
         let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
+        // Deepest first; `remove_dir` only succeeds while a dir is empty.
+        for dir in created_dirs {
+            let _ = tokio::fs::remove_dir(dir).await;
+        }
     }
-    if let Err(e) = tokio::fs::rename(&stage, dest).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
+    result
+}
+
+/// Copy `body` chunk by chunk into a new file at `stage`, returning the
+/// byte count. Only one chunk is held in memory at a time.
+async fn stage_body(stage: &Path, body: &mut BinaryBody) -> Result<u64, EntryError> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(stage)
+        .await
+        .map_err(EntryError::Write)?;
+    let mut size: u64 = 0;
+    while let Some(chunk) = body.chunk().await.map_err(EntryError::Body)? {
+        let chunk = chunk.as_ref();
+        file.write_all(chunk).await.map_err(EntryError::Write)?;
+        size += chunk.len() as u64;
     }
-    Ok(())
+    file.flush().await.map_err(EntryError::Write)?;
+    Ok(size)
+}
+
+/// Why one cache entry was not stored.
+#[derive(Debug)]
+enum EntryError {
+    /// The response body failed or stalled mid-read.
+    Body(ApiError),
+    /// A disk error while staging, hashing or renaming.
+    Write(std::io::Error),
+    /// The blob's content hashed to this, not to its name.
+    HashMismatch(String),
 }
 
 /// Compare an expected blob hash against the hash computed from the
 /// downloaded bytes.
 ///
 /// Git object hashes are hex, and hex is case-insensitive. The content
-/// hasher ([`compute_git_sha256_from_bytes`]) always emits lowercase, but
+/// hasher ([`compute_git_sha256_from_reader`]) always emits lowercase, but
 /// [`ApiClient::fetch_blob`]'s validator accepts uppercase hex too — so a
 /// manifest (or server) that uses uppercase would download byte-for-byte
 /// correct content and then be wrongly rejected by a case-sensitive
 /// comparison. Compare ignoring ASCII case to keep the two consistent.
 ///
-/// [`compute_git_sha256_from_bytes`]: crate::hash::git_sha256::compute_git_sha256_from_bytes
+/// [`compute_git_sha256_from_reader`]: crate::hash::git_sha256::compute_git_sha256_from_reader
 fn blob_hash_matches(expected: &str, actual: &str) -> bool {
     expected.eq_ignore_ascii_case(actual)
 }
 
-/// Download a list of blob hashes sequentially, writing each to
-/// `blobs_path/<hash>`.
-async fn download_hashes(
-    hashes: &[String],
-    blobs_path: &Path,
+/// The two kinds of cache entry [`download_entries`] stores.
+#[derive(Debug, Clone, Copy)]
+enum Entry {
+    /// `blobs/<hash>`, verified against its git-sha256 name.
+    Blob,
+    /// `diffs/<uuid>.tar.gz`, stored as served.
+    Diff,
+}
+
+/// Download `ids` sequentially, streaming each into its cache entry under
+/// `dir` (see [`stream_cache_entry_atomic`]). The one download loop behind
+/// [`fetch_missing_blobs`], [`fetch_blobs_by_hash`] and diff-mode
+/// [`fetch_missing_sources`].
+async fn download_entries(
+    ids: &[String],
+    dir: &Path,
     client: &ApiClient,
     on_progress: Option<&OnProgress>,
+    entry: Entry,
 ) -> FetchMissingBlobsResult {
-    let total = hashes.len();
+    let total = ids.len();
     let mut downloaded: usize = 0;
     let mut failed: usize = 0;
     let mut results: Vec<BlobFetchResult> = Vec::with_capacity(total);
 
-    for (i, hash) in hashes.iter().enumerate() {
+    for (i, id) in ids.iter().enumerate() {
         if let Some(ref cb) = on_progress {
-            cb(hash, i + 1, total);
+            cb(id, i + 1, total);
         }
 
-        match client.fetch_blob(hash).await {
-            Ok(Some(data)) => {
-                // Verify content hash matches expected hash before writing
-                let actual_hash = crate::hash::git_sha256::compute_git_sha256_from_bytes(&data);
-                if !blob_hash_matches(hash, &actual_hash) {
-                    results.push(BlobFetchResult {
-                        hash: hash.clone(),
-                        success: false,
-                        error: Some(format!(
-                            "Content hash mismatch: expected {}, got {}",
-                            hash, actual_hash
-                        )),
-                    });
-                    failed += 1;
-                    continue;
-                }
-
-                let blob_path = blobs_path.join(hash);
-                match write_cache_entry_atomic(&blob_path, &data).await {
-                    Ok(()) => {
-                        results.push(BlobFetchResult {
-                            hash: hash.clone(),
-                            success: true,
-                            error: None,
-                        });
-                        downloaded += 1;
+        let (fetched, dest, expected_hash, noun, not_found) = match entry {
+            Entry::Blob => (
+                client.fetch_blob(id).await,
+                dir.join(id),
+                Some(id.as_str()),
+                "blob",
+                "Blob not found on server",
+            ),
+            Entry::Diff => (
+                client.fetch_diff(id).await,
+                dir.join(format!("{}.tar.gz", id)),
+                None,
+                "archive",
+                "Diff archive not found on server",
+            ),
+        };
+        let error = match fetched {
+            Ok(Some(mut body)) => {
+                match stream_cache_entry_atomic(&dest, &mut body, expected_hash).await {
+                    Ok(()) => None,
+                    Err(EntryError::Body(e)) => Some(e.to_string()),
+                    Err(EntryError::Write(e)) => {
+                        Some(format!("Failed to write {} to disk: {}", noun, e))
                     }
-                    Err(e) => {
-                        results.push(BlobFetchResult {
-                            hash: hash.clone(),
-                            success: false,
-                            error: Some(format!("Failed to write blob to disk: {}", e)),
-                        });
-                        failed += 1;
-                    }
+                    Err(EntryError::HashMismatch(actual)) => Some(format!(
+                        "Content hash mismatch: expected {}, got {}",
+                        id, actual
+                    )),
                 }
             }
-            Ok(None) => {
-                results.push(BlobFetchResult {
-                    hash: hash.clone(),
-                    success: false,
-                    error: Some("Blob not found on server".to_string()),
-                });
-                failed += 1;
-            }
-            Err(e) => {
-                results.push(BlobFetchResult {
-                    hash: hash.clone(),
-                    success: false,
-                    error: Some(e.to_string()),
-                });
-                failed += 1;
-            }
+            Ok(None) => Some(not_found.to_string()),
+            Err(e) => Some(e.to_string()),
+        };
+        if error.is_none() {
+            downloaded += 1;
+        } else {
+            failed += 1;
         }
+        results.push(BlobFetchResult {
+            hash: id.clone(),
+            success: error.is_none(),
+            error,
+        });
     }
 
     FetchMissingBlobsResult {
@@ -1036,6 +1041,34 @@ mod tests {
 
     // ── Atomic cache-entry write ─────────────────────────────────────
 
+    /// A [`BinaryBody`] streaming `bytes` from a local mock server. The
+    /// server is returned so it outlives the read.
+    async fn served_body(bytes: &[u8]) -> (wiremock::MockServer, BinaryBody) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+            .mount(&server)
+            .await;
+        let client = ApiClient::new(crate::api::client::ApiClientOptions {
+            api_url: server.uri(),
+            api_token: None,
+            use_public_proxy: true,
+            org_slug: None,
+        });
+        let body = client
+            .fetch_diff("11111111-1111-4111-8111-111111111111")
+            .await
+            .unwrap()
+            .expect("200 serves a body");
+        (server, body)
+    }
+
+    /// [`stream_cache_entry_atomic`] with no hash check, over `bytes`.
+    async fn write_cache_entry_atomic(dest: &Path, bytes: &[u8]) -> Result<(), EntryError> {
+        let (_server, mut body) = served_body(bytes).await;
+        stream_cache_entry_atomic(dest, &mut body, None).await
+    }
+
     #[tokio::test]
     async fn test_write_cache_entry_atomic_writes_exact_bytes_no_litter() {
         let dir = tempfile::tempdir().unwrap();
@@ -1128,7 +1161,10 @@ mod tests {
 
         let result = write_cache_entry_atomic(&ro.join("x"), b"bytes").await;
         let err = result.expect_err("stage write into a read-only dir must fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            matches!(&err, EntryError::Write(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "{err:?}"
+        );
 
         // Restore before asserting/teardown so cleanup cannot mask failure.
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();

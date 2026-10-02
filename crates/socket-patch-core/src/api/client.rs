@@ -175,6 +175,34 @@ pub async fn hold_back_debug<T>(fut: impl std::future::Future<Output = T>) -> He
     HeldBack { value, debug }
 }
 
+/// The body of a 200 blob or diff response, read chunk by chunk.
+///
+/// [`ApiClient::fetch_blob`] / [`ApiClient::fetch_diff`] return this instead
+/// of the whole body so a large patch artifact streams to disk without being
+/// held in memory (#571). The per-read idle bound of [`ApiTimeouts`] applies
+/// to every chunk.
+#[derive(Debug)]
+pub struct BinaryBody {
+    resp: reqwest::Response,
+    kind: String,
+    identifier: String,
+}
+
+impl BinaryBody {
+    /// The next chunk of the body, or `Ok(None)` once it is complete. A
+    /// failed or stalled read is an [`ApiError::Network`].
+    pub async fn chunk(&mut self) -> Result<Option<impl AsRef<[u8]>>, ApiError> {
+        self.resp.chunk().await.map_err(|e| {
+            ApiError::Network(format!(
+                "Error reading {} body for {}: {}",
+                self.kind,
+                self.identifier,
+                network_error_detail(&e)
+            ))
+        })
+    }
+}
+
 /// Options for constructing an [`ApiClient`].
 #[derive(Debug, Clone)]
 pub struct ApiClientOptions {
@@ -989,10 +1017,10 @@ impl ApiClient {
 
     /// Fetch a blob by its SHA-256 hash.
     ///
-    /// Returns the raw binary content, or `Ok(None)` if not found.
-    /// Uses the authenticated endpoint when token and org slug are
-    /// available, otherwise falls back to the public proxy.
-    pub async fn fetch_blob(&self, hash: &str) -> Result<Option<Vec<u8>>, ApiError> {
+    /// Returns the response body as a [`BinaryBody`] stream, or `Ok(None)`
+    /// if not found. Uses the authenticated endpoint when token and org
+    /// slug are available, otherwise falls back to the public proxy.
+    pub async fn fetch_blob(&self, hash: &str) -> Result<Option<BinaryBody>, ApiError> {
         // Validate hash format: SHA-256 = 64 hex characters
         if !is_valid_sha256_hex(hash) {
             return Err(ApiError::InvalidHash(format!(
@@ -1005,10 +1033,11 @@ impl ApiClient {
 
     /// Fetch a per-file diff archive (tar.gz of bsdiff deltas) by patch UUID.
     ///
-    /// Returns the raw archive bytes, or `Ok(None)` if not found (404). The
-    /// public proxy serves these under `/patch/diff/<uuid>`; the
-    /// authenticated API serves them under `/v0/orgs/<slug>/patches/diff/<uuid>`.
-    pub async fn fetch_diff(&self, uuid: &str) -> Result<Option<Vec<u8>>, ApiError> {
+    /// Returns the archive body as a [`BinaryBody`] stream, or `Ok(None)` if
+    /// not found (404). The public proxy serves these under
+    /// `/patch/diff/<uuid>`; the authenticated API serves them under
+    /// `/v0/orgs/<slug>/patches/diff/<uuid>`.
+    pub async fn fetch_diff(&self, uuid: &str) -> Result<Option<BinaryBody>, ApiError> {
         if !is_valid_uuid(uuid) {
             return Err(ApiError::InvalidHash(format!(
                 "Invalid patch UUID: {}",
@@ -1062,12 +1091,13 @@ impl ApiClient {
     ///
     /// `kind` is the URL segment (`blob` / `diff`), doubling as the
     /// noun in log + error messages. `identifier` is the hash or UUID
-    /// interpolated into the URL.
+    /// interpolated into the URL. A 200 returns the unread body: callers
+    /// stream it to disk instead of buffering it whole.
     async fn fetch_binary(
         &self,
         kind: &str,
         identifier: &str,
-    ) -> Result<Option<Vec<u8>>, ApiError> {
+    ) -> Result<Option<BinaryBody>, ApiError> {
         let (url, use_auth) = self.binary_url(kind, identifier);
 
         debug_log(&format!("GET {} {}", kind, url));
@@ -1093,15 +1123,11 @@ impl ApiClient {
         let status = resp.status();
 
         if status == StatusCode::OK {
-            let bytes = resp.bytes().await.map_err(|e| {
-                ApiError::Network(format!(
-                    "Error reading {} body for {}: {}",
-                    kind,
-                    identifier,
-                    network_error_detail(&e)
-                ))
-            })?;
-            return Ok(Some(bytes.to_vec()));
+            return Ok(Some(BinaryBody {
+                resp,
+                kind: kind.to_string(),
+                identifier: identifier.to_string(),
+            }));
         }
         if status == StatusCode::NOT_FOUND {
             return Ok(None);

@@ -732,3 +732,190 @@ async fn get_missing_blobs_reports_missing_afterhash() {
         "staged blob must not be reported missing"
     );
 }
+
+// ── Streaming (#571) ─────────────────────────────────────────────────
+
+/// A one-response-per-connection server answering every request with
+/// `200` and `Content-Length: head.len() + tail.len()`. It sends `head`,
+/// then waits for `release` before sending `tail` (or, with `tail: None`,
+/// closes the connection after `head`, cutting the body short).
+async fn split_body_server(
+    head: Vec<u8>,
+    tail: Option<Vec<u8>>,
+    declared: usize,
+    release: std::sync::Arc<tokio::sync::Notify>,
+) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let (head, tail, release) = (head.clone(), tail.clone(), release.clone());
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\n\
+                     content-length: {declared}\r\nconnection: close\r\n\r\n"
+                );
+                if sock.write_all(headers.as_bytes()).await.is_err()
+                    || sock.write_all(&head).await.is_err()
+                    || sock.flush().await.is_err()
+                {
+                    return;
+                }
+                if let Some(tail) = tail {
+                    release.notified().await;
+                    let _ = sock.write_all(&tail).await;
+                }
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// The size of the `.socket-dl-*` stage file in `dir`, if one exists.
+fn stage_len(dir: &Path) -> Option<u64> {
+    std::fs::read_dir(dir).ok()?.find_map(|e| {
+        let e = e.ok()?;
+        e.file_name()
+            .to_string_lossy()
+            .starts_with(".socket-dl-")
+            .then(|| e.metadata().ok().map(|m| m.len()))
+            .flatten()
+    })
+}
+
+/// Blob and diff downloads stream to disk: the first part of a body is
+/// already in the stage file while the server is still holding back the
+/// rest. Before #571 `fetch_binary` buffered the whole body in memory, so
+/// nothing reached disk until the response completed.
+#[tokio::test]
+async fn blob_and_diff_bodies_reach_disk_before_the_response_completes() {
+    let head = vec![b'a'; 256 * 1024];
+    let tail = vec![b'b'; 256 * 1024];
+    let content = [head.clone(), tail.clone()].concat();
+    let hash = compute_git_sha256_from_bytes(&content);
+    let uuid = "11111111-1111-4111-8111-111111111111";
+
+    for mode in [DownloadMode::File, DownloadMode::Diff] {
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let uri = split_body_server(
+            head.clone(),
+            Some(tail.clone()),
+            content.len(),
+            release.clone(),
+        )
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs = tmp.path().join("blobs");
+        let diffs = tmp.path().join("diffs");
+        let (manifest, dir) = match mode {
+            DownloadMode::File => (manifest_with_after_hashes(&[&hash]), blobs.clone()),
+            DownloadMode::Diff => (manifest_with_uuids(&[uuid]), diffs.clone()),
+        };
+        let sources = PatchSources {
+            blobs_path: &blobs,
+            diffs_path: Some(&diffs),
+            mem_blobs: None,
+        };
+        let client = proxy_client(&uri);
+
+        let watch = async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut streamed = false;
+            while std::time::Instant::now() < deadline {
+                if stage_len(&dir) == Some(head.len() as u64) {
+                    streamed = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            // Release the tail either way so the download can finish.
+            release.notify_one();
+            streamed
+        };
+        let (result, streamed) = tokio::join!(
+            fetch_missing_sources(&manifest, &sources, mode, &client, None),
+            watch
+        );
+        assert!(
+            streamed,
+            "{mode:?}: the first {} bytes must be on disk while the rest is held back",
+            head.len()
+        );
+        assert_eq!(result.downloaded, 1, "{mode:?}: {:?}", result.results);
+        let entry = match mode {
+            DownloadMode::File => blobs.join(&hash),
+            DownloadMode::Diff => diffs.join(format!("{uuid}.tar.gz")),
+        };
+        assert_eq!(std::fs::read(&entry).unwrap(), content, "{mode:?}");
+        assert_eq!(dir_entry_count(&dir), 1, "{mode:?}: no stage litter");
+    }
+}
+
+/// A body cut short mid-stream fails that entry with the body-read error
+/// and leaves nothing behind: no entry, no stage, and no cache directory
+/// the download created. Same for a blob whose streamed content does not
+/// hash to its name.
+#[tokio::test]
+async fn failed_streams_leave_no_stage_and_no_created_cache_dir() {
+    let content = vec![b'c'; 64 * 1024];
+    let hash = compute_git_sha256_from_bytes(&content);
+    let uuid = "11111111-1111-4111-8111-111111111111";
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    // Cut short: the server declares twice what it sends, then closes.
+    let uri = split_body_server(content.clone(), None, content.len() * 2, release.clone()).await;
+    for mode in [DownloadMode::File, DownloadMode::Diff] {
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs = tmp.path().join("blobs");
+        let diffs = tmp.path().join("diffs");
+        let manifest = match mode {
+            DownloadMode::File => manifest_with_after_hashes(&[&hash]),
+            DownloadMode::Diff => manifest_with_uuids(&[uuid]),
+        };
+        let sources = PatchSources {
+            blobs_path: &blobs,
+            diffs_path: Some(&diffs),
+            mem_blobs: None,
+        };
+        let result =
+            fetch_missing_sources(&manifest, &sources, mode, &proxy_client(&uri), None).await;
+        assert_eq!(result.failed, 1, "{mode:?}");
+        let error = result.results[0].error.as_deref().unwrap();
+        assert!(error.contains("Error reading"), "{mode:?}: {error}");
+        assert!(!blobs.exists() && !diffs.exists(), "{mode:?}: no cache dir");
+    }
+
+    // Mismatch: the full body arrives but hashes to something else.
+    let wrong = compute_git_sha256_from_bytes(b"something else");
+    let uri = split_body_server(content.clone(), None, content.len(), release).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let blobs = tmp.path().join(".socket").join("blobs");
+    let result = fetch_missing_blobs(
+        &manifest_with_after_hashes(&[&wrong]),
+        &blobs,
+        &proxy_client(&uri),
+        None,
+    )
+    .await;
+    assert_eq!(result.failed, 1);
+    let error = result.results[0].error.as_deref().unwrap();
+    assert_eq!(
+        error,
+        format!("Content hash mismatch: expected {wrong}, got {hash}")
+    );
+    assert_eq!(
+        dir_entry_count(tmp.path()),
+        0,
+        "a rejected blob must leave neither .socket/ nor .socket/blobs/ behind"
+    );
+}
