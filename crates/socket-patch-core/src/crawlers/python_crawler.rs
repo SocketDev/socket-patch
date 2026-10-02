@@ -494,7 +494,9 @@ async fn pdm_saved_interpreter(cwd: &Path) -> Option<PathBuf> {
 }
 
 /// Whether `cwd` is a PDM project: `pdm.lock`, `.pdm.toml`, or a
-/// `[tool.pdm]` table in `pyproject.toml`.
+/// `[tool.pdm]` table in `pyproject.toml` with settings beyond `build` (a
+/// `[tool.pdm.build]` table alone only configures the pdm-backend build
+/// backend, which projects driven by other managers use too).
 async fn is_pdm_project(cwd: &Path) -> bool {
     if cwd.join("pdm.lock").is_file() || cwd.join(".pdm.toml").is_file() {
         return true;
@@ -504,7 +506,10 @@ async fn is_pdm_project(cwd: &Path) -> bool {
     };
     text.parse::<toml_edit::DocumentMut>()
         .ok()
-        .and_then(|doc| doc.get("tool")?.get("pdm").map(|_| ()))
+        .and_then(|doc| {
+            let pdm = doc.get("tool")?.get("pdm")?.as_table_like()?;
+            pdm.iter().any(|(key, _)| key != "build").then_some(())
+        })
         .is_some()
 }
 
@@ -537,8 +542,9 @@ async fn uv_project_environment_site_packages(
     ]
     .iter()
     .any(|marker| cwd.join(marker).exists());
-    // A lockless Poetry project is still Poetry's (`[tool.poetry]`).
+    // A lockless Poetry (`[tool.poetry]`) or PDM project is still theirs.
     let other_manager = other_lock
+        || is_pdm_project(cwd).await
         || read_regular_to_string(&cwd.join("pyproject.toml"))
             .await
             .is_ok_and(|text| text.contains("[tool.poetry"));
@@ -2411,6 +2417,30 @@ mod tests {
         std::fs::remove_file(project.join(".pdm-python")).unwrap();
         std::fs::remove_dir_all(project.join(".venv")).unwrap();
 
+        // A lockless PDM project's `__pypackages__` is not handed to an
+        // ambient UV_PROJECT_ENVIRONMENT.
+        std::fs::remove_file(project.join("pdm.lock")).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"demo\"\n[tool.pdm]\ndistribution = false\n",
+        )
+        .unwrap();
+        fake_venv(&tmp.path().join("uv-env"), "venv");
+        let uv_env = env_of(&[(
+            "UV_PROJECT_ENVIRONMENT",
+            tmp.path().join("uv-env").join("venv").to_string_lossy().into_owned(),
+        )]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &uv_env).await,
+            vec![lib.clone()]
+        );
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"demo\"\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("pdm.lock"), "[metadata]\n").unwrap();
+
         // A uv project with a leftover PDM lock is uv's, not PEP 582.
         std::fs::write(project.join("uv.lock"), "version = 1\n").unwrap();
         assert!(find_local_venv_site_packages_with(&project, &no_env)
@@ -2469,7 +2499,7 @@ mod tests {
         std::fs::remove_file(project.join("uv.lock")).unwrap();
         assert_eq!(
             find_local_venv_site_packages_with(&project, &abs_env).await,
-            vec![abs_site]
+            vec![abs_site.clone()]
         );
 
         // A lockless Poetry project (`[tool.poetry]`, or `poetry.toml`) is
@@ -2494,6 +2524,32 @@ mod tests {
             vec![stray.clone()]
         );
         std::fs::remove_file(project.join("poetry.toml")).unwrap();
+
+        // A lockless PDM project is PDM's, while a `[tool.pdm.build]` table
+        // alone (the pdm-backend build backend) does not make one.
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"app\"\n[tool.pdm]\ndistribution = false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &abs_env).await,
+            vec![stray.clone()]
+        );
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"app\"\n[tool.pdm.build]\nincludes = [\"app\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &abs_env).await,
+            vec![abs_site.clone()]
+        );
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"app\"\n",
+        )
+        .unwrap();
 
         // ...but not a project another manager drives, nor a non-project.
         std::fs::write(project.join("poetry.lock"), "").unwrap();
