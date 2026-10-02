@@ -503,7 +503,7 @@ async fn discover_paths_from_assets(cwd: &Path) -> Vec<PathBuf> {
 /// The file is a JSON object with a `packageFolders` key containing
 /// folder paths as keys, e.g.: `{"packageFolders": {"/home/user/.nuget/packages/": {}}}`.
 async fn parse_project_assets_package_folders(path: &Path) -> Option<Vec<PathBuf>> {
-    let content = tokio::fs::read_to_string(path).await.ok()?;
+    let content = crate::utils::fs::read_regular_to_string(path).await.ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     let folders = json.get("packageFolders")?.as_object()?;
     Some(folders.keys().map(PathBuf::from).collect())
@@ -1512,5 +1512,85 @@ mod tests {
                 "vacuous fixtures: {crawled}/{found}"
             );
         }
+    }
+
+    /// mkfifo(2) directly (no child process; spawning `mkfifo` flakes
+    /// under heavy parallel load).
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// On timeout the open is wedged in a blocking-pool thread that the
+    /// runtime waits for on shutdown; connecting a writer releases it so
+    /// the test FAILS instead of hanging the whole suite.
+    #[cfg(unix)]
+    async fn within_deadline<F: std::future::Future>(fifo: &Path, what: &str, fut: F) -> F::Output {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
+            Ok(out) => out,
+            Err(_) => {
+                let _ = std::fs::OpenOptions::new().write(true).open(fifo);
+                panic!("{what} must not block on a FIFO at {}", fifo.display());
+            }
+        }
+    }
+
+    /// Regression (#592): a FIFO at `obj/project.assets.json` used to
+    /// wedge `get_nuget_package_paths` (and so every NuGet crawl) in
+    /// open(2). It now goes through the FIFO-safe reader and is skipped
+    /// like any other unreadable assets file; a sibling sub-project's
+    /// readable assets file is still discovered.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_project_assets_is_skipped_not_blocked_on() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("App.csproj"), "<Project />")
+            .await
+            .unwrap();
+        let obj_dir = dir.path().join("obj");
+        tokio::fs::create_dir_all(&obj_dir).await.unwrap();
+        let fifo = obj_dir.join("project.assets.json");
+        make_fifo(&fifo);
+
+        let pkg_folder = dir.path().join("nuget-cache");
+        tokio::fs::create_dir_all(&pkg_folder).await.unwrap();
+        let sub_obj = dir.path().join("Lib").join("obj");
+        tokio::fs::create_dir_all(&sub_obj).await.unwrap();
+        tokio::fs::write(
+            sub_obj.join("project.assets.json"),
+            serde_json::to_string(&serde_json::json!({
+                "packageFolders": { pkg_folder.to_string_lossy().to_string(): {} }
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let crawler = NuGetCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        let paths = within_deadline(
+            &fifo,
+            "get_nuget_package_paths",
+            crawler.get_nuget_package_paths(&options),
+        )
+        .await
+        .unwrap();
+        assert!(
+            paths.contains(&pkg_folder),
+            "the readable sub-project assets file must still be discovered, got {paths:?}"
+        );
     }
 }
