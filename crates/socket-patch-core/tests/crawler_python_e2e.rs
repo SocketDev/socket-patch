@@ -928,11 +928,17 @@ async fn get_global_python_site_packages_discovers_pdm_managed_interpreters() {
 
 /// `global_project.path` and `python.install_root` in PDM's global
 /// config (`$PDM_CONFIG_FILE` here) relocate both, with `~` expanded the
-/// way PDM's `expanduser` does (#451).
+/// way PDM's `expanduser` does: from USERPROFILE on Windows, where a Git
+/// Bash HOME is ignored, and from HOME elsewhere (#451).
 #[tokio::test]
 #[serial]
 async fn get_global_python_site_packages_follows_pdm_config_overrides() {
     let tmp = tempfile::tempdir().unwrap();
+    let home = if cfg!(windows) {
+        tmp.path().join("msys-home")
+    } else {
+        tmp.path().to_path_buf()
+    };
     let config_file = tmp.path().join("pdm-config.toml");
     tokio::fs::write(
         &config_file,
@@ -943,8 +949,11 @@ async fn get_global_python_site_packages_follows_pdm_config_overrides() {
     let project_sp = stage_env(&tmp.path().join("gp").join(".venv")).await;
     let python_sp = stage_env(&tmp.path().join("pyroot").join("cpython@3.12.14")).await;
 
-    let result =
-        global_site_packages_with_vars(tmp.path(), &[("PDM_CONFIG_FILE", &config_file)]).await;
+    let mut vars: Vec<(&str, &Path)> = vec![("PDM_CONFIG_FILE", &config_file)];
+    if cfg!(windows) {
+        vars.push(("USERPROFILE", tmp.path()));
+    }
+    let result = global_site_packages_with_vars(&home, &vars).await;
     assert_surfaces(
         &result,
         &project_sp,

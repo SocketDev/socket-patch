@@ -1703,7 +1703,15 @@ async fn pdm_global_site_packages(home_dir: &Path) -> Vec<PathBuf> {
     let mut projects = Vec::new();
     let mut install_roots = Vec::new();
     let mut venv_roots = Vec::new();
-    let var = |name: &str| std::env::var(name).ok();
+    // PDM expands `~` with Python's `expanduser`, which reads USERPROFILE
+    // on Windows and ignores HOME there (Python 3.8+), so a Git Bash HOME
+    // must not decide where a relocated setting points.
+    let var = |name: &str| {
+        if cfg!(windows) && name == "HOME" {
+            return None;
+        }
+        std::env::var(name).ok()
+    };
     for file in &config_files {
         let Ok(text) = read_regular_to_string(file).await else {
             continue;
