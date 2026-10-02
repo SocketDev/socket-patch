@@ -107,6 +107,75 @@ fn make_preserve_fixture(root: &Path) -> (PathBuf, String, String) {
     (socket, before_hash, after_hash)
 }
 
+/// Removing one patch must not collect another active patch's only local
+/// rollback data (#559). Exercise both commands against the same lifecycle.
+#[test]
+fn scoped_removal_preserves_other_patches_for_offline_rollback() {
+    for command in ["remove", "rollback"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (socket, before_hash, after_hash) = make_preserve_fixture(root);
+        let other_purl = "pkg:npm/other-patch@1.0.0";
+        let original = b"other original\n";
+        let patched = b"other patched\n";
+        let other_before = common::git_sha256(original);
+        let other_after = common::git_sha256(patched);
+        let mut manifest = read_manifest(&socket);
+        let mut record = manifest["patches"][PRESERVE_PURL].clone();
+        record["uuid"] = serde_json::json!("88888888-8888-4888-8888-888888888888");
+        record["files"]["package/a.js"] = serde_json::json!({
+            "beforeHash": other_before, "afterHash": other_after,
+        });
+        manifest["patches"][other_purl] = record.clone();
+        std::fs::write(
+            socket.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let package = root.join("node_modules/other-patch");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"other-patch","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(package.join("a.js"), patched).unwrap();
+        std::fs::write(socket.join("blobs").join(&other_before), original).unwrap();
+        std::fs::write(socket.join("blobs").join(&other_after), patched).unwrap();
+
+        let (code, stdout, stderr) = common::run_with_env(
+            root,
+            &[command, PRESERVE_PURL, "--json", "--yes", "--offline"],
+            &[],
+        );
+        assert_eq!(code, 0, "{command}: {stdout}\n{stderr}");
+        let remaining = read_manifest(&socket);
+        assert_eq!(remaining["patches"].as_object().unwrap().len(), 1);
+        assert_eq!(remaining["patches"][other_purl], record);
+        assert_eq!(std::fs::read(package.join("a.js")).unwrap(), patched);
+        assert!(!socket.join("blobs").join(&before_hash).exists());
+        assert!(!socket.join("blobs").join(&after_hash).exists());
+        assert!(socket.join("blobs").join(&other_after).exists());
+        assert!(
+            socket.join("blobs").join(&other_before).exists(),
+            "{command} swept the remaining patch's rollback data"
+        );
+
+        let (code, stdout, stderr) =
+            common::run_with_env(root, &["rollback", other_purl, "--json", "--offline"], &[]);
+        assert_eq!(
+            code, 0,
+            "offline rollback after {command}: {stdout}\n{stderr}"
+        );
+        assert_eq!(std::fs::read(package.join("a.js")).unwrap(), original);
+        assert!(read_manifest(&socket)["patches"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+        assert!(!socket.join("blobs").exists());
+    }
+}
+
 /// `remove --preserve-state` on an installed, patched package must restore
 /// the file to its ORIGINAL bytes (the rollback half still runs) while
 /// keeping ALL local state: the manifest entry survives byte-for-byte, both
