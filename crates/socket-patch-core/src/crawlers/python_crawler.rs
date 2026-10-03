@@ -1401,6 +1401,10 @@ async fn poetry_project_site_packages(
         if found.is_empty() {
             if project.in_project_venv_exists(cwd) {
                 found = find_site_packages_under(&cwd.join(".venv"), "site-packages").await;
+                // Keep the existing local inventory when Poetry selects
+                // its in-project env. A healthy .venv must not hide stale
+                // bytes in a sibling venv from hosted verification/VEX.
+                found.extend(find_site_packages_under(&cwd.join("venv"), "site-packages").await);
             } else if project.config.create != Some(false) {
                 if let Some(placement) = placement {
                     found = poetry_placement_site_packages(placement).await;
@@ -4399,6 +4403,46 @@ mod tests {
             poetry_virtualenvs_root(cwd, &explicit, &var),
             Some(PathBuf::from("/explicit/venvs")),
             "an unused cyclic key must not invalidate an explicit path"
+        );
+    }
+
+    #[tokio::test]
+    async fn poetry_in_project_keeps_local_inventory_without_overriding_selected_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, root, prefix) = poetry_fixture(tmp.path(), "", &["3.11"]);
+        let local = poetry_site(&project.join(".venv"), "3.12");
+        let sibling = poetry_site(&project.join("venv"), "3.13");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let var = poetry_env(tmp.path(), &[]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![local, sibling],
+            "a healthy .venv must not hide a stale copy in the local venv inventory"
+        );
+
+        let active = tmp.path().join("active");
+        let active_site = poetry_site(&active, "3.14");
+        std::fs::create_dir_all(&active_site).unwrap();
+        let active_env = [("VIRTUAL_ENV", active.to_string_lossy().into_owned())];
+        let active_var = poetry_env(tmp.path(), &active_env);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &active_var).await,
+            vec![active_site],
+            "an explicitly selected shell env still takes precedence over local inventory"
+        );
+        std::fs::write(
+            project.join("poetry.toml"),
+            format!(
+                "[virtualenvs]\npath = {:?}\nin-project = false\n",
+                root.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![poetry_site(&root.join(format!("{prefix}-py3.11")), "3.11")],
+            "a selected out-of-tree env still takes precedence over local inventory"
         );
     }
 
