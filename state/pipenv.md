@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-02 21:36Z, main `045d7ec` (CLI 4.0.0). #516's Pipenv shape is verified fixed. The #503 vendored → hosted takeover and #572 (path-prefixed / sdist / rotated hosted pins) pass. Filed #612: vendored ignores a sibling requirements.txt, and the hosted → vendored takeover unpatches it.
+Last run: 2026-10-03 03:35Z, main `045d7ec` (CLI 4.0.0, unchanged). Filed #645: since #388, an explicit `PIPENV_VENV_IN_PROJECT=0` / `PIPENV_NO_VENV_IN_PROJECT=1` skips `./.venv`, but Pipenv ≤ 2023.10.24 still uses it. Passing this run: vendored on 2022, hosted → vendored on 2018 / 2022, agent multi-copy on 2022 / 2024 / 2025, the stale-warning remedy, and hosted with a `--hash` requirements.txt.
 
 ## Coverage matrix
 
@@ -10,12 +10,12 @@ Cells marked v5 were re-run on `2463257` (v5: no hosted ledger, upstream-restore
 
 | OS | Pipenv | agent (OOT venv) | agent (stray venv/ or .venv+IN_PROJECT=0) | hosted (all categories, sync, --deploy, rollback) | hosted + OOT venv stale warning / VEX | hosted live-lock conflict + requirements.txt | vendored (lock-only, repair, revert) | hosted → vendored | vendored → hosted | VIRTUAL_ENV w/ IGNORE_VIRTUALENVS / PIPENV_ACTIVE |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 2018.11.26 | pass `61cfb9b` (unicode/space/paren names, nested PIPENV_PYTHON chain) | .venv + WORKON venv: pass `d63ae5f` (#529 fixed); `.venv` reset to pristine → vex false `not_affected` (#516) | pass v5 (+CRLF) | untested | fail #333 | pass v5; + sibling requirements.txt fail #612 | untested | pass `045d7ec` (default + develop) | fail #384 |
-| Linux | 2022.12.19 | untested | .venv + WORKON venv, nothing explicit: fail #529 | pass v5 (+relock); `[docs]`-only + rollback pass `61cfb9b` | untested | fail #333 | untested | untested | untested | untested |
-| Linux | 2023.12.1 | pass | .venv + WORKON venv: pass `d63ae5f` (#529 fixed); `.venv` reset to pristine → vex `not_applied` pass `045d7ec` (#516 fixed) | pass v5 (+relock); verify / requirements / deploy pass `61cfb9b` | pass; fail #334/#384 shapes (false VEX) | fail #333 | + sibling requirements.txt fail #612 | pass `045d7ec` (prefix) | pass `045d7ec` (+ requirements.txt) | fail #384 (agent + hosted VEX) |
-| Linux | 2026.8.0 | pass `61cfb9b`; PIPENV_PYTHON-suffixed twin venv pass `d63ae5f`; `.env` WORKON_HOME still fails #546 `045d7ec` | pass `61cfb9b` (#334 fixed); .venv + WORKON pass `d63ae5f`; #504 still fails `d63ae5f`; no-Pipenv-venv shapes patch the system Python, fail #504 | pass v5 (+CRLF); verify / requirements / deploy pass `61cfb9b` | pass; #334/#384 shapes untested since the fix | pass `61cfb9b` (#333 fixed) | pass v5; + sibling requirements.txt fail #612 | pass v5; prefixed server pass `045d7ec`; requirements.txt unpatched fail #612 | pass `045d7ec` (#328 fixed; default + develop + `[docs]`, requirements.txt) | pass `61cfb9b` (#384 fixed) |
-| Linux | 2024.4.1 | pass `61cfb9b` | untested | pass `61cfb9b` (default + `[docs]`, verify / requirements / sync / --deploy / vex / byte-exact rollback) | untested | untested | pass `61cfb9b` (both categories, sync / --deploy / vex / repair / rollback) | untested | untested | untested |
-| Linux | 2025.1.3 | untested | untested | pass `61cfb9b` (same as 2024.4.1) | untested | untested | pass `61cfb9b` (same as 2024.4.1) | untested | untested | untested |
+| Linux | 2018.11.26 | pass `61cfb9b` (unicode/space/paren names, nested PIPENV_PYTHON chain) | .venv + WORKON venv: pass `d63ae5f` (#529 fixed); `.venv` + `PIPENV_VENV_IN_PROJECT=0` / `NO_VENV_IN_PROJECT=1`: fail #645 `045d7ec` | pass v5 (+CRLF); `Six` casing pass `045d7ec` | stale warning + remedy pass `045d7ec` | fail #333 | pass v5; + sibling requirements.txt fail #612 | pass `045d7ec` (default + develop) | pass `045d7ec` (default + develop) | fail #384 |
+| Linux | 2022.12.19 | multi-copy (.venv + WORKON) + rollback w/ modified copy pass `045d7ec` | .venv + WORKON venv, nothing explicit: pass (#529 fixed); `.venv` + `PIPENV_VENV_IN_PROJECT=0` / `NO_VENV_IN_PROJECT=1`: fail #645 `045d7ec` | pass v5 (+relock); `[docs]`-only + rollback pass `61cfb9b`; `--hash` requirements.txt pass `045d7ec` | stale warning + remedy pass `045d7ec` | fail #333 | pass `045d7ec` (lock-only, sync / --deploy, tamper rejected, repair, revert byte-exact) | pass `045d7ec` (default + develop) | untested | untested |
+| Linux | 2023.12.1 | pass; `PIPENV_VENV_IN_PROJECT=0` + .venv + WORKON pass `045d7ec` (2023.11.14 too; 2023.10.24 fails #645) | .venv + WORKON venv: pass `d63ae5f` (#529 fixed); `.venv` reset to pristine → vex `not_applied` pass `045d7ec` (#516 fixed) | pass v5 (+relock); verify / requirements / deploy pass `61cfb9b` | pass; fail #334/#384 shapes (false VEX) | fail #333 | + sibling requirements.txt fail #612 | pass `045d7ec` (prefix) | pass `045d7ec` (+ requirements.txt) | fail #384 (agent + hosted VEX) |
+| Linux | 2026.8.0 | pass `61cfb9b`; `NO_VENV_IN_PROJECT=1` / `VENV_IN_PROJECT=0` + .venv pass `045d7ec`; PIPENV_PYTHON-suffixed twin venv pass `d63ae5f`; `.env` WORKON_HOME still fails #546 `045d7ec` | pass `61cfb9b` (#334 fixed); .venv + WORKON pass `d63ae5f`; #504 still fails `d63ae5f`; no-Pipenv-venv shapes patch the system Python, fail #504 | pass v5 (+CRLF); verify / requirements / deploy pass `61cfb9b` | pass; #334/#384 shapes untested since the fix | pass `61cfb9b` (#333 fixed) | pass v5; + sibling requirements.txt fail #612 | pass v5; prefixed server pass `045d7ec`; requirements.txt unpatched fail #612 | pass `045d7ec` (#328 fixed; default + develop + `[docs]`, requirements.txt) | pass `61cfb9b` (#384 fixed) |
+| Linux | 2024.4.1 | pass `61cfb9b`; multi-copy + rollback w/ modified copy pass `045d7ec` | untested | pass `61cfb9b` (default + `[docs]`, verify / requirements / sync / --deploy / vex / byte-exact rollback) | untested | untested | pass `61cfb9b` (both categories, sync / --deploy / vex / repair / rollback) | untested | untested | untested |
+| Linux | 2025.1.3 | multi-copy + rollback w/ modified copy pass `045d7ec` | untested | pass `61cfb9b` (same as 2024.4.1) | untested | untested | pass `61cfb9b` (same as 2024.4.1) | untested | untested | untested |
 | macOS | 2023.12.1 | pass | fail #334 | untested | untested | fail #333 | untested | untested | untested | fail #384 |
 | macOS | 2026.8.0 | pass | fail #334 | untested | untested | fail #333 | untested | untested | untested | fail #384 |
 | Windows | 2023.12.1 | pass | fail #334 | untested | untested | fail #333 | untested | untested | untested | fail #384 |
@@ -42,17 +42,20 @@ Named category on 2026.8.0 (`61cfb9b`): `pipenv requirements --categories docs` 
 
 `-g` / agent on an unwritable prefix or a root-owned `.venv`, as a non-root user (2026.8.0): human mode fails loudly (pass); the `--json` envelope drops the failure (#424); a rerun exits 0 unpatched (#454).
 
-macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-01 09:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
+Hosted `pipenv requirements --hash` sibling (2022 / 2026, `045d7ec`): hash mode kept, `pip install --require-hashes` PATCHED (pass); rollback refusal there is #410. Vendored + hashed sibling requirements.txt: `vendor --revert` / rollback byte-exact on both files (2026, pass).
+
+macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-03 03:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
 
-0. #612 variants: `vendor --revert` / rollback on the half-wired project, `pipenv requirements --hash` output, `-r` includes; re-verify once fixed.
-1. Re-verify #546 once it's fixed: `.env` with `PIPENV_CUSTOM_VENV_NAME`, `WORKON_HOME`, `PIPENV_VENV_IN_PROJECT=0` + `.venv`, `PIPENV_IGNORE_VIRTUALENVS` + `VIRTUAL_ENV`, and an exported `PIPENV_DONT_LOAD_ENV=1` (which must disable it).
-2. Re-verify #504 and the #454 human-mode gap once they're fixed. (#516's Pipenv shape is verified fixed on `045d7ec`.)
-3. #567 variants: vendored mode with an `-r` include in a Pipenv project, `remove`, `-c` constraints; re-verify once fixed.
-4. Agent multi-copy (#538) on 2022 / 2024 / 2025, and rollback when one copy is user-modified (a third hash).
+0. Re-verify #645 once it's fixed (2018 / 2022 / 2023.10.24 with `PIPENV_VENV_IN_PROJECT=0`, `=false`, `PIPENV_NO_VENV_IN_PROJECT=1`; 2023.11.14+ must keep using WORKON). Also check its hosted shape: the stale warning and vex look at WORKON while Pipenv ≤ 2023.10 installs into `.venv`.
+1. #612 variants still open: `-r` includes in vendored mode. Re-verify once fixed. (Revert / rollback on the half-wired project pass.)
+2. Re-verify #546 once it's fixed: `.env` with `PIPENV_CUSTOM_VENV_NAME`, `WORKON_HOME`, `PIPENV_VENV_IN_PROJECT=0` + `.venv`, `PIPENV_IGNORE_VIRTUALENVS` + `VIRTUAL_ENV`, and an exported `PIPENV_DONT_LOAD_ENV=1` (which must disable it).
+3. Re-verify #504 and the #454 human-mode gap once they're fixed.
+4. #567 variants: vendored mode with an `-r` include, `remove`, `-c` constraints; re-verify once fixed.
 5. **Maintainer request (global `-g` mode):** still to do: macOS / Windows, `-g` on 2018 / 11, and `--global-prefix` as a venv root (scans 0; undocumented). Checklist in the 20261001T040000Z entry.
-6. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked until branch deletion through the git proxy works.
+6. Hosted path-prefix on Pipenv 9 / 11 (`path` references) and on lock-only checkouts.
+7. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546 / #645, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked until branch deletion through the git proxy works.
 
 ## Known non-bugs
 
@@ -90,3 +93,5 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - Pipenv 11.x / 2018.x with `virtualenv<20` can't create venvs from uv's standalone CPython (missing `libpython`): a sandbox tooling artifact, so use virtualenv 20.x. Pipenv 11.x also breaks on `(` in a project name (an unsanitized shebang): Pipenv's bug.
 - A hosted requirements.txt rewrite touches only the root file; an included pin gets `redirect_requirements_entry_not_found` (documented). The Pipenv-project consequence is #567.
 - Pipenv 2026.8.0 recreates a `PIPENV_PYTHON`-suffixed venv on `pipenv run` when `PIPENV_PYTHON` names a PATH symlink ("Python version differs"). That's Pipenv's quirk.
+- Pipenv 2018.11.26 reads `PIPENV_VENV_IN_PROJECT` with `bool(os.environ.get(...))`, so `"0"` means in project, and Pipenv ≤ 2023.10.24 always uses an existing `.venv` directory. That's Pipenv's behaviour, and the reason #645 is a socket-patch bug.
+- v5 `scan` defaults to hosted mode; agent cells need `--mode agent`.
