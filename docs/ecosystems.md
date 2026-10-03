@@ -412,8 +412,8 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
 ## Gradle
 
 Gradle builds are part of the `maven` ecosystem: patches are Maven PURLs and every
-mode works on Gradle 6.8 or newer with Groovy or Kotlin DSL. Gradle 6.9.4, 7.6.6,
-8.14.3 and 9.8.0 are tested on Linux, macOS and Windows (see
+mode works on Gradle 6.8 or newer with Groovy or Kotlin DSL. The test grid covers
+Gradle 6.9.4, 7.6.6, 8.14.3 and 9.8.0 on Linux, macOS and Windows (see
 [testing](testing/README.md#gradle)). The machine-readable contract, with every code,
 is the "Gradle builds" section of
 [CLI_CONTRACT.md](../crates/socket-patch-cli/CLI_CONTRACT.md#gradle-builds-v50).

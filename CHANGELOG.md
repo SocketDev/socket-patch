@@ -82,7 +82,7 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
   offline; `--local-repo` checks Maven cache conflicts and `--maven-config=none`
   selects the fallback file repository. Single-POM vendoring is unchanged.
 - Gradle 6.8+ in every mode, Groovy and Kotlin DSL, tested on Gradle 6.9.4, 7.6.6,
-  8.14.3 and 9.8.0 on Linux, macOS and Windows.
+  8.14.3 and 9.8.0 on macOS.
   - `scan` reads Gradle's cache, and the read-only cache, and resolves the Gradle
     user home the way the JVM does. It reads `~/.m2` for a Gradle-only build only
     when the build declares `mavenLocal()`. JSON marks lock membership (`inLock`).
