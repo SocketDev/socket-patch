@@ -3773,6 +3773,75 @@ mod plan_gate_tests {
              order, and none for the package its backend refuses first"
         );
     }
+
+    /// A record whose patch dir is a link (#664) is refused by the loop
+    /// before dispatch, so the plan leaves it out: a prefetch running ahead
+    /// of the loop must never stage or extract an archive through the link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_plan_leaves_out_a_package_whose_vendor_dir_is_linked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("project");
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("composer.json"), r#"{"require":{}}"#).unwrap();
+        let names = ["psr/cache", "psr/container", "psr/log"];
+        let locked: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name, "version": "1.0.0",
+                    "dist": {"type": "zip", "url": format!("https://example.invalid/{name}.zip"),
+                             "reference": "abc", "shasum": ""},
+                    "type": "library"
+                })
+            })
+            .collect();
+        std::fs::write(
+            root.join("composer.lock"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "content-hash": "x", "packages": locked, "packages-dev": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut all_packages: Vec<(String, StagedSource)> = Vec::new();
+        let mut records: HashMap<String, PatchRecord> = HashMap::new();
+        for (name, uuid) in names.iter().zip([UUID_A, UUID_B, UUID_C]) {
+            let purl = format!("pkg:composer/{name}@1.0.0");
+            let dir = root.join("vendor").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            all_packages.push((purl.clone(), StagedSource::Installed(dir)));
+            records.insert(purl, record(uuid));
+        }
+        let other = tmp.path().join("other-project-unit");
+        std::fs::create_dir_all(&other).unwrap();
+        let eco_dir = root.join(".socket/vendor/composer");
+        std::fs::create_dir_all(&eco_dir).unwrap();
+        std::os::unix::fs::symlink(&other, eco_dir.join(UUID_B)).unwrap();
+
+        let planned = plan_service_downloads(
+            root,
+            false,
+            &all_packages,
+            &HashMap::new(),
+            &records,
+            &VendorState::default(),
+            &HashSet::new(),
+            None,
+            &|_| false,
+            (
+                &tokio::sync::OnceCell::new(),
+                &vendor::pypi::InstalledSiteListings::default(),
+            ),
+        )
+        .await;
+        let uuids: Vec<&str> = planned.iter().map(|d| d.uuid.as_str()).collect();
+        assert_eq!(
+            uuids,
+            vec![UUID_A, UUID_C],
+            "the linked package is never planned"
+        );
+    }
 }
 
 #[cfg(test)]
