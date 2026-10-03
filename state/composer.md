@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Composer bug-hunt routine (label pm:composer).
 
-Last updated: 2026-10-03 (run 11), main `045d7ec` (after #555 lockfile-only apply skip, #503 pypi-only takeover), latest release v4.0.0.
+Last updated: 2026-10-03 (run 12), main `045d7ec` (after #555 lockfile-only apply skip, #503 pypi-only takeover), latest release v4.0.0.
 
 ## Coverage matrix
 
@@ -86,17 +86,26 @@ OS-independent (pure path logic). macOS/Windows: untested.
 
 Global `--global-prefix` with a space/unicode path and `SOCKET_GLOBAL=1` (2.10.3): pass.
 
+### `--no-dev` lock-only dev package, CRLF lock, custom vendor-dir (run 12, main `045d7ec`, Linux PHP 8.3)
+
+| Composer | hosted: `--no-dev` lock-only `v`-dev pkg → vex → install → fresh clone | vendored: same | CRLF lock: hosted rollback / vendored revert byte-identical | `vendor-dir: lib` vex with pristine install | reinstall hint with `vendor-dir: lib` |
+| --- | --- | --- | --- | --- | --- |
+| 1.10.28 | pass | pass | untested | untested | **fail #658** (vendored; hosted text) |
+| 2.2.30 | pass | pass | untested | untested | **fail #658** (hosted dist-only) |
+| 2.10.3 | pass | pass | pass / pass | pass (hosted omits, vendored warns) | **fail #658** (hosted dist-only) |
+
 ## Backlog
 
 1. macOS #586 variant: create `$XDG_CONFIG_HOME/composer` with the global install, keep a stale `~/.composer`, and run `scan -g` with composer off PATH (run 11's probe never created the XDG dir). Re-run #586 once fixed.
-2. Re-run #536 once Composer joins the vendored → hosted `takeover_capable` set (still missing on `045d7ec`). Cover both `scan` and `get <uuid> --mode hosted`.
-3. Hosted/vendored `vex` and vendored `scan --vendor` on a `--no-dev` project with a lock-only `v`-prefixed dev package.
+2. #658 follow-ups: the `COMPOSER_VENDOR_DIR` env variant and the composer/installers `install-path` variant. Re-run #658 when fixed.
+3. Re-run #536 once Composer joins the vendored → hosted `takeover_capable` set (still missing on `045d7ec`). Cover both `scan` and `get <uuid> --mode hosted`.
 4. Global `-g` leftovers: a non-writable global dir must fail loudly (non-root probe), and #446's `-g` scoping inside a hosted Composer project. Windows `-g` apply/rollback re-check on the #438 fix.
 5. macOS/Windows probe of vendored path-repo + source-install revert (a Windows junction path repo with existing `transport-options`), plus the Windows long-path depth of `.socket/vendor/composer/<uuid>/<v>/<n>@<ver>`.
 6. Re-run the Composer 1 installers cells when #463 is fixed, and add 2.10.3 installers cells. Re-run #399 and #515 when they're fixed.
 7. Ask maintainers whether to document `COMPOSER=<other>.json` and Composer 1's `composer require <other>` re-resolving custom-repo entries.
 8. PHP 7.2 / 7.4 cells for Composer 2.2 LTS (probe with setup-php).
-9. Delete the leftover probe branches `bughunt/composer/20260930-srconly-probe`, `bughunt/composer/20261001-global-probe`, `bughunt/composer/20261001-c1-topts` and `bughunt/composer/20261003-home-probe` (the sandbox git proxy refuses deletes). Needs a maintainer.
+9. CRLF lock cells on 1.10.28 / 2.2.30 (2.10.3 passed in run 12).
+10. Delete the leftover probe branches `bughunt/composer/20260930-srconly-probe`, `bughunt/composer/20261001-global-probe`, `bughunt/composer/20261001-c1-topts` and `bughunt/composer/20261003-home-probe` (the sandbox git proxy refuses deletes). Needs a maintainer.
 
 ## Known non-bugs
 
@@ -133,3 +142,5 @@ Global `--global-prefix` with a space/unicode path and `SOCKET_GLOBAL=1` (2.10.3
 - Composer 1.x prefers `~/.composer` over the XDG home even when both exist (`global config home` on 1.10.28). socket-patch's `~/.composer`-first fallback is correct for Composer 1. #586 is about Composer 2 only.
 - `--global-prefix` names the package root (Composer's global `vendor/` dir), not `COMPOSER_HOME`, the same way it takes `node_modules` or site-packages for other ecosystems. Pointing it at the home dir scans 0 packages by design.
 - Agent `apply` exits 0 for a manifest purl that composer.lock resolves but that isn't installed (`--no-dev`, or no `composer install` yet). That's #555's documented lockfile-only skip. A purl that isn't in the lock still exits 1.
+- Sandbox: after a hosted `rollback` / vendored `--revert`, `composer install` reinstalls the upstream dist and fails "Could not authenticate against github.com". That's the sandbox's zipball block; Composer does detect the change.
+- Repro hygiene for dist-only cells: a package installed from a source clone (`--prefer-source`) is reinstalled once the hosted rewrite drops `source`. Use an inline `package` repo with a `file://` zip dist to get a genuinely dist-only install.
