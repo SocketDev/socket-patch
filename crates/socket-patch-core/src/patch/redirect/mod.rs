@@ -63,6 +63,7 @@ mod poetry;
 #[cfg(test)]
 mod python_lock_equivalence_tests;
 mod requirements;
+pub mod gradle;
 mod staged;
 mod state;
 mod hosted_url;
@@ -143,6 +144,14 @@ pub struct RegistryOverrideIdentifiers {
     /// `maven_suffixed_version`, pinned as a Maven trusted checksum. Only
     /// meaningful alongside `maven_suffixed_version`.
     pub maven_pom_sha256: Option<String>,
+    /// sha256 hex of the exact suffixed Gradle `.module` bytes the serve
+    /// route returns (`<a>-<suffixed>.module`). `None` exactly when that
+    /// route 404s (the upstream release published no module metadata, or
+    /// the deployed service predates serving it); never set without
+    /// `maven_suffixed_version`. The hosted Gradle planner pins it in
+    /// `gradle/verification-metadata.xml`.
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub maven_module_sha256: Option<String>,
     pub gem_checksum_sha256: Option<String>,
 }
 
@@ -197,7 +206,7 @@ pub struct RewriteWarning {
     pub detail: String,
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Default, Clone, PartialEq)]
 #[cfg_attr(test, derive(Serialize))]
 pub struct RewriteResult {
     /// Rewritten file contents keyed by repo-relative path — only CHANGED files.
@@ -259,6 +268,82 @@ pub struct RewriteResult {
     /// [`vlt::vlt_drives`] over the rewriter's input files and the
     /// caller's `bun_lockb_present`.
     pub vlt_drives: bool,
+    /// Maven patch uuids the hosted Gradle planner decided (a Gradle build
+    /// is present): each is also in exactly one of the two sets below.
+    /// Hosted confirmation of a maven purl keys off these, never off
+    /// substring presence (a pasted snippet pins nothing). The three Gradle
+    /// sets serialize (and print) only when non-empty, so the equivalence
+    /// goldens of the other rewriters keep their digests.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub gradle_uuids: std::collections::BTreeSet<String>,
+    /// The owned script, the apply line with the current index digest in
+    /// every build's settings, the index row and every lock entry of the
+    /// GA are final (written by this run or already in place).
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub confirmed_gradle_uuids: std::collections::BTreeSet<String>,
+    /// Refused: nothing was written for them, and the fallback snippet was
+    /// printed (`redirect_gradle_manual_snippet`).
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub refused_gradle_uuids: std::collections::BTreeSet<String>,
+}
+
+/// The derived `Debug` shape, with the Gradle sets shown only when
+/// non-empty: the equivalence goldens digest this rendering for the other
+/// rewriters, which never fill them.
+impl std::fmt::Debug for RewriteResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("RewriteResult");
+        d.field("files", &self.files);
+        d.field("binary_files", &self.binary_files);
+        d.field(
+            "confirmed_bun_binary_uuids",
+            &self.confirmed_bun_binary_uuids,
+        );
+        d.field("edits", &self.edits);
+        d.field("warnings", &self.warnings);
+        d.field("confirmed_cargo_uuids", &self.confirmed_cargo_uuids);
+        d.field("confirmed_golang_uuids", &self.confirmed_golang_uuids);
+        d.field("confirmed_pipenv_uuids", &self.confirmed_pipenv_uuids);
+        d.field("refused_pipenv_uuids", &self.refused_pipenv_uuids);
+        d.field("confirmed_pdm_uuids", &self.confirmed_pdm_uuids);
+        d.field("refused_pdm_uuids", &self.refused_pdm_uuids);
+        d.field("refused_pnpm_uuids", &self.refused_pnpm_uuids);
+        d.field("python_lock_uuids", &self.python_lock_uuids);
+        d.field(
+            "confirmed_python_lock_uuids",
+            &self.confirmed_python_lock_uuids,
+        );
+        d.field("refused_python_lock_uuids", &self.refused_python_lock_uuids);
+        d.field("hatch_uuids", &self.hatch_uuids);
+        d.field("confirmed_hatch_uuids", &self.confirmed_hatch_uuids);
+        d.field(
+            "confirmed_requirements_uuids",
+            &self.confirmed_requirements_uuids,
+        );
+        d.field("confirmed_vlt_uuids", &self.confirmed_vlt_uuids);
+        d.field("refused_vlt_uuids", &self.refused_vlt_uuids);
+        d.field("vlt_foreign_uuids", &self.vlt_foreign_uuids);
+        d.field("vlt_drives", &self.vlt_drives);
+        for (name, set) in [
+            ("gradle_uuids", &self.gradle_uuids),
+            ("confirmed_gradle_uuids", &self.confirmed_gradle_uuids),
+            ("refused_gradle_uuids", &self.refused_gradle_uuids),
+        ] {
+            if !set.is_empty() {
+                d.field(name, set);
+            }
+        }
+        d.finish()
+    }
 }
 
 /// Combined name as it appears in registry coordinates / lock keys.
@@ -465,6 +550,7 @@ fn rewriter_groups<'a>(
         Box::new(move |result| rewrite_nuget(files, overrides, result)),
         Box::new(move |result| rewrite_gem(files, overrides, result)),
         Box::new(move |result| rewrite_maven_pom(files, overrides, result)),
+        Box::new(move |result| gradle::rewrite_gradle_hosted(files, overrides, result)),
         Box::new(move |result| rewrite_golang(files, overrides, result)),
     ]
 }
@@ -537,6 +623,9 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         refused_vlt_uuids,
         vlt_foreign_uuids,
         vlt_drives: _,
+        gradle_uuids,
+        confirmed_gradle_uuids,
+        refused_gradle_uuids,
     } = delta;
     result.files.extend(files);
     result.binary_files.extend(binary_files);
@@ -567,6 +656,9 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.confirmed_vlt_uuids.extend(confirmed_vlt_uuids);
     result.refused_vlt_uuids.extend(refused_vlt_uuids);
     result.vlt_foreign_uuids.extend(vlt_foreign_uuids);
+    result.gradle_uuids.extend(gradle_uuids);
+    result.confirmed_gradle_uuids.extend(confirmed_gradle_uuids);
+    result.refused_gradle_uuids.extend(refused_gradle_uuids);
 }
 
 /// [`rewrite_groups_serial`], with the groups run concurrently under
@@ -5290,18 +5382,10 @@ fn rewrite_gem(
 //   warns `redirect_maven_same_gav_fallback` (a Socket-repo outage/tamper falls
 //   back to the UNPATCHED artifact — NOT fail-closed).
 //
-// Gradle has no equivalent surgical single-line edit, so a present build script
-// gets a paste-able `exclusiveContent { … }` snippet warning instead of an
-// edit. pom.xml + `.mvn/*` are authored surgically (mirrors the cargo/nuget
-// rewriters): every byte not touched by an edit is preserved.
-
-/// Gradle build scripts (Groovy + Kotlin DSL) that trigger the manual snippet.
-const GRADLE_FILES: &[&str] = &[
-    "settings.gradle",
-    "settings.gradle.kts",
-    "build.gradle",
-    "build.gradle.kts",
-];
+// A Gradle build is wired by its own planner ([`gradle`]): the owned hosted
+// settings script, its index and the lockfile surgery. pom.xml + `.mvn/*`
+// are authored surgically (mirrors the cargo/nuget rewriters): every byte
+// not touched by an edit is preserved.
 
 /// The six `-Daether.*` args that enable Maven's Trusted Checksums resolver
 /// post-processor (twin of the TS `MVN_CONFIG_ARGS`), one per `.mvn/maven.config`
@@ -5471,7 +5555,7 @@ fn rewrite_maven_pom(
     let mut mvn_config_changed = false;
     // (local-repo-relative path, bare sha256 hex) entries to merge in.
     let mut checksum_entries: Vec<(String, String)> = vec![];
-    let gradle_build_present = GRADLE_FILES.iter().any(|f| files.contains_key(*f));
+    let gradle_build_present = gradle::gradle_build_present(files);
     let mut warned_no_pom = false;
     // Local-repo paths of the suffixed jars this run's Trusted Checksums pin
     // covers, whether the pin lands now or a prior run wrote it: the
@@ -5501,27 +5585,10 @@ fn rewrite_maven_pom(
         let pom_sha256 = ov.identifiers.maven_pom_sha256.clone();
         let jar_sha256 = dep.integrity.sha256.clone();
 
-        // Gradle: emit a paste-able exclusiveContent snippet (never edit a
-        // build script). Independent of the pom edit — a project may ship both.
-        // Pin the suffixed version when fail-closed; the legacy base otherwise.
-        if gradle_build_present {
-            let gradle_version = suffixed_version.as_deref().unwrap_or(&dep.version);
-            result.warnings.push(RewriteWarning {
-                code: "redirect_gradle_manual_snippet".into(),
-                detail: gradle_snippet(
-                    &ov.index_url,
-                    &group_id,
-                    &artifact_id,
-                    gradle_version,
-                    suffixed_version.is_some(),
-                ),
-            });
-        }
-
         // The pom for the rest of this iteration; edits land in place.
         let Some(pom_text) = pom.as_mut() else {
-            // A Gradle-only project is legitimately pom-less — the snippet
-            // above IS its redirect path. Otherwise say why nothing landed
+            // A Gradle-only project is legitimately pom-less — the Gradle
+            // planner is its redirect path. Otherwise say why nothing landed
             // (parity with `redirect_npm_no_lockfile`), once per run.
             if !gradle_build_present && !warned_no_pom {
                 warned_no_pom = true;
@@ -5989,31 +6056,6 @@ pub(crate) fn local_repo_artifact_path(
     format!(
         "{}/{artifact_id}/{version}/{artifact_id}-{version}.{ext}",
         group_id.replace('.', "/")
-    )
-}
-
-/// A paste-able Gradle `exclusiveContent` block that pins ONLY the patched
-/// artifact to the socket maven2 repository (Groovy DSL — the common case; the
-/// Kotlin DSL differs only in quoting). Uses the SUFFIXED version when
-/// fail-closed; the message reminds the user to also bump the dependency
-/// declaration. Emitted as a warning detail; the rewriter never edits a build
-/// script.
-fn gradle_snippet(
-    index_url: &str,
-    group_id: &str,
-    artifact_id: &str,
-    version: &str,
-    suffixed: bool,
-) -> String {
-    let bump = if suffixed {
-        format!(
-            " Also bump the {group_id}:{artifact_id} dependency declaration to version {version} — exclusiveContent is fail-closed by repo exclusivity."
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        "Gradle build detected — add this per-dependency repository manually (no automatic edit):\nrepositories {{\n    exclusiveContent {{\n        forRepository {{\n            maven {{ url \"{index_url}\" }}\n        }}\n        filter {{\n            includeVersion(\"{group_id}\", \"{artifact_id}\", \"{version}\")\n        }}\n    }}\n}}{bump}"
     )
 }
 
@@ -6924,8 +6966,10 @@ mod tests {
         assert_eq!(kinds, vec!["redirect_maven_repository"]);
     }
 
-    /// A present Gradle build script yields a paste-able snippet pinning the
-    /// SUFFIXED version, with no file edits.
+    /// A Gradle build the hosted Gradle planner refuses (here: a grant whose
+    /// uuid does not name its suffix) writes nothing and prints the
+    /// fallback snippet pinning the SUFFIXED version, substitution and
+    /// reject block included.
     #[test]
     fn maven_pom_gradle_manual_snippet() {
         let mut files = BTreeMap::new();
@@ -6935,17 +6979,30 @@ mod tests {
         );
         let r = rewrite_registry_redirect(&files, &[maven_override()]);
         assert!(r.files.is_empty() && r.edits.is_empty());
-        assert_eq!(warning_codes(&r), vec!["redirect_gradle_manual_snippet"]);
-        let detail = &r.warnings[0].detail;
+        assert_eq!(
+            warning_codes(&r),
+            vec![
+                "redirect_gradle_override_invalid",
+                "redirect_gradle_manual_snippet"
+            ]
+        );
+        assert!(r.refused_gradle_uuids.contains("uuid"));
+        let detail = &r.warnings[1].detail;
         assert!(
             detail.contains(&format!(
-                "includeVersion(\"org.slf4j\", \"slf4j-api\", \"{MAVEN_SUFFIXED}\")"
+                "includeVersion('org.slf4j', 'slf4j-api', '{MAVEN_SUFFIXED}')"
             )),
             "snippet pins the suffixed version: {detail}"
         );
         assert!(
-            detail.contains("bump the org.slf4j:slf4j-api dependency declaration"),
-            "snippet reminds to bump the declaration: {detail}"
+            detail.contains(&format!("strictly '{MAVEN_SUFFIXED}'"))
+                && detail.contains("substitute module('org.slf4j:slf4j-api')")
+                && detail.contains("selection.reject("),
+            "snippet carries the pin, the substitution and the reject block: {detail}"
+        );
+        assert!(
+            !detail.contains("fail-closed by repo exclusivity"),
+            "the false exclusivity claim is gone: {detail}"
         );
     }
 
@@ -15280,8 +15337,8 @@ packages:
     }
 
     /// No pom.xml and no Gradle build script: the maven grants are SAID once.
-    /// (A Gradle-only project is legitimately pom-less — its snippet IS the
-    /// redirect path; see `maven_pom_gradle_manual_snippet`.)
+    /// (A Gradle-only project is legitimately pom-less — the Gradle planner
+    /// is its redirect path; see `redirect::gradle`.)
     #[test]
     fn maven_without_pom_or_gradle_warns_once_and_skips() {
         let files = BTreeMap::new();
@@ -16948,8 +17005,8 @@ packages:
         );
     }
 
-    /// The LEGACY gradle snippet pins the BASE version and omits the "Also
-    /// bump" sentence (there is no suffixed version to bump to).
+    /// The LEGACY (same-GAV) grant is refused for a Gradle build; its
+    /// snippet routes the BASE version and carries no pin to bump to.
     #[test]
     fn maven_legacy_gradle_snippet_pins_base_version() {
         let mut files = BTreeMap::new();
@@ -16959,15 +17016,21 @@ packages:
         );
         let r = rewrite_registry_redirect(&files, &[legacy_maven_override()]);
         assert!(r.files.is_empty() && r.edits.is_empty());
-        assert_eq!(warning_codes(&r), vec!["redirect_gradle_manual_snippet"]);
-        let detail = &r.warnings[0].detail;
+        assert_eq!(
+            warning_codes(&r),
+            vec![
+                "redirect_gradle_same_gav_unsupported",
+                "redirect_gradle_manual_snippet"
+            ]
+        );
+        let detail = &r.warnings[1].detail;
         assert!(
-            detail.contains("includeVersion(\"org.slf4j\", \"slf4j-api\", \"1.7.36\")"),
+            detail.contains("includeVersion('org.slf4j', 'slf4j-api', '1.7.36')"),
             "snippet pins the BASE version: {detail}"
         );
         assert!(
-            !detail.contains("Also bump"),
-            "no bump reminder in legacy mode: {detail}"
+            !detail.contains("strictly"),
+            "no pin to bump to in legacy mode: {detail}"
         );
     }
 

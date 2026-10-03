@@ -1509,8 +1509,21 @@ async fn vendored_takeover(
     // for those locks even though the rewriters never see these purls.
     let mut dry_run_locks: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    // Maven takes over only a Gradle build's vendored JVM entry (its revert
+    // unplans the vendored Gradle wiring); a pom-only vendored entry stays.
     let takeover_capable = |p: &str| {
-        p.starts_with("pkg:cargo/") || p.starts_with("pkg:npm/") || p.starts_with("pkg:golang/")
+        p.starts_with("pkg:cargo/")
+            || p.starts_with("pkg:npm/")
+            || p.starts_with("pkg:golang/")
+            || p.starts_with("pkg:maven/")
+    };
+    let gradle_jvm_entry = |entry: &socket_patch_core::vendor::VendorEntry| {
+        entry.ecosystem == "jvm"
+            && entry.wiring.iter().any(|w| {
+                w.file.ends_with(".gradle")
+                    || w.file.ends_with(".gradle.kts")
+                    || w.file == socket_patch_core::vendor::jvm::gradle::INDEX_REL
+            })
     };
     if !candidates.iter().any(|c| takeover_capable(&c.purl)) {
         // No takeover-capable candidates — nothing to reconcile.
@@ -1535,7 +1548,13 @@ async fn vendored_takeover(
                 .cloned();
             (c, entry)
         })
+        .filter(|(c, entry)| {
+            !c.purl.starts_with("pkg:maven/") || entry.as_ref().is_some_and(gradle_jvm_entry)
+        })
         .collect();
+    if takeover.is_empty() {
+        return Ok(out);
+    }
     // Compatibility must be known before the takeover removes a live
     // patch. In particular, a v0 workspace can keep an existing local
     // tuple even though hosted mode cannot replace it with a URL. Only
@@ -1636,13 +1655,43 @@ async fn vendored_takeover(
     } else {
         None
     };
+    // Gradle twin: the hosted Gradle planner refuses builds and grants the
+    // vendored backend accepts (a custom `lockFile`, a settings-classpath
+    // GA, a same-GAV or incomplete grant, ...). Each refusal must be known
+    // before the revert strips the live vendored patch, or the planner
+    // then writes nothing and the build resolves the unpatched upstream.
+    // Every Gradle JVM takeover purl is checked against the build on disk.
+    let gradle_takeover_refusals: std::collections::HashMap<
+        String,
+        socket_patch_core::patch::redirect::RewriteWarning,
+    > = if takeover.iter().any(|(c, entry)| {
+        c.purl.starts_with("pkg:maven/") && entry.as_ref().is_some_and(gradle_jvm_entry)
+    }) {
+        let files =
+            socket_patch_core::patch::redirect::gradle::read_build_from_disk(&common.cwd).await;
+        takeover
+            .iter()
+            .filter(|(c, entry)| {
+                c.purl.starts_with("pkg:maven/") && entry.as_ref().is_some_and(gradle_jvm_entry)
+            })
+            .filter_map(|(c, _)| {
+                socket_patch_core::patch::redirect::gradle::takeover_refusal(&files, &c.dep)
+                    .map(|w| (c.purl.clone(), w))
+            })
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
     // The takeover refusal (if any) for one candidate: bun gates every
-    // npm purl, berry and vlt only their own vendored entries. A refused
-    // purl is never dispatched (see the loop), so its wiring is not a
-    // write target here.
+    // npm purl, berry and vlt only their own vendored entries, Gradle each
+    // of its own purls. A refused purl is never dispatched (see the loop),
+    // so its wiring is not a write target here.
     let takeover_refusal = |c: &Candidate,
                             entry: Option<&socket_patch_core::vendor::VendorEntry>|
      -> Option<&socket_patch_core::patch::redirect::RewriteWarning> {
+        if c.purl.starts_with("pkg:maven/") {
+            return gradle_takeover_refusals.get(&c.purl);
+        }
         if !c.purl.starts_with("pkg:npm/") {
             return None;
         }
@@ -1684,7 +1733,11 @@ async fn vendored_takeover(
         if let Some(entry) = ledger_entry {
             if let Some(warning) = takeover_refusal(candidate, Some(entry)) {
                 refused.push(purl.clone());
-                if !out.pre_warnings.iter().any(|w| w["code"] == warning.code) {
+                if !out
+                    .pre_warnings
+                    .iter()
+                    .any(|w| w["code"] == warning.code && w["detail"] == warning.detail)
+                {
                     out.pre_warnings.push(serde_json::json!(warning));
                 }
                 continue;
@@ -3622,6 +3675,13 @@ mod tests {
                 "settings.gradle.kts",
                 "build.gradle",
                 "build.gradle.kts",
+                "gradle.lockfile",
+                "buildscript-gradle.lockfile",
+                "settings-gradle.lockfile",
+                "gradle/verification-metadata.xml",
+                "gradle/wrapper/gradle-wrapper.properties",
+                ".socket/gradle/hosted-index.tsv",
+                ".socket/gradle/socket-patch.hosted.settings.gradle",
             ]
         );
     }

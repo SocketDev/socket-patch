@@ -32,6 +32,7 @@ mod client;
 mod composer;
 mod gem;
 mod golang;
+mod gradle;
 mod maven;
 mod npm;
 mod nuget;
@@ -529,6 +530,9 @@ enum Format {
     PythonLock,
     VltLock,
     Maven,
+    /// The hosted Gradle index (the restorer edits the settings, lock and
+    /// verification files it implies).
+    Gradle,
     NuGet,
     Unsupported,
 }
@@ -554,6 +558,7 @@ fn format_of(rel: &str) -> Format {
         leaf if leaf.ends_with(".txt") => Format::Requirements,
         "vlt-lock.json" => Format::VltLock,
         "pom.xml" => Format::Maven,
+        "hosted-index.tsv" => Format::Gradle,
         "nuget.config" | "NuGet.config" | "NuGet.Config" | "packages.lock.json" => Format::NuGet,
         _ => Format::Unsupported,
     }
@@ -688,6 +693,7 @@ async fn restore_pass(view: &mut View<'_>, active: &[&HostedPin], ctx: &Ctx<'_>)
             Format::PythonLock => uv::restore(view, &pins, &files, ctx).await,
             Format::VltLock => vlt::restore(view, &pins, &files, ctx).await,
             Format::Maven => maven::restore(view, &pins, &files, ctx).await,
+            Format::Gradle => gradle::restore(view, &pins, &files, ctx).await,
             Format::NuGet => nuget::restore(view, &pins, &files, ctx).await,
             Format::Unsupported | Format::BunLockb => {
                 let mut r = FormatResult::default();
