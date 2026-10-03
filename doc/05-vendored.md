@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against `main`: not yet re-checked; the content is as of `2463257`. Owner: `audit-ecosystems`._
+_Last checked against main @ 045d7ec on 2026-10-03 by audit-ecosystems (5.4 Python and Cargo only). Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -124,7 +124,8 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
 **Python:**
 - `utils/poetry_lock.rs` and `utils/pdm_lock.rs` are near-twins with mirrored function sets (`rewrite_*_lock`, `*_with_edits`, `plan_*_rewrite`, `*_lock_edits`, `*_lock_fragments`, `extend_span`, `pair_*`).
   - After renaming, `poetry_lock_edits` and `pdm_lock_edits` are **identical**.
-  - `pair_*` differs by three lines: pdm has a shape check that poetry lacks, which is a latent bug in one of them.
+  - `pair_*` differs by three lines: pdm has a shape check that poetry lacks. For Poetry this is unreachable, because a rewrite pairs fragments of one document before and after its own edit, so the fragment count cannot change.
+  - `next_header_end`, the rewrite struct with `edits()`, the parse holder and the finish step (render → reparse → pair → splice) are also copied. The finish steps differ only in their line-ending rule, which is a real drift: on a mixed-line-ending lock, Poetry turns the edited unit CRLF and PDM turns it LF ([`poetry_lock.rs#L366-L369`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/utils/poetry_lock.rs#L366-L369), [`pdm_lock.rs#L268`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/utils/pdm_lock.rs#L268)). {{E13}} {{E54}}
 - `vendor/pypi_{poetry,pdm,pipenv}.rs` repeat one skeleton:
   - `load_*_project`
   - `classify_dependency`
@@ -135,17 +136,18 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
 - Hosted-URL recognition for Pipenv is shared: hosted `owned_url` and the vendored Pipenv guard both ask `lock_inventory::pypi::hosted_pypi_reference`, which applies `hosted_patch_uuid`'s origin allowlist to `hosted_artifact_url`'s tail grammar; the vendored guard gets the run's `--patch-server-url` origin (#572). {{E04}}
 
 **Cargo:**
-- `crawlers/cargo_crawler.rs:13-21` has its own line-based Cargo.toml parser ("no TOML crate dependency"), although `toml_edit` is a dependency of the same crate.
-- `cargo_tag.rs` locates the version textually, while three other files parse the same file with `toml_edit`.
+- `Cargo.toml` `[package]` is read in five places. Two are line scanners: [`crawlers/cargo_crawler.rs#L12-L113`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/crawlers/cargo_crawler.rs#L12-L113) ("no TOML crate dependency") and `vex/product.rs` `scan_toml_section`. Three are ad hoc `toml_edit` lookups: `cargo_tag::version_literal` (`[package]` or legacy `[project]`; it now finds the literal's span through `toml_edit` and splices only those bytes), `cargo.rs` `path_crate_version` (`[package]` only) and `declared_cargo_minor` (#651).
+  - They have drifted, proven by execution: a BOM manifest is invisible to the crawler but read by VEX and `cargo_tag`; `[project]` and dotted keys are read only by `cargo_tag`; `[package] junk` (invalid TOML) is accepted only by the crawler. {{E15}}
 
 **Gem:** `vendor/gem.rs` imports three token helpers from `formats::gem` and keeps its own section model. `formats/gem` itself has two section models, and there are two DEPENDENCIES-name parsers with different rules.
 
 **Go:** `go_mod_edit.rs` is properly shared (9 users) but lives under `vendor/`. `crawlers/go_crawler.rs:63` still has its own `parse_go_mod_module`.
 
 **Small helpers:**
-- **CRLF:** three policies for the same "`toml_edit` emits LF" problem:
+- **CRLF:** four policies for the same "`toml_edit` emits LF" problem:
   - `line_endings` refuses mixed files;
   - `python_lock` converts CRLF-only files and leaves mixed files as LF;
+  - `poetry_lock` has its own inline rule: any CRLF turns the whole rendering CRLF, which disagrees with `python_lock` on mixed files {{E54}};
   - `cargo_manifest` aligns lines with an LCS diff.
 
   There are also ad-hoc helpers in four more files.
@@ -245,6 +247,7 @@ Old `kind`s are translated into `SpliceRecord`s when the ledger loads, so legacy
 
 ### New findings since the review
 
+- {{E54}}: the Poetry and PDM lock rewriters restore line endings with different rules, so a mixed-line-ending lock's edited unit becomes CRLF under Poetry and LF under PDM; see 5.4.
 - {{E49}}: hosted Pipenv used to reject its own pins on path-prefixed `--patch-server-url` origins and sdists. Both private grammars (`owned_url`'s segment count, `is_socket_hosted_reference`) are deleted; Pipenv now uses `hosted_pypi_reference` (#572); see 5.4.
 
 ---

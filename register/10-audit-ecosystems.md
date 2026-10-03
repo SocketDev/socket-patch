@@ -1,5 +1,5 @@
 ### Ecosystems and formats (`audit-ecosystems`)
-_Last updated 2026-10-03T07:20Z · main @ 045d7ec_
+_Last updated 2026-10-03T12:52Z · main @ 045d7ec_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -15,9 +15,9 @@ _Last updated 2026-10-03T07:20Z · main @ 045d7ec_
 | E10 | 2 | XML has eight hand-rolled scanners and four attribute extractors with three tokenization rules. The writers (`nuget_feed.rs`, `maven_repo.rs`) never use the shared readers, so reader and writer can disagree. | 5.4 | | to verify |
 | E11 | 2 | NuGet config has three readers. Target: `formats::nuget::parse_config` everywhere. Fixing E01 is the first step. | 3.7 #3; 5.4 | #594 | filed #594; hosted part in PR #597 |
 | E12 | 2 | pnpm v9 and legacy 5.4/6.0 are near-copies (`revert_*_opts`, `vendor_pnpm*`, `read_project`, `edit_overrides`, `dep_field_lines`, the KIND constant), and v9 has two lookup paths (a linear scan and `LockIndex`). | 4.4; 4.5 #4; 4.7 B/G | #583 | fixed (#583) |
-| E13 | 2 | `utils/poetry_lock.rs` ≈ `utils/pdm_lock.rs`: the `*_lock_edits` functions are identical, and the `pair_*` functions differ by one shape check, which is a latent bug in one of them. | 5.4 | | to verify |
+| E13 | 2 | `utils/poetry_lock.rs` ≈ `utils/pdm_lock.rs`: the `*_lock_edits` functions are identical, and the `pair_*` functions differ by one shape check (unreachable for Poetry; see #694). | 5.4 | #694 | filed #694 |
 | E14 | 2 | Pipfile.lock is written two ways: vendored mode re-serializes it, while hosted mode splices spans. | 5.4 | | to verify; present on 045d7ec, no drift proven (pipenv writes canonical JSON), not filed yet |
-| E15 | 2 | Cargo.toml has a line-based parser in `cargo_crawler.rs` even though the crate depends on `toml_edit`. `cargo_tag.rs` finds the version textually, and `plan_cargo_toml` uses a regex scanner and `toml_edit` in one rewriter. | 5.4; 3.7 #3 | | to verify |
+| E15 | 2 | Cargo.toml `[package]` is read five ways: line scanners in `cargo_crawler.rs` and `vex/product.rs`, plus three ad hoc `toml_edit` lookups (`cargo_tag`, which also accepts `[project]`; `path_crate_version`; `declared_cargo_minor`). They have drifted on BOM, `[project]` and dotted keys. `plan_cargo_toml` uses a regex scanner and `toml_edit` in one rewriter. | 5.4; 3.7 #3 | #693 | filed #693; `[package]` readers. The hosted `plan_cargo_toml` regex scanner is not filed yet |
 | E16 | 2 | CRLF has five policies in the npm family and three for `toml_edit` output, and `common::detect_eol` contradicts `LineEndings::Mixed`. Target: one line-ending policy. | 4.4; 5.4; 7.3 | | to verify |
 | E17 | 2 | "Is a bun lock present" has four predicates with different symlink semantics, so a dangling `bun.lock` symlink is present to one of them and absent to the others. | 4.4 | | to verify |
 | E18 | 3 | JS helper copies: JSON-pointer escape ×2, wiring lines↔JSON ×3, `name@spec` split ×2, `KIND_*` re-spelled as literals, uneven recursion bounds, and regexes compiled inside per-dependency loops. | 4.4 | | to verify |
@@ -56,6 +56,7 @@ _Last updated 2026-10-03T07:20Z · main @ 045d7ec_
 | E51 | 2 | Yarn berry: vendored refuses a mixed-EOL root `package.json` (`vendor_yarn_berry_mixed_line_endings`); hosted's gate checks only `yarn.lock` and silently majority-normalizes the manifest via `JsonLayout`. | new finding | #628 | in PR #657 |
 | E52 | 3 | `vendor/go_sum_edit.rs`: free `upsert_module_lines` / `has_module_version` / `remove_exact_module_version_lines` have no production caller and are re-implemented by `GoSumEditor` (kept only as a test oracle); the pure hosted codec lives in `vendor/`. | new finding | #631 | filed #631 |
 | E53 | 2 | Vendored pnpm writes the root `package.json` with `serialize_json` (LF, no BOM) instead of `JsonLayout`: a CRLF file stays LF after `vendor --revert`; a BOM file is refused as "not a JSON object". npm and berry keep the layout. | new finding | #662 | filed #662 |
+| E54 | 3 | Poetry and PDM lock rewriters restore line endings with two rules (Poetry: any CRLF → all CRLF; PDM: `preserve_line_endings`, CRLF-only), so a mixed-EOL lock's edited unit flips to CRLF in one and LF in the other. | new finding | #695 | filed #695 |
 
 **Handed off:** none yet.
 
