@@ -2,7 +2,7 @@
 
 ## Part 7: Core infrastructure and agent (in-place) mode
 
-_Last checked against main @ 045d7ec on 2026-10-03 by audit-core. Owner: audit-core._ Only the timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing and UUID passages have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ 045d7ec on 2026-10-03 by audit-core. Owner: audit-core._ Only the timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing, UUID, env/home-dir and atomic-write passages have been re-checked; the rest is as of `2463257`.
 
 > Scope: `api/*`, `manifest/*`, `ledgers.rs`, `constants.rs`, `patch/` (excluding `redirect/`), `policy/*`, `rollout*`, `update/*`, the CLI `update_notifier.rs`/`update.rs`, `telemetry.rs`, and the generic `utils/*` and `hash/*`.
 
@@ -67,13 +67,13 @@ The vendor policy also has three separate hand-written retry loops, plus a first
 - **UUID checks:** five grammars. `client.rs` has one, with a near byte-identical copy in CLI `lib.rs`; `path_safety.rs` accepts lowercase only; `apply.rs` accepts any alphanumeric plus `-` and `_`; `utils/python_script.rs` uses `uuid::Uuid::parse_str`, which also takes simple, braced and `urn:uuid:` forms. {{C18}}
 - **Line endings:** `utils/line_endings.rs` has 7 users, but `python_lock`, `vendor/common::detect_eol` (which contradicts `LineEndings::Mixed`), `redirect::crlf_to_lf` and `poetry_lock` each implement their own rules.
 - **Purls:** `utils/purl.rs` has two builder families (unvalidated `build_*` and validated `*_purl`). `vex/product.rs` hand-rolls a third. 48 production `format!("pkg:…")` sites and 58 `starts_with("pkg:<type>/")` checks bypass `Ecosystem::from_purl`.
-- **Env truthiness:** three vocabularies.
-  - `"1"|"true"` in `env_compat.rs`;
+- **Env truthiness:** three vocabularies, plus a fourth rule in `update_notifier::in_ci`. {{C19}}
+  - `"1"|"true"` in `env_compat.rs` (`SOCKET_DEBUG`, `SOCKET_OFFLINE`);
   - `"1"|"true"` separately in `telemetry.rs`;
-  - `1|true|yes|on|y|t` in `socket_cli_config::env_truthy`, which `update_notifier` imports.
+  - `1|true|yes|on|y|t` in `socket_cli_config::env_truthy`, which `update_notifier` imports, and the same set in the CLI's clap `parse_bool_flag`.
 
-  There are also 37 inline "empty means unset" reads in 22 files and at least four home-directory resolvers.
-- **Atomic writes:** `utils/fs.rs` has six writers. `atomic_write_sync` re-implements `stage_and_rename` + `commit_stage` in blocking form. Separate stage+rename code also exists in `blob_fetcher`, `update/download.rs` and `update/swap.rs`.
+  The narrow core match stays correct only because `apply_env_toggles` rewrites every truthy flag back into the env as `"1"`; all ten command entry points call it on `045d7ec`. "Empty means unset" is one private helper (`socket_cli_config::env_non_empty`) plus about 29 inline copies in 16 files. In this area there are at least six home-directory resolvers, and they disagree: `policy::home_dir` reads only `USERPROFILE` on Windows, while `utils::fs::home_dir` prefers `HOME`. The crawlers keep further variants.
+- **Atomic writes:** `utils/fs.rs` has six writers, which are four boolean policies (capture, fsync, keep mode, durability record) spelled as separate functions. `atomic_write_sync` re-implements `stage_and_rename` + `create_stage` + `commit_stage` in blocking form, with no drift yet. `blob_fetcher::write_cache_entry_atomic` is a third, deliberately non-fsyncing stage+rename. The self-update stage (`update/download.rs`, `update/swap.rs`) is legitimately separate. Correction: the artifact writers inside `utils::fs` don't capture into a group commit either, so bypassing `utils::fs` isn't itself a group-commit escape. {{C21}} `get` writes `.socket/blobs/<hash>` with neither: it uses an in-place `fs::write` and doesn't check the content's hash ({{C42}}).
 - **Process spawning** is well centralized in `process.rs::resolve_tool`/`command_for`, with one exception: `vendor/pypi_hatch.rs:118` runs `Command::new("hatch").current_dir(root)` (verified by execution on `045d7ec`). {{C04}} That is exactly the planted-binary pattern `process.rs:23-33` documents as unsafe: "a bare `Command::new("git")` would execute a `git` planted in the repository being scanned".
 
 ### 7.4 Agent mode
@@ -157,6 +157,7 @@ Maven sidecars are not handled at all. This code exists only for in-place mode.
 - {{C37}} Patch blob and diff downloads (`fetch_binary`) buffer the whole body with `resp.bytes()`, while the vendor and self-update downloads use the shared `read_capped` (256 MiB). On `1169ae6` a 600 MiB blob response was buffered in full.
 - {{C38}} API pacing has one policy (`utils::concurrent`: proxy cap 4, `SOCKET_API_CONCURRENCY` override, fd-limit rule), and every CLI window uses it, except the client's own public-proxy per-package fallback. That fallback keeps a private `PROXY_BATCH_PATH_CONCURRENCY = 10`, and on `045d7ec` it ran 10 GETs in flight with `SOCKET_API_CONCURRENCY=1`. `registry_concurrency()` has no caller.
 - {{C41}} Hash case policy is decided per site. Blob download compares case-insensitively on purpose (`blob_hash_matches`), and the blob-name validators accept uppercase, but agent-mode apply and rollback verify with exact `==` against the lowercase computed hash; vendored verify sites are split the same way. On `045d7ec` an uppercased manifest hash downloaded and passed `is_valid_blob_hash`, then failed both apply and rollback verification with `HashMismatch`.
+- {{C42}} `.socket/blobs/<hash>` has two writers. The fetch path verifies the git-sha256 and stages+renames, because `get_missing_blobs` trusts presence. `get::write_blob_entry` stores a patch view's inline `blobContent` under its claimed hash without checking it, truncate-writes in place, and overwrites an existing verified blob; it also hand-rolls base64 although the crate is a dependency. On `045d7ec` a verified `blobs/<H>` was replaced with bytes that don't hash to `H`.
 
 ---
 _Generated by [Claude Code](https://claude.ai/code)_
