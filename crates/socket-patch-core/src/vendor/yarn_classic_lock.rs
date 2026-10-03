@@ -99,6 +99,12 @@ pub async fn vendor_yarn_classic<'a>(
             BlockClass::LinkSkip(detail) => {
                 warnings.push(VendorWarning::new("vendor_link_entry_skipped", detail));
             }
+            BlockClass::GitSkip(detail) => {
+                warnings.push(VendorWarning::new(
+                    "vendor_yarn_classic_git_entry_skipped",
+                    detail,
+                ));
+            }
             BlockClass::NoMatch => {}
         }
     }
@@ -656,6 +662,9 @@ enum BlockClass {
     Candidate,
     /// Matches the target but cannot be rewired; carries the warning detail.
     LinkSkip(String),
+    /// Matches the target but yarn fetches it with git (#363); carries the
+    /// warning detail.
+    GitSkip(String),
     NoMatch,
 }
 
@@ -693,7 +702,17 @@ fn classify_classic_block(block: &LockBlock, name: &str, version: &str) -> Block
             }
         }
     }
-    if classic_field(&block.lines, "resolved").is_none() {
+    let resolved = classic_field(&block.lines, "resolved");
+    // yarn fetches a git pattern with git, from `resolved` (#363): a vendored
+    // tarball there makes every install fail, and the copy is the git bytes.
+    if classic_block_is_git(&patterns, resolved) {
+        return BlockClass::GitSkip(format!(
+            "lock block `{}` installs from git, which yarn fetches from the git \
+             source rather than a tarball; skipped, so that copy stays unpatched",
+            block.key
+        ));
+    }
+    if resolved.is_none() {
         return BlockClass::LinkSkip(format!(
             "lock block `{}` has no resolved tarball; skipped",
             block.key
@@ -1037,6 +1056,72 @@ pub(crate) fn pattern_real_name(pattern: &str) -> Option<&str> {
         };
     }
     Some(name)
+}
+
+/// Whether yarn 1 fetches a lock block with its GIT fetcher (#363): when any
+/// key pattern's range (an `npm:` alias's target range included) is one
+/// yarn's `GitResolver.isVersion` accepts, or the block's `resolved` is
+/// itself a git remote. Yarn picks the fetcher from the PATTERN and hands it
+/// the `resolved` value as a git remote, so rewriting that `resolved` to a
+/// tarball breaks every later install (`git ls-remote` on a `.tgz`). The
+/// hosted-git shorthands (`owner/repo`, `github:owner/repo`) are not git
+/// here: yarn locks them to a codeload tarball and fetches that as one.
+pub(crate) fn classic_block_is_git(patterns: &[String], resolved: Option<&str>) -> bool {
+    patterns.iter().any(|p| {
+        split_pattern(p).is_some_and(|(_, range)| {
+            let range = match range.strip_prefix("npm:") {
+                Some(aliased) => split_pattern(aliased).map_or("", |(_, r)| r),
+                None => range,
+            };
+            yarn_classic_range_is_git(range)
+        })
+    }) || resolved.is_some_and(yarn_classic_range_is_git)
+}
+
+/// yarn 1's `GitResolver.isVersion` over node's legacy `url.parse`: a url
+/// with a scheme whose path ends in `.git`, a `git+<x>:` / `git:` / `ssh:`
+/// scheme, or a `github.com` / `gitlab.com` / `bitbucket.{com,org}` url
+/// naming exactly `<owner>/<repo>` (not a file inside the repo, such as an
+/// `/archive/v1.tar.gz`).
+pub(crate) fn yarn_classic_range_is_git(range: &str) -> bool {
+    let range = range.trim();
+    let scheme_len = range
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-')))
+        .unwrap_or(range.len());
+    if scheme_len == 0 || !range[scheme_len..].starts_with(':') {
+        return false;
+    }
+    let scheme = range[..scheme_len].to_ascii_lowercase();
+    let rest = &range[scheme_len + 1..];
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let (host, path) = match rest.strip_prefix("//") {
+        Some(after) => {
+            let end = after.find(['/', '?']).unwrap_or(after.len());
+            let authority = &after[..end];
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+            (Some(host), &after[end..])
+        }
+        None => (None, rest),
+    };
+    let pathname = path.split('?').next().unwrap_or(path);
+    if pathname.ends_with(".git") {
+        return true;
+    }
+    if (scheme.starts_with("git+") && scheme.len() > 4) || scheme == "git" || scheme == "ssh" {
+        return true;
+    }
+    match host {
+        Some(host)
+            if matches!(
+                host.as_str(),
+                "github.com" | "gitlab.com" | "bitbucket.com" | "bitbucket.org"
+            ) =>
+        {
+            path.split('/').filter(|s| !s.is_empty()).count() == 2
+        }
+        _ => false,
+    }
 }
 
 /// Which blocks yarn actually keeps, by block index: a block survives while
@@ -3011,5 +3096,129 @@ left-pad@^1.3.0:
         let (planned, looped) = preflight_then_vendor(&fx).await;
         assert_eq!(looped, Err("vendor_lockfile_missing"));
         assert_eq!(planned, looped);
+    }
+
+    /// yarn 1's `GitResolver.isVersion`, case by case (#363).
+    #[test]
+    fn yarn_classic_git_ranges_are_recognized() {
+        for range in [
+            "git+https://github.com/stevemao/left-pad.git#v1.3.0",
+            "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba",
+            "git+file:///tmp/lpgit#v1.3.0",
+            "git://github.com/stevemao/left-pad.git",
+            "ssh://git@example.com/left-pad",
+            "https://example.com/left-pad.git",
+            "https://example.com/left-pad.git#v1.3.0",
+            "https://github.com/stevemao/left-pad",
+            "https://github.com/stevemao/left-pad#v1.3.0",
+            "https://gitlab.com/stevemao/left-pad/",
+            "http://bitbucket.org/stevemao/left-pad",
+            "GIT+HTTPS://github.com/stevemao/left-pad.git",
+        ] {
+            assert!(yarn_classic_range_is_git(range), "{range:?} is a git range");
+        }
+        for range in [
+            "^1.3.0",
+            "1.3.0",
+            "latest",
+            "stevemao/left-pad#v1.3.0",
+            "github:stevemao/left-pad#v1.3.0",
+            "https://codeload.github.com/stevemao/left-pad/tar.gz/ff8e7ba",
+            "https://github.com/stevemao/left-pad/archive/v1.3.0.tar.gz",
+            "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7",
+            "file:./old/left-pad-1.3.0.tgz",
+            "file:./.socket/vendor/npm/x/left-pad-1.3.0.tgz",
+            "link:../left-pad",
+            "",
+        ] {
+            assert!(
+                !yarn_classic_range_is_git(range),
+                "{range:?} is not a git range"
+            );
+        }
+        let pats = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(classic_block_is_git(
+            &pats(&["left-pad@git+https://h/x.git#v1"]),
+            Some("https://p.test/lp.tgz")
+        ));
+        assert!(classic_block_is_git(
+            &pats(&["pad@npm:left-pad@git+https://h/x.git"]),
+            None
+        ));
+        assert!(
+            classic_block_is_git(&pats(&["left-pad@^1.3.0"]), Some("git+ssh://h/x.git#abc")),
+            "a git `resolved` alone decides it too"
+        );
+        assert!(!classic_block_is_git(
+            &pats(&["left-pad@stevemao/left-pad#v1.3.0"]),
+            Some("https://codeload.github.com/stevemao/left-pad/tar.gz/ff8e7ba")
+        ));
+    }
+
+    /// #363: a git-pattern block is fetched by yarn 1's git fetcher from its
+    /// `resolved`, so vendoring must never rewrite it — the registry block
+    /// beside it is still wired, and the skip is named, not silent.
+    #[tokio::test]
+    async fn git_pattern_block_is_skipped_with_warning() {
+        let extra = r#"
+"left-pad@git+https://github.com/stevemao/left-pad.git#v1.3.0":
+  version "1.3.0"
+  resolved "git+https://github.com/stevemao/left-pad.git#ff8e7ba5b0b3a5ad2f1bb06a4e6aef1c6b2c3d4e"
+"#;
+        let lock = format!("{Y2_BEFORE}{extra}");
+        let fx = fixture_with_lock(&lock).await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            entry.unwrap().wiring.len(),
+            1,
+            "only the registry block rewritten"
+        );
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.code == "vendor_yarn_classic_git_entry_skipped")
+                .count(),
+            1,
+            "{warnings:?}"
+        );
+        let text = fx.lock_text().await;
+        assert!(
+            text.contains(extra.trim_start()),
+            "git block byte-untouched:\n{text}"
+        );
+    }
+
+    /// #363: a lock whose ONLY copy is git-sourced has nothing vendoring can
+    /// wire — refused before any write, the lock untouched.
+    #[tokio::test]
+    async fn git_only_lock_is_refused_untouched() {
+        let lock = r#"# yarn lockfile v1
+
+
+"left-pad@git+file:///tmp/lpgit#v1.3.0":
+  version "1.3.0"
+  resolved "git+file:///tmp/lpgit#a380ff32159b9beb078ec6ce294cf6fbdad19c55"
+"#;
+        let fx = fixture_with_lock(lock).await;
+        expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_found");
+        assert_eq!(fx.lock_text().await, lock);
+    }
+
+    /// #363 scope note: the hosted-git SHORTHAND locks to a codeload tarball
+    /// that yarn fetches as a tarball, so it stays rewritable.
+    #[tokio::test]
+    async fn codeload_shorthand_block_is_still_rewritten() {
+        let lock = r#"# yarn lockfile v1
+
+
+left-pad@stevemao/left-pad#v1.3.0:
+  version "1.3.0"
+  resolved "https://codeload.github.com/stevemao/left-pad/tar.gz/ff8e7ba5b0b3a5ad2f1bb06a4e6aef1c6b2c3d4e"
+"#;
+        let fx = fixture_with_lock(lock).await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(entry.unwrap().wiring.len(), 1, "{warnings:?}");
     }
 }

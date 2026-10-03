@@ -276,8 +276,9 @@ pub struct RewriteResult {
     /// a scoped registry or jsr, which hosted mode leaves unpatched.
     pub vlt_foreign_uuids: std::collections::BTreeSet<String>,
     /// Patch uuids with a same-`name@version` bundled instance the rewriter
-    /// skipped (Bun's `bundled` entries/records, #469): that copy is
-    /// unpacked from its parent's tarball and stays unpatched, so a
+    /// skipped (Bun's `bundled` entries/records, #469), or a yarn classic
+    /// git-fetched entry (#363): that copy is unpacked from its parent's
+    /// tarball or checked out from git and stays unpatched, so a
     /// confirmation of the uuid must never stand in for the installed tree
     /// (in-run VEX verifies it instead). Left out of the golden digests
     /// while empty, so the blessed oracle outputs predating it still hold.
@@ -3121,6 +3122,7 @@ fn rewrite_yarn_classic(
                 .expect("version regex from the escaped version is valid");
         let mut matched_any = false;
         let mut alias_skipped = false;
+        let mut git_skipped = false;
         for (i, block) in blocks.iter_mut().enumerate() {
             // The block's key line names its consumers; resolve every
             // comma-joined pattern to the REAL package it stands for
@@ -3138,6 +3140,29 @@ fn rewrite_yarn_classic(
                 continue;
             }
             let patterns = split_key_patterns(key);
+            // yarn 1 fetches a git pattern with git, handing it `resolved`
+            // as the remote (#363): a tarball there fails every install, so
+            // the block stays byte-identical and that copy keeps the git
+            // bytes — never assumed patched by the in-run VEX. Checked
+            // before the alias gate: an alias of a git range is git too.
+            let resolved = block
+                .lines()
+                .find_map(|l| l.strip_prefix("  resolved "))
+                .map(|v| v.trim().trim_matches('"'));
+            if crate::vendor::yarn_classic_lock::classic_block_is_git(&patterns, resolved) {
+                git_skipped = true;
+                result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_yarn_classic_git_skipped".into(),
+                    detail: format!(
+                        "lock entry `{key}` installs {fname}@{} from git, which yarn fetches \
+                         from the git source rather than a tarball; the hosted redirect leaves \
+                         it untouched, so this copy stays unpatched",
+                        dep.version
+                    ),
+                });
+                continue;
+            }
             // A block reached only through `alias@npm:<fname>@range`
             // descriptors is left byte-identical (mirroring the berry
             // rewriter), but never silently: that copy keeps installing the
@@ -3209,7 +3234,7 @@ fn rewrite_yarn_classic(
                 changed = true;
             }
         }
-        if !matched_any && !alias_skipped {
+        if !matched_any && !alias_skipped && !git_skipped {
             result.warnings.push(RewriteWarning {
                 code: "redirect_yarn_classic_entry_not_found".into(),
                 detail: format!("no yarn.lock entry resolving {fname}@{}", dep.version),
@@ -9066,6 +9091,93 @@ mod tests {
             r.files
         );
         assert_eq!(r.warnings[0].code, "redirect_yarn_classic_entry_not_found");
+    }
+
+    /// #363: yarn 1 fetches a git-pattern block with its git fetcher from
+    /// the block's `resolved`, so a hosted tarball there makes every later
+    /// install fail. The block stays byte-identical with a named warning,
+    /// and since that copy installs the git bytes, the uuid is never
+    /// assumed applied by the in-run VEX.
+    #[test]
+    fn yarn_classic_git_pattern_block_is_skipped() {
+        let git_block = "\"left-pad@git+https://github.com/stevemao/left-pad.git#v1.3.0\":\n  \
+             version \"1.3.0\"\n  \
+             resolved \"git+https://github.com/stevemao/left-pad.git#ff8e7ba5b0b3a5ad2f1bb06a4e6aef1c6b2c3d4e\"\n";
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+
+        // Git block only: nothing to rewire, a specific warning (not the
+        // generic not-found).
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            format!("# yarn lockfile v1\n\n\n{git_block}"),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(codes, ["redirect_yarn_classic_git_skipped"]);
+        assert!(r.warnings[0].detail.contains("git"), "{:?}", r.warnings);
+
+        // Git block beside a registry block: the registry block is wired,
+        // the git block left alone, and the uuid flagged so in-run VEX
+        // verifies instead of assuming.
+        let registry_block = "left-pad@^1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n";
+        files.insert(
+            "yarn.lock".to_string(),
+            format!("# yarn lockfile v1\n\n\n{registry_block}\n{git_block}"),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        let out = &r.files["yarn.lock"];
+        assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
+        assert!(out.contains(git_block), "git block byte-identical:\n{out}");
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_yarn_classic_git_skipped"));
+        assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+
+        // An `npm:` alias of a git range is fetched with git too: beside a
+        // rewired registry block it still keeps the uuid out of the in-run
+        // VEX assumption.
+        files.insert(
+            "yarn.lock".to_string(),
+            format!(
+                "# yarn lockfile v1\n\n\n{registry_block}\n\
+                 \"safe-pad@npm:left-pad@git+https://github.com/stevemao/left-pad.git#v1.3.0\":\n  \
+                 version \"1.3.0\"\n  \
+                 resolved \"git+https://github.com/stevemao/left-pad.git#ff8e7ba\"\n"
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_yarn_classic_git_skipped"));
+        assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+
+        // The codeload shorthand is a tarball to yarn: still rewired.
+        files.insert(
+            "yarn.lock".to_string(),
+            "# yarn lockfile v1\n\n\nleft-pad@stevemao/left-pad#v1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://codeload.github.com/stevemao/left-pad/tar.gz/ff8e7ba\"\n"
+                .to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.warnings);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
 
     /// The opposite alias direction — `"alias@npm:<fname>@…"` consuming the
