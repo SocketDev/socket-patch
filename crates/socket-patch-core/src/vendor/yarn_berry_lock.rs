@@ -857,6 +857,18 @@ pub async fn revert_yarn_berry_opts(
         return outcome;
     }
 
+    if super::npm_flavor::keep_artifact_while_lock_references_it(
+        &mut outcome,
+        project_root,
+        &[YARN_LOCK, PACKAGE_JSON],
+        &entry.uuid,
+        &uuid_dir_rel,
+    )
+    .await
+    {
+        return outcome;
+    }
+
     // FAIL-CLOSED (same brick class as the unwired guard above, twin of
     // npm_lock's post-restore probe): the restore only rewrites the
     // fragments the wiring recorded, but yarn can still resolve through the

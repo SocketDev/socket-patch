@@ -717,7 +717,11 @@ worse, lets a warm cache silently serve unpatched bytes):
   whole-file wiring cannot tell a converged fragment from a drifted one, keep the artifact exactly
   while the live `composer.lock` / `pom.xml` / `nuget.config` still names its
   `.socket/vendor/<eco>/<uuid>` dir — a file that no longer references it is warned about and the
-  artifact removed), removes the artifacts, prunes the
+  artifact removed; in the npm family (npm, yarn classic and berry, pnpm, bun) a recorded lock entry
+  that no longer exists at all — the user removed the dependency — is not drift: it warns
+  `vendor_lock_entry_removed` and the artifact and entry are kept unless every wired file that exists
+  was read and none mentions the uuid in any spelling (an unreadable lock keeps them), so `rollback` / `remove` / `scan --prune` clean up
+  after `npm uninstall` / `yarn remove` / `pnpm remove` / `bun remove`), removes the artifacts, prunes the
   ledger, sweeps orphan uuid dirs, and (v5.0) prunes the now-empty `.socket/vendor/<eco>/` and
   `.socket/vendor/` levels — `.socket/` itself is removed by the lock guard when nothing else is
   left. It works without a manifest: with no manifest and no ledger it is a clean exit-0 no-op.
