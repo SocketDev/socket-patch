@@ -631,8 +631,9 @@ pub fn wheel_metadata_unavailable(dep: &DepOverride, detail: &str) -> SkippedPat
 /// `package.json`, in candidate order: yarn builds a tarball entry's `bin:`
 /// from that manifest, not from the registry metadata the locked `npm:`
 /// entry came from, and the two spell bin paths differently (#718). Only an
-/// entry of the package version that carries a `bin:` map needs it, so a
-/// berry project without bins fetches nothing.
+/// entry the pin would re-key that carries a `bin:` map needs it (see
+/// `berry_pin_needs_manifest`; a fork alias never counts), so a berry
+/// project without bins fetches nothing.
 pub fn yarn_berry_manifest_targets<'a>(
     candidates: &'a [Candidate],
     files: &BTreeMap<String, String>,
@@ -649,17 +650,7 @@ pub fn yarn_berry_manifest_targets<'a>(
         .iter()
         .map(|c| &c.dep)
         .filter(|dep| dep.ecosystem == "npm")
-        .filter(|dep| {
-            let name = crate::patch::redirect::full_name(dep);
-            let version_line = format!("\n  version: {}\n", dep.version);
-            lock.split("\n\n").any(|block| {
-                block.lines().next().is_some_and(|key| {
-                    key.trim_start_matches('"').starts_with(&format!("{name}@"))
-                        || key.contains(&format!(", {name}@"))
-                }) && block.contains(&version_line)
-                    && block.contains("\n  bin:")
-            })
-        })
+        .filter(|dep| crate::patch::redirect::berry_pin_needs_manifest(&lock, dep))
         .filter(|dep| seen.insert(dep.artifact_url.clone()))
         .collect()
 }

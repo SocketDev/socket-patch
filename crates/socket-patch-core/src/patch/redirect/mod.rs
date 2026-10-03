@@ -3933,6 +3933,44 @@ fn berry_lock_locks(content: &str, name: &str, version: &str) -> bool {
     })
 }
 
+/// Whether the berry hosted pin of `dep` would re-key an entry of the
+/// LF-normalized lock `content` that carries a `bin:` map: an entry of the
+/// package version whose descriptors all name the package through a plain
+/// (non-fork) `npm:` range, or one an earlier hosted run keyed by its
+/// tarball URL. Only such a pin needs the served tarball's own
+/// package.json (#718); a fork alias or another protocol is never re-keyed.
+pub(crate) fn berry_pin_needs_manifest(content: &str, dep: &DepOverride) -> bool {
+    use crate::vendor::yarn_classic_lock::{split_berry_key_patterns, split_pattern};
+    let name = full_name(dep);
+    let version_line = format!("\n  version: {}\n", dep.version);
+    content.split("\n\n").any(|block| {
+        let Some(key) = block.lines().next().and_then(|l| l.strip_suffix(':')) else {
+            return false;
+        };
+        if key.starts_with([' ', '\t', '#']) || key == "__metadata" {
+            return false;
+        }
+        if !format!("{block}\n").contains(&version_line) || !block.contains("\n  bin:") {
+            return false;
+        }
+        let patterns = split_berry_key_patterns(key);
+        !patterns.is_empty()
+            && patterns.iter().all(|p| {
+                split_pattern(p).is_some_and(|(n, range)| {
+                    n == name
+                        && ((range.starts_with("npm:")
+                            && berry_npm_alias_target(range).is_none_or(|real| real == name))
+                            || berry_hosted_pin_is_ours(
+                                range,
+                                &name,
+                                Some(&dep.version),
+                                &dep.artifact_url,
+                            ))
+                })
+            })
+    })
+}
+
 /// The package an `npm:<name>@<range>` alias range installs (`None` for a
 /// plain `npm:<range>` or any other protocol).
 fn berry_npm_alias_target(range: &str) -> Option<&str> {
@@ -17915,6 +17953,46 @@ packages:
             "{}",
             r.files["yarn.lock"]
         );
+    }
+
+    /// Only an entry the berry pin would re-key, with a `bin:` map, needs the
+    /// served manifest: a fork alias (`left-pad@npm:other@…`) at the same
+    /// version never queues a fetch whose failure would drop the patch.
+    #[test]
+    fn berry_pin_needs_manifest_only_for_entries_the_pin_rekeys() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("uuid", "uuid", "9.0.1");
+        let dep = berry_override("uuid", "9.0.1", &url, &checksum);
+        let entry = |key: &str, bin: bool| {
+            format!(
+                "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n{key}:\n  version: 9.0.1\n  \
+                 resolution: \"x\"\n{}  languageName: node\n  linkType: hard\n",
+                if bin { "  bin:\n    uuid: dist/bin/uuid\n" } else { "" }
+            )
+        };
+        assert!(berry_pin_needs_manifest(&entry("\"uuid@npm:^9.0.0\"", true), &dep));
+        assert!(berry_pin_needs_manifest(
+            &entry("\"uuid@npm:^9.0.0, uuid@npm:^9.0.1\"", true),
+            &dep
+        ));
+        assert!(berry_pin_needs_manifest(&entry(&format!("\"uuid@{url}\""), true), &dep));
+        assert!(!berry_pin_needs_manifest(&entry("\"uuid@npm:^9.0.0\"", false), &dep));
+        assert!(!berry_pin_needs_manifest(
+            &entry("\"uuid@npm:other-uuid@^9.0.0\"", true),
+            &dep
+        ));
+        assert!(!berry_pin_needs_manifest(
+            &entry("\"uuid@npm:^9.0.0, other@npm:^1.0.0\"", true),
+            &dep
+        ));
+        assert!(!berry_pin_needs_manifest(
+            &entry("\"uuid@patch:uuid@npm%3A9.0.1#x\"", true),
+            &dep
+        ));
+        assert!(!berry_pin_needs_manifest(
+            &entry("\"uuid@https://mirror.example/uuid-9.0.1.tgz\"", true),
+            &dep
+        ));
     }
 
     /// A bun URL 3-tuple already at the CURRENT artifact URL but with a stale
