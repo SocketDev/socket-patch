@@ -308,7 +308,7 @@ pub enum Lane {
     /// `six==1.16.0` in `dependencies` and `six>=1.15` in an extra: two
     /// `requires-dist` entries told apart only by their `extra` marker, so
     /// the hosted unwind must follow uv's lowering to put each specifier
-    /// back (#606).
+    /// back (#606). `idna==3.7` is the registry sibling the unwind needs.
     Extras,
     /// `six` only in a PEP 735 group that another group pulls in with
     /// `{ include-group = … }`: uv expands it into both groups'
@@ -765,7 +765,8 @@ fn build(uv: &Uv, lane: Lane, mode: Mode, tmp: &Path) -> Result<Built, String> {
         | Lane::IncludeGroup => {
             project_deps(match lane {
                 Lane::Transitive => "\"python-dateutil==2.9.0.post0\"",
-                Lane::IncludeGroup => "",
+                Lane::Extras => "\"six==1.16.0\", \"idna==3.7\"",
+                Lane::IncludeGroup => "\"idna==3.7\"",
                 _ => "\"six==1.16.0\"",
             });
             let tail = match lane {
@@ -1695,7 +1696,14 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
         // (an `index`, or for `uv pip compile` PyPI files with none, #407)
         // and the artifact shape, so they restore to the bytes uv wrote
         // (#408).
-        let byte_exact = matches!(lane, Lane::ExportPylock | Lane::CompilePylock);
+        // The extras / include-group lanes lock an `idna` sibling too, so
+        // their unwind runs and must re-derive every `requires-dist` /
+        // `requires-dev` specifier from the declaration uv lowered it from
+        // (#606, #473).
+        let byte_exact = matches!(
+            lane,
+            Lane::ExportPylock | Lane::CompilePylock | Lane::Extras | Lane::IncludeGroup
+        );
         let env: Value = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|e| panic!("{}: ({e})\n{}", report.what("revert"), dump(&out)));
         let still_wired =
