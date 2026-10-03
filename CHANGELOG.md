@@ -107,7 +107,9 @@ limits, and required install commands.
   same `name@version` (`inBundle`, or `bundled` in a v1 lock). npm unpacks
   that copy from its parent's tarball, so it stays unpatched; the run
   already warned `redirect_npm_bundled_instance_skipped` and now leaves the
-  patch out of its attestation, like a standalone `vex` run (#325).
+  patch out of its attestation, like a standalone `vex` run (#325). When a
+  `packages` map exists, stale bundled flags in the legacy `dependencies`
+  mirror do not suppress an attestation for the actual install tree.
 - Global mode (`-g`) finds npm, yarn, pnpm, bun, RubyGems and Composer on
   Windows, where they install as `.cmd` / `.bat` shims, instead of reporting
   an empty scan. The yarn and npm-family global lookups no longer run from the
