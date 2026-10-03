@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-03 (run 11), main `045d7ec`, latest release v4.0.0. Runs 5–11 added the cells in "Run 5 cells" through "Run 11 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-03 (run 12), main `045d7ec`, latest release v4.0.0. Runs 5–12 added the cells in "Run 5 cells" through "Run 12 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -86,14 +86,19 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Symlinked `.socket/` or `.socket/vendor/npm`, single project, V: pass (consistent). **Two projects sharing a symlinked `.socket/vendor/npm`: fail #664** (1.7.0 / 1.10.1 / 1.22.22).
 - **`yarn remove` of a vendored package, then rollback / remove / `vendor --revert`: fail #665** (1.7.0 / 1.22.22). Hosted same flow: pass.
 
+### Run 12 cells (`045d7ec`)
+- **Vendored workspaces, installs from a member dir (`cd b && yarn install --frozen-lockfile`, `yarn --cwd b install`, `yarn workspace b add`), cold cache: fail #691** on Linux / macOS / Windows × 1.7.0 / 1.10.1 / 1.22.22 (probe run 37123949202). Root installs pass. Warm-cache member installs pass (masking).
+- **Vendored block merged by yarn with a second range (`a@^1.1.0, a@^1.3.0:`) → rollback / remove / `vendor --revert`: fail #692** (Linux 1.7.0 / 1.10.1 / 1.22.22). Re-vendor says `already_vendored` and doesn't re-key.
+- `yarn add`/`yarn upgrade` that re-keys or re-resolves the vendored block: the #665 shape (fix in flight, #689).
+
 ## Backlog
 
-1. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows (Program Files; the runner is admin, so it needs a non-admin user). #437 (1.0.x) is still open.
-2. `vendor --check` / `repair` on a #591-shaped lock (dangling dependency).
-3. Windows directory junctions as `.socket/vendor/npm` (the #664 shape), via a probe.
-4. `yarn upgrade <pkg>` to a different version after vendoring (the block is re-keyed, not removed): does it hit #665's dead end?
-5. Same-size patched files on yarn ≤1.9 in-place installs: the mtime the service tarballs use can't be checked from the sandbox (patch hosts blocked).
-6. Re-run the v4-only project columns (#363, #364) on macOS/Windows once fixes land; re-check #558 / #519 / #467 / #627 / #664 / #665 once fixed.
+1. `vendor --check` / `repair` on a #591-shaped lock and on a #692 merged-key lock.
+2. Windows directory junctions as `.socket/vendor/npm` (#664 shape), via a probe.
+3. Hosted mode with a merged key (the #692 shape): does hosted rollback match blocks by exact key too?
+4. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open.
+5. Same-size patched files on yarn ≤1.9 in-place installs (the mtime the service tarballs use can't be checked from the sandbox).
+6. Re-run #363 / #364 on macOS/Windows once fixes land; re-check #467 / #519 / #558 / #591 / #627 / #664 / #665 / #691 / #692 once fixed.
 
 ## Known non-bugs
 
@@ -140,3 +145,6 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - A symlinked `.socket/` or `.socket/vendor/npm` in a *single* project works consistently in vendored mode (writes and cleans up at the link target). Only a store shared between projects is #664.
 - `vex -o` is `--org`, not `--output`. Use `--output` in harnesses.
 - Hosted rollback after `yarn remove` of a patched package: pass (restores the remaining blocks, removes `.socket/`).
+- Leftover probe branch (deletion blocked): `bughunt/yarn-classic/20261003-member-install`.
+- Quick vendored harness: a scratch cargo test using `tests/prebuilt_common` `prepare_command` (auto-mocks the service for `vendor`/`repair`) plus a staged `.socket/manifest.json` + blob, as in `e2e_vendor_yarn_classic_dev_flow.rs`. Other commands (rollback / remove / `vendor --revert` / `--check`) run offline with the plain binary.
+- A plain root `yarn add <pkg>@<new range>` re-resolves a vendored block from the registry (unpatched). That's yarn's own behaviour; the follow-on rollback is #665.
