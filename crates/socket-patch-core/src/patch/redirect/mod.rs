@@ -3140,6 +3140,29 @@ fn rewrite_yarn_classic(
                 continue;
             }
             let patterns = split_key_patterns(key);
+            // yarn 1 fetches a git pattern with git, handing it `resolved`
+            // as the remote (#363): a tarball there fails every install, so
+            // the block stays byte-identical and that copy keeps the git
+            // bytes — never assumed patched by the in-run VEX. Checked
+            // before the alias gate: an alias of a git range is git too.
+            let resolved = block
+                .lines()
+                .find_map(|l| l.strip_prefix("  resolved "))
+                .map(|v| v.trim().trim_matches('"'));
+            if crate::vendor::yarn_classic_lock::classic_block_is_git(&patterns, resolved) {
+                git_skipped = true;
+                result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_yarn_classic_git_skipped".into(),
+                    detail: format!(
+                        "lock entry `{key}` installs {fname}@{} from git, which yarn fetches \
+                         from the git source rather than a tarball; the hosted redirect leaves \
+                         it untouched, so this copy stays unpatched",
+                        dep.version
+                    ),
+                });
+                continue;
+            }
             // A block reached only through `alias@npm:<fname>@range`
             // descriptors is left byte-identical (mirroring the berry
             // rewriter), but never silently: that copy keeps installing the
@@ -3155,28 +3178,6 @@ fn rewrite_yarn_classic(
                         "lock entry `{key}` consumes {fname}@{} only through npm: alias \
                          descriptors; the hosted redirect does not rewrite alias entries, \
                          so this copy stays unpatched",
-                        dep.version
-                    ),
-                });
-                continue;
-            }
-            // yarn 1 fetches a git pattern with git, handing it `resolved`
-            // as the remote (#363): a tarball there fails every install, so
-            // the block stays byte-identical and that copy keeps the git
-            // bytes — never assumed patched by the in-run VEX.
-            let resolved = block
-                .lines()
-                .find_map(|l| l.strip_prefix("  resolved "))
-                .map(|v| v.trim().trim_matches('"'));
-            if crate::vendor::yarn_classic_lock::classic_block_is_git(&patterns, resolved) {
-                git_skipped = true;
-                result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_yarn_classic_git_skipped".into(),
-                    detail: format!(
-                        "lock entry `{key}` installs {fname}@{} from git, which yarn fetches \
-                         from the git source rather than a tarball; the hosted redirect leaves \
-                         it untouched, so this copy stays unpatched",
                         dep.version
                     ),
                 });
@@ -9139,6 +9140,27 @@ mod tests {
         let out = &r.files["yarn.lock"];
         assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
         assert!(out.contains(git_block), "git block byte-identical:\n{out}");
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_yarn_classic_git_skipped"));
+        assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+
+        // An `npm:` alias of a git range is fetched with git too: beside a
+        // rewired registry block it still keeps the uuid out of the in-run
+        // VEX assumption.
+        files.insert(
+            "yarn.lock".to_string(),
+            format!(
+                "# yarn lockfile v1\n\n\n{registry_block}\n\
+                 \"safe-pad@npm:left-pad@git+https://github.com/stevemao/left-pad.git#v1.3.0\":\n  \
+                 version \"1.3.0\"\n  \
+                 resolved \"git+https://github.com/stevemao/left-pad.git#ff8e7ba\"\n"
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
         assert!(r
             .warnings
             .iter()
