@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled PDM bug-hunt routine (label pm:pdm).
 
-Last run: 2026-10-02 21:12Z on main `045d7ec` (latest tag v4.0.0; #522 and #540 merged; #332/#451/#502/#528 closed by maintainers). Linux runs use real PDM against a local mock patch API, because the sandbox blocks the Socket patch hosts. macOS and Windows runs use probe branches.
+Last run: 2026-10-03 03:15Z on main `045d7ec` (latest tag v4.0.0; #522 and #540 merged; #332/#451/#502/#528 closed by maintainers). Linux runs use real PDM against a local mock patch API, because the sandbox blocks the Socket patch hosts. macOS and Windows runs use probe branches.
 
 ## Coverage matrix
 | PDM | lock_version | agent (Linux / macOS / Windows) | hosted (Linux) | vendored (Linux) |
@@ -20,7 +20,13 @@ Last run: 2026-10-02 21:12Z on main `045d7ec` (latest tag v4.0.0; #522 and #540 
 | 1.4.5 / 1.15.5 / 2.0.3 | 2 / 3.1 / 4.0 | agent PEP 582 (`.pdm.toml` `python.path`; plain, activated venv, stray `.venv`) pass on `045d7ec` | — | — |
 | 2.27.0 – 2.29.2 | 4.5.x | agent PEP 582 with `pdm.toml` `use_venv = "false"` (PDM-written string) + activated / stray venv: **fail #609**; bool form and `PDM_USE_VENV` pass | — | — |
 | all (2.26.9, 2.29.2 run) | — | agent PEP 582 with `use_venv` false in the **user** config + stray venv: **fail #609** | — | — |
-| 0.12, 1.0, 1.8 – 1.14 | 2 / 3.1 | untested | untested | untested |
+| 0.12.3 | 2 (legacy `[tool.pdm]`) | untested | pass (fresh sync patched, rollback byte-exact); `vex` / `scan --vex` **fail #642** | pass (same); `vex` **fail #642** |
+| 1.0.0 | 2 | untested | pass (fresh, vex, rollback byte-exact) | pass (fresh, vex, rollback byte-exact) |
+| 1.5.3 | 2 | untested | pass (fresh) | pass (fresh, rollback byte-exact); warm env **fail #641** |
+| 1.6.4 | 3 | untested | refused (pass) | refused (pass) |
+| 1.4.5 / 2.8.2 / 2.10.4 | 2 / 4.3 / 4.4 | — | warm env warns (pass) | warm env: no stale warning, `pdm sync`/`install` keep upstream, vex attests: **fail #641** |
+| 2.11.2 / 2.29.2 | 4.4.1 / 4.5.1 | — | — | warm env re-installs patched (pass) |
+| 1.8 – 1.14 | 3.1 | untested | untested | untested |
 
 Modes × macOS/Windows for hosted and vendored: untested by this routine (the repo's pdm-compatibility.yml covers them).
 
@@ -42,12 +48,13 @@ Modes × macOS/Windows for hosted and vendored: untested by this routine (the re
 `-g --mode hosted` and `--global-prefix --mode hosted` refuse with exit 2 (pass). `SOCKET_GLOBAL=1` matches `-g` (pass). `--global-prefix <site-packages>` finds both #451 locations (pass).
 
 ## Backlog
-1. #609 on macOS / Windows user-config paths, site config, `PDM_CONFIG_FILE`; other PDM ≥ 2.27 string-valued settings (e.g. `venv.in_project = "false"`) in hosted / vendored stale checks.
-2. #566 on macOS / Windows site-config paths and site-config `venv.location` / `python.install_root` (use a non-3.11 interpreter: the sandbox system 3.11 may carry urllib3 1.26.18). PDM 1.x global project (`~/.pdm/global-project`) under `-g`.
-3. Re-run #477 / #413 on main once `patch/redirect/pdm.rs` or `upstream/pypi_locks.rs` change (hosted mock: references + view).
-4. Hash variant of #413 (private index serving different bytes); PDM 1.x `feature.install_cache` with agent mode.
-5. macOS / Windows probes (branch deletion through the proxy / permission policy still fails; the stale `bughunt/pdm/20260930-cache-symlink` needs a maintainer to delete it).
-6. Done: #502/#528 on main for 1.4.5 / 1.15.5 / 2.0.3 agent PEP 582; CRLF lock_version 2, SIGKILL-interrupted scans, groups, relocks, `pdm add` after hosted/vendored, CRLF / mixed / BOM locks, extras, `rollback --preserve-state`, concurrent scans, space/unicode paths.
+1. #641 follow-ups: vendored on a warm PEP 582 `__pypackages__` (PDM 1.x); per-version `pdm sync --reinstall` remedy.
+2. #609 on macOS / Windows user-config paths, site config, `PDM_CONFIG_FILE`. (PDM ≥ 2.27 string `venv.in_project` doesn't matter: socket-patch never reads it and follows `.pdm-python` instead.)
+3. #566 on macOS / Windows site-config paths and site-config `venv.location` / `python.install_root` (use a non-3.11 interpreter). PDM 1.x global project (`~/.pdm/global-project`) under `-g`.
+4. Re-run #477 / #413 on main once `patch/redirect/pdm.rs` or `upstream/pypi_locks.rs` change (hosted mock: references + view).
+5. Hash variant of #413 (private index serving different bytes); PDM 1.x `feature.install_cache` with agent mode; PDM 1.8 – 1.14 agent cells.
+6. macOS / Windows probes (branch deletion through the proxy / permission policy has failed before; the stale `bughunt/pdm/20260930-cache-symlink` needs a maintainer to delete it).
+7. Done: PDM 0.12.3 / 1.0.0 / 1.5.3 hosted + vendored fresh; #502/#528 on main for 1.4.5 / 1.15.5 / 2.0.3 agent PEP 582; CRLF lock_version 2, SIGKILL-interrupted scans, groups, relocks, `pdm add` after hosted/vendored, CRLF / mixed / BOM locks, extras, `rollback --preserve-state`, concurrent scans, space/unicode paths.
 
 ## Known non-bugs
 - lock_version absent / 3.1 / 4.0–4.2 refused; 2.8.0 accepted-but-crashes (documented).
@@ -82,3 +89,6 @@ Modes × macOS/Windows for hosted and vendored: untested by this routine (the re
 - Test-harness note: the sandbox's `/usr/local/lib/python3.11/dist-packages` now carries urllib3 1.26.18 (from a `pdm add -g` with no global venv), which masks `-g` scan counts on python3.11; check the file bytes of the target copy instead.
 - PDM 2.0–2.4 treat a `.pdm.toml` with a base `python.path` (from `pdm use -f <base>`) as PEP 582, and discovery agrees (verified on 2.0.3).
 - Agent `vex` after a #609 mis-patch fails closed (`not_applied`), so there's no false attestation there.
+- `lock_version` by release: 1.5.x writes `2` (supported, installs fine), 1.6.x writes `3` and 1.7.x writes `3.1` (both refused, lock untouched). pdm-compatibility.md's "0.12 – 1.4" / "1.8 – 1.15" ranges are slightly off (doc drift only).
+- The vendored `vex` attestation over an out-of-sync installed tree is by design (the `vendored_tree_out_of_sync` disclosure). #641 covers only the missing scan warning and the remedy on PDM < 2.11.
+- Test-harness note: PDM 1.5.x needs `resolvelib==0.7.0`; PDM 1.x `pdm sync` exits 1 on a throwaway `[project]` without `[tool.pdm] distribution = false` (self-install), unrelated to socket-patch.
