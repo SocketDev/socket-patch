@@ -245,8 +245,14 @@ fn run_mode(cwd: &Path, api: &str, command: &str, mode: &str, extra: &[&str]) ->
     run_json(cwd, api, &args)
 }
 
+/// The vendor events: top-level for `vendor`, under `vendor` for the
+/// `scan`/`get` envelopes that embed the vendor step.
 fn events(envelope: &Value) -> Vec<Value> {
-    envelope["events"].as_array().cloned().unwrap_or_default()
+    envelope["events"]
+        .as_array()
+        .or_else(|| envelope["vendor"]["events"].as_array())
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn has_event_code(envelope: &Value, code: &str) -> bool {
