@@ -3557,8 +3557,13 @@ wheels = [
         tokio::fs::remove_dir_all(&uuid_dir).await.unwrap();
         let bytes = served_wheel(b"service wheel at another filename");
         let server = wiremock::MockServer::start().await;
-        mount_pypi_granted(&server, "six-1.16.0-py3-none-any.whl", &sri_sha512(&bytes), &bytes)
-            .await;
+        mount_pypi_granted(
+            &server,
+            "six-1.16.0-py3-none-any.whl",
+            &sri_sha512(&bytes),
+            &bytes,
+        )
+        .await;
         let cfg = pypi_service_cfg(&server.uri(), VendorSource::Service, false);
         let error = crate::vendor::test_support::expect_failure(vendor(Some(cfg)).await);
         assert!(
