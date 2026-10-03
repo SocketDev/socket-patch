@@ -429,6 +429,12 @@ enum Driver {
     /// environment, so bundler still loads `Gemfile.next` and the run must
     /// still redirect and attest nothing.
     ScanVexDualBootEnvGemfile,
+    /// [`Driver::ScanVex`] on a Gemfile that pulls the gem from a custom
+    /// `git_source(:local)` key (#652): moved into a Socket source block the
+    /// key still overrides it, so bundler keeps loading the unpatched git
+    /// checkout. Same refuse-and-attest-nothing contract as
+    /// [`Driver::ScanVexDuplicateDeclaration`].
+    ScanVexCustomGitSource,
 }
 
 impl Driver {
@@ -442,6 +448,7 @@ impl Driver {
             Driver::ScanVexDualBootEnvGemfile => {
                 "scan --mode hosted (config Gemfile.next, env BUNDLE_GEMFILE=Gemfile)"
             }
+            Driver::ScanVexCustomGitSource => "scan --mode hosted (gem from a custom git_source)",
         }
     }
 }
@@ -717,6 +724,48 @@ async fn redirect_scanned_project(
                 server.uri()
             )
         }
+        Driver::ScanVexCustomGitSource => {
+            // The gem's pristine source as a local git repo, reached through
+            // a custom `git_source` key: bundler resolves it from a `GIT`
+            // section, never from the registry a Socket source block names.
+            let repos = tmp.path().join("repos");
+            let repo = repos.join(DEP);
+            copy_dir_recursive(&stage.join(format!("{DEP}-src")), &repo);
+            for args in [
+                &["init", "-q"][..],
+                &["add", "-A"][..],
+                &[
+                    "-c",
+                    "user.name=socket-patch e2e",
+                    "-c",
+                    "user.email=e2e@socket.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "fixture",
+                ][..],
+            ] {
+                let out = Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .output()
+                    .expect("failed to run git");
+                assert!(
+                    out.status.success(),
+                    "git {args:?} failed:\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            format!(
+                "source \"{}/upstream\"\n\n\
+                 git_source(:local) {{ |r| \"{}/#{{r}}\" }}\n\n\
+                 gem \"{DEP}\", local: \"{DEP}\"\n",
+                server.uri(),
+                repos.display()
+            )
+        }
         _ => format!("source \"{}/upstream\"\n\ngem \"{DEP}\"\n", server.uri()),
     };
     std::fs::write(proj.join(gemfile_name), gemfile_body).unwrap();
@@ -777,11 +826,20 @@ async fn redirect_scanned_project(
         .join("gems")
         .join(format!("{DEP}-{DEP_VERSION}"))
         .join("lib/vuln_gem.rb");
-    assert_eq!(
-        std::fs::read(&installed_lib).expect("installed lib/vuln_gem.rb"),
-        orig,
-        "fixture install must extract the authored pristine bytes"
-    );
+    if driver == Driver::ScanVexCustomGitSource {
+        // Bundler checks a git gem out under `bundler/gems/`, and the lock
+        // attributes it to a `GIT` section — the shape the scan must refuse.
+        assert!(
+            lock_before.starts_with("GIT\n") && !installed_lib.exists(),
+            "fixture must resolve the gem from git: {lock_before}"
+        );
+    } else {
+        assert_eq!(
+            std::fs::read(&installed_lib).expect("installed lib/vuln_gem.rb"),
+            orig,
+            "fixture install must extract the authored pristine bytes"
+        );
+    }
     // The pre-redirect (registry) pair — what reverting the patch commit
     // restores; the manifest-less VEX legs revert to it.
     let pristine_gemfile = std::fs::read(proj.join(gemfile_name)).unwrap();
@@ -823,7 +881,8 @@ async fn redirect_scanned_project(
         | Driver::ScanVexDualBoot
         | Driver::ScanVexDualBootEnvGemfile
         | Driver::ScanVexDuplicateDeclaration
-        | Driver::ScanVexEvalGemfile => vec![
+        | Driver::ScanVexEvalGemfile
+        | Driver::ScanVexCustomGitSource => vec![
             "scan",
             "--mode",
             "hosted",
@@ -880,6 +939,7 @@ async fn redirect_scanned_project(
     if let Some(warning) = match driver {
         Driver::ScanVexDuplicateDeclaration => Some("redirect_gem_declared_more_than_once"),
         Driver::ScanVexEvalGemfile => Some("redirect_gem_declaration_not_visible"),
+        Driver::ScanVexCustomGitSource => Some("redirect_gem_source_option"),
         _ => None,
     } {
         assert_unwirable_declaration_redirects_nothing(
@@ -968,7 +1028,8 @@ async fn redirect_scanned_project(
         Driver::ScanVexDualBoot
         | Driver::ScanVexDualBootEnvGemfile
         | Driver::ScanVexDuplicateDeclaration
-        | Driver::ScanVexEvalGemfile => unreachable!("asserted and returned above"),
+        | Driver::ScanVexEvalGemfile
+        | Driver::ScanVexCustomGitSource => unreachable!("asserted and returned above"),
         Driver::GetUuid => {
             // get's hosted envelope (CLI_CONTRACT.md "get --mode and
             // installed narrowing"): `found` counts the resolved patch;
@@ -1715,6 +1776,25 @@ async fn gem_hosted_eval_gemfile_direct_dep_is_refused_and_still_installs() {
     )
     .await;
     assert!(fx.is_none(), "the eval_gemfile driver asserts in place");
+}
+
+/// #652: a gem pulled from a custom `git_source` key must not be "redirected"
+/// into a Socket source block the key overrides (bundler would keep loading
+/// the unpatched git checkout while VEX attested `not_affected`).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_custom_git_source_is_refused_and_still_installs() {
+    let fx = redirect_scanned_project(
+        "custom-git-source",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVexCustomGitSource,
+    )
+    .await;
+    assert!(fx.is_none(), "the custom git_source driver asserts in place");
 }
 
 /// #507: the same dual boot with `BUNDLE_GEMFILE=Gemfile` exported. Bundler

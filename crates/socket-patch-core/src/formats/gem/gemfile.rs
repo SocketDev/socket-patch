@@ -49,7 +49,9 @@ enum Arg<'t> {
 }
 
 /// The code of a tail: everything before a `#` comment that sits outside a
-/// string. `None` on an unbalanced quote.
+/// string. `None` on an unbalanced quote. Throughout, a backslash escapes
+/// the next character in either quote style (Ruby's single-quoted strings
+/// honor `\'` and `\\` too).
 fn code_of(tail: &str) -> Option<&str> {
     let mut quote: Option<char> = None;
     let mut escaped = false;
@@ -58,7 +60,7 @@ fn code_of(tail: &str) -> Option<&str> {
             Some(q) => {
                 if escaped {
                     escaped = false;
-                } else if c == '\\' && q == '"' {
+                } else if c == '\\' {
                     escaped = true;
                 } else if c == q {
                     quote = None;
@@ -87,7 +89,7 @@ fn split_args(code: &str) -> Option<Vec<(usize, &str)>> {
         if let Some(q) = quote {
             if escaped {
                 escaped = false;
-            } else if c == '\\' && q == '"' {
+            } else if c == '\\' {
                 escaped = true;
             } else if c == q {
                 quote = None;
@@ -121,7 +123,7 @@ fn leading_quoted(s: &str) -> Option<(&str, &str)> {
     for (i, c) in body.char_indices() {
         if escaped {
             escaped = false;
-        } else if c == '\\' && q == '"' {
+        } else if c == '\\' {
             escaped = true;
         } else if c == q {
             return Some((&body[..i], &body[i + 1..]));
@@ -329,6 +331,13 @@ mod tests {
         assert!(source_option(", { git: \"x\" }").is_some());
         assert!(source_option(", \"7.0").is_some());
         assert!(source_option(", git_opts(\"x\")").is_some());
+    }
+
+    #[test]
+    fn escaped_quotes_and_hashes_inside_strings_stay_in_the_string() {
+        assert_eq!(key(", require: 'it\\'s', gitlab: \"x\""), Some("gitlab:".into()));
+        assert_eq!(key(", require: \"a\\\"b\", git: \"x\""), Some("git:".into()));
+        assert_eq!(key(", local: \"#{name}\""), Some("local:".into()));
     }
 
     #[test]
