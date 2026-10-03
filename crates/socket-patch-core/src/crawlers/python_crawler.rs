@@ -351,27 +351,24 @@ async fn find_local_venv_site_packages_with(
         return found;
     }
 
-    let pipenv = is_pipenv_project(cwd);
-    let poetry = if pipenv {
-        None
-    } else {
-        load_poetry_project(cwd, var).await
-    };
+    // Pipenv loads .env before deciding whether an activated venv applies.
+    // Resolve that decision within each supported settings view, together
+    // with the placement settings. Pipenv never falls back to `venv/`.
+    if is_pipenv_project(cwd) {
+        return pipenv_project_site_packages(cwd, var).await;
+    }
+    let poetry = load_poetry_project(cwd, var).await;
 
-    // 1. Check VIRTUAL_ENV env var. Pipenv ignores it under `PIPENV_ACTIVE`
-    // (a `pipenv shell` started in another project) and
-    // `PIPENV_IGNORE_VIRTUALENVS`, so for a Pipenv project the activated venv
-    // then belongs to something else and must not be patched. Poetry ignores
-    // it once `poetry env use` recorded an env for the project (see
+    // 1. Check VIRTUAL_ENV env var. Poetry ignores it once `poetry env use`
+    // recorded an env for the project (see
     // [`poetry_active_prefix`]). PDM likewise skips an activated venv under
     // `PDM_IGNORE_ACTIVE_VENV`.
-    let pdm_ignores_active = pdm_env_flag(var, "PDM_IGNORE_ACTIVE_VENV")
-        && pdm_drives_project(cwd).await;
+    let pdm_ignores_active =
+        pdm_env_flag(var, "PDM_IGNORE_ACTIVE_VENV") && pdm_drives_project(cwd).await;
     let active_prefix = match &poetry {
         Some(project) => poetry_active_prefix(project, var),
         None if pdm_ignores_active => None,
-        None if !pipenv || pipenv_uses_virtual_env(var) => var("VIRTUAL_ENV"),
-        None => None,
+        None => var("VIRTUAL_ENV"),
     };
     if let Some(virtual_env) = active_prefix {
         let venv_path = PathBuf::from(&virtual_env);
@@ -380,15 +377,6 @@ async fn find_local_venv_site_packages_with(
         if !results.is_empty() {
             return results;
         }
-    }
-
-    // 2. A Pipenv project's venv is whatever Pipenv resolves, which is not
-    // the generic probe order below: Pipenv never uses `venv/`, and its
-    // in-project settings can rule out an existing `./.venv`. When Pipenv
-    // has no venv yet there is nothing to patch, so the generic probes must
-    // not fall back to a tree Pipenv will never use.
-    if pipenv {
-        return pipenv_project_site_packages(cwd, var).await;
     }
 
     // 3. Poetry decides for itself whether `./.venv` is the project's env
@@ -708,7 +696,8 @@ fn pipenv_venv_in_project(cwd: &Path, var: &impl Fn(&str) -> Option<String>) -> 
 /// environment, as every Pipenv command loads it first (see
 /// [`pipenv_dotenv`]), and then from the process environment alone (older
 /// Pipenv read some settings before loading `.env`). Both views' venvs are
-/// returned, the `.env` view first.
+/// returned, the `.env` view first. Each view applies its own active-venv
+/// decision before its in-project/WORKON_HOME placement.
 ///
 /// Never `./venv`: no Pipenv release uses it.
 async fn pipenv_project_site_packages(
@@ -765,69 +754,152 @@ fn pipenv_dotenv(cwd: &Path, var: &impl Fn(&str) -> Option<String>) -> Vec<(Stri
     }
 }
 
-/// `KEY=value` pairs of a `.env` file as python-dotenv (vendored by Pipenv)
-/// reads them, in file order: blank lines and `#` comments skipped, an
-/// optional `export ` prefix, single-quoted values literal, double-quoted
-/// values with backslash escapes, unquoted values trimmed and cut at ` #`.
-/// `${NAME}` / `${NAME:-default}` in unquoted and double-quoted values
-/// expand from earlier keys in the file, then the environment (the
-/// `override=True` order). A key without `=` sets nothing.
+/// python-dotenv bindings are a stream, not independent lines: quoted
+/// values may contain newlines and setting-like text. File reads normalize
+/// CRLF/CR like Python's text mode. Every quoted/unquoted value is then
+/// interpolated against preceding bindings before process variables.
 fn parse_dotenv(text: &str, var: &impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_start();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").map_or(line, str::trim_start);
-        let Some((key, raw)) = line.split_once('=') else {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut rest = normalized.as_str();
+    let mut values: Vec<(String, Option<String>)> = Vec::new();
+    while !rest.is_empty() {
+        let binding = match dotenv_binding(&mut rest) {
+            Ok(binding) => binding,
+            Err(()) => {
+                // Native parser recovery discards the remaining physical
+                // line at the failure, not the next valid binding.
+                rest = rest.split_once('\n').map_or("", |(_, tail)| tail);
+                continue;
+            }
+        };
+        let Some((key, value)) = binding else {
             continue;
         };
-        let key = key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        let raw = raw.trim_start();
-        let (value, interpolate) = if let Some(rest) = raw.strip_prefix('\'') {
-            (dotenv_unquote(rest, '\''), false)
-        } else if let Some(rest) = raw.strip_prefix('"') {
-            (dotenv_unquote(rest, '"'), true)
-        } else {
-            let unquoted = match raw.find(" #").or_else(|| raw.find("\t#")) {
-                Some(at) => &raw[..at],
-                None => raw,
-            };
-            (unquoted.trim_end().to_string(), true)
-        };
-        let value = if interpolate {
-            let lookup = |name: &str| {
-                pairs
-                    .iter()
-                    .rev()
-                    .find(|(k, _)| k == name)
-                    .map(|(_, v)| v.clone())
-                    .or_else(|| var(name))
+        let value = value.map(|value| {
+            let lookup = |name: &str| match values.iter().find(|(key, _)| key == name) {
+                // A valueless binding shadows the environment during
+                // interpolation, but is not exported after resolution.
+                Some((_, value)) => Some(value.clone().unwrap_or_default()),
+                None => var(name),
             };
             dotenv_interpolate(&value, &lookup)
+        });
+        if let Some((_, previous)) = values.iter_mut().find(|(name, _)| name == key) {
+            *previous = value;
         } else {
-            value
-        };
-        pairs.push((key.to_string(), value));
+            values.push((key.to_string(), value));
+        }
     }
-    pairs
+    // Last binding wins even when it has no value: native load_dotenv
+    // first builds its mapping, then exports only its non-None entries.
+    values
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+        .collect()
 }
 
-/// The body of a quoted python-dotenv value up to the closing `quote`,
-/// decoding only the escapes python-dotenv decodes: `\\` and `\'` in single
-/// quotes; those plus `\"` and `\a \b \f \n \r \t \v` in double quotes. Any
-/// other backslash stays literal, so Windows paths survive.
-fn dotenv_unquote(rest: &str, quote: char) -> String {
-    let mut value = String::new();
-    let mut chars = rest.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == quote {
-            break;
+fn dotenv_whitespace(c: char) -> bool {
+    // Python's str.isspace additionally recognizes these separators.
+    c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}')
+}
+
+fn dotenv_inline_whitespace(c: char) -> bool {
+    c != '\n' && c != '\r' && dotenv_whitespace(c)
+}
+
+/// Consume one native python-dotenv binding. Failure keeps the cursor at
+/// the token that did not parse, matching its line-recovery semantics.
+fn dotenv_binding<'a>(rest: &mut &'a str) -> Result<Option<(&'a str, Option<String>)>, ()> {
+    *rest = rest.trim_start_matches(dotenv_whitespace);
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    if let Some(after) = rest.strip_prefix("export") {
+        if after.chars().next().is_some_and(dotenv_inline_whitespace) {
+            *rest = after.trim_start_matches(dotenv_inline_whitespace);
         }
+    }
+    let key = if rest.starts_with('#') {
+        None
+    } else if let Some(after) = rest.strip_prefix('\'') {
+        let end = after.find('\'').filter(|end| *end > 0).ok_or(())?;
+        let key = &after[..end];
+        *rest = &after[end + 1..];
+        Some(key)
+    } else {
+        let end = rest
+            .find(|c| c == '=' || c == '#' || dotenv_whitespace(c))
+            .unwrap_or(rest.len());
+        if end == 0 {
+            return Err(());
+        }
+        let key = &rest[..end];
+        *rest = &rest[end..];
+        Some(key)
+    };
+    *rest = rest.trim_start_matches(dotenv_inline_whitespace);
+    let value = if let Some(after) = rest.strip_prefix('=') {
+        *rest = after.trim_start_matches(dotenv_inline_whitespace);
+        Some(dotenv_value(rest)?)
+    } else {
+        None
+    };
+    *rest = rest.trim_start_matches(dotenv_inline_whitespace);
+    if rest.starts_with('#') {
+        *rest = &rest[rest.find('\n').unwrap_or(rest.len())..];
+    }
+    *rest = rest.trim_start_matches(dotenv_inline_whitespace);
+    if let Some(after) = rest.strip_prefix('\n') {
+        *rest = after;
+    } else if !rest.is_empty() {
+        return Err(());
+    }
+    Ok(key.map(|key| (key, value)))
+}
+
+fn dotenv_value(rest: &mut &str) -> Result<String, ()> {
+    static SINGLE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\A'((?:\\'|[^'])*)'").unwrap());
+    static DOUBLE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"\A"((?:\\"|[^"])*)""#).unwrap());
+    let quote = rest.chars().next();
+    if matches!(quote, Some('\'' | '"')) {
+        let parser = if quote == Some('\'') {
+            &*SINGLE
+        } else {
+            &*DOUBLE
+        };
+        let captures = parser.captures(rest).ok_or(())?;
+        let body = captures.get(1).unwrap().as_str();
+        let value = dotenv_decode_escapes(body, quote.unwrap());
+        *rest = &rest[captures.get(0).unwrap().end()..];
+        return Ok(value);
+    }
+    let end = rest.find('\n').unwrap_or(rest.len());
+    let line = &rest[..end];
+    *rest = &rest[end..];
+    let comment = line
+        .char_indices()
+        .find_map(|(index, c)| {
+            (c == '#'
+                && line[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(dotenv_whitespace))
+            .then_some(index)
+        })
+        .unwrap_or(line.len());
+    Ok(line[..comment]
+        .trim_end_matches(dotenv_whitespace)
+        .to_string())
+}
+
+/// Decode only python-dotenv's escape set after the complete quoted body
+/// was parsed. Unknown escapes stay literal, including Windows paths.
+fn dotenv_decode_escapes(body: &str, quote: char) -> String {
+    let mut value = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
         if c != '\\' {
             value.push(c);
             continue;
@@ -856,28 +928,23 @@ fn dotenv_unquote(rest: &str, quote: char) -> String {
     value
 }
 
-/// python-dotenv's `${NAME}` / `${NAME:-default}` expansion (a bare
-/// `$NAME` stays literal); an unset name takes the default, else "".
+/// python-dotenv's variable grammar. Unsupported `${NAME:...}` and bare
+/// `$NAME` stay literal; defaults and expansions are not recursive.
 fn dotenv_interpolate(value: &str, lookup: &impl Fn(&str) -> Option<String>) -> String {
+    static VARIABLES: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\$\{([^}:]*)(?::-([^}]*))?\}").unwrap());
     let mut out = String::new();
-    let mut rest = value;
-    while let Some(start) = rest.find("${") {
-        let Some(len) = rest[start + 2..].find('}') else {
-            break;
-        };
-        out.push_str(&rest[..start]);
-        let inner = &rest[start + 2..start + 2 + len];
-        let (name, default) = match inner.split_once(":-") {
-            Some((name, default)) => (name, Some(default)),
-            None => (inner, None),
-        };
-        match lookup(name) {
+    let mut end = 0;
+    for captures in VARIABLES.captures_iter(value) {
+        let whole = captures.get(0).unwrap();
+        out.push_str(&value[end..whole.start()]);
+        match lookup(captures.get(1).unwrap().as_str()) {
             Some(found) => out.push_str(&found),
-            None => out.push_str(default.unwrap_or_default()),
+            None => out.push_str(captures.get(2).map_or("", |default| default.as_str())),
         }
-        rest = &rest[start + 3 + len..];
+        end = whole.end();
     }
-    out.push_str(rest);
+    out.push_str(&value[end..]);
     out
 }
 
@@ -886,6 +953,16 @@ async fn pipenv_settings_site_packages(
     cwd: &Path,
     var: &impl Fn(&str) -> Option<String>,
 ) -> Vec<PathBuf> {
+    if pipenv_uses_virtual_env(var) {
+        if let Some(prefix) = var("VIRTUAL_ENV").filter(|prefix| !prefix.is_empty()) {
+            // Pipenv evaluates a relative active prefix from the project,
+            // which can differ from this process's cwd (`--cwd`).
+            let found = find_site_packages_under(&cwd.join(prefix), "site-packages").await;
+            if !found.is_empty() {
+                return found;
+            }
+        }
+    }
     let in_project = pipenv_venv_in_project(cwd, var);
     let dot_venv = cwd.join(".venv");
     if !dot_venv.is_dir() {
@@ -3627,6 +3704,135 @@ mod tests {
     }
 
     #[test]
+    fn dotenv_bindings_match_native_quotes_and_record_boundaries() {
+        let var = env_of(&[("NAME", "ambient".to_string())]);
+        for (text, expected) in [
+            (
+                "NAME=actual\nCUSTOM='${NAME}'\n",
+                vec![("NAME", "actual"), ("CUSTOM", "actual")],
+            ),
+            ("'CUSTOM'=actual\n", vec![("CUSTOM", "actual")]),
+            ("export\tCUSTOM=actual\n", vec![("CUSTOM", "actual")]),
+            (
+                "CUSTOM=actual\nAPP=\"first\nCUSTOM=decoy\nlast\"\n",
+                vec![("CUSTOM", "actual"), ("APP", "first\nCUSTOM=decoy\nlast")],
+            ),
+            (
+                "CUSTOM=actual\nCUSTOM=\"decoy\" trailing\n",
+                vec![("CUSTOM", "actual")],
+            ),
+            (
+                "CUSTOM=actual\nCUSTOM=\"decoy\n",
+                vec![("CUSTOM", "actual")],
+            ),
+            ("NAME\nCUSTOM=${NAME:-default}\n", vec![("CUSTOM", "")]),
+            (
+                "NAME=first\nNAME\nCUSTOM=${NAME:-default}\n",
+                vec![("CUSTOM", "")],
+            ),
+            (
+                "CUSTOM=actual\t# first # second\n",
+                vec![("CUSTOM", "actual")],
+            ),
+            (
+                "CUSTOM=${NAME:unsupported}\n",
+                vec![("CUSTOM", "${NAME:unsupported}")],
+            ),
+            (
+                "APP='first\r\nsecond'\rCUSTOM=actual\r",
+                vec![("APP", "first\nsecond"), ("CUSTOM", "actual")],
+            ),
+        ] {
+            let expected = expected
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<Vec<_>>();
+            assert_eq!(parse_dotenv(text, &var), expected, "dotenv input {text:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pipenv_dotenv_syntax_keeps_the_native_project_environment() {
+        let (tmp, project, default, var) = pipenv_project_with_workon_venv(&[]);
+        let actual = fake_venv(&tmp.path().join("wh"), "actual");
+        let decoy = fake_venv(&tmp.path().join("wh"), "decoy");
+        for dotenv in [
+            "NAME=actual\nPIPENV_CUSTOM_VENV_NAME='${NAME}'\n",
+            "'PIPENV_CUSTOM_VENV_NAME'=actual\n",
+            "export\tPIPENV_CUSTOM_VENV_NAME=actual\n",
+            "PIPENV_CUSTOM_VENV_NAME=actual\nAPP_SETTINGS=\"first\nPIPENV_CUSTOM_VENV_NAME=decoy\nlast\"\n",
+        ] {
+            std::fs::write(project.join(".env"), dotenv).unwrap();
+            let found = find_local_venv_site_packages_with(&project, &var).await;
+            assert_eq!(found, vec![actual.clone(), default.clone()], "dotenv {dotenv:?}");
+            assert!(!found.contains(&decoy), "text inside a quoted value is not a setting");
+        }
+    }
+
+    #[tokio::test]
+    async fn pipenv_dotenv_active_settings_are_resolved_per_view() {
+        let (tmp, project, default, base_var) = pipenv_project_with_workon_venv(&[]);
+        let actual_root = tmp.path().join("wh/actual");
+        let actual = fake_venv(&tmp.path().join("wh"), "actual");
+        let ambient_root = tmp.path().join("ambient");
+        let ambient = fake_venv(tmp.path(), "ambient");
+        // An empty active prefix is falsy, not the project directory.
+        let _project_lib = fake_venv(&project, "");
+        let var = |key: &str| match key {
+            "VIRTUAL_ENV" => Some(ambient_root.to_string_lossy().into_owned()),
+            _ => base_var(key),
+        };
+        for dotenv in [
+            "PIPENV_IGNORE_VIRTUALENVS=1\nPIPENV_CUSTOM_VENV_NAME=actual\n".to_string(),
+            "PIPENV_ACTIVE=1\nPIPENV_CUSTOM_VENV_NAME=actual\n".to_string(),
+            format!(
+                "VIRTUAL_ENV='{}'\n",
+                actual_root.to_string_lossy().replace('\\', "/")
+            ),
+            "VIRTUAL_ENV=../wh/actual\n".to_string(),
+            "VIRTUAL_ENV=\nPIPENV_CUSTOM_VENV_NAME=actual\n".to_string(),
+        ] {
+            std::fs::write(project.join(".env"), &dotenv).unwrap();
+            let found = find_local_venv_site_packages_with(&project, &var)
+                .await
+                .into_iter()
+                .map(|site| site.canonicalize().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                found,
+                vec![
+                    actual.canonicalize().unwrap(),
+                    ambient.canonicalize().unwrap()
+                ],
+                "dotenv {dotenv:?}"
+            );
+        }
+        std::fs::write(project.join(".env"), "PIPENV_IGNORE_VIRTUALENVS=0\n").unwrap();
+        let ignored = |key: &str| match key {
+            "PIPENV_IGNORE_VIRTUALENVS" => Some("1".to_string()),
+            _ => var(key),
+        };
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &ignored).await,
+            vec![ambient.clone(), default],
+            "dotenv can clear a process-level opt-out"
+        );
+        std::fs::write(
+            project.join(".env"),
+            "PIPENV_IGNORE_VIRTUALENVS=1\nPIPENV_CUSTOM_VENV_NAME=actual\n",
+        )
+        .unwrap();
+        let disabled = |key: &str| match key {
+            "PIPENV_DONT_LOAD_ENV" => Some("1".to_string()),
+            _ => var(key),
+        };
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &disabled).await,
+            vec![ambient]
+        );
+    }
+
+    #[test]
     fn dotenv_parsing_follows_python_dotenv() {
         let var = env_of(&[("OUTER", "out".to_string())]);
         let text = "\
@@ -3649,7 +3855,7 @@ G=
         assert_eq!(get("A"), Some("1"));
         assert_eq!(get("B"), Some("two words"));
         assert_eq!(get("C"), Some("quoted # not a comment"));
-        assert_eq!(get("D"), Some("single ${OUTER}"));
+        assert_eq!(get("D"), Some("single out"));
         assert_eq!(get("E"), Some("line\nbreak"));
         assert_eq!(get("F"), Some("1-out-dflt"));
         assert_eq!(get("NOVALUE"), None);

@@ -602,3 +602,116 @@ async fn warm_venv_with_the_upstream_release_is_not_attested() {
     roll_back(tmp.path(), &server).await;
     assert_eq!(read(&lock_path), LOCK);
 }
+
+/// Native Pipenv resolves these .env settings before choosing its env.
+/// A healthy ambient interpreter or empty local env must not hide the
+/// selected stale installation from the hosted-byte/VEX check.
+#[tokio::test]
+#[serial]
+async fn dotenv_selected_pipenv_install_is_checked_before_vex() {
+    for case in [
+        "single-quoted",
+        "multiline",
+        "ignore-active",
+        "override-active",
+        "relative-active",
+    ] {
+        let server = MockServer::start().await;
+        mock_api(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        write_project_with_upstream_install(&project);
+        let workon = tmp.path().join("workon");
+        std::fs::create_dir_all(&workon).unwrap();
+        let actual = workon.join("actual");
+        std::fs::rename(project.join(".venv"), &actual).unwrap();
+        std::fs::create_dir_all(site_packages(&project)).unwrap();
+        let ambient_project = tmp.path().join("ambient-project");
+        std::fs::create_dir_all(&ambient_project).unwrap();
+        write_project_with_upstream_install(&ambient_project);
+        let ambient_file = site_packages(&ambient_project).join("urllib3/response.py");
+        std::fs::write(&ambient_file, PATCHED).unwrap();
+        let actual_file = if cfg!(windows) {
+            actual.join("Lib/site-packages/urllib3/response.py")
+        } else {
+            actual.join("lib/python3.12/site-packages/urllib3/response.py")
+        };
+        let dotenv = match case {
+            "single-quoted" => "NAME=actual\nPIPENV_CUSTOM_VENV_NAME='${NAME}'\n".to_string(),
+            "multiline" => "PIPENV_CUSTOM_VENV_NAME=actual\nAPP_SETTINGS=\"first\nPIPENV_CUSTOM_VENV_NAME=decoy\nlast\"\n".to_string(),
+            "ignore-active" => "PIPENV_IGNORE_VIRTUALENVS=1\nPIPENV_CUSTOM_VENV_NAME=actual\n".to_string(),
+            "relative-active" => "VIRTUAL_ENV=../workon/actual\n".to_string(),
+            _ => format!("VIRTUAL_ENV='{}'\n", actual.to_string_lossy().replace('\\', "/")),
+        };
+        std::fs::write(project.join(".env"), &dotenv).unwrap();
+        let vex = project.join("out.vex.json");
+        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+        for (key, _) in std::env::vars_os() {
+            let key_text = key.to_string_lossy();
+            if key_text.starts_with("SOCKET_")
+                || key_text.starts_with("PIPENV_")
+                || matches!(key_text.as_ref(), "VIRTUAL_ENV" | "WORKON_HOME")
+            {
+                cmd.env_remove(key);
+            }
+        }
+        for key in [
+            "SOCKET_OFFLINE",
+            "SOCKET_DEBUG",
+            "SOCKET_API_URL",
+            "SOCKET_PROXY_URL",
+        ] {
+            cmd.env_remove(key);
+        }
+        cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
+            .env(MAJOR_ENV, "2026")
+            .env("WORKON_HOME", &workon)
+            .args(["scan", "--mode", "hosted", "--yes", "--json", "--cwd"])
+            .arg(&project)
+            .args([
+                "--api-url",
+                &server.uri(),
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+                "--vex",
+            ])
+            .arg(&vex)
+            .args(["--vex-product", VEX_PRODUCT]);
+        if case.ends_with("active") {
+            cmd.env("VIRTUAL_ENV", ambient_project.join(".venv"));
+        }
+        let out = cmd.output().await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{case}: {error}: stdout={} stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        assert_eq!(out.status.code(), Some(1), "{case}: {json}");
+        assert!(
+            json["redirect"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["code"] == "redirect_pypi_stale_install"),
+            "{case}: {json}"
+        );
+        assert!(!vex.exists(), "{case}: stale bytes must not produce VEX");
+        assert_eq!(
+            std::fs::read(&actual_file).unwrap(),
+            UPSTREAM,
+            "the probe is read-only"
+        );
+        assert_eq!(
+            std::fs::read(&ambient_file).unwrap(),
+            PATCHED,
+            "the ambient env is unchanged"
+        );
+        assert_eq!(read(&project.join("Pipfile")), PIPFILE);
+        assert!(read(&project.join("Pipfile.lock")).contains(HOSTED_URL));
+    }
+}
