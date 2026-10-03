@@ -15,7 +15,9 @@
 //! `apply from: '.socket/gradle/socket-patch.hosted.settings.gradle' //
 //! socket-patch-hosted <sha256[..16] of the index>`: the settings script is
 //! a configuration-cache input on every Gradle major, so a changed index
-//! invalidates cached configurations. The script routes each suffixed
+//! invalidates cached configurations. A settings file the planner created
+//! carries ` created` after the digest, so the restore deletes only those
+//! (an existing empty `settings.gradle` marks a build root and stays). The script routes each suffixed
 //! version to its Socket repository with `exclusiveContent`, rewrites every
 //! request whose selector admits the base to the suffixed version
 //! (dependency substitution plus `eachDependency`), rejects every other
@@ -68,6 +70,9 @@ pub const GITATTRIBUTES_REL: &str = vendored::SCRIPT_GITATTRIBUTES_REL;
 pub const GITATTRIBUTES: &str = "* -text\n";
 /// The comment after the apply line's path, followed by the index digest.
 pub const DIGEST_TAG: &str = "// socket-patch-hosted";
+/// The word after the digest on the apply line of a settings file the
+/// planner created.
+pub const CREATED_TAG: &str = "created";
 /// The script's repository names (`<prefix>_<n>`).
 const REPO_NAME_PREFIX: &str = "socketPatchHosted";
 /// The vendored backend's index (a GA it serves cannot also be hosted).
@@ -82,6 +87,13 @@ pub const GRADLE_ROOT_FILES: &[&str] = &[
     "build.gradle",
     "build.gradle.kts",
 ];
+
+/// Whether `rel` is a settings-classpath lock (`settings-gradle.lockfile`
+/// of any build). Gradle resolves that classpath before any settings
+/// script runs, so the hosted script can never pin what it locks.
+pub fn is_settings_lock(rel: &str) -> bool {
+    rel.rsplit('/').next() == Some("settings-gradle.lockfile")
+}
 
 /// Whether `files` (root-relative) hold a root Gradle settings or build
 /// script.
@@ -282,12 +294,18 @@ pub fn settings_targets(graph: &ScriptGraph) -> Vec<SettingsTarget> {
     out
 }
 
-/// The apply line for a build `prefix` below the root.
-pub fn apply_line(dsl: Dsl, prefix: &str, digest: &str) -> String {
+/// The apply line for a build `prefix` below the root (`created` when the
+/// planner creates the settings file).
+pub fn apply_line(dsl: Dsl, prefix: &str, digest: &str, created: bool) -> String {
     let path = format!("{prefix}{HOSTED_SCRIPT_REL}");
+    let tag = if created {
+        format!("{DIGEST_TAG} {digest} {CREATED_TAG}")
+    } else {
+        format!("{DIGEST_TAG} {digest}")
+    };
     match dsl {
-        Dsl::Kotlin => format!("apply(from = \"{path}\") {DIGEST_TAG} {digest}"),
-        Dsl::Groovy => format!("apply from: '{path}' {DIGEST_TAG} {digest}"),
+        Dsl::Kotlin => format!("apply(from = \"{path}\") {tag}"),
+        Dsl::Groovy => format!("apply from: '{path}' {tag}"),
     }
 }
 
@@ -319,25 +337,43 @@ pub fn apply_line_span(text: &str, dsl: Dsl, prefix: &str) -> Option<(usize, usi
     Some((start, end))
 }
 
-/// The digest the live apply line carries, if any.
-pub fn apply_line_digest(text: &str, dsl: Dsl, prefix: &str) -> Option<String> {
+/// The words after [`DIGEST_TAG`] on the live apply line, if any.
+fn apply_line_tail(text: &str, dsl: Dsl, prefix: &str) -> Option<Vec<String>> {
     let (start, end) = apply_line_span(text, dsl, prefix)?;
-    let line = &text[start..end];
-    let tail = line.split_once(DIGEST_TAG)?.1.trim();
-    (!tail.is_empty()).then(|| tail.to_string())
+    let tail = text[start..end].split_once(DIGEST_TAG)?.1;
+    Some(tail.split_whitespace().map(str::to_string).collect())
 }
 
-/// `text` with its apply line set to the one for `digest` (replaced in
-/// place, or appended in the file's line-ending style). `None` when it
-/// already reads so.
-pub fn with_apply_line(text: &str, dsl: Dsl, prefix: &str, digest: &str) -> Option<String> {
-    let line = apply_line(dsl, prefix, digest);
+/// The digest the live apply line carries, if any.
+pub fn apply_line_digest(text: &str, dsl: Dsl, prefix: &str) -> Option<String> {
+    apply_line_tail(text, dsl, prefix)?.into_iter().next()
+}
+
+/// Whether the live apply line marks a settings file the planner created.
+pub fn apply_line_created(text: &str, dsl: Dsl, prefix: &str) -> bool {
+    apply_line_tail(text, dsl, prefix)
+        .is_some_and(|t| t.get(1).map(String::as_str) == Some(CREATED_TAG))
+}
+
+/// `text` with its apply line set to the one for `digest`: replaced in
+/// place (keeping its `created` mark), or appended in the file's
+/// line-ending style, marked `created` when the planner is creating the
+/// file. `None` when it already reads so.
+pub fn with_apply_line(
+    text: &str,
+    dsl: Dsl,
+    prefix: &str,
+    digest: &str,
+    created: bool,
+) -> Option<String> {
     if let Some((start, end)) = apply_line_span(text, dsl, prefix) {
+        let line = apply_line(dsl, prefix, digest, apply_line_created(text, dsl, prefix));
         if text[start..end] == line {
             return None;
         }
         return Some(format!("{}{line}{}", &text[..start], &text[end..]));
     }
+    let line = apply_line(dsl, prefix, digest, created);
     let nl = newline_of(text);
     let mut out = text.to_string();
     if !out.is_empty() && !out.ends_with('\n') && out != "\u{feff}" {
@@ -463,6 +499,55 @@ impl GradleFiles {
             lists.into_inner().into_iter().collect(),
         )
     }
+}
+
+/// The Gradle build under `root`, read from disk to the fixed point of
+/// [`GradleFiles`] (a file that cannot be read is absent; a directory that
+/// cannot be listed lists as empty).
+pub async fn read_build_from_disk(root: &std::path::Path) -> BTreeMap<String, String> {
+    let mut gradle = GradleFiles::default();
+    for _ in 0..MAX_ROUNDS {
+        let (reads, lists) = gradle.misses();
+        if reads.is_empty() && lists.is_empty() {
+            break;
+        }
+        for rel in reads {
+            match crate::utils::fs::read_regular_to_string(&root.join(&rel)).await {
+                Ok(text) => gradle.found(&rel, text),
+                Err(_) => gradle.absent(&rel),
+            }
+        }
+        for dir in lists {
+            let mut children = Vec::new();
+            if let Ok(mut entries) = tokio::fs::read_dir(root.join(&dir)).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                        continue;
+                    };
+                    let is_dir = entry.file_type().await.is_ok_and(|t| t.is_dir());
+                    children.push(if is_dir { format!("{name}/") } else { name });
+                }
+            }
+            children.sort();
+            gradle.listed(&dir, children);
+        }
+    }
+    gradle.files
+}
+
+/// Every project file the hosted Gradle wiring of the build `files` holds
+/// can live in: every build's settings file (created ones included), every
+/// lock file of every build, and the owned and fixed files. The upstream
+/// restore writes or deletes only these, so a snapshot of them undoes it.
+pub fn wiring_files(files: &BTreeMap<String, String>) -> Vec<String> {
+    let graph = graph_of(files);
+    let mut out: BTreeSet<String> = settings_targets(&graph)
+        .into_iter()
+        .map(|t| t.rel)
+        .collect();
+    out.extend(lockfile_paths(&graph, files));
+    out.extend(FIXED_READS.iter().map(|s| s.to_string()));
+    out.into_iter().collect()
 }
 
 /// A [`crate::gradle::ListFn`] over the keys of `files`.
@@ -699,6 +784,25 @@ fn plan_dep(
             ),
         ));
     }
+    // A settings plugin can pull the GA in transitively, which no literal
+    // declaration shows; its settings-classpath lock does.
+    if let Some(rel) = lock_paths.iter().find(|rel| {
+        is_settings_lock(rel)
+            && files.get(*rel).is_some_and(|t| {
+                locks::parse(t)
+                    .entries_of(&group, &artifact)
+                    .next()
+                    .is_some()
+            })
+    }) {
+        return Err(refusal(
+            "redirect_gradle_settings_classpath",
+            format!(
+                "{rel} locks {ga} on a settings-script classpath, which Gradle resolves before \
+                 the hosted settings script runs"
+            ),
+        ));
+    }
     let decls = graph.declarations_of(&group, &artifact);
     if let Some(d) = decls.iter().find(|d| d.kind == DeclKind::Classifier) {
         return Err(refusal(
@@ -786,6 +890,55 @@ fn plan_dep(
             .map(bare_sha256_hex)
             .filter(|s| crate::utils::digest::is_hex64_lower(s)),
     })
+}
+
+/// Whether the hosted planner would refuse `dep` in the build `files`
+/// holds once its vendored Gradle wiring is reverted: every refusal of
+/// [`rewrite_gradle_hosted`] except the vendored-index conflict, which the
+/// takeover's revert clears. The vendored backend serves the original GAV
+/// and leaves lock files alone, so the lock checks hold before the revert
+/// too. A takeover runs this before reverting anything, so a refused purl
+/// keeps its working vendored patch. `None` when there is no Gradle build.
+pub fn takeover_refusal(
+    files: &BTreeMap<String, String>,
+    dep: &DepOverride,
+) -> Option<RewriteWarning> {
+    if !gradle_build_present(files) {
+        return None;
+    }
+    let (group, artifact) = coords_of(dep);
+    let warning = |r: Refusal| RewriteWarning {
+        code: r.code.into(),
+        detail: format!(
+            "{}; the vendored patch of {group}:{artifact}:{} stays in place (NOT switched to \
+             hosted)",
+            r.detail, dep.version
+        ),
+    };
+    if registry_override_of_kind(dep, "maven2").is_none() {
+        return Some(warning(refusal(
+            "redirect_gradle_override_invalid",
+            "the hosted grant carries no maven2 repository",
+        )));
+    }
+    let graph = graph_of(files);
+    let lock_paths = lockfile_paths(&graph, files);
+    let index = files
+        .get(HOSTED_INDEX_REL)
+        .map_or(Ok(Vec::new()), |t| parse_index(t));
+    let project = project_refusal(files, &graph, &index);
+    let rows = index.unwrap_or_default();
+    plan_dep(
+        dep,
+        files,
+        &graph,
+        &lock_paths,
+        &rows,
+        &BTreeSet::new(),
+        project.as_ref(),
+    )
+    .err()
+    .map(warning)
 }
 
 /// `(groupId, artifactId)` of a maven dep.
@@ -973,7 +1126,7 @@ pub(crate) fn rewrite_gradle_hosted(
     let targets = settings_targets(&graph);
     for t in &targets {
         let text = files.get(&t.rel).cloned().unwrap_or_default();
-        if let Some(next) = with_apply_line(&text, t.dsl, &t.prefix(), &digest) {
+        if let Some(next) = with_apply_line(&text, t.dsl, &t.prefix(), &digest, !t.exists) {
             edit(
                 &mut out,
                 result,
@@ -1029,8 +1182,10 @@ pub(crate) fn rewrite_gradle_hosted(
         .unwrap_or_default();
     let applied = targets.iter().all(|t| {
         final_text(&t.rel).is_some_and(|text| {
-            apply_line_span(text, t.dsl, &t.prefix())
-                .is_some_and(|(s, e)| text[s..e] == apply_line(t.dsl, &t.prefix(), &digest))
+            let created = apply_line_created(text, t.dsl, &t.prefix());
+            apply_line_span(text, t.dsl, &t.prefix()).is_some_and(|(s, e)| {
+                text[s..e] == apply_line(t.dsl, &t.prefix(), &digest, created)
+            })
         })
     });
     for a in &accepted {
@@ -1432,7 +1587,7 @@ mod tests {
             Some("\u{feff}rootProject.name = \"x\"\r\n")
         );
         assert_eq!(
-            with_apply_line(kts, Dsl::Kotlin, "", "4567").as_deref(),
+            with_apply_line(kts, Dsl::Kotlin, "", "4567", true).as_deref(),
             Some("\u{feff}apply(from = \".socket/gradle/socket-patch.hosted.settings.gradle\") // socket-patch-hosted 4567\r\nrootProject.name = \"x\"\r\n")
         );
     }
@@ -1486,9 +1641,24 @@ mod tests {
         )));
         assert_eq!(
             r.files["buildSrc/settings.gradle.kts"],
-            format!("apply(from = \"../.socket/gradle/socket-patch.hosted.settings.gradle\") // socket-patch-hosted {digest}\n"),
-            "created in the build script's DSL"
+            format!("apply(from = \"../.socket/gradle/socket-patch.hosted.settings.gradle\") // socket-patch-hosted {digest} created\n"),
+            "created in the build script's DSL, and marked so"
         );
+        assert!(
+            !r.files["build-logic/settings.gradle.kts"].contains(" created"),
+            "an existing file is not marked"
+        );
+        // A second row rewrites the digest and keeps the mark.
+        let two = rewrite_registry_redirect(
+            &applied(input, &r),
+            &[dep(), dep_for(UUID2, "other", "2.0")],
+        );
+        let d2 = index_digest(&two.files[HOSTED_INDEX_REL]);
+        assert_eq!(
+            two.files["buildSrc/settings.gradle.kts"],
+            format!("apply(from = \"../.socket/gradle/socket-patch.hosted.settings.gradle\") // socket-patch-hosted {d2} created\n"),
+        );
+        assert!(two.confirmed_gradle_uuids.contains(UUID2));
         assert!(r.files["build-logic/settings.gradle.kts"].contains(&format!(
             "apply(from = \"../.socket/gradle/socket-patch.hosted.settings.gradle\") // socket-patch-hosted {digest}"
         )));
@@ -1534,7 +1704,7 @@ mod tests {
     }
 
     fn assert_refused(input: &[(&str, &str)], dep: DepOverride, code: &str) -> RewriteResult {
-        let r = rewrite_registry_redirect(&files(input), &[dep.clone()]);
+        let r = rewrite_registry_redirect(&files(input), std::slice::from_ref(&dep));
         assert!(
             r.files.is_empty() && r.edits.is_empty(),
             "{code}: nothing written: {:?}",
@@ -1616,6 +1786,22 @@ mod tests {
             dep(),
             "redirect_gradle_settings_classpath",
         );
+        // A settings plugin pulling the GA in transitively shows only in
+        // the settings-classpath lock.
+        assert_refused(
+            &[
+                (
+                    "settings.gradle",
+                    "plugins { id 'org.example.settings' version '1.0' }\n",
+                ),
+                (
+                    "settings-gradle.lockfile",
+                    "com.socketfixture:victim:1.10.0=classpath\nempty=\n",
+                ),
+            ],
+            dep(),
+            "redirect_gradle_settings_classpath",
+        );
         assert_refused(
             &[
                 s,
@@ -1676,6 +1862,114 @@ mod tests {
             dep(),
             "redirect_gradle_version_conflict",
         );
+    }
+
+    /// The takeover preflight refuses what the planner would refuse once
+    /// the vendored wiring is gone, and ignores the vendored index itself.
+    #[test]
+    fn takeover_refusal_mirrors_the_planner_except_the_vendored_index() {
+        let vendored = (
+            ".socket/vendor/gradle-index.tsv",
+            "#socket-patch-gradle-index 1\ncom.socketfixture:victim:1.10.0\tx\ty\tz\n",
+        );
+        let s = ("settings.gradle", "rootProject.name = 'app'\n");
+        assert!(takeover_refusal(&files(&[s, vendored]), &dep()).is_none());
+        assert!(takeover_refusal(&files(&[("pom.xml", "<project/>")]), &dep()).is_none());
+        let code = |input: &[(&str, &str)], d: DepOverride| {
+            takeover_refusal(&files(input), &d).map(|w| w.code)
+        };
+        assert_eq!(
+            code(
+                &[
+                    s,
+                    vendored,
+                    (
+                        "build.gradle",
+                        "dependencyLocking { lockFile = file('x.lockfile') }\n"
+                    )
+                ],
+                dep()
+            )
+            .as_deref(),
+            Some("redirect_gradle_lock_location_unknown")
+        );
+        let mut legacy = dep();
+        legacy
+            .registry_override
+            .as_mut()
+            .unwrap()
+            .identifiers
+            .maven_suffixed_version = None;
+        assert_eq!(
+            code(&[s, vendored], legacy).as_deref(),
+            Some("redirect_gradle_same_gav_unsupported")
+        );
+        let mut no_sha = dep();
+        no_sha.integrity.sha256 = None;
+        assert_eq!(
+            code(&[s, vendored], no_sha).as_deref(),
+            Some("redirect_gradle_override_invalid")
+        );
+        let mut no_override = dep();
+        no_override.registry_override = None;
+        assert_eq!(
+            code(&[s, vendored], no_override).as_deref(),
+            Some("redirect_gradle_override_invalid")
+        );
+        assert_eq!(
+            code(
+                &[
+                    s,
+                    vendored,
+                    (
+                        "settings-gradle.lockfile",
+                        "com.socketfixture:victim:1.10.0=classpath\n"
+                    ),
+                ],
+                dep()
+            )
+            .as_deref(),
+            Some("redirect_gradle_settings_classpath")
+        );
+        let w = takeover_refusal(
+            &files(&[
+                s,
+                vendored,
+                (
+                    "gradle.lockfile",
+                    "com.socketfixture:victim:1.11=runtimeClasspath\n",
+                ),
+            ]),
+            &dep(),
+        )
+        .unwrap();
+        assert_eq!(w.code, "redirect_gradle_lock_conflict");
+        assert!(w.detail.contains("stays in place"), "{}", w.detail);
+    }
+
+    /// The files a restore can touch: every build's settings (a missing
+    /// one included), every lock and the owned files.
+    #[test]
+    fn wiring_files_cover_every_build() {
+        let got = wiring_files(&files(&[
+            ("settings.gradle", "includeBuild 'tools'\n"),
+            ("buildSrc/build.gradle", ""),
+            ("tools/settings.gradle", ""),
+            ("tools/gradle.lockfile", ""),
+            ("gradle/dependency-locks/compileClasspath.lockfile", ""),
+        ]));
+        for want in [
+            "settings.gradle",
+            "buildSrc/settings.gradle",
+            "tools/settings.gradle",
+            "tools/gradle.lockfile",
+            "gradle/dependency-locks/compileClasspath.lockfile",
+            HOSTED_INDEX_REL,
+            HOSTED_SCRIPT_REL,
+            VERIFICATION_REL,
+        ] {
+            assert!(got.iter().any(|g| g == want), "{want}: {got:?}");
+        }
     }
 
     /// A newer patch of the same GAV replaces the row and moves the old

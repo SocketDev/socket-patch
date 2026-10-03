@@ -980,8 +980,9 @@ fn hosted_pins_in_scope(common: &GlobalArgs, pins: Vec<HostedPin>) -> Vec<Hosted
 /// What a wet eject can touch, captured before it touches anything: every
 /// regular file directly in the project root, the hosted pins' files and
 /// the restore's files (nested locks included), the project's cargo,
-/// maven and Gradle config and owned files, the vendor ledger, and the set
-/// of vendored uuid directories. [`EjectSnapshot::restore`] puts all of it back and removes
+/// maven and Gradle config and owned files (every Gradle build's settings
+/// and lock files when the project has a hosted Gradle index), the vendor
+/// ledger, and the set of vendored uuid directories. [`EjectSnapshot::restore`] puts all of it back and removes
 /// what the eject created.
 struct EjectSnapshot {
     root: std::path::PathBuf,
@@ -1041,6 +1042,21 @@ impl EjectSnapshot {
         let mut rels: std::collections::BTreeSet<String> = root_files.clone();
         rels.extend(touched.iter().cloned());
         rels.extend(Self::EXTRA.iter().map(|s| s.to_string()));
+        // A Gradle pin's restore also rewrites (or deletes) files below
+        // the root: every build's settings file and every build's lock
+        // files. The same files are where the vendored wiring goes.
+        if tokio::fs::symlink_metadata(
+            root.join(socket_patch_core::patch::redirect::gradle::HOSTED_INDEX_REL),
+        )
+        .await
+        .is_ok()
+        {
+            let build =
+                socket_patch_core::patch::redirect::gradle::read_build_from_disk(root).await;
+            rels.extend(socket_patch_core::patch::redirect::gradle::wiring_files(
+                &build,
+            ));
+        }
         let mut files = Vec::with_capacity(rels.len());
         for rel in rels {
             let bytes = match tokio::fs::read(root.join(&rel)).await {

@@ -9,8 +9,9 @@
 //! `gradle/verification-metadata.xml` when it is still exactly what the
 //! planner wrote (otherwise it stays and `gradle_verification_component_left`
 //! says so). Once no row is left, the index and the owned script go, every
-//! build's apply line goes (a settings file left empty — one the planner
-//! created — goes too), and `.socket/gradle/.gitattributes` goes unless the
+//! build's apply line goes (a settings file whose apply line is marked
+//! `created` goes too when nothing else was added to it; a file the user
+//! had, even an empty one, keeps its bytes), and `.socket/gradle/.gitattributes` goes unless the
 //! vendored settings script still lives beside it. While rows remain, the
 //! index is rewritten and every apply line carries its new digest.
 //!
@@ -23,9 +24,10 @@ use super::{Ctx, FormatResult, HostedPin, View};
 use crate::gradle::eol::eol_eq;
 use crate::gradle::locks;
 use crate::patch::redirect::gradle::{
-    graph_of, index_digest, lockfile_paths, parse_index, render_index, settings_targets,
-    with_apply_line, without_apply_line, GradleFiles, HostedRow, GITATTRIBUTES, GITATTRIBUTES_REL,
-    HOSTED_INDEX_REL, HOSTED_SCRIPT, HOSTED_SCRIPT_REL, MAX_ROUNDS,
+    apply_line_created, apply_line_span, graph_of, index_digest, lockfile_paths, parse_index,
+    render_index, settings_targets, with_apply_line, without_apply_line, GradleFiles, HostedRow,
+    GITATTRIBUTES, GITATTRIBUTES_REL, HOSTED_INDEX_REL, HOSTED_SCRIPT, HOSTED_SCRIPT_REL,
+    MAX_ROUNDS,
 };
 use crate::vendor::jvm::gradle as vendored;
 
@@ -143,12 +145,12 @@ pub(crate) async fn restore(
             let Some(text) = current(&staged, &t.rel) else {
                 continue;
             };
-            if crate::patch::redirect::gradle::apply_line_span(&text, t.dsl, &t.prefix()).is_none()
-            {
+            if apply_line_span(&text, t.dsl, &t.prefix()).is_none() {
                 continue;
             }
+            let created = apply_line_created(&text, t.dsl, &t.prefix());
             match without_apply_line(&text, t.dsl, &t.prefix()) {
-                Some(next) if next.trim_start_matches('\u{feff}').trim().is_empty() => {
+                Some(next) if created && next.trim_start_matches('\u{feff}').trim().is_empty() => {
                     staged.insert(t.rel.clone(), None);
                 }
                 Some(next) => {
@@ -185,11 +187,10 @@ pub(crate) async fn restore(
             let Some(text) = current(&staged, &t.rel) else {
                 continue;
             };
-            if crate::patch::redirect::gradle::apply_line_span(&text, t.dsl, &t.prefix()).is_none()
-            {
+            if apply_line_span(&text, t.dsl, &t.prefix()).is_none() {
                 continue;
             }
-            if let Some(next) = with_apply_line(&text, t.dsl, &t.prefix(), &digest) {
+            if let Some(next) = with_apply_line(&text, t.dsl, &t.prefix(), &digest, false) {
                 staged.insert(t.rel.clone(), Some(next));
             }
         }
@@ -458,6 +459,67 @@ mod tests {
             .collect();
         assert_eq!(after, want);
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    }
+
+    /// A settings file the user had, even an empty or BOM-only one (an
+    /// empty `settings.gradle` marks a build root), keeps its bytes; only
+    /// a planner-created settings file goes.
+    #[tokio::test]
+    async fn an_existing_empty_settings_file_survives_the_round_trip() {
+        let input: &[(&str, &str)] = &[
+            ("settings.gradle", ""),
+            (
+                "build.gradle",
+                "dependencies { implementation 'com.socketfixture:victim:1.10.0' }\n",
+            ),
+            (
+                "gradle.lockfile",
+                "com.socketfixture:victim:1.10.0=runtimeClasspath\nempty=\n",
+            ),
+            ("buildSrc/build.gradle", ""),
+            ("buildSrc/settings.gradle", "\u{feff}"),
+        ];
+        let (outcome, wired, after) =
+            round_trip(input, &[dep(UUID, "victim")], &[pin(UUID, "victim")]).await;
+        assert_eq!(
+            outcome.pins[0].status,
+            PinStatus::Restored,
+            "{:?}",
+            outcome.pins
+        );
+        assert!(!wired["settings.gradle"].contains(" created"));
+        let want: BTreeMap<String, String> = input
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(after, want);
+        // A created file the user then added to keeps the addition.
+        let mut files: BTreeMap<String, String> =
+            BTreeMap::from([("build.gradle".to_string(), String::new())]);
+        let r = rewrite_registry_redirect(&files, &[dep(UUID, "victim")]);
+        files.extend(r.files);
+        assert!(files["settings.gradle"].ends_with(" created\n"));
+        files.insert(
+            "settings.gradle".into(),
+            format!("{}rootProject.name = 'x'\n", files["settings.gradle"]),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        for (rel, text) in &files {
+            let p = tmp.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+        let outcome = restore_upstream(
+            tmp.path(),
+            &[pin(UUID, "victim")],
+            &RestoreOptions::default(),
+        )
+        .await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(
+            tree(tmp.path())["settings.gradle"],
+            "rootProject.name = 'x'\n"
+        );
     }
 
     /// Restoring one of two pins keeps the other's row, rewrites the digest

@@ -16,7 +16,9 @@
 //!   holds (`<base>-socket.<uuid[..8]>`, checked by the row parser);
 //! - every lock entry of the GA in every build's lock files is the
 //!   suffixed version (a lock still at the base, or at another version,
-//!   fails the build or bypasses the pin);
+//!   fails the build or bypasses the pin), and no settings-classpath lock
+//!   (`settings-gradle.lockfile`) names the GA at all: that classpath
+//!   resolves before the script runs, so the pin cannot reach it;
 //! - no build script sets a custom lock-file location (`lockFile`), which
 //!   would hide a lock from the check above.
 //!
@@ -42,8 +44,8 @@ use super::{
 use crate::gradle::eol::eol_eq;
 use crate::gradle::locks;
 use crate::patch::redirect::gradle::{
-    apply_line_digest, graph_of, index_digest, lockfile_paths, parse_index, settings_targets,
-    GradleFiles, HOSTED_INDEX_REL, HOSTED_SCRIPT, HOSTED_SCRIPT_REL, MAX_ROUNDS,
+    apply_line_digest, graph_of, index_digest, is_settings_lock, lockfile_paths, parse_index,
+    settings_targets, GradleFiles, HOSTED_INDEX_REL, HOSTED_SCRIPT, HOSTED_SCRIPT_REL, MAX_ROUNDS,
 };
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
@@ -108,14 +110,23 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         });
         let problem = problem.or_else(|| {
             locks.iter().find_map(|(rel, state)| {
+                let settings = is_settings_lock(rel);
                 state
                     .entries_of(&row.group, &row.artifact)
-                    .find(|e| e.version != row.suffixed)
+                    .find(|e| settings || e.version != row.suffixed)
                     .map(|e| {
-                        format!(
-                            "{rel}:{} locks {ga} at {}, not the pinned {}",
-                            e.line, e.version, row.suffixed
-                        )
+                        if settings {
+                            format!(
+                                "{rel}:{} locks {ga} on the settings classpath, which resolves \
+                                 before the hosted script runs",
+                                e.line
+                            )
+                        } else {
+                            format!(
+                                "{rel}:{} locks {ga} at {}, not the pinned {}",
+                                e.line, e.version, row.suffixed
+                            )
+                        }
                     })
             })
         });
@@ -304,13 +315,23 @@ mod tests {
 
     #[tokio::test]
     async fn broken_wiring_is_an_invalid_ref() {
-        let cases: Vec<(&str, Box<dyn Fn(&Project, &BTreeMap<String, String>)>)> = vec![
+        type BreakIt = Box<dyn Fn(&Project, &BTreeMap<String, String>)>;
+        let cases: Vec<(&str, BreakIt)> = vec![
             (
                 "a lock at the base",
                 Box::new(|p, _| {
                     p.write(
                         "app/gradle.lockfile",
                         "com.socketfixture:victim:1.10.0=runtimeClasspath\nempty=\n",
+                    );
+                }),
+            ),
+            (
+                "a settings-classpath lock, even at the suffix",
+                Box::new(|p, _| {
+                    p.write(
+                        "settings-gradle.lockfile",
+                        format!("com.socketfixture:victim:{SFX}=classpath\nempty=\n"),
                     );
                 }),
             ),
