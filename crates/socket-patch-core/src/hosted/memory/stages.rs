@@ -152,6 +152,9 @@ pub(crate) struct Planned {
     /// `(artifact url, sha256)` of every pypi wheel whose metadata a
     /// native lock rewrite needs.
     pub(crate) wheels: Vec<(String, String)>,
+    /// `(artifact url, sha512)` of every npm tarball whose own
+    /// package.json a yarn berry pin needs (#718).
+    pub(crate) npm_manifests: Vec<(String, Option<String>)>,
     /// The vlt artifact preflight, judged offline (no network here, so
     /// every in-scope dep is withheld instead of pinned: `--offline`
     /// parity).
@@ -201,6 +204,10 @@ pub(crate) async fn plan(
         .into_iter()
         .map(|(dep, sha256)| (dep.artifact_url.clone(), sha256.to_string()))
         .collect();
+    let npm_manifests = engine::yarn_berry_manifest_targets(&candidates, &read.files)
+        .into_iter()
+        .map(|dep| (dep.artifact_url.clone(), dep.integrity.sha512.clone()))
+        .collect();
     Ok(Planned {
         project,
         candidates,
@@ -208,6 +215,7 @@ pub(crate) async fn plan(
         pre_warnings,
         read,
         wheels,
+        npm_manifests,
         vlt_preflight,
     })
 }
@@ -229,10 +237,11 @@ pub(crate) struct RewriteRefused {
     pub(crate) skipped: Vec<SkippedPatch>,
 }
 
-/// Wheel metadata → the engine's rewrite → the guard.
+/// Wheel metadata and served npm manifests (keyed by artifact URL) → the
+/// engine's rewrite → the guard.
 pub(crate) async fn rewrite(
     planned: Planned,
-    wheel_metadata: &BTreeMap<String, Result<Option<String>, String>>,
+    artifact_metadata: &BTreeMap<String, Result<Option<String>, String>>,
     options: StageOptions,
 ) -> Result<Rewritten, RewriteRefused> {
     let Planned {
@@ -242,13 +251,14 @@ pub(crate) async fn rewrite(
         pre_warnings,
         read,
         wheels,
+        npm_manifests,
         vlt_preflight,
     } = planned;
     let skipped_before = skipped.clone();
     let mut python_metadata: BTreeMap<String, String> = BTreeMap::new();
     let mut unavailable: BTreeSet<String> = BTreeSet::new();
     for (url, _) in &wheels {
-        match wheel_metadata.get(url) {
+        match artifact_metadata.get(url) {
             Some(Ok(Some(metadata))) => {
                 python_metadata.insert(url.clone(), metadata.clone());
             }
@@ -265,6 +275,27 @@ pub(crate) async fn rewrite(
                 }
             }
             None => {
+                unavailable.insert(url.clone());
+            }
+        }
+    }
+    for (url, _) in &npm_manifests {
+        match artifact_metadata.get(url) {
+            Some(Ok(Some(manifest))) => {
+                python_metadata.insert(url.clone(), manifest.clone());
+            }
+            Some(Err(detail)) => {
+                if unavailable.insert(url.clone()) {
+                    for dep in candidates
+                        .iter()
+                        .map(|c| &c.dep)
+                        .filter(|d| &d.artifact_url == url)
+                    {
+                        skipped.push(engine::npm_manifest_unavailable(dep, detail));
+                    }
+                }
+            }
+            Some(Ok(None)) | None => {
                 unavailable.insert(url.clone());
             }
         }

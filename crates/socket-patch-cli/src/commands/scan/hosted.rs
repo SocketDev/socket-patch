@@ -898,6 +898,29 @@ pub(crate) async fn run_redirect_selected(
             }
         }
     }
+    // A yarn berry pin takes its `bin:` map from the served tarball's own
+    // package.json, the way yarn builds a tarball entry (#718). Only the
+    // berry entries that carry a `bin:` map need it; a tarball that cannot
+    // be fetched or read drops its patch rather than pin an entry yarn
+    // would rewrite on the next install.
+    for dep in engine::yarn_berry_manifest_targets(&candidates, &read.files) {
+        status.set(format!("Fetching hosted package manifest for {}...", dep.name));
+        match socket_patch_core::hosted::npm_manifest::fetch_hosted_npm_manifest(
+            api_client,
+            &dep.artifact_url,
+            dep.integrity.sha512.as_deref(),
+        )
+        .await
+        {
+            Ok(manifest) => {
+                python_metadata.insert(dep.artifact_url.clone(), manifest);
+            }
+            Err(detail) => {
+                unavailable_python_artifacts.insert(dep.artifact_url.clone());
+                skipped.push(engine::npm_manifest_unavailable(dep, &detail));
+            }
+        }
+    }
     status.finish();
     candidates.retain(|c| !unavailable_python_artifacts.contains(&c.dep.artifact_url));
     // The Pipfile.lock reference shape depends on the installing Pipenv
@@ -2209,6 +2232,9 @@ fn describe_skip_reason(reason: &str) -> String {
             "its vendored state could not be reverted (see the warning)".into()
         }
         "python_metadata_unavailable" => "the hosted wheel's metadata could not be fetched".into(),
+        "npm_manifest_unavailable" => {
+            "the hosted tarball's package.json could not be fetched".into()
+        }
         "redirect_bun_lock_unsupported" | "redirect_bun_lockb_invalid" => {
             "the Bun lockfile blocks the vendored-to-hosted migration (see the warning)".into()
         }

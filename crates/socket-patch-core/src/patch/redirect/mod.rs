@@ -57,8 +57,8 @@ use crate::formats::cargo::hosted::CargoLockPlan;
 #[cfg(test)]
 use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
 #[cfg(test)]
-use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
+use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 mod poetry;
@@ -3401,6 +3401,9 @@ pub fn preflight_yarn_berry_hosted(lock: &str, yarnrc: Option<&str>) -> Result<(
     Ok(())
 }
 
+/// The berry hosted pin without served manifests (every pin keeps the
+/// registry entry's `bin:` map).
+#[cfg(test)]
 fn rewrite_yarn_berry(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
