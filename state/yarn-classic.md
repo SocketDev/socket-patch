@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-02 (run 9), main `203e092`, latest release v4.0.0. Runs 5–9 added the cells in "Run 5 cells" through "Run 9 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-03 (run 10), main `045d7ec`, latest release v4.0.0. Runs 5–10 added the cells in "Run 5 cells" through "Run 10 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -19,17 +19,17 @@ Cells are "pass", "fail #N", "n/a", "CI" or "untested". H = hosted, V = vendored
 | macOS | 1.10.1 / 1.22.22 | pass (probe) | fail #364 | fail #363 | pass | pass | pass | pass | untested | untested |
 | Windows | 1.7.0 / 1.10.1 / 1.22.22 | pass (probe) | fail #364 (1.10.1/1.22.22) | fail #363 (vendored: `Couldn't find the binary git`) | pass | pass | pass | pass | untested | untested |
 
-### Global mode (`-g`) on v5 `2463257`
+### Global mode (`-g`) on v5 `2463257` (rows marked run 10 re-measured on `045d7ec`)
 Report = `scan -g` report-only + no leakage; refusal = `scan -g/--global-prefix/SOCKET_GLOBAL --mode hosted` exits 2; A = agent apply + import + `vex -g` + `rollback -g` byte-exact; get-mode = `get -g --mode hosted|vendored` / `scan -g --mode vendored`; RO = read-only global folder fails loudly.
 
 | OS | yarn | report | refusal | A apply/vex/rollback | get-mode | RO | custom global-folder (space+unicode) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 1.0.2 | fail #437 (still on `203e092`) | pass | fail #437 | fixed (#436 closed by #446; not re-run) | n/a (nothing found) | untested |
-| Linux | 1.10.1 / 1.22.22 | pass | pass | pass | fixed (#436 closed by #446; not re-run) | pass (CI runner) | pass (1.22.22) |
-| macOS | 1.0.2 | fail #437 | pass | fail #437 | fail #436 | n/a | untested |
-| macOS | 1.10.1 / 1.22.22 | pass | pass | pass | fail #436 | pass | untested |
-| Windows | 1.0.2 | fail #437 / #434 (#434 closed by #442; re-run) | pass | fail #434 (closed; re-run) | fail #436 | untested | untested |
-| Windows | 1.10.1 / 1.22.22 | fail #434 (closed by #442; re-run) | pass | fail #434 (closed; re-run) | fail #436 | untested | untested |
+| Linux | 1.6.0 / 1.9.4 / 1.10.1 / 1.22.22 (+ corepack 1.22.22), run 10 | pass | pass | pass | pass (#436 fixed) | pass (CI runner) | pass (all) |
+| macOS | 1.0.2 | fail #437 (run 10) | pass | fail #437 | pass (run 10) | n/a | pass (run 10) |
+| macOS | 1.6.0 / 1.9.4 / 1.10.1 / 1.22.22 (+ corepack), run 10 | pass (after warming the mock, see Known non-bugs) | pass | pass | pass (#436 fixed) | pass | pass |
+| Windows | 1.0.2 | fail #437 (run 10; #434 fixed) | pass | fail #437 | pass (run 10) | untested | pass (run 10) |
+| Windows | 1.6.0 / 1.9.4 / 1.10.1 / 1.22.22 (+ corepack), run 10 | pass (#434 fixed) | pass | pass | pass (#436 fixed) | untested | pass (space+unicode) |
 
 Other cells that pass on Linux 1.22.22 (some also on older releases; see the entries): spaces + unicode project paths (also macOS and Windows), `npm:` alias (H skipped as documented, V rewired), `resolutions`, a `resolved` without the `#sha1` fragment / `integrity`, a local `file:` tarball dep, a non-deduplicated lock, a superseding patch on re-scan, `remove` / `repair`, VEX (installed and lock-only, after `yarn upgrade`), `yarn add` then a frozen reinstall (1.7.0 too), `yarn check --integrity` / `--verify-tree`, in-place reinstalls on 1.7–1.22, concurrent scans (`lock_held`), the GitHub shorthand dep on all 3 OSes.
 
@@ -74,13 +74,21 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Repo suites (redirect / vendor / dev-flow, REQUIRED=1): pass on 1.0.2 / 1.7.0 / 1.22.22.
 - Superseding hosted patch followed by an in-place frozen install: pass on 1.10.1 / 1.17.3 / 1.22.22. 1.0.2 / 1.7.0 skip the copy only when size+mtime match (yarn limitation, see Known non-bugs).
 
+### Run 10 cells (`045d7ec`)
+- Symlinked `yarn.lock` (`yarn.lock -> ../shared/yarn.lock`): hosted refuses (`redirect_symlinked_file_unsupported`); **vendored replaces the link with a regular file, leaving the target unpatched: fail #627** (1.7.0 / 1.10.1 / 1.22.22; npm's `package-lock.json` too). `--dry-run` gives no signal, and rollback doesn't restore the link. yarn itself writes through the link.
+- `yarn.lock` file mode 600 / 444 / 755 preserved through H / V scan + rollback: pass (1.22.22).
+- Patch that changes an existing dependency range (is-odd `is-number ^6 → ^7`): same as #591 (commented). Vendored leaves `^7.0.0` unpinned, and hosted installs 6.0.0 under a manifest that asks for ^7.
+- Agent mode with a `link:` dep: patches the link target outside the project (the code Node loads). Design question, not filed.
+- #467 re-checked: still reproduces (H and V, 1.22.22).
+
 ## Backlog
 
-1. **Maintainer request (global mode):** re-run the Windows global cells now that #442 has merged (#434 closed); also the get-mode cells after #446 (#436 closed); yarn via corepack and the Windows MSI; 1.6.0 / 1.9.4 on the probe; a read-only prefix on Windows (Program Files). #437 (1.0.x) still open.
+1. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows (Program Files; the runner is admin, so it needs a non-admin user). #437 (1.0.x) is still open. Windows / get-mode / corepack / 1.6.0 / 1.9.4 were covered in run 10.
 2. Same-size patched files on yarn ≤1.9 in-place installs: find out which mtime the vendored packer and the Socket hosted tarballs use (the npm 1985 constant would make an upstream→patched same-size change a silent no-op in place).
-3. A manifest-rewriting patch that *changes* an existing dep range (#591 follow-up).
-4. Re-run the v4-only project columns (git dep #363, offline mirror H #364) on macOS/Windows once fixes land; re-check #558 / #519 / #467 once fixed.
-5. `vendor --check` / `repair` on a #591-shaped lock (dangling dependency).
+3. Re-run the v4-only project columns (git dep #363, offline mirror H #364) on macOS/Windows once fixes land; re-check #558 / #519 / #467 once fixed.
+4. `vendor --check` / `repair` on a #591-shaped lock (dangling dependency).
+5. Other symlinked inputs: `.yarnrc` (offline mirror) and `package.json` (`resolutions`) as symlinks, in H / V / rollback; a symlinked `.socket/` dir.
+6. Hosted with a slow or stalled patch API since #581 (connect 10 s / read 60 s): does a stalled hosted tarball download during `yarn install` matter? (that's yarn's own network, so probably n/a)
 
 ## Known non-bugs
 
@@ -121,3 +129,6 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - yarn 1.0.x–1.9.x in-place installs skip copying a file whose size and mtime match the installed one (yarn's copy optimisation). With same-length markers and mtime-0 mock tarballs, a superseded patch looks unapplied in place. Fresh installs and 1.10+ are fine. Use different-length markers in harnesses.
 - A `.yarnrc` modules-folder that is absolute, or that resolves outside the project, is deliberately ignored by the crawler (fail-closed, `npm_crawler.rs` `resolve_modules_folder`).
 - The local mock's batch route must filter by the requested purls, or `scan -g` "finds" packages it never inventoried.
+- **macOS probe harness:** the first TCP connects to a freshly started Python mock on a macOS runner stall for 10–30 s. Before #581 the first `scan -g` simply took ~35 s. Since #581's 10 s connect bound, those batches fail (`api_batch_failed` / "All N API batch queries failed", exit 1). This is a harness artifact: warm the mock with a `curl` loop before the first scan. Once warm, `-g` report / agent / vex pass on macOS.
+- Agent mode patches a `link:` / `yarn link` dependency's target directory, even outside the project. That's the code Node loads; whether to refuse it is a design question.
+- Leftover probe branches (deletion blocked): `bughunt/yarn-classic/20261003-global-rerun`, `bughunt/yarn-classic/20261003-macos-global`.
