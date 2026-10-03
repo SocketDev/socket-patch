@@ -3382,14 +3382,6 @@ mod tests {
         assert!(out.warnings.is_empty());
     }
 
-    /// FALSE-POSITIVE hardening: an install whose record file is MISSING
-    /// (or unreadable — same NotFound class) is not positive evidence, so
-    /// the probe stays quiet instead of prescribing deletion on a tree it
-    /// could not actually read.
-    #[tokio::test]
-    async fn gem_stale_probe_never_warns_without_positive_evidence() {
-        let tmp = tempfile::tempdir().unwrap();
-        let gem_dir = materialize_gem(tmp.path(), GEM_UPSTREAM);
     /// #709: a `.bundle/config` `path` outside the project is refused as an
     /// install (write) root, but bundler still installs into and loads
     /// from it — so the probe must read it, or a stale materialization
@@ -3441,6 +3433,14 @@ mod tests {
         assert!(out.stale_purls.is_empty());
     }
 
+    /// FALSE-POSITIVE hardening: an install whose record file is MISSING
+    /// (or unreadable — same NotFound class) is not positive evidence, so
+    /// the probe stays quiet instead of prescribing deletion on a tree it
+    /// could not actually read.
+    #[tokio::test]
+    async fn gem_stale_probe_never_warns_without_positive_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gem_dir = materialize_gem(tmp.path(), GEM_UPSTREAM);
         std::fs::remove_file(gem_dir.join("lib").join("stale_unit.rb")).unwrap();
         let out = probe(tmp.path(), &one_confirmed(), &one_record()).await;
         assert!(
