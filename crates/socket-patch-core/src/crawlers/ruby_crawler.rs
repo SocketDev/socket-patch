@@ -363,9 +363,13 @@ impl RubyCrawler {
             // is the user's own machine state, so it is trusted like the
             // env var: no containment guard. Bundler's `Settings#path`
             // takes the FIRST tier that sets `path` or `path.system`, so a
-            // local or env setting shadows it entirely.
-            let shadowed = bundle_path_env.is_some_and(|v| !v.is_empty())
-                || Self::app_config_sets_path(cwd, app_config_env).await;
+            // local or env setting shadows it entirely — even an empty env
+            // `BUNDLE_PATH`, which adds no root above but still stops
+            // Bundler (`explicit_path` is `""`). An env
+            // `BUNDLE_PATH__SYSTEM` already dropped `global_config`, see
+            // [`global_path_config_unless_env_path_system`].
+            let shadowed =
+                bundle_path_env.is_some() || Self::app_config_sets_path(cwd, app_config_env).await;
             if !shadowed {
                 if let Some(value) = read_global_config(global_config, false)
                     .await
@@ -1091,13 +1095,33 @@ pub(crate) fn bundler_global_config_file(
 }
 
 /// [`ambient_bundler_global_config_file`], or `None` under
-/// `BUNDLE_IGNORE_CONFIG` — for the install-root probe, which takes no
-/// `ignore_config` flag of its own.
+/// `BUNDLE_IGNORE_CONFIG` or when the environment sets `path.system` — for
+/// the install-root probe, which takes no `ignore_config` flag of its own.
 fn ambient_global_config_unless_ignored(root: &Path) -> Option<PathBuf> {
     if bundler_ignores_config() {
         None
     } else {
-        ambient_bundler_global_config_file(root)
+        global_path_config_unless_env_path_system(
+            ambient_bundler_global_config_file(root),
+            std::env::var_os("BUNDLE_PATH__SYSTEM").as_deref(),
+        )
+    }
+}
+
+/// The global config file for the install-root probe, or `None` when the
+/// env tier sets `path.system`. Bundler's `Settings#path` stops at the
+/// first tier that sets `path` OR `path.system`, and the env tier sits
+/// above the global one, so any `BUNDLE_PATH__SYSTEM` value (even `"false"`
+/// or empty) shadows a global `path` — the env `BUNDLE_PATH` half of that
+/// rule is applied in [`RubyCrawler::discover_bundle_stores_with_env`].
+fn global_path_config_unless_env_path_system(
+    global_config: Option<PathBuf>,
+    path_system_env: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if path_system_env.is_some() {
+        None
+    } else {
+        global_config
     }
 }
 
@@ -2386,6 +2410,17 @@ mod tests {
         .await
         .stores;
         assert!(stores.is_empty(), "{stores:?}");
+        // Even empty: Bundler stops at the env tier (`explicit_path` `""`).
+        let stores = RubyCrawler::discover_bundle_stores_with_env(
+            &root,
+            Some(OsStr::new("")),
+            None,
+            None,
+            g,
+        )
+        .await
+        .stores;
+        assert!(stores.is_empty(), "{stores:?}");
 
         // So does a local `path.system` (bundler stops at the local tier).
         std::fs::create_dir(root.join(".bundle")).unwrap();
@@ -2406,6 +2441,32 @@ mod tests {
             .await
             .stores;
         assert!(stores.is_empty(), "{stores:?}");
+    }
+
+    /// An env `BUNDLE_PATH__SYSTEM` — any value, even `"false"` or empty —
+    /// shadows a global `path` like an env `BUNDLE_PATH` does: Bundler's
+    /// `Settings#path` stops at the env tier (checked against Bundler
+    /// 4.0.17: `explicit_path` is `nil` for each value).
+    #[test]
+    fn env_path_system_shadows_the_global_config_path() {
+        let global = Some(PathBuf::from("/home/u/.bundle/config"));
+        for value in ["true", "false"] {
+            assert_eq!(
+                global_path_config_unless_env_path_system(global.clone(), Some(OsStr::new(value))),
+                None,
+                "BUNDLE_PATH__SYSTEM={value}"
+            );
+        }
+        // Bundler reads an empty value as set too (`explicit_path` nil).
+        assert_eq!(
+            global_path_config_unless_env_path_system(global.clone(), Some(OsStr::new(""))),
+            None
+        );
+        // Unset: the global file still applies.
+        assert_eq!(
+            global_path_config_unless_env_path_system(global.clone(), None),
+            global
+        );
     }
 
     #[tokio::test]
