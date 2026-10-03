@@ -271,16 +271,39 @@ impl Gradle {
         args: &[&str],
         env: &[(&str, &std::ffi::OsStr)],
     ) -> Output {
-        let mut cmd = Self::command(&self.program, Some(home));
-        cmd.current_dir(cwd)
-            .args(["--no-daemon", "--console=plain", "--stacktrace"])
-            .args(&self.extra_args)
-            .args(args);
-        for (k, v) in env {
-            cmd.env(k, v);
+        // The single-use daemon a `--no-daemon` build forks sometimes dies
+        // before it answers on Windows runners ("The first result from the
+        // daemon was empty", `DaemonInitialConnectException`): the build
+        // never reported anything, so it is retried (twice at most). Any
+        // other failure is the build's own and is returned as is.
+        let mut attempt = 0;
+        loop {
+            let mut cmd = Self::command(&self.program, Some(home));
+            cmd.current_dir(cwd)
+                .args(["--no-daemon", "--console=plain", "--stacktrace"])
+                .args(&self.extra_args)
+                .args(args);
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().expect("spawn gradle");
+            attempt += 1;
+            if attempt > 2 || out.status.success() || !daemon_died_unanswered(&out) {
+                return out;
+            }
+            eprintln!(
+                "gradle: the single-use daemon died before answering; retrying ({attempt}/2)"
+            );
         }
-        cmd.output().expect("spawn gradle")
     }
+}
+
+/// Whether a failed Gradle run is the launcher reporting that its forked
+/// daemon died before returning any result (see [`Gradle::run_env`]).
+fn daemon_died_unanswered(out: &Output) -> bool {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    stderr.contains("DaemonInitialConnectException")
+        && stderr.contains("The first result from the daemon was empty")
 }
 
 fn version_part(version: &str, index: usize) -> u32 {
