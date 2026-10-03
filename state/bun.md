@@ -1,12 +1,14 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-03 (run 10), main `045d7ec`, latest release 4.0.0, latest Bun 1.4.2.
+Last updated: 2026-10-03 (run 11), main `045d7ec`, latest release 4.0.0, latest Bun 1.4.2.
 
 Method: real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` to the mock. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
 Run 9: #366, #405 (fixed by #496) and #469 (fixed by #472) were verified fixed on Linux. Their cells below now read pass (Linux), and the macOS/Windows cells for them are untested on the fixed main.
 
 Run 10: #599 still reproduces on `045d7ec`. New: #635 (Bun ≥ 1.3.14 `globalStore`).
+
+Run 11 (main unchanged at `045d7ec`): #599 still reproduces. No new bugs. All the new cells pass: the run 11 section below, and the vendored row of the `globalStore` table.
 
 ## Coverage matrix
 
@@ -38,7 +40,7 @@ Run 10: #599 still reproduces on `045d7ec`. New: #635 (Bun ≥ 1.3.14 `globalSto
 
 | Bun | config | agent: sibling project untouched by apply/rollback | agent: transitive `.bun` entries patched | hosted `vex` on stale/unpatched transitive | vendored |
 | --- | --- | --- | --- | --- | --- |
-| 1.4.2 | bunfig `globalStore = true` | fail #635 | fail #635 | fail #635 (verified) | untested |
+| 1.4.2 | bunfig `globalStore = true` | fail #635 | fail #635 | fail #635 (verified) | pass (run 11: sibling untouched, `vex` verified, no false out-of-sync) |
 | 1.4.2 | `BUN_INSTALL_GLOBAL_STORE=1` | fail #635 | fail #635 | untested | untested |
 | 1.3.14 | bunfig / env | fail #635 | fail #635 | fail #635 | untested |
 | 1.3.13 | bunfig (key ignored) | pass | pass | n/a | n/a |
@@ -49,6 +51,20 @@ No `Authorization` header reaches the hosted tarball host for any of: bunfig def
 
 ### Platform-specific optional deps (run 10, Linux)
 `os`/`cpu` meta (fsevents, @esbuild/darwin-arm64, @esbuild/linux-x64). The hosted rewrite keeps the meta, and Linux frozen installs fetch only linux-x64 (patched), on 1.1.45 v0 + lockb, 1.2.23, 1.3.14, 1.4.2 text + lockb: pass. Hosted rollback is byte-exact (1.4.2): pass. `minimumReleaseAge` with hosted pins (1.4.2): pass.
+
+### Run 11 cells (Linux)
+
+| Cell | Bun | Result |
+| --- | --- | --- |
+| Hosted text lock, patched package with `bin` (semver): meta kept, `.bin` linked after frozen install | 1.4.2 (v2) | pass |
+| Hosted `bun.lockb` (1.1.45 writer) with `bin` + scoped packages, frozen install by each reader | 1.1.45 / 1.2.23 / 1.3.14 / 1.4.2 | pass |
+| `bun update` drops hosted pins; `vex` then refuses (`manifest_not_found`), no false attestation | 1.4.2 | pass |
+| v0 text lock (hosted and vendored), then a plain install migrating it to v1; pins survive; `rollback` / `vendor --revert` after the migration | 1.2.23 / 1.3.14 / 1.4.2 | pass |
+| Name-colliding alias (`"left-pad": "npm:is-number@6.0.0"`), hosted + vendored | 1.4.2 | pass (agent: #356) |
+| v2 isolated workspace with nested version keys: hosted → vendored takeover → `vendor --revert` (byte-exact pre-hosted lock) | 1.4.2 | pass |
+| `bun.lockb` workspace with nested version keys, hosted (writers 1.1.45 and 1.4.2) | readers 1.1.45–1.4.2 | pass (1.1.45 can't read a 1.4.2 lockb, Bun limitation) |
+| Concurrent hosted scans (`lock_held`); lockfile-only hosted `vex` | 1.4.2 | pass |
+| Bun auto-migration of a hosted `package-lock.json` | 1.4.2 | fail-closed until a re-run of `scan --mode hosted` heals it (see Known non-bugs) |
 
 ### Global mode (`-g`, agent; run 3)
 
@@ -138,10 +154,10 @@ Other passes (Linux, 1.4.2 unless noted):
 
 ## Backlog
 
-0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open (re-checked in run 9); re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
-1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still blocked from the sandbox (runs 7–10), so no new probes until then.
-2. #635: re-test when fixed; also vendored and workspaces under `globalStore`, and `globalStore` on macOS/Windows.
-3. #599 follow-ups: the orphan state after a version upgrade, and after hosted → `rollback` → in-place install. Re-test when fixed.
+0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open; re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
+1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still refused from the sandbox (runs 7–11), so no new probes until then.
+2. #635 and #599: re-test when fixed. Also `globalStore` + workspaces, and `globalStore` on macOS/Windows.
+3. Bun auto-migration from `yarn.lock` / `pnpm-lock.yaml` with hosted pins (does it produce the same registry-slot URL tuples as the `package-lock.json` case?).
 4. macOS/Windows re-runs of the #366 / #405 / #469 fixes (Windows isolated uses junctions).
 5. #497 `github:` tuples (needs a probe); re-test #497 when fixed.
 6. The multi-project policy cells on a 1.1.45 lockb repo; `ignorePaths` over workspace members on 1.3.14 / 1.1.45.
@@ -183,3 +199,6 @@ Other passes (Linux, 1.4.2 unless noted):
 - `scan -g` with `BUN_INSTALL_GLOBAL_DIR` set reports the Node global prefix's packages, not Bun's. That's #443, not a new bug.
 - Hosted `vex` attests darwin-only packages (fsevents, @esbuild/darwin-*) on a Linux checkout where they're not installed: the lock pins patched bytes for every platform, so that's correct.
 - Mock fixture: in proxy mode set both `SOCKET_PROXY_URL` and `SOCKET_PATCH_SERVER_URL`. Without the latter, hosted pins aren't recognized and `vex` reports `manifest_not_found`.
+- Bun's auto-migration of a hosted `package-lock.json` writes `bun.lock` registry 4-tuples with the hosted URL in the registry slot (`["left-pad@1.3.0", "http://…/tok/<uuid>/left-pad-1.3.0.tgz", {}, "sha512-…"]`). Bun installs the patched bytes from them. socket-patch fails closed on that shape (`vex` → `patched_ref_unattributable` / `manifest_not_found`, `list` / `rollback` → `hosted_wiring_contested`, no writes), and a re-run of `scan --mode hosted` heals it into the canonical URL tuple. No false attestation, so not filed (run 11). The `vex` detail wording ("from elsewhere (not a Socket patch)") is inaccurate for this shape.
+- `bun update` re-resolves hosted pins back to the registry. That's Bun behaviour, and `vex` correctly stops attesting.
+- A 1.4.2-written `bun.lockb` can't be read by Bun 1.1.45 even without socket-patch.
