@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-03 (run 12), main `045d7ec` (includes #532, #552, #517, #442), latest release tag v4.0.0.
+Last updated: 2026-10-03 (run 13), main `045d7ec` (includes #532, #552, #517, #442), latest release tag v4.0.0.
 
 ## Coverage matrix
 
@@ -95,6 +95,18 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | 2.5.22 | untested | untested | fail #681 | n/a |
 | 2.4.22 | untested | untested | fail #681 | n/a |
 
+### Run 13: hosted lifecycle on more shapes (mock patch API + registry, **real rubygems.org upstream**)
+
+| OS | Ruby | Bundler | `gems.rb` redirect → install → `rollback` → frozen install | `Gemfile` + `gems.rb` twin unwind | CRLF manifest + CRLF lock cycle | `remove` purl / uuid (CRLF `gems.rb`) | Unwind: direct `~>` / `group` + opts | Uppercase name (`ZenTest`), 2-constraint decl | Config `path` outside the project (stale guard + VEX) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Linux | 3.3.6 | 4.0.17 | pass | pass | pass | pass | pass | pass | fail #709 |
+| Linux | 3.3.6 | 2.6.9 | pass | untested | pass | untested | pass | pass | fail #709 |
+| Linux | 3.3.6 | 2.4.22 | converged-lock unwind pass | untested | untested | untested | untested | untested | fail #709 |
+| windows-latest | 3.3 / 3.4 | 2.6.9 / 4.0.17 | pass (`Gemfile` too) | untested | pass | untested | untested | untested | fail #709 (4.0.17, `D:/…`) |
+| macos-latest | 3.3 / 3.4 | 2.6.9 / 4.0.17 | pass (`Gemfile` too) | untested | pass | untested | untested | untested | fail #709 (4.0.17) |
+
+Controls for #709 (Linux, 4.0.17): config `path` relative, config `path` absolute inside the project, env `BUNDLE_PATH` absolute outside the project, and `path.system: true` all pass (stale warning; `vex` refuses `not_applied`).
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -108,14 +120,13 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 
 ## Backlog
 
-1. Re-run #340 / #577 / #652 / #681 when #637 / #621 (or any change to the rewriter or settings layer) merge.
-2. `mirror.<patch-registry-url>`, and `mirror.all` with `fallback_timeout`; `mirror.all` in the global config (overlaps #577).
-3. #577 under `BUNDLE_USER_HOME` (`$BUNDLE_USER_HOME/config`).
-4. Windows hosted and vendored cells: CRLF Gemfile / lock, a `BUNDLE_PATH` with a drive letter or spaces, `x64-mingw-ucrt` platform gems, and `vendor/bundle` deployment mode.
-5. **Maintainer request (still open):** global (`-g`) mode on every OS. Remaining: macOS system Ruby and Homebrew Ruby; rbenv / rvm / chruby / asdf layouts; unicode or space-containing `--global-prefix`; a non-writable dir on macOS and Windows (Program Files); `-g` from inside a project on macOS and Windows.
-6. A symlinked env `BUNDLE_GEMFILE` next to a config `gemfile` (`env_keeps_root` compares lexically): needs a macOS probe (`/var` vs `/private/var`).
-7. #340 on Bundler 2.2–2.5 (Linux). Ruby 3.4 + Bundler 2.2 can't boot; check the floor messaging.
-8. Bundler 2.7.2 hand-driven cells (vendored shapes, hosted unwind), beyond the repo suites.
+1. Re-run #340 / #577 / #652 / #681 / #709 when #637 / #621 / #684 (or any fix for #709) merge. #684 already covers `mirror.<url>` / `fallback_timeout` / `BUNDLE_MIRROR__*`, and #621 covers `BUNDLE_USER_HOME`, so neither needs its own hunt any more.
+2. Windows: `x64-mingw-ucrt` platform gems in hosted and vendored modes; `BUNDLE_DEPLOYMENT=true` with a CRLF lock.
+3. Vendored cells on Windows and macOS (needs a Rust-test probe around `e2e_vendor_gem_build.rs`).
+4. **Maintainer request (still open):** global (`-g`) mode on every OS. Remaining: macOS system Ruby and Homebrew Ruby; rbenv / rvm / chruby / asdf layouts; unicode or space-containing `--global-prefix`; a non-writable dir on macOS and Windows (Program Files); `-g` from inside a project on macOS and Windows.
+5. A symlinked env `BUNDLE_GEMFILE` next to a config `gemfile` (`env_keeps_root` compares lexically): needs a macOS probe (`/var` vs `/private/var`).
+6. #340 on Bundler 2.2–2.5 (Linux); Ruby 2.7 + Bundler 2.2/2.3 hosted unwind (setup-ruby probe).
+7. Bundler 2.7.2 hand-driven cells (vendored shapes, hosted unwind), beyond the repo suites.
 
 ## Known non-bugs
 
@@ -150,3 +161,8 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 - `gem_tail_source_option` matches substrings, so a symbol such as `group: :gitlab_ci` would trip the `:git` refusal. It's fail-closed and contrived, so it's not filed.
 - Vendoring a git-sourced gem (`git:`, `gitlab:`, custom `git_source`) fails closed with `apply_failed` ("GEM specs has no entry"), because the lock check fires before the Gemfile token list matters. It writes nothing, so it's not a #652 twin.
 - On a CHECKSUMS lock whose install failed (nothing installed), the post-install `vex` still attests the redirected gem. That's consistent with the "missing files never prove staleness" rule in CLI_CONTRACT.md.
+- `get <uuid> --mode hosted` for a version the lock doesn't hold pins (and downgrades to) the patched version, adds a second CHECKSUMS entry, and leaves a mixed pair that `rollback` / `remove` can't see (`Manifest not found`) until the prescribed unfrozen `bundle install` converges it (after that, rollback works). The uuid path is documented as exempt from installed narrowing (run 13).
+- Bundler 4 prints "Cannot write a changed lockfile while frozen." (exit 0) for any CRLF lock under `BUNDLE_FROZEN`, including the pristine lock. It's Bundler's own behaviour.
+- The in-place hosted rewrite of a CRLF manifest writes the `source … do` block with LF endings (mixed endings). Bundler, frozen installs and `rollback` accept it, so it's cosmetic.
+- Hosted `rollback` / `remove` can be exercised by hand with no Rust harness: a Python mock of the patch API + the patch-registry compact index (rebuild the real `.gem` with `gem unpack` / `gem spec --ruby` / `gem build`), with rubygems.org as the real upstream. The run-13 entry describes it; the mock must ignore nothing the CLI checks (`registryOverride.identifiers.gemChecksumSha256` = the sha256 of the served `.gem`).
+- `bughunt/bundler/20261003-hosted-xos` is also left behind (`git push --delete` hangs up / 403); its workflow is push-triggered only.
