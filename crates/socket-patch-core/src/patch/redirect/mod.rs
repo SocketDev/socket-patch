@@ -7613,7 +7613,7 @@ mod tests {
 
     /// A Gradle build the hosted Gradle planner refuses (here: a grant whose
     /// uuid does not name its suffix) writes nothing and prints the
-    /// fallback snippet pinning the SUFFIXED version, substitution and
+    /// fallback snippet pinning the SUFFIXED version, request rewrite and
     /// reject block included.
     #[test]
     fn maven_pom_gradle_manual_snippet() {
@@ -7640,10 +7640,10 @@ mod tests {
             "snippet pins the suffixed version: {detail}"
         );
         assert!(
-            detail.contains(&format!("strictly '{MAVEN_SUFFIXED}'"))
-                && detail.contains("substitute module('org.slf4j:slf4j-api')")
+            detail.contains(&format!("d.useVersion('{MAVEN_SUFFIXED}')"))
+                && detail.contains("vs.accept('1.7.36')")
                 && detail.contains("selection.reject("),
-            "snippet carries the pin, the substitution and the reject block: {detail}"
+            "snippet carries the pin, the request rewrite and the reject block: {detail}"
         );
         assert!(
             !detail.contains("fail-closed by repo exclusivity"),

@@ -15,12 +15,18 @@
 //!   uuid comes from [`DiscoverCtx::hosted_uuid`]), and the suffix grammar
 //!   holds (`<base>-socket.<uuid[..8]>`, checked by the row parser);
 //! - every lock entry of the GA in every build's lock files is the
-//!   suffixed version (a lock still at the base, or at another version,
-//!   fails the build or bypasses the pin), and no settings-classpath lock
+//!   suffixed version (a lock still at the base fails the build; one above
+//!   the base resolves an upstream release the pin lets through, so that
+//!   build consumes no patch), and no settings-classpath lock
 //!   (`settings-gradle.lockfile`) names the GA at all: that classpath
 //!   resolves before the script runs, so the pin cannot reach it;
 //! - no build script sets a custom lock-file location (`lockFile`), which
-//!   would hide a lock from the check above.
+//!   would hide a lock from the check above;
+//! - none of the hosted planner's build- or GA-level refusals holds now
+//!   (`pinned_row_refusal`: a settings-classpath declaration, a
+//!   non-literal `includeBuild`, an Android / KMP plugin, a classifier
+//!   request, a user `exclusiveContent` claiming the group, …): a build
+//!   changed after the scan in a way the pin cannot reach stops attesting.
 //!
 //! Anything else is a [`DIAG_REF_INVALID`] naming the index, and no ref.
 //!
@@ -45,7 +51,8 @@ use crate::gradle::eol::eol_eq;
 use crate::gradle::locks;
 use crate::patch::redirect::gradle::{
     apply_line_digest, graph_of, index_digest, is_settings_lock, lockfile_paths, parse_index,
-    settings_targets, GradleFiles, HOSTED_INDEX_REL, HOSTED_SCRIPT, HOSTED_SCRIPT_REL, MAX_ROUNDS,
+    pinned_row_refusal, settings_targets, GradleFiles, HOSTED_INDEX_REL, HOSTED_SCRIPT,
+    HOSTED_SCRIPT_REL, MAX_ROUNDS,
 };
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
@@ -121,6 +128,14 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                                  before the hosted script runs",
                                 e.line
                             )
+                        } else if crate::gradle::selector::gradle_version_cmp(&e.version, &row.base)
+                            .is_gt()
+                        {
+                            format!(
+                                "{rel}:{} locks {ga} at {}, above the patched {}: that build \
+                                 resolves an upstream release, not the pinned {}",
+                                e.line, e.version, row.base, row.suffixed
+                            )
                         } else {
                             format!(
                                 "{rel}:{} locks {ga} at {}, not the pinned {}",
@@ -128,6 +143,15 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                             )
                         }
                     })
+            })
+        });
+        // The planner's own build- and GA-level refusals, re-run over the
+        // build as it is now: a settings classpath or a non-literal
+        // `includeBuild` added after the scan resolves the upstream jar
+        // where the pin never reaches.
+        let problem = problem.or_else(|| {
+            pinned_row_refusal(&files, &graph, &row).map(|(code, detail)| {
+                format!("the hosted planner would refuse it now ({code}): {detail}")
             })
         });
         if let Some(problem) = problem {
@@ -332,6 +356,30 @@ mod tests {
                     p.write(
                         "settings-gradle.lockfile",
                         format!("com.socketfixture:victim:{SFX}=classpath\nempty=\n"),
+                    );
+                }),
+            ),
+            (
+                "a settings-classpath declaration added after the scan",
+                Box::new(|p, f| {
+                    p.write(
+                        "settings.gradle",
+                        format!(
+                            "buildscript {{ dependencies {{ classpath 'com.socketfixture:victim:1.10.0' }} }}\n{}",
+                            f["settings.gradle"]
+                        ),
+                    );
+                }),
+            ),
+            (
+                "a non-literal includeBuild added after the scan",
+                Box::new(|p, f| {
+                    p.write(
+                        "settings.gradle",
+                        format!(
+                            "{}includeBuild(\"$rootDir/../logic\")\n",
+                            f["settings.gradle"]
+                        ),
                     );
                 }),
             ),

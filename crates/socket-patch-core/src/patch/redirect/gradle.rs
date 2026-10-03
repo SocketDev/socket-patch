@@ -22,8 +22,16 @@
 //! request whose selector admits the base to the suffixed version
 //! (dependency substitution plus `eachDependency`), rejects every other
 //! candidate at or below the base, and trips on anything that still
-//! resolves there. Versions above the base resolve (a newer upstream fix);
-//! VEX then withholds the attestation until a rescan.
+//! resolves there. A request that admits the base is pinned like a lock:
+//! a dynamic or range selector resolves the patched version even after a
+//! newer upstream release appears (the Socket repository lists no
+//! versions, so leaving the selector dynamic could find no acceptable
+//! candidate at all), and the planner says so
+//! (`redirect_gradle_dynamic_selector_pinned`). A request whose selector
+//! does not admit the base (an explicit newer version, a lock or
+//! `strictly` above the base, a transitive bump) is left alone and
+//! resolves above the base; discovery then withholds the attestation
+//! where a lock records it.
 //!
 //! Every lock file of every build (`ScriptGraph::lockfile_paths`) has the
 //! base entry rewritten to the suffixed one, and an existing
@@ -52,7 +60,7 @@ use crate::gradle::graph::{
     filter_claims_group, wrapper_version, BuildKind, DeclKind, ScriptGraph, Site,
 };
 use crate::gradle::locks;
-use crate::gradle::selector::{admits, parse_selector};
+use crate::gradle::selector::{admits, gradle_version_cmp, parse_selector, Selector};
 use crate::patch::path_safety::is_canonical_uuid;
 use crate::vendor::jvm::gradle as vendored;
 
@@ -775,76 +783,8 @@ fn plan_dep(
             ),
         ));
     }
-    if graph.settings_classpath_has(&group, &artifact) {
-        return Err(refusal(
-            "redirect_gradle_settings_classpath",
-            format!(
-                "{ga} is on a settings-script classpath, which Gradle resolves before the hosted \
-                 settings script runs"
-            ),
-        ));
-    }
-    // A settings plugin can pull the GA in transitively, which no literal
-    // declaration shows; its settings-classpath lock does.
-    if let Some(rel) = lock_paths.iter().find(|rel| {
-        is_settings_lock(rel)
-            && files.get(*rel).is_some_and(|t| {
-                locks::parse(t)
-                    .entries_of(&group, &artifact)
-                    .next()
-                    .is_some()
-            })
-    }) {
-        return Err(refusal(
-            "redirect_gradle_settings_classpath",
-            format!(
-                "{rel} locks {ga} on a settings-script classpath, which Gradle resolves before \
-                 the hosted settings script runs"
-            ),
-        ));
-    }
-    let decls = graph.declarations_of(&group, &artifact);
-    if let Some(d) = decls.iter().find(|d| d.kind == DeclKind::Classifier) {
-        return Err(refusal(
-            "redirect_gradle_classifier_declared",
-            format!(
-                "{}:{} requests {ga} with classifier `{}`, which the Socket repository does not \
-                 serve",
-                d.rel,
-                d.line,
-                d.classifier.as_deref().unwrap_or_default()
-            ),
-        ));
-    }
-    if let Some((d, strict)) = decls.iter().find_map(|d| {
-        let strict = d.rich.as_ref()?.strictly.as_deref()?;
-        (admits(&parse_selector(strict), &base) == Some(false)).then_some((d, strict))
-    }) {
-        return Err(refusal(
-            "redirect_gradle_range_declared",
-            format!(
-                "{}:{} declares {ga} `strictly {strict}`, which excludes the patched {base}; \
-                 the pin would fail every resolution",
-                d.rel, d.line
-            ),
-        ));
-    }
-    if let Some(f) = graph.exclusive_content_filters().into_iter().find(|f| {
-        !f.rel.starts_with(".socket/")
-            && !f
-                .repo_strings
-                .iter()
-                .any(|s| s == REPO_NAME_PREFIX || s.starts_with(&format!("{REPO_NAME_PREFIX}_")))
-            && filter_claims_group(f, &group, &artifact)
-    }) {
-        return Err(refusal(
-            "redirect_gradle_exclusive_content_conflict",
-            format!(
-                "{}:{} routes {group} to another repository with exclusiveContent; drop {ga} \
-                 from it",
-                f.rel, f.line
-            ),
-        ));
+    if let Some(r) = ga_refusal(files, graph, lock_paths, &group, &artifact, &base) {
+        return Err(r);
     }
     let replaces = match rows.iter().find(|r| r.ga() == ga) {
         Some(r) if r.base != base => {
@@ -866,15 +806,18 @@ fn plan_dep(
         let conflict = state
             .entries_of(&group, &artifact)
             .find(|e| {
-                e.version != base && e.version != suffixed && Some(&e.version) != replaces.as_ref()
+                e.version != base
+                    && e.version != suffixed
+                    && Some(&e.version) != replaces.as_ref()
+                    && !above_base(&e.version, &base)
             })
             .cloned();
         if let Some(e) = conflict {
             return Err(refusal(
                 "redirect_gradle_lock_conflict",
                 format!(
-                    "{rel}:{} locks {ga} at {}, neither the patched {base} nor {suffixed}; \
-                     re-lock (`--write-locks`) first",
+                    "{rel}:{} locks {ga} at {}, below the patched {base} (and not {suffixed}), \
+                     which the pin would reject; re-lock (`--write-locks`) first",
                     e.line, e.version
                 ),
             ));
@@ -890,6 +833,141 @@ fn plan_dep(
             .map(bare_sha256_hex)
             .filter(|s| crate::utils::digest::is_hex64_lower(s)),
     })
+}
+
+/// The planner's refusals that depend only on the build and the GA (not
+/// on the grant or the index): a settings-classpath declaration or lock,
+/// a classifier request, a `strictly` that admits nothing the pin lets
+/// resolve, a user `exclusiveContent` claiming the group. Discovery re-runs
+/// them, so a build changed after the scan stops attesting.
+fn ga_refusal(
+    files: &BTreeMap<String, String>,
+    graph: &ScriptGraph,
+    lock_paths: &[String],
+    group: &str,
+    artifact: &str,
+    base: &str,
+) -> Option<Refusal> {
+    let ga = format!("{group}:{artifact}");
+    if graph.settings_classpath_has(group, artifact) {
+        return Some(refusal(
+            "redirect_gradle_settings_classpath",
+            format!(
+                "{ga} is on a settings-script classpath, which Gradle resolves before the hosted \
+                 settings script runs"
+            ),
+        ));
+    }
+    // A settings plugin can pull the GA in transitively, which no literal
+    // declaration shows; its settings-classpath lock does.
+    if let Some(rel) = lock_paths.iter().find(|rel| {
+        is_settings_lock(rel)
+            && files
+                .get(*rel)
+                .is_some_and(|t| locks::parse(t).entries_of(group, artifact).next().is_some())
+    }) {
+        return Some(refusal(
+            "redirect_gradle_settings_classpath",
+            format!(
+                "{rel} locks {ga} on a settings-script classpath, which Gradle resolves before \
+                 the hosted settings script runs"
+            ),
+        ));
+    }
+    let decls = graph.declarations_of(group, artifact);
+    if let Some(d) = decls.iter().find(|d| d.kind == DeclKind::Classifier) {
+        return Some(refusal(
+            "redirect_gradle_classifier_declared",
+            format!(
+                "{}:{} requests {ga} with classifier `{}`, which the Socket repository does not \
+                 serve",
+                d.rel,
+                d.line,
+                d.classifier.as_deref().unwrap_or_default()
+            ),
+        ));
+    }
+    // A `strictly` above the base (a newer upstream fix) is left to
+    // resolve, as the script lets it; one that only admits versions at or
+    // below the base would fail every resolution under the pin.
+    if let Some((d, strict)) = decls.iter().find_map(|d| {
+        let strict = d.rich.as_ref()?.strictly.as_deref()?;
+        let sel = parse_selector(strict);
+        (admits(&sel, base) == Some(false) && !may_admit_above(&sel, base)).then_some((d, strict))
+    }) {
+        return Some(refusal(
+            "redirect_gradle_range_declared",
+            format!(
+                "{}:{} declares {ga} `strictly {strict}`, which excludes the patched {base}; \
+                 the pin would fail every resolution",
+                d.rel, d.line
+            ),
+        ));
+    }
+    if let Some(f) = graph.exclusive_content_filters().into_iter().find(|f| {
+        !f.rel.starts_with(".socket/")
+            && !f
+                .repo_strings
+                .iter()
+                .any(|s| s == REPO_NAME_PREFIX || s.starts_with(&format!("{REPO_NAME_PREFIX}_")))
+            && filter_claims_group(f, group, artifact)
+    }) {
+        return Some(refusal(
+            "redirect_gradle_exclusive_content_conflict",
+            format!(
+                "{}:{} routes {group} to another repository with exclusiveContent; drop {ga} \
+                 from it",
+                f.rel, f.line
+            ),
+        ));
+    }
+    None
+}
+
+/// Why the hosted wiring of `row` no longer holds in the build `files`
+/// holds, by the planner's own build- and GA-level refusals (see
+/// [`ga_refusal`]): `(code, detail)`. Discovery's re-check of a pin made
+/// before the build changed.
+pub(crate) fn pinned_row_refusal(
+    files: &BTreeMap<String, String>,
+    graph: &ScriptGraph,
+    row: &HostedRow,
+) -> Option<(&'static str, String)> {
+    let lock_paths = lockfile_paths(graph, files);
+    project_refusal(files, graph, &Ok(Vec::new()))
+        .or_else(|| {
+            ga_refusal(
+                files,
+                graph,
+                &lock_paths,
+                &row.group,
+                &row.artifact,
+                &row.base,
+            )
+        })
+        .map(|r| (r.code, r.detail))
+}
+
+/// Whether `version` orders above `base` (Gradle's ordering): a newer
+/// upstream release the hosted script lets resolve.
+fn above_base(version: &str, base: &str) -> bool {
+    gradle_version_cmp(version, base) == std::cmp::Ordering::Greater
+}
+
+/// Whether selector `sel` may admit some version above `base` (unknown
+/// selectors may).
+fn may_admit_above(sel: &Selector, base: &str) -> bool {
+    match sel {
+        Selector::Exact(v) => above_base(v, base),
+        Selector::Range { upper, .. } => {
+            upper.as_ref().is_none_or(|b| above_base(&b.version, base))
+        }
+        Selector::Prefix(p) => {
+            let p = p.trim_end_matches(['.', '-', '_']);
+            p.is_empty() || above_base(p, base)
+        }
+        Selector::Latest(_) | Selector::Unknown => true,
+    }
 }
 
 /// Whether the hosted planner would refuse `dep` in the build `files`
@@ -954,6 +1032,70 @@ fn coords_of(dep: &DepOverride) -> (String, String) {
     (group, artifact)
 }
 
+/// The start tag the planner writes for a row's component.
+pub(crate) fn component_tag(row: &HostedRow) -> String {
+    format!(
+        "<component group=\"{}\" name=\"{}\" version=\"{}\">",
+        row.group, row.artifact, row.suffixed
+    )
+}
+
+pub(crate) fn has_component(text: &str, row: &HostedRow) -> bool {
+    text.contains(&component_tag(row))
+}
+
+/// `text` without the row's component, when it is still exactly what the
+/// planner wrote: its artifacts are the suffixed jar, pom and (optionally)
+/// module, each holding one socket-patch sha256 (the jar's and pom's the
+/// row's own). The component's lines go with it.
+pub(crate) fn without_component(text: &str, row: &HostedRow) -> Option<String> {
+    let tag = component_tag(row);
+    let start = text.find(&tag)?;
+    let close = "</component>";
+    let end = start + text[start..].find(close)? + close.len();
+    let block = &text[start + tag.len()..end - close.len()];
+    let (a, v) = (&row.artifact, &row.suffixed);
+    let artifact_re = regex::Regex::new(
+        r#"^\s*<artifact name="([^"]+)">\s*<sha256 value="([0-9a-f]{64})" origin="socket-patch"/>\s*</artifact>"#,
+    )
+    .expect("static artifact regex is valid");
+    let mut rest = block;
+    let mut names = Vec::new();
+    while let Some(c) = artifact_re.captures(rest) {
+        let (name, sha) = (c[1].to_string(), c[2].to_string());
+        let want = if name == format!("{a}-{v}.jar") {
+            Some(&row.jar_sha256)
+        } else if name == format!("{a}-{v}.pom") {
+            Some(&row.pom_sha256)
+        } else if name == format!("{a}-{v}.module") {
+            None
+        } else {
+            return None;
+        };
+        if want.is_some_and(|w| *w != sha) {
+            return None;
+        }
+        names.push(name);
+        rest = &rest[c.get(0).expect("whole match").end()..];
+    }
+    if !rest.trim().is_empty() || !names.iter().any(|n| n.ends_with(".jar")) {
+        return None;
+    }
+    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    let lead_blank = text[line_start..start].trim().is_empty();
+    let after = &text[end..];
+    let line_end = if after.starts_with("\r\n") {
+        end + 2
+    } else if after.starts_with('\n') {
+        end + 1
+    } else {
+        end
+    };
+    let cut_start = if lead_blank { line_start } else { start };
+    let cut_end = if lead_blank { line_end } else { end };
+    Some(format!("{}{}", &text[..cut_start], &text[cut_end..]))
+}
+
 /// The verification component for an accepted row.
 fn verification_edit(text: &str, a: &Accepted) -> Result<String, String> {
     let patch = crate::vendor::jvm::JvmPatch {
@@ -974,7 +1116,23 @@ fn verification_edit(text: &str, a: &Accepted) -> Result<String, String> {
     };
     let (start, end, to) = vendored::update_verification_component(text, &patch, &hashes, None)
         .map_err(|r| r.detail)?;
-    Ok(format!("{}{to}{}", &text[..start], &text[end..]))
+    let mut text = format!("{}{to}{}", &text[..start], &text[end..]);
+    // The component may predate this run (a re-scan): its pom and module
+    // entries are socket-patch's too, so each is set, not only the jar's.
+    // A component first written while the service served no `.module`
+    // gains the module entry once a grant carries its digest; without it
+    // Gradle fails verification of the `.module` it then downloads.
+    let extra = [
+        ("pom", Some(&a.row.pom_sha256)),
+        ("module", a.module_sha256.as_ref()),
+    ];
+    for (extension, sha) in extra {
+        let Some(sha) = sha else { continue };
+        let (start, end, to) = vendored::set_verification_artifact(&text, &patch, extension, sha)
+            .map_err(|r| r.detail)?;
+        text = format!("{}{to}{}", &text[..start], &text[end..]);
+    }
+    Ok(text)
 }
 
 /// Plan the hosted Gradle wiring for every maven dep (see the module docs).
@@ -1007,6 +1165,7 @@ pub(crate) fn rewrite_gradle_hosted(
     let any_lock = !lock_paths.is_empty();
 
     let mut verification = files.get(VERIFICATION_REL).cloned();
+    let mut left_components: Vec<RewriteWarning> = Vec::new();
     let mut accepted: Vec<Accepted> = Vec::new();
     for dep in maven {
         result.gradle_uuids.insert(dep.patch_uuid.clone());
@@ -1045,6 +1204,30 @@ pub(crate) fn rewrite_gradle_hosted(
                     }
                 }
             }
+            // A replaced patch's component goes with its row, when it is
+            // still exactly what the planner wrote (the restore only ever
+            // removes the current row's).
+            if let (Some(text), Some(old)) = (
+                &verification,
+                a.replaces
+                    .as_ref()
+                    .and_then(|_| rows.iter().find(|r| r.ga() == a.row.ga())),
+            ) {
+                match without_component(text, old) {
+                    Some(next) => verification = Some(next),
+                    None if has_component(text, old) => left_components.push(RewriteWarning {
+                        code: "redirect_gradle_verification_component_left".into(),
+                        detail: format!(
+                            "{VERIFICATION_REL} keeps the {}:{} component of the replaced \
+                             patch, which was changed after socket-patch added it; remove it \
+                             if nothing else needs it",
+                            old.ga(),
+                            old.suffixed
+                        ),
+                    }),
+                    None => {}
+                }
+            }
             Ok(a)
         });
         match planned {
@@ -1055,6 +1238,7 @@ pub(crate) fn rewrite_gradle_hosted(
     if accepted.is_empty() {
         return;
     }
+    result.warnings.extend(left_components);
 
     // The index: earlier rows (other GAs) plus this run's.
     let mut new_rows: Vec<HostedRow> = rows
@@ -1190,17 +1374,62 @@ pub(crate) fn rewrite_gradle_hosted(
     });
     for a in &accepted {
         let r = &a.row;
+        // Every lock entry pins the suffixed version, or a release above
+        // the base the script lets resolve (VEX withholds while one does).
         let locked = lock_paths.iter().all(|rel| {
             final_text(rel).is_none_or(|t| {
                 locks::parse(t)
                     .entries_of(&r.group, &r.artifact)
-                    .all(|e| e.version == r.suffixed)
+                    .all(|e| e.version == r.suffixed || above_base(&e.version, &r.base))
             })
         });
         if script_ok && applied && locked && final_rows.contains(r) {
             result.confirmed_gradle_uuids.insert(r.uuid.clone());
         } else {
             result.refused_gradle_uuids.insert(r.uuid.clone());
+        }
+        let dynamic: Vec<String> = graph
+            .declarations_of(&r.group, &r.artifact)
+            .iter()
+            .flat_map(|d| {
+                let rich = d.rich.as_ref();
+                [
+                    d.version.as_deref(),
+                    rich.and_then(|v| v.strictly.as_deref()),
+                    rich.and_then(|v| v.require.as_deref()),
+                    rich.and_then(|v| v.prefer.as_deref()),
+                ]
+                .into_iter()
+                .flatten()
+                .filter(|sel| {
+                    let parsed = parse_selector(sel);
+                    matches!(
+                        parsed,
+                        Selector::Range { .. } | Selector::Prefix(_) | Selector::Latest(_)
+                    ) && admits(&parsed, &r.base) != Some(false)
+                })
+                .map(|sel| format!("{}:{} `{sel}`", d.rel, d.line))
+                .collect::<Vec<_>>()
+            })
+            .collect();
+        if let Some(first) = dynamic.first() {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_gradle_dynamic_selector_pinned".into(),
+                detail: format!(
+                    "{first}{} requests {} with a dynamic version; the hosted pin resolves the \
+                     patched {} for every selector that admits {}, so a newer upstream release \
+                     the selector also admits is not picked up while the patch is in place. \
+                     Declare the newer version explicitly (it resolves above the patch) or roll \
+                     the patch back once upstream fixes it",
+                    match dynamic.len() {
+                        1 => String::new(),
+                        n => format!(" (and {} more)", n - 1),
+                    },
+                    r.ga(),
+                    r.suffixed,
+                    r.base
+                ),
+            });
         }
         if a.module_sha256.is_none() {
             result.warnings.push(RewriteWarning {
@@ -1289,10 +1518,13 @@ fn refuse(
 }
 
 /// The paste-able fallback for a refused dep, in each DSL the build uses
-/// (labelled when there are two). With a suffixed version it routes only
-/// that version to the Socket repository, pins it `strictly`, substitutes
-/// every request of the GA and rejects every other candidate; for a
-/// same-GAV grant it can only route the base version (not fail-closed).
+/// (labelled when there are two). With a suffixed version it follows the
+/// owned script's rules: it routes only that version to the Socket
+/// repository, rewrites every request whose selector admits the base to
+/// it, and rejects every other candidate at or below the base, so a
+/// version above the base (a newer upstream fix) still resolves. It adds
+/// no dependency of its own, so it pastes into any project. For a same-GAV
+/// grant it can only route the base version (not fail-closed).
 #[allow(clippy::too_many_arguments)]
 pub fn fallback_snippet(
     dsls: &[Dsl],
@@ -1309,7 +1541,10 @@ pub fn fallback_snippet(
          script of every project that resolves it",
     );
     match suffixed {
-        Some(_) => out.push_str(" (it pins the patched version and fails the build on any other)"),
+        Some(_) => out.push_str(
+            " (it moves every request of the patched version to the patched build and fails \
+             the build on any other version at or below it)",
+        ),
         None => out.push_str(
             " (served at the original version, so a Socket-repository failure falls back to \
              the unpatched artifact)",
@@ -1337,6 +1572,12 @@ pub fn fallback_snippet(
     out
 }
 
+/// The package of Gradle's own version parser, comparator and selector
+/// scheme (internal, stable from 6.9 through 9.x: the hosted suite's golden
+/// check runs them), which the fallback snippet orders and matches with so
+/// it pins exactly what the owned script pins.
+const STRATEGY: &str = "org.gradle.api.internal.artifacts.ivyservice.ivyresolve.strategy";
+
 fn snippet(
     dsl: Dsl,
     url: &str,
@@ -1356,13 +1597,11 @@ fn snippet(
         ),
         (Dsl::Groovy, Some(s)) => format!(
             "repositories {{\n    exclusiveContent {{\n        forRepository {{ maven {{ url '{url}' }} }}\n        filter {{ includeVersion('{g}', '{a}', '{s}') }}\n    }}\n}}\n\
-             dependencies {{\n    implementation('{g}:{a}') {{ version {{ strictly '{s}' }} }}\n}}\n\
-             configurations.configureEach {{\n    resolutionStrategy.dependencySubstitution {{\n        substitute module('{g}:{a}') using module('{g}:{a}:{s}')\n    }}\n    resolutionStrategy.componentSelection.all {{ ComponentSelection selection ->\n        if (selection.candidate.group == '{g}' && selection.candidate.module == '{a}' && selection.candidate.version != '{s}') {{\n            selection.reject('socket-patch: only {s} (hosted patch {uuid}) may resolve')\n        }}\n    }}\n}}"
+             configurations.configureEach {{\n    resolutionStrategy.eachDependency {{ DependencyResolveDetails d ->\n        def sel = d.requested.version\n        if (d.requested.group == '{g}' && d.requested.name == '{a}' && sel && sel != '{s}') {{\n            def p = new {STRATEGY}.VersionParser()\n            def vs = new {STRATEGY}.DefaultVersionSelectorScheme(new {STRATEGY}.DefaultVersionComparator(), p).parseSelector(sel)\n            if (!vs.requiresMetadata() && vs.accept('{base}')) {{\n                d.useVersion('{s}')\n                d.because('socket-patch hosted patch {uuid}')\n            }}\n        }}\n    }}\n    resolutionStrategy.componentSelection.all {{ ComponentSelection selection ->\n        def c = selection.candidate\n        def p = new {STRATEGY}.VersionParser()\n        def order = new {STRATEGY}.DefaultVersionComparator().asVersionComparator()\n        if (c.group == '{g}' && c.module == '{a}' && c.version != '{s}' && order.compare(p.transform(c.version), p.transform('{base}')) <= 0) {{\n            selection.reject('socket-patch: only {s} (hosted patch {uuid}) may resolve at or below {base}')\n        }}\n    }}\n}}"
         ),
         (Dsl::Kotlin, Some(s)) => format!(
             "repositories {{\n    exclusiveContent {{\n        forRepository {{ maven {{ url = uri(\"{url}\") }} }}\n        filter {{ includeVersion(\"{g}\", \"{a}\", \"{s}\") }}\n    }}\n}}\n\
-             dependencies {{\n    implementation(\"{g}:{a}\") {{ version {{ strictly(\"{s}\") }} }}\n}}\n\
-             configurations.configureEach {{\n    resolutionStrategy.dependencySubstitution {{\n        substitute(module(\"{g}:{a}\")).using(module(\"{g}:{a}:{s}\"))\n    }}\n    resolutionStrategy.componentSelection.all {{\n        if (candidate.group == \"{g}\" && candidate.module == \"{a}\" && candidate.version != \"{s}\") {{\n            reject(\"socket-patch: only {s} (hosted patch {uuid}) may resolve\")\n        }}\n    }}\n}}"
+             configurations.configureEach {{\n    resolutionStrategy.eachDependency {{\n        val sel = requested.version\n        if (requested.group == \"{g}\" && requested.name == \"{a}\" && !sel.isNullOrEmpty() && sel != \"{s}\") {{\n            val p = {STRATEGY}.VersionParser()\n            val vs = {STRATEGY}.DefaultVersionSelectorScheme({STRATEGY}.DefaultVersionComparator(), p).parseSelector(sel)\n            if (!vs.requiresMetadata() && vs.accept(\"{base}\")) {{\n                useVersion(\"{s}\")\n                because(\"socket-patch hosted patch {uuid}\")\n            }}\n        }}\n    }}\n    resolutionStrategy.componentSelection.all {{\n        val p = {STRATEGY}.VersionParser()\n        val order = {STRATEGY}.DefaultVersionComparator().asVersionComparator()\n        if (candidate.group == \"{g}\" && candidate.module == \"{a}\" && candidate.version != \"{s}\" && order.compare(p.transform(candidate.version), p.transform(\"{base}\")) <= 0) {{\n            reject(\"socket-patch: only {s} (hosted patch {uuid}) may resolve at or below {base}\")\n        }}\n    }}\n}}"
         ),
     }
 }
@@ -1703,6 +1942,159 @@ mod tests {
         assert!(!r.files.contains_key("gradle/verification-metadata.xml"));
     }
 
+    /// #646 review: a component written while the service served no
+    /// `.module` (jar and pom only) gains the module entry on the rescan
+    /// whose grant carries `mavenModuleSha256`; the rerun after that is a
+    /// no-op.
+    #[test]
+    fn a_rescan_adds_the_module_entry_to_an_existing_component() {
+        let vm = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<verification-metadata>\n   <components/>\n</verification-metadata>\n";
+        let input = files(&[
+            ("settings.gradle", ""),
+            ("gradle/verification-metadata.xml", vm),
+        ]);
+        let mut no_module = dep();
+        no_module
+            .registry_override
+            .as_mut()
+            .unwrap()
+            .identifiers
+            .maven_module_sha256 = None;
+        let first = rewrite_registry_redirect(&input, &[no_module]);
+        let first_vm = &first.files["gradle/verification-metadata.xml"];
+        assert!(!first_vm.contains(".module"), "{first_vm}");
+        let after = applied(input, &first);
+        let second = rewrite_registry_redirect(&after, &[dep()]);
+        let out = &second.files["gradle/verification-metadata.xml"];
+        let module = format!(
+            "<artifact name=\"{A}-{SFX}.module\">\n            <sha256 value=\"{}\" origin=\"socket-patch\"/>",
+            "d".repeat(64)
+        );
+        assert!(out.contains(&module), "{out}");
+        assert_eq!(out.matches("<component ").count(), 1, "{out}");
+        // Name order, as Gradle writes them: jar, module, pom.
+        let (jar, module, pom) = (
+            out.find(&format!("{A}-{SFX}.jar")).unwrap(),
+            out.find(&format!("{A}-{SFX}.module")).unwrap(),
+            out.find(&format!("{A}-{SFX}.pom")).unwrap(),
+        );
+        assert!(jar < module && module < pom, "{out}");
+        let again = rewrite_registry_redirect(&applied(after, &second), &[dep()]);
+        assert!(
+            !again.files.contains_key("gradle/verification-metadata.xml"),
+            "idempotent"
+        );
+    }
+
+    /// #646 review: a new patch of the same GAV drops the replaced
+    /// patch's component (still as the planner wrote it), so a later
+    /// restore leaves nothing of either behind.
+    #[test]
+    fn a_replaced_patch_drops_its_verification_component() {
+        let vm = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<verification-metadata>\n   <components/>\n</verification-metadata>\n";
+        let input = files(&[
+            ("settings.gradle", ""),
+            ("gradle/verification-metadata.xml", vm),
+        ]);
+        let first = rewrite_registry_redirect(&input, &[dep_for(UUID2, A, BASE)]);
+        let old_sfx = suffixed_version(BASE, UUID2);
+        assert!(first.files["gradle/verification-metadata.xml"].contains(&old_sfx));
+        let after = applied(input, &first);
+        let second = rewrite_registry_redirect(&after, &[dep()]);
+        assert!(second.confirmed_gradle_uuids.contains(UUID));
+        let out = &second.files["gradle/verification-metadata.xml"];
+        assert!(!out.contains(&old_sfx), "{out}");
+        assert!(out.contains(&format!("version=\"{SFX}\"")), "{out}");
+        // Edited by hand: kept, and reported.
+        let edited = files(&[
+            ("settings.gradle", ""),
+            (
+                "gradle/verification-metadata.xml",
+                &first.files["gradle/verification-metadata.xml"]
+                    .replace("</component>", "   <!-- mine -->\n      </component>"),
+            ),
+            (HOSTED_INDEX_REL, &first.files[HOSTED_INDEX_REL]),
+        ]);
+        let r = rewrite_registry_redirect(&edited, &[dep()]);
+        assert!(r.files["gradle/verification-metadata.xml"].contains(&old_sfx));
+        assert!(codes(&r).contains(&"redirect_gradle_verification_component_left"));
+    }
+
+    /// #646 review (decision 3): a lock or `strictly` ABOVE the base is a
+    /// newer upstream fix the script lets resolve, not a conflict: the GA
+    /// is still pinned where the base resolves.
+    #[test]
+    fn locks_and_strict_versions_above_the_base_are_not_conflicts() {
+        let input = files(&[
+            ("settings.gradle", "include 'a', 'b'\n"),
+            (
+                "a/build.gradle",
+                "dependencies { implementation 'com.socketfixture:victim:1.10.0' }\n",
+            ),
+            (
+                "b/build.gradle",
+                "dependencies { implementation('com.socketfixture:victim') { version { strictly '1.11.0' } } }\n",
+            ),
+            (
+                "a/gradle.lockfile",
+                "com.socketfixture:victim:1.10.0=runtimeClasspath\nempty=\n",
+            ),
+            (
+                "b/gradle.lockfile",
+                "com.socketfixture:victim:1.11.0=runtimeClasspath\nempty=\n",
+            ),
+        ]);
+        let r = rewrite_registry_redirect(&input, &[dep()]);
+        assert!(r.confirmed_gradle_uuids.contains(UUID), "{:?}", r.warnings);
+        assert_eq!(
+            r.files["a/gradle.lockfile"],
+            format!("com.socketfixture:victim:{SFX}=runtimeClasspath\nempty=\n")
+        );
+        assert!(!r.files.contains_key("b/gradle.lockfile"));
+        // A strictly that admits only versions below the base still refuses.
+        assert_refused(
+            &[
+                ("settings.gradle", ""),
+                (
+                    "build.gradle",
+                    "dependencies { implementation('com.socketfixture:victim') { version { strictly '1.9.0' } } }\n",
+                ),
+            ],
+            dep(),
+            "redirect_gradle_range_declared",
+        );
+    }
+
+    /// A dynamic selector admitting the base is pinned like a lock; the
+    /// planner says so.
+    #[test]
+    fn a_dynamic_selector_is_reported_pinned() {
+        let input = files(&[
+            ("settings.gradle", ""),
+            (
+                "build.gradle",
+                "dependencies { implementation 'com.socketfixture:victim:[1.9,)' }\n",
+            ),
+        ]);
+        let r = rewrite_registry_redirect(&input, &[dep()]);
+        assert!(r.confirmed_gradle_uuids.contains(UUID));
+        let w = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_gradle_dynamic_selector_pinned")
+            .unwrap_or_else(|| panic!("{:?}", r.warnings));
+        assert!(w.detail.contains("build.gradle:1 `[1.9,)`"), "{}", w.detail);
+        let exact = files(&[
+            ("settings.gradle", ""),
+            (
+                "build.gradle",
+                "dependencies { implementation 'com.socketfixture:victim:1.10.0' }\n",
+            ),
+        ]);
+        let r = rewrite_registry_redirect(&exact, &[dep()]);
+        assert!(!codes(&r).contains(&"redirect_gradle_dynamic_selector_pinned"));
+    }
+
     fn assert_refused(input: &[(&str, &str)], dep: DepOverride, code: &str) -> RewriteResult {
         let r = rewrite_registry_redirect(&files(input), std::slice::from_ref(&dep));
         assert!(
@@ -1807,7 +2199,7 @@ mod tests {
                 s,
                 (
                     "gradle.lockfile",
-                    "com.socketfixture:victim:1.11=runtimeClasspath\n",
+                    "com.socketfixture:victim:1.9=runtimeClasspath\n",
                 ),
             ],
             dep(),
@@ -1937,7 +2329,7 @@ mod tests {
                 vendored,
                 (
                     "gradle.lockfile",
-                    "com.socketfixture:victim:1.11=runtimeClasspath\n",
+                    "com.socketfixture:victim:1.9=runtimeClasspath\n",
                 ),
             ]),
             &dep(),
@@ -2009,12 +2401,26 @@ mod tests {
             true,
         );
         let want_groovy = format!(
-            "repositories {{\n    exclusiveContent {{\n        forRepository {{ maven {{ url '{u}' }} }}\n        filter {{ includeVersion('{G}', '{A}', '{SFX}') }}\n    }}\n}}\n\
-             dependencies {{\n    implementation('{G}:{A}') {{ version {{ strictly '{SFX}' }} }}\n}}\n\
-             configurations.configureEach {{\n    resolutionStrategy.dependencySubstitution {{\n        substitute module('{G}:{A}') using module('{G}:{A}:{SFX}')\n    }}\n    resolutionStrategy.componentSelection.all {{ ComponentSelection selection ->\n        if (selection.candidate.group == '{G}' && selection.candidate.module == '{A}' && selection.candidate.version != '{SFX}') {{\n            selection.reject('socket-patch: only {SFX} (hosted patch {UUID}) may resolve')\n        }}\n    }}\n}}",
+            "repositories {{\n    exclusiveContent {{\n        forRepository {{ maven {{ url '{u}' }} }}\n        filter {{ includeVersion('{G}', '{A}', '{SFX}') }}\n    }}\n}}\n",
             u = url(UUID)
         );
         assert!(groovy.contains(&want_groovy), "{groovy}");
+        // #646 review: the owned script's rules, not a blanket pin. Only
+        // a selector admitting the base is rewritten, only candidates at
+        // or below the base are rejected (Gradle's own ordering), and no
+        // dependency is declared (a project without the java plugin has
+        // no `implementation`).
+        for want in [
+            format!("vs.accept('{BASE}')"),
+            format!("d.useVersion('{SFX}')"),
+            format!("order.compare(p.transform(c.version), p.transform('{BASE}')) <= 0"),
+            format!("{STRATEGY}.DefaultVersionSelectorScheme"),
+        ] {
+            assert!(groovy.contains(&want), "{want}: {groovy}");
+        }
+        for unwanted in ["strictly", "implementation(", "substitute module"] {
+            assert!(!groovy.contains(unwanted), "{unwanted}: {groovy}");
+        }
         assert!(groovy.contains("--write-locks"));
         // #348: the Kotlin DSL assigns the url with `uri(…)`.
         let kotlin = fallback_snippet(
@@ -2028,11 +2434,19 @@ mod tests {
             false,
         );
         let want_kotlin = format!(
-            "repositories {{\n    exclusiveContent {{\n        forRepository {{ maven {{ url = uri(\"{u}\") }} }}\n        filter {{ includeVersion(\"{G}\", \"{A}\", \"{SFX}\") }}\n    }}\n}}\n\
-             dependencies {{\n    implementation(\"{G}:{A}\") {{ version {{ strictly(\"{SFX}\") }} }}\n}}\n\
-             configurations.configureEach {{\n    resolutionStrategy.dependencySubstitution {{\n        substitute(module(\"{G}:{A}\")).using(module(\"{G}:{A}:{SFX}\"))\n    }}\n    resolutionStrategy.componentSelection.all {{\n        if (candidate.group == \"{G}\" && candidate.module == \"{A}\" && candidate.version != \"{SFX}\") {{\n            reject(\"socket-patch: only {SFX} (hosted patch {UUID}) may resolve\")\n        }}\n    }}\n}}",
+            "repositories {{\n    exclusiveContent {{\n        forRepository {{ maven {{ url = uri(\"{u}\") }} }}\n        filter {{ includeVersion(\"{G}\", \"{A}\", \"{SFX}\") }}\n    }}\n}}\n",
             u = url(UUID)
         );
+        for want in [
+            format!("vs.accept(\"{BASE}\")"),
+            format!("useVersion(\"{SFX}\")"),
+            format!("p.transform(\"{BASE}\")) <= 0"),
+        ] {
+            assert!(kotlin.contains(&want), "{want}: {kotlin}");
+        }
+        for unwanted in ["strictly", "implementation(", "substitute("] {
+            assert!(!kotlin.contains(unwanted), "{unwanted}: {kotlin}");
+        }
         assert!(kotlin.contains(&want_kotlin), "{kotlin}");
         assert!(
             !kotlin.contains("url '"),

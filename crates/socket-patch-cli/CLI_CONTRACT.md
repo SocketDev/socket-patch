@@ -1757,10 +1757,15 @@ The script routes the suffixed version to its Socket repository with
 `exclusiveContent`, substitutes every request whose selector admits the base (direct,
 transitive, ranges, dynamic and rich versions), rejects every other candidate at or
 below the base, and fails the build (`socket-patch: … resolved …`) if anything still
-resolves there; it also checks the jar's sha256 against the index. Versions above the
-base resolve (a newer upstream fix); `vex` then withholds the attestation until a
-rescan. Detached configurations (`configurations.detachedConfiguration`) are not
-reached.
+resolves there; it also checks the jar's sha256 against the index. A request whose
+selector does not admit the base (an explicit newer version, a lock or `strictly` above
+the base, a transitive bump) is left alone and resolves above the base (a newer
+upstream fix is never downgraded); `vex` withholds the attestation when a lock entry
+records such a version, and otherwise judges the installed suffixed copies. A dynamic
+or range selector that admits the base is pinned like a lock: it resolves the patched
+version even after a newer upstream release appears (the Socket repository lists no
+versions), reported as `redirect_gradle_dynamic_selector_pinned`. Detached
+configurations (`configurations.detachedConfiguration`) are not reached.
 
 A dep is **confirmed** (`redirected`, attested) only when the final files hold the
 socket-patch script, the live apply line with the current digest in every target
@@ -1768,8 +1773,11 @@ settings file, the index row, and the suffixed version in every lock entry of th
 (`confirmed_gradle_uuids`); anything else is not counted. `list`, `vex`, `rollback`,
 `remove`, `vendor` and `repair` discover hosted Gradle pins from the index under the
 same rules (a settings-classpath lock naming the GA, a stale digest, a custom
-`lockFile`, a non-Socket URL or a lock at another version is `patched_ref_invalid`,
-no reference). `rollback` / `remove` restore without the network: lock entries back to
+`lockFile`, a non-Socket URL, a lock at another version, or any build- or GA-level
+refusal of the planner holding now — a settings-classpath declaration, an
+`includeBuild` it cannot follow, an Android / KMP plugin, a classifier request, a user
+`exclusiveContent` rule — is `patched_ref_invalid`, no reference). `rollback` /
+`remove` restore without the network: lock entries back to
 the base, the row out of the index, the verification component out when it is still
 exactly what the planner wrote (else `gradle_verification_component_left`), and the
 owned files and apply lines once no row is left.
@@ -1781,7 +1789,9 @@ eject (`vendor` over hosted pins) snapshots every Gradle wiring file before it
 restores, so a failed vendor step rolls the whole build back byte-exact.
 
 Refusals write nothing for the dep and are followed by `redirect_gradle_manual_snippet`
-(a per-DSL `exclusiveContent` snippet with the suffixed version):
+(a per-DSL snippet applying the owned script's rules for this dep: `exclusiveContent`
+for the suffixed version, every request whose selector admits the base rewritten to it,
+and every other candidate at or below the base rejected; it declares no dependency):
 
 | Code | Cause |
 |---|---|
@@ -1795,20 +1805,25 @@ Refusals write nothing for the dep and are followed by `redirect_gradle_manual_s
 | `redirect_gradle_vendored_conflict` | The GA is vendored (`.socket/vendor/gradle-index.tsv`); `vendor --revert` first. |
 | `redirect_gradle_settings_classpath` | The GA is on a settings-script classpath (declared, or named in any `settings-gradle.lockfile`), which resolves before the script runs. |
 | `redirect_gradle_classifier_declared` | A declaration requests a classifier the Socket repository does not serve. |
-| `redirect_gradle_range_declared` | A `strictly` constraint excludes the patched base version. |
+| `redirect_gradle_range_declared` | A `strictly` constraint excludes the patched base version and admits nothing above it. |
 | `redirect_gradle_exclusive_content_conflict` | A user `exclusiveContent` rule routes the group to another repository. |
 | `redirect_gradle_version_conflict` | The index already pins the GA at another base, or two patches pin it in one run. |
-| `redirect_gradle_lock_conflict` | A lock entry names the GA at a version that is neither the base nor the suffixed one; re-lock (`--write-locks`) first. |
+| `redirect_gradle_lock_conflict` | A lock entry names the GA below the base (and not at the suffixed version); re-lock (`--write-locks`) first. A lock above the base is a newer upstream release the pin lets resolve, not a conflict. |
 | `redirect_gradle_verification_unparseable` | `gradle/verification-metadata.xml` cannot be edited. |
 
 Warnings on a confirmed run: `redirect_gradle_detached_configs_unguarded` (always:
-detached configurations are not reached), `redirect_gradle_unscanned_build_logic`
+detached configurations are not reached), `redirect_gradle_dynamic_selector_pinned` (a
+declaration's dynamic or range selector admits the base, so it stays on the patched
+version while the patch is in place), `redirect_gradle_verification_component_left`
+(a replaced patch's verification component was edited by hand, so it is kept; an
+unedited one is removed with its row), `redirect_gradle_unscanned_build_logic`
 (build logic the graph could not follow, so a declaration, lock or repository there
 is unchecked) and `redirect_gradle_module_metadata_unavailable` (the grant carries no
 `mavenModuleSha256`: the Socket repository serves no suffixed `.module`, so Gradle
 falls back to the pom and the upstream module's variants and capabilities are not
 applied). When it does, the suffixed `.module` and its digest go into the
-verification component. File edits in `rewrittenFiles` / the edit list carry the kinds
+verification component, also on a rescan of a component written before the service
+served it. File edits in `rewrittenFiles` / the edit list carry the kinds
 `redirect_gradle_hosted_index`, `redirect_gradle_hosted_script`,
 `redirect_gradle_gitattributes`, `redirect_gradle_settings_apply`,
 `redirect_gradle_lock_entry` and `redirect_gradle_verification_component`. The
@@ -1838,7 +1853,10 @@ A root holding both `pom.xml` and a Gradle build vendors both in one ledger entr
 (#395); either half refusing writes nothing. A derived
 `.socket/vendor/gradle/<group-path>/<artifact>/maven-metadata.xml` keeps range,
 prefix and rich selectors on the vendored version (#511). Existing pgp-only
-verification entries get a `sha256` beside them (#487). The owned script, index,
+verification entries get a `sha256` beside them (#487), and so do the classifier jars
+the tree serves (a declared classifier, the IDE sources): the vendored repository
+serves no signatures, so each gets its upstream `sha256` unless its entry already
+holds a checksum. The owned script, index,
 derived metadata and `.gitattributes` are compared line-ending blind (#429). Ledger
 fragments use the kinds `gradle_settings_fragment`, `gradle_verification_fragment`,
 `gradle_derived_metadata`, `jvm_owned_file`, `jvm_vendor_tree`, `jvm_created_dir`

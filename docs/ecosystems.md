@@ -513,9 +513,15 @@ The script routes the suffixed version to the Socket repository only
 (`exclusiveContent`). It substitutes every request that would select the patched base
 version, including transitive requests, ranges, dynamic (`1.+`) and rich versions. It
 rejects other versions at or below the base and fails the build if one still
-resolves. It also checks the jar's sha256. A version *above* the base still resolves,
-since an upstream fix is never downgraded, and `vex` withholds the statement until
-you rescan. The apply line carries a digest of the index, so a changed pin set
+resolves. It also checks the jar's sha256. A request whose selector does not admit the
+base (an explicit newer version, a lock or `strictly` above the base, a transitive
+bump) is left alone, so a version *above* the base still resolves and an upstream fix
+is never downgraded. `vex` withholds the statement when a lock file records such a
+version; without dependency locking it judges the installed suffixed copies. A
+dynamic or range selector that admits the base is pinned like a lock: it keeps
+resolving the patched version after a newer upstream release appears
+(`redirect_gradle_dynamic_selector_pinned`); declare the newer version to move past
+the patch. The apply line carries a digest of the index, so a changed pin set
 invalidates the configuration cache.
 
 **Detached configurations.** Every project and buildscript configuration is pinned.
@@ -533,15 +539,20 @@ A dep is refused, with nothing written for it, when the build is outside what th
 script can pin: a wrapper below 6.8, Android or Kotlin Multiplatform plugins, an
 `includeBuild` the CLI cannot follow, a custom `lockFile`, the GA on a
 settings-script classpath (declared, or in a `settings-gradle.lockfile`), a
-classifier declaration, a `strictly` constraint excluding the base, a user
-`exclusiveContent` rule claiming the group, a lock entry at a third version (re-lock
-first), a GA that is vendored, or a grant that serves the original coordinates. Each
-refusal has its own `redirect_gradle_*` code and is followed by
-`redirect_gradle_manual_snippet`, a paste-able snippet in the build's DSL.
+classifier declaration, a `strictly` constraint admitting only versions below the
+base, a user `exclusiveContent` rule claiming the group, a lock entry below the base
+(re-lock first), a GA that is vendored, or a grant that serves the original
+coordinates. Each refusal has its own `redirect_gradle_*` code and is followed by
+`redirect_gradle_manual_snippet`, a paste-able snippet in the build's DSL that applies
+the owned script's rules (it adds no dependency, and versions above the base still
+resolve).
 
-`rollback` and `remove` restore without the network, using only the index. A
-vendored Gradle package is taken over only when the hosted planner would accept it.
-Otherwise it keeps its vendored patch.
+`rollback` and `remove` restore without the network, using only the index. `list`,
+`vex` and the other readers re-run the planner's build-level checks, so a build changed
+after the scan in a way the pin cannot reach (a settings-classpath declaration, an
+`includeBuild` the CLI cannot follow, …) stops attesting. A vendored Gradle package is
+taken over only when the hosted planner would accept it. Otherwise it keeps its
+vendored patch.
 
 ### Vendored mode
 
@@ -551,8 +562,8 @@ committed under `.socket/vendor/gradle/`, a settings script serves it with
 unchanged. Run it from the build root: a subproject directory is refused
 (`not_build_root`). A root with both `pom.xml` and a Gradle build wires both.
 Classifier jars a build declares are vendored too, and a derived `maven-metadata.xml`
-keeps ranges on the vendored version. Existing pgp-only verification entries get a
-checksum. Refusals use `vendor_jvm_shape_unsupported` /
+keeps ranges on the vendored version. Existing pgp-only verification entries, and the
+classifier jars the tree serves, get a checksum. Refusals use `vendor_jvm_shape_unsupported` /
 `vendor_jvm_upstream_unavailable`, and partial wiring uses `vendor_jvm_degraded`
 (VEX withheld). Each detail starts with `reason: <reason>:`.
 

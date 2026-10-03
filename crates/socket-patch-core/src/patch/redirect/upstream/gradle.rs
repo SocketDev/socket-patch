@@ -24,10 +24,10 @@ use super::{Ctx, FormatResult, HostedPin, View};
 use crate::gradle::eol::eol_eq;
 use crate::gradle::locks;
 use crate::patch::redirect::gradle::{
-    apply_line_created, apply_line_span, graph_of, index_digest, lockfile_paths, parse_index,
-    render_index, settings_targets, with_apply_line, without_apply_line, GradleFiles, HostedRow,
-    GITATTRIBUTES, GITATTRIBUTES_REL, HOSTED_INDEX_REL, HOSTED_SCRIPT, HOSTED_SCRIPT_REL,
-    MAX_ROUNDS,
+    apply_line_created, apply_line_span, graph_of, has_component, index_digest, lockfile_paths,
+    parse_index, render_index, settings_targets, with_apply_line, without_apply_line,
+    without_component, GradleFiles, HostedRow, GITATTRIBUTES, GITATTRIBUTES_REL, HOSTED_INDEX_REL,
+    HOSTED_SCRIPT, HOSTED_SCRIPT_REL, MAX_ROUNDS,
 };
 use crate::vendor::jvm::gradle as vendored;
 
@@ -235,70 +235,6 @@ async fn read_build(view: &mut View<'_>) -> BTreeMap<String, String> {
         }
     }
     gradle.files
-}
-
-/// The start tag the planner writes for a row's component.
-fn component_tag(row: &HostedRow) -> String {
-    format!(
-        "<component group=\"{}\" name=\"{}\" version=\"{}\">",
-        row.group, row.artifact, row.suffixed
-    )
-}
-
-fn has_component(text: &str, row: &HostedRow) -> bool {
-    text.contains(&component_tag(row))
-}
-
-/// `text` without the row's component, when it is still exactly what the
-/// planner wrote: its artifacts are the suffixed jar, pom and (optionally)
-/// module, each holding one socket-patch sha256 (the jar's and pom's the
-/// row's own). The component's lines go with it.
-fn without_component(text: &str, row: &HostedRow) -> Option<String> {
-    let tag = component_tag(row);
-    let start = text.find(&tag)?;
-    let close = "</component>";
-    let end = start + text[start..].find(close)? + close.len();
-    let block = &text[start + tag.len()..end - close.len()];
-    let (a, v) = (&row.artifact, &row.suffixed);
-    let artifact_re = regex::Regex::new(
-        r#"^\s*<artifact name="([^"]+)">\s*<sha256 value="([0-9a-f]{64})" origin="socket-patch"/>\s*</artifact>"#,
-    )
-    .expect("static artifact regex is valid");
-    let mut rest = block;
-    let mut names = Vec::new();
-    while let Some(c) = artifact_re.captures(rest) {
-        let (name, sha) = (c[1].to_string(), c[2].to_string());
-        let want = if name == format!("{a}-{v}.jar") {
-            Some(&row.jar_sha256)
-        } else if name == format!("{a}-{v}.pom") {
-            Some(&row.pom_sha256)
-        } else if name == format!("{a}-{v}.module") {
-            None
-        } else {
-            return None;
-        };
-        if want.is_some_and(|w| *w != sha) {
-            return None;
-        }
-        names.push(name);
-        rest = &rest[c.get(0).expect("whole match").end()..];
-    }
-    if !rest.trim().is_empty() || !names.iter().any(|n| n.ends_with(".jar")) {
-        return None;
-    }
-    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
-    let lead_blank = text[line_start..start].trim().is_empty();
-    let after = &text[end..];
-    let line_end = if after.starts_with("\r\n") {
-        end + 2
-    } else if after.starts_with('\n') {
-        end + 1
-    } else {
-        end
-    };
-    let cut_start = if lead_blank { line_start } else { start };
-    let cut_end = if lead_blank { line_end } else { end };
-    Some(format!("{}{}", &text[..cut_start], &text[cut_end..]))
 }
 
 #[cfg(test)]

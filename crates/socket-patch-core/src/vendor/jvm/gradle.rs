@@ -583,6 +583,40 @@ pub fn plan(
                 json!({ "op": "replace", "from": from, "to": replacement }),
             ));
         }
+        // The classifier jars (a declared classifier, the IDE sources) the
+        // tree serves: the vendored repository serves no `.asc`, so under
+        // signature verification an entry trusted by key or listed
+        // pgp-only would verify nothing. Each gets its upstream sha256
+        // unless it already holds a checksum (the bytes are upstream's).
+        let mut new = new;
+        for extra in patch.extra_artifacts {
+            let name = extra.file_name(a, v);
+            let sha = sha256_hex(&extra.bytes);
+            let h = ArtifactHashes {
+                jar: sha.clone(),
+                pom: sha,
+                module: None,
+            };
+            let (start, end, to) = verification_artifact_edit(&new, patch, &h, &name, true, true)?;
+            let key = format!("classifier:{gav}:{name}");
+            if to == new[start..end] {
+                records.push(adopt(VERIFICATION_REL, VERIFICATION_FRAGMENT_KIND, &key));
+                continue;
+            }
+            records.push(fragment(
+                VERIFICATION_REL,
+                VERIFICATION_FRAGMENT_KIND,
+                &key,
+                if start == end {
+                    WiringAction::Added
+                } else {
+                    WiringAction::Rewritten
+                },
+                None,
+                replace_op(&new[start..end], &to),
+            ));
+            new = format!("{}{to}{}", &new[..start], &new[end..]);
+        }
         writes.push(text_write(VERIFICATION_REL, new.into_bytes()));
     }
 
@@ -843,6 +877,19 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
         .map(|w| w.file.clone())
         .collect();
     files.insert(INDEX_REL.to_string());
+    // An index that exists but is not UTF-8 is unreadable, never absent:
+    // reading it as "no index" would take the last-patch path below and
+    // unwire every other vendored patch with it.
+    if read(INDEX_REL).is_some_and(|bytes| std::str::from_utf8(&bytes).is_err()) {
+        return JvmUnplan {
+            changes: Vec::new(),
+            drifted: vec![format!(
+                "{INDEX_REL} is not UTF-8; nothing was reverted (restore it from version \
+                 control and revert again)"
+            )],
+            still_wired: true,
+        };
+    }
     let mut before: BTreeMap<String, Option<String>> = files
         .into_iter()
         .filter_map(|rel| {
@@ -913,8 +960,18 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
         let Some(to) = op_str(w, "to") else {
             continue;
         };
+        // Line-ending blind, as the settings fragments: the recorded
+        // elements span lines in the file's vendor-time newline, and a
+        // `core.autocrlf` checkout converts the whole file.
+        let holds_to = |t: &str| {
+            t.contains(to)
+                || t.contains(&crate::gradle::eol::apply_eol(
+                    to,
+                    crate::gradle::eol::sniff_crlf(t.as_bytes()),
+                ))
+        };
         let Some(from) = op_str(w, "from") else {
-            if t.contains(to) {
+            if holds_to(t) {
                 drifted.push(format!(
                     "{}: no pre-vendor entry is recorded for {}:{}:{}",
                     w.file, c.group_id, c.artifact_id, c.version
@@ -922,9 +979,9 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
             }
             continue;
         };
-        match undo_replace(t, from, to) {
+        match undo_replace_eol(t, from, to) {
             Some(undone) => *t = undone,
-            None if t.contains(to) => drifted.push(format!(
+            None if holds_to(t) => drifted.push(format!(
                 "{} holds the patched hash for {}:{}:{} in an unexpected shape",
                 w.file, c.group_id, c.artifact_id, c.version
             )),
@@ -2189,6 +2246,56 @@ pub(crate) fn update_verification_component(
     h: &ArtifactHashes,
     metadata_extension: Option<&str>,
 ) -> Result<(usize, usize, String), JvmRefusal> {
+    let name = format!(
+        "{}-{}.{}",
+        patch.artifact_id,
+        patch.version,
+        metadata_extension.unwrap_or("jar")
+    );
+    verification_artifact_edit(
+        text,
+        patch,
+        h,
+        &name,
+        metadata_extension.is_some(),
+        metadata_extension.is_some(),
+    )
+}
+
+/// Set `<a>-<v>.<extension>`'s sha256 (`h.jar`) in the GAV's existing
+/// component, replacing an entry already there, or inserting one in name
+/// order; a missing component is added as [`update_verification_component`]
+/// adds it. For a component socket-patch owns (the hosted suffixed one),
+/// whose every artifact carries socket-patch's hashes.
+pub(crate) fn set_verification_artifact(
+    text: &str,
+    patch: &JvmPatch<'_>,
+    extension: &str,
+    sha256: &str,
+) -> Result<(usize, usize, String), JvmRefusal> {
+    let h = ArtifactHashes {
+        jar: sha256.to_string(),
+        pom: sha256.to_string(),
+        module: None,
+    };
+    let name = format!("{}-{}.{extension}", patch.artifact_id, patch.version);
+    verification_artifact_edit(text, patch, &h, &name, extension != "jar", false)
+}
+
+/// The edit behind [`update_verification_component`] and
+/// [`set_verification_artifact`]: the `file_name` entry of the GAV's
+/// component gets `h.jar`. With `keep_user`, an entry that already holds a
+/// checksum is kept as is (a pgp-only one gets a sha256 added); otherwise
+/// it is replaced. A new component holds only that entry when `single`,
+/// else the jar, pom and (with `h.module`) module.
+fn verification_artifact_edit(
+    text: &str,
+    patch: &JvmPatch<'_>,
+    h: &ArtifactHashes,
+    file_name: &str,
+    single: bool,
+    keep_user: bool,
+) -> Result<(usize, usize, String), JvmRefusal> {
     let unparseable = |why: &str| {
         shape_refusal(
             "gradle_verification_unparseable",
@@ -2199,7 +2306,7 @@ pub(crate) fn update_verification_component(
     let nl = newline_of(text);
     const UNIT: &str = "   ";
     let (a, v) = (patch.artifact_id, patch.version);
-    let jar_name = format!("{a}-{v}.{}", metadata_extension.unwrap_or("jar"));
+    let jar_name = file_name.to_string();
 
     let Some(&(cs_start, cs_tag_end, cs_end)) =
         xml_elements(&masked, 0, masked.len(), "components").first()
@@ -2232,7 +2339,7 @@ pub(crate) fn update_verification_component(
         let comp_indent = line_indent(text, s);
         for &(as_, at_end, ae) in &arts {
             if xml_attr(&masked[as_..at_end], "name") == Some(jar_name.as_str()) {
-                if metadata_extension.is_some() {
+                if keep_user {
                     // The user's entry is kept; a pgp-only one gets the
                     // checksum Gradle needs for the vendored repository.
                     if has_checksum(&masked, at_end, ae) {
@@ -2272,10 +2379,9 @@ pub(crate) fn update_verification_component(
         (jar_name.clone(), h.jar.clone()),
         (format!("{a}-{v}.pom"), h.pom.clone()),
     ];
-    if metadata_extension.is_some() {
+    if single {
         arts.truncate(1);
-    }
-    if let Some(m) = &h.module {
+    } else if let Some(m) = &h.module {
         arts.push((format!("{a}-{v}.module"), m.clone()));
     }
     arts.sort();
@@ -3129,6 +3235,52 @@ mod tests {
         assert!(after.contains("<trust group=\"com.google.code.gson\"/>"));
         assert_eq!(reasons(&plan), vec!["verification_parent_chain_unhandled"]);
         assert_idempotent(&files, &p);
+    }
+
+    /// #646 review: a `core.autocrlf` checkout converts the verification
+    /// file vendored with LF; the revert still takes the patched jar hash
+    /// (and any other recorded entry) out, in the file's own newline,
+    /// instead of silently leaving it and breaking the upstream build.
+    #[test]
+    fn crlf_checkout_of_the_verification_file_reverts_clean() {
+        let before = format!(
+            "{VM_HEAD}{}{VM_TAIL}",
+            vm_component(
+                "com.google.code.gson",
+                "gson",
+                "2.10.1",
+                &[("gson-2.10.1.jar", "old"), ("gson-2.10.1.pom", "pomsha")]
+            ),
+        );
+        let files = fs(&[("settings.gradle", ""), (VERIFICATION_REL, &before)]);
+        let p = patch();
+        let plan = run(&files, &p).unwrap();
+        let after = applied(&files, &plan);
+        assert_ne!(after[VERIFICATION_REL], before.as_bytes());
+        let win = crlf(&after, &[VERIFICATION_REL]);
+        let undo = unplan(&|rel| win.get(rel).cloned(), &p.coords(), &plan.records);
+        assert!(undo.drifted.is_empty(), "{:?}", undo.drifted);
+        assert_eq!(
+            reverted(&win, &undo)[VERIFICATION_REL],
+            crlf(&files, &[VERIFICATION_REL])[VERIFICATION_REL],
+        );
+    }
+
+    /// #646 review: an index that exists but is not UTF-8 is unreadable,
+    /// not absent. The revert of one patch must not take the last-patch
+    /// path and unwire every other vendored patch.
+    #[test]
+    fn unplan_leaves_a_non_utf8_index_and_keeps_the_wiring() {
+        let files = fs(&[("build.gradle", "plugins { id 'java' }\n")]);
+        let p = patch();
+        let plan = run(&files, &p).unwrap();
+        let mut after = applied(&files, &plan);
+        let mut index = after[INDEX_REL].clone();
+        index.extend_from_slice(b"# caf\xe9\n");
+        after.insert(INDEX_REL.into(), index);
+        let undo = unplan(&|rel| after.get(rel).cloned(), &p.coords(), &plan.records);
+        assert!(undo.still_wired && !undo.drifted.is_empty());
+        assert!(undo.changes.is_empty(), "{:?}", undo.changes);
     }
 
     #[test]
@@ -4062,6 +4214,59 @@ mod tests {
         }
         let disk = applied(&files, &plan);
         let undo = unplan(&|rel| disk.get(rel).cloned(), &p.coords(), &plan.records);
+        assert_eq!(
+            reverted(&disk, &undo)[VERIFICATION_REL],
+            before.as_bytes(),
+            "byte-exact revert"
+        );
+    }
+
+    /// #646 review: under signature verification, the classifier jars the
+    /// tree serves (no `.asc` there) get their upstream sha256: a missing
+    /// entry is added, a pgp-only one gets a checksum beside its key, one
+    /// with a checksum is kept. Idempotent, and the revert is byte-exact.
+    #[test]
+    fn classifier_jars_get_checksums_in_the_verification_file() {
+        let tests_jar = ExtraArtifact {
+            classifier: "tests".into(),
+            extension: "jar".into(),
+            bytes: b"UPSTREAM-TESTS-JAR".to_vec(),
+        };
+        let sources_jar = ExtraArtifact {
+            classifier: "sources".into(),
+            extension: "jar".into(),
+            bytes: b"UPSTREAM-SOURCES-JAR".to_vec(),
+        };
+        let extras = [tests_jar, sources_jar];
+        let p = JvmPatch {
+            extra_artifacts: &extras,
+            ..patch()
+        };
+        let before = format!(
+            "{PGP_VM_HEAD}{}{VM_TAIL}",
+            pgp_component(
+                "com.google.code.gson",
+                "gson",
+                "2.10.1",
+                &["gson-2.10.1-sources.jar"]
+            ),
+        );
+        let files = fs(&[("settings.gradle", ""), (VERIFICATION_REL, &before)]);
+        let plan = run(&files, &p).unwrap();
+        let after = text_of(&plan, VERIFICATION_REL).to_string();
+        let tests = format!(
+            "<artifact name=\"gson-2.10.1-tests.jar\">\n            <sha256 value=\"{}\" origin=\"socket-patch\"/>\n         </artifact>",
+            sha256_hex(b"UPSTREAM-TESTS-JAR")
+        );
+        assert!(after.contains(&tests), "{after}");
+        let sources = format!(
+            "<artifact name=\"gson-2.10.1-sources.jar\">\n            <pgp value=\"84789D24DF77A32433CE1F079EB80E92EB2135B1\"/>\n            <sha256 value=\"{}\" origin=\"socket-patch\"/>\n         </artifact>",
+            sha256_hex(b"UPSTREAM-SOURCES-JAR")
+        );
+        assert!(after.contains(&sources), "{after}");
+        let disk = assert_idempotent(&files, &p);
+        let undo = unplan(&|rel| disk.get(rel).cloned(), &p.coords(), &plan.records);
+        assert!(undo.drifted.is_empty(), "{:?}", undo.drifted);
         assert_eq!(
             reverted(&disk, &undo)[VERIFICATION_REL],
             before.as_bytes(),
