@@ -36,7 +36,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use crate::crawlers::ruby_crawler::bundle_config_setting;
+use crate::crawlers::ruby_crawler::bundle_config_setting_including_empty;
 use crate::utils::fs::normalize_lexically;
 
 /// Where a configured `BUNDLE_GEMFILE` came from.
@@ -127,9 +127,10 @@ impl LoadedManifest {
 }
 
 /// The `BUNDLE_GEMFILE:` value of a bundler app config file (flat YAML that
-/// bundler writes itself; an empty value counts as unset).
+/// bundler writes itself). An empty string still shadows the global tier;
+/// it does not replace a non-empty `BUNDLE_GEMFILE` already in the environment.
 pub fn config_gemfile(contents: &str) -> Option<String> {
-    bundle_config_setting(contents, "BUNDLE_GEMFILE")
+    bundle_config_setting_including_empty(contents, "BUNDLE_GEMFILE")
 }
 
 /// `value` resolved against `root` (an absolute value stands alone), made
@@ -168,6 +169,12 @@ pub fn classify(
         (Some(env), Some(config)) if env_keeps_root(&env) => (config, GemfileSetting::AppConfig),
         (Some(env), _) => (env, GemfileSetting::Env),
         (None, Some(config)) => (config, GemfileSetting::AppConfig),
+        // Settings#[] stops at a present empty value, so the global tier
+        // is shadowed. configure_custom_gemfile only exports non-empty
+        // values, leaving an existing non-empty env value in force above.
+        (None, None) if gemfile_env.is_some() || config_value.is_some() => {
+            return LoadedManifest::Default;
+        }
         (None, None) => match global {
             Some(global) => (global, GemfileSetting::GlobalConfig),
             None => return LoadedManifest::Default,
@@ -204,6 +211,51 @@ mod tests {
         assert_eq!(
             classify(&root(), Some(OsStr::new("")), Some(""), None),
             LoadedManifest::Default
+        );
+    }
+
+    #[test]
+    fn empty_higher_tiers_shadow_global_but_preserve_a_nonempty_environment() {
+        for (env, config) in [(Some(""), None), (None, Some("")), (Some(""), Some(""))] {
+            assert_eq!(
+                classify(&root(), env.map(OsStr::new), config, Some("Gemfile.next")),
+                LoadedManifest::Default
+            );
+        }
+        // configure_custom_gemfile does not export the empty local value.
+        assert_eq!(
+            classify(
+                &root(),
+                Some(OsStr::new("Gemfile")),
+                Some(""),
+                Some("Gemfile.next")
+            ),
+            LoadedManifest::Configured {
+                manifest: "Gemfile",
+                by: GemfileSetting::Env
+            }
+        );
+        for env in ["Gemfile.next", "../other/Gemfile"] {
+            assert_eq!(
+                classify(&root(), Some(OsStr::new(env)), Some(""), Some("gems.rb")),
+                LoadedManifest::Unsupported {
+                    value: env.into(),
+                    by: GemfileSetting::Env
+                }
+            );
+        }
+        // A non-empty local setting still wins over an empty environment.
+        assert_eq!(
+            classify(
+                &root(),
+                Some(OsStr::new("")),
+                Some("gems.rb"),
+                Some("Gemfile.next")
+            ),
+            LoadedManifest::Configured {
+                manifest: "gems.rb",
+                by: GemfileSetting::AppConfig
+            }
         );
     }
 
@@ -354,7 +406,10 @@ mod tests {
             ),
             Some("Gemfile.next".into())
         );
-        assert_eq!(config_gemfile("---\nBUNDLE_GEMFILE: \"\"\n"), None);
+        assert_eq!(
+            config_gemfile("---\nBUNDLE_GEMFILE: \"\"\n"),
+            Some("".into())
+        );
         assert_eq!(config_gemfile("---\nBUNDLE_PATH: \"x\"\n"), None);
     }
 }

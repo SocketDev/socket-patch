@@ -660,6 +660,59 @@ async fn get_gem_paths_env_root_still_includes_gempath_homes() {
     );
 }
 
+/// Bundler stops before the global path when the environment supplies
+/// either path flag, even when the flag is false or an empty string.
+#[tokio::test]
+#[serial]
+async fn global_bundle_store_is_shadowed_by_environment_path_flags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
+    let store = root.join("global-store/ruby/3.3.0/gems");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(root.join("Gemfile"), "gem 'rails'\n").unwrap();
+    let global = tmp.path().join("config");
+    std::fs::write(&global, "---\nBUNDLE_PATH: \"global-store\"\n").unwrap();
+
+    let keys = [
+        "BUNDLE_CONFIG",
+        "BUNDLE_USER_CONFIG",
+        "BUNDLE_APP_CONFIG",
+        "BUNDLE_IGNORE_CONFIG",
+        "BUNDLE_PATH",
+        "BUNDLE_PATH__SYSTEM",
+        "BUNDLE_DISABLE_SHARED_GEMS",
+    ];
+    let previous: Vec<_> = keys.iter().map(|key| std::env::var_os(key)).collect();
+    for key in keys {
+        std::env::remove_var(key);
+    }
+    std::env::set_var("BUNDLE_USER_CONFIG", &global);
+    let control = RubyCrawler::discover_bundle_stores(&root).await.stores;
+    let mut cases = Vec::new();
+    for key in ["BUNDLE_PATH__SYSTEM", "BUNDLE_DISABLE_SHARED_GEMS"] {
+        for value in ["true", "false", ""] {
+            std::env::set_var(key, value);
+            cases.push((
+                key,
+                value,
+                RubyCrawler::discover_bundle_stores(&root).await.stores,
+            ));
+        }
+        std::env::remove_var(key);
+    }
+    // Restore the ambient state before any assertion can panic.
+    for (key, value) in keys.into_iter().zip(previous) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+    assert_eq!(control, vec![store]);
+    for (key, value, stores) in cases {
+        assert!(stores.is_empty(), "{key}={value:?}: {stores:?}");
+    }
+}
+
 // ── global gem discovery ───────────────────────────────────────
 
 #[tokio::test]

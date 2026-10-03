@@ -847,6 +847,67 @@ async fn gem_hosted_global_gemfile_setting_is_refused() {
     assert_ne!(code, 0, "nothing was patched or attested: {envelope}");
 }
 
+/// Empty higher-tier gemfile settings shadow the global alternative but
+/// leave Bundler's default manifest (or an existing nonempty env value)
+/// active. A valid project must not be refused because of that unused file.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_empty_gemfile_setting_shadows_global_alternative() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    for (label, local, env_gemfile) in [
+        ("empty-env", false, Some("")),
+        ("empty-local", true, None),
+        ("empty-local-with-env", true, Some("Gemfile")),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        let alternate = proj.join("Gemfile.next");
+        std::fs::write(&alternate, "source 'https://rubygems.org'\n").unwrap();
+        let original_alternate = std::fs::read(&alternate).unwrap();
+        if local {
+            std::fs::create_dir(proj.join(".bundle")).unwrap();
+            std::fs::write(proj.join(".bundle/config"), "---\nBUNDLE_GEMFILE: \"\"\n").unwrap();
+        }
+        let global = tmp.path().join("global-config");
+        std::fs::write(&global, "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n").unwrap();
+        let mut env = vec![("BUNDLE_USER_CONFIG", global.to_str().unwrap())];
+        if let Some(value) = env_gemfile {
+            env.push(("BUNDLE_GEMFILE", value));
+        }
+        let (code, stdout, stderr) = common::run_with_env(
+            &proj,
+            &[
+                "scan",
+                "--mode",
+                "hosted",
+                "--json",
+                "--yes",
+                "--cwd",
+                proj.to_str().unwrap(),
+                "--api-url",
+                &server.uri(),
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+            ],
+            &env,
+        );
+        assert_eq!(code, 0, "{label}: stdout:\n{stdout}\nstderr:\n{stderr}");
+        let envelope = common::parse_json_envelope(&stdout);
+        assert_eq!(envelope["redirect"]["redirected"], 1, "{label}: {envelope}");
+        assert!(
+            std::fs::read_to_string(proj.join("Gemfile"))
+                .unwrap()
+                .contains("/patch-registry/gem/"),
+            "{label}: the active Gemfile must receive the patch source"
+        );
+        assert_eq!(std::fs::read(&alternate).unwrap(), original_alternate);
+    }
+}
+
 /// 7. Manifest-less VEX (no `.socket/manifest.json` — hosted never writes
 /// one) over the stale-install scenario, before and after the prescribed
 /// fix. The two post-install lock shapes are the ones REAL bundler writes

@@ -362,12 +362,14 @@ impl RubyCrawler {
             // The global config's path (`bundle config set --global path`)
             // is the user's own machine state, so it is trusted like the
             // env var: no containment guard. Bundler's `Settings#path`
-            // takes the FIRST tier that sets `path` or `path.system`, so a
-            // local or env setting shadows it entirely — even an empty env
+            // takes the FIRST tier that sets `path`, `path.system`, or
+            // `disable_shared_gems`, so a local or env setting shadows it
+            // entirely — even an empty env
             // `BUNDLE_PATH`, which adds no root above but still stops
             // Bundler (`explicit_path` is `""`). An env
-            // `BUNDLE_PATH__SYSTEM` already dropped `global_config`, see
-            // [`global_path_config_unless_env_path_system`].
+            // `BUNDLE_PATH__SYSTEM` or `BUNDLE_DISABLE_SHARED_GEMS` already
+            // dropped `global_config`, see
+            // [`global_path_config_unless_env_path_settings`].
             let shadowed =
                 bundle_path_env.is_some() || Self::app_config_sets_path(cwd, app_config_env).await;
             if !shadowed {
@@ -475,16 +477,22 @@ impl RubyCrawler {
         paths
     }
 
-    /// Whether the app config file sets `path` or `path.system` at all —
-    /// either one makes bundler stop at that tier (`Settings#path`), so the
-    /// global config's path never applies.
+    /// Whether the app config file sets `path`, `path.system`, or
+    /// `disable_shared_gems` at all, including an empty string — any one
+    /// makes bundler stop at that tier (`Settings#path`), so the global
+    /// config's path never applies.
     async fn app_config_sets_path(cwd: &Path, app_config_env: Option<&OsStr>) -> bool {
         let config = bundler_app_config_dir(cwd, app_config_env).join("config");
         crate::utils::fs::read_regular_to_string(&config)
             .await
             .is_ok_and(|text| {
-                bundle_config_setting(&text, "BUNDLE_PATH").is_some()
-                    || bundle_config_setting(&text, "BUNDLE_PATH__SYSTEM").is_some()
+                [
+                    "BUNDLE_PATH",
+                    "BUNDLE_PATH__SYSTEM",
+                    "BUNDLE_DISABLE_SHARED_GEMS",
+                ]
+                .iter()
+                .any(|key| bundle_config_setting_including_empty(&text, key).is_some())
             })
     }
 
@@ -1095,30 +1103,33 @@ pub(crate) fn bundler_global_config_file(
 }
 
 /// [`ambient_bundler_global_config_file`], or `None` under
-/// `BUNDLE_IGNORE_CONFIG` or when the environment sets `path.system` — for
-/// the install-root probe, which takes no `ignore_config` flag of its own.
+/// `BUNDLE_IGNORE_CONFIG` or when the environment sets `path.system` or
+/// `disable_shared_gems` — for the install-root probe, which takes no
+/// `ignore_config` flag of its own.
 fn ambient_global_config_unless_ignored(root: &Path) -> Option<PathBuf> {
     if bundler_ignores_config() {
         None
     } else {
-        global_path_config_unless_env_path_system(
+        global_path_config_unless_env_path_settings(
             ambient_bundler_global_config_file(root),
             std::env::var_os("BUNDLE_PATH__SYSTEM").as_deref(),
+            std::env::var_os("BUNDLE_DISABLE_SHARED_GEMS").as_deref(),
         )
     }
 }
 
 /// The global config file for the install-root probe, or `None` when the
-/// env tier sets `path.system`. Bundler's `Settings#path` stops at the
-/// first tier that sets `path` OR `path.system`, and the env tier sits
-/// above the global one, so any `BUNDLE_PATH__SYSTEM` value (even `"false"`
-/// or empty) shadows a global `path` — the env `BUNDLE_PATH` half of that
-/// rule is applied in [`RubyCrawler::discover_bundle_stores_with_env`].
-fn global_path_config_unless_env_path_system(
+/// env tier sets `path.system` or `disable_shared_gems`. Bundler's
+/// `Settings#path` stops at the first tier that sets either flag or `path`,
+/// and the env tier sits above the global one, so any flag value (even
+/// `"false"` or empty) shadows a global `path` — the env `BUNDLE_PATH` part
+/// of that rule is applied in [`RubyCrawler::discover_bundle_stores_with_env`].
+fn global_path_config_unless_env_path_settings(
     global_config: Option<PathBuf>,
     path_system_env: Option<&OsStr>,
+    disable_shared_gems_env: Option<&OsStr>,
 ) -> Option<PathBuf> {
-    if path_system_env.is_some() {
+    if path_system_env.is_some() || disable_shared_gems_env.is_some() {
         None
     } else {
         global_config
@@ -1320,11 +1331,19 @@ fn parse_bundle_config_path(contents: &str) -> Option<String> {
 /// empty value counts as unset. The colon must follow the key directly, so
 /// `BUNDLE_PATH__SYSTEM:` never matches `BUNDLE_PATH`.
 pub(crate) fn bundle_config_setting(contents: &str, key: &str) -> Option<String> {
+    bundle_config_setting_including_empty(contents, key).filter(|value| !value.is_empty())
+}
+
+/// Like [`bundle_config_setting`], but retains an explicitly empty string:
+/// Bundler's setting tiers stop at a present value even when it names no
+/// path. Callers that decide whether a lower tier applies need presence,
+/// not just a non-empty value.
+pub(crate) fn bundle_config_setting_including_empty(contents: &str, key: &str) -> Option<String> {
     let mut found = None;
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix(key).and_then(|r| r.strip_prefix(':')) {
             let v = unquote_bundle_config_value(rest);
-            found = (!v.is_empty()).then(|| v.to_string());
+            found = Some(v.to_string());
         }
     }
     found
@@ -2353,6 +2372,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn empty_gemfile_settings_shadow_global_without_erasing_the_environment() {
+        use crate::formats::gem::manifest::{GemfileSetting, LoadedManifest};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join(".bundle")).unwrap();
+        let global = dir.path().join("global-config");
+        std::fs::write(&global, "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n").unwrap();
+        let g = Some(global.as_path());
+
+        // An exported empty value shadows the global file and leaves
+        // Bundler's default Gemfile/gems.rb discovery active.
+        assert_eq!(
+            bundler_loaded_manifest_with_env(&root, Some(OsStr::new("")), None, false, g).await,
+            LoadedManifest::Default
+        );
+        // The same value written by `bundle config set --local gemfile ''`
+        // is present even though it names no file.
+        std::fs::write(root.join(".bundle/config"), "---\nBUNDLE_GEMFILE: \"\"\n").unwrap();
+        assert_eq!(
+            bundler_loaded_manifest_with_env(&root, None, None, false, g).await,
+            LoadedManifest::Default
+        );
+        // Bundler does not re-export an empty local setting, so an existing
+        // non-empty environment value still chooses the manifest.
+        assert_eq!(
+            bundler_loaded_manifest_with_env(&root, Some(OsStr::new("Gemfile")), None, false, g)
+                .await,
+            LoadedManifest::Configured {
+                manifest: "Gemfile",
+                by: GemfileSetting::Env
+            }
+        );
+    }
+
     /// #577: `bundle config set --global path vendor/gems` is where bundler
     /// installs, so agent-mode discovery must probe it (relative to the
     /// project root, like bundler). A local or env `path` / `path.system`
@@ -2422,17 +2476,25 @@ mod tests {
         .stores;
         assert!(stores.is_empty(), "{stores:?}");
 
-        // So does a local `path.system` (bundler stops at the local tier).
+        // Each local path setting stops Bundler at the local tier. Empty
+        // strings and false flags still count as present, just as the
+        // environment's empty path does above.
         std::fs::create_dir(root.join(".bundle")).unwrap();
-        std::fs::write(
-            root.join(".bundle/config"),
-            "---\nBUNDLE_PATH__SYSTEM: \"true\"\n",
-        )
-        .unwrap();
-        let stores = RubyCrawler::discover_bundle_stores_with_env(&root, None, None, None, g)
-            .await
-            .stores;
-        assert!(stores.is_empty(), "{stores:?}");
+        for setting in [
+            "BUNDLE_PATH: \"\"",
+            "BUNDLE_PATH__SYSTEM: \"true\"",
+            "BUNDLE_PATH__SYSTEM: \"false\"",
+            "BUNDLE_PATH__SYSTEM: \"\"",
+            "BUNDLE_DISABLE_SHARED_GEMS: \"true\"",
+            "BUNDLE_DISABLE_SHARED_GEMS: \"false\"",
+            "BUNDLE_DISABLE_SHARED_GEMS: \"\"",
+        ] {
+            std::fs::write(root.join(".bundle/config"), format!("---\n{setting}\n")).unwrap();
+            let stores = RubyCrawler::discover_bundle_stores_with_env(&root, None, None, None, g)
+                .await
+                .stores;
+            assert!(stores.is_empty(), "{setting}: {stores:?}");
+        }
 
         // A non-Ruby directory never reads it (the explicit-roots gate).
         let non_ruby = dir.path().join("not-ruby");
@@ -2443,28 +2505,36 @@ mod tests {
         assert!(stores.is_empty(), "{stores:?}");
     }
 
-    /// An env `BUNDLE_PATH__SYSTEM` — any value, even `"false"` or empty —
-    /// shadows a global `path` like an env `BUNDLE_PATH` does: Bundler's
+    /// An env `BUNDLE_PATH__SYSTEM` or `BUNDLE_DISABLE_SHARED_GEMS` — any
+    /// value, even `"false"` or empty — shadows a global `path`: Bundler's
     /// `Settings#path` stops at the env tier (checked against Bundler
     /// 4.0.17: `explicit_path` is `nil` for each value).
     #[test]
-    fn env_path_system_shadows_the_global_config_path() {
+    fn env_path_flags_shadow_the_global_config_path() {
         let global = Some(PathBuf::from("/home/u/.bundle/config"));
-        for value in ["true", "false"] {
+        for value in ["true", "false", ""] {
             assert_eq!(
-                global_path_config_unless_env_path_system(global.clone(), Some(OsStr::new(value))),
+                global_path_config_unless_env_path_settings(
+                    global.clone(),
+                    Some(OsStr::new(value)),
+                    None
+                ),
                 None,
                 "BUNDLE_PATH__SYSTEM={value}"
             );
+            assert_eq!(
+                global_path_config_unless_env_path_settings(
+                    global.clone(),
+                    None,
+                    Some(OsStr::new(value))
+                ),
+                None,
+                "BUNDLE_DISABLE_SHARED_GEMS={value}"
+            );
         }
-        // Bundler reads an empty value as set too (`explicit_path` nil).
-        assert_eq!(
-            global_path_config_unless_env_path_system(global.clone(), Some(OsStr::new(""))),
-            None
-        );
         // Unset: the global file still applies.
         assert_eq!(
-            global_path_config_unless_env_path_system(global.clone(), None),
+            global_path_config_unless_env_path_settings(global.clone(), None, None),
             global
         );
     }
