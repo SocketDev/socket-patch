@@ -296,8 +296,14 @@ mod tests {
         // A CRLF file whose unit is mostly LF, and an LF file whose unit is
         // mostly CRLF: the unit keeps its own majority, the rest is untouched.
         for (text, unit_break) in [
-            ("[head]\r\na = 1\r\n\r\n[unit]\nb = 2\nc = 3\r\ne = 5\n", "\n"),
-            ("[head]\na = 1\n\n[unit]\r\nb = 2\r\nc = 3\ne = 5\r\n", "\r\n"),
+            (
+                "[head]\r\na = 1\r\n\r\n[unit]\nb = 2\nc = 3\r\ne = 5\n",
+                "\n",
+            ),
+            (
+                "[head]\na = 1\n\n[unit]\r\nb = 2\r\nc = 3\ne = 5\r\n",
+                "\r\n",
+            ),
         ] {
             let mut doc = toml_edit::Document::parse(text.to_owned()).unwrap();
             let before = whole(&doc, text, "");
