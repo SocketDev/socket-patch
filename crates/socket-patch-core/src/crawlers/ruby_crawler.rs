@@ -330,6 +330,7 @@ impl RubyCrawler {
 
         let mut roots: Vec<PathBuf> = Vec::new();
         let mut skipped_config_path = None;
+        let mut skipped_config_root = None;
         if Self::has_bundler_manifest(cwd).await {
             if let Some(value) = Self::app_config_bundle_path(cwd, app_config_env).await {
                 match resolve_config_bundle_path(cwd, &value, home) {
@@ -337,8 +338,14 @@ impl RubyCrawler {
                     // Refused by the containment guard. Recorded — not
                     // printed: the crawler has no --silent/--json context,
                     // so the CLI surfaces it (see
-                    // [`config_path_ignored_warning`]).
-                    None => skipped_config_path = Some(value),
+                    // [`config_path_ignored_warning`]). The resolved root is
+                    // kept too, for READ-ONLY verification only (see
+                    // [`Self::verification_only_gem_paths`]).
+                    None => {
+                        skipped_config_root =
+                            Some(resolve_bundle_path(cwd, Path::new(&value), home));
+                        skipped_config_path = Some(value);
+                    }
                 }
             }
             if let Some(v) = bundle_path_env.filter(|v| !v.is_empty()) {
@@ -369,7 +376,63 @@ impl RubyCrawler {
             stores,
             default_root_has_stores,
             skipped_config_path,
+            skipped_config_root,
         }
+    }
+
+    /// Installed-gem stores under a config-sourced `BUNDLE_PATH` the
+    /// containment guard refused (it resolves outside the project), for
+    /// READ-ONLY consumers: the hosted stale-install probe and `vex`'s
+    /// installed-copy lookup.
+    ///
+    /// The guard exists because crawled roots are apply WRITE targets, and a
+    /// committed `.bundle/config` is untrusted input. Bundler still installs
+    /// into and loads from that root, though, so a verifier that skipped it
+    /// would read "no installed copy" as "nothing to check" and attest a
+    /// patch over the unpatched gem bundler actually loads (#709). These
+    /// paths are therefore never part of [`Self::get_gem_paths`] (what apply
+    /// and rollback write through) — only of verification. Empty in global /
+    /// `--global-prefix` mode and whenever no config root was refused.
+    pub async fn verification_only_gem_paths(&self, options: &CrawlerOptions) -> Vec<PathBuf> {
+        self.verification_only_gem_paths_with_env(
+            options,
+            std::env::var_os("BUNDLE_PATH").as_deref(),
+            std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+            ambient_home().as_deref(),
+        )
+        .await
+    }
+
+    /// [`Self::verification_only_gem_paths`] with the environment passed
+    /// explicitly (the hermetic test seam, like
+    /// [`Self::get_gem_paths_with_env`]).
+    pub async fn verification_only_gem_paths_with_env(
+        &self,
+        options: &CrawlerOptions,
+        bundle_path_env: Option<&OsStr>,
+        app_config_env: Option<&OsStr>,
+        home_env: Option<&OsStr>,
+    ) -> Vec<PathBuf> {
+        if options.global || options.global_prefix.is_some() {
+            return Vec::new();
+        }
+        let discovery = Self::discover_bundle_stores_with_env(
+            &options.cwd,
+            bundle_path_env,
+            app_config_env,
+            home_env,
+        )
+        .await;
+        let Some(root) = discovery.skipped_config_root else {
+            return Vec::new();
+        };
+        // The same root reachable as a trusted store (env `BUNDLE_PATH`
+        // naming it too) is already probed by the regular discovery.
+        Self::bundle_root_gems_dirs(&root)
+            .await
+            .into_iter()
+            .filter(|gems_dir| !discovery.stores.contains(gems_dir))
+            .collect()
     }
 
     /// Local-mode Bundler install-root discovery against the AMBIENT
@@ -810,6 +873,11 @@ pub struct BundleStoreDiscovery {
     /// surface it via [`config_path_ignored_warning`] on their own
     /// warning channel.
     pub skipped_config_path: Option<String>,
+    /// The install root `skipped_config_path` resolves to (`~`
+    /// expanded, relative values joined onto the project root, lexically
+    /// normalized). Never a write target: only
+    /// [`RubyCrawler::verification_only_gem_paths`] probes it, read-only.
+    pub skipped_config_root: Option<PathBuf>,
 }
 
 /// The stable warning `(code, detail)` for a config-sourced `BUNDLE_PATH`
@@ -2083,6 +2151,99 @@ mod tests {
         let discovery =
             RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None).await;
         assert_eq!(discovery.skipped_config_path, None);
+    }
+
+    /// #709: a refused out-of-tree config root stays out of the write-path
+    /// discovery (`get_gem_paths`) but is exposed, read-only, to verifiers —
+    /// bundler installs into and loads from it, so a verifier that skipped
+    /// it would mistake "never looked" for "not installed".
+    #[tokio::test]
+    async fn refused_config_root_is_verification_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"colorize\"\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".bundle"))
+            .await
+            .unwrap();
+        let gems = outside.path().join("ruby").join("3.3.0").join("gems");
+        tokio::fs::create_dir_all(gems.join("colorize-0.8.1").join("lib"))
+            .await
+            .unwrap();
+        let value = outside.path().display().to_string();
+        tokio::fs::write(
+            dir.path().join(".bundle").join("config"),
+            format!("---\nBUNDLE_PATH: \"{value}\"\n"),
+        )
+        .await
+        .unwrap();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        let crawler = RubyCrawler::new();
+
+        let discovery =
+            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None).await;
+        assert!(
+            !discovery
+                .stores
+                .iter()
+                .any(|s| s.starts_with(outside.path())),
+            "the refused root must never become a write-path store: {:?}",
+            discovery.stores
+        );
+        let verify = crawler
+            .verification_only_gem_paths_with_env(&options, None, None, None)
+            .await;
+        let gems = normalize_lexically(&gems).unwrap();
+        assert_eq!(verify, vec![gems.clone()]);
+        let found = crawler
+            .find_by_purls(&verify[0], &["pkg:gem/colorize@0.8.1".to_string()])
+            .await
+            .unwrap();
+        assert!(found.contains_key("pkg:gem/colorize@0.8.1"));
+
+        // `~` spelling resolves against the injected home.
+        tokio::fs::write(
+            dir.path().join(".bundle").join("config"),
+            "---\nBUNDLE_PATH: \"~/\"\n",
+        )
+        .await
+        .unwrap();
+        let verify = crawler
+            .verification_only_gem_paths_with_env(
+                &options,
+                None,
+                None,
+                Some(outside.path().as_os_str()),
+            )
+            .await;
+        assert_eq!(verify, vec![gems.clone()]);
+
+        // The same root supplied through the trusted env is a regular store,
+        // so it is not reported a second time.
+        let verify = crawler
+            .verification_only_gem_paths_with_env(
+                &options,
+                Some(outside.path().as_os_str()),
+                None,
+                Some(outside.path().as_os_str()),
+            )
+            .await;
+        assert!(verify.is_empty(), "{verify:?}");
+
+        // Global mode never probes the project's bundler roots.
+        let global = CrawlerOptions {
+            global: true,
+            ..options
+        };
+        assert!(crawler
+            .verification_only_gem_paths_with_env(&global, None, None, None)
+            .await
+            .is_empty());
     }
 
     /// Unit contract for the config-root containment policy itself.
