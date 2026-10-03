@@ -975,7 +975,10 @@ pub async fn bundler_loaded_manifest_with_env(
 /// `sources` (see [`crate::formats::gem::mirror`]), described for the
 /// refusal's detail. Reads the app config (honoring `BUNDLE_APP_CONFIG`
 /// and `BUNDLE_IGNORE_CONFIG`) and the ambient `BUNDLE_MIRROR__ALL`.
-pub async fn bundler_source_mirror(root: &Path, sources: &[&str]) -> Option<String> {
+pub async fn bundler_source_mirror(
+    root: &Path,
+    sources: &[&str],
+) -> Option<crate::formats::gem::mirror::MirrorCapture> {
     bundler_source_mirror_with_env(
         root,
         sources,
@@ -994,7 +997,7 @@ pub async fn bundler_source_mirror_with_env(
     mirror_all_env: Option<&OsStr>,
     app_config_env: Option<&OsStr>,
     ignore_config: bool,
-) -> Option<String> {
+) -> Option<crate::formats::gem::mirror::MirrorCapture> {
     let config = read_app_config(root, app_config_env, ignore_config).await;
     crate::formats::gem::mirror::capturing_mirror(
         config.as_deref(),
@@ -1385,7 +1388,7 @@ mod tests {
         )
         .unwrap();
         let d = bundler_source_mirror_with_env(dir.path(), &src, None, None, false).await;
-        assert!(d.unwrap().contains("m.example"));
+        assert!(d.unwrap().setting.contains("m.example"));
         // BUNDLE_IGNORE_CONFIG: the file is not read, only the environment.
         assert_eq!(
             bundler_source_mirror_with_env(dir.path(), &src, None, None, true).await,
@@ -1393,7 +1396,7 @@ mod tests {
         );
         let env = OsStr::new("https://env.example/");
         let d = bundler_source_mirror_with_env(dir.path(), &src, Some(env), None, true).await;
-        assert!(d.unwrap().contains("BUNDLE_MIRROR__ALL"));
+        assert!(d.unwrap().setting.contains("BUNDLE_MIRROR__ALL"));
         // BUNDLE_APP_CONFIG moves the config file away from `.bundle`.
         assert_eq!(
             bundler_source_mirror_with_env(

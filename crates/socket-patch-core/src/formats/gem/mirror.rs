@@ -53,8 +53,18 @@ fn config_mirrors_source(contents: &str, source: &str) -> bool {
     found
 }
 
-/// The mirror setting that captures one of `sources`, described for the
-/// refusal's detail; `None` when Bundler fetches every source directly.
+/// A mirror setting that captures a patch-registry source, with the
+/// remedy that clears THAT setting (so re-running the scan converges).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorCapture {
+    /// The setting, described for the refusal's detail.
+    pub setting: String,
+    /// What to change so the next scan no longer detects it.
+    pub remedy: String,
+}
+
+/// The mirror setting that captures one of `sources`; `None` when Bundler
+/// fetches every source directly.
 ///
 /// `config` is the app config file's text (`None` when absent or ignored
 /// via `BUNDLE_IGNORE_CONFIG`), `env_all` the environment's
@@ -63,23 +73,36 @@ pub fn capturing_mirror(
     config: Option<&str>,
     env_all: Option<&str>,
     sources: &[&str],
-) -> Option<String> {
+) -> Option<MirrorCapture> {
     if let Some(url) = config.and_then(|text| bundle_config_setting(text, MIRROR_ALL_KEY)) {
-        return Some(format!(
-            "bundler's `mirror.all` ({url}) in the project's bundler config"
-        ));
+        return Some(MirrorCapture {
+            setting: format!("bundler's `mirror.all` ({url}) in the project's bundler config"),
+            remedy: format!(
+                "scope the mirror to rubygems.org instead (`bundle config set --local \
+                 mirror.https://rubygems.org {url}`, then `bundle config unset --local \
+                 mirror.all`)"
+            ),
+        });
     }
     if let Some(url) = env_all.map(str::trim).filter(|v| !v.is_empty()) {
-        return Some(format!(
-            "bundler's `mirror.all` ({url}) from the BUNDLE_MIRROR__ALL environment variable"
-        ));
+        return Some(MirrorCapture {
+            setting: format!(
+                "bundler's `mirror.all` ({url}) from the BUNDLE_MIRROR__ALL environment variable"
+            ),
+            remedy: format!(
+                "unset the BUNDLE_MIRROR__ALL environment variable and scope the mirror to \
+                 rubygems.org instead (`bundle config set --local \
+                 mirror.https://rubygems.org {url}`)"
+            ),
+        });
     }
     let text = config?;
     sources
         .iter()
         .find(|source| config_mirrors_source(text, source))
-        .map(|source| {
-            format!("a bundler `mirror.{source}` setting in the project's bundler config")
+        .map(|source| MirrorCapture {
+            setting: format!("a bundler `mirror.{source}` setting in the project's bundler config"),
+            remedy: format!("remove it (`bundle config unset --local mirror.{source}`)"),
         })
 }
 
@@ -92,17 +115,17 @@ mod tests {
     #[test]
     fn mirror_all_in_the_app_config_captures_every_source() {
         let cfg = "---\nBUNDLE_MIRROR__ALL: \"https://artifactory.example/api/gems/rubygems/\"\n";
-        let d = capturing_mirror(Some(cfg), None, &[SRC]).unwrap();
-        assert!(d.contains("mirror.all"), "{d}");
-        assert!(d.contains("artifactory.example"), "{d}");
+        let c = capturing_mirror(Some(cfg), None, &[SRC]).unwrap();
+        assert!(c.setting.contains("mirror.all"), "{c:?}");
+        assert!(c.setting.contains("artifactory.example"), "{c:?}");
         // Even with no gem source to compare: `all` matches any URI.
         assert!(capturing_mirror(Some(cfg), None, &[]).is_some());
     }
 
     #[test]
     fn mirror_all_from_the_environment_captures_every_source() {
-        let d = capturing_mirror(None, Some("https://nexus.example/rubygems/"), &[SRC]).unwrap();
-        assert!(d.contains("BUNDLE_MIRROR__ALL"), "{d}");
+        let c = capturing_mirror(None, Some("https://nexus.example/rubygems/"), &[SRC]).unwrap();
+        assert!(c.setting.contains("BUNDLE_MIRROR__ALL"), "{c:?}");
         // An empty value is unset.
         assert_eq!(capturing_mirror(None, Some(""), &[SRC]), None);
     }
@@ -123,8 +146,8 @@ mod tests {
             "BUNDLE_MIRROR__HTTPS://PATCH__SOCKET__DEV/GEM/TOK___1/0A1B___2C/"
         );
         let cfg = format!("---\n{key}: \"https://mirror.example/\"\n");
-        let d = capturing_mirror(Some(&cfg), None, &[SRC]).unwrap();
-        assert!(d.contains(SRC), "{d}");
+        let c = capturing_mirror(Some(&cfg), None, &[SRC]).unwrap();
+        assert!(c.setting.contains(SRC), "{c:?}");
         // Bundler normalizes the URI to end in `/`.
         let bare = SRC.trim_end_matches('/');
         assert!(capturing_mirror(Some(&cfg), None, &[bare]).is_some());
@@ -139,7 +162,46 @@ mod tests {
     #[test]
     fn the_app_config_outranks_the_environment_in_the_detail() {
         let cfg = "---\nBUNDLE_MIRROR__ALL: \"https://a.example/\"\n";
-        let d = capturing_mirror(Some(cfg), Some("https://b.example/"), &[SRC]).unwrap();
-        assert!(d.contains("a.example"), "{d}");
+        let c = capturing_mirror(Some(cfg), Some("https://b.example/"), &[SRC]).unwrap();
+        assert!(c.setting.contains("a.example"), "{c:?}");
+    }
+
+    /// The remedy clears the setting that was detected: applying it (as
+    /// bundler would store the result) makes the next check pass.
+    #[test]
+    fn each_remedy_converges() {
+        let scoped = "BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/: \"https://m.example/\"\n";
+
+        // `mirror.all` in the app config: set the scoped key, unset `all`.
+        let cfg = "---\nBUNDLE_MIRROR__ALL: \"https://m.example/\"\n";
+        let c = capturing_mirror(Some(cfg), None, &[SRC]).unwrap();
+        assert!(
+            c.remedy
+                .contains("mirror.https://rubygems.org https://m.example/"),
+            "{c:?}"
+        );
+        assert!(
+            c.remedy.contains("bundle config unset --local mirror.all"),
+            "{c:?}"
+        );
+        let fixed = format!("---\n{scoped}");
+        assert_eq!(capturing_mirror(Some(&fixed), None, &[SRC]), None);
+
+        // The environment's `mirror.all`: unsetting the variable is required.
+        let c = capturing_mirror(None, Some("https://m.example/"), &[SRC]).unwrap();
+        assert!(c.remedy.contains("unset the BUNDLE_MIRROR__ALL"), "{c:?}");
+        assert!(!c.remedy.contains("unset --local mirror.all"), "{c:?}");
+        assert_eq!(capturing_mirror(Some(&fixed), None, &[SRC]), None);
+
+        // A mirror keyed to the patch-registry source: unset that key.
+        let cfg = format!("---\n{}: \"https://m.example/\"\n", mirror_key_for(SRC));
+        let c = capturing_mirror(Some(&cfg), None, &[SRC]).unwrap();
+        assert!(
+            c.remedy
+                .contains(&format!("bundle config unset --local mirror.{SRC}")),
+            "{c:?}"
+        );
+        assert!(!c.remedy.contains("mirror.all"), "{c:?}");
+        assert_eq!(capturing_mirror(Some("---\n"), None, &[SRC]), None);
     }
 }

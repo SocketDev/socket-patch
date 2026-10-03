@@ -571,14 +571,13 @@ async fn keep_bundler_loaded_gem_files(
         // #681: a mirror serves the upstream gem for the redirected source,
         // so bundler would install unpatched bytes while the run (and its
         // VEX) reported the gem redirected. Refuse every gem redirect.
-        mirror.map(|setting| RewriteWarning {
+        mirror.map(|capture| RewriteWarning {
             code: "redirect_gem_mirror_overrides_source".into(),
             detail: format!(
-                "{setting} routes the Socket patch-registry source to that mirror, which \
-                 serves the unpatched upstream gem; no gem was redirected. Scope the \
-                 mirror to rubygems.org instead (`bundle config set --local \
-                 mirror.https://rubygems.org <url>`, then `bundle config unset mirror.all`) \
-                 and re-run the scan"
+                "{} routes the Socket patch-registry source to that mirror, which serves \
+                 the unpatched upstream gem; no gem was redirected. To fix, {} and re-run \
+                 the scan",
+                capture.setting, capture.remedy
             ),
         })
     };
