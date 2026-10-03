@@ -98,7 +98,12 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   `dependencies`, extras or marker-split lines, or reached through a PEP 735
   `include-group`, rolls back byte for byte (the `extras` and
   `include-group` lanes of `e2e_redirect_uv_build`, uv ≥ 0.4.27). An entry
-  whose marker matches no declaration is still refused. `[tool.uv] constraint-dependencies` /
+  whose marker matches no declaration is still refused. Declaration-owned
+  simple equality markers (`extra == 'name'`) are matched explicitly. More
+  complex `extra` predicates with differing version clauses remain refused,
+  as do declarations whose lowered markers are indistinguishable: hosted
+  URLs erase the specifiers needed to recover their provenance. Refusals
+  leave the lock and paired metadata unchanged. `[tool.uv] constraint-dependencies` /
   `build-constraint-dependencies` naming the package are repointed in the
   lock's `[manifest]` `constraints` / `build-constraints` entries, which uv
   ≥ 0.5.6 serializes with the package's source. uv 0.2.37–0.5.3 serialize

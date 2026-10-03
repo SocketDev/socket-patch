@@ -1086,8 +1086,10 @@ impl SpecStyle {
 ///
 /// When every declaration agrees, that is the answer whatever the marker.
 /// Otherwise uv's lowering picks one: the marker's `extra == '<x>'` terms
-/// name the extras it came from (none: `dependencies`), and the rest of the
-/// marker is the declaration's own.
+/// name the extras it came from (or a declaration-owned simple equality),
+/// and the rest of the marker is the declaration's own. More complex
+/// declaration-owned extra predicates can lower to the same marker, so
+/// differing clauses remain ambiguous and are refused for those shapes.
 fn declared_clauses(
     meta: &Metadata,
     declared: Declared<'_>,
@@ -1114,6 +1116,22 @@ fn declared_clauses(
         Ok(found)
     };
     let mut set: Vec<&Declaration<'_>> = named.iter().collect();
+    // The matcher understands a declaration-owned `extra == '<name>'`,
+    // but uv can lower other predicates (including reversed equality) to
+    // that same marker. Without their erased specifiers, keep differing
+    // clauses ambiguous rather than discard a possible declaration.
+    static SIMPLE_EXTRA: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"^\s*extra\s*==\s*(?:'[A-Za-z0-9._-]+'|"[A-Za-z0-9._-]+")\s*$"#)
+            .expect("static simple extra regex")
+    });
+    let unsupported_extra = named.iter().any(|d| {
+        d.spec.split_once(';').is_some_and(|(_, marker)| {
+            marker
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|token| token == "extra")
+                && !SIMPLE_EXTRA.is_match(marker)
+        })
+    });
     let marker = marker.unwrap_or("");
     let extras = marker_extras(marker);
     let narrowings: [&dyn Fn(&Declaration<'_>) -> bool; 2] = [
@@ -1131,6 +1149,9 @@ fn declared_clauses(
     for narrow in narrowings {
         if let Ok(Some(clauses)) = agreed(&set) {
             return Ok(Some(clauses));
+        }
+        if unsupported_extra {
+            break;
         }
         let narrowed: Vec<&Declaration<'_>> = set.iter().copied().filter(|d| narrow(d)).collect();
         if narrowed.is_empty() {
@@ -1679,6 +1700,45 @@ mod declaration_tests {
                 ],
                 &[]
             )
+        );
+    }
+
+    /// A declaration-owned extra predicate can collide with uv's lowering
+    /// of optional group membership. Different clauses must remain refused.
+    #[test]
+    fn declaration_owned_extra_predicates_keep_ambiguity() {
+        for own in [
+            "extra == 'x'",
+            "'x' == extra",
+            "extra != 'y'",
+            "extra in 'x,y'",
+            "extra not in 'y'",
+            "(extra == 'x' or extra == 'y')",
+        ] {
+            let pyproject = format!(
+                "{HEAD}dependencies = [\"six>=1.10; {own}\"]\n\n\
+                 [project.optional-dependencies]\nx = [\"six==1.16.0\"]\n"
+            );
+            let marker = "extra == 'x'";
+            let hosted = lock(&[six(Some(marker)), six(Some(marker))], &[]);
+            let err = unwind(&pyproject, &hosted).unwrap_err();
+            assert!(err.contains("different specifiers"), "{own}: {err}");
+        }
+    }
+
+    /// Matching version clauses need no provenance inference, even when
+    /// an explicit extra predicate and a lowered group have the same marker.
+    #[test]
+    fn declaration_owned_extra_with_agreed_clauses_restores() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six==1.16.0; 'x' == extra\"]\n\n\
+             [project.optional-dependencies]\nx = [\"six==1.16.0\"]\n"
+        );
+        let marker = "extra == 'x'";
+        let hosted = lock(&[six(Some(marker))], &[]);
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(&[spec("==1.16.0", Some(marker))], &[])
         );
     }
 
