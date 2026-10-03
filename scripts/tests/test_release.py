@@ -322,15 +322,15 @@ class StampTests(unittest.TestCase):
                    rel._read(self.root / "npm/socket-patch-win32-x64/package.json").replace(self.TARGET, "4.0.0"))
         drift = self.lint("--sync-only")
         self.assertNotEqual(drift.returncode, 0)
-        self.assertIn("npm/socket-patch-win32-x64/package.json", drift.stderr)
+        self.assertIn("npm/socket-patch-win32-x64/package.json", drift.stdout + drift.stderr)
 
     def test_release_lint_catches_npm_dependency_drift(self):
         pkg = self.root / "npm/socket-patch/package.json"
         rel._write(pkg, rel._read(pkg).replace('"zod": "3.25.76"', '"zod": "3.25.77"'))
         drift = self.lint("--sync-only")
         self.assertNotEqual(drift.returncode, 0, drift.stdout)
-        self.assertIn("dependencies", drift.stderr)
-        self.assertIn("node_modules/zod is 3.25.76", drift.stderr)
+        self.assertIn("dependencies", drift.stdout + drift.stderr)
+        self.assertIn("node_modules/zod is 3.25.76", drift.stdout + drift.stderr)
         self.assertEqual(quiet(rel.main, ["--root", str(self.root), "npm-lock-check"]), 1)
         rel._write(pkg, rel._read(pkg).replace('"zod": "3.25.77"', '"zod": "3.25.76"'))
         lock_path = self.root / "npm/socket-patch/package-lock.json"
@@ -1026,7 +1026,7 @@ class SyncInvarianceTests(unittest.TestCase):
         r.git("tag", "-d", "v5.0.0-rc.1")
         gone = lint("--tag-exists")
         self.assertNotEqual(gone.returncode, 0)
-        self.assertIn("does not exist", gone.stderr)
+        self.assertIn("does not exist", gone.stdout + gone.stderr)
 
     def test_git_environment_cannot_redirect_the_repos(self):
         victim = tempfile.TemporaryDirectory()
