@@ -966,9 +966,12 @@ fn rewrite_one_npm_lock(
                 // here would put the hosted URL in the lockfile (confirming
                 // and VEX-attesting the patch) while the unpatched bundled
                 // bytes keep installing. Mirrors the vendored backend's
-                // `vendor_bundled_instance_skipped` refusal.
+                // `vendor_bundled_instance_skipped` refusal. The uuid is
+                // recorded so the in-run `--vex` verifies instead of
+                // assuming the patch applied (#325, as Bun's #469).
                 if entry.get("inBundle").and_then(Value::as_bool) == Some(true) {
                     matched_any = true;
+                    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
                     result.warnings.push(RewriteWarning {
                         code: "redirect_npm_bundled_instance_skipped".into(),
                         detail: format!(
@@ -1113,6 +1116,7 @@ fn rewrite_npm_v2_deps(
             // fail-open as the `packages` guard above.
             if entry.get("bundled").and_then(Value::as_bool) == Some(true) {
                 *matched_any = true;
+                result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
                 result.warnings.push(RewriteWarning {
                     code: "redirect_npm_bundled_instance_skipped".into(),
                     detail: format!(
@@ -13643,6 +13647,10 @@ mod tests {
             "a bundled skip is a MATCH — not-found must stay quiet: {:?}",
             r.warnings
         );
+        assert!(
+            r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+            "#325: the skipped bundled copy must keep the patch out of the in-run VEX"
+        );
     }
 
     /// #326: npm installs a git, remote-tarball or `file:` dependency from
@@ -14007,6 +14015,10 @@ mod tests {
             "partial coverage must be surfaced: {:?}",
             r.warnings
         );
+        assert!(
+            r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+            "#325: a redirected sibling must not let the in-run VEX attest the patch"
+        );
     }
 
     /// The v1/v2 legacy `dependencies` tree spells the bundled flag
@@ -14053,6 +14065,10 @@ mod tests {
             warning_codes(&r).contains(&"redirect_npm_bundled_instance_skipped"),
             "legacy bundled skip must warn: {:?}",
             r.warnings
+        );
+        assert!(
+            r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+            "#325: the legacy bundled skip must be recorded like `inBundle`"
         );
     }
 
