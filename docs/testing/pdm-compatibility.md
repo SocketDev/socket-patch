@@ -77,10 +77,11 @@ Measured details:
   conda env. A project with `uv.lock` or `poetry.lock` is not treated as
   PDM's. A base interpreter means PEP 582 (`__pypackages__/<X.Y>/lib`) only
   when `python.use_venv` is off (`PDM_USE_VENV`, else `[python] use_venv` in
-  the first of the project's `pdm.toml` / `.pdm.toml`, the user config
+  the project's legacy `.pdm.toml` over `pdm.toml`, then the user config
   (`$PDM_CONFIG_FILE` or `<user config dir>/pdm/config.toml`) and the site
-  config (`/etc/xdg/pdm/config.toml` or the first absolute `$XDG_CONFIG_DIRS`
-  entry, `/Library/Application Support/pdm`, `%PROGRAMDATA%\pdm\pdm`), as a bool or
+  config (`pdm/config.toml` under the first absolute `$XDG_CONFIG_DIRS`
+  entry on Linux/macOS, defaulting to `/etc/xdg` or `/Library/Application Support`,
+  or `%PROGRAMDATA%\pdm\pdm\config.toml` on Windows), as a bool or
   the string PDM 2.27+ writes; off by default only for PDM 1.x). Otherwise the
   activated or in-project venv is used, with `__pypackages__` as the last
   resort. `PDM_IGNORE_SAVED_PYTHON` and `PDM_IGNORE_ACTIVE_VENV` are

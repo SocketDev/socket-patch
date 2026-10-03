@@ -506,8 +506,9 @@ async fn pdm_uses_venv(cwd: &Path, var: &impl Fn(&str) -> Option<String>) -> boo
 }
 
 /// The first `[table] key` set in PDM's file-backed config for the project
-/// at `cwd`, highest precedence first: the project's `pdm.toml` (PDM 2.x)
-/// or legacy `.pdm.toml`, then the user config ([`pdm_user_config_files`]),
+/// at `cwd`, highest precedence first: legacy `.pdm.toml` settings overlay
+/// the project's `pdm.toml` (as in PDM's `project_config`), then the user
+/// config ([`pdm_user_config_files`]),
 /// then the site config ([`pdm_site_config_dirs`]), the defaults layer PDM
 /// puts under the user config. Environment overrides are the caller's.
 async fn pdm_project_setting(
@@ -519,7 +520,7 @@ async fn pdm_project_setting(
     let home = var("HOME")
         .or_else(|| var("USERPROFILE"))
         .map(PathBuf::from);
-    let files = [cwd.join("pdm.toml"), cwd.join(".pdm.toml")]
+    let files = [cwd.join(".pdm.toml"), cwd.join("pdm.toml")]
         .into_iter()
         .chain(pdm_user_config_files(home.as_deref(), var))
         .chain(
@@ -2034,27 +2035,27 @@ fn pdm_user_config_files(
 
 /// PDM's site config dir (platformdirs' `site_config_path("pdm")`), whose
 /// `config.toml` PDM reads as the defaults under the user config: the
-/// first `$XDG_CONFIG_DIRS` entry (default `/etc/xdg`) + `/pdm` on Linux,
-/// `/Library/Application Support/pdm` on macOS, and
+/// first absolute `$XDG_CONFIG_DIRS` entry + `/pdm` on Linux and macOS,
+/// defaulting to `/etc/xdg/pdm` or `/Library/Application Support/pdm`, and
 /// `%PROGRAMDATA%\pdm\pdm` on Windows.
-#[cfg_attr(target_os = "macos", allow(unused_variables))]
 fn pdm_site_config_dirs(var: &impl Fn(&str) -> Option<String>) -> Vec<PathBuf> {
-    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    #[cfg(not(windows))]
     {
         // The first absolute entry: an empty or relative one (a leading
         // `:` from `$XDG_CONFIG_DIRS:/other` with the variable unset) is
         // not a config dir, per the XDG spec.
         let dirs = var("XDG_CONFIG_DIRS").unwrap_or_default();
+        let default = if cfg!(target_os = "macos") {
+            "/Library/Application Support"
+        } else {
+            "/etc/xdg"
+        };
         let first = dirs
             .split(':')
-            .map(|d| d.trim_end_matches('/'))
+            .map(str::trim)
             .find(|d| Path::new(d).is_absolute())
-            .unwrap_or("/etc/xdg");
+            .unwrap_or(default);
         vec![PathBuf::from(first).join("pdm")]
-    }
-    #[cfg(target_os = "macos")]
-    {
-        vec![PathBuf::from("/Library/Application Support/pdm")]
     }
     #[cfg(windows)]
     {
@@ -3005,6 +3006,63 @@ mod tests {
         }
     }
 
+    /// PDM overlays legacy project keys onto pdm.toml. A modern string must
+    /// not shadow a legacy bool once both encodings are understood.
+    #[tokio::test]
+    async fn pdm_legacy_config_overrides_modern_string_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, lib, stray) = pdm_pep582_fixture(tmp.path());
+        for (modern, legacy) in [(true, false), (false, true)] {
+            std::fs::write(
+                project.join("pdm.toml"),
+                format!("[python]\nuse_venv = \"{modern}\"\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                project.join(".pdm.toml"),
+                format!("[python]\nuse_venv = {legacy}\n"),
+            )
+            .unwrap();
+            let expected = if legacy { &stray } else { &lib };
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &env_of(&[])).await,
+                vec![expected.clone()],
+                "modern string {modern}, legacy bool {legacy}"
+            );
+            // Environment overrides still outrank both project files.
+            let env = env_of(&[("PDM_USE_VENV", modern.to_string())]);
+            let expected = if modern { &stray } else { &lib };
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &env).await,
+                vec![expected.clone()],
+                "environment {modern}, legacy bool {legacy}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pdm_legacy_config_missing_key_uses_modern_setting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, lib, stray) = pdm_pep582_fixture(tmp.path());
+        std::fs::write(
+            project.join(".pdm.toml"),
+            "[python]\npath = \"unused-base-python\"\n",
+        )
+        .unwrap();
+        for modern in [false, true] {
+            std::fs::write(
+                project.join("pdm.toml"),
+                format!("[python]\nuse_venv = \"{modern}\"\n"),
+            )
+            .unwrap();
+            let expected = if modern { &stray } else { &lib };
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &env_of(&[])).await,
+                vec![expected.clone()]
+            );
+        }
+    }
+
     /// #609: `pdm config python.use_venv false` (no `-l`) writes the user
     /// config, which PDM reads under the project's `pdm.toml`; so does a
     /// `$PDM_CONFIG_FILE`.
@@ -3128,7 +3186,7 @@ mod tests {
 
     /// The site config dir is the first ABSOLUTE `$XDG_CONFIG_DIRS` entry:
     /// a leading empty segment (`:/etc/xdg`) does not drop the site layer.
-    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    #[cfg(not(windows))]
     #[test]
     fn pdm_site_config_dir_skips_empty_and_relative_xdg_entries() {
         let dirs = |value: &str| {
@@ -3142,18 +3200,25 @@ mod tests {
             dirs("relative:/etc/site/:/etc/other"),
             vec![PathBuf::from("/etc/site/pdm")]
         );
-        assert_eq!(dirs(""), vec![PathBuf::from("/etc/xdg/pdm")]);
-        assert_eq!(dirs(":"), vec![PathBuf::from("/etc/xdg/pdm")]);
+        assert_eq!(dirs("/"), vec![PathBuf::from("/pdm")]);
         assert_eq!(
-            pdm_site_config_dirs(&|_: &str| None),
-            vec![PathBuf::from("/etc/xdg/pdm")]
+            dirs(" /etc/site/ :/etc/other"),
+            vec![PathBuf::from("/etc/site/pdm")]
         );
+        let default = if cfg!(target_os = "macos") {
+            PathBuf::from("/Library/Application Support/pdm")
+        } else {
+            PathBuf::from("/etc/xdg/pdm")
+        };
+        for value in ["", ":", "relative"] {
+            assert_eq!(dirs(value), vec![default.clone()]);
+        }
+        assert_eq!(pdm_site_config_dirs(&|_: &str| None), vec![default]);
     }
 
     /// The platformdirs site config dir a test can relocate: the first
-    /// `$XDG_CONFIG_DIRS` entry on Linux, `%PROGRAMDATA%\pdm\pdm` on
-    /// Windows. (macOS's `/Library/Application Support/pdm` is fixed.)
-    #[cfg(not(target_os = "macos"))]
+    /// `$XDG_CONFIG_DIRS` entry on Linux/macOS, `%PROGRAMDATA%\pdm\pdm`
+    /// on Windows.
     fn pdm_test_site_config(root: &Path) -> (PathBuf, Vec<(&'static str, String)>) {
         let xdg = root.join("etc").join("xdg");
         let program_data = root.join("program-data");
@@ -3177,7 +3242,6 @@ mod tests {
 
     /// #609: the site config is PDM's lowest config layer, so a
     /// machine-wide `python.use_venv = false` means PEP 582 too.
-    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn pdm_use_venv_is_read_from_the_site_config() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3202,7 +3266,6 @@ mod tests {
 
     /// #566: `-g` reads PDM's global-project, venv and interpreter
     /// locations from the site config as well as the user config.
-    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn pdm_global_settings_are_read_from_the_site_config() {
         let tmp = tempfile::tempdir().unwrap();
