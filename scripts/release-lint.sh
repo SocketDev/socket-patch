@@ -13,7 +13,11 @@
 #      <version> --check`, what `scripts/version-sync.sh` runs) is a no-op —
 #      every stamped site (Cargo.toml, Cargo.lock, npm manifests and lock)
 #      already carries the version, byte for byte. Catches hand-edited drift
-#      in any single site. Offline; writes nothing.
+#      in any single site. Plus `scripts/release.py npm-lock-check`: the npm
+#      wrapper's package-lock.json agrees with its package.json beyond the
+#      versions (dependency maps, engines, bin, a node_modules/ entry per
+#      dependency), the drift the old networked lock refresh used to catch.
+#      Offline; writes nothing.
 #   3. CHANGELOG.md has a `## [<version>]` section with non-empty release
 #      notes, and a stable version has no leftover `[<version>-rc.N]`
 #      sections (they fold into it at promotion). Skipped with --sync-only.
@@ -91,6 +95,11 @@ if STAMP_ERR="$(python3 scripts/release.py stamp --check "$VERSION" 2>&1 >/dev/n
   note "version coherence OK: every stamped site already carries $VERSION"
 else
   fail "${STAMP_ERR#release.py: error: } (run scripts/version-sync.sh $VERSION)"
+fi
+if LOCK_ERR="$(python3 scripts/release.py npm-lock-check 2>&1 >/dev/null)"; then
+  note "npm lock OK: npm/socket-patch/package-lock.json matches package.json"
+else
+  fail "$(printf '%s' "$LOCK_ERR" | tr '\n' ';')"
 fi
 
 # ── 3. CHANGELOG section + non-empty notes ─────────────────────────────────

@@ -8,6 +8,8 @@ Stdlib-only, one file, so every workflow and routine can run it with a bare
   stamp <V> [--check]            offline, byte-deterministic version stamp
                                  (Cargo.toml, Cargo.lock, 15 npm manifests,
                                  the npm wrapper lockfile)
+  npm-lock-check                 offline: the npm wrapper lockfile agrees with
+                                 its package.json beyond the stamped versions
   next-version                   the version the next rc cut would get,
                                  derived from git tags + burned release/*
                                  branches + the [Unreleased] headings
@@ -48,37 +50,47 @@ CHANGELOG model
 Sections are `## [Unreleased]` and `## [V] — YYYY-MM-DD`; subsections are
 `### Name`. A *block* is a top-level bullet with its continuation lines, a
 paragraph, or a fenced code block. Block identity is (subsection name, text
-with trailing whitespace stripped); all matching is exact.
+with trailing whitespace stripped); all matching is exact and counts
+occurrences (multisets): removing a shipped block removes one occurrence, so
+an identical entry written again later is kept. CRLF files stay CRLF.
 
 * cut V: apply sync-main in memory, then move every [Unreleased] block into a
-  new `## [V] — date` section directly below an empty [Unreleased].
+  new `## [V] — date` section directly below an empty [Unreleased]. The new
+  section's `###` subsections are put in canonical order (SUBSECTION_ORDER),
+  so the cut does not depend on the order main's [Unreleased] happens to have.
 * promote rc.K: fold every `[X-rc.N]` section with X-rc.N <= rc.K that is
   newer than the newest stable section into one `## [core] — date` section
   (oldest rc first; within a subsection later rcs append, exact duplicates
   dropped; rc headers removed). Later rc sections of the same core (rc.K+1..)
-  are abandoned: their blocks move back into [Unreleased] (appended to the
-  matching subsection, exact duplicates skipped) and their headers dropped.
+  are abandoned: their blocks move back into [Unreleased] (before the blocks
+  already there, exact duplicates of the folded section skipped) and their
+  headers are dropped.
 * sync-main (main's CHANGELOG := what it would be had every release-sync PR
   merged). For train-era tags (version > TRAIN_FLOOR):
     1. each stable tag S whose section main lacks: insert the tag's own [S]
-       section and remove exactly those blocks from [Unreleased];
+       section and remove those blocks (one occurrence each) from
+       [Unreleased];
     2. each rc section on main whose core already shipped (owner S = the
-       smallest stable tag >= its core): if it is <= the rc S was promoted
-       from (the newest same-core rc tag that is an ancestor of tag S) it
-       was folded into [S] and is deleted; otherwise it was abandoned, and
-       its blocks move back into [Unreleased] (skipping blocks already there
-       or in [S]);
+       smallest stable tag >= its core) is dropped, and its blocks (text from
+       its tag) minus [S]'s blocks, as a multiset shared by all rcs of S and
+       by step 1, move back into [Unreleased], oldest rc first and before the
+       blocks already there. A folded rc returns nothing; an abandoned later
+       rc, or a train rc cut beside a hotfix of the same core, returns exactly
+       what did not ship. No ancestry or rc-number rule is involved;
     3. each pending rc tag (no owner yet) whose section main lacks: insert
-       the tag's section and remove exactly those blocks from [Unreleased].
+       the tag's section and remove those blocks from [Unreleased].
   Only blocks of sections inserted *in this run* are removed from
   [Unreleased], so entries added to [Unreleased] later are never touched and
   a second run is a no-op. Section text always comes from the tag (the bytes
   that shipped); rc-section edits made on main are dropped by the fold.
+  With entries appended at the end of their subsection (the convention), the
+  next cut is byte-identical whether or not release-sync PRs merged.
 """
 
 from __future__ import annotations
 
 import argparse
+import collections
 import copy
 import datetime
 import functools
@@ -208,13 +220,26 @@ def parse_release_branch(name):
 
 # ── git ─────────────────────────────────────────────────────────────────────
 
+# Variables that make git operate on a repository other than the one at
+# `cwd` (a hook's GIT_DIR, for one). Git(root) always means root.
+_GIT_REPO_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                 "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+                 "GIT_CEILING_DIRECTORIES", "GIT_PREFIX")
+
+
+def git_env(extra=None):
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_REPO_ENV}
+    env.update(extra or {})
+    return env
+
+
 class Git:
     def __init__(self, root):
         self.root = Path(root)
 
     def run(self, *args, ok_codes=(0,)):
         proc = subprocess.run(["git", *args], cwd=self.root, capture_output=True,
-                              text=True, encoding="utf-8")
+                              text=True, encoding="utf-8", env=git_env())
         if proc.returncode not in ok_codes:
             raise ReleaseError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
         return proc
@@ -235,17 +260,14 @@ class Git:
     def show(self, rev, path):
         return self.run("show", f"{rev}:{path}").stdout
 
-    def is_ancestor(self, a, b):
-        return self.run("merge-base", "--is-ancestor", a, b, ok_codes=(0, 1)).returncode == 0
-
     def commit_date(self, rev):
         return self.run("log", "-1", "--format=%cI", f"{rev}^{{commit}}").stdout.strip()
 
 
 class TagSource:
-    """What sync-main needs to know about tags: which exist, the CHANGELOG at
-    each, and which rc each stable was promoted from. Backed by git here; the
-    tests hand in the same three facts from temp repos."""
+    """What sync-main needs to know about tags: which exist and the
+    CHANGELOG at each. Backed by git here; tests may hand in the same two
+    facts without git."""
 
     def __init__(self, git):
         self.git = git
@@ -260,15 +282,6 @@ class TagSource:
         if v not in self._changelogs:
             self._changelogs[v] = self.git.show(f"refs/tags/{self._tags[v]}", "CHANGELOG.md")
         return self._changelogs[v]
-
-    def promoted_from(self, stable):
-        """The newest same-core rc tag that is an ancestor of tag `stable`."""
-        cands = sorted((v for v in self._tags if v.is_rc and v.core == stable), reverse=True)
-        for rc in cands:
-            if self.git.is_ancestor(f"refs/tags/{self._tags[rc]}",
-                                    f"refs/tags/{self._tags[stable]}"):
-                return rc
-        return None
 
 
 # ── stamp ───────────────────────────────────────────────────────────────────
@@ -392,6 +405,45 @@ def stamp_files(root, version):
                        if not (_PLATFORM_LOCK_KEY.match(k) and v.get("version") != version)}
     put(npm_lock, _dump_json(obj))
     return changes
+
+
+_LOCK_TOP_FIELDS = ("name", "version", "dependencies", "devDependencies", "optionalDependencies",
+                    "peerDependencies", "engines", "bin")
+_EXACT_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")
+
+
+def npm_lock_drift(root):
+    """Offline coherence of npm/socket-patch/package-lock.json with its
+    package.json, beyond the version fields `stamp` owns: packages[""] must
+    repeat the manifest's dependency maps, engines, bin and name, and every
+    non-optional dependency needs a `node_modules/<name>` entry (at exactly
+    that version when the manifest pins one). Returns a list of problems.
+    (This is what the networked `npm install --package-lock-only` drift check
+    caught before the stamp went offline.)"""
+    root = Path(root)
+    pkg = json.loads(_read(root / "npm" / "socket-patch" / "package.json"))
+    lock = json.loads(_read(root / "npm" / "socket-patch" / "package-lock.json"))
+    top = (lock.get("packages") or {}).get("")
+    if top is None:
+        return ['package-lock.json: no packages[""] entry']
+    problems = []
+    for field in _LOCK_TOP_FIELDS:
+        want, have = pkg.get(field), top.get(field)
+        if field == "bin" and isinstance(want, str):
+            want = {pkg.get("name", "").split("/")[-1]: want}
+        if (want or None) != (have or None):
+            problems.append(f'package-lock.json packages[""].{field} != package.json {field}')
+    if lock.get("name") != pkg.get("name"):
+        problems.append("package-lock.json name != package.json name")
+    for field in ("dependencies", "devDependencies"):
+        for dep, spec in sorted((pkg.get(field) or {}).items()):
+            entry = lock["packages"].get(f"node_modules/{dep}")
+            if entry is None:
+                problems.append(f"package-lock.json has no node_modules/{dep} ({field})")
+            elif _EXACT_VERSION.match(spec) and entry.get("version") != spec:
+                problems.append(f"package-lock.json node_modules/{dep} is {entry.get('version')}, "
+                                f"package.json {field} pins {spec}")
+    return problems
 
 
 def stamp(root, version, check=False):
@@ -548,12 +600,22 @@ class Section:
         self.subs.append(s)
         return s
 
-    def remove(self, keys):
-        """Drop blocks whose key is in `keys`; drop emptied subsections."""
-        removed = 0
+    def key_counts(self):
+        return collections.Counter((name, b.text) for name, b in self.items())
+
+    def remove(self, counts):
+        """Drop blocks matching `counts` ({key: n}), at most n occurrences of
+        each key, oldest (first) first: a shipped block is removed once, so an
+        identical entry added again later stays. Drops emptied subsections."""
+        left, removed = collections.Counter(counts), collections.Counter()
         for s in self.subs:
-            keep = [b for b in s.blocks if (s.name, b.text) not in keys]
-            removed += len(s.blocks) - len(keep)
+            keep = []
+            for b in s.blocks:
+                if left[(s.name, b.text)] > 0:
+                    left[(s.name, b.text)] -= 1
+                    removed[(s.name, b.text)] += 1
+                else:
+                    keep.append(b)
             if len(keep) != len(s.blocks):
                 s.blocks = keep
                 if not keep and s.heading is None:
@@ -575,6 +637,34 @@ class Section:
         if self.preamble.blocks and len(self.subs) > 1:
             self.preamble.trail = max(self.preamble.trail, 1)
         return added
+
+    def return_items(self, items):
+        """Put blocks of an unshipped rc back: (subsection, block) pairs, in
+        their original order, go *before* the blocks already in each
+        subsection (they were written earlier than anything there now);
+        subsections that do not exist yet are created. Nothing is
+        de-duplicated (multiset semantics, like remove()). Returns the count."""
+        groups = {}
+        for name, block in items:
+            groups.setdefault(name, []).append(block)
+        for name, blocks in groups.items():
+            sub = self.sub(name, create=True)
+            old, sub.blocks = sub.blocks, []
+            for b in [Block(b.lines, 0) for b in blocks] + [
+                    Block(b.lines, b.gap if i else 0) for i, b in enumerate(old)]:
+                sub.append(b)
+        if self.preamble.blocks and len(self.subs) > 1:
+            self.preamble.trail = max(self.preamble.trail, 1)
+        return sum(len(b) for b in groups.values())
+
+    def canonicalize(self):
+        """Order subsections canonically (SUBSECTION_ORDER); block order
+        within a subsection is kept."""
+        self.subs = [self.subs[0]] + sorted(self.subs[1:], key=lambda s: subsection_rank(s.name))
+        for s in self.subs[1:-1]:
+            s.trail = max(s.trail, 1)
+        if self.preamble.blocks and len(self.subs) > 1:
+            self.preamble.trail = max(self.preamble.trail, 1)
 
     def render(self):
         out = [self.heading]
@@ -605,11 +695,17 @@ def _parse_section(heading, body):
 
 
 class Changelog:
-    def __init__(self, header, sections, ends_nl):
-        self.header, self.sections, self.ends_nl = header, sections, ends_nl
+    def __init__(self, header, sections, ends_nl, eol="\n"):
+        self.header, self.sections, self.ends_nl, self.eol = header, sections, ends_nl, eol
 
     @classmethod
     def parse(cls, text):
+        # A CRLF file (a Windows checkout: CHANGELOG.md is plain `text` in
+        # .gitattributes) is parsed as LF and rendered back as CRLF, so every
+        # generated line gets the file's own line ending.
+        eol = "\r\n" if text.count("\r\n") * 2 > text.count("\n") else "\n"
+        if eol == "\r\n":
+            text = text.replace("\r\n", "\n")
         ends_nl = text.endswith("\n")
         lines = text.split("\n")
         if ends_nl:
@@ -626,13 +722,13 @@ class Changelog:
                 raw.append((line, []))
                 continue
             (raw[-1][1] if raw else header).append(line)
-        return cls(header, [_parse_section(h, body) for h, body in raw], ends_nl)
+        return cls(header, [_parse_section(h, body) for h, body in raw], ends_nl, eol)
 
     def render(self):
         out = list(self.header)
         for s in self.sections:
             out += s.render()
-        return "\n".join(out) + ("\n" if self.ends_nl else "")
+        return self.eol.join(out) + (self.eol if self.ends_nl else "")
 
     def section(self, version):
         for s in self.sections:
@@ -686,6 +782,20 @@ def _heading(version, date):
     return f"## [{version}] — {date}"
 
 
+# Canonical `###` order of a cut section: breaking headings first, then Keep a
+# Changelog's order, then anything else; ties by name. A cut always uses it,
+# because the order [Unreleased] happens to have on main depends on whether
+# release-sync PRs merged (on an unsynced main, already-shipped subsections
+# keep their old positions), and the cut must not.
+SUBSECTION_ORDER = ("added", "changed", "deprecated", "removed", "fixed", "security")
+
+
+def subsection_rank(name):
+    low = (name or "").lower()
+    kac = next((i for i, k in enumerate(SUBSECTION_ORDER) if low.startswith(k)), len(SUBSECTION_ORDER))
+    return (0 if "breaking" in low else 1, kac, low, name or "")
+
+
 def heading_level(name):
     name = name.lower()
     if "breaking" in name or name.startswith("removed"):
@@ -722,35 +832,51 @@ def sync_main_changelog(text, tags):
     def owner(v):
         return next((s for s in stables if s >= v.core), None)
 
+    # Shipped-block budget per stable: [S]'s blocks, minus the ones this run
+    # already removed from [Unreleased] for it.
+    budget = {}
     for v in (v for v in train if not v.is_rc):
         if cl.section(v) is None:
             sec = tag_section(v)
             cl.insert(sec)
-            report["removedFromUnreleased"] += unrel.remove(sec.keys())
+            removed = unrel.remove(sec.key_counts())
+            budget[v] = sec.key_counts() - removed
+            report["removedFromUnreleased"] += sum(removed.values())
             report["inserted"].append(str(v))
 
-    promoted = {}
-    for sec in [s for s in cl.versioned() if s.version.is_rc]:
+    # Every rc section whose core has shipped is replaced by what did not
+    # ship: its blocks (text from its tag, the bytes that were cut) minus
+    # [S]'s blocks, as a multiset, oldest rc first. A folded rc returns
+    # nothing; a later rc abandoned at promotion, or a train rc cut beside a
+    # hotfix of the same core, returns exactly what [S] lacks. This is what
+    # an unsynced main's [Unreleased] keeps after step 1, so the result does
+    # not depend on which release-sync PRs merged.
+    returned = []
+    for sec in sorted((s for s in cl.versioned() if s.version.is_rc), key=lambda s: s.version):
         stable = owner(sec.version)
         if stable is None:
             continue
-        if stable not in promoted:
-            promoted[stable] = tags.promoted_from(stable)
-        rc = promoted[stable]
-        if rc is not None and sec.version <= rc:
-            report["folded"].append(str(sec.version))
-        else:
+        if stable not in budget:
             shipped = cl.section(stable)
-            report["returnedToUnreleased"] += unrel.append_items(
-                sec.items(), skip=shipped.keys() if shipped else ())
-            report["abandoned"].append(str(sec.version))
+            budget[stable] = shipped.key_counts() if shipped else collections.Counter()
+        left = budget[stable]
+        source = tag_section(sec.version) if sec.version in versions else sec
+        back = []
+        for name, block in source.items():
+            if left[(name, block.text)] > 0:
+                left[(name, block.text)] -= 1
+            else:
+                back.append((name, block))
+        returned += back
+        report["abandoned" if back else "folded"].append(str(sec.version))
         cl.drop(sec)
+    report["returnedToUnreleased"] += unrel.return_items(returned)
 
     for v in (v for v in train if v.is_rc and owner(v) is None):
         if cl.section(v) is None:
             sec = tag_section(v)
             cl.insert(sec)
-            report["removedFromUnreleased"] += unrel.remove(sec.keys())
+            report["removedFromUnreleased"] += sum(unrel.remove(sec.key_counts()).values())
             report["inserted"].append(str(v))
     return cl.render(), report
 
@@ -766,6 +892,7 @@ def roll_unreleased(text, version, date):
     if newer:
         raise ReleaseError(f"CHANGELOG.md already has a section >= {version}: [{max(newer)}]")
     sec = Section(_heading(version, date), unrel.subs)
+    sec.canonicalize()
     unrel.subs = [Sub(None, 1, [], 0)]
     cl.insert(sec)
     return cl.render()
@@ -796,9 +923,11 @@ def promote_changelog(text, rc, date):
     for s in fold[1:]:
         merged.append_items(s.items())
     unrel = cl.unreleased()
-    for s in sorted((s for s in rcs if s.version.core == rc.core and s.version > rc),
-                    key=lambda s: s.version):
-        unrel.append_items(s.items(), skip=merged.keys())
+    later = sorted((s for s in rcs if s.version.core == rc.core and s.version > rc),
+                   key=lambda s: s.version)
+    shipped = merged.keys()
+    unrel.return_items([(n, b) for s in later for n, b in s.items() if (n, b.text) not in shipped])
+    for s in later:
         cl.drop(s)
     newest = fold[-1]
     merged.subs[-1].trail = newest.subs[-1].trail
@@ -897,7 +1026,9 @@ def render_notes(text, version, repo=DEFAULT_REPO, unlogged=None):
 # ── release-blocker gate (DESIGN.md §3.5) ───────────────────────────────────
 
 class ApiError(Exception):
-    pass
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 def urllib_transport(method, url, headers):
@@ -926,7 +1057,7 @@ class GitHub:
         except Exception as e:  # network, TLS, timeouts: all fail closed
             raise ApiError(f"GET {url}: {e}") from e
         if not 200 <= status < 300:
-            raise ApiError(f"GET {url}: HTTP {status}")
+            raise ApiError(f"GET {url}: HTTP {status}", status)
         try:
             data = json.loads(body)
         except ValueError as e:
@@ -968,16 +1099,63 @@ def _iso(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+_LOGIN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,38})(?:\[bot\])?$")
+
+
 def _logins(env_value):
-    return {x.strip().lower() for x in (env_value or "").split(",") if x.strip()}
+    """A login list from a repo variable: comma- and/or whitespace-separated,
+    an optional leading `@`, case-insensitive. Anything that is not a GitHub
+    login is a config error (ReleaseError), never silently dropped."""
+    out = set()
+    for token in re.split(r"[\s,]+", env_value or ""):
+        login = token.strip().lstrip("@").lower()
+        if not token.strip():
+            continue
+        if not _LOGIN_RE.match(login):
+            raise ReleaseError(f"'{token}' is not a GitHub login")
+        out.add(login)
+    return out
 
 
 def _actor(event):
     return ((event.get("actor") or {}).get("login") or "").lower()
 
 
+def _is_blocker_label(name):
+    # GitHub label names are case-insensitive (`labels=` filters that way and
+    # a label can be renamed by case alone), so the gate compares that way.
+    return (name or "").lower() == BLOCKER_LABEL
+
+
 def _is_blocker_event(e, kind):
-    return e.get("event") == kind and (e.get("label") or {}).get("name") == BLOCKER_LABEL
+    return e.get("event") == kind and _is_blocker_label((e.get("label") or {}).get("name"))
+
+
+# A close whose event has no commit_id (GitHub's auto-close on a PR merge) is
+# matched to the merged PR(s) that cross-reference the issue and merged at
+# most this long before the close.
+PR_CLOSE_WINDOW = datetime.timedelta(seconds=120)
+
+
+def _closing_pr_merges(gh, number, close):
+    """Merge commit SHAs of the same-repo PRs that merged within
+    PR_CLOSE_WINDOW before `close` and cross-reference issue `number`."""
+    closed_at = _ts(close["created_at"])
+    shas = []
+    for e in gh.pages(f"/issues/{number}/timeline"):
+        if e.get("event") != "cross-referenced":
+            continue
+        src = (e.get("source") or {}).get("issue") or {}
+        merged_at = _ts((src.get("pull_request") or {}).get("merged_at"))
+        repo = ((src.get("repository") or {}).get("full_name") or "").lower()
+        if merged_at is None or repo != gh.repo.lower():
+            continue
+        if datetime.timedelta(0) <= closed_at - merged_at <= PR_CLOSE_WINDOW:
+            pr = gh.get(f"/pulls/{src['number']}")
+            if not pr.get("merged") or not pr.get("merge_commit_sha"):
+                raise ApiError(f"PR #{src['number']}: merged_at set but no merge commit")
+            shas.append(pr["merge_commit_sha"])
+    return shas
 
 
 def evaluate_blockers(gh, base, since, approvers, routine_actors):
@@ -986,32 +1164,75 @@ def evaluate_blockers(gh, base, since, approvers, routine_actors):
     def trusted(login):
         return bool(login) and login in approvers and login not in routine_actors
 
+    def in_base(sha):
+        return gh.get(f"/compare/{sha}...{base}").get("status") in ("ahead", "identical")
+
+    if not approvers or not routine_actors or not approvers - routine_actors:
+        return {"blocked": True, "blockers": [], "base": base, "since": since,
+                "error": "config: RELEASE_APPROVERS and RELEASE_ROUTINE_ACTORS must both be set "
+                         "and leave at least one trusted approver"}
     try:
         since_dt = _ts(since)
         t = _ts(gh.get(f"/commits/{base}")["commit"]["committer"]["date"])
+        if since_dt > t:
+            return {"blocked": True, "blockers": [], "base": base, "since": since,
+                    "error": f"since: {since} is after the base commit time {_iso(t)}"}
+        # The label must exist under its exact name: a deleted or renamed
+        # label drops off every issue without an `unlabeled` event.
+        try:
+            label = gh.get(f"/labels/{BLOCKER_LABEL}")
+        except ApiError as e:
+            if e.status != 404:
+                raise
+            label = {}
+        if label.get("name") != BLOCKER_LABEL:
+            return {"blocked": True, "blockers": [], "base": base, "since": since,
+                    "error": f"label: the '{BLOCKER_LABEL}' label does not exist under that exact "
+                             f"name (found {label.get('name')!r}); create it (DESIGN.md setup S5)"}
         candidates = set()
         for issue in gh.pages("/issues", state="open", labels=BLOCKER_LABEL):
             candidates.add(issue["number"])
         # `since` filters on updated_at, a superset of "closed since L".
         for issue in gh.pages("/issues", state="closed", labels=BLOCKER_LABEL, since=_iso(since_dt)):
             candidates.add(issue["number"])
-        # Unlabelled issues no longer match a label query; find them in the
-        # repo-wide event feed (newest first), back to the newest stable.
+        # Unlabelled issues no longer match a label query, and labelled ones
+        # whose label vanished without an event do not either; find both in
+        # the repo-wide event feed (newest first), back to `since`.
         stop = lambda page: any(_ts(e["created_at"]) < since_dt for e in page)
         for e in gh.pages("/issues/events", stop=stop):
-            if _ts(e["created_at"]) >= since_dt and _is_blocker_event(e, "unlabeled"):
+            if _ts(e["created_at"]) >= since_dt and (
+                    _is_blocker_event(e, "unlabeled") or _is_blocker_event(e, "labeled")):
                 candidates.add(e["issue"]["number"])
 
         blockers = []
         for number in sorted(candidates):
-            issue = gh.get(f"/issues/{number}")
+            try:
+                issue = gh.get(f"/issues/{number}")
+            except ApiError as e:
+                if e.status not in (404, 410):
+                    raise
+                blockers.append({"number": number, "reason": f"issue gone (HTTP {e.status}): "
+                                 "deleted, transferred or converted"})
+                continue
+            repo_url = (issue.get("repository_url") or "").lower()
+            if issue.get("number") != number or (
+                    repo_url and not repo_url.endswith(f"/repos/{gh.repo.lower()}")):
+                blockers.append({"number": number, "reason": "issue moved to another repository "
+                                 "or number (transferred)"})
+                continue
             events = sorted(gh.pages(f"/issues/{number}/events"),
                             key=lambda e: (_ts(e["created_at"]), e.get("id") or 0))
-            labelled = any(lbl.get("name") == BLOCKER_LABEL for lbl in issue.get("labels") or [])
-            unlabels = [e for e in events if _is_blocker_event(e, "unlabeled")]
-            if not labelled and not (unlabels and not trusted(_actor(unlabels[-1]))):
+            labelled = any(_is_blocker_label(lbl.get("name")) for lbl in issue.get("labels") or [])
+            marks = [e for e in events if _is_blocker_event(e, "labeled") or _is_blocker_event(e, "unlabeled")]
+            last = marks[-1] if marks else None
+            if labelled:
+                why = "labelled"
+            elif last is not None and last["event"] == "labeled":
+                why = "label removed without an unlabeled event"
+            elif last is not None and not trusted(_actor(last)):
+                why = f"unlabelled by untrusted @{_actor(last)}"
+            else:
                 continue  # never a blocker, or a trusted human unlabelled it last
-            why = "labelled" if labelled else f"unlabelled by untrusted @{_actor(unlabels[-1])}"
             if issue.get("state") != "closed":
                 blockers.append({"number": number, "reason": f"open, {why}"})
                 continue
@@ -1021,26 +1242,41 @@ def evaluate_blockers(gh, base, since, approvers, routine_actors):
                 continue
             close = closes[-1]
             if close.get("commit_id"):
-                status = gh.get(f"/compare/{close['commit_id']}...{base}").get("status")
-                if status in ("ahead", "identical"):
+                if in_base(close["commit_id"]):
                     continue  # the fix is in this tree
+                fix = f"fix {close['commit_id'][:12]} not in base"
+            else:
+                # A PR merge auto-close carries no commit_id: use the merge
+                # commit of the PR that closed it. Ambiguous -> all must be in.
+                merges = _closing_pr_merges(gh, number, close)
+                if merges and all(in_base(sha) for sha in merges):
+                    continue  # the closing PR's merge is in this tree
+                fix = (f"closing PR merge {merges[0][:12]} not in base" if merges
+                       else "no fix commit")
             if trusted(_actor(close)) and _ts(close["created_at"]) <= t:
                 continue  # a trusted human closed it before the base commit
-            fix = f"fix {close['commit_id'][:12]} not in base" if close.get("commit_id") else "no fix commit"
             blockers.append({"number": number,
                              "reason": f"closed by @{_actor(close) or '?'} ({fix}), {why}"})
         return {"blocked": bool(blockers), "blockers": blockers, "error": None,
                 "base": base, "baseTime": _iso(t), "since": _iso(since_dt)}
-    except (ApiError, KeyError, TypeError, ValueError) as e:
+    except (ApiError, AttributeError, KeyError, TypeError, ValueError) as e:
         return {"blocked": True, "blockers": [], "error": f"api-error: {e}", "base": base,
                 "since": since}
 
 
-def latest_stable_date(git):
+def latest_stable_date(git, base):
+    """The lower time bound for closed/unlabelled candidates: the committer
+    date of the merge-base of the newest stable tag L and `base` (L's cut
+    point on main), clamped to the base commit's own date. A tag is not
+    trusted for its date: any write-access account could point one at an
+    off-main commit with a forged future date and so hide recent closes;
+    the merge-base is a commit on main's history, at or before `base`. An
+    older bound only adds candidates, each still judged on its events."""
     stables = [v for v in git.tags() if not v.is_rc]
     if not stables:
         raise ReleaseError("no stable tag found — fetch tags or pass --since")
-    return git.commit_date(f"refs/tags/v{max(stables)}")
+    mb = git.run("merge-base", f"refs/tags/v{max(stables)}", base).stdout.strip()
+    return min((git.commit_date(mb), git.commit_date(base)), key=_ts)
 
 
 # ── sync-main ───────────────────────────────────────────────────────────────
@@ -1096,6 +1332,17 @@ def cmd_stamp(args):
     return 0
 
 
+def cmd_npm_lock_check(args):
+    problems = npm_lock_drift(Path(args.root))
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    if problems:
+        print("run `npm install --package-lock-only` in npm/socket-patch with npm 10", file=sys.stderr)
+        return 1
+    print("npm/socket-patch/package-lock.json matches package.json")
+    return 0
+
+
 def cmd_next_version(args):
     result = next_version(Git(args.root), args.ref, args.remote)
     print(json.dumps(result, indent=2) if args.json else result["version"])
@@ -1134,19 +1381,39 @@ def cmd_notes(args):
     return 0
 
 
+def blocker_config(approvers_env, routine_env):
+    """(approvers, routine_actors) from the repo variables, or ReleaseError.
+    Both must be set: an empty routine list would silently make a routine
+    identity that is also an approver (D3: mikolalysenko) trusted."""
+    approvers, routine = _logins(approvers_env), _logins(routine_env)
+    if not approvers:
+        raise ReleaseError("RELEASE_APPROVERS is empty")
+    if not routine:
+        raise ReleaseError("RELEASE_ROUTINE_ACTORS is empty (it must list every routine identity)")
+    if not approvers - routine:
+        raise ReleaseError("every RELEASE_APPROVERS login is also a routine actor; nobody is trusted")
+    return approvers, routine
+
+
 def cmd_blockers(args, transport=urllib_transport):
+    def refuse(error):
+        print(json.dumps({"blocked": True, "blockers": [], "error": error}, indent=2))
+        print(f"blocked: {error}", file=sys.stderr)
+        return 1
+
+    try:
+        approvers, routine = blocker_config(os.environ.get("RELEASE_APPROVERS"),
+                                            os.environ.get("RELEASE_ROUTINE_ACTORS"))
+    except ReleaseError as e:
+        return refuse(f"config: {e}")
     since = args.since
     if not since:
         try:
-            since = latest_stable_date(Git(args.root))
+            since = latest_stable_date(Git(args.root), args.base)
         except ReleaseError as e:
-            result = {"blocked": True, "blockers": [], "error": f"since: {e}"}
-            print(json.dumps(result, indent=2))
-            return 1
+            return refuse(f"since: {e}")
     gh = GitHub(args.repo, os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"), transport)
-    result = evaluate_blockers(gh, args.base, since,
-                               _logins(os.environ.get("RELEASE_APPROVERS")),
-                               _logins(os.environ.get("RELEASE_ROUTINE_ACTORS")))
+    result = evaluate_blockers(gh, args.base, since, approvers, routine)
     print(json.dumps(result, indent=2))
     for b in result["blockers"]:
         print(f"release-blocker #{b['number']}: {b['reason']}", file=sys.stderr)
@@ -1170,6 +1437,9 @@ def build_parser():
     s.add_argument("version")
     s.add_argument("--check", action="store_true", help="write nothing; exit 1 if the stamp would change a file")
     s.set_defaults(fn=cmd_stamp)
+
+    s = sub.add_parser("npm-lock-check", help="offline: the npm wrapper lock matches its package.json")
+    s.set_defaults(fn=cmd_npm_lock_check)
 
     s = sub.add_parser("next-version", help="the version the next rc cut gets")
     s.add_argument("--ref", default="HEAD", help="candidate commit whose CHANGELOG is read")
@@ -1201,8 +1471,8 @@ def build_parser():
     s = sub.add_parser("blockers", help="the release-blocker gate; exit 1 when blocked")
     s.add_argument("--base", required=True, help="the candidate tree's base commit")
     s.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY") or DEFAULT_REPO)
-    s.add_argument("--since", help="ISO time bound for closed/unlabelled candidates "
-                                   "(default: the newest stable tag's commit date)")
+    s.add_argument("--since", help="ISO time bound for closed/unlabelled candidates (default: the "
+                                   "date of merge-base(newest stable tag, --base), at most --base's)")
     s.set_defaults(fn=cmd_blockers)
     return p
 

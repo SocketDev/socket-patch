@@ -186,7 +186,9 @@ jobs:
   #   - the release train's rolling `release-sync` PR (docs/release-train/
   #     DESIGN.md §3.7), which moves main to the newest cut tag (rc or
   #     stable): CHANGELOG has a non-empty section for that version and the
-  #     tag already exists;
+  #     tag already exists. Only a same-repo `release-sync` branch targeting
+  #     main gets this path; the same branch name from a fork (or aimed at
+  #     another base) gets the full gate below;
   #   - any other PR that bumps the workspace version: the full gate —
   #     CHANGELOG has a dated, non-empty section for the new version and the
   #     tag doesn't already exist.
@@ -203,8 +205,12 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
         run: |
-          if [ "$EVENT_NAME" = "pull_request" ] && [ "$HEAD_REF" = "release-sync" ]; then
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$HEAD_REF" = "release-sync" ] \
+              && [ "$HEAD_REPO" = "$REPO" ] && [ "$BASE_REF" = "main" ]; then
             bash scripts/release-lint.sh --tag-exists
             exit 0
           fi
