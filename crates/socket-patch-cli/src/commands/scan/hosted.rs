@@ -1253,10 +1253,25 @@ pub(crate) async fn run_redirect_selected(
         // rediscovers older pins too, so a candidate-only set would miss some
         // refused hosted gems. Keep their actual installed-byte verification,
         // but do not infer applied status from the intercepted source.
-        params.hosted_gem_mirror_refused = rewrite
-            .warnings
-            .iter()
-            .any(|warning| warning.code == "redirect_gem_mirror_overrides_source");
+        // Check for mirrors independently of whether gem candidates are
+        // present: a lockfile-discovered gem pin can still be affected by a
+        // capturing mirror even when this run has no gem grants. Probe for
+        // mirror.all and hostname/exact-source mirrors that would capture the
+        // patch registry, using a representative source URL.
+        params.hosted_gem_mirror_refused = {
+            let patch_registry_sources = &["https://patch.socket.dev/gem/"];
+            let mirror_detected = socket_patch_core::crawlers::ruby_crawler::bundler_source_mirror(
+                &common.cwd,
+                patch_registry_sources,
+            )
+            .await
+            .is_some();
+            mirror_detected
+                || rewrite
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.code == "redirect_gem_mirror_overrides_source")
+        };
         // Stale-flagged purls are EXCLUDED from assume_applied: the same-run
         // envelope carries a redirect_gem_stale_install warning proving the
         // installed materialization unpatched, so attesting that purl from
