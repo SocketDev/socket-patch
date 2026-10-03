@@ -56,11 +56,11 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::constants::SOCKET_DIR;
+use crate::formats::gem::gemfile;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
-use crate::patch::redirect::gem_line_trailing_options;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::purl::{build_gem_purl, parse_gem_purl, purl_qualifier};
 use crate::utils::socket_dir::remove_tree_and_prune;
@@ -1418,7 +1418,7 @@ fn plan_gemfile_edit(
     // Trailing options (`require: false`, `group: :test`, …) must survive the
     // rewrite: dropping `require: false` auto-requires the gem at boot,
     // changing app behavior while vendored.
-    let opts = gem_line_trailing_options(&rest);
+    let opts = gemfile::trailing_options(&rest);
     let new_line = if opts.is_empty() {
         format!("gem {q}{name}{q}, {q}{version}{q}, path: {q}{rel}{q}")
     } else {
@@ -1527,7 +1527,9 @@ fn gem_declaration<'a>(trimmed: &'a str, name: &str) -> Option<GemDecl<'a>> {
 /// original line lives in the ledger for revert), while one trailing kept
 /// options rides along with them verbatim. Every source-selecting option is
 /// blocked, not just `path:`/`git:`: bundler allows ONE source per gem, so a
-/// preserved `source:` (etc.) alongside the `path:` we add would fail every
+/// preserved `source:`, `gitlab:` or custom `git_source` key (in any
+/// spelling — the shared [`gemfile::source_option`] reader, the one hosted
+/// mode refuses with) alongside the `path:` we add would fail every
 /// `bundle` invocation.
 fn rest_blocks_edit(rest: &str) -> Option<String> {
     let code = rest.split('#').next().unwrap_or("").trim();
@@ -1540,30 +1542,15 @@ fn rest_blocks_edit(rest: &str) -> Option<String> {
     if code.ends_with(',') {
         return Some("the declaration continues on the next line".to_string());
     }
-    for tok in [
-        "path:",
-        ":path",
-        "git:",
-        ":git",
-        "github:",
-        ":github",
-        "source:",
-        ":source",
-        "gist:",
-        ":gist",
-        "bitbucket:",
-        ":bitbucket",
-    ] {
-        if code.contains(tok) {
-            return Some(format!(
-                "the declaration already carries `{tok}` (revert any previous vendoring first)"
-            ));
-        }
-    }
     if code.contains(" if ") || code.contains(" unless ") {
         return Some("conditional declaration".to_string());
     }
-    None
+    gemfile::source_option(rest).map(|opt| {
+        format!(
+            "the declaration already carries `{}` (revert any previous vendoring first)",
+            opt.spelling
+        )
+    })
 }
 
 /// The quoted `path:` option value on a gem line's argument tail (only the
@@ -6957,6 +6944,24 @@ mod tests {
                 .err()
                 .expect("path-shaped options must refuse");
             assert!(err.contains("path:"), "{gemfile:?}: {err}");
+        }
+
+        // #652: every git source refuses, whatever its key or spelling —
+        // bundler's built-in `gitlab:`, a custom `git_source(:local)`, and
+        // the string-keyed `"git" =>` — since a vendored `path:` next to it
+        // is a second source bundler refuses.
+        for (gemfile, tok) in [
+            ("gem \"rack\", gitlab: \"rack/rack\"\n", "`gitlab:`"),
+            (
+                "git_source(:local) { |r| \"/srv/#{r}\" }\ngem \"rack\", local: \"rack\"\n",
+                "`local:`",
+            ),
+            ("gem \"rack\", \"git\" => \"/srv/rack\"\n", "`\"git\" =>`"),
+        ] {
+            let err = plan_gemfile_edit(gemfile, "rack", "3.2.6", &rel)
+                .err()
+                .unwrap_or_else(|| panic!("{gemfile:?}: a git source must refuse"));
+            assert!(err.contains(tok), "{gemfile:?}: {err}");
         }
 
         // `gemspec name: "rack"` opens with the keyword but continues as an
