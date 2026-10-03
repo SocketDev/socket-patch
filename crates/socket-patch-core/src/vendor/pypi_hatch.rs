@@ -320,8 +320,8 @@ pub(super) async fn revert(entry: &VendorEntry, root: &Path, dry_run: bool) -> R
     RevertOutcome::ok()
 }
 
-/// Whether `files` already carry Hatch's direct-reference permission for a
-/// project direct reference socket-patch's vendored ledger does not own. A
+/// Whether `files` hold a project direct reference the vendored ledger does
+/// not own, so any direct-reference permission there is held for it. A
 /// hosted→vendored takeover unwinds hosted pins one at a time (#674), so
 /// when the first package is vendored the other packages' hosted references
 /// still hold the permission hosted mode added. Recording that state as the
