@@ -38,3 +38,8 @@ crates/socket-patch-core/src/patch/redirect/socket-patch.hosted.settings.gradle 
 # sbt resolution evidence is real sbt output (JSON, Ivy XML and the 0.13
 # binary update cache); the evidence parser's tests read it byte for byte.
 crates/socket-patch-core/tests/fixtures/sbt/** -text
+
+# The sbt harness scripts run under bash on the Windows legs too
+# (sbt-compatibility.yml); a CRLF checkout breaks them ($'\r').
+scripts/sbt-warm-seed.sh text eol=lf
+scripts/sbt-compat-matrix.sh text eol=lf

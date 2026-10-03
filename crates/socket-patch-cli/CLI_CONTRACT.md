@@ -491,8 +491,12 @@ the build: as for `~/.m2`, every cached GAV is queried and patched. `--global-pr
 root, its layout read from its path. Patch keys are whole files in the package directory (`<a>-<v>.jar`),
 the same parity as `~/.m2`. A GAV cached in several roots (say `~/.m2`, a Coursier cache and an Ivy cache)
 is patched and restored in **every** root, one summary event per copy, since the build loads whichever its
-resolver picks (a root reached twice through a symlink counts once). Inside one Coursier cache the first
-per-repository root holding the GAV wins. A Coursier version directory holding only its `.pom` (a
+resolver picks: the Coursier and Ivy copies join the Maven every-copy fan-out of
+[Gradle builds](#gradle-builds-v50) as consumed copies (never `~/.m2` copies a Gradle-only build ignores), and
+`vex` re-hashes each of them. Each per-repository root of a Coursier cache holding the GAV is its own copy; a
+root reached twice through a symlink counts once. An Ivy copy is the module's `jars/` (`bundles/`, `orbits/`)
+directory, and each patch file is looked up in every artifact type directory of the module, so a
+`?classifier=sources` record patches `srcs/<a>-<v>-sources.jar`. A Coursier version directory holding only its `.pom` (a
 version Coursier considered and evicted; it downloads jars only for the versions it picks) is no copy and
 is never a target.
 

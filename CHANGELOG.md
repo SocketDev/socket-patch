@@ -130,7 +130,9 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
   `JAVA_OPTS` options or the OS defaults name, and resyncs Coursier's checksum
   sidecars after apply and rollback so Coursier keeps the patched bytes. A
   GAV cached in several of these roots (or also in `~/.m2`) is patched and
-  restored in every one. Locally these caches are crawled only for an sbt /
+  restored in every one, through the same every-copy fan-out as Gradle's
+  caches (an Ivy module's classifier jars under `srcs/` / `docs/`
+  included), and VEX re-hashes every such copy. Locally these caches are crawled only for an sbt /
   Mill / scala-cli project (a Maven or Gradle project keeps `~/.m2` alone),
   and a Coursier directory holding only a pom is no copy.
 - Hosted sbt: `scan` / `get --mode hosted` wire Maven patches into an sbt

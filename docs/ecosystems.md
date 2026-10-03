@@ -626,7 +626,10 @@ crawling `~/.m2` alone; `--global` crawls every cache):
 The crawl is not scoped to the build: as with `~/.m2`, every cached GAV is
 queried (a Coursier directory holding only the `.pom` of a version it
 considered but did not pick is no copy), and a GAV cached in several roots is
-patched (and restored) in every one, since the build loads whichever copy its resolver picks. Every project on
+patched (and restored) in every one, since the build loads whichever copy its
+resolver picks: the same every-copy fan-out as [Gradle](#gradle), and `vex`
+re-hashes each copy. An Ivy module's sources jar under `srcs/` is found for a
+`?classifier=sources` patch. Every project on
 the machine sees the patch. A running sbt server, Bloop or Metals holds the old
 classpath: restart it after `apply`. Agent patches are matched as whole jar
 files.

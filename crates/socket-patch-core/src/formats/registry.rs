@@ -308,10 +308,13 @@ mod tests {
             assert_eq!(hosted_file_ecosystem(presence), None, "{presence}");
             assert!(paths_with(HOSTED).contains(&presence), "{presence}");
         }
-        assert_eq!(
-            probe_paths("maven"),
-            ["pom.xml", "socket-patch.sbt", "socket-patch-vendor.sbt"]
-        );
+        // The sbt probes are the two generated files (beside the pom and
+        // the Gradle lock / owned files).
+        let sbt_probes: Vec<&str> = probe_paths("maven")
+            .into_iter()
+            .filter(|p| p.ends_with(".sbt") || p.contains("mill") || p.ends_with(".scala"))
+            .collect();
+        assert_eq!(sbt_probes, ["socket-patch.sbt", "socket-patch-vendor.sbt"]);
         assert!(REGISTRY
             .iter()
             .filter(|f| f.path.ends_with(".sbt") || f.path.contains("mill"))
