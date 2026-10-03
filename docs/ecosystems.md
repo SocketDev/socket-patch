@@ -95,6 +95,15 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   unpatched artifact. The reverse shape — an alias of the patched NAME pointing at a
   different package (`"left-pad@npm:some-fork@^1.3.0"`, the fork-substitution idiom) —
   is never rewritten: it resolves a different package.
+- **yarn classic git dependencies** — yarn 1 fetches a git pattern (`git+https:`,
+  `git+ssh:`, `git:`, `ssh:`, a `….git` url, or a bare `https://github.com/<owner>/<repo>`)
+  with git, using the lock entry's `resolved` as the remote, so a rewritten `resolved`
+  breaks every install. Hosted and vendored modes leave such an entry untouched
+  (`redirect_yarn_classic_git_skipped` / `vendor_yarn_classic_git_entry_skipped`) and
+  that copy stays unpatched; `vex` never attests the package from that lock while the
+  git copy is there, and rollback refuses a hosted pin an older release wrote on one.
+  The hosted-git shorthands (`owner/repo`, `github:owner/repo`) lock to a codeload
+  tarball and are rewired normally.
 - **bun** — text `bun.lock` lockfileVersion 0, 1 or 2: 0 is the `--save-text-lockfile`
   opt-in lock of Bun 1.1.39–1.1.45, 1 the 1.2–1.3 default, 2 the 1.4+ default; all three
   emit one `packages` grammar, so registry entries rewrite identically. Any other or
