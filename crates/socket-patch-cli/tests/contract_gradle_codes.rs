@@ -9,7 +9,8 @@
 //! * the `Gradle*` variants of `SidecarAdvisoryCode` (serialized
 //!   snake_case);
 //! * the vendored Gradle planner's reasons (`degraded("…"`, `note("…"`,
-//!   `shape_refusal("…"`, `reason: …:`) in `vendor/jvm/{gradle,mod}.rs`.
+//!   `shape_refusal("…"`, `reason: …:`) in `vendor/jvm/{gradle,mod,apply}.rs`
+//!   and `vendor/maven_repo.rs`, minus the Maven-reactor-only ones.
 //!
 //! Each must appear in backticks in the contract. A new code fails here
 //! until it is documented (the "Gradle builds (v5.0)" section).
@@ -43,10 +44,14 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// `text` up to its inline test module.
+/// `text` (CRLF already folded to LF) up to its inline test module.
+/// Only a `#[cfg(test)] mod name {` body ends the scan: a
+/// `#[cfg(test)] mod name;` declaration names a separate file and
+/// leaves the rest of this one in scope.
 fn non_test(text: &str) -> &str {
-    text.find("\n#[cfg(test)]\nmod ")
-        .map_or(text, |i| &text[..i])
+    let inline =
+        regex::Regex::new(r"(?m)^#\[cfg\(test\)\]\n(?:pub(?:\([a-z]+\))? )?mod \w+ \{").unwrap();
+    inline.find(text).map_or(text, |m| &text[..m.start()])
 }
 
 fn snake(camel: &str) -> String {
@@ -63,6 +68,20 @@ fn snake(camel: &str) -> String {
     }
     out
 }
+
+/// Files whose vendored `reason`s reach a Gradle build's `vendor --json`.
+const VENDOR_REASON_FILES: &[&str] = &[
+    "vendor/jvm/gradle.rs",
+    "vendor/jvm/mod.rs",
+    "vendor/jvm/apply.rs",
+    "vendor/maven_repo.rs",
+];
+
+/// Reasons in `VENDOR_REASON_FILES` that only a Maven reactor reaches.
+const MAVEN_ONLY_REASONS: &[&str] = &[
+    // `--maven-config=none` over recorded `.mvn/maven.config` wiring.
+    "maven_config_changed",
+];
 
 /// code -> the first file that emits it.
 fn emitted_codes() -> BTreeMap<String, String> {
@@ -82,7 +101,10 @@ fn emitted_codes() -> BTreeMap<String, String> {
     }
     let mut out = BTreeMap::new();
     for path in files {
-        let text = std::fs::read_to_string(&path).unwrap();
+        // A Windows checkout with core.autocrlf has CRLF files.
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\r\n", "\n");
         let body = non_test(&text);
         let rel = path
             .strip_prefix(&root)
@@ -95,9 +117,12 @@ fn emitted_codes() -> BTreeMap<String, String> {
         for m in literal.captures_iter(body) {
             add(&m[1]);
         }
-        if rel.ends_with("vendor/jvm/gradle.rs") || rel.ends_with("vendor/jvm/mod.rs") {
+        if VENDOR_REASON_FILES.iter().any(|f| rel.ends_with(f)) {
             for m in reason.captures_iter(body) {
-                add(m.get(1).or(m.get(2)).unwrap().as_str());
+                let code = m.get(1).or(m.get(2)).unwrap().as_str();
+                if !MAVEN_ONLY_REASONS.contains(&code) {
+                    add(code);
+                }
             }
         }
         if let Some(start) = body.find("pub enum SidecarAdvisoryCode {") {
@@ -124,6 +149,13 @@ fn test_gradle_contract_codes() {
         "jvm_jar_backup_missing",
         "vex_gradle_derived_cache_unchecked",
         "classifier_unpatched_copy",
+        // Only in patch/redirect/mod.rs, past its `#[cfg(test)] mod x;`
+        // declarations.
+        "gradle_uuids",
+        // Vendored reasons emitted only from vendor/maven_repo.rs.
+        "not_build_root",
+        "legacy_maven_root",
+        "ide_sources_unavailable",
     ] {
         assert!(
             codes.contains_key(known),
