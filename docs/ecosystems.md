@@ -175,7 +175,10 @@ source is not an installed copy of the registry package, and no reinstall
 restores it, so it is never overwritten. Patch it directly instead (vendored
 mode refuses it the same way, with `vendor_workspace_member`). Links into a
 store inside a `node_modules` tree, including a workspace member's link
-into the root `node_modules/.pnpm`, are patched as usual.
+into the root `node_modules/.pnpm`, are patched as usual. So are links into
+Yarn's pnpm-linker store relocated outside `node_modules` (`pnpmStoreFolder`
+in the nearest `.yarnrc.yml`), as long as that store does not contain the
+project.
 
 Every command that looks for installed npm copies walks these same trees, not
 only `scan`. A package installed only under a pruned directory is therefore
