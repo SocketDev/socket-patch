@@ -258,10 +258,7 @@ pub(crate) async fn dispatch_revert_one_opts(
 /// dependency graph? `None` = cannot determine — callers must keep the
 /// entry (fail-safe): ecosystems other than npm and cargo have no in-use
 /// probe yet, and a missing/unreadable lockfile proves nothing.
-pub(crate) async fn dispatch_in_use_one(
-    entry: &VendorEntry,
-    project_root: &Path,
-) -> Option<bool> {
+pub(crate) async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     match entry.ecosystem.as_str() {
         "npm" => vendor::npm_flavor::vendored_entry_in_use(entry, project_root).await,
         // Cargo probes the lock entry's shape: detached + `[patch]` pointing
@@ -1103,11 +1100,15 @@ impl EjectSnapshot {
         );
         let mut files = Vec::with_capacity(rels.len());
         for rel in rels {
-            let bytes = match tokio::fs::read(root.join(&rel)).await {
-                Ok(bytes) => Some(bytes),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(e),
-            };
+            // FIFO-safe: a FIFO or device planted at a captured name
+            // (scala-cli / Coursier owned files included) fails the
+            // snapshot, and with it the eject, instead of blocking open(2).
+            let bytes =
+                match socket_patch_core::utils::fs::read_regular_to_bytes(&root.join(&rel)).await {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e),
+                };
             files.push((rel, bytes));
         }
         Ok(EjectSnapshot {
@@ -6060,5 +6061,30 @@ mod ui_format_tests {
             "Run `npm install` to resync the installed tree with the restored lockfile (it \
              may still hold the vendored bytes if you reinstalled after vendoring)."
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod eject_snapshot_tests {
+    use super::*;
+
+    /// A FIFO at a captured path fails the snapshot fast instead of
+    /// wedging the eject in a blocking open(2).
+    #[tokio::test]
+    async fn snapshot_fails_closed_on_a_fifo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = socket_patch_core::vendor::jvm::coursier_tree::CAPTURED_FILES[0];
+        let path = tmp.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let taken = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            EjectSnapshot::take(tmp.path(), &[]),
+        )
+        .await
+        .expect("a FIFO must not wedge the eject snapshot");
+        let err = taken.err().expect("a FIFO must fail the snapshot");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

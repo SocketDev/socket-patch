@@ -670,7 +670,13 @@ pub fn rewrite_sbt(
                         }
                         result.confirmed_sbt_uuids.insert(uuid);
                     }
-                    Err((code, detail)) => warn(result, code, detail),
+                    // Not confirmed by sbt, and recorded as refused so a
+                    // Gradle build beside it cannot confirm the uuid alone
+                    // while sbt may still resolve the unpatched base.
+                    Err((code, detail)) => {
+                        warn(result, code, detail);
+                        result.refused_sbt_uuids.insert(uuid);
+                    }
                 }
                 continue;
             }

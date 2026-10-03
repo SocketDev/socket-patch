@@ -269,7 +269,16 @@ impl Ctx {
         let jar = cp
             .iter()
             .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy() == name))
-            .unwrap_or_else(|| panic!("{name} is not on the classpath: {cp:?}"));
+            // `name` embeds the patch uuid: name it, never print it (CodeQL
+            // rust/cleartext-logging).
+            .unwrap_or_else(|| {
+                let kind = if uuid.is_some() {
+                    "patched"
+                } else {
+                    "pristine"
+                };
+                panic!("the {kind} {a}-{v} jar is not on the classpath: {cp:?}")
+            });
         let member = jar_member(&std::fs::read(jar).unwrap(), MEMBER).expect("NOTICE");
         let marked = String::from_utf8_lossy(&member).contains(MARKER);
         assert_eq!(
@@ -609,7 +618,12 @@ fn sbt_vendor_gitignore_jar_fresh_clone() {
          commons-text-1.10.0-socket.{h}.jar",
         h = hex8(TEXT_UUID)
     );
-    assert!(clone.join(&jar).is_file(), "the clone lost {jar}");
+    // `jar` embeds the patch uuid: name it, never print it (CodeQL
+    // rust/cleartext-logging).
+    assert!(
+        clone.join(&jar).is_file(),
+        "the clone lost the vendored commons-text jar"
+    );
     let cp = ctx.classpath(&clone, true);
     ctx.assert_resolves(&cp, TEXT, Some(TEXT_UUID));
 }

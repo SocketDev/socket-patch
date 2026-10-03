@@ -128,8 +128,11 @@ fn socket(home: &SbtHome, project: &Path, args: &[&str]) -> (i32, serde_json::Va
     let env = home.isolated_env();
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let (code, stdout, stderr) = common::run_bin_with_env(&common::binary(), project, args, &env);
+    // The arguments carry the patch uuid: name the subcommand only, never
+    // print the uuid (CodeQL rust/cleartext-logging).
+    let sub = args.first().copied().unwrap_or_default();
     let json = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("{args:?}: not JSON ({e})\n{stdout}\n{stderr}"));
+        .unwrap_or_else(|e| panic!("socket-patch {sub}: not JSON ({e})\n{stdout}\n{stderr}"));
     (code, json, stderr)
 }
 

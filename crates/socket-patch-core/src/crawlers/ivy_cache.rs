@@ -176,6 +176,13 @@ pub fn installed_pom(installed_dir: &Path, g: &str, a: &str, v: &str) -> Option<
     if let Ok(bytes) = read_regular_to_bytes_sync(&installed_dir.join(format!("{a}-{v}.pom"))) {
         return Some(bytes);
     }
+    // The `.original` fallback walks to the parent, so only an Ivy artifact
+    // directory (`jars/` etc. beside an `ivy-<rev>.xml`) may take it: a
+    // Maven2 / Coursier version dir or any other path would otherwise read
+    // a sibling of an unrelated parent.
+    if !is_artifact_dir(installed_dir) {
+        return None;
+    }
     let original = installed_dir
         .parent()?
         .join(format!("ivy-{v}.xml.original"));
@@ -664,6 +671,23 @@ mod tests {
             installed_pom(&m2, "org.a", "b", "1"),
             Some(b"pom bytes".to_vec())
         );
+        // A non-Ivy dir never falls back to a parent's `.original`, even one
+        // that is a pom for exactly this GAV.
+        let other = t.path().join("staging/org/a/b/1");
+        std::fs::create_dir_all(&other).unwrap();
+        write(
+            &other.parent().unwrap().join("ivy-1.xml.original"),
+            pom("org.a", "b", "1").as_bytes(),
+        );
+        assert_eq!(installed_pom(&other, "org.a", "b", "1"), None);
+        // Nor does an Ivy-named dir with no `ivy-<rev>.xml` beside it.
+        let bare = t.path().join("bare/org.a/b");
+        std::fs::create_dir_all(bare.join("jars")).unwrap();
+        write(
+            &bare.join("ivy-1.xml.original"),
+            pom("org.a", "b", "1").as_bytes(),
+        );
+        assert_eq!(installed_pom(&bare.join("jars"), "org.a", "b", "1"), None);
         assert_eq!(
             installed_pom(&t.path().join("absent/x"), "org.a", "b", "1"),
             None
