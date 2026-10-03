@@ -3301,6 +3301,75 @@ mod tests {
         );
     }
 
+    /// A Maven GAV in two caches: only the second (Coursier) copy holds the
+    /// classifier jar, with a locally modified sibling file. The variant
+    /// gate runs per copy, as the apply loop attempts it per copy, so the
+    /// sibling's afterHash blob is queued although the first copy lacks the
+    /// classifier.
+    #[tokio::test]
+    async fn mismatch_blob_gaps_gates_each_maven_copy() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+
+        let dir = tempfile::tempdir().unwrap();
+        let m2 = dir.path().join("m2/g/a/1");
+        let csr = dir.path().join("csr/https/h/g/a/1");
+        for copy in [&m2, &csr] {
+            tokio::fs::create_dir_all(copy).await.unwrap();
+            tokio::fs::write(copy.join("a-1.jar"), b"jar\n")
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(csr.join("a-1-tests.jar"), b"tests\n")
+            .await
+            .unwrap();
+        tokio::fs::write(csr.join("z-tests.txt"), b"locally modified\n")
+            .await
+            .unwrap();
+        let blobs = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+        let mut base = HashMap::new();
+        base.insert(
+            "a-1.jar".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"jar\n"),
+                after_hash: "1".repeat(64),
+            },
+        );
+        let mut manifest = manifest_with_record("pkg:maven/g/a@1", base);
+        let mut tests = HashMap::new();
+        tests.insert(
+            "a-1-tests.jar".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"tests\n"),
+                after_hash: "2".repeat(64),
+            },
+        );
+        tests.insert(
+            "z-tests.txt".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"pristine\n"),
+                after_hash: "3".repeat(64),
+            },
+        );
+        manifest.patches.insert(
+            "pkg:maven/g/a@1?classifier=tests".to_string(),
+            PatchRecord {
+                uuid: "22222222-2222-4222-8222-222222222222".to_string(),
+                exported_at: "2024-01-01T00:00:00Z".to_string(),
+                files: tests,
+                vulnerabilities: HashMap::new(),
+                description: "fixture".to_string(),
+                license: "MIT".to_string(),
+                tier: "free".to_string(),
+            },
+        );
+        let mut all_packages = HashMap::new();
+        all_packages.insert("pkg:maven/g/a@1".to_string(), vec![m2.clone(), csr.clone()]);
+        let needed =
+            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
+        assert_eq!(needed, HashSet::from(["3".repeat(64)]));
+    }
+
     /// The counterpart guard: a sibling variant that does NOT describe the
     /// installed distribution (its representative file mismatches) is
     /// skipped by the apply loop, so its blobs must not be queued — that

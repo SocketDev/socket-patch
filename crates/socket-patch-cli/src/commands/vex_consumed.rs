@@ -578,11 +578,14 @@ async fn maven_copies(options: &CrawlerOptions, purl: &str, wiring: &HostedWirin
     let target = format!("pkg:maven/{group}/{artifact}@{suffixed}");
     let crawler = MavenCrawler::new();
     let mut paths = Vec::new();
-    for repo in crawler
-        .get_maven_copy_paths(options)
-        .await
-        .unwrap_or_default()
-    {
+    // A hosted sbt build resolves the pin from its own download dir first.
+    let sbt_hosted = socket_patch_core::hosted::sbt_reads::hosted_repo_dirs(&options.cwd);
+    for repo in sbt_hosted.into_iter().chain(
+        crawler
+            .get_maven_copy_paths(options)
+            .await
+            .unwrap_or_default(),
+    ) {
         let found = crawler
             .find_by_purls(&repo, std::slice::from_ref(&target))
             .await
