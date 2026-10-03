@@ -47,12 +47,19 @@ pub fn stale_install_remedy(env_name: &str) -> String {
     )
 }
 
-/// The Hatch env among `envs` whose tree holds `site`.
+/// The Hatch env among `envs` whose tree holds `site`, however either is
+/// spelled (an activated `VIRTUAL_ENV` may name the env through a symlink,
+/// e.g. macOS's `/var` -> `/private/var`).
 pub fn environment_of<'e>(
     envs: &'e [HatchEnvironment],
     site: &Path,
 ) -> Option<&'e HatchEnvironment> {
-    envs.iter().find(|env| site.starts_with(&env.prefix))
+    if let Some(env) = envs.iter().find(|env| site.starts_with(&env.prefix)) {
+        return Some(env);
+    }
+    let site = std::fs::canonicalize(site).ok()?;
+    envs.iter()
+        .find(|env| std::fs::canonicalize(&env.prefix).is_ok_and(|prefix| site.starts_with(prefix)))
 }
 
 /// One Hatch virtual environment of a project, as Hatch names it.
@@ -99,13 +106,13 @@ pub(crate) async fn hatch_environments_with(
     let override_path = var("HATCH_ENV_TYPE_VIRTUAL_PATH").filter(|v| !v.trim().is_empty());
     for env in &configured {
         if let Some(path) = override_path.as_deref().or(env.path.as_deref()) {
-            push(env.name.clone(), absolutize(&root, path));
+            push(env.name.clone(), resolve_env_path(&root, path));
         }
     }
     if override_path.is_some() && configured.iter().all(|e| e.name != "default") {
         push(
             "default".to_string(),
-            absolutize(&root, override_path.as_deref().unwrap()),
+            resolve_env_path(&root, override_path.as_deref().unwrap()),
         );
     }
 
@@ -408,15 +415,19 @@ fn expand(text: &str, var: &impl Fn(&str) -> Option<String>) -> String {
     out
 }
 
-/// `path` against the project root, resolved like Hatch's
-/// `(root / path).resolve()` when it exists.
+/// `path` against the project root, as Hatch joins it.
 fn absolutize(root: &Path, path: &str) -> PathBuf {
     let path = PathBuf::from(path);
-    let joined = if path.is_absolute() {
+    if path.is_absolute() {
         path
     } else {
         root.join(path)
-    };
+    }
+}
+
+/// An env's explicit `path`, resolved like Hatch's `(root / path).resolve()`.
+fn resolve_env_path(root: &Path, path: &str) -> PathBuf {
+    let joined = absolutize(root, path);
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
@@ -689,6 +700,27 @@ mod tests {
             }
             assert!(result.unwrap().is_empty(), "{filename}");
         }
+    }
+
+    /// macOS spells temp dirs `/var/...` and `/private/var/...`: an
+    /// activated env named through a symlink is still that Hatch env.
+    #[cfg(unix)]
+    #[test]
+    fn environment_of_sees_through_symlinked_spellings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let site = real.join("env/lib/python3.12/site-packages");
+        std::fs::create_dir_all(&site).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let envs = vec![HatchEnvironment {
+            name: "default".into(),
+            prefix: real.join("env"),
+        }];
+        let via_link = link.join("env/lib/python3.12/site-packages");
+        assert_eq!(environment_of(&envs, &via_link).unwrap().name, "default");
+        assert_eq!(environment_of(&envs, &site).unwrap().name, "default");
+        assert!(environment_of(&envs, tmp.path()).is_none());
     }
 
     #[test]
