@@ -985,5 +985,4 @@ mod tests {
         );
         assert_eq!(carried_pin_original(&relocked, &old), None);
     }
-
 }

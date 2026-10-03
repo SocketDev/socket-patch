@@ -133,6 +133,14 @@ pub(crate) async fn dispatch_vendor_one(
     installed_sites: &vendor::pypi::InstalledSiteListings,
 ) -> Option<VendorOutcome> {
     let eco = ecosystem_dir_for_purl(purl)?;
+    // Before any backend write: a linked vendor dir is never ours, and the
+    // unit would land in (and a later revert delete from) its target.
+    if let Some(link) = vendor::path::vendor_dir_symlink(project_root, eco, Some(&record.uuid)) {
+        return Some(VendorOutcome::Refused {
+            code: "vendor_dir_symlink_unsupported",
+            detail: vendor::path::vendor_dir_symlink_detail(&link),
+        });
+    }
 
     const SERVICE_ECOSYSTEMS: &[&str] = &[
         "npm", "pypi", "cargo", "golang", "composer", "gem", "nuget", "maven",
@@ -238,6 +246,13 @@ pub(crate) async fn dispatch_revert_one_opts(
     project_root: &Path,
     opts: RevertOpts,
 ) -> RevertOutcome {
+    // Before any lock edit or delete: the unit removal would reach through
+    // a linked vendor dir into another project's artifacts (#664).
+    if let Some(link) =
+        vendor::path::vendor_dir_symlink(project_root, &entry.ecosystem, Some(&entry.uuid))
+    {
+        return RevertOutcome::failed(vendor::path::vendor_dir_symlink_detail(&link));
+    }
     match entry.ecosystem.as_str() {
         "npm" => vendor::npm_flavor::revert_npm_any_opts(entry, project_root, opts).await,
         "pypi" => vendor::pypi::revert_pypi_opts(entry, project_root, opts).await,
@@ -257,10 +272,7 @@ pub(crate) async fn dispatch_revert_one_opts(
 /// dependency graph? `None` = cannot determine — callers must keep the
 /// entry (fail-safe): ecosystems other than npm and cargo have no in-use
 /// probe yet, and a missing/unreadable lockfile proves nothing.
-pub(crate) async fn dispatch_in_use_one(
-    entry: &VendorEntry,
-    project_root: &Path,
-) -> Option<bool> {
+pub(crate) async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     match entry.ecosystem.as_str() {
         "npm" => vendor::npm_flavor::vendored_entry_in_use(entry, project_root).await,
         // Cargo probes the lock entry's shape: detached + `[patch]` pointing

@@ -373,9 +373,17 @@ const SWEEP_MAX_DEPTH: usize = 32;
 pub async fn sweep_stale(project_root: &Path) -> usize {
     let socket_dir = project_root.join(crate::constants::SOCKET_DIR);
     let vendor_dir = socket_dir.join("vendor");
+    let project_root = project_root.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut removed = 0;
         for (eco, nested) in PRESTAGED_ECOSYSTEMS {
+            // `read_dir` follows a linked `.socket/vendor` or `<eco>` dir
+            // into a store this project does not own (see
+            // `path::vendor_dir_symlink`); `plain_subdirs` only filters
+            // the levels below it.
+            if super::path::vendor_dir_symlink(&project_root, eco, None).is_some() {
+                continue;
+            }
             for uuid_dir in plain_subdirs(&vendor_dir.join(eco)) {
                 let depth = if nested { SWEEP_MAX_DEPTH } else { 1 };
                 removed += sweep_level(&uuid_dir, depth, &socket_dir);
@@ -427,6 +435,24 @@ pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_
 mod sweep_tests {
     use super::*;
 
+    /// #664: a linked eco dir is another project's store; its pre-stage
+    /// trees are that project's, so the sweep never enumerates them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_never_follows_a_linked_ecosystem_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("p");
+        let u = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let shared = tmp.path().join("shared-cargo");
+        let other = shared.join(u).join("foo-1.0.0.socket-prestage");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
+        std::os::unix::fs::symlink(&shared, root.join(".socket/vendor/cargo")).unwrap();
+
+        assert_eq!(sweep_stale(&root).await, 0);
+        assert!(other.is_dir(), "the linked store's tree is kept");
+    }
+
     /// Leftover pre-stage trees are removed wherever a copy dir's sibling
     /// can sit, with the vendor levels only they kept alive; copy dirs,
     /// their contents and everything else stay.
@@ -464,7 +490,10 @@ mod sweep_tests {
         for dir in &kept {
             assert!(v.join(dir).exists(), "{dir} kept");
         }
-        assert!(!v.join("gem").exists(), "the levels only the tree kept alive are pruned");
+        assert!(
+            !v.join("gem").exists(),
+            "the levels only the tree kept alive are pruned"
+        );
         assert!(!v.join(format!("composer/{u}/psr/log@3.0.2")).exists());
         assert!(v.join("state.json").exists());
         assert_eq!(sweep_stale(root).await, 0, "idempotent");
