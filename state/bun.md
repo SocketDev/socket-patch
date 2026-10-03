@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-03 (run 12), main `045d7ec`, latest release 4.0.0, latest Bun 1.4.2.
+Last updated: 2026-10-03 (run 13), main `045d7ec`, latest release 4.0.0, latest Bun 1.4.2.
 
 Method: real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` to the mock. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -11,6 +11,8 @@ Run 10: #599 still reproduces on `045d7ec`. New: #635 (Bun ≥ 1.3.14 `globalSto
 Run 11 (main unchanged at `045d7ec`): #599 still reproduces. No new bugs. All the new cells pass: the run 11 section below, and the vendored row of the `globalStore` table.
 
 Run 12 (main unchanged at `045d7ec`, so no re-triage): no new bugs. Bun 1.1.39, the oldest release in range, is now covered and passes. All the new cells pass: the run 12 section below.
+
+Run 13 (main unchanged at `045d7ec`, so no re-triage): new #720. Lockfile-only discovery can't see hosted pins, so a hosted re-run in CI never picks up a superseding patch, and `scan --mode vendored` skips the takeover. Both report success. The other new cells pass: the run 13 section below.
 
 ## Coverage matrix
 
@@ -54,6 +56,18 @@ No `Authorization` header reaches the hosted tarball host for any of: bunfig def
 
 ### Platform-specific optional deps (run 10, Linux)
 `os`/`cpu` meta (fsevents, @esbuild/darwin-arm64, @esbuild/linux-x64). The hosted rewrite keeps the meta, and Linux frozen installs fetch only linux-x64 (patched), on 1.1.45 v0 + lockb, 1.2.23, 1.3.14, 1.4.2 text + lockb: pass. Hosted rollback is byte-exact (1.4.2): pass. `minimumReleaseAge` with hosted pins (1.4.2): pass.
+
+### Run 13 cells (Linux)
+
+| Cell | Bun | Result |
+| --- | --- | --- |
+| Lockfile-only hosted re-run picks up a superseding patch | 1.4.2 text v2, 1.3.14 v1 workspace, 1.1.45 `bun.lockb` | fail #720 (with `node_modules`: pass) |
+| Lockfile-only `scan --mode vendored` over hosted pins (takeover) | 1.4.2 text v2, 1.1.45 `bun.lockb` | fail #720 (`vendor` command: pass) |
+| Lockfile-only vendored re-run picks up a superseding patch | 1.4.2 text v2 | pass |
+| SIGKILL during hosted → vendored takeover (52×) and vendored → hosted (30×) | 1.4.2 text v2 | pass (installable, honest `vex`, exact heal) |
+| SIGKILL during agent apply on an isolated workspace (~200×) | 1.4.2 | pass (no torn files; heals with `apply` or a `--json` re-run) |
+| `repair` on a vendored `bun.lockb` isolated workspace (deleted / corrupt artifact) | 1.1.45 writer, 1.4.2 reader | pass |
+| `bun ci` and `--production` frozen installs with hosted pins | 1.4.2 v2, 1.3.14 v1 | pass |
 
 ### Run 12 cells (Linux)
 
@@ -175,14 +189,12 @@ Other passes (Linux, 1.4.2 unless noted):
 ## Backlog
 
 0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open; re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
-1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still refused from the sandbox (runs 7–12), so no new probes until then.
-2. #635 and #599: re-test when fixed. Also `globalStore` + workspaces, and `globalStore` on macOS/Windows.
+1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still refused from the sandbox (runs 7–13), so no new probes until then.
+2. #720, #635 and #599: re-test when fixed. #720 follow-ups: `get --mode hosted|vendored` on a lockfile-only hosted checkout, and `maxNewPatches` counting with hosted pins it can't see. Also `globalStore` + workspaces, and `globalStore` on macOS/Windows.
 3. macOS/Windows re-runs of the #366 / #405 / #469 fixes (Windows isolated uses junctions).
 4. #497 `github:` tuples (needs a probe); re-test #497 when fixed.
-5. SIGKILL during a hosted ↔ vendored takeover, and during agent `apply` on an isolated store.
-6. `repair` on a vendored `bun.lockb` isolated workspace.
-7. Hosted rollback on real macOS and Windows checkouts.
-8. Digest boundary with a valid substitute tarball, 1.3.9 text lock vs 1.3.10 (low priority, documented limitation).
+5. Hosted rollback on real macOS and Windows checkouts.
+6. Digest boundary with a valid substitute tarball, 1.3.9 text lock vs 1.3.10 (low priority, documented limitation).
 
 ## Known non-bugs
 
@@ -226,3 +238,7 @@ Other passes (Linux, 1.4.2 unless noted):
 - Bun's auto-migration of a hosted `pnpm-lock.yaml` (1.3.14, 1.4.2) ignores `resolution.tarball`, downloads the registry tarball and fails `IntegrityCheckFailed` against the patched sha512, writing no `bun.lock`. That's a Bun migration limitation and fails closed. Remedy: migrate first, then run `scan --mode hosted`.
 - `get <pkg> --mode hosted` from inside a workspace member dir is a `success` no-op with `redirect_npm_no_lockfile`, the same as `scan <member>`. Run it from the root.
 - A SIGKILLed `vendor --revert` can leave a 0-byte `.socket/vendor/.socket-stage-state.json-<uuid>` temp file. It's harmless; the next run heals the state.
+- Plain (human) `scan --mode agent` doesn't re-apply patches the manifest already records (`[skip] … already recorded`, "run `socket-patch apply`"), while `--json` re-applies. It's generic, not Bun-specific: handed to npm (`entries/npm/20261003T193043Z-from-bun.md`). After an interrupted agent apply, use `socket-patch apply`.
+- `scan --json` `apply.patches[].action` (`added` / `skipped`) is the manifest record's state, not whether files were written.
+- `repair` doesn't recreate a deleted `socket-patch.vendor.json` sidecar. It's informational only (CLI_CONTRACT). A deleted `.socket/vendor/state.json` → `repair` `vendor_ledger_missing` (documented v5: restore it from VCS).
+- An interrupted vendored → hosted takeover can leave registry tuples (unpatched install) until the re-run. `vex` doesn't attest them, and the re-run heals.
