@@ -5,7 +5,9 @@
 //! release:
 //!
 //! * #523: whitespace around `==` and the legacy `name (==X)` form;
-//! * #412: pins reached through in-root `-r` includes.
+//! * #412: pins reached through in-root `-r` includes;
+//! * #721: a UTF-16 file with a BOM (Windows PowerShell 5.1's
+//!   `pip freeze >` output), which pip decodes.
 //!
 //! Driven through the built binary against a mock patch API; the
 //! assertion is what discovery sends to the batch endpoint and the
@@ -87,6 +89,11 @@ async fn batch_purls(mock: &MockServer) -> Vec<String> {
 }
 
 async fn assert_lock_only_discovers(files: &[(&str, &str)], expected: &[&str]) {
+    let files: Vec<(&str, &[u8])> = files.iter().map(|(r, c)| (*r, c.as_bytes())).collect();
+    assert_lock_only_discovers_bytes(&files, expected).await;
+}
+
+async fn assert_lock_only_discovers_bytes(files: &[(&str, &[u8])], expected: &[&str]) {
     for mode in [&[][..], &["--vendor"][..]] {
         let mock = MockServer::start().await;
         mount_empty_batch(&mock).await;
@@ -147,4 +154,30 @@ async fn lock_only_scan_discovers_included_pins() {
         &["pkg:pypi/sp-fixture-six@1.16.0"],
     )
     .await;
+}
+
+/// #721: pip decodes a requirements file by its BOM, so a UTF-16 file
+/// (what Windows PowerShell 5.1's `pip freeze >` writes) is discovered,
+/// in either byte order, instead of reading as "No packages found".
+#[tokio::test]
+async fn lock_only_scan_discovers_utf16_pins() {
+    let text = "sp-fixture-idna==3.7\r\nsp-fixture-six==1.16.0\r\n";
+    let le: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    let be: Vec<u8> = [0xFE, 0xFF]
+        .into_iter()
+        .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+        .collect();
+    for bytes in [le, be] {
+        assert_lock_only_discovers_bytes(
+            &[("requirements.txt", &bytes)],
+            &[
+                "pkg:pypi/sp-fixture-idna@3.7",
+                "pkg:pypi/sp-fixture-six@1.16.0",
+            ],
+        )
+        .await;
+    }
 }

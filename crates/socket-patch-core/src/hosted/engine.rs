@@ -68,7 +68,9 @@ pub const SYMLINK_REFUSAL: &str = "redirect_symlinked_file_unsupported";
 
 /// Refusal code for a candidate file that exists but whose content the
 /// in-memory host did not provide (oversize, an LFS pointer,
-/// presence-only); disk would read and rewrite it.
+/// presence-only), and, on disk and in memory alike, for one that is not
+/// UTF-8 text (#721): no rewriter can edit it, and reading it as absent
+/// would leave its pins unpatched behind an exit-0 run.
 pub const UNREADABLE_REFUSAL: &str = "candidate_file_unreadable";
 
 /// Rush's repo-state file, whose `pnpmShrinkwrapHash` a lock edit
@@ -150,6 +152,18 @@ fn unreadable_refusal(rel: &str) -> Refusal {
             "{rel} exists but its content was not provided (too large, an LFS pointer, or \
              not fetched), so it cannot be rewritten alongside the other lockfiles; nothing \
              was written"
+        ),
+    }
+}
+
+fn undecodable_refusal(rel: &str) -> Refusal {
+    Refusal {
+        code: UNREADABLE_REFUSAL.to_string(),
+        message: format!(
+            "{rel} is not UTF-8 text (for example UTF-16, which Windows PowerShell 5.1 \
+             writes for `pip freeze > requirements.txt`), so it cannot be rewritten \
+             alongside the other lockfiles; re-save it as UTF-8 and re-run; nothing was \
+             written"
         ),
     }
 }
@@ -302,6 +316,11 @@ pub struct CandidateFiles {
     /// project whose candidates could rewrite (or whose rewrite depends on)
     /// one is refused, since the rewriters would treat it as absent.
     pub unreadable_reads: Vec<String>,
+    /// Candidate files that exist but are not UTF-8 text (a UTF-16
+    /// requirements.txt pip reads, #721), on disk and in memory alike. They
+    /// are left out of `files`; a project whose candidates could rewrite
+    /// one is refused rather than read as if the file were absent.
+    pub undecodable_reads: Vec<String>,
     /// Set when bundler is configured (`BUNDLE_GEMFILE`) to load a manifest
     /// the gem rewriter cannot edit: every gem manifest and lock was left
     /// out of `files`, and the rewrite reports this instead of a redirect.
@@ -321,7 +340,14 @@ impl CandidateFiles {
             // (non-blocking open + fstat regular-file check), so a FIFO
             // under a candidate name is skipped like a missing file instead
             // of wedging the run in open(2).
-            ProjectView::Disk(_) | ProjectView::Snapshot(_) => view.read_text(rel).await.ok(),
+            ProjectView::Disk(_) | ProjectView::Snapshot(_) => match view.read_text(rel).await {
+                Ok(text) => Some(text),
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    self.undecodable_reads.push(rel.to_string());
+                    None
+                }
+                Err(_) => None,
+            },
             ProjectView::Memory(project) => {
                 if project.is_symlink(rel) {
                     self.symlinked_reads.push(rel.to_string());
@@ -331,13 +357,17 @@ impl CandidateFiles {
                     self.unreadable_reads.push(rel.to_string());
                     return false;
                 }
-                // Disk reads any UTF-8 regular file; a non-UTF-8 one is
-                // absent to it as well.
+                // Disk reads any UTF-8 regular file and records a non-UTF-8
+                // one as undecodable; so does memory.
                 match project.get(rel) {
                     Some(MemoryEntry::Text(text)) => Some(text.to_string()),
-                    Some(MemoryEntry::Binary(bytes)) => {
-                        std::str::from_utf8(bytes).ok().map(str::to_string)
-                    }
+                    Some(MemoryEntry::Binary(bytes)) => match std::str::from_utf8(bytes) {
+                        Ok(text) => Some(text.to_string()),
+                        Err(_) => {
+                            self.undecodable_reads.push(rel.to_string());
+                            None
+                        }
+                    },
                     _ => None,
                 }
             }
@@ -509,6 +539,8 @@ pub async fn read_candidate_files(
     out.symlinked_reads.dedup();
     out.unreadable_reads.sort();
     out.unreadable_reads.dedup();
+    out.undecodable_reads.sort();
+    out.undecodable_reads.dedup();
     out
 }
 
@@ -557,6 +589,7 @@ async fn keep_bundler_loaded_gem_files(view: &ProjectView<'_>, out: &mut Candida
     out.files.retain(|rel, _| !dropped(rel));
     out.symlinked_reads.retain(|rel| !dropped(rel));
     out.unreadable_reads.retain(|rel| !dropped(rel));
+    out.undecodable_reads.retain(|rel| !dropped(rel));
     out.gem_manifest_unsupported = loaded.unsupported_detail().map(|detail| RewriteWarning {
         code: "redirect_gem_bundle_gemfile_unsupported".into(),
         detail,
@@ -677,6 +710,7 @@ pub struct Rewritten {
     pub files: BTreeMap<String, String>,
     pub symlinked_reads: Vec<String>,
     pub unreadable_reads: Vec<String>,
+    pub undecodable_reads: Vec<String>,
     /// The rewriters' override slice (the candidates' deps).
     pub overrides: Vec<DepOverride>,
     pub rewrite: RewriteResult,
@@ -826,6 +860,7 @@ pub async fn rewrite(
         rush_lock_keys,
         symlinked_reads,
         unreadable_reads,
+        undecodable_reads,
         gem_manifest_unsupported,
     } = read;
     // The rewriters' override slice — materialized ONCE, after the last
@@ -980,6 +1015,7 @@ pub async fn rewrite(
         files,
         symlinked_reads,
         unreadable_reads,
+        undecodable_reads,
         overrides,
         rewrite,
         rewritten,
@@ -1512,6 +1548,9 @@ fn file_ecosystem(rel: &str) -> Option<&'static str> {
 /// bytes but never the link. Applies to every ecosystem's files and to dry
 /// runs, so a dry run predicts the refusal.
 ///
+/// On disk and in memory: a candidate file that is not UTF-8 text, when a
+/// candidate of its ecosystem could rewrite it (#721).
+///
 /// In memory, additionally: a candidate file read through a link (its bytes
 /// are unknown) or present without content, when a candidate of its
 /// ecosystem could rewrite it.
@@ -1532,13 +1571,20 @@ pub fn guard(
     if let Some(linked) = written().find(|k| view.is_symlink(k)) {
         return Some(symlink_refusal(linked));
     }
-    let ProjectView::Memory(project) = view else {
-        return None;
-    };
     let candidate_ecosystems: BTreeSet<&str> = candidates
         .iter()
         .map(|c| c.dep.ecosystem.as_str())
         .collect();
+    if let Some(rel) = done
+        .undecodable_reads
+        .iter()
+        .find(|rel| file_ecosystem(rel).is_some_and(|eco| candidate_ecosystems.contains(eco)))
+    {
+        return Some(undecodable_refusal(rel));
+    }
+    let ProjectView::Memory(project) = view else {
+        return None;
+    };
     if let Some(linked) = done
         .symlinked_reads
         .iter()
@@ -1694,6 +1740,95 @@ mod tests {
         // A non-UTF-8 file is absent to disk too: not a refusal.
         let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
         assert!(read.unreadable_reads.is_empty());
+    }
+
+    /// #721: a candidate file that is not UTF-8 (a UTF-16 requirements.txt,
+    /// which pip reads) is refused by name, on disk and in memory alike,
+    /// when a candidate of its ecosystem could rewrite it, instead of being
+    /// treated as absent (exit 0, nothing pinned, no diagnostic).
+    #[tokio::test]
+    async fn an_undecodable_candidate_file_refuses_its_ecosystem() {
+        let purl = "pkg:pypi/six@1.16.0";
+        let uuid = "u-721";
+        let mut refs = HashMap::new();
+        refs.insert(
+            uuid.to_string(),
+            reference(serde_json::json!({
+                "status": "granted",
+                "url": format!("https://patch.example/patch/pypi/six/1.16.0/tok/{uuid}/six-1.16.0-py2.py3-none-any.whl"),
+                "purl": purl,
+                "artifacts": [{"kind": "tarball", "url": null, "integrity": {"sha256": "ab"}}],
+                "registryOverride": null
+            })),
+        );
+        let selected = vec![(purl.to_string(), uuid.to_string())];
+        let mut skipped = Vec::new();
+        let candidates = build_candidates(&selected, &refs, &mut skipped);
+        assert_eq!(candidates.len(), 1, "{skipped:?}");
+        let utf16: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(
+                "idna==3.7\r\nsix==1.16.0\r\n"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes),
+            )
+            .collect();
+        let outer = OuterAllowRemote::default;
+        let options = || RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: true,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            blocking: false,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("requirements.txt"), &utf16).unwrap();
+        let mut memory = MemoryProject::new();
+        memory.insert(
+            "requirements.txt",
+            MemoryEntry::Binary(utf16.clone().into()),
+        );
+        for view in [ProjectView::Disk(tmp.path()), ProjectView::Memory(&memory)] {
+            let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+            assert_eq!(read.undecodable_reads, vec!["requirements.txt"]);
+            let done = rewrite(
+                &view,
+                read,
+                &candidates,
+                BTreeMap::new(),
+                &BTreeSet::new(),
+                &[],
+                options(),
+            )
+            .await;
+            let refusal = guard(&view, &done, &candidates).expect("refused");
+            assert_eq!(refusal.code, UNREADABLE_REFUSAL);
+            assert!(
+                refusal.message.contains("requirements.txt") && refusal.message.contains("UTF-8"),
+                "{}",
+                refusal.message
+            );
+
+            // Another ecosystem's run is not blocked by it.
+            let (cargo_selected, cargo_refs) = cargo_reference("u-2");
+            let cargo = build_candidates(&cargo_selected, &cargo_refs, &mut Vec::new());
+            let read = read_candidate_files(&view, &BTreeSet::new(), &cargo).await;
+            let done = rewrite(
+                &view,
+                read,
+                &cargo,
+                BTreeMap::new(),
+                &BTreeSet::new(),
+                &[],
+                options(),
+            )
+            .await;
+            assert!(guard(&view, &done, &cargo).is_none());
+        }
     }
 
     /// A hosted URL left in a berry project's `package.json` `resolutions`

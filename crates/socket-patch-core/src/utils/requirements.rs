@@ -14,6 +14,42 @@
 //! `--hash=sha256:ab#cd` are data. Exactly one leading BOM is encoding, not
 //! data (pip decodes with utf-8-sig; uv strips it too).
 
+/// Decode a requirements file the way pip's `auto_decode` does: a UTF-16
+/// or UTF-32 byte-order mark selects that encoding and is dropped; anything
+/// else is UTF-8, its one leading BOM kept for [`logical_lines`] to drop.
+/// Windows PowerShell 5.1 writes `pip freeze > requirements.txt` as UTF-16
+/// LE with a BOM, and pip installs from it (#721). pip tries the UTF-16
+/// marks first, so a UTF-32 LE mark (`FF FE 00 00`) reads as UTF-16 LE, as
+/// it does for pip. `None` when the bytes are not valid in that encoding.
+/// (pip's last resort, the locale's encoding for a mark-less non-UTF-8
+/// file, is machine-dependent and not modelled.)
+pub(crate) fn decode(bytes: &[u8]) -> Option<String> {
+    fn utf16(body: &[u8], unit: fn([u8; 2]) -> u16) -> Option<String> {
+        if !body.len().is_multiple_of(2) {
+            return None;
+        }
+        char::decode_utf16(body.chunks_exact(2).map(|c| unit([c[0], c[1]])))
+            .collect::<Result<String, _>>()
+            .ok()
+    }
+    if let Some(body) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return utf16(body, u16::from_le_bytes);
+    }
+    if let Some(body) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return utf16(body, u16::from_be_bytes);
+    }
+    if let Some(body) = bytes.strip_prefix(&[0x00, 0x00, 0xFE, 0xFF]) {
+        if !body.len().is_multiple_of(4) {
+            return None;
+        }
+        return body
+            .chunks_exact(4)
+            .map(|c| char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]])))
+            .collect();
+    }
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
 /// One logical requirements line.
 pub(crate) struct LogicalLine {
     /// 0-based index of the first physical line.
@@ -235,6 +271,34 @@ pub(crate) fn url_sha256_fragment(location: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #721: pip's `auto_decode` BOM table, in pip's order.
+    #[test]
+    fn decode_follows_pips_byte_order_marks() {
+        let text = "six==1.16.0\r\n";
+        let le: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let be: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        let be32: Vec<u8> = text
+            .chars()
+            .flat_map(|c| (c as u32).to_be_bytes())
+            .collect();
+        let with = |bom: &[u8], body: &[u8]| [bom, body].concat();
+        assert_eq!(decode(text.as_bytes()).as_deref(), Some(text));
+        // The UTF-8 mark is left for `logical_lines`.
+        let bom8 = with(&[0xEF, 0xBB, 0xBF], text.as_bytes());
+        assert_eq!(decode(&bom8).as_deref(), Some("\u{feff}six==1.16.0\r\n"));
+        assert_eq!(decode(&with(&[0xFF, 0xFE], &le)).as_deref(), Some(text));
+        assert_eq!(decode(&with(&[0xFE, 0xFF], &be)).as_deref(), Some(text));
+        assert_eq!(
+            decode(&with(&[0x00, 0x00, 0xFE, 0xFF], &be32)).as_deref(),
+            Some(text)
+        );
+        // Not valid in the encoding the mark selects (or mark-less and not
+        // UTF-8): unreadable, never guessed.
+        assert_eq!(decode(&with(&[0xFF, 0xFE], &le[1..])), None);
+        assert_eq!(decode(&with(&[0xFF, 0xFE], &[0x00, 0xD8])), None);
+        assert_eq!(decode(&[b's', 0xC3, 0x28]), None);
+    }
 
     #[test]
     fn requires_hashes_reads_pip_hash_checking_mode() {
