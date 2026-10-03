@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled vlt bug-hunt routine (label pm:vlt).
 
-Last updated: 2026-10-02 (run 9), main `b1f9818`, latest release 4.0.0 (no vlt support; previous 3.3.0). Newest vlt: 1.3.5 (2026-10-02; 1.3.4 on 2026-10-01). Locally, run `vlt ci --allow-scripts :scripts` (otherwise vlt POSTs to api.socket.dev and the sandbox's 403 fails `ci` on 1.0.10 / 1.2.0; see #448). Run 9 mock adds `left-pad@1.2.0` (`'old'`) for bump tests.
+Last updated: 2026-10-03 (run 10), main `045d7ec`, latest release 4.0.0 (no vlt support; previous 3.3.0). Newest vlt: 1.3.6 (2026-10-03; manifest-picking change only, no lock-format change). Locally, run `vlt ci --allow-scripts :scripts` (otherwise vlt POSTs to api.socket.dev and the sandbox's 403 fails `ci` on 1.0.10 / 1.2.0; see #448). Run 9 mock adds `left-pad@1.2.0` (`'old'`) for bump tests.
 
 Method: real vlt installs (`scripts/install-vlt.sh`) against a local Node mock of the npm registry plus the patch API. It's a pure-JS tar writer, so it runs on every OS. The registry is on :18555 and the patch server on :18556 via `SOCKET_PATCH_SERVER_URL`; set `SOCKET_NPM_REGISTRY` to the registry for v5 rollback. The oracle is `require('left-pad')` printing `patched` / `pristine`. The 3-OS probe scripts are in the run-2 workflow (run 36803186961), the run-3 global-mode workflow (run 36834317384) and the run-4 bundled-copy workflow (run 36871535059, whose mock adds a `bundler@1.0.0` that bundles left-pad). Run 6 mock adds `PKG=` (scoped names) and `CDN=1` (non-conventional `dist.tarball`); the patch artifact leaf must be the unscoped basename. The mock's `/patches/batch` must answer only for purls in the request body, or `scan -g` shows false hits. CI already runs the capstones and the native backtest on 57 releases × 3 OS.
 
@@ -21,6 +21,7 @@ Method: real vlt installs (`scripts/install-vlt.sh`) against a local Node mock o
 | Linux | 1.3.4 / 1.3.5 | pass (run-2 matrix; dev / optional flags; multi-instance `~peer.<hex>` ×2; lock mutation between scan and rollback); fail #372 with `tar.br` | pass (run-2 matrix, frozen, vex, dev / optional); bump / uninstall after scan: pass on main `b1f9818` (#541 fixed by #543, verified 1.2.0 / 1.3.5) | pass (incl. multi-instance peer store) | new releases |
 | Linux | 1.0.10 / 1.2.0 / 1.3.3 | non-conventional `dist.tarball` rollback / remove: **fail #521** (run 6); scoped target scan / vex: pass (1.3.3) | scoped target: pass (1.3.3) | scoped target via store symlink: pass (1.3.3) | concurrent scans / SIGKILL mid-run: pass (1.3.3) |
 | Linux | 1.0.0-rc.34 / 1.0.5 / 1.1.1 / 1.3.0 | pass (run-8 probe matrix; 1.3.0 without `tar.br`) | pass (run-8 probe matrix) | pass (run-8) | first local runs of these versions |
+| Linux | 1.3.6 | run-2 matrix: pass (run 10); graph-modifier DepIDs (incl. `:semver()` / `:v()` selectors, plus a direct copy): pass; root peer+dev and peer-only: pass; #372 still fails with `tar.br` | run-2 matrix: pass; modifier variant and peer-only root: refused `vendor_lock_entry_unsupported` (documented); peer+dev root: pass | run-2 matrix, modifier variant (+ direct copy), peer-only root: pass | new release |
 | Linux | 1.3.5 | prerelease target, object-form workspace groups, `catalog:` specs, peer-shape `list` / `remove`: pass (run 8) | prerelease, object workspaces, `catalog:`, peer-shape takeover refusal: pass; named catalogs `catalog:<name>` in workspaces: pass (run 9, also 1.2.0) | prerelease, object workspaces, `catalog:`: pass | |
 
 ### Bundled copies (a package bundling the patched name@version; vlt-lock.json never records the bundled copy)
@@ -34,21 +35,22 @@ Method: real vlt installs (`scripts/install-vlt.sh`) against a local Node mock o
 
 | OS | vlt | `scan -g` report | `-g` / `SOCKET_GLOBAL` / `--global-prefix` × `--mode hosted` refusal | agent apply / vex / rollback (`-g`, `get -g`, env) | `--global-prefix` with space + unicode | unwritable prefix | `rollback -g` / `remove -g` leave the project alone | `vendor -g` / `vendor --revert -g` leave the project alone |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 1.0.10 / 1.2.0 / 1.3.3 | pass | pass | pass | pass | pass (scan); `get` re-run → npm handover | pass (#446; with a hosted project too, run 5) | **fail #498** (closed by #499, re-test pending) |
+| Linux | 1.0.10 / 1.2.0 / 1.3.3 | pass | pass | pass | pass | pass (scan); `get` re-run → npm handover | pass (#446; with a hosted project too, run 5) | pass after #499 (1.2.0 / 1.3.6, flags and env: exit 2 `global_scope_unsupported`, project kept; run 10) |
 | macOS | 1.0.10 / 1.2.0 / 1.3.3 | pass | pass | pass | pass | pass (scan) | untested since #446 | untested |
 | Windows | 1.0.10 / 1.2.0 / 1.3.3 | fail #434 (default prefix) | pass | fail #434 (default prefix) | pass | untested | untested since #446 | untested |
 
 ## Backlog
 
-1. #601 on macOS / Windows, with a bundled copy at a different version and a nested bundle; re-test once it's fixed.
-2. #521 follow-ups: re-test once fixed, macOS / Windows, the 3-tuple (`config.registry`) project, and the hosted→vendored takeover with a non-conventional tarball.
-3. #498 (closed by #499) and #434 (closed by #442): re-test `vendor -g` / `vendor --revert -g`, and Windows with the default prefix. The rest of the **maintainer `-g` request** (20261001T040000Z): the Windows unwritable prefix, and the macOS / Windows re-check of `rollback -g` after #446.
-4. #372 follow-ups once fixed: a mixed brotli / non-brotli lock, a brotli dev node (flag 6) heal, the restore putting bit 4 back, and VEX on brotli nodes.
-5. Vendored + `vlt update` after a catalog bump.
-6. The vlt 1.3.4 tarball-cache integrity changes: a warm cache with pristine bytes at a re-used patch URL.
-7. vlt 1.3.5 frozen / workspaces / catalog cells on macOS and Windows.
-8. Perf: #579 (vlt/hosted wall +127% after #472) isn't a bughunt issue; just watch it.
-9. Probe branches are blocked: branch deletion is denied, and 3 old `bughunt/vlt/*` branches still need a maintainer to delete them.
+1. vlt 1.3.6 on macOS / Windows, plus 1.3.5 frozen / workspaces / catalog cells there (probe branches are blocked).
+2. #601 on macOS / Windows, with a bundled copy at a different version and a nested bundle; re-test once #605 merges.
+3. #521 follow-ups: re-test once fixed, macOS / Windows, the 3-tuple (`config.registry`) project, and the hosted→vendored takeover with a non-conventional tarball.
+4. #434 (closed by #442): Windows with the default prefix. The rest of the **maintainer `-g` request** (20261001T040000Z): the Windows unwritable prefix, and the macOS / Windows re-check of `rollback -g` after #446 and of `vendor -g` after #499.
+5. #372 follow-ups once fixed: a mixed brotli / non-brotli lock, a brotli dev node (flag 6) heal, the restore putting bit 4 back, and VEX on brotli nodes.
+6. A version-changing graph modifier (hosted / agent), which needs a second left-pad version in the mock.
+7. Vendored + `vlt update` after a catalog bump.
+8. The vlt 1.3.4 tarball-cache integrity changes: a warm cache with pristine bytes at a reused patch URL.
+9. Perf: #579 (vlt/hosted wall +127% after #472) isn't a bughunt issue; just watch it.
+10. Probe branches are blocked: branch deletion is denied, and 3 old `bughunt/vlt/*` branches still need a maintainer to delete them.
 
 ## Known non-bugs
 
@@ -77,3 +79,5 @@ Method: real vlt installs (`scripts/install-vlt.sh`) against a local Node mock o
 - vlt 1.0.0-rc.14 full-probe rollback mismatches against the mock because rc.14 resolves left-pad from public npmjs. That's a mock artifact.
 - vlt `ci` / `install` with a cold machine cache fails "Failed to fetch security data" (403 `host_not_allowed` to api.socket.dev) in the sandbox. That's a sandbox artifact; use `--allow-scripts :scripts`.
 - Agent-mode patches disappear after `rm -rf node_modules && vlt ci`. That's expected: a reinstall replaces agent edits.
+- Vendored refuses graph-modifier variants (`~<selector>` DepID suffix) and root peer-only edges with `vendor_lock_entry_unsupported` ("use --mode hosted"). That's loud and fail-closed; hosted and agent handle both.
+- Vendored `rollback` after a refused vendored scan returns "Manifest not found": nothing was written.
