@@ -102,6 +102,12 @@ limits, and required install commands.
 
 ### Fixed
 
+- `scan --vex` in hosted mode no longer attests an npm patch as
+  `not_affected` when `package-lock.json` also lists a bundled copy of the
+  same `name@version` (`inBundle`, or `bundled` in a v1 lock). npm unpacks
+  that copy from its parent's tarball, so it stays unpatched; the run
+  already warned `redirect_npm_bundled_instance_skipped` and now leaves the
+  patch out of its attestation, like a standalone `vex` run (#325).
 - Global mode (`-g`) finds npm, yarn, pnpm, bun, RubyGems and Composer on
   Windows, where they install as `.cmd` / `.bat` shims, instead of reporting
   an empty scan. The yarn and npm-family global lookups no longer run from the
