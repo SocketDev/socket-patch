@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-03 03:35Z, main `045d7ec` (CLI 4.0.0, unchanged). Filed #645: since #388, an explicit `PIPENV_VENV_IN_PROJECT=0` / `PIPENV_NO_VENV_IN_PROJECT=1` skips `./.venv`, but Pipenv ≤ 2023.10.24 still uses it. Passing this run: vendored on 2022, hosted → vendored on 2018 / 2022, agent multi-copy on 2022 / 2024 / 2025, the stale-warning remedy, and hosted with a `--hash` requirements.txt.
+Last run: 2026-10-03 09:37Z, main `045d7ec` (CLI 4.0.0, unchanged). No new issues. Passing: dotted / underscored names (`jaraco.context`, `typing_extensions`) in hosted / vendored / agent, `extras` entries in both modes on 2022 / 2023 / 2026, tamper rejection on a `path` + extras entry (2018 / 2022), and `pipenv install <other>` on 2026. The hosted stale-warning shape of #645 is commented there; PR #654 (`d8356ae`) fixes both shapes.
 
 ## Coverage matrix
 
@@ -28,6 +28,8 @@ Cells marked v5 were re-run on `2463257` (v5: no hosted ledger, upstream-restore
 | macOS / Windows | 7–11 | untested | untested | untested | untested | untested | refused (documented) | n/a | n/a | untested |
 | any | 0–6 | untested | n/a | refused (documented) | n/a | n/a | refused (documented) | n/a | n/a | untested |
 
+Dotted / underscored distribution names (`jaraco.context`, `typing_extensions`), `09:37Z` run, `045d7ec`: hosted lock-only (2023), vendored (2018 / 2023 / 2026), agent + stale-warning remedy (2018 / 2026) all pass. Lock entries with `extras`: hosted (`file`) and vendored (`path`) on 2022 / 2023 / 2026 pass; a tampered `path` + extras wheel is rejected on 2018 / 2022 (pass). Pipenv 2026 `install <other>` keeps the hosted or vendored reference (pass). Hosted stale warning with `.venv` + WORKON + `PIPENV_VENV_IN_PROJECT=0` on 2018 / 2022 names only WORKON: fail, #645 (vex stays conservative, `not_applied`).
+
 Hosted with a path-prefixed `--patch-server-url`, a rotated grant token, or an sdist hosted artifact (2026.8.0, `045d7ec`, #572): rotate, sync / --deploy, verify, vex and byte-exact rollback all pass.
 
 Hosted + `requirements.txt` with `-r req/base.txt` pinning the package (Pipenv 2018 / 2023 / 2026 locks, `d63ae5f` and `8eec03a`): fail #567. Hosted lock-only `default` + `develop` + root requirements.txt (2023 / 2026, `d63ae5f`): pass, except rollback refuses the all-hosted requirements.txt (#410).
@@ -48,16 +50,19 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 
 ## Backlog
 
-0. Re-verify #645 once it's fixed (2018 / 2022 / 2023.10.24 with `PIPENV_VENV_IN_PROJECT=0`, `=false`, `PIPENV_NO_VENV_IN_PROJECT=1`; 2023.11.14+ must keep using WORKON). Also check its hosted shape: the stale warning and vex look at WORKON while Pipenv ≤ 2023.10 installs into `.venv`.
+0. Re-verify #645 once it's fixed (PR #654 `d8356ae` already passes the agent + hosted-warning repros on 2018 / 2022) (2018 / 2022 / 2023.10.24 with `PIPENV_VENV_IN_PROJECT=0`, `=false`, `PIPENV_NO_VENV_IN_PROJECT=1`; 2023.11.14+ must keep using WORKON). Also check its hosted shape: the stale warning and vex look at WORKON while Pipenv ≤ 2023.10 installs into `.venv`.
 1. #612 variants still open: `-r` includes in vendored mode. Re-verify once fixed. (Revert / rollback on the half-wired project pass.)
 2. Re-verify #546 once it's fixed: `.env` with `PIPENV_CUSTOM_VENV_NAME`, `WORKON_HOME`, `PIPENV_VENV_IN_PROJECT=0` + `.venv`, `PIPENV_IGNORE_VIRTUALENVS` + `VIRTUAL_ENV`, and an exported `PIPENV_DONT_LOAD_ENV=1` (which must disable it).
 3. Re-verify #504 and the #454 human-mode gap once they're fixed.
 4. #567 variants: vendored mode with an `-r` include, `remove`, `-c` constraints; re-verify once fixed.
 5. **Maintainer request (global `-g` mode):** still to do: macOS / Windows, `-g` on 2018 / 11, and `--global-prefix` as a venv root (scans 0; undocumented). Checklist in the 20261001T040000Z entry.
-6. Hosted path-prefix on Pipenv 9 / 11 (`path` references) and on lock-only checkouts.
+6. Lock entries with a non-default `index` (second `[[source]]`), hosted + vendored, 2018 / 2026.
+6b. Hosted path-prefix on Pipenv 9 / 11 (`path` references) and on lock-only checkouts.
 7. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546 / #645, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked until branch deletion through the git proxy works.
 
 ## Known non-bugs
+
+- Hosted vex with `.venv` + WORKON venv under `PIPENV_VENV_IN_PROJECT=0` checks both copies, so it gives `not_applied` when either is stale. That's correct; only the stale warning is #645.
 
 - Vendored over a hosted pin from a path-prefixed patch server, with no `--patch-server-url` / `SOCKET_PATCH_SERVER_URL` naming that origin: `pypi_pipenv_source_already_exists`. Since #572 a foreign origin isn't ours, so this fails closed by design.
 
