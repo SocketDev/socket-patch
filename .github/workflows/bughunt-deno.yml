@@ -1,0 +1,85 @@
+name: bughunt-deno probe
+on:
+  push:
+    branches: ['bughunt/deno/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        deno: ['2.2.15', '2.9.7']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo build --release -p socket-patch-cli
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: ${{ matrix.deno }}
+      - name: probe
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/probe"
+          cat > "$RUNNER_TEMP/probe/mkpatch.py" <<'PYEOF'
+          # usage: mkpatch.py <project> <purl> <pkgdir> <relfile>[,<relfile>...] <ghsa> [uuid]
+          # Appends a marker line to each file (computed from the installed pristine copy) and writes manifest + blobs.
+          import sys,os,json,hashlib,uuid as U
+          proj,purl,pkgdir,rels,ghsa=sys.argv[1:6]
+          uid=sys.argv[6] if len(sys.argv)>6 else str(U.uuid4())
+          def gh(b): return hashlib.sha256(b"blob %d\0"%len(b)+b).hexdigest()
+          blobs=os.path.join(proj,".socket","blobs"); os.makedirs(blobs,exist_ok=True)
+          mp=os.path.join(proj,".socket","manifest.json")
+          m=json.load(open(mp)) if os.path.exists(mp) else {"patches":{}}
+          files={}
+          for rel in rels.split(","):
+              b=open(os.path.join(pkgdir,rel),"rb").read()
+              a=b+b"\n;(globalThis.__SP=globalThis.__SP||[]).push(%s);\n"%json.dumps(purl+"#"+rel).encode()
+              for x in (b,a): open(os.path.join(blobs,gh(x)),"wb").write(x)
+              files["package/"+rel]={"beforeHash":gh(b),"afterHash":gh(a)}
+          m["patches"][purl]={"uuid":uid,"exportedAt":"2024-01-01T00:00:00Z","files":files,
+           "vulnerabilities":{ghsa:{"cves":[],"summary":"s","severity":"high","description":"d"}},
+           "description":"bughunt fixture","license":"MIT","tier":"free"}
+          json.dump(m,open(mp,"w"),indent=2)
+          print(uid)
+          PYEOF
+          cat > "$RUNNER_TEMP/probe/run.sh" <<'SHEOF'
+          #!/usr/bin/env bash
+          # env: SP (socket-patch binary), DENO (deno), PY (python), HERE (dir with mkpatch.py)
+          set -u
+          W="$(mktemp -d)/proj dir"; mkdir -p "$W"; cd "$W"
+          export DENO_DIR="$W/../denodir"
+          cat > deno.json <<'J'
+          {"nodeModulesDir":"auto","imports":{"ajv":"npm:ajv@8.12.0","ajv6":"npm:ajv@6.12.6","ajv-keywords":"npm:ajv-keywords@3.5.2","schema-utils":"npm:schema-utils@2.7.1","JSONStream":"npm:JSONStream@1.3.5"}}
+          J
+          cat > main.ts <<'J'
+          import "ajv-keywords"; import "schema-utils"; import "JSONStream"; import "npm:through@2.3.8";
+          console.log("SP=" + JSON.stringify((globalThis.__SP||[]).sort()));
+          J
+          "$DENO" install >/dev/null 2>&1 || "$DENO" cache main.ts
+          echo "== .deno entries"; ls node_modules/.deno | grep -iE "ajv-k|json|through"
+          JS=$(ls -d node_modules/.deno/*@1.3.5/node_modules/JSONStream | head -1); echo "JSONStream dir: $JS"
+          cp -R node_modules/.deno "$W/../pristine"
+          "$PY" "$HERE/mkpatch.py" . pkg:npm/ajv-keywords@3.5.2 node_modules/.deno/ajv-keywords@3.5.2/node_modules/ajv-keywords index.js GHSA-1111-1111-1111 >/dev/null
+          "$PY" "$HERE/mkpatch.py" . pkg:npm/JSONStream@1.3.5 "$JS" index.js GHSA-2222-2222-2222 >/dev/null
+          "$PY" "$HERE/mkpatch.py" . pkg:npm/through@2.3.8 node_modules/.deno/through@2.3.8/node_modules/through index.js GHSA-3333-3333-3333 >/dev/null
+          summ() { "$PY" -c "import json,sys;d=json.load(sys.stdin);print(d['status'],d['summary'].get('applied'),sorted((e.get('purl'),e['action'],e.get('errorCode')) for e in d['events']))"; }
+          cp -R .socket "$W/../socket-bak"
+          echo "== apply #1"; "$SP" apply --offline --json | summ; echo "rc=${PIPESTATUS[0]}"
+          echo "== apply #2 (idempotent)"; "$SP" apply --offline --json | summ
+          echo "== markers in files"; grep -lc __SP node_modules/.deno/*/node_modules/*/index.js
+          echo "== runtime"; "$DENO" run -A main.ts
+          echo "== DENO_DIR untouched"; grep -rl __SP "$DENO_DIR/npm" || echo "none patched in DENO_DIR (good)"
+          echo "== vex"; "$SP" vex --offline --product pkg:npm/x@1.0.0 --output vex.json --json | summ; "$PY" -c "import json;d=json.load(open('vex.json'));print(sorted((s['vulnerability']['name'],s['status']) for s in d['statements']))"
+          echo "== rollback"; "$SP" rollback --offline --json | "$PY" -c "import json,sys;d=json.load(sys.stdin);print(d['status'],'rolledBack',d['rolledBack'],'alreadyOriginal',d['alreadyOriginal'],'failed',d['failed'])"; echo "rc=${PIPESTATUS[0]}"
+          echo "== diff vs pristine"; diff -r -x .setup-cache.bin "$W/../pristine" node_modules/.deno >/dev/null && echo "identical (good)" || diff -rq "$W/../pristine" node_modules/.deno | head
+          echo "== runtime after rollback"; "$DENO" run -A main.ts
+          echo "== frozen reinstall after apply"; rm -rf .socket; cp -R "$W/../socket-bak" .socket; "$SP" apply --offline --json | summ; "$DENO" install --frozen >/dev/null 2>&1; echo "install rc=$?"; "$DENO" run -A main.ts
+          SHEOF
+          export SP="$GITHUB_WORKSPACE/target/release/socket-patch"; [ -f "$SP.exe" ] && SP="$SP.exe"
+          export DENO="$(command -v deno)"; export HERE="$RUNNER_TEMP/probe"
+          if command -v python3 >/dev/null && python3 -c 1 2>/dev/null; then export PY=python3; else export PY=python; fi
+          bash "$RUNNER_TEMP/probe/run.sh" 2>&1 | grep -v -e "peer dep" -e "These packages" -e "Learn more"
