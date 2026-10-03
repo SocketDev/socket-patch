@@ -365,8 +365,8 @@ async fn find_local_venv_site_packages_with(
     // it once `poetry env use` recorded an env for the project (see
     // [`poetry_active_prefix`]). PDM likewise skips an activated venv under
     // `PDM_IGNORE_ACTIVE_VENV`.
-    let pdm_ignores_active = pdm_env_flag(var, "PDM_IGNORE_ACTIVE_VENV")
-        && pdm_drives_project(cwd).await;
+    let pdm_ignores_active =
+        pdm_env_flag(var, "PDM_IGNORE_ACTIVE_VENV") && pdm_drives_project(cwd).await;
     let active_prefix = match &poetry {
         Some(project) => poetry_active_prefix(project, var),
         None if pdm_ignores_active => None,
@@ -540,9 +540,7 @@ async fn pdm_saved_interpreter(cwd: &Path) -> Option<PathBuf> {
     let saved = match read_regular_to_string(&cwd.join(".pdm-python")).await {
         Ok(text) => text.trim().to_string(),
         Err(_) => {
-            let text = read_regular_to_string(&cwd.join(".pdm.toml"))
-                .await
-                .ok()?;
+            let text = read_regular_to_string(&cwd.join(".pdm.toml")).await.ok()?;
             let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
             doc.get("python")?.get("path")?.as_str()?.trim().to_string()
         }
@@ -737,11 +735,15 @@ struct PoetryVirtualenvConfig {
     /// `virtualenvs.in-project` — `true` means `./.venv` once it exists;
     /// until then Poetry keeps using its out-of-tree env.
     in_project: Option<bool>,
-    /// `virtualenvs.path` — may carry Poetry's `{cache-dir}` /
-    /// `{project-dir}` placeholders and a leading `~`.
+    /// `virtualenvs.path` — may carry `{key}` placeholders (see
+    /// [`poetry_process`]) and a leading `~`.
     path: Option<String>,
-    /// `cache-dir` — the parent of the default `virtualenvs` root.
+    /// `cache-dir` — the parent of the default `virtualenvs` root. Goes
+    /// through the same placeholder processing as `path`.
     cache_dir: Option<String>,
+    /// `data-dir` (Poetry >= 2.1) — what `{data-dir}` expands to; see
+    /// [`poetry_data_dir`].
+    data_dir: Option<String>,
 }
 
 impl PoetryVirtualenvConfig {
@@ -752,6 +754,7 @@ impl PoetryVirtualenvConfig {
         self.in_project = self.in_project.or(other.in_project);
         self.path = self.path.or(other.path);
         self.cache_dir = self.cache_dir.or(other.cache_dir);
+        self.data_dir = self.data_dir.or(other.data_dir);
         self
     }
 
@@ -767,6 +770,7 @@ impl PoetryVirtualenvConfig {
             in_project: flag("POETRY_VIRTUALENVS_IN_PROJECT"),
             path: var("POETRY_VIRTUALENVS_PATH").filter(|v| !v.trim().is_empty()),
             cache_dir: var("POETRY_CACHE_DIR").filter(|v| !v.trim().is_empty()),
+            data_dir: var("POETRY_DATA_DIR").filter(|v| !v.trim().is_empty()),
         }
     }
 
@@ -800,6 +804,10 @@ impl PoetryVirtualenvConfig {
                 .map(str::to_string),
             cache_dir: doc
                 .get("cache-dir")
+                .and_then(toml_edit::Item::as_str)
+                .map(str::to_string),
+            data_dir: doc
+                .get("data-dir")
                 .and_then(toml_edit::Item::as_str)
                 .map(str::to_string),
         }
@@ -988,21 +996,71 @@ fn poetry_virtualenvs_root(
 /// Poetry's `config.virtualenvs_path`: `virtualenvs.path` with its
 /// placeholders and `~` expanded, else `<cache-dir>/virtualenvs`. Also where
 /// `envs.toml` lives, which Poetry reads whatever `virtualenvs.create` says.
+///
+/// Placeholder handling depends on the Poetry version, which is not known
+/// here, so every [`PoetryPlaceholders`] generation is resolved and the
+/// first one that exists on disk wins; with none on disk, the current
+/// Poetry's placement is returned.
 fn poetry_virtualenvs_path(
     cwd: &Path,
     config: &PoetryVirtualenvConfig,
     var: &impl Fn(&str) -> Option<String>,
 ) -> Option<PathBuf> {
-    let cache_dir = config
-        .cache_dir
-        .as_deref()
-        .map(|c| expand_home(c, var))
-        .or_else(|| poetry_default_cache_dir(var))?;
+    let data_dir = poetry_data_dir(config, var);
+    let mut candidates = Vec::new();
+    for generation in [
+        PoetryPlaceholders::Current,
+        PoetryPlaceholders::NoDataDir,
+        PoetryPlaceholders::Poetry11,
+    ] {
+        let Some(path) =
+            poetry_virtualenvs_path_for(cwd, config, data_dir.as_deref(), generation, var)
+        else {
+            continue;
+        };
+        if !candidates.contains(&path) {
+            candidates.push(path);
+        }
+    }
+    candidates
+        .iter()
+        .find(|path| path.is_dir())
+        .or_else(|| candidates.first())
+        .cloned()
+}
+
+/// [`poetry_virtualenvs_path`] for one placeholder `generation`.
+fn poetry_virtualenvs_path_for(
+    cwd: &Path,
+    config: &PoetryVirtualenvConfig,
+    data_dir: Option<&Path>,
+    generation: PoetryPlaceholders,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
+    let data_dir = data_dir.map(|d| d.to_string_lossy().into_owned());
+    let data_dir = match generation {
+        PoetryPlaceholders::Current => data_dir,
+        PoetryPlaceholders::NoDataDir | PoetryPlaceholders::Poetry11 => None,
+    };
+    // `cache-dir` is itself processed; only `{data-dir}` can resolve in it
+    // (a `{cache-dir}` there would be self-referential).
+    let cache_dir = match config.cache_dir.as_deref() {
+        Some(raw) => expand_home(
+            &poetry_process(raw, generation, |key| {
+                (key == "data-dir").then(|| data_dir.clone()).flatten()
+            }),
+            var,
+        ),
+        None => poetry_default_cache_dir(var)?,
+    };
+    let cache_dir = cache_dir.to_string_lossy().into_owned();
     match config.path.as_deref() {
         Some(template) => {
-            let expanded = template
-                .replace("{cache-dir}", &cache_dir.to_string_lossy())
-                .replace("{project-dir}", &cwd.to_string_lossy());
+            let expanded = poetry_process(template, generation, |key| match key {
+                "cache-dir" => Some(cache_dir.clone()),
+                "data-dir" => data_dir.clone(),
+                _ => None,
+            });
             let path = expand_home(&expanded, var);
             Some(if path.is_absolute() {
                 path
@@ -1010,8 +1068,100 @@ fn poetry_virtualenvs_path(
                 cwd.join(path)
             })
         }
-        None => Some(cache_dir.join("virtualenvs")),
+        None => Some(PathBuf::from(cache_dir).join("virtualenvs")),
     }
+}
+
+/// How a Poetry generation treats `{key}` placeholders in a config value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoetryPlaceholders {
+    /// Poetry >= 2.1: `{cache-dir}` and `{data-dir}` resolve, any other
+    /// `{key}` is kept literally.
+    Current,
+    /// Poetry 1.2 - 2.0: there is no `data-dir` setting, so `{data-dir}` is
+    /// kept literally like any other unknown key.
+    NoDataDir,
+    /// Poetry 1.1: an unknown `{key}` is replaced with nothing.
+    Poetry11,
+}
+
+/// Poetry's `Config.process()`: every `{key}` (non-greedy, as in
+/// `re.sub(r"{(.+?)}", ...)`) is replaced with the value `resolve` gives
+/// for that config key. A key with no value is kept as-is, except on
+/// Poetry 1.1, which drops it. Poetry has no `{project-dir}` key (#608).
+fn poetry_process(
+    value: &str,
+    generation: PoetryPlaceholders,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        // `.+?` needs at least one character before the closing brace.
+        let close = after
+            .char_indices()
+            .skip(1)
+            .find(|&(_, c)| c == '}')
+            .map(|(i, _)| i);
+        let Some(close) = close else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        let key = &after[..close];
+        match resolve(key).filter(|v| !v.is_empty()) {
+            Some(resolved) => out.push_str(&resolved),
+            None if generation == PoetryPlaceholders::Poetry11 => {}
+            None => {
+                out.push('{');
+                out.push_str(key);
+                out.push('}');
+            }
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Poetry's `data-dir` (Poetry >= 2.1): `POETRY_DATA_DIR`, else the
+/// config's `data-dir`, else `locations.data_dir()` ([`poetry_default_data_dir`]).
+fn poetry_data_dir(
+    config: &PoetryVirtualenvConfig,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
+    match config.data_dir.as_deref() {
+        Some(raw) => Some(expand_home(raw, var)),
+        None => poetry_default_data_dir(var),
+    }
+}
+
+/// Poetry's `locations.data_dir()`, which the official installer
+/// (`install.python-poetry.org`) also installs Poetry's own venv under:
+/// `$POETRY_HOME` when set, else platformdirs' roaming user data dir for
+/// `pypoetry` — `$XDG_DATA_HOME` (absolute only) or `~/.local/share` on
+/// Linux, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows.
+fn poetry_default_data_dir(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if let Some(home) = var("POETRY_HOME").filter(|v| !v.trim().is_empty()) {
+        return Some(expand_home(&home, var));
+    }
+    let home = var("HOME")
+        .or_else(|| var("USERPROFILE"))
+        .map(PathBuf::from);
+    let base = if cfg!(windows) {
+        var("APPDATA")
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.map(|h| h.join("AppData").join("Roaming")))?
+    } else if cfg!(target_os = "macos") {
+        home?.join("Library").join("Application Support")
+    } else {
+        var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| home.map(|h| h.join(".local").join("share")))?
+    };
+    Some(base.join("pypoetry"))
 }
 
 fn expand_home(raw: &str, var: &impl Fn(&str) -> Option<String>) -> PathBuf {
@@ -1621,7 +1771,7 @@ fn run_site_query() -> Option<String> {
 ///
 /// Queries `python3` for site-packages paths, then checks well-known system
 /// locations including Homebrew, conda, uv tools and interpreters, pipx
-/// venvs, PDM's global project and interpreters, pip --user, etc.
+/// venvs, Poetry's installer venv, PDM's global project and interpreters, pip --user, etc.
 pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     let mut results = Vec::new();
     let mut seen = HashSet::new();
@@ -1822,6 +1972,31 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         let matches = find_python_dirs(&venvs, &["*", "Lib", "site-packages"]).await;
         for m in matches {
             add_path(m, &mut seen, &mut results);
+        }
+    }
+
+    // Poetry's own venv from the official installer
+    // (`install.python-poetry.org`): `<data dir>/venv`, where the data dir
+    // is `$POETRY_HOME` or platformdirs' user data dir (#640). Both are
+    // scanned: an install made before `POETRY_HOME` was set (or unset) is
+    // still a real install.
+    {
+        let var = |name: &str| std::env::var(name).ok();
+        let without_poetry_home = |name: &str| {
+            if name == "POETRY_HOME" {
+                None
+            } else {
+                std::env::var(name).ok()
+            }
+        };
+        let data_dirs = [
+            poetry_default_data_dir(&var),
+            poetry_default_data_dir(&without_poetry_home),
+        ];
+        for data_dir in data_dirs.into_iter().flatten() {
+            for m in find_env_site_packages(&data_dir.join("venv")).await {
+                add_path(m, &mut seen, &mut results);
+            }
         }
     }
 
@@ -2813,7 +2988,11 @@ mod tests {
         fake_venv(&tmp.path().join("uv-env"), "venv");
         let uv_env = env_of(&[(
             "UV_PROJECT_ENVIRONMENT",
-            tmp.path().join("uv-env").join("venv").to_string_lossy().into_owned(),
+            tmp.path()
+                .join("uv-env")
+                .join("venv")
+                .to_string_lossy()
+                .into_owned(),
         )]);
         assert_eq!(
             find_local_venv_site_packages_with(&project, &uv_env).await,
@@ -3547,13 +3726,15 @@ mod tests {
             poetry_virtualenvs_root(cwd, &merged, &var),
             Some(PathBuf::from("/srv/poetry-cache/venvs"))
         );
+        // Poetry has no `{project-dir}` key, so `Config.process()` keeps
+        // the text and the relative result lands under the cwd (#608).
         let project_local = PoetryVirtualenvConfig {
             path: Some("{project-dir}/.envs".into()),
             ..Default::default()
         };
         assert_eq!(
             poetry_virtualenvs_root(cwd, &project_local, &var),
-            Some(PathBuf::from("/home/dev/proj/.envs"))
+            Some(PathBuf::from("/home/dev/proj/{project-dir}/.envs"))
         );
         let tilde = PoetryVirtualenvConfig {
             path: Some("~/venvs".into()),
@@ -3586,6 +3767,149 @@ mod tests {
             poetry_virtualenvs_root(cwd, &default, &|_: &str| None),
             None
         );
+    }
+
+    /// `virtualenvs.path` and `cache-dir` go through Poetry's
+    /// `Config.process()`: `{cache-dir}` and `{data-dir}` (Poetry >= 2.1)
+    /// are substituted, any other `{key}` is kept literally (#608).
+    #[test]
+    fn poetry_virtualenvs_path_mirrors_config_process() {
+        let cwd = Path::new("/home/dev/proj");
+        let root = |config: PoetryVirtualenvConfig, vars: &[(&str, &str)]| {
+            let vars: Vec<(String, String)> = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let var = move |k: &str| {
+                vars.iter()
+                    .find(|(name, _)| name == k)
+                    .map(|(_, v)| v.clone())
+            };
+            poetry_virtualenvs_root(cwd, &config, &var)
+        };
+        let path = |p: &str| PoetryVirtualenvConfig {
+            path: Some(p.into()),
+            ..Default::default()
+        };
+
+        // `{data-dir}` follows the `data-dir` setting (POETRY_DATA_DIR, then
+        // the config files), then POETRY_HOME.
+        let env = |k: &str| match k {
+            "POETRY_DATA_DIR" => Some("/srv/pd".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            root(
+                PoetryVirtualenvConfig::from_env(env).or(path("{data-dir}/venvs")),
+                &[("HOME", "/home/dev"), ("POETRY_HOME", "/opt/poetry")]
+            ),
+            Some(PathBuf::from("/srv/pd/venvs"))
+        );
+        assert_eq!(
+            root(
+                path("{data-dir}/venvs"),
+                &[("HOME", "/home/dev"), ("POETRY_HOME", "/opt/poetry")]
+            ),
+            Some(PathBuf::from("/opt/poetry/venvs"))
+        );
+        let from_toml = PoetryVirtualenvConfig::from_toml(
+            "data-dir = \"~/pdata\"\n[virtualenvs]\npath = \"{data-dir}/venvs\"\n",
+        );
+        assert_eq!(
+            root(
+                from_toml,
+                &[("HOME", "/home/dev"), ("POETRY_HOME", "/opt/poetry")]
+            ),
+            Some(PathBuf::from("/home/dev/pdata/venvs"))
+        );
+        let env = PoetryVirtualenvConfig::from_env(|k| match k {
+            "POETRY_DATA_DIR" => Some("/env/pd".into()),
+            _ => None,
+        });
+        assert_eq!(env.data_dir.as_deref(), Some("/env/pd"));
+
+        // `cache-dir` is processed too, so `{data-dir}` inside it moves
+        // the default `<cache-dir>/virtualenvs` root.
+        let cache = PoetryVirtualenvConfig {
+            cache_dir: Some("{data-dir}/cache".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            root(cache, &[("HOME", "/home/dev"), ("POETRY_HOME", "/srv/pd")]),
+            Some(PathBuf::from("/srv/pd/cache/virtualenvs"))
+        );
+
+        // Unknown keys stay literal; `{cache-dir}` still resolves next to
+        // them.
+        let unknown = PoetryVirtualenvConfig {
+            cache_dir: Some("/c".into()),
+            ..path("{cache-dir}/{nope}/venvs")
+        };
+        assert_eq!(
+            root(unknown, &[("HOME", "/home/dev")]),
+            Some(PathBuf::from("/c/{nope}/venvs"))
+        );
+    }
+
+    /// Poetry's default data dir is platformdirs' roaming user data dir.
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    #[test]
+    fn poetry_data_dir_defaults_to_xdg_data_home_on_linux() {
+        let cwd = Path::new("/home/dev/proj");
+        let config = PoetryVirtualenvConfig {
+            path: Some("{data-dir}/venvs".into()),
+            ..Default::default()
+        };
+        let home_only = |k: &str| (k == "HOME").then(|| "/home/dev".to_string());
+        assert_eq!(
+            poetry_virtualenvs_root(cwd, &config, &home_only),
+            Some(PathBuf::from("/home/dev/.local/share/pypoetry/venvs"))
+        );
+        let xdg = |k: &str| match k {
+            "HOME" => Some("/home/dev".to_string()),
+            "XDG_DATA_HOME" => Some("/xdg".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            poetry_virtualenvs_root(cwd, &config, &xdg),
+            Some(PathBuf::from("/xdg/pypoetry/venvs"))
+        );
+        // platformdirs ignores a relative XDG_DATA_HOME.
+        let relative = |k: &str| match k {
+            "HOME" => Some("/home/dev".to_string()),
+            "XDG_DATA_HOME" => Some("rel".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            poetry_virtualenvs_root(cwd, &config, &relative),
+            Some(PathBuf::from("/home/dev/.local/share/pypoetry/venvs"))
+        );
+    }
+
+    /// Poetry 1.1 replaces an unknown `{key}` with nothing instead of
+    /// keeping it, so `{project-dir}/.envs` lands at `/.envs`. When only
+    /// that placement exists on disk, it is the one Poetry used (#608);
+    /// when both exist, the current Poetry placement wins.
+    #[cfg(not(windows))]
+    #[test]
+    fn poetry_virtualenvs_path_falls_back_to_poetry_1_1_placement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("proj");
+        let legacy = tmp.path().join("envs");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        let config = PoetryVirtualenvConfig {
+            path: Some(format!("{{project-dir}}{}", legacy.display())),
+            ..Default::default()
+        };
+        let var = |k: &str| (k == "HOME").then(|| "/home/dev".to_string());
+        assert_eq!(
+            poetry_virtualenvs_root(&cwd, &config, &var),
+            Some(legacy.clone())
+        );
+        let current = cwd.join(format!("{{project-dir}}{}", legacy.display()));
+        std::fs::create_dir_all(&current).unwrap();
+        assert_eq!(poetry_virtualenvs_root(&cwd, &config, &var), Some(current));
     }
 
     /// End to end against the filesystem: a Poetry project with no `.venv`
