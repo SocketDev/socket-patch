@@ -29,9 +29,10 @@ use crate::utils::purl::parse_maven_purl;
 use super::super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::super::{RevertOpts, RevertOutcome, VendorWarning};
 use super::{
-    gradle, maven_reactor, op_of, op_str, safe_coordinates, sha256_hex, Coords, JvmPlan, JvmUnplan,
-    Shape, CONFIG_LINE_KIND, CREATED_DIR_KIND, DERIVED_METADATA_KIND, KINDS, OWNED_FILE_KIND,
-    POM_FRAGMENT_KIND, SETTINGS_FRAGMENT_KIND, TREE_KIND, VERIFICATION_FRAGMENT_KIND,
+    coursier_tree, gradle, maven_reactor, op_of, op_str, safe_coordinates, sbt, scala_cli,
+    sha256_hex, Coords, JvmPlan, JvmUnplan, Shape, CONFIG_LINE_KIND, COURSIER_INDEX_KIND,
+    CREATED_DIR_KIND, DERIVED_METADATA_KIND, KINDS, OWNED_FILE_KIND, POM_FRAGMENT_KIND,
+    SBT_FRAGMENT_KIND, SETTINGS_FRAGMENT_KIND, TREE_KIND, VERIFICATION_FRAGMENT_KIND,
 };
 
 /// Whether `entry` was written by this backend: it has wiring and every
@@ -92,6 +93,8 @@ fn is_wiring_file(rel: &str) -> bool {
     rel == maven_reactor::MAVEN_CONFIG
         || is_owned_file(rel)
         || gradle::is_derived_metadata_path(rel)
+        || sbt::is_wiring_file(rel)
+        || scala_cli::is_wiring_file(rel)
         || (!under_owned && (rel.ends_with(".xml") || is_settings_file(rel)))
 }
 
@@ -105,17 +108,23 @@ fn is_owned_file(rel: &str) -> bool {
         gradle::INDEX_REL,
     ]
     .contains(&rel)
+        || sbt::is_owned_file(rel)
+        || scala_cli::is_owned_file(rel)
 }
 
 /// A file directly in `c`'s own Maven or Gradle version directory.
 fn is_own_tree_file(rel: &str, c: &Coords<'_>) -> bool {
-    [maven_reactor::tree_dir(c), gradle::tree_dir(c)]
-        .iter()
-        .any(|dir| {
-            rel.strip_prefix(dir.as_str())
-                .and_then(|r| r.strip_prefix('/'))
-                .is_some_and(|name| !name.is_empty() && !name.contains('/'))
-        })
+    [
+        maven_reactor::tree_dir(c),
+        gradle::tree_dir(c),
+        coursier_tree::tree_dir(c),
+    ]
+    .iter()
+    .any(|dir| {
+        rel.strip_prefix(dir.as_str())
+            .and_then(|r| r.strip_prefix('/'))
+            .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+    })
 }
 
 /// A directory a plan may create.
@@ -136,6 +145,10 @@ fn record_allowed(w: &WiringRecord, c: &Coords<'_>) -> bool {
             VERIFICATION_FRAGMENT_KIND => rel == gradle::VERIFICATION_REL,
             OWNED_FILE_KIND => is_owned_file(rel),
             DERIVED_METADATA_KIND => rel == gradle::derived_metadata_rel(c.group_id, c.artifact_id),
+            SBT_FRAGMENT_KIND => sbt::is_wiring_file(rel),
+            COURSIER_INDEX_KIND => {
+                rel == coursier_tree::INDEX_REL || scala_cli::is_wiring_file(rel)
+            }
             TREE_KIND | super::UPSTREAM_KIND => is_own_tree_file(rel, c),
             CREATED_DIR_KIND => is_creatable_dir(rel),
             _ => false,
@@ -311,6 +324,7 @@ pub async fn write_plan(root: &Path, plan: &JvmPlan) -> Result<Vec<WiringRecord>
         let allowed = if w.tree {
             w.rel.starts_with(".socket/vendor/maven2/")
                 || w.rel.starts_with(".socket/vendor/gradle/")
+                || w.rel.starts_with(&format!("{}/", coursier_tree::TREE_ROOT))
         } else {
             is_wiring_file(&w.rel)
         };
@@ -499,6 +513,12 @@ fn sides(wiring: &[WiringRecord]) -> (bool, bool) {
 
 /// The shape a recorded entry was planned for.
 fn shape_of(wiring: &[WiringRecord]) -> Shape {
+    if sbt::owns(wiring) {
+        return Shape::Sbt;
+    }
+    if scala_cli::owns(wiring) {
+        return Shape::ScalaCli;
+    }
     match sides(wiring) {
         (true, true) => Shape::Mixed,
         (false, true) => Shape::Gradle,
@@ -577,14 +597,21 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
         })
         .cloned()
         .collect();
-    let (maven, gradle) = sides(&entry.wiring);
-    let mut unplan = JvmUnplan::default();
-    if gradle {
-        unplan = merge_unplans(unplan, gradle::unplan(&read, &c, &records));
-    }
-    if maven {
-        unplan = merge_unplans(unplan, maven_reactor::unplan(&read, &c, &entry.wiring));
-    }
+    let unplan: JvmUnplan = if sbt::owns(&entry.wiring) {
+        sbt::unplan(&read, &c, &records)
+    } else if scala_cli::owns(&entry.wiring) {
+        scala_cli::unplan(&read, &c, &records)
+    } else {
+        let (maven, gradle) = sides(&entry.wiring);
+        let mut unplan = JvmUnplan::default();
+        if gradle {
+            unplan = merge_unplans(unplan, gradle::unplan(&read, &c, &records));
+        }
+        if maven {
+            unplan = merge_unplans(unplan, maven_reactor::unplan(&read, &c, &entry.wiring));
+        }
+        unplan
+    };
     if let Some(rel) = reader.escaped() {
         return RevertOutcome::failed(format!(
             "refusing revert: {rel} is a symlink that leaves the project"
@@ -672,6 +699,7 @@ const OWNED_DIRS: &[&str] = &[
     ".socket/vendor/maven2",
     ".socket/vendor/gradle",
     ".socket/gradle",
+    coursier_tree::TREE_ROOT,
 ];
 
 /// Remove, deepest first and only when empty, the parents of `removed` up to
@@ -770,6 +798,12 @@ pub fn entry_references(root: &Path, entry: &VendorEntry) -> bool {
     };
     let reader = ProjectReader::new(root);
     let read = |rel: &str| reader.read(rel);
+    if sbt::owns(&entry.wiring) {
+        return sbt::wired_checked(&read, &c).unwrap_or(true);
+    }
+    if scala_cli::owns(&entry.wiring) {
+        return scala_cli::wired_checked(&read, &c).unwrap_or(true);
+    }
     let (maven, gradle) = sides(&entry.wiring);
     (maven && maven_reactor::wired_checked(&read, &c).unwrap_or(true))
         || (gradle && gradle::references(&read, &c))
@@ -790,14 +824,21 @@ pub fn entry_wired_checked(root: &Path, entry: &VendorEntry) -> Result<bool, Str
     let reader = ProjectReader::new(root);
     let read = |rel: &str| reader.read(rel);
     let list = |dir: &str| reader.list(dir);
-    let (maven, gradle) = sides(&entry.wiring);
-    let mut wired = Ok(true);
-    if gradle {
-        wired = gradle::wired_checked(&read, &list, &c).map_err(|e| e.detail);
-    }
-    if maven && wired == Ok(true) {
-        wired = maven_reactor::wired_checked(&read, &c).map_err(|e| e.detail);
-    }
+    let wired = if sbt::owns(&entry.wiring) {
+        sbt::wired_checked(&read, &c).map_err(|e| e.detail)
+    } else if scala_cli::owns(&entry.wiring) {
+        scala_cli::wired_checked(&read, &c).map_err(|e| e.detail)
+    } else {
+        let (maven, gradle) = sides(&entry.wiring);
+        let mut wired = Ok(true);
+        if gradle {
+            wired = gradle::wired_checked(&read, &list, &c).map_err(|e| e.detail);
+        }
+        if maven && wired == Ok(true) {
+            wired = maven_reactor::wired_checked(&read, &c).map_err(|e| e.detail);
+        }
+        wired
+    };
     if let Some(e) = reader.read_error.borrow().as_ref() {
         return Err(e.clone());
     }
@@ -842,9 +883,19 @@ pub fn check_entry(
             }
         }
     }
-    let (maven, gradle) = sides(&entry.wiring);
+    let (sbt_entry, scala_cli_entry) = (sbt::owns(&entry.wiring), scala_cli::owns(&entry.wiring));
+    // An sbt / scala-cli entry has neither a Maven-reactor nor a Gradle half.
+    let (maven, gradle) = if sbt_entry || scala_cli_entry {
+        (false, false)
+    } else {
+        sides(&entry.wiring)
+    };
     let list = |dir: &str| reader.list(dir);
-    let (jar, pom, module) = if gradle {
+    let (jar, pom, module) = if sbt_entry {
+        sbt::committed(&read, &c)
+    } else if scala_cli_entry {
+        scala_cli::committed(&read, &c)
+    } else if gradle {
         gradle::committed(&read, &c)
     } else {
         maven_reactor::committed(&read, &c).map(|(j, p)| (j, p, None))
@@ -878,8 +929,12 @@ pub fn check_entry(
     if let Some(w) = plan.writes.first() {
         return Err(format!("vendored wiring or metadata drifted: {}", w.rel));
     }
-    let referenced = (!maven || maven_reactor::wired_checked(&read, &c).map_err(|e| e.detail)?)
-        && (!gradle || gradle::references(&read, &c));
+    let referenced = if sbt_entry || scala_cli_entry {
+        entry_wired_checked(root, entry)?
+    } else {
+        (!maven || maven_reactor::wired_checked(&read, &c).map_err(|e| e.detail)?)
+            && (!gradle || gradle::references(&read, &c))
+    };
     if !referenced {
         return Err("vendored artifact is no longer wired into the build".into());
     }
@@ -901,7 +956,9 @@ pub fn check_entry(
             }
         }
     }
-    if maven {
+    // The sbt tree is the reactor's suffixed layout, so a Maven local
+    // repository may cache the same suffixed GAV.
+    if maven || sbt_entry {
         if let Some(repo) = local_repo {
             for ext in ["jar", "pom"] {
                 let sv = c.suffixed_version();
@@ -959,6 +1016,12 @@ pub(crate) fn checked_tree_jar_path(
     let gradle_jar = format!("{}/{a}-{v}.jar", gradle::tree_dir(&c));
     if rel == maven {
         return Ok(maven);
+    }
+    // The scala-cli Coursier tree is same-GAV like Gradle's: its marker
+    // names the uuid (checked by `checked_tree_jar`).
+    let coursier_jar = format!("{}/{a}-{v}.jar", coursier_tree::tree_dir(&c));
+    if rel == coursier_jar {
+        return Ok(coursier_jar);
     }
     if rel != gradle_jar {
         return Err(unsafe_path());

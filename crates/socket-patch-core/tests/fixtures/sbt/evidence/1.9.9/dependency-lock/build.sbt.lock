@@ -1,0 +1,29 @@
+{
+  "lockVersion" : 1,
+  "timestamp" : "2026-10-02T17:00:25.162529512Z",
+  "configurations" : [
+    "compile",
+    "optional",
+    "provided",
+    "runtime",
+    "test"
+  ],
+  "dependencies" : [
+    {
+      "org" : "org.scala-lang",
+      "name" : "scala-library",
+      "version" : "2.12.18",
+      "artifacts" : [
+        {
+          "name" : "scala-library.jar",
+          "hash" : "sha1:fa825f984172f6801e3d8c476071b1823c0a925b"
+        }
+      ],
+      "configurations" : [
+        "compile",
+        "runtime",
+        "test"
+      ]
+    }
+  ]
+}

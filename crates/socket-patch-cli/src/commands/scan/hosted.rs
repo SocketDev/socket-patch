@@ -2090,9 +2090,33 @@ const TAKEOVER_INFO_CODES: &[&str] = &[
 /// Lowercase tool names that must keep their spelling at the start of a
 /// sentence (`pnpm >=11 rejects…` must not become `Pnpm`).
 const LOWERCASE_TOOLS: &[&str] = &[
-    "npm", "pnpm", "yarn", "bun", "cargo", "pip", "pipenv", "uv", "poetry", "pdm", "hatch", "go",
-    "gem", "bundler", "bundle", "composer", "mvn", "gradle", "dotnet", "deno", "rush", "vlt",
-    "vlx", "vlr",
+    "npm",
+    "pnpm",
+    "yarn",
+    "bun",
+    "cargo",
+    "pip",
+    "pipenv",
+    "uv",
+    "poetry",
+    "pdm",
+    "hatch",
+    "go",
+    "gem",
+    "bundler",
+    "bundle",
+    "composer",
+    "mvn",
+    "gradle",
+    "dotnet",
+    "deno",
+    "rush",
+    "vlt",
+    "vlx",
+    "vlr",
+    "sbt",
+    "mill",
+    "scala-cli",
 ];
 
 /// Capitalize the first letter of a message for an `Error:`/`Warning:`
@@ -2376,6 +2400,8 @@ fn format_next_steps(files: &[String], edits: &[socket_patch_core::patch::redire
         .any(|f| f == "package-lock.json" || f == "npm-shrinkwrap.json");
     let hint = if npm {
         " (e.g. `npm ci`)".to_string()
+    } else if let Some(sbt) = socket_patch_core::patch::redirect::sbt::next_step_hint(files) {
+        sbt.to_string()
     } else {
         crate::commands::composer_hints::hosted_reinstall_hint(files, edits).unwrap_or_default()
     };
@@ -3941,6 +3967,18 @@ mod tests {
                 "gradle/wrapper/gradle-wrapper.properties",
                 ".socket/gradle/hosted-index.tsv",
                 ".socket/gradle/socket-patch.hosted.settings.gradle",
+                "socket-patch.sbt",
+                "socket-patch-vendor.sbt",
+                "build.sbt",
+                "project/build.properties",
+                ".sbtopts",
+                ".jvmopts",
+                "build.sbt.lock",
+                "build.mill",
+                "build.mill.yaml",
+                "build.sc",
+                ".mill-version",
+                "project.scala",
             ]
         );
     }

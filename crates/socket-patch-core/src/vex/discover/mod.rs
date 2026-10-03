@@ -206,6 +206,10 @@ pub(crate) mod npm;
 pub(crate) mod nuget;
 pub(crate) mod pypi_locks;
 pub(crate) mod pypi_other;
+pub(crate) mod sbt;
+pub use sbt::{
+    DIAG_SBT_OWNED_FILE_MODIFIED, DIAG_SBT_RESOLUTION_UNVERIFIED, DIAG_VENDORED_TREE_MISSING,
+};
 pub(crate) mod vlt;
 pub(crate) mod yarn;
 
@@ -768,6 +772,7 @@ async fn discover_with_ctx(ctx: DiscoverCtx<'_>) -> Discovery {
     composer::extract(&ctx, &mut out).await;
     maven::extract(&ctx, &mut out).await;
     gradle::extract(&ctx, &mut out).await;
+    sbt::extract(&ctx, &mut out).await;
     nuget::extract(&ctx, &mut out).await;
     deno::extract(&ctx, &mut out).await;
     out.contest_across_locks();
@@ -3040,6 +3045,8 @@ mod tests {
                     "gradle.lockfile",
                     "pom.xml",
                     "settings-gradle.lockfile",
+                    "socket-patch-vendor.sbt",
+                    "socket-patch.sbt",
                 ],
             ),
             ("nuget", &["NuGet.Config", "NuGet.config", "nuget.config"]),

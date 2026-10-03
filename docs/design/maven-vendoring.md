@@ -11,6 +11,12 @@ Gradle support without automatically migrating existing single-POM repositories.
 Hosted Gradle wiring is a separate backend; see
 [ecosystem support](../ecosystems.md#gradle).
 
+sbt build roots and scala-cli directory builds use the same backend and ledger
+ecosystem (`jvm`): sbt through a generated `socket-patch-vendor.sbt` over the
+reactor-style suffixed `.socket/vendor/maven2` tree, scala-cli through owned
+files over a same-GAV `.socket/vendor/coursier` tree. Mill is not wired. See
+[sbt, Mill and scala-cli support](sbt-support.md).
+
 ## Commands
 
 ```sh

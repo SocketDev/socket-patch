@@ -2893,9 +2893,7 @@ async fn maven_rollback_targets(
     groups: &[((String, PathBuf), Vec<&String>, bool)],
     manifest: &PatchManifest,
 ) -> (Vec<CopyTarget>, Vec<String>) {
-    use socket_patch_core::crawlers::gradle_cache::{
-        installed_copies_detailed, is_gradle_version_dir,
-    };
+    use socket_patch_core::crawlers::gradle_cache::{expands, installed_copies_detailed};
     use socket_patch_core::patch::jvm_jar::{self, RecordShape};
 
     let mut targets = Vec::new();
@@ -2928,7 +2926,9 @@ async fn maven_rollback_targets(
                         });
                     }
                 }
-                RecordShape::Leaf if is_gradle_version_dir(copy) => {
+                // A Gradle version dir, or an Ivy artifact dir whose
+                // module keeps classifier jars in sibling type dirs.
+                RecordShape::Leaf if expands(copy) => {
                     for (dir, files) in installed_copies_detailed(copy, files).targets {
                         out.push(CopyTarget {
                             purl: purl.to_string(),
