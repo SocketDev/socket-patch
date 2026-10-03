@@ -1,0 +1,76 @@
+name: bughunt uv probe
+on:
+  push:
+    branches: ['bughunt/uv/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        uv: ['0.8.17', '0.12.22']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: false
+      - name: Build CLI
+        shell: bash
+        run: cargo build --release -p socket-patch-cli
+      - name: Probe scan -g over uv tool envs
+        shell: bash
+        run: |
+          set -x
+          python -m pip install "uv==${{ matrix.uv }}"
+          uv --version
+          cat > "$RUNNER_TEMP/mock.py" <<'PY'
+          import http.server, json
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_POST(s):
+                  b = s.rfile.read(int(s.headers.get('Content-Length') or 0)).decode()
+                  purl = "pkg:pypi/six@1.16.0"
+                  pk = [{"purl": purl, "patches": [{"uuid": "11111111-2222-4333-8444-555555555555", "purl": purl, "tier": "free", "cveIds": [], "ghsaIds": ["GHSA-uvbu-ildv-ex01"], "severity": "HIGH", "title": "t"}]}] if purl in b else []
+                  out = json.dumps({"packages": pk, "canAccessPaidPatches": False}).encode()
+                  s.send_response(200); s.send_header('Content-Type', 'application/json'); s.send_header('Content-Length', str(len(out))); s.end_headers(); s.wfile.write(out)
+              def do_GET(s):
+                  s.send_response(404); s.end_headers()
+          http.server.ThreadingHTTPServer(('127.0.0.1', 8765), H).serve_forever()
+          PY
+          python "$RUNNER_TEMP/mock.py" &
+          sleep 2
+          SP="$GITHUB_WORKSPACE/target/release/socket-patch"
+          A="--api-url http://127.0.0.1:8765 --api-token sktsec_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_api --org test-org"
+          export SOCKET_TELEMETRY_DISABLED=1 SOCKET_NO_CONFIG=1
+          mkdir -p "$RUNNER_TEMP/empty" && cd "$RUNNER_TEMP/empty"
+          check() {
+            label="$1"; shift
+            out=$("$@" 2>"$RUNNER_TEMP/err.txt"); rc=$?
+            if echo "$out" | grep -q 'pkg:pypi/six@1.16.0'; then echo "RESULT $label: FOUND (rc=$rc)"; else echo "RESULT $label: MISSING (rc=$rc)"; echo "$out" | head -c 1500; cat "$RUNNER_TEMP/err.txt" | head -20; fi
+          }
+          # 1. default tool dir
+          uv tool install --with six==1.16.0 pycowsay
+          uv tool dir || true
+          check default-tool-dir $SP scan -g --json $A
+          uv tool uninstall pycowsay
+          # 2. UV_TOOL_DIR with a space and unicode
+          export UV_TOOL_DIR="$RUNNER_TEMP/tool dir é"
+          export UV_TOOL_BIN_DIR="$RUNNER_TEMP/toolbin"
+          uv tool install --with six==1.16.0 pycowsay
+          uv tool dir || true
+          check uv-tool-dir-space-unicode $SP scan -g --json $A
+          uv tool uninstall pycowsay
+          unset UV_TOOL_DIR
+          # 3. XDG_DATA_HOME (unix-only meaning; uv also honours it on Windows? record either way)
+          export XDG_DATA_HOME="$RUNNER_TEMP/xdg data"
+          uv tool install --with six==1.16.0 pycowsay
+          uv tool dir || true
+          check xdg-data-home $SP scan -g --json $A
+          uv tool uninstall pycowsay || true
+          exit 0
