@@ -3057,7 +3057,7 @@ async fn rollback_maven_target(
             .unwrap_or_default();
         for file in &result.files_rolled_back {
             let path = target.dir.join(file.trim_start_matches("package/"));
-            let Ok(bytes) = tokio::fs::read(&path).await else {
+            let Ok(bytes) = socket_patch_core::utils::fs::read_regular_to_bytes(&path).await else {
                 continue;
             };
             if !pristine(hash, &bytes) {

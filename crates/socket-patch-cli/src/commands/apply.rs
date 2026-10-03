@@ -2783,7 +2783,8 @@ async fn unexpected_gradle_bytes(
     }
     let hash_dir = dir.file_name()?.to_str()?;
     for (leaf, info) in files {
-        let Ok(bytes) = tokio::fs::read(dir.join(leaf)).await else {
+        let Ok(bytes) = socket_patch_core::utils::fs::read_regular_to_bytes(&dir.join(leaf)).await
+        else {
             continue;
         };
         let git = compute_git_sha256_from_bytes(&bytes);
@@ -4041,5 +4042,43 @@ mod tests {
         assert_eq!(dl.code, "sources_download_failed");
         assert!(is_stage_failure_code(&dl.code));
         assert!(!is_stage_failure_code("gem_config_path_ignored"));
+    }
+
+    /// A FIFO squatting a patched leaf in a Gradle hash dir must not wedge
+    /// `unexpected_gradle_bytes`: a bare `tokio::fs::read` open(2)s it with
+    /// `O_RDONLY` and waits for a writer forever. The FIFO-safe reader
+    /// rejects it, so the leaf is skipped and the check returns promptly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unexpected_gradle_bytes_skips_fifo_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp
+            .path()
+            .join("caches/modules-2/files-2.1/org.example/lib/1.0")
+            .join("a".repeat(40));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(maven_sidecars::is_gradle_hash_dir(&dir));
+        let leaf = "lib-1.0.jar";
+        let c = std::ffi::CString::new(dir.join(leaf).to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let mut files = HashMap::new();
+        files.insert(
+            leaf.to_string(),
+            PatchFileInfo {
+                before_hash: "1".repeat(64),
+                after_hash: "2".repeat(64),
+            },
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            unexpected_gradle_bytes(&dir, &files),
+        )
+        .await;
+        if result.is_err() {
+            // Unblock the reader stuck in open(2) so the runtime can exit.
+            let _ = std::fs::OpenOptions::new().write(true).open(dir.join(leaf));
+            panic!("unexpected_gradle_bytes must not wedge on a FIFO leaf");
+        }
+        assert_eq!(result.unwrap(), None);
     }
 }
