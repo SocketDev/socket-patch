@@ -34,3 +34,7 @@ crates/socket-patch-cli/tests/fixtures/legacy-ledgers/** -text
 # include_str! and written into user repos byte for byte; a CRLF checkout would change it.
 crates/socket-patch-core/src/vendor/jvm/socket-patch.settings.gradle -text
 crates/socket-patch-core/src/patch/redirect/socket-patch.hosted.settings.gradle -text
+
+# sbt resolution evidence is real sbt output (JSON, Ivy XML and the 0.13
+# binary update cache); the evidence parser's tests read it byte for byte.
+crates/socket-patch-core/tests/fixtures/sbt/** -text
