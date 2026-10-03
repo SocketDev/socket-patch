@@ -908,14 +908,16 @@ fn regenerate(repo: &BTreeMap<String, Vec<u8>>) {
             .args(args)
             .output()
             .expect("run gpg");
+        // Only gpg's stderr goes in the message: the arguments name the
+        // signing-key file.
         assert!(
             out.status.success(),
-            "gpg {args:?}: {}",
+            "gpg failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     };
-    let secret = dir.join("keys/signing-key.secret.asc");
-    gpg(&["--import", secret.to_str().unwrap()]);
+    let signing_key_path = dir.join("keys/signing-key.secret.asc");
+    gpg(&["--import", signing_key_path.to_str().unwrap()]);
     let scratch = tempfile::tempdir().unwrap();
     for (path, bytes) in repo.iter().filter(|(p, _)| is_signed(p)) {
         let input = scratch.path().join("input");

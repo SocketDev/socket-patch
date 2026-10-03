@@ -56,7 +56,7 @@ reach Maven Central.
 | Tier | Where | Cells |
 | --- | --- | --- |
 | PR | `ci.yml` `e2e` job | ubuntu × {6.9.4 / JDK 11, 7.6.6 / JDK 17, 8.14.3 / JDK 21, 9.8.0 / JDK 21} × {agent + hosted, vendored + multi-project}, plus Windows 8.14.3 multi-project |
-| Full | [`gradle-compatibility.yml`](../../.github/workflows/gradle-compatibility.yml) (path-filtered PRs, nightly, manual) | {ubuntu, macOS arm64, Windows} × the four lines × {agent, hosted, vendored} = 36 cells; JDK ceilings (6.9 on 16, 7.6 on 19, 8.14 on 24); `--configuration-cache` (9.8.0 hosted and vendored); Isolated Projects (9.8.0 hosted, recording only); real Maven Central (8.14.3, #511 and #487) |
+| Full | [`gradle-compatibility.yml`](../../.github/workflows/gradle-compatibility.yml) (path-filtered PRs, nightly, manual) | {ubuntu, macOS arm64, Windows} × the four lines × {agent, hosted, vendored} = 36 cells; JDK ceilings (6.9 on 15, 7.6 on 19, 8.14 on 24); `--configuration-cache` (9.8.0 hosted and vendored); Isolated Projects (9.8.0 hosted, recording only); real Maven Central (8.14.3, #511 and #487) |
 
 Every full-tier cell uploads JSON probe reports (Gradle and JDK version, resolved jar
 path and sha256, hash-directory naming, refresh, read-only cache and transform-cache

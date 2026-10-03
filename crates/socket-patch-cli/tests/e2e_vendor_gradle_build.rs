@@ -925,10 +925,16 @@ fn gradle_vendor_511_catalog() {
 
 /// A task printing the sources jar an IDE sync resolves for each module of
 /// `runtimeClasspath` (`ArtifactResolutionQuery`).
+///
+/// The query runs in a `providers.provider` the task captures, never in the
+/// task action: the configuration-cache cells reject an action that reaches
+/// `configurations` / `dependencies` (the project) at execution time, while a
+/// provider is evaluated (and its value stored) when the cache entry is
+/// written.
 fn sources_task(dsl: Dsl) -> &'static str {
     match dsl {
-        Dsl::Groovy => "tasks.register('printSources') {\n    doLast {\n        def ids = configurations.runtimeClasspath.incoming.resolutionResult.allComponents.collect { it.id }.findAll { it instanceof ModuleComponentIdentifier }\n        def r = dependencies.createArtifactResolutionQuery().forComponents(ids).withArtifacts(JvmLibrary, SourcesArtifact).execute()\n        r.resolvedComponents.each { c -> c.getArtifacts(SourcesArtifact).each { a -> if (a instanceof ResolvedArtifactResult) { println('SOCKET-SRC ' + a.file.absolutePath) } } }\n    }\n}\n",
-        Dsl::Kotlin => "tasks.register(\"printSources\") {\n    doLast {\n        val ids = configurations.getByName(\"runtimeClasspath\").incoming.resolutionResult.allComponents.map { it.id }.filterIsInstance<ModuleComponentIdentifier>()\n        val r = dependencies.createArtifactResolutionQuery().forComponents(ids).withArtifacts(JvmLibrary::class.java, SourcesArtifact::class.java).execute()\n        r.resolvedComponents.forEach { c -> c.getArtifacts(SourcesArtifact::class.java).forEach { a -> if (a is ResolvedArtifactResult) println(\"SOCKET-SRC \" + a.file.absolutePath) } }\n    }\n}\n",
+        Dsl::Groovy => "def socketSources = providers.provider {\n    def ids = configurations.runtimeClasspath.incoming.resolutionResult.allComponents.collect { it.id }.findAll { it instanceof ModuleComponentIdentifier }\n    def r = dependencies.createArtifactResolutionQuery().forComponents(ids).withArtifacts(JvmLibrary, SourcesArtifact).execute()\n    def paths = []\n    r.resolvedComponents.each { c -> c.getArtifacts(SourcesArtifact).each { a -> if (a instanceof ResolvedArtifactResult) { paths << a.file.absolutePath } } }\n    paths\n}\ntasks.register('printSources') {\n    def srcs = socketSources\n    doLast { srcs.get().each { println('SOCKET-SRC ' + it) } }\n}\n",
+        Dsl::Kotlin => "val socketSources = providers.provider {\n    val ids = configurations.getByName(\"runtimeClasspath\").incoming.resolutionResult.allComponents.map { it.id }.filterIsInstance<ModuleComponentIdentifier>()\n    val r = dependencies.createArtifactResolutionQuery().forComponents(ids).withArtifacts(JvmLibrary::class.java, SourcesArtifact::class.java).execute()\n    r.resolvedComponents.flatMap { c -> c.getArtifacts(SourcesArtifact::class.java).filterIsInstance<ResolvedArtifactResult>().map { it.file.absolutePath } }\n}\ntasks.register(\"printSources\") {\n    val srcs = socketSources\n    doLast { srcs.get().forEach { println(\"SOCKET-SRC \" + it) } }\n}\n",
     }
 }
 

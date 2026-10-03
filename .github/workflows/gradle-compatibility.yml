@@ -9,7 +9,7 @@ name: Gradle patch compatibility
 #   6.9.4 / JDK 11, 7.6.6 / JDK 17, 8.14.3 / JDK 21, 9.8.0 / JDK 21
 #   x {agent, hosted, vendor}.
 # Extra ubuntu rows (`extras`):
-#   * JDK ceilings — the newest JDK each line runs on: 6.9 <= 16,
+#   * JDK ceilings — the newest JDK each line runs on: 6.9 <= 15,
 #     7.6 <= 19, 8.14 <= 24 (9.x runs on 17-25; the grid's 21 is its LTS).
 #   * Configuration cache — 9.8.0 with --configuration-cache, hosted and
 #     vendor.
@@ -315,9 +315,9 @@ jobs:
       matrix:
         include:
           # JDK ceilings.
-          - {os: ubuntu-latest, gradle: '6.9.4', java: '16', mode: agent, label: jdk-ceiling}
-          - {os: ubuntu-latest, gradle: '6.9.4', java: '16', mode: hosted, label: jdk-ceiling}
-          - {os: ubuntu-latest, gradle: '6.9.4', java: '16', mode: vendor, label: jdk-ceiling}
+          - {os: ubuntu-latest, gradle: '6.9.4', java: '15', mode: agent, label: jdk-ceiling}
+          - {os: ubuntu-latest, gradle: '6.9.4', java: '15', mode: hosted, label: jdk-ceiling}
+          - {os: ubuntu-latest, gradle: '6.9.4', java: '15', mode: vendor, label: jdk-ceiling}
           - {os: ubuntu-latest, gradle: '7.6.6', java: '19', mode: agent, label: jdk-ceiling}
           - {os: ubuntu-latest, gradle: '7.6.6', java: '19', mode: hosted, label: jdk-ceiling}
           - {os: ubuntu-latest, gradle: '7.6.6', java: '19', mode: vendor, label: jdk-ceiling}
