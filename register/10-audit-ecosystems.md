@@ -1,5 +1,5 @@
 ### Ecosystems and formats (`audit-ecosystems`)
-_Last updated 2026-10-03T00:53Z · main @ 045d7ec_
+_Last updated 2026-10-03T07:20Z · main @ 045d7ec_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -9,14 +9,14 @@ _Last updated 2026-10-03T00:53Z · main @ 045d7ec_
 | E04 | 1 | Pipenv hosted-URL recognition accepts any host (`pypi_pipenv.rs`), but `redirect` `hosted_patch_uuid` uses an origin allowlist. | 5.4 | #563 | fixed (#572) |
 | E05 | 1 | Cache crawls aren't project-scoped: cargo, go, maven, nuget and deno enumerate the whole machine cache, and scan sends all of it to the API (#265). | 6.6 | #595 | filed #595; tracking, children #427, #265 |
 | E06 | 1 | Some crawler reads aren't FIFO-safe: `nuget_crawler.rs` (`obj/project.assets.json`) and the cargo `vendor/<crate>/Cargo.toml` reads use a plain `read_to_string` on project-tree files. The Python `.venv` read is guarded. | 6.6 | #592 | in PR #602 |
-| E07 | 2 | package-lock has four entry walks and three JSON re-serialization strategies (`redirect::serialize_json`, `common::serialize_json`, `JsonLayout`). Target: one `NpmLockDoc` model. #357 fixed part of this. | 4.4; 4.7 E | | to verify |
+| E07 | 2 | package-lock has four entry walks (inventory, vendored, hosted, restore) with copied identity/skip rules and two pointer escapes. Target: one addressed walk. The serializer half was fixed by #357 (all writers use `JsonLayout`). | 4.4; 4.7 E | #663 | filed #663 |
 | E08 | 2 | yarn has five `split("\n\n")` + regex grammars beside `scan_blocks`. Target: hosted yarn writers and restorers built on `LockBlock`. | 3.7 #3; 4.7 D | | to verify |
-| E09 | 2 | Yarn berry gates are written twice: the cacheKey constant, cacheKey extraction, and the mixed-EOL and `compressionLevel` refusals, which use different codes. #370 needs fixing twice. | 4.4 | #629, #628 | filed #629, #628; `compressionLevel` reader already shared (#508) |
+| E09 | 2 | Yarn berry gates are written twice: the cacheKey constant, cacheKey extraction, and the mixed-EOL and `compressionLevel` refusals, which use different codes. #370 needs fixing twice. | 4.4 | #629, #628 | in PR #657; `compressionLevel` reader already shared (#508) |
 | E10 | 2 | XML has eight hand-rolled scanners and four attribute extractors with three tokenization rules. The writers (`nuget_feed.rs`, `maven_repo.rs`) never use the shared readers, so reader and writer can disagree. | 5.4 | | to verify |
 | E11 | 2 | NuGet config has three readers. Target: `formats::nuget::parse_config` everywhere. Fixing E01 is the first step. | 3.7 #3; 5.4 | #594 | filed #594; hosted part in PR #597 |
 | E12 | 2 | pnpm v9 and legacy 5.4/6.0 are near-copies (`revert_*_opts`, `vendor_pnpm*`, `read_project`, `edit_overrides`, `dep_field_lines`, the KIND constant), and v9 has two lookup paths (a linear scan and `LockIndex`). | 4.4; 4.5 #4; 4.7 B/G | #583 | fixed (#583) |
 | E13 | 2 | `utils/poetry_lock.rs` ≈ `utils/pdm_lock.rs`: the `*_lock_edits` functions are identical, and the `pair_*` functions differ by one shape check, which is a latent bug in one of them. | 5.4 | | to verify |
-| E14 | 2 | Pipfile.lock is written two ways: vendored mode re-serializes it, while hosted mode splices spans. | 5.4 | | to verify |
+| E14 | 2 | Pipfile.lock is written two ways: vendored mode re-serializes it, while hosted mode splices spans. | 5.4 | | to verify; present on 045d7ec, no drift proven (pipenv writes canonical JSON), not filed yet |
 | E15 | 2 | Cargo.toml has a line-based parser in `cargo_crawler.rs` even though the crate depends on `toml_edit`. `cargo_tag.rs` finds the version textually, and `plan_cargo_toml` uses a regex scanner and `toml_edit` in one rewriter. | 5.4; 3.7 #3 | | to verify |
 | E16 | 2 | CRLF has five policies in the npm family and three for `toml_edit` output, and `common::detect_eol` contradicts `LineEndings::Mixed`. Target: one line-ending policy. | 4.4; 5.4; 7.3 | | to verify |
 | E17 | 2 | "Is a bun lock present" has four predicates with different symlink semantics, so a dangling `bun.lock` symlink is present to one of them and absent to the others. | 4.4 | | to verify |
@@ -53,8 +53,9 @@ _Last updated 2026-10-03T00:53Z · main @ 045d7ec_
 | E48 | 3 | Discovery re-implements package-manager layouts (venv-name hashing, global prefixes, the pnpm store). Target: ask the package manager (`poetry env info -p`, `pipenv --venv`, `npm query`, …). | 2.2 #2; 6.6 | | to verify |
 | E49 | 2 | Hosted Pipenv `owned_url` rejects path-prefixed `--patch-server-url` origins and sdists, so it refuses to rotate its own pin; there are four hosted-PyPI-URL grammars (`hosted_patch_uuid`, `hosted_artifact_url`, `owned_url`, `is_socket_hosted_reference`). | new finding | #563 | fixed (#572) |
 | E50 | 2 | Hosted `rewrite_nuget` and upstream restore rewrite `packages.lock.json` entries of the patched id at other versions (every framework); vendored `locked_at` filters by version. Four lock walkers. | new finding | #593 | filed #593 |
-| E51 | 2 | Yarn berry: vendored refuses a mixed-EOL root `package.json` (`vendor_yarn_berry_mixed_line_endings`); hosted's gate checks only `yarn.lock` and silently majority-normalizes the manifest via `JsonLayout`. | new finding | #628 | filed #628 |
+| E51 | 2 | Yarn berry: vendored refuses a mixed-EOL root `package.json` (`vendor_yarn_berry_mixed_line_endings`); hosted's gate checks only `yarn.lock` and silently majority-normalizes the manifest via `JsonLayout`. | new finding | #628 | in PR #657 |
 | E52 | 3 | `vendor/go_sum_edit.rs`: free `upsert_module_lines` / `has_module_version` / `remove_exact_module_version_lines` have no production caller and are re-implemented by `GoSumEditor` (kept only as a test oracle); the pure hosted codec lives in `vendor/`. | new finding | #631 | filed #631 |
+| E53 | 2 | Vendored pnpm writes the root `package.json` with `serialize_json` (LF, no BOM) instead of `JsonLayout`: a CRLF file stays LF after `vendor --revert`; a BOM file is refused as "not a JSON object". npm and berry keep the layout. | new finding | #662 | filed #662 |
 
 **Handed off:** none yet.
 
