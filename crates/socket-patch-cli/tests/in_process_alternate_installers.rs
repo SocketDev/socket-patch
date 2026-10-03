@@ -1342,6 +1342,69 @@ async fn rush_transitive_dep_in_common_temp_store_is_patched() {
     );
 }
 
+/// REGRESSION (#661), real pnpm: with `modulesDir: deps` (pnpm 10+
+/// reads `pnpm-workspace.yaml`, older pnpm `.npmrc` `modules-dir`), pnpm
+/// 10.12+ puts the virtual store in `deps/.pnpm` and no package under
+/// `node_modules`. Agent-mode apply must patch the store copy. Older pnpm
+/// keeps the store in `node_modules/.pnpm`, which is not this layout, so
+/// the leg skips there.
+#[tokio::test]
+#[serial]
+async fn pnpm_modules_dir_install_then_apply_patches_file() {
+    if !has("pnpm") {
+        println!("SKIP: pnpm not on PATH");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{ "name": "pnpm-md-test", "version": "0.0.0", "dependencies": { "ms": "2.1.3" } }"#,
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("pnpm-workspace.yaml"), "modulesDir: deps\n").unwrap();
+    std::fs::write(tmp.path().join(".npmrc"), "modules-dir=deps\n").unwrap();
+
+    let status = pm_command("pnpm", &["npm_config_"])
+        .args(["install", "--silent", "--no-frozen-lockfile"])
+        .current_dir(tmp.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("pnpm install");
+    if !status.status.success() {
+        println!(
+            "SKIP: pnpm install failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        return;
+    }
+    let ms_index = tmp
+        .path()
+        .join("deps/.pnpm/ms@2.1.3/node_modules/ms/index.js");
+    if !ms_index.exists() {
+        println!("SKIP: this pnpm keeps its virtual store outside modulesDir (< 10.12)");
+        return;
+    }
+    assert!(!tmp.path().join("node_modules/.pnpm").exists());
+
+    let original = std::fs::read(&ms_index).expect("read ms/index.js");
+    let before_hash = git_sha256(&original);
+    let mut patched = original.clone();
+    patched.extend_from_slice(b"\n// SOCKET-PATCH-PNPM-MODULES-DIR-REAL-MARKER\n");
+    let after_hash = git_sha256(&patched);
+
+    let socket = tmp.path().join(".socket");
+    write_manifest(&socket, "pkg:npm/ms@2.1.3", &before_hash, &after_hash);
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&after_hash), &patched).unwrap();
+
+    let code = apply_run(default_apply(tmp.path())).await;
+    assert_eq!(code, 0, "apply must patch the pnpm modulesDir install");
+    assert_patched(&ms_index, &patched, &before_hash, &after_hash);
+}
+
 /// REGRESSION (#661): with pnpm 10.12+ `modulesDir: deps`, pnpm installs
 /// into `deps/.pnpm` and there is no `node_modules`. Agent-mode apply
 /// reported the package not installed ("resolved by the project

@@ -206,6 +206,13 @@ limits, and required install commands.
   `virtualStoreDir`, instead of reporting them `package_not_installed` (#359,
   #362). A store outside the project, such as pnpm's global virtual store, is
   shared with other projects and is still not patched in place.
+- Agent mode and `vex` find packages installed under pnpm's `modulesDir`
+  (`modulesDir:` in `pnpm-workspace.yaml`, or `modules-dir` in `.npmrc`).
+  From pnpm 10.12 the virtual store moves there (`<modulesDir>/.pnpm`), so
+  `apply` exited 0 with the package unpatched as "not installed", and
+  hosted `vex` attested `not_affected` over the unpatched install. Hosted
+  `vex` also no longer attests a pinned npm package the crawler cannot see
+  because pnpm keeps the installed store outside the project (#661, #696).
 - npm locks keep their own layout when edited. `scan --mode hosted`,
   `scan --mode vendored`, `rollback` and `vendor --revert`
   re-serialized `package-lock.json` / `npm-shrinkwrap.json` with LF line
