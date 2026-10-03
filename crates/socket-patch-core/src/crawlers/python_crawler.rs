@@ -789,32 +789,9 @@ fn parse_dotenv(text: &str, var: &impl Fn(&str) -> Option<String>) -> Vec<(Strin
         }
         let raw = raw.trim_start();
         let (value, interpolate) = if let Some(rest) = raw.strip_prefix('\'') {
-            (
-                rest.split('\'').next().unwrap_or_default().to_string(),
-                false,
-            )
+            (dotenv_unquote(rest, '\''), false)
         } else if let Some(rest) = raw.strip_prefix('"') {
-            let mut value = String::new();
-            let mut chars = rest.chars();
-            while let Some(c) = chars.next() {
-                match c {
-                    '"' => break,
-                    '\\' => match chars.next() {
-                        Some('n') => value.push('\n'),
-                        Some('t') => value.push('\t'),
-                        Some('r') => value.push('\r'),
-                        Some(other) => {
-                            if !matches!(other, '"' | '\\' | '\'') {
-                                value.push('\\');
-                            }
-                            value.push(other);
-                        }
-                        None => value.push('\\'),
-                    },
-                    c => value.push(c),
-                }
-            }
-            (value, true)
+            (dotenv_unquote(rest, '"'), true)
         } else {
             let unquoted = match raw.find(" #").or_else(|| raw.find("\t#")) {
                 Some(at) => &raw[..at],
@@ -838,6 +815,45 @@ fn parse_dotenv(text: &str, var: &impl Fn(&str) -> Option<String>) -> Vec<(Strin
         pairs.push((key.to_string(), value));
     }
     pairs
+}
+
+/// The body of a quoted python-dotenv value up to the closing `quote`,
+/// decoding only the escapes python-dotenv decodes: `\\` and `\'` in single
+/// quotes; those plus `\"` and `\a \b \f \n \r \t \v` in double quotes. Any
+/// other backslash stays literal, so Windows paths survive.
+fn dotenv_unquote(rest: &str, quote: char) -> String {
+    let mut value = String::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == quote {
+            break;
+        }
+        if c != '\\' {
+            value.push(c);
+            continue;
+        }
+        let decoded = match (quote, chars.peek()) {
+            (_, Some('\\')) => Some('\\'),
+            (_, Some('\'')) => Some('\''),
+            ('"', Some('"')) => Some('"'),
+            ('"', Some('a')) => Some('\u{7}'),
+            ('"', Some('b')) => Some('\u{8}'),
+            ('"', Some('f')) => Some('\u{c}'),
+            ('"', Some('n')) => Some('\n'),
+            ('"', Some('r')) => Some('\r'),
+            ('"', Some('t')) => Some('\t'),
+            ('"', Some('v')) => Some('\u{b}'),
+            _ => None,
+        };
+        match decoded {
+            Some(decoded) => {
+                chars.next();
+                value.push(decoded);
+            }
+            None => value.push('\\'),
+        }
+    }
+    value
 }
 
 /// python-dotenv's `${NAME}` / `${NAME:-default}` expansion (a bare
@@ -3512,7 +3528,11 @@ mod tests {
             find_local_venv_site_packages_with(&project, &var).await,
             vec![custom.clone(), site.clone()]
         );
-        std::fs::remove_dir_all(site.ancestors().nth(3).unwrap()).unwrap();
+        // Remove only the default venv (`wh/proj-<hash>`); the site-packages
+        // depth under it differs between POSIX and Windows.
+        let wh = tmp.path().join("wh");
+        let default_root = site.ancestors().find(|a| a.parent() == Some(wh.as_path()));
+        std::fs::remove_dir_all(default_root.unwrap()).unwrap();
         assert_eq!(
             find_local_venv_site_packages_with(&project, &var).await,
             vec![custom.clone()],
@@ -3539,7 +3559,9 @@ mod tests {
         std::fs::write(project.join("Pipfile"), "[packages]\nsix = \"==1.16.0\"\n").unwrap();
         let real = std::fs::canonicalize(&project).unwrap();
         let hash = pipenv_venv_hash(&pipenv_path_string(&real.join("Pipfile")));
-        let base = tmp.path().to_string_lossy().into_owned();
+        // Forward slashes: python-dotenv decodes `\r`, `\t`... inside double
+        // quotes, so a quoted Windows path must not carry backslashes.
+        let base = tmp.path().to_string_lossy().replace('\\', "/");
         let elsewhere = fake_venv(&tmp.path().join("elsewhere"), &format!("proj-{hash}"));
         let home = env_of(&[(
             "HOME",
@@ -3615,6 +3637,9 @@ C=\"quoted # not a comment\"
 D='single ${OUTER}'
 E=\"line\\nbreak\"
 F=${A}-${OUTER}-${MISSING:-dflt}
+H=\"C:\\Users\\dev\\Temp\"
+I='it\\'s'
+J='C:\\Temp\\x'
 NOVALUE
 G=
 =skipped
@@ -3629,7 +3654,11 @@ G=
         assert_eq!(get("F"), Some("1-out-dflt"));
         assert_eq!(get("NOVALUE"), None);
         assert_eq!(get("G"), Some(""));
-        assert_eq!(parsed.len(), 7);
+        // Unknown escapes stay literal (Windows paths); `\'` and `\\` decode.
+        assert_eq!(get("H"), Some(r"C:\Users\dev\Temp"));
+        assert_eq!(get("I"), Some("it's"));
+        assert_eq!(get("J"), Some(r"C:\Temp\x"));
+        assert_eq!(parsed.len(), 10);
     }
 
     #[tokio::test]
