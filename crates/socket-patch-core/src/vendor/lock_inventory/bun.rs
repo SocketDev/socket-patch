@@ -7,6 +7,8 @@ use crate::formats::bun::{BunTextError, BunTextLock};
 use crate::vendor::bun_lock_text::{self, BunEntry};
 use crate::vendor::bun_lockb::BunLockb;
 
+use crate::patch::redirect::hosted_url_version;
+
 use super::view::ProjectView;
 use super::{http_url, LockIntegrity, LockfileEntry, UnsupportedNpmLayout};
 
@@ -58,10 +60,15 @@ pub(super) async fn inventory_bun_binary_in(
     Ok(packages
         .into_iter()
         .filter_map(|package| {
-            let version = package.version?;
-            // Only resolved registry versions participate. Workspace, file and
-            // git sources have no registry version; a local vendored tarball's
-            // pristine metadata is recovered from its wiring ledger instead.
+            // Only resolved registry versions participate, plus a hosted
+            // pin: a tarball record whose URL leaf names the package's own
+            // `<name>-<version>.tgz` (#720). Workspace, file and git sources
+            // have no registry version; a local vendored tarball's pristine
+            // metadata is recovered from its wiring ledger instead.
+            let version = match package.version {
+                Some(version) => version,
+                None => hosted_url_version(&package.resolution, &package.name)?.to_string(),
+            };
             if !version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                 return None;
             }
@@ -89,6 +96,10 @@ pub(super) async fn inventory_bun_in(view: &ProjectView<'_>) -> Option<Vec<Lockf
 
     let mut out = Vec::new();
     for entry in entries {
+        if let Some(hosted) = hosted_pin_entry(&entry) {
+            out.push(hosted);
+            continue;
+        }
         // Registry entries are 4-tuples `[spec, registry, {deps}, sha512]`;
         // our vendored 3-tuples and other shapes are skipped.
         if entry.elems.len() != 4 || !entry.elems[2].starts_with('{') {
@@ -127,4 +138,26 @@ pub(super) async fn inventory_bun_in(view: &ProjectView<'_>) -> Option<Vec<Lockf
         ));
     }
     Some(out)
+}
+
+/// A hosted redirect's pin of a registry package: the URL tuple
+/// `["name@https://…/<bare>-<version>.tgz", {deps}, "sha512-…"]` both bun
+/// rewriters write (the 2-tuple without the sha512 when Bun < 1.3.10
+/// re-saved it). The version is the URL leaf's (`hosted_url_version`, the
+/// rule lockfile discovery reads bun hosted refs by), so a lockfile-only
+/// re-run still sees the package (#720), as the pnpm, vlt and yarn berry
+/// views do. Our vendored 3-tuples carry a relative path, never an
+/// http(s) URL, and stay out.
+fn hosted_pin_entry(entry: &BunEntry) -> Option<LockfileEntry> {
+    if !(2..=3).contains(&entry.elems.len()) || !entry.elems[1].starts_with('{') {
+        return None;
+    }
+    let spec = bun_lock_text::decode_json_string(&entry.elems[0])?;
+    let (name, url) = bun_lock_text::split_name_spec(&spec)?;
+    let version = hosted_url_version(url, name)?;
+    let integrity = match entry.elems.get(2) {
+        Some(raw) => LockIntegrity::Sri(bun_lock_text::decode_json_string(raw)?),
+        None => LockIntegrity::None,
+    };
+    Some(LockfileEntry::npm(name, version, http_url(url), integrity))
 }
