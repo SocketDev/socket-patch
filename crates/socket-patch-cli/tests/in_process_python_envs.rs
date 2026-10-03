@@ -546,6 +546,8 @@ const PIPENV_VARS: &[&str] = &[
     "PIPENV_NO_VENV_IN_PROJECT",
     "PIPENV_CUSTOM_VENV_NAME",
     "PIPENV_PIPFILE",
+    "PIPENV_DONT_LOAD_ENV",
+    "PIPENV_DOTENV_LOCATION",
 ];
 
 /// Run `scan` with exactly `env` set among [`PIPENV_VARS`].
@@ -612,31 +614,101 @@ async fn pipenv_opt_outs_keep_activated_virtual_env_from_hijacking_scan() {
     }
 }
 
-/// #334: Pipenv never uses `venv/`, and `PIPENV_VENV_IN_PROJECT=0` makes it
-/// ignore a `./.venv` directory, so neither may shadow Pipenv's venv.
+/// #334: Pipenv never uses `venv/`, so it may not shadow Pipenv's venv.
 #[tokio::test]
 #[serial]
 async fn pipenv_stray_venv_dirs_do_not_shadow_the_pipenv_venv() {
-    for (stray, opt_out) in [("venv", None), (".venv", Some("0"))] {
+    let (_tmp, project, workon) = pipenv_project();
+    let stray_site = venv_site_packages(&project.join("venv"), "python3.12");
+    std::fs::create_dir_all(&stray_site).unwrap();
+    write_dist_info(&stray_site, "stray_decoy", "6.6.6");
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let env: Vec<(&str, &Path)> = vec![
+        ("WORKON_HOME", &workon),
+        ("PIPENV_CUSTOM_VENV_NAME", Path::new("proj-env")),
+    ];
+    let code = scan_with_pipenv_env(default_args(&project, server.uri()), &env).await;
+    assert_eq!(code, 0);
+    let bodies = batch_bodies(&server).await;
+    assert_discovered(&bodies, "pkg:pypi/pipenv-pkg@1.0.0");
+    assert_not_discovered(&bodies, "pkg:pypi/stray-decoy@6.6.6");
+}
+
+/// #645: with `PIPENV_VENV_IN_PROJECT=0` (or `PIPENV_NO_VENV_IN_PROJECT=1`)
+/// only Pipenv 2023.11.14+ ignores a `./.venv` directory; 2018.11 through
+/// 2023.10.24 still use it. Both venvs are scanned, so whichever one the
+/// installed Pipenv uses is patched.
+#[tokio::test]
+#[serial]
+async fn pipenv_explicit_not_in_project_still_scans_dot_venv() {
+    for (name, value) in [
+        ("PIPENV_VENV_IN_PROJECT", "0"),
+        ("PIPENV_NO_VENV_IN_PROJECT", "1"),
+    ] {
         let (_tmp, project, workon) = pipenv_project();
-        let stray_site = venv_site_packages(&project.join(stray), "python3.12");
-        std::fs::create_dir_all(&stray_site).unwrap();
-        write_dist_info(&stray_site, "stray_decoy", "6.6.6");
+        let dot_site = venv_site_packages(&project.join(".venv"), "python3.12");
+        std::fs::create_dir_all(&dot_site).unwrap();
+        write_dist_info(&dot_site, "dot_venv_pkg", "1.0.0");
         let server = MockServer::start().await;
         mock_batch_empty(&server).await;
-        let mut env: Vec<(&str, &Path)> = vec![
+        let env: Vec<(&str, &Path)> = vec![
             ("WORKON_HOME", &workon),
             ("PIPENV_CUSTOM_VENV_NAME", Path::new("proj-env")),
+            (name, Path::new(value)),
         ];
-        if let Some(value) = opt_out {
-            env.push(("PIPENV_VENV_IN_PROJECT", Path::new(value)));
-        }
         let code = scan_with_pipenv_env(default_args(&project, server.uri()), &env).await;
-        assert_eq!(code, 0, "{stray}");
+        assert_eq!(code, 0, "{name}={value}");
         let bodies = batch_bodies(&server).await;
         assert_discovered(&bodies, "pkg:pypi/pipenv-pkg@1.0.0");
-        assert_not_discovered(&bodies, "pkg:pypi/stray-decoy@6.6.6");
+        assert_discovered(&bodies, "pkg:pypi/dot-venv-pkg@1.0.0");
     }
+}
+
+/// #546: Pipenv loads the project's `.env` before it picks the venv, so a
+/// `PIPENV_CUSTOM_VENV_NAME` or `WORKON_HOME` there decides which venv is
+/// scanned (and `PIPENV_DONT_LOAD_ENV` turns that off).
+#[tokio::test]
+#[serial]
+async fn pipenv_dotenv_settings_pick_the_scanned_venv() {
+    // Name in .env, WORKON_HOME exported.
+    let (_tmp, project, workon) = pipenv_project();
+    std::fs::write(project.join(".env"), "PIPENV_CUSTOM_VENV_NAME=proj-env\n").unwrap();
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let code = scan_with_pipenv_env(
+        default_args(&project, server.uri()),
+        &[("WORKON_HOME", &workon)],
+    )
+    .await;
+    assert_eq!(code, 0);
+    assert_discovered(&batch_bodies(&server).await, "pkg:pypi/pipenv-pkg@1.0.0");
+
+    // Both in .env, nothing exported.
+    std::fs::write(
+        project.join(".env"),
+        format!(
+            "export WORKON_HOME=\"{}\"\nPIPENV_CUSTOM_VENV_NAME=proj-env # named\n",
+            workon.display()
+        ),
+    )
+    .unwrap();
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let code = scan_with_pipenv_env(default_args(&project, server.uri()), &[]).await;
+    assert_eq!(code, 0);
+    assert_discovered(&batch_bodies(&server).await, "pkg:pypi/pipenv-pkg@1.0.0");
+
+    // PIPENV_DONT_LOAD_ENV: Pipenv ignores .env, and so does discovery.
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let code = scan_with_pipenv_env(
+        default_args(&project, server.uri()),
+        &[("PIPENV_DONT_LOAD_ENV", Path::new("1"))],
+    )
+    .await;
+    assert_eq!(code, 0);
+    assert_not_discovered(&batch_bodies(&server).await, "pkg:pypi/pipenv-pkg@1.0.0");
 }
 
 // ---------------------------------------------------------------------------
