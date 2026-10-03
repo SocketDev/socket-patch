@@ -654,6 +654,31 @@ pub(super) async fn lock_text_mentions_uuid(
     any_readable.then_some(false)
 }
 
+/// The keep gate for recorded lock entries that VANISHED during a revert
+/// ([`RevertOutcome::lock_entry_removed`], #665). The user removed the
+/// dependency, so there was nothing to restore; the artifact can go once
+/// no lockfile in `names` resolves through it any more. While one still
+/// mentions the uuid dir (the entry moved to a key the wiring never
+/// recorded), or none can be read, the artifact may be the only copy an
+/// install needs: keep it exactly like a drift-skip. Returns true when the
+/// artifact was kept and the caller must stop before deleting it.
+pub(super) async fn keep_artifact_while_lock_references_it(
+    outcome: &mut RevertOutcome,
+    project_root: &Path,
+    names: &[&str],
+    uuid: &str,
+    uuid_dir_rel: &str,
+) -> bool {
+    if !outcome.lock_entry_removed() {
+        return false;
+    }
+    if lock_text_mentions_uuid(project_root, names, uuid).await == Some(false) {
+        return false;
+    }
+    outcome.keep_artifact(uuid_dir_rel);
+    true
+}
+
 /// Does this build have a backend for an npm entry's recorded flavor?
 /// `None` is a pre-flavor (package-lock) ledger. An unknown flavor was
 /// wired by a newer socket-patch, so health checks and rebuilds must not

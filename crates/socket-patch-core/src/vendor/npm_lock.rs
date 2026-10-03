@@ -780,6 +780,18 @@ pub async fn revert_npm_opts(
         return outcome;
     }
 
+    if super::npm_flavor::keep_artifact_while_lock_references_it(
+        &mut outcome,
+        project_root,
+        &[SHRINKWRAP, PACKAGE_LOCK],
+        &entry.uuid,
+        &uuid_dir_rel,
+    )
+    .await
+    {
+        return outcome;
+    }
+
     // FAIL-CLOSED (same brick class as the unwired guard above): the
     // restore only rewrites the lock files the wiring names, but the lock
     // npm actually installs from can still resolve through the artifact —
@@ -1116,8 +1128,11 @@ fn revert_one_record(
         }
     };
     let Some(live) = live else {
+        // REMOVED, not drifted (#665): `npm uninstall` dropped the entry.
+        // The caller keeps the artifact only while a lock still resolves
+        // through it.
         warnings.push(VendorWarning::new(
-            "vendor_lock_entry_drifted",
+            super::LOCK_ENTRY_REMOVED_CODE,
             format!("lock entry `{key}` no longer exists; nothing to restore"),
         ));
         return;
@@ -3182,6 +3197,92 @@ mod tests {
                 .join(format!(".socket/vendor/npm/{UUID}"))
                 .exists(),
             "artifact pruned once the revert converges"
+        );
+    }
+
+    /// #665: the user dropped the patched dependency (`npm uninstall
+    /// left-pad`), so npm deleted every lock entry the wiring recorded and
+    /// nothing in the lock resolves through the artifact any more. That is
+    /// not a third-party re-resolution to protect: the revert must succeed,
+    /// remove the artifact (so the CLI drops the ledger entry) and say why,
+    /// instead of drift-keeping it forever.
+    #[tokio::test]
+    async fn revert_after_dependency_removed_drops_the_unreferenced_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let mut live = fx.read_lock().await;
+        let packages = live["packages"].as_object_mut().unwrap();
+        packages.remove("node_modules/left-pad");
+        packages.remove("node_modules/foo/node_modules/left-pad");
+        packages[""]["dependencies"] = json!({});
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+        let uninstalled = tokio::fs::read(fx.lock_path()).await.unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_removed"
+                    && w.detail.contains("node_modules/left-pad")),
+            "the vanished entry is still surfaced: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "nothing resolves through the artifact, so it is removed"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            uninstalled,
+            "the user's post-uninstall lock is left byte-identical"
+        );
+    }
+
+    /// #665 guard: a recorded entry vanished but the lock still resolves
+    /// through the artifact under a key the wiring never recorded (npm
+    /// re-hoisted it). The artifact may be the only copy that install
+    /// needs, so it is kept, exactly like a drift-skip.
+    #[tokio::test]
+    async fn revert_keeps_artifact_when_a_vanished_entry_moved_to_an_unrecorded_key() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let mut live = fx.read_lock().await;
+        let packages = live["packages"].as_object_mut().unwrap();
+        let wired = packages.remove("node_modules/left-pad").unwrap();
+        packages.remove("node_modules/foo/node_modules/left-pad");
+        packages.insert("node_modules/bar/node_modules/left-pad".into(), wired);
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "the lock still resolves through the artifact"
         );
     }
 
