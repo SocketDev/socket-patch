@@ -22,7 +22,7 @@ mod common;
 #[path = "sbt_build_common/mod.rs"]
 mod sbt_build_common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sbt_build_common::*;
 use socket_patch_core::formats::sbt::owned_file::{HOSTED_FILE, HOSTED_REPO_REL};
@@ -783,10 +783,16 @@ fn sbt_build_common_writes_a_resolvable_fixture() {
     );
     assert!(text.contains(".aggregate(a)") && text.contains("autoScalaLibrary := false"));
     assert!(ws.root.is_absolute() && Path::new(&ws.root).exists());
+    // This OS's absolute spelling and classpath separator.
+    let (d, sep) = if cfg!(windows) {
+        ("C:", ";")
+    } else {
+        ("", ":")
+    };
     assert_eq!(
         SbtRun {
             code: Some(0),
-            output: "[info] x\n/a/b/lib-1.0.0.jar:/c/top-1.0.0.jar\n".into(),
+            output: format!("[info] x\n{d}/a/b/lib-1.0.0.jar{sep}{d}/c/top-1.0.0.jar\n"),
             commands: vec![],
         }
         .classpath_jars()
@@ -796,11 +802,14 @@ fn sbt_build_common_writes_a_resolvable_fixture() {
     assert_eq!(
         SbtRun {
             code: Some(0),
-            output: "List(/a/lib-1.0.0.jar, /c/top-1.0.0.jar)\n".into(),
+            output: format!("List({d}/a/lib-1.0.0.jar, {d}/c/top-1.0.0.jar)\n"),
             commands: vec![],
         }
         .classpath_jars(),
-        [Path::new("/a/lib-1.0.0.jar"), Path::new("/c/top-1.0.0.jar")]
+        [
+            PathBuf::from(format!("{d}/a/lib-1.0.0.jar")),
+            PathBuf::from(format!("{d}/c/top-1.0.0.jar"))
+        ]
     );
     let base = SbtRun {
         code: Some(0),

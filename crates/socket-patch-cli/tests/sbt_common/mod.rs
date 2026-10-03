@@ -184,6 +184,43 @@ pub fn copy_evidence(version: &str, scenario: &str, root: &Path) {
     copy(&evidence_fixture(version, scenario), root);
 }
 
+/// The `file:` URI sbt's update report writes for the absolute `path`:
+/// `file:///C:/x` on Windows (no verbatim `\\?\` prefix, no backslashes,
+/// which would also be invalid JSON escapes), `file:///x` elsewhere, with
+/// the characters a URI path cannot carry percent-encoded.
+pub fn file_uri(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let text = text
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| text.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| text.to_string())
+        .replace('\\', "/");
+    let mut enc = String::with_capacity(text.len());
+    for b in text.bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'/'
+            | b':'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'+' => enc.push(b as char),
+            _ => enc.push_str(&format!("%{b:02X}")),
+        }
+    }
+    if let Some(unc) = enc.strip_prefix("//") {
+        format!("file://{unc}")
+    } else if enc.starts_with('/') {
+        format!("file://{enc}")
+    } else {
+        format!("file:///{enc}")
+    }
+}
+
 /// What `sbt update` records once a pin is wired: every `update` record
 /// under `root` that resolved `gav` from the committed evidence's Coursier
 /// cache (`file:///root/.cache/coursier/v1/https/repo1.maven.org/maven2/…`)
@@ -222,12 +259,10 @@ pub fn record_pinned_resolution(
                     "file:///root/.cache/coursier/v1/https/repo1.maven.org/maven2/{}/{a}/{v}/{a}-{v}.jar",
                     gav.group_path()
                 );
-                wired = wired
-                    .replace(&cached, &format!("file://{}", jar.display()))
-                    .replace(
-                        &format!("\"organization\":\"{g}\",\"name\":\"{a}\",\"revision\":\"{v}\""),
-                        &format!("\"organization\":\"{g}\",\"name\":\"{a}\",\"revision\":\"{sv}\""),
-                    );
+                wired = wired.replace(&cached, &file_uri(jar)).replace(
+                    &format!("\"organization\":\"{g}\",\"name\":\"{a}\",\"revision\":\"{v}\""),
+                    &format!("\"organization\":\"{g}\",\"name\":\"{a}\",\"revision\":\"{sv}\""),
+                );
             }
             if wired != text {
                 write(&path, wired.as_bytes());
@@ -241,4 +276,28 @@ pub fn record_pinned_resolution(
         f.set_modified(at).expect("date record");
     }
     changed
+}
+
+mod sbt_common_selftests {
+    use super::*;
+
+    /// Windows-shaped inputs are plain strings, so every OS checks them.
+    #[test]
+    fn file_uri_spells_every_os_path_as_sbt_does() {
+        assert_eq!(file_uri(Path::new("/r/a b/x.jar")), "file:///r/a%20b/x.jar");
+        assert_eq!(
+            file_uri(Path::new(r"\\?\C:\Users\RUNNER~1\x.jar")),
+            "file:///C:/Users/RUNNER~1/x.jar"
+        );
+        assert_eq!(file_uri(Path::new(r"C:\a\x.jar")), "file:///C:/a/x.jar");
+        assert_eq!(
+            file_uri(Path::new(r"\\?\UNC\srv\share\x.jar")),
+            "file://srv/share/x.jar"
+        );
+        for p in ["/r/a b/x.jar", r"\\?\C:\Users\RUNNER~1\x.jar"] {
+            let uri = file_uri(Path::new(p));
+            let back = socket_patch_core::formats::sbt::evidence::location_path(&uri).unwrap();
+            assert!(back.to_string_lossy().ends_with("x.jar"), "{uri}");
+        }
+    }
 }

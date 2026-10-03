@@ -294,20 +294,25 @@ mod tests {
 
     #[test]
     fn export_classpath_reads_every_line_shape() {
-        let base = Path::new("/w/p");
-        let cs = Path::new("/h/cs");
-        let one = "[info] loading\n/a/x.jar:/b/y.jar\n";
+        // This OS's absolute spelling and classpath separator (`C:/…`, `;`
+        // on Windows, where `/a` is not absolute).
+        let (d, sep) = if cfg!(windows) {
+            ("C:", ";")
+        } else {
+            ("", ":")
+        };
+        let abs = |p: &str| PathBuf::from(format!("{d}{p}"));
+        let base = abs("/w/p");
+        let cs = abs("/h/cs");
+        let one = format!("[info] loading\n{d}/a/x.jar{sep}{d}/b/y.jar\n");
         assert_eq!(
-            export_classpath(one, base, cs),
-            [PathBuf::from("/a/x.jar"), PathBuf::from("/b/y.jar")]
+            export_classpath(&one, &base, &cs),
+            [abs("/a/x.jar"), abs("/b/y.jar")]
         );
         let two = "List(${BASE}/lib/z.jar, ${CSR_CACHE}/https/r/y.jar)\n";
         assert_eq!(
-            export_classpath(two, base, cs),
-            [
-                PathBuf::from("/w/p/lib/z.jar"),
-                PathBuf::from("/h/cs/https/r/y.jar")
-            ]
+            export_classpath(two, &base, &cs),
+            [abs("/w/p/lib/z.jar"), abs("/h/cs/https/r/y.jar")]
         );
     }
 

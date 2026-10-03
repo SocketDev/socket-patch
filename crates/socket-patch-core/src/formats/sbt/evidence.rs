@@ -476,7 +476,15 @@ fn xml_unescape(raw: &str) -> String {
 pub fn location_path(loc: &str) -> Option<PathBuf> {
     let raw = match loc.strip_prefix("file:") {
         Some(rest) => {
-            let rest = rest.strip_prefix("//").unwrap_or(rest);
+            let rest = match rest.strip_prefix("//") {
+                // `file:///x`, and Java's `file:////srv/share/x` (UNC).
+                Some(path) if path.starts_with('/') => path,
+                // `file://localhost/x`: the local host names no share.
+                Some(path) if path.starts_with("localhost/") => &path["localhost".len()..],
+                // `file://srv/share/x`: a host is a UNC share, `//srv/share/x`;
+                // `file:/x` has no authority.
+                _ => rest,
+            };
             let decoded = percent_decode(rest)?;
             // `file:///C:/x` → `C:/x`.
             let bytes = decoded.as_bytes();
@@ -1249,6 +1257,30 @@ mod tests {
         assert_eq!(p("https://h/b.jar"), None);
         assert_eq!(p("rel/b.jar"), None);
         assert_eq!(p("file:///a/%zz"), None);
+        // What sbt / Java write on Windows: `File.toURI` (`file:/C:/…`),
+        // `Path.toUri` (`file:///C:/…`), percent-encoded, and UNC shares.
+        assert_eq!(
+            p("file:/C:/Users/runneradmin/x%20y/b.jar").as_deref(),
+            Some("C:/Users/runneradmin/x y/b.jar")
+        );
+        assert_eq!(
+            p("file:///C:/Users/RUNNER~1/AppData/b.jar").as_deref(),
+            Some("C:/Users/RUNNER~1/AppData/b.jar")
+        );
+        assert_eq!(
+            p("file://localhost/C:/u/b.jar").as_deref(),
+            Some("C:/u/b.jar")
+        );
+        assert_eq!(p("file://localhost/a/b.jar").as_deref(), Some("/a/b.jar"));
+        assert_eq!(
+            p("file:////srv/share/b.jar").as_deref(),
+            Some("//srv/share/b.jar")
+        );
+        assert_eq!(
+            p("file://srv/share/b.jar").as_deref(),
+            Some("//srv/share/b.jar")
+        );
+        assert_eq!(p(r"C:\u\b.jar").as_deref(), Some(r"C:\u\b.jar"));
     }
 
     #[test]

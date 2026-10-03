@@ -346,6 +346,20 @@ fn symlinks_are_never_followed() {
     assert_eq!(e.build_sources.len(), 1);
 }
 
+/// The `file:` URI sbt writes for `path`: `file:///C:/x` on Windows (a
+/// backslash is no URI separator, and an invalid JSON escape).
+fn file_uri(path: &Path) -> String {
+    let text = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace(' ', "%20");
+    if text.starts_with('/') {
+        format!("file://{text}")
+    } else {
+        format!("file:///{text}")
+    }
+}
+
 #[test]
 fn cache_roots_from_artifact_paths() {
     let caches = tempfile::tempdir().unwrap();
@@ -362,7 +376,7 @@ fn cache_roots_from_artifact_paths() {
         };
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(&p, b"jar").unwrap();
-        format!("file://{}", p.display())
+        file_uri(&p)
     };
     let uris = [
         jar(&coursier, true),
@@ -370,18 +384,9 @@ fn cache_roots_from_artifact_paths() {
         jar(&m2, true),
         jar(&own, true),
         // Gone, mismatched coordinates, the sbt boot directory.
-        format!(
-            "file://{}/gone/org/apache/commons/commons-lang3/3.11/x.jar",
-            c.display()
-        ),
-        format!(
-            "file://{}/m2/repository/org/other/commons-lang3/3.11/x.jar",
-            c.display()
-        ),
-        format!(
-            "file://{}/.sbt/boot/scala-2.12.18/lib/scala-library.jar",
-            c.display()
-        ),
+        file_uri(&c.join("gone/org/apache/commons/commons-lang3/3.11/x.jar")),
+        file_uri(&c.join("m2/repository/org/other/commons-lang3/3.11/x.jar")),
+        file_uri(&c.join(".sbt/boot/scala-2.12.18/lib/scala-library.jar")),
     ];
     let artifacts: Vec<String> = uris
         .iter()

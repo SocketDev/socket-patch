@@ -284,7 +284,10 @@ const MAX_WALK_DEPTH: usize = 32;
 /// single-file run, not this directory build). The files socket-patch owns
 /// never count: vendoring writes them after the build.
 fn is_stale(root: &Path, sources: &[PathBuf], evidence_time: SystemTime) -> bool {
-    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    // Without Windows' verbatim prefix, which bloop's paths never carry.
+    let canonical_root = std::fs::canonicalize(root)
+        .map(|c| super::sbt_evidence::strip_verbatim(&c))
+        .unwrap_or_else(|_| root.to_path_buf());
     let rel_of = |p: &Path| {
         p.strip_prefix(root)
             .or_else(|_| p.strip_prefix(&canonical_root))
@@ -679,8 +682,19 @@ mod tests {
         );
         let classes = root.join(BLOOP_DIR).join("p/bloop-internal-classes");
         std::fs::create_dir_all(&classes).unwrap();
+        // Windows opens a directory only with backup semantics, and dates
+        // it only through a handle with write access.
         let set_dir_mtime = |d: &Path, t: SystemTime| {
-            std::fs::File::open(d).unwrap().set_modified(t).unwrap();
+            let mut opts = std::fs::OpenOptions::new();
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt as _;
+                const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+                opts.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+            }
+            #[cfg(not(windows))]
+            opts.read(true);
+            opts.open(d).unwrap().set_modified(t).unwrap();
         };
         set_mtime(&ev, t0);
         set_dir_mtime(&classes, t0);
