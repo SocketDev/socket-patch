@@ -1,5 +1,5 @@
 {
- "_comment": "Recorded 2026-10-02 from GET repos/SocketDev/socket-patch/issues/454/events, /issues/454/timeline and /pulls/456 (trimmed to the fields release.py reads; ids and timestamps verbatim). #454 was closed by merging PR #456: the `closed` event has commit_id null. The `labeled` release-blocker event is added for the test (the real issue never carried that label).",
+ "_comment": "Recorded 2026-10-02 from GET repos/SocketDev/socket-patch/issues/454/events, /issues/454/timeline and /pulls/456 (trimmed to the fields release.py reads, merged_by.login included; ids and timestamps verbatim). #454 was closed by merging PR #456: the `closed` event has commit_id null. The `labeled` release-blocker event is added for the test (the real issue never carried that label).",
  "repo": "SocketDev/socket-patch",
  "base": "a36432ee1ae7f52b8afd13393989e1a1b516281c",
  "baseTime": "2026-10-01T16:51:09Z",
@@ -94,7 +94,10 @@
    "merged": true,
    "merged_at": "2026-10-01T16:51:08Z",
    "number": 456,
-   "state": "closed"
+   "state": "closed",
+   "merged_by": {
+    "login": "mikolalysenko"
+   }
   }
  }
 }

@@ -343,6 +343,51 @@ class StampTests(unittest.TestCase):
         self.assertIn('package-lock.json packages[""].engines != package.json engines', problems)
 
 
+class StampEolAndAtomicityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        copy_packaging(self.root, baseline="4.0.0", changelog=TRAIN)
+
+    def test_a_crlf_checkout_stamps_and_checks_like_an_lf_one(self):
+        # Re-review finding 5: a Windows autocrlf checkout (no `* text=auto`).
+        twin = tempfile.TemporaryDirectory()
+        self.addCleanup(twin.cleanup)
+        copy_packaging(Path(twin.name), baseline="4.0.0", changelog=TRAIN)
+        for rel_path in packaging_files():
+            f = self.root / rel_path
+            f.write_bytes(f.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+        self.assertEqual(rel.stamp(self.root, "4.0.0", check=True), [])
+        self.assertEqual(rel.npm_lock_drift(self.root), [])
+        changed = rel.stamp(self.root, "5.0.0-rc.1")
+        self.assertEqual(changed, rel.stamp(Path(twin.name), "5.0.0-rc.1"))
+        for rel_path in packaging_files():
+            data = (self.root / rel_path).read_bytes()
+            self.assertNotIn(b"\n", data.replace(b"\r\n", b""), rel_path)
+            self.assertEqual(data.replace(b"\r\n", b"\n"), (Path(twin.name) / rel_path).read_bytes(), rel_path)
+        self.assertEqual(rel.stamp(self.root, "5.0.0-rc.1", check=True), [])
+
+    def test_sync_main_writes_nothing_when_the_stamp_refuses(self):
+        # Re-review finding 6: CHANGELOG.md must not be rewritten when the
+        # stamp then fails (here: Cargo.lock lost a workspace member entry).
+        repo = TrainRepo()
+        self.addCleanup(repo.close)
+        copy_packaging(repo.root, baseline="4.0.0", changelog=TRAIN)
+        lock = repo.root / "Cargo.lock"
+        chunks = rel._read(lock).split("[[package]]\n")
+        rel._write(lock, "[[package]]\n".join(c for c in chunks if not c.startswith('name = "socket-patch-bench"\n')))
+        repo.commit("packaging")
+        repo.git("tag", "-f", "v4.0.0")
+        repo.cut("5.0.0-rc.1", "2026-10-12")
+        before = snapshot(repo.root)
+        with self.assertRaisesRegex(rel.ReleaseError, "Cargo.lock"):
+            rel.sync_main(repo.root)
+        self.assertEqual(snapshot(repo.root), before)
+        self.assertEqual(quiet(rel.main, ["--root", str(repo.root), "sync-main"]), 1)
+        self.assertEqual(snapshot(repo.root), before)
+
+
 class StampFromAnRcBaselineTests(StampTests):
     """The same suite on a tree already at an rc (main after a release-sync)."""
     BASELINE = "5.0.0-rc.1"
@@ -408,14 +453,28 @@ class ChangelogTests(unittest.TestCase):
         self.assertEqual([str(s.version) for s in cl.versioned()], ["5.0.0", "4.0.0", "3.2.0"])
         folded = cl.section(V("5.0.0"))
         texts = [b.text for _, b in folded.items()]
-        self.assertEqual(texts.count("- Bound patch API connects and stalled reads (#581)."), 1)
-        self.assertEqual(texts[-1], "- rc.2 fix (#600).")
-        self.assertEqual(len(texts), 7)
+        # The fold keeps every occurrence (multiset): rc.2 repeated #581.
+        self.assertEqual(texts.count("- Bound patch API connects and stalled reads (#581)."), 2)
+        self.assertEqual(texts[-2:], ["- rc.2 fix (#600).", "- Bound patch API connects and stalled reads (#581)."])
+        self.assertEqual(len(texts), 8)
         # rc.3 was never promoted: its block returns to [Unreleased].
         self.assertEqual([b.text for _, b in cl.unreleased().items()], ["- rc.3 feature (#610)."])
-        self.assertEqual(rel.check_section(stable, "5.0.0"), 7)
+        self.assertEqual(rel.check_section(stable, "5.0.0"), 8)
         with self.assertRaises(rel.ReleaseError):
             rel.promote_changelog(stable, "5.0.0-rc.2", "2026-10-27")
+
+    def test_promote_returns_every_block_of_a_later_rc(self):
+        # rc.2 repeats an rc.1 entry and is abandoned when rc.1 is promoted:
+        # its copy did not ship, so it returns (sync-main step 2 agrees).
+        rc1 = rel.cut_changelog(TRAIN, "5.0.0-rc.1", "2026-10-12")
+        cl = rel.Changelog.parse(rc1)
+        cl.unreleased().append_items([("Fixed", rel.Block(["- Bound patch API connects and stalled reads (#581)."])),
+                                      ("Fixed", rel.Block(["- rc.2 fix (#600)."]))])
+        rc2 = rel.cut_changelog(cl.render(), "5.0.0-rc.2", "2026-10-19")
+        stable = rel.Changelog.parse(rel.promote_changelog(rc2, "5.0.0-rc.1", "2026-10-20"))
+        self.assertEqual([b.text for _, b in stable.unreleased().items()],
+                         ["- Bound patch API connects and stalled reads (#581).", "- rc.2 fix (#600)."])
+        self.assertEqual(len(stable.section(V("5.0.0")).items()), 6)
 
     def test_notes_link_p1s_never_titles(self):
         rc1 = rel.cut_changelog(TRAIN, "5.0.0-rc.1", "2026-10-12")
@@ -871,6 +930,42 @@ class SyncInvarianceTests(unittest.TestCase):
         self.assertEqual([b.text for _, b in rel.Changelog.parse(cut).section(V(nv)).items()],
                          ["- Updated dependencies.", "- Week-two fix (#600)."])
 
+    def test_an_entry_repeated_across_folded_rcs_ships_once_per_copy(self):
+        # Re-review finding 1: the fold and sync-main count the same way, so
+        # neither copy of a repeated entry comes back as unshipped (which
+        # would also have raised the next bump from patch to minor).
+        def script(r, sync):
+            r.add_unreleased("Changed", "- Updated dependencies.")
+            r.cut("5.0.0-rc.1", "2026-10-12"); sync()
+            r.add_unreleased("Changed", "- Updated dependencies.")
+            r.add_unreleased("Fixed", "- Week-two fix (#600).")
+            r.cut("5.0.0-rc.2", "2026-10-19"); sync()
+            folded = rel.Changelog.parse(r.promote("5.0.0-rc.2", "2026-10-27")).section(V("5.0.0"))
+            self.assertEqual([b.text for _, b in folded.items()].count("- Updated dependencies."), 2)
+            sync()
+            synced = rel.Changelog.parse(rel.sync_main_changelog(r.read(), r.tags())[0])
+            self.assertFalse(synced.unreleased().items())
+            r.add_unreleased("Fixed", "- Week-four fix (#700).")
+        nv, cut, _ = self.both(script)
+        self.assertEqual(nv, "5.0.1-rc.1")
+        self.assertEqual([(n, b.text) for n, b in rel.Changelog.parse(cut).section(V(nv)).items()],
+                         [("Fixed", "- Week-four fix (#700).")])
+
+    def test_a_repeated_entry_after_a_promotion_keeps_its_place(self):
+        # Re-review finding 3: the rc section on main is charged before
+        # [Unreleased] is touched, so the newer identical copy stays where
+        # it was written, synced or not.
+        def script(r, sync):
+            r.add_unreleased("Fixed", "- R.")
+            r.cut("5.0.0-rc.1", "2026-10-12"); sync()
+            r.add_unreleased("Fixed", "- W2 (#600).")
+            r.add_unreleased("Fixed", "- R.")
+            r.promote("5.0.0-rc.1", "2026-10-20"); sync()
+        nv, cut, _ = self.both(script)
+        self.assertEqual(nv, "5.0.1-rc.1")
+        self.assertEqual([b.text for _, b in rel.Changelog.parse(cut).section(V(nv)).items()],
+                         ["- W2 (#600).", "- R."])
+
     def test_a_repeated_heading_entry_keeps_the_bump_level(self):
         def script(r, sync):
             r.cut("5.0.0-rc.1", "2026-10-12"); sync()
@@ -1091,6 +1186,27 @@ class BlockerHardeningTests(unittest.TestCase):
         late[0]["source"]["issue"]["pull_request"]["merged_at"] = "2026-10-01T10:00:00Z"
         self.assertIn("no fix commit", run({sha: "ahead"}, timeline=late)["blockers"][0]["reason"])
 
+    def test_a_manual_close_after_an_unrelated_mentioning_pr_does_not_resolve(self):
+        # Re-review finding 4: a PR that merely mentions the issue and merged
+        # just before someone else closed it by hand is not its closing PR.
+        fx = json.loads((FIXTURES / "blockers-pr-merge-454.json").read_text(encoding="utf-8"))
+        sha = fx["pulls"]["456"]["merge_commit_sha"]
+        for closer, merger in [("claude-routine-bot", "mikolalysenko"), ("alice", "mikolalysenko"),
+                               ("mikolalysenko", None)]:
+            with self.subTest(closer=closer, merger=merger):
+                events = copy.deepcopy(fx["events"])
+                events[-1]["actor"]["login"] = closer
+                pulls = copy.deepcopy(fx["pulls"])
+                pulls["456"]["merged_by"] = {"login": merger} if merger else None
+                issue = dict(fx["issue"], events=events, timeline=fx["timeline"])
+                fake = FakeGitHub({"issues": [issue], "pulls": pulls, "compare": {sha: "ahead"}},
+                                  repo=fx["repo"], base=fx["base"], base_time=fx["baseTime"])
+                result = rel.evaluate_blockers(rel.GitHub(fx["repo"], "t0ken", fake), fx["base"], fx["since"],
+                                               self.APPROVERS, self.ROUTINE)
+                # (alice is trusted, but her close is after t: it needs a fix.)
+                self.assertTrue(result["blocked"], result)
+                self.assertIn("no fix commit", result["blockers"][0]["reason"])
+
     def test_since_comes_from_mains_history_not_the_tags_date(self):
         repo = TrainRepo()
         self.addCleanup(repo.close)
@@ -1104,10 +1220,32 @@ class BlockerHardeningTests(unittest.TestCase):
         repo.git("tag", "v4.0.1")
         repo.git("checkout", "-q", "main")
         since = rel.latest_stable_date(repo.git_api, base)
-        self.assertLessEqual(rel._ts(since), rel._ts(repo.git_api.commit_date(base)))
-        self.assertEqual(since, repo.git_api.commit_date("v4.0.0"))
+        floor = rel._ts(repo.git_api.commit_date(base)) - rel.SINCE_LOOKBACK
+        self.assertEqual(rel._ts(since), min(floor, rel._ts(repo.git_api.commit_date("v4.0.0"))))
         with self.assertRaises(rel.ReleaseError):
             rel.latest_stable_date(repo.git_api, "0" * 40)
+
+    def test_a_forged_stable_tag_cannot_move_since_past_the_lookback(self):
+        # Re-review finding 2: a high stable tag pointed at the base itself
+        # (no date forgery) makes merge-base(L, base) = base.
+        def at(date):
+            return rel.git_env(dict(GIT_COMMITTER_DATE=date, GIT_AUTHOR_DATE=date, GIT_AUTHOR_NAME="t",
+                                    GIT_AUTHOR_EMAIL="t@e", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@e"))
+        repo = TrainRepo()
+        self.addCleanup(repo.close)
+        for date in ("2026-06-01T00:00:00Z", "2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z"):
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", date],
+                           cwd=repo.root, check=True, env=at(date))
+            if date.startswith("2026-06"):
+                repo.git("tag", "-f", "v4.0.0")  # L, cut long before the lookback
+        base = repo.git("rev-parse", "HEAD").strip()
+        honest = rel._ts(rel.latest_stable_date(repo.git_api, base))
+        self.assertEqual(honest, rel._ts("2026-06-01T00:00:00Z"))
+        for tag in ("v4.0.1", "v99.0.0"):
+            repo.git("tag", tag, base)
+            forged = rel._ts(rel.latest_stable_date(repo.git_api, base))
+            self.assertEqual(forged, rel._ts("2026-10-01T00:00:00Z") - rel.SINCE_LOOKBACK, tag)
+            repo.git("tag", "-d", tag)
 
 
 # ── review fixes: the CI release-readiness gate ─────────────────────────────

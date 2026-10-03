@@ -206,7 +206,8 @@ Every skip produces a health report with the reason, the tried SHAs, the run lin
 **Candidate set:**
 - **all open issues** labelled `release-blocker`, with no time bound (fix for the 90-day-window violation);
 - ∪ issues closed since `since`, and issues with a `release-blocker` `labeled` or `unlabeled` event since `since`, from `issues/events`.
-- `since` = the committer date of `merge-base(L, base)`, clamped to the base commit's date. That is a commit on main's history. The tag's own commit is not used: until the tag ruleset (D1) is live, any write-access account can point a `v*` tag at an off-main commit with a forged future date and hide recent closes. An earlier `since` only adds candidates. A `--since` later than the base time fails closed.
+- `since` = the earlier of the committer date of `merge-base(L, base)` and the base commit's date minus 35 days (`SINCE_LOOKBACK`). The merge-base is a commit on main's history; the tag's own commit date is never read, since a `v*` tag can point at an off-main commit with a forged future date. The lookback is what no tag can move: an account that can push tags could point a high stable tag (`v99.0.0`) at `base` itself, which makes the merge-base `base` and would drop every older close or unlabel out of the candidate set. With the lookback, such a tag can hide only events older than 35 days before the base (a stable's 8-day soak plus several skipped weeks). An earlier `since` only adds candidates. A `--since` later than the base time fails closed.
+- **The tag ruleset (setup S9) is a hard prerequisite for any live gate run** (PR 3 merges only after S9): before it, the lookback bounds what a forged tag can hide but does not remove it.
 
 **Config.** `RELEASE_APPROVERS` and `RELEASE_ROUTINE_ACTORS` are split on commas and whitespace, and a leading `@` is dropped. A token that is not a GitHub login, an empty list, or no approver left after removing routine actors blocks with error `config:`. An unset routine list must never quietly make mik trusted.
 
@@ -219,7 +220,7 @@ An issue **blocks** iff it is **effectively labelled** and not **resolved**:
   - An issue that now 404s or 410s (deleted, or converted to a discussion), or that resolves to another repository or number (transferred), blocks.
 - **Resolved:** the issue is closed, and either
   - it was closed by a `closed` event whose `commit_id` is an ancestor of the tree's base (checked with `GET /compare`). So a fix that isn't in this tree doesn't unblock it; or
-  - it was closed by merging a PR. GitHub's `closed` event for that auto-close has `commit_id: null` (recorded: #454, closed by merging #456). The closing PR is the same-repo PR that cross-references the issue in `/issues/{n}/timeline` and merged at most 120 s before the close. Its `merge_commit_sha` (from `GET /pulls/{n}`) must be an ancestor of the base. If several PRs match, all of them must be. Without this path, every blocker fixed by a PR that mik merges would stay blocked, because he is a routine actor (D3); or
+  - it was closed by merging a PR. GitHub's `closed` event for that auto-close has `commit_id: null` (recorded: #454, closed by merging #456). The closing PR is the same-repo PR that cross-references the issue in `/issues/{n}/timeline`, merged at most 120 s before the close, **and was merged by the close event's own actor** (`merged_by.login` from `GET /pulls/{n}`; GitHub attributes a merge auto-close to the merger). So a manual close by anyone else right after an unrelated PR that merely mentions `#N` merges matches nothing. Its `merge_commit_sha` must be an ancestor of the base. If several PRs match, all of them must be. Without this path, every blocker fixed by a PR that mik merges would stay blocked, because he is a routine actor (D3). Residual: a merger who closes the issue by hand within 120 s of merging a PR that mentions it is treated like that PR's auto-close, which is the same trust as a `Fixes #N` merged PR (it went through the reviewed-PR ruleset and its merge is in the base); or
   - a trusted actor closed it with `closed_at ≤ t`, where t is the base commit time.
   - Any other close is ignored, so the issue is still blocking.
 
@@ -251,12 +252,13 @@ The routine runs daily at 10:15Z and maintains one branch, `release-sync`. Each 
 1. Run `python3 scripts/release.py sync-main` on a clean `origin/main` checkout with tags fetched. It is deterministic given main plus the tags, and idempotent (a second run changes nothing). Per D2 it brings main to the **newest cut tag, rc or stable**:
    - **version:** stamp the highest-precedence tag's version (e.g. `5.0.0-rc.1` during the first rc week, `5.0.0` after promotion). `release-lint` accepts main at an rc version.
    - **rc sections:** for each pending rc tag (no stable of its core yet) whose section main lacks, insert the tag's `## [X.Y.Z-rc.N] — date` section verbatim and remove exactly those blocks from `[Unreleased]`.
-   - **stable sections:** for each stable tag whose section main lacks, insert the tag's folded `## [X.Y.Z] — date` section and remove exactly those blocks from `[Unreleased]`.
-   - **fold at promotion:** every rc section on main whose core has shipped is dropped. Its blocks, with text taken from its tag, minus the blocks of the tag's `[X.Y.Z]` section, go back into `[Unreleased]`. Blocks are counted as a multiset, shared across all rcs of that stable and with the removal above. A folded rc therefore returns nothing. A later rc abandoned at promotion (rc.2 cut after rc.1 was chosen), or a train rc cut beside a hotfix of the same core (§3.4), returns exactly the blocks that did not ship. They go back oldest rc first, before the blocks already in their `###`, which is their original chronological place, and their headers are dropped. They ship in the next train. No rc-number or ancestry rule is involved, so the cut order doesn't matter.
+   - **stable sections:** for each stable tag whose section main lacks, insert the tag's folded `## [X.Y.Z] — date` section; its blocks not accounted for by rc sections already on main are removed from `[Unreleased]` (next bullet).
+   - **fold at promotion:** `changelog promote --rc R` folds rc.1..R into `[X.Y.Z]` keeping **every occurrence** (an entry written in two rcs, `- Updated dependencies.`, appears twice), so `[X.Y.Z]` is exactly the multiset sum of the folded rcs. At sync, every rc section on main whose core has shipped is dropped. Its blocks, with text taken from its tag, are charged against the blocks of the tag's `[X.Y.Z]` section (a multiset budget shared across all rcs of that stable, oldest rc first); the uncovered ones go back into `[Unreleased]`. Only then is what is left of the budget (shipped blocks main never got as an rc section, i.e. still in `[Unreleased]` on an unsynced main) removed from `[Unreleased]`, oldest occurrence first. Charging the rc sections first keeps a newer identical entry in `[Unreleased]` (which did not ship) in its place whether or not the sync PR merged. A folded rc therefore returns nothing. A later rc abandoned at promotion (rc.2 cut after rc.1 was chosen), or a train rc cut beside a hotfix of the same core (§3.4), returns exactly the blocks that did not ship. They go back oldest rc first, before the blocks already in their `###`, which is their original chronological place, and their headers are dropped. They ship in the next train. No rc-number or ancestry rule is involved, so the cut order doesn't matter.
    - only blocks of sections inserted **in this run** are removed from `[Unreleased]`, so entries added to `[Unreleased]` since are never touched.
    - Section text always comes from the tag (the bytes that shipped). An edit made on main to an rc section is discarded by the fold; fix release notes before promotion through a new rc, or edit the stable section after the sync.
    - Matching is exact (subsection + text) and counts occurrences: a shipped block removes one occurrence, so an identical entry written again later (`- Updated dependencies.`) stays. A block reworded on main after the cut is not matched and may duplicate in `[Unreleased]`; the sync PR reviewer removes it.
-   - CRLF CHANGELOGs (a Windows checkout) stay CRLF, generated lines included.
+   - CRLF CHANGELOGs (a Windows checkout) stay CRLF, generated lines included. The stamp is CRLF-safe too: each stamped file keeps its own line endings, so `stamp --check` and `release-lint` check 2 are byte no-ops on a Windows `core.autocrlf` checkout (the repo has no `* text=auto`).
+   - `sync-main` computes the CHANGELOG and every stamped file before writing any of them, so a stamp refusal leaves the tree untouched.
    - **Byte-identical cuts.** A cut puts its `###` subsections in a canonical order: breaking first, then Keep a Changelog's Added, Changed, Deprecated, Removed, Fixed, Security, then any other heading, with ties broken by name. Block order within a subsection is kept. Main's `[Unreleased]` subsection order depends on history (on an unsynced main, already-shipped subsections keep their old positions), so without the canonical order the cut would depend on whether the sync PR merged. With entries appended at the end of their subsection, which is the convention, the next cut is byte-identical either way.
 2. **Gap-fill.** For first-parent product commits since L (touching `crates/*/src`, `npm/` or `scripts/install.sh`) that have no CHANGELOG change, add at most 1 bullet each under `Fixed` / `Added` / `Changed` in `[Unreleased]`:
    - never under Breaking;
@@ -298,6 +300,7 @@ A human approver reviews the bullets like any PR. If the PR merges before Monday
 **The stamp** (offline, byte-deterministic). It replaces the networked `npx npm@10 install --package-lock-only` at `version-sync.sh:45-49`, which ends the #233/#235 lock-drift class. It sets:
 1. `Cargo.toml`: `[workspace.package] version` and the `=V` core pin.
 2. `Cargo.lock`: the source-less workspace-member `[[package]]` blocks (core, cli, node, bench), so `--locked` builds work.
+   Every file keeps its own line endings (CRLF in, CRLF out).
 3. All 15 `package.json` files: `version`, plus `optionalDependencies` in the main package.
 4. `npm/socket-patch/package-lock.json`: `version`, `packages[""]`, and deletes `node_modules/@socketsecurity/socket-patch-*` entries whose version ≠ V. Written as `json.dumps(indent=2) + "\n"`.
 
@@ -351,7 +354,7 @@ A human approver reviews the bullets like any PR. If the PR merges before Monday
 | S6 | Human triage of `release-blocker` on #559, #424, #325/#356/#519/#588 and #578/#579. |
 | S7 | Run `e2e_npm`, `e2e_pypi`, `e2e_gem` and `e2e_scan --ignored` by hand on main. Drop any that are chronically red because of the public proxy from `live-e2e`, and document why. |
 | S8 | Create the GitHub App `socket-patch-release` (D1): repository permission `contents: write` only, no webhooks, installed on `SocketDev/socket-patch` only. Store its app id and private key as `RELEASE_APP_ID` / `RELEASE_APP_PRIVATE_KEY` secrets of env `publish` (not repo secrets). |
-| S9 | Tag ruleset on `refs/tags/v*`: restrict creations, updates and deletions; bypass list = the App only. Adding an App as bypass actor (and keeping admins out of it) needs an **enterprise/org admin**, so schedule it with one before PR 3 merges. Existing `v*` tags are unaffected. |
+| S9 | Tag ruleset on `refs/tags/v*`: restrict creations, updates and deletions; bypass list = the App only. Adding an App as bypass actor (and keeping admins out of it) needs an **enterprise/org admin**, so schedule it with one before PR 3 merges. Existing `v*` tags are unaffected. **Hard prerequisite for any live blocker-gate run** (§3.5): before it, a tag pusher can still narrow the gate's `since` to the 35-day lookback. |
 
 **Must-run probes.** Only these change the design if they fail.
 
@@ -392,8 +395,8 @@ A human approver reviews the bullets like any PR. If the PR merges before Monday
   - a missing or renamed `release-blocker` label blocks (`label:`); case variants of the label on issues and events count;
   - a label that vanished without an `unlabeled` event, and a deleted, converted or transferred issue, block;
   - an empty, unset or malformed `RELEASE_ROUTINE_ACTORS` / `RELEASE_APPROVERS` blocks (`config:`); newline-, space- and `@`-separated lists parse;
-  - `since` comes from `merge-base(L, base)`, not from a forgeable tag date, and a `since` after the base fails closed;
-  - a PR-merge close (`commit_id: null`, recorded from #454) resolves only through the closing PR's merge commit being in the base;
+  - `since` comes from `merge-base(L, base)`, not from a forgeable tag date, and is never later than the base minus 35 days, so a forged high stable tag pointed at the base cannot move it; a `since` after the base fails closed;
+  - a PR-merge close (`commit_id: null`, recorded from #454) resolves only through the closing PR's merge commit being in the base, and only when the PR's merger is the close actor (a manual close after an unrelated mentioning PR does not resolve);
   - an open issue untouched for 200 days blocks;
   - closed by a commit not in the base blocks;
   - closed by a commit that is an ancestor of the base passes;
@@ -407,11 +410,13 @@ A human approver reviews the bullets like any PR. If the PR merges before Monday
   - stable promotion of rc.1 with a later rc.2 already synced to main: one `## [X.Y.Z]` section equal to the tag's, no rc headers left, rc.2's blocks back in `[Unreleased]`, newer `[Unreleased]` entries untouched and in place;
   - the same end state when the sync PR never merged;
   - `sync-main` is idempotent;
-  - `next-version` and `changelog cut` give the same result, byte for byte, with the sync PR merged or unmerged, including a repeated identical entry, an abandoned later rc, and subsection order left over from shipped history;
+  - `next-version` and `changelog cut` give the same result, byte for byte, with the sync PR merged or unmerged, including a repeated identical entry (also one repeated across rc.1 and a promoted rc.2, and one re-added after a promotion), an abandoned later rc, and subsection order left over from shipped history;
+  - the fold keeps every occurrence of a repeated entry, and promote returns every block of a later rc;
   - a hotfix promoted beside a pending train rc of the same core returns that rc's entries to `[Unreleased]`;
   - CRLF CHANGELOGs round-trip and every transform keeps CRLF;
   - `release-lint.sh` (no flags and `--tag-exists`) passes on a `sync-main`ed working tree at an rc, and `--tag-exists` fails once the tag is gone;
   - the stamp tests run on a temp tree stamped to a fixed baseline (4.0.0 and an rc), never on the live checkout's version;
+  - the stamp on a CRLF checkout gives the LF result with CRLF endings and `stamp --check` is a no-op there; `sync-main` writes nothing when the stamp refuses;
   - `release-lint.sh` catches npm dependency drift between `package.json` and its lock, offline;
   - a breaking heading that would open an unapproved major is refused; a major is never skipped.
 

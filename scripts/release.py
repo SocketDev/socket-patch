@@ -60,24 +60,31 @@ an identical entry written again later is kept. CRLF files stay CRLF.
   so the cut does not depend on the order main's [Unreleased] happens to have.
 * promote rc.K: fold every `[X-rc.N]` section with X-rc.N <= rc.K that is
   newer than the newest stable section into one `## [core] — date` section
-  (oldest rc first; within a subsection later rcs append, exact duplicates
-  dropped; rc headers removed). Later rc sections of the same core (rc.K+1..)
-  are abandoned: their blocks move back into [Unreleased] (before the blocks
-  already there, exact duplicates of the folded section skipped) and their
-  headers are dropped.
+  (oldest rc first; within a subsection later rcs append; rc headers
+  removed). The fold keeps every occurrence: an entry written in two rcs
+  (`- Updated dependencies.` twice) appears twice, so [core] is exactly the
+  multiset sum of the folded rcs, the same count sync-main charges them
+  against. Later rc sections of the same core (rc.K+1..) are abandoned:
+  all of their blocks move back into [Unreleased] (before the blocks already
+  there) and their headers are dropped.
 * sync-main (main's CHANGELOG := what it would be had every release-sync PR
   merged). For train-era tags (version > TRAIN_FLOOR):
     1. each stable tag S whose section main lacks: insert the tag's own [S]
-       section and remove those blocks (one occurrence each) from
-       [Unreleased];
+       section; its blocks form S's budget (a multiset);
     2. each rc section on main whose core already shipped (owner S = the
-       smallest stable tag >= its core) is dropped, and its blocks (text from
-       its tag) minus [S]'s blocks, as a multiset shared by all rcs of S and
-       by step 1, move back into [Unreleased], oldest rc first and before the
-       blocks already there. A folded rc returns nothing; an abandoned later
-       rc, or a train rc cut beside a hotfix of the same core, returns exactly
-       what did not ship. No ancestry or rc-number rule is involved;
-    3. each pending rc tag (no owner yet) whose section main lacks: insert
+       smallest stable tag >= its core) is dropped. Its blocks (text from
+       its tag) are charged against S's budget, oldest rc first; the ones
+       the budget does not cover did not ship and move back into
+       [Unreleased], oldest rc first and before the blocks already there. A
+       folded rc returns nothing; an abandoned later rc, or a train rc cut
+       beside a hotfix of the same core, returns exactly what did not ship.
+       No ancestry or rc-number rule is involved;
+    3. what is left of each new S's budget (the shipped blocks main never
+       got as an rc section, i.e. still in [Unreleased] on an unsynced
+       main) is removed from [Unreleased], one occurrence each, oldest
+       first. Charging the rc sections before touching [Unreleased] keeps a
+       newer identical entry (which did not ship) in place either way;
+    4. each pending rc tag (no owner yet) whose section main lacks: insert
        the tag's section and remove those blocks from [Unreleased].
   Only blocks of sections inserted *in this run* are removed from
   [Unreleased], so entries added to [Unreleased] later are never touched and
@@ -132,6 +139,20 @@ def _read(path):
 def _write(path, text):
     with open(path, "w", encoding="utf-8", newline="") as f:
         f.write(text)
+
+
+def _is_crlf(text):
+    """A CRLF file (a Windows checkout with core.autocrlf: the repo has no
+    `* text=auto`, so every text file may arrive CRLF)."""
+    return text.count("\r\n") * 2 > text.count("\n")
+
+
+def _with_eol(text, transform):
+    """transform(LF text) applied to `text`, keeping its line endings: a
+    CRLF file is normalized to LF, transformed, and written back CRLF."""
+    if not _is_crlf(text):
+        return transform(text)
+    return transform(text.replace("\r\n", "\n")).replace("\n", "\r\n")
 
 
 # ── semver ──────────────────────────────────────────────────────────────────
@@ -368,42 +389,52 @@ def stamp_files(root, version):
     root = Path(root)
     changes = {}
 
-    def put(path, new):
+    def put(path, transform):
+        # Every file keeps its own line endings (a CRLF checkout stays CRLF,
+        # so `stamp --check` on it is a byte no-op).
         old = _read(path)
+        new = _with_eol(old, transform)
         if new != old:
             changes[path.relative_to(root).as_posix()] = new
 
     cargo_toml = root / "Cargo.toml"
-    toml_text = _read(cargo_toml)
-    put(cargo_toml, _stamp_cargo_toml(toml_text, version))
-    lock = root / "Cargo.lock"
-    put(lock, _stamp_cargo_lock(_read(lock), version,
-                                _workspace_members(root, toml_text)))
+    toml_text = _read(cargo_toml).replace("\r\n", "\n")
+    put(cargo_toml, lambda text: _stamp_cargo_toml(text, version))
+    members = _workspace_members(root, toml_text)
+    put(root / "Cargo.lock", lambda text: _stamp_cargo_lock(text, version, members))
+
+    def stamp_manifest(main):
+        def transform(text):
+            pkg = json.loads(text)
+            pkg["version"] = version
+            if main:
+                for dep in pkg.get("optionalDependencies", {}):
+                    pkg["optionalDependencies"][dep] = version
+            return _dump_json(pkg)
+        return transform
 
     for i, manifest in enumerate(_npm_manifests(root)):
-        pkg = json.loads(_read(manifest))
-        pkg["version"] = version
-        if i == 0:
-            for dep in pkg.get("optionalDependencies", {}):
-                pkg["optionalDependencies"][dep] = version
-        put(manifest, _dump_json(pkg))
+        put(manifest, stamp_manifest(i == 0))
 
-    npm_lock = root / "npm" / "socket-patch" / "package-lock.json"
-    obj = json.loads(_read(npm_lock))
-    obj["version"] = version
-    top = obj.get("packages", {}).get("")
-    if top is None:
-        raise ReleaseError('package-lock.json: no packages[""] entry')
-    top["version"] = version
-    for dep in top.get("optionalDependencies", {}):
-        top["optionalDependencies"][dep] = version
-    # Platform entries pin a registry tarball + integrity for one version; an
-    # entry for any other version is stale and would make `npm ci` refuse the
-    # lock. Dropping it (instead of re-resolving over the network) keeps the
-    # stamp offline and deterministic; `npm install` resolves it on demand.
-    obj["packages"] = {k: v for k, v in obj["packages"].items()
-                       if not (_PLATFORM_LOCK_KEY.match(k) and v.get("version") != version)}
-    put(npm_lock, _dump_json(obj))
+    def stamp_npm_lock(text):
+        obj = json.loads(text)
+        obj["version"] = version
+        top = obj.get("packages", {}).get("")
+        if top is None:
+            raise ReleaseError('package-lock.json: no packages[""] entry')
+        top["version"] = version
+        for dep in top.get("optionalDependencies", {}):
+            top["optionalDependencies"][dep] = version
+        # Platform entries pin a registry tarball + integrity for one version;
+        # an entry for any other version is stale and would make `npm ci`
+        # refuse the lock. Dropping it (instead of re-resolving over the
+        # network) keeps the stamp offline and deterministic; `npm install`
+        # resolves it on demand.
+        obj["packages"] = {k: v for k, v in obj["packages"].items()
+                           if not (_PLATFORM_LOCK_KEY.match(k) and v.get("version") != version)}
+        return _dump_json(obj)
+
+    put(root / "npm" / "socket-patch" / "package-lock.json", stamp_npm_lock)
     return changes
 
 
@@ -623,14 +654,12 @@ class Section:
         self.subs = [self.subs[0]] + [s for s in self.subs[1:] if s.blocks]
         return removed
 
-    def append_items(self, items, skip=frozenset()):
-        """Append (subsection, block) pairs, skipping exact duplicates of
-        `skip` or of blocks already here. Returns how many were added."""
-        seen, added = set(skip) | self.keys(), 0
+    def append_items(self, items):
+        """Append (subsection, block) pairs at the end of their subsections.
+        Nothing is de-duplicated (multiset semantics, like remove()): an
+        entry written twice is two entries. Returns how many were added."""
+        added = 0
         for name, block in items:
-            if (name, block.text) in seen:
-                continue
-            seen.add((name, block.text))
             self.sub(name, create=True).append(block)
             added += 1
         # The preamble needs a blank line before a following subsection.
@@ -703,7 +732,7 @@ class Changelog:
         # A CRLF file (a Windows checkout: CHANGELOG.md is plain `text` in
         # .gitattributes) is parsed as LF and rendered back as CRLF, so every
         # generated line gets the file's own line ending.
-        eol = "\r\n" if text.count("\r\n") * 2 > text.count("\n") else "\n"
+        eol = "\r\n" if _is_crlf(text) else "\n"
         if eol == "\r\n":
             text = text.replace("\r\n", "\n")
         ends_nl = text.endswith("\n")
@@ -832,25 +861,23 @@ def sync_main_changelog(text, tags):
     def owner(v):
         return next((s for s in stables if s >= v.core), None)
 
-    # Shipped-block budget per stable: [S]'s blocks, minus the ones this run
-    # already removed from [Unreleased] for it.
-    budget = {}
+    # 1. Shipped-block budget per stable: [S]'s blocks (a multiset; the fold
+    #    keeps every occurrence, so [S] is the sum of its folded rcs).
+    budget, new_stables = {}, []
     for v in (v for v in train if not v.is_rc):
         if cl.section(v) is None:
             sec = tag_section(v)
             cl.insert(sec)
-            removed = unrel.remove(sec.key_counts())
-            budget[v] = sec.key_counts() - removed
-            report["removedFromUnreleased"] += sum(removed.values())
+            budget[v] = sec.key_counts()
+            new_stables.append(v)
             report["inserted"].append(str(v))
 
-    # Every rc section whose core has shipped is replaced by what did not
-    # ship: its blocks (text from its tag, the bytes that were cut) minus
-    # [S]'s blocks, as a multiset, oldest rc first. A folded rc returns
-    # nothing; a later rc abandoned at promotion, or a train rc cut beside a
-    # hotfix of the same core, returns exactly what [S] lacks. This is what
-    # an unsynced main's [Unreleased] keeps after step 1, so the result does
-    # not depend on which release-sync PRs merged.
+    # 2. Every rc section whose core has shipped is replaced by what did not
+    #    ship: its blocks (text from its tag, the bytes that were cut) are
+    #    charged against [S]'s budget, oldest rc first, and the rest return.
+    #    A folded rc returns nothing; a later rc abandoned at promotion, or
+    #    a train rc cut beside a hotfix of the same core, returns exactly
+    #    what [S] lacks.
     returned = []
     for sec in sorted((s for s in cl.versioned() if s.version.is_rc), key=lambda s: s.version):
         stable = owner(sec.version)
@@ -870,7 +897,18 @@ def sync_main_changelog(text, tags):
         returned += back
         report["abandoned" if back else "folded"].append(str(sec.version))
         cl.drop(sec)
+
+    # 3. What the rc sections on main did not cover shipped from blocks that
+    #    are still in [Unreleased] (an unsynced main): remove those, oldest
+    #    occurrence first. Charging the rc sections first means a newer
+    #    identical entry in [Unreleased] (which did not ship) is never
+    #    taken in place of an rc's copy, so the result, block order
+    #    included, does not depend on which release-sync PRs merged.
+    for v in new_stables:
+        report["removedFromUnreleased"] += sum(unrel.remove(budget[v]).values())
     report["returnedToUnreleased"] += unrel.return_items(returned)
+
+    # 4. Pending rc tags.
 
     for v in (v for v in train if v.is_rc and owner(v) is None):
         if cl.section(v) is None:
@@ -925,8 +963,10 @@ def promote_changelog(text, rc, date):
     unrel = cl.unreleased()
     later = sorted((s for s in rcs if s.version.core == rc.core and s.version > rc),
                    key=lambda s: s.version)
-    shipped = merged.keys()
-    unrel.return_items([(n, b) for s in later for n, b in s.items() if (n, b.text) not in shipped])
+    # [core] is exactly the multiset sum of the folded rcs, so none of a
+    # later rc's blocks shipped through it: all of them return (the same
+    # count sync-main step 2 charges, which leaves no budget for later rcs).
+    unrel.return_items([(n, b) for s in later for n, b in s.items()])
     for s in later:
         cl.drop(s)
     newest = fold[-1]
@@ -1139,8 +1179,12 @@ PR_CLOSE_WINDOW = datetime.timedelta(seconds=120)
 
 def _closing_pr_merges(gh, number, close):
     """Merge commit SHAs of the same-repo PRs that merged within
-    PR_CLOSE_WINDOW before `close` and cross-reference issue `number`."""
+    PR_CLOSE_WINDOW before `close`, cross-reference issue `number`, and were
+    merged by the close event's own actor (GitHub attributes a merge
+    auto-close to the merger). A manual close by anyone else right after an
+    unrelated PR that merely mentions the issue therefore matches nothing."""
     closed_at = _ts(close["created_at"])
+    closer = _actor(close)
     shas = []
     for e in gh.pages(f"/issues/{number}/timeline"):
         if e.get("event") != "cross-referenced":
@@ -1154,6 +1198,9 @@ def _closing_pr_merges(gh, number, close):
             pr = gh.get(f"/pulls/{src['number']}")
             if not pr.get("merged") or not pr.get("merge_commit_sha"):
                 raise ApiError(f"PR #{src['number']}: merged_at set but no merge commit")
+            merger = ((pr.get("merged_by") or {}).get("login") or "").lower()
+            if not closer or merger != closer:
+                continue
             shas.append(pr["merge_commit_sha"])
     return shas
 
@@ -1264,19 +1311,31 @@ def evaluate_blockers(gh, base, since, approvers, routine_actors):
                 "since": since}
 
 
+# `since` is never later than this long before the base commit. Until the
+# refs/tags/v* ruleset (DESIGN.md S9) is live, any account that can push a
+# tag can point a high stable tag (v99.0.0) at `base` itself, which makes
+# merge-base(L, base) = base and would drop every older close or unlabel
+# out of the candidate set. The lookback bounds what such a tag can hide to
+# events older than this; it covers a stable's 8-day soak plus several
+# skipped weeks, and an earlier bound only adds candidates.
+SINCE_LOOKBACK = datetime.timedelta(days=35)
+
+
 def latest_stable_date(git, base):
-    """The lower time bound for closed/unlabelled candidates: the committer
-    date of the merge-base of the newest stable tag L and `base` (L's cut
-    point on main), clamped to the base commit's own date. A tag is not
-    trusted for its date: any write-access account could point one at an
-    off-main commit with a forged future date and so hide recent closes;
-    the merge-base is a commit on main's history, at or before `base`. An
-    older bound only adds candidates, each still judged on its events."""
+    """The lower time bound for closed/unlabelled candidates: the earlier of
+    the committer date of merge-base(L, base) (L = the newest stable tag,
+    so this is L's cut point on main) and base's date minus SINCE_LOOKBACK.
+    Nothing a tag can do moves it later than the lookback: a tag's own date
+    is never read (it could point at an off-main commit with a forged
+    future date), and a forged high tag at `base` only reaches the
+    lookback bound. An older bound only adds candidates, each still judged
+    on its events."""
     stables = [v for v in git.tags() if not v.is_rc]
     if not stables:
         raise ReleaseError("no stable tag found — fetch tags or pass --since")
     mb = git.run("merge-base", f"refs/tags/v{max(stables)}", base).stdout.strip()
-    return min((git.commit_date(mb), git.commit_date(base)), key=_ts)
+    floor = _ts(git.commit_date(base)) - SINCE_LOOKBACK
+    return _iso(min(_ts(git.commit_date(mb)), floor))
 
 
 # ── sync-main ───────────────────────────────────────────────────────────────
@@ -1285,18 +1344,21 @@ def sync_main(root, check=False):
     """CHANGELOG sync + stamp of the newest tag version, on a working tree."""
     git = Git(root)
     tags = TagSource(git)
-    path = Path(root) / "CHANGELOG.md"
-    old = _read(path)
-    new, report = sync_main_changelog(old, tags)
     if not tags.versions:
         raise ReleaseError("no release tags found — fetch tags first")
     target = max(tags.versions)
-    changed = []
-    if new != old:
-        changed.append("CHANGELOG.md")
-        if not check:
+    path = Path(root) / "CHANGELOG.md"
+    old = _read(path)
+    # Compute everything before writing anything: a stamp refusal (a lock
+    # missing a member entry, say) must not leave a half-synced tree.
+    new, report = sync_main_changelog(old, tags)
+    changes = stamp_files(root, target)
+    changed = (["CHANGELOG.md"] if new != old else []) + sorted(changes)
+    if not check:
+        if new != old:
             _write(path, new)
-    changed += stamp(root, target, check=check)
+        for rel_path, text in changes.items():
+            _write(Path(root) / rel_path, text)
     report.update({"version": str(target), "changed": changed})
     return report
 
@@ -1472,7 +1534,8 @@ def build_parser():
     s.add_argument("--base", required=True, help="the candidate tree's base commit")
     s.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY") or DEFAULT_REPO)
     s.add_argument("--since", help="ISO time bound for closed/unlabelled candidates (default: the "
-                                   "date of merge-base(newest stable tag, --base), at most --base's)")
+                                   "earlier of merge-base(newest stable tag, --base)'s date and "
+                                   "--base's date minus 35 days)")
     s.set_defaults(fn=cmd_blockers)
     return p
 
