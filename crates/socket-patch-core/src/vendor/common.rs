@@ -307,13 +307,13 @@ async fn read_zip_artifact_capped(archive_path: &Path, cap: u64) -> Option<Vec<u
 /// bytes read once through [`read_zip_artifact`] — has every patched file
 /// already hashing to its `afterHash` (the zip twin of
 /// [`copy_matches_after_hashes`], reading the archive's entries).
+/// Stream each decompressed member through the shared Git hash reader, so
+/// verification's working memory does not grow with the inflated file size.
 pub(crate) fn zip_bytes_match_after_hashes(
     bytes: &[u8],
     files: &HashMap<String, PatchFileInfo>,
 ) -> bool {
-    use std::io::Read as _;
-
-    use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+    use crate::hash::git_sha256::compute_git_sha256_from_std_reader;
     let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
         return false;
     };
@@ -324,14 +324,12 @@ pub(crate) fn zip_bytes_match_after_hashes(
         if !is_safe_relative_subpath(normalized) {
             return false;
         }
-        let Ok(mut entry) = archive.by_name(normalized) else {
+        let Ok(entry) = archive.by_name(normalized) else {
             return false;
         };
-        let mut content = Vec::with_capacity(entry.size() as usize);
-        if entry.read_to_end(&mut content).is_err() {
-            return false;
-        }
-        if compute_git_sha256_from_bytes(&content) != info.after_hash {
+        if !compute_git_sha256_from_std_reader(entry.size(), entry)
+            .is_ok_and(|hash| hash == info.after_hash)
+        {
             return false;
         }
     }
@@ -1007,6 +1005,85 @@ mod tests {
             zip_matches_after_hashes(&jar, &files).await,
             "an archive matching every afterHash must read as in-sync"
         );
+    }
+
+    #[test]
+    fn zip_matches_after_hashes_handles_empty_and_multichunk_members() {
+        let body: Vec<u8> = (0..20_003).map(|i| (i % 251) as u8).collect();
+        let entries = [
+            ("empty".to_string(), Vec::new(), 0o644),
+            ("lib/data".to_string(), body, 0o644),
+        ];
+        let bytes = write_zip_entries(&entries).unwrap();
+        let mut files: HashMap<_, _> = entries
+            .iter()
+            .map(|(name, content, _)| {
+                (
+                    name.clone(),
+                    PatchFileInfo {
+                        before_hash: "before".to_string(),
+                        after_hash: compute_git_sha256_from_bytes(content),
+                    },
+                )
+            })
+            .collect();
+        assert!(zip_bytes_match_after_hashes(&bytes, &files));
+        files.get_mut("empty").unwrap().after_hash = "0".repeat(64);
+        assert!(!zip_bytes_match_after_hashes(&bytes, &files));
+    }
+
+    #[test]
+    fn zip_matches_after_hashes_rejects_incorrect_declared_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, files, bytes) = in_sync_jar_fixture(dir.path());
+        let central = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        for size in [7u32, 9] {
+            let mut altered = bytes.clone();
+            // Only the uncompressed size changes. The deflated payload,
+            // CRC and afterHash still describe the original eight bytes.
+            altered[22..26].copy_from_slice(&size.to_le_bytes());
+            altered[central + 24..central + 28].copy_from_slice(&size.to_le_bytes());
+            assert!(
+                !zip_bytes_match_after_hashes(&altered, &files),
+                "declared size {size} must agree with the streamed body"
+            );
+        }
+    }
+
+    /// Run alone under a memory profiler to check the verifier's working
+    /// set. Build the fixture in chunks too, so it never allocates the
+    /// inflated body. The member exceeds the extraction path's 64 MiB cap:
+    /// comparison must accept it without introducing a new size limit.
+    #[test]
+    fn zip_matches_after_hashes_streams_large_entry() {
+        use std::io::Write as _;
+
+        const SIZE: usize = 64 * 1024 * 1024 + 1;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "large.bin",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        let chunk = [0u8; 8192];
+        for _ in 0..SIZE / chunk.len() {
+            writer.write_all(&chunk).unwrap();
+        }
+        writer.write_all(&chunk[..SIZE % chunk.len()]).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        assert!(bytes.len() < 128 * 1024);
+        let files = HashMap::from([(
+            "large.bin".to_string(),
+            PatchFileInfo {
+                before_hash: "before".to_string(),
+                // Python hashlib: sha256(b"blob 67108865\0" + 67108865 zero bytes).
+                after_hash: "453f670092f0481b99614c8a1a5846335799943dd26f5375274e08fa5f12744f"
+                    .to_string(),
+            },
+        )]);
+        assert!(zip_bytes_match_after_hashes(&bytes, &files));
     }
 
     /// Bytes that aren't a zip archive at all (a truncated or clobbered

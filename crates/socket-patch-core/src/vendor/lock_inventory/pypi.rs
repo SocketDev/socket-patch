@@ -165,6 +165,25 @@ pub(crate) fn hosted_artifact_url(url: &str) -> Result<HostedArtifactUrl, String
 
 // ── registry view ──
 
+/// A Socket-HOSTED pypi patch reference's coordinates, or `None` when
+/// `url` is not one — the ONE "is this lock entry ours" grammar hosted
+/// Pipenv rotation (`redirect::pipenv`) and the vendored Pipenv guard
+/// (`vendor::pypi_pipenv`) share. Ours means both: served from an accepted
+/// origin (patch.socket.dev or one of `origins`, with no userinfo —
+/// [`crate::patch::redirect::hosted_patch_url_uuids`]'s origin policy), and
+/// a [`hosted_artifact_url`] whose `…/patch/pypi/<name>/<version>/<grant>/
+/// <uuid>/<artifact>` tail is matched from the END, so a path-prefixed
+/// `--patch-server-url` deployment and a hosted sdist are recognized too.
+pub(crate) fn hosted_pypi_reference(url: &str, origins: &[String]) -> Option<HostedArtifactUrl> {
+    crate::patch::redirect::hosted_patch_url_uuids(url, origins)?;
+    hosted_artifact_url(url).ok().filter(|coords| {
+        coords
+            .uuid_level
+            .as_deref()
+            .is_some_and(|uuid| !uuid.is_empty())
+    })
+}
+
 /// Inventory the pypi lock the project carries. Fetchable resolution
 /// (URL + sha256 of a pure `-none-any` wheel) comes from `uv.lock` and
 /// PEP 751 / PEP 723 script locks; `poetry.lock` entries carry the pure

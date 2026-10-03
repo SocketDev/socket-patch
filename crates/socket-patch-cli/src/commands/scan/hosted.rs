@@ -794,6 +794,7 @@ pub(crate) async fn run_redirect_selected(
         pre_warnings: takeover_pre_warnings,
         dry_run: dry_run_takeover,
         migrated: takeover_migrated,
+        unrecorded: takeover_unrecorded,
         files: takeover_files,
         previews: dry_run_takeover_urls,
     } = match vendored_takeover(common, &mut candidates, &mut vendor_state, &mut skipped).await {
@@ -1015,6 +1016,15 @@ pub(crate) async fn run_redirect_selected(
     // report that outcome. Populated only under --dry-run.
     let mut confirmed = done.confirmed.clone();
     confirmed.extend(dry_run_takeover);
+    // The takeover already reverted these purls' vendored wiring; one the
+    // rewrite then did not pin (a refused lock, unavailable wheel
+    // metadata) is left on the unpatched registry release in BOTH modes.
+    // That must never pass as success.
+    let mut stranded = stranded_takeovers(&takeover_migrated, &confirmed, common.dry_run);
+    // A takeover whose revert succeeded but whose ledger update failed is
+    // refused (never redirected), yet its vendored wiring and artifact are
+    // already gone: it is unpatched in both modes all the same.
+    stranded.extend(takeover_unrecorded);
 
     // Fetch the full patch view (file hashes + vulnerabilities) for each
     // CONFIRMED redirect and persist it so a post-install `socket-patch vex`
@@ -1295,6 +1305,18 @@ pub(crate) async fn run_redirect_selected(
     warnings.extend(python_stale.warnings.iter().cloned());
     warnings.extend(vlt_stale.warnings.iter().cloned());
     warnings.extend(takeover_pre_warnings.iter().cloned());
+    warnings.extend(stranded.iter().map(|purl| {
+        serde_json::json!({
+            "code": "redirect_takeover_unpatched",
+            "detail": format!(
+                "{purl} was vendored and its vendored wiring was reverted, but it \
+                 was not pinned to hosted (see the warnings above), so the \
+                 project now installs the UNPATCHED registry release — fix the \
+                 reported cause and re-run `scan --mode hosted`, or run `scan \
+                 --mode vendored` to vendor it again"
+            ),
+        })
+    }));
     warnings.extend(takeover_warnings.iter().cloned());
     warnings.extend(prune_warnings.iter().cloned());
 
@@ -1314,6 +1336,9 @@ pub(crate) async fn run_redirect_selected(
             common.dry_run,
         );
         let mut result = build_redirect_json_envelope(scan_result.take(), redirect);
+        if !stranded.is_empty() {
+            result["status"] = serde_json::json!("partial_failure");
+        }
         if let Some(gate) = &rollout {
             super::finish_rollout_json(gate.stage, &mut result);
         }
@@ -1345,7 +1370,9 @@ pub(crate) async fn run_redirect_selected(
             // line per sentence so CI can grep them.
             let width =
                 std::io::IsTerminal::is_terminal(&std::io::stderr()).then(crate::ui::stderr_width);
-            for purl in &takeover_migrated {
+            // A stranded takeover was NOT migrated to hosted: its
+            // `redirect_takeover_unpatched` warning below says so instead.
+            for purl in takeover_migrated.iter().filter(|p| !stranded.contains(p)) {
                 eprintln!("{}", format_takeover_line(purl, common.dry_run));
             }
             // The files a takeover's revert touched (or, on --dry-run,
@@ -1455,7 +1482,9 @@ pub(crate) async fn run_redirect_selected(
             if let Some(line) = rollout_line {
                 println!("{line}");
             }
-            let mut next_steps = if common.dry_run {
+            // "Commit … to keep the hosted patches" / "reinstall" would be
+            // wrong for a stranded takeover, whose warning names the remedy.
+            let mut next_steps = if common.dry_run || !stranded.is_empty() {
                 Vec::new()
             } else {
                 format_next_steps(&human_files, &rewrite.edits, !takeover_migrated.is_empty())
@@ -1470,8 +1499,48 @@ pub(crate) async fn run_redirect_selected(
         if let Some(e) = &vex_error {
             e.print_embedded(common);
         }
+        if common.silent {
+            for w in warnings
+                .iter()
+                .filter(|w| w["code"] == "redirect_takeover_unpatched")
+            {
+                eprintln!(
+                    "{}",
+                    format_warning(
+                        "redirect_takeover_unpatched",
+                        w["detail"].as_str().unwrap_or_default(),
+                        None
+                    )
+                );
+            }
+        }
+    }
+    if vex_code == 0 && !stranded.is_empty() {
+        return 1;
     }
     vex_code
+}
+
+/// The purls a WET takeover migrated (vendored wiring reverted) that the
+/// rewrite did not confirm as pinned. Empty under `--dry-run`, whose
+/// takeover previews are counted as confirmed without a rewrite.
+fn stranded_takeovers(
+    migrated: &[String],
+    confirmed: &[(String, String)],
+    dry_run: bool,
+) -> Vec<String> {
+    use socket_patch_core::utils::purl::{canonical_purl, strip_purl_qualifiers};
+    if dry_run {
+        return Vec::new();
+    }
+    let key = |purl: &str| canonical_purl(strip_purl_qualifiers(purl));
+    let pinned: std::collections::HashSet<String> =
+        confirmed.iter().map(|(purl, _)| key(purl)).collect();
+    migrated
+        .iter()
+        .filter(|purl| !pinned.contains(&key(purl)))
+        .cloned()
+        .collect()
 }
 
 /// Cross-mode takeover: a purl this run is about to redirect may still be
@@ -1510,8 +1579,15 @@ async fn vendored_takeover(
     // for those locks even though the rewriters never see these purls.
     let mut dry_run_locks: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    // PyPI: every Python rewriter (requirements.txt, Poetry, Pipenv, uv,
+    // Hatch, PDM, pylock) refuses a non-registry source as user-authored,
+    // including the vendored one socket-patch wrote itself, so a vendored
+    // purl must be reverted to its registry entry first (#328).
     let takeover_capable = |p: &str| {
-        p.starts_with("pkg:cargo/") || p.starts_with("pkg:npm/") || p.starts_with("pkg:golang/")
+        p.starts_with("pkg:cargo/")
+            || p.starts_with("pkg:npm/")
+            || p.starts_with("pkg:golang/")
+            || p.starts_with("pkg:pypi/")
     };
     if !candidates.iter().any(|c| takeover_capable(&c.purl)) {
         // No takeover-capable candidates — nothing to reconcile.
@@ -1708,6 +1784,11 @@ async fn vendored_takeover(
                 // would refuse the still-vendored wiring.
                 let outcome =
                     crate::commands::vendor::dispatch_revert_one(entry, &common.cwd, true).await;
+                if outcome.success && revert_keeps_wiring(&outcome) {
+                    refused.push(purl.clone());
+                    out.pre_warnings.push(drifted_takeover_warning(purl));
+                    continue;
+                }
                 if !outcome.success {
                     refused.push(purl.clone());
                     out.pre_warnings.push(serde_json::json!({
@@ -1754,6 +1835,16 @@ async fn vendored_takeover(
                 }));
                 continue;
             }
+            if revert_keeps_wiring(&outcome) {
+                // A wiring record drifted and was left in place, so the
+                // project may still resolve through the vendored artifact
+                // and the ledger entry holds the only recorded originals
+                // (the RevertOutcome contract): keep both and refuse,
+                // exactly as `vendor --revert` reports it skipped.
+                refused.push(purl.clone());
+                out.pre_warnings.push(drifted_takeover_warning(purl));
+                continue;
+            }
             // Drop the reverted entry from the in-memory ledger and
             // persist per purl so a crash mid-run leaves a ledger
             // matching the on-disk wiring. The entry stays dropped even
@@ -1768,8 +1859,10 @@ async fn vendored_takeover(
             if let Err(e) = socket_patch_core::vendor::save_state(&common.cwd, state).await {
                 // The wiring is reverted but the ledger still claims it;
                 // redirecting now would leave a ledger asserting wiring
-                // that is gone. Fail closed for this purl.
+                // that is gone. Fail closed for this purl — and since its
+                // vendored wiring is already gone, report it as stranded.
                 refused.push(purl.clone());
+                out.unrecorded.push(purl.clone());
                 out.pre_warnings.push(serde_json::json!({
                     "code": "redirect_vendored_revert_failed",
                     "detail": format!(
@@ -1866,6 +1959,32 @@ async fn vendored_takeover(
     Ok(out)
 }
 
+/// Whether a takeover revert left (or, on `--dry-run`, would leave) vendored
+/// wiring in place: a drift-skipped record, or a reverted file that still
+/// references the artifact dir. The backends compute both signals on dry
+/// runs too, while `kept_artifact` itself is set only on wet runs.
+fn revert_keeps_wiring(outcome: &socket_patch_core::vendor::RevertOutcome) -> bool {
+    outcome.kept_artifact
+        || outcome.drift_skipped()
+        || outcome
+            .warnings
+            .iter()
+            .any(|w| w.code == "vendor_revert_residual_reference")
+}
+
+/// The refusal for a takeover whose vendored wiring drifted since vendoring.
+fn drifted_takeover_warning(purl: &str) -> serde_json::Value {
+    serde_json::json!({
+        "code": "redirect_vendored_revert_failed",
+        "detail": format!(
+            "{purl} is vendored and part of its vendored wiring was edited since \
+             vendoring, so it is left in place; NOT switched to hosted — restore or \
+             remove that wiring (`socket-patch vendor --revert` lists it), then re-run \
+             `scan --mode hosted`"
+        ),
+    })
+}
+
 /// What [`vendored_takeover`] did (or, on `--dry-run`, would do).
 #[derive(Default)]
 struct Takeover {
@@ -1880,6 +1999,10 @@ struct Takeover {
     /// Human output: the purls migrated (or, on --dry-run, to be migrated)
     /// from vendored to hosted.
     migrated: Vec<String>,
+    /// Wet takeovers whose vendored wiring was reverted but whose ledger
+    /// update then failed: refused (never redirected), so unpatched in
+    /// both modes.
+    unrecorded: Vec<String>,
     /// The files their revert touches (or would touch). Both modes count
     /// `rewritten ∪ files`, so the preview's file count matches the wet
     /// run's even for wiring files the hosted rewriter does not also

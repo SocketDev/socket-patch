@@ -127,6 +127,50 @@ impl ApiRetryPolicy {
     }
 }
 
+/// Default [`ApiTimeouts::connect`]: TCP connect plus the TLS handshake.
+pub const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default [`ApiTimeouts::read`]: the longest silence on an open
+/// connection (waiting for the response headers, or between body chunks).
+pub const API_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Transport bounds for every patch-API request: the JSON calls, the
+/// blob/diff downloads and the vendoring service, on both of
+/// [`crate::api::client::ApiClient`]'s HTTP clients.
+///
+/// Neither is a total deadline: `read` restarts after every chunk that
+/// arrives, so a large download that keeps streaming is never cut off,
+/// while a stalled proxy, load balancer or half-open connection fails the
+/// request as `ApiError::Network` instead of hanging the run. A stall is a
+/// transport error, so the JSON retry loop does not repeat it; the
+/// vendoring service's own per-attempt deadlines and retries still apply
+/// on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApiTimeouts {
+    /// Bound on establishing a connection.
+    pub connect: Duration,
+    /// Bound on one read waiting for data.
+    pub read: Duration,
+}
+
+impl Default for ApiTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: API_CONNECT_TIMEOUT,
+            read: API_READ_TIMEOUT,
+        }
+    }
+}
+
+impl ApiTimeouts {
+    /// `builder` with these bounds applied.
+    pub fn apply(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        builder
+            .connect_timeout(self.connect)
+            .read_timeout(self.read)
+    }
+}
+
 /// [`API_MAX_RETRIES_ENV`]'s value as a retry count, or `None` to keep the
 /// default (unset, empty, or not a non-negative integer).
 fn max_retries_override(raw: Option<&str>) -> Option<u32> {

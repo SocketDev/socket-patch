@@ -1336,12 +1336,18 @@ mod tests {
                         let _ = std::fs::write(entry.join("node_modules"), "file");
                     }
                     76..=79 => {
-                        // An entry whose node_modules is a symlink.
-                        if let Some(target) = self.nm_dirs.first().cloned() {
-                            let entry = store.join(self.store_entry_name(&name, &version));
-                            let _ = std::fs::create_dir_all(&entry);
-                            Self::symlink(&target, &entry.join("node_modules"));
-                        }
+                        // An entry whose node_modules is a symlink (to a
+                        // dir outside the tree, so the followed walk cannot
+                        // cycle: a link back to an ancestor `node_modules`
+                        // is walked until the OS refuses the path, which
+                        // compares where two walkers gave up, not what
+                        // they found).
+                        let entry = store.join(self.store_entry_name(&name, &version));
+                        let _ = std::fs::create_dir_all(&entry);
+                        let id = self.uniq();
+                        let elsewhere = self.scratch.join(format!("pnpm-nm{id}"));
+                        self.package_json(&elsewhere.join(&name), &name, &version);
+                        Self::symlink(&elsewhere, &entry.join("node_modules"));
                     }
                     80..=83 => {
                         // The entry itself is a symlink (skipped).

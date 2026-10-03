@@ -2138,7 +2138,9 @@ async fn human_rush_run_prints_the_repo_state_stale_warning_line() {
 /// save_state failure AFTER a successful takeover revert: the wiring is gone
 /// but the vendored ledger still claims it, so the purl must fail CLOSED —
 /// `redirect_vendored_revert_failed` with the could-not-be-updated detail, a
-/// `vendored_revert_failed` skip, and no redirect. Reached by making
+/// `vendored_revert_failed` skip, and no redirect — and, since the package
+/// is now unpatched in both modes, `redirect_takeover_unpatched` with
+/// `partial_failure` and exit 1. Reached by making
 /// `.socket/vendor` itself read-only (0o555): the entry's empty wiring
 /// reverts trivially and its artifact dir under the still-writable
 /// `.socket/vendor/npm/` is removed, but persisting the now-empty ledger
@@ -2185,7 +2187,14 @@ async fn ledger_save_failure_after_successful_revert_fails_closed() {
 
     let (code, doc) = scan_hosted_json(root, &server.uri(), &[], &[]);
 
-    assert_eq!(code, 0, "the fail-closed refusal still exits 0: {doc:#}");
+    // The vendored wiring and artifact are already gone, so the package is
+    // unpatched in both modes: a stranded takeover, never a success.
+    assert_eq!(code, 1, "a stranded takeover exits 1: {doc:#}");
+    assert_eq!(doc["status"], "partial_failure", "envelope: {doc:#}");
+    assert!(
+        warning_detail(&doc, "redirect_takeover_unpatched").contains(PURL),
+        "the stranded package is named: {doc:#}"
+    );
     let detail = warning_detail(&doc, "redirect_vendored_revert_failed");
     assert!(
         detail.contains("could not be updated"),
