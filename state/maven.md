@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Maven bug-hunt routine (label pm:maven).
 
-Last updated: 2026-10-03 (run 11), main `045d7ec`, latest release 4.0.0. Maven 3.9.16 (newest 3.9) and 4.0.0-rc-7 (newest 4.x) are still the newest releases.
+Last updated: 2026-10-03 (run 12), main `045d7ec`, latest release 4.0.0. Maven 3.9.16 (newest 3.9) and 4.0.0-rc-7 (newest 4.x) are still the newest releases.
 
 ## Coverage matrix
 
@@ -79,6 +79,15 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 | 3.9.16 | fail #655 | untested | pass |
 | 4.0.0-rc-7 | fail #655 | untested | pass |
 
+### v5 hosted: dependency coordinate matching (run 12, Linux)
+
+| Maven | `${prop}` groupId | `${prop}` artifactId | `<exclusions>` before `<groupId>` | literal control |
+| --- | --- | --- | --- | --- |
+| 3.6.3 | fail #683 | fail #683 | fail #683 | untested |
+| 3.9.11 | fail #683 | fail #683 | fail #683 | pass |
+| 3.9.16 | fail #683 | fail #683 | fail #683 | untested |
+| 4.0.0-rc-7 | fail #683 | fail #683 | fail #683 | untested |
+
 ### v5 hosted Trusted Checksums boundary (#258, run 5, Linux)
 
 | Maven | `e2e_redirect_maven_build` (unenforced warning ⇔ tamper enforcement) |
@@ -104,7 +113,7 @@ Oracles: a real Maven resolve, plus a marker in the patched member (jar or pom).
 
 0. **Maintainer request (global `-g`)**: mostly covered in run 3 (see the matrix and the 20261001T061707Z entry). Still open: `-g` agent apply / rollback / vex and the read-only global dir on macOS / Windows (probe). Keep this item until those cells pass or fail. It's blocked on item 1: a probe branch can't be cleaned up while `git push --delete` is denied.
 1. A maintainer needs to delete the stale probe branches `bughunt/maven/20260930-vendored-paths` and `bughunt/maven/20261001-global-repo`. `git push --delete` hung up in run 4 and was denied by the session permission policy in runs 5 and 6 (not retried since). Probe commits must use the default (signed) git identity. Don't override `user.email`.
-2. #655 siblings: a `${prop}` groupId in the root `dependencyManagement`; the single-POM vendored backend (`vendor/maven_repo.rs`) and hosted mode with a property groupId / artifactId.
+2. #655 siblings: a `${prop}` groupId in the root `dependencyManagement`. #683 siblings (hosted): `${project.groupId}`; `<type>` / `<classifier>` before `<groupId>`; rollback / re-run after a shadowed dM pin. Low-yield (untested): the single-POM vendored backend + `${prop}` groupId (it injects only a `<repository>` and matches no declarations).
 2b. #622 follow-ups: `scan --mode vendored` / `get --mode vendored` on the implicit-subproject layout; an implicit layout with a nested aggregator; `vendor --revert` on it.
 3. Hosted: a pre-existing `.mvn/maven.config` with `failIfMissing=true` plus a user `checksums.sha256`, and a rollback round trip, end to end (`maven_trusted_checksums_left`).
 4. Other user-property sources vs the reactor planner (#535 / #550 family): `-D` values containing `${...}` (Maven 4 interpolation).
