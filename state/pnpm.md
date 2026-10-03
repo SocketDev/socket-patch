@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-03 (run 13), main `045d7ec`, latest release 4.0.0.
+Last updated: 2026-10-03 (run 14), main `045d7ec`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, package grant, hosted tarball, `/registry/<name>/<ver>` mirror). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -115,6 +115,17 @@ Run 13 additions (main `045d7ec`, Linux):
 
 #696 first bad commit: `cf8150b` (#251). Release 4.0.0 is honest with `modulesDir`.
 
+Run 14 additions (main `045d7ec`, Linux, Rush 5.180.0):
+
+| pnpm | Rush hosted: clean-clone `rush install` | Rush subspaces hosted (prevent off / `preventManualShrinkwrapChanges`) | Rush agent scan / vex `--product` / rollback | Hosted `remove` one of two pins / last pin | Hosted tarball-URL dep | Hosted pin survives `--no-prefer-frozen-lockfile` |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8.15.9 | pass | untested | untested | untested | untested | untested |
+| 9.15.9 | pass (run 10) | untested / fail #714 | pass (run 10) | untested | untested | pass |
+| 10.34.5 | pass | pass / fail #714 | untested | untested | untested | pass |
+| 11.0.0 | fail #713 (upstream installed, exit 0) | untested | untested | untested | untested | untested |
+| 11.28.3 | fail #713 (`ERR_PNPM_TARBALL_URL_MISMATCH`; env trust → upstream) | untested / fail #714 | pass | untested | untested | fail (upstream pnpm, in #713) |
+| 12.8.1 | fail #713 (`ERR_PNPM_TARBALL_URL_MISMATCH`; env trust → pass) | untested | untested | pass / pass (byte-exact, scaffold deleted) | pass | pass |
+
 Default isolated linker + alias: pass on 7.33.7 / 9.15.9 / 10.34.5 / 11.28.3 / 12.8.1 (one shared `.pnpm` copy).
 
 #492 also reproduces on pnpm 7.33.7 (there's no root lock at all, only `redirect_pnpm_no_lockfile`).
@@ -137,14 +148,14 @@ Global mode (`-g`, v5 main `2463257`):
 ## Backlog
 
 0. **Maintainer request (global `-g` mode):** the Linux cells are done. Still to do: macOS and Windows (corepack, standalone and npm-installed pnpm; `PNPM_HOME` with spaces or unicode; Windows `%LOCALAPPDATA%\pnpm`), and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry. Needs a probe branch.
-1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3 and 10, and was denied by the permission policy in runs 2, 5–9 and 11–13, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
+1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3 and 10, and was denied by the permission policy in runs 2, 5–9 and 11–14, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
 2. #696 / #661 follow-ups: `modulesDir` in the global `config.yaml` / `rc`, and `modulesDir` + `virtualStoreDir` together. When fixed, check that GVS and out-of-project `virtualStoreDir` transitive deps also stop attesting.
 3. #636 follow-ups: a hosted → vendored takeover with several packages, then revert, and a user-created `pnpm` table with several vendored packages.
-4. #362 GVS transitive and #435 global `-g`: re-check exit codes under #555's skip semantics on 11.28.3 / 12.8.1.
-5. Rush subspaces (`common/config/subspaces/*`), and Rush + pnpm 8 / 10.
+4. Hosted `remove` on legacy locks (5.4 / 6.0), on a two-document lock (pnpm 12 `packageManager`), and vendored `remove`.
+5. #362 GVS transitive and #435 global `-g`: re-check exit codes under #555's skip semantics on 11.28.3 / 12.8.1.
 6. `package-import-method=clone` on reflink (needs CI).
 7. #556 follow-ups: merging branch lockfiles after a hosted pin, and agent `vex` on the branch.
-8. Re-verify #360, #362, #435, #466, #492, #556, #557, #590 (PR #598), #601 (PR #605), #626 (PR #634), #633, #636, #661 and #696 when fixes land.
+8. Re-verify #360, #362, #435, #466, #492, #556, #557, #590 (PR #598), #601 (PR #605), #626 (PR #634), #633, #636, #661 / #696 (PR #698), #713 and #714 when fixes land.
 9. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout).
 
 ## Known non-bugs
@@ -182,3 +193,6 @@ Global mode (`-g`, v5 main `2463257`):
 - In-run `scan --mode hosted --vex` attests from this run's records without hash verification, so it says `not_affected` over an upstream install (CLI_CONTRACT `(redirected)` row). Use standalone `vex` after the install as the oracle.
 - A `pnpm patch-commit` over a hosted pin makes `vex` decline with `hash_mismatch` (the file matches neither hash). That's honest. Rollback keeps the user's patch and restores the upstream pin.
 - pnpm ≤10 `patch-commit` under `CI=true` runs a frozen install and fails with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` (fixture note: use `confirmModulesPurge=false`, not `CI`). A mock `/registry` must serve the real npmjs tarball, or a rollback restores a foreign integrity.
+- Rush has no root `package.json`, so `vex` needs `--product` there (`product_undetected`), like `-g`.
+- pnpm 12.0.0 doesn't run under Rush 5.180 (it rejects Rush's `--no-prefer-frozen-lockfile`). Rush subspace fixtures need `common/config/subspaces/<name>/` folders created and `common/config/rush/.pnpmfile.cjs` removed before `rush update`.
+- pnpm 11.28.3 `pnpm install --no-prefer-frozen-lockfile` re-resolves hosted pins to upstream even with `trustLockfile: true` (9 / 10 / 12 keep them). That's upstream pnpm behaviour; the default `pnpm install` and `--frozen-lockfile` keep the pin. It's tracked inside #713 because Rush uses that flag by default.
