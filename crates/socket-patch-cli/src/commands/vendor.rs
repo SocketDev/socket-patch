@@ -1090,7 +1090,7 @@ impl EjectSnapshot {
             let build =
                 socket_patch_core::patch::redirect::gradle::read_build_from_disk(root).await;
             rels.extend(socket_patch_core::patch::redirect::gradle::wiring_files(
-                &build,
+                &build.files,
             ));
         }
         let mut files = Vec::with_capacity(rels.len());

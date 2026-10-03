@@ -124,18 +124,21 @@ fn assert_same_with_metadata(
         let overrides = withhold(overrides, &prefix.refused_pdm_uuids);
         pipenv::rewrite(files, &overrides, pipenv_major, &mut prefix);
         let overrides = withhold(&overrides, &prefix.refused_pipenv_uuids);
+        let no_gradle_unreadable = std::collections::BTreeSet::new();
         let groups = rewriter_groups(
             files,
             &overrides,
             &overrides,
             bun_lockb_present,
             python_metadata,
+            &no_gradle_unreadable,
         );
-        let merged = merge_group_outputs(&prefix, run_groups_concurrently(&prefix, &groups))
-            .map(|mut merged| {
+        let merged = merge_group_outputs(&prefix, run_groups_concurrently(&prefix, &groups)).map(
+            |mut merged| {
                 merged.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
                 merged
-            });
+            },
+        );
         assert_eq!(
             merged.as_ref(),
             Some(&want),

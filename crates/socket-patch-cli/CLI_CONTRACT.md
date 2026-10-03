@@ -1727,7 +1727,7 @@ starts with the code):
 | `jvm_jar_backup_failed` | refused, exit 1 | The original jar could not be backed up before the swap. Nothing is written. |
 | `gradle_rollback_hash_mismatch` | rollback: that copy fails | A file restored into a Gradle hash directory does not hash to the directory's name (the sha1 Gradle verified on download): the before-blob is not that download. The file is left as it is and the result fails; delete that hash directory so Gradle downloads it again. |
 | `jvm_jar_backup_missing` | rollback: that copy fails | No backup of the original jar exists (and, for a Gradle copy, no upstream download matched its hash directory, or the run is offline). The copy is left as it is. |
-| `gradle_m2_copy_not_restored` | rollback / remove: warning | A `~/.m2` copy this Gradle-only build does not read could not be restored (its bytes are neither side of the record, a file is missing, or it is a swapped jar with no backup in this project). It is left as it is and does not fail the run. |
+| `gradle_m2_copy_not_restored` | rollback / remove: warning | A `~/.m2` copy this Gradle-only build does not read could not be restored (its bytes are neither side of the record, a file is missing, or it is a swapped jar with no backup in this project). It is left as it is and does not fail the run. A file that is there but cannot be read (permissions, not a regular file) may still hold the patched bytes, so it fails the run and `remove` keeps the record. |
 
 Each patched Gradle copy's sidecar record (`PatchEvent.sidecar`) carries an advisory
 instead of a checksum-file rewrite (a `files-2.1` copy has none):
@@ -1815,6 +1815,7 @@ candidate at or below the base rejected; it declares no dependency):
 | `redirect_gradle_android_or_kmp` | An Android or Kotlin Multiplatform plugin, in any script or catalog `[plugins]`. |
 | `redirect_gradle_include_build_unresolved` | An `includeBuild` the script graph cannot follow. |
 | `redirect_gradle_lock_location_unknown` | A build script sets a custom `lockFile`. |
+| `redirect_gradle_build_file_unreadable` | A settings, build, catalog, lock or owned file the script graph reaches exists but cannot be read as UTF-8 text (permissions, encoding, not a regular file). The planner refuses rather than take it for absent, which would create a settings file over the user's. The hosted writer also refuses, as a whole-run refusal, to write a settings file it did not read over one on disk. |
 | `redirect_gradle_index_malformed` | `.socket/gradle/hosted-index.tsv` does not parse. |
 | `redirect_gradle_same_gav_unsupported` | The grant serves the original GAV (no `mavenSuffixedVersion` / `mavenPomSha256`), which cannot be pinned fail-closed. |
 | `redirect_gradle_override_invalid` | The grant has unsafe coordinates, a non-canonical uuid, a wrong suffix, a non-https repository, a missing digest, or no maven2 repository. |

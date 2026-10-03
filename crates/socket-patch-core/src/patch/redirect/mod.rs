@@ -497,13 +497,16 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
         pipenv_major,
         bun_lockb_present,
         &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
     )
 }
 
 /// [`rewrite_registry_redirect_with_pipenv_version`] with the patch uuids
 /// in `vlt_withheld` kept out of the vlt rewrite only: their artifact
 /// failed vlt's preflight while another npm-family lock may be the one the
-/// project installs from.
+/// project installs from. `gradle_unreadable` are the Gradle build files
+/// the host found but could not read as text: the Gradle planner refuses
+/// the build rather than take them for absent.
 pub fn rewrite_registry_redirect_withholding_vlt(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -511,6 +514,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
     pipenv_major: Option<u32>,
     bun_lockb_present: bool,
     vlt_withheld: &std::collections::BTreeSet<String>,
+    gradle_unreadable: &std::collections::BTreeSet<String>,
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
     // pdm runs FIRST, but only when `pdm.lock` is the project's PyPI install
@@ -533,6 +537,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
         &vlt_overrides,
         bun_lockb_present,
         python_metadata,
+        gradle_unreadable,
     );
     let mut result = rewrite_groups_parallel(result, &groups);
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
@@ -557,6 +562,7 @@ fn rewriter_groups<'a>(
     vlt_overrides: &'a [DepOverride],
     bun_lockb_present: bool,
     python_metadata: &'a BTreeMap<String, String>,
+    gradle_unreadable: &'a std::collections::BTreeSet<String>,
 ) -> Vec<RewriterGroup<'a>> {
     vec![
         Box::new(move |result| {
@@ -580,7 +586,9 @@ fn rewriter_groups<'a>(
         Box::new(move |result| rewrite_nuget(files, overrides, result)),
         Box::new(move |result| rewrite_gem(files, overrides, result)),
         Box::new(move |result| rewrite_maven_pom(files, overrides, result)),
-        Box::new(move |result| gradle::rewrite_gradle_hosted(files, overrides, result)),
+        Box::new(move |result| {
+            gradle::rewrite_gradle_hosted(files, gradle_unreadable, overrides, result)
+        }),
         Box::new(move |result| rewrite_golang(files, overrides, result)),
     ]
 }

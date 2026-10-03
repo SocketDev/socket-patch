@@ -513,11 +513,52 @@ impl GradleFiles {
     }
 }
 
+/// Whether a read error means the file is not there (absent to the script
+/// graph), as opposed to a file that exists but cannot be read as text
+/// (permissions, non-UTF-8 bytes, not a regular file), which
+/// [`unreadable_refusal`] refuses.
+pub fn is_absent_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Refusal code for a build whose script graph reaches a file that exists
+/// but cannot be read as text: the planner would take it for absent and,
+/// for a settings file, write a new one over it.
+pub const UNREADABLE_REFUSAL_CODE: &str = "redirect_gradle_build_file_unreadable";
+
+/// The build-level refusal for the files the script graph reached that
+/// exist but could not be read (see [`is_absent_error`]).
+fn unreadable_refusal(unreadable: &BTreeSet<String>) -> Option<Refusal> {
+    let rel = unreadable.iter().next()?;
+    Some(refusal(
+        UNREADABLE_REFUSAL_CODE,
+        format!(
+            "{rel} exists but cannot be read as UTF-8 text (permissions, encoding, or not a \
+             regular file), so the hosted wiring cannot edit the build safely; make it a \
+             readable UTF-8 file and re-run"
+        ),
+    ))
+}
+
+/// A Gradle build read from disk ([`read_build_from_disk`]).
+#[derive(Debug, Clone, Default)]
+pub struct DiskBuild {
+    /// The readable files the script graph reached.
+    pub files: BTreeMap<String, String>,
+    /// Files it reached that exist but could not be read as text.
+    pub unreadable: BTreeSet<String>,
+}
+
 /// The Gradle build under `root`, read from disk to the fixed point of
-/// [`GradleFiles`] (a file that cannot be read is absent; a directory that
-/// cannot be listed lists as empty).
-pub async fn read_build_from_disk(root: &std::path::Path) -> BTreeMap<String, String> {
+/// [`GradleFiles`] (a missing file is absent; one that exists but cannot
+/// be read is absent to the graph and listed in `unreadable`; a directory
+/// that cannot be listed lists as empty).
+pub async fn read_build_from_disk(root: &std::path::Path) -> DiskBuild {
     let mut gradle = GradleFiles::default();
+    let mut unreadable = BTreeSet::new();
     for _ in 0..MAX_ROUNDS {
         let (reads, lists) = gradle.misses();
         if reads.is_empty() && lists.is_empty() {
@@ -526,7 +567,12 @@ pub async fn read_build_from_disk(root: &std::path::Path) -> BTreeMap<String, St
         for rel in reads {
             match crate::utils::fs::read_regular_to_string(&root.join(&rel)).await {
                 Ok(text) => gradle.found(&rel, text),
-                Err(_) => gradle.absent(&rel),
+                Err(e) => {
+                    if !is_absent_error(&e) {
+                        unreadable.insert(rel.clone());
+                    }
+                    gradle.absent(&rel);
+                }
             }
         }
         for dir in lists {
@@ -544,7 +590,10 @@ pub async fn read_build_from_disk(root: &std::path::Path) -> BTreeMap<String, St
             gradle.listed(&dir, children);
         }
     }
-    gradle.files
+    DiskBuild {
+        files: gradle.files,
+        unreadable,
+    }
 }
 
 /// Every project file the hosted Gradle wiring of the build `files` holds
@@ -1013,6 +1062,7 @@ fn may_admit_above(sel: &Selector, base: &str) -> bool {
 /// keeps its working vendored patch. `None` when there is no Gradle build.
 pub fn takeover_refusal(
     files: &BTreeMap<String, String>,
+    unreadable: &BTreeSet<String>,
     dep: &DepOverride,
 ) -> Option<RewriteWarning> {
     if !gradle_build_present(files) {
@@ -1038,7 +1088,7 @@ pub fn takeover_refusal(
     let index = files
         .get(HOSTED_INDEX_REL)
         .map_or(Ok(Vec::new()), |t| parse_index(t));
-    let project = project_refusal(files, &graph, &index);
+    let project = unreadable_refusal(unreadable).or_else(|| project_refusal(files, &graph, &index));
     let rows = index.unwrap_or_default();
     plan_dep(
         dep,
@@ -1174,6 +1224,7 @@ fn verification_edit(text: &str, a: &Accepted) -> Result<String, String> {
 /// `confirmed_gradle_uuids` and `refused_gradle_uuids`.
 pub(crate) fn rewrite_gradle_hosted(
     files: &BTreeMap<String, String>,
+    unreadable: &BTreeSet<String>,
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
@@ -1192,7 +1243,10 @@ pub(crate) fn rewrite_gradle_hosted(
     let index = files
         .get(HOSTED_INDEX_REL)
         .map_or(Ok(Vec::new()), |t| parse_index(t));
-    let project = project_refusal(files, &graph, &index);
+    // A file the graph reached that exists but could not be read is not
+    // absent: a settings target "created" over it would replace the
+    // user's settings file.
+    let project = unreadable_refusal(unreadable).or_else(|| project_refusal(files, &graph, &index));
     let rows = index.unwrap_or_default();
     let vendored_gas = vendored_gas(files);
     let dsls = build_dsls(files);
@@ -2348,10 +2402,23 @@ mod tests {
             "#socket-patch-gradle-index 1\ncom.socketfixture:victim:1.10.0\tx\ty\tz\n",
         );
         let s = ("settings.gradle", "rootProject.name = 'app'\n");
-        assert!(takeover_refusal(&files(&[s, vendored]), &dep()).is_none());
-        assert!(takeover_refusal(&files(&[("pom.xml", "<project/>")]), &dep()).is_none());
+        let none = BTreeSet::new();
+        assert!(takeover_refusal(&files(&[s, vendored]), &none, &dep()).is_none());
+        assert!(takeover_refusal(&files(&[("pom.xml", "<project/>")]), &none, &dep()).is_none());
+        // A build file that exists but cannot be read refuses the takeover.
+        let unreadable: BTreeSet<String> = ["settings.gradle".to_string()].into();
+        assert_eq!(
+            takeover_refusal(
+                &files(&[("build.gradle", ""), vendored]),
+                &unreadable,
+                &dep()
+            )
+            .map(|w| w.code)
+            .as_deref(),
+            Some(UNREADABLE_REFUSAL_CODE)
+        );
         let code = |input: &[(&str, &str)], d: DepOverride| {
-            takeover_refusal(&files(input), &d).map(|w| w.code)
+            takeover_refusal(&files(input), &none, &d).map(|w| w.code)
         };
         assert_eq!(
             code(
@@ -2415,6 +2482,7 @@ mod tests {
                     "com.socketfixture:victim:1.9=runtimeClasspath\n",
                 ),
             ]),
+            &none,
             &dep(),
         )
         .unwrap();

@@ -302,6 +302,11 @@ pub struct CandidateFiles {
     /// project whose candidates could rewrite (or whose rewrite depends on)
     /// one is refused, since the rewriters would treat it as absent.
     pub unreadable_reads: Vec<String>,
+    /// Gradle build files the script graph reached that exist but cannot be
+    /// read as text (any view): the hosted Gradle planner refuses the build
+    /// instead of taking them for absent (and creating a settings file over
+    /// one).
+    pub gradle_unreadable: BTreeSet<String>,
     /// Set when bundler is configured (`BUNDLE_GEMFILE`) to load a manifest
     /// the gem rewriter cannot edit: every gem manifest and lock was left
     /// out of `files`, and the rewrite reports this instead of a redirect.
@@ -522,9 +527,11 @@ pub async fn read_candidate_files(
 /// Read what the hosted Gradle planner needs into `out` (see
 /// [`crate::patch::redirect::gradle::GradleFiles`]): the script graph is
 /// re-walked over what was read so far until it asks for nothing new
-/// (bounded by its own caps and [`MAX_ROUNDS`] rounds). A file that cannot
-/// be read is absent to the graph, which records it as unresolved; a
-/// directory that cannot be listed lists as empty.
+/// (bounded by its own caps and [`MAX_ROUNDS`] rounds). A missing file is
+/// absent to the graph, which records it as unresolved; one that exists
+/// but cannot be read as text is absent to the graph too, and listed in
+/// [`CandidateFiles::gradle_unreadable`] so the planner refuses the build;
+/// a directory that cannot be listed lists as empty.
 ///
 /// [`MAX_ROUNDS`]: crate::patch::redirect::gradle::MAX_ROUNDS
 async fn read_gradle_files(
@@ -543,12 +550,7 @@ async fn read_gradle_files(
             break;
         }
         for rel in reads {
-            match out
-                .read(view, unreadable, &rel)
-                .await
-                .then(|| out.files.get(&rel).cloned())
-                .flatten()
-            {
+            match read_gradle_file(view, unreadable, out, &rel).await {
                 Some(text) => gradle.found(&rel, text),
                 None => gradle.absent(&rel),
             }
@@ -573,6 +575,37 @@ async fn read_gradle_files(
             gradle.listed(&dir, children);
         }
     }
+}
+
+/// Read one Gradle file into `out` for [`read_gradle_files`]: its text, or
+/// `None` when it is missing or cannot be read — in which case a file that
+/// exists (permissions, non-UTF-8 bytes, not a regular file, content not
+/// provided in memory) is recorded in `gradle_unreadable`.
+async fn read_gradle_file(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    out: &mut CandidateFiles,
+    rel: &str,
+) -> Option<String> {
+    let exists = match view {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => match view.read_text(rel).await {
+            Ok(text) => {
+                out.files.insert(rel.to_string(), text.clone());
+                return Some(text);
+            }
+            Err(e) => !crate::patch::redirect::gradle::is_absent_error(&e),
+        },
+        ProjectView::Memory(project) => {
+            if out.read(view, unreadable, rel).await {
+                return out.files.get(rel).cloned();
+            }
+            project.get(rel).is_some()
+        }
+    };
+    if exists {
+        out.gradle_unreadable.insert(rel.to_string());
+    }
+    None
 }
 
 /// The Bundler manifest/lock spellings among the candidate files.
@@ -889,6 +922,7 @@ pub async fn rewrite(
         rush_lock_keys,
         symlinked_reads,
         unreadable_reads,
+        gradle_unreadable,
         gem_manifest_unsupported,
     } = read;
     // The rewriters' override slice — materialized ONCE, after the last
@@ -932,6 +966,7 @@ pub async fn rewrite(
                 pipenv_major,
                 bun_lockb,
                 &withheld,
+                &gradle_unreadable,
             );
             (files, rewrite)
         })
@@ -948,6 +983,7 @@ pub async fn rewrite(
             pipenv_major,
             bun_lockb,
             withheld_from_vlt,
+            &gradle_unreadable,
         );
         (files, rewrite)
     };
@@ -2123,6 +2159,10 @@ mod tests {
     }
 
     async fn gradle_rewrite(p: &MemoryProject) -> (CandidateFiles, Rewritten) {
+        gradle_rewrite_in(&ProjectView::Memory(p)).await
+    }
+
+    async fn gradle_rewrite_in(view: &ProjectView<'_>) -> (CandidateFiles, Rewritten) {
         let outer = OuterAllowRemote::default;
         let options = RewriteOptions {
             dry_run: false,
@@ -2135,10 +2175,9 @@ mod tests {
             blocking: false,
         };
         let candidates = vec![gradle_candidate()];
-        let view = ProjectView::Memory(p);
-        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
         let done = rewrite(
-            &view,
+            view,
             read.clone(),
             &candidates,
             BTreeMap::new(),
@@ -2187,6 +2226,79 @@ mod tests {
                 GRADLE_UUID.to_string()
             )]
         );
+    }
+
+    /// #646 review: a settings file that exists but cannot be read as text
+    /// (Latin-1 bytes, mode 000) is not absent. The planner refuses the
+    /// build instead of "creating" a one-line settings.gradle over it.
+    #[tokio::test]
+    async fn an_unreadable_settings_file_refuses_the_gradle_build() {
+        const BUILD: &str = "dependencies { implementation 'com.socketfixture:victim:1.10.0' }\n";
+        let refused = |read: &CandidateFiles, done: &Rewritten| {
+            assert!(
+                read.gradle_unreadable.contains("settings.gradle"),
+                "{:?}",
+                read.gradle_unreadable
+            );
+            assert!(done.rewrite.refused_gradle_uuids.contains(GRADLE_UUID));
+            assert!(
+                !done.rewrite.files.contains_key("settings.gradle"),
+                "{:?}",
+                done.rewrite.files.keys()
+            );
+            assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+            assert!(
+                done.rewrite.warnings.iter().any(|w| w.code
+                    == crate::patch::redirect::gradle::UNREADABLE_REFUSAL_CODE
+                    || w.detail
+                        .contains(crate::patch::redirect::gradle::UNREADABLE_REFUSAL_CODE)),
+                "{:?}",
+                done.rewrite.warnings
+            );
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = tmp.path().join("settings.gradle");
+        std::fs::write(
+            &settings,
+            b"rootProject.name = 'app'\n// Auteur: Andr\xe9\ninclude 'core'\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("build.gradle"), BUILD).unwrap();
+        let (read, done) = gradle_rewrite_in(&ProjectView::Disk(tmp.path())).await;
+        refused(&read, &done);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&settings, "rootProject.name = 'app'\n").unwrap();
+            std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read(&settings).is_err() {
+                let (read, done) = gradle_rewrite_in(&ProjectView::Disk(tmp.path())).await;
+                refused(&read, &done);
+            }
+            std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        // In memory: non-UTF-8 bytes, and content the host did not provide.
+        for entry in [
+            MemoryEntry::Binary(b"rootProject.name = 'Andr\xe9'\n".to_vec().into()),
+            MemoryEntry::Present,
+        ] {
+            let mut p = MemoryProject::new();
+            p.insert("settings.gradle", entry);
+            p.insert_text("build.gradle", BUILD);
+            let (read, done) = gradle_rewrite(&p).await;
+            refused(&read, &done);
+        }
+
+        // Control: a readable settings file is rewritten in place, never
+        // created over.
+        std::fs::write(&settings, "rootProject.name = 'app'\ninclude 'core'\n").unwrap();
+        let (read, done) = gradle_rewrite_in(&ProjectView::Disk(tmp.path())).await;
+        assert!(read.gradle_unreadable.is_empty());
+        let text = &done.rewrite.files["settings.gradle"];
+        assert!(text.contains("include 'core'"), "{text}");
     }
 
     /// A refused Gradle build is never confirmed by a snippet pasted into a

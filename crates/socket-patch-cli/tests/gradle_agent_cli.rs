@@ -909,6 +909,45 @@ fn unconsumed_m2_copy_with_foreign_bytes_does_not_fail_rollback_or_remove() {
     );
 }
 
+/// #646 review: an unconsumed `~/.m2` copy this project patched whose jar
+/// cannot be read (a `sudo mvn install` left it root-owned, mode 600) may
+/// still hold the patched bytes. It is not "foreign or absent": `remove`
+/// fails and keeps the record and its before-blobs, so a later rollback
+/// can still restore the shared jar.
+#[cfg(unix)]
+#[test]
+fn unreadable_unconsumed_m2_copy_fails_remove_and_keeps_the_record() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx(CENTRAL);
+    let m2 = f.m2(&[(JAR, &patched_jar()), (POM, PATCHED_POM)]);
+    f.gradle(&as_refs(&pristine_files()));
+    f.leaf_manifest();
+    f.run(&["apply", "--offline"]).ok();
+    let jar_path = m2.join(JAR);
+    std::fs::set_permissions(&jar_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&jar_path).is_ok() {
+        // Running as root: mode 000 does not stop the read.
+        std::fs::set_permissions(&jar_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+    let out = f.run(&["remove", PURL, "--offline"]);
+    std::fs::set_permissions(&jar_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    out.failed();
+    assert!(
+        !out.warning_codes()
+            .iter()
+            .any(|c| c == "gradle_m2_copy_not_restored"),
+        "{}",
+        out.json
+    );
+    let manifest = std::fs::read_to_string(f.proj.join(".socket/manifest.json")).unwrap();
+    assert!(manifest.contains(PURL), "{manifest}");
+    // Readable again, the copy still holds the patched bytes and rolls back.
+    assert_eq!(std::fs::read(&jar_path).unwrap(), patched_jar());
+    f.run(&["rollback", "--offline"]).ok();
+    assert_eq!(std::fs::read(&jar_path).unwrap(), pristine_jar());
+}
+
 /// #646 review: a member-keyed record whose unconsumed `~/.m2` jar was
 /// swapped by another project (its original backed up there, not under
 /// this project's `.socket/jvm-originals/`) cannot be restored here; the

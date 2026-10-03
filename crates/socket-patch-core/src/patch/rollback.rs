@@ -31,6 +31,21 @@ pub struct VerifyRollbackResult {
     pub target_hash: Option<String>,
 }
 
+/// The `NotFound` message of a file that is truly absent, as opposed to
+/// one that exists but could not be read or stat'd (`Failed to hash
+/// file: …` / `Failed to stat file: …`) or whose key is unsafe.
+pub const FILE_NOT_FOUND_MESSAGE: &str = "File not found";
+
+impl VerifyRollbackResult {
+    /// `NotFound` because the file is absent from disk — not an I/O error
+    /// on a file that is there (which may still hold the patched bytes)
+    /// or an unsafe key, both of which share the `NotFound` status.
+    pub fn is_absent(&self) -> bool {
+        self.status == VerifyRollbackStatus::NotFound
+            && self.message.as_deref() == Some(FILE_NOT_FOUND_MESSAGE)
+    }
+}
+
 /// Result of rolling back patches for a single package.
 #[derive(Debug, Clone)]
 pub struct RollbackResult {
@@ -172,7 +187,7 @@ pub async fn verify_file_rollback(
             return VerifyRollbackResult {
                 file: file_name.to_string(),
                 status: VerifyRollbackStatus::NotFound,
-                message: Some("File not found".to_string()),
+                message: Some(FILE_NOT_FOUND_MESSAGE.to_string()),
                 current_hash: None,
                 expected_hash: None,
                 target_hash: None,

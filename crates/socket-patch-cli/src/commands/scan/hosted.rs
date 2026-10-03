@@ -1042,6 +1042,12 @@ pub(crate) async fn run_redirect_selected(
     if let Some(refusal) = engine::guard(&view, &done, &candidates) {
         return refuse(common, scan_result.take(), &refusal);
     }
+    // Defense in depth for the Gradle planner: a settings file it plans to
+    // CREATE (it never read one) must not already be on disk, or the
+    // atomic write would replace the user's settings with the apply line.
+    if let Some(refusal) = created_settings_over_existing(&common.cwd, &done) {
+        return refuse(common, scan_result.take(), &refusal);
+    }
 
     if !common.dry_run {
         let total = confirmed.len();
@@ -1742,7 +1748,7 @@ async fn vendored_takeover(
     > = if takeover.iter().any(|(c, entry)| {
         c.purl.starts_with("pkg:maven/") && entry.as_ref().is_some_and(gradle_jvm_entry)
     }) {
-        let files =
+        let build =
             socket_patch_core::patch::redirect::gradle::read_build_from_disk(&common.cwd).await;
         takeover
             .iter()
@@ -1750,8 +1756,12 @@ async fn vendored_takeover(
                 c.purl.starts_with("pkg:maven/") && entry.as_ref().is_some_and(gradle_jvm_entry)
             })
             .filter_map(|(c, _)| {
-                socket_patch_core::patch::redirect::gradle::takeover_refusal(&files, &c.dep)
-                    .map(|w| (c.purl.clone(), w))
+                socket_patch_core::patch::redirect::gradle::takeover_refusal(
+                    &build.files,
+                    &build.unreadable,
+                    &c.dep,
+                )
+                .map(|w| (c.purl.clone(), w))
             })
             .collect()
     } else {
@@ -2443,6 +2453,31 @@ pub(crate) fn npm_allow_remote_one_line(detail: &str) -> String {
              automatically {MORE}."
         )
     }
+}
+
+/// The refusal for a Gradle settings file the hosted rewrite writes
+/// without having read it (the planner took it for absent and creates it)
+/// while one is on disk: writing it would replace the user's settings.
+fn created_settings_over_existing(
+    cwd: &std::path::Path,
+    done: &socket_patch_core::hosted::engine::Rewritten,
+) -> Option<socket_patch_core::hosted::engine::Refusal> {
+    done.rewrite
+        .files
+        .keys()
+        .filter(|rel| {
+            let base = rel.rsplit('/').next().unwrap_or(rel);
+            matches!(base, "settings.gradle" | "settings.gradle.kts")
+                && !done.files.contains_key(rel.as_str())
+        })
+        .find(|rel| std::fs::symlink_metadata(cwd.join(rel)).is_ok())
+        .map(|rel| socket_patch_core::hosted::engine::Refusal {
+            code: socket_patch_core::patch::redirect::gradle::UNREADABLE_REFUSAL_CODE.to_string(),
+            message: format!(
+                "{rel} exists but could not be read, so the hosted Gradle wiring would replace \
+                 it; make it a readable UTF-8 file and re-run; nothing was written"
+            ),
+        })
 }
 
 #[cfg(test)]

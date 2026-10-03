@@ -2829,20 +2829,32 @@ impl CopyTarget {
 /// writing anything because the copy holds bytes that are neither side of
 /// this record (another build re-patched it, or `mvn install` rebuilt it),
 /// lacks a file, or is a swapped jar whose original this project never
-/// backed up. `None` for any other result, which is reported as usual.
+/// backed up. `None` for any other result, which is reported as usual —
+/// including a file that is there but cannot be read or stat'd, which may
+/// still hold this record's patched bytes.
 fn unconsumed_m2_skip(target: &CopyTarget, result: &RollbackResult) -> Option<(String, String)> {
     if !target.unconsumed_m2 || result.success || !result.files_rolled_back.is_empty() {
         return None;
     }
-    let refused = result.files_verified.iter().any(|v| {
-        matches!(
-            v.status,
-            VerifyRollbackStatus::HashMismatch | VerifyRollbackStatus::NotFound
-        )
-    }) || result
-        .error
-        .as_deref()
-        .is_some_and(|e| e.starts_with("jvm_jar_backup_missing"));
+    // A file that is there but could not be read or stat'd (EACCES, EISDIR,
+    // ELOOP…) may still hold this record's patched bytes: leaving it would
+    // let `remove` drop the record and its before-blobs with the shared
+    // copy still patched, so it fails the run like any unverifiable copy.
+    if result
+        .files_verified
+        .iter()
+        .any(|v| v.status == VerifyRollbackStatus::NotFound && !v.is_absent())
+    {
+        return None;
+    }
+    let refused = result
+        .files_verified
+        .iter()
+        .any(|v| v.status == VerifyRollbackStatus::HashMismatch || v.is_absent())
+        || result
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("jvm_jar_backup_missing"));
     refused.then(|| {
         (
             "gradle_m2_copy_not_restored".to_string(),

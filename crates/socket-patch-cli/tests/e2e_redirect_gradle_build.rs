@@ -1811,6 +1811,38 @@ fn gradle_hosted_429_autocrlf_clone() {
     });
 }
 
+/// #646 review: a settings.gradle that is not UTF-8 (a Latin-1 comment)
+/// is not absent. The scan refuses the build
+/// (`redirect_gradle_build_file_unreadable`) and leaves the settings file
+/// byte-identical, instead of replacing it with a one-line apply file.
+/// Gradle still builds the untouched project.
+#[test]
+#[ignore = "real Gradle; run with --ignored"]
+fn gradle_hosted_non_utf8_settings_refused_untouched() {
+    let dsl = Dsl::Groovy;
+    let Some(c) = cell(
+        dsl,
+        &single(dsl, &[&implementation(dsl, &coordinate())], ""),
+    ) else {
+        return;
+    };
+    let settings = c.proj.join("settings.gradle");
+    let latin1: &[u8] = b"rootProject.name = 'app'\n// Auteur: Andr\xe9\n";
+    std::fs::write(&settings, latin1).unwrap();
+    c.warm();
+    c.serve_leaf(&Served::new(true));
+    let (code, json) = c.scan_in(&c.proj, &[]);
+    assert_eq!(code, Some(0), "{json}");
+    assert_eq!(json["redirect"]["redirected"], 0, "{json}");
+    assert!(
+        has(&json, "redirect_gradle_build_file_unreadable"),
+        "{json}"
+    );
+    assert_eq!(std::fs::read(&settings).unwrap(), latin1, "{json}");
+    let out = c.build(&[]);
+    c.assert_pristine(&out, "refused build");
+}
+
 /// A build the planner refuses (a declared classifier) with the fallback
 /// snippet pasted in: the build consumes the patch, but nothing attests
 /// it.
