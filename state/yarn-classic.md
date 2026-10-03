@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-03 (run 10), main `045d7ec`, latest release v4.0.0. Runs 5–10 added the cells in "Run 5 cells" through "Run 10 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-03 (run 11), main `045d7ec`, latest release v4.0.0. Runs 5–11 added the cells in "Run 5 cells" through "Run 11 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -81,14 +81,19 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Agent mode with a `link:` dep: patches the link target outside the project (the code Node loads). Design question, not filed.
 - #467 re-checked: still reproduces (H and V, 1.22.22).
 
+### Run 11 cells (Linux, `045d7ec`)
+- No trailing newline (LF / CRLF, target block last) and CRLF + trailing blank lines, H and V + fresh frozen install + rollback: pass (1.22.22).
+- Symlinked `.socket/` or `.socket/vendor/npm`, single project, V: pass (consistent). **Two projects sharing a symlinked `.socket/vendor/npm`: fail #664** (1.7.0 / 1.10.1 / 1.22.22).
+- **`yarn remove` of a vendored package, then rollback / remove / `vendor --revert`: fail #665** (1.7.0 / 1.22.22). Hosted same flow: pass.
+
 ## Backlog
 
-1. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows (Program Files; the runner is admin, so it needs a non-admin user). #437 (1.0.x) is still open. Windows / get-mode / corepack / 1.6.0 / 1.9.4 were covered in run 10.
-2. Same-size patched files on yarn ≤1.9 in-place installs: find out which mtime the vendored packer and the Socket hosted tarballs use (the npm 1985 constant would make an upstream→patched same-size change a silent no-op in place).
-3. Re-run the v4-only project columns (git dep #363, offline mirror H #364) on macOS/Windows once fixes land; re-check #558 / #519 / #467 once fixed.
-4. `vendor --check` / `repair` on a #591-shaped lock (dangling dependency).
-5. Other symlinked inputs: `.yarnrc` (offline mirror) and `package.json` (`resolutions`) as symlinks, in H / V / rollback; a symlinked `.socket/` dir.
-6. Hosted with a slow or stalled patch API since #581 (connect 10 s / read 60 s): does a stalled hosted tarball download during `yarn install` matter? (that's yarn's own network, so probably n/a)
+1. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows (Program Files; the runner is admin, so it needs a non-admin user). #437 (1.0.x) is still open.
+2. `vendor --check` / `repair` on a #591-shaped lock (dangling dependency).
+3. Windows directory junctions as `.socket/vendor/npm` (the #664 shape), via a probe.
+4. `yarn upgrade <pkg>` to a different version after vendoring (the block is re-keyed, not removed): does it hit #665's dead end?
+5. Same-size patched files on yarn ≤1.9 in-place installs: the mtime the service tarballs use can't be checked from the sandbox (patch hosts blocked).
+6. Re-run the v4-only project columns (#363, #364) on macOS/Windows once fixes land; re-check #558 / #519 / #467 / #627 / #664 / #665 once fixed.
 
 ## Known non-bugs
 
@@ -132,3 +137,6 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - **macOS probe harness:** the first TCP connects to a freshly started Python mock on a macOS runner stall for 10–30 s. Before #581 the first `scan -g` simply took ~35 s. Since #581's 10 s connect bound, those batches fail (`api_batch_failed` / "All N API batch queries failed", exit 1). This is a harness artifact: warm the mock with a `curl` loop before the first scan. Once warm, `-g` report / agent / vex pass on macOS.
 - Agent mode patches a `link:` / `yarn link` dependency's target directory, even outside the project. That's the code Node loads; whether to refuse it is a design question.
 - Leftover probe branches (deletion blocked): `bughunt/yarn-classic/20261003-global-rerun`, `bughunt/yarn-classic/20261003-macos-global`.
+- A symlinked `.socket/` or `.socket/vendor/npm` in a *single* project works consistently in vendored mode (writes and cleans up at the link target). Only a store shared between projects is #664.
+- `vex -o` is `--org`, not `--output`. Use `--output` in harnesses.
+- Hosted rollback after `yarn remove` of a patched package: pass (restores the remaining blocks, removes `.socket/`).

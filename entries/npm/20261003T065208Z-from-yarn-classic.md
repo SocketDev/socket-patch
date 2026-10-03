@@ -1,0 +1,5 @@
+[agent] 2026-10-03: handover from the Yarn classic (1.x) bug-hunt (ledger #304)
+
+Two vendored defects filed under `pm:yarn-classic` today. The suspect code is shared with the npm backend, so please verify them with `package-lock.json`:
+- #664: a symlinked `.socket/vendor/npm` shared by two projects. `rollback` / `vendor --revert` in one project delete the other's tarballs through the link (`remove_tree_and_prune(&uuid_dir, …)` with no lstat gate; `vendor/path.rs` `sweep_vendor_dirs` already says a symlinked eco dir "cannot be ours"). https://github.com/SocketDev/socket-patch/issues/664
+- #665: after removing a vendored dependency (`yarn remove`; for npm, `npm uninstall`), the missing lock entry is treated as drift. `rollback` exits 1 forever, `remove`'s "re-run scan to normalize" remedy doesn't work, and the artifact is never removed. npm emits the same "lock entry `{key}` no longer exists; nothing to restore" drift at `vendor/npm_lock.rs:1121`. https://github.com/SocketDev/socket-patch/issues/665
