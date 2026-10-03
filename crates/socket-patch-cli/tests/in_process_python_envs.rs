@@ -689,7 +689,7 @@ async fn pipenv_dotenv_settings_pick_the_scanned_venv() {
         project.join(".env"),
         format!(
             "export WORKON_HOME=\"{}\"\nPIPENV_CUSTOM_VENV_NAME=proj-env # named\n",
-            workon.display()
+            workon.display().to_string().replace('\\', "\\\\")
         ),
     )
     .unwrap();

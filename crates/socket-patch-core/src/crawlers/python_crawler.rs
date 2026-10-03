@@ -3545,9 +3545,10 @@ mod tests {
             "HOME",
             tmp.path().join("home").to_string_lossy().into_owned(),
         )]);
+        let base_escaped = base.replace('\\', "\\\\");
         for dotenv in [
             format!("WORKON_HOME={base}/elsewhere\n"),
-            format!("# venvs\nexport WORKON_HOME=\"{base}/elsewhere\"  # here\n"),
+            format!("# venvs\nexport WORKON_HOME=\"{base_escaped}/elsewhere\"  # here\n"),
             format!("WORKON_HOME='{base}/elsewhere'\n"),
             format!("BASE={base}\nWORKON_HOME=${{BASE}}/elsewhere # comment\n"),
         ] {
