@@ -1,6 +1,8 @@
 [agent] Progress ledger for the scheduled Cargo bug-hunt routine (label pm:cargo).
 
-Last updated: 2026-10-02 (run 10), main `045d7ec` (no cargo-specific code changes since `61cfb9b`; shared #555 lockfile-only apply skip regressed cargo cold caches as #616; #517 vex every-copy fix doesn't cover #339), CLI 4.0.0, latest release 4.0.0.
+Last updated: 2026-10-03 (run 11), main `045d7ec` (unchanged since run 10; no cargo-specific code changes since `61cfb9b`; shared #555 lockfile-only apply skip regressed cargo cold caches as #616 and silences the #338 non-cargo `vendor/` shape), CLI 4.0.0, latest release 4.0.0.
+
+Run 11 added these cells (Linux; not yet in the table): agent with a non-cargo `vendor/` dir: fail #338 (comment); agent `cargo vendor --versioned-dirs`: pass (1.93.1); `-g` with default `~/.cargo`: pass (stable); vendored multi-version with `rust-version.workspace = true`: fail #651; hosted on cargo 1.67.1: fail #653 (1.68.2 passes); stale `[[patch.unused]]` with `--locked`: pass on 1.56.1, 1.84.1 and 1.93.1.
 
 ## Coverage matrix
 
@@ -19,16 +21,15 @@ Cells marked (pre-v5) were last verified on `f6b7fb9` and need a re-check on v5.
 
 ## Backlog
 
-0. **Maintainer request (Linux done in run 3):** global `-g` mode on macOS and Windows across the Cargo majors: scan report, hosted refusal, apply, rollback and vex. The full checklist is in the 20261001T040000Z entry.
-1. The stale probe branches `bughunt/cargo/20260930-vendor-dir` and `bughunt/cargo/20260930-index-dirs` still exist. Deleting them failed through the git proxy in runs 1–5 and was blocked by the session permission policy in run 6, got a 403 again in run 7, and failed again in run 8 ("remote end hung up"). A maintainer needs to delete them. Until then, avoid new probe branches. (Runs 9 and 10: the delete was denied by the session permission policy.)
-2. Stale `[[patch.unused]]` left in `Cargo.lock` after a vendored revert/prune of a removed crate (seen in run 9 on 1.93.1, where `--locked` tolerates it): does `--locked` fail on 1.56 or 1.84, or does the next plain build dirty the lock?
-2b. Hosted with a `[patch]` override in `$CARGO_HOME/config.toml` or an ancestor config: same root cause as #480 (a sourceless lock block gets a `source` inserted), so only worth a live check once #480 is fixed.
-4. Vendored on old cargo (`+1.41` / `+1.45`) with a BOM/CRLF root manifest, plus v1/v2 lock re-encodes of the vendored workspace shape. Also vendored on Windows and macOS.
-5. Re-triage #387 and #339 live once cargo code changes on main. #339 was re-checked on `045d7ec` after #517 and still fails.
-5b. #616: a target-gated crate (`cfg(windows)` dependency on Linux) should stay a calm skip once the fix lands. Verify that.
-6. `-g` with a custom `CARGO_HOME` containing spaces passed in run 8. Remaining: default `~/.cargo` with `CARGO_HOME` unset, and the same on macOS/Windows.
+0. **Maintainer request (Linux done in runs 3 and 11):** global `-g` mode on macOS and Windows across the Cargo majors: scan report, hosted refusal, apply, rollback and vex. The full checklist is in the 20261001T040000Z entry.
+1. The stale probe branches `bughunt/cargo/20260930-vendor-dir` and `bughunt/cargo/20260930-index-dirs` still exist. Deleting them failed through the git proxy or was denied by policy in runs 1–10. A maintainer needs to delete them. Until then, avoid new probe branches.
+2. Hosted on cargo 1.68–1.81 (lock v3), between the sparse floor (#653) and the CI leg (1.82).
+2b. Hosted with a `[patch]` override in `$CARGO_HOME/config.toml` or an ancestor config: same root cause as #480, so only worth a live check once #480 is fixed.
+3. Vendored on old cargo (`+1.41` / `+1.45`) with a BOM/CRLF root manifest, plus v1/v2 lock re-encodes of the vendored workspace shape. Also vendored on Windows and macOS.
+4. Re-triage #387 and #339 live once cargo code changes on main.
+5. #616: a target-gated crate (`cfg(windows)` dependency on Linux) should stay a calm skip once the fix lands. Verify that.
+6. `-g` default `~/.cargo` on macOS and Windows (Linux passed in run 11).
 7. Maintainer call needed: a local agent scan patches registry-cache crates that the project's `Cargo.lock` doesn't contain, and `vex --product <project>` lists them (see Known non-bugs; #506 is the narrower, filed case).
-8. Old-toolchain hosted shapes: the harness's `pin_patched_versions` uses `cargo update -p name@ver`, which cargo 1.56 rejects. Use a lock written directly (or `name:ver`) to cover cargo < 1.58.
 
 ## Known non-bugs
 
@@ -57,3 +58,5 @@ Cells marked (pre-v5) were last verified on `f6b7fb9` and need a re-check on v5.
 - A hosted dependency spelled with a single-quoted literal (`cfg-if = '1.0.4'`) is refused loudly with `redirect_cargo_toml_dep_unrewritable` ("unsupported dependency-entry spelling"), with nothing rewritten. It's a loud limitation, like the dotted-key spelling (run 8).
 - Hosted `remove` in a mirror-only environment: the upstream restore always queries `index.crates.io` (or `SOCKET_CRATES_INDEX`) and doesn't follow `[source]` replacement. An unreachable index fails loudly with `hosted_revert_failed` and changes nothing, as documented (run 9).
 - `vendor -g` / `--revert -g` / `--check -g` exit 2 with `global_scope_unsupported` by design (#498/#499, run 9).
+- A stale `[[patch.unused]]` left in `Cargo.lock` after a `[patch]` entry is removed is tolerated by `--locked` on cargo 1.56.1, 1.84.1 and 1.93.1. The next plain build drops it, which is cargo normalising its own lock. Cosmetic (run 11).
+- An agent apply on a `cargo vendor --versioned-dirs` tree finds `vendor/<name>-<version>` correctly (run 11).
