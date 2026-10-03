@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Deno bug-hunt routine (label pm:deno).
 
-Last updated: 2026-10-03 (run 10), main `045d7ec`, latest release 4.0.0 (previous 3.3.0). Newest Deno is 2.9.7. #373 is fixed on main (#496) and verified on Linux, macOS and Windows. #603 (`_1` VEX) is still open and its fix PR #605 isn't merged. Which copy vex wrongly trusts depends on Deno's top-level link.
+Last updated: 2026-10-03 (run 11), main `045d7ec`, latest release 4.0.0 (previous 3.3.0). Newest Deno is 2.9.7. #373 is fixed on main (#496) and verified on Linux, macOS and Windows. #603 (`_1` VEX) still reproduces on main. Its unmerged fix PR #605 (`b92456b`) fixes the vex verdict in both directions on Linux 2.9.7 / 2.2.15, but not the rollback under-count.
 
 Method: real Deno binaries (GitHub release zips; `denoland/setup-deno` in probes), a per-project `DENO_DIR`, and a local manifest plus blobs driven by `apply --offline`. The patched bytes record themselves in `globalThis.__SP`, so `deno run` shows which patched modules actually loaded. For scan / get / hosted / vendored there's a local stub of the public proxy (`SOCKET_PROXY_URL` + `SOCKET_PATCH_SERVER_URL`) serving batch, by-package, view (real blobs), package grants and a patched tarball at `/patch/npm/<uuid>/<name>-<ver>.tgz`. Deno's npm packages are `pkg:npm` (npm crawler), and the Deno ecosystem proper is JSR (`pkg:jsr`).
 
@@ -20,9 +20,9 @@ Method: real Deno binaries (GitHub release zips; `denoland/setup-deno` in probes
 
 | Deno | copy-index peer variant `<name>@<ver>_1` of a direct dep | hashed mixed-case name `_<base32>@<ver>` | scoped transitive `@scope+name@ver` | isolated workspace (deno.json + package.json members) |
 | --- | --- | --- | --- | --- |
-| 1.46.3 | n/a (single copy) | pass on `045d7ec` | pass on `045d7ec` | untested |
-| 2.0.6 / 2.2.15 | apply: fail #373 on `61cfb9b`, fixed on main; VEX partial revert of `_1`: fail #603 (2.2.15) | untested | fail #373 on `61cfb9b` | untested |
-| 2.9.7 | apply / runtime / rollback / remove / `get --mode agent` / `scan --mode agent` / `scan --sync`: pass on `045d7ec`; VEX partial revert of either copy: fail #603 (order depends on the top-level link); rollback count with a mixed state under-reports (#603 comment) | pass on `045d7ec` | pass on `045d7ec` | pass |
+| 1.46.3 | n/a (single copy) | pass on `045d7ec` | pass on `045d7ec` | pass on `045d7ec` (run 11) |
+| 2.0.6 / 2.2.15 | apply: fail #373 on `61cfb9b`, fixed on main; VEX partial revert of `_1`: fail #603 (2.2.15), fixed by #605 head `b92456b` | untested | fail #373 on `61cfb9b` | 2.2.15: pass on `045d7ec` (run 11) |
+| 2.9.7 | apply / runtime / rollback / remove / `get --mode agent` / `scan --mode agent` / `scan --sync`: pass on `045d7ec`; VEX partial revert of either copy: fail #603 on main, pass on #605 head `b92456b`; rollback count with a mixed state under-reports (#603 comments, still there on #605) | pass on `045d7ec` | pass on `045d7ec` | pass (also wipe + reinstall vex, incremental `deno add`) |
 | macOS / Windows 2.2.15, 2.9.7 (probe) | apply / runtime / vex / rollback / frozen reinstall: pass on `045d7ec` | pass (case-insensitive FS) | — | untested |
 
 ### `nodeModulesLinker: "hoisted"` (Deno ≥ 2.8, needs `nodeModulesDir: manual`), agent mode
@@ -49,10 +49,10 @@ Other passes (Linux): `DENO_DIR` inside the project (`./.deno_cache`; never patc
 
 0. **Maintainer request (global mode), partly covered.** Filed #444 (still open on `045d7ec`, no fix PR). Still to do: an unwritable global prefix (read-only `DENO_INSTALL_ROOT` / `DENO_DIR`) on macOS / Windows, `rollback -g` after #444 is fixed, and `DENO_DIR` with spaces or unicode.
 1. A maintainer needs to delete the probe branches `bughunt/deno/20260930-deno-store`, `bughunt/deno/20261001-scoped-jsr`, `bughunt/deno/20261001-global`, `bughunt/deno/20261001-hoisted` and `bughunt/deno/20261003-store-xos`. The git proxy refuses `push --delete` (the remote hangs up).
-2. #603 once #605 lands: re-test the vex revert in both directions (root copy and `_1`) and the rollback counts for a mixed patched / pristine state.
+2. #603 once #605 lands: re-run the two-direction revert on main and close #603. Raise the rollback under-count (pristine root + patched `_1` reports `rolledBack: 0`) separately if it's still there (check npm/pnpm for a duplicate first).
 3. #406 follow-ups: pnpm-lock / yarn.lock / bun.lock beside deno.lock (check for duplicates of #406 first).
-4. JSR: `get` by GHSA / CVE through the stub (needs a search route), and hosted `get pkg:jsr/...` against the real proxy shape.
-5. `nodeModulesDir: none` on macOS / Windows (low value). Hoisted + `vendor: true` JSR is low value (it's just #374).
+4. Isolated workspace on macOS / Windows (probe), and the hashed mixed-case name on Linux 2.2.15.
+5. JSR: `get` by GHSA / CVE through the stub (needs a search route), and hosted `get pkg:jsr/...` against the real proxy shape. `nodeModulesDir: none` on macOS / Windows (low value).
 
 ## Known non-bugs
 
@@ -79,3 +79,5 @@ Other passes (Linux): `DENO_DIR` inside the project (`./.deno_cache`; never patc
 - The duplicate `applied` + `already_patched` events for one PURL in an isolated Deno workspace come from the member `node_modules/<dep>` symlink reaching the same file. Cosmetic.
 - SIGKILL / SIGTERM during `apply` leaves one `.socket-stage-*` file in the package dir that later runs never remove. This is generic to the atomic writer, harmless (never loaded), and SIGINT exits cleanly.
 - When a probe snapshots `node_modules/.deno` with `cp -R`, macOS reports "Directory loop detected" and Windows git-bash can't recreate junctions ("Only in …"). Those are probe artifacts. Judge rollback by its JSON and the runtime markers.
+- Deno 2.2.15 (not 2.9.7) leaves stale `.deno/<name>@<old>` dirs after a version change. A patched orphan copy keeps `vex` attesting `not_affected` for a version the product no longer loads. That's harmless, because the vulnerable component isn't present either.
+- `apply -e deno` in a project with only `npm:` deps is a clean no-op: those deps are the npm ecosystem, and `-e npm` patches them.
