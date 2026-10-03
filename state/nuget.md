@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled NuGet / dotnet bug-hunt routine (label pm:nuget).
 
-Last run: 2026-10-02 23:50 UTC, main `045d7ec`, release v4.0.0.
+Last run: 2026-10-03 UTC, main `045d7ec`, release v4.0.0.
 
 ## Coverage matrix
 
@@ -33,6 +33,10 @@ BOM `packages.lock.json`, Linux 8: hosted fail #623 (exit 0, nothing wired), ven
 
 Hosted unwind (`remove`, `rollback <purl>`, hosted → `vendor` takeover → `vendor --revert`), Linux 8: fail #624 (lock gets the catalog `packageHash`, NU1403 on every restore; since `de316b4`). Config side is byte-exact for LF / CRLF / BOM. Vendored `remove`/`rollback` with a lowercase purl: `not_found` (the inverse of #553; commented there).
 
+Symlinked `nuget.config` / `packages.lock.json` (Linux 8): hosted pass (refuses); vendored fail, see the #627 comment (link replaced, revert never restores it; v4.0.0 too).
+
+Also passed on Linux 8 (2026-10-03): RID lock sections, custom source key + `<clear />`, an existing `Newtonsoft.*` prefix mapping, lowercase `Include`, hosted/vendored re-run idempotency, `--dry-run` (no writes), space/unicode/`&` paths, CPM `VersionOverride`, hosted `remove`/`rollback --offline` (loud refusal, nothing written), and concurrent scans (`lock_held`).
+
 Project-mode agent scan (no `-g`) patches unrelated cached packages and VEX attests them: fail #427 (Linux 8; v4.0.0 too).
 
 ### Global mode (`-g`)
@@ -57,7 +61,7 @@ Also passed on Linux 8: `SOCKET_GLOBAL=1`, `SOCKET_GLOBAL_PREFIX`, `--global-pre
 
 ## Backlog
 
-0. #624 follow-ups: an unsigned-package hash path and the `--offline` refusal; #623 on Windows with a PowerShell-written lock.
+0. #624 follow-up: an unsigned-package hash path; #623 on Windows with a PowerShell-written lock. (`--offline` refusal: done, pass.)
 1. #553's case sensitivity in `vex` (no `--package` flag exists; check `vex` output purls) and `list`.
 2. #585 follow-ups: a real `<packageSourceMapping>` placed after a commented one (expect NU1403 with a lock), plus hosted revert after a hand-fixed config.
 3. #489 / #462 / #353 / #354 on macOS / Windows and SDK 6/9/10 (probe harness: `scratch_serve` + `SCRATCH_SCRIPT`; vendored legs need `--vendor-source service --patch-server-url`; hosted unwind probes must sed the feed URL to `https://patch.socket.dev`). Local SDK installs beyond apt 8.0 are blocked (dotnet-install 403), so this needs a probe branch.
@@ -65,7 +69,8 @@ Also passed on Linux 8: `SOCKET_GLOBAL=1`, `SOCKET_GLOBAL_PREFIX`, `--global-pre
 5. Mapping edge cases: a case-variant exact id, and two Socket patches for different ids.
 6. Vendored/hosted with packages.config (windows-latest probe with nuget.exe).
 7. #427 on macOS / Windows; unicode / space paths and Windows long paths.
-8. Probe-branch cleanup: deleting branches is blocked from the sandbox, so 5 `bughunt/nuget/*` branches are still on the remote and need a maintainer.
+8. Probe-branch cleanup: deleting branches is still blocked from the sandbox (denied again 2026-10-03), so 5 `bughunt/nuget/*` branches are still on the remote and need a maintainer. No new probe branches until then.
+9. Interrupted (SIGKILL) vendored run, then `repair`; local tools in agent mode.
 
 Also passed on Linux 8 (no issue): vendored with a BOM + CRLF `NuGet.Config` (+ byte-exact revert), multi-TFM + `RestoreLockedMode`, a transitive-only patched package, and `rollback -g` alone from a v5 vendored project (no manifest → refused, nothing touched).
 
@@ -88,3 +93,6 @@ Also passed on Linux 8 (no issue): vendored with a BOM + CRLF `NuGet.Config` (+ 
 - `scan --mode hosted` over a vendored NuGet project doesn't take over (`takeover_capable` = cargo/npm/golang): `redirected: 0`, `already: 1`, and it stays vendored and patched. Not a bug. On an autocrlf checkout, a later revert hits #537.
 - #486's shared-store guard (PDM cache, pnpm GVS) doesn't cover `~/.nuget/packages`. NuGet agent mode patches the global packages folder by design, so that's not a bug.
 - A version bump after vendoring/hosting fails NU1102: the exclusive id-level `packageSourceMapping` routes the id only to a feed holding the patched version. This is a design limitation; unwind first.
+- Hosted `remove --offline` hint names only `nuget.config` though `packages.lock.json` is also rewired. A wording nit, not filed.
+- A `<packageSourceMapping>` key with different case from its `<add key>`, or a duplicate `<packageSources>` section: plain `dotnet restore` fails before socket-patch runs. Invalid fixtures.
+- Standalone `vex` after a hosted scan on a warm, unpatched store says `not_applied`. That's correct: the installed bytes are pristine (#352 shape).
