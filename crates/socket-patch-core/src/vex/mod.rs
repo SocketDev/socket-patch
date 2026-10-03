@@ -36,8 +36,8 @@ pub use schema::{
     OPENVEX_CONTEXT_V0_2_0,
 };
 pub use verify::{
-    applied_patches, applied_patches_with_vendor, FailedPatch, HostedCopies, PackageCopies,
-    VendorContext, VerifyOutcome,
+    applied_patches, applied_patches_with_copies, applied_patches_with_vendor, FailedPatch,
+    HostedCopies, VendorContext, VerifyOutcome,
 };
 
 #[cfg(test)]

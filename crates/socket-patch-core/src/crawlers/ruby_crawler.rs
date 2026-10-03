@@ -952,23 +952,45 @@ pub async fn bundler_loaded_manifest(root: &Path) -> crate::formats::gem::manife
         root,
         std::env::var_os("BUNDLE_GEMFILE").as_deref(),
         std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+        bundler_ignores_config(),
     )
     .await
 }
 
 /// [`bundler_loaded_manifest`] with the environment passed explicitly (hermetic
-/// tests).
+/// tests). `ignore_config` is [`bundler_ignores_config`].
 pub async fn bundler_loaded_manifest_with_env(
     root: &Path,
     gemfile_env: Option<&OsStr>,
     app_config_env: Option<&OsStr>,
+    ignore_config: bool,
 ) -> crate::formats::gem::manifest::LoadedManifest {
-    let config = bundler_app_config_dir(root, app_config_env).join("config");
-    let config_value = crate::utils::fs::read_regular_to_string(&config)
+    let config_value = read_app_config(root, app_config_env, ignore_config)
         .await
-        .ok()
         .and_then(|text| crate::formats::gem::manifest::config_gemfile(&text));
     crate::formats::gem::manifest::classify(root, gemfile_env, config_value.as_deref())
+}
+
+/// Whether bundler skips its config files: `Bundler::Settings#ignore_config?`
+/// is `ENV["BUNDLE_IGNORE_CONFIG"]`, so any value set (even an empty one)
+/// switches them off and every setting comes from the environment alone.
+pub(crate) fn bundler_ignores_config() -> bool {
+    std::env::var_os("BUNDLE_IGNORE_CONFIG").is_some()
+}
+
+/// The app config file's text (`$BUNDLE_APP_CONFIG/config`, else
+/// `<root>/.bundle/config`), or `None` when it is missing, unreadable, or
+/// `ignore_config` is set — bundler's `load_config` then returns `{}`.
+async fn read_app_config(
+    root: &Path,
+    app_config_env: Option<&OsStr>,
+    ignore_config: bool,
+) -> Option<String> {
+    if ignore_config {
+        return None;
+    }
+    let config = bundler_app_config_dir(root, app_config_env).join("config");
+    crate::utils::fs::read_regular_to_string(&config).await.ok()
 }
 
 /// Bundler's app-config dir for `root`, following `Bundler.app_config_path`
@@ -986,6 +1008,50 @@ pub(crate) fn bundler_app_config_dir(root: &Path, env_value: Option<&OsStr>) -> 
             }
         }
         _ => root.join(".bundle"),
+    }
+}
+
+/// Bundler's app cache dir for `root` — where `bundle cache` writes and
+/// `bundle install` installs from in preference to fetching
+/// (`Bundler.app_cache`: `<root>/<cache_path>`, default `vendor/cache`).
+/// Reads the ambient `BUNDLE_CACHE_PATH` / `BUNDLE_APP_CONFIG`.
+pub async fn bundler_app_cache_dir(root: &Path) -> PathBuf {
+    bundler_app_cache_dir_with_env(
+        root,
+        std::env::var_os("BUNDLE_CACHE_PATH").as_deref(),
+        std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+        bundler_ignores_config(),
+    )
+    .await
+}
+
+/// [`bundler_app_cache_dir`] with the environment passed explicitly
+/// (hermetic tests). The `cache_path` setting follows `Bundler::Settings`
+/// priority like every other key: the app config file's
+/// `BUNDLE_CACHE_PATH:` (`bundle config set --local cache_path …`) first,
+/// then the `BUNDLE_CACHE_PATH` environment variable. A relative value is
+/// read against the project root; an absolute one stands alone (bundler
+/// `Pathname#join`s it onto the root). The result is only ever READ (a
+/// committed archive is hashed and named in a warning), so unlike a
+/// config-sourced `BUNDLE_PATH` it needs no containment: a value that
+/// points outside the project names exactly the file bundler installs from.
+/// With `ignore_config` ([`bundler_ignores_config`]) the file is skipped and
+/// only the environment and the default count.
+pub async fn bundler_app_cache_dir_with_env(
+    root: &Path,
+    cache_env: Option<&OsStr>,
+    app_config_env: Option<&OsStr>,
+    ignore_config: bool,
+) -> PathBuf {
+    let configured = read_app_config(root, app_config_env, ignore_config)
+        .await
+        .and_then(|text| bundle_config_setting(&text, "BUNDLE_CACHE_PATH"))
+        .map(PathBuf::from)
+        .or_else(|| cache_env.filter(|v| !v.is_empty()).map(PathBuf::from));
+    match configured {
+        // Component-wise, so `vendor/gems` uses the native separator.
+        Some(value) => root.join(normalize_lexically(&value).unwrap_or(value)),
+        None => root.join("vendor").join("cache"),
     }
 }
 
@@ -1095,6 +1161,22 @@ fn parse_bundle_config_path(contents: &str) -> Option<String> {
     }
 }
 
+/// The effective `<key>:` value of a bundler app config file (flat YAML
+/// that bundler writes itself, `---\nBUNDLE_GEMFILE: "Gemfile.next"\n`):
+/// the last entry for the exact key wins, quotes are unwrapped, and an
+/// empty value counts as unset. The colon must follow the key directly, so
+/// `BUNDLE_PATH__SYSTEM:` never matches `BUNDLE_PATH`.
+pub(crate) fn bundle_config_setting(contents: &str, key: &str) -> Option<String> {
+    let mut found = None;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix(key).and_then(|r| r.strip_prefix(':')) {
+            let v = unquote_bundle_config_value(rest);
+            found = (!v.is_empty()).then(|| v.to_string());
+        }
+    }
+    found
+}
+
 /// Unwrap one bundler app-config scalar: trim, then strip one matching
 /// pair of double or single quotes (bundler double-quotes what it writes).
 pub(crate) fn unquote_bundle_config_value(rest: &str) -> &str {
@@ -1133,7 +1215,7 @@ mod tests {
             "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n",
         )
         .unwrap();
-        let m = bundler_loaded_manifest_with_env(dir.path(), None, None).await;
+        let m = bundler_loaded_manifest_with_env(dir.path(), None, None, false).await;
         assert!(matches!(
             m,
             crate::formats::gem::manifest::LoadedManifest::Unsupported {
@@ -1146,9 +1228,124 @@ mod tests {
             dir.path(),
             None,
             Some(std::ffi::OsStr::new("elsewhere")),
+            false,
         )
         .await;
         assert_eq!(m, crate::formats::gem::manifest::LoadedManifest::Default);
+        // BUNDLE_IGNORE_CONFIG: bundler reads no config file at all.
+        let m = bundler_loaded_manifest_with_env(dir.path(), None, None, true).await;
+        assert_eq!(m, crate::formats::gem::manifest::LoadedManifest::Default);
+    }
+
+    /// #507: a committed `bundle config set --local gemfile Gemfile.next`
+    /// beats an exported `BUNDLE_GEMFILE=Gemfile`, as in bundler, so the run
+    /// refuses instead of wiring the `Gemfile` bundler ignores.
+    #[tokio::test]
+    async fn loaded_manifest_app_config_beats_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".bundle")).unwrap();
+        std::fs::write(
+            dir.path().join(".bundle/config"),
+            "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n",
+        )
+        .unwrap();
+        let m = bundler_loaded_manifest_with_env(
+            dir.path(),
+            Some(std::ffi::OsStr::new("Gemfile")),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            m,
+            crate::formats::gem::manifest::LoadedManifest::Unsupported {
+                value: "Gemfile.next".into(),
+                by: crate::formats::gem::manifest::GemfileSetting::AppConfig,
+            }
+        );
+    }
+
+    /// #483: bundler's cache dir is the `cache_path` setting — the app
+    /// config value first, then `BUNDLE_CACHE_PATH`, else `vendor/cache`.
+    #[tokio::test]
+    async fn app_cache_dir_follows_bundler_settings_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let default = root.join("vendor").join("cache");
+        assert_eq!(
+            bundler_app_cache_dir_with_env(root, None, None, false).await,
+            default
+        );
+        // The environment alone moves it.
+        let env = std::ffi::OsStr::new("vendor/env-gems");
+        assert_eq!(
+            bundler_app_cache_dir_with_env(root, Some(env), None, false).await,
+            root.join("vendor").join("env-gems")
+        );
+        // An empty value is unset.
+        assert_eq!(
+            bundler_app_cache_dir_with_env(root, Some(std::ffi::OsStr::new("")), None, false).await,
+            default
+        );
+        // `bundle config set --local cache_path vendor/gems` outranks it.
+        std::fs::create_dir(root.join(".bundle")).unwrap();
+        std::fs::write(
+            root.join(".bundle/config"),
+            "---\nBUNDLE_PATH: \"vendor/bundle\"\nBUNDLE_CACHE_PATH: \"vendor/gems\"\n",
+        )
+        .unwrap();
+        let configured = root.join("vendor").join("gems");
+        assert_eq!(
+            bundler_app_cache_dir_with_env(root, None, None, false).await,
+            configured
+        );
+        assert_eq!(
+            bundler_app_cache_dir_with_env(root, Some(env), None, false).await,
+            configured
+        );
+        // BUNDLE_APP_CONFIG moves the config file: the env value applies.
+        assert_eq!(
+            bundler_app_cache_dir_with_env(
+                root,
+                Some(env),
+                Some(std::ffi::OsStr::new("elsewhere")),
+                false,
+            )
+            .await,
+            root.join("vendor").join("env-gems")
+        );
+        // BUNDLE_IGNORE_CONFIG skips the file: the env value, else the default.
+        assert_eq!(
+            bundler_app_cache_dir_with_env(root, Some(env), None, true).await,
+            root.join("vendor").join("env-gems")
+        );
+        assert_eq!(
+            bundler_app_cache_dir_with_env(root, None, None, true).await,
+            default
+        );
+        // An absolute value stands alone.
+        let abs = root.join("shared-cache");
+        std::fs::write(
+            root.join(".bundle/config"),
+            format!("---\nBUNDLE_CACHE_PATH: \"{}\"\n", abs.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            bundler_app_cache_dir_with_env(root, None, None, false).await,
+            abs
+        );
+    }
+
+    #[test]
+    fn bundle_config_setting_matches_the_exact_key() {
+        let text = "---\nBUNDLE_PATH__SYSTEM: \"true\"\nBUNDLE_PATH: 'vendor/bundle'\n\
+                    BUNDLE_CACHE_PATH: \"\"\n";
+        assert_eq!(
+            bundle_config_setting(text, "BUNDLE_PATH"),
+            Some("vendor/bundle".into())
+        );
+        assert_eq!(bundle_config_setting(text, "BUNDLE_CACHE_PATH"), None);
+        assert_eq!(bundle_config_setting(text, "BUNDLE_GEMFILE"), None);
     }
 
     #[test]

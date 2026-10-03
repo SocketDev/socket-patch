@@ -338,6 +338,10 @@ pub struct RestoreOutcome {
     pub reverted_files: Vec<String>,
     /// Advisory `(code, detail)` pairs.
     pub warnings: Vec<(&'static str, String)>,
+    /// The new text of each root-relative text file the restore rewrote (or
+    /// would, on a dry run); `None` for a file it removed. Lets a caller
+    /// evaluate the restored project before anything is written.
+    pub staged_text: BTreeMap<String, Option<String>>,
     /// A write failure after every pin resolved: some files may have
     /// landed. `None` on a clean flush (and always on a dry run).
     pub flush_error: Option<String>,
@@ -654,6 +658,7 @@ pub async fn restore_upstream(
         pins: pins_out,
         reverted_files: reverted_files.into_iter().collect(),
         warnings: result.warnings,
+        staged_text: changed,
         flush_error,
     }
 }

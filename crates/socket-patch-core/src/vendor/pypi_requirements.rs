@@ -85,7 +85,8 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, b
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        if spec_no_ws == format!("=={version}") {
+        // pip resolves `==` under PEP 440 (`==1.16` installs 1.16.0).
+        if crate::utils::pep440::is_exact_pin_of(&spec_no_ws, version) {
             exact.push((ll.start, ll.physical.len(), req.marker, req.hashed));
         } else {
             found_range = true;
@@ -683,7 +684,7 @@ pub async fn requirements_include_names(root: &Path) -> std::io::Result<Vec<Stri
 
 /// A root-relative requirements path that stays inside the project root
 /// (not `../…`, not absolute) — the only files the planner may edit.
-fn is_in_root_rel(rel: &str) -> bool {
+pub(crate) fn is_in_root_rel(rel: &str) -> bool {
     !rel.starts_with("../") && !Path::new(rel).is_absolute()
 }
 
@@ -711,24 +712,7 @@ async fn walk_requirements_tree<E>(
         // Parse the includes BEFORE handing the content over (the visitor
         // takes it by value); nothing is pushed unless it asks to descend.
         let includes: Vec<String> = match &read {
-            Ok(content) => {
-                let include_dir = match rel.rfind('/') {
-                    Some(i) => rel[..i].to_string(),
-                    None => String::new(),
-                };
-                logical_lines(content)
-                    .iter()
-                    .filter_map(|ll| include_target(&ll.text))
-                    .map(|target| {
-                        let joined = if include_dir.is_empty() {
-                            target.to_string()
-                        } else {
-                            format!("{include_dir}/{target}")
-                        };
-                        normalize_rel_path(&joined)
-                    })
-                    .collect()
-            }
+            Ok(content) => requirements_includes(&rel, content),
             Err(_) => Vec::new(),
         };
         if visit(&rel, &path, read)? {
@@ -738,6 +722,30 @@ async fn walk_requirements_tree<E>(
         }
     }
     Ok(())
+}
+
+/// The `-r`/`--requirement` includes of the requirements file `rel`
+/// (root-relative) with `content`, in file order: each target resolved
+/// against the INCLUDING file's directory and lexically normalized
+/// (`requirements/../x.txt` → `x.txt`; an escape keeps its `../`). The one
+/// include grammar behind the planner's walk and the lock inventory's.
+pub(crate) fn requirements_includes(rel: &str, content: &str) -> Vec<String> {
+    let include_dir = match rel.rfind('/') {
+        Some(i) => &rel[..i],
+        None => "",
+    };
+    logical_lines(content)
+        .iter()
+        .filter_map(|ll| include_target(&ll.text))
+        .map(|target| {
+            let joined = if include_dir.is_empty() {
+                target.to_string()
+            } else {
+                format!("{include_dir}/{target}")
+            };
+            normalize_rel_path(&joined)
+        })
+        .collect()
 }
 
 /// The `-r`/`--requirement` include target of a logical line, if any.
@@ -1004,6 +1012,22 @@ mod tests {
             find_pin("six == 1.16.0\n", "six", "1.16.0"),
             PinSearch::Exact { .. }
         ));
+        // #475: pip selects the pinned release under PEP 440, so these
+        // spellings all pin exactly 1.16.0.
+        for pin in [
+            "six==1.16\n",
+            "six==1.16.0.0\n",
+            "Six==01.16.0\n",
+            "six == 1.16\n",
+        ] {
+            assert!(
+                matches!(find_pin(pin, "six", "1.16.0"), PinSearch::Exact { .. }),
+                "{pin}"
+            );
+        }
+        // Arbitrary equality is string equality; a wildcard is a range.
+        assert_eq!(find_pin("six===1.16\n", "six", "1.16.0"), PinSearch::Range);
+        assert_eq!(find_pin("six==1.16.*\n", "six", "1.16.0"), PinSearch::Range);
         // PEP 503 name canonicalization on both sides.
         assert!(matches!(
             find_pin("Six_Pkg==1.0\n", "six-pkg", "1.0"),

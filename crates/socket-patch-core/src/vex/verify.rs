@@ -124,26 +124,6 @@ pub async fn applied_patches(
     applied_patches_with_vendor(manifest, package_paths, None).await
 }
 
-/// The installed copies [`applied_patches_with_vendor`] judges, per purl:
-/// one path per purl (`HashMap<String, PathBuf>`) or every copy found
-/// (`HashMap<String, Vec<PathBuf>>`).
-pub trait PackageCopies {
-    /// The copies of `purl`, in lookup order (empty when none).
-    fn copies_of(&self, purl: &str) -> &[PathBuf];
-}
-
-impl PackageCopies for HashMap<String, PathBuf> {
-    fn copies_of(&self, purl: &str) -> &[PathBuf] {
-        self.get(purl).map(std::slice::from_ref).unwrap_or_default()
-    }
-}
-
-impl PackageCopies for HashMap<String, Vec<PathBuf>> {
-    fn copies_of(&self, purl: &str) -> &[PathBuf] {
-        self.get(purl).map(Vec::as_slice).unwrap_or_default()
-    }
-}
-
 /// [`applied_patches`] with vendored-patch awareness.
 ///
 /// Per-PURL precedence:
@@ -162,14 +142,43 @@ impl PackageCopies for HashMap<String, Vec<PathBuf>> {
 /// 3. A `hosted` entry verifies exactly the copies the hosted build consumes
 ///    ([`HostedCopies`]) — no fallback to `package_paths` either, whose
 ///    representative may be the pristine sibling the build never reads.
-/// 4. Otherwise the installed tree: the first copy of `package_copies`,
-///    except for Maven, where EVERY copy listed (`~/.m2` and each Gradle
-///    cache, version dirs expanded into their hash dirs) is re-hashed and
-///    must verify — the caller lists only the copies some build consumes.
-///    The failing Maven copies land in [`VerifyOutcome::unpatched_copies`].
+/// 4. Otherwise the installed tree, judged as [`applied_patches_with_copies`]
+///    judges it.
+///
+/// `package_paths` carries ONE representative copy per PURL; see
+/// [`applied_patches_with_copies`] for the every-copy form `vex` uses.
 pub async fn applied_patches_with_vendor(
     manifest: &PatchManifest,
-    package_copies: &impl PackageCopies,
+    package_paths: &HashMap<String, PathBuf>,
+    vendor: Option<&VendorContext>,
+) -> VerifyOutcome {
+    let copies: HashMap<String, Vec<PathBuf>> = package_paths
+        .iter()
+        .map(|(purl, path)| (purl.clone(), vec![path.clone()]))
+        .collect();
+    applied_patches_with_copies(manifest, &copies, vendor).await
+}
+
+/// [`applied_patches_with_vendor`] over EVERY installed copy the crawler
+/// found per PURL (crawl order), not one representative.
+///
+/// `apply` patches every physical copy (npm nests genuine duplicates of one
+/// `name@version`), and any copy may be the one some dependent loads — so an
+/// installed-tree record is applied only when EVERY copy verifies; the
+/// first failing copy's tag wins, exactly like [`HostedCopies`]. Judging the
+/// first copy alone would attest `not_affected` while a later install's
+/// fresh, unpatched nested copy runs. An empty copy list is
+/// `package_not_found`. The vendored drift probe likewise flags the PURL
+/// when ANY installed copy is out of sync.
+///
+/// Maven: a copy is the `~/.m2` version dir or a Gradle `files-2.1`
+/// version dir (expanded into its hash dirs), and a member-keyed record is
+/// checked against the jar's members. Every failing Maven copy (not just
+/// the first) lands in [`VerifyOutcome::unpatched_copies`] — the caller
+/// lists only the copies some build consumes.
+pub async fn applied_patches_with_copies(
+    manifest: &PatchManifest,
+    package_copies: &HashMap<String, Vec<PathBuf>>,
     vendor: Option<&VendorContext>,
 ) -> VerifyOutcome {
     let mut out = VerifyOutcome::default();
@@ -177,17 +186,16 @@ pub async fn applied_patches_with_vendor(
     for (purl, record) in &manifest.patches {
         let vendor_entry =
             vendor.and_then(|ctx| lookup_entry(&ctx.entries, purl).map(|e| (ctx, e)));
-        let copies = Some(package_copies.copies_of(purl)).filter(|c| !c.is_empty());
         let result = if let Some((ctx, entry)) = vendor_entry {
             verify_vendored_patch_record(&ctx.project_root, entry, record).await
         } else if let Some(copy_dir) = vendor.and_then(|ctx| ctx.go_patches.get(purl)) {
             verify_patch_record(copy_dir, record).await
         } else if let Some(copies) = vendor.and_then(|ctx| ctx.hosted.get(purl)) {
             verify_hosted_copies(purl, copies, record).await
-        } else if let Some(copies) = copies {
+        } else if let Some(paths) = package_copies.get(purl).filter(|p| !p.is_empty()) {
             if purl.starts_with("pkg:maven/") {
                 let mut first_failure = None;
-                for copy in copies {
+                for copy in paths {
                     if let Err(reason) = verify_patch_record_for(purl, copy, record).await {
                         out.unpatched_copies.push((purl.clone(), copy.clone()));
                         first_failure.get_or_insert(reason);
@@ -195,7 +203,7 @@ pub async fn applied_patches_with_vendor(
                 }
                 first_failure.map_or(Ok(()), Err)
             } else {
-                verify_patch_record_for(purl, &copies[0], record).await
+                verify_every_copy(paths, record).await
             }
         } else {
             Err("package_not_found".to_string())
@@ -228,10 +236,13 @@ pub async fn applied_patches_with_vendor(
                     // pristine sibling the build never reads.
                     let go_cache_copy = purl.starts_with("pkg:golang/");
                     let installed = package_copies
-                        .copies_of(purl)
+                        .get(purl)
+                        .filter(|_| !go_cache_copy)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
                         .iter()
-                        .find(|p| !crate::crawlers::gradle_cache::is_gradle_version_dir(p));
-                    if let Some(pkg_path) = installed.filter(|_| !go_cache_copy) {
+                        .filter(|p| !crate::crawlers::gradle_cache::is_gradle_version_dir(p));
+                    for pkg_path in installed {
                         let in_sync = if is_vlt_dir_entry(entry) {
                             vlt_installed_copy_matches(&ctx.project_root, pkg_path, entry, record)
                                 .await
@@ -242,6 +253,7 @@ pub async fn applied_patches_with_vendor(
                         };
                         if !in_sync {
                             out.vendored_out_of_sync.push(purl.clone());
+                            break;
                         }
                     }
                 }
@@ -425,6 +437,15 @@ fn judge_installed_files(pkg_path: &Path, files: &[(String, String)]) -> Install
     }
 }
 
+/// Every copy must pass [`verify_patch_record`]; the first failure's tag
+/// wins. The caller guarantees `paths` is non-empty.
+async fn verify_every_copy(paths: &[PathBuf], record: &PatchRecord) -> Result<(), String> {
+    for path in paths {
+        verify_patch_record(path, record).await?;
+    }
+    Ok(())
+}
+
 /// [`HostedCopies`] verdict: no consumed copy is `package_not_found`; every
 /// listed copy must pass [`verify_patch_record`] (under the maven file
 /// rename, when set — a Gradle version dir expanded into its hash dirs),
@@ -457,10 +478,7 @@ async fn verify_hosted_copies(
         }
         None => record,
     };
-    for path in &copies.paths {
-        verify_patch_record(path, record).await?;
-    }
-    Ok(())
+    verify_every_copy(&copies.paths, record).await
 }
 
 /// Whether `rest` (what follows a matched `from` prefix) starts a new name
@@ -497,7 +515,10 @@ fn rename_record_files(record: &PatchRecord, from: &str, to: &str) -> PatchRecor
                 Some(name) => ("package/", name),
                 None => ("", key.as_str()),
             };
-            (format!("{prefix}{}", rename_leaf(name, from, to)), info.clone())
+            (
+                format!("{prefix}{}", rename_leaf(name, from, to)),
+                info.clone(),
+            )
         })
         .collect();
     renamed
@@ -550,6 +571,67 @@ mod tests {
         let out = applied_patches(&manifest, &paths).await;
         assert_eq!(out.applied, vec!["pkg:npm/x@1.0.0".to_string()]);
         assert!(out.failed.is_empty());
+    }
+
+    /// Two nested copies of one `name@version`: `(dir, bytes)` each.
+    async fn two_copies(a: &[u8], b: &[u8]) -> (tempfile::TempDir, Vec<PathBuf>) {
+        let root = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for (i, bytes) in [a, b].into_iter().enumerate() {
+            let dir = root.path().join(format!("copy{i}"));
+            tokio::fs::create_dir_all(&dir).await.unwrap();
+            tokio::fs::write(dir.join("index.js"), bytes).await.unwrap();
+            paths.push(dir);
+        }
+        (root, paths)
+    }
+
+    /// Regression (#516): an installed-tree record verifies only when EVERY
+    /// copy does, whichever copy the crawler met first; the unpatched
+    /// copy's tag is reported.
+    #[tokio::test]
+    async fn every_installed_copy_must_verify() {
+        let patched = b"patched-content";
+        let pristine = b"pristine-content";
+        let hash = compute_git_sha256_from_bytes(patched);
+        let mut record = record_with_one_file(&hash);
+        record.files.get_mut("index.js").unwrap().before_hash =
+            compute_git_sha256_from_bytes(pristine);
+        let mut manifest = PatchManifest::new();
+        manifest
+            .patches
+            .insert("pkg:npm/x@1.0.0".to_string(), record);
+
+        for (a, b) in [(&patched[..], &pristine[..]), (&pristine[..], &patched[..])] {
+            let (_root, paths) = two_copies(a, b).await;
+            let copies = HashMap::from([("pkg:npm/x@1.0.0".to_string(), paths)]);
+            let out = applied_patches_with_copies(&manifest, &copies, None).await;
+            assert!(
+                out.applied.is_empty(),
+                "a pristine copy must block attestation"
+            );
+            assert_eq!(out.failed[0].reason, "not_applied");
+        }
+
+        let (_root, paths) = two_copies(patched, patched).await;
+        let copies = HashMap::from([("pkg:npm/x@1.0.0".to_string(), paths)]);
+        let out = applied_patches_with_copies(&manifest, &copies, None).await;
+        assert_eq!(out.applied, vec!["pkg:npm/x@1.0.0".to_string()]);
+        assert!(out.failed.is_empty());
+    }
+
+    /// An empty copy list is `package_not_found`, never a vacuous pass.
+    #[tokio::test]
+    async fn empty_copy_list_is_package_not_found() {
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.0".to_string(),
+            record_with_one_file("deadbeef"),
+        );
+        let copies = HashMap::from([("pkg:npm/x@1.0.0".to_string(), Vec::new())]);
+        let out = applied_patches_with_copies(&manifest, &copies, None).await;
+        assert!(out.applied.is_empty());
+        assert_eq!(out.failed[0].reason, "package_not_found");
     }
 
     #[tokio::test]
@@ -1392,7 +1474,7 @@ mod tests {
             .await
             .unwrap();
         let copies = HashMap::from([(purl.to_string(), vec![version.clone()])]);
-        let out = applied_patches_with_vendor(&manifest, &copies, Some(&ctx)).await;
+        let out = applied_patches_with_copies(&manifest, &copies, Some(&ctx)).await;
         assert_eq!(out.vendored, vec![purl.to_string()]);
         assert!(out.vendored_out_of_sync.is_empty(), "{out:?}");
 
@@ -1402,7 +1484,7 @@ mod tests {
             .await
             .unwrap();
         let copies = HashMap::from([(purl.to_string(), vec![version, m2])]);
-        let out = applied_patches_with_vendor(&manifest, &copies, Some(&ctx)).await;
+        let out = applied_patches_with_copies(&manifest, &copies, Some(&ctx)).await;
         assert_eq!(out.vendored_out_of_sync, vec![purl.to_string()]);
     }
 
@@ -1516,6 +1598,67 @@ mod tests {
         // Disclosure: the live tree is present and pristine-unpatched — the
         // attestation stands (committed artifact is the product) but the
         // drift must be reported so the CLI can advise a re-install.
+        assert_eq!(out.vendored_out_of_sync, vec![purl.to_string()]);
+    }
+
+    /// Drift disclosure covers EVERY installed copy: a first copy in sync
+    /// must not hide an out-of-sync second one (#516).
+    #[tokio::test]
+    async fn vendored_drift_probe_checks_every_installed_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let purl = "pkg:cargo/serde@1.0.0";
+        let rel = format!(".socket/vendor/cargo/{VUUID}/serde-1.0.0");
+        let original = b"original-unpatched";
+        let patched = b"patched-content";
+        let before = compute_git_sha256_from_bytes(original);
+        let after = compute_git_sha256_from_bytes(patched);
+
+        let vdir = root.path().join(&rel);
+        tokio::fs::create_dir_all(&vdir).await.unwrap();
+        tokio::fs::write(vdir.join("index.js"), patched)
+            .await
+            .unwrap();
+        let mut installed = Vec::new();
+        for (name, bytes) in [("in-sync", &patched[..]), ("drifted", &original[..])] {
+            let dir = root.path().join(name);
+            tokio::fs::create_dir_all(&dir).await.unwrap();
+            tokio::fs::write(dir.join("index.js"), bytes).await.unwrap();
+            installed.push(dir);
+        }
+
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash: before,
+                after_hash: after,
+            },
+        );
+        let rec = PatchRecord {
+            uuid: VUUID.to_string(),
+            exported_at: String::new(),
+            files,
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        };
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(purl.to_string(), rec);
+
+        let mut entries = HashMap::new();
+        entries.insert(purl.to_string(), vendor_entry(purl, &rel));
+        let ctx = VendorContext {
+            project_root: root.path().to_path_buf(),
+            entries,
+            go_patches: HashMap::new(),
+            hosted: HashMap::new(),
+        };
+        let copies = HashMap::from([(purl.to_string(), installed)]);
+
+        let out = applied_patches_with_copies(&manifest, &copies, Some(&ctx)).await;
+        assert_eq!(out.applied, vec![purl.to_string()]);
+        assert_eq!(out.vendored, vec![purl.to_string()]);
         assert_eq!(out.vendored_out_of_sync, vec![purl.to_string()]);
     }
 
@@ -2103,18 +2246,19 @@ mod tests {
         let mut manifest = PatchManifest::new();
         manifest.patches.insert(purl.to_string(), record);
         let copies = HashMap::from([(purl.to_string(), vec![m2.clone(), version.clone()])]);
-        let out = applied_patches_with_vendor(&manifest, &copies, None).await;
+        let out = applied_patches_with_copies(&manifest, &copies, None).await;
         assert!(out.applied.is_empty(), "{out:?}");
         assert_eq!(out.failed[0].reason, "not_applied");
         assert_eq!(out.unpatched_copies, [(purl.to_string(), version.clone())]);
 
         // Patch the re-download too: every copy verifies.
         std::fs::write(stale.join("lib-1.0.pom"), b"<patched/>").unwrap();
-        let out = applied_patches_with_vendor(&manifest, &copies, None).await;
+        let out = applied_patches_with_copies(&manifest, &copies, None).await;
         assert_eq!(out.applied, [purl.to_string()]);
         assert!(out.unpatched_copies.is_empty());
 
-        // Only the first copy of a non-Maven purl is judged.
+        // A non-Maven purl also needs every copy (#516), but its failing
+        // copies are not listed in `unpatched_copies`.
         let npm = "pkg:npm/x@1.0.0";
         let good = tempfile::tempdir().unwrap();
         std::fs::write(good.path().join("index.js"), b"patched").unwrap();
@@ -2127,8 +2271,10 @@ mod tests {
             npm.to_string(),
             vec![good.path().to_path_buf(), tmp.path().join("absent")],
         )]);
-        let out = applied_patches_with_vendor(&manifest, &copies, None).await;
-        assert_eq!(out.applied, [npm.to_string()]);
+        let out = applied_patches_with_copies(&manifest, &copies, None).await;
+        assert!(out.applied.is_empty(), "{out:?}");
+        assert_eq!(out.failed[0].reason, "file_not_found");
+        assert!(out.unpatched_copies.is_empty());
     }
 
     /// A member-keyed record verifies against the jar's members, in every

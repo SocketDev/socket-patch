@@ -437,6 +437,21 @@ async fn rollback_package_patch_at(
         .files_verified
         .iter()
         .all(|v| v.status == VerifyRollbackStatus::AlreadyOriginal);
+    // Restoring bytes into a package dir shared with other projects (PDM's
+    // symlink cache, pnpm's global virtual store) would silently unpatch
+    // them. Refused whenever a write would happen, dry run included; an
+    // already-original shared copy needs no write and passes.
+    if !all_original {
+        if let Some(store) = crate::patch::shared_store::shared_store_of_patch_dirs(
+            pkg_path,
+            files.keys().map(String::as_str),
+        )
+        .await
+        {
+            result.error = Some(store.refusal("roll back"));
+            return result;
+        }
+    }
     if all_original || dry_run {
         result.success = true;
         return result;
@@ -2519,5 +2534,67 @@ mod tests {
                 .is_err(),
             "an already-original primary must still heal a patched twin"
         );
+    }
+
+    /// #361 / #332: rollback in one project must not restore the original
+    /// bytes into a package directory shared with other projects (that
+    /// would silently unpatch them). It fails closed, dry run included,
+    /// and leaves the shared bytes as they are.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rollback_refuses_shared_store_package_dir() {
+        use crate::patch::shared_store::test_support::{make_pdm_cache_entry, make_pnpm_gvs};
+        for (pdm, purl) in [
+            (false, "pkg:npm/left-pad@1.3.0"),
+            (true, "pkg:pypi/urllib3@1.26.18"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let store_pkg = if pdm {
+                make_pdm_cache_entry(root.path())
+            } else {
+                make_pnpm_gvs(root.path())
+            };
+            let original = b"original shared bytes".to_vec();
+            let patched = b"PATCHED shared bytes".to_vec();
+            std::fs::write(store_pkg.join("index.js"), &patched).unwrap();
+            let install_dir = root.path().join("a").join("install");
+            std::fs::create_dir_all(&install_dir).unwrap();
+            let link = install_dir.join(store_pkg.file_name().unwrap());
+            std::os::unix::fs::symlink(&store_pkg, &link).unwrap();
+            // What the crawlers hand rollback: the linked package dir for
+            // npm, but `site-packages` (keys `<pkg>/<file>`) for PyPI.
+            let (pkg_root, key) = if pdm {
+                (install_dir.clone(), "urllib3/index.js")
+            } else {
+                (link.clone(), "index.js")
+            };
+            let blobs = root.path().join("blobs");
+            std::fs::create_dir_all(&blobs).unwrap();
+            let before_hash = compute_git_sha256_from_bytes(&original);
+            std::fs::write(blobs.join(&before_hash), &original).unwrap();
+            let mut files = HashMap::new();
+            files.insert(
+                key.to_string(),
+                PatchFileInfo {
+                    before_hash,
+                    after_hash: compute_git_sha256_from_bytes(&patched),
+                },
+            );
+            for dry_run in [true, false] {
+                let result = rollback_package_patch(purl, &pkg_root, &files, &blobs, dry_run).await;
+                assert!(!result.success, "{purl} dry_run={dry_run}: must refuse");
+                let err = result.error.unwrap_or_default();
+                assert!(
+                    err.contains(crate::patch::shared_store::SHARED_STORE_REFUSAL_MARKER),
+                    "{purl}: {err}"
+                );
+            }
+            assert_eq!(std::fs::read(store_pkg.join("index.js")).unwrap(), patched);
+
+            // Already original: nothing to write, so nothing to refuse.
+            std::fs::write(store_pkg.join("index.js"), &original).unwrap();
+            let result = rollback_package_patch(purl, &pkg_root, &files, &blobs, false).await;
+            assert!(result.success, "{purl}: {:?}", result.error);
+        }
     }
 }

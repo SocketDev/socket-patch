@@ -150,10 +150,30 @@ limits, and required install commands.
     `maven-metadata.xml` (#511).
   - Declared classifier jars are vendored or refused, and IDE sources are kept
     (#533).
+- Global mode (`-g`) finds npm, yarn, pnpm, bun, RubyGems and Composer on
+  Windows, where they install as `.cmd` / `.bat` shims, instead of reporting
+  an empty scan. The yarn and npm-family global lookups no longer run from the
+  scanned project, so a Yarn Berry project's `global` script can't run or pick
+  the directory treated as the global install. Composer's global home also
+  falls back to `%APPDATA%\Composer` and `$XDG_CONFIG_HOME/composer`.
+- Agent-mode PyPI `apply` patches every installed copy of a release, not just
+  the first one found. A Pipenv project with both a WORKON_HOME venv and a
+  `./.venv`, or a global install with the same release in the user site and a
+  system dir, no longer keeps the copy Python imports unpatched while `vex`
+  attests it (#529, #501).
 - Gem hosted and vendored modes wire only the manifest Bundler loads. A `gems.rb`
   twin or a `BUNDLE_GEMFILE` setting (environment or `.bundle/config`) no longer
   leads to an edit of an ignored `Gemfile` that reports success and attests an
   unpatched gem; unsupported layouts are refused before any write (#341, #390).
+- Gem modes read Bundler settings in Bundler's own priority. A `BUNDLE_GEMFILE`
+  in `.bundle/config` now outranks the environment variable, so a dual-boot
+  project with an exported `BUNDLE_GEMFILE=Gemfile` is no longer wired through
+  the `Gemfile` Bundler ignores (#507). The hosted stale-install guard checks
+  the committed archive in Bundler's configured cache dir (`cache_path` /
+  `BUNDLE_CACHE_PATH`) instead of always `vendor/cache`, so a stale archive
+  there now warns and keeps the same run's VEX from attesting it (#483).
+  Both settings skip `.bundle/config` under `BUNDLE_IGNORE_CONFIG`, as Bundler
+  does.
 - **npm dependencies installed from git, a URL or `file:` are no longer
   reported patched.** npm installs such a dependency from the dependent's
   spec (`github:user/repo`, `https://…/x.tgz`, `file:…`) and ignores the
@@ -164,7 +184,10 @@ limits, and required install commands.
   `vendor_non_registry_entry_skipped`; vendoring refuses with
   `vendor_lock_entry_not_rewritable` when no registry copy is left), and
   `vex` attests nothing for a `name@version` while such a copy is in the
-  lock (#326).
+  lock (#326). A dependency the project's `overrides` send back to a
+  registry version is not one of these: npm installs the override's
+  registry release, so hosted and vendored modes patch it again, and
+  `vex` attests it (#490).
 - **Agent mode finds Poetry's virtualenv in more setups.** Three cases
   missed the virtualenv Poetry installed into. Each fell back to the
   wrong interpreter, skipped the patch as `package_not_installed` and
@@ -194,6 +217,15 @@ limits, and required install commands.
   fetches honor `GOPROXY` and private-module settings.
 - Yarn Berry preserves supported line endings and checksum spellings. Mode
   preflights, including Bun's, run before discarding existing protection.
+- Yarn Berry hosted references no longer send npm registry credentials to the
+  patch server. The old `npm:` locator made yarn attach `npmAuthToken` /
+  `YARN_NPM_AUTH_TOKEN` to scoped packages (and to every package under
+  `npmAlwaysAuth`). Hosted mode now pins the way yarn does for a root
+  `resolutions` entry: `package.json` routes the locked descriptor to the
+  hosted tarball and the lock entry is keyed by it, which also passes yarn's
+  hardened mode (on by default for public pull request CI). A user-authored
+  `resolutions` entry for the package is never overwritten. Locks pinned by
+  earlier releases are re-pinned on the next hosted `scan`.
 - Composer hosted references remove upstream source fallbacks and mirrors;
   RubyGems hosted locks preserve source order; NuGet edits use the active config
   and survive `<clear />` entries.
@@ -231,6 +263,27 @@ limits, and required install commands.
   unparseable (hosted) or refused as `vendor_lockfile_version_unsupported`
   (vendored). The lock now keeps its BOM, indent and line endings, and the
   undo is byte-exact (#324).
+- Agent mode no longer patches other projects through a store they share.
+  PDM 2.0–2.12 with `install.cache` and `cache_method = symlink` links
+  `site-packages/<pkg>` into its package cache, and pnpm's global virtual
+  store (`enableGlobalVirtualStore`) links `node_modules/<dep>` into
+  `<store>/links`. `apply` (also `-g`) wrote the patch into that shared
+  directory, so every project using it was patched, and a `rollback` in one
+  project silently unpatched the rest. `apply` and `rollback` now fail on
+  such a package, naming the store and how to get a private copy
+  (#332, #361).
+- `vendor` under `--global` / `--global-prefix` (or `SOCKET_GLOBAL` /
+  `SOCKET_GLOBAL_PREFIX`) is now a usage error (exit 2,
+  `global_scope_unsupported`), like `scan` and `get` with `--mode vendored`.
+  Run inside a project, `vendor -g` vendored the manifest's records into that
+  project and rewired its lockfile, and `vendor --revert -g` unwound the
+  project's vendoring, so its next frozen install was silently unpatched.
+  Global installs have no project lockfile to vendor into (#498).
+- Patch API requests (`scan`, `get`, `apply` and `vex` lookups, and blob and
+  diff downloads) no longer hang forever on a stalled proxy, load balancer or
+  half-open connection. A connect now fails after 10 s, and a connection that
+  sends nothing for 60 s fails as a network error. Downloads that keep
+  streaming are not cut off (#570).
 
 ### Maintenance
 

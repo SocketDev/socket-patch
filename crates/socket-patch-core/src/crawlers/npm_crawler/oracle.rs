@@ -9,8 +9,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::{
-    build_npm_purl, is_legacy_pnpm_store_dir_name,
-    is_safe_npm_component, parse_package_name, read_package_json, NpmCrawler, StoreEntry,
+    build_npm_purl, configured_install_roots, is_legacy_pnpm_store_dir_name, is_safe_npm_component,
+    merge_configured_install_roots, parse_package_name, read_package_json, NpmCrawler, StoreEntry,
     Target, NESTED_STORE_MAX_DEPTH, NESTED_STORE_MAX_DIRS, SKIP_DIRS, VLT_STORE_NAME,
 };
 use crate::crawlers::types::{CrawledPackage, CrawlerOptions};
@@ -415,7 +415,9 @@ impl LegacyNpmCrawler {
         // Recursively search for workspace node_modules
         Self::find_workspace_node_modules(start_path, &mut results).await;
 
-        results
+        // The package-manager-configured roots are shared with the parent
+        // module (not part of the walk this oracle checks).
+        merge_configured_install_roots(results, configured_install_roots(start_path))
     }
 
     /// Recursively find `node_modules` in subdirectories (for monorepos / workspaces).
@@ -1334,12 +1336,18 @@ mod tests {
                         let _ = std::fs::write(entry.join("node_modules"), "file");
                     }
                     76..=79 => {
-                        // An entry whose node_modules is a symlink.
-                        if let Some(target) = self.nm_dirs.first().cloned() {
-                            let entry = store.join(self.store_entry_name(&name, &version));
-                            let _ = std::fs::create_dir_all(&entry);
-                            Self::symlink(&target, &entry.join("node_modules"));
-                        }
+                        // An entry whose node_modules is a symlink (to a
+                        // dir outside the tree, so the followed walk cannot
+                        // cycle: a link back to an ancestor `node_modules`
+                        // is walked until the OS refuses the path, which
+                        // compares where two walkers gave up, not what
+                        // they found).
+                        let entry = store.join(self.store_entry_name(&name, &version));
+                        let _ = std::fs::create_dir_all(&entry);
+                        let id = self.uniq();
+                        let elsewhere = self.scratch.join(format!("pnpm-nm{id}"));
+                        self.package_json(&elsewhere.join(&name), &name, &version);
+                        Self::symlink(&elsewhere, &entry.join("node_modules"));
                     }
                     80..=83 => {
                         // The entry itself is a symlink (skipped).

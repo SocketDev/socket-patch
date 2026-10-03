@@ -2,9 +2,7 @@ use clap::Args;
 use socket_patch_core::api::blob_fetcher::get_missing_blobs;
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
-use socket_patch_core::crawlers::{
-    detect_npm_pkg_manager, Ecosystem, NpmPkgManager, RubyCrawler,
-};
+use socket_patch_core::crawlers::{detect_npm_pkg_manager, Ecosystem, NpmPkgManager, RubyCrawler};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{
@@ -17,7 +15,7 @@ use socket_patch_core::patch::redirect::golang_local::{
 use socket_patch_core::patch::sidecars::{maven as maven_sidecars, SidecarAdvisoryCode};
 use socket_patch_core::telemetry::{track_patch_applied, track_patch_apply_failed};
 use socket_patch_core::utils::purl::parse_golang_purl;
-use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{normalize_purl, purl_eq, strip_purl_qualifiers};
 use socket_patch_core::vendor::purl_keys_cover;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -208,10 +206,13 @@ fn format_mismatch_fetch_result(downloaded: usize, needed: usize) -> String {
 /// duplicates of one `name@version`, the apply loop patches each of them,
 /// and copies drift independently — a pristine (or already-patched) root
 /// copy says nothing about a locally-modified nested duplicate, whose
-/// mismatched files still need their afterHash blobs. The variant gate,
-/// by contrast, mirrors the apply loop's representative check against the
-/// FIRST copy (release-variant ecosystems install one directory per
-/// `package@version`).
+/// mismatched files still need their afterHash blobs. The variant gate
+/// mirrors the apply loop's representative check PER COPY for gem and
+/// PyPI (which patch every copy, and two envs can hold different wheels
+/// of one release), and against the FIRST copy otherwise (Maven's
+/// Gradle copies are version dirs whose files sit in hash dirs, gated per
+/// hash dir by `apply_maven_base`): a variant's files are probed only on
+/// the copies it is attempted on.
 ///
 /// Only a mismatched file whose afterHash blob is NOT staged can queue a
 /// fetch, so the probe first decides that with metadata probes alone and
@@ -264,25 +265,45 @@ async fn mismatch_blob_gaps(
                 || records
                     .first()
                     .is_some_and(|(key, _)| key.as_str() != stripped));
+        // The copies the apply loop gates per copy: gem and PyPI patch
+        // every copy, each against its own representative check; the
+        // rest gate on the first.
+        let gate_copies: &[PathBuf] = if matches!(
+            Ecosystem::from_purl(purl),
+            Some(Ecosystem::Gem | Ecosystem::Pypi)
+        ) {
+            pkg_paths.as_slice()
+        } else {
+            std::slice::from_ref(first_path)
+        };
         for (_, record) in records {
             if !can_queue(record) {
                 continue;
             }
-            if gated {
-                if let Some((file_name, file_info)) = representative_file(&record.files) {
-                    let status = verify_file_patch(first_path, file_name, file_info)
-                        .await
-                        .status;
-                    if !variant_matches_installed(Some(&status)) {
-                        continue;
+            // Copies this variant is attempted on: a copy whose installed
+            // distribution is another variant (two envs can hold different
+            // wheels of one release) is skipped there by the apply loop.
+            let probe_copies: Vec<&PathBuf> = match representative_file(&record.files) {
+                Some((file_name, file_info)) if gated => {
+                    let mut matched = Vec::new();
+                    for copy in gate_copies {
+                        let status = verify_file_patch(copy, file_name, file_info).await.status;
+                        if variant_matches_installed(Some(&status)) {
+                            matched.push(copy);
+                        }
                     }
+                    matched
                 }
+                _ => pkg_paths.iter().collect(),
+            };
+            if probe_copies.is_empty() {
+                continue;
             }
             for (file_name, info) in &record.files {
                 if info.before_hash.is_empty() || !missing.contains(&info.after_hash) {
                     continue;
                 }
-                for pkg_path in pkg_paths {
+                for pkg_path in &probe_copies {
                     let verify = verify_file_patch(pkg_path, file_name, info).await;
                     if verify.status == VerifyStatus::HashMismatch {
                         needed.insert(info.after_hash.clone());
@@ -626,6 +647,25 @@ pub(crate) fn variant_matches_installed(first_file_status: Option<&VerifyStatus>
         None => true,
         Some(status) => *status == VerifyStatus::Ready || *status == VerifyStatus::AlreadyPatched,
     }
+}
+
+/// `paths` in order with every path that resolves to an already-listed
+/// directory dropped: two discovered site-packages paths can name ONE
+/// directory (a `lib64 -> lib` symlink, a symlinked venv), and patching it
+/// twice would report the second pass `already_patched`. A path that can't
+/// be canonicalized is kept as-is.
+async fn distinct_install_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let key = tokio::fs::canonicalize(path)
+            .await
+            .unwrap_or_else(|_| path.clone());
+        if seen.insert(key) {
+            out.push(path.clone());
+        }
+    }
+    out
 }
 
 /// The file whose verify status decides whether a release variant
@@ -1000,6 +1040,7 @@ pub(crate) async fn run_locked(
             success,
             results,
             unmatched,
+            lockfile_only,
             run_warnings,
             fallback_skips,
             targeted,
@@ -1143,11 +1184,14 @@ pub(crate) async fn run_locked(
                 // had no installed package on disk — emit one Skipped
                 // event per purl so downstream consumers can surface them.
                 for purl in &unmatched {
+                    let detail = if lockfile_only.contains(purl) {
+                        LOCKFILE_ONLY_DETAIL
+                    } else {
+                        "No installed package matches this PURL"
+                    };
                     env.record(
-                        PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
-                            "package_not_installed",
-                            "No installed package matches this PURL",
-                        ),
+                        PatchEvent::new(PatchAction::Skipped, purl.clone())
+                            .with_reason("package_not_installed", detail),
                     );
                 }
                 // Best-effort gem-env fallback-home copies left unpatched:
@@ -1365,6 +1409,11 @@ struct ApplyOutcome {
     results: Vec<ApplyResult>,
     /// In-scope manifest purls with no installed package on disk.
     unmatched: Vec<String>,
+    /// The subset of [`Self::unmatched`] the project's own lockfiles
+    /// resolve: deliberately not installed on this host (a platform-gated
+    /// optional dependency, a devDependency under `--omit=dev`), so a calm
+    /// skip that never fails the run (#403).
+    lockfile_only: HashSet<String>,
     /// Run-level advisories: JSON `warnings[]`, and one gated stderr line
     /// each on the human path (`--silent` = errors only) except the
     /// sources-unavailable codes (already printed by the stager): the gem
@@ -1683,6 +1732,7 @@ async fn apply_patches_inner(
                 success: false,
                 results: Vec::new(),
                 unmatched: Vec::new(),
+                lockfile_only: HashSet::new(),
                 run_warnings: vec![stage_failure_warning(args.common.offline)],
                 fallback_skips: Vec::new(),
                 targeted: target_manifest_purls.len(),
@@ -1714,6 +1764,7 @@ async fn apply_patches_inner(
             success: true,
             results: Vec::new(),
             unmatched: Vec::new(),
+            lockfile_only: HashSet::new(),
             run_warnings: Vec::new(),
             fallback_skips: Vec::new(),
             targeted: 0,
@@ -1805,20 +1856,24 @@ async fn apply_patches_inner(
         );
         let mut unmatched = unmatched;
         unmatched.sort();
+        let lockfile_only = Box::pin(lockfile_resolved(&args.common, &unmatched)).await;
+        let unresolved = unresolved_purls(&unmatched, &lockfile_only);
         // This diagnostic flips the exit code, so it is an error — and it
         // prints even under --silent ("errors only", never a mute exit 1);
         // `--json`
         // mutes stderr and the envelope's `package_not_installed` events
-        // are the channel.
-        if !unmatched.is_empty() && args.prints_errors() {
-            for line in format_none_installed_error(&unmatched) {
+        // are the channel. Lockfile-resolved purls never flip it (#403).
+        if !unresolved.is_empty() && args.prints_errors() {
+            for line in format_none_installed_error(&unresolved) {
                 eprintln!("{line}");
             }
         }
+        print_lockfile_only_note(args, &unmatched, &lockfile_only);
         return Ok(ApplyOutcome {
-            success: unmatched.is_empty(),
+            success: unresolved.is_empty(),
             results,
             unmatched,
+            lockfile_only,
             run_warnings,
             fallback_skips,
             targeted: target_manifest_purls.len(),
@@ -1941,22 +1996,30 @@ async fn apply_patches_inner(
                 continue;
             }
 
-            // Patch EVERY coexisting gem store copy (the npm multi-copy
-            // precedent): leaving the other store pristine is a silent
-            // false "applied" for whichever bundler loads it, and the
-            // per-copy results below make the JSON summary count each
-            // patched copy — the signal a second copy exists. PyPI/Maven
-            // keep the one-representative contract: their crawlers resolve
-            // one install dir per version, and a second path can only
-            // alias the same logical install (re-patching it would produce
-            // the spurious `already_patched` double-patch the nuget
-            // first-wins restoration fixed).
-            let copy_paths: &[PathBuf] =
-                if matches!(Ecosystem::from_purl(purl), Some(Ecosystem::Gem)) {
-                    pkg_paths.as_slice()
-                } else {
-                    std::slice::from_ref(pkg_path)
-                };
+            // Patch EVERY coexisting gem store copy and every PyPI
+            // site-packages copy (the npm multi-copy precedent): leaving
+            // the other copy pristine is a silent false "applied" for
+            // whichever bundler / interpreter loads it, and the per-copy
+            // results below make the JSON summary count each patched copy
+            // — the signal a second copy exists. The Python crawler
+            // resolves one release in several candidate envs when it
+            // can't tell which one the project's tool runs (a Pipenv
+            // WORKON_HOME venv beside `./.venv`, #529) or which one
+            // `sys.path` shadows (the user site beside a system dir in
+            // global scope, #501), and rollback already restores every
+            // copy. A PyPI path that only ALIASES another (a symlinked
+            // site-packages) is collapsed by canonical path, so one
+            // install is never patched twice. Maven never reaches here:
+            // `apply_maven_base` above patches its every consumed copy.
+            let pypi_copies: Vec<PathBuf>;
+            let copy_paths: &[PathBuf] = match Ecosystem::from_purl(purl) {
+                Some(Ecosystem::Gem) => pkg_paths.as_slice(),
+                Some(Ecosystem::Pypi) => {
+                    pypi_copies = distinct_install_dirs(pkg_paths).await;
+                    pypi_copies.as_slice()
+                }
+                _ => std::slice::from_ref(pkg_path),
+            };
 
             // Copy CLASS decides FAILURE semantics (never write scope —
             // patching a shared home's vulnerable copy is fine when it
@@ -2229,28 +2292,38 @@ async fn apply_patches_inner(
         &vendored_bases,
     );
     unmatched.sort();
+    let lockfile_only = if unmatched.is_empty() {
+        HashSet::new()
+    } else {
+        Box::pin(lockfile_resolved(&args.common, &unmatched)).await
+    };
+    let unresolved = unresolved_purls(&unmatched, &lockfile_only);
 
+    // Nothing matched and some purl has no lock evidence either: this
+    // fails the run, so it is an error — and errors print even under
+    // --silent. Lockfile-resolved purls are deliberately not installed
+    // here, so they never fail it (#403).
     let none_matched = !target_manifest_purls.is_empty()
         && matched_manifest_purls.is_empty()
-        && !all_packages.is_empty();
+        && !all_packages.is_empty()
+        && !unresolved.is_empty();
     if none_matched {
-        // Nothing matched: this fails the run, so it is an error — and
-        // errors print even under --silent.
         has_errors = true;
         if args.prints_errors() {
-            for line in format_none_installed_error(&unmatched) {
+            for line in format_none_installed_error(&unresolved) {
                 eprintln!("{line}");
             }
         }
-    } else if !unmatched.is_empty() && !args.common.silent && !args.common.json {
+    } else if !unresolved.is_empty() && !args.common.silent && !args.common.json {
         eprintln!(
             "Warning: {} had no matching installed package:",
-            plural(unmatched.len(), "manifest patch", "manifest patches")
+            plural(unresolved.len(), "manifest patch", "manifest patches")
         );
-        for purl in &unmatched {
+        for purl in &unresolved {
             eprintln!("  - {}", normalize_purl(purl));
         }
     }
+    print_lockfile_only_note(args, &unmatched, &lockfile_only);
 
     // The human summary is printed by `run`, after the per-package list.
 
@@ -2264,6 +2337,7 @@ async fn apply_patches_inner(
         success: !has_errors,
         results,
         unmatched,
+        lockfile_only,
         run_warnings,
         fallback_skips,
         targeted: target_manifest_purls.len(),
@@ -2706,6 +2780,72 @@ async fn check_derived_copies(
                 }
             ),
         );
+    }
+}
+
+/// The `package_not_installed` detail of a lockfile-resolved purl.
+const LOCKFILE_ONLY_DETAIL: &str =
+    "Resolved by the project lockfile but not installed on this host (lockfile-only)";
+
+/// The `unmatched` purls the project's own lockfiles resolve (#403): the
+/// package manager resolved them but deliberately did not install them on
+/// this host — an `os`/`cpu`-gated optional dependency (`fsevents`,
+/// `@esbuild/<os>-<cpu>`), a devDependency under `npm ci --omit=dev`. The
+/// tree is in its correct end state, so they are calm skips, as `scan
+/// --apply` treats lockfile-only packages. Global runs have no project
+/// lock, so nothing is lockfile-resolved there.
+async fn lockfile_resolved(common: &GlobalArgs, unmatched: &[String]) -> HashSet<String> {
+    if unmatched.is_empty() || common.is_global() {
+        return HashSet::new();
+    }
+    let ctx = crate::commands::context::ProjectContext::new(common);
+    let entries = &ctx.locks().await.entries;
+    let lock_purls: HashSet<String> = entries
+        .iter()
+        .map(|e| normalize_purl(strip_purl_qualifiers(&e.purl)).into_owned())
+        .collect();
+    unmatched
+        .iter()
+        .filter(|p| {
+            let base = strip_purl_qualifiers(p);
+            lock_purls.contains(normalize_purl(base).as_ref())
+                || (base.starts_with("pkg:composer/")
+                    && entries.iter().any(|e| purl_eq(&e.purl, base)))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The `unmatched` purls with no lock evidence (sorted input, sorted
+/// output): the ones that can still fail an all-miss run.
+fn unresolved_purls(unmatched: &[String], lockfile_only: &HashSet<String>) -> Vec<String> {
+    unmatched
+        .iter()
+        .filter(|p| !lockfile_only.contains(*p))
+        .cloned()
+        .collect()
+}
+
+/// The human note for lockfile-resolved purls (never an error; muted by
+/// `--silent` and `--json`).
+fn print_lockfile_only_note(
+    args: &ApplyArgs,
+    unmatched: &[String],
+    lockfile_only: &HashSet<String>,
+) {
+    if lockfile_only.is_empty() || args.common.silent || args.common.json {
+        return;
+    }
+    eprintln!(
+        "Note: {} not installed on this host (resolved by the project lockfile; skipped):",
+        plural(
+            lockfile_only.len(),
+            "manifest patch targets a package",
+            "manifest patches target packages"
+        )
+    );
+    for purl in unmatched.iter().filter(|p| lockfile_only.contains(*p)) {
+        eprintln!("  - {}", normalize_purl(purl));
     }
 }
 
@@ -3375,6 +3515,90 @@ mod tests {
             needed,
             HashSet::from(["8".repeat(64)]),
             "the drifted second copy must queue the blob even though the first copy is clean"
+        );
+    }
+
+    /// Regression (#538 review): two PyPI copies of one release holding
+    /// DIFFERENT wheels. The apply loop gates each variant per copy, so the
+    /// variant installed only in the SECOND copy is attempted there; its
+    /// locally-modified non-representative file needs the full afterHash
+    /// blob. Gating against the first copy alone skipped that variant and
+    /// left the blob unfetched, so warn-and-apply failed on the second copy.
+    #[tokio::test]
+    async fn mismatch_blob_gaps_gates_pypi_variants_per_copy() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Copy A: the wheel's distribution, pristine.
+        let copy_a = dir.path().join("a");
+        tokio::fs::create_dir_all(&copy_a).await.unwrap();
+        tokio::fs::write(copy_a.join("aaa.py"), b"wheel\n")
+            .await
+            .unwrap();
+        // Copy B: the sdist's distribution, with a locally modified
+        // non-representative file.
+        let copy_b = dir.path().join("b");
+        tokio::fs::create_dir_all(&copy_b).await.unwrap();
+        tokio::fs::write(copy_b.join("aaa.py"), b"sdist\n")
+            .await
+            .unwrap();
+        tokio::fs::write(copy_b.join("zzz.py"), b"locally modified\n")
+            .await
+            .unwrap();
+        let blobs = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+
+        let mut wheel_files = HashMap::new();
+        wheel_files.insert(
+            "aaa.py".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"wheel\n"),
+                after_hash: "1".repeat(64),
+            },
+        );
+        let mut manifest = manifest_with_record(
+            "pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0-py3-none-any.whl",
+            wheel_files,
+        );
+        let mut sdist_files = HashMap::new();
+        sdist_files.insert(
+            "aaa.py".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"sdist\n"),
+                after_hash: "2".repeat(64),
+            },
+        );
+        sdist_files.insert(
+            "zzz.py".to_string(),
+            PatchFileInfo {
+                before_hash: "3".repeat(64),
+                after_hash: "4".repeat(64),
+            },
+        );
+        manifest.patches.insert(
+            "pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0.tar.gz".to_string(),
+            PatchRecord {
+                uuid: "22222222-2222-4222-8222-222222222222".to_string(),
+                exported_at: "2024-01-01T00:00:00Z".to_string(),
+                files: sdist_files,
+                vulnerabilities: HashMap::new(),
+                description: "fixture".to_string(),
+                license: "MIT".to_string(),
+                tier: "free".to_string(),
+            },
+        );
+        let mut all_packages = HashMap::new();
+        all_packages.insert(
+            "pkg:pypi/foo@1.0.0".to_string(),
+            vec![copy_a.clone(), copy_b.clone()],
+        );
+
+        let needed =
+            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
+        assert_eq!(
+            needed,
+            HashSet::from(["4".repeat(64)]),
+            "the second copy's variant must queue its mismatched file's blob"
         );
     }
 

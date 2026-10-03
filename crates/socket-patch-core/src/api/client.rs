@@ -14,7 +14,7 @@ use crate::api::ranking::severity_order as get_severity_order;
 use crate::api::ranking::{cmp_batch_infos, cmp_search_results};
 use crate::api::retry::{
     is_retryable_status, jitter_sample as retry_jitter, parse_retry_after, ApiRetry,
-    ApiRetryPolicy, RetryHooks,
+    ApiRetryPolicy, ApiTimeouts, RetryHooks,
 };
 use crate::api::types::*;
 use crate::api::vendor_prefetch::VendorPrefetch;
@@ -47,6 +47,19 @@ fn network_error_detail(e: &reqwest::Error) -> String {
         source = cause.source();
     }
     msg
+}
+
+/// `Response::json` reads the body before decoding it. A read timeout is a
+/// transport failure, not malformed JSON; retain its cause chain.
+fn json_response_error(error: reqwest::Error, context: &str) -> ApiError {
+    if error.is_timeout() || error.is_body() {
+        ApiError::Network(format!(
+            "Network error reading {context} body: {}",
+            network_error_detail(&error)
+        ))
+    } else {
+        ApiError::Parse(format!("Failed to parse {context}: {error}"))
+    }
 }
 
 /// The readable part of a non-2xx response body, for an error message: the
@@ -376,28 +389,11 @@ impl ApiClient {
     /// (User-Agent, Accept, and optionally Authorization).
     pub fn new(options: ApiClientOptions) -> Self {
         let api_url = options.api_url.trim_end_matches('/').to_string();
-
-        let mut default_headers = HeaderMap::new();
-        default_headers.insert(
-            header::USER_AGENT,
-            HeaderValue::from_static(USER_AGENT_VALUE),
-        );
-        default_headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
-
-        if let Some(ref token) = options.api_token {
-            if let Ok(hv) = HeaderValue::from_str(&format!("Bearer {}", token)) {
-                default_headers.insert(header::AUTHORIZATION, hv);
-            }
-        }
-
-        let client = reqwest::Client::builder()
-            .default_headers(default_headers)
-            .build()
-            .expect("failed to build reqwest client");
+        let timeouts = ApiTimeouts::default();
 
         Self {
-            client,
-            plain: plain_client(),
+            client: api_client(options.api_token.as_deref(), &timeouts),
+            plain: plain_client(&timeouts),
             api_url,
             api_token: options.api_token,
             use_public_proxy: options.use_public_proxy,
@@ -417,6 +413,15 @@ impl ApiClient {
     /// retries off.
     pub fn with_api_retry(mut self, policy: ApiRetryPolicy, hooks: RetryHooks) -> Self {
         self.api_retry = ApiRetry::with_policy(policy, hooks);
+        self
+    }
+
+    /// Override the connect and stalled-read bounds of both HTTP clients
+    /// (tests use short ones). Rebuilds the clients, so call it before
+    /// cloning the client.
+    pub fn with_api_timeouts(mut self, timeouts: ApiTimeouts) -> Self {
+        self.client = api_client(self.api_token.as_deref(), &timeouts);
+        self.plain = plain_client(&timeouts);
         self
     }
 
@@ -611,7 +616,7 @@ impl ApiClient {
             let body = resp
                 .json::<T>()
                 .await
-                .map_err(|e| ApiError::Parse(format!("Failed to parse response: {}", e)))?;
+                .map_err(|e| json_response_error(e, "response"))?;
             return Ok(Some(body));
         }
         if status == StatusCode::NOT_FOUND {
@@ -855,7 +860,7 @@ impl ApiClient {
                     let parsed = resp
                         .json::<BatchSearchResponse>()
                         .await
-                        .map_err(|e| ApiError::Parse(format!("Failed to parse response: {}", e)))?;
+                        .map_err(|e| json_response_error(e, "response"))?;
                     return Ok(Some(parsed));
                 }
                 if let Some(err) = classify_auth_error(status, true) {
@@ -1543,10 +1548,7 @@ impl ApiClient {
                 // A body cut off (or timed out) mid-transfer is transport,
                 // not a malformed answer.
                 let hint = (e.is_timeout() || e.is_body()).then_some(None);
-                (
-                    ApiError::Parse(format!("Failed to parse package response: {e}")),
-                    hint,
-                )
+                (json_response_error(e, "package response"), hint)
             })?;
             return Ok(parsed.results);
         }
@@ -1905,18 +1907,42 @@ enum ServeDownload {
     Failed(ApiError),
 }
 
+/// Build the authenticated `reqwest::Client` ([`ApiClient`]'s `client`
+/// field): User-Agent, `Accept: application/json` and, given a token, the
+/// Socket bearer, bounded by `timeouts`.
+fn api_client(api_token: Option<&str>, timeouts: &ApiTimeouts) -> reqwest::Client {
+    let mut default_headers = HeaderMap::new();
+    default_headers.insert(
+        header::USER_AGENT,
+        HeaderValue::from_static(USER_AGENT_VALUE),
+    );
+    default_headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+
+    if let Some(token) = api_token {
+        if let Ok(hv) = HeaderValue::from_str(&format!("Bearer {}", token)) {
+            default_headers.insert(header::AUTHORIZATION, hv);
+        }
+    }
+
+    timeouts
+        .apply(reqwest::Client::builder().default_headers(default_headers))
+        .build()
+        .expect("failed to build reqwest client")
+}
+
 /// Build a plain `reqwest::Client` carrying only the User-Agent — no
 /// Authorization. Built once per [`ApiClient`] (its `plain` field) for the
 /// public-proxy POST and the grant-tokenized serve GETs, where sending the
-/// Socket bearer would leak it to a third party.
-fn plain_client() -> reqwest::Client {
+/// Socket bearer would leak it to a third party. Bounded by `timeouts`,
+/// like the authenticated client.
+fn plain_client(timeouts: &ApiTimeouts) -> reqwest::Client {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::USER_AGENT,
         HeaderValue::from_static(USER_AGENT_VALUE),
     );
-    reqwest::Client::builder()
-        .default_headers(headers)
+    timeouts
+        .apply(reqwest::Client::builder().default_headers(headers))
         .build()
         .expect("failed to build plain reqwest client")
 }
@@ -5454,6 +5480,78 @@ mod vendor_retry_tests {
             started.elapsed()
         );
         assert_eq!(posts(&server).await, 2, "the timed-out attempt is retried");
+    }
+
+    /// A response can stall after its successful headers arrive. Keep the
+    /// transport classification and retry hint while reading package JSON.
+    #[tokio::test]
+    async fn stalled_post_json_body_is_network_and_retried() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let count = Arc::clone(&count);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buffer).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buffer[..n]),
+                        }
+                    }
+                    count.fetch_add(1, Ordering::Relaxed);
+                    if socket
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    while let Ok(n) = socket.read(&mut buffer).await {
+                        if n == 0 {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        for proxy in [false, true] {
+            let before = requests.load(Ordering::Relaxed);
+            let api = ApiClient::new(ApiClientOptions {
+                api_url: uri.clone(),
+                api_token: (!proxy).then(|| "tok".into()),
+                use_public_proxy: proxy,
+                org_slug: Some("org".into()),
+            })
+            .with_vendor_retry(VendorRetryPolicy {
+                attempts: 2,
+                ..fast()
+            })
+            .with_api_timeouts(ApiTimeouts {
+                connect: Duration::from_secs(5),
+                read: Duration::from_millis(100),
+            });
+            let (error, retryable) = tokio::time::timeout(
+                Duration::from_secs(10),
+                api.request_vendor_references(&[UUID_A.to_string()], false, None),
+            )
+            .await
+            .expect("body read must be bounded")
+            .expect_err("partial JSON body must fail");
+            assert!(
+                matches!(&error, ApiError::Network(msg) if msg.contains("timed out")),
+                "{error:?}"
+            );
+            assert!(retryable, "body timeout keeps the retry hint");
+            assert_eq!(requests.load(Ordering::Relaxed) - before, 2);
+        }
     }
 
     /// The archive GET's response headers are bounded the same way.

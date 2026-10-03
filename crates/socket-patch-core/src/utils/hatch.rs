@@ -147,7 +147,7 @@ fn replacement(spec: &str, name: &str, version: &str, url: &str) -> Result<Optio
             "{name}: an existing direct source must be reverted before patching"
         ));
     }
-    if constraint != format!("=={version}") {
+    if !crate::utils::pep440::is_exact_pin_of(&constraint, version) {
         return Err(format!(
             "{name}: Hatch patching requires an exact =={version} declaration"
         ));
@@ -506,6 +506,47 @@ mod tests {
             assert_eq!(
                 restored.replace("\r\n", "\n"),
                 original.replace("\r\n", "\n")
+            );
+        }
+    }
+
+    /// #475: Hatch (via pip/uv) selects a release under PEP 440, so
+    /// `==1.26.18.0` and `==01.26.18` are exact pins of 1.26.18.
+    #[test]
+    fn pep440_equivalent_pins_are_exact_declarations() {
+        for pin in [
+            "urllib3==1.26.18.0",
+            "urllib3 == 01.26.18",
+            "Urllib3==v1.26.18",
+        ] {
+            let text = format!("[project]\ndependencies=[\"{pin}\"]\n");
+            let result = rewrite(
+                &files(&text),
+                "urllib3",
+                "1.26.18",
+                "https://patch.test/a.whl",
+            )
+            .unwrap_or_else(|error| panic!("{pin}: {error}"));
+            assert!(
+                result["pyproject.toml"].contains("@ https://patch.test/a.whl"),
+                "{pin}"
+            );
+        }
+        for pin in [
+            "urllib3==1.26.18.1",
+            "urllib3===1.26.18.0",
+            "urllib3==1.26.*",
+        ] {
+            let text = format!("[project]\ndependencies=[\"{pin}\"]\n");
+            assert!(
+                rewrite(
+                    &files(&text),
+                    "urllib3",
+                    "1.26.18",
+                    "https://patch.test/a.whl"
+                )
+                .is_err(),
+                "{pin}"
             );
         }
     }

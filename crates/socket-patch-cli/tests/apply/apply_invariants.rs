@@ -635,6 +635,11 @@ fn write_partial_match_project(root: &Path) {
 /// Resolving either direction changes a documented contract for the
 /// other consumer — whoever does it must update BOTH halves of this test
 /// and the hook/CI guidance together.
+///
+/// Narrowed by #403: an unmatched purl the project's lockfiles resolve
+/// (deliberately not installed here) never fails the all-miss run — see
+/// `lockfile_only_skip.rs`. The ghost purl below has no lock evidence, so
+/// both halves still hold for it.
 #[test]
 fn unmatched_purl_exit_semantics_are_pinned() {
     // Mixed manifest: applied + unmatched → exit 0, status success,

@@ -372,16 +372,18 @@ async fn restore_berry(
     ctx: &Ctx<'_>,
     result: &mut FormatResult,
 ) {
+    use crate::vendor::yarn_berry_lock::resolution_selector_target;
     use crate::vendor::yarn_classic_lock::{split_berry_key_patterns, split_pattern};
 
     let (bom, body) = match raw.strip_prefix('\u{feff}') {
         Some(rest) => ("\u{feff}", rest),
         None => ("", raw),
     };
-    let yarnrc_rel = match rel.rsplit_once('/') {
-        Some((dir, _)) => format!("{dir}/.yarnrc.yml"),
-        None => ".yarnrc.yml".to_string(),
+    let dir_prefix = match rel.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/"),
+        None => String::new(),
     };
+    let yarnrc_rel = format!("{dir_prefix}.yarnrc.yml");
     let yarnrc = view.read(&yarnrc_rel).await.ok().flatten();
     if let Err(w) = super::super::preflight_yarn_berry_hosted(raw, yarnrc.as_deref()) {
         refuse_all_in(pins, rel, result, w.detail);
@@ -389,7 +391,10 @@ async fn restore_berry(
     }
     let eol = LineEndings::of(body);
     let content = to_lf(body).into_owned();
-    let mut blocks: Vec<String> = content.split("\n\n").map(String::from).collect();
+    let trimmed = content.trim_end_matches('\n');
+    let trailing_newlines = content[trimmed.len()..].to_string();
+    let mut blocks: Vec<String> = trimmed.split("\n\n").map(String::from).collect();
+    let was_sorted = super::super::berry_entries_sorted(&blocks);
     let resolution_re = Regex::new(r#"\n {2}resolution: "([^"]*)""#)
         .expect("static resolution-line regex is valid");
     let checksum_re =
@@ -397,15 +402,45 @@ async fn restore_berry(
     let version_re =
         Regex::new(r"\n {2}version: ([^\n]*)").expect("static version-line regex is valid");
 
-    let mut hits: Vec<(usize, String, String, String)> = Vec::new();
+    // The root manifest: a hosted pin keyed by its tarball URL keeps the
+    // descriptors it replaced only as `resolutions` selectors routed there.
+    let pkg_rel = format!("{dir_prefix}package.json");
+    let pkg_text = view.read(&pkg_rel).await.ok().flatten();
+    let mut pkg: Option<serde_json::Value> = pkg_text
+        .as_deref()
+        .and_then(|t| serde_json::from_str(t.strip_prefix('\u{feff}').unwrap_or(t)).ok())
+        .filter(serde_json::Value::is_object);
+    let mut pkg_changed = false;
+
+    // `(block index, uuid, name, version, restored key or None to keep it,
+    // selectors to drop)`.
+    struct Hit {
+        idx: usize,
+        uuid: String,
+        name: String,
+        version: String,
+        key: Option<String>,
+        selectors: Vec<String>,
+    }
+    let mut hits: Vec<Hit> = Vec::new();
     for (i, block) in blocks.iter().enumerate() {
         let Some(resolution) = resolution_re.captures(block).map(|c| c[1].to_string()) else {
             continue;
         };
-        let Some((_, archive)) = resolution.split_once("::__archiveUrl=") else {
+        // The hosted pin is the tarball-URL locator `name@<url>`; locks
+        // pinned by releases up to 5.0 spell it as an `npm:` locator's
+        // percent-encoded `::__archiveUrl=` binding (#404).
+        let Some((_, reference)) = split_pattern(&resolution) else {
             continue;
         };
-        let archive = archive.split('&').next().unwrap_or(archive);
+        let url_pin = reference.starts_with("https://") || reference.starts_with("http://");
+        let archive = if url_pin {
+            reference
+        } else if let Some((_, binding)) = reference.split_once("::__archiveUrl=") {
+            binding.split('&').next().unwrap_or(binding)
+        } else {
+            continue;
+        };
         let Some(uuid) = ctx.hosted_uuid(archive) else {
             continue;
         };
@@ -425,16 +460,80 @@ async fn restore_berry(
         let version = version_re
             .captures(block)
             .map(|c| c[1].trim().trim_matches('"').to_string());
-        match (names.len(), names.into_iter().next(), version) {
-            (1, Some(name), Some(version)) => hits.push((i, uuid, name.to_string(), version)),
-            _ => result.refuse(
+        let (Some(name), Some(version), 1) = (names.iter().next(), version, names.len()) else {
+            result.refuse(
                 &uuid,
                 format!("a {rel} entry wiring it names no single package and version"),
-            ),
-        }
+            );
+            continue;
+        };
+        // An entry keyed by the tarball descriptor itself takes back the
+        // descriptors its `resolutions` selectors route to that URL.
+        let keyed_by_url = matches!(
+            patterns.as_slice(),
+            [only] if split_pattern(only).is_some_and(|(_, r)| r == reference)
+        );
+        let (restored_key, selectors) = if keyed_by_url {
+            let selectors: Vec<String> = pkg
+                .as_ref()
+                .and_then(|p| p.get("resolutions"))
+                .and_then(serde_json::Value::as_object)
+                .map(|table| {
+                    table
+                        .iter()
+                        .filter(|(sel, value)| {
+                            resolution_selector_target(sel) == Some(name.as_str())
+                                && value.as_str() == Some(reference)
+                        })
+                        .map(|(sel, _)| sel.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut descriptors: Vec<String> = selectors
+                .iter()
+                .filter(|sel| {
+                    split_pattern(sel).is_some_and(|(n, r)| n == name && r.starts_with("npm:"))
+                })
+                .cloned()
+                .collect();
+            if descriptors.is_empty() {
+                result.refuse(
+                    &uuid,
+                    format!(
+                        "{pkg_rel} has no resolutions entry routing a {name} descriptor to the \
+                         hosted tarball, so the {rel} entry's original key cannot be rebuilt — \
+                         restore {rel} and {pkg_rel} from version control (or delete the entry \
+                         and run `yarn install`)"
+                    ),
+                );
+                continue;
+            }
+            descriptors.sort();
+            descriptors.dedup();
+            (Some(format!("\"{}\"", descriptors.join(", "))), selectors)
+        } else {
+            (None, Vec::new())
+        };
+        hits.push(Hit {
+            idx: i,
+            uuid,
+            name: name.clone(),
+            version,
+            key: restored_key,
+            selectors,
+        });
     }
     let mut changed = false;
-    for (i, uuid, name, version) in hits {
+    let mut moved: Vec<String> = Vec::new();
+    for Hit {
+        idx,
+        uuid,
+        name,
+        version,
+        key,
+        selectors,
+    } in hits
+    {
         if result.refused.contains_key(&uuid) {
             continue;
         }
@@ -459,20 +558,69 @@ async fn restore_berry(
         };
         let resolution = format!("\n  resolution: \"{name}@npm:{version}\"").replace('$', "$$");
         let mut block = resolution_re
-            .replace(&blocks[i], resolution.as_str())
+            .replace(&blocks[idx], resolution.as_str())
             .into_owned();
         if checksum_re.is_match(&block) {
             block = checksum_re
                 .replace(&block, format!("\n  checksum: {checksum}").as_str())
                 .into_owned();
         }
-        blocks[i] = block;
+        if let Some(key) = key {
+            let body_lines = block
+                .split_once('\n')
+                .map(|(_, r)| r.to_string())
+                .unwrap_or_default();
+            block = format!("{key}:\n{body_lines}");
+            moved.push(key);
+        }
+        blocks[idx] = block;
+        if !selectors.is_empty() {
+            if let Some(table) = pkg
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+                .and_then(|obj| obj.get_mut("resolutions"))
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                for selector in &selectors {
+                    table.shift_remove(selector);
+                }
+                pkg_changed = true;
+            }
+        }
         result.handled.insert(uuid);
         changed = true;
     }
-    if changed {
-        view.write(rel, format!("{bom}{}", eol.restore(&blocks.join("\n\n"))));
+    if !changed {
+        return;
     }
+    if pkg_changed {
+        if let (Some(text), Some(value)) = (pkg_text.as_deref(), pkg.as_mut()) {
+            if let Some(obj) = value.as_object_mut() {
+                if obj
+                    .get("resolutions")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(serde_json::Map::is_empty)
+                {
+                    obj.shift_remove("resolutions");
+                }
+            }
+            match crate::vendor::common::JsonLayout::of(text)
+                .render(value)
+                .map(String::from_utf8)
+            {
+                Ok(Ok(rendered)) => view.write(&pkg_rel, rendered),
+                _ => {
+                    for uuid in pins.keys() {
+                        result.refuse(uuid, format!("{pkg_rel} could not be re-serialized"));
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    super::super::berry_reposition_blocks(&mut blocks, &moved, was_sorted);
+    let out = format!("{}{trailing_newlines}", blocks.join("\n\n"));
+    view.write(rel, format!("{bom}{}", eol.restore(&out)));
 }
 
 // ── pnpm-lock.yaml ───────────────────────────────────────────────────────────

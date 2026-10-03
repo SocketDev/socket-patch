@@ -253,7 +253,7 @@ fn gem_stale_cache_warning(purl: &str, cache_path: &Path) -> serde_json::Value {
         "detail": format!(
             "{purl} was switched to its hosted patch, but the \
              project's committed bundler cache still holds an UNPATCHED \
-             archive at {} — bundler installs from vendor/cache in preference \
+             archive at {} — bundler installs from its cache dir in preference \
              to fetching, so installs (fresh checkouts included) keep \
              materializing the vulnerable upstream bytes. Remove that file, \
              run `bundle install` so bundler fetches the patched gem, and \
@@ -378,6 +378,9 @@ async fn gem_stale_install_warnings(
     }
     let mut dir_state: std::collections::BTreeMap<std::path::PathBuf, DirJudgment> =
         std::collections::BTreeMap::new();
+    // Bundler's configured cache dir (`cache_path`, default vendor/cache):
+    // the committed archives `bundle install` installs from (#483).
+    let app_cache = socket_patch_core::crawlers::ruby_crawler::bundler_app_cache_dir(cwd).await;
     for (index, (purl, record)) in candidates.iter().enumerate() {
         for found in &found_per_home {
             let Some(pkg) = &found[index] else {
@@ -418,10 +421,7 @@ async fn gem_stale_install_warnings(
         }
         let mut folded_cache: Option<std::path::PathBuf> = None;
         if dir.starts_with(cwd) {
-            let project_cache = cwd
-                .join("vendor")
-                .join("cache")
-                .join(format!("{}.gem", j.leaf));
+            let project_cache = app_cache.join(format!("{}.gem", j.leaf));
             if project_cache.is_file() {
                 let proven_patched = match (
                     gem_artifact_shas.get(&gem_sha_key(&j.purl)),
@@ -467,10 +467,7 @@ async fn gem_stale_install_warnings(
         let Some((_, name, version)) = purl_parts(purl) else {
             continue;
         };
-        let cache_path = cwd
-            .join("vendor")
-            .join("cache")
-            .join(format!("{name}-{version}.gem"));
+        let cache_path = app_cache.join(format!("{name}-{version}.gem"));
         if !cache_path.is_file() {
             continue;
         }
@@ -797,6 +794,7 @@ pub(crate) async fn run_redirect_selected(
         pre_warnings: takeover_pre_warnings,
         dry_run: dry_run_takeover,
         migrated: takeover_migrated,
+        unrecorded: takeover_unrecorded,
         files: takeover_files,
         previews: dry_run_takeover_urls,
     } = match vendored_takeover(common, &mut candidates, &mut vendor_state, &mut skipped).await {
@@ -1018,6 +1016,15 @@ pub(crate) async fn run_redirect_selected(
     // report that outcome. Populated only under --dry-run.
     let mut confirmed = done.confirmed.clone();
     confirmed.extend(dry_run_takeover);
+    // The takeover already reverted these purls' vendored wiring; one the
+    // rewrite then did not pin (a refused lock, unavailable wheel
+    // metadata) is left on the unpatched registry release in BOTH modes.
+    // That must never pass as success.
+    let mut stranded = stranded_takeovers(&takeover_migrated, &confirmed, common.dry_run);
+    // A takeover whose revert succeeded but whose ledger update failed is
+    // refused (never redirected), yet its vendored wiring and artifact are
+    // already gone: it is unpatched in both modes all the same.
+    stranded.extend(takeover_unrecorded);
 
     // Fetch the full patch view (file hashes + vulnerabilities) for each
     // CONFIRMED redirect and persist it so a post-install `socket-patch vex`
@@ -1247,8 +1254,12 @@ pub(crate) async fn run_redirect_selected(
         // installed materialization unpatched, so attesting that purl from
         // the ledger would contradict the run's own warning. Excluded purls
         // fall back to `vex`'s normal installed-tree verification.
+        // A confirmed uuid whose bundled instance the rewriter had to skip
+        // (#469) leaves that copy unpatched, so it too is verified, never
+        // assumed.
         params.assume_applied = confirmed
             .iter()
+            .filter(|(_, uuid)| !rewrite.bundled_skipped_uuids.contains(uuid))
             .map(|(purl, _)| purl.clone())
             .filter(|purl| {
                 !gem_stale.stale_purls.contains(purl)
@@ -1294,6 +1305,18 @@ pub(crate) async fn run_redirect_selected(
     warnings.extend(python_stale.warnings.iter().cloned());
     warnings.extend(vlt_stale.warnings.iter().cloned());
     warnings.extend(takeover_pre_warnings.iter().cloned());
+    warnings.extend(stranded.iter().map(|purl| {
+        serde_json::json!({
+            "code": "redirect_takeover_unpatched",
+            "detail": format!(
+                "{purl} was vendored and its vendored wiring was reverted, but it \
+                 was not pinned to hosted (see the warnings above), so the \
+                 project now installs the UNPATCHED registry release — fix the \
+                 reported cause and re-run `scan --mode hosted`, or run `scan \
+                 --mode vendored` to vendor it again"
+            ),
+        })
+    }));
     warnings.extend(takeover_warnings.iter().cloned());
     warnings.extend(prune_warnings.iter().cloned());
 
@@ -1313,6 +1336,9 @@ pub(crate) async fn run_redirect_selected(
             common.dry_run,
         );
         let mut result = build_redirect_json_envelope(scan_result.take(), redirect);
+        if !stranded.is_empty() {
+            result["status"] = serde_json::json!("partial_failure");
+        }
         if let Some(gate) = &rollout {
             super::finish_rollout_json(gate.stage, &mut result);
         }
@@ -1344,7 +1370,9 @@ pub(crate) async fn run_redirect_selected(
             // line per sentence so CI can grep them.
             let width =
                 std::io::IsTerminal::is_terminal(&std::io::stderr()).then(crate::ui::stderr_width);
-            for purl in &takeover_migrated {
+            // A stranded takeover was NOT migrated to hosted: its
+            // `redirect_takeover_unpatched` warning below says so instead.
+            for purl in takeover_migrated.iter().filter(|p| !stranded.contains(p)) {
                 eprintln!("{}", format_takeover_line(purl, common.dry_run));
             }
             // The files a takeover's revert touched (or, on --dry-run,
@@ -1454,7 +1482,9 @@ pub(crate) async fn run_redirect_selected(
             if let Some(line) = rollout_line {
                 println!("{line}");
             }
-            let mut next_steps = if common.dry_run {
+            // "Commit … to keep the hosted patches" / "reinstall" would be
+            // wrong for a stranded takeover, whose warning names the remedy.
+            let mut next_steps = if common.dry_run || !stranded.is_empty() {
                 Vec::new()
             } else {
                 format_next_steps(&human_files, &rewrite.edits, !takeover_migrated.is_empty())
@@ -1469,8 +1499,48 @@ pub(crate) async fn run_redirect_selected(
         if let Some(e) = &vex_error {
             e.print_embedded(common);
         }
+        if common.silent {
+            for w in warnings
+                .iter()
+                .filter(|w| w["code"] == "redirect_takeover_unpatched")
+            {
+                eprintln!(
+                    "{}",
+                    format_warning(
+                        "redirect_takeover_unpatched",
+                        w["detail"].as_str().unwrap_or_default(),
+                        None
+                    )
+                );
+            }
+        }
+    }
+    if vex_code == 0 && !stranded.is_empty() {
+        return 1;
     }
     vex_code
+}
+
+/// The purls a WET takeover migrated (vendored wiring reverted) that the
+/// rewrite did not confirm as pinned. Empty under `--dry-run`, whose
+/// takeover previews are counted as confirmed without a rewrite.
+fn stranded_takeovers(
+    migrated: &[String],
+    confirmed: &[(String, String)],
+    dry_run: bool,
+) -> Vec<String> {
+    use socket_patch_core::utils::purl::{canonical_purl, strip_purl_qualifiers};
+    if dry_run {
+        return Vec::new();
+    }
+    let key = |purl: &str| canonical_purl(strip_purl_qualifiers(purl));
+    let pinned: std::collections::HashSet<String> =
+        confirmed.iter().map(|(purl, _)| key(purl)).collect();
+    migrated
+        .iter()
+        .filter(|purl| !pinned.contains(&key(purl)))
+        .cloned()
+        .collect()
 }
 
 /// Cross-mode takeover: a purl this run is about to redirect may still be
@@ -1511,10 +1581,15 @@ async fn vendored_takeover(
         std::collections::HashMap::new();
     // Maven takes over only a Gradle build's vendored JVM entry (its revert
     // unplans the vendored Gradle wiring); a pom-only vendored entry stays.
+    // PyPI: every Python rewriter (requirements.txt, Poetry, Pipenv, uv,
+    // Hatch, PDM, pylock) refuses a non-registry source as user-authored,
+    // including the vendored one socket-patch wrote itself, so a vendored
+    // purl must be reverted to its registry entry first (#328).
     let takeover_capable = |p: &str| {
         p.starts_with("pkg:cargo/")
             || p.starts_with("pkg:npm/")
             || p.starts_with("pkg:golang/")
+            || p.starts_with("pkg:pypi/")
             || p.starts_with("pkg:maven/")
     };
     let gradle_jvm_entry = |entry: &socket_patch_core::vendor::VendorEntry| {
@@ -1684,27 +1759,35 @@ async fn vendored_takeover(
     };
     // The takeover refusal (if any) for one candidate: bun gates every
     // npm purl, berry and vlt only their own vendored entries, Gradle each
-    // of its own purls. A refused purl is never dispatched (see the loop),
-    // so its wiring is not a write target here.
+    // of its own purls. Berry also runs the rewriter's per-dep grant gate (a
+    // grant without the berry cache checksum is skipped by the rewriter, so
+    // reverting first would leave the package in neither mode). A refused
+    // purl is never dispatched (see the loop), so its wiring is not a write
+    // target here.
     let takeover_refusal = |c: &Candidate,
                             entry: Option<&socket_patch_core::vendor::VendorEntry>|
-     -> Option<&socket_patch_core::patch::redirect::RewriteWarning> {
+     -> Option<socket_patch_core::patch::redirect::RewriteWarning> {
         if c.purl.starts_with("pkg:maven/") {
-            return gradle_takeover_refusals.get(&c.purl);
+            return gradle_takeover_refusals.get(&c.purl).cloned();
         }
         if !c.purl.starts_with("pkg:npm/") {
             return None;
         }
+        let berry = entry.is_some_and(berry_entry);
         bun_takeover_refusal
-            .as_ref()
+            .clone()
+            .or_else(|| berry_takeover_refusal.clone().filter(|_| berry))
             .or_else(|| {
-                berry_takeover_refusal
-                    .as_ref()
-                    .filter(|_| entry.is_some_and(berry_entry))
+                berry
+                    .then(|| {
+                        socket_patch_core::patch::redirect::preflight_yarn_berry_hosted_dep(&c.dep)
+                            .err()
+                    })
+                    .flatten()
             })
             .or_else(|| {
                 vlt_takeover_refusal
-                    .as_ref()
+                    .clone()
                     .filter(|_| entry.is_some_and(vlt_entry))
             })
     };
@@ -1733,12 +1816,10 @@ async fn vendored_takeover(
         if let Some(entry) = ledger_entry {
             if let Some(warning) = takeover_refusal(candidate, Some(entry)) {
                 refused.push(purl.clone());
-                if !out
-                    .pre_warnings
-                    .iter()
-                    .any(|w| w["code"] == warning.code && w["detail"] == warning.detail)
-                {
-                    out.pre_warnings.push(serde_json::json!(warning));
+                // Project-level refusals repeat per purl; report each once.
+                let warning = serde_json::json!(warning);
+                if !out.pre_warnings.contains(&warning) {
+                    out.pre_warnings.push(warning);
                 }
                 continue;
             }
@@ -1751,6 +1832,11 @@ async fn vendored_takeover(
                 // would refuse the still-vendored wiring.
                 let outcome =
                     crate::commands::vendor::dispatch_revert_one(entry, &common.cwd, true).await;
+                if outcome.success && revert_keeps_wiring(&outcome) {
+                    refused.push(purl.clone());
+                    out.pre_warnings.push(drifted_takeover_warning(purl));
+                    continue;
+                }
                 if !outcome.success {
                     refused.push(purl.clone());
                     out.pre_warnings.push(serde_json::json!({
@@ -1797,6 +1883,16 @@ async fn vendored_takeover(
                 }));
                 continue;
             }
+            if revert_keeps_wiring(&outcome) {
+                // A wiring record drifted and was left in place, so the
+                // project may still resolve through the vendored artifact
+                // and the ledger entry holds the only recorded originals
+                // (the RevertOutcome contract): keep both and refuse,
+                // exactly as `vendor --revert` reports it skipped.
+                refused.push(purl.clone());
+                out.pre_warnings.push(drifted_takeover_warning(purl));
+                continue;
+            }
             // Drop the reverted entry from the in-memory ledger and
             // persist per purl so a crash mid-run leaves a ledger
             // matching the on-disk wiring. The entry stays dropped even
@@ -1811,8 +1907,10 @@ async fn vendored_takeover(
             if let Err(e) = socket_patch_core::vendor::save_state(&common.cwd, state).await {
                 // The wiring is reverted but the ledger still claims it;
                 // redirecting now would leave a ledger asserting wiring
-                // that is gone. Fail closed for this purl.
+                // that is gone. Fail closed for this purl — and since its
+                // vendored wiring is already gone, report it as stranded.
                 refused.push(purl.clone());
+                out.unrecorded.push(purl.clone());
                 out.pre_warnings.push(serde_json::json!({
                     "code": "redirect_vendored_revert_failed",
                     "detail": format!(
@@ -1880,8 +1978,8 @@ async fn vendored_takeover(
     for purl in &refused {
         if let Some((c, entry)) = takeover.iter().find(|(c, _)| &c.purl == purl) {
             let reason = takeover_refusal(c, entry.as_ref())
-                .map_or("vendored_revert_failed", |w| w.code.as_str());
-            skipped.push(SkippedPatch::new(purl, &c.dep.patch_uuid, reason));
+                .map_or_else(|| "vendored_revert_failed".to_string(), |w| w.code);
+            skipped.push(SkippedPatch::new(purl, &c.dep.patch_uuid, &reason));
         }
     }
     // Purls leaving the rewrite set: refused takeovers, plus the dry-run
@@ -1909,6 +2007,32 @@ async fn vendored_takeover(
     Ok(out)
 }
 
+/// Whether a takeover revert left (or, on `--dry-run`, would leave) vendored
+/// wiring in place: a drift-skipped record, or a reverted file that still
+/// references the artifact dir. The backends compute both signals on dry
+/// runs too, while `kept_artifact` itself is set only on wet runs.
+fn revert_keeps_wiring(outcome: &socket_patch_core::vendor::RevertOutcome) -> bool {
+    outcome.kept_artifact
+        || outcome.drift_skipped()
+        || outcome
+            .warnings
+            .iter()
+            .any(|w| w.code == "vendor_revert_residual_reference")
+}
+
+/// The refusal for a takeover whose vendored wiring drifted since vendoring.
+fn drifted_takeover_warning(purl: &str) -> serde_json::Value {
+    serde_json::json!({
+        "code": "redirect_vendored_revert_failed",
+        "detail": format!(
+            "{purl} is vendored and part of its vendored wiring was edited since \
+             vendoring, so it is left in place; NOT switched to hosted — restore or \
+             remove that wiring (`socket-patch vendor --revert` lists it), then re-run \
+             `scan --mode hosted`"
+        ),
+    })
+}
+
 /// What [`vendored_takeover`] did (or, on `--dry-run`, would do).
 #[derive(Default)]
 struct Takeover {
@@ -1923,6 +2047,10 @@ struct Takeover {
     /// Human output: the purls migrated (or, on --dry-run, to be migrated)
     /// from vendored to hosted.
     migrated: Vec<String>,
+    /// Wet takeovers whose vendored wiring was reverted but whose ledger
+    /// update then failed: refused (never redirected), so unpatched in
+    /// both modes.
+    unrecorded: Vec<String>,
     /// The files their revert touches (or would touch). Both modes count
     /// `rewritten ∪ files`, so the preview's file count matches the wet
     /// run's even for wiring files the hosted rewriter does not also
@@ -3507,6 +3635,102 @@ mod tests {
         )
         .await;
         assert!(out.warnings.is_empty());
+    }
+
+    /// #483: bundler's cache dir is a setting (`bundle config set --local
+    /// cache_path vendor/gems` → `BUNDLE_CACHE_PATH` in `.bundle/config`).
+    /// A committed archive at the CONFIGURED path is what `bundle install`
+    /// installs from, so it warns standalone (fresh checkout, no installed
+    /// dir) and joins a stale install's delete list (folded) — and the
+    /// default `vendor/cache`, which bundler no longer reads, is ignored.
+    #[tokio::test]
+    async fn gem_stale_probe_follows_the_configured_bundle_cache_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".bundle")).unwrap();
+        std::fs::write(
+            tmp.path().join(".bundle/config"),
+            "---\nBUNDLE_PATH: \"vendor/bundle\"\nBUNDLE_CACHE_PATH: \"vendor/gems\"\n",
+        )
+        .unwrap();
+        let configured = tmp
+            .path()
+            .join("vendor")
+            .join("gems")
+            .join(format!("{GEM_LEAF}.gem"));
+        std::fs::create_dir_all(configured.parent().unwrap()).unwrap();
+        std::fs::write(&configured, b"upstream archive bytes").unwrap();
+        let mut shas = std::collections::BTreeMap::new();
+        shas.insert(
+            ("stale-unit".to_string(), "1.0.0".to_string()),
+            "0".repeat(64), // the patched artifact's sha — differs
+        );
+
+        // Standalone: a fresh checkout with only the configured cache.
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &one_confirmed(),
+            &one_record(),
+            &shas,
+        )
+        .await;
+        assert_eq!(out.warnings.len(), 1, "configured cache must warn");
+        let detail = detail_of(&out.warnings[0]);
+        assert!(
+            detail.contains(&configured.display().to_string()),
+            "{detail}"
+        );
+        assert_eq!(
+            out.stale_purls,
+            std::collections::BTreeSet::from([GEM_PURL.to_string()]),
+            "the in-run VEX must withhold the attestation"
+        );
+
+        // Folded: a stale install beside it gets the configured archive in
+        // its delete list, in one warning.
+        materialize_gem(tmp.path(), GEM_UPSTREAM);
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &one_confirmed(),
+            &one_record(),
+            &shas,
+        )
+        .await;
+        assert_eq!(out.warnings.len(), 1, "one warning, cache folded in");
+        let detail = detail_of(&out.warnings[0]);
+        assert!(
+            detail.contains(&configured.display().to_string()),
+            "the configured archive must join the delete list: {detail}"
+        );
+
+        // A leftover default vendor/cache archive is not what bundler reads
+        // once cache_path moves it: it neither warns nor joins the list.
+        std::fs::remove_file(&configured).unwrap();
+        let default = tmp
+            .path()
+            .join("vendor")
+            .join("cache")
+            .join(format!("{GEM_LEAF}.gem"));
+        std::fs::create_dir_all(default.parent().unwrap()).unwrap();
+        std::fs::write(&default, b"upstream archive bytes").unwrap();
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &one_confirmed(),
+            &one_record(),
+            &shas,
+        )
+        .await;
+        assert_eq!(out.warnings.len(), 1, "the stale install still warns");
+        let detail = detail_of(&out.warnings[0]);
+        assert!(
+            !detail.contains(&default.display().to_string()),
+            "vendor/cache is not bundler's cache dir here: {detail}"
+        );
     }
 
     /// Committed `vendor/cache` fold, UNKNOWN-sha arm (`_ => false`): when

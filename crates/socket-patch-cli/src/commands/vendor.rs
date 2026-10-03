@@ -257,7 +257,10 @@ pub(crate) async fn dispatch_revert_one_opts(
 /// dependency graph? `None` = cannot determine — callers must keep the
 /// entry (fail-safe): ecosystems other than npm and cargo have no in-use
 /// probe yet, and a missing/unreadable lockfile proves nothing.
-async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
+pub(crate) async fn dispatch_in_use_one(
+    entry: &VendorEntry,
+    project_root: &Path,
+) -> Option<bool> {
     match entry.ecosystem.as_str() {
         "npm" => vendor::npm_flavor::vendored_entry_in_use(entry, project_root).await,
         // Cargo probes the lock entry's shape: detached + `[patch]` pointing
@@ -644,7 +647,42 @@ pub(crate) fn note_classic_migration_risk(
     });
 }
 
+/// The usage error for `vendor` under global scope, or `None` for a
+/// project run. Every form of the command acts on the `--cwd` project's
+/// lockfiles and vendor ledger, which a global run never targets (#498):
+/// plain `vendor` would vendor into the project, `--revert` would unwind
+/// the project's vendoring, and `--check` would report on it.
+fn global_scope_conflict(args: &VendorArgs) -> Option<String> {
+    if crate::commands::project_state_in_scope(&args.common) {
+        return None;
+    }
+    let (form, why) = if args.check {
+        (" --check", "check vendored artifacts in")
+    } else if args.revert {
+        (" --revert", "revert vendored artifacts from")
+    } else {
+        ("", "wire vendored artifacts into")
+    };
+    Some(format!(
+        "{} cannot be used with vendor{form}: global installs have no project lockfile to {why}",
+        crate::commands::global_scope_flag(&args.common),
+    ))
+}
+
 pub async fn run(args: VendorArgs) -> i32 {
+    // Usage errors exit 2, like scan's and get's global mode guard. Checked
+    // before anything reads or locks the project.
+    if let Some(message) = global_scope_conflict(&args) {
+        if args.common.json {
+            let mut env = Envelope::new(Command::Vendor);
+            env.dry_run = args.common.dry_run;
+            env.mark_error(EnvelopeError::new("global_scope_unsupported", message));
+            println!("{}", env.to_pretty_json());
+        } else {
+            eprintln!("Error: {message}");
+        }
+        return 2;
+    }
     if args.check {
         return run_check(&args).await;
     }
@@ -662,31 +700,29 @@ pub async fn run(args: VendorArgs) -> i32 {
     if !args.revert && tokio::fs::metadata(&manifest_path).await.is_err() {
         // A hosted project (no manifest, hosted pins in its lockfiles)
         // ejects: its patch set is the lockfiles' hosted pins.
-        if !args.common.is_global() {
-            let inventory = crate::commands::hosted_inventory(&args.common, &args.common.cwd).await;
-            // Contested hosted wiring: the patch set cannot be read off the
-            // lockfiles, and a "nothing to vendor" answer would hide it.
-            if let Some(refusal) = inventory.contested_refusal() {
-                return emit_eject_refusal(&args.common, "hosted_wiring_contested", &refusal);
+        let inventory = crate::commands::hosted_inventory(&args.common, &args.common.cwd).await;
+        // Contested hosted wiring: the patch set cannot be read off the
+        // lockfiles, and a "nothing to vendor" answer would hide it.
+        if let Some(refusal) = inventory.contested_refusal() {
+            return emit_eject_refusal(&args.common, "hosted_wiring_contested", &refusal);
+        }
+        let pins = hosted_pins_in_scope(&args.common, inventory.pins);
+        if !pins.is_empty() {
+            // Eject needs every patch record from the API: an offline
+            // run (or dry run) refuses before any request.
+            if args.common.offline {
+                return emit_eject_refusal(
+                    &args.common,
+                    "offline_eject_unavailable",
+                    &format!(
+                        "ejecting {} needs {} patch record(s) from the Socket API, and this \
+                         run is offline; re-run without --offline",
+                        plural(pins.len(), "hosted package", "hosted packages"),
+                        pins.len()
+                    ),
+                );
             }
-            let pins = hosted_pins_in_scope(&args.common, inventory.pins);
-            if !pins.is_empty() {
-                // Eject needs every patch record from the API: an offline
-                // run (or dry run) refuses before any request.
-                if args.common.offline {
-                    return emit_eject_refusal(
-                        &args.common,
-                        "offline_eject_unavailable",
-                        &format!(
-                            "ejecting {} needs {} patch record(s) from the Socket API, and this \
-                             run is offline; re-run without --offline",
-                            plural(pins.len(), "hosted package", "hosted packages"),
-                            pins.len()
-                        ),
-                    );
-                }
-                return run_eject(&args, pins).await;
-            }
+            return run_eject(&args, pins).await;
         }
         // A requested `--vex` still attests what the `.socket/vendor`
         // ledgers and lockfiles already wire. Same contract as `apply --vex`
@@ -2378,6 +2414,13 @@ pub(crate) async fn vendor_records_reusing(
             // whose upstream entry cannot be restored is REFUSED; the cargo
             // backend's `hosted_redirect_live` guard backstops the rest.
             if let Some(pin) = hosted_pin_of(candidate) {
+                let origins = crate::commands::rollback::patch_server_origins(common);
+                let restore_opts = socket_patch_core::patch::redirect::upstream::RestoreOptions {
+                    dry_run: common.dry_run,
+                    offline: common.offline,
+                    patch_server_origins: origins.clone(),
+                    bun_lockb: true,
+                };
                 // The refusal the berry backend would raise after the
                 // restore, raised HERE instead — the same `failed` event,
                 // code and detail, in the dry run and the wet run alike —
@@ -2398,12 +2441,25 @@ pub(crate) async fn vendor_records_reusing(
                     }
                 }
                 if candidate.starts_with("pkg:npm/") {
-                    let refusal = berry_takeover_refusal
+                    let project = berry_takeover_refusal
                         .get_or_init(|| {
                             socket_patch_core::vendor::yarn_berry_vendor_preflight(&common.cwd)
                         })
-                        .await;
-                    if let Some((code, detail)) = refusal {
+                        .await
+                        .clone();
+                    let refusal = match project {
+                        Some(refusal) => Some(refusal),
+                        None => {
+                            socket_patch_core::vendor::yarn_berry_vendor_target_preflight(
+                                &common.cwd,
+                                candidate,
+                                pin,
+                                &restore_opts,
+                            )
+                            .await
+                        }
+                    };
+                    if let Some((code, detail)) = &refusal {
                         has_errors = true;
                         env.record(
                             PatchEvent::new(PatchAction::Failed, candidate.clone())
@@ -2413,7 +2469,6 @@ pub(crate) async fn vendor_records_reusing(
                         continue;
                     }
                 }
-                let origins = crate::commands::rollback::patch_server_origins(common);
                 let vlt_lock = socket_patch_core::utils::fs::read_regular_to_string(
                     &common
                         .cwd
@@ -2434,12 +2489,7 @@ pub(crate) async fn vendor_records_reusing(
                 let restore = socket_patch_core::patch::redirect::upstream::restore_upstream(
                     &common.cwd,
                     std::slice::from_ref(pin),
-                    &socket_patch_core::patch::redirect::upstream::RestoreOptions {
-                        dry_run: common.dry_run,
-                        offline: common.offline,
-                        patch_server_origins: origins,
-                        bun_lockb: true,
-                    },
+                    &restore_opts,
                 )
                 .await;
                 let refusal = restore

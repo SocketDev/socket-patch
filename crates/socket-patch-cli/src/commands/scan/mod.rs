@@ -1812,13 +1812,28 @@ async fn run_scan(
     let vendor_state = &ctx.loaded().await.vendor;
     let ledger_supplement =
         vendored_ledger_supplement(&args.common, &all_crawled, vendor_state).await;
-    for pkg in &ledger_supplement {
+    for pkg in &ledger_supplement.packages {
         if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
             *eco_counts.entry(eco).or_insert(0) += 1;
         }
         supplement_purls.insert(pkg.purl.clone());
     }
-    all_crawled.extend(ledger_supplement);
+    all_crawled.extend(ledger_supplement.packages);
+    // Ledger entries whose dependency left the lock: not discovered (see
+    // `vendored_ledger_supplement`). A pruning run reverts them in its GC;
+    // every other run says how to.
+    let unwired_vendored: Vec<String> = ledger_supplement
+        .unwired
+        .into_iter()
+        .filter(|purl| args.common.purl_ecosystem_selected(purl))
+        .collect();
+    let prune_reverts_unwired = prune && !hosted;
+    if !unwired_vendored.is_empty() && !prune_reverts_unwired {
+        layout_refusals.push((
+            "vendor_ledger_entry_unwired".to_string(),
+            render::unwired_vendored_detail(&unwired_vendored),
+        ));
+    }
 
     // Every PURL the crawl found, captured BEFORE the `--ecosystems` /
     // `--package` / PATH filters: prune must judge manifest entries against
@@ -1960,8 +1975,22 @@ async fn run_scan(
             print_layout_refusals(&layout_refusals, args.common.silent);
             policy.print_warnings(args.common.silent);
             // Hosted mode already printed its own prune-ignored warning.
-            if prune && !hosted {
+            if prune && !hosted && unwired_vendored.is_empty() {
                 eprintln!("{}", render::PRUNE_SKIPPED_EMPTY);
+            }
+        }
+        // The manifest half of the GC is skipped on an empty crawl, but
+        // reverting vendored entries the lock no longer wires asks the
+        // lockfile, not the crawl: run that half alone, or a project whose
+        // last vendored dependency was removed could never reconcile.
+        let unwired_gc = if prune_reverts_unwired && !unwired_vendored.is_empty() {
+            Some(gc::run_vendor_only_gc(&args.common, &manifest_path, &socket_dir).await)
+        } else {
+            None
+        };
+        if human {
+            if let Some(gc) = &unwired_gc {
+                gc::print_human_gc(gc, args.common.dry_run);
             }
         }
         // Telemetry: empty-scan still counts as a successful scan.
@@ -2005,6 +2034,9 @@ async fn run_scan(
             // empty one.
             if !layout_refusals.is_empty() {
                 result["warnings"] = layout_refusal_json(&layout_refusals);
+            }
+            if let Some(gc) = &unwired_gc {
+                result["gc"] = gc.to_json(args.common.dry_run);
             }
             policy.fold_into_json(&mut result);
             // Hosted mode: a no-op `redirect` block keeps the envelope
@@ -4513,6 +4545,32 @@ mod tests {
             takeover.redirect,
             vec!["pkg:npm/minimist@1.2.2".to_string()],
             "a berry __archiveUrl binding must prove hosted is live"
+        );
+        assert!(takeover.vendored.is_empty(), "{takeover:?}");
+    }
+
+    #[tokio::test]
+    async fn hosted_direction_provable_for_berry_tarball_locator() {
+        // Today's berry pin is the plain tarball-URL locator (#404).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_vendor_ledger_wired(root, &["pkg:npm/minimist@1.2.2"]).await;
+        tokio::fs::write(
+            root.join("yarn.lock"),
+            format!(
+                "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                 \"minimist@npm:1.2.2\":\n  version: 1.2.2\n  \
+                 resolution: \"minimist@https://patch.socket.dev/patch/npm/{TAKEOVER_TOKEN}/{TAKEOVER_UUID}/minimist-1.2.2.tgz\"\n"
+            ),
+        )
+        .await
+        .unwrap();
+
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
+        assert_eq!(
+            takeover.redirect,
+            vec!["pkg:npm/minimist@1.2.2".to_string()],
+            "a berry tarball locator must prove hosted is live"
         );
         assert!(takeover.vendored.is_empty(), "{takeover:?}");
     }

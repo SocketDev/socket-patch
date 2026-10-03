@@ -998,6 +998,43 @@ async fn yarn_berry_registry_resolutions_inventory_with_checksums() {
     assert!(!entries.iter().any(|e| e.name == "fixture"), "{entries:?}");
 }
 
+/// #404: a hosted berry pin — keyed by its tarball descriptor (the
+/// `resolutions` pin) or, from an earlier release, under the untouched
+/// `npm:` key — is still the registry package, so lock-only discovery keeps
+/// inventorying it (and a later hosted scan can re-pin it). A user's own URL
+/// dependency whose tarball does not name a package version stays out.
+#[tokio::test]
+async fn yarn_berry_hosted_tarball_pin_stays_in_the_inventory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hosted = YARN_BERRY
+        .replace(
+            "resolution: \"left-pad@npm:1.3.0\"",
+            "resolution: \"left-pad@https://patch.socket.dev/patch/npm/left-pad/1.3.0/t/u/left-pad-1.3.0.tgz\"",
+        )
+        .replace(
+            "\"@scope/pkg@npm:^2.0.0\":\n  version: 2.0.0\n  resolution: \"@scope/pkg@npm:2.0.0\"",
+            "\"@scope/pkg@https://patch.socket.dev/patch/npm/@scope/pkg/2.0.0/t/u/pkg-2.0.0.tgz\":\n  \
+             version: 2.0.0\n  \
+             resolution: \"@scope/pkg@https://patch.socket.dev/patch/npm/@scope/pkg/2.0.0/t/u/pkg-2.0.0.tgz\"",
+        )
+        + "\n\"own@https://example.test/own-latest.tgz\":\n  version: 1.0.0\n  \
+           resolution: \"own@https://example.test/own-latest.tgz\"\n  \
+           checksum: 10c0/own==\n  languageName: node\n  linkType: hard\n";
+    assert!(hosted.contains("\"@scope/pkg@https://"), "{hosted}");
+    write(tmp.path(), "yarn.lock", &hosted).await;
+
+    let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    assert_eq!(flavor, NpmLockFlavor::YarnBerry);
+    let lp = entry(&entries, "left-pad");
+    assert_eq!(lp.version, "1.3.0");
+    assert_eq!(
+        lp.integrity,
+        LockIntegrity::BerryChecksum("10c0/deadbeefcafe==".into())
+    );
+    assert_eq!(entry(&entries, "@scope/pkg").version, "2.0.0");
+    assert!(!entries.iter().any(|e| e.name == "own"), "{entries:?}");
+}
+
 /// yarn berry writes a CRLF `yarn.lock` on Windows (a new lockfile gets
 /// `os.EOL`), and editors add a BOM: the Windows spellings — header-less
 /// too — inventory exactly like the LF lock, with no stray `\r` riding into
@@ -2923,5 +2960,155 @@ async fn the_vendored_requirements_writers_own_output_reinventories() {
         sorted_pairs(&entries),
         vec![("requests".to_string(), "2.28.1".to_string())],
         "wet requirements.txt:\n{line}\nentries: {entries:?}"
+    );
+}
+
+/// #523: pip reads `six == 1.15.0`, `six ==1.15.0`, `six== 1.15.0`,
+/// `six[x] == 1.15.0` and the legacy `six (==1.15.0)` exactly like
+/// `six==1.15.0`, and so does the hosted rewriter — the lock-only
+/// inventory must too, or a fresh checkout never asks for the patch.
+#[tokio::test]
+async fn requirements_spaced_and_parenthesised_pins_are_inventoried() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "requirements.txt",
+        "six == 1.15.0\n\
+         idna ==3.7\n\
+         attrs== 23.1.0\n\
+         requests[socks] == 2.31.0 ; python_version >= \"3.8\"\n\
+         certifi (==2024.2.2)\n\
+         urllib3 ( == 1.26.18 )  # legacy parens\n\
+         flask == 3.0.0 \\\n    --hash=sha256:{sha}\n\
+         jinja2 == 3.*\n\
+         click == 8.0,<9\n"
+            .replace("{sha}", &"d".repeat(64))
+            .as_str(),
+    )
+    .await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![
+            ("attrs".to_string(), "23.1.0".to_string()),
+            ("certifi".to_string(), "2024.2.2".to_string()),
+            ("flask".to_string(), "3.0.0".to_string()),
+            ("idna".to_string(), "3.7".to_string()),
+            ("requests".to_string(), "2.31.0".to_string()),
+            ("six".to_string(), "1.15.0".to_string()),
+            ("urllib3".to_string(), "1.26.18".to_string()),
+        ],
+        "{entries:?}"
+    );
+    assert_eq!(
+        entry(&entries, "flask").integrity,
+        LockIntegrity::Sha256AnyOf(vec!["d".repeat(64)]),
+        "a spaced pin keeps its --hash digest"
+    );
+}
+
+/// #412: pins reached through in-root `-r` / `--requirement` includes
+/// (resolved against the INCLUDING file's directory) join the lock-only
+/// inventory — the same tree the vendored writer edits. `-c` constraints
+/// and out-of-root includes are not followed; include cycles terminate.
+#[tokio::test]
+async fn requirements_in_root_includes_are_inventoried() {
+    let outer = tempfile::tempdir().unwrap();
+    let root = outer.path().join("proj");
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    write(
+        &root,
+        "requirements.txt",
+        "-r requirements/base.txt\n--requirement=requirements/dev.txt\n-c constraints.txt\n-r ../outside.txt\nflask==3.0.0\n",
+    )
+    .await;
+    write_nested(
+        &root,
+        "requirements/base.txt",
+        "six==1.16.0\n-r common/extra.txt\n",
+    )
+    .await;
+    // Relative to requirements/, not to the root.
+    write_nested(
+        &root,
+        "requirements/common/extra.txt",
+        "idna == 3.7\n-r ../base.txt\n",
+    )
+    .await;
+    write_nested(&root, "requirements/dev.txt", "-rbase.txt\npytest==8.0.0\n").await;
+    write(&root, "constraints.txt", "attrs==23.1.0\n").await;
+    write(outer.path(), "outside.txt", "click==8.1.7\n").await;
+
+    let entries = inventory_pypi_locks(&root).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![
+            ("flask".to_string(), "3.0.0".to_string()),
+            ("idna".to_string(), "3.7".to_string()),
+            ("pytest".to_string(), "8.0.0".to_string()),
+            ("six".to_string(), "1.16.0".to_string()),
+        ],
+        "{entries:?}"
+    );
+
+    // A root file holding ONLY an include still yields the included pins
+    // (the #412 repro layout).
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "requirements.txt", "-r requirements/base.txt\n").await;
+    write_nested(tmp.path(), "requirements/base.txt", "six==1.16.0\n").await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![("six".to_string(), "1.16.0".to_string())]
+    );
+
+    // The in-memory hosted engine reads the same tree.
+    let mut project = MemoryProject::new();
+    project.insert_text("requirements.txt", "-r requirements/base.txt\n");
+    project.insert_text("requirements/base.txt", "six==1.16.0\n");
+    let in_memory = super::pypi::inventory_pypi_locks_in(&ProjectView::Memory(&project))
+        .await
+        .unwrap();
+    assert_eq!(sorted_pairs(&in_memory), sorted_pairs(&entries));
+}
+
+/// pip applies an index option from ANY file of the tree globally, so an
+/// `--index-url` inside an include keeps the root file's hashed pins
+/// unverifiable too (the `public_index` rule spans the whole tree).
+#[tokio::test]
+async fn requirements_index_option_in_an_include_spans_the_tree() {
+    let sha = "e".repeat(64);
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "requirements.txt",
+        &format!("-r private.txt\nsix==1.16.0 --hash=sha256:{sha}\n"),
+    )
+    .await;
+    write(
+        tmp.path(),
+        "private.txt",
+        &format!(
+            "--index-url https://pypi.internal.example/simple\nidna==3.7 --hash=sha256:{sha}\n"
+        ),
+    )
+    .await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(entry(&entries, "six").integrity, LockIntegrity::None);
+    assert_eq!(entry(&entries, "idna").integrity, LockIntegrity::None);
+
+    // Control: no index option anywhere keeps the digests.
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "requirements.txt", "-r public.txt\n").await;
+    write(
+        tmp.path(),
+        "public.txt",
+        &format!("idna==3.7 --hash=sha256:{sha}\n"),
+    )
+    .await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        entry(&entries, "idna").integrity,
+        LockIntegrity::Sha256AnyOf(vec![sha.clone()])
     );
 }

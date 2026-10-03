@@ -9,4 +9,5 @@ pub mod package;
 pub(crate) mod path_safety;
 pub mod redirect;
 pub mod rollback;
+pub mod shared_store;
 pub mod sidecars;

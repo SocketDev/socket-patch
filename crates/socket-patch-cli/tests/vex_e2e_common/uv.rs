@@ -688,7 +688,10 @@ struct Built {
 
 /// Build the lane's project with the real uv (network: PyPI). `Err` is a
 /// skip reason (PyPI unreachable, fixture command failed).
-fn build(uv: &Uv, lane: Lane, tmp: &Path) -> Result<Built, String> {
+/// `mode` hosted: the uv pylock lanes also lock a pure-Python PyPI sibling
+/// (`idna`), which shows the hosted rollback the lock's registry and
+/// artifact shape.
+fn build(uv: &Uv, lane: Lane, mode: Mode, tmp: &Path) -> Result<Built, String> {
     let proj = tmp.join("proj");
     std::fs::create_dir_all(&proj).unwrap();
     let cache = tmp.join("uv-cache");
@@ -754,10 +757,16 @@ fn build(uv: &Uv, lane: Lane, tmp: &Path) -> Result<Built, String> {
         Lane::ExportPylock => {
             let src = tmp.join("export-src");
             std::fs::create_dir_all(&src).unwrap();
+            let deps = match mode {
+                Mode::Hosted => "\"six==1.16.0\", \"idna==3.7\"",
+                Mode::Vendored => "\"six==1.16.0\"",
+            };
             std::fs::write(
                 src.join("pyproject.toml"),
-                "[project]\nname = \"uv-vex-capstone\"\nversion = \"0.1.0\"\n\
-                 requires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\"]\n",
+                format!(
+                    "[project]\nname = \"uv-vex-capstone\"\nversion = \"0.1.0\"\n\
+                     requires-python = \">=3.9\"\ndependencies = [{deps}]\n"
+                ),
             )
             .unwrap();
             need(uv.run_py(&src, &["lock"], &cache), "uv lock")?;
@@ -773,7 +782,13 @@ fn build(uv: &Uv, lane: Lane, tmp: &Path) -> Result<Built, String> {
             pylock_sync(uv, &proj, &cache)?;
         }
         Lane::CompilePylock => {
-            std::fs::write(proj.join("requirements.in"), "six==1.16.0\n").unwrap();
+            // Hosted: `idna` is a sibling with no `index` (uv pip compile
+            // writes none).
+            let reqs = match mode {
+                Mode::Hosted => "six==1.16.0\nidna==3.7\n",
+                Mode::Vendored => "six==1.16.0\n",
+            };
+            std::fs::write(proj.join("requirements.in"), reqs).unwrap();
             need(
                 uv.run_py(
                     &proj,
@@ -1171,7 +1186,7 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let built = match build(uv, lane, tmp.path()) {
+    let built = match build(uv, lane, mode, tmp.path()) {
         Ok(b) => b,
         Err(why) => {
             skip(suite, &format!("{}: {why}", report.what("setup")));
@@ -1560,6 +1575,11 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
         &|step, result| report.row(step, result),
     );
 
+    // ── 5b. a sibling dependency added after vendoring (#474) ─────────
+    if mode == Mode::Vendored && lane == Lane::Script {
+        script_sibling_revert(uv, &report, &proj, tmp.path());
+    }
+
     // ── 6. the real revert ────────────────────────────────────────────
     // Vendored: `vendor --revert` restores every wiring file byte for
     // byte. Hosted (v5): `rollback` rewrites each pin back to the DEFAULT
@@ -1611,6 +1631,11 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
         ),
     };
     if mode == Mode::Hosted {
+        // The uv pylock lanes lock a PyPI sibling, which shows the registry
+        // (an `index`, or for `uv pip compile` PyPI files with none, #407)
+        // and the artifact shape, so they restore to the bytes uv wrote
+        // (#408).
+        let byte_exact = matches!(lane, Lane::ExportPylock | Lane::CompilePylock);
         let env: Value = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|e| panic!("{}: ({e})\n{}", report.what("revert"), dump(&out)));
         let still_wired =
@@ -1624,15 +1649,28 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
                     report.what("revert"),
                     dump(&out)
                 );
-                for (f, _) in &built.registry {
+                for (f, bytes) in &built.registry {
                     assert!(
                         !still_wired(f),
                         "{}: {f} still names the hosted patch",
                         report.what("revert")
                     );
+                    if byte_exact {
+                        assert_eq!(
+                            String::from_utf8_lossy(&std::fs::read(proj.join(f)).unwrap()),
+                            String::from_utf8_lossy(bytes),
+                            "{}: {f} not byte-restored",
+                            report.what("revert")
+                        );
+                    }
                 }
                 report.row("revert", "restored to the upstream registry entry");
             }
+            _ if byte_exact => panic!(
+                "{}: a uv pylock must restore:\n{}",
+                report.what("revert"),
+                dump(&out)
+            ),
             _ => {
                 let error = env["hosted"]["failed"][0]["error"]
                     .as_str()
@@ -1680,6 +1718,85 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
         );
     }
     report.row("revert", "byte-identical");
+}
+
+/// #474: `uv add --script` after vendoring adds an unrelated requirement
+/// to the script and its lock (a new `[manifest] requirements` element and
+/// `[[package]]`). `vendor --revert` must still restore six's registry
+/// wiring and keep the user's addition, leaving a lock uv accepts as is.
+/// Runs on a copy so the byte-identical revert below is unaffected.
+fn script_sibling_revert(uv: &Uv, report: &Report<'_>, proj: &Path, tmp: &Path) {
+    let dir = tmp.join("sibling");
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in [SCRIPT, "tool.py.lock"] {
+        std::fs::copy(proj.join(f), dir.join(f)).unwrap();
+    }
+    copy_tree(&proj.join(".socket"), &dir.join(".socket"));
+    let cache = tmp.join("sibling-cache");
+    let out = uv.run_py(&dir, &["add", "--script", SCRIPT, "idna==3.7"], &cache);
+    if !ok(&out) {
+        report.row("sibling-revert", "n/a (`uv add --script` failed)");
+        println!("{}", dump(&out));
+        return;
+    }
+    let lock = std::fs::read_to_string(dir.join("tool.py.lock")).unwrap();
+    assert!(
+        lock.contains("name = \"idna\"") && lock.contains(".socket/vendor"),
+        "{}: uv add did not keep the vendored lock:\n{lock}",
+        report.what("sibling-revert")
+    );
+    let out = socket_patch(
+        &dir,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            dir.to_str().unwrap(),
+        ],
+    );
+    let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), dump(&out));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}:\n{text}",
+        report.what("sibling-revert")
+    );
+    assert!(
+        !text.contains("vendor_lock_entry_drifted"),
+        "{}: an added sibling counted as drift:\n{text}",
+        report.what("sibling-revert")
+    );
+    for f in [SCRIPT, "tool.py.lock"] {
+        let body = std::fs::read_to_string(dir.join(f)).unwrap();
+        assert!(
+            !body.contains(".socket/vendor") && body.contains("idna"),
+            "{}: {f} still vendored or lost idna:\n{body}",
+            report.what("sibling-revert")
+        );
+    }
+    assert!(
+        !dir.join(".socket/vendor/pypi")
+            .join(Mode::Vendored.uuid())
+            .exists(),
+        "{}: the vendored artifact was kept",
+        report.what("sibling-revert")
+    );
+    let reverted = std::fs::read(dir.join("tool.py.lock")).unwrap();
+    let out = uv.run_py(&dir, &["lock", "--script", SCRIPT], &cache);
+    assert!(
+        ok(&out),
+        "{}: uv lock --script:\n{}",
+        report.what("sibling-revert"),
+        dump(&out)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(dir.join("tool.py.lock")).unwrap()),
+        String::from_utf8_lossy(&reverted),
+        "{}: uv rewrote the reverted lock",
+        report.what("sibling-revert")
+    );
+    report.row("sibling-revert", "restored, user addition kept");
 }
 
 // ── production legs ────────────────────────────────────────────────────

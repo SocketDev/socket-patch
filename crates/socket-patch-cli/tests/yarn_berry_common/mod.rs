@@ -371,7 +371,7 @@ pub fn off_runtime<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 /// How the flow wired the patched dependency.
 #[derive(Clone, Debug)]
 pub enum BerryWiring {
-    /// `yarn.lock` resolves it via `::__archiveUrl=` on `patch_server`
+    /// `yarn.lock` resolves it via a tarball-URL locator on `patch_server`
     /// (the mock tarball host — not a Socket host, so every VEX run passes
     /// it as `--patch-server-url`).
     Hosted { patch_server: String },

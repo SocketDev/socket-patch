@@ -697,8 +697,10 @@ fn write_berry_project_spelled(root: &Path, spell: impl Fn(&str) -> String) {
     .unwrap();
 }
 
-/// The berry leg: the yarn.lock entry is repointed via `::__archiveUrl=` (the
-/// URL percent-encoded) and its `checksum:` becomes the yarnBerry10c0. The
+/// The berry leg: the yarn.lock entry's resolution becomes the hosted
+/// tarball-URL locator (never an `npm:` one, whose fetcher sends npm
+/// registry auth to the patch host — #404) and its `checksum:` becomes the
+/// yarnBerry10c0. The
 /// descriptor KEY is preserved (so `--immutable` still passes), no ledger is
 /// written, and a second run is a no-op.
 #[tokio::test]
@@ -715,20 +717,30 @@ async fn scan_redirect_rewrites_yarn_berry_lock() {
     assert_eq!(code, 0, "scan --mode hosted (berry) should succeed");
 
     let lock = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
-    // yarn writes `__archiveUrl=<encodeURIComponent(url)>`; assert both the
-    // binding marker and the encoded URL landed.
-    let encoded = socket_patch_core::utils::uri::encode_uri_component(HOSTED_URL);
     assert!(
-        lock.contains("::__archiveUrl=") && lock.contains(&encoded),
-        "resolution must carry the encoded __archiveUrl; got:\n{lock}"
+        lock.contains(&format!("\n  resolution: \"{NAME}@{HOSTED_URL}\"\n")),
+        "resolution must be the hosted tarball locator; got:\n{lock}"
+    );
+    assert!(
+        !lock.contains("__archiveUrl") && !lock.contains(&format!("resolution: \"{NAME}@npm:")),
+        "the hosted pin must not be an npm: locator; got:\n{lock}"
     );
     assert!(
         lock.contains(BERRY_CHECKSUM),
         "checksum must be the yarnBerry10c0"
     );
+    // Option C (#404): the entry is re-keyed by the tarball descriptor, and
+    // the root package.json routes the original descriptor there.
     assert!(
-        lock.contains(&format!("\"{NAME}@npm:^{VERSION}\":")),
-        "the descriptor key must be preserved verbatim; got:\n{lock}"
+        lock.contains(&format!("\"{NAME}@{HOSTED_URL}\":")),
+        "the entry is keyed by the tarball descriptor; got:\n{lock}"
+    );
+    let pkg = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
+    let pkg: serde_json::Value = serde_json::from_str(&pkg).unwrap();
+    assert_eq!(
+        pkg["resolutions"],
+        serde_json::json!({ format!("{NAME}@npm:^{VERSION}"): HOSTED_URL }),
+        "{pkg}"
     );
     vlt_hosted_common::assert_no_ledger(tmp.path());
 
@@ -770,9 +782,7 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
         Some(tarball),
     )
     .await;
-    let encoded = socket_patch_core::utils::uri::encode_uri_component(
-        &HOSTED_URL.replace("http://patch.test", &server.uri()),
-    );
+    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
 
     for (label, bom) in [("crlf", ""), ("bom+crlf", "\u{feff}")] {
         let tmp = tempfile::tempdir().unwrap();
@@ -792,7 +802,7 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
         );
         let lock = std::fs::read_to_string(&lock_path).unwrap();
         assert!(
-            lock.contains(&format!("::__archiveUrl={encoded}\"\r\n"))
+            lock.contains(&format!("  resolution: \"{NAME}@{hosted_url}\"\r\n"))
                 && lock.contains(&format!("  checksum: {BERRY_CHECKSUM}\r\n")),
             "{label}: the entry is redirected in CRLF: {lock:?}"
         );
@@ -841,8 +851,87 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
             "{label}: rollback restores the pristine CRLF lock (upstream checksum \
              re-derived from the registry tarball)"
         );
+        let pkg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.path().join("package.json")).unwrap())
+                .unwrap();
+        assert!(
+            pkg.get("resolutions").is_none(),
+            "{label}: rollback drops the resolutions pin: {pkg}"
+        );
         vlt_hosted_common::assert_no_ledger(tmp.path());
     }
+}
+
+/// #404 upgrade path: a lock pinned by an earlier release carries the old
+/// `npm:<v>::__archiveUrl=<url>` resolution, which makes yarn's npm fetcher
+/// send registry auth to the patch host. `rollback` must still recognize and
+/// restore that legacy pin, and a repeat hosted `scan` must re-pin it to the
+/// tarball-URL locator.
+#[tokio::test]
+#[serial]
+async fn yarn_berry_legacy_archive_url_pin_is_rolled_back_and_repinned() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    mock_reference_with_berry_url(&server, &hosted_url).await;
+    mock_view(&server).await;
+    let tarball = upstream_tarball();
+    mock_npm_registry(
+        &server,
+        &vlt_hosted_common::sha512_sri(&tarball),
+        Some(tarball),
+    )
+    .await;
+    let legacy = |t: &str| {
+        t.replace(
+            &format!("resolution: \"{NAME}@npm:{VERSION}\""),
+            &format!(
+                "resolution: \"{NAME}@npm:{VERSION}::__archiveUrl={}\"",
+                socket_patch_core::utils::uri::encode_uri_component(&hosted_url)
+            ),
+        )
+        .replace(&format!("10c0/{}", "3".repeat(128)), BERRY_CHECKSUM)
+    };
+
+    // Rollback of the legacy pin restores the registry entry.
+    let tmp = tempfile::tempdir().unwrap();
+    write_berry_project_spelled(tmp.path(), legacy);
+    let lock_path = tmp.path().join("yarn.lock");
+    assert!(std::fs::read_to_string(&lock_path)
+        .unwrap()
+        .contains("::__archiveUrl="));
+    let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
+    assert_eq!(code, Some(0), "rollback: {env:#}");
+    assert_eq!(
+        env["hosted"]["reverted"],
+        serde_json::json!([PURL]),
+        "{env:#}"
+    );
+    let restored = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(
+        restored.contains(&format!("\n  resolution: \"{NAME}@npm:{VERSION}\"\n"))
+            && !restored.contains("__archiveUrl")
+            && !restored.contains(BERRY_CHECKSUM),
+        "the registry entry is restored: {restored}"
+    );
+
+    // A repeat hosted scan re-pins the legacy entry as a tarball locator.
+    let tmp = tempfile::tempdir().unwrap();
+    write_berry_project_spelled(tmp.path(), legacy);
+    let lock_path = tmp.path().join("yarn.lock");
+    let env = run_redirect_subprocess_with(
+        tmp.path(),
+        &server.uri(),
+        &["--patch-server-url", &server.uri()],
+    );
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(
+        lock.contains(&format!("\n  resolution: \"{NAME}@{hosted_url}\"\n"))
+            && !lock.contains("__archiveUrl"),
+        "the legacy pin is migrated: {lock}"
+    );
+    vlt_hosted_common::assert_no_ledger(tmp.path());
 }
 
 /// A berry lock whose line endings are MIXED (CRLF and LF, or a bare CR)
@@ -1031,6 +1120,63 @@ async fn scan_redirect_rewrites_bun_lock() {
     );
     vlt_hosted_common::assert_no_ledger(tmp.path());
     bun_manifestless_vex(tmp.path(), &lock_before, "bun-v1");
+}
+
+/// REGRESSION (#469): the project also gets a BUNDLED copy of the patched
+/// `name@version` (`parent` bundles it; Bun unpacks it from parent's
+/// tarball, so no rewire reaches it). The regular entry is redirected, but
+/// the in-run `--vex` must not attest the purl while that copy stays
+/// unpatched, exactly like a standalone `vex` run.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_bun_bundled_copy_is_not_attested_in_run() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_project(tmp.path(), 1);
+    let lock = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
+    let bundled = format!(
+        "    \"parent/{NAME}\": [\"{NAME}@{VERSION}\", \"\", {{ \"bundled\": true }},          \"sha512-UPSTREAMupstream==\"],\n  }}\n}}\n"
+    );
+    let lock = lock.replacen("  }\n}\n", &bundled, 1);
+    std::fs::write(tmp.path().join("bun.lock"), &lock).unwrap();
+    let copy = tmp
+        .path()
+        .join("node_modules/parent/node_modules")
+        .join(NAME);
+    std::fs::create_dir_all(&copy).unwrap();
+    std::fs::write(
+        copy.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+
+    let out = tmp.path().join("out.vex.json");
+    let mut args = redirect_args(tmp.path(), server.uri());
+    args.vex.vex = Some(out.clone());
+    args.vex.vex_product = Some("pkg:npm/consumer@0.0.0".into());
+    let _ = run(args).await;
+
+    let rewritten = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
+    assert!(
+        rewritten.contains(&format!("\"{NAME}@{HOSTED_URL}\"")),
+        "the regular entry is redirected"
+    );
+    assert!(
+        rewritten.contains(&format!("\"parent/{NAME}\": [\"{NAME}@{VERSION}\"")),
+        "the bundled entry keeps its registry spec"
+    );
+    let attested = std::fs::read_to_string(&out)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .is_some_and(|doc| doc.to_string().contains(PURL));
+    assert!(
+        !attested,
+        "in-run VEX must not attest a purl whose bundled copy stays unpatched"
+    );
 }
 
 /// The bun 1.4 leg: `"lockfileVersion": 2` is the SAME emitted grammar as 1

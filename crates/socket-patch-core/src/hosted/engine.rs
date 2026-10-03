@@ -424,6 +424,46 @@ pub async fn read_candidate_files(
         }
     }
 
+    // A yarn berry lock is pinned through the root manifest's `resolutions`
+    // (see `patch::redirect::rewrite_yarn_berry`), so beside one the
+    // manifest is a rewrite target: read strictly, a link or an unreadable
+    // in-memory entry refused like any other file the rewrite writes.
+    if candidates.iter().any(|c| c.dep.ecosystem == "npm")
+        && out
+            .files
+            .get("yarn.lock")
+            .is_some_and(|lock| crate::patch::redirect::is_berry_lock(lock))
+    {
+        out.read(view, unreadable, "package.json").await;
+    // Otherwise the root manifest's `overrides` decide which git / url /
+    // `file:` dependent specs npm really installs from (#490). Only the npm
+    // lock rewriter reads it, as advisory input: no rewriter edits it, so a
+    // link or an unreadable in-memory entry is left out (the rewriter then
+    // keeps its conservative reading) rather than refused.
+    } else if candidates.iter().any(|c| c.dep.ecosystem == "npm")
+        && NPM_LOCKS.iter().any(|lock| out.files.contains_key(*lock))
+    {
+        let rel = crate::hosted::memory::select::NPM_MANIFEST_REL;
+        let text = match view {
+            ProjectView::Disk(_) | ProjectView::Snapshot(_) => view.read_text(rel).await.ok(),
+            ProjectView::Memory(project)
+                if !project.is_symlink(rel) && !unreadable.contains(rel) =>
+            {
+                match project.get(rel) {
+                    Some(MemoryEntry::Text(text)) => Some(text.to_string()),
+                    Some(MemoryEntry::Binary(bytes)) => {
+                        std::str::from_utf8(bytes).ok().map(str::to_string)
+                    }
+                    _ => None,
+                }
+            }
+            ProjectView::Memory(_) => None,
+        };
+        if let Some(text) = text {
+            out.files.insert(rel.to_string(), text);
+        }
+    }
+
     // Cargo workspace members (and in-root path dependencies) declare
     // dependencies of their own: a member's direct `cfg-if = "1"` must be
     // pinned alongside the root's, or the redirected lock entry is
@@ -811,8 +851,9 @@ enum ProbeStep {
 ///   ([`artifact_url_spellings`], raw or the `\/`-escaped slashes an old
 ///   composer.lock spells them with), so a writer's spelling can never be
 ///   one this probe misses.
-/// - The percent-encoded URL: the berry rewriter writes it into the lock's
-///   `::__archiveUrl=` binding, so the raw form is absent.
+/// - The percent-encoded URL: releases up to 5.0 wrote it into a berry
+///   lock's `::__archiveUrl=` binding (today's berry pin is the raw URL), so
+///   a lock pinned by them carries no raw form.
 /// - The registry index URL and the maven suffixed version, when present.
 pub fn candidate_presence_needles(dep: &DepOverride) -> Vec<String> {
     let artifact_url = dep.artifact_url.as_str();
@@ -1368,15 +1409,20 @@ fn confirm(
     // artifact failed the preflight beside another npm-family lock) may
     // still hold an earlier run's pin: only the sibling lock this run
     // rewrote can confirm that dep.
+    // The yarn berry pin's `package.json` `resolutions` entry is only half of
+    // it — the URL-keyed `yarn.lock` entry is what installs — so a hosted URL
+    // left in the manifest (an earlier run, a refused rewrite) proves
+    // nothing on its own: the manifest never feeds the probe.
     let final_texts: Vec<(&str, &String)> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
+        .filter(|(name, _)| name.as_str() != "package.json")
         .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
         .chain(
             rewrite
                 .files
                 .iter()
-                .filter(|(name, _)| !files.contains_key(*name))
+                .filter(|(name, _)| !files.contains_key(*name) && name.as_str() != "package.json")
                 .map(|(name, content)| (name.as_str(), content)),
         )
         .collect();
@@ -1448,6 +1494,13 @@ fn confirm(
             }
             if rewrite.refused_pnpm_uuids.contains(uuid) {
                 return ProbeStep::Decided(false);
+            }
+            // A yarn berry pin is the URL-keyed lock entry AND the manifest
+            // `resolutions` routing to it; the URL in `yarn.lock` alone (the
+            // routing removed, a refused re-pin) installs nothing, so the
+            // berry rewriter's own report decides every dep its lock holds.
+            if rewrite.yarn_berry_uuids.contains(uuid) {
+                return ProbeStep::Decided(rewrite.confirmed_yarn_berry_uuids.contains(uuid));
             }
             // Cargo is transactional: the rewriter reports exactly which
             // patch uuids FULLY landed (manifest pin + lock + registry
@@ -1742,6 +1795,264 @@ mod tests {
         // A non-UTF-8 file is absent to disk too: not a refusal.
         let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
         assert!(read.unreadable_reads.is_empty());
+    }
+
+    /// A hosted URL left in a berry project's `package.json` `resolutions`
+    /// while `yarn.lock` still resolves the registry entry confirms nothing:
+    /// only the lock pin installs (#404).
+    #[test]
+    fn a_resolutions_url_alone_does_not_confirm_a_berry_redirect() {
+        use crate::patch::redirect::Integrity;
+        let url = "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/uuid/left-pad-1.3.0.tgz";
+        let candidate = Candidate {
+            purl: "pkg:npm/left-pad@1.3.0".into(),
+            dep: DepOverride {
+                ecosystem: "npm".into(),
+                name: "left-pad".into(),
+                namespace: None,
+                version: "1.3.0".into(),
+                token: "tok".into(),
+                patch_uuid: "uuid".into(),
+                artifact_url: url.into(),
+                registry_override: None,
+                integrity: Integrity::default(),
+            },
+        };
+        let lock = "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\"left-pad@npm:^1.3.0\":\n  \
+                    version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n";
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), lock.to_string());
+        files.insert(
+            "package.json".to_string(),
+            format!("{{\"resolutions\": {{\"left-pad@npm:^1.3.0\": \"{url}\"}}}}"),
+        );
+        let none = confirm(
+            &files,
+            &RewriteResult::default(),
+            std::slice::from_ref(&candidate),
+            false,
+            &BTreeSet::new(),
+        );
+        assert!(none.is_empty(), "{none:?}");
+        // The lock pin itself still confirms.
+        files.insert(
+            "yarn.lock".to_string(),
+            lock.replace(
+                "resolution: \"left-pad@npm:1.3.0\"",
+                &format!("resolution: \"left-pad@{url}\""),
+            ),
+        );
+        let confirmed = confirm(
+            &files,
+            &RewriteResult::default(),
+            std::slice::from_ref(&candidate),
+            false,
+            &BTreeSet::new(),
+        );
+        assert_eq!(confirmed.len(), 1, "{confirmed:?}");
+    }
+
+    /// Review of #465: a hosted berry pin whose `resolutions` routing was
+    /// removed keeps its URL-keyed lock entry. The rewriter refuses to re-pin
+    /// it (the routing is not ours to recreate silently), so nothing
+    /// installs the patch — and the URL in `yarn.lock` must not confirm it
+    /// (a confirmed dep feeds the in-run VEX `not_affected` exemption).
+    #[test]
+    fn an_orphaned_berry_lock_pin_is_not_confirmed() {
+        use crate::patch::redirect::{rewrite_registry_redirect, Integrity};
+        let url = "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/uuid/left-pad-1.3.0.tgz";
+        let candidate = Candidate {
+            purl: "pkg:npm/left-pad@1.3.0".into(),
+            dep: DepOverride {
+                ecosystem: "npm".into(),
+                name: "left-pad".into(),
+                namespace: None,
+                version: "1.3.0".into(),
+                token: "tok".into(),
+                patch_uuid: "uuid".into(),
+                artifact_url: url.into(),
+                registry_override: None,
+                integrity: Integrity {
+                    yarn_berry10c0: Some(format!("10c0/{}", "7".repeat(128))),
+                    ..Default::default()
+                },
+            },
+        };
+        let manifest = "{\n  \"name\": \"app\"\n}\n".to_string();
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            format!(
+                "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\"left-pad@npm:^1.3.0\":\n  \
+                 version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n  \
+                 languageName: node\n  linkType: hard\n",
+                "3".repeat(128)
+            ),
+        );
+        files.insert("package.json".to_string(), manifest.clone());
+        let run = |files: &BTreeMap<String, String>| {
+            let rewrite = rewrite_registry_redirect(files, std::slice::from_ref(&candidate.dep));
+            let confirmed = confirm(
+                files,
+                &rewrite,
+                std::slice::from_ref(&candidate),
+                false,
+                &BTreeSet::new(),
+            );
+            (rewrite, confirmed)
+        };
+        let (first, confirmed) = run(&files);
+        assert_eq!(confirmed.len(), 1, "{:?}", first.warnings);
+        let pinned_lock = first.files["yarn.lock"].clone();
+        assert!(
+            pinned_lock.contains(&format!("\"left-pad@{url}\":")),
+            "{pinned_lock}"
+        );
+
+        // Rescan with the pin intact: still confirmed.
+        let mut pinned = files.clone();
+        pinned.insert("yarn.lock".to_string(), pinned_lock.clone());
+        pinned.insert(
+            "package.json".to_string(),
+            first.files["package.json"].clone(),
+        );
+        assert_eq!(run(&pinned).1.len(), 1);
+
+        // The routing removed: the URL is still in the lock, nothing installs it.
+        let mut orphan = files;
+        orphan.insert("yarn.lock".to_string(), pinned_lock);
+        orphan.insert("package.json".to_string(), manifest);
+        let (rewrite, confirmed) = run(&orphan);
+        assert!(
+            rewrite
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_yarn_berry_resolutions_conflict"),
+            "{:?}",
+            rewrite.warnings
+        );
+        assert!(confirmed.is_empty(), "{confirmed:?}");
+    }
+
+    fn left_pad_candidate() -> Candidate {
+        use crate::patch::redirect::Integrity;
+        Candidate {
+            purl: "pkg:npm/left-pad@1.3.0".into(),
+            dep: DepOverride {
+                ecosystem: "npm".into(),
+                name: "left-pad".into(),
+                namespace: None,
+                version: "1.3.0".into(),
+                token: "tok".into(),
+                patch_uuid: "uuid".into(),
+                artifact_url: "https://patch.test/left-pad-1.3.0.tgz".into(),
+                registry_override: None,
+                integrity: Integrity {
+                    sha512: Some("sha512-PATCHED==".into()),
+                    ..Default::default()
+                },
+            },
+        }
+    }
+
+    /// The #490 lock: `pkga` depends on left-pad from git.
+    const OVERRIDDEN_GIT_LOCK: &str = r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": { "name": "app", "dependencies": { "pkga": "file:pkga-1.0.0.tgz" } },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    },
+    "node_modules/pkga": {
+      "version": "1.0.0",
+      "resolved": "file:pkga-1.0.0.tgz",
+      "dependencies": { "left-pad": "github:stevemao/left-pad#v1.3.0" }
+    }
+  }
+}
+"#;
+    const OVERRIDING_MANIFEST: &str = r#"{"name":"app","dependencies":{"pkga":"file:pkga-1.0.0.tgz"},"overrides":{"left-pad":"1.3.0"}}"#;
+
+    async fn npm_rewrite(
+        view: &ProjectView<'_>,
+        unreadable: &BTreeSet<String>,
+    ) -> (CandidateFiles, Rewritten) {
+        let outer = OuterAllowRemote::default;
+        let options = RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: true,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            blocking: false,
+        };
+        let candidates = vec![left_pad_candidate()];
+        let read = read_candidate_files(view, unreadable, &candidates).await;
+        let done = rewrite(
+            view,
+            read.clone(),
+            &candidates,
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            &[],
+            options,
+        )
+        .await;
+        (read, done)
+    }
+
+    #[tokio::test]
+    async fn issue_490_the_root_manifest_overrides_reach_the_npm_rewriter() {
+        let redirected = |done: &Rewritten| {
+            done.rewrite
+                .files
+                .get("package-lock.json")
+                .is_some_and(|lock| lock.contains("https://patch.test/left-pad-1.3.0.tgz"))
+        };
+        // In memory.
+        let mut p = MemoryProject::new();
+        p.insert_text("package-lock.json", OVERRIDDEN_GIT_LOCK);
+        p.insert_text("package.json", OVERRIDING_MANIFEST);
+        let (read, done) = npm_rewrite(&ProjectView::Memory(&p), &BTreeSet::new()).await;
+        assert!(read.files.contains_key("package.json"));
+        assert!(redirected(&done), "{:?}", done.rewrite.warnings);
+        assert!(!done.rewrite.files.contains_key("package.json"));
+
+        // A linked or unreadable manifest is left out, not refused: the
+        // rewriter keeps the conservative #326 skip.
+        for linked in [true, false] {
+            let mut p = MemoryProject::new();
+            p.insert_text("package-lock.json", OVERRIDDEN_GIT_LOCK);
+            let mut unreadable = BTreeSet::new();
+            if linked {
+                p.insert("package.json", MemoryEntry::Symlink);
+            } else {
+                p.insert_present("package.json");
+                unreadable.insert("package.json".to_string());
+            }
+            let (read, done) = npm_rewrite(&ProjectView::Memory(&p), &unreadable).await;
+            assert!(!read.files.contains_key("package.json"));
+            assert!(read.symlinked_reads.is_empty() && read.unreadable_reads.is_empty());
+            assert!(!redirected(&done));
+            assert!(done
+                .rewrite
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_npm_non_registry_entry_skipped"));
+        }
+
+        // On disk.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package-lock.json"), OVERRIDDEN_GIT_LOCK).unwrap();
+        std::fs::write(tmp.path().join("package.json"), OVERRIDING_MANIFEST).unwrap();
+        let (_, done) = npm_rewrite(&ProjectView::Disk(tmp.path()), &BTreeSet::new()).await;
+        assert!(redirected(&done), "{:?}", done.rewrite.warnings);
     }
 
     fn gem_candidate() -> Candidate {

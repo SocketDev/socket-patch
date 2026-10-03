@@ -2,14 +2,71 @@
 
 socket-patch supports yarn berry at cacheKey `10c0` — yarn 4 with the default
 `compressionLevel: 0`, the one cache-zip checksum recipe it can reproduce
-offline — in both modes: hosted (`scan --mode hosted` rewrites the lock entry
-to the hosted `::__archiveUrl=`) and vendored (`vendor` wires the root
+offline — in both modes: hosted (`scan --mode hosted` routes the locked
+descriptors to the hosted tarball through root `package.json` `resolutions` and
+re-keys the lock entry `<name>@https://…/<name>-<v>.tgz`, see below) and
+vendored (`vendor` wires the root
 `package.json` `resolutions` plus the lock's `file:` entry). yarn 2 and 3
 (cacheKeys `7` / `8`) are refused by both modes. The node-modules and pnpm
 linkers are covered end to end; Plug'n'Play keeps packages inside
 `.yarn/cache` zips, so `vendor` refuses it (`vendor_yarn_berry_unsupported`)
 and so does `apply` (`yarn_pnp_unsupported`), while standalone `vex` still
 attests a hosted lock's `checksum:` pin.
+
+## Hosted pin shape and registry credentials
+
+The hosted pin is what yarn itself writes for a root `resolutions` entry:
+
+- `package.json` gains one descriptor-specific selector per range the lock
+  entry carries, routed to the hosted tarball:
+  `"resolutions": {"left-pad@npm:^1.3.0": "https://patch.socket.dev/…/left-pad-1.3.0.tgz"}`;
+- `yarn.lock` re-keys only that entry, `"left-pad@https://…/left-pad-1.3.0.tgz":`,
+  with the same URL as its `resolution:` and the patched `10c0` checksum. Its
+  `version:`, `dependencies:` and every dependent's descriptors stay
+  byte-identical, and the entry moves to where yarn sorts it.
+
+Why this shape (#404):
+
+- An `npm:` locator — including the `npm:<v>::__archiveUrl=<url>` pin releases
+  up to 5.0 wrote — is fetched with yarn's npm fetcher, which attaches the
+  configured registry auth (`npmAuthToken`, `YARN_NPM_AUTH_TOKEN`,
+  `npmScopes.<scope>.npmAuthToken`) to every scoped package's request, and to
+  every request under `npmAlwaysAuth: true`, whatever host the URL names. The
+  tarball fetcher sends none.
+- A tarball locator under the untouched `npm:` key is rejected by yarn's
+  hardened mode (`YN0078: Invalid resolution`), which yarn turns on by itself
+  for CI runs on public pull requests and `enableHardenedMode: true` turns on
+  anywhere. The `resolutions` pin passes it, so hosted mode assumes every
+  berry project may run hardened.
+
+Measured on yarn 4.12.0 (fresh checkout, cold cache, `YARN_NPM_AUTH_TOKEN` +
+`npmAlwaysAuth`, hardened mode): `yarn install --immutable --check-cache`
+passes for direct and transitive packages, leaves the lock untouched, and the
+patch host receives no `Authorization` header; another locked version of the
+same package keeps its registry entry. The real-yarn capstone
+(`e2e_redirect_yarn_berry_build`) runs that fresh install in hardened mode with
+a registry token configured and asserts the patch host received none.
+
+Only yarn berry projects are touched this way: `package.json` is read beside a
+berry `yarn.lock` only, and yarn classic, npm, pnpm, bun and vlt pins are
+unchanged. `rollback` / `remove` rebuild the original lock key from the
+selectors and drop them (an emptied `resolutions` table is removed); a lock
+pinned by an older release (`::__archiveUrl=`) is still recognized by `vex`,
+rollback and the mode takeovers, and the next hosted `scan` re-pins it.
+
+Refusals (nothing written, the warning names the cause):
+
+- `redirect_yarn_berry_resolutions_conflict` — `package.json` already has a
+  user-authored `resolutions` entry for the package (bare, ranged or nested);
+  hosted mode never overwrites it.
+- `redirect_yarn_berry_manifest_missing` — no root `package.json` object.
+- `redirect_yarn_berry_shared_descriptor` — the package is also locked through
+  a non-npm entry (yarn's builtin `patch:` compatibility entries for
+  `resolve`, `typescript`, `fsevents`), which wraps the same descriptor a pin
+  would move.
+- `redirect_yarn_berry_artifact_url_unsupported` — an artifact URL yarn could
+  not fetch as a tarball (not `http(s)`, not ending in `.tgz`/`.tar.gz`, or
+  carrying a query or fragment).
 
 ## Test matrix
 

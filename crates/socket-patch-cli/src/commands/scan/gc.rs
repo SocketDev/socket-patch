@@ -119,6 +119,16 @@ impl GcSummary {
         json
     }
 
+    /// The `gc` sub-object: [`Self::to_preview_json`] for a `--dry-run`
+    /// pass, [`Self::to_apply_json`] otherwise.
+    pub(super) fn to_json(&self, preview: bool) -> serde_json::Value {
+        if preview {
+            self.to_preview_json()
+        } else {
+            self.to_apply_json()
+        }
+    }
+
     /// Serialize for a *non-mutating* GC pass (read-only preview).
     fn to_preview_json(&self) -> serde_json::Value {
         serde_json::json!({
@@ -246,6 +256,41 @@ pub(super) async fn run_apply_gc(
     gc.absorb_vendor_gc(vendor_gc);
     gc.warnings.extend(write_failure);
     gc
+}
+
+/// The vendored-state half of the GC alone, for a `--prune` whose crawl
+/// found nothing (the manifest half is skipped there: pruning against an
+/// empty crawl would drop every entry). Reverting entries whose patch left
+/// the manifest or whose dependency left the lock asks the manifest and
+/// the lockfile, not the crawl, so it stays safe. Wet passes take the
+/// apply lock like [`run_apply_gc`]; `--dry-run` previews.
+pub(super) async fn run_vendor_only_gc(
+    common: &GlobalArgs,
+    manifest_path: &Path,
+    socket_dir: &Path,
+) -> GcSummary {
+    if common.dry_run {
+        return GcSummary::vendor_only(run_vendor_gc(common, manifest_path, true).await);
+    }
+    // Same pre-lock existence gate as `run_apply_gc`: no ledger, no pass
+    // (and no `.socket/` created by the lock acquire).
+    let has_ledger = tokio::fs::metadata(common.cwd.join(VENDOR_STATE_REL))
+        .await
+        .is_ok_and(|m| m.is_file());
+    if !has_ledger {
+        return GcSummary::default();
+    }
+    let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
+    let _guard = match crate::commands::lock_cli::acquire_with_status(socket_dir, timeout) {
+        Ok(g) => g,
+        Err(e) => {
+            return GcSummary {
+                skipped: Some(lock_failure(&e, timeout)),
+                ..Default::default()
+            };
+        }
+    };
+    GcSummary::vendor_only(run_vendor_gc(common, manifest_path, false).await)
 }
 
 /// Dry-run preview of the apply-mode GC pass. Same shape as
@@ -417,10 +462,16 @@ pub(super) async fn run_human_gc(
     if common.silent {
         return;
     }
-    if let Some(line) = format_gc_line(&gc, preview) {
+    print_human_gc(&gc, preview);
+}
+
+/// The human summary lines of a finished GC pass (`preview`: the
+/// `--dry-run` wording). Callers handle `--silent`.
+pub(super) fn print_human_gc(gc: &GcSummary, preview: bool) {
+    if let Some(line) = format_gc_line(gc, preview) {
         println!("\n{line}");
     }
-    for line in format_gc_vendored_lines(&gc) {
+    for line in format_gc_vendored_lines(gc) {
         if preview {
             println!("[dry-run] {line}");
         } else {

@@ -88,12 +88,12 @@
 
 use super::{
     npm_purl, DiscoverCtx, Discovery, LocateOpts, Located, PatchedRef, DIAG_LOCKFILE_UNPARSEABLE,
-    DIAG_REF_INVALID,
+    DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
 use crate::patch::redirect::hosted_url_version;
 use crate::utils::digest::is_sri_pin;
-use crate::vendor::bun_lock_text::{decode_json_string, split_name_spec};
+use crate::vendor::bun_lock_text::{decode_json_string, is_bundled_entry, split_name_spec};
 use crate::vendor::bun_lockb::BunLockb;
 use crate::vendor::lock_inventory::bun::bun_text_entries;
 use crate::vendor::lock_inventory::LockIntegrity;
@@ -123,6 +123,7 @@ async fn extract_text(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             return;
         }
     };
+    let mut bundled = Bundled::default();
     for entry in &entries {
         let elems = &entry.elems;
         let Some(spec) = elems.first().and_then(|e| decode_json_string(e)) else {
@@ -141,19 +142,102 @@ async fn extract_text(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             .and_then(|e| decode_json_string(e))
             .filter(|sri| is_sri_pin(sri))
             .map(LockIntegrity::Sri);
-        classify(
-            ctx,
-            BUN_LOCK,
-            Entry {
-                label: &entry.key,
-                name,
-                target,
-                recorded_version: None,
-                integrity,
-                shape_ok: tarball_tuple,
-            },
-            out,
-        );
+        let classified = Entry {
+            label: &entry.key,
+            name,
+            target,
+            recorded_version: None,
+            integrity,
+            shape_ok: tarball_tuple,
+        };
+        if is_bundled_entry(entry) {
+            bundled.record(ctx, BUN_LOCK, classified, out);
+        } else {
+            classify(ctx, BUN_LOCK, classified, out);
+        }
+    }
+    bundled.contest(BUN_LOCK, out);
+}
+
+// ── bundled copies ───────────────────────────────────────────────────────
+
+/// The bundled copies one lock records (#469): bun unpacks a
+/// `bundleDependencies` entry from its PARENT's tarball and never reads the
+/// entry's own spec, so
+///
+/// * a Socket url / vendored path written into a bundled entry wires
+///   nothing: it is never a ref (diagnosed instead);
+/// * every bundled entry IS an unpatched install of its `name@version`, so
+///   it contests a ref for the same version in this lock
+///   ([`Bundled::contest`]) and in any other ([`Discovery::resolved_elsewhere`])
+///   — the Bun twin of the npm extractor's `inBundle` contest (#325).
+#[derive(Default)]
+struct Bundled {
+    /// purl → the first bundled entry's label.
+    copies: std::collections::BTreeMap<String, String>,
+}
+
+impl Bundled {
+    /// Record the bundled `entry`: it is classified on its own, so a ref it
+    /// would make is withdrawn (and diagnosed) rather than deduped into a
+    /// regular entry's identical ref, and its other findings are kept.
+    fn record(&mut self, ctx: &DiscoverCtx<'_>, file: &str, entry: Entry<'_>, out: &mut Discovery) {
+        let (label, name, target) = (entry.label.to_string(), entry.name, entry.target);
+        let mut alone = Discovery::default();
+        classify(ctx, file, entry, &mut alone);
+        out.diagnostics.extend(alone.diagnostics);
+        let mut purls: Vec<String> = alone.elsewhere.into_iter().map(|e| e.purl).collect();
+        for r in alone.refs {
+            out.diag(
+                DIAG_REF_UNATTRIBUTABLE,
+                file,
+                format!(
+                    "{file}: {label}: {} is wired to a Socket patch, but bun installs this \
+                     entry as a bundled dependency, unpacked from the parent package's \
+                     tarball that no rewire reaches, so that copy stays unpatched; the patch \
+                     is not attested",
+                    r.purl,
+                ),
+            );
+            purls.push(r.purl);
+        }
+        if purls.is_empty() && target.starts_with(|c: char| c.is_ascii_digit()) {
+            purls.extend(npm_purl(name, target));
+        }
+        for purl in purls {
+            out.resolved_elsewhere(file, Some(purl.clone()));
+            self.copies.entry(purl).or_insert_with(|| label.clone());
+        }
+    }
+
+    /// Withdraw every ref of `file` whose `name@version` a bundled copy in
+    /// the same lock also installs: that copy stays unpatched beside it.
+    fn contest(&self, file: &str, out: &mut Discovery) {
+        if self.copies.is_empty() {
+            return;
+        }
+        let refs = std::mem::take(&mut out.refs);
+        for r in refs {
+            let bundled_at = (r.source_file == std::path::Path::new(file))
+                .then(|| self.copies.get(&r.purl))
+                .flatten();
+            let Some(label) = bundled_at else {
+                out.refs.push(r);
+                continue;
+            };
+            out.diag(
+                DIAG_REF_UNATTRIBUTABLE,
+                file,
+                format!(
+                    "{file}: {} is wired to a Socket patch but {file} also installs a bundled \
+                     copy of it at {label:?} (bun unpacks bundled dependencies from the parent \
+                     package's tarball, so no rewire reaches it and that copy stays unpatched); \
+                     the patch is not attested while the build ships unpatched bytes of this \
+                     version",
+                    r.purl,
+                ),
+            );
+        }
     }
 }
 
@@ -174,28 +258,35 @@ async fn extract_binary(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             return;
         }
     };
+    let mut bundled = Bundled::default();
     for p in &packages {
         let integrity = p
             .integrity
             .as_deref()
             .filter(|sri| is_sri_pin(sri))
             .map(|sri| LockIntegrity::Sri(sri.to_string()));
-        classify(
-            ctx,
-            BUN_LOCKB,
-            Entry {
-                label: &format!("package #{}", p.id),
-                name: &p.name,
-                target: &p.resolution,
-                recorded_version: p.version.as_deref(),
-                integrity,
-                // The codec only yields a resolution STRING for registry and
-                // tarball-like records; git records come back empty.
-                shape_ok: true,
-            },
-            out,
-        );
+        let label = format!("package #{}", p.id);
+        let classified = Entry {
+            label: &label,
+            name: &p.name,
+            target: &p.resolution,
+            recorded_version: p.version.as_deref(),
+            integrity,
+            // The codec only yields a resolution STRING for registry and
+            // tarball-like records; git records come back empty.
+            shape_ok: true,
+        };
+        // A record some bundled edge reaches installs (also) as a copy
+        // unpacked from that parent's tarball. Bun keeps ONE record for a
+        // regular and a bundled install of the same version, so even a
+        // record a regular edge also reaches is never attested.
+        if p.bundled {
+            bundled.record(ctx, BUN_LOCKB, classified, out);
+        } else {
+            classify(ctx, BUN_LOCKB, classified, out);
+        }
     }
+    bundled.contest(BUN_LOCKB, out);
 }
 
 // ── shared classification ────────────────────────────────────────────────
@@ -560,6 +651,84 @@ mod tests {
             .find(|r| r.purl == "pkg:npm/minimist@1.2.2")
             .expect("digest-less ref");
         assert_eq!(minimist.locked_integrity, None);
+    }
+
+    /// The `DIAG_REF_UNATTRIBUTABLE` diagnostics that name a bundled copy.
+    fn bundled_contests(out: &Discovery) -> usize {
+        out.diagnostics
+            .iter()
+            .filter(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("bundled"))
+            .count()
+    }
+
+    /// REGRESSION (#469): Bun unpacks a `{ "bundled": true }` entry from its
+    /// PARENT's tarball and never reads the entry's spec, so a Socket url /
+    /// vendored path written there wires nothing, and a registry bundled
+    /// copy of the ref's `name@version` installs unpatched beside the wired
+    /// entry. Neither may be attested (the Bun twin of npm's #325 contest).
+    #[tokio::test]
+    async fn bundled_entries_are_never_refs_and_contest_the_same_version() {
+        let url = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("left-pad@.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz");
+        let bundled = |spec: &str| {
+            format!("\"bund/left-pad\": [\"{spec}\", {{ \"bundled\": true }}, \"{SRI}\"]")
+        };
+        let registry_bundled = |version: &str| {
+            format!(
+                "\"bund/left-pad\": [\"left-pad@{version}\", \"\", {{ \"bundled\": true }}, \"{SRI}\"]"
+            )
+        };
+
+        // A Socket-wired bundled entry alone (hosted / vendored): not a ref.
+        for (case, spec) in [format!("left-pad@{url}"), vendored.clone()]
+            .into_iter()
+            .enumerate()
+        {
+            let p = Project::new();
+            p.write("bun.lock", text_lock(1, &[bundled(&spec)]));
+            let out = run(&p).await;
+            assert_refs(&out, &[]);
+            assert_eq!(bundled_contests(&out), 1, "wired bundled case {case}");
+        }
+
+        // A wired regular entry beside a registry bundled copy of the SAME
+        // version (hosted and vendored), and beside a wired bundled entry.
+        for (case, (wired, other)) in [
+            (format!("left-pad@{url}"), registry_bundled("1.3.0")),
+            (vendored.clone(), registry_bundled("1.3.0")),
+            (
+                format!("left-pad@{url}"),
+                bundled(&format!("left-pad@{url}")),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let p = Project::new();
+            p.write(
+                "bun.lock",
+                text_lock(1, &[tuple("left-pad", &wired, Some(SRI)), other.clone()]),
+            );
+            let out = run(&p).await;
+            assert_refs(&out, &[]);
+            assert!(bundled_contests(&out) >= 1, "contested case {case}");
+        }
+
+        // A bundled copy of ANOTHER version is a different package.
+        let p = Project::new();
+        p.write(
+            "bun.lock",
+            text_lock(
+                1,
+                &[
+                    tuple("left-pad", &format!("left-pad@{url}"), Some(SRI)),
+                    registry_bundled("1.2.0"),
+                ],
+            ),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[(LEFT_PAD, UUID_A, WiringMode::Hosted)]);
+        assert_eq!(bundled_contests(&out), 0, "{:?}", diag_codes(&out));
     }
 
     /// Hosted and vendored entries in one lock are all discovered (a mixed
@@ -974,6 +1143,43 @@ mod tests {
                     ),
                 }
             }
+        }
+    }
+
+    /// REGRESSION (#469), `bun.lockb`: a record a bundled edge reaches is
+    /// (also) installed from the parent's tarball, so a Socket resolution
+    /// on it is never attested — whether only the bundled edge reaches it
+    /// (`only`) or Bun shares it with a regular install (`both`).
+    #[tokio::test]
+    async fn binary_bundled_records_are_never_attested() {
+        for shape in ["only", "both"] {
+            let bytes = std::fs::read(
+                fixture_path("bun-lockb-bundled")
+                    .join(shape)
+                    .join("bun.lockb"),
+            )
+            .expect("bundled fixture");
+            let mut lock = crate::vendor::bun_lockb::BunLockb::parse(&bytes).unwrap();
+            let id = lock
+                .packages()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.name == "is-number")
+                .unwrap()
+                .id;
+            let url = hosted_url("npm", "is-number", "7.0.0", UUID_A, "is-number-7.0.0.tgz");
+            lock.set_package(id, &url, SRI).unwrap();
+            let p = Project::new();
+            p.write("bun.lockb", lock.bytes());
+            let out = run(&p).await;
+            assert_refs(&out, &[]);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("bundled")),
+                "{shape}: {:?}",
+                diag_codes(&out)
+            );
         }
     }
 

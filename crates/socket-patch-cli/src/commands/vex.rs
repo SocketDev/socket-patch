@@ -548,14 +548,17 @@ async fn generate_vex(
         // mirroring apply/rollback's `silent || json` gating.
         let quiet = common.silent || common.json || params.output.is_none();
         let purls: Vec<String> = manifest.patches.keys().cloned().collect();
-        // ONE installed-tree lookup: the first copy of every purl for the
-        // record check, every copy of the hosted ones below.
+        // ONE installed-tree lookup: every copy of every purl, for the
+        // record check and the hosted ones below alike. `apply` patches
+        // every copy, so an agent record is attested only when EVERY copy
+        // verifies; the first copy alone would vouch for a later install's
+        // unpatched nested duplicate.
         let copies =
             find_manifest_package_copies_reusing(&purls, common, quiet, params.npm_prior.as_ref())
                 .await;
-        // The record check: the first copy of each purl, except Maven,
-        // whose every consumed copy (`~/.m2` unless the Gradle build never
-        // reads it, each Gradle cache, the read-only cache) is re-hashed
+        // The record check: every copy of each purl; for Maven, every copy
+        // a build consumes (`~/.m2` unless the Gradle build never reads it,
+        // each Gradle cache, the read-only cache), re-hashed
         // (`vex_copy_sets`).
         let package_paths = vex_copy_sets(common, manifest, &copies).await;
         let go_patches = synthesize_go_patches(common, manifest, &plan.vendor_entries).await;
@@ -577,7 +580,7 @@ async fn generate_vex(
             go_patches,
             hosted,
         };
-        let mut outcome = socket_patch_core::vex::applied_patches_with_vendor(
+        let mut outcome = socket_patch_core::vex::applied_patches_with_copies(
             manifest,
             &package_paths,
             Some(&vendor),
@@ -802,12 +805,7 @@ async fn generate_vex(
     })
 }
 
-/// Record a run-level advisory the way `update`/`vendor` do: stderr
-/// (`Warning: <detail>`) in human mode, and into `warnings` so the `--json`
-/// envelope — which silences stderr — carries it in `warnings[]` instead.
-/// Under `--silent` only the envelope copy survives (warnings are not
-/// errors).
-/// The installed copies VEX judges per purl: the first copy, except for a
+/// The installed copies VEX judges per purl: every copy, except for a
 /// Maven purl, whose copies are every one a build consumes ([`JvmScope`]):
 /// `~/.m2` (unless this Gradle-only build never reads it — `mavenLocal()`
 /// declared or undetermined keeps it), each Gradle cache and the read-only
@@ -857,7 +855,7 @@ async fn vex_copy_sets(
                         .filter(|p| holds(purl, p))
                         .collect()
                 }
-                None => paths.iter().take(1).cloned().collect(),
+                None => paths.clone(),
             };
             (purl.clone(), paths)
         })
@@ -973,6 +971,11 @@ async fn withhold_unpatched_jvm_copies(
     }
 }
 
+/// Record a run-level advisory the way `update`/`vendor` do: stderr
+/// (`Warning: <detail>`) in human mode, and into `warnings` so the `--json`
+/// envelope — which silences stderr — carries it in `warnings[]` instead.
+/// Under `--silent` only the envelope copy survives (warnings are not
+/// errors).
 fn note_warning(warnings: &mut Vec<RunWarning>, common: &GlobalArgs, code: &str, detail: String) {
     if !common.silent && !common.json {
         eprintln!("Warning: {detail}");
