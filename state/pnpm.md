@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-03 (run 11), main `045d7ec` (#583 pnpm vendoring refactor merged), latest release 4.0.0.
+Last updated: 2026-10-03 (run 12), main `045d7ec`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, package grant, hosted tarball, `/registry/<name>/<ver>` mirror). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -92,6 +92,17 @@ Run 11 additions (main `045d7ec`, Linux):
 
 #636 first bad commit: `09956d90` (#247). Release 4.0.0 is byte-exact.
 
+Run 12 additions (main `045d7ec`, Linux):
+
+| pnpm | Agent: `workspace:*` member / `link:` dir / `file:` dir named like a patched pkg (#626) | Agent: `modulesDir: deps` | Agent: `node-linker=pnp` | Agent: `virtualStoreDirMaxLength` (hashed dirs) |
+| --- | --- | --- | --- | --- |
+| 7.33.7 / 8.15.9 | fail #626 / fail #626 / pass | pass (store stays in `node_modules/.pnpm`) | untested | untested |
+| 9.15.9 | fail #626 / fail #626 / pass (PR #634 refuses) | pass | pass | pass |
+| 10.0.0 – 10.11.1 | untested | pass | untested | untested |
+| 10.12.0 – 10.34.5 | fail #626 (10.28.0) | fail #661 (first bad pnpm 10.12.0) | untested | untested |
+| 11.28.3 | fail #626 / fail #626 / pass | fail #661 | untested | untested |
+| 12.8.1 | fail #626 / fail #626 / pass (PR #634 refuses) | fail #661 (also workspace) | pass | pass |
+
 Default isolated linker + alias: pass on 7.33.7 / 9.15.9 / 10.34.5 / 11.28.3 / 12.8.1 (one shared `.pnpm` copy).
 
 #492 also reproduces on pnpm 7.33.7 (there's no root lock at all, only `redirect_pnpm_no_lockfile`).
@@ -115,13 +126,14 @@ Global mode (`-g`, v5 main `2463257`):
 
 0. **Maintainer request (global `-g` mode):** the Linux cells are done. Still to do: macOS and Windows (corepack, standalone and npm-installed pnpm; `PNPM_HOME` with spaces or unicode; Windows `%LOCALAPPDATA%\pnpm`), and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry. Needs a probe branch.
 1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3 and 10, and was denied by the permission policy in runs 2, 5–9 and 11, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
-2. #636 follow-ups: a hosted → vendored takeover with several packages, then revert, and a user-created `pnpm` table with several vendored packages.
-3. #362 GVS transitive and #435 global `-g`: re-check exit codes under #555's skip semantics on 11.28.3 / 12.8.1.
-4. Rush subspaces (`common/config/subspaces/*`), and Rush + pnpm 8 / 10.
-5. `pnpm patch-commit` after a hosted pin, then rollback. `package-import-method=clone` on reflink (needs CI).
-6. #556 follow-ups: merging branch lockfiles after a hosted pin, and agent `vex` on the branch.
-7. Re-verify #360, #362, #435, #466, #492, #556, #557, #590, #601 (PR #605), #633 and #636 when fixes land.
-8. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout).
+2. #661 follow-ups: hosted `vex` with `modulesDir` (a possible false attestation, as in #493), `modulesDir` + custom `virtualStoreDir`, and `modulesDir` set in the global `config.yaml` / `rc`.
+3. #636 follow-ups: a hosted → vendored takeover with several packages, then revert, and a user-created `pnpm` table with several vendored packages.
+4. #362 GVS transitive and #435 global `-g`: re-check exit codes under #555's skip semantics on 11.28.3 / 12.8.1.
+5. Rush subspaces (`common/config/subspaces/*`), and Rush + pnpm 8 / 10.
+6. `pnpm patch-commit` after a hosted pin, then rollback. `package-import-method=clone` on reflink (needs CI).
+7. #556 follow-ups: merging branch lockfiles after a hosted pin, and agent `vex` on the branch.
+8. Re-verify #360, #362, #435, #466, #492, #556, #557, #590 (PR #598), #601 (PR #605), #626 (PR #634), #633, #636 and #661 when fixes land.
+9. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout).
 
 ## Known non-bugs
 
@@ -153,3 +165,5 @@ Global mode (`-g`, v5 main `2463257`):
 - Vendored from a workspace member cwd fails closed with `vendor_lockfile_missing` (`partial_failure`). Hosted's silent success in the same layout is #590.
 - A `package.json` without a trailing newline gains one after vendor + revert. That's a fixture artifact; files that end in a newline round-trip byte-exactly.
 - Bundled-copy fixtures need a registry-served host package. A `file:` tarball host (`.pnpm/bundler@file+…`) is patched correctly, so it doesn't reproduce #601.
+- pnpm ≤10 `.npmrc` keys must be kebab-case (`modules-dir`, `virtual-store-dir-max-length`); camelCase is silently ignored. pnpm 7–10.11 keep the virtual store in `node_modules/.pnpm` even with `modules-dir`, so agent mode passes there.
+- pnpm `file:` directory dependencies are copied into the store (`.pnpm/<name>@file+…`), so patching that copy is correct and doesn't touch the source (unlike `link:` / `workspace:`, #626).
