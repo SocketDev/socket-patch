@@ -216,6 +216,9 @@ async fn restore_lock(
                 continue;
             }
         };
+        // A refused hit leaves the lock as it was: its entry and every
+        // requirement array are restored together or not at all.
+        let before = doc.clone();
         let restore = if pep751 {
             restore_pylock_entry(&mut doc, hit, &shape, artifacts)
         } else {
@@ -223,6 +226,7 @@ async fn restore_lock(
                 .and_then(|()| restore_requirements(&mut doc, hit, metadata.as_ref(), &styles, ctx))
         };
         if let Err(why) = restore {
+            doc = before;
             result.refuse(&hit.uuid, format!("{rel}: {why}"));
             continue;
         }
@@ -1113,9 +1117,11 @@ fn declared_clauses(
     let marker = marker.unwrap_or("");
     let extras = marker_extras(marker);
     let narrowings: [&dyn Fn(&Declaration<'_>) -> bool; 2] = [
+        // A `dependencies` line can carry its own `extra == '<x>'` marker
+        // (uv accepts it), so its lock entry looks like one from extra `x`.
         &|d| match &d.extra {
             Some(extra) => extras.contains(extra),
-            None => extras.is_empty(),
+            None => marker_extras(d.spec.split_once(';').map_or("", |(_, m)| m)) == extras,
         },
         &|d| {
             let own = d.spec.split_once(';').map_or("", |(_, m)| m);
@@ -1786,6 +1792,41 @@ mod declaration_tests {
         let hosted = lock(&[six(Some("sys_platform == 'linux'"))], &[]);
         let err = unwind(&pyproject, &hosted).unwrap_err();
         assert!(err.contains("different specifiers"), "{err}");
+    }
+
+    /// A `dependencies` line with its own `extra == 'x'` marker lowers to
+    /// the same marker as extra `x`'s member: with different specifiers,
+    /// which entry mirrors which is not derivable, so the unwind refuses
+    /// rather than restore both from one declaration.
+    #[test]
+    fn dependency_with_its_own_extra_marker_is_ambiguous() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six>=1.10; extra == 'x'\"]\n\n\
+             [project.optional-dependencies]\nx = [\"six==1.16.0\"]\n"
+        );
+        let hosted = lock(&[six(Some("extra == 'x'")), six(Some("extra == 'x'"))], &[]);
+        let err = unwind(&pyproject, &hosted).unwrap_err();
+        assert!(err.contains("different specifiers"), "{err}");
+    }
+
+    /// Unambiguous when the dependency's own extra is not also declared.
+    #[test]
+    fn dependency_with_its_own_extra_marker() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six>=1.10; extra == 'x'\"]\n\n\
+             [project.optional-dependencies]\ny = [\"six==1.16.0\"]\n"
+        );
+        let hosted = lock(&[six(Some("extra == 'x'")), six(Some("extra == 'y'"))], &[]);
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(
+                &[
+                    spec(">=1.10", Some("extra == 'x'")),
+                    spec("==1.16.0", Some("extra == 'y'"))
+                ],
+                &[]
+            )
+        );
     }
 
     /// #473: a group reaching six through `include-group`.
