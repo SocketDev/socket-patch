@@ -75,6 +75,13 @@ pub async fn restore(
     if let Some(outcome) = super::common::service_offline_conflict(Some(service)) {
         return Err(detail(outcome));
     }
+    // A JVM tree belongs to its build root: repairing from a subproject
+    // would restore it where the real build never looks (#428).
+    if entry.ecosystem == "jvm" {
+        if let Some(detail) = super::maven_repo::not_build_root(root) {
+            return Err(format!("vendor_jvm_shape_unsupported: {detail}"));
+        }
+    }
     let artifact = match super::verify::checked_artifact_path(root, entry, record) {
         Ok(path) => path,
         Err(reason)
@@ -121,6 +128,8 @@ pub async fn restore(
     let stage = temporary.path().join(&entry.artifact.path);
     let uuid_dir = stage.parent().ok_or("artifact has no parent")?;
     let mut warnings = Vec::new();
+    // The JVM tree directories the stage holds besides the artifact's own.
+    let mut jvm_trees: Vec<String> = Vec::new();
     if file_shaped {
         let archive = download_archive(
             service,
@@ -164,7 +173,7 @@ pub async fn restore(
             .await
             .map_err(|e| e.to_string())?;
         if entry.ecosystem == "maven" || entry.ecosystem == "jvm" {
-            restore_maven_metadata(
+            jvm_trees = restore_maven_metadata(
                 root,
                 temporary.path(),
                 entry,
@@ -307,6 +316,34 @@ pub async fn restore(
         swap_stage_into_place(uuid_dir, target)
             .await
             .map_err(|e| e.to_string())?;
+        // A mixed root's other tree (the Gradle one beside the Maven jar).
+        for rel in &jvm_trees {
+            let (stage_dir, target) = (temporary.path().join(rel), root.join(rel));
+            if stage_dir == uuid_dir || !stage_dir.is_dir() {
+                continue;
+            }
+            // Same guard as the artifact's own path: never swap a tree
+            // reached through a link (the swap deletes what it replaces).
+            let mut cursor = root.to_path_buf();
+            for part in rel.split('/') {
+                cursor.push(part);
+                if tokio::fs::symlink_metadata(&cursor)
+                    .await
+                    .is_ok_and(|m| m.file_type().is_symlink())
+                {
+                    return Err("vendor_path_unsafe: artifact path contains a symlink".into());
+                }
+            }
+            tokio::fs::create_dir_all(target.parent().ok_or("tree has no parent")?)
+                .await
+                .map_err(|e| e.to_string())?;
+            swap_stage_into_place(&stage_dir, &target)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        if entry.ecosystem == "jvm" {
+            restore_jvm_owned_files(root, entry).await?;
+        }
     } else {
         if let Some(parent) = artifact.parent() {
             tokio::fs::create_dir_all(parent)
@@ -347,6 +384,10 @@ pub async fn restore(
     Ok(warnings)
 }
 
+/// Stage the entry's whole recorded JVM tree under `stage_root` from the
+/// verified jar and freshly downloaded, checksum-verified upstream files,
+/// re-planned through the project's builds (both halves of a mixed root).
+/// Returns the staged tree directories (project-relative).
 async fn restore_maven_metadata(
     root: &Path,
     stage_root: &Path,
@@ -354,7 +395,7 @@ async fn restore_maven_metadata(
     record: &PatchRecord,
     jar: &[u8],
     service: &VendorServiceConfig,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let (group, artifact, version) =
         parse_maven_purl(&entry.base_purl).ok_or("invalid Maven coordinates")?;
     let empty_cache = stage_root.join("upstream");
@@ -369,14 +410,15 @@ async fn restore_maven_metadata(
     .await?;
     let target = stage_root.join(&entry.artifact.path);
     if entry.ecosystem == "maven" {
-        return super::maven_repo::write_maven_artifact(
+        super::maven_repo::write_maven_artifact(
             target.parent().ok_or("artifact has no parent")?,
             &format!("{artifact}-{version}.jar"),
             jar,
             &format!("{artifact}-{version}.pom"),
             &pom,
         )
-        .await;
+        .await?;
+        return Ok(Vec::new());
     }
     let module = if entry
         .wiring
@@ -397,6 +439,44 @@ async fn restore_maven_metadata(
     } else {
         None
     };
+    // The classifier artifacts the tree recorded (#533), downloaded again
+    // and checked against their upstream checksums.
+    let mut extras = Vec::new();
+    let gradle_tree = format!("{}/", super::jvm::gradle::TREE_ROOT);
+    for w in entry
+        .wiring
+        .iter()
+        .filter(|w| w.kind == super::jvm::TREE_KIND && w.file.starts_with(&gradle_tree))
+    {
+        let name = w.file.rsplit('/').next().unwrap_or_default();
+        let Some(rest) = name.strip_prefix(&format!("{artifact}-{version}-")) else {
+            continue;
+        };
+        let Some((classifier, extension)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        if extras
+            .iter()
+            .any(|x: &super::jvm::ExtraArtifact| x.classifier == classifier)
+        {
+            continue;
+        }
+        let gav = (group.to_string(), artifact.to_string(), version.to_string());
+        let bytes = super::maven_repo::acquire_jvm_artifact(
+            &super::maven_repo::LocalSources::none(),
+            &gav,
+            Some(classifier),
+            extension,
+            Some(service),
+        )
+        .await?;
+        extras.push(super::jvm::ExtraArtifact {
+            classifier: classifier.to_string(),
+            extension: extension.to_string(),
+            bytes,
+        });
+    }
+    let patched: Vec<String> = record.files.keys().cloned().collect();
     let patch = super::jvm::JvmPatch {
         group_id: &group,
         artifact_id: &artifact,
@@ -405,6 +485,8 @@ async fn restore_maven_metadata(
         jar,
         upstream_pom: &pom,
         upstream_module: module.as_deref(),
+        extra_artifacts: &extras,
+        patched_members: &patched,
     };
     let reader = super::jvm::apply::ProjectReader::new(root);
     let read = |rel: &str| {
@@ -414,21 +496,25 @@ async fn restore_maven_metadata(
             reader.read(rel)
         }
     };
+    let list = |dir: &str| reader.list(dir);
+    // Re-planned through every build the root holds (#395).
     let shape = super::jvm::detect(&read);
-    let plan = if shape == super::jvm::Shape::MavenReactor {
-        let enabled = !entry
-            .wiring
-            .iter()
-            .any(|w| super::jvm::op_of(w) == "config_none");
-        super::jvm::maven_reactor::plan_with_config(&read, &patch, enabled)
-    } else {
-        super::jvm::plan(shape, &read, &patch)
-    }
-    .map_err(|e| e.detail)?;
+    let enabled = !entry
+        .wiring
+        .iter()
+        .any(|w| super::jvm::op_of(w) == "config_none");
+    let plan =
+        super::jvm::plan_with_config(shape, &read, &list, &patch, enabled).map_err(|e| e.detail)?;
     if reader.escaped().is_some() {
         return Err("Maven project path escapes the checkout".into());
     }
     let tree: Vec<_> = plan.writes.into_iter().filter(|w| w.tree).collect();
+    let mut dirs: Vec<String> = tree
+        .iter()
+        .filter_map(|w| w.rel.rsplit_once('/').map(|(d, _)| d.to_string()))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
     if tree.len()
         != entry
             .wiring
@@ -454,6 +540,68 @@ async fn restore_maven_metadata(
             .await
             .map_err(|e| e.to_string())?;
         crate::utils::fs::atomic_write_artifact(&path, &write.bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(dirs)
+}
+
+/// The owned files a Gradle tree needs beside its directory: the derived
+/// `maven-metadata.xml` (recomputed from the committed index) and the
+/// `.gitattributes` the entry created, rewritten when missing. Needs no
+/// download, so `repair` also runs it for a healthy entry.
+pub async fn restore_jvm_owned_files(root: &Path, entry: &VendorEntry) -> Result<(), String> {
+    use super::jvm::gradle;
+    let Some((group, artifact, _)) = parse_maven_purl(&entry.base_purl) else {
+        return Ok(());
+    };
+    let reader = super::jvm::apply::ProjectReader::new(root);
+    let read = |rel: &str| reader.read(rel);
+    let mut wanted: Vec<(String, String)> = Vec::new();
+    if entry
+        .wiring
+        .iter()
+        .any(|w| w.kind == super::jvm::DERIVED_METADATA_KIND)
+    {
+        if let Some(text) = gradle::derived_metadata_of(&read, &group, &artifact) {
+            wanted.push((gradle::derived_metadata_rel(&group, &artifact), text));
+        }
+    }
+    let created = |rel: &str| {
+        entry.wiring.iter().any(|w| {
+            w.kind == super::jvm::OWNED_FILE_KIND
+                && w.file == rel
+                && super::jvm::op_of(w) == "create"
+        })
+    };
+    for rel in [gradle::GITATTRIBUTES_REL, gradle::SCRIPT_GITATTRIBUTES_REL] {
+        if created(rel) {
+            wanted.push((rel.to_string(), "* -text\n".to_string()));
+        }
+    }
+    if created(gradle::VENDOR_GITATTRIBUTES_REL) {
+        wanted.push((
+            gradle::VENDOR_GITATTRIBUTES_REL.to_string(),
+            format!("{}\n", gradle::VENDOR_GITATTRIBUTES_LINE),
+        ));
+    }
+    for (rel, text) in wanted {
+        let current = read(&rel);
+        if current
+            .as_deref()
+            .is_some_and(|c| crate::gradle::eol::eol_eq(c, text.as_bytes()))
+        {
+            continue;
+        }
+        // Only a missing file is ours to write; an edited one stays.
+        if current.is_some() || reader.escaped().is_some() {
+            continue;
+        }
+        let path = root.join(&rel);
+        tokio::fs::create_dir_all(path.parent().ok_or("owned file has no parent")?)
+            .await
+            .map_err(|e| e.to_string())?;
+        crate::utils::fs::atomic_write_bytes_preserving_mode(&path, text.as_bytes())
             .await
             .map_err(|e| e.to_string())?;
     }

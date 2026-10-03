@@ -1072,7 +1072,13 @@ fn layout_refusal_json(refusals: &[(String, String)]) -> serde_json::Value {
     serde_json::Value::Array(
         refusals
             .iter()
-            .map(|(code, detail)| serde_json::json!({ "code": code, "detail": detail }))
+            .map(|(code, detail)| {
+                let mut entry = serde_json::json!({ "code": code, "detail": detail });
+                if let Some(level) = warning_level(code) {
+                    entry["level"] = serde_json::json!(level);
+                }
+                entry
+            })
             .collect(),
     )
 }
@@ -1117,6 +1123,188 @@ pub(super) const API_BATCH_FAILED: &str = "api_batch_failed";
 /// `Warning: could not fetch details for <purl>: <error>` line without its
 /// prefix. (Every query failing is the discovery error envelope instead.)
 pub(super) const PATCH_DETAILS_FAILED: &str = "patch_details_failed";
+
+/// Run-level warning: a Gradle-only build that never declares
+/// `mavenLocal()` locks (or has patch records for) module(s) that only the
+/// Maven local repository holds. The build does not resolve from `~/.m2`,
+/// so the scan leaves those copies out (#551).
+pub(super) const GRADLE_BUILD_IGNORES_M2: &str = "gradle_build_ignores_m2";
+
+/// Run-level advisory: the Maven local repository stays a scan root of a
+/// Gradle build because `mavenLocal()` could not be ruled out (a script or
+/// init script that could not be read literally).
+pub(super) const GRADLE_MAVEN_LOCAL_UNDETERMINED: &str = "gradle_maven_local_undetermined";
+
+/// Run-level advisory: Gradle takes its user home from the account's passwd
+/// entry, which differs from `$HOME`, so its cache is not under
+/// `$HOME/.gradle`.
+pub(super) const GRADLE_USER_HOME_DIFFERS: &str = "gradle_user_home_differs";
+
+/// What a scan learned about the Gradle side of discovery.
+#[derive(Default)]
+struct GradleScan {
+    /// `(code, detail)` run-level warnings.
+    notes: Vec<(String, String)>,
+    /// Base purls (normalized) of the packages crawled from a Gradle cache.
+    gradle_purls: HashSet<String>,
+    /// Base purls the build's lock files name; `None` when they were not
+    /// read (no Gradle build at the cwd, or no Gradle-cached package to
+    /// annotate), so no `inLock` is reported.
+    locked: Option<HashSet<String>>,
+}
+
+/// The level of a run-level warning code: `info` for the Gradle advisories
+/// that need no action, `warn` for the Gradle warning, `None` (no `level`
+/// field, printed as a warning) for every other code.
+fn warning_level(code: &str) -> Option<&'static str> {
+    match code {
+        GRADLE_MAVEN_LOCAL_UNDETERMINED | GRADLE_USER_HOME_DIFFERS => Some("info"),
+        GRADLE_BUILD_IGNORES_M2 => Some("warn"),
+        _ => None,
+    }
+}
+
+/// Print the run-level warnings to stderr: advisories as `Note:` (not
+/// under `--silent`), everything else as `Warning:`.
+fn print_layout_refusals(refusals: &[(String, String)], silent: bool) {
+    for (code, detail) in refusals {
+        if warning_level(code) == Some("info") {
+            if !silent {
+                eprintln!("Note: {detail}");
+            }
+        } else {
+            eprintln!("Warning: {detail}");
+        }
+    }
+}
+
+/// The Gradle discovery notes and the lock-membership annotation for a
+/// scan. `crawled` are the packages this run covers, `scanned` every purl
+/// the crawl found, `manifest` the recorded patches. Locks only annotate:
+/// they never filter what the scan reports.
+async fn gradle_scan(
+    common: &GlobalArgs,
+    crawled: &[socket_patch_core::crawlers::CrawledPackage],
+    scanned: &HashSet<String>,
+    manifest: Option<&PatchManifest>,
+) -> GradleScan {
+    use socket_patch_core::crawlers::gradle_cache;
+    use socket_patch_core::crawlers::maven_crawler::{m2_gate, JvmEnv, M2Gate};
+
+    let mut out = GradleScan {
+        gradle_purls: crawled
+            .iter()
+            .filter(|p| gradle_cache::is_gradle_version_dir(&p.path))
+            .map(|p| normalize_purl(strip_purl_qualifiers(&p.purl)).into_owned())
+            .collect(),
+        ..GradleScan::default()
+    };
+    if !common.ecosystem_selected(Ecosystem::Maven) {
+        return out;
+    }
+    let cwd = common.cwd.clone();
+    let global = common.is_global();
+    // An explicit cache root makes the user home Gradle would pick moot.
+    let prefixed = common.global_prefix.is_some();
+    let manifest_gavs: Vec<String> = manifest
+        .map(|m| {
+            m.patches
+                .keys()
+                .filter(|k| k.starts_with("pkg:maven/"))
+                .map(|k| normalize_purl(strip_purl_qualifiers(k)).into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let want_locks = !out.gradle_purls.is_empty();
+    let Ok((gate, locked, mismatch, env)) = tokio::task::spawn_blocking(move || {
+        let gradle_build = gradle_cache::has_gradle_marker(&cwd);
+        let env = JvmEnv::from_process();
+        let gate = (!global && gradle_build).then(|| m2_gate(&cwd, &env));
+        // The cwd's build locks annotate Gradle-cached packages in a global
+        // run too; without a Gradle build at the cwd there is nothing to
+        // say, so no annotation at all.
+        let locked: Option<HashSet<String>> =
+            (gradle_build && (want_locks || gate == Some(M2Gate::Ignored))).then(|| {
+                gradle_cache::locked_gavs(&cwd)
+                    .into_iter()
+                    .map(|(g, a, v)| format!("pkg:maven/{g}/{a}@{v}"))
+                    .collect()
+            });
+        let mismatch = (!prefixed && (global || gradle_build))
+            .then(gradle_cache::home_mismatch)
+            .flatten();
+        (gate, locked, mismatch, env)
+    })
+    .await
+    else {
+        return out;
+    };
+
+    match gate {
+        Some(M2Gate::Undetermined(why)) => out.notes.push((
+            GRADLE_MAVEN_LOCAL_UNDETERMINED.to_string(),
+            format!(
+                "the Maven local repository is scanned for this Gradle build because \
+                 mavenLocal() could not be ruled out ({why})"
+            ),
+        )),
+        Some(M2Gate::Ignored) => {
+            let mut candidates: Vec<String> = locked
+                .iter()
+                .flatten()
+                .cloned()
+                .chain(manifest_gavs)
+                .filter(|p| !scanned.contains(p))
+                .collect();
+            candidates.sort();
+            candidates.dedup();
+            let only_m2: Vec<String> = if candidates.is_empty() {
+                Vec::new()
+            } else {
+                let mut found: Vec<String> = socket_patch_core::crawlers::MavenCrawler
+                    .find_by_purls(&env.m2_repo, &candidates)
+                    .await
+                    .unwrap_or_default()
+                    .into_keys()
+                    .collect();
+                found.sort();
+                found
+            };
+            if !only_m2.is_empty() {
+                const SHOWN: usize = 5;
+                let mut list = only_m2[..only_m2.len().min(SHOWN)].join(", ");
+                if only_m2.len() > SHOWN {
+                    list.push_str(&format!(" and {} more", only_m2.len() - SHOWN));
+                }
+                out.notes.push((
+                    GRADLE_BUILD_IGNORES_M2.to_string(),
+                    format!(
+                        "this Gradle build declares no mavenLocal(), so it does not resolve \
+                         from the Maven local repository ({}); {} found only there {} not \
+                         scanned: {list}",
+                        env.m2_repo.display(),
+                        plural(only_m2.len(), "module", "modules"),
+                        if only_m2.len() == 1 { "is" } else { "are" },
+                    ),
+                ));
+            }
+        }
+        _ => {}
+    }
+    if let Some((home, passwd)) = mismatch {
+        out.notes.push((
+            GRADLE_USER_HOME_DIFFERS.to_string(),
+            format!(
+                "Gradle's user home follows the account's home directory {} (not $HOME={}); \
+                 set GRADLE_USER_HOME to scan another Gradle cache",
+                passwd.display(),
+                home.display()
+            ),
+        ));
+    }
+    out.locked = want_locks.then_some(locked).flatten();
+    out
+}
 
 /// The scanned purls whose HOSTED redirect wiring is still live: a hosted
 /// pin names the purl (`redirect_state`, the lockfiles' hosted state — see
@@ -1767,15 +1955,24 @@ async fn run_scan(
         .filter(|pkg| policy.admit_crawled(&pkg.purl))
         .collect();
 
+    // Gradle discovery notes (m2 gating, the user home) ride the run-level
+    // warnings; the lock set only annotates `packages[]` below.
+    let gradle = gradle_scan(
+        &args.common,
+        &filtered_crawled,
+        &scanned_purls,
+        update_manifest.as_deref(),
+    )
+    .await;
+    layout_refusals.extend(gradle.notes.iter().cloned());
+
     let all_purls: Vec<String> = filtered_crawled.iter().map(|p| p.purl.clone()).collect();
     let package_count = all_purls.len();
 
     if package_count == 0 {
         status.finish();
         if human {
-            for (_, detail) in &layout_refusals {
-                eprintln!("Warning: {detail}");
-            }
+            print_layout_refusals(&layout_refusals, args.common.silent);
             policy.print_warnings(args.common.silent);
             // Hosted mode already printed its own prune-ignored warning.
             if prune && !hosted && unwired_vendored.is_empty() {
@@ -1922,9 +2119,7 @@ async fn run_scan(
         if !lockfile_only.purls.is_empty() {
             eprintln!("{}", render::lockfile_only_note(lockfile_only.purls.len()));
         }
-        for (_, detail) in &layout_refusals {
-            eprintln!("Warning: {detail}");
-        }
+        print_layout_refusals(&layout_refusals, args.common.silent);
         policy.print_warnings(args.common.silent);
     }
 
@@ -2177,6 +2372,17 @@ async fn run_scan(
                 });
                 if is_lockfile_only {
                     pkg["notInstalled"] = serde_json::json!(true);
+                }
+                // Gradle-cached packages: whether the build's lock files
+                // name them (additive; an annotation, never a filter).
+                if let Some(base) = pkg["purl"]
+                    .as_str()
+                    .map(|p| normalize_purl(strip_purl_qualifiers(p)).into_owned())
+                    .filter(|base| gradle.gradle_purls.contains(base))
+                {
+                    if let Some(locked) = &gradle.locked {
+                        pkg["inLock"] = serde_json::json!(locked.contains(&base));
+                    }
                 }
             }
         }

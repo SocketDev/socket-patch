@@ -10,13 +10,13 @@ use socket_patch_core::manifest::operations::{
 };
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::select_installed_variants;
+use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::patch::rollback::{
     cannot_rollback_error, rollback_package_patch, verify_file_rollback, RollbackResult,
     VerifyRollbackResult, VerifyRollbackStatus,
 };
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
-use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::vendor::{purl_keys_cover, RevertOpts, VendorState};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -26,7 +26,7 @@ use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::apply::is_local_go;
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
-use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls};
+use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls, JvmScope};
 use crate::json_envelope::Command as EnvelopeCommand;
 use crate::looks_like_uuid;
 use crate::ui::{plural, StatusLine};
@@ -490,6 +490,9 @@ pub(crate) struct RollbackOutcome {
     /// was restored, so nothing is removable and the GC must not sweep
     /// the revert data the retry needs.
     pub(crate) aborted: bool,
+    /// Run warnings `(code, detail)` for copies left alone without failing
+    /// the run (today: `gradle_m2_copy_not_restored`).
+    pub(crate) warnings: Vec<(String, String)>,
 }
 
 /// How `rollback_patches_inner` selects manifest entries.
@@ -1026,7 +1029,8 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
             .iter()
             .map(|(code, detail)| (code.to_string(), detail.clone())),
     );
-    out.edited_files.extend(outcome.reverted_files.iter().cloned());
+    out.edited_files
+        .extend(outcome.reverted_files.iter().cloned());
     let unwound: Vec<_> = vlt_targets
         .into_iter()
         .filter(|t| out.reverted.iter().any(|p| p == &t.purl))
@@ -1170,7 +1174,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
             } else if !args.common.silent {
                 println!(
                     "{} the pre-v5 hosted ledger {}: no lockfile pins a hosted patch.",
-                    if args.common.dry_run { "Would remove" } else { "Removed" },
+                    if args.common.dry_run {
+                        "Would remove"
+                    } else {
+                        "Removed"
+                    },
                     socket_patch_core::patch::redirect::REDIRECT_STATE_REL
                 );
             }
@@ -1534,7 +1542,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
             not_installed,
             narrowed_out,
             aborted,
+            warnings: agent_warnings,
         }) => {
+            // Copies left alone without failing the run (an unconsumed
+            // `~/.m2` copy: `gradle_m2_copy_not_restored`).
+            run_warnings.extend(agent_warnings);
             // ── vendored leg ─────────────────────────────────────────────
             // The in-scope ledger entries: unwire the lockfiles and (by
             // default) delete the artifacts + drop the entries.
@@ -2149,6 +2161,7 @@ pub(crate) async fn rollback_patches_inner(
             not_installed: Vec::new(),
             narrowed_out: Vec::new(),
             aborted: false,
+            warnings: Vec::new(),
         });
     }
 
@@ -2175,6 +2188,7 @@ pub(crate) async fn rollback_patches_inner(
             not_installed: Vec::new(),
             narrowed_out: Vec::new(),
             aborted: false,
+            warnings: Vec::new(),
         });
     }
 
@@ -2281,10 +2295,48 @@ pub(crate) async fn rollback_patches_inner(
     // so they are pushed straight to `rollback_targets`. Only the
     // release-variant ecosystems (whose multiple qualified PURLs share ONE
     // install dir) go through the group + narrow path.
-    let mut rollback_targets: Vec<(&String, &PathBuf)> = Vec::new();
+    let mut rollback_targets: Vec<CopyTarget> = Vec::new();
     let mut groups: HashMap<String, Vec<(&String, &PathBuf)>> = HashMap::new();
+    // Maven: grouped by (base purl, copy) — `~/.m2` and each Gradle cache
+    // are distinct installs whose variants and state differ per copy.
+    let jvm_scope = if partitioned.contains_key(&Ecosystem::Maven) {
+        Some(JvmScope::of(common).await)
+    } else {
+        None
+    };
+    let mut maven_groups: Vec<((String, PathBuf), Vec<&String>, bool)> = Vec::new();
     for (purl, pkg_paths) in &all_packages_multi {
-        if Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants()) {
+        if let Some(scope) = jvm_scope
+            .as_ref()
+            .filter(|_| Ecosystem::from_purl(purl) == Some(Ecosystem::Maven))
+        {
+            // Every writable copy: the read-only cache is never written,
+            // but a `~/.m2` copy this Gradle-only build no longer reads
+            // (`m2_ignored`) is still restored. An earlier apply wrote it
+            // (before the gate existed, or while `mavenLocal()` was
+            // declared); skipping it would leave the shared jar patched
+            // with no record to restore it from once `remove` drops the
+            // entry. Only bytes that verify as this record's afterHash
+            // are ever put back, and a Maven build that wants the patch
+            // re-applies it from its own manifest. Such a copy never
+            // decides the run's outcome, though (`CopyTarget::unconsumed_m2`):
+            // the build does not read it, so one another build re-patched
+            // or rebuilt, or whose backup lives in that other project, is
+            // left with a warning instead of failing this rollback/remove.
+            let copies = scope.split(pkg_paths);
+            let tagged = copies
+                .consumed
+                .iter()
+                .map(|p| (p, false))
+                .chain(copies.m2_ignored.iter().map(|p| (p, true)));
+            for (pkg_path, unconsumed) in tagged {
+                let key = (strip_purl_qualifiers(purl).to_string(), pkg_path.clone());
+                match maven_groups.iter_mut().find(|(k, _, _)| *k == key) {
+                    Some((_, purls, _)) => purls.push(purl),
+                    None => maven_groups.push((key, vec![purl], unconsumed)),
+                }
+            }
+        } else if Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants()) {
             for pkg_path in pkg_paths {
                 groups
                     .entry(strip_purl_qualifiers(purl).to_string())
@@ -2293,7 +2345,7 @@ pub(crate) async fn rollback_patches_inner(
             }
         } else {
             for pkg_path in pkg_paths {
-                rollback_targets.push((purl, pkg_path));
+                rollback_targets.push(CopyTarget::plain(purl, pkg_path));
             }
         }
     }
@@ -2345,8 +2397,16 @@ pub(crate) async fn rollback_patches_inner(
                     .collect()
             }
         };
-        rollback_targets.extend(to_rollback);
+        rollback_targets.extend(
+            to_rollback
+                .into_iter()
+                .map(|(purl, path)| CopyTarget::plain(purl, path)),
+        );
     }
+    let (maven_targets, maven_narrowed) =
+        maven_rollback_targets(&maven_groups, &filtered_manifest).await;
+    rollback_targets.extend(maven_targets);
+    narrowed_out.extend(maven_narrowed);
     narrowed_out.sort();
     narrowed_out.dedup();
 
@@ -2365,7 +2425,7 @@ pub(crate) async fn rollback_patches_inner(
     //     their rollback just drops the project-local redirect + copy and
     //     reads no blobs, so a missing before-blob must not block an
     //     offline redirect rollback.
-    let attempted_purls: HashSet<&str> = rollback_targets.iter().map(|(p, _)| p.as_str()).collect();
+    let attempted_purls: HashSet<&str> = rollback_targets.iter().map(|t| t.purl.as_str()).collect();
     let gate_manifest = before_blob_gate_manifest(&scoped_manifest, &attempted_purls, common);
 
     // Apply's `unmatched` twin: in-scope manifest entries the crawler found
@@ -2441,6 +2501,15 @@ pub(crate) async fn rollback_patches_inner(
                 .get(purl)
                 .expect("gate manifest holds only attempted targets, which the crawler discovered")
                 .clone();
+            // Maven copies are probed where they are restored: the hash
+            // dirs (and `~/.m2` dirs) of the expanded targets.
+            if purl.starts_with("pkg:maven/") {
+                pkg_paths = rollback_targets
+                    .iter()
+                    .filter(|t| t.purl == *purl && t.jar_leaf.is_none())
+                    .map(|t| t.dir.clone())
+                    .collect();
+            }
             // The engine also restores every pnpm/vlt store peer variant of
             // an npm copy, so each of those is a copy that may need a blob.
             if purl.starts_with("pkg:npm/") {
@@ -2463,7 +2532,8 @@ pub(crate) async fn rollback_patches_inner(
                     continue;
                 }
                 for pkg_path in &pkg_paths {
-                    let v = verify_file_rollback(pkg_path, file, info, &blobs_path).await;
+                    let file = maven_target_key(purl, pkg_path, file);
+                    let v = verify_file_rollback(pkg_path, &file, info, &blobs_path).await;
                     if v.status == VerifyRollbackStatus::MissingBlob {
                         missing_blobs.insert(info.before_hash.clone());
                         blob_gated_purls.insert(purl.clone());
@@ -2517,6 +2587,7 @@ pub(crate) async fn rollback_patches_inner(
                 not_installed,
                 narrowed_out: Vec::new(),
                 aborted: true,
+                warnings: Vec::new(),
             });
         }
 
@@ -2596,6 +2667,7 @@ pub(crate) async fn rollback_patches_inner(
                 not_installed,
                 narrowed_out: Vec::new(),
                 aborted: true,
+                warnings: Vec::new(),
             });
         }
     }
@@ -2615,30 +2687,55 @@ pub(crate) async fn rollback_patches_inner(
             not_installed,
             narrowed_out: narrowed_out.clone(),
             aborted: false,
+            warnings: Vec::new(),
         });
     }
 
     // Rollback patches
     let mut results: Vec<RollbackResult> = Vec::new();
     let mut has_errors = false;
+    let mut warnings: Vec<(String, String)> = Vec::new();
 
-    for (purl, pkg_path) in rollback_targets {
+    for target in &rollback_targets {
+        let (purl, pkg_path) = (&target.purl, &target.dir);
         let patch = match filtered_manifest.patches.get(purl) {
             Some(p) => p,
             None => continue,
         };
 
-        // Local go drops the project-local `replace`-redirect; everything
-        // else — npm/pypi/gem and cargo (vendored or registry cache) —
-        // restores in place from before-blobs.
-        let result = match try_rollback_local_go(purl, pkg_path, patch, common).await {
-            Some(r) => r,
-            None => {
-                rollback_package_patch(purl, pkg_path, &patch.files, &blobs_path, common.dry_run)
+        // Local go drops the project-local `replace`-redirect; Maven
+        // restores each expanded copy (`rollback_maven_target`);
+        // everything else — npm/pypi/gem and cargo (vendored or registry
+        // cache) — restores in place from before-blobs.
+        let result = if purl.starts_with("pkg:maven/") {
+            Box::pin(rollback_maven_target(
+                target,
+                patch,
+                &blobs_path,
+                socket_dir,
+                common,
+            ))
+            .await
+        } else {
+            match try_rollback_local_go(purl, pkg_path, patch, common).await {
+                Some(r) => r,
+                None => {
+                    rollback_package_patch(
+                        purl,
+                        pkg_path,
+                        &patch.files,
+                        &blobs_path,
+                        common.dry_run,
+                    )
                     .await
+                }
             }
         };
 
+        if let Some(warning) = unconsumed_m2_skip(target, &result) {
+            warnings.push(warning);
+            continue;
+        }
         if !result.success {
             has_errors = true;
             // Under --silent (the summary muted) this line is the run's
@@ -2693,7 +2790,290 @@ pub(crate) async fn rollback_patches_inner(
         not_installed,
         narrowed_out,
         aborted: false,
+        warnings,
     })
+}
+
+/// One copy `rollback_patches_inner` restores.
+#[derive(Debug, Clone)]
+struct CopyTarget {
+    purl: String,
+    dir: PathBuf,
+    /// Maven: the record's files as joined onto `dir` (a Gradle hash dir's
+    /// keys are bare file names). `None`: the manifest record's files.
+    files: Option<HashMap<String, PatchFileInfo>>,
+    /// Maven member-keyed record: the jar under `dir` to restore whole.
+    jar_leaf: Option<String>,
+    /// A `~/.m2` copy this Gradle-only build never reads
+    /// (`JvmScope::split`'s `m2_ignored`). Restored when it holds this
+    /// record's patched bytes, but a copy that verifies as neither side
+    /// or has no backup here is left with a `gradle_m2_copy_not_restored`
+    /// warning (`unconsumed_m2_skip`), never a failure.
+    unconsumed_m2: bool,
+}
+
+impl CopyTarget {
+    fn plain(purl: &str, dir: &Path) -> Self {
+        Self {
+            purl: purl.to_string(),
+            dir: dir.to_path_buf(),
+            files: None,
+            jar_leaf: None,
+            unconsumed_m2: false,
+        }
+    }
+}
+
+/// The run warning that replaces a failed restore of an unconsumed
+/// `~/.m2` copy ([`CopyTarget::unconsumed_m2`]), when it failed before
+/// writing anything because the copy holds bytes that are neither side of
+/// this record (another build re-patched it, or `mvn install` rebuilt it),
+/// lacks a file, or is a swapped jar whose original this project never
+/// backed up. `None` for any other result, which is reported as usual —
+/// including a file that is there but cannot be read or stat'd, which may
+/// still hold this record's patched bytes.
+fn unconsumed_m2_skip(target: &CopyTarget, result: &RollbackResult) -> Option<(String, String)> {
+    if !target.unconsumed_m2 || result.success || !result.files_rolled_back.is_empty() {
+        return None;
+    }
+    // A file that is there but could not be read or stat'd (EACCES, EISDIR,
+    // ELOOP…) may still hold this record's patched bytes: leaving it would
+    // let `remove` drop the record and its before-blobs with the shared
+    // copy still patched, so it fails the run like any unverifiable copy.
+    if result
+        .files_verified
+        .iter()
+        .any(|v| v.status == VerifyRollbackStatus::NotFound && !v.is_absent())
+    {
+        return None;
+    }
+    let refused = result
+        .files_verified
+        .iter()
+        .any(|v| v.status == VerifyRollbackStatus::HashMismatch || v.is_absent())
+        || result
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("jvm_jar_backup_missing"));
+    refused.then(|| {
+        (
+            "gradle_m2_copy_not_restored".to_string(),
+            format!(
+                "{}: left the ~/.m2 copy at {} as it is; this Gradle-only build does not \
+                 read it ({})",
+                target.purl,
+                target.dir.display(),
+                result.error.as_deref().unwrap_or("it cannot be restored")
+            ),
+        )
+    })
+}
+
+/// The key `file` of a Maven record as it is joined onto `dir`: a Gradle
+/// hash dir holds the bare file name (`package/` dropped).
+fn maven_target_key(purl: &str, dir: &Path, file: &str) -> String {
+    if purl.starts_with("pkg:maven/")
+        && socket_patch_core::patch::sidecars::maven::is_gradle_hash_dir(dir)
+    {
+        file.trim_start_matches("package/").to_string()
+    } else {
+        file.to_string()
+    }
+}
+
+/// Maven rollback targets, per `(base purl, copy)` group: the variants the
+/// copy holds (`select_installed_variants`, which expands a Gradle version
+/// dir through `installed_copies`), each expanded into the hash dirs
+/// holding its files — or, for a member-keyed record, into every copy of
+/// its jar. A copy holding none of a group's variants' files is not an
+/// install of them and is skipped; one that holds files no variant
+/// matches attempts every variant, so verification reports the mismatch.
+/// Returns the targets and the variants no copy kept (narrowed out).
+async fn maven_rollback_targets(
+    groups: &[((String, PathBuf), Vec<&String>, bool)],
+    manifest: &PatchManifest,
+) -> (Vec<CopyTarget>, Vec<String>) {
+    use socket_patch_core::crawlers::gradle_cache::{
+        installed_copies_detailed, is_gradle_version_dir,
+    };
+    use socket_patch_core::patch::jvm_jar::{self, RecordShape};
+
+    let mut targets = Vec::new();
+    let mut considered: HashSet<String> = HashSet::new();
+    let mut kept: HashSet<String> = HashSet::new();
+    for ((_, copy), purls, unconsumed_m2) in groups {
+        let unconsumed_m2 = *unconsumed_m2;
+        let candidates: Vec<(&str, &HashMap<String, PatchFileInfo>)> = purls
+            .iter()
+            .filter_map(|purl| {
+                manifest
+                    .patches
+                    .get(*purl)
+                    .map(|p| (purl.as_str(), &p.files))
+            })
+            .collect();
+        considered.extend(candidates.iter().map(|(p, _)| p.to_string()));
+        let mut expanded: Vec<(String, Vec<CopyTarget>)> = Vec::new();
+        for (purl, files) in &candidates {
+            let mut out = Vec::new();
+            match jvm_jar::classify(purl, files) {
+                RecordShape::Members { jar_leaf } => {
+                    for dir in jvm_jar::jar_copies(copy, &jar_leaf) {
+                        out.push(CopyTarget {
+                            purl: purl.to_string(),
+                            dir,
+                            files: None,
+                            jar_leaf: Some(jar_leaf.clone()),
+                            unconsumed_m2,
+                        });
+                    }
+                }
+                RecordShape::Leaf if is_gradle_version_dir(copy) => {
+                    for (dir, files) in installed_copies_detailed(copy, files).targets {
+                        out.push(CopyTarget {
+                            purl: purl.to_string(),
+                            dir,
+                            files: Some(files),
+                            jar_leaf: None,
+                            unconsumed_m2,
+                        });
+                    }
+                }
+                RecordShape::Leaf => {
+                    let present = files
+                        .keys()
+                        .any(|k| copy.join(k.trim_start_matches("package/")).exists());
+                    if present {
+                        out.push(CopyTarget {
+                            unconsumed_m2,
+                            ..CopyTarget::plain(purl, copy)
+                        });
+                    }
+                }
+            }
+            if !out.is_empty() {
+                expanded.push((purl.to_string(), out));
+            }
+        }
+        if expanded.is_empty() {
+            continue;
+        }
+        let winners: HashSet<String> = if candidates.len() == 1 {
+            expanded.iter().map(|(p, _)| p.clone()).collect()
+        } else {
+            let matched = select_installed_variants(copy, &candidates).await;
+            if matched.is_empty() {
+                expanded.iter().map(|(p, _)| p.clone()).collect()
+            } else {
+                matched
+                    .iter()
+                    .map(|&i| candidates[i].0.to_string())
+                    .collect()
+            }
+        };
+        for (purl, out) in expanded {
+            if winners.contains(&purl) {
+                kept.insert(purl);
+                targets.extend(out);
+            }
+        }
+    }
+    let mut narrowed: Vec<String> = considered.difference(&kept).cloned().collect();
+    narrowed.sort();
+    (targets, narrowed)
+}
+
+/// Roll back one Maven target: a member-keyed record restores its whole
+/// jar (`jvm_jar::rollback_jar_swap`); a leaf record restores its files
+/// from before-blobs, `~/.m2` checksum files put back to the restored bytes.
+/// A restored Gradle hash-dir file must hash to its directory's name (the
+/// sha1 Gradle verified when it downloaded it); one that does not fails
+/// with `gradle_rollback_hash_mismatch` and is left as it is.
+async fn rollback_maven_target(
+    target: &CopyTarget,
+    patch: &PatchRecord,
+    blobs_path: &Path,
+    socket_dir: &Path,
+    common: &GlobalArgs,
+) -> RollbackResult {
+    use socket_patch_core::crawlers::gradle_cache::pristine;
+    use socket_patch_core::patch::jvm_jar::{rollback_jar_swap, JarRestore};
+    use socket_patch_core::patch::sidecars::{maven as maven_sidecars, SidecarRecord};
+
+    if let Some(jar_leaf) = &target.jar_leaf {
+        let restore = JarRestore {
+            purl: &target.purl,
+            jar_leaf,
+            files: &patch.files,
+            socket_dir,
+            dry_run: common.dry_run,
+            offline: common.offline,
+        };
+        return rollback_jar_swap(&restore, std::slice::from_ref(&target.dir))
+            .await
+            .into_iter()
+            .next()
+            .expect("one result per copy");
+    }
+    let files = target.files.as_ref().unwrap_or(&patch.files);
+    let gradle = maven_sidecars::is_gradle_hash_dir(&target.dir);
+    let keys: Vec<String> = files.keys().cloned().collect();
+    let pre = if gradle || common.dry_run {
+        None
+    } else {
+        Some(maven_sidecars::snapshot(&target.dir, &keys).await)
+    };
+    let mut result =
+        rollback_package_patch(&target.purl, &target.dir, files, blobs_path, common.dry_run).await;
+    if !result.success || common.dry_run {
+        return result;
+    }
+    if let Some(pre) = pre.filter(|p| !p.is_empty()) {
+        result.sidecar = Some(match maven_sidecars::resync(&target.dir, &pre).await {
+            Ok(files) => SidecarRecord {
+                purl: target.purl.clone(),
+                ecosystem: "maven".to_string(),
+                files,
+                advisory: None,
+            },
+            Err(e) => SidecarRecord {
+                purl: target.purl.clone(),
+                ecosystem: "maven".to_string(),
+                files: Vec::new(),
+                advisory: Some(socket_patch_core::patch::sidecars::SidecarAdvisory {
+                    code:
+                        socket_patch_core::patch::sidecars::SidecarAdvisoryCode::SidecarFixupFailed,
+                    severity: socket_patch_core::patch::sidecars::SidecarSeverity::Error,
+                    message: format!("sidecar resync failed (rollback still applied): {e}"),
+                }),
+            },
+        });
+    }
+    if gradle {
+        let hash = target
+            .dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        for file in &result.files_rolled_back {
+            let path = target.dir.join(file.trim_start_matches("package/"));
+            let Ok(bytes) = socket_patch_core::utils::fs::read_regular_to_bytes(&path).await else {
+                continue;
+            };
+            if !pristine(hash, &bytes) {
+                result.success = false;
+                result.error = Some(format!(
+                    "gradle_rollback_hash_mismatch: {} does not hash to its Gradle cache \
+                     directory after the restore (the before-blob is not the bytes Gradle \
+                     downloaded); left as it is — delete {} and let Gradle download it again.",
+                    path.display(),
+                    target.dir.display()
+                ));
+                break;
+            }
+        }
+    }
+    result
 }
 
 #[cfg(test)]

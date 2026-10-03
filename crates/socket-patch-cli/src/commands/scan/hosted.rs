@@ -1042,6 +1042,12 @@ pub(crate) async fn run_redirect_selected(
     if let Some(refusal) = engine::guard(&view, &done, &candidates) {
         return refuse(common, scan_result.take(), &refusal);
     }
+    // Defense in depth for the Gradle planner: a settings file it plans to
+    // CREATE (it never read one) must not already be on disk, or the
+    // atomic write would replace the user's settings with the apply line.
+    if let Some(refusal) = created_settings_over_existing(&common.cwd, &done) {
+        return refuse(common, scan_result.take(), &refusal);
+    }
 
     if !common.dry_run {
         let total = confirmed.len();
@@ -1579,6 +1585,8 @@ async fn vendored_takeover(
     // for those locks even though the rewriters never see these purls.
     let mut dry_run_locks: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    // Maven takes over only a Gradle build's vendored JVM entry (its revert
+    // unplans the vendored Gradle wiring); a pom-only vendored entry stays.
     // PyPI: every Python rewriter (requirements.txt, Poetry, Pipenv, uv,
     // Hatch, PDM, pylock) refuses a non-registry source as user-authored,
     // including the vendored one socket-patch wrote itself, so a vendored
@@ -1588,6 +1596,15 @@ async fn vendored_takeover(
             || p.starts_with("pkg:npm/")
             || p.starts_with("pkg:golang/")
             || p.starts_with("pkg:pypi/")
+            || p.starts_with("pkg:maven/")
+    };
+    let gradle_jvm_entry = |entry: &socket_patch_core::vendor::VendorEntry| {
+        entry.ecosystem == "jvm"
+            && entry.wiring.iter().any(|w| {
+                w.file.ends_with(".gradle")
+                    || w.file.ends_with(".gradle.kts")
+                    || w.file == socket_patch_core::vendor::jvm::gradle::INDEX_REL
+            })
     };
     if !candidates.iter().any(|c| takeover_capable(&c.purl)) {
         // No takeover-capable candidates — nothing to reconcile.
@@ -1612,7 +1629,13 @@ async fn vendored_takeover(
                 .cloned();
             (c, entry)
         })
+        .filter(|(c, entry)| {
+            !c.purl.starts_with("pkg:maven/") || entry.as_ref().is_some_and(gradle_jvm_entry)
+        })
         .collect();
+    if takeover.is_empty() {
+        return Ok(out);
+    }
     // Compatibility must be known before the takeover removes a live
     // patch. In particular, a v0 workspace can keep an existing local
     // tuple even though hosted mode cannot replace it with a URL. Only
@@ -1713,15 +1736,50 @@ async fn vendored_takeover(
     } else {
         None
     };
+    // Gradle twin: the hosted Gradle planner refuses builds and grants the
+    // vendored backend accepts (a custom `lockFile`, a settings-classpath
+    // GA, a same-GAV or incomplete grant, ...). Each refusal must be known
+    // before the revert strips the live vendored patch, or the planner
+    // then writes nothing and the build resolves the unpatched upstream.
+    // Every Gradle JVM takeover purl is checked against the build on disk.
+    let gradle_takeover_refusals: std::collections::HashMap<
+        String,
+        socket_patch_core::patch::redirect::RewriteWarning,
+    > = if takeover.iter().any(|(c, entry)| {
+        c.purl.starts_with("pkg:maven/") && entry.as_ref().is_some_and(gradle_jvm_entry)
+    }) {
+        let build =
+            socket_patch_core::patch::redirect::gradle::read_build_from_disk(&common.cwd).await;
+        takeover
+            .iter()
+            .filter(|(c, entry)| {
+                c.purl.starts_with("pkg:maven/") && entry.as_ref().is_some_and(gradle_jvm_entry)
+            })
+            .filter_map(|(c, _)| {
+                socket_patch_core::patch::redirect::gradle::takeover_refusal(
+                    &build.files,
+                    &build.unreadable,
+                    &c.dep,
+                )
+                .map(|w| (c.purl.clone(), w))
+            })
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
     // The takeover refusal (if any) for one candidate: bun gates every
-    // npm purl, berry and vlt only their own vendored entries. Berry also
-    // runs the rewriter's per-dep grant gate (a grant without the berry
-    // cache checksum is skipped by the rewriter, so reverting first would
-    // leave the package in neither mode). A refused purl is never
-    // dispatched (see the loop), so its wiring is not a write target here.
+    // npm purl, berry and vlt only their own vendored entries, Gradle each
+    // of its own purls. Berry also runs the rewriter's per-dep grant gate (a
+    // grant without the berry cache checksum is skipped by the rewriter, so
+    // reverting first would leave the package in neither mode). A refused
+    // purl is never dispatched (see the loop), so its wiring is not a write
+    // target here.
     let takeover_refusal = |c: &Candidate,
                             entry: Option<&socket_patch_core::vendor::VendorEntry>|
      -> Option<socket_patch_core::patch::redirect::RewriteWarning> {
+        if c.purl.starts_with("pkg:maven/") {
+            return gradle_takeover_refusals.get(&c.purl).cloned();
+        }
         if !c.purl.starts_with("pkg:npm/") {
             return None;
         }
@@ -2395,6 +2453,31 @@ pub(crate) fn npm_allow_remote_one_line(detail: &str) -> String {
              automatically {MORE}."
         )
     }
+}
+
+/// The refusal for a Gradle settings file the hosted rewrite writes
+/// without having read it (the planner took it for absent and creates it)
+/// while one is on disk: writing it would replace the user's settings.
+fn created_settings_over_existing(
+    cwd: &std::path::Path,
+    done: &socket_patch_core::hosted::engine::Rewritten,
+) -> Option<socket_patch_core::hosted::engine::Refusal> {
+    done.rewrite
+        .files
+        .keys()
+        .filter(|rel| {
+            let base = rel.rsplit('/').next().unwrap_or(rel);
+            matches!(base, "settings.gradle" | "settings.gradle.kts")
+                && !done.files.contains_key(rel.as_str())
+        })
+        .find(|rel| std::fs::symlink_metadata(cwd.join(rel)).is_ok())
+        .map(|rel| socket_patch_core::hosted::engine::Refusal {
+            code: socket_patch_core::patch::redirect::gradle::UNREADABLE_REFUSAL_CODE.to_string(),
+            message: format!(
+                "{rel} exists but could not be read, so the hosted Gradle wiring would replace \
+                 it; make it a readable UTF-8 file and re-run; nothing was written"
+            ),
+        })
 }
 
 #[cfg(test)]
@@ -3851,6 +3934,13 @@ mod tests {
                 "settings.gradle.kts",
                 "build.gradle",
                 "build.gradle.kts",
+                "gradle.lockfile",
+                "buildscript-gradle.lockfile",
+                "settings-gradle.lockfile",
+                "gradle/verification-metadata.xml",
+                "gradle/wrapper/gradle-wrapper.properties",
+                ".socket/gradle/hosted-index.tsv",
+                ".socket/gradle/socket-patch.hosted.settings.gradle",
             ]
         );
     }

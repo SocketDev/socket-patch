@@ -22,7 +22,7 @@
 //! |---|---|---|
 //! | golang | the REPLACEMENT module `$GOMODCACHE/patch.socket.dev/gopatch/<uuid>@<sver>` (the ref's `url`, else go.mod's hosted `replace`) | the original `M@v` |
 //! | cargo | `registry/src/<host>-<hash>/<name>-<version>` for the lock source's host; several such registries (one per patch uuid) are narrowed to the one whose cached `.crate` has the lock's pinned checksum. A `vendor/` source tree or `--global-prefix` is taken as given | crates.io's / any other registry's extraction |
-//! | maven | `<repo>/<g>/<a>/<base>-socket.<hex8>/` (the version the pom pins), its artifact files matched under the suffixed name | the `<base>` version dir |
+//! | maven | `<repo>/<g>/<a>/<base>-socket.<hex8>/` (the version the pom or the hosted Gradle wiring pins) in `~/.m2` and every Gradle `files-2.1` holding it (hash dirs expanded), its artifact files matched under the suffixed name | the `<base>` version dir |
 //! | npm | every `node_modules` copy the crawler finds (pnpm and vlt store copies included), every peer / modifier / registry variant of those in the same `.pnpm` / `.vlt` store, plus alias installs (`node_modules/<alias>` holding the package) in the root's and every workspace member's tree | — each serves some dependent: ALL must verify |
 //! | pypi | every copy in the crawler's environment set (the project's venvs when it has any, else the interpreters) | — any may be the one that runs the project: ALL must verify |
 //! | gem | every copy in bundler's gem path | — bundler loads whichever `Gem.path` home it hits first: ALL must verify |
@@ -556,9 +556,14 @@ fn cached_crate(src: &Path, name: &str, version: &str) -> Option<PathBuf> {
 /// The fail-closed hosted pom pins `<base>-socket.<first 8 hex of the patch
 /// uuid>`, a version only the Socket repository serves: maven resolves
 /// `~/.m2/…/<a>/<suffixed>/`, never the `<base>` dir (whose copy predates
-/// the redirect or belongs to another project). The served files carry the
-/// suffixed version in their names, so the record's `<a>-<base>…` files are
-/// matched as `<a>-<suffixed>…`.
+/// the redirect or belongs to another project), and the hosted Gradle
+/// wiring pins the same version into `files-2.1/<g>/<a>/<suffixed>/`. Every
+/// cache holding the suffixed version (`get_maven_copy_paths`: `~/.m2`,
+/// then each Gradle cache, the read-only one included) is a consumed copy;
+/// a Gradle version dir is expanded into its hash dirs at verify time
+/// (`installed_copies`). The served files carry the suffixed version in
+/// their names, so the record's `<a>-<base>…` files are matched as
+/// `<a>-<suffixed>…` — a member-keyed record checks the jar of that name.
 async fn maven_copies(options: &CrawlerOptions, purl: &str, wiring: &HostedWiring) -> HostedCopies {
     let Some((_, name, version)) = purl_parts(purl) else {
         return not_installed();
@@ -572,8 +577,9 @@ async fn maven_copies(options: &CrawlerOptions, purl: &str, wiring: &HostedWirin
     let suffixed = format!("{version}-socket.{hex8}");
     let target = format!("pkg:maven/{group}/{artifact}@{suffixed}");
     let crawler = MavenCrawler::new();
+    let mut paths = Vec::new();
     for repo in crawler
-        .get_maven_repo_paths(options)
+        .get_maven_copy_paths(options)
         .await
         .unwrap_or_default()
     {
@@ -582,16 +588,21 @@ async fn maven_copies(options: &CrawlerOptions, purl: &str, wiring: &HostedWirin
             .await
             .unwrap_or_default();
         if let Some(pkg) = found.get(&target) {
-            return HostedCopies {
-                paths: vec![pkg.path.clone()],
-                rename: Some((
-                    format!("{artifact}-{version}"),
-                    format!("{artifact}-{suffixed}"),
-                )),
-            };
+            if !paths.contains(&pkg.path) {
+                paths.push(pkg.path.clone());
+            }
         }
     }
-    not_installed()
+    if paths.is_empty() {
+        return not_installed();
+    }
+    HostedCopies {
+        paths,
+        rename: Some((
+            format!("{artifact}-{version}"),
+            format!("{artifact}-{suffixed}"),
+        )),
+    }
 }
 
 #[cfg(test)]

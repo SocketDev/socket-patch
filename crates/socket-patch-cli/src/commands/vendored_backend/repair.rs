@@ -478,6 +478,22 @@ impl VendoredBackend<'_> {
                             continue;
                         }
                     }
+                    // Likewise a JVM entry's derived metadata and owned
+                    // `.gitattributes`: rewritten when missing, offline.
+                    if vendor::jvm::apply::is_jvm_entry(&entry) && !common.dry_run {
+                        if let Err(e) =
+                            vendor::redownload::restore_jvm_owned_files(&common.cwd, &entry).await
+                        {
+                            fail(
+                                env,
+                                common.json,
+                                purl,
+                                "vendor_artifact_unrepairable",
+                                format!("cannot restore the vendored Gradle files: {e}"),
+                            );
+                            continue;
+                        }
+                    }
                     // Dir-shaped gem artifacts from pre-inventory vendors:
                     // the health check could only verify the PATCHED members
                     // — unpatched-file drift is invisible until a re-vendor

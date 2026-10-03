@@ -4,6 +4,7 @@ pub mod apply_lock;
 pub mod copy_tree;
 pub mod diff;
 pub(crate) mod file_hash;
+pub mod jvm_jar;
 pub mod package;
 pub(crate) mod path_safety;
 pub mod redirect;
