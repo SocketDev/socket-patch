@@ -73,8 +73,10 @@ pub fn vendor_uuid_dir_rel(eco: &str, uuid: &str) -> Option<String> {
 /// The first of `.socket/vendor`, `.socket/vendor/<eco>` and
 /// `.socket/vendor/<eco>/<uuid>` under `project_root` that is a symlink (or
 /// a Windows junction), project-relative and forward-slashed; `None` when
-/// none is. The `<eco>` level is only checked for a known ecosystem dir and
-/// the `<uuid>` level only for a canonical uuid.
+/// none is. The `<eco>` level is only checked for a known ecosystem dir
+/// (`jvm` counts as `maven`, which also checks the JVM repository tree
+/// `.socket/vendor/maven2`) and the `<uuid>` level only for a canonical
+/// uuid.
 ///
 /// Vendor staging creates these dirs itself and never writes symlinks, so a
 /// linked level is never ours: its target may be another project's vendor
@@ -83,11 +85,18 @@ pub fn vendor_uuid_dir_rel(eco: &str, uuid: &str) -> Option<String> {
 /// and revert dispatch refuses on this before touching anything, as
 /// [`sweep_vendor_dirs`] already skips a linked eco or uuid dir.
 pub fn vendor_dir_symlink(project_root: &Path, eco: &str, uuid: Option<&str>) -> Option<String> {
+    // A `jvm` ledger entry is reverted by the maven backend, and every
+    // maven-family entry may own files in the JVM repository tree
+    // (`.socket/vendor/maven2`) as well as a `maven/<uuid>` unit.
+    let eco = if eco == "jvm" { "maven" } else { eco };
     let mut levels = vec![VENDOR_DIR.to_string()];
     if ECOSYSTEM_DIRS.contains(&eco) {
         levels.push(format!("{VENDOR_DIR}/{eco}"));
         if let Some(rel) = uuid.and_then(|u| vendor_uuid_dir_rel(eco, u)) {
             levels.push(rel);
+        }
+        if eco == "maven" {
+            levels.push(format!("{VENDOR_DIR}/maven2"));
         }
     }
     levels.into_iter().find(|rel| {
@@ -1003,6 +1012,26 @@ mod tests {
             Some(format!(".socket/vendor/npm/{UUID}"))
         );
         assert_eq!(vendor_dir_symlink(&unit, "npm", Some("not-a-uuid")), None);
+
+        // `jvm` entries are maven-backed: the maven unit and the JVM
+        // repository tree are both checked.
+        let jvm = tmp.path().join("jvm");
+        std::fs::create_dir_all(jvm.join(".socket/vendor")).unwrap();
+        symlink(&outside, jvm.join(".socket/vendor/maven")).unwrap();
+        assert_eq!(
+            vendor_dir_symlink(&jvm, "jvm", Some(UUID)).as_deref(),
+            Some(".socket/vendor/maven")
+        );
+        let tree = tmp.path().join("tree");
+        std::fs::create_dir_all(tree.join(".socket/vendor/maven")).unwrap();
+        symlink(&outside, tree.join(".socket/vendor/maven2")).unwrap();
+        for eco in ["jvm", "maven"] {
+            assert_eq!(
+                vendor_dir_symlink(&tree, eco, Some(UUID)).as_deref(),
+                Some(".socket/vendor/maven2"),
+                "{eco}"
+            );
+        }
 
         let vendor = tmp.path().join("vendor");
         std::fs::create_dir_all(vendor.join(".socket")).unwrap();
