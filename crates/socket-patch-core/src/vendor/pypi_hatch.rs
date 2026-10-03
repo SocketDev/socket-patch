@@ -607,6 +607,91 @@ mod tests {
         }
     }
 
+    /// #674 end to end through the real lanes: the hosted rewrite, then the
+    /// takeover's per-pin `restore_upstream` and vendored wiring for each
+    /// package in turn, then a revert in either order.
+    #[tokio::test]
+    async fn takeover_through_hosted_unwind_reverts_byte_exact() {
+        use crate::patch::redirect::upstream::{restore_upstream, HostedPin, RestoreOptions};
+        let original = "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\", \"toml==0.10.2\"]\n";
+        let packages = [
+            ("six", "1.16.0", UUID),
+            ("toml", "0.10.2", "a0f74f9a-ce65-4451-ab60-025159b4d410"),
+        ];
+        let deps: Vec<crate::patch::redirect::DepOverride> = packages
+            .iter()
+            .map(|(name, version, uuid)| {
+                serde_json::from_value(json!({
+                    "ecosystem": "pypi", "name": name, "version": version,
+                    "token": "11111111-1111-1111-1111-111111111111",
+                    "patchUuid": uuid,
+                    "artifactUrl": format!(
+                        "https://patch.socket.dev/patch/pypi/{name}/{version}/11111111-1111-1111-1111-111111111111/{uuid}/{name}-{version}-py3-none-any.whl"
+                    ),
+                    "integrity": { "sha256": "d".repeat(64) }
+                }))
+                .unwrap()
+            })
+            .collect();
+        let input = BTreeMap::from([("pyproject.toml".to_owned(), original.to_owned())]);
+        let hosted = crate::patch::redirect::rewrite_registry_redirect_with_pipenv_version(
+            &input,
+            &deps,
+            &BTreeMap::new(),
+            None,
+            false,
+        );
+        let hosted = &hosted.files["pyproject.toml"];
+        assert!(
+            hosted.contains("allow-direct-references = true"),
+            "{hosted}"
+        );
+        for order in [[0, 1], [1, 0]] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            tokio::fs::write(root.join("pyproject.toml"), hosted)
+                .await
+                .unwrap();
+            let pins = HostedPin::all(&crate::vex::discover_patched_refs(root).await);
+            assert_eq!(pins.len(), 2, "{pins:?}");
+            let mut state = VendorState::default();
+            let mut entries = Vec::new();
+            for (name, version, uuid) in packages {
+                let pin = pins.iter().find(|pin| pin.uuid == uuid).unwrap();
+                let restore = restore_upstream(
+                    root,
+                    std::slice::from_ref(pin),
+                    &RestoreOptions {
+                        offline: true,
+                        ..RestoreOptions::default()
+                    },
+                )
+                .await;
+                assert_eq!(restore.refused().count(), 0, "{name}");
+                let project = load(root, name, version, uuid).await.unwrap();
+                let wheel = format!(".socket/vendor/pypi/{uuid}/{name}-{version}-py3-none-any.whl");
+                let wiring = wire(&project, root, name, version, &wheel, &"0".repeat(64))
+                    .await
+                    .unwrap();
+                let entry = entry(uuid, name, &wheel, &"0".repeat(64), wiring);
+                state.entries.insert(name.into(), entry.clone());
+                entries.push(entry);
+                save_state(root, &state).await.unwrap();
+            }
+            for index in order {
+                let outcome = revert(&entries[index], root, false).await;
+                assert!(outcome.success, "{:?}", outcome.error);
+            }
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("pyproject.toml"))
+                    .await
+                    .unwrap(),
+                original,
+                "order {order:?}"
+            );
+        }
+    }
+
     /// The #674 drop only applies to a permission recorded while
     /// non-vendored direct references were live. A permission the user set
     /// is restored verbatim after two vendored packages are reverted, inline
