@@ -1359,16 +1359,16 @@ async fn berry_crlf_takeovers_round_trip_both_directions() {
     // The vendored `resolutions` entry is gone and the hosted pin (#404
     // option C) took its place, in the manifest's own layout: BOM + CRLF.
     let hosted_pkg = std::fs::read_to_string(root.join("package.json")).unwrap();
-    assert!(
-        hosted_pkg.starts_with('\u{feff}'),
-        "BOM kept: {hosted_pkg:?}"
-    );
+    assert!(hosted_pkg.starts_with('\u{feff}'), "BOM kept: {hosted_pkg:?}");
     let pin_line = format!("    \"left-pad@npm:1.3.0\": \"{hosted_url}\"\r\n");
     assert!(
         hosted_pkg.contains(&pin_line) && !hosted_pkg.contains(".socket/vendor/"),
         "the hosted pin replaced the vendored resolutions entry: {hosted_pkg:?}"
     );
-    let unpinned = hosted_pkg.replace(&format!(",\r\n  \"resolutions\": {{\r\n{pin_line}  }}"), "");
+    let unpinned = hosted_pkg.replace(
+        &format!(",\r\n  \"resolutions\": {{\r\n{pin_line}  }}"),
+        "",
+    );
     assert_eq!(unpinned, pkg, "nothing else in package.json changed");
     let hosted_lock = std::fs::read_to_string(root.join("yarn.lock")).unwrap();
     assert!(

@@ -65,10 +65,7 @@ pub(crate) async fn restore(
         (uuid.clone(), ctx.client.go_sums(module, version).await)
     });
     let sums: std::collections::BTreeMap<String, Result<super::client::GoSums, String>> =
-        futures_util::future::join_all(lookups)
-            .await
-            .into_iter()
-            .collect();
+        futures_util::future::join_all(lookups).await.into_iter().collect();
 
     let mut go_mod_next = go_mod.clone();
     let mut go_sum = view.read("go.sum").await.ok().flatten();
@@ -91,8 +88,8 @@ pub(crate) async fn restore(
             }
         }
         if let Some(text) = go_sum.as_deref() {
-            let mut next =
-                remove_module_prefix_lines(text, socket_module).unwrap_or_else(|| text.to_string());
+            let mut next = remove_module_prefix_lines(text, socket_module)
+                .unwrap_or_else(|| text.to_string());
             let upstream = format!(
                 "{module} {version} {}\n{module} {version}/go.mod {}\n",
                 sums.zip_h1, sums.mod_h1
