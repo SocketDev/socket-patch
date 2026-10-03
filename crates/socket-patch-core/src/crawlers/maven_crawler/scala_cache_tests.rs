@@ -255,14 +255,24 @@ struct Hermetic(Vec<(&'static str, Option<String>)>);
 
 impl Hermetic {
     fn new(home: &Path, vars: &[(&'static str, String)]) -> Self {
-        const CLEARED: &[&str] = &["XDG_CACHE_HOME", "LOCALAPPDATA", "JAVA_OPTS", "M2_HOME"];
-        let mut keys: Vec<&'static str> = vec!["HOME", "USERPROFILE"];
+        const CLEARED: &[&str] = &[
+            "XDG_CACHE_HOME",
+            "LOCALAPPDATA",
+            "JAVA_OPTS",
+            "M2_HOME",
+            "GRADLE_OPTS",
+            "GRADLE_RO_DEP_CACHE",
+        ];
+        // Gradle's user home comes from the passwd entry on Unix, not
+        // `HOME`: pin it into the stand-in home too.
+        let mut keys: Vec<&'static str> = vec!["HOME", "USERPROFILE", "GRADLE_USER_HOME"];
         keys.extend(CLEARED);
         keys.extend(vars.iter().map(|(k, _)| *k));
         let saved = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
         std::fs::create_dir_all(home).unwrap();
         std::env::set_var("HOME", home);
         std::env::set_var("USERPROFILE", home);
+        std::env::set_var("GRADLE_USER_HOME", home.join(".gradle"));
         for key in CLEARED {
             std::env::remove_var(key);
         }
@@ -393,8 +403,11 @@ async fn local_scala_caches_only_for_scala_tool_projects() {
         }
     };
     let m2_only = vec![JvmCacheRoot::new(m2_root.clone(), JvmCacheLayout::Maven2)];
-    for marker in ["pom.xml", "build.gradle", "settings.gradle.kts"] {
-        assert_eq!(roots_of(marker).await, m2_only, "{marker}");
+    assert_eq!(roots_of("pom.xml").await, m2_only, "pom.xml");
+    // A Gradle-only build without `mavenLocal()` does not even read `~/.m2`
+    // (the Gradle caches are empty here); never the Scala caches.
+    for marker in ["build.gradle", "settings.gradle.kts"] {
+        assert_eq!(roots_of(marker).await, Vec::new(), "{marker}");
     }
     for marker in [
         "build.sbt",
@@ -414,4 +427,106 @@ async fn local_scala_caches_only_for_scala_tool_projects() {
             "{marker}: {roots:?}"
         );
     }
+}
+
+/// An Ivy artifact directory expands over its module's type dirs: the
+/// jar in `jars/`, the sources jar in `srcs/`; a key no type dir holds
+/// stays joined onto the crawled directory (reported not found).
+#[test]
+fn installed_copies_expands_an_ivy_artifact_dir() {
+    use crate::crawlers::gradle_cache::{expands, installed_copies, installed_copies_detailed};
+    use crate::manifest::schema::PatchFileInfo;
+    use std::collections::HashMap;
+    let tmp = tempfile::tempdir().unwrap();
+    let jars = ivy(&tmp.path().join("ivy/cache"), "org.socket.test", "lib", "1");
+    let module = jars.parent().unwrap().to_path_buf();
+    write(&module.join("srcs/lib-1-sources.jar"), b"src");
+    let info = |h: &str| PatchFileInfo {
+        before_hash: h.repeat(64),
+        after_hash: h.repeat(64),
+    };
+    let files: HashMap<String, PatchFileInfo> = [
+        ("package/lib-1.jar", "a"),
+        ("package/lib-1-sources.jar", "b"),
+        ("package/lib-1.pom", "c"),
+    ]
+    .into_iter()
+    .map(|(k, h)| (k.to_string(), info(h)))
+    .collect();
+    assert!(expands(&jars));
+    assert!(!expands(&module), "the module dir is no package dir");
+    let detailed = installed_copies_detailed(&jars, &files);
+    let targets: Vec<(PathBuf, Vec<String>)> = detailed
+        .targets
+        .iter()
+        .map(|(dir, files)| {
+            let mut keys: Vec<String> = files.keys().cloned().collect();
+            keys.sort();
+            (dir.clone(), keys)
+        })
+        .collect();
+    assert_eq!(
+        targets,
+        vec![
+            (module.join("jars"), vec!["lib-1.jar".to_string()]),
+            (module.join("srcs"), vec!["lib-1-sources.jar".to_string()]),
+        ]
+    );
+    assert_eq!(detailed.missing, vec!["package/lib-1.pom".to_string()]);
+    let all = installed_copies(&jars, &files);
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[2].0, jars, "the missing pom stays on the crawled dir");
+    // A Maven2 / Coursier version dir is joined as is.
+    let repo = m2(
+        &tmp.path().join("cs/https/h/maven2"),
+        "org.socket.test",
+        "lib",
+        "1",
+    );
+    assert!(!expands(&repo));
+    assert_eq!(
+        installed_copies(&repo, &files),
+        vec![(repo.clone(), files.clone())]
+    );
+}
+
+/// `locate_artifact` finds a file's copy in a Coursier cache (through its
+/// repository roots) and in an Ivy cache (in any artifact type dir).
+#[test]
+fn locate_artifact_reads_coursier_and_ivy_caches() {
+    use crate::crawlers::jvm_cache::locate_artifact;
+    let tmp = tempfile::tempdir().unwrap();
+    let (cache, central, _, gson) = coursier_cache(tmp.path());
+    let gav = (
+        "com.google.code.gson".to_string(),
+        "gson".to_string(),
+        "2.8.9".to_string(),
+    );
+    let jar = gson.join("gson-2.8.9.jar");
+    for root in [
+        JvmCacheRoot::new(cache.clone(), JvmCacheLayout::Coursier),
+        JvmCacheRoot::new(central.clone(), JvmCacheLayout::Coursier),
+    ] {
+        assert_eq!(locate_artifact(&root, &gav, None, "jar"), vec![jar.clone()]);
+    }
+    let ivy_root = tmp.path().join("ivy/cache");
+    let jars = ivy(&ivy_root, "org.socket.test", "lib", "1");
+    write(
+        &jars.parent().unwrap().join("srcs/lib-1-sources.jar"),
+        b"src",
+    );
+    let root = JvmCacheRoot::new(ivy_root, JvmCacheLayout::Ivy);
+    let lib = (
+        "org.socket.test".to_string(),
+        "lib".to_string(),
+        "1".to_string(),
+    );
+    assert_eq!(
+        locate_artifact(&root, &lib, None, "jar"),
+        vec![jars.join("lib-1.jar")]
+    );
+    assert_eq!(
+        locate_artifact(&root, &lib, Some("sources"), "jar"),
+        vec![jars.parent().unwrap().join("srcs/lib-1-sources.jar")]
+    );
 }

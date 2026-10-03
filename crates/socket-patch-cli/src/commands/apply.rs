@@ -2646,8 +2646,9 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
             // holds are applied against the version dir, where they are
             // not found and fail the copy as they would on `~/.m2` (the
             // build still loads the held jar, so a silent skip would leave
-            // it unpatched behind a clean exit).
-            let (targets, absent) = if is_gradle_version_dir(copy) {
+            // it unpatched behind a clean exit). An Ivy copy expands the
+            // same way over its module's type dirs (`jars/`, `srcs/`, …).
+            let (targets, absent) = if gradle_cache::expands(copy) {
                 let detailed = gradle_cache::installed_copies_detailed(copy, &patch.files);
                 if detailed.targets.is_empty() {
                     continue;

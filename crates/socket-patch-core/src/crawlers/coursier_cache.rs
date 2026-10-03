@@ -62,9 +62,9 @@ const MAX_ENTRIES_PER_HOST: usize = 200_000;
 /// Every source is kept, not only the first: sbt, Mill and scala-cli on the
 /// same machine may each have been pointed at a different cache, and each
 /// cache's packages must be discoverable, and `apply` / `rollback` act on
-/// a GAV's copy in every root (the Maven arm of the CLI apply copy loop).
-/// A relative value resolves against `cwd`
-/// (the JVM's working directory when the build runs there).
+/// a GAV's copy in every root (the Maven every-copy fan-out over
+/// `MavenCrawler::get_maven_copy_paths`). A relative value resolves
+/// against `cwd` (the JVM's working directory when the build runs there).
 pub fn coursier_cache_dirs(
     os: TargetOs,
     env: &dyn Fn(&str) -> Option<String>,

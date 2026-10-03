@@ -819,15 +819,15 @@ async fn vex_copy_sets(
     manifest: &PatchManifest,
     copies: &HashMap<String, Vec<PathBuf>>,
 ) -> HashMap<String, Vec<PathBuf>> {
-    use socket_patch_core::crawlers::gradle_cache::{
-        installed_copies_detailed, is_gradle_version_dir,
-    };
+    use socket_patch_core::crawlers::gradle_cache::{expands, installed_copies_detailed};
     use socket_patch_core::patch::jvm_jar::{self, RecordShape};
     let holds = |purl: &str, path: &PathBuf| {
         let Some(record) = manifest.patches.get(purl) else {
             return true;
         };
-        if !is_gradle_version_dir(path) {
+        // A Gradle version dir or an Ivy artifact dir holding none of the
+        // record's files is no copy of it.
+        if !expands(path) {
             return true;
         }
         match jvm_jar::classify(purl, &record.files) {

@@ -228,7 +228,7 @@ fn agent_apply_patches_an_ivy_cache_copy() {
 }
 
 #[test]
-fn agent_m2_sidecars_are_not_coursier_sidecars() {
+fn agent_m2_checksum_files_are_not_coursier_sidecars() {
     let fx = fixture();
     let dir = fx.home.m2().join("org/slf4j/slf4j-api/1.7.36");
     std::fs::create_dir_all(&dir).unwrap();
@@ -241,12 +241,19 @@ fn agent_m2_sidecars_are_not_coursier_sidecars() {
     let (code, env, stderr) = run(&fx, &["apply", "--offline", "--json"], &[]);
     assert_eq!(code, 0, "apply: {env}\n{stderr}");
     assert_eq!(std::fs::read(dir.join(JAR)).unwrap(), PATCHED);
+    // The `~/.m2` checksum file follows the patched bytes (the Maven
+    // sidecar arm), and no Coursier `.<file>__<algo>` sidecar is made.
     assert_eq!(
         std::fs::read_to_string(dir.join(format!("{JAR}.sha1"))).unwrap(),
-        sha1_hex(ORIGINAL),
-        "`~/.m2` sidecars are not this module's"
+        sha1_hex(PATCHED)
     );
-    assert!(maven_sidecars(&env).is_empty(), "{env}");
+    assert!(!hidden(&dir, "__sha1").exists());
+    let files: Vec<String> = maven_sidecars(&env)
+        .iter()
+        .flat_map(|r| r["files"].as_array().cloned().unwrap_or_default())
+        .filter_map(|f| f["path"].as_str().map(str::to_string))
+        .collect();
+    assert!(files.iter().all(|f| !f.contains("__")), "{env}");
 }
 
 /// A Coursier sidecar that cannot be resynced (here a directory squatting
@@ -551,5 +558,153 @@ fn agent_rollback_narrows_classifier_variants_per_copy() {
         std::fs::read(coursier.join(TESTS_JAR)).unwrap(),
         TESTS_ORIGINAL,
         "the classifier jar is restored where it lives: {env}"
+    );
+}
+
+/// `vex -O <doc>` in the fixture's project: the statement count (0 when no
+/// document was written) and the envelope.
+fn vex_statements(fx: &Fixture, extra: &[(&str, String)]) -> (usize, Value) {
+    let doc = fx.project.join("vex.json");
+    let _ = std::fs::remove_file(&doc);
+    let (_, env, _) = run(
+        fx,
+        &[
+            "vex",
+            "-O",
+            doc.to_str().unwrap(),
+            "--product",
+            "pkg:maven/com.example/app@1.0",
+            "--offline",
+            "--json",
+        ],
+        extra,
+    );
+    let statements = std::fs::read(&doc)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|d| d["statements"].as_array().map(Vec::len))
+        .unwrap_or(0);
+    (statements, env)
+}
+
+/// VEX judges every copy an sbt build may load: with `~/.m2`, Coursier and
+/// Ivy all patched it attests; one copy put back to its pristine bytes
+/// (a re-download, say) withholds the statement.
+#[test]
+fn agent_vex_rehashes_every_cached_copy() {
+    let fx = fixture();
+    let m2 = fx.home.m2().join("org/slf4j/slf4j-api/1.7.36");
+    std::fs::create_dir_all(&m2).unwrap();
+    std::fs::write(m2.join(JAR), ORIGINAL).unwrap();
+    std::fs::write(m2.join("slf4j-api-1.7.36.pom"), SLF4J.pom()).unwrap();
+    let coursier = write_coursier_artifact(&fx.home.coursier_cache(), CENTRAL, SLF4J, ORIGINAL);
+    let ivy = write_ivy_artifact(&fx.home.ivy_home(), SLF4J, ORIGINAL);
+    stage_manifest(&fx.project, SLF4J);
+    // VEX attests only a record with vulnerability metadata.
+    let manifest_path = fx.project.join(".socket/manifest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["patches"][SLF4J.purl()]["vulnerabilities"] = serde_json::json!({
+        "GHSA-5b7a-0000-0001": {
+            "cves": ["CVE-2026-0001"], "summary": "s",
+            "severity": "high", "description": "d"
+        }
+    });
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let sbt_opts = (
+        "SBT_OPTS",
+        format!("-Dsbt.ivy.home={}", fx.home.ivy_home().display()),
+    );
+    let (code, env, stderr) = run(
+        &fx,
+        &["apply", "--offline", "--json"],
+        std::slice::from_ref(&sbt_opts),
+    );
+    assert_eq!(code, 0, "apply: {env}\n{stderr}");
+    let (statements, env) = vex_statements(&fx, std::slice::from_ref(&sbt_opts));
+    assert!(statements > 0, "every copy patched: {env}");
+    for copy in [coursier.join(JAR), ivy.join(JAR)] {
+        std::fs::write(&copy, ORIGINAL).unwrap();
+        let (statements, env) = vex_statements(&fx, std::slice::from_ref(&sbt_opts));
+        assert_eq!(statements, 0, "{} pristine: {env}", copy.display());
+        std::fs::write(&copy, PATCHED).unwrap();
+    }
+}
+
+/// An Ivy module keeps a sources jar under `srcs/`, beside the `jars/`
+/// directory the crawler reports: a `?classifier=sources` record is
+/// patched and restored there.
+#[test]
+fn agent_an_ivy_sources_jar_under_srcs_is_patched_and_restored() {
+    const SOURCES_JAR: &str = "slf4j-api-1.7.36-sources.jar";
+    const SOURCES_ORIGINAL: &[u8] = b"PK\x03\x04 pristine slf4j-api sources\n";
+    const SOURCES_PATCHED: &[u8] = b"PK\x03\x04 socket-patched slf4j-api sources\n";
+    let fx = fixture();
+    let jars = write_ivy_artifact(&fx.home.ivy_home(), SLF4J, ORIGINAL);
+    let srcs = jars.parent().unwrap().join("srcs");
+    std::fs::create_dir_all(&srcs).unwrap();
+    std::fs::write(srcs.join(SOURCES_JAR), SOURCES_ORIGINAL).unwrap();
+    let record = |uuid: &str, file: &str, before: &[u8], after: &[u8]| {
+        serde_json::json!({
+            "uuid": uuid,
+            "exportedAt": "2026-10-02T00:00:00Z",
+            "files": { file: {
+                "beforeHash": common::git_sha256(before),
+                "afterHash": common::git_sha256(after),
+            } },
+            "vulnerabilities": {},
+            "description": "sbt agent Ivy sources fixture",
+            "license": "MIT",
+            "tier": "free",
+        })
+    };
+    let manifest = serde_json::json!({ "patches": {
+        SLF4J.purl(): record("5b7a0000-0000-4000-8000-000000000001", JAR, ORIGINAL, PATCHED),
+        format!("{}?classifier=sources", SLF4J.purl()): record(
+            "5b7a0000-0000-4000-8000-000000000003",
+            SOURCES_JAR,
+            SOURCES_ORIGINAL,
+            SOURCES_PATCHED,
+        ),
+    } });
+    let socket = fx.project.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    for bytes in [ORIGINAL, PATCHED, SOURCES_ORIGINAL, SOURCES_PATCHED] {
+        std::fs::write(socket.join("blobs").join(common::git_sha256(bytes)), bytes).unwrap();
+    }
+    let sbt_opts = (
+        "SBT_OPTS",
+        format!("-Dsbt.ivy.home={}", fx.home.ivy_home().display()),
+    );
+
+    let (code, env, stderr) = run(
+        &fx,
+        &["apply", "--offline", "--json"],
+        std::slice::from_ref(&sbt_opts),
+    );
+    assert_eq!(code, 0, "apply: {env}\n{stderr}");
+    assert_eq!(std::fs::read(jars.join(JAR)).unwrap(), PATCHED, "{env}");
+    assert_eq!(
+        std::fs::read(srcs.join(SOURCES_JAR)).unwrap(),
+        SOURCES_PATCHED,
+        "{env}"
+    );
+
+    let (code, env, stderr) = run(&fx, &["rollback", "--offline", "--json"], &[sbt_opts]);
+    assert_eq!(code, 0, "rollback: {env}\n{stderr}");
+    assert_eq!(std::fs::read(jars.join(JAR)).unwrap(), ORIGINAL, "{env}");
+    assert_eq!(
+        std::fs::read(srcs.join(SOURCES_JAR)).unwrap(),
+        SOURCES_ORIGINAL,
+        "{env}"
     );
 }

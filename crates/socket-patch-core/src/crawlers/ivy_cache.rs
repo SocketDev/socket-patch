@@ -29,6 +29,12 @@ use crate::utils::fs::{open_regular_file_sync, read_regular_to_bytes_sync};
 /// (`bundles/` holds OSGi-packaged jars such as guava 19.0's).
 const ARTIFACT_DIRS: &[&str] = &["jars", "bundles", "orbits"];
 
+/// Every artifact type directory of a module: [`ARTIFACT_DIRS`] plus the
+/// classifier ones (`srcs/` holds `<module>-<rev>-sources.jar`, `docs/`
+/// the javadoc jar). The gradle_cache `installed_copies` expansion looks a
+/// patch key up in each.
+const TYPE_DIRS: &[&str] = &["jars", "bundles", "orbits", "srcs", "docs"];
+
 /// How much of an `ivy-<rev>.xml` the `<info>` cross-check reads.
 const INFO_PREFIX_BYTES: u64 = 4096;
 
@@ -129,6 +135,33 @@ pub fn find_by_purls(root: &Path, purls: &[String]) -> HashMap<String, CrawledPa
         }
     }
     out
+}
+
+/// Whether `path` is an Ivy package directory as [`scan`] and
+/// [`find_by_purls`] report it: one of a module's [`ARTIFACT_DIRS`], a real
+/// directory, beside at least one `ivy-<rev>.xml`.
+pub fn is_artifact_dir(path: &Path) -> bool {
+    let named = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| ARTIFACT_DIRS.contains(&n));
+    named
+        && is_real_dir(path)
+        && path.parent().is_some_and(|module_dir| {
+            children(module_dir, false)
+                .iter()
+                .any(|(name, _)| name.starts_with("ivy-") && name.ends_with(".xml"))
+        })
+}
+
+/// The artifact type directories ([`TYPE_DIRS`]) present under
+/// `module_dir`, real directories only, in [`TYPE_DIRS`] order.
+pub fn type_dirs(module_dir: &Path) -> Vec<String> {
+    TYPE_DIRS
+        .iter()
+        .filter(|d| is_real_dir(&module_dir.join(d)))
+        .map(|d| d.to_string())
+        .collect()
 }
 
 /// The pristine upstream pom of `g:a:v` for a package crawled at

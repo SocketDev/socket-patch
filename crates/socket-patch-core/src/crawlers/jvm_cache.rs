@@ -139,7 +139,15 @@ pub fn push_classified(roots: &mut Vec<JvmCacheRoot>, root: JvmCacheRoot) -> boo
         ));
         return false;
     }
-    if roots.iter().any(|r| r.path == root.path) {
+    // A root reached twice (the same path, or another spelling of it
+    // through a symlink) is one cache: listing it twice would make the
+    // every-copy fan-out patch the same files twice.
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let key = canonical(&root.path);
+    if roots
+        .iter()
+        .any(|r| r.path == root.path || canonical(&r.path) == key)
+    {
         return false;
     }
     roots.push(root);
@@ -226,7 +234,9 @@ pub fn all_local_roots_with(cwd: &Path, env: &super::maven_crawler::JvmEnv) -> V
 /// Every installed copy of one artifact file
 /// (`<artifact>-<version>[-<classifier>].<ext>`) under `root`: the one
 /// repository path for [`JvmCacheLayout::Maven2`], every hash directory's
-/// copy for [`JvmCacheLayout::GradleModules2`] (sorted). Only existing
+/// copy for [`JvmCacheLayout::GradleModules2`] (sorted), the path in each
+/// repository root of a [`JvmCacheLayout::Coursier`] cache, and each
+/// artifact type directory's copy for [`JvmCacheLayout::Ivy`]. Only existing
 /// regular files are returned; unsafe coordinates resolve to nothing.
 pub fn locate_artifact(
     root: &JvmCacheRoot,
@@ -278,8 +288,35 @@ pub fn locate_artifact(
             copies.sort();
             copies
         }
-        // sbt: Coursier / Ivy plug in here.
-        JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => Vec::new(),
+        // A Coursier cache directory holds per-repository Maven2 roots; a
+        // per-repository root is one itself.
+        JvmCacheLayout::Coursier => {
+            let repos = if super::coursier_cache::is_coursier_cache_dir(&root.path) {
+                super::coursier_cache::repo_roots(&root.path)
+            } else {
+                vec![root.path.clone()]
+            };
+            repos
+                .into_iter()
+                .map(|repo| {
+                    repo.join(group.replace('.', "/"))
+                        .join(artifact)
+                        .join(version)
+                        .join(&leaf)
+                })
+                .filter(|p| p.is_file())
+                .collect()
+        }
+        // `<cache>/<org>/<module>/<type dir>/<leaf>`: the jar under
+        // `jars/` (or `bundles/`, `orbits/`), a sources jar under `srcs/`.
+        JvmCacheLayout::Ivy => {
+            let module = root.path.join(group).join(artifact);
+            super::ivy_cache::type_dirs(&module)
+                .iter()
+                .map(|dir| module.join(dir).join(&leaf))
+                .filter(|p| p.is_file())
+                .collect()
+        }
     }
 }
 
@@ -369,6 +406,23 @@ mod tests {
         );
         assert!(push_classified(&mut roots, repo));
         assert_eq!(roots.len(), 2);
+    }
+
+    /// A root reached again through a symlink is the same cache: listing
+    /// it twice would patch its files twice.
+    #[cfg(unix)]
+    #[test]
+    fn push_classified_drops_a_symlinked_spelling_of_a_listed_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("home/.ivy2/cache");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = tmp.path().join("alias-ivy");
+        std::os::unix::fs::symlink(tmp.path().join("home/.ivy2"), &alias).unwrap();
+        let mut roots = Vec::new();
+        let ivy = |p: PathBuf| JvmCacheRoot::new(p, JvmCacheLayout::Ivy);
+        assert!(push_classified(&mut roots, ivy(real.clone())));
+        assert!(!push_classified(&mut roots, ivy(alias.join("cache"))));
+        assert_eq!(roots, vec![ivy(real)]);
     }
 
     #[test]
