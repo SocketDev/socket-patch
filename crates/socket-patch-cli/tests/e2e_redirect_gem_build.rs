@@ -433,6 +433,13 @@ enum Driver {
     /// modifier (#340): rewriting it would drop the condition. Same contract
     /// as [`Driver::ScanVexDuplicateDeclaration`].
     ScanVexConditionalDeclaration,
+    /// A modifier adjacent to a top-level constant is still a modifier,
+    /// not a hash label (`if::ENV`, #340).
+    ScanVexScopedConstantModifier,
+    /// A heredoc option continues beyond the declaration's physical line.
+    ScanVexHeredocDeclaration,
+    /// A double-quoted interpolation can itself contain a heredoc opener.
+    ScanVexInterpolatedHeredocDeclaration,
     /// [`Driver::ScanVexDualBoot`] with `BUNDLE_GEMFILE=Gemfile` exported to
     /// socket-patch too (#507): bundler's local app config outranks the
     /// environment, so bundler still loads `Gemfile.next` and the run must
@@ -450,6 +457,11 @@ impl Driver {
             Driver::ScanVexEvalGemfile => "scan --mode hosted (gem via eval_gemfile)",
             Driver::ScanVexMultiLineDeclaration => "scan --mode hosted (multi-line gem line)",
             Driver::ScanVexConditionalDeclaration => "scan --mode hosted (gem line with `if`)",
+            Driver::ScanVexScopedConstantModifier => "scan --mode hosted (gem line with `if::ENV`)",
+            Driver::ScanVexHeredocDeclaration => "scan --mode hosted (heredoc gem option)",
+            Driver::ScanVexInterpolatedHeredocDeclaration => {
+                "scan --mode hosted (interpolated heredoc gem option)"
+            }
             Driver::ScanVexDualBootEnvGemfile => {
                 "scan --mode hosted (config Gemfile.next, env BUNDLE_GEMFILE=Gemfile)"
             }
@@ -736,6 +748,18 @@ async fn redirect_scanned_project(
             "source \"{}/upstream\"\n\ngem \"{DEP}\" if ENV[\"WITH_VULN\"] != \"0\"\n",
             server.uri()
         ),
+        Driver::ScanVexScopedConstantModifier => format!(
+            "source \"{}/upstream\"\n\ngem \"{DEP}\", \"{DEP_VERSION}\" if::ENV[\"WITH_VULN\"] != \"0\"\n",
+            server.uri()
+        ),
+        Driver::ScanVexHeredocDeclaration => format!(
+            "source \"{}/upstream\"\n\ngem \"{DEP}\", require: <<~REQUIRE_PATH.chomp\n  vuln_gem\nREQUIRE_PATH\n",
+            server.uri()
+        ),
+        Driver::ScanVexInterpolatedHeredocDeclaration => format!(
+            "source \"{}/upstream\"\n\ngem \"{DEP}\", require: \"#{{<<~REQUIRE_PATH}}\".chomp\n  vuln_gem\nREQUIRE_PATH\n",
+            server.uri()
+        ),
         _ => format!("source \"{}/upstream\"\n\ngem \"{DEP}\"\n", server.uri()),
     };
     std::fs::write(proj.join(gemfile_name), gemfile_body).unwrap();
@@ -844,7 +868,10 @@ async fn redirect_scanned_project(
         | Driver::ScanVexDuplicateDeclaration
         | Driver::ScanVexEvalGemfile
         | Driver::ScanVexMultiLineDeclaration
-        | Driver::ScanVexConditionalDeclaration => vec![
+        | Driver::ScanVexConditionalDeclaration
+        | Driver::ScanVexScopedConstantModifier
+        | Driver::ScanVexHeredocDeclaration
+        | Driver::ScanVexInterpolatedHeredocDeclaration => vec![
             "scan",
             "--mode",
             "hosted",
@@ -901,7 +928,11 @@ async fn redirect_scanned_project(
     if let Some(warning) = match driver {
         Driver::ScanVexDuplicateDeclaration => Some("redirect_gem_declared_more_than_once"),
         Driver::ScanVexEvalGemfile => Some("redirect_gem_declaration_not_visible"),
-        Driver::ScanVexMultiLineDeclaration | Driver::ScanVexConditionalDeclaration => {
+        Driver::ScanVexMultiLineDeclaration
+        | Driver::ScanVexConditionalDeclaration
+        | Driver::ScanVexScopedConstantModifier
+        | Driver::ScanVexHeredocDeclaration
+        | Driver::ScanVexInterpolatedHeredocDeclaration => {
             Some("redirect_gem_unrecognized_declaration")
         }
         _ => None,
@@ -994,7 +1025,12 @@ async fn redirect_scanned_project(
         | Driver::ScanVexDuplicateDeclaration
         | Driver::ScanVexEvalGemfile
         | Driver::ScanVexMultiLineDeclaration
-        | Driver::ScanVexConditionalDeclaration => unreachable!("asserted and returned above"),
+        | Driver::ScanVexConditionalDeclaration
+        | Driver::ScanVexScopedConstantModifier
+        | Driver::ScanVexHeredocDeclaration
+        | Driver::ScanVexInterpolatedHeredocDeclaration => {
+            unreachable!("asserted and returned above")
+        }
         Driver::GetUuid => {
             // get's hosted envelope (CLI_CONTRACT.md "get --mode and
             // installed narrowing"): `found` counts the resolved patch;
@@ -1777,6 +1813,37 @@ async fn gem_hosted_conditional_declaration_is_refused_and_still_installs() {
     )
     .await;
     assert!(fx.is_none(), "the conditional driver asserts in place");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            run with a pinned toolchain via --ignored"]
+async fn gem_hosted_scoped_constant_modifier_is_refused_and_still_installs() {
+    let fx = redirect_scanned_project(
+        "scoped-constant-modifier",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVexScopedConstantModifier,
+    )
+    .await;
+    assert!(fx.is_none(), "the scoped modifier driver asserts in place");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            run with a pinned toolchain via --ignored"]
+async fn gem_hosted_heredoc_declaration_is_refused_and_still_installs() {
+    for driver in [
+        Driver::ScanVexHeredocDeclaration,
+        Driver::ScanVexInterpolatedHeredocDeclaration,
+    ] {
+        let fx =
+            redirect_scanned_project(driver.label(), Spelling::Gemfile, false, true, None, driver)
+                .await;
+        assert!(fx.is_none(), "the heredoc driver asserts in place");
+    }
 }
 
 /// #507: the same dual boot with `BUNDLE_GEMFILE=Gemfile` exported. Bundler

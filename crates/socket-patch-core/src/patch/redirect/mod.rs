@@ -5191,13 +5191,17 @@ pub(crate) fn gem_line_trailing_options(tail: &str) -> String {
 ///   `or`) or a `do` block would be dropped, silently changing when the gem
 ///   is declared.
 ///
-/// Only code outside string literals and before a `#` comment counts, so a
-/// keyword or `,` inside `require: "…"` or a trailing comment is fine.
+/// Only code outside ordinary string literals and before a `#` comment
+/// counts, so a keyword or `,` inside `require: "…"` or a comment is fine.
+/// Double-quoted interpolation can execute a heredoc, so its presence with
+/// a possible `<<` opener is refused conservatively too.
 /// Shared with the vendor backend's Gemfile rewrite (`vendor::gem`).
 pub(crate) fn gem_line_tail_blocks_edit(tail: &str) -> Option<String> {
     const CONTINUES: &str = "the declaration continues on the next line";
     let mut code = String::new();
     let mut quote: Option<char> = None;
+    let mut interpolated = false;
+    let mut quoted_operator = false;
     let mut depth: i64 = 0;
     let mut chars = tail.chars();
     while let Some(c) = chars.next() {
@@ -5206,6 +5210,10 @@ pub(crate) fn gem_line_tail_blocks_edit(tail: &str) -> Option<String> {
                 chars.next();
             } else if c == q {
                 quote = None;
+            } else if q == '"' && c == '#' && chars.as_str().starts_with('{') {
+                interpolated = true;
+            } else if c == '<' && chars.as_str().starts_with('<') {
+                quoted_operator = true;
             }
             // String contents never count as code: keep a placeholder so
             // word boundaries and the final character stay meaningful.
@@ -5236,8 +5244,10 @@ pub(crate) fn gem_line_tail_blocks_edit(tail: &str) -> Option<String> {
         return Some(CONTINUES.to_string());
     }
     // A heredoc body lives on the following lines, past where the rewrite
-    // would insert its closing `end`.
-    if code.contains("<<") {
+    // would insert its closing `end`. Interpolation is executable Ruby too
+    // (`"#{<<~NAME}"`), so do not let quote masking hide its opener. Literal
+    // and escaped-interpolation lookalikes remain masked.
+    if code.contains("<<") || (interpolated && quoted_operator) {
         return Some(CONTINUES.to_string());
     }
     let bytes = code.as_bytes();
@@ -12544,6 +12554,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gemfile_quoted_and_interpolated_heredocs_fail_closed() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    vuln-gem (1.0.0)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  vuln-gem\n\n\
+                    BUNDLED WITH\n   4.0.17\n";
+        for decl in [
+            "gem \"vuln-gem\", require: <<'REQUIRE_PATH'\nvuln-gem\nREQUIRE_PATH",
+            "gem(\"vuln-gem\", require: <<\"REQUIRE_PATH\")\nvuln-gem\nREQUIRE_PATH",
+            "gem \"vuln-gem\", require: \"#{<<~REQUIRE_PATH}\".chomp\n  vuln_gem\nREQUIRE_PATH",
+        ] {
+            let gemfile = format!("source \"https://rubygems.org\"\n{decl}\n");
+            let files = BTreeMap::from([
+                ("Gemfile".to_string(), gemfile),
+                ("Gemfile.lock".to_string(), lock.to_string()),
+            ]);
+            let r = rewrite_registry_redirect(&files, &[gem_override("vuln-gem", "1.0.0")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{decl:?} must not be rewritten: {:?}",
+                r.files
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_unrecognized_declaration"],
+                "{decl:?}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn gem_line_tail_colon_and_heredoc_syntax_is_not_confused_with_literals() {
+        for tail in [
+            ", \"1.0.0\" if::FEATURE",
+            ", \"1.0.0\" unless::FEATURE",
+            ", \"1.0.0\" if:enabled == ENV[\"MODE\"].to_sym",
+            ", require: <<~REQUIRE_PATH.chomp",
+            ", require: <<'REQUIRE_PATH'",
+            ", require: <<\"REQUIRE_PATH\"",
+            ", require: \"#{<<~REQUIRE_PATH}\".chomp",
+        ] {
+            assert!(gem_line_tail_blocks_edit(tail).is_some(), "{tail:?}");
+        }
+        for tail in [
+            ", require: \"<<REQUIRE_PATH\"",
+            ", require: '<<~REQUIRE_PATH'",
+            ", require: '#{<<REQUIRE_PATH}'",
+            ", require: \"\\#{<<REQUIRE_PATH}\"",
+            ", require: \"#{ENV['REQUIRE_PATH']}\"",
+            ", require: \"#{ENV['REQUIRE_PATH']}\" # <<NOT_A_HEREDOC",
+            ", group: :unless",
+            ", require: { if: \"vuln-gem\", unless: \"other\" }.values",
+            ", require: loader(if: \"vuln-gem\")",
+            ", if: true",
+            ", require: false # if::FEATURE, <<REQUIRE_PATH",
+        ] {
+            assert_eq!(gem_line_tail_blocks_edit(tail), None, "{tail:?}");
+        }
+    }
+
     /// Control for #340: single-line declarations whose tails merely look
     /// like the refused shapes (a keyword inside a string or a comment, a
     /// symbol or a key named like a keyword, a closed bracket) still
@@ -12565,6 +12635,14 @@ mod tests {
                 "require: \"if/unless\"",
             ),
             ("gem \"vuln-gem\", require: 'a,'", "require: 'a,'"),
+            (
+                "gem \"vuln-gem\", require: { if: \"vuln-gem\" }.values",
+                "require: { if: \"vuln-gem\" }.values",
+            ),
+            (
+                "gem \"vuln-gem\", require: \"<<REQUIRE_PATH\"",
+                "require: \"<<REQUIRE_PATH\"",
+            ),
             ("gem \"vuln-gem\", group: :unless", "group: :unless"),
             (
                 "gem \"vuln-gem\", platforms: [:mri, :mingw]",

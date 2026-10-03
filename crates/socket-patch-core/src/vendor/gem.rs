@@ -6953,6 +6953,24 @@ mod tests {
                 "conditional",
             ),
             ("gem \"rack\", require: false rescue nil\n", "rescue"),
+            ("gem \"rack\", \"~> 3.1\" if::FEATURE\n", "conditional"),
+            ("gem \"rack\", \"~> 3.1\" unless::FEATURE\n", "conditional"),
+            (
+                "gem \"rack\", \"~> 3.1\" if:enabled == ENV[\"MODE\"].to_sym\n",
+                "conditional",
+            ),
+            (
+                "gem \"rack\", require: <<~REQUIRE_PATH.chomp\n  rack\nREQUIRE_PATH\n",
+                "continues",
+            ),
+            (
+                "gem \"rack\", require: <<'REQUIRE_PATH'\nrack\nREQUIRE_PATH\n",
+                "continues",
+            ),
+            (
+                "gem \"rack\", require: \"#{<<~REQUIRE_PATH}\".chomp\n  rack\nREQUIRE_PATH\n",
+                "continues",
+            ),
         ] {
             let err = plan_gemfile_edit(gemfile, "rack", "3.2.6", &rel)
                 .err()
@@ -6968,6 +6986,21 @@ mod tests {
                 .err()
                 .expect("path-shaped options must refuse");
             assert!(err.contains("path:"), "{gemfile:?}: {err}");
+        }
+
+        for options in [
+            "require: { if: \"rack\" }.values",
+            "require: \"<<REQUIRE_PATH\"",
+            "require: '#{<<REQUIRE_PATH}'",
+            "require: \"\\#{<<REQUIRE_PATH}\"",
+            "group: :unless",
+        ] {
+            let gemfile = format!("gem \"rack\", {options}\n");
+            let plan = plan_gemfile_edit(&gemfile, "rack", "3.2.6", &rel).unwrap();
+            let GemfilePlan::Rewrite { new_line, .. } = plan else {
+                panic!("a one-line declaration must rewrite: {gemfile}");
+            };
+            assert!(new_line.ends_with(options), "{new_line}");
         }
 
         // `gemspec name: "rack"` opens with the keyword but continues as an
