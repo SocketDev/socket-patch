@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-02 (run 10), main `045d7ec` (includes #532, #552, #517, #442), latest release tag v4.0.0.
+Last updated: 2026-10-03 (run 11), main `045d7ec` (includes #532, #552, #517, #442), latest release tag v4.0.0.
 
 ## Coverage matrix
 
@@ -78,6 +78,13 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | windows-latest | 2.7 / 3.3 / 3.4 (Bundler 4.0.x) | pass | untested |
 | macos-latest | 2.7 / 3.3 / 3.4 (Bundler 4.0.x) | pass | untested |
 
+### Run 11 (hosted, git-sourced declarations, Linux, Ruby 3.3.6)
+
+| Bundler | Custom `git_source` key | Built-in `gitlab:` | String-keyed `"git" =>` | `"github" =>` |
+| --- | --- | --- | --- | --- |
+| 4.0.17 | fail #652 | fail #652 | fail #652 (option dropped) | untested (needs network) |
+| 2.5.22 | fail #652 | untested | untested | untested |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -91,13 +98,13 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 
 ## Backlog
 
-1. Re-run #340 and #577 when the hosted rewriter or the settings layer changes (including `rollback` on a gem refused as doubly declared).
-2. #577 under `BUNDLE_USER_HOME` (`$BUNDLE_USER_HOME/config`), and the agent `BUNDLE_PATH` read under `BUNDLE_IGNORE_CONFIG`.
-3. Windows hosted and vendored cells: CRLF Gemfile / lock, a `BUNDLE_PATH` with a drive letter or spaces, `x64-mingw-ucrt` platform gems, and `vendor/bundle` deployment mode.
-4. **Maintainer request (still open):** global (`-g`) mode on every OS. Remaining: macOS system Ruby and Homebrew Ruby; rbenv / rvm / chruby / asdf layouts; unicode or space-containing `--global-prefix`; a non-writable dir on macOS and Windows (Program Files); `-g` from inside a project on macOS and Windows.
-5. A symlinked env `BUNDLE_GEMFILE` next to a config `gemfile` (`env_keeps_root` compares lexically): needs a macOS probe (`/var` vs `/private/var`).
-6. #340 on Bundler 2.2–2.5 (Linux).
-7. Ruby 3.4 + Bundler 2.2 can't boot. Check the floor messaging.
+1. Re-run #340 / #577 / #652 when #637 / #621 (or any change to the rewriter or settings layer) merge.
+2. Vendored mode with `gitlab:` / custom `git_source` (the same token list is at `vendor/gem.rs:1544`).
+3. #577 under `BUNDLE_USER_HOME` (`$BUNDLE_USER_HOME/config`), and the agent `BUNDLE_PATH` read under `BUNDLE_IGNORE_CONFIG`.
+4. Windows hosted and vendored cells: CRLF Gemfile / lock, a `BUNDLE_PATH` with a drive letter or spaces, `x64-mingw-ucrt` platform gems, and `vendor/bundle` deployment mode.
+5. **Maintainer request (still open):** global (`-g`) mode on every OS. Remaining: macOS system Ruby and Homebrew Ruby; rbenv / rvm / chruby / asdf layouts; unicode or space-containing `--global-prefix`; a non-writable dir on macOS and Windows (Program Files); `-g` from inside a project on macOS and Windows.
+6. A symlinked env `BUNDLE_GEMFILE` next to a config `gemfile` (`env_keeps_root` compares lexically): needs a macOS probe (`/var` vs `/private/var`).
+7. #340 on Bundler 2.2–2.5 (Linux). Ruby 3.4 + Bundler 2.2 can't boot; check the floor messaging.
 
 ## Known non-bugs
 
@@ -129,3 +136,4 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 - `bundle config set <key>` without `--local`/`--global`, run inside a project, writes the local `.bundle/config` on Bundler 2.4 / 2.6 / 4.0 (verified in run 9). Only an explicit `--global` reaches the global tier (#577).
 - Probe workflows must wait for the mock API to listen before the first call. The run-10 Windows `scan -g` "0 found" was a "connection refused" race, not a crawler miss.
 - `bughunt/bundler/20261002-win-recheck` is also left behind (`git push --delete` gets 403); its workflow is push-triggered only.
+- `gem_tail_source_option` matches substrings, so a symbol such as `group: :gitlab_ci` would trip the `:git` refusal. It's fail-closed and contrived, so it's not filed.
