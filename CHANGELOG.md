@@ -9,11 +9,15 @@ Pre-v3.0 entries are concise summaries derived from each tag's commit
 history. For full per-release detail, see the
 [GitHub releases page](https://github.com/SocketDev/socket-patch/releases).
 
-The `Release` workflow refuses to publish a version that does not appear
-in this file — see `scripts/release-lint.sh` (run by the `version` job in
-`.github/workflows/release.yml` and by CI on version-bump PRs). Bump PRs
-are opened by `scripts/bump-version.sh`, which rolls `[Unreleased]` over
-into the new version's section — see docs/releasing.md.
+Add entries under `[Unreleased]`; its `###` headings set the next version's
+bump (Breaking/Removed → major, Added/Changed/Deprecated → minor, anything
+else → patch). Releases are cut by the release train
+([docs/release-train/DESIGN.md](docs/release-train/DESIGN.md)) with
+`scripts/release.py`: a release candidate's `[Unreleased]` entries become a
+`## [X.Y.Z-rc.N]` section, the rolling `release-sync` PR brings each cut
+section and version back to main, and promoting an rc folds its rc sections
+into one `## [X.Y.Z]` section. `scripts/release-lint.sh` refuses to release
+a version without a non-empty section in this file.
 
 ## [Unreleased]
 
