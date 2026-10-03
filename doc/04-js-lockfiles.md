@@ -2,7 +2,7 @@
 
 ## Part 4: JavaScript lockfiles (npm, pnpm, yarn, bun, vlt)
 
-_Last checked against `main`: not yet re-checked; the content is as of `2463257`. Owner: `audit-ecosystems`._
+_Last checked against main @ 045d7ec on 2026-10-03 by audit-ecosystems (§4.4 pnpm and berry gates re-checked; the rest is as of `2463257`). Owner: `audit-ecosystems`._
 
 > Scope: `vendor/{npm_*,pnpm_*,yarn_*,bun_*,vlt_*,berry_zip}.rs`, `formats/{pnpm,yarn,bun,registry}`, `crawlers/npm_crawler*`, `vendor/lock_inventory/*`, `vex/discover/{npm,yarn,bun,vlt}.rs`, and the JS parts of `patch/redirect/` and `hosted/vlt.rs`. Line counts are production / inline-test, split at the first top-level `#[cfg(test)] mod`.
 
@@ -60,22 +60,17 @@ The question "which lockfile drives installs?" is also answered in **five places
 
 ### 4.4 Verified duplication
 
-**pnpm v9 vs pnpm legacy (the largest copy).** `pnpm_lock_legacy.rs` imports 14 helpers from v9 (`:74-78`) but still re-implements the drivers:
-- `revert_pnpm_legacy_opts` (:1323, 195 lines) is `revert_pnpm_opts` (:636, 234 lines) minus one 26-line workspace block and three trivial line changes. `diff` shows 34 changed lines out of roughly 200.
-- `vendor_pnpm_legacy` (290 lines) vs `vendor_pnpm` (251 lines): 120 of 147 distinct normalized lines are shared.
-- `read_project` (106 vs 101 lines) and `edit_overrides` (~80% identical) are near-copies.
-- `dep_field_lines` is identical except for an `indent` parameter.
-- `lock_has_target_package`, `revert_lock_record` and the `Ctx`/`EditCtx` methods `reg_key`/`new_key`/`is_ours` are duplicated.
-- Both files define `KIND_LOCK_PACKAGE = "pnpm_lock_package"` and the same CRLF refusal text.
+**pnpm v9 vs pnpm legacy.** The drivers are now shared (#583): `vendor_pnpm_legacy` and `revert_pnpm_legacy_opts` are thin wrappers over `pnpm_lock::vendor_pnpm_dialect` / `revert_pnpm_dialect` with `PnpmDialect::Legacy` ([`pnpm_lock_legacy.rs#L200-L223`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/vendor/pnpm_lock_legacy.rs#L200-L223), [`#L894-L900`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/vendor/pnpm_lock_legacy.rs#L894-L900)), and `KIND_LOCK_PACKAGE` is imported, not redefined. What stays per dialect is the legacy line grammar: `read_lock`, `preflight_package(s)`, `lock_has_target_package`, `edit_*_v54/v60`, `revert_lock_record` and the `Ctx` methods. {{E12}}
 
 **The vendor driver skeleton is copied eight times.** npm_lock, pnpm, pnpm-legacy, yarn-berry, yarn-classic, bun_lock, bun_binary and vlt all repeat the same sequence:
 `guard_coordinates` → `read_project` → `stage_patch_pack` (×2) → `already_patched_result` → `write_marker_or_warn` → a literal `VendorEntry { … pdm: None, pipenv: None, poetry: None, uv: None, … }`.
 Each shares 55-67 distinct lines with `vendor_pnpm`. `read_project`, `preflight_package(s)` and `revert_*_opts` exist in 7-9 files each. {{E12}}
 
-**Yarn berry project gates are written twice.**
-- cacheKey `10c0` appears as `SUPPORTED_CACHE_KEY` (`yarn_berry_lock.rs:89`) and as `YARN_BERRY_SUPPORTED_CACHE_KEY` (`redirect/mod.rs:3154`).
-- cacheKey extraction exists as `berry_metadata` + `berry_field` and as `berry_cache_key` (split-based). The latter's own comment says it is "mirroring the vendored backend's `berry_field`".
-- The mixed-EOL and `compressionLevel` refusals are implemented twice (`yarn_berry_lock.rs:1001-1074` vs `redirect:3196-3236`), with different codes and wording. Open issue #370 (`compressionLevel: 0 # comment` refused) has to be fixed in both.
+**Yarn berry project gates are written twice.** {{E09}}
+- cacheKey `10c0` appears as `SUPPORTED_CACHE_KEY` ([`yarn_berry_lock.rs#L89`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/vendor/yarn_berry_lock.rs#L89)) and as `YARN_BERRY_SUPPORTED_CACHE_KEY` ([`redirect/mod.rs#L3289`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/patch/redirect/mod.rs#L3287-L3289)).
+- cacheKey extraction exists as `berry_metadata` + `berry_field` and as `berry_cache_key` (split-based, [`#L3291-L3306`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/patch/redirect/mod.rs#L3291-L3306)). The latter's own comment says it is "mirroring the vendored backend's `berry_field`".
+- The gate drivers are implemented twice (`yarn_berry_lock.rs:1001-1103` vs `preflight_yarn_berry_hosted`, `redirect/mod.rs:3355-3398`), with per-mode codes and differently worded details. Only the `.yarnrc.yml` reader `yarnrc_compression_level` is shared, so #370 was fixed once (#508); hosted imports it from `vendor/`.
+- The copies have drifted: vendored refuses a mixed-EOL root `package.json` and an unreadable `.yarnrc.yml`, while hosted checks only `yarn.lock` and treats an unreadable `.yarnrc.yml` as absent. {{E51}}
 
 **Small helpers that have already drifted apart:**
 - **JSON-pointer escape:** byte-identical `escape_json_pointer_token` (`npm_lock.rs:1022`) and `json_pointer_escape` (`upstream/npm.rs:136`).
@@ -169,7 +164,7 @@ Each format exposes `parse(&[u8]) -> Model`, `entries()`, `wired_refs()`, `plan_
 
 ### New findings since the review
 
-_None yet._
+- Hosted yarn berry rewrites (majority-normalizes) a mixed-line-ending root `package.json` that vendored mode refuses with `vendor_yarn_berry_mixed_line_endings`; the gates live once per mode. {{E51}}
 
 ---
 _Generated by [Claude Code](https://claude.ai/code)_
