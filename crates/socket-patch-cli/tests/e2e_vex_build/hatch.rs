@@ -694,7 +694,10 @@ fn existing_env_flow(mode: Mode) {
                             .as_str()
                             .is_some_and(|d| d.contains("hatch env remove default"))
                 });
-            assert!(disclosed, "{what}: vendored_tree_out_of_sync with Hatch remedy: {out}");
+            assert!(
+                disclosed,
+                "{what}: vendored_tree_out_of_sync with Hatch remedy: {out}"
+            );
         }
     }
     record(
