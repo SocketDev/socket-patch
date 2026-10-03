@@ -82,9 +82,7 @@ fn write_berry_project(root: &Path) {
 
 /// The patch API, with the hosted tarball served as `tarball` (or 404).
 async fn mock_api(server: &MockServer, tarball: Option<Vec<u8>>) -> String {
-    let artifact = format!(
-        "/patch/npm/uuid/9.0.1/{TOKEN}/{UUID}/uuid-9.0.1.tgz"
-    );
+    let artifact = format!("/patch/npm/uuid/9.0.1/{TOKEN}/{UUID}/uuid-9.0.1.tgz");
     let url = format!("{}{artifact}", server.uri());
     let sha512 = tarball
         .as_deref()
@@ -106,7 +104,9 @@ async fn mock_api(server: &MockServer, tarball: Option<Vec<u8>>) -> String {
         .mount(server)
         .await;
     Mock::given(method("GET"))
-        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "patches": [{
                 "uuid": UUID, "purl": PURL,
@@ -235,7 +235,10 @@ async fn unfetchable_served_manifest_skips_the_patch() {
     assert_eq!(skipped.len(), 1, "{doc:#}");
     assert_eq!(skipped[0]["purl"], PURL, "{doc:#}");
     let detail = skipped[0]["detail"].as_str().unwrap();
-    assert!(!detail.contains(&server.uri()), "the hosted URL is redacted: {detail}");
+    assert!(
+        !detail.contains(&server.uri()),
+        "the hosted URL is redacted: {detail}"
+    );
     assert_eq!(doc["redirect"]["redirected"], 0, "{doc:#}");
     assert_eq!(
         std::fs::read(root.join("yarn.lock")).unwrap(),

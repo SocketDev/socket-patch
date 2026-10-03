@@ -904,7 +904,10 @@ pub(crate) async fn run_redirect_selected(
     // be fetched or read drops its patch rather than pin an entry yarn
     // would rewrite on the next install.
     for dep in engine::yarn_berry_manifest_targets(&candidates, &read.files) {
-        status.set(format!("Fetching hosted package manifest for {}...", dep.name));
+        status.set(format!(
+            "Fetching hosted package manifest for {}...",
+            dep.name
+        ));
         match socket_patch_core::hosted::npm_manifest::fetch_hosted_npm_manifest(
             api_client,
             &dep.artifact_url,

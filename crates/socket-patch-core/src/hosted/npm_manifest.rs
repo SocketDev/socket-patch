@@ -69,7 +69,9 @@ mod tests {
         let bytes = tgz(&[("package/package.json", manifest)]);
         let sri = sha512_sri(&bytes);
         assert_eq!(
-            decode_hosted_npm_manifest(&bytes, Some(&sri)).unwrap().as_bytes(),
+            decode_hosted_npm_manifest(&bytes, Some(&sri))
+                .unwrap()
+                .as_bytes(),
             manifest
         );
         assert_eq!(
