@@ -4,7 +4,9 @@ use once_cell::sync::Lazy;
 use uuid::Uuid;
 
 use crate::constants::USER_AGENT;
-use crate::utils::env_compat::{is_debug_enabled, is_offline_env, proxy_url_from_env};
+use crate::utils::env_compat::{
+    is_debug_enabled, is_offline_env, proxy_url_from_env,
+};
 use crate::utils::fs::home_dir;
 use crate::vex::time::unix_to_ymdhms;
 
