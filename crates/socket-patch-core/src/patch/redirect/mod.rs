@@ -5235,6 +5235,11 @@ pub(crate) fn gem_line_tail_blocks_edit(tail: &str) -> Option<String> {
     if !(last.is_alphanumeric() || matches!(last, '_' | '"' | '\'' | ')' | ']' | '}' | '?' | '!')) {
         return Some(CONTINUES.to_string());
     }
+    // A heredoc body lives on the following lines, past where the rewrite
+    // would insert its closing `end`.
+    if code.contains("<<") {
+        return Some(CONTINUES.to_string());
+    }
     let bytes = code.as_bytes();
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut i = 0;
@@ -5249,11 +5254,19 @@ pub(crate) fn gem_line_tail_blocks_edit(tail: &str) -> Option<String> {
         }
         let word = &code[start..i];
         // A symbol (`:if`), method call (`.if`) or variable sigil is a name,
-        // not a keyword; so is a hash key (`if:`) or predicate (`if?`).
+        // not a keyword; so is a predicate (`if?`). `if:` is a hash key only
+        // where an argument can start (after `,`, `(` or `{`) and not `if::`;
+        // straight after a value, `if:FLAG` is a modifier on symbol `:FLAG`.
         let prev_ok = start == 0 || !matches!(bytes[start - 1], b':' | b'.' | b'@' | b'$');
-        let next_ok = bytes
-            .get(i)
-            .is_none_or(|b| !matches!(b, b':' | b'?' | b'!'));
+        let arg_start = matches!(
+            code[..start].trim_end().as_bytes().last(),
+            Some(b',' | b'(' | b'{')
+        );
+        let next_ok = match bytes.get(i) {
+            Some(b'?' | b'!') => false,
+            Some(b':') => !(arg_start && bytes.get(i + 1) != Some(&b':')),
+            _ => true,
+        };
         if !(prev_ok && next_ok) {
             continue;
         }
@@ -12505,6 +12518,11 @@ mod tests {
             "gem \"vuln-gem\", require: false rescue nil",
             "gem(\"vuln-gem\") if true",
             "gem \"vuln-gem\" do",
+            // A label-looking modifier straight after a value, and a heredoc.
+            "gem \"vuln-gem\", \"1.0.0\" if::FEATURE",
+            "gem \"vuln-gem\", \"1.0.0\" unless::FEATURE",
+            "gem \"vuln-gem\", \"1.0.0\" if:enabled == ENV[\"MODE\"].to_sym",
+            "gem \"vuln-gem\", require: <<~REQ.strip\n  vuln\nREQ",
         ] {
             let gemfile = format!("source \"https://rubygems.org\"\n\n{decl}\n");
             let mut files = BTreeMap::new();
