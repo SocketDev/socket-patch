@@ -158,8 +158,9 @@ jobs:
           cd "$RUNNER_TEMP/probe"
           $PY mkpatch.py left-pad 1.3.0 >/dev/null
           $PY server.py 8765 > server.out 2>&1 &
-          sleep 3
-          for L in ws file; do
+          for i in $(seq 1 30); do curl -sf -XPOST localhost:8765/v0/orgs/o/patches/batch -d '{"components":[]}' >/dev/null && break; sleep 1; done
+          echo "server ready after $i tries"
+          for L in ws file ws; do
             echo "===== [${{ matrix.os }} npm ${{ matrix.npm }}] layout=$L"
             bash repro.sh "$RUNNER_TEMP/w-$L" npm $L 2>&1 | grep -v "Got: fake"
             echo "--- scan.out"; cat "$RUNNER_TEMP/w-$L/scan.out"; echo "--- rb.out"; cat "$RUNNER_TEMP/w-$L/rb.out"
