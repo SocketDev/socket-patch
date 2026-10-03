@@ -230,9 +230,6 @@ mod tests {
     /// Hatch's remedy, not "reinstall from the rewritten lock".
     #[tokio::test]
     async fn hatch_env_gets_the_stale_install_warning_with_hatch_remedy() {
-        if std::env::var_os("VIRTUAL_ENV").is_some() {
-            return; // an activated venv takes precedence over project envs
-        }
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("app");
         std::fs::create_dir_all(&project).unwrap();

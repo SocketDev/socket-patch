@@ -380,6 +380,9 @@ async fn find_local_venv_site_packages_with(
         let matches = find_site_packages_under(&venv_path, "site-packages").await;
         results.extend(matches);
         if !results.is_empty() {
+            // `hatch run` / `hatch shell` never use an activated venv that
+            // is not one of Hatch's own (#335): its envs stay the project's.
+            add_hatch_site_packages(cwd, var, &mut results).await;
             return results;
         }
     }
@@ -424,15 +427,31 @@ async fn find_local_venv_site_packages_with(
     // 6. Hatch never installs into `./.venv` / `./venv`: `hatch run` uses
     // its own out-of-tree envs (#335). Every existing one belongs to the
     // project, next to whatever a generic probe found.
+    add_hatch_site_packages(cwd, var, &mut results).await;
+
+    results
+}
+
+/// Appends the `site-packages` of every existing Hatch env of the project
+/// at `cwd` (see [`super::hatch_env::hatch_environments`]) not already in
+/// `results`.
+async fn add_hatch_site_packages(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+    results: &mut Vec<PathBuf>,
+) {
     for env in super::hatch_env::hatch_environments_with(cwd, var).await {
-        for site in find_site_packages_under(&env.prefix, "site-packages").await {
+        for site in hatch_env_site_packages(&env).await {
             if !results.contains(&site) {
                 results.push(site);
             }
         }
     }
+}
 
-    results
+/// The `site-packages` directories of one Hatch env.
+pub async fn hatch_env_site_packages(env: &super::hatch_env::HatchEnvironment) -> Vec<PathBuf> {
+    find_site_packages_under(&env.prefix, "site-packages").await
 }
 
 /// The `site-packages` of the env the project's package manager records for
@@ -2598,6 +2617,26 @@ mod tests {
         let found = find_local_venv_site_packages_with(&project, &var).await;
         assert!(!found.is_empty());
         assert!(found.iter().all(|s| sites.contains(s)), "{found:?}");
+
+        // An activated venv that is not Hatch's does not hide them.
+        let other = tempfile::tempdir().unwrap();
+        let activated_site = fake_venv(other.path(), "tool-venv");
+        let mut activated = vec![(
+            "VIRTUAL_ENV",
+            other
+                .path()
+                .join("tool-venv")
+                .to_string_lossy()
+                .into_owned(),
+        )];
+        activated.push(("HATCH_DATA_DIR", data.to_string_lossy().into_owned()));
+        activated.push((
+            "HOME",
+            tmp.path().join("home").to_string_lossy().into_owned(),
+        ));
+        let found = find_local_venv_site_packages_with(&project, &env_of(&activated)).await;
+        assert_eq!(found.first(), Some(&activated_site), "{found:?}");
+        assert!(found.iter().any(|s| sites.contains(s)), "{found:?}");
 
         // A `./.venv` beside them is kept too.
         let dot = fake_venv(&project, ".venv");

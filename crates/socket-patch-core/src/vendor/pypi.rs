@@ -643,16 +643,16 @@ async fn hatch_stale_install_warning(
     listings: &InstalledSiteListings,
 ) -> Vec<VendorWarning> {
     use crate::crawlers::hatch_env::{environment_of, hatch_environments, stale_install_remedy};
-    use crate::crawlers::python_crawler::find_local_venv_site_packages;
     let envs = hatch_environments(project_root).await;
     if envs.is_empty() {
         return Vec::new();
     }
-    let sites: Vec<std::path::PathBuf> = find_local_venv_site_packages(project_root)
-        .await
-        .into_iter()
-        .filter(|site| environment_of(&envs, site).is_some())
-        .collect();
+    // Judged over Hatch's own envs only (an activated one is among them): a
+    // `./.venv` another tool made is not where `hatch run` installs.
+    let mut sites: Vec<std::path::PathBuf> = Vec::new();
+    for env in &envs {
+        sites.extend(crate::crawlers::python_crawler::hatch_env_site_packages(env).await);
+    }
     stale_install_sites(&sites, purl, record, listings)
         .await
         .into_iter()
@@ -5062,9 +5062,6 @@ wheels = [
     /// out of it; a patched env gets nothing.
     #[tokio::test]
     async fn hatch_vendor_warns_about_a_stale_hatch_env() {
-        if std::env::var_os("VIRTUAL_ENV").is_some() {
-            return; // an activated venv takes precedence over project envs
-        }
         let fx = e2e_fixture().await;
         swap_to_lock_flavor(
             &fx,
