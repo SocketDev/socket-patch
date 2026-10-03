@@ -113,6 +113,14 @@ fn refusal_is_benign(code: &str) -> bool {
     matches!(code, "vendor_unsupported_ecosystem" | "already_vendored")
 }
 
+/// The `vendor_dir_symlink_unsupported` detail when `purl`'s vendor dir
+/// (`.socket/vendor`, its ecosystem dir, or the `uuid` unit) is a link.
+fn linked_vendor_dir_refusal(project_root: &Path, purl: &str, uuid: &str) -> Option<String> {
+    let eco = ecosystem_dir_for_purl(purl)?;
+    vendor::path::vendor_dir_symlink(project_root, eco, Some(uuid))
+        .map(|link| vendor::path::vendor_dir_symlink_detail(&link))
+}
+
 /// Dispatch one purl to its ecosystem backend. `pkg_path` is the crawler's
 /// installed location (site-packages root for pypi, the package dir
 /// otherwise), or a fetched artifact the backend materialises only if it
@@ -134,11 +142,13 @@ pub(crate) async fn dispatch_vendor_one(
 ) -> Option<VendorOutcome> {
     let eco = ecosystem_dir_for_purl(purl)?;
     // Before any backend write: a linked vendor dir is never ours, and the
-    // unit would land in (and a later revert delete from) its target.
-    if let Some(link) = vendor::path::vendor_dir_symlink(project_root, eco, Some(&record.uuid)) {
+    // unit would land in (and a later revert delete from) its target. The
+    // vendor loop refuses it earlier still, before a hosted takeover; this
+    // is the backstop for every other caller.
+    if let Some(detail) = linked_vendor_dir_refusal(project_root, purl, &record.uuid) {
         return Some(VendorOutcome::Refused {
             code: "vendor_dir_symlink_unsupported",
-            detail: vendor::path::vendor_dir_symlink_detail(&link),
+            detail,
         });
     }
 
@@ -1911,6 +1921,10 @@ async fn plan_service_downloads(
             if bun_refusal.is_some_and(|r| r.applies_to(candidate)) {
                 continue;
             }
+            // The loop refuses a linked vendor dir; no grant on its behalf.
+            if linked_vendor_dir_refusal(cwd, candidate, &record.uuid).is_some() {
+                continue;
+            }
             if takeover_blocked(candidate) {
                 continue;
             }
@@ -2380,6 +2394,18 @@ pub(crate) async fn vendor_records_reusing(
                         .with_error(refusal.code, refusal.detail.clone()),
                 );
                 report_vendor_failure(common, candidate, &refusal.detail);
+                continue;
+            }
+            // A linked vendor dir (#664) is refused before the takeover
+            // below can restore a live hosted pin's upstream entry: the
+            // refusal must leave the hosted patch wired.
+            if let Some(detail) = linked_vendor_dir_refusal(&common.cwd, candidate, &record.uuid) {
+                has_errors = true;
+                env.record(
+                    PatchEvent::new(PatchAction::Failed, candidate.clone())
+                        .with_error("vendor_dir_symlink_unsupported", detail.clone()),
+                );
+                report_vendor_failure(common, candidate, &detail);
                 continue;
             }
 
