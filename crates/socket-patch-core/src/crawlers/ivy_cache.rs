@@ -176,6 +176,15 @@ pub fn installed_pom(installed_dir: &Path, g: &str, a: &str, v: &str) -> Option<
     if let Ok(bytes) = read_regular_to_bytes_sync(&installed_dir.join(format!("{a}-{v}.pom"))) {
         return Some(bytes);
     }
+    // SECURITY: verify installed_dir is an Ivy artifact directory before
+    // walking to its parent, to prevent layout escape attacks.
+    let is_artifact_dir = installed_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| ARTIFACT_DIRS.contains(&n));
+    if !is_artifact_dir {
+        return None;
+    }
     let original = installed_dir
         .parent()?
         .join(format!("ivy-{v}.xml.original"));
