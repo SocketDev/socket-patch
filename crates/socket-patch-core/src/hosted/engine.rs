@@ -558,7 +558,7 @@ async fn keep_bundler_loaded_gem_files(
             let root = std::path::Path::new("/");
             (
                 manifest::classify(root, None, value.as_deref()),
-                crate::formats::gem::mirror::capturing_mirror(config.as_deref(), None, &sources),
+                crate::formats::gem::mirror::capturing_mirror(config.as_deref(), &[], &sources),
             )
         }
     };
@@ -2124,7 +2124,7 @@ mod tests {
             .iter()
             .find(|w| w.code == "redirect_gem_mirror_overrides_source")
             .unwrap();
-        assert!(w.detail.contains("artifactory.example"), "{}", w.detail);
+        assert!(!w.detail.contains("artifactory.example"), "{}", w.detail);
         assert!(
             w.detail.contains("mirror.https://rubygems.org"),
             "{}",
@@ -2132,28 +2132,37 @@ mod tests {
         );
     }
 
-    /// #681: a `mirror.<source>` key naming the patch-registry source
-    /// captures it like `mirror.all`.
+    /// Exact-source and hostname mirrors both refuse intake and confirmation,
+    /// with sensitive mirror values excluded from the rendered warning.
     #[tokio::test]
     async fn bundler_mirror_for_the_patch_source_redirects_nothing() {
-        let mut p = MemoryProject::new();
-        p.insert_text("Gemfile", GEMFILE);
-        p.insert_text("Gemfile.lock", GEM_LOCK);
-        p.insert_text(
-            ".bundle/config",
-            "---\nBUNDLE_MIRROR__HTTPS://PATCH__TEST/GEM/TOK/UUID/: \"https://m.example/\"\n",
-        );
-        let (_read, done) = gem_rewrite(&p).await;
-        assert!(
-            done.rewrite.files.is_empty(),
-            "{:?}",
-            done.rewrite.files.keys()
-        );
-        assert!(
-            warning_codes(&done).contains(&"redirect_gem_mirror_overrides_source"),
-            "{:?}",
-            warning_codes(&done)
-        );
+        for key in [
+            "BUNDLE_MIRROR__HTTPS://PATCH__TEST/GEM/TOK/UUID/",
+            "BUNDLE_MIRROR__PATCH__TEST",
+            "BUNDLE_MIRROR__PATCH__TEST/",
+        ] {
+            let mut p = MemoryProject::new();
+            p.insert_text("Gemfile", GEMFILE);
+            p.insert_text("Gemfile.lock", GEM_LOCK);
+            p.insert_text(".bundle/config", format!("---\n{key}: \"https://review-user:review-secret@m.example/?token=review-token\"\n"));
+            let (read, done) = gem_rewrite(&p).await;
+            assert!(!read.files.contains_key("Gemfile"));
+            assert!(!read.files.contains_key("Gemfile.lock"));
+            assert!(
+                done.rewrite.files.is_empty(),
+                "{key}: {:?}",
+                done.rewrite.files.keys()
+            );
+            let warning = done
+                .rewrite
+                .warnings
+                .iter()
+                .find(|warning| warning.code == "redirect_gem_mirror_overrides_source")
+                .unwrap();
+            for secret in ["review-user", "review-secret", "review-token"] {
+                assert!(!warning.detail.contains(secret));
+            }
+        }
     }
 
     /// A mirror scoped to rubygems.org leaves the patch-registry source

@@ -167,6 +167,11 @@ fn run_socket_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> (i32, Str
             cmd.env_remove(&k);
         }
     }
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("BUNDLE_MIRROR__") {
+            cmd.env_remove(key);
+        }
+    }
     cmd.env_remove("VIRTUAL_ENV");
     for (k, v) in envs {
         cmd.env(k, v);
@@ -435,6 +440,10 @@ enum Driver {
     /// write nothing and attest nothing; the fixture asserts that and
     /// yields `None`.
     ScanVexMirrorAll,
+    /// Hostname app-config and exact/all environment mirrors use the same gate.
+    ScanVexMirrorHost,
+    ScanVexMirrorSourceEnv,
+    ScanVexMirrorAllEnv,
 }
 
 impl Driver {
@@ -446,6 +455,9 @@ impl Driver {
             Driver::ScanVexDuplicateDeclaration => "scan --mode hosted (gem in two groups)",
             Driver::ScanVexEvalGemfile => "scan --mode hosted (gem via eval_gemfile)",
             Driver::ScanVexMirrorAll => "scan --mode hosted (bundler mirror.all)",
+            Driver::ScanVexMirrorHost => "scan --mode hosted (bundler hostname mirror)",
+            Driver::ScanVexMirrorSourceEnv => "scan --mode hosted (bundler source mirror env)",
+            Driver::ScanVexMirrorAllEnv => "scan --mode hosted (bundler mirror.all env)",
             Driver::ScanVexDualBootEnvGemfile => {
                 "scan --mode hosted (config Gemfile.next, env BUNDLE_GEMFILE=Gemfile)"
             }
@@ -825,12 +837,20 @@ async fn redirect_scanned_project(
             String::from_utf8_lossy(&cfg.stderr)
         );
     }
-    if driver == Driver::ScanVexMirrorAll {
-        // A committed mirror for every source (the corporate Artifactory /
-        // Nexus shape), pointing at the upstream index: it serves the
-        // unpatched gem for the patch-registry source too.
-        let mirror = format!("{}/upstream/", server.uri());
-        let args = bundler.config_local_args("mirror.all", &mirror);
+    // Synthetic credentials must never appear in the scan's automatic
+    // diagnostics. The loopback mirror itself serves the unpatched gem.
+    let mirror = format!("{}/upstream/", server.uri()).replacen(
+        "http://",
+        "http://review-user:review-secret@",
+        1,
+    );
+    if matches!(driver, Driver::ScanVexMirrorAll | Driver::ScanVexMirrorHost) {
+        let setting = if driver == Driver::ScanVexMirrorAll {
+            "mirror.all"
+        } else {
+            "mirror.127.0.0.1"
+        };
+        let args = bundler.config_local_args(setting, &mirror);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let cfg = bundle(&proj, &args);
         assert!(
@@ -842,6 +862,9 @@ async fn redirect_scanned_project(
     let argv: Vec<&str> = match driver {
         Driver::ScanVex
         | Driver::ScanVexMirrorAll
+        | Driver::ScanVexMirrorHost
+        | Driver::ScanVexMirrorSourceEnv
+        | Driver::ScanVexMirrorAllEnv
         | Driver::ScanVexDualBoot
         | Driver::ScanVexDualBootEnvGemfile
         | Driver::ScanVexDuplicateDeclaration
@@ -881,8 +904,17 @@ async fn redirect_scanned_project(
             "fake",
         ],
     };
+    let mirror_source_key = format!(
+        "BUNDLE_MIRROR__{}",
+        index_url
+            .replace('.', "__")
+            .replace('-', "___")
+            .to_uppercase()
+    );
     let socket_env: &[(&str, &str)] = match driver {
         Driver::ScanVexDualBootEnvGemfile => &[("BUNDLE_GEMFILE", "Gemfile")],
+        Driver::ScanVexMirrorSourceEnv => &[(&mirror_source_key, &mirror)],
+        Driver::ScanVexMirrorAllEnv => &[("BUNDLE_MIRROR__ALL", &mirror)],
         _ => &[],
     };
     let (code, stdout, stderr) = run_socket_env(&proj, &argv, socket_env);
@@ -902,9 +934,18 @@ async fn redirect_scanned_project(
     if let Some(warning) = match driver {
         Driver::ScanVexDuplicateDeclaration => Some("redirect_gem_declared_more_than_once"),
         Driver::ScanVexEvalGemfile => Some("redirect_gem_declaration_not_visible"),
-        Driver::ScanVexMirrorAll => Some("redirect_gem_mirror_overrides_source"),
+        Driver::ScanVexMirrorAll
+        | Driver::ScanVexMirrorHost
+        | Driver::ScanVexMirrorSourceEnv
+        | Driver::ScanVexMirrorAllEnv => Some("redirect_gem_mirror_overrides_source"),
         _ => None,
     } {
+        for secret in ["review-user", "review-secret"] {
+            assert!(
+                !stdout.contains(secret) && !stderr.contains(secret),
+                "mirror credential disclosed"
+            );
+        }
         assert_unwirable_declaration_redirects_nothing(
             &proj,
             &bundler,
@@ -992,7 +1033,10 @@ async fn redirect_scanned_project(
         | Driver::ScanVexDualBootEnvGemfile
         | Driver::ScanVexDuplicateDeclaration
         | Driver::ScanVexEvalGemfile
-        | Driver::ScanVexMirrorAll => unreachable!("asserted and returned above"),
+        | Driver::ScanVexMirrorAll
+        | Driver::ScanVexMirrorHost
+        | Driver::ScanVexMirrorSourceEnv
+        | Driver::ScanVexMirrorAllEnv => unreachable!("asserted and returned above"),
         Driver::GetUuid => {
             // get's hosted envelope (CLI_CONTRACT.md "get --mode and
             // installed narrowing"): `found` counts the resolved patch;
@@ -1780,6 +1824,114 @@ async fn gem_hosted_bundler_mirror_all_redirects_nothing() {
     )
     .await;
     assert!(fx.is_none(), "the mirror.all driver asserts in place");
+}
+
+/// Native hostname and environment mirrors must refuse before writing or
+/// attesting, and credentialed values must stay out of JSON and stderr.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to real ruby/gem/bundler; pinned e2e job runs --ignored"]
+async fn gem_hosted_bundler_host_and_environment_mirrors_redirect_nothing() {
+    for (label, driver) in [
+        ("mirror-host", Driver::ScanVexMirrorHost),
+        ("mirror-source-env", Driver::ScanVexMirrorSourceEnv),
+        ("mirror-all-env", Driver::ScanVexMirrorAllEnv),
+    ] {
+        let fx =
+            redirect_scanned_project(label, Spelling::Gemfile, false, true, None, driver).await;
+        assert!(fx.is_none(), "the mirror driver asserts in place");
+    }
+}
+
+/// A repeat scan can rediscover an older hosted pin even though mirror intake
+/// refused it. That pin cannot attest without installed, hash-verified bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to real ruby/gem/bundler; pinned e2e job runs --ignored"]
+async fn gem_hosted_mirror_rescan_requires_verified_installed_bytes() {
+    let Some(fx) = redirect_scanned_project(
+        "mirror-rescan",
+        Spelling::Gemfile,
+        true,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    let (fresh, install) = fresh_checkout_bundle_install(&fx);
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert_patched_install(&fx, &fresh);
+    let api = fx._server.uri();
+    for (root, installed) in [(&fx.proj, false), (&fresh, true)] {
+        let mirror = format!("{api}/upstream/");
+        let args = fx.bundler.config_local_args("mirror.127.0.0.1", &mirror);
+        let args: Vec<_> = args.iter().map(String::as_str).collect();
+        assert!(bundle(root, &args).status.success());
+        let gemfile = std::fs::read(root.join(fx.gemfile_name)).unwrap();
+        let lock = std::fs::read(root.join(fx.lock_name)).unwrap();
+        for no_verify in [false, true] {
+            let output = if no_verify {
+                "mirror-no-verify.vex.json"
+            } else {
+                "mirror-verified.vex.json"
+            };
+            let mut args = vec![
+                "scan",
+                "--mode",
+                "hosted",
+                "--json",
+                "--yes",
+                "--cwd",
+                root.to_str().unwrap(),
+                "--api-url",
+                &api,
+                "--patch-server-url",
+                &api,
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+                "--vex",
+                output,
+                "--vex-product",
+                PRODUCT,
+            ];
+            if no_verify {
+                args.push("--vex-no-verify");
+            }
+            let (code, stdout, stderr) = run_socket(root, &args);
+            let env: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            assert!(
+                stdout.contains("redirect_gem_mirror_overrides_source"),
+                "{env}"
+            );
+            assert_eq!(env["redirect"]["redirected"], 0, "{env}");
+            if installed && !no_verify {
+                assert_eq!(code, 0, "{env}\n{stderr}");
+                assert_eq!(
+                    env["vex"]["statements"], 1,
+                    "verified installed bytes remain evidence: {env}"
+                );
+                assert_patched_install(&fx, root);
+            } else {
+                assert_ne!(code, 0, "mirror-refused wiring cannot attest: {env}");
+                assert!(
+                    !root.join(output).exists(),
+                    "refused VEX output was written"
+                );
+                if no_verify {
+                    assert!(stdout.contains("mirror_overrides_source"), "{env}");
+                }
+            }
+            assert_eq!(std::fs::read(root.join(fx.gemfile_name)).unwrap(), gemfile);
+            assert_eq!(std::fs::read(root.join(fx.lock_name)).unwrap(), lock);
+        }
+    }
 }
 
 /// The compact-index DEPENDENCY contract, pinned from the red side: a patch

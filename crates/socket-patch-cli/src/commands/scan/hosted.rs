@@ -1249,6 +1249,14 @@ pub(crate) async fn run_redirect_selected(
         // v5 keeps no hosted ledger: this run's fetched records are the
         // hosted record source of the in-run attestation.
         params.hosted_records = records.clone();
+        // The gem intake gate withholds every gem file. VEX independently
+        // rediscovers older pins too, so a candidate-only set would miss some
+        // refused hosted gems. Keep their actual installed-byte verification,
+        // but do not infer applied status from the intercepted source.
+        params.hosted_gem_mirror_refused = rewrite
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "redirect_gem_mirror_overrides_source");
         // Stale-flagged purls are EXCLUDED from assume_applied: the same-run
         // envelope carries a redirect_gem_stale_install warning proving the
         // installed materialization unpatched, so attesting that purl from
