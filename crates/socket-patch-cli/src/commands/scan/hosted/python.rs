@@ -44,6 +44,13 @@ pub(super) async fn stale_install_warnings(
     // fallback to the global interpreters would judge an unrelated Python's
     // copy of the release (a tool venv on PATH) and warn falsely.
     // --global / --global-prefix keep their meaning.
+    // Hatch envs need their own remedy: a reinstall from the rewritten
+    // pyproject does nothing there (#335).
+    let hatch_envs = if common.is_global() {
+        Vec::new()
+    } else {
+        socket_patch_core::crawlers::hatch_env::hatch_environments(&common.cwd).await
+    };
     let paths = if common.is_global() {
         crawler
             .get_site_packages_paths(&common.crawler_options())
@@ -105,7 +112,11 @@ pub(super) async fn stale_install_warnings(
             // (`install`, `install --deploy`, `sync` all keep the installed
             // bytes on every major), and `pipenv uninstall` rewrites the
             // Pipfile and re-locks the patch away — name the verified remedy.
-            let remedy = if pipenv_purls.contains(&purl) {
+            let hatch_env =
+                socket_patch_core::crawlers::hatch_env::environment_of(&hatch_envs, &site);
+            let remedy = if let Some(env) = hatch_env {
+                socket_patch_core::crawlers::hatch_env::stale_install_remedy(&env.name)
+            } else if pipenv_purls.contains(&purl) {
                 let name = strip_purl_qualifiers(&purl)
                     .strip_prefix("pkg:pypi/")
                     .and_then(|rest| rest.split('@').next())
@@ -211,6 +222,55 @@ mod tests {
         ledger.insert("three".into(), record("variant", "first.py", b"upstream"));
         let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), &ledger).await;
         assert!(out.stale_purls.is_empty());
+        assert!(out.warnings.is_empty());
+    }
+
+    /// #335: a Hatch env keeps the upstream release after the rewrite, and
+    /// the probe must find it (Hatch keeps envs out of `./.venv`) and name
+    /// Hatch's remedy, not "reinstall from the rewritten lock".
+    #[tokio::test]
+    async fn hatch_env_gets_the_stale_install_warning_with_hatch_remedy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n\n[tool.hatch.envs.default]\npath = \"../hatch-envs/app\"\n",
+        )
+        .unwrap();
+        let env = tmp.path().join("hatch-envs").join("app");
+        std::fs::create_dir_all(&env).unwrap();
+        std::fs::write(env.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        let site = if cfg!(windows) {
+            env.join("Lib").join("site-packages")
+        } else {
+            env.join("lib").join("python3.12").join("site-packages")
+        };
+        let dist = site.join("six-1.16.0.dist-info");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("METADATA"), "Name: six\nVersion: 1.16.0\n").unwrap();
+        std::fs::write(site.join("six.py"), b"upstream").unwrap();
+
+        let common = crate::args::GlobalArgs {
+            cwd: project.clone(),
+            ..Default::default()
+        };
+        let purl = "pkg:pypi/six@1.16.0";
+        let confirmed = vec![(purl.to_string(), "six-uuid".to_string())];
+        let ledger = BTreeMap::from([("k".into(), record("six-uuid", "six.py", b"patched"))]);
+        let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), &ledger).await;
+        assert_eq!(out.stale_purls, BTreeSet::from([purl.to_string()]));
+        assert_eq!(out.warnings.len(), 1);
+        let detail = out.warnings[0]["detail"].as_str().unwrap();
+        assert!(detail.contains("hatch env remove default"), "{detail}");
+        assert!(
+            !detail.contains("Reinstall from the rewritten lock"),
+            "{detail}"
+        );
+
+        // Patched in the env: nothing to warn about.
+        std::fs::write(site.join("six.py"), b"patched").unwrap();
+        let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), &ledger).await;
         assert!(out.warnings.is_empty());
     }
 
