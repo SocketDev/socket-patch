@@ -693,15 +693,180 @@ fn pipenv_venv_in_project(cwd: &Path, var: &impl Fn(&str) -> Option<String>) -> 
 ///   [`find_pipenv_virtualenv_site_packages`]). An explicit "in project"
 ///   with no `./.venv` means Pipenv has no venv yet, so nothing.
 /// - A `./.venv` directory and an explicit "in project": `./.venv` only.
-/// - A `./.venv` directory and an explicit "not in project": the
-///   WORKON_HOME venv only (Pipenv 2023+ ignores `./.venv` then).
+/// - A `./.venv` directory and an explicit "not in project": Pipenv
+///   2023.11.14+ ignores `./.venv` and uses WORKON_HOME, but 2018.11
+///   through 2023.10.24 use an existing `./.venv` directory whatever the
+///   setting says (and only 2026.2+ reads the Pipfile key).
 /// - A `./.venv` directory and nothing explicit: Pipenv up to 2026.1 uses
-///   it, 2026.2+ prefers an existing WORKON_HOME venv. Without running
-///   Pipenv the version is unknown, so both are returned, WORKON_HOME
-///   first, and whichever one the installed Pipenv uses gets patched.
+///   it, 2026.2+ prefers an existing WORKON_HOME venv.
+///
+/// In both of those cases the version is unknown without running Pipenv,
+/// so both venvs are returned, WORKON_HOME first, and whichever one the
+/// installed Pipenv uses gets patched.
+///
+/// The settings come from the project's `.env` layered over the process
+/// environment, as every Pipenv command loads it first (see
+/// [`pipenv_dotenv`]), and then from the process environment alone (older
+/// Pipenv read some settings before loading `.env`). Both views' venvs are
+/// returned, the `.env` view first.
 ///
 /// Never `./venv`: no Pipenv release uses it.
 async fn pipenv_project_site_packages(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    let dotenv = pipenv_dotenv(cwd, var);
+    let mut results = Vec::new();
+    if !dotenv.is_empty() {
+        let layered = |name: &str| {
+            dotenv
+                .iter()
+                .rev()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+                .or_else(|| var(name))
+        };
+        results = pipenv_settings_site_packages(cwd, &layered).await;
+    }
+    for site in pipenv_settings_site_packages(cwd, var).await {
+        if !results.contains(&site) {
+            results.push(site);
+        }
+    }
+    results
+}
+
+/// The `.env` variables Pipenv loads before it resolves the venv
+/// (`load_dot_env`, unchanged from 2018 through 2026): `PIPENV_DOTENV_LOCATION`
+/// (relative to the project) or `<project>/.env`, unless
+/// `bool(PIPENV_DONT_LOAD_ENV)`. Pipenv loads it with `override=True`, so
+/// these beat the process environment. Empty when there is nothing to load.
+fn pipenv_dotenv(cwd: &Path, var: &impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    let dont_load = match var("PIPENV_DONT_LOAD_ENV") {
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            other => !other.is_empty(),
+        },
+        None => false,
+    };
+    if dont_load {
+        return Vec::new();
+    }
+    let path = match var("PIPENV_DOTENV_LOCATION").filter(|v| !v.is_empty()) {
+        Some(location) => cwd.join(location),
+        None => cwd.join(".env"),
+    };
+    // Regular files only, non-blocking: a FIFO `.env` must not wedge
+    // discovery.
+    match read_regular_to_string_sync(&path) {
+        Ok(text) => parse_dotenv(&text, var),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `KEY=value` pairs of a `.env` file as python-dotenv (vendored by Pipenv)
+/// reads them, in file order: blank lines and `#` comments skipped, an
+/// optional `export ` prefix, single-quoted values literal, double-quoted
+/// values with backslash escapes, unquoted values trimmed and cut at ` #`.
+/// `${NAME}` / `${NAME:-default}` in unquoted and double-quoted values
+/// expand from earlier keys in the file, then the environment (the
+/// `override=True` order). A key without `=` sets nothing.
+fn parse_dotenv(text: &str, var: &impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").map_or(line, str::trim_start);
+        let Some((key, raw)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let raw = raw.trim_start();
+        let (value, interpolate) = if let Some(rest) = raw.strip_prefix('\'') {
+            (
+                rest.split('\'').next().unwrap_or_default().to_string(),
+                false,
+            )
+        } else if let Some(rest) = raw.strip_prefix('"') {
+            let mut value = String::new();
+            let mut chars = rest.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => break,
+                    '\\' => match chars.next() {
+                        Some('n') => value.push('\n'),
+                        Some('t') => value.push('\t'),
+                        Some('r') => value.push('\r'),
+                        Some(other) => {
+                            if !matches!(other, '"' | '\\' | '\'') {
+                                value.push('\\');
+                            }
+                            value.push(other);
+                        }
+                        None => value.push('\\'),
+                    },
+                    c => value.push(c),
+                }
+            }
+            (value, true)
+        } else {
+            let unquoted = match raw.find(" #").or_else(|| raw.find("\t#")) {
+                Some(at) => &raw[..at],
+                None => raw,
+            };
+            (unquoted.trim_end().to_string(), true)
+        };
+        let value = if interpolate {
+            let lookup = |name: &str| {
+                pairs
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.clone())
+                    .or_else(|| var(name))
+            };
+            dotenv_interpolate(&value, &lookup)
+        } else {
+            value
+        };
+        pairs.push((key.to_string(), value));
+    }
+    pairs
+}
+
+/// python-dotenv's `${NAME}` / `${NAME:-default}` expansion (a bare
+/// `$NAME` stays literal); an unset name takes the default, else "".
+fn dotenv_interpolate(value: &str, lookup: &impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        let Some(len) = rest[start + 2..].find('}') else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let inner = &rest[start + 2..start + 2 + len];
+        let (name, default) = match inner.split_once(":-") {
+            Some((name, default)) => (name, Some(default)),
+            None => (inner, None),
+        };
+        match lookup(name) {
+            Some(found) => out.push_str(&found),
+            None => out.push_str(default.unwrap_or_default()),
+        }
+        rest = &rest[start + 3 + len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// [`pipenv_project_site_packages`] for one settings view.
+async fn pipenv_settings_site_packages(
     cwd: &Path,
     var: &impl Fn(&str) -> Option<String>,
 ) -> Vec<PathBuf> {
@@ -718,9 +883,7 @@ async fn pipenv_project_site_packages(
         return in_tree;
     }
     let mut results = find_pipenv_virtualenv_site_packages_with(cwd, var).await;
-    if in_project.is_none() {
-        results.extend(in_tree);
-    }
+    results.extend(in_tree);
     results
 }
 
@@ -3215,8 +3378,7 @@ mod tests {
     }
 
     /// #334: when Pipenv has no venv yet, discovery must not fall back to a
-    /// tree Pipenv will never use: a stray `venv/`, or a `./.venv` that an
-    /// explicit "not in project" rules out.
+    /// tree Pipenv will never use, such as a stray `venv/`.
     #[tokio::test]
     async fn pipenv_without_its_venv_does_not_fall_back_to_stray_trees() {
         let (_tmp, project, site, var) = pipenv_project_with_workon_venv(&[]);
@@ -3225,36 +3387,44 @@ mod tests {
         assert!(find_local_venv_site_packages_with(&project, &var)
             .await
             .is_empty());
-
-        let (_tmp, project, site, var) =
-            pipenv_project_with_workon_venv(&[("PIPENV_VENV_IN_PROJECT", "0".to_string())]);
-        std::fs::remove_dir_all(site.ancestors().nth(3).unwrap()).unwrap();
-        let _dot = fake_venv(&project, ".venv");
-        assert!(find_local_venv_site_packages_with(&project, &var)
-            .await
-            .is_empty());
     }
 
-    /// #334: an explicit "not in project" (`PIPENV_VENV_IN_PROJECT` falsy,
+    /// #645: an explicit "not in project" (`PIPENV_VENV_IN_PROJECT` falsy,
     /// `PIPENV_NO_VENV_IN_PROJECT` truthy, or Pipenv 2026.2+'s Pipfile
-    /// `[pipenv] venv_in_project = false`) makes Pipenv ignore a `./.venv`
-    /// directory. An explicit "in project" makes it use `./.venv` only, and
-    /// the environment variable beats the Pipfile.
+    /// `[pipenv] venv_in_project = false`) makes only Pipenv 2023.11.14+
+    /// ignore a `./.venv` directory (#334); 2018.11 through 2023.10.24 use
+    /// an existing `./.venv` directory whatever the setting says. The
+    /// version is unknown, so both venvs are returned, WORKON_HOME first,
+    /// and `./.venv` alone when it is the only one. An explicit "in project"
+    /// makes every version use `./.venv` only, and the environment variable
+    /// beats the Pipfile.
     #[tokio::test]
     async fn pipenv_venv_in_project_settings_decide_about_dot_venv() {
         for env in [
             ("PIPENV_VENV_IN_PROJECT", "0"),
             ("PIPENV_VENV_IN_PROJECT", "false"),
             ("PIPENV_VENV_IN_PROJECT", "Off"),
+            ("PIPENV_VENV_IN_PROJECT", "no"),
             ("PIPENV_NO_VENV_IN_PROJECT", "1"),
         ] {
             let (_tmp, project, site, var) =
                 pipenv_project_with_workon_venv(&[(env.0, env.1.to_string())]);
-            let _dot = fake_venv(&project, ".venv");
+            let dot = fake_venv(&project, ".venv");
             assert_eq!(
                 find_local_venv_site_packages_with(&project, &var).await,
-                vec![site],
-                "{}={:?} must skip ./.venv",
+                vec![site.clone(), dot.clone()],
+                "{}={:?}: Pipenv <= 2023.10.24 still uses ./.venv",
+                env.0,
+                env.1
+            );
+            // Only `./.venv` exists: that is the venv old Pipenv uses, so
+            // it is patched instead of falling through to the global
+            // interpreter.
+            std::fs::remove_dir_all(site.ancestors().nth(3).unwrap()).unwrap();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &var).await,
+                vec![dot],
+                "{}={:?} with only ./.venv",
                 env.0,
                 env.1
             );
@@ -3269,8 +3439,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             find_local_venv_site_packages_with(&project, &var).await,
-            vec![site.clone()],
-            "Pipfile venv_in_project = false must skip ./.venv"
+            vec![site.clone(), dot.clone()],
+            "Pipfile venv_in_project = false: only 2026.2+ reads it"
         );
         std::fs::write(
             project.join("Pipfile"),
@@ -3324,6 +3494,142 @@ mod tests {
             find_local_venv_site_packages_with(&project, &var).await,
             vec![dot]
         );
+    }
+
+    /// #546: every Pipenv command loads the project's `.env` (with
+    /// `override=True`) before it resolves the venv, so a
+    /// `PIPENV_CUSTOM_VENV_NAME` or `WORKON_HOME` set there moves the venv.
+    /// Discovery must find that venv instead of falling through to the
+    /// global interpreter. The process-environment venv is still returned
+    /// after it (older Pipenv cached some settings before loading `.env`).
+    #[tokio::test]
+    async fn pipenv_dotenv_settings_move_the_venv() {
+        // PIPENV_CUSTOM_VENV_NAME in .env, WORKON_HOME exported.
+        let (tmp, project, site, var) = pipenv_project_with_workon_venv(&[]);
+        let custom = fake_venv(&tmp.path().join("wh"), "myenv");
+        std::fs::write(project.join(".env"), "PIPENV_CUSTOM_VENV_NAME=myenv\n").unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![custom.clone(), site.clone()]
+        );
+        std::fs::remove_dir_all(site.ancestors().nth(3).unwrap()).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![custom.clone()],
+            "the .env-named venv alone"
+        );
+
+        // PIPENV_DONT_LOAD_ENV: Pipenv skips .env, so does discovery.
+        let dont = env_of(&[
+            (
+                "WORKON_HOME",
+                tmp.path().join("wh").to_string_lossy().into_owned(),
+            ),
+            ("PIPENV_DONT_LOAD_ENV", "1".to_string()),
+        ]);
+        assert!(find_local_venv_site_packages_with(&project, &dont)
+            .await
+            .is_empty());
+
+        // WORKON_HOME in .env with nothing exported (python-dotenv syntax:
+        // `export`, quotes, inline comments, `${VAR}` interpolation).
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("Pipfile"), "[packages]\nsix = \"==1.16.0\"\n").unwrap();
+        let real = std::fs::canonicalize(&project).unwrap();
+        let hash = pipenv_venv_hash(&pipenv_path_string(&real.join("Pipfile")));
+        let base = tmp.path().to_string_lossy().into_owned();
+        let elsewhere = fake_venv(&tmp.path().join("elsewhere"), &format!("proj-{hash}"));
+        let home = env_of(&[(
+            "HOME",
+            tmp.path().join("home").to_string_lossy().into_owned(),
+        )]);
+        for dotenv in [
+            format!("WORKON_HOME={base}/elsewhere\n"),
+            format!("# venvs\nexport WORKON_HOME=\"{base}/elsewhere\"  # here\n"),
+            format!("WORKON_HOME='{base}/elsewhere'\n"),
+            format!("BASE={base}\nWORKON_HOME=${{BASE}}/elsewhere # comment\n"),
+        ] {
+            std::fs::write(project.join(".env"), &dotenv).unwrap();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &home).await,
+                vec![elsewhere.clone()],
+                ".env {dotenv:?}"
+            );
+        }
+
+        // PIPENV_DOTENV_LOCATION names the file (relative to the project).
+        std::fs::remove_file(project.join(".env")).unwrap();
+        std::fs::write(
+            project.join("ci.env"),
+            format!("WORKON_HOME={base}/elsewhere\n"),
+        )
+        .unwrap();
+        assert!(find_local_venv_site_packages_with(&project, &home)
+            .await
+            .is_empty());
+        let located = env_of(&[
+            (
+                "HOME",
+                tmp.path().join("home").to_string_lossy().into_owned(),
+            ),
+            ("PIPENV_DOTENV_LOCATION", "ci.env".to_string()),
+        ]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &located).await,
+            vec![elsewhere]
+        );
+    }
+
+    /// #546 / #645: `.env` also carries the in-project setting.
+    #[tokio::test]
+    async fn pipenv_dotenv_venv_in_project_is_honoured() {
+        // `.env` says "in project" and Pipenv has created `./.venv`, so
+        // `./.venv` comes first. The process-environment view (nothing
+        // explicit) still adds this project's own WORKON_HOME venv after it.
+        let (_tmp, project, site, var) = pipenv_project_with_workon_venv(&[]);
+        let dot = fake_venv(&project, ".venv");
+        std::fs::write(project.join(".env"), "PIPENV_VENV_IN_PROJECT=1\n").unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![dot.clone(), site.clone()]
+        );
+        // With no `./.venv` yet, the `.env` "in project" means Pipenv has
+        // no venv; only the process view's WORKON_HOME venv remains.
+        std::fs::remove_dir_all(project.join(".venv")).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![site]
+        );
+    }
+
+    #[test]
+    fn dotenv_parsing_follows_python_dotenv() {
+        let var = env_of(&[("OUTER", "out".to_string())]);
+        let text = "\
+# comment
+export A=1
+B = two words  # trailing
+C=\"quoted # not a comment\"
+D='single ${OUTER}'
+E=\"line\\nbreak\"
+F=${A}-${OUTER}-${MISSING:-dflt}
+NOVALUE
+G=
+=skipped
+";
+        let parsed = parse_dotenv(text, &var);
+        let get = |k: &str| parsed.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("A"), Some("1"));
+        assert_eq!(get("B"), Some("two words"));
+        assert_eq!(get("C"), Some("quoted # not a comment"));
+        assert_eq!(get("D"), Some("single ${OUTER}"));
+        assert_eq!(get("E"), Some("line\nbreak"));
+        assert_eq!(get("F"), Some("1-out-dflt"));
+        assert_eq!(get("NOVALUE"), None);
+        assert_eq!(get("G"), Some(""));
+        assert_eq!(parsed.len(), 7);
     }
 
     #[tokio::test]
