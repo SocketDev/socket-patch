@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-03 09:37Z, main `045d7ec` (CLI 4.0.0, unchanged). No new issues. Passing: dotted / underscored names (`jaraco.context`, `typing_extensions`) in hosted / vendored / agent, `extras` entries in both modes on 2022 / 2023 / 2026, tamper rejection on a `path` + extras entry (2018 / 2022), and `pipenv install <other>` on 2026. The hosted stale-warning shape of #645 is commented there; PR #654 (`d8356ae`) fixes both shapes.
+Last run: 2026-10-03 15:32Z, main `045d7ec` (CLI 4.0.0, unchanged). No new issues. Passing: lock entries with a non-default `index` (second `[[source]]`, private simple index) in hosted on 2018 / 2022 / 2023 / 2026, vendored on 2018 / 2026, and both takeovers; rollback refusal is documented. Also passing: a re-formatted (2-space or minified) Pipfile.lock in hosted mode. PR #654 (`d8356ae`, #645 + #546) is still unmerged.
 
 ## Coverage matrix
 
@@ -30,6 +30,8 @@ Cells marked v5 were re-run on `2463257` (v5: no hosted ledger, upstream-restore
 
 Dotted / underscored distribution names (`jaraco.context`, `typing_extensions`), `09:37Z` run, `045d7ec`: hosted lock-only (2023), vendored (2018 / 2023 / 2026), agent + stale-warning remedy (2018 / 2026) all pass. Lock entries with `extras`: hosted (`file`) and vendored (`path`) on 2022 / 2023 / 2026 pass; a tampered `path` + extras wheel is rejected on 2018 / 2022 (pass). Pipenv 2026 `install <other>` keeps the hosted or vendored reference (pass). Hosted stale warning with `.venv` + WORKON + `PIPENV_VENV_IN_PROJECT=0` on 2018 / 2022 names only WORKON: fail, #645 (vex stays conservative, `not_applied`).
 
+Non-default `index` (`six = {version, index = "private"}`, second http `[[source]]`), `15:32Z` run, `045d7ec`: hosted lock-only on 2018.11.26 / 2022.12.19 / 2023.12.1 / 2026.8.0 keeps `index`, and `sync` / `--deploy` give PATCHED (pass). 2026 vex / `verify` / `requirements` → pip pass. Vendored on 2018 / 2026: sync / --deploy / check / byte-exact rollback pass. Hosted → vendored is refused fail-closed (`redirect_revert_failed`), and vendored → hosted restores `index` (pass). Hosted rollback refusal: documented.
+
 Hosted with a path-prefixed `--patch-server-url`, a rotated grant token, or an sdist hosted artifact (2026.8.0, `045d7ec`, #572): rotate, sync / --deploy, verify, vex and byte-exact rollback all pass.
 
 Hosted + `requirements.txt` with `-r req/base.txt` pinning the package (Pipenv 2018 / 2023 / 2026 locks, `d63ae5f` and `8eec03a`): fail #567. Hosted lock-only `default` + `develop` + root requirements.txt (2023 / 2026, `d63ae5f`): pass, except rollback refuses the all-hosted requirements.txt (#410).
@@ -56,9 +58,9 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 3. Re-verify #504 and the #454 human-mode gap once they're fixed.
 4. #567 variants: vendored mode with an `-r` include, `remove`, `-c` constraints; re-verify once fixed.
 5. **Maintainer request (global `-g` mode):** still to do: macOS / Windows, `-g` on 2018 / 11, and `--global-prefix` as a venv root (scans 0; undocumented). Checklist in the 20261001T040000Z entry.
-6. Lock entries with a non-default `index` (second `[[source]]`), hosted + vendored, 2018 / 2026.
+6. A `pypi`-named `[[source]]` pointing at a mirror (no pypi.org in `_meta.sources`): hosted, vendored and rollback, on 2018 / 2026. (Non-default `index` done 2026-10-03 15:32Z, pass.)
 6b. Hosted path-prefix on Pipenv 9 / 11 (`path` references) and on lock-only checkouts.
-7. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546 / #645, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked until branch deletion through the git proxy works.
+7. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546 / #645, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked until branch deletion through the git proxy works (still denied 2026-10-03 15:20Z).
 
 ## Known non-bugs
 
@@ -100,3 +102,4 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - Pipenv 2026.8.0 recreates a `PIPENV_PYTHON`-suffixed venv on `pipenv run` when `PIPENV_PYTHON` names a PATH symlink ("Python version differs"). That's Pipenv's quirk.
 - Pipenv 2018.11.26 reads `PIPENV_VENV_IN_PROJECT` with `bool(os.environ.get(...))`, so `"0"` means in project, and Pipenv ≤ 2023.10.24 always uses an existing `.venv` directory. That's Pipenv's behaviour, and the reason #645 is a socket-patch bug.
 - v5 `scan` defaults to hosted mode; agent cells need `--mode agent`.
+- A hand-reformatted Pipfile.lock (2-space indent or minified) gets the hosted entry in Pipenv's 4-space style, so rollback is semantically exact but not byte-exact. Cosmetic: Pipenv re-serializes on any `pipenv lock`.
