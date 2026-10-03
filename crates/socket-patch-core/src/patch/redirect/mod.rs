@@ -64,6 +64,7 @@ mod poetry;
 #[cfg(test)]
 mod python_lock_equivalence_tests;
 mod requirements;
+pub use requirements::preflight_requirements_takeover;
 mod staged;
 mod state;
 pub(crate) mod hosted_url;
