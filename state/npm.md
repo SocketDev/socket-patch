@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-02 (run 9 with a ledger), main `203e092` (v5 + the #324/#326/#359/#403/#434/#454/#490/#516/#541 fixes; the binary still reports 4.0.0), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`.
+Last updated: 2026-10-03 (run 10 with a ledger), main `045d7ec` (v5 + the #324/#326/#359/#403/#434/#454/#490/#516/#541 fixes and #570 API timeouts; the binary still reports 4.0.0), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`.
 
 ## Coverage matrix
 
@@ -21,14 +21,19 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 | Windows | 12.1.0 / 12.2.0 | pass: linked `.store` apply/vex/rollback (main). fail #356, #403 (v4) | pass: cycle + `--omit=dev`, revert (main) | pass: cycle, linked cycle (probe) | **fail #434** |
 | Windows 2022 | 10.9.7 / 12.2.0 | pass: linked `.store` apply/vex/rollback (main) | pass: cycle + `--omit=dev`, revert (main) | pass: linked cycle (probe) | **fail #434** |
 
+## Agent writes through links (#626)
+
+Agent mode follows a `node_modules` link into a workspace member, a `file:` dir or an `npm link` target, overwrites first-party source, and rollback restores upstream bytes. **fail #626** on Linux npm 6 (`file:`) / 8 / 10 / 12, macOS npm 10.9.7, and Windows npm 8 / 10 / 12, also on v4.0.0. Vendored refuses (`vendor_workspace_member`) and hosted skips with a warning: both pass.
+
 ## Backlog
 
+0. **#626 follow-ups:** `apply --check` / `repair` over a link; a byte-identical fork (patched silently); a nested member's `node_modules` reached through a link.
 1. **#588 follow-ups:** an unwired same-lock copy under `install-strategy=linked` and across a shrinkwrap/package-lock pair; whether `vendor --check` should flag it.
-2. **Re-checks on `203e092`:** #325, #432, #490 (override over URL / `file:` transitive deps on npm 8–12).
+2. **Re-checks:** #325 (#432 still reproduces on `045d7ec`), #490 (override over URL / `file:` transitive deps on npm 8–12).
 3. **#554 follow-ups:** agent `rollback` / `vex` with path policy over nested projects.
 4. **#356:** alias-only agent `scan` now exits 0 with nothing applied (since #555). Watch for a fix.
 5. **Maintainer request (global `-g`), still open:** npm 6/8/11 on macOS and Windows; an unwritable prefix (root-owned / `Program Files`); nvm, volta, fnm and Homebrew prefixes on macOS; `%APPDATA%\npm` now that #434 is closed. Full checklist in the 20261001T040000Z entry.
-6. Stale probe branches the proxy can't delete (`git push --delete` fails with "remote end hung up" / "Everything up-to-date"): `bughunt/npm/20260930-alias-linked`, `20260930-win-mac-e2e`, `20260930-win-old-npm`, `20261001-crlf-paths`, `20261001-optional-dep`, `20261001-v5-hosted-global`, `20261001-win-global`, `20261002-v5-agent-vendored-winmac`. A maintainer needs to delete them.
+6. Stale probe branches the proxy can't delete (`git push --delete` fails with "remote end hung up" / "Everything up-to-date"): `bughunt/npm/20260930-alias-linked`, `20260930-win-mac-e2e`, `20260930-win-old-npm`, `20261001-crlf-paths`, `20261001-optional-dep`, `20261001-v5-hosted-global`, `20261001-win-global`, `20261002-v5-agent-vendored-winmac`, `20261003-ws-link-agent`, `20261003-ws-link-mac`. A maintainer needs to delete them.
 
 ## Known non-bugs
 
@@ -69,3 +74,6 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 - `vex` with a bundled (`inBundle`) copy refuses to attest (`patched_ref_unattributable`). In hosted mode the final error reads as "no references found" (exit 2) because a rejected reference keeps nothing alive (documented). Only the diagnostic is misleading.
 - `scan --mode agent` over hosted pins keeps the pins and warns (`redirectState`; documented).
 - npm vendored `scan --prune` / `vendor --revert` / `remove` keep (`keptVendoredEntries`, `vendor_artifact_kept`) an entry whose lock entry vanished after `npm uninstall` or a version bump. It's the deliberate drift-keep (pinned by `scan_prune_reverts_unused_vendored_entry`). Whether to reclaim it is an open maintainer question (#541 / PR #543 scope note). The rescan exit 1 is #541.
+- `package-lock=false` in `.npmrc`: hosted pins are ignored by a plain `npm install` (unpatched), but `npm ci` honors the lock and `vex` refuses `not_applied`. Fails closed; the user's config choice.
+- A symlinked `.npmrc` isn't written through (hosted warns that `allow-remote` must be set). A symlinked lock is refused `redirect_symlinked_file_unsupported`.
+- Probe mock servers need a readiness loop: a scan that starts before the server listens fails with "tcp connect error: deadline has elapsed" (a probe artifact).
