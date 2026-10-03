@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-03 (run 11), main `045d7ec` (includes #330, #446, #452, #456, #503, #527, #538, #540), latest release 4.0.0 (previous 3.3.0). Run 9 re-measured the cells marked "r9". Runs 10 and 11 have their own tables below. #327 and #329 are closed: macOS / Windows cells that still show them haven't been re-run, because probe branches are blocked.
+Last updated: 2026-10-03 (run 12), main `045d7ec` (includes #330, #446, #452, #456, #503, #527, #538, #540), latest release 4.0.0 (previous 3.3.0). Run 9 re-measured the cells marked "r9". Runs 10, 11 and 12 have their own tables below. #327 and #329 are closed: macOS / Windows cells that still show them haven't been re-run, because probe branches are blocked.
 
 ## Coverage matrix
 
@@ -114,15 +114,30 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 | 1.8.5 | same (`{data-dir}` stays literal in Poetry < 2.1) | pass |
 | 1.8.5, 2.5.1 | `path = "{cache-dir}/venvs"` control | pass |
 
+### Run 12 cells (Linux, main `045d7ec`)
+
+| Poetry | Cell | Result |
+| --- | --- | --- |
+| 1.3.2 → 1.8.5 (every minor) | Hosted, warm venv: the 1.3 / 1.4 boundary (version stamp, advisory, byte replacement), then `vex` | pass (matches the docs) |
+| 1.3.2, 1.4.0, 1.5.1, 1.7.1, 2.0.1, 2.1.1 | Vendored scan, install, vex (1.3.2 warns `vendored_tree_out_of_sync`) | pass |
+| 1.2.2 – 1.7.1, 2.1.1 | Agent, out-of-tree env, `Demo_App.Core` / `My Proj é` names | pass |
+| 2.1.1 | Agent list / rollback / apply / repair / remove | pass |
+| 2.5.1 | Agent, dev-group-only patch, `sync --without dev`, then `vex` omits it | pass |
+| 2.5.1 | Hosted / vendored with six as a path-wheel or URL dependency | refused before any write (documented) |
+| 1.0.10, 1.1.15 | Hosted on a CRLF lock + fresh install + idempotent re-scan | pass |
+| 1.0.10, 1.1.15, 1.3.2 | Hosted rollback (via the forwarder): byte-identical lock | pass |
+| 1.8.5, 2.5.1 | `virtualenvs.create = false` + stray `./venv`, or `./.venv` with `in-project = false` | fail #671 (also release 4.0.0 and the PR #644 head) |
+| 2.5.1 | `create = false` controls (no stray tree; `.venv` with in-project unset) | pass |
+
 ## Backlog
 
 1. **macOS / Windows re-checks for closed #327 / #329**, plus the #640 default paths (`~/Library/Application Support/pypoetry/venv`, `%APPDATA%\pypoetry\venv`). All need probe branches.
 2. **macOS XDG** (run 8 lead): with `XDG_CACHE_HOME` / `XDG_CONFIG_HOME` set and platformdirs ≥ 4.6.0, Poetry uses the XDG dirs, but `poetry_default_cache_dir` / `poetry_user_config_path` only look in `~/Library/...`. Needs a macOS probe.
 3. **Windows Poetry 1.0/1.1 env hash** (run 8 lead): Poetry < 1.2 hashes the raw cwd, while socket-patch lowercases it. Needs a Windows probe.
-4. Probe branches are still blocked: in runs 9–11 remote branch deletion was denied (`git push --delete` disconnects). A maintainer needs to delete `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes`, and allow deleting `bughunt/poetry/*` branches.
-5. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the poetry-compatibility "Installer boundaries" table says 1.4–1.8 replace it.
-6. Hosted + `poetry sync --only` / `--without` with group-only patches across several envs.
-7. `POETRY_DATA_DIR` / `POETRY_CACHE_DIR` set to values that contain placeholders, after #608 is fixed.
+4. Probe branches are still blocked: in runs 9–12 remote branch deletion was denied (in run 12 the auto-mode classifier refused `git push --delete`). A maintainer needs to delete `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes`, and allow deleting `bughunt/poetry/*` branches.
+5. Hosted with `create = false` + a stray venv: which interpreter do the stale-install check and VEX judge? (Related to #671.)
+6. Re-verify #608 / #640 when PR #644 merges.
+7. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the poetry-compatibility "Installer boundaries" table says 1.4–1.8 replace it.
 
 ## Known non-bugs
 
@@ -167,3 +182,6 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 - A test mock that answers every `/patches/batch` with the same patch makes agent scans report `partial_failure` for packages the project doesn't have. Filter the mock to the requested purls.
 - Poetry < 2.1 has no `data-dir` config key, so `{data-dir}` in `virtualenvs.path` stays a literal relative directory, and socket-patch matches it.
 - `vex` saying "No applied patches with vulnerability metadata" after a hand-staged manifest with empty `vulnerabilities` is a fixture artifact.
+- Poetry 1.x's env-var `boolean_normalizer` is case-sensitive (`POETRY_VIRTUALENVS_IN_PROJECT=True` is false), while 2.x lowercases. Same theoretical class as `yes` / `on`; it only diverges with a stray `.venv`. Not filed.
+- Standalone `vex --json` needs `-O <file>` (`-o` is `--org`), and against a mock it needs `--api-url` / `--org` for vulnerability metadata. Without them you get harness errors, not product bugs.
+- Hosted `rollback` prints "1 unwired package keeps its patched bytes in installed trees" even when no venv exists. Cosmetic, not filed.
