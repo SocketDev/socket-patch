@@ -217,7 +217,8 @@ jobs:
           java-version: ${{ matrix.java }}
 
       - name: Install Maven 3.9.16 (vendor cells)
-        # gradle_vendor_395 and the multi-project capstone seed through Maven.
+        # gradle_vendor_395 builds its mixed root's pom with Maven; the
+        # multi-project capstone reads the Gradle cache and needs none.
         if: matrix.mode == 'vendor'
         shell: bash
         env:

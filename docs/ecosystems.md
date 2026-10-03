@@ -19,18 +19,22 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected |
 | RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` when present (bundler prefers them over `Gemfile`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from the environment or `.bundle/config` is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
 | Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [Go notes](#go-directory-replaces-and-gosum). Paid hosted patches are unsupported; `redirect_golang_unsupported` names the vendored remedy |
-| Maven (`maven`) | ✅ in-place jar patching leaves the `~/.m2` checksum sidecars stale — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ single-POM repository, suffixed Maven reactor repository, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks; see [JVM vendoring](design/maven-vendoring.md) | ✅ **pom projects only, fail-closed** — the patched jar is pinned at a Socket-only `<version>-socket.<hex8>` suffix; `${property}` versions are refused; Gradle gets a manual `exclusiveContent` snippet — see [Maven & NuGet caveats](#maven--nuget-caveats) |
+| Maven (`maven`) — Maven and Gradle | ✅ in place in every copy the build consumes: each `~/.m2` copy it reads and each Gradle `files-2.1` copy; `~/.m2` `.sha1`/`.md5` sidecars are rewritten, Gradle copies get advisories; jar-member records swap in the patch service's whole jar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) | ✅ single-POM repository, suffixed Maven reactor repository, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks (a root with both `pom.xml` and a Gradle build wires both); see [JVM vendoring](design/maven-vendoring.md) and [Gradle](#gradle) | ✅ fail-closed by a Socket-only `<version>-socket.<hex8>` suffix: pom projects get a pinned `<version>` (`${property}` versions are refused); Gradle 6.8+ builds get an owned settings script, lock-entry rewrites and a resolution tripwire — see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) |
 | NuGet (`nuget`) | ✅ in-place patching deletes `.nupkg.metadata` and advises on the `.nupkg.sha512` tamper-evidence sidecar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed folder feed + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats) |
 | Composer (`composer`) | ✅ in place (`vendor/`) | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite; the entry's `source` and `dist.mirrors` are removed. See [composer-compatibility.md](testing/composer-compatibility.md) |
 | Deno (`deno`) | ✅ in place (the only mode for Deno) | ❌ refused (`vendor_unsupported_ecosystem`) | ❌ not supported |
 
 > **Maven / NuGet sidecar caveat**: Maven and NuGet are fully enabled in every mode.
-> In-place (agent-mode) patching leaves the caches' own checksum sidecars stale: NuGet's
-> post-apply fixup deletes `.nupkg.metadata` and raises an advisory for the
-> signed-package `.nupkg.sha512` tamper marker it cannot honestly rewrite; Maven's
-> `.jar.sha1`/`.jar.md5` are left as-is. The copy-out modes — `vendor`,
-> `scan --mode vendored`, `scan --mode hosted` — never write into the caches and avoid
-> the issue entirely.
+> In-place (agent-mode) patching writes into shared caches: NuGet's post-apply fixup
+> deletes `.nupkg.metadata` and raises an advisory for the signed-package
+> `.nupkg.sha512` tamper marker it cannot honestly rewrite. A `~/.m2` copy's
+> `.jar.sha1`/`.jar.md5` that described the pre-patch bytes are rewritten to the patched
+> bytes (and back on rollback); one that already disagreed is left alone. A Gradle
+> `files-2.1` copy has no checksum file (its directory names the download's sha1), so
+> each patched copy gets advisories instead: `gradle_refresh_reverts`,
+> `gradle_daemon_stale` and `gradle_global_cache_shared` (see [Gradle](#gradle)). The
+> copy-out modes — `vendor`, `scan --mode vendored`, `scan --mode hosted` — never write
+> into the caches and avoid the issue entirely.
 
 ## npm hosted-mode notes
 
@@ -392,13 +396,11 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   Scope the mirror to exclude the Socket repos (e.g.
   `<mirrorOf>*,!socket-patch-*</mirrorOf>`) so the redirect resolves; the
   `originAware=false` Trusted Checksums act as a backstop when present.
-* **Gradle (hosted Maven).** Gradle build scripts are never edited. A present
-  `build.gradle*` / `settings.gradle*` gets a paste-able `exclusiveContent { … }` snippet
-  (a `redirect_gradle_manual_snippet` warning) that carries the **suffixed** version —
-  and you must bump the `groupId:artifactId` dependency declaration to that suffixed
-  version yourself. It is fail-closed by repository exclusivity: the `exclusiveContent`
-  filter routes only the suffixed version to the Socket repo, which is the only place it
-  exists.
+* **Gradle (hosted Maven).** Gradle builds get automated wiring, not a pasted snippet:
+  an owned settings script pins the suffixed version, every lock file is rewritten,
+  and a tripwire fails the build if the base version still resolves. See
+  [Gradle](#gradle) for the rules and refusals; `redirect_gradle_manual_snippet` now
+  appears only beside a refusal.
 * **NuGet locked mode (hosted + vendored).** With a `packages.lock.json` and
   `dotnet restore --locked-mode`, the rewritten `contentHash` pins the patched `.nupkg` —
   a tampered or wrong package fails restore with `NU1403`. Without a lockfile there is no
@@ -406,6 +408,139 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   warning; the feed + source mapping still force the patched copy).
 
 * **NuGet package signatures.** The server constructs the patched `.nupkg` and removes invalidated upstream signatures. The CLI verifies and stores the served archive without repacking it. Vendoring uses a folder feed with source mapping; installations requiring signed packages need an appropriate server artifact and signing policy.
+
+## Gradle
+
+Gradle builds are part of the `maven` ecosystem: patches are Maven PURLs and every
+mode works on Gradle 6.8 or newer with Groovy or Kotlin DSL. The test grid covers
+Gradle 6.9.4, 7.6.6, 8.14.3 and 9.8.0 on Linux, macOS and Windows (see
+[testing](testing/README.md#gradle)). The machine-readable contract, with every code,
+is the "Gradle builds" section of
+[CLI_CONTRACT.md](../crates/socket-patch-cli/CLI_CONTRACT.md#gradle-builds-v50).
+
+**Which mode to pick.** Hosted and vendored mode change files you commit, so every
+checkout and CI runner builds the patched jar. Agent mode rewrites the Gradle cache
+of one machine: it is undone by `--refresh-dependencies`, shared by every build that
+uses the same Gradle user home, and refused when the build verifies its
+dependencies. Prefer hosted or vendored for Gradle.
+
+### Discovery
+
+`scan` reads Gradle's cache (`<Gradle user home>/caches/modules-2/files-2.1`, plus the
+read-only cache in `$GRADLE_RO_DEP_CACHE`) before `~/.m2`. The user home is found the
+way Gradle finds it: `-Dgradle.user.home` in `GRADLE_OPTS`, then `GRADLE_USER_HOME`,
+then `.gradle` in the account's home directory. On Unix that is the passwd entry, not
+`$HOME`; when they differ, scan notes `gradle_user_home_differs`.
+
+A Gradle-only build reads `~/.m2` only through `mavenLocal()`. Scan looks for it in
+every settings, build, `buildSrc`, included-build, applied and init script, including
+the wrapper distribution's `init.d`. Without it, `~/.m2` is not scanned, and modules
+found only there are listed in a `gradle_build_ignores_m2` warning. When a script
+cannot be read literally, `~/.m2` stays in the scan and scan notes
+`gradle_maven_local_undetermined`. In JSON, packages from the Gradle cache carry
+`inLock` when the build's lock files were read.
+
+### Agent mode
+
+`apply` patches every copy the build consumes. Gradle keeps one hash directory per
+download of a version, and each one holding the patched files is patched. Records
+keyed by members inside a jar swap in the patch service's build of the whole jar, so
+they need network access (`jvm_agent_service_required` offline). The original is
+backed up under `.socket/jvm-originals/` and `rollback` restores from it. Guards:
+
+- `gradle/verification-metadata.xml` present: refused
+  (`gradle_verification_metadata_present`). Gradle would reject the rewritten bytes,
+  so use hosted or vendored mode.
+- The only copy is in `~/.m2`, which the build never reads: refused
+  (`gradle_build_ignores_m2`). Build once so Gradle caches the jar, then apply.
+- **Read-only cache shadowing.** A copy in `$GRADLE_RO_DEP_CACHE` is never written,
+  and Gradle may read it first. The writable copies are patched but the run fails
+  (`gradle_ro_cache_shadows`). Rebuild the read-only cache from a patched user home.
+- A cache copy whose bytes are not the ones the patch was made for is left alone and
+  fails the run (`gradle_copy_unexpected_bytes`).
+- **Transform-copy staleness.** Gradle keeps derived copies of jars
+  (`caches/transforms-*`, `caches/jars-*`, instrumented build-logic jars). One proven
+  to come from the unpatched jar fails that copy (`gradle_transform_copy_stale`); one
+  that cannot be matched is reported (`gradle_transform_copy_unverified`). Run
+  `gradle --stop`, delete the named directories, and apply again.
+- On Windows a jar held open by a daemon is reported as `gradle_jar_locked_by_daemon`.
+  Run `gradle --stop` and retry.
+
+Each patched Gradle copy also gets informational advisories:
+`gradle_refresh_reverts` (`--refresh-dependencies` downloads a fresh, unpatched copy;
+apply again), `gradle_daemon_stale` (a running daemon may still hold the old classes)
+and `gradle_global_cache_shared` (every build of that user home sees the patch).
+
+### Hosted mode
+
+`scan --mode hosted` pins the patched jar at its Socket-only
+`<version>-socket.<hex8>` version and writes, for you to commit:
+
+- `.socket/gradle/socket-patch.hosted.settings.gradle`, an owned script whose bytes
+  change only with a CLI release, and its data, `.socket/gradle/hosted-index.tsv`;
+- one `apply from` line in every settings file of the checkout's builds: the root,
+  `buildSrc` and each literal `includeBuild`. A missing settings file is created and
+  marked so that `rollback` deletes only files it created;
+- every `gradle.lockfile`, `buildscript-gradle.lockfile` and legacy
+  `gradle/dependency-locks/*.lockfile` entry of the patched GA, moved to the suffixed
+  version;
+- the suffixed component in an existing `gradle/verification-metadata.xml`.
+
+The script routes the suffixed version to the Socket repository only
+(`exclusiveContent`). It substitutes every request that would select the patched base
+version, including transitive requests, ranges, dynamic (`1.+`) and rich versions. It
+rejects other versions at or below the base and fails the build if one still
+resolves. It also checks the jar's sha256. A version *above* the base still resolves,
+since an upstream fix is never downgraded, and `vex` withholds the statement until
+you rescan. The apply line carries a digest of the index, so a changed pin set
+invalidates the configuration cache.
+
+**Detached configurations.** Every project and buildscript configuration is pinned.
+Configurations a plugin creates with `configurations.detachedConfiguration` are not
+reached and may resolve the upstream version. Every hosted run says so
+(`redirect_gradle_detached_configs_unguarded`).
+
+**Gradle module metadata.** When the Socket repository serves a suffixed `.module`,
+the wiring uses it silently. A deployment that does not serve one warns
+`redirect_gradle_module_metadata_unavailable`; Gradle then resolves the suffixed pom,
+so variants and capabilities that only the upstream `.module` declares are not
+applied.
+
+A dep is refused, with nothing written for it, when the build is outside what the
+script can pin: a wrapper below 6.8, Android or Kotlin Multiplatform plugins, an
+`includeBuild` the CLI cannot follow, a custom `lockFile`, the GA on a
+settings-script classpath (declared, or in a `settings-gradle.lockfile`), a
+classifier declaration, a `strictly` constraint excluding the base, a user
+`exclusiveContent` rule claiming the group, a lock entry at a third version (re-lock
+first), a GA that is vendored, or a grant that serves the original coordinates. Each
+refusal has its own `redirect_gradle_*` code and is followed by
+`redirect_gradle_manual_snippet`, a paste-able snippet in the build's DSL.
+
+`rollback` and `remove` restore without the network, using only the index. A
+vendored Gradle package is taken over only when the hosted planner would accept it.
+Otherwise it keeps its vendored patch.
+
+### Vendored mode
+
+See [JVM vendoring](design/maven-vendoring.md#gradle). In short: the original GAV is
+committed under `.socket/vendor/gradle/`, a settings script serves it with
+`exclusiveContent` and verifies its sha256, and lock files and build scripts stay
+unchanged. Run it from the build root: a subproject directory is refused
+(`not_build_root`). A root with both `pom.xml` and a Gradle build wires both.
+Classifier jars a build declares are vendored too, and a derived `maven-metadata.xml`
+keeps ranges on the vendored version. Existing pgp-only verification entries get a
+checksum. Refusals use `vendor_jvm_shape_unsupported` /
+`vendor_jvm_upstream_unavailable`, and partial wiring uses `vendor_jvm_degraded`
+(VEX withheld). Each detail starts with `reason: <reason>:`.
+
+### VEX
+
+`vex` re-hashes every copy a build may load: the `~/.m2` copies it reads, every
+Gradle hash directory, and the suffixed copies of a hosted pin. A derived copy proven
+to come from the unpatched jar, or an older one that does not match the patched jar,
+withholds the statement (`vex_gradle_unpatched_copy`). A derived-cache walk cut short
+on a very large cache warns `vex_gradle_derived_cache_unchecked` and does not
+withhold.
 
 ## Cargo: shared registry cache
 

@@ -57,6 +57,11 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
   `vendor`, the unimplemented `--one-off` flags, and the three legacy
   `SOCKET_PATCH_*` environment aliases listed in the migration guide.
   `.socket/packages/` archives are no longer consumed; cleanup removes leftovers.
+- Hosted mode wires Gradle builds instead of printing a snippet. `scan --mode hosted`
+  (the default) now writes `.socket/gradle/` (an owned settings script and its
+  index), an apply line in each build's settings file, the patched GA's lock
+  entries and an existing `gradle/verification-metadata.xml`. Commit them with the
+  build. `redirect_gradle_manual_snippet` is only emitted after a refusal.
 - `list` on an empty project exits 0; `get` usage errors exit 2. Human help and
   output are grouped by task, with diagnostic codes retained in JSON and verbose
   output. Hosted JSON identifies lockfiles instead of a ledger; rollback's
@@ -76,6 +81,25 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
   existing verification metadata. `vendor --check` audits artifacts and wiring
   offline; `--local-repo` checks Maven cache conflicts and `--maven-config=none`
   selects the fallback file repository. Single-POM vendoring is unchanged.
+- Gradle 6.8+ in every mode, Groovy and Kotlin DSL, tested on Gradle 6.9.4, 7.6.6,
+  8.14.3 and 9.8.0 on macOS.
+  - `scan` reads Gradle's cache, and the read-only cache, and resolves the Gradle
+    user home the way the JVM does. It reads `~/.m2` for a Gradle-only build only
+    when the build declares `mavenLocal()`. JSON marks lock membership (`inLock`).
+  - Agent mode patches every copy a build consumes and swaps whole jars for
+    jar-member records. It refuses builds with dependency verification and reports
+    read-only cache shadowing, stale transform copies and Windows daemon locks.
+  - Hosted mode adds an owned settings script that substitutes, rejects and trips
+    on the unpatched base version (higher upstream versions still resolve). It also
+    rewrites lock files and verification metadata, refuses what it cannot pin, and
+    restores without the network. It uses the suffixed Gradle module metadata when
+    the patch service serves it, and warns
+    `redirect_gradle_module_metadata_unavailable` when it does not.
+  - VEX re-hashes every copy, Gradle hash directories and derived caches included,
+    before it attests.
+
+  New codes are listed in [CLI_CONTRACT.md](crates/socket-patch-cli/CLI_CONTRACT.md#gradle-builds-v50);
+  see [Gradle](docs/ecosystems.md#gradle).
 - `socket.yml` patch policy for paths, ecosystems, packages, severity, and per-run
   limits. `scan --package`, `--min-severity`, `--max-new-patches`, and
   `--no-socket-yml` support targeted and gradual rollout. Already-patched packages
@@ -102,6 +126,30 @@ limits, and required install commands.
 
 ### Fixed
 
+- `scan` reported success with 0 packages on a resolved Gradle project because it
+  never read Gradle's cache (#349).
+- Agent `apply` in a Gradle-only project patched the `~/.m2` copy Gradle never
+  reads, and VEX attested it. It now patches the Gradle cache copies the build
+  loads and refuses an `~/.m2`-only install (`gradle_build_ignores_m2`) (#551).
+  Records keyed by jar members, which `vendor` already accepted, now apply in agent
+  mode (#264).
+- Hosted Gradle was not fail-closed. A transitive request for the base version won
+  conflict resolution (#347), the snippet was always Groovy (#348), and dependency
+  locking built the unpatched jar on every Gradle major (#396). The owned hosted
+  script and lock rewrites replace the snippet.
+- Vendored Gradle fixes:
+  - A root with both `pom.xml` and a Gradle build now wires both instead of leaving
+    the Gradle build unpatched (#395).
+  - Running from a subproject is refused (`not_build_root`) instead of wiring a
+    nested settings file (#428).
+  - `core.autocrlf` checkouts pass `--check` and revert cleanly (#429).
+  - `exclusiveContent` conflicts in subproject scripts and convention plugins are
+    refused (#461).
+  - pgp-only verification entries get a checksum (#487).
+  - Version ranges keep resolving the vendored version through a derived
+    `maven-metadata.xml` (#511).
+  - Declared classifier jars are vendored or refused, and IDE sources are kept
+    (#533).
 - Gem hosted and vendored modes wire only the manifest Bundler loads. A `gems.rb`
   twin or a `BUNDLE_GEMFILE` setting (environment or `.bundle/config`) no longer
   leads to an edit of an ignored `Gemfile` that reports success and attests an

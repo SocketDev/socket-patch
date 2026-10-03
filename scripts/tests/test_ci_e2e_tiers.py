@@ -188,8 +188,10 @@ class GradleRows(unittest.TestCase):
         self.assertIn("if: matrix.jvm_tool != ''", select)
         self.assertIn('var="JAVA_HOME_${JAVA_FEATURE}_${arch}"', select)
         self.assertIn("maven) maven=true ;;", select)
-        self.assertIn("gradle) case \" $TEST_FILTER \" in *gradle_vendor_*|*gradle_multi_project*) maven=true ;; esac ;;",
-                      select)
+        # Only gradle_vendor_395 needs Maven; the multi-project capstone
+        # reads the Gradle cache, so its windows row runs Maven-free.
+        self.assertIn("gradle) case \" $TEST_FILTER \" in *gradle_vendor_*) maven=true ;; esac ;;", select)
+        self.assertNotIn("*gradle_multi_project*", select)
         self.assertIn("if: matrix.jvm_tool != '' && steps.jvm.outputs.runner-jdk != 'true'",
                       steps["Setup Java (JDK not on the runner image)"])
         self.assertIn("if: steps.jvm.outputs.maven == 'true'", steps["Install Maven ${{ matrix.maven || '3.9.16' }}"])

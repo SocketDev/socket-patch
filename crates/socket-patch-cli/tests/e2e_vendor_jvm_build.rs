@@ -20,7 +20,8 @@
 //!   vendoring the lockfiles are byte-unchanged, `:app` runtimeClasspath
 //!   resolves the vendored jar online and `--offline`, a tampered vendored
 //!   jar fails the build with the socket-patch message, and
-//!   `vendor --revert` is byte-exact.
+//!   `vendor --revert` is byte-exact. It needs no Maven: the CLI reads the
+//!   registry bytes from the Gradle cache the build fills.
 //!
 //! Gated like the other real-toolchain capstones: `#[ignore]` (network to
 //! Maven Central), Maven via `SOCKET_PATCH_MAVEN_E2E_{MVN,VERSION,REQUIRED}`
@@ -68,20 +69,26 @@ fn git_sha256(bytes: &[u8]) -> String {
     socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
 }
 
-/// `socket-patch <args>` with ambient `SOCKET_*` scrubbed and `m2` as the Maven repo.
-fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value, String) {
+/// `socket-patch <args>` with ambient `SOCKET_*` scrubbed, `m2` as the Maven
+/// repo and, when given, `gradle_home` as the `GRADLE_USER_HOME` the CLI
+/// crawls (and the fixture registry serves).
+fn socket_in(
+    cwd: &Path,
+    m2: &Path,
+    gradle_home: Option<&Path>,
+    args: &[&str],
+) -> (Option<i32>, serde_json::Value, String) {
     let mut cmd = Command::new(binary());
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("SOCKET_") {
             cmd.env_remove(&k);
         }
     }
-    let _fixture = prebuilt_common::prepare_command(
-        &mut cmd,
-        cwd,
-        args,
-        &[("MAVEN_REPO_LOCAL", m2.to_str().unwrap())],
-    );
+    let mut caches = vec![("MAVEN_REPO_LOCAL", m2.to_str().unwrap())];
+    if let Some(home) = gradle_home {
+        caches.push(("GRADLE_USER_HOME", home.to_str().unwrap()));
+    }
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &caches);
     let out = cmd
         .current_dir(cwd)
         .env("SOCKET_TELEMETRY_DISABLED", "1")
@@ -99,9 +106,14 @@ fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Val
 }
 
 fn vendor(proj: &Path, m2: &Path) -> serde_json::Value {
-    let (code, env, stderr) = socket(
+    vendor_in(proj, m2, None)
+}
+
+fn vendor_in(proj: &Path, m2: &Path, gradle_home: Option<&Path>) -> serde_json::Value {
+    let (code, env, stderr) = socket_in(
         proj,
         m2,
+        gradle_home,
         &[
             "vendor",
             "--json",
@@ -116,9 +128,14 @@ fn vendor(proj: &Path, m2: &Path) -> serde_json::Value {
 }
 
 fn revert(proj: &Path, m2: &Path) {
-    let (code, env, stderr) = socket(
+    revert_in(proj, m2, None)
+}
+
+fn revert_in(proj: &Path, m2: &Path, gradle_home: Option<&Path>) {
+    let (code, env, stderr) = socket_in(
         proj,
         m2,
+        gradle_home,
         &[
             "vendor",
             "--revert",
@@ -603,6 +620,24 @@ fn write_gradle_project(proj: &Path) {
     );
 }
 
+/// The registry jar of the fixture GAV as the build cached it in
+/// `gradle_home`'s `files-2.1` (the multi-project capstone's only copy).
+fn gradle_cached_jar(gradle_home: &Path) -> Vec<u8> {
+    let version_dir = gradle_home
+        .join(prebuilt_common::GRADLE_FILES21)
+        .join(GROUP)
+        .join(ARTIFACT)
+        .join(VERSION);
+    let leaf = format!("{ARTIFACT}-{VERSION}.jar");
+    let jars: Vec<PathBuf> = std::fs::read_dir(&version_dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", version_dir.display()))
+        .map(|e| e.unwrap().path().join(&leaf))
+        .filter(|p| p.is_file())
+        .collect();
+    assert_eq!(jars.len(), 1, "one cached {leaf}: {jars:?}");
+    std::fs::read(&jars[0]).unwrap()
+}
+
 fn gradle_tree_rel() -> String {
     format!(".socket/vendor/gradle/{GROUP_PATH}/{ARTIFACT}/{VERSION}")
 }
@@ -638,7 +673,7 @@ fn assert_gradle_vendored(out: &Output, checkout: &Path, patched: &[u8], what: &
 }
 
 #[test]
-#[ignore = "real Gradle + Maven + Maven Central (fixture); run with --ignored"]
+#[ignore = "real Gradle + Maven Central (fixture); run with --ignored"]
 fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
     const SUITE: &str = "e2e_vendor_jvm_build::gradle";
     let tmp = tempfile::tempdir().unwrap();
@@ -647,50 +682,11 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
     let Some(gradle) = Gradle::detect(SUITE, &gradle_home) else {
         return;
     };
-    // The crawler reads a maven repository: seed it with the registry bytes.
-    let Some(mvn) = Mvn::detect(SUITE) else {
-        return;
-    };
+    // No Maven seed: the crawler reads the Gradle cache the build fills, and
+    // the vendor plan sources parent poms and BOM metadata from it offline.
+    // `m2` stays empty so the user's own ~/.m2 is never consulted.
     let m2 = root.join("m2");
-    let settings = root.join("settings.xml");
-    write_settings(&settings, &[]);
-    std::fs::create_dir_all(root.join("seed")).unwrap();
-    let out = mvn.run(
-        &root.join("seed"),
-        &m2,
-        &settings,
-        &[
-            &format!("{DEPENDENCY_PLUGIN}:get"),
-            &format!("-Dartifact={GROUP}:{ARTIFACT}:{VERSION}"),
-        ],
-    );
-    if !ok(&out) {
-        skip(
-            SUITE,
-            &format!(
-                "seeding the maven repo from Central failed:\n{}",
-                dump(&out)
-            ),
-        );
-        return;
-    }
-    // Gradle verifies the standalone parent's import as well as the child's
-    // effective import. Maven does not fetch the former or their module metadata.
-    for version in ["5.9.0", "5.9.1"] {
-        let out = mvn.run(
-            &root.join("seed"),
-            &m2,
-            &settings,
-            &[
-                &format!("{DEPENDENCY_PLUGIN}:get"),
-                &format!("-Dartifact=org.junit:junit-bom:{version}:module"),
-                "-Dtransitive=false",
-            ],
-        );
-        assert!(ok(&out), "seeding imported BOM metadata:\n{}", dump(&out));
-    }
-    let jar =
-        std::fs::read(repo_dir(&m2, VERSION).join(format!("{ARTIFACT}-{VERSION}.jar"))).unwrap();
+    std::fs::create_dir_all(&m2).unwrap();
 
     let proj = root.join("proj");
     write_gradle_project(&proj);
@@ -709,6 +705,7 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
         );
         return;
     }
+    let jar = gradle_cached_jar(&gradle_home);
     let locked = lockfiles(&proj);
     for project in ["app", "lib"] {
         assert!(
@@ -751,7 +748,7 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
     stage_manifest(&proj, &orig, &patched);
     let before = snapshot(&proj);
 
-    let env = vendor(&proj, &m2);
+    let env = vendor_in(&proj, &m2, Some(&gradle_home));
     assert_eq!(env["summary"]["applied"], 1, "{env}");
     println!("vendor envelope: {env}");
     let vendored = snapshot(&proj);
@@ -798,7 +795,7 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
     );
 
     // Idempotent: a second vendor run changes no project file.
-    vendor(&proj, &m2);
+    vendor_in(&proj, &m2, Some(&gradle_home));
     let (changed, added, removed) = diff(&vendored, &snapshot(&proj));
     assert!(
         changed.iter().all(|p| p == ".socket/vendor/state.json")
@@ -878,7 +875,7 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
     println!("{SUITE}: Gradle {} green", gradle.version);
 
     // Byte-exact revert of the source project.
-    revert(&proj, &m2);
+    revert_in(&proj, &m2, Some(&gradle_home));
     assert_restored(&proj, &before);
     assert!(
         !proj.join(".socket/vendor").exists(),
