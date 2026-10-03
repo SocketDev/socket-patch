@@ -183,9 +183,13 @@ jobs:
   #   - every PR/push: version coherence — version-sync.sh must be a no-op,
   #     so a hand-edited version in any single packaging site fails CI here
   #     instead of surfacing mid-release;
-  #   - PRs that bump the workspace version (release/vX.Y.Z bump PRs): the
-  #     full gate — CHANGELOG has a dated, non-empty section for the new
-  #     version and the tag doesn't already exist.
+  #   - the release train's rolling `release-sync` PR (docs/release-train/
+  #     DESIGN.md §3.7), which moves main to the newest cut tag (rc or
+  #     stable): CHANGELOG has a non-empty section for that version and the
+  #     tag already exists;
+  #   - any other PR that bumps the workspace version: the full gate —
+  #     CHANGELOG has a dated, non-empty section for the new version and the
+  #     tag doesn't already exist.
   release-readiness:
     runs-on: ubuntu-latest
     steps:
@@ -198,7 +202,12 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$HEAD_REF" = "release-sync" ]; then
+            bash scripts/release-lint.sh --tag-exists
+            exit 0
+          fi
           if [ "$EVENT_NAME" = "pull_request" ]; then
             # Compare the workspace version against the PR base to detect a
             # version bump. The shallow checkout doesn't have the base

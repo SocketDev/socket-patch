@@ -1600,6 +1600,7 @@ scripts/version-sync.sh <new-version>
 This syncs the workspace package version into:
 
 - `Cargo.toml` (workspace version and the exact `socket-patch-core` dependency pin)
+- `Cargo.lock` (the workspace members' own entries)
 - `npm/socket-patch/package.json` (and its `optionalDependencies`) and `package-lock.json`
 - every per-platform `npm/socket-patch-*/package.json`
 
