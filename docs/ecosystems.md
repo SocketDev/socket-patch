@@ -176,9 +176,11 @@ restores it, so it is never overwritten. Patch it directly instead (vendored
 mode refuses it the same way, with `vendor_workspace_member`). Links into a
 store inside a `node_modules` tree, including a workspace member's link
 into the root `node_modules/.pnpm`, are patched as usual. So are links into
-Yarn's pnpm-linker store relocated outside `node_modules` (`pnpmStoreFolder`
-in the nearest `.yarnrc.yml`), as long as that store does not contain the
-project.
+Yarn's pnpm-linker store relocated outside `node_modules`, but only for an
+active Yarn pnpm install (a `yarn.lock`, and `nodeLinker: pnpm` with
+`pnpmStoreFolder` in the nearest `.yarnrc.yml`), only to a registry entry's
+`<store>/<name>-npm-<version>-<hash>/package` directory, and only when that
+store does not contain the project.
 
 Every command that looks for installed npm copies walks these same trees, not
 only `scan`. A package installed only under a pruned directory is therefore

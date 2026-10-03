@@ -34,7 +34,7 @@
 //! (pnpm's `.pnpm`, Yarn's `.store`, vlt's `.vlt`, bun's `.bun`, npm's
 //! linked `.store`) resolve inside a `node_modules` tree; the one exception,
 //! Yarn's pnpm-linker store relocated by `pnpmStoreFolder`, is recognized
-//! from the project's `.yarnrc.yml`.
+//! only for an active Yarn pnpm install and a registry entry's layout.
 
 use std::path::{Path, PathBuf};
 
@@ -221,27 +221,54 @@ fn linked_source_of(pkg_path: &Path, real: PathBuf) -> Option<SharedStore> {
     })
 }
 
-/// Whether `real` is an entry `<store>/<entry>/package` of Yarn's pnpm
-/// linker store relocated outside `node_modules` (`nodeLinker: pnpm` with
-/// `pnpmStoreFolder: .cache/.store`): an installed registry copy, not
-/// first-party source. `<store>` is the `pnpmStoreFolder` of the nearest
-/// `.yarnrc.yml` at or above the project that sets it, resolved against
-/// that file's directory as Yarn does. A store that contains the project
-/// itself (`pnpmStoreFolder: .`) is not honored, so the setting can never
-/// re-admit a workspace member's source.
+/// Whether `real` is an installed registry entry of Yarn's pnpm linker
+/// store relocated outside `node_modules` (`nodeLinker: pnpm` with
+/// `pnpmStoreFolder: .cache/.store`), not first-party source. Every part of
+/// that must hold, so that an inactive or stray `.yarnrc.yml` (an npm
+/// workspace carrying `pnpmStoreFolder: packages`) can never admit a
+/// workspace member:
+///
+/// * the project is a Yarn project: a `yarn.lock` at or above it;
+/// * the active linker is pnpm: the nearest `.yarnrc.yml` at or above the
+///   project that sets `nodeLinker` sets it to `pnpm`;
+/// * `<store>` is the `pnpmStoreFolder` of the nearest `.yarnrc.yml` that
+///   sets it, resolved against that file's directory as Yarn does, and does
+///   not contain the project (`pnpmStoreFolder: .`);
+/// * `real` is exactly `<store>/<entry>/package`, where `<entry>` is Yarn's
+///   slug of a registry locator, `<ident>-npm-<version>-<10 hex>`: the
+///   layout Yarn gives a hard (installed) package, never a workspace.
 fn in_yarn_pnpm_store(node_modules: &Path, real: &Path) -> bool {
     let Some(project) = node_modules.parent() else {
         return false;
     };
-    let Some(store) = project.ancestors().find_map(|dir| {
-        let rc = crate::utils::fs::read_regular_to_string_sync(&dir.join(".yarnrc.yml")).ok()?;
-        let value = crate::vendor::yarn_berry_lock::yarnrc_scalar(&rc, "pnpmStoreFolder")?;
-        (!value.is_empty()).then(|| dir.join(value))
-    }) else {
+    if !project
+        .ancestors()
+        .any(|dir| dir.join("yarn.lock").is_file())
+    {
+        return false;
+    }
+    let rcs: Vec<(&Path, String)> = project
+        .ancestors()
+        .filter_map(|dir| {
+            let rc = crate::utils::fs::read_regular_to_string_sync(&dir.join(".yarnrc.yml"));
+            rc.ok().map(|rc| (dir, rc))
+        })
+        .collect();
+    let nearest = |key: &str| {
+        rcs.iter().find_map(|(dir, rc)| {
+            crate::vendor::yarn_berry_lock::yarnrc_scalar(rc, key).map(|v| (*dir, v.to_string()))
+        })
+    };
+    if nearest("nodeLinker").is_none_or(|(_, linker)| linker != "pnpm") {
+        return false;
+    }
+    let Some((rc_dir, value)) = nearest("pnpmStoreFolder").filter(|(_, v)| !v.is_empty()) else {
         return false;
     };
-    let (Ok(store), Ok(project)) = (std::fs::canonicalize(store), std::fs::canonicalize(project))
-    else {
+    let (Ok(store), Ok(project)) = (
+        std::fs::canonicalize(rc_dir.join(value)),
+        std::fs::canonicalize(project),
+    ) else {
         return false;
     };
     if project.starts_with(&store) {
@@ -251,9 +278,23 @@ fn in_yarn_pnpm_store(node_modules: &Path, real: &Path) -> bool {
         return false;
     };
     let mut parts = rest.components();
-    parts.next().is_some()
+    let entry = parts.next().and_then(|c| c.as_os_str().to_str());
+    entry.is_some_and(is_yarn_registry_slug)
         && parts.next().is_some_and(|c| c.as_os_str() == "package")
         && parts.next().is_none()
+}
+
+/// `left-pad-npm-1.3.0-0123456789`, `@types-node-npm-20.1.0-abcdef0123`:
+/// Yarn's slug of an `npm:` locator, ending in ten hex digits of its hash.
+fn is_yarn_registry_slug(entry: &str) -> bool {
+    let Some((head, hash)) = entry.rsplit_once('-') else {
+        return false;
+    };
+    hash.len() == 10
+        && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        && head
+            .split_once("-npm-")
+            .is_some_and(|(ident, version)| !ident.is_empty() && !version.is_empty())
 }
 
 fn is_node_modules(dir: &Path) -> bool {
@@ -519,49 +560,108 @@ mod tests {
 
     /// Yarn's pnpm linker with a relocated `pnpmStoreFolder` links
     /// `node_modules/<name>` to `<store>/<entry>/package` outside every
-    /// `node_modules`: an installed copy, still patchable. The setting is
-    /// read from the nearest `.yarnrc.yml` at or above the project, and
-    /// cannot admit first-party source.
+    /// `node_modules`: an installed copy, still patchable. Only an active
+    /// Yarn pnpm install qualifies, and only a registry entry's `package`
+    /// dir, so the setting can never admit first-party source.
     #[cfg(unix)]
     #[tokio::test]
     async fn relocated_yarn_pnpm_store_is_not_refused() {
         use std::os::unix::fs::symlink;
+        let is_linked_source = |pkg: PathBuf| async move {
+            shared_store_of(&pkg).await.map(|s| s.kind) == Some(SharedStoreKind::LinkedSource)
+        };
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("ws");
         let nm = root.join("node_modules");
         std::fs::create_dir_all(&nm).unwrap();
         let store = root.join(".cache").join(".store");
-        let entry = store.join("left-pad-npm-1.3.0-x").join("package");
+        let entry = store.join("left-pad-npm-1.3.0-0123456789").join("package");
         std::fs::create_dir_all(&entry).unwrap();
         symlink(&entry, nm.join("left-pad")).unwrap();
         // A workspace member linked beside it stays refused.
         let member = root.join("packages").join("a");
         std::fs::create_dir_all(&member).unwrap();
         symlink(&member, nm.join("a")).unwrap();
-        // A link into the store that is not an entry's `package` dir.
-        symlink(store.join("left-pad-npm-1.3.0-x"), nm.join("odd")).unwrap();
+        // Store links that are not a registry entry's `package` dir.
+        symlink(store.join("left-pad-npm-1.3.0-0123456789"), nm.join("odd")).unwrap();
+        let soft = store
+            .join("b-workspace-packages-b-0123456789")
+            .join("package");
+        std::fs::create_dir_all(&soft).unwrap();
+        symlink(&soft, nm.join("b")).unwrap();
+        let refused = [nm.join("a"), nm.join("odd"), nm.join("b")];
 
-        // Without the setting, the relocated store is not recognized.
-        assert_eq!(
-            shared_store_of(&nm.join("left-pad")).await.map(|s| s.kind),
-            Some(SharedStoreKind::LinkedSource)
-        );
-
-        // Set in an ancestor's `.yarnrc.yml`, resolved against its dir.
+        // Without a Yarn pnpm install, the relocated store is not recognized.
+        assert!(is_linked_source(nm.join("left-pad")).await);
         std::fs::write(
             dir.path().join(".yarnrc.yml"),
             "nodeLinker: pnpm\npnpmStoreFolder: \"ws/.cache/.store\"\n",
         )
         .unwrap();
+        assert!(is_linked_source(nm.join("left-pad")).await, "no yarn.lock");
+
+        // With a yarn.lock, an ancestor's settings resolve against its dir.
+        std::fs::write(root.join("yarn.lock"), "").unwrap();
         assert_eq!(shared_store_of(&nm.join("left-pad")).await, None);
         // The project's own `.yarnrc.yml` wins over the ancestor's.
         std::fs::write(
             root.join(".yarnrc.yml"),
-            "nodeLinker: pnpm\npnpmStoreFolder: .cache/.store # relocated\n",
+            "pnpmStoreFolder: .cache/.store # relocated\n",
         )
         .unwrap();
         assert_eq!(shared_store_of(&nm.join("left-pad")).await, None);
-        for pkg in [nm.join("a"), nm.join("odd")] {
+        for pkg in &refused {
+            assert!(is_linked_source(pkg.clone()).await, "{}", pkg.display());
+        }
+        // An inactive linker setting turns the exception off.
+        std::fs::write(
+            root.join(".yarnrc.yml"),
+            "nodeLinker: node-modules\npnpmStoreFolder: .cache/.store\n",
+        )
+        .unwrap();
+        assert!(
+            is_linked_source(nm.join("left-pad")).await,
+            "node-modules linker"
+        );
+        // A store that contains the project is not honored.
+        std::fs::write(
+            root.join(".yarnrc.yml"),
+            "nodeLinker: pnpm\npnpmStoreFolder: .\n",
+        )
+        .unwrap();
+        assert!(
+            is_linked_source(nm.join("left-pad")).await,
+            "store contains project"
+        );
+    }
+
+    /// The review reproduction: an npm workspace whose stray `.yarnrc.yml`
+    /// names its `packages/` dir as a pnpm store. npm ignores the file, and
+    /// `node_modules/left-pad` is the first-party member `packages/foo/package`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stray_yarn_store_setting_does_not_admit_an_npm_workspace_member() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let nm = root.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        std::fs::write(root.join("package-lock.json"), "{}").unwrap();
+        std::fs::write(
+            root.join(".yarnrc.yml"),
+            "nodeLinker: node-modules\npnpmStoreFolder: packages\n",
+        )
+        .unwrap();
+        let member = root.join("packages").join("foo").join("package");
+        std::fs::create_dir_all(&member).unwrap();
+        symlink(&member, nm.join("left-pad")).unwrap();
+        let named = root
+            .join("packages")
+            .join("left-pad-npm-1.3.0-0123456789")
+            .join("package");
+        std::fs::create_dir_all(&named).unwrap();
+        symlink(&named, nm.join("named")).unwrap();
+        for pkg in [nm.join("left-pad"), nm.join("named")] {
             assert_eq!(
                 shared_store_of(&pkg).await.map(|s| s.kind),
                 Some(SharedStoreKind::LinkedSource),
@@ -569,19 +669,36 @@ mod tests {
                 pkg.display()
             );
         }
+        // Even an active-looking setting needs a yarn.lock and a registry slug.
+        std::fs::write(
+            root.join(".yarnrc.yml"),
+            "nodeLinker: pnpm\npnpmStoreFolder: packages\n",
+        )
+        .unwrap();
+        assert_eq!(
+            shared_store_of(&nm.join("left-pad")).await.map(|s| s.kind),
+            Some(SharedStoreKind::LinkedSource)
+        );
+    }
 
-        // A store that contains the project is not honored.
-        let member_entry = root.join("packages").join("b").join("package");
-        std::fs::create_dir_all(&member_entry).unwrap();
-        symlink(&member_entry, nm.join("b")).unwrap();
-        std::fs::write(root.join(".yarnrc.yml"), "pnpmStoreFolder: .\n").unwrap();
-        for pkg in [nm.join("left-pad"), nm.join("b")] {
-            assert_eq!(
-                shared_store_of(&pkg).await.map(|s| s.kind),
-                Some(SharedStoreKind::LinkedSource),
-                "{}",
-                pkg.display()
-            );
+    #[test]
+    fn yarn_registry_slugs() {
+        for ok in [
+            "left-pad-npm-1.3.0-0123456789",
+            "@types-node-npm-20.1.0-abcdef0123",
+        ] {
+            assert!(is_yarn_registry_slug(ok), "{ok}");
+        }
+        for bad in [
+            "package",
+            "foo",
+            "left-pad-npm-1.3.0-x",
+            "left-pad-npm-1.3.0-012345678",
+            "left-pad-npm-1.3.0-0123456789a",
+            "b-workspace-packages-b-0123456789",
+            "-npm-1.0.0-0123456789",
+        ] {
+            assert!(!is_yarn_registry_slug(bad), "{bad}");
         }
     }
 
