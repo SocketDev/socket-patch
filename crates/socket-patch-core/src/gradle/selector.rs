@@ -7,8 +7,9 @@
 //! non-numeric part makes a version lower) and above every earlier
 //! release. The hosted settings script carries a Groovy port of this
 //! module; the `GOLDEN_*` tables are the shared cases both ports are tested
-//! against, and `tests/gradle_selector_golden.rs` checks them against real
-//! Gradle.
+//! against, and socket-patch-cli's real-Gradle hosted suite
+//! (`e2e_redirect_gradle_build`, every hosted grid cell) checks them against
+//! real Gradle's own comparator.
 //!
 //! Two behaviours changed in Gradle 7 (measured on 6.9.4 against 7.6.6,
 //! 8.14.3 and 9.8.0), so the `*_for` functions take the Gradle major:
