@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled PDM bug-hunt routine (label pm:pdm).
 
-Last run: 2026-10-03 03:15Z on main `045d7ec` (latest tag v4.0.0; #522 and #540 merged; #332/#451/#502/#528 closed by maintainers). Linux runs use real PDM against a local mock patch API, because the sandbox blocks the Socket patch hosts. macOS and Windows runs use probe branches.
+Last run: 2026-10-03 09:18Z on main `045d7ec` (latest tag v4.0.0; #522 and #540 merged; #332/#451/#502/#528 closed by maintainers). Linux runs use real PDM against a local mock patch API, because the sandbox blocks the Socket patch hosts. macOS and Windows runs use probe branches.
 
 ## Coverage matrix
 | PDM | lock_version | agent (Linux / macOS / Windows) | hosted (Linux) | vendored (Linux) |
@@ -26,7 +26,11 @@ Last run: 2026-10-03 03:15Z on main `045d7ec` (latest tag v4.0.0; #522 and #540 
 | 1.6.4 | 3 | untested | refused (pass) | refused (pass) |
 | 1.4.5 / 2.8.2 / 2.10.4 | 2 / 4.3 / 4.4 | — | warm env warns (pass) | warm env: no stale warning, `pdm sync`/`install` keep upstream, vex attests: **fail #641** |
 | 2.11.2 / 2.29.2 | 4.4.1 / 4.5.1 | — | — | warm env re-installs patched (pass) |
-| 1.8 – 1.14 | 3.1 | untested | untested | untested |
+| 1.8.5 / 1.12.8 | 3 / 3.1 | pass (plain venv); `feature.install_cache` symlink → refused, cache untouched (pass); pth → fails closed (pass) | refused (documented) | refused (documented) |
+| 1.4.5 / 1.5.3 | 2 | — | warm PEP 582 `__pypackages__`: warns, vex fails closed (pass) | warm PEP 582 `__pypackages__`: **fail #641**; no `pdm sync --reinstall` on these releases |
+| 2.15.4 | 4.4.1 | — | — | pass (direct, dev group, `--static-urls --strategy no_cross_platform`, `pdm export` → pip install) |
+| 2.26.9 | 4.5.0 | dotted name `jaraco.context` pass | PEP 735 `include-group` pass; dotted name pass | pass (direct, dev, optional `install --frozen-lockfile`, `--static-urls`, PEP 735, `pdm export`, dotted name) |
+| 2.29.2 | 4.5.1 | `PDM_PYTHON` / CRLF `.pdm-python` / activated stray venv precedence pass (space+unicode path) | PEP 735 `include-group` pass | PEP 735 pass; `pdm export` pass |
 
 Modes × macOS/Windows for hosted and vendored: untested by this routine (the repo's pdm-compatibility.yml covers them).
 
@@ -48,13 +52,14 @@ Modes × macOS/Windows for hosted and vendored: untested by this routine (the re
 `-g --mode hosted` and `--global-prefix --mode hosted` refuse with exit 2 (pass). `SOCKET_GLOBAL=1` matches `-g` (pass). `--global-prefix <site-packages>` finds both #451 locations (pass).
 
 ## Backlog
-1. #641 follow-ups: vendored on a warm PEP 582 `__pypackages__` (PDM 1.x); per-version `pdm sync --reinstall` remedy.
-2. #609 on macOS / Windows user-config paths, site config, `PDM_CONFIG_FILE`. (PDM ≥ 2.27 string `venv.in_project` doesn't matter: socket-patch never reads it and follows `.pdm-python` instead.)
+1. Once PR #611 merges: re-run #609 / #566 on main; then #609 on macOS / Windows user-config paths, site config, `PDM_CONFIG_FILE`.
+2. Hosted / vendored on macOS / Windows via a probe branch that ships the Python mock (pdm-compatibility.yml has no Windows cells). (PDM ≥ 2.27 string `venv.in_project` doesn't matter: socket-patch never reads it and follows `.pdm-python` instead.)
 3. #566 on macOS / Windows site-config paths and site-config `venv.location` / `python.install_root` (use a non-3.11 interpreter). PDM 1.x global project (`~/.pdm/global-project`) under `-g`.
 4. Re-run #477 / #413 on main once `patch/redirect/pdm.rs` or `upstream/pypi_locks.rs` change (hosted mock: references + view).
 5. Hash variant of #413 (private index serving different bytes); PDM 1.x `feature.install_cache` with agent mode; PDM 1.8 – 1.14 agent cells.
 6. macOS / Windows probes (branch deletion through the proxy / permission policy has failed before; the stale `bughunt/pdm/20260930-cache-symlink` needs a maintainer to delete it).
-7. Done: PDM 0.12.3 / 1.0.0 / 1.5.3 hosted + vendored fresh; #502/#528 on main for 1.4.5 / 1.15.5 / 2.0.3 agent PEP 582; CRLF lock_version 2, SIGKILL-interrupted scans, groups, relocks, `pdm add` after hosted/vendored, CRLF / mixed / BOM locks, extras, `rollback --preserve-state`, concurrent scans, space/unicode paths.
+7. Dotted / underscore names when the API returns the dash-normalized purl; PDM 2.8.0 re-check.
+8. Done: #641 PEP 582 follow-up + per-version remedy (commented on #641); PDM 1.8.5 / 1.12.8 install_cache agent; vendored 2.15.4 / 2.26.9; PEP 735 groups; `pdm export`; dotted names; interpreter precedence. PDM 0.12.3 / 1.0.0 / 1.5.3 hosted + vendored fresh; #502/#528 on main for 1.4.5 / 1.15.5 / 2.0.3 agent PEP 582; CRLF lock_version 2, SIGKILL-interrupted scans, groups, relocks, `pdm add` after hosted/vendored, CRLF / mixed / BOM locks, extras, `rollback --preserve-state`, concurrent scans, space/unicode paths.
 
 ## Known non-bugs
 - lock_version absent / 3.1 / 4.0–4.2 refused; 2.8.0 accepted-but-crashes (documented).
@@ -92,3 +97,7 @@ Modes × macOS/Windows for hosted and vendored: untested by this routine (the re
 - `lock_version` by release: 1.5.x writes `2` (supported, installs fine), 1.6.x writes `3` and 1.7.x writes `3.1` (both refused, lock untouched). pdm-compatibility.md's "0.12 – 1.4" / "1.8 – 1.15" ranges are slightly off (doc drift only).
 - The vendored `vex` attestation over an out-of-sync installed tree is by design (the `vendored_tree_out_of_sync` disclosure). #641 covers only the missing scan warning and the remedy on PDM < 2.11.
 - Test-harness note: PDM 1.5.x needs `resolvelib==0.7.0`; PDM 1.x `pdm sync` exits 1 on a throwaway `[project]` without `[tool.pdm] distribution = false` (self-install), unrelated to socket-patch.
+- `scan --mode agent --json` after a refused apply (PDM cache symlink) shows `partial_failure` with `failed: 0` and no reason: that's the generic #424, not PDM-specific.
+- The "PDM 0.x may regenerate freshly generated locks" warning also fires on PDM 1.4.5 / 1.5.3 lock_version 2 locks (it can't tell them apart). Harmless.
+- `PDM_PYTHON=<venv dir>` (not an interpreter) is ignored by PDM itself, which falls back to `.venv`; socket-patch agrees.
+- Test-harness note: hosted rollback needs `SOCKET_PYPI_JSON_API` pointed at a local pass-through (reqwest can't reach pypi.org directly in the sandbox). Never `pgrep -f`/`pkill -f` the mock (it matches the shell); use pid files.
