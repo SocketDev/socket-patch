@@ -1,5 +1,5 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-03T09:51Z · main @ 045d7ec_
+_Last updated 2026-10-03T15:50Z · main @ 045d7ec_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -16,11 +16,11 @@ _Last updated 2026-10-03T09:51Z · main @ 045d7ec_
 | C11 | 2 | Tracking: split `run_scan` (1,499 lines; mode booleans referenced 91 times) into discover → select → `ModeBackend::consume` → render. | 2.2; R5 | | to verify |
 | C12 | 2 | Tracking: move engine code out of the CLI and into core behind one orchestrator over `ProjectView`. That covers `vendor_records_reusing` (962 lines), `run_redirect_selected` (836) and `ecosystem_dispatch.rs` (816). Coordinate with E32. | 2.1; R11 | | to verify |
 | C13 | 2 | Error codes are untyped. Target: a typed registry (`enum Reason × Ecosystem`) that generates the contract's code tables, plus a freshness test. Today ~65 codes are undocumented and 1 is phantom. | 2.8; 3.7 #8; 8.5 F | | to verify |
-| C14 | 2 | Decide: one JSON envelope. `scan`, `get` and `rollback` still emit a bare-string `error`, while the other commands emit `{code, message}`. | 2.8; R4 | | to verify |
+| C14 | 2 | Decide: one JSON envelope. `scan`, `get` and `rollback` still emit a bare-string `error`, while the other commands emit `{code, message}`. | 2.8; R4 | #704 | decision #704 |
 | C15 | 2 | There are three HTTP retry systems, and blob and diff fetches have none. A 206-line HTTP-date parser, two near-identical downloaders, and per-fetch or per-event clients round it out. Target: one retry + timeout primitive. | 7.2; R12 | #676, #677 | filed #676, #677 |
 | C16 | 2 | Batch limits are split across crates. The CLI owns 500 / 100 / 256 KiB, and `search_patches_batch` documents a maximum of 500 without enforcing it. The in-memory engine keeps a third copy (default 100, no body cap). | 7.2 | #675 | filed #675 |
-| C17 | 2 | Digest helpers are duplicated: ~30 inline `hex::encode(Sha256::digest(..))` sites, and `sha256_hex` copies that *compute* beside a `utils::digest::sha256_hex` that *validates*. `sha1_hex` exists twice, and SRI formatting is inlined three times. | 4.4; 7.3 | | to verify |
-| C18 | 2 | There are four UUID grammars. `client.rs` has one, CLI `lib.rs` a byte-identical copy, `path_safety.rs` accepts lowercase only, and `apply.rs` accepts any alphanumeric plus `-`/`_`. | 7.3 | | to verify |
+| C17 | 2 | Digest helpers are duplicated: ~30 inline `hex::encode(Sha256::digest(..))` sites, and `sha256_hex` copies that *compute* beside a `utils::digest::sha256_hex` that *validates*. `sha1_hex` exists twice, and SRI formatting is inlined three times. | 4.4; 7.3 | #706 | filed #706 |
+| C18 | 2 | There are four UUID grammars. `client.rs` has one, CLI `lib.rs` a byte-identical copy, `path_safety.rs` accepts lowercase only, and `apply.rs` accepts any alphanumeric plus `-`/`_`. | 7.3 | #705 | filed #705; a fifth grammar (`Uuid::parse_str` in `python_script.rs`) |
 | C19 | 2 | Env truthiness has three vocabularies, and there are 37 inline "empty means unset" reads and four home-directory resolvers. | 7.3 | | to verify |
 | C20 | 2 | Purls have two builder families in `utils/purl.rs`, plus 78 hand-built `pkg:` strings and 58 `starts_with("pkg:<type>/")` checks that bypass `Ecosystem::from_purl`. | 6.4; 7.3 | | to verify |
 | C21 | 3 | `utils/fs.rs` has six atomic writers, and separate stage + rename code lives in `blob_fetcher` and `update/`. Writes that bypass `utils::fs` (`blob_fetcher.rs`) escape group commit. | 5.7; 7.3 | | to verify |
@@ -43,6 +43,7 @@ _Last updated 2026-10-03T09:51Z · main @ 045d7ec_
 | C38 | 2 | The public-proxy per-package fallback keeps a private cap of 10, ignoring `SOCKET_API_CONCURRENCY`, the proxy cap of 4 and the fd-limit rule; `registry_concurrency()` has no caller. | new finding | #614 | filed #614 |
 | C39 | 2 | The 401/403 proxy fallback is missing beyond `get` search: `apply`, `rollback` and `repair` blob/diff downloads and `vendor` eject view fetches fail on a stale token, although the contract promises eject `get`'s fallback. Fix: the fallback moves into `ApiClient`. | new finding | #647 | filed #647 |
 | C40 | 3 | `SOCKET_API_CONCURRENCY` and `SOCKET_WALK_THREADS` are read by core but documented nowhere; only clap-bound env vars have a guard test. | new finding | #678 | filed #678 |
+| C41 | 2 | Hash case policy is per site: blob download compares case-insensitively and the validators accept uppercase, but agent-mode apply/rollback verify with exact `==`, so an uppercase manifest hash never verifies. Vendored verify sites are split the same way. | new finding | #707 | filed #707 |
 
 **Handed off** (to the CI janitor): report-only coverage and LTO `docker-base` off PRs; e2e from 148 to ~50 legs; a reusable compat workflow; no per-leg compiles; dead CI path filters (review 8.2, 8.5 B/C/E).
 

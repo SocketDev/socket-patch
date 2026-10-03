@@ -116,7 +116,7 @@ $ socket-patch get nope --offline --json             → {"status":"error","erro
 ```
 
 - `repair`, `remove` and `vex` use the envelope, with an `error` object that carries a stable `code`.
-- `scan`, `get` and `rollback` emit a **bare-string `error` with no code**, so a script cannot branch on it.
+- `scan`, `get` and `rollback` have no fixed `error` type. `rollback` always emits a bare string, but `scan` and `get` each emit a bare string on some paths and a `{code, message}` object on others (scan's embedded-VEX failure, get's vendored failure); `get`'s lock failure adds a sibling `errorCode`. A script must type-check `.error` before reading it. {{C14}}
 - Status is `partialFailure` in the envelope but `partial_failure` in the legacy shapes.
 - `get --mode vendored` nests an `Envelope` inside a legacy object.
 - The contract's "Migration status (v3.0)" section still says scan, get and rollback "will migrate in a follow-up PR". That was two majors ago.
