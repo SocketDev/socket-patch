@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-03T04:00Z · main @ 045d7ec_
+_Last updated 2026-10-03T05:58Z · main @ 045d7ec_
 
 **In flight:**
 - [#574](https://github.com/SocketDev/socket-patch/pull/574): one vlt `registry_base` following vlt's DepID hydration. Issues #562 (E02, E03). State: ready (Ready for review). It awaits human approval.
@@ -20,7 +20,7 @@ _Last updated 2026-10-03T04:00Z · main @ 045d7ec_
 | 4 | #629 + #628 (E09, E51): one `formats/yarn/berry_gates.rs` for both modes; hosted refuses a mixed-EOL root `package.json` | 1 | 0 | 3 | M | 4 | skipped: `redirect/mod.rs` (#597) and `scan/hosted.rs` (#598) changed by open PRs |
 | 5 | #647 (C09, C39): 401/403 proxy fallback moves into `ApiClient`; delete the scan/get/vex copies | 1 | 0 | 3 | M | 4 | skipped: `api/client.rs` changed by open PRs #607 and #610; check #648 (C07 decision) doesn't gate it |
 
-At capacity (3 open, all ready, all reviewed "ready to merge") on 2026-10-03T01:05Z; re-ranked with the new issues #628–#631, no new work started (blockers #597, #598, #602, #607, #610 still open). Next: #631 (E52, go.sum oracle delete + move to `formats/golang`), score 3.5 (D3.5 R L), skipped while #597 changes `redirect/mod.rs`. Dropped C07 from the queue: needs an owner decision on the fallback route. Taken: #571 (C37) in #607, score 2 (B1 D1 R M). Re-ranked 2026-10-03T04:00Z with #647 (C09/C39) and #649 (C08, hygiene, score ≈1); still at capacity, no new work. #614 (C38, score 4) drops to sixth. #648 is a decision. Checked and set aside: E13 (`poetry_lock`/`pdm_lock`): the fragment walkers differ in real format handling, not just one shape check.
+At capacity (3 open, all ready, all reviewed "ready to merge") on 2026-10-03T01:05Z; re-ranked with the new issues #628–#631, no new work started (blockers #597, #598, #602, #607, #610 still open). Next: #631 (E52, go.sum oracle delete + move to `formats/golang`), score 3.5 (D3.5 R L), skipped while #597 changes `redirect/mod.rs`. Dropped C07 from the queue: needs an owner decision on the fallback route. Taken: #571 (C37) in #607, score 2 (B1 D1 R M). Re-ranked 2026-10-03T04:00Z with #647 (C09/C39) and #649 (C08, hygiene, score ≈1); still at capacity, no new work. #614 (C38, score 4) drops to sixth. #648 is a decision. Re-ranked 2026-10-03T05:58Z: no new `arch-audit`/`refactor` issues, nothing merged, blockers still open; queue unchanged. Checked and set aside: E13 (`poetry_lock`/`pdm_lock`): the fragment walkers differ in real format handling, not just one shape check.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
