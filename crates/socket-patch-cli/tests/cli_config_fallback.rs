@@ -59,7 +59,8 @@ fn scan_cmd(project: &Path, data_dir: &Path) -> Command {
     let mut cmd = Command::new(BINARY);
     // Human mode: core's proxy advisory (the oracle below) is muted under
     // `--json`/`--silent`.
-    cmd.args(["scan", "-e", "npm", "--cwd"]).arg(project);
+    cmd.args(["scan", "-e", "npm", "--cwd"])
+        .arg(project);
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
         if name.starts_with("SOCKET_") {
@@ -297,9 +298,7 @@ async fn corrupt_config_warns_and_keeps_json_stdout_clean() {
     json_cmd.arg("--json");
     let json_out = run(json_cmd);
     assert!(
-        json_out
-            .stderr
-            .contains("could not parse socket-cli config"),
+        json_out.stderr.contains("could not parse socket-cli config"),
         "the parse warning must reach stderr under --json too; got:\n{}",
         json_out.stderr
     );

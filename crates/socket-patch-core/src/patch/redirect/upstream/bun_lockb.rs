@@ -332,10 +332,7 @@ mod tests {
         let package_start = u64::from_le_bytes(lock[110..118].try_into().unwrap()) as usize;
         // The root resolution's flag byte (its last).
         let flags_at = package_start + count * 16 + 63;
-        assert_eq!(
-            lock[flags_at],
-            crate::vendor::bun_lockb::NORMALIZED_FORMAT_1
-        );
+        assert_eq!(lock[flags_at], crate::vendor::bun_lockb::NORMALIZED_FORMAT_1);
         lock[flags_at] |= 0x40;
         BunLockb::parse(&lock).unwrap().validate_mutation().unwrap();
         let (outcome, after) = run(&lock, &vendor_opts()).await;

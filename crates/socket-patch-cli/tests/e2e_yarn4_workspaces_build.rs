@@ -566,9 +566,9 @@ async fn yarn4_workspaces_hosted_redirect_rewires_member_dep_from_root_scan() {
     let root_pkg = std::fs::read_to_string(proj.join("package.json")).unwrap();
     let root_pkg: serde_json::Value = serde_json::from_str(&root_pkg).unwrap();
     assert!(
-        root_pkg["resolutions"].as_object().is_some_and(|r| r
-            .iter()
-            .any(|(sel, v)| sel.starts_with(&format!("{DEP}@npm:"))
+        root_pkg["resolutions"]
+            .as_object()
+            .is_some_and(|r| r.iter().any(|(sel, v)| sel.starts_with(&format!("{DEP}@npm:"))
                 && v.as_str() == Some(hosted_url.as_str()))),
         "package.json must route {DEP} to the hosted tarball: {root_pkg}"
     );
@@ -596,10 +596,7 @@ async fn yarn4_workspaces_hosted_redirect_rewires_member_dep_from_root_scan() {
             serde_json::from_slice(&std::fs::read(proj.join("package.json")).unwrap()).unwrap();
         let before: serde_json::Value = serde_json::from_slice(&root_pkg_before).unwrap();
         after.as_object_mut().unwrap().shift_remove("resolutions");
-        assert_eq!(
-            after, before,
-            "the hosted pin only adds `resolutions` to the root package.json"
-        );
+        assert_eq!(after, before, "the hosted pin only adds `resolutions` to the root package.json");
     }
     assert_eq!(
         std::fs::read(proj.join("packages/app/package.json")).unwrap(),
@@ -633,10 +630,7 @@ async fn yarn4_workspaces_hosted_redirect_rewires_member_dep_from_root_scan() {
     eprintln!("FRESH INSTALL + MEMBER RESOLUTION OK");
 
     // MANIFEST-LESS VEX over the hosted wiring (see `yarn_berry_common`).
-    let registry_state = [
-        ("yarn.lock", registry_lock),
-        ("package.json", root_pkg_before.clone()),
-    ];
+    let registry_state = [("yarn.lock", registry_lock), ("package.json", root_pkg_before.clone())];
     let yarn =
         |cwd: &Path, args: &[&str], env: &[(&str, &str)]| corepack(cwd, yarn_berry(), args, env);
     let api_url = server.uri();
