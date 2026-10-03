@@ -1342,6 +1342,62 @@ async fn rush_transitive_dep_in_common_temp_store_is_patched() {
     );
 }
 
+/// REGRESSION (#661): with pnpm 10.12+ `modulesDir: deps`, pnpm installs
+/// into `deps/.pnpm` and there is no `node_modules`. Agent-mode apply
+/// reported the package not installed ("resolved by the project
+/// lockfile") and exited 0 with it unpatched; the store copy is now
+/// patched.
+#[tokio::test]
+#[serial]
+async fn pnpm_modules_dir_install_is_patched() {
+    for (file, text) in [
+        ("pnpm-workspace.yaml", "modulesDir: deps\n"),
+        (".npmrc", "modules-dir=deps\n"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "app", "version": "1.0.0", "dependencies": { "left-pad": "1.3.0" } }"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(file), text).unwrap();
+        std::fs::write(
+            root.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      left-pad:\n        \
+             specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n  left-pad@1.3.0:\n    \
+             resolution: {integrity: sha512-upstream==}\n\nsnapshots:\n  left-pad@1.3.0: {}\n",
+        )
+        .unwrap();
+        let pkg = root.join("deps/.pnpm/left-pad@1.3.0/node_modules/left-pad");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{ "name": "left-pad", "version": "1.3.0" }"#,
+        )
+        .unwrap();
+        let original = b"module.exports = leftPad;\n".to_vec();
+        std::fs::write(pkg.join("index.js"), &original).unwrap();
+        let before_hash = git_sha256(&original);
+        let mut patched = original.clone();
+        patched.extend_from_slice(b"\n// SOCKET-PATCH-PNPM-MODULES-DIR-MARKER\n");
+        let after_hash = git_sha256(&patched);
+        let socket = root.join(".socket");
+        write_manifest(&socket, "pkg:npm/left-pad@1.3.0", &before_hash, &after_hash);
+        let blobs = socket.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join(&after_hash), &patched).unwrap();
+
+        let code = apply_run(default_apply(root)).await;
+        assert_eq!(
+            code, 0,
+            "{file}: apply must find the pnpm modulesDir store copy"
+        );
+        assert_patched(&pkg.join("index.js"), &patched, &before_hash, &after_hash);
+        assert!(!root.join("node_modules").exists());
+    }
+}
+
 /// REGRESSION (#493): with `.yarnrc` `--modules-folder deps`, yarn classic
 /// installs into `deps/` and there is no `node_modules`. Agent-mode apply
 /// reported the package `package_not_installed` (exit 0 from `scan`,
