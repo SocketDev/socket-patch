@@ -5179,6 +5179,120 @@ pub(crate) fn gem_line_trailing_options(tail: &str) -> String {
     }
 }
 
+/// Why the argument tail of a one-line `gem "name"…` declaration can't be
+/// rewritten in place (`None` = safe). Both Gemfile rewriters replace the
+/// declaration's LINE, so the tail must be the whole declaration: a `,`-led
+/// option list that ends on this line and carries no modifier. Anything else
+/// is refused fail-closed (#340):
+/// - a tail that continues on the next line (a dangling `,`, `=>`, key, `\`,
+///   an unclosed bracket or string) would leave the continuation orphaned
+///   after the rewrite, and bundler refuses the Gemfile;
+/// - a modifier (`if` / `unless` / `while` / `until` / `rescue` / `and` /
+///   `or`) or a `do` block would be dropped, silently changing when the gem
+///   is declared.
+///
+/// Only code outside ordinary string literals and before a `#` comment
+/// counts, so a keyword or `,` inside `require: "…"` or a comment is fine.
+/// Double-quoted interpolation can execute a heredoc, so its presence with
+/// a possible `<<` opener is refused conservatively too.
+/// Shared with the vendor backend's Gemfile rewrite (`vendor::gem`).
+pub(crate) fn gem_line_tail_blocks_edit(tail: &str) -> Option<String> {
+    const CONTINUES: &str = "the declaration continues on the next line";
+    let mut code = String::new();
+    let mut quote: Option<char> = None;
+    let mut interpolated = false;
+    let mut quoted_operator = false;
+    let mut depth: i64 = 0;
+    let mut chars = tail.chars();
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if c == '\\' {
+                chars.next();
+            } else if c == q {
+                quote = None;
+            } else if q == '"' && c == '#' && chars.as_str().starts_with('{') {
+                interpolated = true;
+            } else if c == '<' && chars.as_str().starts_with('<') {
+                quoted_operator = true;
+            }
+            // String contents never count as code: keep a placeholder so
+            // word boundaries and the final character stay meaningful.
+            code.push(if c == q && quote.is_none() { c } else { 'x' });
+            continue;
+        }
+        match c {
+            '#' => break,
+            '"' | '\'' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        code.push(c);
+    }
+    if quote.is_some() || depth > 0 {
+        return Some(CONTINUES.to_string());
+    }
+    let code = code.trim();
+    if code.is_empty() {
+        return None;
+    }
+    if depth < 0 || !code.starts_with(',') {
+        return Some("unexpected tokens after the gem name".to_string());
+    }
+    let last = code.chars().next_back().unwrap_or(',');
+    if !(last.is_alphanumeric() || matches!(last, '_' | '"' | '\'' | ')' | ']' | '}' | '?' | '!')) {
+        return Some(CONTINUES.to_string());
+    }
+    // A heredoc body lives on the following lines, past where the rewrite
+    // would insert its closing `end`. Interpolation is executable Ruby too
+    // (`"#{<<~NAME}"`), so do not let quote masking hide its opener. Literal
+    // and escaped-interpolation lookalikes remain masked.
+    if code.contains("<<") || (interpolated && quoted_operator) {
+        return Some(CONTINUES.to_string());
+    }
+    let bytes = code.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_ident(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_ident(bytes[i]) {
+            i += 1;
+        }
+        let word = &code[start..i];
+        // A symbol (`:if`), method call (`.if`) or variable sigil is a name,
+        // not a keyword; so is a predicate (`if?`). `if:` is a hash key only
+        // where an argument can start (after `,`, `(` or `{`) and not `if::`;
+        // straight after a value, `if:FLAG` is a modifier on symbol `:FLAG`.
+        let prev_ok = start == 0 || !matches!(bytes[start - 1], b':' | b'.' | b'@' | b'$');
+        let arg_start = matches!(
+            code[..start].trim_end().as_bytes().last(),
+            Some(b',' | b'(' | b'{')
+        );
+        let next_ok = match bytes.get(i) {
+            Some(b'?' | b'!') => false,
+            Some(b':') => !(arg_start && bytes.get(i + 1) != Some(&b':')),
+            _ => true,
+        };
+        if !(prev_ok && next_ok) {
+            continue;
+        }
+        match word {
+            "if" | "unless" | "while" | "until" => {
+                return Some(format!("conditional declaration (`{word}` modifier)"));
+            }
+            "rescue" | "and" | "or" | "do" => {
+                return Some(format!("a trailing `{word}` after the declaration"));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The source-selecting option a `gem` line's argument tail carries, if any
 /// (only the code before any `#` comment counts). Bundler allows ONE source
 /// per gem, so an option like `git:` preserved into the Socket source block
@@ -5697,6 +5811,20 @@ fn rewrite_gem(
                         result.warnings.push(RewriteWarning {
                             code: "redirect_gem_source_option".into(),
                             detail,
+                        });
+                        continue;
+                    }
+                    // Only a whole one-line declaration can move into the
+                    // block: a continuation would be orphaned after `end`
+                    // and a modifier silently dropped (#340).
+                    if let Some(reason) = gem_line_tail_blocks_edit(&tail) {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_gem_unrecognized_declaration".into(),
+                            detail: format!(
+                                "the `gem \"{}\"` declaration is in a form the \
+                                 rewriter cannot safely edit ({reason}); redirect skipped",
+                                dep.name
+                            ),
                         });
                         continue;
                     }
@@ -12366,6 +12494,181 @@ mod tests {
                 1,
                 "the one declaration is rewritten, nothing appended: {out}"
             );
+        }
+    }
+
+    /// #340: a declaration whose tail continues on the next line, or that
+    /// carries a modifier (`if` / `unless` / …), is not a single-line
+    /// declaration the rewriter can move into a source block. Rewriting it
+    /// orphans the continuation after `end` (bundler refuses the Gemfile) or
+    /// silently drops the condition. Fail closed and leave both files alone.
+    #[test]
+    fn gemfile_multi_line_or_conditional_declaration_fails_closed() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    vuln-gem (1.0.0)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  vuln-gem\n\n\
+                    BUNDLED WITH\n   4.0.17\n";
+        for decl in [
+            // Continuations: a dangling `,`, `=>`, key, backslash, open bracket.
+            "gem \"vuln-gem\",\n  require: false",
+            "gem \"vuln-gem\", # keep it lazy\n  require: false",
+            "gem \"vuln-gem\",\r\n  require: false",
+            "gem \"vuln-gem\", :require =>\n  false",
+            "gem \"vuln-gem\", require:\n  false",
+            "gem \"vuln-gem\", \"1.0.0\", \\\n  require: false",
+            "gem \"vuln-gem\", platforms: [:mri,\n  :mingw]",
+            "gem \"vuln-gem\", platforms: [\n  :mri]",
+            "gem \"vuln-gem\", require: \"vuln\n/gem\"",
+            "gem(\"vuln-gem\",\n  require: false)",
+            // Modifiers and other non-option tails.
+            "gem \"vuln-gem\" if true",
+            "gem \"vuln-gem\" if ENV[\"WITH_VULN\"] != \"0\"",
+            "gem \"vuln-gem\", require: false if ENV[\"CI\"]",
+            "gem \"vuln-gem\", \"1.0.0\"\tunless RUBY_VERSION < \"3\"",
+            "gem \"vuln-gem\", \"1.0.0\" if(ENV[\"CI\"])",
+            "gem \"vuln-gem\", require: false rescue nil",
+            "gem(\"vuln-gem\") if true",
+            "gem \"vuln-gem\" do",
+            // A label-looking modifier straight after a value, and a heredoc.
+            "gem \"vuln-gem\", \"1.0.0\" if::FEATURE",
+            "gem \"vuln-gem\", \"1.0.0\" unless::FEATURE",
+            "gem \"vuln-gem\", \"1.0.0\" if:enabled == ENV[\"MODE\"].to_sym",
+            "gem \"vuln-gem\", require: <<~REQ.strip\n  vuln\nREQ",
+        ] {
+            let gemfile = format!("source \"https://rubygems.org\"\n\n{decl}\n");
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.clone());
+            files.insert("Gemfile.lock".to_string(), lock.to_string());
+            let r = rewrite_registry_redirect(&files, &[gem_override("vuln-gem", "1.0.0")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{decl:?} must not be rewritten: files={:?} edits={:?}",
+                r.files,
+                r.edits
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_unrecognized_declaration"],
+                "{decl:?}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn gemfile_quoted_and_interpolated_heredocs_fail_closed() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    vuln-gem (1.0.0)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  vuln-gem\n\n\
+                    BUNDLED WITH\n   4.0.17\n";
+        for decl in [
+            "gem \"vuln-gem\", require: <<'REQUIRE_PATH'\nvuln-gem\nREQUIRE_PATH",
+            "gem(\"vuln-gem\", require: <<\"REQUIRE_PATH\")\nvuln-gem\nREQUIRE_PATH",
+            "gem \"vuln-gem\", require: \"#{<<~REQUIRE_PATH}\".chomp\n  vuln_gem\nREQUIRE_PATH",
+        ] {
+            let gemfile = format!("source \"https://rubygems.org\"\n{decl}\n");
+            let files = BTreeMap::from([
+                ("Gemfile".to_string(), gemfile),
+                ("Gemfile.lock".to_string(), lock.to_string()),
+            ]);
+            let r = rewrite_registry_redirect(&files, &[gem_override("vuln-gem", "1.0.0")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{decl:?} must not be rewritten: {:?}",
+                r.files
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_unrecognized_declaration"],
+                "{decl:?}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn gem_line_tail_colon_and_heredoc_syntax_is_not_confused_with_literals() {
+        for tail in [
+            ", \"1.0.0\" if::FEATURE",
+            ", \"1.0.0\" unless::FEATURE",
+            ", \"1.0.0\" if:enabled == ENV[\"MODE\"].to_sym",
+            ", require: <<~REQUIRE_PATH.chomp",
+            ", require: <<'REQUIRE_PATH'",
+            ", require: <<\"REQUIRE_PATH\"",
+            ", require: \"#{<<~REQUIRE_PATH}\".chomp",
+        ] {
+            assert!(gem_line_tail_blocks_edit(tail).is_some(), "{tail:?}");
+        }
+        for tail in [
+            ", require: \"<<REQUIRE_PATH\"",
+            ", require: '<<~REQUIRE_PATH'",
+            ", require: '#{<<REQUIRE_PATH}'",
+            ", require: \"\\#{<<REQUIRE_PATH}\"",
+            ", require: \"#{ENV['REQUIRE_PATH']}\"",
+            ", require: \"#{ENV['REQUIRE_PATH']}\" # <<NOT_A_HEREDOC",
+            ", group: :unless",
+            ", require: { if: \"vuln-gem\", unless: \"other\" }.values",
+            ", require: loader(if: \"vuln-gem\")",
+            ", if: true",
+            ", require: false # if::FEATURE, <<REQUIRE_PATH",
+        ] {
+            assert_eq!(gem_line_tail_blocks_edit(tail), None, "{tail:?}");
+        }
+    }
+
+    /// Control for #340: single-line declarations whose tails merely look
+    /// like the refused shapes (a keyword inside a string or a comment, a
+    /// symbol or a key named like a keyword, a closed bracket) still
+    /// rewrite, keeping their options.
+    #[test]
+    fn gemfile_single_line_declaration_lookalikes_still_rewrite() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    vuln-gem (1.0.0)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  vuln-gem\n\n\
+                    BUNDLED WITH\n   4.0.17\n";
+        for (decl, opts) in [
+            ("gem \"vuln-gem\"", ""),
+            ("gem \"vuln-gem\" # only if needed,", ""),
+            (
+                "gem \"vuln-gem\", \"~> 1.0\" # pinned, unless told otherwise",
+                "",
+            ),
+            (
+                "gem \"vuln-gem\", require: \"if/unless\"",
+                "require: \"if/unless\"",
+            ),
+            ("gem \"vuln-gem\", require: 'a,'", "require: 'a,'"),
+            (
+                "gem \"vuln-gem\", require: { if: \"vuln-gem\" }.values",
+                "require: { if: \"vuln-gem\" }.values",
+            ),
+            (
+                "gem \"vuln-gem\", require: \"<<REQUIRE_PATH\"",
+                "require: \"<<REQUIRE_PATH\"",
+            ),
+            ("gem \"vuln-gem\", group: :unless", "group: :unless"),
+            (
+                "gem \"vuln-gem\", platforms: [:mri, :mingw]",
+                "platforms: [:mri, :mingw]",
+            ),
+            ("gem \"vuln-gem\", require: \"a#b\"", "require: \"a#b\""),
+            ("gem \"vuln-gem\", require: false\r", "require: false"),
+            ("gem(\"vuln-gem\", require: false)", "require: false"),
+        ] {
+            let gemfile = format!("source \"https://rubygems.org\"\n\n{decl}\n");
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.clone());
+            files.insert("Gemfile.lock".to_string(), lock.to_string());
+            let r = rewrite_registry_redirect(&files, &[gem_override("vuln-gem", "1.0.0")]);
+            assert!(
+                !warning_codes(&r).contains(&"redirect_gem_unrecognized_declaration"),
+                "{decl:?}: {:?}",
+                r.warnings
+            );
+            let out = r.files.get("Gemfile").expect("declaration rewritten");
+            let want = if opts.is_empty() {
+                "  gem \"vuln-gem\", \"1.0.0\"\nend".to_string()
+            } else {
+                format!("  gem \"vuln-gem\", \"1.0.0\", {opts}\nend")
+            };
+            assert!(out.contains(&want), "{decl:?}: {out}");
         }
     }
 
