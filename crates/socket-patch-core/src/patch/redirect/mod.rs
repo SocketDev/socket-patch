@@ -3933,24 +3933,43 @@ fn berry_lock_locks(content: &str, name: &str, version: &str) -> bool {
     })
 }
 
-/// Whether the berry hosted pin of `dep` would re-key an entry of the
-/// LF-normalized lock `content` that carries a `bin:` map: an entry of the
-/// package version whose descriptors all name the package through a plain
-/// (non-fork) `npm:` range, or one an earlier hosted run keyed by its
-/// tarball URL. Only such a pin needs the served tarball's own
-/// package.json (#718); a fork alias or another protocol is never re-keyed.
-pub(crate) fn berry_pin_needs_manifest(content: &str, dep: &DepOverride) -> bool {
+/// The entries of the LF-normalized berry lock `content` that carry a
+/// `bin:` map: the only ones whose pin needs the served tarball's own
+/// package.json (#718). Split once per lock, so the per-dep check in
+/// [`berry_pin_needs_manifest`] only walks these (usually none).
+pub(crate) fn berry_bin_entries(content: &str) -> Vec<&str> {
+    content
+        .split("\n\n")
+        .filter(|block| block.contains("\n  bin:"))
+        .collect()
+}
+
+/// Whether the berry hosted pin of `dep` would re-key one of `bin_entries`
+/// (see [`berry_bin_entries`]): an entry of the package version whose
+/// descriptors all name the package through a plain (non-fork) `npm:`
+/// range, or one an earlier hosted run keyed by its tarball URL. A fork
+/// alias or another protocol is never re-keyed, so never needs a fetch.
+pub(crate) fn berry_pin_needs_manifest(bin_entries: &[&str], dep: &DepOverride) -> bool {
     use crate::vendor::yarn_classic_lock::{split_berry_key_patterns, split_pattern};
+    if bin_entries.is_empty() {
+        return false;
+    }
     let name = full_name(dep);
-    let version_line = format!("\n  version: {}\n", dep.version);
-    content.split("\n\n").any(|block| {
+    let version_line = format!("\n  version: {}", dep.version);
+    bin_entries.iter().any(|block| {
         let Some(key) = block.lines().next().and_then(|l| l.strip_suffix(':')) else {
             return false;
         };
         if key.starts_with([' ', '\t', '#']) || key == "__metadata" {
             return false;
         }
-        if !format!("{block}\n").contains(&version_line) || !block.contains("\n  bin:") {
+        let has_version = block.match_indices(&version_line).any(|(at, _)| {
+            matches!(
+                block.as_bytes().get(at + version_line.len()),
+                None | Some(b'\n')
+            )
+        });
+        if !has_version {
             return false;
         }
         let patterns = split_berry_key_patterns(key);
@@ -17970,29 +17989,17 @@ packages:
                 if bin { "  bin:\n    uuid: dist/bin/uuid\n" } else { "" }
             )
         };
-        assert!(berry_pin_needs_manifest(&entry("\"uuid@npm:^9.0.0\"", true), &dep));
-        assert!(berry_pin_needs_manifest(
-            &entry("\"uuid@npm:^9.0.0, uuid@npm:^9.0.1\"", true),
-            &dep
-        ));
-        assert!(berry_pin_needs_manifest(&entry(&format!("\"uuid@{url}\""), true), &dep));
-        assert!(!berry_pin_needs_manifest(&entry("\"uuid@npm:^9.0.0\"", false), &dep));
-        assert!(!berry_pin_needs_manifest(
-            &entry("\"uuid@npm:other-uuid@^9.0.0\"", true),
-            &dep
-        ));
-        assert!(!berry_pin_needs_manifest(
-            &entry("\"uuid@npm:^9.0.0, other@npm:^1.0.0\"", true),
-            &dep
-        ));
-        assert!(!berry_pin_needs_manifest(
-            &entry("\"uuid@patch:uuid@npm%3A9.0.1#x\"", true),
-            &dep
-        ));
-        assert!(!berry_pin_needs_manifest(
-            &entry("\"uuid@https://mirror.example/uuid-9.0.1.tgz\"", true),
-            &dep
-        ));
+        let needs = |lock: String| berry_pin_needs_manifest(&berry_bin_entries(&lock), &dep);
+        assert!(needs(entry("\"uuid@npm:^9.0.0\"", true)));
+        assert!(needs(entry("\"uuid@npm:^9.0.0, uuid@npm:^9.0.1\"", true)));
+        assert!(needs(entry(&format!("\"uuid@{url}\""), true)));
+        assert!(!needs(entry("\"uuid@npm:^9.0.0\"", false)));
+        assert!(!needs(entry("\"uuid@npm:other-uuid@^9.0.0\"", true)));
+        assert!(!needs(entry("\"uuid@npm:^9.0.0, other@npm:^1.0.0\"", true)));
+        assert!(!needs(entry("\"uuid@patch:uuid@npm%3A9.0.1#x\"", true)));
+        assert!(!needs(entry("\"uuid@https://mirror.example/uuid-9.0.1.tgz\"", true)));
+        // Another version of the package (`9.0.10` shares the prefix).
+        assert!(!needs(entry("\"uuid@npm:^9.0.0\"", true).replace("9.0.1\n", "9.0.10\n")));
     }
 
     /// A bun URL 3-tuple already at the CURRENT artifact URL but with a stale

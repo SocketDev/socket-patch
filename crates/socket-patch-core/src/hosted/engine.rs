@@ -645,12 +645,16 @@ pub fn yarn_berry_manifest_targets<'a>(
         return Vec::new();
     };
     let lock = crate::utils::line_endings::to_lf(lock);
+    let bin_entries = crate::patch::redirect::berry_bin_entries(&lock);
+    if bin_entries.is_empty() {
+        return Vec::new();
+    }
     let mut seen = BTreeSet::new();
     candidates
         .iter()
         .map(|c| &c.dep)
         .filter(|dep| dep.ecosystem == "npm")
-        .filter(|dep| crate::patch::redirect::berry_pin_needs_manifest(&lock, dep))
+        .filter(|dep| crate::patch::redirect::berry_pin_needs_manifest(&bin_entries, dep))
         .filter(|dep| seen.insert(dep.artifact_url.clone()))
         .collect()
 }
