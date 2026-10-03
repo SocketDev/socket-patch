@@ -494,7 +494,7 @@ impl DerivedIndex {
             if by_hash {
                 out.stale.push(path.clone());
             } else if name == jar_leaf || name == instrumented {
-                match std::fs::read(path) {
+                match crate::utils::fs::read_regular_to_bytes_sync(path) {
                     Ok(bytes) if hash_eq(&hex::encode(Sha1::digest(&bytes)), pristine_sha1) => {
                         out.stale.push(path.clone())
                     }
@@ -622,7 +622,7 @@ pub fn fs_text_read(root: &Path) -> impl Fn(&str) -> Option<String> + '_ {
         if meta.len() > graph::MAX_FILE_BYTES as u64 {
             return Some(" ".repeat(graph::MAX_FILE_BYTES + 1));
         }
-        crate::gradle::dsl::decode(&std::fs::read(&path).ok()?)
+        crate::gradle::dsl::decode(&crate::utils::fs::read_regular_to_bytes_sync(&path).ok()?)
     }
 }
 
@@ -672,7 +672,7 @@ impl InitScripts {
             return;
         }
         let tag = path.to_string_lossy().into_owned();
-        match std::fs::read(path)
+        match crate::utils::fs::read_regular_to_bytes_sync(path)
             .ok()
             .and_then(|b| crate::gradle::dsl::decode(&b))
         {
@@ -808,7 +808,7 @@ impl WrapperProps {
         if meta.len() > graph::MAX_FILE_BYTES as u64 {
             return unusable("too large");
         }
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(bytes) = crate::utils::fs::read_regular_to_bytes_sync(&path) else {
             return unusable("unreadable");
         };
         let mut props = parse_properties(&bytes);
