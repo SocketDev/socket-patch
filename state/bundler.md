@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-03 (run 13), main `045d7ec` (includes #532, #552, #517, #442), latest release tag v4.0.0.
+Last updated: 2026-10-03 (run 14), main `045d7ec` (includes #532, #552, #517, #442), latest release tag v4.0.0.
 
 ## Coverage matrix
 
@@ -107,6 +107,14 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 
 Controls for #709 (Linux, 4.0.17): config `path` relative, config `path` absolute inside the project, env `BUNDLE_PATH` absolute outside the project, and `path.system: true` all pass (stale warning; `vex` refuses `not_applied`).
 
+### Run 14: stale-install warning flavor and `BUNDLE_IGNORE_CONFIG` (Linux, Ruby 3.3.6)
+
+| Bundler | Hosted stale warning, `--cwd` omitted / `.` | Hosted stale warning, absolute or `../proj` `--cwd` | Hosted `BUNDLE_IGNORE_CONFIG` + config `path vendor/bundle` | Agent + `vex`, same shape |
+| --- | --- | --- | --- | --- |
+| 4.0.17 | fail #729 (also on the v4.0.0 release) | pass | documented heuristic (warns about the wrong copy) | documented heuristic (false VEX; see Known non-bugs) |
+| 2.6.9 | fail #729 | pass | untested | untested |
+| 2.4.22 | fail #729 | pass | untested | untested |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -120,13 +128,14 @@ Controls for #709 (Linux, 4.0.17): config `path` relative, config `path` absolut
 
 ## Backlog
 
-1. Re-run #340 / #577 / #652 / #681 / #709 when #637 / #621 / #684 (or any fix for #709) merge. #684 already covers `mirror.<url>` / `fallback_timeout` / `BUNDLE_MIRROR__*`, and #621 covers `BUNDLE_USER_HOME`, so neither needs its own hunt any more.
+1. Re-run #340 / #577 / #652 / #681 / #709 / #729 when #637 / #621 / #684 / #712 merge (#712 does not fix #729). #684 already covers `mirror.<url>` / `fallback_timeout` / `BUNDLE_MIRROR__*`, and #621 covers `BUNDLE_USER_HOME`, so neither needs its own hunt any more.
 2. Windows: `x64-mingw-ucrt` platform gems in hosted and vendored modes; `BUNDLE_DEPLOYMENT=true` with a CRLF lock.
 3. Vendored cells on Windows and macOS (needs a Rust-test probe around `e2e_vendor_gem_build.rs`).
 4. **Maintainer request (still open):** global (`-g`) mode on every OS. Remaining: macOS system Ruby and Homebrew Ruby; rbenv / rvm / chruby / asdf layouts; unicode or space-containing `--global-prefix`; a non-writable dir on macOS and Windows (Program Files); `-g` from inside a project on macOS and Windows.
 5. A symlinked env `BUNDLE_GEMFILE` next to a config `gemfile` (`env_keeps_root` compares lexically): needs a macOS probe (`/var` vs `/private/var`).
 6. #340 on Bundler 2.2–2.5 (Linux); Ruby 2.7 + Bundler 2.2/2.3 hosted unwind (setup-ruby probe).
 7. Bundler 2.7.2 hand-driven cells (vendored shapes, hosted unwind), beyond the repo suites.
+8. Other lexical `starts_with(cwd)` comparisons in the gem paths (vex excuse, rollback/remove scoping) under the default relative `--cwd .`.
 
 ## Known non-bugs
 
@@ -166,3 +175,5 @@ Controls for #709 (Linux, 4.0.17): config `path` relative, config `path` absolut
 - The in-place hosted rewrite of a CRLF manifest writes the `source … do` block with LF endings (mixed endings). Bundler, frozen installs and `rollback` accept it, so it's cosmetic.
 - Hosted `rollback` / `remove` can be exercised by hand with no Rust harness: a Python mock of the patch API + the patch-registry compact index (rebuild the real `.gem` with `gem unpack` / `gem spec --ruby` / `gem build`), with rubygems.org as the real upstream. The run-13 entry describes it; the mock must ignore nothing the CLI checks (`registryOverride.identifiers.gemChecksumSha256` = the sha256 of the served `.gem`).
 - `bughunt/bundler/20261003-hosted-xos` is also left behind (`git push --delete` hangs up / 403); its workflow is push-triggered only.
+- `BUNDLE_IGNORE_CONFIG` is not honored when the crawler reads `.bundle/config` `path` (it is for `cache_path`/`gemfile`). It's harmless on its own: a non-default config path still gets the `gem env` homes appended. The only harmful shape is a populated `vendor/bundle` that bundler doesn't use (agent patches it, `vex` attests while the system copy loads), and that's the documented "`vendor/bundle` holds stores, so no `gem env` homes" rule; a leftover `vendor/bundle` with no config does the same (run 14).
+- To bisect, the published binary is at `npm pack @socketsecurity/socket-patch-linux-x64-gnu@<ver>` (`package/socket-patch`). v4 needs `--mode hosted` explicitly.
