@@ -4155,8 +4155,14 @@ mod tests {
         )
         .await;
         if result.is_err() {
-            // Unblock the reader stuck in open(2) so the runtime can exit.
-            let _ = std::fs::OpenOptions::new().write(true).open(dir.join(leaf));
+            // Unblock a reader stuck in open(2) so the runtime can exit.
+            // O_NONBLOCK: with no reader waiting, a blocking write-open would
+            // itself wedge the suite instead of failing it.
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(dir.join(leaf));
             panic!("unexpected_gradle_bytes must not wedge on a FIFO leaf");
         }
         assert_eq!(result.unwrap(), None);
