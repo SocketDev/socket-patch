@@ -1930,20 +1930,44 @@ fn script_error(out: &Output) -> bool {
         || text.contains("A problem occurred evaluating root project")
 }
 
+/// The request a [`fallback_case`] pastes the snippet over.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Request {
+    Direct,
+    Transitive,
+    /// A rich version with only `prefer` (#646 review): its
+    /// `requested.version` is empty, so only the snippet's dependency
+    /// substitution on the version constraint rewrites it.
+    PreferOnly,
+}
+
 /// The fallback snippet compiles in each DSL and pins the patch. A direct
-/// request must resolve the suffixed, patched jar; a transitive-only one
-/// (`consumer:2.0` → the base) resolves it or fails in resolution, never
-/// in the pasted script, and never resolves the unpatched base.
-fn fallback_case(dsl: Dsl, direct: bool) {
-    let what = if direct { "direct" } else { "transitive" };
+/// (or `prefer`-only) request must resolve the suffixed, patched jar; a
+/// transitive-only one (`consumer:2.0` → the base) resolves it or fails in
+/// resolution, never in the pasted script, and never resolves the
+/// unpatched base.
+fn fallback_case(dsl: Dsl, kind: Request) {
+    let what = match kind {
+        Request::Direct => "direct",
+        Request::Transitive => "transitive",
+        Request::PreferOnly => "prefer-only",
+    };
+    let direct = kind != Request::Transitive;
     let tests = match dsl {
         Dsl::Groovy => format!("testImplementation '{}:tests'", coordinate()),
         Dsl::Kotlin => format!("testImplementation(\"{}:tests\")", coordinate()),
     };
-    let request = if direct {
-        implementation(dsl, &coordinate())
-    } else {
-        implementation(dsl, &format!("{GROUP}:{CONSUMER}:{CONSUMER_VERSION}"))
+    let request = match (kind, dsl) {
+        (Request::Direct, _) => implementation(dsl, &coordinate()),
+        (Request::Transitive, _) => {
+            implementation(dsl, &format!("{GROUP}:{CONSUMER}:{CONSUMER_VERSION}"))
+        }
+        (Request::PreferOnly, Dsl::Groovy) => format!(
+            "implementation('{GROUP}:{VICTIM}') {{ version {{ prefer '{VICTIM_VERSION}' }} }}"
+        ),
+        (Request::PreferOnly, Dsl::Kotlin) => format!(
+            "implementation(\"{GROUP}:{VICTIM}\") {{ version {{ prefer(\"{VICTIM_VERSION}\") }} }}"
+        ),
     };
     let deps = [request, tests];
     let deps: Vec<&str> = deps.iter().map(String::as_str).collect();
@@ -1979,15 +2003,46 @@ fn fallback_case(dsl: Dsl, direct: bool) {
 #[test]
 #[ignore = "real Gradle; run with --ignored"]
 fn gradle_hosted_fallback_snippet_compiles_groovy() {
-    fallback_case(Dsl::Groovy, true);
-    fallback_case(Dsl::Groovy, false);
+    fallback_case(Dsl::Groovy, Request::Direct);
+    fallback_case(Dsl::Groovy, Request::Transitive);
+    fallback_case(Dsl::Groovy, Request::PreferOnly);
 }
 
 #[test]
 #[ignore = "real Gradle; run with --ignored"]
 fn gradle_hosted_fallback_snippet_compiles_kotlin() {
-    fallback_case(Dsl::Kotlin, true);
-    fallback_case(Dsl::Kotlin, false);
+    fallback_case(Dsl::Kotlin, Request::Direct);
+    fallback_case(Dsl::Kotlin, Request::Transitive);
+    fallback_case(Dsl::Kotlin, Request::PreferOnly);
+}
+
+/// #646 review: `latest.release` is refused (`redirect_gradle_latest_selector`)
+/// with nothing written, and the build keeps resolving as before. Pinning
+/// it would break it: with every upstream version at or below the base
+/// rejected and none listed by the Socket repository, no version matches.
+#[test]
+#[ignore = "real Gradle; run with --ignored"]
+fn gradle_hosted_latest_selector_refused() {
+    for_each_dsl(|dsl| {
+        let dep = implementation(dsl, &format!("{GROUP}:{VICTIM}:latest.release"));
+        let Some(c) = cell(dsl, &single(dsl, &[&dep], "")) else {
+            return;
+        };
+        c.warm();
+        c.serve_leaf(&Served::new(true));
+        let before = snapshot(&c.proj);
+        let (code, json) = c.scan_in(&c.proj, &[]);
+        assert_eq!(code, Some(0), "{json}");
+        assert!(has(&json, "redirect_gradle_latest_selector"), "{json}");
+        assert!(
+            !has(&json, "redirect_gradle_dynamic_selector_pinned"),
+            "{json}"
+        );
+        assert!(has(&json, "redirect_gradle_manual_snippet"), "{json}");
+        assert_eq!(snapshot(&c.proj), before, "a refusal writes nothing");
+        let out = c.build(&[]);
+        c.assert_pristine(&out, "latest.release, refused");
+    });
 }
 
 /// The agent-mode record `vendor` builds from: `Victim.class` patched.

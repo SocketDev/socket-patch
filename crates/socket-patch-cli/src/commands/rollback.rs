@@ -10,13 +10,13 @@ use socket_patch_core::manifest::operations::{
 };
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::select_installed_variants;
+use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::patch::rollback::{
     cannot_rollback_error, rollback_package_patch, verify_file_rollback, RollbackResult,
     VerifyRollbackResult, VerifyRollbackStatus,
 };
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
-use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::vendor::{purl_keys_cover, RevertOpts, VendorState};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -490,6 +490,9 @@ pub(crate) struct RollbackOutcome {
     /// was restored, so nothing is removable and the GC must not sweep
     /// the revert data the retry needs.
     pub(crate) aborted: bool,
+    /// Run warnings `(code, detail)` for copies left alone without failing
+    /// the run (today: `gradle_m2_copy_not_restored`).
+    pub(crate) warnings: Vec<(String, String)>,
 }
 
 /// How `rollback_patches_inner` selects manifest entries.
@@ -1026,7 +1029,8 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
             .iter()
             .map(|(code, detail)| (code.to_string(), detail.clone())),
     );
-    out.edited_files.extend(outcome.reverted_files.iter().cloned());
+    out.edited_files
+        .extend(outcome.reverted_files.iter().cloned());
     let unwound: Vec<_> = vlt_targets
         .into_iter()
         .filter(|t| out.reverted.iter().any(|p| p == &t.purl))
@@ -1170,7 +1174,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
             } else if !args.common.silent {
                 println!(
                     "{} the pre-v5 hosted ledger {}: no lockfile pins a hosted patch.",
-                    if args.common.dry_run { "Would remove" } else { "Removed" },
+                    if args.common.dry_run {
+                        "Would remove"
+                    } else {
+                        "Removed"
+                    },
                     socket_patch_core::patch::redirect::REDIRECT_STATE_REL
                 );
             }
@@ -1534,7 +1542,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
             not_installed,
             narrowed_out,
             aborted,
+            warnings: agent_warnings,
         }) => {
+            // Copies left alone without failing the run (an unconsumed
+            // `~/.m2` copy: `gradle_m2_copy_not_restored`).
+            run_warnings.extend(agent_warnings);
             // ── vendored leg ─────────────────────────────────────────────
             // The in-scope ledger entries: unwire the lockfiles and (by
             // default) delete the artifacts + drop the entries.
@@ -2149,6 +2161,7 @@ pub(crate) async fn rollback_patches_inner(
             not_installed: Vec::new(),
             narrowed_out: Vec::new(),
             aborted: false,
+            warnings: Vec::new(),
         });
     }
 
@@ -2175,6 +2188,7 @@ pub(crate) async fn rollback_patches_inner(
             not_installed: Vec::new(),
             narrowed_out: Vec::new(),
             aborted: false,
+            warnings: Vec::new(),
         });
     }
 
@@ -2290,7 +2304,7 @@ pub(crate) async fn rollback_patches_inner(
     } else {
         None
     };
-    let mut maven_groups: Vec<((String, PathBuf), Vec<&String>)> = Vec::new();
+    let mut maven_groups: Vec<((String, PathBuf), Vec<&String>, bool)> = Vec::new();
     for (purl, pkg_paths) in &all_packages_multi {
         if let Some(scope) = jvm_scope
             .as_ref()
@@ -2304,13 +2318,22 @@ pub(crate) async fn rollback_patches_inner(
             // with no record to restore it from once `remove` drops the
             // entry. Only bytes that verify as this record's afterHash
             // are ever put back, and a Maven build that wants the patch
-            // re-applies it from its own manifest.
+            // re-applies it from its own manifest. Such a copy never
+            // decides the run's outcome, though (`CopyTarget::unconsumed_m2`):
+            // the build does not read it, so one another build re-patched
+            // or rebuilt, or whose backup lives in that other project, is
+            // left with a warning instead of failing this rollback/remove.
             let copies = scope.split(pkg_paths);
-            for pkg_path in copies.consumed.iter().chain(&copies.m2_ignored) {
+            let tagged = copies
+                .consumed
+                .iter()
+                .map(|p| (p, false))
+                .chain(copies.m2_ignored.iter().map(|p| (p, true)));
+            for (pkg_path, unconsumed) in tagged {
                 let key = (strip_purl_qualifiers(purl).to_string(), pkg_path.clone());
-                match maven_groups.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, purls)) => purls.push(purl),
-                    None => maven_groups.push((key, vec![purl])),
+                match maven_groups.iter_mut().find(|(k, _, _)| *k == key) {
+                    Some((_, purls, _)) => purls.push(purl),
+                    None => maven_groups.push((key, vec![purl], unconsumed)),
                 }
             }
         } else if Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants()) {
@@ -2564,6 +2587,7 @@ pub(crate) async fn rollback_patches_inner(
                 not_installed,
                 narrowed_out: Vec::new(),
                 aborted: true,
+                warnings: Vec::new(),
             });
         }
 
@@ -2643,6 +2667,7 @@ pub(crate) async fn rollback_patches_inner(
                 not_installed,
                 narrowed_out: Vec::new(),
                 aborted: true,
+                warnings: Vec::new(),
             });
         }
     }
@@ -2662,12 +2687,14 @@ pub(crate) async fn rollback_patches_inner(
             not_installed,
             narrowed_out: narrowed_out.clone(),
             aborted: false,
+            warnings: Vec::new(),
         });
     }
 
     // Rollback patches
     let mut results: Vec<RollbackResult> = Vec::new();
     let mut has_errors = false;
+    let mut warnings: Vec<(String, String)> = Vec::new();
 
     for target in &rollback_targets {
         let (purl, pkg_path) = (&target.purl, &target.dir);
@@ -2705,6 +2732,10 @@ pub(crate) async fn rollback_patches_inner(
             }
         };
 
+        if let Some(warning) = unconsumed_m2_skip(target, &result) {
+            warnings.push(warning);
+            continue;
+        }
         if !result.success {
             has_errors = true;
             // Under --silent (the summary muted) this line is the run's
@@ -2759,6 +2790,7 @@ pub(crate) async fn rollback_patches_inner(
         not_installed,
         narrowed_out,
         aborted: false,
+        warnings,
     })
 }
 
@@ -2772,6 +2804,12 @@ struct CopyTarget {
     files: Option<HashMap<String, PatchFileInfo>>,
     /// Maven member-keyed record: the jar under `dir` to restore whole.
     jar_leaf: Option<String>,
+    /// A `~/.m2` copy this Gradle-only build never reads
+    /// (`JvmScope::split`'s `m2_ignored`). Restored when it holds this
+    /// record's patched bytes, but a copy that verifies as neither side
+    /// or has no backup here is left with a `gradle_m2_copy_not_restored`
+    /// warning (`unconsumed_m2_skip`), never a failure.
+    unconsumed_m2: bool,
 }
 
 impl CopyTarget {
@@ -2781,8 +2819,42 @@ impl CopyTarget {
             dir: dir.to_path_buf(),
             files: None,
             jar_leaf: None,
+            unconsumed_m2: false,
         }
     }
+}
+
+/// The run warning that replaces a failed restore of an unconsumed
+/// `~/.m2` copy ([`CopyTarget::unconsumed_m2`]), when it failed before
+/// writing anything because the copy holds bytes that are neither side of
+/// this record (another build re-patched it, or `mvn install` rebuilt it),
+/// lacks a file, or is a swapped jar whose original this project never
+/// backed up. `None` for any other result, which is reported as usual.
+fn unconsumed_m2_skip(target: &CopyTarget, result: &RollbackResult) -> Option<(String, String)> {
+    if !target.unconsumed_m2 || result.success || !result.files_rolled_back.is_empty() {
+        return None;
+    }
+    let refused = result.files_verified.iter().any(|v| {
+        matches!(
+            v.status,
+            VerifyRollbackStatus::HashMismatch | VerifyRollbackStatus::NotFound
+        )
+    }) || result
+        .error
+        .as_deref()
+        .is_some_and(|e| e.starts_with("jvm_jar_backup_missing"));
+    refused.then(|| {
+        (
+            "gradle_m2_copy_not_restored".to_string(),
+            format!(
+                "{}: left the ~/.m2 copy at {} as it is; this Gradle-only build does not \
+                 read it ({})",
+                target.purl,
+                target.dir.display(),
+                result.error.as_deref().unwrap_or("it cannot be restored")
+            ),
+        )
+    })
 }
 
 /// The key `file` of a Maven record as it is joined onto `dir`: a Gradle
@@ -2806,7 +2878,7 @@ fn maven_target_key(purl: &str, dir: &Path, file: &str) -> String {
 /// matches attempts every variant, so verification reports the mismatch.
 /// Returns the targets and the variants no copy kept (narrowed out).
 async fn maven_rollback_targets(
-    groups: &[((String, PathBuf), Vec<&String>)],
+    groups: &[((String, PathBuf), Vec<&String>, bool)],
     manifest: &PatchManifest,
 ) -> (Vec<CopyTarget>, Vec<String>) {
     use socket_patch_core::crawlers::gradle_cache::{
@@ -2817,7 +2889,8 @@ async fn maven_rollback_targets(
     let mut targets = Vec::new();
     let mut considered: HashSet<String> = HashSet::new();
     let mut kept: HashSet<String> = HashSet::new();
-    for ((_, copy), purls) in groups {
+    for ((_, copy), purls, unconsumed_m2) in groups {
+        let unconsumed_m2 = *unconsumed_m2;
         let candidates: Vec<(&str, &HashMap<String, PatchFileInfo>)> = purls
             .iter()
             .filter_map(|purl| {
@@ -2839,6 +2912,7 @@ async fn maven_rollback_targets(
                             dir,
                             files: None,
                             jar_leaf: Some(jar_leaf.clone()),
+                            unconsumed_m2,
                         });
                     }
                 }
@@ -2849,6 +2923,7 @@ async fn maven_rollback_targets(
                             dir,
                             files: Some(files),
                             jar_leaf: None,
+                            unconsumed_m2,
                         });
                     }
                 }
@@ -2857,7 +2932,10 @@ async fn maven_rollback_targets(
                         .keys()
                         .any(|k| copy.join(k.trim_start_matches("package/")).exists());
                     if present {
-                        out.push(CopyTarget::plain(purl, copy));
+                        out.push(CopyTarget {
+                            unconsumed_m2,
+                            ..CopyTarget::plain(purl, copy)
+                        });
                     }
                 }
             }

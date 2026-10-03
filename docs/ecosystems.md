@@ -465,6 +465,9 @@ they need network access (`jvm_agent_service_required` offline). The original is
 backed up under `.socket/jvm-originals/` and `rollback` restores from it. `rollback`
 and `remove` restore every patched writable copy, including a `~/.m2` copy the build
 no longer reads (an earlier apply patched it while `mavenLocal()` was declared).
+Such a copy never fails the run: one another build re-patched or rebuilt, or whose
+original this project never backed up, is left as it is with
+`gradle_m2_copy_not_restored`.
 Guards:
 
 - `gradle/verification-metadata.xml` present: refused
@@ -517,11 +520,15 @@ resolves. It also checks the jar's sha256. A request whose selector does not adm
 base (an explicit newer version, a lock or `strictly` above the base, a transitive
 bump) is left alone, so a version *above* the base still resolves and an upstream fix
 is never downgraded. `vex` withholds the statement when a lock file records such a
-version; without dependency locking it judges the installed suffixed copies. A
+version (`vex_gradle_lock_above_base`), while `list`, `rollback` and `remove` still
+find the pin; without dependency locking it judges the installed suffixed copies. A
 dynamic or range selector that admits the base is pinned like a lock: it keeps
 resolving the patched version after a newer upstream release appears
 (`redirect_gradle_dynamic_selector_pinned`); declare the newer version to move past
-the patch. The apply line carries a digest of the index, so a changed pin set
+the patch. A `latest.release` / `latest.integration` request is refused
+(`redirect_gradle_latest_selector`): the script cannot rewrite it, and with every
+upstream version at or below the base rejected it would not resolve until upstream
+ships a newer release. The apply line carries a digest of the index, so a changed pin set
 invalidates the configuration cache.
 
 **Detached configurations.** Every project and buildscript configuration is pinned.
@@ -539,8 +546,8 @@ A dep is refused, with nothing written for it, when the build is outside what th
 script can pin: a wrapper below 6.8, Android or Kotlin Multiplatform plugins, an
 `includeBuild` the CLI cannot follow, a custom `lockFile`, the GA on a
 settings-script classpath (declared, or in a `settings-gradle.lockfile`), a
-classifier declaration, a `strictly` constraint admitting only versions below the
-base, a user `exclusiveContent` rule claiming the group, a lock entry below the base
+classifier declaration, a `latest.*` request, a `strictly` constraint admitting only
+versions below the base, a user `exclusiveContent` rule claiming the group, a lock entry below the base
 (re-lock first), a GA that is vendored, or a grant that serves the original
 coordinates. Each refusal has its own `redirect_gradle_*` code and is followed by
 `redirect_gradle_manual_snippet`, a paste-able snippet in the build's DSL that applies

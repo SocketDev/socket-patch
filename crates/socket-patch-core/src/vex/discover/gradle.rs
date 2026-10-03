@@ -15,9 +15,8 @@
 //!   uuid comes from [`DiscoverCtx::hosted_uuid`]), and the suffix grammar
 //!   holds (`<base>-socket.<uuid[..8]>`, checked by the row parser);
 //! - every lock entry of the GA in every build's lock files is the
-//!   suffixed version (a lock still at the base fails the build; one above
-//!   the base resolves an upstream release the pin lets through, so that
-//!   build consumes no patch), and no settings-classpath lock
+//!   suffixed version or above the base (a lock still at the base fails
+//!   the build), and no settings-classpath lock
 //!   (`settings-gradle.lockfile`) names the GA at all: that classpath
 //!   resolves before the script runs, so the pin cannot reach it;
 //! - no build script sets a custom lock-file location (`lockFile`), which
@@ -29,6 +28,12 @@
 //!   changed after the scan in a way the pin cannot reach stops attesting.
 //!
 //! Anything else is a [`DIAG_REF_INVALID`] naming the index, and no ref.
+//!
+//! A lock entry above the base is a newer upstream release the script lets
+//! resolve, and the planner confirms that wiring: the row is still a ref
+//! (rollback, remove and list must find what the scan wired), but that
+//! build consumes no patch, so the ref is also [`Discovery::unattested`]
+//! and `vex` omits it.
 //!
 //! Integrity: `locked_integrity` is `None` and `integrity_required` is
 //! TRUE, so a Gradle ref never takes the not-installed lockfile basis.
@@ -115,26 +120,24 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                 row.url, row.uuid
             )),
         });
+        // A lock above the base is a newer upstream release the script
+        // lets resolve (the planner confirms such a pin): the wiring stands
+        // — rollback, remove and list must find it — but that build
+        // consumes no patch, so the ref is not attested.
+        let above_base =
+            |v: &str| crate::gradle::selector::gradle_version_cmp(v, &row.base).is_gt();
         let problem = problem.or_else(|| {
             locks.iter().find_map(|(rel, state)| {
                 let settings = is_settings_lock(rel);
                 state
                     .entries_of(&row.group, &row.artifact)
-                    .find(|e| settings || e.version != row.suffixed)
+                    .find(|e| settings || (e.version != row.suffixed && !above_base(&e.version)))
                     .map(|e| {
                         if settings {
                             format!(
                                 "{rel}:{} locks {ga} on the settings classpath, which resolves \
                                  before the hosted script runs",
                                 e.line
-                            )
-                        } else if crate::gradle::selector::gradle_version_cmp(&e.version, &row.base)
-                            .is_gt()
-                        {
-                            format!(
-                                "{rel}:{} locks {ga} at {}, above the patched {}: that build \
-                                 resolves an upstream release, not the pinned {}",
-                                e.line, e.version, row.base, row.suffixed
                             )
                         } else {
                             format!(
@@ -144,6 +147,21 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                         }
                     })
             })
+        });
+        let bypass = locks.iter().find_map(|(rel, state)| {
+            state
+                .entries_of(&row.group, &row.artifact)
+                .find(|e| above_base(&e.version))
+                .map(|e| {
+                    (
+                        rel.clone(),
+                        format!(
+                            "{rel}:{} locks {ga} at {}, above the patched {}: that build \
+                             resolves an upstream release, not the pinned {}",
+                            e.line, e.version, row.base, row.suffixed
+                        ),
+                    )
+                })
         });
         // The planner's own build- and GA-level refusals, re-run over the
         // build as it is now: a settings classpath or a non-literal
@@ -173,6 +191,9 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             );
             continue;
         };
+        if let Some((rel, detail)) = bypass {
+            out.unattested(&purl, &row.uuid, &rel, detail);
+        }
         out.push(PatchedRef::hosted(
             purl,
             row.uuid.clone(),
@@ -446,6 +467,46 @@ mod tests {
                 diag_details(&out)
             );
         }
+    }
+
+    /// #646 review: a lock above the base is a newer upstream release the
+    /// planner confirms the pin over. The row stays a ref (rollback, remove
+    /// and list find the wiring), and is unattested: that build consumes
+    /// no patch.
+    #[tokio::test]
+    async fn a_lock_above_the_base_is_a_ref_but_unattested() {
+        let (p, _) = wired(&[
+            ("settings.gradle", "include 'a', 'b'\n"),
+            ("build.gradle", ""),
+            (
+                "a/build.gradle",
+                "dependencies { implementation 'com.socketfixture:victim:1.10.0' }\n",
+            ),
+            (
+                "a/gradle.lockfile",
+                "com.socketfixture:victim:1.10.0=runtimeClasspath\nempty=\n",
+            ),
+            (
+                "b/gradle.lockfile",
+                "com.socketfixture:victim:1.11.0=runtimeClasspath\nempty=\n",
+            ),
+        ]);
+        let out = run(&p).await;
+        assert_refs(&out, &[(PURL, UUID, WiringMode::Hosted)]);
+        assert!(out.diagnostics.is_empty(), "{:?}", diag_details(&out));
+        assert_eq!(out.hosted_claim(PURL, UUID), Some(true));
+        assert_eq!(out.unattested.len(), 1, "{:?}", out.unattested);
+        let u = &out.unattested[0];
+        assert_eq!((u.purl.as_str(), u.uuid.as_str()), (PURL, UUID));
+        assert_eq!(u.file, std::path::PathBuf::from("b/gradle.lockfile"));
+        assert!(
+            u.detail.contains("above the patched 1.10.0"),
+            "{}",
+            u.detail
+        );
+        // Pinned locks everywhere: attested as usual.
+        let (p, _) = wired(BUILD);
+        assert!(run(&p).await.unattested.is_empty());
     }
 
     #[tokio::test]

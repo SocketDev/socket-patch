@@ -17,9 +17,9 @@ use super::rollback::{
     pin_before_hash_blobs, rollback_patches_inner, run_hosted_leg, sweep_failure,
     sweep_unused_artifacts, HostedLegOutcome, InnerSelection,
 };
-use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::lock_cli::acquire_or_emit;
+use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
 use crate::ui::plural;
 
@@ -581,6 +581,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // warning event rides the envelope. Empty under `--skip-rollback`
     // (no rollback ran, so nothing is known — semantics unchanged).
     let mut rollback_not_installed: Vec<String> = Vec::new();
+    let mut rollback_warnings: Vec<(String, String)> = Vec::new();
     // Whether something was printed after the header listing, so the
     // manifest result below gets a separating blank line (and only then).
     let mut printed_progress = false;
@@ -609,6 +610,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         {
             Ok(outcome) => {
                 rollback_not_installed = outcome.not_installed;
+                rollback_warnings = outcome.warnings;
                 if !outcome.success {
                     track_patch_remove_failed(
                         "Rollback failed during patch removal",
@@ -652,6 +654,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     .iter()
                     .filter(|r| r.success && !r.files_rolled_back.is_empty())
                     .count();
+                print_hosted_leg_warnings(&args.common, &rollback_warnings);
 
                 if loud {
                     // Vendor-owned targets say nothing here: the vendored
@@ -1056,12 +1059,15 @@ pub async fn run(args: RemoveArgs) -> i32 {
             env.record(ev);
         }
         env.warnings
-            .extend(hosted_leg_warnings.iter().map(|(code, detail)| {
-                crate::json_envelope::RunWarning {
-                    code: code.clone(),
-                    detail: detail.clone(),
-                }
-            }));
+            .extend(
+                rollback_warnings
+                    .iter()
+                    .chain(&hosted_leg_warnings)
+                    .map(|(code, detail)| crate::json_envelope::RunWarning {
+                        code: code.clone(),
+                        detail: detail.clone(),
+                    }),
+            );
         // One Removed event per purl whose manifest entry was deleted
         // (Verified on --dry-run).
         for purl in &removed {

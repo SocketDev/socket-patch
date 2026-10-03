@@ -1702,7 +1702,11 @@ no longer reads (an earlier apply wrote it while the build declared `mavenLocal(
 or before v5.0 gated `~/.m2`; leaving it would strand the shared jar patched once
 `remove` drops the record). It restores from the backup, else, online and for a
 Gradle copy only, from an upstream download that hashes to the copy's hash
-directory.
+directory. Such an unread `~/.m2` copy never fails the run: one that holds bytes
+that are neither side of the record (another build applied a different patch there,
+or `mvn install` rebuilt it), lacks a file, or is a swapped jar whose original this
+project never backed up is left as it is with `gradle_m2_copy_not_restored`, and
+`remove` still drops the record.
 
 Run-level `warnings[]` codes (a refusal is also a `failed` event whose `error`
 starts with the code):
@@ -1723,6 +1727,7 @@ starts with the code):
 | `jvm_jar_backup_failed` | refused, exit 1 | The original jar could not be backed up before the swap. Nothing is written. |
 | `gradle_rollback_hash_mismatch` | rollback: that copy fails | A file restored into a Gradle hash directory does not hash to the directory's name (the sha1 Gradle verified on download): the before-blob is not that download. The file is left as it is and the result fails; delete that hash directory so Gradle downloads it again. |
 | `jvm_jar_backup_missing` | rollback: that copy fails | No backup of the original jar exists (and, for a Gradle copy, no upstream download matched its hash directory, or the run is offline). The copy is left as it is. |
+| `gradle_m2_copy_not_restored` | rollback / remove: warning | A `~/.m2` copy this Gradle-only build does not read could not be restored (its bytes are neither side of the record, a file is missing, or it is a swapped jar with no backup in this project). It is left as it is and does not fail the run. |
 
 Each patched Gradle copy's sidecar record (`PatchEvent.sidecar`) carries an advisory
 instead of a checksum-file rewrite (a `files-2.1` copy has none):
@@ -1761,22 +1766,31 @@ resolves there; it also checks the jar's sha256 against the index. A request who
 selector does not admit the base (an explicit newer version, a lock or `strictly` above
 the base, a transitive bump) is left alone and resolves above the base (a newer
 upstream fix is never downgraded); `vex` withholds the attestation when a lock entry
-records such a version, and otherwise judges the installed suffixed copies. A dynamic
-or range selector that admits the base is pinned like a lock: it resolves the patched
-version even after a newer upstream release appears (the Socket repository lists no
-versions), reported as `redirect_gradle_dynamic_selector_pinned`. Detached
+records such a version (`vex_gradle_lock_above_base`), and otherwise judges the
+installed suffixed copies. A dynamic or range selector that admits the base is pinned
+like a lock: it resolves the patched version even after a newer upstream release
+appears (the Socket repository lists no versions), reported as
+`redirect_gradle_dynamic_selector_pinned`. A `latest.release` / `latest.integration`
+request is refused (`redirect_gradle_latest_selector`): whether it admits the base
+depends on what the repositories list, so the script cannot rewrite it, and with every
+upstream candidate at or below the base rejected it fails to resolve until upstream
+ships a newer release. Detached
 configurations (`configurations.detachedConfiguration`) are not reached.
 
 A dep is **confirmed** (`redirected`, attested) only when the final files hold the
 socket-patch script, the live apply line with the current digest in every target
-settings file, the index row, and the suffixed version in every lock entry of the GA
-(`confirmed_gradle_uuids`); anything else is not counted. `list`, `vex`, `rollback`,
+settings file, the index row, and in every lock entry of the GA the suffixed version
+or a release above the base (`confirmed_gradle_uuids`); anything else is not counted. `list`, `vex`, `rollback`,
 `remove`, `vendor` and `repair` discover hosted Gradle pins from the index under the
 same rules (a settings-classpath lock naming the GA, a stale digest, a custom
 `lockFile`, a non-Socket URL, a lock at another version, or any build- or GA-level
 refusal of the planner holding now — a settings-classpath declaration, an
 `includeBuild` it cannot follow, an Android / KMP plugin, a classifier request, a user
-`exclusiveContent` rule — is `patched_ref_invalid`, no reference). `rollback` /
+`exclusiveContent` rule — is `patched_ref_invalid`, no reference). A lock entry above
+the base is still a reference, so `list`, `rollback` and `remove` find the pin, but
+`vex` omits it (`vex_gradle_lock_above_base`, as a run warning and as the
+`failed[].reason`): that build resolves the newer upstream release, not the patch.
+`rollback` /
 `remove` restore without the network: lock entries back to
 the base, the row out of the index, the verification component out when it is still
 exactly what the planner wrote (else `gradle_verification_component_left`), and the
@@ -1790,8 +1804,10 @@ restores, so a failed vendor step rolls the whole build back byte-exact.
 
 Refusals write nothing for the dep and are followed by `redirect_gradle_manual_snippet`
 (a per-DSL snippet applying the owned script's rules for this dep: `exclusiveContent`
-for the suffixed version, every request whose selector admits the base rewritten to it,
-and every other candidate at or below the base rejected; it declares no dependency):
+for the suffixed version, every request whose selector admits the base rewritten to it
+— by dependency substitution on the strictly / require / prefer constraint, so a
+`prefer`-only rich version is covered, and by `eachDependency` — and every other
+candidate at or below the base rejected; it declares no dependency):
 
 | Code | Cause |
 |---|---|
@@ -1806,6 +1822,7 @@ and every other candidate at or below the base rejected; it declares no dependen
 | `redirect_gradle_settings_classpath` | The GA is on a settings-script classpath (declared, or named in any `settings-gradle.lockfile`), which resolves before the script runs. |
 | `redirect_gradle_classifier_declared` | A declaration requests a classifier the Socket repository does not serve. |
 | `redirect_gradle_range_declared` | A `strictly` constraint excludes the patched base version and admits nothing above it. |
+| `redirect_gradle_latest_selector` | A declaration requests `latest.release` / `latest.integration`, which the pin cannot rewrite; the build would fail until upstream ships a release above the base. Declare the base version explicitly and scan again. |
 | `redirect_gradle_exclusive_content_conflict` | A user `exclusiveContent` rule routes the group to another repository. |
 | `redirect_gradle_version_conflict` | The index already pins the GA at another base, or two patches pin it in one run. |
 | `redirect_gradle_lock_conflict` | A lock entry names the GA below the base (and not at the suffixed version); re-lock (`--write-locks`) first. A lock above the base is a newer upstream release the pin lets resolve, not a conflict. |
@@ -1878,6 +1895,7 @@ match it, withholds the statement:
 |---|---|---|
 | `vex_gradle_unpatched_copy` | run warning | A copy a build may load does not carry the patch; no statement until every copy does. |
 | `gradle_unpatched_copy` | `failed[].reason` | The purl the warning above withheld. |
+| `vex_gradle_lock_above_base` | run warning and `failed[].reason` | A hosted pin is wired, but a lock file records a release above its base, which that build resolves instead of the patch; no statement until it is re-locked or the patch is rolled back. |
 | `vex_gradle_derived_cache_unchecked` | run warning | The derived-cache walk was cut short (a very large transforms cache); the statement is still emitted, the copies the walk did reach were checked. |
 
 A vendored Gradle entry attests only while its wiring is live (apply line, index rows,

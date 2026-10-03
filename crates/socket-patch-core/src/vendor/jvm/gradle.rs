@@ -877,29 +877,31 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
         .map(|w| w.file.clone())
         .collect();
     files.insert(INDEX_REL.to_string());
-    // An index that exists but is not UTF-8 is unreadable, never absent:
-    // reading it as "no index" would take the last-patch path below and
-    // unwire every other vendored patch with it.
-    if read(INDEX_REL).is_some_and(|bytes| std::str::from_utf8(&bytes).is_err()) {
-        return JvmUnplan {
-            changes: Vec::new(),
-            drifted: vec![format!(
-                "{INDEX_REL} is not UTF-8; nothing was reverted (restore it from version \
-                 control and revert again)"
-            )],
-            still_wired: true,
+    // A file that exists but is not UTF-8 is unreadable, never absent:
+    // reading the index as "no index" would take the last-patch path below
+    // and unwire every other vendored patch with it, and dropping a
+    // settings or verification file would leave its apply line, in-block
+    // entry or patched hash behind while the revert reported clean.
+    let mut before: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for rel in files {
+        let text = match read(&rel) {
+            None => None,
+            Some(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => Some(text),
+                Err(_) => {
+                    return JvmUnplan {
+                        changes: Vec::new(),
+                        drifted: vec![format!(
+                            "{rel} is not UTF-8; nothing was reverted (restore it from \
+                             version control or re-save it as UTF-8, and revert again)"
+                        )],
+                        still_wired: true,
+                    };
+                }
+            },
         };
+        before.insert(rel, text);
     }
-    let mut before: BTreeMap<String, Option<String>> = files
-        .into_iter()
-        .filter_map(|rel| {
-            let text = match read(&rel) {
-                None => None,
-                Some(bytes) => Some(String::from_utf8(bytes).ok()?),
-            };
-            Some((rel, text))
-        })
-        .collect();
     let mut after = before.clone();
     let recs = |rel: &str| {
         records
@@ -3280,6 +3282,65 @@ mod tests {
         after.insert(INDEX_REL.into(), index);
         let undo = unplan(&|rel| after.get(rel).cloned(), &p.coords(), &plan.records);
         assert!(undo.still_wired && !undo.drifted.is_empty());
+        assert!(undo.changes.is_empty(), "{:?}", undo.changes);
+    }
+
+    /// #646 review: a settings script re-saved as Latin-1 after vendoring
+    /// is unreadable, not absent. Dropping it from the revert would take
+    /// the last-patch path, delete the owned script and index, and leave
+    /// the apply line pointing at a script that no longer exists.
+    #[test]
+    fn unplan_leaves_a_non_utf8_settings_script_and_keeps_the_wiring() {
+        let files = fs(&[("settings.gradle", "rootProject.name = 'x'\n")]);
+        let p = patch();
+        let plan = run(&files, &p).unwrap();
+        let mut after = applied(&files, &plan);
+        let mut settings = after["settings.gradle"].clone();
+        assert!(String::from_utf8_lossy(&settings).contains("socket-patch.settings.gradle"));
+        settings.extend_from_slice(b"// caf\xe9\n");
+        after.insert("settings.gradle".into(), settings);
+        let undo = unplan(&|rel| after.get(rel).cloned(), &p.coords(), &plan.records);
+        assert!(undo.still_wired, "{undo:?}");
+        assert!(
+            undo.drifted
+                .iter()
+                .any(|d| d.starts_with("settings.gradle is not UTF-8")),
+            "{:?}",
+            undo.drifted
+        );
+        assert!(undo.changes.is_empty(), "{:?}", undo.changes);
+    }
+
+    /// #646 review: a Latin-1 verification file would otherwise keep the
+    /// patched jar hash while the revert reported clean, failing upstream
+    /// dependency verification on the next build.
+    #[test]
+    fn unplan_leaves_a_non_utf8_verification_file_and_keeps_the_wiring() {
+        let before = format!(
+            "{VM_HEAD}{}{VM_TAIL}",
+            vm_component(
+                "com.google.code.gson",
+                "gson",
+                "2.10.1",
+                &[("gson-2.10.1.jar", "old"), ("gson-2.10.1.pom", "pomsha")]
+            ),
+        );
+        let files = fs(&[("settings.gradle", ""), (VERIFICATION_REL, &before)]);
+        let p = patch();
+        let plan = run(&files, &p).unwrap();
+        let mut after = applied(&files, &plan);
+        let mut vm = after[VERIFICATION_REL].clone();
+        vm.extend_from_slice(b"<!-- caf\xe9 -->\n");
+        after.insert(VERIFICATION_REL.into(), vm);
+        let undo = unplan(&|rel| after.get(rel).cloned(), &p.coords(), &plan.records);
+        assert!(undo.still_wired, "{undo:?}");
+        assert!(
+            undo.drifted
+                .iter()
+                .any(|d| d.starts_with(&format!("{VERIFICATION_REL} is not UTF-8"))),
+            "{:?}",
+            undo.drifted
+        );
         assert!(undo.changes.is_empty(), "{:?}", undo.changes);
     }
 

@@ -27,7 +27,11 @@
 //! newer upstream release appears (the Socket repository lists no
 //! versions, so leaving the selector dynamic could find no acceptable
 //! candidate at all), and the planner says so
-//! (`redirect_gradle_dynamic_selector_pinned`). A request whose selector
+//! (`redirect_gradle_dynamic_selector_pinned`). A `latest.*` request is
+//! refused (`redirect_gradle_latest_selector`): whether it admits the base
+//! depends on what the repositories list, so the script cannot rewrite it,
+//! and with every upstream candidate at or below the base rejected it
+//! would fail to resolve. A request whose selector
 //! does not admit the base (an explicit newer version, a lock or
 //! `strictly` above the base, a transitive bump) is left alone and
 //! resolves above the base; discovery then withholds the attestation
@@ -887,6 +891,36 @@ fn ga_refusal(
             ),
         ));
     }
+    // `latest.release` / `latest.integration` picks from the versions the
+    // repositories list. The pin cannot rewrite it (whether it admits the
+    // base depends on that listing), rejects every upstream candidate at or
+    // below the base, and the Socket repository lists none: while upstream
+    // has no release above the base, which is the usual case while the
+    // vulnerability is unfixed, every resolution fails.
+    if let Some((d, sel)) = decls.iter().find_map(|d| {
+        let rich = d.rich.as_ref();
+        [
+            d.version.as_deref(),
+            rich.and_then(|v| v.strictly.as_deref()),
+            rich.and_then(|v| v.require.as_deref()),
+            rich.and_then(|v| v.prefer.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|sel| matches!(parse_selector(sel), Selector::Latest(_)))
+        .map(|sel| (d, sel))
+    }) {
+        return Some(refusal(
+            "redirect_gradle_latest_selector",
+            format!(
+                "{}:{} requests {ga} as `{sel}`, which the pin cannot rewrite: with every \
+                 upstream release at or below {base} rejected and none listed by the Socket \
+                 repository, the build would fail until upstream ships a newer release. Declare \
+                 {ga}:{base} explicitly and scan again",
+                d.rel, d.line
+            ),
+        ));
+    }
     // A `strictly` above the base (a newer upstream fix) is left to
     // resolve, as the script lets it; one that only admits versions at or
     // below the base would fail every resolution under the pin.
@@ -1403,10 +1437,10 @@ pub(crate) fn rewrite_gradle_hosted(
                 .flatten()
                 .filter(|sel| {
                     let parsed = parse_selector(sel);
-                    matches!(
-                        parsed,
-                        Selector::Range { .. } | Selector::Prefix(_) | Selector::Latest(_)
-                    ) && admits(&parsed, &r.base) != Some(false)
+                    // `latest.*` is refused (`redirect_gradle_latest_selector`):
+                    // the pin never rewrites it.
+                    matches!(parsed, Selector::Range { .. } | Selector::Prefix(_))
+                        && admits(&parsed, &r.base) == Some(true)
                 })
                 .map(|sel| format!("{}:{} `{sel}`", d.rel, d.line))
                 .collect::<Vec<_>>()
@@ -1521,7 +1555,10 @@ fn refuse(
 /// (labelled when there are two). With a suffixed version it follows the
 /// owned script's rules: it routes only that version to the Socket
 /// repository, rewrites every request whose selector admits the base to
-/// it, and rejects every other candidate at or below the base, so a
+/// it (dependency substitution on the strictly / require / prefer
+/// constraint, so a `prefer`-only rich version is covered, plus
+/// `eachDependency`), and rejects every other candidate at or below the
+/// base, so a
 /// version above the base (a newer upstream fix) still resolves. It adds
 /// no dependency of its own, so it pastes into any project. For a same-GAV
 /// grant it can only route the base version (not fail-closed).
@@ -1597,11 +1634,11 @@ fn snippet(
         ),
         (Dsl::Groovy, Some(s)) => format!(
             "repositories {{\n    exclusiveContent {{\n        forRepository {{ maven {{ url '{url}' }} }}\n        filter {{ includeVersion('{g}', '{a}', '{s}') }}\n    }}\n}}\n\
-             configurations.configureEach {{\n    resolutionStrategy.eachDependency {{ DependencyResolveDetails d ->\n        def sel = d.requested.version\n        if (d.requested.group == '{g}' && d.requested.name == '{a}' && sel && sel != '{s}') {{\n            def p = new {STRATEGY}.VersionParser()\n            def vs = new {STRATEGY}.DefaultVersionSelectorScheme(new {STRATEGY}.DefaultVersionComparator(), p).parseSelector(sel)\n            if (!vs.requiresMetadata() && vs.accept('{base}')) {{\n                d.useVersion('{s}')\n                d.because('socket-patch hosted patch {uuid}')\n            }}\n        }}\n    }}\n    resolutionStrategy.componentSelection.all {{ ComponentSelection selection ->\n        def c = selection.candidate\n        def p = new {STRATEGY}.VersionParser()\n        def order = new {STRATEGY}.DefaultVersionComparator().asVersionComparator()\n        if (c.group == '{g}' && c.module == '{a}' && c.version != '{s}' && order.compare(p.transform(c.version), p.transform('{base}')) <= 0) {{\n            selection.reject('socket-patch: only {s} (hosted patch {uuid}) may resolve at or below {base}')\n        }}\n    }}\n}}"
+             configurations.configureEach {{\n    resolutionStrategy.dependencySubstitution.all {{ DependencySubstitution ds ->\n        def r = ds.requested\n        if (r instanceof org.gradle.api.artifacts.component.ModuleComponentSelector && r.group == '{g}' && r.module == '{a}') {{\n            def vc = r.versionConstraint\n            def sel = [vc.strictVersion, vc.requiredVersion, vc.preferredVersion].find {{ it }}\n            if (sel && sel != '{s}') {{\n                def p = new {STRATEGY}.VersionParser()\n                def vs = new {STRATEGY}.DefaultVersionSelectorScheme(new {STRATEGY}.DefaultVersionComparator(), p).parseSelector(sel)\n                if (!vs.requiresMetadata() && vs.accept('{base}')) {{\n                    ds.useTarget('{g}:{a}:{s}', 'socket-patch hosted patch {uuid}')\n                }}\n            }}\n        }}\n    }}\n    resolutionStrategy.eachDependency {{ DependencyResolveDetails d ->\n        def sel = d.requested.version\n        if (d.requested.group == '{g}' && d.requested.name == '{a}' && sel && sel != '{s}') {{\n            def p = new {STRATEGY}.VersionParser()\n            def vs = new {STRATEGY}.DefaultVersionSelectorScheme(new {STRATEGY}.DefaultVersionComparator(), p).parseSelector(sel)\n            if (!vs.requiresMetadata() && vs.accept('{base}')) {{\n                d.useVersion('{s}')\n                d.because('socket-patch hosted patch {uuid}')\n            }}\n        }}\n    }}\n    resolutionStrategy.componentSelection.all {{ ComponentSelection selection ->\n        def c = selection.candidate\n        def p = new {STRATEGY}.VersionParser()\n        def order = new {STRATEGY}.DefaultVersionComparator().asVersionComparator()\n        if (c.group == '{g}' && c.module == '{a}' && c.version != '{s}' && order.compare(p.transform(c.version), p.transform('{base}')) <= 0) {{\n            selection.reject('socket-patch: only {s} (hosted patch {uuid}) may resolve at or below {base}')\n        }}\n    }}\n}}"
         ),
         (Dsl::Kotlin, Some(s)) => format!(
             "repositories {{\n    exclusiveContent {{\n        forRepository {{ maven {{ url = uri(\"{url}\") }} }}\n        filter {{ includeVersion(\"{g}\", \"{a}\", \"{s}\") }}\n    }}\n}}\n\
-             configurations.configureEach {{\n    resolutionStrategy.eachDependency {{\n        val sel = requested.version\n        if (requested.group == \"{g}\" && requested.name == \"{a}\" && !sel.isNullOrEmpty() && sel != \"{s}\") {{\n            val p = {STRATEGY}.VersionParser()\n            val vs = {STRATEGY}.DefaultVersionSelectorScheme({STRATEGY}.DefaultVersionComparator(), p).parseSelector(sel)\n            if (!vs.requiresMetadata() && vs.accept(\"{base}\")) {{\n                useVersion(\"{s}\")\n                because(\"socket-patch hosted patch {uuid}\")\n            }}\n        }}\n    }}\n    resolutionStrategy.componentSelection.all {{\n        val p = {STRATEGY}.VersionParser()\n        val order = {STRATEGY}.DefaultVersionComparator().asVersionComparator()\n        if (candidate.group == \"{g}\" && candidate.module == \"{a}\" && candidate.version != \"{s}\" && order.compare(p.transform(candidate.version), p.transform(\"{base}\")) <= 0) {{\n            reject(\"socket-patch: only {s} (hosted patch {uuid}) may resolve at or below {base}\")\n        }}\n    }}\n}}"
+             configurations.configureEach {{\n    resolutionStrategy.dependencySubstitution.all {{\n        val r = requested\n        if (r is org.gradle.api.artifacts.component.ModuleComponentSelector && r.group == \"{g}\" && r.module == \"{a}\") {{\n            val vc = r.versionConstraint\n            val sel = listOf(vc.strictVersion, vc.requiredVersion, vc.preferredVersion).firstOrNull {{ !it.isNullOrEmpty() }}\n            if (sel != null && sel != \"{s}\") {{\n                val vs = {STRATEGY}.DefaultVersionSelectorScheme({STRATEGY}.DefaultVersionComparator(), {STRATEGY}.VersionParser()).parseSelector(sel)\n                if (!vs.requiresMetadata() && vs.accept(\"{base}\")) {{\n                    useTarget(\"{g}:{a}:{s}\", \"socket-patch hosted patch {uuid}\")\n                }}\n            }}\n        }}\n    }}\n    resolutionStrategy.eachDependency {{\n        val sel = requested.version\n        if (requested.group == \"{g}\" && requested.name == \"{a}\" && !sel.isNullOrEmpty() && sel != \"{s}\") {{\n            val p = {STRATEGY}.VersionParser()\n            val vs = {STRATEGY}.DefaultVersionSelectorScheme({STRATEGY}.DefaultVersionComparator(), p).parseSelector(sel)\n            if (!vs.requiresMetadata() && vs.accept(\"{base}\")) {{\n                useVersion(\"{s}\")\n                because(\"socket-patch hosted patch {uuid}\")\n            }}\n        }}\n    }}\n    resolutionStrategy.componentSelection.all {{\n        val p = {STRATEGY}.VersionParser()\n        val order = {STRATEGY}.DefaultVersionComparator().asVersionComparator()\n        if (candidate.group == \"{g}\" && candidate.module == \"{a}\" && candidate.version != \"{s}\" && order.compare(p.transform(candidate.version), p.transform(\"{base}\")) <= 0) {{\n            reject(\"socket-patch: only {s} (hosted patch {uuid}) may resolve at or below {base}\")\n        }}\n    }}\n}}"
         ),
     }
 }
@@ -2093,6 +2130,52 @@ mod tests {
         ]);
         let r = rewrite_registry_redirect(&exact, &[dep()]);
         assert!(!codes(&r).contains(&"redirect_gradle_dynamic_selector_pinned"));
+    }
+
+    /// #646 review: `latest.release` / `latest.integration` is refused, not
+    /// reported pinned: the script cannot rewrite it, and with every
+    /// upstream candidate at or below the base rejected the build fails
+    /// until upstream ships a newer release (verified on real Gradle).
+    #[test]
+    fn a_latest_selector_is_refused_not_reported_pinned() {
+        for decl in [
+            "implementation 'com.socketfixture:victim:latest.release'",
+            "implementation 'com.socketfixture:victim:latest.integration'",
+            "implementation('com.socketfixture:victim') { version { prefer 'latest.release' } }",
+        ] {
+            let r = assert_refused(
+                &[
+                    ("settings.gradle", ""),
+                    ("build.gradle", &format!("dependencies {{ {decl} }}\n")),
+                ],
+                dep(),
+                "redirect_gradle_latest_selector",
+            );
+            assert!(
+                !codes(&r).contains(&"redirect_gradle_dynamic_selector_pinned"),
+                "{decl}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    /// #646 review: the fallback snippet substitutes on the version
+    /// constraint (strictly, then require, then prefer) like the owned
+    /// script, so a `prefer`-only rich version, whose requested.version is
+    /// empty, is rewritten too. Real Gradle runs it in
+    /// `gradle_hosted_fallback_snippet_compiles_*`.
+    #[test]
+    fn the_fallback_snippet_substitutes_on_the_version_constraint() {
+        for dsl in [Dsl::Groovy, Dsl::Kotlin] {
+            let text = snippet(dsl, "https://x", G, A, "1.10.0", Some(SFX), UUID);
+            assert!(
+                text.contains("dependencySubstitution.all")
+                    && text.contains("vc.strictVersion, vc.requiredVersion, vc.preferredVersion")
+                    && text.contains("useTarget(")
+                    && text.contains("eachDependency"),
+                "{dsl:?}: {text}"
+            );
+        }
     }
 
     fn assert_refused(input: &[(&str, &str)], dep: DepOverride, code: &str) -> RewriteResult {

@@ -397,6 +397,75 @@ mod tests {
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
     }
 
+    /// #646 review: plan, then discovery, then restore on a build where
+    /// one project locks a release above the base. The planner confirms
+    /// the pin, discovery still finds it (unattested), and the pin it
+    /// names restores byte-exactly, leaving the above-base lock alone.
+    #[tokio::test]
+    async fn an_above_base_lock_plans_discovers_and_restores() {
+        let input: &[(&str, &str)] = &[
+            ("settings.gradle", "include 'a', 'b'\n"),
+            ("build.gradle", ""),
+            (
+                "a/build.gradle",
+                "dependencies { implementation 'com.socketfixture:victim:1.10.0' }\n",
+            ),
+            (
+                "a/gradle.lockfile",
+                "com.socketfixture:victim:1.10.0=runtimeClasspath\nempty=\n",
+            ),
+            (
+                "b/gradle.lockfile",
+                "com.socketfixture:victim:1.11.0=runtimeClasspath\nempty=\n",
+            ),
+        ];
+        let mut files: BTreeMap<String, String> = input
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let r = rewrite_registry_redirect(&files, &[dep(UUID, "victim")]);
+        assert!(r.confirmed_gradle_uuids.contains(UUID), "{:?}", r.warnings);
+        files.extend(r.files);
+        let tmp = tempfile::tempdir().unwrap();
+        for (rel, text) in &files {
+            let p = tmp.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+        let found = crate::vex::discover_patched_refs(tmp.path()).await;
+        let pins: Vec<HostedPin> = found
+            .refs
+            .iter()
+            .map(|r| HostedPin {
+                purl: r.purl.clone(),
+                uuid: r.uuid.clone(),
+                files: vec![r.source_file.to_string_lossy().into_owned()],
+            })
+            .collect();
+        assert_eq!(pins, vec![pin(UUID, "victim")], "{:?}", found.diagnostics);
+        assert_eq!(found.unattested.len(), 1, "{:?}", found.unattested);
+        let outcome = restore_upstream(
+            tmp.path(),
+            &pins,
+            &RestoreOptions {
+                offline: true,
+                ..RestoreOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome.pins[0].status,
+            PinStatus::Restored,
+            "{:?}",
+            outcome.pins
+        );
+        let want: BTreeMap<String, String> = input
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(tree(tmp.path()), want);
+    }
+
     /// A settings file the user had, even an empty or BOM-only one (an
     /// empty `settings.gradle` marks a build root), keeps its bytes; only
     /// a planner-created settings file goes.

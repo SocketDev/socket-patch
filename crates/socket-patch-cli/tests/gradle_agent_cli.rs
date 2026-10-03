@@ -867,6 +867,74 @@ fn remove_restores_an_m2_only_copy_the_build_no_longer_reads() {
     assert_eq!(std::fs::read(m2.join(POM)).unwrap(), PRISTINE_POM);
 }
 
+/// #646 review: a `~/.m2` copy this Gradle-only build never reads, holding
+/// bytes that are neither side of the record (another build applied a
+/// different patch there, or `mvn install` rebuilt it), must not fail this
+/// project's rollback or `remove`: the Gradle copy is restored, the m2 copy
+/// is left as it is with `gradle_m2_copy_not_restored`, and `remove` drops
+/// the record.
+#[test]
+fn unconsumed_m2_copy_with_foreign_bytes_does_not_fail_rollback_or_remove() {
+    let foreign = jar(&[(NOTICE, b"another build's patch\n")]);
+    for cmd in [
+        &["rollback", "--offline"][..],
+        &["remove", PURL, "--offline"],
+    ] {
+        let f = fx(CENTRAL);
+        let m2 = f.m2(&[(JAR, &foreign), (POM, PRISTINE_POM)]);
+        let version = f.gradle(&as_refs(&pristine_files()));
+        f.leaf_manifest();
+        f.run(&["apply", "--offline"]).ok();
+        assert_eq!(hash_copies(&version, JAR)[0].1, patched_jar());
+        f.run(cmd).ok().has("gradle_m2_copy_not_restored");
+        assert_eq!(hash_copies(&version, JAR)[0].1, pristine_jar(), "{cmd:?}");
+        assert_eq!(std::fs::read(m2.join(JAR)).unwrap(), foreign, "{cmd:?}");
+        let manifest = std::fs::read_to_string(f.proj.join(".socket/manifest.json")).unwrap();
+        if cmd[0] == "remove" {
+            assert!(!manifest.contains(PURL), "{manifest}");
+        }
+    }
+    // A Gradle copy in the same state still fails: the build reads it.
+    let f = fx(CENTRAL);
+    f.gradle(&[(JAR, &foreign), (POM, PRISTINE_POM)]);
+    f.leaf_manifest();
+    let out = f.run(&["rollback", "--offline"]);
+    out.failed();
+    assert!(
+        !out.warning_codes()
+            .iter()
+            .any(|c| c == "gradle_m2_copy_not_restored"),
+        "{}",
+        out.json
+    );
+}
+
+/// #646 review: a member-keyed record whose unconsumed `~/.m2` jar was
+/// swapped by another project (its original backed up there, not under
+/// this project's `.socket/jvm-originals/`) cannot be restored here; the
+/// rollback restores the Gradle copy and leaves the m2 jar with a warning
+/// instead of failing on `jvm_jar_backup_missing`.
+#[test]
+fn unconsumed_m2_jar_without_a_backup_here_does_not_fail_rollback() {
+    let other = jar(&[
+        ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\r\n\r\n"),
+        (NOTICE, b"patched\n"),
+        ("other.txt", b"swapped by another project\n"),
+    ]);
+    let f = fx(CENTRAL);
+    let m2 = f.m2(&[(JAR, &other), (POM, PRISTINE_POM)]);
+    let version = f.gradle(&as_refs(&pristine_files()));
+    f.member_manifest();
+    let (_rt, server) = service(&service_jar());
+    f.run(&["apply", "--vendor-url", &server.uri()]).ok();
+    assert_eq!(hash_copies(&version, JAR)[0].1, service_jar());
+    f.run(&["rollback", "--offline"])
+        .ok()
+        .has("gradle_m2_copy_not_restored");
+    assert_eq!(hash_copies(&version, JAR)[0].1, pristine_jar());
+    assert_eq!(std::fs::read(m2.join(JAR)).unwrap(), other);
+}
+
 /// A before-blob that does not hash to the Gradle hash dir it is restored
 /// into fails the rollback (`gradle_rollback_hash_mismatch`).
 #[test]

@@ -404,6 +404,22 @@ pub struct ResolvedElsewhere {
     pub file: PathBuf,
 }
 
+/// A ref discovery emits (so rollback, remove and list find the wiring)
+/// that must not be attested: the files show a build that resolves the
+/// package from somewhere the pin does not reach. Today: a Gradle lock
+/// entry above the hosted pin's base (the owned script lets that newer
+/// upstream release resolve), so that build consumes no patch. The CLI's
+/// VEX plan omits every candidate of `(purl, uuid)` with `detail`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Unattested {
+    /// Canonical base purl ([`canonical_base_purl`]).
+    pub purl: String,
+    pub uuid: String,
+    /// Root-relative file that shows the bypass.
+    pub file: PathBuf,
+    pub detail: String,
+}
+
 /// Everything [`discover_patched_refs`] found.
 #[derive(Debug, Clone, Default)]
 pub struct Discovery {
@@ -421,6 +437,8 @@ pub struct Discovery {
     /// non-Socket source — the evidence the cross-lock contest
     /// ([`discover_patched_refs_with`]) weighs against another lock's ref.
     pub elsewhere: Vec<ResolvedElsewhere>,
+    /// Refs in `refs` whose wiring a build bypasses ([`Unattested`]).
+    pub unattested: Vec<Unattested>,
 }
 
 impl Discovery {
@@ -667,9 +685,22 @@ impl Discovery {
         });
     }
 
+    /// Record that the ref `(purl, uuid)` is wired but bypassed by the
+    /// build `file` shows ([`Unattested`]). Pushed beside the ref itself.
+    pub(crate) fn unattested(&mut self, purl: &str, uuid: &str, file: &str, detail: String) {
+        self.unattested.push(Unattested {
+            purl: canonical_base_purl(purl),
+            uuid: uuid.to_string(),
+            file: PathBuf::from(file),
+            detail,
+        });
+    }
+
     fn finalize(&mut self) {
         self.elsewhere.sort();
         self.elsewhere.dedup();
+        self.unattested.sort();
+        self.unattested.dedup();
         self.refs.sort_by(|a, b| {
             (&a.source_file, &a.purl, &a.uuid, a.mode).cmp(&(
                 &b.source_file,
