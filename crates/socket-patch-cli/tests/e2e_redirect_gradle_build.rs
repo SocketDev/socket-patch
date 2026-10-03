@@ -824,8 +824,8 @@ fn gradle_hosted_selector_port_matches_golden_tables() {
 #[ignore = "real Gradle; run with --ignored"]
 fn gradle_hosted_selector_golden_tables_match_real_gradle() {
     use socket_patch_core::gradle::selector::{
-        admits_for, gradle_version_cmp_for, parse_selector, GOLDEN_ADMITS,
-        GOLDEN_ADMITS_BY_MAJOR, GOLDEN_ORDERING, GOLDEN_ORDERING_BY_MAJOR,
+        admits_for, gradle_version_cmp_for, parse_selector, GOLDEN_ADMITS, GOLDEN_ADMITS_BY_MAJOR,
+        GOLDEN_ORDERING, GOLDEN_ORDERING_BY_MAJOR,
     };
     let groovy = |s: &str| format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"));
     let mut ords: Vec<(&str, &str)> = GOLDEN_ORDERING.iter().map(|(a, b, _)| (*a, *b)).collect();
@@ -865,7 +865,10 @@ for (r in adm) {{
     let Some(c) = cell(
         Dsl::Groovy,
         &[
-            ("settings.gradle".into(), "rootProject.name = 'probe'\n".into()),
+            (
+                "settings.gradle".into(),
+                "rootProject.name = 'probe'\n".into(),
+            ),
             ("build.gradle".into(), probe),
         ],
     ) else {

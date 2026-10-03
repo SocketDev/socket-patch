@@ -1690,13 +1690,18 @@ never filters.
 `apply` writes every copy a build consumes: each `~/.m2` version directory the build
 reads and each Gradle hash directory that holds the record's files. A Gradle version
 directory holding none of the record's files is not an install of it
-(`package_not_installed`). A record keyed by jar members (`<a>-<v>.jar/<member>`,
+(`package_not_installed`). One holding only some of them is: the held files are
+patched and the missing ones fail that copy as not found, as on `~/.m2` (the build
+still loads the held jar). A record keyed by jar members (`<a>-<v>.jar/<member>`,
 #264) swaps the whole jar for the patch service's build of it, in one transaction
 across every consumed copy: one download, one backup per distinct original under
 `.socket/jvm-originals/`, and a failed write puts every copy already swapped back.
-`rollback` restores only copies `apply` writes (never the read-only cache, never a
-`~/.m2` copy a Gradle-only build does not read), from the backup, else, online and
-for a Gradle copy only, from an upstream download that hashes to the copy's hash
+`rollback` (and `remove`) restores every writable copy that still holds the record's
+patched bytes: never the read-only cache, but also a `~/.m2` copy a Gradle-only build
+no longer reads (an earlier apply wrote it while the build declared `mavenLocal()`,
+or before v5.0 gated `~/.m2`; leaving it would strand the shared jar patched once
+`remove` drops the record). It restores from the backup, else, online and for a
+Gradle copy only, from an upstream download that hashes to the copy's hash
 directory.
 
 Run-level `warnings[]` codes (a refusal is also a `failed` event whose `error`
@@ -1706,6 +1711,7 @@ starts with the code):
 |---|---|---|
 | `gradle_verification_metadata_present` | refused, exit 1 | `gradle/verification-metadata.xml` exists; rewritten cache bytes would fail (or, with key-only trust, slip past) Gradle's dependency verification. Nothing is written; use `--mode vendored` or `--mode hosted`. |
 | `gradle_build_ignores_m2` | refused, exit 1 | The only installed copy is in `~/.m2`, which this Gradle-only build never reads. Nothing is patched; build once so Gradle caches it, then apply again. |
+| `gradle_m2_may_be_unconsumed` | warning | A Gradle-only build that declares `mavenLocal()` (or may) has no Gradle cache copy, so only the `~/.m2` copy was patched. Gradle takes a module from the first declared repository that has it: with another repository before `mavenLocal()`, the next build downloads the unpatched jar. Run the build once and apply again. |
 | `gradle_ro_cache_shadows` | exit 1 | The read-only cache holds a copy that is never written and that Gradle may read first. Writable copies are still patched. |
 | `gradle_copy_unexpected_bytes` | refused, exit 1 | A hash directory's file is the pristine download (its sha1 names the directory) but neither side of the record, or a hash directory holds a variant's files whose bytes no variant was made for. That copy is left unpatched and the run fails (changed in v5.0: it used to only warn), since the build still loads it. |
 | `gradle_transform_copy_stale` | that copy fails | After the write, Gradle still holds a copy derived from the pristine jar (`caches/transforms-*`, `caches/jars-*`, instrumented jars). Run `gradle --stop`, delete those directories, apply again. |
@@ -1844,7 +1850,8 @@ CLI.
 `vex` re-hashes every copy a build consumes (`~/.m2` copies the build reads, every
 Gradle hash directory holding the record's files, and the suffixed copies of a
 hosted pin) and attests only when all of them carry the patch. A Gradle version
-directory that holds none of the record's files is ignored. A derived copy
+directory that holds none of the record's files is ignored; one that holds only some
+of them is judged, and its missing files withhold the statement. A derived copy
 (`caches/transforms-*`, `caches/jars-*`, instrumented jars) proven to come from the
 pristine jar, or a same-named one that is older than the patched jar and does not
 match it, withholds the statement:

@@ -811,7 +811,9 @@ async fn generate_vex(
 /// declared or undetermined keeps it), each Gradle cache and the read-only
 /// cache, all re-hashed at VEX time. A Gradle version dir holding none of
 /// the record's files (a pom-only entry, another classifier) is not an
-/// install of it and is dropped, as apply does.
+/// install of it and is dropped, as apply does. One holding only some of
+/// them is kept: the keys it lacks verify as not found, so the statement
+/// is withheld while the build loads the held (unpatched) jar.
 async fn vex_copy_sets(
     common: &GlobalArgs,
     manifest: &PatchManifest,
@@ -830,10 +832,9 @@ async fn vex_copy_sets(
         }
         match jvm_jar::classify(purl, &record.files) {
             RecordShape::Members { jar_leaf } => !jvm_jar::jar_copies(path, &jar_leaf).is_empty(),
-            RecordShape::Leaf => {
-                let detailed = installed_copies_detailed(path, &record.files);
-                detailed.missing.is_empty() && !detailed.targets.is_empty()
-            }
+            RecordShape::Leaf => !installed_copies_detailed(path, &record.files)
+                .targets
+                .is_empty(),
         }
     };
     let maven = copies.keys().any(|p| p.starts_with("pkg:maven/"));

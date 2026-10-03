@@ -2296,11 +2296,17 @@ pub(crate) async fn rollback_patches_inner(
             .as_ref()
             .filter(|_| Ecosystem::from_purl(purl) == Some(Ecosystem::Maven))
         {
-            // Only the copies apply writes (`JvmScope::split`'s consumed
-            // ones): the read-only cache is never written, and a `~/.m2`
-            // copy this Gradle-only build never reads belongs to some
-            // other build — restoring it would unpatch that build.
-            for pkg_path in &scope.split(pkg_paths).consumed {
+            // Every writable copy: the read-only cache is never written,
+            // but a `~/.m2` copy this Gradle-only build no longer reads
+            // (`m2_ignored`) is still restored. An earlier apply wrote it
+            // (before the gate existed, or while `mavenLocal()` was
+            // declared); skipping it would leave the shared jar patched
+            // with no record to restore it from once `remove` drops the
+            // entry. Only bytes that verify as this record's afterHash
+            // are ever put back, and a Maven build that wants the patch
+            // re-applies it from its own manifest.
+            let copies = scope.split(pkg_paths);
+            for pkg_path in copies.consumed.iter().chain(&copies.m2_ignored) {
                 let key = (strip_purl_qualifiers(purl).to_string(), pkg_path.clone());
                 match maven_groups.iter_mut().find(|(k, _)| *k == key) {
                     Some((_, purls)) => purls.push(purl),

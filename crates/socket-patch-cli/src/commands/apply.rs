@@ -209,10 +209,13 @@ fn format_mismatch_fetch_result(downloaded: usize, needed: usize) -> String {
 /// mismatched files still need their afterHash blobs. The variant gate
 /// mirrors the apply loop's representative check PER COPY for gem and
 /// PyPI (which patch every copy, and two envs can hold different wheels
-/// of one release), and against the FIRST copy otherwise (Maven's
-/// Gradle copies are version dirs whose files sit in hash dirs, gated per
-/// hash dir by `apply_maven_base`): a variant's files are probed only on
-/// the copies it is attempted on.
+/// of one release), and against the FIRST copy otherwise: a variant's
+/// files are probed only on the copies it is attempted on. Maven's Gradle
+/// copies are version dirs whose files sit in hash dirs, so each one is
+/// first expanded into the hash dirs holding the record's files (as
+/// `apply_maven_base` does) and gated and probed per hash dir; probing the
+/// version dir itself would only ever find nothing, and a drifted Gradle
+/// copy would never queue the afterHash blob its write needs.
 ///
 /// Only a mismatched file whose afterHash blob is NOT staged can queue a
 /// fetch, so the probe first decides that with metadata probes alone and
@@ -265,21 +268,40 @@ async fn mismatch_blob_gaps(
                 || records
                     .first()
                     .is_some_and(|(key, _)| key.as_str() != stripped));
-        // The copies the apply loop gates per copy: gem and PyPI patch
-        // every copy, each against its own representative check; the
-        // rest gate on the first.
-        let gate_copies: &[PathBuf] = if matches!(
-            Ecosystem::from_purl(purl),
-            Some(Ecosystem::Gem | Ecosystem::Pypi)
-        ) {
-            pkg_paths.as_slice()
-        } else {
-            std::slice::from_ref(first_path)
-        };
+        let maven = Ecosystem::from_purl(purl) == Some(Ecosystem::Maven);
         for (_, record) in records {
             if !can_queue(record) {
                 continue;
             }
+            // Maven: every Gradle version dir expanded into the hash dirs
+            // holding the record's files.
+            let expanded: Vec<PathBuf> = if maven {
+                pkg_paths
+                    .iter()
+                    .flat_map(|p| {
+                        socket_patch_core::crawlers::gradle_cache::installed_copies(
+                            p,
+                            &record.files,
+                        )
+                        .into_iter()
+                        .map(|(dir, _)| dir)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let pkg_paths: &[PathBuf] = if maven { &expanded } else { pkg_paths };
+            // The copies the apply loop gates per copy: gem and PyPI patch
+            // every copy, each against its own representative check, and
+            // Maven each hash dir; the rest gate on the first.
+            let gate_copies: &[PathBuf] = if matches!(
+                Ecosystem::from_purl(purl),
+                Some(Ecosystem::Gem | Ecosystem::Pypi | Ecosystem::Maven)
+            ) {
+                pkg_paths
+            } else {
+                std::slice::from_ref(first_path)
+            };
             // Copies this variant is attempted on: a copy whose installed
             // distribution is another variant (two envs can hold different
             // wheels of one release) is skipped there by the apply loop.
@@ -2527,6 +2549,35 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
         return out;
     }
 
+    // A Gradle-only build that reads `~/.m2` (mavenLocal() declared or
+    // undetermined) but has no Gradle cache copy: the m2 copy is patched,
+    // yet Gradle takes a module from the FIRST declared repository that
+    // has it, so when another repository comes before mavenLocal() the
+    // next build downloads the pristine jar instead. Gradle never caches
+    // a mavenLocal() artifact in files-2.1, so this is also exactly what a
+    // build reading the module from mavenLocal() looks like: warn, not
+    // refuse. `vex` re-hashes the Gradle cache copy that build makes.
+    if matches!(
+        m.scope.gate,
+        Some(socket_patch_core::crawlers::maven_crawler::M2Gate::Declared(_))
+            | Some(socket_patch_core::crawlers::maven_crawler::M2Gate::Undetermined(_))
+    ) && copies.consumed.iter().all(|c| !is_gradle_version_dir(c))
+    {
+        out.warn(
+            "gradle_m2_may_be_unconsumed",
+            format!(
+                "{}: the only patched copy is in the Maven local repository ({}). This Gradle                  build reads it only when no repository declared before mavenLocal() has the                  module; otherwise its next build downloads the unpatched jar. Run the build                  once and apply again so the Gradle cache copy is patched too.",
+                normalize_purl(m.base_purl),
+                copies
+                    .consumed
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+
     let multi = variants.len() > 1 || variants.first().is_some_and(|v| **v != m.base_purl);
     let gate_variants = !args.force && multi;
     let mut attempted = false;
@@ -2589,11 +2640,16 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
 
         for copy in &copies.consumed {
             // Leaf record: the hash dirs holding its files (the copy itself
-            // for `~/.m2`). A key no hash dir holds means this Gradle copy
-            // does not hold the variant.
-            let targets = if is_gradle_version_dir(copy) {
+            // for `~/.m2`). A Gradle copy holding NONE of the record's
+            // files is not an install of it. One holding only some of them
+            // is: its held files are patched, and the keys no hash dir
+            // holds are applied against the version dir, where they are
+            // not found and fail the copy as they would on `~/.m2` (the
+            // build still loads the held jar, so a silent skip would leave
+            // it unpatched behind a clean exit).
+            let (targets, absent) = if is_gradle_version_dir(copy) {
                 let detailed = gradle_cache::installed_copies_detailed(copy, &patch.files);
-                if !detailed.missing.is_empty() {
+                if detailed.targets.is_empty() {
                     continue;
                 }
                 for (dir, _) in &detailed.targets {
@@ -2601,10 +2657,16 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
                         .or_default()
                         .push((*variant).clone());
                 }
-                detailed.targets
+                let absent: HashMap<String, PatchFileInfo> = detailed
+                    .missing
+                    .iter()
+                    .filter_map(|k| patch.files.get(k).map(|info| (k.clone(), info.clone())))
+                    .collect();
+                (detailed.targets, absent)
             } else {
-                vec![(copy.clone(), patch.files.clone())]
+                (vec![(copy.clone(), patch.files.clone())], HashMap::new())
             };
+            let mut copy_attempted = false;
             for (dir, files) in targets {
                 if gate_variants {
                     let status = match representative_file(&files) {
@@ -2619,6 +2681,7 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
                 }
                 hit.insert(dir.clone());
                 out.matched.push((*variant).clone());
+                copy_attempted = true;
                 if let Some(detail) = unexpected_gradle_bytes(&dir, &files).await {
                     out.refuse(variant, &dir, "gradle_copy_unexpected_bytes", detail);
                     continue;
@@ -2637,6 +2700,24 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
                 for leaf in files.keys().filter(|k| k.ends_with(".jar")) {
                     check_derived_copies(&mut out, &mut result, leaf, args, m.derived).await;
                 }
+                out.record(args, result);
+            }
+            // The record's keys this Gradle copy lacks, once the variant
+            // was attempted on its held files: not found there (a failure
+            // under the default and strict policies, a skip under
+            // `--force`), as on a `~/.m2` copy missing them.
+            if copy_attempted && !absent.is_empty() {
+                attempted = true;
+                let result = apply_package_patch(
+                    variant,
+                    copy,
+                    &absent,
+                    m.sources,
+                    Some(&patch.uuid),
+                    args.common.dry_run,
+                    m.policy,
+                )
+                .await;
                 out.record(args, result);
             }
         }
@@ -3334,6 +3415,43 @@ mod tests {
             HashSet::from(["5".repeat(64)]),
             "a singleton base falls through to the mismatch policy, so its blob is needed"
         );
+    }
+
+    /// #646 review: a Gradle copy is a `files-2.1` version dir whose files
+    /// sit one level down in `<sha1>/` hash dirs. A drifted jar there (not
+    /// pristine, not the record's beforeHash) must queue its afterHash
+    /// blob as a drifted `~/.m2` copy does: the default Warn policy
+    /// overwrites it with the full blob.
+    #[tokio::test]
+    async fn mismatch_blob_gaps_probes_gradle_hash_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let version = dir
+            .path()
+            .join(".gradle/caches/modules-2/files-2.1/com.example/victim/1.0");
+        let hash = version.join("0123456789abcdef0123456789abcdef01234567");
+        tokio::fs::create_dir_all(&hash).await.unwrap();
+        tokio::fs::write(hash.join("victim-1.0.jar"), b"older patch bytes")
+            .await
+            .unwrap();
+        let blobs = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+        let mut files = HashMap::new();
+        files.insert(
+            "package/victim-1.0.jar".to_string(),
+            PatchFileInfo {
+                before_hash: "4".repeat(64),
+                after_hash: "5".repeat(64),
+            },
+        );
+        let manifest = manifest_with_record("pkg:maven/com.example/victim@1.0", files);
+        let mut all_packages = HashMap::new();
+        all_packages.insert(
+            "pkg:maven/com.example/victim@1.0".to_string(),
+            vec![version.clone()],
+        );
+        let needed =
+            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
+        assert_eq!(needed, HashSet::from(["5".repeat(64)]));
     }
 
     /// A QUALIFIED singleton (`?platform=`…) keeps the

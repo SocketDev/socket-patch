@@ -529,6 +529,36 @@ fn maven_local_declared_patches_m2_and_gradle_in_both_orders() {
     }
 }
 
+/// #646 review: mavenLocal() declared after mavenCentral() and no Gradle
+/// cache copy yet: the m2 copy is patched (a module only mavenLocal()
+/// has is read from there, never cached in files-2.1), but the run says
+/// the build may instead download the pristine jar from the earlier
+/// repository (`gradle_m2_may_be_unconsumed`).
+#[test]
+fn m2_only_copy_with_maven_local_declared_warns_it_may_be_unconsumed() {
+    let f = fx("    mavenCentral()\n    mavenLocal()\n");
+    let m2 = f.m2(&as_refs(&pristine_files()));
+    f.leaf_manifest();
+    f.run(&["apply", "--offline"])
+        .ok()
+        .has("gradle_m2_may_be_unconsumed");
+    assert_eq!(std::fs::read(m2.join(JAR)).unwrap(), patched_jar());
+    // With a Gradle cache copy patched too there is nothing to warn about.
+    let g = fx("    mavenCentral()\n    mavenLocal()\n");
+    g.m2(&as_refs(&pristine_files()));
+    g.gradle(&as_refs(&pristine_files()));
+    g.leaf_manifest();
+    let out = g.run(&["apply", "--offline"]);
+    out.ok();
+    assert!(
+        !out.warning_codes()
+            .iter()
+            .any(|c| c == "gradle_m2_may_be_unconsumed"),
+        "{}",
+        out.json
+    );
+}
+
 /// mavenLocal() declared only in a user-home init script still makes the
 /// build read `~/.m2`: the m2 copy is patched.
 #[test]
@@ -740,6 +770,24 @@ fn gradle_copy_without_the_patched_file_is_not_installed() {
     );
 }
 
+/// #646 review: a Gradle copy holding only SOME of a record's files (the
+/// jar, but not the pom a `metadataSources { artifact() }` build never
+/// downloads) is still an install: the held jar is patched, the missing
+/// pom fails the run as it would on `~/.m2`, and `vex` withholds instead
+/// of dropping the copy and attesting the `~/.m2` one.
+#[test]
+fn gradle_copy_missing_some_record_files_fails_and_vex_withholds() {
+    let f = fx("    mavenLocal()\n    mavenCentral()\n");
+    let m2 = f.m2(&as_refs(&pristine_files()));
+    let version = f.gradle(&[(JAR, &pristine_jar())]);
+    f.leaf_manifest();
+    f.run(&["apply", "--offline"]).failed();
+    assert_eq!(hash_copies(&version, JAR)[0].1, patched_jar());
+    assert_eq!(std::fs::read(m2.join(JAR)).unwrap(), patched_jar());
+    let (out, statements) = f.vex(&[]);
+    assert_eq!(statements, 0, "{}", out.json);
+}
+
 // ── derived copies ──────────────────────────────────────────────────────
 
 /// Set `path`'s mtime `secs` seconds into the past.
@@ -788,10 +836,12 @@ fn instrumented_copy_made_after_the_apply_does_not_withhold() {
 
 // ── rollback scope and checks ───────────────────────────────────────────
 
-/// A Gradle-only build's rollback restores only what its apply wrote: the
-/// `~/.m2` copy another (Maven) build patched stays patched.
+/// A Gradle-only build's rollback also restores a `~/.m2` copy it no
+/// longer reads: an earlier apply (before the `mavenLocal()` gate, or
+/// while the script declared it) patched it, and leaving it would strand
+/// the shared jar patched once `remove` drops the record.
 #[test]
-fn rollback_leaves_an_m2_copy_the_build_never_reads() {
+fn rollback_restores_an_m2_copy_the_build_no_longer_reads() {
     let f = fx(CENTRAL);
     let m2 = f.m2(&[(JAR, &patched_jar()), (POM, PATCHED_POM)]);
     let version = f.gradle(&as_refs(&pristine_files()));
@@ -800,11 +850,21 @@ fn rollback_leaves_an_m2_copy_the_build_never_reads() {
     assert_eq!(hash_copies(&version, JAR)[0].1, patched_jar());
     f.run(&["rollback", "--offline"]).ok();
     assert_eq!(hash_copies(&version, JAR)[0].1, pristine_jar());
-    assert_eq!(
-        std::fs::read(m2.join(JAR)).unwrap(),
-        patched_jar(),
-        "another build's ~/.m2 copy must stay patched"
-    );
+    assert_eq!(std::fs::read(m2.join(JAR)).unwrap(), pristine_jar());
+    assert_eq!(std::fs::read(m2.join(POM)).unwrap(), PRISTINE_POM);
+}
+
+/// #646 review: the patched `~/.m2` copy is the only one (the build never
+/// cached the artifact). `remove` restores it before it drops the record,
+/// instead of reporting success with the shared jar still patched.
+#[test]
+fn remove_restores_an_m2_only_copy_the_build_no_longer_reads() {
+    let f = fx(CENTRAL);
+    let m2 = f.m2(&[(JAR, &patched_jar()), (POM, PATCHED_POM)]);
+    f.leaf_manifest();
+    f.run(&["remove", PURL, "--offline"]).ok();
+    assert_eq!(std::fs::read(m2.join(JAR)).unwrap(), pristine_jar());
+    assert_eq!(std::fs::read(m2.join(POM)).unwrap(), PRISTINE_POM);
 }
 
 /// A before-blob that does not hash to the Gradle hash dir it is restored

@@ -462,13 +462,20 @@ cannot be read literally, `~/.m2` stays in the scan and scan notes
 download of a version, and each one holding the patched files is patched. Records
 keyed by members inside a jar swap in the patch service's build of the whole jar, so
 they need network access (`jvm_agent_service_required` offline). The original is
-backed up under `.socket/jvm-originals/` and `rollback` restores from it. Guards:
+backed up under `.socket/jvm-originals/` and `rollback` restores from it. `rollback`
+and `remove` restore every patched writable copy, including a `~/.m2` copy the build
+no longer reads (an earlier apply patched it while `mavenLocal()` was declared).
+Guards:
 
 - `gradle/verification-metadata.xml` present: refused
   (`gradle_verification_metadata_present`). Gradle would reject the rewritten bytes,
   so use hosted or vendored mode.
 - The only copy is in `~/.m2`, which the build never reads: refused
   (`gradle_build_ignores_m2`). Build once so Gradle caches the jar, then apply.
+- The only copy is in `~/.m2` and the build declares `mavenLocal()`: patched, with
+  the warning `gradle_m2_may_be_unconsumed`. When another repository comes before
+  `mavenLocal()`, Gradle downloads the module from it instead; build once and apply
+  again.
 - **Read-only cache shadowing.** A copy in `$GRADLE_RO_DEP_CACHE` is never written,
   and Gradle may read it first. The writable copies are patched but the run fails
   (`gradle_ro_cache_shadows`). Rebuild the read-only cache from a patched user home.
