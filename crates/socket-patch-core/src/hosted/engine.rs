@@ -1541,6 +1541,19 @@ fn file_ecosystem(rel: &str) -> Option<&'static str> {
         .then_some("pypi")
 }
 
+/// The [`guard`]'s non-UTF-8 rule on its own (#721): the first of
+/// `undecodable` (a [`CandidateFiles::undecodable_reads`]) whose ecosystem
+/// has a candidate refuses the run. The vendored→hosted takeover runs it
+/// before reverting anything, so a refusal never strands a reverted purl.
+pub fn undecodable_guard(undecodable: &[String], candidates: &[Candidate]) -> Option<Refusal> {
+    undecodable
+        .iter()
+        .find(|rel| {
+            file_ecosystem(rel).is_some_and(|eco| candidates.iter().any(|c| c.dep.ecosystem == eco))
+        })
+        .map(|rel| undecodable_refusal(rel))
+}
+
 /// SYMLINK GUARD — fail-closed, whole rewrite, before the ledger and before
 /// any write (hosted rewrites are transactional). The writer stages next to
 /// the path and renames over it, which REPLACES a symbolic link with a
@@ -1571,17 +1584,13 @@ pub fn guard(
     if let Some(linked) = written().find(|k| view.is_symlink(k)) {
         return Some(symlink_refusal(linked));
     }
+    if let Some(refusal) = undecodable_guard(&done.undecodable_reads, candidates) {
+        return Some(refusal);
+    }
     let candidate_ecosystems: BTreeSet<&str> = candidates
         .iter()
         .map(|c| c.dep.ecosystem.as_str())
         .collect();
-    if let Some(rel) = done
-        .undecodable_reads
-        .iter()
-        .find(|rel| file_ecosystem(rel).is_some_and(|eco| candidate_ecosystems.contains(eco)))
-    {
-        return Some(undecodable_refusal(rel));
-    }
     let ProjectView::Memory(project) = view else {
         return None;
     };
