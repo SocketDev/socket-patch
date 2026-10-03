@@ -2371,11 +2371,11 @@ async fn bun_malformed_tuples_are_skipped() {
 /// {}, "sha512-…"]` is still the registry package, fetched from the patch
 /// host (#720): every committed hosted-rewriter output (lock v0 / v1 / v2,
 /// CRLF, alias and nested keys, workspace-nested instances) inventories
-/// `left-pad@1.3.0` with its hosted URL and sha512, so a lockfile-only
-/// re-run can rediscover a hosted pin (pnpm / vlt / berry parity).
+/// `left-pad@1.3.0`, so a lockfile-only re-run can rediscover a hosted pin
+/// (pnpm / vlt / berry parity). The entry is identity only: the URL and
+/// sha512 belong to the patched artifact, not a pristine registry source.
 #[tokio::test]
 async fn bun_text_hosted_pins_inventory_as_their_registry_package() {
-    const SRI: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
     const UUID: &str = "77777777-7777-7777-7777-777777777777";
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/redirect/npm/bun");
     for case in [
@@ -2398,22 +2398,18 @@ async fn bun_text_hosted_pins_inventory_as_their_registry_package() {
             .unwrap()
             .unwrap_or_else(|| panic!("{case}: no inventory"));
         assert_eq!(flavor, NpmLockFlavor::Bun, "{case}");
+        assert!(lock.contains(UUID), "{case}: fixture must be hosted-wired");
         let left_pad = entry(&entries, "left-pad");
         assert_eq!(left_pad.version, "1.3.0", "{case}");
-        assert_eq!(left_pad.integrity, LockIntegrity::Sri(SRI.into()), "{case}");
-        assert!(
-            left_pad
-                .resolved
-                .as_deref()
-                .is_some_and(|url| url.contains(UUID) && url.ends_with("/left-pad-1.3.0.tgz")),
-            "{case}: {left_pad:?}"
-        );
+        // Identity only: the URL and sha512 are the patched artifact's.
+        assert_eq!(left_pad.resolved, None, "{case}");
+        assert_eq!(left_pad.integrity, LockIntegrity::None, "{case}");
     }
 }
 
 /// A Bun < 1.3.10 re-save drops a URL 3-tuple's sha512, leaving the 2-tuple
 /// `["left-pad@https://…/left-pad-1.3.0.tgz", {}]`: still the hosted pin, so
-/// it is still inventoried (with no verifier: the fetch layer refuses it).
+/// it is still inventoried.
 /// A URL whose leaf is not the package's own `<name>-<version>.tgz` (a
 /// user's arbitrary tarball dependency) and our vendored 3-tuple stay out.
 #[tokio::test]
@@ -2451,16 +2447,19 @@ async fn bun_text_hosted_pin_shapes_and_non_pins() {
         ],
         "{entries:?}"
     );
-    assert_eq!(entry(&entries, "left-pad").integrity, LockIntegrity::None);
-    assert_eq!(
-        entry(&entries, "@scope/pkg").integrity,
-        LockIntegrity::Sri("sha512-c2NvcGU=".into())
-    );
+    for e in &entries {
+        assert_eq!(
+            (&e.resolved, &e.integrity),
+            (&None, &LockIntegrity::None),
+            "{e:?}"
+        );
+    }
 }
 
 /// The binary twin of [`bun_text_hosted_pins_inventory_as_their_registry_package`]:
 /// a `bun.lockb` record the hosted rewriter re-pointed at a patch-host
-/// tarball carries no registry version, and is recovered from its URL leaf.
+/// tarball carries no registry version, and is recovered from its URL leaf
+/// (identity only, like the text pin).
 #[tokio::test]
 async fn bun_binary_hosted_pins_inventory_as_their_registry_package() {
     let bytes = include_bytes!("../../../tests/fixtures/bun-lockb/1.1.45/bun.lockb");
@@ -2485,8 +2484,8 @@ async fn bun_binary_hosted_pins_inventory_as_their_registry_package() {
         vec![("minimist".into(), "1.2.2".into())]
     );
     let minimist = entry(&entries, "minimist");
-    assert_eq!(minimist.resolved.as_deref(), Some(hosted));
-    assert_eq!(minimist.integrity, LockIntegrity::Sri(sri));
+    assert_eq!(minimist.resolved, None);
+    assert_eq!(minimist.integrity, LockIntegrity::None);
 }
 
 /// composer.lock packages missing a name or version are skipped, and

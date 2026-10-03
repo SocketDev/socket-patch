@@ -64,9 +64,9 @@ pub(super) async fn inventory_bun_binary_in(
             // `<name>-<version>.tgz` (#720). Workspace, file and git sources
             // have no registry version; a local vendored tarball's pristine
             // metadata is recovered from its wiring ledger instead.
-            let version = match package.version {
-                Some(version) => version,
-                None => hosted_url_version(&package.resolution, &package.name)?.to_string(),
+            let Some(version) = package.version else {
+                let version = hosted_url_version(&package.resolution, &package.name)?;
+                return Some(hosted_pin(&package.name, version));
             };
             if !version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                 return None;
@@ -153,10 +153,16 @@ fn hosted_pin_entry(entry: &BunEntry) -> Option<LockfileEntry> {
     }
     let spec = bun_lock_text::decode_json_string(&entry.elems[0])?;
     let (name, url) = bun_lock_text::split_name_spec(&spec)?;
-    let version = hosted_url_version(url, name)?;
-    let integrity = match entry.elems.get(2) {
-        Some(raw) => LockIntegrity::Sri(bun_lock_text::decode_json_string(raw)?),
-        None => LockIntegrity::None,
-    };
-    Some(LockfileEntry::npm(name, version, http_url(url), integrity))
+    Some(hosted_pin(name, hosted_url_version(url, name)?))
+}
+
+/// The registry identity of a bun hosted pin, and nothing else. The pin's
+/// URL and sha512 name the PATCHED artifact, so neither is a pristine
+/// source a registry fetch could use, and this view cannot tell a Socket
+/// host from a foreign one (that is the hosted-origin policy lockfile
+/// discovery applies): a recorded URL carrying a uuid would read as proof
+/// that a redirect ledger record is live (`vex::discover`). Like a yarn
+/// berry hosted pin, the entry carries no location and no verifier.
+fn hosted_pin(name: &str, version: &str) -> LockfileEntry {
+    LockfileEntry::npm(name, version, None, LockIntegrity::None)
 }
