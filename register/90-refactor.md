@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-02T23:58Z · main @ 045d7ec_
+_Last updated 2026-10-03T01:05Z · main @ 045d7ec_
 
 **In flight:**
 - [#574](https://github.com/SocketDev/socket-patch/pull/574): one vlt `registry_base` following vlt's DepID hydration. Issues #562 (E02, E03). State: ready (Ready for review). It awaits human approval.
@@ -15,12 +15,12 @@ _Last updated 2026-10-02T23:58Z · main @ 045d7ec_
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
 | 1 | #568 (C03): takeover honors `kept_artifact` via `vendored_backend`'s revert step | 1 | 0 | 1 | L | 4 | skipped: `scan/hosted.rs` changed by open PR #598 |
-| 2 | #593 (E50): one version-aware `packages.lock.json` walker | 1 | 0 | 3 | M | 4 | skipped: `redirect/mod.rs` changed by open PR #597; new bughunt #623 (BOM) and #624 may share this root cause, re-score B once #597 lands |
-| 3 | E37: byte-identical `is_safe_{cargo,gem,nuget}_coordinate` + `normalize_version` copy | 0 | 0 | 4 | L | 4 | to verify; `cargo_crawler.rs`/`nuget_crawler.rs` changed by open PR #602 |
-| 4 | C07: URL builders disagree on a missing org slug (`/v0/orgs/default` vs public proxy) | 1 | 0 | 3 | M | 4 | verified on 045d7ec; needs an owner decision on the fallback route (`covgap_api_client` pins `default`) |
+| 2 | #593 (E50): one version-aware `packages.lock.json` walker | 1 | 0 | 3 | M | 4 | skipped: `redirect/mod.rs` changed by open PR #597; bughunt #623 (BOM) and #624 may share this root cause, re-score B once #597 lands |
+| 3 | #630 (E37): one `path_safety::is_safe_name_version` + Maven guard in utils; delete `is_safe_{cargo,gem,nuget}_coordinate` and `composer_crawler::normalize_version` | 0 | 0 | 4 | L | 4 | skipped: `cargo_crawler.rs`/`nuget_crawler.rs` changed by open PR #602 |
+| 4 | #629 + #628 (E09, E51): one `formats/yarn/berry_gates.rs` for both modes; hosted refuses a mixed-EOL root `package.json` | 1 | 0 | 3 | M | 4 | skipped: `redirect/mod.rs` (#597) and `scan/hosted.rs` (#598) changed by open PRs |
 | 5 | #614 (C38): proxy per-package fallback sized from `utils::concurrent`; delete `PROXY_BATCH_PATH_CONCURRENCY` and dead `registry_concurrency` | 1 | 0 | 1 | L | 4 | skipped: `api/client.rs` changed by open PRs #607 and #610 |
 
-At capacity (3 open, all ready, all reviewed "ready to merge") on 2026-10-02T23:58Z; re-ranked, queue unchanged (blockers #598, #597, #602, #607, #610 still open; #615 is a decision issue), no new work started. Taken: #571 (C37) in #607, score 2 (B1 D1 R M). Checked and set aside: E13 (`poetry_lock`/`pdm_lock`): the fragment walkers differ in real format handling, not just one shape check.
+At capacity (3 open, all ready, all reviewed "ready to merge") on 2026-10-03T01:05Z; re-ranked with the new issues #628–#631, no new work started (blockers #597, #598, #602, #607, #610 still open). Next: #631 (E52, go.sum oracle delete + move to `formats/golang`), score 3.5 (D3.5 R L), skipped while #597 changes `redirect/mod.rs`. Dropped C07 from the queue: needs an owner decision on the fallback route. Taken: #571 (C37) in #607, score 2 (B1 D1 R M). Checked and set aside: E13 (`poetry_lock`/`pdm_lock`): the fragment walkers differ in real format handling, not just one shape check.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
