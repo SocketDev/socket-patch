@@ -21,14 +21,28 @@
 //!
 //! Detection is positive and marker-based, on the package directory's real
 //! path: a per-project store reached through a symlink (pnpm's
-//! `node_modules/.pnpm`, a relocated `virtualStoreDir`, a workspace link)
-//! carries neither marker and is patched as before.
+//! `node_modules/.pnpm`, a relocated `virtualStoreDir`, a member's link
+//! into the root store) carries neither marker and is patched as before.
+//!
+//! One more kind of link is not ours to write through, though no other
+//! project shares it: a `node_modules/<name>` entry that resolves outside
+//! every `node_modules` tree. Package managers link that way only to
+//! first-party source (an npm / yarn / pnpm / bun workspace member, a
+//! `file:` or `link:` directory dependency, an `npm link` target), never to
+//! an installed copy, so writing through it would overwrite the user's own
+//! code with upstream bytes that no reinstall gives back (#626). Store links
+//! (pnpm's `.pnpm`, Yarn's `.store`, vlt's `.vlt`, bun's `.bun`, npm's
+//! linked `.store`) all resolve inside a `node_modules` tree.
 
 use std::path::{Path, PathBuf};
 
 /// The substring every shared-store refusal carries, so callers and tests
 /// can recognize it without matching the full sentence.
 pub const SHARED_STORE_REFUSAL_MARKER: &str = "shared by other projects";
+
+/// The substring every linked-source refusal carries (see
+/// [`SharedStoreKind::LinkedSource`]).
+pub const LINKED_SOURCE_REFUSAL_MARKER: &str = "outside every node_modules tree";
 
 /// A cross-project store a package directory resolves into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +51,10 @@ pub enum SharedStoreKind {
     PdmPackageCache,
     /// `<store>/v<N>/links`, pnpm's global virtual store.
     PnpmGlobalVirtualStore,
+    /// A `node_modules` entry linked to first-party source outside every
+    /// `node_modules` tree (a workspace member, a `file:` / `link:`
+    /// directory dependency, an `npm link` target).
+    LinkedSource,
 }
 
 /// Where a package directory really lives, when that is a shared store.
@@ -61,6 +79,17 @@ impl SharedStore {
                 "pnpm's global virtual store (enableGlobalVirtualStore)",
                 "set enableGlobalVirtualStore to false and reinstall",
             ),
+            SharedStoreKind::LinkedSource => {
+                return format!(
+                    "Refusing to {action} {path}: node_modules links to it, but it is \
+                     {LINKED_SOURCE_REFUSAL_MARKER} (a workspace member, a `file:` or \
+                     `link:` directory dependency, or an `npm link` target), so it is \
+                     first-party source that no reinstall restores, not an installed \
+                     copy of the registry package. Patch that source directly, or \
+                     install the package from the registry instead of linking it",
+                    path = self.real_path.display(),
+                );
+            }
         };
         format!(
             "Refusing to {action} {path}: it is in {what}, which is \
@@ -157,7 +186,40 @@ fn shared_store_of_blocking(pkg_path: &Path) -> Option<SharedStore> {
             });
         }
     }
-    None
+    linked_source_of(pkg_path, real)
+}
+
+/// [`SharedStoreKind::LinkedSource`]: `pkg_path` is spelled as a
+/// `node_modules` entry (`node_modules/<name>` or
+/// `node_modules/@scope/<name>`), yet its real path `real` is neither below
+/// that `node_modules` (a real dir, or a link into its own store) nor below
+/// any other `node_modules` (a workspace member's link into the root store).
+fn linked_source_of(pkg_path: &Path, real: PathBuf) -> Option<SharedStore> {
+    let parent = pkg_path.parent()?;
+    let node_modules = if is_node_modules(parent) {
+        parent
+    } else {
+        let scope = parent.file_name()?.to_str()?;
+        let grandparent = parent.parent()?;
+        if !scope.starts_with('@') || !is_node_modules(grandparent) {
+            return None;
+        }
+        grandparent
+    };
+    let real_node_modules = std::fs::canonicalize(node_modules).ok()?;
+    if real.starts_with(&real_node_modules)
+        || real.components().any(|c| c.as_os_str() == "node_modules")
+    {
+        return None;
+    }
+    Some(SharedStore {
+        kind: SharedStoreKind::LinkedSource,
+        real_path: real,
+    })
+}
+
+fn is_node_modules(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|n| n == "node_modules")
 }
 
 /// `v3`, `v10`, `v11`, …: the layout-version directory of a pnpm store.
@@ -324,6 +386,99 @@ mod tests {
         assert_eq!(shared_store_of_patch_dirs(&site, ["../x/y.py"]).await, None);
     }
 
+    /// #626: a `node_modules` entry linked to first-party source (a
+    /// workspace member, a `file:` / `link:` dir, an `npm link` target,
+    /// scoped or not, global prefix included) is refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn node_modules_link_to_first_party_source_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        let nm = root.join("node_modules");
+        std::fs::create_dir_all(nm.join("@acme")).unwrap();
+        let member = root.join("packages").join("left-pad");
+        let scoped_member = root.join("packages").join("util");
+        let checkout = dir.path().join("dev").join("is-odd");
+        for d in [&member, &scoped_member, &checkout] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // Workspace member / `file:` dep, a scoped one, an `npm link` target.
+        symlink("../packages/left-pad", nm.join("left-pad")).unwrap();
+        symlink("../../packages/util", nm.join("@acme").join("util")).unwrap();
+        symlink(&checkout, nm.join("is-odd")).unwrap();
+        // `npm link` from the global prefix: lib/node_modules/<name> -> checkout.
+        let global_nm = dir.path().join("prefix").join("lib").join("node_modules");
+        std::fs::create_dir_all(&global_nm).unwrap();
+        symlink(&checkout, global_nm.join("is-odd")).unwrap();
+
+        for (pkg, real) in [
+            (nm.join("left-pad"), &member),
+            (nm.join("@acme").join("util"), &scoped_member),
+            (nm.join("is-odd"), &checkout),
+            (global_nm.join("is-odd"), &checkout),
+        ] {
+            let got = shared_store_of(&pkg).await.expect("refused");
+            assert_eq!(got.kind, SharedStoreKind::LinkedSource, "{}", pkg.display());
+            assert_eq!(got.real_path, std::fs::canonicalize(real).unwrap());
+            // Classified through the patch's own file keys too.
+            let got = shared_store_of_patch_dirs(&pkg, ["index.js", "lib/a.js"]).await;
+            assert_eq!(got.map(|s| s.kind), Some(SharedStoreKind::LinkedSource));
+        }
+    }
+
+    /// Links into a store inside a `node_modules` tree, and real dirs,
+    /// are installed copies and stay patchable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn node_modules_store_links_and_real_dirs_are_not_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        let nm = root.join("node_modules");
+        // A real dir, plain and scoped.
+        std::fs::create_dir_all(nm.join("left-pad")).unwrap();
+        std::fs::create_dir_all(nm.join("@types").join("node")).unwrap();
+        // A member's link into the root `.pnpm` store.
+        let store_pkg = nm
+            .join(".pnpm")
+            .join("is-number@6.0.0")
+            .join("node_modules")
+            .join("is-number");
+        std::fs::create_dir_all(&store_pkg).unwrap();
+        let member_nm = root.join("packages").join("a").join("node_modules");
+        std::fs::create_dir_all(&member_nm).unwrap();
+        symlink(&store_pkg, member_nm.join("is-number")).unwrap();
+        // Yarn's pnpm linker: node_modules/<name> -> node_modules/.store/<entry>/package.
+        let yarn_pkg = nm.join(".store").join("is-odd-npm-3.0.1-x").join("package");
+        std::fs::create_dir_all(&yarn_pkg).unwrap();
+        symlink(".store/is-odd-npm-3.0.1-x/package", nm.join("is-odd")).unwrap();
+        // A node_modules that is itself a link to a dir not named node_modules.
+        let cache_nm = dir.path().join("cache").join("modules");
+        let cache_store_pkg = cache_nm.join(".store").join("e").join("package");
+        std::fs::create_dir_all(cache_nm.join("six")).unwrap();
+        std::fs::create_dir_all(&cache_store_pkg).unwrap();
+        symlink(".store/e/package", cache_nm.join("ms")).unwrap();
+        let linked_root = dir.path().join("linked");
+        std::fs::create_dir_all(&linked_root).unwrap();
+        symlink(&cache_nm, linked_root.join("node_modules")).unwrap();
+
+        for pkg in [
+            nm.join("left-pad"),
+            nm.join("@types").join("node"),
+            store_pkg.clone(),
+            member_nm.join("is-number"),
+            nm.join("is-odd"),
+            linked_root.join("node_modules").join("six"),
+            linked_root.join("node_modules").join("ms"),
+        ] {
+            assert_eq!(shared_store_of(&pkg).await, None, "{}", pkg.display());
+        }
+        // A first-party dir that is not spelled as a node_modules entry
+        // (a PyPI site-packages root, a cargo vendor dir) is not classified.
+        assert_eq!(shared_store_of(&root.join("packages")).await, None);
+    }
+
     #[test]
     fn refusal_names_store_and_remedy() {
         let s = SharedStore {
@@ -339,5 +494,13 @@ mod tests {
             real_path: PathBuf::from("/s/v10/links/x"),
         };
         assert!(s.refusal("roll back").contains("enableGlobalVirtualStore"));
+        let s = SharedStore {
+            kind: SharedStoreKind::LinkedSource,
+            real_path: PathBuf::from("/ws/packages/left-pad"),
+        };
+        let msg = s.refusal("patch");
+        assert!(msg.contains(LINKED_SOURCE_REFUSAL_MARKER), "{msg}");
+        assert!(msg.contains("/ws/packages/left-pad"), "{msg}");
+        assert!(!msg.contains(SHARED_STORE_REFUSAL_MARKER), "{msg}");
     }
 }

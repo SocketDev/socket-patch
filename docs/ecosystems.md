@@ -166,6 +166,17 @@ names the store and how to get a private copy (disable the global virtual
 store, or `pdm config install.cache_method hardlink`, then reinstall), or
 use hosted or vendored mode.
 
+Agent-mode `apply` and `rollback` also fail, dry run included, on a
+`node_modules/<dep>` (or `node_modules/@scope/<dep>`) link whose real path
+is outside every `node_modules` tree. Package managers link that way only
+to first-party source: an npm, Yarn, pnpm or Bun workspace member, a
+`file:` or `link:` directory dependency, or an `npm link` target. That
+source is not an installed copy of the registry package, and no reinstall
+restores it, so it is never overwritten. Patch it directly instead (vendored
+mode refuses it the same way, with `vendor_workspace_member`). Links into a
+store inside a `node_modules` tree, including a workspace member's link
+into the root `node_modules/.pnpm`, are patched as usual.
+
 Every command that looks for installed npm copies walks these same trees, not
 only `scan`. A package installed only under a pruned directory is therefore
 "not installed" to `scan --prune` / `--sync`, which garbage-collect its
