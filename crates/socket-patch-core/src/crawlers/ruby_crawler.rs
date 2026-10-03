@@ -971,6 +971,50 @@ pub async fn bundler_loaded_manifest_with_env(
     crate::formats::gem::manifest::classify(root, gemfile_env, config_value.as_deref())
 }
 
+/// The Bundler mirror setting that captures one of the patch-registry
+/// `sources` (see [`crate::formats::gem::mirror`]), described for the
+/// refusal's detail. Reads the app config (honoring `BUNDLE_APP_CONFIG`
+/// and `BUNDLE_IGNORE_CONFIG`) and ambient `BUNDLE_MIRROR__...` settings.
+pub async fn bundler_source_mirror(
+    root: &Path,
+    sources: &[&str],
+) -> Option<crate::formats::gem::mirror::MirrorCapture> {
+    let environment: Vec<_> = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            if !key.starts_with("BUNDLE_MIRROR__") {
+                return None;
+            }
+            Some((key, value.into_string().ok()?))
+        })
+        .collect();
+    let mirrors: Vec<_> = environment
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    bundler_source_mirror_with_env(
+        root,
+        sources,
+        &mirrors,
+        std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+        bundler_ignores_config(),
+    )
+    .await
+}
+
+/// [`bundler_source_mirror`] with the environment passed explicitly
+/// (hermetic tests).
+pub async fn bundler_source_mirror_with_env(
+    root: &Path,
+    sources: &[&str],
+    mirror_environment: &[(&str, &str)],
+    app_config_env: Option<&OsStr>,
+    ignore_config: bool,
+) -> Option<crate::formats::gem::mirror::MirrorCapture> {
+    let config = read_app_config(root, app_config_env, ignore_config).await;
+    crate::formats::gem::mirror::capturing_mirror(config.as_deref(), mirror_environment, sources)
+}
+
 /// Whether bundler skips its config files: `Bundler::Settings#ignore_config?`
 /// is `ENV["BUNDLE_IGNORE_CONFIG"]`, so any value set (even an empty one)
 /// switches them off and every setting comes from the environment alone.
@@ -997,9 +1041,10 @@ async fn read_app_config(
 /// exactly: `$BUNDLE_APP_CONFIG` when set (a relative value resolves against
 /// the project root, NOT the process cwd), else `<root>/.bundle` — e.g. the
 /// official ruby Docker images export `BUNDLE_APP_CONFIG=/usr/local/bundle`.
+/// A set-but-empty value is truthy in Ruby and selects `<root>/config`.
 pub(crate) fn bundler_app_config_dir(root: &Path, env_value: Option<&OsStr>) -> PathBuf {
     match env_value {
-        Some(v) if !v.is_empty() => {
+        Some(v) => {
             let p = PathBuf::from(v);
             if p.is_absolute() {
                 p
@@ -1007,7 +1052,7 @@ pub(crate) fn bundler_app_config_dir(root: &Path, env_value: Option<&OsStr>) -> 
                 root.join(p)
             }
         }
-        _ => root.join(".bundle"),
+        None => root.join(".bundle"),
     }
 }
 
@@ -1334,6 +1379,131 @@ mod tests {
             bundler_app_cache_dir_with_env(root, None, None, false).await,
             abs
         );
+    }
+
+    /// The app-config path/ignore controls apply equally to all mirror forms.
+    #[tokio::test]
+    async fn source_mirror_reads_the_app_config_and_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = ["https://patch.test/gem/tok/uuid/"];
+        assert_eq!(
+            bundler_source_mirror_with_env(dir.path(), &src, &[], None, false).await,
+            None
+        );
+        std::fs::create_dir(dir.path().join(".bundle")).unwrap();
+        for key in [
+            "BUNDLE_MIRROR__ALL",
+            "BUNDLE_MIRROR__PATCH__TEST",
+            "BUNDLE_MIRROR__HTTPS://PATCH__TEST/GEM/TOK/UUID/",
+        ] {
+            std::fs::write(
+                dir.path().join(".bundle/config"),
+                format!("---\n{key}: \"https://m.example/\"\n"),
+            )
+            .unwrap();
+            let local = bundler_source_mirror_with_env(dir.path(), &src, &[], None, false)
+                .await
+                .unwrap();
+            assert!(local.setting.contains("project's Bundler config"));
+            assert_eq!(
+                bundler_source_mirror_with_env(dir.path(), &src, &[], None, true).await,
+                None
+            );
+            let env = [(key, "https://env.example/")];
+            let capture = bundler_source_mirror_with_env(dir.path(), &src, &env, None, true)
+                .await
+                .unwrap();
+            assert!(capture.setting.contains("environment"));
+            assert_eq!(
+                bundler_source_mirror_with_env(
+                    dir.path(),
+                    &src,
+                    &[],
+                    Some(OsStr::new("elsewhere")),
+                    false
+                )
+                .await,
+                None
+            );
+        }
+        std::fs::create_dir(dir.path().join("elsewhere")).unwrap();
+        std::fs::write(
+            dir.path().join("elsewhere/config"),
+            "BUNDLE_MIRROR__PATCH__TEST: \"https://m.example/\"\n",
+        )
+        .unwrap();
+        assert!(bundler_source_mirror_with_env(
+            dir.path(),
+            &src,
+            &[],
+            Some(OsStr::new("elsewhere")),
+            false
+        )
+        .await
+        .is_some());
+    }
+
+    /// Ruby treats an empty BUNDLE_APP_CONFIG as set: config lives directly
+    /// in the project root, and the usual .bundle/config must not shadow it.
+    #[tokio::test]
+    async fn empty_app_config_selects_root_config_and_respects_ignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let src = ["https://patch.test/gem/tok/uuid/"];
+        std::fs::create_dir(root.join(".bundle")).unwrap();
+        let capture = "BUNDLE_MIRROR__ALL: \"https://mirror.example/\"\n";
+        let scoped = "BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/: \"https://mirror.example/\"\n";
+        for root_captures in [true, false] {
+            let (root_config, usual_config) = if root_captures {
+                (capture, scoped)
+            } else {
+                (scoped, capture)
+            };
+            std::fs::write(root.join("config"), root_config).unwrap();
+            std::fs::write(root.join(".bundle/config"), usual_config).unwrap();
+            assert_eq!(
+                bundler_source_mirror_with_env(root, &src, &[], Some(OsStr::new("")), false)
+                    .await
+                    .is_some(),
+                root_captures
+            );
+            assert_eq!(
+                bundler_source_mirror_with_env(root, &src, &[], None, false)
+                    .await
+                    .is_some(),
+                !root_captures
+            );
+            assert!(
+                bundler_source_mirror_with_env(root, &src, &[], Some(OsStr::new("")), true)
+                    .await
+                    .is_none()
+            );
+            assert!(bundler_source_mirror_with_env(
+                root,
+                &src,
+                &[("BUNDLE_MIRROR__ALL", "https://env.example/")],
+                Some(OsStr::new("")),
+                true
+            )
+            .await
+            .is_some());
+        }
+        // Existing manifest/cache consumers share the same config location.
+        std::fs::write(
+            root.join("config"),
+            "BUNDLE_GEMFILE: \"Gemfile.next\"\nBUNDLE_CACHE_PATH: \"root-cache\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            bundler_loaded_manifest_with_env(root, None, Some(OsStr::new("")), false).await,
+            crate::formats::gem::manifest::LoadedManifest::Unsupported { .. }
+        ));
+        assert_eq!(
+            bundler_app_cache_dir_with_env(root, None, Some(OsStr::new("")), false).await,
+            root.join("root-cache")
+        );
+        assert_eq!(bundler_app_config_dir(root, Some(OsStr::new(""))), root);
+        assert_eq!(bundler_app_config_dir(root, None), root.join(".bundle"));
     }
 
     #[test]

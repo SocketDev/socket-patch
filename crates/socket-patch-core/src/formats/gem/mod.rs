@@ -20,6 +20,7 @@
 
 pub(crate) mod hosted;
 pub(crate) mod manifest;
+pub(crate) mod mirror;
 
 use std::collections::{BTreeSet, HashMap};
 
