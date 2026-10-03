@@ -30,7 +30,11 @@
 //!   `overrides` entries lost their `specifier` for the url — re-derived
 //!   from the paired metadata's declarations in uv's spelling (a
 //!   multi-clause specifier only when another entry of the lock shows how
-//!   this uv joins clauses), and an `overrides` entry the rewrite added for
+//!   this uv joins clauses). The declaration is the one uv lowered the
+//!   entry from: PEP 735 `include-group` members are expanded, and when one
+//!   name has several specifiers the entry's marker picks one (its
+//!   `extra == '<x>'` terms name the extra, the rest is the declaration's
+//!   own marker). An `overrides` entry the rewrite added for
 //!   a transitive dependency is removed with its `override-dependencies`
 //!   line;
 //! * the metadata's `[tool.uv.sources].<name> = { url }` is removed.
@@ -793,36 +797,57 @@ enum Declared<'a> {
     Manifest(&'a str),
 }
 
-/// Every declaration string `declared` covers in the metadata.
-fn declarations<'d>(meta: &'d Metadata, declared: Declared<'_>) -> Vec<&'d str> {
+/// One declaration a lock requirement entry can mirror: the PEP 508 string
+/// and, for a `[project.optional-dependencies]` member, its extra (PEP 685
+/// normalized) — uv lowers that into the entry's marker as `extra == '<x>'`.
+struct Declaration<'d> {
+    spec: &'d str,
+    extra: Option<String>,
+}
+
+/// Every declaration `declared` covers in the metadata.
+fn declarations<'d>(meta: &'d Metadata, declared: Declared<'_>) -> Vec<Declaration<'d>> {
     let doc = &meta.doc;
     let uv = tool_uv(doc);
+    let plain = |specs: Vec<&'d str>| {
+        specs
+            .into_iter()
+            .map(|spec| Declaration { spec, extra: None })
+            .collect()
+    };
     match declared {
         Declared::Dist => {
             let project = doc.get("project");
-            let mut out = strings(project.and_then(|p| p.get("dependencies")));
+            let mut out: Vec<Declaration<'d>> =
+                plain(strings(project.and_then(|p| p.get("dependencies"))));
             if let Some(extras) = project
                 .and_then(|p| p.get("optional-dependencies"))
                 .and_then(Item::as_table_like)
             {
-                for (_, group) in extras.iter() {
-                    out.extend(strings(Some(group)));
+                for (extra, group) in extras.iter() {
+                    let extra = canonicalize_pypi_name(extra);
+                    out.extend(strings(Some(group)).into_iter().map(|spec| Declaration {
+                        spec,
+                        extra: Some(extra.clone()),
+                    }));
                 }
             }
             out
         }
         Declared::Dev(group) => {
-            let mut out = strings(
-                doc.get("dependency-groups")
-                    .and_then(Item::as_table_like)
-                    .and_then(|g| g.get(group)),
+            let mut out = Vec::new();
+            group_members(
+                doc.get("dependency-groups").and_then(Item::as_table_like),
+                group,
+                &mut Vec::new(),
+                &mut out,
             );
             if group == "dev" {
                 out.extend(strings(uv.and_then(|u| u.get("dev-dependencies"))));
             }
-            out
+            plain(out)
         }
-        Declared::Manifest("requirements") => strings(doc.get("dependencies")),
+        Declared::Manifest("requirements") => plain(strings(doc.get("dependencies"))),
         Declared::Manifest(key) => {
             let key = match key {
                 "constraints" => "constraint-dependencies",
@@ -830,9 +855,114 @@ fn declarations<'d>(meta: &'d Metadata, declared: Declared<'_>) -> Vec<&'d str> 
                 "overrides" => "override-dependencies",
                 other => other,
             };
-            strings(uv.and_then(|u| u.get(key)))
+            plain(strings(uv.and_then(|u| u.get(key))))
         }
     }
+}
+
+/// A PEP 735 group's requirement strings, with its `{ include-group = … }`
+/// members expanded the way uv expands them into the lock (group names
+/// compare normalized; a group already being expanded is not re-entered).
+fn group_members<'d>(
+    groups: Option<&'d dyn TableLike>,
+    group: &str,
+    expanding: &mut Vec<String>,
+    out: &mut Vec<&'d str>,
+) {
+    let canon = canonicalize_pypi_name(group);
+    if expanding.contains(&canon) {
+        return;
+    }
+    let Some(members) = groups
+        .into_iter()
+        .flat_map(|g| g.iter())
+        .find(|(name, _)| canonicalize_pypi_name(name) == canon)
+        .and_then(|(_, item)| item.as_array())
+    else {
+        return;
+    };
+    expanding.push(canon);
+    for member in members.iter() {
+        if let Some(spec) = member.as_str() {
+            out.push(spec);
+        } else if let Some(included) = member
+            .as_inline_table()
+            .and_then(|t| t.get("include-group"))
+            .and_then(Value::as_str)
+        {
+            group_members(groups, included, expanding, out);
+        }
+    }
+    expanding.pop();
+}
+
+/// The extras an entry's marker names (`extra == '<x>'`), normalized.
+fn marker_extras(marker: &str) -> BTreeSet<String> {
+    static EXTRA: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"\bextra\s*==\s*['"]([^'"]+)['"]"#).expect("static extra regex")
+    });
+    EXTRA
+        .captures_iter(marker)
+        .map(|c| canonicalize_pypi_name(&c[1]))
+        .collect()
+}
+
+/// A comparison key for a PEP 508 marker as uv records it in the lock:
+/// `and`-joined atoms with `extra` terms dropped, quotes and spacing
+/// normalized, sorted, and `python_version` comparisons spelled as the
+/// `python_full_version` bounds uv rewrites them into. A marker with `or`
+/// or parentheses is compared as normalized text.
+fn marker_key(marker: &str) -> String {
+    static ATOM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"^([A-Za-z_][A-Za-z0-9_.]*)\s*(===|==|!=|~=|<=|>=|<|>)\s*(?:'([^']*)'|"([^"]*)")$"#,
+        )
+        .expect("static marker atom regex")
+    });
+    static AND: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\s+and\s+").expect("static and regex"));
+    let text = marker.trim();
+    if text.contains('(') || text.split_whitespace().any(|w| w == "or") {
+        return text
+            .replace('"', "'")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    let mut atoms: Vec<String> = AND
+        .split(text)
+        .filter(|atom| !atom.trim().is_empty())
+        .filter_map(|atom| {
+            let atom = atom.trim();
+            let Some(c) = ATOM.captures(atom) else {
+                return Some(atom.replace('"', "'").split_whitespace().collect());
+            };
+            let (var, op) = (&c[1], &c[2]);
+            let value = c.get(3).or_else(|| c.get(4)).map_or("", |m| m.as_str());
+            if var == "extra" {
+                return None;
+            }
+            if var == "python_version" {
+                if let Some((major, minor)) = value
+                    .split_once('.')
+                    .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+                {
+                    let next = format!("{major}.{}", minor + 1);
+                    let full = |op: &str, v: &str| format!("python_full_version {op} '{v}'");
+                    return Some(match op {
+                        "<" | ">=" => full(op, value),
+                        "<=" => full("<", &next),
+                        ">" => full(">=", &next),
+                        "==" | "!=" => full(op, &format!("{value}.*")),
+                        _ => format!("{var} {op} '{value}'"),
+                    });
+                }
+            }
+            Some(format!("{var} {op} '{value}'"))
+        })
+        .collect();
+    atoms.sort();
+    atoms.join(" and ")
 }
 
 /// The normalized version clauses of a PEP 508 registry requirement (`[]`
@@ -931,7 +1061,8 @@ impl SpecStyle {
                 if !specifier.contains(',') {
                     continue;
                 }
-                if let Ok(Some(clauses)) = declared_clauses(meta, declared, name) {
+                let marker = entry.get("marker").and_then(Value::as_str);
+                if let Ok(Some(clauses)) = declared_clauses(meta, declared, name, marker) {
                     evidence.push((specifier.to_string(), clauses));
                 }
             }
@@ -946,32 +1077,68 @@ impl SpecStyle {
     }
 }
 
-/// The one clause list every declaration of `name` in `declared` agrees
-/// on; `Ok(None)` when nothing declares it.
+/// The clause list of the declaration of `name` in `declared` that a lock
+/// entry with `marker` mirrors; `Ok(None)` when nothing declares it.
+///
+/// When every declaration agrees, that is the answer whatever the marker.
+/// Otherwise uv's lowering picks one: the marker's `extra == '<x>'` terms
+/// name the extras it came from (none: `dependencies`), and the rest of the
+/// marker is the declaration's own.
 fn declared_clauses(
     meta: &Metadata,
     declared: Declared<'_>,
     name: &str,
+    marker: Option<&str>,
 ) -> Result<Option<Vec<String>>, String> {
     let canon = canonicalize_pypi_name(name);
-    let mut found: Option<Vec<String>> = None;
-    for spec in declarations(meta, declared) {
-        if canonicalize_pypi_name(pep508_name(spec)) != canon {
-            continue;
-        }
-        let clauses = spec_clauses(spec)?;
-        match &found {
-            Some(prior) if *prior != clauses => {
-                return Err(format!(
-                    "{} declares {name} with different specifiers; which one each lock entry \
-                     mirrors is not derivable",
-                    meta.rel
-                ))
-            }
-            _ => found = Some(clauses),
-        }
+    let named: Vec<Declaration<'_>> = declarations(meta, declared)
+        .into_iter()
+        .filter(|d| canonicalize_pypi_name(pep508_name(d.spec)) == canon)
+        .collect();
+    if named.is_empty() {
+        return Ok(None);
     }
-    Ok(found)
+    let agreed = |set: &[&Declaration<'_>]| -> Result<Option<Vec<String>>, String> {
+        let mut found: Option<Vec<String>> = None;
+        for d in set {
+            let clauses = spec_clauses(d.spec)?;
+            match &found {
+                Some(prior) if *prior != clauses => return Ok(None),
+                _ => found = Some(clauses),
+            }
+        }
+        Ok(found)
+    };
+    let mut set: Vec<&Declaration<'_>> = named.iter().collect();
+    let marker = marker.unwrap_or("");
+    let extras = marker_extras(marker);
+    let narrowings: [&dyn Fn(&Declaration<'_>) -> bool; 2] = [
+        &|d| match &d.extra {
+            Some(extra) => extras.contains(extra),
+            None => extras.is_empty(),
+        },
+        &|d| {
+            let own = d.spec.split_once(';').map_or("", |(_, m)| m);
+            marker_key(own) == marker_key(marker)
+        },
+    ];
+    for narrow in narrowings {
+        if let Ok(Some(clauses)) = agreed(&set) {
+            return Ok(Some(clauses));
+        }
+        let narrowed: Vec<&Declaration<'_>> = set.iter().copied().filter(|d| narrow(d)).collect();
+        if narrowed.is_empty() {
+            break;
+        }
+        set = narrowed;
+    }
+    agreed(&set)?.map(Some).ok_or_else(|| {
+        format!(
+            "{} declares {name} with different specifiers; which one each lock entry \
+             mirrors is not derivable",
+            meta.rel
+        )
+    })
 }
 
 /// Every lock requirement array with the declarations it mirrors
@@ -1050,7 +1217,8 @@ fn restore_requirement_array(
             "the lock's requirement entries name the hosted artifact but its paired metadata \
              file is missing, so their specifiers are not derivable",
         )?;
-        let clauses = declared_clauses(meta, declared, &hit.name)?.ok_or_else(|| {
+        let marker = entry.get("marker").and_then(Value::as_str);
+        let clauses = declared_clauses(meta, declared, &hit.name, marker)?.ok_or_else(|| {
             format!(
                 "{} no longer declares {}, so the lock entry's specifier is not derivable",
                 meta.rel, hit.name
@@ -1480,7 +1648,8 @@ mod declaration_tests {
         Ok(doc.to_string())
     }
 
-    const HEAD: &str = "[project]\nname = \"uvp\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\n";
+    const HEAD: &str =
+        "[project]\nname = \"uvp\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\n";
 
     /// #606 (a): a pin in `dependencies` and a floor in an extra.
     #[test]
@@ -1551,7 +1720,10 @@ mod declaration_tests {
              \"six==1.16.0; python_version >= \\\"3.10\\\"\"]\n"
         );
         for (lt, ge) in [
-            ("python_full_version < '3.10'", "python_full_version >= '3.10'"),
+            (
+                "python_full_version < '3.10'",
+                "python_full_version >= '3.10'",
+            ),
             ("python_version < '3.10'", "python_version >= '3.10'"),
         ] {
             let hosted = lock(&[six(Some(lt)), six(Some(ge))], &[]);

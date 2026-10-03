@@ -92,7 +92,13 @@ frozen, locked, and ordinary installation outcomes separately where supported.
 - `[tool.uv] dev-dependencies` (the pre-PEP 735 dev group) is classified as a
   direct dependency, and every duplicate `requires-dist` / `requires-dev`
   entry for the package (extras, markers) is repointed, so `uv sync --locked`
-  accepts the lock. `[tool.uv] constraint-dependencies` /
+  accepts the lock. The hosted unwind (`rollback`, `remove`, the hosted →
+  vendored takeover) puts each entry's specifier back from the declaration
+  uv lowered it from, so one package declared with different specifiers in
+  `dependencies`, extras or marker-split lines, or reached through a PEP 735
+  `include-group`, rolls back byte for byte (the `extras` and
+  `include-group` lanes of `e2e_redirect_uv_build`, uv ≥ 0.4.27). An entry
+  whose marker matches no declaration is still refused. `[tool.uv] constraint-dependencies` /
   `build-constraint-dependencies` naming the package are repointed in the
   lock's `[manifest]` `constraints` / `build-constraints` entries, which uv
   ≥ 0.5.6 serializes with the package's source. uv 0.2.37–0.5.3 serialize
