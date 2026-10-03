@@ -3724,6 +3724,58 @@ snapshots:
             "no hosted ledger exists at any point"
         );
     }
+
+    /// Hosted → vendored over a linked `.socket/vendor/npm` (#664): the
+    /// refusal comes BEFORE the takeover restores the upstream entry, so
+    /// the hosted patch stays wired (lock and `.npmrc` byte-identical) and
+    /// nothing is written into the link's target.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn hosted_then_vendor_over_a_linked_vendor_dir_keeps_the_hosted_wiring() {
+        let server = MockServer::start().await;
+        mock_hosted_api(&server).await;
+        let registry = mock_registry(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("project");
+        std::fs::create_dir_all(root).unwrap();
+        write_package_lock_project(root);
+        assert_eq!(scan_run(hosted_args(root, server.uri())).await, 0);
+        let hosted_lock = std::fs::read(root.join("package-lock.json")).unwrap();
+        let hosted_npmrc = std::fs::read(root.join(".npmrc")).unwrap();
+        assert!(String::from_utf8_lossy(&hosted_lock).contains(HOSTED_URL));
+
+        seed_manifest_and_blob(root);
+        let shared = tmp.path().join("shared-npm");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
+        std::os::unix::fs::symlink(&shared, root.join(".socket/vendor/npm")).unwrap();
+
+        let (code, env) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &[]);
+        assert_eq!(code, 1, "{env:#}");
+        find_event(&env, "failed", Some("vendor_dir_symlink_unsupported"));
+        assert!(
+            events(&env)
+                .iter()
+                .all(|e| e["errorCode"] != "vendor_takeover_reverted_redirect"),
+            "the takeover must not run before the refusal: {env:#}"
+        );
+        assert_eq!(
+            std::fs::read(root.join("package-lock.json")).unwrap(),
+            hosted_lock,
+            "the hosted lock must be untouched"
+        );
+        assert_eq!(
+            std::fs::read(root.join(".npmrc")).unwrap(),
+            hosted_npmrc,
+            "the hosted .npmrc must be untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(&shared).unwrap().count(),
+            0,
+            "nothing is written through the link"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
