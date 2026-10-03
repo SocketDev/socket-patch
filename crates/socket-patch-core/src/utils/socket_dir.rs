@@ -97,10 +97,7 @@ async fn linked_level<'a>(dir: &'a Path, stop_dir: &Path) -> Option<&'a Path> {
         vec![dir]
     };
     for level in levels.into_iter().rev() {
-        if tokio::fs::symlink_metadata(level)
-            .await
-            .is_ok_and(|meta| meta.file_type().is_symlink())
-        {
+        if crate::utils::fs::is_symlink_or_junction(level).await {
             return Some(level);
         }
     }

@@ -114,6 +114,53 @@ pub(crate) fn is_dir_sync(path: &Path) -> bool {
     std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
 }
 
+/// Check whether `path` is a symlink or junction (Windows), without following it.
+///
+/// Returns `true` when the path is a symbolic link (Unix/Windows) or a junction
+/// (Windows reparse point). Returns `false` on stat errors. This is the guard
+/// for vendor-dir and socket-dir link protection: socket-patch never creates
+/// links under `.socket/`, so a linked level points at a tree it does not own.
+#[cfg(not(windows))]
+pub(crate) fn is_symlink_or_junction_sync(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+pub(crate) fn is_symlink_or_junction_sync(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    std::fs::symlink_metadata(path)
+        .map(|m| {
+            m.file_type().is_symlink() || (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        })
+        .unwrap_or(false)
+}
+
+/// Async twin of [`is_symlink_or_junction_sync`].
+#[cfg(not(windows))]
+pub(crate) async fn is_symlink_or_junction(path: &Path) -> bool {
+    tokio::fs::symlink_metadata(path)
+        .await
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+pub(crate) async fn is_symlink_or_junction(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    tokio::fs::symlink_metadata(path)
+        .await
+        .map(|m| {
+            m.file_type().is_symlink() || (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        })
+        .unwrap_or(false)
+}
+
 /// Run a blocking closure on tokio's blocking pool and hand back its value.
 /// A panic inside `f` is re-raised on the awaiting task (the same outcome
 /// as when the closure's body ran inline on that task); cancellation only

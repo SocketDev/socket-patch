@@ -90,10 +90,9 @@ pub fn vendor_dir_symlink(project_root: &Path, eco: &str, uuid: Option<&str>) ->
             levels.push(rel);
         }
     }
-    levels.into_iter().find(|rel| {
-        std::fs::symlink_metadata(project_root.join(rel))
-            .is_ok_and(|meta| meta.file_type().is_symlink())
-    })
+    levels
+        .into_iter()
+        .find(|rel| crate::utils::fs::is_symlink_or_junction_sync(&project_root.join(rel)))
 }
 
 /// The user-facing reason for a [`vendor_dir_symlink`] hit at `link`.
@@ -389,6 +388,9 @@ pub async fn sweep_vendor_dirs(project_root: &Path) -> Vec<SweptVendorDir> {
     let vendor_root = project_root.join(VENDOR_DIR);
     // A linked `.socket/vendor` makes every eco dir below it lstat as a
     // real dir, so the eco-level check alone would follow it.
+    if crate::utils::fs::is_symlink_or_junction(&vendor_root).await {
+        return out;
+    }
     if !tokio::fs::symlink_metadata(&vendor_root)
         .await
         .is_ok_and(|meta| meta.is_dir())
@@ -401,6 +403,9 @@ pub async fn sweep_vendor_dirs(project_root: &Path) -> Vec<SweptVendorDir> {
         // creates these dirs itself and never writes symlinks, so a symlinked
         // eco dir cannot be ours — `read_dir` would follow it and the sweep
         // would enumerate (and let callers delete through) its target.
+        if crate::utils::fs::is_symlink_or_junction(&eco_root).await {
+            continue;
+        }
         match tokio::fs::symlink_metadata(&eco_root).await {
             Ok(meta) if meta.is_dir() => {}
             _ => continue,
