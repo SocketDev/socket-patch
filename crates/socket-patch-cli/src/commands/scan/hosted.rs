@@ -1257,6 +1257,9 @@ pub(crate) async fn run_redirect_selected(
             .warnings
             .iter()
             .any(|warning| warning.code == "redirect_gem_mirror_overrides_source");
+        // The warning above exists only when this run had gem candidates;
+        // also check every hosted gem pin the VEX plan rediscovers.
+        params.hosted_gem_mirror_check = true;
         // Stale-flagged purls are EXCLUDED from assume_applied: the same-run
         // envelope carries a redirect_gem_stale_install warning proving the
         // installed materialization unpatched, so attesting that purl from

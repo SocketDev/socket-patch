@@ -616,8 +616,15 @@ async fn run_vendor_json_path(
         .await;
     }
 
-    let final_code =
-        embed_vex_into_json(&args.common, &args.vex, manifest_path, vendor_code, result).await;
+    let final_code = embed_vex_into_json(
+        &args.common,
+        &args.vex,
+        manifest_path,
+        vendor_code,
+        result,
+        false,
+    )
+    .await;
     print_json(result);
     final_code
 }
