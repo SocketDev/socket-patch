@@ -74,8 +74,8 @@ pub fn vendor_uuid_dir_rel(eco: &str, uuid: &str) -> Option<String> {
 /// `.socket/vendor/<eco>/<uuid>` under `project_root` that is a symlink (or
 /// a Windows junction), project-relative and forward-slashed; `None` when
 /// none is. The `<eco>` level is only checked for a known ecosystem dir
-/// (`jvm` counts as `maven`, which also checks the JVM repository tree
-/// `.socket/vendor/maven2`) and the `<uuid>` level only for a canonical
+/// (`jvm` counts as `maven`, which also checks the JVM repository trees
+/// `.socket/vendor/maven2` and `.socket/vendor/gradle`) and the `<uuid>` level only for a canonical
 /// uuid.
 ///
 /// Vendor staging creates these dirs itself and never writes symlinks, so a
@@ -86,8 +86,9 @@ pub fn vendor_uuid_dir_rel(eco: &str, uuid: &str) -> Option<String> {
 /// [`sweep_vendor_dirs`] already skips a linked eco or uuid dir.
 pub fn vendor_dir_symlink(project_root: &Path, eco: &str, uuid: Option<&str>) -> Option<String> {
     // A `jvm` ledger entry is reverted by the maven backend, and every
-    // maven-family entry may own files in the JVM repository tree
-    // (`.socket/vendor/maven2`) as well as a `maven/<uuid>` unit.
+    // maven-family entry may own files in the JVM repository trees
+    // (`.socket/vendor/maven2`, `.socket/vendor/gradle`) as well as a
+    // `maven/<uuid>` unit.
     let eco = if eco == "jvm" { "maven" } else { eco };
     let mut levels = vec![VENDOR_DIR.to_string()];
     if ECOSYSTEM_DIRS.contains(&eco) {
@@ -96,7 +97,11 @@ pub fn vendor_dir_symlink(project_root: &Path, eco: &str, uuid: Option<&str>) ->
             levels.push(rel);
         }
         if eco == "maven" {
-            levels.push(format!("{VENDOR_DIR}/maven2"));
+            levels.extend(
+                super::jvm::apply::VENDOR_TREES
+                    .iter()
+                    .map(|t| t.to_string()),
+            );
         }
     }
     levels.into_iter().find(|rel| {
@@ -1029,6 +1034,16 @@ mod tests {
             assert_eq!(
                 vendor_dir_symlink(&tree, eco, Some(UUID)).as_deref(),
                 Some(".socket/vendor/maven2"),
+                "{eco}"
+            );
+        }
+        let gradle = tmp.path().join("gradle");
+        std::fs::create_dir_all(gradle.join(".socket/vendor/maven2")).unwrap();
+        symlink(&outside, gradle.join(".socket/vendor/gradle")).unwrap();
+        for eco in ["jvm", "maven"] {
+            assert_eq!(
+                vendor_dir_symlink(&gradle, eco, Some(UUID)).as_deref(),
+                Some(".socket/vendor/gradle"),
                 "{eco}"
             );
         }
