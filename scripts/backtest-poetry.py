@@ -185,7 +185,7 @@ def operation_transport_failure(run):
                 found = transport_diagnostic(json.dumps(value["error"]))
                 if found:
                     return found
-            if (value.get("errorCode") or value.get("code") == "api_batch_failed"
+            if (value.get("errorCode") or value.get("code") in ("api_batch_failed", "patch_details_failed")
                     or value.get("action") in ("failed", "skipped")):
                 found = transport_diagnostic(json.dumps(value))
                 if found:

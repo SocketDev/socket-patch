@@ -208,6 +208,7 @@ class PoetryRetryClassificationTests(unittest.TestCase):
     def test_zero_exit_cli_errors_are_structured_and_terminal(self):
         for envelope in ({"error": {"message": TRANSPORT}},
                          {"warnings": [{"code": "api_batch_failed", "detail": TRANSPORT}]},
+                         {"warnings": [{"code": "patch_details_failed", "detail": "could not fetch details for pkg:pypi/urllib3@1.26.18: Rate limit exceeded (HTTP 429, gave up after 3 retries). Please try again later."}]},
                          {"vendor": {"events": [{"action": "skipped", "errorCode": "download_failed", "reason": TRANSPORT}]}}):
             with self.subTest(envelope=envelope):
                 self.assertTrue(poetry.operation_transport_failure(operation(rc=0, out=json.dumps(envelope), err="")))
