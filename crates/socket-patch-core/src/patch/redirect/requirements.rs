@@ -387,21 +387,35 @@ pub fn preflight_requirements_takeover(entry: &VendorEntry) -> Result<(), Rewrit
     let Some(record) = unreachable else {
         return Ok(());
     };
-    let wired = if record.action == WiringAction::Added {
-        format!(
-            "a `(transitive)` line socket-patch appended to {}",
-            record.file
+    // `vendor --revert` has no per-package form, so the remedy names its
+    // full reach; the pin must then live ONLY in the root file, or the
+    // include's unpatched pin stays in the install alongside the hosted
+    // one.
+    let (wired, relocate) = if record.action == WiringAction::Added {
+        (
+            format!(
+                "a `(transitive)` line socket-patch appended to {}",
+                record.file
+            ),
+            "add an exact `==` pin for it to the root requirements.txt".to_string(),
         )
     } else {
-        format!("a pin in {}", record.file)
+        (
+            format!("a pin in {}", record.file),
+            format!(
+                "move its pin from {} into the root requirements.txt (delete it from {})",
+                record.file, record.file
+            ),
+        )
     };
     Err(RewriteWarning {
         code: "redirect_requirements_takeover_unreachable".into(),
         detail: format!(
             "{} is vendored through {wired}; hosted mode only rewrites an existing pin in \
              the root requirements.txt, so it is kept vendored (not switched to hosted). To \
-             switch, pin it in the root requirements.txt, run `socket-patch vendor --revert`, \
-             then re-run `scan --mode hosted`",
+             switch it: run `socket-patch vendor --revert` (this reverts EVERY vendored \
+             package in the project, not just this one), {relocate}, then re-run \
+             `scan --mode hosted`",
             entry.base_purl
         ),
     })
@@ -473,6 +487,16 @@ mod takeover_reach_tests {
         assert_eq!(w.code, "redirect_requirements_takeover_unreachable");
         assert!(w.detail.contains("a pin in base.txt"), "{}", w.detail);
         assert!(w.detail.contains("pkg:pypi/six@1.16.0"), "{}", w.detail);
+        assert!(
+            w.detail.contains("reverts EVERY vendored package"),
+            "the remedy names `vendor --revert`'s full reach: {}",
+            w.detail
+        );
+        assert!(
+            w.detail.contains("delete it from base.txt"),
+            "the include pin must not survive next to the hosted one: {}",
+            w.detail
+        );
     }
 
     #[test]
@@ -495,6 +519,17 @@ mod takeover_reach_tests {
         );
         let w = preflight_requirements_takeover(&e).unwrap_err();
         assert!(w.detail.contains("`(transitive)` line"), "{}", w.detail);
+        assert!(
+            w.detail.contains("reverts EVERY vendored package"),
+            "{}",
+            w.detail
+        );
+        assert!(
+            w.detail
+                .contains("add an exact `==` pin for it to the root requirements.txt"),
+            "{}",
+            w.detail
+        );
     }
 
     #[test]
