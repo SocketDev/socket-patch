@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use regex::{NoExpand, Regex};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -57,6 +57,7 @@ use crate::formats::cargo::hosted::CargoLockPlan;
 #[cfg(test)]
 use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
 #[cfg(test)]
+use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
 #[cfg(test)]
 mod pnpm_equivalence_tests;
@@ -339,12 +340,16 @@ pub fn rewrite_registry_redirect(
     rewrite_registry_redirect_with_python_metadata(files, overrides, &BTreeMap::new())
 }
 
+/// [`rewrite_registry_redirect`] with what the served artifacts carry, keyed
+/// by artifact URL: a hosted wheel's core metadata (the uv lock rewrite
+/// copies its dependency block) and a hosted npm tarball's `package.json`
+/// (the yarn berry pin takes its `bin` map from it).
 pub fn rewrite_registry_redirect_with_python_metadata(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
-    python_metadata: &BTreeMap<String, String>,
+    artifact_metadata: &BTreeMap<String, String>,
 ) -> RewriteResult {
-    rewrite_registry_redirect_with_pipenv_version(files, overrides, python_metadata, None, false)
+    rewrite_registry_redirect_with_pipenv_version(files, overrides, artifact_metadata, None, false)
 }
 
 /// Whether any pypi override targets an entry of `files["Pipfile.lock"]` —
@@ -401,14 +406,14 @@ fn withhold<'a>(
 pub fn rewrite_registry_redirect_with_pipenv_version(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
-    python_metadata: &BTreeMap<String, String>,
+    artifact_metadata: &BTreeMap<String, String>,
     pipenv_major: Option<u32>,
     bun_lockb_present: bool,
 ) -> RewriteResult {
     rewrite_registry_redirect_withholding_vlt(
         files,
         overrides,
-        python_metadata,
+        artifact_metadata,
         pipenv_major,
         bun_lockb_present,
         &std::collections::BTreeSet::new(),
@@ -422,7 +427,7 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
 pub fn rewrite_registry_redirect_withholding_vlt(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
-    python_metadata: &BTreeMap<String, String>,
+    artifact_metadata: &BTreeMap<String, String>,
     pipenv_major: Option<u32>,
     bun_lockb_present: bool,
     vlt_withheld: &std::collections::BTreeSet<String>,
@@ -447,7 +452,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
         &overrides,
         &vlt_overrides,
         bun_lockb_present,
-        python_metadata,
+        artifact_metadata,
     );
     let mut result = rewrite_groups_parallel(result, &groups);
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
@@ -471,14 +476,14 @@ fn rewriter_groups<'a>(
     overrides: &'a [DepOverride],
     vlt_overrides: &'a [DepOverride],
     bun_lockb_present: bool,
-    python_metadata: &'a BTreeMap<String, String>,
+    artifact_metadata: &'a BTreeMap<String, String>,
 ) -> Vec<RewriterGroup<'a>> {
     vec![
         Box::new(move |result| {
             rewrite_npm_lock(files, overrides, result);
             plan_hosted(files, overrides, result);
             rewrite_yarn_classic(files, overrides, result);
-            rewrite_yarn_berry(files, overrides, result);
+            rewrite_yarn_berry_with_manifests(files, overrides, artifact_metadata, result);
             rewrite_bun_lock(files, overrides, result);
         }),
         Box::new(move |result| {
@@ -487,7 +492,7 @@ fn rewriter_groups<'a>(
         Box::new(move |result| {
             requirements::rewrite(files, overrides, result);
             rewrite_hatch(files, overrides, result);
-            rewrite_uv_lock(files, overrides, python_metadata, result);
+            rewrite_uv_lock(files, overrides, artifact_metadata, result);
             poetry::rewrite_poetry(files, overrides, result);
         }),
         Box::new(move |result| rewrite_cargo(files, overrides, result)),
@@ -3401,6 +3406,18 @@ fn rewrite_yarn_berry(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
+    rewrite_yarn_berry_with_manifests(files, overrides, &BTreeMap::new(), result);
+}
+
+/// The berry hosted pin. `manifests` maps an artifact URL to the served
+/// tarball's `package.json` text; a pin whose manifest is absent keeps the
+/// registry entry's `bin:` map.
+fn rewrite_yarn_berry_with_manifests(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    manifests: &BTreeMap<String, String>,
+    result: &mut RewriteResult,
+) {
     // Descriptors split with the classic grammar's `name@range` rule.
     use crate::vendor::yarn_classic_lock::{split_berry_key_patterns, split_pattern};
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
@@ -3463,10 +3480,6 @@ fn rewrite_yarn_berry(
     // Keys of the entries re-keyed to a tarball descriptor; yarn sorts lock
     // entries by key, so each one moves to its sorted position at the end.
     let mut moved_keys: Vec<String> = Vec::new();
-    let resolution_re =
-        Regex::new(r#"\n {2}resolution: "[^"]*""#).expect("static resolution-line regex is valid");
-    let checksum_re =
-        Regex::new(r"\n {2}checksum: [^\n]*").expect("static checksum-line regex is valid");
     let mut changed = false;
     for dep in &npm {
         let fname = full_name(dep);
@@ -3783,40 +3796,31 @@ fn rewrite_yarn_berry(
                 continue;
             }
         };
-        // The entry yarn writes for those resolutions: only the key and the
-        // resolution change (plus our checksum); every other line — version,
-        // dependencies, bin, languageName — carries over verbatim.
+        // The entry yarn writes for those resolutions: the key, resolution
+        // and checksum change, `bin:` comes from the served tarball's own
+        // package.json when the caller fetched it (#718; yarn builds a
+        // tarball entry from it, not from the registry metadata), every
+        // other field carries over, and all of them sit in yarn's order
+        // (#697).
         let new_key = format!("\"{fname}@{}\"", dep.artifact_url);
+        let key_line = format!("{new_key}:");
         let resolution = format!("{fname}@{}", dep.artifact_url);
-        let body_lines = block.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
-        let mut rewritten = format!("\n{new_key}:\n{body_lines}");
-        // `NoExpand`: the URL is literal text, and a `$` in it (a patch
-        // server path) must never be read as a capture-group reference.
-        rewritten = resolution_re
-            .replace(
-                &rewritten,
-                NoExpand(&format!("\n  resolution: \"{resolution}\"")),
-            )
-            .to_string();
-        match &checksum {
-            Some(checksum) if checksum_re.is_match(&rewritten) => {
-                rewritten = checksum_re
-                    .replace(&rewritten, NoExpand(&format!("\n  checksum: {checksum}")))
-                    .to_string();
-            }
-            Some(checksum) => {
-                rewritten = resolution_re
-                    .replace(
-                        &rewritten,
-                        NoExpand(&format!(
-                            "\n  resolution: \"{resolution}\"\n  checksum: {checksum}"
-                        )),
-                    )
-                    .to_string();
-            }
-            None => {}
-        }
-        let rewritten = rewritten[1..].to_string();
+        let tarball_bin = manifests
+            .get(&dep.artifact_url)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .filter(Value::is_object)
+            .map(|manifest| manifest_bin(&manifest));
+        let body: Vec<&str> = block.lines().skip(1).collect();
+        let rewritten = render_pinned_entry(
+            &body,
+            &Pin {
+                key_line: &key_line,
+                resolution: &resolution,
+                checksum: checksum.as_deref(),
+                bin: tarball_bin.as_ref(),
+            },
+        )
+        .join("\n");
         for (selector, original) in pin.apply(manifest_obj, &dep.artifact_url) {
             manifest_changed = true;
             result.edits.push(FileEdit {
@@ -17800,6 +17804,114 @@ packages:
         );
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert_eq!(r.edits.iter().filter(|e| e.path == "yarn.lock").count(), 1);
+    }
+
+    /// #697: a platform-conditional entry yarn reached only through
+    /// `optionalDependencies` has no `checksum:` line. The hosted pin adds
+    /// one where yarn writes it — after the dependency maps and `bin:`,
+    /// before `conditions:` — never straight after `resolution:`.
+    #[test]
+    fn issue_697_checksum_lands_in_yarn_field_order() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("@img/sharp-linux-x64", "sharp-linux-x64", "0.33.5");
+        let ovr = DepOverride {
+            namespace: Some("@img".into()),
+            ..berry_override("sharp-linux-x64", "0.33.5", &url, &checksum)
+        };
+        let lock = "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                    \"@img/sharp-linux-x64@npm:0.33.5\":\n  version: 0.33.5\n  \
+                    resolution: \"@img/sharp-linux-x64@npm:0.33.5\"\n  dependencies:\n    \
+                    \"@img/sharp-libvips-linux-x64\": \"npm:1.0.4\"\n  dependenciesMeta:\n    \
+                    \"@img/sharp-libvips-linux-x64\":\n      optional: true\n  \
+                    conditions: os=linux & cpu=x64 & libc=glibc\n  languageName: node\n  \
+                    linkType: hard\n";
+        let files = berry_files(lock.to_string(), berry_manifest());
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = &r.files["yarn.lock"];
+        assert!(
+            out.contains(&format!(
+                "\n\"@img/sharp-linux-x64@{url}\":\n  version: 0.33.5\n  \
+                 resolution: \"@img/sharp-linux-x64@{url}\"\n  dependencies:\n    \
+                 \"@img/sharp-libvips-linux-x64\": \"npm:1.0.4\"\n  dependenciesMeta:\n    \
+                 \"@img/sharp-libvips-linux-x64\":\n      optional: true\n  \
+                 checksum: {checksum}\n  conditions: os=linux & cpu=x64 & libc=glibc\n  \
+                 languageName: node\n  linkType: hard\n"
+            )),
+            "checksum between dependenciesMeta and conditions: {out}"
+        );
+    }
+
+    /// #718: yarn builds a tarball-locator entry from the served tarball's
+    /// own package.json, whose `bin` keeps the published spelling
+    /// (`./dist/bin/uuid`), while the registry entry the pin started from
+    /// carries the registry's normalized `dist/bin/uuid`. With the served
+    /// manifest in hand the pin writes the tarball's `bin:`, or hardened
+    /// installs (`--refresh-lockfile`) fail YN0028.
+    #[test]
+    fn issue_718_bin_comes_from_the_served_tarball_manifest() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("uuid", "uuid", "9.0.1");
+        let ovr = berry_override("uuid", "9.0.1", &url, &checksum);
+        let lock = format!(
+            "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"uuid@npm:^9.0.0\":\n  version: 9.0.1\n  resolution: \"uuid@npm:9.0.1\"\n  \
+             bin:\n    uuid: dist/bin/uuid\n  checksum: 10c0/{}\n  languageName: node\n  \
+             linkType: hard\n",
+            "3".repeat(128)
+        );
+        let files = berry_files(lock, berry_manifest());
+        let mut manifests = BTreeMap::new();
+        manifests.insert(
+            url.clone(),
+            r#"{"name":"uuid","version":"9.0.1","bin":{"uuid":"./dist/bin/uuid"}}"#.to_string(),
+        );
+        let r = rewrite_registry_redirect_with_python_metadata(
+            &files,
+            std::slice::from_ref(&ovr),
+            &manifests,
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = &r.files["yarn.lock"];
+        assert!(
+            out.contains(&format!(
+                "\n\"uuid@{url}\":\n  version: 9.0.1\n  resolution: \"uuid@{url}\"\n  \
+                 bin:\n    uuid: ./dist/bin/uuid\n  checksum: {checksum}\n  languageName: node\n"
+            )),
+            "bin map from the served manifest: {out}"
+        );
+
+        // A string `bin` names the package itself (scope dropped), and a
+        // manifest without `bin` drops the registry's map entirely.
+        let mut manifests = BTreeMap::new();
+        manifests.insert(
+            url.clone(),
+            r#"{"name":"uuid","version":"9.0.1","bin":"./cli.js"}"#.to_string(),
+        );
+        let r = rewrite_registry_redirect_with_python_metadata(
+            &files,
+            std::slice::from_ref(&ovr),
+            &manifests,
+        );
+        assert!(
+            r.files["yarn.lock"].contains("\n  bin:\n    uuid: ./cli.js\n  checksum:"),
+            "{}",
+            r.files["yarn.lock"]
+        );
+        manifests.insert(
+            url.clone(),
+            r#"{"name":"uuid","version":"9.0.1"}"#.to_string(),
+        );
+        let r = rewrite_registry_redirect_with_python_metadata(
+            &files,
+            std::slice::from_ref(&ovr),
+            &manifests,
+        );
+        assert!(
+            !r.files["yarn.lock"].contains("bin:"),
+            "{}",
+            r.files["yarn.lock"]
+        );
     }
 
     /// A bun URL 3-tuple already at the CURRENT artifact URL but with a stale
