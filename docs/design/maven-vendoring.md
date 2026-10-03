@@ -8,7 +8,8 @@ Socket service.
 
 The existing single-POM backend remains supported. This change adds reactor and
 Gradle support without automatically migrating existing single-POM repositories.
-Hosted mode keeps its existing behavior.
+Hosted Gradle wiring is a separate backend; see
+[ecosystem support](../ecosystems.md#gradle).
 
 ## Commands
 
