@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-03 (run 10 with a ledger), main `045d7ec` (v5 + the #324/#326/#359/#403/#434/#454/#490/#516/#541 fixes and #570 API timeouts; the binary still reports 4.0.0), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`.
+Last updated: 2026-10-03 (run 11 with a ledger), main `045d7ec` (re-run 2026-10-03T06Z, unchanged; v5 + the #324/#326/#359/#403/#434/#454/#490/#516/#541 fixes and #570 API timeouts; the binary still reports 4.0.0), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`.
 
 ## Coverage matrix
 
@@ -8,7 +8,7 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 
 | OS | npm | Agent (apply / scan --mode agent) | Vendored | Hosted (v5 default) | Global `-g` (scan report / get+apply / vex / rollback) |
 | --- | --- | --- | --- | --- | --- |
-| Linux | 6.14.18 | fail #356 (v4). pass: `-g` (v4) | pass: nested v2 lock (v4). v1 lock refused loudly (documented). fail #432 (alias mirror) | pass: v1-lock cycle (npm 6 installs the patched bytes), shrinkwrap-only v1 cycle. v1 alias: not wired (#432) | pass (v4) |
+| Linux | 6.14.18 | fail #356 (v4). pass: `-g` (v4) | pass: nested v2 lock (v4). v1 lock refused loudly (documented). fail #432 (alias mirror), **#659** (hosted→vendored takeover via `scan`/`get` on a v1 lock un-hosts, then refuses; `vendor` eject rolls back) | pass: v1-lock cycle (npm 6 installs the patched bytes), shrinkwrap-only v1 cycle. v1 alias: not wired (#432) | pass (v4) |
 | Linux | 7.0.15 / 7.24.2 | pass: scan/apply, vex, `npm ci` → vex refuses, re-apply, rollback | pass: cycle + `--omit=dev`, workspaces, vendored↔hosted takeover, revert byte-exact | pass: cycle (alias, nested, dev), workspaces, takeovers | untested |
 | Linux | 8.19.4 | fail #356 (v4). #403 / #516 closed by fixes | fail #432, **#588** (same-lock unwired copy). pass: cycle + `--omit=dev`, workspaces, takeovers, rescan no-op | pass: nested v2 cycle, shrinkwrap-only, workspaces, takeovers, rescan no-op, `overrides` (flat, alias, nested). fail #432 (alias mirror, npm 6 consumer), #490 (override over a git spec; closed by #491, not re-checked), **#588** (`--no-verify`) | untested |
 | Linux | 9.9.4 | pass `-g` (v4); Node 18 cycle | pass: cycle + `--omit=dev` (main), Node 18 cycle | pass: cycle (alias, nested, dev), Node 18 cycle | pass (v4) |
@@ -27,13 +27,14 @@ Agent mode follows a `node_modules` link into a workspace member, a `file:` dir 
 
 ## Backlog
 
-0. **#626 follow-ups:** `apply --check` / `repair` over a link; a byte-identical fork (patched silently); a nested member's `node_modules` reached through a link.
-1. **#588 follow-ups:** an unwired same-lock copy under `install-strategy=linked` and across a shrinkwrap/package-lock pair; whether `vendor --check` should flag it.
-2. **Re-checks:** #325 (#432 still reproduces on `045d7ec`), #490 (override over URL / `file:` transitive deps on npm 8–12).
-3. **#554 follow-ups:** agent `rollback` / `vex` with path policy over nested projects.
-4. **#356:** alias-only agent `scan` now exits 0 with nothing applied (since #555). Watch for a fix.
-5. **Maintainer request (global `-g`), still open:** npm 6/8/11 on macOS and Windows; an unwritable prefix (root-owned / `Program Files`); nvm, volta, fnm and Homebrew prefixes on macOS; `%APPDATA%\npm` now that #434 is closed. Full checklist in the 20261001T040000Z entry.
-6. Stale probe branches the proxy can't delete (`git push --delete` fails with "remote end hung up" / "Everything up-to-date"): `bughunt/npm/20260930-alias-linked`, `20260930-win-mac-e2e`, `20260930-win-old-npm`, `20261001-crlf-paths`, `20261001-optional-dep`, `20261001-v5-hosted-global`, `20261001-win-global`, `20261002-v5-agent-vendored-winmac`, `20261003-ws-link-agent`, `20261003-ws-link-mac`. A maintainer needs to delete them.
+0. **#659 class:** other npm vendored refusals reached after the takeover restore on v2/v3 locks (`vendor_lock_entry_not_rewritable`, `vendor_multiple_lockfiles`, `vendor_npm_sibling_lock_unwired`, aliases).
+1. **#626 follow-ups** (after draft PR #634): `apply --check` / `repair` over a link; a byte-identical fork (patched silently); a nested member's `node_modules` reached through a link.
+2. **#588 follow-ups** (claimed): an unwired same-lock copy under `install-strategy=linked` and across a shrinkwrap/package-lock pair; whether `vendor --check` should flag it.
+3. **Re-checks:** #325 and #433 (both still reproduce on `045d7ec`, 2026-10-03T06Z), #432, #464, #490 (override over URL / `file:` transitive deps on npm 8–12).
+4. **#554 follow-ups:** agent `rollback` / `vex` with path policy over nested projects.
+5. **#356:** alias-only agent `scan` now exits 0 with nothing applied (since #555). Watch for a fix.
+6. **Maintainer request (global `-g`), still open:** npm 6/8/11 on macOS and Windows; an unwritable prefix (root-owned / `Program Files`); nvm, volta, fnm and Homebrew prefixes on macOS; `%APPDATA%\npm` now that #434 is closed. Full checklist in the 20261001T040000Z entry.
+7. Stale probe branches the proxy can't delete (`git push --delete` fails with "remote end hung up" / "Everything up-to-date"): `bughunt/npm/20260930-alias-linked`, `20260930-win-mac-e2e`, `20260930-win-old-npm`, `20261001-crlf-paths`, `20261001-optional-dep`, `20261001-v5-hosted-global`, `20261001-win-global`, `20261002-v5-agent-vendored-winmac`, `20261003-ws-link-agent`, `20261003-ws-link-mac`. A maintainer needs to delete them.
 
 ## Known non-bugs
 
@@ -77,3 +78,5 @@ Agent mode follows a `node_modules` link into a workspace member, a `file:` dir 
 - `package-lock=false` in `.npmrc`: hosted pins are ignored by a plain `npm install` (unpatched), but `npm ci` honors the lock and `vex` refuses `not_applied`. Fails closed; the user's config choice.
 - A symlinked `.npmrc` isn't written through (hosted warns that `allow-remote` must be set). A symlinked lock is refused `redirect_symlinked_file_unsupported`.
 - Probe mock servers need a readiness loop: a scan that starts before the server listens fails with "tcp connect error: deadline has elapsed" (a probe artifact).
+- Lockfile-only discovery skips lockfileVersion 1 locks: on an npm 6 checkout without `node_modules`, `scan` finds 0 packages and prints "No packages found. Run your package manager's install first." (exit 0). The code calls this documented (`vendor/lock_inventory/npm.rs:168`), though the user docs don't say it. It's loud, and installing first works. Not filed.
+- A hosted-appended `allow-remote=all` line in a pre-existing `.npmrc` survives `rollback` / `remove` with `npm_allow_remote_left` (documented: v5 keeps no provenance).
