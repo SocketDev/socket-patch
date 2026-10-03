@@ -943,6 +943,17 @@ async fn run_check(args: &VendorArgs) -> i32 {
     };
     let mut entries: Vec<_> = state.entries.iter().collect();
     entries.sort_by_key(|(key, _)| *key);
+    // The lockfile view `vex` and `scan` judge vendor-ledger liveness from;
+    // JVM entries are checked against their own layout instead.
+    let discovery = if state
+        .entries
+        .values()
+        .any(|e| !vendor::jvm::apply::is_jvm_entry(e))
+    {
+        Some(crate::commands::discover_wiring(&args.common, root).await)
+    } else {
+        None
+    };
     for (key, entry) in entries {
         let record = entry.record.as_ref().or_else(|| manifest.patches.get(key));
         let mut failure = match record {
@@ -954,6 +965,17 @@ async fn run_check(args: &VendorArgs) -> i32 {
         };
         if failure.is_none() && vendor::jvm::apply::is_jvm_entry(entry) {
             failure = vendor::jvm::apply::check_entry(root, entry, local_repo.as_deref()).err();
+        } else if let (None, Some(discovery)) = (&failure, &discovery) {
+            // A relock (`pipenv lock`, `npm install`, `uv lock`, …) can
+            // drop the `.socket/vendor/` reference while the artifact stays
+            // intact; a fresh install is then unpatched. Same rule as
+            // `vex`'s `vendor_unwired`.
+            if !discovery.vendor_entry_live(root, entry).await {
+                failure = Some(format!(
+                    "wiring missing: no lockfile or config references .socket/vendor/{}/{} any more, so a fresh install gets the unpatched package; re-run `socket-patch vendor` to rewire it",
+                    entry.ecosystem, entry.uuid
+                ));
+            }
         }
         if vendor::jvm::apply::upstream_unverified(entry) {
             env.warnings.push(RunWarning {code: "vendor_jvm_upstream_unverified".into(), detail: format!("{key}: upstream metadata was accepted offline; run vendor online to verify registry checksums")});
