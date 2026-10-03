@@ -4,10 +4,9 @@ use std::path::Path;
 
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
 use crate::formats::bun::{BunTextError, BunTextLock};
+use crate::patch::redirect::hosted_url_version;
 use crate::vendor::bun_lock_text::{self, BunEntry};
 use crate::vendor::bun_lockb::BunLockb;
-
-use crate::patch::redirect::hosted_url_version;
 
 use super::view::ProjectView;
 use super::{http_url, LockIntegrity, LockfileEntry, UnsupportedNpmLayout};
@@ -141,8 +140,8 @@ pub(super) async fn inventory_bun_in(view: &ProjectView<'_>) -> Option<Vec<Lockf
 }
 
 /// A hosted redirect's pin of a registry package: the URL tuple
-/// `["name@https://…/<bare>-<version>.tgz", {deps}, "sha512-…"]` both bun
-/// rewriters write (the 2-tuple without the sha512 when Bun < 1.3.10
+/// `["name@https://…/<bare>-<version>.tgz", {deps}, "sha512-…"]` the hosted
+/// text rewriter writes (the 2-tuple without the sha512 when Bun < 1.3.10
 /// re-saved it). The version is the URL leaf's (`hosted_url_version`, the
 /// rule lockfile discovery reads bun hosted refs by), so a lockfile-only
 /// re-run still sees the package (#720), as the pnpm, vlt and yarn berry
