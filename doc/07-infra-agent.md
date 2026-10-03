@@ -2,7 +2,7 @@
 
 ## Part 7: Core infrastructure and agent (in-place) mode
 
-_Last checked against main @ 045d7ec on 2026-10-02 by audit-core. Owner: audit-core._ Only the timeout, blob/diff body, zip-read, process-spawning and API-pacing passages have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ 045d7ec on 2026-10-03 by audit-core. Owner: audit-core._ Only the timeout, blob/diff body, zip-read, process-spawning, API-pacing and URL-builder passages have been re-checked; the rest is as of `2463257`.
 
 > Scope: `api/*`, `manifest/*`, `ledgers.rs`, `constants.rs`, `patch/` (excluding `redirect/`), `policy/*`, `rollout*`, `update/*`, the CLI `update_notifier.rs`/`update.rs`, `telemetry.rs`, and the generic `utils/*` and `hash/*`.
 
@@ -39,7 +39,7 @@ That is about **19.6K production lines.** Comments are a large share of them: 25
 
 The vendor policy also has three separate hand-written retry loops, plus a first-attempt/resume split that exists only to keep the request sequence identical under prefetch. Two near-identical downloaders (`download_vendor_archive_once` and `download_artifact_capped_once`) differ only in return type and message strings.
 
-**Three URL builders with two different policies.** `patches_path` sends an authenticated client without an org slug to `/v0/orgs/default/...`, but `binary_url` and `vendor_package_url` send the same client to the public proxy. Telemetry has a fourth copy of the decision. So when org auto-resolve fails, JSON calls go to the "default" org while blob downloads silently go to the proxy.
+**Three URL builders with two different policies.** `patches_path` sends an authenticated client without an org slug to `/v0/orgs/default/...`, but `binary_url` and `vendor_package_url` send the same client to the public proxy. Telemetry has a fourth copy of the decision. So when org auto-resolve fails, JSON calls go to the "default" org while blob downloads silently go to the proxy. Re-verified by execution on `045d7ec`: view and batch go to `/v0/orgs/default/patches/…` with the bearer, while blob, diff, vendor references and telemetry go anonymously to `patches-api.socket.dev/patch/…`. {{C07}}
 
 **Timeouts on the main paths (#581).**
 - `ApiClient::new` and `plain_client()` build both reqwest clients through one policy, `api::retry::ApiTimeouts`: `API_CONNECT_TIMEOUT` (10 s) and `API_READ_TIMEOUT` (60 s of silence, reset per chunk), with no total deadline. Tests override it with `ApiClient::with_api_timeouts`. {{C02}}

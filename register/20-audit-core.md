@@ -1,17 +1,17 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-02T22:30Z · main @ 045d7ec_
+_Last updated 2026-10-03T03:50Z · main @ 045d7ec_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
-| C01 | 1 | Unbounded zip inflate on tamperable input. `zip_bytes_match_after_hashes` pre-allocates from the archive's declared size and reads with no cap, and it runs on committed `.nupkg`/`.jar` files and service archives. There are three archive caps (512/256/128 MiB). | #569 | fixed (#587); streams members, no cap per maintainer |
-| C02 | 1 | `ApiClient::new` and `plain_client()` set no HTTP timeout, and blob and diff fetches have no retry, so `scan`, `get` and `apply` can hang in CI. | #570 | fixed (#581) |
-| C03 | 1 | `vendored_takeover` ignores `RevertOutcome.kept_artifact`. It deletes the ledger entry and reports the artifact as reverted on a drift-keep, while every other revert caller honors the flag. | #568 | filed #568 |
-| C04 | 1 | Planted-binary spawn: `vendor/pypi_hatch.rs` runs `Command::new("hatch").current_dir(root)` instead of `process::resolve_tool`. #442 didn't cover it. | §1 #4; 7.3 | #613 | filed #613 |
+| C01 | 1 | Unbounded zip inflate on tamperable input. `zip_bytes_match_after_hashes` pre-allocates from the archive's declared size and reads with no cap, and it runs on committed `.nupkg`/`.jar` files and service archives. There are three archive caps (512/256/128 MiB). | §1 #1 | #569 | fixed (#587); streams members, no cap per maintainer |
+| C02 | 1 | `ApiClient::new` and `plain_client()` set no HTTP timeout, and blob and diff fetches have no retry, so `scan`, `get` and `apply` can hang in CI. | §1 #2 | #570 | fixed (#581) |
+| C03 | 1 | `vendored_takeover` ignores `RevertOutcome.kept_artifact`. It deletes the ledger entry and reports the artifact as reverted on a drift-keep, while every other revert caller honors the flag. | §1 #3; 2.4 | #568 | filed #568 |
+| C04 | 1 | Planted-binary spawn: `vendor/pypi_hatch.rs` runs `Command::new("hatch").current_dir(root)` instead of `process::resolve_tool`. #442 didn't cover it. | §1 #4; 7.3 | #613 | in PR #617 |
 | C05 | 1 | `SOCKET_FORCE` is bound to `vendor --force`, `apply --force` and `--update --force`, so forcing a self-update also forces past hash checks. | §1 #6 | #615 | decision #615 |
 | C06 | 1 | `get` round-trips its arguments through `DownloadParams` and `..GlobalArgs::default()`, which silently resets `offline`, `patch_server_url` and more. `get` also builds a fake `ApplyArgs`, and `get` and `scan` call each other. | 2.1; 2.3; R7 | | rejected; resets inert on 045d7ec, cycle folded into C12 |
-| C07 | 1 | The URL builders disagree. When org auto-resolve fails, `patches_path` sends JSON calls to `/v0/orgs/default/…`, while `binary_url` and `vendor_package_url` send the same client to the public proxy. Telemetry has a fourth copy of this logic. | 7.2 | | to verify |
-| C08 | 2 | Repo hygiene: a stray `.github/actions/actions/cache/<sha>/.vscode/launch.json`, a README that documents v5 but whose installer installs v4, and 39 references to a "DESIGN §" document that doesn't exist. (The dead CI path filters go to the CI janitor.) | §1 #8; 8.5 J | | to verify |
-| C09 | 2 | There is no shared `with_proxy_fallback` helper: scan, get (both paths) and vex each handle the proxy fallback themselves, and get's handling has a gap. | 2.10 R2 | | to verify |
+| C07 | 1 | The URL builders disagree. When org auto-resolve fails, `patches_path` sends JSON calls to `/v0/orgs/default/…`, while `binary_url` and `vendor_package_url` send the same client to the public proxy. Telemetry has a fourth copy of this logic. | 7.2 | #648 | decision #648 |
+| C08 | 2 | Repo hygiene: a stray `.github/actions/actions/cache/<sha>/.vscode/launch.json`, a README that documents v5 but whose installer installs v4, and 39 references to a "DESIGN §" document that doesn't exist. (The dead CI path filters go to the CI janitor.) | §1 #8; 8.5 J | #649 | filed #649; README part already fixed |
+| C09 | 2 | There is no shared `with_proxy_fallback` helper: scan, get (both paths) and vex each handle the proxy fallback themselves, and get's handling has a gap. | 2.10 R2 | #647 | filed #647 |
 | C10 | 2 | Tracking: `RunCtx { config, client, telemetry, lock }`, built once in `main`. It would delete `apply_env_toggles` (flags written back into process env, which has a documented token-leak history) and unblock removing 553 `#[serial]`. | 2.5; R3 | | to verify |
 | C11 | 2 | Tracking: split `run_scan` (1,499 lines; mode booleans referenced 91 times) into discover → select → `ModeBackend::consume` → render. | 2.2; R5 | | to verify |
 | C12 | 2 | Tracking: move engine code out of the CLI and into core behind one orchestrator over `ProjectView`. That covers `vendor_records_reusing` (962 lines), `run_redirect_selected` (836) and `ecosystem_dispatch.rs` (816). Coordinate with E32. | 2.1; R11 | | to verify |
@@ -41,6 +41,7 @@ _Last updated 2026-10-02T22:30Z · main @ 045d7ec_
 | C36 | 3 | Decide: the futures of agent mode and of the self-update binary swap. | §6 Q2; 7.5 | | to verify |
 | C37 | 2 | Patch blob/diff downloads (`fetch_binary`) buffer the whole body with no size cap; vendor and self-update use the shared `read_capped`. | new finding | #571 | in PR #607 |
 | C38 | 2 | The public-proxy per-package fallback keeps a private cap of 10, ignoring `SOCKET_API_CONCURRENCY`, the proxy cap of 4 and the fd-limit rule; `registry_concurrency()` has no caller. | new finding | #614 | filed #614 |
+| C39 | 2 | The 401/403 proxy fallback is missing beyond `get` search: `apply`, `rollback` and `repair` blob/diff downloads and `vendor` eject view fetches fail on a stale token, although the contract promises eject `get`'s fallback. Fix: the fallback moves into `ApiClient`. | new finding | #647 | filed #647 |
 
 **Handed off** (to the CI janitor): report-only coverage and LTO `docker-base` off PRs; e2e from 148 to ~50 legs; a reusable compat workflow; no per-leg compiles; dead CI path filters (review 8.2, 8.5 B/C/E).
 

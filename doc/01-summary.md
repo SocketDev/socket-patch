@@ -92,15 +92,15 @@
 |---|---|
 | Production code (non-blank, non-comment) | **117.6K lines** + 34.8K comment lines + 9K blank |
 | Inline `#[cfg(test)]` code in `src/` | ~194K lines |
-| Integration tests (`crates/*/tests`) | ~255K lines in **209 separate test executables** (198 top-level files + 11 directory binaries; recounted at `1169ae6`, 2026-10-02) |
+| Integration tests (`crates/*/tests`) | ~255K lines in **212 separate test executables** (201 top-level files + 11 directory binaries; recounted at `045d7ec`, 2026-10-03) |
 | Test : production ratio | ~2.8 : 1 overall; ~7 : 1 for the CLI crate |
-| Largest file | `patch/redirect/mod.rs`: 18,154 lines at `1169ae6` (2026-10-02; 17,517 at the snapshot, 6.2K production then) |
+| Largest file | `patch/redirect/mod.rs`: 19,571 lines at `045d7ec` (2026-10-03; 17,517 at the snapshot, 6.2K production then) |
 | Functions > 200 / > 500 lines | 61 / 9 (`run_scan` 1,499, `rollback::run` 984, `vendor_records_reusing` 962, `run_redirect_selected` 836, `remove::run` 797, `get::run` 635, memory `engine` 604, …) |
 | CLI surface | 9 visible + 2 hidden subcommands; 57 visible long flags; 27 globals on every command; 43 env bindings (84 `SOCKET_*` names in source); 156 documented `errorCode`s; ~570 code-like strings in source |
 | `--help` | 150–219 lines per subcommand; `list --help` lists 27 options, most of which do nothing for `list` |
 | CI per push | ~516 jobs; the CI workflow alone is 237 jobs and 348 runner-minutes; Windows `test` is the 28-minute critical path |
-| `CLI_CONTRACT.md` | 340 KB; the longest *line* is 9,491 characters (at `1169ae6`, 2026-10-02; 332 KB / 9,320 at the snapshot) |
-| Open issues | 156 on 2026-10-02 (155 labelled `bug`). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
+| `CLI_CONTRACT.md` | 343 KB; the longest *line* is 10,530 characters (at `045d7ec`, 2026-10-03; 332 KB / 9,320 at the snapshot) |
+| Open issues | 176 on 2026-10-03 (166 labelled `bug`). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
 | PR size | Recent squash merges of +53K, +85K and +94K lines |
 
 ---
@@ -116,7 +116,7 @@
 | 5 | **Comment-blind NuGet config reader in hosted mode** | `redirect/mod.rs:4302 nuget_package_source_keys` regex-scans raw XML without masking `<!-- -->`. A commented-out `<add key>` changes which sources get mapped. The vendored and `formats::nuget` readers both mask comments. | Use `formats::nuget::parse_config`. | {{E01}} |
 | 6 | **`SOCKET_FORCE` is bound to three unrelated flags** | `vendor --force`, `apply --force` and `--update --force` (`vendor.rs:80`, `apply.rs:339`, `update.rs:61` at `045d7ec`). Exporting it to force a self-update also forces `apply`/`vendor` past hash checks. | Per-command env names. | {{C05}} |
 | 7 | **`bun.lockb` ignores the registry override** | `vendor/bun_lockb.rs:235` hard-codes `registry.npmjs.org` instead of `registry_fetch::npm_tarball_url`, ignoring `SOCKET_NPM_REGISTRY`. vlt has two divergent `registry_base` implementations. | Use the shared helpers. | {{E02,E03}} |
-| 8 | **Repo hygiene** | A stray `.github/actions/actions/cache/<sha>/.vscode/launch.json` (accidentally committed in #201); 2 dead CI path filters; `README` documents v5 while its install one-liner installs v4 (disclosed in a note, but easy to miss); 39 references to a "DESIGN §x.y" document that doesn't exist. | Delete or fix. | {{C08}} |
+| 8 | **Repo hygiene** | A stray `.github/actions/actions/cache/<sha>/.vscode/launch.json` (accidentally committed in #358); 2 dead CI path filters (CI janitor); 39 references in 20 files to a "DESIGN §x.y" document that isn't in this repository. The README now says plainly that its installer selects the latest release (verified on `045d7ec`). | Delete or fix. | {{C08}} |
 
 ---
 

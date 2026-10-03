@@ -2,7 +2,7 @@
 
 ## Part 8: Tests, CI, docs and distribution
 
-_Last checked against `main`: not yet re-checked; the content is as of `2463257`. Owner: `audit-core`._
+_Last checked against main @ 045d7ec on 2026-10-03 by audit-core. Owner: audit-core._ Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references) have been re-checked; the rest is as of `2463257`.
 
 > Scope: `crates/*/tests/**`, `tests/` (docker fixtures), `.github/workflows/*`, `.github/actions/*`, `scripts/`, `docs/`, `CLI_CONTRACT.md`, `CHANGELOG.md`, `npm/`, `crates/socket-patch-node/npm/`, and the Cargo profiles. CI timings come from the GitHub Actions run for `2463257` on `main`.
 
@@ -91,7 +91,7 @@ For `2463257` on `main`:
   For comparison, npm compatibility is 11 jobs.
 - **Hygiene:**
   - Toolchains and actions are well pinned (SHA-pinned actions, enforced by `pin-check.yml`).
-  - But `.github/actions/actions/cache/0057852b…/.vscode/launch.json` is a stray Jest launch config from the `actions/cache` repo, accidentally committed in #201 and referenced by nothing.
+  - But `.github/actions/actions/cache/0057852b…/.vscode/launch.json` is a stray Jest launch config from the `actions/cache` repo, accidentally committed in #358 and referenced by nothing. {{C08}}
   - `scripts/ci-e2e-bundle.py` imports a YAML parser from a *test* file.
 
 ### 8.3 Docs
@@ -110,7 +110,7 @@ For `2463257` on `main`:
 - The good: `README.md` (6.7 KB) has a clear scan → install → vex flow, and `usage.md`, `configuration.md` and `migrating-to-v5.md` are well scoped.
 - `README.md` documents the v5 prerelease while the one-line installer installs the latest release (v4.0.0). A note discloses this, but a new user can easily read about behavior they won't get.
 - `docs/ecosystems.md` has single table cells of 1,382 and 1,827 characters, and vlt alone takes 138 of its 579 lines.
-- **39 references in 25 files point to a "DESIGN §x.y" document that does not exist.**
+- **39 references in 20 files point to a "DESIGN §x.y" document that is not in this repository** (recounted on `045d7ec`). {{C08}}
 
 **`docs/testing/*` doubles as test input.** `vlt-compatibility.md` tables are parsed by `scripts/check-vlt-legs.py`, which produces `tests/vlt-leg-manifest.json`, which a Python test checks against the doc. `vlt-coverage.json` maps codes to Rust test *function names*, so renaming a test breaks a Python test that reads a JSON file under `docs/`.
 
