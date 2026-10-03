@@ -429,6 +429,12 @@ enum Driver {
     /// environment, so bundler still loads `Gemfile.next` and the run must
     /// still redirect and attest nothing.
     ScanVexDualBootEnvGemfile,
+    /// [`Driver::ScanVex`] on a project whose committed `.bundle/config`
+    /// sets `mirror.all` (#681): bundler fetches the patch-registry source
+    /// from the mirror, which serves the upstream gem. The run must refuse,
+    /// write nothing and attest nothing; the fixture asserts that and
+    /// yields `None`.
+    ScanVexMirrorAll,
 }
 
 impl Driver {
@@ -439,6 +445,7 @@ impl Driver {
             Driver::ScanVexDualBoot => "scan --mode hosted (BUNDLE_GEMFILE=Gemfile.next)",
             Driver::ScanVexDuplicateDeclaration => "scan --mode hosted (gem in two groups)",
             Driver::ScanVexEvalGemfile => "scan --mode hosted (gem via eval_gemfile)",
+            Driver::ScanVexMirrorAll => "scan --mode hosted (bundler mirror.all)",
             Driver::ScanVexDualBootEnvGemfile => {
                 "scan --mode hosted (config Gemfile.next, env BUNDLE_GEMFILE=Gemfile)"
             }
@@ -818,8 +825,23 @@ async fn redirect_scanned_project(
             String::from_utf8_lossy(&cfg.stderr)
         );
     }
+    if driver == Driver::ScanVexMirrorAll {
+        // A committed mirror for every source (the corporate Artifactory /
+        // Nexus shape), pointing at the upstream index: it serves the
+        // unpatched gem for the patch-registry source too.
+        let mirror = format!("{}/upstream/", server.uri());
+        let args = bundler.config_local_args("mirror.all", &mirror);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let cfg = bundle(&proj, &args);
+        assert!(
+            cfg.status.success(),
+            "bundle config set --local mirror.all failed:\n{}",
+            String::from_utf8_lossy(&cfg.stderr)
+        );
+    }
     let argv: Vec<&str> = match driver {
         Driver::ScanVex
+        | Driver::ScanVexMirrorAll
         | Driver::ScanVexDualBoot
         | Driver::ScanVexDualBootEnvGemfile
         | Driver::ScanVexDuplicateDeclaration
@@ -880,6 +902,7 @@ async fn redirect_scanned_project(
     if let Some(warning) = match driver {
         Driver::ScanVexDuplicateDeclaration => Some("redirect_gem_declared_more_than_once"),
         Driver::ScanVexEvalGemfile => Some("redirect_gem_declaration_not_visible"),
+        Driver::ScanVexMirrorAll => Some("redirect_gem_mirror_overrides_source"),
         _ => None,
     } {
         assert_unwirable_declaration_redirects_nothing(
@@ -968,7 +991,8 @@ async fn redirect_scanned_project(
         Driver::ScanVexDualBoot
         | Driver::ScanVexDualBootEnvGemfile
         | Driver::ScanVexDuplicateDeclaration
-        | Driver::ScanVexEvalGemfile => unreachable!("asserted and returned above"),
+        | Driver::ScanVexEvalGemfile
+        | Driver::ScanVexMirrorAll => unreachable!("asserted and returned above"),
         Driver::GetUuid => {
             // get's hosted envelope (CLI_CONTRACT.md "get --mode and
             // installed narrowing"): `found` counts the resolved patch;
@@ -1735,6 +1759,27 @@ async fn gem_hosted_bundle_gemfile_config_outranks_env_redirects_nothing() {
     )
     .await;
     assert!(fx.is_none(), "the dual-boot driver asserts in place");
+}
+
+/// #681: bundler's `mirror.all` sends the per-dep patch-registry `source`
+/// block to the mirror, which serves the upstream gem. The hosted scan used
+/// to report the gem redirected and attest it while the next install was
+/// unpatched (or failed CHECKSUMS); it must refuse, leave the pair
+/// untouched and attest nothing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_bundler_mirror_all_redirects_nothing() {
+    let fx = redirect_scanned_project(
+        "mirror-all",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVexMirrorAll,
+    )
+    .await;
+    assert!(fx.is_none(), "the mirror.all driver asserts in place");
 }
 
 /// The compact-index DEPENDENCY contract, pinned from the red side: a patch

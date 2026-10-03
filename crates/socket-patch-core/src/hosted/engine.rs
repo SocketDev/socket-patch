@@ -302,10 +302,12 @@ pub struct CandidateFiles {
     /// project whose candidates could rewrite (or whose rewrite depends on)
     /// one is refused, since the rewriters would treat it as absent.
     pub unreadable_reads: Vec<String>,
-    /// Set when bundler is configured (`BUNDLE_GEMFILE`) to load a manifest
-    /// the gem rewriter cannot edit: every gem manifest and lock was left
-    /// out of `files`, and the rewrite reports this instead of a redirect.
-    pub gem_manifest_unsupported: Option<RewriteWarning>,
+    /// Set when bundler is configured to load a manifest the gem rewriter
+    /// cannot edit (`BUNDLE_GEMFILE`), or to fetch the patch-registry
+    /// source through a mirror (`mirror.all`, #681): every gem manifest and
+    /// lock was left out of `files`, and the rewrite reports this instead
+    /// of a redirect.
+    pub gem_refusal: Option<RewriteWarning>,
 }
 
 impl CandidateFiles {
@@ -503,7 +505,7 @@ pub async fn read_candidate_files(
         }
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
-        keep_bundler_loaded_gem_files(view, &mut out).await;
+        keep_bundler_loaded_gem_files(view, candidates, &mut out).await;
     }
     out.symlinked_reads.sort();
     out.symlinked_reads.dedup();
@@ -526,41 +528,75 @@ const GEM_MANIFEST_FILES: [&str; 4] = ["Gemfile", "Gemfile.lock", "gems.rb", "ge
 /// - `BUNDLE_GEMFILE` naming the root `Gemfile` / `gems.rb`: the other
 ///   spelling is dropped;
 /// - `BUNDLE_GEMFILE` naming anything else: every spelling is dropped and
-///   [`CandidateFiles::gem_manifest_unsupported`] says why.
+///   [`CandidateFiles::gem_refusal`] says why;
+/// - a bundler mirror capturing the patch-registry source (`mirror.all`,
+///   or `mirror.<source>`; see [`crate::formats::gem::mirror`]): every
+///   spelling is dropped the same way (#681).
 ///
 /// A memory view has no environment: only its own app config is read.
-async fn keep_bundler_loaded_gem_files(view: &ProjectView<'_>, out: &mut CandidateFiles) {
+async fn keep_bundler_loaded_gem_files(
+    view: &ProjectView<'_>,
+    candidates: &[Candidate],
+    out: &mut CandidateFiles,
+) {
     use crate::formats::gem::manifest::{self, LoadedManifest};
-    let loaded = match view {
+    let sources: Vec<&str> = candidates
+        .iter()
+        .filter_map(|c| c.dep.registry_override.as_ref())
+        .filter(|ov| ov.kind == "rubygems-compact-index")
+        .map(|ov| ov.index_url.as_str())
+        .collect();
+    let (loaded, mirror) = match view {
         ProjectView::Disk(root)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot { root, .. }) => {
-            crate::crawlers::ruby_crawler::bundler_loaded_manifest(root).await
-        }
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot { root, .. }) => (
+            crate::crawlers::ruby_crawler::bundler_loaded_manifest(root).await,
+            crate::crawlers::ruby_crawler::bundler_source_mirror(root, &sources).await,
+        ),
         ProjectView::Memory(_) => {
             let config = view.read_text(".bundle/config").await.ok();
             let value = config.as_deref().and_then(manifest::config_gemfile);
             let root = std::path::Path::new("/");
-            manifest::classify(root, None, value.as_deref())
+            (
+                manifest::classify(root, None, value.as_deref()),
+                crate::formats::gem::mirror::capturing_mirror(config.as_deref(), None, &sources),
+            )
         }
     };
-    let keep: &[&str] = match &loaded {
-        LoadedManifest::Default => return,
-        LoadedManifest::Configured { .. } => {
+    let refusal = if let Some(detail) = loaded.unsupported_detail() {
+        Some(RewriteWarning {
+            code: "redirect_gem_bundle_gemfile_unsupported".into(),
+            detail,
+        })
+    } else {
+        // #681: a mirror serves the upstream gem for the redirected source,
+        // so bundler would install unpatched bytes while the run (and its
+        // VEX) reported the gem redirected. Refuse every gem redirect.
+        mirror.map(|setting| RewriteWarning {
+            code: "redirect_gem_mirror_overrides_source".into(),
+            detail: format!(
+                "{setting} routes the Socket patch-registry source to that mirror, which \
+                 serves the unpatched upstream gem; no gem was redirected. Scope the \
+                 mirror to rubygems.org instead (`bundle config set --local \
+                 mirror.https://rubygems.org <url>`, then `bundle config unset mirror.all`) \
+                 and re-run the scan"
+            ),
+        })
+    };
+    let keep: &[&str] = match (&loaded, &refusal) {
+        (_, Some(_)) | (LoadedManifest::Unsupported { .. }, _) => &[],
+        (LoadedManifest::Default, None) => return,
+        (LoadedManifest::Configured { .. }, None) => {
             let (gemfile, lock) = loaded
                 .pair(out.files.contains_key("gems.rb"))
                 .expect("a configured default spelling has a pair");
             &[gemfile, lock]
         }
-        LoadedManifest::Unsupported { .. } => &[],
     };
     let dropped = |rel: &str| GEM_MANIFEST_FILES.contains(&rel) && !keep.contains(&rel);
     out.files.retain(|rel, _| !dropped(rel));
     out.symlinked_reads.retain(|rel| !dropped(rel));
     out.unreadable_reads.retain(|rel| !dropped(rel));
-    out.gem_manifest_unsupported = loaded.unsupported_detail().map(|detail| RewriteWarning {
-        code: "redirect_gem_bundle_gemfile_unsupported".into(),
-        detail,
-    });
+    out.gem_refusal = refusal;
 }
 
 /// The pypi wheels whose metadata a native lock rewrite needs, in
@@ -826,7 +862,7 @@ pub async fn rewrite(
         rush_lock_keys,
         symlinked_reads,
         unreadable_reads,
-        gem_manifest_unsupported,
+        gem_refusal,
     } = read;
     // The rewriters' override slice — materialized ONCE, after the last
     // candidate filter, so it can never disagree with `candidates`.
@@ -889,7 +925,7 @@ pub async fn rewrite(
         (files, rewrite)
     };
     // The gem files were withheld on purpose: say why, not "no Gemfile".
-    if let Some(warning) = gem_manifest_unsupported {
+    if let Some(warning) = gem_refusal {
         rewrite
             .warnings
             .retain(|w| w.code != "redirect_gem_no_gemfile");
@@ -2046,6 +2082,100 @@ mod tests {
             "{codes:?}"
         );
         assert!(!codes.contains(&"redirect_gem_no_gemfile"), "{codes:?}");
+    }
+
+    fn warning_codes(done: &Rewritten) -> Vec<&str> {
+        done.rewrite
+            .warnings
+            .iter()
+            .map(|w| w.code.as_str())
+            .collect()
+    }
+
+    /// #681: `bundle config set --local mirror.all <url>` sends the
+    /// patch-registry `source` block to the mirror, which serves the
+    /// upstream gem. The redirect used to be written and attested; now no
+    /// gem file is a candidate and the run says why.
+    #[tokio::test]
+    async fn bundler_mirror_all_redirects_nothing() {
+        let mut p = MemoryProject::new();
+        p.insert_text("Gemfile", GEMFILE);
+        p.insert_text("Gemfile.lock", GEM_LOCK);
+        p.insert_text(
+            ".bundle/config",
+            "---\nBUNDLE_MIRROR__ALL: \"https://artifactory.example/api/gems/rubygems/\"\n",
+        );
+        let (read, done) = gem_rewrite(&p).await;
+        assert!(!read.files.contains_key("Gemfile"));
+        assert!(!read.files.contains_key("Gemfile.lock"));
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        let codes = warning_codes(&done);
+        assert!(
+            codes.contains(&"redirect_gem_mirror_overrides_source"),
+            "{codes:?}"
+        );
+        assert!(!codes.contains(&"redirect_gem_no_gemfile"), "{codes:?}");
+        let w = done
+            .rewrite
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_gem_mirror_overrides_source")
+            .unwrap();
+        assert!(w.detail.contains("artifactory.example"), "{}", w.detail);
+        assert!(
+            w.detail.contains("mirror.https://rubygems.org"),
+            "{}",
+            w.detail
+        );
+    }
+
+    /// #681: a `mirror.<source>` key naming the patch-registry source
+    /// captures it like `mirror.all`.
+    #[tokio::test]
+    async fn bundler_mirror_for_the_patch_source_redirects_nothing() {
+        let mut p = MemoryProject::new();
+        p.insert_text("Gemfile", GEMFILE);
+        p.insert_text("Gemfile.lock", GEM_LOCK);
+        p.insert_text(
+            ".bundle/config",
+            "---\nBUNDLE_MIRROR__HTTPS://PATCH__TEST/GEM/TOK/UUID/: \"https://m.example/\"\n",
+        );
+        let (_read, done) = gem_rewrite(&p).await;
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        assert!(
+            warning_codes(&done).contains(&"redirect_gem_mirror_overrides_source"),
+            "{:?}",
+            warning_codes(&done)
+        );
+    }
+
+    /// A mirror scoped to rubygems.org leaves the patch-registry source
+    /// alone: the redirect still lands.
+    #[tokio::test]
+    async fn bundler_mirror_scoped_to_rubygems_org_still_redirects() {
+        let mut p = MemoryProject::new();
+        p.insert_text("Gemfile", GEMFILE);
+        p.insert_text("Gemfile.lock", GEM_LOCK);
+        p.insert_text(
+            ".bundle/config",
+            "---\nBUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/: \"https://m.example/\"\n",
+        );
+        let (_read, done) = gem_rewrite(&p).await;
+        assert!(
+            done.rewrite.files.contains_key("Gemfile"),
+            "{:?} {:?}",
+            done.rewrite.files.keys(),
+            warning_codes(&done)
+        );
+        assert!(!warning_codes(&done).contains(&"redirect_gem_mirror_overrides_source"));
     }
 
     /// `BUNDLE_GEMFILE: Gemfile` beside a `gems.rb`: bundler loads the
