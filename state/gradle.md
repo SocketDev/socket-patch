@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Gradle bug-hunt routine (label pm:gradle).
 
-Last updated: 2026-10-02 (run 10), main `045d7ec` (no Gradle/JVM code changes since `2463257` / #277), latest release v4.0.0. #551 and #349 were re-confirmed on `045d7ec`. Run 8 filed #551, run 9 filed nothing, and run 10 filed #620.
+Last updated: 2026-10-03 (run 11), main `045d7ec` (no Gradle/JVM code changes since `2463257` / #277), latest release v4.0.0. #551 and #349 were re-confirmed on `045d7ec` in run 10. Run 8 filed #551, run 9 filed nothing, run 10 filed #620, and run 11 filed #656 and commented on #511.
 
 ## Coverage matrix
 
@@ -64,6 +64,12 @@ Last updated: 2026-10-02 (run 10), main `045d7ec` (no Gradle/JVM code changes si
 - A project path with a space, unicode, `%41` and `#`, on 8.14.3 and 9.8.0: pass.
 - Gradle 6 / 7, macOS, Windows: untested.
 
+**Vendored, run 11 cells (Linux).**
+- A stray `.DS_Store` in the vendored version directory: **fail #656** on 8.14.3 (Groovy) and 9.8.0 (Kotlin). The build fails, and `vendor` / `repair` report success without removing the file.
+- The vendored jar deleted, then `vendor` re-run: pass (`rebuilt`).
+- A transitive range from a dependency's POM: **fail #511** on 8.14.3 (downgrades to 1.9).
+- macOS / Windows, Gradle 6 / 7: untested.
+
 **Agent mode, run 8 (Linux, 8.14.3).**
 - Gradle-only project (`mavenCentral()`) with the same GAV in `~/.m2`: `apply` patches m2, `vex` says `not_affected`, and the build uses the unpatched cache jar. **fail #551**.
 - The same with `mavenLocal()` first (+ `-Dmaven.repo.local`): pass (control).
@@ -80,13 +86,13 @@ Last updated: 2026-10-02 (run 10), main `045d7ec` (no Gradle/JVM code changes si
 
 ## Backlog
 1. **Maintainer request (partly done):** global `-g` mode. Linux is covered (the report, the refusal, no project leakage, and `--global-prefix` apply failing loudly). Still to do: macOS / Windows, and `apply -g` / `rollback -g` / `vex -g` with the GAV in `~/.m2` (see the 20261001T040000Z entry).
-2. #487, #511 and #533 on Gradle 6.9.4 / 7.6.6 (a JDK 11/17 probe), plus `verify-signatures` with `.module` artifacts and imported BOMs.
-3. #511 with a transitive range from a dependency's POM, and with catalog `strictly` / `prefer`.
+2. #487, #511, #533 and #656 on Gradle 6.9.4 / 7.6.6 (a JDK 11/17 probe), plus `verify-signatures` with `.module` artifacts and imported BOMs.
+3. #511 with catalog `strictly` / `prefer` (the transitive-POM variant was done in run 11).
 4. #620 variants: `.socket/` ignored, a global `core.excludesFile`, and `**/vendor/` rules. Re-test #620 when the JVM vendor path gains a gitignore probe.
 5. The hosted snippet in its suffixed form, with the dependency bumped and then `vendor`. Check the result and VEX. Also the hosted snippet plus a classifier dependency (the hosted analogue of #533).
 6. Agent `apply` + `vex` when `GRADLE_USER_HOME` and `~/.m2` hold different versions (a #551 variant).
-7. The run 9 init-script cells on Gradle 6.9.4 (9.8.0 done in run 10), and the run 5 cells on 9.8.0.
-8. Re-test #347, #348, #349, #395, #396, #428, #429, #461, #487, #511, #533, #551 and #620 when `vendor/jvm/`, `maven_crawler.rs` or `gradle_snippet` change.
+7. The run 9 init-script cells on Gradle 6.9.4, and the run 5 cells on 9.8.0.
+8. Re-test #347, #348, #349, #395, #396, #428, #429, #461, #487, #511, #533, #551, #620 and #656 when `vendor/jvm/`, `maven_crawler.rs` or `gradle_snippet` change.
 
 ## Known non-bugs
 - The sandbox can't reach the Socket API. For vendored, use `prebuilt_common::prepare_command` + a staged manifest/blob (see the run 3 entry). For hosted, use the wiremock shaped like `e2e_redirect_maven_build`.
@@ -116,3 +122,5 @@ Last updated: 2026-10-02 (run 10), main `045d7ec` (no Gradle/JVM code changes si
 - In init scripts, compare repository URLs via `File.toURI()`, not `file://` strings: Gradle normalizes `file:///x` to `file:/x/` (run 9 harness note).
 - Gradle can throw `InvalidPathException` on non-ASCII project paths in the sandbox because there's no UTF-8 locale. Export `LC_ALL=C.UTF-8` (run 10).
 - `gradle::wired()` accepts the apply line in either `settings.gradle` or `settings.gradle.kts`. Gradle reads the Groovy file when both exist, and the planner targets it too, so a mismatch only happens if someone hand-moves the line. That's contrived, so it hasn't been filed (run 10).
+- Kotlin DSL harness note: inside `build.gradle.kts` with the `java` plugin applied, `java.util.…` resolves `java` to the extension. Use a top-level `import` (run 11).
+- A vendored Gradle build failing on a *missing* vendored file is healed by re-running `vendor` (`rebuilt`). Only *extra* files hit #656 (run 11).
