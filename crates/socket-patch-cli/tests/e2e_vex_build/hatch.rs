@@ -579,3 +579,142 @@ fn hatch_toml_environment_dependency_hosted() {
 fn hatch_toml_environment_dependency_vendored() {
     flow(Flavor::HatchTomlEnv, Mode::Vendored);
 }
+
+/// #335: on a project whose Hatch env ALREADY exists (any developer
+/// checkout, a warm CI cache), Hatch keeps the upstream `six` on the next
+/// `hatch run`: pip, and uv before Hatch 1.16, never reinstall a present
+/// release, and Hatch then records the env as synced. Hatch keeps that env
+/// out of tree, so socket-patch must find it on its own (no `VIRTUAL_ENV`):
+/// the scan warns with the Hatch remedy and names the env, `vex` from the
+/// project root refuses to attest the unpatched env, and the named remedy
+/// (`hatch env remove default`) really yields the patched bytes, which vex
+/// then attests.
+fn existing_env_flow(mode: Mode) {
+    let Some(hatch) = hatch() else { return };
+    let version = hatch.version.clone();
+    let what = format!("hatch {version} existing-env {}", mode.label());
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join("app")).unwrap();
+    std::fs::write(project.join("app/__init__.py"), "").unwrap();
+    write_native(&project, Flavor::Project);
+    let case_envs = hatch.case_env(&tmp.path().join("case"));
+
+    // The env as a developer has it: created from PyPI, upstream six.
+    let out = hatch.run(&project, &case_envs, &["env", "create"]);
+    if !out.status.success() {
+        skip_or_fail(
+            REQUIRED,
+            &format!("{what}: hatch env create: {}", out_text(&out)),
+        );
+        return;
+    }
+    let found = hatch.run(&project, &case_envs, &["env", "find"]);
+    assert_ok(&found, &format!("{what}: hatch env find"));
+    let env_dir = PathBuf::from(
+        String::from_utf8_lossy(&found.stdout)
+            .trim()
+            .lines()
+            .last()
+            .unwrap()
+            .trim(),
+    );
+    let (_, pristine, marked) =
+        six_oracle(&venv_bin(&env_dir, "python"), &project).expect("pristine six");
+    assert!(!marked, "{what}: the env starts unpatched");
+    let patched = [pristine.as_slice(), PATCH_SUFFIX].concat();
+    let api = RealApi::start(mode.uuid(), &pristine, &patched);
+
+    // Hatch's own state (data dir, config, HOME) but no VIRTUAL_ENV: the
+    // crawler has to locate Hatch's out-of-tree env itself.
+    let (code, env, stderr) = socket_scan(&project, &api, &scan_mode_args(mode), &case_envs);
+    assert_eq!(code, Some(0), "{what}: scan failed: {env}\n{stderr}");
+    let (warnings, code_name) = match mode {
+        Mode::Hosted => (
+            env["redirect"]["warnings"].clone(),
+            "redirect_pypi_stale_install",
+        ),
+        Mode::Vendored => (env["vendor"]["events"].clone(), "pypi_hatch_stale_install"),
+    };
+    let details: Vec<String> = warnings
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|w| w["code"] == code_name || w["errorCode"] == code_name)
+        .map(|w| w.to_string())
+        .collect();
+    assert_eq!(
+        details.len(),
+        1,
+        "{what}: {code_name} expected: {env}\n{stderr}"
+    );
+    assert!(
+        details[0].contains("hatch env remove default"),
+        "{what}: Hatch remedy: {}",
+        details[0]
+    );
+
+    // The next `hatch run` keeps the upstream bytes, as the warning says.
+    let out = hatch.run(&project, &case_envs, &["run", "python", "-c", "import six"]);
+    assert_ok(&out, &format!("{what}: hatch run"));
+    let (_, _, marked) = six_oracle(&venv_bin(&env_dir, "python"), &project).unwrap();
+    assert!(
+        !marked,
+        "{what}: Hatch reinstalled; the premise no longer holds"
+    );
+
+    // vex from the project root sees the Hatch env and attests nothing.
+    let patch_api = vex_e2e_common::PatchApi::start(vec![(
+        mode.uuid().to_string(),
+        view(mode.uuid(), &pristine, &patched),
+    )]);
+    let run = vex_e2e_common::VexRun {
+        patch_server_url: Some(api.uri()),
+        product: Some(PRODUCT.into()),
+        envs: case_envs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.into()))
+            .collect(),
+        ..vex_e2e_common::VexRun::online(&patch_api)
+    };
+    let out = vex_e2e_common::run_vex(&vex_e2e_common::binary(), &project, &run);
+    vex_e2e_common::assert_absent(out.doc.as_ref(), PURL);
+    record(
+        "hatch",
+        &version,
+        &format!("existing-env/{}", mode.label()),
+        "stale-warned",
+        "pass",
+    );
+
+    // The remedy works: the recreated env holds the patch, and vex attests.
+    let out = hatch.run(&project, &case_envs, &["env", "remove", "default"]);
+    assert_ok(&out, &format!("{what}: hatch env remove"));
+    let out = hatch.run(&project, &case_envs, &["run", "python", "-c", "import six"]);
+    assert_ok(&out, &format!("{what}: hatch run after remove"));
+    let (_, bytes, marked) = six_oracle(&venv_bin(&env_dir, "python"), &project).unwrap();
+    assert!(marked, "{what}: the recreated env must hold the patch");
+    assert_eq!(git_sha256(&bytes), git_sha256(&patched), "{what}");
+    let out = vex_e2e_common::run_vex(&vex_e2e_common::binary(), &project, &run);
+    assert_eq!(out.code, Some(0), "{what}: vex after the remedy: {out}");
+    assert_attested(out.doc(), PURL, mode.uuid(), mode.marker(), VULNS);
+    record(
+        "hatch",
+        &version,
+        &format!("existing-env/{}", mode.label()),
+        "remedy-attested",
+        "pass",
+    );
+}
+
+#[test]
+#[ignore = "real Hatch + PyPI; run with --ignored (CI: SOCKET_PATCH_HATCH_E2E_REQUIRED=1)"]
+fn hatch_existing_env_hosted() {
+    existing_env_flow(Mode::Hosted);
+}
+
+#[test]
+#[ignore = "real Hatch + PyPI; run with --ignored (CI: SOCKET_PATCH_HATCH_E2E_REQUIRED=1)"]
+fn hatch_existing_env_vendored() {
+    existing_env_flow(Mode::Vendored);
+}

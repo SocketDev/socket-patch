@@ -331,7 +331,9 @@ async fn find_site_packages_under(
 /// 3. Poetry's out-of-tree virtualenv(s), when Poetry itself would not use
 ///    `./.venv` for the project (see [`find_poetry_virtualenv_site_packages`])
 /// 4. `.venv` directory in `cwd`
-/// 5. `venv` directory in `cwd`
+/// 5. `venv` directory in `cwd` (a PDM project with neither: PEP 582)
+/// 6. Hatch's out-of-tree envs for the project (see
+///    [`super::hatch_env::hatch_environments`]), added to 4/5
 pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     let var = |name: &str| std::env::var(name).ok();
     find_local_venv_site_packages_with(cwd, &var).await
@@ -417,6 +419,17 @@ async fn find_local_venv_site_packages_with(
     // default): its packages live in `__pypackages__/<X.Y>/lib`.
     if results.is_empty() && pdm_drives_project(cwd).await {
         results = pdm_pep582_dirs(cwd).await;
+    }
+
+    // 6. Hatch never installs into `./.venv` / `./venv`: `hatch run` uses
+    // its own out-of-tree envs (#335). Every existing one belongs to the
+    // project, next to whatever a generic probe found.
+    for env in super::hatch_env::hatch_environments_with(cwd, var).await {
+        for site in find_site_packages_under(&env.prefix, "site-packages").await {
+            if !results.contains(&site) {
+                results.push(site);
+            }
+        }
     }
 
     results
@@ -2543,6 +2556,54 @@ mod tests {
                 .find(|(k, _)| k == name)
                 .map(|(_, v)| v.clone())
         }
+    }
+
+    /// #335: Hatch keeps a project's envs out of tree, under
+    /// `<data dir>/env/virtual/<name>/<id>/<env>`, and never uses `./.venv`
+    /// for them. Every existing env is the project's (stale-install probes,
+    /// VEX's installed basis and agent mode see them all), alongside a
+    /// `./.venv` another tool made.
+    #[tokio::test]
+    async fn hatch_out_of_tree_envs_are_project_envs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n",
+        )
+        .unwrap();
+        let data = tmp.path().join("hatch-data");
+        let var = env_of(&[
+            ("HATCH_DATA_DIR", data.to_string_lossy().into_owned()),
+            (
+                "HOME",
+                tmp.path().join("home").to_string_lossy().into_owned(),
+            ),
+        ]);
+        assert!(find_local_venv_site_packages_with(&project, &var)
+            .await
+            .is_empty());
+
+        let envs = super::super::hatch_env::hatch_environments_with(&project, &var).await;
+        assert!(envs.is_empty());
+        let storage_root = data.join("env").join("virtual").join("app");
+        // Hatch's own id for the project root, whichever casefolding applies.
+        let real = std::fs::canonicalize(&project).unwrap();
+        let mut sites = Vec::new();
+        for id in super::super::hatch_env::project_ids_for_tests(&real) {
+            let (_, site) = fake_venv_root(&storage_root.join(&id).join("app"));
+            sites.push(site);
+        }
+        let found = find_local_venv_site_packages_with(&project, &var).await;
+        assert!(!found.is_empty());
+        assert!(found.iter().all(|s| sites.contains(s)), "{found:?}");
+
+        // A `./.venv` beside them is kept too.
+        let dot = fake_venv(&project, ".venv");
+        let found = find_local_venv_site_packages_with(&project, &var).await;
+        assert!(found.contains(&dot));
+        assert!(found.iter().any(|s| sites.contains(s)));
     }
 
     /// #502: PDM installs into the interpreter saved in `.pdm-python` (an
