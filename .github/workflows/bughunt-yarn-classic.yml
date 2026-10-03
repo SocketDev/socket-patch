@@ -1,0 +1,57 @@
+name: bughunt yarn-classic probe
+on:
+  push:
+    branches: ['bughunt/yarn-classic/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    name: global ${{ matrix.os }} yarn ${{ matrix.yarn }} via ${{ matrix.via }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        yarn: ['1.0.2', '1.6.0', '1.9.4', '1.10.1', '1.22.22']
+        via: [npm]
+        include:
+          - { os: ubuntu-latest, yarn: '1.22.22', via: corepack }
+          - { os: macos-latest, yarn: '1.22.22', via: corepack }
+          - { os: windows-latest, yarn: '1.22.22', via: corepack }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.x'
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: bughunt-yarn-classic
+          save-if: false
+      - name: Build
+        shell: bash
+        run: cargo build --release -p socket-patch-cli
+      - name: Install yarn via npm
+        if: matrix.via == 'npm'
+        shell: bash
+        run: npm i -g yarn@${{ matrix.yarn }} && yarn --version
+      - name: Install yarn via corepack
+        if: matrix.via == 'corepack'
+        shell: bash
+        run: |
+          npm rm -g yarn || true
+          corepack enable && corepack prepare yarn@${{ matrix.yarn }} --activate
+          cd "$RUNNER_TEMP" && yarn --version && which yarn
+      - name: Probe
+        shell: bash
+        env:
+          YV: ${{ matrix.yarn }}-${{ matrix.via }}
+          BH: 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
+        run: |
+          mkdir -p .bh && echo "$BH" | base64 -d | tar xz
+          bash .bh/probe.sh
