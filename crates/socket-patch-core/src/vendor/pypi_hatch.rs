@@ -195,12 +195,19 @@ pub(super) async fn wire(
                 .find(|record| record.kind == "hatch_permission" && record.file == permission.file)
                 .cloned()
                 .unwrap_or_else(|| {
+                    // A permission live references hold is recorded as the
+                    // value it has once they are gone, the same rule the
+                    // hosted unwind applies.
+                    let original = permission_held_by_live_references(&project.files)
+                        .then(|| drop_owned_permission(&permission.original, &permission.file))
+                        .flatten()
+                        .unwrap_or(permission.original);
                     record(
                         &permission.file,
                         "hatch_permission",
                         WiringAction::Rewritten,
                         "allow-direct-references",
-                        Some(permission.original),
+                        Some(original),
                         permission.new,
                     )
                 }),
@@ -311,6 +318,41 @@ pub(super) async fn revert(entry: &VendorEntry, root: &Path, dry_run: bool) -> R
         }
     }
     RevertOutcome::ok()
+}
+
+/// Whether `files` already carry Hatch's direct-reference permission for a
+/// project direct reference socket-patch's vendored ledger does not own. A
+/// hosted→vendored takeover unwinds hosted pins one at a time (#674), so
+/// when the first package is vendored the other packages' hosted references
+/// still hold the permission hosted mode added. Recording that state as the
+/// permission's "original" would make rollback restore a permission the user
+/// never had. Vendored references don't count: a permission they need was
+/// recorded before them.
+fn permission_held_by_live_references(files: &BTreeMap<String, String>) -> bool {
+    files
+        .get(hatch::HATCH_FILES[0])
+        .and_then(|text| text.trim_start_matches('\u{feff}').parse().ok())
+        .is_some_and(|document: toml_edit::DocumentMut| {
+            crate::vendor::common::pyproject_dependency_specs(&document)
+                .into_iter()
+                .filter_map(|(_, spec)| spec.split(';').next()?.split_once('@'))
+                .any(|(_, location)| {
+                    !location
+                        .trim_start()
+                        .starts_with("{root:uri}/.socket/vendor/")
+                })
+        })
+}
+
+/// `text` without its direct-reference permission and the tables that
+/// leaves empty, or `None` when the permission is not set there.
+fn drop_owned_permission(text: &str, file: &str) -> Option<String> {
+    let body = text.trim_start_matches('\u{feff}');
+    let bom = &text[..text.len() - body.len()];
+    let mut document = body.parse::<toml_edit::DocumentMut>().ok()?;
+    let keys = hatch::permission_keys(file == hatch::HATCH_FILES[1]);
+    hatch::drop_direct_reference_permission(&mut document, keys)
+        .then(|| crate::utils::python_lock::preserve_line_endings(text, format!("{bom}{document}")))
 }
 
 #[cfg(test)]
@@ -475,6 +517,148 @@ mod tests {
                 .unwrap(),
             ORIGINAL
         );
+    }
+
+    /// #674: a hosted→vendored takeover reverts one hosted pin at a time,
+    /// so the first package's ledger snapshots the permission the OTHER
+    /// package's still-live hosted reference needs. Once the last project
+    /// direct reference is unwired, in either order, the pyproject is back
+    /// to its pre-hosted bytes.
+    #[tokio::test]
+    async fn takeover_snapshot_of_hosted_permission_is_not_restored() {
+        let original = "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\", \"toml==0.10.2\"]\n";
+        let packages = [
+            ("six", "1.16.0", UUID),
+            ("toml", "0.10.2", "a0f74f9a-ce65-4451-ab60-025159b4d410"),
+        ];
+        let hosted_url = |name: &str, version: &str| {
+            format!(
+                "https://patches.example/{name}-{version}-py3-none-any.whl#sha256={}",
+                "b".repeat(64)
+            )
+        };
+        for order in [[0, 1], [1, 0]] {
+            for external in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let mut files =
+                    BTreeMap::from([("pyproject.toml".to_owned(), original.to_owned())]);
+                if external {
+                    files.insert(
+                        "hatch.toml".into(),
+                        "[metadata]\nallow-ambiguous-features = true\n".into(),
+                    );
+                }
+                let before = files.clone();
+                // Hosted scan: both packages redirected, permission enabled.
+                for (name, version, _) in packages {
+                    let plan =
+                        hatch::plan(&files, name, version, &hosted_url(name, version)).unwrap();
+                    files.extend(plan.files);
+                }
+                let permission_file = if external {
+                    "hatch.toml"
+                } else {
+                    "pyproject.toml"
+                };
+                assert!(files[permission_file].contains("allow-direct-references = true"));
+                for (file, text) in &files {
+                    tokio::fs::write(root.join(file), text).await.unwrap();
+                }
+                // Takeover: unwind one hosted pin (the other keeps the
+                // permission live), then vendor that package.
+                let mut state = VendorState::default();
+                let mut entries = Vec::new();
+                for (name, version, uuid) in packages {
+                    let text = tokio::fs::read_to_string(root.join("pyproject.toml"))
+                        .await
+                        .unwrap();
+                    let unwound = text.replace(
+                        &format!("{name} @ {}", hosted_url(name, version)),
+                        &format!("{name}=={version}"),
+                    );
+                    assert_ne!(unwound, text);
+                    tokio::fs::write(root.join("pyproject.toml"), unwound)
+                        .await
+                        .unwrap();
+                    let project = load(root, name, version, uuid).await.unwrap();
+                    let wheel =
+                        format!(".socket/vendor/pypi/{uuid}/{name}-{version}-py3-none-any.whl");
+                    let wiring = wire(&project, root, name, version, &wheel, &"0".repeat(64))
+                        .await
+                        .unwrap();
+                    let entry = entry(uuid, name, &wheel, &"0".repeat(64), wiring);
+                    state.entries.insert(name.into(), entry.clone());
+                    entries.push(entry);
+                    save_state(root, &state).await.unwrap();
+                }
+                for index in order {
+                    let outcome = revert(&entries[index], root, false).await;
+                    assert!(outcome.success, "{:?}", outcome.error);
+                }
+                for (file, text) in &before {
+                    assert_eq!(
+                        &tokio::fs::read_to_string(root.join(file)).await.unwrap(),
+                        text,
+                        "{file}, order {order:?}, external {external}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The #674 drop only applies to a permission recorded while
+    /// non-vendored direct references were live. A permission the user set
+    /// is restored verbatim after two vendored packages are reverted, inline
+    /// and in hatch.toml alike.
+    #[tokio::test]
+    async fn user_permission_survives_vendored_revert() {
+        let pyproject = "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\", \"toml==0.10.2\"]\n";
+        for (file, text) in [
+            (
+                "pyproject.toml",
+                format!("{pyproject}\n[tool.hatch.metadata]\nallow-direct-references = true\n"),
+            ),
+            (
+                "hatch.toml",
+                "[metadata]\nallow-direct-references = true\n".to_owned(),
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let mut before = BTreeMap::from([("pyproject.toml".to_owned(), pyproject.to_owned())]);
+            before.insert(file.to_owned(), text);
+            for (file, text) in &before {
+                tokio::fs::write(root.join(file), text).await.unwrap();
+            }
+            let mut state = VendorState::default();
+            let mut entries = Vec::new();
+            for (name, version, uuid) in [
+                ("six", "1.16.0", UUID),
+                ("toml", "0.10.2", "a0f74f9a-ce65-4451-ab60-025159b4d410"),
+            ] {
+                let project = load(root, name, version, uuid).await.unwrap();
+                let wheel = format!(".socket/vendor/pypi/{uuid}/{name}-{version}-py3-none-any.whl");
+                let wiring = wire(&project, root, name, version, &wheel, &"0".repeat(64))
+                    .await
+                    .unwrap();
+                let entry = entry(uuid, name, &wheel, &"0".repeat(64), wiring);
+                state.entries.insert(name.into(), entry.clone());
+                entries.push(entry);
+                save_state(root, &state).await.unwrap();
+            }
+            for entry in entries.iter().rev() {
+                let outcome = revert(entry, root, false).await;
+                assert!(outcome.success, "{:?}", outcome.error);
+            }
+            for (name, text) in &before {
+                assert_eq!(
+                    &tokio::fs::read_to_string(root.join(name)).await.unwrap(),
+                    text,
+                    "{name} ({file} permission)"
+                );
+            }
+        }
     }
 
     /// #385: ordinary pyproject edits after vendoring (a release bump, a
