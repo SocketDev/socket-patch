@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Go modules bug-hunt routine (label pm:go).
 
-Last updated: 2026-10-02 (run 10), main `045d7ec` (no Go code changes since `2463257`; CLI still reports 4.0.0), latest release 4.0.0 (previous 3.3.0). Run 10 filed #618 (a patch that edits the module's own go.mod breaks the default build) and re-confirmed #484 and #343. Run 9: #549 and #531 confirmed in vendored mode; a reusable vendored mock is described in the run-9 entry.
+Last updated: 2026-10-03 (run 11), main `045d7ec` (unchanged since run 10; CLI 4.0.0), latest release 4.0.0 (previous 3.3.0). Run 11 confirmed #618 in hosted mode (1.21/1.22/1.24/1.26), passed #531's shape in hosted mode, and covered global `-g` on Linux 1.22/1.26. Run 10 filed #618 (a patch that edits the module's own go.mod breaks the default build) and re-confirmed #484 and #343. Run 9: #549 and #531 confirmed in vendored mode; a reusable vendored mock is described in the run-9 entry.
 ## Coverage matrix
 
 Cells are "pass", "fail #N" or "untested". Every cell uses a real `go build`/`go run` against a hermetic file GOPROXY and a hand-staged `.socket/manifest.json` plus blob (the `tests/e2e_golang_build.rs` shape). Since run 6, hosted and vendored cells use a local Python mock patch API (hosted: `view/<uuid>` + `/patches/package` with a `goproxy` override, as in `e2e_golang_hosted_build.rs`; vendored: a granted tarball with `sha512`, as in `vendor/golang.rs` `mount_go_granted`). The module proxy is served over http so hosted rollback works. Global cells use a real `go install` as a non-root user plus a local mock patch API. Rows before run 3 were tested on `f6b7fb9`. Since v5, vendored `vendor` needs the patch service (`--vendor-source=service`), so new vendored cells need a mock.
@@ -9,7 +9,7 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real `go build`/`go
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 1.16.15 | untested | untested | untested | untested | fail #343 | fail #344 | untested | untested | n/a (no go.work) | n/a | n/a (no go.work) | untested | untested | n/a | n/a (no proxy toolchain) |
 | Linux | 1.21.13 | pass (probe) | untested | untested | pass (probe) | fail #343 | fail #344 | untested | untested | untested | untested | untested | untested | untested | untested | fail #618 (agent) |
-| Linux | 1.24.7 (+1.22.12) | pass | pass | apply/check/rollback pass; vex fail #484 (agent only; vendored + takeover pass) | pass | fail #343 (agent, vendored, hosted) | fail #344 | fail #391 (agent) / vendored pass / hosted pass (vex exits 2) | fail #392 (agent + vendored), fail #509 (hosted, go 1.16) | fail #393 (agent, vendored, hosted) | fail #458 (agent, vendored, hosted) | fail #531 (agent, 1.22 + 1.24; vendored 1.24; hosted untested) | plain get/day-2/idempotent/rollback/CRLF pass; `+incompatible` blocked (server contract) | fail #549 (agent, 1.22 + 1.24; vendored 1.24); hosted pass | off pass; `<path>` pass; `<path>` + user replace fail #393 | fail #618 (agent 1.22 + 1.24, vendored 1.24; hosted untested) |
+| Linux | 1.24.7 (+1.22.12) | pass | pass | apply/check/rollback pass; vex fail #484 (agent only; vendored + takeover pass) | pass | fail #343 (agent, vendored, hosted) | fail #344 | fail #391 (agent) / vendored pass / hosted pass (vex exits 2) | fail #392 (agent + vendored), fail #509 (hosted, go 1.16) | fail #393 (agent, vendored, hosted) | fail #458 (agent, vendored, hosted) | fail #531 (agent, 1.22 + 1.24; vendored 1.24); hosted pass (identical module-path replaces) | plain get/day-2/idempotent/rollback/CRLF pass; `+incompatible` blocked (server contract) | fail #549 (agent, 1.22 + 1.24; vendored 1.24); hosted pass | off pass; `<path>` pass; `<path>` + user replace fail #393 | fail #618 (agent 1.22 + 1.24, vendored 1.24, hosted 1.21/1.22/1.24/1.26) |
 | Linux | 1.26.3 | pass (probe) | untested | untested | pass (probe) | fail #343 | fail #344 | untested | untested | untested | fail #458 (agent, 1.26.8) | fail #531 (agent, 1.26.8) | untested | fail #549 (agent, 1.26.8) | untested | fail #618 (agent, 1.26.8) |
 | macOS | 1.24.13 / 1.26.3 | untested (plain; the vendor/-dir cell got as far as apply exit 0) | untested | untested | untested | fail #343 | fail #344 | untested | untested | untested | untested | untested | untested | untested | untested | untested |
 | Windows | 1.16.15 / 1.21.13 / 1.26.3 | fail #346 | blocked by #346 | blocked by #346 | fail #346 | blocked by #346 | fail #344 | blocked by #346 | blocked by #346 | blocked by #346 | blocked by #346 | blocked by #346 | untested | blocked by #346 | untested | blocked by #346 |
@@ -20,22 +20,20 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real `go build`/`go
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 1.24.7 | pass | pass | pass (cache) | fail #422 | pass | fail #422 (attests stale binary); pass after cache revert | pass (loud) | fail #344 (silent 0 packages) |
 | Linux | 1.25.1 | untested | untested | pass (cache) | fail #422 | untested | fail #422 | untested | untested |
-| Linux | 1.16 / 1.21 / 1.26 | untested | untested | untested | untested | untested | untested | untested | untested |
+| Linux | 1.22.12 / 1.26.8 | Go hit crawled (report fields untested: mock lacks /patches/batch) | untested | pass (cache) | fail #422 | pass | pass | untested (ran as root) | untested |
+| Linux | 1.16 / 1.21 | untested | untested | untested | untested | untested | untested | untested | untested |
 | macOS | any | untested (probe branches blocked) | untested | untested | untested | untested | untested | untested | untested |
 | Windows | any | untested (probe branches blocked) | untested | likely blocked by #346 | untested | untested | untested | untested | untested |
 
 ## Backlog
 
-0. **Maintainer request (partly covered, keep it on top):** global (`-g`) mode on macOS and Windows and across go 1.21 / 1.26. Linux 1.24/1.25 is done (see the table and #422). Linux 1.22.12 / 1.26.8 toolchains can be fetched from proxy.golang.org (`golang.org/toolchain/@v/v0.0.1-go<ver>.linux-amd64.zip`); `dl.google.com` (needed for 1.16–1.20) is blocked. The full checklist is in the 20261001T040000Z entry.
-0a. #531 in hosted mode (#549 and #531 vendored are done, run 9).
-0b. #618 in hosted mode (agent and vendored are done, run 10).
-1. **Needs a maintainer:** delete the stale probe branches `bughunt/go/20260930-goenv-vendor`, `bughunt/go/20260930-windows-apply` and `bughunt/go/20260930-windows-bisect`. `git push --delete` from the sandbox fails (runs 4–5) or is denied by the permission classifier (run 6). Until they're gone, no new probe branches get pushed.
-2. Hosted `+incompatible` and `/v2+` modules (needs the gopatch version spelling the service uses for `+incompatible`), and `scan --mode hosted` with a `%2B` purl.
-3. Vendored and hosted with GOPRIVATE / GONOSUMDB / `GOFLAGS=-mod=vendor`, `go.work.sum`, and a CRLF go.sum in vendored mode.
-4. `--global-prefix` shapes: GOPATH root instead of `pkg/mod`, multi-entry GOPATH.
-5. Empty or relative GOMODCACHE (GOPATH single and multi-entry pass, run 8).
-6. Toolchain matrix (1.22 / 1.26) for #391, #392, #393 and #509 on Linux via the proxy toolchains.
-7. Windows cells once #346 is fixed.
+0. **Maintainer request (partly covered, keep it on top):** global (`-g`) mode on macOS and Windows. Linux 1.22 / 1.24 / 1.25 / 1.26 is done (see the table and #422). The full checklist is in the 20261001T040000Z entry.
+1. **Needs a maintainer:** delete the stale probe branches `bughunt/go/20260930-goenv-vendor`, `bughunt/go/20260930-windows-apply` and `bughunt/go/20260930-windows-bisect`. `git push --delete` from the sandbox is denied by the permission classifier (runs 6 and 11). Until they're gone, no new probe branches get pushed.
+2. Hosted `+incompatible` and `/v2+` modules (needs the gopatch version spelling the service uses), and `scan --mode hosted` with a `%2B` purl. Add `/patches/batch` to the mock for crawl-driven scans.
+3. Global as non-root on 1.22 / 1.26 (unwritable prefix); `--global-prefix` shapes (GOPATH root, multi-entry GOPATH).
+4. Hosted with GOPRIVATE / GONOSUMDB / `GOFLAGS=-mod=vendor`, `go.work.sum` in hosted workspace mode, and a CRLF go.sum in vendored mode.
+5. Toolchain matrix (1.22 / 1.26) for #391, #392, #393 and #509 on Linux via the proxy toolchains.
+6. Windows cells once #346 is fixed.
 
 ## Known non-bugs
 
@@ -66,3 +64,7 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real `go build`/`go
 - Agent `apply` with a cold module cache exits 1 with `package_not_installed`: correct. Run `go mod download` first.
 - Rollback of a go.mod that had no trailing newline leaves one added. Cosmetic, not filed.
 - Vendored mock: `SOCKET_VENDOR_URL=<mock>` plus `POST */patch/package` granted tarball (see the run-9 entry). `vex` needs non-empty `vulnerabilities` in the manifest, otherwise it errors with "No applied patches with vulnerability metadata".
+- Hosted `rollback` needs the upstream go.sum hashes. For a module sum.golang.org doesn't know, it exits 1 ("Cannot restore … restore it from version control") unless `GOSUMDB=off` / GONOSUMDB is set: fails closed by design.
+- Hosted `get` with a user `replace` for the patched module in go.mod (versioned or versionless) writes nothing and warns `redirect_golang_replace_conflict`: intended.
+- Hosted mode in a go.work with several members writes identical module-path replaces, which Go accepts. So #531 is agent- and vendored-only.
+- Toolchains for 1.21+ are fetched with `GOMODCACHE=<dir> GOTOOLCHAIN=go<ver> GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org go version`, then run `<dir>/golang.org/toolchain@v0.0.1-go<ver>.linux-amd64/bin/go` directly against the fixture proxy.
