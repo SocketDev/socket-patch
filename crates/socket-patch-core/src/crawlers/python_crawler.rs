@@ -11,6 +11,9 @@ use crate::utils::process::{CommandRunner, SystemCommandRunner};
 #[cfg(test)]
 mod oracle;
 
+#[cfg(target_os = "macos")]
+mod pdm_site;
+
 // ---------------------------------------------------------------------------
 // Python command discovery
 // ---------------------------------------------------------------------------
@@ -522,12 +525,28 @@ async fn pdm_project_setting(
         .map(PathBuf::from);
     let files = [cwd.join(".pdm.toml"), cwd.join("pdm.toml")]
         .into_iter()
-        .chain(pdm_user_config_files(home.as_deref(), var))
-        .chain(
-            pdm_site_config_dirs(var)
-                .into_iter()
-                .map(|d| d.join("config.toml")),
-        );
+        .chain(pdm_user_config_files(home.as_deref(), var));
+    if let Some(setting) = pdm_setting_from_files(files, table, key).await {
+        return Some(setting);
+    }
+    // On macOS the implicit site layer needs PDM's runtime; do not probe
+    // it when a higher-precedence file already supplies the setting.
+    pdm_setting_from_files(
+        pdm_site_config_dirs(var)
+            .await
+            .into_iter()
+            .map(|dir| dir.join("config.toml")),
+        table,
+        key,
+    )
+    .await
+}
+
+async fn pdm_setting_from_files(
+    files: impl IntoIterator<Item = PathBuf>,
+    table: &str,
+    key: &str,
+) -> Option<toml_edit::Item> {
     for file in files {
         let Ok(text) = read_regular_to_string(&file).await else {
             continue;
@@ -2036,26 +2055,34 @@ fn pdm_user_config_files(
 /// PDM's site config dir (platformdirs' `site_config_path("pdm")`), whose
 /// `config.toml` PDM reads as the defaults under the user config: the
 /// first absolute `$XDG_CONFIG_DIRS` entry + `/pdm` on Linux and macOS,
-/// defaulting to `/etc/xdg/pdm` or `/Library/Application Support/pdm`, and
-/// `%PROGRAMDATA%\pdm\pdm` on Windows.
-fn pdm_site_config_dirs(var: &impl Fn(&str) -> Option<String>) -> Vec<PathBuf> {
+/// defaulting to `/etc/xdg/pdm` on Linux, and `%PROGRAMDATA%\pdm\pdm` on
+/// Windows. macOS's implicit default depends on PDM's Python runtime;
+/// an unrecognized launcher or failed probe leaves that layer unknown.
+async fn pdm_site_config_dirs(var: &impl Fn(&str) -> Option<String>) -> Vec<PathBuf> {
     #[cfg(not(windows))]
     {
         // The first absolute entry: an empty or relative one (a leading
         // `:` from `$XDG_CONFIG_DIRS:/other` with the variable unset) is
         // not a config dir, per the XDG spec.
         let dirs = var("XDG_CONFIG_DIRS").unwrap_or_default();
-        let default = if cfg!(target_os = "macos") {
-            "/Library/Application Support"
-        } else {
-            "/etc/xdg"
-        };
-        let first = dirs
+        if let Some(first) = dirs
             .split(':')
             .map(str::trim)
             .find(|d| Path::new(d).is_absolute())
-            .unwrap_or(default);
-        vec![PathBuf::from(first).join("pdm")]
+        {
+            return vec![PathBuf::from(first).join("pdm")];
+        }
+        #[cfg(target_os = "macos")]
+        {
+            pdm_site::implicit_site_config_dir(var)
+                .await
+                .into_iter()
+                .collect()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            vec![PathBuf::from("/etc/xdg/pdm")]
+        }
     }
     #[cfg(windows)]
     {
@@ -2108,6 +2135,7 @@ async fn pdm_global_site_packages_with(
     config_files.extend(config_dirs.iter().map(|d| d.join("config.toml")));
     config_files.extend(
         pdm_site_config_dirs(env)
+            .await
             .into_iter()
             .map(|d| d.join("config.toml")),
     );
@@ -3187,33 +3215,115 @@ mod tests {
     /// The site config dir is the first ABSOLUTE `$XDG_CONFIG_DIRS` entry:
     /// a leading empty segment (`:/etc/xdg`) does not drop the site layer.
     #[cfg(not(windows))]
-    #[test]
-    fn pdm_site_config_dir_skips_empty_and_relative_xdg_entries() {
-        let dirs = |value: &str| {
-            let value = value.to_string();
-            pdm_site_config_dirs(&move |name: &str| {
-                (name == "XDG_CONFIG_DIRS").then(|| value.clone())
+    #[tokio::test]
+    async fn pdm_site_config_dir_skips_empty_and_relative_xdg_entries() {
+        async fn dirs(value: &str) -> Vec<PathBuf> {
+            pdm_site_config_dirs(&|name: &str| {
+                (name == "XDG_CONFIG_DIRS").then(|| value.to_string())
             })
-        };
-        assert_eq!(dirs(":/etc/site"), vec![PathBuf::from("/etc/site/pdm")]);
+            .await
+        }
         assert_eq!(
-            dirs("relative:/etc/site/:/etc/other"),
+            dirs(":/etc/site").await,
             vec![PathBuf::from("/etc/site/pdm")]
         );
-        assert_eq!(dirs("/"), vec![PathBuf::from("/pdm")]);
         assert_eq!(
-            dirs(" /etc/site/ :/etc/other"),
+            dirs("relative:/etc/site/:/etc/other").await,
+            vec![PathBuf::from("/etc/site/pdm")]
+        );
+        assert_eq!(dirs("/").await, vec![PathBuf::from("/pdm")]);
+        assert_eq!(
+            dirs(" /etc/site/ :/etc/other").await,
             vec![PathBuf::from("/etc/site/pdm")]
         );
         let default = if cfg!(target_os = "macos") {
-            PathBuf::from("/Library/Application Support/pdm")
+            // No PATH means no recognized PDM runtime, not a guessed path.
+            vec![]
         } else {
-            PathBuf::from("/etc/xdg/pdm")
+            vec![PathBuf::from("/etc/xdg/pdm")]
         };
         for value in ["", ":", "relative"] {
-            assert_eq!(dirs(value), vec![default.clone()]);
+            assert_eq!(dirs(value).await, default);
         }
-        assert_eq!(pdm_site_config_dirs(&|_: &str| None), vec![default]);
+        assert_eq!(pdm_site_config_dirs(&|_: &str| None).await, default);
+    }
+
+    /// The implicit macOS site path belongs to PDM's runtime, not the
+    /// crawler's platform: Homebrew Python uses a different site layer.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn pdm_implicit_site_config_follows_launcher_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let python = tmp.path().join("python3.13");
+        std::fs::write(
+            &python,
+            "#!/bin/sh\nprintf '\"/opt/homebrew/share/pdm\"\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pdm = tmp.path().join("pdm");
+        std::fs::write(
+            &pdm,
+            format!(
+                "#!{}\nraise RuntimeError('do not run PDM')\n",
+                python.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&pdm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env = env_of(&[("PATH", tmp.path().to_string_lossy().into_owned())]);
+        assert_eq!(
+            pdm_site_config_dirs(&env).await,
+            vec![PathBuf::from("/opt/homebrew/share/pdm")]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn pdm_explicit_site_project_and_user_settings_do_not_probe_the_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("probe-ran");
+        let python = tmp.path().join("python");
+        std::fs::write(
+            &python,
+            format!("#!/bin/sh\nprintf ran > '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pdm = tmp.path().join("pdm");
+        std::fs::write(&pdm, format!("#!{}\n", python.display())).unwrap();
+        std::fs::set_permissions(&pdm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = tmp.path().to_string_lossy().into_owned();
+        let explicit = env_of(&[
+            ("PATH", path.clone()),
+            ("XDG_CONFIG_DIRS", "/explicit".into()),
+        ]);
+        assert_eq!(
+            pdm_site_config_dirs(&explicit).await,
+            vec![PathBuf::from("/explicit/pdm")]
+        );
+
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let env = env_of(&[("PATH", path.clone())]);
+        for name in [".pdm.toml", "pdm.toml"] {
+            let file = project.join(name);
+            std::fs::write(&file, "[python]\nuse_venv = false\n").unwrap();
+            assert!(!pdm_uses_venv(&project, &env).await);
+            std::fs::remove_file(file).unwrap();
+        }
+        let user = tmp.path().join("config.toml");
+        std::fs::write(&user, "[python]\nuse_venv = false\n").unwrap();
+        let env = env_of(&[
+            ("PATH", path),
+            ("PDM_CONFIG_FILE", user.to_string_lossy().into_owned()),
+        ]);
+        assert!(!pdm_uses_venv(&project, &env).await);
+        assert!(!marker.exists(), "a lower-priority probe ran unnecessarily");
     }
 
     /// The platformdirs site config dir a test can relocate: the first

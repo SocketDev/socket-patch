@@ -80,7 +80,8 @@ Measured details:
   the project's legacy `.pdm.toml` over `pdm.toml`, then the user config
   (`$PDM_CONFIG_FILE` or `<user config dir>/pdm/config.toml`) and the site
   config (`pdm/config.toml` under the first absolute `$XDG_CONFIG_DIRS`
-  entry on Linux/macOS, defaulting to `/etc/xdg` or `/Library/Application Support`,
+  entry on Linux/macOS, defaulting to `/etc/xdg` on Linux or the site
+  directory reported by PDM's own Python runtime on macOS,
   or `%PROGRAMDATA%\pdm\pdm\config.toml` on Windows), as a bool or
   the string PDM 2.27+ writes; off by default only for PDM 1.x). Otherwise the
   activated or in-project venv is used, with `__pypackages__` as the last
@@ -89,6 +90,19 @@ Measured details:
   and the hosted stale-install warning and `vex` check it. Global mode (`-g`)
   reads `global_project.path`, `venv.location` and `python.install_root` from
   the user and site configs alike.
+- **Implicit macOS site settings require a recognized PDM launcher.** The
+  crawler reads an absolute-PATH Python console launcher (including the
+  standard pip/uv shell trampoline for paths with spaces) and asks that
+  interpreter's `platformdirs` for the site path. Homebrew Python can use
+  `<brew prefix>/share/pdm`; other runtimes commonly use
+  `/Library/Application Support/pdm`. The probe imports `platformdirs`
+  directly without invoking PDM or its plugin loader.
+  Unknown wrappers, missing `platformdirs`, or a failed five-second probe
+  leave the implicit site layer undiscovered. Explicit `XDG_CONFIG_DIRS`
+  works without a launcher or probe; project and user settings take priority.
+  The probe ignores Python import and launcher environment overrides;
+  normal HOME-based user-site installs work, but an installation available
+  only through a custom `PYTHONUSERBASE` is not discovered this way.
 - **A non-default lock filename (`pdm lock -L custom.lock`) is invisible** to the
   scan, which only reads `pdm.lock`. A package locked at two versions (a marker
   fork) is refused (`pypi_pdm_lock_forked_package` / a version-mismatch refusal),
