@@ -8860,4 +8860,196 @@ snapshots:
             }
         }
     }
+
+    // ── two packages sharing created scaffolding (#636) ──────────────────
+
+    const TWO_PKG: &str = r#"{
+  "name": "fx",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "left-pad": "1.3.0",
+    "is-number": "7.0.0"
+  }
+}
+"#;
+
+    const TWO_LOCK: &str = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      is-number:
+        specifier: 7.0.0
+        version: 7.0.0
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+
+packages:
+
+  is-number@7.0.0:
+    resolution: {integrity: sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==}
+    engines: {node: '>=0.12.0'}
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+    deprecated: use String.prototype.padStart()
+
+snapshots:
+
+  is-number@7.0.0: {}
+
+  left-pad@1.3.0: {}
+";
+
+    const IS_NUMBER_UUID: &str = "4d5e6f70-8a9b-4c0d-9e1f-2a3b4c5d6e7f";
+    const IS_NUMBER: &str = "pkg:npm/is-number@7.0.0";
+    const LEFT_PAD: &str = "pkg:npm/left-pad@1.3.0";
+
+    /// Vendor is-number then left-pad (is-number creates every scaffold),
+    /// persisting the ledger after each the way the vendor loop does.
+    async fn vendor_two(pkg_json: &str, workspace: Option<&str>) -> Fixture {
+        let fx = fixture_with(pkg_json, TWO_LOCK).await;
+        if let Some(ws) = workspace {
+            tokio::fs::write(fx.root().join(PNPM_WORKSPACE), ws)
+                .await
+                .unwrap();
+        }
+        let is_number = fx.root().join("node_modules/is-number");
+        tokio::fs::create_dir_all(&is_number).await.unwrap();
+        tokio::fs::write(
+            is_number.join("package.json"),
+            br#"{"name":"is-number","version":"7.0.0"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(is_number.join("index.js"), ORIG_INDEX)
+            .await
+            .unwrap();
+        let mut is_number_record = fx.record.clone();
+        is_number_record.uuid = IS_NUMBER_UUID.to_string();
+
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let mut state = crate::vendor::state::VendorState::new();
+        for (purl, dir, record) in [
+            (IS_NUMBER, is_number.clone(), &is_number_record),
+            (LEFT_PAD, fx.installed(), &fx.record),
+        ] {
+            let outcome = crate::vendor::test_support::vendor_pnpm(
+                purl,
+                &dir,
+                fx.root(),
+                record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                None,
+            )
+            .await;
+            let (result, entry, _) = expect_done(outcome);
+            assert!(result.success, "{purl}: {:?}", result.error);
+            state.entries.insert(purl.to_string(), entry.unwrap());
+            crate::vendor::state::save_state(fx.root(), &state)
+                .await
+                .unwrap();
+        }
+        fx
+    }
+
+    /// Revert `order` one entry at a time from a freshly loaded ledger,
+    /// saving after each removal (`vendor --revert`, `rollback` and
+    /// successive `remove` runs all persist per entry).
+    async fn revert_in_order(fx: &Fixture, order: [&str; 2]) {
+        for key in order {
+            let mut state = crate::vendor::state::load_state(fx.root()).await.unwrap();
+            let entry = state.entries.get(key).cloned().unwrap();
+            let outcome = revert_pnpm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{key}: {:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{key}: {:?}", outcome.warnings);
+            state.entries.remove(key);
+            crate::vendor::state::save_state(fx.root(), &state)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// #636: the creator (is-number, first in purl order) reverted first
+    /// must not leave `"pnpm": { "overrides": {} }` or the scaffolded
+    /// pnpm-workspace.yaml behind once left-pad empties them.
+    #[tokio::test]
+    async fn revert_two_packages_creator_first_removes_created_scaffold() {
+        let fx = vendor_two(TWO_PKG, None).await;
+        assert!(fx.root().join(PNPM_WORKSPACE).exists());
+
+        revert_in_order(&fx, [IS_NUMBER, LEFT_PAD]).await;
+        assert_eq!(fx.read(PACKAGE_JSON).await, TWO_PKG);
+        assert_eq!(fx.read(PNPM_LOCK).await, TWO_LOCK);
+        assert!(
+            !fx.root().join(PNPM_WORKSPACE).exists(),
+            "scaffolded workspace file left behind"
+        );
+    }
+
+    /// #636, `remove` in the other order: clean before the fix too.
+    #[tokio::test]
+    async fn revert_two_packages_creator_last_removes_created_scaffold() {
+        let fx = vendor_two(TWO_PKG, None).await;
+
+        revert_in_order(&fx, [LEFT_PAD, IS_NUMBER]).await;
+        assert_eq!(fx.read(PACKAGE_JSON).await, TWO_PKG);
+        assert!(!fx.root().join(PNPM_WORKSPACE).exists());
+    }
+
+    /// The `overrides:` section vendoring added to the user's own
+    /// pnpm-workspace.yaml goes too, in creator-first order; the file and
+    /// the user's keys stay.
+    #[tokio::test]
+    async fn revert_two_packages_removes_created_workspace_overrides() {
+        let ws = "packages:\n  - '.'\n";
+        let fx = vendor_two(TWO_PKG, Some(ws)).await;
+
+        revert_in_order(&fx, [IS_NUMBER, LEFT_PAD]).await;
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws);
+        assert_eq!(fx.read(PACKAGE_JSON).await, TWO_PKG);
+    }
+
+    /// A ledger written before the flags were shared (only the creator
+    /// flagged) is repaired on load, so it unwinds cleanly too.
+    #[tokio::test]
+    async fn revert_two_packages_repairs_a_creator_only_ledger() {
+        let fx = vendor_two(TWO_PKG, None).await;
+        let path = fx.root().join(".socket/vendor/state.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        ledger["entries"][LEFT_PAD]["pnpm"] = serde_json::json!({});
+        tokio::fs::write(&path, serde_json::to_vec_pretty(&ledger).unwrap())
+            .await
+            .unwrap();
+
+        revert_in_order(&fx, [IS_NUMBER, LEFT_PAD]).await;
+        assert_eq!(fx.read(PACKAGE_JSON).await, TWO_PKG);
+        assert!(!fx.root().join(PNPM_WORKSPACE).exists());
+    }
+
+    /// A user's own `pnpm` table keeps its keys; only the overrides table
+    /// vendoring created goes.
+    #[tokio::test]
+    async fn revert_two_packages_keeps_a_user_pnpm_table() {
+        let pkg = TWO_PKG.replace(
+            "  }\n}\n",
+            "  },\n  \"pnpm\": {\n    \"onlyBuiltDependencies\": []\n  }\n}\n",
+        );
+        let fx = vendor_two(&pkg, None).await;
+
+        revert_in_order(&fx, [IS_NUMBER, LEFT_PAD]).await;
+        assert_eq!(fx.read(PACKAGE_JSON).await, pkg);
+    }
 }
