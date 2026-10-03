@@ -2,7 +2,7 @@
 
 ## Part 7: Core infrastructure and agent (in-place) mode
 
-_Last checked against main @ 045d7ec on 2026-10-03 by audit-core. Owner: audit-core._ Only the timeout, blob/diff body, zip-read, process-spawning, API-pacing and URL-builder passages have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ 045d7ec on 2026-10-03 by audit-core. Owner: audit-core._ Only the timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry and batching passages have been re-checked; the rest is as of `2463257`.
 
 > Scope: `api/*`, `manifest/*`, `ledgers.rs`, `constants.rs`, `patch/` (excluding `redirect/`), `policy/*`, `rollout*`, `update/*`, the CLI `update_notifier.rs`/`update.rs`, `telemetry.rs`, and the generic `utils/*` and `hash/*`.
 
@@ -29,12 +29,12 @@ That is about **19.6K production lines.** Comments are a large share of them: 25
 - **~80 lines: debug-ordering machinery.** A `task_local` buffer plus `HeldBack`/`hold_back_debug`, with 45 call sites in 11 files. Its only purpose is to make `--debug` output byte-identical to what a serial loop would print.
 - **~650 lines: the patch API itself.**
 
-**Three retry systems in one module:**
+**Three retry systems in one module:** {{C15}}
 
 | Path | Policy | Retry-After | Jitter |
 |---|---|---|---|
 | JSON calls (`send_json_request`) | `api::retry`: 429/503 only, run-wide 60 s window | seconds or HTTP-date, via a **206-line hand-rolled HTTP-date parser** (`api/date.rs`) | seeded SplitMix |
-| Vendor POST/GET (`VendorRetryPolicy`) | 429/500/502/503/504 + transport, 3 attempts | seconds only | a second `jitter_sample`, ±25% |
+| Vendor POST/GET (`VendorRetryPolicy`) | 429/500/502/503/504 + transport, 3 attempts | seconds only (an HTTP-date is ignored, shown by execution on `045d7ec`) | a second `jitter_sample`, ±25% |
 | Blob and diff fetch (`fetch_binary`) | **none** | — | — |
 
 The vendor policy also has three separate hand-written retry loops, plus a first-attempt/resume split that exists only to keep the request sequence identical under prefetch. Two near-identical downloaders (`download_vendor_archive_once` and `download_artifact_capped_once`) differ only in return type and message strings.
@@ -46,7 +46,7 @@ The vendor policy also has three separate hand-written retry loops, plus a first
 - A stall before the headers or mid-body fails as `ApiError::Network`; the three JSON readers share `json_response_error`, so a stalled body keeps its transport cause and only complete malformed JSON is `Parse`.
 - The vendoring service keeps its own per-attempt deadlines and retries on top. Blob/diff fetches still have no retry (C15).
 
-**Batching is split across two crates.** The CLI owns the batch sizes (500 authenticated, 100 proxy, the 256 KiB body cap). `search_patches_batch` documents "Maximum 500" but does not enforce it.
+**Batching is defined three times.** The CLI owns the batch sizes (500 authenticated, 100 proxy, the 256 KiB body cap) and accepts any `--batch-size`. The in-memory hosted engine keeps its own copy (default 100 on either endpoint, max 500, no body-cap split, a second `MAX_REFERENCE_BATCH`). `search_patches_batch` documents "Maximum 500" but does not enforce it, while `fetch_registry_references` chunks itself. {{C16}}
 
 **Other HTTP stacks** keep TLS and proxy settings consistent but diverge on timeouts, retry and error formatting:
 - `RegistryClient`: 60 s timeout, no retry.
