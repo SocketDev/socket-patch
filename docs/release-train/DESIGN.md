@@ -51,7 +51,7 @@ Base: `origin/main` @ `045d7ec7`. This design starts from Candidate 1 ("two work
 The promotion rule is "newest rc whose prerelease was published at least 7 days ago". Monday's rc is therefore promoted on the second Tuesday after it (8 days of soak).
 - Example: 5.0.0-rc.1 is cut Mon 10-12 and promoted Tue 10-20.
 - 5.0.0-rc.2 (Mon 10-19) is never promoted, because once 5.0.0 ships its core is no longer above the latest stable.
-- rc.2's extra content stays in main's `[Unreleased]` and flows into the next train.
+- rc.2's section is synced to main like every rc (D2). When 5.0.0 is synced, the fold drops it and its blocks that did not ship in `[5.0.0]` return to `[Unreleased]`, so they flow into the next train.
 
 ---
 
@@ -61,7 +61,7 @@ The promotion rule is "newest rc whose prerelease was published at least 7 days 
 |---|---|---|
 | `.github/workflows/release.yml` (rewritten) | Orchestrator, always evaluated from main. Crons `0 12 * * 1` (rc) and `0 12 * * 2` (stable); `workflow_dispatch` with mode `rc` / `stable` / `hotfix`. Jobs: `plan`, `attempt-1`, `attempt-2`, `approve`, `publish`, `report`. | Main is reviewed code (ruleset 14306549: PR + 1 approval, no bypass). That makes it the only place where registry OIDC can be bound safely (I6). It also gives Monday's rc an Actions-side schedule that doesn't depend on a cloud routine staying alive. |
 | `.github/workflows/release-qa.yml` (new) | Dispatched by release.yml with `--ref release/v<V>`. Profile `full` (rc, hotfix) or `smoke` (stable). Jobs: `guard`, `build`×14, `bundle`, `smoke`, `live-e2e`, `ci` + 9 compat via `uses:`, `verdict`. Only `contents: read` (plus `actions: read` on `verdict`). No secrets. | It is the single unit of evidence for I1 and I5. Dispatching at the release ref makes every existing checkout resolve to H, and the `workflow_dispatch` event turns on every event-gated tier, all without editing the tiers. |
-| `scripts/release.py` (stdlib Python, one file) | Subcommands: `stamp`, `plan`, `cut`, `qa`, `verify-qa`, `blockers`, `notes`, `publish-checks`, `verify-channels`, `notify`, `sync-main`. REST via urllib + `GITHUB_TOKEN`. GraphQL only for `createCommitOnBranch`. | Semver, CHANGELOG and blocker logic are correctness-critical and need unit tests. The existing `scripts/tests` unittest discovery (`ci.yml:113-114`) already runs Python tests. Bash + jq (Candidate 2) was judged worse for this. |
+| `scripts/release.py` (stdlib Python, one file) | Subcommands: `semver`, `stamp`, `npm-lock-check`, `next-version`, `changelog cut|promote|sync-main|check`, `plan`, `cut`, `qa`, `verify-qa`, `blockers`, `notes`, `publish-checks`, `verify-channels`, `notify`, `sync-main`. REST via urllib + `GITHUB_TOKEN`. GraphQL only for `createCommitOnBranch`. | Semver, CHANGELOG and blocker logic are correctness-critical and need unit tests. The existing `scripts/tests` unittest discovery (`ci.yml:113-114`) already runs Python tests. Bash + jq (Candidate 2) was judged worse for this. |
 | `scripts/release_smoke.py` | Black-box smoke of the bundle: Tier 0 on every executable target, Tier 1 live lifecycle plus channels on 3 OSes. | I5 requires black-box smoke of the artifacts. Python runs the same way on Linux, macOS and Windows runners. |
 | Environment `release` | Required reviewers = team `socket-patch-release-approvers` (any 1). Deployment branch `main`. `can_admins_bypass: false`. The team never contains a routine identity. | I2. This is the human gate. (`prevent_self_review` is deliberately **off**, see §5 I2.) |
 | Environment `publish` | No reviewers. Deployment branch `main`. `can_admins_bypass: false`. The 15 npm and 2 crates trusted publishers are bound to (repo, `release.yml`, `publish`). Holds the App secrets `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY`. | I6. A same-named workflow on any other ref cannot get a usable OIDC token or App token. |
@@ -89,7 +89,7 @@ The promotion rule is "newest rc whose prerelease was published at least 7 days 
    - primary equals the previous base → SKIPPED `nothing-new`, quietly: log line and Slack only, no ntfy.
 6. **Version V:**
    - L = the newest stable tag.
-   - U = the `[Unreleased]` blocks at C, minus any block that appears verbatim in L's section on tag L. This covers a sync PR that hasn't merged yet.
+   - U = the `[Unreleased]` section of `sync-main(C)`, computed in memory from git tags only (§3.7), never from main's Cargo version. This covers every release-sync PR that hasn't merged yet: pending rc sections' blocks are removed, shipped stables' blocks are removed, and blocks of rcs that did not ship come back. So whether the sync PR merged changes neither V nor the cut's CHANGELOG.
    - Level comes from U's `###` headings only, which is human-reviewed text on main:
      - a heading containing `breaking`, or starting `Removed` → major;
      - `Added` / `Changed` / `Deprecated` → minor;
@@ -97,7 +97,6 @@ The promotion rule is "newest rc whose prerelease was published at least 7 days 
    - `core = max(bump(L, level), max core of rc tags with core > L)`.
    - **Major rule (D4).** If `core.major > L.major`, the cut is allowed only when `core.major == L.major + 1` (a major is never skipped) **and** `core.major` is listed in `APPROVED_MAJORS` in `scripts/release.py`. Adding a major there is a reviewed PR on main, i.e. the human approval. Otherwise `next-version` refuses with an error naming the breaking heading, and the run is SKIPPED `unapproved-major`. Once an approved major's train is in flight (an rc tag `M.0.0-rc.N` exists), further breaking entries are absorbed into `M.0.0` by the `max`. `APPROVED_MAJORS = (5,)` today.
    - `N = 1 + max N` over existing tags and `release/v<core>-rc.*` branches. N is burned when the branch is created.
-   - U is computed on `sync-main(C)` in memory, from git tags only, never from main's Cargo version, so whether the release-sync PR has merged changes neither V nor the cut's CHANGELOG (§3.7).
    - First train: `### Breaking changes` is present and 5 is approved, so V = **`5.0.0-rc.1`**.
 7. Open the tracking issue.
 
@@ -197,23 +196,30 @@ Every skip produces a health report with the reason, the tried SHAs, the run lin
    - base = the newest stable tag L;
    - each pick is a first-parent commit of `origin/main` that is not an ancestor of L.
 3. Cut: cherry-pick the picks locally plus the stamp, written as one commit with `Release-Kind: hotfix`. The guard recomputes that tree. Anything the API can't reproduce, such as a file-mode change, is refused.
-4. V = `patch(L)-rc.N`. Full QA, then publish as an rc.
+4. V = `patch(L)-rc.N`. Full QA, then publish as an rc. The hotfix CHANGELOG is cut from L's tree with `changelog cut --no-sync`, so no pending train rc section enters it. When the hotfix is promoted, `sync-main` hands any train rc of the same core back to `[Unreleased]`, because those blocks are not in the hotfix's `[X.Y.Z]` (§3.7). Nothing is lost whichever of the two was cut first.
 5. A maintainer dispatches `mode=stable rc_tag=v<V> waive_soak=true reason=…`. The soak waiver is accepted only when R's trailer is `Release-Kind: hotfix` **and** R's cut run was a human hotfix dispatch. Approval is still required.
 
 ### 3.5 Blocker gate (`release.py blockers --base <sha>`): the fixed rule
 
+**Label check first.** `GET /labels/release-blocker` must return that exact name. Otherwise the gate is blocked with error `label:`. A deleted or renamed label silently drops off every issue without an `unlabeled` event, and before setup S5 the label does not exist at all. Label names are compared case-insensitively everywhere, as GitHub's `labels=` filter does.
+
 **Candidate set:**
 - **all open issues** labelled `release-blocker`, with no time bound (fix for the 90-day-window violation);
-- ∪ issues closed or unlabelled since the newest stable tag's date, from `issues/events`.
+- ∪ issues closed since `since`, and issues with a `release-blocker` `labeled` or `unlabeled` event since `since`, from `issues/events`.
+- `since` = the committer date of `merge-base(L, base)`, clamped to the base commit's date. That is a commit on main's history. The tag's own commit is not used: until the tag ruleset (D1) is live, any write-access account can point a `v*` tag at an off-main commit with a forged future date and hide recent closes. An earlier `since` only adds candidates. A `--since` later than the base time fails closed.
+
+**Config.** `RELEASE_APPROVERS` and `RELEASE_ROUTINE_ACTORS` are split on commas and whitespace, and a leading `@` is dropped. A token that is not a GitHub login, an empty list, or no approver left after removing routine actors blocks with error `config:`. An unset routine list must never quietly make mik trusted.
 
 **Trusted** = a login in `RELEASE_APPROVERS` and **not** in `RELEASE_ROUTINE_ACTORS`. The second list contains *every* routine identity, including `mikolalysenko` while existing routines (issue janitor, burn-down, CI janitor) run as him. This fixes the "janitor running as a trusted maintainer" violation.
 
 An issue **blocks** iff it is **effectively labelled** and not **resolved**:
 
-- **Effectively labelled:** the label is present, or the last `release-blocker` unlabel event was by an untrusted actor.
+- **Effectively labelled:** the label is present; or the last `release-blocker` label event is a `labeled` one although the label is gone (it vanished without an event: label deleted or renamed); or the last one is an unlabel by an untrusted actor.
   - A trusted unlabel is the immediate human override ("not a blocker"), and it counts at any time.
+  - An issue that now 404s or 410s (deleted, or converted to a discussion), or that resolves to another repository or number (transferred), blocks.
 - **Resolved:** the issue is closed, and either
   - it was closed by a `closed` event whose `commit_id` is an ancestor of the tree's base (checked with `GET /compare`). So a fix that isn't in this tree doesn't unblock it; or
+  - it was closed by merging a PR. GitHub's `closed` event for that auto-close has `commit_id: null` (recorded: #454, closed by merging #456). The closing PR is the same-repo PR that cross-references the issue in `/issues/{n}/timeline` and merged at most 120 s before the close. Its `merge_commit_sha` (from `GET /pulls/{n}`) must be an ancestor of the base. If several PRs match, all of them must be. Without this path, every blocker fixed by a PR that mik merges would stay blocked, because he is a routine actor (D3); or
   - a trusted actor closed it with `closed_at ≤ t`, where t is the base commit time.
   - Any other close is ignored, so the issue is still blocking.
 
@@ -246,18 +252,20 @@ The routine runs daily at 10:15Z and maintains one branch, `release-sync`. Each 
    - **version:** stamp the highest-precedence tag's version (e.g. `5.0.0-rc.1` during the first rc week, `5.0.0` after promotion). `release-lint` accepts main at an rc version.
    - **rc sections:** for each pending rc tag (no stable of its core yet) whose section main lacks, insert the tag's `## [X.Y.Z-rc.N] — date` section verbatim and remove exactly those blocks from `[Unreleased]`.
    - **stable sections:** for each stable tag whose section main lacks, insert the tag's folded `## [X.Y.Z] — date` section and remove exactly those blocks from `[Unreleased]`.
-   - **fold at promotion:** every rc section on main whose core has shipped is resolved against the rc the stable was promoted from (rc.K = the newest same-core rc tag that is an ancestor of the stable tag): sections ≤ rc.K were folded into `[X.Y.Z]` and are deleted; later ones (e.g. rc.2 cut after rc.1 was chosen) were abandoned, so their blocks move back into `[Unreleased]` (appended to the matching `###`, exact duplicates skipped) and their headers are dropped. They ship in the next train.
+   - **fold at promotion:** every rc section on main whose core has shipped is dropped. Its blocks, with text taken from its tag, minus the blocks of the tag's `[X.Y.Z]` section, go back into `[Unreleased]`. Blocks are counted as a multiset, shared across all rcs of that stable and with the removal above. A folded rc therefore returns nothing. A later rc abandoned at promotion (rc.2 cut after rc.1 was chosen), or a train rc cut beside a hotfix of the same core (§3.4), returns exactly the blocks that did not ship. They go back oldest rc first, before the blocks already in their `###`, which is their original chronological place, and their headers are dropped. They ship in the next train. No rc-number or ancestry rule is involved, so the cut order doesn't matter.
    - only blocks of sections inserted **in this run** are removed from `[Unreleased]`, so entries added to `[Unreleased]` since are never touched.
    - Section text always comes from the tag (the bytes that shipped). An edit made on main to an rc section is discarded by the fold; fix release notes before promotion through a new rc, or edit the stable section after the sync.
-   - Matching is exact (subsection + text). A block reworded on main after the cut is not matched and may duplicate in `[Unreleased]`; the sync PR reviewer removes it.
+   - Matching is exact (subsection + text) and counts occurrences: a shipped block removes one occurrence, so an identical entry written again later (`- Updated dependencies.`) stays. A block reworded on main after the cut is not matched and may duplicate in `[Unreleased]`; the sync PR reviewer removes it.
+   - CRLF CHANGELOGs (a Windows checkout) stay CRLF, generated lines included.
+   - **Byte-identical cuts.** A cut puts its `###` subsections in a canonical order: breaking first, then Keep a Changelog's Added, Changed, Deprecated, Removed, Fixed, Security, then any other heading, with ties broken by name. Block order within a subsection is kept. Main's `[Unreleased]` subsection order depends on history (on an unsynced main, already-shipped subsections keep their old positions), so without the canonical order the cut would depend on whether the sync PR merged. With entries appended at the end of their subsection, which is the convention, the next cut is byte-identical either way.
 2. **Gap-fill.** For first-parent product commits since L (touching `crates/*/src`, `npm/` or `scripts/install.sh`) that have no CHANGELOG change, add at most 1 bullet each under `Fixed` / `Added` / `Changed` in `[Unreleased]`:
    - never under Breaking;
    - each ending `(#PR)`;
    - at most 20 in total;
    - each self-checked against the diff.
-3. If the result differs from main, push it (signed by the Claude app) and open or update the PR through REST. Labels `release:sync` and `agent:needs-human`. **It never merges.** CI's `release-readiness` runs `release-lint.sh --tag-exists` on it: coherent stamp, a non-empty CHANGELOG section for main's new version, and that version's tag exists.
+3. If the result differs from main, push it (signed by the Claude app) and open or update the PR through REST. Labels `release:sync` and `agent:needs-human`. **It never merges.** CI's `release-readiness` runs `release-lint.sh --tag-exists` on it (only for a same-repo `release-sync` branch targeting `main`; the same branch name from a fork gets the normal bump gate): coherent stamp, a non-empty CHANGELOG section for main's new version, and that version's tag exists.
 
-**Nothing on the release path waits for it.** `next-version` and `changelog cut` apply `sync-main` to C in memory first, and version selection reads only tags and `release/*` branch names, so an unmerged sync PR changes neither what gets cut nor its CHANGELOG.
+**Nothing on the release path waits for it.** `next-version` and `changelog cut` apply `sync-main` to C in memory first, and version selection reads only tags and `release/*` branch names, so an unmerged sync PR changes neither what gets cut nor its CHANGELOG (bytes included, see above).
 
 A human approver reviews the bullets like any PR. If the PR merges before Monday, the bullets reach the rc as human-reviewed text on main. If it doesn't, the rc ships without them and the notes say "N product commits without changelog entries".
 
@@ -277,7 +285,7 @@ A human approver reviews the bullets like any PR. If the PR merges before Monday
 
 **New**
 - `.github/workflows/release-qa.yml` (§2, §3.6). It must never declare inputs named `versions`, `shapes`, `modes` or `nightly`: compat steps read `github.event.inputs.<name>`, which under `workflow_call` is the caller's payload.
-- `scripts/release.py` (PR 1: `semver`, `stamp`, `next-version`, `changelog cut|promote|sync-main|check`, `sync-main`, `notes`, `blockers`; later PRs add `plan`, `cut`, `qa`, `verify-qa`, `publish-checks`, `verify-channels`, `notify`).
+- `scripts/release.py` (PR 1: `semver`, `stamp`, `npm-lock-check`, `next-version`, `changelog cut|promote|sync-main|check`, `sync-main`, `notes`, `blockers`; later PRs add `plan`, `cut`, `qa`, `verify-qa`, `publish-checks`, `verify-channels`, `notify`).
 - `scripts/release_smoke.py`, plus `scripts/release-smoke/npm-fixture/{package.json,package-lock.json}` (minimist@1.2.2).
 - `scripts/tests/test_release.py`, plus `scripts/tests/fixtures/release/**`: temp git repos and recorded REST JSON.
 - `docs/release-train/ROUTINE.md`.
@@ -294,10 +302,10 @@ A human approver reviews the bullets like any PR. If the PR merges before Monday
 4. `npm/socket-patch/package-lock.json`: `version`, `packages[""]`, and deletes `node_modules/@socketsecurity/socket-patch-*` entries whose version ≠ V. Written as `json.dumps(indent=2) + "\n"`.
 
 **Edited**
-- `scripts/release-lint.sh:68`: the grammar accepts `-rc.N` (via `release.py semver validate`); `--stable-only` refuses an rc (used by the legacy `release.yml` until PR 3 replaces it). Check 2 becomes the offline stamp (`release.py stamp --check`, byte compare, no clean-tree requirement). Check 3 is `release.py changelog check` (rc sections included; a stable fails while `[V-rc.*]` sections remain). New `--tag-exists` (the tag must already exist).
+- `scripts/release-lint.sh:68`: the grammar accepts `-rc.N` (via `release.py semver validate`); `--stable-only` refuses an rc (used by the legacy `release.yml` until PR 3 replaces it). Check 2 becomes the offline stamp (`release.py stamp --check`, byte compare, no clean-tree requirement) plus `release.py npm-lock-check`. The lock check compares the npm wrapper's `package-lock.json` `packages[""]` with `package.json` (dependency maps, engines, bin, name) and requires a `node_modules/<dep>` entry per non-optional dependency, at the pinned version. That is the dependency drift the networked lock refresh used to catch. Check 3 is `release.py changelog check` (rc sections included; a stable fails while `[V-rc.*]` sections remain). New `--tag-exists` (the tag must already exist).
 - `.github/workflows/ci.yml`:
   - (a) under `on:`, add `workflow_call: {inputs: {hosted_e2e: {type: string, default: auto}}}`;
-  - (b) in `release-readiness`, when `head_ref == 'release-sync'`, run `release-lint.sh --tag-exists` (main's new version, rc or stable, must be a cut tag with its CHANGELOG section); every other PR keeps today's behavior;
+  - (b) in `release-readiness`, when `head_ref == 'release-sync'` **and** the head repo is this repo **and** `base_ref == 'main'`, run `release-lint.sh --tag-exists` (main's new version, rc or stable, must be a cut tag with its CHANGELOG section); every other PR keeps today's behavior;
   - (c) one step in the ubuntu `e2e-build` leg: `release_smoke.py --tier 0` on the freshly built CLI, so the smoke cases can't drift from the CLI before a cut (graft from Candidate 2).
   - No tier logic changes.
 - The 9 `*-compatibility.yml` files: add `workflow_call: {}` under `on:`, one line each.
@@ -320,7 +328,7 @@ A human approver reviews the bullets like any PR. If the PR merges before Monday
 
 | Inv | How it is enforced | Residual risk |
 |---|---|---|
-| **I1** tested tree == shipped tree | **rc:** main's release.yml creates H = C + one allowlisted, tree-asserted stamp commit. One `release-qa` run at H builds once (`--locked`, no caches), smokes those bytes, and tests tree H through ci + 9 compat (every checkout defaults to H). Publish accepts only that run (path, `head_sha == H`, success, verdict, artifact digest) and publishes exactly those files after `sha256sum -c`. crates are published from a checkout of H with `--locked`. The release targets H, and `verify-channels` asserts `refs/tags/vV == H`. Immutable releases freeze tag and assets afterwards. **stable:** H = rc commit + a version-only commit whose tree equals `stamp(rc tree)` plus the heading rename. It is rebuilt and smoked in its own QA run, and R's full-QA run is re-verified. | The live `--ignored` suites test tree H built from source, not the artifact binary. The artifact is exercised live by Tier 1 smoke instead. |
+| **I1** tested tree == shipped tree | **rc:** main's release.yml creates H = C + one allowlisted, tree-asserted stamp commit. One `release-qa` run at H builds once (`--locked`, no caches), smokes those bytes, and tests tree H through ci + 9 compat (every checkout defaults to H). Publish accepts only that run (path, `head_sha == H`, success, verdict, artifact digest) and publishes exactly those files after `sha256sum -c`. crates are published from a checkout of H with `--locked`. The release targets H, and `verify-channels` asserts `refs/tags/vV == H`. Immutable releases freeze tag and assets afterwards. **stable:** H = rc commit + a version-only commit whose tree equals `stamp(rc tree)` plus `changelog promote --rc R` (the fold of rc.1..rc.R into `[X.Y.Z]`). It is rebuilt and smoked in its own QA run, and R's full-QA run is re-verified. | The live `--ignored` suites test tree H built from source, not the artifact binary. The artifact is exercised live by Tier 1 smoke instead. |
 | **I2** stable needs a non-routine maintainer | The only stable publish path is `publish` after `approve` in environment `release`: reviewers = the approvers team (no routine identity), admin bypass off, main only. `publish-checks` independently requires an approval on this run's `/approvals` by a login in `RELEASE_APPROVERS` minus `RELEASE_ROUTINE_ACTORS`. The rc path refuses any version without `-rc.N`. All of this logic is on main, which needs a reviewed PR to change. `prevent_self_review` is **off**: on a scheduled run the "triggering actor" is whoever last edited the cron, and that setting could lock a maintainer out. The routine is excluded by team membership and by the code check, not by self-review. | mik is the routine identity for now (D3), so he can't approve; a second human must exist on the team (setup S2) until routines move to the bot. |
 | **I3** blockers stop rc and stable; skip > ship; bounded fallback | §3.5 rule, evaluated in plan, in publish and after approval; API error = blocked. Untrusted closes and unlabels, including by any routine identity, never unblock. A close counts only via a fix commit that is an ancestor of the base, or a trusted close before t. Open blockers are queried with no time bound. Bounded fallback: a 14-day window, newer than the previous base, at most 1 fallback attempt, then skip + health report. There is no override path that publishes on red. | A trusted human can unlabel to override. That is intended. When mik is the routine identity, his overrides go through another maintainer. |
 | **I4** rc never Latest / npm latest / default | rc publishes with `--prerelease --latest=false` and the GitHub flip comes last; npm `--tag next`/`rc`; crates semver prerelease. `install.sh:135-136` and self-update `release.rs:88-93` resolve `/releases/latest`, which excludes prereleases. `verify-channels` asserts after each rc that GitHub latest (API and redirect), npm `latest` and crates `max_stable_version` are unchanged. On violation it re-marks the previous stable `make_latest=true`, fails and sends ntfy at high priority. | — |
@@ -339,7 +347,7 @@ A human approver reviews the bullets like any PR. If the PR merges before Monday
 | S2 | Team `socket-patch-release-approvers` with at least 2 humans, none of them in `RELEASE_ROUTINE_ACTORS`. Mirror it in `RELEASE_APPROVERS`. |
 | S3 | Environments `release` (reviewers = team, branch `main`, admin bypass off, self-review prevention off) and `publish` (no reviewers, branch `main`, admin bypass off). Delete `pypi` and `rubygems`. |
 | S4 | Trusted publishers: 15 npm packages and 2 crates → `SocketDev/socket-patch` / `release.yml` / env `publish`. Do this when PR 3 merges. npm has one publisher per package, so this is an atomic cutover. Confirm the org policy allows direct OIDC publish. |
-| S5 | Enable immutable releases. Labels `release-blocker`, `release`, `release:train`, `release:sync`. Secrets `NTFY_TOPIC` and `SLACK_WEBHOOK_URL` (optional; without the webhook, the routine posts a daily Slack digest instead). Pin the "Release train" issue. |
+| S5 | Enable immutable releases. Labels `release-blocker` (exact name; until it exists the blocker gate fails closed with `label:`), `release`, `release:train`, `release:sync`. Secrets `NTFY_TOPIC` and `SLACK_WEBHOOK_URL` (optional; without the webhook, the routine posts a daily Slack digest instead). Pin the "Release train" issue. |
 | S6 | Human triage of `release-blocker` on #559, #424, #325/#356/#519/#588 and #578/#579. |
 | S7 | Run `e2e_npm`, `e2e_pypi`, `e2e_gem` and `e2e_scan --ignored` by hand on main. Drop any that are chronically red because of the public proxy from `live-e2e`, and document why. |
 | S8 | Create the GitHub App `socket-patch-release` (D1): repository permission `contents: write` only, no webhooks, installed on `SocketDev/socket-patch` only. Store its app id and private key as `RELEASE_APP_ID` / `RELEASE_APP_PRIVATE_KEY` secrets of env `publish` (not repo secrets). |
@@ -368,7 +376,7 @@ A human approver reviews the bullets like any PR. If the PR merges before Monday
 - in `release.py`: `stamp`, semver and precedence, CHANGELOG cut / promote (fold) / `sync-main` (D2), version selection with the major rule (D4), the blocker rule, `notes`;
 - the `version-sync.sh` wrapper;
 - `release-lint.sh:68` (rc grammar, offline check 2, rc-aware check 3, `--stable-only`, `--tag-exists`);
-- ci.yml `release-readiness` handling for `release-sync`;
+- ci.yml `release-readiness` handling for a same-repo `release-sync` PR into main;
 - delete `version-bump.yml` and `bump-version.sh`, fixing every reference;
 - tests (`scripts/tests/test_release.py`, fixtures under `scripts/tests/fixtures/release/`).
 
@@ -381,6 +389,11 @@ A human approver reviews the bullets like any PR. If the PR merges before Monday
 - version selection on the main CHANGELOG snapshot gives `5.0.0-rc.1`;
 - version scenarios: rc.2 while rc.1 is pending gives `5.0.0-rc.2`; after a v5.0.0 tag with the sync PR unmerged, the result is `5.0.1-rc.1` or `5.1.0-rc.1`; burned branches are skipped;
 - blocker fixtures:
+  - a missing or renamed `release-blocker` label blocks (`label:`); case variants of the label on issues and events count;
+  - a label that vanished without an `unlabeled` event, and a deleted, converted or transferred issue, block;
+  - an empty, unset or malformed `RELEASE_ROUTINE_ACTORS` / `RELEASE_APPROVERS` blocks (`config:`); newline-, space- and `@`-separated lists parse;
+  - `since` comes from `merge-base(L, base)`, not from a forgeable tag date, and a `since` after the base fails closed;
+  - a PR-merge close (`commit_id: null`, recorded from #454) resolves only through the closing PR's merge commit being in the base;
   - an open issue untouched for 200 days blocks;
   - closed by a commit not in the base blocks;
   - closed by a commit that is an ancestor of the base passes;
@@ -394,7 +407,12 @@ A human approver reviews the bullets like any PR. If the PR merges before Monday
   - stable promotion of rc.1 with a later rc.2 already synced to main: one `## [X.Y.Z]` section equal to the tag's, no rc headers left, rc.2's blocks back in `[Unreleased]`, newer `[Unreleased]` entries untouched and in place;
   - the same end state when the sync PR never merged;
   - `sync-main` is idempotent;
-  - `next-version` and `changelog cut` give the same result with the sync PR merged or unmerged;
+  - `next-version` and `changelog cut` give the same result, byte for byte, with the sync PR merged or unmerged, including a repeated identical entry, an abandoned later rc, and subsection order left over from shipped history;
+  - a hotfix promoted beside a pending train rc of the same core returns that rc's entries to `[Unreleased]`;
+  - CRLF CHANGELOGs round-trip and every transform keeps CRLF;
+  - `release-lint.sh` (no flags and `--tag-exists`) passes on a `sync-main`ed working tree at an rc, and `--tag-exists` fails once the tag is gone;
+  - the stamp tests run on a temp tree stamped to a fixed baseline (4.0.0 and an rc), never on the live checkout's version;
+  - `release-lint.sh` catches npm dependency drift between `package.json` and its lock, offline;
   - a breaking heading that would open an unapproved major is refused; a major is never skipped.
 
 ### PR 2: `release-qa.yml` + smoke
@@ -440,7 +458,7 @@ A human approver reviews the bullets like any PR. If the PR merges before Monday
 - `docs/releasing.md`, `ROUTINE.md`, the CHANGELOG header.
 
 **Accept:**
-- unit tests: the stable tree equals `stamp(rc tree)` plus the rename, with the diff a subset of the allowlist;
+- unit tests: the stable tree equals `stamp(rc tree)` plus `changelog promote --rc R` (the fold), with the diff a subset of the allowlist;
 - the approvals check rejects an approver in `RELEASE_ROUTINE_ACTORS`, or one not in `RELEASE_APPROVERS`;
 - a stable plan with a fabricated rc tag (no QA run) is refused;
 - a hotfix with a pick off main's first-parent is refused, and so is a dispatch by a routine actor;
@@ -477,8 +495,8 @@ Create the routine and make the prompt edits.
 | Bench as a gate | Perf regressions only gate if someone labels them `release-blocker` (the daily bench routine files issues). |
 | Three routines plus the claim protocol (cut / promote confirm, classification, attribution, fix-forward, changelog-drop markers) | The routine is off the critical path. The only cost is that gap-fill is missing if the PR isn't merged. |
 | Routine-applied blocker labels, the B1–B7 rubric in code, attribution and ancestry lines, override comments | Blockers are labelled by humans, or by bughunt/triage routines adding them, which only adds safety. Override = a trusted human unlabels. |
-| Fix-forward rc and 48h mini-soak, major-hold, `approved_majors`, ABANDONED / SUPERSEDED states | Fall out of "cumulative since last stable" plus `core = max(...)`. An urgent fix goes through hotfix mode. A major ships whenever `[Unreleased]` has a Breaking heading, which is a human-reviewed decision on main. |
-| CHANGELOG block-identity hashing, fuzzy matching, multiset invariant (rc sections **are** synced to main, D2) | Exact-match transforms. A reworded block on main after an rc may duplicate in `[Unreleased]`; the sync PR reviewer cleans it up. rc-section edits on main are dropped at the fold; the tag text is canonical. |
+| Fix-forward rc and 48h mini-soak, major-hold, ABANDONED / SUPERSEDED states (`APPROVED_MAJORS` is **kept**, D4) | Fall out of "cumulative since last stable" plus `core = max(...)`. An urgent fix goes through hotfix mode. A major needs both a Breaking heading in `[Unreleased]` and a reviewed `APPROVED_MAJORS` entry in `release.py`, and a major is never skipped (§3.1). |
+| CHANGELOG block-identity hashing, fuzzy matching (rc sections **are** synced to main, D2; blocks are counted as a multiset, §3.7) | Exact-match transforms. A reworded block on main after an rc may duplicate in `[Unreleased]`; the sync PR reviewer cleans it up. rc-section edits on main are dropped at the fold; the tag text is canonical. |
 | Approval TTL, single-use approval binding via digest | A late approval is safe because of the post-approval re-check. A stale parked run is cancelled by the next `plan`. |
 | Older-line hotfixes, patch-id equivalence | Picks must be exact main first-parent SHAs, on the newest line only. |
 | Deadline bookkeeping (Tue 06:00Z) | Bounded implicitly by two attempt jobs of at most 355 min each. The worst case finishes about Tue 00:00. |
