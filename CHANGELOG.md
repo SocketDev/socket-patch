@@ -119,6 +119,40 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
   trust-lockfile configuration. Explicit user settings are respected.
 - Path targeting on scan and rollback, hosted update detection from lockfiles,
   and configurable API request concurrency.
+- sbt, Mill and scala-cli projects (`build.sbt`, `build.mill`,
+  `build.mill.yaml`, `build.sc`, `project.scala`) count as Maven projects: a
+  local scan crawls the Maven repository for them, socket.yml path filters
+  match those files as root markers, and the in-memory hosted scan warns
+  `ecosystem_unsupported_in_memory` for them.
+- Agent mode finds and patches Maven artifacts in Coursier caches (sbt 1.3+,
+  sbt 2, Mill, scala-cli) and Ivy caches (sbt 0.13–1.2, `useCoursier := false`),
+  at the locations `COURSIER_CACHE`, `.jvmopts` / `.sbtopts` / `SBT_OPTS` /
+  `JAVA_OPTS` options or the OS defaults name, and resyncs Coursier's checksum
+  sidecars after apply and rollback so Coursier keeps the patched bytes. A
+  GAV cached in several of these roots (or also in `~/.m2`) is patched and
+  restored in every one. Locally these caches are crawled only for an sbt /
+  Mill / scala-cli project (a Maven or Gradle project keeps `~/.m2` alone),
+  and a Coursier directory holding only a pom is no copy.
+- Hosted sbt: `scan` / `get --mode hosted` wire Maven patches into an sbt
+  build (0.13.18 to 2.0) through one generated `socket-patch.sbt`, gated on
+  sbt's own resolution records (each project dated by its own records) and
+  verified again at every sbt load, which also fails a build that declares a
+  pinned GA newer than the patched base;
+  `rollback` restores it offline and VEX attests a pin only after
+  `sbt update` shows it resolved. Mill and scala-cli get paste-able snippets
+  (`redirect_mill_manual_snippet`, `redirect_scala_cli_manual_snippet`).
+- Vendored sbt: `vendor` wires an sbt 0.13.18+ build root through a generated
+  `socket-patch-vendor.sbt` over the committed suffixed tree
+  `.socket/vendor/maven2`, editing no user file; revert, rollback, `--check`
+  and repair cover it. New `vendor_sbt_*` refusal and warning codes and
+  `vendor_jvm_build_ambiguous` are listed in `CLI_CONTRACT.md`.
+- Vendored scala-cli directory builds (`project.scala`): `vendor` writes only
+  owned files (a root `socket-patch.scala` including a guard inside the
+  committed same-GAV `.socket/vendor/coursier/` tree), gated on scala-cli's own
+  Bloop resolution, failing closed when the tree is deleted, and refusing builds
+  whose own repositories would shadow it (`vendor_scala_cli_*`,
+  `vendor_coursier_tree_conflict`). Mill vendoring stays docs-only
+  (docs/design/sbt-support.md).
 
 See [ecosystem support](docs/ecosystems.md) and the
 [compatibility guides](docs/testing/README.md) for format boundaries, integrity
@@ -295,6 +329,21 @@ limits, and required install commands.
 - Documentation now separates usage, configuration, migration, compatibility, and
   development guidance; completed plans, prototype research, and historical run
   reports are removed from the maintained docs.
+- sbt support scaffolding: the shared sbt build model and resolution gate,
+  Coursier / Ivy cache layouts in the JVM cache seam, real sbt resolution
+  evidence fixtures, and hooks for the hosted, vendored, VEX and sidecar
+  lanes (docs/design/sbt-support.md).
+- The generated `socket-patch.sbt` / `socket-patch-vendor.sbt` templates are
+  frozen by a six-version sbt probe (docs/design/sbt-template-probe.md), with a
+  byte-exact renderer and strict parser for them.
+- sbt resolution evidence: parsers for the update-cache JSON, Ivy reports and
+  scala-cli Bloop files, a capped FIFO-safe evidence walk with staleness, the
+  hosted evidence document and the vendored sbt gate
+  (docs/design/sbt-evidence-probe.md).
+- CI runs real sbt: `sbt-compatibility.yml` covers six sbt lines in every mode
+  (JDK 8 / 17 / 21), Mill, scala-cli and macOS / Windows, and `ci.yml` blocks
+  on the sbt agent cells (1.2.8, 1.13.0) and hosted + vendored sbt 1.13.0
+  (docs/testing/sbt-compatibility.md).
 
 ## [4.0.0] — 2026-08-20
 
