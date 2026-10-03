@@ -670,8 +670,9 @@ pub fn normalize_prefix(prefix: &Path) -> PathBuf {
 /// Whether a local scan of `cwd` counts the Maven local repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum M2Gate {
-    /// Not a Gradle-only project (a `pom.xml`, or no Gradle marker): m2
-    /// counts as always.
+    /// Not a Gradle-only project (a `pom.xml`, an sbt / Mill / scala-cli
+    /// build beside the Gradle one, or no Gradle marker): m2 counts as
+    /// always.
     NotGradleOnly,
     /// A Gradle build that declares `mavenLocal()` (in this script).
     Declared(String),
@@ -684,8 +685,16 @@ pub enum M2Gate {
 
 /// See [`M2Gate`]. Reads the build's scripts and the init scripts of
 /// `env`'s Gradle user home.
+///
+/// A Scala-tool build beside the Gradle one ([`SCALA_TOOL_MARKERS`]) keeps
+/// m2 as a lone sbt / Mill / scala-cli root does: its own resolvers (an
+/// sbt `Resolver.mavenLocal`, say) are not the Gradle scripts', so the
+/// Gradle build's silence on `mavenLocal()` cannot rule `~/.m2` out.
 pub fn m2_gate(cwd: &Path, env: &JvmEnv) -> M2Gate {
-    if cwd.join("pom.xml").exists() || !gradle_cache::has_gradle_marker(cwd) {
+    if cwd.join("pom.xml").exists()
+        || !gradle_cache::has_gradle_marker(cwd)
+        || has_scala_tool_marker(cwd)
+    {
         return M2Gate::NotGradleOnly;
     }
     match gradle_cache::maven_local(cwd, env.gradle.as_ref()) {
@@ -725,6 +734,20 @@ const SCALA_TOOL_MARKERS: &[&str] = &[
     "project.scala",
     ".scala-build",
 ];
+
+/// [`scala_tool_project`] for a blocking caller (the walk pool).
+fn has_scala_tool_marker(dir: &Path) -> bool {
+    SCALA_TOOL_MARKERS
+        .iter()
+        .any(|marker| std::fs::symlink_metadata(dir.join(marker)).is_ok())
+}
+
+/// `path` with its symlinks resolved, or as given when it cannot be.
+async fn canonical_or_self(path: &Path) -> PathBuf {
+    tokio::fs::canonicalize(path)
+        .await
+        .unwrap_or_else(|_| path.to_path_buf())
+}
 
 /// Whether `dir` holds any [`SCALA_TOOL_MARKERS`] entry.
 async fn scala_tool_project(dir: &Path) -> bool {
@@ -807,8 +830,9 @@ impl MavenCrawler {
     /// - The Coursier / Ivy caches count for an sbt, Mill or scala-cli
     ///   project (`SCALA_TOOL_MARKERS`) or in global mode; their
     ///   directories are read from the process environment.
-    /// - The Maven local repository counts in global mode, for a `pom.xml`
-    ///   or a cwd with no Gradle marker, and for a Gradle build that reads
+    /// - The Maven local repository counts in global mode, for a `pom.xml`,
+    ///   a Scala-tool build or a cwd with no Gradle marker, and for a
+    ///   Gradle build that reads
     ///   it: `mavenLocal()` declared in the build's scripts or an init
     ///   script, or not ruled out ([`m2_gate`]). A Gradle-only build that
     ///   never declares it does not resolve from `~/.m2`, so its contents
@@ -929,8 +953,18 @@ impl MavenCrawler {
         if jvm && is_dir(&env.m2_repo).await {
             paths.push(env.m2_repo.clone());
         }
+        // One physical cache once, however it is spelled (a root reached
+        // through a symlinked home names the `~/.m2` pushed above): the
+        // every-copy fan-out would otherwise patch it twice, and the alias
+        // would escape the `~/.m2` prefix checks.
+        let mut seen = Vec::with_capacity(paths.len());
+        for path in &paths {
+            seen.push(canonical_or_self(path).await);
+        }
         for root in self.get_jvm_cache_roots_with(options, env).await {
-            if !paths.contains(&root.path) {
+            let key = canonical_or_self(&root.path).await;
+            if !paths.contains(&root.path) && !seen.contains(&key) {
+                seen.push(key);
                 paths.push(root.path);
             }
         }

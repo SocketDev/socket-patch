@@ -2557,23 +2557,27 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
     // a mavenLocal() artifact in files-2.1, so this is also exactly what a
     // build reading the module from mavenLocal() looks like: warn, not
     // refuse. `vex` re-hashes the Gradle cache copy that build makes.
+    // Only the `~/.m2` copies are named: a Coursier / Ivy copy beside them
+    // (an sbt build in the same root) is no Maven local repository.
+    let m2_copies: Vec<String> = copies
+        .consumed
+        .iter()
+        .filter(|c| c.starts_with(&m.scope.env.m2_repo))
+        .map(|p| p.display().to_string())
+        .collect();
     if matches!(
         m.scope.gate,
         Some(socket_patch_core::crawlers::maven_crawler::M2Gate::Declared(_))
             | Some(socket_patch_core::crawlers::maven_crawler::M2Gate::Undetermined(_))
-    ) && copies.consumed.iter().all(|c| !is_gradle_version_dir(c))
+    ) && !m2_copies.is_empty()
+        && copies.consumed.iter().all(|c| !is_gradle_version_dir(c))
     {
         out.warn(
             "gradle_m2_may_be_unconsumed",
             format!(
                 "{}: the only patched copy is in the Maven local repository ({}). This Gradle                  build reads it only when no repository declared before mavenLocal() has the                  module; otherwise its next build downloads the unpatched jar. Run the build                  once and apply again so the Gradle cache copy is patched too.",
                 normalize_purl(m.base_purl),
-                copies
-                    .consumed
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                m2_copies.join(", ")
             ),
         );
     }
@@ -2653,10 +2657,15 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
                 if detailed.targets.is_empty() {
                     continue;
                 }
+                // Only a Gradle hash dir's name proves its bytes are the
+                // pristine download; an Ivy type dir no variant matches is
+                // skipped as a `~/.m2` or Coursier copy is.
                 for (dir, _) in &detailed.targets {
-                    held.entry(dir.clone())
-                        .or_default()
-                        .push((*variant).clone());
+                    if maven_sidecars::is_gradle_hash_dir(dir) {
+                        held.entry(dir.clone())
+                            .or_default()
+                            .push((*variant).clone());
+                    }
                 }
                 let absent: HashMap<String, PatchFileInfo> = detailed
                     .missing
@@ -2752,11 +2761,12 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
     }
     out.matched.sort();
     out.matched.dedup();
-    // Nothing attempted. Gradle version dirs that hold none of a record's
-    // files (a pom-only entry, another classifier) are not installs of it:
-    // the variants stay unmatched (`package_not_installed`). A `~/.m2` copy
-    // no variant matches is a different distribution: an error, as before.
-    let gradle_only = copies.consumed.iter().all(|c| is_gradle_version_dir(c));
+    // Nothing attempted. Gradle version dirs and Ivy artifact dirs that
+    // hold none of a record's files (a pom-only entry, another classifier)
+    // are not installs of it: the variants stay unmatched
+    // (`package_not_installed`). A `~/.m2` copy no variant matches is a
+    // different distribution: an error, as before.
+    let gradle_only = copies.consumed.iter().all(|c| gradle_cache::expands(c));
     if !attempted && !out.failed && !gradle_only {
         out.failed = true;
         if args.prints_errors() {

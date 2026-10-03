@@ -1506,12 +1506,18 @@ fn confirm(
             // not the pin was verified against the build's evidence (so it
             // is never a substring proof). Beside a `pom.xml` the Maven
             // rewriter's own landing also confirms. Beside a Gradle build
-            // whose planner decided the patch, the Gradle arm below must
-            // confirm it as well (each build pins on its own).
+            // whose planner decided the patch, both builds must pin it
+            // (each build pins on its own, as a pom beside Gradle must):
+            // the Gradle arm below confirms an sbt-confirmed uuid, and a
+            // uuid the sbt rewriter refused is never confirmed by the
+            // Gradle planner alone — the sbt build still loads upstream.
             if purl.starts_with("pkg:maven/") {
                 if let Some(sbt_only) = crate::patch::redirect::sbt::maven_confirmation(files) {
-                    let by_sbt = rewrite.confirmed_sbt_uuids.contains(uuid)
-                        && !rewrite.refused_sbt_uuids.contains(uuid);
+                    let refused_by_sbt = rewrite.refused_sbt_uuids.contains(uuid);
+                    if refused_by_sbt && rewrite.gradle_uuids.contains(uuid) {
+                        return ProbeStep::Decided(false);
+                    }
+                    let by_sbt = rewrite.confirmed_sbt_uuids.contains(uuid) && !refused_by_sbt;
                     let gradle_decides = by_sbt && rewrite.gradle_uuids.contains(uuid);
                     if (by_sbt || sbt_only) && !gradle_decides {
                         return ProbeStep::Decided(by_sbt);
@@ -2383,6 +2389,37 @@ mod tests {
         );
         let (_, done) = gradle_rewrite(&p).await;
         assert!(done.rewrite.confirmed_gradle_uuids.contains(GRADLE_UUID));
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+    }
+
+    /// An sbt build beside a Gradle build: the Gradle planner pinning a
+    /// uuid the sbt rewriter refused (here: no resolution evidence) does
+    /// not confirm it — the sbt build still loads the upstream artifact.
+    #[tokio::test]
+    async fn a_mixed_sbt_and_gradle_build_needs_both() {
+        let mut p = MemoryProject::new();
+        p.insert_text("settings.gradle", "");
+        p.insert_text(
+            "build.gradle",
+            "dependencies { implementation 'com.socketfixture:victim:1.10.0' }\n",
+        );
+        p.insert_text(
+            "gradle.lockfile",
+            "com.socketfixture:victim:1.10.0=runtimeClasspath\nempty=\n",
+        );
+        // The Gradle half alone pins the patch.
+        let (_, done) = gradle_rewrite(&p).await;
+        assert!(done.rewrite.confirmed_gradle_uuids.contains(GRADLE_UUID));
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.confirmed);
+
+        p.insert_text("project/build.properties", "sbt.version=1.9.9\n");
+        p.insert_text(
+            "build.sbt",
+            "libraryDependencies += \"com.socketfixture\" % \"victim\" % \"1.10.0\"\n",
+        );
+        let (_, done) = gradle_rewrite(&p).await;
+        assert!(done.rewrite.confirmed_gradle_uuids.contains(GRADLE_UUID));
+        assert!(done.rewrite.refused_sbt_uuids.contains(GRADLE_UUID));
         assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
     }
 

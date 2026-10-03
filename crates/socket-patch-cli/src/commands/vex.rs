@@ -879,12 +879,14 @@ async fn withhold_unpatched_jvm_copies(
     common: &GlobalArgs,
     warnings: &mut Vec<RunWarning>,
 ) {
-    use socket_patch_core::crawlers::gradle_cache::is_gradle_version_dir;
+    use socket_patch_core::crawlers::gradle_cache::{self, is_gradle_version_dir};
     use socket_patch_core::patch::jvm_jar::{self, RecordShape};
 
+    // A Gradle version dir or an Ivy artifact dir expands into several
+    // directories, so even a lone copy can be partly unpatched: name it.
     let mut unpatched = std::mem::take(&mut outcome.unpatched_copies);
     unpatched.retain(|(purl, path)| {
-        is_gradle_version_dir(path) || copies.get(purl).is_some_and(|c| c.len() > 1)
+        gradle_cache::expands(path) || copies.get(purl).is_some_and(|c| c.len() > 1)
     });
     let mut derived: Vec<(String, PathBuf)> = Vec::new();
     let mut unchecked: Vec<String> = Vec::new();

@@ -708,3 +708,231 @@ fn agent_an_ivy_sources_jar_under_srcs_is_patched_and_restored() {
         "{env}"
     );
 }
+
+// ── mixed roots and Ivy type dirs (adaptation review) ───────────────────
+
+const SOURCES_JAR: &str = "slf4j-api-1.7.36-sources.jar";
+const SOURCES_ORIGINAL: &[u8] = b"PK\x03\x04 pristine slf4j-api sources\n";
+const SOURCES_PATCHED: &[u8] = b"PK\x03\x04 socket-patched slf4j-api sources\n";
+const BASE_UUID: &str = "5b7a0000-0000-4000-8000-000000000001";
+const SOURCES_UUID: &str = "5b7a0000-0000-4000-8000-000000000003";
+
+/// Write a manifest of `(purl, uuid, files)` records, each file
+/// `(key, before, after)`, with GHSA metadata so VEX attests it, and stage
+/// every blob.
+/// A record file: `(key, before, after)`.
+type RecordFile<'a> = (&'a str, &'a [u8], &'a [u8]);
+/// A record: `(purl, uuid, files)`.
+type Record<'a> = (String, &'a str, &'a [RecordFile<'a>]);
+
+fn stage_records(project: &Path, records: &[Record<'_>]) {
+    let socket = project.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    let mut patches = serde_json::Map::new();
+    for (purl, uuid, files) in records {
+        let mut entries = serde_json::Map::new();
+        for (key, before, after) in *files {
+            for bytes in [before, after] {
+                std::fs::write(socket.join("blobs").join(common::git_sha256(bytes)), bytes)
+                    .unwrap();
+            }
+            entries.insert(
+                key.to_string(),
+                serde_json::json!({
+                    "beforeHash": common::git_sha256(before),
+                    "afterHash": common::git_sha256(after),
+                }),
+            );
+        }
+        patches.insert(
+            purl.clone(),
+            serde_json::json!({
+                "uuid": uuid,
+                "exportedAt": "2026-10-02T00:00:00Z",
+                "files": entries,
+                "vulnerabilities": { "GHSA-5b7a-0000-0001": {
+                    "cves": ["CVE-2026-0001"], "summary": "s",
+                    "severity": "high", "description": "d"
+                } },
+                "description": "sbt agent review fixture",
+                "license": "MIT",
+                "tier": "free",
+            }),
+        );
+    }
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({ "patches": patches })).unwrap(),
+    )
+    .unwrap();
+}
+
+fn ivy_opts(fx: &Fixture) -> (&'static str, String) {
+    (
+        "SBT_OPTS",
+        format!("-Dsbt.ivy.home={}", fx.home.ivy_home().display()),
+    )
+}
+
+fn warning_codes(envelope: &Value) -> Vec<String> {
+    [&envelope["warnings"], &envelope["vex"]["warnings"]]
+        .into_iter()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|w| w["code"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// An sbt build beside a Gradle build that never declares `mavenLocal()`:
+/// the sbt build's own `Resolver.mavenLocal` reads `~/.m2`, so its copy is
+/// patched, not refused as one "this Gradle build never reads".
+#[test]
+fn agent_mixed_sbt_and_gradle_root_patches_the_m2_copy() {
+    let fx = fixture();
+    std::fs::write(
+        fx.project.join("build.sbt"),
+        "resolvers += Resolver.mavenLocal\n\
+         libraryDependencies += \"org.slf4j\" % \"slf4j-api\" % \"1.7.36\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fx.project.join("settings.gradle"),
+        "rootProject.name = 'app'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fx.project.join("build.gradle"),
+        "plugins { id 'java' }\nrepositories { mavenCentral() }\n",
+    )
+    .unwrap();
+    let m2 = fx.home.m2().join("org/slf4j/slf4j-api/1.7.36");
+    std::fs::create_dir_all(&m2).unwrap();
+    std::fs::write(m2.join(JAR), ORIGINAL).unwrap();
+    std::fs::write(m2.join("slf4j-api-1.7.36.pom"), SLF4J.pom()).unwrap();
+    stage_manifest(&fx.project, SLF4J);
+
+    let (code, env, stderr) = run(&fx, &["apply", "--offline", "--json"], &[]);
+    assert_eq!(code, 0, "apply: {env}\n{stderr}");
+    assert!(
+        !env.to_string().contains("gradle_build_ignores_m2"),
+        "{env}"
+    );
+    assert_eq!(std::fs::read(m2.join(JAR)).unwrap(), PATCHED, "{env}");
+}
+
+/// Base and `sources` variants, and an Ivy `srcs/` jar neither was made
+/// for: the variant gate skips it as it would a `~/.m2` or Coursier copy.
+/// Only a Gradle hash dir's name proves pristine bytes, so this is no
+/// `gradle_copy_unexpected_bytes` failure.
+#[test]
+fn agent_an_ivy_srcs_jar_no_variant_matches_is_skipped() {
+    let fx = fixture();
+    let jars = write_ivy_artifact(&fx.home.ivy_home(), SLF4J, ORIGINAL);
+    let srcs = jars.parent().unwrap().join("srcs");
+    std::fs::create_dir_all(&srcs).unwrap();
+    let other: &[u8] = b"PK\x03\x04 some other sources build\n";
+    std::fs::write(srcs.join(SOURCES_JAR), other).unwrap();
+    stage_records(
+        &fx.project,
+        &[
+            (SLF4J.purl(), BASE_UUID, &[(JAR, ORIGINAL, PATCHED)]),
+            (
+                format!("{}?classifier=sources", SLF4J.purl()),
+                SOURCES_UUID,
+                &[(SOURCES_JAR, SOURCES_ORIGINAL, SOURCES_PATCHED)],
+            ),
+        ],
+    );
+
+    let (code, env, stderr) = run(&fx, &["apply", "--offline", "--json"], &[ivy_opts(&fx)]);
+    assert_eq!(code, 0, "apply: {env}\n{stderr}");
+    assert!(
+        !env.to_string().contains("gradle_copy_unexpected_bytes"),
+        "{env}"
+    );
+    assert_eq!(std::fs::read(jars.join(JAR)).unwrap(), PATCHED, "{env}");
+    assert_eq!(std::fs::read(srcs.join(SOURCES_JAR)).unwrap(), other);
+}
+
+/// A `sources` record and an Ivy module with no `srcs/`: the Ivy copy
+/// holds none of the record's files, so it is no install of it
+/// (`package_not_installed`, as for a Gradle version dir), not a "no
+/// matching variant found" failure; the other patch applies and the run
+/// succeeds.
+#[test]
+fn agent_an_ivy_copy_without_the_classifier_is_not_installed() {
+    let fx = fixture();
+    let jars = write_ivy_artifact(&fx.home.ivy_home(), SLF4J, ORIGINAL);
+    let gson = write_ivy_artifact(&fx.home.ivy_home(), GSON, ORIGINAL);
+    stage_records(
+        &fx.project,
+        &[
+            (
+                format!("{}?classifier=sources", SLF4J.purl()),
+                SOURCES_UUID,
+                &[(SOURCES_JAR, SOURCES_ORIGINAL, SOURCES_PATCHED)],
+            ),
+            (
+                GSON.purl(),
+                BASE_UUID,
+                &[("gson-2.8.9.jar", ORIGINAL, PATCHED)],
+            ),
+        ],
+    );
+
+    let (code, env, stderr) = run(&fx, &["apply", "--offline", "--json"], &[ivy_opts(&fx)]);
+    assert_eq!(code, 0, "apply: {env}\n{stderr}");
+    assert!(env.to_string().contains("package_not_installed"), "{env}");
+    assert_eq!(std::fs::read(jars.join(JAR)).unwrap(), ORIGINAL);
+    assert_eq!(
+        std::fs::read(gson.join("gson-2.8.9.jar")).unwrap(),
+        PATCHED,
+        "{env}"
+    );
+}
+
+/// One Ivy copy whose `jars/` jar is patched but whose `srcs/` jar went
+/// back to its pristine bytes: VEX withholds the statement AND names the
+/// copy (`vex_gradle_unpatched_copy`), as for a lone Gradle version dir.
+#[test]
+fn agent_vex_names_a_lone_partly_unpatched_ivy_copy() {
+    let fx = fixture();
+    let jars = write_ivy_artifact(&fx.home.ivy_home(), SLF4J, ORIGINAL);
+    let srcs = jars.parent().unwrap().join("srcs");
+    std::fs::create_dir_all(&srcs).unwrap();
+    std::fs::write(srcs.join(SOURCES_JAR), SOURCES_ORIGINAL).unwrap();
+    stage_records(
+        &fx.project,
+        &[(
+            SLF4J.purl(),
+            BASE_UUID,
+            &[
+                (JAR, ORIGINAL, PATCHED),
+                (SOURCES_JAR, SOURCES_ORIGINAL, SOURCES_PATCHED),
+            ],
+        )],
+    );
+    let opts = ivy_opts(&fx);
+    let (code, env, stderr) = run(
+        &fx,
+        &["apply", "--offline", "--json"],
+        std::slice::from_ref(&opts),
+    );
+    assert_eq!(code, 0, "apply: {env}\n{stderr}");
+    assert_eq!(
+        std::fs::read(srcs.join(SOURCES_JAR)).unwrap(),
+        SOURCES_PATCHED
+    );
+    let (statements, env) = vex_statements(&fx, std::slice::from_ref(&opts));
+    assert!(statements > 0, "every file patched: {env}");
+
+    std::fs::write(srcs.join(SOURCES_JAR), SOURCES_ORIGINAL).unwrap();
+    let (statements, env) = vex_statements(&fx, std::slice::from_ref(&opts));
+    assert_eq!(statements, 0, "{env}");
+    assert!(
+        warning_codes(&env)
+            .iter()
+            .any(|c| c == "vex_gradle_unpatched_copy"),
+        "{env}"
+    );
+}
