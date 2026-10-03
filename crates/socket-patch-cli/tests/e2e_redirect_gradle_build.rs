@@ -529,86 +529,136 @@ impl Cell {
 
 /// The grant, the patch view and the discovery routes `scan` drives.
 fn mount_api(s: &Server, served: &Served, files: &[(String, Vec<u8>)]) {
-    let purl = purl();
-    let artifact_url = format!(
-        "https://patch.socket.dev/patch/maven/{GROUP}/{VICTIM}/{VICTIM_VERSION}/{TOKEN}/{UUID}/{VICTIM}-{}.jar",
-        sfx()
-    );
-    let mut identifiers = serde_json::json!({
-        "name": format!("{GROUP}/{VICTIM}"),
-        "version": VICTIM_VERSION,
-        "mavenGroupId": GROUP,
-        "mavenArtifactId": VICTIM,
-        "mavenSuffixedVersion": sfx(),
-        "mavenPomSha256": sha256_hex(&served.pom),
-    });
-    if let Some(m) = &served.module {
-        identifiers["mavenModuleSha256"] = sha256_hex(m).into();
+    mount_grants(s, &[(&HOSTED, served, files)]);
+}
+
+/// One hosted patch for [`mount_grants`]: the patch, what the Socket
+/// repository serves and the patch view's files.
+type Grant<'a> = (&'a Hosted, &'a Served, &'a [(String, Vec<u8>)]);
+
+/// [`mount_api`] for several hosted patches at once.
+fn mount_grants(s: &Server, grants: &[Grant<'_>]) {
+    let mut packages = Vec::new();
+    let mut results = serde_json::Map::new();
+    let mut by_package = Vec::new();
+    let mut views = Vec::new();
+    for (h, served, files) in grants {
+        let purl = h.purl();
+        let uuid = h.uuid;
+        let artifact_url = format!(
+            "https://patch.socket.dev/patch/maven/{}/{}/{}/{TOKEN}/{uuid}/{}-{}.jar",
+            h.group,
+            h.artifact,
+            h.version,
+            h.artifact,
+            h.suffixed()
+        );
+        let mut identifiers = serde_json::json!({
+            "name": format!("{}/{}", h.group, h.artifact),
+            "version": h.version,
+            "mavenGroupId": h.group,
+            "mavenArtifactId": h.artifact,
+            "mavenSuffixedVersion": h.suffixed(),
+            "mavenPomSha256": sha256_hex(&served.pom),
+        });
+        if let Some(m) = &served.module {
+            identifiers["mavenModuleSha256"] = sha256_hex(m).into();
+        }
+        let view_files: serde_json::Map<String, serde_json::Value> = files
+            .iter()
+            .map(|(key, after)| {
+                (
+                    key.clone(),
+                    serde_json::json!({ "beforeHash": "a".repeat(64), "afterHash": git_sha256(after) }),
+                )
+            })
+            .collect();
+        let vulnerabilities = serde_json::json!({
+            GHSA: { "cves": [CVE], "summary": "s", "severity": "high", "description": "d" }
+        });
+        let view = serde_json::json!({
+            "uuid": uuid,
+            "purl": purl,
+            "publishedAt": "Fri, 27 Mar 2026 00:00:00 GMT",
+            "files": view_files,
+            "vulnerabilities": vulnerabilities.clone(),
+            "description": h.title,
+            "license": "MIT",
+            "tier": "free",
+        });
+        packages.push(serde_json::json!({ "purl": purl, "patches": [{
+            "uuid": uuid, "purl": purl, "tier": "free", "cveIds": [CVE],
+            "ghsaIds": [GHSA], "severity": "high", "title": h.title
+        }] }));
+        results.insert(
+            uuid.to_string(),
+            serde_json::json!({
+                "status": "granted",
+                "url": artifact_url,
+                "purl": purl,
+                "artifacts": [{
+                    "kind": "tarball",
+                    "url": artifact_url,
+                    "integrity": { "sha1": sha1_hex(&served.jar), "sha256": sha256_hex(&served.jar) }
+                }],
+                "registryOverride": {
+                    "kind": "maven2",
+                    "indexUrl": h.prod_index_url(),
+                    "identifiers": identifiers,
+                }
+            }),
+        );
+        // One patch answers every by-package lookup (as before); several
+        // answer by artifact.
+        let route = if grants.len() == 1 {
+            format!("^/v0/orgs/{ORG}/patches/by-package/.+$")
+        } else {
+            format!("^/v0/orgs/{ORG}/patches/by-package/.*{}.*$", h.artifact)
+        };
+        by_package.push((
+            route,
+            serde_json::json!({
+                "patches": [{
+                    "uuid": uuid, "purl": purl, "publishedAt": "2026-01-01T00:00:00Z",
+                    "description": "d", "license": "MIT", "tier": "free",
+                    "vulnerabilities": vulnerabilities
+                }],
+                "canAccessPaidPatches": false,
+            }),
+        ));
+        views.push((uuid, view));
     }
-    let view_files: serde_json::Map<String, serde_json::Value> = files
-        .iter()
-        .map(|(key, after)| {
-            (
-                key.clone(),
-                serde_json::json!({ "beforeHash": "a".repeat(64), "afterHash": git_sha256(after) }),
-            )
-        })
-        .collect();
-    let view = serde_json::json!({
-        "uuid": UUID,
-        "purl": purl,
-        "publishedAt": "Fri, 27 Mar 2026 00:00:00 GMT",
-        "files": view_files,
-        "vulnerabilities": { GHSA: { "cves": [CVE], "summary": "s", "severity": "high", "description": "d" } },
-        "description": "gradle hosted e2e",
-        "license": "MIT",
-        "tier": "free",
-    });
     s.rt.block_on(async {
         s.server.reset().await;
-        for m in [
+        let mut mocks = vec![
             Mock::given(method("POST"))
                 .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "packages": [{ "purl": purl, "patches": [{
-                        "uuid": UUID, "purl": purl, "tier": "free", "cveIds": [CVE],
-                        "ghsaIds": [GHSA], "severity": "high", "title": "gradle hosted e2e"
-                    }] }],
-                    "canAccessPaidPatches": false,
-                }))),
-            Mock::given(method("GET"))
-                .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "patches": [{
-                        "uuid": UUID, "purl": purl, "publishedAt": "2026-01-01T00:00:00Z",
-                        "description": "d", "license": "MIT", "tier": "free",
-                        "vulnerabilities": view["vulnerabilities"].clone()
-                    }],
+                    "packages": packages,
                     "canAccessPaidPatches": false,
                 }))),
             Mock::given(method("POST"))
                 .and(path(format!("/v0/orgs/{ORG}/patches/package")))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "results": { UUID: {
-                        "status": "granted",
-                        "url": artifact_url,
-                        "purl": purl,
-                        "artifacts": [{
-                            "kind": "tarball",
-                            "url": artifact_url,
-                            "integrity": { "sha1": sha1_hex(&served.jar), "sha256": sha256_hex(&served.jar) }
-                        }],
-                        "registryOverride": {
-                            "kind": "maven2",
-                            "indexUrl": HOSTED.prod_index_url(),
-                            "identifiers": identifiers,
-                        }
-                    } }
-                }))),
-            Mock::given(method("GET"))
-                .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-                .respond_with(ResponseTemplate::new(200).set_body_json(view.clone())),
-        ] {
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "results": results })),
+                ),
+        ];
+        for (route, body) in by_package {
+            mocks.push(
+                Mock::given(method("GET"))
+                    .and(path_regex(route))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body)),
+            );
+        }
+        for (uuid, view) in views {
+            mocks.push(
+                Mock::given(method("GET"))
+                    .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(view)),
+            );
+        }
+        for m in mocks {
             m.mount(&s.server).await;
         }
     });
@@ -1304,7 +1354,9 @@ fn gradle_hosted_tamper_fails() {
 
 /// A lock rolled back to the base after the scan: the locked build fails
 /// rather than consuming the unpatched base, and discovery stops naming
-/// the pin.
+/// the pin. A build after the scan installs the suffixed jar first, so the
+/// attestation is withheld by discovery's lock check, not by missing
+/// installed evidence.
 #[test]
 #[ignore = "real Gradle; run with --ignored"]
 fn gradle_hosted_stale_lock_fails() {
@@ -1318,26 +1370,81 @@ fn gradle_hosted_stale_lock_fails() {
         let pristine_locks = lock_texts(&c.proj);
         c.serve_leaf(&Served::new(true));
         c.scan_ok();
+        let out = c.build(&[]);
+        c.assert_patched(&out, "the scanned locks");
+        let (statements, json) = c.vex(&[]);
+        assert_eq!(statements, 1, "attested while the locks pin: {json}");
         for (rel, text) in &pristine_locks {
             std::fs::write(c.proj.join(rel), text).unwrap();
         }
         let out = c.build(&[]);
         c.assert_fails_loud(&out, "stale lock");
-        let (statements, _) = c.vex(&[]);
-        assert_eq!(statements, 0, "a stale lock is not attested");
+        let (statements, json) = c.vex(&[]);
+        assert_eq!(statements, 0, "a stale lock is not attested: {json}");
+        assert!(
+            json.to_string().contains("patched_ref_invalid")
+                && json
+                    .to_string()
+                    .contains(&format!("locks {GROUP}:{VICTIM} at {VICTIM_VERSION}")),
+            "discovery names the stale lock: {json}"
+        );
     });
 }
 
-/// The configuration cache: a stored entry is invalidated by the scan's
-/// settings edit (the patched jar resolves) and again by the restore.
+/// The second hosted patch: `consumer:2.0` (which requests the victim
+/// base transitively).
+const UUID2: &str = "0abcdef1-2345-4678-9abc-def012345678";
+const HOSTED2: Hosted = Hosted {
+    org: ORG,
+    uuid: UUID2,
+    hex8: "0abcdef1",
+    token: TOKEN,
+    ghsa: GHSA,
+    cve: CVE,
+    group: GROUP,
+    artifact: CONSUMER,
+    version: CONSUMER_VERSION,
+    title: "gradle hosted e2e consumer",
+};
+/// The member the patched consumer jar adds.
+const CONSUMER_PATCHED_MEMBER: &str = "META-INF/socket-consumer-patched.txt";
+
+/// The consumer as its Socket repository serves it: the upstream jar plus
+/// a marker member, the upstream pom re-versioned, no `.module`.
+fn served_consumer() -> Served {
+    use std::io::Read as _;
+    let upstream = central_file(&repo_path(CONSUMER, CONSUMER_VERSION, None, "jar"));
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(upstream)).unwrap();
+    let mut members = Vec::new();
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).unwrap();
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf).unwrap();
+        members.push((entry.name().to_string(), buf));
+    }
+    members.push((CONSUMER_PATCHED_MEMBER.to_string(), b"patched\n".to_vec()));
+    let upstream_pom = central_file(&repo_path(CONSUMER, CONSUMER_VERSION, None, "pom"));
+    Served {
+        jar: jvm_fixture_repo::jar(&members),
+        pom: HOSTED2.served_pom(&upstream_pom),
+        module: None,
+    }
+}
+
+/// The configuration cache: a stored entry with one hosted row is
+/// invalidated when a second row lands (the digest on the apply line
+/// changes), and both GAs then resolve their suffixed, patched jars from
+/// their own Socket repositories; the restore invalidates it again.
 #[test]
 #[ignore = "real Gradle; run with --ignored"]
 fn gradle_hosted_config_cache_second_row() {
     for_each_dsl(|dsl| {
-        let Some(c) = cell(
-            dsl,
-            &single(dsl, &[&implementation(dsl, &coordinate())], ""),
-        ) else {
+        let deps = [
+            implementation(dsl, &coordinate()),
+            implementation(dsl, &format!("{GROUP}:{CONSUMER}:{CONSUMER_VERSION}")),
+        ];
+        let deps: Vec<&str> = deps.iter().map(String::as_str).collect();
+        let Some(c) = cell(dsl, &single(dsl, &deps, "")) else {
             return;
         };
         if !c.gradle.at_least(8, 1) {
@@ -1345,20 +1452,74 @@ fn gradle_hosted_config_cache_second_row() {
             return;
         }
         let cc = "--configuration-cache";
-        let out = c.build(&[cc]);
-        c.assert_pristine(&out, "store a configuration-cache entry");
-        let out = c.build(&[cc]);
-        assert!(configuration_reused(&out), "{}", dump(&out));
-        c.serve_leaf(&Served::new(true));
+        c.warm();
+        // Row one: the victim.
+        let victim = Served::new(true);
+        c.serve_leaf(&victim);
         c.scan_ok();
+        let out = c.build(&[cc]);
+        c.assert_patched(&out, "one row: store");
+        let out = c.build(&[cc]);
+        assert!(
+            configuration_reused(&out),
+            "one row: reused\n{}",
+            dump(&out)
+        );
+        c.assert_patched(&out, "one row: reused");
+
+        // Row two: the consumer, served from its own Socket repository.
+        let consumer = served_consumer();
+        c.central.put(
+            HOSTED2.served_path("jar").trim_start_matches('/'),
+            &consumer.jar,
+        );
+        c.central.put(
+            HOSTED2.served_path("pom").trim_start_matches('/'),
+            &consumer.pom,
+        );
+        let victim_files = [(format!("{VICTIM}-{VICTIM_VERSION}.jar"), victim.jar.clone())];
+        let consumer_files = [(
+            format!("{CONSUMER}-{CONSUMER_VERSION}.jar"),
+            consumer.jar.clone(),
+        )];
+        mount_grants(
+            &c.api,
+            &[
+                (&HOSTED, &victim, &victim_files),
+                (&HOSTED2, &consumer, &consumer_files),
+            ],
+        );
+        let (code, json) = c.scan_in(&c.proj, &[]);
+        assert_eq!(code, Some(0), "second scan: {json}");
+        let index = c.file(INDEX_REL);
+        assert_eq!(index.lines().count(), 3, "two rows: {index}");
         let out = c.build(&[cc]);
         assert!(
             !configuration_reused(&out),
-            "the scan invalidates the entry"
+            "the second row invalidates the entry\n{}",
+            dump(&out)
         );
-        c.assert_patched(&out, "after the scan");
+        c.assert_patched(&out, "two rows");
+        let consumer_jar = format!("{CONSUMER}-{}.jar", HOSTED2.suffixed());
+        let hit = gradle_classpath(&out)
+            .into_iter()
+            .find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy() == consumer_jar)
+            })
+            .unwrap_or_else(|| panic!("{consumer_jar} resolves:\n{}", dump(&out)));
+        assert_eq!(
+            jar_member(&std::fs::read(&hit).unwrap(), CONSUMER_PATCHED_MEMBER).as_deref(),
+            Some(&b"patched\n"[..]),
+            "the patched consumer resolves"
+        );
         let out = c.build(&[cc]);
-        c.assert_patched(&out, "reused after the scan");
+        assert!(
+            configuration_reused(&out),
+            "two rows: reused\n{}",
+            dump(&out)
+        );
+
         let (code, json, _) = c.socket_in(&c.proj, &["rollback", "--yes"]);
         assert_eq!(code, Some(0), "rollback: {json}");
         let out = c.build(&[cc]);
@@ -1622,17 +1783,37 @@ fn gradle_hosted_vex_before_build_no_statement() {
     });
 }
 
-/// The fallback snippet compiles in each DSL and pins the patch, or fails
-/// loudly; it never resolves the unpatched base.
-fn fallback_case(dsl: Dsl) {
+/// Whether a failed run failed in a pasted script rather than in
+/// dependency resolution: a Groovy or Kotlin compile error, or an
+/// evaluation error in the build script.
+fn script_error(out: &Output) -> bool {
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    text.contains("Script compilation error")
+        || text.contains("Could not compile build file")
+        || text.lines().any(|l| l.starts_with("e: "))
+        || text.contains("A problem occurred evaluating root project")
+}
+
+/// The fallback snippet compiles in each DSL and pins the patch. A direct
+/// request must resolve the suffixed, patched jar; a transitive-only one
+/// (`consumer:2.0` → the base) resolves it or fails in resolution, never
+/// in the pasted script, and never resolves the unpatched base.
+fn fallback_case(dsl: Dsl, direct: bool) {
+    let what = if direct { "direct" } else { "transitive" };
     let tests = match dsl {
         Dsl::Groovy => format!("testImplementation '{}:tests'", coordinate()),
         Dsl::Kotlin => format!("testImplementation(\"{}:tests\")", coordinate()),
     };
-    let deps = [
-        implementation(dsl, &format!("{GROUP}:{CONSUMER}:{CONSUMER_VERSION}")),
-        tests,
-    ];
+    let request = if direct {
+        implementation(dsl, &coordinate())
+    } else {
+        implementation(dsl, &format!("{GROUP}:{CONSUMER}:{CONSUMER_VERSION}"))
+    };
+    let deps = [request, tests];
     let deps: Vec<&str> = deps.iter().map(String::as_str).collect();
     let Some(c) = cell(dsl, &single(dsl, &deps, "")) else {
         return;
@@ -1645,35 +1826,47 @@ fn fallback_case(dsl: Dsl) {
     let snippet = snippet_code(&json);
     let build = c.proj.join(dsl.build_file());
     // The classifier request the snippet's pin cannot serve goes; the
-    // transitive request of the base stays.
+    // request of the base stays.
     let text = std::fs::read_to_string(&build)
         .unwrap()
-        .replace(&deps[1], "");
+        .replace(deps[1], "");
     std::fs::write(&build, format!("{text}\n{snippet}\n")).unwrap();
     let out = c.build(&[]);
-    if ok(&out) {
-        c.assert_patched(&out, "fallback snippet");
+    assert!(
+        !script_error(&out),
+        "{what}: the pasted snippet does not compile:\n{snippet}\n{}",
+        dump(&out)
+    );
+    if direct || ok(&out) {
+        c.assert_patched(&out, &format!("fallback snippet ({what})"));
     } else {
-        c.assert_fails_loud(&out, "fallback snippet");
+        c.assert_fails_loud(&out, &format!("fallback snippet ({what})"));
     }
 }
 
 #[test]
 #[ignore = "real Gradle; run with --ignored"]
 fn gradle_hosted_fallback_snippet_compiles_groovy() {
-    fallback_case(Dsl::Groovy);
+    fallback_case(Dsl::Groovy, true);
+    fallback_case(Dsl::Groovy, false);
 }
 
 #[test]
 #[ignore = "real Gradle; run with --ignored"]
 fn gradle_hosted_fallback_snippet_compiles_kotlin() {
-    fallback_case(Dsl::Kotlin);
+    fallback_case(Dsl::Kotlin, true);
+    fallback_case(Dsl::Kotlin, false);
 }
 
 /// The agent-mode record `vendor` builds from: `Victim.class` patched.
 fn stage_manifest(proj: &Path) {
+    stage_manifest_as(proj, "patched");
+}
+
+/// [`stage_manifest`] with `Victim.class` in `state`.
+fn stage_manifest_as(proj: &Path, state: &str) {
     let before = victim_class(VICTIM_VERSION, "pristine");
-    let after = victim_class(VICTIM_VERSION, "patched");
+    let after = victim_class(VICTIM_VERSION, state);
     std::fs::create_dir_all(proj.join(".socket/blobs")).unwrap();
     std::fs::write(proj.join(".socket/blobs").join(git_sha256(&after)), &after).unwrap();
     let manifest = serde_json::json!({ "patches": { purl(): {
@@ -1764,5 +1957,120 @@ fn gradle_hosted_vendored_takeover_and_eject() {
         );
         let class = jar_member(&std::fs::read(&jar).unwrap(), VICTIM_CLASS_MEMBER).unwrap();
         assert_eq!(class, victim_class(VICTIM_VERSION, "patched"));
+    });
+}
+
+/// A vendored Gradle build the hosted planner would refuse (a custom
+/// `lockFile`): `scan --mode hosted` refuses the takeover BEFORE reverting
+/// anything, so the vendored patch keeps working.
+#[test]
+#[ignore = "real Gradle; run with --ignored"]
+fn gradle_hosted_takeover_refusal_keeps_vendored() {
+    // `lockFile = file(..)` is an assignment only the Groovy DSL takes on
+    // every supported Gradle.
+    let dsl = Dsl::Groovy;
+    let custom = "dependencyLocking { lockFile = file('locks/custom.lockfile') }\n";
+    let Some(c) = cell(
+        dsl,
+        &single(dsl, &[&implementation(dsl, &coordinate())], custom),
+    ) else {
+        return;
+    };
+    c.warm();
+    stage_manifest(&c.proj);
+    let (code, json) = c.vendor_cmd(None, &[]);
+    assert_eq!(code, Some(0), "vendor: {json}");
+    std::fs::remove_file(c.proj.join(".socket/manifest.json")).unwrap();
+    std::fs::remove_dir_all(c.proj.join(".socket/blobs")).unwrap();
+    let before = snapshot(&c.proj);
+    c.serve(
+        &Served::new(true),
+        &[(
+            VICTIM_CLASS_MEMBER.to_string(),
+            victim_class(VICTIM_VERSION, "patched"),
+        )],
+    );
+    let (_, json) = c.scan_in(&c.proj, &[]);
+    assert!(
+        has(&json, "redirect_gradle_lock_location_unknown"),
+        "{json}"
+    );
+    assert!(!has(&json, "redirect_takeover_reverted_vendored"), "{json}");
+    assert_eq!(json["redirect"]["redirected"], 0, "{json}");
+    assert_eq!(snapshot(&c.proj), before, "nothing was reverted or written");
+    let out = c.build(&[]);
+    let (jar, _) = c.victim_on(&out, "still vendored");
+    assert!(
+        jar.to_string_lossy()
+            .replace('\\', "/")
+            .contains(".socket/vendor/gradle/"),
+        "the vendored jar still resolves: {}",
+        jar.display()
+    );
+}
+
+/// An eject whose vendor step fails after the upstream restore rolls the
+/// whole multi-build project back: the included build's and buildSrc's
+/// settings (buildSrc's created by the planner) and the included build's
+/// lock are byte-identical to the hosted checkout.
+#[test]
+#[ignore = "real Gradle; run with --ignored"]
+fn gradle_hosted_eject_rollback_multi_build() {
+    for_each_dsl(|dsl| {
+        let q = match dsl {
+            Dsl::Groovy => "'",
+            Dsl::Kotlin => "\"",
+        };
+        let mut files = single(dsl, &[&implementation(dsl, &coordinate())], "");
+        files[0].1.push_str(&match dsl {
+            Dsl::Groovy => "includeBuild 'tools'\n".to_string(),
+            Dsl::Kotlin => "includeBuild(\"tools\")\n".to_string(),
+        });
+        files.push((
+            format!("tools/{}", dsl.settings_file()),
+            format!("rootProject.name = {q}tools{q}\n"),
+        ));
+        files.push((format!("tools/{}", dsl.build_file()), String::new()));
+        files.push((
+            "tools/gradle.lockfile".to_string(),
+            format!("{GROUP}:{VICTIM}:{VICTIM_VERSION}=runtimeClasspath\nempty=\n"),
+        ));
+        files.push((format!("buildSrc/{}", dsl.build_file()), String::new()));
+        let Some(c) = cell(dsl, &files) else { return };
+        c.warm();
+        let served = Served::new(true);
+        c.serve(
+            &served,
+            &[(
+                VICTIM_CLASS_MEMBER.to_string(),
+                victim_class(VICTIM_VERSION, "patched"),
+            )],
+        );
+        c.scan_ok();
+        let bsrc_settings = format!("buildSrc/{}", dsl.settings_file());
+        assert!(c.file(&bsrc_settings).contains(" created"), "created");
+        assert!(c.file("tools/gradle.lockfile").contains(&sfx()));
+        let hosted = snapshot(&c.proj);
+        // The prebuilt the fixture serves is not the record's patch, so
+        // the vendor step fails after the restore.
+        let records = c.root.join("records");
+        std::fs::create_dir_all(&records).unwrap();
+        stage_manifest_as(&records, "tampered");
+        let api = c.api_args();
+        let mut args: Vec<&str> = api.iter().map(String::as_str).collect();
+        args.push("--yes");
+        let (code, json) = c.vendor_cmd(Some(&records), &args);
+        assert_ne!(code, Some(0), "the eject fails: {json}");
+        assert!(has(&json, "eject_rolled_back"), "{json}");
+        let after = snapshot(&c.proj);
+        let changed: Vec<&String> = hosted
+            .keys()
+            .chain(after.keys())
+            .filter(|k| hosted.get(*k) != after.get(*k))
+            .collect();
+        assert!(
+            changed.is_empty(),
+            "the rollback is byte-exact: {changed:?}"
+        );
     });
 }
