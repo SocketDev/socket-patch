@@ -235,8 +235,8 @@ fn linked_source_of(pkg_path: &Path, real: PathBuf) -> Option<SharedStore> {
 ///   sets it, resolved against that file's directory as Yarn does, and does
 ///   not contain the project (`pnpmStoreFolder: .`);
 /// * `real` is exactly `<store>/<entry>/package`, where `<entry>` is Yarn's
-///   slug of a registry locator, `<ident>-npm-<version>-<10 hex>`: the
-///   layout Yarn gives a hard (installed) package, never a workspace.
+///   slug of a registry locator ([`is_yarn_registry_slug`]): the layout
+///   Yarn gives a hard (installed) package, never a workspace.
 fn in_yarn_pnpm_store(node_modules: &Path, real: &Path) -> bool {
     let Some(project) = node_modules.parent() else {
         return false;
@@ -284,17 +284,24 @@ fn in_yarn_pnpm_store(node_modules: &Path, real: &Path) -> bool {
         && parts.next().is_none()
 }
 
-/// `left-pad-npm-1.3.0-0123456789`, `@types-node-npm-20.1.0-abcdef0123`:
-/// Yarn's slug of an `npm:` locator, ending in ten hex digits of its hash.
+/// Yarn's slug of a registry package's store entry, ending in ten hex
+/// digits of its locator hash: `left-pad-npm-1.3.0-0123456789` and
+/// `@types-node-npm-20.1.0-abcdef0123` for an `npm:` locator, or
+/// `react-dom-virtual-685e277730` for one instantiated for its peers (a
+/// `virtual:` locator). Workspaces never get a store entry: the pnpm linker
+/// links them to their source directly.
 fn is_yarn_registry_slug(entry: &str) -> bool {
     let Some((head, hash)) = entry.rsplit_once('-') else {
         return false;
     };
     hash.len() == 10
         && hash.bytes().all(|b| b.is_ascii_hexdigit())
-        && head
+        && (head
             .split_once("-npm-")
             .is_some_and(|(ident, version)| !ident.is_empty() && !version.is_empty())
+            || head
+                .strip_suffix("-virtual")
+                .is_some_and(|ident| !ident.is_empty()))
 }
 
 fn is_node_modules(dir: &Path) -> bool {
@@ -578,6 +585,10 @@ mod tests {
         let entry = store.join("left-pad-npm-1.3.0-0123456789").join("package");
         std::fs::create_dir_all(&entry).unwrap();
         symlink(&entry, nm.join("left-pad")).unwrap();
+        // A registry package instantiated for its peers (`virtual:`).
+        let virtual_entry = store.join("react-dom-virtual-685e277730").join("package");
+        std::fs::create_dir_all(&virtual_entry).unwrap();
+        symlink(&virtual_entry, nm.join("react-dom")).unwrap();
         // A workspace member linked beside it stays refused.
         let member = root.join("packages").join("a");
         std::fs::create_dir_all(&member).unwrap();
@@ -603,6 +614,7 @@ mod tests {
         // With a yarn.lock, an ancestor's settings resolve against its dir.
         std::fs::write(root.join("yarn.lock"), "").unwrap();
         assert_eq!(shared_store_of(&nm.join("left-pad")).await, None);
+        assert_eq!(shared_store_of(&nm.join("react-dom")).await, None);
         // The project's own `.yarnrc.yml` wins over the ancestor's.
         std::fs::write(
             root.join(".yarnrc.yml"),
@@ -686,6 +698,8 @@ mod tests {
         for ok in [
             "left-pad-npm-1.3.0-0123456789",
             "@types-node-npm-20.1.0-abcdef0123",
+            "react-dom-virtual-685e277730",
+            "@emotion-react-virtual-0123456789",
         ] {
             assert!(is_yarn_registry_slug(ok), "{ok}");
         }
@@ -697,6 +711,8 @@ mod tests {
             "left-pad-npm-1.3.0-0123456789a",
             "b-workspace-packages-b-0123456789",
             "-npm-1.0.0-0123456789",
+            "-virtual-0123456789",
+            "react-dom-virtual-x",
         ] {
             assert!(!is_yarn_registry_slug(bad), "{bad}");
         }
