@@ -1,0 +1,86 @@
+name: bughunt composer home probe
+on:
+  push:
+    branches: ['bughunt/composer/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    name: ${{ matrix.os }} / composer ${{ matrix.composer }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+        composer: ['1.10.28', '2.2.30', '2.10.3']
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: bughunt-composer-home
+          save-if: false
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: ${{ matrix.composer == '1.10.28' && '8.1' || '8.4' }}
+          tools: composer:${{ matrix.composer }}
+          extensions: zip, mbstring, curl, openssl
+          coverage: none
+      - run: cargo build --release -p socket-patch-cli
+      - name: Probe Composer home discovery
+        shell: bash
+        run: |
+          set +e
+          T="$RUNNER_TEMP"; if command -v cygpath >/dev/null; then T="$(cygpath -m "$RUNNER_TEMP")"; fi
+          B="$PWD/target/release/socket-patch"; [ -f "$B.exe" ] && B="$B.exe"
+          export COMPOSER_ALLOW_SUPERUSER=1 SOCKET_TELEMETRY_DISABLED=1 COMPOSER_NO_INTERACTION=1
+          unset COMPOSER_HOME
+          composer --version
+          mkdir -p "$T/pkg/src" "$T/work"
+          printf '{"name":"acme/tool","version":"1.0.0","type":"library"}\n' > "$T/pkg/composer.json"
+          printf '<?php\n// VULNERABLE\n' > "$T/pkg/src/Msg.php"
+          REPO='{"type":"path","url":"'"$T/pkg"'","options":{"symlink":false}}'
+          cat > "$T/mock.py" <<'EOF'
+          import json,sys
+          from http.server import BaseHTTPRequestHandler,HTTPServer
+          class H(BaseHTTPRequestHandler):
+            def _j(self,o):
+              b=json.dumps(o).encode(); self.send_response(200); self.send_header('content-type','application/json'); self.send_header('content-length',str(len(b))); self.end_headers(); self.wfile.write(b)
+            def do_POST(self):
+              self.rfile.read(int(self.headers.get('content-length',0))); self._j({"packages":[],"canAccessPaidPatches":False})
+            def do_GET(self): self._j({"patches":[],"canAccessPaidPatches":False})
+            def log_message(self,*a): pass
+          HTTPServer(('127.0.0.1',int(sys.argv[1])),H).serve_forever()
+          EOF
+          python3 "$T/mock.py" 18999 &
+          sleep 3
+          R() { echo "RESULT ${{ matrix.os }} composer-${{ matrix.composer }} $1 $2"; }
+          NOCOMP_PATH="/usr/bin:/bin"
+          count() { grep -o '"scannedPackages": *[0-9]*' "$1" | tr '\n' ' '; }
+          S() { "$B" scan -g --json --api-url http://127.0.0.1:18999 --org o --api-token fake --ecosystems composer > "$1" 2>"$1.err"; echo "exit=$?" >> "$1.err"; }
+          GH="$(composer global config home 2>/dev/null | tail -1)"; echo "composer home: $GH"
+          [ -n "${APPDATA:-}" ] && echo "APPDATA=$APPDATA"
+          mkdir -p "$GH"
+          printf '{"repositories":[%s],"require":{"acme/tool":"1.0.0"}}\n' "$REPO" > "$GH/composer.json"
+          composer global update 2>&1 | tail -2
+          ls "$GH/vendor/acme" || true
+          cd "$T/work"
+          # 1. composer on PATH
+          S on.json; echo "on PATH: $(count on.json)"; cat on.json | head -c 600; echo; tail -3 on.json.err
+          # 2. composer not on PATH (#438 fallback)
+          (PATH="$NOCOMP_PATH:$(dirname "$B")"; command -v composer && echo "composer still visible"; S off.json)
+          echo "off PATH: $(count off.json)"; cat off.json | head -c 600; echo; tail -3 off.json.err
+          # 3. macOS: XDG_CONFIG_HOME set + stale ~/.composer (#586 variant)
+          if [ "${{ runner.os }}" = macOS ]; then
+            export XDG_CONFIG_HOME="$T/xdg"; mkdir -p "$XDG_CONFIG_HOME"
+            GH2="$(composer global config home 2>/dev/null | tail -1)"; echo "home with XDG_CONFIG_HOME: $GH2"
+            mkdir -p "$GH2"
+            printf '{"repositories":[%s],"require":{"acme/tool":"1.0.0"}}\n' "$REPO" > "$GH2/composer.json"
+            composer global update 2>&1 | tail -1
+            mkdir -p "$HOME/.composer"; ls -la "$HOME/.composer" | head -5
+            S xon.json; echo "xdg on PATH: $(count xon.json)"; tail -2 xon.json.err
+            (PATH="$NOCOMP_PATH:$(dirname "$B")"; S xoff.json); echo "xdg off PATH: $(count xoff.json)"; head -c 600 xoff.json; echo; tail -2 xoff.json.err
+          fi
+          exit 0
