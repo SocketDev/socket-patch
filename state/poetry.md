@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-02 (run 10), main `045d7ec` (includes #330, #446, #452, #456, #503, #527, #538, #540), latest release 4.0.0 (previous 3.3.0). Run 9 re-measured the cells marked "r9"; run 10 cells are in their own table below.
+Last updated: 2026-10-03 (run 11), main `045d7ec` (includes #330, #446, #452, #456, #503, #527, #538, #540), latest release 4.0.0 (previous 3.3.0). Run 9 re-measured the cells marked "r9". Runs 10 and 11 have their own tables below. #327 and #329 are closed: macOS / Windows cells that still show them haven't been re-run, because probe branches are blocked.
 
 ## Coverage matrix
 
@@ -15,16 +15,16 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | Linux | 1.8.5 | untested | pass; r9 `envs.toml` + custom path pass | pass r5 (fixed by #330; nameless, in-project=false, unicode path) | pass r9 (#527) | pass v5 (LF + CRLF) | pass r5 (#330) | pass v5 (LF + CRLF, unicode/space path) | untested | pass v5 (#380 fixed) |
 | Linux | 2.0.1 | untested | pass | pass r5 (fixed by #330; nameless, in-project=false, unicode path, both names) | fixed by #527 (not re-run) | pass v5 (LF + CRLF) | pass r5 (#330) | untested | untested | untested |
 | Linux | 2.1.1 | untested | untested | untested | untested | pass v5 (repo e2e, up to rollback) | untested | pass v5 (repo e2e) | untested | untested |
-| Linux | 2.3.3 | pass | pass | fail #327 (pre-#330, not re-run) | untested | pass (groups, markers, path/url deps, supersede, dry-run, get) | untested | pass (path/url deps) | fixed by #503 (not re-run) | fixed (#380) |
-| Linux | 2.4.3 | untested | pass | fail #327 (pre-#330, not re-run) | untested | pass (LF + CRLF) | untested | pass (LF + CRLF, CI) | untested | fixed (#380) |
+| Linux | 2.3.3 | pass | pass | pass r11 (all 3 layouts) | untested | pass (groups, markers, path/url deps, supersede, dry-run, get) | untested | pass (path/url deps) | fixed by #503 (not re-run) | fixed (#380) |
+| Linux | 2.4.3 | untested | pass | pass r11 (all 3 layouts) | untested | pass (LF + CRLF) | untested | pass (LF + CRLF, CI) | untested | fixed (#380) |
 | Linux | 2.5.1 | pass v5 | pass r5 (full agent cycle incl. rollback + vex) | pass r5 (all 3 cases, plus long names, symlinked dir, relative / `{cache-dir}` / `~` virtualenvs.path, XDG_CACHE_HOME, `.venv` symlink) | pass r9 (#527) | pass v5 (LF + CRLF, PEP 621 extras/groups/markers, `sync`, `remove`, dry-run, `get`, relock/`add`, directory targets) | pass r5 (#330: stale check fires) | pass v5 (LF + CRLF, unicode/space path) | hosted→vendored pass r5; vendored→hosted pass r10 (#328 fixed by #503) | pass v5 (#380 fixed) |
-| macOS | 1.8.5 | untested | pass | fail #327 | untested | pass (LF + CRLF) | untested | pass (LF + CRLF) | untested | untested |
-| macOS | 2.0.1 | untested | pass | fail #327 | untested | untested | untested | untested | untested | untested |
-| macOS | 2.4.3 | untested | pass | fail #327 | untested | pass (LF + CRLF) | untested | pass (LF + CRLF) | untested | untested |
+| macOS | 1.8.5 | untested | pass | fail #327 (closed; not re-run) | untested | pass (LF + CRLF) | untested | pass (LF + CRLF) | untested | untested |
+| macOS | 2.0.1 | untested | pass | fail #327 (closed; not re-run) | untested | untested | untested | untested | untested | untested |
+| macOS | 2.4.3 | untested | pass | fail #327 (closed; not re-run) | untested | pass (LF + CRLF) | untested | pass (LF + CRLF) | untested | untested |
 | macOS | 2.5.1 | untested | untested | untested | untested | untested | untested | untested | untested | untested |
-| Windows | 1.8.5 | untested | fail #329 | fail #327 | untested | pass (LF + CRLF) | untested (likely #327/#329) | pass (LF + CRLF) | untested | untested |
-| Windows | 2.0.1 | untested | fail #329 | fail #327 | untested | untested | untested | untested | untested | untested |
-| Windows | 2.4.3 | untested | fail #329 | fail #327 | untested | pass (LF + CRLF) | untested (likely #327/#329) | pass (LF + CRLF) | untested | untested |
+| Windows | 1.8.5 | untested | fail #329 (closed; not re-run) | fail #327 (closed; not re-run) | untested | pass (LF + CRLF) | untested (likely #327/#329) | pass (LF + CRLF) | untested | untested |
+| Windows | 2.0.1 | untested | fail #329 (closed; not re-run) | fail #327 (closed; not re-run) | untested | untested | untested | untested | untested | untested |
+| Windows | 2.4.3 | untested | fail #329 (closed; not re-run) | fail #327 (closed; not re-run) | untested | pass (LF + CRLF) | untested (likely #327/#329) | pass (LF + CRLF) | untested | untested |
 | Windows | 2.5.1 | untested | untested | untested | untested | untested | untested | untested | untested | untested |
 
 ### Venv selection and policy (run 7, Linux, main `61cfb9b`)
@@ -46,7 +46,7 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 | --- | --- | --- |
 | Linux | `scan -g` report-only (`--json`): global user-site `six` found, project `.venv` and lock-only packages don't leak in | pass |
 | Linux | `scan -g` sees Debian/apt `.egg-info` installs | fixed by #452 (but see #501) |
-| Linux | `scan -g` sees Poetry's official-installer venv (`~/.local/share/pypoetry/venv`) | fail (commented on #415) |
+| Linux | `scan -g` sees Poetry's official-installer venv (`~/.local/share/pypoetry/venv`, custom `POETRY_HOME`) | fail #640 (r11: 2.2.1 default, 1.8.5 `POETRY_HOME`; #415 / #418 only fixed pipx) |
 | Linux | `scan -g --mode hosted`, `--global-prefix --mode hosted`, `SOCKET_GLOBAL=1 --mode hosted`: exit 2, poetry.lock untouched | pass |
 | Linux | `scan -g --mode agent`, re-run idempotent, `get <uuid> -g`, `SOCKET_GLOBAL=1 get`: global copy patched, `.venv` and lock untouched | pass |
 | Linux | `vex -g` attests applied global patch; plain `vex` refuses (`not_applied`) | pass |
@@ -104,14 +104,25 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 | 1.8.5 | `installer.modern-installation = false`, warm venv | Poetry keeps the upstream bytes; CLI fail-closed (stale warning, vex refuses); docs table is inaccurate |
 | 1.1.15, 1.8.5, 2.5.1 | `virtualenvs.path = "{project-dir}/.envs"` | fail #608 |
 
+### Run 11 cells (Linux, main `045d7ec`)
+
+| Poetry | Cell | Result |
+| --- | --- | --- |
+| 2.3.3, 2.4.3 | #327 layouts (nameless `package-mode=false`, `[project].name` override, `in-project=false` + stray `.venv`), agent scan finds the out-of-tree env | pass |
+| 2.2.1 (official installer), 1.8.5 (`POETRY_HOME`) | `scan -g` crawls `$POETRY_HOME/venv` / `~/.local/share/pypoetry/venv` | fail #640 (pipx-layout control passes) |
+| 2.5.1 | `virtualenvs.path = "{data-dir}/venvs"`; `cache-dir = "{data-dir}/cache"` | fail (commented on #608; `data-dir` key exists from Poetry 2.1) |
+| 1.8.5 | same (`{data-dir}` stays literal in Poetry < 2.1) | pass |
+| 1.8.5, 2.5.1 | `path = "{cache-dir}/venvs"` control | pass |
+
 ## Backlog
 
-1. **macOS XDG** (run 8 lead): with `XDG_CACHE_HOME` / `XDG_CONFIG_HOME` set and platformdirs ≥ 4.6.0, Poetry uses `$XDG_CACHE_HOME/pypoetry/virtualenvs` and `$XDG_CONFIG_HOME/pypoetry/config.toml`, but `python_crawler.rs` `poetry_default_cache_dir` / `poetry_user_config_path` only look in `~/Library/...`. Needs a macOS probe.
-2. **Windows Poetry 1.0/1.1 env hash** (run 8 lead): Poetry < 1.2 hashes the raw cwd, while socket-patch lowercases it. Needs a Windows probe.
-3. Probe branches are blocked: in runs 9 and 10, remote branch deletion was denied, so no probes could be pushed and cleaned up. A maintainer needs to delete `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes`, and allow deleting `bughunt/poetry/*` branches.
-4. `virtualenvs.path` / `cache-dir` substitution parity with Poetry's `Config.process()`: `{data-dir}`, unknown keys and nested placeholders (follow-up to #608).
-5. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install; the poetry-compatibility "Installer boundaries" table says 1.4–1.8 replace it.
+1. **macOS / Windows re-checks for closed #327 / #329**, plus the #640 default paths (`~/Library/Application Support/pypoetry/venv`, `%APPDATA%\pypoetry\venv`). All need probe branches.
+2. **macOS XDG** (run 8 lead): with `XDG_CACHE_HOME` / `XDG_CONFIG_HOME` set and platformdirs ≥ 4.6.0, Poetry uses the XDG dirs, but `poetry_default_cache_dir` / `poetry_user_config_path` only look in `~/Library/...`. Needs a macOS probe.
+3. **Windows Poetry 1.0/1.1 env hash** (run 8 lead): Poetry < 1.2 hashes the raw cwd, while socket-patch lowercases it. Needs a Windows probe.
+4. Probe branches are still blocked: in runs 9–11 remote branch deletion was denied (`git push --delete` disconnects). A maintainer needs to delete `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes`, and allow deleting `bughunt/poetry/*` branches.
+5. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the poetry-compatibility "Installer boundaries" table says 1.4–1.8 replace it.
 6. Hosted + `poetry sync --only` / `--without` with group-only patches across several envs.
+7. `POETRY_DATA_DIR` / `POETRY_CACHE_DIR` set to values that contain placeholders, after #608 is fixed.
 
 ## Known non-bugs
 
@@ -154,4 +165,5 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 - Hosted `socket.yml` narrowing lists recorded pins under `policy.filtered` rather than `retained` when the mock origin isn't the patch server. Set `SOCKET_PATCH_SERVER_URL`; this is the documented hosted-origin rule.
 - #543's vendored "unwired ledger entry" check doesn't cover pypi (`dispatch_in_use_one` returns `None`), so Poetry vendored re-runs are unchanged by it.
 - A test mock that answers every `/patches/batch` with the same patch makes agent scans report `partial_failure` for packages the project doesn't have. Filter the mock to the requested purls.
+- Poetry < 2.1 has no `data-dir` config key, so `{data-dir}` in `virtualenvs.path` stays a literal relative directory, and socket-patch matches it.
 - `vex` saying "No applied patches with vulnerability metadata" after a hand-staged manifest with empty `vulnerabilities` is a fixture artifact.
