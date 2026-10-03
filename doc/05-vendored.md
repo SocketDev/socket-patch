@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ 045d7ec on 2026-10-03 by audit-ecosystems (5.4 Python and Cargo only). Owner: audit-ecosystems._
+_Last checked against main @ 045d7ec on 2026-10-03 by audit-ecosystems (5.4 Python, Cargo and Maven XML). Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -118,8 +118,9 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
   - `redirect/upstream/nuget.rs:39` uses a regex;
   - `jvm/gradle.rs:1538` checks for preceding whitespace;
   - `formats/nuget/mod.rs:41` does a real tag parse.
-- The writers (`nuget_feed.rs`, `maven_repo.rs`) never use the shared readers (`formats::nuget::parse_config`, `formats::maven::parse_pom`) that VEX and redirect use, **so reader and writer can disagree about what a file contains**. {{E11}}
-- The Maven/Gradle share of the open backlog (22 of 88 issues, for example #259 "edits commented-out, plugin and profile markup", #342 "adds a second section when the existing one is self-closed or has a comment") is mostly this.
+- The NuGet writers (`nuget_feed.rs`, the hosted splicer) never use the shared reader `formats::nuget::parse_config` that VEX uses, **so reader and writer can disagree about what a file contains**. {{E11}}
+- `pom.xml` alone has seven scanners (checked on `045d7ec`): `formats::maven::parse_pom` (VEX, restore gate); the hosted rewriter's raw regex (`MAVEN_DEPENDENCY_BLOCK_RE`, `insert_maven_*`), which upstream restore reuses and which masks nothing; vendored `maven_repo.rs` (`comment_spans`/`profiles_spans`, plus a second `declares_modules`); the reactor's `mask` + `Doc` tree and, in the same file, `scan_pom_project` (a depscan port); and the crawler's and `vex/product.rs`'s own readers. None of the three writers (hosted, restore, vendored single-pom) locates elements through a reader. Target: one masked element tree in `formats::maven` that readers and splicing writers both query. {{E10}}
+- The Maven share of the open backlog is mostly this: #259 "edits commented-out, plugin and profile markup", #342 "adds a second section when the existing one is self-closed or has a comment", #683 (`<exclusions>` first) and {{E55}}.
 
 **Python:**
 - `utils/poetry_lock.rs` and `utils/pdm_lock.rs` are near-twins with mirrored function sets (`rewrite_*_lock`, `*_with_edits`, `plan_*_rewrite`, `*_lock_edits`, `*_lock_fragments`, `extend_span`, `pair_*`).
@@ -247,6 +248,7 @@ Old `kind`s are translated into `SpliceRecord`s when the ledger loads, so legacy
 
 ### New findings since the review
 
+- {{E55}}: vendored Maven decides "is this a reactor?" twice. `jvm::detect` uses the reactor's `Doc`-based `declares_modules`, which ignores plugin `<configuration><modules>`, then the legacy single-pom path re-checks with its own comment-stripping `declares_modules` and refuses `vendor_maven_multimodule_unsupported`. That refusal fires only on the disagreement, so every `maven-ear-plugin` project is refused; see 5.4.
 - {{E54}}: the Poetry and PDM lock rewriters restore line endings with different rules, so a mixed-line-ending lock's edited unit becomes CRLF under Poetry and LF under PDM; see 5.4.
 - {{E49}}: hosted Pipenv used to reject its own pins on path-prefixed `--patch-server-url` origins and sdists. Both private grammars (`owned_url`'s segment count, `is_socket_hosted_reference`) are deleted; Pipenv now uses `hosted_pypi_reference` (#572); see 5.4.
 
