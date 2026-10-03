@@ -3286,6 +3286,78 @@ mod tests {
         );
     }
 
+    /// #665 guard, escaped spelling: the moved entry's resolution is
+    /// written with JSON-escaped slashes (`.socket\/vendor\/npm\/...`),
+    /// which parses to the same path npm installs from. A literal-path scan
+    /// misses it, so the gate matches the uuid itself.
+    #[tokio::test]
+    async fn revert_keeps_artifact_when_a_moved_entry_uses_escaped_slashes() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let mut live = fx.read_lock().await;
+        let packages = live["packages"].as_object_mut().unwrap();
+        let wired = packages.remove("node_modules/left-pad").unwrap();
+        packages.remove("node_modules/foo/node_modules/left-pad");
+        packages.insert("node_modules/bar/node_modules/left-pad".into(), wired);
+        let text = String::from_utf8(serialize_json(&live, "  ").unwrap())
+            .unwrap()
+            .replace(".socket/vendor/npm/", ".socket\\/vendor\\/npm\\/");
+        assert!(!text.contains(".socket/vendor/npm/"), "{text}");
+        tokio::fs::write(fx.lock_path(), text).await.unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            fx.root().join(fx.expected_rel_tgz()).exists(),
+            "the escaped lock still resolves through the artifact"
+        );
+    }
+
+    /// #665 guard, unreadable alternate lock: package-lock.json no longer
+    /// has the entry, but an npm-shrinkwrap.json that exists and cannot be
+    /// read may be the lock an install resolves through. One readable,
+    /// clean lock is not proof of absence, so the artifact is kept.
+    #[tokio::test]
+    async fn revert_keeps_artifact_when_an_alternate_lock_is_unreadable() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let mut live = fx.read_lock().await;
+        let packages = live["packages"].as_object_mut().unwrap();
+        let wired = packages.remove("node_modules/left-pad").unwrap();
+        packages.remove("node_modules/foo/node_modules/left-pad");
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+        // Invalid UTF-8 makes the shrinkwrap unreadable even as root, where
+        // a permission bit would not.
+        let mut shrinkwrap = b"\xff".to_vec();
+        shrinkwrap.extend(serde_json::to_vec(&wired).unwrap());
+        tokio::fs::write(fx.root().join(SHRINKWRAP), shrinkwrap)
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            fx.root().join(fx.expected_rel_tgz()).exists(),
+            "an unreadable lock is not proof the artifact is unused"
+        );
+
+        // Once the shrinkwrap is gone, the same revert reclaims it.
+        tokio::fs::remove_file(fx.root().join(SHRINKWRAP))
+            .await
+            .unwrap();
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(!fx.root().join(fx.expected_rel_tgz()).exists());
+    }
+
     /// The WIRED revert (non-empty wiring) fails closed on an unparseable
     /// lock — editing JSON we cannot parse risks destroying it. (The
     /// unreadable-lock test below covers only the EMPTY-wiring guard.)

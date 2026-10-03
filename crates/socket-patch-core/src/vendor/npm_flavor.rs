@@ -656,12 +656,13 @@ pub(super) async fn lock_text_mentions_uuid(
 
 /// The keep gate for recorded lock entries that VANISHED during a revert
 /// ([`RevertOutcome::lock_entry_removed`], #665). The user removed the
-/// dependency, so there was nothing to restore; the artifact can go once
-/// no lockfile in `names` resolves through it any more. While one still
-/// mentions the uuid dir (the entry moved to a key the wiring never
-/// recorded), or none can be read, the artifact may be the only copy an
-/// install needs: keep it exactly like a drift-skip. Returns true when the
-/// artifact was kept and the caller must stop before deleting it.
+/// dependency, so there was nothing to restore; the artifact can go only
+/// once [`uuid_proven_unreferenced`] shows no file in `names` resolves
+/// through it any more. Anything short of that proof (the entry moved to a
+/// key the wiring never recorded, a lock that cannot be read) keeps the
+/// artifact exactly like a drift-skip, since it may be the only copy an
+/// install needs. Returns true when the artifact was kept and the caller
+/// must stop before deleting it.
 pub(super) async fn keep_artifact_while_lock_references_it(
     outcome: &mut RevertOutcome,
     project_root: &Path,
@@ -672,11 +673,67 @@ pub(super) async fn keep_artifact_while_lock_references_it(
     if !outcome.lock_entry_removed() {
         return false;
     }
-    if lock_text_mentions_uuid(project_root, names, uuid).await == Some(false) {
+    if uuid_proven_unreferenced(project_root, names, uuid).await {
         return false;
     }
     outcome.keep_artifact(uuid_dir_rel);
     true
+}
+
+/// True only when at least one file in `names` exists, every existing one
+/// was read, and none of them references `uuid`. Stricter than
+/// [`lock_text_mentions_uuid`] because `true` here deletes the artifact:
+///
+/// - Only a missing file (`NotFound`) counts as absent. A lock that exists
+///   but cannot be read (permissions, invalid UTF-8, not a regular file)
+///   may be the one an install resolves through, so it fails closed.
+/// - The match is on the uuid alone, ASCII case-insensitively, so any
+///   spelling of the artifact path counts (`\/`-escaped JSON slashes, a
+///   backslash separator, a different case on a case-insensitive disk).
+/// - JSON files are also parsed and every key and string value checked,
+///   which decodes `\u` escapes. A file that might hide the uuid behind an
+///   escape the raw scan cannot see (a `\u`/`\x`/`\U` sequence in YAML,
+///   yarn.lock or JSON that does not parse) fails closed.
+async fn uuid_proven_unreferenced(project_root: &Path, names: &[&str], uuid: &str) -> bool {
+    let mut any_present = false;
+    for name in names {
+        match read_regular_to_string(&project_root.join(name)).await {
+            Ok(text) => {
+                if text_may_reference_uuid(name, &text, uuid) {
+                    return false;
+                }
+                any_present = true;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return false,
+        }
+    }
+    any_present
+}
+
+fn text_may_reference_uuid(name: &str, text: &str, uuid: &str) -> bool {
+    let needle = uuid.to_ascii_lowercase();
+    if text.to_ascii_lowercase().contains(&needle) {
+        return true;
+    }
+    if name.ends_with(".json") {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+            return json_mentions(&value, &needle);
+        }
+    }
+    ["\\u", "\\x", "\\U"].iter().any(|esc| text.contains(esc))
+}
+
+fn json_mentions(value: &serde_json::Value, needle: &str) -> bool {
+    let hit = |s: &str| s.to_ascii_lowercase().contains(needle);
+    match value {
+        serde_json::Value::String(s) => hit(s),
+        serde_json::Value::Array(items) => items.iter().any(|v| json_mentions(v, needle)),
+        serde_json::Value::Object(map) => {
+            map.iter().any(|(k, v)| hit(k) || json_mentions(v, needle))
+        }
+        _ => false,
+    }
 }
 
 /// Does this build have a backend for an npm entry's recorded flavor?

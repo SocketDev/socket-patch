@@ -719,8 +719,8 @@ worse, lets a warm cache silently serve unpatched bytes):
   `.socket/vendor/<eco>/<uuid>` dir — a file that no longer references it is warned about and the
   artifact removed; in the npm family (npm, yarn classic and berry, pnpm, bun) a recorded lock entry
   that no longer exists at all — the user removed the dependency — is not drift: it warns
-  `vendor_lock_entry_removed` and the artifact and entry are kept only while a wired file still
-  mentions the `.socket/vendor/npm/<uuid>/` dir, so `rollback` / `remove` / `scan --prune` clean up
+  `vendor_lock_entry_removed` and the artifact and entry are kept unless every wired file that exists
+  was read and none mentions the uuid in any spelling (an unreadable lock keeps them), so `rollback` / `remove` / `scan --prune` clean up
   after `npm uninstall` / `yarn remove` / `pnpm remove` / `bun remove`), removes the artifacts, prunes the
   ledger, sweeps orphan uuid dirs, and (v5.0) prunes the now-empty `.socket/vendor/<eco>/` and
   `.socket/vendor/` levels — `.socket/` itself is removed by the lock guard when nothing else is
