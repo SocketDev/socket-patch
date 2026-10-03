@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ivy-report version="1.0">
+<info organisation="a" module="a_2.12" revision="0.1.0-SNAPSHOT" conf="scala-doc-tool"/>
+<dependencies>
+</dependencies>
+</ivy-report>

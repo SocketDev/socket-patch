@@ -14,8 +14,13 @@
 //! does the disk side.
 
 pub mod apply;
+pub mod coursier_gate;
+pub mod coursier_tree;
 pub mod gradle;
 pub mod maven_reactor;
+pub mod sbt;
+pub mod sbt_gate;
+pub mod scala_cli;
 
 use serde_json::{json, Value};
 
@@ -42,6 +47,11 @@ pub const TREE_KIND: &str = "jvm_vendor_tree";
 pub const CREATED_DIR_KIND: &str = "jvm_created_dir";
 /// Whether upstream metadata was verified against registry checksums.
 pub const UPSTREAM_KIND: &str = "jvm_upstream_status";
+/// Fragment of the generated `socket-patch-vendor.sbt`: `file` (shared),
+/// `pin:<uuid>` (per patch).
+pub const SBT_FRAGMENT_KIND: &str = "sbt_build_fragment";
+/// Rows of `.socket/vendor/coursier-index.tsv` (scala-cli).
+pub const COURSIER_INDEX_KIND: &str = "coursier_index_fragment";
 /// Every kind this backend records.
 pub const KINDS: &[&str] = &[
     POM_FRAGMENT_KIND,
@@ -53,6 +63,8 @@ pub const KINDS: &[&str] = &[
     TREE_KIND,
     CREATED_DIR_KIND,
     UPSTREAM_KIND,
+    SBT_FRAGMENT_KIND,
+    COURSIER_INDEX_KIND,
 ];
 
 /// Parse the distribution version from a checked-in wrapper only; never runs the build tool.
@@ -202,6 +214,10 @@ pub enum Shape {
     /// A root `pom.xml` (a reactor or a single module) next to a Gradle
     /// build: both are planned (see [`Detected`]).
     Mixed,
+    /// An sbt build root ([`sbt::detect`]).
+    Sbt,
+    /// A scala-cli directory build ([`scala_cli::detect`]).
+    ScalaCli,
     /// Anything else (including a single-module pom, which stays legacy).
     Other,
 }
@@ -284,6 +300,12 @@ pub struct Detected {
     pub maven: Option<MavenShape>,
     /// A Gradle settings or build script.
     pub gradle: bool,
+    /// An sbt build root ([`sbt::detect`], [`Shape::Sbt`]) or a scala-cli
+    /// directory build ([`scala_cli::detect`], [`Shape::ScalaCli`]). It
+    /// takes the root: a pom or Gradle build beside it is not planned
+    /// (unless that backend already wired the root, which `sbt::detect`
+    /// leaves on it).
+    pub scala: Option<Shape>,
 }
 
 impl Detected {
@@ -291,6 +313,9 @@ impl Detected {
     /// backend; next to a Gradle build it is planned as a one-pom reactor,
     /// so both halves share one ledger entry.
     pub fn shape(&self) -> Shape {
+        if let Some(scala) = self.scala {
+            return scala;
+        }
         match (self.maven, self.gradle) {
             (Some(_), true) => Shape::Mixed,
             (Some(MavenShape::Reactor), false) => Shape::MavenReactor,
@@ -319,6 +344,7 @@ pub fn detect_builds(read: ReadFn<'_>) -> Detected {
     Detected {
         maven,
         gradle: GRADLE_FILES.iter().any(|f| read(f).is_some()),
+        scala: sbt::detect(read).or_else(|| scala_cli::detect(read)),
     }
 }
 
@@ -354,6 +380,8 @@ pub fn plan_with_config(
             let gradle = gradle::plan(read, list, patch)?;
             Ok(compose(maven, gradle))
         }
+        Shape::Sbt => sbt::plan(read, patch),
+        Shape::ScalaCli => scala_cli::plan(read, patch),
         Shape::Other => Err(JvmRefusal {
             code: "vendor_jvm_shape_unsupported",
             detail: "reason: no_build_file: not a multi-module Maven reactor or a Gradle build"
@@ -429,12 +457,23 @@ pub(crate) fn fragment(
 /// A tree root's owned `.gitattributes`: created when absent,
 /// adopted (never overwritten) when present.
 pub(crate) fn owned_file(read: ReadFn<'_>, rel: &str, writes: &mut Vec<FileWrite>) -> WiringRecord {
+    owned_file_with(read, rel, TREE_GITATTRIBUTES.as_bytes(), writes)
+}
+
+/// An owned file with the given bytes: created when absent, adopted (never
+/// overwritten) when present.
+pub(crate) fn owned_file_with(
+    read: ReadFn<'_>,
+    rel: &str,
+    bytes: &[u8],
+    writes: &mut Vec<FileWrite>,
+) -> WiringRecord {
     if read(rel).is_some() {
         return adopt(rel, OWNED_FILE_KIND, "owned");
     }
     writes.push(FileWrite {
         rel: rel.to_string(),
-        bytes: TREE_GITATTRIBUTES.as_bytes().to_vec(),
+        bytes: bytes.to_vec(),
         tree: false,
     });
     fragment(

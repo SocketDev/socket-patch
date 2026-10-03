@@ -65,6 +65,8 @@ mod poetry;
 mod python_lock_equivalence_tests;
 mod requirements;
 pub mod gradle;
+pub mod sbt;
+pub mod scala_guidance;
 mod staged;
 mod state;
 pub(crate) mod hosted_url;
@@ -324,6 +326,23 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub refused_gradle_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids pinned in `socket-patch.sbt` and verified against the
+    /// build's resolution evidence (kept or added by this run). On a pure
+    /// sbt root ([`sbt::owns_maven_root`]) maven confirmation keys off this
+    /// set alone; beside a `pom.xml` the pom rewriter's proof also counts.
+    /// Like the Gradle sets, the sbt sets serialize (and print) only when
+    /// non-empty, so the blessed rewriter oracles predating them stay valid.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub confirmed_sbt_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids the sbt rewriter refused (never confirmed).
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub refused_sbt_uuids: std::collections::BTreeSet<String>,
 }
 
 /// The derived `Debug` shape, with the Gradle sets shown only when
@@ -367,6 +386,8 @@ impl std::fmt::Debug for RewriteResult {
             ("gradle_uuids", &self.gradle_uuids),
             ("confirmed_gradle_uuids", &self.confirmed_gradle_uuids),
             ("refused_gradle_uuids", &self.refused_gradle_uuids),
+            ("confirmed_sbt_uuids", &self.confirmed_sbt_uuids),
+            ("refused_sbt_uuids", &self.refused_sbt_uuids),
         ] {
             if !set.is_empty() {
                 d.field(name, set);
@@ -590,6 +611,10 @@ fn rewriter_groups<'a>(
             gradle::rewrite_gradle_hosted(files, gradle_unreadable, overrides, result)
         }),
         Box::new(move |result| rewrite_golang(files, overrides, result)),
+        Box::new(move |result| {
+            sbt::rewrite_sbt(files, overrides, result);
+            scala_guidance::warn(files, overrides, result);
+        }),
     ]
 }
 
@@ -667,6 +692,8 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         gradle_uuids,
         confirmed_gradle_uuids,
         refused_gradle_uuids,
+        confirmed_sbt_uuids,
+        refused_sbt_uuids,
     } = delta;
     result.files.extend(files);
     result.binary_files.extend(binary_files);
@@ -705,6 +732,8 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.confirmed_gradle_uuids.extend(confirmed_gradle_uuids);
     result.refused_gradle_uuids.extend(refused_gradle_uuids);
     result.bundled_skipped_uuids.extend(bundled_skipped_uuids);
+    result.confirmed_sbt_uuids.extend(confirmed_sbt_uuids);
+    result.refused_sbt_uuids.extend(refused_sbt_uuids);
 }
 
 /// [`rewrite_groups_serial`], with the groups run concurrently under
@@ -6040,6 +6069,12 @@ fn rewrite_gem(
 // are authored surgically (mirrors the cargo/nuget rewriters): every byte
 // not touched by an edit is preserved.
 
+/// No `pom.xml` and no Gradle script among `files`: a Scala-tool root
+/// (sbt, Mill, scala-cli) has no other Maven planner beside it.
+pub(crate) fn no_maven_or_gradle(files: &BTreeMap<String, String>) -> bool {
+    !files.contains_key("pom.xml") && !gradle::gradle_build_present(files)
+}
+
 /// The six `-Daether.*` args that enable Maven's Trusted Checksums resolver
 /// post-processor (twin of the TS `MVN_CONFIG_ARGS`), one per `.mvn/maven.config`
 /// line. `failIfMissing=false` so a dependency without a committed checksum
@@ -6115,7 +6150,7 @@ fn maven_enforces_trusted_checksums(version: &str) -> bool {
 /// Strip any `sha256-`/`sha256:` SRI-style prefix off a stored hash, leaving the
 /// bare lowercase hex Maven's trusted-checksums summary file expects (twin of
 /// the TS `bareSha256Hex`).
-fn bare_sha256_hex(hash: &str) -> String {
+pub(crate) fn bare_sha256_hex(hash: &str) -> String {
     let lower = hash.trim().to_lowercase();
     if let Some(rest) = lower.strip_prefix("sha256-") {
         return rest.to_string();
@@ -6200,6 +6235,11 @@ fn rewrite_maven_pom(
         .filter(|o| o.ecosystem == "maven")
         .collect();
     if maven.is_empty() {
+        return;
+    }
+    // A pure sbt / Mill / scala-cli root is wired (or guided) by its own
+    // rewriter; the pom path would only add `no_pom` / `missing_override`.
+    if sbt::owns_maven_root(files) || scala_guidance::owns_maven_root(files) {
         return;
     }
     let mut pom = files.get("pom.xml").cloned();

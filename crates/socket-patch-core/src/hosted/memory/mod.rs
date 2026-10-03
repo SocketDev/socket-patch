@@ -1480,6 +1480,54 @@ mod tests {
         );
     }
 
+    /// A multi-project sbt build (no lock, so no root): its root and
+    /// subproject `build.sbt` files raise one run-level maven warning. In a
+    /// rooted repo the root's own `build.sbt` is the root's (rooted)
+    /// warning, and only the subprojects' stay run-level.
+    #[test]
+    fn sbt_build_files_warn_unsupported_in_memory() {
+        let paths = [
+            "build.sbt",
+            "a/build.sbt",
+            "b/build.sbt",
+            "project/build.properties",
+            "project/plugins.sbt",
+            "a/src/main/scala/A.scala",
+        ];
+        let mut out = Vec::new();
+        unrooted_unsupported_warnings(
+            paths.into_iter(),
+            &[],
+            None,
+            crate::policy::builtin_defaults(),
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].code, "ecosystem_unsupported_in_memory");
+        assert!(out[0].project_root.is_none());
+        assert!(
+            out[0]
+                .detail
+                .starts_with("build.sbt (and 2 more) is present, but maven"),
+            "{}",
+            out[0].detail
+        );
+        let mut rooted = Vec::new();
+        unrooted_unsupported_warnings(
+            paths.into_iter(),
+            &[String::new()],
+            None,
+            crate::policy::builtin_defaults(),
+            &mut rooted,
+        );
+        assert_eq!(rooted.len(), 1, "{rooted:?}");
+        assert!(
+            rooted[0].detail.starts_with("a/build.sbt (and 1 more)"),
+            "{}",
+            rooted[0].detail
+        );
+    }
+
     #[test]
     fn unsupported_markers_outside_roots_warn_once_per_ecosystem() {
         let paths = [

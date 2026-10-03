@@ -517,6 +517,18 @@ pub async fn read_candidate_files(
     {
         read_gradle_files(view, unreadable, &mut out).await;
     }
+    // An sbt build's resolution evidence rides a synthetic key (see
+    // `patch::redirect::sbt::SBT_RESOLUTION_KEY`).
+    if candidates.iter().any(|c| c.dep.ecosystem == "maven")
+        && crate::formats::sbt::build::sbt_build_present(&crate::formats::sbt::build::files_reader(
+            &out.files,
+        ))
+    {
+        if let Some(json) = super::sbt_reads::extra_resolution(view).await {
+            let key = crate::patch::redirect::sbt::SBT_RESOLUTION_KEY;
+            out.files.insert(key.to_string(), json);
+        }
+    }
     out.symlinked_reads.sort();
     out.symlinked_reads.dedup();
     out.unreadable_reads.sort();
@@ -1072,6 +1084,7 @@ pub async fn rewrite(
         .files
         .keys()
         .chain(rewrite.binary_files.keys())
+        .filter(|k| !crate::patch::redirect::sbt::is_synthetic_key(k))
         .cloned()
         .collect();
     let confirmed = confirm(&files, &rewrite, candidates, binary_bun, withheld_from_vlt);
@@ -1453,6 +1466,7 @@ fn confirm(
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
         .filter(|(name, _)| name.as_str() != "package.json")
+        .filter(|(name, _)| !crate::patch::redirect::sbt::is_synthetic_key(name))
         .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
         .chain(
             rewrite
@@ -1461,6 +1475,7 @@ fn confirm(
                 .filter(|(name, _)| !files.contains_key(*name) && name.as_str() != "package.json")
                 .map(|(name, content)| (name.as_str(), content)),
         )
+        .filter(|(name, _)| !crate::patch::redirect::sbt::is_generated_file(name))
         .collect();
     // Gradle scripts, locks and owned files never confirm by substring: a
     // pasted snippet or a stale lock line pins nothing (the Gradle planner
@@ -1485,6 +1500,23 @@ fn confirm(
             // a vlt-driven `vlt-lock.json` never confirms an npm purl.
             if rewrite.refused_vlt_uuids.contains(uuid) {
                 return ProbeStep::Decided(false);
+            }
+            // An sbt build's Maven pins are confirmed by the sbt rewriter's
+            // own report: the generated file names the index URL whether or
+            // not the pin was verified against the build's evidence (so it
+            // is never a substring proof). Beside a `pom.xml` the Maven
+            // rewriter's own landing also confirms. Beside a Gradle build
+            // whose planner decided the patch, the Gradle arm below must
+            // confirm it as well (each build pins on its own).
+            if purl.starts_with("pkg:maven/") {
+                if let Some(sbt_only) = crate::patch::redirect::sbt::maven_confirmation(files) {
+                    let by_sbt = rewrite.confirmed_sbt_uuids.contains(uuid)
+                        && !rewrite.refused_sbt_uuids.contains(uuid);
+                    let gradle_decides = by_sbt && rewrite.gradle_uuids.contains(uuid);
+                    if (by_sbt || sbt_only) && !gradle_decides {
+                        return ProbeStep::Decided(by_sbt);
+                    }
+                }
             }
             if rewrite.vlt_drives && purl.starts_with("pkg:npm/") {
                 return ProbeStep::Decided(rewrite.confirmed_vlt_uuids.contains(uuid));
@@ -1665,6 +1697,7 @@ pub fn guard(
             .files
             .keys()
             .chain(done.rewrite.binary_files.keys())
+            .filter(|k| !crate::patch::redirect::sbt::is_synthetic_key(k))
     };
     if let Some(linked) = written().find(|k| view.is_symlink(k)) {
         return Some(symlink_refusal(linked));
