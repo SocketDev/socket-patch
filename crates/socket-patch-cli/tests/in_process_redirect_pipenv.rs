@@ -715,3 +715,105 @@ async fn dotenv_selected_pipenv_install_is_checked_before_vex() {
         assert!(read(&project.join("Pipfile.lock")).contains(HOSTED_URL));
     }
 }
+
+/// Pipenv 2018 shell can select a third dotenv WORKON_HOME while current
+/// Pipenv and pre-dotenv commands use a healthy cached environment.
+#[tokio::test]
+#[serial]
+async fn legacy_dotenv_workon_install_is_checked_before_vex() {
+    for forward_reference in [true, false] {
+        let server = MockServer::start().await;
+        mock_api(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let legacy = tmp.path().join("legacy-workon");
+        let cached = tmp.path().join("cached-workon");
+        let make_install = |seed: &Path, root: &Path, bytes: &[u8]| {
+            std::fs::create_dir_all(seed).unwrap();
+            std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+            write_project_with_upstream_install(seed);
+            let relative = site_packages(seed)
+                .strip_prefix(seed.join(".venv"))
+                .unwrap()
+                .to_path_buf();
+            std::fs::rename(seed.join(".venv"), root).unwrap();
+            let file = root.join(relative).join("urllib3/response.py");
+            std::fs::write(&file, bytes).unwrap();
+            file
+        };
+        let stale_file = make_install(&project, &legacy.join("env"), UPSTREAM);
+        let healthy_file = make_install(&tmp.path().join("seed"), &cached.join("env"), PATCHED);
+        // The .venv file names a project-specific venv within WORKON_HOME
+        // in both native generations, avoiding unrelated directory scans.
+        std::fs::write(project.join(".venv"), "env\n").unwrap();
+        let legacy_text = legacy.to_string_lossy().replace('\\', "/");
+        let cached_text = cached.to_string_lossy().replace('\\', "/");
+        let dotenv = if forward_reference {
+            format!("WORKON_HOME=${{BASE}}\nBASE={legacy_text}\n")
+        } else {
+            format!("BASE={cached_text}\nWORKON_HOME=${{BASE}}\n")
+        };
+        std::fs::write(project.join(".env"), dotenv).unwrap();
+        let vex = project.join("out.vex.json");
+        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+        for (key, _) in std::env::vars_os() {
+            let text = key.to_string_lossy();
+            if text.starts_with("SOCKET_")
+                || text.starts_with("PIPENV_")
+                || matches!(text.as_ref(), "VIRTUAL_ENV" | "WORKON_HOME" | "BASE")
+            {
+                cmd.env_remove(key);
+            }
+        }
+        cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
+            .env(MAJOR_ENV, "2026")
+            .env("HOME", tmp.path().join("home"))
+            .env("USERPROFILE", tmp.path().join("home"))
+            .env("WORKON_HOME", &cached)
+            .args(["scan", "--mode", "hosted", "--yes", "--json", "--cwd"])
+            .arg(&project)
+            .args([
+                "--api-url",
+                &server.uri(),
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+                "--vex",
+            ])
+            .arg(&vex)
+            .args(["--vex-product", VEX_PRODUCT]);
+        if !forward_reference {
+            cmd.env("BASE", &legacy);
+        }
+        let out = cmd.output().await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{error}: stdout={} stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "forward={forward_reference}: {json}"
+        );
+        assert!(
+            json["redirect"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["code"] == "redirect_pypi_stale_install"),
+            "{json}"
+        );
+        assert!(
+            !vex.exists(),
+            "a healthy cached copy cannot attest the stale shell copy"
+        );
+        assert_eq!(std::fs::read(stale_file).unwrap(), UPSTREAM);
+        assert_eq!(std::fs::read(healthy_file).unwrap(), PATCHED);
+        assert_eq!(read(&project.join(".venv")), "env\n");
+        assert_eq!(read(&project.join("Pipfile")), PIPFILE);
+    }
+}
