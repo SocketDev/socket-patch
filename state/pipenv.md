@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-03 15:32Z, main `045d7ec` (CLI 4.0.0, unchanged). No new issues. Passing: lock entries with a non-default `index` (second `[[source]]`, private simple index) in hosted on 2018 / 2022 / 2023 / 2026, vendored on 2018 / 2026, and both takeovers; rollback refusal is documented. Also passing: a re-formatted (2-space or minified) Pipfile.lock in hosted mode. PR #654 (`d8356ae`, #645 + #546) is still unmerged.
+Last run: 2026-10-03 21:36Z, main `045d7ec` (CLI 4.0.0, unchanged). Filed #725 (`vendor --check` reports wiring verified after `pipenv lock` drops the vendored reference). Passing: a `pypi`-named mirror source (hosted / vendored on 2018 / 2026, rollback refusal documented); a hosted path-prefixed server on Pipenv 11 / 2018 / 2022; a transitive entry with markers. PR #654 (`d8356ae`, #645 + #546) is still unmerged.
 
 ## Coverage matrix
 
@@ -48,6 +48,8 @@ Named category on 2026.8.0 (`61cfb9b`): `pipenv requirements --categories docs` 
 
 Hosted `pipenv requirements --hash` sibling (2022 / 2026, `045d7ec`): hash mode kept, `pip install --require-hashes` PATCHED (pass); rollback refusal there is #410. Vendored + hashed sibling requirements.txt: `vendor --revert` / rollback byte-exact on both files (2026, pass).
 
+`pypi`-named `[[source]]` on a mirror (no pypi.org in `_meta.sources`), `21:36Z` run, `045d7ec`: hosted lock-only on 2018.11.26 / 2026.8.0 (sync / --deploy PATCHED, vex `not_affected`) pass; hosted rollback refused (documented); vendored on 2018 / 2026 (sync / --deploy / check / vex / byte-exact rollback) pass. Hosted path-prefixed server (`/cdn/v2`), lock-only: Pipenv 11.10.4 (`path`), 2018.11.26 and 2022.12.19 (--deploy, vex, idempotent re-scan, byte-exact rollback) pass. A transitive entry with `markers` and no `index` (hosted, 2026): pass. Vendored, then `pipenv lock` (ref dropped) on 2018 / 2022 / 2023 / 2026: vex `vendor_unwired` (correct), but `vendor --check` stays green: fail #725.
+
 macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-03 03:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
@@ -58,8 +60,8 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 3. Re-verify #504 and the #454 human-mode gap once they're fixed.
 4. #567 variants: vendored mode with an `-r` include, `remove`, `-c` constraints; re-verify once fixed.
 5. **Maintainer request (global `-g` mode):** still to do: macOS / Windows, `-g` on 2018 / 11, and `--global-prefix` as a venv root (scans 0; undocumented). Checklist in the 20261001T040000Z entry.
-6. A `pypi`-named `[[source]]` pointing at a mirror (no pypi.org in `_meta.sources`): hosted, vendored and rollback, on 2018 / 2026. (Non-default `index` done 2026-10-03 15:32Z, pass.)
-6b. Hosted path-prefix on Pipenv 9 / 11 (`path` references) and on lock-only checkouts.
+6. Re-verify #725 once fixed, plus other wiring-drift shapes: a hand-edited `file` ref to a different uuid, the entry moved to `develop`, and `pipenv install <other>` on 2023. (Mirror-named `pypi` source and hosted path-prefix on 11 / 2018 / 2022 done 2026-10-03 21:36Z, pass.)
+6b. Mixed sources (a mirror named `pypi` plus pypi.org under another name) with a transitive, index-less entry: hosted rollback restore.
 7. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546 / #645, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked until branch deletion through the git proxy works (still denied 2026-10-03 15:20Z).
 
 ## Known non-bugs
@@ -103,3 +105,5 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - Pipenv 2018.11.26 reads `PIPENV_VENV_IN_PROJECT` with `bool(os.environ.get(...))`, so `"0"` means in project, and Pipenv ≤ 2023.10.24 always uses an existing `.venv` directory. That's Pipenv's behaviour, and the reason #645 is a socket-patch bug.
 - v5 `scan` defaults to hosted mode; agent cells need `--mode agent`.
 - A hand-reformatted Pipfile.lock (2-space indent or minified) gets the hosted entry in Pipenv's 4-space style, so rollback is semantically exact but not byte-exact. Cosmetic: Pipenv re-serializes on any `pipenv lock`.
+- Pipenv 11.x crashes on `PIP_NO_CACHE_DIR=1` (its vendored pip9 `_build_session` TypeError): a sandbox env artifact, so unset it.
+- `repair` after a relock leaves an unwired vendored entry unwired (success, 0 events): documented as artifact-only. `get --mode vendored` re-wires it. (Only `vendor --check` staying green is a bug, #725.)
