@@ -1,0 +1,128 @@
+name: bughunt-bundler
+on:
+  push:
+    branches: ['bughunt/bundler/**']
+permissions:
+  contents: read
+jobs:
+  hosted:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        ruby: ['3.3', '3.4']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: false
+          key: bughunt-${{ matrix.os }}
+      - uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Build CLI
+        run: cargo build --release -p socket-patch-cli
+      - name: Probe hosted cycle
+        run: |
+          set +e
+          W="$RUNNER_TEMP/bh"; mkdir -p "$W"; cd "$W"
+          BIN="$GITHUB_WORKSPACE/target/release/socket-patch"
+          R(){ echo "RESULT ${{ matrix.os }} ruby-${{ matrix.ruby }} $1=$2"; }
+          ruby -v; gem install bundler -v 2.6.9 --no-document; gem install bundler -v 4.0.17 --no-document; gem list bundler
+          gem fetch colorize -v 0.8.1
+          gem unpack colorize-0.8.1.gem --target pk
+          cp pk/colorize-0.8.1/lib/colorize.rb orig.rb
+          (cd pk/colorize-0.8.1 && gem spec ../../colorize-0.8.1.gem --ruby > c.gemspec && printf '# SOCKET_PATCHED\n' >> lib/colorize.rb && gem build c.gemspec && cp colorize-0.8.1.gem ../../patched.gem && cp lib/colorize.rb ../../after.rb)
+          cat > mock.py <<'PY'
+          import http.server, json, hashlib, sys
+          PORT=18765; UUID="11111111-2222-4333-8444-555555555555"; TOKEN="tok"; N,V="colorize","0.8.1"; PURL=f"pkg:gem/{N}@{V}"
+          patched=open("patched.gem","rb").read(); psha=hashlib.sha256(patched).hexdigest()
+          B=open("orig.rb","rb").read(); A=open("after.rb","rb").read()
+          def gh(b): return hashlib.sha256(b"blob %d\0"%len(b)+b).hexdigest()
+          BASE=f"http://127.0.0.1:{PORT}"; REG=f"/patch-registry/gem/{TOKEN}/{UUID}"
+          info=f"---\n{V} |checksum:{psha},ruby:>= 0\n"
+          versions=f"created_at: 2026-01-01T00:00:00Z\n---\n{N} {V} {hashlib.md5(info.encode()).hexdigest()}\n"
+          class H(http.server.BaseHTTPRequestHandler):
+              def log_message(self,*a): pass
+              def send(self,code,body,ct="application/json",etag=False):
+                  if isinstance(body,(dict,list)): body=json.dumps(body)
+                  if isinstance(body,str): body=body.encode()
+                  self.send_response(code); self.send_header("Content-Type",ct); self.send_header("Content-Length",str(len(body)))
+                  if etag: self.send_header("ETag",'"%s"'%hashlib.md5(body).hexdigest())
+                  self.end_headers(); self.wfile.write(body)
+              def do_POST(self):
+                  self.rfile.read(int(self.headers.get("Content-Length",0))); p=self.path.split("?")[0]
+                  if p.endswith("/patches/batch"):
+                      return self.send(200,{"packages":[{"purl":PURL,"patches":[{"uuid":UUID,"purl":PURL,"tier":"free","cveIds":[],"ghsaIds":["GHSA-aaaa-bbbb-cccc"],"severity":"high","title":"t"}]}],"canAccessPaidPatches":False})
+                  if p.endswith("/patches/package"):
+                      u=f"{BASE}/patch/gem/{N}/{V}/{TOKEN}/{UUID}/{N}-{V}.gem"
+                      return self.send(200,{"results":{UUID:{"status":"granted","url":u,"purl":PURL,"artifacts":[{"kind":"tarball","url":u,"integrity":{"sha256":psha}}],"registryOverride":{"kind":"rubygems-compact-index","indexUrl":f"{BASE}{REG}/","identifiers":{"name":N,"version":V,"gemChecksumSha256":psha}}}}})
+                  self.send(404,{})
+              def do_GET(self):
+                  p=self.path.split("?")[0]
+                  if "/patches/by-package/" in p:
+                      return self.send(200,{"patches":[{"uuid":UUID,"purl":PURL,"publishedAt":"2026-01-01T00:00:00Z","description":"x","license":"MIT","tier":"free","vulnerabilities":{}}],"canAccessPaidPatches":False})
+                  if p.endswith(f"/patches/view/{UUID}"):
+                      return self.send(200,{"uuid":UUID,"purl":PURL,"publishedAt":"2026-01-01T00:00:00Z","files":{"lib/colorize.rb":{"beforeHash":gh(B),"afterHash":gh(A)}},"vulnerabilities":{"GHSA-aaaa-bbbb-cccc":{"cves":["CVE-2026-1"],"summary":"s","severity":"high","description":"d"}},"description":"x","license":"MIT","tier":"free"})
+                  if p.startswith(REG):
+                      r=p[len(REG):]
+                      if r=="/versions": return self.send(200,versions,"text/plain",True)
+                      if r==f"/info/{N}": return self.send(200,info,"text/plain",True)
+                      if r=="/names": return self.send(200,f"---\n{N}\n","text/plain",True)
+                  if p.endswith(f"/{N}-{V}.gem"): return self.send(200,patched,"application/octet-stream")
+                  self.send(404,"nf","text/plain")
+          http.server.ThreadingHTTPServer(("127.0.0.1",PORT),H).serve_forever()
+          PY
+          python mock.py & 
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:18765/patch-registry/gem/tok/11111111-2222-4333-8444-555555555555/names >/dev/null && break; sleep 1; done
+          API=http://127.0.0.1:18765; AA="--api-url $API --org org --api-token fake"
+          cycle(){ # tag bundler spelling crlf
+            local TAG=$1 BV=$2 SP=$3 CR=$4 LOCK; [ $SP = gems.rb ] && LOCK=gems.locked || LOCK=Gemfile.lock
+            local D="$W/c-$TAG"; rm -rf "$D"; mkdir -p "$D/proj"; cd "$D/proj"
+            printf 'source "https://rubygems.org"\n\ngem "rake"\ngem "colorize", "~> 0.8.1"\n' > $SP
+            bundle _${BV}_ config set --local path vendor/bundle >/dev/null
+            bundle _${BV}_ install --quiet || { R $TAG install0-fail; cd "$W"; return; }
+            bundle _${BV}_ lock --add-checksums >/dev/null
+            rm -rf vendor
+            [ $CR = 1 ] && { ruby -e 'ARGV.each{|f| s=File.binread(f).gsub("\r\n","\n").gsub("\n","\r\n"); File.binwrite(f,s)}' $SP $LOCK; }
+            cp $SP $LOCK "$D/"
+            "$BIN" scan --mode hosted --json --yes --cwd . $AA > "$D/scan.json" 2>"$D/scan.err"; local sc=$?
+            python -c "import json;e=json.load(open(r'$D/scan.json'));r=e.get('redirect') or {};print('SCAN',e.get('status'),r.get('redirected'),r.get('rewrittenFiles'),[w['code'] for w in r.get('warnings',[])])"
+            echo "--- $SP"; cat -A $SP 2>/dev/null || cat $SP; echo "--- $LOCK"; cat $LOCK
+            mkdir "$D/fresh"; cp $SP $LOCK "$D/fresh/"; cp -r .bundle "$D/fresh/"
+            (cd "$D/fresh" && bundle _${BV}_ install --quiet; echo "freshexit=$?"; grep -c SOCKET_PATCHED vendor/bundle/ruby/*/gems/colorize-0.8.1/lib/colorize.rb) > "$D/fresh.txt" 2>&1
+            cat "$D/fresh.txt"; local fp=$(tail -1 "$D/fresh.txt")
+            "$BIN" rollback --json --cwd . $AA --patch-server-url $API > "$D/rb.json" 2>"$D/rb.err"; local rb=$?
+            python -c "import json;e=json.load(open(r'$D/rb.json'));print('RB',e.get('status'),e.get('hosted'),e.get('error'))"
+            local same=no; cmp -s "$D/$LOCK" $LOCK && same=lock-identical
+            diff "$D/$SP" $SP; diff "$D/$LOCK" $LOCK
+            mkdir "$D/fresh2"; cp $SP $LOCK "$D/fresh2/"; cp -r .bundle "$D/fresh2/"
+            (cd "$D/fresh2" && BUNDLE_FROZEN=true bundle _${BV}_ install --quiet; echo "frozenexit=$?"; grep -c SOCKET_PATCHED vendor/bundle/ruby/*/gems/colorize-0.8.1/lib/colorize.rb) > "$D/fresh2.txt" 2>&1
+            cat "$D/fresh2.txt"; local f2=$(tail -1 "$D/fresh2.txt")
+            R $TAG "scan=$sc fresh_patched=$fp rollback=$rb frozen_after_rb=$(grep frozenexit "$D/fresh2.txt") patched_after_rb=$f2 $same"
+            cd "$W"
+          }
+          for BV in 2.6.9 4.0.17; do for SP in Gemfile gems.rb; do for CR in 0 1; do cycle "$BV-$SP-crlf$CR" $BV $SP $CR; done; done; done
+          # #709 cell: config path outside the project (drive-letter absolute on Windows)
+          OUT="$RUNNER_TEMP/outside bundle"; D="$W/abs"; mkdir -p "$D"; cd "$D"
+          printf 'source "https://rubygems.org"\n\ngem "colorize", "0.8.1"\n' > Gemfile
+          OUTN=$(ruby -e 'print File.expand_path(ARGV[0])' "$OUT"); echo "OUTN=$OUTN"
+          bundle _4.0.17_ config set --local path "$OUTN" >/dev/null; cat .bundle/config
+          bundle _4.0.17_ install --quiet; bundle _4.0.17_ lock --add-checksums >/dev/null
+          "$BIN" scan --mode hosted --json --yes --cwd . $AA --vex out.vex.json --vex-product pkg:generic/app@1 > scan.json 2>scan.err
+          python -c "import json;e=json.load(open('scan.json'));r=e.get('redirect') or {};print('ABS-SCAN',[w['code'] for w in e.get('warnings') or []],[w['code'] for w in r.get('warnings',[])],e.get('vex'))"
+          bundle _4.0.17_ install --quiet; P=$(grep -c SOCKET_PATCHED "$OUTN"/ruby/*/gems/colorize-0.8.1/lib/colorize.rb)
+          "$BIN" vex --output post.json --product pkg:generic/app@1 --cwd . --patch-server-url $API $AA > vex.out 2>&1; VX=$?
+          cat vex.out
+          R abs709 "installed_patched=$P post_vex_exit=$VX $(python -c "import json;print([s['status'] for s in json.load(open('post.json'))['statements']])" 2>/dev/null)"
