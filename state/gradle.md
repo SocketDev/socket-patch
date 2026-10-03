@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Gradle bug-hunt routine (label pm:gradle).
 
-Last updated: 2026-10-03 (run 11), main `045d7ec` (no Gradle/JVM code changes since `2463257` / #277), latest release v4.0.0. #551 and #349 were re-confirmed on `045d7ec` in run 10. Run 8 filed #551, run 9 filed nothing, run 10 filed #620, and run 11 filed #656 and commented on #511.
+Last updated: 2026-10-03 (run 12), main `045d7ec` (no Gradle/JVM code changes since `2463257` / #277), latest release v4.0.0. #551 and #349 were re-confirmed on `045d7ec` in run 10. Run 8 filed #551, run 9 filed nothing, run 10 filed #620, run 11 filed #656 and commented on #511, and run 12 commented on #620.
 
 ## Coverage matrix
 
@@ -70,6 +70,12 @@ Last updated: 2026-10-03 (run 11), main `045d7ec` (no Gradle/JVM code changes si
 - A transitive range from a dependency's POM: **fail #511** on 8.14.3 (downgrades to 1.9).
 - macOS / Windows, Gradle 6 / 7: untested.
 
+**Vendored, run 12 cells (Linux).**
+- `.gitignore` with `vendor/`: **fail #620** on 8.14.3. The whole `.socket/vendor/` tree, including the index, is never committed, and vendor and `--check` exit 0.
+- Android Studio template with catalog `alias(...)` plugin ids: the `android_or_kmp` refusal doesn't fire (vendor exits 0). The build is untested because dl.google.com is blocked. KMP wizard-style (`jvm()`) with catalog aliases: vendor exits 0, and the fresh build is patched (pass).
+- 9.8.0: Kotlin settings + catalog + `pluginManagement { includeBuild("build-logic") }` + subproject buildscript classpath, fresh clone: pass (all three classpaths patched). `vendor --revert`: byte-exact (pass).
+- macOS / Windows, Gradle 6 / 7: untested.
+
 **Agent mode, run 8 (Linux, 8.14.3).**
 - Gradle-only project (`mavenCentral()`) with the same GAV in `~/.m2`: `apply` patches m2, `vex` says `not_affected`, and the build uses the unpatched cache jar. **fail #551**.
 - The same with `mavenLocal()` first (+ `-Dmaven.repo.local`): pass (control).
@@ -85,13 +91,13 @@ Last updated: 2026-10-03 (run 11), main `045d7ec` (no Gradle/JVM code changes si
 - macOS / Windows: untested.
 
 ## Backlog
-1. **Maintainer request (partly done):** global `-g` mode. Linux is covered (the report, the refusal, no project leakage, and `--global-prefix` apply failing loudly). Still to do: macOS / Windows, and `apply -g` / `rollback -g` / `vex -g` with the GAV in `~/.m2` (see the 20261001T040000Z entry).
-2. #487, #511, #533 and #656 on Gradle 6.9.4 / 7.6.6 (a JDK 11/17 probe), plus `verify-signatures` with `.module` artifacts and imported BOMs.
-3. #511 with catalog `strictly` / `prefer` (the transitive-POM variant was done in run 11).
-4. #620 variants: `.socket/` ignored, a global `core.excludesFile`, and `**/vendor/` rules. Re-test #620 when the JVM vendor path gains a gitignore probe.
-5. The hosted snippet in its suffixed form, with the dependency bumped and then `vendor`. Check the result and VEX. Also the hosted snippet plus a classifier dependency (the hosted analogue of #533).
-6. Agent `apply` + `vex` when `GRADLE_USER_HOME` and `~/.m2` hold different versions (a #551 variant).
-7. The run 9 init-script cells on Gradle 6.9.4, and the run 5 cells on 9.8.0.
+1. **Android catalog-alias template** on a GitHub ubuntu runner (it has the SDK). Vendor bypasses `android_or_kmp` there (run 12). Build it and file only if AGP fails or resolves the unpatched jar.
+2. **Maintainer request (partly done):** global `-g` mode. Linux is covered (the report, the refusal, no project leakage, and `--global-prefix` apply failing loudly). Still to do: macOS / Windows, and `apply -g` / `rollback -g` / `vex -g` with the GAV in `~/.m2` (see the 20261001T040000Z entry).
+3. #487, #511, #533, #620 and #656 on Gradle 6.9.4 / 7.6.6 (a JDK 11/17 probe), plus `verify-signatures` with `.module` artifacts and imported BOMs.
+4. The `.module` artifact (jackson-core) cell on 9.8.0. It needs a second patch fixture.
+5. #511 with catalog `strictly` / `prefer`.
+6. The hosted snippet in its suffixed form, with the dependency bumped and then `vendor`. Check the result and VEX. Also the hosted snippet plus a classifier dependency (the hosted analogue of #533).
+7. Agent `apply` + `vex` when `GRADLE_USER_HOME` and `~/.m2` hold different versions (a #551 variant).
 8. Re-test #347, #348, #349, #395, #396, #428, #429, #461, #487, #511, #533, #551, #620 and #656 when `vendor/jvm/`, `maven_crawler.rs` or `gradle_snippet` change.
 
 ## Known non-bugs
@@ -124,3 +130,5 @@ Last updated: 2026-10-03 (run 11), main `045d7ec` (no Gradle/JVM code changes si
 - `gradle::wired()` accepts the apply line in either `settings.gradle` or `settings.gradle.kts`. Gradle reads the Groovy file when both exist, and the planner targets it too, so a mismatch only happens if someone hand-moves the line. That's contrived, so it hasn't been filed (run 10).
 - Kotlin DSL harness note: inside `build.gradle.kts` with the `java` plugin applied, `java.util.…` resolves `java` to the extension. Use a top-level `import` (run 11).
 - A vendored Gradle build failing on a *missing* vendored file is healed by re-running `vendor` (`rebuilt`). Only *extra* files hit #656 (run 11).
+- `android_or_kmp` only matches literal plugin ids (`gradle.rs:1043`), so catalog `alias(...)` builds aren't refused. On a KMP `jvm()` build the vendored jar is correctly on the classpath, so that's not filed unless an Android build shows harm (run 12).
+- Precompiled `build-logic` `*.gradle.kts` scripts hit the same `java.` extension shadowing as build scripts. Use top-level imports (run 12).
