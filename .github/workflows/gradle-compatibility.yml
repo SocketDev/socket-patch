@@ -229,7 +229,8 @@ jobs:
         if: steps.jdk.outputs.runner-jdk != 'true'
         uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
-          distribution: temurin
+          # Temurin never shipped JDK 15 (the 6.9 ceiling); Zulu did.
+          distribution: ${{ matrix.java == '15' && 'zulu' || 'temurin' }}
           java-version: ${{ matrix.java }}
 
       - name: Install Maven 3.9.16 (vendor cells)

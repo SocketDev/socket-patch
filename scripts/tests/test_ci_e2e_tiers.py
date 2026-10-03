@@ -227,7 +227,7 @@ class GradleRows(unittest.TestCase):
             labels.setdefault(row["label"], []).append(row)
             self.assertEqual(row["os"], "ubuntu-latest")
         ceilings = {(r["gradle"], r["java"]) for r in labels["jdk-ceiling"]}
-        self.assertEqual(ceilings, {("6.9.4", "16"), ("7.6.6", "19"), ("8.14.3", "24")})
+        self.assertEqual(ceilings, {("6.9.4", "15"), ("7.6.6", "19"), ("8.14.3", "24")})
         self.assertEqual(len(labels["jdk-ceiling"]), 9)
         self.assertEqual({(r["gradle"], r["mode"]) for r in labels["configuration-cache"]},
                          {("9.8.0", "hosted"), ("9.8.0", "vendor")})
@@ -251,7 +251,7 @@ class GradleRows(unittest.TestCase):
                      "crates/socket-patch-core/src/vendor/jvm/**", "crates/socket-patch-core/src/patch/jvm_jar.rs",
                      "crates/socket-patch-cli/tests/jvm_fixture_repo/**", "crates/socket-patch-cli/tests/e2e_*gradle*"):
             self.assertIn(f"'{path}'", text)
-        self.assertIn("6.9 <= 16", text)
+        self.assertIn("6.9 <= 15", text)
         self.assertIn("7.6 <= 19", text)
         self.assertIn("8.14 <= 24", text)
         self.assertIn("gradle-probe", text)
