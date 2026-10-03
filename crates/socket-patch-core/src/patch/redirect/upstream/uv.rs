@@ -1411,3 +1411,259 @@ mod tests {
         assert_eq!(SpecStyle::CANDIDATES[3].join(&clauses), "<2,>=1");
     }
 }
+
+/// The hosted unwind re-derives each requirement entry's specifier from the
+/// declaration uv lowered it from: by extra and marker when one name has
+/// several specifiers (#606), through PEP 735 `include-group` (#473).
+#[cfg(test)]
+mod declaration_tests {
+    use super::*;
+
+    const UUID: &str = "e828efa5-5c6d-43f3-9909-03f5ac232b98";
+    const HOSTED: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/g/e828efa5-5c6d-43f3-9909-03f5ac232b98/six-1.16.0-py2.py3-none-any.whl";
+
+    /// A hosted entry for six with an optional `marker`.
+    fn six(marker: Option<&str>) -> String {
+        match marker {
+            Some(m) => format!("{{ name = \"six\", marker = \"{m}\", url = \"{HOSTED}\" }}"),
+            None => format!("{{ name = \"six\", url = \"{HOSTED}\" }}"),
+        }
+    }
+
+    /// The registry entry the unwind should write back.
+    fn spec(specifier: &str, marker: Option<&str>) -> String {
+        match marker {
+            Some(m) => {
+                format!("{{ name = \"six\", marker = \"{m}\", specifier = \"{specifier}\" }}")
+            }
+            None => format!("{{ name = \"six\", specifier = \"{specifier}\" }}"),
+        }
+    }
+
+    fn lock(requires_dist: &[String], requires_dev: &[(&str, Vec<String>)]) -> String {
+        let mut out = String::from(
+            "version = 1\nrequires-python = \">=3.9\"\n\n[[package]]\nname = \"uvp\"\n\
+             version = \"0.1.0\"\nsource = { editable = \".\" }\n\n[package.metadata]\n",
+        );
+        out.push_str(&format!("requires-dist = [{}]\n", requires_dist.join(", ")));
+        if !requires_dev.is_empty() {
+            out.push_str("\n[package.metadata.requires-dev]\n");
+            for (group, entries) in requires_dev {
+                out.push_str(&format!("{group} = [{}]\n", entries.join(", ")));
+            }
+        }
+        out
+    }
+
+    /// Run the requirement unwind for six over `lock_text` with `pyproject`.
+    fn unwind(pyproject: &str, lock_text: &str) -> Result<String, String> {
+        let mut doc: DocumentMut = lock_text.parse().unwrap();
+        let meta = Metadata {
+            rel: "pyproject.toml".into(),
+            text: pyproject.into(),
+            script: false,
+            doc: pyproject.parse().unwrap(),
+        };
+        let hit = Hit {
+            index: 0,
+            uuid: UUID.into(),
+            name: "six".into(),
+            version: "1.16.0".into(),
+        };
+        let client = super::super::UpstreamClient::new(true);
+        let ctx = Ctx {
+            client: &client,
+            origins: &[],
+            bun_lockb: false,
+        };
+        restore_requirements(&mut doc, &hit, Some(&meta), &[], &ctx)?;
+        Ok(doc.to_string())
+    }
+
+    const HEAD: &str = "[project]\nname = \"uvp\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\n";
+
+    /// #606 (a): a pin in `dependencies` and a floor in an extra.
+    #[test]
+    fn dependencies_and_extra_with_different_specifiers() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six==1.16.0\", \"idna==3.7\"]\n\n\
+             [project.optional-dependencies]\nextra = [\"six>=1.15\"]\n"
+        );
+        let idna = "{ name = \"idna\", specifier = \"==3.7\" }".to_string();
+        let hosted = lock(
+            &[idna.clone(), six(None), six(Some("extra == 'extra'"))],
+            &[],
+        );
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(
+                &[
+                    idna,
+                    spec("==1.16.0", None),
+                    spec(">=1.15", Some("extra == 'extra'"))
+                ],
+                &[]
+            )
+        );
+    }
+
+    /// #606 (c): two extras with different floors.
+    #[test]
+    fn two_extras_with_different_specifiers() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"idna==3.7\"]\n\n[project.optional-dependencies]\n\
+             a = [\"six==1.16.0\"]\nb = [\"six>=1.10\"]\n"
+        );
+        let hosted = lock(&[six(Some("extra == 'a'")), six(Some("extra == 'b'"))], &[]);
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(
+                &[
+                    spec("==1.16.0", Some("extra == 'a'")),
+                    spec(">=1.10", Some("extra == 'b'"))
+                ],
+                &[]
+            )
+        );
+    }
+
+    /// Extras sharing one specifier lower to one entry naming both.
+    #[test]
+    fn extras_merged_into_one_entry() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six>=1.10\"]\n\n[project.optional-dependencies]\n\
+             a = [\"six==1.16.0\"]\nc = [\"six==1.16.0\"]\n"
+        );
+        let marker = "extra == 'a' or extra == 'c'";
+        let hosted = lock(&[six(None), six(Some(marker))], &[]);
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(&[spec(">=1.10", None), spec("==1.16.0", Some(marker))], &[])
+        );
+    }
+
+    /// #606 (e): marker-split specifiers in `dependencies`, in both of
+    /// uv's spellings of a `python_version` marker.
+    #[test]
+    fn marker_split_dependencies() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"idna==3.7\", \"six>=1.10; python_version < \\\"3.10\\\"\", \
+             \"six==1.16.0; python_version >= \\\"3.10\\\"\"]\n"
+        );
+        for (lt, ge) in [
+            ("python_full_version < '3.10'", "python_full_version >= '3.10'"),
+            ("python_version < '3.10'", "python_version >= '3.10'"),
+        ] {
+            let hosted = lock(&[six(Some(lt)), six(Some(ge))], &[]);
+            assert_eq!(
+                unwind(&pyproject, &hosted).unwrap(),
+                lock(&[spec(">=1.10", Some(lt)), spec("==1.16.0", Some(ge))], &[]),
+                "{lt} / {ge}"
+            );
+        }
+    }
+
+    /// uv rewrites `<=` / `>` / `==` on `python_version` into
+    /// `python_full_version` bounds.
+    #[test]
+    fn python_version_operators_match_uvs_rewrite() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six>=1.10; python_version <= '3.9'\", \
+             \"six==1.16.0; python_version > '3.9' and sys_platform == 'linux'\", \
+             \"six>=1.12; python_version == '3.12' and sys_platform != 'linux'\"]\n"
+        );
+        let le = "python_full_version < '3.10'";
+        let gt = "python_full_version >= '3.10' and sys_platform == 'linux'";
+        let eq = "python_full_version == '3.12.*' and sys_platform != 'linux'";
+        let hosted = lock(&[six(Some(le)), six(Some(gt)), six(Some(eq))], &[]);
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(
+                &[
+                    spec(">=1.10", Some(le)),
+                    spec("==1.16.0", Some(gt)),
+                    spec(">=1.12", Some(eq))
+                ],
+                &[]
+            )
+        );
+    }
+
+    /// A marker inside an extra lowers to `<marker> and extra == '<x>'`.
+    #[test]
+    fn marker_inside_an_extra() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six==1.16.0\"]\n\n[project.optional-dependencies]\n\
+             win = [\"six>=1.15; sys_platform == 'win32'\"]\n"
+        );
+        let marker = "sys_platform == 'win32' and extra == 'win'";
+        let hosted = lock(&[six(None), six(Some(marker))], &[]);
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(&[spec("==1.16.0", None), spec(">=1.15", Some(marker))], &[])
+        );
+    }
+
+    /// An entry no declaration lowers to is still refused.
+    #[test]
+    fn unmatched_marker_still_refuses() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six>=1.10; python_version < '3.10'\", \
+             \"six==1.16.0; python_version >= '3.10'\"]\n"
+        );
+        let hosted = lock(&[six(Some("sys_platform == 'linux'"))], &[]);
+        let err = unwind(&pyproject, &hosted).unwrap_err();
+        assert!(err.contains("different specifiers"), "{err}");
+    }
+
+    /// #473: a group reaching six through `include-group`.
+    #[test]
+    fn include_group_member() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"python-dateutil==2.8.2\"]\n\n[dependency-groups]\n\
+             test = [\"six==1.16.0\"]\ndev = [\"idna==3.7\", {{include-group = \"test\"}}]\n"
+        );
+        let idna = "{ name = \"idna\", specifier = \"==3.7\" }".to_string();
+        let dateutil = "{ name = \"python-dateutil\", specifier = \"==2.8.2\" }".to_string();
+        let hosted = lock(
+            &[dateutil.clone()],
+            &[
+                ("dev", vec![idna.clone(), six(None)]),
+                ("test", vec![six(None)]),
+            ],
+        );
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(
+                &[dateutil],
+                &[
+                    ("dev", vec![idna, spec("==1.16.0", None)]),
+                    ("test", vec![spec("==1.16.0", None)]),
+                ]
+            )
+        );
+    }
+
+    /// Nested and cyclic `include-group`s (uv rejects a cycle, but the
+    /// unwind must not loop on one) and PEP 735 group-name normalization.
+    #[test]
+    fn nested_and_cyclic_include_groups() {
+        let pyproject = format!(
+            "{HEAD}dependencies = []\n\n[dependency-groups]\n\
+             Unit_Tests = [\"six==1.16.0\", {{include-group = \"all\"}}]\n\
+             qa = [{{include-group = \"unit-tests\"}}]\n\
+             all = [{{include-group = \"qa\"}}]\n"
+        );
+        let hosted = lock(&[], &[("all", vec![six(None)]), ("qa", vec![six(None)])]);
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(
+                &[],
+                &[
+                    ("all", vec![spec("==1.16.0", None)]),
+                    ("qa", vec![spec("==1.16.0", None)]),
+                ]
+            )
+        );
+    }
+}
