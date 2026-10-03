@@ -663,7 +663,9 @@ fn existing_env_flow(mode: Mode) {
         "{what}: Hatch reinstalled; the premise no longer holds"
     );
 
-    // vex from the project root sees the Hatch env and attests nothing.
+    // vex from the project root sees the Hatch env: hosted attests
+    // nothing over it; vendored attests the committed artifact (its
+    // contract) but discloses the out-of-sync env with Hatch's remedy.
     let patch_api = vex_e2e_common::PatchApi::start(vec![(
         mode.uuid().to_string(),
         view(mode.uuid(), &pristine, &patched),
@@ -678,7 +680,23 @@ fn existing_env_flow(mode: Mode) {
         ..vex_e2e_common::VexRun::online(&patch_api)
     };
     let out = vex_e2e_common::run_vex(&vex_e2e_common::binary(), &project, &run);
-    vex_e2e_common::assert_absent(out.doc.as_ref(), PURL);
+    match mode {
+        Mode::Hosted => vex_e2e_common::assert_absent(out.doc.as_ref(), PURL),
+        Mode::Vendored => {
+            assert_attested(out.doc(), PURL, mode.uuid(), mode.marker(), VULNS);
+            let disclosed = out.envelope["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|w| {
+                    w["code"] == "vendored_tree_out_of_sync"
+                        && w["detail"]
+                            .as_str()
+                            .is_some_and(|d| d.contains("hatch env remove default"))
+                });
+            assert!(disclosed, "{what}: vendored_tree_out_of_sync with Hatch remedy: {out}");
+        }
+    }
     record(
         "hatch",
         &version,

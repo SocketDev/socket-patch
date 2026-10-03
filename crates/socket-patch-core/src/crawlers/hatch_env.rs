@@ -5,7 +5,7 @@
 //! a hash of the project root. Modelled on `hatch/env/virtual.py`,
 //! `hatch/cli/application.py::get_env_directory` and
 //! `hatch/utils/fs.py::Path.id`, unchanged in layout from Hatch 1.0 through
-//! 1.18:
+//! 1.18 except where noted:
 //!
 //! - env type directory: `[dirs.env] virtual` from Hatch's config file
 //!   (absolute, else relative to the project), else
@@ -16,6 +16,8 @@
 //!   lives exactly there;
 //! - when the env type directory is `~/.virtualenvs` or inside the project,
 //!   envs sit flat in it (`<dir>/<env name>`);
+//! - Hatch 1.0 - 1.2 keep every env at `<dir>/<project name>-<project
+//!   id>/<env name>`;
 //! - otherwise `<dir>/<project name>/<project id>/<env name>`, where the
 //!   project name is the PEP 503-normalized `[project] name` (or
 //!   `<id>-unmanaged` without a `[project]` table), the id is the first 8
@@ -115,6 +117,13 @@ pub(crate) async fn hatch_environments_with(
     let shared_flat = home_dir(var).is_some_and(|h| same_path(&env_dir, &h.join(".virtualenvs")));
 
     for id in project_ids(&root) {
+        // Hatch 1.0 - 1.2: `<dir>/<project name>-<id>/<env name>`, whatever
+        // the directory (no flat or unmanaged layouts yet).
+        if let Some(name) = &project_name {
+            for (dir_name, prefix) in subdirs(&env_dir.join(format!("{name}-{id}"))) {
+                push(env_name_for(&dir_name, name), prefix);
+            }
+        }
         let name = project_name
             .clone()
             .unwrap_or_else(|| format!("{id}-unmanaged"));
@@ -507,6 +516,31 @@ mod tests {
                     prefix: storage.join("test")
                 },
             ]
+        );
+    }
+
+    /// Hatch 1.0 - 1.2 (`hatch/env/virtual.py` there): `<name>-<id>`.
+    #[tokio::test]
+    async fn legacy_hatch_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("pyproject.toml"), PYPROJECT).unwrap();
+        let data = tmp.path().join("data");
+        let root = std::fs::canonicalize(&project).unwrap();
+        let id = project_ids(&root).pop().unwrap();
+        let prefix = data
+            .join("env/virtual")
+            .join(format!("my-app-core-{id}"))
+            .join("my-app-core");
+        make_venv(&prefix);
+        let var = env_of(&[("HATCH_DATA_DIR", data.display().to_string())]);
+        assert_eq!(
+            hatch_environments_with(&project, &var).await,
+            vec![HatchEnvironment {
+                name: "default".into(),
+                prefix
+            }]
         );
     }
 
