@@ -2451,6 +2451,38 @@ async fn scan_human_dry_run_previews_reapply_of_a_recorded_patch() {
     );
 }
 
+/// A report-only `scan --prune --dry-run` never applies, so it must not say that
+/// dropping `--dry-run` re-applies a recorded patch; it points at
+/// `socket-patch apply` instead.
+#[tokio::test]
+async fn scan_report_only_dry_run_points_recorded_patch_at_apply() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+    mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+    seed_manifest(tmp.path(), &[(purl, UUID)]);
+
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--prune", "--dry-run"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.contains(&format!("[skip] {purl} (already recorded: 11111111)")),
+        "{stdout:?}"
+    );
+    assert!(
+        !stdout.contains("a run without --dry-run re-applies them"),
+        "{stdout:?}"
+    );
+    assert!(!stdout.contains("[re-apply]"), "{stdout:?}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/minimist/index.js")).unwrap(),
+        b"x\n"
+    );
+}
+
 /// The human table's PACKAGE column grows to fit the PURL (a fixed-width
 /// cut would drop the version), and the rule matches the table.
 #[tokio::test]

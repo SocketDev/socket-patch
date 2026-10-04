@@ -2771,7 +2771,7 @@ async fn run_scan(
                 }
             } else if already_recorded.is_empty() {
                 println!("No patches selected.");
-            } else if args.common.dry_run {
+            } else if args.common.dry_run && !report_only {
                 println!("{}", render::ALL_ALREADY_RECORDED_DRY_RUN);
             } else {
                 println!("{}", render::ALL_ALREADY_RECORDED);

@@ -315,7 +315,9 @@ pub(super) fn already_recorded_line(purl: &str, uuid: &str, reapply: bool) -> St
 pub(super) const ALL_ALREADY_RECORDED: &str =
     "All selected patches are already recorded in the manifest; run `socket-patch apply` to re-apply them.";
 
-/// [`ALL_ALREADY_RECORDED`] for an agent-mode `--dry-run`.
+/// [`ALL_ALREADY_RECORDED`] for an agent-mode `--dry-run`. A report-only
+/// dry run keeps [`ALL_ALREADY_RECORDED`]: dropping `--dry-run` there still
+/// only reports.
 pub(super) const ALL_ALREADY_RECORDED_DRY_RUN: &str =
     "All selected patches are already recorded in the manifest; a run without --dry-run re-applies them.";
 
