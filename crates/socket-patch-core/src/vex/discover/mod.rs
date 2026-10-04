@@ -3199,15 +3199,13 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        for (purl, uuid, rel) in [("pkg:pypi/six@1.16.0", UUID_B, wheel.as_str())] {
-            let r = out
-                .refs
-                .iter()
-                .find(|r| r.purl == purl && r.uuid == uuid)
-                .unwrap_or_else(|| panic!("{purl} missing: {:#?}", out.refs));
-            assert_eq!(r.mode, WiringMode::Vendored);
-            assert_eq!(r.artifact_rel.as_deref(), Some(rel));
-        }
+        let six = out
+            .refs
+            .iter()
+            .find(|r| r.purl == "pkg:pypi/six@1.16.0" && r.uuid == UUID_B)
+            .unwrap_or_else(|| panic!("six missing: {:#?}", out.refs));
+        assert_eq!(six.mode, WiringMode::Vendored);
+        assert_eq!(six.artifact_rel.as_deref(), Some(wheel.as_str()));
         assert!(out.refs.iter().any(|r| r.mode == WiringMode::Hosted));
     }
 
