@@ -608,6 +608,7 @@ async fn pipenv_stale_install_warning(
     purl: &str,
     record: &PatchRecord,
     listings: &InstalledSiteListings,
+    lock: &serde_json::Value,
 ) -> Option<VendorWarning> {
     use crate::crawlers::python_crawler::{find_local_venv_site_packages, PythonCrawler};
     use crate::patch::apply::{verify_file_patch, VerifyStatus};
@@ -657,10 +658,11 @@ async fn pipenv_stale_install_warning(
         .map(|d| d.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    let remedy = super::pypi_pipenv::stale_install_remedy(Some(lock), &name);
     Some(VendorWarning::new(
         "pypi_pipenv_stale_install",
         format!(
-            "{purl}: the UNPATCHED upstream release is still installed in {listed}. Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired Pipfile.lock only protects fresh installs. Reinstall it from the lock without touching the Pipfile: `pipenv run pip uninstall -y {name} && pipenv sync` (`pipenv install --deploy` before Pipenv 2018), or `pipenv --rm && pipenv sync` for a clean virtualenv — NOT `pipenv uninstall`, which rewrites the Pipfile and re-locks the patch away; then `socket-patch vex` re-verifies the installed files."
+            "{purl}: the UNPATCHED upstream release is still installed in {listed}. Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired Pipfile.lock only protects fresh installs. {remedy}; then `socket-patch vex` re-verifies the installed files."
         ),
     ))
 }
@@ -878,8 +880,14 @@ async fn pypi_prelude<'p>(
             }
             // Both a fresh vendor and a re-run over an already-wired lock
             // keep warning while the venv still holds the upstream release.
-            if let Some(stale) =
-                pipenv_stale_install_warning(project_root, purl, record, installed_sites).await
+            if let Some(stale) = pipenv_stale_install_warning(
+                project_root,
+                purl,
+                record,
+                installed_sites,
+                &project.lock,
+            )
+            .await
             {
                 warnings.push(stale);
             }
@@ -2273,6 +2281,43 @@ mod tests {
             blobs,
             record,
         }
+    }
+
+    /// #790: the vendored stale-install remedy re-syncs the lock category
+    /// that pins the package. Plain `pipenv sync` installs only `default`,
+    /// so for a `[dev-packages]` entry it uninstalled the package and left
+    /// it uninstalled.
+    #[tokio::test]
+    async fn pipenv_stale_install_remedy_names_the_develop_category() {
+        let fx = e2e_fixture().await;
+        let lock: serde_json::Value = serde_json::from_str(
+            r#"{"_meta": {"pipfile-spec": 6}, "default": {}, "develop": {"six": {"version": "==1.16.0"}}}"#,
+        )
+        .unwrap();
+        let warning = pipenv_stale_install_warning(
+            &fx.root,
+            "pkg:pypi/six@1.16.0",
+            &fx.record,
+            &InstalledSiteListings::default(),
+            &lock,
+        )
+        .await
+        .expect("the upstream six.py is installed");
+        assert_eq!(warning.code, "pypi_pipenv_stale_install");
+        assert!(
+            warning
+                .detail
+                .contains("`pipenv run pip uninstall -y six && pipenv sync --dev`"),
+            "{}",
+            warning.detail
+        );
+        assert!(
+            warning
+                .detail
+                .contains("`pipenv --rm && pipenv sync --dev` for a clean virtualenv"),
+            "{}",
+            warning.detail
+        );
     }
 
     #[tokio::test]
