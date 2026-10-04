@@ -51,7 +51,8 @@ npm 12 notes:
   both present, npm 12 installs from package-lock.json while npm <= 11 installs
   from the shrinkwrap — so hosted and vendored rewrites wire BOTH, and
   manifest-less VEX refuses to attest a package one lock wires while the other
-  still resolves it from the registry (`patched_ref_unattributable`).
+  still resolves it from the registry or has no entry for it at all, which npm
+  re-resolves from the registry (`patched_ref_unattributable`).
 - `allow-file` defaults to `all`: vendored `file:` tarballs install unchanged.
 
 ## Suites

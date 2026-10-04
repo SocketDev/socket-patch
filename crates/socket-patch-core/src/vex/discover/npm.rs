@@ -72,13 +72,35 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 }
 
 /// What one parsed npm lock wires, plus the packages it resolves ELSEWHERE
-/// (an entry whose `resolved` is not a Socket reference) and the packages it
-/// installs BUNDLED (purl → the first bundled entry's lock location).
+/// (an entry whose `resolved` is not a Socket reference), the packages it
+/// installs BUNDLED (purl → the first bundled entry's lock location) and
+/// every package NAME it has any entry for ([`purl_name`] keys).
 struct NpmLockRefs {
     file: &'static str,
     refs: Vec<PatchedRef>,
     unwired: BTreeSet<String>,
     bundled: BTreeMap<String, String>,
+    names: BTreeSet<String>,
+}
+
+impl NpmLockRefs {
+    /// Remember that this lock has an entry named `name` (any version).
+    fn mention(&mut self, name: &str) {
+        if let Some(purl) = npm_purl(name, "0") {
+            self.names.insert(purl_name(&purl).to_string());
+        }
+    }
+
+    /// Whether this lock has any entry for the package `purl` names.
+    fn mentions(&self, purl: &str) -> bool {
+        self.names.contains(purl_name(purl))
+    }
+}
+
+/// An npm purl without its `@version` (the version never holds an `@`; a
+/// scope's `@` comes before it).
+fn purl_name(purl: &str) -> &str {
+    purl.rsplit_once('@').map_or(purl, |(name, _)| name)
 }
 
 /// Push every ref no OTHER npm lock contests. npm <= 11 installs from
@@ -89,9 +111,13 @@ struct NpmLockRefs {
 /// patched by some npm majors and unpatched by others — not decidable from
 /// the files, so it is diagnosed and not attested (the same call as the v2
 /// legacy mirror: a lock section some npm reads must not attest bytes
-/// another npm installs). The lock that does not mention the package at all
-/// contests nothing. Two locks wiring DIFFERENT patches are both emitted
-/// (the CLI's `wiring_conflict` gate).
+/// another npm installs). A lock with NO entry for the package contests it
+/// too (#798): npm re-resolves the missing entry from the registry (npm 12
+/// with a stale package-lock.json twin, npm <= 11 with a stale shrinkwrap).
+/// A lock holding the package only at another version contests nothing:
+/// it installs that version, not unpatched bytes of the wired one. Two
+/// locks wiring DIFFERENT patches are both emitted (the CLI's
+/// `wiring_conflict` gate).
 ///
 /// A bundled copy of the ref's `name@version` in either lock contests it
 /// too, the same lock included (#325): the rewired entry and the bundled
@@ -140,6 +166,25 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
                         lock.file, r.purl, r.uuid, other.file, NPM_LOCKS[0], NPM_LOCKS[1],
                     ),
                 );
+            } else if let Some(other) = locks
+                .iter()
+                .enumerate()
+                .find(|(j, other)| *j != i && !other.mentions(&r.purl))
+                .map(|(_, other)| other)
+            {
+                out.diag(
+                    DIAG_REF_UNATTRIBUTABLE,
+                    lock.file,
+                    format!(
+                        "{}: {} is wired to Socket patch {} but {} has no entry for the \
+                         package, so npm re-resolves it from the registry when it installs \
+                         from that lock — npm <= 11 installs from {}, npm >= 12 from {}, so \
+                         whether the patched bytes install depends on the npm version; \
+                         rewire both locks (re-run `socket-patch vendor` / `scan --mode \
+                         hosted`) to attest it",
+                        lock.file, r.purl, r.uuid, other.file, NPM_LOCKS[0], NPM_LOCKS[1],
+                    ),
+                );
             } else {
                 out.push(r.clone());
             }
@@ -161,6 +206,7 @@ async fn extract_package_lock(
         refs: Vec::new(),
         unwired: BTreeSet::new(),
         bundled: BTreeMap::new(),
+        names: BTreeSet::new(),
     };
     let doc: Value = match parse_json(file, &bytes) {
         Ok(doc) => doc,
@@ -184,6 +230,7 @@ async fn extract_package_lock(
     // the same version, here ([`push_uncontested`]) and in any other lock
     // (the orchestrator).
     for (location, node) in npm_lock_bundled_nodes(&doc) {
+        read.mention(node.name);
         if let Some(purl) = node.version.and_then(|v| npm_purl(node.name, v)) {
             out.resolved_elsewhere(file, Some(purl.clone()));
             read.bundled.entry(purl).or_insert(location);
@@ -232,6 +279,7 @@ fn drop_non_registry_installs(
         else {
             continue;
         };
+        read.mention(name);
         out.resolved_elsewhere(file, Some(purl.clone()));
         read.unwired.insert(purl.clone());
         unpatched.push((purl, key, reason));
@@ -264,6 +312,7 @@ fn entry_ref(
     out: &mut Discovery,
 ) {
     let name = node.name;
+    read.mention(name);
     let resolved = node.resolved;
     let Located {
         vendored,
@@ -839,7 +888,7 @@ mod tests {
 
     /// The agreeing dual-lock state (both locks wired identically — what the
     /// hosted rewriter and the vendor backend now write) is a ref from each
-    /// lock; a lock that does not mention the package contests nothing.
+    /// lock.
     #[tokio::test]
     async fn agreeing_dual_npm_locks_both_wire_the_patch() {
         let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
@@ -855,6 +904,90 @@ mod tests {
             .refs
             .iter()
             .all(|r| r.purl == "pkg:npm/left-pad@1.3.0" && r.uuid == UUID_A));
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    /// REGRESSION (#798): a twin npm lock with NO entry for the package
+    /// contests it too. npm 12 reads package-lock.json beside a committed
+    /// shrinkwrap and re-resolves the missing entry from the registry, so
+    /// the bytes it installs are unpatched, in either direction, hosted or
+    /// vendored. The uuids stay recognized (a ledger claim is dead too).
+    #[tokio::test]
+    async fn a_sibling_npm_lock_without_the_package_contests_it() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/minimist-1.2.5.tgz");
+        let registry = |n: &str, v: &str| format!("https://registry.npmjs.org/{n}/-/{n}-{v}.tgz");
+        let p = Project::new();
+        // Shrinkwrap wires left-pad (hosted); package-lock has no left-pad.
+        // package-lock wires minimist (vendored); shrinkwrap has no minimist.
+        p.write(
+            "npm-shrinkwrap.json",
+            lock_with_packages(serde_json::json!({
+                "node_modules/left-pad": { "version": "1.3.0", "resolved": hosted, "integrity": SRI },
+                "node_modules/other": { "version": "1.0.0", "resolved": registry("other", "1.0.0"), "integrity": SRI },
+            })),
+        );
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({
+                "node_modules/minimist": { "version": "1.2.5", "resolved": vendored, "integrity": SRI },
+            })),
+        );
+        let out = run(&p).await;
+        assert!(
+            out.refs.is_empty(),
+            "contested refs emitted: {:#?}",
+            out.refs
+        );
+        let contested: Vec<&Diag> = out
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == DIAG_REF_UNATTRIBUTABLE)
+            .collect();
+        assert_eq!(contested.len(), 2, "{:#?}", out.diagnostics);
+        assert!(contested
+            .iter()
+            .any(|d| d.file == std::path::Path::new("npm-shrinkwrap.json")
+                && d.detail.contains("pkg:npm/left-pad@1.3.0")
+                && d.detail.contains("no entry")
+                && d.detail.contains("npm >= 12")));
+        assert!(contested
+            .iter()
+            .any(|d| d.file == std::path::Path::new("package-lock.json")
+                && d.detail.contains("pkg:npm/minimist@1.2.5")
+                && d.detail.contains("no entry")));
+        for (label, uuid) in [("UUID_A", UUID_A), ("UUID_B", UUID_B)] {
+            assert!(
+                out.recognized.iter().any(|r| r.uuid == uuid),
+                "{label} must stay recognized (authoritative, dead): {:#?}",
+                out.recognized
+            );
+        }
+    }
+
+    /// A twin lock that holds the package only at ANOTHER version installs
+    /// that version, not an unpatched copy of the wired one, so it contests
+    /// nothing (#798 is about a missing entry, not a different version). A
+    /// bundled or aliased entry of the name counts as mentioning it.
+    #[tokio::test]
+    async fn a_sibling_npm_lock_with_another_version_contests_nothing() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let registry = |n: &str, v: &str| format!("https://registry.npmjs.org/{n}/-/{n}-{v}.tgz");
+        let p = Project::new();
+        p.write(
+            "npm-shrinkwrap.json",
+            lock_with_packages(serde_json::json!({
+                "node_modules/left-pad": { "version": "1.3.0", "resolved": hosted, "integrity": SRI },
+            })),
+        );
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({
+                "node_modules/left-pad": { "version": "1.2.0", "resolved": registry("left-pad", "1.2.0"), "integrity": SRI },
+            })),
+        );
+        let out = run(&p).await;
+        assert_eq!(out.refs.len(), 1, "{:#?}", out.diagnostics);
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 

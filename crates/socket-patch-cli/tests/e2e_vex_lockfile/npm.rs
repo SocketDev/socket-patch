@@ -361,6 +361,40 @@ fn dual_lock_with_one_lock_on_the_registry_attests_nothing() {
     }
 }
 
+/// REGRESSION (#798): the same holds when the other lock has NO entry for
+/// the package (a stale twin an npm <= 11 teammate left behind): npm
+/// re-resolves the missing entry from the registry, so whichever npm major
+/// reads that lock installs unpatched bytes. Nothing attests.
+#[test]
+fn dual_lock_with_one_lock_missing_the_package_attests_nothing() {
+    let api = api_for(UUID, PURL);
+    let stale = json!({
+        "name": "app", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
+        "packages": { "": { "name": "app", "version": "1.0.0" } },
+    });
+    for wired in [
+        hosted_url("patch.socket.dev", UUID),
+        format!("file:{}", vendored_rel(UUID)),
+    ] {
+        for stale_file in ["package-lock.json", "npm-shrinkwrap.json"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let p = tmp.path();
+            write_locks(p, Shape::Dual, &wired, PIN);
+            std::fs::write(p.join(stale_file), stale.to_string()).unwrap();
+            write_artifact(p, UUID, PATCHED);
+            let out = run_vex(&binary(), p, &VexRun::online(&api));
+            assert_ne!(out.code, Some(0), "{stale_file} {wired}:\n{out}");
+            assert_absent(out.doc.as_ref(), PURL);
+            let text = out.stdout.clone() + &out.stderr;
+            assert!(
+                text.contains("patched_ref_unattributable")
+                    && text.contains("has no entry for the package"),
+                "the contested wiring must be explained:\n{out}"
+            );
+        }
+    }
+}
+
 /// Standalone `vex` over a manifest-less checkout honors the output
 /// conventions every `vex` run does: `-O -` prints the document to stdout
 /// (never a file named `-`) with the summary on stderr, and `--dry-run`
