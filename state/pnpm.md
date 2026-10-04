@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-03 (run 14), main `045d7ec`, latest release 4.0.0.
+Last updated: 2026-10-04 (run 15), main `045d7ec`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, package grant, hosted tarball, `/registry/<name>/<ver>` mirror). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -126,6 +126,21 @@ Run 14 additions (main `045d7ec`, Linux, Rush 5.180.0):
 | 11.28.3 | fail #713 (`ERR_PNPM_TARBALL_URL_MISMATCH`; env trust → upstream) | untested / fail #714 | pass | untested | untested | fail (upstream pnpm, in #713) |
 | 12.8.1 | fail #713 (`ERR_PNPM_TARBALL_URL_MISMATCH`; env trust → pass) | untested | untested | pass / pass (byte-exact, scaffold deleted) | pass | pass |
 
+Run 15 additions (main `045d7ec`, Linux):
+
+| pnpm | `pnpm add <pkg>` after hosted / vendored scaffold | Hosted `remove` 1 of 2 → last (byte-exact) | Vendored `remove` 1 of 2 → last | `repair` agent (file mode) / vendored | Hosted pin survives `pnpm add` / `dedupe` | `pnpm fetch` → `install --offline` (lock + workspace file) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 7.33.7 (5.4) | n/a (no scaffold) | pass | untested | untested | untested | untested |
+| 8.15.9 (6.0) | n/a (no scaffold) | pass | untested | untested | pass / dropped (re-resolve) | untested |
+| 9.0.0 / 9.7.1 | fail #734 / untested | untested | untested | untested | untested | untested |
+| 9.15.9 | fail #734 / fail #734 | untested | pass | untested / pass | fail #734 / dropped | pass |
+| 10.0.0 – 10.4.1 | fail #734 (vendored 10.0.0 too) | untested | untested | untested | untested | untested |
+| 10.5.0 – 10.34.5 | pass | untested | untested | untested | pass / dropped | pass |
+| 11.0.0 / 11.28.3 | pass (but the pin drops: upstream pnpm 11, see #713) | untested | untested | untested | dropped / dropped | pass (lock-only fetch: loud `TARBALL_URL_MISMATCH`) |
+| 12.8.1 | pass | pass (two-doc lock) | pass | pass / pass | pass / dropped | pass (lock-only: same) |
+
+#734 isn't a regression: release 4.0.0 writes the same scaffold.
+
 Default isolated linker + alias: pass on 7.33.7 / 9.15.9 / 10.34.5 / 11.28.3 / 12.8.1 (one shared `.pnpm` copy).
 
 #492 also reproduces on pnpm 7.33.7 (there's no root lock at all, only `redirect_pnpm_no_lockfile`).
@@ -151,11 +166,11 @@ Global mode (`-g`, v5 main `2463257`):
 1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3 and 10, and was denied by the permission policy in runs 2, 5–9 and 11–14, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
 2. #696 / #661 follow-ups: `modulesDir` in the global `config.yaml` / `rc`, and `modulesDir` + `virtualStoreDir` together. When fixed, check that GVS and out-of-project `virtualStoreDir` transitive deps also stop attesting.
 3. #636 follow-ups: a hosted → vendored takeover with several packages, then revert, and a user-created `pnpm` table with several vendored packages.
-4. Hosted `remove` on legacy locks (5.4 / 6.0), on a two-document lock (pnpm 12 `packageManager`), and vendored `remove`.
+4. Vendored `remove` on legacy 5.4 / 6.0 locks; workspace-sensitive pnpm commands under the #734 scaffold on 9.x (`pnpm link`, `publish`, `-r`). Hosted remove on legacy and two-doc locks passed in run 15.
 5. #362 GVS transitive and #435 global `-g`: re-check exit codes under #555's skip semantics on 11.28.3 / 12.8.1.
 6. `package-import-method=clone` on reflink (needs CI).
 7. #556 follow-ups: merging branch lockfiles after a hosted pin, and agent `vex` on the branch.
-8. Re-verify #360, #362, #435, #466, #492, #556, #557, #590 (PR #598), #601 (PR #605), #626 (PR #634), #633, #636, #661 / #696 (PR #698), #713 and #714 when fixes land.
+8. Re-verify #360, #362, #435, #466, #492, #556, #557, #590 (PR #598), #601 (PR #605), #626 (PR #634), #633, #636, #661 / #696 (PR #698), #713, #714 and #734 when fixes land.
 9. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout).
 
 ## Known non-bugs
@@ -196,3 +211,6 @@ Global mode (`-g`, v5 main `2463257`):
 - Rush has no root `package.json`, so `vex` needs `--product` there (`product_undetected`), like `-g`.
 - pnpm 12.0.0 doesn't run under Rush 5.180 (it rejects Rush's `--no-prefer-frozen-lockfile`). Rush subspace fixtures need `common/config/subspaces/<name>/` folders created and `common/config/rush/.pnpmfile.cjs` removed before `rush update`.
 - pnpm 11.28.3 `pnpm install --no-prefer-frozen-lockfile` re-resolves hosted pins to upstream even with `trustLockfile: true` (9 / 10 / 12 keep them). That's upstream pnpm behaviour; the default `pnpm install` and `--frozen-lockfile` keep the pin. It's tracked inside #713 because Rush uses that flag by default.
+- `pnpm dedupe` re-resolves and drops hosted pins on every pnpm version (like `pnpm update`). pnpm 11.0.0 / 11.28.3 `pnpm add <other>` also drops them (9 / 10 / 12 keep them). That's upstream pnpm 11 re-resolution, tracked with #713.
+- `repair` in the default diff mode needs `/v0/orgs/<org>/patches/diff/<uuid>` archives. A mock without them gives `download_failed`; use `--download-mode file` with a blob route.
+- pnpm 11 / 12 `pnpm fetch` with only `pnpm-lock.yaml` copied (no `pnpm-workspace.yaml`) fails loudly with `ERR_PNPM_TARBALL_URL_MISMATCH`. Commit and copy the trust config, as documented.
