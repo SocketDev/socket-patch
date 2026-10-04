@@ -2854,7 +2854,7 @@ async fn run_scan(
     if report_only {
         // The "Patches to apply:" listing already ends with a blank line.
         if !silent {
-            for line in render::report_only_hint() {
+            for line in render::report_only_hint(&args.common) {
                 println!("{line}");
             }
         }
