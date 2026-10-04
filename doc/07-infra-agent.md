@@ -2,7 +2,7 @@
 
 ## Part 7: Core infrastructure and agent (in-place) mode
 
-_Last checked against main @ 045d7ec on 2026-10-03 by audit-core. Owner: audit-core._ Only the timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing, UUID, env/home-dir and atomic-write passages have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ 045d7ec on 2026-10-04 by audit-core. Owner: audit-core._ Only the timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing, UUID, env/home-dir, atomic-write, purl and dead-code passages have been re-checked; the rest is as of `2463257`.
 
 > Scope: `api/*`, `manifest/*`, `ledgers.rs`, `constants.rs`, `patch/` (excluding `redirect/`), `policy/*`, `rollout*`, `update/*`, the CLI `update_notifier.rs`/`update.rs`, `telemetry.rs`, and the generic `utils/*` and `hash/*`.
 
@@ -66,7 +66,7 @@ The vendor policy also has three separate hand-written retry loops, plus a first
   - The 64-hex validator exists three times: `apply::is_valid_blob_hash`, `client::is_valid_sha256_hex` and `digest::is_hex(s, 64)`.
 - **UUID checks:** five grammars. `client.rs` has one, with a near byte-identical copy in CLI `lib.rs`; `path_safety.rs` accepts lowercase only; `apply.rs` accepts any alphanumeric plus `-` and `_`; `utils/python_script.rs` uses `uuid::Uuid::parse_str`, which also takes simple, braced and `urn:uuid:` forms. {{C18}}
 - **Line endings:** `utils/line_endings.rs` has 7 users, but `python_lock`, `vendor/common::detect_eol` (which contradicts `LineEndings::Mixed`), `redirect::crlf_to_lf` and `poetry_lock` each implement their own rules.
-- **Purls:** `utils/purl.rs` has two builder families (unvalidated `build_*` and validated `*_purl`). `vex/product.rs` hand-rolls a third. 48 production `format!("pkg:…")` sites and 58 `starts_with("pkg:<type>/")` checks bypass `Ecosystem::from_purl`.
+- **Purls:** `utils/purl.rs` has two builder families (7 unvalidated `build_*` with 21 production callers, and the validated `*_purl`). `vex/product.rs` hand-rolls a third. 42 production `format!("pkg:…")` sites outside `utils/purl.rs` and 24 `starts_with("pkg:<type>/")` checks outside `Ecosystem::from_purl` (counted at `045d7ec`, production code only). The type checks agree today, but the builders already disagree on canonicalization (PyPI names and composer case). {{C20}}
 - **Env truthiness:** three vocabularies, plus a fourth rule in `update_notifier::in_ci`. {{C19}}
   - `"1"|"true"` in `env_compat.rs` (`SOCKET_DEBUG`, `SOCKET_OFFLINE`);
   - `"1"|"true"` separately in `telemetry.rs`;
@@ -115,13 +115,13 @@ Maven sidecars are not handled at all. This code exists only for in-place mode.
 
 **`apply.lock`** is 554 production lines. Most of that complexity comes from *deleting* the lock file on exit: unlinking while it is held, identity checks, Windows delete-pending handling. Lock acquisition also replays the vendored group-commit journal, which couples vendored crash recovery into every command's lock. Leaving a gitignored lock file on disk (the convention every package manager uses) would cut about 150 lines.
 
-**Dead path (verified):** `PatchSources::mem_blobs` is never `Some` in production, but its doc still says vendor flows stage content there.
+**Dead path (verified):** `PatchSources::mem_blobs` is never `Some` in production, but its doc still says vendor flows stage content there. {{C23}}
 
 ### 7.5 Features with questionable value
 
 | Feature | Prod / tests | Verdict |
 |---|---|---|
-| **Self-update + passive notifier** | 2,351 / 5,689 | Only `Standalone` installs self-update; npm, cargo and brew are redirected to their own tools. Still detects `Pypi` and `LauncherCache` channels that v5 no longer publishes. Two metadata strategies, a separate lock, and its own stage writer. **Keep the notifier; replace `--update` with "re-run install.sh"** (or keep a much thinner swap). Up to −1K production and −3K test lines. |
+| **Self-update + passive notifier** | 2,351 / 5,689 | Only `Standalone` installs self-update; npm, cargo and brew are redirected to their own tools. Still detects the pre-v5 `Pypi` and `LauncherCache` channels, which is a live refusal for old installs, not dead code. Two metadata strategies, a separate lock, and its own stage writer. **Keep the notifier; replace `--update` with "re-run install.sh"** (or keep a much thinner swap). Up to −1K production and −3K test lines. |
 | **Telemetry** | 891 / 864 | 17 near-identical `track_*` wrappers (~450 lines); a new HTTP client per event; endpoint logic duplicated; the CLI threads token/org through 125 signature sites. **Collapse to one `track(Event)` with a shared client** (~−300). |
 | **Failpoints** | 65 | Fine (compiled out of release). But `switched_off("group_commit")` keeps the *old non-group-commit path* alive as a test oracle. |
 | **group_commit + durability** | 1,376 / 1,287 | A process-wide virtual filesystem: every `utils::fs` read and write consults it. It renders typed values lazily via `Any`, does three-way hand-edit reconciliation in `recover`, and still journals `redirect-state.json`, which nothing writes. Writes that bypass `utils::fs` are silently not captured. High-cost machinery for a vendored-run speedup; see 5.7 for the root-cause fix. |
@@ -134,7 +134,7 @@ Maven sidecars are not handled at all. This code exists only for in-place mode.
 
 1. **Make `file` the default download mode** and delete the diff machinery: −600 production, −1K tests, −1 dependency. Low risk.
 2. **One retry and timeout primitive** across every HTTP path, so the JSON and blob paths get timeouts: −200 production. **Fixes possible indefinite hangs.** Medium risk, because tests pin the current semantics.
-3. **Delete the verified dead and legacy code:** `mem_blobs`, `save_redirect_state` and its group-commit `LEDGERS` entry, the `Pypi`/`LauncherCache` update channels, and the `switched_off("group_commit")` oracle path. −150 production, −300 tests.
+3. **Delete the verified dead and legacy code:** `mem_blobs`, the always-true `VendorSource` predicates, the `redirect-state.json` group-commit `LEDGERS` entry, and the `switched_off("group_commit")` oracle path. About −60 production, −350 tests. {{C23}} (The `Pypi`/`LauncherCache` update channels are *not* dead: they make `--update` refuse to swap a pre-v5 pip/gem-owned binary and print a migration hint.)
 4. **Fold rollback into the apply engine** (swap hashes, keep a delete branch for created files): −300 production.
 5. **One telemetry `track(Event)`** with a shared client: −300.
 6. **One validated purl builder family**, and `Ecosystem::from_purl` for type checks: −250.

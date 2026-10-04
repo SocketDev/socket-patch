@@ -100,7 +100,7 @@
 | `--help` | 150–219 lines per subcommand; `list --help` lists 27 options, most of which do nothing for `list` |
 | CI per push | ~516 jobs; the CI workflow alone is 237 jobs and 348 runner-minutes; Windows `test` is the 28-minute critical path |
 | `CLI_CONTRACT.md` | 343 KB; the longest *line* is 10,530 characters (at `045d7ec`, 2026-10-03; 332 KB / 9,320 at the snapshot) |
-| Open issues | 176 on 2026-10-03 (166 labelled `bug`). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
+| Open issues | 250 on 2026-10-04 (222 labelled `bug`, 43 `arch-audit`; main still at `045d7ec`, so the code numbers above stand). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
 | PR size | Recent squash merges of +53K, +85K and +94K lines |
 
 ---
@@ -230,7 +230,7 @@ Several patterns show code that outlived its purpose:
 - **Parity suites** that exist only because two orchestrators exist.
 - **Covgap tests:** 402 tests (26.9K lines), 136 of them asserting human text.
 - **Exact-sentence assertions:** 328 of them. The output-polish PR touched 65 test files.
-- **Dead flags and vestigial abstractions:** `--vendor-source` (one valid value), `VendorSource`/`PackageSource` (one variant each), `PatchSources::mem_blobs` (never `Some`), `lock_inventory/wired.rs` (no production caller), pre-v5 redirect-ledger readers.
+- **Dead flags and vestigial abstractions:** `--vendor-source` (one valid value), `VendorSource`/`PackageSource` (one variant each), `PatchSources::mem_blobs` (never `Some`; {{C23}}), `lock_inventory/wired.rs` (no production caller), pre-v5 redirect-ledger readers.
 - **History in reference docs:** 177 `v5.0` annotations in the contract.
 - **Very large squash merges:** +53K, +85K and +94K lines.
 
@@ -258,8 +258,8 @@ Several patterns show code that outlived its purpose:
 | 8 | S | **One JSON envelope and error shape** (`scan`/`get`/`rollback` still emit an untyped `error`: a bare string on some paths, a `{code, message}` object on others; {{C14}}); **a typed code registry** (`enum Reason × Ecosystem`) that generates the contract's code tables, with a freshness test. | 0.3–0.6K prod; fixes ~65 undocumented and 1 phantom code | L-M (MAJOR) | Parts 2, 8 | {{C13,C14}} |
 | 9 | C | **Support tiers** (§5): `bun.lockb` write support → refuse with remedy; vendored pnpm 7/8 → refuse (or a dialect of v9); vlt pre-1.0 encodings; Maven single-POM backend merged into `jvm/`. | 5–8K prod, 8–12K test | M (product) | Parts 4, 5 | {{E26,E47}} |
 | 10 | C | **`--download-mode` default `file`**: `diff` re-downloads every blob anyway on a cold cache (`fetch_stage.rs:377`); delete the diff machinery and `qbsdiff`. | 0.6K prod, 1K test, −1 dep | L | Part 7 | {{C25}} |
-| 11 | C | **Delete verified dead/vestigial code:** `--vendor-source`, `VendorSource`, `PackageSource`, `vend_installed!`, `mem_blobs`, `lock_inventory/wired.rs`, dead vlt ledger helpers, `save_redirect_state` + its group-commit entry, `Pypi`/`LauncherCache` update channels, the empty Deno extractor, the `switched_off("group_commit")` oracle path. | ~1K prod, ~1K test | L | Parts 4–7 | {{E28,E41,C23}} |
-| 12 | M | **Utility consolidation:** one HTTP retry/timeout primitive; one validated purl builder family (78 hand-built `format!("pkg:…")`, 58 prefix checks); one digest/SRI helper set (fixing the `sha256_hex` name collision: one copy validates, three compute); one line-ending policy; one env-truthiness vocabulary (there are three); one UUID grammar (there are four). | 1–1.5K prod | L | Parts 4, 7 | {{C15,C17,C18,C19,C20,E16}} |
+| 11 | C | **Delete verified dead/vestigial code:** `--vendor-source`, `VendorSource`, `PackageSource`, `vend_installed!`, `mem_blobs`, `lock_inventory/wired.rs`, dead vlt ledger helpers, `save_redirect_state` + its group-commit entry, the empty Deno extractor, the `switched_off("group_commit")` oracle path. | ~1K prod, ~1K test | L | Parts 4–7 | {{E28,E41,C23}} |
+| 12 | M | **Utility consolidation:** one HTTP retry/timeout primitive; one validated purl builder family (42 hand-built `format!("pkg:…")` and 24 prefix checks in production code); one digest/SRI helper set (fixing the `sha256_hex` name collision: one copy validates, three compute); one line-ending policy; one env-truthiness vocabulary (there are three); one UUID grammar (there are four). | 1–1.5K prod | L | Parts 4, 7 | {{C15,C17,C18,C19,C20,E16}} |
 | 13 | C | **Embedded `--vex`** (15 flag instances on 3 commands, ~600 lines of glue, plus bypass sets that couple VEX correctness to each caller) → `fix && vex -O`. | 0.6K prod | L (MAJOR) | Parts 2, 6 | {{E42,C35}} |
 | 14 | S | **Simplify per-package-manager auto-config:** npm `allow-remote` (re-implements npm's `ini` and config layering, ~900 lines), pnpm `trustLockfile` (~450; three open corruption bugs), the vlt warm-tree heal (installed-tree surgery in a lockfile-only mode), parallel rewriter groups (benchmark them or drop them). | 1–1.5K prod | M | Part 3 | {{E34}} |
 | 15 | C | **Self-update:** keep the notifier; replace the binary swap with "re-run install.sh" (only the standalone channel can self-update). **Telemetry:** one `track(Event)` + a shared client instead of 17 wrappers and 125 token/org plumbing sites. | 1.3–2.3K prod, 3K+ test | L-M (product) | Parts 2, 7 | {{C22,C36}} |

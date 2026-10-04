@@ -2,7 +2,7 @@
 
 ## Part 2: CLI command layer and user experience
 
-_Last checked against main @ 045d7ec on 2026-10-03 by audit-core. Owner: audit-core._
+_Last checked against main @ 045d7ec on 2026-10-04 by audit-core. Owner: audit-core._
 
 > Scope: `crates/socket-patch-cli/src/` — `args.rs`, `lib.rs`/`main.rs`, `ecosystem_dispatch.rs`, `json_envelope.rs`, `ui/*`, `update_notifier.rs`, and every `commands/*` module.
 
@@ -176,6 +176,8 @@ That is **7 verbs instead of 9 visible + 2 hidden + 2 aliases + 3 hidden flag sp
 ### New findings since the review
 
 - {{C39}} The stale-token fallback is wider than get's search gap: `apply`, `rollback` and `repair` blob/diff downloads and `vendor` eject view fetches never fall back, although `CLI_CONTRACT.md` promises eject the same fallback as `get`. On `045d7ec`, with the auth API answering 401, `apply` reported `sources_download_failed` without trying the proxy; without a token, the same run fetched from the proxy.
+
+- {{C43}} `--manifest-path` interleaves two projects' state. `GlobalArgs::project_root()` documents that every multi-store command derives its stores from the manifest's project, and `list`, `apply` and `vendor --check` do. But `rollback`, `remove`, `repair`, `apply --check`, `vex`, `scan` and `get` load the vendored ledger from `--cwd`. `rollback` also locks the manifest's `.socket/` while writing the cwd ledger. On `045d7ec`, with a corrupt ledger in `--cwd` and `--manifest-path ../b/.socket/manifest.json`, `list` succeeded while `vex`, `rollback` and `repair` failed on the cwd ledger; with the corruption moved to `b`, the results inverted.
 
 (The `C38` pacing finding is in Part 7.)
 

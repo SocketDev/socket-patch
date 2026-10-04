@@ -1,5 +1,5 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-03T21:51Z · main @ 045d7ec_
+_Last updated 2026-10-04T03:54Z · main @ 045d7ec_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -22,10 +22,10 @@ _Last updated 2026-10-03T21:51Z · main @ 045d7ec_
 | C17 | 2 | Digest helpers are duplicated: ~30 inline `hex::encode(Sha256::digest(..))` sites, and `sha256_hex` copies that *compute* beside a `utils::digest::sha256_hex` that *validates*. `sha1_hex` exists twice, and SRI formatting is inlined three times. | 4.4; 7.3 | #706 | filed #706 |
 | C18 | 2 | There are four UUID grammars. `client.rs` has one, CLI `lib.rs` a byte-identical copy, `path_safety.rs` accepts lowercase only, and `apply.rs` accepts any alphanumeric plus `-`/`_`. | 7.3 | #705 | filed #705; a fifth grammar (`Uuid::parse_str` in `python_script.rs`) |
 | C19 | 2 | Env truthiness has three vocabularies (core's `"1"`/`"true"` match kept correct only by `apply_env_toggles`), and there are ~29 inline "empty means unset" reads and six or more home-directory resolvers that disagree on Windows. | 7.3 | #727 | filed #727 |
-| C20 | 2 | Purls have two builder families in `utils/purl.rs`, plus 78 hand-built `pkg:` strings and 58 `starts_with("pkg:<type>/")` checks that bypass `Ecosystem::from_purl`. | 6.4; 7.3 | | to verify |
+| C20 | 2 | Tracking: purls have two builder families in `utils/purl.rs` (canonicalization already drifted), plus 42 production hand-built `pkg:` strings and 24 `starts_with("pkg:<type>/")` checks beside `Ecosystem::from_purl`. | 6.4; 7.3 | #748, #747 | filed #748, #747; children 2–4 touch the ecosystem area |
 | C21 | 3 | `utils/fs.rs` has six atomic writers (four boolean policies) and a blocking copy of the stage code; `blob_fetcher` has a third stage+rename. (The group-commit escape claim was wrong; `update/` is legitimately separate.) | 5.7; 7.3 | #728 | filed #728 |
 | C22 | 2 | Telemetry has 17 near-identical `track_*` wrappers, builds a new HTTP client for every event, and threads the token and org through 125 signatures. Target: one `track(Event)` with a shared client. | 7.5; R15 | | to verify |
-| C23 | 2 | Dead code: `PatchSources::mem_blobs` is never `Some`. `save_redirect_state` and its group-commit entry journal a file that nothing writes. The `switched_off("group_commit")` oracle path, the `Pypi`/`LauncherCache` update channels and `--vendor-source` (one value) also remain. | 7.4; 7.6 #3; 5.6 | | to verify |
+| C23 | 2 | Dead code: `PatchSources::mem_blobs` is never `Some`; `VendorSource` predicates are always true; group commit captures `redirect-state.json`, which nothing in its scope writes; the `switched_off("group_commit")` oracle path. | 7.4; 7.6 #3; 5.6 | #746 | filed #746; `Pypi`/`LauncherCache` channels are live (not dead) |
 | C24 | 2 | Apply and rollback are mirror images: the verify types are identical, and `fold_copy_result`, the pnpm peer fan-out and the sidecar boundary are each written twice. Target: one engine. | 7.4; 7.6 #4 | | to verify |
 | C25 | 2 | `--download-mode diff`, the default, re-downloads every blob on a cold cache, runs sequentially with no retry, and is the only user of `qbsdiff`. Making `file` the default is a decision; removing the duplicate fetch work is a refactor. | 7.4; R10 | | to verify |
 | C26 | 3 | `apply.lock` spends ~554 lines deleting the lock file on exit, and taking the lock replays the vendored group-commit journal, coupling vendored crash recovery to every command. | 7.4 | | to verify |
@@ -45,6 +45,7 @@ _Last updated 2026-10-03T21:51Z · main @ 045d7ec_
 | C40 | 3 | `SOCKET_API_CONCURRENCY` and `SOCKET_WALK_THREADS` are read by core but documented nowhere; only clap-bound env vars have a guard test. | new finding | #678 | filed #678 |
 | C41 | 2 | Hash case policy is per site: blob download compares case-insensitively and the validators accept uppercase, but agent-mode apply/rollback verify with exact `==`, so an uppercase manifest hash never verifies. Vendored verify sites are split the same way. | new finding | #707 | filed #707 |
 | C42 | 2 | `get` writes a patch view's inline blobs to `.socket/blobs/<hash>` without verifying the hash, in place, overwriting existing verified blobs; the fetch path verifies and stages. It also hand-rolls base64. | new finding | #726 | filed #726 |
+| C43 | 2 | With `--manifest-path` into another project, `rollback`, `remove`, `repair`, `apply --check`, `vex`, `scan` and `get` read the vendored ledger from `--cwd` while `list`, `apply` and `vendor --check` use the manifest's project; `rollback` locks one `.socket/` and writes the other's ledger. | new finding | #745 | filed #745 |
 
 **Handed off** (to the CI janitor): report-only coverage and LTO `docker-base` off PRs; e2e from 148 to ~50 legs; a reusable compat workflow; no per-leg compiles; dead CI path filters (review 8.2, 8.5 B/C/E).
 
