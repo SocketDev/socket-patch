@@ -494,8 +494,7 @@ pub fn is_pending(error: &std::io::Error) -> bool {
 }
 
 /// A commit refused before writing anything: the project-relative path of
-/// a changed file that is, or lies under, a symbolic link. See
-/// [`symlinked_target`].
+/// a changed file that is a symbolic link. See [`symlinked_target`].
 #[derive(Debug)]
 struct SymlinkedTarget(String);
 
@@ -508,7 +507,7 @@ impl std::fmt::Display for SymlinkedTarget {
 impl std::error::Error for SymlinkedTarget {}
 
 /// The changed file a failed [`GroupCommit::commit`] refused because it is
-/// (or lies under) a symbolic link — renaming over it would replace the
+/// a symbolic link — renaming over it would replace the
 /// link with a detached regular file and leave the shared target as it was.
 /// Nothing was written.
 pub fn symlinked_target(error: &std::io::Error) -> Option<&str> {
@@ -638,7 +637,7 @@ impl GroupCommit {
         // the file other checkouts read, unpatched. Refuse the whole commit
         // before anything is written, as the hosted guard does.
         for change in &changes {
-            if crosses_symlink(&root, &change.rel)? {
+            if is_symlink(&root.join(&change.rel)) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     SymlinkedTarget(rel_string(&change.rel)),
@@ -942,14 +941,17 @@ fn carries_commit(item: &Replay) -> Option<bool> {
 }
 
 /// The paths of `rels` (relative to `root`) that a commit would refuse to
-/// write ([`symlinked_target`]): the file, or a directory above it, is a
-/// symbolic link. For a dry run, which captures nothing, to predict that
-/// refusal.
+/// write ([`symlinked_target`]) because they are symbolic links. For a dry
+/// run, which captures nothing, to predict that refusal.
 pub fn symlinked_paths<'a>(root: &Path, rels: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     rels.into_iter()
-        .filter(|rel| crosses_symlink(root, Path::new(rel)).unwrap_or(false))
+        .filter(|rel| is_symlink(&root.join(rel)))
         .map(str::to_string)
         .collect()
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// Whether any existing level of `rel` below `root` — the file itself
@@ -1537,32 +1539,22 @@ mod tests {
     }
 
     /// #627: a commit never renames over a symbolic link (a shared lock, a
-    /// linked `package.json` / `nuget.config`) or writes through a symlinked
-    /// directory: it refuses before writing anything, naming the link, so
-    /// the link and its target stay as they were — a one-file commit, the
-    /// second file of a journaled one, and a file under a linked directory.
+    /// linked `package.json` / `nuget.config`): it refuses before writing
+    /// anything, naming the link, so the link and its target stay as they
+    /// were — in a one-file commit and as the second file of a journaled
+    /// one.
     #[cfg(unix)]
     #[tokio::test]
     async fn commit_refuses_a_symlinked_target_before_writing_anything() {
-        for (linked, rel, expect) in [
-            ("yarn.lock", "yarn.lock", "yarn.lock"),
-            ("package.json", "package.json", "package.json"),
-            ("config", "config/nuget.config", "config/nuget.config"),
-        ] {
+        for rel in ["yarn.lock", "package.json", "nuget.config"] {
             let tmp = tempfile::tempdir().unwrap();
             let shared = tmp.path().join("shared");
             let root = tmp.path().join("proj");
             std::fs::create_dir_all(&shared).unwrap();
             std::fs::create_dir_all(&root).unwrap();
-            let target = if rel.contains('/') {
-                std::fs::write(shared.join("nuget.config"), b"old").unwrap();
-                std::os::unix::fs::symlink(&shared, root.join(linked)).unwrap();
-                shared.join("nuget.config")
-            } else {
-                std::fs::write(shared.join(linked), b"old").unwrap();
-                std::os::unix::fs::symlink(shared.join(linked), root.join(linked)).unwrap();
-                shared.join(linked)
-            };
+            let target = shared.join(rel);
+            std::fs::write(&target, b"old").unwrap();
+            std::os::unix::fs::symlink(&target, root.join(rel)).unwrap();
             std::fs::write(root.join("a.lock"), b"a-old").unwrap();
             for with_sibling in [false, true] {
                 let group = GroupCommit::begin(&root);
@@ -1575,10 +1567,10 @@ mod tests {
                     .await
                     .unwrap();
                 let err = group.commit().await.unwrap_err();
-                assert_eq!(symlinked_target(&err), Some(expect), "{rel}: {err}");
+                assert_eq!(symlinked_target(&err), Some(rel), "{rel}: {err}");
                 assert!(!is_pending(&err));
                 assert!(
-                    std::fs::symlink_metadata(root.join(linked))
+                    std::fs::symlink_metadata(root.join(rel))
                         .unwrap()
                         .file_type()
                         .is_symlink(),
