@@ -306,8 +306,11 @@ impl Fixture {
             .take(2)
             .filter_map(|p| p.parse().ok())
             .collect();
+        // Only the `direct` shape has a captured lock; a modern reader
+        // writes every other shape's binary lock itself.
         let captured_fixture = std::env::var_os("SOCKET_PATCH_BUN_LOCKB_WRITER").is_none()
-            && major_minor.as_slice() >= [1, 2].as_slice();
+            && major_minor.as_slice() >= [1, 2].as_slice()
+            && shape == "direct";
         // Windows runners keep the checkout on D: and the system tempdir on
         // C:. Bun workspace writers cannot relativize paths across those
         // drives; keep the fixture on the working drive, as the public matrix
@@ -1068,6 +1071,106 @@ async fn native_binary_alias_and_transitive() {
         cli(&fixture.project, &["vendor", "--revert"]);
         fixture.pristine();
     }
+}
+
+/// #803: Bun 1.4 migrates a hosted workspace `bun.lockb` to `bun.lock`
+/// with the member path the binary normalization wrote as the root's
+/// `consumer` literal, so a frozen install of the migrated lock fails and
+/// an unfrozen one drops the pin. A hosted re-run must restore the
+/// manifest's `workspace:*`, after which a fresh frozen install from the
+/// text lock gets the patched bytes. Needs a Bun >= 1.4 reader (the only
+/// releases whose text reader re-resolves on the path literal).
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn native_binary_workspace_text_migration_heals_on_rerun() {
+    let Some(fixture) = Fixture::new("workspace") else {
+        return;
+    };
+    let raw = String::from_utf8_lossy(
+        &command(&fixture.reader, &fixture.project)
+            .arg("--version")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    let major_minor: Vec<u32> = raw
+        .split('.')
+        .take(2)
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    if major_minor.as_slice() < [1, 4].as_slice() {
+        eprintln!("SKIP workspace text migration: Bun {raw} < 1.4");
+        return;
+    }
+    let server = MockServer::start().await;
+    mock_api(&server, &fixture, "minimist").await;
+    let project = &fixture.project;
+    let hosted = scan(project, &server, "hosted", &[]);
+    assert_eq!(hosted["redirect"]["redirected"], 1, "{hosted}");
+
+    // Bun's own migration, as its prompt suggests.
+    std::fs::remove_file(project.join("bunfig.toml")).unwrap();
+    let output = command(&fixture.reader, project)
+        .args(["install", "--save-text-lockfile", "--ignore-scripts"])
+        .env(
+            "BUN_INSTALL_CACHE_DIR",
+            fixture.temp.path().join("migrate-cache"),
+        )
+        .env("BUN_INSTALL", fixture.temp.path().join("migrate-home"))
+        .output()
+        .unwrap();
+    require_success(output, "bun.lockb -> bun.lock migration");
+    let migrated = std::fs::read_to_string(project.join("bun.lock")).unwrap();
+    assert!(
+        migrated.contains("\"consumer\": \"packages/consumer\""),
+        "the migration carries the normalized path literal:\n{migrated}"
+    );
+    assert!(migrated.contains("/patch/npm/minimist/"), "{migrated}");
+
+    let rerun = scan(project, &server, "hosted", &[]);
+    assert_eq!(rerun["redirect"]["redirected"], 1, "{rerun}");
+    let healed = std::fs::read_to_string(project.join("bun.lock")).unwrap();
+    assert_eq!(
+        healed,
+        migrated.replace(
+            "\"consumer\": \"packages/consumer\"",
+            "\"consumer\": \"workspace:*\""
+        ),
+        "only the literal changes"
+    );
+
+    // A fresh checkout of the healed text lock installs frozen, patched.
+    let checkout = fixture.temp.path().join("text-checkout");
+    std::fs::create_dir_all(checkout.join("packages/consumer")).unwrap();
+    for file in ["package.json", "bun.lock", "packages/consumer/package.json"] {
+        std::fs::copy(project.join(file), checkout.join(file)).unwrap();
+    }
+    let output = command(&fixture.reader, &checkout)
+        .args(["install", "--frozen-lockfile", "--ignore-scripts"])
+        .env("BUN_INSTALL_CACHE_DIR", fixture.temp.path().join("text-cache"))
+        .env("BUN_INSTALL", fixture.temp.path().join("text-home"))
+        .output()
+        .unwrap();
+    let output = require_success(output, "frozen install of the healed bun.lock");
+    let target = find_installed_target(&checkout).unwrap_or_else(|| {
+        panic!(
+            "installed target absent\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(
+        std::fs::read(target.join("index.js")).unwrap(),
+        fixture.patched,
+        "the healed lock installs the patched bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("bun.lock")).unwrap(),
+        healed,
+        "the frozen install keeps the lock"
+    );
 }
 
 fn production_scoped_rollback() {
