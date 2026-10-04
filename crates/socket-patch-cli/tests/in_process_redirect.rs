@@ -851,10 +851,9 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
             "{label}: rollback restores the pristine CRLF lock (upstream checksum \
              re-derived from the registry tarball)"
         );
-        let pkg: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmp.path().join("package.json")).unwrap(),
-        )
-        .unwrap();
+        let pkg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.path().join("package.json")).unwrap())
+                .unwrap();
         assert!(
             pkg.get("resolutions").is_none(),
             "{label}: rollback drops the resolutions pin: {pkg}"
@@ -863,6 +862,7 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
     }
 }
 
+/// #404 upgrade path: a lock pinned by an earlier release carries the old
 /// #632: a dependency declared through a yarn catalog (`"catalog:"`) is
 /// matched by yarn's `resolutions` before the catalog is expanded, so the
 /// hosted pin must also route `<name>@catalog:`; `rollback` must drop every
@@ -951,7 +951,6 @@ async fn yarn_berry_catalog_dependency_is_pinned_and_rolled_back() {
     );
 }
 
-/// #404 upgrade path: a lock pinned by an earlier release carries the old
 /// `npm:<v>::__archiveUrl=<url>` resolution, which makes yarn's npm fetcher
 /// send registry auth to the patch host. `rollback` must still recognize and
 /// restore that legacy pin, and a repeat hosted `scan` must re-pin it to the

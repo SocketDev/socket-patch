@@ -660,9 +660,7 @@ pub fn run_manifestless_vex_matrix(flow: &BerryVexFlow<'_>) -> Vec<String> {
         crate::vex_e2e_common::assert_no_hosted_ledger(&fresh, "manifest-deleted");
     } else {
         assert!(
-            fresh
-                .join(socket_patch_core::vendor::VENDOR_STATE_REL)
-                .is_file(),
+            fresh.join(socket_patch_core::vendor::VENDOR_STATE_REL).is_file(),
             "manifest-deleted: the vendored flow must have left its .socket/vendor ledger"
         );
     }

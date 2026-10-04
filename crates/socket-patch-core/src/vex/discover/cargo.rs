@@ -738,22 +738,23 @@ async fn vendored_from_patches(
         }
         let copy_tagged = matches!(tag, CopyTag::Tagged(_) | CopyTag::Unreadable);
         if let Lock::Parsed(lock) = lock {
-            let why = match lock.vendored_in_use(name, version, &vref.uuid, copy_tagged) {
-                CopyClaim::Consumed => None,
-                CopyClaim::OtherTag(other) => Some(format!(
-                    "{CARGO_LOCK} builds the copy tagged for patch {other} ({name} {})",
-                    cargo_tag::tag_version(version, other)
-                )),
-                CopyClaim::UntaggedOverride => Some(format!(
-                    "{CARGO_LOCK} builds an untagged {name} {version}, not the copy (which \
+            let why =
+                match lock.vendored_in_use(name, version, &vref.uuid, copy_tagged) {
+                    CopyClaim::Consumed => None,
+                    CopyClaim::OtherTag(other) => Some(format!(
+                        "{CARGO_LOCK} builds the copy tagged for patch {other} ({name} {})",
+                        cargo_tag::tag_version(version, other)
+                    )),
+                    CopyClaim::UntaggedOverride => Some(format!(
+                        "{CARGO_LOCK} builds an untagged {name} {version}, not the copy (which \
                      cargo would lock as {}): another [patch] or path dependency overrides it",
-                    cargo_tag::tag_version(version, &vref.uuid)
-                )),
-                CopyClaim::NotConsumed => Some(format!(
-                    "{CARGO_LOCK} does not build {name}@{version} from it (an unused patch, \
+                        cargo_tag::tag_version(version, &vref.uuid)
+                    )),
+                    CopyClaim::NotConsumed => Some(format!(
+                        "{CARGO_LOCK} does not build {name}@{version} from it (an unused patch, \
                      or the lock resolves it from a registry)"
-                )),
-            };
+                    )),
+                };
             if let Some(why) = why {
                 out.diag(
                     DIAG_REF_INVALID,
