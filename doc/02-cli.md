@@ -69,8 +69,9 @@ Command modules double as libraries and form a dense web:
 `apply_env_toggles` (`args.rs:559-575`) writes parsed flags back into `SOCKET_OFFLINE`, `SOCKET_DEBUG`, `SOCKET_TELEMETRY_DISABLED`, `SOCKET_API_URL` and `SOCKET_PROXY_URL`, so that core (51 production env reads) can see them.
 - Its own doc comment records the bug this caused: an on-prem `--api-url` run "POSTed the event — Bearer token included — to the default `api.socket.dev`".
 - It is called separately in 10 command entry points rather than once in `main`, and `vendor --check` returns before calling it.
-- It is why the test suites carry **553 `#[serial]` attributes** (plus 182 in `src`).
-- **Fix:** an explicit `RunCtx { config, client, telemetry, lock }` built once in `main` and passed down. Core should not read ambient env except at the edge.
+- It is why the test suites carry **993 `#[serial]` attributes** in `tests/` (plus 185 in `src`), counted on `045d7ec`; the review counted 553 + 182.
+- The lock timeout is converted by hand at 12 sites, and the API client is built at 13 production sites.
+- **Fix:** an explicit `RunCtx { config, client, telemetry, lock }` built once in `main` and passed down. Core should not read ambient env except at the edge. {{C10}}
 
 ### 2.6 Structural duplication
 
@@ -96,7 +97,7 @@ A sliding-window copy-paste detector finds little *literal* duplication. **The d
 - **Every global flag is silently accepted by every command.** `list --download-mode bogus --strict --yes --lock-timeout 9 --maven-config none --no-vlt-install-cleanup --dry-run` exits 0. `--update --ecosystems npm --manifest-path x.json --strict --global` parses.
 - **Dead or vestigial flags:**
   - `--vendor-source`: core's `VendorSource` has **one variant**, and `build` is an error.
-  - `--download-mode` is an unvalidated `String`, checked only where it is used. That breaks the "fail loud on typo" posture the same file applies to `--ecosystems`.
+  - `--download-mode` is an unvalidated `String`, checked only where it is used. That breaks the "fail loud on typo" posture the same file applies to `--ecosystems`. On `045d7ec` a bad value fails `apply` and `repair` with exit 1 and `apply_failed`/`repair_failed`, while `apply --check`, `rollback`, `list` and `vendor` exit 0; `--vendor-source bogus` is a clap usage error (exit 2). {{C45}}
 - **Deprecated spellings and aliases:** `scan --apply` (hidden), `scan --vendor` (hidden), `--sync`, `get --no-apply`, and the `download` and `gc` aliases. `resolve_mode_flags` (`scan/mod.rs:205–255`) exists mainly to reconcile these.
 - **Name collisions:**
   - `--package` is a value list on `scan` but a boolean type-forcer (`-p`) on `get`.
@@ -180,6 +181,8 @@ That is **7 verbs instead of 9 visible + 2 hidden + 2 aliases + 3 hidden flag sp
 - {{C43}} `--manifest-path` interleaves two projects' state. `GlobalArgs::project_root()` documents that every multi-store command derives its stores from the manifest's project, and `list`, `apply` and `vendor --check` do. But `rollback`, `remove`, `repair`, `apply --check`, `vex`, `scan` and `get` load the vendored ledger from `--cwd`. `rollback` also locks the manifest's `.socket/` while writing the cwd ledger. On `045d7ec`, with a corrupt ledger in `--cwd` and `--manifest-path ../b/.socket/manifest.json`, `list` succeeded while `vex`, `rollback` and `repair` failed on the cwd ledger; with the corruption moved to `b`, the results inverted.
 
 - {{C44}} The ecosystem-name parser is written three times. `--ecosystems`/`SOCKET_ECOSYSTEMS` require an exact, case-sensitive `cli_name()` with no trim, socket.yml `patches.ecosystems` trims and lowercases, and `vendor::ecosystem_in_scope` has its own exact lookup. On `045d7ec`, `-e NPM`, `-e "npm, pypi"` and `SOCKET_ECOSYSTEMS=PyPI` exit 2, while `ecosystems: [NPM, pypi]` parses. `--min-severity` and `minSeverity` already share one parser.
+
+- {{C45}} `--download-mode` typos are runtime failures in two commands only (see 2.7): `apply`/`repair` exit 1 with a generic command code, and the rest accept them. This narrows the review's R8 note to a non-breaking fix (a typed clap parser).
 
 (The `C38` pacing finding is in Part 7.)
 

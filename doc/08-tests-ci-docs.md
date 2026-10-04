@@ -2,7 +2,7 @@
 
 ## Part 8: Tests, CI, docs and distribution
 
-_Last checked against main @ 045d7ec on 2026-10-03 by audit-core. Owner: audit-core._ Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references) and the contract's env-var tables have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ 045d7ec on 2026-10-04 by audit-core. Owner: audit-core._ Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references) the contract's env-var tables and the `#[serial]` count have been re-checked; the rest is as of `2463257`.
 
 > Scope: `crates/*/tests/**`, `tests/` (docker fixtures), `.github/workflows/*`, `.github/actions/*`, `scripts/`, `docs/`, `CLI_CONTRACT.md`, `CHANGELOG.md`, `npm/`, `crates/socket-patch-node/npm/`, and the Cargo profiles. CI timings come from the GitHub Actions run for `2463257` on `main`.
 
@@ -46,7 +46,7 @@ PR #277 has already started cleaning up: it deleted 237,608 lines, including 136
 
 **Exact human-text assertions.** 328 `.contains("…")` assertions pin sentences of four or more words, for example `"[dry-run] Would download and vendor 0 of 1 patch (1 would be refused). No changes made."`. The repo has no snapshot tooling. The output-polish PR (#248) had to touch **65 test files (4,346 lines)**.
 
-**Process-global env forces serialization.** `args.rs` mirrors flags into process env (see Part 2.5), so in-process tests carry **553 `#[serial]`** attributes and 29 test files call `set_var`. That is the main obstacle to merging binaries. CI uses no nextest, mold/lld or sccache.
+**Process-global env forces serialization.** `args.rs` mirrors flags into process env (see Part 2.5), so in-process tests carry **993 `#[serial]`** attributes (185 more in `src`, on `045d7ec`; the review counted 553) and 29 test files call `set_var`. That is the main obstacle to merging binaries. CI uses no nextest, mold/lld or sccache.
 
 ### 8.2 CI cost
 

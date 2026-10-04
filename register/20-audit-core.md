@@ -1,5 +1,5 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-04T09:54Z · main @ 045d7ec_
+_Last updated 2026-10-04T15:50Z · main @ 045d7ec_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -12,7 +12,7 @@ _Last updated 2026-10-04T09:54Z · main @ 045d7ec_
 | C07 | 1 | The URL builders disagree. When org auto-resolve fails, `patches_path` sends JSON calls to `/v0/orgs/default/…`, while `binary_url` and `vendor_package_url` send the same client to the public proxy. Telemetry has a fourth copy of this logic. | 7.2 | #648 | decision #648 |
 | C08 | 2 | Repo hygiene: a stray `.github/actions/actions/cache/<sha>/.vscode/launch.json`, a README that documents v5 but whose installer installs v4, and 39 references to a "DESIGN §" document that doesn't exist. (The dead CI path filters go to the CI janitor.) | §1 #8; 8.5 J | #649 | filed #649; README part already fixed |
 | C09 | 2 | There is no shared `with_proxy_fallback` helper: scan, get (both paths) and vex each handle the proxy fallback themselves, and get's handling has a gap. | 2.10 R2 | #647 | filed #647 |
-| C10 | 2 | Tracking: `RunCtx { config, client, telemetry, lock }`, built once in `main`. It would delete `apply_env_toggles` (flags written back into process env, which has a documented token-leak history) and unblock removing 553 `#[serial]`. | 2.5; R3 | | to verify |
+| C10 | 2 | Tracking: `RunCtx { config, client, telemetry, lock }`, built once in `main`. It would delete `apply_env_toggles` (flags written back into process env, which has a documented token-leak history) and unblock removing 553 `#[serial]`. | 2.5; R3 | #793, #794 | filed #793, #794; tracking #793, child 1 #794; `#[serial]` now 993 in tests + 185 in src |
 | C11 | 2 | Tracking: split `run_scan` (1,499 lines; mode booleans referenced 91 times) into discover → select → `ModeBackend::consume` → render. | 2.2; R5 | | to verify |
 | C12 | 2 | Tracking: move engine code out of the CLI and into core behind one orchestrator over `ProjectView`. That covers `vendor_records_reusing` (962 lines), `run_redirect_selected` (836) and `ecosystem_dispatch.rs` (816). Coordinate with E32. | 2.1; R11 | | to verify |
 | C13 | 2 | Error codes are untyped. Target: a typed registry (`enum Reason × Ecosystem`) that generates the contract's code tables, plus a freshness test. Today ~65 codes are undocumented and 1 is phantom. | 2.8; 3.7 #8; 8.5 F | | to verify |
@@ -26,9 +26,9 @@ _Last updated 2026-10-04T09:54Z · main @ 045d7ec_
 | C21 | 3 | `utils/fs.rs` has six atomic writers (four boolean policies) and a blocking copy of the stage code; `blob_fetcher` has a third stage+rename. (The group-commit escape claim was wrong; `update/` is legitimately separate.) | 5.7; 7.3 | #728 | filed #728 |
 | C22 | 2 | Telemetry has 19 near-identical public wrappers (17 `track_*`, 2 `spawn_*`), builds a new HTTP client for every event, and the CLI threads token/org through ~45 call sites (review said 125), resolved two ways. Target: one `Telemetry` handle with `track(Event)` and a shared client. | 7.5; R15 | #770 | filed #770 |
 | C23 | 2 | Dead code: `PatchSources::mem_blobs` is never `Some`; `VendorSource` predicates are always true; group commit captures `redirect-state.json`, which nothing in its scope writes; the `switched_off("group_commit")` oracle path. | 7.4; 7.6 #3; 5.6 | #746 | filed #746; `Pypi`/`LauncherCache` channels are live (not dead) |
-| C24 | 2 | Apply and rollback are mirror images: the verify types are identical, and `fold_copy_result`, the pnpm peer fan-out and the sidecar boundary are each written twice; the folds have drifted and both drop per-file records (#756). Target: one engine. | 7.4; 7.6 #4 | #771, #772 | filed #771, #772; tracking #771, child 1 #772 |
-| C25 | 2 | `--download-mode diff`, the default, re-downloads every blob on a cold cache, runs sequentially with no retry, and is the only user of `qbsdiff`. Making `file` the default is a decision; removing the duplicate fetch work is a refactor. | 7.4; R10 | | to verify |
-| C26 | 3 | `apply.lock` spends ~554 lines deleting the lock file on exit, and taking the lock replays the vendored group-commit journal, coupling vendored crash recovery to every command. | 7.4 | | to verify |
+| C24 | 2 | Apply and rollback are mirror images: the verify types are identical, and `fold_copy_result`, the pnpm peer fan-out and the sidecar boundary are each written twice; the folds have drifted and both drop per-file records (#756). Target: one engine. | 7.4; 7.6 #4 | #771, #772 | in PR #774; #772 is in PR #774, tracking #771 open |
+| C25 | 2 | `--download-mode diff`, the default, re-downloads every blob on a cold cache, runs sequentially with no retry, and is the only user of `qbsdiff`. Making `file` the default is a decision; removing the duplicate fetch work is a refactor. | 7.4; R10 | #792 | decision #792 |
+| C26 | 3 | `apply.lock` spends ~554 lines deleting the lock file on exit, and taking the lock replays the vendored group-commit journal, coupling vendored crash recovery to every command. | 7.4 | | to verify; checked on 045d7ec (553 prod lines; journal replay in `acquire`); deleting the lock file is user-visible, so the decision is due next run |
 | C27 | 3 | Agent-mode sidecars don't handle Maven files at all. Verify whether in-place Maven patches leave stale checksum files behind. | 7.4 | | to verify |
 | C28 | 3 | socket.yml builds a hand-made YAML tree on serde-saphyr's event parser to read 8 keys. Target: serde with `deny_unknown_fields`. | 7.5 | | to verify |
 | C29 | 3 | The `client.rs` split (2.8K lines) into client, vendor_service and credentials; the debug-ordering machinery (`HeldBack`) has 45 call sites. | 7.2; 7.6 #8 | | to verify |
@@ -47,6 +47,7 @@ _Last updated 2026-10-04T09:54Z · main @ 045d7ec_
 | C42 | 2 | `get` writes a patch view's inline blobs to `.socket/blobs/<hash>` without verifying the hash, in place, overwriting existing verified blobs; the fetch path verifies and stages. It also hand-rolls base64. | new finding | #726 | filed #726 |
 | C43 | 2 | With `--manifest-path` into another project, `rollback`, `remove`, `repair`, `apply --check`, `vex`, `scan` and `get` read the vendored ledger from `--cwd` while `list`, `apply` and `vendor --check` use the manifest's project; `rollback` locks one `.socket/` and writes the other's ledger. | new finding | #745 | filed #745 |
 | C44 | 3 | The ecosystem-name parser is written three times: `--ecosystems`/`SOCKET_ECOSYSTEMS` need an exact, case-sensitive match, socket.yml `patches.ecosystems` trims and lowercases, and `vendor::ecosystem_in_scope` has its own lookup; `-e NPM` and `-e "npm, pypi"` exit 2. | new finding | #773 | filed #773 |
+| C45 | 3 | `--download-mode` is an unvalidated `String`, parsed late in `fetch_stage`/`repair`: a typo fails `apply`/`repair` with exit 1 and `apply_failed`/`repair_failed` (and `scan`/`get` only after saving the patch), while `apply --check`, `rollback`, `list` and `vendor` accept it; `--vendor-source` uses a clap parser (exit 2). | 2.7; R8 (narrowed) | #791 | filed #791 |
 
 **Handed off** (to the CI janitor): report-only coverage and LTO `docker-base` off PRs; e2e from 148 to ~50 legs; a reusable compat workflow; no per-leg compiles; dead CI path filters (review 8.2, 8.5 B/C/E).
 

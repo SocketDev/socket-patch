@@ -2,7 +2,7 @@
 
 ## Part 7: Core infrastructure and agent (in-place) mode
 
-_Last checked against main @ 045d7ec on 2026-10-04 by audit-core. Owner: audit-core._ Only the timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing, UUID, env/home-dir, atomic-write, purl, dead-code, telemetry and apply/rollback-engine passages have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ 045d7ec on 2026-10-04 by audit-core. Owner: audit-core._ Only the timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing, UUID, env/home-dir, atomic-write, purl, dead-code, telemetry, apply/rollback-engine, diff-download and `apply.lock` passages have been re-checked; the rest is as of `2463257`.
 
 > Scope: `api/*`, `manifest/*`, `ledgers.rs`, `constants.rs`, `patch/` (excluding `redirect/`), `policy/*`, `rollout*`, `update/*`, the CLI `update_notifier.rs`/`update.rs`, `telemetry.rs`, and the generic `utils/*` and `hash/*`.
 
@@ -104,7 +104,7 @@ The default `MismatchPolicy::Warn` silently overwrites locally modified dependen
 
 So diff only saves bytes when a user commits `.socket/diffs` but not `.socket/blobs`. The diff fetch is also sequential with no retry, and it is the only user of the `qbsdiff` dependency. Blob downloads are sequential with no retry too, while the JSON calls run 32 at a time.
 - **Recommendation:** make `file` the default (keep `diff` as an alias for one major), then delete `patch/diff.rs`, the diff branches in `blob_fetcher`/`fetch_stage`/`repair`, and `qbsdiff`.
-- **Saving:** about 600 production and 1,000 test lines, plus one dependency.
+- **Saving:** about 600 production and 1,000 test lines, plus one dependency. Re-verified on `045d7ec` (top-up at `fetch_stage.rs:377-398`; diff-only code includes `patch/diff.rs` (99 production lines) and `patch/package.rs` (332)). The default change is a contract MAJOR, so it is filed as a decision. {{C25}}
 
 **Sidecars** (`patch/sidecars/`, 708 production / 1,312 test lines) are post-apply fixes for package-manager checksum files:
 - cargo: rewrite `.cargo-checksum.json`;
@@ -113,7 +113,7 @@ So diff only saves bytes when a user commits `.socket/diffs` but not `.socket/bl
 
 Maven sidecars are not handled at all. This code exists only for in-place mode.
 
-**`apply.lock`** is 554 production lines. Most of that complexity comes from *deleting* the lock file on exit: unlinking while it is held, identity checks, Windows delete-pending handling. Lock acquisition also replays the vendored group-commit journal, which couples vendored crash recovery into every command's lock. Leaving a gitignored lock file on disk (the convention every package manager uses) would cut about 150 lines.
+**`apply.lock`** is 553 production lines (re-checked on `045d7ec`). Most of that complexity comes from *deleting* the lock file on exit: unlinking while it is held, identity checks, Windows delete-pending handling. Lock acquisition also replays the vendored group-commit journal, which couples vendored crash recovery into every command's lock. Leaving a gitignored lock file on disk (the convention every package manager uses) would cut about 150 lines.
 
 **Dead path (verified):** `PatchSources::mem_blobs` is never `Some` in production, but its doc still says vendor flows stage content there. {{C23}}
 
