@@ -5435,6 +5435,23 @@ fn rewrite_gem(
     // frozen-installable as written.
     let mut mixed_state = false;
     let mut warned_no_gemfile = false;
+    // The gems the lock resolves from a non-registry section (`GIT`,
+    // `PATH`, `PLUGIN SOURCE`): header + whether it is socket-patch's own
+    // vendored wiring. Read once — the rewrites below only touch `GEM`
+    // sections and CHECKSUMS, never these.
+    let non_registry: BTreeMap<String, (String, bool)> = lock
+        .as_deref()
+        .map(|lk| {
+            crate::formats::gem::parse(lk)
+                .non_registry_sources()
+                .into_iter()
+                .map(|(name, s)| {
+                    let vendored = s.remotes.iter().any(|r| r.contains(".socket/vendor/"));
+                    (name.to_string(), (s.header.to_string(), vendored))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     for dep in &gem {
         let Some(ov) = registry_override_of_kind(dep, "rubygems-compact-index") else {
@@ -5519,15 +5536,8 @@ fn rewrite_gem(
         // however the Gemfile spells the declaration (a plain `gem` line in
         // a `git "…" do` block, an option the line reader cannot see), so a
         // Socket source block cannot redirect it (#652). Fail closed.
-        if let Some((header, socket_vendored)) = lock.as_deref().and_then(|lk| {
-            let parsed = crate::formats::gem::parse(lk);
-            parsed.non_registry_section_of(&dep.name).map(|s| {
-                (
-                    s.header.to_string(),
-                    s.remotes.iter().any(|r| r.contains(".socket/vendor/")),
-                )
-            })
-        }) {
+        if let Some((header, socket_vendored)) = non_registry.get(dep.name.as_str()) {
+            let (header, socket_vendored) = (header.as_str(), *socket_vendored);
             result.warnings.push(RewriteWarning {
                 code: "redirect_gem_source_option".into(),
                 detail: gem_source_option_detail(
