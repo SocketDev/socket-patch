@@ -14,7 +14,9 @@
 //!   copy is untouched is the fail-open this closes.
 //! - A copy's per-file records are merged into the primary's, each file
 //!   qualified by the copy's on-disk path, so a write that landed only in
-//!   a twin is visible to the CLI's event classification and tallies.
+//!   a twin is visible to the CLI's event classification and tallies. A
+//!   successful apply copy's `--force` skips (NotFound) are not carried,
+//!   for the same reason its all-skipped note is not.
 //! - Of a successful copy's advisory, only the ownership note is carried
 //!   (it already names the copy's file). Any other success note (apply's
 //!   `--force` all-skipped note) describes the copy alone and would
@@ -199,6 +201,41 @@ mod regression_tests {
                 .iter()
                 .all(|v| v.status == VerifyStatus::AlreadyPatched),
             "a run that wrote a copy is not all-already-patched"
+        );
+    }
+
+    /// A `--force` twin that is missing the patched file skips it
+    /// (success, NotFound record, all-skipped note). That skip describes
+    /// the twin alone: over an already-patched primary the result must stay
+    /// all-already-patched, with no NotFound record and no note, or the CLI
+    /// would report an empty `applied` event instead of `already_patched`.
+    #[tokio::test]
+    async fn apply_force_skip_in_a_twin_keeps_an_already_patched_primary() {
+        let (_root, primary, copies, blobs, files) = pnpm_twins(PATCHED, ORIGINAL).await;
+        tokio::fs::remove_file(copies[1].join("index.js"))
+            .await
+            .unwrap();
+        let result = apply_package_patch(
+            "pkg:npm/foo@1.0.0",
+            &primary,
+            &files,
+            &PatchSources::blobs_only(&blobs),
+            None,
+            false,
+            MismatchPolicy::Force,
+        )
+        .await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(result.files_patched.is_empty());
+        assert!(
+            !result.files_verified.is_empty()
+                && result
+                    .files_verified
+                    .iter()
+                    .all(|v| v.status == VerifyStatus::AlreadyPatched),
+            "{:?}",
+            result.files_verified
         );
     }
 

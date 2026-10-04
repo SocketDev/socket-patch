@@ -762,6 +762,12 @@ impl crate::patch::store_copies::CopyFold for ApplyResult {
 
     fn extend_files(&mut self, copy: &mut Self, qualify: &dyn Fn(&str) -> String) {
         for mut verified in copy.files_verified.drain(..) {
+            // A successful copy's NotFound is a `--force` skip: like its
+            // all-skipped note, it describes that copy alone and must not
+            // turn an already-patched primary into a no-op "applied".
+            if copy.success && verified.status == VerifyStatus::NotFound {
+                continue;
+            }
             verified.file = qualify(&verified.file);
             self.files_verified.push(verified);
         }
