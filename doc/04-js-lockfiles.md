@@ -2,7 +2,7 @@
 
 ## Part 4: JavaScript lockfiles (npm, pnpm, yarn, bun, vlt)
 
-_Last checked against main @ 045d7ec on 2026-10-03 by audit-ecosystems (§4.4 pnpm, berry gates, package-lock walks and JSON writers re-checked; the rest is as of `2463257`). Owner: `audit-ecosystems`._
+_Last checked against main @ 045d7ec on 2026-10-04 by audit-ecosystems (§4.4 pnpm, berry gates, package-lock walks, JSON writers and bun-lock presence re-checked; the rest is as of `2463257`). Owner: `audit-ecosystems`._
 
 > Scope: `vendor/{npm_*,pnpm_*,yarn_*,bun_*,vlt_*,berry_zip}.rs`, `formats/{pnpm,yarn,bun,registry}`, `crawlers/npm_crawler*`, `vendor/lock_inventory/*`, `vex/discover/{npm,yarn,bun,vlt}.rs`, and the JS parts of `patch/redirect/` and `hosted/vlt.rs`. Line counts are production / inline-test, split at the first top-level `#[cfg(test)] mod`.
 
@@ -82,7 +82,7 @@ Each shares 55-67 distinct lines with `vendor_pnpm`. `read_project`, `preflight_
 - **sha512 SRI formatting** is inlined at `npm_pack.rs:27`, `bun_lock.rs:388` and `vlt_preflight.rs:70`. `utils/digest.rs` has no SRI helper.
 - **npm tarball URLs:** the canonical `registry_fetch::npm_tarball_url` is re-implemented at `lock_inventory/vlt.rs:141` and `bun_lockb.rs:235`. The latter hard-codes `registry.npmjs.org` and **ignores `SOCKET_NPM_REGISTRY`**. There are two `NPM_REGISTRY` constants, one with a trailing slash and one without. {{E02}}
 - **vlt `registry_base`:** two divergent implementations (`upstream/vlt.rs:55` vs `lock_inventory/vlt.rs:104`) with different fallback orders and unknown-alias behavior. {{E03}}
-- **"Is a bun lock present":** four predicates with different symlink semantics (`lock_inventory/bun.rs:40` uses lstat; `hosted/engine.rs:255`, `hosted/vlt.rs:53` and `bun_lock.rs:623` follow symlinks). A dangling `bun.lock` symlink is "present" to one and "absent" to the others.
+- **"Is a bun lock present":** seven sites with three semantics. lstat (`lock_inventory/bun.rs::bun_text_lock_present`, which also feeds the GC in-use probe, and VEX `DiscoverCtx::exists`) treats a dangling `bun.lock` symlink as present; `Path::exists` (`hosted/engine.rs::bun_lock_present`, `bun_lock.rs::binary_lock_drives`, `bun_workspace.rs`, CLI `repair.rs`) and `is_file` (`pkg_managers.rs`) treat it as absent, like Bun itself. Proved on `045d7ec`: with a dangling `bun.lock` beside a `bun.lockb` that Bun installs from, the inventory returns nothing while vendored and hosted write `bun.lockb`. {{E17}}
 - **`name@spec` splitting** is written twice (`yarn_classic_lock::split_pattern`, `bun_lock_text::split_name_spec`). npm purl → (name, version) is parsed three more times outside `utils/purl.rs`.
 - **Wiring `KIND_*` constants** are private to each backend but re-spelled as string literals in `recover.rs` (7 sites), `state.rs` and `bun_lock.rs`.
 - **Recursion depth:** the legacy npm `dependencies` recursion is bounded at 64 in two places and unbounded in two others.

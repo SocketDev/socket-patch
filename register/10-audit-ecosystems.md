@@ -1,5 +1,5 @@
 ### Ecosystems and formats (`audit-ecosystems`)
-_Last updated 2026-10-03T18:53Z · main @ 045d7ec_
+_Last updated 2026-10-04T01:10Z · main @ 045d7ec_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -19,7 +19,7 @@ _Last updated 2026-10-03T18:53Z · main @ 045d7ec_
 | E14 | 2 | Pipfile.lock is written two ways: vendored mode re-serializes it, while hosted mode splices spans. | 5.4 | | to verify; present on 045d7ec, no drift proven (pipenv writes canonical JSON), not filed yet |
 | E15 | 2 | Cargo.toml `[package]` is read five ways: line scanners in `cargo_crawler.rs` and `vex/product.rs`, plus three ad hoc `toml_edit` lookups (`cargo_tag`, which also accepts `[project]`; `path_crate_version`; `declared_cargo_minor`). They have drifted on BOM, `[project]` and dotted keys. `plan_cargo_toml` uses a regex scanner and `toml_edit` in one rewriter. | 5.4; 3.7 #3 | #693 | filed #693; `[package]` readers. The hosted `plan_cargo_toml` regex scanner is not filed yet |
 | E16 | 2 | CRLF has five policies in the npm family and three for `toml_edit` output, and `common::detect_eol` contradicts `LineEndings::Mixed`. Target: one line-ending policy. | 4.4; 5.4; 7.3 | | to verify |
-| E17 | 2 | "Is a bun lock present" has four predicates with different symlink semantics, so a dangling `bun.lock` symlink is present to one of them and absent to the others. | 4.4 | | to verify |
+| E17 | 2 | "Is a bun lock present" is asked at seven sites with three semantics (lstat, `exists`, `is_file`). With a dangling `bun.lock` symlink, Bun and the writers use `bun.lockb`, but the inventory returns nothing. | 4.4 | #735 | filed #735 |
 | E18 | 3 | JS helper copies: JSON-pointer escape ×2, wiring lines↔JSON ×3, `name@spec` split ×2, `KIND_*` re-spelled as literals, uneven recursion bounds, and regexes compiled inside per-dependency loops. | 4.4 | | to verify |
 | E19 | 3 | Gem has three section models and two DEPENDENCIES-name parsers with different rules. Go's `go_mod_edit.rs` lives in `vendor/`, and `go_crawler.rs` has its own `parse_go_mod_module`. | 5.4 | | to verify |
 | E20 | 3 | Pure codecs (`bun_lockb.rs`, `bun_lock_text.rs`, `vlt_lock_text.rs`) and the neutral types (`Edit`, `Warning`, `LockfileEntry`) live outside `formats/`, which creates `formats`↔`vendor`/`redirect`/`vex` cycles. | 2.1; 4.5 #2; 4.7 J | | to verify |
@@ -58,6 +58,7 @@ _Last updated 2026-10-03T18:53Z · main @ 045d7ec_
 | E53 | 2 | Vendored pnpm writes the root `package.json` with `serialize_json` (LF, no BOM) instead of `JsonLayout`: a CRLF file stays LF after `vendor --revert`; a BOM file is refused as "not a JSON object". npm and berry keep the layout. | new finding | #662 | filed #662 |
 | E54 | 3 | Poetry and PDM lock rewriters restore line endings with two rules (Poetry: any CRLF → all CRLF; PDM: `preserve_line_endings`, CRLF-only), so a mixed-EOL lock's edited unit flips to CRLF in one and LF in the other. | new finding | #695 | in PR #703 |
 | E55 | 2 | Vendored Maven has two `declares_modules`: `jvm::detect` (reactor `Doc`, ignores plugin `<configuration><modules>`) routes an EAR pom to the legacy path, whose comment-stripping copy then refuses it as `vendor_maven_multimodule_unsupported`. The legacy refusal fires only on that disagreement. | new finding | #716 | filed #716 |
+| E56 | 2 | Lock inventory reads only `Gemfile.lock` and VEX discovery reads both locks, while hosted/vendored/crawler use `LoadedManifest::pair`: a `gems.rb` project's `gems.locked` is invisible to the inventory (in-memory hosted, scan supplement, VEX liveness), and a stale `Gemfile.lock` twin is read instead. | new finding | #736 | filed #736 |
 
 **Handed off:** none yet.
 
