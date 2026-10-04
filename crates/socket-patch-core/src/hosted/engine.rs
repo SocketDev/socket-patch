@@ -1386,17 +1386,21 @@ fn confirm(
     // The yarn berry pin's `package.json` `resolutions` entry is only half of
     // it — the URL-keyed `yarn.lock` entry is what installs — so a hosted URL
     // left in the manifest (an earlier run, a refused rewrite) proves
-    // nothing on its own: the manifest never feeds the probe.
+    // nothing on its own: the manifest never feeds the probe. Nor do the
+    // Bun workspace members' manifests, read only as advisory input.
+    fn is_npm_manifest(name: &str) -> bool {
+        name == "package.json" || name.ends_with("/package.json")
+    }
     let final_texts: Vec<(&str, &String)> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
-        .filter(|(name, _)| name.as_str() != "package.json")
+        .filter(|(name, _)| !is_npm_manifest(name))
         .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
         .chain(
             rewrite
                 .files
                 .iter()
-                .filter(|(name, _)| !files.contains_key(*name) && name.as_str() != "package.json")
+                .filter(|(name, _)| !files.contains_key(*name) && !is_npm_manifest(name))
                 .map(|(name, content)| (name.as_str(), content)),
         )
         .collect();

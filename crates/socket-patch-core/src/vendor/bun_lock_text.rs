@@ -346,12 +346,16 @@ struct WorkspaceDepLine {
     literal: String,
 }
 
-/// The `workspaces` section in bun's emitted shape: each member's
-/// `(key, name)` and every dependency line. `None` when there is no section
-/// or it deviates from that shape anywhere (fail closed).
-fn parse_workspaces_section(
-    lines: &[String],
-) -> Option<(Vec<(String, Option<String>)>, Vec<WorkspaceDepLine>)> {
+/// The `workspaces` section in bun's emitted shape.
+struct WorkspacesSection {
+    /// Each member's `(key, name)`, in lock order.
+    members: Vec<(String, Option<String>)>,
+    deps: Vec<WorkspaceDepLine>,
+}
+
+/// Parse the `workspaces` section. `None` when there is no section or it
+/// deviates from bun's emitted shape anywhere (fail closed).
+fn parse_workspaces_section(lines: &[String]) -> Option<WorkspacesSection> {
     let start = lines
         .iter()
         .position(|l| l.strip_suffix('\r').unwrap_or(l) == "  \"workspaces\": {")?;
@@ -361,7 +365,7 @@ fn parse_workspaces_section(
     loop {
         let line = lines.get(idx)?;
         if is_object_close(line, 2) {
-            return Some((members, deps));
+            return Some(WorkspacesSection { members, deps });
         }
         let workspace = object_open_key(line, 4)?;
         let mut name = None;
@@ -419,7 +423,7 @@ fn parse_workspaces_section(
 /// not in bun's emitted shape.
 pub(crate) fn workspace_member_dirs(lines: &[String]) -> Vec<String> {
     parse_workspaces_section(lines)
-        .map(|(members, _)| members.into_iter().map(|(dir, _)| dir).collect())
+        .map(|section| section.members.into_iter().map(|(dir, _)| dir).collect())
         .unwrap_or_default()
 }
 
@@ -465,10 +469,10 @@ pub(crate) fn heal_workspace_literals(
     mut manifest: impl FnMut(&str) -> Option<String>,
 ) -> Vec<WorkspaceLiteralHeal> {
     let head = lines.iter().take(5).cloned().collect::<Vec<_>>().join("\n");
-    if !lock_version(&head).is_some_and(|v| v >= 1) {
+    if lock_version(&head).is_none_or(|v| v < 1) {
         return Vec::new();
     }
-    let Some((members, deps)) = parse_workspaces_section(lines) else {
+    let Some(WorkspacesSection { members, deps }) = parse_workspaces_section(lines) else {
         return Vec::new();
     };
     let mut manifests = std::collections::HashMap::<String, Option<serde_json::Value>>::new();
