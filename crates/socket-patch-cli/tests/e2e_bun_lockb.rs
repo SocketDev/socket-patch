@@ -1079,10 +1079,12 @@ async fn native_binary_alias_and_transitive() {
 /// an unfrozen one drops the pin. A hosted re-run must restore the
 /// manifest's `workspace:*`, after which a fresh frozen install from the
 /// text lock gets the patched bytes. Needs a Bun >= 1.4 reader (the only
-/// releases whose text reader re-resolves on the path literal).
+/// releases whose text reader re-resolves on the path literal). Not named
+/// `native_binary_*`: scripts/backtest-bun-lockb.py runs exactly those
+/// three tests per writer/reader cell; this one has its own 1.4.2 CI leg.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
-async fn native_binary_workspace_text_migration_heals_on_rerun() {
+async fn workspace_text_migration_heals_on_rerun() {
     let Some(fixture) = Fixture::new("workspace") else {
         return;
     };

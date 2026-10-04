@@ -231,7 +231,7 @@ runners) from the GitHub releases and verifies it against `SHASUMS256.txt`. Ever
   the migrated lock restores the manifest's `workspace:` literal (Bun's own
   spelling) whenever the lock holds a pin; version-0 locks, where Bun 1.1
   writes the bare path itself, are left alone. Covered by
-  `e2e_bun_lockb::native_binary_workspace_text_migration_heals_on_rerun`
+  `e2e_bun_lockb::workspace_text_migration_heals_on_rerun`
   on the 1.4.2 leg.
 - **Workspace-member local tarballs.** Bun 1.2.x–1.3.x resolve a
   local-tarball dependency declared by a workspace member relative to the
