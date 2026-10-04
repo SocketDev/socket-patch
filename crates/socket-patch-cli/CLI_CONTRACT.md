@@ -565,7 +565,10 @@ non-derivable field; a binary `bun.lockb` record is rebuilt like the takeover's)
 remedy, nothing touched; (3) `--dry-run` stops here and reports each pin as an `applied` event with
 reason `eject_planned` — no file is written and no `.socket/` is created; (4) the wet run snapshots
 every file the eject may touch under one `apply.lock`, restores upstream, then vendors. If any
-package then fails, the snapshot is put back — the project stays hosted exactly as before, with the
+package then fails, exactly the files the eject wrote are put back (the pins' files, the upstream
+restore's files, and every file the vendored apply committed, each only when its bytes changed) —
+the project stays hosted exactly as before, and every other file (a `--json > report.json` redirect
+target, a log another process appends to) is left alone, with the
 `eject_rolled_back` warning and `partial_failure`, exit 1; if putting the snapshot back itself fails,
 the error is `eject_rollback_failed` naming the files to `git checkout`. The eject does not emit the
 per-purl `vendor_takeover_reverted_redirect` warning (the restore is its own planned step).
