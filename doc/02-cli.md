@@ -179,6 +179,8 @@ That is **7 verbs instead of 9 visible + 2 hidden + 2 aliases + 3 hidden flag sp
 
 - {{C43}} `--manifest-path` interleaves two projects' state. `GlobalArgs::project_root()` documents that every multi-store command derives its stores from the manifest's project, and `list`, `apply` and `vendor --check` do. But `rollback`, `remove`, `repair`, `apply --check`, `vex`, `scan` and `get` load the vendored ledger from `--cwd`. `rollback` also locks the manifest's `.socket/` while writing the cwd ledger. On `045d7ec`, with a corrupt ledger in `--cwd` and `--manifest-path ../b/.socket/manifest.json`, `list` succeeded while `vex`, `rollback` and `repair` failed on the cwd ledger; with the corruption moved to `b`, the results inverted.
 
+- {{C44}} The ecosystem-name parser is written three times. `--ecosystems`/`SOCKET_ECOSYSTEMS` require an exact, case-sensitive `cli_name()` with no trim, socket.yml `patches.ecosystems` trims and lowercases, and `vendor::ecosystem_in_scope` has its own exact lookup. On `045d7ec`, `-e NPM`, `-e "npm, pypi"` and `SOCKET_ECOSYSTEMS=PyPI` exit 2, while `ecosystems: [NPM, pypi]` parses. `--min-severity` and `minSeverity` already share one parser.
+
 (The `C38` pacing finding is in Part 7.)
 
 ---

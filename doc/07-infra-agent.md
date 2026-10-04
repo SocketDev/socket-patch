@@ -2,7 +2,7 @@
 
 ## Part 7: Core infrastructure and agent (in-place) mode
 
-_Last checked against main @ 045d7ec on 2026-10-04 by audit-core. Owner: audit-core._ Only the timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing, UUID, env/home-dir, atomic-write, purl and dead-code passages have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ 045d7ec on 2026-10-04 by audit-core. Owner: audit-core._ Only the timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing, UUID, env/home-dir, atomic-write, purl, dead-code, telemetry and apply/rollback-engine passages have been re-checked; the rest is as of `2463257`.
 
 > Scope: `api/*`, `manifest/*`, `ledgers.rs`, `constants.rs`, `patch/` (excluding `redirect/`), `policy/*`, `rollout*`, `update/*`, the CLI `update_notifier.rs`/`update.rs`, `telemetry.rs`, and the generic `utils/*` and `hash/*`.
 
@@ -95,7 +95,7 @@ Counting the agent arms in `scan`, `get` and `rollback`, agent mode is **about 6
 
 The default `MismatchPolicy::Warn` silently overwrites locally modified dependency files with the verified content; `--strict` is opt-in.
 
-**Apply and rollback are mirror images.** `VerifyStatus`/`VerifyResult` and `VerifyRollbackStatus`/`VerifyRollbackResult` have identical fields. `fold_copy_result`, the pnpm peer-copy fan-out and the sidecar boundary are each written twice. Rollback is apply with before/after swapped, plus deleting files the patch created, and could be one engine.
+**Apply and rollback are mirror images.** `VerifyStatus`/`VerifyResult` and `VerifyRollbackStatus`/`VerifyRollbackResult` have identical fields. `fold_copy_result`, the pnpm peer-copy fan-out and the sidecar boundary are each written twice, and the two folds have already drifted: apply carries only the ownership advisory, rollback any advisory, and both drop the copy's per-file records, so a run that writes only a store copy reports `already_patched`/`already_original` (#756). Rollback is apply with before/after swapped, plus deleting files the patch created, and could be one engine. {{C24}}
 
 **`--download-mode diff` is the default and is a net loss (verified).** On a cold cache it fetches every diff archive *and then every blob anyway*:
 - `blob_scope = manifest` whenever any archive was missing (`fetch_stage.rs:377-385`);
@@ -122,7 +122,7 @@ Maven sidecars are not handled at all. This code exists only for in-place mode.
 | Feature | Prod / tests | Verdict |
 |---|---|---|
 | **Self-update + passive notifier** | 2,351 / 5,689 | Only `Standalone` installs self-update; npm, cargo and brew are redirected to their own tools. Still detects the pre-v5 `Pypi` and `LauncherCache` channels, which is a live refusal for old installs, not dead code. Two metadata strategies, a separate lock, and its own stage writer. **Keep the notifier; replace `--update` with "re-run install.sh"** (or keep a much thinner swap). Up to −1K production and −3K test lines. |
-| **Telemetry** | 891 / 864 | 17 near-identical `track_*` wrappers (~450 lines); a new HTTP client per event; endpoint logic duplicated; the CLI threads token/org through 125 signature sites. **Collapse to one `track(Event)` with a shared client** (~−300). |
+| **Telemetry** | 891 / 864 | 19 near-identical public wrappers (17 `track_*` + 2 `spawn_*`, ~450 lines); a new HTTP client per event; endpoint logic duplicated. The CLI passes token/org at ~45 call sites in 10 command files, plus 5 helper signatures (not 125), and resolves them two ways: `telemetry_credentials()` in `list`/`vex`, the API client's getters elsewhere. **Collapse to one `Telemetry` handle with `track(Event)` and a shared client** (~−300). {{C22}} |
 | **Failpoints** | 65 | Fine (compiled out of release). But `switched_off("group_commit")` keeps the *old non-group-commit path* alive as a test oracle. |
 | **group_commit + durability** | 1,376 / 1,287 | A process-wide virtual filesystem: every `utils::fs` read and write consults it. It renders typed values lazily via `Any`, does three-way hand-edit reconciliation in `recover`, and still journals `redirect-state.json`, which nothing writes. Writes that bypass `utils::fs` are silently not captured. High-cost machinery for a vendored-run speedup; see 5.7 for the root-cause fix. |
 | **socket.yml policy** | 1,942 / 2,211 | Real value. But `socket_yml.rs` builds its own YAML node tree on serde-saphyr's *event* parser (`:36-320`) to read **8 keys**, with edit-distance "did you mean" hints and repository-ownership trust checks. The `deserialize` feature is enabled, but nothing uses it through serde. **Replace with serde + `deny_unknown_fields`** plus a small strictness check (~−500). |
@@ -135,8 +135,8 @@ Maven sidecars are not handled at all. This code exists only for in-place mode.
 1. **Make `file` the default download mode** and delete the diff machinery: −600 production, −1K tests, −1 dependency. Low risk.
 2. **One retry and timeout primitive** across every HTTP path, so the JSON and blob paths get timeouts: −200 production. **Fixes possible indefinite hangs.** Medium risk, because tests pin the current semantics.
 3. **Delete the verified dead and legacy code:** `mem_blobs`, the always-true `VendorSource` predicates, the `redirect-state.json` group-commit `LEDGERS` entry, and the `switched_off("group_commit")` oracle path. About −60 production, −350 tests. {{C23}} (The `Pypi`/`LauncherCache` update channels are *not* dead: they make `--update` refuse to swap a pre-v5 pip/gem-owned binary and print a migration hint.)
-4. **Fold rollback into the apply engine** (swap hashes, keep a delete branch for created files): −300 production.
-5. **One telemetry `track(Event)`** with a shared client: −300.
+4. **Fold rollback into the apply engine** (swap hashes, keep a delete branch for created files): −300 production. {{C24}}
+5. **One telemetry `track(Event)`** with a shared client: −300. {{C22}}
 6. **One validated purl builder family**, and `Ecosystem::from_purl` for type checks: −250.
 7. **Small helper consolidation:**
    - digest compute vs. validate;
