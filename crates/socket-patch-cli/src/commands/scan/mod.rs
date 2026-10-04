@@ -2832,7 +2832,12 @@ async fn run_scan(
             // rendered as `[would-refuse]` lines so a preview never
             // advertises vendoring the wet run would refuse.
             let preview = if vendor {
-                Some(preview_vendor_json(&args.common.cwd, &selected).await)
+                let takeover = crate::commands::vendor::gem_takeover_preview_refusals(
+                    &args.common,
+                    selected.iter().map(|p| p.purl.as_str()),
+                )
+                .await;
+                Some(preview_vendor_json(&args.common.cwd, &selected, &takeover).await)
             } else {
                 None
             };

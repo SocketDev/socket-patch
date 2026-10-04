@@ -1003,6 +1003,66 @@ fn emit_eject_refusal(common: &GlobalArgs, code: &'static str, message: &str) ->
     1
 }
 
+/// The gem vendored backend's refusals a hosted→vendored takeover raises
+/// BEFORE it restores `pin` upstream, so a gem vendored mode cannot wire
+/// keeps its hosted wiring instead of ending up unpatched in both modes:
+/// the manifest gate (a `gems.rb` twin, `BUNDLE_GEMFILE`) and the Gemfile
+/// declaration gate on the restored Gemfile (a declaration inside a
+/// `group` block, #775).
+async fn gem_takeover_refusal(
+    cwd: &Path,
+    candidate: &str,
+    pin: &HostedPin,
+    restore_opts: &socket_patch_core::patch::redirect::upstream::RestoreOptions,
+) -> Option<(&'static str, String)> {
+    match socket_patch_core::vendor::gem::gem_manifest_refusal(cwd).await {
+        Some(refusal) => Some(refusal),
+        None => {
+            socket_patch_core::vendor::gem::gem_vendor_target_preflight(
+                cwd,
+                candidate,
+                pin,
+                restore_opts,
+            )
+            .await
+        }
+    }
+}
+
+/// [`gem_takeover_refusal`] for the dry-run preview of `scan` / `get
+/// --mode vendored`: each selected gem purl the lockfiles still pin hosted
+/// whose takeover the wet run would refuse, keyed by the selected purl.
+/// Nothing is written (the restore is resolved as a dry run).
+pub(crate) async fn gem_takeover_preview_refusals<'a>(
+    common: &GlobalArgs,
+    purls: impl Iterator<Item = &'a str>,
+) -> HashMap<String, (&'static str, String)> {
+    let gems: Vec<&str> = purls.filter(|p| p.starts_with("pkg:gem/")).collect();
+    let mut refusals = HashMap::new();
+    if gems.is_empty() {
+        return refusals;
+    }
+    let pins = HostedPin::all(&crate::commands::discover_wiring(common, &common.cwd).await);
+    let restore_opts = socket_patch_core::patch::redirect::upstream::RestoreOptions {
+        dry_run: true,
+        offline: common.offline,
+        patch_server_origins: crate::commands::rollback::patch_server_origins(common),
+        bun_lockb: true,
+    };
+    for purl in gems {
+        let Some(pin) = pins
+            .iter()
+            .find(|pin| canonical_purl(&pin.purl) == canonical_purl(purl))
+        else {
+            continue;
+        };
+        if let Some(refusal) = gem_takeover_refusal(&common.cwd, purl, pin, &restore_opts).await {
+            refusals.insert(purl.to_string(), refusal);
+        }
+    }
+    refusals
+}
+
 /// The hosted pins whose ecosystem `--ecosystems` selects.
 fn hosted_pins_in_scope(common: &GlobalArgs, pins: Vec<HostedPin>) -> Vec<HostedPin> {
     pins.into_iter()
@@ -2395,11 +2455,13 @@ pub(crate) async fn vendor_records_reusing(
                 // code and detail, in the dry run and the wet run alike —
                 // so the hosted wiring stays untouched.
                 // The gem backend's manifest refusal, likewise raised before
-                // the restore (a hosted `gems.rb` project cannot vendor).
+                // the restore (a hosted `gems.rb` project cannot vendor), and
+                // its Gemfile declaration refusal, evaluated on the restored
+                // Gemfile (a gem declared inside a `group` block stays hosted).
                 if candidate.starts_with("pkg:gem/") {
-                    if let Some((code, detail)) =
-                        socket_patch_core::vendor::gem::gem_manifest_refusal(&common.cwd).await
-                    {
+                    let refusal =
+                        gem_takeover_refusal(&common.cwd, candidate, pin, &restore_opts).await;
+                    if let Some((code, detail)) = refusal {
                         has_errors = true;
                         env.record(
                             PatchEvent::new(PatchAction::Failed, candidate.clone())
