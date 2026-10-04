@@ -1,5 +1,5 @@
 ### Ecosystems and formats (`audit-ecosystems`)
-_Last updated 2026-10-04T13:01Z · main @ 045d7ec_
+_Last updated 2026-10-04T18:48Z · main @ 045d7ec_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -30,7 +30,7 @@ _Last updated 2026-10-04T13:01Z · main @ 045d7ec_
 | E25 | 3 | Per-backend copies: `cleanup_failed_stage`, `<eco>_service_copy` (cargo, composer, gem, golang), and the `service_preflight_names_exactly_*` test copied seven times. | 5.4; 5.8 | | to verify |
 | E26 | 3 | JVM has two Maven backends. Target: merge `maven_repo.rs` into `jvm/` as `Shape::Single`. Its three artifact roots don't follow `<eco>/<uuid>`. | 5.7 | | to verify |
 | E27 | 3 | The per-package call model needs ~3K lines of compensating machinery (`group_commit`, `durability`, `prestage`, `vendor_prefetch`, 22 `ParseMemo` statics, `ledger_snapshots`). Target: batched pure planners, after E21 and E24. | 2.4; 5.7 | | to verify |
-| E28 | 2 | Dead vendored scaffolding: `VendorSource` / `PackageSource` have one variant each, the `SERVICE_ECOSYSTEMS` refusal can never fire, `ServicePolicy::new` ignores its config, `vend_installed!` has no target, and several docs are stale. | 5.6; R11 | | to verify |
+| E28 | 2 | Dead vendored scaffolding: `VendorSource` / `PackageSource` have one variant each, the `SERVICE_ECOSYSTEMS` refusal can never fire, `ServicePolicy::new` ignores its config, `vend_installed!` has no target, and several docs are stale. | 5.6; R11 | #800, #746 | filed #800, #746; `VendorSource` predicates and `mem_blobs` are #746 (C23) |
 | E29 | 3 | `registry_fetch.rs` (1.5K lines) is really archive extraction, integrity checks and the hosted-restore HTTP client, so it is misnamed and in the wrong place. | 5.6 | | to verify |
 | E30 | 2 | Split `redirect/mod.rs` (17.5K lines) mechanically: `model`, `driver`, one file per ecosystem, `hosted_url`, and sibling test files. | 3.7 #1 | | to verify |
 | E31 | 2 | Tracking: `trait HostedRewriter` + `Outcome { per_dep }`. It replaces the 20 uuid sets in `RewriteResult`, `merge_group_delta`, the 16-rule `confirm()` and eight parallel tables. | 2.1; 3.7 #2 | | to verify |
@@ -43,7 +43,7 @@ _Last updated 2026-10-04T13:01Z · main @ 045d7ec_
 | E38 | 2 | The product-manifest probe table is copied three times and has drifted: `vex.rs` lacks the csproj and gemspec probes. The probes don't reuse the format parsers. | 6.4; 6.5 | | to verify |
 | E39 | 3 | `canonicalize_pypi_name` lives in `crawlers/` (29 importers), and `Ecosystem` lives in `crawlers/types.rs` while `LockfileEntry.ecosystem` is a string. Target: `core/src/ecosystem.rs`. | 2.1; 6.4 | | to verify |
 | E40 | 2 | `vex_consumed.rs`, in the CLI, is a third copy of package-manager layout knowledge. Target: move it into per-ecosystem locators in core. | 6.5 | | to verify |
-| E41 | 2 | Dead discovery code: `lock_inventory/wired.rs` has no production caller, `vex/discover/deno.rs` is an empty extractor, and the pre-v5 redirect-ledger readers (~430 lines) remain. | 6.4; 6.5; R11 | | to verify |
+| E41 | 2 | Dead discovery code: `lock_inventory/wired.rs` has no production caller, `vex/discover/deno.rs` is an empty extractor, and the pre-v5 redirect-ledger readers (~430 lines) remain. | 6.4; 6.5; R11 | #801 | filed #801; `deno.rs` empty extractor is deliberate, pre-v5 ledger readers are live migration |
 | E42 | 2 | The embedded `--vex` glue is copied per command (scan, apply, and vendor ×3), each with caller-injected bypass sets. Target: one `EmbeddedVex` helper. | 6.5; R13 | | to verify |
 | E43 | 2 | Fail closed on unmodeled resolution config in one shared place: `go.work`, `gradle.lockfile`, `BUNDLE_GEMFILE`, `virtualStoreDir`, `install-strategy=linked`, `globalPackagesFolder`, mirrors. | 2.2 #3 | | to verify |
 | E44 | 2 | Decide: the napi addon and in-memory engine. Will depscan adopt it (then delete the TS rewriters), or should it be deleted (−4.8K prod)? | §6 Q1; 3.7 #6 | | to verify |

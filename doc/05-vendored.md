@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ 045d7ec on 2026-10-04 by audit-ecosystems (5.4 Python, Cargo, Maven XML, Gem and Go). Owner: audit-ecosystems._
+_Last checked against main @ 045d7ec on 2026-10-04 by audit-ecosystems (5.4 Python, Cargo, Maven XML, Gem and Go; 5.6 scaffolding). Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -175,11 +175,11 @@ A malicious PR that commits a crafted `.nupkg` can make CI's `vendor --check` / 
 ### 5.6 Scaffolding left over from the removed local-build path
 
 v5 removed local artifact building, but the scaffolding remains:
-- `VendorSource` has one variant, and `may_use_service()`/`requires_service()` always return `true` (`mod.rs:212-237`).
-- `PackageSource` has one variant.
-- `SERVICE_ECOSYSTEMS` lists every ecosystem, so its refusal can never fire.
+- `VendorSource` has one variant, and `may_use_service()`/`requires_service()` always return `true` (`mod.rs:212-237`). Deleting the predicates is #746 (audit-core C23).
+- `PackageSource` has one variant, but 53 production references across 19 files take `impl Into<PackageSource>` only to call `.path()`. One of them is `redirect/golang_local.rs`, which adds a `redirect` → `vendor` import. {{E28}}
+- `SERVICE_ECOSYSTEMS` lists every name `ecosystem_dir_for_purl` can return, so its `vendor_service_unsupported_ecosystem` refusal can never fire. The code's only test asserts its absence. {{E28}}
 - `ServicePolicy::new(_cfg)` ignores its config, and `miss()` does `let _ = (warnings, code)`.
-- `vend_installed!` exists for a "registry-fetch rung" whose function no longer exists.
+- `vend_installed!` exists for a "registry-fetch rung" whose function no longer exists. Its `debug_assert!` matches the only `PackageSource` variant, so it always holds. {{E28}}
 - `PatchSources::mem_blobs` (`patch/apply.rs:96`) is `None` at every production construction site.
 - Stale docs:
   - `args.rs:59` still lists `build` as valid;
