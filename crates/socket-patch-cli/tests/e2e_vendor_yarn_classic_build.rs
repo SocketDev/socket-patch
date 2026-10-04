@@ -888,7 +888,12 @@ fn yarn_classic_vendor_refuses_a_symlinked_lock() {
     .unwrap();
     let cache = tmp.path().join("yarn-cache");
     let cache_env = [("YARN_CACHE_FOLDER", cache.to_str().unwrap())];
-    let install = corepack(&proj, &yarn_classic(), &["install", "--no-progress"], &cache_env);
+    let install = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--no-progress"],
+        &cache_env,
+    );
     if !install.status.success() {
         skip!(
             "fixture `yarn install` failed (registry unreachable?):\n{}",
@@ -928,7 +933,8 @@ fn yarn_classic_vendor_refuses_a_symlinked_lock() {
         "dry run predicts the refusal: {env}"
     );
 
-    let (code, stdout, stderr) = run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+    let (code, stdout, stderr) =
+        run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
     assert_eq!(code, 1, "vendor.\nstdout:\n{stdout}\nstderr:\n{stderr}");
     let env = parse_envelope(&stdout);
     assert_eq!(
