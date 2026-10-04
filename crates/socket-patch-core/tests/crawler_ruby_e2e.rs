@@ -659,6 +659,70 @@ async fn get_gem_paths_env_root_still_includes_gempath_homes() {
     );
 }
 
+/// #796: a Bundler 4 `bundle install --standalone` project has NO
+/// `.bundle/config` — only `bundle/bundler/setup.rb` plus the
+/// `bundle/ruby/<abi>/gems/` store the app loads. With the same
+/// `name-version` also installed in an ambient gem home, the standalone
+/// copy must be discovered, and ranked ahead of the `gem env` homes, so
+/// apply patches the copy the app actually loads (and VEX judges it)
+/// instead of patching only the ambient copy.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn get_gem_paths_finds_bundler4_standalone_tree_before_gem_homes() {
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        tmp.path().join("Gemfile"),
+        b"source \"https://rubygems.org\"\ngem \"rack\", \"~> 3.1\"\n",
+    )
+    .await
+    .unwrap();
+    let standalone = tmp.path().join("bundle");
+    let standalone_gems = standalone.join("ruby").join("3.3.0").join("gems");
+    let standalone_copy = stage_gem(&standalone_gems, "rack", "3.2.7").await;
+    tokio::fs::create_dir_all(standalone.join("bundler"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        standalone.join("bundler").join("setup.rb"),
+        "require 'rbconfig'\n",
+    )
+    .await
+    .unwrap();
+
+    // The ambient copy of the SAME version in the gem home `gem env` reports.
+    let home = tempfile::tempdir().unwrap();
+    let home_gems = home.path().join("gems");
+    let ambient_copy = stage_gem(&home_gems, "rack", "3.2.7").await;
+    let bin = tempfile::tempdir().unwrap();
+    install_fake_gem(bin.path(), home.path());
+
+    let crawler = RubyCrawler;
+    let options = options_at(tmp.path());
+    let paths = with_path(bin.path(), || async {
+        crawler
+            .get_gem_paths_with_env(&options, None, None, None)
+            .await
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        paths,
+        vec![standalone_gems.clone(), home_gems.clone()],
+        "standalone store first, then the gem-env home; got {paths:?}"
+    );
+
+    // Every physical copy the apply fan-out iterates includes the
+    // standalone one, found under the PRIMARY store.
+    let purls = ["pkg:gem/rack@3.2.7".to_string()];
+    let mut found = Vec::new();
+    for gems_dir in &paths {
+        let hits = crawler.find_each_by_purl(gems_dir, &purls).await;
+        found.extend(hits.into_iter().flatten().map(|p| p.path));
+    }
+    assert_eq!(found, vec![standalone_copy, ambient_copy]);
+}
+
 // ── global gem discovery ───────────────────────────────────────
 
 #[tokio::test]
