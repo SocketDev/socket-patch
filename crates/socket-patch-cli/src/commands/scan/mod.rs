@@ -2760,7 +2760,7 @@ async fn run_scan(
         }
     }
 
-    if selected.is_empty() && !(reapply && !already_recorded.is_empty()) {
+    if selected.is_empty() && (!reapply || already_recorded.is_empty()) {
         if !silent {
             open_paragraph(&mut skip_paragraph);
             if !stage.deferred_keys().is_empty() {
