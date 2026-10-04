@@ -151,6 +151,7 @@ jobs:
         with:
           name: proj-${{ matrix.os }}
           path: out/
+          include-hidden-files: true
   consume:
     needs: produce
     runs-on: ${{ matrix.os }}
