@@ -119,4 +119,5 @@ mod tests {
         assert_eq!(majority_terminator("a\r\nb\n"), "\n", "a tie is LF");
         assert_eq!(majority_terminator("{}"), "\n", "no break: LF, not os.EOL");
     }
+
 }

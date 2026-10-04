@@ -25,7 +25,10 @@ fn run_get(cwd: &Path, args: &[&str]) -> (i32, String) {
     for var in GLOBAL_ARG_ENV_VARS {
         cmd.env_remove(var);
     }
-    for var in ["SOCKET_SAVE_ONLY", "SOCKET_ALL_RELEASES"] {
+    for var in [
+        "SOCKET_SAVE_ONLY",
+        "SOCKET_ALL_RELEASES",
+    ] {
         cmd.env_remove(var);
     }
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
