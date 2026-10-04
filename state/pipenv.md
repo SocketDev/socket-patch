@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-03 21:36Z, main `045d7ec` (CLI 4.0.0, unchanged). Filed #725 (`vendor --check` reports wiring verified after `pipenv lock` drops the vendored reference). Passing: a `pypi`-named mirror source (hosted / vendored on 2018 / 2026, rollback refusal documented); a hosted path-prefixed server on Pipenv 11 / 2018 / 2022; a transitive entry with markers. PR #654 (`d8356ae`, #645 + #546) is still unmerged.
+Last run: 2026-10-04 03:36Z, main `045d7ec` (CLI 4.0.0, unchanged). Filed #744 (hosted `scan --dry-run --vex --json` drops the `vex` dry_run marker). Commented on #645 (hosted VEX in the #645 shape attests a false `not_affected`; PR #654 fixes it) and on #725 (uuid-drift shapes). Passing: in-run hosted `--vex` with a stale OOT venv on 2018 / 2022 / 2026 (also with `--vex-no-verify`), and after the remedy; `--dry-run` writes nothing (all modes); vendored `remove`. PR #654 (`d8356ae`, #645 + #546) is still unmerged.
 
 ## Coverage matrix
 
@@ -50,17 +50,19 @@ Hosted `pipenv requirements --hash` sibling (2022 / 2026, `045d7ec`): hash mode 
 
 `pypi`-named `[[source]]` on a mirror (no pypi.org in `_meta.sources`), `21:36Z` run, `045d7ec`: hosted lock-only on 2018.11.26 / 2026.8.0 (sync / --deploy PATCHED, vex `not_affected`) pass; hosted rollback refused (documented); vendored on 2018 / 2026 (sync / --deploy / check / vex / byte-exact rollback) pass. Hosted path-prefixed server (`/cdn/v2`), lock-only: Pipenv 11.10.4 (`path`), 2018.11.26 and 2022.12.19 (--deploy, vex, idempotent re-scan, byte-exact rollback) pass. A transitive entry with `markers` and no `index` (hosted, 2026): pass. Vendored, then `pipenv lock` (ref dropped) on 2018 / 2022 / 2023 / 2026: vex `vendor_unwired` (correct), but `vendor --check` stays green: fail #725.
 
+In-run VEX (`scan --vex`), `04:00Z` run, `045d7ec`: hosted with a stale OOT venv on 2018 / 2022 / 2026 omits the patch and exits 1 with `no_applicable_patches` (also with `--vex-no-verify`), and attests after the remedy (pass). Vendored in-run VEX over a warm unpatched venv attests with `vendored_tree_out_of_sync` (documented). Hosted `.venv` + WORKON + `PIPENV_VENV_IN_PROJECT=0` with WORKON patched (2018 / 2022): in-run and standalone vex give a false `not_affected` (fail #645; PR #654 fixes it). `--dry-run` hosted / vendored / agent scan and hosted / vendored get write nothing (pass); hosted JSON drops the vex dry_run marker (fail #744). Vendored `remove` gives a byte-exact lock (pass). `vendor --check` with the file ref pointing at another or missing uuid stays green (fail #725).
+
 macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-03 03:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
 
-0. Re-verify #645 once it's fixed (PR #654 `d8356ae` already passes the agent + hosted-warning repros on 2018 / 2022) (2018 / 2022 / 2023.10.24 with `PIPENV_VENV_IN_PROJECT=0`, `=false`, `PIPENV_NO_VENV_IN_PROJECT=1`; 2023.11.14+ must keep using WORKON). Also check its hosted shape: the stale warning and vex look at WORKON while Pipenv ≤ 2023.10 installs into `.venv`.
+0. Re-verify #645 once it's fixed (now including hosted in-run / standalone VEX, which gives a false `not_affected` on main and passes on `d8356ae`) (PR #654 `d8356ae` already passes the agent + hosted-warning repros on 2018 / 2022) (2018 / 2022 / 2023.10.24 with `PIPENV_VENV_IN_PROJECT=0`, `=false`, `PIPENV_NO_VENV_IN_PROJECT=1`; 2023.11.14+ must keep using WORKON). Also check its hosted shape: the stale warning and vex look at WORKON while Pipenv ≤ 2023.10 installs into `.venv`.
 1. #612 variants still open: `-r` includes in vendored mode. Re-verify once fixed. (Revert / rollback on the half-wired project pass.)
 2. Re-verify #546 once it's fixed: `.env` with `PIPENV_CUSTOM_VENV_NAME`, `WORKON_HOME`, `PIPENV_VENV_IN_PROJECT=0` + `.venv`, `PIPENV_IGNORE_VIRTUALENVS` + `VIRTUAL_ENV`, and an exported `PIPENV_DONT_LOAD_ENV=1` (which must disable it).
 3. Re-verify #504 and the #454 human-mode gap once they're fixed.
 4. #567 variants: vendored mode with an `-r` include, `remove`, `-c` constraints; re-verify once fixed.
 5. **Maintainer request (global `-g` mode):** still to do: macOS / Windows, `-g` on 2018 / 11, and `--global-prefix` as a venv root (scans 0; undocumented). Checklist in the 20261001T040000Z entry.
-6. Re-verify #725 once fixed, plus other wiring-drift shapes: a hand-edited `file` ref to a different uuid, the entry moved to `develop`, and `pipenv install <other>` on 2023. (Mirror-named `pypi` source and hosted path-prefix on 11 / 2018 / 2022 done 2026-10-03 21:36Z, pass.)
+6. Re-verify #725 once fixed (incl. the uuid-drift shapes), and #744. Still to do: `pipenv install <other>` on 2023, and `vendor --vex` / `apply --vex` dry-run markers. (Mirror-named `pypi` source and hosted path-prefix on 11 / 2018 / 2022 done 2026-10-03 21:36Z, pass.)
 6b. Mixed sources (a mirror named `pypi` plus pypi.org under another name) with a transitive, index-less entry: hosted rollback restore.
 7. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546 / #645, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked until branch deletion through the git proxy works (still denied 2026-10-03 15:20Z).
 
@@ -107,3 +109,5 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - A hand-reformatted Pipfile.lock (2-space indent or minified) gets the hosted entry in Pipenv's 4-space style, so rollback is semantically exact but not byte-exact. Cosmetic: Pipenv re-serializes on any `pipenv lock`.
 - Pipenv 11.x crashes on `PIP_NO_CACHE_DIR=1` (its vendored pip9 `_build_session` TypeError): a sandbox env artifact, so unset it.
 - `repair` after a relock leaves an unwired vendored entry unwired (success, 0 events): documented as artifact-only. `get --mode vendored` re-wires it. (Only `vendor --check` staying green is a bug, #725.)
+- A vendored in-run or standalone VEX attests from the committed artifact even when a warm venv still holds the upstream bytes; it only warns `vendored_tree_out_of_sync` (CLI_CONTRACT, vendored evidence row). The `pypi_pipenv_stale_install` event beside it gives the Pipenv remedy.
+- Correction: in the #645 shape (`.venv` + WORKON + `PIPENV_VENV_IN_PROJECT=0`, Pipenv ≤ 2023.10), hosted vex is NOT conservative. With the WORKON venv patched it attests a false `not_affected` (the 10-03 note was wrong). That's #645.
