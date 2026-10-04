@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-04 (run 14), main `045d7ec`, latest release v4.0.0. Runs 5–14 added the cells in "Run 5 cells" through "Run 14 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-04 (run 15), main `045d7ec`, latest release v4.0.0. Runs 5–15 added the cells in "Run 5 cells" through "Run 15 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -103,13 +103,20 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - #591 shape: `vendor --check` OK and `repair` no-op: fail #591 (commented).
 - `yarn.lock` + `package-lock.json` together, H and V: pass. Hosted `vex` before reinstall: `not_applied`, pass. `--link-duplicates` agent apply / vex / rollback: pass.
 
+### Run 15 cells (Linux, `045d7ec`)
+- **Bundled copy (`bundledDependencies`) of the patched name@version beside the normal copy: fail #758.** The scan gives no warning. The hosted in-run `--vex` attests, and vendored in-run and post-install `vex` attest, while the bundled copy stays unpatched. Hosted post-install `vex` and agent mode are correct. 1.7.0 / 1.10.1 / 1.22.22.
+- `get <uuid> --mode hosted|vendored|agent` (project mode) + frozen install + vex: pass. `list` (H / V / A / CRLF+BOM merged-key workspace / `--json`): pass (1.22.22).
+- `scan --mode vendored --prune` after `yarn remove`: entry kept (`keptVendoredEntries`), fail #665 (PR #689 covers the prune path).
+- Vendored odd range keys merged into one block (hyphen, `||`, `>= <`, `v`-prefix) + frozen install + rollback byte-exact: pass. 20k-block lock hosted scan: 2.9 s, pass.
+- vendored → agent → reinstall → `apply` → rollback → frozen reinstall: pass (1.22.22).
+
 ## Backlog
 
-1. Re-check #363 (PR #710) / #665 (PR #689) / #664 (PR #666) once merged; re-run #364 on macOS/Windows; re-check #467 / #519 / #558 / #591 / #627 / #691 / #692 once fixed.
-2. Windows directory junctions as `.socket/vendor/npm` (#664 shape), via a probe, after #666.
-3. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open.
-4. Same-size patched files on yarn ≤1.9 in-place installs (the mtime the service tarballs use can't be checked from the sandbox).
-5. agent → vendored takeover on macOS/Windows (#336 yarn leg); vendored → agent → rollback with a reinstall in between.
+1. Re-check #363 (PR #710) / #665 (PR #689, including `scan --prune`) / #664 (PR #666) once merged; re-run #364 on macOS/Windows; re-check #467 / #519 / #558 / #591 / #627 / #691 / #692 / #758 once fixed.
+2. #758 follow-ups: a real registry package with `bundledDependencies`; a lock-only hosted `vex` (bundling is invisible in yarn.lock).
+3. Windows directory junctions as `.socket/vendor/npm` (#664 shape), via a probe, after #666.
+4. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open.
+5. agent → vendored takeover on macOS/Windows (#336 yarn leg). Same-size patched files on yarn ≤1.9 in-place installs (can't be checked from the sandbox).
 
 ## Known non-bugs
 
@@ -164,3 +171,5 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - `vex` in a workspace root whose `package.json` has no `version` exits `product_undetected`. Pass `--product`.
 - yarn classic itself merges `left-pad@1.3.0` into an existing `left-pad@npm:async@1.3.0` block (it installs the fork for the real name). That's a yarn bug; socket-patch fails closed on that block in all modes.
 - With `yarn.lock` and `package-lock.json` both present, hosted rewrites both (and writes `.npmrc` allow-remote), and vendored wires `yarn.lock` with `vendor_multiple_lockfiles`. Intended.
+- After `yarn remove` of a vendored package, `list` still shows the entry as "recorded in .socket/vendor/state.json". That's accurate about the ledger; the cleanup gap is #665.
+- Rebuilt the mock in run 15: the public-proxy path also calls `GET /patch/by-package/<purl>` (a `SearchResponse` with the patch summary) before `/patch/view/<uuid>`. Without it, scan says "could not fetch patch details".
