@@ -1,0 +1,186 @@
+name: bughunt-uv
+on:
+  push:
+    branches: ['bughunt/uv/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        uv: ['0.8.17', '0.12.23']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo build --release -p socket-patch-cli
+      - name: tools
+        run: |
+          python -m pip install -q "uv==${{ matrix.uv }}"
+          mkdir -p "$RUNNER_TEMP/h/wh"
+          cd "$RUNNER_TEMP/h"
+          for spec in six==1.16.0 idna==3.7; do python -m pip download -q --no-deps -d wh "$spec"; done
+          python -m pip download -q --no-deps -d wh --only-binary=:all: --python-version 3.11 --platform manylinux_2_17_x86_64 MarkupSafe==2.1.5
+          cat > mock.py <<'MOCKEOF'
+          import base64, hashlib, http.server, io, json, os, re, sys, urllib.request, zipfile, ssl
+          S = os.path.dirname(os.path.abspath(__file__))
+          PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+          BASE = f"http://127.0.0.1:{PORT}"
+          TOKEN = "11111111-2222-4333-8444-555555555555"
+          SUFFIX = b"\n# SOCKET-PATCHED\nSOCKET_PATCHED = 1\n"
+          def gsha(b): return hashlib.sha256(b"blob %d\0" % len(b) + b).hexdigest()
+          def patch_wheel(src, target):
+              zin = zipfile.ZipFile(src); out = io.BytesIO(); members = []
+              rec_name = [n for n in zin.namelist() if n.endswith(".dist-info/RECORD")][0]
+              before = after = None
+              for n in sorted(zin.namelist()):
+                  if n == rec_name: continue
+                  b = zin.read(n)
+                  if n == target: before = b; b = b + SUFFIX; after = b
+                  members.append((n, b))
+              rec = ""
+              for n, b in members:
+                  d = base64.urlsafe_b64encode(hashlib.sha256(b).digest()).rstrip(b"=").decode()
+                  rec += f"{n},sha256={d},{len(b)}\n"
+              rec += f"{rec_name},,\n"; members.append((rec_name, rec.encode()))
+              with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+                  for n, b in members:
+                      zi = zipfile.ZipInfo(n, (2020,1,1,0,0,0)); zi.compress_type = zipfile.ZIP_DEFLATED; zi.external_attr = 0o644 << 16
+                      z.writestr(zi, b)
+              return out.getvalue(), before, after
+          PATCHES = {}
+          def add(uuid, name, ver, whl, target):
+              data, before, after = patch_wheel(os.path.join(S, "wh", whl), target)
+              purl = f"pkg:pypi/{name}@{ver}"
+              PATCHES[uuid] = dict(uuid=uuid, name=name, ver=ver, purl=purl, whl=whl, data=data,
+                  url=f"{BASE}/patch/pypi/{name}/{ver}/{TOKEN}/{uuid}/{whl}",
+                  files={target: {"beforeHash": gsha(before), "afterHash": gsha(after)}}, blobs={gsha(after): after, gsha(before): before})
+          add("aaaaaaaa-0000-4000-8000-000000000001", "six", "1.16.0", "six-1.16.0-py2.py3-none-any.whl", "six.py")
+          add("aaaaaaaa-0000-4000-8000-000000000002", "markupsafe", "2.1.5", "MarkupSafe-2.1.5-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", "markupsafe/__init__.py")
+          add("aaaaaaaa-0000-4000-8000-000000000003", "idna", "3.7", "idna-3.7-py3-none-any.whl", "idna/__init__.py")
+          ENABLED = set(os.environ.get("MOCK_PATCHES", "six").split(","))
+          def canon(n): return re.sub(r"[-_.]+", "-", n).lower()
+          def live(): return [p for p in PATCHES.values() if p["name"] in ENABLED]
+          def find_purl(purl):
+              m = re.match(r"pkg:pypi/([^@]+)@([^?#]+)", purl)
+              if not m: return None
+              for p in live():
+                  if canon(m.group(1)) == canon(p["name"]) and m.group(2) == p["ver"]: return p
+          def view(p):
+              return {"uuid": p["uuid"], "purl": p["purl"], "publishedAt": "2026-09-01T00:00:00Z", "files": p["files"],
+                      "vulnerabilities": {"GHSA-xxxx-yyyy-zzzz": {"cves": ["CVE-2026-0001"], "summary": "s", "severity": "high", "description": "d"}},
+                      "description": "bughunt patch", "license": "MIT", "tier": "free"}
+          def grant(p):
+              sri = "sha512-" + base64.b64encode(hashlib.sha512(p["data"]).digest()).decode()
+              return {"status": "granted", "purl": p["purl"], "url": p["url"], "artifacts": [
+                  {"kind": "tarball", "url": p["url"], "integrity": {"sha512": sri, "sha256": hashlib.sha256(p["data"]).hexdigest()}}], "registryOverride": None}
+          CTX = ssl.create_default_context(cafile="/root/.ccr/ca-bundle.crt") if os.path.exists("/root/.ccr/ca-bundle.crt") else ssl.create_default_context()
+          class H(http.server.BaseHTTPRequestHandler):
+              def log_message(self, *a):
+                  with open(os.path.join(S, "mock.log"), "a") as f: f.write(f"{self.command} {self.path}\n")
+              def send(self, code, body=b"", ctype="application/json", head=False):
+                  if isinstance(body, (dict, list)): body = json.dumps(body).encode()
+                  self.send_response(code); self.send_header("Content-Type", ctype); self.send_header("Content-Length", str(len(body))); self.end_headers()
+                  if not head: self.wfile.write(body)
+              def body(self):
+                  n = int(self.headers.get("Content-Length") or 0); raw = self.rfile.read(n) if n else b""
+                  try: return json.loads(raw or b"{}")
+                  except Exception: return {}
+              def do_HEAD(self): self.do_GET(head=True)
+              def do_GET(self, head=False):
+                  path = self.path.split("?")[0]
+                  for p in PATCHES.values():
+                      if path.endswith("/" + p["uuid"] + "/" + p["whl"]) or path.endswith("/artifacts/" + p["uuid"] + "/" + p["whl"]):
+                          return self.send(200, p["data"], "application/octet-stream", head)
+                  m = re.search(r"/view/([0-9a-f-]+)$", path)
+                  if m and m.group(1) in PATCHES and PATCHES[m.group(1)]["name"] in ENABLED: return self.send(200, view(PATCHES[m.group(1)]), head=head)
+                  m = re.search(r"/by-package/(.+)$", path)
+                  if m:
+                      from urllib.parse import unquote
+                      p = find_purl(unquote(m.group(1)))
+                      pl = [dict(view(p), vulnerabilities={})] if p else []
+                      return self.send(200, {"patches": pl, "canAccessPaidPatches": False}, head=head)
+                  m = re.search(r"/blob/([0-9a-f]+)$", path)
+                  if m:
+                      for p in PATCHES.values():
+                          if m.group(1) in p["blobs"]: return self.send(200, p["blobs"][m.group(1)], "application/octet-stream", head)
+                  if path.startswith("/pypi/"):
+                      try:
+                          with urllib.request.urlopen("https://pypi.org" + path, context=CTX, timeout=30) as r: return self.send(200, r.read(), head=head)
+                      except urllib.error.HTTPError as e: return self.send(e.code, b"", head=head)
+                  return self.send(404, {"error": "not found"}, head=head)
+              def do_POST(self):
+                  path = self.path.split("?")[0]; b = self.body()
+                  with open(os.path.join(S, "mock.log"), "a") as f: f.write(f"  body {json.dumps(b)[:300]}\n")
+                  if path.endswith("/patches/batch"):
+                      pk = []
+                      for c in b.get("components", []):
+                          p = find_purl(c.get("purl", ""))
+                          if p: pk.append({"purl": c["purl"], "patches": [{"uuid": p["uuid"], "purl": p["purl"], "tier": "free", "cveIds": ["CVE-2026-0001"], "ghsaIds": ["GHSA-xxxx-yyyy-zzzz"], "severity": "HIGH", "title": "bughunt"}]})
+                      return self.send(200, {"packages": pk, "canAccessPaidPatches": False})
+                  if path.endswith("/package"):
+                      res = {}
+                      ids = set()
+                      def walk(o):
+                          if isinstance(o, dict): [walk(v) for v in o.values()]
+                          elif isinstance(o, list): [walk(v) for v in o]
+                          elif isinstance(o, str):
+                              if o in PATCHES: ids.add(o)
+                              p = find_purl(o)
+                              if p: ids.add(p["uuid"])
+                      walk(b)
+                      for u in ids: res[u] = grant(PATCHES[u])
+                      return self.send(200, {"results": res})
+                  return self.send(404, {"error": "not found"})
+          http.server.ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+          MOCKEOF
+          cat > probe.sh <<'PROBEEOF'
+          set -u
+          M=http://127.0.0.1:8765
+          export SOCKET_TELEMETRY_DISABLED=1 SOCKET_NO_CONFIG=1 SOCKET_PYPI_JSON_API=$M/pypi
+          sp() { "$SP" "$@" --api-url $M --api-token fake --org acme --patch-server-url $M --vendor-url $M; }
+          res() { echo "RESULT $1: $2"; }
+          py() { if [ -x .venv/Scripts/python.exe ]; then .venv/Scripts/python.exe "$@"; else .venv/bin/python "$@"; fi; }
+          pat() { py -c 'import six;print(getattr(six,"SOCKET_PATCHED",0))' 2>&1 | tr -d '\r'; }
+          cachehits() { grep -rl "SOCKET-PATCHED" "$UV_CACHE_DIR" 2>/dev/null | wc -l | tr -d ' '; }
+          root=$PWD/work; rm -rf "$root"; mkdir -p "$root"
+          for lm in default hardlink copy; do
+            d="$root/a-$lm dir é"; mkdir -p "$d"; cd "$d"
+            if [ $lm = default ]; then unset UV_LINK_MODE; else export UV_LINK_MODE=$lm; fi
+            printf '[project]\nname = "app"\nversion = "0.1.0"\nrequires-python = ">=3.9"\ndependencies = ["six==1.16.0", "idna==3.7"]\n' > pyproject.toml
+            "$UV" lock -q; "$UV" sync -q
+            sp scan --mode agent --yes --json > s.json 2>s.err; res "$lm agent scan" "exit=$? patched=$(pat) cache_polluted=$(cachehits)"
+            sp vex --product pkg:pypi/app@0.1.0 --output vex.out.json > /dev/null 2>&1; res "$lm vex" "exit=$? not_affected=$(grep -c not_affected vex.out.json)"
+            "$UV" sync -q --reinstall-package six; res "$lm reinstall" "patched=$(pat)"
+            sp vex --product pkg:pypi/app@0.1.0 --output vex2.out.json > /dev/null 2>&1; res "$lm vex after reinstall" "exit=$? not_affected=$(grep -c not_affected vex2.out.json 2>/dev/null)"
+            sp apply --json > a.json 2>&1; res "$lm apply" "exit=$? patched=$(pat) cache_polluted=$(cachehits)"
+            rm -rf .venv; "$UV" sync -q; res "$lm fresh venv from cache" "patched=$(pat)"
+            sp apply --json > a2.json 2>&1; res "$lm apply2" "exit=$? patched=$(pat)"
+            sp rollback --yes --json > r.json 2>&1; res "$lm rollback" "exit=$? patched=$(pat) cache_polluted=$(cachehits)"
+            "$UV" pip uninstall -q six 2>&1 | tail -1; res "$lm uninstall after rollback" "exit=$? left=$(ls .venv/Lib/site-packages/six.py .venv/lib/python*/site-packages/six.py 2>/dev/null | wc -l | tr -d ' ')"
+            head -c 1500 s.err; grep -o '"code": *"[^"]*' s.json a.json r.json | sort | uniq -c
+            cd "$root"
+          done
+          PROBEEOF
+      - name: probe
+        run: |
+          cd "$RUNNER_TEMP/h"
+          (MOCK_PATCHES=six python mock.py 8765 > mock.out 2>&1 &)
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8765/v0/orgs/acme/patches/view/aaaaaaaa-0000-4000-8000-000000000001 >/dev/null && break; sleep 1; done
+          export SP="$GITHUB_WORKSPACE/target/release/socket-patch"
+          [ -f "$SP.exe" ] && SP="$SP.exe"
+          export UV="$(command -v uv)"
+          "$UV" --version
+          export UV_CACHE_DIR="$RUNNER_TEMP/uvcache"
+          bash probe.sh 2>&1 | tee probe.log
+          echo '--- RESULTS'; grep '^RESULT' probe.log
+          echo '--- mock log'; tail -30 mock.log || true; cat mock.out || true
