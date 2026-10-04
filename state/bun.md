@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-03 (run 13), main `045d7ec`, latest release 4.0.0, latest Bun 1.4.2.
+Last updated: 2026-10-04 (run 14), main `045d7ec`, latest release 4.0.0, latest Bun 1.4.2.
 
 Method: real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` to the mock. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -14,6 +14,8 @@ Run 12 (main unchanged at `045d7ec`, so no re-triage): no new bugs. Bun 1.1.39, 
 
 Run 13 (main unchanged at `045d7ec`, so no re-triage): new #720. Lockfile-only discovery can't see hosted pins, so a hosted re-run in CI never picks up a superseding patch, and `scan --mode vendored` skips the takeover. Both report success. The other new cells pass: the run 13 section below.
 
+Run 14 (main unchanged at `045d7ec`, so no re-triage): new #739. A `bun.lockb` holding `X@1.0.0` + `X@1.0.0-beta.1` is refused as a metadata-hash mismatch, and hosted exits 0 with nothing patched (a regression since 4.0.0). Bun cells added to #626 (agent mode overwrites first-party workspace members). The other new cells pass: the run 14 section below.
+
 ## Coverage matrix
 
 | OS | Bun | Agent: hoisted | Agent: isolated linker | Hosted/vendored: `bun patch` | Hosted/vendored: default-trusted scripts | Hosted → `vex`: isolated linker | Hosted rollback/remove byte-exact (text lock) | `bun.lockb` takeover ⇄ revert |
@@ -22,9 +24,9 @@ Run 13 (main unchanged at `045d7ec`, so no re-triage): new #720. Lockfile-only d
 | Linux | 1.1.45 | untested | n/a | untested | pass | n/a | pass (v0) | pass (semantic; run 10) |
 | Linux | 1.2.23 | pass | pass (opt-in; run 9) | fail #367 | pass | pass, but fail #599 after an in-place reinstall | untested | untested |
 | Linux | 1.3.0–1.3.4 | pass (1.3.0, 1.3.4) | pass (1.3.0, 1.3.4; run 9) | untested | pass | pass (1.3.0, 1.3.4; run 9) | pass (single: hosted + vendored; workspace: hosted, vendored refuses as documented) | untested |
-| Linux | 1.3.5–1.3.9 | untested | untested | fail #367 (1.3.9) | fail #371 | untested | untested | untested |
+| Linux | 1.3.5–1.3.9 | pass (1.3.9; run 14) | pass (1.3.9; run 14) | fail #367 (1.3.9) | fail #371 | untested | untested | untested |
 | Linux | 1.3.14 | pass | pass (run 9) | fail #367 | fail #371 | pass fresh; fail #599 in place | pass (v1, workspace, catalog) | pass (semantic; vendored lockb isolated workspace too; run 10) |
-| Linux | 1.4.2 | pass; fail #635 with `globalStore` | pass (run 9; peer-hash entries, symlink backend) | fail #367 (text + lockb) | fail #371 | pass fresh (text + lockb workspace); fail #599 in place | pass (v2, alias, overrides) | pass (semantic; not byte-exact, see Known non-bugs) |
+| Linux | 1.4.2 | pass; fail #635 with `globalStore`; fail #626 (first-party workspace member) | pass (run 9; peer-hash entries, symlink backend) | fail #367 (text + lockb) | fail #371 | pass fresh (text + lockb workspace); fail #599 in place | pass (v2, alias, overrides) | pass (semantic; not byte-exact, see Known non-bugs) |
 | macOS | 1.2.23 | pass | fail #366 | fail #367 | untested | fail #405 | untested | untested |
 | macOS | 1.3.4 / 1.3.5 | untested | untested | untested | pass / fail #371 | untested | untested | untested |
 | macOS | 1.3.14 / 1.4.2 | pass | fail #366 | fail #367 | fail #371 (1.4.2) | fail #405 | untested | untested |
@@ -56,6 +58,17 @@ No `Authorization` header reaches the hosted tarball host for any of: bunfig def
 
 ### Platform-specific optional deps (run 10, Linux)
 `os`/`cpu` meta (fsevents, @esbuild/darwin-arm64, @esbuild/linux-x64). The hosted rewrite keeps the meta, and Linux frozen installs fetch only linux-x64 (patched), on 1.1.45 v0 + lockb, 1.2.23, 1.3.14, 1.4.2 text + lockb: pass. Hosted rollback is byte-exact (1.4.2): pass. `minimumReleaseAge` with hosted pins (1.4.2): pass.
+
+### Run 14 cells (Linux)
+
+| Cell | Bun | Result |
+| --- | --- | --- |
+| Prerelease / build-metadata (`+`) / legacy-uppercase / scoped dotted names: hosted, vendored, agent (isolated), `vex`, rollback, `vendor --revert` | 1.4.2 text v2 | pass |
+| Same five on `bun.lockb`: hosted, frozen installs by each reader, hosted → vendored → revert | writer 1.1.45; readers 1.1.45 / 1.2.23 / 1.3.9 / 1.4.2 | pass (revert semantic) |
+| Agent / hosted / rollback | 1.3.9 v1, isolated | pass |
+| Root `X@1.0.0-beta.1` + nested `X@1.0.0` (also under a scoped parent), text lock | 1.4.2 | pass |
+| Same pair in `bun.lockb` (patch on any package) | writers 1.1.45 / 1.2.23 / 1.3.9 / 1.4.2 | fail #739 (hosted exit 0, vendored exit 1; v4.0.0 passes) |
+| Agent mode with a workspace member / `link:` target matching a patched `name@version` | 1.1.45 / 1.2.23 / 1.3.9 / 1.4.2 (hoisted + isolated) | fail #626 (npm-owned; `file:` passes, hosted / vendored safe) |
 
 ### Run 13 cells (Linux)
 
@@ -190,7 +203,7 @@ Other passes (Linux, 1.4.2 unless noted):
 
 0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open; re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
 1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still refused from the sandbox (runs 7–13), so no new probes until then.
-2. #720, #635 and #599: re-test when fixed. #720 follow-ups: `get --mode hosted|vendored` on a lockfile-only hosted checkout, and `maxNewPatches` counting with hosted pins it can't see. Also `globalStore` + workspaces, and `globalStore` on macOS/Windows.
+2. #739, #720, #635 and #599: re-test when fixed. #626 on Bun once PR #634 merges (isolated member links live under `packages/<member>/node_modules`). Legacy-dialect `meta_hash` with numeric prerelease identifiers (`beta.2` vs `beta.10`). #720 follow-ups: `get --mode hosted|vendored` on a lockfile-only hosted checkout, and `maxNewPatches` counting with hosted pins it can't see. Also `globalStore` + workspaces, and `globalStore` on macOS/Windows.
 3. macOS/Windows re-runs of the #366 / #405 / #469 fixes (Windows isolated uses junctions).
 4. #497 `github:` tuples (needs a probe); re-test #497 when fixed.
 5. Hosted rollback on real macOS and Windows checkouts.
@@ -242,3 +255,6 @@ Other passes (Linux, 1.4.2 unless noted):
 - `scan --json` `apply.patches[].action` (`added` / `skipped`) is the manifest record's state, not whether files were written.
 - `repair` doesn't recreate a deleted `socket-patch.vendor.json` sidecar. It's informational only (CLI_CONTRACT). A deleted `.socket/vendor/state.json` → `repair` `vendor_ledger_missing` (documented v5: restore it from VCS).
 - An interrupted vendored → hosted takeover can leave registry tuples (unpatched install) until the re-run. `vex` doesn't attest them, and the re-run heals.
+- Hosted rollback on a lock whose registry slot holds a full custom-registry tarball URL (Bun writes one for a non-default `[install] registry`) restores `""`. It's pinned by the `custom-registry` shape in `backtest-bun.py`, and the restored lock frozen-installs from the configured registry (run 14).
+- Bun resolves a dependency on `X@2.0.0+build.6` to an installed `X@2.0.0+build.5`, because semver ignores build metadata. That's Bun behaviour.
+- Bun copies `file:` directory deps into `node_modules`, so agent mode patches the copy, not the source. That's safe and not part of #626.
