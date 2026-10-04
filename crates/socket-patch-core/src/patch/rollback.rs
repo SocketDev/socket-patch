@@ -339,8 +339,10 @@ pub fn cannot_rollback_error(file: &str, why: &str) -> String {
 /// dry-run (verify only, so a preview fails closed on a copy that cannot
 /// be rolled back). Apply materializes patch-ADDED files in every copy
 /// too, so the deletes must reach every copy as well. A failed copy fails
-/// the whole result; the primary's per-file records are what the returned
-/// `RollbackResult` carries.
+/// the whole result; each copy's per-file records are merged into the
+/// returned `RollbackResult` with the file qualified by the copy's path, so
+/// a restore of a twin alone still counts as rolled back (see
+/// [`store_copies`](crate::patch::store_copies)).
 pub async fn rollback_package_patch(
     package_key: &str,
     pkg_path: &Path,
@@ -348,47 +350,35 @@ pub async fn rollback_package_patch(
     blobs_path: &Path,
     dry_run: bool,
 ) -> RollbackResult {
-    let mut result =
-        rollback_package_patch_at(package_key, pkg_path, files, blobs_path, dry_run).await;
-    // Only npm purls can name pnpm or vlt store copies; everything else skips the
-    // (already cheap) discovery outright.
-    if result.success && package_key.starts_with("pkg:npm/") {
-        for copy in crate::crawlers::npm_crawler::find_store_peer_variant_copies(pkg_path).await {
-            let copy_result =
-                rollback_package_patch_at(package_key, &copy, files, blobs_path, dry_run).await;
-            fold_copy_result(&mut result, &copy, copy_result);
-        }
-    }
-    result
+    crate::patch::store_copies::fan_out(package_key, pkg_path, |path| async move {
+        rollback_package_patch_at(package_key, &path, files, blobs_path, dry_run).await
+    })
+    .await
 }
 
-/// Merge one pnpm or vlt store copy's result into the primary's. A failed
-/// copy fails the whole result with a `store copy <path> failed to roll
-/// back: …` note; a copy that restored fine but carries an advisory
-/// (`success: true, error: Some(…)` — e.g. "…ownership could not be
-/// restored…") keeps `success` and appends the advisory verbatim, so the
-/// CLI's `ownership_not_restored` warning sees every copy, not just the
-/// primary. The advisory already names the copy's full file path.
-fn fold_copy_result(result: &mut RollbackResult, copy: &Path, copy_result: RollbackResult) {
-    let note = if copy_result.success {
-        match copy_result.error {
-            Some(advisory) => advisory,
-            None => return,
+impl crate::patch::store_copies::CopyFold for RollbackResult {
+    const VERB: &'static str = "roll back";
+
+    fn success(&self) -> bool {
+        self.success
+    }
+
+    fn mark_failed(&mut self) {
+        self.success = false;
+    }
+
+    fn error_mut(&mut self) -> &mut Option<String> {
+        &mut self.error
+    }
+
+    fn extend_files(&mut self, copy: &mut Self, qualify: &dyn Fn(&str) -> String) {
+        for mut verified in copy.files_verified.drain(..) {
+            verified.file = qualify(&verified.file);
+            self.files_verified.push(verified);
         }
-    } else {
-        result.success = false;
-        format!(
-            "store copy {} failed to roll back: {}",
-            copy.display(),
-            copy_result
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
-        )
-    };
-    result.error = Some(match result.error.take() {
-        Some(prev) => format!("{prev}; {note}"),
-        None => note,
-    });
+        self.files_rolled_back
+            .extend(copy.files_rolled_back.drain(..).map(|file| qualify(&file)));
+    }
 }
 
 /// The single-copy rollback engine behind [`rollback_package_patch`]:
@@ -1996,7 +1986,7 @@ mod tests {
     /// advisory verbatim (it already names the copy's file path); a clean copy
     /// changes nothing.
     #[test]
-    fn fold_copy_result_carries_advisories_and_failures() {
+    fn store_copy_fold_carries_advisories_and_failures() {
         let copy = Path::new("/store/pkg@1.0.0_peer");
         let clean = || RollbackResult {
             package_key: "pkg:npm/a@1.0.0".to_string(),
@@ -2009,13 +1999,13 @@ mod tests {
         };
 
         let mut primary = clean();
-        fold_copy_result(&mut primary, copy, clean());
+        crate::patch::store_copies::fold(&mut primary, copy, clean());
         assert!(primary.success && primary.error.is_none());
 
         let advisory = "/store/pkg@1.0.0_peer/index.js: patched, but ownership could not be \
                         restored to uid 1 gid 2: EPERM";
         let mut primary = clean();
-        fold_copy_result(
+        crate::patch::store_copies::fold(
             &mut primary,
             copy,
             RollbackResult {
@@ -2028,7 +2018,7 @@ mod tests {
 
         let mut primary = clean();
         primary.error = Some("first".to_string());
-        fold_copy_result(
+        crate::patch::store_copies::fold(
             &mut primary,
             copy,
             RollbackResult {
@@ -2467,6 +2457,7 @@ mod tests {
         // that is the primary the resolver hands rollback.
         std::os::unix::fs::symlink(variants[0].join("foo"), nm.join("foo")).unwrap();
         let primary = nm.join("foo");
+        let twin_added = variants[1].join("foo").join("added.js");
 
         let mut files = HashMap::new();
         files.insert(
@@ -2486,9 +2477,14 @@ mod tests {
         )
         .await;
         assert!(result.success, "expected success: {:?}", result.error);
+        // The primary's delete under its manifest key, the twin's under its
+        // on-disk path (the store fan-out qualifies copy records).
         assert_eq!(
             result.files_rolled_back,
-            vec!["package/added.js".to_string()]
+            vec![
+                "package/added.js".to_string(),
+                twin_added.display().to_string(),
+            ]
         );
         for entry_nm in &variants {
             assert!(
@@ -2518,6 +2514,11 @@ mod tests {
                 .await
                 .is_err(),
             "an already-original primary must still heal a patched twin"
+        );
+        // ...and report the heal (#756), not "already original".
+        assert_eq!(
+            result.files_rolled_back,
+            vec![twin_added.display().to_string()]
         );
     }
 
