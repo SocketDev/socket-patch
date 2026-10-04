@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-03 (run 13), main `045d7ec`, latest release v4.0.0. Runs 5–13 added the cells in "Run 5 cells" through "Run 13 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-04 (run 14), main `045d7ec`, latest release v4.0.0. Runs 5–14 added the cells in "Run 5 cells" through "Run 14 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -97,13 +97,19 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Merged key already present before vendoring, V + frozen install + rollback byte-exact: pass (1.22.22).
 - Scoped merged key: H frozen install on 1.0.2 / 1.7.0 / 1.10.1 / 1.22.22 pass; V on 1.7.0 / 1.10.1 / 1.22.22 pass (rollback byte-exact); H⇄V takeover chain + re-run + rollback pass.
 
+### Run 14 cells (Linux, `045d7ec`)
+- Fork alias `"left-pad": "npm:async@1.3.0"` and the yarn-merged `left-pad@1.3.0, "left-pad@npm:async@1.3.0":` block, H/V/A: all fail-closed, pass (1.22.22).
+- agent → hosted takeover + rollback: pass. **agent → vendored takeover + rollback / remove / `vendor --revert`: fail #336** (node_modules left patched, record dropped, yarn's next frozen install is "Already up-to-date"). 1.7.0 / 1.10.1 / 1.22.22.
+- #591 shape: `vendor --check` OK and `repair` no-op: fail #591 (commented).
+- `yarn.lock` + `package-lock.json` together, H and V: pass. Hosted `vex` before reinstall: `not_applied`, pass. `--link-duplicates` agent apply / vex / rollback: pass.
+
 ## Backlog
 
-1. `vendor --check` / `repair` on a #591-shaped lock.
-2. Windows directory junctions as `.socket/vendor/npm` (#664 shape), via a probe.
+1. Re-check #363 (PR #710) / #665 (PR #689) / #664 (PR #666) once merged; re-run #364 on macOS/Windows; re-check #467 / #519 / #558 / #591 / #627 / #691 / #692 once fixed.
+2. Windows directory junctions as `.socket/vendor/npm` (#664 shape), via a probe, after #666.
 3. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open.
 4. Same-size patched files on yarn ≤1.9 in-place installs (the mtime the service tarballs use can't be checked from the sandbox).
-5. Re-check #363 (PR #710) / #665 (PR #689) once merged; re-run #364 on macOS/Windows; re-check #467 / #519 / #558 / #591 / #627 / #664 / #691 / #692 once fixed.
+5. agent → vendored takeover on macOS/Windows (#336 yarn leg); vendored → agent → rollback with a reinstall in between.
 
 ## Known non-bugs
 
@@ -154,3 +160,7 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Quick vendored harness: a scratch cargo test using `tests/prebuilt_common` `prepare_command` (auto-mocks the service for `vendor`/`repair`) plus a staged `.socket/manifest.json` + blob, as in `e2e_vendor_yarn_classic_dev_flow.rs`. Other commands (rollback / remove / `vendor --revert` / `--check`) run offline with the plain binary.
 - A plain root `yarn add <pkg>@<new range>` re-resolves a vendored block from the registry (unpatched). That's yarn's own behaviour; the follow-on rollback is #665.
 - A vendored lock after a hosted→vendored takeover, rolled back, restores `registry.npmjs.org` (the hosted-unwound entry, via `SOCKET_NPM_REGISTRY`), not the original `registry.yarnpkg.com`. Documented; frozen installs are fine.
+- Agent-mode mock: serve `GET /v0/orgs/<org>/patches/blob/<hash>` for both the before and the after hash. `…/patches/diff/<uuid>` may 404 (it falls back to blobs). Without the before blob, rollback reports `missing_blob`.
+- `vex` in a workspace root whose `package.json` has no `version` exits `product_undetected`. Pass `--product`.
+- yarn classic itself merges `left-pad@1.3.0` into an existing `left-pad@npm:async@1.3.0` block (it installs the fork for the real name). That's a yarn bug; socket-patch fails closed on that block in all modes.
+- With `yarn.lock` and `package-lock.json` both present, hosted rewrites both (and writes `.npmrc` allow-remote), and vendored wires `yarn.lock` with `vendor_multiple_lockfiles`. Intended.
