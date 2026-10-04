@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-04 (run 17), main `045d7ec` (includes #532, #552, #517, #442), latest release tag v4.0.0.
+Last updated: 2026-10-04 (run 18), main `045d7ec` (includes #532, #552, #517, #442), latest release tag v4.0.0.
 
 ## Coverage matrix
 
@@ -143,6 +143,14 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | 4.0.17 | pass | pass (fails closed) | fail #796 |
 | 2.7.2 / 2.6.9 / 2.5.22 / 2.4.22 | untested | n/a | pass |
 
+### Run 18: multi-gem hosted lifecycle and takeover (Linux, Ruby 3.3.6, real rubygems.org upstream)
+
+| Bundler | Hosted: 3 gems one scan (frozen fresh install) | Hosted: incremental + byte-identical re-run | Hosted: `rollback` 1 of 3, then all | H→V takeover, 1 gem | H→V takeover, 3 gems | H→V takeover, mixed no-CHECKSUMS pair |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4.0.17 | pass | pass | pass | pass | fail #779 (PR #805 fixes) | n/a |
+| 2.6.9 | pass | untested | pass | untested | untested | untested |
+| 2.4.22 | pass (after the documented unfrozen install) | untested | untested | untested | fail #779 after the converge install (PR #805 fixes) | fails closed (documented mixed state) |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -156,14 +164,13 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Hosted on a Bundler 4 standalone project (stale-install guard vs `./bundle`), and vendored + standalone (#796 follow-ups).
-2. Re-run #340 / #577 / #652 / #681 / #709 / #729 / #736 / #749 / #751 / #775 / #796 when fixes merge (open PRs #637, #684, #712, #768).
-3. Hosted → vendored takeover success cell with a unified mock (one grant + artifact): top-level, transitive, `gems.rb` (expected refusal), on 2.4 / 2.6 / 4.0.
-4. Takeover over other shapes hosted accepts but vendored refuses: platform gem on a no-CHECKSUMS lock, `eval_gemfile`, `install_if` / `platforms:` blocks.
-5. Windows: `x64-mingw-ucrt` platform gems in hosted and vendored modes; `BUNDLE_DEPLOYMENT=true` with a CRLF lock; vendored cells and `repair` on Windows and macOS.
-6. **Maintainer request (still open):** global (`-g`) mode on every OS. Remaining: macOS system Ruby and Homebrew Ruby; rbenv / rvm / chruby / asdf layouts; unicode or space-containing `--global-prefix`; a non-writable dir on macOS and Windows; `-g` from inside a project on macOS and Windows.
-7. A symlinked env `BUNDLE_GEMFILE` next to a config `gemfile` (macOS `/var` vs `/private/var`).
-8. #340 on Bundler 2.2–2.5; Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
+1. Re-run #340 / #577 / #652 / #681 / #709 / #729 / #736 / #749 / #751 / #775 / #779 / #796 when fixes merge (open PRs #637, #684, #712, #768, #797 (verified for #796), #805 (verified for #779 incl. multi-gem takeover)).
+2. Hosted stale-install guard on a Bundler 4 standalone project once #797 lands; vendored + standalone.
+3. Takeover over shapes hosted accepts but vendored refuses: platform gem on a no-CHECKSUMS lock, `eval_gemfile`, `install_if` / `platforms:` blocks. Multi-gem takeover on 2.6.9.
+4. Windows: `x64-mingw-ucrt` platform gems in hosted and vendored modes; `BUNDLE_DEPLOYMENT=true` with a CRLF lock; vendored cells and `repair` on Windows and macOS (script-based probes: the gem e2e suites run on ubuntu only and spawn bare `bundle`).
+5. **Maintainer request (still open):** global (`-g`) mode on every OS. Remaining: macOS system Ruby and Homebrew Ruby; rbenv / rvm / chruby / asdf layouts; unicode or space-containing `--global-prefix`; a non-writable dir on macOS and Windows; `-g` from inside a project on macOS and Windows.
+6. A symlinked env `BUNDLE_GEMFILE` next to a config `gemfile` (macOS `/var` vs `/private/var`).
+7. #340 on Bundler 2.2–2.5; Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
 
 ## Known non-bugs
 
@@ -214,3 +221,6 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - Vendored `repair` doesn't restore Gemfile / lock wiring the user reverted. It reports success with no events, matching the docs ("preserves project wiring"); `vex` reports `vendor_unwired` (run 17).
 - Multi-source locks (a private `source … do` writes its own `GEM` section): vendored is tracked by #779 / #780 (arch audit). Hosted redirects a gem from any `GEM` remote; mirrors are legitimate, so that's policy, not a bug.
 - In helper scripts, never `pkill -f` / `pgrep -f` a name that also appears in the same shell command; it kills the agent's own shell (exit 144).
+- Hosted → vendored takeover by hand (run 18): `--patch-server-url <api mock>` is needed so vendored mode recognizes the loopback patch-registry wiring, but it also rewrites artifact download hosts. Have the API mock proxy `/artifacts/*` (every non-`/v0`, non-`/patch-registry` GET) to the prebuilt server, and export `SOCKET_VENDOR_URL=<prebuilt uri>` as well.
+- Hosted → vendored takeover on a mixed (no-CHECKSUMS, not yet re-installed) pair fails closed with `gemfile_declaration_not_editable` and writes nothing. The takeover can't see the unconverged hosted wiring, consistent with the documented mixed-state limits (run 18).
+- When verifying several fix PRs, build each into its own `CARGO_TARGET_DIR`; reusing one silently tests the wrong head (run 18 near-miss).
