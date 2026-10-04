@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-04T15:58Z · main @ 045d7ec_
+_Last updated 2026-10-04T16:56Z · main @ 045d7ec_
 
 **In flight:**
 - [#574](https://github.com/SocketDev/socket-patch/pull/574): one vlt `registry_base` following vlt's DepID hydration. Issues #562 (E02, E03). State: ready (Ready for review). It awaits human approval.
@@ -20,7 +20,7 @@ _Last updated 2026-10-04T15:58Z · main @ 045d7ec_
 | 4 | #728 (C21): one `utils::fs` stage-and-rename core with policy flags; delete the six-writer spread and the blocking `atomic_write_sync` copy | 0 | 1 | 3.5 | L | 5.5 | eligible once capacity frees (`utils/fs.rs` touched by no open PR); leave `write_cache_entry_atomic` for after #607; makes #726's writer fix one call |
 | 5 | #707 (C41): one case-insensitive hash comparison for agent-mode apply/rollback and vendored verify | 1 | 0 | 2 | L | 5 | skipped: `patch/apply.rs`/`patch/rollback.rs` changed by open PRs #634, #646 and #690; simpler after #706 |
 
-At capacity (3 open, all ready, awaiting human merge) since 2026-10-03T01:05Z; re-ranked hourly through 2026-10-04T15:56Z with no merges and no maintainer steering. Outside the top five (score; why skipped): #747 (C20 child 1 of #748, 5; open-PR file overlap), #773 (C44 bug, 5), #794 (C10 child 1 of RunCtx #793, ≈5; `get.rs`/`vendor.rs`/`scan/mod.rs` overlap), #746 (C23, ≈4.5; `patch/apply.rs` overlap), #663 (E07, 4.5), #593/#614/#726/#780/#791 (4), #757 (E15 hosted half, ≈4; `redirect/mod.rs`), #631 (E52, 3.5; `redirect/mod.rs`), #735/#736/#745 (3), #727 (C19, ≈2–4), #781/#782/#705/#770/#662/#630 (≤2.5), #675–#678 (≤2.5), #649 (≈1). Decisions (not candidates): #648, #704, #792; C07 needs an owner decision. Bughunt and bench issues are not candidates. Queue blockers still open: #574, #589, #597, #598, #602, #634, #646, #657, #660, #689, #690, #710.
+At capacity (3 open, all ready, awaiting human merge) since 2026-10-03T01:05Z; re-ranked hourly through 2026-10-04T16:56Z with no merges and no maintainer steering. Outside the top five (score; why skipped): #747 (C20 child 1 of #748, 5; open-PR file overlap), #773 (C44 bug, 5), #794 (C10 child 1 of RunCtx #793, ≈5; `get.rs`/`vendor.rs`/`scan/mod.rs` overlap), #746 (C23, ≈4.5; `patch/apply.rs` overlap), #663 (E07, 4.5), #593/#614/#726/#780/#791 (4), #757 (E15 hosted half, ≈4; `redirect/mod.rs`), #631 (E52, 3.5; `redirect/mod.rs`), #735/#736/#745 (3), #727 (C19, ≈2–4), #781/#782/#705/#770/#662/#630 (≤2.5), #675–#678 (≤2.5), #649 (≈1). Decisions (not candidates): #648, #704, #792; C07 needs an owner decision. Bughunt and bench issues are not candidates. Queue blockers still open: #574, #589, #597, #598, #602, #634, #646, #657, #660, #689, #690, #710.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
