@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-04 (run 16), main `045d7ec`, latest release v4.0.0. Runs 5–16 added the cells in "Run 5 cells" through "Run 16 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-04 (run 17), main `045d7ec`, latest release v4.0.0. Runs 5–17 added the cells in "Run 5 cells" through "Run 17 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -9,11 +9,11 @@ Cells are "pass", "fail #N", "n/a", "CI" or "untested". H = hosted, V = vendored
 | OS | yarn | H baseline | H offline mirror | H/V git dep (`git+…`) | H/V multi-version workspaces + scoped | H⇄V takeover + rollback | H/V CRLF lock + rollback | V baseline | V offline mirror (+pruning, rollback) | A apply + setup |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 1.0.2 | pass | n/a (yarn limitation) | fail #363 | H pass | untested | H pass (run 16) | n/a (yarn ≤1.6 can't install `file:` tarballs) | n/a | pass |
-| Linux | 1.6.0 | pass | n/a (yarn limitation) | untested | H pass | untested | H pass (run 16) | n/a (yarn ≤1.6) | n/a | untested |
-| Linux | 1.7.0 | CI | fail #364 (`--offline`) | fail #363 | pass | pass (run 16) | pass (run 16) | pass | untested | untested |
-| Linux | 1.9.4 | CI | fail #364 (`--offline`) | untested | untested | untested | untested | CI | pass (run 16) | untested |
+| Linux | 1.6.0 | pass | n/a (yarn limitation) | untested | H pass | untested | H pass (run 16) | n/a (yarn ≤1.6) | n/a | pass (run 17) |
+| Linux | 1.7.0 | CI | fail #364 (`--offline`) | fail #363 | pass | pass (run 16) | pass (run 16) | pass | untested | pass (run 17) |
+| Linux | 1.9.4 | CI | fail #364 (`--offline`) | untested | untested | untested | untested | CI | pass (run 16) | pass (run 17) |
 | Linux | 1.10.1 | pass | fail #364 | fail #363 | pass | pass | pass (run 16, + BOM) | pass | pass | pass (+ `--install.modules-folder`, run 9) |
-| Linux | 1.17.3 | pass (in-place) | fail #364 | untested | untested | untested | untested | pass (in-place) | pass (run 16) | untested |
+| Linux | 1.17.3 | pass (in-place) | fail #364 | untested | untested | untested | untested | pass (in-place) | pass (run 16) | pass (run 17) |
 | Linux | 1.22.22 | pass (v5, + hosted rollback pass) | fail #364 (v5) | fail #363 (v5; rollback also wrong; still fails on `203e092`) | pass | pass | pass | pass | pass | pass |
 | macOS | 1.7.0 | untested | untested | fail #363 | pass | pass | pass | pass | untested | untested |
 | macOS | 1.10.1 / 1.22.22 | pass (probe) | fail #364 | fail #363 | pass | pass | pass | pass | untested | untested |
@@ -114,10 +114,15 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - **Windows path shapes** (probe, windows-latest, yarn 1.10.1 / 1.22.22; H/V scan + fresh frozen install + rollback, A apply + vex + rollback): a >MAX_PATH project path (345 chars), a directory-junction project dir, a `subst` drive (`--cwd X:/p` from another drive, and run inside `X:\`), cross-drive `--cwd` both ways, a backslash `--cwd`: all pass. yarn on Windows writes CRLF locks natively (`os.EOL`), and H/V rollback restores them byte-exact.
 - Linux: CRLF H/V + rollback (1.0.2 / 1.6.0 H; 1.7.0 / 1.10.1 H+V), H⇄V takeover chain on 1.7.0 and BOM+CRLF on 1.10.1, V offline mirror on 1.9.4 / 1.17.3, `yarn add` (1.7.0) then rollback, a lock-only workspace with an alias, conflict markers around the target (fail-closed), a missing vendored artifact (`vex` omits it): all pass. Also a 414-char path and a symlinked project dir.
 
+### Run 17 cells (`045d7ec`)
+- **Cross-OS vendored checkout portability** (probe run 37226728998, yarn 1.22.22): a project vendored on Linux, macOS or Windows, then installed `--frozen-lockfile --offline` (cold cache), `vendor --check`, `vex --offline`, `list` and rollback on each of the three OSes. All 9 cells pass, with rollback byte-exact (CRLF for a Windows producer). Windows writes forward-slash `file:./.socket/…` paths.
+- A 4-package project (prerelease `ms@3.0.0-canary.1`, dotted `lodash.isequal`, scoped `@types/left-pad`, `left-pad`): H pass on 1.0.2 / 1.7.0 / 1.10.1 / 1.22.22, V pass (byte-exact rollback) on 1.7.0 / 1.10.1 / 1.22.22, A (apply + vex + rollback) pass on 1.6.0 / 1.7.0 / 1.9.4 / 1.17.3 / 1.22.22.
+- Private-registry `resolved` URLs (Verdaccio `%2f`, Nexus, a URL with no `.tgz` basename), H and V: pass. A vendored grant without `sha1`: vendored computes `#sha1`, and the warm-cache install is patched (not #558). A tampered vendored tarball → check fails, vex omits it, repair restores: pass. Vendored re-run idempotent, and V→H→V: pass. `get <purl>` for prerelease / scoped purls (`%40` or `@`): pass.
+
 ## Backlog
 
 1. Re-check #363 (PR #710) / #665 (PR #689, including `scan --prune`) / #664 (PR #666) once merged; re-run #364 on macOS/Windows; re-check #467 / #519 / #558 / #591 / #627 / #691 / #692 / #758 once fixed.
-2. #758 follow-ups: a real registry package with `bundledDependencies`.
+2. #758 follow-ups: a real registry package with `bundledDependencies`. A cross-OS *hosted* checkout (needs one shared mock artifact so every runner serves identical bytes) and workspaces in the cross-OS vendored probe.
 3. Windows directory junctions as `.socket/vendor/npm` (#664 shape), via a probe, after #666.
 4. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open.
 5. agent → vendored takeover on macOS/Windows (#336 yarn leg). macOS case-insensitive name collisions. Same-size patched files on yarn ≤1.9 in-place installs (can't be checked from the sandbox).
@@ -181,3 +186,6 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - yarn 1.x on Windows writes *new* lockfiles with CRLF (`os.EOL`, `writeFilePreservingEol`), and keeps an existing file's EOL. CRLF locks are therefore the default on Windows, not an edge case.
 - Running `scan --mode agent` from a workspace member dir finds nothing ("No packages found"), because the hoisted copies live under the root. That's the documented one-project model: run from the root.
 - Leftover probe branch (deletion blocked): `bughunt/yarn-classic/20261004-win-paths`.
+- **Probe harness:** `actions/upload-artifact` drops dot-directories (`.socket/`) unless you set `include-hidden-files: true`. A per-runner Python mock builds tarballs with that OS's zlib, so hashes differ across OSes. Ship one shared mock artifact for hosted cross-OS tests.
+- `get name@version` (not a purl) runs the fuzzy package-name search, and against the mock it returns `no_packages`. Use a `pkg:` purl or a uuid.
+- Leftover probe branch (deletion blocked): `bughunt/yarn-classic/20261004-xos-vendored`.
