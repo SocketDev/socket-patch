@@ -117,6 +117,11 @@ limits, and required install commands.
   twin or a `BUNDLE_GEMFILE` setting (environment or `.bundle/config`) no longer
   leads to an edit of an ignored `Gemfile` that reports success and attests an
   unpatched gem; unsupported layouts are refused before any write (#341, #390).
+- `vex`, scan's lockfile supplement and the hosted engine read the gem lock
+  Bundler loads. A `gems.rb` project's `gems.locked` is no longer invisible,
+  and a leftover redirected `Gemfile.lock` beside it no longer makes `vex`
+  attest `not_affected` for a gem Bundler installs unpatched from
+  `gems.locked` (#736).
 - Gem modes read Bundler settings in Bundler's own priority. A `BUNDLE_GEMFILE`
   in `.bundle/config` now outranks the environment variable, so a dual-boot
   project with an exported `BUNDLE_GEMFILE=Gemfile` is no longer wired through
