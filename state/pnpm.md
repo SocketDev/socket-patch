@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-04 (run 16), main `045d7ec`, latest release 4.0.0.
+Last updated: 2026-10-04 (run 17), main `045d7ec`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, package grant, hosted tarball, `/registry/<name>/<ver>` mirror). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -154,6 +154,18 @@ Run 16 additions (main `045d7ec`, Linux):
 
 #754 and #756 aren't regressions: release 4.0.0 behaves the same.
 
+Run 17 additions (main `045d7ec`, Linux):
+
+| pnpm (lock) | Agent `scan <member path>` in a workspace / `rollback <member path>` | Hosted: `file:` tarball / git dep sharing a patched name@version | Hosted: prerelease version (pin, fresh frozen) | Agent: prerelease | Hosted: peer-suffixed (pin, fresh frozen, rollback) | Hosted: block-style `resolution:` | Agent: hoisted + nested twin |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 7.33.7 (5.4) | untested | untested | pass | pass | pass | untested | untested |
+| 8.15.9 (6.0) | fail #778 / selects | untested | pass | untested | pass | untested | pass |
+| 9.15.9 | fail #778 / selects | untested | pass | pass | (run 6) | pass | pass |
+| 10.34.5 | fail #778 / selects; hoisted n/a | untested | untested | untested | untested | untested | pass |
+| 12.8.1 | fail #778 / selects (single-package project pass) | pass / pass (not pinned, not attested) | pass | pass | (run 6) | pass | pass; #756 n/a under hoisted |
+
+#778 isn't a regression: release 4.0.0 has no `scan [PATHS]`.
+
 Default isolated linker + alias: pass on 7.33.7 / 9.15.9 / 10.34.5 / 11.28.3 / 12.8.1 (one shared `.pnpm` copy).
 
 #492 also reproduces on pnpm 7.33.7 (there's no root lock at all, only `redirect_pnpm_no_lockfile`).
@@ -176,15 +188,16 @@ Global mode (`-g`, v5 main `2463257`):
 ## Backlog
 
 0. **Maintainer request (global `-g` mode):** the Linux cells are done. Still to do: macOS and Windows (corepack, standalone and npm-installed pnpm; `PNPM_HOME` with spaces or unicode; Windows `%LOCALAPPDATA%\pnpm`), and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry. Needs a probe branch.
-1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3, 10 and 16, and was denied by the permission policy in runs 2, 5–9, 11–14 and 16, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
+1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3, 10 and 16, and was denied by the permission policy in runs 2, 5–9, 11–14, 16 and 17, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
 2. #754 follow-ups: a Windows `C:/…/My Project #2` checkout, and the moved-checkout heal path once the specifier is quoted. Needs a probe.
+2a. #778 follow-ups: `scan --sync packages/a` / `--prune` with a scope in a pnpm workspace, pnpm 7 workspace layout, and `-g` absolute scopes vs `rollback -g`.
 3. #696 / #661 follow-ups: `modulesDir` in the global `config.yaml` / `rc`, and `modulesDir` + `virtualStoreDir` together. When fixed, check that GVS and out-of-project `virtualStoreDir` transitive deps also stop attesting.
 4. Workspace-sensitive pnpm commands under the #734 scaffold on 9.x (`pnpm link`, `publish`, `-r`).
-5. #756 variants: peer-variant twins under node-linker=hoisted, in global mode, and on 9.15.9 / 10.34.5.
+5. #756 variants: in global mode, and on 9.15.9 / 10.34.5 (hoisted is n/a: one shared copy).
 6. #362 GVS transitive and #435 global `-g`: re-check exit codes under #555's skip semantics on 11.28.3 / 12.8.1.
 7. `package-import-method=clone` on reflink (needs CI).
 8. #556 follow-ups: merging branch lockfiles after a hosted pin, and agent `vex` on the branch.
-9. Re-verify #360, #362, #435, #466, #492, #556, #557, #590 (PR #598), #601 (PR #605), #626 (PR #634), #633, #636 (PR #672; include the takeover path from the run 16 comment), #661 / #696 (PR #698), #713, #714, #734, #754 and #756 when fixes land.
+9. Re-verify #360, #362, #435, #466, #492, #556, #557, #590 (PR #598), #601 (PR #605), #626 (PR #634), #633, #636 (PR #672; include the takeover path from the run 16 comment), #661 / #696 (PR #698), #713, #714, #734, #754, #756 and #778 when fixes land.
 10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout; hosted CRLF passes on Linux).
 
 ## Known non-bugs
@@ -231,3 +244,6 @@ Global mode (`-g`, v5 main `2463257`):
 - Hosted standalone `vex` attests an optional dependency that isn't installed on this OS (for example `fsevents` on Linux) from its lock pin. That's the documented manifest-less attestation ("nothing installed → attests from the pin").
 - pnpm 11 / 12 fail `ERR_PNPM_IGNORED_BUILDS` for `esbuild` even on the first install, unless builds are allowed. That's upstream; the patched bytes still land.
 - `pnpm update <pkg>` drops the hosted pins of every package it re-resolves (pnpm 12 also re-resolves the package's dependents), like `pnpm update`.
+- Agent `apply` from a pnpm workspace member cwd patches only the member's direct (linked) deps. Transitive deps in the root `.pnpm` are skipped ("No installed package matches this PURL", exit 0), and agent `vex` omits them (`package_not_found`). Agent crawls are cwd-scoped, and CLI_CONTRACT puts a member that shares the root lock in the root project, so run from the root.
+- Hosted on a `pnpm-lock.yaml` with git conflict markers writes nothing and warns `redirect_pnpm_entry_not_found` for every package (exit 0). It fails safe. Resolve the conflict (`pnpm install`) first.
+- Hosted leaves a `file:` tarball or git dependency that shares a patched name@version alone (`redirect_pnpm_entry_not_found`), and `vex` doesn't attest it.
