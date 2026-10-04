@@ -483,10 +483,7 @@ pub async fn read_candidate_files(
         if let Some(lock) = out.files.get("bun.lock") {
             let lines: Vec<String> = lock.split('\n').map(str::to_string).collect();
             for dir in crate::vendor::bun_lock_text::workspace_member_dirs(&lines) {
-                let plain = std::path::Path::new(&dir)
-                    .components()
-                    .all(|c| matches!(c, std::path::Component::Normal(_)));
-                if !plain || dir.contains('\\') {
+                if !crate::vendor::bun_lock_text::is_plain_member_dir(&dir) {
                     continue;
                 }
                 let rel = if dir.is_empty() {

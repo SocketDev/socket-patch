@@ -543,6 +543,24 @@ pub(crate) async fn vendor_bun<'a>(
         changed = true;
     }
 
+    // A workspace lock Bun 1.4 migrated from a vendored `bun.lockb` keeps
+    // the member paths the binary normalization wrote as inter-workspace
+    // literals, so Bun re-resolves the workspace and drops the vendored
+    // tuples (#803). Restore each manifest's `workspace:` literal (Bun's own
+    // spelling) like the digest heal above: in place, with no wiring
+    // record, since a revert has no reason to put the path back.
+    let literal_heals = super::bun_lock_text::heal_workspace_literals(&mut lines, |dir| {
+        let rel = if dir.is_empty() {
+            "package.json".to_string()
+        } else {
+            format!("{dir}/package.json")
+        };
+        crate::utils::fs::read_regular_to_bytes_sync(&project_root.join(rel))
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    });
+    healed |= !literal_heals.is_empty();
+
     if !changed {
         // Every instance already points at this uuid with the packed
         // integrity (or with the digest Bun dropped, now re-pinned): in
@@ -2389,6 +2407,96 @@ mod tests {
             .await
             .unwrap();
         (fx, entry, lock)
+    }
+
+    /// A BN3 lock as Bun 1.4 migrates it from a vendored workspace
+    /// `bun.lockb` (#803): a `consumer` member the root depends on, spelled
+    /// with the member path the binary normalization wrote (`literal`).
+    fn migrated_workspace_lock(base: &str, version: u64, literal: &str) -> String {
+        let lock = base
+            .replace(
+                "        \"left-pad\": \"1.3.0\",\n      },\n    },\n",
+                &format!(
+                    "        \"consumer\": \"{literal}\",\n        \"left-pad\": \"1.3.0\",\n      \
+                     }},\n    }},\n    \"packages/consumer\": {{\n      \"name\": \"consumer\",\n      \
+                     \"version\": \"1.0.0\",\n    }},\n"
+                ),
+            )
+            .replace(
+                "  \"packages\": {\n",
+                &format!("  \"packages\": {{\n{}\n\n", workspace_entry_line(version)),
+            );
+        assert!(
+            lock.contains("packages/consumer\": {"),
+            "the splice must hit"
+        );
+        lock
+    }
+
+    async fn write_workspace_manifests(fx: &Fixture) {
+        tokio::fs::write(
+            fx.root().join("package.json"),
+            r#"{"name":"bn3-lockonly","workspaces":["packages/*"],"dependencies":{"consumer":"workspace:*","left-pad":"1.3.0"}}"#,
+        )
+        .await
+        .unwrap();
+        let member = fx.root().join("packages/consumer");
+        tokio::fs::create_dir_all(&member).await.unwrap();
+        tokio::fs::write(
+            member.join("package.json"),
+            r#"{"name":"consumer","version":"1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// #803: a vendored workspace `bun.lockb` that Bun 1.4 migrated to
+    /// text carries the member path as the literal. The in-sync re-run (the
+    /// only vendored write a text workspace lock admits) restores the
+    /// manifest's `workspace:` literal without a record, and a revert keeps
+    /// Bun's own spelling.
+    #[tokio::test]
+    async fn migrated_workspace_path_literal_is_healed_on_rerun() {
+        for version in [1u64, 2] {
+            let fx = fixture_with(
+                &as_lock_version(BN3_BEFORE_LOCK, version),
+                "node_modules/left-pad",
+            )
+            .await;
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "v{version}: {:?}", result.error);
+            let entry = entry.expect("fresh vendor records an entry");
+            write_workspace_manifests(&fx).await;
+            let wired = fx.read_lock().await;
+            let migrated = migrated_workspace_lock(&wired, version, "packages/consumer");
+            tokio::fs::write(fx.root().join(BUN_LOCK), &migrated)
+                .await
+                .unwrap();
+
+            let (result, rerun_entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "v{version}: {:?}", result.error);
+            assert!(
+                rerun_entry.is_none(),
+                "v{version}: in-sync re-run records nothing"
+            );
+            assert_eq!(
+                fx.read_lock().await,
+                migrated_workspace_lock(&wired, version, "workspace:*"),
+                "v{version}: only the literal is healed"
+            );
+
+            let outcome = revert_bun(&entry, fx.root(), false).await;
+            assert!(outcome.success, "v{version}: {outcome:?}");
+            assert_eq!(
+                fx.read_lock().await,
+                migrated_workspace_lock(
+                    &as_lock_version(BN3_BEFORE_LOCK, version),
+                    version,
+                    "workspace:*"
+                ),
+                "v{version}: the registry tuple is back, Bun's literal kept"
+            );
+        }
     }
 
     /// Every matching instance is already ours: the in-sync re-run must

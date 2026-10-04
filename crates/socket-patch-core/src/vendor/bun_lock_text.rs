@@ -423,6 +423,16 @@ pub(crate) fn workspace_member_dirs(lines: &[String]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether a `workspaces` key is a plain relative directory (`""` is the
+/// root): no `..`, no absolute or drive-prefixed path, no backslash. Only
+/// such a member's `package.json` is ever read.
+pub(crate) fn is_plain_member_dir(dir: &str) -> bool {
+    !dir.contains(['\\', ':'])
+        && std::path::Path::new(dir)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
 /// One workspace dependency literal [`heal_workspace_literals`] rewrote.
 pub(crate) struct WorkspaceLiteralHeal {
     /// `<member>:<group>:<dependency>`, e.g. `packages/m1:dependencies:m2`.
@@ -448,11 +458,16 @@ pub(crate) struct WorkspaceLiteralHeal {
 /// own name, and whose declaring manifest (read by `manifest`, keyed by
 /// member dir, `""` for the root) spells it `workspace:…`, is touched.
 /// Anything else, including a lock not in bun's emitted shape, is left
-/// alone.
+/// alone. A version-0 lock is never touched either: Bun 1.1 writes the
+/// bare path there itself.
 pub(crate) fn heal_workspace_literals(
     lines: &mut [String],
     mut manifest: impl FnMut(&str) -> Option<String>,
 ) -> Vec<WorkspaceLiteralHeal> {
+    let head = lines.iter().take(5).cloned().collect::<Vec<_>>().join("\n");
+    if !lock_version(&head).is_some_and(|v| v >= 1) {
+        return Vec::new();
+    }
     let Some((members, deps)) = parse_workspaces_section(lines) else {
         return Vec::new();
     };
@@ -462,7 +477,7 @@ pub(crate) fn heal_workspace_literals(
         let points_at_member = members.iter().any(|(dir, name)| {
             !dir.is_empty() && *dir == dep.literal && name.as_deref() == Some(dep.name.as_str())
         });
-        if !points_at_member {
+        if !points_at_member || !is_plain_member_dir(&dep.workspace) {
             continue;
         }
         let declared = manifests
@@ -869,6 +884,24 @@ mod tests {
         assert!(heal_workspace_literals(&mut lines, migrated_manifests).is_empty());
         assert!(workspace_member_dirs(&lines).is_empty());
         assert_eq!(lines.join("\n"), reindented);
+        // A version-0 lock spells the literal as a path itself.
+        let v0 = MIGRATED_WORKSPACE_LOCK
+            .replace("\"lockfileVersion\": 2,", "\"lockfileVersion\": 0,")
+            .replace("  \"configVersion\": 1,\n", "");
+        let mut lines = to_lines(&v0);
+        assert!(heal_workspace_literals(&mut lines, migrated_manifests).is_empty());
+        // A member dir that leaves the project is never read.
+        assert!(is_plain_member_dir("") && is_plain_member_dir("packages/m1"));
+        for dir in [
+            "../m1",
+            "/abs/m1",
+            "C:/m1",
+            "packages/../../m1",
+            "packages\\m1",
+            "./m1",
+        ] {
+            assert!(!is_plain_member_dir(dir), "{dir}");
+        }
         // No `workspaces` section at all.
         let mut lines = to_lines("{\n  \"lockfileVersion\": 1,\n  \"packages\": {\n  }\n}\n");
         assert!(heal_workspace_literals(&mut lines, migrated_manifests).is_empty());
