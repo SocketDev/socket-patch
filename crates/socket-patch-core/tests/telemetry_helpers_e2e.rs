@@ -18,11 +18,7 @@ use socket_patch_core::telemetry::{is_telemetry_disabled, sanitize_error_message
 
 /// Every environment variable that can independently disable telemetry.
 /// Scrubbing the full set is what makes the per-var causation asserts honest.
-const DISABLE_VARS: &[&str] = &[
-    "SOCKET_TELEMETRY_DISABLED",
-    "VITEST",
-    "SOCKET_OFFLINE",
-];
+const DISABLE_VARS: &[&str] = &["SOCKET_TELEMETRY_DISABLED", "VITEST", "SOCKET_OFFLINE"];
 
 /// Run `f` with all telemetry-disabling vars removed, restoring the prior
 /// values afterward even if `f` panics (so one failing assert can't poison

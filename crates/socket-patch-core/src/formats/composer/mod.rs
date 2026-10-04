@@ -22,7 +22,6 @@ use crate::utils::digest::sha1_hex;
 use crate::vendor::lock_inventory::{http_url, LockIntegrity, LockfileEntry, SourceKind};
 use crate::vendor::path::{parse_vendor_path, VendorPathParts};
 
-
 // ── entry model ──
 
 /// One entry of a parsed `composer.lock` (see [`composer_lock_packages`]).
@@ -107,7 +106,6 @@ pub(crate) fn composer_lock_packages(doc: &Value) -> Vec<ComposerLockPackage<'_>
     out
 }
 
-
 // ── the model ──
 
 /// One `composer.lock`, read once (see the module docs).
@@ -177,4 +175,3 @@ impl<'a> ComposerLock<'a> {
         out
     }
 }
-
