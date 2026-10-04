@@ -1980,6 +1980,13 @@ packages:
         }
     }
 
+    /// Project dir names holding a YAML indicator (#754). Windows forbids
+    /// `:` in a path component, so the `: ` case runs on unix only.
+    #[cfg(not(windows))]
+    const YAML_INDICATOR_DIRS: &[&str] = &["hash #x", "colon: x"];
+    #[cfg(windows)]
+    const YAML_INDICATOR_DIRS: &[&str] = &["hash #x"];
+
     /// #754: a project root holding a YAML indicator (` #` truncates a
     /// plain scalar into a comment, `: ` makes the line invalid) gets the
     /// absolute specifier single-quoted exactly as pnpm 7/8 write it, so a
@@ -1988,7 +1995,7 @@ packages:
     /// restores the lock byte-for-byte — for BOTH grammars.
     #[tokio::test]
     async fn absolute_specifier_is_yaml_quoted_under_indicator_paths() {
-        for dir in ["hash #x", "colon: x"] {
+        for dir in YAML_INDICATOR_DIRS {
             for (before_lock, after_lock, tag) in [
                 (T7_BEFORE_LOCK, T7_AFTER_LOCK, "5.4"),
                 (T8_BEFORE_LOCK, T8_AFTER_LOCK, "6.0"),

@@ -1500,6 +1500,13 @@ fn pnpm8_real_lifecycle_same_path_frozen_and_moved_checkout_offline() {
     run_legacy_capstone(PNPM_LEGACY_8, "lockfileVersion: '6.0'", "proj");
 }
 
+/// Project dir names holding a YAML indicator (#754). Windows forbids `:`
+/// in a path component, so the `: ` case runs on unix only.
+#[cfg(not(windows))]
+const YAML_INDICATOR_DIRS: &[&str] = &["hash #x", "colon: x"];
+#[cfg(windows)]
+const YAML_INDICATOR_DIRS: &[&str] = &["hash #x"];
+
 /// #754: the absolute specifier lands in the lock under a project path
 /// holding YAML indicators. Unquoted, ` #` turned the rest of the path
 /// into a comment (ERR_PNPM_OUTDATED_LOCKFILE) and `: ` broke the line
@@ -1510,7 +1517,7 @@ fn pnpm7_real_lifecycle_under_yaml_indicator_paths() {
         println!("SKIP: `corepack {PNPM_LEGACY_7}` unavailable");
         return;
     }
-    for dir in ["hash #x", "colon: x"] {
+    for dir in YAML_INDICATOR_DIRS {
         run_legacy_capstone(PNPM_LEGACY_7, "lockfileVersion: 5.4", dir);
     }
 }
@@ -1521,7 +1528,7 @@ fn pnpm8_real_lifecycle_under_yaml_indicator_paths() {
         println!("SKIP: `corepack {PNPM_LEGACY_8}` unavailable");
         return;
     }
-    for dir in ["hash #x", "colon: x"] {
+    for dir in YAML_INDICATOR_DIRS {
         run_legacy_capstone(PNPM_LEGACY_8, "lockfileVersion: '6.0'", dir);
     }
 }
