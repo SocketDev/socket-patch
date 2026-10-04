@@ -24,6 +24,20 @@
 //! directory, a missing file) is [`LoadedManifest::Unsupported`]: the
 //! rewriters and the lock readers only know the two default pairs, so the
 //! callers fail closed rather than wire a manifest Bundler never reads.
+//! Bundler 4's custom lockfile (`BUNDLE_LOCKFILE` from the environment,
+//! else `BUNDLE_LOCKFILE:` in the app config — `Bundler::CLI` checks the
+//! environment first) is layered on by [`LoadedManifest::with_lockfile`]: a
+//! value naming the lock of the pair bundler loads anyway changes nothing,
+//! and anything else is [`LoadedManifest::UnsupportedLockfile`] — the
+//! rewriters only edit the default lock of each pair, so wiring a project
+//! whose lock lives elsewhere would leave the lock bundler reads unpinned
+//! (#749).
+//!
+//! A `Gemfile` + `gems.rb` twin under default discovery is ambiguous across
+//! bundler majors (1.x loads the `Gemfile`, >= 2 loads `gems.rb`);
+//! [`default_twin_manifest`] settles it from the `BUNDLED WITH` lines of
+//! the two locks (#751).
+//!
 //! The user-level `~/.bundle/config` is not consulted. The model is pure:
 //! the disk and environment reads live in
 //! [`crate::crawlers::ruby_crawler::bundler_loaded_manifest`].
@@ -68,6 +82,9 @@ pub enum LoadedManifest {
     },
     /// `BUNDLE_GEMFILE` names any other file.
     Unsupported { value: String, by: GemfileSetting },
+    /// Bundler 4's `BUNDLE_LOCKFILE` names a lock other than the default
+    /// lock of the pair bundler loads.
+    UnsupportedLockfile { value: String, by: GemfileSetting },
 }
 
 impl LoadedManifest {
@@ -78,7 +95,9 @@ impl LoadedManifest {
             LoadedManifest::Default if gems_rb_present => "gems.rb",
             LoadedManifest::Default => "Gemfile",
             LoadedManifest::Configured { manifest, .. } => manifest,
-            LoadedManifest::Unsupported { .. } => return None,
+            LoadedManifest::Unsupported { .. } | LoadedManifest::UnsupportedLockfile { .. } => {
+                return None
+            }
         };
         Some(if manifest == "gems.rb" {
             ("gems.rb", "gems.locked")
@@ -107,8 +126,105 @@ impl LoadedManifest {
                     by.describe()
                 ))
             }
+            LoadedManifest::UnsupportedLockfile { value, by } => {
+                let (knob, remedy) = match by {
+                    GemfileSetting::Env => (
+                        "the BUNDLE_LOCKFILE environment variable",
+                        "unset BUNDLE_LOCKFILE",
+                    ),
+                    GemfileSetting::AppConfig => (
+                        "BUNDLE_LOCKFILE in the bundler app config (.bundle/config)",
+                        "run `bundle config unset --local lockfile`",
+                    ),
+                };
+                Some(format!(
+                    "bundler reads the lockfile `{value}` ({knob}), not the Gemfile.lock or \
+                     gems.locked socket-patch pins; wiring the manifest alone would leave that \
+                     lock unpinned and break frozen installs, so it left the gem manifests \
+                     untouched ({remedy} to use the default lock, and re-run)"
+                ))
+            }
             _ => None,
         }
+    }
+
+    /// Layer Bundler 4's configured lockfile onto `self`: `lockfile_env`
+    /// (`BUNDLE_LOCKFILE`) first, else `lockfile_config` (the app config's
+    /// `BUNDLE_LOCKFILE:`), as `Bundler::CLI` resolves it. A relative value
+    /// is read against `root`, like `BUNDLE_GEMFILE`. A value naming the
+    /// default lock of the pair bundler loads (given whether the root holds
+    /// a `gems.rb`) leaves `self` unchanged; any other value is
+    /// [`LoadedManifest::UnsupportedLockfile`]. An unsupported manifest
+    /// stays the answer: it is refused either way.
+    pub fn with_lockfile(
+        self,
+        root: &Path,
+        lockfile_env: Option<&OsStr>,
+        lockfile_config: Option<&str>,
+        gems_rb_present: bool,
+    ) -> LoadedManifest {
+        let Some((_, lock)) = self.pair(gems_rb_present) else {
+            return self;
+        };
+        let (value, by) = match (
+            lockfile_env.filter(|v| !v.is_empty()),
+            lockfile_config.filter(|v| !v.is_empty()),
+        ) {
+            (Some(env), _) => (PathBuf::from(env), GemfileSetting::Env),
+            (None, Some(config)) => (PathBuf::from(config), GemfileSetting::AppConfig),
+            (None, None) => return self,
+        };
+        let target = resolve_against(root, &value);
+        let expected = resolve_against(root, Path::new(lock));
+        if target.is_some() && target == expected {
+            return self;
+        }
+        LoadedManifest::UnsupportedLockfile {
+            value: value.display().to_string(),
+            by,
+        }
+    }
+}
+
+/// The `BUNDLE_LOCKFILE:` value of a bundler app config file (bundler 4's
+/// `bundle config set lockfile <path>`; an empty value counts as unset).
+pub fn config_lockfile(contents: &str) -> Option<String> {
+    bundle_config_setting(contents, "BUNDLE_LOCKFILE")
+}
+
+/// Which manifest bundler's DEFAULT discovery loads when the root holds
+/// both a `Gemfile` and a `gems.rb`, judged from the twin locks' texts
+/// (`None` = absent): bundler 1.x tries `Gemfile` first and >= 2 tries
+/// `gems.rb` first, and the bundler that runs is the one the locks were
+/// written with. `Ok("Gemfile")` when every recorded `BUNDLED WITH` is
+/// 1.x, `Ok("gems.rb")` when none is (bundler >= 2's order, also when no
+/// lock records a version), and `Err(detail)` when the two locks disagree
+/// on the major — then no spelling is safe to wire.
+pub fn default_twin_manifest(
+    gemfile_lock: Option<&str>,
+    gems_locked: Option<&str>,
+) -> Result<&'static str, String> {
+    let majors: Vec<(&str, u32)> = [("Gemfile.lock", gemfile_lock), ("gems.locked", gems_locked)]
+        .into_iter()
+        .filter_map(|(file, text)| Some((file, super::bundled_with_major(text?)?)))
+        .collect();
+    let legacy = majors.iter().filter(|(_, major)| *major < 2).count();
+    if legacy == 0 {
+        Ok("gems.rb")
+    } else if legacy == majors.len() {
+        Ok("Gemfile")
+    } else {
+        let said: Vec<String> = majors
+            .iter()
+            .map(|(file, major)| format!("{file} is BUNDLED WITH {major}.x"))
+            .collect();
+        Err(format!(
+            "both Gemfile and gems.rb are present and {}; bundler 1.x loads the Gemfile while \
+             bundler >= 2 loads gems.rb, so socket-patch cannot tell which pair is installed \
+             and left the gem manifests untouched (remove the spelling you don't use, and \
+             re-run)",
+            said.join(" but ")
+        ))
     }
 }
 
@@ -319,6 +435,97 @@ mod tests {
         assert!(matches!(m, LoadedManifest::Unsupported { .. }));
         let m = classify(&root(), None, Some("sub/Gemfile"));
         assert!(matches!(m, LoadedManifest::Unsupported { .. }));
+    }
+
+    /// #749: a configured lockfile is judged against the pair bundler
+    /// loads; a manifest refusal stays the answer.
+    #[test]
+    fn with_lockfile_accepts_only_the_pairs_own_lock() {
+        let unset = classify(&root(), None, None).with_lockfile(&root(), None, None, false);
+        assert_eq!(unset, LoadedManifest::Default);
+        let own = classify(&root(), None, None).with_lockfile(
+            &root(),
+            Some(OsStr::new("Gemfile.lock")),
+            None,
+            false,
+        );
+        assert_eq!(own, LoadedManifest::Default);
+        let custom =
+            classify(&root(), None, None).with_lockfile(&root(), None, Some("custom.lock"), false);
+        assert_eq!(
+            custom,
+            LoadedManifest::UnsupportedLockfile {
+                value: "custom.lock".into(),
+                by: GemfileSetting::AppConfig
+            }
+        );
+        let detail = custom.unsupported_detail().unwrap();
+        assert!(detail.contains("custom.lock"), "{detail}");
+        assert!(
+            detail.contains("bundle config unset --local lockfile"),
+            "{detail}"
+        );
+        // The other pair's lock is not what bundler loads with this manifest.
+        let configured = classify(&root(), None, Some("Gemfile")).with_lockfile(
+            &root(),
+            Some(OsStr::new("gems.locked")),
+            None,
+            true,
+        );
+        assert!(matches!(
+            configured,
+            LoadedManifest::UnsupportedLockfile {
+                by: GemfileSetting::Env,
+                ..
+            }
+        ));
+        assert!(configured
+            .unsupported_detail()
+            .unwrap()
+            .contains("unset BUNDLE_LOCKFILE"));
+        // An unsupported manifest keeps its own refusal.
+        let manifest = classify(&root(), None, Some("Gemfile.next")).with_lockfile(
+            &root(),
+            Some(OsStr::new("custom.lock")),
+            None,
+            false,
+        );
+        assert!(matches!(manifest, LoadedManifest::Unsupported { .. }));
+    }
+
+    /// #751: bundler 1.x loads a twin's `Gemfile`, >= 2 its `gems.rb`;
+    /// locks that disagree on the major leave no safe answer.
+    #[test]
+    fn default_twin_manifest_follows_the_locks_bundler_major() {
+        let lock = |v: &str| format!("GEM\n  specs:\n\nBUNDLED WITH\n   {v}\n");
+        let (one, two) = (lock("1.17.3"), lock("2.6.2"));
+        assert_eq!(default_twin_manifest(Some(&one), Some(&one)), Ok("Gemfile"));
+        assert_eq!(default_twin_manifest(Some(&one), None), Ok("Gemfile"));
+        assert_eq!(default_twin_manifest(None, Some(&one)), Ok("Gemfile"));
+        assert_eq!(default_twin_manifest(Some(&two), Some(&two)), Ok("gems.rb"));
+        assert_eq!(default_twin_manifest(None, None), Ok("gems.rb"));
+        // A lock without BUNDLED WITH says nothing either way.
+        assert_eq!(
+            default_twin_manifest(Some("GEM\n"), Some(&one)),
+            Ok("Gemfile")
+        );
+        let err = default_twin_manifest(Some(&one), Some(&two)).unwrap_err();
+        assert!(
+            err.contains("Gemfile.lock is BUNDLED WITH 1.x")
+                && err.contains("gems.locked is BUNDLED WITH 2.x"),
+            "{err}"
+        );
+        assert!(default_twin_manifest(Some(&two), Some(&one)).is_err());
+    }
+
+    #[test]
+    fn config_lockfile_reads_bundlers_own_spelling() {
+        assert_eq!(
+            config_lockfile("---\nBUNDLE_LOCKFILE: \"custom.lock\"\n"),
+            Some("custom.lock".into())
+        );
+        assert_eq!(config_lockfile("---\nBUNDLE_LOCKFILE: \"\"\n"), None);
+        assert_eq!(config_lockfile("---\nBUNDLE_GEMFILE: \"x\"\n"), None);
     }
 
     #[test]

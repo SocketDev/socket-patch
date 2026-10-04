@@ -117,6 +117,15 @@ limits, and required install commands.
   twin or a `BUNDLE_GEMFILE` setting (environment or `.bundle/config`) no longer
   leads to an edit of an ignored `Gemfile` that reports success and attests an
   unpatched gem; unsupported layouts are refused before any write (#341, #390).
+- Gem hosted mode follows the Bundler that wrote a `Gemfile` + `gems.rb`
+  twin. Bundler 1.x loads the `Gemfile`, so a twin locked `BUNDLED WITH 1.x`
+  is now wired there instead of in `gems.rb`. Before, the scan's own VEX
+  attested a gem Bundler installed unpatched. Twin locks that disagree on the
+  Bundler major are refused with nothing written (#751).
+- Gem hosted and vendored modes refuse a project whose Bundler 4 custom
+  lockfile (`BUNDLE_LOCKFILE`, or `lockfile` in `.bundle/config`) points away
+  from the default lock. Before, hosted mode left that lock unpinned, reported
+  success, and every frozen install then failed (#749).
 - Gem modes read Bundler settings in Bundler's own priority. A `BUNDLE_GEMFILE`
   in `.bundle/config` now outranks the environment variable, so a dual-boot
   project with an exported `BUNDLE_GEMFILE=Gemfile` is no longer wired through

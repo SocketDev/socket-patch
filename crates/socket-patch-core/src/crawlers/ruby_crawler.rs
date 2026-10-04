@@ -946,29 +946,53 @@ fn expand_tilde(value: &Path, home: Option<&Path>) -> PathBuf {
 
 /// [`crate::formats::gem::manifest::classify`] for `root` on disk: the
 /// manifest bundler loads, reading the ambient `BUNDLE_GEMFILE` /
-/// `BUNDLE_APP_CONFIG` and the app config file.
+/// `BUNDLE_LOCKFILE` / `BUNDLE_APP_CONFIG` and the app config file.
 pub async fn bundler_loaded_manifest(root: &Path) -> crate::formats::gem::manifest::LoadedManifest {
     bundler_loaded_manifest_with_env(
         root,
-        std::env::var_os("BUNDLE_GEMFILE").as_deref(),
-        std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
-        bundler_ignores_config(),
+        BundlerEnv {
+            gemfile: std::env::var_os("BUNDLE_GEMFILE").as_deref(),
+            lockfile: std::env::var_os("BUNDLE_LOCKFILE").as_deref(),
+            app_config: std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+            ignore_config: bundler_ignores_config(),
+        },
     )
     .await
 }
 
+/// The bundler environment [`bundler_loaded_manifest_with_env`] reads.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BundlerEnv<'a> {
+    /// `BUNDLE_GEMFILE`.
+    pub gemfile: Option<&'a OsStr>,
+    /// `BUNDLE_LOCKFILE` (bundler 4).
+    pub lockfile: Option<&'a OsStr>,
+    /// `BUNDLE_APP_CONFIG`.
+    pub app_config: Option<&'a OsStr>,
+    /// [`bundler_ignores_config`].
+    pub ignore_config: bool,
+}
+
 /// [`bundler_loaded_manifest`] with the environment passed explicitly (hermetic
-/// tests). `ignore_config` is [`bundler_ignores_config`].
+/// tests).
 pub async fn bundler_loaded_manifest_with_env(
     root: &Path,
-    gemfile_env: Option<&OsStr>,
-    app_config_env: Option<&OsStr>,
-    ignore_config: bool,
+    env: BundlerEnv<'_>,
 ) -> crate::formats::gem::manifest::LoadedManifest {
-    let config_value = read_app_config(root, app_config_env, ignore_config)
+    use crate::formats::gem::manifest;
+    let config = read_app_config(root, env.app_config, env.ignore_config).await;
+    let config = config.as_deref();
+    let gemfile = config.and_then(manifest::config_gemfile);
+    let lockfile = config.and_then(manifest::config_lockfile);
+    let gems_rb_present = tokio::fs::symlink_metadata(root.join("gems.rb"))
         .await
-        .and_then(|text| crate::formats::gem::manifest::config_gemfile(&text));
-    crate::formats::gem::manifest::classify(root, gemfile_env, config_value.as_deref())
+        .is_ok();
+    manifest::classify(root, env.gemfile, gemfile.as_deref()).with_lockfile(
+        root,
+        env.lockfile,
+        lockfile.as_deref(),
+        gems_rb_present,
+    )
 }
 
 /// Whether bundler skips its config files: `Bundler::Settings#ignore_config?`
@@ -1215,7 +1239,7 @@ mod tests {
             "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n",
         )
         .unwrap();
-        let m = bundler_loaded_manifest_with_env(dir.path(), None, None, false).await;
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
         assert!(matches!(
             m,
             crate::formats::gem::manifest::LoadedManifest::Unsupported {
@@ -1226,14 +1250,22 @@ mod tests {
         // BUNDLE_APP_CONFIG moves the config file away from `.bundle`.
         let m = bundler_loaded_manifest_with_env(
             dir.path(),
-            None,
-            Some(std::ffi::OsStr::new("elsewhere")),
-            false,
+            BundlerEnv {
+                app_config: Some(std::ffi::OsStr::new("elsewhere")),
+                ..BundlerEnv::default()
+            },
         )
         .await;
         assert_eq!(m, crate::formats::gem::manifest::LoadedManifest::Default);
         // BUNDLE_IGNORE_CONFIG: bundler reads no config file at all.
-        let m = bundler_loaded_manifest_with_env(dir.path(), None, None, true).await;
+        let m = bundler_loaded_manifest_with_env(
+            dir.path(),
+            BundlerEnv {
+                ignore_config: true,
+                ..BundlerEnv::default()
+            },
+        )
+        .await;
         assert_eq!(m, crate::formats::gem::manifest::LoadedManifest::Default);
     }
 
@@ -1251,9 +1283,10 @@ mod tests {
         .unwrap();
         let m = bundler_loaded_manifest_with_env(
             dir.path(),
-            Some(std::ffi::OsStr::new("Gemfile")),
-            None,
-            false,
+            BundlerEnv {
+                gemfile: Some(std::ffi::OsStr::new("Gemfile")),
+                ..BundlerEnv::default()
+            },
         )
         .await;
         assert_eq!(
@@ -1263,6 +1296,79 @@ mod tests {
                 by: crate::formats::gem::manifest::GemfileSetting::AppConfig,
             }
         );
+    }
+
+    /// #749: bundler 4's configured lockfile (`BUNDLE_LOCKFILE`, the
+    /// environment first, then the app config) naming anything but the
+    /// loaded pair's own lock is unsupported; naming that lock is a no-op.
+    #[tokio::test]
+    async fn loaded_manifest_reads_the_lockfile_setting() {
+        use crate::formats::gem::manifest::{GemfileSetting, LoadedManifest};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".bundle")).unwrap();
+        let config = |value: &str| {
+            std::fs::write(
+                dir.path().join(".bundle/config"),
+                format!("---\nBUNDLE_LOCKFILE: \"{value}\"\n"),
+            )
+            .unwrap()
+        };
+        config("custom.lock");
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert_eq!(
+            m,
+            LoadedManifest::UnsupportedLockfile {
+                value: "custom.lock".into(),
+                by: GemfileSetting::AppConfig
+            }
+        );
+        assert_eq!(m.pair(false), None);
+        // The environment wins over the app config, as in `Bundler::CLI`.
+        let m = bundler_loaded_manifest_with_env(
+            dir.path(),
+            BundlerEnv {
+                lockfile: Some(std::ffi::OsStr::new("Gemfile.lock")),
+                ..BundlerEnv::default()
+            },
+        )
+        .await;
+        assert_eq!(m, LoadedManifest::Default);
+        let m = bundler_loaded_manifest_with_env(
+            dir.path(),
+            BundlerEnv {
+                lockfile: Some(std::ffi::OsStr::new("other.lock")),
+                ..BundlerEnv::default()
+            },
+        )
+        .await;
+        assert!(matches!(
+            m,
+            LoadedManifest::UnsupportedLockfile {
+                by: GemfileSetting::Env,
+                ..
+            }
+        ));
+        // BUNDLE_IGNORE_CONFIG drops the app config value.
+        let m = bundler_loaded_manifest_with_env(
+            dir.path(),
+            BundlerEnv {
+                ignore_config: true,
+                ..BundlerEnv::default()
+            },
+        )
+        .await;
+        assert_eq!(m, LoadedManifest::Default);
+        // The default lock of the pair bundler loads is a no-op; with a
+        // gems.rb, that lock is gems.locked, not Gemfile.lock.
+        config("Gemfile.lock");
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert_eq!(m, LoadedManifest::Default);
+        std::fs::write(dir.path().join("gems.rb"), "").unwrap();
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert!(matches!(m, LoadedManifest::UnsupportedLockfile { .. }));
+        config("./gems.locked");
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert_eq!(m, LoadedManifest::Default);
     }
 
     /// #483: bundler's cache dir is the `cache_path` setting — the app

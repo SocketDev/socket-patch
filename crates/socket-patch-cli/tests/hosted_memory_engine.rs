@@ -989,3 +989,172 @@ async fn a_vlt_project_is_withheld_as_offline() {
     );
     assert!(output.changed_files.is_empty());
 }
+
+const GEM_BASIC_FIXTURE: &str = "redirect/gem/bundler/basic";
+
+/// The gem fixture's API mocks and input files.
+async fn gem_server_and_input() -> (MockServer, BTreeMap<String, Vec<u8>>) {
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(
+        &fixtures_root()
+            .join(GEM_BASIC_FIXTURE)
+            .join("overrides.json"),
+        None,
+    );
+    mount_api(&server, &patches).await;
+    let input = fixture_files(&fixtures_root().join(GEM_BASIC_FIXTURE).join("input"));
+    (server, input)
+}
+
+fn warning_codes(redirect: &Value) -> Vec<String> {
+    redirect["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["code"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn changed_paths(output: &HostedScanOutput) -> Vec<&str> {
+    output
+        .changed_files
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect()
+}
+
+/// #749: bundler 4 reads the lock `bundle config set lockfile custom.lock`
+/// names, which the rewriter never pins. With a leftover `Gemfile.lock`
+/// beside it, the run used to rewrite that ignored lock, report success,
+/// and break every frozen install; the project is refused with nothing
+/// written instead. (A memory tree only finds gem candidates through a
+/// default lock; the no-leftover shape is covered on disk by
+/// `ruby_crawler`'s `loaded_manifest_reads_the_lockfile_setting`.)
+#[tokio::test]
+async fn a_bundler4_custom_lockfile_is_refused() {
+    let (server, input) = gem_server_and_input().await;
+    let mut files = input.clone();
+    files.insert("custom.lock".to_string(), input["Gemfile.lock"].clone());
+    files.insert(
+        ".bundle/config".to_string(),
+        b"---\nBUNDLE_LOCKFILE: \"custom.lock\"\n".to_vec(),
+    );
+    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+    let project = &output.projects[0];
+    assert!(project.error.is_none(), "{:?}", project.error);
+    assert!(project.redirected.is_empty(), "{:?}", project.redirected);
+    assert!(
+        warning_codes(&project.redirect)
+            .contains(&"redirect_gem_bundle_lockfile_unsupported".into()),
+        "{:?}",
+        warning_codes(&project.redirect)
+    );
+    assert!(
+        changed_paths(&output).is_empty(),
+        "{:?}",
+        changed_paths(&output)
+    );
+}
+
+/// #749: a configured lockfile naming the pair's own default lock is the
+/// lock the rewriter pins anyway, so the project is wired as usual.
+#[tokio::test]
+async fn a_lockfile_setting_naming_the_default_lock_is_wired() {
+    let (server, input) = gem_server_and_input().await;
+    let mut files = input.clone();
+    files.insert(
+        ".bundle/config".to_string(),
+        b"---\nBUNDLE_LOCKFILE: \"Gemfile.lock\"\n".to_vec(),
+    );
+    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+    let project = &output.projects[0];
+    assert_eq!(
+        project.redirected.len(),
+        1,
+        "{:?}",
+        warning_codes(&project.redirect)
+    );
+    assert_eq!(changed_paths(&output), vec!["Gemfile", "Gemfile.lock"]);
+}
+
+/// The fixture lock re-stamped `BUNDLED WITH <version>`.
+fn bundled_with(lock: &[u8], version: &str) -> Vec<u8> {
+    let text = String::from_utf8(lock.to_vec()).unwrap();
+    let (head, _) = text.split_once("BUNDLED WITH").unwrap();
+    format!("{head}BUNDLED WITH\n   {version}\n").into_bytes()
+}
+
+/// A `Gemfile` + `gems.rb` twin with each lock bundled by `versions`.
+fn gem_twin(
+    input: &BTreeMap<String, Vec<u8>>,
+    versions: (&str, &str),
+) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    files.insert("Gemfile".to_string(), input["Gemfile"].clone());
+    files.insert("gems.rb".to_string(), input["Gemfile"].clone());
+    files.insert(
+        "Gemfile.lock".to_string(),
+        bundled_with(&input["Gemfile.lock"], versions.0),
+    );
+    files.insert(
+        "gems.locked".to_string(),
+        bundled_with(&input["Gemfile.lock"], versions.1),
+    );
+    files
+}
+
+/// #751: bundler 1.x loads `Gemfile` before `gems.rb`. A twin whose locks
+/// say bundler 1.17 wrote them is wired through the `Gemfile` pair (the
+/// one that installs), never `gems.rb`.
+#[tokio::test]
+async fn a_bundler1_twin_wires_the_gemfile_pair() {
+    let (server, input) = gem_server_and_input().await;
+    let files = gem_twin(&input, ("1.17.3", "1.17.3"));
+    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+    let project = &output.projects[0];
+    assert!(project.error.is_none(), "{:?}", project.error);
+    assert_eq!(
+        project.redirected.len(),
+        1,
+        "{:?}",
+        warning_codes(&project.redirect)
+    );
+    assert_eq!(changed_paths(&output), vec!["Gemfile", "Gemfile.lock"]);
+}
+
+/// #751 control: a bundler >= 2 twin still wires `gems.rb`, as bundler
+/// >= 2 loads it.
+#[tokio::test]
+async fn a_bundler2_twin_still_wires_gems_rb() {
+    let (server, input) = gem_server_and_input().await;
+    let files = gem_twin(&input, ("2.6.2", "2.6.2"));
+    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+    let project = &output.projects[0];
+    assert_eq!(
+        project.redirected.len(),
+        1,
+        "{:?}",
+        warning_codes(&project.redirect)
+    );
+    assert_eq!(changed_paths(&output), vec!["gems.locked", "gems.rb"]);
+}
+
+/// #751: twin locks written by different bundler majors leave no safe
+/// spelling to wire: refused, nothing written.
+#[tokio::test]
+async fn a_twin_with_diverging_bundler_majors_is_refused() {
+    let (server, input) = gem_server_and_input().await;
+    for versions in [("1.17.3", "2.6.2"), ("2.6.2", "1.17.3")] {
+        let files = gem_twin(&input, versions);
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let project = &output.projects[0];
+        assert!(project.redirected.is_empty(), "{versions:?}");
+        assert!(
+            warning_codes(&project.redirect)
+                .contains(&"redirect_gem_twin_bundler_versions_diverge".into()),
+            "{versions:?}: {:?}",
+            warning_codes(&project.redirect)
+        );
+        assert!(changed_paths(&output).is_empty());
+    }
+}

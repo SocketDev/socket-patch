@@ -43,6 +43,20 @@ pub(crate) fn bundler_manifest_for(lock: &str) -> &'static str {
     }
 }
 
+/// The major version of the bundler that wrote `text`: the version line
+/// under the lock's `BUNDLED WITH` header (`   1.17.3` => `1`). `None`
+/// when the lock records no parseable one. CRLF is tolerated.
+pub(crate) fn bundled_with_major(text: &str) -> Option<u32> {
+    let mut lines = text.lines().map(|l| l.trim_end_matches('\r'));
+    lines.find(|l| *l == "BUNDLED WITH")?;
+    let version = lines.next()?.trim();
+    let major = version.split('.').next()?;
+    if major.is_empty() || !major.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    major.parse().ok()
+}
+
 /// Remote URLs compared the way bundler normalizes them (trailing `/`).
 pub(crate) fn same_remote(a: &str, b: &str) -> bool {
     a.trim_end_matches('/') == b.trim_end_matches('/')
@@ -399,6 +413,25 @@ fn parse_checksum(entry: &str) -> Option<((&str, &str), Option<String>)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bundled_with_major_reads_the_version_line() {
+        assert_eq!(
+            super::bundled_with_major("GEM\n\nBUNDLED WITH\n   1.17.3\n"),
+            Some(1)
+        );
+        assert_eq!(
+            super::bundled_with_major("GEM\r\n\r\nBUNDLED WITH\r\n   2.6.2\r\n"),
+            Some(2)
+        );
+        assert_eq!(
+            super::bundled_with_major("BUNDLED WITH\n   4.0.17"),
+            Some(4)
+        );
+        assert_eq!(super::bundled_with_major("GEM\n"), None);
+        assert_eq!(super::bundled_with_major("BUNDLED WITH\n"), None);
+        assert_eq!(super::bundled_with_major("BUNDLED WITH\n   x.1\n"), None);
+    }
+
     use super::*;
 
     #[test]

@@ -522,11 +522,17 @@ const GEM_MANIFEST_FILES: [&str; 4] = ["Gemfile", "Gemfile.lock", "gems.rb", "ge
 /// ignores:
 ///
 /// - no `BUNDLE_GEMFILE`: unchanged (the rewriter's `gems.rb`-first choice
-///   and its divergence guard are bundler's default discovery);
+///   and its divergence guard are bundler >= 2's default discovery) —
+///   except a `Gemfile` + `gems.rb` twin whose locks say bundler 1.x wrote
+///   them, which loads the `Gemfile` pair, and a twin whose locks disagree
+///   on the bundler major, which is withheld
+///   ([`manifest::default_twin_manifest`](crate::formats::gem::manifest::default_twin_manifest));
 /// - `BUNDLE_GEMFILE` naming the root `Gemfile` / `gems.rb`: the other
 ///   spelling is dropped;
-/// - `BUNDLE_GEMFILE` naming anything else: every spelling is dropped and
-///   [`CandidateFiles::gem_manifest_unsupported`] says why.
+/// - `BUNDLE_GEMFILE` naming anything else, or bundler 4's
+///   `BUNDLE_LOCKFILE` naming a lock other than the pair's own: every
+///   spelling is dropped and [`CandidateFiles::gem_manifest_unsupported`]
+///   says why.
 ///
 /// A memory view has no environment: only its own app config is read.
 async fn keep_bundler_loaded_gem_files(view: &ProjectView<'_>, out: &mut CandidateFiles) {
@@ -538,12 +544,37 @@ async fn keep_bundler_loaded_gem_files(view: &ProjectView<'_>, out: &mut Candida
         }
         ProjectView::Memory(_) => {
             let config = view.read_text(".bundle/config").await.ok();
-            let value = config.as_deref().and_then(manifest::config_gemfile);
+            let gemfile = config.as_deref().and_then(manifest::config_gemfile);
+            let lockfile = config.as_deref().and_then(manifest::config_lockfile);
             let root = std::path::Path::new("/");
-            manifest::classify(root, None, value.as_deref())
+            manifest::classify(root, None, gemfile.as_deref()).with_lockfile(
+                root,
+                None,
+                lockfile.as_deref(),
+                view.is_file("gems.rb"),
+            )
         }
     };
+    let mut twin_ambiguous = None;
     let keep: &[&str] = match &loaded {
+        // Default discovery: the rewriter's `gems.rb`-first choice and its
+        // divergence guard are bundler >= 2's order. A twin the locks say
+        // bundler 1.x wrote is loaded through its `Gemfile` instead (#751).
+        LoadedManifest::Default
+            if out.files.contains_key("gems.rb") && out.files.contains_key("Gemfile") =>
+        {
+            match manifest::default_twin_manifest(
+                out.files.get("Gemfile.lock").map(String::as_str),
+                out.files.get("gems.locked").map(String::as_str),
+            ) {
+                Ok("gems.rb") => return,
+                Ok(_) => &["Gemfile", "Gemfile.lock"],
+                Err(detail) => {
+                    twin_ambiguous = Some(detail);
+                    &[]
+                }
+            }
+        }
         LoadedManifest::Default => return,
         LoadedManifest::Configured { .. } => {
             let (gemfile, lock) = loaded
@@ -551,16 +582,26 @@ async fn keep_bundler_loaded_gem_files(view: &ProjectView<'_>, out: &mut Candida
                 .expect("a configured default spelling has a pair");
             &[gemfile, lock]
         }
-        LoadedManifest::Unsupported { .. } => &[],
+        LoadedManifest::Unsupported { .. } | LoadedManifest::UnsupportedLockfile { .. } => &[],
     };
     let dropped = |rel: &str| GEM_MANIFEST_FILES.contains(&rel) && !keep.contains(&rel);
     out.files.retain(|rel, _| !dropped(rel));
     out.symlinked_reads.retain(|rel| !dropped(rel));
     out.unreadable_reads.retain(|rel| !dropped(rel));
-    out.gem_manifest_unsupported = loaded.unsupported_detail().map(|detail| RewriteWarning {
-        code: "redirect_gem_bundle_gemfile_unsupported".into(),
-        detail,
-    });
+    let code = match &loaded {
+        LoadedManifest::UnsupportedLockfile { .. } => "redirect_gem_bundle_lockfile_unsupported",
+        _ => "redirect_gem_bundle_gemfile_unsupported",
+    };
+    out.gem_manifest_unsupported = loaded
+        .unsupported_detail()
+        .map(|detail| RewriteWarning {
+            code: code.into(),
+            detail,
+        })
+        .or(twin_ambiguous.map(|detail| RewriteWarning {
+            code: "redirect_gem_twin_bundler_versions_diverge".into(),
+            detail,
+        }));
 }
 
 /// The pypi wheels whose metadata a native lock rewrite needs, in
