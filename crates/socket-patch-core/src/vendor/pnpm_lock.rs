@@ -5048,6 +5048,41 @@ snapshots:
             .exists());
     }
 
+    /// A CRLF, BOM or BOM+CRLF+tab `package.json` (a Windows / autocrlf
+    /// checkout) keeps its layout: the vendored file differs from the
+    /// original only in `pnpm.overrides`, and the revert is byte-exact
+    /// (#662).
+    #[tokio::test]
+    async fn vendor_and_revert_keep_package_json_layout() {
+        use crate::vendor::test_support::{relayout, JSON_LAYOUTS};
+        for (tag, bom, crlf, tab) in JSON_LAYOUTS {
+            let before = relayout(P1_BEFORE_PKG, bom, crlf, tab);
+            let fx = fixture_with(&before, P1_BEFORE_LOCK).await;
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{tag}: {:?}", result.error);
+            assert_eq!(
+                fx.read(PACKAGE_JSON).await,
+                relayout(P1_AFTER_PKG, bom, crlf, tab),
+                "{tag}: vendored package.json keeps its layout"
+            );
+            assert_eq!(
+                fx.read(PNPM_LOCK).await,
+                P1_AFTER_LOCK.replace(SPIKE_INTEGRITY, &fx.actual_integrity().await),
+                "{tag}: lock unaffected by the manifest layout"
+            );
+
+            let outcome = revert_pnpm(&entry.unwrap(), fx.root(), false).await;
+            assert!(outcome.success, "{tag}: {:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{tag}: {:?}", outcome.warnings);
+            assert_eq!(
+                fx.read(PACKAGE_JSON).await,
+                before,
+                "{tag}: package.json byte-restored"
+            );
+            assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "{tag}");
+        }
+    }
+
     #[tokio::test]
     async fn revert_allowlist_is_fail_closed() {
         let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
