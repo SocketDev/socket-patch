@@ -19569,3 +19569,142 @@ mod hosted_patch_uuid_tests {
             .starts_with(&format!("{SOCKET_PATCH_SERVER_HOST}/")));
     }
 }
+
+/// #742 / #650: a superseding patch uuid for a package an earlier hosted
+/// scan already wired re-pins socket-patch's own source, end to end through
+/// the redirect planner, instead of warning "revert it" and leaving the old
+/// uuid in place.
+#[cfg(test)]
+mod superseding_repin_tests {
+    use super::*;
+
+    const HEX_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HEX_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn six(grant: &str, uuid: &str, sha256: &str) -> DepOverride {
+        DepOverride {
+            ecosystem: "pypi".into(),
+            name: "six".into(),
+            namespace: None,
+            version: "1.16.0".into(),
+            token: grant.into(),
+            patch_uuid: uuid.into(),
+            artifact_url: format!(
+                "https://patch.socket.dev/patch/pypi/six/1.16.0/{grant}/{uuid}/six-1.16.0-py2.py3-none-any.whl"
+            ),
+            registry_override: None,
+            integrity: Integrity {
+                sha256: Some(sha256.into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn first() -> DepOverride {
+        six(
+            "11111111-1111-4111-8111-111111111111",
+            "aaaaaaaa-0000-4000-8000-000000000001",
+            HEX_A,
+        )
+    }
+
+    fn second() -> DepOverride {
+        six(
+            "22222222-2222-4222-8222-222222222222",
+            "aaaaaaaa-0000-4000-8000-000000000004",
+            HEX_B,
+        )
+    }
+
+    /// Run the planner and fold its rewrites over `files`.
+    fn scan(files: &BTreeMap<String, String>, dep: &DepOverride) -> (BTreeMap<String, String>, RewriteResult) {
+        let result = rewrite_registry_redirect(files, std::slice::from_ref(dep));
+        let mut out = files.clone();
+        out.extend(result.files.clone());
+        (out, result)
+    }
+
+    fn assert_repinned(files: &BTreeMap<String, String>, result: &RewriteResult) {
+        assert!(
+            result.warnings.is_empty(),
+            "superseding patch refused: {:?}",
+            result.warnings
+        );
+        for (path, text) in files {
+            assert!(!text.contains(&first().patch_uuid), "{path} kept the old uuid:\n{text}");
+        }
+        let joined: String = files.values().cloned().collect();
+        assert!(joined.contains(&second().patch_uuid));
+    }
+
+    #[test]
+    fn uv_project_repins_to_a_superseding_patch() {
+        let lock = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\ndependencies = [{ name = \"six\" }]\n\n[package.metadata]\nrequires-dist = [{ name = \"six\", specifier = \"==1.16.0\" }]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" }]\n";
+        let project = "[project]\nname = \"app\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\"]\n";
+        for newline in ["\n", "\r\n"] {
+            let files: BTreeMap<String, String> = [
+                ("uv.lock".to_string(), lock.replace('\n', newline)),
+                ("pyproject.toml".to_string(), project.replace('\n', newline)),
+            ]
+            .into_iter()
+            .collect();
+            let (wired, result) = scan(&files, &first());
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert!(wired["pyproject.toml"].contains(&first().artifact_url));
+            assert!(wired["uv.lock"].contains(&first().artifact_url));
+            let (repinned, result) = scan(&wired, &second());
+            assert_repinned(&repinned, &result);
+            assert!(result
+                .confirmed_python_lock_uuids
+                .contains(&second().patch_uuid));
+            assert!(repinned["uv.lock"].contains(&format!("sha256:{HEX_B}")));
+            assert!(!repinned["uv.lock"].contains(HEX_A));
+            assert_eq!(repinned["uv.lock"].contains('\r'), newline == "\r\n");
+            // The re-pinned project is settled.
+            let (_, again) = scan(&repinned, &second());
+            assert!(again.files.is_empty() && again.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn uv_script_lock_repins_to_a_superseding_patch() {
+        let script = "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"six==1.16.0\"]\n# ///\nimport six\n";
+        let lock = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{ name = \"six\", specifier = \"==1.16.0\" }]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" }]\n";
+        let files: BTreeMap<String, String> = [
+            ("tool.py".to_string(), script.to_string()),
+            ("tool.py.lock".to_string(), lock.to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let (wired, result) = scan(&files, &first());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(wired["tool.py"].contains(&first().artifact_url));
+        let (repinned, result) = scan(&wired, &second());
+        assert_repinned(&repinned, &result);
+        assert!(repinned["tool.py.lock"].contains(&second().artifact_url));
+    }
+
+    #[test]
+    fn hatch_project_repins_to_a_superseding_patch() {
+        let project = "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n\n[tool.hatch.envs.default]\ndependencies = [\"six==1.16.0\"]\n";
+        let files: BTreeMap<String, String> = [("pyproject.toml".to_string(), project.to_string())]
+            .into_iter()
+            .collect();
+        let (wired, result) = scan(&files, &first());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(wired["pyproject.toml"].matches(&first().artifact_url).count(), 2);
+        let (repinned, result) = scan(&wired, &second());
+        assert_repinned(&repinned, &result);
+        assert!(result.confirmed_hatch_uuids.contains(&second().patch_uuid));
+        let pyproject = &repinned["pyproject.toml"];
+        assert_eq!(
+            pyproject
+                .matches(&format!("{}#sha256={HEX_B}", second().artifact_url))
+                .count(),
+            2,
+            "{pyproject}"
+        );
+        let (_, again) = scan(&repinned, &second());
+        assert!(again.files.is_empty() && again.warnings.is_empty());
+    }
+}

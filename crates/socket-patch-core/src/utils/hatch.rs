@@ -510,6 +510,54 @@ mod tests {
         }
     }
 
+    /// #650: a superseding patch (a new patch uuid for the same package and
+    /// version) re-pins socket-patch's OWN earlier hosted direct reference —
+    /// in `pyproject.toml` (project and env tables) and in `hatch.toml` —
+    /// instead of refusing it as an unknown user source.
+    #[test]
+    fn superseding_patch_repins_own_hosted_reference() {
+        const A: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/11111111-1111-4111-8111-111111111111/aaaaaaaa-0000-4000-8000-000000000001/six-1.16.0-py2.py3-none-any.whl#sha256=aaaa";
+        const B: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/22222222-2222-4222-8222-222222222222/aaaaaaaa-0000-4000-8000-000000000004/six-1.16.0-py2.py3-none-any.whl#sha256=bbbb";
+        let inputs: BTreeMap<String, String> = [
+            ("pyproject.toml".to_string(), "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0 ; python_version >= '3'\"]\n[tool.hatch.envs.default]\ndependencies = [\"six==1.16.0\"]\n".to_string()),
+            ("hatch.toml".to_string(), "[envs.lint]\ndependencies = [\"Six[x]==1.16.0\"]\n".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        // hatch.toml's `envs` replaces pyproject's whole env table, so the
+        // project dependency and the hatch.toml env are the two declarations.
+        let mut wired = inputs.clone();
+        wired.extend(rewrite(&inputs, "six", "1.16.0", A).unwrap());
+        assert_eq!(wired.values().map(|t| t.matches(A).count()).sum::<usize>(), 2);
+        let edits = rewrite(&wired, "six", "1.16.0", B)
+            .unwrap_or_else(|e| panic!("superseding patch refused: {e}"));
+        let mut repinned = wired.clone();
+        repinned.extend(edits);
+        for text in repinned.values() {
+            assert!(!text.contains(A), "{text}");
+        }
+        assert_eq!(repinned.values().map(|t| t.matches(B).count()).sum::<usize>(), 2);
+        assert!(repinned["pyproject.toml"].contains(&format!("six @ {B} ; python_version >= '3'")));
+        assert!(repinned["hatch.toml"].contains(&format!("Six[x] @ {B}")));
+        assert!(rewrite(&repinned, "six", "1.16.0", B).unwrap().is_empty());
+        // Not ours: another host, another version, or credentials stay a
+        // user source that must be reverted first.
+        for foreign in [
+            A.replace("patch.socket.dev", "example.test"),
+            A.replace("1.16.0", "1.15.0"),
+            A.replace("https://", "https://user@"),
+        ] {
+            let user: BTreeMap<String, String> = wired
+                .iter()
+                .map(|(k, v)| (k.clone(), v.replace(A, &foreign)))
+                .collect();
+            assert!(
+                rewrite(&user, "six", "1.16.0", B).is_err(),
+                "{foreign} must stay a user source"
+            );
+        }
+    }
+
     /// #475: Hatch (via pip/uv) selects a release under PEP 440, so
     /// `==1.26.18.0` and `==01.26.18` are exact pins of 1.26.18.
     #[test]

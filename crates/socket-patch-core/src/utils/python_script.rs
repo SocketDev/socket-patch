@@ -351,17 +351,6 @@ mod tests {
                 .unwrap();
         assert!(new.contains(&current));
         assert!(!new.contains(previous));
-        let different_patch = current.replace(
-            "e828efa5-5c6d-43f3-9909-03f5ac232b98",
-            "33333333-3333-4333-8333-333333333333",
-        );
-        assert!(rewrite_script_metadata(
-            &old,
-            "urllib3",
-            "1.26.18",
-            ArtifactSource::Url(&different_patch)
-        )
-        .is_err());
         let different_host = current.replace("patch.socket.dev", "example.test");
         assert!(rewrite_script_metadata(
             &old,
@@ -370,6 +359,67 @@ mod tests {
             ArtifactSource::Url(&different_host)
         )
         .is_err());
+    }
+
+    const OWN_A: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/11111111-1111-4111-8111-111111111111/aaaaaaaa-0000-4000-8000-000000000001/six-1.16.0-py2.py3-none-any.whl";
+    const OWN_B: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/22222222-2222-4222-8222-222222222222/aaaaaaaa-0000-4000-8000-000000000004/six-1.16.0-py2.py3-none-any.whl";
+
+    /// #742: a superseding patch (a new patch uuid for the same package and
+    /// version) re-pins socket-patch's OWN earlier hosted source in both a
+    /// uv project and a PEP 723 script, instead of refusing it as a
+    /// user-authored source.
+    #[test]
+    fn superseding_patch_repins_own_hosted_source() {
+        let project = "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\", \"idna==3.7\"]\n";
+        let script = "# /// script\n# dependencies = [\"six==1.16.0\"]\n# ///\n";
+        type Rewrite = fn(&str, &str, &str, ArtifactSource<'_>) -> Result<Option<String>, String>;
+        let writers: [(&str, Rewrite); 2] = [
+            (project, rewrite_project_metadata),
+            (script, rewrite_script_metadata),
+        ];
+        for (original, rewrite) in writers {
+            let wired = rewrite(original, "six", "1.16.0", ArtifactSource::Url(OWN_A))
+                .unwrap()
+                .unwrap();
+            let repinned = rewrite(&wired, "six", "1.16.0", ArtifactSource::Url(OWN_B))
+                .unwrap_or_else(|e| panic!("superseding patch refused: {e}"))
+                .expect("re-pinned");
+            assert!(repinned.contains(OWN_B), "{repinned}");
+            assert!(!repinned.contains(OWN_A), "{repinned}");
+            assert_eq!(repinned.matches("six-1.16.0").count(), 1, "{repinned}");
+            // The re-pin is settled: running the same patch again is a no-op.
+            assert_eq!(
+                rewrite(&repinned, "six", "1.16.0", ArtifactSource::Url(OWN_B)).unwrap(),
+                None
+            );
+            // A path-prefixed --patch-server-url deployment re-pins its own
+            // earlier source too.
+            let custom_a = OWN_A.replace("patch.socket.dev/", "patches.internal.example/socket/");
+            let custom_b = OWN_B.replace("patch.socket.dev/", "patches.internal.example/socket/");
+            let wired = rewrite(original, "six", "1.16.0", ArtifactSource::Url(&custom_a))
+                .unwrap()
+                .unwrap();
+            let repinned = rewrite(&wired, "six", "1.16.0", ArtifactSource::Url(&custom_b))
+                .unwrap()
+                .expect("re-pinned on a custom origin");
+            assert!(repinned.contains(&custom_b) && !repinned.contains(&custom_a));
+            // Not ours: another host, another version, credentials, or a
+            // user path source still refuse.
+            let wired = rewrite(original, "six", "1.16.0", ArtifactSource::Url(OWN_A))
+                .unwrap()
+                .unwrap();
+            for foreign in [
+                OWN_A.replace("patch.socket.dev", "example.test"),
+                OWN_A.replace("1.16.0", "1.15.0"),
+                OWN_A.replace("https://", "https://user@"),
+            ] {
+                let user = wired.replace(OWN_A, &foreign);
+                assert!(
+                    rewrite(&user, "six", "1.16.0", ArtifactSource::Url(OWN_B)).is_err(),
+                    "{foreign} must stay a user source"
+                );
+            }
+        }
     }
 
     /// A package declared in ANY project table (dependencies, an extra, a
