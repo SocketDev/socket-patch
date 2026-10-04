@@ -751,9 +751,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client =
-            metadata_client(&short_timeouts(), follow_redirect_policy(&default_endpoints()))
-                .unwrap();
+        let client = metadata_client(
+            &short_timeouts(),
+            follow_redirect_policy(&default_endpoints()),
+        )
+        .unwrap();
         let err = client
             .get(format!("{}/start", server.uri()))
             .send()
@@ -786,9 +788,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client =
-            metadata_client(&short_timeouts(), follow_redirect_policy(&default_endpoints()))
-                .unwrap();
+        let client = metadata_client(
+            &short_timeouts(),
+            follow_redirect_policy(&default_endpoints()),
+        )
+        .unwrap();
         let err = client
             .get(format!("{}/start", server.uri()))
             .send()
@@ -864,7 +868,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, UpdateError::CheckFailed(_)), "{err:?}");
         let msg = err.to_string();
-        assert!(msg.contains("expected a redirect to the latest tag"), "{msg}");
+        assert!(
+            msg.contains("expected a redirect to the latest tag"),
+            "{msg}"
+        );
         assert!(msg.contains("API fallback:"), "{msg}");
         assert!(msg.contains("returned 500"), "{msg}");
     }
@@ -945,8 +952,14 @@ mod tests {
 
     #[test]
     fn url_host_keeps_explicit_ports() {
-        assert_eq!(url_host("http://127.0.0.1:9/x").as_deref(), Some("127.0.0.1:9"));
-        assert_eq!(url_host("https://github.com/a").as_deref(), Some("github.com"));
+        assert_eq!(
+            url_host("http://127.0.0.1:9/x").as_deref(),
+            Some("127.0.0.1:9")
+        );
+        assert_eq!(
+            url_host("https://github.com/a").as_deref(),
+            Some("github.com")
+        );
         assert_eq!(url_host("not a url"), None);
     }
 
@@ -959,7 +972,9 @@ mod tests {
         // code stays `check_failed` (stable contract).
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/SocketDev/socket-patch/releases/download/v1.2.3/SHA256SUMS"))
+            .and(path(
+                "/SocketDev/socket-patch/releases/download/v1.2.3/SHA256SUMS",
+            ))
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
@@ -992,7 +1007,9 @@ mod tests {
         // silently.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/SocketDev/socket-patch/releases/download/v1.2.3/SHA256SUMS"))
+            .and(path(
+                "/SocketDev/socket-patch/releases/download/v1.2.3/SHA256SUMS",
+            ))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
