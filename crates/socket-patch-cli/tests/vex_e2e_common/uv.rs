@@ -688,7 +688,7 @@ struct Built {
 
 /// Build the lane's project with the real uv (network: PyPI). `Err` is a
 /// skip reason (PyPI unreachable, fixture command failed).
-/// `mode` hosted: the uv pylock lanes also lock a pure-Python PyPI sibling
+/// `mode` hosted: the pylock lanes also lock a pure-Python PyPI sibling
 /// (`idna`), which shows the hosted rollback the lock's registry and
 /// artifact shape.
 fn build(uv: &Uv, lane: Lane, mode: Mode, tmp: &Path) -> Result<Built, String> {
@@ -801,11 +801,19 @@ fn build(uv: &Uv, lane: Lane, mode: Mode, tmp: &Path) -> Result<Built, String> {
             pylock_sync(uv, &proj, &cache)?;
         }
         Lane::PipLock => {
+            // Hosted: `idna` is a sibling in pip's `[[packages.wheels]]`
+            // spelling with no `index` (#804).
+            let reqs: &[&str] = match mode {
+                Mode::Hosted => &["six==1.16.0", "idna==3.7"],
+                Mode::Vendored => &["six==1.16.0"],
+            };
             let mut cmd = Command::new(host_python());
             scrub_python_env(&mut cmd);
             crate::cache_env::isolate(&mut cmd);
             let out = cmd
-                .args(["-m", "pip", "lock", "six==1.16.0", "-o", "pylock.toml"])
+                .args(["-m", "pip", "lock"])
+                .args(reqs)
+                .args(["-o", "pylock.toml"])
                 .current_dir(&proj)
                 .output()
                 .expect("spawn pip lock");
@@ -1631,11 +1639,15 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
         ),
     };
     if mode == Mode::Hosted {
-        // The uv pylock lanes lock a PyPI sibling, which shows the registry
-        // (an `index`, or for `uv pip compile` PyPI files with none, #407)
-        // and the artifact shape, so they restore to the bytes uv wrote
-        // (#408).
-        let byte_exact = matches!(lane, Lane::ExportPylock | Lane::CompilePylock);
+        // The pylock lanes lock a PyPI sibling, which shows the registry
+        // (an `index`, or for `uv pip compile` / `pip lock` PyPI files with
+        // none, #407) and the artifact shape (`pip lock`'s
+        // `[[packages.wheels]]` tables, #804), so they restore to the bytes
+        // uv or pip wrote (#408).
+        let byte_exact = matches!(
+            lane,
+            Lane::ExportPylock | Lane::CompilePylock | Lane::PipLock
+        );
         let env: Value = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|e| panic!("{}: ({e})\n{}", report.what("revert"), dump(&out)));
         let still_wired =
@@ -1667,7 +1679,7 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
                 report.row("revert", "restored to the upstream registry entry");
             }
             _ if byte_exact => panic!(
-                "{}: a uv pylock must restore:\n{}",
+                "{}: a pylock must restore:\n{}",
                 report.what("revert"),
                 dump(&out)
             ),

@@ -21,7 +21,13 @@
 //!   only the wheels its `requires-python` and environments can install, so
 //!   a release with any wheel that is not pure Python 3 is refused, as is a
 //!   lock whose `[options]` / `[tool.uv]` filter files (`exclude-newer`,
-//!   `no-binary`, `no-build`);
+//!   `no-binary`, `no-build`). PEP 751 allows both TOML spellings of the
+//!   artifacts: uv's inline `wheels = [{ … }]`, and the standard tables
+//!   `pip lock` writes (`[[packages.wheels]]` with a
+//!   `[packages.wheels.hashes]` sub-table, `[packages.sdist]`); the entry
+//!   comes back in its siblings' spelling. `pip lock` records only the one
+//!   artifact pip selected — the wheel, or the sdist of a release with no
+//!   wheel — so a pip release with several wheels is refused;
 //! * `[package.metadata]` (the patched wheel's metadata) was added — removed;
 //! * dependents' `{ name, source = { registry = R } }` references were
 //!   repointed at the url — pointed back;
@@ -77,6 +83,14 @@ struct Shape {
     datetime: bool,
     /// `wheels` puts one entry per line.
     multiline: bool,
+    /// pylock: artifacts are standard tables (`[[packages.wheels]]`,
+    /// `[packages.sdist]`), as `pip lock` writes them, not inline ones.
+    tables: bool,
+    /// With `tables`: `hashes` is a sub-table (`[packages.wheels.hashes]`).
+    hash_tables: bool,
+    /// pylock: the lock records only the artifact its writer selected
+    /// (`created-by = "pip"`), not every file of the release.
+    selected_only: bool,
     /// A sibling package's key order (pylock re-places `index` by it).
     package_keys: Vec<String>,
 }
@@ -324,15 +338,25 @@ impl SiblingRegistry<'_> {
     }
 }
 
-/// A package's `wheels` and `sdist` artifact tables.
-fn artifact_tables(package: &toml_edit::Table) -> impl Iterator<Item = &toml_edit::InlineTable> {
-    let wheels = package
-        .get("wheels")
-        .and_then(Item::as_array)
-        .into_iter()
-        .flat_map(|a| a.iter());
-    let sdist = package.get("sdist").and_then(Item::as_value);
-    wheels.chain(sdist).filter_map(Value::as_inline_table)
+/// A package's `wheels` and `sdist` artifact tables, in either PEP 751
+/// spelling: inline (`wheels = [{ … }]`, as uv writes them) or standard
+/// tables (`[[packages.wheels]]` / `[packages.sdist]`, as `pip lock` does).
+fn artifact_tables(package: &toml_edit::Table) -> Vec<&dyn TableLike> {
+    let mut tables: Vec<&dyn TableLike> = Vec::new();
+    match package.get("wheels") {
+        Some(Item::Value(Value::Array(wheels))) => tables.extend(
+            wheels
+                .iter()
+                .filter_map(Value::as_inline_table)
+                .map(|t| t as &dyn TableLike),
+        ),
+        Some(Item::ArrayOfTables(wheels)) => {
+            tables.extend(wheels.iter().map(|t| t as &dyn TableLike))
+        }
+        _ => {}
+    }
+    tables.extend(package.get("sdist").and_then(Item::as_table_like));
+    tables
 }
 
 /// The lowercased host of `url`.
@@ -352,6 +376,7 @@ fn url_host(url: &str) -> String {
 /// `directory` or `archive` package).
 fn pylock_unindexed_registry(package: &toml_edit::Table) -> Option<SiblingRegistry<'static>> {
     let urls: Vec<&str> = artifact_tables(package)
+        .into_iter()
         .filter_map(|a| a.get("url")?.as_str())
         .collect();
     let other = urls
@@ -378,7 +403,9 @@ fn lock_shape(
         .and_then(Item::as_array_of_tables)
         .ok_or("the lock has no package array")?;
     let mut registries: BTreeSet<SiblingRegistry> = BTreeSet::new();
-    let mut shape: Option<(Vec<String>, bool, bool, Vec<String>)> = None;
+    // (keys, datetime, multiline, tables, hash_tables, package_keys)
+    type Learned = (Vec<String>, bool, bool, bool, bool, Vec<String>);
+    let mut shape: Option<Learned> = None;
     let mut fractional_seconds = false;
     for (i, package) in packages.iter().enumerate() {
         if hit_indices.contains(&i) {
@@ -398,20 +425,17 @@ fn lock_shape(
             continue;
         };
         registries.insert(registry);
-        fractional_seconds |= artifact_tables(package).any(|a| {
+        let artifacts = artifact_tables(package);
+        fractional_seconds |= artifacts.iter().any(|a| {
             a.get("upload-time")
-                .and_then(Value::as_datetime)
+                .and_then(Item::as_datetime)
                 .is_some_and(|t| t.to_string().contains('.'))
         });
         if shape.is_some() {
             continue;
         }
-        let first = package
-            .get("wheels")
-            .and_then(Item::as_array)
-            .and_then(|a| a.iter().next())
-            .or_else(|| package.get("sdist").and_then(Item::as_value));
-        let Some(artifact) = first.and_then(Value::as_inline_table) else {
+        // The first wheel, else the sdist.
+        let Some(artifact) = artifacts.first() else {
             continue;
         };
         let keys: Vec<String> = artifact.iter().map(|(k, _)| k.to_string()).collect();
@@ -422,8 +446,14 @@ fn lock_shape(
             .get("wheels")
             .and_then(Item::as_array)
             .is_none_or(|a| a.to_string().contains('\n'));
+        let tables = match package.get("wheels") {
+            Some(Item::ArrayOfTables(wheels)) => !wheels.is_empty(),
+            Some(Item::Value(Value::Array(wheels))) if !wheels.is_empty() => false,
+            _ => package.get("sdist").is_some_and(Item::is_table),
+        };
+        let hash_tables = artifact.get("hashes").is_some_and(Item::is_table);
         let package_keys = package.iter().map(|(k, _)| k.to_string()).collect();
-        shape = Some((keys, datetime, multiline, package_keys));
+        shape = Some((keys, datetime, multiline, tables, hash_tables, package_keys));
     }
     if registries.len() > 1 {
         return Err(format!(
@@ -439,8 +469,8 @@ fn lock_shape(
     let (registry, index) = match registries.pop_first() {
         None => {
             return Err(
-                "no sibling registry package shows the registry and artifact fields this uv \
-                 release records"
+                "no sibling registry package shows the registry and artifact fields the lock \
+                 records"
                     .to_string(),
             )
         }
@@ -459,9 +489,9 @@ fn lock_shape(
              re-derived"
         ));
     }
-    let (keys, datetime, multiline, package_keys) = shape.ok_or(
-        "no sibling registry package records an artifact, so which artifact fields this uv \
-         release records is not derivable",
+    let (keys, datetime, multiline, tables, hash_tables, package_keys) = shape.ok_or(
+        "no sibling registry package records an artifact, so which artifact fields the lock \
+         records is not derivable",
     )?;
     let known = ["url", "hash", "hashes", "size", "upload-time", "name"];
     if let Some(unknown) = keys.iter().find(|k| !known.contains(&k.as_str())) {
@@ -476,6 +506,9 @@ fn lock_shape(
         keys,
         datetime,
         multiline,
+        tables,
+        hash_tables,
+        selected_only: pep751 && doc.get("created-by").and_then(Item::as_str) == Some("pip"),
         package_keys,
     })
 }
@@ -536,11 +569,11 @@ fn render_artifact(file: &PypiFile, shape: &Shape) -> Result<String, String> {
     Ok(format!("{{ {} }}", fields.join(", ")))
 }
 
-/// `(sdist, wheels)` values for a release, in the sibling shape.
+/// `(sdist, wheels)` items for a release, in the sibling shape.
 fn render_artifacts(
     release: &[PypiFile],
     shape: &Shape,
-) -> Result<(Option<Value>, Option<Value>), String> {
+) -> Result<(Option<Item>, Option<Item>), String> {
     if !universal_release(release) {
         return Err(
             "the release ships platform- or interpreter-specific wheels, and which of them uv \
@@ -550,11 +583,38 @@ fn render_artifacts(
     }
     let (wheels, sdists): (Vec<&PypiFile>, Vec<&PypiFile>) =
         release.iter().partition(|f| f.filename.ends_with(".whl"));
+    let (wheels, sdists) = match (shape.selected_only, wheels.len()) {
+        (false, _) | (true, 0) => (wheels, sdists),
+        // pip installs a wheel over the sdist, and records only it.
+        (true, 1) => (wheels, Vec::new()),
+        (true, _) => {
+            return Err(
+                "`pip lock` records only the one wheel pip selected, and which of this \
+                 release's several wheels that is depends on the interpreter that ran it"
+                    .to_string(),
+            )
+        }
+    };
     let sdist = match sdists.as_slice() {
         [] => None,
         [one] => Some(render_artifact(one, shape)?),
         _ => return Err("the release has several source distributions".to_string()),
     };
+    if shape.tables {
+        let table = |text: &str| -> Result<toml_edit::Table, String> {
+            toml_value(text)
+                .and_then(|v| v.as_inline_table().cloned())
+                .map(|t| standard_table(t, shape.hash_tables))
+                .ok_or("an artifact does not render as TOML".to_string())
+        };
+        let sdist = sdist.as_deref().map(table).transpose()?.map(Item::Table);
+        let mut array = toml_edit::ArrayOfTables::new();
+        for wheel in &wheels {
+            array.push(table(&render_artifact(wheel, shape)?)?);
+        }
+        let wheels = (!array.is_empty()).then_some(Item::ArrayOfTables(array));
+        return Ok((sdist, wheels));
+    }
     let wheels = if wheels.is_empty() {
         None
     } else {
@@ -568,11 +628,32 @@ fn render_artifacts(
             format!("[{}]", entries.join(", "))
         })
     };
-    let parse = |text: Option<String>| -> Result<Option<Value>, String> {
-        text.map(|t| toml_value(&t).ok_or("an artifact does not render as TOML".to_string()))
-            .transpose()
+    let parse = |text: Option<String>| -> Result<Option<Item>, String> {
+        text.map(|t| {
+            toml_value(&t)
+                .map(Item::Value)
+                .ok_or("an artifact does not render as TOML".to_string())
+        })
+        .transpose()
     };
     Ok((parse(sdist)?, parse(wheels)?))
+}
+
+/// An inline artifact table as a standard table in default layout; its
+/// inline sub-tables (`hashes`) become sub-tables too when `sub_tables`.
+fn standard_table(inline: toml_edit::InlineTable, sub_tables: bool) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    for (key, mut value) in inline {
+        let item = match value {
+            Value::InlineTable(sub) if sub_tables => Item::Table(standard_table(sub, false)),
+            _ => {
+                value.decor_mut().clear();
+                Item::Value(value)
+            }
+        };
+        table.insert(&key, item);
+    }
+    table
 }
 
 fn inline_source(registry: &str) -> Value {
@@ -591,7 +672,7 @@ fn restore_uv_entry(
     doc: &mut DocumentMut,
     hit: &Hit,
     shape: &Shape,
-    (sdist, wheels): (Option<Value>, Option<Value>),
+    (sdist, wheels): (Option<Item>, Option<Item>),
     ctx: &Ctx<'_>,
 ) -> Result<(), String> {
     let package = doc
@@ -607,10 +688,10 @@ fn restore_uv_entry(
         package.remove(key);
     }
     if let Some(sdist) = sdist {
-        package.insert("sdist", Item::Value(sdist));
+        package.insert("sdist", sdist);
     }
     if let Some(wheels) = wheels {
-        package.insert("wheels", Item::Value(wheels));
+        package.insert("wheels", wheels);
     }
     package.remove("metadata");
     restore_refs(doc.as_item_mut(), hit, &shape.registry, ctx);
@@ -675,7 +756,7 @@ fn restore_pylock_entry(
     doc: &mut DocumentMut,
     hit: &Hit,
     shape: &Shape,
-    (sdist, wheels): (Option<Value>, Option<Value>),
+    (sdist, wheels): (Option<Item>, Option<Item>),
 ) -> Result<(), String> {
     let package = doc
         .get_mut("packages")
@@ -687,10 +768,10 @@ fn restore_pylock_entry(
         package.insert("index", toml_edit::value(shape.registry.clone()));
     }
     if let Some(sdist) = sdist {
-        package.insert("sdist", Item::Value(sdist));
+        package.insert("sdist", sdist);
     }
     if let Some(wheels) = wheels {
-        package.insert("wheels", Item::Value(wheels));
+        package.insert("wheels", wheels);
     }
     // Keys the sibling orders sort by its order; any other key keeps its
     // place after the known key before it.
