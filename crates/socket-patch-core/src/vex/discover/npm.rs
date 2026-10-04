@@ -778,8 +778,10 @@ mod tests {
     }
 
     /// Both npm locks are read (npm 12 installs from package-lock.json beside a
-    /// committed shrinkwrap); a v2 lock's legacy `dependencies` mirror is
-    /// not (its agreeing twin adds nothing).
+    /// committed shrinkwrap), each yielding its own refs; a v2 lock's legacy
+    /// `dependencies` mirror is not (its agreeing twin adds nothing). The
+    /// twins agree: a lock with no entry for a package would contest it
+    /// (#798).
     #[tokio::test]
     async fn both_locks_are_read_and_the_agreeing_mirror_adds_nothing() {
         let a = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
@@ -789,6 +791,7 @@ mod tests {
             "npm-shrinkwrap.json",
             lock_with_packages(serde_json::json!({
                 "node_modules/left-pad": { "version": "1.3.0", "resolved": a, "integrity": SRI },
+                "node_modules/minimist": { "version": "1.2.5", "resolved": b, "integrity": SRI },
             })),
         );
         p.write(
@@ -796,6 +799,7 @@ mod tests {
             serde_json::json!({
                 "lockfileVersion": 2,
                 "packages": {
+                    "node_modules/left-pad": { "version": "1.3.0", "resolved": a, "integrity": SRI },
                     "node_modules/minimist": { "version": "1.2.5", "resolved": b, "integrity": SRI },
                 },
                 "dependencies": {
@@ -821,8 +825,9 @@ mod tests {
         );
         assert_eq!(
             out.refs.len(),
-            2,
-            "the v2 mirror and its nested legacy copy add nothing: {:#?}",
+            4,
+            "one ref per package from each lock; the v2 mirror and its nested \
+             legacy copy add nothing: {:#?}",
             out.refs
         );
     }
