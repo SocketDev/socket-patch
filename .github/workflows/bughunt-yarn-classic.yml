@@ -1,0 +1,200 @@
+name: bughunt yarn-classic cross-OS vendored probe
+on:
+  push:
+    branches: ['bughunt/yarn-classic/**']
+permissions:
+  contents: read
+jobs:
+  produce:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: build
+        run: cargo build --release -p socket-patch-cli
+      - name: kit
+        run: |
+          mkdir -p kit
+          cat > kit/mock.py <<'PYEOF'
+          import json, sys, os, io, tarfile, hashlib, base64, uuid, gzip, urllib.request, threading, re
+          from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+          # usage: mock.py PORT spec.json ; spec: [{"name":..,"version":..,"file":"index.js"}]
+          PORT=int(sys.argv[1]); spec=json.load(open(sys.argv[2]))
+          ORG="test-org"; TOKEN="33333333-3333-4333-8333-333333333333"
+          MARK=os.environ.get("MARK","/* SOCKET-PATCHED-%s */\n")
+          def gsha(b): return hashlib.sha256(b"blob %d\0"%len(b)+b).hexdigest()
+          P={}
+          for s in spec:
+              name,ver,f=s["name"],s["version"],s["file"]
+              base=name.split("/")[-1]
+              url="https://registry.npmjs.org/%s/-/%s-%s.tgz"%(name,base,ver)
+              raw=urllib.request.urlopen(url).read()
+              tin=tarfile.open(fileobj=io.BytesIO(raw),mode="r:gz")
+              out=io.BytesIO(); tout=tarfile.open(fileobj=out,mode="w",format=tarfile.GNU_FORMAT)
+              orig=patched=None
+              for m in tin.getmembers():
+                  data=tin.extractfile(m).read() if m.isfile() else None
+                  rel=m.name.split("/",1)[1] if "/" in m.name else m.name
+                  m2=tarfile.TarInfo("package/"+rel); m2.mode=m.mode; m2.mtime=1700000000
+                  if m.isfile():
+                      if rel==f:
+                          orig=data; data=(MARK%ver).encode()+data; patched=data
+                      m2.size=len(data); tout.addfile(m2,io.BytesIO(data))
+              tout.close()
+              tgz=gzip.compress(out.getvalue(),mtime=0)
+              u=str(uuid.uuid5(uuid.NAMESPACE_URL,name+"@"+ver))
+              purl="pkg:npm/%s@%s"%(name,ver)
+              path="/patch/npm/%s/%s/%s/%s/%s-%s.tgz"%(name,ver,TOKEN,u,base,ver)
+              P[u]=dict(name=name,ver=ver,purl=purl,uuid=u,tgz=tgz,path=path,file=f,orig=orig,patched=patched,
+                sha1=hashlib.sha1(tgz).hexdigest(),sri="sha512-"+base64.b64encode(hashlib.sha512(tgz).digest()).decode())
+              print("ready",purl,u,flush=True)
+          BYP={p["purl"]:p for p in P.values()}
+          BLOBS={}
+          for p in P.values(): BLOBS[gsha(p["orig"])]=p["orig"]; BLOBS[gsha(p["patched"])]=p["patched"]
+          def norm(purl): return purl.replace("%40","@")
+          def summ(p): return {"uuid":p["uuid"],"purl":p["purl"],"tier":"free","cveIds":["CVE-2026-1111"],"ghsaIds":["GHSA-aaaa-bbbb-cccc"],"severity":"high","title":"fixture "+p["purl"]}
+          def view(p):
+              return {"uuid":p["uuid"],"purl":p["purl"],"publishedAt":"2026-01-01T00:00:00Z","description":"x","license":"MIT","tier":"free",
+                "files":{"package/"+p["file"]:{"beforeHash":gsha(p["orig"]),"afterHash":gsha(p["patched"]),"blobContent":base64.b64encode(p["patched"]).decode()}},
+                "vulnerabilities":{"GHSA-aaaa-bbbb-cccc":{"cves":["CVE-2026-1111"],"summary":"s","severity":"high","description":"d"}}}
+          LOG=open(os.environ.get("MOCKLOG","mock.log"),"a")
+          class H(BaseHTTPRequestHandler):
+              def log_message(self,*a): LOG.write(self.command+" "+self.path+"\n"); LOG.flush()
+              def js(self,o,code=200):
+                  b=json.dumps(o).encode(); self.send_response(code); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
+              def do_POST(self):
+                  body=json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))) or b"{}")
+                  if self.path.endswith("/patches/batch") or self.path.endswith("/patch/batch"):
+                      pk=[]
+                      for c in body.get("components",[]):
+                          p=BYP.get(norm(c["purl"]))
+                          if p: pk.append({"purl":p["purl"],"patches":[summ(p)]})
+                      return self.js({"packages":pk,"canAccessPaidPatches":False})
+                  if self.path.endswith("/patches/package") or self.path.endswith("/patch/package"):
+                      res={}
+                      for u in body.get("uuids",[]):
+                          p=P.get(u)
+                          if not p: continue
+                          url="http://127.0.0.1:%d%s"%(PORT,p["path"])
+                          integ={"sha512":p["sri"]}
+                          if not os.environ.get("NOSHA1"): integ["sha1"]=p["sha1"]
+                          res[u]={"status":"granted","url":url,"purl":p["purl"],"artifacts":[{"kind":"tarball","url":url,"integrity":integ}],"registryOverride":None}
+                      return self.js({"results":res})
+                  self.js({"error":"nf"},404)
+              def do_GET(self):
+                  path=self.path.split("?")[0]
+                  m=re.search(r"/by-package/(.+)$",path)
+                  if m:
+                      from urllib.parse import unquote
+                      p=BYP.get(norm(unquote(m.group(1))))
+                      return self.js({"patches":[dict(summ(p),publishedAt="2026-01-01T00:00:00Z",description="x",license="MIT",vulnerabilities={})] if p else [],"canAccessPaidPatches":False})
+                  m=re.search(r"/patches/view/([0-9a-f-]+)$",path) or re.search(r"/patch/view/([0-9a-f-]+)$",path)
+                  if m:
+                      p=P.get(m.group(1))
+                      return self.js(view(p)) if p else self.js({},404)
+                  m=re.search(r"/blob/([0-9a-f]{64})$",path)
+                  if m and m.group(1) in BLOBS:
+                      b=BLOBS[m.group(1)]; self.send_response(200); self.send_header("Content-Length",str(len(b))); self.end_headers(); return self.wfile.write(b)
+                  for p in P.values():
+                      if path==p["path"]:
+                          b=p["tgz"]; self.send_response(200); self.send_header("Content-Type","application/octet-stream"); self.send_header("Content-Length",str(len(b))); self.end_headers(); return self.wfile.write(b)
+                  self.js({"error":"nf"},404)
+          ThreadingHTTPServer(("127.0.0.1",PORT),H).serve_forever()
+          PYEOF
+          cat > kit/spec.json <<'JSEOF'
+          [{"name":"left-pad","version":"1.3.0","file":"index.js"},
+           {"name":"ms","version":"3.0.0-canary.1","file":"dist/index.cjs"},
+           {"name":"lodash.isequal","version":"4.5.0","file":"index.js"},
+           {"name":"@types/left-pad","version":"1.2.0","file":"README.md"}]
+          JSEOF
+          npm i -g yarn@1.22.22 --force >/dev/null 2>&1; yarn --version
+      - name: produce
+        run: |
+          set +e -u
+          OS=${{ matrix.os }}
+          SP="$PWD/target/release/socket-patch"; [ -f "$SP.exe" ] && SP="$SP.exe"
+          (cd kit && python mock.py 8811 spec.json > mock.out 2>&1 &)
+          for i in $(seq 1 60); do curl -sf -o /dev/null -X POST -d '{}' http://127.0.0.1:8811/v0/orgs/test-org/patches/batch && break; sleep 2; done
+          cat kit/mock.out
+          A="--api-url http://127.0.0.1:8811 --org test-org --api-token fake"
+          export SOCKET_PATCH_SERVER_URL=http://127.0.0.1:8811
+          O="$PWD/out/$OS"; mkdir -p "$O/proj"; cd "$O/proj"
+          echo '{"name":"app","version":"1.0.0","private":true,"dependencies":{"left-pad":"1.3.0","ms":"3.0.0-canary.1","lodash.isequal":"^4.5.0","@types/left-pad":"^1.2.0"}}' > package.json
+          YARN_CACHE_FOLDER="$RUNNER_TEMP/yc0" yarn install --no-progress
+          cp yarn.lock ../orig.lock; rm -rf node_modules
+          "$SP" scan --mode vendored --vendor-source service --json --yes $A > ../scan.json 2>../scan.err; echo "RESULT $OS scan exit=$?"
+          tail -5 ../scan.err
+          echo "--- lock"; cat -A yarn.lock | grep -E "resolved|integrity"
+          echo "--- state"; cat .socket/vendor/state.json
+          echo "--- tree"; find .socket -type f
+          echo "--- vendor.json"; find .socket -name socket-patch.vendor.json -exec cat {} \; | head -80
+          mkdir ../ctl && cp -r package.json yarn.lock .socket ../ctl/ && cd ../ctl
+          YARN_CACHE_FOLDER="$RUNNER_TEMP/yc1" yarn install --frozen-lockfile --offline --no-progress; echo "RESULT $OS local-frozen exit=$?"
+          head -c 30 node_modules/left-pad/index.js; echo; head -c 30 node_modules/@types/left-pad/README.md; echo
+          cd .. && rm -rf ctl
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: proj-${{ matrix.os }}
+          path: out/
+  consume:
+    needs: produce
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+      - run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: build
+        run: cargo build --release -p socket-patch-cli
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: in
+      - name: consume
+        run: |
+          set +e -u
+          npm i -g yarn@1.22.22 --force >/dev/null 2>&1
+          ME=${{ matrix.os }}
+          SP="$PWD/target/release/socket-patch"; [ -f "$SP.exe" ] && SP="$SP.exe"
+          find in -maxdepth 3
+          for SRC in ubuntu-latest macos-latest windows-latest; do
+            D="$PWD/in/proj-$SRC/$SRC"; [ -d "$D" ] || { echo "RESULT $SRC->$ME missing"; continue; }
+            W="$RUNNER_TEMP/w-$SRC"; rm -rf "$W"; cp -r "$D" "$W"; cd "$W/proj"
+            YARN_CACHE_FOLDER="$RUNNER_TEMP/yc-$SRC" yarn install --frozen-lockfile --offline --no-progress > ../inst.log 2>&1; rc=$?
+            tail -3 ../inst.log
+            pat=""; for f in left-pad/index.js ms/dist/index.cjs lodash.isequal/index.js @types/left-pad/README.md; do head -c 12 node_modules/$f 2>/dev/null | grep -q SOCKET && pat="${pat}P" || pat="${pat}U"; done
+            echo "RESULT $SRC->$ME frozen=$rc patched=$pat"
+            "$SP" vendor --check --json > ../check.json 2>&1; echo "RESULT $SRC->$ME vendor-check=$?"; head -c 1500 ../check.json; echo
+            "$SP" vex --offline --product pkg:npm/app@1.0.0 --output ../v.json --json > ../vex.out 2>&1; echo "RESULT $SRC->$ME vex=$? purls=$(grep -o 'pkg:npm/[^"]*' ../v.json | sort -u | tr '\n' ' ')"
+            tail -c 800 ../vex.out; echo
+            "$SP" list --json > ../list.json 2>&1; echo "RESULT $SRC->$ME list=$?"; head -c 800 ../list.json; echo
+            "$SP" rollback --json --yes > ../rb.json 2>&1; echo "RESULT $SRC->$ME rollback=$?"; head -c 1500 ../rb.json; echo
+            cmp ../orig.lock yarn.lock && echo "RESULT $SRC->$ME rollback-byte-exact" || { echo "RESULT $SRC->$ME rollback-NOT-exact"; diff ../orig.lock yarn.lock | head -20; }
+            echo "RESULT $SRC->$ME leftover: $(find .socket -type f 2>/dev/null | tr '\n' ' ')"
+            cd "$GITHUB_WORKSPACE"
+          done
+          echo "=== SUMMARY"
