@@ -1,750 +1,1199 @@
 [
- {
-  "date": "2026-10-02",
-  "main_sha": "1169ae68b9dbb974da4860593b8c66d0d8d75a36",
-  "runner": "4 vCPU Intel Xeon @ 2.10GHz (cloud sandbox)",
-  "slow": [
-   "cargo",
-   "pdm",
-   "pipenv",
-   "poetry",
-   "pylock",
-   "uv",
-   "vlt"
-  ],
-  "scenarios": {
-   "npm/hosted": {
-    "median_ms": 198.6,
-    "ms_per_pkg": 0.0662,
-    "day_ratio": 1.021,
-    "week_ratio": 1.044,
-    "status": "ok"
-   },
-   "npm/rescan": {
-    "median_ms": 177.4,
-    "ms_per_pkg": 0.0591,
-    "day_ratio": 1.033,
-    "week_ratio": 1.059,
-    "status": "ok"
-   },
-   "pnpm/hosted": {
-    "median_ms": 153.6,
-    "ms_per_pkg": 0.0512,
-    "day_ratio": 0.984,
-    "week_ratio": 1.062,
-    "status": "ok"
-   },
-   "pnpm/rescan": {
-    "median_ms": 143.1,
-    "ms_per_pkg": 0.0477,
-    "day_ratio": 0.944,
-    "week_ratio": 0.964,
-    "status": "ok"
-   },
-   "yarn-classic/hosted": {
-    "median_ms": 179.9,
-    "ms_per_pkg": 0.06,
-    "day_ratio": 0.975,
-    "week_ratio": 1.066,
-    "status": "ok"
-   },
-   "yarn-classic/rescan": {
-    "median_ms": 153.0,
-    "ms_per_pkg": 0.051,
-    "day_ratio": 1.048,
-    "week_ratio": 1.044,
-    "status": "ok"
-   },
-   "yarn-berry/hosted": {
-    "median_ms": 219.5,
-    "ms_per_pkg": 0.0732,
-    "day_ratio": 0.988,
-    "week_ratio": 1.038,
-    "status": "ok"
-   },
-   "yarn-berry/rescan": {
-    "median_ms": 213.9,
-    "ms_per_pkg": 0.0713,
-    "day_ratio": 0.998,
-    "week_ratio": 1.032,
-    "status": "ok"
-   },
-   "bun/hosted": {
-    "median_ms": 289.7,
-    "ms_per_pkg": 0.0966,
-    "day_ratio": 2.166,
-    "week_ratio": null,
-    "status": "regressed"
-   },
-   "bun/rescan": {
-    "median_ms": 294.5,
-    "ms_per_pkg": 0.0982,
-    "day_ratio": 2.132,
-    "week_ratio": null,
-    "status": "regressed"
-   },
-   "vlt/hosted": {
-    "median_ms": 843.8,
-    "ms_per_pkg": 0.5625,
-    "day_ratio": 2.178,
-    "week_ratio": null,
-    "status": "regressed"
-   },
-   "vlt/rescan": {
-    "median_ms": 778.7,
-    "ms_per_pkg": 0.5192,
-    "day_ratio": 2.206,
-    "week_ratio": null,
-    "status": "regressed"
-   },
-   "pip/hosted": {
-    "median_ms": 102.2,
-    "ms_per_pkg": 0.1022,
-    "day_ratio": 0.999,
-    "week_ratio": 1.036,
-    "status": "ok"
-   },
-   "pip/rescan": {
-    "median_ms": 79.1,
-    "ms_per_pkg": 0.0791,
-    "day_ratio": 1.001,
-    "week_ratio": 1.12,
-    "status": "ok"
-   },
-   "uv/hosted": {
-    "median_ms": 136.0,
-    "ms_per_pkg": 0.34,
-    "day_ratio": 1.046,
-    "week_ratio": 1.028,
-    "status": "slow"
-   },
-   "uv/rescan": {
-    "median_ms": 136.9,
-    "ms_per_pkg": 0.3422,
-    "day_ratio": 1.003,
-    "week_ratio": 0.976,
-    "status": "slow"
-   },
-   "pylock/hosted": {
-    "median_ms": 113.6,
-    "ms_per_pkg": 0.284,
-    "day_ratio": 1.056,
-    "week_ratio": 1.029,
-    "status": "slow"
-   },
-   "pylock/rescan": {
-    "median_ms": 103.7,
-    "ms_per_pkg": 0.2591,
-    "day_ratio": 1.062,
-    "week_ratio": 0.986,
-    "status": "slow"
-   },
-   "poetry/hosted": {
-    "median_ms": 187.6,
-    "ms_per_pkg": 0.4691,
-    "day_ratio": 0.998,
-    "week_ratio": 1.05,
-    "status": "slow"
-   },
-   "poetry/rescan": {
-    "median_ms": 170.3,
-    "ms_per_pkg": 0.4259,
-    "day_ratio": 1.024,
-    "week_ratio": 1.009,
-    "status": "slow"
-   },
-   "pipenv/hosted": {
-    "median_ms": 106.2,
-    "ms_per_pkg": 0.2654,
-    "day_ratio": 1.01,
-    "week_ratio": 1.001,
-    "status": "slow"
-   },
-   "pipenv/rescan": {
-    "median_ms": 94.3,
-    "ms_per_pkg": 0.2358,
-    "day_ratio": 1.007,
-    "week_ratio": 1.041,
-    "status": "slow"
-   },
-   "pdm/hosted": {
-    "median_ms": 180.4,
-    "ms_per_pkg": 0.451,
-    "day_ratio": 1.067,
-    "week_ratio": 1.032,
-    "status": "slow"
-   },
-   "pdm/rescan": {
-    "median_ms": 160.7,
-    "ms_per_pkg": 0.4018,
-    "day_ratio": 1.016,
-    "week_ratio": 1.023,
-    "status": "slow"
-   },
-   "bundler/hosted": {
-    "median_ms": 136.0,
-    "ms_per_pkg": 0.17,
-    "day_ratio": 1.02,
-    "week_ratio": 1.001,
-    "status": "ok"
-   },
-   "bundler/rescan": {
-    "median_ms": 143.9,
-    "ms_per_pkg": 0.1798,
-    "day_ratio": 1.0,
-    "week_ratio": 1.006,
-    "status": "ok"
-   },
-   "composer/hosted": {
-    "median_ms": 122.2,
-    "ms_per_pkg": 0.1527,
-    "day_ratio": 1.047,
-    "week_ratio": 0.975,
-    "status": "ok"
-   },
-   "composer/rescan": {
-    "median_ms": 106.7,
-    "ms_per_pkg": 0.1334,
-    "day_ratio": 0.942,
-    "week_ratio": 1.077,
-    "status": "ok"
-   },
-   "cargo/hosted": {
-    "median_ms": 228.4,
-    "ms_per_pkg": 0.3806,
-    "day_ratio": 1.044,
-    "week_ratio": 1.005,
-    "status": "slow"
-   },
-   "cargo/rescan": {
-    "median_ms": 229.5,
-    "ms_per_pkg": 0.3825,
-    "day_ratio": 0.991,
-    "week_ratio": 0.997,
-    "status": "slow"
-   },
-   "golang/hosted": {
-    "median_ms": 68.5,
-    "ms_per_pkg": 0.0571,
-    "day_ratio": 0.972,
-    "week_ratio": 0.971,
-    "status": "ok"
-   },
-   "golang/rescan": {
-    "median_ms": 69.8,
-    "ms_per_pkg": 0.0581,
-    "day_ratio": 1.01,
-    "week_ratio": 1.003,
-    "status": "ok"
-   },
-   "nuget/hosted": {
-    "median_ms": 90.9,
-    "ms_per_pkg": 0.101,
-    "day_ratio": 1.001,
-    "week_ratio": 0.994,
-    "status": "ok"
-   },
-   "nuget/rescan": {
-    "median_ms": 68.4,
-    "ms_per_pkg": 0.076,
-    "day_ratio": 0.987,
-    "week_ratio": 0.982,
-    "status": "ok"
-   },
-   "maven/hosted": {
-    "median_ms": 79.3,
-    "ms_per_pkg": 0.0793,
-    "day_ratio": 0.973,
-    "week_ratio": 1.046,
-    "status": "ok"
-   },
-   "maven/rescan": {
-    "median_ms": 60.8,
-    "ms_per_pkg": 0.0608,
-    "day_ratio": 0.977,
-    "week_ratio": 1.029,
-    "status": "ok"
-   },
-   "npm/dry-run": {
-    "median_ms": 189.5,
-    "ms_per_pkg": 0.0632,
-    "day_ratio": 1.01,
-    "week_ratio": 1.007,
-    "status": "ok"
-   },
-   "npm/public-proxy": {
-    "median_ms": 244.8,
-    "ms_per_pkg": 0.0816,
-    "day_ratio": 1.0,
-    "week_ratio": 1.028,
-    "status": "ok"
-   },
-   "npm/latency": {
-    "median_ms": 664.9,
-    "ms_per_pkg": 0.2216,
-    "day_ratio": 0.988,
-    "week_ratio": 1.007,
-    "status": "ok"
-   }
+  {
+    "date": "2026-10-02",
+    "main_sha": "1169ae68b9dbb974da4860593b8c66d0d8d75a36",
+    "runner": "4 vCPU Intel Xeon @ 2.10GHz (cloud sandbox)",
+    "slow": [
+      "cargo",
+      "pdm",
+      "pipenv",
+      "poetry",
+      "pylock",
+      "uv",
+      "vlt"
+    ],
+    "scenarios": {
+      "npm/hosted": {
+        "median_ms": 198.6,
+        "ms_per_pkg": 0.0662,
+        "day_ratio": 1.021,
+        "week_ratio": 1.044,
+        "status": "ok"
+      },
+      "npm/rescan": {
+        "median_ms": 177.4,
+        "ms_per_pkg": 0.0591,
+        "day_ratio": 1.033,
+        "week_ratio": 1.059,
+        "status": "ok"
+      },
+      "pnpm/hosted": {
+        "median_ms": 153.6,
+        "ms_per_pkg": 0.0512,
+        "day_ratio": 0.984,
+        "week_ratio": 1.062,
+        "status": "ok"
+      },
+      "pnpm/rescan": {
+        "median_ms": 143.1,
+        "ms_per_pkg": 0.0477,
+        "day_ratio": 0.944,
+        "week_ratio": 0.964,
+        "status": "ok"
+      },
+      "yarn-classic/hosted": {
+        "median_ms": 179.9,
+        "ms_per_pkg": 0.06,
+        "day_ratio": 0.975,
+        "week_ratio": 1.066,
+        "status": "ok"
+      },
+      "yarn-classic/rescan": {
+        "median_ms": 153.0,
+        "ms_per_pkg": 0.051,
+        "day_ratio": 1.048,
+        "week_ratio": 1.044,
+        "status": "ok"
+      },
+      "yarn-berry/hosted": {
+        "median_ms": 219.5,
+        "ms_per_pkg": 0.0732,
+        "day_ratio": 0.988,
+        "week_ratio": 1.038,
+        "status": "ok"
+      },
+      "yarn-berry/rescan": {
+        "median_ms": 213.9,
+        "ms_per_pkg": 0.0713,
+        "day_ratio": 0.998,
+        "week_ratio": 1.032,
+        "status": "ok"
+      },
+      "bun/hosted": {
+        "median_ms": 289.7,
+        "ms_per_pkg": 0.0966,
+        "day_ratio": 2.166,
+        "week_ratio": null,
+        "status": "regressed"
+      },
+      "bun/rescan": {
+        "median_ms": 294.5,
+        "ms_per_pkg": 0.0982,
+        "day_ratio": 2.132,
+        "week_ratio": null,
+        "status": "regressed"
+      },
+      "vlt/hosted": {
+        "median_ms": 843.8,
+        "ms_per_pkg": 0.5625,
+        "day_ratio": 2.178,
+        "week_ratio": null,
+        "status": "regressed"
+      },
+      "vlt/rescan": {
+        "median_ms": 778.7,
+        "ms_per_pkg": 0.5192,
+        "day_ratio": 2.206,
+        "week_ratio": null,
+        "status": "regressed"
+      },
+      "pip/hosted": {
+        "median_ms": 102.2,
+        "ms_per_pkg": 0.1022,
+        "day_ratio": 0.999,
+        "week_ratio": 1.036,
+        "status": "ok"
+      },
+      "pip/rescan": {
+        "median_ms": 79.1,
+        "ms_per_pkg": 0.0791,
+        "day_ratio": 1.001,
+        "week_ratio": 1.12,
+        "status": "ok"
+      },
+      "uv/hosted": {
+        "median_ms": 136.0,
+        "ms_per_pkg": 0.34,
+        "day_ratio": 1.046,
+        "week_ratio": 1.028,
+        "status": "slow"
+      },
+      "uv/rescan": {
+        "median_ms": 136.9,
+        "ms_per_pkg": 0.3422,
+        "day_ratio": 1.003,
+        "week_ratio": 0.976,
+        "status": "slow"
+      },
+      "pylock/hosted": {
+        "median_ms": 113.6,
+        "ms_per_pkg": 0.284,
+        "day_ratio": 1.056,
+        "week_ratio": 1.029,
+        "status": "slow"
+      },
+      "pylock/rescan": {
+        "median_ms": 103.7,
+        "ms_per_pkg": 0.2591,
+        "day_ratio": 1.062,
+        "week_ratio": 0.986,
+        "status": "slow"
+      },
+      "poetry/hosted": {
+        "median_ms": 187.6,
+        "ms_per_pkg": 0.4691,
+        "day_ratio": 0.998,
+        "week_ratio": 1.05,
+        "status": "slow"
+      },
+      "poetry/rescan": {
+        "median_ms": 170.3,
+        "ms_per_pkg": 0.4259,
+        "day_ratio": 1.024,
+        "week_ratio": 1.009,
+        "status": "slow"
+      },
+      "pipenv/hosted": {
+        "median_ms": 106.2,
+        "ms_per_pkg": 0.2654,
+        "day_ratio": 1.01,
+        "week_ratio": 1.001,
+        "status": "slow"
+      },
+      "pipenv/rescan": {
+        "median_ms": 94.3,
+        "ms_per_pkg": 0.2358,
+        "day_ratio": 1.007,
+        "week_ratio": 1.041,
+        "status": "slow"
+      },
+      "pdm/hosted": {
+        "median_ms": 180.4,
+        "ms_per_pkg": 0.451,
+        "day_ratio": 1.067,
+        "week_ratio": 1.032,
+        "status": "slow"
+      },
+      "pdm/rescan": {
+        "median_ms": 160.7,
+        "ms_per_pkg": 0.4018,
+        "day_ratio": 1.016,
+        "week_ratio": 1.023,
+        "status": "slow"
+      },
+      "bundler/hosted": {
+        "median_ms": 136.0,
+        "ms_per_pkg": 0.17,
+        "day_ratio": 1.02,
+        "week_ratio": 1.001,
+        "status": "ok"
+      },
+      "bundler/rescan": {
+        "median_ms": 143.9,
+        "ms_per_pkg": 0.1798,
+        "day_ratio": 1.0,
+        "week_ratio": 1.006,
+        "status": "ok"
+      },
+      "composer/hosted": {
+        "median_ms": 122.2,
+        "ms_per_pkg": 0.1527,
+        "day_ratio": 1.047,
+        "week_ratio": 0.975,
+        "status": "ok"
+      },
+      "composer/rescan": {
+        "median_ms": 106.7,
+        "ms_per_pkg": 0.1334,
+        "day_ratio": 0.942,
+        "week_ratio": 1.077,
+        "status": "ok"
+      },
+      "cargo/hosted": {
+        "median_ms": 228.4,
+        "ms_per_pkg": 0.3806,
+        "day_ratio": 1.044,
+        "week_ratio": 1.005,
+        "status": "slow"
+      },
+      "cargo/rescan": {
+        "median_ms": 229.5,
+        "ms_per_pkg": 0.3825,
+        "day_ratio": 0.991,
+        "week_ratio": 0.997,
+        "status": "slow"
+      },
+      "golang/hosted": {
+        "median_ms": 68.5,
+        "ms_per_pkg": 0.0571,
+        "day_ratio": 0.972,
+        "week_ratio": 0.971,
+        "status": "ok"
+      },
+      "golang/rescan": {
+        "median_ms": 69.8,
+        "ms_per_pkg": 0.0581,
+        "day_ratio": 1.01,
+        "week_ratio": 1.003,
+        "status": "ok"
+      },
+      "nuget/hosted": {
+        "median_ms": 90.9,
+        "ms_per_pkg": 0.101,
+        "day_ratio": 1.001,
+        "week_ratio": 0.994,
+        "status": "ok"
+      },
+      "nuget/rescan": {
+        "median_ms": 68.4,
+        "ms_per_pkg": 0.076,
+        "day_ratio": 0.987,
+        "week_ratio": 0.982,
+        "status": "ok"
+      },
+      "maven/hosted": {
+        "median_ms": 79.3,
+        "ms_per_pkg": 0.0793,
+        "day_ratio": 0.973,
+        "week_ratio": 1.046,
+        "status": "ok"
+      },
+      "maven/rescan": {
+        "median_ms": 60.8,
+        "ms_per_pkg": 0.0608,
+        "day_ratio": 0.977,
+        "week_ratio": 1.029,
+        "status": "ok"
+      },
+      "npm/dry-run": {
+        "median_ms": 189.5,
+        "ms_per_pkg": 0.0632,
+        "day_ratio": 1.01,
+        "week_ratio": 1.007,
+        "status": "ok"
+      },
+      "npm/public-proxy": {
+        "median_ms": 244.8,
+        "ms_per_pkg": 0.0816,
+        "day_ratio": 1.0,
+        "week_ratio": 1.028,
+        "status": "ok"
+      },
+      "npm/latency": {
+        "median_ms": 664.9,
+        "ms_per_pkg": 0.2216,
+        "day_ratio": 0.988,
+        "week_ratio": 1.007,
+        "status": "ok"
+      }
+    },
+    "suite_source": "#485 (merged locally with main); backfilled from issue #580",
+    "regressions": [
+      {
+        "scenario": "bun/hosted",
+        "metric": "wall",
+        "ratio": 2.166,
+        "range": "6e7ef748..1169ae68",
+        "culprit": "1169ae68 (#472)",
+        "confirmed": true,
+        "issue": 578
+      },
+      {
+        "scenario": "bun/rescan",
+        "metric": "wall",
+        "ratio": 2.132,
+        "range": "6e7ef748..1169ae68",
+        "culprit": "1169ae68 (#472)",
+        "confirmed": true,
+        "issue": 578
+      },
+      {
+        "scenario": "vlt/hosted",
+        "metric": "wall",
+        "ratio": 2.178,
+        "range": "6e7ef748..1169ae68",
+        "culprit": "1169ae68 (#472)",
+        "confirmed": true,
+        "issue": 579
+      },
+      {
+        "scenario": "vlt/rescan",
+        "metric": "wall",
+        "ratio": 2.206,
+        "range": "6e7ef748..1169ae68",
+        "culprit": "1169ae68 (#472)",
+        "confirmed": true,
+        "issue": 579
+      }
+    ]
   },
-  "suite_source": "#485 (merged locally with main); backfilled from issue #580",
-  "regressions": [
-   {
-    "scenario": "bun/hosted",
-    "metric": "wall",
-    "ratio": 2.166,
-    "range": "6e7ef748..1169ae68",
-    "culprit": "1169ae68 (#472)",
-    "confirmed": true,
-    "issue": 578
-   },
-   {
-    "scenario": "bun/rescan",
-    "metric": "wall",
-    "ratio": 2.132,
-    "range": "6e7ef748..1169ae68",
-    "culprit": "1169ae68 (#472)",
-    "confirmed": true,
-    "issue": 578
-   },
-   {
-    "scenario": "vlt/hosted",
-    "metric": "wall",
-    "ratio": 2.178,
-    "range": "6e7ef748..1169ae68",
-    "culprit": "1169ae68 (#472)",
-    "confirmed": true,
-    "issue": 579
-   },
-   {
-    "scenario": "vlt/rescan",
-    "metric": "wall",
-    "ratio": 2.206,
-    "range": "6e7ef748..1169ae68",
-    "culprit": "1169ae68 (#472)",
-    "confirmed": true,
-    "issue": 579
-   }
-  ]
- },
- {
-  "date": "2026-10-03",
-  "main_sha": "045d7ec783d788bf3c5a1310724b51e09fb6505d",
-  "suite_source": "main",
-  "runner": "4 vCPU Intel(R) Xeon(R) Processor @ 2.80GHz (cloud sandbox)",
-  "last_sha": "1169ae68b9dbb974da4860593b8c66d0d8d75a36",
-  "week_sha": "2463257a (#277; 7-day SHA 2390c5ff predates v5 output)",
-  "aa": "clean (npm/hosted -3.1%, vlt/hosted -2.8%, poetry/hosted -0.8%)",
-  "scenarios": {
-   "npm/hosted": {
-    "median_ms": 204.0,
-    "ms_per_pkg": 0.068,
-    "peak_rss_kb": 43452,
-    "requests": 127,
-    "day_ratio": 1.02,
-    "week_ratio": 1.053,
-    "status": "ok"
-   },
-   "npm/rescan": {
-    "median_ms": 189.7,
-    "ms_per_pkg": 0.0632,
-    "peak_rss_kb": 42348,
-    "requests": 127,
-    "day_ratio": 0.997,
-    "week_ratio": 1.024,
-    "status": "ok"
-   },
-   "pnpm/hosted": {
-    "median_ms": 180.5,
-    "ms_per_pkg": 0.0602,
-    "peak_rss_kb": 35784,
-    "requests": 127,
-    "day_ratio": 1.071,
-    "week_ratio": 1.025,
-    "status": "ok"
-   },
-   "pnpm/rescan": {
-    "median_ms": 147.9,
-    "ms_per_pkg": 0.0493,
-    "peak_rss_kb": 34536,
-    "requests": 127,
-    "day_ratio": 1.036,
-    "week_ratio": 1.014,
-    "status": "ok"
-   },
-   "yarn-classic/hosted": {
-    "median_ms": 195.4,
-    "ms_per_pkg": 0.0651,
-    "peak_rss_kb": 37704,
-    "requests": 127,
-    "day_ratio": 1.062,
-    "week_ratio": 1.01,
-    "status": "ok"
-   },
-   "yarn-classic/rescan": {
-    "median_ms": 172.3,
-    "ms_per_pkg": 0.0574,
-    "peak_rss_kb": 36568,
-    "requests": 127,
-    "day_ratio": 1.029,
-    "week_ratio": 1.027,
-    "status": "ok"
-   },
-   "yarn-berry/hosted": {
-    "median_ms": 228.8,
-    "ms_per_pkg": 0.0763,
-    "peak_rss_kb": 38788,
-    "requests": 127,
-    "day_ratio": null,
-    "week_ratio": null,
-    "status": "ok",
-    "note": "no comparable base (pre-#465 base fails yarn-berry expectations)"
-   },
-   "yarn-berry/rescan": {
-    "median_ms": 190.6,
-    "ms_per_pkg": 0.0635,
-    "peak_rss_kb": 37184,
-    "requests": 127,
-    "day_ratio": null,
-    "week_ratio": null,
-    "status": "ok",
-    "note": "no comparable base (pre-#465 base fails yarn-berry expectations)"
-   },
-   "bun/hosted": {
-    "median_ms": 303.6,
-    "ms_per_pkg": 0.1012,
-    "peak_rss_kb": 33760,
-    "requests": 127,
-    "day_ratio": 0.993,
-    "week_ratio": 2.166,
-    "status": "regressed"
-   },
-   "bun/rescan": {
-    "median_ms": 305.5,
-    "ms_per_pkg": 0.1018,
-    "peak_rss_kb": 33644,
-    "requests": 127,
-    "day_ratio": 1.017,
-    "week_ratio": 2.247,
-    "status": "regressed"
-   },
-   "vlt/hosted": {
-    "median_ms": 894.2,
-    "ms_per_pkg": 0.5962,
-    "peak_rss_kb": 36752,
-    "requests": 94,
-    "day_ratio": 1.021,
-    "week_ratio": 2.386,
-    "status": "regressed"
-   },
-   "vlt/rescan": {
-    "median_ms": 908.4,
-    "ms_per_pkg": 0.6056,
-    "peak_rss_kb": 36276,
-    "requests": 94,
-    "day_ratio": 1.009,
-    "week_ratio": 2.534,
-    "status": "regressed"
-   },
-   "pip/hosted": {
-    "median_ms": 97.0,
-    "ms_per_pkg": 0.097,
-    "peak_rss_kb": 33644,
-    "requests": 53,
-    "day_ratio": 1.022,
-    "week_ratio": 1.017,
-    "status": "ok"
-   },
-   "pip/rescan": {
-    "median_ms": 90.6,
-    "ms_per_pkg": 0.0906,
-    "peak_rss_kb": 33644,
-    "requests": 53,
-    "day_ratio": 1.041,
-    "week_ratio": 1.071,
-    "status": "ok"
-   },
-   "uv/hosted": {
-    "median_ms": 143.9,
-    "ms_per_pkg": 0.3598,
-    "peak_rss_kb": 35108,
-    "requests": 38,
-    "day_ratio": 1.011,
-    "week_ratio": 0.993,
-    "status": "slow"
-   },
-   "uv/rescan": {
-    "median_ms": 145.4,
-    "ms_per_pkg": 0.3636,
-    "peak_rss_kb": 34772,
-    "requests": 38,
-    "day_ratio": 0.955,
-    "week_ratio": 0.952,
-    "status": "slow"
-   },
-   "pylock/hosted": {
-    "median_ms": 142.1,
-    "ms_per_pkg": 0.3552,
-    "peak_rss_kb": 34876,
-    "requests": 26,
-    "day_ratio": 0.987,
-    "week_ratio": 1.044,
-    "status": "slow"
-   },
-   "pylock/rescan": {
-    "median_ms": 104.5,
-    "ms_per_pkg": 0.2613,
-    "peak_rss_kb": 35244,
-    "requests": 26,
-    "day_ratio": 0.988,
-    "week_ratio": 1.082,
-    "status": "slow"
-   },
-   "poetry/hosted": {
-    "median_ms": 221.4,
-    "ms_per_pkg": 0.5535,
-    "peak_rss_kb": 38096,
-    "requests": 26,
-    "day_ratio": 1.0,
-    "week_ratio": 0.964,
-    "status": "slow"
-   },
-   "poetry/rescan": {
-    "median_ms": 224.4,
-    "ms_per_pkg": 0.5609,
-    "peak_rss_kb": 37656,
-    "requests": 26,
-    "day_ratio": 1.007,
-    "week_ratio": 1.024,
-    "status": "slow"
-   },
-   "pipenv/hosted": {
-    "median_ms": 96.5,
-    "ms_per_pkg": 0.2413,
-    "peak_rss_kb": 33772,
-    "requests": 26,
-    "day_ratio": 0.988,
-    "week_ratio": 1.016,
-    "status": "ok"
-   },
-   "pipenv/rescan": {
-    "median_ms": 94.3,
-    "ms_per_pkg": 0.2358,
-    "peak_rss_kb": 33772,
-    "requests": 26,
-    "day_ratio": 0.986,
-    "week_ratio": 1.007,
-    "status": "ok"
-   },
-   "pdm/hosted": {
-    "median_ms": 180.5,
-    "ms_per_pkg": 0.4513,
-    "peak_rss_kb": 37444,
-    "requests": 26,
-    "day_ratio": 0.976,
-    "week_ratio": 0.999,
-    "status": "slow"
-   },
-   "pdm/rescan": {
-    "median_ms": 164.8,
-    "ms_per_pkg": 0.4119,
-    "peak_rss_kb": 37896,
-    "requests": 26,
-    "day_ratio": 1.045,
-    "week_ratio": 0.977,
-    "status": "slow"
-   },
-   "bundler/hosted": {
-    "median_ms": 180.4,
-    "ms_per_pkg": 0.2256,
-    "peak_rss_kb": 33772,
-    "requests": 43,
-    "day_ratio": 1.063,
-    "week_ratio": 0.988,
-    "status": "ok"
-   },
-   "bundler/rescan": {
-    "median_ms": 154.3,
-    "ms_per_pkg": 0.1928,
-    "peak_rss_kb": 33772,
-    "requests": 43,
-    "day_ratio": 0.983,
-    "week_ratio": 1.024,
-    "status": "ok"
-   },
-   "composer/hosted": {
-    "median_ms": 123.0,
-    "ms_per_pkg": 0.1537,
-    "peak_rss_kb": 33772,
-    "requests": 43,
-    "day_ratio": 0.967,
-    "week_ratio": 1.011,
-    "status": "ok"
-   },
-   "composer/rescan": {
-    "median_ms": 111.6,
-    "ms_per_pkg": 0.1395,
-    "peak_rss_kb": 33772,
-    "requests": 43,
-    "day_ratio": 0.994,
-    "week_ratio": 0.967,
-    "status": "ok"
-   },
-   "cargo/hosted": {
-    "median_ms": 262.5,
-    "ms_per_pkg": 0.4375,
-    "peak_rss_kb": 33772,
-    "requests": 33,
-    "day_ratio": 0.981,
-    "week_ratio": 0.994,
-    "status": "slow"
-   },
-   "cargo/rescan": {
-    "median_ms": 251.4,
-    "ms_per_pkg": 0.419,
-    "peak_rss_kb": 33772,
-    "requests": 33,
-    "day_ratio": 0.998,
-    "week_ratio": 1.057,
-    "status": "slow"
-   },
-   "golang/hosted": {
-    "median_ms": 71.4,
-    "ms_per_pkg": 0.0595,
-    "peak_rss_kb": 33772,
-    "requests": 64,
-    "day_ratio": 1.089,
-    "week_ratio": 1.026,
-    "status": "ok"
-   },
-   "golang/rescan": {
-    "median_ms": 73.4,
-    "ms_per_pkg": 0.0611,
-    "peak_rss_kb": 33772,
-    "requests": 64,
-    "day_ratio": 1.049,
-    "week_ratio": 0.956,
-    "status": "ok"
-   },
-   "nuget/hosted": {
-    "median_ms": 90.1,
-    "ms_per_pkg": 0.1001,
-    "peak_rss_kb": 33772,
-    "requests": 53,
-    "day_ratio": 0.999,
-    "week_ratio": 1.0,
-    "status": "ok"
-   },
-   "nuget/rescan": {
-    "median_ms": 76.6,
-    "ms_per_pkg": 0.0851,
-    "peak_rss_kb": 33772,
-    "requests": 53,
-    "day_ratio": 1.024,
-    "week_ratio": 1.014,
-    "status": "ok"
-   },
-   "maven/hosted": {
-    "median_ms": 81.6,
-    "ms_per_pkg": 0.0816,
-    "peak_rss_kb": 33772,
-    "requests": 53,
-    "day_ratio": 1.005,
-    "week_ratio": 1.025,
-    "status": "ok"
-   },
-   "maven/rescan": {
-    "median_ms": 69.6,
-    "ms_per_pkg": 0.0696,
-    "peak_rss_kb": 33772,
-    "requests": 53,
-    "day_ratio": 1.026,
-    "week_ratio": 0.996,
-    "status": "ok"
-   },
-   "npm/dry-run": {
-    "median_ms": 207.3,
-    "ms_per_pkg": 0.0691,
-    "peak_rss_kb": 43356,
-    "requests": 67,
-    "day_ratio": 0.954,
-    "week_ratio": 1.049,
-    "status": "ok"
-   },
-   "npm/public-proxy": {
-    "median_ms": 218.5,
-    "ms_per_pkg": 0.0728,
-    "peak_rss_kb": 42972,
-    "requests": 151,
-    "day_ratio": 0.993,
-    "week_ratio": 0.983,
-    "status": "ok"
-   },
-   "npm/latency": {
-    "median_ms": 653.0,
-    "ms_per_pkg": 0.2177,
-    "peak_rss_kb": 43264,
-    "requests": 127,
-    "day_ratio": 1.008,
-    "week_ratio": 1.016,
-    "status": "ok"
-   }
+  {
+    "date": "2026-10-03",
+    "main_sha": "045d7ec783d788bf3c5a1310724b51e09fb6505d",
+    "suite_source": "main",
+    "runner": "4 vCPU Intel(R) Xeon(R) Processor @ 2.80GHz (cloud sandbox)",
+    "last_sha": "1169ae68b9dbb974da4860593b8c66d0d8d75a36",
+    "week_sha": "2463257a (#277; 7-day SHA 2390c5ff predates v5 output)",
+    "aa": "clean (npm/hosted -3.1%, vlt/hosted -2.8%, poetry/hosted -0.8%)",
+    "scenarios": {
+      "npm/hosted": {
+        "median_ms": 204.0,
+        "ms_per_pkg": 0.068,
+        "peak_rss_kb": 43452,
+        "requests": 127,
+        "day_ratio": 1.02,
+        "week_ratio": 1.053,
+        "status": "ok"
+      },
+      "npm/rescan": {
+        "median_ms": 189.7,
+        "ms_per_pkg": 0.0632,
+        "peak_rss_kb": 42348,
+        "requests": 127,
+        "day_ratio": 0.997,
+        "week_ratio": 1.024,
+        "status": "ok"
+      },
+      "pnpm/hosted": {
+        "median_ms": 180.5,
+        "ms_per_pkg": 0.0602,
+        "peak_rss_kb": 35784,
+        "requests": 127,
+        "day_ratio": 1.071,
+        "week_ratio": 1.025,
+        "status": "ok"
+      },
+      "pnpm/rescan": {
+        "median_ms": 147.9,
+        "ms_per_pkg": 0.0493,
+        "peak_rss_kb": 34536,
+        "requests": 127,
+        "day_ratio": 1.036,
+        "week_ratio": 1.014,
+        "status": "ok"
+      },
+      "yarn-classic/hosted": {
+        "median_ms": 195.4,
+        "ms_per_pkg": 0.0651,
+        "peak_rss_kb": 37704,
+        "requests": 127,
+        "day_ratio": 1.062,
+        "week_ratio": 1.01,
+        "status": "ok"
+      },
+      "yarn-classic/rescan": {
+        "median_ms": 172.3,
+        "ms_per_pkg": 0.0574,
+        "peak_rss_kb": 36568,
+        "requests": 127,
+        "day_ratio": 1.029,
+        "week_ratio": 1.027,
+        "status": "ok"
+      },
+      "yarn-berry/hosted": {
+        "median_ms": 228.8,
+        "ms_per_pkg": 0.0763,
+        "peak_rss_kb": 38788,
+        "requests": 127,
+        "day_ratio": null,
+        "week_ratio": null,
+        "status": "ok",
+        "note": "no comparable base (pre-#465 base fails yarn-berry expectations)"
+      },
+      "yarn-berry/rescan": {
+        "median_ms": 190.6,
+        "ms_per_pkg": 0.0635,
+        "peak_rss_kb": 37184,
+        "requests": 127,
+        "day_ratio": null,
+        "week_ratio": null,
+        "status": "ok",
+        "note": "no comparable base (pre-#465 base fails yarn-berry expectations)"
+      },
+      "bun/hosted": {
+        "median_ms": 303.6,
+        "ms_per_pkg": 0.1012,
+        "peak_rss_kb": 33760,
+        "requests": 127,
+        "day_ratio": 0.993,
+        "week_ratio": 2.166,
+        "status": "regressed"
+      },
+      "bun/rescan": {
+        "median_ms": 305.5,
+        "ms_per_pkg": 0.1018,
+        "peak_rss_kb": 33644,
+        "requests": 127,
+        "day_ratio": 1.017,
+        "week_ratio": 2.247,
+        "status": "regressed"
+      },
+      "vlt/hosted": {
+        "median_ms": 894.2,
+        "ms_per_pkg": 0.5962,
+        "peak_rss_kb": 36752,
+        "requests": 94,
+        "day_ratio": 1.021,
+        "week_ratio": 2.386,
+        "status": "regressed"
+      },
+      "vlt/rescan": {
+        "median_ms": 908.4,
+        "ms_per_pkg": 0.6056,
+        "peak_rss_kb": 36276,
+        "requests": 94,
+        "day_ratio": 1.009,
+        "week_ratio": 2.534,
+        "status": "regressed"
+      },
+      "pip/hosted": {
+        "median_ms": 97.0,
+        "ms_per_pkg": 0.097,
+        "peak_rss_kb": 33644,
+        "requests": 53,
+        "day_ratio": 1.022,
+        "week_ratio": 1.017,
+        "status": "ok"
+      },
+      "pip/rescan": {
+        "median_ms": 90.6,
+        "ms_per_pkg": 0.0906,
+        "peak_rss_kb": 33644,
+        "requests": 53,
+        "day_ratio": 1.041,
+        "week_ratio": 1.071,
+        "status": "ok"
+      },
+      "uv/hosted": {
+        "median_ms": 143.9,
+        "ms_per_pkg": 0.3598,
+        "peak_rss_kb": 35108,
+        "requests": 38,
+        "day_ratio": 1.011,
+        "week_ratio": 0.993,
+        "status": "slow"
+      },
+      "uv/rescan": {
+        "median_ms": 145.4,
+        "ms_per_pkg": 0.3636,
+        "peak_rss_kb": 34772,
+        "requests": 38,
+        "day_ratio": 0.955,
+        "week_ratio": 0.952,
+        "status": "slow"
+      },
+      "pylock/hosted": {
+        "median_ms": 142.1,
+        "ms_per_pkg": 0.3552,
+        "peak_rss_kb": 34876,
+        "requests": 26,
+        "day_ratio": 0.987,
+        "week_ratio": 1.044,
+        "status": "slow"
+      },
+      "pylock/rescan": {
+        "median_ms": 104.5,
+        "ms_per_pkg": 0.2613,
+        "peak_rss_kb": 35244,
+        "requests": 26,
+        "day_ratio": 0.988,
+        "week_ratio": 1.082,
+        "status": "slow"
+      },
+      "poetry/hosted": {
+        "median_ms": 221.4,
+        "ms_per_pkg": 0.5535,
+        "peak_rss_kb": 38096,
+        "requests": 26,
+        "day_ratio": 1.0,
+        "week_ratio": 0.964,
+        "status": "slow"
+      },
+      "poetry/rescan": {
+        "median_ms": 224.4,
+        "ms_per_pkg": 0.5609,
+        "peak_rss_kb": 37656,
+        "requests": 26,
+        "day_ratio": 1.007,
+        "week_ratio": 1.024,
+        "status": "slow"
+      },
+      "pipenv/hosted": {
+        "median_ms": 96.5,
+        "ms_per_pkg": 0.2413,
+        "peak_rss_kb": 33772,
+        "requests": 26,
+        "day_ratio": 0.988,
+        "week_ratio": 1.016,
+        "status": "ok"
+      },
+      "pipenv/rescan": {
+        "median_ms": 94.3,
+        "ms_per_pkg": 0.2358,
+        "peak_rss_kb": 33772,
+        "requests": 26,
+        "day_ratio": 0.986,
+        "week_ratio": 1.007,
+        "status": "ok"
+      },
+      "pdm/hosted": {
+        "median_ms": 180.5,
+        "ms_per_pkg": 0.4513,
+        "peak_rss_kb": 37444,
+        "requests": 26,
+        "day_ratio": 0.976,
+        "week_ratio": 0.999,
+        "status": "slow"
+      },
+      "pdm/rescan": {
+        "median_ms": 164.8,
+        "ms_per_pkg": 0.4119,
+        "peak_rss_kb": 37896,
+        "requests": 26,
+        "day_ratio": 1.045,
+        "week_ratio": 0.977,
+        "status": "slow"
+      },
+      "bundler/hosted": {
+        "median_ms": 180.4,
+        "ms_per_pkg": 0.2256,
+        "peak_rss_kb": 33772,
+        "requests": 43,
+        "day_ratio": 1.063,
+        "week_ratio": 0.988,
+        "status": "ok"
+      },
+      "bundler/rescan": {
+        "median_ms": 154.3,
+        "ms_per_pkg": 0.1928,
+        "peak_rss_kb": 33772,
+        "requests": 43,
+        "day_ratio": 0.983,
+        "week_ratio": 1.024,
+        "status": "ok"
+      },
+      "composer/hosted": {
+        "median_ms": 123.0,
+        "ms_per_pkg": 0.1537,
+        "peak_rss_kb": 33772,
+        "requests": 43,
+        "day_ratio": 0.967,
+        "week_ratio": 1.011,
+        "status": "ok"
+      },
+      "composer/rescan": {
+        "median_ms": 111.6,
+        "ms_per_pkg": 0.1395,
+        "peak_rss_kb": 33772,
+        "requests": 43,
+        "day_ratio": 0.994,
+        "week_ratio": 0.967,
+        "status": "ok"
+      },
+      "cargo/hosted": {
+        "median_ms": 262.5,
+        "ms_per_pkg": 0.4375,
+        "peak_rss_kb": 33772,
+        "requests": 33,
+        "day_ratio": 0.981,
+        "week_ratio": 0.994,
+        "status": "slow"
+      },
+      "cargo/rescan": {
+        "median_ms": 251.4,
+        "ms_per_pkg": 0.419,
+        "peak_rss_kb": 33772,
+        "requests": 33,
+        "day_ratio": 0.998,
+        "week_ratio": 1.057,
+        "status": "slow"
+      },
+      "golang/hosted": {
+        "median_ms": 71.4,
+        "ms_per_pkg": 0.0595,
+        "peak_rss_kb": 33772,
+        "requests": 64,
+        "day_ratio": 1.089,
+        "week_ratio": 1.026,
+        "status": "ok"
+      },
+      "golang/rescan": {
+        "median_ms": 73.4,
+        "ms_per_pkg": 0.0611,
+        "peak_rss_kb": 33772,
+        "requests": 64,
+        "day_ratio": 1.049,
+        "week_ratio": 0.956,
+        "status": "ok"
+      },
+      "nuget/hosted": {
+        "median_ms": 90.1,
+        "ms_per_pkg": 0.1001,
+        "peak_rss_kb": 33772,
+        "requests": 53,
+        "day_ratio": 0.999,
+        "week_ratio": 1.0,
+        "status": "ok"
+      },
+      "nuget/rescan": {
+        "median_ms": 76.6,
+        "ms_per_pkg": 0.0851,
+        "peak_rss_kb": 33772,
+        "requests": 53,
+        "day_ratio": 1.024,
+        "week_ratio": 1.014,
+        "status": "ok"
+      },
+      "maven/hosted": {
+        "median_ms": 81.6,
+        "ms_per_pkg": 0.0816,
+        "peak_rss_kb": 33772,
+        "requests": 53,
+        "day_ratio": 1.005,
+        "week_ratio": 1.025,
+        "status": "ok"
+      },
+      "maven/rescan": {
+        "median_ms": 69.6,
+        "ms_per_pkg": 0.0696,
+        "peak_rss_kb": 33772,
+        "requests": 53,
+        "day_ratio": 1.026,
+        "week_ratio": 0.996,
+        "status": "ok"
+      },
+      "npm/dry-run": {
+        "median_ms": 207.3,
+        "ms_per_pkg": 0.0691,
+        "peak_rss_kb": 43356,
+        "requests": 67,
+        "day_ratio": 0.954,
+        "week_ratio": 1.049,
+        "status": "ok"
+      },
+      "npm/public-proxy": {
+        "median_ms": 218.5,
+        "ms_per_pkg": 0.0728,
+        "peak_rss_kb": 42972,
+        "requests": 151,
+        "day_ratio": 0.993,
+        "week_ratio": 0.983,
+        "status": "ok"
+      },
+      "npm/latency": {
+        "median_ms": 653.0,
+        "ms_per_pkg": 0.2177,
+        "peak_rss_kb": 43264,
+        "requests": 127,
+        "day_ratio": 1.008,
+        "week_ratio": 1.016,
+        "status": "ok"
+      }
+    },
+    "regressions": [
+      {
+        "scenario": "bun/hosted",
+        "metric": "wall",
+        "ratio": 2.166,
+        "base": "2463257a",
+        "window": "week",
+        "culprit": "1169ae68 (#472)",
+        "confirmed": true,
+        "issue": 578,
+        "new": false
+      },
+      {
+        "scenario": "bun/rescan",
+        "metric": "wall",
+        "ratio": 2.247,
+        "base": "2463257a",
+        "window": "week",
+        "culprit": "1169ae68 (#472)",
+        "confirmed": true,
+        "issue": 578,
+        "new": false
+      },
+      {
+        "scenario": "vlt/hosted",
+        "metric": "wall",
+        "ratio": 2.386,
+        "base": "2463257a",
+        "window": "week",
+        "culprit": "1169ae68 (#472)",
+        "confirmed": true,
+        "issue": 579,
+        "new": false
+      },
+      {
+        "scenario": "vlt/rescan",
+        "metric": "wall",
+        "ratio": 2.534,
+        "base": "2463257a",
+        "window": "week",
+        "culprit": "1169ae68 (#472)",
+        "confirmed": true,
+        "issue": 579,
+        "new": false
+      }
+    ],
+    "slow": [
+      "cargo",
+      "pdm",
+      "poetry",
+      "pylock",
+      "uv",
+      "vlt"
+    ],
+    "hosted_median_ms_per_pkg": 0.1275,
+    "pr": 667
   },
-  "regressions": [
-   {
-    "scenario": "bun/hosted",
-    "metric": "wall",
-    "ratio": 2.166,
-    "base": "2463257a",
-    "window": "week",
-    "culprit": "1169ae68 (#472)",
-    "confirmed": true,
-    "issue": 578,
-    "new": false
-   },
-   {
-    "scenario": "bun/rescan",
-    "metric": "wall",
-    "ratio": 2.247,
-    "base": "2463257a",
-    "window": "week",
-    "culprit": "1169ae68 (#472)",
-    "confirmed": true,
-    "issue": 578,
-    "new": false
-   },
-   {
-    "scenario": "vlt/hosted",
-    "metric": "wall",
-    "ratio": 2.386,
-    "base": "2463257a",
-    "window": "week",
-    "culprit": "1169ae68 (#472)",
-    "confirmed": true,
-    "issue": 579,
-    "new": false
-   },
-   {
-    "scenario": "vlt/rescan",
-    "metric": "wall",
-    "ratio": 2.534,
-    "base": "2463257a",
-    "window": "week",
-    "culprit": "1169ae68 (#472)",
-    "confirmed": true,
-    "issue": 579,
-    "new": false
-   }
-  ],
-  "slow": [
-   "cargo",
-   "pdm",
-   "poetry",
-   "pylock",
-   "uv",
-   "vlt"
-  ],
-  "hosted_median_ms_per_pkg": 0.1275,
-  "pr": 667
- }
+  {
+    "date": "2026-10-04",
+    "main_sha": "045d7ec783d788bf3c5a1310724b51e09fb6505d",
+    "suite_source": "main (+ #667 bun-isolated and harness fix)",
+    "runner": "4 vCPU Intel(R) Xeon(R) Processor @ 2.10GHz (cloud sandbox)",
+    "last_sha": "045d7ec783d788bf3c5a1310724b51e09fb6505d (unchanged; daily A/B skipped)",
+    "week_sha": "2463257a (#277; 7-day SHA 3efdc31d predates v5 output)",
+    "aa": "clean (npm/hosted -1.0%, vlt/hosted +0.9%, poetry/hosted -0.4%)",
+    "scenarios": {
+      "npm/hosted": {
+        "median_ms": 198.3,
+        "ms_per_pkg": 0.0661,
+        "peak_rss_kb": 43392,
+        "requests": 127,
+        "day_ratio": null,
+        "week_ratio": 1.022,
+        "status": "ok"
+      },
+      "npm/rescan": {
+        "median_ms": 176.7,
+        "ms_per_pkg": 0.0589,
+        "peak_rss_kb": 42100,
+        "requests": 127,
+        "day_ratio": null,
+        "week_ratio": 1.055,
+        "status": "ok"
+      },
+      "pnpm/hosted": {
+        "median_ms": 162.1,
+        "ms_per_pkg": 0.054,
+        "peak_rss_kb": 34452,
+        "requests": 127,
+        "day_ratio": null,
+        "week_ratio": 0.953,
+        "status": "ok"
+      },
+      "pnpm/rescan": {
+        "median_ms": 138.4,
+        "ms_per_pkg": 0.0461,
+        "peak_rss_kb": 34252,
+        "requests": 127,
+        "day_ratio": null,
+        "week_ratio": 1.031,
+        "status": "ok"
+      },
+      "yarn-classic/hosted": {
+        "median_ms": 166.9,
+        "ms_per_pkg": 0.0556,
+        "peak_rss_kb": 37576,
+        "requests": 127,
+        "day_ratio": null,
+        "week_ratio": 0.997,
+        "status": "ok"
+      },
+      "yarn-classic/rescan": {
+        "median_ms": 157.0,
+        "ms_per_pkg": 0.0523,
+        "peak_rss_kb": 36540,
+        "requests": 127,
+        "day_ratio": null,
+        "week_ratio": 1.006,
+        "status": "ok"
+      },
+      "yarn-berry/hosted": {
+        "median_ms": 208.6,
+        "ms_per_pkg": 0.0695,
+        "peak_rss_kb": 39660,
+        "requests": 127,
+        "day_ratio": null,
+        "week_ratio": null,
+        "status": "ok",
+        "note": "no comparable base (pre-#465 base fails yarn-berry expectations)"
+      },
+      "yarn-berry/rescan": {
+        "median_ms": 172.3,
+        "ms_per_pkg": 0.0574,
+        "peak_rss_kb": 37128,
+        "requests": 127,
+        "day_ratio": null,
+        "week_ratio": null,
+        "status": "ok",
+        "note": "no comparable base (pre-#465 base fails yarn-berry expectations)"
+      },
+      "bun/hosted": {
+        "median_ms": 321.5,
+        "ms_per_pkg": 0.1072,
+        "peak_rss_kb": 32904,
+        "requests": 127,
+        "day_ratio": null,
+        "week_ratio": 2.167,
+        "status": "regressed"
+      },
+      "bun/rescan": {
+        "median_ms": 287.9,
+        "ms_per_pkg": 0.096,
+        "peak_rss_kb": 32652,
+        "requests": 127,
+        "day_ratio": null,
+        "week_ratio": 2.267,
+        "status": "regressed"
+      },
+      "bun-isolated/hosted": {
+        "median_ms": 336.6,
+        "ms_per_pkg": 0.1122,
+        "peak_rss_kb": 35432,
+        "requests": 127,
+        "day_ratio": null,
+        "week_ratio": null,
+        "status": "ok",
+        "note": "no comparable base (pre-#496 base fails bun-isolated expectations); suite in #667"
+      },
+      "bun-isolated/rescan": {
+        "median_ms": 301.5,
+        "ms_per_pkg": 0.1005,
+        "peak_rss_kb": 35052,
+        "requests": 127,
+        "day_ratio": null,
+        "week_ratio": null,
+        "status": "ok",
+        "note": "no comparable base (pre-#496 base fails bun-isolated expectations); suite in #667"
+      },
+      "vlt/hosted": {
+        "median_ms": 764.0,
+        "ms_per_pkg": 0.5093,
+        "peak_rss_kb": 37348,
+        "requests": 94,
+        "day_ratio": null,
+        "week_ratio": 2.116,
+        "status": "slow",
+        "note": "weekly +112-116% from #472, accepted by maintainer (#579 closed)"
+      },
+      "vlt/rescan": {
+        "median_ms": 698.5,
+        "ms_per_pkg": 0.4656,
+        "peak_rss_kb": 35928,
+        "requests": 94,
+        "day_ratio": null,
+        "week_ratio": 2.156,
+        "status": "slow",
+        "note": "weekly +112-116% from #472, accepted by maintainer (#579 closed)"
+      },
+      "pip/hosted": {
+        "median_ms": 81.8,
+        "ms_per_pkg": 0.0818,
+        "peak_rss_kb": 34060,
+        "requests": 53,
+        "day_ratio": null,
+        "week_ratio": 1.067,
+        "status": "ok"
+      },
+      "pip/rescan": {
+        "median_ms": 75.2,
+        "ms_per_pkg": 0.0752,
+        "peak_rss_kb": 34060,
+        "requests": 53,
+        "day_ratio": null,
+        "week_ratio": 1.004,
+        "status": "ok"
+      },
+      "uv/hosted": {
+        "median_ms": 127.1,
+        "ms_per_pkg": 0.3177,
+        "peak_rss_kb": 35352,
+        "requests": 38,
+        "day_ratio": null,
+        "week_ratio": 1.023,
+        "status": "slow"
+      },
+      "uv/rescan": {
+        "median_ms": 111.0,
+        "ms_per_pkg": 0.2776,
+        "peak_rss_kb": 34960,
+        "requests": 38,
+        "day_ratio": null,
+        "week_ratio": 1.158,
+        "status": "slow"
+      },
+      "pylock/hosted": {
+        "median_ms": 126.2,
+        "ms_per_pkg": 0.3156,
+        "peak_rss_kb": 34856,
+        "requests": 26,
+        "day_ratio": null,
+        "week_ratio": 0.992,
+        "status": "slow"
+      },
+      "pylock/rescan": {
+        "median_ms": 102.2,
+        "ms_per_pkg": 0.2554,
+        "peak_rss_kb": 34788,
+        "requests": 26,
+        "day_ratio": null,
+        "week_ratio": 1.016,
+        "status": "slow"
+      },
+      "poetry/hosted": {
+        "median_ms": 201.6,
+        "ms_per_pkg": 0.504,
+        "peak_rss_kb": 38260,
+        "requests": 26,
+        "day_ratio": null,
+        "week_ratio": 0.98,
+        "status": "slow"
+      },
+      "poetry/rescan": {
+        "median_ms": 175.1,
+        "ms_per_pkg": 0.4377,
+        "peak_rss_kb": 37728,
+        "requests": 26,
+        "day_ratio": null,
+        "week_ratio": 0.971,
+        "status": "slow"
+      },
+      "pipenv/hosted": {
+        "median_ms": 86.5,
+        "ms_per_pkg": 0.2162,
+        "peak_rss_kb": 34060,
+        "requests": 26,
+        "day_ratio": null,
+        "week_ratio": 1.006,
+        "status": "ok"
+      },
+      "pipenv/rescan": {
+        "median_ms": 79.8,
+        "ms_per_pkg": 0.1995,
+        "peak_rss_kb": 34060,
+        "requests": 26,
+        "day_ratio": null,
+        "week_ratio": 1.032,
+        "status": "ok"
+      },
+      "pdm/hosted": {
+        "median_ms": 162.4,
+        "ms_per_pkg": 0.4061,
+        "peak_rss_kb": 37252,
+        "requests": 26,
+        "day_ratio": null,
+        "week_ratio": 0.962,
+        "status": "slow"
+      },
+      "pdm/rescan": {
+        "median_ms": 159.9,
+        "ms_per_pkg": 0.3997,
+        "peak_rss_kb": 38316,
+        "requests": 26,
+        "day_ratio": null,
+        "week_ratio": 1.046,
+        "status": "slow"
+      },
+      "bundler/hosted": {
+        "median_ms": 141.5,
+        "ms_per_pkg": 0.1769,
+        "peak_rss_kb": 34060,
+        "requests": 43,
+        "day_ratio": null,
+        "week_ratio": 1.036,
+        "status": "ok"
+      },
+      "bundler/rescan": {
+        "median_ms": 124.6,
+        "ms_per_pkg": 0.1558,
+        "peak_rss_kb": 34060,
+        "requests": 43,
+        "day_ratio": null,
+        "week_ratio": 1.042,
+        "status": "ok"
+      },
+      "composer/hosted": {
+        "median_ms": 115.4,
+        "ms_per_pkg": 0.1443,
+        "peak_rss_kb": 34060,
+        "requests": 43,
+        "day_ratio": null,
+        "week_ratio": 1.057,
+        "status": "ok"
+      },
+      "composer/rescan": {
+        "median_ms": 103.3,
+        "ms_per_pkg": 0.1291,
+        "peak_rss_kb": 34060,
+        "requests": 43,
+        "day_ratio": null,
+        "week_ratio": 1.043,
+        "status": "ok"
+      },
+      "cargo/hosted": {
+        "median_ms": 258.5,
+        "ms_per_pkg": 0.4309,
+        "peak_rss_kb": 34060,
+        "requests": 33,
+        "day_ratio": null,
+        "week_ratio": 1.033,
+        "status": "slow"
+      },
+      "cargo/rescan": {
+        "median_ms": 213.9,
+        "ms_per_pkg": 0.3566,
+        "peak_rss_kb": 34060,
+        "requests": 33,
+        "day_ratio": null,
+        "week_ratio": 0.993,
+        "status": "slow"
+      },
+      "golang/hosted": {
+        "median_ms": 64.3,
+        "ms_per_pkg": 0.0536,
+        "peak_rss_kb": 34060,
+        "requests": 64,
+        "day_ratio": null,
+        "week_ratio": 1.057,
+        "status": "ok"
+      },
+      "golang/rescan": {
+        "median_ms": 77.7,
+        "ms_per_pkg": 0.0648,
+        "peak_rss_kb": 34060,
+        "requests": 64,
+        "day_ratio": null,
+        "week_ratio": 1.054,
+        "status": "ok"
+      },
+      "nuget/hosted": {
+        "median_ms": 87.2,
+        "ms_per_pkg": 0.0969,
+        "peak_rss_kb": 34060,
+        "requests": 53,
+        "day_ratio": null,
+        "week_ratio": 1.045,
+        "status": "ok"
+      },
+      "nuget/rescan": {
+        "median_ms": 73.2,
+        "ms_per_pkg": 0.0814,
+        "peak_rss_kb": 34060,
+        "requests": 53,
+        "day_ratio": null,
+        "week_ratio": 0.989,
+        "status": "ok"
+      },
+      "maven/hosted": {
+        "median_ms": 62.0,
+        "ms_per_pkg": 0.062,
+        "peak_rss_kb": 34060,
+        "requests": 53,
+        "day_ratio": null,
+        "week_ratio": 0.986,
+        "status": "ok"
+      },
+      "maven/rescan": {
+        "median_ms": 56.6,
+        "ms_per_pkg": 0.0566,
+        "peak_rss_kb": 34060,
+        "requests": 53,
+        "day_ratio": null,
+        "week_ratio": 0.96,
+        "status": "ok"
+      },
+      "npm/dry-run": {
+        "median_ms": 200.4,
+        "ms_per_pkg": 0.0668,
+        "peak_rss_kb": 43136,
+        "requests": 67,
+        "day_ratio": null,
+        "week_ratio": 1.068,
+        "status": "ok"
+      },
+      "npm/public-proxy": {
+        "median_ms": 201.2,
+        "ms_per_pkg": 0.0671,
+        "peak_rss_kb": 42928,
+        "requests": 151,
+        "day_ratio": null,
+        "week_ratio": 1.044,
+        "status": "ok"
+      },
+      "npm/latency": {
+        "median_ms": 647.8,
+        "ms_per_pkg": 0.2159,
+        "peak_rss_kb": 42948,
+        "requests": 127,
+        "day_ratio": null,
+        "week_ratio": 1.028,
+        "status": "ok"
+      }
+    },
+    "regressions": [
+      {
+        "scenario": "bun/hosted",
+        "metric": "wall",
+        "ratio": 2.167,
+        "base": "2463257a",
+        "window": "week",
+        "culprit": "1169ae68 (#472)",
+        "confirmed": true,
+        "issue": 578,
+        "new": false
+      },
+      {
+        "scenario": "bun/rescan",
+        "metric": "wall",
+        "ratio": 2.267,
+        "base": "2463257a",
+        "window": "week",
+        "culprit": "1169ae68 (#472)",
+        "confirmed": true,
+        "issue": 578,
+        "new": false
+      },
+      {
+        "scenario": "vlt/hosted",
+        "metric": "wall",
+        "ratio": 2.116,
+        "base": "2463257a",
+        "window": "week",
+        "culprit": "1169ae68 (#472)",
+        "confirmed": true,
+        "issue": 579,
+        "new": false,
+        "accepted": true
+      },
+      {
+        "scenario": "vlt/rescan",
+        "metric": "wall",
+        "ratio": 2.156,
+        "base": "2463257a",
+        "window": "week",
+        "culprit": "1169ae68 (#472)",
+        "confirmed": true,
+        "issue": 579,
+        "new": false,
+        "accepted": true
+      }
+    ],
+    "slow": [
+      "cargo",
+      "pdm",
+      "poetry",
+      "pylock",
+      "uv",
+      "vlt"
+    ],
+    "hosted_median_ms_per_pkg": 0.1122,
+    "pr": 667,
+    "issues_opened": [
+      760,
+      761,
+      762
+    ]
+  }
 ]
