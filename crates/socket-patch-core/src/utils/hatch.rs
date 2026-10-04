@@ -143,11 +143,16 @@ fn replacement(spec: &str, name: &str, version: &str, url: &str) -> Result<Optio
         if existing == url {
             return Ok(Some(spec.to_owned()));
         }
-        return Err(format!(
-            "{name}: an existing direct source must be reverted before patching"
-        ));
-    }
-    if !crate::utils::pep440::is_exact_pin_of(&constraint, version) {
+        // socket-patch's own earlier hosted reference (a rotated grant or a
+        // superseding patch uuid for this release) is re-pinned in place.
+        if !crate::vendor::lock_inventory::pypi::replaceable_hosted_pin(
+            existing, url, name, version,
+        ) {
+            return Err(format!(
+                "{name}: an existing direct source must be reverted before patching"
+            ));
+        }
+    } else if !crate::utils::pep440::is_exact_pin_of(&constraint, version) {
         return Err(format!(
             "{name}: Hatch patching requires an exact =={version} declaration"
         ));
@@ -528,7 +533,10 @@ mod tests {
         // project dependency and the hatch.toml env are the two declarations.
         let mut wired = inputs.clone();
         wired.extend(rewrite(&inputs, "six", "1.16.0", A).unwrap());
-        assert_eq!(wired.values().map(|t| t.matches(A).count()).sum::<usize>(), 2);
+        let count = |files: &BTreeMap<String, String>, url: &str| -> usize {
+            files.values().map(|t| t.matches(url).count()).sum()
+        };
+        assert_eq!(count(&wired, A), 2);
         let edits = rewrite(&wired, "six", "1.16.0", B)
             .unwrap_or_else(|e| panic!("superseding patch refused: {e}"));
         let mut repinned = wired.clone();
@@ -536,7 +544,7 @@ mod tests {
         for text in repinned.values() {
             assert!(!text.contains(A), "{text}");
         }
-        assert_eq!(repinned.values().map(|t| t.matches(B).count()).sum::<usize>(), 2);
+        assert_eq!(count(&repinned, B), 2);
         assert!(repinned["pyproject.toml"].contains(&format!("six @ {B} ; python_version >= '3'")));
         assert!(repinned["hatch.toml"].contains(&format!("Six[x] @ {B}")));
         assert!(rewrite(&repinned, "six", "1.16.0", B).unwrap().is_empty());

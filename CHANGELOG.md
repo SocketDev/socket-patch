@@ -236,6 +236,12 @@ limits, and required install commands.
   half-open connection. A connect now fails after 10 s, and a connection that
   sends nothing for 60 s fails as a network error. Downloads that keep
   streaming are not cut off (#570).
+- Hosted `scan` re-pins a uv project, a uv PEP 723 script or a Hatch project
+  to a superseding patch for a package it already wired. It used to list the
+  upgrade in `updates[]`, then refuse its own earlier pin as a user source
+  (`redirect_uv_project_unsupported`, `redirect_uv_script_unsupported`,
+  `redirect_hatch_unsupported`) and exit 0 with the old patch still installed.
+  Vendored re-vendoring is not covered yet (#742, #650).
 
 ### Maintenance
 

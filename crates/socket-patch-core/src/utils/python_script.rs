@@ -61,7 +61,15 @@ fn dependency_name(specifier: &str) -> String {
     canonicalize_pypi_name(pep508_name(specifier))
 }
 
-fn same_hosted_artifact(previous: &str, current: &str) -> bool {
+/// Whether `previous` is socket-patch's own earlier hosted source for this
+/// package that `current` may replace: a rotated grant token on the same
+/// artifact path, or (the shared PyPI recognizer) a superseding patch uuid
+/// for the same name and version on Socket's patch server.
+fn same_hosted_artifact(previous: &str, current: &str, name: &str, version: &str) -> bool {
+    if crate::vendor::lock_inventory::pypi::replaceable_hosted_pin(previous, current, name, version)
+    {
+        return true;
+    }
     let (Ok(previous), Ok(current)) = (reqwest::Url::parse(previous), reqwest::Url::parse(current))
     else {
         return false;
@@ -175,7 +183,8 @@ fn rewrite_sources(
             .and_then(|table| table.get(key))
             .and_then(Item::as_str);
         let same = previous.is_some_and(|previous| {
-            previous == location || (key == "url" && same_hosted_artifact(previous, location))
+            previous == location
+                || (key == "url" && same_hosted_artifact(previous, location, name, version))
         });
         if !same {
             return Err(format!("Python project already declares a source for {existing_name}; revert it before applying a different patch"));

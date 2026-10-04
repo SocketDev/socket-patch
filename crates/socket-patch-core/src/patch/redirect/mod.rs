@@ -19617,7 +19617,10 @@ mod superseding_repin_tests {
     }
 
     /// Run the planner and fold its rewrites over `files`.
-    fn scan(files: &BTreeMap<String, String>, dep: &DepOverride) -> (BTreeMap<String, String>, RewriteResult) {
+    fn scan(
+        files: &BTreeMap<String, String>,
+        dep: &DepOverride,
+    ) -> (BTreeMap<String, String>, RewriteResult) {
         let result = rewrite_registry_redirect(files, std::slice::from_ref(dep));
         let mut out = files.clone();
         out.extend(result.files.clone());
@@ -19631,7 +19634,10 @@ mod superseding_repin_tests {
             result.warnings
         );
         for (path, text) in files {
-            assert!(!text.contains(&first().patch_uuid), "{path} kept the old uuid:\n{text}");
+            assert!(
+                !text.contains(&first().patch_uuid),
+                "{path} kept the old uuid:\n{text}"
+            );
         }
         let joined: String = files.values().cloned().collect();
         assert!(joined.contains(&second().patch_uuid));
@@ -19692,7 +19698,12 @@ mod superseding_repin_tests {
             .collect();
         let (wired, result) = scan(&files, &first());
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
-        assert_eq!(wired["pyproject.toml"].matches(&first().artifact_url).count(), 2);
+        assert_eq!(
+            wired["pyproject.toml"]
+                .matches(&first().artifact_url)
+                .count(),
+            2
+        );
         let (repinned, result) = scan(&wired, &second());
         assert_repinned(&repinned, &result);
         assert!(result.confirmed_hatch_uuids.contains(&second().patch_uuid));
