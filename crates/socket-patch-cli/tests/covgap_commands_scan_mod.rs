@@ -1476,7 +1476,13 @@ async fn scan_hosted_paths_run_once_per_project_directory() {
         let header = format!("== {} ==", Path::new("apps").join(app).display());
         assert!(stdout.contains(&header), "missing {header:?}: {stdout}");
     }
-    assert_eq!(stdout.matches("Switched 0 packages to hosted patches").count(), 2, "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("Switched 0 packages to hosted patches")
+            .count(),
+        2,
+        "{stdout}"
+    );
     let reqs = recorded(&mock).await;
     assert_eq!(batch_bodies(&reqs).len(), 2, "one discovery per directory");
 }
@@ -1915,7 +1921,6 @@ mod pty {
             screen.join("\n")
         );
     }
-
 }
 
 // ---------------------------------------------------------------------------

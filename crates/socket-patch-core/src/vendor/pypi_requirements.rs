@@ -130,6 +130,13 @@ pub(super) enum RequirementsTarget {
         /// empty and the guard checks only the path.
         pin: Option<(String, String)>,
     },
+    /// The files route the package to socket-patch's own vendored wheel for
+    /// an OLDER patch uuid, and the ledger still holds that entry: re-wire
+    /// its recorded vendor lines in place to the superseding uuid
+    /// ([`rewire_requirements`]), carrying the pre-vendor originals over.
+    Rewire {
+        prev: Box<VendorEntry>,
+    },
 }
 
 /// Pre-flight the wiring without writing — the orchestrator runs this before
@@ -138,9 +145,12 @@ pub(super) enum RequirementsTarget {
 /// A file already carrying a socket vendor line for this package
 /// short-circuits the plan: at the SAME patch uuid it is our own first-run
 /// edit (in sync — the artifact-only rebuild path handles a deleted wheel);
-/// at a DIFFERENT uuid it refuses — appending a second wheel line would
-/// leave pip two competing requirements, and the new ledger entry would
-/// clobber the old one's record, orphaning its line.
+/// at a DIFFERENT uuid it is a superseding patch (#765), re-wired in place
+/// when the ledger still records that older entry's wiring
+/// ([`RequirementsTarget::Rewire`]). Without that record it refuses:
+/// appending a second wheel line would leave pip two competing
+/// requirements, and a re-wire with no recorded pre-vendor original could
+/// never be reverted.
 pub(super) async fn preflight_requirements(
     root: &Path,
     canon_name: &str,
@@ -155,14 +165,28 @@ pub(super) async fn preflight_requirements(
                     pin: wired_pin_in(&file.content, canon_name, record_uuid),
                 });
             }
-            return Err((
-                "pypi_requirements_already_vendored",
-                format!(
-                    "{}: already routes {canon_name} to the socket-patch vendored wheel for \
-                     patch {found}; run `socket-patch vendor --revert` before re-vendoring",
-                    file.rel
-                ),
-            ));
+            let refused = |why: &str| {
+                (
+                    "pypi_requirements_already_vendored",
+                    format!(
+                        "{}: already routes {canon_name} to the socket-patch vendored wheel for \
+                         patch {found}{why}; run `socket-patch vendor --revert` before \
+                         re-vendoring",
+                        file.rel
+                    ),
+                )
+            };
+            let Some(prev) = superseded_entry(root, canon_name, version, &found).await else {
+                return Err(refused(
+                    " and the vendor ledger records no wiring for it to carry over",
+                ));
+            };
+            return match plan_rewire(&files, &prev, canon_name, version, "", "") {
+                Ok(_) => Ok(RequirementsTarget::Rewire {
+                    prev: Box::new(prev),
+                }),
+                Err(why) => Err(refused(&format!(" ({why})"))),
+            };
         }
     }
     plan_requirements(root, canon_name, version, "", "")
@@ -232,13 +256,56 @@ pub(super) async fn wire_requirements(
     wheel_sha256_hex: &str,
 ) -> Result<Vec<WiringRecord>, (&'static str, String)> {
     let plan = plan_requirements(root, canon_name, version, rel_wheel, wheel_sha256_hex).await?;
+    write_plan(root, &plan).await
+}
+
+/// Re-wire the vendor lines `prev` (the ledger entry of an OLDER patch uuid
+/// for this package) recorded, in place, to the superseding wheel (#765).
+/// Each returned record keeps `prev`'s file, key, action and pre-vendor
+/// `original`, so reverting the new entry restores the user's own pins.
+pub(super) async fn rewire_requirements(
+    root: &Path,
+    prev: &VendorEntry,
+    canon_name: &str,
+    version: &str,
+    rel_wheel: &str,
+    wheel_sha256_hex: &str,
+) -> Result<Vec<WiringRecord>, (&'static str, String)> {
+    let files = collect_requirements_files(root).await?;
+    let plan = plan_rewire(
+        &files,
+        prev,
+        canon_name,
+        version,
+        rel_wheel,
+        wheel_sha256_hex,
+    )
+    .map_err(|why| {
+        (
+            "pypi_requirements_already_vendored",
+            format!(
+                "cannot re-wire {canon_name} from patch {}: {why}; run `socket-patch vendor \
+                     --revert` before re-vendoring",
+                prev.uuid
+            ),
+        )
+    })?;
+    write_plan(root, &plan).await
+}
+
+/// Write a planned edit set, unwinding the files already written if any
+/// write fails. Returns the wiring records in application order.
+async fn write_plan(
+    root: &Path,
+    plan: &[PlannedFile],
+) -> Result<Vec<WiringRecord>, (&'static str, String)> {
     // Before ANY write: a symlinked requirements file (root or `-r` include)
     // would be replaced by the rename-over.
     let planned: Vec<&str> = plan.iter().map(|f| f.rel.as_str()).collect();
     refuse_symlinked(root, &planned, "pypi_requirements_symlink_unsupported").await?;
     let mut wiring = Vec::new();
     let mut written: Vec<&PlannedFile> = Vec::new();
-    for file in &plan {
+    for file in plan {
         if let Err(e) =
             atomic_write_bytes_preserving_mode(&root.join(&file.rel), file.new_content.as_bytes())
                 .await
@@ -583,6 +650,135 @@ async fn plan_requirements(
                 new: Some(serde_json::Value::String(line)),
             }],
         });
+    }
+    Ok(planned)
+}
+
+/// The ledger entry an OLDER patch uuid left for this package's
+/// requirements wiring: a pypi entry at `uuid` whose every record is a
+/// `requirements_line` tagged `canon_name==version`. `None` when the ledger
+/// is missing or unreadable, holds no such entry, or holds more than one
+/// (ambiguous: no single set of originals to carry over).
+async fn superseded_entry(
+    root: &Path,
+    canon_name: &str,
+    version: &str,
+    uuid: &str,
+) -> Option<VendorEntry> {
+    let state = super::state::load_state_shared(root).await.ok()?;
+    let mut hits = state.entries.values().filter(|e| {
+        e.ecosystem == "pypi"
+            && e.uuid == uuid
+            && !e.wiring.is_empty()
+            && e.wiring.iter().all(|r| {
+                r.kind == "requirements_line"
+                    && r.new
+                        .as_ref()
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|line| split_comment(line).1)
+                        .and_then(vendor_tag)
+                        .is_some_and(|(n, v)| n == canon_name && v == version)
+            })
+    });
+    let hit = hits.next()?.clone();
+    hits.next().is_none().then_some(hit)
+}
+
+/// The environment marker a vendor line carries (`./<wheel> ; <marker>
+/// [--hash=…]`, the shape [`vendor_line`] writes), from its code part.
+fn vendor_line_marker(code: &str) -> Option<String> {
+    let rest = code.trim().split_once(char::is_whitespace)?.1.trim_start();
+    let marker = rest.strip_prefix(';')?;
+    let end = marker.find("--hash").unwrap_or(marker.len());
+    let marker = marker[..end].trim();
+    (!marker.is_empty()).then(|| marker.to_string())
+}
+
+/// Plan the in-place re-wire of `prev`'s recorded vendor lines to the
+/// superseding wheel (#765). Pure read. Every line `prev` recorded must
+/// still be present verbatim in an editable file of the tree, and they must
+/// be ALL the vendor lines for the package (an unrecorded one could not be
+/// reverted); otherwise the reason is returned.
+fn plan_rewire(
+    files: &[ReqFile],
+    prev: &VendorEntry,
+    canon_name: &str,
+    version: &str,
+    rel_wheel: &str,
+    wheel_sha256_hex: &str,
+) -> Result<Vec<PlannedFile>, String> {
+    let hashed = files.iter().any(|f| requires_hashes(&f.content));
+    let mut order: Vec<&str> = Vec::new();
+    for rec in &prev.wiring {
+        if !order.contains(&rec.file.as_str()) {
+            order.push(&rec.file);
+        }
+    }
+    let mut planned = Vec::new();
+    let mut rewired = 0usize;
+    for rel in order {
+        let Some(file) = files.iter().find(|f| f.rel == rel) else {
+            return Err(format!(
+                "the recorded {rel} is no longer part of the requirements tree"
+            ));
+        };
+        if !file.editable {
+            return Err(format!("{rel} is outside the project root"));
+        }
+        let nl = detect_eol(&file.content);
+        let mut lines: Vec<String> = file.content.lines().map(str::to_string).collect();
+        let mut taken: HashSet<usize> = HashSet::new();
+        let mut records = Vec::new();
+        // Bottom-up, pairing identical lines with their own records exactly
+        // as the revert does.
+        for rec in prev.wiring.iter().rev().filter(|r| r.file == rel) {
+            let old = rec
+                .new
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("{rel}: a recorded vendor line is empty"))?;
+            let idx = (0..lines.len())
+                .rev()
+                .find(|i| !taken.contains(i) && lines[*i].trim() == old.trim())
+                .ok_or_else(|| format!("{rel}: the vendor line changed since vendoring"))?;
+            let marker = vendor_line_marker(split_comment(old).0);
+            let line = vendor_line(
+                rel_wheel,
+                hashed.then_some(wheel_sha256_hex),
+                canon_name,
+                version,
+                &marker,
+                rec.action == WiringAction::Added,
+            );
+            lines[idx] = line.clone();
+            taken.insert(idx);
+            records.push(WiringRecord {
+                new: Some(serde_json::Value::String(line)),
+                ..rec.clone()
+            });
+        }
+        records.reverse(); // application order = top-down
+        rewired += records.len();
+        let mut new_content = lines.join(nl);
+        if file.content.ends_with('\n') && !new_content.is_empty() {
+            new_content.push_str(nl);
+        }
+        planned.push(PlannedFile {
+            rel: file.rel.clone(),
+            original_content: file.content.clone(),
+            new_content,
+            records,
+        });
+    }
+    let live: usize = files
+        .iter()
+        .map(|f| vendor_lines(&f.content, canon_name).count())
+        .sum();
+    if live != rewired {
+        return Err(format!(
+            "the requirements tree has {live} vendor line(s) for {canon_name}, the vendor \
+             ledger records {rewired}"
+        ));
     }
     Ok(planned)
 }

@@ -102,6 +102,14 @@ limits, and required install commands.
 
 ### Fixed
 
+- A requirements.txt project vendored with one patch now moves to a newer
+  patch for the same package. `vendor`, `get <uuid> --mode vendored` and
+  `scan --mode vendored` used to fail with
+  `pypi_requirements_already_vendored` (exit 1), and pip kept installing the
+  old patch. The vendor line is now rewired to the new wheel in place, the
+  old patch's directory is removed, and `vendor --revert` still restores your
+  original pin. This needs the vendor ledger entry for the old patch; without
+  it the re-vendor is still refused (#765).
 - Global mode (`-g`) finds npm, yarn, pnpm, bun, RubyGems and Composer on
   Windows, where they install as `.cmd` / `.bat` shims, instead of reporting
   an empty scan. The yarn and npm-family global lookups no longer run from the
