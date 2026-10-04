@@ -1369,7 +1369,7 @@ impl NpmCrawler {
     ) -> ResolverVisit {
         let listing = list_dir_sync(&nm_path);
         let probe_filter = ProbeFilter::new(&listing);
-        let matched = pending
+        let mut matched: Vec<(usize, PathBuf)> = pending
             .iter()
             .enumerate()
             .filter_map(|(index, target)| {
@@ -1394,6 +1394,9 @@ impl NpmCrawler {
                     .then_some((index, pkg_path))
             })
             .collect();
+        if !store_entry {
+            matched.extend(Self::alias_copies(&nm_path, &listing, pending));
+        }
         let mut nested = Self::collect_nested_node_modules(&nm_path, listing);
         if store_entry {
             nested.extend(own_package_nested_node_modules_sync(&nm_path));
@@ -1403,6 +1406,71 @@ impl NpmCrawler {
             matched,
             nested,
         }
+    }
+
+    /// The alias installs in an importer-tree `node_modules` that are copies
+    /// of a pending target: `"lp": "npm:left-pad@1.3.0"` puts the real
+    /// `left-pad@1.3.0` (its own `package.json` says so) at
+    /// `node_modules/lp`, and npm, yarn, Bun and pnpm's hoisted linker
+    /// all do this. `require('lp')` loads those bytes, so the dir is an
+    /// installed copy of `pkg:npm/left-pad@1.3.0` that apply must patch
+    /// and VEX must verify, beside any plain `node_modules/left-pad` copy.
+    ///
+    /// Only real package dirs count (links are dependency edges into a
+    /// store or into first-party source, never copies of their own), and
+    /// a dir whose name is its package's own name is the direct probe's
+    /// job, so it is skipped here: that keeps one physical dir from being
+    /// recorded twice through a case-insensitive lookup.
+    fn alias_copies(
+        nm_path: &Path,
+        listing: &Listing,
+        pending: &[Target],
+    ) -> Vec<(usize, PathBuf)> {
+        let mut by_identity: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+        for (index, target) in pending.iter().enumerate() {
+            by_identity
+                .entry((target.dir_key.as_str(), target.version.as_str()))
+                .or_default()
+                .push(index);
+        }
+        if by_identity.is_empty() {
+            return Vec::new();
+        }
+        let is_package_dir = |entry: &ListedEntry| {
+            !entry.name_str.starts_with('.')
+                && entry.name_str != "node_modules"
+                && entry.file_type.is_some_and(|ft| ft.is_dir())
+        };
+        let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+        for entry in listing.entries.iter().filter(|e| is_package_dir(e)) {
+            let entry_path = nm_path.join(&entry.name);
+            if entry.name_str.starts_with('@') {
+                for scoped in list_dir_sync(&entry_path).entries {
+                    if is_package_dir(&scoped) {
+                        candidates.push((
+                            format!("{}/{}", entry.name_str, scoped.name_str),
+                            entry_path.join(&scoped.name),
+                        ));
+                    }
+                }
+            } else {
+                candidates.push((entry.name_str.clone(), entry_path));
+            }
+        }
+        let mut found = Vec::new();
+        for (dir_key, pkg_path) in candidates {
+            let Some((name, version)) = read_package_json_sync(&pkg_path.join("package.json"))
+            else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case(&dir_key) {
+                continue;
+            }
+            if let Some(indices) = by_identity.get(&(name.as_str(), version.as_str())) {
+                found.extend(indices.iter().map(|&index| (index, pkg_path.clone())));
+            }
+        }
+        found
     }
 
     /// The `node_modules` dirs living one level below `nm_path` (inside each
@@ -3147,6 +3215,110 @@ mod tests {
         assert!(result.contains_key("pkg:npm/foo@1.0.0"));
         assert!(result.contains_key("pkg:npm/@types/node@20.0.0"));
         assert!(!result.contains_key("pkg:npm/not-installed@0.0.1"));
+    }
+
+    fn copy_paths(found: &HashMap<String, Vec<CrawledPackage>>, purl: &str) -> Vec<PathBuf> {
+        found
+            .get(purl)
+            .map(|copies| copies.iter().map(|c| c.path.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// #356: an npm alias (`"lp": "npm:left-pad@1.3.0"`) installs the real
+    /// `left-pad@1.3.0` at `node_modules/lp`. With no plain copy beside
+    /// it, that dir is the purl's only installed copy, so apply must not
+    /// report it `package_not_installed`.
+    #[tokio::test]
+    async fn find_by_purls_resolves_an_alias_only_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        write_pkg(&nm.join("lp"), "left-pad", "1.3.0");
+
+        let purl = "pkg:npm/left-pad@1.3.0".to_string();
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, std::slice::from_ref(&purl))
+            .await
+            .unwrap();
+        assert_eq!(copy_paths(&found, &purl), vec![nm.join("lp")]);
+        let copy = &found[&purl][0];
+        assert_eq!(
+            (copy.name.as_str(), copy.version.as_str()),
+            ("left-pad", "1.3.0")
+        );
+    }
+
+    /// #356: a plain copy plus an alias of the same `name@version` are two
+    /// copies of the purl. Resolving only the plain one left `require('lp')`
+    /// loading unpatched bytes while apply reported success and VEX
+    /// attested `not_affected`. The plain copy stays first.
+    #[tokio::test]
+    async fn find_by_purls_returns_alias_copies_beside_the_plain_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        write_pkg(&nm.join("left-pad"), "left-pad", "1.3.0");
+        write_pkg(&nm.join("lp"), "left-pad", "1.3.0");
+        // A nested alias under another package is a copy too.
+        write_pkg(&nm.join("host"), "host", "1.0.0");
+        write_pkg(&nm.join("host/node_modules/pad"), "left-pad", "1.3.0");
+        // Another version under an alias is not.
+        write_pkg(&nm.join("lp2"), "left-pad", "1.2.0");
+
+        let purl = "pkg:npm/left-pad@1.3.0".to_string();
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, std::slice::from_ref(&purl))
+            .await
+            .unwrap();
+        assert_eq!(
+            copy_paths(&found, &purl),
+            vec![
+                nm.join("left-pad"),
+                nm.join("lp"),
+                nm.join("host/node_modules/pad"),
+            ]
+        );
+    }
+
+    /// #356: a scoped alias dir (`"@x/pad": "npm:left-pad@1.3.0"`) and an
+    /// unscoped alias of a scoped package (`"sp": "npm:@s/pkg@2.0.0"`).
+    #[tokio::test]
+    async fn find_by_purls_resolves_scoped_alias_installs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        write_pkg(&nm.join("@x/pad"), "left-pad", "1.3.0");
+        write_pkg(&nm.join("sp"), "@s/pkg", "2.0.0");
+
+        let pad = "pkg:npm/left-pad@1.3.0".to_string();
+        let scoped = "pkg:npm/%40s/pkg@2.0.0".to_string();
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, &[pad.clone(), scoped.clone()])
+            .await
+            .unwrap();
+        assert_eq!(copy_paths(&found, &pad), vec![nm.join("@x/pad")]);
+        assert_eq!(copy_paths(&found, &scoped), vec![nm.join("sp")]);
+        let copy = &found[&scoped][0];
+        assert_eq!(copy.namespace.as_deref(), Some("@s"));
+        assert_eq!(copy.name, "pkg");
+    }
+
+    /// A link is a dependency edge (into a store, a workspace member or an
+    /// `npm link` target), never an alias copy of its own; pnpm's isolated
+    /// alias link resolves through the store entry instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn find_by_purls_does_not_take_a_link_as_an_alias_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        let elsewhere = tmp.path().join("src/left-pad");
+        write_pkg(&elsewhere, "left-pad", "1.3.0");
+        std::fs::create_dir_all(&nm).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, nm.join("lp")).unwrap();
+
+        let purl = "pkg:npm/left-pad@1.3.0".to_string();
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, std::slice::from_ref(&purl))
+            .await
+            .unwrap();
+        assert!(copy_paths(&found, &purl).is_empty());
     }
 
     /// Regression: the patches API serves scoped purls percent-encoded
