@@ -1667,7 +1667,7 @@ fn edit_lock(text: &str, name: &str, version: &str, rel: &str) -> Result<LockEdi
 
     // 1. Lift the gem's spec block out of GEM/specs — or, on a re-vendor to
     // a newer patch uuid (same purl), out of the PATH section our previous
-    // run emitted. Bundler 2+ writes one GEM section per rubygems source
+    // run emitted. Bundler 2.2+ writes one GEM section per rubygems source
     // (sorted by remote), so the spec may sit in any of them (#779).
     let gem_sections = gem_section_spans(&lines);
     if gem_sections.is_empty() {
@@ -7658,7 +7658,7 @@ mod tests {
 
     // ── #779: a gem outside the lock's first GEM section ──────────────────
 
-    /// Bundler 2+ writes one GEM section per rubygems source, sorted by
+    /// Bundler 2.2+ writes one GEM section per rubygems source, sorted by
     /// remote, so a private source can put rubygems.org second.
     const GEMFILE_TWO_SOURCES: &str = "source \"https://rubygems.org\"\n\ngem \"puma\"\ngem \"rack\", \"~> 3.1\"\n\nsource \"https://gems.example.com\" do\n  gem \"aaa-internal\"\nend\n";
     const LOCK_TWO_SOURCES: &str = "GEM\n  remote: https://gems.example.com/\n  specs:\n    aaa-internal (1.0.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.4.2)\n      nio4r (~> 2.0)\n    rack (3.2.6)\n      base64 (>= 0.1.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  aaa-internal!\n  puma\n  rack (~> 3.1)\n\nBUNDLED WITH\n   2.5.22\n";

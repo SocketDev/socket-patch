@@ -1675,7 +1675,7 @@ File.binwrite("quick/Marshal.4.8/#{spec.full_name}.gemspec.rz", Zlib::Deflate.de
     );
 }
 
-/// #779: a Gemfile with a second rubygems source. Bundler 2+ writes one
+/// #779: a Gemfile with a second rubygems source. Bundler 2.2+ writes one
 /// GEM section per source, sorted by remote, so the `file://` source comes
 /// first and rack sits in the second GEM section. Vendor used to fail with
 /// "GEM specs has no entry". It must wire rack so a fresh frozen install
@@ -1722,9 +1722,10 @@ fn gem_vendor_second_gem_section_fresh_checkout_and_revert() {
     let gemfile_before = std::fs::read(&gemfile_path).unwrap();
     let lock_text = String::from_utf8_lossy(&lock_before).into_owned();
     let version = locked_gem_version(&lock_text, DEP).expect("resolved rack version");
-    if bundler.at_least(2, 0) {
-        // The premise: rack is NOT in the first GEM section. (Bundler 1.x
-        // merges every rubygems remote into one GEM section.)
+    if bundler.at_least(2, 2) {
+        // The premise: rack is NOT in the first GEM section. (Bundler
+        // <= 2.1 merges every rubygems remote into one GEM section; the
+        // round trip below must hold on that layout too.)
         let sections: Vec<&str> = lock_text
             .split("\n\n")
             .filter(|s| s.starts_with("GEM\n"))
