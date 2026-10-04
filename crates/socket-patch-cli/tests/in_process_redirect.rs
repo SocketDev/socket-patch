@@ -863,6 +863,94 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
     }
 }
 
+/// #632: a dependency declared through a yarn catalog (`"catalog:"`) is
+/// matched by yarn's `resolutions` before the catalog is expanded, so the
+/// hosted pin must also route `<name>@catalog:`; `rollback` must drop every
+/// selector it wrote and restore the lock's expanded `npm:` key, leaving
+/// package.json byte-identical to the pristine one.
+#[tokio::test]
+#[serial]
+async fn yarn_berry_catalog_dependency_is_pinned_and_rolled_back() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    mock_reference_with_berry_url(&server, &hosted_url).await;
+    mock_view(&server).await;
+    let tarball = upstream_tarball();
+    mock_npm_registry(
+        &server,
+        &vlt_hosted_common::sha512_sri(&tarball),
+        Some(tarball),
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_berry_project(tmp.path());
+    let pkg_path = tmp.path().join("package.json");
+    std::fs::write(
+        &pkg_path,
+        format!(
+            "{{\n  \"name\": \"consumer\",\n  \"version\": \"0.0.0\",\n  \
+             \"dependencies\": {{\n    \"{NAME}\": \"catalog:\"\n  }}\n}}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(".yarnrc.yml"),
+        format!("nodeLinker: node-modules\ncatalog:\n  {NAME}: ^{VERSION}\n"),
+    )
+    .unwrap();
+    let pristine_pkg = std::fs::read_to_string(&pkg_path).unwrap();
+    let lock_path = tmp.path().join("yarn.lock");
+    let pristine_lock = std::fs::read_to_string(&lock_path).unwrap();
+
+    let env = run_redirect_subprocess_with(
+        tmp.path(),
+        &server.uri(),
+        &["--patch-server-url", &server.uri()],
+    );
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert!(warning_codes(&env).is_empty(), "{env:#}");
+    let pkg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap()).unwrap();
+    assert_eq!(
+        pkg["resolutions"],
+        serde_json::json!({
+            format!("{NAME}@npm:^{VERSION}"): hosted_url,
+            format!("{NAME}@catalog:"): hosted_url,
+        }),
+        "{pkg}"
+    );
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(
+        lock.contains(&format!("\"{NAME}@{hosted_url}\":")),
+        "the entry is keyed by the tarball descriptor: {lock}"
+    );
+
+    let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
+    assert_eq!(code, Some(0), "rollback: {env:#}");
+    assert_eq!(
+        env["hosted"]["reverted"],
+        serde_json::json!([PURL]),
+        "{env:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&pkg_path).unwrap(),
+        pristine_pkg,
+        "rollback drops both selectors"
+    );
+    let restored = std::fs::read_to_string(&lock_path).unwrap();
+    let checksum = berry_checksum_of(&restored);
+    assert_eq!(
+        restored,
+        pristine_lock.replace(
+            &format!("10c0/{}", "3".repeat(128)),
+            &format!("10c0/{checksum}")
+        ),
+        "rollback restores the expanded npm: key"
+    );
+}
+
 /// #404 upgrade path: a lock pinned by an earlier release carries the old
 /// `npm:<v>::__archiveUrl=<url>` resolution, which makes yarn's npm fetcher
 /// send registry auth to the patch host. `rollback` must still recognize and
