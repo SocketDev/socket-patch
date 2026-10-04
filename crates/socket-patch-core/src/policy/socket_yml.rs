@@ -486,7 +486,11 @@ pub(crate) fn package_spec_error(spec: &str) -> Option<&'static str> {
     if spec.is_empty() {
         return Some("package spec is empty");
     }
-    if let Some(rest) = spec.get(..4).filter(|p| p.eq_ignore_ascii_case("pkg:")).map(|_| &spec[4..]) {
+    if let Some(rest) = spec
+        .get(..4)
+        .filter(|p| p.eq_ignore_ascii_case("pkg:"))
+        .map(|_| &spec[4..])
+    {
         let valid = rest.split_once('/').is_some_and(|(ty, name)| {
             !ty.is_empty() && !name.trim_matches('/').is_empty() && !name.starts_with('@')
         });
@@ -785,7 +789,9 @@ pub(crate) fn parse_file(
             Some(Err((key, message))) => {
                 warnings.push(PolicyWarning {
                     code: super::SOCKET_YML_IGNORED_VALUE,
-                    detail: super::strip_unsafe(&format!("{file}: {key} {message}; the key is ignored")),
+                    detail: super::strip_unsafe(&format!(
+                        "{file}: {key} {message}; the key is ignored"
+                    )),
                 });
                 Vec::new()
             }
@@ -916,8 +922,12 @@ mod tests {
         // YAML beats everything; the case variant beats the version gate;
         // the version gate beats the keys.
         assert_eq!(err_key("patches: {minSeverty: x}\n").0, "version");
-        assert!(err_key("Patches: {}\npatches: {minSeverty: x}\n").1.contains("misspelled"));
-        assert!(err_key("patches: {minSeverty: x\n").1.contains("invalid YAML"));
+        assert!(err_key("Patches: {}\npatches: {minSeverty: x}\n")
+            .1
+            .contains("misspelled"));
+        assert!(err_key("patches: {minSeverty: x\n")
+            .1
+            .contains("invalid YAML"));
     }
 
     #[test]
@@ -986,12 +996,9 @@ mod tests {
             let (key, message) = err_key(text);
             assert_eq!(key, "", "{text:?}");
             assert!(
-                [
-                    "invalid YAML",
-                    "top level must be a mapping",
-                ]
-                .iter()
-                .any(|m| message.contains(m)),
+                ["invalid YAML", "top level must be a mapping",]
+                    .iter()
+                    .any(|m| message.contains(m)),
                 "{text:?}: {message}"
             );
         }

@@ -92,7 +92,9 @@ pub(super) fn rewrite_poetry(
                             }
                         }
                         Err(detail) => {
-                            result.refused_python_lock_uuids.insert(dep.patch_uuid.clone());
+                            result
+                                .refused_python_lock_uuids
+                                .insert(dep.patch_uuid.clone());
                             result.warnings.push(RewriteWarning {
                                 code: "redirect_poetry_lock_unsupported".into(),
                                 detail: format!("{path}: {detail}"),
@@ -100,7 +102,9 @@ pub(super) fn rewrite_poetry(
                             continue;
                         }
                     }
-                    result.confirmed_python_lock_uuids.insert(dep.patch_uuid.clone());
+                    result
+                        .confirmed_python_lock_uuids
+                        .insert(dep.patch_uuid.clone());
                     content = rewrite.text;
                     if !stale_warned {
                         if let Some(format) =
@@ -136,14 +140,18 @@ pub(super) fn rewrite_poetry(
                 }
                 // Already redirected to this artifact (idempotent re-scan).
                 Ok(Some(_)) => {
-                    result.confirmed_python_lock_uuids.insert(dep.patch_uuid.clone());
+                    result
+                        .confirmed_python_lock_uuids
+                        .insert(dep.patch_uuid.clone());
                 }
                 Ok(None) => result.warnings.push(RewriteWarning {
                     code: "redirect_poetry_entry_not_found".into(),
                     detail: format!("no {path} entry for {}@{}", dep.name, dep.version),
                 }),
                 Err(detail) => {
-                    result.refused_python_lock_uuids.insert(dep.patch_uuid.clone());
+                    result
+                        .refused_python_lock_uuids
+                        .insert(dep.patch_uuid.clone());
                     result.warnings.push(RewriteWarning {
                         code: "redirect_poetry_lock_unsupported".into(),
                         detail: format!("{path}: {detail}"),
@@ -268,7 +276,11 @@ mod equivalence_tests {
                     let mut again = files.clone();
                     again.extend(got.files.clone());
                     let got = run(rewrite_poetry, &again, &deps);
-                    g.case(format!("{what}/re-run"), &(&again, &deps), &format!("{got:?}"));
+                    g.case(
+                        format!("{what}/re-run"),
+                        &(&again, &deps),
+                        &format!("{got:?}"),
+                    );
                 }
             }
         }
