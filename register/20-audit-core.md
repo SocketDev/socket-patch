@@ -1,5 +1,5 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-04T15:50Z · main @ 045d7ec_
+_Last updated 2026-10-04T21:49Z · main @ 045d7ec_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -28,8 +28,8 @@ _Last updated 2026-10-04T15:50Z · main @ 045d7ec_
 | C23 | 2 | Dead code: `PatchSources::mem_blobs` is never `Some`; `VendorSource` predicates are always true; group commit captures `redirect-state.json`, which nothing in its scope writes; the `switched_off("group_commit")` oracle path. | 7.4; 7.6 #3; 5.6 | #746 | filed #746; `Pypi`/`LauncherCache` channels are live (not dead) |
 | C24 | 2 | Apply and rollback are mirror images: the verify types are identical, and `fold_copy_result`, the pnpm peer fan-out and the sidecar boundary are each written twice; the folds have drifted and both drop per-file records (#756). Target: one engine. | 7.4; 7.6 #4 | #771, #772 | in PR #774; #772 is in PR #774, tracking #771 open |
 | C25 | 2 | `--download-mode diff`, the default, re-downloads every blob on a cold cache, runs sequentially with no retry, and is the only user of `qbsdiff`. Making `file` the default is a decision; removing the duplicate fetch work is a refactor. | 7.4; R10 | #792 | decision #792 |
-| C26 | 3 | `apply.lock` spends ~554 lines deleting the lock file on exit, and taking the lock replays the vendored group-commit journal, coupling vendored crash recovery to every command. | 7.4 | | to verify; checked on 045d7ec (553 prod lines; journal replay in `acquire`); deleting the lock file is user-visible, so the decision is due next run |
-| C27 | 3 | Agent-mode sidecars don't handle Maven files at all. Verify whether in-place Maven patches leave stale checksum files behind. | 7.4 | | to verify |
+| C26 | 3 | `apply.lock` spends ~554 lines deleting the lock file on exit, and taking the lock replays the vendored group-commit journal, coupling vendored crash recovery to every command. | 7.4 | #808 | decision #808; layering (replay + barrier out of the lock) is option-independent |
+| C27 | 3 | Agent-mode sidecars don't handle Maven files at all. Verify whether in-place Maven patches leave stale checksum files behind. | 7.4 | | rejected; Maven 3.9.11 ignores stale local `.jar.sha1` (built twice on 045d7ec); Gradle gap is #551 |
 | C28 | 3 | socket.yml builds a hand-made YAML tree on serde-saphyr's event parser to read 8 keys. Target: serde with `deny_unknown_fields`. | 7.5 | | to verify |
 | C29 | 3 | The `client.rs` split (2.8K lines) into client, vendor_service and credentials; the debug-ordering machinery (`HeldBack`) has 45 call sites. | 7.2; 7.6 #8 | | to verify |
 | C30 | 2 | No `socket-patch-test-support` crate: `binary()` is defined in 102 files and `git_sha256` in 84, there are 14 divergent `scrub_socket_env`, xorshift is implemented four times, and the VEX helpers are forked. | 6.4; 8.5 D | | to verify |
@@ -48,9 +48,10 @@ _Last updated 2026-10-04T15:50Z · main @ 045d7ec_
 | C43 | 2 | With `--manifest-path` into another project, `rollback`, `remove`, `repair`, `apply --check`, `vex`, `scan` and `get` read the vendored ledger from `--cwd` while `list`, `apply` and `vendor --check` use the manifest's project; `rollback` locks one `.socket/` and writes the other's ledger. | new finding | #745 | filed #745 |
 | C44 | 3 | The ecosystem-name parser is written three times: `--ecosystems`/`SOCKET_ECOSYSTEMS` need an exact, case-sensitive match, socket.yml `patches.ecosystems` trims and lowercases, and `vendor::ecosystem_in_scope` has its own lookup; `-e NPM` and `-e "npm, pypi"` exit 2. | new finding | #773 | filed #773 |
 | C45 | 3 | `--download-mode` is an unvalidated `String`, parsed late in `fetch_stage`/`repair`: a typo fails `apply`/`repair` with exit 1 and `apply_failed`/`repair_failed` (and `scan`/`get` only after saving the patch), while `apply --check`, `rollback`, `list` and `vendor` accept it; `--vendor-source` uses a clap parser (exit 2). | 2.7; R8 (narrowed) | #791 | filed #791 |
+| C46 | 3 | The group-commit journal is replayed only inside `apply_lock::acquire`: after a crash past the journal, lock-free `vendor --check` fails every patch with `vendor_ledger_missing` (remedy: restore `state.json` by hand) and pnpm `vex` omits the packages, while one locked command rolls forward to the clean result. | new finding | #809 | filed #809 |
 
 **Handed off** (to the CI janitor): report-only coverage and LTO `docker-base` off PRs; e2e from 148 to ~50 legs; a reusable compat workflow; no per-leg compiles; dead CI path filters (review 8.2, 8.5 B/C/E).
 
-**Rejected / not a defect:** C06. On `045d7ec`, the nested apply reads none of the fields `..GlobalArgs::default()` resets except `offline`, which `get`/`scan` refuse up front; the hosted opt-outs reach core through process env. The `get` ↔ `scan` cycle and the fake `ApplyArgs` stay in C12.
+**Rejected / not a defect:** C27. Agent mode writes no Maven sidecar, but Maven 3.9.11 doesn't verify the local repository's `.sha1` files: a jar patched in place under a stale `.jar.sha1` compiled and ran twice on `045d7ec`. C06. On `045d7ec`, the nested apply reads none of the fields `..GlobalArgs::default()` resets except `offline`, which `get`/`scan` refuse up front; the hosted opt-outs reach core through process env. The `get` ↔ `scan` cycle and the fake `ApplyArgs` stay in C12.
 
 **Already fixed:** none yet.
