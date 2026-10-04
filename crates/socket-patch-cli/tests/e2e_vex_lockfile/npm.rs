@@ -372,9 +372,9 @@ fn dual_lock_with_one_lock_missing_the_package_attests_nothing() {
         "name": "app", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
         "packages": { "": { "name": "app", "version": "1.0.0" } },
     });
-    for wired in [
-        hosted_url("patch.socket.dev", UUID),
-        format!("file:{}", vendored_rel(UUID)),
+    for (mode, wired) in [
+        ("hosted", hosted_url("patch.socket.dev", UUID)),
+        ("vendored", format!("file:{}", vendored_rel(UUID))),
     ] {
         for stale_file in ["package-lock.json", "npm-shrinkwrap.json"] {
             let tmp = tempfile::tempdir().unwrap();
@@ -383,7 +383,7 @@ fn dual_lock_with_one_lock_missing_the_package_attests_nothing() {
             std::fs::write(p.join(stale_file), stale.to_string()).unwrap();
             write_artifact(p, UUID, PATCHED);
             let out = run_vex(&binary(), p, &VexRun::online(&api));
-            assert_ne!(out.code, Some(0), "{stale_file} {wired}:\n{out}");
+            assert_ne!(out.code, Some(0), "{mode}, stale {stale_file}:\n{out}");
             assert_absent(out.doc.as_ref(), PURL);
             let text = out.stdout.clone() + &out.stderr;
             assert!(
