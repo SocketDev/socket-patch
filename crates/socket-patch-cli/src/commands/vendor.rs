@@ -364,6 +364,35 @@ pub(crate) fn ecosystem_in_scope(common: &GlobalArgs, eco: &str) -> bool {
 /// [`Envelope::record`], so it stays visible to JSON consumers but does NOT
 /// bump `summary.skipped`, which counts genuinely skipped packages.
 /// `Skipped` never flips the run status, so no status signal is lost.
+/// A dry run captures nothing, so it cannot see which files the wet run
+/// would rewrite: one `vendor_would_refuse_symlinked_file` advisory per
+/// symlinked wiring file of `purl`'s ecosystem, which the wet run's group
+/// commit refuses to rename over (`redirect_symlinked_file_unsupported`).
+/// Shared by `vendor --dry-run` and the `scan` / `get --mode vendored`
+/// dry-run preview.
+pub(crate) fn symlinked_wiring_warnings(cwd: &Path, purl: &str) -> Vec<VendorWarning> {
+    let Some(eco) = Ecosystem::from_purl(purl) else {
+        return Vec::new();
+    };
+    socket_patch_core::utils::group_commit::symlinked_paths(
+        cwd,
+        socket_patch_core::formats::registry::wiring_paths(eco.cli_name()),
+    )
+    .into_iter()
+    .map(|linked| {
+        VendorWarning::new(
+            "vendor_would_refuse_symlinked_file",
+            format!(
+                "{linked} is a symbolic link; a non-dry-run vendor refuses with \
+                 redirect_symlinked_file_unsupported if it must rewrite it (an atomic \
+                 rename would replace the link) — replace the link with a regular file, \
+                 or run socket-patch in the directory it points to"
+            ),
+        )
+    })
+    .collect()
+}
+
 pub(crate) fn record_warning(
     env: &mut Envelope,
     purl: &str,
@@ -2712,41 +2741,14 @@ pub(crate) async fn vendor_records_reusing(
                         dry_in_sync += 1;
                     }
                     let in_sync = event.error_code.as_deref() == Some("already_vendored");
-                    // A dry run captures nothing, so it cannot see which
-                    // files the wet run would rewrite; it names every
-                    // symlinked wiring file of the package's ecosystem,
-                    // which the wet run's commit refuses to rename over.
-                    let symlinked: Vec<String> = if common.dry_run && result.success && !in_sync {
-                        Ecosystem::from_purl(candidate)
-                            .map(|eco| {
-                                socket_patch_core::utils::group_commit::symlinked_paths(
-                                    &common.cwd,
-                                    socket_patch_core::formats::registry::wiring_paths(
-                                        eco.cli_name(),
-                                    ),
-                                )
-                            })
-                            .unwrap_or_default()
+                    let symlinked = if common.dry_run && result.success && !in_sync {
+                        symlinked_wiring_warnings(&common.cwd, candidate)
                     } else {
                         Vec::new()
                     };
                     env.record(event);
-                    for linked in symlinked {
-                        record_warning(
-                            env,
-                            candidate,
-                            &VendorWarning::new(
-                                "vendor_would_refuse_symlinked_file",
-                                format!(
-                                    "{linked} is a symbolic link; a non-dry-run vendor refuses \
-                                     with redirect_symlinked_file_unsupported if it must rewrite \
-                                     it (an atomic rename would replace the link) — replace the \
-                                     link with a regular file, or run socket-patch in the \
-                                     directory it points to"
-                                ),
-                            ),
-                            common,
-                        );
+                    for w in &symlinked {
+                        record_warning(env, candidate, w, common);
                     }
                     for w in &warnings {
                         // "vendored X from the patch service" on a package
