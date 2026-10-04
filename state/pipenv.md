@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-04 ~10Z, main `045d7ec` (CLI 4.0.0, unchanged). Filed #769 (vendored Pipenv can't re-vendor to a superseding patch: `pypi_pipenv_source_already_exists` on lock-only, a false `package_not_installed` with a venv; 2018 / 2022 / 2023 / 2026). Hosted re-pin to a superseding patch passes on 2026. PR #654 (#645 + #546) and PR #730 (#725) are still open.
+Last run: 2026-10-04 ~15:30Z, main `045d7ec` (CLI 4.0.0, unchanged). Filed #790: the Pipenv stale-install remedy (`… && pipenv sync`, `pipenv --rm && pipenv sync`) uninstalls a `develop` / named-category package instead of reinstalling it patched (2018 / 2022 / 2023 / 2026, hosted + vendored). Hosted supersede A → B passes on 2018 / 2022 / 2023 / 2026 across default / develop / `[docs]`, with byte-exact rollback / remove. PR #654 (#645 + #546) and PR #730 (#725) are still open.
 
 ## Coverage matrix
 
@@ -54,11 +54,14 @@ In-run VEX (`scan --vex`), `04:00Z` run, `045d7ec`: hosted with a stale OOT venv
 
 Superseding patch (uuid A → B), `~10Z` run, `045d7ec`: hosted re-pin + stale warning + remedy + vex on 2026.8.0 pass. Vendored re-vendor fails on 2018.11.26 / 2022.12.19 / 2023.12.1 / 2026.8.0, both lock-only and venv-present (#769); `--dry-run` previews `would_revendor`. The `vendor --revert` + re-scan workaround passes.
 
+Stale-install remedy followed verbatim, `15:30Z` run, `045d7ec`: `default` patched on 2018 / 2022 / 2023 / 2026 (pass). `develop` (2018–2026) and `[docs]` (2022–2026), hosted and vendored, both printed remedies leave the package uninstalled (fail #790). Hosted supersede A → B on 2018 (default / develop), 2022 (develop / docs), 2023 (default / docs) and 2026 (docs / develop): re-pin, stale warning and conservative vex all pass; rollback / remove after the supersede are byte-exact (pass); with a sibling requirements.txt both files re-pin (pass), and the rollback refusal is #410.
+
 macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-03 03:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
 
-00. Re-verify #769 once fixed (vendored re-vendor A → B: rewire in place, old uuid dir removed, revert byte-exact, no false `package_not_installed` with a venv). Still to do: hosted supersede on 2018 / 2022 / 2023, on `develop` / named categories, and with a sibling requirements.txt.
+000. Re-verify #790 once fixed: the remedy must name `--dev` / `--categories <name>` (and `install --deploy --dev` before 2018); also a package in both default and develop.
+00. Re-verify #769 once fixed (vendored re-vendor A → B: rewire in place, old uuid dir removed, revert byte-exact, no false `package_not_installed` with a venv). (Hosted supersede on 2018 / 2022 / 2023, develop / named categories and with a sibling requirements.txt: done 2026-10-04 15:30Z, pass.)
 0. Re-verify #645 once it's fixed (now including hosted in-run / standalone VEX, which gives a false `not_affected` on main and passes on `d8356ae`) (PR #654 `d8356ae` already passes the agent + hosted-warning repros on 2018 / 2022) (2018 / 2022 / 2023.10.24 with `PIPENV_VENV_IN_PROJECT=0`, `=false`, `PIPENV_NO_VENV_IN_PROJECT=1`; 2023.11.14+ must keep using WORKON). Also check its hosted shape: the stale warning and vex look at WORKON while Pipenv ≤ 2023.10 installs into `.venv`.
 1. #612 variants still open: `-r` includes in vendored mode. Re-verify once fixed. (Revert / rollback on the half-wired project pass.)
 2. Re-verify #546 once it's fixed: `.env` with `PIPENV_CUSTOM_VENV_NAME`, `WORKON_HOME`, `PIPENV_VENV_IN_PROJECT=0` + `.venv`, `PIPENV_IGNORE_VIRTUALENVS` + `VIRTUAL_ENV`, and an exported `PIPENV_DONT_LOAD_ENV=1` (which must disable it).
@@ -67,7 +70,7 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 5. **Maintainer request (global `-g` mode):** still to do: macOS / Windows, `-g` on 2018 / 11, and `--global-prefix` as a venv root (scans 0; undocumented). Checklist in the 20261001T040000Z entry.
 6. Re-verify #725 once fixed (incl. the uuid-drift shapes), and #744. Still to do: `pipenv install <other>` on 2023, and `vendor --vex` / `apply --vex` dry-run markers. (Mirror-named `pypi` source and hosted path-prefix on 11 / 2018 / 2022 done 2026-10-03 21:36Z, pass.)
 6b. Mixed sources (a mirror named `pypi` plus pypi.org under another name) with a transitive, index-less entry: hosted rollback restore.
-7. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546 / #645, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked until branch deletion through the git proxy works (still denied 2026-10-03 15:20Z).
+7. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546 / #645, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked until branch deletion through the git proxy works (still denied 2026-10-04 15:30Z).
 
 ## Known non-bugs
 
@@ -114,3 +117,4 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - `repair` after a relock leaves an unwired vendored entry unwired (success, 0 events): documented as artifact-only. `get --mode vendored` re-wires it. (Only `vendor --check` staying green is a bug, #725.)
 - A vendored in-run or standalone VEX attests from the committed artifact even when a warm venv still holds the upstream bytes; it only warns `vendored_tree_out_of_sync` (CLI_CONTRACT, vendored evidence row). The `pypi_pipenv_stale_install` event beside it gives the Pipenv remedy.
 - Correction: in the #645 shape (`.venv` + WORKON + `PIPENV_VENV_IN_PROJECT=0`, Pipenv ≤ 2023.10), hosted vex is NOT conservative. With the WORKON venv patched it attests a false `not_affected` (the 10-03 note was wrong). That's #645.
+- After a stale-install remedy has removed a package (#790 shape), `vex` attests `not_affected` from the lock wiring. The package is absent, so this isn't a false attestation of unpatched bytes.
