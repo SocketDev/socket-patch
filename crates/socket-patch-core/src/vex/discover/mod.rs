@@ -3077,8 +3077,10 @@ mod tests {
     /// Cross-package-manager union: one root carrying the committed hosted
     /// golden output of EVERY rewriter family at once (npm package-lock, pnpm,
     /// bun, yarn, cargo, go, uv, requirements, bundler, composer, maven,
-    /// nuget) plus hand-written vendored wiring in files none of those
-    /// fixtures own (`gems.locked` PATH section, a `Pipfile.lock` wheel)
+    /// nuget) plus hand-written vendored wiring in a file none of those
+    /// fixtures own (a `Pipfile.lock` wheel; bundler reads only ONE lock
+    /// pair, so a `gems.locked` beside the fixture's `Gemfile.lock` would be
+    /// an ignored twin, not a second source — #736)
     /// discovers exactly the UNION of what each file discovers alone — no
     /// extractor shadows, suppresses, or re-attributes another's refs, and
     /// no file's presence makes another file diagnose. This is the property
@@ -3100,13 +3102,6 @@ mod tests {
             "redirect/maven/pom/basic/expected",
             "redirect/nuget/packages-lock/basic/expected",
         ];
-        let gem_rel = format!(".socket/vendor/gem/{UUID_A}/rack-3.2.6");
-        let gems_locked = format!(
-            "PATH\n  remote: {gem_rel}\n  specs:\n    rack (3.2.6)\n\n\
-             GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
-             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= 3.2.6)!\n\n\
-             BUNDLED WITH\n   2.5.22\n"
-        );
         let wheel = format!(".socket/vendor/pypi/{UUID_B}/six-1.16.0-py2.py3-none-any.whl");
         let pipfile_lock = serde_json::json!({
             "_meta": { "pipfile-spec": 6, "hash": { "sha256": "x" }, "requires": {}, "sources": [] },
@@ -3116,10 +3111,7 @@ mod tests {
             "develop": {},
         })
         .to_string();
-        let vendored: [(&str, &str); 2] = [
-            ("gems.locked", gems_locked.as_str()),
-            ("Pipfile.lock", pipfile_lock.as_str()),
-        ];
+        let vendored: [(&str, &str); 1] = [("Pipfile.lock", pipfile_lock.as_str())];
 
         // Each source alone: must be non-empty and diagnostic-free, so the
         // union below is a meaningful sum rather than a sum of nothings.
@@ -3207,10 +3199,7 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        for (purl, uuid, rel) in [
-            ("pkg:gem/rack@3.2.6", UUID_A, gem_rel.as_str()),
-            ("pkg:pypi/six@1.16.0", UUID_B, wheel.as_str()),
-        ] {
+        for (purl, uuid, rel) in [("pkg:pypi/six@1.16.0", UUID_B, wheel.as_str())] {
             let r = out
                 .refs
                 .iter()

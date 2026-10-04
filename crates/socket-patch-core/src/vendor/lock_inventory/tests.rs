@@ -1460,6 +1460,168 @@ async fn gemfile_lock_legacy_multi_remote_section_is_discovery_only() {
     assert_eq!(rack.integrity, LockIntegrity::Sha256Hex("c".repeat(64)));
 }
 
+/// A one-gem `GEM` lock on `remote` locking `rack (version)`.
+fn rack_lock(remote: &str, version: &str) -> String {
+    format!(
+        "GEM\n  remote: {remote}\n  specs:\n    rack ({version})\n\n\
+         PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= {version})\n\n\
+         BUNDLED WITH\n   2.6.9\n"
+    )
+}
+
+fn gem_purls(entries: &[LockfileEntry]) -> Vec<String> {
+    let mut out: Vec<String> = entries
+        .iter()
+        .filter(|e| e.purl.starts_with("pkg:gem/"))
+        .map(|e| e.purl.clone())
+        .collect();
+    out.sort();
+    out
+}
+
+/// #736: bundler loads `gems.rb` + `gems.locked` when the root holds a
+/// `gems.rb` (and nothing configures `BUNDLE_GEMFILE`), so the inventory
+/// reads `gems.locked`. A leftover `Gemfile.lock` beside it is a lock
+/// bundler ignores and must not stand in for it.
+#[tokio::test]
+async fn gem_inventory_reads_the_lock_bundler_loads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "gems.rb",
+        "source \"https://rubygems.org\"\ngem \"rack\", \"2.2.8\"\n",
+    )
+    .await;
+    write(
+        root,
+        "gems.locked",
+        &rack_lock("https://rubygems.org/", "2.2.8"),
+    )
+    .await;
+    assert_eq!(
+        gem_purls(&inventory_project(root).await),
+        vec!["pkg:gem/rack@2.2.8"],
+        "a gems.rb project's gems.locked is inventoried"
+    );
+
+    // The stale twin from before the project moved to gems.rb.
+    write(
+        root,
+        "Gemfile.lock",
+        &rack_lock("https://rubygems.org/", "2.0.0"),
+    )
+    .await;
+    assert_eq!(
+        gem_purls(&inventory_project(root).await),
+        vec!["pkg:gem/rack@2.2.8"],
+        "the ignored Gemfile.lock is not read"
+    );
+    assert_eq!(
+        gem_purls(&inventory_project_every_lock(root).await),
+        vec!["pkg:gem/rack@2.2.8"],
+        "nor by the every-instance view"
+    );
+
+    // `bundle config set --local gemfile Gemfile` beside the gems.rb:
+    // bundler now loads Gemfile + Gemfile.lock.
+    write(
+        root,
+        "Gemfile",
+        "source \"https://rubygems.org\"\ngem \"rack\"\n",
+    )
+    .await;
+    tokio::fs::create_dir_all(root.join(".bundle"))
+        .await
+        .unwrap();
+    write(root, ".bundle/config", "---\nBUNDLE_GEMFILE: \"Gemfile\"\n").await;
+    assert_eq!(
+        gem_purls(&inventory_project(root).await),
+        vec!["pkg:gem/rack@2.0.0"],
+        "BUNDLE_GEMFILE in the app config selects Gemfile.lock"
+    );
+
+    // A BUNDLE_GEMFILE naming some other manifest: neither root lock is
+    // what bundler reads.
+    write(
+        root,
+        ".bundle/config",
+        "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n",
+    )
+    .await;
+    assert_eq!(
+        gem_purls(&inventory_project(root).await),
+        Vec::<String>::new()
+    );
+}
+
+/// #736: without a `gems.rb`, bundler loads `Gemfile` + `Gemfile.lock`; a
+/// stray `gems.locked` is not read.
+#[tokio::test]
+async fn gem_inventory_ignores_gems_locked_without_gems_rb() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "Gemfile.lock",
+        &rack_lock("https://rubygems.org/", "2.0.0"),
+    )
+    .await;
+    write(
+        root,
+        "gems.locked",
+        &rack_lock("https://rubygems.org/", "2.2.8"),
+    )
+    .await;
+    assert_eq!(
+        gem_purls(&inventory_project(root).await),
+        vec!["pkg:gem/rack@2.0.0"]
+    );
+}
+
+/// #736: the in-memory view (the hosted engine's) picks the same lock: a
+/// `gems.rb` selects `gems.locked`, and its own `.bundle/config` can
+/// select `Gemfile.lock` instead.
+#[tokio::test]
+async fn gem_inventory_memory_view_reads_the_lock_bundler_loads() {
+    let mut project = MemoryProject::new();
+    project.insert_text("gems.rb", "gem \"rack\"\n");
+    project.insert_text("gems.locked", rack_lock("https://rubygems.org/", "2.2.8"));
+    project.insert_text("Gemfile.lock", rack_lock("https://rubygems.org/", "2.0.0"));
+    let (entries, _) = inventory_project_diagnosed_in(&ProjectView::Memory(&project)).await;
+    assert_eq!(gem_purls(&entries), vec!["pkg:gem/rack@2.2.8"]);
+
+    project.insert_text("Gemfile", "gem \"rack\"\n");
+    project.insert_text(".bundle/config", "---\nBUNDLE_GEMFILE: \"Gemfile\"\n");
+    let (entries, _) = inventory_project_diagnosed_in(&ProjectView::Memory(&project)).await;
+    assert_eq!(gem_purls(&entries), vec!["pkg:gem/rack@2.0.0"]);
+}
+
+/// #736: ledger recovery's GEM remote set comes from the lock bundler
+/// loads too, never from an ignored twin's sources.
+#[tokio::test]
+async fn gem_remotes_reads_the_lock_bundler_loads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "gems.rb", "gem \"rack\"\n").await;
+    write(
+        root,
+        "gems.locked",
+        &rack_lock("https://gems.example.com/", "2.2.8"),
+    )
+    .await;
+    write(
+        root,
+        "Gemfile.lock",
+        &rack_lock("https://rubygems.org/", "2.0.0"),
+    )
+    .await;
+    assert_eq!(
+        gem_remotes(root).await,
+        vec!["https://gems.example.com".to_string()]
+    );
+}
+
 #[tokio::test]
 async fn inventories_script_and_pylock_files_without_installed_packages() {
     let tmp = tempfile::tempdir().unwrap();

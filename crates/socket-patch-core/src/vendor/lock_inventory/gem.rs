@@ -1,8 +1,10 @@
-//! `Gemfile.lock`: the registry view and the GEM remote set ledger recovery
-//! reads.
+//! The Bundler lock (`Gemfile.lock`, or `gems.locked` for a `gems.rb`
+//! project — whichever bundler loads): the registry view and the GEM remote
+//! set ledger recovery reads.
 
 use std::path::Path;
 
+use crate::crawlers::ruby_crawler::bundler_loaded_lock_in;
 pub(super) use crate::formats::gem::gem_download_url;
 use crate::formats::gem::GemfileLock;
 use crate::utils::fs::read_regular_to_string;
@@ -46,18 +48,22 @@ pub(super) async fn inventory_gemfile_lock_in(
 pub(super) async fn inventory_gemfile_lock_raw_in(
     view: &ProjectView<'_>,
 ) -> Option<Vec<LockfileEntry>> {
-    let text = view.read_text("Gemfile.lock").await.ok()?;
+    // Only the lock bundler loads: a twin it ignores (a leftover
+    // `Gemfile.lock` beside `gems.rb` + `gems.locked`) is not what installs.
+    let lock = bundler_loaded_lock_in(view).await?;
+    let text = view.read_text(lock).await.ok()?;
     // The shared lock model (lockfile discovery reads it too); what bundler
     // would refuse (`problems`) still inventories whatever parsed — this is
     // read-only discovery.
     GemfileLock::parse(&text).entries()
 }
 
-/// The DISTINCT `GEM remote:` bases across ALL GEM sections of the
-/// Gemfile.lock (trailing `/` trimmed), in first-appearance order. A
-/// vendored gem's spec block moved into its PATH section, so which GEM
-/// section it came from is unrecoverable — ledger recovery may only build
-/// a download URL when the lock's GEM sources agree on a single remote.
+/// The DISTINCT `GEM remote:` bases across ALL GEM sections of the lock
+/// bundler loads ([`bundler_loaded_lock_in`]; trailing `/` trimmed), in
+/// first-appearance order. A vendored gem's spec block moved into its PATH
+/// section, so which GEM section it came from is unrecoverable — ledger
+/// recovery may only build a download URL when the lock's GEM sources
+/// agree on a single remote.
 /// Collected scheme-AGNOSTICALLY: a non-http remote (a `file://` gem repo —
 /// bundler 4.0.15 locks one GEM section per `source "file://…" do` block)
 /// still counts toward the ambiguity decision; filtering it out first would
@@ -65,7 +71,10 @@ pub(super) async fn inventory_gemfile_lock_raw_in(
 /// file-sourced gem's name to the http one. The caller requires the single
 /// survivor to be http(s).
 pub(super) async fn gem_remotes(project_root: &Path) -> Vec<String> {
-    let Ok(text) = read_regular_to_string(&project_root.join("Gemfile.lock")).await else {
+    let Some(lock) = bundler_loaded_lock_in(&ProjectView::Disk(project_root)).await else {
+        return Vec::new();
+    };
+    let Ok(text) = read_regular_to_string(&project_root.join(lock)).await else {
         return Vec::new();
     };
     GemfileLock::parse(&text)
