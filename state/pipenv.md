@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-04 03:36Z, main `045d7ec` (CLI 4.0.0, unchanged). Filed #744 (hosted `scan --dry-run --vex --json` drops the `vex` dry_run marker). Commented on #645 (hosted VEX in the #645 shape attests a false `not_affected`; PR #654 fixes it) and on #725 (uuid-drift shapes). Passing: in-run hosted `--vex` with a stale OOT venv on 2018 / 2022 / 2026 (also with `--vex-no-verify`), and after the remedy; `--dry-run` writes nothing (all modes); vendored `remove`. PR #654 (`d8356ae`, #645 + #546) is still unmerged.
+Last run: 2026-10-04 ~10Z, main `045d7ec` (CLI 4.0.0, unchanged). Filed #769 (vendored Pipenv can't re-vendor to a superseding patch: `pypi_pipenv_source_already_exists` on lock-only, a false `package_not_installed` with a venv; 2018 / 2022 / 2023 / 2026). Hosted re-pin to a superseding patch passes on 2026. PR #654 (#645 + #546) and PR #730 (#725) are still open.
 
 ## Coverage matrix
 
@@ -52,10 +52,13 @@ Hosted `pipenv requirements --hash` sibling (2022 / 2026, `045d7ec`): hash mode 
 
 In-run VEX (`scan --vex`), `04:00Z` run, `045d7ec`: hosted with a stale OOT venv on 2018 / 2022 / 2026 omits the patch and exits 1 with `no_applicable_patches` (also with `--vex-no-verify`), and attests after the remedy (pass). Vendored in-run VEX over a warm unpatched venv attests with `vendored_tree_out_of_sync` (documented). Hosted `.venv` + WORKON + `PIPENV_VENV_IN_PROJECT=0` with WORKON patched (2018 / 2022): in-run and standalone vex give a false `not_affected` (fail #645; PR #654 fixes it). `--dry-run` hosted / vendored / agent scan and hosted / vendored get write nothing (pass); hosted JSON drops the vex dry_run marker (fail #744). Vendored `remove` gives a byte-exact lock (pass). `vendor --check` with the file ref pointing at another or missing uuid stays green (fail #725).
 
+Superseding patch (uuid A → B), `~10Z` run, `045d7ec`: hosted re-pin + stale warning + remedy + vex on 2026.8.0 pass. Vendored re-vendor fails on 2018.11.26 / 2022.12.19 / 2023.12.1 / 2026.8.0, both lock-only and venv-present (#769); `--dry-run` previews `would_revendor`. The `vendor --revert` + re-scan workaround passes.
+
 macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-03 03:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
 
+00. Re-verify #769 once fixed (vendored re-vendor A → B: rewire in place, old uuid dir removed, revert byte-exact, no false `package_not_installed` with a venv). Still to do: hosted supersede on 2018 / 2022 / 2023, on `develop` / named categories, and with a sibling requirements.txt.
 0. Re-verify #645 once it's fixed (now including hosted in-run / standalone VEX, which gives a false `not_affected` on main and passes on `d8356ae`) (PR #654 `d8356ae` already passes the agent + hosted-warning repros on 2018 / 2022) (2018 / 2022 / 2023.10.24 with `PIPENV_VENV_IN_PROJECT=0`, `=false`, `PIPENV_NO_VENV_IN_PROJECT=1`; 2023.11.14+ must keep using WORKON). Also check its hosted shape: the stale warning and vex look at WORKON while Pipenv ≤ 2023.10 installs into `.venv`.
 1. #612 variants still open: `-r` includes in vendored mode. Re-verify once fixed. (Revert / rollback on the half-wired project pass.)
 2. Re-verify #546 once it's fixed: `.env` with `PIPENV_CUSTOM_VENV_NAME`, `WORKON_HOME`, `PIPENV_VENV_IN_PROJECT=0` + `.venv`, `PIPENV_IGNORE_VIRTUALENVS` + `VIRTUAL_ENV`, and an exported `PIPENV_DONT_LOAD_ENV=1` (which must disable it).
