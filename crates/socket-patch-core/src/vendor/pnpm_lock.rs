@@ -63,7 +63,7 @@ use crate::utils::fs::{
 };
 use crate::utils::socket_dir::remove_tree_and_prune;
 
-use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
+use super::common::{already_patched_result, done, parse_json_manifest, refused, JsonLayout};
 use super::npm_common::{
     done_failure_unstage, gate_packages, guard_coordinates, guard_revert_uuid_dir, refusal_code,
     stage_patch_pack, tgz_rel_leaf,
@@ -323,8 +323,9 @@ pub(super) async fn vendor_pnpm_dialect(
 
     // ── 6. Commit: package.json + pnpm-workspace.yaml FIRST, lock second,
     //    unwind the override surfaces on a lock failure (P3 desync safety).
-    let pkg_indent = detect_indent(&String::from_utf8_lossy(&pkg_bytes));
-    let new_pkg_bytes = match serialize_json(&pkg, &pkg_indent) {
+    // Re-render package.json in its own layout (BOM, indent, line ending,
+    // trailer) so a Windows / autocrlf manifest diffs only in the override.
+    let new_pkg_bytes = match JsonLayout::of(&String::from_utf8_lossy(&pkg_bytes)).render(&pkg) {
         Ok(bytes) => bytes,
         Err(e) => {
             return done_failure_unstage(
@@ -480,7 +481,7 @@ async fn read_project(
             )));
         }
     };
-    let pkg: Value = match serde_json::from_slice(&pkg_bytes) {
+    let pkg: Value = match parse_json_manifest(&pkg_bytes) {
         Ok(Value::Object(map)) => Value::Object(map),
         Ok(_) | Err(_) => {
             return Err(Box::new(refused(
@@ -845,13 +846,13 @@ pub(super) async fn revert_pnpm_dialect(
             Err(e) => return RevertOutcome::failed(format!("cannot read {PNPM_LOCK}: {e}")),
         }
     }
-    let mut pkg_state: Option<(Value, String)> = None; // (doc, indent)
+    let mut pkg_state: Option<(Value, JsonLayout)> = None;
     if touches_pkg {
         match read_regular_to_bytes(&project_root.join(PACKAGE_JSON)).await {
-            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(bytes) => match parse_json_manifest(&bytes) {
                 Ok(doc) if doc.is_object() => {
-                    let indent = detect_indent(&String::from_utf8_lossy(&bytes));
-                    pkg_state = Some((doc, indent));
+                    let layout = JsonLayout::of(&String::from_utf8_lossy(&bytes));
+                    pkg_state = Some((doc, layout));
                 }
                 // Fail-closed: editing a manifest we cannot parse risks
                 // destroying it; the user must repair it first.
@@ -944,8 +945,8 @@ pub(super) async fn revert_pnpm_dialect(
         }
     }
     if pkg_dirty {
-        if let Some((doc, indent)) = &pkg_state {
-            let bytes = match serialize_json(doc, indent) {
+        if let Some((doc, layout)) = &pkg_state {
+            let bytes = match layout.render(doc) {
                 Ok(b) => b,
                 Err(e) => {
                     return RevertOutcome::failed(format!("cannot serialize {PACKAGE_JSON}: {e}"))
