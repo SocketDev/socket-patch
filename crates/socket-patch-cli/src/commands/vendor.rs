@@ -255,8 +255,9 @@ pub(crate) async fn dispatch_revert_one_opts(
 
 /// Is this vendored entry still consumed by its project's lockfile
 /// dependency graph? `None` = cannot determine — callers must keep the
-/// entry (fail-safe): ecosystems other than npm and cargo have no in-use
-/// probe yet, and a missing/unreadable lockfile proves nothing.
+/// entry (fail-safe): ecosystems other than npm, cargo and pypi (whose
+/// probe covers the requirements flavor only) have no in-use probe yet,
+/// and a missing/unreadable lockfile proves nothing.
 pub(crate) async fn dispatch_in_use_one(
     entry: &VendorEntry,
     project_root: &Path,
@@ -267,6 +268,7 @@ pub(crate) async fn dispatch_in_use_one(
         // at this entry's copy = in use; a registry source (crates.io
         // re-resolve or a hosted takeover) or a missing entry = reclaimable.
         "cargo" => vendor::cargo::vendored_entry_in_use(entry, project_root).await,
+        "pypi" => vendor::pypi::vendored_entry_in_use(entry, project_root).await,
         _ => None,
     }
 }
@@ -5369,7 +5371,8 @@ mod revert_dispatch_tests {
     }
 
     /// [`dispatch_in_use_one`]'s fail-safe arm: every ecosystem without an
-    /// in-use probe (everything but npm/cargo) reports `None` — "cannot
+    /// in-use probe (everything but npm/cargo), and a pypi entry of a flavor
+    /// without one (here the pre-flavor `None`), reports `None` — "cannot
     /// determine" — which all callers must treat as KEEP.
     #[tokio::test]
     async fn in_use_probe_is_none_for_unprobed_ecosystems() {
