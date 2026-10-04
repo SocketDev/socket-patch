@@ -2290,6 +2290,21 @@ mod tests {
     #[tokio::test]
     async fn pipenv_stale_install_remedy_names_the_develop_category() {
         let fx = e2e_fixture().await;
+        // The venv probe reads `.venv\Lib\site-packages` on Windows, so mirror
+        // the fixture's POSIX-layout install there.
+        if cfg!(windows) {
+            let sp = fx.root.join(".venv").join("Lib").join("site-packages");
+            let di = sp.join("six-1.16.0.dist-info");
+            std::fs::create_dir_all(&di).unwrap();
+            std::fs::copy(fx.site_packages.join("six.py"), sp.join("six.py")).unwrap();
+            for leaf in ["METADATA", "WHEEL", "RECORD"] {
+                std::fs::copy(
+                    fx.site_packages.join("six-1.16.0.dist-info").join(leaf),
+                    di.join(leaf),
+                )
+                .unwrap();
+            }
+        }
         let lock: serde_json::Value = serde_json::from_str(
             r#"{"_meta": {"pipfile-spec": 6}, "default": {}, "develop": {"six": {"version": "==1.16.0"}}}"#,
         )
