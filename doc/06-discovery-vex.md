@@ -2,7 +2,7 @@
 
 ## Part 6: Discovery, inventory and VEX
 
-_Last checked against main @ 045d7ec on 2026-10-04 by audit-ecosystems (gem lock selection re-checked). Owner: `audit-ecosystems`._
+_Last checked against main @ 045d7ec on 2026-10-04 by audit-ecosystems (gem lock selection and the go.mod row re-checked). Owner: `audit-ecosystems`._
 
 > Scope: `vex/**` (incl. `vex/discover/*`), `crawlers/**`, `formats/**`, `vendor/lock_inventory/*`, and the CLI consumers `vex.rs`, `vex_sources.rs`, `vex_consumed.rs`, `scan/discovery.rs`, `context.rs`, `list.rs`, `ecosystem_dispatch.rs`.
 
@@ -68,7 +68,7 @@ From that model:
 | package-lock | `lock_inventory::npm_lock_nodes` | vendored `scan_lock_matches`, hosted `mod.rs:837`, upstream `npm_lock_hits` |
 | Pipfile.lock | `lock_inventory::pypi::pipfile_lock_entries` | vendored `pypi_pipenv.rs` (×3), hosted `redirect/pipenv.rs:98`; the crawler re-implements Pipenv venv hashing |
 | Cargo.toml | — | hand-rolled **twice** (`cargo_crawler.rs:21`, `vex/product.rs:167/380`) despite `toml_edit` |
-| go.mod | `go_mod_edit` | `module` directive parsed again at `go_crawler.rs:63` and `product.rs:175` |
+| go.mod | `go_mod_edit` | `module` directive parsed again at `product.rs:175` and in `go_crawler.rs:63` (no production caller); both misread the block form `module ( … )` {{E19}} |
 | NuGet | `formats::nuget::parse_open_tag` | vendored has its own XML scanner. The crawler reads `obj/project.assets.json` **only for `packageFolders`**, never `libraries`/`targets`, then enumerates the global `~/.nuget/packages` |
 | Maven | `formats::maven::parse_pom` | vendored `jvm/maven_reactor.rs` `Doc::parse` and `gradle.rs`; hosted's own tag scanner; the crawler's own XML parser; `product.rs` again |
 

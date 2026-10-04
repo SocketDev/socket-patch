@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ 045d7ec on 2026-10-04 by audit-ecosystems (5.4 Python, Cargo and Maven XML). Owner: audit-ecosystems._
+_Last checked against main @ 045d7ec on 2026-10-04 by audit-ecosystems (5.4 Python, Cargo, Maven XML, Gem and Go). Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -141,9 +141,10 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
   - They have drifted, proven by execution: a BOM manifest is invisible to the crawler but read by VEX and `cargo_tag`; `[project]` and dotted keys are read only by `cargo_tag`; `[package] junk` (invalid TOML) is accepted only by the crawler. {{E15}}
   - Hosted mode plans the dependency pin itself with a line scanner (`plan_cargo_toml`, six regexes), then re-checks it with a second, `toml_edit` classifier (`validate_cargo_toml_pins`). `CargoRegistryPins`, a `#[cfg(test)]` oracle and upstream restore's `unpin_line` are three more line-level readers of the same declarations. Vendored edits only through `toml_edit`. The scanner refuses an inline table whose `features` array spans lines, which is valid TOML and accepted by cargo, so hosted skips a crate that vendors fine. {{E57}}
 
-**Gem:** `vendor/gem.rs` imports three token helpers from `formats::gem` and keeps its own section model. `formats/gem` itself has two section models, and there are two DEPENDENCIES-name parsers with different rules.
+**Gem:** `vendor/gem.rs` imports three token helpers from `formats::gem` and keeps its own section model (`section_span` / `section_end`, which take the *first* line equal to a header). With `formats::gem::parse` and hosted's `GemLockSection` that makes three section models and three DEPENDENCIES-name parsers; the name rules agree on Bundler-written entries. {{E19}}
+  - The section models have drifted, proven by execution: Bundler 2 writes one `GEM` section per source, and vendored `edit_lock` looks only in the first, so a gem from any later source (rubygems.org, when a private source sorts first) is refused with "GEM specs has no entry", while hosted and the shared parser handle it. {{E59}}
 
-**Go:** `go_mod_edit.rs` is properly shared (9 users) but lives under `vendor/`. `crawlers/go_crawler.rs:63` still has its own `parse_go_mod_module`.
+**Go:** `go_mod_edit.rs` is properly shared (9 users) but lives under `vendor/`. `crawlers/go_crawler.rs:63` still has its own `parse_go_mod_module`, which has no production caller; the live `module` reader is `vex/product.rs`'s own, and both misread Go's block form `module ( … )` as the module `(`. {{E19}}
 
 **Small helpers:**
 - **CRLF:** four policies for the same "`toml_edit` emits LF" problem:
@@ -249,6 +250,8 @@ Old `kind`s are translated into `SpliceRecord`s when the ledger loads, so legacy
 
 ### New findings since the review
 
+- {{E59}}: vendored gem `edit_lock` searches only the first `GEM` section of `Gemfile.lock`. Bundler 2 writes one per source, so in a project with a private source that sorts first, every rubygems.org gem is refused with "GEM specs has no entry"; see 5.4.
+- {{E58}}: production `pub fn`s with no production caller, orphaned by #277: `VendorEntry::committed_artifact_intact` and `go_sum_edit::remove_lines` (no reference at all), plus test-only helpers compiled into production (`cargo_tag::copy_manifest_tag`, `jvm::apply::read_project_file`). The hosted-vlt half is in Part 3.
 - {{E55}}: vendored Maven decides "is this a reactor?" twice. `jvm::detect` uses the reactor's `Doc`-based `declares_modules`, which ignores plugin `<configuration><modules>`, then the legacy single-pom path re-checks with its own comment-stripping `declares_modules` and refuses `vendor_maven_multimodule_unsupported`. That refusal fires only on the disagreement, so every `maven-ear-plugin` project is refused; see 5.4.
 - {{E54}}: the Poetry and PDM lock rewriters restore line endings with different rules, so a mixed-line-ending lock's edited unit becomes CRLF under Poetry and LF under PDM; see 5.4.
 - {{E49}}: hosted Pipenv used to reject its own pins on path-prefixed `--patch-server-url` origins and sdists. Both private grammars (`owned_url`'s segment count, `is_socket_hosted_reference`) are deleted; Pipenv now uses `hosted_pypi_reference` (#572); see 5.4.
