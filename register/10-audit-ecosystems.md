@@ -1,5 +1,5 @@
 ### Ecosystems and formats (`audit-ecosystems`)
-_Last updated 2026-10-04T01:10Z · main @ 045d7ec_
+_Last updated 2026-10-04T07:05Z · main @ 045d7ec_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -17,7 +17,7 @@ _Last updated 2026-10-04T01:10Z · main @ 045d7ec_
 | E12 | 2 | pnpm v9 and legacy 5.4/6.0 are near-copies (`revert_*_opts`, `vendor_pnpm*`, `read_project`, `edit_overrides`, `dep_field_lines`, the KIND constant), and v9 has two lookup paths (a linear scan and `LockIndex`). | 4.4; 4.5 #4; 4.7 B/G | #583 | fixed (#583) |
 | E13 | 2 | `utils/poetry_lock.rs` ≈ `utils/pdm_lock.rs`: the `*_lock_edits` functions are identical, and the `pair_*` functions differ by one shape check (unreachable for Poetry; see #694). | 5.4 | #694 | in PR #703 |
 | E14 | 2 | Pipfile.lock is written two ways: vendored mode re-serializes it, while hosted mode splices spans. | 5.4 | | to verify; present on 045d7ec, no drift proven (pipenv writes canonical JSON), not filed yet |
-| E15 | 2 | Cargo.toml `[package]` is read five ways: line scanners in `cargo_crawler.rs` and `vex/product.rs`, plus three ad hoc `toml_edit` lookups (`cargo_tag`, which also accepts `[project]`; `path_crate_version`; `declared_cargo_minor`). They have drifted on BOM, `[project]` and dotted keys. `plan_cargo_toml` uses a regex scanner and `toml_edit` in one rewriter. | 5.4; 3.7 #3 | #693 | filed #693; `[package]` readers. The hosted `plan_cargo_toml` regex scanner is not filed yet |
+| E15 | 2 | Cargo.toml `[package]` is read five ways: line scanners in `cargo_crawler.rs` and `vex/product.rs`, plus three ad hoc `toml_edit` lookups (`cargo_tag`, which also accepts `[project]`; `path_crate_version`; `declared_cargo_minor`). They have drifted on BOM, `[project]` and dotted keys. `plan_cargo_toml` uses a regex scanner and `toml_edit` in one rewriter. | 5.4; 3.7 #3 | #693, #757 | filed #693, #757; `[package]` readers (#693), hosted `plan_cargo_toml` scanner (#757) |
 | E16 | 2 | CRLF has five policies in the npm family and three for `toml_edit` output, and `common::detect_eol` contradicts `LineEndings::Mixed`. Target: one line-ending policy. | 4.4; 5.4; 7.3 | | to verify |
 | E17 | 2 | "Is a bun lock present" is asked at seven sites with three semantics (lstat, `exists`, `is_file`). With a dangling `bun.lock` symlink, Bun and the writers use `bun.lockb`, but the inventory returns nothing. | 4.4 | #735 | filed #735 |
 | E18 | 3 | JS helper copies: JSON-pointer escape ×2, wiring lines↔JSON ×3, `name@spec` split ×2, `KIND_*` re-spelled as literals, uneven recursion bounds, and regexes compiled inside per-dependency loops. | 4.4 | | to verify |
@@ -58,7 +58,8 @@ _Last updated 2026-10-04T01:10Z · main @ 045d7ec_
 | E53 | 2 | Vendored pnpm writes the root `package.json` with `serialize_json` (LF, no BOM) instead of `JsonLayout`: a CRLF file stays LF after `vendor --revert`; a BOM file is refused as "not a JSON object". npm and berry keep the layout. | new finding | #662 | filed #662 |
 | E54 | 3 | Poetry and PDM lock rewriters restore line endings with two rules (Poetry: any CRLF → all CRLF; PDM: `preserve_line_endings`, CRLF-only), so a mixed-EOL lock's edited unit flips to CRLF in one and LF in the other. | new finding | #695 | in PR #703 |
 | E55 | 2 | Vendored Maven has two `declares_modules`: `jvm::detect` (reactor `Doc`, ignores plugin `<configuration><modules>`) routes an EAR pom to the legacy path, whose comment-stripping copy then refuses it as `vendor_maven_multimodule_unsupported`. The legacy refusal fires only on that disagreement. | new finding | #716 | filed #716 |
-| E56 | 2 | Lock inventory reads only `Gemfile.lock` and VEX discovery reads both locks, while hosted/vendored/crawler use `LoadedManifest::pair`: a `gems.rb` project's `gems.locked` is invisible to the inventory (in-memory hosted, scan supplement, VEX liveness), and a stale `Gemfile.lock` twin is read instead. | new finding | #736 | filed #736 |
+| E56 | 2 | Lock inventory reads only `Gemfile.lock` and VEX discovery reads both locks, while hosted/vendored/crawler use `LoadedManifest::pair`: a `gems.rb` project's `gems.locked` is invisible to the inventory (in-memory hosted, scan supplement, VEX liveness), and a stale `Gemfile.lock` twin is read instead. | new finding | #736 | in PR #750 |
+| E57 | 2 | Hosted `plan_cargo_toml` is a line scanner gated by a second `toml_edit` classifier (`validate_cargo_toml_pins`), beside three more line-level readers (`CargoRegistryPins`, a test oracle, restore's `unpin_line`). It refuses a valid inline table whose `features` array spans lines, so hosted skips a crate that vendors fine. | new finding | #757 | filed #757 |
 
 **Handed off:** none yet.
 

@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ 045d7ec on 2026-10-03 by audit-ecosystems (5.4 Python, Cargo and Maven XML). Owner: audit-ecosystems._
+_Last checked against main @ 045d7ec on 2026-10-04 by audit-ecosystems (5.4 Python, Cargo and Maven XML). Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -139,6 +139,7 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
 **Cargo:**
 - `Cargo.toml` `[package]` is read in five places. Two are line scanners: [`crawlers/cargo_crawler.rs#L12-L113`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/crawlers/cargo_crawler.rs#L12-L113) ("no TOML crate dependency") and `vex/product.rs` `scan_toml_section`. Three are ad hoc `toml_edit` lookups: `cargo_tag::version_literal` (`[package]` or legacy `[project]`; it now finds the literal's span through `toml_edit` and splices only those bytes), `cargo.rs` `path_crate_version` (`[package]` only) and `declared_cargo_minor` (#651).
   - They have drifted, proven by execution: a BOM manifest is invisible to the crawler but read by VEX and `cargo_tag`; `[project]` and dotted keys are read only by `cargo_tag`; `[package] junk` (invalid TOML) is accepted only by the crawler. {{E15}}
+  - Hosted mode plans the dependency pin itself with a line scanner (`plan_cargo_toml`, six regexes), then re-checks it with a second, `toml_edit` classifier (`validate_cargo_toml_pins`). `CargoRegistryPins`, a `#[cfg(test)]` oracle and upstream restore's `unpin_line` are three more line-level readers of the same declarations. Vendored edits only through `toml_edit`. The scanner refuses an inline table whose `features` array spans lines, which is valid TOML and accepted by cargo, so hosted skips a crate that vendors fine. {{E57}}
 
 **Gem:** `vendor/gem.rs` imports three token helpers from `formats::gem` and keeps its own section model. `formats/gem` itself has two section models, and there are two DEPENDENCIES-name parsers with different rules.
 
