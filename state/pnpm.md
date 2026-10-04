@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-04 (run 15), main `045d7ec`, latest release 4.0.0.
+Last updated: 2026-10-04 (run 16), main `045d7ec`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, package grant, hosted tarball, `/registry/<name>/<ver>` mirror). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -141,6 +141,19 @@ Run 15 additions (main `045d7ec`, Linux):
 
 #734 isn't a regression: release 4.0.0 writes the same scaffold.
 
+Run 16 additions (main `045d7ec`, Linux):
+
+| pnpm (lock) | Vendored: project path with ` #` / `: ` (spaces, unicode, `'`, `[]` pass) | Agent: peer-variant twin unpatched → apply / rollback report | Takeover hosted → vendored → hosted, 2 pkgs | Vendored `remove` 1 of 2 → last | Hosted: two versions of one pkg (pin, remove one, rollback) | Hosted: lock metadata (`hasBin`/`os`/`optional`/`requiresBuild`) + transitive pins | Hosted: user overrides / resolutions | Hosted: CRLF lock |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 7.33.7 (5.4) | fail #754 | untested | untested | pass | untested | untested | untested | untested |
+| 8.15.9 (6.0) | fail #754 | untested | pass (#636 residue) | pass | pass | pass | pass / pass | pass |
+| 9.15.9 | n/a (relative specifiers) | untested | pass (#636 residue) | pass (run 15) | pass | pass | pass / pass | pass |
+| 10.34.5 | n/a | untested | pass (#636 residue) | untested | untested | pass | pass / pass / ws block+flow pass | untested |
+| 11.28.3 | n/a | untested | untested | untested | untested | pass | ws block+flow pass | untested |
+| 12.8.1 | n/a | fail #756 (both) | pass (#636 residue) | pass (run 15) | pass | pass | ws block+flow pass | pass |
+
+#754 and #756 aren't regressions: release 4.0.0 behaves the same.
+
 Default isolated linker + alias: pass on 7.33.7 / 9.15.9 / 10.34.5 / 11.28.3 / 12.8.1 (one shared `.pnpm` copy).
 
 #492 also reproduces on pnpm 7.33.7 (there's no root lock at all, only `redirect_pnpm_no_lockfile`).
@@ -163,15 +176,16 @@ Global mode (`-g`, v5 main `2463257`):
 ## Backlog
 
 0. **Maintainer request (global `-g` mode):** the Linux cells are done. Still to do: macOS and Windows (corepack, standalone and npm-installed pnpm; `PNPM_HOME` with spaces or unicode; Windows `%LOCALAPPDATA%\pnpm`), and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry. Needs a probe branch.
-1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3 and 10, and was denied by the permission policy in runs 2, 5–9 and 11–14, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
-2. #696 / #661 follow-ups: `modulesDir` in the global `config.yaml` / `rc`, and `modulesDir` + `virtualStoreDir` together. When fixed, check that GVS and out-of-project `virtualStoreDir` transitive deps also stop attesting.
-3. #636 follow-ups: a hosted → vendored takeover with several packages, then revert, and a user-created `pnpm` table with several vendored packages.
-4. Vendored `remove` on legacy 5.4 / 6.0 locks; workspace-sensitive pnpm commands under the #734 scaffold on 9.x (`pnpm link`, `publish`, `-r`). Hosted remove on legacy and two-doc locks passed in run 15.
-5. #362 GVS transitive and #435 global `-g`: re-check exit codes under #555's skip semantics on 11.28.3 / 12.8.1.
-6. `package-import-method=clone` on reflink (needs CI).
-7. #556 follow-ups: merging branch lockfiles after a hosted pin, and agent `vex` on the branch.
-8. Re-verify #360, #362, #435, #466, #492, #556, #557, #590 (PR #598), #601 (PR #605), #626 (PR #634), #633, #636, #661 / #696 (PR #698), #713, #714 and #734 when fixes land.
-9. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout).
+1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3, 10 and 16, and was denied by the permission policy in runs 2, 5–9, 11–14 and 16, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
+2. #754 follow-ups: a Windows `C:/…/My Project #2` checkout, and the moved-checkout heal path once the specifier is quoted. Needs a probe.
+3. #696 / #661 follow-ups: `modulesDir` in the global `config.yaml` / `rc`, and `modulesDir` + `virtualStoreDir` together. When fixed, check that GVS and out-of-project `virtualStoreDir` transitive deps also stop attesting.
+4. Workspace-sensitive pnpm commands under the #734 scaffold on 9.x (`pnpm link`, `publish`, `-r`).
+5. #756 variants: peer-variant twins under node-linker=hoisted, in global mode, and on 9.15.9 / 10.34.5.
+6. #362 GVS transitive and #435 global `-g`: re-check exit codes under #555's skip semantics on 11.28.3 / 12.8.1.
+7. `package-import-method=clone` on reflink (needs CI).
+8. #556 follow-ups: merging branch lockfiles after a hosted pin, and agent `vex` on the branch.
+9. Re-verify #360, #362, #435, #466, #492, #556, #557, #590 (PR #598), #601 (PR #605), #626 (PR #634), #633, #636 (PR #672; include the takeover path from the run 16 comment), #661 / #696 (PR #698), #713, #714, #734, #754 and #756 when fixes land.
+10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout; hosted CRLF passes on Linux).
 
 ## Known non-bugs
 
@@ -214,3 +228,6 @@ Global mode (`-g`, v5 main `2463257`):
 - `pnpm dedupe` re-resolves and drops hosted pins on every pnpm version (like `pnpm update`). pnpm 11.0.0 / 11.28.3 `pnpm add <other>` also drops them (9 / 10 / 12 keep them). That's upstream pnpm 11 re-resolution, tracked with #713.
 - `repair` in the default diff mode needs `/v0/orgs/<org>/patches/diff/<uuid>` archives. A mock without them gives `download_failed`; use `--download-mode file` with a blob route.
 - pnpm 11 / 12 `pnpm fetch` with only `pnpm-lock.yaml` copied (no `pnpm-workspace.yaml`) fails loudly with `ERR_PNPM_TARBALL_URL_MISMATCH`. Commit and copy the trust config, as documented.
+- Hosted standalone `vex` attests an optional dependency that isn't installed on this OS (for example `fsevents` on Linux) from its lock pin. That's the documented manifest-less attestation ("nothing installed → attests from the pin").
+- pnpm 11 / 12 fail `ERR_PNPM_IGNORED_BUILDS` for `esbuild` even on the first install, unless builds are allowed. That's upstream; the patched bytes still land.
+- `pnpm update <pkg>` drops the hosted pins of every package it re-resolves (pnpm 12 also re-resolves the package's dependents), like `pnpm update`.
