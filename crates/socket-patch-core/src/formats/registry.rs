@@ -196,6 +196,22 @@ pub fn hosted_file_ecosystem(rel: &str) -> Option<&'static str> {
         .map(|f| f.ecosystem)
 }
 
+/// The project-relative paths of `ecosystem` that a hosted or vendored run
+/// may rewrite (plus pnpm's workspace file, which vendored pnpm writes):
+/// the files a vendored dry run checks for symbolic links, since the wet
+/// run's commit refuses to rename over one.
+pub fn wiring_paths(ecosystem: &str) -> Vec<&'static str> {
+    REGISTRY
+        .iter()
+        .filter(|f| {
+            f.ecosystem == ecosystem
+                && f.has(HOSTED | VENDORED | PNPM_MARKER)
+                && !f.has(PRESENCE_ONLY)
+        })
+        .map(|f| f.path)
+        .collect()
+}
+
 /// The [`ROOT`] row a basename names.
 pub fn root_marker(base: &str) -> Option<&'static FormatFile> {
     REGISTRY.iter().find(|f| f.has(ROOT) && f.path == base)
@@ -215,6 +231,26 @@ mod tests {
         for f in REGISTRY.iter().filter(|f| f.has(ROOT)) {
             assert!(!f.path.contains('/'), "{}: a root marker is a basename", f.path);
         }
+    }
+
+    #[test]
+    fn wiring_paths_name_every_rewritable_file_of_the_ecosystem() {
+        let npm = wiring_paths("npm");
+        for p in [
+            "package-lock.json",
+            "yarn.lock",
+            "package.json",
+            "pnpm-workspace.yaml",
+        ] {
+            assert!(npm.contains(&p), "{p}");
+        }
+        let nuget = wiring_paths("nuget");
+        assert!(nuget.contains(&"nuget.config") && nuget.contains(&"packages.lock.json"));
+        assert!(
+            !wiring_paths("maven").contains(&"build.gradle"),
+            "presence only"
+        );
+        assert!(!npm.contains(&"uv.lock"));
     }
 
     #[test]

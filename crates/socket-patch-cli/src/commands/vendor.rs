@@ -2712,7 +2712,42 @@ pub(crate) async fn vendor_records_reusing(
                         dry_in_sync += 1;
                     }
                     let in_sync = event.error_code.as_deref() == Some("already_vendored");
+                    // A dry run captures nothing, so it cannot see which
+                    // files the wet run would rewrite; it names every
+                    // symlinked wiring file of the package's ecosystem,
+                    // which the wet run's commit refuses to rename over.
+                    let symlinked: Vec<String> = if common.dry_run && result.success && !in_sync {
+                        Ecosystem::from_purl(candidate)
+                            .map(|eco| {
+                                socket_patch_core::utils::group_commit::symlinked_paths(
+                                    &common.cwd,
+                                    socket_patch_core::formats::registry::wiring_paths(
+                                        eco.cli_name(),
+                                    ),
+                                )
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     env.record(event);
+                    for linked in symlinked {
+                        record_warning(
+                            env,
+                            candidate,
+                            &VendorWarning::new(
+                                "vendor_would_refuse_symlinked_file",
+                                format!(
+                                    "{linked} is a symbolic link; a non-dry-run vendor refuses \
+                                     with redirect_symlinked_file_unsupported if it must rewrite \
+                                     it (an atomic rename would replace the link) — replace the \
+                                     link with a regular file, or run socket-patch in the \
+                                     directory it points to"
+                                ),
+                            ),
+                            common,
+                        );
+                    }
                     for w in &warnings {
                         // "vendored X from the patch service" on a package
                         // this run left untouched would contradict the
@@ -2807,6 +2842,18 @@ pub(crate) async fn vendor_records_reusing(
                 for stale in stale_artifacts {
                     sweep_stale_artifact(common, env, &state, stale).await;
                 }
+            }
+            Err(e) if socket_patch_core::utils::group_commit::symlinked_target(&e).is_some() => {
+                // Refused before anything was written: the hosted refusal,
+                // same code and wording.
+                has_errors = true;
+                let linked = socket_patch_core::utils::group_commit::symlinked_target(&e)
+                    .unwrap_or_default();
+                let refusal = socket_patch_core::hosted::engine::symlink_refusal(linked);
+                if !common.json {
+                    eprintln!("Error: {}", refusal.message);
+                }
+                env.mark_error(EnvelopeError::new(refusal.code, refusal.message));
             }
             Err(e) => {
                 has_errors = true;
