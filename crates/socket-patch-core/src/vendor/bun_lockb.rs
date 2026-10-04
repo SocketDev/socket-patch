@@ -1867,7 +1867,10 @@ mod tests {
             lock.set_package(package.id, &repin, &digest()).unwrap();
             assert_eq!(lock.bytes().len(), first.len(), "{version}");
             assert!(
-                !lock.bytes().windows(token.len()).any(|w| w == token.as_bytes()),
+                !lock
+                    .bytes()
+                    .windows(token.len())
+                    .any(|w| w == token.as_bytes()),
                 "{version}: the superseded URL is gone"
             );
             // A remote tarball keeps the registry record's inactive bytes; a
@@ -1910,7 +1913,9 @@ mod tests {
             .set_package(1, ".socket/vendor/npm/x/minimist-1.2.2.tgz", &digest())
             .unwrap();
         let at = local.resolution_at(1);
-        assert!(local.data[at + 16..at + local.resolution_size].iter().all(|b| *b == 0));
+        assert!(local.data[at + 16..at + local.resolution_size]
+            .iter()
+            .all(|b| *b == 0));
     }
 
     #[test]

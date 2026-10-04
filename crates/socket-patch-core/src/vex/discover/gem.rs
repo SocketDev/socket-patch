@@ -125,10 +125,10 @@ use super::{
     names_vendor_dir, simple_purl, vendor_ref, vendored_leaf_purl, DiscoverCtx, Discovery,
     PatchedRef, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
-use crate::vendor::gem::{gem_declaration_any, quoted_literal};
 use crate::formats::gem::{
     bundler_manifest_for, same_remote, GemfileLock, Section, SpecLine, BUNDLER_LOCKS,
 };
+use crate::vendor::gem::{gem_declaration_any, quoted_literal};
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     // Both locks, legacy spelling first (order only affects diagnostics).
