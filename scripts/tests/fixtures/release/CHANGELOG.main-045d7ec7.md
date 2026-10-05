@@ -9,15 +9,11 @@ Pre-v3.0 entries are concise summaries derived from each tag's commit
 history. For full per-release detail, see the
 [GitHub releases page](https://github.com/SocketDev/socket-patch/releases).
 
-Add entries under `[Unreleased]`; its `###` headings set the next version's
-bump (Breaking/Removed → major, Added/Changed/Deprecated → minor, anything
-else → patch). Releases are cut by the release train
-([docs/release-train/DESIGN.md](docs/release-train/DESIGN.md)) with
-`scripts/release.py`: a release candidate's `[Unreleased]` entries become a
-`## [X.Y.Z-rc.N]` section, the rolling `release-sync` PR brings each cut
-section and version back to main, and promoting an rc folds its rc sections
-into one `## [X.Y.Z]` section. `scripts/release-lint.sh` refuses to release
-a version without a non-empty section in this file.
+The `Release` workflow refuses to publish a version that does not appear
+in this file — see `scripts/release-lint.sh` (run by the `version` job in
+`.github/workflows/release.yml` and by CI on version-bump PRs). Bump PRs
+are opened by `scripts/bump-version.sh`, which rolls `[Unreleased]` over
+into the new version's section — see docs/releasing.md.
 
 ## [Unreleased]
 
@@ -106,12 +102,6 @@ limits, and required install commands.
 
 ### Fixed
 
-- `vex` no longer attests an npm or Bun patch as `not_affected` while a
-  second entry for the same `name@version` in the same lockfile still
-  resolves from the registry (for example a workspace member added after
-  vendoring). That copy installs unpatched, so the patch is now reported
-  as contested. `vendor --check` reports the same lockfile entry as drift
-  (#588).
 - Global mode (`-g`) finds npm, yarn, pnpm, bun, RubyGems and Composer on
   Windows, where they install as `.cmd` / `.bat` shims, instead of reporting
   an empty scan. The yarn and npm-family global lookups no longer run from the
@@ -246,10 +236,6 @@ limits, and required install commands.
   half-open connection. A connect now fails after 10 s, and a connection that
   sends nothing for 60 s fails as a network error. Downloads that keep
   streaming are not cut off (#570).
-- Patch blob and diff downloads stream straight to the `.socket` cache instead
-  of being held in memory whole first, so a large patch artifact no longer
-  costs its full size in RAM during `apply`, `get`, `repair` or `rollback`
-  (#571).
 
 ### Maintenance
 
