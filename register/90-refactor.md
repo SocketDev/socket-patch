@@ -2,12 +2,12 @@
 _Last updated 2026-10-05T17:00Z · main @ 0d302dc_
 
 **In flight:**
-- [#858](https://github.com/SocketDev/socket-patch/pull/858): one blocking `stage_and_rename_blocking` core with a private `WriteOpts` policy behind the six `utils::fs` writers; `atomic_write_sync`'s copy and `create_stage`/`commit_stage` deleted; one `stage_path` builds `.socket-stage-` and `.socket-dl-` names. Issue #728 (C21). Production +171 / −168, tests ≈ +85 / −12. State: ready, with the PR burn-down.
 - [#865](https://github.com/SocketDev/socket-patch/pull/865): `utils::digest` gains `sha256_hex_of`, `sha1_hex_of`, `sha512_base64_of`, `sha512_sri_of`; production digest sites in the 14 files no open PR changes move onto them; `ledger_snapshots::sha256_hex`, `vlt_preflight::sha512_sri`, `nuget_feed::content_hash`, `client::is_valid_sha256_hex` and the npm_pack/bun_lock SRI blocks deleted; a ratchet lists the 6 files left for slice 2. Issue #706 slice 1 (C17).
 
 - [#870](https://github.com/SocketDev/socket-patch/pull/870): `go_mod_edit::module_path` on the shared directive walker reads the go.mod `module` directive for VEX `--product` (fixes the block-form `module ( … )` misread); `go_crawler::parse_go_mod_module` (dead) and `product.rs`'s line scanner deleted. Issue #781 (E19 Go half). Production ≈ +22 / −64, tests ≈ +65 / −117. State: ready, CI green after one re-run, Bugbot clean; with the PR burn-down.
 
 **Merged:**
+- [#858](https://github.com/SocketDev/socket-patch/pull/858): one blocking `stage_and_rename_blocking` core with a private `WriteOpts` policy behind the six `utils::fs` writers; `atomic_write_sync`'s copy and `create_stage`/`commit_stage` deleted; one `stage_path` builds `.socket-stage-` and `.socket-dl-` names. Issue #728 (C21). Production +171 / −168, tests ≈ +85 / −12. Merged 2026-10-05 as `ee8ebf4`.
 - [#850](https://github.com/SocketDev/socket-patch/pull/850): one hermetic `common/hermetic.rs` builder for CLI test children; 8 `scrub_socket_env` copies deleted, 7 unscrubbed spawners made hermetic, `spawn_env_hygiene` ratchet. Issue #823 slice 1 (C30, C47). Merged 2026-10-05 as `99f61d2`. Test-only: +745 / −322.
 - [#607](https://github.com/SocketDev/socket-patch/pull/607): blob and diff downloads stream to disk through `BinaryBody`; one `download_entries` loop replaces the blob and diff copies. Issue #571 (C37). Merged 2026-10-05 as `366b155`. Production ≈ +190 / −80 (`blob_fetcher.rs`, `client.rs`), tests ≈ +230.
 - [#602](https://github.com/SocketDev/socket-patch/pull/602): crawler project-tree reads go through `utils::fs::read_regular_*`, plus a `crawlers::architecture_tests` guard against bare reads. Issue #592 (E06). Merged 2026-10-05 as `2eae9a0`. Production +4 / −4, tests +241.
