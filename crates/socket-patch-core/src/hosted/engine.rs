@@ -398,6 +398,29 @@ fn presence_only_present(view: &ProjectView<'_>, rel: &str) -> bool {
             .any(|f| f.path == rel && f.has(crate::formats::registry::PRESENCE_ONLY))
 }
 
+/// Read `rel` as advisory rewriter input: a link or an unreadable in-memory
+/// entry is left out (the rewriter then keeps its conservative reading)
+/// rather than refused like a file the rewrite writes.
+async fn read_advisory(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    rel: &str,
+) -> Option<String> {
+    match view {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => view.read_text(rel).await.ok(),
+        ProjectView::Memory(project) if !project.is_symlink(rel) && !unreadable.contains(rel) => {
+            match project.get(rel) {
+                Some(MemoryEntry::Text(text)) => Some(text.to_string()),
+                Some(MemoryEntry::Binary(bytes)) => {
+                    std::str::from_utf8(bytes).ok().map(str::to_string)
+                }
+                _ => None,
+            }
+        }
+        ProjectView::Memory(_) => None,
+    }
+}
+
 /// Read the project's candidate files: [`REDIRECT_CANDIDATE_FILES`], the
 /// Cargo workspace members (when a cargo candidate meets a root
 /// `Cargo.toml`), the Python locks and their scripts, and the Rush locks.
@@ -445,23 +468,37 @@ pub async fn read_candidate_files(
         && NPM_LOCKS.iter().any(|lock| out.files.contains_key(*lock))
     {
         let rel = crate::hosted::memory::select::NPM_MANIFEST_REL;
-        let text = match view {
-            ProjectView::Disk(_) | ProjectView::Snapshot(_) => view.read_text(rel).await.ok(),
-            ProjectView::Memory(project)
-                if !project.is_symlink(rel) && !unreadable.contains(rel) =>
-            {
-                match project.get(rel) {
-                    Some(MemoryEntry::Text(text)) => Some(text.to_string()),
-                    Some(MemoryEntry::Binary(bytes)) => {
-                        std::str::from_utf8(bytes).ok().map(str::to_string)
-                    }
-                    _ => None,
+        if let Some(text) = read_advisory(view, unreadable, rel).await {
+            out.files.insert(rel.to_string(), text);
+        }
+    }
+
+    // A text `bun.lock` names its workspace members; each member's manifest
+    // says which `workspace:` literal its inter-workspace dependencies carry,
+    // which the bun rewriter restores over a member path a migrated binary
+    // lock left behind (#803). Advisory input like the npm manifest above:
+    // keyed `<dir>/package.json` (the root as `package.json`), never
+    // rewritten, and a member dir that is not a plain relative path is
+    // never read.
+    if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
+        if let Some(lock) = out.files.get("bun.lock") {
+            let lines: Vec<String> = lock.split('\n').map(str::to_string).collect();
+            for dir in crate::vendor::bun_lock_text::workspace_member_dirs(&lines) {
+                if !crate::vendor::bun_lock_text::is_plain_member_dir(&dir) {
+                    continue;
+                }
+                let rel = if dir.is_empty() {
+                    "package.json".to_string()
+                } else {
+                    format!("{dir}/package.json")
+                };
+                if out.files.contains_key(&rel) {
+                    continue;
+                }
+                if let Some(text) = read_advisory(view, unreadable, &rel).await {
+                    out.files.insert(rel, text);
                 }
             }
-            ProjectView::Memory(_) => None,
-        };
-        if let Some(text) = text {
-            out.files.insert(rel.to_string(), text);
         }
     }
 
@@ -1398,17 +1435,21 @@ fn confirm(
     // The yarn berry pin's `package.json` `resolutions` entry is only half of
     // it — the URL-keyed `yarn.lock` entry is what installs — so a hosted URL
     // left in the manifest (an earlier run, a refused rewrite) proves
-    // nothing on its own: the manifest never feeds the probe.
+    // nothing on its own: the manifest never feeds the probe. Nor do the
+    // Bun workspace members' manifests, read only as advisory input.
+    fn is_npm_manifest(name: &str) -> bool {
+        name == "package.json" || name.ends_with("/package.json")
+    }
     let final_texts: Vec<(&str, &String)> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
-        .filter(|(name, _)| name.as_str() != "package.json")
+        .filter(|(name, _)| !is_npm_manifest(name))
         .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
         .chain(
             rewrite
                 .files
                 .iter()
-                .filter(|(name, _)| !files.contains_key(*name) && name.as_str() != "package.json")
+                .filter(|(name, _)| !files.contains_key(*name) && !is_npm_manifest(name))
                 .map(|(name, content)| (name.as_str(), content)),
         )
         .collect();
