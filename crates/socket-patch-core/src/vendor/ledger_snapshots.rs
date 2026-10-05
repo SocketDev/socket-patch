@@ -44,8 +44,8 @@
 //! expects a string and leaves that fragment alone with a drift warning,
 //! the documented forward-compatibility posture.
 
+use crate::utils::digest::sha256_hex_of;
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 
 /// A `new` text at least this long is stored as an edit. Whole-file
 /// snapshots of real projects are far longer.
@@ -69,10 +69,6 @@ const PLAIN_VERSION: u64 = 1;
 
 const SNAPSHOT_REF: &str = "snapshot";
 const OPS: &str = "ops";
-
-fn sha256_hex(text: &str) -> String {
-    hex::encode(Sha256::digest(text.as_bytes()))
-}
 
 /// The wiring records of a serialized ledger, mutably.
 fn records_mut(ledger: &mut Value) -> impl Iterator<Item = &mut Map<String, Value>> {
@@ -110,7 +106,7 @@ pub(crate) fn encode(ledger: &mut Value) {
         let Some(ops) = edit(original, new) else {
             continue;
         };
-        let value = serde_json::json!({ SNAPSHOT_REF: sha256_hex(new), OPS: ops });
+        let value = serde_json::json!({ SNAPSHOT_REF: sha256_hex_of(new.as_bytes()), OPS: ops });
         record.insert("new".to_string(), value);
         encoded = true;
     }
@@ -344,7 +340,7 @@ fn apply_ops(hash: &str, base: &str, ops: &[Value]) -> Result<String, String> {
             _ => return Err(format!("snapshot {hash} has a malformed op")),
         }
     }
-    if sha256_hex(&text) != hash {
+    if sha256_hex_of(text.as_bytes()) != hash {
         return Err(format!("snapshot {hash} does not reproduce its text"));
     }
     Ok(text)
@@ -485,7 +481,7 @@ mod tests {
         let inserted: usize = ops.iter().filter_map(Value::as_str).map(str::len).sum();
         assert!(inserted < 80, "{inserted} bytes inserted: {ops:?}");
         assert_eq!(
-            apply_ops(&sha256_hex(&target), &base, &ops).unwrap(),
+            apply_ops(&sha256_hex_of(target.as_bytes()), &base, &ops).unwrap(),
             target
         );
         for (b, t) in [
@@ -546,11 +542,12 @@ mod tests {
         assert!(decode(&mut orphaned).unwrap_err().contains("no original"));
 
         let mut dangling = encoded.clone();
-        new(&mut dangling)["new"] = serde_json::json!({ "snapshot": sha256_hex(&v1) });
+        new(&mut dangling)["new"] = serde_json::json!({ "snapshot": sha256_hex_of(v1.as_bytes()) });
         assert!(decode(&mut dangling).unwrap_err().contains("no edit"));
 
         let mut original_ref = encoded.clone();
-        new(&mut original_ref)["original"] = serde_json::json!({ "snapshot": sha256_hex(&v0) });
+        new(&mut original_ref)["original"] =
+            serde_json::json!({ "snapshot": sha256_hex_of(v0.as_bytes()) });
         assert!(decode(&mut original_ref).is_err());
     }
 
