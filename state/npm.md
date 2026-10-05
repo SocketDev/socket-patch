@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-05T06Z (run 19 with a ledger), main `045d7ec` (re-run 2026-10-05T06Z, unchanged; v5 + the #324/#326/#359/#403/#434/#454/#490/#516/#541 fixes and #570 API timeouts; the binary still reports 4.0.0), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`.
+Last updated: 2026-10-05T12Z (run 20 with a ledger), main `4646693` (about 30 fixes past `045d7ec`, including #356, #732, #325, #665, #687, #557/#817 and #601/#603), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`.
 
 ## Coverage matrix
 
@@ -32,7 +32,19 @@ Other 2026-10-05 passes (Linux): prerelease version (`ms@3.0.0-canary.1`) hosted
 
 Agent mode follows a `node_modules` link into a workspace member, a `file:` dir or an `npm link` target, overwrites first-party source, and rollback restores upstream bytes. **fail #626** on Linux npm 6 (`file:`) / 8 / 10 / 12, macOS npm 10.9.7, and Windows npm 8 / 10 / 12, also on v4.0.0. Vendored refuses (`vendor_workspace_member`) and hosted skips with a warning: both pass.
 
+## Alias under `install-strategy=linked` (#852)
+
+npm 9–11 store an alias as `node_modules/.store/lp@<v>-<h>/node_modules/lp`. Agent mode misses that copy. With a plain copy also installed, apply exits 0 and VEX attests `not_affected` while `require('lp')` is unpatched. **fail #852** on Linux npm 9.9.4 / 10.9.4 / 11.6.2. npm 12.2.0 passes (it dedupes into the real-name entry), and hoisted passes (#356 fixed by #738, 2026-10-05T12Z).
+
+## Vendored artifact under `.gitignore` (#831, yarn-classic's issue)
+
+`*.tgz`, `vendor/` and `.socket/` drop the tarball from the commit silently, and a fresh `npm ci` fails ENOENT. With `.socket/` ignored, `vendor --check` exits 0. **fail #831** on Linux npm 8.19.4 / 10.9.4 / 12.2.0 (matrix on #831; draft fix #837).
+
 ## Backlog
+
+- **#852 follow-ups:** agent `rollback` over the alias store copy; a scoped alias; a transitive alias in `.store`.
+- **#732 fix re-check** (human `scan --mode agent` after `npm ci`): needs a mock API, because `--offline` scan is refused. Also re-check #828 on main `4646693`.
+- (#688 and #432 re-checked on `4646693`: both still reproduce, 2026-10-05T12Z.)
 
 - **#828 follow-ups:** `get --mode vendored` takeover; the real `npm` bundle (`ansi-regex`) shape; a dual lock where only one lock carries the bundle; other `ContestedWiring` shapes (#798 stale twin) reaching the vendored takeover silently.
 - **#812 variants:** global npmrc; a `registry=` mirror + `always`. macOS / Windows once probe branches are allowed again. (User `.npmrc` and hostname value done 2026-10-05T06Z.)
@@ -54,6 +66,8 @@ Agent mode follows a `node_modules` link into a workspace member, a `file:` dir 
 8. Stale probe branches the proxy can't delete (2026-10-04T06Z: the session permission policy now refuses `git push --delete` outright, so no new probe branches are pushed until a maintainer allows it or deletes these) (`git push --delete` fails with "remote end hung up" / "Everything up-to-date"; re-checked 2026-10-03T12Z): `bughunt/npm/20260930-alias-linked`, `20260930-win-mac-e2e`, `20260930-win-old-npm`, `20261001-crlf-paths`, `20261001-optional-dep`, `20261001-v5-hosted-global`, `20261001-win-global`, `20261002-v5-agent-vendored-winmac`, `20261003-ws-link-agent`, `20261003-ws-link-mac`. A maintainer needs to delete them.
 
 ## Known non-bugs
+
+- Scratch harness tip: a test file that includes `npm_e2e_common` must also include `vex_e2e_common`. `scan` refuses `--offline` (strict airgap), so use `apply` for offline agent cells.
 
 - Mocks of the public proxy need `SOCKET_PROXY_URL` (and `NO_PROXY=127.0.0.1`); `--api-url` alone still reaches `patches-api.socket.dev`.
 - Project `.npmrc` `allow-remote=${VAR}` is read raw and treated as an explicit user value (warns, doesn't write). Fails safe.
