@@ -36,8 +36,9 @@ pub(super) fn rewrite(
     // Every dep is rewritten over one parse and one render of the lock.
     let LockBatch { text, steps } = rewrite_pdm_lock_all(original, &lock_deps);
     let mut steps = steps.into_iter();
-    // No rewrite touches `[metadata] lock_version`: read once.
-    let lock_ver: Option<String> = parse.parsed(&text).ok().and_then(|lock| {
+    // No rewrite touches `[metadata] lock_version`: read once, from the
+    // parse the presence probe already took.
+    let lock_ver: Option<String> = parse.parsed(original).ok().and_then(|lock| {
         crate::utils::pdm_lock::lock_version(lock)
             .ok()
             .map(str::to_string)
