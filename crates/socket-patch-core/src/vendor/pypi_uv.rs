@@ -7096,10 +7096,8 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
     /// tells apart, from following its edited declaration.
     #[tokio::test]
     async fn revert_respells_past_an_unreadable_sibling_declaration() {
-        let py_in = EXTRAS_DUP_REGISTRY_PYPROJECT.replace(
-            "socks = [\"six==1.16.0\"]",
-            "socks = [\"six===1.16.0\"]",
-        );
+        let py_in = EXTRAS_DUP_REGISTRY_PYPROJECT
+            .replace("socks = [\"six==1.16.0\"]", "socks = [\"six===1.16.0\"]");
         let lock_in = EXTRAS_DUP_REGISTRY_LOCK.replace(
             "marker = \"extra == 'socks'\", specifier = \"==1.16.0\"",
             "marker = \"extra == 'socks'\", specifier = \"===1.16.0\"",

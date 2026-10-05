@@ -1253,7 +1253,11 @@ pub(crate) fn respell_lock_specifier(
                 .iter()
                 .filter(|d| canonicalize_pypi_name(pep508_name(d.spec)) == canon)
                 .all(|d| spec_clauses(d.spec).is_err());
-            return if all_unreadable { Ok(None) } else { Err(reason) };
+            return if all_unreadable {
+                Ok(None)
+            } else {
+                Err(reason)
+            };
         }
     };
     let sorted = |clauses: &[String]| {
