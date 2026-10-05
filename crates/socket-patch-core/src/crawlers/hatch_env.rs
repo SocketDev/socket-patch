@@ -154,8 +154,13 @@ pub(crate) async fn hatch_environments_with(
             }
             // `hatch test` (Hatch 1.10+) installs the project into the
             // internal `hatch-test.<python>` matrix, whose default Python
-            // list varies by Hatch release.
-            if !configured.iter().any(|e| e.name == "hatch-test") {
+            // list varies by Hatch release. A project's
+            // `[tool.hatch.envs.hatch-test]` is layered over that default,
+            // so the default matrix stays unless the project sets its own.
+            let own_test_matrix = configured
+                .iter()
+                .any(|e| e.name == "hatch-test" && !e.matrix_names.is_empty());
+            if !own_test_matrix {
                 for (dir_name, prefix) in subdirs(&env_dir) {
                     if dir_name.starts_with("hatch-test.") {
                         push(dir_name, prefix);
@@ -739,7 +744,8 @@ mod tests {
                  matrix = [{{ version = [\"a\"], python = [\"3.11\", \"py3.12\"] }}]\n\n\
                  [tool.hatch.envs.lint]\n\
                  matrix-name-format = \"{{variable}}_{{value}}\"\n\
-                 [[tool.hatch.envs.lint.matrix]]\ntool = [\"ruff\"]\n"
+                 [[tool.hatch.envs.lint.matrix]]\ntool = [\"ruff\"]\n\n\
+                 [tool.hatch.envs.hatch-test]\nextra-dependencies = [\"rich\"]\n"
             ),
         )
         .unwrap();
