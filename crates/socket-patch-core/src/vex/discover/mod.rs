@@ -200,6 +200,7 @@ pub(crate) mod composer;
 pub(crate) mod deno;
 pub(crate) mod gem;
 pub(crate) mod golang;
+pub(crate) mod gradle;
 pub(crate) mod maven;
 pub(crate) mod npm;
 pub(crate) mod nuget;
@@ -403,6 +404,22 @@ pub struct ResolvedElsewhere {
     pub file: PathBuf,
 }
 
+/// A ref discovery emits (so rollback, remove and list find the wiring)
+/// that must not be attested: the files show a build that resolves the
+/// package from somewhere the pin does not reach. Today: a Gradle lock
+/// entry above the hosted pin's base (the owned script lets that newer
+/// upstream release resolve), so that build consumes no patch. The CLI's
+/// VEX plan omits every candidate of `(purl, uuid)` with `detail`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Unattested {
+    /// Canonical base purl ([`canonical_base_purl`]).
+    pub purl: String,
+    pub uuid: String,
+    /// Root-relative file that shows the bypass.
+    pub file: PathBuf,
+    pub detail: String,
+}
+
 /// Everything [`discover_patched_refs`] found.
 #[derive(Debug, Clone, Default)]
 pub struct Discovery {
@@ -420,6 +437,8 @@ pub struct Discovery {
     /// non-Socket source — the evidence the cross-lock contest
     /// ([`discover_patched_refs_with`]) weighs against another lock's ref.
     pub elsewhere: Vec<ResolvedElsewhere>,
+    /// Refs in `refs` whose wiring a build bypasses ([`Unattested`]).
+    pub unattested: Vec<Unattested>,
 }
 
 impl Discovery {
@@ -666,9 +685,22 @@ impl Discovery {
         });
     }
 
+    /// Record that the ref `(purl, uuid)` is wired but bypassed by the
+    /// build `file` shows ([`Unattested`]). Pushed beside the ref itself.
+    pub(crate) fn unattested(&mut self, purl: &str, uuid: &str, file: &str, detail: String) {
+        self.unattested.push(Unattested {
+            purl: canonical_base_purl(purl),
+            uuid: uuid.to_string(),
+            file: PathBuf::from(file),
+            detail,
+        });
+    }
+
     fn finalize(&mut self) {
         self.elsewhere.sort();
         self.elsewhere.dedup();
+        self.unattested.sort();
+        self.unattested.dedup();
         self.refs.sort_by(|a, b| {
             (&a.source_file, &a.purl, &a.uuid, a.mode).cmp(&(
                 &b.source_file,
@@ -735,6 +767,7 @@ async fn discover_with_ctx(ctx: DiscoverCtx<'_>) -> Discovery {
     gem::extract(&ctx, &mut out).await;
     composer::extract(&ctx, &mut out).await;
     maven::extract(&ctx, &mut out).await;
+    gradle::extract(&ctx, &mut out).await;
     nuget::extract(&ctx, &mut out).await;
     deno::extract(&ctx, &mut out).await;
     out.contest_across_locks();
@@ -2997,7 +3030,18 @@ mod tests {
             ("golang", &["go.mod"]),
             ("gem", &["Gemfile.lock"]),
             ("composer", &["composer.lock"]),
-            ("maven", &["pom.xml"]),
+            (
+                "maven",
+                &[
+                    ".socket/gradle/hosted-index.tsv",
+                    ".socket/gradle/socket-patch.hosted.settings.gradle",
+                    ".socket/vendor/gradle-index.tsv",
+                    "buildscript-gradle.lockfile",
+                    "gradle.lockfile",
+                    "pom.xml",
+                    "settings-gradle.lockfile",
+                ],
+            ),
             ("nuget", &["NuGet.Config", "NuGet.config", "nuget.config"]),
             ("deno", &[]),
         ];
@@ -3077,8 +3121,10 @@ mod tests {
     /// Cross-package-manager union: one root carrying the committed hosted
     /// golden output of EVERY rewriter family at once (npm package-lock, pnpm,
     /// bun, yarn, cargo, go, uv, requirements, bundler, composer, maven,
-    /// nuget) plus hand-written vendored wiring in files none of those
-    /// fixtures own (`gems.locked` PATH section, a `Pipfile.lock` wheel)
+    /// nuget) plus hand-written vendored wiring in a file none of those
+    /// fixtures own (a `Pipfile.lock` wheel; bundler reads only ONE lock
+    /// pair, so a `gems.locked` beside the fixture's `Gemfile.lock` would be
+    /// an ignored twin, not a second source — #736)
     /// discovers exactly the UNION of what each file discovers alone — no
     /// extractor shadows, suppresses, or re-attributes another's refs, and
     /// no file's presence makes another file diagnose. This is the property
@@ -3100,13 +3146,6 @@ mod tests {
             "redirect/maven/pom/basic/expected",
             "redirect/nuget/packages-lock/basic/expected",
         ];
-        let gem_rel = format!(".socket/vendor/gem/{UUID_A}/rack-3.2.6");
-        let gems_locked = format!(
-            "PATH\n  remote: {gem_rel}\n  specs:\n    rack (3.2.6)\n\n\
-             GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
-             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= 3.2.6)!\n\n\
-             BUNDLED WITH\n   2.5.22\n"
-        );
         let wheel = format!(".socket/vendor/pypi/{UUID_B}/six-1.16.0-py2.py3-none-any.whl");
         let pipfile_lock = serde_json::json!({
             "_meta": { "pipfile-spec": 6, "hash": { "sha256": "x" }, "requires": {}, "sources": [] },
@@ -3116,10 +3155,7 @@ mod tests {
             "develop": {},
         })
         .to_string();
-        let vendored: [(&str, &str); 2] = [
-            ("gems.locked", gems_locked.as_str()),
-            ("Pipfile.lock", pipfile_lock.as_str()),
-        ];
+        let vendored: [(&str, &str); 1] = [("Pipfile.lock", pipfile_lock.as_str())];
 
         // Each source alone: must be non-empty and diagnostic-free, so the
         // union below is a meaningful sum rather than a sum of nothings.
@@ -3207,18 +3243,13 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        for (purl, uuid, rel) in [
-            ("pkg:gem/rack@3.2.6", UUID_A, gem_rel.as_str()),
-            ("pkg:pypi/six@1.16.0", UUID_B, wheel.as_str()),
-        ] {
-            let r = out
-                .refs
-                .iter()
-                .find(|r| r.purl == purl && r.uuid == uuid)
-                .unwrap_or_else(|| panic!("{purl} missing: {:#?}", out.refs));
-            assert_eq!(r.mode, WiringMode::Vendored);
-            assert_eq!(r.artifact_rel.as_deref(), Some(rel));
-        }
+        let six = out
+            .refs
+            .iter()
+            .find(|r| r.purl == "pkg:pypi/six@1.16.0" && r.uuid == UUID_B)
+            .unwrap_or_else(|| panic!("six missing: {:#?}", out.refs));
+        assert_eq!(six.mode, WiringMode::Vendored);
+        assert_eq!(six.artifact_rel.as_deref(), Some(wheel.as_str()));
         assert!(out.refs.iter().any(|r| r.mode == WiringMode::Hosted));
     }
 

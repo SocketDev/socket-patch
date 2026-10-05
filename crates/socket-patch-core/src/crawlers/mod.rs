@@ -3,7 +3,9 @@ pub mod composer_crawler;
 pub mod deno_crawler;
 pub mod fuzzy_match;
 pub mod go_crawler;
+pub mod gradle_cache;
 pub mod hatch_env;
+pub mod jvm_cache;
 mod listing;
 pub mod maven_crawler;
 #[cfg(test)]

@@ -424,10 +424,6 @@ async fn stream_cache_entry_atomic(
             "cache entry path has no parent directory",
         ))
     })?;
-    let stem = dest
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "blob".to_string());
     // The cache directory (`.socket/blobs/`, `.socket/diffs/`) is created
     // here, by the first download, and nowhere earlier. A fetch that lands
     // nothing (all 404, offline, every hash mismatched, every body cut
@@ -442,9 +438,7 @@ async fn stream_cache_entry_atomic(
         }
         created_dirs.push(dir);
     }
-    // Leading dot keeps the stage out of editor/glob views; the uuid suffix
-    // keeps concurrent writers of the same entry from colliding.
-    let stage = parent.join(format!(".socket-dl-{}-{}", stem, uuid::Uuid::new_v4()));
+    let stage = crate::utils::fs::stage_path(dest, ".socket-dl-");
 
     let result = async {
         // Inside the cleanup scope: a `create_dir_all` that makes some

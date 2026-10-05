@@ -169,9 +169,9 @@ fn merge_first_wins(
 /// `gems/` layout, or an env `BUNDLE_PATH` store) — first-wins would drop
 /// the second copy, so apply would patch one store while the other bundler
 /// loads pristine bytes. Collapsing consumers still take the first
-/// (highest-precedence) path; apply fans out per-copy for gem
-/// only (PyPI/Maven keep their one-install-dir contract — see the apply
-/// variant loop).
+/// (highest-precedence) path; apply fans out per-copy for gem and Maven
+/// (`~/.m2` and each Gradle cache are distinct installs some build reads;
+/// PyPI keeps its one-install-dir contract — see the apply variant loop).
 fn merge_variant_copies(
     out: &mut HashMap<String, Vec<PathBuf>>,
     _purls: &[String],
@@ -337,7 +337,13 @@ async fn dispatch_find(
         options = options,
         silent = silent,
         crawler = MavenCrawler,
-        get_paths = get_maven_repo_paths,
+        // Every cache holding a copy: `~/.m2` first, then each Gradle
+        // `files-2.1` (the user home's and the read-only one), whose
+        // version dirs every join site expands through
+        // `gradle_cache::installed_copies`. `variant_merge` keeps every
+        // distinct copy (`push_path`), and the Maven join sites
+        // ([`JvmScope`]) split them into the copies a build consumes.
+        get_paths = get_maven_copy_paths,
         using_label = "Maven repository",
         err_label = "Maven packages",
         // Maven has per-classifier release variants
@@ -630,6 +636,103 @@ pub async fn find_manifest_package_copies_reusing(
         }
     }
     copies
+}
+
+// ── JVM copies ──────────────────────────────────────────────────────────
+
+/// What the Maven join sites (apply, rollback, vex) need to know about the
+/// run's JVM caches, resolved once per run: which copies a build consumes,
+/// which are read-only, and whether the build verifies its dependencies.
+#[derive(Debug, Clone)]
+pub(crate) struct JvmScope {
+    pub env: socket_patch_core::crawlers::maven_crawler::JvmEnv,
+    /// The local Gradle build's `m2_gate` (local mode only; `None` in a
+    /// global run, where every cache counts).
+    pub gate: Option<socket_patch_core::crawlers::maven_crawler::M2Gate>,
+    /// `gradle/verification-metadata.xml` of the cwd's build (or the
+    /// ancestor build it belongs to), local mode only.
+    pub verification_metadata: Option<PathBuf>,
+}
+
+/// The installed copies of one Maven purl, split by how a build reads them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MavenCopies {
+    /// Writable copies some build consumes: `~/.m2` version dirs (unless
+    /// ignored) and Gradle user-home version dirs, in lookup order.
+    pub consumed: Vec<PathBuf>,
+    /// Copies in the read-only Gradle cache (`GRADLE_RO_DEP_CACHE`): read
+    /// by Gradle, never written.
+    pub read_only: Vec<PathBuf>,
+    /// `~/.m2` copies a Gradle-only build never reads (no `mavenLocal()`).
+    pub m2_ignored: Vec<PathBuf>,
+}
+
+impl JvmScope {
+    /// The scope of a run with `common`'s flags, over the process
+    /// environment.
+    pub(crate) async fn of(common: &GlobalArgs) -> Self {
+        use socket_patch_core::crawlers::gradle_cache;
+        use socket_patch_core::crawlers::maven_crawler::{m2_gate, JvmEnv};
+        let env = JvmEnv::from_process();
+        if common.is_global() {
+            return Self {
+                env,
+                gate: None,
+                verification_metadata: None,
+            };
+        }
+        let cwd = common.cwd.clone();
+        let probe_env = env.clone();
+        let probe = move || {
+            let gate = m2_gate(&cwd, &probe_env);
+            let metadata = gradle_cache::build_roots(&cwd)
+                .into_iter()
+                .map(|root| root.join("gradle").join("verification-metadata.xml"))
+                .find(|p| p.is_file());
+            (gate, metadata)
+        };
+        // Script reads and stats: off the async workers.
+        let (gate, verification_metadata) = tokio::task::spawn_blocking(probe)
+            .await
+            .expect("JVM scope probe panicked");
+        Self {
+            env,
+            gate: Some(gate),
+            verification_metadata,
+        }
+    }
+
+    /// Whether a build of this run reads `~/.m2` (always, except a local
+    /// Gradle-only build that never declares `mavenLocal()`).
+    pub(crate) fn m2_consumed(&self) -> bool {
+        use socket_patch_core::crawlers::maven_crawler::M2Gate;
+        self.gate.as_ref() != Some(&M2Gate::Ignored)
+    }
+
+    /// Whether `path` lies in the read-only Gradle cache.
+    pub(crate) fn is_read_only(&self, path: &std::path::Path) -> bool {
+        self.env
+            .gradle
+            .as_ref()
+            .and_then(|h| h.ro_files21.as_deref())
+            .is_some_and(|ro| path.starts_with(ro))
+    }
+
+    /// Split the copies the resolver found for one purl.
+    pub(crate) fn split(&self, paths: &[PathBuf]) -> MavenCopies {
+        use socket_patch_core::crawlers::gradle_cache::is_gradle_version_dir;
+        let mut out = MavenCopies::default();
+        for path in paths {
+            if self.is_read_only(path) {
+                out.read_only.push(path.clone());
+            } else if !is_gradle_version_dir(path) && !self.m2_consumed() {
+                out.m2_ignored.push(path.clone());
+            } else {
+                out.consumed.push(path.clone());
+            }
+        }
+        out
+    }
 }
 
 /// Box the future `make` returns, constructing it inside this (non-async)

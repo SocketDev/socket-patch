@@ -40,12 +40,12 @@ use super::state::{
     WiringRecord,
 };
 use super::vlt_lock_text::{
-    edges_block, entry_text, file_dep_id, installs_outside_registry, is_default_registry,
-    is_importer_dep_id, is_registry_url_segment, nodes_block, parse_edge_entry_text,
-    parse_edge_line, parse_node_entry_text, parse_node_line, parse_vendored_dir_path,
-    render_entry_line, render_tuple_with_slots, sniff_lock, split_dep_id, split_lines,
-    vendored_dir_rel, vlt_collate, vlt_edge_cmp, DepIdEra, DepIdKind, LockSniff, ParsedLock,
-    SectionSpan,
+    brotli_for_slot3, edges_block, entry_text, file_dep_id, has_brotli_flag,
+    installs_outside_registry, is_default_registry, is_importer_dep_id, is_registry_url_segment,
+    nodes_block, parse_edge_entry_text, parse_edge_line, parse_node_entry_text, parse_node_line,
+    parse_vendored_dir_path, render_entry_line, render_tuple_with_slots, sniff_lock, split_dep_id,
+    split_lines, vendored_dir_rel, vlt_collate, vlt_edge_cmp, DepIdEra, DepIdKind, LockSniff,
+    ParsedLock, SectionSpan,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
@@ -855,8 +855,13 @@ fn plan_wiring(
             NOT_CANONICAL.to_string(),
         )
     })?;
-    let file_tuple =
-        render_tuple_with_slots(&node_entry.elems, Some("null"), Some(&json_string(rel)));
+    let rel_slot = json_string(rel);
+    let file_tuple = render_tuple_with_slots(
+        &node_entry.elems,
+        brotli_for_slot3(Some(&rel_slot)),
+        Some("null"),
+        Some(&rel_slot),
+    );
     let new_node = Entry {
         key: file_id.clone(),
         value: file_tuple,
@@ -1645,6 +1650,7 @@ fn revert_node(staged: &mut Staged, rec: &WiringRecord) -> Step {
         }
         let tuple = render_tuple_with_slots(
             &live.elems,
+            has_brotli_flag(original.elems[0]),
             original.slot(2).filter(|s| *s != "null"),
             original.slot(3).filter(|s| *s != "null"),
         );
@@ -2979,6 +2985,35 @@ mod tests {
         assert_eq!(read(&fx, VLT_LOCK).await, drifted, "a drift writes nothing");
         assert_eq!(read(&fx, PACKAGE_JSON).await, pkg);
         assert!(fx.root.join(&entry.artifact.path).exists());
+    }
+
+    /// #372: vlt 1.3 sets the brotli bit (4) on nodes that resolved the
+    /// registry's `.tar.br` alternate. Vendoring wires such a lock (the
+    /// vendored directory is no Brotli tarball, so the wired node drops
+    /// bit 4) and the revert puts the pristine brotli entry back.
+    #[tokio::test]
+    async fn a_vlt_1_3_brotli_lock_is_vendored_and_reverted_exactly() {
+        let brotli = basic_lock()
+            .replace("[0,\"a\",", "[6,\"a\",")
+            .replace(
+                "[0,\"left-pad\",\"sha512-REG==\",\"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"]",
+                "[4,\"left-pad\",\"sha512-REG==\",\"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tar.br\"]",
+            );
+        assert!(brotli.contains("[4,\"left-pad\""));
+        let fx = fx(&brotli, &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (entry, _) = entry_of(run(&fx, UUID, false).await);
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad");
+        let wired = read(&fx, VLT_LOCK).await;
+        assert!(
+            wired.contains(&format!("[0,\"left-pad\",null,\"{rel}\"]")),
+            "{wired}"
+        );
+        assert!(wired.contains("[6,\"a\",\"sha512-A==\"]"), "{wired}");
+
+        let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(false)).await;
+        assert!(out.success && out.warnings.is_empty(), "{out:?}");
+        assert_eq!(read(&fx, VLT_LOCK).await, brotli);
+        assert_eq!(read(&fx, PACKAGE_JSON).await, ROOT_PKG);
     }
 
     #[tokio::test]

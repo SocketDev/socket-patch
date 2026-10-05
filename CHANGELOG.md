@@ -9,9 +9,11 @@ Pre-v3.0 entries are concise summaries derived from each tag's commit
 history. For full per-release detail, see the
 [GitHub releases page](https://github.com/SocketDev/socket-patch/releases).
 
-Add entries under `[Unreleased]`; its `###` headings set the next version's
-bump (Breaking/Removed → major, Added/Changed/Deprecated → minor, anything
-else → patch). Releases are cut by the release train
+PRs never edit this file. Only the release agent writes `[Unreleased]`, at
+release time, from the PRs merged since the last tag and the code they
+changed. Its `###` headings set the next version's bump (Breaking/Removed →
+major, Added/Changed/Deprecated → minor, anything else → patch). Releases
+are cut by the release train
 ([docs/release-train/DESIGN.md](docs/release-train/DESIGN.md)) with
 `scripts/release.py`: a release candidate's `[Unreleased]` entries become a
 `## [X.Y.Z-rc.N]` section, the rolling `release-sync` PR brings each cut

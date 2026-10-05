@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 
 fn mem(files: &[(&str, &str)]) -> MemoryPolicyFs {
     let mut fs = MemoryPolicyFs::default();

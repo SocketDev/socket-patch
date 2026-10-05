@@ -133,8 +133,8 @@ jobs:
           fi
           phar="$dir/composer-$COMPOSER_RELEASE.phar"
           base="https://getcomposer.org/download/$COMPOSER_RELEASE/composer.phar"
-          curl -fsSL --retry 3 -o "$phar" "$base"
-          published="$(curl -fsSL --retry 3 "$base.sha256sum" | cut -d' ' -f1)"
+          curl -fsSL --retry 5 --retry-all-errors -o "$phar" "$base"
+          published="$(curl -fsSL --retry 5 --retry-all-errors "$base.sha256sum" | cut -d' ' -f1)"
           # shellcheck disable=SC2016 # $argv is PHP, not shell
           actual="$(php -r 'echo hash_file("sha256", $argv[1]);' "$phar")"
           if [ "$actual" != "$COMPOSER_PHAR_SHA256" ] || [ "$actual" != "$published" ]; then

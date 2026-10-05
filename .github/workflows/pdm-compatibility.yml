@@ -165,6 +165,7 @@ jobs:
             native-pdm/cases/**/cli-output.json
             native-pdm/cases/**/pdm.lock
             native-pdm/cases/**/*.log
+            native-pdm/attempts/**
           retention-days: 14
 
   # The hermetic Rust capstone (wiremock Socket API that also serves the
