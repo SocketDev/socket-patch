@@ -15,7 +15,8 @@
 //!   restored without one too;
 //! * `sdist` / `wheels` were replaced by the patched wheel (pylock: an
 //!   `archive`) — re-derived from PyPI's JSON API in the artifact shape a
-//!   sibling registry package shows (which of `size` / `upload-time` /
+//!   sibling registry package shows (which of `size` / `upload-time` (or
+//!   uv 0.6.15–0.6.17's `upload_time`) /
 //!   `hashes` this uv release records, one wheel per line or not; pylock
 //!   `upload-time`s in whole seconds unless a sibling shows a fraction). uv keeps
 //!   only the wheels its `requires-python` and environments can install, so
@@ -407,7 +408,7 @@ fn lock_shape(
         };
         registries.insert(registry);
         fractional_seconds |= artifact_tables(package).any(|a| {
-            a.get("upload-time")
+            upload_time_value(a)
                 .and_then(Value::as_datetime)
                 .is_some_and(|t| t.to_string().contains('.'))
         });
@@ -423,9 +424,7 @@ fn lock_shape(
             continue;
         };
         let keys: Vec<String> = artifact.iter().map(|(k, _)| k.to_string()).collect();
-        let datetime = artifact
-            .get("upload-time")
-            .is_some_and(|v| v.as_datetime().is_some());
+        let datetime = upload_time_value(artifact).is_some_and(|v| v.as_datetime().is_some());
         let multiline = package
             .get("wheels")
             .and_then(Item::as_array)
@@ -471,8 +470,11 @@ fn lock_shape(
         "no sibling registry package records an artifact, so which artifact fields this uv \
          release records is not derivable",
     )?;
-    let known = ["url", "hash", "hashes", "size", "upload-time", "name"];
-    if let Some(unknown) = keys.iter().find(|k| !known.contains(&k.as_str())) {
+    let known = ["url", "hash", "hashes", "size", "name"];
+    if let Some(unknown) = keys
+        .iter()
+        .find(|k| !known.contains(&k.as_str()) && !UPLOAD_TIME_KEYS.contains(&k.as_str()))
+    {
         return Err(format!(
             "sibling artifacts carry an unknown field `{unknown}`"
         ));
@@ -486,6 +488,17 @@ fn lock_shape(
         multiline,
         package_keys,
     })
+}
+
+/// The artifact timestamp key, in both spellings uv has written:
+/// `upload_time` (uv 0.6.15–0.6.17, lock revision 2) and `upload-time`
+/// (uv 0.7.0 and later, and PEP 751 pylock files). A re-derived artifact
+/// keeps the spelling its sibling shows.
+const UPLOAD_TIME_KEYS: [&str; 2] = ["upload-time", "upload_time"];
+
+/// An artifact's timestamp, under whichever spelling it records.
+fn upload_time_value(artifact: &toml_edit::InlineTable) -> Option<&Value> {
+    UPLOAD_TIME_KEYS.iter().find_map(|k| artifact.get(k))
 }
 
 /// uv's timestamp of a PyPI `upload_time_iso_8601`: milliseconds in
@@ -525,7 +538,7 @@ fn render_artifact(file: &PypiFile, shape: &Shape) -> Result<String, String> {
                 .size
                 .ok_or_else(|| format!("PyPI reports no size for {}", file.filename))?
                 .to_string(),
-            "upload-time" => {
+            key if UPLOAD_TIME_KEYS.contains(&key) => {
                 let time = file
                     .upload_time
                     .as_deref()
