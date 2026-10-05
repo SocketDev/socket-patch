@@ -1206,6 +1206,17 @@ pub(crate) async fn bundler_loaded_manifest_in(
 /// inventory, ledger recovery, VEX discovery), so none reads a twin
 /// bundler ignores (#736).
 pub(crate) async fn bundler_loaded_lock_in(view: &ProjectView<'_>) -> Option<&'static str> {
+    bundler_loaded_lock_diagnosed_in(view).await.ok()
+}
+
+/// [`bundler_loaded_lock_in`], with the reason when bundler loads no lock
+/// socket-patch reads: the detail of the unsupported `BUNDLE_GEMFILE` /
+/// `BUNDLE_LOCKFILE`, or of the twin whose locks disagree on the bundler
+/// major. Lock inventory surfaces it so a lockfile-only scan does not
+/// skip the project's gems silently.
+pub(crate) async fn bundler_loaded_lock_diagnosed_in(
+    view: &ProjectView<'_>,
+) -> Result<&'static str, String> {
     use crate::formats::gem::manifest::{self, LoadedManifest};
     let loaded = bundler_loaded_manifest_in(view).await;
     let gems_rb = view.is_file("gems.rb");
@@ -1215,13 +1226,15 @@ pub(crate) async fn bundler_loaded_lock_in(view: &ProjectView<'_>) -> Option<&'s
         return match manifest::default_twin_manifest(
             gemfile_lock.as_deref(),
             gems_locked.as_deref(),
-        ) {
-            Ok("Gemfile") => Some("Gemfile.lock"),
-            Ok(_) => Some("gems.locked"),
-            Err(_) => None,
+        )? {
+            "Gemfile" => Ok("Gemfile.lock"),
+            _ => Ok("gems.locked"),
         };
     }
-    loaded.pair(gems_rb).map(|(_, lock)| lock)
+    match loaded.pair(gems_rb) {
+        Some((_, lock)) => Ok(lock),
+        None => Err(loaded.unsupported_detail().unwrap_or_default()),
+    }
 }
 
 /// [`bundler_loaded_manifest`] with the environment passed explicitly (hermetic

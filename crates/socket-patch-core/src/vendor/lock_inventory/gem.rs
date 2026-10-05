@@ -4,13 +4,13 @@
 
 use std::path::Path;
 
-use crate::crawlers::ruby_crawler::bundler_loaded_lock_in;
+use crate::crawlers::ruby_crawler::{bundler_loaded_lock_diagnosed_in, bundler_loaded_lock_in};
 pub(super) use crate::formats::gem::gem_download_url;
 use crate::formats::gem::GemfileLock;
 use crate::utils::fs::read_regular_to_string;
 
 use super::view::ProjectView;
-use super::{dedup_prefer_integrity, LockfileEntry};
+use super::{dedup_prefer_integrity, LockfileEntry, UnsupportedNpmLayout};
 
 // ── registry view ──
 
@@ -57,6 +57,31 @@ pub(super) async fn inventory_gemfile_lock_raw_in(
     // read-only discovery.
     GemfileLock::parse(&text).entries()
 }
+
+/// Why the project's Bundler lock was not inventoried, when it holds gem
+/// files ([`GEM_FILES`]) but bundler loads no lock socket-patch reads
+/// ([`bundler_loaded_lock_diagnosed_in`]): an unsupported `BUNDLE_GEMFILE`
+/// or `BUNDLE_LOCKFILE`, or a `Gemfile` + `gems.rb` twin whose locks
+/// disagree on the bundler major. Without it a lockfile-only scan would
+/// report the project's gems as absent rather than unscanned.
+pub(super) async fn unsupported_gem_layout_in(
+    view: &ProjectView<'_>,
+) -> Option<UnsupportedNpmLayout> {
+    if !GEM_FILES.iter().any(|rel| view.is_file(rel)) {
+        return None;
+    }
+    let reason = bundler_loaded_lock_diagnosed_in(view).await.err()?;
+    Some(UnsupportedNpmLayout {
+        code: "gem_lock_unsupported",
+        detail: format!(
+            "lockfile-only gem dependencies were NOT scanned: bundler loads no Gemfile.lock \
+             or gems.locked socket-patch can read here: {reason}"
+        ),
+    })
+}
+
+/// The manifest and lock spellings of the two default Bundler pairs.
+const GEM_FILES: [&str; 4] = ["Gemfile", "Gemfile.lock", "gems.rb", "gems.locked"];
 
 /// The DISTINCT `GEM remote:` bases across ALL GEM sections of the lock
 /// bundler loads ([`bundler_loaded_lock_in`]; trailing `/` trimmed), in

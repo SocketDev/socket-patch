@@ -50,7 +50,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use crate::crawlers::ruby_crawler::{bundle_config_setting, bundle_config_setting_including_empty};
+use crate::crawlers::ruby_crawler::bundle_config_setting_including_empty;
 use crate::utils::fs::normalize_lexically;
 
 /// Where a configured `BUNDLE_GEMFILE` came from.
@@ -186,16 +186,18 @@ impl LoadedManifest {
         let Some((_, lock)) = self.pair(gems_rb_present) else {
             return self;
         };
-        let (value, by) = match (
-            lockfile_env.filter(|v| !v.is_empty()),
-            lockfile_config.filter(|v| !v.is_empty()),
-            lockfile_global.filter(|v| !v.is_empty()),
-        ) {
+        // The first tier that holds the key wins, as in `Settings#[]`: a
+        // present empty value shadows the tiers below and means the
+        // default lock.
+        let (value, by) = match (lockfile_env, lockfile_config, lockfile_global) {
             (Some(env), _, _) => (PathBuf::from(env), GemfileSetting::Env),
             (None, Some(config), _) => (PathBuf::from(config), GemfileSetting::AppConfig),
             (None, None, Some(global)) => (PathBuf::from(global), GemfileSetting::GlobalConfig),
             (None, None, None) => return self,
         };
+        if value.as_os_str().is_empty() {
+            return self;
+        }
         let target = resolve_against(root, &value);
         let expected = resolve_against(root, Path::new(lock));
         if target.is_some() && target == expected {
@@ -208,10 +210,11 @@ impl LoadedManifest {
     }
 }
 
-/// The `BUNDLE_LOCKFILE:` value of a bundler app config file (bundler 4's
-/// `bundle config set lockfile <path>`; an empty value counts as unset).
+/// The `BUNDLE_LOCKFILE:` value of a bundler config file (bundler 4's
+/// `bundle config set lockfile <path>`). An empty value is still returned:
+/// it shadows the tiers below it ([`LoadedManifest::with_lockfile`]).
 pub fn config_lockfile(contents: &str) -> Option<String> {
-    bundle_config_setting(contents, "BUNDLE_LOCKFILE")
+    bundle_config_setting_including_empty(contents, "BUNDLE_LOCKFILE")
 }
 
 /// Which manifest bundler's DEFAULT discovery loads when the root holds
@@ -613,6 +616,18 @@ mod tests {
             false,
         );
         assert_eq!(shadowed, LoadedManifest::Default);
+        // A present empty value stops at its tier like `Settings#[]`: the
+        // global custom lock is shadowed and bundler uses the default one.
+        for (env, config) in [(Some(OsStr::new("")), None), (None, Some(""))] {
+            let cleared = classify(&root(), None, None, None).with_lockfile(
+                &root(),
+                env,
+                config,
+                Some("custom.lock"),
+                false,
+            );
+            assert_eq!(cleared, LoadedManifest::Default, "{env:?} {config:?}");
+        }
     }
 
     /// #751: bundler 1.x loads a twin's `Gemfile`, >= 2 its `gems.rb`;
@@ -646,7 +661,10 @@ mod tests {
             config_lockfile("---\nBUNDLE_LOCKFILE: \"custom.lock\"\n"),
             Some("custom.lock".into())
         );
-        assert_eq!(config_lockfile("---\nBUNDLE_LOCKFILE: \"\"\n"), None);
+        assert_eq!(
+            config_lockfile("---\nBUNDLE_LOCKFILE: \"\"\n"),
+            Some(String::new())
+        );
         assert_eq!(config_lockfile("---\nBUNDLE_GEMFILE: \"x\"\n"), None);
     }
 

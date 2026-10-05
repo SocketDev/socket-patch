@@ -1030,10 +1030,10 @@ fn changed_paths(output: &HostedScanOutput) -> Vec<&str> {
 /// and break every frozen install; the project is refused with nothing
 /// written instead. A memory tree only finds gem candidates through the
 /// lock bundler loads (#736), and that lock is none of the default ones
-/// here, so the project yields no gem candidate at all (as with an
-/// unsupported `BUNDLE_GEMFILE`); the `redirect_gem_bundle_lockfile_unsupported`
-/// refusal itself is covered by `ruby_crawler`'s
-/// `loaded_manifest_reads_the_lockfile_setting` and the engine unit tests.
+/// here, so the project yields no gem candidate; the run reports
+/// `gem_lock_unsupported` instead (the per-candidate
+/// `redirect_gem_bundle_lockfile_unsupported` refusal is covered by the
+/// engine unit tests).
 #[tokio::test]
 async fn a_bundler4_custom_lockfile_is_refused() {
     let (server, input) = gem_server_and_input().await;
@@ -1052,6 +1052,14 @@ async fn a_bundler4_custom_lockfile_is_refused() {
         "{:?}",
         changed_paths(&output)
     );
+    assert_gem_lock_unsupported(&output);
+}
+
+/// The run says the project's gems were not scanned, rather than finding
+/// none: the lock inventory's `gem_lock_unsupported` diagnosis.
+fn assert_gem_lock_unsupported(output: &HostedScanOutput) {
+    let codes: Vec<&str> = output.warnings.iter().map(|w| w.code.as_str()).collect();
+    assert!(codes.contains(&"gem_lock_unsupported"), "{codes:?}");
 }
 
 /// #749: a configured lockfile naming the pair's own default lock is the
@@ -1139,8 +1147,9 @@ async fn a_bundler2_twin_still_wires_gems_rb() {
 
 /// #751: twin locks written by different bundler majors leave no safe
 /// spelling to wire: refused, nothing written. No lock is the one bundler
-/// loads (#736), so the memory tree yields no gem candidate to warn about;
-/// the `redirect_gem_twin_bundler_versions_diverge` refusal is covered by the
+/// loads (#736), so the memory tree yields no gem candidate and the run
+/// reports `gem_lock_unsupported`; the per-candidate
+/// `redirect_gem_twin_bundler_versions_diverge` refusal is covered by the
 /// engine unit tests.
 #[tokio::test]
 async fn a_twin_with_diverging_bundler_majors_is_refused() {
@@ -1151,6 +1160,7 @@ async fn a_twin_with_diverging_bundler_majors_is_refused() {
         let project = &output.projects[0];
         assert!(project.redirected.is_empty(), "{versions:?}");
         assert!(changed_paths(&output).is_empty());
+        assert_gem_lock_unsupported(&output);
     }
 }
 
