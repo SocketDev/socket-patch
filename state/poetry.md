@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-03 (run 12), main `045d7ec` (includes #330, #446, #452, #456, #503, #527, #538, #540), latest release 4.0.0 (previous 3.3.0). Run 9 re-measured the cells marked "r9". Runs 10, 11 and 12 have their own tables below. #327 and #329 are closed: macOS / Windows cells that still show them haven't been re-run, because probe branches are blocked.
+Last updated: 2026-10-05 (run 13), main `99f61d2` (includes #330, #446, #452, #456, #503, #527, #538, #540, #644, #703, #708), latest release 4.0.0 (previous 3.3.0). Run 9 re-measured the cells marked "r9". Runs 10–13 have their own tables below. #327 and #329 are closed: macOS / Windows cells that still show them haven't been re-run, because probe branches are blocked.
 
 ## Coverage matrix
 
@@ -46,7 +46,7 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 | --- | --- | --- |
 | Linux | `scan -g` report-only (`--json`): global user-site `six` found, project `.venv` and lock-only packages don't leak in | pass |
 | Linux | `scan -g` sees Debian/apt `.egg-info` installs | fixed by #452 (but see #501) |
-| Linux | `scan -g` sees Poetry's official-installer venv (`~/.local/share/pypoetry/venv`, custom `POETRY_HOME`) | fail #640 (r11: 2.2.1 default, 1.8.5 `POETRY_HOME`; #415 / #418 only fixed pipx) |
+| Linux | `scan -g` sees Poetry's official-installer venv (`~/.local/share/pypoetry/venv`, custom `POETRY_HOME`) | pass r13 (#640 fixed by #644) |
 | Linux | `scan -g --mode hosted`, `--global-prefix --mode hosted`, `SOCKET_GLOBAL=1 --mode hosted`: exit 2, poetry.lock untouched | pass |
 | Linux | `scan -g --mode agent`, re-run idempotent, `get <uuid> -g`, `SOCKET_GLOBAL=1 get`: global copy patched, `.venv` and lock untouched | pass |
 | Linux | `vex -g` attests applied global patch; plain `vex` refuses (`not_applied`) | pass |
@@ -129,14 +129,27 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 | 1.8.5, 2.5.1 | `virtualenvs.create = false` + stray `./venv`, or `./.venv` with `in-project = false` | fail #671 (also release 4.0.0 and the PR #644 head) |
 | 2.5.1 | `create = false` controls (no stray tree; `.venv` with in-project unset) | pass |
 
+### Run 13 cells (Linux, main `99f61d2`)
+
+| Poetry | Cell | Result |
+| --- | --- | --- |
+| 2.5.1, 1.8.5 | #608 re-check: `{data-dir}/venvs` (2.5.1), `{project-dir}/.envs` literal (1.8.5) + vex | pass (fixed by #644) |
+| any | #640 re-check: `scan -g` / `rollback -g` on `$POETRY_HOME/venv` and `~/.local/share/pypoetry/venv` | pass (fixed by #644) |
+| 2.5.1, 1.8.5 | `{data-dir}/venvs` + `env use` + unrelated `VIRTUAL_ENV` / conda env | fail #866 (agent over-patches; hosted vex refuses) |
+| 2.5.1 | default path + `env use` + unrelated `VIRTUAL_ENV` | pass (control) |
+| 2.5.1, 1.8.5 | Hosted forward splice on a mixed CRLF/LF lock (#703) | pass |
+| 1.2.2 | Hosted on a mixed lock 1.1 (`[metadata.files]` LF), then install | pass |
+| 2.5.1, 1.8.5 | Hosted `rollback` / `remove` on a mixed lock | whole file goes LF (see #814, comment) |
+| 2.5.1 | #671, #450 | still fail |
+
 ## Backlog
 
-1. **macOS / Windows re-checks for closed #327 / #329**, plus the #640 default paths (`~/Library/Application Support/pypoetry/venv`, `%APPDATA%\pypoetry\venv`). All need probe branches.
+1. **macOS / Windows re-checks for closed #327 / #329**, the #640 default paths (`~/Library/Application Support/pypoetry/venv`, `%APPDATA%\pypoetry\venv`), and #866 on macOS (where `poetry_default_data_dirs` can return two data dirs). All need probe branches.
 2. **macOS XDG** (run 8 lead): with `XDG_CACHE_HOME` / `XDG_CONFIG_HOME` set and platformdirs ≥ 4.6.0, Poetry uses the XDG dirs, but `poetry_default_cache_dir` / `poetry_user_config_path` only look in `~/Library/...`. Needs a macOS probe.
 3. **Windows Poetry 1.0/1.1 env hash** (run 8 lead): Poetry < 1.2 hashes the raw cwd, while socket-patch lowercases it. Needs a Windows probe.
-4. Probe branches are still blocked: in runs 9–12 remote branch deletion was denied (in run 12 the auto-mode classifier refused `git push --delete`). A maintainer needs to delete `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes`, and allow deleting `bughunt/poetry/*` branches.
-5. Hosted with `create = false` + a stray venv: which interpreter do the stale-install check and VEX judge? (Related to #671.)
-6. Re-verify #608 / #640 when PR #644 merges.
+4. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist (run 13), and deletion was denied in runs 9–12. A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
+5. Hosted ⇄ vendored takeover on a mixed-EOL lock (the takeover restore shares `pypi_locks::finish`).
+6. Hosted with `create = false` + a stray venv: which interpreter do the stale-install check and VEX judge? (Related to #671.)
 7. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the poetry-compatibility "Installer boundaries" table says 1.4–1.8 replace it.
 
 ## Known non-bugs
@@ -185,3 +198,5 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 - Poetry 1.x's env-var `boolean_normalizer` is case-sensitive (`POETRY_VIRTUALENVS_IN_PROJECT=True` is false), while 2.x lowercases. Same theoretical class as `yes` / `on`; it only diverges with a stray `.venv`. Not filed.
 - Standalone `vex --json` needs `-O <file>` (`-o` is `--org`), and against a mock it needs `--api-url` / `--org` for vulnerability metadata. Without them you get harness errors, not product bugs.
 - Hosted `rollback` prints "1 unwired package keeps its patched bytes in installed trees" even when no venv exists. Cosmetic, not filed.
+- Hosted `rollback` / `remove` on a lock mixing CRLF and LF rewrites the whole file as LF (content equal modulo EOL; Poetry still installs). Tracked under #814 child 2 (comment from run 13), not filed separately.
+- Release 4.0.0 doesn't redirect against a v5-shaped mock (`Redirected 0`). It's no baseline for hosted cells.
