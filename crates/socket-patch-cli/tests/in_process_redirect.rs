@@ -1179,6 +1179,178 @@ async fn scan_redirect_bun_bundled_copy_is_not_attested_in_run() {
     );
 }
 
+/// REGRESSION (#325): npm's half of #469. The hoisted entry is redirected,
+/// but a parent also bundles the same `name@version` (`inBundle: true` in
+/// `packages`, or the legacy `bundled: true` spelling in a v1
+/// `dependencies` tree). npm unpacks that copy from the parent's tarball,
+/// so it stays unpatched; the run warns
+/// `redirect_npm_bundled_instance_skipped`, and its in-run `--vex` must
+/// not attest the purl either.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_npm_bundled_copy_is_not_attested_in_run() {
+    let packages_lock = format!(
+        r#"{{
+  "name": "consumer",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {{
+    "": {{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}", "parent": "2.0.0" }} }},
+    "node_modules/{NAME}": {{
+      "version": "{VERSION}",
+      "resolved": "https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz",
+      "integrity": "sha512-UPSTREAMupstream=="
+    }},
+    "node_modules/parent": {{
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/parent/-/parent-2.0.0.tgz",
+      "integrity": "sha512-PARENT=="
+    }},
+    "node_modules/parent/node_modules/{NAME}": {{
+      "version": "{VERSION}",
+      "inBundle": true,
+      "integrity": "sha512-UPSTREAMupstream=="
+    }}
+  }}
+}}
+"#
+    );
+    let legacy_lock = format!(
+        r#"{{
+  "name": "consumer",
+  "version": "0.0.0",
+  "lockfileVersion": 1,
+  "requires": true,
+  "dependencies": {{
+    "{NAME}": {{
+      "version": "{VERSION}",
+      "resolved": "https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz",
+      "integrity": "sha512-UPSTREAMupstream=="
+    }},
+    "parent": {{
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/parent/-/parent-2.0.0.tgz",
+      "integrity": "sha512-PARENT==",
+      "dependencies": {{
+        "{NAME}": {{
+          "version": "{VERSION}",
+          "bundled": true
+        }}
+      }}
+    }}
+  }}
+}}
+"#
+    );
+    for (shape, lock) in [("inBundle", packages_lock), ("legacy bundled", legacy_lock)] {
+        let server = MockServer::start().await;
+        mock_discovery(&server).await;
+        mock_reference(&server).await;
+        mock_view(&server).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_project(tmp.path());
+        std::fs::write(tmp.path().join("package-lock.json"), &lock).unwrap();
+        let copy = tmp
+            .path()
+            .join("node_modules/parent/node_modules")
+            .join(NAME);
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(
+            copy.join("package.json"),
+            format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("node_modules/parent/package.json"),
+            format!(
+                r#"{{ "name": "parent", "version": "2.0.0", "bundleDependencies": ["{NAME}"] }}"#
+            ),
+        )
+        .unwrap();
+
+        let out = tmp.path().join("out.vex.json");
+        let mut args = redirect_args(tmp.path(), server.uri());
+        args.vex.vex = Some(out.clone());
+        args.vex.vex_product = Some("pkg:npm/consumer@0.0.0".into());
+        let _ = run(args).await;
+
+        let rewritten = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+        assert!(
+            rewritten.contains(HOSTED_URL),
+            "{shape}: the regular entry is redirected:\n{rewritten}"
+        );
+        let attested = std::fs::read_to_string(&out)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .is_some_and(|doc| doc.to_string().contains(PURL));
+        assert!(
+            !attested,
+            "{shape}: in-run VEX must not attest a purl whose bundled copy stays unpatched"
+        );
+    }
+}
+
+/// npm 7+ installs from the v2 `packages` map. An ignored legacy bundled
+/// flag must not block the hosted in-run attestation before that install.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_npm_stale_legacy_bundle_mirror_still_attests() {
+    for lockfile in ["package-lock.json", "npm-shrinkwrap.json"] {
+        let server = MockServer::start().await;
+        mock_discovery(&server).await;
+        mock_reference(&server).await;
+        mock_view(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_project(tmp.path());
+        std::fs::write(
+            tmp.path().join("node_modules").join(NAME).join("index.js"),
+            b"upstream bytes before the next install\n",
+        )
+        .unwrap();
+        let original = tmp.path().join("package-lock.json");
+        let mut lock: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&original).unwrap()).unwrap();
+        lock["lockfileVersion"] = serde_json::json!(2);
+        lock["dependencies"] = serde_json::json!({
+            NAME: {
+                "version": VERSION,
+                "resolved": format!("https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz"),
+                "integrity": "sha512-UPSTREAMupstream==",
+                "bundled": true
+            }
+        });
+        std::fs::write(&original, serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+        if lockfile != "package-lock.json" {
+            std::fs::rename(&original, tmp.path().join(lockfile)).unwrap();
+        }
+        let out = tmp.path().join("out.vex.json");
+        let mut args = redirect_args(tmp.path(), server.uri());
+        args.vex.vex = Some(out.clone());
+        args.vex.vex_product = Some("pkg:npm/consumer@0.0.0".into());
+        let exit = run(args).await;
+        assert_eq!(
+            exit, 0,
+            "{lockfile}: npm consumes the normal packages entry"
+        );
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        assert!(
+            document.to_string().contains(PURL),
+            "{lockfile}: {document:#}"
+        );
+        assert_eq!(document["statements"][0]["status"], "not_affected");
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join(lockfile)).unwrap()).unwrap();
+        assert_eq!(
+            rewritten["packages"][format!("node_modules/{NAME}")]["resolved"],
+            HOSTED_URL
+        );
+        assert_eq!(rewritten["dependencies"][NAME]["bundled"], true);
+    }
+}
+
 /// The bun 1.4 leg: `"lockfileVersion": 2` is the SAME emitted grammar as 1
 /// (bun 1.4 bumped the integer to gate stricter parse checks — oven-sh/bun
 /// PR #31539 — same-fixture locks are byte-identical except the integer), so
@@ -4326,4 +4498,258 @@ async fn in_process_hosted_scan_state_attests_manifest_less() {
             .join()
             .expect("manifest-less VEX tail panicked");
     });
+}
+
+// ── #557 / #817: restore keeps the registry tarball URL its PM records ──────
+
+/// [`mock_npm_registry`] for a registry whose version document advertises
+/// `tarball_url` as `dist.tarball` — a proxy or GitHub Packages-style
+/// registry whose URLs are not at the conventional
+/// `<registry>/<name>/-/<name>-<version>.tgz` path. Also mounts the
+/// `/upstream/npm/<uuid>.json` record a berry restore reads its checksum
+/// from.
+async fn mock_npm_registry_advertising(server: &MockServer, integrity: &str, tarball_url: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/npm-registry/{NAME}/{VERSION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": NAME,
+            "version": VERSION,
+            "dist": {
+                "tarball": tarball_url,
+                "integrity": integrity,
+                "shasum": "0".repeat(40),
+            }
+        })))
+        .mount(server)
+        .await;
+    let checksum = socket_patch_core::vendor::test_support::service_fixture::berry_checksum(
+        &upstream_tarball(),
+        NAME,
+    )
+    .unwrap();
+    Mock::given(method("GET"))
+        .and(path(format!("/upstream/npm/{UUID}.json")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": NAME, "version": VERSION, "integrity": integrity, "yarnBerry10c0": checksum
+        })))
+        .mount(server)
+        .await;
+}
+
+/// #817: on a registry whose `dist.tarball` is not at yarn's conventional
+/// path, yarn locks the entry as `name@npm:<v>::__archiveUrl=<encoded url>`
+/// and fetches from that URL. A hosted pin then `rollback` must give the
+/// binding back (the restored locator is the one yarn wrote), not a bare
+/// `name@npm:<v>` that yarn would fetch from a path the registry never
+/// advertised.
+#[tokio::test]
+#[serial]
+async fn yarn_berry_rollback_restores_the_registry_archive_url_binding() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    mock_reference_with_berry_url(&server, &hosted_url).await;
+    mock_view(&server).await;
+    let advertised = format!(
+        "{}/files/{}",
+        server.uri(),
+        socket_patch_core::utils::uri::encode_uri_component(&format!(
+            "https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz"
+        ))
+    );
+    mock_npm_registry_advertising(
+        &server,
+        &vlt_hosted_common::sha512_sri(&upstream_tarball()),
+        &advertised,
+    )
+    .await;
+    let binding = |t: &str| {
+        t.replace(
+            &format!("resolution: \"{NAME}@npm:{VERSION}\""),
+            &format!(
+                "resolution: \"{NAME}@npm:{VERSION}::__archiveUrl={}\"",
+                socket_patch_core::utils::uri::encode_uri_component(&advertised)
+            ),
+        )
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_berry_project_spelled(tmp.path(), binding);
+    let lock_path = tmp.path().join("yarn.lock");
+    let pristine = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(pristine.contains("::__archiveUrl="), "{pristine}");
+
+    let env = run_redirect_subprocess_with(
+        tmp.path(),
+        &server.uri(),
+        &["--patch-server-url", &server.uri()],
+    );
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let pinned = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(
+        pinned.contains(&format!("\n  resolution: \"{NAME}@{hosted_url}\"\n")),
+        "{pinned}"
+    );
+
+    let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
+    assert_eq!(code, Some(0), "rollback: {env:#}");
+    assert_eq!(
+        env["hosted"]["reverted"],
+        serde_json::json!([PURL]),
+        "{env:#}"
+    );
+    let restored = std::fs::read_to_string(&lock_path).unwrap();
+    let checksum = berry_checksum_of(&restored);
+    assert_eq!(
+        restored,
+        pristine.replace(
+            &format!("10c0/{}", "3".repeat(128)),
+            &format!("10c0/{checksum}")
+        ),
+        "rollback restores the locator with its __archiveUrl binding"
+    );
+}
+
+/// #817 control: a registry serving conventional tarball URLs keeps the
+/// bare `name@npm:<v>` locator yarn writes for it (no binding invented).
+#[tokio::test]
+#[serial]
+async fn yarn_berry_rollback_keeps_a_bare_locator_for_conventional_urls() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    mock_reference_with_berry_url(&server, &hosted_url).await;
+    mock_view(&server).await;
+    let conventional = format!(
+        "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+        server.uri()
+    );
+    mock_npm_registry_advertising(
+        &server,
+        &vlt_hosted_common::sha512_sri(&upstream_tarball()),
+        &conventional,
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_berry_project(tmp.path());
+    let lock_path = tmp.path().join("yarn.lock");
+    let pristine = std::fs::read_to_string(&lock_path).unwrap();
+    let env = run_redirect_subprocess_with(
+        tmp.path(),
+        &server.uri(),
+        &["--patch-server-url", &server.uri()],
+    );
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
+    assert_eq!(code, Some(0), "rollback: {env:#}");
+    let restored = std::fs::read_to_string(&lock_path).unwrap();
+    let checksum = berry_checksum_of(&restored);
+    assert_eq!(
+        restored,
+        pristine.replace(
+            &format!("10c0/{}", "3".repeat(128)),
+            &format!("10c0/{checksum}")
+        )
+    );
+    assert!(!restored.contains("__archiveUrl"), "{restored}");
+}
+
+/// A pnpm project whose lock records the patched entry as
+/// `{integrity, tarball: <tarball>}` — what pnpm writes under
+/// `lockfile-include-tarball-url`, or for a tarball URL the registry
+/// serves off the conventional path.
+fn write_pnpm_tarball_project(root: &Path, tarball: &str) -> String {
+    write_pnpm_project(root);
+    let lock = rush_pnpm_lock(NAME).replace(
+        "resolution: {integrity: sha512-UPSTREAMupstream==}",
+        &format!("resolution: {{integrity: sha512-UPSTREAMupstream==, tarball: {tarball}}}"),
+    );
+    std::fs::write(root.join("pnpm-lock.yaml"), &lock).unwrap();
+    lock
+}
+
+/// Scan hosted, then roll back, and return the restored pnpm-lock.yaml.
+fn pnpm_pin_and_rollback(root: &Path, server: &MockServer) -> String {
+    let env = run_redirect_subprocess(root, &server.uri());
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let pinned = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+    assert!(pinned.contains("patch.test"), "{pinned}");
+    let (code, env) = rollback_json(root, server);
+    assert_eq!(code, Some(0), "rollback: {env:#}");
+    assert_eq!(
+        env["hosted"]["reverted"],
+        serde_json::json!([PURL]),
+        "{env:#}"
+    );
+    std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap()
+}
+
+/// #557: under `.npmrc` `lockfile-include-tarball-url=true` (pnpm 9/10),
+/// pnpm records every resolution with its `tarball:` URL, so `rollback`
+/// must write the registry's `dist.tarball` back — byte-exact.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_keeps_tarball_under_npmrc_include_tarball_url() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+    let tarball = format!(
+        "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+        server.uri()
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &tarball);
+    std::fs::write(
+        tmp.path().join(".npmrc"),
+        "lockfile-include-tarball-url=true\n",
+    )
+    .unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// #557, the pnpm 10+ spelling: `lockfileIncludeTarballUrl: true` in
+/// pnpm-workspace.yaml.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_keeps_tarball_under_workspace_include_tarball_url() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+    let tarball = format!(
+        "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+        server.uri()
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &tarball);
+    std::fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - '.'\nlockfileIncludeTarballUrl: true\n",
+    )
+    .unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// #557, the other case pnpm records `tarball:` in: the registry's
+/// `dist.tarball` is not the conventional URL pnpm would derive, so pnpm
+/// keeps it even without the setting.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_keeps_an_unconventional_registry_tarball() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let advertised = format!("{}/files/{NAME}/{VERSION}/download.tgz", server.uri());
+    mock_npm_registry_advertising(&server, "sha512-UPSTREAMupstream==", &advertised).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &advertised);
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
 }

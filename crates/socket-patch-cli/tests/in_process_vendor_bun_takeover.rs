@@ -593,6 +593,77 @@ async fn bun_hosted_then_scan_vendored_takeover_round_trips_to_registry() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// 1a. Lockfile-only checkouts (no node_modules) see the hosted pin (#720)
+// ─────────────────────────────────────────────────────────────────────
+// The usual CI shape: a committed hosted bun.lock and no install. The
+// lockfile inventory must still name the hosted-pinned package, or a
+// hosted re-run never moves to a superseding patch and `scan --mode
+// vendored` never takes the pin over — both "success" with 0 packages.
+
+/// A superseded patch's uuid: the hosted pin an earlier scan committed.
+const SUPERSEDED_UUID: &str = "1e2d3c4b-5a69-4788-9a6b-5c4d3e2f1a0b";
+
+/// A lockfile-only bun project whose lock pins `left-pad` to `url`.
+fn write_lockfile_only_hosted_project(root: &Path, url: &str) -> String {
+    write_bun_project(root, &pristine_lock(), &[(NAME, VERSION)]);
+    let lock = pristine_lock().replace(
+        LEFT_PAD_REGISTRY_LINE,
+        &hosted_line(NAME, NAME, url, PATCHED_SHA512),
+    );
+    assert_ne!(lock, pristine_lock(), "replacement must hit");
+    std::fs::write(root.join("bun.lock"), &lock).unwrap();
+    std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+    lock
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bun_lockfile_only_hosted_rerun_moves_to_a_superseding_patch() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let superseded_url = HOSTED_URL.replace(UUID, SUPERSEDED_UUID);
+    write_lockfile_only_hosted_project(root, &superseded_url);
+
+    let (code, env) = scan_mode(root, &server.uri(), "hosted", &[]);
+    assert_eq!(code, 0, "hosted re-run must succeed: {env:#}");
+    assert_eq!(
+        env["scannedPackages"], 1,
+        "the hosted pin must be seen: {env:#}"
+    );
+    let lock = read(root, "bun.lock");
+    assert_eq!(
+        lock_line(&lock, NAME),
+        hosted_line(NAME, NAME, HOSTED_URL, PATCHED_SHA512),
+        "the re-run must re-pin to the superseding patch:\n{lock}"
+    );
+    assert!(!lock.contains(SUPERSEDED_UUID), "{lock}");
+    assert!(!root.join("node_modules").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bun_lockfile_only_scan_vendored_takes_over_the_hosted_pin() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let hosted_lock = write_lockfile_only_hosted_project(root, HOSTED_URL);
+
+    let (code, env) = scan_mode(root, &server.uri(), "vendored", &[]);
+    assert_eq!(code, 0, "vendored takeover must succeed: {env:#}");
+    assert_eq!(
+        env["scannedPackages"], 1,
+        "the hosted pin must be seen: {env:#}"
+    );
+    let vendor = &env["vendor"];
+    assert_eq!(vendor["summary"]["applied"], 1, "{env:#}");
+    assert_eq!(vendor["summary"]["failed"], 0, "{env:#}");
+    find_event(vendor, "skipped", Some("vendor_takeover_reverted_redirect"));
+    assert_ne!(read(root, "bun.lock"), hosted_lock, "bun.lock must change");
+    assert_pure_vendored(root);
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // 1b. Digest-less re-saves (Bun 1.1.39–1.3.9) across the conversions
 // ─────────────────────────────────────────────────────────────────────
 // Every text-lock release below 1.3.10 re-saves a URL or local-tarball

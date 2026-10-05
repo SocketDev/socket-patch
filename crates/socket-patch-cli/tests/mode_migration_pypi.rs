@@ -63,9 +63,14 @@ fn hosted_wheel() -> Vec<u8> {
 /// Stage `.socket/manifest.json` + the after-hash blob so `vendor` builds
 /// the vendored wheel from the prebuilt fixture server, offline.
 fn stage_manifest(root: &Path) {
-    let after = compute_git_sha256_from_bytes(PATCHED);
+    stage_manifest_with(root, UUID, PATCHED);
+}
+
+/// [`stage_manifest`] for patch `uuid` whose patched `six.py` is `patched`.
+fn stage_manifest_with(root: &Path, uuid: &str, patched: &[u8]) {
+    let after = compute_git_sha256_from_bytes(patched);
     let manifest = json!({ "patches": { PURL: {
-        "uuid": UUID,
+        "uuid": uuid,
         "exportedAt": "2026-01-01T00:00:00Z",
         "files": { "six.py": {
             "beforeHash": compute_git_sha256_from_bytes(ORIG),
@@ -83,7 +88,7 @@ fn stage_manifest(root: &Path) {
         serde_json::to_vec_pretty(&manifest).unwrap(),
     )
     .unwrap();
-    std::fs::write(socket.join("blobs").join(after), PATCHED).unwrap();
+    std::fs::write(socket.join("blobs").join(after), patched).unwrap();
 }
 
 /// The built binary with every ambient `SOCKET_*` var scrubbed. An EMPTY
@@ -291,6 +296,86 @@ lock-version = "2.1"
 python-versions = ">=3.9"
 content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01"
 "#;
+
+/// #765: a vendored requirements.txt picks up a superseding patch. The
+/// manifest moves `six` from patch A to patch B (different patched bytes);
+/// the next `vendor` must re-wire the requirements line to B's wheel in
+/// place, remove A's uuid dir (`vendor_stale_artifact_removed`) and exit 0.
+/// Before the fix it failed `pypi_requirements_already_vendored` (exit 1)
+/// and pip kept installing patch A. `vendor --revert` afterwards restores
+/// the user's original pin, so the carried-over ledger record is intact.
+#[tokio::test]
+async fn requirements_vendored_revendors_superseding_patch() {
+    const UUID_B: &str = "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6d";
+    const PATCHED_B: &[u8] = b"# six\nVERSION = '1.16.0'\nSOCKET_PATCHED = 2\n";
+    for original in [
+        "idna==3.7\nsix==1.16.0\n".to_string(),
+        format!(
+            "idna==3.7 --hash=sha256:{}\nsix==1.16.0 ; python_version >= \"3\" \\\n    --hash=sha256:{WHEEL_SHA}\n",
+            "1".repeat(64)
+        ),
+    ] {
+        let (_tmp, root) = project();
+        std::fs::write(root.join("requirements.txt"), &original).unwrap();
+        vendor_project(&root, &["requirements.txt"]);
+        let wired_a = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+
+        stage_manifest_with(&root, UUID_B, PATCHED_B);
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 0, "re-vendor to the superseding patch: {env:#}");
+        let rendered = env.to_string();
+        assert!(
+            !rendered.contains("pypi_requirements_already_vendored"),
+            "{env:#}"
+        );
+        assert!(
+            rendered.contains("vendor_stale_artifact_removed"),
+            "patch A's artifact is reclaimed: {env:#}"
+        );
+        let wired_b = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+        assert!(!wired_b.contains(UUID), "uuid A is gone:\n{wired_b}");
+        assert_eq!(
+            wired_b.matches(&format!(".socket/vendor/pypi/{UUID_B}/")).count(),
+            1,
+            "one six line, on patch B:\n{wired_b}"
+        );
+        assert_eq!(
+            wired_b.lines().count(),
+            wired_a.lines().count(),
+            "re-wired in place:\n{wired_a}\n{wired_b}"
+        );
+        assert_eq!(
+            wired_b.contains("--hash="),
+            original.contains("--hash="),
+            "hash mode kept:\n{wired_b}"
+        );
+        assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+        let wheel_b = wired_b
+            .split_whitespace()
+            .find(|t| t.contains(UUID_B))
+            .unwrap();
+        assert!(root.join(wheel_b).is_file(), "patch B's wheel: {wheel_b}");
+        let ledger = std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap();
+        assert!(ledger.contains(UUID_B) && !ledger.contains(UUID), "{ledger}");
+
+        // Re-running is settled: in sync, nothing rewritten.
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 0, "{env:#}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("requirements.txt")).unwrap(),
+            wired_b
+        );
+
+        let (code, env) = run_cli(&root, &["vendor", "--revert"], &[]);
+        assert_eq!(code, 0, "revert after the re-vendor: {env:#}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("requirements.txt")).unwrap(),
+            original,
+            "the user's own pin is restored"
+        );
+        assert!(!root.join(format!(".socket/vendor/pypi/{UUID_B}")).exists());
+    }
+}
 
 #[tokio::test]
 async fn requirements_vendored_to_hosted() {
@@ -596,4 +681,129 @@ async fn ledger_update_failure_after_revert_is_stranded() {
     assert!(text.contains("redirect_takeover_unpatched"), "{env:#}");
     assert_eq!(env["status"], "partial_failure", "{env:#}");
     assert_eq!(code, 1, "{env:#}");
+}
+
+/// #699: hosted mode rewrites only the ROOT `requirements.txt`, while
+/// vendored mode also wires a pin in a `-r` include or appends a managed
+/// `(transitive)` line. A vendored → hosted takeover of such a pin used to
+/// revert the vendored wiring first and then find no root entry to pin,
+/// stranding the package unpatched (exit 1). It must be refused BEFORE the
+/// revert — the vendored patch, ledger entry and wheel are kept — and the
+/// dry run must predict that refusal instead of a clean takeover.
+async fn assert_unreachable_takeover_refused(root: &Path, wired: &str, dry_run: bool) {
+    let before = std::fs::read_to_string(root.join(wired)).unwrap();
+    let root_before = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+    let state = root.join(".socket/vendor/state.json");
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+    let mut args = hosted_scan_args(&uri);
+    if dry_run {
+        args.push("--dry-run");
+    }
+    let (code, env) = run_cli(root, &args, &[]);
+    let text = env.to_string();
+    assert!(
+        !text.contains("redirect_would_revert_vendored")
+            && !text.contains("redirect_takeover_reverted_vendored"),
+        "no takeover over an entry hosted mode cannot pin: {env:#}"
+    );
+    assert!(
+        !text.contains("redirect_takeover_unpatched"),
+        "the package is never stranded: {env:#}"
+    );
+    assert!(
+        text.contains("redirect_requirements_takeover_unreachable"),
+        "the refusal is named: {env:#}"
+    );
+    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    assert_eq!(
+        code, 0,
+        "a refused takeover keeps the package vendored: {env:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(wired)).unwrap(),
+        before,
+        "{wired}: the vendored line is kept"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("requirements.txt")).unwrap(),
+        root_before,
+        "requirements.txt is untouched"
+    );
+    assert!(
+        std::fs::read_to_string(&state).unwrap().contains(UUID),
+        "the ledger entry is kept"
+    );
+    assert!(
+        root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
+        "the vendored artifact is kept"
+    );
+}
+
+fn include_project() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, root) = project();
+    std::fs::write(root.join("requirements.txt"), "-r base.txt\nidna==3.7\n").unwrap();
+    std::fs::write(root.join("base.txt"), "six==1.16.0\n").unwrap();
+    vendor_project(&root, &["base.txt"]);
+    (tmp, root)
+}
+
+fn transitive_project() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, root) = project();
+    std::fs::write(root.join("requirements.txt"), "idna==3.7\n").unwrap();
+    std::fs::write(root.join("requirements-dev.txt"), "six==1.16.0\n").unwrap();
+    vendor_project(&root, &["requirements.txt"]);
+    assert!(
+        std::fs::read_to_string(root.join("requirements.txt"))
+            .unwrap()
+            .contains("(transitive)"),
+        "vendor appended a managed transitive line"
+    );
+    (tmp, root)
+}
+
+#[tokio::test]
+async fn include_pin_takeover_is_refused_before_revert() {
+    let (_tmp, root) = include_project();
+    assert_unreachable_takeover_refused(&root, "base.txt", false).await;
+}
+
+#[tokio::test]
+async fn dry_run_predicts_include_pin_takeover_refusal() {
+    let (_tmp, root) = include_project();
+    assert_unreachable_takeover_refused(&root, "base.txt", true).await;
+}
+
+#[tokio::test]
+async fn transitive_line_takeover_is_refused_before_revert() {
+    let (_tmp, root) = transitive_project();
+    assert_unreachable_takeover_refused(&root, "requirements.txt", false).await;
+}
+
+#[tokio::test]
+async fn dry_run_predicts_transitive_line_takeover_refusal() {
+    let (_tmp, root) = transitive_project();
+    assert_unreachable_takeover_refused(&root, "requirements.txt", true).await;
+}
+
+/// Control for #699: a vendored pin in the root file is still taken over,
+/// and the dry run still previews it.
+#[tokio::test]
+async fn dry_run_previews_root_pin_takeover() {
+    let (_tmp, root) = project();
+    std::fs::write(root.join("requirements.txt"), "idna==3.7\nsix==1.16.0\n").unwrap();
+    vendor_project(&root, &["requirements.txt"]);
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+    let mut args = hosted_scan_args(&uri);
+    args.push("--dry-run");
+    let (code, env) = run_cli(&root, &args, &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(
+        env.to_string().contains("redirect_would_revert_vendored"),
+        "{env:#}"
+    );
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
 }

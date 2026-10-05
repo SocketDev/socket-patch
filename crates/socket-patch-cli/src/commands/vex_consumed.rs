@@ -40,7 +40,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use socket_patch_core::crawlers::npm_crawler::find_store_peer_variant_copies;
+#[cfg(not(test))]
+use socket_patch_core::crawlers::npm_crawler::with_store_peer_variant_copies;
 use socket_patch_core::crawlers::{
     CargoCrawler, CrawlerOptions, Ecosystem, GoCrawler, MavenCrawler, NpmCrawler,
 };
@@ -50,6 +51,8 @@ use socket_patch_core::vendor::go_mod_edit::{
 };
 use socket_patch_core::vendor::lock_inventory::LockIntegrity;
 use socket_patch_core::vex::HostedCopies;
+#[cfg(test)]
+use tests::recording_store_variants as with_store_peer_variant_copies;
 
 use crate::args::GlobalArgs;
 use crate::commands::vex_sources::HostedWiring;
@@ -61,8 +64,9 @@ use crate::ecosystem_dispatch::{
 /// module docs), under the same crawler options and `--ecosystems` scope as
 /// the installed-tree lookup. `installed` is that lookup's every-copy
 /// result ([`crate::ecosystem_dispatch::find_manifest_package_copies_reusing`] over
-/// the record view, which holds every hosted purl): the shared-location
-/// ecosystems read it instead of crawling the tree a second time. `prior`
+/// the record view, which holds every hosted purl), including npm store
+/// variants. The shared-location ecosystems read it instead of crawling
+/// the tree a second time. `prior`
 /// (embedded hosted `scan --vex` only) is scan's npm crawl of the same
 /// tree: the alias walk takes its `node_modules` roots and the identity
 /// fallback its packages instead of walking the tree again.
@@ -107,9 +111,40 @@ pub(crate) async fn hosted_consumed_copies(
         let npm: Vec<&String> = shared.get(&Ecosystem::Npm).into_iter().flatten().collect();
         for purl in shared.values().flatten() {
             let mut paths = all.remove(purl).unwrap_or_default();
-            paths.extend(aliases.remove(purl).unwrap_or_default());
-            if npm.contains(&purl) {
-                paths = with_store_variants(paths).await;
+            // The installed-tree lookup already resolves importer-tree
+            // aliases, so most of the walk's finds are in `paths` already.
+            let extra: Vec<PathBuf> = aliases
+                .remove(purl)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|alias| !paths.contains(alias))
+                .collect();
+            if npm.contains(&purl) && installed.get(purl).is_some_and(|p| !p.is_empty()) {
+                // The installed lookup already expanded these copies.
+                // Expanding its N variants again scans the store N times.
+                // Only aliases are new; expand them before merging so a
+                // different alias/store can still contribute more copies.
+                if !extra.is_empty() {
+                    let added = with_store_peer_variant_copies(extra).await;
+                    let mut seen = std::collections::HashSet::new();
+                    for path in &paths {
+                        seen.insert(tokio::fs::canonicalize(path).await.unwrap_or(path.clone()));
+                    }
+                    for path in added {
+                        let canonical =
+                            tokio::fs::canonicalize(&path).await.unwrap_or(path.clone());
+                        if seen.insert(canonical) {
+                            paths.push(path);
+                        }
+                    }
+                }
+            } else if npm.contains(&purl) {
+                // No installed copies: the identity fallback and aliases
+                // have not had their store variants enumerated yet.
+                paths.extend(extra);
+                paths = with_store_peer_variant_copies(paths).await;
+            } else {
+                paths.extend(extra);
             }
             out.insert(
                 purl.clone(),
@@ -313,28 +348,6 @@ async fn npm_identity_fallback_reusing(
         Some(installed) => all.extend(npm_paths_by_identity_in(installed, &missing)),
         None => all.extend(npm_paths_by_identity(options, &missing).await),
     }
-}
-
-/// `paths` plus every store variant of each (a pnpm peer suffix, a vlt peer
-/// or modifier extra, a vlt registry-alias instance of the same
-/// `name@version`): the crawler resolves a store copy only for a package
-/// with no importer copy, leaving the variants to apply's fan-out, but each
-/// variant is what some dependent loads.
-async fn with_store_variants(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    for path in &paths {
-        seen.insert(tokio::fs::canonicalize(path).await.unwrap_or(path.clone()));
-    }
-    let mut out = paths.clone();
-    for path in &paths {
-        for copy in find_store_peer_variant_copies(path).await {
-            let canonical = tokio::fs::canonicalize(&copy).await.unwrap_or(copy.clone());
-            if seen.insert(canonical) {
-                out.push(copy);
-            }
-        }
-    }
-    out
 }
 
 // ── golang ───────────────────────────────────────────────────────────────
@@ -598,6 +611,208 @@ async fn maven_copies(options: &CrawlerOptions, purl: &str, wiring: &HostedWirin
 mod tests {
     use super::*;
 
+    tokio::task_local! {
+        // Observe real expansion work only in the regression's own task;
+        // concurrent tests keep calling the production helper normally.
+        static VARIANT_INPUTS: std::cell::RefCell<Vec<Vec<PathBuf>>>;
+    }
+
+    pub(super) async fn recording_store_variants(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        let _ = VARIANT_INPUTS.try_with(|calls| calls.borrow_mut().push(paths.clone()));
+        socket_patch_core::crawlers::npm_crawler::with_store_peer_variant_copies(paths).await
+    }
+
+    #[cfg(unix)]
+    async fn tracked_npm_hosted(
+        common: &GlobalArgs,
+        installed: &HashMap<String, Vec<PathBuf>>,
+    ) -> (Vec<PathBuf>, Vec<Vec<PathBuf>>) {
+        let purl = "pkg:npm/left-pad@1.3.0".to_string();
+        let hosted = BTreeMap::from([(
+            purl.clone(),
+            HostedWiring {
+                uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+                refs: Vec::new(),
+            },
+        )]);
+        VARIANT_INPUTS
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                let mut found = hosted_consumed_copies(common, &hosted, installed, None).await;
+                let paths = found.remove(&purl).unwrap().paths;
+                let calls = VARIANT_INPUTS.with(|inputs| inputs.borrow().clone());
+                (paths, calls)
+            })
+            .await
+    }
+
+    #[cfg(unix)]
+    fn peer_copies(store: &Path, count: usize) -> Vec<PathBuf> {
+        (0..count)
+            .map(|i| {
+                let path = store.join(format!(
+                    "left-pad@1.3.0(peer@1.0.{i})/node_modules/left-pad"
+                ));
+                pkg(&path, "left-pad", "1.3.0");
+                path
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hosted_reuses_expanded_npm_copies_and_merges_alias_variants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().canonicalize().unwrap().join("node_modules");
+        let peers = peer_copies(&nm.join(".pnpm"), 8);
+        std::os::unix::fs::symlink(&peers[0], nm.join("left-pad")).unwrap();
+        let common = GlobalArgs {
+            cwd: tmp.path().canonicalize().unwrap(),
+            ecosystems: Some(vec!["npm".to_string()]),
+            ..GlobalArgs::default()
+        };
+        let purl = "pkg:npm/left-pad@1.3.0".to_string();
+        let installed = crate::ecosystem_dispatch::find_manifest_package_copies_reusing(
+            std::slice::from_ref(&purl),
+            &common,
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(installed[&purl].len(), peers.len());
+        let (paths, calls) = tracked_npm_hosted(&common, &installed).await;
+        assert_eq!(paths, installed[&purl]);
+        assert!(
+            calls.is_empty(),
+            "already-expanded copies were rescanned: {calls:?}"
+        );
+
+        // A real alias is absent from the name-keyed installed set. Its
+        // store variants overlap that set canonically, including the
+        // importer link's physical copy; keep the alias once and preserve
+        // the original importer-first path choices.
+        let alias = nm.join("lp");
+        pkg(&alias, "left-pad", "1.3.0");
+        let (paths, calls) = tracked_npm_hosted(&common, &installed).await;
+        assert_eq!(calls, vec![vec![alias.clone()]]);
+        let mut expected = installed[&purl].clone();
+        expected.push(alias);
+        assert_eq!(paths, expected);
+
+        // An alias beneath a real nested host can reach another store.
+        // The installed root copy makes the name-keyed resolver skip
+        // those peers, so alias expansion must still add them even when
+        // installed copies are already present.
+        let host = nm.join("host");
+        pkg(&host, "host", "1.0.0");
+        let host_nm = host.join("node_modules");
+        let nested_peers = peer_copies(&host_nm.join(".pnpm"), 2);
+        let nested_alias = host_nm.join("lp");
+        pkg(&nested_alias, "left-pad", "1.3.0");
+        let installed_again = crate::ecosystem_dispatch::find_manifest_package_copies_reusing(
+            std::slice::from_ref(&purl),
+            &common,
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(installed_again, installed);
+        let (paths, calls) = tracked_npm_hosted(&common, &installed_again).await;
+        assert_eq!(calls.len(), 1);
+        let mut inputs = calls[0].clone();
+        inputs.sort();
+        let mut aliases = vec![nm.join("lp"), nested_alias.clone()];
+        aliases.sort();
+        assert_eq!(inputs, aliases);
+        assert_eq!(&paths[..installed[&purl].len()], installed[&purl]);
+        expected.push(nested_alias);
+        expected.extend(nested_peers);
+        let mut actual = paths.clone();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| path.canonicalize().unwrap())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            paths.len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hosted_expands_alias_only_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("node_modules/.pnpm");
+        let peers = peer_copies(&store, 2);
+        // Run within a store package whose nested dependency is an alias.
+        // The sibling peer copies are outside its project-root search.
+        let root = store.join("host@1.0.0/node_modules/host");
+        let alias = root.join("node_modules/lp");
+        pkg(&alias, "left-pad", "1.3.0");
+        let common = GlobalArgs {
+            cwd: root,
+            ecosystems: Some(vec!["npm".to_string()]),
+            ..GlobalArgs::default()
+        };
+        let purl = "pkg:npm/left-pad@1.3.0".to_string();
+        let installed = crate::ecosystem_dispatch::find_manifest_package_copies_reusing(
+            std::slice::from_ref(&purl),
+            &common,
+            true,
+            None,
+        )
+        .await;
+        assert!(installed.is_empty(), "{installed:?}");
+        let (mut paths, calls) = tracked_npm_hosted(&common, &installed).await;
+        assert_eq!(calls, vec![vec![alias.clone()]]);
+        let mut expected = peers;
+        expected.push(alias);
+        paths.sort();
+        expected.sort();
+        assert_eq!(paths, expected);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hosted_expands_identity_fallback_with_empty_installed_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers = peer_copies(
+            &tmp.path()
+                .canonicalize()
+                .unwrap()
+                .join("external/node_modules/.pnpm"),
+            2,
+        );
+        let root = tmp.path().canonicalize().unwrap().join("project");
+        let alias = root.join("node_modules/lp");
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&peers[0], &alias).unwrap();
+        let common = GlobalArgs {
+            cwd: root,
+            ecosystems: Some(vec!["npm".to_string()]),
+            ..GlobalArgs::default()
+        };
+        let purl = "pkg:npm/left-pad@1.3.0".to_string();
+        assert!(
+            npm_alias_copies(&common.crawler_options(), std::slice::from_ref(&purl))
+                .await
+                .is_empty()
+        );
+        let installed = HashMap::from([(purl, Vec::new())]);
+        let (mut paths, calls) = tracked_npm_hosted(&common, &installed).await;
+        assert_eq!(calls, vec![vec![alias.clone()]]);
+        let mut expected = vec![alias, peers[1].clone()];
+        paths.sort();
+        expected.sort();
+        assert_eq!(paths, expected);
+    }
+
     fn pkg(dir: &Path, name: &str, version: &str) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(
@@ -851,7 +1066,7 @@ mod tests {
             nm.join("left-pad"),
         )
         .unwrap();
-        let mut got = with_store_variants(vec![nm.join("left-pad")]).await;
+        let mut got = with_store_peer_variant_copies(vec![nm.join("left-pad")]).await;
         got.sort();
         let mut want = vec![
             nm.join("left-pad"),
@@ -860,7 +1075,7 @@ mod tests {
         ];
         want.sort();
         assert_eq!(got, want);
-        assert!(with_store_variants(Vec::new()).await.is_empty());
+        assert!(with_store_peer_variant_copies(Vec::new()).await.is_empty());
     }
 
     /// vlt twin of the `.pnpm` case: every importer entry is a link into

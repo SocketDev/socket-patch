@@ -12,6 +12,10 @@
 //!   wired through `[tool.uv] override-dependencies` + `[tool.uv.sources]` —
 //!   the uv 0.5.6 boundary (older uv re-resolves the override against the
 //!   registry on a plain `uv sync`, and VEX must stop attesting);
+//! * the same with `six` also in an extra under a different specifier, and
+//!   with `six` only in a PEP 735 group reached through `include-group`
+//!   (the hosted unwind re-derives each entry's specifier the way uv
+//!   lowered it, #606 / #473);
 //! * a PEP 723 script lock (`uv lock --script`), installed by `uv run
 //!   --frozen --script` into uv's own env — so VEX attests it from the lock's
 //!   sha256 pin, the not-installed hosted basis;
@@ -68,6 +72,18 @@ fn hosted_uv_constraints_manifestless_vex() {
 #[ignore = "real uv + PyPI; run with --ignored"]
 fn hosted_uv_transitive_override_manifestless_vex() {
     hosted(Lane::Transitive);
+}
+
+#[test]
+#[ignore = "real uv + PyPI; run with --ignored"]
+fn hosted_uv_extras_manifestless_vex() {
+    hosted(Lane::Extras);
+}
+
+#[test]
+#[ignore = "real uv + PyPI; run with --ignored"]
+fn hosted_uv_include_group_manifestless_vex() {
+    hosted(Lane::IncludeGroup);
 }
 
 #[test]

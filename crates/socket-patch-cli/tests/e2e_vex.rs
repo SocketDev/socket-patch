@@ -991,6 +991,212 @@ fn verify_mode_requires_every_installed_copy_patched() {
     assert_eq!(stmts[0]["status"], "not_affected");
 }
 
+/// Regressions #603 and #601: the every-copy rule covers store copies
+/// too. `apply` patches a package's other store copies (a Deno `_1` copy
+/// index, a pnpm peer variant) and a copy bundled inside another
+/// package's store entry, so `vex` must hash each of them: one pristine
+/// copy omits the purl, and all patched attests it. Each layout has the
+/// primary copy linked from the importer, as `deno install`, pnpm and vlt
+/// write it.
+#[cfg(unix)]
+#[test]
+fn verify_mode_requires_every_store_copy_patched() {
+    let patched: &[u8] = b"patched store index";
+    let pristine: &[u8] = b"pristine store index";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    let before_hash = compute_git_sha256_from_bytes(pristine);
+
+    // (label, the importer-linked copy, the other copy) — both relative to
+    // `node_modules`.
+    let layouts = [
+        (
+            "deno copy index (#603)",
+            ".deno/store-pkg@1.0.0/node_modules/store-pkg",
+            ".deno/store-pkg@1.0.0_1/node_modules/store-pkg",
+        ),
+        (
+            "pnpm peer variant (#603)",
+            ".pnpm/store-pkg@1.0.0(react@17.0.2)/node_modules/store-pkg",
+            ".pnpm/store-pkg@1.0.0(react@18.2.0)/node_modules/store-pkg",
+        ),
+        (
+            "vlt bundled copy (#601)",
+            ".vlt/~npm~store-pkg@1.0.0/node_modules/store-pkg",
+            ".vlt/~npm~bundler@1.0.0/node_modules/bundler/node_modules/store-pkg",
+        ),
+        (
+            "pnpm bundled copy (#601)",
+            ".pnpm/store-pkg@1.0.0/node_modules/store-pkg",
+            ".pnpm/bundler@1.0.0/node_modules/bundler/node_modules/store-pkg",
+        ),
+    ];
+
+    let run = |primary: &str, other: &str, other_bytes: &[u8]| {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let nm = cwd.join("node_modules");
+        for (rel, bytes) in [(primary, patched), (other, other_bytes)] {
+            let dir = nm.join(rel);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("package.json"),
+                r#"{"name":"store-pkg","version":"1.0.0"}"#,
+            )
+            .unwrap();
+            std::fs::write(dir.join("index.js"), bytes).unwrap();
+        }
+        // A bundled copy's host package, so its store entry is real.
+        if let Some(host) = other.split_once("/node_modules/bundler/") {
+            let host = nm.join(host.0).join("node_modules/bundler");
+            std::fs::write(
+                host.join("package.json"),
+                r#"{"name":"bundler","version":"1.0.0"}"#,
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&host, nm.join("bundler")).unwrap();
+        }
+        std::os::unix::fs::symlink(nm.join(primary), nm.join("store-pkg")).unwrap();
+
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/store-pkg@1.0.0".to_string(),
+            make_record(
+                "55555555-5555-4555-8555-555555555555",
+                "package/index.js",
+                before_hash.as_str(),
+                after_hash.as_str(),
+                "GHSA-store",
+                &["CVE-STORE"],
+            ),
+        );
+        write_manifest(cwd, &manifest);
+        let out = cli()
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--product",
+                "pkg:npm/test-app@1.0.0",
+            ])
+            .output()
+            .expect("invoke vex");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    for (label, primary, other) in layouts {
+        let (ok, stdout, stderr) = run(primary, other, pristine);
+        assert!(
+            !ok && !stdout.contains("GHSA-store"),
+            "{label}: an unpatched store copy must keep the purl out of the \
+             VEX doc.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("Warning: omitting pkg:npm/store-pkg@1.0.0 from VEX")
+                && stderr.contains("(not_applied)"),
+            "{label}: the omission must carry not_applied. got: {stderr}"
+        );
+
+        // Control: every copy patched → attested.
+        let (ok, stdout, stderr) = run(primary, other, patched);
+        assert!(
+            ok,
+            "{label}: all copies patched must attest. stderr:\n{stderr}"
+        );
+        let doc: Value = serde_json::from_str(&stdout).unwrap();
+        let stmts = doc["statements"].as_array().unwrap();
+        assert_eq!(stmts.len(), 1, "{label}: doc:\n{stdout}");
+        assert_eq!(stmts[0]["status"], "not_affected", "{label}");
+    }
+}
+
+/// Regression (#356): an npm alias install (`node_modules/lp` holding the
+/// real `dup-pkg@1.0.0`) is an installed copy of `pkg:npm/dup-pkg@1.0.0`.
+/// `vex` used to verify only `node_modules/dup-pkg`, so it attested the
+/// purl while the alias copy that `require('lp')` loads was unpatched.
+#[test]
+fn verify_mode_requires_npm_alias_copies_patched() {
+    let patched: &[u8] = b"patched dup index";
+    let pristine: &[u8] = b"pristine dup index";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    let before_hash = compute_git_sha256_from_bytes(pristine);
+
+    let run = |copies: &[(&str, &[u8])]| {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        for (dir, content) in copies {
+            let copy = cwd.join("node_modules").join(dir);
+            std::fs::create_dir_all(&copy).unwrap();
+            std::fs::write(
+                copy.join("package.json"),
+                r#"{"name":"dup-pkg","version":"1.0.0"}"#,
+            )
+            .unwrap();
+            std::fs::write(copy.join("index.js"), content).unwrap();
+        }
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/dup-pkg@1.0.0".to_string(),
+            make_record(
+                "44444444-4444-4444-8444-444444444444",
+                "package/index.js",
+                before_hash.as_str(),
+                after_hash.as_str(),
+                "GHSA-dup",
+                &["CVE-DUP"],
+            ),
+        );
+        write_manifest(cwd, &manifest);
+        let out = cli()
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--product",
+                "pkg:npm/test-app@1.0.0",
+            ])
+            .output()
+            .expect("invoke vex");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    // The plain copy is patched, an alias copy (plain or scoped) is not.
+    for alias in ["lp", "@x/dp"] {
+        let (ok, stdout, stderr) = run(&[("dup-pkg", patched), (alias, pristine)]);
+        assert!(
+            !ok && !stdout.contains("GHSA-dup"),
+            "an unpatched alias copy ({alias}) must keep the purl out of the \
+             VEX doc.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("Warning: omitting pkg:npm/dup-pkg@1.0.0 from VEX")
+                && stderr.contains("(not_applied)"),
+            "the omission must name the unpatched alias copy. got: {stderr}"
+        );
+    }
+
+    // Control: alias-only and plain + alias, every copy patched → attested.
+    for copies in [
+        vec![("lp", patched)],
+        vec![("dup-pkg", patched), ("lp", patched)],
+    ] {
+        let (ok, stdout, stderr) = run(&copies);
+        assert!(ok, "all copies patched must attest. stderr:\n{stderr}");
+        let doc: Value = serde_json::from_str(&stdout).unwrap();
+        let stmts = doc["statements"].as_array().unwrap();
+        assert_eq!(stmts.len(), 1, "doc:\n{stdout}");
+        assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-dup");
+        assert_eq!(stmts[0]["status"], "not_affected");
+    }
+}
+
 #[test]
 fn verify_mode_all_failed_exits_non_zero() {
     let tmp = tempfile::tempdir().unwrap();

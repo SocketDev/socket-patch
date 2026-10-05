@@ -144,9 +144,147 @@ class Run:
             return {}
 
 
+# Terminal transport diagnostics: Poetry/pip giving up on PyPI
+# (requests/urllib3 connection errors, "too many 503 error responses") or the
+# CLI's own report of a request error, a patch API 5xx, or a 429 its retry
+# loop gave up on.
+TRANSPORT_FAILURE = re.compile(
+    r"too many 5\d\d error responses|Max retries exceeded with url|"
+    r"NewConnectionError|ConnectTimeoutError|ReadTimeoutError|ProtocolError\(|"
+    r"raise ConnectionError\(|requests\.exceptions\.ConnectionError|ClosedPoolError|"
+    r"Temporary failure in name resolution|nodename nor servname provided|Connection reset by peer|RemoteDisconnected|"
+    r"error sending request for url \(|API request failed with status 5\d\d\b|Rate limit exceeded \(HTTP 429"
+)
+
+
+INFORMATIONAL_CHECKS = {"lockOnlyVendorApplies", "warmInstallReplacesUpstream"}
+
+
+def transport_diagnostic(text):
+    # A recovered pip/Poetry/CLI retry warning is not a terminal failure,
+    # even when a later part of the same command fails for another reason.
+    text = "\n".join(line for line in text.splitlines() if "retrying" not in line.lower())
+    match = TRANSPORT_FAILURE.search(text)
+    return match.group(0) if match else None
+
+
+def operation_transport_failure(run):
+    """Transport evidence from this required operation, not other case logs.
+
+    A successful installer can print recovered retry warnings. The CLI can
+    instead report a terminal error in JSON while exiting zero: inspect its
+    error records, including failed batch warnings, without treating arbitrary
+    successful output or stderr as evidence.
+    """
+    if not run.ok():
+        return transport_diagnostic(run.out + "\n" + run.err)
+
+    def diagnostic(value):
+        if isinstance(value, dict):
+            if value.get("error"):
+                found = transport_diagnostic(json.dumps(value["error"]))
+                if found:
+                    return found
+            if (value.get("errorCode") or value.get("code") in ("api_batch_failed", "patch_details_failed")
+                    or value.get("action") in ("failed", "skipped")):
+                found = transport_diagnostic(json.dumps(value))
+                if found:
+                    return found
+            return next((found for child in value.values() if (found := diagnostic(child))), None)
+        if isinstance(value, list):
+            return next((found for child in value if (found := diagnostic(child))), None)
+        return None
+
+    return diagnostic(run.json_or_empty())
+
+
+class CommandFailure(RuntimeError):
+    def __init__(self, run, what):
+        self.run = run
+        super().__init__(f"{what} failed (exit {run.rc}):\n{(run.out + run.err)[-4000:]}")
+
+
+class CaseFailure(RuntimeError):
+    def __init__(self, cause, row):
+        self.cause, self.row = cause, row
+        super().__init__(str(cause))
+
+
+def exception_transport_failure(error):
+    if isinstance(error, CommandFailure):
+        return operation_transport_failure(error.run)
+    # HTTPError is also a URLError: do not retry authentication/not-found or
+    # other permanent 4xx responses as if they were connection failures.
+    if isinstance(error, urllib.error.HTTPError):
+        return str(error) if error.code == 429 or 500 <= error.code < 600 else None
+    if isinstance(error, (TimeoutError, ConnectionError)):
+        return str(error) or type(error).__name__
+    if isinstance(error, urllib.error.URLError):
+        return exception_transport_failure(error.reason) or transport_diagnostic(str(error))
+    return None
+
+
+def failed_required_checks(row):
+    return [name for name, ok in row.get("checks", {}).items() if not ok and name not in INFORMATIONAL_CHECKS]
+
+
+def record_check(row, name, value, note=None, operation=None):
+    row["checks"][name] = bool(value)
+    if note is not None:
+        row["info"][name] = note
+    evidence = operation_transport_failure(operation) if not value and operation is not None else None
+    if evidence:
+        row.setdefault("transportFailures", {})[name] = evidence
+    elif "transportFailures" in row:
+        row["transportFailures"].pop(name, None)
+    return bool(value)
+
+
+def retry_transport(run_case, job, case, root, attempts=3, sleep=time.sleep):
+    """("row"|"error", payload) for one case, re-run from a clean case dir while
+    it fails for transport reasons. A failed attempt's logs are kept under
+    <root>/attempts/<case>/<n>/ and listed on the final payload."""
+    history = []
+    for attempt in range(1, attempts + 1):
+        exception_transport = None
+        try:
+            kind, payload = "row", run_case(job)
+        except Exception as e:
+            version, shape, mode = job
+            cause = e.cause if isinstance(e, CaseFailure) else e
+            payload = dict(e.row) if isinstance(e, CaseFailure) else {}
+            payload.update({"poetry": version, "shape": shape, "mode": mode, "error": str(cause)[-3000:], "trace": traceback.format_exc()[-1500:]})
+            kind, exception_transport = "error", exception_transport_failure(cause)
+        failed = kind == "error" or not payload.get("passed")
+        failed_checks = failed_required_checks(payload)
+        causes = payload.get("transportFailures", {})
+        retryable = (bool(exception_transport) if kind == "error" else bool(failed_checks)) and all(name in causes for name in failed_checks)
+        if not failed or attempt == attempts or not retryable:
+            if history:
+                payload["transportRetries"] = history
+                if case.is_dir():
+                    save(case / "result.json", payload)
+            return kind, payload
+        evidence = root / "attempts" / case.name / str(attempt)
+        evidence.mkdir(parents=True, exist_ok=True)
+        for log in case.glob("*.log*") if case.is_dir() else []:
+            if log.is_file():
+                shutil.copy2(log, evidence / log.name)
+        history.append({"attempt": attempt, "evidence": evidence.relative_to(root).as_posix(), "error": (payload.get("error") or "")[-300:], "failedChecks": [k for k, ok in payload.get("checks", {}).items() if not ok]})
+        print(f"{case.name}: transport failure; retrying fresh case ({attempt}/{attempts})", flush=True)
+        sleep(10 * attempt)
+
+
+def failure_details(row):
+    """One line per failed check with the note it recorded, so a job log
+    shows why a case failed without downloading the capture artifact."""
+    info = row.get("info", {})
+    return [f"  {k}: {json.dumps(info[k], default=str)[:500]}" for k, ok in row.get("checks", {}).items() if not ok and k in info]
+
+
 def require(r, what):
     if not r.ok():
-        raise RuntimeError(f"{what} failed (exit {r.rc}):\n{(r.out + r.err)[-4000:]}")
+        raise CommandFailure(r, what)
     return r
 
 
@@ -351,7 +489,7 @@ def main():
             runs.append({"args": list(extra), "exit": r.rc, "error": (envelope.get("error") or {}).get("code"),
                          "skipped": sorted({e.get("errorCode") for e in envelope.get("events", []) if e.get("action") == "skipped"} - {None}),
                          "statements": len(d.get("statements", [])) if d else 0})
-            return r.rc, envelope, d
+            return r, envelope, d
 
         def attests(rc, d):
             return rc == 0 and d is not None and any(
@@ -371,11 +509,11 @@ def main():
         # (1) manifest deleted: online, and (vendored) offline from the
         # committed vendor ledger. v5 hosted keeps no ledger: no local record.
         (fresh / ".socket/manifest.json").unlink(missing_ok=True)
-        rc, _, d = vex()
-        check("vexManifestDeleted", attests(rc, d), runs[-1])
+        r, _, d = vex()
+        check("vexManifestDeleted", attests(r.rc, d), runs[-1], operation=r)
         if mode != "hosted":
-            rc, _, d = vex("--offline")
-            check("vexLedgerOffline", attests(rc, d), runs[-1])
+            r, _, d = vex("--offline")
+            check("vexLedgerOffline", attests(r.rc, d), runs[-1])
         # (2) ledgers deleted too: lockfile discovery + the patch API.
         ledgers = {}
         for rel in (".socket/vendor/state.json", ".socket/vendor/redirect-state.json"):
@@ -383,11 +521,12 @@ def main():
             if path.exists():
                 ledgers[path] = path.read_bytes()
                 path.unlink()
-        rc, _, d = vex()
-        check("vexLedgersDeleted", bool(ledgers) == (mode != "hosted") and attests(rc, d), runs[-1])
+        r, _, d = vex()
+        ledger_shape_ok = bool(ledgers) == (mode != "hosted")
+        check("vexLedgersDeleted", ledger_shape_ok and attests(r.rc, d), runs[-1], operation=r if ledger_shape_ok else None)
         # (3) offline without ledgers: nothing to attest from, no network.
-        rc, e, d = vex("--offline")
-        check("vexOfflineRecordUnavailable", rc == 1 and d is None and skipped(e, "record_unavailable"), runs[-1])
+        r, e, d = vex("--offline")
+        check("vexOfflineRecordUnavailable", r.rc == 1 and d is None and skipped(e, "record_unavailable"), runs[-1])
         # (4) the lock reverted to the registry, ledgers + artifacts kept.
         for path, data in ledgers.items():
             path.write_bytes(data)
@@ -395,12 +534,12 @@ def main():
         (fresh / "poetry.lock").write_bytes(pristine_lock)
         ok = True
         for extra in ((), ("--no-verify",), ("--offline", "--no-verify")):
-            rc, e, d = vex(*extra)
+            r, e, d = vex(*extra)
             if mode == "hosted":
                 # No ledger and no wiring: nothing names the patch any more.
-                ok = ok and rc == 2 and d is None and (e.get("error") or {}).get("code") == "manifest_not_found"
+                ok = ok and r.rc == 2 and d is None and (e.get("error") or {}).get("code") == "manifest_not_found"
             else:
-                ok = ok and rc == 1 and d is None and skipped(e, unwired)
+                ok = ok and r.rc == 1 and d is None and skipped(e, unwired)
         check("vexRevertedUnwired", ok, runs[-3:])
         (fresh / "poetry.lock").write_bytes(committed_lock)
         info["manifestlessVex"] = runs
@@ -449,11 +588,26 @@ def main():
             return [poetry, "install", "-n", "--no-root", "--sync"]
         return None
 
+    def case_dir(job):
+        version, shape, mode = job
+        return root / "captures" / f"{version}-{shape}-{mode}"
+
     def backtest(job):
+        version, shape, mode = job
+        row = {"poetry": version, "shape": shape, "mode": mode, "checks": {}, "info": {}, "passed": None}
+        try:
+            return backtest_case(job, row)
+        except Exception as error:
+            # A later installer/HTTP failure must not erase an earlier
+            # functional failure and turn the whole case into a retry.
+            row["passed"] = False
+            raise CaseFailure(error, row) from error
+
+    def backtest_case(job, row):
         version, shape, mode = job
         tool = root / "tools" / version
         poetry = tool / "bin/poetry"
-        case = root / "captures" / f"{version}-{shape}-{mode}"
+        case = case_dir(job)
         if case.exists():
             shutil.rmtree(case)
         case.mkdir(parents=True)
@@ -464,15 +618,11 @@ def main():
         shutil.copytree(pristine_dir, project)
         pristine_lock = (pristine_dir / "poetry.lock").read_bytes()
         pristine_pyproject = (pristine_dir / "pyproject.toml").read_bytes()
-        row = {"poetry": version, "shape": shape, "mode": mode, "checks": {}, "info": {}, "passed": None}
         checks, info = row["checks"], row["info"]
         v = vtuple(version)
 
-        def check(name, value, note=None):
-            checks[name] = bool(value)
-            if note is not None:
-                info[name] = note
-            return bool(value)
+        def check(name, value, note=None, operation=None):
+            return record_check(row, name, value, note, operation)
 
         venv = project / ".venv"
         python = venv / "bin/python"
@@ -518,7 +668,7 @@ def main():
             ) and e1.get("apply", {}).get("found", 0) >= 1 and not any(
                 ev.get("errorCode") == "package_not_installed" for ev in e1.get("apply", {}).get("patches", [])
             )
-            check("bareScanSeesPoetryVenv", sees, {"scannedPackages": e1.get("scannedPackages"), "found": e1.get("apply", {}).get("found")})
+            check("bareScanSeesPoetryVenv", sees, {"scannedPackages": e1.get("scannedPackages"), "found": e1.get("apply", {}).get("found")}, operation=r1)
             # 2. apply for real: BARE when the crawler found the venv (the fixed
             # CLI), else via `poetry run` (Poetry exports VIRTUAL_ENV).
             bare = bool(sees)
@@ -526,10 +676,16 @@ def main():
             cmd = cli_cmd(project, "scan", "--mode", "agent") if bare else [poetry, "run", *cli_cmd(project, "scan", "--mode", "agent")]
             r2 = Run(cmd, project, bare_env if bare else penv, case / "scan-apply.log")
             e2 = r2.json_or_empty()
-            check("poetryRunScanApplied", applied_count("agent", e2) == 1, {"exit": r2.rc, "applied": applied_count("agent", e2), "path": info["applyPath"]})
+            check("poetryRunScanApplied", applied_count("agent", e2) == 1, {"exit": r2.rc, "applied": applied_count("agent", e2), "path": info["applyPath"]}, operation=r2)
             after, before, _ = record_hashes(project, "agent") if (project / ".socket/manifest.json").exists() else ({}, {}, None)
             res = oracle(oot_venv / "bin/python", list(after), project, case / "oracle-1.log")
-            check("patchedViaPoetryRun", bool(after) and all(res.get(n) == h for n, h in after.items()), res)
+            check("patchedViaPoetryRun", bool(after) and all(res.get(n) == h for n, h in after.items()), res, operation=r2)
+            if (not checks["poetryRunScanApplied"] or not checks["patchedViaPoetryRun"]) and operation_transport_failure(r2):
+                # This failed apply did not establish the patched state for
+                # repeat/sync/rollback oracles. Keep any earlier failure,
+                # but do not manufacture unrelated downstream failures.
+                row["passed"] = False
+                return row
             # 3. a repeat `poetry install` must not revert the in-place patch
             require(Run(poetry_install_cmd(version, poetry), project, penv, case / "install-again.log"), "poetry install again")
             res = oracle(oot_venv / "bin/python", list(after), project, case / "oracle-2.log")
@@ -538,14 +694,14 @@ def main():
             if sc:
                 rs = Run(sc, project, penv, case / "sync.log")
                 res = oracle(oot_venv / "bin/python", list(after), project, case / "oracle-3.log")
-                check("survivesSync", rs.ok() and bool(after) and all(res.get(n) == h for n, h in after.items()), {"exit": rs.rc, "oracle": res})
+                check("survivesSync", rs.ok() and bool(after) and all(res.get(n) == h for n, h in after.items()), {"exit": rs.rc, "oracle": res}, operation=rs)
             # 4. rollback the same way the patch was applied (bare when the
             # crawler sees the venv; a bare rollback that cannot see it would
             # prune the manifest while the venv stays patched)
             rb = Run(cli_cmd(project, "rollback") if bare else [poetry, "run", *cli_cmd(project, "rollback")], project, bare_env if bare else penv, case / "rollback.log")
             res = oracle(oot_venv / "bin/python", list(after), project, case / "oracle-4.log")
-            check("rollbackRestoresUpstream", rb.ok() and bool(before) and all(res.get(n) == h for n, h in before.items()), {"exit": rb.rc, "oracle": res})
-            check("rollbackClearsManifest", not (project / ".socket/manifest.json").exists() or json.loads((project / ".socket/manifest.json").read_text()).get("patches") == {})
+            check("rollbackRestoresUpstream", rb.ok() and bool(before) and all(res.get(n) == h for n, h in before.items()), {"exit": rb.rc, "oracle": res}, operation=rb)
+            check("rollbackClearsManifest", not (project / ".socket/manifest.json").exists() or json.loads((project / ".socket/manifest.json").read_text()).get("patches") == {}, operation=rb)
             # The crawler finds Poetry's out-of-tree venv (virtualenvs.path), so
             # the bare scan seeing it is required like every other check.
             row["passed"] = all(checks.values())
@@ -578,6 +734,8 @@ def main():
         try:
             envelope = r.json()
         except Exception as e:
+            if operation_transport_failure(r):
+                raise CommandFailure(r, "scan produced no JSON") from e
             raise RuntimeError(f"scan produced no JSON: {e}")
         save(case / "cli-output.json", envelope)
         applied = applied_count(mode, envelope)
@@ -589,13 +747,13 @@ def main():
 
         if mode == "hosted" and version.startswith("0."):
             row["expected"] = "refused: Poetry 0.x ignores URL sources"
-            check("refusedWithWarning", applied == 0 and any("ignores URL sources" in json.dumps(w) for w in warnings), warnings[:3])
+            check("refusedWithWarning", applied == 0 and any("ignores URL sources" in json.dumps(w) for w in warnings), warnings[:3], operation=r)
             check("lockUnchanged", lock_after == pristine_lock)
             check("noLedger", not (project / ".socket/vendor/redirect-state.json").exists())
             row["passed"] = all(checks.values())
             return row
 
-        check("appliedExactlyOne", applied == 1, {"applied": applied, "status": envelope.get("status"), "warnings": warnings[:4]})
+        check("appliedExactlyOne", applied == 1, {"applied": applied, "status": envelope.get("status"), "warnings": warnings[:4]}, operation=r)
         if not checks["appliedExactlyOne"]:
             row["passed"] = False
             return row
@@ -619,7 +777,8 @@ def main():
         # idempotent re-scan
         r2 = Run(cli_cmd(project, "scan", "--mode", mode), project, env, case / "rescan.log")
         e2 = r2.json_or_empty()
-        check("rescanIdempotent", r2.ok() and (project / "poetry.lock").read_bytes() == lock_after and (project / "pyproject.toml").read_bytes() == pristine_pyproject, {"exit": r2.rc, "applied": applied_count(mode, e2), "status": e2.get("status")})
+        unchanged = (project / "poetry.lock").read_bytes() == lock_after and (project / "pyproject.toml").read_bytes() == pristine_pyproject
+        check("rescanIdempotent", r2.ok() and unchanged, {"exit": r2.rc, "applied": applied_count(mode, e2), "status": e2.get("status")}, operation=r2 if unchanged else None)
 
         if mode == "agent":
             res = oracle(python, list(after), project, case / "oracle-1.log")
@@ -627,12 +786,12 @@ def main():
             # repeat install must not revert; sync too
             ri = Run(poetry_install_cmd(version, poetry), project, penv, case / "install-again.log")
             res = oracle(python, list(after), project, case / "oracle-2.log")
-            check("survivesRepeatInstall", ri.ok() and all(res.get(n) == h for n, h in after.items()), {"exit": ri.rc, "oracle": res})
+            check("survivesRepeatInstall", ri.ok() and all(res.get(n) == h for n, h in after.items()), {"exit": ri.rc, "oracle": res}, operation=ri)
             sc = sync_cmd(version, poetry)
             if sc:
                 rs = Run(sc, project, penv, case / "sync.log")
                 res = oracle(python, list(after), project, case / "oracle-3.log")
-                check("survivesSync", rs.ok() and all(res.get(n) == h for n, h in after.items()), {"exit": rs.rc, "oracle": res})
+                check("survivesSync", rs.ok() and all(res.get(n) == h for n, h in after.items()), {"exit": rs.rc, "oracle": res}, operation=rs)
         else:
             # Warm venv: upstream urllib3 is already installed. Does the
             # redirected lock make Poetry replace it? (Poetry <= 1.1 compares
@@ -645,9 +804,12 @@ def main():
             require(Run(["uv", "pip", "uninstall", "-q", "--python", python, "urllib3"], project, env, case / "uninstall.log"), "uninstall")
             inst = Run(poetry_install_cmd(version, poetry), project, penv, case / "install.log")
             res = oracle(python, list(after), project, case / "oracle-1.log")
-            check("poetryInstallExit0", inst.ok(), (inst.out + inst.err)[-600:])
-            check("installedBytesPatched", all(res.get(n) == h for n, h in after.items()), res)
+            check("poetryInstallExit0", inst.ok(), (inst.out + inst.err)[-600:], operation=inst)
+            check("installedBytesPatched", all(res.get(n) == h for n, h in after.items()), res, operation=inst)
             check("lockUnchangedByInstall", (project / "poetry.lock").read_bytes() == lock_after)
+            if (not checks["poetryInstallExit0"] or not checks["installedBytesPatched"]) and operation_transport_failure(inst):
+                row["passed"] = False
+                return row
             info["lockCheck"] = lock_check(version, poetry, project, penv, case / "lock-check.log")
             # Fresh clone of the committed state (no venv, no caches)
             fresh = case / "fresh"
@@ -656,7 +818,12 @@ def main():
             fenv = poetry_env(fresh, venv=fresh / ".venv", cache=fresh / ".poetry-cache")
             finst = Run(poetry_install_cmd(version, poetry), fresh, fenv, case / "fresh-install.log")
             fres = oracle(fresh / ".venv/bin/python", list(after), fresh, case / "fresh-oracle.log")
-            check("freshCloneInstallsPatch", finst.ok() and all(fres.get(n) == h for n, h in after.items()), {"exit": finst.rc, "oracle": fres, "tail": (finst.out + finst.err)[-500:]})
+            check("freshCloneInstallsPatch", finst.ok() and all(fres.get(n) == h for n, h in after.items()), {"exit": finst.rc, "oracle": fres, "tail": (finst.out + finst.err)[-500:]}, operation=finst)
+            if not checks["freshCloneInstallsPatch"] and operation_transport_failure(finst):
+                # Manifest-less/offline attestation needs the installed bytes.
+                # A failed setup cannot establish those later preconditions.
+                row["passed"] = False
+                return row
             # Manifest-less VEX over the installed fresh clone (what a hosted /
             # depscan-vendored checkout has): lockfile discovery + the public
             # patch API must attest; offline without ledgers must not; a
@@ -698,7 +865,8 @@ def main():
                 # the final rollback below can still invert to pristine bytes.
                 rs = Run(cli_cmd(project, "scan", "--mode", mode), project, env, case / "rescan-after-relock.log")
                 ers = rs.json_or_empty()
-                check("rescanAfterRelockApplies", rs.ok() and applied_count(mode, ers) >= 0 and marker in (project / "poetry.lock").read_bytes(), {"exit": rs.rc, "applied": applied_count(mode, ers)})
+                marker_kept = marker in (project / "poetry.lock").read_bytes()
+                check("rescanAfterRelockApplies", rs.ok() and applied_count(mode, ers) >= 0 and marker_kept, {"exit": rs.rc, "applied": applied_count(mode, ers)}, operation=rs if marker_kept else None)
                 info["rescanAfterRelock"] = {"exit": rs.rc, "applied": applied_count(mode, ers), "lockChanged": (project / "poetry.lock").read_bytes() != relocked}
             else:
                 (project / "poetry.lock").write_bytes(lock_after)
@@ -707,27 +875,26 @@ def main():
         # re-resolved from the registry) and clears the ledgers.
         rb = Run(cli_cmd(project, "rollback"), project, env, case / "rollback.log")
         erb = rb.json_or_empty()
-        check("rollbackExit0", rb.ok(), (rb.out + rb.err)[-600:] if not rb.ok() else None)
-        check("rollbackRestoresLockBytes", (project / "poetry.lock").read_bytes() == pristine_lock)
+        check("rollbackExit0", rb.ok(), (rb.out + rb.err)[-600:] if not rb.ok() else None, operation=rb)
+        check("rollbackRestoresLockBytes", (project / "poetry.lock").read_bytes() == pristine_lock, operation=rb)
         check("rollbackKeepsPyproject", (project / "pyproject.toml").read_bytes() == pristine_pyproject)
         if mode == "hosted":
-            check("rollbackNoRedirectLedger", not (project / ".socket/vendor/redirect-state.json").exists())
-            check("rollbackRestoredUpstream", PURL_BASE in ((erb.get("hosted") or {}).get("reverted") or []), erb.get("hosted"))
+            check("rollbackNoRedirectLedger", not (project / ".socket/vendor/redirect-state.json").exists(), operation=rb)
+            check("rollbackRestoredUpstream", PURL_BASE in ((erb.get("hosted") or {}).get("reverted") or []), erb.get("hosted"), operation=rb)
         if mode == "vendored":
-            check("rollbackRemovesVendoredWheel", not (project / ".socket/vendor/pypi" / (uuid or "x")).exists())
+            check("rollbackRemovesVendoredWheel", not (project / ".socket/vendor/pypi" / (uuid or "x")).exists(), operation=rb)
         if mode == "agent":
             res = oracle(python, list(after), project, case / "oracle-rollback.log")
-            check("rollbackRestoresUpstreamBytes", bool(before) and all(res.get(n) == h for n, h in before.items()), res)
+            check("rollbackRestoresUpstreamBytes", bool(before) and all(res.get(n) == h for n, h in before.items()), res, operation=rb)
         mf = project / ".socket/manifest.json"
         if mode == "agent":
-            check("rollbackClearsManifest", not mf.exists() or json.loads(mf.read_text()).get("patches") in ({}, None))
+            check("rollbackClearsManifest", not mf.exists() or json.loads(mf.read_text()).get("patches") in ({}, None), operation=rb)
         else:
             # Hosted and vendored runs are manifest-free (v5.0): nothing may
             # have been written to `.socket/manifest.json` at any point.
             check("noManifestWritten", not mf.exists())
         info["rollbackEnvelope"] = {k: erb.get(k) for k in ("status", "rolledBack", "failed", "hosted", "vendoredReverted", "manifest") if k in erb}
-        informational = {"lockOnlyVendorApplies", "warmInstallReplacesUpstream"}
-        row["passed"] = all(val for k, val in checks.items() if k not in informational)
+        row["passed"] = not failed_required_checks(row)
         return row
 
     prepared = {}
@@ -770,17 +937,20 @@ def main():
                     say("LOCK GENERATION FAILED", v, shape, str(e)[-800:])
                     errors.append({"poetry": v, "shape": shape, "error": "lock generation: " + str(e)[-1500:]})
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        pending = {pool.submit(backtest, job): job for job in jobs}
+        pending = {pool.submit(retry_transport, backtest, job, case_dir(job), root): job for job in jobs}
         for fut in concurrent.futures.as_completed(pending):
             job = pending[fut]
-            try:
-                row = fut.result()
-                results.append(row)
-                failed = [k for k, ok in row["checks"].items() if not ok]
-                say(*job, "PASS" if row["passed"] else "FAIL", ",".join(failed))
-            except Exception as e:
-                errors.append({"poetry": job[0], "shape": job[1], "mode": job[2], "error": str(e)[-3000:], "trace": traceback.format_exc()[-1500:]})
-                say(*job, "ERROR", str(e)[-300:].replace("\n", " "))
+            kind, payload = fut.result()
+            if kind == "row":
+                results.append(payload)
+                failed = [k for k, ok in payload["checks"].items() if not ok]
+                say(*job, "PASS" if payload["passed"] else "FAIL", ",".join(failed))
+            else:
+                errors.append(payload)
+                say(*job, "ERROR", payload["error"][-300:].replace("\n", " "))
+            details = [] if payload.get("passed") else failure_details(payload)
+            if details:
+                say("\n".join(details))
             save(root / "summary.json", {"provenance": provenance, "results": sorted(results, key=lambda r: (vtuple(r["poetry"]), r["shape"], r["mode"])), "errors": errors})
     summary = json.loads((root / "summary.json").read_text()) if (root / "summary.json").exists() else {"provenance": provenance, "results": results, "errors": errors}
     (root / "summary.md").write_text(render_table(summary))
