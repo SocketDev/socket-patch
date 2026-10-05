@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-05 (run 20), main `6811b4e`, latest release 4.0.0, latest Bun 1.4.2.
+Last updated: 2026-10-05 (run 21), main `9c43dfc`, latest release 4.0.0, latest Bun 1.4.2.
 
 Method (run 16 note: the sandbox shell exports `BUN_OPTIONS=--smol`, so unset it; run 17 note: on Bun ≥ 1.2, `bunfig [install] saveTextLockfile = false` writes a binary `bun.lockb`): real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` to the mock. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -28,15 +28,17 @@ Run 19 (main unchanged at `045d7ec`, so no re-triage): no new issue. The yarn-cl
 
 Run 20 (new main `6811b4e`): #803, #739 and #720 were fixed by #811, #741 and #722, closed by the maintainers, and verified on Linux (#803 heal: hosted + vendored re-run; #720: lockfile-only `bun.lockb` supersede + vendored takeover). #599 and #497 still reproduce, and #497 also gives a false `not_affected` from lockfile-only default `vex` (commented). New: #861. A vendored re-run after a new dependent duplicates a `bun.lockb` tarball record, and isolated frozen installs fail EEXIST intermittently on 1.3.9/1.4.2. The other new cells pass: the run 20 section below.
 
+Run 21 (new main `9c43dfc`): #861 still reproduces. No new issue. The isolated-workspace member-run shape (hosted `scan` from a member: `success`, nothing pinned) is now tracked on #884 (commented), and is no longer a known non-bug. Three generic npm-family findings were handed to npm. The other new cells pass: the run 21 section below.
+
 ## Coverage matrix
 
 | OS | Bun | Agent: hoisted | Agent: isolated linker | Hosted/vendored: `bun patch` | Hosted/vendored: default-trusted scripts | Hosted → `vex`: isolated linker | Hosted rollback/remove byte-exact (text lock) | `bun.lockb` takeover ⇄ revert |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 1.1.39 / 1.1.40 | pass (1.1.39; run 12) | n/a | untested | untested | n/a | pass (v0 hosted + vendored; lockb refuses / semantic, as documented; run 12) | untested |
 | Linux | 1.1.45 | untested | n/a | untested | pass | n/a | pass (v0) | pass (semantic; run 10) |
-| Linux | 1.2.23 | pass | pass (opt-in; run 9) | fail #367 | pass | pass, but fail #599 after an in-place reinstall | untested | untested |
+| Linux | 1.2.23 | pass | pass (opt-in; run 9; peer variants run 21) | fail #367 | pass | pass, but fail #599 after an in-place reinstall | pass (v1 single + workspace; run 21) | pass (semantic; workspace takeover refuses, documented; run 21) |
 | Linux | 1.3.0–1.3.4 | pass (1.3.0, 1.3.4) | pass (1.3.0, 1.3.4; run 9) | untested | pass | pass (1.3.0, 1.3.4; run 9) | pass (single: hosted + vendored; workspace: hosted, vendored refuses as documented) | untested |
-| Linux | 1.3.5–1.3.9 | pass (1.3.9; run 14) | pass (1.3.9; run 14) | fail #367 (1.3.9) | fail #371 | untested | untested | untested |
+| Linux | 1.3.5–1.3.9 | pass (1.3.9; run 14) | pass (1.3.9; run 14; peer variants run 21) | fail #367 (1.3.9) | fail #371 | untested | pass (1.3.9 v1 single + workspace; run 21) | pass (1.3.9 semantic; workspace takeover refuses, documented; run 21) |
 | Linux | 1.3.14 | pass | pass (run 9) | fail #367 | fail #371 | pass fresh; fail #599 in place | pass (v1, workspace, catalog) | pass (semantic; vendored lockb isolated workspace too; run 10) |
 | Linux | 1.4.2 | pass; fail #635 with `globalStore`; fail #626 (first-party workspace member) | pass (run 9; peer-hash entries, symlink backend) | fail #367 (text + lockb) | fail #371 | pass fresh (text + lockb workspace); fail #599 in place | pass (v2, alias, overrides) | pass (semantic; not byte-exact, see Known non-bugs); workspace lockb → text migration healed by a re-run (#803 fixed, run 20); vendored re-run after a new dependent: fail #861 (isolated) |
 | macOS | 1.2.23 | pass | fail #366 | fail #367 | untested | fail #405 | untested | untested |
@@ -70,6 +72,20 @@ No `Authorization` header reaches the hosted tarball host for any of: bunfig def
 
 ### Platform-specific optional deps (run 10, Linux)
 `os`/`cpu` meta (fsevents, @esbuild/darwin-arm64, @esbuild/linux-x64). The hosted rewrite keeps the meta, and Linux frozen installs fetch only linux-x64 (patched), on 1.1.45 v0 + lockb, 1.2.23, 1.3.14, 1.4.2 text + lockb: pass. Hosted rollback is byte-exact (1.4.2): pass. `minimumReleaseAge` with hosted pins (1.4.2): pass.
+
+### Run 21 cells (Linux, main `9c43dfc`)
+
+| Cell | Bun | Result |
+| --- | --- | --- |
+| Agent over isolated peer-variant entries (`+<hash>` ×2): apply, no cache write-through, `vex`, `rollback`; a new peer variant → `vex` refuses → `apply` patches only it | 1.4.2 / 1.3.9 / 1.2.23 | pass |
+| File modes after the #858 write core: `bun.lock` / `bun.lockb` 0664 (hosted + vendored); agent bin file 0755 / 0777 through apply + rollback | 1.4.2 | pass |
+| Hosted `rollback` byte-exact + frozen install, text v1 single + workspace | 1.2.23 / 1.3.9 | pass |
+| `bun.lockb` hosted → vendored → revert; vendored → hosted → rollback refusal; single + workspace | 1.2.23 / 1.3.9 | pass (as documented) |
+| Dual `bun.lock` + stale `bun.lockb`: hosted / vendored, `vex`, `vendor --check`, frozen | 1.4.2 | pass |
+| Symlinked `bun.lockb` / `bun.lock`, vendored | 1.4.2 | pass (refused; text leaves an orphan artifact, handed to npm) |
+| Hosted `scan` / `get --mode hosted` from an isolated workspace member | 1.2.23 / 1.3.9 / 1.4.2 | fail #884 (commented) |
+| `bun.lock` + `package-lock.json` vendored → `vendor --check` | 1.4.2 | wrong message, no-op remedy (generic, handed to npm) |
+| `bun.lock` wired + stale `package-lock.json` without the package → lockfile-only `vex` | 1.4.2 | attests (generic cross-lock rule, handed to npm) |
 
 ### Run 20 cells (Linux, main `6811b4e`)
 
@@ -280,10 +296,10 @@ Other passes (Linux, 1.4.2 unless noted):
 ## Backlog
 
 0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open; re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
-1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still refused from the sandbox (runs 7–20), so no new probes until then.
-2. #861: macOS/Windows; the `bun add` in an existing member variant; re-test when fixed.
+1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still refused from the sandbox (runs 7–21), so no new probes until then.
+2. #861: macOS/Windows; the `bun add` in an existing member variant; re-test when fixed. #884 (Bun member shape) and #367 (PR #873): re-test when merged.
 3. #831: re-test on Bun (text, `bun.lockb`, workspace) once #837 lands. #764 follow-up: macOS/Windows. Real Windows autocrlf checkouts.
-4. #861, #831, #784, #764, #635, #599 and #497: re-test when fixed. #626 on Bun once PR #634 merges. Also `globalStore` + workspaces, `globalStore` on macOS/Windows, and #605's store-copy handling on Bun isolated peer-variant (`+hash`) entries.
+4. #861, #831, #784, #764, #635, #599 and #497: re-test when fixed. #626 on Bun once PR #634 merges. Also `globalStore` + workspaces and `globalStore` on macOS/Windows. (#605/#774 store copies on Bun peer-variant entries: pass, run 21.)
 5. macOS/Windows re-runs of the #366 / #405 / #469 / #803 fixes (Windows isolated uses junctions).
 6. #497 `github:` tuples (needs a probe).
 7. Hosted rollback on real macOS and Windows checkouts.
@@ -311,7 +327,7 @@ Other passes (Linux, 1.4.2 unless noted):
 - On a `bun install --yarn` project, hosted `rollback` restores `bun.lock` byte-exact but adds a `#<sha1>` fragment to Bun's `yarn.lock` `resolved` lines. It's semantically equivalent and yarn-classic's rewriter, so it isn't filed as a Bun bug.
 - Mock fixture: build the patched tarball with a fixed gzip mtime. Otherwise a mock restart changes its sha512 and later installs fail `IntegrityCheckFailed`.
 - `link:` deps need `bun link` registration, and `github:` deps don't resolve in the sandbox. Both are environment limits.
-- `scan <workspace-member>` (e.g. `scan packages/a`): hosted reports `success` with 0 redirected and `redirect_npm_no_lockfile`; vendored refuses with `vendor_lockfile_missing`. Pinned as today's behaviour in bun-compatibility.md ("Not measured"); scan the root instead.
+- `scan <workspace-member>` (e.g. `scan packages/a`) with vendored refusing `vendor_lockfile_missing` is pinned behaviour. The hosted side (`success`, 0 redirected) is NOT a non-bug any more: since run 21 it's tracked on #884 (the isolated-workspace Bun matrix is commented there).
 - Mode-less `scan -g` is report-only. Use `--mode agent` to patch global copies. `-g` agent runs record the global copies in the cwd's `.socket/manifest.json` (by design).
 - A v1/v2 text `bun.lock` can't be read by Bun 1.1.45 (`lockfile had changes, but lockfile is frozen`) even without socket-patch. When `bun.lock` and `bun.lockb` are both present, Bun ≥ 1.2 reads `bun.lock`.
 - Mock fixture: `SOCKET_PATCH_SERVER_URL` must name the same origin across runs. A mock on another port makes the earlier pins non-hosted.
@@ -329,7 +345,7 @@ Other passes (Linux, 1.4.2 unless noted):
 - A 1.4.2-written `bun.lockb` can't be read by Bun 1.1.45 even without socket-patch.
 - Bun's auto-migration of a hosted `yarn.lock` writes the same registry-slot 4-tuples as the `package-lock.json` case, plus a `#<sha1>` fragment. socket-patch fails closed, and a re-run of `scan --mode hosted` heals it (run 12).
 - Bun's auto-migration of a hosted `pnpm-lock.yaml` (1.3.14, 1.4.2) ignores `resolution.tarball`, downloads the registry tarball and fails `IntegrityCheckFailed` against the patched sha512, writing no `bun.lock`. That's a Bun migration limitation and fails closed. Remedy: migrate first, then run `scan --mode hosted`.
-- `get <pkg> --mode hosted` from inside a workspace member dir is a `success` no-op with `redirect_npm_no_lockfile`, the same as `scan <member>`. Run it from the root.
+- `get <pkg> --mode hosted` from inside a workspace member dir is a `success` no-op with `redirect_npm_no_lockfile`, the same as `scan <member>`: tracked on #884 since run 21. Run it from the root.
 - A SIGKILLed `vendor --revert` can leave a 0-byte `.socket/vendor/.socket-stage-state.json-<uuid>` temp file. It's harmless; the next run heals the state.
 - Plain (human) `scan --mode agent` doesn't re-apply patches the manifest already records (`[skip] … already recorded`, "run `socket-patch apply`"), while `--json` re-applies. It's generic, not Bun-specific: handed to npm (`entries/npm/20261003T193043Z-from-bun.md`). After an interrupted agent apply, use `socket-patch apply`.
 - `scan --json` `apply.patches[].action` (`added` / `skipped`) is the manifest record's state, not whether files were written.
@@ -350,3 +366,4 @@ Other passes (Linux, 1.4.2 unless noted):
 - Vendored `bun.lockb` workspaces commit an identical tarball under every member's `.socket/vendor`, even members that don't use the package. That's deliberate (Bun 0.5.9–1.3 resolves workspace local tarballs relative to the declaring member, `bun_binary.rs:142`). A missing member copy fails closed (`vendor_workspace_artifact_missing`), and `repair` restores it (run 20).
 - Bun refuses a workspace member that depends on the root package via `workspace:*` (`root@workspace:* failed to resolve`), so that #803-heal shape can't occur (run 20).
 - Bun 1.3.9 can't frozen-install a text `bun.lock` written by 1.4.2 (`lockfile had changes`). That's cross-version Bun behaviour.
+- `bun install --save-text-lockfile` on 1.4.2 deletes `bun.lockb`; `bun bun.lockb` prints the ACTIVE lock (the text one when both exist). Inspect a stale binary with `strings` (run 21).
