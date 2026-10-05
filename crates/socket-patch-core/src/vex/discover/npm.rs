@@ -207,9 +207,11 @@ async fn extract_package_lock(
 /// whose package the mirror still resolves from a non-Socket source (the
 /// registry: a lock a pre-#432 run left with an alias mirror node
 /// unrewired) installs unpatched under npm 6, so it is diagnosed and not
-/// attested (#432). A mirror node that agrees, or a mirror that does not
-/// mention the package, contests nothing; a mirror node wired while
-/// `packages` is not is never a ref (see [`npm_lock_nodes`]).
+/// attested (#432), and the package counts as resolved elsewhere, so the
+/// sibling npm lock's and other locks' refs for it are contested too. A
+/// mirror node that agrees, or a mirror that does not mention the package,
+/// contests nothing; a mirror node wired while `packages` is not is never a
+/// ref (see [`npm_lock_nodes`]).
 fn drop_mirror_unwired(
     ctx: &DiscoverCtx<'_>,
     file: &str,
@@ -226,6 +228,11 @@ fn drop_mirror_unwired(
             ctx.locate(r, LocateOpts::LITERAL_CHECKED)
         });
         if located.vendored.is_none() && located.hosted.is_none() {
+            // An npm 6 install from a non-Socket source: it contests the
+            // sibling npm lock's ref ([`push_uncontested`]) and any other
+            // lock's (the orchestrator), like an unwired `packages` entry.
+            out.resolved_elsewhere(file, Some(purl.clone()));
+            read.unwired.insert(purl.clone());
             let source = node.resolved.unwrap_or("no `resolved` url").to_string();
             unwired.entry(purl).or_insert(source);
         }
@@ -1056,6 +1063,61 @@ mod tests {
                 diag.detail
             );
         }
+    }
+
+    /// #432 (Bugbot on #813): a shrinkwrap whose stale alias mirror still
+    /// resolves to the registry is what npm 6 installs from, so it also
+    /// contests the SIBLING package-lock.json's ref for the package, not
+    /// only its own `packages` ref.
+    #[tokio::test]
+    async fn stale_alias_mirror_contests_the_sibling_lock_ref() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let registry = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let p = Project::new();
+        p.write(
+            "npm-shrinkwrap.json",
+            serde_json::json!({
+                "lockfileVersion": 2,
+                "packages": {
+                    "": { "name": "app", "version": "1.0.0" },
+                    "node_modules/lp": {
+                        "name": "left-pad", "version": "1.3.0",
+                        "resolved": hosted, "integrity": SRI
+                    }
+                },
+                "dependencies": {
+                    "lp": {
+                        "version": "npm:left-pad@1.3.0",
+                        "resolved": registry, "integrity": "sha512-ORIG"
+                    }
+                }
+            })
+            .to_string(),
+        );
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/lp": {
+                    "name": "left-pad", "version": "1.3.0",
+                    "resolved": hosted, "integrity": SRI
+                },
+            })),
+        );
+        let out = run(&p).await;
+        assert!(out.refs.is_empty(), "{:#?}", out.refs);
+        let files: Vec<&std::path::Path> = out
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == DIAG_REF_UNATTRIBUTABLE)
+            .map(|d| d.file.as_path())
+            .collect();
+        assert!(
+            files.contains(&std::path::Path::new("npm-shrinkwrap.json"))
+                && files.contains(&std::path::Path::new("package-lock.json")),
+            "{:#?}",
+            out.diagnostics
+        );
     }
 
     /// #432: the same v2 lock with the alias mirror node rewired too (what
