@@ -143,10 +143,24 @@ pub(crate) async fn hatch_environments_with(
         }
         if shared_flat {
             // `~/.virtualenvs` is shared, so only the names this project
-            // configures are taken from it.
+            // configures are taken from it, matrix variants included.
             push("default".to_string(), env_dir.join(&name));
-            for env in configured.iter().filter(|e| e.name != "default") {
-                push(env.name.clone(), env_dir.join(&env.name));
+            for env in &configured {
+                for generated in env.generated_names() {
+                    if generated != "default" {
+                        push(generated.clone(), env_dir.join(&generated));
+                    }
+                }
+            }
+            // `hatch test` (Hatch 1.10+) installs the project into the
+            // internal `hatch-test.<python>` matrix, whose default Python
+            // list varies by Hatch release.
+            if !configured.iter().any(|e| e.name == "hatch-test") {
+                for (dir_name, prefix) in subdirs(&env_dir) {
+                    if dir_name.starts_with("hatch-test.") {
+                        push(dir_name, prefix);
+                    }
+                }
             }
             break;
         }
@@ -172,6 +186,20 @@ fn env_name_for(dir_name: &str, project_name: &str) -> String {
 struct ConfiguredEnv {
     name: String,
     path: Option<String>,
+    /// The names its `matrix` generates; empty without one.
+    matrix_names: Vec<String>,
+}
+
+impl ConfiguredEnv {
+    /// The env names Hatch creates from this entry: the matrix variants,
+    /// or the env itself without a matrix.
+    fn generated_names(&self) -> Vec<String> {
+        if self.matrix_names.is_empty() {
+            vec![self.name.clone()]
+        } else {
+            self.matrix_names.clone()
+        }
+    }
 }
 
 /// `[tool.hatch.envs.*]` from pyproject, unless hatch.toml carries `envs`
@@ -211,9 +239,96 @@ fn configured_envs(
                     .and_then(Item::as_str)
                     .filter(|p| !p.is_empty())
                     .map(str::to_string),
+                matrix_names: matrix_names(name, env),
             })
         })
         .collect()
+}
+
+/// The env names an env's `matrix` generates, as
+/// `hatch/project/config.py::envs` builds them: per matrix table, the
+/// product of its variables' values, a `py`/`python` variable first as
+/// `py<value>`, the rest through `matrix-name-format` (default
+/// `{value}`), joined with `-` and prefixed `<env>.` unless the env is
+/// `default`. A format set by overrides or inherited through `template`
+/// is not modelled.
+fn matrix_names(env_name: &str, env: &dyn toml_edit::TableLike) -> Vec<String> {
+    let format = env
+        .get("matrix-name-format")
+        .and_then(Item::as_str)
+        .filter(|f| f.contains("{value}"))
+        .unwrap_or("{value}");
+    let tables: Vec<&dyn toml_edit::TableLike> = match env.get("matrix") {
+        Some(Item::ArrayOfTables(tables)) => tables
+            .iter()
+            .map(|t| t as &dyn toml_edit::TableLike)
+            .collect(),
+        Some(Item::Value(toml_edit::Value::Array(array))) => array
+            .iter()
+            .filter_map(|v| v.as_inline_table())
+            .map(|t| t as &dyn toml_edit::TableLike)
+            .collect(),
+        _ => return Vec::new(),
+    };
+    let mut names = Vec::new();
+    for table in tables {
+        let mut variables: Vec<(&str, Vec<&str>)> = table
+            .iter()
+            .filter_map(|(variable, values)| {
+                let values: Vec<&str> = values
+                    .as_array()?
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect();
+                Some((variable, values))
+            })
+            .collect();
+        let python = variables
+            .iter()
+            .position(|(variable, _)| matches!(*variable, "py" | "python"));
+        if let Some(index) = python {
+            let entry = variables.remove(index);
+            variables.insert(0, entry);
+        }
+        let mut parts: Vec<Vec<String>> = vec![Vec::new()];
+        for (position, (variable, values)) in variables.iter().enumerate() {
+            let rendered: Vec<String> = values
+                .iter()
+                .map(|value| {
+                    if position == 0 && python.is_some() {
+                        if value.starts_with("py") {
+                            value.to_string()
+                        } else {
+                            format!("py{value}")
+                        }
+                    } else {
+                        format
+                            .replace("{variable}", variable)
+                            .replace("{value}", value)
+                    }
+                })
+                .collect();
+            parts = parts
+                .iter()
+                .flat_map(|prefix| {
+                    rendered.iter().map(move |part| {
+                        let mut next = prefix.clone();
+                        next.push(part.clone());
+                        next
+                    })
+                })
+                .collect();
+        }
+        for name in parts.into_iter().filter(|p| !p.is_empty()) {
+            let name = name.join("-");
+            names.push(if env_name == "default" {
+                name
+            } else {
+                format!("{env_name}.{name}")
+            });
+        }
+    }
+    names
 }
 
 /// The PEP 503-normalized `[project] name` (hatchling's
@@ -603,6 +718,77 @@ mod tests {
                 name: "lint".into(),
                 prefix: moved
             }]
+        );
+    }
+
+    /// `~/.virtualenvs` holds every project's envs flat, so only the names
+    /// this project's config generates are taken from it, matrix
+    /// variants included (`hatch/project/config.py::envs`).
+    #[tokio::test]
+    async fn shared_virtualenvs_dir_takes_configured_and_matrix_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            format!(
+                "{PYPROJECT}\n\
+                 [[tool.hatch.envs.default.matrix]]\npy = [\"3.10\"]\n\n\
+                 [tool.hatch.envs.test]\n\
+                 matrix = [{{ version = [\"a\"], python = [\"3.11\", \"py3.12\"] }}]\n\n\
+                 [tool.hatch.envs.lint]\n\
+                 matrix-name-format = \"{{variable}}_{{value}}\"\n\
+                 [[tool.hatch.envs.lint.matrix]]\ntool = [\"ruff\"]\n"
+            ),
+        )
+        .unwrap();
+        let config = tmp.path().join("hatch-config.toml");
+        std::fs::write(&config, "[dirs.env]\nvirtual = \"~/.virtualenvs\"\n").unwrap();
+        let shared = home.join(".virtualenvs");
+        for name in [
+            "my-app-core",
+            "py3.10",
+            "test.py3.11-a",
+            "test.py3.12-a",
+            "lint.tool_ruff",
+            "hatch-test.py3.13",
+            // Another project's envs share the directory.
+            "test.py3.9-a",
+            "other",
+        ] {
+            make_venv(&shared.join(name));
+        }
+        let var = env_of(&[
+            ("HATCH_CONFIG", config.display().to_string()),
+            ("HOME", home.display().to_string()),
+        ]);
+        let mut names: Vec<_> = hatch_environments_with(&project, &var)
+            .await
+            .into_iter()
+            .map(|e| {
+                assert_eq!(e.prefix.file_name().unwrap(), {
+                    let dir = if e.name == "default" {
+                        "my-app-core"
+                    } else {
+                        &e.name
+                    };
+                    std::ffi::OsString::from(dir)
+                });
+                e.name
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "default",
+                "hatch-test.py3.13",
+                "lint.tool_ruff",
+                "py3.10",
+                "test.py3.11-a",
+                "test.py3.12-a"
+            ]
         );
     }
 
