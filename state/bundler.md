@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-04 (run 18), main `045d7ec` (includes #532, #552, #517, #442), latest release tag v4.0.0.
+Last updated: 2026-10-05 (run 19), main `045d7ec` (includes #532, #552, #517, #442), latest release tag v4.0.0.
 
 ## Coverage matrix
 
@@ -151,6 +151,14 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | 2.6.9 | pass | untested | pass | untested | untested | untested |
 | 2.4.22 | pass (after the documented unfrozen install) | untested | untested | untested | fail #779 after the converge install (PR #805 fixes) | fails closed (documented mixed state) |
 
+### Run 19: single-line declaration shapes, deployment config, 2.6.9 suites (Linux, Ruby 3.3.6, real rubygems.org upstream)
+
+| Bundler | Repo gem e2e suites | Hosted: trailing `# comment` | Hosted: `gem(...)` | Hosted: `y; gem "x"` (patched 2nd) | Hosted: `gem "x"; gem "y"` (patched 1st) | Hosted: `gem "x", opt; gem "y"` | Vendored: `gem "x"; gem "y"` | Agent: `BUNDLE_DEPLOYMENT` config | Agent `vex`: stale `ruby/<old ABI>` scope |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 4.0.17 | pass | pass (comment dropped) | pass | pass (refused) | fail #826 (also `gems.rb`, and PR #637) | fail #826 | fail #826 | pass | pass (refuses) |
+| 2.6.9 | pass (21 + 16 + 25) | untested | untested | untested | fail #826 | untested | untested | untested | untested |
+| 2.4.22 | untested | untested | untested | untested | fail #826 | untested | fail #826 | untested | untested |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -164,13 +172,14 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #340 / #577 / #652 / #681 / #709 / #729 / #736 / #749 / #751 / #775 / #779 / #796 when fixes merge (open PRs #637, #684, #712, #768, #797 (verified for #796), #805 (verified for #779 incl. multi-gem takeover)).
-2. Hosted stale-install guard on a Bundler 4 standalone project once #797 lands; vendored + standalone.
-3. Takeover over shapes hosted accepts but vendored refuses: platform gem on a no-CHECKSUMS lock, `eval_gemfile`, `install_if` / `platforms:` blocks. Multi-gem takeover on 2.6.9.
-4. Windows: `x64-mingw-ucrt` platform gems in hosted and vendored modes; `BUNDLE_DEPLOYMENT=true` with a CRLF lock; vendored cells and `repair` on Windows and macOS (script-based probes: the gem e2e suites run on ubuntu only and spawn bare `bundle`).
-5. **Maintainer request (still open):** global (`-g`) mode on every OS. Remaining: macOS system Ruby and Homebrew Ruby; rbenv / rvm / chruby / asdf layouts; unicode or space-containing `--global-prefix`; a non-writable dir on macOS and Windows; `-g` from inside a project on macOS and Windows.
-6. A symlinked env `BUNDLE_GEMFILE` next to a config `gemfile` (macOS `/var` vs `/private/var`).
-7. #340 on Bundler 2.2–2.5; Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
+1. Re-run #340 / #577 / #652 / #681 / #709 / #729 / #736 / #749 / #751 / #775 / #779 / #796 / #826 when fixes merge (open PRs #637 (doesn't cover #826), #684, #712, #731, #750, #768, #776, #797 (verified for #796), #805 (verified for #779)).
+2. More single-line shapes for both rewriters: `gem "x", "1.0"; # trailing`, `gem "x" unless …; gem "y"`, one-line `group :t do gem "x" end`, `gem "x", *VERSIONS`, `gem "x", ENV.fetch("V")`.
+3. Hosted stale-install guard on a Bundler 4 standalone project once #797 lands; vendored + standalone.
+4. Takeover over shapes hosted accepts but vendored refuses: platform gem on a no-CHECKSUMS lock, `eval_gemfile`, `install_if` / `platforms:` blocks. Multi-gem takeover on 2.6.9.
+5. Windows: `x64-mingw-ucrt` platform gems in hosted and vendored modes; `BUNDLE_DEPLOYMENT=true` with a CRLF lock; vendored cells and `repair` on Windows and macOS (script-based probes with the run-19 mock2 pattern under `shell: bash`).
+6. **Maintainer request (still open):** global (`-g`) mode on every OS. Remaining: macOS system Ruby and Homebrew Ruby; rbenv / rvm / chruby / asdf layouts; unicode or space-containing `--global-prefix`; a non-writable dir on macOS and Windows; `-g` from inside a project on macOS and Windows.
+7. A symlinked env `BUNDLE_GEMFILE` next to a config `gemfile` (macOS `/var` vs `/private/var`).
+8. #340 on Bundler 2.2–2.5; Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
 
 ## Known non-bugs
 
@@ -224,3 +233,8 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - Hosted → vendored takeover by hand (run 18): `--patch-server-url <api mock>` is needed so vendored mode recognizes the loopback patch-registry wiring, but it also rewrites artifact download hosts. Have the API mock proxy `/artifacts/*` (every non-`/v0`, non-`/patch-registry` GET) to the prebuilt server, and export `SOCKET_VENDOR_URL=<prebuilt uri>` as well.
 - Hosted → vendored takeover on a mixed (no-CHECKSUMS, not yet re-installed) pair fails closed with `gemfile_declaration_not_editable` and writes nothing. The takeover can't see the unconverged hosted wiring, consistent with the documented mixed-state limits (run 18).
 - When verifying several fix PRs, build each into its own `CARGO_TARGET_DIR`; reusing one silently tests the wrong head (run 18 near-miss).
+- `scan` defaults to hosted mode in v5. An agent probe must pass `--mode agent`, or it fails with "Failed to resolve patch references" against a mock with no `/patches/package` (run 19).
+- `cargo test --test <t> -- --ignored --include-ignored` prints no results (conflicting flags). Use `--include-ignored` alone (run 19).
+- A hosted rewrite drops a trailing `# comment` on the patched gem's line. That's cosmetic; vendored does the same and keeps the original in its ledger.
+- Agent `vex` refuses `not_applied` when any crawled copy (e.g. a leftover `vendor/bundle/ruby/<old ABI>` scope) is unpatched, even if the live scope is patched. It's fail-safe, so it's not filed (run 19).
+- Run-19 mocks (`mock.py` agent, `mock2.py` hosted grant + patch-registry compact index, with ETags) are described in the run-19 entry. Each is about 50 lines, and a rebuilt marker gem (`gem unpack` → append → `gem spec --ruby` → `gem build`) is enough for full hosted cycles against real rubygems.org.
