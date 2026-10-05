@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::fs::{
-    entry_is_dir, home_dir, is_dir, list_dir_entries, normalize_lexically, run_blocking,
+    entry_is_dir, home_dir, is_dir, is_file, list_dir_entries, normalize_lexically, run_blocking,
 };
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
@@ -320,11 +320,18 @@ impl RubyCrawler {
     ///    value resolves against the project root, matching
     ///    `Bundler.bundle_path`; a leading `~` expands against home).
     ///    Trusted as-is: it is the user's own environment.
-    /// 3. the `BUNDLE_PATH:` entry of the global config file
+    /// 3. `<cwd>/bundle` when it holds `bundler/setup.rb` — the tree
+    ///    `bundle install --standalone` writes and the app loads through
+    ///    that script. Bundler 2 also recorded it as `BUNDLE_PATH:
+    ///    "bundle"` (root 1), but bundler 4 no longer remembers CLI flags
+    ///    and writes no config at all, so the marker is the only trace
+    ///    (#796). It counts as an explicit root, like the recorded path it
+    ///    replaces: the `gem env` fallback stays on for the default gems.
+    /// 4. the `BUNDLE_PATH:` entry of the global config file
     ///    ([`bundler_global_config_file`], what `bundle config set --global
     ///    path <dir>` records) — resolved like the env var, and trusted
     ///    like it: it is the user's own machine state, not project input.
-    /// 4. `<cwd>/vendor/bundle` — the default deployment/`--path` location.
+    /// 5. `<cwd>/vendor/bundle` — the default deployment/`--path` location.
     ///
     /// The explicit roots can point anywhere (a machine-wide `BUNDLE_PATH`
     /// export must not pull another project's gem store into a non-Ruby
@@ -379,6 +386,10 @@ impl RubyCrawler {
             }
             if let Some(v) = bundle_path_env.filter(|v| !v.is_empty()) {
                 roots.push(resolve_bundle_path(cwd, Path::new(v), home));
+            }
+            let standalone_root = cwd.join("bundle");
+            if is_file(&standalone_root.join("bundler").join("setup.rb")).await {
+                roots.push(normalize_lexically(&standalone_root).unwrap_or(standalone_root));
             }
             // The global config's path (`bundle config set --global path`)
             // is the user's own machine state, so it is trusted like the
@@ -965,7 +976,8 @@ fn verify_gem_at_path_sync(path: &Path) -> bool {
 /// JSON envelope is the CLI's job, where `--silent`/`--json` gating lives.
 pub struct BundleStoreDiscovery {
     /// The discovered installed-gem `gems/` stores, in root-precedence
-    /// order (local config > env > default `vendor/bundle`). Copies found
+    /// order (local config > env > standalone `bundle/` > default
+    /// `vendor/bundle`). Copies found
     /// under these are the PRIMARY class in apply's multi-copy fan-out;
     /// paths outside them are `gem env` fallback-home copies.
     pub stores: Vec<PathBuf>,
@@ -2192,6 +2204,146 @@ mod tests {
             vec![flats[0].clone(), flats[1].clone(), default_flat],
             "stores must come back config-first, env second, default last (bundler precedence); got {paths:?}"
         );
+    }
+
+    // ── `bundle install --standalone` root (#796) ─────
+
+    /// Lay down what `bundle install --standalone` leaves in `<cwd>/bundle`:
+    /// the scoped `ruby/<abi>/gems/<leaf>` store plus the
+    /// `bundler/setup.rb` load-path script the app requires. Returns the
+    /// `gems/` store dir.
+    async fn stage_standalone_bundle(cwd: &Path, leaf: &str) -> PathBuf {
+        let root = cwd.join("bundle");
+        let gems = root.join("ruby").join("3.3.0").join("gems");
+        tokio::fs::create_dir_all(gems.join(leaf).join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("bundler"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join("bundler").join("setup.rb"),
+            "require 'rbconfig'\n$:.unshift File.expand_path(\"#{__dir__}/../#{RUBY_ENGINE}/#{Gem.ruby_api_version}/gems/rack-3.2.7/lib\")\n",
+        )
+        .await
+        .unwrap();
+        gems
+    }
+
+    /// Bundler 4 no longer remembers CLI flags, so `bundle install
+    /// --standalone` writes NO `.bundle/config` — the `./bundle` tree is
+    /// marked only by its `bundler/setup.rb`. Discovery must still find
+    /// it: it is the tree the app loads (#796).
+    #[tokio::test]
+    async fn standalone_bundle_root_discovered_without_config() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"rack\"\n")
+            .await
+            .unwrap();
+        let gems = stage_standalone_bundle(dir.path(), "rack-3.2.7").await;
+
+        let discovery =
+            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None, None).await;
+        assert_eq!(
+            discovery.stores,
+            vec![gems],
+            "standalone store must be discovered"
+        );
+        // Same class as bundler 2's recorded `BUNDLE_PATH: "bundle"`: an
+        // explicit project root, which keeps the `gem env` fallback (the
+        // default gems live there), not the implicit vendor/bundle one.
+        assert!(!discovery.default_root_has_stores);
+    }
+
+    /// Without the `bundler/setup.rb` marker a `bundle/` dir is just a
+    /// project directory (a script folder, a frontend bundle output) and
+    /// must not be crawled — or patched — as a gem store.
+    #[tokio::test]
+    async fn bundle_dir_without_standalone_marker_is_not_a_store() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"rack\"\n")
+            .await
+            .unwrap();
+        let gems = stage_standalone_bundle(dir.path(), "rack-3.2.7").await;
+        tokio::fs::remove_file(dir.path().join("bundle").join("bundler").join("setup.rb"))
+            .await
+            .unwrap();
+        assert!(gems.is_dir());
+
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(dir.path(), None, None).await;
+        assert!(paths.is_empty(), "no marker, no store; got {paths:?}");
+    }
+
+    /// The standalone probe sits behind the same "looks like a Ruby
+    /// project" gate as the other explicit roots.
+    #[tokio::test]
+    async fn standalone_bundle_root_ignored_without_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        stage_standalone_bundle(dir.path(), "rack-3.2.7").await;
+
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(dir.path(), None, None).await;
+        assert!(
+            paths.is_empty(),
+            "no Bundler manifest, no store; got {paths:?}"
+        );
+    }
+
+    /// Bundler 2 records `BUNDLE_PATH: "bundle"` for a standalone install,
+    /// so the config root and the standalone probe name the same tree: it
+    /// must be scanned (and patched) once.
+    #[tokio::test]
+    async fn standalone_bundle_root_dedups_with_bundler2_config_path() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"rack\"\n")
+            .await
+            .unwrap();
+        let gems = stage_standalone_bundle(dir.path(), "rack-3.2.7").await;
+        tokio::fs::create_dir_all(dir.path().join(".bundle"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.path().join(".bundle").join("config"),
+            "---\nBUNDLE_PATH: \"bundle\"\n",
+        )
+        .await
+        .unwrap();
+
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(dir.path(), None, None).await;
+        assert_eq!(paths, vec![gems]);
+    }
+
+    /// The standalone tree ranks after the explicit config/env roots and
+    /// before the implicit `vendor/bundle` default.
+    #[tokio::test]
+    async fn standalone_bundle_root_probes_between_env_and_default() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"rack\"\n")
+            .await
+            .unwrap();
+        let standalone = stage_standalone_bundle(dir.path(), "rack-3.2.7").await;
+        let env_root = dir.path().join("envstore");
+        let env_gems = env_root.join("ruby").join("3.3.0").join("gems");
+        tokio::fs::create_dir_all(env_gems.join("rack-3.2.7").join("lib"))
+            .await
+            .unwrap();
+        let default_gems = dir
+            .path()
+            .join("vendor")
+            .join("bundle")
+            .join("ruby")
+            .join("3.3.0")
+            .join("gems");
+        tokio::fs::create_dir_all(default_gems.join("rack-3.2.7").join("lib"))
+            .await
+            .unwrap();
+
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(
+            dir.path(),
+            Some(env_root.as_os_str()),
+            None,
+        )
+        .await;
+        assert_eq!(paths, vec![env_gems, standalone, default_gems]);
     }
 
     // ── config-sourced root containment (untrusted .bundle/config) ─

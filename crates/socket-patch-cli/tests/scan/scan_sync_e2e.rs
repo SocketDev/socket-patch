@@ -5,7 +5,6 @@
 //! file fixture.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
@@ -125,7 +124,7 @@ async fn scan_sync_against_clean_project_adds_and_applies_patch() {
     write_root(tmp.path());
     write_npm_package(tmp.path(), "sync-target", "1.0.0", before);
 
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args([
             "scan",
             "--json",
@@ -358,7 +357,7 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
     std::fs::create_dir_all(&blobs).unwrap();
     std::fs::write(blobs.join(&after_hash), after).unwrap();
 
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args([
             "scan",
             "--json",
@@ -481,7 +480,7 @@ async fn scan_apply_with_no_patches_emits_empty_apply_object() {
     write_root(tmp.path());
     write_npm_package(tmp.path(), "empty-target", "1.0.0", b"x");
 
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args([
             "scan",
             "--json",
@@ -625,7 +624,7 @@ async fn scan_apply_skips_vendored_purl_without_downloading() {
     )
     .unwrap();
 
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args([
             "scan",
             "--json",

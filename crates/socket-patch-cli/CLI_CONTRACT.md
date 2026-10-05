@@ -487,6 +487,8 @@ the model is **not uniform** today:
   crawler probes the project's Bundler install roots in **bundler's own precedence order** — the app
   config file's `BUNDLE_PATH:` (`$BUNDLE_APP_CONFIG/config`, else `<cwd>/.bundle/config` — what
   `bundle config set --local path` records), then the **`BUNDLE_PATH` environment variable**, then the
+  **standalone `<cwd>/bundle`** tree when it holds `bundle/bundler/setup.rb` (what `bundle install
+  --standalone` writes and the app loads; bundler 4 records no config for it), then the
   default `<cwd>/vendor/bundle` — each in both store layouts bundler produces (scoped
   `<root>/<engine>/<abi>/gems/` and flat `<root>/gems/`). The env variable is the user's own machine
   state, so it is honored verbatim (it may point outside `--cwd`; a leading `~` expands against home);
@@ -500,7 +502,7 @@ the model is **not uniform** today:
   from that root, so the read-only verifiers — the hosted gem stale-install probe and `vex`'s
   installed-copy lookup — still read it (a copy there must verify; an unpatched one is never the
   "nothing installed" absence the hosted lockfile basis excuses), while `apply`/`rollback` never
-  touch it (#709). Explicit env/config roots only count when `--cwd` holds a Bundler
+  touch it (#709). Explicit env/config/standalone roots only count when `--cwd` holds a Bundler
   manifest/lockfile. When the default `vendor/bundle` root holds no store, the gem homes `gem env`
   reports are appended (default gems like rexml/json only ever live there). When several roots hold
   **coexisting physical copies of one `gem@version`** (bundler-2's scoped store beside bundler-1's
