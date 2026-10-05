@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use regex::{NoExpand, Regex};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -59,6 +59,7 @@ use crate::formats::cargo::hosted::CargoLockPlan;
 use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
+use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 mod poetry;
@@ -342,12 +343,16 @@ pub fn rewrite_registry_redirect(
     rewrite_registry_redirect_with_python_metadata(files, overrides, &BTreeMap::new())
 }
 
+/// [`rewrite_registry_redirect`] with what the served artifacts carry, keyed
+/// by artifact URL: a hosted wheel's core metadata (the uv lock rewrite
+/// copies its dependency block) and a hosted npm tarball's `package.json`
+/// (the yarn berry pin takes its `bin` map from it).
 pub fn rewrite_registry_redirect_with_python_metadata(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
-    python_metadata: &BTreeMap<String, String>,
+    artifact_metadata: &BTreeMap<String, String>,
 ) -> RewriteResult {
-    rewrite_registry_redirect_with_pipenv_version(files, overrides, python_metadata, None, false)
+    rewrite_registry_redirect_with_pipenv_version(files, overrides, artifact_metadata, None, false)
 }
 
 /// Whether any pypi override targets an entry of `files["Pipfile.lock"]` —
@@ -404,14 +409,14 @@ fn withhold<'a>(
 pub fn rewrite_registry_redirect_with_pipenv_version(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
-    python_metadata: &BTreeMap<String, String>,
+    artifact_metadata: &BTreeMap<String, String>,
     pipenv_major: Option<u32>,
     bun_lockb_present: bool,
 ) -> RewriteResult {
     rewrite_registry_redirect_withholding_vlt(
         files,
         overrides,
-        python_metadata,
+        artifact_metadata,
         pipenv_major,
         bun_lockb_present,
         &std::collections::BTreeSet::new(),
@@ -425,7 +430,7 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
 pub fn rewrite_registry_redirect_withholding_vlt(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
-    python_metadata: &BTreeMap<String, String>,
+    artifact_metadata: &BTreeMap<String, String>,
     pipenv_major: Option<u32>,
     bun_lockb_present: bool,
     vlt_withheld: &std::collections::BTreeSet<String>,
@@ -450,7 +455,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
         &overrides,
         &vlt_overrides,
         bun_lockb_present,
-        python_metadata,
+        artifact_metadata,
     );
     let mut result = rewrite_groups_parallel(result, &groups);
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
@@ -474,14 +479,14 @@ fn rewriter_groups<'a>(
     overrides: &'a [DepOverride],
     vlt_overrides: &'a [DepOverride],
     bun_lockb_present: bool,
-    python_metadata: &'a BTreeMap<String, String>,
+    artifact_metadata: &'a BTreeMap<String, String>,
 ) -> Vec<RewriterGroup<'a>> {
     vec![
         Box::new(move |result| {
             rewrite_npm_lock(files, overrides, result);
             plan_hosted(files, overrides, result);
             rewrite_yarn_classic(files, overrides, result);
-            rewrite_yarn_berry(files, overrides, result);
+            rewrite_yarn_berry_with_manifests(files, overrides, artifact_metadata, result);
             rewrite_bun_lock(files, overrides, result);
         }),
         Box::new(move |result| {
@@ -490,7 +495,7 @@ fn rewriter_groups<'a>(
         Box::new(move |result| {
             requirements::rewrite(files, overrides, result);
             rewrite_hatch(files, overrides, result);
-            rewrite_uv_lock(files, overrides, python_metadata, result);
+            rewrite_uv_lock(files, overrides, artifact_metadata, result);
             poetry::rewrite_poetry(files, overrides, result);
         }),
         Box::new(move |result| rewrite_cargo(files, overrides, result)),
@@ -3436,9 +3441,24 @@ pub fn preflight_yarn_berry_hosted(lock: &str, yarnrc: Option<&str>) -> Result<(
     Ok(())
 }
 
+/// The berry hosted pin without served manifests (every pin keeps the
+/// registry entry's `bin:` map).
+#[cfg(test)]
 fn rewrite_yarn_berry(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    rewrite_yarn_berry_with_manifests(files, overrides, &BTreeMap::new(), result);
+}
+
+/// The berry hosted pin. `manifests` maps an artifact URL to the served
+/// tarball's `package.json` text; a pin whose manifest is absent keeps the
+/// registry entry's `bin:` map.
+fn rewrite_yarn_berry_with_manifests(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    manifests: &BTreeMap<String, String>,
     result: &mut RewriteResult,
 ) {
     // Descriptors split with the classic grammar's `name@range` rule.
@@ -3503,10 +3523,6 @@ fn rewrite_yarn_berry(
     // Keys of the entries re-keyed to a tarball descriptor; yarn sorts lock
     // entries by key, so each one moves to its sorted position at the end.
     let mut moved_keys: Vec<String> = Vec::new();
-    let resolution_re =
-        Regex::new(r#"\n {2}resolution: "[^"]*""#).expect("static resolution-line regex is valid");
-    let checksum_re =
-        Regex::new(r"\n {2}checksum: [^\n]*").expect("static checksum-line regex is valid");
     let mut changed = false;
     for dep in &npm {
         let fname = full_name(dep);
@@ -3823,40 +3839,31 @@ fn rewrite_yarn_berry(
                 continue;
             }
         };
-        // The entry yarn writes for those resolutions: only the key and the
-        // resolution change (plus our checksum); every other line — version,
-        // dependencies, bin, languageName — carries over verbatim.
+        // The entry yarn writes for those resolutions: the key, resolution
+        // and checksum change, `bin:` comes from the served tarball's own
+        // package.json when the caller fetched it (#718; yarn builds a
+        // tarball entry from it, not from the registry metadata), every
+        // other field carries over, and all of them sit in yarn's order
+        // (#697).
         let new_key = format!("\"{fname}@{}\"", dep.artifact_url);
+        let key_line = format!("{new_key}:");
         let resolution = format!("{fname}@{}", dep.artifact_url);
-        let body_lines = block.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
-        let mut rewritten = format!("\n{new_key}:\n{body_lines}");
-        // `NoExpand`: the URL is literal text, and a `$` in it (a patch
-        // server path) must never be read as a capture-group reference.
-        rewritten = resolution_re
-            .replace(
-                &rewritten,
-                NoExpand(&format!("\n  resolution: \"{resolution}\"")),
-            )
-            .to_string();
-        match &checksum {
-            Some(checksum) if checksum_re.is_match(&rewritten) => {
-                rewritten = checksum_re
-                    .replace(&rewritten, NoExpand(&format!("\n  checksum: {checksum}")))
-                    .to_string();
-            }
-            Some(checksum) => {
-                rewritten = resolution_re
-                    .replace(
-                        &rewritten,
-                        NoExpand(&format!(
-                            "\n  resolution: \"{resolution}\"\n  checksum: {checksum}"
-                        )),
-                    )
-                    .to_string();
-            }
-            None => {}
-        }
-        let rewritten = rewritten[1..].to_string();
+        let tarball_bin = manifests
+            .get(&dep.artifact_url)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .filter(Value::is_object)
+            .map(|manifest| manifest_bin(&manifest));
+        let body: Vec<&str> = block.lines().skip(1).collect();
+        let rewritten = render_pinned_entry(
+            &body,
+            &Pin {
+                key_line: &key_line,
+                resolution: &resolution,
+                checksum: checksum.as_deref(),
+                bin: tarball_bin.as_ref(),
+            },
+        )
+        .join("\n");
         for (selector, original) in pin.apply(manifest_obj, &dep.artifact_url) {
             manifest_changed = true;
             result.edits.push(FileEdit {
@@ -3961,6 +3968,63 @@ fn berry_lock_locks(content: &str, name: &str, version: &str) -> bool {
             && split_berry_key_patterns(key).iter().any(|p| {
                 split_pattern(p).is_some_and(|(n, range)| {
                     n == name && berry_npm_alias_target(range).is_none_or(|real| real == name)
+                })
+            })
+    })
+}
+
+/// The entries of the LF-normalized berry lock `content` that carry a
+/// `bin:` map: the only ones whose pin needs the served tarball's own
+/// package.json (#718). Split once per lock, so the per-dep check in
+/// [`berry_pin_needs_manifest`] only walks these (usually none).
+pub(crate) fn berry_bin_entries(content: &str) -> Vec<&str> {
+    content
+        .split("\n\n")
+        .filter(|block| block.contains("\n  bin:"))
+        .collect()
+}
+
+/// Whether the berry hosted pin of `dep` would re-key one of `bin_entries`
+/// (see [`berry_bin_entries`]): an entry of the package version whose
+/// descriptors all name the package through a plain (non-fork) `npm:`
+/// range, or one an earlier hosted run keyed by its tarball URL. A fork
+/// alias or another protocol is never re-keyed, so never needs a fetch.
+pub(crate) fn berry_pin_needs_manifest(bin_entries: &[&str], dep: &DepOverride) -> bool {
+    use crate::vendor::yarn_classic_lock::{split_berry_key_patterns, split_pattern};
+    if bin_entries.is_empty() {
+        return false;
+    }
+    let name = full_name(dep);
+    let version_line = format!("\n  version: {}", dep.version);
+    bin_entries.iter().any(|block| {
+        let Some(key) = block.lines().next().and_then(|l| l.strip_suffix(':')) else {
+            return false;
+        };
+        if key.starts_with([' ', '\t', '#']) || key == "__metadata" {
+            return false;
+        }
+        let has_version = block.match_indices(&version_line).any(|(at, _)| {
+            matches!(
+                block.as_bytes().get(at + version_line.len()),
+                None | Some(b'\n')
+            )
+        });
+        if !has_version {
+            return false;
+        }
+        let patterns = split_berry_key_patterns(key);
+        !patterns.is_empty()
+            && patterns.iter().all(|p| {
+                split_pattern(p).is_some_and(|(n, range)| {
+                    n == name
+                        && ((range.starts_with("npm:")
+                            && berry_npm_alias_target(range).is_none_or(|real| real == name))
+                            || berry_hosted_pin_is_ours(
+                                range,
+                                &name,
+                                Some(&dep.version),
+                                &dep.artifact_url,
+                            ))
                 })
             })
     })
@@ -4291,6 +4355,7 @@ fn rewrite_bun_lock(
     };
 
     let mut changed = false;
+    let mut pinned_any = false;
     for dep in &npm {
         let fname = full_name(dep);
         let Some(sha512) = dep.integrity.sha512.clone() else {
@@ -4410,6 +4475,7 @@ fn rewrite_bun_lock(
             });
             changed = true;
         }
+        pinned_any |= matched_any;
         if !matched_any {
             // Mirrors the pnpm/berry/uv rewriters: a granted dep that matched
             // no rewritable tuple (lock re-resolved to another version, entry
@@ -4419,6 +4485,34 @@ fn rewrite_bun_lock(
                 code: "redirect_bun_entry_not_found".into(),
                 detail: format!("no rewritable bun.lock entry for {fname}@{}", dep.version),
             });
+        }
+    }
+    // A workspace lock Bun migrated from a hosted `bun.lockb` keeps the
+    // member paths the binary normalization wrote as inter-workspace
+    // literals; Bun's text reader then re-resolves the workspace and drops
+    // the pins this run just wrote or confirmed (#803). Restore the
+    // manifests' `workspace:` literals, Bun's own spelling. Only a lock that
+    // holds a pin is touched, and the manifests are the engine's advisory
+    // `<dir>/package.json` reads.
+    if pinned_any {
+        let heals = crate::vendor::bun_lock_text::heal_workspace_literals(&mut lines, |dir| {
+            let rel = if dir.is_empty() {
+                "package.json".to_string()
+            } else {
+                format!("{dir}/package.json")
+            };
+            files.get(&rel).cloned()
+        });
+        for heal in heals {
+            result.edits.push(FileEdit {
+                path: "bun.lock".into(),
+                kind: "redirect_bun_lock_workspace_literal".into(),
+                action: "rewritten".into(),
+                key: Some(heal.key),
+                original: Some(Value::String(heal.original)),
+                new: Some(Value::String(heal.new)),
+            });
+            changed = true;
         }
     }
     if changed {
@@ -9849,6 +9943,111 @@ mod tests {
             .expect("real v1 grammar must rewrite");
         assert!(out.contains(&format!("{ws_v1}\n")), "{out}");
         assert!(out.contains("left-pad@http://p.test/lp.tgz"), "{out}");
+    }
+
+    /// #803: Bun 1.4 migrates a hosted workspace `bun.lockb` to `bun.lock`
+    /// with the member paths the binary normalization wrote as the
+    /// inter-workspace literals, so its text reader re-resolves the
+    /// workspace and drops the pins. A hosted re-run that finds its pin
+    /// already in place must still restore the manifests' `workspace:`
+    /// literals; a fresh pin heals them in the same pass.
+    #[test]
+    fn bun_lock_migrated_workspace_path_literals_are_healed() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override(
+            "is-number",
+            "7.0.0",
+            "http://p.test/is-number-7.0.0.tgz",
+            &sha512,
+        );
+        let pinned = format!(
+            "    \"is-number\": [\"is-number@http://p.test/is-number-7.0.0.tgz\", {{}}, \"{sha512}\"],"
+        );
+        let registry = "    \"is-number\": [\"is-number@7.0.0\", \"\", {}, \"sha512-OLD==\"],";
+        let lock = |entry: &str, m1: &str, m2: &str| {
+            format!(
+                "{{\n  \"lockfileVersion\": 2,\n  \"configVersion\": 1,\n  \"workspaces\": {{\n    \
+                 \"\": {{\n      \"name\": \"w\",\n      \"dependencies\": {{\n        \
+                 \"m1\": \"{m1}\",\n      }},\n    }},\n    \"packages/m1\": {{\n      \
+                 \"name\": \"m1\",\n      \"version\": \"1.0.0\",\n      \"dependencies\": {{\n        \
+                 \"is-number\": \"7.0.0\",\n        \"m2\": \"{m2}\",\n      }},\n    }},\n    \
+                 \"packages/m2\": {{\n      \"name\": \"m2\",\n      \"version\": \"1.0.0\",\n    }},\n  \
+                 }},\n  \"packages\": {{\n{entry}\n\n    \"m1\": [\"m1@workspace:packages/m1\"],\n\n    \
+                 \"m2\": [\"m2@workspace:packages/m2\"],\n  }}\n}}\n"
+            )
+        };
+        let manifests = [
+            (
+                "package.json",
+                r#"{"name":"w","workspaces":["packages/*"],"dependencies":{"m1":"workspace:*"}}"#,
+            ),
+            (
+                "packages/m1/package.json",
+                r#"{"name":"m1","dependencies":{"is-number":"7.0.0","m2":"workspace:^"}}"#,
+            ),
+            ("packages/m2/package.json", r#"{"name":"m2"}"#),
+        ];
+        let migrated = lock(&pinned, "packages/m1", "packages/m2");
+        let healed = lock(&pinned, "workspace:*", "workspace:^");
+
+        // The pin is already in place: only the literals change.
+        let mut files: BTreeMap<String, String> = manifests
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        files.insert("bun.lock".to_string(), migrated.clone());
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(r.files.get("bun.lock"), Some(&healed));
+        let kinds: Vec<(&str, Option<&str>)> = r
+            .edits
+            .iter()
+            .map(|e| (e.kind.as_str(), e.key.as_deref()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (
+                    "redirect_bun_lock_workspace_literal",
+                    Some(":dependencies:m1")
+                ),
+                (
+                    "redirect_bun_lock_workspace_literal",
+                    Some("packages/m1:dependencies:m2")
+                ),
+            ]
+        );
+        assert!(!r.files.contains_key("package.json"));
+
+        // Converged: the healed lock is a no-op.
+        files.insert("bun.lock".to_string(), healed.clone());
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+
+        // A registry tuple is pinned and the literals healed in one pass.
+        files.insert(
+            "bun.lock".to_string(),
+            lock(registry, "packages/m1", "packages/m2"),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.files.get("bun.lock"), Some(&healed));
+        assert_eq!(r.edits.len(), 3, "{:?}", r.edits);
+
+        // Without the manifests nothing proves the literal: left alone.
+        let mut bare = BTreeMap::new();
+        bare.insert("bun.lock".to_string(), migrated.clone());
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&bare, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+
+        // No pin for this run's deps: the lock is not touched.
+        let other = npm_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &sha512);
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&other), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
     }
 
     /// A version-0 lock whose only `workspaces` key is the root `""` (bun
@@ -18476,6 +18675,142 @@ packages:
         assert_eq!(r.edits.iter().filter(|e| e.path == "yarn.lock").count(), 1);
     }
 
+    /// #697: a platform-conditional entry yarn reached only through
+    /// `optionalDependencies` has no `checksum:` line. The hosted pin adds
+    /// one where yarn writes it — after the dependency maps and `bin:`,
+    /// before `conditions:` — never straight after `resolution:`.
+    #[test]
+    fn issue_697_checksum_lands_in_yarn_field_order() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("@img/sharp-linux-x64", "sharp-linux-x64", "0.33.5");
+        let ovr = DepOverride {
+            namespace: Some("@img".into()),
+            ..berry_override("sharp-linux-x64", "0.33.5", &url, &checksum)
+        };
+        let lock = "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                    \"@img/sharp-linux-x64@npm:0.33.5\":\n  version: 0.33.5\n  \
+                    resolution: \"@img/sharp-linux-x64@npm:0.33.5\"\n  dependencies:\n    \
+                    \"@img/sharp-libvips-linux-x64\": \"npm:1.0.4\"\n  dependenciesMeta:\n    \
+                    \"@img/sharp-libvips-linux-x64\":\n      optional: true\n  \
+                    conditions: os=linux & cpu=x64 & libc=glibc\n  languageName: node\n  \
+                    linkType: hard\n";
+        let files = berry_files(lock.to_string(), berry_manifest());
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = &r.files["yarn.lock"];
+        assert!(
+            out.contains(&format!(
+                "\n\"@img/sharp-linux-x64@{url}\":\n  version: 0.33.5\n  \
+                 resolution: \"@img/sharp-linux-x64@{url}\"\n  dependencies:\n    \
+                 \"@img/sharp-libvips-linux-x64\": \"npm:1.0.4\"\n  dependenciesMeta:\n    \
+                 \"@img/sharp-libvips-linux-x64\":\n      optional: true\n  \
+                 checksum: {checksum}\n  conditions: os=linux & cpu=x64 & libc=glibc\n  \
+                 languageName: node\n  linkType: hard\n"
+            )),
+            "checksum between dependenciesMeta and conditions: {out}"
+        );
+    }
+
+    /// #718: yarn builds a tarball-locator entry from the served tarball's
+    /// own package.json, whose `bin` keeps the published spelling
+    /// (`./dist/bin/uuid`), while the registry entry the pin started from
+    /// carries the registry's normalized `dist/bin/uuid`. With the served
+    /// manifest in hand the pin writes the tarball's `bin:`, or hardened
+    /// installs (`--refresh-lockfile`) fail YN0028.
+    #[test]
+    fn issue_718_bin_comes_from_the_served_tarball_manifest() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("uuid", "uuid", "9.0.1");
+        let ovr = berry_override("uuid", "9.0.1", &url, &checksum);
+        let lock = format!(
+            "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"uuid@npm:^9.0.0\":\n  version: 9.0.1\n  resolution: \"uuid@npm:9.0.1\"\n  \
+             bin:\n    uuid: dist/bin/uuid\n  checksum: 10c0/{}\n  languageName: node\n  \
+             linkType: hard\n",
+            "3".repeat(128)
+        );
+        let files = berry_files(lock, berry_manifest());
+        let mut manifests = BTreeMap::new();
+        manifests.insert(
+            url.clone(),
+            r#"{"name":"uuid","version":"9.0.1","bin":{"uuid":"./dist/bin/uuid"}}"#.to_string(),
+        );
+        let r = rewrite_registry_redirect_with_python_metadata(
+            &files,
+            std::slice::from_ref(&ovr),
+            &manifests,
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = &r.files["yarn.lock"];
+        assert!(
+            out.contains(&format!(
+                "\n\"uuid@{url}\":\n  version: 9.0.1\n  resolution: \"uuid@{url}\"\n  \
+                 bin:\n    uuid: ./dist/bin/uuid\n  checksum: {checksum}\n  languageName: node\n"
+            )),
+            "bin map from the served manifest: {out}"
+        );
+
+        // A string `bin` names the package itself (scope dropped), and a
+        // manifest without `bin` drops the registry's map entirely.
+        let mut manifests = BTreeMap::new();
+        manifests.insert(
+            url.clone(),
+            r#"{"name":"uuid","version":"9.0.1","bin":"./cli.js"}"#.to_string(),
+        );
+        let r = rewrite_registry_redirect_with_python_metadata(
+            &files,
+            std::slice::from_ref(&ovr),
+            &manifests,
+        );
+        assert!(
+            r.files["yarn.lock"].contains("\n  bin:\n    uuid: ./cli.js\n  checksum:"),
+            "{}",
+            r.files["yarn.lock"]
+        );
+        manifests.insert(
+            url.clone(),
+            r#"{"name":"uuid","version":"9.0.1"}"#.to_string(),
+        );
+        let r = rewrite_registry_redirect_with_python_metadata(
+            &files,
+            std::slice::from_ref(&ovr),
+            &manifests,
+        );
+        assert!(
+            !r.files["yarn.lock"].contains("bin:"),
+            "{}",
+            r.files["yarn.lock"]
+        );
+    }
+
+    /// Only an entry the berry pin would re-key, with a `bin:` map, needs the
+    /// served manifest: a fork alias (`left-pad@npm:other@…`) at the same
+    /// version never queues a fetch whose failure would drop the patch.
+    #[test]
+    fn berry_pin_needs_manifest_only_for_entries_the_pin_rekeys() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("uuid", "uuid", "9.0.1");
+        let dep = berry_override("uuid", "9.0.1", &url, &checksum);
+        let entry = |key: &str, bin: bool| {
+            format!(
+                "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n{key}:\n  version: 9.0.1\n  \
+                 resolution: \"x\"\n{}  languageName: node\n  linkType: hard\n",
+                if bin { "  bin:\n    uuid: dist/bin/uuid\n" } else { "" }
+            )
+        };
+        let needs = |lock: String| berry_pin_needs_manifest(&berry_bin_entries(&lock), &dep);
+        assert!(needs(entry("\"uuid@npm:^9.0.0\"", true)));
+        assert!(needs(entry("\"uuid@npm:^9.0.0, uuid@npm:^9.0.1\"", true)));
+        assert!(needs(entry(&format!("\"uuid@{url}\""), true)));
+        assert!(!needs(entry("\"uuid@npm:^9.0.0\"", false)));
+        assert!(!needs(entry("\"uuid@npm:other-uuid@^9.0.0\"", true)));
+        assert!(!needs(entry("\"uuid@npm:^9.0.0, other@npm:^1.0.0\"", true)));
+        assert!(!needs(entry("\"uuid@patch:uuid@npm%3A9.0.1#x\"", true)));
+        assert!(!needs(entry("\"uuid@https://mirror.example/uuid-9.0.1.tgz\"", true)));
+        // Another version of the package (`9.0.10` shares the prefix).
+        assert!(!needs(entry("\"uuid@npm:^9.0.0\"", true).replace("9.0.1\n", "9.0.10\n")));
+    }
+
     /// A bun URL 3-tuple already at the CURRENT artifact URL but with a stale
     /// integrity (a patch republish rotating only the hash) is refreshed in
     /// place.
@@ -20228,5 +20563,155 @@ mod hosted_patch_uuid_tests {
     fn go_module_namespace_is_on_the_patch_server_host() {
         assert!(crate::vendor::go_mod_edit::HOSTED_GO_MODULE_PREFIX
             .starts_with(&format!("{SOCKET_PATCH_SERVER_HOST}/")));
+    }
+}
+
+/// #742 / #650: a superseding patch uuid for a package an earlier hosted
+/// scan already wired re-pins socket-patch's own source, end to end through
+/// the redirect planner, instead of warning "revert it" and leaving the old
+/// uuid in place.
+#[cfg(test)]
+mod superseding_repin_tests {
+    use super::*;
+
+    const HEX_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HEX_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn six(grant: &str, uuid: &str, sha256: &str) -> DepOverride {
+        DepOverride {
+            ecosystem: "pypi".into(),
+            name: "six".into(),
+            namespace: None,
+            version: "1.16.0".into(),
+            token: grant.into(),
+            patch_uuid: uuid.into(),
+            artifact_url: format!(
+                "https://patch.socket.dev/patch/pypi/six/1.16.0/{grant}/{uuid}/six-1.16.0-py2.py3-none-any.whl"
+            ),
+            registry_override: None,
+            integrity: Integrity {
+                sha256: Some(sha256.into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn first() -> DepOverride {
+        six(
+            "11111111-1111-4111-8111-111111111111",
+            "aaaaaaaa-0000-4000-8000-000000000001",
+            HEX_A,
+        )
+    }
+
+    fn second() -> DepOverride {
+        six(
+            "22222222-2222-4222-8222-222222222222",
+            "aaaaaaaa-0000-4000-8000-000000000004",
+            HEX_B,
+        )
+    }
+
+    /// Run the planner and fold its rewrites over `files`.
+    fn scan(
+        files: &BTreeMap<String, String>,
+        dep: &DepOverride,
+    ) -> (BTreeMap<String, String>, RewriteResult) {
+        let result = rewrite_registry_redirect(files, std::slice::from_ref(dep));
+        let mut out = files.clone();
+        out.extend(result.files.clone());
+        (out, result)
+    }
+
+    fn assert_repinned(files: &BTreeMap<String, String>, result: &RewriteResult) {
+        assert!(
+            result.warnings.is_empty(),
+            "superseding patch refused: {:?}",
+            result.warnings
+        );
+        for (path, text) in files {
+            assert!(
+                !text.contains(&first().patch_uuid),
+                "{path} kept the old uuid:\n{text}"
+            );
+        }
+        let joined: String = files.values().cloned().collect();
+        assert!(joined.contains(&second().patch_uuid));
+    }
+
+    #[test]
+    fn uv_project_repins_to_a_superseding_patch() {
+        let lock = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\ndependencies = [{ name = \"six\" }]\n\n[package.metadata]\nrequires-dist = [{ name = \"six\", specifier = \"==1.16.0\" }]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" }]\n";
+        let project = "[project]\nname = \"app\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\"]\n";
+        for newline in ["\n", "\r\n"] {
+            let files: BTreeMap<String, String> = [
+                ("uv.lock".to_string(), lock.replace('\n', newline)),
+                ("pyproject.toml".to_string(), project.replace('\n', newline)),
+            ]
+            .into_iter()
+            .collect();
+            let (wired, result) = scan(&files, &first());
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert!(wired["pyproject.toml"].contains(&first().artifact_url));
+            assert!(wired["uv.lock"].contains(&first().artifact_url));
+            let (repinned, result) = scan(&wired, &second());
+            assert_repinned(&repinned, &result);
+            assert!(result
+                .confirmed_python_lock_uuids
+                .contains(&second().patch_uuid));
+            assert!(repinned["uv.lock"].contains(&format!("sha256:{HEX_B}")));
+            assert!(!repinned["uv.lock"].contains(HEX_A));
+            assert_eq!(repinned["uv.lock"].contains('\r'), newline == "\r\n");
+            // The re-pinned project is settled.
+            let (_, again) = scan(&repinned, &second());
+            assert!(again.files.is_empty() && again.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn uv_script_lock_repins_to_a_superseding_patch() {
+        let script = "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"six==1.16.0\"]\n# ///\nimport six\n";
+        let lock = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{ name = \"six\", specifier = \"==1.16.0\" }]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" }]\n";
+        let files: BTreeMap<String, String> = [
+            ("tool.py".to_string(), script.to_string()),
+            ("tool.py.lock".to_string(), lock.to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let (wired, result) = scan(&files, &first());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(wired["tool.py"].contains(&first().artifact_url));
+        let (repinned, result) = scan(&wired, &second());
+        assert_repinned(&repinned, &result);
+        assert!(repinned["tool.py.lock"].contains(&second().artifact_url));
+    }
+
+    #[test]
+    fn hatch_project_repins_to_a_superseding_patch() {
+        let project = "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n\n[tool.hatch.envs.default]\ndependencies = [\"six==1.16.0\"]\n";
+        let files: BTreeMap<String, String> = [("pyproject.toml".to_string(), project.to_string())]
+            .into_iter()
+            .collect();
+        let (wired, result) = scan(&files, &first());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(
+            wired["pyproject.toml"]
+                .matches(&first().artifact_url)
+                .count(),
+            2
+        );
+        let (repinned, result) = scan(&wired, &second());
+        assert_repinned(&repinned, &result);
+        assert!(result.confirmed_hatch_uuids.contains(&second().patch_uuid));
+        let pyproject = &repinned["pyproject.toml"];
+        assert_eq!(
+            pyproject
+                .matches(&format!("{}#sha256={HEX_B}", second().artifact_url))
+                .count(),
+            2,
+            "{pyproject}"
+        );
+        let (_, again) = scan(&repinned, &second());
+        assert!(again.files.is_empty() && again.warnings.is_empty());
     }
 }

@@ -93,10 +93,13 @@ const GEMFILE_LOCK: &str = "Gemfile.lock";
 ///
 /// `gemfile_lock_spec`: `original` and `new` are arrays of verbatim lock
 /// lines. In `original`, lines indented 4+ spaces are the gem's GEM spec
-/// block and the single 2-space line (if any) is the pre-vendor DEPENDENCIES
-/// entry — its absence means the gem was transitive and revert deletes the
-/// added entry. In `new`, the last element is the DEPENDENCIES entry we wrote
-/// and the rest is the emitted PATH section.
+/// block and the single 2-space line (if any) other than a `  remote: ` line
+/// is the pre-vendor DEPENDENCIES entry — its absence means the gem was
+/// transitive and revert deletes the added entry. A `  remote: ` line names
+/// the GEM section the block came from; it is recorded only when that is not
+/// the lock's first GEM section (#779), and revert restores into it. In
+/// `new`, the last element is the DEPENDENCIES entry we wrote and the rest
+/// is the emitted PATH section.
 ///
 /// `gemfile_lock_checksum`: `original`/`new` are the verbatim CHECKSUMS line
 /// strings (the registry `  <name> (<version>) sha256=<hex>` form vs the bare
@@ -729,32 +732,16 @@ pub async fn vendor_gem<'a>(
     // fragments: record `original: None` — the true originals live in the
     // ledger entry being replaced, which the caller carries forward by
     // wiring identity (`persist_vendor_entry`).
-    let lock_original = if lock_edit.rewired_ours {
-        None
-    } else {
-        let mut original_lines: Vec<Value> = lock_edit
-            .removed_spec_block
-            .iter()
-            .map(|l| Value::String(l.clone()))
-            .collect();
-        if let Some(dep) = &lock_edit.old_dep_line {
-            original_lines.push(Value::String(dep.clone()));
-        }
-        Some(Value::Array(original_lines))
-    };
-    let mut new_lines: Vec<Value> = lock_edit
-        .path_section
-        .iter()
-        .map(|l| Value::String(l.clone()))
-        .collect();
-    new_lines.push(Value::String(lock_edit.new_dep_line.clone()));
+    let (original_lines, new_lines) = lock_record_lines(&lock_edit);
+    let to_array =
+        |lines: Vec<String>| Value::Array(lines.into_iter().map(Value::String).collect());
     let lock_record = WiringRecord {
         file: GEMFILE_LOCK.to_string(),
         kind: LOCK_WIRING_KIND.to_string(),
         action: WiringAction::Rewritten,
         key: Some(name.to_string()),
-        original: lock_original,
-        new: Some(Value::Array(new_lines)),
+        original: (!lock_edit.rewired_ours).then(|| to_array(original_lines)),
+        new: Some(to_array(new_lines)),
     };
     let mut wiring = vec![gemfile_record, lock_record];
     // The CHECKSUMS rewrite (when the lock had a registry entry for the gem)
@@ -1636,6 +1623,21 @@ struct LockEdit {
     /// must ride again or the first run's registry `sha256=` restore line
     /// drops out of the ledger with the entry being replaced.
     checksum_bare: Option<String>,
+    /// The `  remote: ` line of the GEM section the spec block was lifted
+    /// from, when that is not the lock's first GEM section (#779). Revert
+    /// puts the block back into that section.
+    source_remote: Option<String>,
+}
+
+/// The `gemfile_lock_spec` record's `(original, new)` line arrays for
+/// `edit` (see [`LOCK_WIRING_KIND`] for the positional grammar).
+fn lock_record_lines(edit: &LockEdit) -> (Vec<String>, Vec<String>) {
+    let mut original = edit.removed_spec_block.clone();
+    original.extend(edit.source_remote.iter().cloned());
+    original.extend(edit.old_dep_line.iter().cloned());
+    let mut new = edit.path_section.clone();
+    new.push(edit.new_dep_line.clone());
+    (original, new)
 }
 
 /// Produce the pair-edited lock text (see the module doc for the canonical
@@ -1647,10 +1649,16 @@ fn edit_lock(text: &str, name: &str, version: &str, rel: &str) -> Result<LockEdi
 
     // 1. Lift the gem's spec block out of GEM/specs — or, on a re-vendor to
     // a newer patch uuid (same purl), out of the PATH section our previous
-    // run emitted.
-    let (gem_start, gem_end) =
-        section_span(&lines, "GEM").ok_or_else(|| "Gemfile.lock has no GEM section".to_string())?;
-    if !(gem_start..gem_end).any(|i| lines[i] == "  specs:") {
+    // run emitted. Bundler 2.2+ writes one GEM section per rubygems source
+    // (sorted by remote), so the spec may sit in any of them (#779).
+    let gem_sections = gem_section_spans(&lines);
+    if gem_sections.is_empty() {
+        return Err("Gemfile.lock has no GEM section".to_string());
+    }
+    if gem_sections
+        .iter()
+        .any(|&(gs, ge)| !(gs..ge).any(|i| lines[i] == "  specs:"))
+    {
         return Err("Gemfile.lock GEM section has no specs: stanza".to_string());
     }
     // SECURITY/fail-closed: platform-suffixed installs were refused
@@ -1661,19 +1669,52 @@ fn edit_lock(text: &str, name: &str, version: &str, rel: &str) -> Result<LockEdi
     // shape, but only bundler ≥ 2.6 locks have a CHECKSUMS section to catch
     // it in.
     let platform_prefix = format!("{version}-");
-    for line in lines.iter().take(gem_end).skip(gem_start + 1) {
-        if let Some((n, v)) = spec_entry(line) {
-            if n == name && v.starts_with(&platform_prefix) {
-                return Err(format!(
-                    "Gemfile.lock GEM specs has a platform-suffixed entry `{n} ({v})` but the installed gem is not platform-specific; the lock disagrees with the install (re-resolve it before vendoring)"
-                ));
+    for &(gs, ge) in &gem_sections {
+        for line in lines.iter().take(ge).skip(gs + 1) {
+            if let Some((n, v)) = spec_entry(line) {
+                if n == name && v.starts_with(&platform_prefix) {
+                    return Err(format!(
+                        "Gemfile.lock GEM specs has a platform-suffixed entry `{n} ({v})` but the installed gem is not platform-specific; the lock disagrees with the install (re-resolve it before vendoring)"
+                    ));
+                }
             }
         }
     }
     let target = format!("    {name} ({version})");
+    let mut hits = gem_sections
+        .iter()
+        .enumerate()
+        .filter_map(|(k, &(gs, ge))| {
+            (gs..ge)
+                .find(|&i| lines[i] == target)
+                .map(|i| (k, gs, ge, i))
+        });
+    let hit = hits.next();
+    if hits.next().is_some() {
+        // SECURITY/fail-closed: bundler locks one spec per gem; the same
+        // entry under two sources is a lock this backend does not
+        // understand, and lifting either copy would be a guess.
+        return Err(format!(
+            "Gemfile.lock lists `{name} ({version})` in more than one GEM section"
+        ));
+    }
+    let mut source_remote: Option<String> = None;
     let mut rewired_ours = false;
-    let removed_spec_block: Vec<String> = match (gem_start..gem_end).find(|&i| lines[i] == target) {
-        Some(block_start) => {
+    let removed_spec_block: Vec<String> = match hit {
+        Some((k, gem_start, gem_end, block_start)) => {
+            if k > 0 {
+                // Revert must find this section again; without a remote
+                // line there is nothing to find it by.
+                source_remote = Some(
+                    lines[gem_start..gem_end]
+                        .iter()
+                        .find(|l| l.starts_with("  remote: "))
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!("Gemfile.lock GEM section holding `{name} ({version})` has no remote: line")
+                        })?,
+                );
+            }
             let mut block_end = block_start + 1;
             while block_end < gem_end && lines[block_end].starts_with("      ") {
                 block_end += 1;
@@ -1866,6 +1907,7 @@ fn edit_lock(text: &str, name: &str, version: &str, rel: &str) -> Result<LockEdi
         checksum_rewrite,
         rewired_ours,
         checksum_bare,
+        source_remote,
     })
 }
 
@@ -1889,6 +1931,44 @@ fn section_end(lines: &[String], start: usize) -> usize {
         end += 1;
     }
     end
+}
+
+/// `[start, end)` of every GEM section, in lock order.
+fn gem_section_spans(lines: &[String]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].as_str() == "GEM" {
+            let end = section_end(lines, i);
+            spans.push((i, end));
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    spans
+}
+
+/// The GEM section a `gemfile_lock_spec` record's spec block belongs in:
+/// the one carrying the recorded `remote:` line, or the first GEM section
+/// when none was recorded (the block came from it).
+fn record_gem_section(lines: &[String], source_remote: Option<&str>) -> Option<(usize, usize)> {
+    let spans = gem_section_spans(lines);
+    match source_remote {
+        None => spans.first().copied(),
+        Some(remote) => spans
+            .into_iter()
+            .find(|&(gs, ge)| lines[gs..ge].iter().any(|l| l == remote)),
+    }
+}
+
+/// The recorded source-section `remote:` line in a `gemfile_lock_spec`
+/// record's `original` (present only when it was not the first GEM section).
+fn record_source_remote(original_lines: &[String]) -> Option<&str> {
+    original_lines
+        .iter()
+        .map(String::as_str)
+        .find(|l| l.starts_with("  remote: "))
 }
 
 /// Bundler's lock-sort identifier for a path source — `source at `<path>``
@@ -2124,7 +2204,7 @@ fn lock_record_converged(text: &str, original_lines: &[String], new_lines: &[Str
     if find_path_section(&lines, remote_line).is_some() {
         return false;
     }
-    let Some((gs, ge)) = section_span(&lines, "GEM") else {
+    let Some((gs, ge)) = record_gem_section(&lines, record_source_remote(original_lines)) else {
         return false;
     };
     let gem = &lines[gs..ge];
@@ -2215,9 +2295,10 @@ fn revert_lock_text(text: &str, original_lines: &[String], new_lines: &[String])
         .iter()
         .filter(|l| l.starts_with("    "))
         .collect();
+    let source_remote = record_source_remote(original_lines);
     let old_dep_line = original_lines
         .iter()
-        .find(|l| l.starts_with("  ") && !l[2..].starts_with(' '));
+        .find(|l| l.starts_with("  ") && !l[2..].starts_with(' ') && !l.starts_with("  remote: "));
     let our_name = spec_entry_name(spec_block.first()?)?.to_string();
 
     let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
@@ -2228,7 +2309,7 @@ fn revert_lock_text(text: &str, original_lines: &[String], new_lines: &[String])
         return None;
     }
     {
-        let (gs, ge) = section_span(&lines, "GEM")?;
+        let (gs, ge) = record_gem_section(&lines, source_remote)?;
         (gs..ge).find(|&i| lines[i] == "  specs:")?;
     }
 
@@ -2236,8 +2317,9 @@ fn revert_lock_text(text: &str, original_lines: &[String], new_lines: &[String])
     lines.drain(path_start..path_end);
 
     // 2. Spec block back into GEM/specs, sorted by entry name (bundler keeps
-    // specs alphabetized; the block came out of a sorted list).
-    let (gs, ge) = section_span(&lines, "GEM")?;
+    // specs alphabetized; the block came out of a sorted list), in the GEM
+    // section it was lifted from.
+    let (gs, ge) = record_gem_section(&lines, source_remote)?;
     let specs_idx = (gs..ge).find(|&i| lines[i] == "  specs:")?;
     let mut insert_at = specs_idx + 1;
     let mut i = specs_idx + 1;
@@ -7622,5 +7704,199 @@ mod tests {
         };
         assert_eq!(code, "vendor_prebuilt_required");
         assert!(!root.join(".socket").exists(), "nothing written");
+    }
+
+    // ── #779: a gem outside the lock's first GEM section ──────────────────
+
+    /// Bundler 2.2+ writes one GEM section per rubygems source, sorted by
+    /// remote, so a private source can put rubygems.org second.
+    const GEMFILE_TWO_SOURCES: &str = "source \"https://rubygems.org\"\n\ngem \"puma\"\ngem \"rack\", \"~> 3.1\"\n\nsource \"https://gems.example.com\" do\n  gem \"aaa-internal\"\nend\n";
+    const LOCK_TWO_SOURCES: &str = "GEM\n  remote: https://gems.example.com/\n  specs:\n    aaa-internal (1.0.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.4.2)\n      nio4r (~> 2.0)\n    rack (3.2.6)\n      base64 (>= 0.1.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  aaa-internal!\n  puma\n  rack (~> 3.1)\n\nBUNDLED WITH\n   2.5.22\n";
+
+    /// Bundler's own re-lock of [`LOCK_TWO_SOURCES`] with rack path-sourced
+    /// (shape verified against bundler 4.0.17 `bundle lock --local`).
+    fn expected_lock_two_sources() -> String {
+        format!(
+            "PATH\n  remote: {rel}\n  specs:\n    rack (3.2.6)\n      base64 (>= 0.1.0)\n\nGEM\n  remote: https://gems.example.com/\n  specs:\n    aaa-internal (1.0.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.4.2)\n      nio4r (~> 2.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  aaa-internal!\n  puma\n  rack (= 3.2.6)!\n\nBUNDLED WITH\n   2.5.22\n",
+            rel = copy_rel()
+        )
+    }
+
+    /// #779: the spec sits in the second GEM section. It used to fail with
+    /// "GEM specs has no entry" although the lock lists it.
+    #[test]
+    fn edit_lock_lifts_spec_from_second_gem_section() {
+        let edit = edit_lock(LOCK_TWO_SOURCES, "rack", "3.2.6", &copy_rel()).unwrap();
+        assert_eq!(edit.text, expected_lock_two_sources());
+        assert!(!edit.rewired_ours);
+        assert_eq!(
+            edit.removed_spec_block,
+            vec!["    rack (3.2.6)", "      base64 (>= 0.1.0)"]
+        );
+        assert_eq!(
+            edit.source_remote.as_deref(),
+            Some("  remote: https://rubygems.org/")
+        );
+    }
+
+    /// The first-section case keeps its ledger shape: no source remote is
+    /// recorded, so ledgers written before #779 and after it agree.
+    #[test]
+    fn edit_lock_first_gem_section_records_no_source_remote() {
+        let edit = edit_lock(LOCK_DIRECT, "rack", "3.2.6", &copy_rel()).unwrap();
+        assert_eq!(edit.source_remote, None);
+        let (original, _new) = lock_record_lines(&edit);
+        assert!(original.iter().all(|l| !l.starts_with("  remote: ")));
+    }
+
+    /// SECURITY/fail-closed: the same `name (version)` in two GEM sections
+    /// means the lock disagrees with bundler's one-spec-per-gem model.
+    /// Lifting either copy would be a guess.
+    #[test]
+    fn edit_lock_spec_in_two_gem_sections_fails_closed() {
+        let lock = LOCK_TWO_SOURCES.replace(
+            "    aaa-internal (1.0.0)\n",
+            "    aaa-internal (1.0.0)\n    rack (3.2.6)\n",
+        );
+        let err = edit_lock(&lock, "rack", "3.2.6", &copy_rel())
+            .err()
+            .expect("a spec listed in two GEM sections must fail closed");
+        assert!(err.contains("more than one GEM section"), "{err}");
+    }
+
+    /// SECURITY/fail-closed: a platform-suffixed sibling in ANOTHER GEM
+    /// section is still a lock that disagrees with the install.
+    #[test]
+    fn edit_lock_platform_sibling_in_other_gem_section_fails_closed() {
+        let lock = LOCK_TWO_SOURCES.replace(
+            "    aaa-internal (1.0.0)\n",
+            "    aaa-internal (1.0.0)\n    rack (3.2.6-x86_64-linux)\n",
+        );
+        let err = edit_lock(&lock, "rack", "3.2.6", &copy_rel())
+            .err()
+            .expect("a platform sibling in any GEM section must fail closed");
+        assert!(err.contains("platform-suffixed"), "{err}");
+    }
+
+    /// #779 end to end: vendor a gem from the second GEM section, then
+    /// revert. The lock is Bundler's canonical form while vendored, and
+    /// revert puts the spec back into the section it came from, restoring
+    /// the original bytes exactly.
+    #[tokio::test]
+    async fn second_gem_section_vendor_and_revert_round_trip() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture(GEMFILE_TWO_SOURCES, LOCK_TWO_SOURCES).await;
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            expected_lock_two_sources()
+        );
+
+        // Idempotent re-run: nothing to change.
+        let lock_before = tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap();
+        let (r2, _e2, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
+            lock_before
+        );
+
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "clean revert must not report drift: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_TWO_SOURCES
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_TWO_SOURCES,
+            "revert must restore the spec into the second GEM section"
+        );
+    }
+
+    /// Re-vendor to a newer patch uuid (the spec now lives in our PATH
+    /// section) keeps the source section recorded by the first run, so a
+    /// later revert still targets the second GEM section.
+    #[test]
+    fn revert_lock_text_targets_recorded_gem_section() {
+        let edit = edit_lock(LOCK_TWO_SOURCES, "rack", "3.2.6", &copy_rel()).unwrap();
+        let (original, new) = lock_record_lines(&edit);
+        assert_eq!(
+            revert_lock_text(&edit.text, &original, &new).as_deref(),
+            Some(LOCK_TWO_SOURCES)
+        );
+        // A regenerated lock that already put rack back into its section is
+        // converged, not drifted.
+        assert!(lock_record_converged(LOCK_TWO_SOURCES, &original, &new));
+        // The recorded section vanished (the source was dropped): drift,
+        // never a guess at another section.
+        let gone = edit.text.replace(
+            "  remote: https://rubygems.org/\n",
+            "  remote: https://mirror.example/\n",
+        );
+        assert_eq!(revert_lock_text(&gone, &original, &new), None);
+        assert!(!lock_record_converged(
+            &LOCK_TWO_SOURCES.replace("https://rubygems.org/", "https://mirror.example/"),
+            &original,
+            &new
+        ));
+    }
+
+    /// #779 re-vendor: a superseding patch uuid lifts the spec out of our
+    /// own PATH section, and the carried-forward original still names the
+    /// second GEM section, so revert restores the pre-vendor bytes.
+    #[tokio::test]
+    async fn second_gem_section_revendor_then_revert_restores_original() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture(GEMFILE_TWO_SOURCES, LOCK_TWO_SOURCES).await;
+        let (r1, e1, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let entry1 = e1.unwrap();
+
+        let mut record2 = record.clone();
+        record2.uuid = "0e1f2a3b-4c5d-4e6f-8a7b-9c0d1e2f3a4b".to_string();
+        let (r2, e2, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record2, false).await);
+        assert!(r2.success, "re-vendor must succeed: {:?}", r2.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            expected_lock_two_sources().replace(UUID, &record2.uuid)
+        );
+
+        let mut entry2 = e2.unwrap();
+        carry_forward_originals(&entry1, &mut entry2);
+        let outcome = revert_gem(&entry2, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_TWO_SOURCES
+        );
     }
 }

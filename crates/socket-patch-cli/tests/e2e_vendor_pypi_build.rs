@@ -946,6 +946,125 @@ fn uv_vendor_revert_sub_table_sources() {
     );
 }
 
+/// Vendor six on a REAL uv project, run `relock` (a uv command the user
+/// runs after vendoring that re-serializes a lock array around our
+/// element), then `vendor --revert`. The revert must recognise our element
+/// inside uv's re-serialized array and unwind BOTH files: no drift, nothing
+/// left routing through `.socket/vendor`, and `uv lock --check` accepts
+/// the pair (#806, #821). Before the fix the pyproject side reverted alone
+/// and `uv sync --locked` failed while revert reported success.
+fn uv_relock_then_revert(tag: &str, pyproject: &str, relock: &[&str]) {
+    let Some((uv, python)) = capstone_uv(tag) else {
+        return;
+    };
+    bake_leak_guards();
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let cache = tmp.path().join("uv-cache");
+    let mut cache_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", cache.to_str().unwrap())];
+    if let Some(py) = python.as_deref() {
+        cache_env.push(("UV_PYTHON", py));
+    }
+    std::fs::write(proj.join("pyproject.toml"), pyproject).unwrap();
+    for step in [&["lock", "-q"][..], &["sync", "-q"][..]] {
+        let out = tool(&uv, &proj, step, &cache_env);
+        if !out.status.success() {
+            println!(
+                "SKIP e2e_vendor_pypi_build({tag}): `uv {}` failed (PyPI unreachable?):\n{}",
+                step[0],
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+    }
+    let installed_six = site_packages(&proj.join(".venv")).join("six.py");
+    stage_patch(&proj, &installed_six);
+
+    let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_vendored_applied(&parse_envelope(&stdout));
+    let check = tool(&uv, &proj, &["lock", "--check"], &cache_env);
+    assert_tool_ok(&check, "`uv lock --check` on the wired pair");
+
+    let out = tool(&uv, &proj, relock, &cache_env);
+    if !out.status.success() {
+        println!(
+            "SKIP e2e_vendor_pypi_build({tag}): `uv {}` failed (PyPI unreachable?):\n{}",
+            relock.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let relocked = std::fs::read_to_string(proj.join("uv.lock")).unwrap();
+    assert!(
+        relocked.contains(".socket/vendor/pypi/"),
+        "the relock must keep six vendored: {relocked}"
+    );
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let renv = parse_envelope(&stdout);
+    assert_eq!(renv["status"], "success", "revert envelope: {renv}");
+    assert!(
+        !stdout.contains("vendor_lock_entry_drifted"),
+        "uv re-serializing the array around our element is not drift: {renv}"
+    );
+    for file in ["pyproject.toml", "uv.lock"] {
+        let text = std::fs::read_to_string(proj.join(file)).unwrap();
+        assert!(
+            !text.contains(".socket/vendor"),
+            "{file} must be fully unwired:\n{text}"
+        );
+    }
+    let check = tool(&uv, &proj, &["lock", "--check"], &cache_env);
+    assert_tool_ok(&check, "`uv lock --check` after the revert");
+    assert!(
+        !proj.join(".socket/vendor").exists(),
+        ".socket/vendor must be fully removed after revert"
+    );
+}
+
+/// #821: six in a PEP 735 dev group, then `uv add --dev zipp` rewrites the
+/// whole `requires-dev` group line.
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_after_dev_group_relock() {
+    uv_relock_then_revert(
+        "uv-dev-group-relock",
+        "[project]\nname = \"vendor-capstone\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = []\n\n[dependency-groups]\ndev = [\"six==1.16.0\", \"attrs>=20\"]\n",
+        &["add", "-q", "--dev", "zipp"],
+    );
+}
+
+/// #806: six arrives transitively next to a user-authored
+/// `override-dependencies`, then `uv add idna` re-serializes `[manifest]
+/// overrides` sorted and multi-line.
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_after_manifest_overrides_relock() {
+    uv_relock_then_revert(
+        "uv-overrides-relock",
+        "[project]\nname = \"vendor-capstone\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"python-dateutil==2.9.0.post0\"]\n\n[tool.uv]\nconstraint-dependencies = [\"six==1.16.0\"]\noverride-dependencies = [\"attrs>=20\"]\n",
+        &["add", "-q", "idna==3.7"],
+    );
+}
+
 /// `get <uuid> --mode vendored` twin of the uv capstone above (v3.6): the
 /// SAME vendor engine and wiring, driven through get's uuid path — exempt
 /// from installed narrowing, so only the mocked `view/{uuid}` route is
