@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ 045d7ec on 2026-10-04 by audit-ecosystems (5.4 Python, Cargo, Maven XML, Gem and Go; 5.6 scaffolding). Owner: audit-ecosystems._
+_Last checked against main @ 045d7ec on 2026-10-05 by audit-ecosystems (5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding). Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -153,7 +153,7 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
   - `poetry_lock` has its own inline rule: any CRLF turns the whole rendering CRLF, which disagrees with `python_lock` on mixed files {{E54}};
   - `cargo_manifest` aligns lines with an LCS diff.
 
-  There are also ad-hoc helpers in four more files.
+  There are also ad-hoc helpers in four more files: on main, `common::detect_eol`, `pypi_uv::newline_of` and `gradle::newline_of` (a different, first-line rule under the same name), plus inline any-CRLF copies in `maven_reactor.rs` (×2) and `pypi_pipenv.rs`. One classifier is the target. {{E16}}
 - **Per-backend copies:**
   - `cleanup_failed_stage` is byte-identical in cargo and gem, and one line different in composer.
   - `<eco>_service_copy` (fetch → settle → claim_prestaged-or-extract → afterHash check → swap) is repeated for cargo, composer, gem and golang.

@@ -2,7 +2,7 @@
 
 ## Part 6: Discovery, inventory and VEX
 
-_Last checked against main @ 045d7ec on 2026-10-04 by audit-ecosystems (gem lock selection, the go.mod row and 6.4 dead code re-checked). Owner: `audit-ecosystems`._
+_Last checked against main @ 045d7ec on 2026-10-05 by audit-ecosystems (gem lock selection, the go.mod row, 6.4 dead code and the product probe table re-checked). Owner: `audit-ecosystems`._
 
 > Scope: `vex/**` (incl. `vex/discover/*`), `crawlers/**`, `formats/**`, `vendor/lock_inventory/*`, and the CLI consumers `vex.rs`, `vex_sources.rs`, `vex_consumed.rs`, `scan/discovery.rs`, `context.rs`, `list.rs`, `ecosystem_dispatch.rs`.
 
@@ -83,7 +83,7 @@ Across the repo that is **eight hand-rolled XML scanners**, 4–5 independent wa
 - **The crawlers re-implement the validators.** `is_safe_cargo_coordinate`, `is_safe_gem_coordinate` and `is_safe_nuget_coordinate` have byte-identical bodies and equal `simple_purl`'s check; `utils::purl::maven_purl` and `vendor/maven_repo.rs` import `crawlers::maven_crawler::is_safe_maven_coordinate`. {{E37}}
 - **`composer_crawler::normalize_version`** behaves exactly like `utils/composer_version::strip_leading_v`, and `formats::composer` and `upstream::composer` import the crawler copy (a `formats` → `crawlers` edge). {{E37}}
 - **Layering inversion.** `canonicalize_pypi_name` lives in `crawlers/python_crawler.rs` and is imported by **29 files**, including `lock_inventory`, `vex::discover`, `utils::purl` and `patch::redirect`. `Ecosystem` itself lives in `crawlers/types.rs`, while `LockfileEntry.ecosystem` is a string tag beside it.
-- **The product-manifest probe table is copied three times, and has drifted.** `vex.rs:1118 PRODUCT_MANIFESTS` copies `product.rs:80-87` but lacks the csproj and gemspec probes. The `--product` help text is a third copy.
+- **The product-manifest probe table is copied three times, and has drifted.** `vex.rs:1118 PRODUCT_MANIFESTS` copies `product.rs:80-87` but lacks the csproj and gemspec probes. The `--product` help text is a third copy (up to date today). Proved on `045d7ec`: a lone `Tool.csproj` that `parse_csproj` rejects yields a bare `product_undetected` message, while a `package.json` without a version is named in it. {{E38}}
 - **Test RNG.** xorshift is implemented four times.
 
 **Dead code:**
