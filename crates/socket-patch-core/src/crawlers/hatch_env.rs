@@ -462,6 +462,12 @@ async fn read_toml(path: &Path) -> Option<DocumentMut> {
         .ok()
 }
 
+/// [`project_ids`] for tests elsewhere in the crate.
+#[cfg(test)]
+pub(crate) fn project_ids_for_tests(root: &Path) -> Vec<String> {
+    project_ids(root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,10 +735,4 @@ mod tests {
         assert_eq!(expand("~/a/$X/${X}b/$NOPE/c", &var), "/h/a/ex/exb/$NOPE/c");
         assert_eq!(expand("~user/a", &var), "~user/a");
     }
-}
-
-/// [`project_ids`] for tests elsewhere in the crate.
-#[cfg(test)]
-pub(crate) fn project_ids_for_tests(root: &Path) -> Vec<String> {
-    project_ids(root)
 }
