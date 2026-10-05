@@ -52,9 +52,16 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   gates them by `allow-file`, default `all`). npm 6 ignores `resolved` for registry
   dependencies, so a redirected lockfileVersion 1 lock fails closed with
   EINTEGRITY under npm 6 (`redirect_npm_legacy_client`) and installs under npm
-  >= 7. Vendoring needs a lockfileVersion 2/3 lock (npm 6 still installs a
-  vendored v2 lock from its legacy mirror) and rewires both locks in npm 12's
-  dual-lock state. Majors 6–12 are measured in
+  >= 7. A lockfileVersion 2 lock's legacy `dependencies` mirror is rewired with
+  `packages`, npm alias nodes (`"lp": {"version": "npm:left-pad@1.3.0"}`)
+  included. npm 6 installs an aliased dependency from the configured registry
+  whatever its `resolved` says, so under npm 6 an aliased hosted pin in a v2
+  lock fails closed with EINTEGRITY too (`redirect_npm_legacy_alias_client`).
+  Lockfile-only `vex` attests nothing for a package whose `packages` entry is
+  wired while the v2 mirror still resolves it from the registry. Vendoring
+  needs a lockfileVersion 2/3 lock (npm 6 still installs a vendored v2 lock
+  from its legacy mirror, alias nodes included) and rewires both locks in npm
+  12's dual-lock state. Majors 6–12 are measured in
   [npm compatibility](testing/npm-compatibility.md).
 - **pnpm** — hosted rewriting supports legacy `shrinkwrap.yaml` (pnpm 1/2),
   lockfileVersion 5.x (pnpm 3–7), 6.0 (pnpm 8), and 9.0 (pnpm 9–12).

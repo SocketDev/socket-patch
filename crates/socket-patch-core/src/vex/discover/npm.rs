@@ -56,7 +56,8 @@ use crate::formats::pnpm::{
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::pnpm::rush_lock_rels;
 use crate::vendor::lock_inventory::{
-    npm_lock_bundled_nodes, npm_lock_nodes, LockIntegrity, NpmLockNode,
+    npm_lock_bundled_nodes, npm_lock_legacy_mirror_nodes, npm_lock_nodes, LockIntegrity,
+    NpmLockNode,
 };
 use crate::vendor::npm_origin::{npm_non_registry_entries, NpmOverrides};
 
@@ -197,7 +198,58 @@ async fn extract_package_lock(
         .map(|text| NpmOverrides::from_manifest_text(&text))
         .unwrap_or_default();
     drop_non_registry_installs(file, &doc, &overrides, &mut read, out);
+    drop_mirror_unwired(ctx, file, &doc, &mut read, out);
     Some(read)
+}
+
+/// A lockfileVersion 2 lock's legacy `dependencies` mirror is what npm 6
+/// installs from (the docs list npm 6 as a v2 client). A `packages` ref
+/// whose package the mirror still resolves from a non-Socket source (the
+/// registry: a lock a pre-#432 run left with an alias mirror node
+/// unrewired) installs unpatched under npm 6, so it is diagnosed and not
+/// attested (#432). A mirror node that agrees, or a mirror that does not
+/// mention the package, contests nothing; a mirror node wired while
+/// `packages` is not is never a ref (see [`npm_lock_nodes`]).
+fn drop_mirror_unwired(
+    ctx: &DiscoverCtx<'_>,
+    file: &str,
+    doc: &Value,
+    read: &mut NpmLockRefs,
+    out: &mut Discovery,
+) {
+    let mut unwired: BTreeMap<String, String> = BTreeMap::new();
+    for node in npm_lock_legacy_mirror_nodes(doc) {
+        let Some(purl) = node.version.and_then(|v| npm_purl(node.name, v)) else {
+            continue;
+        };
+        let located = node.resolved.map_or_else(Located::default, |r| {
+            ctx.locate(r, LocateOpts::LITERAL_CHECKED)
+        });
+        if located.vendored.is_none() && located.hosted.is_none() {
+            let source = node.resolved.unwrap_or("no `resolved` url").to_string();
+            unwired.entry(purl).or_insert(source);
+        }
+    }
+    if unwired.is_empty() {
+        return;
+    }
+    read.refs.retain(|r| {
+        let Some(source) = unwired.get(&r.purl) else {
+            return true;
+        };
+        out.diag(
+            DIAG_REF_UNATTRIBUTABLE,
+            file,
+            format!(
+                "{file}: {} is wired to Socket patch {} in `packages`, but the lock's legacy \
+                 `dependencies` mirror, which npm <= 6 installs from, still resolves it to \
+                 {source:?}, so npm 6 installs the unpatched bytes and nothing is attested; \
+                 re-run `socket-patch scan` (or `vendor`) to rewire the mirror",
+                r.purl, r.uuid
+            ),
+        );
+        false
+    });
 }
 
 /// npm installs a git / url / `file:` dependency from the dependent's spec
@@ -929,6 +981,113 @@ mod tests {
             &run(&p).await,
             &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
         );
+    }
+
+    /// #432, lockfileVersion 1: npm 6 writes an alias install as
+    /// `"lp": {"version": "npm:left-pad@1.3.0"}`; the node is an install of
+    /// left-pad@1.3.0, never of a package named `lp`.
+    #[tokio::test]
+    async fn lockfile_v1_alias_node_is_its_target() {
+        let url = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            serde_json::json!({
+                "lockfileVersion": 1,
+                "dependencies": {
+                    "lp": { "version": "npm:left-pad@1.3.0", "resolved": url, "integrity": SRI },
+                    "@x/lp": { "version": "npm:left-pad@1.3.0", "resolved": url, "integrity": SRI }
+                }
+            })
+            .to_string(),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[
+                ("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted),
+                ("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted),
+            ],
+        );
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    /// #432: a v2 lock whose `packages` alias entry is wired while its
+    /// legacy mirror node (what npm 6 installs from) still resolves to the
+    /// registry is NOT attested: npm 6 installs the unpatched bytes. This is
+    /// the lock a pre-#432 hosted or vendored run left behind.
+    #[tokio::test]
+    async fn v2_alias_mirror_left_on_the_registry_contests_the_ref() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        let registry = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        for wired in [hosted, vendored] {
+            let p = Project::new();
+            p.write(
+                "package-lock.json",
+                serde_json::json!({
+                    "lockfileVersion": 2,
+                    "packages": {
+                        "": { "name": "app", "version": "1.0.0" },
+                        "node_modules/lp": {
+                            "name": "left-pad", "version": "1.3.0",
+                            "resolved": wired, "integrity": SRI
+                        }
+                    },
+                    "dependencies": {
+                        "lp": {
+                            "version": "npm:left-pad@1.3.0",
+                            "resolved": registry, "integrity": "sha512-ORIG"
+                        }
+                    }
+                })
+                .to_string(),
+            );
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{wired}: {:#?}", out.refs);
+            let diag = out
+                .diagnostics
+                .iter()
+                .find(|d| d.code == DIAG_REF_UNATTRIBUTABLE)
+                .unwrap_or_else(|| panic!("{wired}: {:?}", out.diagnostics));
+            assert!(
+                diag.detail.contains("npm <= 6") && diag.detail.contains(registry),
+                "{}",
+                diag.detail
+            );
+        }
+    }
+
+    /// #432: the same v2 lock with the alias mirror node rewired too (what
+    /// hosted and vendored runs now write) is attested once, from
+    /// `packages`.
+    #[tokio::test]
+    async fn v2_alias_mirror_that_agrees_attests() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            serde_json::json!({
+                "lockfileVersion": 2,
+                "packages": {
+                    "": { "name": "app", "version": "1.0.0" },
+                    "node_modules/lp": {
+                        "name": "left-pad", "version": "1.3.0",
+                        "resolved": hosted, "integrity": SRI
+                    }
+                },
+                "dependencies": {
+                    "lp": { "version": "npm:left-pad@1.3.0", "resolved": hosted, "integrity": SRI }
+                }
+            })
+            .to_string(),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
+        );
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 
     /// link / inBundle / bundled entries install from somewhere else, so a
