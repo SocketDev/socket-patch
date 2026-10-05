@@ -1,0 +1,19 @@
+{
+  "upstream/uv-explicit-extra": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/idna@3.7",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/six@1.16.0",
+        "file": "uv.lock"
+      }
+    ],
+    "live_claims": []
+  }
+}

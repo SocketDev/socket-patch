@@ -752,6 +752,19 @@ fn nuget_hosted_dotnet_restore_then_manifestless_vex() {
     let store_fx = sb.dir("store-fixture");
     let registry = restore_fixture(&dn, &sb, &fixture, &store_fx);
 
+    // Regression #561/#585: templates often keep inactive sources/mappings.
+    // A forward rewrite must agree with NuGet and VEX about which XML is live.
+    let inactive = "<!-- <packageSources><add key=\"old\" value=\"https://old.invalid/v3/index.json\" /></packageSources><packageSourceMapping></packageSourceMapping> -->";
+    std::fs::write(
+        fixture.join("nuget.config"),
+        registry.0.replacen(
+            "<configuration>",
+            &format!("<configuration>\n  {inactive}"),
+            1,
+        ),
+    )
+    .unwrap();
+
     let pristine = std::fs::read(pkg_dir(&store_fx).join(FILE_KEY)).unwrap();
     let mut patched = pristine.clone();
     patched.extend_from_slice(MARKER);
@@ -794,6 +807,10 @@ fn nuget_hosted_dotnet_restore_then_manifestless_vex() {
     let doc: Value = serde_json::from_slice(&std::fs::read(&embedded).unwrap()).unwrap();
     assert_attested(&doc, PURL, HOSTED_UUID, Marker::Redirected, &vulns());
     let config = std::fs::read_to_string(fixture.join("nuget.config")).unwrap();
+    assert!(
+        config.contains(inactive),
+        "inactive XML left byte-exact: {config}"
+    );
     assert!(
         config.contains(&format!("socket-patch-{HOSTED_UUID}"))
             && config.contains(&format!("pattern=\"{ID}\"")),

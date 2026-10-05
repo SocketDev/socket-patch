@@ -3,7 +3,10 @@ use toml_edit::DocumentMut;
 use toml_edit::{value, Array, InlineTable, Item, Table, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::python_lock::{is_prior_hosted_url, preserve_line_endings};
+use crate::utils::lock_fragments::{
+    extend_span, finish, fragments_of, next_header_end, pair_fragments, FragmentRewrite, LockParse,
+};
+use crate::utils::python_lock::is_prior_hosted_url;
 
 pub fn lock_version(lock: &Table) -> Result<&str, String> {
     let version = lock
@@ -131,32 +134,10 @@ pub fn rewrite_pdm_lock(
     Ok(rewrite_pdm_lock_with_edits(text, name, version, source, filename, sha256)?.text)
 }
 
-/// A successful [`rewrite_pdm_lock_with_edits`].
-pub struct PdmLockRewrite<'a> {
-    /// The rewritten lock text.
-    pub text: String,
-    original: &'a str,
-    name: &'a str,
-    /// The original's fragments, already taken to build `text`.
-    before: Vec<String>,
-    /// The fragment edits, when `text` is byte-identical to the rendered
-    /// document they were derived against (the common case: toml_edit
-    /// round-trips the untouched bytes) — then they are also the edits
-    /// against `text`.
-    known_edits: Option<Vec<(String, String)>>,
-}
-
-impl PdmLockRewrite<'_> {
-    /// Exactly `pdm_lock_edits(original, &self.text, name)`, without
-    /// re-deriving what the rewrite already did.
-    pub fn edits(&self) -> Result<Vec<(String, String)>, String> {
-        if let Some(edits) = &self.known_edits {
-            return Ok(edits.clone());
-        }
-        let after = pdm_lock_fragments(&self.text, self.name)?;
-        pair_pdm_lock_fragments(self.original, &self.before, &self.text, after)
-    }
-}
+/// A successful [`rewrite_pdm_lock_with_edits`]; its
+/// [`edits`](FragmentRewrite::edits) are exactly
+/// `pdm_lock_edits(original, &text, name)`.
+pub type PdmLockRewrite<'a> = FragmentRewrite<'a>;
 
 /// [`rewrite_pdm_lock`], also handing back what the caller needs to record
 /// the rewrite's fragment edits ([`PdmLockRewrite::edits`]).
@@ -179,28 +160,9 @@ pub fn rewrite_pdm_lock_with_edits<'a>(
     )
 }
 
-/// The parse of the lock text last seen or produced, carried between calls
-/// so a caller working through one `pdm.lock` dep by dep parses each state
-/// once: [`Self::parsed`] reuses it for byte-identical text, and a rewrite
-/// hands on the parse of its own output (which it takes anyway, for the
-/// output's fragments) when the splice reproduced that output byte for byte.
-/// `DocumentMut`'s own parser is exactly `Document::parse(..).into_mut()`, so
-/// every result is the fresh parse's.
-#[derive(Default)]
-pub struct PdmLockParse {
-    doc: Option<toml_edit::Document<String>>,
-}
-
-impl PdmLockParse {
-    /// The parse of `text`, reusing the held one when it is of these bytes.
-    pub fn parsed(&mut self, text: &str) -> Result<&Table, toml_edit::TomlError> {
-        if self.doc.as_ref().is_none_or(|doc| doc.raw() != text) {
-            self.doc = None;
-            self.doc = Some(toml_edit::Document::parse(text.to_owned())?);
-        }
-        Ok(self.doc.as_ref().expect("parsed just above").as_table())
-    }
-}
+/// The parse of the `pdm.lock` text last seen or produced, carried between
+/// calls (see [`LockParse`]).
+pub type PdmLockParse = LockParse;
 
 /// [`rewrite_pdm_lock_with_edits`], reusing (and refreshing) `parse`.
 pub fn rewrite_pdm_lock_in<'a>(
@@ -222,16 +184,12 @@ pub fn rewrite_pdm_lock_in<'a>(
     if !crate::vendor::pypi_distribution::matches(filename, name, version) {
         return Err("PDM patch wheel does not match package".into());
     }
-    let doc = match parse.doc.take() {
-        Some(doc) if doc.raw() == text => doc,
-        _ => toml_edit::Document::parse(text.to_owned())
-            .map_err(|e| format!("invalid PDM lock: {e}"))?,
-    };
+    let doc = parse.take(text, "PDM")?;
     let edits = match plan_pdm_rewrite(&doc, name, version, kind, location) {
         Ok(edits) => edits,
         Err(detail) => {
             // Nothing was mutated: the parse still describes `text`.
-            parse.doc = Some(doc);
+            parse.restore(doc);
             return Err(detail);
         }
     };
@@ -265,28 +223,15 @@ pub fn rewrite_pdm_lock_in<'a>(
             table.insert(&files_key, value(files));
         }
     }
-    let rendered = preserve_line_endings(text, lock.to_string());
-    let before = before?;
-    let after_doc = toml_edit::Document::parse(rendered).map_err(|e| e.to_string())?;
-    let rendered = after_doc.raw();
-    let after = pdm_lock_fragments_in(&after_doc, rendered, name)?;
-    let edits = pair_pdm_lock_fragments(text, &before, rendered, after)?;
-    let mut result = text.to_string();
-    for (old, new) in &edits {
-        result = result.replacen(old, new, 1);
-    }
-    let known_edits = (result == rendered).then_some(edits);
-    if known_edits.is_some() {
-        // The output IS the rendered text just parsed: the next dep's input.
-        parse.doc = Some(after_doc);
-    }
-    Ok(PdmLockRewrite {
-        text: result,
-        original: text,
+    finish(
+        "PDM",
+        parse,
+        text,
         name,
+        lock.to_string(),
         before,
-        known_edits,
-    })
+        pdm_lock_fragments_in::<String>,
+    )
 }
 
 /// Every refusal of [`rewrite_pdm_lock_in`], read from the parsed lock before
@@ -395,27 +340,6 @@ fn plan_pdm_rewrite(
     Ok(edits)
 }
 
-/// End (exclusive, before its line break) of the first top-level TOML header
-/// line at or after `from`, skipping blank/comment lines; `text.len()` at EOF;
-/// `from` itself when the next non-blank line is not a header (a shape PDM never
-/// writes — the fragment is then not extended). Kept local, like this
-/// module's own `extend_span`.
-fn next_header_end(text: &str, from: usize) -> usize {
-    let mut pos = from;
-    for line in text[from..].split_inclusive('\n') {
-        let content = line.trim_end_matches(['\r', '\n']);
-        if content.trim().is_empty() || content.trim_start().starts_with('#') {
-            pos += line.len();
-            continue;
-        }
-        if content.starts_with('[') {
-            return pos + content.len();
-        }
-        return from;
-    }
-    text.len()
-}
-
 pub fn pdm_lock_edits(
     original: &str,
     rewritten: &str,
@@ -423,14 +347,13 @@ pub fn pdm_lock_edits(
 ) -> Result<Vec<(String, String)>, String> {
     let before = pdm_lock_fragments(original, name)?;
     let after = pdm_lock_fragments(rewritten, name)?;
-    pair_pdm_lock_fragments(original, &before, rewritten, after)
+    pair_fragments("PDM", original, &before, rewritten, after)
 }
 
 /// The fragments of `text` for `name` that [`pdm_lock_edits`] pairs up:
 /// every `[[package]]` unit and each legacy `[metadata.files]` entry.
 fn pdm_lock_fragments(text: &str, name: &str) -> Result<Vec<String>, String> {
-    let lock = toml_edit::Document::parse(text).map_err(|e| e.to_string())?;
-    pdm_lock_fragments_in(&lock, text, name)
+    fragments_of(text, name, pdm_lock_fragments_in::<String>)
 }
 
 /// [`pdm_lock_fragments`] of `text` from its (spanned) parse `lock`.
@@ -453,17 +376,6 @@ fn pdm_lock_fragments_in<S>(
                 canonicalize_pypi_name(candidate) == canonicalize_pypi_name(name)
             })
     }) {
-        fn extend_span(table: &Table, span: &mut std::ops::Range<usize>) {
-            for (_, item) in table.iter() {
-                if let Some(own) = item.span() {
-                    span.start = span.start.min(own.start);
-                    span.end = span.end.max(own.end);
-                }
-                if let Some(child) = item.as_table() {
-                    extend_span(child, span);
-                }
-            }
-        }
         let mut span = package.span().ok_or("missing PDM package span")?;
         extend_span(package, &mut span);
         span.end += text[span.end..]
@@ -507,31 +419,8 @@ fn pdm_lock_fragments_in<S>(
     Ok(result)
 }
 
-/// [`pdm_lock_edits`] over fragments already taken from both sides.
-fn pair_pdm_lock_fragments(
-    original: &str,
-    before: &[String],
-    rewritten: &str,
-    after: Vec<String>,
-) -> Result<Vec<(String, String)>, String> {
-    if before.len() != after.len() {
-        return Err("PDM package fragments changed shape".into());
-    }
-    let mut edits = Vec::new();
-    for (old, new) in before.iter().zip(after) {
-        if *old == new {
-            continue;
-        }
-        if original.matches(old.as_str()).count() != 1 || rewritten.matches(&new).count() != 1 {
-            return Err("ambiguous PDM rollback fragment".into());
-        }
-        edits.push((old.clone(), new));
-    }
-    Ok(edits)
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const WHEEL: &str = "urllib3-1.26.18-py2.py3-none-any.whl";
@@ -837,6 +726,91 @@ mod tests {
     /// line-ending lock: the renderer keeps no CRLF, the splice leaves the
     /// untouched CRLF lines alone), the rewrite's own edits are not kept and
     /// `edits()` re-derives them against the output.
+    /// `text` with every line break spelled `base`, except the patched
+    /// unit's `name = "urllib3"` line(s), spelled `odd`.
+    pub(crate) fn mixed_endings(text: &str, base: &str, odd: &str) -> String {
+        text.replace("\r\n", "\n")
+            .split_inclusive('\n')
+            .map(|line| {
+                let ending = if line.starts_with("name = \"urllib3\"") {
+                    odd
+                } else {
+                    base
+                };
+                line.replace('\n', ending)
+            })
+            .collect()
+    }
+
+    /// Breaks spelled `ending` (bare `\n` for LF) in `text`.
+    pub(crate) fn count_breaks(text: &str, ending: &str) -> usize {
+        let crlf = text.matches("\r\n").count();
+        if ending == "\r\n" {
+            crlf
+        } else {
+            text.matches('\n').count() - crlf
+        }
+    }
+
+    /// #695: a mixed-ending lock's rewritten unit takes the ending most of
+    /// its own lines had, every other line keeps its own, and the recorded
+    /// edits replay back byte for byte (hosted `url` and vendored `path`).
+    #[test]
+    fn mixed_line_ending_unit_keeps_its_majority_ending() {
+        let url = "https://patch.socket.dev/patch/pypi/urllib3/1.26.18/7e52b8b6-53f2-4dc8-860a-1ae7ebd8be0e/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl";
+        for version in [
+            "0.12.3",
+            "2.8.2",
+            "2.11.2",
+            "2.17.3",
+            "2.29.2",
+            "2.29.2-extras",
+        ] {
+            for (base, odd) in [("\r\n", "\n"), ("\n", "\r\n")] {
+                let original = mixed_endings(&fixture(version), base, odd);
+                assert!(count_breaks(&original, odd) > 0);
+                for source in [("path", PATH), ("url", url)] {
+                    let rewrite = rewrite_pdm_lock_with_edits(
+                        &original,
+                        "urllib3",
+                        "1.26.18",
+                        source,
+                        WHEEL,
+                        &"a".repeat(64),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        count_breaks(&rewrite.text, odd),
+                        0,
+                        "{version} {source:?} base {base:?}: {:?}",
+                        rewrite.text
+                    );
+                    let edits = rewrite.edits().unwrap();
+                    assert_eq!(
+                        edits,
+                        pdm_lock_edits(&original, &rewrite.text, "urllib3").unwrap()
+                    );
+                    let mut reverted = rewrite.text.clone();
+                    for (before, after) in edits.into_iter().rev() {
+                        reverted = reverted.replacen(&after, &before, 1);
+                    }
+                    assert_eq!(reverted, original, "{version} {source:?}");
+                }
+            }
+        }
+    }
+
+    /// #694: the shared pairing refuses fragments that changed shape.
+    #[test]
+    fn pairing_refuses_a_fragment_shape_change() {
+        let original = fixture("2.29.2");
+        let before = pdm_lock_fragments(&original, "urllib3").unwrap();
+        assert_eq!(
+            pair_fragments("PDM", &original, &before, &original, Vec::new()),
+            Err("PDM package fragments changed shape".to_string())
+        );
+    }
+
     #[test]
     fn rewrite_edits_are_rederived_when_the_splice_differs_from_the_document() {
         let mut rederived = 0;

@@ -1,5 +1,11 @@
 # Releasing socket-patch — publish runbook
 
+> **Being replaced.** The weekly release train
+> ([docs/release-train/DESIGN.md](release-train/DESIGN.md)) replaces this
+> process as its PRs land; this runbook is rewritten for it at the end. The
+> version-bump script and workflow are already gone — step 2 below does the
+> same chores with `scripts/release.py`.
+
 One release = one version-bump PR + one dispatch of the **Release** workflow.
 The CLI publishes to three channels, all from that single dispatch:
 
@@ -16,26 +22,24 @@ See the [migration instructions](migrating-to-v5.md#installation-channels).
 ## 1. Write the release notes
 
 Make sure `CHANGELOG.md`'s `[Unreleased]` section describes this release —
-`bump-version.sh` refuses to run if it is empty, and `release-lint.sh` blocks
-a release whose CHANGELOG section is missing or empty.
+`release.py changelog cut` refuses to run if it is empty, and `release-lint.sh`
+blocks a release whose CHANGELOG section is missing or empty.
 
 ## 2. Open the version-bump PR
 
-From a developer machine (preferred — CI runs on the PR normally):
+From a developer machine, on a branch off the default branch:
 
 ```sh
-scripts/bump-version.sh 5.0.0 --pr
+python3 scripts/release.py changelog cut --version 5.0.0 --date "$(date -u +%F)"
+scripts/version-sync.sh 5.0.0
+git commit -am "chore(release): 5.0.0" && gh pr create --fill
 ```
 
-This stamps `5.0.0` into every packaging site (`scripts/version-sync.sh`:
-`Cargo.toml`, the npm main + platform packages and lockfile), rolls
-`[Unreleased]` into a dated `## [5.0.0]` section, and opens a
-`release/v5.0.0` PR whose body carries the rolled-over notes.
-
-Alternatively, dispatch the **Version Bump** workflow from the Actions tab
-(input: the new version). Caveat: a PR opened by a workflow's `GITHUB_TOKEN`
-does not trigger `pull_request` CI — close/reopen the PR (or push any commit
-to its branch) to kick the checks.
+`changelog cut` rolls `[Unreleased]` into a dated `## [5.0.0]` section;
+`scripts/version-sync.sh` (the offline `release.py stamp`) stamps `5.0.0` into
+every packaging site: `Cargo.toml`, `Cargo.lock`'s workspace entries, the npm
+main + platform packages and the npm lockfile. This legacy workflow publishes
+stable versions only (`release-lint.sh --stable-only`).
 
 CI's `release-readiness` job runs the full release gate on the bump PR
 (`scripts/release-lint.sh`): version coherence across all packaging sites,
