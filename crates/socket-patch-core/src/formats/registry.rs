@@ -223,6 +223,37 @@ pub fn hosted_file_ecosystem(rel: &str) -> Option<&'static str> {
         .map(|f| f.ecosystem)
 }
 
+/// Files a vendored run writes that carry no [`VENDORED`] role (that role
+/// also scopes `repair`'s fingerprint): pnpm's workspace file, NuGet's
+/// config and lock (the vendored feed), the root `pom.xml` and
+/// `.mvn/maven.config` (vendored Maven), and `hatch.toml` (vendored Hatch).
+const VENDORED_WRITES_UNMARKED: &[&str] = &[
+    "pnpm-workspace.yaml",
+    "nuget.config",
+    "NuGet.config",
+    "NuGet.Config",
+    "packages.lock.json",
+    "pom.xml",
+    ".mvn/maven.config",
+    "hatch.toml",
+];
+
+/// The project-relative paths of `ecosystem` that a vendored run may
+/// rewrite: the files a vendored dry run checks for symbolic links, since
+/// the wet run's commit refuses to rename over one. Files a vendored run
+/// only reads (`.yarnrc.yml`, `vlt.json`, `node_modules/.modules.yaml`, …)
+/// are left out.
+pub fn wiring_paths(ecosystem: &str) -> Vec<&'static str> {
+    REGISTRY
+        .iter()
+        .filter(|f| {
+            f.ecosystem == ecosystem
+                && (f.has(VENDORED) || VENDORED_WRITES_UNMARKED.contains(&f.path))
+        })
+        .map(|f| f.path)
+        .collect()
+}
+
 /// The [`ROOT`] row a basename names.
 pub fn root_marker(base: &str) -> Option<&'static FormatFile> {
     REGISTRY.iter().find(|f| f.has(ROOT) && f.path == base)
@@ -241,6 +272,38 @@ mod tests {
         assert_eq!(before, paths.len(), "duplicate registry path");
         for f in REGISTRY.iter().filter(|f| f.has(ROOT)) {
             assert!(!f.path.contains('/'), "{}: a root marker is a basename", f.path);
+        }
+    }
+
+    #[test]
+    fn wiring_paths_name_every_rewritable_file_of_the_ecosystem() {
+        let npm = wiring_paths("npm");
+        for p in [
+            "package-lock.json",
+            "yarn.lock",
+            "package.json",
+            "pnpm-workspace.yaml",
+        ] {
+            assert!(npm.contains(&p), "{p}");
+        }
+        let nuget = wiring_paths("nuget");
+        assert!(nuget.contains(&"nuget.config") && nuget.contains(&"packages.lock.json"));
+        assert!(
+            !wiring_paths("maven").contains(&"build.gradle"),
+            "presence only"
+        );
+        assert!(!npm.contains(&"uv.lock"));
+        let maven = wiring_paths("maven");
+        assert!(maven.contains(&"pom.xml") && maven.contains(&".mvn/maven.config"));
+        assert!(wiring_paths("pypi").contains(&"hatch.toml"));
+        // Read-only for a vendored run: never captured, never refused.
+        for p in [
+            ".yarnrc.yml",
+            "vlt.json",
+            "node_modules/.modules.yaml",
+            "shrinkwrap.yaml",
+        ] {
+            assert!(!npm.contains(&p), "{p}");
         }
     }
 
