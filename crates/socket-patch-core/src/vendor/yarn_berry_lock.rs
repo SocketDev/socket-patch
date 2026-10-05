@@ -44,6 +44,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::constants::SOCKET_DIR;
+use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{normalize_file_path, PatchSources};
 use crate::utils::fs::{
@@ -333,9 +334,6 @@ pub async fn vendor_yarn_berry<'a>(
 
     // ── 9. The replacement lock entry (verbatim B3 shape) ─────────────────
     let lock_key = format!("\"{name}@file:./{rel_tgz}::locator={locator}\"");
-    // Sections beyond the five we own (dependencies:, peerDependencies:,
-    // bin:, …) describe the same package version and carry over verbatim.
-    let carried = carried_sections(&target.lines);
     if patches_manifest {
         warnings.push(VendorWarning::new(
             "vendor_dep_manifest_stale",
@@ -346,18 +344,27 @@ pub async fn vendor_yarn_berry<'a>(
             ),
         ));
     }
+    // Yarn builds a `file:` entry from the tarball's own package.json, whose
+    // `bin` keeps its published spelling where the registry entry's is
+    // normalized (#718). A tarball without a readable manifest keeps the
+    // registry's map (yarn cannot install it either way).
+    let tarball_bin = crate::patch::package::read_archive_bytes_to_map(&tgz_bytes)
+        .ok()
+        .and_then(|members| serde_json::from_slice::<Value>(members.get(PACKAGE_JSON)?).ok())
+        .filter(Value::is_object)
+        .map(|manifest| manifest_bin(&manifest));
     // The exact entry yarn 4 emits for a resolutions-driven `file:` tarball
-    // (the B3 fixture, verbatim), carried sections in yarn's position between
-    // `resolution` and `checksum`.
-    let mut new_lines = vec![
-        format!("{lock_key}:"),
-        format!("  version: {version}"),
-        format!("  resolution: \"{resolution}\""),
-    ];
-    new_lines.extend(carried);
-    new_lines.push(format!("  checksum: {checksum}"));
-    new_lines.push("  languageName: node".to_string());
-    new_lines.push("  linkType: hard".to_string());
+    // (the B3 fixture shape), fields in yarn's order (#697).
+    let lock_key_line = format!("{lock_key}:");
+    let new_lines = render_pinned_entry(
+        &target.lines[1..],
+        &Pin {
+            key_line: &lock_key_line,
+            resolution: &resolution,
+            checksum: Some(&checksum),
+            bin: tarball_bin.as_ref(),
+        },
+    );
 
     // ── 10. In-sync hot path: nothing to write, nothing to record ─────────
     let existing_res = pkg_obj.get("resolutions").and_then(|r| r.get(name));
@@ -1308,40 +1315,6 @@ fn scan_berry_target(
         target: found.into_iter().next(),
         alias_keys,
     })
-}
-
-/// Body sections of a lock entry that are NOT the five scalar fields we own
-/// — dependency sub-maps, bin:, conditions:, … — verbatim, in order.
-fn carried_sections(lines: &[String]) -> Vec<String> {
-    const OWNED: [&str; 5] = [
-        "version",
-        "resolution",
-        "checksum",
-        "languageName",
-        "linkType",
-    ];
-    let mut out = Vec::new();
-    let mut i = 1;
-    while i < lines.len() {
-        if let Some(rest) = body_field_line(&lines[i]) {
-            let field = rest.split(':').next().unwrap_or("");
-            if OWNED.contains(&field) {
-                i += 1;
-                continue;
-            }
-            out.push(lines[i].clone());
-            i += 1;
-            // Sub-map entries (deeper indent) belong to this section.
-            while i < lines.len() && body_field_line(&lines[i]).is_none() {
-                out.push(lines[i].clone());
-                i += 1;
-            }
-        } else {
-            out.push(lines[i].clone());
-            i += 1;
-        }
-    }
-    out
 }
 
 /// Whether `lock_text` spells its entries' `checksum:` values as BARE hex.
@@ -2346,6 +2319,65 @@ __metadata:
             )),
             "sub-map carried between resolution and checksum: {text}"
         );
+    }
+
+    /// #697: yarn writes `checksum:` after `bin:` and before `conditions:`
+    /// (special keys first, the rest alphabetically). A platform-conditional
+    /// entry's `conditions:` must stay after the checksum the vendored entry
+    /// writes, or every `yarn install --immutable` fails YN0028.
+    #[tokio::test]
+    async fn issue_697_conditional_entry_keeps_yarn_field_order() {
+        let lock = B3_BEFORE_LOCK.replace(
+            "  resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/3fb59c76e281a2f5c810ad71dbbb8eba8b10c6cf94733dc7f27b8c516a5376cacea53543e76f6ae477d866c8954b27f1e15ca349424c2542474eb5bb1d2b6955\n",
+            "  resolution: \"left-pad@npm:1.3.0\"\n  dependencies:\n    wow: \"npm:^1.0.0\"\n  dependenciesMeta:\n    wow:\n      optional: true\n  conditions: os=linux & cpu=x64\n",
+        );
+        let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+        let (result, _, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+
+        let text = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+        let (_, checksum) = fx.packed_berry_facts().await;
+        assert!(
+            text.contains(&format!(
+                "&locator=vendor-spike%40workspace%3A.\"\n  dependencies:\n    wow: \"npm:^1.0.0\"\n  \
+                 dependenciesMeta:\n    wow:\n      optional: true\n  checksum: {checksum}\n  \
+                 conditions: os=linux & cpu=x64\n  languageName: node\n  linkType: hard\n"
+            )),
+            "checksum between the dependency maps and conditions: {text}"
+        );
+    }
+
+    /// #718: yarn builds a `file:` entry from the tarball's own package.json,
+    /// not from the registry metadata the `npm:` entry came from. The
+    /// registry normalizes `bin` paths (`bin/cli.js`) while the published
+    /// manifest keeps its spelling (`./bin/cli.js`), so the vendored entry
+    /// must carry the tarball's `bin:` or yarn rewrites it on every install.
+    #[tokio::test]
+    async fn issue_718_bin_map_comes_from_the_tarball_manifest() {
+        let lock = B3_BEFORE_LOCK.replace(
+            "  resolution: \"left-pad@npm:1.3.0\"\n  checksum:",
+            "  resolution: \"left-pad@npm:1.3.0\"\n  bin:\n    left-pad: bin/cli.js\n  checksum:",
+        );
+        let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+        tokio::fs::write(
+            fx.installed().join("package.json"),
+            br#"{"name":"left-pad","version":"1.3.0","bin":{"left-pad":"./bin/cli.js","@scope/lp-extra":"bin\\extra.js"}}"#,
+        )
+        .await
+        .unwrap();
+        let (result, _, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+
+        let text = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+        let (_, checksum) = fx.packed_berry_facts().await;
+        assert!(
+            text.contains(&format!(
+                "&locator=vendor-spike%40workspace%3A.\"\n  bin:\n    left-pad: ./bin/cli.js\n    \
+                 lp-extra: bin/extra.js\n  checksum: {checksum}\n"
+            )),
+            "bin map read from the packed tarball's package.json: {text}"
+        );
+        assert!(!text.contains("left-pad: bin/cli.js"), "{text}");
     }
 
     #[tokio::test]
@@ -3620,28 +3652,6 @@ __metadata:
             Some("left-pad@npm:1.3.0")
         );
 
-        // Carried sections: dep sub-maps survive, owned scalars do not.
-        let lines: Vec<String> = [
-            "\"left-pad@npm:1.3.0\":",
-            "  version: 1.3.0",
-            "  resolution: \"left-pad@npm:1.3.0\"",
-            "  dependencies:",
-            "    wow: \"npm:^1.0.0\"",
-            "  checksum: 10c0/aa",
-            "  languageName: node",
-            "  linkType: hard",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        assert_eq!(
-            carried_sections(&lines),
-            vec![
-                "  dependencies:".to_string(),
-                "    wow: \"npm:^1.0.0\"".to_string()
-            ]
-        );
-
         // A `resolutions:` line must not satisfy a `resolution` field read:
         // the prefix match leaves a leading `s`, and the `:` gate skips it.
         let collide: Vec<String> = ["\"k\":", "  resolutions: nope", "  resolution: \"y\""]
@@ -3650,17 +3660,6 @@ __metadata:
             .collect();
         assert_eq!(berry_field(&collide, "resolution"), Some("y"));
         assert_eq!(berry_field(&collide, "resolutions"), Some("nope"));
-
-        // A body line that is neither a field line nor preceded by a section
-        // header is carried verbatim (the owned scalar still drops).
-        let orphan: Vec<String> = ["\"k\":", "    orphan-submap-line", "  version: 1.3.0"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(
-            carried_sections(&orphan),
-            vec!["    orphan-submap-line".to_string()]
-        );
     }
 
     /// The vendored backend splits berry keys with the ONE berry splitter

@@ -197,7 +197,13 @@ fn new_ledgers_compact_whole_file_snapshots_and_revert() {
             assert_eq!(masked_tree(&f.root), pristine, "{eco}: byte-exact restore");
         } else {
             let reverted = read_tree(&fixtures_dir().join(eco).join("reverted"));
-            for (rel, bytes) in reverted {
+            for (rel, mut bytes) in reverted {
+                // The base binary always ended a re-rendered pnpm
+                // package.json with a newline; this binary keeps the
+                // file's own trailer, and the fixture's has none (#662).
+                if *eco == "pnpm" && rel == "package.json" {
+                    assert_eq!(bytes.pop(), Some(b'\n'), "{eco}: {rel}");
+                }
                 assert_eq!(
                     std::fs::read(f.root.join(&rel)).unwrap(),
                     bytes,

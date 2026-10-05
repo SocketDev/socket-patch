@@ -30,7 +30,7 @@ use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
 use socket_patch_core::utils::composer_version::composer_purls_equivalent;
 use socket_patch_core::utils::concurrent::ordered_concurrent;
-use socket_patch_core::utils::group_commit::GroupCommit;
+use socket_patch_core::utils::group_commit::{CommittedFile, GroupCommit};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
 use socket_patch_core::vendor::{
@@ -280,8 +280,9 @@ pub(crate) async fn dispatch_revert_one_opts(
 
 /// Is this vendored entry still consumed by its project's lockfile
 /// dependency graph? `None` = cannot determine — callers must keep the
-/// entry (fail-safe): ecosystems other than npm and cargo have no in-use
-/// probe yet, and a missing/unreadable lockfile proves nothing.
+/// entry (fail-safe): ecosystems other than npm, cargo and pypi (whose
+/// probe covers the requirements flavor only) have no in-use probe yet,
+/// and a missing/unreadable lockfile proves nothing.
 pub(crate) async fn dispatch_in_use_one(
     entry: &VendorEntry,
     project_root: &Path,
@@ -292,6 +293,7 @@ pub(crate) async fn dispatch_in_use_one(
         // at this entry's copy = in use; a registry source (crates.io
         // re-resolve or a hosted takeover) or a missing entry = reclaimable.
         "cargo" => vendor::cargo::vendored_entry_in_use(entry, project_root).await,
+        "pypi" => vendor::pypi::vendored_entry_in_use(entry, project_root).await,
         _ => None,
     }
 }
@@ -1076,11 +1078,22 @@ fn hosted_pins_in_scope(common: &GlobalArgs, pins: Vec<HostedPin>) -> Vec<Hosted
 /// regular file directly in the project root, the hosted pins' files and
 /// the restore's files (nested locks included), the project's cargo and
 /// maven config files, the vendor ledger, and the set of vendored uuid
-/// directories. [`EjectSnapshot::restore`] puts all of it back and removes
-/// what the eject created.
+/// directories.
+///
+/// [`EjectSnapshot::restore`] puts back only what the eject WROTE: the
+/// files above that the upstream restore planned or wrote, and every file
+/// the vendored group commit wrote (from its own before-image when no
+/// snapshot holds it), each only when its bytes actually changed. Every
+/// other root file is left alone, so a redirect target (`vendor --json >
+/// report.json`), a log another process appends to, or an untouched
+/// README keeps its inode and its bytes (#687).
 struct EjectSnapshot {
     root: std::path::PathBuf,
-    files: Vec<(String, Option<Vec<u8>>)>,
+    /// Pre-eject bytes (`None`: absent) by project-relative path.
+    files: std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    /// The pins' files, the planned restore files and [`Self::EXTRA`]:
+    /// always in the rollback's scope.
+    planned: std::collections::BTreeSet<String>,
     root_files: std::collections::BTreeSet<String>,
     vendor_dirs: std::collections::BTreeSet<std::path::PathBuf>,
 }
@@ -1124,53 +1137,90 @@ impl EjectSnapshot {
 
     async fn take(root: &Path, touched: &[String]) -> std::io::Result<Self> {
         let root_files = Self::root_file_names(root).await?;
-        let mut rels: std::collections::BTreeSet<String> = root_files.clone();
-        rels.extend(touched.iter().cloned());
-        rels.extend(Self::EXTRA.iter().map(|s| s.to_string()));
-        let mut files = Vec::with_capacity(rels.len());
-        for rel in rels {
-            let bytes = match tokio::fs::read(root.join(&rel)).await {
-                Ok(bytes) => Some(bytes),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(e),
-            };
-            files.push((rel, bytes));
+        let mut planned: std::collections::BTreeSet<String> = touched.iter().cloned().collect();
+        planned.extend(Self::EXTRA.iter().map(|s| s.to_string()));
+        let mut files = std::collections::BTreeMap::new();
+        for rel in root_files.iter().chain(planned.iter()) {
+            if files.contains_key(rel) {
+                continue;
+            }
+            files.insert(rel.clone(), Self::read(&root.join(rel)).await?);
         }
         Ok(EjectSnapshot {
             root: root.to_path_buf(),
             files,
+            planned,
             root_files,
             vendor_dirs: Self::vendor_dir_set(root),
         })
     }
 
-    async fn restore(&self) -> Result<(), String> {
-        let mut errors: Vec<String> = Vec::new();
-        for (rel, bytes) in &self.files {
-            let path = self.root.join(rel);
-            let result = match bytes {
-                Some(bytes) => {
-                    socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(&path, bytes)
-                        .await
-                }
-                None => match tokio::fs::remove_file(&path).await {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    other => other,
-                },
-            };
-            if let Err(e) = result {
-                errors.push(format!("{rel}: {e}"));
-            }
+    /// A file's bytes, `None` when it does not exist.
+    async fn read(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+        match tokio::fs::read(path).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
         }
-        // Root files the eject created.
-        if let Ok(now) = Self::root_file_names(&self.root).await {
-            for name in now.difference(&self.root_files) {
-                if self.files.iter().any(|(rel, _)| rel == name) {
-                    continue;
-                }
-                if let Err(e) = tokio::fs::remove_file(self.root.join(name)).await {
-                    errors.push(format!("{name}: {e}"));
-                }
+    }
+
+    /// The files the rollback restores: the planned ones, the ones the
+    /// upstream restore `written`, and the ones the vendored commit wrote.
+    fn scope(
+        &self,
+        written: &[String],
+        committed: &[CommittedFile],
+    ) -> std::collections::BTreeSet<String> {
+        let mut scope = self.planned.clone();
+        scope.extend(written.iter().cloned());
+        scope.extend(committed.iter().map(|c| c.rel.clone()));
+        scope
+    }
+
+    /// What the rollback puts `rel` back to: `Some(Some(bytes))` to rewrite,
+    /// `Some(None)` to remove, `None` to leave it as it is. The pre-eject
+    /// snapshot wins; without one, the bytes the vendored commit replaced.
+    fn wanted<'s>(&'s self, rel: &str, committed: &'s [CommittedFile]) -> Option<Option<&'s [u8]>> {
+        if let Some(bytes) = self.files.get(rel) {
+            return Some(bytes.as_deref());
+        }
+        match committed.iter().find(|c| c.rel == rel) {
+            Some(c) => Some(c.before.as_deref()),
+            // A root file the restore created; anything deeper that no
+            // snapshot holds is left as it is.
+            None if !rel.contains('/') && !self.root_files.contains(rel) => Some(None),
+            None => None,
+        }
+    }
+
+    /// Put `rel` back to `want` (`None`: absent) unless it already is, so a
+    /// file the eject left unchanged is never replaced.
+    async fn put_back(&self, rel: &str, want: Option<&[u8]>) -> std::io::Result<()> {
+        let path = self.root.join(rel);
+        if Self::read(&path).await.ok().as_ref().map(|b| b.as_deref()) == Some(want) {
+            return Ok(());
+        }
+        match want {
+            Some(bytes) => {
+                socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(&path, bytes).await
+            }
+            None => match tokio::fs::remove_file(&path).await {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+        }
+    }
+
+    /// Undo the eject: `written` is the upstream restore's file list and
+    /// `committed` what the vendored group commit wrote (see the type doc).
+    async fn restore(&self, written: &[String], committed: &[CommittedFile]) -> Result<(), String> {
+        let mut errors: Vec<String> = Vec::new();
+        for rel in self.scope(written, committed) {
+            let Some(want) = self.wanted(&rel, committed) else {
+                continue;
+            };
+            if let Err(e) = self.put_back(&rel, want).await {
+                errors.push(format!("{rel}: {e}"));
             }
         }
         // Vendored uuid dirs the eject created.
@@ -1186,12 +1236,13 @@ impl EjectSnapshot {
         }
     }
 
-    /// The project files for the manual remedy.
-    fn files_hint(&self) -> String {
-        self.files
-            .iter()
-            .filter(|(_, bytes)| bytes.is_some())
-            .map(|(rel, _)| rel.as_str())
+    /// The project files for the manual remedy: every file in the
+    /// rollback's scope that it would put back to earlier bytes (a nested
+    /// file only the vendored commit's before-image holds included).
+    fn files_hint(&self, written: &[String], committed: &[CommittedFile]) -> String {
+        self.scope(written, committed)
+            .into_iter()
+            .filter(|rel| matches!(self.wanted(rel, committed), Some(Some(_))))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -1374,8 +1425,9 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     // One transaction under one apply lock: snapshot what the eject can
     // touch, restore every pin upstream (so the vendor engine resolves the
     // pristine registry package even in a fresh checkout with nothing
-    // installed), vendor, and on ANY failure put the snapshot back — a
-    // failed eject leaves the project hosted, exactly as it was.
+    // installed), vendor, and on ANY failure put back what the eject wrote
+    // — a failed eject leaves the project hosted, exactly as it was, and
+    // every file it never wrote untouched.
     let socket_dir = common.socket_dir();
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
     let guard = match crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout) {
@@ -1418,6 +1470,9 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         .map(|(_, why)| why.to_string())
         .next()
         .or_else(|| restore.flush_error.clone());
+    // Every file the vendored apply's group commit wrote, with its bytes
+    // from before: the rollback's scope beyond the restore's own files.
+    let mut committed: Vec<CommittedFile> = Vec::new();
     let mut exit: i32;
     if let Some(why) = restore_failure {
         env.mark_error(EnvelopeError::new("redirect_revert_failed", why.clone()));
@@ -1449,6 +1504,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
                     detached: true,
                     force: false,
                     prior: None,
+                    committed: Some(&mut committed),
                 },
                 &mut env,
             )
@@ -1456,7 +1512,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         exit = i32::from(applied);
     }
     if exit != 0 {
-        match snapshot.restore().await {
+        match snapshot.restore(&restore.reverted_files, &committed).await {
             Ok(()) => env.warnings.push(RunWarning {
                 code: "eject_rolled_back".to_string(),
                 detail: "the eject did not complete, so every file it touched was restored: the \
@@ -1467,7 +1523,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
                 let detail = format!(
                     "the eject did not complete and restoring the pre-eject files failed ({e}); \
                      restore them from version control (`git checkout -- {}`)",
-                    snapshot.files_hint()
+                    snapshot.files_hint(&restore.reverted_files, &committed)
                 );
                 if !common.json {
                     eprintln!("Error: {detail}");
@@ -1620,6 +1676,7 @@ async fn run_vendor(
                 detached: false,
                 force: args.force,
                 prior: None,
+                committed: None,
             },
             env,
         )
@@ -2055,7 +2112,7 @@ pub(crate) async fn vendor_records(
     ledger: std::io::Result<VendorState>,
 ) -> bool {
     vendor_records_reusing(
-        common, records, sources, detached, force, env, service, ledger, None,
+        common, records, sources, detached, force, env, service, ledger, None, None,
     )
     .await
 }
@@ -2077,6 +2134,7 @@ pub(crate) async fn vendor_records_reusing(
     service: Option<&VendorServiceConfig>,
     ledger: std::io::Result<VendorState>,
     prior: Option<&NpmCrawlSnapshot>,
+    committed: Option<&mut Vec<CommittedFile>>,
 ) -> bool {
     let mut has_errors = false;
     // Lockfile flavors the backends wired THIS run (from the returned ledger
@@ -2902,8 +2960,11 @@ pub(crate) async fn vendor_records_reusing(
     // where committing after every package would have left it.
     if let Some(group) = group {
         socket_patch_core::utils::failpoint::hit("vendor_group_commit");
-        match group.commit().await {
-            Ok(_) => {
+        match group.commit_changes().await {
+            Ok(changes) => {
+                if let Some(committed) = committed {
+                    committed.extend(changes);
+                }
                 for stale in stale_artifacts {
                     sweep_stale_artifact(common, env, &state, stale).await;
                 }
@@ -5550,7 +5611,8 @@ mod revert_dispatch_tests {
     }
 
     /// [`dispatch_in_use_one`]'s fail-safe arm: every ecosystem without an
-    /// in-use probe (everything but npm/cargo) reports `None` — "cannot
+    /// in-use probe (everything but npm/cargo), and a pypi entry of a flavor
+    /// without one (here the pre-flavor `None`), reports `None` — "cannot
     /// determine" — which all callers must treat as KEEP.
     #[tokio::test]
     async fn in_use_probe_is_none_for_unprobed_ecosystems() {
@@ -6022,6 +6084,128 @@ mod ui_format_tests {
             format_revert_install_hint("npm install"),
             "Run `npm install` to resync the installed tree with the restored lockfile (it \
              may still hold the vendored bytes if you reinstalled after vendoring)."
+        );
+    }
+}
+
+#[cfg(test)]
+mod eject_snapshot_tests {
+    use super::*;
+
+    fn write(root: &Path, rel: &str, bytes: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn read(root: &Path, rel: &str) -> Option<String> {
+        std::fs::read_to_string(root.join(rel)).ok()
+    }
+
+    /// #687: the rollback puts back exactly what the eject wrote — the
+    /// planned restore files, the files the restore reported, and the
+    /// vendored commit's files (from the commit's before-image when no
+    /// snapshot holds them; deleted when the commit created them) — and
+    /// leaves every other root file as it is now, even one whose bytes
+    /// changed during the run (another process's log).
+    #[tokio::test]
+    async fn restore_undoes_only_what_the_eject_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "package-lock.json", "hosted lock");
+        write(root, "package.json", "manifest v1");
+        write(root, "build.log", "line 1\n");
+        write(root, "packages/a/package.json", "member v1");
+        let snapshot = EjectSnapshot::take(root, &["package-lock.json".to_string()])
+            .await
+            .unwrap();
+
+        // The upstream restore: rewrites the planned lock and creates a root
+        // file it reports.
+        write(root, "package-lock.json", "upstream lock");
+        write(root, ".npmrc-created", "x");
+        let written = vec![
+            "package-lock.json".to_string(),
+            ".npmrc-created".to_string(),
+        ];
+        // The vendored commit: a root manifest edit, a nested member edit
+        // no snapshot holds, and a root file it creates.
+        write(root, "package.json", "manifest vendored");
+        write(root, "packages/a/package.json", "member vendored");
+        write(root, "vendored-new.yaml", "new");
+        let committed = vec![
+            CommittedFile {
+                rel: "package.json".into(),
+                before: Some(b"manifest v1".to_vec()),
+            },
+            CommittedFile {
+                rel: "packages/a/package.json".into(),
+                before: Some(b"member v1".to_vec()),
+            },
+            CommittedFile {
+                rel: "vendored-new.yaml".into(),
+                before: None,
+            },
+        ];
+        // Another process appends to its log meanwhile.
+        write(root, "build.log", "line 1\nline 2\n");
+
+        snapshot.restore(&written, &committed).await.unwrap();
+
+        assert_eq!(
+            read(root, "package-lock.json").as_deref(),
+            Some("hosted lock")
+        );
+        assert_eq!(read(root, "package.json").as_deref(), Some("manifest v1"));
+        assert_eq!(
+            read(root, "packages/a/package.json").as_deref(),
+            Some("member v1")
+        );
+        assert_eq!(read(root, "vendored-new.yaml"), None);
+        assert_eq!(read(root, ".npmrc-created"), None);
+        assert_eq!(
+            read(root, "build.log").as_deref(),
+            Some("line 1\nline 2\n"),
+            "a root file the eject never wrote keeps its new bytes"
+        );
+        let hint = snapshot.files_hint(&written, &committed);
+        let hinted: Vec<&str> = hint.split(' ').collect();
+        assert_eq!(
+            hinted,
+            vec![
+                "package-lock.json",
+                "package.json",
+                "packages/a/package.json"
+            ],
+            "the remedy names every file the rollback restores, nested commit \
+             files included, and nothing it leaves alone or removes"
+        );
+    }
+
+    /// #687: a file in scope whose bytes are already the snapshot's is not
+    /// rewritten, so it keeps its inode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_skips_files_already_at_their_snapshot_bytes() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "package-lock.json", "hosted lock");
+        let snapshot = EjectSnapshot::take(root, &["package-lock.json".to_string()])
+            .await
+            .unwrap();
+        let ino = std::fs::metadata(root.join("package-lock.json"))
+            .unwrap()
+            .ino();
+        snapshot
+            .restore(&["package-lock.json".to_string()], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(root.join("package-lock.json"))
+                .unwrap()
+                .ino(),
+            ino
         );
     }
 }
