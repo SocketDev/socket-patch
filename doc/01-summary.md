@@ -59,7 +59,7 @@
 4. **The code is large for what it does, and much of the size is duplication and scaffolding.**
    - ~118K lines of production code plus 35K comment lines.
    - ~450K lines of tests.
-   - Nine functions over 500 lines; `run_scan` alone is 1,499.
+   - Nine functions over 500 lines; `run_scan` alone is 1,540 (on `045d7ec`).
    - A 17.5K-line `redirect/mod.rs`.
    - Two hosted orchestrators kept equal by parity tests.
    - Four discovery systems.
@@ -95,7 +95,7 @@
 | Integration tests (`crates/*/tests`) | ~255K lines in **212 separate test executables** (201 top-level files + 11 directory binaries; recounted at `045d7ec`, 2026-10-03) |
 | Test : production ratio | ~2.8 : 1 overall; ~7 : 1 for the CLI crate |
 | Largest file | `patch/redirect/mod.rs`: 19,571 lines at `045d7ec` (2026-10-03; 17,517 at the snapshot, 6.2K production then) |
-| Functions > 200 / > 500 lines | 61 / 9 (`run_scan` 1,499, `rollback::run` 984, `vendor_records_reusing` 962, `run_redirect_selected` 836, `remove::run` 797, `get::run` 635, memory `engine` 604, …) |
+| Functions > 200 / > 500 lines | 61 / 9 (`run_scan` 1,540 on `045d7ec`, `rollback::run` 984, `vendor_records_reusing` 962, `run_redirect_selected` 836, `remove::run` 797, `get::run` 635, memory `engine` 604, …) |
 | CLI surface | 9 visible + 2 hidden subcommands; 57 visible long flags; 27 globals on every command; 43 env bindings (84 `SOCKET_*` names in source); 156 documented `errorCode`s; ~570 code-like strings in source |
 | `--help` | 150–219 lines per subcommand; `list --help` lists 27 options, most of which do nothing for `list` |
 | CI per push | ~516 jobs; the CI workflow alone is 237 jobs and 348 runner-minutes; Windows `test` is the 28-minute critical path |

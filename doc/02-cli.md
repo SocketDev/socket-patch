@@ -2,7 +2,7 @@
 
 ## Part 2: CLI command layer and user experience
 
-_Last checked against main @ 045d7ec on 2026-10-04 by audit-core. Owner: audit-core._
+_Last checked against main @ 045d7ec on 2026-10-05 by audit-core. Owner: audit-core._
 
 > Scope: `crates/socket-patch-cli/src/` — `args.rs`, `lib.rs`/`main.rs`, `ecosystem_dispatch.rs`, `json_envelope.rs`, `ui/*`, `update_notifier.rs`, and every `commands/*` module.
 
@@ -22,7 +22,7 @@ _Last checked against main @ 045d7ec on 2026-10-04 by audit-core. Owner: audit-c
 
 | Function | Location | Lines |
 |---|---|---:|
-| `run_scan` | `scan/mod.rs:1436–2934` | **1,499** |
+| `run_scan` | `scan/mod.rs:1429–2968` | **1,540** |
 | `rollback::run` | `rollback.rs:1069–2052` | 984 |
 | `vendor_records_reusing` | `vendor.rs:1971–2932` | 962 |
 | `run_redirect_selected` | `scan/hosted.rs:639–1474` | 836 |
@@ -36,11 +36,11 @@ _Last checked against main @ 045d7ec on 2026-10-04 by audit-core. Owner: audit-c
 - the PATH fan-out, path-scope parsing, the rollout cap and the offline check;
 - the crawl, the lockfile supplement, ledger loads and filters;
 - concurrent batch API calls with proxy fallback, then telemetry;
-- **a JSON arm and a human arm that each dispatch all three modes again**: `run_redirect` @2153 vs `boxed_run_redirect_selected` @2641, `boxed_vendor_json_path` @2341 vs `boxed_vendor_interactive_path` @2878, `download_and_apply_patches_with` @2305 vs @2897.
+- **a JSON arm and a human arm that each dispatch all three modes again**: `run_redirect` @2187 vs `boxed_run_redirect_selected` @2675, `boxed_vendor_json_path` @2375 vs `boxed_vendor_interactive_path` @2912, `download_and_apply_patches_with` @2339 vs @2931 (re-checked on `045d7ec`; the split is tracked phase by phase). {{C11}}
 
 Mode is three booleans (`apply`/`vendor`/`hosted`). They are referenced 91 times inside the function, across about 27 conditional branches.
 
-**The root cause is that output mode leaks into the engine.** For example, `discover_selected` (`scan/mod.rs:491`) takes `show_progress`, `warn`, `detail_error_line` and `json_warnings: Option<&mut Value>`.
+**The root cause is that output mode leaks into the engine.** For example, `discover_selected` (`scan/mod.rs:484`) takes `show_progress`, `warn`, `detail_error_line` and `json_warnings: Option<&mut Value>`.
 
 ### 2.3 No service layer: commands call each other
 
@@ -79,7 +79,7 @@ A sliding-window copy-paste detector finds little *literal* duplication. **The d
 
 | Duplicate | Evidence |
 |---|---|
-| JSON vs human agent pipeline in `run_scan` | `discover_selected` @2192/2212 vs @2455; `classified_rows` @2231/2476; `partition_agent_selection` @2248/2668; `plan_kept_rows` @2249/2696 |
+| JSON vs human agent pipeline in `run_scan` | `discover_selected` @2226/2246 vs @2489; `classified_rows` @2265/2510; `partition_agent_selection` @2282/2702; `plan_kept_rows` @2283/2730 (on `045d7ec`) |
 | `remove` vs `rollback` | `remove::run` (797) + `remove_hosted_only` (94) + `remove_ledger_only` (127) vs `rollback::run` (984). Both run agent leg → vendored leg → hosted leg → manifest cleanup → GC over the same primitives. The contract itself says "remove parity" repeatedly. |
 | `get` agent mode, twice | `save_and_apply_patch` (UUID path, `get.rs:3365`) vs `download_and_apply_patches_with` (search path, `:2343`) |
 | Vendored revert ×4 | `VendoredBackend::revert`, `vendor.rs:3400`, `vendor.rs:3436`, `hosted.rs:1700/1733` |

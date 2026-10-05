@@ -1,5 +1,5 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-05T03:55Z · main @ 045d7ec_
+_Last updated 2026-10-05T09:53Z · main @ 045d7ec_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -13,7 +13,7 @@ _Last updated 2026-10-05T03:55Z · main @ 045d7ec_
 | C08 | 2 | Repo hygiene: a stray `.github/actions/actions/cache/<sha>/.vscode/launch.json`, a README that documents v5 but whose installer installs v4, and 39 references to a "DESIGN §" document that doesn't exist. (The dead CI path filters go to the CI janitor.) | §1 #8; 8.5 J | #649 | filed #649; README part already fixed |
 | C09 | 2 | There is no shared `with_proxy_fallback` helper: scan, get (both paths) and vex each handle the proxy fallback themselves, and get's handling has a gap. | 2.10 R2 | #647 | filed #647 |
 | C10 | 2 | Tracking: `RunCtx { config, client, telemetry, lock }`, built once in `main`. It would delete `apply_env_toggles` (flags written back into process env, which has a documented token-leak history) and unblock removing 553 `#[serial]`. | 2.5; R3 | #793, #794 | filed #793, #794; tracking #793, child 1 #794; `#[serial]` now 993 in tests + 185 in src |
-| C11 | 2 | Tracking: split `run_scan` (1,499 lines; mode booleans referenced 91 times) into discover → select → `ModeBackend::consume` → render. | 2.2; R5 | | to verify |
+| C11 | 2 | Tracking: split `run_scan` (1,540 lines on `045d7ec`; JSON and human arms each dispatch all three modes) into discover → select → `ModeBackend::consume` → render. | 2.2; R5 | #843, #844 | filed #843, #844; tracking #843, child 1 #844 |
 | C12 | 2 | Tracking: move engine code out of the CLI and into core behind one orchestrator over `ProjectView`. That covers `vendor_records_reusing` (962 lines), `run_redirect_selected` (836) and `ecosystem_dispatch.rs` (816). Coordinate with E32. | 2.1; R11 | | to verify |
 | C13 | 2 | Error codes are untyped. Target: a typed registry (`enum Reason × Ecosystem`) that generates the contract's code tables, plus a freshness test. Today ~65 codes are undocumented and 1 is phantom. | 2.8; 3.7 #8; 8.5 F | | to verify |
 | C14 | 2 | Decide: one JSON envelope. `scan`, `get` and `rollback` still emit a bare-string `error`, while the other commands emit `{code, message}`. | 2.8; R4 | #704 | decision #704 |
@@ -50,6 +50,7 @@ _Last updated 2026-10-05T03:55Z · main @ 045d7ec_
 | C45 | 3 | `--download-mode` is an unvalidated `String`, parsed late in `fetch_stage`/`repair`: a typo fails `apply`/`repair` with exit 1 and `apply_failed`/`repair_failed` (and `scan`/`get` only after saving the patch), while `apply --check`, `rollback`, `list` and `vendor` accept it; `--vendor-source` uses a clap parser (exit 2). | 2.7; R8 (narrowed) | #791 | filed #791 |
 | C46 | 3 | The group-commit journal is replayed only inside `apply_lock::acquire`: after a crash past the journal, lock-free `vendor --check` fails every patch with `vendor_ledger_missing` (remedy: restore `state.json` by hand) and pnpm `vex` omits the packages, while one locked command rolls forward to the clean result. | new finding | #809 | filed #809 |
 | C47 | 2 | 10 CLI test files spawn the binary with no `SOCKET_*` scrub; an ambient `SOCKET_DRY_RUN=true`/`SOCKET_OFFLINE=true` turns 18 of 19 `repair_vendor_e2e` tests red while scrubbed tests in the same target pass. | new finding | #823 | filed #823 |
+| C48 | 2 | Child processes have no shared deadline: the crawler probe runners (`gem env`, `python --version`, `npm root -g`, …) call `output()` unbounded, while 4 sites hand-roll `timeout` + `kill_on_drop` (10/10/10/30–60 s); a hung `gem` shim hangs a local `scan` forever. | new finding | #845 | filed #845 |
 
 **Handed off** (to the CI janitor): report-only coverage and LTO `docker-base` off PRs; e2e from 148 to ~50 legs; a reusable compat workflow; no per-leg compiles; dead CI path filters (review 8.2, 8.5 B/C/E).
 
