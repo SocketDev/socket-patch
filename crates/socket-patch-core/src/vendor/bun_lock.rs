@@ -2189,7 +2189,10 @@ mod tests {
             "  \"patchedDependencies\": {\n    \"left-pad@1.3.0\": \"patches/left-pad@1.3.0.patch\",\n  },\n  \"packages\": {",
             1,
         );
-        assert_ne!(mirrored_lock, BN3_BEFORE_LOCK, "fixture has a packages section");
+        assert_ne!(
+            mirrored_lock, BN3_BEFORE_LOCK,
+            "fixture has a packages section"
+        );
 
         for (manifest_key, lock) in [
             (true, BN3_BEFORE_LOCK),

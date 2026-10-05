@@ -601,7 +601,10 @@ mod tests {
             patched_dependency_key(&keys, "left-pad", "1.3.0"),
             Some("left-pad@1.3.0")
         );
-        assert_eq!(patched_dependency_key(&keys, "@s/p", "2.0.0"), Some("@s/p@2.0.0"));
+        assert_eq!(
+            patched_dependency_key(&keys, "@s/p", "2.0.0"),
+            Some("@s/p@2.0.0")
+        );
         assert_eq!(patched_dependency_key(&keys, "left-pad", "1.3.1"), None);
         assert_eq!(patched_dependency_key(&keys, "x", "1.0.0"), None);
         let bare = vec!["left-pad".to_string()];
