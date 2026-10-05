@@ -35,8 +35,9 @@ Each scenario is one project and one `scan` invocation:
 
 Package managers (`<pm>`), each in its native lockfile format and install
 layout: `npm`, `pnpm` (isolated `.pnpm` store with symlinks), `yarn-classic`,
-`yarn-berry` (node-modules linker), `bun` (text `bun.lock`), `vlt`
-(`.vlt` store), `pip` (hash-pinned `requirements.txt`), `uv`, `pylock`
+`yarn-berry` (node-modules linker), `bun` (text `bun.lock`, hoisted),
+`bun-isolated` (the same lockfile, Bun 1.3's isolated `.bun` store),
+`vlt` (`.vlt` store), `pip` (hash-pinned `requirements.txt`), `uv`, `pylock`
 (PEP 751), `poetry`, `pipenv`, `pdm`, `bundler`, `composer`, `cargo`,
 `golang`, `nuget` and `maven`. Deno has no hosted rewrite and is not
 benchmarked separately.

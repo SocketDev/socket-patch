@@ -305,6 +305,15 @@ pub enum Lane {
     /// `six` only as `python-dateutil`'s dependency: wired through `[tool.uv]
     /// override-dependencies` + `[tool.uv.sources]` (the 0.5.6 boundary).
     Transitive,
+    /// `six==1.16.0` in `dependencies` and `six>=1.15` in an extra: two
+    /// `requires-dist` entries told apart only by their `extra` marker, so
+    /// the hosted unwind must follow uv's lowering to put each specifier
+    /// back (#606). `idna==3.7` is the registry sibling the unwind needs.
+    Extras,
+    /// `six` only in a PEP 735 group that another group pulls in with
+    /// `{ include-group = … }`: uv expands it into both groups'
+    /// `requires-dev` entries (#473).
+    IncludeGroup,
     /// PEP 723 `tool.py` + `uv lock --script` → `tool.py.lock`.
     Script,
     /// `uv export --format pylock.toml` (a pylock-only consumer checkout).
@@ -316,10 +325,12 @@ pub enum Lane {
 }
 
 impl Lane {
-    pub const ALL: [Lane; 7] = [
+    pub const ALL: [Lane; 9] = [
         Lane::Project,
         Lane::Constraints,
         Lane::Transitive,
+        Lane::Extras,
+        Lane::IncludeGroup,
         Lane::Script,
         Lane::ExportPylock,
         Lane::CompilePylock,
@@ -331,6 +342,8 @@ impl Lane {
             Lane::Project => "project",
             Lane::Constraints => "constraints",
             Lane::Transitive => "transitive",
+            Lane::Extras => "extras",
+            Lane::IncludeGroup => "include-group",
             Lane::Script => "script",
             Lane::ExportPylock => "export-pylock",
             Lane::CompilePylock => "compile-pylock",
@@ -341,7 +354,11 @@ impl Lane {
     /// The files the writers wire (and the fresh checkout commits).
     fn wiring(self) -> &'static [&'static str] {
         match self {
-            Lane::Project | Lane::Constraints | Lane::Transitive => &["pyproject.toml", "uv.lock"],
+            Lane::Project
+            | Lane::Constraints
+            | Lane::Transitive
+            | Lane::Extras
+            | Lane::IncludeGroup => &["pyproject.toml", "uv.lock"],
             Lane::Script => &[SCRIPT, "tool.py.lock"],
             _ => &["pylock.toml"],
         }
@@ -350,7 +367,11 @@ impl Lane {
     /// The lock file among [`Self::wiring`].
     fn lock(self) -> &'static str {
         match self {
-            Lane::Project | Lane::Constraints | Lane::Transitive => "uv.lock",
+            Lane::Project
+            | Lane::Constraints
+            | Lane::Transitive
+            | Lane::Extras
+            | Lane::IncludeGroup => "uv.lock",
             Lane::Script => "tool.py.lock",
             _ => "pylock.toml",
         }
@@ -358,7 +379,14 @@ impl Lane {
 
     /// A `pyproject.toml` + `uv.lock` project lane.
     fn has_project(self) -> bool {
-        matches!(self, Lane::Project | Lane::Constraints | Lane::Transitive)
+        matches!(
+            self,
+            Lane::Project
+                | Lane::Constraints
+                | Lane::Transitive
+                | Lane::Extras
+                | Lane::IncludeGroup
+        )
     }
 
     /// `Err(why)` when this uv release has no such flow (reported `n/a`).
@@ -385,6 +413,15 @@ impl Lane {
                 Err("no `[tool.uv] override-dependencies` + sources before uv 0.2.35".into())
             }
             Lane::Transitive => Ok(()),
+            // The hosted unwind's declaration matching; dependency groups
+            // (and `include-group`) arrived in uv 0.4.27.
+            Lane::Extras | Lane::IncludeGroup if mode == Mode::Vendored => {
+                Err("a hosted-unwind lane".into())
+            }
+            Lane::Extras | Lane::IncludeGroup if !uv.at_least((0, 4, 27)) => {
+                Err("no PEP 735 dependency groups in uv.lock before uv 0.4.27".into())
+            }
+            Lane::Extras | Lane::IncludeGroup => Ok(()),
             Lane::Script if !uv.help_has(&["lock"], "--script") => {
                 Err("no `uv lock --script` before uv 0.5.17".into())
             }
@@ -721,11 +758,31 @@ fn build(uv: &Uv, lane: Lane, mode: Mode, tmp: &Path) -> Result<Built, String> {
         Ok(())
     };
     match lane {
-        Lane::Project | Lane::Constraints | Lane::Transitive => {
+        Lane::Project
+        | Lane::Constraints
+        | Lane::Transitive
+        | Lane::Extras
+        | Lane::IncludeGroup => {
             project_deps(match lane {
                 Lane::Transitive => "\"python-dateutil==2.9.0.post0\"",
+                Lane::Extras => "\"six==1.16.0\", \"idna==3.7\"",
+                Lane::IncludeGroup => "\"idna==3.7\"",
                 _ => "\"six==1.16.0\"",
             });
+            let tail = match lane {
+                Lane::Extras => "\n[project.optional-dependencies]\nextra = [\"six>=1.15\"]\n",
+                Lane::IncludeGroup => {
+                    "\n[dependency-groups]\ntest = [\"six==1.16.0\"]\n\
+                     dev = [{ include-group = \"test\" }]\n"
+                }
+                _ => "",
+            };
+            if !tail.is_empty() {
+                let path = proj.join("pyproject.toml");
+                let mut text = std::fs::read_to_string(&path).unwrap();
+                text.push_str(tail);
+                std::fs::write(&path, text).unwrap();
+            }
             if lane == Lane::Constraints {
                 let path = proj.join("pyproject.toml");
                 let mut text = std::fs::read_to_string(&path).unwrap();
@@ -937,7 +994,11 @@ fn stage_manifest(proj: &Path, purl: &str, uuid: &str, orig: &[u8], patched: &[u
 fn install(uv: &Uv, lane: Lane, dir: &Path, cache: &Path, offline: bool, frozen: bool) -> String {
     let mut args: Vec<&str> = Vec::new();
     match lane {
-        Lane::Project | Lane::Constraints | Lane::Transitive => {
+        Lane::Project
+        | Lane::Constraints
+        | Lane::Transitive
+        | Lane::Extras
+        | Lane::IncludeGroup => {
             args.push("sync");
             if frozen && uv.help_has(&["sync"], "--frozen") {
                 args.push("--frozen");
@@ -1644,9 +1705,17 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
         // none, #407) and the artifact shape (`pip lock`'s
         // `[[packages.wheels]]` tables, #804), so they restore to the bytes
         // uv or pip wrote (#408).
+        // The extras / include-group lanes lock an `idna` sibling too, so
+        // their unwind runs and must re-derive every `requires-dist` /
+        // `requires-dev` specifier from the declaration uv lowered it from
+        // (#606, #473).
         let byte_exact = matches!(
             lane,
-            Lane::ExportPylock | Lane::CompilePylock | Lane::PipLock
+            Lane::ExportPylock
+                | Lane::CompilePylock
+                | Lane::PipLock
+                | Lane::Extras
+                | Lane::IncludeGroup
         );
         let env: Value = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|e| panic!("{}: ({e})\n{}", report.what("revert"), dump(&out)));
