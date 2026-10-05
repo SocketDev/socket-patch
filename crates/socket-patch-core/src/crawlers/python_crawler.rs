@@ -352,7 +352,11 @@ async fn find_local_venv_site_packages_with(
 
     // 0. PDM and uv record where they install a project, and that record
     // beats both an activated `VIRTUAL_ENV` and a `./.venv` they don't use.
-    if let Some(found) = package_manager_recorded_site_packages(cwd, var).await {
+    if let Some(mut found) = package_manager_recorded_site_packages(cwd, var).await {
+        // Hatch never installs into the env PDM or uv records (a Hatch
+        // project's pyproject alone reads as a uv project): its own envs
+        // stay the project's (#335).
+        add_hatch_site_packages(cwd, var, &mut found).await;
         return found;
     }
 
@@ -3039,6 +3043,25 @@ mod tests {
         ));
         let found = find_local_venv_site_packages_with(&project, &env_of(&activated)).await;
         assert_eq!(found.first(), Some(&activated_site), "{found:?}");
+        assert!(found.iter().any(|s| sites.contains(s)), "{found:?}");
+
+        // Nor does a `UV_PROJECT_ENVIRONMENT` venv (a Hatch project's
+        // pyproject alone makes it a uv project).
+        let uv_env = tmp.path().join("uv-env");
+        let uv_site = fake_venv(&uv_env, "venv");
+        let uv_vars = env_of(&[
+            (
+                "UV_PROJECT_ENVIRONMENT",
+                uv_env.join("venv").to_string_lossy().into_owned(),
+            ),
+            ("HATCH_DATA_DIR", data.to_string_lossy().into_owned()),
+            (
+                "HOME",
+                tmp.path().join("home").to_string_lossy().into_owned(),
+            ),
+        ]);
+        let found = find_local_venv_site_packages_with(&project, &uv_vars).await;
+        assert_eq!(found.first(), Some(&uv_site), "{found:?}");
         assert!(found.iter().any(|s| sites.contains(s)), "{found:?}");
 
         // A `./.venv` beside them is kept too.
