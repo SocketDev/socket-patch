@@ -2987,8 +2987,9 @@ async fn maven_rollback_targets(
 /// jar (`jvm_jar::rollback_jar_swap`); a leaf record restores its files
 /// from before-blobs, `~/.m2` checksum files put back to the restored bytes.
 /// A restored Gradle hash-dir file must hash to its directory's name (the
-/// sha1 Gradle verified when it downloaded it); one that does not fails
-/// with `gradle_rollback_hash_mismatch` and is left as it is.
+/// sha1 Gradle verified when it downloaded it): a before-blob that does not
+/// is refused with `gradle_rollback_hash_mismatch` before anything is
+/// written, so the patched file is left as it is.
 async fn rollback_maven_target(
     target: &CopyTarget,
     patch: &PatchRecord,
@@ -3023,6 +3024,41 @@ async fn rollback_maven_target(
     } else {
         Some(maven_sidecars::snapshot(&target.dir, &keys).await)
     };
+    let hash = target
+        .dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if gradle && !common.dry_run {
+        // Check the before-blobs before anything is written, so a refusal
+        // really leaves the patched file in place (and a re-run refuses again).
+        // A missing blob is left to `rollback_package_patch` to report.
+        for (file, info) in files {
+            let blob = blobs_path.join(&info.before_hash);
+            let Ok(bytes) = socket_patch_core::utils::fs::read_regular_to_bytes(&blob).await else {
+                continue;
+            };
+            if !pristine(hash, &bytes) {
+                let path = target.dir.join(file.trim_start_matches("package/"));
+                return RollbackResult {
+                    package_key: target.purl.clone(),
+                    package_path: target.dir.display().to_string(),
+                    success: false,
+                    files_verified: Vec::new(),
+                    files_rolled_back: Vec::new(),
+                    error: Some(format!(
+                        "gradle_rollback_hash_mismatch: the before-blob for {} does not hash \
+                         to its Gradle cache directory (it is not the bytes Gradle \
+                         downloaded); left as it is — delete {} and let Gradle download it \
+                         again.",
+                        path.display(),
+                        target.dir.display()
+                    )),
+                    sidecar: None,
+                };
+            }
+        }
+    }
     let mut result =
         rollback_package_patch(&target.purl, &target.dir, files, blobs_path, common.dry_run).await;
     if !result.success || common.dry_run {
@@ -3050,11 +3086,6 @@ async fn rollback_maven_target(
         });
     }
     if gradle {
-        let hash = target
-            .dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
         for file in &result.files_rolled_back {
             let path = target.dir.join(file.trim_start_matches("package/"));
             let Ok(bytes) = socket_patch_core::utils::fs::read_regular_to_bytes(&path).await else {
@@ -3065,7 +3096,7 @@ async fn rollback_maven_target(
                 result.error = Some(format!(
                     "gradle_rollback_hash_mismatch: {} does not hash to its Gradle cache \
                      directory after the restore (the before-blob is not the bytes Gradle \
-                     downloaded); left as it is — delete {} and let Gradle download it again.",
+                     downloaded) — delete {} and let Gradle download it again.",
                     path.display(),
                     target.dir.display()
                 ));

@@ -975,7 +975,8 @@ fn unconsumed_m2_jar_without_a_backup_here_does_not_fail_rollback() {
 }
 
 /// A before-blob that does not hash to the Gradle hash dir it is restored
-/// into fails the rollback (`gradle_rollback_hash_mismatch`).
+/// into fails the rollback (`gradle_rollback_hash_mismatch`) before anything
+/// is written: the patched file stays, and a second run refuses the same way.
 #[test]
 fn rollback_before_blob_not_matching_the_hash_dir_fails() {
     let f = fx(CENTRAL);
@@ -1001,6 +1002,18 @@ fn rollback_before_blob_not_matching_the_hash_dir_fails() {
         "{}",
         out.json
     );
+    assert_eq!(std::fs::read(dir.join(JAR)).unwrap(), patched);
+    let again = f.run(&["rollback", "--offline"]);
+    again.failed();
+    assert!(
+        again
+            .json
+            .to_string()
+            .contains("gradle_rollback_hash_mismatch"),
+        "{}",
+        again.json
+    );
+    assert_eq!(std::fs::read(dir.join(JAR)).unwrap(), patched);
 }
 
 // ── member-keyed records (#264) ─────────────────────────────────────────
