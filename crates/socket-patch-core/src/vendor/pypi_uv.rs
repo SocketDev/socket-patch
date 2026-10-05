@@ -30,6 +30,7 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 // revert) forever in an `open(2)` that waits for a writer — the
 // flavor-routing probes ahead of the load are metadata-only, so these are
 // the first opens.
+use crate::patch::redirect::upstream::{respell_lock_specifier, LockRequirementArray};
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::python_lock::preserve_line_endings;
 
@@ -815,7 +816,30 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
 
     for rec in entry.wiring.iter().rev() {
         let new_text = rec.new.as_ref().and_then(serde_json::Value::as_str);
-        let original_text = rec.original.as_ref().and_then(serde_json::Value::as_str);
+        let recorded = rec.original.as_ref().and_then(serde_json::Value::as_str);
+        // A root requirement entry lost its specifier to the path source,
+        // so a declaration the user changed since vendoring left the lock
+        // byte-identical: restore the specifier pyproject.toml declares
+        // NOW, never the recorded one blindly (#840).
+        let respelled = match (recorded, rec.key.as_deref()) {
+            (Some(orig), Some(key)) => {
+                match respell_original(orig, &rec.kind, key, &pyproject_text) {
+                    Ok(text) => Some(text),
+                    Err(reason) => {
+                        warnings.push(VendorWarning::new(
+                            "vendor_lock_entry_drifted",
+                            format!(
+                                "uv.lock entry for {key:?} can't be restored to match \
+                                 pyproject.toml ({reason}); left untouched"
+                            ),
+                        ));
+                        continue;
+                    }
+                }
+            }
+            (orig, _) => orig.map(str::to_string),
+        };
+        let original_text = respelled.as_deref();
         let drifted = |what: &str| {
             VendorWarning::new(
                 "vendor_lock_entry_drifted",
@@ -1020,6 +1044,102 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
+
+/// The recorded pre-vendor `original` of a root requirement record
+/// (`uv_lock_requires_dist` element, `uv_lock_requires_dev` group line,
+/// `uv_lock_manifest_constraints` key line) with every `canon` entry's
+/// `specifier` re-derived from the current pyproject.toml declaration
+/// ([`respell_lock_specifier`]). Other record kinds, other packages'
+/// entries and entries whose declaration still agrees come back
+/// unchanged, so an untouched project still reverts byte-for-byte. `Err`
+/// when the declaration changed but uv's spelling of it isn't derivable.
+fn respell_original(
+    orig: &str,
+    kind: &str,
+    canon: &str,
+    pyproject_text: &str,
+) -> Result<String, String> {
+    // (offset of the element list in `orig`, the array it mirrors).
+    let (offset, array) = match kind {
+        "uv_lock_requires_dist" => (0, None),
+        "uv_lock_requires_dev" | "uv_lock_manifest_constraints" => {
+            let Some((key, _)) = orig.split_once(" = ") else {
+                return Ok(orig.to_string());
+            };
+            let key = key.trim().trim_matches('"');
+            let array = if kind == "uv_lock_requires_dev" {
+                LockRequirementArray::RequiresDev(key)
+            } else {
+                LockRequirementArray::Manifest(key)
+            };
+            (orig.find(" = ").map_or(0, |i| i + " = ".len()), Some(array))
+        }
+        _ => return Ok(orig.to_string()),
+    };
+    let needle = format!("name = \"{canon}\"");
+    let mut out = orig.to_string();
+    // Back-to-front so the earlier spans stay valid.
+    for (s, e) in top_level_brace_groups(&orig[offset..]).into_iter().rev() {
+        let (s, e) = (offset + s, offset + e);
+        let element = &orig[s..e];
+        if !element.contains(&needle) {
+            continue;
+        }
+        let array = array.unwrap_or(LockRequirementArray::RequiresDist {
+            extra: marker_extra(element),
+        });
+        let specifier = entry_value(element, "specifier");
+        if let Some(spec) = respell_lock_specifier(pyproject_text, array, canon, specifier)? {
+            out.replace_range(s..e, &with_specifier(element, spec.as_deref()));
+        }
+    }
+    Ok(out)
+}
+
+/// The string value of `key` in a one-line `{ k = "v", … }` lock entry.
+fn entry_value<'a>(entry: &'a str, key: &str) -> Option<&'a str> {
+    let inner = entry.trim().strip_prefix('{')?.strip_suffix('}')?;
+    split_top_level_commas(inner).into_iter().find_map(|part| {
+        part.trim()
+            .strip_prefix(key)?
+            .trim_start()
+            .strip_prefix('=')
+            .map(|v| v.trim().trim_matches('"'))
+    })
+}
+
+/// The extra a root `requires-dist` entry belongs to: uv records an
+/// optional-dependencies requirement with `extra == '<name>'` in its marker.
+fn marker_extra(entry: &str) -> Option<&str> {
+    let marker = entry_value(entry, "marker")?;
+    let rest = &marker[marker.find("extra == '")? + "extra == '".len()..];
+    rest.split('\'').next()
+}
+
+/// `entry` with its `specifier` replaced by `spec` (removed when `None`),
+/// in place, or appended last, where uv writes it, when it had none.
+fn with_specifier(entry: &str, spec: Option<&str>) -> String {
+    let inner = entry.trim().trim_start_matches('{').trim_end_matches('}');
+    let rendered = spec.map(|s| format!("specifier = \"{s}\""));
+    let mut parts: Vec<String> = Vec::new();
+    let mut placed = false;
+    for part in split_top_level_commas(inner) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if part.starts_with("specifier =") {
+            parts.extend(rendered.clone());
+            placed = true;
+            continue;
+        }
+        parts.push(part.to_string());
+    }
+    if !placed {
+        parts.extend(rendered);
+    }
+    format!("{{ {} }}", parts.join(", "))
+}
 
 /// Result of [`revert_array_elements`].
 enum ArrayRevert {
@@ -6630,7 +6750,8 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
     /// unchanged `dependencies` element is restored byte-for-byte.
     #[tokio::test]
     async fn revert_respells_an_edited_manifest_constraint() {
-        let manifest = "[manifest]\nconstraints = [{ name = \"six\", specifier = \"==1.16.0\" }]\n\n";
+        let manifest =
+            "[manifest]\nconstraints = [{ name = \"six\", specifier = \"==1.16.0\" }]\n\n";
         let registry_lock =
             DIRECT_REGISTRY_LOCK.replacen("[[package]]", &format!("{manifest}[[package]]"), 1);
         let (outcome, _, (_, lock)) = revert_after_declaration_edit(
@@ -6651,18 +6772,19 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
         );
     }
 
-    /// #840, multi-clause: how uv joins clauses (`,` or `, `, sorted or not)
-    /// differs between releases. With a sibling entry showing this lock's
-    /// spelling, the edited requirement is written in it.
+    /// #840, multi-clause: uv's clause order differs between releases (0.8
+    /// orders by version, `>=20,!=21.1.0,<30`), so even a sibling entry
+    /// can't show how this edit would be spelled. Fail closed: keep the
+    /// wired pair and warn rather than guess.
     #[tokio::test]
-    async fn revert_respells_a_multi_clause_specifier_in_the_locks_style() {
-        let py_in =
-            DIRECT_REGISTRY_PYPROJECT.replace("[\"six==1.16.0\"]", "[\"attrs<30,>=20\", \"six==1.16.0\"]");
+    async fn revert_keeps_the_pair_on_a_multi_clause_edit_despite_sibling_evidence() {
+        let py_in = DIRECT_REGISTRY_PYPROJECT
+            .replace("[\"six==1.16.0\"]", "[\"attrs>=20,<30\", \"six==1.16.0\"]");
         let lock_in = DIRECT_REGISTRY_LOCK.replace(
             "requires-dist = [{ name = \"six\", specifier = \"==1.16.0\" }]",
             "requires-dist = [\n    { name = \"attrs\", specifier = \">=20,<30\" },\n    { name = \"six\", specifier = \"==1.16.0\" },\n]",
         );
-        let (outcome, _, (_, lock)) = revert_after_declaration_edit(
+        let (outcome, (edited_py, wired_lock), (py, lock)) = revert_after_declaration_edit(
             &py_in,
             &lock_in,
             "\"six==1.16.0\"",
@@ -6670,15 +6792,9 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
         )
         .await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
-        assert_eq!(
-            lock,
-            lock_in.replace(
-                "{ name = \"six\", specifier = \"==1.16.0\" }",
-                "{ name = \"six\", specifier = \">=1.16,<1.17\" }"
-            ),
-            "attrs shows this uv sorts clauses and joins them with `,`"
-        );
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert_eq!(py, edited_py);
+        assert_eq!(lock, wired_lock);
     }
 
     /// #840, multi-clause with nothing in the lock showing uv's spelling:
@@ -6706,6 +6822,30 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
         );
         assert_eq!(py, edited_py, "pyproject.toml stays wired with its lock");
         assert_eq!(lock, wired_lock, "uv.lock is left exactly as found");
+    }
+
+    /// #840 with six in both `dependencies` and an extra: each requires-dist
+    /// element follows its OWN declaration (uv marks the extra's with
+    /// `extra == 'socks'`), so editing only the extra respells only that
+    /// element.
+    #[tokio::test]
+    async fn revert_respells_only_the_edited_extra_element() {
+        let (outcome, _, (_, lock)) = revert_after_declaration_edit(
+            EXTRAS_DUP_REGISTRY_PYPROJECT,
+            EXTRAS_DUP_REGISTRY_LOCK,
+            "socks = [\"six==1.16.0\"]",
+            "socks = [\"six>=1.16\"]",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            lock,
+            EXTRAS_DUP_REGISTRY_LOCK.replace(
+                "marker = \"extra == 'socks'\", specifier = \"==1.16.0\"",
+                "marker = \"extra == 'socks'\", specifier = \">=1.16\""
+            )
+        );
     }
 
     /// An unchanged declaration, however it is spaced or ordered, still

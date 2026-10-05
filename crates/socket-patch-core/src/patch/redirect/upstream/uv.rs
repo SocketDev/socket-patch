@@ -974,6 +974,123 @@ fn declared_clauses(
     Ok(found)
 }
 
+/// Which lock requirement array a vendored revert is restoring an entry
+/// of, for [`respell_lock_specifier`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LockRequirementArray<'a> {
+    /// The root `requires-dist`, for the entry carrying `extra` in its
+    /// marker (`marker = "extra == 'x'"`), or for `[project]
+    /// dependencies` when `None`.
+    RequiresDist { extra: Option<&'a str> },
+    /// The root `requires-dev.<group>`.
+    RequiresDev(&'a str),
+    /// `[manifest] constraints` / `build-constraints`.
+    Manifest(&'a str),
+}
+
+/// The `specifier` a vendored revert should restore for `name`'s entry
+/// in `array`, given the one it recorded when vendoring (`None` when the
+/// entry had none).
+///
+/// A path source records no specifier, so a user who changes the
+/// declaration while the package is vendored (`uv add "six>=1.16"`)
+/// leaves uv.lock byte-identical, and the recorded specifier goes stale
+/// (#840). Returns:
+/// * `Ok(None)`: keep the recorded entry as it is. The declaration still
+///   agrees with it, nothing declares the name, or the declaration isn't a
+///   plain version range (the recorded spelling was uv's own, so it stays
+///   the best answer);
+/// * `Ok(Some(spec))`: write `spec` instead, in uv's spelling (`None` is no
+///   specifier at all);
+/// * `Err`: the declaration changed but uv's spelling of it can't be
+///   derived (a multi-clause range, or several conflicting declarations),
+///   so restoring any spelling may break `--locked`.
+pub(crate) fn respell_lock_specifier(
+    pyproject_text: &str,
+    array: LockRequirementArray<'_>,
+    name: &str,
+    recorded: Option<&str>,
+) -> Result<Option<Option<String>>, String> {
+    let Ok(doc) = pyproject_text.parse::<DocumentMut>() else {
+        return Ok(None);
+    };
+    let meta = Metadata {
+        rel: "pyproject.toml".to_string(),
+        text: String::new(),
+        script: false,
+        doc,
+    };
+    let canon = canonicalize_pypi_name(name);
+    let specs: Vec<&str> = match array {
+        LockRequirementArray::RequiresDist { extra: None } => {
+            strings(meta.doc.get("project").and_then(|p| p.get("dependencies")))
+        }
+        LockRequirementArray::RequiresDist { extra: Some(extra) } => {
+            let extra = canonicalize_pypi_name(extra);
+            meta.doc
+                .get("project")
+                .and_then(|p| p.get("optional-dependencies"))
+                .and_then(Item::as_table_like)
+                .into_iter()
+                .flat_map(|groups| groups.iter())
+                .filter(|(group, _)| canonicalize_pypi_name(group) == extra)
+                .flat_map(|(_, group)| strings(Some(group)))
+                .collect()
+        }
+        LockRequirementArray::RequiresDev(group) => declarations(&meta, Declared::Dev(group)),
+        LockRequirementArray::Manifest(key) => declarations(&meta, Declared::Manifest(key)),
+    };
+    let sorted = |clauses: &[String]| {
+        let mut c = clauses.to_vec();
+        c.sort();
+        c
+    };
+    // Each distinct clause set declared for the name, in declaration order.
+    let mut declared: Vec<Vec<String>> = Vec::new();
+    for spec in specs {
+        if canonicalize_pypi_name(pep508_name(spec)) != canon {
+            continue;
+        }
+        let Ok(clauses) = spec_clauses(spec) else {
+            return Ok(None);
+        };
+        if !declared.iter().any(|d| sorted(d) == sorted(&clauses)) {
+            declared.push(clauses);
+        }
+    }
+    if declared.is_empty() {
+        return Ok(None);
+    }
+    let recorded = match recorded {
+        None => Vec::new(),
+        Some(r) => match spec_clauses(&format!("{canon}{r}")) {
+            Ok(clauses) => clauses,
+            Err(_) => return Ok(None),
+        },
+    };
+    if declared.iter().any(|d| sorted(d) == sorted(&recorded)) {
+        return Ok(None);
+    }
+    let [clauses] = declared.as_slice() else {
+        return Err(format!(
+            "pyproject.toml declares {name} with several specifiers, none of them the \
+             recorded one, so which one the lock entry mirrors is not derivable"
+        ));
+    };
+    match clauses.as_slice() {
+        [] => Ok(Some(None)),
+        [one] => Ok(Some(Some(one.clone()))),
+        // How uv orders and joins clauses differs between releases (0.8
+        // orders them by version: `>=20,!=21.1.0,<30`), and the lock no
+        // longer shows this entry's spelling, so any guess may break
+        // `--locked`.
+        _ => Err(format!(
+            "pyproject.toml now declares {name} with a multi-clause specifier, whose \
+             spelling in uv.lock is not derivable"
+        )),
+    }
+}
+
 /// Every lock requirement array with the declarations it mirrors
 /// (read-only twin of [`restore_requirements`]'s walk).
 fn requirement_arrays_ref(doc: &DocumentMut) -> Vec<(Declared<'_>, &toml_edit::Array)> {
