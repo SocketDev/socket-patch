@@ -197,8 +197,17 @@ impl<'a> Prepared<'a> {
             let prep = crate::process::run(self.command(bin, false), &self.capture)
                 .map_err(|e| format!("spawning {}: {e}", bin.display()))?;
             let stats = self.mock.take_stats();
-            validate(self, &prep, &stats, Kind::Hosted)
-                .map_err(|e| format!("the rescan's preparatory scan failed validation: {e}"))?;
+            if let Err(e) = validate(self, &prep, &stats, Kind::Hosted) {
+                // A failed preparatory scan can still have rewritten the
+                // project. Restore it, or the next run (the other binary's,
+                // in `compare`) starts from a rescanned tree and fails
+                // validation for this binary's fault.
+                tree::restore(&self.work, &self.pristine, &mut self.snapshot)
+                    .map_err(|e| format!("restoring the fixture: {e}"))?;
+                return Err(format!(
+                    "the rescan's preparatory scan failed validation: {e}"
+                ));
+            }
         }
         self.mock.take_stats();
         let dry = self.scenario.kind == Kind::DryRun;

@@ -111,7 +111,14 @@ pub(crate) async fn hosted_consumed_copies(
         let npm: Vec<&String> = shared.get(&Ecosystem::Npm).into_iter().flatten().collect();
         for purl in shared.values().flatten() {
             let mut paths = all.remove(purl).unwrap_or_default();
-            let extra = aliases.remove(purl).unwrap_or_default();
+            // The installed-tree lookup already resolves importer-tree
+            // aliases, so most of the walk's finds are in `paths` already.
+            let extra: Vec<PathBuf> = aliases
+                .remove(purl)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|alias| !paths.contains(alias))
+                .collect();
             if npm.contains(&purl) && installed.get(purl).is_some_and(|p| !p.is_empty()) {
                 // The installed lookup already expanded these copies.
                 // Expanding its N variants again scans the store N times.

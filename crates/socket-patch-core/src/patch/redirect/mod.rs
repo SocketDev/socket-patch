@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use regex::{NoExpand, Regex};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -58,12 +58,14 @@ use crate::formats::cargo::hosted::CargoLockPlan;
 use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
+use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 mod poetry;
 #[cfg(test)]
 mod python_lock_equivalence_tests;
 mod requirements;
+pub use requirements::preflight_requirements_takeover;
 mod staged;
 mod state;
 pub(crate) mod hosted_url;
@@ -276,8 +278,9 @@ pub struct RewriteResult {
     /// a scoped registry or jsr, which hosted mode leaves unpatched.
     pub vlt_foreign_uuids: std::collections::BTreeSet<String>,
     /// Patch uuids with a same-`name@version` bundled instance the rewriter
-    /// skipped (Bun's `bundled` entries/records, #469): that copy is
-    /// unpacked from its parent's tarball and stays unpatched, so a
+    /// skipped (Bun's `bundled` entries/records, #469), or a yarn classic
+    /// git-fetched entry (#363): that copy is unpacked from its parent's
+    /// tarball or checked out from git and stays unpatched, so a
     /// confirmation of the uuid must never stand in for the installed tree
     /// (in-run VEX verifies it instead). Left out of the golden digests
     /// while empty, so the blessed oracle outputs predating it still hold.
@@ -339,12 +342,16 @@ pub fn rewrite_registry_redirect(
     rewrite_registry_redirect_with_python_metadata(files, overrides, &BTreeMap::new())
 }
 
+/// [`rewrite_registry_redirect`] with what the served artifacts carry, keyed
+/// by artifact URL: a hosted wheel's core metadata (the uv lock rewrite
+/// copies its dependency block) and a hosted npm tarball's `package.json`
+/// (the yarn berry pin takes its `bin` map from it).
 pub fn rewrite_registry_redirect_with_python_metadata(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
-    python_metadata: &BTreeMap<String, String>,
+    artifact_metadata: &BTreeMap<String, String>,
 ) -> RewriteResult {
-    rewrite_registry_redirect_with_pipenv_version(files, overrides, python_metadata, None, false)
+    rewrite_registry_redirect_with_pipenv_version(files, overrides, artifact_metadata, None, false)
 }
 
 /// Whether any pypi override targets an entry of `files["Pipfile.lock"]` —
@@ -401,14 +408,14 @@ fn withhold<'a>(
 pub fn rewrite_registry_redirect_with_pipenv_version(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
-    python_metadata: &BTreeMap<String, String>,
+    artifact_metadata: &BTreeMap<String, String>,
     pipenv_major: Option<u32>,
     bun_lockb_present: bool,
 ) -> RewriteResult {
     rewrite_registry_redirect_withholding_vlt(
         files,
         overrides,
-        python_metadata,
+        artifact_metadata,
         pipenv_major,
         bun_lockb_present,
         &std::collections::BTreeSet::new(),
@@ -422,7 +429,7 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
 pub fn rewrite_registry_redirect_withholding_vlt(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
-    python_metadata: &BTreeMap<String, String>,
+    artifact_metadata: &BTreeMap<String, String>,
     pipenv_major: Option<u32>,
     bun_lockb_present: bool,
     vlt_withheld: &std::collections::BTreeSet<String>,
@@ -447,7 +454,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
         &overrides,
         &vlt_overrides,
         bun_lockb_present,
-        python_metadata,
+        artifact_metadata,
     );
     let mut result = rewrite_groups_parallel(result, &groups);
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
@@ -471,14 +478,14 @@ fn rewriter_groups<'a>(
     overrides: &'a [DepOverride],
     vlt_overrides: &'a [DepOverride],
     bun_lockb_present: bool,
-    python_metadata: &'a BTreeMap<String, String>,
+    artifact_metadata: &'a BTreeMap<String, String>,
 ) -> Vec<RewriterGroup<'a>> {
     vec![
         Box::new(move |result| {
             rewrite_npm_lock(files, overrides, result);
             plan_hosted(files, overrides, result);
             rewrite_yarn_classic(files, overrides, result);
-            rewrite_yarn_berry(files, overrides, result);
+            rewrite_yarn_berry_with_manifests(files, overrides, artifact_metadata, result);
             rewrite_bun_lock(files, overrides, result);
         }),
         Box::new(move |result| {
@@ -487,7 +494,7 @@ fn rewriter_groups<'a>(
         Box::new(move |result| {
             requirements::rewrite(files, overrides, result);
             rewrite_hatch(files, overrides, result);
-            rewrite_uv_lock(files, overrides, python_metadata, result);
+            rewrite_uv_lock(files, overrides, artifact_metadata, result);
             poetry::rewrite_poetry(files, overrides, result);
         }),
         Box::new(move |result| rewrite_cargo(files, overrides, result)),
@@ -932,6 +939,10 @@ fn rewrite_one_npm_lock(
     // Entries npm installs from a git / url / `file:` spec: see
     // `vendor::npm_origin` (#326).
     let non_registry = npm_non_registry_entries(&lock, manifest_overrides);
+    // npm 7+ reads `packages` when it exists; the legacy `dependencies`
+    // mirror must not suppress an attestation for that install tree.
+    // Match the shared npm lock inventory's object-valued-map precedence.
+    let legacy_is_install_tree = lock.get("packages").and_then(Value::as_object).is_none();
     let mut changed = false;
     for dep in npm {
         let fname = full_name(dep);
@@ -966,9 +977,12 @@ fn rewrite_one_npm_lock(
                 // here would put the hosted URL in the lockfile (confirming
                 // and VEX-attesting the patch) while the unpatched bundled
                 // bytes keep installing. Mirrors the vendored backend's
-                // `vendor_bundled_instance_skipped` refusal.
+                // `vendor_bundled_instance_skipped` refusal. The uuid is
+                // recorded so the in-run `--vex` verifies instead of
+                // assuming the patch applied (#325, as Bun's #469).
                 if entry.get("inBundle").and_then(Value::as_bool) == Some(true) {
                     matched_any = true;
+                    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
                     result.warnings.push(RewriteWarning {
                         code: "redirect_npm_bundled_instance_skipped".into(),
                         detail: format!(
@@ -1019,6 +1033,7 @@ fn rewrite_one_npm_lock(
                 dep,
                 &sha512,
                 lockfile,
+                legacy_is_install_tree,
                 result,
                 &mut matched_any,
             ) || changed;
@@ -1100,6 +1115,7 @@ fn rewrite_npm_v2_deps(
     dep: &DepOverride,
     sha512: &str,
     lockfile: &str,
+    legacy_is_install_tree: bool,
     result: &mut RewriteResult,
     matched_any: &mut bool,
 ) -> bool {
@@ -1113,6 +1129,9 @@ fn rewrite_npm_v2_deps(
             // fail-open as the `packages` guard above.
             if entry.get("bundled").and_then(Value::as_bool) == Some(true) {
                 *matched_any = true;
+                if legacy_is_install_tree {
+                    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                }
                 result.warnings.push(RewriteWarning {
                     code: "redirect_npm_bundled_instance_skipped".into(),
                     detail: format!(
@@ -1146,6 +1165,7 @@ fn rewrite_npm_v2_deps(
                 dep,
                 sha512,
                 lockfile,
+                legacy_is_install_tree,
                 result,
                 matched_any,
             ) || changed;
@@ -3121,6 +3141,7 @@ fn rewrite_yarn_classic(
                 .expect("version regex from the escaped version is valid");
         let mut matched_any = false;
         let mut alias_skipped = false;
+        let mut git_skipped = false;
         for (i, block) in blocks.iter_mut().enumerate() {
             // The block's key line names its consumers; resolve every
             // comma-joined pattern to the REAL package it stands for
@@ -3138,6 +3159,29 @@ fn rewrite_yarn_classic(
                 continue;
             }
             let patterns = split_key_patterns(key);
+            // yarn 1 fetches a git pattern with git, handing it `resolved`
+            // as the remote (#363): a tarball there fails every install, so
+            // the block stays byte-identical and that copy keeps the git
+            // bytes — never assumed patched by the in-run VEX. Checked
+            // before the alias gate: an alias of a git range is git too.
+            let resolved = block
+                .lines()
+                .find_map(|l| l.strip_prefix("  resolved "))
+                .map(|v| v.trim().trim_matches('"'));
+            if crate::vendor::yarn_classic_lock::classic_block_is_git(&patterns, resolved) {
+                git_skipped = true;
+                result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_yarn_classic_git_skipped".into(),
+                    detail: format!(
+                        "lock entry `{key}` installs {fname}@{} from git, which yarn fetches \
+                         from the git source rather than a tarball; the hosted redirect leaves \
+                         it untouched, so this copy stays unpatched",
+                        dep.version
+                    ),
+                });
+                continue;
+            }
             // A block reached only through `alias@npm:<fname>@range`
             // descriptors is left byte-identical (mirroring the berry
             // rewriter), but never silently: that copy keeps installing the
@@ -3209,7 +3253,7 @@ fn rewrite_yarn_classic(
                 changed = true;
             }
         }
-        if !matched_any && !alias_skipped {
+        if !matched_any && !alias_skipped && !git_skipped {
             result.warnings.push(RewriteWarning {
                 code: "redirect_yarn_classic_entry_not_found".into(),
                 detail: format!("no yarn.lock entry resolving {fname}@{}", dep.version),
@@ -3396,9 +3440,24 @@ pub fn preflight_yarn_berry_hosted(lock: &str, yarnrc: Option<&str>) -> Result<(
     Ok(())
 }
 
+/// The berry hosted pin without served manifests (every pin keeps the
+/// registry entry's `bin:` map).
+#[cfg(test)]
 fn rewrite_yarn_berry(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    rewrite_yarn_berry_with_manifests(files, overrides, &BTreeMap::new(), result);
+}
+
+/// The berry hosted pin. `manifests` maps an artifact URL to the served
+/// tarball's `package.json` text; a pin whose manifest is absent keeps the
+/// registry entry's `bin:` map.
+fn rewrite_yarn_berry_with_manifests(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    manifests: &BTreeMap<String, String>,
     result: &mut RewriteResult,
 ) {
     // Descriptors split with the classic grammar's `name@range` rule.
@@ -3463,10 +3522,6 @@ fn rewrite_yarn_berry(
     // Keys of the entries re-keyed to a tarball descriptor; yarn sorts lock
     // entries by key, so each one moves to its sorted position at the end.
     let mut moved_keys: Vec<String> = Vec::new();
-    let resolution_re =
-        Regex::new(r#"\n {2}resolution: "[^"]*""#).expect("static resolution-line regex is valid");
-    let checksum_re =
-        Regex::new(r"\n {2}checksum: [^\n]*").expect("static checksum-line regex is valid");
     let mut changed = false;
     for dep in &npm {
         let fname = full_name(dep);
@@ -3783,40 +3838,31 @@ fn rewrite_yarn_berry(
                 continue;
             }
         };
-        // The entry yarn writes for those resolutions: only the key and the
-        // resolution change (plus our checksum); every other line — version,
-        // dependencies, bin, languageName — carries over verbatim.
+        // The entry yarn writes for those resolutions: the key, resolution
+        // and checksum change, `bin:` comes from the served tarball's own
+        // package.json when the caller fetched it (#718; yarn builds a
+        // tarball entry from it, not from the registry metadata), every
+        // other field carries over, and all of them sit in yarn's order
+        // (#697).
         let new_key = format!("\"{fname}@{}\"", dep.artifact_url);
+        let key_line = format!("{new_key}:");
         let resolution = format!("{fname}@{}", dep.artifact_url);
-        let body_lines = block.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
-        let mut rewritten = format!("\n{new_key}:\n{body_lines}");
-        // `NoExpand`: the URL is literal text, and a `$` in it (a patch
-        // server path) must never be read as a capture-group reference.
-        rewritten = resolution_re
-            .replace(
-                &rewritten,
-                NoExpand(&format!("\n  resolution: \"{resolution}\"")),
-            )
-            .to_string();
-        match &checksum {
-            Some(checksum) if checksum_re.is_match(&rewritten) => {
-                rewritten = checksum_re
-                    .replace(&rewritten, NoExpand(&format!("\n  checksum: {checksum}")))
-                    .to_string();
-            }
-            Some(checksum) => {
-                rewritten = resolution_re
-                    .replace(
-                        &rewritten,
-                        NoExpand(&format!(
-                            "\n  resolution: \"{resolution}\"\n  checksum: {checksum}"
-                        )),
-                    )
-                    .to_string();
-            }
-            None => {}
-        }
-        let rewritten = rewritten[1..].to_string();
+        let tarball_bin = manifests
+            .get(&dep.artifact_url)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .filter(Value::is_object)
+            .map(|manifest| manifest_bin(&manifest));
+        let body: Vec<&str> = block.lines().skip(1).collect();
+        let rewritten = render_pinned_entry(
+            &body,
+            &Pin {
+                key_line: &key_line,
+                resolution: &resolution,
+                checksum: checksum.as_deref(),
+                bin: tarball_bin.as_ref(),
+            },
+        )
+        .join("\n");
         for (selector, original) in pin.apply(manifest_obj, &dep.artifact_url) {
             manifest_changed = true;
             result.edits.push(FileEdit {
@@ -3921,6 +3967,63 @@ fn berry_lock_locks(content: &str, name: &str, version: &str) -> bool {
             && split_berry_key_patterns(key).iter().any(|p| {
                 split_pattern(p).is_some_and(|(n, range)| {
                     n == name && berry_npm_alias_target(range).is_none_or(|real| real == name)
+                })
+            })
+    })
+}
+
+/// The entries of the LF-normalized berry lock `content` that carry a
+/// `bin:` map: the only ones whose pin needs the served tarball's own
+/// package.json (#718). Split once per lock, so the per-dep check in
+/// [`berry_pin_needs_manifest`] only walks these (usually none).
+pub(crate) fn berry_bin_entries(content: &str) -> Vec<&str> {
+    content
+        .split("\n\n")
+        .filter(|block| block.contains("\n  bin:"))
+        .collect()
+}
+
+/// Whether the berry hosted pin of `dep` would re-key one of `bin_entries`
+/// (see [`berry_bin_entries`]): an entry of the package version whose
+/// descriptors all name the package through a plain (non-fork) `npm:`
+/// range, or one an earlier hosted run keyed by its tarball URL. A fork
+/// alias or another protocol is never re-keyed, so never needs a fetch.
+pub(crate) fn berry_pin_needs_manifest(bin_entries: &[&str], dep: &DepOverride) -> bool {
+    use crate::vendor::yarn_classic_lock::{split_berry_key_patterns, split_pattern};
+    if bin_entries.is_empty() {
+        return false;
+    }
+    let name = full_name(dep);
+    let version_line = format!("\n  version: {}", dep.version);
+    bin_entries.iter().any(|block| {
+        let Some(key) = block.lines().next().and_then(|l| l.strip_suffix(':')) else {
+            return false;
+        };
+        if key.starts_with([' ', '\t', '#']) || key == "__metadata" {
+            return false;
+        }
+        let has_version = block.match_indices(&version_line).any(|(at, _)| {
+            matches!(
+                block.as_bytes().get(at + version_line.len()),
+                None | Some(b'\n')
+            )
+        });
+        if !has_version {
+            return false;
+        }
+        let patterns = split_berry_key_patterns(key);
+        !patterns.is_empty()
+            && patterns.iter().all(|p| {
+                split_pattern(p).is_some_and(|(n, range)| {
+                    n == name
+                        && ((range.starts_with("npm:")
+                            && berry_npm_alias_target(range).is_none_or(|real| real == name))
+                            || berry_hosted_pin_is_ours(
+                                range,
+                                &name,
+                                Some(&dep.version),
+                                &dep.artifact_url,
+                            ))
                 })
             })
     })
@@ -4755,224 +4858,111 @@ const NUGET_ORG_URL: &str = "https://api.nuget.org/v3/index.json";
 /// caller must skip the dep fail-closed — writing the mapping without its
 /// source (or recording the edit at all) routes the patched id to a source
 /// that was never defined while the ledger claims the redirect landed.
-fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> Option<String> {
-    // Capture the pre-existing packageSource keys BEFORE the Socket source is
-    // added — the fallback below fans a `*` mapping out to them.
-    let mut pre_existing_keys = nuget_package_source_keys(config);
-    let mut out = config.to_string();
-
-    // A from-scratch <packageSourceMapping> is EXCLUSIVE: once it exists, every
-    // package must match some source's `*`/pattern or restore fails NU1100. If
-    // there are NO pre-existing sources to fan `*` out to, the mapping would be
-    // socket-only and every other package would fail. Seed the implicit default
-    // nuget.org source so the catch-all has a real target (unless the config
-    // already has one). Only relevant when we are about to CREATE the mapping.
-    // The open tag may carry whitespace or attributes (`<packageSourceMapping >`
-    // is valid XML); a literal probe reads it as absent and authors a
-    // DUPLICATE section.
-    let creating_mapping = nuget_mapping_open_end(&out).is_none();
-    // "Already has one" is decided by the parsed <packageSources> keys ALONE:
-    // a whole-file "nuget.org" probe is satisfied by text that defines no
-    // source (a defaultPushSource URL, a <disabledPackageSources> entry, a
-    // comment), and suppressing the seed on it leaves the from-scratch
-    // mapping socket-only — NU1100 for every other package.
+fn add_nuget_source(
+    config: &str,
+    parsed: &crate::formats::nuget::NugetConfig,
+    reg: &str,
+    index_url: &str,
+    pkg_id: &str,
+) -> Option<String> {
+    // The same source identities restore and VEX read, before Socket is added.
+    let mut pre_existing_keys: Vec<&str> =
+        parsed.sources.iter().map(|(key, _)| key.as_str()).collect();
+    let creating_mapping = parsed
+        .source_mapping
+        .as_ref()
+        .is_none_or(|section| section.close_start.is_none());
     let seed_nuget_org = creating_mapping && pre_existing_keys.is_empty();
-    if seed_nuget_org {
-        out = insert_nuget_source(&out, NUGET_ORG_KEY, NUGET_ORG_URL)?;
-        pre_existing_keys.push(NUGET_ORG_KEY.to_string());
-    }
-
-    out = insert_nuget_source(&out, reg, index_url)?;
-
-    let socket_mapping = format!(
-        "    <packageSource key=\"{reg}\">\n      <package pattern=\"{pkg_id}\" />\n    </packageSource>"
+    let reg = nuget_xml_attribute(reg);
+    let mut source_lines = format!(
+        "    <add key=\"{reg}\" value=\"{}\" />",
+        nuget_xml_attribute(index_url)
     );
-    if !creating_mapping {
-        // A mapping already exists (e.g. a prior patched dep, or the project's
-        // own): append ONLY this source's mapping — every other source is
-        // already covered.
-        // After any `<clear />` in the section: NuGet drops every mapping
-        // read before one, leaving the patched id routed nowhere.
-        let open_end = nuget_mapping_open_end(&out)?;
-        let at = nuget_after_last_clear(&out, open_end, "packageSourceMapping");
-        out = format!("{}\n{socket_mapping}{}", &out[..at], &out[at..]);
-    } else {
-        // Creating the mapping from scratch. Once ANY <packageSourceMapping>
-        // exists, NuGet requires EVERY package to match some source's pattern,
-        // so a mapping that routed only the patched id to the Socket source
-        // would make every OTHER package fail restore with NU1100. Fan a
-        // `<package pattern="*" />` out to each pre-existing source (which now
-        // includes the seeded nuget.org when the config had none) so the rest
-        // of the restore keeps resolving exactly where it did before.
-        let fallback_mappings = pre_existing_keys
-            .iter()
-            .map(|key| {
-                format!(
-                    "    <packageSource key=\"{key}\">\n      <package pattern=\"*\" />\n    </packageSource>"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let inner = if fallback_mappings.is_empty() {
-            socket_mapping
-        } else {
-            format!("{socket_mapping}\n{fallback_mappings}")
-        };
-        let map_block = format!("  <packageSourceMapping>\n{inner}\n  </packageSourceMapping>");
-        // The close tag may carry whitespace (`</configuration >` is valid
-        // XML); a literal replacen would silently drop the mapping.
-        let close_re = Regex::new(r"</configuration\s*>")
-            .expect("static configuration close-tag regex is valid");
-        let m = close_re.find(&out)?;
-        let at = m.start();
-        out = format!("{}{map_block}\n{}", &out[..at], &out[at..]);
-    }
-    Some(out)
-}
-
-/// Insert an `<add key="…" value="…" />` source under `<packageSources>`,
-/// creating the element (right after the `<configuration>` root open tag,
-/// whatever whitespace or attributes it carries) when absent. A self-closing
-/// `<packageSources />` (any whitespace before `/>`) is expanded in place
-/// into an open/close pair rather than left dangling beside a duplicate
-/// element. `None` when no anchor exists at all — the caller must treat the
-/// insert as failed rather than proceed on unchanged text.
-fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
-    let source_line = format!("    <add key=\"{key}\" value=\"{url}\" />");
-    // A self-closing element carries no children, so expand it to an open/close
-    // pair holding the new source. Matched before the open-tag check because
-    // the tolerant open-tag regex below also matches the whitespace-carrying
-    // `<packageSources />` form, and inserting after its `>` would land the
-    // source OUTSIDE the element.
-    let self_closing = Regex::new(r"<packageSources\s*/>")
-        .expect("static self-closing packageSources regex is valid");
-    // The open tag may carry whitespace (`<packageSources >` is valid XML
-    // NuGet parses); a literal `<packageSources>` probe reads it as absent
-    // and the from-scratch branch below authors a DUPLICATE element — the
-    // vendor/nuget_feed twin already tolerates the spelling.
-    let open_tag = Regex::new(r"<packageSources(?:\s[^>]*)?>")
-        .expect("static packageSources open-tag regex is valid");
-    if let Some(m) = self_closing.find(config) {
-        let mut out = String::with_capacity(config.len() + source_line.len() + 40);
-        out.push_str(&config[..m.start()]);
-        out.push_str(&format!(
-            "<packageSources>\n{source_line}\n  </packageSources>"
+    if seed_nuget_org {
+        // Once a mapping exists, every package needs a matching source. Keep
+        // the implicit nuget.org fallback when this file defines none.
+        source_lines.push_str(&format!(
+            "\n    <add key=\"{NUGET_ORG_KEY}\" value=\"{NUGET_ORG_URL}\" />"
         ));
-        out.push_str(&config[m.end()..]);
-        Some(out)
-    } else if let Some(m) = open_tag
-        .find(config)
-        // An attribute-carrying self-closing form (`<packageSources … />`,
-        // schema-invalid but cheap to guard) has no children span: fall
-        // through to the from-scratch branch rather than insert outside it.
-        .filter(|m| !m.as_str().ends_with("/>"))
-    {
-        // After any `<clear />`: NuGet drops every source read before one,
-        // so the mapping would point at an undefined source (NU1100).
-        let end = nuget_after_last_clear(config, m.end(), "packageSources");
-        Some(format!(
-            "{}\n{source_line}{}",
-            &config[..end],
-            &config[end..]
+        pre_existing_keys.push(NUGET_ORG_KEY);
+    }
+    let out = if let Some(section) = &parsed.package_sources {
+        insert_nuget_children(config, section, "packageSources", &source_lines)
+    } else {
+        insert_nuget_children(
+            config,
+            parsed.configuration.as_ref()?,
+            "configuration",
+            &format!("  <packageSources>\n{source_lines}\n  </packageSources>"),
+        )
+    };
+
+    // Source insertion shifted the mapping's byte offsets. Re-read through
+    // the shared tokenizer, never a second grammar over the modified text.
+    let updated = crate::formats::nuget::parse_config(&out)?;
+    let socket_mapping = format!(
+        "    <packageSource key=\"{reg}\">\n      <package pattern=\"{}\" />\n    </packageSource>",
+        nuget_xml_attribute(pkg_id),
+    );
+    let mut inner = socket_mapping;
+    if creating_mapping {
+        for key in pre_existing_keys {
+            inner.push_str(&format!(
+                "\n    <packageSource key=\"{}\">\n      <package pattern=\"*\" />\n    </packageSource>",
+                nuget_xml_attribute(key),
+            ));
+        }
+    }
+    if let Some(section) = &updated.source_mapping {
+        Some(insert_nuget_children(
+            &out,
+            section,
+            "packageSourceMapping",
+            &inner,
         ))
     } else {
-        // The root open tag may carry whitespace or attributes
-        // (`<configuration >`, `<configuration xmlns=…>`) — all valid XML a
-        // literal `<configuration>` match would silently miss, leaving the
-        // source undefined while the mapping still lands.
-        let open_re = Regex::new(r"<configuration(\s[^>]*)?>")
-            .expect("static configuration open-tag regex is valid");
-        let end = open_re.find(config)?.end();
+        let at = updated.configuration.as_ref()?.close_start?;
         Some(format!(
-            "{}\n  <packageSources>\n{source_line}\n  </packageSources>{}",
-            &config[..end],
-            &config[end..]
+            "{}  <packageSourceMapping>\n{inner}\n  </packageSourceMapping>\n{}",
+            &out[..at],
+            &out[at..]
         ))
     }
 }
 
-/// The offset just past the `<packageSourceMapping>` open tag (any whitespace
-/// or attributes), or `None` when the config has no open/close section — a
-/// self-closing `<packageSourceMapping />` holds no children to append to.
-fn nuget_mapping_open_end(config: &str) -> Option<usize> {
-    static OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"<packageSourceMapping(?:\s[^>]*)?>")
-            .expect("static packageSourceMapping open-tag regex is valid")
-    });
-    OPEN_RE
-        .find(config)
-        .filter(|m| !m.as_str().ends_with("/>"))
-        .map(|m| m.end())
-}
-
-/// The offset just past the last `<clear />` between `from` and the `section`
-/// element's close tag (any whitespace before `>`), else `from`. Comments are
-/// skipped: a commented-out `<clear />` clears nothing, and anchoring on it
-/// would splice the new entry INSIDE the comment.
-fn nuget_after_last_clear(config: &str, from: usize, section: &str) -> usize {
-    static CLEAR_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"<clear\s*/>").expect("static clear-tag regex is valid"));
-    static COMMENT_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").expect("static comment regex is valid"));
-    // Blank comment bytes in place so offsets still index `config`.
-    let mut masked = config.as_bytes()[from..].to_vec();
-    for m in COMMENT_RE.find_iter(&config[from..]) {
-        masked[m.range()].fill(b' ');
+/// Insert only at live, directly-scoped elements recorded by the XML reader.
+/// The model's insertion point follows the last `<clear>` child. Expanding a
+/// self-closing section keeps its opening attributes and all surrounding bytes.
+fn insert_nuget_children(
+    config: &str,
+    section: &crate::formats::nuget::ConfigSection,
+    name: &str,
+    children: &str,
+) -> String {
+    let mut out = config.to_string();
+    if section.close_start.is_some() {
+        out.insert_str(section.insert_at, &format!("\n{children}"));
+    } else {
+        let open = config[section.open.start..section.open.end - 2].trim_end();
+        out.replace_range(
+            section.open.clone(),
+            &format!("{open}>\n{children}\n  </{name}>"),
+        );
     }
-    let masked = String::from_utf8(masked).expect("only whole comments are blanked");
-    let close_re =
-        Regex::new(&format!(r"</{section}\s*>")).expect("section close-tag regex is valid");
-    let Some(close) = close_re.find(&masked) else {
-        return from;
-    };
-    CLEAR_RE
-        .find_iter(&masked[..close.start()])
-        .last()
-        .map_or(from, |m| from + m.end())
+    out
 }
 
-/// The `key` of every `<add … />` under `<packageSources>` (empty when there
-/// is no such element). Used to preserve resolution for non-patched packages
-/// when a `<packageSourceMapping>` is introduced.
-// The open tag may carry whitespace (`<packageSources >` is valid XML NuGet
-// parses); a literal match reads a real source list as "no sources" —
-// duplicate nuget.org seed, missed catch-all fan-out — while the
-// vendor/nuget_feed twin already tolerates the spelling. A self-closing
-// `<packageSources />` has no close tag, so the regex (correctly) finds no
-// children span.
-static NUGET_PACKAGE_SOURCES_REGION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)<packageSources(?:\s[^>]*)?>(.*?)</packageSources>")
-        .expect("static packageSources region regex is valid")
-});
-// Tolerates any attribute order, whitespace around `=`, and single-quoted
-// values (all valid XML NuGet accepts): a real source the scan misses would
-// read as "no sources", triggering a duplicate nuget.org seed and leaving the
-// missed source out of the catch-all fan-out. `[^>]` keeps the match inside
-// one element.
-static NUGET_ADD_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<add\s[^>]*?key\s*=\s*(?:"([^"]+)"|'([^']+)')"#)
-        .expect("static add-key regex is valid")
-});
-
-fn nuget_package_source_keys(config: &str) -> Vec<String> {
-    let scope = NUGET_PACKAGE_SOURCES_REGION_RE
-        .captures(config)
-        .map(|c| {
-            c.get(1)
-                .expect("region_re always captures group 1")
-                .as_str()
-        })
-        .unwrap_or("");
-    NUGET_ADD_KEY_RE
-        .captures_iter(scope)
-        .map(|c| {
-            c.get(1)
-                .or_else(|| c.get(2))
-                .expect("one quote alternative always captures")
-                .as_str()
-                .to_string()
-        })
-        .collect()
+/// The reader returns decoded attribute values; encode them when writing so
+/// a source named `a&amp;b` still has the same identity in its mapping.
+fn nuget_xml_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        // Literal XML attribute whitespace would be normalized to spaces.
+        .replace('\t', "&#x9;")
+        .replace('\n', "&#xA;")
+        .replace('\r', "&#xD;")
 }
 
 fn rewrite_nuget(
@@ -5051,28 +5041,35 @@ fn rewrite_nuget(
             .clone()
             .unwrap_or_else(|| dep.name.to_lowercase());
 
-        // Idempotency probe over the parsed `<packageSources>` keys — the
-        // same reader `add_nuget_source` fans the catch-all out with — so a
-        // hand-normalized spelling (`key = 'socket-patch-…'`) is recognized
-        // as already wired instead of being duplicated on a re-run.
-        if !nuget_package_source_keys(&config)
-            .iter()
-            .any(|key| key == &reg)
-        {
+        let unwritable = || RewriteWarning {
+            code: "redirect_nuget_config_unwritable".into(),
+            detail: format!(
+                "nuget.config has malformed XML or no unambiguous <configuration> layout \
+                 to wire {} into; not redirected",
+                dep.name
+            ),
+        };
+        // Validate even an apparently existing Socket source before re-pinning
+        // the lock. A partial parse must never turn into a claimed redirect.
+        let Some(parsed) = crate::formats::nuget::parse_config(&config).filter(|parsed| {
+            !parsed.repeated_sections
+                && parsed
+                    .configuration
+                    .as_ref()
+                    .is_some_and(|root| root.close_start.is_some())
+        }) else {
+            result.warnings.push(unwritable());
+            continue;
+        };
+        if !parsed.sources.iter().any(|(key, _)| key == &reg) {
             // A failed insert skips the WHOLE dep (no edit record, no lock
             // re-pin): a mapping without its source routes the patched id to
             // a source that was never defined, and a lock pinned at the
             // patched contentHash over an upstream fetch fails NU1403 — both
             // while the ledger would claim the redirect landed.
-            let Some(updated) = add_nuget_source(&config, &reg, &ov.index_url, &dep.name) else {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_nuget_config_unwritable".into(),
-                    detail: format!(
-                        "nuget.config has no <configuration> element to wire {} into; \
-                         not redirected",
-                        dep.name
-                    ),
-                });
+            let Some(updated) = add_nuget_source(&config, &parsed, &reg, &ov.index_url, &dep.name)
+            else {
+                result.warnings.push(unwritable());
                 continue;
             };
             config = updated;
@@ -5177,6 +5174,120 @@ pub(crate) fn gem_line_trailing_options(tail: &str) -> String {
             None => return String::new(),
         }
     }
+}
+
+/// Why the argument tail of a one-line `gem "name"…` declaration can't be
+/// rewritten in place (`None` = safe). Both Gemfile rewriters replace the
+/// declaration's LINE, so the tail must be the whole declaration: a `,`-led
+/// option list that ends on this line and carries no modifier. Anything else
+/// is refused fail-closed (#340):
+/// - a tail that continues on the next line (a dangling `,`, `=>`, key, `\`,
+///   an unclosed bracket or string) would leave the continuation orphaned
+///   after the rewrite, and bundler refuses the Gemfile;
+/// - a modifier (`if` / `unless` / `while` / `until` / `rescue` / `and` /
+///   `or`) or a `do` block would be dropped, silently changing when the gem
+///   is declared.
+///
+/// Only code outside ordinary string literals and before a `#` comment
+/// counts, so a keyword or `,` inside `require: "…"` or a comment is fine.
+/// Double-quoted interpolation can execute a heredoc, so its presence with
+/// a possible `<<` opener is refused conservatively too.
+/// Shared with the vendor backend's Gemfile rewrite (`vendor::gem`).
+pub(crate) fn gem_line_tail_blocks_edit(tail: &str) -> Option<String> {
+    const CONTINUES: &str = "the declaration continues on the next line";
+    let mut code = String::new();
+    let mut quote: Option<char> = None;
+    let mut interpolated = false;
+    let mut quoted_operator = false;
+    let mut depth: i64 = 0;
+    let mut chars = tail.chars();
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if c == '\\' {
+                chars.next();
+            } else if c == q {
+                quote = None;
+            } else if q == '"' && c == '#' && chars.as_str().starts_with('{') {
+                interpolated = true;
+            } else if c == '<' && chars.as_str().starts_with('<') {
+                quoted_operator = true;
+            }
+            // String contents never count as code: keep a placeholder so
+            // word boundaries and the final character stay meaningful.
+            code.push(if c == q && quote.is_none() { c } else { 'x' });
+            continue;
+        }
+        match c {
+            '#' => break,
+            '"' | '\'' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        code.push(c);
+    }
+    if quote.is_some() || depth > 0 {
+        return Some(CONTINUES.to_string());
+    }
+    let code = code.trim();
+    if code.is_empty() {
+        return None;
+    }
+    if depth < 0 || !code.starts_with(',') {
+        return Some("unexpected tokens after the gem name".to_string());
+    }
+    let last = code.chars().next_back().unwrap_or(',');
+    if !(last.is_alphanumeric() || matches!(last, '_' | '"' | '\'' | ')' | ']' | '}' | '?' | '!')) {
+        return Some(CONTINUES.to_string());
+    }
+    // A heredoc body lives on the following lines, past where the rewrite
+    // would insert its closing `end`. Interpolation is executable Ruby too
+    // (`"#{<<~NAME}"`), so do not let quote masking hide its opener. Literal
+    // and escaped-interpolation lookalikes remain masked.
+    if code.contains("<<") || (interpolated && quoted_operator) {
+        return Some(CONTINUES.to_string());
+    }
+    let bytes = code.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_ident(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_ident(bytes[i]) {
+            i += 1;
+        }
+        let word = &code[start..i];
+        // A symbol (`:if`), method call (`.if`) or variable sigil is a name,
+        // not a keyword; so is a predicate (`if?`). `if:` is a hash key only
+        // where an argument can start (after `,`, `(` or `{`) and not `if::`;
+        // straight after a value, `if:FLAG` is a modifier on symbol `:FLAG`.
+        let prev_ok = start == 0 || !matches!(bytes[start - 1], b':' | b'.' | b'@' | b'$');
+        let arg_start = matches!(
+            code[..start].trim_end().as_bytes().last(),
+            Some(b',' | b'(' | b'{')
+        );
+        let next_ok = match bytes.get(i) {
+            Some(b'?' | b'!') => false,
+            Some(b':') => !(arg_start && bytes.get(i + 1) != Some(&b':')),
+            _ => true,
+        };
+        if !(prev_ok && next_ok) {
+            continue;
+        }
+        match word {
+            "if" | "unless" | "while" | "until" => {
+                return Some(format!("conditional declaration (`{word}` modifier)"));
+            }
+            "rescue" | "and" | "or" | "do" => {
+                return Some(format!("a trailing `{word}` after the declaration"));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The source-selecting option a `gem` line's argument tail carries, if any
@@ -5697,6 +5808,20 @@ fn rewrite_gem(
                         result.warnings.push(RewriteWarning {
                             code: "redirect_gem_source_option".into(),
                             detail,
+                        });
+                        continue;
+                    }
+                    // Only a whole one-line declaration can move into the
+                    // block: a continuation would be orphaned after `end`
+                    // and a modifier silently dropped (#340).
+                    if let Some(reason) = gem_line_tail_blocks_edit(&tail) {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_gem_unrecognized_declaration".into(),
+                            detail: format!(
+                                "the `gem \"{}\"` declaration is in a form the \
+                                 rewriter cannot safely edit ({reason}); redirect skipped",
+                                dep.name
+                            ),
                         });
                         continue;
                     }
@@ -7621,6 +7746,155 @@ mod tests {
         }
     }
 
+    #[test]
+    fn nuget_shared_model_ignores_commented_sources() {
+        for sources in [
+            r#"<packageSources><!-- <add key="old" value="https://old.test" /> --></packageSources>"#,
+            r#"<!-- <packageSources><add key="old" value="https://old.test" /></packageSources> -->
+  <packageSources><add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+    <!-- <add key="other" value="https://other.test" /> -->
+  </packageSources>"#,
+        ] {
+            let config = format!("<configuration>\n  {sources}\n</configuration>\n");
+            let files = BTreeMap::from([("nuget.config".into(), config)]);
+            let result = rewrite_registry_redirect(&files, &[nuget_override()]);
+            let out = result.files.get("nuget.config").expect("config rewritten");
+            let parsed = crate::formats::nuget::parse_config(out).unwrap();
+            assert_eq!(
+                parsed
+                    .sources
+                    .iter()
+                    .map(|(key, _)| key.as_str())
+                    .collect::<Vec<_>>(),
+                ["socket-patch-uuid", "nuget.org"],
+                "only live sources receive mappings: {out}"
+            );
+            assert_eq!(
+                parsed.mappings,
+                [
+                    ("socket-patch-uuid".into(), vec!["Newtonsoft.Json".into()]),
+                    ("nuget.org".into(), vec!["*".into()]),
+                ],
+                "every catch-all must name a source NuGet reads: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn nuget_shared_model_never_splices_into_inert_markup() {
+        let fake = "<packageSources></packageSources><packageSourceMapping></packageSourceMapping>";
+        for inert in [
+            format!("<!-- é {fake} -->"),
+            format!("<![CDATA[{fake}]]>"),
+            format!("<?example {fake}?>"),
+        ] {
+            let config = format!(
+                "<configuration>\n  {inert}\n  <packageSources>\n    \
+                 <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  \
+                 </packageSources>\n</configuration>\n"
+            );
+            let files = BTreeMap::from([("nuget.config".into(), config)]);
+            let result = rewrite_registry_redirect(&files, &[nuget_override()]);
+            let out = result.files.get("nuget.config").expect("config rewritten");
+            assert!(out.contains(&inert), "inert bytes must be preserved: {out}");
+            let parsed = crate::formats::nuget::parse_config(out).unwrap();
+            assert!(parsed
+                .sources
+                .iter()
+                .any(|(key, _)| key == "socket-patch-uuid"));
+            assert!(parsed.mappings.iter().any(|(key, patterns)| {
+                key == "socket-patch-uuid" && patterns == &["Newtonsoft.Json"]
+            }));
+            let rerun = rewrite_registry_redirect(&result.files, &[nuget_override()]);
+            assert!(
+                rerun.files.is_empty() && rerun.edits.is_empty(),
+                "idempotent: {rerun:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nuget_shared_model_refuses_malformed_config_without_repinning_lock() {
+        for config in [
+            "<configuration><packageSources></configuration>",
+            "<configuration><!-- unterminated </configuration>",
+            "<configuration><packageSources/><packageSources/></configuration>",
+            // Even an apparently existing Socket source cannot bypass validation.
+            r#"<configuration><packageSources><add key="socket-patch-uuid" value="https://patch.test/nuget/index.json" /></packageSources>"#,
+        ] {
+            let files = BTreeMap::from([
+                ("nuget.config".into(), config.into()),
+                ("packages.lock.json".into(), r#"{"version":1,"dependencies":{"net8.0":{"Newtonsoft.Json":{"type":"Direct","resolved":"13.0.3","contentHash":"ORIGINAL"}}}}"#.into()),
+            ]);
+            let result = rewrite_registry_redirect(&files, &[nuget_override()]);
+            assert!(
+                result.files.is_empty() && result.edits.is_empty(),
+                "no half-write: {result:?}"
+            );
+            assert!(warning_codes(&result).contains(&"redirect_nuget_config_unwritable"));
+        }
+    }
+
+    #[test]
+    fn nuget_shared_model_preserves_source_key_attribute_whitespace() {
+        for (raw, decoded, encoded) in [
+            ("corp&#x9;feed", "corp\tfeed", "corp&#x9;feed"),
+            ("corp&#10;feed", "corp\nfeed", "corp&#xA;feed"),
+            ("corp&#13;feed", "corp\rfeed", "corp&#xD;feed"),
+            ("corp\tfeed", "corp feed", "corp feed"),
+            ("corp\nfeed", "corp feed", "corp feed"),
+            ("corp\rfeed", "corp feed", "corp feed"),
+            ("corp\r\nfeed", "corp feed", "corp feed"),
+            (
+                "corp\r\n&#x9;&#xD;&#xA;feed",
+                "corp \t\r\nfeed",
+                "corp &#x9;&#xD;&#xA;feed",
+            ),
+        ] {
+            let source = format!("<add key=\"{raw}\" value=\"https://corp.test/index.json\" />");
+            let config = format!(
+                "<configuration><packageSources><clear/>{source}</packageSources></configuration>"
+            );
+            let files = BTreeMap::from([("nuget.config".into(), config)]);
+            let result = rewrite_registry_redirect(&files, &[nuget_override()]);
+            let out = result.files.get("nuget.config").expect("config rewritten");
+            assert!(out.contains(&source), "original source bytes preserved: {out}");
+            // XML normalizes literal attribute whitespace to spaces, but
+            // preserves character references. The fallback must keep the
+            // same source identity under a real XML reader, not just ours.
+            assert!(
+                out.contains(&format!("<packageSource key=\"{encoded}\">")),
+                "source {raw:?} needs an equivalent mapping: {out}"
+            );
+            let parsed = crate::formats::nuget::parse_config(out).unwrap();
+            assert_eq!(parsed.sources[1].0, decoded);
+            assert_eq!(parsed.mappings[1], (decoded.into(), vec!["*".into()]));
+        }
+    }
+
+    #[test]
+    fn nuget_shared_model_expands_empty_mapping_and_encodes_source_keys() {
+        let config = r#"<configuration note=">">
+  <packageSources>
+    <clear></clear>
+    <add key="a&amp;b&quot;&lt;" value="https://corp.test/index.json" />
+  </packageSources>
+  <!-- <packageSourceMapping /> -->
+  <packageSourceMapping />
+</configuration>
+"#;
+        let files = BTreeMap::from([("nuget.config".into(), config.into())]);
+        let result = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let out = result.files.get("nuget.config").expect("config rewritten");
+        let parsed = crate::formats::nuget::parse_config(out).unwrap();
+        assert!(!parsed.repeated_sections, "reuse the empty mapping: {out}");
+        assert_eq!(parsed.sources[1].0, "a&b\"<");
+        assert_eq!(parsed.mappings[1], ("a&b\"<".into(), vec!["*".into()]));
+        assert!(out.contains("<clear></clear>\n    <add key=\"socket-patch-uuid\""));
+        assert!(out.contains("<!-- <packageSourceMapping /> -->"));
+        assert!(out.starts_with("<configuration note=\">\">"));
+    }
+
     /// Creating a `<packageSourceMapping>` from scratch: once ANY mapping
     /// exists NuGet requires EVERY package to match some source's pattern, so
     /// the rewriter must fan a `pattern="*"` mapping out to every pre-existing
@@ -9066,6 +9340,93 @@ mod tests {
             r.files
         );
         assert_eq!(r.warnings[0].code, "redirect_yarn_classic_entry_not_found");
+    }
+
+    /// #363: yarn 1 fetches a git-pattern block with its git fetcher from
+    /// the block's `resolved`, so a hosted tarball there makes every later
+    /// install fail. The block stays byte-identical with a named warning,
+    /// and since that copy installs the git bytes, the uuid is never
+    /// assumed applied by the in-run VEX.
+    #[test]
+    fn yarn_classic_git_pattern_block_is_skipped() {
+        let git_block = "\"left-pad@git+https://github.com/stevemao/left-pad.git#v1.3.0\":\n  \
+             version \"1.3.0\"\n  \
+             resolved \"git+https://github.com/stevemao/left-pad.git#ff8e7ba5b0b3a5ad2f1bb06a4e6aef1c6b2c3d4e\"\n";
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+
+        // Git block only: nothing to rewire, a specific warning (not the
+        // generic not-found).
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            format!("# yarn lockfile v1\n\n\n{git_block}"),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(codes, ["redirect_yarn_classic_git_skipped"]);
+        assert!(r.warnings[0].detail.contains("git"), "{:?}", r.warnings);
+
+        // Git block beside a registry block: the registry block is wired,
+        // the git block left alone, and the uuid flagged so in-run VEX
+        // verifies instead of assuming.
+        let registry_block = "left-pad@^1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n";
+        files.insert(
+            "yarn.lock".to_string(),
+            format!("# yarn lockfile v1\n\n\n{registry_block}\n{git_block}"),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        let out = &r.files["yarn.lock"];
+        assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
+        assert!(out.contains(git_block), "git block byte-identical:\n{out}");
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_yarn_classic_git_skipped"));
+        assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+
+        // An `npm:` alias of a git range is fetched with git too: beside a
+        // rewired registry block it still keeps the uuid out of the in-run
+        // VEX assumption.
+        files.insert(
+            "yarn.lock".to_string(),
+            format!(
+                "# yarn lockfile v1\n\n\n{registry_block}\n\
+                 \"safe-pad@npm:left-pad@git+https://github.com/stevemao/left-pad.git#v1.3.0\":\n  \
+                 version \"1.3.0\"\n  \
+                 resolved \"git+https://github.com/stevemao/left-pad.git#ff8e7ba\"\n"
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_yarn_classic_git_skipped"));
+        assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+
+        // The codeload shorthand is a tarball to yarn: still rewired.
+        files.insert(
+            "yarn.lock".to_string(),
+            "# yarn lockfile v1\n\n\nleft-pad@stevemao/left-pad#v1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://codeload.github.com/stevemao/left-pad/tar.gz/ff8e7ba\"\n"
+                .to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.warnings);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
 
     /// The opposite alias direction — `"alias@npm:<fname>@…"` consuming the
@@ -12369,6 +12730,181 @@ mod tests {
         }
     }
 
+    /// #340: a declaration whose tail continues on the next line, or that
+    /// carries a modifier (`if` / `unless` / …), is not a single-line
+    /// declaration the rewriter can move into a source block. Rewriting it
+    /// orphans the continuation after `end` (bundler refuses the Gemfile) or
+    /// silently drops the condition. Fail closed and leave both files alone.
+    #[test]
+    fn gemfile_multi_line_or_conditional_declaration_fails_closed() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    vuln-gem (1.0.0)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  vuln-gem\n\n\
+                    BUNDLED WITH\n   4.0.17\n";
+        for decl in [
+            // Continuations: a dangling `,`, `=>`, key, backslash, open bracket.
+            "gem \"vuln-gem\",\n  require: false",
+            "gem \"vuln-gem\", # keep it lazy\n  require: false",
+            "gem \"vuln-gem\",\r\n  require: false",
+            "gem \"vuln-gem\", :require =>\n  false",
+            "gem \"vuln-gem\", require:\n  false",
+            "gem \"vuln-gem\", \"1.0.0\", \\\n  require: false",
+            "gem \"vuln-gem\", platforms: [:mri,\n  :mingw]",
+            "gem \"vuln-gem\", platforms: [\n  :mri]",
+            "gem \"vuln-gem\", require: \"vuln\n/gem\"",
+            "gem(\"vuln-gem\",\n  require: false)",
+            // Modifiers and other non-option tails.
+            "gem \"vuln-gem\" if true",
+            "gem \"vuln-gem\" if ENV[\"WITH_VULN\"] != \"0\"",
+            "gem \"vuln-gem\", require: false if ENV[\"CI\"]",
+            "gem \"vuln-gem\", \"1.0.0\"\tunless RUBY_VERSION < \"3\"",
+            "gem \"vuln-gem\", \"1.0.0\" if(ENV[\"CI\"])",
+            "gem \"vuln-gem\", require: false rescue nil",
+            "gem(\"vuln-gem\") if true",
+            "gem \"vuln-gem\" do",
+            // A label-looking modifier straight after a value, and a heredoc.
+            "gem \"vuln-gem\", \"1.0.0\" if::FEATURE",
+            "gem \"vuln-gem\", \"1.0.0\" unless::FEATURE",
+            "gem \"vuln-gem\", \"1.0.0\" if:enabled == ENV[\"MODE\"].to_sym",
+            "gem \"vuln-gem\", require: <<~REQ.strip\n  vuln\nREQ",
+        ] {
+            let gemfile = format!("source \"https://rubygems.org\"\n\n{decl}\n");
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.clone());
+            files.insert("Gemfile.lock".to_string(), lock.to_string());
+            let r = rewrite_registry_redirect(&files, &[gem_override("vuln-gem", "1.0.0")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{decl:?} must not be rewritten: files={:?} edits={:?}",
+                r.files,
+                r.edits
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_unrecognized_declaration"],
+                "{decl:?}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn gemfile_quoted_and_interpolated_heredocs_fail_closed() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    vuln-gem (1.0.0)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  vuln-gem\n\n\
+                    BUNDLED WITH\n   4.0.17\n";
+        for decl in [
+            "gem \"vuln-gem\", require: <<'REQUIRE_PATH'\nvuln-gem\nREQUIRE_PATH",
+            "gem(\"vuln-gem\", require: <<\"REQUIRE_PATH\")\nvuln-gem\nREQUIRE_PATH",
+            "gem \"vuln-gem\", require: \"#{<<~REQUIRE_PATH}\".chomp\n  vuln_gem\nREQUIRE_PATH",
+        ] {
+            let gemfile = format!("source \"https://rubygems.org\"\n{decl}\n");
+            let files = BTreeMap::from([
+                ("Gemfile".to_string(), gemfile),
+                ("Gemfile.lock".to_string(), lock.to_string()),
+            ]);
+            let r = rewrite_registry_redirect(&files, &[gem_override("vuln-gem", "1.0.0")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{decl:?} must not be rewritten: {:?}",
+                r.files
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_unrecognized_declaration"],
+                "{decl:?}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn gem_line_tail_colon_and_heredoc_syntax_is_not_confused_with_literals() {
+        for tail in [
+            ", \"1.0.0\" if::FEATURE",
+            ", \"1.0.0\" unless::FEATURE",
+            ", \"1.0.0\" if:enabled == ENV[\"MODE\"].to_sym",
+            ", require: <<~REQUIRE_PATH.chomp",
+            ", require: <<'REQUIRE_PATH'",
+            ", require: <<\"REQUIRE_PATH\"",
+            ", require: \"#{<<~REQUIRE_PATH}\".chomp",
+        ] {
+            assert!(gem_line_tail_blocks_edit(tail).is_some(), "{tail:?}");
+        }
+        for tail in [
+            ", require: \"<<REQUIRE_PATH\"",
+            ", require: '<<~REQUIRE_PATH'",
+            ", require: '#{<<REQUIRE_PATH}'",
+            ", require: \"\\#{<<REQUIRE_PATH}\"",
+            ", require: \"#{ENV['REQUIRE_PATH']}\"",
+            ", require: \"#{ENV['REQUIRE_PATH']}\" # <<NOT_A_HEREDOC",
+            ", group: :unless",
+            ", require: { if: \"vuln-gem\", unless: \"other\" }.values",
+            ", require: loader(if: \"vuln-gem\")",
+            ", if: true",
+            ", require: false # if::FEATURE, <<REQUIRE_PATH",
+        ] {
+            assert_eq!(gem_line_tail_blocks_edit(tail), None, "{tail:?}");
+        }
+    }
+
+    /// Control for #340: single-line declarations whose tails merely look
+    /// like the refused shapes (a keyword inside a string or a comment, a
+    /// symbol or a key named like a keyword, a closed bracket) still
+    /// rewrite, keeping their options.
+    #[test]
+    fn gemfile_single_line_declaration_lookalikes_still_rewrite() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    vuln-gem (1.0.0)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  vuln-gem\n\n\
+                    BUNDLED WITH\n   4.0.17\n";
+        for (decl, opts) in [
+            ("gem \"vuln-gem\"", ""),
+            ("gem \"vuln-gem\" # only if needed,", ""),
+            (
+                "gem \"vuln-gem\", \"~> 1.0\" # pinned, unless told otherwise",
+                "",
+            ),
+            (
+                "gem \"vuln-gem\", require: \"if/unless\"",
+                "require: \"if/unless\"",
+            ),
+            ("gem \"vuln-gem\", require: 'a,'", "require: 'a,'"),
+            (
+                "gem \"vuln-gem\", require: { if: \"vuln-gem\" }.values",
+                "require: { if: \"vuln-gem\" }.values",
+            ),
+            (
+                "gem \"vuln-gem\", require: \"<<REQUIRE_PATH\"",
+                "require: \"<<REQUIRE_PATH\"",
+            ),
+            ("gem \"vuln-gem\", group: :unless", "group: :unless"),
+            (
+                "gem \"vuln-gem\", platforms: [:mri, :mingw]",
+                "platforms: [:mri, :mingw]",
+            ),
+            ("gem \"vuln-gem\", require: \"a#b\"", "require: \"a#b\""),
+            ("gem \"vuln-gem\", require: false\r", "require: false"),
+            ("gem(\"vuln-gem\", require: false)", "require: false"),
+        ] {
+            let gemfile = format!("source \"https://rubygems.org\"\n\n{decl}\n");
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.clone());
+            files.insert("Gemfile.lock".to_string(), lock.to_string());
+            let r = rewrite_registry_redirect(&files, &[gem_override("vuln-gem", "1.0.0")]);
+            assert!(
+                !warning_codes(&r).contains(&"redirect_gem_unrecognized_declaration"),
+                "{decl:?}: {:?}",
+                r.warnings
+            );
+            let out = r.files.get("Gemfile").expect("declaration rewritten");
+            let want = if opts.is_empty() {
+                "  gem \"vuln-gem\", \"1.0.0\"\nend".to_string()
+            } else {
+                format!("  gem \"vuln-gem\", \"1.0.0\", {opts}\nend")
+            };
+            assert!(out.contains(&want), "{decl:?}: {out}");
+        }
+    }
+
     /// #482: a DIRECT dependency the root Gemfile declares out of the
     /// rewriter's sight (`eval_gemfile`, a loop) is listed under the lock's
     /// DEPENDENCIES. Appending a source block for it declares it twice and
@@ -13643,6 +14179,10 @@ mod tests {
             "a bundled skip is a MATCH — not-found must stay quiet: {:?}",
             r.warnings
         );
+        assert!(
+            r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+            "#325: the skipped bundled copy must keep the patch out of the in-run VEX"
+        );
     }
 
     /// #326: npm installs a git, remote-tarball or `file:` dependency from
@@ -14007,6 +14547,10 @@ mod tests {
             "partial coverage must be surfaced: {:?}",
             r.warnings
         );
+        assert!(
+            r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+            "#325: a redirected sibling must not let the in-run VEX attest the patch"
+        );
     }
 
     /// The v1/v2 legacy `dependencies` tree spells the bundled flag
@@ -14054,6 +14598,62 @@ mod tests {
             "legacy bundled skip must warn: {:?}",
             r.warnings
         );
+        assert!(
+            r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+            "#325: the legacy bundled skip must be recorded like `inBundle`"
+        );
+    }
+
+    /// A stale v2 legacy mirror is not the install tree. Its bundled flag
+    /// must not suppress in-run VEX for a normal `packages` entry; genuine
+    /// bundled entries in `packages` still suppress the same patch.
+    #[test]
+    fn npm_stale_legacy_bundled_mirror_does_not_contest_packages() {
+        for nested in [false, true] {
+            for actual_bundle in [false, true] {
+                let bundled = json!({"version": "1.3.0", "bundled": true});
+                let legacy = if nested {
+                    json!({"parent": {"version": "2.0.0", "dependencies": {"left-pad": bundled}}})
+                } else {
+                    json!({"left-pad": bundled})
+                };
+                let mut lock = json!({
+                    "lockfileVersion": 2,
+                    "packages": {
+                        "": {"name": "app", "version": "1.0.0"},
+                        "node_modules/left-pad": {
+                            "version": "1.3.0",
+                            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                            "integrity": "sha512-UPSTREAM=="
+                        }
+                    },
+                    "dependencies": legacy
+                });
+                if actual_bundle {
+                    lock["packages"]["node_modules/parent/node_modules/left-pad"] =
+                        json!({"version": "1.3.0", "inBundle": true});
+                }
+                let files = BTreeMap::from([("package-lock.json".into(), lock.to_string())]);
+                let overrides = vec![npm_override(
+                    "left-pad",
+                    "1.3.0",
+                    "http://patch.test/lp.tgz",
+                    "sha512-PATCHED==",
+                )];
+                let r = rewrite_registry_redirect(&files, &overrides);
+                assert_eq!(
+                    r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+                    actual_bundle,
+                    "nested mirror={nested}, actual bundled install={actual_bundle}"
+                );
+                let out: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+                assert_eq!(
+                    out["packages"]["node_modules/left-pad"]["resolved"],
+                    "http://patch.test/lp.tgz"
+                );
+                assert_eq!(out["dependencies"], lock["dependencies"]);
+            }
+        }
     }
 
     /// An alias install (`npm i my-alias@npm:left-pad@1.3.0`) keys the lock
@@ -17802,6 +18402,142 @@ packages:
         assert_eq!(r.edits.iter().filter(|e| e.path == "yarn.lock").count(), 1);
     }
 
+    /// #697: a platform-conditional entry yarn reached only through
+    /// `optionalDependencies` has no `checksum:` line. The hosted pin adds
+    /// one where yarn writes it — after the dependency maps and `bin:`,
+    /// before `conditions:` — never straight after `resolution:`.
+    #[test]
+    fn issue_697_checksum_lands_in_yarn_field_order() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("@img/sharp-linux-x64", "sharp-linux-x64", "0.33.5");
+        let ovr = DepOverride {
+            namespace: Some("@img".into()),
+            ..berry_override("sharp-linux-x64", "0.33.5", &url, &checksum)
+        };
+        let lock = "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                    \"@img/sharp-linux-x64@npm:0.33.5\":\n  version: 0.33.5\n  \
+                    resolution: \"@img/sharp-linux-x64@npm:0.33.5\"\n  dependencies:\n    \
+                    \"@img/sharp-libvips-linux-x64\": \"npm:1.0.4\"\n  dependenciesMeta:\n    \
+                    \"@img/sharp-libvips-linux-x64\":\n      optional: true\n  \
+                    conditions: os=linux & cpu=x64 & libc=glibc\n  languageName: node\n  \
+                    linkType: hard\n";
+        let files = berry_files(lock.to_string(), berry_manifest());
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = &r.files["yarn.lock"];
+        assert!(
+            out.contains(&format!(
+                "\n\"@img/sharp-linux-x64@{url}\":\n  version: 0.33.5\n  \
+                 resolution: \"@img/sharp-linux-x64@{url}\"\n  dependencies:\n    \
+                 \"@img/sharp-libvips-linux-x64\": \"npm:1.0.4\"\n  dependenciesMeta:\n    \
+                 \"@img/sharp-libvips-linux-x64\":\n      optional: true\n  \
+                 checksum: {checksum}\n  conditions: os=linux & cpu=x64 & libc=glibc\n  \
+                 languageName: node\n  linkType: hard\n"
+            )),
+            "checksum between dependenciesMeta and conditions: {out}"
+        );
+    }
+
+    /// #718: yarn builds a tarball-locator entry from the served tarball's
+    /// own package.json, whose `bin` keeps the published spelling
+    /// (`./dist/bin/uuid`), while the registry entry the pin started from
+    /// carries the registry's normalized `dist/bin/uuid`. With the served
+    /// manifest in hand the pin writes the tarball's `bin:`, or hardened
+    /// installs (`--refresh-lockfile`) fail YN0028.
+    #[test]
+    fn issue_718_bin_comes_from_the_served_tarball_manifest() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("uuid", "uuid", "9.0.1");
+        let ovr = berry_override("uuid", "9.0.1", &url, &checksum);
+        let lock = format!(
+            "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"uuid@npm:^9.0.0\":\n  version: 9.0.1\n  resolution: \"uuid@npm:9.0.1\"\n  \
+             bin:\n    uuid: dist/bin/uuid\n  checksum: 10c0/{}\n  languageName: node\n  \
+             linkType: hard\n",
+            "3".repeat(128)
+        );
+        let files = berry_files(lock, berry_manifest());
+        let mut manifests = BTreeMap::new();
+        manifests.insert(
+            url.clone(),
+            r#"{"name":"uuid","version":"9.0.1","bin":{"uuid":"./dist/bin/uuid"}}"#.to_string(),
+        );
+        let r = rewrite_registry_redirect_with_python_metadata(
+            &files,
+            std::slice::from_ref(&ovr),
+            &manifests,
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = &r.files["yarn.lock"];
+        assert!(
+            out.contains(&format!(
+                "\n\"uuid@{url}\":\n  version: 9.0.1\n  resolution: \"uuid@{url}\"\n  \
+                 bin:\n    uuid: ./dist/bin/uuid\n  checksum: {checksum}\n  languageName: node\n"
+            )),
+            "bin map from the served manifest: {out}"
+        );
+
+        // A string `bin` names the package itself (scope dropped), and a
+        // manifest without `bin` drops the registry's map entirely.
+        let mut manifests = BTreeMap::new();
+        manifests.insert(
+            url.clone(),
+            r#"{"name":"uuid","version":"9.0.1","bin":"./cli.js"}"#.to_string(),
+        );
+        let r = rewrite_registry_redirect_with_python_metadata(
+            &files,
+            std::slice::from_ref(&ovr),
+            &manifests,
+        );
+        assert!(
+            r.files["yarn.lock"].contains("\n  bin:\n    uuid: ./cli.js\n  checksum:"),
+            "{}",
+            r.files["yarn.lock"]
+        );
+        manifests.insert(
+            url.clone(),
+            r#"{"name":"uuid","version":"9.0.1"}"#.to_string(),
+        );
+        let r = rewrite_registry_redirect_with_python_metadata(
+            &files,
+            std::slice::from_ref(&ovr),
+            &manifests,
+        );
+        assert!(
+            !r.files["yarn.lock"].contains("bin:"),
+            "{}",
+            r.files["yarn.lock"]
+        );
+    }
+
+    /// Only an entry the berry pin would re-key, with a `bin:` map, needs the
+    /// served manifest: a fork alias (`left-pad@npm:other@…`) at the same
+    /// version never queues a fetch whose failure would drop the patch.
+    #[test]
+    fn berry_pin_needs_manifest_only_for_entries_the_pin_rekeys() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("uuid", "uuid", "9.0.1");
+        let dep = berry_override("uuid", "9.0.1", &url, &checksum);
+        let entry = |key: &str, bin: bool| {
+            format!(
+                "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n{key}:\n  version: 9.0.1\n  \
+                 resolution: \"x\"\n{}  languageName: node\n  linkType: hard\n",
+                if bin { "  bin:\n    uuid: dist/bin/uuid\n" } else { "" }
+            )
+        };
+        let needs = |lock: String| berry_pin_needs_manifest(&berry_bin_entries(&lock), &dep);
+        assert!(needs(entry("\"uuid@npm:^9.0.0\"", true)));
+        assert!(needs(entry("\"uuid@npm:^9.0.0, uuid@npm:^9.0.1\"", true)));
+        assert!(needs(entry(&format!("\"uuid@{url}\""), true)));
+        assert!(!needs(entry("\"uuid@npm:^9.0.0\"", false)));
+        assert!(!needs(entry("\"uuid@npm:other-uuid@^9.0.0\"", true)));
+        assert!(!needs(entry("\"uuid@npm:^9.0.0, other@npm:^1.0.0\"", true)));
+        assert!(!needs(entry("\"uuid@patch:uuid@npm%3A9.0.1#x\"", true)));
+        assert!(!needs(entry("\"uuid@https://mirror.example/uuid-9.0.1.tgz\"", true)));
+        // Another version of the package (`9.0.10` shares the prefix).
+        assert!(!needs(entry("\"uuid@npm:^9.0.0\"", true).replace("9.0.1\n", "9.0.10\n")));
+    }
+
     /// A bun URL 3-tuple already at the CURRENT artifact URL but with a stale
     /// integrity (a patch republish rotating only the hash) is refreshed in
     /// place.
@@ -19567,5 +20303,155 @@ mod hosted_patch_uuid_tests {
     fn go_module_namespace_is_on_the_patch_server_host() {
         assert!(crate::vendor::go_mod_edit::HOSTED_GO_MODULE_PREFIX
             .starts_with(&format!("{SOCKET_PATCH_SERVER_HOST}/")));
+    }
+}
+
+/// #742 / #650: a superseding patch uuid for a package an earlier hosted
+/// scan already wired re-pins socket-patch's own source, end to end through
+/// the redirect planner, instead of warning "revert it" and leaving the old
+/// uuid in place.
+#[cfg(test)]
+mod superseding_repin_tests {
+    use super::*;
+
+    const HEX_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HEX_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn six(grant: &str, uuid: &str, sha256: &str) -> DepOverride {
+        DepOverride {
+            ecosystem: "pypi".into(),
+            name: "six".into(),
+            namespace: None,
+            version: "1.16.0".into(),
+            token: grant.into(),
+            patch_uuid: uuid.into(),
+            artifact_url: format!(
+                "https://patch.socket.dev/patch/pypi/six/1.16.0/{grant}/{uuid}/six-1.16.0-py2.py3-none-any.whl"
+            ),
+            registry_override: None,
+            integrity: Integrity {
+                sha256: Some(sha256.into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn first() -> DepOverride {
+        six(
+            "11111111-1111-4111-8111-111111111111",
+            "aaaaaaaa-0000-4000-8000-000000000001",
+            HEX_A,
+        )
+    }
+
+    fn second() -> DepOverride {
+        six(
+            "22222222-2222-4222-8222-222222222222",
+            "aaaaaaaa-0000-4000-8000-000000000004",
+            HEX_B,
+        )
+    }
+
+    /// Run the planner and fold its rewrites over `files`.
+    fn scan(
+        files: &BTreeMap<String, String>,
+        dep: &DepOverride,
+    ) -> (BTreeMap<String, String>, RewriteResult) {
+        let result = rewrite_registry_redirect(files, std::slice::from_ref(dep));
+        let mut out = files.clone();
+        out.extend(result.files.clone());
+        (out, result)
+    }
+
+    fn assert_repinned(files: &BTreeMap<String, String>, result: &RewriteResult) {
+        assert!(
+            result.warnings.is_empty(),
+            "superseding patch refused: {:?}",
+            result.warnings
+        );
+        for (path, text) in files {
+            assert!(
+                !text.contains(&first().patch_uuid),
+                "{path} kept the old uuid:\n{text}"
+            );
+        }
+        let joined: String = files.values().cloned().collect();
+        assert!(joined.contains(&second().patch_uuid));
+    }
+
+    #[test]
+    fn uv_project_repins_to_a_superseding_patch() {
+        let lock = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\ndependencies = [{ name = \"six\" }]\n\n[package.metadata]\nrequires-dist = [{ name = \"six\", specifier = \"==1.16.0\" }]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" }]\n";
+        let project = "[project]\nname = \"app\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\"]\n";
+        for newline in ["\n", "\r\n"] {
+            let files: BTreeMap<String, String> = [
+                ("uv.lock".to_string(), lock.replace('\n', newline)),
+                ("pyproject.toml".to_string(), project.replace('\n', newline)),
+            ]
+            .into_iter()
+            .collect();
+            let (wired, result) = scan(&files, &first());
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert!(wired["pyproject.toml"].contains(&first().artifact_url));
+            assert!(wired["uv.lock"].contains(&first().artifact_url));
+            let (repinned, result) = scan(&wired, &second());
+            assert_repinned(&repinned, &result);
+            assert!(result
+                .confirmed_python_lock_uuids
+                .contains(&second().patch_uuid));
+            assert!(repinned["uv.lock"].contains(&format!("sha256:{HEX_B}")));
+            assert!(!repinned["uv.lock"].contains(HEX_A));
+            assert_eq!(repinned["uv.lock"].contains('\r'), newline == "\r\n");
+            // The re-pinned project is settled.
+            let (_, again) = scan(&repinned, &second());
+            assert!(again.files.is_empty() && again.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn uv_script_lock_repins_to_a_superseding_patch() {
+        let script = "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"six==1.16.0\"]\n# ///\nimport six\n";
+        let lock = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{ name = \"six\", specifier = \"==1.16.0\" }]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" }]\n";
+        let files: BTreeMap<String, String> = [
+            ("tool.py".to_string(), script.to_string()),
+            ("tool.py.lock".to_string(), lock.to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let (wired, result) = scan(&files, &first());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(wired["tool.py"].contains(&first().artifact_url));
+        let (repinned, result) = scan(&wired, &second());
+        assert_repinned(&repinned, &result);
+        assert!(repinned["tool.py.lock"].contains(&second().artifact_url));
+    }
+
+    #[test]
+    fn hatch_project_repins_to_a_superseding_patch() {
+        let project = "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n\n[tool.hatch.envs.default]\ndependencies = [\"six==1.16.0\"]\n";
+        let files: BTreeMap<String, String> = [("pyproject.toml".to_string(), project.to_string())]
+            .into_iter()
+            .collect();
+        let (wired, result) = scan(&files, &first());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(
+            wired["pyproject.toml"]
+                .matches(&first().artifact_url)
+                .count(),
+            2
+        );
+        let (repinned, result) = scan(&wired, &second());
+        assert_repinned(&repinned, &result);
+        assert!(result.confirmed_hatch_uuids.contains(&second().patch_uuid));
+        let pyproject = &repinned["pyproject.toml"];
+        assert_eq!(
+            pyproject
+                .matches(&format!("{}#sha256={HEX_B}", second().artifact_url))
+                .count(),
+            2,
+            "{pyproject}"
+        );
+        let (_, again) = scan(&repinned, &second());
+        assert!(again.files.is_empty() && again.warnings.is_empty());
     }
 }

@@ -1476,7 +1476,13 @@ async fn scan_hosted_paths_run_once_per_project_directory() {
         let header = format!("== {} ==", Path::new("apps").join(app).display());
         assert!(stdout.contains(&header), "missing {header:?}: {stdout}");
     }
-    assert_eq!(stdout.matches("Switched 0 packages to hosted patches").count(), 2, "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("Switched 0 packages to hosted patches")
+            .count(),
+        2,
+        "{stdout}"
+    );
     let reqs = recorded(&mock).await;
     assert_eq!(batch_bodies(&reqs).len(), 2, "one discovery per directory");
 }
@@ -1915,7 +1921,6 @@ mod pty {
             screen.join("\n")
         );
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -2262,10 +2267,195 @@ fn scan_mode_conflict_error_is_capitalized_and_names_no_hidden_flag() {
     assert!(!stderr.contains("--redirect"), "{stderr:?}");
 }
 
-/// A selection the manifest already records at the same uuid is not
-/// offered again (it would only be downloaded to be skipped).
+/// Mount batch, by-package and view endpoints for two patched packages
+/// (each `index.js` goes from `before\n` to `after\n`).
+async fn mount_two_patch_api(mock: &MockServer, pkgs: &[(&str, &str)], before: &[u8]) {
+    let patches = |purl: &str, uuid: &str| {
+        serde_json::json!({
+            "purl": purl,
+            "patches": [{
+                "uuid": uuid, "purl": purl, "tier": "free",
+                "cveIds": [], "ghsaIds": [], "severity": "high",
+                "title": "covgap test patch"
+            }]
+        })
+    };
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": pkgs.iter().map(|(p, u)| patches(p, u)).collect::<Vec<_>>(),
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+    for (purl, uuid) in pkgs {
+        mount_by_package(mock, purl, uuid, serde_json::json!({})).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{uuid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": uuid,
+                "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "files": {
+                    "package/index.js": {
+                        "beforeHash": git_sha256(before),
+                        "afterHash": git_sha256(b"after\n"),
+                        "blobContent": "YWZ0ZXIK",
+                    }
+                },
+                "vulnerabilities": {},
+                "description": "Covgap test patch",
+                "license": "MIT",
+                "tier": "free",
+            })))
+            .mount(mock)
+            .await;
+    }
+}
+
+/// #732: a human-output `scan --mode agent` / `scan --sync` re-applies a
+/// patch the manifest already records once a reinstall has put the
+/// pristine bytes back (the `--json` path has done so since #454).
 #[tokio::test]
-async fn scan_human_does_not_offer_an_already_recorded_patch() {
+async fn scan_human_reapplies_an_already_recorded_patch_after_reinstall() {
+    for flags in [&["--mode", "agent"][..], &["--sync"][..]] {
+        let mock = MockServer::start().await;
+        let purl = "pkg:npm/minimist@1.2.2";
+        let before = b"before\n";
+        mount_one_patch_api(&mock, purl, before).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "minimist", "1.2.2", before);
+        let index = tmp.path().join("node_modules/minimist/index.js");
+
+        let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), flags);
+        assert_eq!(code, 0, "flags={flags:?}: stdout={stdout}; stderr={stderr}");
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            b"after\n",
+            "flags={flags:?}"
+        );
+
+        // `npm ci` / `rm -rf node_modules && npm install`.
+        std::fs::write(&index, before).unwrap();
+
+        let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), flags);
+        assert_eq!(code, 0, "flags={flags:?}: stdout={stdout}; stderr={stderr}");
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            b"after\n",
+            "flags={flags:?}: the recorded patch must be re-applied; stdout={stdout}; stderr={stderr}"
+        );
+        assert!(
+            stdout.contains(&format!("[re-apply] {purl} (already recorded: 11111111)")),
+            "flags={flags:?}: {stdout:?}"
+        );
+        assert!(
+            !stdout.contains("run `socket-patch apply` to re-apply them"),
+            "flags={flags:?}: {stdout:?}"
+        );
+        let manifest =
+            std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).expect("manifest");
+        let v: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        assert_eq!(v["patches"][purl]["uuid"], UUID, "flags={flags:?}: {v}");
+    }
+}
+
+/// #732: when a run also has a new patch, the recorded-but-reverted one
+/// is re-applied alongside it rather than dropped from the selection.
+#[tokio::test]
+async fn scan_human_reapplies_recorded_patch_alongside_a_new_one() {
+    const UUID_B: &str = "22222222-2222-4222-8222-222222222222";
+    let a = "pkg:npm/minimist@1.2.2";
+    let b = "pkg:npm/left-pad@1.3.0";
+    let before = b"before\n";
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2", before);
+    write_npm_package(tmp.path(), "left-pad", "1.3.0", before);
+    let index_a = tmp.path().join("node_modules/minimist/index.js");
+    let index_b = tmp.path().join("node_modules/left-pad/index.js");
+
+    // First run: only `a` has a patch.
+    let first = MockServer::start().await;
+    mount_two_patch_api(&first, &[(a, UUID)], before).await;
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &first.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert_eq!(std::fs::read(&index_a).unwrap(), b"after\n");
+    assert_eq!(std::fs::read(&index_b).unwrap(), before);
+
+    // Reinstall, then a patch for `b` is published.
+    std::fs::write(&index_a, before).unwrap();
+    let second = MockServer::start().await;
+    mount_two_patch_api(&second, &[(a, UUID), (b, UUID_B)], before).await;
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &second.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert_eq!(
+        std::fs::read(&index_b).unwrap(),
+        b"after\n",
+        "new patch applied; stdout={stdout}; stderr={stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&index_a).unwrap(),
+        b"after\n",
+        "recorded patch re-applied; stdout={stdout}; stderr={stderr}"
+    );
+    assert!(stdout.contains("Patches to apply:"), "{stdout:?}");
+    assert!(
+        stdout.contains(&format!("[re-apply] {a} (already recorded: 11111111)")),
+        "{stdout:?}"
+    );
+}
+
+/// `--dry-run` stays a non-mutating preview: an already-recorded
+/// selection is neither downloaded nor re-applied, and the message says a
+/// wet run re-applies it.
+#[tokio::test]
+async fn scan_human_dry_run_previews_reapply_of_a_recorded_patch() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+    mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+    seed_manifest(tmp.path(), &[(purl, UUID)]);
+    let manifest_before = std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap();
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--dry-run"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.contains(&format!("[skip] {purl} (already recorded: 11111111)")),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.contains("a run without --dry-run re-applies them"),
+        "{stdout:?}"
+    );
+    assert!(!stdout.contains("Patches to apply:"), "{stdout:?}");
+    assert_eq!(
+        view_gets(&recorded(&mock).await),
+        0,
+        "nothing is downloaded"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/minimist/index.js")).unwrap(),
+        b"x\n"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap(),
+        manifest_before
+    );
+}
+
+/// A report-only `scan --prune --dry-run` never applies, so it must not say that
+/// dropping `--dry-run` re-applies a recorded patch; it points at
+/// `socket-patch apply` instead.
+#[tokio::test]
+async fn scan_report_only_dry_run_points_recorded_patch_at_apply() {
     let mock = MockServer::start().await;
     let purl = "pkg:npm/minimist@1.2.2";
     mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
@@ -2276,22 +2466,20 @@ async fn scan_human_does_not_offer_an_already_recorded_patch() {
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
     seed_manifest(tmp.path(), &[(purl, UUID)]);
 
-    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--yes"]);
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--prune", "--dry-run"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
         stdout.contains(&format!("[skip] {purl} (already recorded: 11111111)")),
         "{stdout:?}"
     );
     assert!(
-        stdout.contains("All selected patches are already recorded in the manifest"),
+        !stdout.contains("a run without --dry-run re-applies them"),
         "{stdout:?}"
     );
-    assert!(!stdout.contains("Patches to apply:"), "{stdout:?}");
-    assert!(!stderr.contains("Download and apply"), "{stderr:?}");
+    assert!(!stdout.contains("[re-apply]"), "{stdout:?}");
     assert_eq!(
-        view_gets(&recorded(&mock).await),
-        0,
-        "nothing is downloaded"
+        std::fs::read(tmp.path().join("node_modules/minimist/index.js")).unwrap(),
+        b"x\n"
     );
 }
 

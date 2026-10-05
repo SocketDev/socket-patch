@@ -133,6 +133,13 @@ pub static ALL: &[Pm] = &[
         build: npm::build_bun,
     },
     Pm {
+        name: "bun-isolated",
+        description: "bun (text bun.lock v1, isolated node_modules/.bun store)",
+        packages: 3000,
+        patched: 60,
+        build: npm::build_bun_isolated,
+    },
+    Pm {
         name: "vlt",
         description: "vlt (vlt-lock.json v1, node_modules/.vlt store)",
         packages: 1500,

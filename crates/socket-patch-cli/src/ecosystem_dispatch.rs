@@ -1705,15 +1705,16 @@ mod tests {
             find_packages_for_rollback_reusing(&partitioned, &options, true, Some(&snapshot)).await;
         assert_eq!(reused, crawled);
         assert!(crawled.contains_key("pkg:npm/baz@3.0.0"), "{crawled:?}");
+        // The resolver finds the alias install itself (#356).
+        let left_pad = "pkg:npm/left-pad@1.3.0".to_string();
+        assert_eq!(crawled.get(&left_pad), Some(&root.join("node_modules/lp")));
 
         let missing: Vec<&String> = purls.iter().filter(|p| !crawled.contains_key(*p)).collect();
-        assert!(
-            missing.iter().any(|p| p.contains("left-pad")),
-            "{missing:?}"
-        );
-        let by_crawl = npm_paths_by_identity(&options, &missing).await;
+        assert_eq!(missing, vec!["pkg:npm/absent@9.9.9"]);
+        let lookup: Vec<&String> = missing.into_iter().chain([&left_pad]).collect();
+        let by_crawl = npm_paths_by_identity(&options, &lookup).await;
         let by_snapshot =
-            npm_paths_by_identity_in(snapshot.packages_for(&options).unwrap(), &missing);
+            npm_paths_by_identity_in(snapshot.packages_for(&options).unwrap(), &lookup);
         assert_eq!(by_snapshot, by_crawl);
         assert_eq!(
             by_crawl.get("pkg:npm/left-pad@1.3.0"),

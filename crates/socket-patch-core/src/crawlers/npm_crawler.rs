@@ -41,6 +41,11 @@ const SKIP_DIRS: &[&str] = &[
 ///   store and the projects' own `node_modules` hold only links to their
 ///   direct deps.
 ///
+/// - pnpm's `modulesDir` (see [`pnpm_modules_dirs`]): pnpm installs the
+///   project there instead of `node_modules`, and from pnpm 10.12 its
+///   virtual store follows (`<modulesDir>/.pnpm`), so nothing of the
+///   install is under a dir named `node_modules` (#661).
+///
 /// Only existing directories are returned.
 pub(super) fn configured_install_roots(start_path: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
@@ -50,8 +55,111 @@ pub(super) fn configured_install_roots(start_path: &Path) -> Vec<PathBuf> {
     if start_path.join("rush.json").is_file() {
         roots.push(start_path.join("common").join("temp").join("node_modules"));
     }
+    roots.extend(pnpm_modules_dirs(start_path));
     roots.retain(|root| root.is_dir());
+    let mut seen = HashSet::new();
+    roots.retain(|root| seen.insert(root.clone()));
     roots
+}
+
+/// The project's pnpm `modulesDir` install roots, other than
+/// `node_modules` itself:
+/// - the configured setting ([`pnpm_modules_dir_setting`]), resolved
+///   against the project like pnpm does, and honored only strictly inside
+///   it (the value comes from the scanned project and names a tree apply
+///   WRITES into; see [`resolve_modules_folder`]);
+/// - any direct child dir holding pnpm's `.modules.yaml` install record,
+///   which pnpm writes into whatever modules dir it used. That finds an
+///   install whose `modulesDir` came from pnpm's global config or the
+///   environment, which the project's files do not show.
+fn pnpm_modules_dirs(start_path: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) =
+        pnpm_modules_dir_setting(start_path).and_then(|raw| resolve_modules_folder(&[], &raw))
+    {
+        dirs.push(start_path.join(dir));
+    }
+    let Some((entries, _)) = read_dir_entries_sync(start_path) else {
+        return dirs;
+    };
+    for entry in entries {
+        let name = entry.file_name();
+        if name == OsStr::new("node_modules") || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let dir = start_path.join(name);
+        if std::fs::symlink_metadata(dir.join(PNPM_MODULES_YAML)).is_ok_and(|m| m.is_file()) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// The raw pnpm `modulesDir` setting that applies to the project at
+/// `start_path`: `modulesDir:` in the nearest `pnpm-workspace.yaml` at or
+/// above it (the workspace's settings file on pnpm 10+, which wins over
+/// `.npmrc`), else `modules-dir` from the nearest `.npmrc` at or above it
+/// that sets it (pnpm up to 10). Read with
+/// [`crate::utils::fs::read_regular_to_string_sync`]: the files belong to
+/// the (untrusted) project.
+fn pnpm_modules_dir_setting(start_path: &Path) -> Option<String> {
+    let read = |path: PathBuf| crate::utils::fs::read_regular_to_string_sync(&path).ok();
+    let from_workspace = start_path
+        .ancestors()
+        .find_map(|dir| read(dir.join("pnpm-workspace.yaml")))
+        .and_then(|yaml| {
+            crate::utils::serde::strip_bom(&yaml)
+                .lines()
+                .filter_map(crate::formats::pnpm::workspace::top_level_key)
+                .rfind(|(key, _)| key == "modulesDir")
+                .map(|(_, value)| unquote_yaml_scalar(value))
+        });
+    from_workspace
+        .or_else(|| {
+            start_path.ancestors().find_map(|dir| {
+                let npmrc = read(dir.join(".npmrc"))?;
+                crate::patch::redirect::npmrc::npmrc_top_level_value(&npmrc, "modules-dir")
+            })
+        })
+        .filter(|value| !value.is_empty())
+}
+
+/// A YAML flow scalar's value: quotes removed (`''` is a literal quote
+/// inside single quotes), a plain scalar as is.
+fn unquote_yaml_scalar(raw: &str) -> String {
+    if raw.starts_with('"') {
+        if let Ok(value) = serde_json::from_str::<String>(raw) {
+            return value;
+        }
+    } else if let Some(inner) = raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        return inner.replace("''", "'");
+    }
+    raw.to_string()
+}
+
+/// Whether the installed pnpm tree of the project at `project` keeps its
+/// virtual store where the crawler does not look: a `.modules.yaml` in
+/// `node_modules` or a pnpm modules dir ([`pnpm_modules_dirs`]) records a
+/// `virtualStoreDir` outside the project, as pnpm's global virtual store
+/// (`enableGlobalVirtualStore`) and a `virtualStoreDir` that climbs out
+/// do. Only direct deps are linked into the project then, so a package
+/// the crawler does not find may still be installed (as a transitive dep)
+/// and must not be read as absent (#696). `false` with no pnpm install.
+pub fn pnpm_store_outside_project(project: &Path) -> bool {
+    let mut modules_dirs = vec![project.join("node_modules")];
+    modules_dirs.extend(pnpm_modules_dirs(project));
+    modules_dirs.iter().any(|nm| {
+        let Ok(text) = crate::utils::fs::read_regular_to_string_sync(&nm.join(PNPM_MODULES_YAML))
+        else {
+            return false;
+        };
+        let Some(recorded) = parse_modules_yaml_virtual_store_dir(&text) else {
+            return false;
+        };
+        let importer = normalize_lexically(project);
+        let store = normalize_lexically(&nm.join(recorded));
+        store_below_importer(&importer, &store).is_none()
+    })
 }
 
 /// Append the `configured` roots to the walk's `walked` roots. A walked
@@ -1396,7 +1504,7 @@ impl NpmCrawler {
     ) -> ResolverVisit {
         let listing = list_dir_sync(&nm_path);
         let probe_filter = ProbeFilter::new(&listing);
-        let matched = pending
+        let mut matched: Vec<(usize, PathBuf)> = pending
             .iter()
             .enumerate()
             .filter_map(|(index, target)| {
@@ -1421,6 +1529,9 @@ impl NpmCrawler {
                     .then_some((index, pkg_path))
             })
             .collect();
+        if !store_entry {
+            matched.extend(Self::alias_copies(&nm_path, &listing, pending));
+        }
         let mut nested = Self::collect_nested_node_modules(&nm_path, listing);
         if store_entry {
             nested.extend(own_package_nested_node_modules_sync(&nm_path));
@@ -1430,6 +1541,71 @@ impl NpmCrawler {
             matched,
             nested,
         }
+    }
+
+    /// The alias installs in an importer-tree `node_modules` that are copies
+    /// of a pending target: `"lp": "npm:left-pad@1.3.0"` puts the real
+    /// `left-pad@1.3.0` (its own `package.json` says so) at
+    /// `node_modules/lp`, and npm, yarn, Bun and pnpm's hoisted linker
+    /// all do this. `require('lp')` loads those bytes, so the dir is an
+    /// installed copy of `pkg:npm/left-pad@1.3.0` that apply must patch
+    /// and VEX must verify, beside any plain `node_modules/left-pad` copy.
+    ///
+    /// Only real package dirs count (links are dependency edges into a
+    /// store or into first-party source, never copies of their own), and
+    /// a dir whose name is its package's own name is the direct probe's
+    /// job, so it is skipped here: that keeps one physical dir from being
+    /// recorded twice through a case-insensitive lookup.
+    fn alias_copies(
+        nm_path: &Path,
+        listing: &Listing,
+        pending: &[Target],
+    ) -> Vec<(usize, PathBuf)> {
+        let mut by_identity: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+        for (index, target) in pending.iter().enumerate() {
+            by_identity
+                .entry((target.dir_key.as_str(), target.version.as_str()))
+                .or_default()
+                .push(index);
+        }
+        if by_identity.is_empty() {
+            return Vec::new();
+        }
+        let is_package_dir = |entry: &ListedEntry| {
+            !entry.name_str.starts_with('.')
+                && entry.name_str != "node_modules"
+                && entry.file_type.is_some_and(|ft| ft.is_dir())
+        };
+        let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+        for entry in listing.entries.iter().filter(|e| is_package_dir(e)) {
+            let entry_path = nm_path.join(&entry.name);
+            if entry.name_str.starts_with('@') {
+                for scoped in list_dir_sync(&entry_path).entries {
+                    if is_package_dir(&scoped) {
+                        candidates.push((
+                            format!("{}/{}", entry.name_str, scoped.name_str),
+                            entry_path.join(&scoped.name),
+                        ));
+                    }
+                }
+            } else {
+                candidates.push((entry.name_str.clone(), entry_path));
+            }
+        }
+        let mut found = Vec::new();
+        for (dir_key, pkg_path) in candidates {
+            let Some((name, version)) = read_package_json_sync(&pkg_path.join("package.json"))
+            else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case(&dir_key) {
+                continue;
+            }
+            if let Some(indices) = by_identity.get(&(name.as_str(), version.as_str())) {
+                found.extend(indices.iter().map(|&index| (index, pkg_path.clone())));
+            }
+        }
+        found
     }
 
     /// The `node_modules` dirs living one level below `nm_path` (inside each
@@ -3249,6 +3425,110 @@ mod tests {
         assert!(result.contains_key("pkg:npm/foo@1.0.0"));
         assert!(result.contains_key("pkg:npm/@types/node@20.0.0"));
         assert!(!result.contains_key("pkg:npm/not-installed@0.0.1"));
+    }
+
+    fn copy_paths(found: &HashMap<String, Vec<CrawledPackage>>, purl: &str) -> Vec<PathBuf> {
+        found
+            .get(purl)
+            .map(|copies| copies.iter().map(|c| c.path.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// #356: an npm alias (`"lp": "npm:left-pad@1.3.0"`) installs the real
+    /// `left-pad@1.3.0` at `node_modules/lp`. With no plain copy beside
+    /// it, that dir is the purl's only installed copy, so apply must not
+    /// report it `package_not_installed`.
+    #[tokio::test]
+    async fn find_by_purls_resolves_an_alias_only_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        write_pkg(&nm.join("lp"), "left-pad", "1.3.0");
+
+        let purl = "pkg:npm/left-pad@1.3.0".to_string();
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, std::slice::from_ref(&purl))
+            .await
+            .unwrap();
+        assert_eq!(copy_paths(&found, &purl), vec![nm.join("lp")]);
+        let copy = &found[&purl][0];
+        assert_eq!(
+            (copy.name.as_str(), copy.version.as_str()),
+            ("left-pad", "1.3.0")
+        );
+    }
+
+    /// #356: a plain copy plus an alias of the same `name@version` are two
+    /// copies of the purl. Resolving only the plain one left `require('lp')`
+    /// loading unpatched bytes while apply reported success and VEX
+    /// attested `not_affected`. The plain copy stays first.
+    #[tokio::test]
+    async fn find_by_purls_returns_alias_copies_beside_the_plain_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        write_pkg(&nm.join("left-pad"), "left-pad", "1.3.0");
+        write_pkg(&nm.join("lp"), "left-pad", "1.3.0");
+        // A nested alias under another package is a copy too.
+        write_pkg(&nm.join("host"), "host", "1.0.0");
+        write_pkg(&nm.join("host/node_modules/pad"), "left-pad", "1.3.0");
+        // Another version under an alias is not.
+        write_pkg(&nm.join("lp2"), "left-pad", "1.2.0");
+
+        let purl = "pkg:npm/left-pad@1.3.0".to_string();
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, std::slice::from_ref(&purl))
+            .await
+            .unwrap();
+        assert_eq!(
+            copy_paths(&found, &purl),
+            vec![
+                nm.join("left-pad"),
+                nm.join("lp"),
+                nm.join("host/node_modules/pad"),
+            ]
+        );
+    }
+
+    /// #356: a scoped alias dir (`"@x/pad": "npm:left-pad@1.3.0"`) and an
+    /// unscoped alias of a scoped package (`"sp": "npm:@s/pkg@2.0.0"`).
+    #[tokio::test]
+    async fn find_by_purls_resolves_scoped_alias_installs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        write_pkg(&nm.join("@x/pad"), "left-pad", "1.3.0");
+        write_pkg(&nm.join("sp"), "@s/pkg", "2.0.0");
+
+        let pad = "pkg:npm/left-pad@1.3.0".to_string();
+        let scoped = "pkg:npm/%40s/pkg@2.0.0".to_string();
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, &[pad.clone(), scoped.clone()])
+            .await
+            .unwrap();
+        assert_eq!(copy_paths(&found, &pad), vec![nm.join("@x/pad")]);
+        assert_eq!(copy_paths(&found, &scoped), vec![nm.join("sp")]);
+        let copy = &found[&scoped][0];
+        assert_eq!(copy.namespace.as_deref(), Some("@s"));
+        assert_eq!(copy.name, "pkg");
+    }
+
+    /// A link is a dependency edge (into a store, a workspace member or an
+    /// `npm link` target), never an alias copy of its own; pnpm's isolated
+    /// alias link resolves through the store entry instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn find_by_purls_does_not_take_a_link_as_an_alias_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        let elsewhere = tmp.path().join("src/left-pad");
+        write_pkg(&elsewhere, "left-pad", "1.3.0");
+        std::fs::create_dir_all(&nm).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, nm.join("lp")).unwrap();
+
+        let purl = "pkg:npm/left-pad@1.3.0".to_string();
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, std::slice::from_ref(&purl))
+            .await
+            .unwrap();
+        assert!(copy_paths(&found, &purl).is_empty());
     }
 
     /// Regression: the patches API serves scoped purls percent-encoded
@@ -5356,6 +5636,142 @@ mod tests {
             .await
             .unwrap();
         assert!(roots.is_empty(), "{roots:?}");
+    }
+
+    /// REGRESSION (#661, #696): pnpm's `modulesDir` (`modulesDir:` in
+    /// `pnpm-workspace.yaml`, `modules-dir=` in `.npmrc` up to pnpm 10)
+    /// renames `node_modules`, and from pnpm 10.12 the virtual store moves
+    /// with it to `<modulesDir>/.pnpm`. The walk only collects dirs named
+    /// `node_modules`, so agent mode read the install as absent and hosted
+    /// `vex` attested the lock over it. The configured dir is a crawl root,
+    /// as is a project child holding pnpm's `.modules.yaml` (a value from
+    /// pnpm's global config or the environment).
+    #[tokio::test]
+    async fn test_pnpm_modules_dir_is_a_crawl_root() {
+        let configs = [
+            ("pnpm-workspace.yaml", "modulesDir: deps\n"),
+            (
+                "pnpm-workspace.yaml",
+                "packages:\n  - packages/*\n'modulesDir' : \"./deps\" # moved\n",
+            ),
+            (".npmrc", "modules-dir=deps\n"),
+            ("deps/.modules.yaml", "{\"virtualStoreDir\": \".pnpm\"}"),
+        ];
+        for (file, text) in configs {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            std::fs::write(root.join("package.json"), r#"{"name":"app"}"#).unwrap();
+            let store_copy = root.join("deps/.pnpm/left-pad@1.3.0/node_modules/left-pad");
+            write_pkg(&store_copy, "left-pad", "1.3.0");
+            let crawler = NpmCrawler::new();
+            let options = local_options(root);
+            let has_left_pad = |pkgs: &[CrawledPackage]| {
+                pkgs.iter()
+                    .any(|p| p.purl == "pkg:npm/left-pad@1.3.0" && p.path == store_copy)
+            };
+            // Control: unconfigured, deps/ is not an install root.
+            assert!(!has_left_pad(&crawler.crawl_all(&options).await), "{file}");
+
+            std::fs::write(root.join(file), text).unwrap();
+            let roots = crawler.get_node_modules_paths(&options).await.unwrap();
+            assert_eq!(roots, vec![root.join("deps")], "{file}: {text}");
+            assert!(has_left_pad(&crawler.crawl_all(&options).await), "{file}");
+            let found = crawler
+                .find_by_purls(&root.join("deps"), &["pkg:npm/left-pad@1.3.0".to_string()])
+                .await
+                .unwrap();
+            assert_eq!(found.len(), 1, "{file}: {found:?}");
+        }
+    }
+
+    /// The `modulesDir` setting is read from the nearest
+    /// `pnpm-workspace.yaml` (pnpm resolves it against each project, so a
+    /// workspace member installs into its own `deps/`), wins over `.npmrc`,
+    /// and fails closed when it leaves the project.
+    #[test]
+    fn test_pnpm_modules_dir_setting_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let member = repo.join("packages/member");
+        std::fs::create_dir_all(member.join("deps")).unwrap();
+        std::fs::create_dir_all(member.join("lib")).unwrap();
+        std::fs::create_dir_all(repo.join("deps")).unwrap();
+        std::fs::write(repo.join("pnpm-workspace.yaml"), "modulesDir: deps\n").unwrap();
+        assert_eq!(configured_install_roots(&member), vec![member.join("deps")]);
+        assert_eq!(configured_install_roots(repo), vec![repo.join("deps")]);
+
+        std::fs::write(member.join(".npmrc"), "modules-dir=lib\n").unwrap();
+        assert_eq!(configured_install_roots(&member), vec![member.join("deps")]);
+        std::fs::write(repo.join("pnpm-workspace.yaml"), "packages: [packages/*]\n").unwrap();
+        assert_eq!(configured_install_roots(&member), vec![member.join("lib")]);
+
+        for outside in ["../deps", "/tmp/deps", "."] {
+            std::fs::write(member.join(".npmrc"), format!("modules-dir={outside}\n")).unwrap();
+            assert!(configured_install_roots(&member).is_empty(), "{outside}");
+        }
+    }
+
+    /// REGRESSION (#696): an installed pnpm tree whose virtual store pnpm
+    /// recorded OUTSIDE the project (the global virtual store, or a
+    /// `virtualStoreDir` that climbs out) holds copies the crawler never
+    /// sees, so "not found" there does not mean "not installed". A store
+    /// inside the project, or no install at all, is not such a blind spot.
+    #[test]
+    fn test_pnpm_store_outside_project() {
+        let outside = tempfile::tempdir().unwrap();
+        let shared: PathBuf = outside.path().components().collect();
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        assert!(!pnpm_store_outside_project(&root), "nothing installed");
+
+        let nm = root.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        assert!(!pnpm_store_outside_project(&root), "not a pnpm install");
+        let record = |dir: &Path, store: &str| {
+            let store = store.replace('\\', "\\\\");
+            std::fs::write(
+                dir.join(".modules.yaml"),
+                format!("{{\"virtualStoreDir\": \"{store}\"}}"),
+            )
+            .unwrap();
+        };
+        record(&nm, ".pnpm");
+        assert!(!pnpm_store_outside_project(&root), "default store");
+        std::fs::create_dir_all(root.join(".vstore")).unwrap();
+        record(&nm, "../.vstore");
+        assert!(
+            !pnpm_store_outside_project(&root),
+            "store inside the project"
+        );
+        record(&nm, &format!("{}", shared.join("v11/links").display()));
+        assert!(pnpm_store_outside_project(&root), "global virtual store");
+        record(&nm, "../../outside-vs");
+        assert!(
+            pnpm_store_outside_project(&root),
+            "virtualStoreDir climbs out"
+        );
+        std::fs::write(
+            nm.join(".modules.yaml"),
+            "layoutVersion: 5\nvirtualStoreDir: ../../outside-vs\n",
+        )
+        .unwrap();
+        assert!(pnpm_store_outside_project(&root), "YAML .modules.yaml");
+
+        // The same record under a configured `modulesDir`.
+        std::fs::remove_dir_all(&nm).unwrap();
+        std::fs::write(root.join("pnpm-workspace.yaml"), "modulesDir: deps\n").unwrap();
+        let deps = root.join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        record(&deps, ".pnpm");
+        assert!(
+            !pnpm_store_outside_project(&root),
+            "modulesDir default store"
+        );
+        record(&deps, "../../outside-vs");
+        assert!(
+            pnpm_store_outside_project(&root),
+            "modulesDir, store outside"
+        );
     }
 
     /// REVIEW (#520): `--install.modules-folder` wins over

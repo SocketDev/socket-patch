@@ -477,3 +477,96 @@ fn apply_and_rollback_reach_a_bundled_copy_beside_a_normal_install() {
         );
     }
 }
+
+/// #626: a `node_modules/<name>` link to first-party source (an npm
+/// workspace member, which a `file:` directory dependency lays out the
+/// same way) that shares a patched package's `name@version` is the user's
+/// own code, not an installed copy. Agent-mode apply (dry run included)
+/// and rollback refuse it with a diagnostic and never overwrite the fork,
+/// even though the default mismatch policy would otherwise replace it.
+#[cfg(unix)]
+#[test]
+fn apply_and_rollback_refuse_a_node_modules_link_to_first_party_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let name = "dupvuln";
+    let original = b"module.exports = function(){ return 'VULNERABLE'; };\n";
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"// SOCKET-PATCHED-MULTICOPY\n");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "ws-root", "version": "0.0.0", "private": true, "workspaces": ["packages/*"] }"#,
+    )
+    .unwrap();
+    let fork = b"module.exports = 'first-party fork';\n";
+    let fork_index = write_copy(&root.join("packages").join(name), name, "1.0.0", fork);
+    std::fs::create_dir_all(root.join("node_modules")).unwrap();
+    std::os::unix::fs::symlink(
+        format!("../packages/{name}"),
+        root.join("node_modules").join(name),
+    )
+    .unwrap();
+    stage_manifest_and_blob(
+        root,
+        "pkg:npm/dupvuln@1.0.0",
+        &git_sha256(original),
+        &git_sha256(&patched),
+        &patched,
+    );
+    std::fs::write(
+        root.join(".socket")
+            .join("blobs")
+            .join(git_sha256(original)),
+        original,
+    )
+    .unwrap();
+
+    let assert_refused = |code: i32, v: &serde_json::Value, stage: &str| {
+        assert_ne!(code, 0, "{stage}: must fail closed; envelope={v}");
+        assert!(
+            v.to_string().contains("outside every node_modules tree"),
+            "{stage}: the refusal must name the cause; envelope={v}"
+        );
+        assert_eq!(
+            std::fs::read(&fork_index).unwrap(),
+            fork,
+            "{stage}: the first-party fork was overwritten"
+        );
+    };
+
+    let out = Command::new(binary())
+        .args([
+            "apply",
+            "--json",
+            "--offline",
+            "--dry-run",
+            "--ecosystems",
+            "npm",
+            "--cwd",
+        ])
+        .arg(root)
+        .output()
+        .expect("run apply --dry-run");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("apply must emit JSON: {e}; stdout={stdout}"));
+    assert_refused(out.status.code().unwrap_or(-1), &v, "apply --dry-run");
+
+    let (code, v) = run_apply(root);
+    assert_refused(code, &v, "apply");
+
+    // A fork left patched by an apply from before the guard: rollback must
+    // not write the upstream original over it either.
+    std::fs::write(&fork_index, &patched).unwrap();
+    let (code, v) = run_rollback(root);
+    assert_ne!(code, 0, "rollback must fail closed; envelope={v}");
+    assert!(
+        v.to_string().contains("outside every node_modules tree"),
+        "rollback: envelope={v}"
+    );
+    assert_eq!(
+        std::fs::read(&fork_index).unwrap(),
+        patched,
+        "rollback wrote through the link"
+    );
+}

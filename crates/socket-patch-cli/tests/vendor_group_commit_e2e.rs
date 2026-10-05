@@ -113,12 +113,22 @@ fn group_commit_ends_where_per_package_commits_end_for_every_ecosystem() {
             masked_tree(&oracle.root),
             "{eco}: same tree after --revert"
         );
-        // Two ecosystems keep scaffolding their revert does not remove when
-        // TWO packages were vendored (the emptied pnpm override tables and
-        // workspace file; the catch-all `<packageSourceMapping>` nuget adds
-        // to a config that had none). That predates the group commit — the
-        // oracle leaves the same bytes, asserted just above — so only the
-        // others are held to a byte-exact round trip here.
+        // Two ecosystems do not round-trip byte for byte when TWO packages
+        // were vendored: pnpm rewrites the fixture's minified package.json
+        // with an indent, and nuget keeps the catch-all
+        // `<packageSourceMapping>` it adds to a config that had none. That
+        // predates the group commit — the oracle leaves the same bytes,
+        // asserted just above — so only the others are held to a
+        // byte-exact round trip here. pnpm's created scaffold itself is
+        // gone (#636): no emptied `pnpm.overrides`, no workspace file.
+        if *eco == "pnpm" {
+            assert!(
+                !grouped.root.join("pnpm-workspace.yaml").exists(),
+                "pnpm: the scaffolded workspace file is removed"
+            );
+            let pkg = std::fs::read_to_string(grouped.root.join("package.json")).unwrap();
+            assert!(!pkg.contains("\"pnpm\""), "pnpm: {pkg}");
+        }
         if !["pnpm", "nuget"].contains(eco) {
             let after = masked_tree(&grouped.root);
             assert!(
