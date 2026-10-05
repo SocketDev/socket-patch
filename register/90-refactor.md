@@ -1,17 +1,18 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-05T18:25Z · main @ a1d4260_
+_Last updated 2026-10-05T19:30Z · main @ 9c43dfc_
 
 **In flight:**
 - [#876](https://github.com/SocketDev/socket-patch/pull/876): registry clients (`build_registry_client`, Maven `fetch_registry_bytes`) built through one `registry_client_builder` under `ApiTimeouts`; `registry_fetch::download` onto `read_capped`. Also ports the base-red digest-ratchet fix for #646's JVM files. Issue #872 (C49). `ready`.
+- [#886](https://github.com/SocketDev/socket-patch/pull/886): one `utils::process::output_within` bounded spawn; `run_resolved` (every crawler probe) runs under `PROBE_TIMEOUT` (10 s), and the pipenv, hatch and self-update `sanity_exec` timeout blocks are deleted. Issue #845 slice 1 (C48). `ready`. Remaining: `vendor/npm_dir.rs` git exchange (wait for #837), async `CommandRunner`, `architecture_tests` guard.
 
 **Merged:**
 - [#870](https://github.com/SocketDev/socket-patch/pull/870): `go_mod_edit::module_path` on the shared directive walker reads the go.mod `module` directive for VEX `--product` (block form fixed); `go_crawler::parse_go_mod_module` and `product.rs`'s scanner deleted. Issue #781 (E19 Go half). Merged 2026-10-05 as `c644ab0`. Production ≈ +22 / −64, tests ≈ +65 / −117.
 - [#865](https://github.com/SocketDev/socket-patch/pull/865): `utils::digest` compute helpers; 4 private copies and the inline digest sites in 14 files deleted; ratchet for the 6 slice-2 files. Issue #706 slice 1 (C17). Merged 2026-10-05 as `1714299`. Production ≈ +45 / −105, tests ≈ +145 / −11.
 - [#858](https://github.com/SocketDev/socket-patch/pull/858): one blocking `stage_and_rename_blocking` core with a private `WriteOpts` policy behind the six `utils::fs` writers; `atomic_write_sync`'s copy and `create_stage`/`commit_stage` deleted; one `stage_path` builds `.socket-stage-` and `.socket-dl-` names. Issue #728 (C21). Production +171 / −168, tests ≈ +85 / −12. Merged 2026-10-05 as `ee8ebf4`.
 - [#850](https://github.com/SocketDev/socket-patch/pull/850): one hermetic `common/hermetic.rs` builder for CLI test children; 8 `scrub_socket_env` copies deleted, 7 unscrubbed spawners made hermetic, `spawn_env_hygiene` ratchet. Issue #823 slice 1 (C30, C47). Merged 2026-10-05 as `99f61d2`. Test-only: +745 / −322.
-- [#607](https://github.com/SocketDev/socket-patch/pull/607): blob and diff downloads stream to disk through `BinaryBody`; one `download_entries` loop replaces the blob and diff copies. Issue #571 (C37). Merged 2026-10-05 as `366b155`. Production ≈ +190 / −80 (`blob_fetcher.rs`, `client.rs`), tests ≈ +230.
-- [#602](https://github.com/SocketDev/socket-patch/pull/602): crawler project-tree reads go through `utils::fs::read_regular_*`, plus a `crawlers::architecture_tests` guard against bare reads. Issue #592 (E06). Merged 2026-10-05 as `2eae9a0`. Production +4 / −4, tests +241.
-- [#574](https://github.com/SocketDev/socket-patch/pull/574): one vlt `registry_base(era, segment, name, options)` for lock inventory and hosted restore, following vlt 1.3.5 DepID hydration (scoped registries, `~~` as `npm`, restore admission matching the rewrite). Issue #562 (E02, E03). Merged 2026-10-05 as `6ca92f5`.
+- [#607](https://github.com/SocketDev/socket-patch/pull/607): blob and diff downloads stream to disk through `BinaryBody`, one `download_entries` loop. Issue #571 (C37). Merged as `366b155`. Production ≈ +190 / −80, tests ≈ +230.
+- [#602](https://github.com/SocketDev/socket-patch/pull/602): crawler project-tree reads through `utils::fs::read_regular_*` plus a guard. Issue #592 (E06). Merged as `2eae9a0`. Production +4 / −4, tests +241.
+- [#574](https://github.com/SocketDev/socket-patch/pull/574): one vlt `registry_base` for lock inventory and hosted restore. Issue #562 (E02, E03). Merged as `6ca92f5`.
 - [#572](https://github.com/SocketDev/socket-patch/pull/572): one hosted-PyPI-URL recognizer for hosted and vendored Pipenv. Issues #563 (E04, E49). Production +31 / −48, tests +174 / −37 (approx.).
 - [#581](https://github.com/SocketDev/socket-patch/pull/581): one `ApiTimeouts` policy (10 s connect, 60 s idle read) on both `ApiClient` reqwest clients. Issue #570 (C02).
 
@@ -19,13 +20,13 @@ _Last updated 2026-10-05T18:25Z · main @ a1d4260_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by #690, #776, #825, #837 |
-| 2 | #856 (E62, child 1 of #855): VEX npm aliases through the core resolver | 1 | 1 | ≈1.8 | M | ≈5 | skipped: `vex_consumed.rs` changed by 9 open PRs |
-| 3 | #816 (E38): CLI `PRODUCT_MANIFESTS` copy → `ProductDetection.present` | 1 | 0 | ≈1 | L | ≈4 | skipped: `commands/vex.rs` changed by #684, #690, #700 |
-| 4 | #871: vendoring-service client out of `api/client.rs` into its own submodule (move only) | 0 | 1 | ≈0.5 | L | ≈2.5 | eligible since #865 merged |
-| 5 | #631 slice 1 (E52): delete `go_sum_edit` oracle-only free functions | 0 | 0 | ≈1.5 | L | ≈1.5 | eligible |
+| 1 | #845 slice 1 (C48): one bounded spawn for crawler probes, pipenv, hatch, self-update | 1 | 1 | ≈3 | M | ≈5 | taken: #886 |
+| 2 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by #690, #776, #825, #837 |
+| 3 | #856 (E62, child 1 of #855): VEX npm aliases through the core resolver | 1 | 1 | ≈1.8 | M | ≈5 | skipped: `vex_consumed.rs` changed by 6 open PRs |
+| 4 | #816 (E38): CLI `PRODUCT_MANIFESTS` copy → `ProductDetection.present` | 1 | 0 | ≈1 | L | ≈4 | skipped: `commands/vex.rs` changed by #684, #690, #700 |
+| 5 | #871: vendoring-service client out of `api/client.rs` into its own submodule (move only) | 0 | 1 | ≈0.5 | L | ≈2.5 | eligible; next overlap-free candidate (then #631 slice 1, ≈1.5) |
 
-Re-ranked 2026-10-05T18:25Z: #872 won (p1, overlap-free once #865 merged; score ≈5.1) and is in #876. 1 of 3 slots used. With 17 open PRs, #773, #856 and #816 still overlap; #871 and #631 slice 1 are the best overlap-free candidates for the next run. Decisions (not candidates): #648, #704, #792, #808, #615; C07 needs an owner decision.
+Re-ranked 2026-10-05T19:00Z: #845 won (p1 hang; the slice bounds `run_resolved` in `utils/process.rs` so no crawler file that open PRs edit is touched) and is in #886. 2 of 3 slots used. Decisions (not candidates): #648, #704, #792, #808, #615; C07 needs an owner decision.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
@@ -55,3 +56,4 @@ Re-ranked 2026-10-05T18:25Z: #872 won (p1, overlap-free once #865 merged; score 
 - `vendor/berry_zip.rs`'s `berry_cache_checksum_10c0` has only test callers, so a helper used only there is dead code in the lib build.
 - #646 merged inline digests after the `utils::digest` ratchet, so `production_digests_go_through_the_helpers` failed on `main` @ `a1d4260`; #876 carries the fix (`gradle_cache.rs` added to `PENDING_INLINE_DIGESTS` because #690 edits it). Drop it from the list when #706 slice 2 migrates it.
 - A process-global `reqwest::Client` (`LazyLock`) is unsafe in core tests: pooled connections stay bound to the tokio runtime that opened them, and each `#[tokio::test]` has its own runtime. Build per call through a shared builder instead.
+- Probe spawns go through `utils::process::output_within` since #886 (blocking; async callers wrap it in `utils::fs::run_blocking`). It nulls stderr; don't add a new `tokio::time::timeout` + `kill_on_drop` site.
