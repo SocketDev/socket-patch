@@ -4239,15 +4239,20 @@ fn berry_resolutions_pin(
 /// `.yarnrc.yml` catalog that maps `name` to one of `ranges` (yarn's `npm:`
 /// spellings, as the lock keys them). A catalog range is normalized the way
 /// yarn normalizes a manifest range: one without a protocol is an `npm:`
-/// range. A `.yarnrc.yml` that is absent or not YAML has no catalogs (yarn
-/// itself refuses to run on one it cannot parse).
+/// range. Yarn reads `.yarnrc.yml` with the failsafe schema, so an unquoted
+/// range is its source text (`1.10` stays `1.10`, never the number `1.1`):
+/// the catalog tables are deserialized as string tables, never
+/// type-inferred. A `.yarnrc.yml` that is absent, not YAML, or whose catalogs
+/// are not string tables has no catalogs (yarn itself refuses to run on one
+/// it cannot parse).
 fn berry_catalog_selectors(yarnrc: Option<&str>, name: &str, ranges: &[&str]) -> Vec<String> {
+    type Table = BTreeMap<String, Option<String>>;
     #[derive(serde::Deserialize, Default)]
     struct Catalogs {
         #[serde(default)]
-        catalog: Option<serde_json::Map<String, Value>>,
+        catalog: Option<Table>,
         #[serde(default)]
-        catalogs: Option<serde_json::Map<String, Value>>,
+        catalogs: Option<BTreeMap<String, Option<Table>>>,
     }
     let Some(rc) = yarnrc else {
         return Vec::new();
@@ -4257,14 +4262,13 @@ fn berry_catalog_selectors(yarnrc: Option<&str>, name: &str, ranges: &[&str]) ->
         return Vec::new();
     };
     let parsed = parsed.unwrap_or_default();
-    let pins = |table: Option<&serde_json::Map<String, Value>>| {
-        let range = match table.and_then(|t| t.get(name)) {
-            Some(Value::String(range)) => range.trim().to_string(),
-            Some(Value::Number(n)) => n.to_string(),
-            _ => return false,
+    let pins = |table: Option<&Table>| {
+        let Some(range) = table.and_then(|t| t.get(name)).and_then(Option::as_deref) else {
+            return false;
         };
+        let range = range.trim();
         let range = if range.contains(':') {
-            range
+            range.to_string()
         } else {
             format!("npm:{range}")
         };
@@ -4275,7 +4279,7 @@ fn berry_catalog_selectors(yarnrc: Option<&str>, name: &str, ranges: &[&str]) ->
         selectors.push(format!("{name}@catalog:"));
     }
     for (catalog, table) in parsed.catalogs.iter().flatten() {
-        if pins(table.as_object()) {
+        if pins(table.as_ref()) {
             selectors.push(format!("{name}@catalog:{catalog}"));
         }
     }
@@ -8621,6 +8625,31 @@ mod tests {
             );
             assert!(r.confirmed_yarn_berry_uuids.contains(&ovr.patch_uuid));
         }
+    }
+
+    /// Yarn reads `.yarnrc.yml` with the failsafe schema: an unquoted range
+    /// that looks like a number is its source text, so `1.10` must match the
+    /// lock's `npm:1.10` (not `npm:1.1`), and an integer, a null or a
+    /// non-string entry of another package must not hide the catalogs.
+    #[test]
+    fn yarn_berry_catalog_ranges_keep_their_source_text() {
+        let yarnrc = "nodeLinker: node-modules\npackageExtensions:\n  x@*:\n    \
+                      dependencies:\n      y: 1\ncatalog:\n  left-pad: 1.10\n  other: ~\n\
+                      catalogs:\n  ints:\n    left-pad: 2\n  nulls:\n  bare:\n    \
+                      left-pad: 1.10.0\n";
+        assert_eq!(
+            berry_catalog_selectors(Some(yarnrc), "left-pad", &["npm:1.10"]),
+            ["left-pad@catalog:"]
+        );
+        assert!(berry_catalog_selectors(Some(yarnrc), "left-pad", &["npm:1.1"]).is_empty());
+        assert_eq!(
+            berry_catalog_selectors(Some(yarnrc), "left-pad", &["npm:2", "npm:1.10.0"]),
+            ["left-pad@catalog:bare", "left-pad@catalog:ints"]
+        );
+        assert!(
+            berry_catalog_selectors(Some("catalog: [1, 2]\n"), "left-pad", &["npm:1"]).is_empty()
+        );
+        assert!(berry_catalog_selectors(Some(": : :"), "left-pad", &["npm:1"]).is_empty());
     }
 
     /// #632, workspace shape: the default catalog and a named one
