@@ -2294,6 +2294,144 @@ fn yarn_modules_folder_install_is_hash_verified_not_lockfile_attested() {
     );
 }
 
+/// A pnpm v9 lock whose only package, `left-pad@1.3.0`, is pinned to its
+/// hosted patch artifact.
+fn pnpm_lock_pinning_left_pad() -> String {
+    format!(
+        "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      left-pad:\n        \
+         specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n  left-pad@1.3.0:\n    \
+         resolution: {{integrity: {SRI}, tarball: {}}}\n\nsnapshots:\n  left-pad@1.3.0: {{}}\n",
+        hosted_npm_url("left-pad", "1.3.0", UUID)
+    )
+}
+
+/// REGRESSION (#696): pnpm 10.12+ with `modulesDir: deps` installs into
+/// `deps/.pnpm` and there is no `node_modules`. The crawler never looked
+/// there, so the unpatched installed copy read as "nothing installed" and
+/// the pinned hosted lock attested `not_affected`. Installed evidence
+/// wins: the copy is hash-checked and omitted. With nothing installed the
+/// lock basis still attests.
+#[test]
+fn pnpm_modules_dir_install_is_hash_verified_not_lockfile_attested() {
+    for (file, text) in [
+        ("pnpm-workspace.yaml", "modulesDir: deps\n"),
+        (".npmrc", "modules-dir=deps\n"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let purl = "pkg:npm/left-pad@1.3.0";
+        std::fs::write(
+            cwd.join("package.json"),
+            r#"{ "name": "app", "version": "1.0.0", "dependencies": { "left-pad": "1.3.0" } }"#,
+        )
+        .unwrap();
+        std::fs::write(cwd.join(file), text).unwrap();
+        std::fs::write(cwd.join("pnpm-lock.yaml"), pnpm_lock_pinning_left_pad()).unwrap();
+        let pkg = cwd.join("deps/.pnpm/left-pad@1.3.0/node_modules/left-pad");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{ "name": "left-pad", "version": "1.3.0" }"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), b"unpatched upstream bytes\n").unwrap();
+        let patched = b"hosted patched index\n";
+        let (_rt, server) = serve_patch_views(vec![(
+            UUID.to_string(),
+            left_pad_view(&compute_git_sha256_from_bytes(patched)),
+        )]);
+
+        let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+        assert_eq!(
+            code,
+            Some(1),
+            "{file}: the unpatched deps/.pnpm copy must not attest: {env}"
+        );
+        assert_eq!(skipped_reason(&env, purl), "hash_mismatch", "{file}: {env}");
+
+        std::fs::write(pkg.join("index.js"), patched).unwrap();
+        let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+        assert_eq!(code, Some(0), "{file}: a patched store copy attests: {env}");
+
+        std::fs::remove_dir_all(cwd.join("deps")).unwrap();
+        let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+        assert_eq!(
+            code,
+            Some(0),
+            "{file}: nothing installed: the lock basis attests: {env}"
+        );
+    }
+}
+
+/// REGRESSION (#696, follow-up variants): with pnpm's global virtual
+/// store, or a `virtualStoreDir` outside the project, a TRANSITIVE dep is
+/// installed only in that outside store, which the crawler does not walk.
+/// "Not found" then is not "not installed": the pinned lock must not
+/// attest over an install the crawler could not inspect. Without an
+/// install the lock basis still attests.
+#[test]
+fn pnpm_store_outside_project_is_not_lockfile_attested() {
+    let outside = tempfile::tempdir().unwrap();
+    let store = outside.path().join("v11/links");
+    let copy = store.join("@/left-pad/1.3.0/abc/node_modules/left-pad");
+    std::fs::create_dir_all(&copy).unwrap();
+    std::fs::write(
+        copy.join("package.json"),
+        r#"{ "name": "left-pad", "version": "1.3.0" }"#,
+    )
+    .unwrap();
+    std::fs::write(copy.join("index.js"), b"unpatched upstream bytes\n").unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let purl = "pkg:npm/left-pad@1.3.0";
+    std::fs::write(
+        cwd.join("package.json"),
+        r#"{ "name": "app", "version": "1.0.0" }"#,
+    )
+    .unwrap();
+    std::fs::write(cwd.join("pnpm-lock.yaml"), pnpm_lock_pinning_left_pad()).unwrap();
+    let nm = cwd.join("node_modules");
+    std::fs::create_dir_all(&nm).unwrap();
+    let recorded = format!("{}", store.display()).replace('\\', "\\\\");
+    std::fs::write(
+        nm.join(".modules.yaml"),
+        format!("{{\"layoutVersion\": 5, \"virtualStoreDir\": \"{recorded}\"}}"),
+    )
+    .unwrap();
+    let patched = b"hosted patched index\n";
+    let (_rt, server) = serve_patch_views(vec![(
+        UUID.to_string(),
+        left_pad_view(&compute_git_sha256_from_bytes(patched)),
+    )]);
+
+    let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+    assert_eq!(
+        code,
+        Some(1),
+        "an install the crawler cannot see must not attest: {env}"
+    );
+    assert_eq!(skipped_reason(&env, purl), "package_not_found", "{env}");
+
+    // A store inside the project is walked, so its absence is real.
+    let inside = cwd.join(".vstore");
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::write(
+        nm.join(".modules.yaml"),
+        "{\"layoutVersion\": 5, \"virtualStoreDir\": \"../.vstore\"}",
+    )
+    .unwrap();
+    let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+    assert_eq!(code, Some(0), "an in-project store hides nothing: {env}");
+
+    std::fs::remove_dir_all(&nm).unwrap();
+    let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+    assert_eq!(
+        code,
+        Some(0),
+        "nothing installed: the lock basis attests: {env}"
+    );
+}
+
 /// REGRESSION (#518): Rush installs every package into
 /// `common/temp/node_modules/.pnpm` and the projects' `node_modules` only
 /// link their DIRECT deps. The crawler pruned `temp`, so an unpatched

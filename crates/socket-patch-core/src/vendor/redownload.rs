@@ -72,6 +72,14 @@ pub async fn restore(
     {
         return Err("ledger package identity does not match its artifact ecosystem".into());
     }
+    // The download would land in (and repair would vouch for) a store this
+    // project does not own; see `path::vendor_dir_symlink`.
+    if let Some(link) = super::path::vendor_dir_symlink(root, &entry.ecosystem, Some(&entry.uuid)) {
+        return Err(format!(
+            "vendor_dir_symlink_unsupported: {}",
+            super::path::vendor_dir_symlink_detail(&link)
+        ));
+    }
     if let Some(outcome) = super::common::service_offline_conflict(Some(service)) {
         return Err(detail(outcome));
     }
@@ -561,6 +569,33 @@ mod tests {
         tokio::fs::remove_file(&path).await.unwrap();
         restore(root.path(), &entry, &record(), &cfg).await.unwrap();
         assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
+    }
+
+    /// #664: repair never downloads into a linked eco dir, whose target
+    /// may be another project's vendor store.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn linked_vendor_dir_refuses_without_downloading() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let bytes = tgz("package", b"pinned");
+        let entry = entry(&bytes);
+        tokio::fs::create_dir_all(root.path().join(".socket/vendor"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(shared.path(), root.path().join(".socket/vendor/npm")).unwrap();
+        let server = wiremock::MockServer::start().await;
+        mount_granted(&server, UUID, "example-1.0.0.tgz", &bytes).await;
+        let cfg = service_cfg(&server.uri(), VendorSource::Service, false);
+        let error = restore(root.path(), &entry, &record(), &cfg)
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with("vendor_dir_symlink_unsupported"),
+            "{error}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(shared.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
