@@ -11,13 +11,14 @@
 //!
 //! Designated #551 regression test: [`m2_only_gradle_project_refuses`].
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use sha1::Digest as _;
 
@@ -258,12 +259,7 @@ impl Fx {
     }
 
     fn run_env(&self, args: &[&str], env: &[(&str, &str)]) -> Out {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-        for (k, _) in std::env::vars_os() {
-            if k.to_string_lossy().starts_with("SOCKET_") {
-                cmd.env_remove(&k);
-            }
-        }
+        let mut cmd = hermetic::command(Path::new(env!("CARGO_BIN_EXE_socket-patch")));
         prebuilt_common::jvm_env::isolate_cli(&mut cmd);
         cmd.args(args)
             .args(["--json", "--cwd", self.proj.to_str().unwrap()])
@@ -1091,7 +1087,7 @@ fn failed_swap_restores_every_copy() {
             version.join(&hash_copies(&version, JAR)[0].0).join(JAR)
         };
         let flag = |f: &str| {
-            assert!(Command::new("chflags")
+            assert!(std::process::Command::new("chflags")
                 .args([f, locked.to_str().unwrap()])
                 .status()
                 .unwrap()
@@ -1332,12 +1328,7 @@ fn vendored_gradle_entry_is_not_out_of_sync() {
     f.m2(&as_refs(&files));
     f.gradle(&as_refs(&files));
     f.member_manifest();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(&k);
-        }
-    }
+    let mut cmd = hermetic::command(Path::new(env!("CARGO_BIN_EXE_socket-patch")));
     let home = f.home.to_string_lossy().into_owned();
     let m2 = f.m2.to_string_lossy().into_owned();
     let _server = prebuilt_common::prepare_command(

@@ -862,6 +862,94 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
     }
 }
 
+/// #632: a dependency declared through a yarn catalog (`"catalog:"`) is
+/// matched by yarn's `resolutions` before the catalog is expanded, so the
+/// hosted pin must also route `<name>@catalog:`; `rollback` must drop every
+/// selector it wrote and restore the lock's expanded `npm:` key, leaving
+/// package.json byte-identical to the pristine one.
+#[tokio::test]
+#[serial]
+async fn yarn_berry_catalog_dependency_is_pinned_and_rolled_back() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    mock_reference_with_berry_url(&server, &hosted_url).await;
+    mock_view(&server).await;
+    let tarball = upstream_tarball();
+    mock_npm_registry(
+        &server,
+        &vlt_hosted_common::sha512_sri(&tarball),
+        Some(tarball),
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_berry_project(tmp.path());
+    let pkg_path = tmp.path().join("package.json");
+    std::fs::write(
+        &pkg_path,
+        format!(
+            "{{\n  \"name\": \"consumer\",\n  \"version\": \"0.0.0\",\n  \
+             \"dependencies\": {{\n    \"{NAME}\": \"catalog:\"\n  }}\n}}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(".yarnrc.yml"),
+        format!("nodeLinker: node-modules\ncatalog:\n  {NAME}: ^{VERSION}\n"),
+    )
+    .unwrap();
+    let pristine_pkg = std::fs::read_to_string(&pkg_path).unwrap();
+    let lock_path = tmp.path().join("yarn.lock");
+    let pristine_lock = std::fs::read_to_string(&lock_path).unwrap();
+
+    let env = run_redirect_subprocess_with(
+        tmp.path(),
+        &server.uri(),
+        &["--patch-server-url", &server.uri()],
+    );
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert!(warning_codes(&env).is_empty(), "{env:#}");
+    let pkg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap()).unwrap();
+    assert_eq!(
+        pkg["resolutions"],
+        serde_json::json!({
+            format!("{NAME}@npm:^{VERSION}"): hosted_url,
+            format!("{NAME}@catalog:"): hosted_url,
+        }),
+        "{pkg}"
+    );
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(
+        lock.contains(&format!("\"{NAME}@{hosted_url}\":")),
+        "the entry is keyed by the tarball descriptor: {lock}"
+    );
+
+    let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
+    assert_eq!(code, Some(0), "rollback: {env:#}");
+    assert_eq!(
+        env["hosted"]["reverted"],
+        serde_json::json!([PURL]),
+        "{env:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&pkg_path).unwrap(),
+        pristine_pkg,
+        "rollback drops both selectors"
+    );
+    let restored = std::fs::read_to_string(&lock_path).unwrap();
+    let checksum = berry_checksum_of(&restored);
+    assert_eq!(
+        restored,
+        pristine_lock.replace(
+            &format!("10c0/{}", "3".repeat(128)),
+            &format!("10c0/{checksum}")
+        ),
+        "rollback restores the expanded npm: key"
+    );
+}
+
 /// #404 upgrade path: a lock pinned by an earlier release carries the old
 /// `npm:<v>::__archiveUrl=<url>` resolution, which makes yarn's npm fetcher
 /// send registry auth to the patch host. `rollback` must still recognize and
@@ -4753,4 +4841,112 @@ async fn pnpm_rollback_keeps_an_unconventional_registry_tarball() {
     let tmp = tempfile::tempdir().unwrap();
     let pristine = write_pnpm_tarball_project(tmp.path(), &advertised);
     assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// #417: hosted `scan` from a cargo workspace MEMBER treated it as a
+/// lockless project, wrote `registry = …` into the member's Cargo.toml and
+/// a `[registries]` block into the member's `.cargo/config.toml`, left the
+/// root Cargo.lock alone, and exited 0, breaking every build of the
+/// workspace. It now refuses with vendored mode's
+/// `cargo_manifest_not_workspace_root` and writes nothing.
+#[tokio::test]
+#[serial]
+async fn cargo_hosted_scan_from_workspace_member_refuses() {
+    const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.4";
+    const CARGO_UUID: &str = "33333333-3333-4333-8333-333333333333";
+    let cksum = "cd".repeat(32);
+    let index_url = format!("sparse+http://patch.test/registry/cargo/{CARGO_UUID}/index/");
+    let server = MockServer::start().await;
+    mock_cargo_patch(
+        &server,
+        CARGO_PURL,
+        CARGO_UUID,
+        "cfg-if",
+        "1.0.4",
+        &index_url,
+        &cksum,
+        "GHSA-carg-wsmb-wsmb",
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"inherits\", \"direct\"]\n\n\
+         [workspace.dependencies]\ncfg-if = \"1.0.4\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+         checksum = \"ee\"\n\n[[package]]\nname = \"direct\"\nversion = \"0.1.0\"\n\
+         dependencies = [\n \"cfg-if\",\n]\n\n[[package]]\nname = \"inherits\"\n\
+         version = \"0.1.0\"\ndependencies = [\n \"cfg-if\",\n]\n",
+    )
+    .unwrap();
+    for (member, dep) in [
+        ("inherits", "cfg-if = { workspace = true }"),
+        ("direct", "cfg-if = \"1.0.4\""),
+    ] {
+        std::fs::create_dir_all(root.join(member).join("src")).unwrap();
+        std::fs::write(
+            root.join(member).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2018\"\n\n\
+                 [dependencies]\n{dep}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join(member).join("src/lib.rs"), "").unwrap();
+    }
+    let member = root.join("direct");
+    write_vendored_crate(&member, "cfg-if", "1.0.4");
+    let manifest_before = std::fs::read(member.join("Cargo.toml")).unwrap();
+    let lock_before = std::fs::read(root.join("Cargo.lock")).unwrap();
+
+    let out = scrubbed_cli()
+        .args([
+            "scan",
+            "--mode=hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            member.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "scan --json output is not JSON ({e}):\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    assert_eq!(out.status.code(), Some(1), "{doc}");
+    assert_eq!(doc["status"], "error", "{doc}");
+    assert_eq!(
+        doc["errorCode"], "cargo_manifest_not_workspace_root",
+        "{doc}"
+    );
+    assert!(
+        doc["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("workspace root") && m.contains("nothing was written")),
+        "{doc}"
+    );
+    assert_eq!(
+        std::fs::read(member.join("Cargo.toml")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(std::fs::read(root.join("Cargo.lock")).unwrap(), lock_before);
+    assert!(!member.join(".cargo").exists(), "no member registry block");
+    assert!(!member.join(".socket").exists());
 }

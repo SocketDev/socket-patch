@@ -4,12 +4,13 @@
 //! and are put back exactly on rollback; absent, none is created; one that
 //! never described the file is left alone. Every rollback is byte-exact.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 
 use sha1::Digest as _;
 
@@ -140,12 +141,7 @@ fn fx(sidecars: &[(&str, String)]) -> Fx {
 
 impl Fx {
     fn run(&self, args: &[&str]) -> serde_json::Value {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-        for (k, _) in std::env::vars_os() {
-            if k.to_string_lossy().starts_with("SOCKET_") {
-                cmd.env_remove(&k);
-            }
-        }
+        let mut cmd = hermetic::command(Path::new(env!("CARGO_BIN_EXE_socket-patch")));
         prebuilt_common::jvm_env::isolate_cli(&mut cmd);
         let out = cmd
             .args(args)

@@ -494,6 +494,30 @@ pub fn is_pending(error: &std::io::Error) -> bool {
     error.get_ref().is_some_and(|e| e.is::<CommitPending>())
 }
 
+/// A commit refused before writing anything: the project-relative path of
+/// a changed file that is a symbolic link. See [`symlinked_target`].
+#[derive(Debug)]
+struct SymlinkedTarget(String);
+
+impl std::fmt::Display for SymlinkedTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} is a symbolic link", self.0)
+    }
+}
+
+impl std::error::Error for SymlinkedTarget {}
+
+/// The changed file a failed [`GroupCommit::commit`] refused because it is
+/// a symbolic link — renaming over it would replace the
+/// link with a detached regular file and leave the shared target as it was.
+/// Nothing was written.
+pub fn symlinked_target(error: &std::io::Error) -> Option<&str> {
+    error
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<SymlinkedTarget>())
+        .map(|t| t.0.as_str())
+}
+
 /// An open group commit (see the module docs). Dropping it without
 /// [`Self::commit`] discards every captured write — the crash semantics.
 pub struct GroupCommit {
@@ -626,6 +650,19 @@ impl GroupCommit {
         // sees the wiring before the ledger that records it, never a ledger
         // naming wiring that is not there yet.
         changes.sort_by_key(|c| is_ledger(&c.rel));
+        // Every write below stages a sibling and renames it over the path,
+        // which REPLACES a symbolic link (a shared lock, a linked
+        // `package.json`) with a detached copy and leaves the link's target,
+        // the file other checkouts read, unpatched. Refuse the whole commit
+        // before anything is written, as the hosted guard does.
+        for change in &changes {
+            if is_symlink(&root.join(&change.rel)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    SymlinkedTarget(rel_string(&change.rel)),
+                ));
+            }
+        }
         // Even with nothing to write: an artifact rebuilt in place (a
         // drifted committed copy healed at its own path) is already named
         // by the committed state, so it is synced before the run returns.
@@ -930,6 +967,20 @@ fn carries_commit(item: &Replay) -> Option<bool> {
         }
         _ => None,
     }
+}
+
+/// The paths of `rels` (relative to `root`) that a commit would refuse to
+/// write ([`symlinked_target`]) because they are symbolic links. For a dry
+/// run, which captures nothing, to predict that refusal.
+pub fn symlinked_paths<'a>(root: &Path, rels: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    rels.into_iter()
+        .filter(|rel| is_symlink(&root.join(rel)))
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// Whether any existing level of `rel` below `root` — the file itself
@@ -1547,6 +1598,51 @@ mod tests {
             assert!(!outside.join("pwned.txt").exists(), "{rel}");
             assert_eq!(std::fs::read(outside.join("target.json")).unwrap(), b"old");
             assert!(!root.join("b.lock").exists(), "{rel}: nothing applied");
+        }
+    }
+
+    /// #627: a commit never renames over a symbolic link (a shared lock, a
+    /// linked `package.json` / `nuget.config`): it refuses before writing
+    /// anything, naming the link, so the link and its target stay as they
+    /// were — in a one-file commit and as the second file of a journaled
+    /// one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_refuses_a_symlinked_target_before_writing_anything() {
+        for rel in ["yarn.lock", "package.json", "nuget.config"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let shared = tmp.path().join("shared");
+            let root = tmp.path().join("proj");
+            std::fs::create_dir_all(&shared).unwrap();
+            std::fs::create_dir_all(&root).unwrap();
+            let target = shared.join(rel);
+            std::fs::write(&target, b"old").unwrap();
+            std::os::unix::fs::symlink(&target, root.join(rel)).unwrap();
+            std::fs::write(root.join("a.lock"), b"a-old").unwrap();
+            for with_sibling in [false, true] {
+                let group = GroupCommit::begin(&root);
+                if with_sibling {
+                    super::super::fs::atomic_write_bytes(&root.join("a.lock"), b"a-new")
+                        .await
+                        .unwrap();
+                }
+                super::super::fs::atomic_write_bytes_preserving_mode(&root.join(rel), b"new")
+                    .await
+                    .unwrap();
+                let err = group.commit().await.unwrap_err();
+                assert_eq!(symlinked_target(&err), Some(rel), "{rel}: {err}");
+                assert!(!is_pending(&err));
+                assert!(
+                    std::fs::symlink_metadata(root.join(rel))
+                        .unwrap()
+                        .file_type()
+                        .is_symlink(),
+                    "{rel}: the link is kept"
+                );
+                assert_eq!(std::fs::read(&target).unwrap(), b"old", "{rel}");
+                assert_eq!(std::fs::read(root.join("a.lock")).unwrap(), b"a-old");
+                assert!(!root.join(COMMIT_JOURNAL_REL).exists(), "{rel}");
+            }
         }
     }
 

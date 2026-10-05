@@ -57,9 +57,16 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   gates them by `allow-file`, default `all`). npm 6 ignores `resolved` for registry
   dependencies, so a redirected lockfileVersion 1 lock fails closed with
   EINTEGRITY under npm 6 (`redirect_npm_legacy_client`) and installs under npm
-  >= 7. Vendoring needs a lockfileVersion 2/3 lock (npm 6 still installs a
-  vendored v2 lock from its legacy mirror) and rewires both locks in npm 12's
-  dual-lock state. Majors 6–12 are measured in
+  >= 7. A lockfileVersion 2 lock's legacy `dependencies` mirror is rewired with
+  `packages`, npm alias nodes (`"lp": {"version": "npm:left-pad@1.3.0"}`)
+  included. npm 6 installs an aliased dependency from the configured registry
+  whatever its `resolved` says, so under npm 6 an aliased hosted pin in a v2
+  lock fails closed with EINTEGRITY too (`redirect_npm_legacy_alias_client`).
+  Lockfile-only `vex` attests nothing for a package whose `packages` entry is
+  wired while the v2 mirror still resolves it from the registry. Vendoring
+  needs a lockfileVersion 2/3 lock (npm 6 still installs a vendored v2 lock
+  from its legacy mirror, alias nodes included) and rewires both locks in npm
+  12's dual-lock state. Majors 6–12 are measured in
   [npm compatibility](testing/npm-compatibility.md).
 - **pnpm** — hosted rewriting supports legacy `shrinkwrap.yaml` (pnpm 1/2),
   lockfileVersion 5.x (pnpm 3–7), 6.0 (pnpm 8), and 9.0 (pnpm 9–12).
@@ -83,7 +90,10 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 - **yarn berry** — the redirect pins the way yarn does for a root `resolutions`
   entry (cacheKey `10c0` / yarn 4): `package.json` routes the locked descriptor
   (`"left-pad@npm:^1.3.0"`) to the hosted tarball and only that `yarn.lock` entry
-  is re-keyed by it. Yarn then fetches it without npm registry credentials and
+  is re-keyed by it. A dependency declared through a yarn catalog (`"catalog:"`,
+  yarn 4.10+) is matched before yarn expands the catalog, so each `.yarnrc.yml`
+  catalog that resolves to the locked range is routed too (`"left-pad@catalog:"`,
+  `"left-pad@catalog:<name>"`). Yarn then fetches it without npm registry credentials and
   hardened mode accepts it. The re-keyed entry is written the way yarn writes
   it, with its fields in yarn's order and its `bin:` map taken from the served
   tarball's own `package.json`. For an entry that has a `bin:` map, the scan
@@ -170,13 +180,17 @@ moved it to, as recorded in `node_modules/.modules.yaml`), vlt's
 `node_modules/.vlt`, Bun's isolated-linker store `node_modules/.bun`,
 Deno's isolated `nodeModulesDir` store `node_modules/.deno`, and
 `node_modules/.store`, written by npm's `install-strategy=linked` and by
-Yarn 4's pnpm linker (where each entry's `package/` dir is the copy). A recorded virtual store outside the project,
-notably pnpm's global virtual store (`enableGlobalVirtualStore`, under the
-pnpm store directory), is not walked: other projects on the machine load
-the same files, so patching it in place would patch them as well.
-For the same reason, agent-mode `apply` and `rollback` fail on a direct
-dependency whose `node_modules/<dep>` link resolves into that store
-(`<store>/v<N>/links`) instead of writing through it. PDM's symlink install
+Yarn 4's pnpm linker (where each entry's `package/` dir is the copy). A recorded virtual store outside the project is not
+listed: other projects on the machine load the same files, so patching it
+in place would patch them as well. For pnpm's global virtual store
+(`enableGlobalVirtualStore`, `<store>/v<N>/links` under the pnpm store
+directory), only the entries this project reaches are walked: its
+`node_modules/<dep>` links into the store, and each entry's dependency
+links on to other entries. A workspace member's `node_modules` has no
+`.modules.yaml` of its own (pnpm writes it only at the workspace root), so
+the root's record is used, and the member's own links seed the walk. Agent-mode `apply` and `rollback` then fail on
+those copies, direct and transitive alike, instead of writing through
+them, and never report a transitive one as "not installed". PDM's symlink install
 cache gets the same treatment: with `install.cache` and
 `cache_method = symlink` (PDM 2.0–2.12), `site-packages/<pkg>` links into
 `<cache>/packages/<wheel>/lib`, and that package is refused too. The error

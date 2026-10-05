@@ -41,7 +41,7 @@
 //! install cannot reach the registry; every assertion after that is HARD.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 use base64::Engine as _;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
@@ -50,6 +50,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 #[path = "yarn_berry_common/mod.rs"]
@@ -108,30 +110,13 @@ fn has_corepack_pm(pm: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn scrub_socket_env(cmd: &mut Command) {
-    // Seed-then-scrub (mirrors e2e_redirect_yarn_berry_build.rs): yarn berry
-    // lets EVERY `.yarnrc.yml` setting be overridden by a `YARN_*` env var,
-    // so an ambient `YARN_NODE_LINKER=pnp` would build a PnP tree and
-    // node_modules/left-pad would never exist. The env_remove below clears
-    // the seed too, but if the scrub is ever dropped the seed turns these
-    // tests red immediately rather than relying on a developer's shell.
-    cmd.env("YARN_NODE_LINKER", "pnp");
-    for (k, _) in std::env::vars_os() {
-        let key = k.to_string_lossy();
-        if (key.starts_with("SOCKET_") || key.starts_with("YARN_")) && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("YARN_NODE_LINKER");
-}
-
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = yarn_berry_common::corepack_command();
     cmd.arg(pm).args(args).current_dir(cwd);
     // Scrub FIRST (it removes YARN_* / SOCKET_* from the inherited env), then
     // set the hermetic flags so they survive (Command: last env call wins).
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Yarn]);
     cache_env::isolate(&mut cmd);
     yarn_berry_common::pin_berry_ci_defaults(&mut cmd, pm);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
@@ -143,9 +128,9 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
     cmd.args(args).current_dir(cwd);
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Yarn]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),

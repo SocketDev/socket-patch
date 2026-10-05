@@ -18,6 +18,8 @@
 //! case is DSL-specific; toolchain selection is `gradle_build_common`'s
 //! `SOCKET_PATCH_GRADLE_E2E_*` knobs.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -32,7 +34,7 @@ mod hosted_maven_common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use gradle_build_common::{
     configuration_reused, dump, fixture_root, for_each_dsl, gradle_classpath, init_script,
@@ -378,12 +380,7 @@ impl Cell {
     /// `socket-patch <args> --json --cwd <dir>` under the cell's Gradle
     /// home, with the fake API.
     fn socket_in(&self, dir: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value, String) {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-        for (k, _) in std::env::vars_os() {
-            if k.to_string_lossy().starts_with("SOCKET_") {
-                cmd.env_remove(&k);
-            }
-        }
+        let mut cmd = hermetic::command(Path::new(env!("CARGO_BIN_EXE_socket-patch")));
         prebuilt_common::jvm_env::isolate_cli(&mut cmd);
         cmd.args(args)
             .args(["--json", "--cwd", dir.to_str().unwrap()])
@@ -409,12 +406,7 @@ impl Cell {
         fixture: Option<&Path>,
         extra: &[&str],
     ) -> (Option<i32>, serde_json::Value) {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-        for (k, _) in std::env::vars_os() {
-            if k.to_string_lossy().starts_with("SOCKET_") {
-                cmd.env_remove(&k);
-            }
-        }
+        let mut cmd = hermetic::command(Path::new(env!("CARGO_BIN_EXE_socket-patch")));
         let proj = self.proj.to_string_lossy().into_owned();
         let mut args: Vec<&str> = vec!["vendor"];
         args.extend_from_slice(extra);

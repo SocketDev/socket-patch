@@ -240,6 +240,8 @@ jobs:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 50
+    env:
+      VEXCTL_VERSION: v0.3.0
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -264,6 +266,7 @@ jobs:
         run: cargo build --workspace
 
       - name: Install Go (for vexctl)
+        id: go
         # The `vex` subcommand emits OpenVEX documents; tests/e2e_vex.rs
         # validates the output with vexctl when it's on PATH. vexctl is
         # a Go binary distributed via `go install`. Setting up Go here
@@ -279,6 +282,19 @@ jobs:
           go-version: '1.24'
           cache: false
 
+      - name: Restore vexctl (macOS)
+        # The macOS compile below took a median 110s (max 168s) of every
+        # macOS `test` job and is the step's only network flake source
+        # (sum.golang.org resets). Its output depends only on the vexctl
+        # version, the Go toolchain and the runner, so it is cached under
+        # exactly those. Saved from main only, like the cargo cache.
+        id: vexctl-cache
+        if: runner.os == 'macOS'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/vexctl-bin
+          key: vexctl-${{ env.VEXCTL_VERSION }}-go${{ steps.go.outputs.go-version }}-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install vexctl
         # Linux / Windows: the v0.3.0 release binary, checked against the
         # sha256 pinned here (from the release's vexctl_checksums.txt).
@@ -292,25 +308,26 @@ jobs:
         # sum.golang.org checksum tiles, and transient INTERNAL_ERROR
         # stream resets there have failed this step on otherwise-green
         # runs. The backoff rides out short resets; a persistent outage
-        # still fails loudly on the last attempt.
+        # still fails loudly on the last attempt. A binary restored by the
+        # step above skips the compile.
         #
         # Either way the binary's directory goes on PATH so
         # `Command::new("vexctl")` in the tests resolves.
         shell: bash
         env:
-          VEXCTL_VERSION: v0.3.0
           VEXCTL_SHA256_LINUX_AMD64: cd7f8b57d20642166ed4eb3dd1fd849bbb30bbd7c5b9f5b0316b6003b57ceaba
           VEXCTL_SHA256_WINDOWS_AMD64: 346fb3104b656fe1a407cbae88ea29a636b36f4569ec58a5a8dadca7343993ed
+          CACHE_HIT: ${{ steps.vexctl-cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
+          dir="$RUNNER_TEMP/vexctl-bin"
+          mkdir -p "$dir"
           case "$RUNNER_OS" in
             Linux) asset=vexctl-linux-amd64 bin=vexctl sha="$VEXCTL_SHA256_LINUX_AMD64" ;;
             Windows) asset=vexctl-windows-amd64.exe bin=vexctl.exe sha="$VEXCTL_SHA256_WINDOWS_AMD64" ;;
             *) asset='' ;;
           esac
           if [ -n "$asset" ]; then
-            dir="$RUNNER_TEMP/vexctl-bin"
-            mkdir -p "$dir"
             curl -fsSL --retry 5 --retry-all-errors -o "$dir/$bin" \
               "https://github.com/openvex/vexctl/releases/download/$VEXCTL_VERSION/$asset"
             echo "$sha  $dir/$bin" | sha256sum -c -
@@ -319,18 +336,31 @@ jobs:
             echo "$dir" >> "$GITHUB_PATH"
             exit 0
           fi
-          for attempt in 1 2 3 4 5; do
-            if go install "github.com/openvex/vexctl@$VEXCTL_VERSION"; then
-              break
-            fi
-            if [ "$attempt" = 5 ]; then
-              echo "::error::go install vexctl failed on all 5 attempts"
-              exit 1
-            fi
-            echo "::warning::go install vexctl attempt $attempt failed; retrying"
-            sleep $((attempt * 20))
-          done
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          if [ "$CACHE_HIT" != true ]; then
+            for attempt in 1 2 3 4 5; do
+              if GOBIN="$dir" go install "github.com/openvex/vexctl@$VEXCTL_VERSION"; then
+                break
+              fi
+              if [ "$attempt" = 5 ]; then
+                echo "::error::go install vexctl failed on all 5 attempts"
+                exit 1
+              fi
+              echo "::warning::go install vexctl attempt $attempt failed; retrying"
+              sleep $((attempt * 20))
+            done
+          fi
+          "$dir/vexctl" version
+          echo "$dir" >> "$GITHUB_PATH"
+
+      - name: Save vexctl (macOS)
+        if: >-
+          runner.os == 'macOS'
+          && github.ref == 'refs/heads/main'
+          && steps.vexctl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/vexctl-bin
+          key: ${{ steps.vexctl-cache.outputs.cache-primary-key }}
 
       - name: Run tests
         # Default features only: `--all-features` would also RUN the
@@ -1442,8 +1472,8 @@ jobs:
         run: |
           major="${MAVEN_VERSION%%.*}"
           url="https://archive.apache.org/dist/maven/maven-${major}/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"
-          curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/maven.tgz"
-          curl -fsSL --retry 3 "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
+          curl -fsSL --retry 5 --retry-all-errors "$url" -o "$RUNNER_TEMP/maven.tgz"
+          curl -fsSL --retry 5 --retry-all-errors "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
           python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
           # Python accepts native Windows paths for both archive and destination.
           python -m tarfile -e "$RUNNER_TEMP/maven.tgz" "$RUNNER_TEMP"
@@ -1458,8 +1488,8 @@ jobs:
           GRADLE_VERSION: ${{ matrix.gradle }}
         run: |
           url="https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
-          curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/gradle.zip"
-          curl -fsSL --retry 3 "$url.sha256" -o "$RUNNER_TEMP/gradle.sha256"
+          curl -fsSL --retry 5 --retry-all-errors "$url" -o "$RUNNER_TEMP/gradle.zip"
+          curl -fsSL --retry 5 --retry-all-errors "$url.sha256" -o "$RUNNER_TEMP/gradle.sha256"
           python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha256((p/"gradle.zip").read_bytes()).hexdigest() == (p/"gradle.sha256").read_text().strip()'
           unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
           launcher="$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin/gradle"

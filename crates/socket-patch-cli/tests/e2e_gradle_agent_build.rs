@@ -12,6 +12,8 @@
 //! classifier jars, build logic, the build cache, the read-only cache) in a
 //! JSON probe report per cell.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -23,7 +25,7 @@ mod jvm_fixture_repo;
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use gradle_build_common::{
     assert_patched, dump, fixture_root, init_script, jar_member, mirror_init_script, ok, print_cp,
@@ -321,12 +323,7 @@ impl Cell {
 
     /// `socket-patch <args> --json --cwd <proj>` under the cell's caches.
     fn socket(&self, args: &[&str]) -> (Option<i32>, serde_json::Value) {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-        for (k, _) in std::env::vars_os() {
-            if k.to_string_lossy().starts_with("SOCKET_") {
-                cmd.env_remove(&k);
-            }
-        }
+        let mut cmd = hermetic::command(Path::new(env!("CARGO_BIN_EXE_socket-patch")));
         prebuilt_common::jvm_env::isolate_cli(&mut cmd);
         cmd.args(args)
             .args(["--json", "--cwd", self.proj.to_str().unwrap()])

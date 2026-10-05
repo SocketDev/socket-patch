@@ -354,8 +354,10 @@ pub fn cannot_rollback_error(file: &str, why: &str) -> String {
 /// dry-run (verify only, so a preview fails closed on a copy that cannot
 /// be rolled back). Apply materializes patch-ADDED files in every copy
 /// too, so the deletes must reach every copy as well. A failed copy fails
-/// the whole result; the primary's per-file records are what the returned
-/// `RollbackResult` carries.
+/// the whole result; each copy's per-file records are merged into the
+/// returned `RollbackResult` with the file qualified by the copy's path, so
+/// a restore of a twin alone still counts as rolled back (see
+/// [`store_copies`](crate::patch::store_copies)).
 pub async fn rollback_package_patch(
     package_key: &str,
     pkg_path: &Path,
@@ -363,47 +365,134 @@ pub async fn rollback_package_patch(
     blobs_path: &Path,
     dry_run: bool,
 ) -> RollbackResult {
-    let mut result =
-        rollback_package_patch_at(package_key, pkg_path, files, blobs_path, dry_run).await;
-    // Only npm purls can name pnpm or vlt store copies; everything else skips the
-    // (already cheap) discovery outright.
-    if result.success && package_key.starts_with("pkg:npm/") {
-        for copy in crate::crawlers::npm_crawler::find_store_peer_variant_copies(pkg_path).await {
-            let copy_result =
-                rollback_package_patch_at(package_key, &copy, files, blobs_path, dry_run).await;
-            fold_copy_result(&mut result, &copy, copy_result);
-        }
-    }
-    result
+    crate::patch::store_copies::fan_out(package_key, pkg_path, |path| async move {
+        rollback_package_patch_at(package_key, &path, files, blobs_path, dry_run).await
+    })
+    .await
 }
 
-/// Merge one pnpm or vlt store copy's result into the primary's. A failed
-/// copy fails the whole result with a `store copy <path> failed to roll
-/// back: …` note; a copy that restored fine but carries an advisory
-/// (`success: true, error: Some(…)` — e.g. "…ownership could not be
-/// restored…") keeps `success` and appends the advisory verbatim, so the
-/// CLI's `ownership_not_restored` warning sees every copy, not just the
-/// primary. The advisory already names the copy's full file path.
-fn fold_copy_result(result: &mut RollbackResult, copy: &Path, copy_result: RollbackResult) {
-    let note = if copy_result.success {
-        match copy_result.error {
-            Some(advisory) => advisory,
-            None => return,
+impl crate::patch::store_copies::CopyFold for RollbackResult {
+    const VERB: &'static str = "roll back";
+
+    fn success(&self) -> bool {
+        self.success
+    }
+
+    fn mark_failed(&mut self) {
+        self.success = false;
+    }
+
+    fn error_mut(&mut self) -> &mut Option<String> {
+        &mut self.error
+    }
+
+    fn extend_files(&mut self, copy: &mut Self, qualify: &dyn Fn(&str) -> String) {
+        for mut verified in copy.files_verified.drain(..) {
+            verified.file = qualify(&verified.file);
+            self.files_verified.push(verified);
         }
-    } else {
-        result.success = false;
-        format!(
-            "store copy {} failed to roll back: {}",
-            copy.display(),
-            copy_result
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
-        )
+        self.files_rolled_back
+            .extend(copy.files_rolled_back.drain(..).map(|file| qualify(&file)));
+    }
+}
+
+/// After deleting a patch-added file, undo the directories apply created
+/// for it (`create_dir_all` in `apply_file_patch_at`), so the package tree
+/// is back to its pre-apply shape. In site-packages a leftover empty
+/// directory still imports as a PEP 420 namespace package (#838).
+///
+/// For a `.py` file, its now-stale bytecode in the sibling `__pycache__/`
+/// (`<stem>.<tag>[.opt-N].pyc`) goes first. Then each parent directory is
+/// removed while it is empty, deepest first, stopping at `pkg_path`
+/// (never removed) or at the first directory that still holds anything.
+/// Apply records no list of the directories it created, so "empty once
+/// the patch's files are gone" is the test: a package directory holding
+/// only patch-added files did not exist before the patch.
+///
+/// Only real directories are removed: each is lstat'ed first, so a
+/// symlinked directory is neither removed nor walked above, and
+/// `remove_dir` refuses a non-empty one atomically. Read-only parents (Go
+/// module cache) are relaxed for the rmdir exactly as for the unlink.
+/// Best effort: the file delete already committed the rollback, so a
+/// directory that can't be removed is left in place rather than failing it.
+async fn prune_emptied_parents(pkg_path: &Path, filepath: &Path) {
+    let Some(rel) = filepath
+        .parent()
+        .and_then(|parent| parent.strip_prefix(pkg_path).ok())
+    else {
+        return;
     };
-    result.error = Some(match result.error.take() {
-        Some(prev) => format!("{prev}; {note}"),
-        None => note,
-    });
+    // Every directory between the package root and the deleted file, top
+    // down. A symlink (or anything but a real directory) anywhere on the
+    // chain means the deeper levels live outside this tree: prune nothing.
+    let mut chain = Vec::new();
+    let mut cur = pkg_path.to_path_buf();
+    for component in rel.components() {
+        cur.push(component);
+        match tokio::fs::symlink_metadata(&cur).await {
+            Ok(meta) if meta.is_dir() => chain.push(cur.clone()),
+            _ => return,
+        }
+    }
+    if filepath.extension().is_some_and(|ext| ext == "py") {
+        if let Some(stem) = filepath.file_stem().and_then(|s| s.to_str()) {
+            let cache = filepath.with_file_name("__pycache__");
+            remove_stale_bytecode(&cache, stem).await;
+            remove_dir_if_empty(&cache).await;
+        }
+    }
+    for dir in chain.iter().rev() {
+        if !remove_dir_if_empty(dir).await {
+            return;
+        }
+    }
+}
+
+/// Delete the regular `<stem>.*.pyc` files in `cache`: bytecode compiled
+/// from a module the rollback just removed.
+async fn remove_stale_bytecode(cache: &Path, stem: &str) {
+    match tokio::fs::symlink_metadata(cache).await {
+        Ok(meta) if meta.is_dir() => {}
+        _ => return,
+    }
+    let Ok(mut entries) = tokio::fs::read_dir(cache).await else {
+        return;
+    };
+    let prefix = format!("{stem}.");
+    let mut stale = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(&prefix)
+            && name.ends_with(".pyc")
+            && entry.file_type().await.is_ok_and(|t| t.is_file())
+        {
+            stale.push(entry.path());
+        }
+    }
+    if stale.is_empty() {
+        return;
+    }
+    let guard = crate::patch::apply::DirWriteGuard::acquire(Some(cache)).await;
+    for path in stale {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    guard.restore().await;
+}
+
+/// Remove `dir` if it is a real (non-symlink) empty directory. Returns
+/// whether it is gone.
+async fn remove_dir_if_empty(dir: &Path) -> bool {
+    match tokio::fs::symlink_metadata(dir).await {
+        Ok(meta) if meta.is_dir() => {}
+        _ => return false,
+    }
+    let guard = crate::patch::apply::DirWriteGuard::acquire(dir.parent()).await;
+    let removed = tokio::fs::remove_dir(dir).await.is_ok();
+    guard.restore().await;
+    removed
 }
 
 /// The single-copy rollback engine behind [`rollback_package_patch`]:
@@ -534,6 +623,7 @@ async fn rollback_package_patch_at(
                 result.error = Some(format!("Failed to delete {}: {}", file_name, e));
                 return result;
             }
+            prune_emptied_parents(pkg_path, &filepath).await;
             result.files_rolled_back.push(file_name.clone());
             continue;
         }
@@ -1516,6 +1606,221 @@ mod tests {
             .unwrap();
     }
 
+    /// Build a new-file manifest (empty `beforeHash`) for `names`, writing
+    /// each file under `pkg` with its content so it verifies as patched.
+    async fn write_added_files(pkg: &Path, names: &[&str]) -> HashMap<String, PatchFileInfo> {
+        let mut files = HashMap::new();
+        for name in names {
+            let body = format!("added {name}\n");
+            let path = pkg.join(name);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&path, body.as_bytes()).await.unwrap();
+            files.insert(
+                name.to_string(),
+                PatchFileInfo {
+                    before_hash: String::new(),
+                    after_hash: compute_git_sha256_from_bytes(body.as_bytes()),
+                },
+            );
+        }
+        files
+    }
+
+    /// #838: a patch that added `six_safe/__init__.py` (a new top-level
+    /// directory in site-packages) must leave no `six_safe/` behind after
+    /// rollback, or Python keeps importing it as a namespace package.
+    #[tokio::test]
+    async fn test_rollback_new_file_prunes_created_top_level_dir() {
+        let site = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let files = write_added_files(site.path(), &["six_safe/__init__.py"]).await;
+
+        let result = rollback_package_patch(
+            "pkg:pypi/six@1.16.0",
+            site.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            tokio::fs::symlink_metadata(site.path().join("six_safe"))
+                .await
+                .is_err(),
+            "the directory apply created must be removed"
+        );
+        assert!(site.path().exists(), "the package root is never removed");
+    }
+
+    /// #838 nested variant: `six_safe/sub/__init__.py` leaves neither
+    /// `six_safe/sub/` nor `six_safe/`, including a `__pycache__/` that
+    /// only holds bytecode for the deleted module.
+    #[tokio::test]
+    async fn test_rollback_new_file_prunes_nested_dirs_and_stale_pycache() {
+        let site = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let files = write_added_files(site.path(), &["six_safe/sub/__init__.py"]).await;
+        let cache = site.path().join("six_safe/sub/__pycache__");
+        tokio::fs::create_dir_all(&cache).await.unwrap();
+        tokio::fs::write(cache.join("__init__.cpython-313.pyc"), b"pyc")
+            .await
+            .unwrap();
+        tokio::fs::write(cache.join("__init__.cpython-313.opt-1.pyc"), b"pyc")
+            .await
+            .unwrap();
+
+        let result = rollback_package_patch(
+            "pkg:pypi/six@1.16.0",
+            site.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            tokio::fs::symlink_metadata(site.path().join("six_safe"))
+                .await
+                .is_err(),
+            "every directory apply created must be removed, deepest first"
+        );
+    }
+
+    /// Pruning stops at the first directory that still holds something
+    /// the patch did not add: an unrelated file, or bytecode for a module
+    /// that still exists.
+    #[tokio::test]
+    async fn test_rollback_new_file_keeps_dirs_that_are_not_empty() {
+        let site = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let files = write_added_files(site.path(), &["pkg/sub/added.py"]).await;
+        tokio::fs::write(site.path().join("pkg/keep.py"), b"x")
+            .await
+            .unwrap();
+        let cache = site.path().join("pkg/sub/__pycache__");
+        tokio::fs::create_dir_all(&cache).await.unwrap();
+        tokio::fs::write(cache.join("added.cpython-313.pyc"), b"pyc")
+            .await
+            .unwrap();
+        tokio::fs::write(cache.join("other.cpython-313.pyc"), b"pyc")
+            .await
+            .unwrap();
+
+        let result = rollback_package_patch(
+            "pkg:pypi/pkg@1.0.0",
+            site.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(!cache.join("added.cpython-313.pyc").exists());
+        assert!(cache.join("other.cpython-313.pyc").exists());
+        assert!(site.path().join("pkg/keep.py").exists());
+    }
+
+    /// Several added files in one new directory: the directory goes once
+    /// the last of them is deleted, whatever order they are processed in.
+    #[tokio::test]
+    async fn test_rollback_new_files_sharing_a_created_dir_prune_it() {
+        let pkg = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let files = write_added_files(pkg.path(), &["lib/new/a.js", "lib/new/b.js"]).await;
+        tokio::fs::write(pkg.path().join("index.js"), b"x")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(pkg.path().join("lib/old"))
+            .await
+            .unwrap();
+        tokio::fs::write(pkg.path().join("lib/old/c.js"), b"x")
+            .await
+            .unwrap();
+
+        let result =
+            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
+                .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(!pkg.path().join("lib/new").exists());
+        assert!(pkg.path().join("lib/old/c.js").exists());
+    }
+
+    /// A symlinked parent directory is never removed or followed by the
+    /// prune: only real, empty directories inside the package go.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rollback_new_file_prune_never_follows_a_symlinked_dir() {
+        let pkg = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let target = outside.path().join("real");
+        tokio::fs::create_dir_all(target.join("inner"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&target, pkg.path().join("link")).unwrap();
+        let files = write_added_files(pkg.path(), &["link/inner/added.js"]).await;
+
+        let result =
+            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
+                .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(!target.join("inner/added.js").exists());
+        // `inner` is reached through the symlink, so it lives outside the
+        // package and stays; so does `link` itself.
+        assert!(target.join("inner").is_dir());
+        assert!(tokio::fs::symlink_metadata(pkg.path().join("link"))
+            .await
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(target.exists());
+    }
+
+    /// The prune also works under a read-only (Go cache style) package
+    /// root: the parent is relaxed for the rmdir and its mode restored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rollback_new_file_prunes_created_dir_under_readonly_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let pkg = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let files = write_added_files(pkg.path(), &["newdir/added.go"]).await;
+        tokio::fs::set_permissions(pkg.path(), std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let result = rollback_package_patch(
+            "pkg:golang/example.com/x@1.0.0",
+            pkg.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
+
+        let mode = tokio::fs::metadata(pkg.path())
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        tokio::fs::set_permissions(pkg.path(), std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(!pkg.path().join("newdir").exists());
+        assert_eq!(mode, 0o555);
+    }
+
     /// SECURITY (before-blob hash path-escape at verify): `beforeHash`
     /// comes from the same untrusted manifest as the file keys, but is
     /// joined onto the blobs directory as a path component. A traversal
@@ -2042,7 +2347,7 @@ mod tests {
     /// advisory verbatim (it already names the copy's file path); a clean copy
     /// changes nothing.
     #[test]
-    fn fold_copy_result_carries_advisories_and_failures() {
+    fn store_copy_fold_carries_advisories_and_failures() {
         let copy = Path::new("/store/pkg@1.0.0_peer");
         let clean = || RollbackResult {
             package_key: "pkg:npm/a@1.0.0".to_string(),
@@ -2055,13 +2360,13 @@ mod tests {
         };
 
         let mut primary = clean();
-        fold_copy_result(&mut primary, copy, clean());
+        crate::patch::store_copies::fold(&mut primary, copy, clean());
         assert!(primary.success && primary.error.is_none());
 
         let advisory = "/store/pkg@1.0.0_peer/index.js: patched, but ownership could not be \
                         restored to uid 1 gid 2: EPERM";
         let mut primary = clean();
-        fold_copy_result(
+        crate::patch::store_copies::fold(
             &mut primary,
             copy,
             RollbackResult {
@@ -2074,7 +2379,7 @@ mod tests {
 
         let mut primary = clean();
         primary.error = Some("first".to_string());
-        fold_copy_result(
+        crate::patch::store_copies::fold(
             &mut primary,
             copy,
             RollbackResult {
@@ -2513,6 +2818,7 @@ mod tests {
         // that is the primary the resolver hands rollback.
         std::os::unix::fs::symlink(variants[0].join("foo"), nm.join("foo")).unwrap();
         let primary = nm.join("foo");
+        let twin_added = variants[1].join("foo").join("added.js");
 
         let mut files = HashMap::new();
         files.insert(
@@ -2532,9 +2838,14 @@ mod tests {
         )
         .await;
         assert!(result.success, "expected success: {:?}", result.error);
+        // The primary's delete under its manifest key, the twin's under its
+        // on-disk path (the store fan-out qualifies copy records).
         assert_eq!(
             result.files_rolled_back,
-            vec!["package/added.js".to_string()]
+            vec![
+                "package/added.js".to_string(),
+                twin_added.display().to_string(),
+            ]
         );
         for entry_nm in &variants {
             assert!(
@@ -2564,6 +2875,11 @@ mod tests {
                 .await
                 .is_err(),
             "an already-original primary must still heal a patched twin"
+        );
+        // ...and report the heal (#756), not "already original".
+        assert_eq!(
+            result.files_rolled_back,
+            vec![twin_added.display().to_string()]
         );
     }
 

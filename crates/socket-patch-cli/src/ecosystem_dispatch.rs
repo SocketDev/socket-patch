@@ -610,6 +610,11 @@ pub(crate) fn npm_paths_by_identity_in(
 /// [`find_packages_for_rollback_reusing`]. Only the root discovery is
 /// reused: each root is still searched by `find_by_purls`, so copy choice
 /// and order are unchanged. A snapshot taken with other options is ignored.
+///
+/// Read-only by contract (its one caller is `vex`), so it also searches the
+/// gem stores under a refused out-of-tree `.bundle/config` path
+/// (`RubyCrawler::verification_only_gem_paths`), which the write paths never
+/// see.
 pub async fn find_manifest_package_copies_reusing(
     purls: &[String],
     common: &GlobalArgs,
@@ -633,6 +638,22 @@ pub async fn find_manifest_package_copies_reusing(
     for (purl, paths) in copies.iter_mut() {
         if purl.starts_with("pkg:npm/") {
             *paths = with_store_peer_variant_copies(std::mem::take(paths)).await;
+        }
+    }
+    // Verification also READS a `.bundle/config` bundle path the crawler
+    // refused as a write root (it resolves outside the project): bundler
+    // installs into and loads from it, so a copy there must verify too —
+    // skipping it would leave an unpatched gem looking "not installed",
+    // which the hosted lockfile basis then attests (#709).
+    if let Some(gem_purls) = partitioned.get(&Ecosystem::Gem) {
+        let stores = RubyCrawler
+            .verification_only_gem_paths(&crawler_options)
+            .await;
+        let bases = dedup_qualified_purls(gem_purls);
+        for store in &stores {
+            if let Ok(found) = RubyCrawler.find_by_purls(store, &bases).await {
+                merge_qualified(&mut copies, gem_purls, found);
+            }
         }
     }
     copies

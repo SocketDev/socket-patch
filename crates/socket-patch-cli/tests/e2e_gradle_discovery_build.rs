@@ -9,6 +9,8 @@
 //! (`jvm_fixture_repo`) and scans it; toolchain selection is
 //! `gradle_build_common`'s `SOCKET_PATCH_GRADLE_E2E_*` knobs.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -19,7 +21,6 @@ mod gradle_build_common;
 mod jvm_fixture_repo;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use gradle_build_common::{
     fixture_root, init_script, mirror_init_script, print_cp, print_cp_task, probe_report,
@@ -120,12 +121,7 @@ fn scan(cwd: &Path, gradle_home: Option<&Path>, m2: &Path, extra: &[&str]) -> Sc
         mock_batch_all(&server).await;
         server
     });
-    let mut cmd = Command::new(binary());
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(&key);
-        }
-    }
+    let mut cmd = hermetic::command(&binary());
     let uri = server.uri();
     let mut args = vec![
         "scan",
