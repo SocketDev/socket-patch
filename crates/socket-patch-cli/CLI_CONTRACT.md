@@ -534,7 +534,11 @@ is patched identically to a direct one. Both halves are pinned in
 `crawl_all_discovers_deeply_nested_transitive_deps`, and apply-side resolution by
 `find_by_purls_resolves_nested_only_install` (`find_by_purls` probes the tree root first, then falls
 back breadth-first into nested `node_modules` for still-unresolved PURLs; a root-level install always
-wins, pinned by `find_by_purls_prefers_root_copy_over_nested_duplicate`).
+wins, pinned by `find_by_purls_prefers_root_copy_over_nested_duplicate`). An **npm alias install**
+(`"lp": "npm:left-pad@1.3.0"`, written by npm, yarn, Bun and pnpm's hoisted linker) is a copy of
+the purl its own `package.json` names, so `apply`, `rollback` and `vex` cover `node_modules/lp`
+beside any plain `node_modules/left-pad` copy. Only real package dirs count: a link is a dependency
+edge, never an alias copy of its own.
 
 ## Vendor command contract
 
