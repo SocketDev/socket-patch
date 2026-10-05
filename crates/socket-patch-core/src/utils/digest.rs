@@ -135,6 +135,7 @@ mod tests {
     /// when you move it onto the helpers above; the test fails on a stale
     /// entry as well as on a new inline copy.
     const PENDING_INLINE_DIGESTS: &[&str] = &[
+        "crawlers/gradle_cache.rs",
         "utils/group_commit.rs",
         "vendor/jvm/mod.rs",
         "vendor/maven_repo.rs",
