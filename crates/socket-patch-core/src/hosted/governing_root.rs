@@ -179,9 +179,12 @@ async fn lock_elsewhere(project: &Path, base: &Path, dir: &str) -> Option<PathBu
 
 /// The top-level `lockfileDir:` scalar of a `pnpm-workspace.yaml`, read
 /// line-wise (a block key at column 0, bare or quoted, an optional quoted
-/// value, an optional trailing comment).
+/// value, an optional trailing comment). A leading UTF-8 BOM is skipped,
+/// and the last assignment wins, as in the `.npmrc` reader.
 fn workspace_lockfile_dir(yaml: &str) -> Option<String> {
-    yaml.lines().find_map(|line| {
+    let yaml = yaml.strip_prefix('\u{feff}').unwrap_or(yaml);
+    // The last assignment wins: scan from the end.
+    yaml.lines().rev().find_map(|line| {
         let rest = ["lockfileDir", "\"lockfileDir\"", "'lockfileDir'"]
             .iter()
             .find_map(|key| line.strip_prefix(key))?
@@ -444,5 +447,14 @@ mod tests {
         );
         assert_eq!(workspace_lockfile_dir("  lockfileDir: ..\n"), None);
         assert_eq!(workspace_lockfile_dir("lockfileDirX: ..\n"), None);
+        // Bugbot on #598: a BOM-prefixed file, and the last assignment.
+        assert_eq!(
+            workspace_lockfile_dir("\u{feff}lockfileDir: ../x\n").as_deref(),
+            Some("../x")
+        );
+        assert_eq!(
+            workspace_lockfile_dir("lockfileDir: ../a\nlockfileDir: ../b\n").as_deref(),
+            Some("../b")
+        );
     }
 }
