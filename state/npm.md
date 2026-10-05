@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-05T18Z (run 21 with a ledger), main `c644ab0` (adds #813 (#432 fix), #799 (#798 fix), #730 (#725 fix) and more since `4646693`), including #356, #732, #325, #665, #687, #557/#817 and #601/#603), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`.
+Last updated: 2026-10-05T18Z (run 21 with a ledger), main `c644ab0` (adds #813 (#432 fix), #799 (#798 fix), #730 (#725 fix) and more since `4646693`; earlier fixes include #356, #732, #325, #665, #687, #557/#817 and #601/#603), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`.
 
 ## Coverage matrix
 
