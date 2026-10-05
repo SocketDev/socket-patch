@@ -184,6 +184,26 @@ pub(crate) fn hosted_pypi_reference(url: &str, origins: &[String]) -> Option<Hos
     })
 }
 
+/// Whether `previous`, a source already pinned for `name`==`version`, is
+/// socket-patch's OWN earlier hosted reference that the hosted artifact
+/// `current` (the url this run selected) may replace — a rotated grant, or
+/// a superseding patch uuid for the same package and version (an UPGRADE
+/// row). Ours means [`hosted_pypi_reference`] recognizes it on Socket's
+/// patch server or `current`'s own origin, and its coordinates name the
+/// same package and version. A url on any other host, with userinfo, or for
+/// another release stays a user source.
+pub(crate) fn replaceable_hosted_pin(
+    previous: &str,
+    current: &str,
+    name: &str,
+    version: &str,
+) -> bool {
+    hosted_pypi_reference(previous, &[current.to_string()]).is_some_and(|coords| {
+        canonicalize_pypi_name(&coords.name) == canonicalize_pypi_name(name)
+            && coords.version == version
+    })
+}
+
 /// Inventory the pypi lock the project carries. Fetchable resolution
 /// (URL + sha256 of a pure `-none-any` wheel) comes from `uv.lock` and
 /// PEP 751 / PEP 723 script locks; `poetry.lock` entries carry the pure

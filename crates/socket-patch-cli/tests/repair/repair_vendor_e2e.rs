@@ -10,7 +10,6 @@
 //! byte-for-byte on real `bundle lock` output (bundler 4.0.15).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
@@ -198,7 +197,7 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str]) -> (i32, String, String) 
         "--org",
         ORG_SLUG,
     ]);
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args(&full)
         .current_dir(root)
         .env("SOCKET_TELEMETRY_DISABLED", "1")

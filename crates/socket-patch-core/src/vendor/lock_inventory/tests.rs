@@ -2367,6 +2367,127 @@ async fn bun_malformed_tuples_are_skipped() {
     );
 }
 
+/// The hosted rewriter's URL 3-tuple `["left-pad@https://…/left-pad-1.3.0.tgz",
+/// {}, "sha512-…"]` is still the registry package, fetched from the patch
+/// host (#720): every committed hosted-rewriter output (lock v0 / v1 / v2,
+/// CRLF, alias and nested keys, workspace-nested instances) inventories
+/// `left-pad@1.3.0`, so a lockfile-only re-run can rediscover a hosted pin
+/// (pnpm / vlt / berry parity). The entry is identity only: the URL and
+/// sha512 belong to the patched artifact, not a pristine registry source.
+#[tokio::test]
+async fn bun_text_hosted_pins_inventory_as_their_registry_package() {
+    const UUID: &str = "77777777-7777-7777-7777-777777777777";
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/redirect/npm/bun");
+    for case in [
+        "alias",
+        "basic",
+        "custom-registry",
+        "lock-v0",
+        "lock-v1-workspace",
+        "lock-v2",
+        "lock-v2-crlf",
+        "lock-v2-workspace-nested",
+        "nested-entry",
+        "re-redirect-stale-url",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = std::fs::read_to_string(fixtures.join(case).join("expected/bun.lock")).unwrap();
+        write(tmp.path(), "bun.lock", &lock).await;
+        let (flavor, entries) = inventory_npm_lock(tmp.path())
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{case}: no inventory"));
+        assert_eq!(flavor, NpmLockFlavor::Bun, "{case}");
+        assert!(lock.contains(UUID), "{case}: fixture must be hosted-wired");
+        let left_pad = entry(&entries, "left-pad");
+        assert_eq!(left_pad.version, "1.3.0", "{case}");
+        // Identity only: the URL and sha512 are the patched artifact's.
+        assert_eq!(left_pad.resolved, None, "{case}");
+        assert_eq!(left_pad.integrity, LockIntegrity::None, "{case}");
+    }
+}
+
+/// A Bun < 1.3.10 re-save drops a URL 3-tuple's sha512, leaving the 2-tuple
+/// `["left-pad@https://…/left-pad-1.3.0.tgz", {}]`: still the hosted pin, so
+/// it is still inventoried.
+/// A URL whose leaf is not the package's own `<name>-<version>.tgz` (a
+/// user's arbitrary tarball dependency) and our vendored 3-tuple stay out.
+#[tokio::test]
+async fn bun_text_hosted_pin_shapes_and_non_pins() {
+    let hosted = "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777";
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "bun.lock",
+        &format!(
+            r#"{{
+  "lockfileVersion": 2,
+  "workspaces": {{
+    "": {{ "name": "fixture" }},
+  }},
+  "packages": {{
+    "left-pad": ["left-pad@{hosted}/left-pad-1.3.0.tgz", {{}}],
+    "@scope/pkg": ["@scope/pkg@{hosted}/pkg-2.0.0.tgz", {{}}, "sha512-c2NvcGU="],
+    "mismatched": ["mismatched@{hosted}/left-pad-1.3.0.tgz", {{}}, "sha512-bWlz"],
+    "noversion": ["noversion@https://example.com/noversion.tgz", {{}}, "sha512-bm92"],
+    "vendored": ["vendored@./.socket/vendor/npm/77777777-7777-7777-7777-777777777777/vendored-1.0.0.tgz", {{}}, "sha512-dmVu"],
+  }}
+}}
+"#
+        ),
+    )
+    .await;
+
+    let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![
+            ("@scope/pkg".into(), "2.0.0".into()),
+            ("left-pad".into(), "1.3.0".into()),
+        ],
+        "{entries:?}"
+    );
+    for e in &entries {
+        assert_eq!(
+            (&e.resolved, &e.integrity),
+            (&None, &LockIntegrity::None),
+            "{e:?}"
+        );
+    }
+}
+
+/// The binary twin of [`bun_text_hosted_pins_inventory_as_their_registry_package`]:
+/// a `bun.lockb` record the hosted rewriter re-pointed at a patch-host
+/// tarball carries no registry version, and is recovered from its URL leaf
+/// (identity only, like the text pin).
+#[tokio::test]
+async fn bun_binary_hosted_pins_inventory_as_their_registry_package() {
+    let bytes = include_bytes!("../../../tests/fixtures/bun-lockb/1.1.45/bun.lockb");
+    let mut lock = super::super::bun_lockb::BunLockb::parse(bytes).unwrap();
+    let packages = lock.packages().unwrap();
+    let id_of = |name: &str| packages.iter().find(|p| p.name == name).unwrap().id;
+    let hosted = "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/minimist-1.2.2.tgz";
+    let sri = format!("sha512-{}", "A".repeat(86) + "==");
+    lock.set_package(id_of("minimist"), hosted, &sri).unwrap();
+    // A tarball record whose leaf does not name the package stays out.
+    lock.set_package(id_of("is-number"), "https://example.com/other.tgz", &sri)
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
+        .await
+        .unwrap();
+
+    let (entries, diagnoses) = inventory_project_diagnosed(tmp.path()).await;
+    assert!(diagnoses.is_empty(), "{diagnoses:?}");
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![("minimist".into(), "1.2.2".into())]
+    );
+    let minimist = entry(&entries, "minimist");
+    assert_eq!(minimist.resolved, None);
+    assert_eq!(minimist.integrity, LockIntegrity::None);
+}
+
 /// composer.lock packages missing a name or version are skipped, and
 /// names that are unsafe or not `vendor/pkg`-shaped are dropped
 /// fail-closed (SECURITY: they feed paths and download URLs).

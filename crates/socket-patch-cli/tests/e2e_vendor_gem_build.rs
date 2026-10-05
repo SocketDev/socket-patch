@@ -1637,3 +1637,329 @@ fn gem_vendor_refuses_an_eval_gemfile_direct_dep() {
         );
     }
 }
+
+/// A static `file://` rubygems source serving one empty gem,
+/// `aaa-internal 1.0.0`. It writes the full-index files bundler reads from
+/// a file remote (`specs.4.8.gz`, the quick gemspec, the `.gem`), so it
+/// works without `gem generate_index` (no longer bundled with RubyGems).
+fn private_gem_source(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    let script = r#"
+require "rubygems/package"
+require "zlib"
+require "fileutils"
+spec = Gem::Specification.new do |s|
+  s.name = "aaa-internal"
+  s.version = "1.0.0"
+  s.summary = "fixture"
+  s.authors = ["fixture"]
+  s.files = []
+end
+FileUtils.mkdir_p(["gems", "quick/Marshal.4.8"])
+file = Gem::Package.build(spec)
+FileUtils.mv(file, "gems/#{file}")
+tuple = [[spec.name, spec.version, "ruby"]]
+{ "specs.4.8.gz" => tuple, "latest_specs.4.8.gz" => tuple, "prerelease_specs.4.8.gz" => [] }.each do |f, v|
+  Zlib::GzipWriter.open(f) { |gz| gz.write(Marshal.dump(v)) }
+end
+File.binwrite("quick/Marshal.4.8/#{spec.full_name}.gemspec.rz", Zlib::Deflate.deflate(Marshal.dump(spec)))
+"#;
+    let mut ruby = Command::new("ruby");
+    ruby.args(["-e", script]).current_dir(dir);
+    cache_env::isolate(&mut ruby);
+    let out = ruby.output().expect("failed to run ruby");
+    assert!(
+        out.status.success(),
+        "building the private gem source failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// #779: a Gemfile with a second rubygems source. Bundler 2.2+ writes one
+/// GEM section per source, sorted by remote, so the `file://` source comes
+/// first and rack sits in the second GEM section. Vendor used to fail with
+/// "GEM specs has no entry". It must wire rack so a fresh frozen install
+/// loads the patched copy, and `vendor --revert` must put rack back into
+/// its own section, restoring the lock byte for byte.
+#[test]
+#[ignore = "host capstone: shells out to a real bundler >= 1.17; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+fn gem_vendor_second_gem_section_fresh_checkout_and_revert() {
+    let Some(bundler) = gate("second GEM section") else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("private-gems");
+    private_gem_source(&repo);
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let gemfile_text = format!(
+        "source \"https://rubygems.org\"\n\ngem \"rack\", \"~> 3.1\"\n\nsource \"file://{}\" do\n  gem \"aaa-internal\"\nend\n",
+        repo.display()
+    );
+    std::fs::write(proj.join("Gemfile"), &gemfile_text).unwrap();
+    let config = bundle(
+        &proj,
+        &argv(&bundler.config_local_args("path", "vendor/bundle")),
+        false,
+    );
+    let install = config
+        .status
+        .success()
+        .then(|| bundle(&proj, &["install"], false));
+    if !install.as_ref().is_some_and(|i| i.status.success()) {
+        println!(
+            "SKIP e2e_vendor_gem_build (second GEM section): fixture `bundle install` failed:\n{}",
+            install
+                .map(|i| String::from_utf8_lossy(&i.stderr).into_owned())
+                .unwrap_or_default()
+        );
+        return;
+    }
+    let lock_path = proj.join("Gemfile.lock");
+    let gemfile_path = proj.join("Gemfile");
+    let lock_before = std::fs::read(&lock_path).unwrap();
+    let gemfile_before = std::fs::read(&gemfile_path).unwrap();
+    let lock_text = String::from_utf8_lossy(&lock_before).into_owned();
+    let version = locked_gem_version(&lock_text, DEP).expect("resolved rack version");
+    if bundler.at_least(2, 2) {
+        // The premise: rack is NOT in the first GEM section. (Bundler
+        // <= 2.1 merges every rubygems remote into one GEM section; the
+        // round trip below must hold on that layout too.)
+        let sections: Vec<&str> = lock_text
+            .split("\n\n")
+            .filter(|s| s.starts_with("GEM\n"))
+            .collect();
+        let spec = format!("\n    {DEP} ({version})");
+        assert!(
+            sections.len() == 2 && !sections[0].contains(&spec) && sections[1].contains(&spec),
+            "rack must sit in the second of two GEM sections (test premise):\n{lock_text}"
+        );
+    }
+
+    let mut ruby = Command::new("ruby");
+    ruby.args(["-e", "puts Gem.ruby_api_version"]);
+    cache_env::isolate(&mut ruby);
+    let api = ruby.output().expect("failed to run ruby");
+    let api = String::from_utf8_lossy(&api.stdout).trim().to_string();
+    let installed_rb = proj
+        .join("vendor/bundle/ruby")
+        .join(&api)
+        .join("gems")
+        .join(format!("{DEP}-{version}"))
+        .join("lib/rack.rb");
+    let orig = std::fs::read(&installed_rb).expect("installed lib/rack.rb");
+    let marker = format!(
+        "\n# SOCKET-PATCH-VENDOR-E2E-MARKER\nmodule Rack\n  SOCKET_PATCH_VENDOR_E2E = \"{UUID}\"\nend\n"
+    );
+    let patched: Vec<u8> = [orig.as_slice(), marker.as_bytes()].concat();
+    let purl = format!("pkg:gem/{DEP}@{version}");
+    stage_patch_with_vuln(&proj, &purl, "lib/rack.rb", &orig, &patched);
+
+    let vendor_args = [
+        "vendor",
+        "--json",
+        "--offline",
+        "--cwd",
+        proj.to_str().unwrap(),
+    ];
+    let (code, stdout, stderr) = run_socket(&proj, &vendor_args);
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
+    assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
+
+    let copy_rel = format!(".socket/vendor/gem/{UUID}/{DEP}-{version}");
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(
+        lock.contains(&format!(
+            "PATH\n  remote: {copy_rel}\n  specs:\n    {DEP} ({version})"
+        )),
+        "canonical PATH section missing from Gemfile.lock:\n{lock}"
+    );
+    assert!(
+        lock.contains("    aaa-internal (1.0.0)"),
+        "the private source's spec stays in its GEM section:\n{lock}"
+    );
+
+    // Fresh checkout: only the committable files, frozen install, and rack
+    // loads the patched bytes from the vendored path.
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(&gemfile_path, fresh.join("Gemfile")).unwrap();
+    std::fs::copy(&lock_path, fresh.join("Gemfile.lock")).unwrap();
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    copy_dir_recursive(&proj.join(".bundle"), &fresh.join(".bundle"));
+    let lock_wired = std::fs::read(&lock_path).unwrap();
+    let ci = bundle(&fresh, &["install"], true);
+    assert!(
+        ci.status.success(),
+        "fresh-checkout frozen `bundle install` must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("Gemfile.lock")).unwrap(),
+        lock_wired,
+        "frozen install must leave the committed Gemfile.lock byte-identical"
+    );
+    let probe = bundle(
+        &fresh,
+        &[
+            "exec",
+            "ruby",
+            "-e",
+            "require \"rack\"\n\
+             abort \"probe constant missing after require\" unless defined?(Rack::SOCKET_PATCH_VENDOR_E2E)\n\
+             puts $LOADED_FEATURES.grep(%r{/rack\\.rb\\z})",
+        ],
+        false,
+    );
+    assert!(
+        probe.status.success(),
+        "bundle exec runtime probe failed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&probe.stdout).contains(&format!("{copy_rel}/lib/rack.rb")),
+        "rack must be loaded from the vendored path:\n{}",
+        String::from_utf8_lossy(&probe.stdout)
+    );
+
+    // Idempotent re-run.
+    let (code, stdout, stderr) = run_socket(&proj, &vendor_args);
+    assert_eq!(
+        code, 0,
+        "re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(std::fs::read(&lock_path).unwrap(), lock_wired);
+
+    // Revert: the spec goes back into the second GEM section.
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let renv = parse_envelope(&stdout);
+    assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");
+    assert_eq!(
+        std::fs::read(&gemfile_path).unwrap(),
+        gemfile_before,
+        "revert must restore the Gemfile byte for byte"
+    );
+    assert_eq!(
+        String::from_utf8(std::fs::read(&lock_path).unwrap()).unwrap(),
+        lock_text,
+        "revert must restore Gemfile.lock byte for byte"
+    );
+    assert!(!proj.join(".socket/vendor").exists());
+}
+
+/// #847: a declaration whose version comes from a splat, a method call or
+/// a constant. Vendor used to carry that positional argument after the
+/// inserted `path:` keyword, a Ruby syntax error, and exit 0 with a Gemfile
+/// every `bundle` command failed to parse. The exact pin supersedes it, so
+/// it is dropped like a quoted constraint (`require: false` survives). The
+/// real bundler must parse the rewritten Gemfile, install it frozen and load
+/// rack from the vendored path; revert restores the original bytes.
+#[test]
+#[ignore = "host capstone: shells out to a real bundler >= 1.17; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+fn gem_vendor_drops_positional_constraints() {
+    for gemfile in [
+        "source \"https://rubygems.org\"\n\nRV = [\"~> 3.1\"]\ngem \"rack\", *RV\n",
+        "source \"https://rubygems.org\"\n\ngem \"rack\", ENV.fetch(\"SOCKET_E2E_RV\", \"~> 3.1\")\n",
+        "source \"https://rubygems.org\"\n\nRACK_VERSION = \"~> 3.1\"\ngem \"rack\", RACK_VERSION, require: false\n",
+    ] {
+        let Some((_tmp, proj, _bundler, purl)) = staged_rack_project("positional args") else {
+            return;
+        };
+        std::fs::write(proj.join("Gemfile"), gemfile).unwrap();
+        let relock = bundle(&proj, &["install"], false);
+        assert!(
+            relock.status.success(),
+            "{gemfile:?} installs before vendor (test premise):\n{}",
+            String::from_utf8_lossy(&relock.stderr)
+        );
+        let lock_before = std::fs::read(proj.join("Gemfile.lock")).unwrap();
+
+        let (code, stdout, stderr) = run_socket(
+            &proj,
+            &[
+                "vendor",
+                "--json",
+                "--offline",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            code, 0,
+            "{gemfile:?}: vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let env = parse_envelope(&stdout);
+        assert_eq!(env["summary"]["applied"], 1, "{gemfile:?}: {env}");
+        let wired = std::fs::read_to_string(proj.join("Gemfile")).unwrap();
+
+        let install = bundle(&proj, &["install"], true);
+        assert!(
+            install.status.success(),
+            "{gemfile:?}: frozen install of the rewritten Gemfile failed:\n{wired}\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        let probe = bundle(
+            &proj,
+            &[
+                "exec",
+                "ruby",
+                "-e",
+                "print Gem.loaded_specs.fetch(\"rack\").full_gem_path",
+            ],
+            true,
+        );
+        let loaded = String::from_utf8_lossy(&probe.stdout);
+        assert!(
+            probe.status.success() && loaded.contains(".socket/vendor/gem/"),
+            "{gemfile:?}: rack must load from the vendored path ({purl}), got {loaded:?}:\n{}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+
+        let (code, stdout, stderr) = run_socket(
+            &proj,
+            &[
+                "vendor",
+                "--revert",
+                "--json",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            code, 0,
+            "{gemfile:?}: revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+            gemfile,
+            "revert restores the Gemfile byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(proj.join("Gemfile.lock")).unwrap(),
+            lock_before,
+            "revert restores Gemfile.lock byte-identical"
+        );
+    }
+}

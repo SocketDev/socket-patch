@@ -1017,6 +1017,9 @@ jobs:
           - {os: ubuntu-latest, suite: mode_migration_bun, bun: '1.2.23', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.0.36', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.1.45', test_filter: --include-ignored}
+          # Bun >= 1.4 migrating a hosted workspace bun.lockb to bun.lock
+          # (#803): the only binary-lock test whose reader must be 1.4+.
+          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.4.2', test_filter: --include-ignored workspace_text_migration_heals_on_rerun}
           # Real-vlt capstones (DESIGN §8.4): wiremock patch service and a local
           # npm registry fed from npmjs, driven by the pinned vlt release
           # (`node vlt.js`, installed below from a sha512-checked `npm pack`).
