@@ -44,14 +44,16 @@ impl RubyCrawler {
         &self,
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
-        self.get_gem_paths_with_env(
+        Ok(Self::gem_paths_and_discovery(
             options,
             std::env::var_os("BUNDLE_PATH").as_deref(),
             std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
             ambient_home().as_deref(),
             ambient_global_config_unless_ignored(&options.cwd).as_deref(),
+            bundler_ignores_config(),
         )
         .await
+        .0)
     }
 
     /// [`Self::get_gem_paths`] with the ambient `BUNDLE_PATH` /
@@ -73,6 +75,7 @@ impl RubyCrawler {
             app_config_env,
             home_env,
             global_config,
+            false,
         )
         .await
         .0)
@@ -88,6 +91,7 @@ impl RubyCrawler {
         app_config_env: Option<&OsStr>,
         home_env: Option<&OsStr>,
         global_config: Option<&Path>,
+        ignore_config: bool,
     ) -> (Vec<PathBuf>, Option<BundleStoreDiscovery>) {
         if options.global || options.global_prefix.is_some() {
             if let Some(ref custom) = options.global_prefix {
@@ -97,12 +101,13 @@ impl RubyCrawler {
         }
 
         // Local mode: probe the Bundler install roots first.
-        let discovery = Self::discover_bundle_stores_with_env(
+        let discovery = Self::discover_bundle_stores_impl(
             &options.cwd,
             bundle_path_env,
             app_config_env,
             home_env,
             global_config,
+            ignore_config,
         )
         .await;
         let mut paths = discovery.stores.clone();
@@ -158,6 +163,7 @@ impl RubyCrawler {
             std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
             ambient_home().as_deref(),
             ambient_global_config_unless_ignored(&options.cwd).as_deref(),
+            bundler_ignores_config(),
         )
         .await;
 
@@ -279,7 +285,7 @@ impl RubyCrawler {
     /// Reads the ambient `BUNDLE_PATH`/`BUNDLE_APP_CONFIG`/home
     /// environment; the `_with_env` variant takes them as parameters so
     /// tests stay hermetic. Production flows go through
-    /// [`Self::get_gem_paths`] → [`Self::discover_bundle_stores_with_env`];
+    /// [`Self::get_gem_paths`] → [`Self::discover_bundle_stores_impl`];
     /// these two are the unit-test seam pinning the store list shape.
     #[cfg(test)]
     async fn get_vendor_bundle_paths(cwd: &Path) -> Vec<PathBuf> {
@@ -340,12 +346,18 @@ impl RubyCrawler {
     /// dirs are lexically normalized and deduped so a root reachable two
     /// ways (e.g. `BUNDLE_PATH` naming `vendor/bundle`, or spelling it
     /// `vendor/x/../bundle`) is not scanned — or patched — twice.
-    async fn discover_bundle_stores_with_env(
+    ///
+    /// With `ignore_config` (`BUNDLE_IGNORE_CONFIG`, see
+    /// [`bundler_ignores_config`]) bundler reads no config file, so the app
+    /// config's `BUNDLE_PATH` is neither a root nor a refused root, and it
+    /// shadows nothing. (Callers already drop `global_config` then.)
+    async fn discover_bundle_stores_impl(
         cwd: &Path,
         bundle_path_env: Option<&OsStr>,
         app_config_env: Option<&OsStr>,
         home_env: Option<&OsStr>,
         global_config: Option<&Path>,
+        ignore_config: bool,
     ) -> BundleStoreDiscovery {
         let home = home_env.map(Path::new);
         let default_root = cwd.join("vendor").join("bundle");
@@ -353,15 +365,24 @@ impl RubyCrawler {
 
         let mut roots: Vec<PathBuf> = Vec::new();
         let mut skipped_config_path = None;
+        let mut skipped_config_root = None;
         if Self::has_bundler_manifest(cwd).await {
-            if let Some(value) = Self::app_config_bundle_path(cwd, app_config_env).await {
+            if let Some(value) =
+                Self::app_config_bundle_path(cwd, app_config_env, ignore_config).await
+            {
                 match resolve_config_bundle_path(cwd, &value, home) {
                     Some(root) => roots.push(root),
                     // Refused by the containment guard. Recorded — not
                     // printed: the crawler has no --silent/--json context,
                     // so the CLI surfaces it (see
-                    // [`config_path_ignored_warning`]).
-                    None => skipped_config_path = Some(value),
+                    // [`config_path_ignored_warning`]). The resolved root is
+                    // kept too, for READ-ONLY verification only (see
+                    // [`Self::verification_only_gem_paths`]).
+                    None => {
+                        skipped_config_root =
+                            Some(resolve_bundle_path(cwd, Path::new(&value), home));
+                        skipped_config_path = Some(value);
+                    }
                 }
             }
             if let Some(v) = bundle_path_env.filter(|v| !v.is_empty()) {
@@ -382,8 +403,8 @@ impl RubyCrawler {
             // `BUNDLE_PATH__SYSTEM` or `BUNDLE_DISABLE_SHARED_GEMS` already
             // dropped `global_config`, see
             // [`global_path_config_unless_env_path_settings`].
-            let shadowed =
-                bundle_path_env.is_some() || Self::app_config_sets_path(cwd, app_config_env).await;
+            let shadowed = bundle_path_env.is_some()
+                || (!ignore_config && Self::app_config_sets_path(cwd, app_config_env).await);
             if !shadowed {
                 if let Some(value) = read_global_config(global_config, false)
                     .await
@@ -417,6 +438,7 @@ impl RubyCrawler {
             stores,
             default_root_has_stores,
             skipped_config_path,
+            skipped_config_root,
         }
     }
 
@@ -427,14 +449,99 @@ impl RubyCrawler {
     /// advisory (`skipped_config_path`). Cheap: filesystem probes only,
     /// no `gem env` shell-out.
     pub async fn discover_bundle_stores(cwd: &Path) -> BundleStoreDiscovery {
-        Self::discover_bundle_stores_with_env(
+        Self::discover_bundle_stores_impl(
             cwd,
             std::env::var_os("BUNDLE_PATH").as_deref(),
             std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
             ambient_home().as_deref(),
             ambient_global_config_unless_ignored(cwd).as_deref(),
+            bundler_ignores_config(),
         )
         .await
+    }
+
+    /// [`Self::discover_bundle_stores_impl`] with the config files read (no
+    /// `BUNDLE_IGNORE_CONFIG`): the hermetic unit-test seam.
+    #[cfg(test)]
+    async fn discover_bundle_stores_with_env(
+        cwd: &Path,
+        bundle_path_env: Option<&OsStr>,
+        app_config_env: Option<&OsStr>,
+        home_env: Option<&OsStr>,
+        global_config: Option<&Path>,
+    ) -> BundleStoreDiscovery {
+        Self::discover_bundle_stores_impl(
+            cwd,
+            bundle_path_env,
+            app_config_env,
+            home_env,
+            global_config,
+            false,
+        )
+        .await
+    }
+
+    /// Installed-gem stores under a config-sourced `BUNDLE_PATH` the
+    /// containment guard refused (it resolves outside the project), for
+    /// READ-ONLY consumers: the hosted stale-install probe and `vex`'s
+    /// installed-copy lookup.
+    ///
+    /// The guard exists because crawled roots are apply WRITE targets, and a
+    /// committed `.bundle/config` is untrusted input. Bundler still installs
+    /// into and loads from that root, though, so a verifier that skipped it
+    /// would read "no installed copy" as "nothing to check" and attest a
+    /// patch over the unpatched gem bundler actually loads (#709). These
+    /// paths are therefore never part of [`Self::get_gem_paths`] (what apply
+    /// and rollback write through) — only of verification. Empty in global /
+    /// `--global-prefix` mode and whenever no config root was refused.
+    pub async fn verification_only_gem_paths(&self, options: &CrawlerOptions) -> Vec<PathBuf> {
+        self.verification_only_gem_paths_with_env(
+            options,
+            std::env::var_os("BUNDLE_PATH").as_deref(),
+            std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+            ambient_home().as_deref(),
+            ambient_global_config_unless_ignored(&options.cwd).as_deref(),
+            bundler_ignores_config(),
+        )
+        .await
+    }
+
+    /// [`Self::verification_only_gem_paths`] with the environment passed
+    /// explicitly (the hermetic test seam, like
+    /// [`Self::get_gem_paths_with_env`]).
+    pub async fn verification_only_gem_paths_with_env(
+        &self,
+        options: &CrawlerOptions,
+        bundle_path_env: Option<&OsStr>,
+        app_config_env: Option<&OsStr>,
+        home_env: Option<&OsStr>,
+        global_config: Option<&Path>,
+        ignore_config: bool,
+    ) -> Vec<PathBuf> {
+        if options.global || options.global_prefix.is_some() {
+            return Vec::new();
+        }
+        // Under `BUNDLE_IGNORE_CONFIG` bundler never reads the config path,
+        // so nothing is refused and there is nothing extra to verify.
+        let discovery = Self::discover_bundle_stores_impl(
+            &options.cwd,
+            bundle_path_env,
+            app_config_env,
+            home_env,
+            global_config,
+            ignore_config,
+        )
+        .await;
+        let Some(root) = discovery.skipped_config_root else {
+            return Vec::new();
+        };
+        // The same root reachable as a trusted store (env `BUNDLE_PATH`
+        // naming it too) is already probed by the regular discovery.
+        Self::bundle_root_gems_dirs(&root)
+            .await
+            .into_iter()
+            .filter(|gems_dir| !discovery.stores.contains(gems_dir))
+            .collect()
     }
 
     /// The installed-gem `gems/` dirs under one bundler install root, in
@@ -512,7 +619,14 @@ impl RubyCrawler {
     /// `bundle config set --local path <dir>` writes. The file lives at
     /// `$BUNDLE_APP_CONFIG/config`, else `<cwd>/.bundle/config`, resolved by
     /// the shared [`bundler_app_config_dir`] rule.
-    async fn app_config_bundle_path(cwd: &Path, app_config_env: Option<&OsStr>) -> Option<String> {
+    async fn app_config_bundle_path(
+        cwd: &Path,
+        app_config_env: Option<&OsStr>,
+        ignore_config: bool,
+    ) -> Option<String> {
+        if ignore_config {
+            return None;
+        }
         let config = bundler_app_config_dir(cwd, app_config_env).join("config");
         // The config lives inside the (untrusted) project tree: a planted
         // FIFO would make a plain `read_to_string` open block forever
@@ -879,6 +993,11 @@ pub struct BundleStoreDiscovery {
     /// surface it via [`config_path_ignored_warning`] on their own
     /// warning channel.
     pub skipped_config_path: Option<String>,
+    /// The install root `skipped_config_path` resolves to (`~`
+    /// expanded, relative values joined onto the project root, lexically
+    /// normalized). Never a write target: only
+    /// [`RubyCrawler::verification_only_gem_paths`] probes it, read-only.
+    pub skipped_config_root: Option<PathBuf>,
 }
 
 /// The stable warning `(code, detail)` for a config-sourced `BUNDLE_PATH`
@@ -1170,7 +1289,7 @@ fn ambient_global_config_unless_ignored(root: &Path) -> Option<PathBuf> {
 /// `Settings#path` stops at the first tier that sets either flag or `path`,
 /// and the env tier sits above the global one, so any flag value (even
 /// `"false"` or empty) shadows a global `path` — the env `BUNDLE_PATH` part
-/// of that rule is applied in [`RubyCrawler::discover_bundle_stores_with_env`].
+/// of that rule is applied in [`RubyCrawler::discover_bundle_stores_impl`].
 fn global_path_config_unless_env_path_settings(
     global_config: Option<PathBuf>,
     path_system_env: Option<&OsStr>,
@@ -2777,6 +2896,117 @@ mod tests {
         let discovery =
             RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None, None).await;
         assert_eq!(discovery.skipped_config_path, None);
+    }
+
+    /// #709: a refused out-of-tree config root stays out of the write-path
+    /// discovery (`get_gem_paths`) but is exposed, read-only, to verifiers —
+    /// bundler installs into and loads from it, so a verifier that skipped
+    /// it would mistake "never looked" for "not installed".
+    #[tokio::test]
+    async fn refused_config_root_is_verification_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"colorize\"\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".bundle"))
+            .await
+            .unwrap();
+        let gems = outside.path().join("ruby").join("3.3.0").join("gems");
+        tokio::fs::create_dir_all(gems.join("colorize-0.8.1").join("lib"))
+            .await
+            .unwrap();
+        let value = outside.path().display().to_string();
+        tokio::fs::write(
+            dir.path().join(".bundle").join("config"),
+            format!("---\nBUNDLE_PATH: \"{value}\"\n"),
+        )
+        .await
+        .unwrap();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        let crawler = RubyCrawler::new();
+
+        let discovery =
+            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None, None).await;
+        assert!(
+            !discovery
+                .stores
+                .iter()
+                .any(|s| s.starts_with(outside.path())),
+            "the refused root must never become a write-path store: {:?}",
+            discovery.stores
+        );
+        let verify = crawler
+            .verification_only_gem_paths_with_env(&options, None, None, None, None, false)
+            .await;
+        let gems = normalize_lexically(&gems).unwrap();
+        assert_eq!(verify, vec![gems.clone()]);
+        let found = crawler
+            .find_by_purls(&verify[0], &["pkg:gem/colorize@0.8.1".to_string()])
+            .await
+            .unwrap();
+        assert!(found.contains_key("pkg:gem/colorize@0.8.1"));
+
+        // `~` spelling resolves against the injected home.
+        tokio::fs::write(
+            dir.path().join(".bundle").join("config"),
+            "---\nBUNDLE_PATH: \"~/\"\n",
+        )
+        .await
+        .unwrap();
+        let verify = crawler
+            .verification_only_gem_paths_with_env(
+                &options,
+                None,
+                None,
+                Some(outside.path().as_os_str()),
+                None,
+                false,
+            )
+            .await;
+        assert_eq!(verify, vec![gems.clone()]);
+
+        // BUNDLE_IGNORE_CONFIG: bundler never reads the config path, so a
+        // leftover install there is not what it loads — nothing to verify.
+        let verify = crawler
+            .verification_only_gem_paths_with_env(
+                &options,
+                None,
+                None,
+                Some(outside.path().as_os_str()),
+                None,
+                true,
+            )
+            .await;
+        assert!(verify.is_empty(), "{verify:?}");
+
+        // The same root supplied through the trusted env is a regular store,
+        // so it is not reported a second time.
+        let verify = crawler
+            .verification_only_gem_paths_with_env(
+                &options,
+                Some(outside.path().as_os_str()),
+                None,
+                Some(outside.path().as_os_str()),
+                None,
+                false,
+            )
+            .await;
+        assert!(verify.is_empty(), "{verify:?}");
+
+        // Global mode never probes the project's bundler roots.
+        let global = CrawlerOptions {
+            global: true,
+            ..options
+        };
+        assert!(crawler
+            .verification_only_gem_paths_with_env(&global, None, None, None, None, false)
+            .await
+            .is_empty());
     }
 
     /// Unit contract for the config-root containment policy itself.

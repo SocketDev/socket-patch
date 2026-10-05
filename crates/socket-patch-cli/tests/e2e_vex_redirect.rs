@@ -2505,3 +2505,56 @@ fn rush_common_temp_install_is_hash_verified_not_lockfile_attested() {
     let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
     assert_eq!(code, Some(0), "a patched store copy attests: {env}");
 }
+
+/// Gem (#709): `bundle config set --local path <dir>` outside the project
+/// is refused as an apply WRITE root (a committed `.bundle/config` is
+/// untrusted), but bundler installs into and loads from it. `vex` must
+/// still READ it: an unpatched copy there is a failure, never the "nothing
+/// installed" absence the pinned lockfile wiring may excuse; a patched copy
+/// there attests; with nothing installed the lockfile basis still attests.
+#[test]
+fn gem_hosted_ref_is_verified_under_an_out_of_tree_config_bundle_path() {
+    const U: &str = "77777777-7777-7777-7777-777777777777";
+    let purl = "pkg:gem/rails@7.0.0";
+    let (pristine, patched) = (
+        &b"module Rails; STATUS = :vulnerable; end\n"[..],
+        &b"module Rails; STATUS = :patched; end\n"[..],
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("app");
+    let bundle = tmp.path().join("outside bundle");
+    std::fs::create_dir_all(&cwd).unwrap();
+    for file in ["Gemfile", "Gemfile.lock"] {
+        let text = redirect_fixture(&format!("gem/bundler/basic/expected/{file}"));
+        std::fs::write(cwd.join(file), text).unwrap();
+    }
+    put(
+        &cwd,
+        ".bundle/config",
+        format!("---\nBUNDLE_PATH: \"{}\"\n", bundle.display()).as_bytes(),
+    );
+    let (_rt, server) = serve_patch_views(vec![(
+        U.to_string(),
+        one_file_view(U, purl, "lib/rails.rb", pristine, patched),
+    )]);
+    let args = ["--proxy-url", &server.uri()];
+    let installed = "ruby/3.3.0/gems/rails-7.0.0/lib/rails.rb";
+
+    let (code, env) = vex_json(&cwd, &args);
+    assert_attested(&cwd, code, &env, U, "nothing installed: the pinned wiring");
+
+    put(&bundle, installed, pristine);
+    let (code, env) = vex_json(&cwd, &args);
+    assert_eq!(code, Some(1), "an unpatched configured install: {env}");
+    let reason = skipped_reason(&env, purl);
+    assert!(
+        reason == "not_applied" || reason == "hash_mismatch",
+        "the configured root was read and failed verification, got {reason}: {env}"
+    );
+
+    put(&bundle, installed, patched);
+    let (code, env) = vex_json(&cwd, &args);
+    assert_attested(&cwd, code, &env, U, "the configured install verifies");
+    // Read-only: vex never writes the refused root.
+    assert_eq!(std::fs::read(bundle.join(installed)).unwrap(), patched);
+}
