@@ -7,6 +7,10 @@ ecosystem) and `{DISC}` (its ledger discussion number), plus the version range,
 the docs and the focus areas. Substitute them everywhere below. Maintainers
 edit this file to retune every routine at once.
 
+Never edit `CHANGELOG.md` or suggest changelog entries in issues. Release
+notes are written only by the release agent when a release is cut, from the
+merged PR log and the code.
+
 ## Ledger mechanics
 Cloud sessions can't write to GitHub Discussions: GraphQL is blocked, the
 GitHub MCP has no discussion tools, and the REST discussions API is read-only.
