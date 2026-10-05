@@ -4,7 +4,6 @@
 //! dry-run flag-propagation branches each command's `run` has.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
@@ -95,11 +94,9 @@ fn make_applicable_npm_patch(root: &Path) {
 fn apply_dry_run_empty_manifest_emits_dry_run_envelope() {
     let tmp = tempfile::tempdir().expect("tempdir");
     make_socket_with_empty_manifest(tmp.path());
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args(["apply", "--json", "--dry-run"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run apply");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -165,11 +162,9 @@ fn apply_dry_run_with_real_patch_verifies_without_mutating() {
     );
 
     // ---- DRY RUN ----
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args(["apply", "--json", "--dry-run", "--offline"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run apply --dry-run");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -249,11 +244,9 @@ fn apply_dry_run_with_real_patch_verifies_without_mutating() {
     // This guarantees the dry-run assertions above are non-vacuous: the
     // patch really is applicable, so "nothing changed" under --dry-run is a
     // meaningful result rather than an artifact of an inapplicable fixture.
-    let out2 = Command::new(binary())
+    let out2 = crate::common::hermetic_command(&binary())
         .args(["apply", "--json", "--offline"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run apply (real)");
     let stdout2 = String::from_utf8_lossy(&out2.stdout);
@@ -335,11 +328,9 @@ fn apply_dry_run_human_count_excludes_vendored() {
     // Prove the fixture is non-vacuous first: in JSON mode the vendored
     // entry must classify as skipped/vendored (if the vendor ledger were
     // unreadable it would fail open and this test would assert nothing).
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args(["apply", "--json", "--dry-run", "--offline"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run apply --json --dry-run");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -366,11 +357,9 @@ fn apply_dry_run_human_count_excludes_vendored() {
 
     // The human summary must agree with that classification: only the
     // genuinely applicable package counts as patchable.
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args(["apply", "--dry-run", "--offline"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run apply --dry-run");
     assert_eq!(out.status.code(), Some(0));
@@ -387,11 +376,9 @@ fn apply_dry_run_human_count_excludes_vendored() {
 fn repair_dry_run_offline_emits_dry_run_envelope() {
     let tmp = tempfile::tempdir().expect("tempdir");
     make_socket_with_empty_manifest(tmp.path());
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args(["repair", "--json", "--dry-run", "--offline"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run repair");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -415,11 +402,9 @@ fn repair_dry_run_offline_emits_dry_run_envelope() {
 fn rollback_with_empty_manifest_emits_envelope() {
     let tmp = tempfile::tempdir().expect("tempdir");
     make_socket_with_empty_manifest(tmp.path());
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args(["rollback", "--json", "--offline"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run rollback");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -449,7 +434,7 @@ fn rollback_with_empty_manifest_emits_envelope() {
 fn remove_with_no_socket_dir_emits_manifest_not_found() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // NO .socket/ directory at all.
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args([
             "remove",
             "11111111-1111-4111-8111-111111111111",
@@ -458,8 +443,6 @@ fn remove_with_no_socket_dir_emits_manifest_not_found() {
             "--skip-rollback",
         ])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run remove");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -483,11 +466,9 @@ fn remove_with_no_socket_dir_emits_manifest_not_found() {
 fn list_with_empty_manifest_emits_empty_envelope() {
     let tmp = tempfile::tempdir().expect("tempdir");
     make_socket_with_empty_manifest(tmp.path());
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args(["list", "--json"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run list");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -511,11 +492,9 @@ fn list_with_empty_manifest_emits_empty_envelope() {
 #[test]
 fn apply_silent_no_manifest_produces_no_output() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args(["apply", "--silent"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run apply");
     assert_eq!(out.status.code(), Some(0));

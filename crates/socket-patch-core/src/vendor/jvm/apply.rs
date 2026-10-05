@@ -30,8 +30,8 @@ use super::super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::super::{RevertOpts, RevertOutcome, VendorWarning};
 use super::{
     gradle, maven_reactor, op_of, op_str, safe_coordinates, sha256_hex, Coords, JvmPlan, JvmUnplan,
-    CONFIG_LINE_KIND, CREATED_DIR_KIND, KINDS, OWNED_FILE_KIND, POM_FRAGMENT_KIND,
-    SETTINGS_FRAGMENT_KIND, TREE_KIND, VERIFICATION_FRAGMENT_KIND,
+    Shape, CONFIG_LINE_KIND, CREATED_DIR_KIND, DERIVED_METADATA_KIND, KINDS, OWNED_FILE_KIND,
+    POM_FRAGMENT_KIND, SETTINGS_FRAGMENT_KIND, TREE_KIND, VERIFICATION_FRAGMENT_KIND,
 };
 
 /// Whether `entry` was written by this backend: it has wiring and every
@@ -91,6 +91,7 @@ fn is_wiring_file(rel: &str) -> bool {
     let under_owned = rel.starts_with(".socket/") || rel.starts_with(".mvn/");
     rel == maven_reactor::MAVEN_CONFIG
         || is_owned_file(rel)
+        || gradle::is_derived_metadata_path(rel)
         || (!under_owned && (rel.ends_with(".xml") || is_settings_file(rel)))
 }
 
@@ -98,6 +99,8 @@ fn is_owned_file(rel: &str) -> bool {
     [
         maven_reactor::GITATTRIBUTES_REL,
         gradle::GITATTRIBUTES_REL,
+        gradle::SCRIPT_GITATTRIBUTES_REL,
+        gradle::VENDOR_GITATTRIBUTES_REL,
         gradle::SCRIPT_REL,
         gradle::INDEX_REL,
     ]
@@ -132,6 +135,7 @@ fn record_allowed(w: &WiringRecord, c: &Coords<'_>) -> bool {
             SETTINGS_FRAGMENT_KIND => is_settings_file(rel) && !rel.starts_with(".socket/"),
             VERIFICATION_FRAGMENT_KIND => rel == gradle::VERIFICATION_REL,
             OWNED_FILE_KIND => is_owned_file(rel),
+            DERIVED_METADATA_KIND => rel == gradle::derived_metadata_rel(c.group_id, c.artifact_id),
             TREE_KIND | super::UPSTREAM_KIND => is_own_tree_file(rel, c),
             CREATED_DIR_KIND => is_creatable_dir(rel),
             _ => false,
@@ -179,6 +183,37 @@ impl ProjectReader {
                 None
             }
         }
+    }
+
+    /// The children of the project directory `rel` (`""` = the root) for
+    /// the script graph: names, directories ending in `/`. Resolved like
+    /// [`Self::read`]; anything unsafe or unreadable lists as empty.
+    pub fn list(&self, rel: &str) -> Vec<String> {
+        let path = if rel.is_empty() {
+            match &self.canonical {
+                Some(c) => c.clone(),
+                None => return Vec::new(),
+            }
+        } else {
+            match self.resolve(rel.trim_end_matches('/')) {
+                Ok(path) => path,
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut out: Vec<String> = std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                // Followed like `read` (in-checkout links only).
+                let dir = e.metadata().ok()?.is_dir()
+                    || (e.file_type().ok()?.is_symlink() && e.path().is_dir());
+                Some(if dir { format!("{name}/") } else { name })
+            })
+            .collect();
+        out.sort();
+        out
     }
 
     /// The first path that resolved outside the checkout.
@@ -451,6 +486,41 @@ fn drifted(detail: String) -> VendorWarning {
     VendorWarning::new("vendor_lock_entry_drifted", format!("{detail}; left alone"))
 }
 
+/// Which planners wrote the wiring: `(maven, gradle)`. A mixed root's
+/// entry has both (#395).
+fn sides(wiring: &[WiringRecord]) -> (bool, bool) {
+    let gradle = is_gradle(wiring);
+    let maven = wiring.iter().any(|w| {
+        matches!(w.kind.as_str(), POM_FRAGMENT_KIND | CONFIG_LINE_KIND)
+            || w.file
+                .starts_with(&format!("{}/", maven_reactor::TREE_ROOT))
+    });
+    (maven || !gradle, gradle)
+}
+
+/// The shape a recorded entry was planned for.
+fn shape_of(wiring: &[WiringRecord]) -> Shape {
+    match sides(wiring) {
+        (true, true) => Shape::Mixed,
+        (false, true) => Shape::Gradle,
+        _ => Shape::MavenReactor,
+    }
+}
+
+/// Merge the revert plans of a mixed root's two halves.
+fn merge_unplans(a: JvmUnplan, b: JvmUnplan) -> JvmUnplan {
+    let mut changes = a.changes;
+    changes.extend(b.changes);
+    changes.sort_by(|x, y| x.0.cmp(&y.0));
+    let mut drifted = a.drifted;
+    drifted.extend(b.drifted);
+    JvmUnplan {
+        changes,
+        drifted,
+        still_wired: a.still_wired || b.still_wired,
+    }
+}
+
 /// Whether the wiring belongs to the Gradle planner.
 fn is_gradle(wiring: &[WiringRecord]) -> bool {
     wiring.iter().any(|w| {
@@ -499,7 +569,7 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
                 && w.key.as_deref().is_some_and(|k| k.starts_with("metadata:"))
                 && peers.entries.values().any(|peer| {
                     peer.base_purl != entry.base_purl
-                        && entry_wired(root, peer)
+                        && entry_references(root, peer)
                         && peer
                             .wiring
                             .iter()
@@ -508,11 +578,14 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
         })
         .cloned()
         .collect();
-    let unplan: JvmUnplan = if is_gradle(&entry.wiring) {
-        gradle::unplan(&read, &c, &records)
-    } else {
-        maven_reactor::unplan(&read, &c, &entry.wiring)
-    };
+    let (maven, gradle) = sides(&entry.wiring);
+    let mut unplan = JvmUnplan::default();
+    if gradle {
+        unplan = merge_unplans(unplan, gradle::unplan(&read, &c, &records));
+    }
+    if maven {
+        unplan = merge_unplans(unplan, maven_reactor::unplan(&read, &c, &entry.wiring));
+    }
     if let Some(rel) = reader.escaped() {
         return RevertOutcome::failed(format!(
             "refusing revert: {rel} is a symlink that leaves the project"
@@ -678,14 +751,38 @@ pub async fn sweep_replaced_tree<'e>(
     Ok(!removed.is_empty())
 }
 
-/// Whether the project still wires the JVM `entry` (its suffixed version in
-/// a reactor pom; its index rows plus the root apply line for Gradle).
+/// Whether the project still wires the JVM `entry` for `vex` (see
+/// [`entry_wired_checked`]).
 pub fn entry_wired(root: &Path, entry: &VendorEntry) -> bool {
     // Failure to read does not prove that deleting a tree is safe. Attestation
     // uses the checked variant and reports the diagnostic instead.
     entry_wired_checked(root, entry).unwrap_or(true)
 }
 
+/// Whether the project still references the JVM `entry`'s tree (its
+/// suffixed version in a reactor pom; its index rows plus the root apply
+/// line for Gradle): what a revert must not pull from under a peer.
+pub fn entry_references(root: &Path, entry: &VendorEntry) -> bool {
+    let Ok((g, a, v)) = entry_gav(entry) else {
+        return true;
+    };
+    let c = Coords {
+        group_id: &g,
+        artifact_id: &a,
+        version: &v,
+        uuid: &entry.uuid,
+    };
+    let reader = ProjectReader::new(root);
+    let read = |rel: &str| reader.read(rel);
+    let (maven, gradle) = sides(&entry.wiring);
+    (maven && maven_reactor::wired_checked(&read, &c).unwrap_or(true))
+        || (gradle && gradle::references(&read, &c))
+}
+
+/// The liveness proof `vex` needs: every half of the entry is wired, and
+/// a Gradle half's script is intact and re-plans with no refusal and no
+/// degraded warning (a conflicting rule or unchecked build logic added
+/// since vendoring withholds attestation).
 pub fn entry_wired_checked(root: &Path, entry: &VendorEntry) -> Result<bool, String> {
     let (g, a, v) = entry_gav(entry)?;
     let c = Coords {
@@ -696,11 +793,15 @@ pub fn entry_wired_checked(root: &Path, entry: &VendorEntry) -> Result<bool, Str
     };
     let reader = ProjectReader::new(root);
     let read = |rel: &str| reader.read(rel);
-    let wired = if is_gradle(&entry.wiring) {
-        gradle::wired_checked(&read, &c).map_err(|e| e.detail)
-    } else {
-        maven_reactor::wired_checked(&read, &c).map_err(|e| e.detail)
-    };
+    let list = |dir: &str| reader.list(dir);
+    let (maven, gradle) = sides(&entry.wiring);
+    let mut wired = Ok(true);
+    if gradle {
+        wired = gradle::wired_checked(&read, &list, &c).map_err(|e| e.detail);
+    }
+    if maven && wired == Ok(true) {
+        wired = maven_reactor::wired_checked(&read, &c).map_err(|e| e.detail);
+    }
     if let Some(e) = reader.read_error.borrow().as_ref() {
         return Err(e.clone());
     }
@@ -745,13 +846,25 @@ pub fn check_entry(
             }
         }
     }
-    let gradle = is_gradle(&entry.wiring);
+    let (maven, gradle) = sides(&entry.wiring);
+    let list = |dir: &str| reader.list(dir);
     let (jar, pom, module) = if gradle {
         gradle::committed(&read, &c)
     } else {
         maven_reactor::committed(&read, &c).map(|(j, p)| (j, p, None))
     }
     .ok_or_else(|| "committed JVM tree is incomplete".to_string())?;
+    let extras = if gradle {
+        gradle::committed_extras(&read, &c)
+            .ok_or_else(|| "committed JVM tree is incomplete".to_string())?
+    } else {
+        Vec::new()
+    };
+    let patched = if gradle {
+        gradle::committed_patched(&read, &c)
+    } else {
+        Vec::new()
+    };
     let patch = super::JvmPatch {
         group_id: &g,
         artifact_id: &a,
@@ -760,33 +873,39 @@ pub fn check_entry(
         jar: &jar,
         upstream_pom: &pom,
         upstream_module: module.as_deref(),
+        extra_artifacts: &extras,
+        patched_members: &patched,
     };
-    let plan = if gradle {
-        gradle::plan(&read, &patch)
-    } else {
-        let config = !entry.wiring.iter().any(|w| op_of(w) == "config_none");
-        maven_reactor::plan_with_config(&read, &patch, config)
-    }
-    .map_err(|e| e.detail)?;
+    let config = !entry.wiring.iter().any(|w| op_of(w) == "config_none");
+    let plan = super::plan_with_config(shape_of(&entry.wiring), &read, &list, &patch, config)
+        .map_err(|e| e.detail)?;
     if let Some(w) = plan.writes.first() {
         return Err(format!("vendored wiring or metadata drifted: {}", w.rel));
     }
-    if !entry_wired_checked(root, entry)? {
+    let referenced = (!maven || maven_reactor::wired_checked(&read, &c).map_err(|e| e.detail)?)
+        && (!gradle || gradle::references(&read, &c));
+    if !referenced {
         return Err("vendored artifact is no longer wired into the build".into());
     }
-    let dir = reader.resolve(&plan.tree_dir)?;
-    for item in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-        let item = item.map_err(|e| e.to_string())?;
-        let rel = format!("{}/{}", plan.tree_dir, item.file_name().to_string_lossy());
-        if !entry
-            .wiring
-            .iter()
-            .any(|w| w.kind == TREE_KIND && w.file == rel)
-        {
-            return Err(format!("unindexed vendored file: {rel}"));
+    let mut tree_dirs = vec![plan.tree_dir.clone()];
+    if maven && gradle {
+        tree_dirs.push(gradle::tree_dir(&c));
+    }
+    for tree_dir in tree_dirs {
+        let dir = reader.resolve(&tree_dir)?;
+        for item in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+            let item = item.map_err(|e| e.to_string())?;
+            let rel = format!("{tree_dir}/{}", item.file_name().to_string_lossy());
+            if !entry
+                .wiring
+                .iter()
+                .any(|w| w.kind == TREE_KIND && w.file == rel)
+            {
+                return Err(format!("unindexed vendored file: {rel}"));
+            }
         }
     }
-    if !gradle {
+    if maven {
         if let Some(repo) = local_repo {
             for ext in ["jar", "pom"] {
                 let sv = c.suffixed_version();
@@ -853,6 +972,28 @@ pub(crate) fn checked_tree_jar_path(
 
 pub fn checked_tree_jar(root: &Path, entry: &VendorEntry, uuid: &str) -> Result<String, String> {
     let rel = checked_tree_jar_path(root, entry, uuid)?;
+    // The jar alone does not make a usable tree: a missing classifier jar,
+    // pom or derived metadata file fails resolution, so `repair` restores
+    // it from the same download (#533, #511).
+    let (g, a, v) = entry_gav(entry).map_err(|_| "vendor_path_unsafe")?;
+    let c = Coords {
+        group_id: &g,
+        artifact_id: &a,
+        version: &v,
+        uuid,
+    };
+    let reader = ProjectReader::new(root);
+    for w in &entry.wiring {
+        let needed = w.kind == TREE_KIND || w.kind == DERIVED_METADATA_KIND;
+        if needed && record_allowed(w, &c) && reader.read(&w.file).is_none() {
+            // A tree reached through a link out of the checkout is no
+            // missing file a repair may restore there.
+            if reader.escaped().is_some() {
+                return Err("vendor_path_unsafe".into());
+            }
+            return Err("vendor_artifact_missing".into());
+        }
+    }
     if rel.starts_with(".socket/vendor/maven2/") {
         return Ok(rel);
     }
@@ -941,6 +1082,13 @@ mod tests {
                 ".socket/gradle/socket-patch.settings.gradle",
             ),
             (OWNED_FILE_KIND, ".socket/vendor/maven2/.gitattributes"),
+            (OWNED_FILE_KIND, ".socket/gradle/.gitattributes"),
+            (OWNED_FILE_KIND, ".socket/vendor/.gitattributes"),
+            (
+                DERIVED_METADATA_KIND,
+                ".socket/vendor/gradle/g/a/maven-metadata.xml",
+            ),
+            (TREE_KIND, ".socket/vendor/gradle/g/a/1/a-1-tests.jar"),
             (
                 TREE_KIND,
                 ".socket/vendor/maven2/g/a/1-socket.1d3c1fd2/a-1-socket.1d3c1fd2.jar",
@@ -964,6 +1112,16 @@ mod tests {
             (SETTINGS_FRAGMENT_KIND, "build.gradle"),
             (VERIFICATION_FRAGMENT_KIND, "gradle/other.xml"),
             (OWNED_FILE_KIND, ".socket/vendor/state.json"),
+            (OWNED_FILE_KIND, ".gitattributes"),
+            (
+                DERIVED_METADATA_KIND,
+                ".socket/vendor/gradle/g/b/maven-metadata.xml",
+            ),
+            (
+                DERIVED_METADATA_KIND,
+                ".socket/vendor/gradle/g/a/1/maven-metadata.xml",
+            ),
+            (DERIVED_METADATA_KIND, "maven-metadata.xml"),
             (
                 TREE_KIND,
                 ".socket/vendor/maven2/g/a/1-socket.99999999/a.jar",

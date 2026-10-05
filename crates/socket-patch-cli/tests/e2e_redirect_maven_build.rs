@@ -52,6 +52,8 @@
 //! `SOCKET_PATCH_MAVEN_E2E_{MVN,VERSION,REQUIRED}` gates in
 //! `maven_build_common`.
 
+#[path = "hosted_maven_common/mod.rs"]
+mod hosted_maven_common;
 #[path = "maven_build_common/mod.rs"]
 mod maven_build_common;
 #[path = "vex_e2e_common/mod.rs"]
@@ -60,10 +62,9 @@ mod vex_e2e_common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use hosted_maven_common::{Hosted, Server};
 use maven_build_common::*;
 use vex_e2e_common::*;
-use wiremock::matchers::{method, path, path_regex};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const SUITE: &str = "e2e_redirect_maven_build";
 const ORG: &str = "test-org";
@@ -76,26 +77,35 @@ const GHSA: &str = "GHSA-redirect-maven-real";
 const CVE: &str = "CVE-2026-7201";
 const PRODUCT: &str = "pkg:maven/com.example/app@1.0.0";
 
+const HOSTED: Hosted = Hosted {
+    org: ORG,
+    uuid: UUID,
+    hex8: HEX8,
+    token: TOKEN,
+    ghsa: GHSA,
+    cve: CVE,
+    group: GROUP,
+    artifact: ARTIFACT,
+    version: VERSION,
+    title: "maven hosted capstone",
+};
+
 fn suffixed() -> String {
-    format!("{VERSION}-socket.{HEX8}")
+    HOSTED.suffixed()
 }
 
 /// The Socket repository path (mirror target and index url path).
 fn repo_path() -> String {
-    format!("/patch-registry/maven/{TOKEN}/{UUID}/maven2")
+    HOSTED.repo_path()
 }
 
 fn prod_index_url() -> String {
-    format!("https://patch.socket.dev{}", repo_path())
+    HOSTED.prod_index_url()
 }
 
 /// `<repo>/<g>/<a>/<sfx>/<a>-<sfx>.<ext>` under the Socket repository.
 fn served_path(ext: &str) -> String {
-    let sfx = suffixed();
-    format!(
-        "{}/{GROUP_PATH}/{ARTIFACT}/{sfx}/{ARTIFACT}-{sfx}.{ext}",
-        repo_path()
-    )
+    HOSTED.served_path(ext)
 }
 
 /// The record's file key: the version-dir jar name (the consumed copy is
@@ -108,141 +118,16 @@ fn jar_key() -> String {
 /// own `<version>` right after `</parent>`; the parent and the
 /// dependencies — the transitive — are untouched).
 fn served_pom(upstream: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8(upstream.to_vec()).expect("utf-8 pom");
-    let after_parent = text.find("</parent>").expect("commons-text has a parent") + 9;
-    let needle = format!("<version>{VERSION}</version>");
-    let at = after_parent + text[after_parent..].find(&needle).expect("project version");
-    let mut out = text.clone();
-    out.replace_range(
-        at..at + needle.len(),
-        &format!("<version>{}</version>", suffixed()),
+    let out = HOSTED.served_pom(upstream);
+    assert!(
+        String::from_utf8_lossy(&out).contains("commons-lang3"),
+        "transitive kept"
     );
-    assert!(out.contains("commons-lang3"), "transitive kept");
-    out.into_bytes()
+    out
 }
 
-/// A wiremock server with its own runtime (the CLI and Maven run as
-/// blocking child processes on the test thread).
-struct Server {
-    server: MockServer,
-    rt: tokio::runtime::Runtime,
-}
-
-impl Server {
-    fn start() -> Self {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        let server = rt.block_on(MockServer::start());
-        Server { server, rt }
-    }
-
-    fn uri(&self) -> String {
-        self.server.uri()
-    }
-
-    fn get(&self, route: &str, status: u16, body: Vec<u8>) {
-        self.rt.block_on(
-            Mock::given(method("GET"))
-                .and(path(route.to_string()))
-                .respond_with(ResponseTemplate::new(status).set_body_bytes(body))
-                .mount(&self.server),
-        );
-    }
-
-    /// Serve `jar` + `pom` (and `.sha1` sidecars: `jar_sha1` overrides the
-    /// jar's) as the Socket repository's suffixed GAV.
-    fn serve_repo(&self, jar: &[u8], pom: &[u8], jar_sha1: Option<String>) {
-        self.get(&served_path("jar"), 200, jar.to_vec());
-        self.get(
-            &format!("{}.sha1", served_path("jar")),
-            200,
-            jar_sha1.unwrap_or_else(|| sha1_hex(jar)).into_bytes(),
-        );
-        self.get(&served_path("pom"), 200, pom.to_vec());
-        self.get(
-            &format!("{}.sha1", served_path("pom")),
-            200,
-            sha1_hex(pom).into_bytes(),
-        );
-    }
-
-    fn paths(&self) -> Vec<String> {
-        self.rt
-            .block_on(self.server.received_requests())
-            .unwrap_or_default()
-            .iter()
-            .map(|r| r.url.path().to_string())
-            .collect()
-    }
-}
-
-/// The API `scan --mode hosted` drives: batch discovery, the by-package
-/// listing, the reference grant (maven2 override, production-shaped urls)
-/// and the patch view.
 fn mount_api(s: &Server, jar: &[u8], pom: &[u8], view: &serde_json::Value) {
-    let purl = purl();
-    let artifact_url = format!(
-        "https://patch.socket.dev/patch/maven/{GROUP}/{ARTIFACT}/{VERSION}/{TOKEN}/{UUID}/{ARTIFACT}-{}.jar",
-        suffixed()
-    );
-    let mounts = [
-        Mock::given(method("POST"))
-            .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "packages": [{ "purl": purl, "patches": [{
-                    "uuid": UUID, "purl": purl, "tier": "free", "cveIds": [CVE],
-                    "ghsaIds": [GHSA], "severity": "high", "title": "maven hosted capstone"
-                }] }],
-                "canAccessPaidPatches": false,
-            }))),
-        Mock::given(method("GET"))
-            .and(path_regex(format!(
-                "^/v0/orgs/{ORG}/patches/by-package/.+$"
-            )))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "patches": [{
-                    "uuid": UUID, "purl": purl, "publishedAt": "2026-01-01T00:00:00Z",
-                    "description": "d", "license": "MIT", "tier": "free",
-                    "vulnerabilities": view["vulnerabilities"].clone()
-                }],
-                "canAccessPaidPatches": false,
-            }))),
-        Mock::given(method("POST"))
-            .and(path(format!("/v0/orgs/{ORG}/patches/package")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "results": { UUID: {
-                    "status": "granted",
-                    "url": artifact_url,
-                    "purl": purl,
-                    "artifacts": [{
-                        "kind": "tarball",
-                        "url": artifact_url,
-                        "integrity": { "sha1": sha1_hex(jar), "sha256": sha256_hex(jar) }
-                    }],
-                    "registryOverride": {
-                        "kind": "maven2",
-                        "indexUrl": prod_index_url(),
-                        "identifiers": {
-                            "name": format!("{GROUP}/{ARTIFACT}"),
-                            "version": VERSION,
-                            "mavenGroupId": GROUP,
-                            "mavenArtifactId": ARTIFACT,
-                            "mavenSuffixedVersion": suffixed(),
-                            "mavenPomSha256": sha256_hex(pom),
-                        }
-                    }
-                } }
-            }))),
-        Mock::given(method("GET"))
-            .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(view.clone())),
-    ];
-    for m in mounts {
-        s.rt.block_on(m.mount(&s.server));
-    }
+    hosted_maven_common::mount_api(s, &HOSTED, jar, pom, view);
 }
 
 /// `socket-patch <args>` with ambient `SOCKET_*` scrubbed and the per-test
@@ -336,7 +221,7 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
     );
     let server = Server::start();
     mount_api(&server, &patched_jar, &sfx_pom, &view);
-    server.serve_repo(&patched_jar, &sfx_pom, None);
+    server.serve_repo(&HOSTED, &patched_jar, &sfx_pom, None);
 
     // 3. The real writer: three-file rewrite + in-run VEX, no ledger.
     let (code, env, stderr) = socket(
@@ -415,7 +300,7 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
     let bad = Server::start();
     let mut tampered = patched_jar.clone();
     tampered.extend_from_slice(b"TAMPER");
-    bad.serve_repo(&tampered, &sfx_pom, Some(sha1_hex(&patched_jar)));
+    bad.serve_repo(&HOSTED, &tampered, &sfx_pom, Some(sha1_hex(&patched_jar)));
     let bad_settings = root.join("settings-bad.xml");
     let bad_url = format!("{}{}", bad.uri(), repo_path());
     write_settings(
@@ -435,7 +320,7 @@ fn maven_scan_hosted_fresh_checkout_install_and_manifestless_vex() {
     // MATCHING `.sha1` passes transport validation; only the committed
     // sha256 summary can catch it.
     let resigned = Server::start();
-    resigned.serve_repo(&tampered, &sfx_pom, None);
+    resigned.serve_repo(&HOSTED, &tampered, &sfx_pom, None);
     let resigned_settings = root.join("settings-resigned.xml");
     let resigned_url = format!("{}{}", resigned.uri(), repo_path());
     write_settings(
