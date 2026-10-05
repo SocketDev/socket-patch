@@ -992,3 +992,39 @@ pub(crate) fn expect_failed(
         }
     }
 }
+
+/// The `package.json` layouts a Windows / editor-written manifest arrives
+/// in, each paired with a tag for assertion messages: CRLF, a UTF-8 BOM,
+/// and BOM + CRLF + tab indent. `relayout(lf_text)` converts an LF,
+/// two-space-indented oracle into the same layout, so a vendored oracle
+/// and the pre-vendor bytes can both be compared byte-for-byte.
+pub(crate) const JSON_LAYOUTS: [(&str, bool, bool, bool); 3] = [
+    ("crlf", false, true, false),
+    ("bom", true, false, false),
+    ("bom+crlf+tab", true, true, true),
+];
+
+/// `text` (LF, two-space indent) in the given layout.
+pub(crate) fn relayout(text: &str, bom: bool, crlf: bool, tab: bool) -> String {
+    let mut out = String::new();
+    if bom {
+        out.push('\u{feff}');
+    }
+    for line in text.split_inclusive('\n') {
+        let line = if tab {
+            let body = line.trim_start_matches(' ');
+            let depth = (line.len() - body.len()) / 2;
+            format!("{}{body}", "\t".repeat(depth))
+        } else {
+            line.to_string()
+        };
+        match line.strip_suffix('\n') {
+            Some(content) if crlf => {
+                out.push_str(content);
+                out.push_str("\r\n");
+            }
+            _ => out.push_str(&line),
+        }
+    }
+    out
+}

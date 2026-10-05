@@ -22,7 +22,9 @@ environment plugin, source table or conditional override is refused before
 writing. Use agent mode (`scan --mode agent` + `socket-patch apply` in CI) for these shapes. Hosted PEP 735 groups are
 supported; vendored groups are refused because Hatch does not expand
 `{root:uri}` within dependency groups. Unknown direct sources require an
-explicit revert before patching.
+explicit revert before patching. A hosted scan re-pins socket-patch's own
+earlier hosted reference (same package and version on the patch server)
+when the grant rotates or a newer patch supersedes it.
 
 Repeated vendored scans compare the declared source with the committed
 artifact path and digest, and verify an existing wheel's bytes. Missing
