@@ -29,7 +29,8 @@ use super::pypi_pdm::{PdmProject, PdmTarget};
 use super::pypi_pipenv::{PipenvProject, PipenvTarget};
 use super::pypi_poetry::{PoetryProject, PoetryTarget};
 use super::pypi_requirements::{
-    preflight_requirements, revert_requirements, wire_requirements, RequirementsTarget,
+    preflight_requirements, revert_requirements, rewire_requirements, wire_requirements,
+    RequirementsTarget,
 };
 use super::pypi_uv::{
     check_target_guards, load_uv_project, revert_uv, wire_uv, UvProject, UvTarget,
@@ -423,6 +424,9 @@ enum WiringPlan {
     Uv(Box<UvProject>),
     PythonLocks(super::pypi_lock::PythonLocks),
     Requirements,
+    /// Re-wire the vendor lines an OLDER patch uuid's ledger entry recorded
+    /// to this uuid in place (#765).
+    RequirementsRewire(Box<VendorEntry>),
     Hatch(super::pypi_hatch::HatchProject),
     Poetry(Box<PoetryProject>),
     Pdm(Box<PdmProject>),
@@ -608,6 +612,7 @@ async fn pipenv_stale_install_warning(
     purl: &str,
     record: &PatchRecord,
     listings: &InstalledSiteListings,
+    lock: &serde_json::Value,
 ) -> Option<VendorWarning> {
     use crate::crawlers::python_crawler::find_local_venv_site_packages;
     let sites = find_local_venv_site_packages(project_root).await;
@@ -623,10 +628,11 @@ async fn pipenv_stale_install_warning(
         .map(|d| d.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    let remedy = super::pypi_pipenv::stale_install_remedy(Some(lock), &name);
     Some(VendorWarning::new(
         "pypi_pipenv_stale_install",
         format!(
-            "{purl}: the UNPATCHED upstream release is still installed in {listed}. Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired Pipfile.lock only protects fresh installs. Reinstall it from the lock without touching the Pipfile: `pipenv run pip uninstall -y {name} && pipenv sync` (`pipenv install --deploy` before Pipenv 2018), or `pipenv --rm && pipenv sync` for a clean virtualenv — NOT `pipenv uninstall`, which rewrites the Pipfile and re-locks the patch away; then `socket-patch vex` re-verifies the installed files."
+            "{purl}: the UNPATCHED upstream release is still installed in {listed}. Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired Pipfile.lock only protects fresh installs. {remedy}; then `socket-patch vex` re-verifies the installed files."
         ),
     ))
 }
@@ -861,6 +867,7 @@ async fn pypi_prelude<'p>(
                     WiringPlan::InSync
                 }
                 Ok(RequirementsTarget::Fresh) => WiringPlan::Requirements,
+                Ok(RequirementsTarget::Rewire { prev }) => WiringPlan::RequirementsRewire(prev),
                 Err((code, detail)) => return Err(refused(code, detail)),
             }
         }
@@ -943,8 +950,14 @@ async fn pypi_prelude<'p>(
             }
             // Both a fresh vendor and a re-run over an already-wired lock
             // keep warning while the venv still holds the upstream release.
-            if let Some(stale) =
-                pipenv_stale_install_warning(project_root, purl, record, installed_sites).await
+            if let Some(stale) = pipenv_stale_install_warning(
+                project_root,
+                purl,
+                record,
+                installed_sites,
+                &project.lock,
+            )
+            .await
             {
                 warnings.push(stale);
             }
@@ -1316,6 +1329,16 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         )
         .await
         .map(|wiring| (wiring, MetaSlot::None)),
+        WiringPlan::RequirementsRewire(prev) => rewire_requirements(
+            project_root,
+            &prev,
+            &canon_name,
+            version,
+            &rel_wheel,
+            &artifact.sha256_hex,
+        )
+        .await
+        .map(|wiring| (wiring, MetaSlot::None)),
         WiringPlan::Poetry(project) => super::pypi_poetry::wire_poetry(
             &project,
             project_root,
@@ -1420,6 +1443,22 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
 /// from state.json).
 pub async fn revert_pypi(entry: &VendorEntry, project_root: &Path, dry_run: bool) -> RevertOutcome {
     revert_pypi_opts(entry, project_root, RevertOpts::new(dry_run)).await
+}
+
+/// Is this pypi-vendored entry still consumed by its project? The prune GC
+/// and the vendored discovery supplement ask this; `None` keeps the entry.
+///
+/// Only the `requirements` flavor has a probe: its requirements tree is
+/// the lock pip installs from, so a pin the user removed or bumped there
+/// proves the entry unused. The other flavors report `None` (cannot
+/// determine), as before.
+pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
+    match entry.flavor.as_deref() {
+        Some("requirements") => {
+            super::pypi_requirements::requirements_entry_in_use(project_root, &entry.uuid).await
+        }
+        _ => None,
+    }
 }
 
 /// Fail-closed twin of [`super::npm_lock::guard_unwired_textual_revert`]
@@ -2340,6 +2379,58 @@ mod tests {
         }
     }
 
+    /// #790: the vendored stale-install remedy re-syncs the lock category
+    /// that pins the package. Plain `pipenv sync` installs only `default`,
+    /// so for a `[dev-packages]` entry it uninstalled the package and left
+    /// it uninstalled.
+    #[tokio::test]
+    async fn pipenv_stale_install_remedy_names_the_develop_category() {
+        let fx = e2e_fixture().await;
+        // The venv probe reads `.venv\Lib\site-packages` on Windows, so mirror
+        // the fixture's POSIX-layout install there.
+        if cfg!(windows) {
+            let sp = fx.root.join(".venv").join("Lib").join("site-packages");
+            let di = sp.join("six-1.16.0.dist-info");
+            std::fs::create_dir_all(&di).unwrap();
+            std::fs::copy(fx.site_packages.join("six.py"), sp.join("six.py")).unwrap();
+            for leaf in ["METADATA", "WHEEL", "RECORD"] {
+                std::fs::copy(
+                    fx.site_packages.join("six-1.16.0.dist-info").join(leaf),
+                    di.join(leaf),
+                )
+                .unwrap();
+            }
+        }
+        let lock: serde_json::Value = serde_json::from_str(
+            r#"{"_meta": {"pipfile-spec": 6}, "default": {}, "develop": {"six": {"version": "==1.16.0"}}}"#,
+        )
+        .unwrap();
+        let warning = pipenv_stale_install_warning(
+            &fx.root,
+            "pkg:pypi/six@1.16.0",
+            &fx.record,
+            &InstalledSiteListings::default(),
+            &lock,
+        )
+        .await
+        .expect("the upstream six.py is installed");
+        assert_eq!(warning.code, "pypi_pipenv_stale_install");
+        assert!(
+            warning
+                .detail
+                .contains("`pipenv run pip uninstall -y six && pipenv sync --dev`"),
+            "{}",
+            warning.detail
+        );
+        assert!(
+            warning
+                .detail
+                .contains("`pipenv --rm && pipenv sync --dev` for a clean virtualenv"),
+            "{}",
+            warning.detail
+        );
+    }
+
     #[tokio::test]
     async fn end_to_end_requirements_vendor_and_revert() {
         let fx = e2e_fixture().await;
@@ -2727,12 +2818,195 @@ wheels = [
         );
     }
 
-    /// A requirements file already wired to an EARLIER patch uuid for the
-    /// same package refuses (mirrors uv/poetry): appending a second wheel
-    /// line would leave pip two competing requirements, and the new entry
-    /// would clobber the old one's ledger record, orphaning its line.
+    /// #765: a requirements tree already wired to an EARLIER patch uuid for
+    /// the same package re-vendors in place to the superseding uuid, as the
+    /// `would_revendor` preview and the CLI contract promise. Every recorded
+    /// vendor line (a rewritten root pin with a marker, a pin in a `-r`
+    /// include, an appended transitive line) moves to the new wheel path,
+    /// keeps its marker / hash mode / `(transitive)` note, and keeps the
+    /// pre-vendor original, so `vendor --revert` of the NEW entry restores
+    /// the user's files byte for byte.
     #[tokio::test]
-    async fn requirements_stale_uuid_vendor_line_refuses() {
+    async fn requirements_superseding_uuid_revendors_in_place() {
+        const UUID2: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let hex = "0".repeat(64);
+        let shapes: Vec<(&str, Vec<(&str, String)>)> = vec![
+            ("unhashed", vec![("requirements.txt", "six==1.16.0\nidna==3.7\n".into())]),
+            (
+                "hashed, marker, continuation, CRLF",
+                vec![(
+                    "requirements.txt",
+                    format!("six==1.16.0 ; python_version >= \"3\" \\\r\n    --hash=sha256:{hex}\r\nidna==3.7 --hash=sha256:{hex}\r\n"),
+                )],
+            ),
+            (
+                "-r include",
+                vec![
+                    ("requirements.txt", "-r base.txt\nidna==3.7\n".into()),
+                    ("base.txt", "six==1.16.0\n".into()),
+                ],
+            ),
+            ("transitive", vec![("requirements.txt", "idna==3.7\n".into())]),
+        ];
+        for (shape, files) in shapes {
+            let fx = e2e_fixture().await;
+            for (name, text) in &files {
+                touch(&fx.root, name, text).await;
+            }
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let vendor_with = |record: PatchRecord| {
+                let sources = &sources;
+                let fx = &fx;
+                async move {
+                    crate::vendor::test_support::vendor_pypi(
+                        "pkg:pypi/six@1.16.0",
+                        &fx.site_packages,
+                        &fx.root,
+                        &record,
+                        sources,
+                        "2026-06-09T00:00:00Z",
+                        false,
+                        false,
+                        None,
+                    )
+                    .await
+                }
+            };
+            let VendorOutcome::Done { result, entry, .. } = vendor_with(fx.record.clone()).await
+            else {
+                panic!("{shape}: first vendor must be Done");
+            };
+            assert!(result.success, "{shape}: {:?}", result.error);
+            let first = entry.expect("entry on success");
+            save_ledger_entry(&fx.root, &first).await;
+
+            // Same package, new patch generation (different uuid).
+            let mut record2 = fx.record.clone();
+            record2.uuid = UUID2.to_string();
+            let outcome = vendor_with(record2).await;
+            let VendorOutcome::Done { result, entry, .. } = outcome else {
+                panic!("{shape}: superseding uuid must re-vendor, got {outcome:?}");
+            };
+            assert!(result.success, "{shape}: {:?}", result.error);
+            let second = entry.expect("entry on success");
+            assert_eq!(second.uuid, UUID2);
+            assert_eq!(second.wiring.len(), first.wiring.len(), "{shape}");
+            for (old, new) in first.wiring.iter().zip(&second.wiring) {
+                assert_eq!(
+                    (&old.file, &old.action, &old.key, &old.original),
+                    (&new.file, &new.action, &new.key, &new.original),
+                    "{shape}: the pre-vendor original is carried over"
+                );
+                let line = new.new.as_ref().and_then(|v| v.as_str()).unwrap();
+                let old_line = old.new.as_ref().and_then(|v| v.as_str()).unwrap();
+                assert_eq!(line, old_line.replace(UUID, UUID2), "{shape}");
+            }
+            for (name, _) in &files {
+                let text = tokio::fs::read_to_string(fx.root.join(name)).await.unwrap();
+                assert!(!text.contains(UUID), "{shape}: {name} kept uuid A:\n{text}");
+            }
+            let wired: String = {
+                let mut all = String::new();
+                for (name, _) in &files {
+                    all.push_str(&tokio::fs::read_to_string(fx.root.join(name)).await.unwrap());
+                }
+                all
+            };
+            assert_eq!(
+                wired.matches(UUID2).count(),
+                1,
+                "{shape}: one six line:\n{wired}"
+            );
+            assert!(fx
+                .root
+                .join(format!(".socket/vendor/pypi/{UUID2}/{WHEEL_NAME}"))
+                .is_file());
+
+            // Revert of the NEW entry restores every file byte for byte.
+            save_ledger_entry(&fx.root, &second).await;
+            let reverted = revert_pypi(&second, &fx.root, false).await;
+            assert!(reverted.success, "{shape}: {:?}", reverted.error);
+            assert!(
+                reverted.warnings.is_empty(),
+                "{shape}: {:?}",
+                reverted.warnings
+            );
+            for (name, text) in &files {
+                assert_eq!(
+                    &tokio::fs::read_to_string(fx.root.join(name)).await.unwrap(),
+                    text,
+                    "{shape}: {name} restored"
+                );
+            }
+        }
+    }
+
+    /// #765: a re-wire replays only what the older entry's ledger recorded. A
+    /// vendor line edited since vendoring (no longer verbatim what the ledger
+    /// recorded) refuses before anything is written.
+    #[tokio::test]
+    async fn requirements_superseding_uuid_drifted_line_refuses() {
+        const UUID2: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let vendor_with = |record: PatchRecord| {
+            let sources = &sources;
+            let fx = &fx;
+            async move {
+                crate::vendor::test_support::vendor_pypi(
+                    "pkg:pypi/six@1.16.0",
+                    &fx.site_packages,
+                    &fx.root,
+                    &record,
+                    sources,
+                    "2026-06-09T00:00:00Z",
+                    false,
+                    false,
+                    None,
+                )
+                .await
+            }
+        };
+        let VendorOutcome::Done { result, entry, .. } = vendor_with(fx.record.clone()).await else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        save_ledger_entry(&fx.root, &entry.expect("entry on success")).await;
+        let wired = tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+            .await
+            .unwrap();
+        let drifted = wired.replace(
+            "  # socket-patch vendor:",
+            " --no-deps  # socket-patch vendor:",
+        );
+        assert_ne!(drifted, wired);
+        touch(&fx.root, "requirements.txt", &drifted).await;
+
+        let mut record2 = fx.record.clone();
+        record2.uuid = UUID2.to_string();
+        let outcome = vendor_with(record2).await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "pypi_requirements_already_vendored");
+        assert!(detail.contains("changed since vendoring"), "{detail}");
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            drifted
+        );
+        assert!(!fx
+            .root
+            .join(format!(".socket/vendor/pypi/{UUID2}"))
+            .exists());
+    }
+
+    /// #765: without a ledger entry for the older uuid there is no recorded
+    /// pre-vendor original to carry forward, so a re-wire could never be
+    /// reverted. That case still refuses, before anything is written.
+    #[tokio::test]
+    async fn requirements_superseding_uuid_without_ledger_refuses() {
         const UUID2: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
         let fx = e2e_fixture().await;
         let sources = PatchSources::blobs_only(&fx.blobs);
@@ -2762,7 +3036,7 @@ wheels = [
             .await
             .unwrap();
 
-        // Same package, new patch generation (different uuid).
+        // No state.json was persisted (a lost or never-committed ledger).
         let mut record2 = fx.record.clone();
         record2.uuid = UUID2.to_string();
         let outcome = vendor_with(record2).await;
@@ -3557,8 +3831,13 @@ wheels = [
         tokio::fs::remove_dir_all(&uuid_dir).await.unwrap();
         let bytes = served_wheel(b"service wheel at another filename");
         let server = wiremock::MockServer::start().await;
-        mount_pypi_granted(&server, "six-1.16.0-py3-none-any.whl", &sri_sha512(&bytes), &bytes)
-            .await;
+        mount_pypi_granted(
+            &server,
+            "six-1.16.0-py3-none-any.whl",
+            &sri_sha512(&bytes),
+            &bytes,
+        )
+        .await;
         let cfg = pypi_service_cfg(&server.uri(), VendorSource::Service, false);
         let error = crate::vendor::test_support::expect_failure(vendor(Some(cfg)).await);
         assert!(
