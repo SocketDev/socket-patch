@@ -6,7 +6,6 @@
 //! failure into a fake success fails loudly.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -116,7 +115,7 @@ async fn get_uuid_with_401_falls_back_to_proxy() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args([
             "get",
             UUID,
@@ -199,7 +198,7 @@ async fn get_uuid_with_500_reports_error() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args([
             "get",
             UUID,
@@ -239,7 +238,7 @@ async fn get_uuid_with_malformed_json_reports_parse_error() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args([
             "get",
             UUID,
@@ -281,7 +280,7 @@ async fn scan_with_400_bad_request_reports_failure() {
     write_root(tmp.path());
     write_npm_package(tmp.path(), "foo");
 
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args([
             "scan",
             "--json",
@@ -323,7 +322,7 @@ async fn scan_with_400_bad_request_reports_failure() {
 async fn get_with_unreachable_api_url_reports_error() {
     let tmp = tempfile::tempdir().unwrap();
     // Port 1 is reserved and reliably refuses connections.
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args([
             "get",
             UUID,
@@ -354,7 +353,7 @@ async fn scan_with_unreachable_api_url_reports_failure() {
     write_root(tmp.path());
     write_npm_package(tmp.path(), "bar");
 
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args([
             "scan",
             "--json",
@@ -397,7 +396,7 @@ async fn get_by_cve_with_500_reports_error() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args([
             "get",
             cve,
@@ -434,7 +433,7 @@ async fn get_by_ghsa_with_404_reports_not_found() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args([
             "get",
             ghsa,
@@ -510,7 +509,7 @@ async fn repair_with_blob_404_marks_failure_in_summary() {
     )
     .unwrap();
 
-    let out = Command::new(binary())
+    let out = crate::common::hermetic_command(&binary())
         .args([
             "repair",
             "--json",

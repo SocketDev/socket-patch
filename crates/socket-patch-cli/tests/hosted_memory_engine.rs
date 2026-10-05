@@ -990,6 +990,53 @@ async fn a_vlt_project_is_withheld_as_offline() {
     assert!(output.changed_files.is_empty());
 }
 
+/// #736: the engine's purl set comes from the lock bundler loads. A
+/// `gems.rb` project's gems live in `gems.locked`; reading only
+/// `Gemfile.lock` found nothing to redirect, and a leftover `Gemfile.lock`
+/// beside it must not change that.
+#[tokio::test]
+async fn gems_rb_project_yields_its_gem_candidates() {
+    const GEM_FIXTURE: &str = "redirect/gem/bundler/basic";
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(
+        &fixtures_root().join(GEM_FIXTURE).join("overrides.json"),
+        None,
+    );
+    mount_api(&server, &patches).await;
+    let input = fixture_files(&fixtures_root().join(GEM_FIXTURE).join("input"));
+    let renamed = |stale_twin: bool| {
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), input["Gemfile"].clone());
+        files.insert("gems.locked".to_string(), input["Gemfile.lock"].clone());
+        if stale_twin {
+            // Locks nothing the patch API knows about.
+            files.insert(
+                "Gemfile.lock".to_string(),
+                b"GEM\n  remote: https://rubygems.org/\n  specs:\n    rake (13.0.0)\n\n\
+                  PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rake\n"
+                    .to_vec(),
+            );
+        }
+        files
+    };
+    for stale_twin in [false, true] {
+        let output = run_engine(
+            &server,
+            build_input(&renamed(stale_twin), &[], options(true)),
+        )
+        .await;
+        assert_eq!(output.projects.len(), 1);
+        let project = &output.projects[0];
+        assert!(project.error.is_none(), "{:?}", project.error);
+        assert_eq!(
+            project.redirected.len(),
+            1,
+            "stale twin {stale_twin}: {}",
+            serde_json::to_string_pretty(&comparable(&output)).unwrap()
+        );
+    }
+}
+
 /// #718 in the in-memory engine: a yarn berry pin of a package with a `bin`
 /// takes the map from the served tarball's own package.json (fetched
 /// through the provider, like wheel metadata), and a tarball it cannot

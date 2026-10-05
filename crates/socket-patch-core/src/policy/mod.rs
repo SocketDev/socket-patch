@@ -15,8 +15,6 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
-
 use crate::api::ranking::max_severity_order;
 use crate::api::types::PatchSearchResult;
 use crate::crawlers::Ecosystem;
@@ -579,7 +577,7 @@ impl SelectionPolicy {
             Some((name, bytes, parsed)) if !parsed.empty => {
                 let source = PolicySource::File {
                     path: name.to_string(),
-                    sha256: hex::encode(Sha256::digest(&bytes)),
+                    sha256: crate::utils::digest::sha256_hex_of(&bytes),
                 };
                 let block = parsed.patches.clone().unwrap_or_default();
                 Self::from_parts(name, source, &parsed.project_ignore_paths, &block)?

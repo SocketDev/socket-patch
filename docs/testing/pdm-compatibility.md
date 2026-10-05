@@ -140,5 +140,16 @@ every Windows cell used to skip, and a run whose cells all skip or whose PDM
 bootstrap fails is now an error. The matrix needs no Socket API token (the
 `urllib3@1.26.18` patch is a free tier).
 
+The matrix runs against production PyPI and the public patch API, so a case
+is re-run from a fresh directory, at most three attempts in total, when every
+failed check is explained by a terminal transport failure in the operation it
+judged: PDM, pip or uv giving up on PyPI, or the CLI's request error, patch
+API 5xx or exhausted 429 retry, including one the CLI reports in its JSON
+with exit code zero. Recovered retry warnings do not count, and a functional
+failure is never retried, even when a later step raises a transport error.
+Failed attempt logs stay under `attempts/<version>-<shape>-<mode>/<n>/`, and
+the final row lists them in `transportRetries`. A failing case prints each
+failed check's recorded detail to the job log.
+
 Full run results belong with the source revision and toolchain versions in CI
 artifacts or a local output directory. See the [testing guide](README.md#ci-and-results).

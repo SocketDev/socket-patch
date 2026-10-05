@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use sha2::{Digest, Sha256};
-
 use crate::manifest::schema::PatchRecord;
 use crate::utils::env_compat::is_debug_enabled;
 
@@ -221,7 +219,7 @@ pub(crate) async fn verify_committed_artifact(
     }
 
     // The ledger anchor.
-    let sha = hex::encode(Sha256::digest(&bytes));
+    let sha = crate::utils::digest::sha256_hex_of(&bytes);
     if !sha.eq_ignore_ascii_case(&entry.artifact.sha256) {
         return Err(ReuseMiss::Sha256Mismatch);
     }
@@ -353,6 +351,7 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::vendor::state::{save_state, VendorArtifact, VendorState};
+    use sha2::{Digest, Sha256};
     use std::io::Write as _;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
