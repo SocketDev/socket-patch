@@ -349,13 +349,34 @@ fn hosted_unreadable_owned_file_is_refused_untouched() {
     std::fs::write(project.join(HOSTED_FILE), latin1).unwrap();
     let api = Api::start();
     api.grant(UUID, GROUP, ARTIFACT, BASE);
-    let (_, json) = get_hosted(&home, &project, &api, UUID);
+    let uri = api.server.uri();
+    let (code, json, _) = socket(
+        &home,
+        &project,
+        &[
+            "get",
+            UUID,
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            project.to_str().unwrap(),
+            "--api-url",
+            &uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    );
+    // A whole-run refusal: `get` fails, with nothing written.
+    assert_eq!(code, 1, "{json}");
     assert!(
         codes(&json).contains(&"redirect_sbt_owned_file_unreadable".to_string()),
         "{json}"
     );
     assert_eq!(std::fs::read(project.join(HOSTED_FILE)).unwrap(), latin1);
-    assert_eq!(json["redirect"]["redirected"], 0, "{json}");
 }
 
 #[test]
