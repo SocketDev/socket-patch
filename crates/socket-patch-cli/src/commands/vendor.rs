@@ -1151,9 +1151,11 @@ impl EjectSnapshot {
         })
     }
 
-    /// A file's bytes, `None` when it does not exist.
+    /// A file's bytes, `None` when it does not exist. Read through the
+    /// FIFO-safe opener: a FIFO or device at a snapshotted workspace path
+    /// fails the snapshot (and the eject refuses) instead of wedging open(2).
     async fn read(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-        match tokio::fs::read(path).await {
+        match socket_patch_core::utils::fs::read_regular_to_bytes(path).await {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -6087,6 +6089,24 @@ mod eject_snapshot_tests {
     /// snapshot holds them; deleted when the commit created them) — and
     /// leaves every other root file as it is now, even one whose bytes
     /// changed during the run (another process's log).
+    /// A FIFO at a snapshotted path fails the snapshot promptly (the eject
+    /// then refuses) instead of blocking in open(2).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_refuses_a_fifo_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let c = std::ffi::CString::new(root.join("package-lock.json").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            EjectSnapshot::take(root, &["package-lock.json".to_string()]),
+        )
+        .await
+        .expect("the snapshot must not block on a FIFO");
+        assert!(result.is_err());
+    }
+
     #[tokio::test]
     async fn restore_undoes_only_what_the_eject_wrote() {
         let tmp = tempfile::tempdir().unwrap();
