@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-05T16:00Z · main @ 0d302dc_
+_Last updated 2026-10-05T17:00Z · main @ 0d302dc_
 
 **In flight:**
 - [#858](https://github.com/SocketDev/socket-patch/pull/858): one blocking `stage_and_rename_blocking` core with a private `WriteOpts` policy behind the six `utils::fs` writers; `atomic_write_sync`'s copy and `create_stage`/`commit_stage` deleted; one `stage_path` builds `.socket-stage-` and `.socket-dl-` names. Issue #728 (C21). Production +171 / −168, tests ≈ +85 / −12. State: ready, with the PR burn-down.
@@ -19,13 +19,13 @@ _Last updated 2026-10-05T16:00Z · main @ 0d302dc_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #856 (E62, child 1 of #855): VEX npm aliases through the core resolver | 1 | 1 | ≈1.8 | M | ≈5 | skipped: `vex_consumed.rs` changed by 20 open PRs, `npm_crawler.rs` by #829 |
-| 2 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by 7 open PRs (#646, #690, #730, #776, #802, #825, #837) |
-| 3 | #816 (E38): CLI `PRODUCT_MANIFESTS` copy → `ProductDetection.present` | 1 | 0 | ≈1 | L | ≈4 | skipped: `commands/vex.rs` changed by #646, #684, #690, #700 |
-| 4 | #871: vendoring-service client out of `api/client.rs` into its own submodule (move only) | 0 | 1 | ≈0.5 | L | ≈2.5 | skipped: `api/client.rs` changed by #865; new 2026-10-05T15:47Z |
-| 5 | #631 slice 1 (E52): delete `go_sum_edit`'s oracle-only free functions (no move) | 0 | 0 | ≈1.5 | L | ≈1.5 | free of overlap (no open PR touches `go_sum_edit.rs`); next when capacity frees |
+| 1 | #872 (C49): registry clients onto `ApiTimeouts`; `registry_fetch::download` onto `utils::http::read_capped`; Maven reuses one client | 1 | 0 | ≈2.1 | L | ≈5.1 | skipped: `registry_fetch.rs` changed by #865 (mine), `maven_repo.rs` by #646, #690; p1, filed 2026-10-05T15:52Z |
+| 2 | #856 (E62, child 1 of #855): VEX npm aliases through the core resolver | 1 | 1 | ≈1.8 | M | ≈5 | skipped: `vex_consumed.rs` changed by 20 open PRs, `npm_crawler.rs` by #829 |
+| 3 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by 7 open PRs (#646, #690, #730, #776, #802, #825, #837) |
+| 4 | #816 (E38): CLI `PRODUCT_MANIFESTS` copy → `ProductDetection.present` | 1 | 0 | ≈1 | L | ≈4 | skipped: `commands/vex.rs` changed by #646, #684, #690, #700 |
+| 5 | #871: vendoring-service client out of `api/client.rs` into its own submodule (move only) | 0 | 1 | ≈0.5 | L | ≈2.5 | skipped: `api/client.rs` changed by #865; new 2026-10-05T15:47Z |
 
-Re-ranked 2026-10-05T16:00Z: at capacity, 3 open (#858, #865, #870), all `ready` with the burn-down. With 29 other open PRs, most candidates overlap: #823 slice 2, #815, #717, #856 (`vex_consumed.rs`), #773 (`vendor.rs`), #816 (`commands/vex.rs`), #705 and #677 (`api/client.rs`, #865), #693 (`vendor/cargo.rs`, #598), #801 and #782 (`lock_inventory`, `vendor/state.rs`, `redirect/vlt*.rs`), #845 (`npm_crawler.rs`, #829). #726 waits on #858. Decisions (not candidates): #648, #704, #792, #808, #615; C07 needs an owner decision.
+Re-ranked 2026-10-05T17:00Z: at capacity, 3 open (#858, #865, #870), all `ready` with the burn-down (#865 and #870 approved). #872 takes first place once #865 lands. #631 slice 1 (E52, score ≈1.5) stays the only overlap-free candidate. With 30 other open PRs, most candidates overlap: #823 slice 2, #815, #717, #856 (`vex_consumed.rs`), #773 (`vendor.rs`), #816 (`commands/vex.rs`), #705 and #677 (`api/client.rs`, #865), #693 (`vendor/cargo.rs`, #598), #801 and #782 (`lock_inventory`, `vendor/state.rs`, `redirect/vlt*.rs`), #845 (`npm_crawler.rs`, #829). #726 waits on #858. Decisions (not candidates): #648, #704, #792, #808, #615; C07 needs an owner decision.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
