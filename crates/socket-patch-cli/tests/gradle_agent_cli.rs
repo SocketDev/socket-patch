@@ -1087,7 +1087,7 @@ fn failed_swap_restores_every_copy() {
             version.join(&hash_copies(&version, JAR)[0].0).join(JAR)
         };
         let flag = |f: &str| {
-            assert!(Command::new("chflags")
+            assert!(std::process::Command::new("chflags")
                 .args([f, locked.to_str().unwrap()])
                 .status()
                 .unwrap()
