@@ -156,13 +156,15 @@ pub(super) async fn load_pipenv_project(
     })
 }
 
-/// Target-specific guards (also re-run by [`wire_pipenv`] right before
+/// Target-specific guards (also re-run by the wire step right before
 /// writing). Entries match by PEP 503 canonical NAME in every package
 /// category. Registry pins and existing vendored wheel identities
 /// must both match the selected patch version. `hosted_origins` are the
 /// run's `--patch-server-url` origins: a hosted reference on one of them
 /// (or on patch.socket.dev) is refused with the rollback remedy, any other
-/// file reference as user-declared.
+/// file reference as user-declared. Production callers pass the ledger
+/// through [`check_target_guards_superseding`].
+#[cfg(test)]
 pub(super) fn check_target_guards(
     p: &PipenvProject,
     canon_name: &str,
@@ -173,7 +175,7 @@ pub(super) fn check_target_guards(
     check_target_guards_superseding(p, canon_name, record_uuid, version, hosted_origins, None)
 }
 
-/// [`check_target_guards`], given `superseded`: the vendor-ledger entry
+/// The target guards, given `superseded`: the vendor-ledger entry
 /// that wired this package at an OLDER patch uuid. An entry still routed
 /// through that uuid's wheel is a superseding patch (#769): it re-wires in
 /// place when the ledger records exactly what was written there and the
@@ -345,6 +347,8 @@ fn superseded_record<'e>(
 /// pinned pipenv serialization). `rel_wheel` is the project-relative wheel
 /// path (`.socket/vendor/pypi/<uuid>/<wheel>`, no `./` prefix — the
 /// fixture's `./` spelling is applied here).
+/// Production callers pass the ledger through [`wire_pipenv_superseding`].
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn wire_pipenv(
     p: &PipenvProject,
@@ -370,10 +374,11 @@ pub(super) async fn wire_pipenv(
     .await
 }
 
-/// [`wire_pipenv`] over entries `superseded` (the ledger entry of an OLDER
-/// patch uuid, see [`check_target_guards_superseding`]) wired: each one is
-/// re-wired in place and its record carries that entry's pre-vendor
-/// original forward, so reverting the new entry restores the registry pin.
+/// Wire Pipfile.lock as `wire_pipenv` does. Entries `superseded` (the
+/// ledger entry of an OLDER patch uuid, see
+/// [`check_target_guards_superseding`]) wired are re-wired in place, and
+/// each record carries that entry's pre-vendor original forward, so
+/// reverting the new entry restores the registry pin.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn wire_pipenv_superseding(
     p: &PipenvProject,
