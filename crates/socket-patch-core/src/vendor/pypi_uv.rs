@@ -843,7 +843,21 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                         if original_text.is_some_and(|orig| lock_text.contains(orig)) {
                             continue;
                         }
-                        warnings.push(drifted("uv.lock"));
+                        // A whole-array record whose array uv re-serialized
+                        // around our unchanged element (`uv add --dev x`
+                        // rewrites the group line, #821): revert just our
+                        // element inside the live array.
+                        match revert_array_elements(
+                            &lock_text,
+                            &rec.kind,
+                            new_text,
+                            original_text,
+                            &needle,
+                        ) {
+                            ArrayRevert::Reverted(t) => lock_text = t,
+                            ArrayRevert::Converged => {}
+                            ArrayRevert::Drift => warnings.push(drifted("uv.lock")),
+                        }
                     }
                 }
             }
@@ -886,7 +900,21 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                             if original_text.is_some_and(|orig| lock_text.contains(orig)) {
                                 continue;
                             }
-                            warnings.push(drifted("uv.lock"));
+                            // uv re-serializes `[manifest] overrides` sorted
+                            // and multi-line on any relock that touches it
+                            // (#806): remove just our element from the live
+                            // array.
+                            match revert_array_elements(
+                                &lock_text,
+                                &rec.kind,
+                                new_text,
+                                original_text,
+                                &needle,
+                            ) {
+                                ArrayRevert::Reverted(t) => lock_text = t,
+                                ArrayRevert::Converged => {}
+                                ArrayRevert::Drift => warnings.push(drifted("uv.lock")),
+                            }
                         }
                     }
                 }
@@ -965,7 +993,16 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
         }
     }
 
-    if !dry_run {
+    // PAIR GATE (docs/testing/uv-compatibility.md: "conflicting changes
+    // preserve both files"): pyproject.toml and uv.lock are one unit. When
+    // any record was drift-kept, restoring the rest would leave one file
+    // wired and the other not, which `uv sync --locked` rejects (#806,
+    // #821). Write neither; the drift warning keeps the artifact and ledger
+    // entry so a re-run can finish once the drift is undone.
+    let drift_kept = warnings
+        .iter()
+        .any(|w| w.code == "vendor_lock_entry_drifted");
+    if !dry_run && !drift_kept {
         // Reverse of the wire order: the lock first, then the pyproject.
         let write = atomic_write_bytes_preserving_mode(&lock_path, lock_text.as_bytes()).await;
         LOCK_MEMO.invalidate();
@@ -998,6 +1035,174 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
+
+/// Result of [`revert_array_elements`].
+enum ArrayRevert {
+    /// Our elements were restored or removed; the new lock text.
+    Reverted(String),
+    /// Nothing of ours is left in the array: the reverted state already
+    /// holds (the LIVENESS CONTRACT; silent).
+    Converged,
+    /// Our element is gone but the array still routes through the
+    /// artifact, or the record can't be read: genuine drift.
+    Drift,
+}
+
+/// Where a whole-array lock record lives.
+#[derive(Clone, Copy)]
+enum ArrayScope {
+    /// The root unit's `[package.metadata.requires-dev]` sub-table.
+    RootRequiresDev,
+    /// The top-level `[manifest]` table.
+    Manifest,
+}
+
+/// Element-level revert of a record that captured a WHOLE lock array
+/// (`uv_lock_requires_dev` / `uv_lock_manifest_constraints` as a `<key> =
+/// […]` line, `uv_lock_manifest_overrides` Rewritten as the bare array).
+/// uv re-serializes those arrays on any relock that touches a sibling
+/// element (`uv add --dev x`, `uv add y` sorting `[manifest] overrides`
+/// into its multi-line form), so the recorded text stops matching while
+/// our element is byte-identical inside. Diff the recorded old/new arrays
+/// into our element edits (an element rewritten in place, or one appended),
+/// apply them to the live array under the same key, and re-render the
+/// array the way uv writes it: one element inline, more one per line.
+fn revert_array_elements(
+    lock_text: &str,
+    kind: &str,
+    new: Option<&str>,
+    orig: Option<&str>,
+    needle: &str,
+) -> ArrayRevert {
+    let (Some(new), Some(orig)) = (new, orig) else {
+        return ArrayRevert::Drift;
+    };
+    let (scope, key, old_array, new_array) = match kind {
+        "uv_lock_requires_dev" | "uv_lock_manifest_constraints" => {
+            let (Some((key, old_arr)), Some((new_key, new_arr))) =
+                (orig.split_once(" = "), new.split_once(" = "))
+            else {
+                return ArrayRevert::Drift;
+            };
+            if key != new_key {
+                return ArrayRevert::Drift;
+            }
+            let scope = if kind == "uv_lock_requires_dev" {
+                ArrayScope::RootRequiresDev
+            } else {
+                ArrayScope::Manifest
+            };
+            (scope, key, old_arr, new_arr)
+        }
+        "uv_lock_manifest_overrides" => (ArrayScope::Manifest, "overrides", orig, new),
+        _ => return ArrayRevert::Drift,
+    };
+    let elements = |arr: &str| -> Vec<String> {
+        top_level_brace_groups(arr)
+            .into_iter()
+            .map(|(s, e)| arr[s..e].to_string())
+            .collect()
+    };
+    let (old_els, new_els) = (elements(old_array), elements(new_array));
+    // (ours, Some(original)) = rewritten in place; (ours, None) = appended.
+    let mut edits: Vec<(String, Option<String>)> = Vec::new();
+    if old_els.len() == new_els.len() {
+        for (o, n) in old_els.iter().zip(&new_els) {
+            if o != n {
+                edits.push((n.clone(), Some(o.clone())));
+            }
+        }
+    } else if new_els.len() == old_els.len() + 1 && new_els[..old_els.len()] == old_els[..] {
+        edits.push((new_els[old_els.len()].clone(), None));
+    }
+    if edits.is_empty() || edits.iter().any(|(ours, _)| !ours.contains(needle)) {
+        return ArrayRevert::Drift;
+    }
+
+    let Some(span) = locate_lock_array(lock_text, scope, key) else {
+        // The whole key is gone (uv drops an emptied group): nothing in it
+        // routes through the artifact.
+        return ArrayRevert::Converged;
+    };
+    let mut live = elements(&lock_text[span.clone()]);
+    let mut changed = false;
+    for (ours, original) in &edits {
+        match live.iter().position(|el| el == ours) {
+            Some(i) => {
+                match original {
+                    Some(o) => live[i] = o.clone(),
+                    None => {
+                        live.remove(i);
+                    }
+                }
+                changed = true;
+            }
+            // Our element was edited in place and still routes through the
+            // artifact: drift, fail-closed.
+            None if live.iter().any(|el| el.contains(needle)) => return ArrayRevert::Drift,
+            // Our element is gone and nothing else in the array routes
+            // through the artifact: that element's reverted state holds.
+            None => {}
+        }
+    }
+    if !changed {
+        return ArrayRevert::Converged;
+    }
+    let nl = newline_of(lock_text);
+    let rendered = match live.len() {
+        0 => "[]".to_string(),
+        1 => format!("[{}]", live[0]),
+        _ => {
+            let mut out = format!("[{nl}");
+            for el in &live {
+                out.push_str(&format!("    {el},{nl}"));
+            }
+            out.push(']');
+            out
+        }
+    };
+    let mut text = lock_text.to_string();
+    text.replace_range(span, &rendered);
+    ArrayRevert::Reverted(text)
+}
+
+/// Byte span of the `[…]` array assigned to `key` at line start inside
+/// `scope`, or `None` when the section or key is absent.
+fn locate_lock_array(lock_text: &str, scope: ArrayScope, key: &str) -> Option<Range<usize>> {
+    let section = match scope {
+        ArrayScope::RootRequiresDev => {
+            let unit = find_unit_span(lock_text, unit_is_root)?;
+            let header = "[package.metadata.requires-dev]";
+            let hdr = unit.start + lock_text[unit.clone()].find(header)?;
+            let start = hdr + header.len();
+            // Elements are indented, so a line-leading `[` is the next
+            // sub-table header.
+            let end = lock_text[start..unit.end]
+                .find("\n[")
+                .map_or(unit.end, |i| start + i + 1);
+            start..end
+        }
+        ArrayScope::Manifest => {
+            let index = line_index(lock_text);
+            let h = index
+                .iter()
+                .position(|(_, l)| l.trim_end() == "[manifest]")?;
+            let end = index[h + 1..]
+                .iter()
+                .find(|(_, l)| l.starts_with('['))
+                .map_or(lock_text.len(), |(off, _)| *off);
+            index[h].0..end
+        }
+    };
+    let prefix = format!("{key} = [");
+    let line_off = line_index(&lock_text[section.clone()])
+        .into_iter()
+        .find(|(_, l)| l.starts_with(&prefix))
+        .map(|(off, _)| section.start + off)?;
+    let open = line_off + prefix.len() - 1;
+    let end = balanced_span(lock_text, open)?;
+    Some(open..end)
+}
 
 /// The two files this backend edits — both are checked for symlinks before
 /// any write (uv itself writes through a link; the atomic rename would
@@ -2634,6 +2839,7 @@ wheels = [
         tokio::fs::write(tmp.path().join("uv.lock"), &drifted)
             .await
             .unwrap();
+        let (wired_py, _) = read_pair(tmp.path()).await;
 
         let outcome = revert_uv(&entry, tmp.path(), false).await;
         assert!(outcome.success);
@@ -2645,9 +2851,11 @@ wheels = [
             "{:?}",
             outcome.warnings
         );
-        // The pyproject side (undrifted) was still reverted.
-        let (pyproject, _) = read_pair(tmp.path()).await;
-        assert_eq!(pyproject, DIRECT_REGISTRY_PYPROJECT);
+        // PAIR GATE: the undrifted pyproject side is NOT reverted alone —
+        // that would leave a pair `uv sync --locked` rejects.
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, wired_py);
+        assert_eq!(lock, drifted);
     }
 
     /// mkfifo(2) directly rather than shelling out to the `mkfifo` binary —
@@ -3743,11 +3951,12 @@ wheels = [
         assert_eq!(lock, input_lock, "only our added line may be removed");
     }
 
-    /// A third-party edit to the REWRITTEN `[manifest] overrides` array must
-    /// be left alone with a drift warning — the never-clobber contract for
-    /// this record kind.
+    /// A third-party edit to the REWRITTEN `[manifest] overrides` array
+    /// around our unchanged element (a sibling replaced, ours moved) is not
+    /// drift of OUR element: revert removes just our element and keeps the
+    /// user's reshaping (#806).
     #[tokio::test]
-    async fn revert_warns_and_skips_on_drifted_manifest_overrides_array() {
+    async fn revert_removes_our_element_from_a_reshaped_manifest_overrides_array() {
         let one_el = "overrides = [{ name = \"other\", path = \"o.whl\" }]";
         let input_lock = TRANSITIVE_REGISTRY_LOCK.replace(
             "requires-python = \">=3.10\"\n",
@@ -3789,24 +3998,16 @@ wheels = [
         let entry = entry_for(wiring, meta);
         let outcome = revert_uv(&entry, tmp.path(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
-        assert_eq!(outcome.warnings[0].code, "vendor_lock_entry_drifted");
-        assert!(
-            outcome.warnings[0].detail.contains("uv.lock"),
-            "{}",
-            outcome.warnings[0].detail
-        );
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
         let (py, lock) = read_pair(tmp.path()).await;
         assert_eq!(py, TRANSITIVE_REGISTRY_PYPROJECT);
         let expected = input_lock.replace(
             "[{ name = \"other\", path = \"o.whl\" }]",
-            &format!(
-                "[{{ name = \"six\", path = \"{REL_WHEEL}\" }}, {{ name = \"extra\", path = \"e.whl\" }}]"
-            ),
+            "[{ name = \"extra\", path = \"e.whl\" }]",
         );
         assert_eq!(
             lock, expected,
-            "the undrifted [[package]] fragment still reverts; the array is left as the user edited it"
+            "our element is removed; the user's reshaping of the array stays"
         );
     }
 
@@ -3854,13 +4055,12 @@ wheels = [
             outcome.warnings[0].detail
         );
         let (py, lock) = read_pair(tmp.path()).await;
-        assert_eq!(lock, DIRECT_REGISTRY_LOCK, "the lock side still reverts");
-        assert!(
-            py.contains(&format!(
-                "six = {{ path = \"{REL_WHEEL}\", editable = false }}"
-            )),
-            "the drifted pyproject is left alone: {py}"
+        assert_eq!(py, tampered, "the drifted pyproject is left alone");
+        assert_ne!(
+            lock, DIRECT_REGISTRY_LOCK,
+            "PAIR GATE: the lock stays wired with its drift-kept pyproject"
         );
+        assert!(lock.contains(REL_WHEEL), "{lock}");
     }
 
     /// LIVENESS CONTRACT (vendor/mod.rs): a hand-restored pair — the user
@@ -4068,14 +4268,10 @@ wheels = [
             outcome.warnings[0].detail
         );
         let (py, lock) = read_pair(tmp.path()).await;
-        assert_eq!(lock, TRANSITIVE_REGISTRY_LOCK);
+        assert_eq!(py, tampered, "the user's edit must survive, untouched");
         assert!(
-            py.contains("override-dependencies = [\"six==1.17.0\"]"),
-            "the user's edit must survive: {py}"
-        );
-        assert!(
-            !py.contains("[tool.uv.sources]"),
-            "the undrifted sources entry (and its created table) still reverts: {py}"
+            lock.contains(REL_WHEEL),
+            "PAIR GATE: the lock stays wired with its drift-kept pyproject: {lock}"
         );
     }
 
@@ -4741,12 +4937,12 @@ wheels = [
             outcome.warnings[0].detail
         );
         let (py, lock) = read_pair(tmp.path()).await;
-        assert_eq!(py, TRANSITIVE_REGISTRY_PYPROJECT);
-        let expected = tampered.replacen(&pkg_new, &pkg_orig, 1);
         assert_eq!(
-            lock, expected,
-            "the [[package]] fragment reverts; the reshaped [manifest] stays"
+            py, OVERRIDE_TRANSITIVE_PYPROJECT,
+            "PAIR GATE: the pyproject stays wired with the drift-kept lock"
         );
+        assert_eq!(lock, tampered, "the lock is left exactly as found");
+        assert!(tampered.contains(&pkg_new) && !tampered.contains(&pkg_orig));
     }
 
     /// Hand-restoring a pair whose lock had a PRE-EXISTING overrides array
@@ -4867,14 +5063,13 @@ wheels = [
             outcome.warnings[0].detail
         );
         let (py, lock) = read_pair(tmp.path()).await;
-        assert_eq!(lock, TRANSITIVE_REGISTRY_LOCK, "the lock still reverts");
-        assert!(
-            py.contains("override-dependencies = [\"attrs==23.9.9\", \"six==1.16.0\"]"),
-            "the drifted array is left as the user edited it: {py}"
+        assert_eq!(
+            py, tampered,
+            "the drifted pyproject is left as the user edited it"
         );
         assert!(
-            !py.contains("[tool.uv.sources]"),
-            "the undrifted sources entry still reverts: {py}"
+            lock.contains(REL_WHEEL),
+            "PAIR GATE: the lock stays wired with its drift-kept pyproject: {lock}"
         );
     }
 
@@ -5906,5 +6101,273 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
         );
         assert_sources_spelling_round_trips(&pyproject, DIRECT_REGISTRY_LOCK, &six_source_line(""))
             .await;
+    }
+
+    // ── relock re-serialization (#806, #821) + the pair gate ──────────────
+
+    /// #821: six is a dev-group dependency and the user runs `uv add --dev
+    /// zipp` after vendoring. uv re-serializes the WHOLE `dev = […]`
+    /// requires-dev line (multi-line, sorted) while six's element stays
+    /// byte-identical. Revert must recognise our element inside the
+    /// re-serialized group, restore just that element, and unwind BOTH
+    /// files — no drift, no half-revert.
+    #[tokio::test]
+    async fn revert_survives_uv_reserializing_the_dev_group_line() {
+        let tmp = write_pair(DEV_GROUP_REGISTRY_PYPROJECT, DEV_GROUP_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        // What `uv add --dev zipp` does to the pair.
+        let (wired_py, wired_lock) = read_pair(tmp.path()).await;
+        let six_el = format!("{{ name = \"six\", path = \"{REL_WHEEL}\" }}");
+        let relocked_lock = wired_lock.replace(
+            &format!("dev = [{six_el}]"),
+            &format!("dev = [\n    {six_el},\n    {{ name = \"zipp\", specifier = \">=3\" }},\n]"),
+        );
+        assert_ne!(relocked_lock, wired_lock, "the relock must hit the group");
+        let relocked_py = wired_py.replace(
+            "dev = [\"six==1.16.0\"]",
+            "dev = [\"six==1.16.0\", \"zipp>=3\"]",
+        );
+        tokio::fs::write(tmp.path().join("uv.lock"), &relocked_lock)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("pyproject.toml"), &relocked_py)
+            .await
+            .unwrap();
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(!outcome.drift_skipped());
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(
+            py,
+            DEV_GROUP_REGISTRY_PYPROJECT.replace(
+                "dev = [\"six==1.16.0\"]",
+                "dev = [\"six==1.16.0\", \"zipp>=3\"]",
+            )
+        );
+        assert_eq!(
+            lock,
+            DEV_GROUP_REGISTRY_LOCK.replace(
+                "dev = [{ name = \"six\", specifier = \"==1.16.0\" }]",
+                "dev = [\n    { name = \"six\", specifier = \"==1.16.0\" },\n    { name = \"zipp\", specifier = \">=3\" },\n]",
+            ),
+            "only six's element is restored; the user's zipp stays"
+        );
+        assert!(!lock.contains(".socket/vendor"), "{lock}");
+    }
+
+    /// #821 (`uv remove --dev`): a sibling leaving the group collapses uv's
+    /// multi-line array back to one inline element — revert still finds and
+    /// restores our element.
+    #[tokio::test]
+    async fn revert_survives_a_sibling_leaving_the_dev_group() {
+        let two = "dev = [\n    { name = \"attrs\", specifier = \">=20\" },\n    { name = \"six\", specifier = \"==1.16.0\" },\n]";
+        let input_lock = DEV_GROUP_REGISTRY_LOCK
+            .replace("dev = [{ name = \"six\", specifier = \"==1.16.0\" }]", two);
+        let input_py = DEV_GROUP_REGISTRY_PYPROJECT.replace(
+            "dev = [\"six==1.16.0\"]",
+            "dev = [\"six==1.16.0\", \"attrs>=20\"]",
+        );
+        let tmp = write_pair(&input_py, &input_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let (wired_py, wired_lock) = read_pair(tmp.path()).await;
+        let six_el = format!("{{ name = \"six\", path = \"{REL_WHEEL}\" }}");
+        let wired_group =
+            format!("dev = [\n    {{ name = \"attrs\", specifier = \">=20\" }},\n    {six_el},\n]");
+        assert!(wired_lock.contains(&wired_group), "{wired_lock}");
+        // `uv remove --dev attrs`.
+        tokio::fs::write(
+            tmp.path().join("uv.lock"),
+            wired_lock.replace(&wired_group, &format!("dev = [{six_el}]")),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("pyproject.toml"),
+            wired_py.replace(", \"attrs>=20\"", ""),
+        )
+        .await
+        .unwrap();
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, DEV_GROUP_REGISTRY_PYPROJECT);
+        assert_eq!(lock, DEV_GROUP_REGISTRY_LOCK);
+    }
+
+    /// #806: the user already authors `override-dependencies`, six arrives
+    /// transitively, and a later relock (`uv add idna`) re-serializes
+    /// `[manifest] overrides` sorted and multi-line. Our element is
+    /// unchanged inside it, so revert must remove just that element and
+    /// unwind BOTH files.
+    #[tokio::test]
+    async fn revert_survives_uv_reserializing_manifest_overrides() {
+        let user_py = format!(
+            "{TRANSITIVE_REGISTRY_PYPROJECT}\n[tool.uv]\noverride-dependencies = [\"attrs>=20\"]\n"
+        );
+        let input_lock = TRANSITIVE_REGISTRY_LOCK.replace(
+            "requires-python = \">=3.10\"\n",
+            "requires-python = \">=3.10\"\n\n[manifest]\noverrides = [{ name = \"attrs\", specifier = \">=20\" }]\n",
+        );
+        let tmp = write_pair(&user_py, &input_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(classify_dependency(&p, "six"), UvDepClass::Transitive);
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let (_, wired_lock) = read_pair(tmp.path()).await;
+        let six_el = format!("{{ name = \"six\", path = \"{REL_WHEEL}\" }}");
+        let ours = format!("overrides = [{{ name = \"attrs\", specifier = \">=20\" }}, {six_el}]");
+        assert!(wired_lock.contains(&ours), "{wired_lock}");
+        // uv's own spelling after any relock that rewrites the array.
+        let uv_spelling = format!(
+            "overrides = [\n    {{ name = \"attrs\", specifier = \">=20\" }},\n    {six_el},\n]"
+        );
+        tokio::fs::write(
+            tmp.path().join("uv.lock"),
+            wired_lock.replace(&ours, &uv_spelling),
+        )
+        .await
+        .unwrap();
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(!outcome.drift_skipped());
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, user_py);
+        assert_eq!(
+            lock, input_lock,
+            "one remaining element renders inline, as uv writes it"
+        );
+    }
+
+    /// #806 with a second user override sorted AFTER ours: removing our
+    /// element from uv's multi-line array keeps uv's multi-line shape.
+    #[tokio::test]
+    async fn revert_removes_our_override_from_a_sorted_multi_line_array() {
+        let input_lock = TRANSITIVE_REGISTRY_LOCK.replace(
+            "requires-python = \">=3.10\"\n",
+            "requires-python = \">=3.10\"\n\n[manifest]\noverrides = [\n    { name = \"attrs\", specifier = \">=20\" },\n    { name = \"zipp\", specifier = \">=3\" },\n]\n",
+        );
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let (_, wired_lock) = read_pair(tmp.path()).await;
+        let six_el = format!("{{ name = \"six\", path = \"{REL_WHEEL}\" }}");
+        let ours = format!(
+            "overrides = [\n    {{ name = \"attrs\", specifier = \">=20\" }},\n    {{ name = \"zipp\", specifier = \">=3\" }},\n    {six_el},\n]"
+        );
+        assert!(wired_lock.contains(&ours), "{wired_lock}");
+        let sorted = format!(
+            "overrides = [\n    {{ name = \"attrs\", specifier = \">=20\" }},\n    {six_el},\n    {{ name = \"zipp\", specifier = \">=3\" }},\n]"
+        );
+        tokio::fs::write(
+            tmp.path().join("uv.lock"),
+            wired_lock.replace(&ours, &sorted),
+        )
+        .await
+        .unwrap();
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, TRANSITIVE_REGISTRY_PYPROJECT);
+        assert_eq!(lock, input_lock);
+    }
+
+    /// The pair gate: when a uv.lock record is GENUINELY drift-kept (our
+    /// element itself was edited and still routes through the artifact),
+    /// revert must write NEITHER file — restoring pyproject.toml alone would
+    /// leave a pair `uv sync --locked` rejects (#806, #821).
+    #[tokio::test]
+    async fn revert_writes_neither_file_when_a_lock_record_is_drift_kept() {
+        let tmp = write_pair(DEV_GROUP_REGISTRY_PYPROJECT, DEV_GROUP_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let (wired_py, wired_lock) = read_pair(tmp.path()).await;
+        // Our own element was edited (a marker added) — genuine drift.
+        let six_el = format!("{{ name = \"six\", path = \"{REL_WHEEL}\" }}");
+        let edited = format!(
+            "{{ name = \"six\", marker = \"python_full_version >= '3.11'\", path = \"{REL_WHEEL}\" }}"
+        );
+        let drifted_lock = wired_lock.replace(&six_el, &edited);
+        assert_ne!(drifted_lock, wired_lock);
+        tokio::fs::write(tmp.path().join("uv.lock"), &drifted_lock)
+            .await
+            .unwrap();
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, wired_py, "pyproject.toml must stay wired with its lock");
+        assert_eq!(lock, drifted_lock, "uv.lock is left exactly as found");
     }
 }
