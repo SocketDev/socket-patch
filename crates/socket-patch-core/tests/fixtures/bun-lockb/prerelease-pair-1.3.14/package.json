@@ -1,0 +1,1 @@
+{"name": "prerelease-pair-binary-fixture", "version": "1.0.0", "dependencies": {"minimist": "1.2.2", "uuid": "8.0.0", "uuid-beta": "npm:uuid@8.0.0-beta.0"}}

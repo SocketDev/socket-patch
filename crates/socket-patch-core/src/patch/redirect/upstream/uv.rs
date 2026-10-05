@@ -15,7 +15,8 @@
 //!   restored without one too;
 //! * `sdist` / `wheels` were replaced by the patched wheel (pylock: an
 //!   `archive`) — re-derived from PyPI's JSON API in the artifact shape a
-//!   sibling registry package shows (which of `size` / `upload-time` /
+//!   sibling registry package shows (which of `size` / `upload-time` (or
+//!   uv 0.6.15–0.6.17's `upload_time`) /
 //!   `hashes` this uv release records, one wheel per line or not; pylock
 //!   `upload-time`s in whole seconds unless a sibling shows a fraction). uv keeps
 //!   only the wheels its `requires-python` and environments can install, so
@@ -30,7 +31,11 @@
 //!   `overrides` entries lost their `specifier` for the url — re-derived
 //!   from the paired metadata's declarations in uv's spelling (a
 //!   multi-clause specifier only when another entry of the lock shows how
-//!   this uv joins clauses), and an `overrides` entry the rewrite added for
+//!   this uv joins clauses). The declaration is the one uv lowered the
+//!   entry from: PEP 735 `include-group` members are expanded, and when one
+//!   name has several specifiers the entry's marker picks one (its
+//!   `extra == '<x>'` terms name the extra, the rest is the declaration's
+//!   own marker). An `overrides` entry the rewrite added for
 //!   a transitive dependency is removed with its `override-dependencies`
 //!   line;
 //! * the metadata's `[tool.uv.sources].<name> = { url }` is removed.
@@ -212,6 +217,9 @@ async fn restore_lock(
                 continue;
             }
         };
+        // A refused hit leaves the lock as it was: its entry and every
+        // requirement array are restored together or not at all.
+        let before = doc.clone();
         let restore = if pep751 {
             restore_pylock_entry(&mut doc, hit, &shape, artifacts)
         } else {
@@ -219,6 +227,7 @@ async fn restore_lock(
                 .and_then(|()| restore_requirements(&mut doc, hit, metadata.as_ref(), &styles, ctx))
         };
         if let Err(why) = restore {
+            doc = before;
             result.refuse(&hit.uuid, format!("{rel}: {why}"));
             continue;
         }
@@ -399,7 +408,7 @@ fn lock_shape(
         };
         registries.insert(registry);
         fractional_seconds |= artifact_tables(package).any(|a| {
-            a.get("upload-time")
+            upload_time_value(a)
                 .and_then(Value::as_datetime)
                 .is_some_and(|t| t.to_string().contains('.'))
         });
@@ -415,9 +424,7 @@ fn lock_shape(
             continue;
         };
         let keys: Vec<String> = artifact.iter().map(|(k, _)| k.to_string()).collect();
-        let datetime = artifact
-            .get("upload-time")
-            .is_some_and(|v| v.as_datetime().is_some());
+        let datetime = upload_time_value(artifact).is_some_and(|v| v.as_datetime().is_some());
         let multiline = package
             .get("wheels")
             .and_then(Item::as_array)
@@ -463,8 +470,11 @@ fn lock_shape(
         "no sibling registry package records an artifact, so which artifact fields this uv \
          release records is not derivable",
     )?;
-    let known = ["url", "hash", "hashes", "size", "upload-time", "name"];
-    if let Some(unknown) = keys.iter().find(|k| !known.contains(&k.as_str())) {
+    let known = ["url", "hash", "hashes", "size", "name"];
+    if let Some(unknown) = keys
+        .iter()
+        .find(|k| !known.contains(&k.as_str()) && !UPLOAD_TIME_KEYS.contains(&k.as_str()))
+    {
         return Err(format!(
             "sibling artifacts carry an unknown field `{unknown}`"
         ));
@@ -478,6 +488,17 @@ fn lock_shape(
         multiline,
         package_keys,
     })
+}
+
+/// The artifact timestamp key, in both spellings uv has written:
+/// `upload_time` (uv 0.6.15–0.6.17, lock revision 2) and `upload-time`
+/// (uv 0.7.0 and later, and PEP 751 pylock files). A re-derived artifact
+/// keeps the spelling its sibling shows.
+const UPLOAD_TIME_KEYS: [&str; 2] = ["upload-time", "upload_time"];
+
+/// An artifact's timestamp, under whichever spelling it records.
+fn upload_time_value(artifact: &toml_edit::InlineTable) -> Option<&Value> {
+    UPLOAD_TIME_KEYS.iter().find_map(|k| artifact.get(k))
 }
 
 /// uv's timestamp of a PyPI `upload_time_iso_8601`: milliseconds in
@@ -517,7 +538,7 @@ fn render_artifact(file: &PypiFile, shape: &Shape) -> Result<String, String> {
                 .size
                 .ok_or_else(|| format!("PyPI reports no size for {}", file.filename))?
                 .to_string(),
-            "upload-time" => {
+            key if UPLOAD_TIME_KEYS.contains(&key) => {
                 let time = file
                     .upload_time
                     .as_deref()
@@ -793,36 +814,57 @@ enum Declared<'a> {
     Manifest(&'a str),
 }
 
-/// Every declaration string `declared` covers in the metadata.
-fn declarations<'d>(meta: &'d Metadata, declared: Declared<'_>) -> Vec<&'d str> {
+/// One declaration a lock requirement entry can mirror: the PEP 508 string
+/// and, for a `[project.optional-dependencies]` member, its extra (PEP 685
+/// normalized) — uv lowers that into the entry's marker as `extra == '<x>'`.
+struct Declaration<'d> {
+    spec: &'d str,
+    extra: Option<String>,
+}
+
+/// Every declaration `declared` covers in the metadata.
+fn declarations<'d>(meta: &'d Metadata, declared: Declared<'_>) -> Vec<Declaration<'d>> {
     let doc = &meta.doc;
     let uv = tool_uv(doc);
+    let plain = |specs: Vec<&'d str>| {
+        specs
+            .into_iter()
+            .map(|spec| Declaration { spec, extra: None })
+            .collect()
+    };
     match declared {
         Declared::Dist => {
             let project = doc.get("project");
-            let mut out = strings(project.and_then(|p| p.get("dependencies")));
+            let mut out: Vec<Declaration<'d>> =
+                plain(strings(project.and_then(|p| p.get("dependencies"))));
             if let Some(extras) = project
                 .and_then(|p| p.get("optional-dependencies"))
                 .and_then(Item::as_table_like)
             {
-                for (_, group) in extras.iter() {
-                    out.extend(strings(Some(group)));
+                for (extra, group) in extras.iter() {
+                    let extra = canonicalize_pypi_name(extra);
+                    out.extend(strings(Some(group)).into_iter().map(|spec| Declaration {
+                        spec,
+                        extra: Some(extra.clone()),
+                    }));
                 }
             }
             out
         }
         Declared::Dev(group) => {
-            let mut out = strings(
-                doc.get("dependency-groups")
-                    .and_then(Item::as_table_like)
-                    .and_then(|g| g.get(group)),
+            let mut out = Vec::new();
+            group_members(
+                doc.get("dependency-groups").and_then(Item::as_table_like),
+                group,
+                &mut Vec::new(),
+                &mut out,
             );
             if group == "dev" {
                 out.extend(strings(uv.and_then(|u| u.get("dev-dependencies"))));
             }
-            out
+            plain(out)
         }
-        Declared::Manifest("requirements") => strings(doc.get("dependencies")),
+        Declared::Manifest("requirements") => plain(strings(doc.get("dependencies"))),
         Declared::Manifest(key) => {
             let key = match key {
                 "constraints" => "constraint-dependencies",
@@ -830,9 +872,114 @@ fn declarations<'d>(meta: &'d Metadata, declared: Declared<'_>) -> Vec<&'d str> 
                 "overrides" => "override-dependencies",
                 other => other,
             };
-            strings(uv.and_then(|u| u.get(key)))
+            plain(strings(uv.and_then(|u| u.get(key))))
         }
     }
+}
+
+/// A PEP 735 group's requirement strings, with its `{ include-group = … }`
+/// members expanded the way uv expands them into the lock (group names
+/// compare normalized; a group already being expanded is not re-entered).
+fn group_members<'d>(
+    groups: Option<&'d dyn TableLike>,
+    group: &str,
+    expanding: &mut Vec<String>,
+    out: &mut Vec<&'d str>,
+) {
+    let canon = canonicalize_pypi_name(group);
+    if expanding.contains(&canon) {
+        return;
+    }
+    let Some(members) = groups
+        .into_iter()
+        .flat_map(|g| g.iter())
+        .find(|(name, _)| canonicalize_pypi_name(name) == canon)
+        .and_then(|(_, item)| item.as_array())
+    else {
+        return;
+    };
+    expanding.push(canon);
+    for member in members.iter() {
+        if let Some(spec) = member.as_str() {
+            out.push(spec);
+        } else if let Some(included) = member
+            .as_inline_table()
+            .and_then(|t| t.get("include-group"))
+            .and_then(Value::as_str)
+        {
+            group_members(groups, included, expanding, out);
+        }
+    }
+    expanding.pop();
+}
+
+/// The extras an entry's marker names (`extra == '<x>'`), normalized.
+fn marker_extras(marker: &str) -> BTreeSet<String> {
+    static EXTRA: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"\bextra\s*==\s*['"]([^'"]+)['"]"#).expect("static extra regex")
+    });
+    EXTRA
+        .captures_iter(marker)
+        .map(|c| canonicalize_pypi_name(&c[1]))
+        .collect()
+}
+
+/// A comparison key for a PEP 508 marker as uv records it in the lock:
+/// `and`-joined atoms with `extra` terms dropped, quotes and spacing
+/// normalized, sorted, and `python_version` comparisons spelled as the
+/// `python_full_version` bounds uv rewrites them into. A marker with `or`
+/// or parentheses is compared as normalized text.
+fn marker_key(marker: &str) -> String {
+    static ATOM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"^([A-Za-z_][A-Za-z0-9_.]*)\s*(===|==|!=|~=|<=|>=|<|>)\s*(?:'([^']*)'|"([^"]*)")$"#,
+        )
+        .expect("static marker atom regex")
+    });
+    static AND: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\s+and\s+").expect("static and regex"));
+    let text = marker.trim();
+    if text.contains('(') || text.split_whitespace().any(|w| w == "or") {
+        return text
+            .replace('"', "'")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    let mut atoms: Vec<String> = AND
+        .split(text)
+        .filter(|atom| !atom.trim().is_empty())
+        .filter_map(|atom| {
+            let atom = atom.trim();
+            let Some(c) = ATOM.captures(atom) else {
+                return Some(atom.replace('"', "'").split_whitespace().collect());
+            };
+            let (var, op) = (&c[1], &c[2]);
+            let value = c.get(3).or_else(|| c.get(4)).map_or("", |m| m.as_str());
+            if var == "extra" {
+                return None;
+            }
+            if var == "python_version" {
+                if let Some((major, minor)) = value
+                    .split_once('.')
+                    .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+                {
+                    let next = format!("{major}.{}", minor + 1);
+                    let full = |op: &str, v: &str| format!("python_full_version {op} '{v}'");
+                    return Some(match op {
+                        "<" | ">=" => full(op, value),
+                        "<=" => full("<", &next),
+                        ">" => full(">=", &next),
+                        "==" | "!=" => full(op, &format!("{value}.*")),
+                        _ => format!("{var} {op} '{value}'"),
+                    });
+                }
+            }
+            Some(format!("{var} {op} '{value}'"))
+        })
+        .collect();
+    atoms.sort();
+    atoms.join(" and ")
 }
 
 /// The normalized version clauses of a PEP 508 registry requirement (`[]`
@@ -931,7 +1078,8 @@ impl SpecStyle {
                 if !specifier.contains(',') {
                     continue;
                 }
-                if let Ok(Some(clauses)) = declared_clauses(meta, declared, name) {
+                let marker = entry.get("marker").and_then(Value::as_str);
+                if let Ok(Some(clauses)) = declared_clauses(meta, declared, name, marker) {
                     evidence.push((specifier.to_string(), clauses));
                 }
             }
@@ -946,32 +1094,192 @@ impl SpecStyle {
     }
 }
 
-/// The one clause list every declaration of `name` in `declared` agrees
-/// on; `Ok(None)` when nothing declares it.
+/// The clause list of the declaration of `name` in `declared` that a lock
+/// entry with `marker` mirrors; `Ok(None)` when nothing declares it.
+///
+/// When every declaration agrees, that is the answer whatever the marker.
+/// Otherwise uv's lowering picks one: the marker's `extra == '<x>'` terms
+/// name the extras it came from (or a declaration-owned simple equality),
+/// and the rest of the marker is the declaration's own. More complex
+/// declaration-owned extra predicates can lower to the same marker, so
+/// differing clauses remain ambiguous and are refused for those shapes.
 fn declared_clauses(
     meta: &Metadata,
     declared: Declared<'_>,
     name: &str,
+    marker: Option<&str>,
 ) -> Result<Option<Vec<String>>, String> {
     let canon = canonicalize_pypi_name(name);
-    let mut found: Option<Vec<String>> = None;
-    for spec in declarations(meta, declared) {
-        if canonicalize_pypi_name(pep508_name(spec)) != canon {
-            continue;
-        }
-        let clauses = spec_clauses(spec)?;
-        match &found {
-            Some(prior) if *prior != clauses => {
-                return Err(format!(
-                    "{} declares {name} with different specifiers; which one each lock entry \
-                     mirrors is not derivable",
-                    meta.rel
-                ))
-            }
-            _ => found = Some(clauses),
-        }
+    let named: Vec<Declaration<'_>> = declarations(meta, declared)
+        .into_iter()
+        .filter(|d| canonicalize_pypi_name(pep508_name(d.spec)) == canon)
+        .collect();
+    if named.is_empty() {
+        return Ok(None);
     }
-    Ok(found)
+    let agreed = |set: &[&Declaration<'_>]| -> Result<Option<Vec<String>>, String> {
+        let mut found: Option<Vec<String>> = None;
+        for d in set {
+            let clauses = spec_clauses(d.spec)?;
+            match &found {
+                Some(prior) if *prior != clauses => return Ok(None),
+                _ => found = Some(clauses),
+            }
+        }
+        Ok(found)
+    };
+    let mut set: Vec<&Declaration<'_>> = named.iter().collect();
+    // The matcher understands a declaration-owned `extra == '<name>'`,
+    // but uv can lower other predicates (including reversed equality) to
+    // that same marker. Without their erased specifiers, keep differing
+    // clauses ambiguous rather than discard a possible declaration.
+    static SIMPLE_EXTRA: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"^\s*extra\s*==\s*(?:'[A-Za-z0-9._-]+'|"[A-Za-z0-9._-]+")\s*$"#)
+            .expect("static simple extra regex")
+    });
+    let unsupported_extra = named.iter().any(|d| {
+        d.spec.split_once(';').is_some_and(|(_, marker)| {
+            marker
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|token| token == "extra")
+                && !SIMPLE_EXTRA.is_match(marker)
+        })
+    });
+    let marker = marker.unwrap_or("");
+    let extras = marker_extras(marker);
+    let narrowings: [&dyn Fn(&Declaration<'_>) -> bool; 2] = [
+        // A `dependencies` line can carry its own `extra == '<x>'` marker
+        // (uv accepts it), so its lock entry looks like one from extra `x`.
+        &|d| match &d.extra {
+            Some(extra) => extras.contains(extra),
+            None => marker_extras(d.spec.split_once(';').map_or("", |(_, m)| m)) == extras,
+        },
+        &|d| {
+            let own = d.spec.split_once(';').map_or("", |(_, m)| m);
+            marker_key(own) == marker_key(marker)
+        },
+    ];
+    for narrow in narrowings {
+        if let Ok(Some(clauses)) = agreed(&set) {
+            return Ok(Some(clauses));
+        }
+        if unsupported_extra {
+            break;
+        }
+        let narrowed: Vec<&Declaration<'_>> = set.iter().copied().filter(|d| narrow(d)).collect();
+        if narrowed.is_empty() {
+            break;
+        }
+        set = narrowed;
+    }
+    agreed(&set)?.map(Some).ok_or_else(|| {
+        format!(
+            "{} declares {name} with different specifiers; which one each lock entry \
+             mirrors is not derivable",
+            meta.rel
+        )
+    })
+}
+
+/// Which lock requirement array a vendored revert is restoring an entry
+/// of, for [`respell_lock_specifier`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LockRequirementArray<'a> {
+    /// The root `requires-dist`: `[project]` dependencies and extras.
+    RequiresDist,
+    /// The root `requires-dev.<group>`.
+    RequiresDev(&'a str),
+    /// `[manifest] constraints` / `build-constraints`.
+    Manifest(&'a str),
+}
+
+/// The `specifier` a vendored revert should restore for `name`'s entry
+/// in `array`, given the one it recorded when vendoring (`None` when the
+/// entry had none) and the entry's `marker`.
+///
+/// A path source records no specifier, so a user who changes the
+/// declaration while the package is vendored (`uv add "six>=1.16"`)
+/// leaves uv.lock byte-identical, and the recorded specifier goes stale
+/// (#840). The entry's declaration is picked the way hosted unwind picks
+/// it ([`declared_clauses`]: by the extra and environment marker uv
+/// lowered into the entry). Returns:
+/// * `Ok(None)`: keep the recorded entry as it is. The declaration still
+///   agrees with it, nothing declares the name, or no declaration of it is
+///   a plain version range (the recorded spelling was uv's own, so it
+///   stays the best answer);
+/// * `Ok(Some(spec))`: write `spec` instead, in uv's spelling (`None` is no
+///   specifier at all);
+/// * `Err`: the declaration changed but uv's spelling of it can't be
+///   derived (a multi-clause range), or which declaration the entry
+///   mirrors is ambiguous, so restoring any spelling may break `--locked`.
+pub(crate) fn respell_lock_specifier(
+    pyproject_text: &str,
+    array: LockRequirementArray<'_>,
+    name: &str,
+    recorded: Option<&str>,
+    marker: Option<&str>,
+) -> Result<Option<Option<String>>, String> {
+    let Ok(doc) = pyproject_text.parse::<DocumentMut>() else {
+        return Ok(None);
+    };
+    let meta = Metadata {
+        rel: "pyproject.toml".to_string(),
+        text: String::new(),
+        script: false,
+        doc,
+    };
+    let declared = match array {
+        LockRequirementArray::RequiresDist => Declared::Dist,
+        LockRequirementArray::RequiresDev(group) => Declared::Dev(group),
+        LockRequirementArray::Manifest(key) => Declared::Manifest(key),
+    };
+    let canon = canonicalize_pypi_name(name);
+    let recorded = match recorded {
+        None => Vec::new(),
+        Some(r) => match spec_clauses(&format!("{canon}{r}")) {
+            Ok(clauses) => clauses,
+            Err(_) => return Ok(None),
+        },
+    };
+    let clauses = match declared_clauses(&meta, declared, name, marker) {
+        Ok(Some(clauses)) => clauses,
+        Ok(None) => return Ok(None),
+        // Not one declaration of the name is a plain version range: the
+        // recorded spelling was uv's own, so it stays the best answer.
+        // Otherwise the marker narrowing left an unreadable or conflicting
+        // set, which is ambiguous: fail closed.
+        Err(reason) => {
+            let all_unreadable = declarations(&meta, declared)
+                .iter()
+                .filter(|d| canonicalize_pypi_name(pep508_name(d.spec)) == canon)
+                .all(|d| spec_clauses(d.spec).is_err());
+            return if all_unreadable {
+                Ok(None)
+            } else {
+                Err(reason)
+            };
+        }
+    };
+    let sorted = |clauses: &[String]| {
+        let mut c = clauses.to_vec();
+        c.sort();
+        c
+    };
+    if sorted(&clauses) == sorted(&recorded) {
+        return Ok(None);
+    }
+    match clauses.as_slice() {
+        [] => Ok(Some(None)),
+        [one] => Ok(Some(Some(one.clone()))),
+        // How uv orders and joins clauses differs between releases (0.8
+        // orders them by version: `>=20,!=21.1.0,<30`), and the lock no
+        // longer shows this entry's spelling, so any guess may break
+        // `--locked`.
+        _ => Err(format!(
+            "pyproject.toml now declares {name} with a multi-clause specifier, whose \
+             spelling in uv.lock is not derivable"
+        )),
+    }
 }
 
 /// Every lock requirement array with the declarations it mirrors
@@ -1050,7 +1358,8 @@ fn restore_requirement_array(
             "the lock's requirement entries name the hosted artifact but its paired metadata \
              file is missing, so their specifiers are not derivable",
         )?;
-        let clauses = declared_clauses(meta, declared, &hit.name)?.ok_or_else(|| {
+        let marker = entry.get("marker").and_then(Value::as_str);
+        let clauses = declared_clauses(meta, declared, &hit.name, marker)?.ok_or_else(|| {
             format!(
                 "{} no longer declares {}, so the lock entry's specifier is not derivable",
                 meta.rel, hit.name
@@ -1409,5 +1718,339 @@ mod tests {
         let clauses = vec![">=1".to_string(), "<2".to_string()];
         assert_eq!(SpecStyle::CANDIDATES[0].join(&clauses), ">=1, <2");
         assert_eq!(SpecStyle::CANDIDATES[3].join(&clauses), "<2,>=1");
+    }
+}
+
+/// The hosted unwind re-derives each requirement entry's specifier from the
+/// declaration uv lowered it from: by extra and marker when one name has
+/// several specifiers (#606), through PEP 735 `include-group` (#473).
+#[cfg(test)]
+mod declaration_tests {
+    use super::*;
+
+    const UUID: &str = "e828efa5-5c6d-43f3-9909-03f5ac232b98";
+    const HOSTED: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/g/e828efa5-5c6d-43f3-9909-03f5ac232b98/six-1.16.0-py2.py3-none-any.whl";
+
+    /// A hosted entry for six with an optional `marker`.
+    fn six(marker: Option<&str>) -> String {
+        match marker {
+            Some(m) => format!("{{ name = \"six\", marker = \"{m}\", url = \"{HOSTED}\" }}"),
+            None => format!("{{ name = \"six\", url = \"{HOSTED}\" }}"),
+        }
+    }
+
+    /// The registry entry the unwind should write back.
+    fn spec(specifier: &str, marker: Option<&str>) -> String {
+        match marker {
+            Some(m) => {
+                format!("{{ name = \"six\", marker = \"{m}\", specifier = \"{specifier}\" }}")
+            }
+            None => format!("{{ name = \"six\", specifier = \"{specifier}\" }}"),
+        }
+    }
+
+    fn lock(requires_dist: &[String], requires_dev: &[(&str, Vec<String>)]) -> String {
+        let mut out = String::from(
+            "version = 1\nrequires-python = \">=3.9\"\n\n[[package]]\nname = \"uvp\"\n\
+             version = \"0.1.0\"\nsource = { editable = \".\" }\n\n[package.metadata]\n",
+        );
+        out.push_str(&format!("requires-dist = [{}]\n", requires_dist.join(", ")));
+        if !requires_dev.is_empty() {
+            out.push_str("\n[package.metadata.requires-dev]\n");
+            for (group, entries) in requires_dev {
+                out.push_str(&format!("{group} = [{}]\n", entries.join(", ")));
+            }
+        }
+        out
+    }
+
+    /// Run the requirement unwind for six over `lock_text` with `pyproject`.
+    fn unwind(pyproject: &str, lock_text: &str) -> Result<String, String> {
+        let mut doc: DocumentMut = lock_text.parse().unwrap();
+        let meta = Metadata {
+            rel: "pyproject.toml".into(),
+            text: pyproject.into(),
+            script: false,
+            doc: pyproject.parse().unwrap(),
+        };
+        let hit = Hit {
+            index: 0,
+            uuid: UUID.into(),
+            name: "six".into(),
+            version: "1.16.0".into(),
+        };
+        let client = super::super::UpstreamClient::new(true);
+        let ctx = Ctx {
+            client: &client,
+            origins: &[],
+            bun_lockb: false,
+        };
+        restore_requirements(&mut doc, &hit, Some(&meta), &[], &ctx)?;
+        Ok(doc.to_string())
+    }
+
+    const HEAD: &str =
+        "[project]\nname = \"uvp\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\n";
+
+    /// #606 (a): a pin in `dependencies` and a floor in an extra.
+    #[test]
+    fn dependencies_and_extra_with_different_specifiers() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six==1.16.0\", \"idna==3.7\"]\n\n\
+             [project.optional-dependencies]\nextra = [\"six>=1.15\"]\n"
+        );
+        let idna = "{ name = \"idna\", specifier = \"==3.7\" }".to_string();
+        let hosted = lock(
+            &[idna.clone(), six(None), six(Some("extra == 'extra'"))],
+            &[],
+        );
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(
+                &[
+                    idna,
+                    spec("==1.16.0", None),
+                    spec(">=1.15", Some("extra == 'extra'"))
+                ],
+                &[]
+            )
+        );
+    }
+
+    /// A declaration-owned extra predicate can collide with uv's lowering
+    /// of optional group membership. Different clauses must remain refused.
+    #[test]
+    fn declaration_owned_extra_predicates_keep_ambiguity() {
+        for own in [
+            "extra == 'x'",
+            "'x' == extra",
+            "extra != 'y'",
+            "extra in 'x,y'",
+            "extra not in 'y'",
+            "(extra == 'x' or extra == 'y')",
+        ] {
+            let pyproject = format!(
+                "{HEAD}dependencies = [\"six>=1.10; {own}\"]\n\n\
+                 [project.optional-dependencies]\nx = [\"six==1.16.0\"]\n"
+            );
+            let marker = "extra == 'x'";
+            let hosted = lock(&[six(Some(marker)), six(Some(marker))], &[]);
+            let err = unwind(&pyproject, &hosted).unwrap_err();
+            assert!(err.contains("different specifiers"), "{own}: {err}");
+        }
+    }
+
+    /// Matching version clauses need no provenance inference, even when
+    /// an explicit extra predicate and a lowered group have the same marker.
+    #[test]
+    fn declaration_owned_extra_with_agreed_clauses_restores() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six==1.16.0; 'x' == extra\"]\n\n\
+             [project.optional-dependencies]\nx = [\"six==1.16.0\"]\n"
+        );
+        let marker = "extra == 'x'";
+        let hosted = lock(&[six(Some(marker))], &[]);
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(&[spec("==1.16.0", Some(marker))], &[])
+        );
+    }
+
+    /// #606 (c): two extras with different floors.
+    #[test]
+    fn two_extras_with_different_specifiers() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"idna==3.7\"]\n\n[project.optional-dependencies]\n\
+             a = [\"six==1.16.0\"]\nb = [\"six>=1.10\"]\n"
+        );
+        let hosted = lock(&[six(Some("extra == 'a'")), six(Some("extra == 'b'"))], &[]);
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(
+                &[
+                    spec("==1.16.0", Some("extra == 'a'")),
+                    spec(">=1.10", Some("extra == 'b'"))
+                ],
+                &[]
+            )
+        );
+    }
+
+    /// Extras sharing one specifier lower to one entry naming both.
+    #[test]
+    fn extras_merged_into_one_entry() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six>=1.10\"]\n\n[project.optional-dependencies]\n\
+             a = [\"six==1.16.0\"]\nc = [\"six==1.16.0\"]\n"
+        );
+        let marker = "extra == 'a' or extra == 'c'";
+        let hosted = lock(&[six(None), six(Some(marker))], &[]);
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(&[spec(">=1.10", None), spec("==1.16.0", Some(marker))], &[])
+        );
+    }
+
+    /// #606 (e): marker-split specifiers in `dependencies`, in both of
+    /// uv's spellings of a `python_version` marker.
+    #[test]
+    fn marker_split_dependencies() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"idna==3.7\", \"six>=1.10; python_version < \\\"3.10\\\"\", \
+             \"six==1.16.0; python_version >= \\\"3.10\\\"\"]\n"
+        );
+        for (lt, ge) in [
+            (
+                "python_full_version < '3.10'",
+                "python_full_version >= '3.10'",
+            ),
+            ("python_version < '3.10'", "python_version >= '3.10'"),
+        ] {
+            let hosted = lock(&[six(Some(lt)), six(Some(ge))], &[]);
+            assert_eq!(
+                unwind(&pyproject, &hosted).unwrap(),
+                lock(&[spec(">=1.10", Some(lt)), spec("==1.16.0", Some(ge))], &[]),
+                "{lt} / {ge}"
+            );
+        }
+    }
+
+    /// uv rewrites `<=` / `>` / `==` on `python_version` into
+    /// `python_full_version` bounds.
+    #[test]
+    fn python_version_operators_match_uvs_rewrite() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six>=1.10; python_version <= '3.9'\", \
+             \"six==1.16.0; python_version > '3.9' and sys_platform == 'linux'\", \
+             \"six>=1.12; python_version == '3.12' and sys_platform != 'linux'\"]\n"
+        );
+        let le = "python_full_version < '3.10'";
+        let gt = "python_full_version >= '3.10' and sys_platform == 'linux'";
+        let eq = "python_full_version == '3.12.*' and sys_platform != 'linux'";
+        let hosted = lock(&[six(Some(le)), six(Some(gt)), six(Some(eq))], &[]);
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(
+                &[
+                    spec(">=1.10", Some(le)),
+                    spec("==1.16.0", Some(gt)),
+                    spec(">=1.12", Some(eq))
+                ],
+                &[]
+            )
+        );
+    }
+
+    /// A marker inside an extra lowers to `<marker> and extra == '<x>'`.
+    #[test]
+    fn marker_inside_an_extra() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six==1.16.0\"]\n\n[project.optional-dependencies]\n\
+             win = [\"six>=1.15; sys_platform == 'win32'\"]\n"
+        );
+        let marker = "sys_platform == 'win32' and extra == 'win'";
+        let hosted = lock(&[six(None), six(Some(marker))], &[]);
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(&[spec("==1.16.0", None), spec(">=1.15", Some(marker))], &[])
+        );
+    }
+
+    /// An entry no declaration lowers to is still refused.
+    #[test]
+    fn unmatched_marker_still_refuses() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six>=1.10; python_version < '3.10'\", \
+             \"six==1.16.0; python_version >= '3.10'\"]\n"
+        );
+        let hosted = lock(&[six(Some("sys_platform == 'linux'"))], &[]);
+        let err = unwind(&pyproject, &hosted).unwrap_err();
+        assert!(err.contains("different specifiers"), "{err}");
+    }
+
+    /// A `dependencies` line with its own `extra == 'x'` marker lowers to
+    /// the same marker as extra `x`'s member: with different specifiers,
+    /// which entry mirrors which is not derivable, so the unwind refuses
+    /// rather than restore both from one declaration.
+    #[test]
+    fn dependency_with_its_own_extra_marker_is_ambiguous() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six>=1.10; extra == 'x'\"]\n\n\
+             [project.optional-dependencies]\nx = [\"six==1.16.0\"]\n"
+        );
+        let hosted = lock(&[six(Some("extra == 'x'")), six(Some("extra == 'x'"))], &[]);
+        let err = unwind(&pyproject, &hosted).unwrap_err();
+        assert!(err.contains("different specifiers"), "{err}");
+    }
+
+    /// Unambiguous when the dependency's own extra is not also declared.
+    #[test]
+    fn dependency_with_its_own_extra_marker() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"six>=1.10; extra == 'x'\"]\n\n\
+             [project.optional-dependencies]\ny = [\"six==1.16.0\"]\n"
+        );
+        let hosted = lock(&[six(Some("extra == 'x'")), six(Some("extra == 'y'"))], &[]);
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(
+                &[
+                    spec(">=1.10", Some("extra == 'x'")),
+                    spec("==1.16.0", Some("extra == 'y'"))
+                ],
+                &[]
+            )
+        );
+    }
+
+    /// #473: a group reaching six through `include-group`.
+    #[test]
+    fn include_group_member() {
+        let pyproject = format!(
+            "{HEAD}dependencies = [\"python-dateutil==2.8.2\"]\n\n[dependency-groups]\n\
+             test = [\"six==1.16.0\"]\ndev = [\"idna==3.7\", {{include-group = \"test\"}}]\n"
+        );
+        let idna = "{ name = \"idna\", specifier = \"==3.7\" }".to_string();
+        let dateutil = "{ name = \"python-dateutil\", specifier = \"==2.8.2\" }".to_string();
+        let hosted = lock(
+            &[dateutil.clone()],
+            &[
+                ("dev", vec![idna.clone(), six(None)]),
+                ("test", vec![six(None)]),
+            ],
+        );
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(
+                &[dateutil],
+                &[
+                    ("dev", vec![idna, spec("==1.16.0", None)]),
+                    ("test", vec![spec("==1.16.0", None)]),
+                ]
+            )
+        );
+    }
+
+    /// Nested and cyclic `include-group`s (uv rejects a cycle, but the
+    /// unwind must not loop on one) and PEP 735 group-name normalization.
+    #[test]
+    fn nested_and_cyclic_include_groups() {
+        let pyproject = format!(
+            "{HEAD}dependencies = []\n\n[dependency-groups]\n\
+             Unit_Tests = [\"six==1.16.0\", {{include-group = \"all\"}}]\n\
+             qa = [{{include-group = \"unit-tests\"}}]\n\
+             all = [{{include-group = \"qa\"}}]\n"
+        );
+        let hosted = lock(&[], &[("all", vec![six(None)]), ("qa", vec![six(None)])]);
+        assert_eq!(
+            unwind(&pyproject, &hosted).unwrap(),
+            lock(
+                &[],
+                &[
+                    ("all", vec![spec("==1.16.0", None)]),
+                    ("qa", vec![spec("==1.16.0", None)]),
+                ]
+            )
+        );
     }
 }

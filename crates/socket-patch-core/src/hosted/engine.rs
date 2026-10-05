@@ -9,7 +9,8 @@
 //! 2. [`bun_lockb_symlinked`] — the binary-lock symlink refusal.
 //! 3. vlt artifact preflight ([`super::vlt`]) + [`withhold_everywhere`].
 //! 4. (caller) the apply lock, the ledger, the vendored→hosted takeover.
-//! 5. [`read_candidate_files`] → [`wheel_targets`] → (caller) wheel metadata.
+//! 5. [`read_candidate_files`] → [`wheel_targets`] → (caller) wheel metadata,
+//!    and [`yarn_berry_manifest_targets`] → (caller) served npm manifests.
 //! 6. [`rewrite`] — the rewriters, the pnpm `trustLockfile` and npm
 //!    `allow-remote` auto-configs, and the per-ecosystem confirmation.
 //! 7. [`guard`] — the symlink / unreadable-file refusal before any write.
@@ -397,6 +398,29 @@ fn presence_only_present(view: &ProjectView<'_>, rel: &str) -> bool {
             .any(|f| f.path == rel && f.has(crate::formats::registry::PRESENCE_ONLY))
 }
 
+/// Read `rel` as advisory rewriter input: a link or an unreadable in-memory
+/// entry is left out (the rewriter then keeps its conservative reading)
+/// rather than refused like a file the rewrite writes.
+async fn read_advisory(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    rel: &str,
+) -> Option<String> {
+    match view {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => view.read_text(rel).await.ok(),
+        ProjectView::Memory(project) if !project.is_symlink(rel) && !unreadable.contains(rel) => {
+            match project.get(rel) {
+                Some(MemoryEntry::Text(text)) => Some(text.to_string()),
+                Some(MemoryEntry::Binary(bytes)) => {
+                    std::str::from_utf8(bytes).ok().map(str::to_string)
+                }
+                _ => None,
+            }
+        }
+        ProjectView::Memory(_) => None,
+    }
+}
+
 /// Read the project's candidate files: [`REDIRECT_CANDIDATE_FILES`], the
 /// Cargo workspace members (when a cargo candidate meets a root
 /// `Cargo.toml`), the Python locks and their scripts, and the Rush locks.
@@ -444,23 +468,37 @@ pub async fn read_candidate_files(
         && NPM_LOCKS.iter().any(|lock| out.files.contains_key(*lock))
     {
         let rel = crate::hosted::memory::select::NPM_MANIFEST_REL;
-        let text = match view {
-            ProjectView::Disk(_) | ProjectView::Snapshot(_) => view.read_text(rel).await.ok(),
-            ProjectView::Memory(project)
-                if !project.is_symlink(rel) && !unreadable.contains(rel) =>
-            {
-                match project.get(rel) {
-                    Some(MemoryEntry::Text(text)) => Some(text.to_string()),
-                    Some(MemoryEntry::Binary(bytes)) => {
-                        std::str::from_utf8(bytes).ok().map(str::to_string)
-                    }
-                    _ => None,
+        if let Some(text) = read_advisory(view, unreadable, rel).await {
+            out.files.insert(rel.to_string(), text);
+        }
+    }
+
+    // A text `bun.lock` names its workspace members; each member's manifest
+    // says which `workspace:` literal its inter-workspace dependencies carry,
+    // which the bun rewriter restores over a member path a migrated binary
+    // lock left behind (#803). Advisory input like the npm manifest above:
+    // keyed `<dir>/package.json` (the root as `package.json`), never
+    // rewritten, and a member dir that is not a plain relative path is
+    // never read.
+    if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
+        if let Some(lock) = out.files.get("bun.lock") {
+            let lines: Vec<String> = lock.split('\n').map(str::to_string).collect();
+            for dir in crate::vendor::bun_lock_text::workspace_member_dirs(&lines) {
+                if !crate::vendor::bun_lock_text::is_plain_member_dir(&dir) {
+                    continue;
+                }
+                let rel = if dir.is_empty() {
+                    "package.json".to_string()
+                } else {
+                    format!("{dir}/package.json")
+                };
+                if out.files.contains_key(&rel) {
+                    continue;
+                }
+                if let Some(text) = read_advisory(view, unreadable, &rel).await {
+                    out.files.insert(rel, text);
                 }
             }
-            ProjectView::Memory(_) => None,
-        };
-        if let Some(text) = text {
-            out.files.insert(rel.to_string(), text);
         }
     }
 
@@ -540,7 +578,7 @@ async fn keep_bundler_loaded_gem_files(view: &ProjectView<'_>, out: &mut Candida
             let config = view.read_text(".bundle/config").await.ok();
             let value = config.as_deref().and_then(manifest::config_gemfile);
             let root = std::path::Path::new("/");
-            manifest::classify(root, None, value.as_deref())
+            manifest::classify(root, None, value.as_deref(), None)
         }
     };
     let keep: &[&str] = match &loaded {
@@ -622,6 +660,54 @@ pub fn wheel_metadata_unavailable(dep: &DepOverride, detail: &str) -> SkippedPat
         purl: format!("pkg:pypi/{}@{}", dep.name, dep.version),
         uuid: dep.patch_uuid.clone(),
         reason: "python_metadata_unavailable".to_string(),
+        detail: Some(detail.replace(&dep.artifact_url, "<hosted artifact>")),
+    }
+}
+
+/// The npm candidates whose yarn berry pin needs the served tarball's own
+/// `package.json`, in candidate order: yarn builds a tarball entry's `bin:`
+/// from that manifest, not from the registry metadata the locked `npm:`
+/// entry came from, and the two spell bin paths differently (#718). Only an
+/// entry the pin would re-key that carries a `bin:` map needs it (see
+/// `berry_pin_needs_manifest`; a fork alias never counts), so a berry
+/// project without bins fetches nothing.
+pub fn yarn_berry_manifest_targets<'a>(
+    candidates: &'a [Candidate],
+    files: &BTreeMap<String, String>,
+) -> Vec<&'a DepOverride> {
+    let Some(lock) = files
+        .get("yarn.lock")
+        .filter(|lock| crate::patch::redirect::is_berry_lock(lock))
+    else {
+        return Vec::new();
+    };
+    let lock = crate::utils::line_endings::to_lf(lock);
+    let bin_entries = crate::patch::redirect::berry_bin_entries(&lock);
+    if bin_entries.is_empty() {
+        return Vec::new();
+    }
+    let mut seen = BTreeSet::new();
+    candidates
+        .iter()
+        .map(|c| &c.dep)
+        .filter(|dep| dep.ecosystem == "npm")
+        .filter(|dep| crate::patch::redirect::berry_pin_needs_manifest(&bin_entries, dep))
+        .filter(|dep| seen.insert(dep.artifact_url.clone()))
+        .collect()
+}
+
+/// The skip recorded for an npm dep whose served `package.json` could not
+/// be fetched (the grant token in `detail` is redacted to `<hosted
+/// artifact>`).
+pub fn npm_manifest_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch {
+    SkippedPatch {
+        purl: format!(
+            "pkg:npm/{}@{}",
+            crate::patch::redirect::full_name(dep),
+            dep.version
+        ),
+        uuid: dep.patch_uuid.clone(),
+        reason: "npm_manifest_unavailable".to_string(),
         detail: Some(detail.replace(&dep.artifact_url, "<hosted artifact>")),
     }
 }
@@ -1349,17 +1435,21 @@ fn confirm(
     // The yarn berry pin's `package.json` `resolutions` entry is only half of
     // it — the URL-keyed `yarn.lock` entry is what installs — so a hosted URL
     // left in the manifest (an earlier run, a refused rewrite) proves
-    // nothing on its own: the manifest never feeds the probe.
+    // nothing on its own: the manifest never feeds the probe. Nor do the
+    // Bun workspace members' manifests, read only as advisory input.
+    fn is_npm_manifest(name: &str) -> bool {
+        name == "package.json" || name.ends_with("/package.json")
+    }
     let final_texts: Vec<(&str, &String)> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
-        .filter(|(name, _)| name.as_str() != "package.json")
+        .filter(|(name, _)| !is_npm_manifest(name))
         .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
         .chain(
             rewrite
                 .files
                 .iter()
-                .filter(|(name, _)| !files.contains_key(*name) && name.as_str() != "package.json")
+                .filter(|(name, _)| !files.contains_key(*name) && !is_npm_manifest(name))
                 .map(|(name, content)| (name.as_str(), content)),
         )
         .collect();

@@ -9,11 +9,17 @@ Pre-v3.0 entries are concise summaries derived from each tag's commit
 history. For full per-release detail, see the
 [GitHub releases page](https://github.com/SocketDev/socket-patch/releases).
 
-The `Release` workflow refuses to publish a version that does not appear
-in this file — see `scripts/release-lint.sh` (run by the `version` job in
-`.github/workflows/release.yml` and by CI on version-bump PRs). Bump PRs
-are opened by `scripts/bump-version.sh`, which rolls `[Unreleased]` over
-into the new version's section — see docs/releasing.md.
+PRs never edit this file. Only the release agent writes `[Unreleased]`, at
+release time, from the PRs merged since the last tag and the code they
+changed. Its `###` headings set the next version's bump (Breaking/Removed →
+major, Added/Changed/Deprecated → minor, anything else → patch). Releases
+are cut by the release train
+([docs/release-train/DESIGN.md](docs/release-train/DESIGN.md)) with
+`scripts/release.py`: a release candidate's `[Unreleased]` entries become a
+`## [X.Y.Z-rc.N]` section, the rolling `release-sync` PR brings each cut
+section and version back to main, and promoting an rc folds its rc sections
+into one `## [X.Y.Z]` section. `scripts/release-lint.sh` refuses to release
+a version without a non-empty section in this file.
 
 ## [Unreleased]
 
@@ -102,6 +108,20 @@ limits, and required install commands.
 
 ### Fixed
 
+- `scan --vex` in hosted mode no longer attests an npm patch as
+  `not_affected` when `package-lock.json` also lists a bundled copy of the
+  same `name@version` (`inBundle`, or `bundled` in a v1 lock). npm unpacks
+  that copy from its parent's tarball, so it stays unpatched; the run
+  already warned `redirect_npm_bundled_instance_skipped` and now leaves the
+  patch out of its attestation, like a standalone `vex` run (#325). When a
+  `packages` map exists, stale bundled flags in the legacy `dependencies`
+  mirror do not suppress an attestation for the actual install tree.
+- `vex` no longer attests an npm or Bun patch as `not_affected` while a
+  second entry for the same `name@version` in the same lockfile still
+  resolves from the registry (for example a workspace member added after
+  vendoring). That copy installs unpatched, so the patch is now reported
+  as contested. `vendor --check` reports the same lockfile entry as drift
+  (#588).
 - Global mode (`-g`) finds npm, yarn, pnpm, bun, RubyGems and Composer on
   Windows, where they install as `.cmd` / `.bat` shims, instead of reporting
   an empty scan. The yarn and npm-family global lookups no longer run from the
@@ -206,6 +226,13 @@ limits, and required install commands.
   `virtualStoreDir`, instead of reporting them `package_not_installed` (#359,
   #362). A store outside the project, such as pnpm's global virtual store, is
   shared with other projects and is still not patched in place.
+- Agent mode and `vex` find packages installed under pnpm's `modulesDir`
+  (`modulesDir:` in `pnpm-workspace.yaml`, or `modules-dir` in `.npmrc`).
+  From pnpm 10.12 the virtual store moves there (`<modulesDir>/.pnpm`), so
+  `apply` exited 0 with the package unpatched as "not installed", and
+  hosted `vex` attested `not_affected` over the unpatched install. Hosted
+  `vex` also no longer attests a pinned npm package the crawler cannot see
+  because pnpm keeps the installed store outside the project (#661, #696).
 - npm locks keep their own layout when edited. `scan --mode hosted`,
   `scan --mode vendored`, `rollback` and `vendor --revert`
   re-serialized `package-lock.json` / `npm-shrinkwrap.json` with LF line
@@ -236,6 +263,10 @@ limits, and required install commands.
   half-open connection. A connect now fails after 10 s, and a connection that
   sends nothing for 60 s fails as a network error. Downloads that keep
   streaming are not cut off (#570).
+- Patch blob and diff downloads stream straight to the `.socket` cache instead
+  of being held in memory whole first, so a large patch artifact no longer
+  costs its full size in RAM during `apply`, `get`, `repair` or `rollback`
+  (#571).
 
 ### Maintenance
 

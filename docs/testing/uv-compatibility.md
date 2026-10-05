@@ -92,7 +92,18 @@ frozen, locked, and ordinary installation outcomes separately where supported.
 - `[tool.uv] dev-dependencies` (the pre-PEP 735 dev group) is classified as a
   direct dependency, and every duplicate `requires-dist` / `requires-dev`
   entry for the package (extras, markers) is repointed, so `uv sync --locked`
-  accepts the lock. `[tool.uv] constraint-dependencies` /
+  accepts the lock. The hosted unwind (`rollback`, `remove`, the hosted →
+  vendored takeover) puts each entry's specifier back from the declaration
+  uv lowered it from, so one package declared with different specifiers in
+  `dependencies`, extras or marker-split lines, or reached through a PEP 735
+  `include-group`, rolls back byte for byte (the `extras` and
+  `include-group` lanes of `e2e_redirect_uv_build`, uv ≥ 0.4.27). An entry
+  whose marker matches no declaration is still refused. Declaration-owned
+  simple equality markers (`extra == 'name'`) are matched explicitly. More
+  complex `extra` predicates with differing version clauses remain refused,
+  as do declarations whose lowered markers are indistinguishable: hosted
+  URLs erase the specifiers needed to recover their provenance. Refusals
+  leave the lock and paired metadata unchanged. `[tool.uv] constraint-dependencies` /
   `build-constraint-dependencies` naming the package are repointed in the
   lock's `[manifest]` `constraints` / `build-constraints` entries, which uv
   ≥ 0.5.6 serializes with the package's source. uv 0.2.37–0.5.3 serialize
@@ -175,7 +186,18 @@ frozen, locked, and ordinary installation outcomes separately where supported.
 
 Revert state retains the original wiring. Script and lock edits are treated as a
 pair: conflicting changes preserve both files and their recovery state rather
-than restoring only one side. Tests also cover restoring one package while
+than restoring only one side. When any uv.lock or pyproject.toml record has
+drifted, neither file is written. A relock that only re-serializes an array
+around socket-patch's unchanged element is not drift: `uv add --dev x` rewrites
+the dev group's `requires-dev` line, and `uv add y` sorts `[manifest] overrides`
+into its multi-line form. Revert restores or removes just that element.
+A path source records no specifier, so changing the vendored package's own
+declaration (`uv add "six>=1.16"`) leaves uv.lock unchanged. Revert then
+restores the `requires-dist`, `requires-dev` and `[manifest] constraints`
+entries with the specifier pyproject.toml declares at revert time, not the one
+recorded when vendoring. When uv's spelling can't be derived, as with a
+multi-clause range (uv orders clauses differently across releases), the edit is
+treated as drift and both files are kept. Tests also cover restoring one package while
 preserving another package's vendored entries.
 
 ## Reproduce the release-family matrix

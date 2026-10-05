@@ -5,20 +5,29 @@
 # (`version` job in release.yml, before anything builds or publishes).
 #
 # Checks (all failures are collected and reported together):
-#   1. The version is a plain X.Y.Z release version and matches Cargo.toml.
-#   2. Version coherence: `scripts/version-sync.sh <version>` is a no-op —
-#      every stamped site (npm/cargo) already
-#      carries the workspace version. Catches hand-edited drift in any single
-#      site. NOTE: this runs version-sync, which refreshes the npm lockfile
-#      (network); files the sync touches are restored afterwards, so the tree
-#      is left as found — but the tree must be CLEAN before the check runs.
-#   3. CHANGELOG.md has a `## [X.Y.Z]` heading with non-empty release notes
-#      (skipped with --sync-only).
-#   4. With --tag-check: the tag v<X.Y.Z> does not already exist at a commit
-#      other than HEAD (existing at HEAD is allowed — that is a re-run of a
-#      release that already tagged; mirrors the Release workflow semantics).
+#   1. The version is a release version — X.Y.Z, or X.Y.Z-rc.N (main carries
+#      the newest cut rc between release-sync merges; see
+#      docs/release-train/DESIGN.md §3.7) — and matches Cargo.toml.
+#      With --stable-only an rc version is refused.
+#   2. Version coherence: the offline stamp (`scripts/release.py stamp
+#      <version> --check`, what `scripts/version-sync.sh` runs) is a no-op —
+#      every stamped site (Cargo.toml, Cargo.lock, npm manifests and lock)
+#      already carries the version, byte for byte. Catches hand-edited drift
+#      in any single site. Plus `scripts/release.py npm-lock-check`: the npm
+#      wrapper's package-lock.json agrees with its package.json beyond the
+#      versions (dependency maps, engines, bin, a node_modules/ entry per
+#      dependency), the drift the old networked lock refresh used to catch.
+#      Offline; writes nothing.
+#   3. CHANGELOG.md has a `## [<version>]` section with non-empty release
+#      notes, and a stable version has no leftover `[<version>-rc.N]`
+#      sections (they fold into it at promotion). Skipped with --sync-only.
+#   4. With --tag-check: the tag v<version> does not already exist at a
+#      commit other than HEAD (existing at HEAD is allowed — that is a re-run
+#      of a release that already tagged; mirrors the Release workflow
+#      semantics). With --tag-exists: the tag v<version> must already exist
+#      on origin (the release-sync PR only ever moves main to a cut tag).
 #
-# Usage: release-lint.sh [--sync-only] [--tag-check] [<version>]
+# Usage: release-lint.sh [--sync-only] [--stable-only] [--tag-check|--tag-exists] [<version>]
 #   <version> defaults to the workspace version in Cargo.toml.
 set -euo pipefail
 
@@ -26,12 +35,16 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 SYNC_ONLY=false
+STABLE_ONLY=false
 TAG_CHECK=false
+TAG_EXISTS=false
 VERSION=""
 for arg in "$@"; do
   case "$arg" in
     --sync-only) SYNC_ONLY=true ;;
+    --stable-only) STABLE_ONLY=true ;;
     --tag-check) TAG_CHECK=true ;;
+    --tag-exists) TAG_EXISTS=true ;;
     -*)
       echo "release-lint: unknown flag: $arg" >&2
       exit 2
@@ -65,64 +78,49 @@ if [ -z "$VERSION" ]; then
   VERSION="$CARGO_VERSION"
 fi
 
-if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-  fail "'$VERSION' is not a plain X.Y.Z release version"
+KIND=any
+if [ "$STABLE_ONLY" = "true" ]; then
+  KIND=stable
+fi
+if ! SEMVER_ERR="$(python3 scripts/release.py semver validate --kind "$KIND" "$VERSION" 2>&1 >/dev/null)"; then
+  fail "${SEMVER_ERR#release.py: error: }"
 fi
 if [ "$VERSION" != "$CARGO_VERSION" ]; then
   fail "requested version $VERSION != Cargo.toml workspace version $CARGO_VERSION (run scripts/version-sync.sh $VERSION)"
 fi
 
-# ── 2. version coherence: version-sync must be a no-op ──────────────────────
+# ── 2. version coherence: the stamp must be a no-op ─────────────────────────
 
-if [ -n "$(git status --porcelain)" ]; then
-  fail "working tree is not clean — the coherence check runs version-sync and needs a clean tree to compare against"
+if STAMP_ERR="$(python3 scripts/release.py stamp --check "$VERSION" 2>&1 >/dev/null)"; then
+  note "version coherence OK: every stamped site already carries $VERSION"
 else
-  bash scripts/version-sync.sh "$VERSION" >/dev/null
-  DRIFTED="$(git status --porcelain | awk '{print $2}')"
-  if [ -n "$DRIFTED" ]; then
-    fail "version-sync.sh $VERSION is not a no-op — these files carried a stale version: $(echo "$DRIFTED" | tr '\n' ' ')"
-    # The tree was clean before the sync, so restoring exactly the files the
-    # sync touched leaves it as found.
-    echo "$DRIFTED" | xargs git checkout --
-  else
-    note "version coherence OK: every stamped site already carries $VERSION"
-  fi
+  fail "${STAMP_ERR#release.py: error: } (run scripts/version-sync.sh $VERSION)"
+fi
+if LOCK_ERR="$(python3 scripts/release.py npm-lock-check 2>&1 >/dev/null)"; then
+  note "npm lock OK: npm/socket-patch/package-lock.json matches package.json"
+else
+  fail "$(printf '%s' "$LOCK_ERR" | tr '\n' ';')"
 fi
 
-# ── 3. CHANGELOG heading + non-empty notes ──────────────────────────────────
+# ── 3. CHANGELOG section + non-empty notes ─────────────────────────────────
 
 if [ "$SYNC_ONLY" = "false" ]; then
-  VERSION_RE="$(printf '%s' "$VERSION" | sed 's/\./\\./g')"
-  # Accept `## [X.Y.Z] — date` and the bracketless `## X.Y.Z` variant, the
-  # same shapes the Release workflow historically accepted.
-  if ! grep -qE "^## \[?${VERSION_RE}\]?( |$)" CHANGELOG.md; then
-    fail "CHANGELOG.md has no '## [$VERSION]' heading — roll [Unreleased] over with scripts/bump-version.sh $VERSION (or write the section by hand)"
+  if CHANGELOG_MSG="$(python3 scripts/release.py changelog check --version "$VERSION" 2>&1)"; then
+    note "CHANGELOG OK: $CHANGELOG_MSG"
   else
-    # Non-empty: at least one non-blank line between the heading and the next
-    # `## ` heading (or EOF). The heading is matched by string prefix, not an
-    # awk -v regex — awk applies escape processing to -v values, which
-    # silently mangles \[ and \. into a wrong pattern.
-    BODY_LINES="$(awk -v ver="$VERSION" '
-      !found {
-        if ($0 == "## [" ver "]" || index($0, "## [" ver "] ") == 1 ||
-            $0 == "## " ver     || index($0, "## " ver " ") == 1) {
-          found = 1
-        }
-        next
-      }
-      /^## / { exit }
-      NF > 0 { count++ }
-      END { print count + 0 }
-    ' CHANGELOG.md)"
-    if [ "$BODY_LINES" -eq 0 ]; then
-      fail "CHANGELOG.md's [$VERSION] section is empty — a release needs written notes"
-    else
-      note "CHANGELOG OK: [$VERSION] section present with $BODY_LINES lines of notes"
-    fi
+    fail "${CHANGELOG_MSG#release.py: error: } — cut it with scripts/release.py changelog cut --version $VERSION --date <YYYY-MM-DD> (or write the section by hand)"
   fi
 fi
 
 # ── 4. tag collision (opt-in: needs the remote) ─────────────────────────────
+
+if [ "$TAG_EXISTS" = "true" ]; then
+  if [ -n "$(git ls-remote origin "refs/tags/v${VERSION}")" ]; then
+    note "tag v${VERSION} exists"
+  else
+    fail "tag v${VERSION} does not exist — main's version may only move to a version the release train already cut"
+  fi
+fi
 
 if [ "$TAG_CHECK" = "true" ]; then
   # HEAD is the release commit in the Release workflow (GITHUB_SHA) and the

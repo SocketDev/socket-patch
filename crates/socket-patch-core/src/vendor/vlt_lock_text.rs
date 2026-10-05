@@ -411,12 +411,7 @@ pub(crate) fn is_default_registry(segment: &str, options: Option<&Map<String, Va
     if segment.is_empty() {
         return true;
     }
-    let alias = match options.and_then(|o| o.get("default-registry-alias")) {
-        None | Some(Value::Null) => Some("npm"),
-        Some(Value::String(alias)) => Some(alias.as_str()),
-        Some(_) => None,
-    };
-    if alias == Some(segment) {
+    if default_registry_alias(options) == Some(segment) {
         return true;
     }
     let Some(registry) = options
@@ -435,6 +430,94 @@ pub(crate) fn is_default_registry(segment: &str, options: Option<&Map<String, Va
     is_registry_url_segment(segment, options)
 }
 
+/// The lock's default registry alias: `default-registry-alias`, else
+/// `npm` (vlt's `defaultRegistryName`). `None` when the option is not a
+/// string.
+pub(crate) fn default_registry_alias(options: Option<&Map<String, Value>>) -> Option<&str> {
+    match options.and_then(|o| o.get("default-registry-alias")) {
+        None | Some(Value::Null) => Some("npm"),
+        Some(Value::String(alias)) => Some(alias.as_str()),
+        Some(_) => None,
+    }
+}
+
+/// vlt's tilde `splitDepID` fills an empty registry field with the literal
+/// `npm`, independently of `default-registry-alias`. Keep the legacy-era
+/// resolution policy separate from that modern normalization.
+pub(crate) fn registry_segment(era: DepIdEra, segment: &str) -> &str {
+    if era == DepIdEra::Tilde && segment.is_empty() {
+        "npm"
+    } else {
+        segment
+    }
+}
+
+/// The registry base URL (with a trailing `/`) a decoded DepID registry
+/// segment names for `name`, given the lock's `options`. Modern hydration
+/// follows `@vltpkg/dep-id` / `@vltpkg/spec` 1.3.5. The legacy empty-segment
+/// fallback preserves compatibility policy: older release/runtime behavior
+/// varies, so it is not inferred from the modern hydration rule.
+///
+/// First normalize an empty tilde segment to `npm`, as `splitDepID` does,
+/// then resolve the segment's base:
+/// - an http(s) URL segment is its own base;
+/// - a named segment is its `options.registries` URL when the lock maps it;
+/// - an empty legacy segment, and an unmapped segment that still names the
+///   default registry ([`is_default_registry`]), is `options.registry`,
+///   else the default alias's `options.registries` URL, else the public
+///   npm registry (`registry ?? registries[default-registry-alias]`);
+/// - any other segment is `None`: the lock names an alias it never maps.
+///
+/// Once the segment resolves, a configured scope registry takes precedence,
+/// including in a named/URL registry spec's final subspec. Unknown aliases
+/// still fail before scope lookup, as `hydrateTuple` does.
+pub(crate) fn registry_base(
+    era: DepIdEra,
+    segment: &str,
+    name: &str,
+    options: Option<&Map<String, Value>>,
+) -> Option<String> {
+    let segment = registry_segment(era, segment);
+    let string = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+            .map(with_trailing_slash)
+    };
+    let alias_url = |alias: &str| {
+        string(
+            options
+                .and_then(|o| o.get("registries"))
+                .and_then(|r| r.get(alias)),
+        )
+    };
+    let base =
+        if reqwest::Url::parse(segment).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
+            with_trailing_slash(segment)
+        } else if let Some(base) = Some(segment).filter(|s| !s.is_empty()).and_then(alias_url) {
+            base
+        } else if is_default_registry(segment, options) {
+            string(options.and_then(|o| o.get("registry")))
+                .or_else(|| default_registry_alias(options).and_then(alias_url))
+                .unwrap_or_else(|| {
+                    with_trailing_slash(crate::vendor::registry_fetch::DEFAULT_NPM_REGISTRY)
+                })
+        } else {
+            return None;
+        };
+    name.split_once('/')
+        .map(|(scope, _)| scope)
+        .filter(|scope| scope.starts_with('@'))
+        .and_then(|scope| {
+            string(
+                options
+                    .and_then(|o| o.get("scoped-registries"))
+                    .and_then(|registries| registries.get(scope)),
+            )
+        })
+        .or(Some(base))
+}
+
 /// Is `segment` an http(s) URL naming `options.registry` (a trailing `/`
 /// aside)?
 pub(crate) fn is_registry_url_segment(segment: &str, options: Option<&Map<String, Value>>) -> bool {
@@ -447,6 +530,104 @@ pub(crate) fn is_registry_url_segment(segment: &str, options: Option<&Map<String
     reqwest::Url::parse(segment).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
         && with_trailing_slash(segment) == with_trailing_slash(registry)
 }
+
+/// `(era, segment, lock options, registry_base)` covers actual DepID
+/// spelling, including modern `~~` normalization and preserved legacy policy.
+/// Every caller's tests assert against this one table.
+#[cfg(test)]
+pub(crate) const REGISTRY_BASE_CASES: &[(DepIdEra, &str, &str, Option<&str>)] = &[
+    (
+        DepIdEra::Tilde,
+        "",
+        "{}",
+        Some("https://registry.npmjs.org/"),
+    ),
+    (
+        DepIdEra::Tilde,
+        "npm",
+        "{}",
+        Some("https://registry.npmjs.org/"),
+    ),
+    (
+        DepIdEra::Tilde,
+        "",
+        r#"{"registry":"https://a.example"}"#,
+        Some("https://a.example/"),
+    ),
+    (
+        DepIdEra::Tilde,
+        "",
+        r#"{"registry":"https://a.example/","registries":{"npm":"https://b.example/"}}"#,
+        Some("https://b.example/"),
+    ),
+    (
+        DepIdEra::Legacy,
+        "",
+        r#"{"registry":"https://a.example/","registries":{"npm":"https://b.example/"}}"#,
+        Some("https://a.example/"),
+    ),
+    (
+        DepIdEra::Tilde,
+        "npm",
+        r#"{"registry":"https://a.example/","registries":{"npm":"https://b.example/"}}"#,
+        Some("https://b.example/"),
+    ),
+    (
+        DepIdEra::Tilde,
+        "npm",
+        r#"{"registries":{"npm":"https://b.example/npm"}}"#,
+        Some("https://b.example/npm/"),
+    ),
+    (
+        DepIdEra::Tilde,
+        "corp",
+        r#"{"default-registry-alias":"corp","registries":{"corp":"https://c.example/"}}"#,
+        Some("https://c.example/"),
+    ),
+    (
+        DepIdEra::Tilde,
+        "",
+        r#"{"default-registry-alias":"corp","registries":{"corp":"https://c.example/"}}"#,
+        None,
+    ),
+    (
+        DepIdEra::Tilde,
+        "",
+        r#"{"default-registry-alias":"corp","registries":{"npm":"https://b.example/","corp":"https://c.example/"}}"#,
+        Some("https://b.example/"),
+    ),
+    (
+        DepIdEra::Legacy,
+        "",
+        r#"{"default-registry-alias":"corp","registries":{"corp":"https://c.example/"}}"#,
+        Some("https://c.example/"),
+    ),
+    (
+        DepIdEra::Tilde,
+        "corp",
+        r#"{"registries":{"corp":"https://c.example/"}}"#,
+        Some("https://c.example/"),
+    ),
+    (
+        DepIdEra::Tilde,
+        "corp",
+        r#"{"registry":"https://a.example/"}"#,
+        None,
+    ),
+    (DepIdEra::Tilde, "corp", "{}", None),
+    (
+        DepIdEra::Tilde,
+        "https://u.example",
+        "{}",
+        Some("https://u.example/"),
+    ),
+];
+
+/// @vltpkg/spec + dep-id 1.3.5 produce `~npm~@s+a@1.0.0` for
+/// `@s/a@npm:@s/a@1.0.0` under these options. Its final registry is `a`,
+/// while an unscoped `npm:` package uses `b`.
+#[cfg(test)]
+pub(crate) const SCOPED_REGISTRY_OPTIONS: &str = r#"{"registry":"https://a.example/","registries":{"npm":"https://b.example/","corp":"https://corp.example/"},"scoped-registries":{"@s":"https://a.example/"}}"#;
 
 // ── lock-level sniff ─────────────────────────────────────────────────────
 
@@ -1672,6 +1853,64 @@ mod tests {
                 "{registry}"
             );
         }
+    }
+
+    #[test]
+    fn registry_base_follows_modern_hydration_and_legacy_policy() {
+        for (era, segment, opts, want) in REGISTRY_BASE_CASES {
+            let opts = options(opts);
+            let delimiter = era.delimiter();
+            let key = format!(
+                "{delimiter}{}{delimiter}left-pad@1.3.0",
+                encode_segment(segment, *era)
+            );
+            let id = split_dep_id(&key).unwrap();
+            assert_eq!(
+                registry_base(id.era, &id.first, "left-pad", Some(&opts)).as_deref(),
+                *want,
+                "{segment:?} with {opts:?}"
+            );
+        }
+        assert_eq!(
+            registry_base(DepIdEra::Tilde, "npm", "left-pad", None).as_deref(),
+            Some("https://registry.npmjs.org/")
+        );
+        assert_eq!(
+            registry_base(DepIdEra::Tilde, "corp", "left-pad", None),
+            None
+        );
+    }
+
+    #[test]
+    fn registry_base_applies_scope_after_resolving_the_segment() {
+        let opts = options(SCOPED_REGISTRY_OPTIONS);
+        for (segment, unscoped) in [
+            ("", "https://b.example/"),
+            ("npm", "https://b.example/"),
+            ("corp", "https://corp.example/"),
+            (
+                "https://explicit.example/npm",
+                "https://explicit.example/npm/",
+            ),
+        ] {
+            assert_eq!(
+                registry_base(DepIdEra::Tilde, segment, "@s/a", Some(&opts)).as_deref(),
+                Some("https://a.example/"),
+                "{segment}"
+            );
+            for name in ["a", "@other/a"] {
+                assert_eq!(
+                    registry_base(DepIdEra::Tilde, segment, name, Some(&opts)).as_deref(),
+                    Some(unscoped),
+                    "{segment}: {name}"
+                );
+            }
+        }
+        // A scope mapping must not make an unknown registry alias valid.
+        assert_eq!(
+            registry_base(DepIdEra::Tilde, "unmapped", "@s/a", Some(&opts)),
+            None
+        );
     }
 
     fn readable(text: &str) -> ParsedLock {

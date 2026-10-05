@@ -773,3 +773,127 @@ fn vlt_preserve_state_rollback_then_revendor_then_rollback() {
         .join(format!(".socket/vendor/npm/{}", hosted::UUID))
         .exists());
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// #664: a vendor store shared between projects through a symlink
+// ─────────────────────────────────────────────────────────────────────
+
+/// Move `fx`'s real `.socket/vendor/npm` into `shared` (when it has one)
+/// and leave a symlink to `shared` in its place — two projects in a
+/// monorepo sharing one vendor store.
+#[cfg(unix)]
+fn link_npm_vendor_dir(fx: &NpmFixture, shared: &Path) {
+    let npm = fx.root().join(".socket/vendor/npm");
+    std::fs::create_dir_all(shared).unwrap();
+    if npm.is_dir() {
+        for entry in std::fs::read_dir(&npm).unwrap() {
+            let entry = entry.unwrap();
+            let dest = shared.join(entry.file_name());
+            if !dest.exists() {
+                std::fs::rename(entry.path(), dest).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(&npm).unwrap();
+    }
+    std::fs::create_dir_all(npm.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(shared, &npm).unwrap();
+}
+
+/// #664: project A and project B both vendored the same patch into one
+/// store that their `.socket/vendor/npm` links point at. Rolling A back
+/// used to delete the uuid dir THROUGH the link, so B's committed tarball
+/// vanished while A's rollback reported success. A linked vendor dir is
+/// never one socket-patch created, so the revert must refuse before it
+/// edits anything: A stays wired, the shared artifacts survive, and the
+/// run says why.
+#[cfg(unix)]
+#[tokio::test]
+async fn rollback_never_deletes_through_a_shared_vendor_dir_link() {
+    let shared_tmp = tempfile::tempdir().unwrap();
+    let shared = shared_tmp.path().join("shared-npm");
+    let a = npm_fixture();
+    let b = npm_fixture();
+    for fx in [&a, &b] {
+        assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "vendor");
+        link_npm_vendor_dir(fx, &shared);
+    }
+    let shared_tgz = shared.join(UUID).join("left-pad-1.3.0.tgz");
+    assert!(
+        shared_tgz.is_file(),
+        "sanity: the shared store holds the unit"
+    );
+    let a_lock = a.lock_bytes();
+    let a_state = std::fs::read(a.state_path()).unwrap();
+
+    let (code, env) = rollback_cli(a.root(), &[]);
+    assert_eq!(code, 1, "a refused revert fails the rollback: {env:#}");
+    let text = env.to_string();
+    assert!(
+        text.contains(".socket/vendor/npm` is a symlink"),
+        "the failure names the link: {env:#}"
+    );
+    assert!(
+        shared_tgz.is_file(),
+        "B's vendored tarball in the shared store must survive A's rollback"
+    );
+    assert!(b.tgz_path().is_file(), "B still resolves its tarball");
+    assert_eq!(a.lock_bytes(), a_lock, "A's lock is left wired, untouched");
+    assert_eq!(
+        std::fs::read(a.state_path()).unwrap(),
+        a_state,
+        "A keeps its ledger entry"
+    );
+
+    // `vendor --revert` takes the same dispatch.
+    let (code, stdout, stderr) = run_cli(
+        a.root(),
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--offline",
+            "--cwd",
+            a.root().to_str().unwrap(),
+        ],
+    );
+    assert_ne!(code, 0, "vendor --revert refuses too:\n{stdout}\n{stderr}");
+    assert!(shared_tgz.is_file(), "still there after vendor --revert");
+}
+
+/// #664, write side: vendoring into a linked `.socket/vendor/npm` would
+/// stage the unit in a store another project owns (and a later revert
+/// would delete it there). It is refused before any write, with a code
+/// naming the cause, and the link target stays empty.
+#[cfg(unix)]
+#[tokio::test]
+async fn vendor_refuses_a_linked_vendor_dir_before_writing() {
+    let shared_tmp = tempfile::tempdir().unwrap();
+    let shared = shared_tmp.path().join("shared-npm");
+    let fx = npm_fixture();
+    link_npm_vendor_dir(&fx, &shared);
+
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ],
+    );
+    assert_ne!(
+        code, 0,
+        "a refused vendor is not a success:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("vendor_dir_symlink_unsupported"),
+        "refusal code in the envelope:\n{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&shared).unwrap().count(),
+        0,
+        "nothing staged through the link"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
+}
