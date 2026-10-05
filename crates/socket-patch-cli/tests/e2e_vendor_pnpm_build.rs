@@ -2042,3 +2042,122 @@ fn pnpm_agent_apply_patches_a_transitive_dep_in_a_relocated_virtual_store() {
         assert_eq!(std::fs::read(&index).unwrap(), orig, "{setting}");
     }
 }
+
+/// #360: on pnpm 10.5+ a project may keep its `overrides:` in
+/// pnpm-workspace.yaml, and a package.json `pnpm.overrides` then REPLACES
+/// them. Vendoring must wire only the workspace file and the lock, so the
+/// committable set still frozen-installs (no
+/// ERR_PNPM_LOCKFILE_CONFIG_MISMATCH) with the user's override intact and
+/// the patched bytes installed, and `vendor --revert` restores every file.
+#[test]
+fn pnpm_vendor_keeps_user_workspace_overrides_authoritative() {
+    if !has_corepack_pm(PNPM_PRIMARY) {
+        println!("SKIP: `corepack {PNPM_PRIMARY}` unavailable");
+        return;
+    }
+    let pm = PNPM_PRIMARY;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let pkg_before = format!(
+        "{{\"name\":\"ws-overrides\",\"version\":\"0.0.0\",\"private\":true,\
+         \"dependencies\":{{\"{DEP}\":\"{DEP_VERSION}\",\"is-odd\":\"3.0.1\"}}}}\n"
+    );
+    let ws_before = "packages:\n  - '.'\noverrides:\n  is-number: 7.0.0\n";
+    std::fs::write(proj.join("package.json"), &pkg_before).unwrap();
+    std::fs::write(proj.join("pnpm-workspace.yaml"), ws_before).unwrap();
+
+    let store = tmp.path().join("pnpm-store");
+    let install = corepack(
+        &proj,
+        pm,
+        &["install", "--store-dir", store.to_str().unwrap()],
+    );
+    if !install.status.success() {
+        assert!(!pnpm_required(), "fixture install failed: {install:?}");
+        println!("SKIP: fixture `pnpm install` failed: {install:?}");
+        return;
+    }
+    let lock_path = proj.join("pnpm-lock.yaml");
+    let lock_before = std::fs::read_to_string(&lock_path).unwrap();
+    if !lock_before.contains("overrides:\n  is-number: 7.0.0\n") {
+        // pnpm 10.0-10.4 ignore workspace-file overrides; nothing to prove.
+        println!("SKIP: {pm} does not read overrides from pnpm-workspace.yaml");
+        return;
+    }
+
+    let index = proj.join("node_modules").join(DEP).join("index.js");
+    let orig = std::fs::read(&index).unwrap();
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
+    let cwd = proj.to_str().unwrap();
+
+    let (code, stdout, stderr) =
+        run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+    assert_eq!(code, 0, "vendor failed.\n{stdout}\n{stderr}");
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    assert_eq!(
+        std::fs::read_to_string(proj.join("package.json")).unwrap(),
+        pkg_before,
+        "package.json must not gain a pnpm.overrides that shadows the workspace overrides"
+    );
+    let ws_after = std::fs::read_to_string(proj.join("pnpm-workspace.yaml")).unwrap();
+    assert!(
+        ws_after.starts_with(ws_before)
+            && ws_after.contains(&format!("{DEP}@{DEP_VERSION}: file:")),
+        "{ws_after}"
+    );
+
+    // Fresh checkout of the committable files, empty store.
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    for file in ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"] {
+        std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
+    }
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    let fresh_store = tmp.path().join("fresh-pnpm-store");
+    let ci = corepack(
+        &fresh,
+        pm,
+        &[
+            "install",
+            "--frozen-lockfile",
+            "--store-dir",
+            fresh_store.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        ci.status.success(),
+        "fresh `pnpm install --frozen-lockfile` must accept the vendored wiring.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+        patched,
+        "the patched bytes are installed"
+    );
+    // The user's override still applies: is-odd's is-number is 7.0.0.
+    let script = "const p=require('path');process.stdout.write(require(require.resolve(\
+         'is-number/package.json',{paths:[p.dirname(require.resolve('is-odd'))]})).version)";
+    let out = Command::new("node")
+        .args(["-e", script])
+        .current_dir(&fresh)
+        .output()
+        .expect("node runs");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7.0.0", "{out:?}");
+
+    let (code, stdout, stderr) = run_socket(&proj, &["vendor", "--revert", "--json", "--cwd", cwd]);
+    assert_eq!(code, 0, "revert failed.\n{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(proj.join("package.json")).unwrap(),
+        pkg_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("pnpm-workspace.yaml")).unwrap(),
+        ws_before
+    );
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock_before);
+}
