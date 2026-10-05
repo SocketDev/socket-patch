@@ -1085,11 +1085,11 @@ fn respell_original(
         if !element.contains(&needle) {
             continue;
         }
-        let array = array.unwrap_or(LockRequirementArray::RequiresDist {
-            extra: marker_extra(element),
-        });
+        let array = array.unwrap_or(LockRequirementArray::RequiresDist);
         let specifier = entry_value(element, "specifier");
-        if let Some(spec) = respell_lock_specifier(pyproject_text, array, canon, specifier)? {
+        let marker = entry_value(element, "marker");
+        if let Some(spec) = respell_lock_specifier(pyproject_text, array, canon, specifier, marker)?
+        {
             out.replace_range(s..e, &with_specifier(element, spec.as_deref()));
         }
     }
@@ -1106,14 +1106,6 @@ fn entry_value<'a>(entry: &'a str, key: &str) -> Option<&'a str> {
             .strip_prefix('=')
             .map(|v| v.trim().trim_matches('"'))
     })
-}
-
-/// The extra a root `requires-dist` entry belongs to: uv records an
-/// optional-dependencies requirement with `extra == '<name>'` in its marker.
-fn marker_extra(entry: &str) -> Option<&str> {
-    let marker = entry_value(entry, "marker")?;
-    let rest = &marker[marker.find("extra == '")? + "extra == '".len()..];
-    rest.split('\'').next()
 }
 
 /// `entry` with its `specifier` replaced by `spec` (removed when `None`),
@@ -7021,6 +7013,61 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
                 "marker = \"extra == 'socks'\", specifier = \">=1.16\""
             )
         );
+    }
+
+    /// Bugbot on #841: six declared twice under complementary environment
+    /// markers, both `==1.16.0` when vendored. Editing only the second
+    /// must respell only the entry whose marker mirrors it, never keep the
+    /// stale pin because the OTHER declaration still matches it.
+    #[tokio::test]
+    async fn revert_respells_the_entry_whose_marker_mirrors_the_edit() {
+        let py_in = DIRECT_REGISTRY_PYPROJECT.replace(
+            "[\"six==1.16.0\"]",
+            "[\"six==1.16.0; python_version < '3.12'\", \"six==1.16.0; python_version >= '3.12'\"]",
+        );
+        let lock_in = DIRECT_REGISTRY_LOCK.replace(
+            "requires-dist = [{ name = \"six\", specifier = \"==1.16.0\" }]",
+            "requires-dist = [\n    { name = \"six\", marker = \"python_full_version < '3.12'\", specifier = \"==1.16.0\" },\n    { name = \"six\", marker = \"python_full_version >= '3.12'\", specifier = \"==1.16.0\" },\n]",
+        );
+        let (outcome, _, (_, lock)) = revert_after_declaration_edit(
+            &py_in,
+            &lock_in,
+            "\"six==1.16.0; python_version >= '3.12'\"",
+            "\"six>=1.16; python_version >= '3.12'\"",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            lock,
+            lock_in.replace(
+                "marker = \"python_full_version >= '3.12'\", specifier = \"==1.16.0\"",
+                "marker = \"python_full_version >= '3.12'\", specifier = \">=1.16\""
+            )
+        );
+    }
+
+    /// Bugbot on #841: an `include-group` still carries the old pin after
+    /// the group's own declaration was edited. The two declarations now
+    /// disagree and the entry's marker can't tell them apart, so keep the
+    /// wired pair (drift) instead of restoring the stale specifier.
+    #[tokio::test]
+    async fn revert_keeps_the_pair_when_group_declarations_disagree() {
+        let py_in = DEV_GROUP_REGISTRY_PYPROJECT.replace(
+            "dev = [\"six==1.16.0\"]",
+            "base = [\"six==1.16.0\"]\ndev = [\"six==1.16.0\", { include-group = \"base\" }]",
+        );
+        let (outcome, (edited_py, wired_lock), (py, lock)) = revert_after_declaration_edit(
+            &py_in,
+            DEV_GROUP_REGISTRY_LOCK,
+            "dev = [\"six==1.16.0\",",
+            "dev = [\"six>=1.16\",",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert_eq!(py, edited_py);
+        assert_eq!(lock, wired_lock);
     }
 
     /// An unchanged declaration, however it is spaced or ordered, still

@@ -1185,10 +1185,8 @@ fn declared_clauses(
 /// of, for [`respell_lock_specifier`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum LockRequirementArray<'a> {
-    /// The root `requires-dist`, for the entry carrying `extra` in its
-    /// marker (`marker = "extra == 'x'"`), or for `[project]
-    /// dependencies` when `None`.
-    RequiresDist { extra: Option<&'a str> },
+    /// The root `requires-dist`: `[project]` dependencies and extras.
+    RequiresDist,
     /// The root `requires-dev.<group>`.
     RequiresDev(&'a str),
     /// `[manifest] constraints` / `build-constraints`.
@@ -1197,26 +1195,29 @@ pub(crate) enum LockRequirementArray<'a> {
 
 /// The `specifier` a vendored revert should restore for `name`'s entry
 /// in `array`, given the one it recorded when vendoring (`None` when the
-/// entry had none).
+/// entry had none) and the entry's `marker`.
 ///
 /// A path source records no specifier, so a user who changes the
 /// declaration while the package is vendored (`uv add "six>=1.16"`)
 /// leaves uv.lock byte-identical, and the recorded specifier goes stale
-/// (#840). Returns:
+/// (#840). The entry's declaration is picked the way hosted unwind picks
+/// it ([`declared_clauses`]: by the extra and environment marker uv
+/// lowered into the entry). Returns:
 /// * `Ok(None)`: keep the recorded entry as it is. The declaration still
-///   agrees with it, nothing declares the name, or the declaration isn't a
-///   plain version range (the recorded spelling was uv's own, so it stays
-///   the best answer);
+///   agrees with it, nothing declares the name, or a declaration of it
+///   isn't a plain version range (the recorded spelling was uv's own, so
+///   it stays the best answer);
 /// * `Ok(Some(spec))`: write `spec` instead, in uv's spelling (`None` is no
 ///   specifier at all);
 /// * `Err`: the declaration changed but uv's spelling of it can't be
-///   derived (a multi-clause range, or several conflicting declarations),
-///   so restoring any spelling may break `--locked`.
+///   derived (a multi-clause range), or which declaration the entry
+///   mirrors is ambiguous, so restoring any spelling may break `--locked`.
 pub(crate) fn respell_lock_specifier(
     pyproject_text: &str,
     array: LockRequirementArray<'_>,
     name: &str,
     recorded: Option<&str>,
+    marker: Option<&str>,
 ) -> Result<Option<Option<String>>, String> {
     let Ok(doc) = pyproject_text.parse::<DocumentMut>() else {
         return Ok(None);
@@ -1227,44 +1228,16 @@ pub(crate) fn respell_lock_specifier(
         script: false,
         doc,
     };
+    let declared = match array {
+        LockRequirementArray::RequiresDist => Declared::Dist,
+        LockRequirementArray::RequiresDev(group) => Declared::Dev(group),
+        LockRequirementArray::Manifest(key) => Declared::Manifest(key),
+    };
     let canon = canonicalize_pypi_name(name);
-    let specs: Vec<&str> = match array {
-        LockRequirementArray::RequiresDist { extra } => {
-            let extra = extra.map(canonicalize_pypi_name);
-            declarations(&meta, Declared::Dist)
-                .into_iter()
-                .filter(|d| d.extra == extra)
-                .map(|d| d.spec)
-                .collect()
-        }
-        LockRequirementArray::RequiresDev(group) => declarations(&meta, Declared::Dev(group))
-            .into_iter()
-            .map(|d| d.spec)
-            .collect(),
-        LockRequirementArray::Manifest(key) => declarations(&meta, Declared::Manifest(key))
-            .into_iter()
-            .map(|d| d.spec)
-            .collect(),
-    };
-    let sorted = |clauses: &[String]| {
-        let mut c = clauses.to_vec();
-        c.sort();
-        c
-    };
-    // Each distinct clause set declared for the name, in declaration order.
-    let mut declared: Vec<Vec<String>> = Vec::new();
-    for spec in specs {
-        if canonicalize_pypi_name(pep508_name(spec)) != canon {
-            continue;
-        }
-        let Ok(clauses) = spec_clauses(spec) else {
-            return Ok(None);
-        };
-        if !declared.iter().any(|d| sorted(d) == sorted(&clauses)) {
-            declared.push(clauses);
-        }
-    }
-    if declared.is_empty() {
+    let unreadable = declarations(&meta, declared).iter().any(|d| {
+        canonicalize_pypi_name(pep508_name(d.spec)) == canon && spec_clauses(d.spec).is_err()
+    });
+    if unreadable {
         return Ok(None);
     }
     let recorded = match recorded {
@@ -1274,15 +1247,17 @@ pub(crate) fn respell_lock_specifier(
             Err(_) => return Ok(None),
         },
     };
-    if declared.iter().any(|d| sorted(d) == sorted(&recorded)) {
+    let Some(clauses) = declared_clauses(&meta, declared, name, marker)? else {
+        return Ok(None);
+    };
+    let sorted = |clauses: &[String]| {
+        let mut c = clauses.to_vec();
+        c.sort();
+        c
+    };
+    if sorted(&clauses) == sorted(&recorded) {
         return Ok(None);
     }
-    let [clauses] = declared.as_slice() else {
-        return Err(format!(
-            "pyproject.toml declares {name} with several specifiers, none of them the \
-             recorded one, so which one the lock entry mirrors is not derivable"
-        ));
-    };
     match clauses.as_slice() {
         [] => Ok(Some(None)),
         [one] => Ok(Some(Some(one.clone()))),
