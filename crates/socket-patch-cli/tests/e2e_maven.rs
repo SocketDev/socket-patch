@@ -251,10 +251,16 @@ async fn scan_discovers_gradle_project_artifacts() {
     )
     .unwrap();
 
-    // Create a build.gradle in the project directory (Gradle project)
+    // Create a build.gradle in the project directory (Gradle project). It
+    // declares mavenLocal(): a Gradle-only build without it never
+    // reads the Maven local repository, so scan leaves m2 out for it (#551).
     let project_dir = dir.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
-    std::fs::write(project_dir.join("build.gradle"), "plugins { id 'java' }\n").unwrap();
+    std::fs::write(
+        project_dir.join("build.gradle"),
+        "plugins { id 'java' }\nrepositories { mavenLocal() }\n",
+    )
+    .unwrap();
 
     // --- JSON run: the `scannedPackages` count is the contract field -----
     // A single artifact lives in the repo. We assert the *value* (1), not

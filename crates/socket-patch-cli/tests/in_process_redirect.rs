@@ -2423,8 +2423,9 @@ packages:
 
 /// The rewriters' own warnings must reach HUMAN mode too, not just the
 /// `--json` envelope: they carry the load-bearing "why nothing happened /
-/// what you must do" guidance (`redirect_npm_no_lockfile`,
-/// `redirect_gradle_manual_snippet`, the missing-integrity family).
+/// what you must do" guidance (`redirect_npm_no_lockfile`, the hosted
+/// Gradle planner's refusal codes and its `redirect_gradle_manual_snippet`
+/// fallback, the missing-integrity family).
 /// Regression guard: the human branch printed skipped/record/rush warnings
 /// but dropped `rewrite.warnings` entirely, so a default-mode
 /// `scan --mode hosted` in a lockfile-less project reported "Redirected 0

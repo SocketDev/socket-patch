@@ -31,6 +31,21 @@ pub struct VerifyRollbackResult {
     pub target_hash: Option<String>,
 }
 
+/// The `NotFound` message of a file that is truly absent, as opposed to
+/// one that exists but could not be read or stat'd (`Failed to hash
+/// file: …` / `Failed to stat file: …`) or whose key is unsafe.
+pub const FILE_NOT_FOUND_MESSAGE: &str = "File not found";
+
+impl VerifyRollbackResult {
+    /// `NotFound` because the file is absent from disk — not an I/O error
+    /// on a file that is there (which may still hold the patched bytes)
+    /// or an unsafe key, both of which share the `NotFound` status.
+    pub fn is_absent(&self) -> bool {
+        self.status == VerifyRollbackStatus::NotFound
+            && self.message.as_deref() == Some(FILE_NOT_FOUND_MESSAGE)
+    }
+}
+
 /// Result of rolling back patches for a single package.
 #[derive(Debug, Clone)]
 pub struct RollbackResult {
@@ -172,7 +187,7 @@ pub async fn verify_file_rollback(
             return VerifyRollbackResult {
                 file: file_name.to_string(),
                 status: VerifyRollbackStatus::NotFound,
-                message: Some("File not found".to_string()),
+                message: Some(FILE_NOT_FOUND_MESSAGE.to_string()),
                 current_hash: None,
                 expected_hash: None,
                 target_hash: None,
@@ -671,6 +686,21 @@ async fn rollback_package_patch_at(
         {
             Ok(warning) => warnings.extend(warning),
             Err(e) => {
+                // A Windows daemon holding a cached jar open: say which
+                // process to stop (apply's twin).
+                let target = pkg_path.join(normalize_file_path(file_name));
+                if package_key.starts_with("pkg:maven/")
+                    && crate::patch::sidecars::maven::is_locked_by_daemon(&e, &target)
+                {
+                    result.sidecar = Some(crate::patch::sidecars::SidecarRecord {
+                        purl: package_key.to_string(),
+                        ecosystem: "maven".to_string(),
+                        files: Vec::new(),
+                        advisory: Some(crate::patch::sidecars::maven::locked_by_daemon_advisory(
+                            &target,
+                        )),
+                    });
+                }
                 result.error = Some(e.to_string());
                 return result;
             }

@@ -543,62 +543,75 @@ async fn get_maven_repo_paths_with_pom_xml_returns_repo() {
     );
 }
 
-#[tokio::test]
-#[serial]
-async fn get_maven_repo_paths_with_build_gradle_returns_repo() {
+/// A Gradle marker makes a JVM project, but a Gradle-only build that never
+/// declares `mavenLocal()` does not resolve from the Maven local repository
+/// (#551): scan's roots leave it out, while PURL lookups (vendor sourcing,
+/// apply's every-copy fan-out) still see it. The caches come from an
+/// explicit env (an empty Gradle user home), never the process's.
+async fn assert_gradle_marker_gates_m2(marker: &str, maven_local: bool) {
+    use socket_patch_core::crawlers::maven_crawler::JvmEnv;
+    use socket_patch_core::gradle::Os;
+
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::write(tmp.path().join("build.gradle"), b"plugins {}")
+    let body = if maven_local {
+        "repositories { mavenLocal() }"
+    } else {
+        "plugins {}"
+    };
+    tokio::fs::write(tmp.path().join(marker), body)
         .await
         .unwrap();
     let repo = tempfile::tempdir().unwrap();
-    let prev = std::env::var("MAVEN_REPO_LOCAL").ok();
-    std::env::set_var("MAVEN_REPO_LOCAL", repo.path());
+    let gradle_home = tempfile::tempdir().unwrap();
+    let env: std::collections::HashMap<String, String> = [
+        ("MAVEN_REPO_LOCAL", repo.path()),
+        ("GRADLE_USER_HOME", gradle_home.path()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string_lossy().into_owned()))
+    .collect();
+    let env = JvmEnv::resolve(&env, Os::current(), None);
 
     let crawler = MavenCrawler;
-    let paths = crawler
-        .get_maven_repo_paths(&options_at(tmp.path()))
+    let roots: Vec<_> = crawler
+        .get_jvm_cache_roots_with(&options_at(tmp.path()), &env)
+        .await
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+    let lookup = crawler
+        .get_maven_repo_paths_with(&options_at(tmp.path()), &env)
         .await
         .unwrap();
 
-    std::env::remove_var("MAVEN_REPO_LOCAL");
-    if let Some(v) = prev {
-        std::env::set_var("MAVEN_REPO_LOCAL", v);
-    }
-
+    let want: Vec<std::path::PathBuf> = if maven_local {
+        vec![repo.path().to_path_buf()]
+    } else {
+        Vec::new()
+    };
     assert_eq!(
-        paths,
+        roots, want,
+        "{marker} (mavenLocal: {maven_local}): scan roots"
+    );
+    assert_eq!(
+        lookup,
         vec![repo.path().to_path_buf()],
-        "build.gradle marker + MAVEN_REPO_LOCAL must yield exactly that repo"
+        "{marker} + MAVEN_REPO_LOCAL must still resolve PURLs from that repo"
     );
 }
 
 #[tokio::test]
 #[serial]
+async fn get_maven_repo_paths_with_build_gradle_returns_repo() {
+    assert_gradle_marker_gates_m2("build.gradle", false).await;
+    assert_gradle_marker_gates_m2("build.gradle", true).await;
+}
+
+#[tokio::test]
+#[serial]
 async fn get_maven_repo_paths_with_build_gradle_kts_returns_repo() {
-    let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::write(tmp.path().join("build.gradle.kts"), b"plugins {}")
-        .await
-        .unwrap();
-    let repo = tempfile::tempdir().unwrap();
-    let prev = std::env::var("MAVEN_REPO_LOCAL").ok();
-    std::env::set_var("MAVEN_REPO_LOCAL", repo.path());
-
-    let crawler = MavenCrawler;
-    let paths = crawler
-        .get_maven_repo_paths(&options_at(tmp.path()))
-        .await
-        .unwrap();
-
-    std::env::remove_var("MAVEN_REPO_LOCAL");
-    if let Some(v) = prev {
-        std::env::set_var("MAVEN_REPO_LOCAL", v);
-    }
-
-    assert_eq!(
-        paths,
-        vec![repo.path().to_path_buf()],
-        "build.gradle.kts marker + MAVEN_REPO_LOCAL must yield exactly that repo"
-    );
+    assert_gradle_marker_gates_m2("build.gradle.kts", false).await;
+    assert_gradle_marker_gates_m2("build.gradle.kts", true).await;
 }
 
 #[tokio::test]

@@ -1047,9 +1047,10 @@ fn hosted_pins_in_scope(common: &GlobalArgs, pins: Vec<HostedPin>) -> Vec<Hosted
 
 /// What a wet eject can touch, captured before it touches anything: every
 /// regular file directly in the project root, the hosted pins' files and
-/// the restore's files (nested locks included), the project's cargo and
-/// maven config files, the vendor ledger, and the set of vendored uuid
-/// directories.
+/// the restore's files (nested locks included), the project's cargo,
+/// maven and Gradle config and owned files (every Gradle build's settings
+/// and lock files when the project has a hosted Gradle index), the vendor
+/// ledger, and the set of vendored uuid directories.
 ///
 /// [`EjectSnapshot::restore`] puts back only what the eject WROTE: the
 /// files above that the upstream restore planned or wrote, and every file
@@ -1070,12 +1071,21 @@ struct EjectSnapshot {
 }
 
 impl EjectSnapshot {
-    const EXTRA: [&'static str; 5] = [
+    const EXTRA: [&'static str; 12] = [
         ".cargo/config",
         ".cargo/config.toml",
         ".mvn/maven.config",
         ".mvn/checksums/checksums.sha256",
         socket_patch_core::vendor::VENDOR_STATE_REL,
+        // The Gradle owned files: the hosted ones the restore removes and
+        // the vendored ones the vendor step writes.
+        socket_patch_core::patch::redirect::gradle::HOSTED_INDEX_REL,
+        socket_patch_core::patch::redirect::gradle::HOSTED_SCRIPT_REL,
+        socket_patch_core::patch::redirect::gradle::GITATTRIBUTES_REL,
+        socket_patch_core::vendor::jvm::gradle::SCRIPT_REL,
+        socket_patch_core::vendor::jvm::gradle::INDEX_REL,
+        socket_patch_core::vendor::jvm::gradle::VENDOR_GITATTRIBUTES_REL,
+        socket_patch_core::vendor::jvm::gradle::VERIFICATION_REL,
     ];
 
     async fn root_file_names(root: &Path) -> std::io::Result<std::collections::BTreeSet<String>> {
@@ -1110,6 +1120,21 @@ impl EjectSnapshot {
         let root_files = Self::root_file_names(root).await?;
         let mut planned: std::collections::BTreeSet<String> = touched.iter().cloned().collect();
         planned.extend(Self::EXTRA.iter().map(|s| s.to_string()));
+        // A Gradle pin's restore also rewrites (or deletes) files below
+        // the root: every build's settings file and every build's lock
+        // files. The same files are where the vendored wiring goes.
+        if tokio::fs::symlink_metadata(
+            root.join(socket_patch_core::patch::redirect::gradle::HOSTED_INDEX_REL),
+        )
+        .await
+        .is_ok()
+        {
+            let build =
+                socket_patch_core::patch::redirect::gradle::read_build_from_disk(root).await;
+            planned.extend(socket_patch_core::patch::redirect::gradle::wiring_files(
+                &build.files,
+            ));
+        }
         let mut files = std::collections::BTreeMap::new();
         for rel in root_files.iter().chain(planned.iter()) {
             if files.contains_key(rel) {
@@ -1126,9 +1151,11 @@ impl EjectSnapshot {
         })
     }
 
-    /// A file's bytes, `None` when it does not exist.
+    /// A file's bytes, `None` when it does not exist. Read through the
+    /// FIFO-safe opener: a FIFO or device at a snapshotted workspace path
+    /// fails the snapshot (and the eject refuses) instead of wedging open(2).
     async fn read(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-        match tokio::fs::read(path).await {
+        match socket_patch_core::utils::fs::read_regular_to_bytes(path).await {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -1173,6 +1200,12 @@ impl EjectSnapshot {
         }
         match want {
             Some(bytes) => {
+                // The upstream restore may have removed the file's
+                // directory with it (the hosted Gradle files under
+                // `.socket/gradle/`).
+                if let Some(parent) = path.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
                 socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(&path, bytes).await
             }
             None => match tokio::fs::remove_file(&path).await {
@@ -6056,6 +6089,24 @@ mod eject_snapshot_tests {
     /// snapshot holds them; deleted when the commit created them) — and
     /// leaves every other root file as it is now, even one whose bytes
     /// changed during the run (another process's log).
+    /// A FIFO at a snapshotted path fails the snapshot promptly (the eject
+    /// then refuses) instead of blocking in open(2).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_refuses_a_fifo_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let c = std::ffi::CString::new(root.join("package-lock.json").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            EjectSnapshot::take(root, &["package-lock.json".to_string()]),
+        )
+        .await
+        .expect("the snapshot must not block on a FIFO");
+        assert!(result.is_err());
+    }
+
     #[tokio::test]
     async fn restore_undoes_only_what_the_eject_wrote() {
         let tmp = tempfile::tempdir().unwrap();
