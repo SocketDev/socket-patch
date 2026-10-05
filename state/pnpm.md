@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-04 (run 18), main `045d7ec`, latest release 4.0.0.
+Last updated: 2026-10-05 (run 19), main `045d7ec`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, package grant, hosted tarball, `/registry/<name>/<ver>` mirror). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -175,6 +175,19 @@ Run 18 additions (main `045d7ec`, Linux):
 | 12.8.1 | untested | pass / pass; re-install in deploy dir fails loudly (deploy drops `trustLockfile`) | pass (patched; `vex` in the deploy dir declines) | refuses / fail #627 (all three files) | pass / pass | untested | untested | pass / kept / kept / kept |
 | 12.8.1 + `modulesDir` + `virtualStoreDir` | — | — | — | — | fail #661 (0 of 2 applied, `vex` honestly empty) | — | — | — |
 
+Run 19 additions (main `045d7ec`, Linux):
+
+| pnpm (lock) | `list` hosted (text / `--json`) | `list` vendored / agent | `list` from member cwd | `remove <uuid>` hosted / vendored | Hosted re-scan after `pnpm install` (idempotent) | Hosted transitive pin + `blockExoticSubdeps: true` | `scan --dry-run` hosted / vendored writes nothing | Takeover agent → hosted / agent → vendored | Concurrent hosted scans |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 7.33.7 (5.4) | pass | untested | untested | untested | untested | n/a | untested | untested | untested |
+| 8.15.9 (6.0) | pass (also `npm:` alias) | pass / untested | untested | pass / pass | untested | n/a | pass / pass | untested | untested |
+| 9.15.9 | pass | pass / pass | fail #590 | untested | pass | n/a | untested | pass / pass | untested |
+| 10.34.5 | pass | untested | untested | untested | pass | pass | untested | untested | untested |
+| 11.28.3 | pass (two-doc lock too) | untested | untested | untested | untested | pass | untested | untested | untested |
+| 12.8.1 | pass (two-doc, alias, conflict markers, `--offline`) | pass / pass | fail #590 | pass / pass | pass | pass | pass / pass | pass / pass | pass (`lock_held`, 3/3) |
+
+Run 19 also: hosted `pnpm deploy` on 11.28.3 pass; vendored workspace + `pnpm deploy` on 9.15.9 pass; agent `vex` on a lockfile-only checkout declines (9 / 12).
+
 Default isolated linker + alias: pass on 7.33.7 / 9.15.9 / 10.34.5 / 11.28.3 / 12.8.1 (one shared `.pnpm` copy).
 
 #492 also reproduces on pnpm 7.33.7 (there's no root lock at all, only `redirect_pnpm_no_lockfile`).
@@ -197,16 +210,17 @@ Global mode (`-g`, v5 main `2463257`):
 ## Backlog
 
 0. **Maintainer request (global `-g` mode):** the Linux cells are done. Still to do: macOS and Windows (corepack, standalone and npm-installed pnpm; `PNPM_HOME` with spaces or unicode; Windows `%LOCALAPPDATA%\pnpm`), and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry. Needs a probe branch.
-1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3, 10 and 16, and was denied by the permission policy in runs 2, 5–9, 11–14, 16 and 17, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
+1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3, 10 and 16, and was denied by the permission policy in runs 2, 5–9, 11–14, 16, 17 and 19, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
 2. #754 follow-ups: a Windows `C:/…/My Project #2` checkout, and the moved-checkout heal path once the specifier is quoted. Needs a probe.
 2a. #778 follow-ups: pnpm 7 workspace layout, and `-g` absolute scopes vs `rollback -g` (`--sync`/`--prune` with a scope done in run 18: fails safe).
 3. #696 / #661 follow-ups: `modulesDir` in the global `config.yaml` / `rc` (`modulesDir` + `virtualStoreDir` together done in run 18: #661). When fixed, check that GVS and out-of-project `virtualStoreDir` transitive deps also stop attesting.
+3a. `list -g` on pnpm 11 / 12, and `list` under Rush and `sharedWorkspaceLockfile: false`.
 4. Workspace-sensitive pnpm commands under the #734 scaffold on 9.x (`pnpm link`, `publish`, `-r`).
 5. #756 variants: in global mode, and on 9.15.9 / 10.34.5 (hoisted is n/a: one shared copy).
 6. #362 GVS transitive and #435 global `-g`: re-check exit codes under #555's skip semantics on 11.28.3 / 12.8.1.
 7. `package-import-method=clone` on reflink (needs CI).
 8. #556 follow-ups: merging branch lockfiles after a hosted pin, and agent `vex` on the branch.
-9. Re-verify #360, #362, #435, #466, #492, #556, #557, #590 (PR #598), #601 (PR #605), #626 (PR #634), #627 (pnpm vendored symlinks), #633, #636 (PR #672; include the takeover path from the run 16 comment), #661 / #696 (PR #698), #713, #714, #734, #754, #756 and #778 when fixes land.
+9. Re-verify #360, #362, #435, #466, #492, #556, #557, #590 (PR #598; include member-cwd `list`), #601 (PR #605), #626 (PR #634), #627 (pnpm vendored symlinks, PR #802), #662 (PR #810), #633, #636 (PR #672; include the takeover path from the run 16 comment), #661 / #696 (PR #698), #713, #714, #734, #754, #756 and #778 when fixes land.
 10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout; hosted CRLF passes on Linux).
 
 ## Known non-bugs
@@ -262,3 +276,5 @@ Global mode (`-g`, v5 main `2463257`):
 - `pnpm install --resolution-only` on pnpm 9 / 10 re-resolves and drops hosted pins, like `pnpm update` (pnpm 12 keeps them). `prune`, `install --prod` and a plain `install` keep the pin on 9 / 10 / 12.
 - Agent `scan --sync <scope>` / `--prune <scope>` where the scope matches nothing (#778) skips the prune with a warning and keeps the manifest. It fails safe.
 - Hosted `vex` recognises a hosted pin only when the tarball URL is on the patch-server origin AND carries the patch uuid as a path segment. Mock fixtures need `/…/<uuid>/<file>.tgz` URLs.
+- Agent → hosted takeover keeps the agent-mode manifest beside the new hosted pin (`list` shows each patch twice). The layers coexist, and `rollback` unwinds both. Agent → vendored migrates the manifest record out, as documented.
+- Vendored `list` keeps listing a package after `pnpm remove <pkg>`, because pnpm keeps the override and the wiring is still live. `vex` omits it.
