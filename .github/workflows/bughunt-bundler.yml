@@ -1,0 +1,123 @@
+name: bughunt bundler probe
+on:
+  push:
+    branches: ['bughunt/bundler/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            ruby: '3.4'
+          - os: macos-14
+            ruby: system
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - if: matrix.ruby != 'system'
+        uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler: '4.0.22'
+      - name: Install Rust
+        run: rustup show
+      - name: Build
+        run: cargo build -p socket-patch-cli
+      - name: Write mock
+        run: |
+          mkdir -p "$RUNNER_TEMP/w"
+          cat > "$RUNNER_TEMP/w/mock.py" <<'PY'
+          import hashlib, json, sys, base64
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          W=sys.argv[2]; PORT=int(sys.argv[1])
+          UUID="7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d"; PURL="pkg:gem/colorize@0.8.1"
+          def gitsha(b): return hashlib.sha256(b"blob %d\0"%len(b)+b).hexdigest()
+          orig=open(W+"/orig_colorize.rb","rb").read(); pat=orig+b"SOCKET_PATCHED_COLORIZE = true\n"
+          class H(BaseHTTPRequestHandler):
+              def log_message(self,*a): sys.stderr.write("%s %s\n"%(self.command,self.path))
+              def send(self,body):
+                  body=body.encode()
+                  self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
+              def do_POST(self):
+                  n=int(self.headers.get("Content-Length",0)); self.rfile.read(n)
+                  if self.path.split("?")[0].endswith("/patches/batch"):
+                      return self.send(json.dumps({"packages":[{"purl":PURL,"patches":[{"uuid":UUID,"purl":PURL,"tier":"free","cveIds":[],"ghsaIds":[],"severity":"high","title":"t"}]}],"canAccessPaidPatches":False}))
+                  self.send_response(404); self.end_headers()
+              def do_GET(self):
+                  p=self.path.split("?")[0]
+                  if "/patches/by-package/" in p:
+                      return self.send(json.dumps({"patches":[{"uuid":UUID,"purl":PURL,"publishedAt":"2026-01-01T00:00:00Z","description":"x","license":"MIT","tier":"free","vulnerabilities":{}}],"canAccessPaidPatches":False}))
+                  if p.endswith("/patches/view/"+UUID):
+                      return self.send(json.dumps({"uuid":UUID,"purl":PURL,"publishedAt":"2026-01-01T00:00:00Z","files":{"lib/colorize.rb":{"beforeHash":gitsha(orig),"afterHash":gitsha(pat),"blobContent":base64.b64encode(pat).decode(),"beforeBlobContent":base64.b64encode(orig).decode()}},"vulnerabilities":{"GHSA-xxxx-yyyy-zzzz":{"cves":["CVE-2026-1"],"summary":"s","severity":"high","description":"d"}},"description":"x","license":"MIT","tier":"free"}))
+                  self.send_response(404); self.end_headers()
+          ThreadingHTTPServer(("127.0.0.1",PORT),H).serve_forever()
+          PY
+          cd "$RUNNER_TEMP/w"
+          gem fetch colorize -v 0.8.1
+          gem unpack colorize-0.8.1.gem && cp colorize-0.8.1/lib/colorize.rb orig_colorize.rb
+          ls -la
+      - name: Probe cells
+        run: |
+          set +e
+          W="$RUNNER_TEMP/w"
+          BIN="$GITHUB_WORKSPACE/target/debug/socket-patch"; [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          PYEXE=python3; command -v python3 >/dev/null || PYEXE=python
+          $PYEXE "$W/mock.py" 18777 "$W" > "$W/mock.log" 2>&1 &
+          for i in $(seq 1 30); do curl -s -o /dev/null http://127.0.0.1:18777/v0/orgs/org/patches/view/7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d && break; sleep 1; done
+          A="--api-url http://127.0.0.1:18777 --org org --api-token fake"
+          probe() { "$1" -e 'require "colorize"; puts "loaded=#{$LOADED_FEATURES.grep(/colorize\.rb/).first} patched=#{defined?(SOCKET_PATCHED_COLORIZE) ? 1 : 0}"' 2>&1 | tail -1; }
+          vexst() { $PYEXE -c "import json;d=json.load(open('$1'));print([s['status'] for s in d['statements']])" 2>&1 | tail -1; }
+          if [ "$RUNNER_OS" = Windows ]; then
+            RB=$(command -v ruby); ruby -v; bundle -v
+            # Cell W1: non-writable global gem dir (deny-write ACE on the gem's dir)
+            gem install colorize -v 0.8.1 --no-document
+            GD=$(ruby -e 'print Gem::Specification.find_by_name("colorize").gem_dir')
+            WGD=$(cygpath -w "$GD"); echo "gem dir: $GD ($WGD)"
+            icacls "$WGD" /deny "${USERNAME}:(OI)(CI)(W,D,DC)" /T >/dev/null; icacls "$WGD\\lib\\colorize.rb"
+            echo hi >> "$GD/lib/colorize.rb" && echo "WARNING: still writable" || echo "confirmed not writable"
+            D="$W/cwd-ro"; mkdir -p "$D"; cd "$D"
+            "$BIN" scan -g --mode agent --json $A > scan.json 2>scan.err; echo "scan exit $?"; grep -E '"(scannedPackages|packagesWithPatches)"' scan.json
+            "$BIN" get -g pkg:gem/colorize@0.8.1 --yes --json $A > get.json 2>get.err; echo "get exit $?"; cat get.json | head -60; cat get.err | tail -5
+            echo "after get: $(probe "$RB")"
+            "$BIN" vex -g --product pkg:gem/app@1 --output v.json > vex.out 2>&1; echo "vex exit $?"; vexst v.json; tail -3 vex.out
+            ls -la "$GD/lib"; ls -la .socket 2>&1 | head
+            echo "CELL W1 non-writable: get=$(grep -o '"status": "[a-z_]*"' get.json | head -1) $(probe "$RB")"
+            icacls "$WGD" /remove:d "${USERNAME}" /T >/dev/null
+            "$BIN" rollback -g --yes --json $A > rb.json 2>&1; grep -E '"(rolledBack|failed)"' rb.json | head -2
+            gem uninstall colorize -x -a >/dev/null 2>&1
+            cd "$W"
+            # Cell W2: Bundler 4.0.22 project, vendor/bundle, agent cycle
+            P="$W/proj w"; mkdir -p "$P"; cd "$P"; printf 'source "https://rubygems.org"\ngem "colorize", "0.8.1"\n' > Gemfile
+            bundle config set --local path vendor/bundle; bundle install --quiet; echo "install exit $?"
+            "$BIN" scan --mode agent --json --yes $A > scan.json 2>scan.err; echo "scan exit $?"; grep -E '"(scannedPackages|packagesWithPatches|applied)"' scan.json | head -4
+            BP=$(bundle exec ruby -e 'require "colorize"; puts "patched=#{defined?(SOCKET_PATCHED_COLORIZE) ? 1 : 0} #{$LOADED_FEATURES.grep(/colorize\.rb/).first}"' 2>&1 | tail -1)
+            "$BIN" vex --product pkg:gem/app@1 --output v.json > vex.out 2>&1; echo "vex exit $?"
+            echo "CELL W2 bundler4.0.22 agent: $BP vex=$(vexst v.json)"
+            "$BIN" rollback --yes --json $A > rb.json 2>&1; grep -E '"(rolledBack|failed)"' rb.json | head -2
+            echo "CELL W2 after rollback: $(bundle exec ruby -e 'require "colorize"; puts "patched=#{defined?(SOCKET_PATCHED_COLORIZE) ? 1 : 0}"' 2>&1 | tail -1)"
+          else
+            # Cell M1: macOS system ruby, -g inside a Bundler project (--user-install global copy)
+            export PATH="/usr/bin:$PATH"; RB=/usr/bin/ruby; ruby -v; bundle -v
+            gem install --user-install colorize -v 0.8.1 --no-document
+            export GEM_PATH="$(ruby -e 'print Gem.user_dir'):$(ruby -e 'print Gem.default_dir')"
+            P="$W/proj"; mkdir -p "$P"; cd "$P"; printf 'source "https://rubygems.org"\ngem "colorize", "0.8.1"\n' > Gemfile
+            bundle install --path vendor/bundle --quiet 2>&1 | tail -2 || bundle config set --local path vendor/bundle
+            ls vendor/bundle/ruby/*/gems
+            "$BIN" scan -g --mode agent --json $A > scan.json 2>&1; grep -E '"(scannedPackages|packagesWithPatches)"' scan.json
+            "$BIN" get -g pkg:gem/colorize@0.8.1 --yes --json $A > get.json 2>&1; grep -E '"(applied|status)"' get.json | head -3
+            echo "CELL M1 in-project global: $(probe "$RB")"
+            echo "CELL M1 in-project bundle: $(bundle exec ruby -e 'require "colorize"; puts "loaded=#{$LOADED_FEATURES.grep(/colorize\.rb/).first} patched=#{defined?(SOCKET_PATCHED_COLORIZE) ? 1 : 0}"' 2>&1 | tail -1)"
+            "$BIN" vex -g --product pkg:gem/app@1 --output v.json > vex.out 2>&1; echo "CELL M1 vex -g exit $? $(vexst v.json)"
+            git -C "$GITHUB_WORKSPACE" status --short | head
+            ls -a "$P" "$P/.socket" 2>&1 | head -20
+            "$BIN" rollback -g --yes --json $A > rb.json 2>&1; grep -E '"rolledBack"' rb.json
+            echo "CELL M1 after rollback: $(probe "$RB")"
+          fi
+          echo "=== mock log"; tail -20 "$W/mock.log"
