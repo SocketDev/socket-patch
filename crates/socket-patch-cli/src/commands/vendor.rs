@@ -2212,14 +2212,16 @@ pub(crate) async fn vendor_records_reusing(
             .find(|pin| canonical_purl(&pin.purl) == canonical_purl(purl))
     };
 
-    // Yarn berry takeover preflight (see
-    // `socket_patch_core::vendor::yarn_berry_vendor_preflight`): the berry
-    // backend's project-level refusals (mixed line endings in yarn.lock or
-    // package.json, cacheKey, `.yarnrc.yml` compressionLevel), computed at
+    // Yarn berry / npm package-lock takeover preflight (see
+    // `socket_patch_core::vendor::yarn_berry_vendor_preflight` and
+    // `npm_lock_vendor_preflight`): the backend's project-level refusals
+    // (berry: mixed line endings in yarn.lock or package.json, cacheKey,
+    // `.yarnrc.yml` compressionLevel; package-lock: a lock that is not
+    // v2/v3, #659), computed at
     // most once per run and only when a hosted-claimed npm purl reaches the
     // takeover below, which must refuse such a purl BEFORE reverting its
     // hosted edits.
-    let berry_takeover_refusal: tokio::sync::OnceCell<Option<(&'static str, String)>> =
+    let npm_takeover_refusal: tokio::sync::OnceCell<Option<(&'static str, String)>> =
         tokio::sync::OnceCell::new();
     let pipenv_version = tokio::sync::OnceCell::new();
     // The vlt store entries each hosted→vendored takeover unpinned, healed
@@ -2415,9 +2417,21 @@ pub(crate) async fn vendor_records_reusing(
                     }
                 }
                 if candidate.starts_with("pkg:npm/") {
-                    let project = berry_takeover_refusal
-                        .get_or_init(|| {
-                            socket_patch_core::vendor::yarn_berry_vendor_preflight(&common.cwd)
+                    let project = npm_takeover_refusal
+                        .get_or_init(|| async {
+                            match socket_patch_core::vendor::yarn_berry_vendor_preflight(
+                                &common.cwd,
+                            )
+                            .await
+                            {
+                                Some(refusal) => Some(refusal),
+                                None => {
+                                    socket_patch_core::vendor::npm_lock_vendor_preflight(
+                                        &common.cwd,
+                                    )
+                                    .await
+                                }
+                            }
                         })
                         .await
                         .clone();

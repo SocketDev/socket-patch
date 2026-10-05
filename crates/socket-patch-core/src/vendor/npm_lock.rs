@@ -417,6 +417,41 @@ pub async fn vendor_npm<'a>(
     done(result, Some(entry), warnings)
 }
 
+/// The project-level refusal [`vendor_npm`]'s step 2 raises whatever the
+/// purl: the primary lock (`npm-shrinkwrap.json`, else `package-lock.json`)
+/// is not parseable JSON or not a v2/v3 lock. `None` unless the project's
+/// npm flavor is package-lock (the probe `vendor_npm_any` routes on) and
+/// that lock fails the gate; a missing or unreadable lock is left to the
+/// backend's own refusal.
+///
+/// For the hosted→vendored mode takeover (`vendor`, `scan`/`get --mode
+/// vendored` over a hosted pin): the takeover restores the pin's upstream
+/// registry entry BEFORE this backend runs, and the restore keeps a v1 lock
+/// v1 — so without this preflight the refusal would land after the hosted
+/// pin was gone, leaving the package unpatched in both modes (#659).
+/// Returns `(code, detail)`, exactly the refusal the backend would raise.
+pub async fn npm_lock_vendor_preflight(project_root: &Path) -> Option<(&'static str, String)> {
+    use super::npm_flavor::{detect_npm_lock_flavor, NpmLockFlavor};
+    if !matches!(
+        detect_npm_lock_flavor(project_root).await,
+        Ok((NpmLockFlavor::PackageLock, _))
+    ) {
+        return None;
+    }
+    let (lock_name, lock_bytes, _) = select_lockfile(project_root).await.ok()??;
+    let gate = match LOCK_MEMO.parse(&lock_bytes, || parse_json_manifest(&lock_bytes)) {
+        Ok(lock) => lock_version_gate(&lock, &lock_name).err(),
+        Err(e) => Some(Box::new(refused(
+            "vendor_lockfile_version_unsupported",
+            format!("{lock_name} is not parseable JSON: {e}"),
+        ))),
+    };
+    match *gate? {
+        VendorOutcome::Refused { code, detail } => Some((code, detail)),
+        _ => None,
+    }
+}
+
 /// The lock version gate of [`vendor_npm`]'s step 2: only v2/v3 locks with
 /// a `packages` object are rewritten. `Ok` is the parsed `lockfileVersion`.
 fn lock_version_gate(lock: &Value, lock_name: &str) -> Result<Option<u64>, Box<VendorOutcome>> {
@@ -2380,6 +2415,44 @@ mod tests {
             fx.vendor(false).await,
             "vendor_lockfile_version_unsupported",
         );
+    }
+
+    /// The takeover preflight raises exactly the backend's own version
+    /// refusal on a v1 lock (#659), before any write.
+    #[tokio::test]
+    async fn preflight_matches_the_backend_v1_refusal() {
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 1,
+            "dependencies": {
+                "left-pad": { "version": "1.3.0", "resolved": REG_RESOLVED, "integrity": "sha512-orig==" }
+            }
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock).await;
+        let (code, detail) = npm_lock_vendor_preflight(fx.root())
+            .await
+            .expect("a v1 lock is refused");
+        assert_eq!(code, "vendor_lockfile_version_unsupported");
+        assert_eq!(
+            detail,
+            expect_refused(
+                fx.vendor(false).await,
+                "vendor_lockfile_version_unsupported"
+            )
+        );
+    }
+
+    /// A supported lock, and a project of another npm flavor, pass the
+    /// preflight.
+    #[tokio::test]
+    async fn preflight_passes_v3_and_other_flavors() {
+        let fx = fixture().await;
+        assert_eq!(npm_lock_vendor_preflight(fx.root()).await, None);
+        let yarn = tempfile::tempdir().unwrap();
+        std::fs::write(yarn.path().join("package.json"), b"{}").unwrap();
+        std::fs::write(yarn.path().join("yarn.lock"), b"# yarn lockfile v1\n").unwrap();
+        assert_eq!(npm_lock_vendor_preflight(yarn.path()).await, None);
     }
 
     /// A merge-conflicted / truncated package-lock.json must refuse before
