@@ -682,6 +682,37 @@ pub async fn requirements_include_names(root: &Path) -> std::io::Result<Vec<Stri
     Ok(names)
 }
 
+/// The prune/discovery in-use probe for a `requirements`-flavored entry:
+/// does pip still install the wheel under `.socket/vendor/pypi/<uuid>/`?
+/// The requirements tree IS this flavor's lock, so the answer is whether
+/// any requirement line (its code, not its comment) reached from the root
+/// `requirements.txt` through in-root `-r` includes still names the uuid
+/// dir. `Some(false)` when the tree was read and none does — the user
+/// removed the pin, or bumped it to another release; `None` when no file
+/// of the tree could be read, or a reached include exists but cannot be
+/// read (cannot prove the absence of a reference: callers keep the entry).
+pub(super) async fn requirements_entry_in_use(root: &Path, uuid: &str) -> Option<bool> {
+    let needle = format!(".socket/vendor/pypi/{uuid}/");
+    let names = requirements_include_names(root).await.ok()?;
+    let mut any_readable = false;
+    for name in &names {
+        match read_regular_to_string(&root.join(name)).await {
+            Ok(content) => {
+                any_readable = true;
+                if logical_lines(&content)
+                    .iter()
+                    .any(|ll| split_comment(&ll.text).0.contains(&needle))
+                {
+                    return Some(true);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    any_readable.then_some(false)
+}
+
 /// A root-relative requirements path that stays inside the project root
 /// (not `../…`, not absolute) — the only files the planner may edit.
 pub(crate) fn is_in_root_rel(rel: &str) -> bool {
@@ -2243,6 +2274,114 @@ mod tests {
             read_root(tmp.path()).await,
             wired,
             "the link target is untouched"
+        );
+    }
+
+    // ── in-use probe (#786) ───────────────────────────────────────────────
+
+    const PROBE_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
+    fn probe_vendor_line(transitive: bool) -> String {
+        vendor_line(
+            &format!(".socket/vendor/pypi/{PROBE_UUID}/six-1.16.0-py2.py3-none-any.whl"),
+            None,
+            "six",
+            "1.16.0",
+            &None,
+            transitive,
+        )
+    }
+
+    /// The wired shapes: the rewritten pin in the root file, the appended
+    /// `(transitive)` line, and a pin rewritten inside an `-r` include all
+    /// keep the entry in use.
+    #[tokio::test]
+    async fn in_use_probe_sees_wired_vendor_lines() {
+        for (root_txt, include) in [
+            (format!("{}\nidna==3.7\n", probe_vendor_line(false)), None),
+            (format!("idna==3.7\n{}\n", probe_vendor_line(true)), None),
+            (
+                "-r requirements/base.txt\nidna==3.7\n".to_string(),
+                Some(format!("{}\n", probe_vendor_line(false))),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            tokio::fs::write(root.join("requirements.txt"), &root_txt)
+                .await
+                .unwrap();
+            if let Some(include) = &include {
+                tokio::fs::create_dir(root.join("requirements"))
+                    .await
+                    .unwrap();
+                tokio::fs::write(root.join("requirements/base.txt"), include)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                requirements_entry_in_use(root, PROBE_UUID).await,
+                Some(true),
+                "root={root_txt:?} include={include:?}"
+            );
+        }
+    }
+
+    /// #786: the user removed the vendored pin (case A), bumped it to
+    /// another release (case B), or commented it out (pip ignores the
+    /// line). The requirements tree was read and nothing pip installs
+    /// names the uuid dir any more, so the entry is unused.
+    #[tokio::test]
+    async fn in_use_probe_reports_removed_or_bumped_pins_unused() {
+        for root_txt in [
+            "idna==3.7\n".to_string(),
+            "six==1.17.0\nidna==3.7\n".to_string(),
+            format!("# {}\nidna==3.7\n", probe_vendor_line(false)),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            tokio::fs::write(tmp.path().join("requirements.txt"), &root_txt)
+                .await
+                .unwrap();
+            assert_eq!(
+                requirements_entry_in_use(tmp.path(), PROBE_UUID).await,
+                Some(false),
+                "{root_txt:?}"
+            );
+        }
+        // A line for ANOTHER uuid (a superseding patch) does not keep this
+        // one in use either.
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join("requirements.txt"),
+            probe_vendor_line(false).replace(PROBE_UUID, "1a2b3c4d-5e6f-4a1b-8c2d-9e0f1a2b3c4d"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            requirements_entry_in_use(tmp.path(), PROBE_UUID).await,
+            Some(false)
+        );
+    }
+
+    /// Nothing proves the entry unused when the tree cannot be read: no
+    /// `requirements.txt` at all, or a reached include that exists but is
+    /// unreadable (a FIFO). Callers keep the entry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_use_probe_is_undeterminable_without_a_readable_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            requirements_entry_in_use(tmp.path(), PROBE_UUID).await,
+            None
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("requirements.txt"), "-r base.txt\n")
+            .await
+            .unwrap();
+        mkfifo(&tmp.path().join("base.txt"));
+        assert_eq!(
+            requirements_entry_in_use(tmp.path(), PROBE_UUID).await,
+            None
         );
     }
 }

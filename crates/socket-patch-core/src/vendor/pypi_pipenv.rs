@@ -723,6 +723,93 @@ fn find_entries<'a>(lock: &'a Value, canon_name: &str) -> Vec<(&'a str, String, 
     out
 }
 
+/// The `pipenv sync` arguments that install every lock section in
+/// `sections`. Plain `pipenv sync` installs only `default`; `--dev` adds
+/// `develop` (every release); a Pipenv 2022+ named category needs
+/// `--categories`, which takes Pipfile names (`packages`, `dev-packages`,
+/// `<name>`) and installs exactly the categories listed.
+fn sync_args(sections: &[&str]) -> String {
+    if sections.iter().all(|s| *s == "default") {
+        String::new()
+    } else if sections.iter().all(|s| *s == "default" || *s == "develop") {
+        " --dev".to_string()
+    } else {
+        let names: Vec<&str> = sections
+            .iter()
+            .map(|s| match *s {
+                "default" => "packages",
+                "develop" => "dev-packages",
+                other => other,
+            })
+            .collect();
+        format!(" --categories \"{}\"", names.join(" "))
+    }
+}
+
+/// `default`, then `develop`, then named categories in lock order — so the
+/// rendered `--categories` list is stable.
+fn ordered_sections(mut sections: Vec<&str>) -> Vec<&str> {
+    let rank = |s: &str| match s {
+        "default" => 0,
+        "develop" => 1,
+        _ => 2,
+    };
+    sections.sort_by_key(|s| rank(s));
+    let mut seen = std::collections::HashSet::new();
+    sections.retain(|s| seen.insert(*s));
+    sections
+}
+
+/// The verified way to reinstall `name` from `lock` over a warm virtualenv
+/// that still holds the upstream release, shared by the hosted
+/// (`redirect_pypi_stale_install`) and vendored (`pypi_pipenv_stale_install`)
+/// warnings. The `sync` arguments follow the lock: the uninstall-and-sync
+/// remedy re-syncs every category that pins the package (plain `pipenv sync`
+/// would uninstall a `[dev-packages]` or named-category package and leave
+/// it uninstalled), and the clean-virtualenv remedy re-syncs every non-empty
+/// category, so `--rm` drops nothing the project had installed. With no
+/// readable lock, falls back to the `default`-only commands.
+pub fn stale_install_remedy(lock: Option<&Value>, name: &str) -> String {
+    let canon = canonicalize_pypi_name(name);
+    let (package, all): (Vec<&str>, Vec<&str>) = match lock {
+        Some(lock) => (
+            ordered_sections(
+                find_entries(lock, &canon)
+                    .into_iter()
+                    .map(|(section, _, _)| section)
+                    .collect(),
+            ),
+            ordered_sections(
+                lock.as_object()
+                    .into_iter()
+                    .flat_map(|map| map.iter())
+                    .filter(|(section, value)| {
+                        section.as_str() != "_meta"
+                            && value.as_object().is_some_and(|m| !m.is_empty())
+                    })
+                    .map(|(section, _)| section.as_str())
+                    .collect(),
+            ),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+    let reinstall = sync_args(&package);
+    let clean = sync_args(&all);
+    // Named categories arrived in Pipenv 2022, so the pre-2018 spelling only
+    // ever needs `--dev`.
+    let legacy = if package.contains(&"develop") {
+        " --dev"
+    } else {
+        ""
+    };
+    format!(
+        "Reinstall it from the lock without touching the Pipfile: `pipenv run pip uninstall \
+         -y {name} && pipenv sync{reinstall}` (`pipenv install --deploy{legacy}` before \
+         Pipenv 2018), or `pipenv --rm && pipenv sync{clean}` for a clean virtualenv — NOT \
+         `pipenv uninstall`, which rewrites the Pipfile and re-locks the patch away"
+    )
+}
+
 /// Pipenv preserves a lock's CRLF line endings; so do we, on both writes.
 fn with_line_ending(text: String, crlf: bool) -> String {
     if crlf {
@@ -2001,5 +2088,91 @@ mod tests {
             relocked,
             "the live lock is left alone"
         );
+    }
+
+    /// #790: the stale-install remedy re-syncs the category that pins the
+    /// package — plain `pipenv sync` installs only `default`, so for a
+    /// `[dev-packages]` or named-category entry it uninstalled the package
+    /// and left it uninstalled — and `--rm` re-syncs every category.
+    #[test]
+    fn stale_install_remedy_follows_the_lock_categories() {
+        let lock = |body: &str| -> Value {
+            serde_json::from_str(&format!(r#"{{"_meta": {{"pipfile-spec": 6}}, {body}}}"#)).unwrap()
+        };
+        let six = r#"{"version": "==1.16.0"}"#;
+
+        // default only: unchanged commands.
+        let only_default = lock(&format!(r#""default": {{"six": {six}}}, "develop": {{}}"#));
+        let remedy = stale_install_remedy(Some(&only_default), "six");
+        assert!(
+            remedy.contains("`pipenv run pip uninstall -y six && pipenv sync`"),
+            "{remedy}"
+        );
+        assert!(
+            remedy.contains("(`pipenv install --deploy` before Pipenv 2018)"),
+            "{remedy}"
+        );
+        assert!(
+            remedy.contains("`pipenv --rm && pipenv sync` for a clean"),
+            "{remedy}"
+        );
+
+        // develop ([dev-packages]): `--dev` on every spelling.
+        let develop = lock(&format!(
+            r#""default": {{"requests": {six}}}, "develop": {{"six": {six}}}"#
+        ));
+        let remedy = stale_install_remedy(Some(&develop), "Six");
+        assert!(
+            remedy.contains("`pipenv run pip uninstall -y Six && pipenv sync --dev`"),
+            "{remedy}"
+        );
+        assert!(
+            remedy.contains("(`pipenv install --deploy --dev` before Pipenv 2018)"),
+            "{remedy}"
+        );
+        assert!(
+            remedy.contains("`pipenv --rm && pipenv sync --dev` for a clean"),
+            "{remedy}"
+        );
+
+        // A default package in a project that also has dev-packages: the
+        // targeted re-sync stays default-only, `--rm` must restore develop.
+        let remedy = stale_install_remedy(Some(&develop), "requests");
+        assert!(remedy.contains("-y requests && pipenv sync` ("), "{remedy}");
+        assert!(
+            remedy.contains("`pipenv --rm && pipenv sync --dev` for a clean"),
+            "{remedy}"
+        );
+
+        // A Pipenv 2022+ named category: `--categories` with Pipfile names.
+        let named = lock(&format!(
+            r#""default": {{"requests": {six}}}, "develop": {{"pytest": {six}}}, "docs": {{"six": {six}}}"#
+        ));
+        let remedy = stale_install_remedy(Some(&named), "six");
+        assert!(
+            remedy.contains("-y six && pipenv sync --categories \"docs\"`"),
+            "{remedy}"
+        );
+        assert!(
+            remedy.contains(
+                "`pipenv --rm && pipenv sync --categories \"packages dev-packages docs\"` for a clean"
+            ),
+            "{remedy}"
+        );
+
+        // Pinned in several categories: every one of them is re-synced.
+        let both = lock(&format!(
+            r#""default": {{"six": {six}}}, "docs": {{"six": {six}}}"#
+        ));
+        let remedy = stale_install_remedy(Some(&both), "six");
+        assert!(
+            remedy.contains("pipenv sync --categories \"packages docs\"`"),
+            "{remedy}"
+        );
+
+        // No readable lock: the default-only spelling.
+        let remedy = stale_install_remedy(None, "six");
+        assert!(remedy.contains("-y six && pipenv sync` ("), "{remedy}");
+        assert!(remedy.contains("NOT `pipenv uninstall`"), "{remedy}");
     }
 }

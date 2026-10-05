@@ -129,6 +129,7 @@ pub use verify::{
 };
 // The hosted→vendored takeover refuses a berry project the backend would
 // refuse BEFORE it reverts the hosted redirect.
+pub use npm_lock::npm_lock_vendor_preflight;
 pub use yarn_berry_lock::{yarn_berry_vendor_preflight, yarn_berry_vendor_target_preflight};
 
 use std::collections::{HashMap, HashSet};
@@ -657,6 +658,10 @@ impl RevertOpts {
     }
 }
 
+/// Warning code for a recorded lock entry that no longer exists at revert
+/// time (the dependency was removed). See [`RevertOutcome::lock_entry_removed`].
+pub const LOCK_ENTRY_REMOVED_CODE: &str = "vendor_lock_entry_removed";
+
 /// The result of one backend `revert_*` call.
 #[derive(Debug)]
 pub struct RevertOutcome {
@@ -695,9 +700,14 @@ impl RevertOutcome {
     }
 
     /// True when any wiring record was left alone during the restore —
-    /// every left-alone branch (ownership-gate drift, vanished block,
-    /// missing pre-vendor original, unknown kind/key, allowlist skip)
-    /// warns with the stable code `vendor_lock_entry_drifted`.
+    /// every left-alone branch (ownership-gate drift, missing pre-vendor
+    /// original, unknown kind/key, allowlist skip) warns with the stable
+    /// code `vendor_lock_entry_drifted`.
+    ///
+    /// A recorded lock entry that has VANISHED (the user removed the
+    /// dependency) is not drift: it warns `vendor_lock_entry_removed`
+    /// instead (see [`Self::lock_entry_removed`]), and the backend keeps
+    /// the artifact only while the lock still resolves through it.
     ///
     /// LIVENESS CONTRACT: backends must NOT emit that code for a record
     /// whose live state already equals its reverted state (the fragment
@@ -714,6 +724,19 @@ impl RevertOutcome {
             .any(|w| w.code == "vendor_lock_entry_drifted")
     }
 
+    /// True when any recorded lock entry no longer existed at revert time
+    /// (`vendor_lock_entry_removed`): the user removed the dependency
+    /// (`yarn remove`, `npm uninstall`, ...), so there was nothing to
+    /// restore. Unlike drift, nothing of the user's is being protected, so
+    /// this alone must not keep the artifact forever (#665). The backend
+    /// keeps it only while a lockfile still mentions the uuid dir, see
+    /// `npm_flavor::keep_artifact_while_lock_references_it`.
+    pub fn lock_entry_removed(&self) -> bool {
+        self.warnings
+            .iter()
+            .any(|w| w.code == LOCK_ENTRY_REMOVED_CODE)
+    }
+
     /// Mark the artifact dir as deliberately kept after a drift-skip and
     /// surface it honestly. Backends call this INSTEAD of removing the
     /// uuid dir when [`Self::drift_skipped`] is true: deleting it would be
@@ -726,7 +749,7 @@ impl RevertOutcome {
             "vendor_artifact_kept",
             format!(
                 "kept {uuid_dir_rel}: some recorded lock entries were left alone (see the \
-                 vendor_lock_entry_drifted warnings) and the vendored artifacts may still be \
+                 vendor_lock_entry_drifted / vendor_lock_entry_removed warnings) and the vendored artifacts may still be \
                  needed for a later restore; undo the drift (restore the vendored lock entries \
                  or re-vendor) and re-run `vendor --revert` to finish cleaning up"
             ),
