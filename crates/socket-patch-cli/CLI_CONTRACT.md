@@ -387,7 +387,7 @@ Recognition rules that hold for every ecosystem:
 |---|---|---|
 | Vendored: a lockfile/config wires a `.socket/vendor` artifact, or a live vendor ledger entry | The **committed artifact** is hashed against the record's `afterHash`. The ledger entry is used when it names the wired artifact (it carries the dir-artifact inventory); otherwise an entry is synthesized from the reference. A present installed tree with different bytes only warns `vendored_tree_out_of_sync`. | `(vendored)` |
 | Hosted: a discovered patch-host reference (or a live pre-v5 redirect-ledger record) | The installed copies the build **consumes** through the hosted wiring are hash-verified when any exist: the Go replacement module, never the pristine `M@v` in the module cache; the Socket-registry cargo source dir; maven's suffixed version. Installed evidence wins: `hash_mismatch` / `not_applied` are omitted. With **nothing installed**, a discovered reference whose lock pins the artifact (or whose format's rewriter never writes a pin) attests from that pin, which is the same evidence as in-run `scan --mode hosted --vex`. A pre-v5 ledger-only record, or a reference whose required pin is missing, stays `package_not_found`. So do purls that `--ecosystems` kept out of the crawl, because "not installed" has to mean the crawler looked. The same goes for npm purls when an installed pnpm tree records its virtual store outside the project (`enableGlobalVirtualStore`, or a `virtualStoreDir` that climbs out): transitive deps there are invisible to the crawler. A pnpm `modulesDir` inside the project is crawled. | `(redirected)` |
-| Agent: a manifest record with no live hosted/vendored wiring | The installed tree, unchanged. **Every** installed copy the crawler finds for the purl (npm nests duplicates of one `name@version`) must hash to the patched bytes, as `apply` patches every copy. One unpatched copy omits the purl with that copy's tag (`not_applied` / `hash_mismatch`). | none |
+| Agent: a manifest record with no live hosted/vendored wiring | The installed tree, unchanged. **Every** installed copy the crawler finds for the purl (npm nests duplicates of one `name@version`; pnpm, vlt, Bun and Deno stores add peer-variant copies and copies bundled inside other packages) must hash to the patched bytes, as `apply` patches every copy. One unpatched copy omits the purl with that copy's tag (`not_applied` / `hash_mismatch`). | none |
 
 **Liveness gates.** These gates run before hashing, and `--no-verify` / `--vex-no-verify` skips only the hashing, never the gates:
 
@@ -569,7 +569,10 @@ non-derivable field; a binary `bun.lockb` record is rebuilt like the takeover's)
 remedy, nothing touched; (3) `--dry-run` stops here and reports each pin as an `applied` event with
 reason `eject_planned` — no file is written and no `.socket/` is created; (4) the wet run snapshots
 every file the eject may touch under one `apply.lock`, restores upstream, then vendors. If any
-package then fails, the snapshot is put back — the project stays hosted exactly as before, with the
+package then fails, exactly the files the eject wrote are put back (the pins' files, the upstream
+restore's files, and every file the vendored apply committed, each only when its bytes changed) —
+the project stays hosted exactly as before, and every other file (a `--json > report.json` redirect
+target, a log another process appends to) is left alone, with the
 `eject_rolled_back` warning and `partial_failure`, exit 1; if putting the snapshot back itself fails,
 the error is `eject_rollback_failed` naming the files to `git checkout`. The eject does not emit the
 per-purl `vendor_takeover_reverted_redirect` warning (the restore is its own planned step).
