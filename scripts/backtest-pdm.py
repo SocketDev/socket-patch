@@ -1057,7 +1057,7 @@ def main():
         for p, data in saved.items():
             p.write_bytes(data)
         (vdir / lockname).write_bytes(pristine_lock)
-        reverted = {}
+        reverted, reverted_runs = {}, []
         for flags in ((), ("--no-verify",), ("--offline", "--no-verify")):
             r, env_, doc = vex("vex-reverted%s.log" % "".join(flags).replace("--", "-"), *flags)
             if mode == "hosted":
@@ -1065,8 +1065,9 @@ def main():
             else:
                 dead = r.rc == 1 and omitted(env_, unwired)
             reverted[" ".join(flags) or "default"] = {"exit": r.rc, "dead": dead, "attested": attested(doc)}
+            reverted_runs.append(r)
         notes["reverted"] = reverted
-        check("vexRevertedUnwired", bool(saved) == (mode != "hosted") and all(v["dead"] and not v["attested"] for v in reverted.values()), reverted)
+        check("vexRevertedUnwired", bool(saved) == (mode != "hosted") and all(v["dead"] and not v["attested"] for v in reverted.values()), reverted, tuple(reverted_runs))
         if not args.keep_environments:
             for path in (vvenv, vhome, vcache):
                 shutil.rmtree(path, ignore_errors=True)
@@ -1242,7 +1243,7 @@ def main():
                 and (project / "pyproject.toml").read_bytes() == pristine_pyproject
             )
             info["rollbackOutsideProject"] = {"exit": rb.rc, "restored": restored}
-            check("rollbackRestoresUnverifiableWrite", restored)
+            check("rollbackRestoresUnverifiableWrite", restored, None, rb)
             return finish("UNSUPPORTED" if restored else "FAIL")
 
         expected_refusal = mode != "agent" and (row["lockVersion"] not in SUPPORTED_LOCK_VERSIONS or shape in EXPECTED_NOOP_SHAPES)
@@ -1287,7 +1288,7 @@ def main():
                 vdoc = json.loads(vout.read_text(encoding="utf-8")) if vout.exists() else {}
                 named = [st for st in vdoc.get("statements", []) if any(sc.get("@id", "").startswith(PURL_BASE) for p in st.get("products", []) for sc in p.get("subcomponents", []))]
                 info["vexRefused"] = {"exit": rv.rc, "error": (rv.json_or_empty().get("error") or {}).get("code"), "statements": len(named)}
-                check("vexRefusedAttestsNothing", rv.rc != 0 and not named, info["vexRefused"])
+                check("vexRefusedAttestsNothing", rv.rc != 0 and not named, info["vexRefused"], rv)
                 return finish("REFUSED-EXPECTED" if all(checks.values()) else "FAIL")
 
         if mode == "agent":
@@ -1370,9 +1371,9 @@ def main():
         res = oracle(version, project, penv, after, case / "oracle-1.log")
         info["installedOrigin"] = res.get("origin")
         if excluded:
-            check("installedBytesPatched", res.get("installed") is False, {"expected": "not installed (marker excludes this host)", "oracle": res})
+            check("installedBytesPatched", res.get("installed") is False, {"expected": "not installed (marker excludes this host)", "oracle": res}, r)
         else:
-            check("installedBytesPatched", patched(res, after), res)
+            check("installedBytesPatched", patched(res, after), res, r)
         check("lockUnchangedByInstall", (project / lockname).read_bytes() == lock_after)
         if not excluded:
             manifestless_vex(check, info, version, case, project, lockname, pristine_lock, mode, uuid, after, groups)
@@ -1474,12 +1475,14 @@ def main():
         # final rollback restores every byte
         rb = Run(cli_cmd(project, "rollback"), project, cenv, case / "rollback.log", timeout=900)
         erb = rb.json_or_empty()
-        check("rollbackExit0", rb.ok(), rb.tail(600) if not rb.ok() else None)
-        check("rollbackRestoresLockBytes", (project / lockname).read_bytes() == pristine_lock)
-        check("rollbackKeepsPyproject", (project / "pyproject.toml").read_bytes() == pristine_pyproject)
-        check("rollbackClearsLedger", ledger_cleared(project, mode))
+        # A rollback that stops on a transport error leaves the lock, ledger
+        # and wheel it had not yet restored: those follow from `rb`.
+        check("rollbackExit0", rb.ok(), rb.tail(600) if not rb.ok() else None, rb)
+        check("rollbackRestoresLockBytes", (project / lockname).read_bytes() == pristine_lock, None, rb)
+        check("rollbackKeepsPyproject", (project / "pyproject.toml").read_bytes() == pristine_pyproject, None, rb)
+        check("rollbackClearsLedger", ledger_cleared(project, mode), None, rb)
         if mode == "vendored":
-            check("rollbackRemovesVendoredWheel", not (project / ".socket/vendor/pypi" / (uuid or "x")).exists())
+            check("rollbackRemovesVendoredWheel", not (project / ".socket/vendor/pypi" / (uuid or "x")).exists(), None, rb)
         info["rollbackEnvelope"] = {k: erb.get(k) for k in ("status", "rolledBack", "failed", "vendoredReverted") if k in erb}
         if erb.get("hosted"):
             info["rollbackEnvelope"]["hosted"] = {k: erb["hosted"].get(k) for k in ("reverted", "failed", "unsupported", "editedFiles")}
