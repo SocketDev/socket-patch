@@ -3616,6 +3616,9 @@ fn rewrite_yarn_berry_with_manifests(
     // the hosted tarball (see the section header). Parsed once; written back
     // in its own layout when a pin changes it.
     let manifest_text = files.get(BERRY_MANIFEST).map(String::as_str);
+    // Its `catalog:` / `catalogs:` tables: a dependency declared `catalog:`
+    // needs a selector yarn matches before it expands the catalog.
+    let yarnrc = files.get(".yarnrc.yml").map(String::as_str);
     let mut manifest: Option<Value> = manifest_text
         .and_then(|t| serde_json::from_str::<Value>(t.strip_prefix('\u{feff}').unwrap_or(t)).ok())
         .filter(Value::is_object);
@@ -3927,6 +3930,7 @@ fn rewrite_yarn_berry_with_manifests(
         };
         let pin = match berry_resolutions_pin(
             manifest_obj,
+            yarnrc,
             &fname,
             &dep.version,
             &key_ranges,
@@ -4230,6 +4234,17 @@ impl BerryResolutionsPin {
 /// tarball URL they are empty and recovered from our selectors routed to
 /// `current_url`.
 ///
+/// Yarn matches `resolutions` against a dependency's descriptor as the
+/// manifest spells it, before a `catalog:` descriptor is expanded to its
+/// catalog range (#632): a dependency declared `"left-pad": "catalog:"` is
+/// never matched by `left-pad@npm:^1.3.0`, though the lock keys its entry by
+/// that expanded range. So every `.yarnrc.yml` catalog (`yarnrc`) whose range
+/// for `name` is one of the pinned npm ranges is also routed, as
+/// `name@catalog:` (the default `catalog:` table) or `name@catalog:<named>`
+/// (`catalogs.<named>`). The `npm:` selectors stay: transitive dependents
+/// still ask for the expanded range, and rollback rebuilds the lock key from
+/// them.
+///
 /// Refuses (fail closed, nothing written) when the manifest already carries
 /// a user-authored `resolutions` entry for the package — any selector whose
 /// target is `name`, bare or scoped — since yarn would apply it alongside
@@ -4237,6 +4252,7 @@ impl BerryResolutionsPin {
 /// user pinned.
 fn berry_resolutions_pin(
     manifest: &serde_json::Map<String, Value>,
+    yarnrc: Option<&str>,
     name: &str,
     version: &str,
     key_ranges: &[String],
@@ -4276,7 +4292,7 @@ fn berry_resolutions_pin(
             ),
         });
     }
-    let selectors: Vec<String> = if key_ranges.is_empty() {
+    let mut selectors: Vec<String> = if key_ranges.is_empty() {
         ours.iter()
             .filter(|(_, value)| value.as_str().is_some() && value.as_str() == current_url)
             .map(|(selector, _)| (*selector).clone())
@@ -4296,6 +4312,17 @@ fn berry_resolutions_pin(
             ),
         });
     }
+    let ranges: Vec<&str> = selectors
+        .iter()
+        .filter_map(|selector| crate::vendor::yarn_classic_lock::split_pattern(selector))
+        .filter(|(n, range)| *n == name && range.starts_with("npm:"))
+        .map(|(_, range)| range)
+        .collect();
+    for selector in berry_catalog_selectors(yarnrc, name, &ranges) {
+        if !selectors.contains(&selector) {
+            selectors.push(selector);
+        }
+    }
     let stale = ours
         .iter()
         .filter(|(selector, value)| {
@@ -4307,6 +4334,57 @@ fn berry_resolutions_pin(
         .map(|(selector, _)| (*selector).clone())
         .collect();
     Ok(BerryResolutionsPin { selectors, stale })
+}
+
+/// The `name@catalog:` / `name@catalog:<named>` selectors of every
+/// `.yarnrc.yml` catalog that maps `name` to one of `ranges` (yarn's `npm:`
+/// spellings, as the lock keys them). A catalog range is normalized the way
+/// yarn normalizes a manifest range: one without a protocol is an `npm:`
+/// range. Yarn reads `.yarnrc.yml` with the failsafe schema, so an unquoted
+/// range is its source text (`1.10` stays `1.10`, never the number `1.1`):
+/// the catalog tables are deserialized as string tables, never
+/// type-inferred. A `.yarnrc.yml` that is absent, not YAML, or whose catalogs
+/// are not string tables has no catalogs (yarn itself refuses to run on one
+/// it cannot parse).
+fn berry_catalog_selectors(yarnrc: Option<&str>, name: &str, ranges: &[&str]) -> Vec<String> {
+    type Table = BTreeMap<String, Option<String>>;
+    #[derive(serde::Deserialize, Default)]
+    struct Catalogs {
+        #[serde(default)]
+        catalog: Option<Table>,
+        #[serde(default)]
+        catalogs: Option<BTreeMap<String, Option<Table>>>,
+    }
+    let Some(rc) = yarnrc else {
+        return Vec::new();
+    };
+    let rc = rc.strip_prefix('\u{feff}').unwrap_or(rc);
+    let Ok(parsed) = serde_saphyr::from_str::<Option<Catalogs>>(rc) else {
+        return Vec::new();
+    };
+    let parsed = parsed.unwrap_or_default();
+    let pins = |table: Option<&Table>| {
+        let Some(range) = table.and_then(|t| t.get(name)).and_then(Option::as_deref) else {
+            return false;
+        };
+        let range = range.trim();
+        let range = if range.contains(':') {
+            range.to_string()
+        } else {
+            format!("npm:{range}")
+        };
+        ranges.contains(&range.as_str())
+    };
+    let mut selectors = Vec::new();
+    if pins(parsed.catalog.as_ref()) {
+        selectors.push(format!("{name}@catalog:"));
+    }
+    for (catalog, table) in parsed.catalogs.iter().flatten() {
+        if pins(table.as_ref()) {
+            selectors.push(format!("{name}@catalog:{catalog}"));
+        }
+    }
+    selectors
 }
 
 /// Move each entry keyed `moved` to where yarn sorts it. Yarn writes lock
@@ -8564,6 +8642,205 @@ mod tests {
         assert_eq!(
             r.edits.iter().filter(|e| e.kind == "redirect_yarn_berry_resolution").count(),
             2
+        );
+    }
+
+    /// A root manifest consuming left-pad through the default catalog.
+    fn berry_catalog_manifest() -> String {
+        "{\n  \"name\": \"app\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \
+         \"left-pad\": \"catalog:\"\n  }\n}\n"
+            .to_string()
+    }
+
+    /// #632: yarn matches `resolutions` against the manifest's `catalog:`
+    /// descriptor before it expands the catalog, so a pin keyed only by the
+    /// lock's expanded `left-pad@npm:^1.3.0` never applies to a catalog
+    /// dependency: `yarn install --immutable` fails YN0028 and a mutable
+    /// install is unpatched. The catalog's own selector is routed too; the
+    /// `npm:` one stays for transitive descriptors and for rollback.
+    #[test]
+    fn yarn_berry_pin_routes_a_default_catalog_dependency() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        for yarnrc in [
+            "nodeLinker: node-modules\ncatalog:\n  left-pad: ^1.3.0\n",
+            "\u{feff}catalog:\r\n  left-pad: \"npm:^1.3.0\"\r\n",
+        ] {
+            let mut files = berry_files(berry_lock("10c0"), berry_catalog_manifest());
+            files.insert(".yarnrc.yml".to_string(), yarnrc.to_string());
+            let mut r = RewriteResult::default();
+            rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(r.warnings.is_empty(), "{yarnrc:?}: {:?}", r.warnings);
+            let manifest: Value = serde_json::from_str(&r.files["package.json"]).unwrap();
+            assert_eq!(
+                manifest["resolutions"],
+                json!({"left-pad@npm:^1.3.0": url, "left-pad@catalog:": url}),
+                "{yarnrc:?}: {manifest}"
+            );
+            assert_eq!(manifest["dependencies"]["left-pad"], "catalog:");
+            let keys: Vec<_> = r
+                .edits
+                .iter()
+                .filter(|e| e.kind == "redirect_yarn_berry_resolution")
+                .filter_map(|e| e.key.as_deref())
+                .collect();
+            assert_eq!(
+                keys,
+                ["left-pad@npm:^1.3.0", "left-pad@catalog:"],
+                "{yarnrc:?}"
+            );
+            assert!(r.confirmed_yarn_berry_uuids.contains(&ovr.patch_uuid));
+        }
+    }
+
+    /// Yarn reads `.yarnrc.yml` with the failsafe schema: an unquoted range
+    /// that looks like a number is its source text, so `1.10` must match the
+    /// lock's `npm:1.10` (not `npm:1.1`), and an integer, a null or a
+    /// non-string entry of another package must not hide the catalogs.
+    #[test]
+    fn yarn_berry_catalog_ranges_keep_their_source_text() {
+        let yarnrc = "nodeLinker: node-modules\npackageExtensions:\n  x@*:\n    \
+                      dependencies:\n      y: 1\ncatalog:\n  left-pad: 1.10\n  other: ~\n\
+                      catalogs:\n  ints:\n    left-pad: 2\n  nulls:\n  bare:\n    \
+                      left-pad: 1.10.0\n";
+        assert_eq!(
+            berry_catalog_selectors(Some(yarnrc), "left-pad", &["npm:1.10"]),
+            ["left-pad@catalog:"]
+        );
+        assert!(berry_catalog_selectors(Some(yarnrc), "left-pad", &["npm:1.1"]).is_empty());
+        assert_eq!(
+            berry_catalog_selectors(Some(yarnrc), "left-pad", &["npm:2", "npm:1.10.0"]),
+            ["left-pad@catalog:bare", "left-pad@catalog:ints"]
+        );
+        assert!(
+            berry_catalog_selectors(Some("catalog: [1, 2]\n"), "left-pad", &["npm:1"]).is_empty()
+        );
+        assert!(berry_catalog_selectors(Some(": : :"), "left-pad", &["npm:1"]).is_empty());
+    }
+
+    /// #632, workspace shape: the default catalog and a named one
+    /// (`catalogs.legacy`) both lock into one merged entry, so both catalog
+    /// selectors are routed; a catalog whose range locks another entry, a
+    /// catalog of another package and one with a non-npm protocol are not.
+    #[test]
+    fn yarn_berry_pin_routes_every_catalog_locking_the_entry() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let lock = format!(
+            "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"left-pad@npm:1.3.0, left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  \
+             resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n  languageName: node\n  \
+             linkType: hard\n",
+            "3".repeat(128)
+        );
+        let mut files = berry_files(lock, berry_catalog_manifest());
+        files.insert(
+            ".yarnrc.yml".to_string(),
+            "catalog:\n  left-pad: ^1.3.0\n  is-number: 1.3.0\ncatalogs:\n  legacy:\n    \
+             left-pad: 1.3.0\n  old:\n    left-pad: ^1.0.0\n  forked:\n    \
+             left-pad: \"patch:left-pad@npm%3A1.3.0#./p.patch\"\n"
+                .to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let manifest: Value = serde_json::from_str(&r.files["package.json"]).unwrap();
+        assert_eq!(
+            manifest["resolutions"],
+            json!({
+                "left-pad@npm:1.3.0": url,
+                "left-pad@npm:^1.3.0": url,
+                "left-pad@catalog:": url,
+                "left-pad@catalog:legacy": url,
+            }),
+            "{manifest}"
+        );
+    }
+
+    /// #632: a re-run over its own catalog pin changes nothing, and a re-run
+    /// over a pin written before the fix (lock keyed by the URL, only the
+    /// `npm:` selector) adds the missing catalog selector without touching
+    /// the lock.
+    #[test]
+    fn yarn_berry_catalog_pin_rerun_is_stable_and_heals_an_old_pin() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let yarnrc = "catalog:\n  left-pad: ^1.3.0\n";
+        let mut files = berry_files(berry_lock("10c0"), berry_catalog_manifest());
+        files.insert(".yarnrc.yml".to_string(), yarnrc.to_string());
+        let mut first = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut first);
+        assert!(first.warnings.is_empty(), "{:?}", first.warnings);
+        let pinned_lock = first.files["yarn.lock"].clone();
+        let pinned_manifest = first.files["package.json"].clone();
+
+        let mut rerun_files = berry_files(pinned_lock.clone(), pinned_manifest);
+        rerun_files.insert(".yarnrc.yml".to_string(), yarnrc.to_string());
+        let mut rerun = RewriteResult::default();
+        rewrite_yarn_berry(&rerun_files, std::slice::from_ref(&ovr), &mut rerun);
+        assert!(rerun.warnings.is_empty(), "{:?}", rerun.warnings);
+        assert!(
+            rerun.files.is_empty(),
+            "re-run is a no-op: {:?}",
+            rerun.files
+        );
+        assert!(rerun.confirmed_yarn_berry_uuids.contains(&ovr.patch_uuid));
+
+        let old_manifest = serde_json::to_string_pretty(&json!({
+            "name": "app",
+            "version": "1.0.0",
+            "dependencies": {"left-pad": "catalog:"},
+            "resolutions": {"left-pad@npm:^1.3.0": url},
+        }))
+        .unwrap()
+            + "\n";
+        let mut old_files = berry_files(pinned_lock, old_manifest);
+        old_files.insert(".yarnrc.yml".to_string(), yarnrc.to_string());
+        let mut healed = RewriteResult::default();
+        rewrite_yarn_berry(&old_files, std::slice::from_ref(&ovr), &mut healed);
+        assert!(healed.warnings.is_empty(), "{:?}", healed.warnings);
+        assert!(
+            !healed.files.contains_key("yarn.lock"),
+            "lock already pinned"
+        );
+        let manifest: Value = serde_json::from_str(&healed.files["package.json"]).unwrap();
+        assert_eq!(
+            manifest["resolutions"],
+            json!({"left-pad@npm:^1.3.0": url, "left-pad@catalog:": url}),
+            "{manifest}"
+        );
+    }
+
+    /// A user-authored catalog selector is the user's pin: the hosted
+    /// redirect refuses rather than overwrite it.
+    #[test]
+    fn yarn_berry_pin_refuses_a_user_catalog_resolution() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let manifest = serde_json::to_string_pretty(&json!({
+            "name": "app",
+            "dependencies": {"left-pad": "catalog:"},
+            "resolutions": {"left-pad@catalog:": "npm:1.3.0"},
+        }))
+        .unwrap();
+        let mut files = berry_files(berry_lock("10c0"), manifest);
+        files.insert(
+            ".yarnrc.yml".to_string(),
+            "catalog:\n  left-pad: ^1.3.0\n".into(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            r.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
+            ["redirect_yarn_berry_resolutions_conflict"]
         );
     }
 

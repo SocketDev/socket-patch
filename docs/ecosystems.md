@@ -82,7 +82,10 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 - **yarn berry** — the redirect pins the way yarn does for a root `resolutions`
   entry (cacheKey `10c0` / yarn 4): `package.json` routes the locked descriptor
   (`"left-pad@npm:^1.3.0"`) to the hosted tarball and only that `yarn.lock` entry
-  is re-keyed by it. Yarn then fetches it without npm registry credentials and
+  is re-keyed by it. A dependency declared through a yarn catalog (`"catalog:"`,
+  yarn 4.10+) is matched before yarn expands the catalog, so each `.yarnrc.yml`
+  catalog that resolves to the locked range is routed too (`"left-pad@catalog:"`,
+  `"left-pad@catalog:<name>"`). Yarn then fetches it without npm registry credentials and
   hardened mode accepts it. The re-keyed entry is written the way yarn writes
   it, with its fields in yarn's order and its `bin:` map taken from the served
   tarball's own `package.json`. For an entry that has a `bin:` map, the scan
