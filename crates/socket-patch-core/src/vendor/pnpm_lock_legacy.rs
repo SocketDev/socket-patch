@@ -64,15 +64,16 @@ use crate::utils::fs::read_regular_to_string;
 use super::common::refused;
 use super::path::parse_vendor_path;
 use super::pnpm_lock::{
-    dep_field_lines, drifted, lines_value, revert_overrides_line, value_lines, vendor_value_is_for,
-    EditCtx, PnpmDialect, KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
+    dep_field_lines, drifted, lines_value, removed, revert_overrides_line, value_lines,
+    vendor_value_is_for, EditCtx, PnpmDialect, KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
 };
 use super::source::PackageSource;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use crate::constants::npm_family::PNPM_LOCK;
 use crate::formats::pnpm::lines::{
-    next_block, parse_key_line, section_bounds, split_lines, yaml_key, yaml_key_like,
+    next_block, parse_key_line, section_bounds, split_lines, unquote_value, yaml_key,
+    yaml_key_like, yaml_value,
 };
 use crate::formats::pnpm::{sniff_lock_grammar, PnpmLock, PnpmLockGrammar};
 
@@ -575,12 +576,16 @@ fn edit_specifier_v54(
         if key != ctx.name {
             continue;
         }
-        if rest == ctx.abs_spec {
+        // The absolute root can hold YAML indicators (` #`, `: `); spell it
+        // the way pnpm does, or YAML truncates or rejects the line (#754).
+        let abs_yaml = yaml_value(ctx.abs_spec);
+        if rest == abs_yaml {
             return Ok(false); // in sync
         }
-        // Ours at a stale root/uuid (a moved checkout being re-vendored) has
-        // no original; anything else is the user's range, recorded.
-        let original = (!ctx.is_ours(rest)).then(|| Value::String(rest.to_string()));
+        // Ours at a stale root/uuid (a moved checkout being re-vendored, or
+        // an unquoted spelling an older release wrote) has no original;
+        // anything else is the user's range, recorded.
+        let original = (!ctx.is_ours(unquote_value(rest))).then(|| Value::String(rest.to_string()));
         // Built before the splice below: `key`/`repr` borrow `*line`.
         let record = WiringRecord {
             file: PNPM_LOCK.to_string(),
@@ -590,7 +595,7 @@ fn edit_specifier_v54(
             original,
             new: Some(Value::String(ctx.abs_spec.to_string())),
         };
-        let rewritten = format!("  {}: {}", yaml_key_like(key, repr), ctx.abs_spec);
+        let rewritten = format!("  {}: {abs_yaml}", yaml_key_like(key, repr));
         *line = rewritten;
         wiring.push(record);
         return Ok(true);
@@ -608,6 +613,8 @@ fn edit_root_deps_v60(
 ) -> Result<(bool, bool), String> {
     let mut changed = false;
     let mut hit = false;
+    // Quoted the way pnpm writes it when the root holds YAML indicators.
+    let abs_yaml = yaml_value(ctx.abs_spec);
     for section in ROOT_DEP_SECTIONS {
         let Some((start, end)) = section_bounds(lines, section) else {
             continue;
@@ -627,7 +634,7 @@ fn edit_root_deps_v60(
                 let target = old_ver == ctx.version || ctx.is_ours(&old_ver);
                 if target {
                     hit = true;
-                    if old_ver == ctx.spec && old_spec == ctx.abs_spec {
+                    if old_ver == ctx.spec && old_spec == abs_yaml {
                         k = f;
                         continue; // in sync
                     }
@@ -651,7 +658,7 @@ fn edit_root_deps_v60(
                             "version": ctx.spec,
                         })),
                     };
-                    lines[si] = format!("    specifier: {}", ctx.abs_spec);
+                    lines[si] = format!("    specifier: {abs_yaml}");
                     lines[vi] = format!("    version: {}", ctx.spec);
                     wiring.push(record);
                     changed = true;
@@ -967,8 +974,14 @@ fn revert_value_line(
         if rec.original.as_ref().and_then(Value::as_str) == Some(rest) {
             return;
         }
-        let ours = Some(rest) == rec.new.as_ref().and_then(Value::as_str)
-            || parse_vendor_path(rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
+        // `new` holds the value; the line may spell it YAML-quoted.
+        let ours = rec
+            .new
+            .as_ref()
+            .and_then(Value::as_str)
+            .is_some_and(|new| rest == new || rest == yaml_value(new))
+            || parse_vendor_path(unquote_value(rest))
+                .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
         if !ours {
             warnings.push(drifted(format!(
                 "{section} entry `{dep}` was changed since vendoring ({rest}); left alone"
@@ -986,7 +999,7 @@ fn revert_value_line(
         *dirty = true;
         return;
     }
-    warnings.push(drifted(format!(
+    warnings.push(removed(format!(
         "{section} entry `{dep}` no longer exists; nothing to restore"
     )));
 }
@@ -1069,7 +1082,7 @@ fn revert_root_dep_pair(
         *dirty = true;
         return;
     }
-    warnings.push(drifted(format!(
+    warnings.push(removed(format!(
         "root dep `{key}` no longer exists; nothing to restore"
     )));
 }
@@ -1156,7 +1169,7 @@ fn revert_package_block(
             j = block.end;
         }
     }
-    warnings.push(drifted(format!(
+    warnings.push(removed(format!(
         "packages entry `{new_key}` no longer exists; nothing to restore"
     )));
 }
@@ -1229,7 +1242,7 @@ fn revert_pkg_dep_ref(
         }
         break;
     }
-    warnings.push(drifted(format!(
+    warnings.push(removed(format!(
         "dep ref `{key}` no longer exists; nothing to restore"
     )));
 }
@@ -1563,13 +1576,15 @@ packages:
 ";
 
     struct Fixture {
-        tmp: tempfile::TempDir,
+        // Held only to keep the tempdir alive for the fixture's lifetime.
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
         record: PatchRecord,
     }
 
     impl Fixture {
         fn root(&self) -> &Path {
-            self.tmp.path()
+            &self.root
         }
 
         /// The canonical root — what the backend embeds in the absolute
@@ -1689,8 +1704,18 @@ packages:
     crate::vendor::test_support::npm_flip_suite!(flip_suite_v6, Fixture, flip_fixture_v6, flip_run);
 
     async fn fixture_with(pkg_json: &str, lock: &str) -> Fixture {
+        fixture_in(None, pkg_json, lock).await
+    }
+
+    /// [`fixture_with`], with the project in a `dir_name` subdirectory of
+    /// the tempdir — for project paths whose spelling matters to the lock.
+    async fn fixture_in(dir_name: Option<&str>, pkg_json: &str, lock: &str) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
+        let root_buf = match dir_name {
+            Some(d) => tmp.path().join(d),
+            None => tmp.path().to_path_buf(),
+        };
+        let root = root_buf.as_path();
 
         let installed = root.join("node_modules/left-pad");
         tokio::fs::create_dir_all(&installed).await.unwrap();
@@ -1733,7 +1758,11 @@ packages:
             license: "MIT".to_string(),
             tier: "free".to_string(),
         };
-        Fixture { tmp, record }
+        Fixture {
+            _tmp: tmp,
+            root: root_buf,
+            record,
+        }
     }
 
     fn expect_done(
@@ -1951,6 +1980,121 @@ packages:
         }
     }
 
+    /// Project dir names holding a YAML indicator (#754). Windows forbids
+    /// `:` in a path component, so the `: ` case runs on unix only.
+    #[cfg(not(windows))]
+    const YAML_INDICATOR_DIRS: &[&str] = &["hash #x", "colon: x"];
+    #[cfg(windows)]
+    const YAML_INDICATOR_DIRS: &[&str] = &["hash #x"];
+
+    /// #754: a project root holding a YAML indicator (` #` truncates a
+    /// plain scalar into a comment, `: ` makes the line invalid) gets the
+    /// absolute specifier single-quoted exactly as pnpm 7/8 write it, so a
+    /// frozen install at that path reads the specifier socket-patch meant.
+    /// The re-run is in sync (what `vendor --check` relies on) and revert
+    /// restores the lock byte-for-byte — for BOTH grammars.
+    #[tokio::test]
+    async fn absolute_specifier_is_yaml_quoted_under_indicator_paths() {
+        for dir in YAML_INDICATOR_DIRS {
+            for (before_lock, after_lock, tag) in [
+                (T7_BEFORE_LOCK, T7_AFTER_LOCK, "5.4"),
+                (T8_BEFORE_LOCK, T8_AFTER_LOCK, "6.0"),
+            ] {
+                let fx = fixture_in(Some(dir), T_BEFORE_PKG, before_lock).await;
+                let (result, entry, _) = expect_done(fx.vendor(false).await);
+                assert!(result.success, "{tag} {dir}: {:?}", result.error);
+                let entry = entry.expect("entry");
+
+                let plain = format!("file:{ROOT_TOKEN}/{}", fx.rel_tgz());
+                let abs = format!("file:{}/{}", fx.canon_root_str(), fx.rel_tgz());
+                let quoted = format!("'{}'", abs.replace('\'', "''"));
+                let want = after_lock
+                    .replace(&plain, &quoted)
+                    .replace(SPIKE_INTEGRITY, &fx.actual_integrity().await);
+                let lock_after = fx.read(PNPM_LOCK).await;
+                assert_eq!(lock_after, want, "{tag} {dir}");
+                let want_line = match tag {
+                    "5.4" => format!("  left-pad: {quoted}"),
+                    _ => format!("    specifier: {quoted}"),
+                };
+                assert!(
+                    lock_after.lines().any(|l| l == want_line),
+                    "{tag} {dir}: {want_line}\n{lock_after}"
+                );
+
+                // In sync on re-run: nothing recorded, bytes stable.
+                let (result, again, _) = expect_done(fx.vendor(false).await);
+                assert!(result.success, "{tag} {dir}: {:?}", result.error);
+                assert!(
+                    again.is_none(),
+                    "{tag} {dir}: in-sync rerun records nothing"
+                );
+                assert!(
+                    result
+                        .files_verified
+                        .iter()
+                        .all(|v| v.status == VerifyStatus::AlreadyPatched),
+                    "{tag} {dir}"
+                );
+                assert_eq!(fx.read(PNPM_LOCK).await, lock_after, "{tag} {dir}");
+
+                let outcome = revert_pnpm_legacy(&entry, fx.root(), false).await;
+                assert!(outcome.success, "{tag} {dir}: {:?}", outcome.error);
+                assert!(
+                    outcome.warnings.is_empty(),
+                    "{tag} {dir}: {:?}",
+                    outcome.warnings
+                );
+                assert_eq!(fx.read(PNPM_LOCK).await, before_lock, "{tag} {dir}");
+                assert_eq!(fx.read(PACKAGE_JSON).await, T_BEFORE_PKG, "{tag} {dir}");
+            }
+        }
+    }
+
+    /// #754: a lock an earlier release left broken (the absolute specifier
+    /// spliced unquoted under a ` #` path) is not "in sync" — re-vendoring
+    /// rewrites it to the quoted spelling and records no original for our
+    /// own stale value; the first entry's revert still restores the user's
+    /// range.
+    #[tokio::test]
+    async fn unquoted_absolute_specifier_from_an_older_release_is_healed() {
+        for (before_lock, tag) in [(T7_BEFORE_LOCK, "5.4"), (T8_BEFORE_LOCK, "6.0")] {
+            let fx = fixture_in(Some("hash #x"), T_BEFORE_PKG, before_lock).await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.expect("entry");
+            let abs = format!("file:{}/{}", fx.canon_root_str(), fx.rel_tgz());
+            let quoted = format!("'{}'", abs.replace('\'', "''"));
+            let healthy = fx.read(PNPM_LOCK).await;
+            // What releases before the fix wrote.
+            let broken = healthy.replace(&quoted, &abs);
+            assert_ne!(broken, healthy, "{tag}");
+            tokio::fs::write(fx.root().join(PNPM_LOCK), &broken)
+                .await
+                .unwrap();
+
+            let (result, again, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{tag}: {:?}", result.error);
+            assert_eq!(fx.read(PNPM_LOCK).await, healthy, "{tag}: healed");
+            let again = again.expect("a healing re-run records its wiring");
+            let rec = again
+                .wiring
+                .iter()
+                .find(|r| r.kind == KIND_LOCK_SPECIFIER || r.kind == KIND_LOCK_ROOT_DEP_PAIR)
+                .expect("specifier record");
+            assert!(
+                rec.original.is_none(),
+                "{tag}: our own stale value is never recorded as the user's original: {:?}",
+                rec.original
+            );
+            // The first vendor's ledger entry (the one carrying the user's
+            // original) still reverts the healed lock byte-for-byte.
+            let outcome = revert_pnpm_legacy(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{tag}: {:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{tag}: {:?}", outcome.warnings);
+            assert_eq!(fx.read(PNPM_LOCK).await, before_lock, "{tag}");
+        }
+    }
+
     /// Revert restores BOTH files byte-identical (the packages block moves
     /// back across the sort boundary to its original slot) and removes the
     /// artifact dir — for BOTH grammars.
@@ -1989,6 +2133,45 @@ packages:
                     .exists(),
                 "{tag}"
             );
+        }
+    }
+
+    /// A CRLF, BOM or BOM+CRLF+tab `package.json` keeps its layout through
+    /// vendor and a byte-exact revert, for BOTH legacy grammars (#662).
+    #[tokio::test]
+    async fn vendor_and_revert_keep_package_json_layout() {
+        use crate::vendor::test_support::{relayout, JSON_LAYOUTS};
+        for (before_lock, after_lock, grammar) in [
+            (T7_BEFORE_LOCK, T7_AFTER_LOCK, "5.4"),
+            (T8_BEFORE_LOCK, T8_AFTER_LOCK, "6.0"),
+        ] {
+            for (layout, bom, crlf, tab) in JSON_LAYOUTS {
+                let tag = format!("{grammar} {layout}");
+                let before = relayout(T_BEFORE_PKG, bom, crlf, tab);
+                let fx = fixture_with(&before, before_lock).await;
+                let (result, entry, _) = expect_done(fx.vendor(false).await);
+                assert!(result.success, "{tag}: {:?}", result.error);
+                assert_eq!(
+                    fx.read(PACKAGE_JSON).await,
+                    relayout(T_AFTER_PKG, bom, crlf, tab),
+                    "{tag}: vendored package.json keeps its layout"
+                );
+                assert_eq!(
+                    fx.read(PNPM_LOCK).await,
+                    fx.expected_lock(after_lock).await,
+                    "{tag}: lock unaffected by the manifest layout"
+                );
+
+                let outcome = revert_pnpm_legacy(&entry.unwrap(), fx.root(), false).await;
+                assert!(outcome.success, "{tag}: {:?}", outcome.error);
+                assert!(outcome.warnings.is_empty(), "{tag}: {:?}", outcome.warnings);
+                assert_eq!(
+                    fx.read(PACKAGE_JSON).await,
+                    before,
+                    "{tag}: package.json byte-restored"
+                );
+                assert_eq!(fx.read(PNPM_LOCK).await, before_lock, "{tag}");
+            }
         }
     }
 
@@ -2782,6 +2965,47 @@ packages:
         );
     }
 
+    /// Revert and assert the #665 removed-entry contract: success, no
+    /// drift, one `vendor_lock_entry_removed` warning containing `want`,
+    /// and the artifact kept exactly while the lock still resolves through
+    /// it (`still_referenced`). A removed artifact is put back afterwards
+    /// so the caller's next matrix case starts from the vendored state.
+    async fn assert_removed(fx: &Fixture, entry: &VendorEntry, want: &str, still_referenced: bool) {
+        let uuid_dir = fx.root().join(fx.rel_tgz()).parent().unwrap().to_path_buf();
+        let mut saved = Vec::new();
+        for file in std::fs::read_dir(&uuid_dir).unwrap() {
+            let path = file.unwrap().path();
+            saved.push((path.clone(), std::fs::read(&path).unwrap()));
+        }
+
+        let outcome = revert_pnpm_legacy(entry, fx.root(), false).await;
+        assert!(outcome.success, "{want}: {:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{want}: {:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_removed" && w.detail.contains(want)),
+            "expected a removed warning containing `{want}`: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            outcome.kept_artifact, still_referenced,
+            "{want}: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            fx.root().join(fx.rel_tgz()).exists(),
+            still_referenced,
+            "{want}: the artifact goes once nothing resolves through it"
+        );
+
+        std::fs::create_dir_all(&uuid_dir).unwrap();
+        for (path, bytes) in saved {
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+
     /// A dry run previews and records NOTHING through the legacy entry
     /// point, and a missing patch-target file fails the vendor before any
     /// pack — both land in the `staged == None` early return with the
@@ -3344,8 +3568,9 @@ packages:
     }
 
     /// v5.4 drift matrix: third-party re-resolutions are left alone with ONE
-    /// precise warning each, vanished fragments/sections warn, and every
-    /// case keeps the artifact.
+    /// precise warning each and keep the artifact; vanished sections warn
+    /// and keep; a vanished fragment warns as removed and the artifact goes
+    /// once nothing resolves through it (#665).
     #[tokio::test]
     async fn reresolved_and_vanished_fragments_drift_keep_v54() {
         let (fx, entry) = vendored(T7_BEFORE_LOCK).await;
@@ -3381,11 +3606,11 @@ packages:
         tokio::fs::write(fx.root().join(PNPM_LOCK), &tampered)
             .await
             .unwrap();
-        assert_drift_keep(
+        assert_removed(
             &fx,
             &entry,
             "specifiers entry `left-pad` no longer exists",
-            1,
+            false,
         )
         .await;
         rewire(&fx, &wired_pkg, &wired).await;
@@ -3412,11 +3637,11 @@ packages:
         tokio::fs::write(fx.root().join(PNPM_LOCK), &tampered)
             .await
             .unwrap();
-        assert_drift_keep(
+        assert_removed(
             &fx,
             &entry,
             "dep ref `file:consumer|left-pad` no longer exists",
-            1,
+            false,
         )
         .await;
         rewire(&fx, &wired_pkg, &wired).await;
@@ -3430,7 +3655,7 @@ packages:
             .await
             .unwrap();
         let want_block_gone = format!("packages entry `file:{rel}` no longer exists");
-        assert_drift_keep(&fx, &entry, &want_block_gone, 1).await;
+        assert_removed(&fx, &entry, &want_block_gone, false).await;
         rewire(&fx, &wired_pkg, &wired).await;
 
         // (f) the whole specifiers section is gone.
@@ -3482,11 +3707,13 @@ packages:
         tokio::fs::write(fx.root().join(PNPM_LOCK), &tampered)
             .await
             .unwrap();
-        assert_drift_keep(
+        // The surviving `specifier:` line still names the artifact, so it
+        // is kept.
+        assert_removed(
             &fx,
             &entry,
             "root dep `dependencies|left-pad` no longer exists",
-            1,
+            true,
         )
         .await;
         rewire(&fx, &wired_pkg, &wired).await;
@@ -4350,7 +4577,8 @@ packages:
     /// Our rekeyed block gone (user re-locked) AND the record's original
     /// stripped (corrupted ledger): with neither the live block nor a
     /// converged original to anchor on, the record warns `no longer exists`
-    /// and the artifact is kept.
+    /// (removed), and with nothing left resolving through the artifact it is
+    /// removed (#665).
     #[tokio::test]
     async fn missing_block_with_no_recorded_original_warns_no_longer_exists() {
         let (fx, mut entry) = vendored(T7_BEFORE_LOCK).await;
@@ -4369,11 +4597,11 @@ packages:
             .find(|r| r.kind == KIND_LOCK_PACKAGE)
             .unwrap();
         rec.original = None;
-        assert_drift_keep(
+        assert_removed(
             &fx,
             &entry,
             &format!("packages entry `file:{rel}` no longer exists"),
-            1,
+            false,
         )
         .await;
     }

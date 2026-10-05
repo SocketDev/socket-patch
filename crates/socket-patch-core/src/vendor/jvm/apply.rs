@@ -322,9 +322,9 @@ pub async fn write_plan(root: &Path, plan: &JvmPlan) -> Result<Vec<WiringRecord>
     let mut targets = Vec::new();
     for w in &plan.writes {
         let allowed = if w.tree {
-            w.rel.starts_with(".socket/vendor/maven2/")
-                || w.rel.starts_with(".socket/vendor/gradle/")
-                || w.rel.starts_with(&format!("{}/", coursier_tree::TREE_ROOT))
+            VENDOR_TREES
+                .iter()
+                .any(|tree| w.rel.strip_prefix(tree).is_some_and(|r| r.starts_with('/')))
         } else {
             is_wiring_file(&w.rel)
         };
@@ -693,6 +693,14 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
         kept_artifact: kept,
     }
 }
+
+/// The vendored repository trees JVM entries write under `.socket/vendor`
+/// (sbt's Coursier tree included).
+pub(crate) const VENDOR_TREES: &[&str] = &[
+    ".socket/vendor/maven2",
+    ".socket/vendor/gradle",
+    coursier_tree::TREE_ROOT,
+];
 
 /// Owned directories pruned once empty, up to and including themselves.
 const OWNED_DIRS: &[&str] = &[

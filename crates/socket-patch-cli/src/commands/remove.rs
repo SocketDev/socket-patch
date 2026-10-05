@@ -1,6 +1,6 @@
 use clap::Args;
 use socket_patch_core::api::client::get_api_client_with_overrides;
-use socket_patch_core::manifest::cleanup_blobs::format_bytes;
+use socket_patch_core::manifest::cleanup_blobs::{format_bytes, ArtifactReferences};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::patch::redirect::upstream::HostedPin;
@@ -14,8 +14,7 @@ use std::time::Duration;
 
 use super::get::short_uuid;
 use super::rollback::{
-    pin_before_hash_blobs, rollback_patches_inner, run_hosted_leg, sweep_failure,
-    sweep_unused_artifacts, HostedLegOutcome, InnerSelection,
+    rollback_patches_inner, run_hosted_leg, sweep_failure, HostedLegOutcome, InnerSelection,
 };
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::lock_cli::acquire_or_emit;
@@ -938,24 +937,15 @@ pub async fn run(args: RemoveArgs) -> i32 {
     }
 
     // ── GC ──────────────────────────────────────────────────────────────
-    // Clean up unused blobs (previewed, not deleted, on --dry-run). The
-    // reference manifest is the post-removal manifest PLUS one synthetic
-    // keep record per retained entry above: `cleanup_unused_blobs` keeps
-    // only afterHash blobs (beforeHash blobs are normally re-downloadable
-    // on demand), so each pinned before-hash is listed in an afterHash
-    // slot. Scoped to REVERT data only — the retained entries' real
-    // afterHash blobs stay sweepable like any other orphan.
-    let mut cleanup_reference = updated_manifest;
-    let pinned_purls: Vec<String> = retained_not_installed
-        .iter()
-        .map(|p| (*p).to_string())
-        .collect();
-    pin_before_hash_blobs(&mut cleanup_reference, &manifest, pinned_purls.iter());
+    let references = ArtifactReferences::after_removal(
+        &manifest,
+        &updated_manifest,
+        retained_not_installed.iter().copied(),
+    );
     let mut blobs_removed = 0;
     let mut archives_removed = 0;
     if !args.preserve_state {
-        let sweep =
-            sweep_unused_artifacts(&cleanup_reference, &socket_dir, args.common.dry_run).await;
+        let sweep = references.sweep(&socket_dir, args.common.dry_run).await;
         // repair's posture: a failed pass (or a pass that could not unlink
         // every orphan) warns and continues, never fatal; its partial
         // counts still stand.

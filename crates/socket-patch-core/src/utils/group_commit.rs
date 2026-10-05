@@ -501,6 +501,17 @@ pub struct GroupCommit {
     open: bool,
 }
 
+/// One project file a [`GroupCommit::commit_changes`] wrote: its
+/// project-relative path and the bytes it held before the commit (`None`
+/// when the commit created it). A caller that must undo the commit (the
+/// hosted→vendored eject's rollback) puts exactly these back, and nothing
+/// else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedFile {
+    pub rel: String,
+    pub before: Option<Vec<u8>>,
+}
+
 /// One file the commit changes.
 struct Change {
     rel: PathBuf,
@@ -547,7 +558,14 @@ impl GroupCommit {
     /// [`remove_after_commit`] (and the empty directories queued by
     /// [`remove_dir_after_commit`]) are deleted only after a commit
     /// succeeded.
-    pub async fn commit(mut self) -> std::io::Result<Vec<String>> {
+    pub async fn commit(self) -> std::io::Result<Vec<String>> {
+        let changed = self.commit_changes().await?;
+        Ok(changed.into_iter().map(|c| c.rel).collect())
+    }
+
+    /// [`GroupCommit::commit`], returning each changed file with the bytes
+    /// it held before the commit.
+    pub async fn commit_changes(mut self) -> std::io::Result<Vec<CommittedFile>> {
         self.close();
         let changed = self.write().await?;
         let removals = std::mem::take(
@@ -573,7 +591,7 @@ impl GroupCommit {
         Ok(changed)
     }
 
-    async fn write(&mut self) -> std::io::Result<Vec<String>> {
+    async fn write(&mut self) -> std::io::Result<Vec<CommittedFile>> {
         let root = self.overlay.root.clone();
         let captured = std::mem::take(
             &mut *self
@@ -608,17 +626,16 @@ impl GroupCommit {
         // sees the wiring before the ledger that records it, never a ledger
         // naming wiring that is not there yet.
         changes.sort_by_key(|c| is_ledger(&c.rel));
-        let changed: Vec<String> = changes.iter().map(|c| rel_string(&c.rel)).collect();
         // Even with nothing to write: an artifact rebuilt in place (a
         // drifted committed copy healed at its own path) is already named
         // by the committed state, so it is synced before the run returns.
         super::durability::barrier().await?;
         if changes.is_empty() {
-            return Ok(changed);
+            return Ok(committed(changes));
         }
         if let [only] = changes.as_slice() {
             apply_durably(&root, only).await?;
-            return Ok(changed);
+            return Ok(committed(changes));
         }
         let journal = root.join(COMMIT_JOURNAL_REL);
         if let Some(parent) = journal.parent() {
@@ -652,7 +669,7 @@ impl GroupCommit {
         {
             sync_dir(journal.parent());
         }
-        Ok(changed)
+        Ok(committed(changes))
     }
 }
 
@@ -664,6 +681,17 @@ impl Drop for GroupCommit {
 
 fn is_ledger(rel: &Path) -> bool {
     LEDGERS.contains(&rel_string(rel).as_str())
+}
+
+/// What [`GroupCommit::commit_changes`] reports for the written `changes`.
+fn committed(changes: Vec<Change>) -> Vec<CommittedFile> {
+    changes
+        .into_iter()
+        .map(|c| CommittedFile {
+            rel: rel_string(&c.rel),
+            before: c.before,
+        })
+        .collect()
 }
 
 fn rel_string(rel: &Path) -> String {
@@ -1126,6 +1154,40 @@ mod tests {
         assert_eq!(std::fs::read(&lock).unwrap(), b"new");
         assert!(!ws.exists(), "created then removed: never written");
         assert!(!root.join(COMMIT_JOURNAL_REL).exists());
+    }
+
+    /// `commit_changes` reports each written file with the bytes it held
+    /// before the commit (`None` for a file the commit created), so a
+    /// caller can undo exactly the commit (#687).
+    #[tokio::test]
+    async fn commit_changes_reports_each_files_before_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("package.json"), b"old").unwrap();
+        std::fs::write(root.join("README.md"), b"untouched").unwrap();
+        let group = GroupCommit::begin(root);
+        super::super::fs::atomic_write_bytes(&root.join("package.json"), b"new")
+            .await
+            .unwrap();
+        super::super::fs::atomic_write_bytes(&root.join("pnpm-workspace.yaml"), b"ws")
+            .await
+            .unwrap();
+        let mut changed = group.commit_changes().await.unwrap();
+        changed.sort_by(|a, b| a.rel.cmp(&b.rel));
+        assert_eq!(
+            changed,
+            vec![
+                CommittedFile {
+                    rel: "package.json".into(),
+                    before: Some(b"old".to_vec()),
+                },
+                CommittedFile {
+                    rel: "pnpm-workspace.yaml".into(),
+                    before: None,
+                },
+            ]
+        );
+        assert_eq!(std::fs::read(root.join("package.json")).unwrap(), b"new");
     }
 
     fn render_string(value: &(dyn Any + Send + Sync)) -> std::io::Result<Vec<u8>> {

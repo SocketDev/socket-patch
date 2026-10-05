@@ -364,6 +364,70 @@ impl VendorState {
             .flatten()
             .collect()
     }
+
+    /// The created-scaffold flags every entry should carry: the union
+    /// over the entries that wire the same project-root files (every uv
+    /// entry shares `pyproject.toml`'s `[tool.uv.sources]`; every pnpm
+    /// entry shares `package.json` and `pnpm-workspace.yaml`).
+    fn shared_scaffold_flags(&self) -> (bool, PnpmMeta) {
+        let mut uv = false;
+        let mut pnpm = PnpmMeta::default();
+        for entry in self.entries.values() {
+            if let Some(m) = &entry.uv {
+                uv |= m.created_sources_table;
+            }
+            if let Some(m) = &entry.pnpm {
+                pnpm.created_overrides_table |= m.created_overrides_table;
+                pnpm.created_pnpm_table |= m.created_pnpm_table;
+                pnpm.created_workspace_file |= m.created_workspace_file;
+                pnpm.created_workspace_overrides |= m.created_workspace_overrides;
+            }
+        }
+        (uv, pnpm)
+    }
+
+    /// Whether every entry already carries [`Self::shared_scaffold_flags`].
+    fn scaffold_flags_shared(&self) -> bool {
+        let (uv, pnpm) = self.shared_scaffold_flags();
+        self.entries.values().all(|entry| {
+            entry
+                .uv
+                .as_ref()
+                .is_none_or(|m| m.created_sources_table == uv)
+                && entry.pnpm.as_ref().is_none_or(|m| *m == pnpm)
+        })
+    }
+
+    /// Make "vendor created this table/file" a property of the shared
+    /// scaffold rather than of the one entry that happened to be wired
+    /// first (#636, #670). Each later package finds the scaffold already
+    /// there and records `false`, and revert removes an emptied scaffold
+    /// only when the entry it reverts carries the flag, so a residue was
+    /// left unless the creator was reverted last. With the flags shared,
+    /// whichever entry empties the scaffold removes it, in any order;
+    /// revert still keeps a scaffold that holds anything else.
+    pub fn share_scaffold_flags(&mut self) {
+        let (uv, pnpm) = self.shared_scaffold_flags();
+        for entry in self.entries.values_mut() {
+            if let Some(m) = entry.uv.as_mut() {
+                m.created_sources_table = uv;
+            }
+            if let Some(m) = entry.pnpm.as_mut() {
+                *m = pnpm.clone();
+            }
+        }
+    }
+
+    /// `self` with [`Self::share_scaffold_flags`] applied, copied only
+    /// when that changes something.
+    fn with_shared_scaffold_flags(state: Arc<Self>) -> Arc<Self> {
+        if state.scaffold_flags_shared() {
+            return state;
+        }
+        let mut owned = (*state).clone();
+        owned.share_scaffold_flags();
+        Arc::new(owned)
+    }
 }
 
 /// Whether `purl` is vendor-owned according to `keys`, a
@@ -594,7 +658,9 @@ fn state_path(project_root: &Path) -> PathBuf {
 pub async fn load_state(project_root: &Path) -> std::io::Result<VendorState> {
     let path = state_path(project_root);
     if let Some(state) = crate::utils::group_commit::read_value::<VendorState>(&path) {
-        return Ok((*state).clone());
+        let mut state = (*state).clone();
+        state.share_scaffold_flags();
+        return Ok(state);
     }
     match read_regular_to_bytes(&path).await {
         Ok(bytes) => parse_state(&bytes, &path),
@@ -603,9 +669,17 @@ pub async fn load_state(project_root: &Path) -> std::io::Result<VendorState> {
     }
 }
 
-/// The ledger bytes as a [`VendorState`]; see [`load_state`] for the
+/// The ledger bytes as a [`VendorState`], created-scaffold flags shared
+/// across entries ([`VendorState::share_scaffold_flags`], which also
+/// repairs a ledger written before they were); see [`load_state`] for the
 /// `mode`-tagged exception.
 fn parse_state(bytes: &[u8], path: &Path) -> std::io::Result<VendorState> {
+    let mut state = parse_state_raw(bytes, path)?;
+    state.share_scaffold_flags();
+    Ok(state)
+}
+
+fn parse_state_raw(bytes: &[u8], path: &Path) -> std::io::Result<VendorState> {
     if super::ledger_snapshots::may_have_snapshots(bytes) {
         return parse_snapshot_state(bytes, path);
     }
@@ -659,7 +733,7 @@ static STATE_MEMO: ParseMemo<VendorState> = ParseMemo::new();
 pub(crate) async fn load_state_shared(project_root: &Path) -> std::io::Result<Arc<VendorState>> {
     let path = state_path(project_root);
     if let Some(state) = crate::utils::group_commit::read_value::<VendorState>(&path) {
-        return Ok(state);
+        return Ok(VendorState::with_shared_scaffold_flags(state));
     }
     match read_regular_to_bytes(&path).await {
         Ok(bytes) => STATE_MEMO.parse(&bytes, || parse_state(&bytes, &path)),
@@ -736,7 +810,17 @@ pub async fn save_state_shared(
 /// `super::ledger_snapshots`); a ledger without one keeps its version-1
 /// form.
 fn ledger_value(state: &VendorState) -> std::io::Result<serde_json::Value> {
-    let mut ledger = serde_json::to_value(state).map_err(std::io::Error::other)?;
+    // A package wired this run beside one that created a shared scaffold
+    // records `false`; persist the shared flags so a later run's revert
+    // order cannot matter.
+    let mut ledger = if state.scaffold_flags_shared() {
+        serde_json::to_value(state)
+    } else {
+        let mut shared = state.clone();
+        shared.share_scaffold_flags();
+        serde_json::to_value(&shared)
+    }
+    .map_err(std::io::Error::other)?;
     super::ledger_snapshots::encode(&mut ledger);
     Ok(ledger)
 }
@@ -1436,6 +1520,93 @@ mod tests {
         assert!(
             !text.contains("createdWorkspaceOverrides"),
             "false bool omitted: {text}"
+        );
+    }
+
+    /// #636 / #670: the created-scaffold flags the first package recorded
+    /// are shared with every entry wiring the same files — on load (which
+    /// repairs a ledger written before) and on save — so revert order no
+    /// longer decides whether the emptied scaffold is removed.
+    #[tokio::test]
+    async fn created_scaffold_flags_are_shared_across_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let with = |flavor: &str, uv: Option<UvMeta>, pnpm: Option<PnpmMeta>| {
+            let mut e = sample_entry();
+            e.flavor = Some(flavor.into());
+            e.uv = uv;
+            e.pnpm = pnpm;
+            e
+        };
+        let uv_meta = |created| UvMeta {
+            dep_class: "direct".into(),
+            original_specifier: None,
+            created_sources_table: created,
+            lock_revision: None,
+        };
+        let creator = PnpmMeta {
+            created_overrides_table: true,
+            created_pnpm_table: true,
+            created_workspace_file: true,
+            created_workspace_overrides: false,
+        };
+        let mut state = VendorState::new();
+        for (key, entry) in [
+            ("pkg:npm/a@1.0.0", with("pnpm", None, Some(creator.clone()))),
+            (
+                "pkg:npm/b@1.0.0",
+                with("pnpm", None, Some(PnpmMeta::default())),
+            ),
+            ("pkg:pypi/c@1.0.0", with("uv", Some(uv_meta(true)), None)),
+            ("pkg:pypi/d@1.0.0", with("uv", Some(uv_meta(false)), None)),
+            ("pkg:cargo/e@1.0.0", sample_entry()),
+        ] {
+            state.entries.insert(key.into(), entry);
+        }
+
+        save_state(root, &state).await.unwrap();
+        let text = tokio::fs::read_to_string(root.join(VENDOR_STATE_REL))
+            .await
+            .unwrap();
+        assert_eq!(text.matches("\"createdSourcesTable\": true").count(), 2);
+        assert_eq!(text.matches("\"createdOverridesTable\": true").count(), 2);
+
+        // A ledger with only the creator flagged (as older releases wrote
+        // it) loads with the flags shared.
+        let mut legacy: serde_json::Value = serde_json::from_str(&text).unwrap();
+        legacy["entries"]["pkg:npm/b@1.0.0"]["pnpm"] = serde_json::json!({});
+        legacy["entries"]["pkg:pypi/d@1.0.0"]["uv"]
+            .as_object_mut()
+            .unwrap()
+            .remove("createdSourcesTable");
+        tokio::fs::write(
+            root.join(VENDOR_STATE_REL),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .await
+        .unwrap();
+        let loaded = load_state(root).await.unwrap();
+        assert_eq!(loaded.entries["pkg:npm/b@1.0.0"].pnpm, Some(creator));
+        assert!(
+            loaded.entries["pkg:pypi/d@1.0.0"]
+                .uv
+                .as_ref()
+                .unwrap()
+                .created_sources_table
+        );
+        assert!(loaded.entries["pkg:cargo/e@1.0.0"].pnpm.is_none());
+        assert!(loaded.entries["pkg:cargo/e@1.0.0"].uv.is_none());
+
+        // Nothing flagged stays unflagged.
+        let mut plain = VendorState::new();
+        plain.entries.insert(
+            "pkg:npm/a@1.0.0".into(),
+            with("pnpm", None, Some(PnpmMeta::default())),
+        );
+        plain.share_scaffold_flags();
+        assert_eq!(
+            plain.entries["pkg:npm/a@1.0.0"].pnpm,
+            Some(PnpmMeta::default())
         );
     }
 

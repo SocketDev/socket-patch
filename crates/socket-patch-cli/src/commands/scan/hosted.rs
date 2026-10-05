@@ -898,6 +898,32 @@ pub(crate) async fn run_redirect_selected(
             }
         }
     }
+    // A yarn berry pin takes its `bin:` map from the served tarball's own
+    // package.json, the way yarn builds a tarball entry (#718). Only the
+    // berry entries that carry a `bin:` map need it; a tarball that cannot
+    // be fetched or read drops its patch rather than pin an entry yarn
+    // would rewrite on the next install.
+    for dep in engine::yarn_berry_manifest_targets(&candidates, &read.files) {
+        status.set(format!(
+            "Fetching hosted package manifest for {}...",
+            dep.name
+        ));
+        match socket_patch_core::hosted::npm_manifest::fetch_hosted_npm_manifest(
+            api_client,
+            &dep.artifact_url,
+            dep.integrity.sha512.as_deref(),
+        )
+        .await
+        {
+            Ok(manifest) => {
+                python_metadata.insert(dep.artifact_url.clone(), manifest);
+            }
+            Err(detail) => {
+                unavailable_python_artifacts.insert(dep.artifact_url.clone());
+                skipped.push(engine::npm_manifest_unavailable(dep, &detail));
+            }
+        }
+    }
     status.finish();
     candidates.retain(|c| !unavailable_python_artifacts.contains(&c.dep.artifact_url));
     // The Pipfile.lock reference shape depends on the installing Pipenv
@@ -1158,6 +1184,11 @@ pub(crate) async fn run_redirect_selected(
             common,
             &confirmed,
             &rewrite.confirmed_pipenv_uuids,
+            rewrite
+                .files
+                .get("Pipfile.lock")
+                .or_else(|| done.files.get("Pipfile.lock"))
+                .map(String::as_str),
             &records,
         )
         .await
@@ -1769,16 +1800,22 @@ async fn vendored_takeover(
     };
     // The takeover refusal (if any) for one candidate: bun gates every
     // npm purl, berry and vlt only their own vendored entries, Gradle each
-    // of its own purls. Berry also runs the rewriter's per-dep grant gate (a
-    // grant without the berry cache checksum is skipped by the rewriter, so
-    // reverting first would leave the package in neither mode). A refused
-    // purl is never dispatched (see the loop), so its wiring is not a write
-    // target here.
+    // of its own purls, and a requirements.txt entry is gated on the hosted
+    // rewriter's reach (it pins only the root file, #699). Berry also runs
+    // the rewriter's per-dep grant gate (a grant without the berry cache
+    // checksum is skipped by the rewriter, so reverting first would leave
+    // the package in neither mode). A refused purl is never dispatched (see
+    // the loop), so its wiring is not a write target here.
     let takeover_refusal = |c: &Candidate,
                             entry: Option<&socket_patch_core::vendor::VendorEntry>|
      -> Option<socket_patch_core::patch::redirect::RewriteWarning> {
         if c.purl.starts_with("pkg:maven/") {
             return gradle_takeover_refusals.get(&c.purl).cloned();
+        }
+        if c.purl.starts_with("pkg:pypi/") {
+            return entry.and_then(|e| {
+                socket_patch_core::patch::redirect::preflight_requirements_takeover(e).err()
+            });
         }
         if !c.purl.starts_with("pkg:npm/") {
             return None;
@@ -2291,11 +2328,19 @@ fn describe_skip_reason(reason: &str) -> String {
             "its vendored state could not be reverted (see the warning)".into()
         }
         "python_metadata_unavailable" => "the hosted wheel's metadata could not be fetched".into(),
+        "npm_manifest_unavailable" => {
+            "the hosted tarball's package.json could not be fetched".into()
+        }
         "redirect_bun_lock_unsupported" | "redirect_bun_lockb_invalid" => {
             "the Bun lockfile blocks the vendored-to-hosted migration (see the warning)".into()
         }
         "redirect_vlt_lock_unsupported" => {
             "vlt-lock.json blocks the vendored-to-hosted migration (see the warning)".into()
+        }
+        "redirect_requirements_takeover_unreachable" => {
+            "hosted mode cannot pin it where vendored mode wired it, so it stays vendored \
+             (see the warning)"
+                .into()
         }
         "redirect_vlt_artifact_unverifiable" => {
             "vlt could not verify the hosted artifact (see the warning)".into()
@@ -4076,6 +4121,11 @@ mod tests {
         assert_eq!(
             describe_skip_reason("redirect_vlt_lock_unsupported"),
             "vlt-lock.json blocks the vendored-to-hosted migration (see the warning)"
+        );
+        assert_eq!(
+            describe_skip_reason("redirect_requirements_takeover_unreachable"),
+            "hosted mode cannot pin it where vendored mode wired it, so it stays vendored \
+             (see the warning)"
         );
         assert_eq!(describe_skip_reason("mystery"), "server status `mystery`");
         for code in [

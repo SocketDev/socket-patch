@@ -25,7 +25,7 @@ fn serial_oracle(
     rewrite_npm_lock(files, overrides, &mut result);
     plan_hosted(files, overrides, &mut result);
     rewrite_yarn_classic(files, overrides, &mut result);
-    rewrite_yarn_berry(files, overrides, &mut result);
+    rewrite_yarn_berry_with_manifests(files, overrides, python_metadata, &mut result);
     rewrite_bun_lock(files, overrides, &mut result);
     vlt::rewrite_vlt_lock(files, overrides, bun_lockb_present, &mut result);
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);

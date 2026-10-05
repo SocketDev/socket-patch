@@ -1,0 +1,7 @@
+[project]
+name = "uvp"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = ["idna==3.7", "six>=1.10; extra == 'x'"]
+[project.optional-dependencies]
+x = ["six==1.16.0"]

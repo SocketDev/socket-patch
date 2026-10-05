@@ -9,11 +9,15 @@ Pre-v3.0 entries are concise summaries derived from each tag's commit
 history. For full per-release detail, see the
 [GitHub releases page](https://github.com/SocketDev/socket-patch/releases).
 
-The `Release` workflow refuses to publish a version that does not appear
-in this file — see `scripts/release-lint.sh` (run by the `version` job in
-`.github/workflows/release.yml` and by CI on version-bump PRs). Bump PRs
-are opened by `scripts/bump-version.sh`, which rolls `[Unreleased]` over
-into the new version's section — see docs/releasing.md.
+Add entries under `[Unreleased]`; its `###` headings set the next version's
+bump (Breaking/Removed → major, Added/Changed/Deprecated → minor, anything
+else → patch). Releases are cut by the release train
+([docs/release-train/DESIGN.md](docs/release-train/DESIGN.md)) with
+`scripts/release.py`: a release candidate's `[Unreleased]` entries become a
+`## [X.Y.Z-rc.N]` section, the rolling `release-sync` PR brings each cut
+section and version back to main, and promoting an rc folds its rc sections
+into one `## [X.Y.Z]` section. `scripts/release-lint.sh` refuses to release
+a version without a non-empty section in this file.
 
 ## [Unreleased]
 
@@ -57,11 +61,6 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
   `vendor`, the unimplemented `--one-off` flags, and the three legacy
   `SOCKET_PATCH_*` environment aliases listed in the migration guide.
   `.socket/packages/` archives are no longer consumed; cleanup removes leftovers.
-- Hosted mode wires Gradle builds instead of printing a snippet. `scan --mode hosted`
-  (the default) now writes `.socket/gradle/` (an owned settings script and its
-  index), an apply line in each build's settings file, the patched GA's lock
-  entries and an existing `gradle/verification-metadata.xml`. Commit them with the
-  build. `redirect_gradle_manual_snippet` is only emitted after a refusal.
 - `list` on an empty project exits 0; `get` usage errors exit 2. Human help and
   output are grouped by task, with diagnostic codes retained in JSON and verbose
   output. Hosted JSON identifies lockfiles instead of a ledger; rollback's
@@ -81,25 +80,6 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
   existing verification metadata. `vendor --check` audits artifacts and wiring
   offline; `--local-repo` checks Maven cache conflicts and `--maven-config=none`
   selects the fallback file repository. Single-POM vendoring is unchanged.
-- Gradle 6.8+ in every mode, Groovy and Kotlin DSL, tested on Gradle 6.9.4, 7.6.6,
-  8.14.3 and 9.8.0 on macOS.
-  - `scan` reads Gradle's cache, and the read-only cache, and resolves the Gradle
-    user home the way the JVM does. It reads `~/.m2` for a Gradle-only build only
-    when the build declares `mavenLocal()`. JSON marks lock membership (`inLock`).
-  - Agent mode patches every copy a build consumes and swaps whole jars for
-    jar-member records. It refuses builds with dependency verification and reports
-    read-only cache shadowing, stale transform copies and Windows daemon locks.
-  - Hosted mode adds an owned settings script that substitutes, rejects and trips
-    on the unpatched base version (higher upstream versions still resolve). It also
-    rewrites lock files and verification metadata, refuses what it cannot pin, and
-    restores without the network. It uses the suffixed Gradle module metadata when
-    the patch service serves it, and warns
-    `redirect_gradle_module_metadata_unavailable` when it does not.
-  - VEX re-hashes every copy, Gradle hash directories and derived caches included,
-    before it attests.
-
-  New codes are listed in [CLI_CONTRACT.md](crates/socket-patch-cli/CLI_CONTRACT.md#gradle-builds-v50);
-  see [Gradle](docs/ecosystems.md#gradle).
 - `socket.yml` patch policy for paths, ecosystems, packages, severity, and per-run
   limits. `scan --package`, `--min-severity`, `--max-new-patches`, and
   `--no-socket-yml` support targeted and gradual rollout. Already-patched packages
@@ -126,30 +106,20 @@ limits, and required install commands.
 
 ### Fixed
 
-- `scan` reported success with 0 packages on a resolved Gradle project because it
-  never read Gradle's cache (#349).
-- Agent `apply` in a Gradle-only project patched the `~/.m2` copy Gradle never
-  reads, and VEX attested it. It now patches the Gradle cache copies the build
-  loads and refuses an `~/.m2`-only install (`gradle_build_ignores_m2`) (#551).
-  Records keyed by jar members, which `vendor` already accepted, now apply in agent
-  mode (#264).
-- Hosted Gradle was not fail-closed. A transitive request for the base version won
-  conflict resolution (#347), the snippet was always Groovy (#348), and dependency
-  locking built the unpatched jar on every Gradle major (#396). The owned hosted
-  script and lock rewrites replace the snippet.
-- Vendored Gradle fixes:
-  - A root with both `pom.xml` and a Gradle build now wires both instead of leaving
-    the Gradle build unpatched (#395).
-  - Running from a subproject is refused (`not_build_root`) instead of wiring a
-    nested settings file (#428).
-  - `core.autocrlf` checkouts pass `--check` and revert cleanly (#429).
-  - `exclusiveContent` conflicts in subproject scripts and convention plugins are
-    refused (#461).
-  - pgp-only verification entries get a checksum (#487).
-  - Version ranges keep resolving the vendored version through a derived
-    `maven-metadata.xml` (#511).
-  - Declared classifier jars are vendored or refused, and IDE sources are kept
-    (#533).
+- `scan --vex` in hosted mode no longer attests an npm patch as
+  `not_affected` when `package-lock.json` also lists a bundled copy of the
+  same `name@version` (`inBundle`, or `bundled` in a v1 lock). npm unpacks
+  that copy from its parent's tarball, so it stays unpatched; the run
+  already warned `redirect_npm_bundled_instance_skipped` and now leaves the
+  patch out of its attestation, like a standalone `vex` run (#325). When a
+  `packages` map exists, stale bundled flags in the legacy `dependencies`
+  mirror do not suppress an attestation for the actual install tree.
+- `vex` no longer attests an npm or Bun patch as `not_affected` while a
+  second entry for the same `name@version` in the same lockfile still
+  resolves from the registry (for example a workspace member added after
+  vendoring). That copy installs unpatched, so the patch is now reported
+  as contested. `vendor --check` reports the same lockfile entry as drift
+  (#588).
 - Global mode (`-g`) finds npm, yarn, pnpm, bun, RubyGems and Composer on
   Windows, where they install as `.cmd` / `.bat` shims, instead of reporting
   an empty scan. The yarn and npm-family global lookups no longer run from the
@@ -254,6 +224,13 @@ limits, and required install commands.
   `virtualStoreDir`, instead of reporting them `package_not_installed` (#359,
   #362). A store outside the project, such as pnpm's global virtual store, is
   shared with other projects and is still not patched in place.
+- Agent mode and `vex` find packages installed under pnpm's `modulesDir`
+  (`modulesDir:` in `pnpm-workspace.yaml`, or `modules-dir` in `.npmrc`).
+  From pnpm 10.12 the virtual store moves there (`<modulesDir>/.pnpm`), so
+  `apply` exited 0 with the package unpatched as "not installed", and
+  hosted `vex` attested `not_affected` over the unpatched install. Hosted
+  `vex` also no longer attests a pinned npm package the crawler cannot see
+  because pnpm keeps the installed store outside the project (#661, #696).
 - npm locks keep their own layout when edited. `scan --mode hosted`,
   `scan --mode vendored`, `rollback` and `vendor --revert`
   re-serialized `package-lock.json` / `npm-shrinkwrap.json` with LF line
@@ -284,6 +261,10 @@ limits, and required install commands.
   half-open connection. A connect now fails after 10 s, and a connection that
   sends nothing for 60 s fails as a network error. Downloads that keep
   streaming are not cut off (#570).
+- Patch blob and diff downloads stream straight to the `.socket` cache instead
+  of being held in memory whole first, so a large patch artifact no longer
+  costs its full size in RAM during `apply`, `get`, `repair` or `rollback`
+  (#571).
 
 ### Maintenance
 

@@ -3846,6 +3846,77 @@ mod tests {
         assert!(!result.success);
     }
 
+    /// #626: agent apply must not write through a `node_modules` link to
+    /// first-party source (a workspace member / `file:` dir, scoped or not,
+    /// or an `npm link` target outside the project). The user's fork does
+    /// not match the patch's beforeHash, which the default policy would
+    /// otherwise overwrite. Refused for every policy, dry run included, and
+    /// the fork keeps its bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_refuses_node_modules_link_to_first_party_source() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        let nm = ws.join("node_modules");
+        std::fs::create_dir_all(nm.join("@acme")).unwrap();
+        let member = ws.join("packages").join("left-pad");
+        let scoped = ws.join("packages").join("util");
+        let checkout = root.path().join("dev").join("left-pad");
+        let fork = b"module.exports = 'first-party fork';\n".to_vec();
+        for d in [&member, &scoped, &checkout] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("index.js"), &fork).unwrap();
+        }
+        symlink("../packages/left-pad", nm.join("left-pad")).unwrap();
+        symlink("../../packages/util", nm.join("@acme").join("util")).unwrap();
+        let linked_nm = root.path().join("app").join("node_modules");
+        std::fs::create_dir_all(&linked_nm).unwrap();
+        symlink(&checkout, linked_nm.join("left-pad")).unwrap();
+
+        let upstream = b"upstream original".to_vec();
+        let patched = b"upstream PATCHED".to_vec();
+        let blobs = root.path().join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let after_hash = compute_git_sha256_from_bytes(&patched);
+        std::fs::write(blobs.join(&after_hash), &patched).unwrap();
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(&upstream),
+                after_hash,
+            },
+        );
+        let sources = PatchSources::blobs_only(&blobs);
+        for (purl, pkg, real) in [
+            ("pkg:npm/left-pad@1.3.0", nm.join("left-pad"), &member),
+            ("pkg:npm/%40acme/util@1.0.0", nm.join("@acme/util"), &scoped),
+            (
+                "pkg:npm/left-pad@1.3.0",
+                linked_nm.join("left-pad"),
+                &checkout,
+            ),
+        ] {
+            for policy in [MismatchPolicy::Warn, MismatchPolicy::Force] {
+                for dry_run in [true, false] {
+                    let result =
+                        apply_package_patch(purl, &pkg, &files, &sources, None, dry_run, policy)
+                            .await;
+                    assert!(!result.success, "{}: must refuse", pkg.display());
+                    let err = result.error.unwrap_or_default();
+                    assert!(
+                        err.contains(crate::patch::shared_store::LINKED_SOURCE_REFUSAL_MARKER),
+                        "{}: {err}",
+                        pkg.display()
+                    );
+                    assert!(result.files_patched.is_empty());
+                }
+            }
+            assert_eq!(std::fs::read(real.join("index.js")).unwrap(), fork);
+        }
+    }
+
     /// A per-project pnpm store reached through a symlink is still patched.
     #[cfg(unix)]
     #[tokio::test]

@@ -17,6 +17,7 @@
 pub mod engine;
 pub mod guidance;
 pub mod memory;
+pub mod npm_manifest;
 pub mod render;
 pub mod sbt_reads;
 pub mod vlt;
