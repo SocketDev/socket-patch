@@ -65,12 +65,46 @@ pub async fn remove_file_and_prune(path: &Path, stop_dir: &Path) -> std::io::Res
 /// `<eco>/` and `vendor/` levels when that was their last unit. A removal
 /// error propagates unchanged (callers surface it verbatim) and skips the
 /// prune — the tree is still there.
+///
+/// Refuses (before deleting anything) when `dir`, or any level between it
+/// and `stop_dir`, is a symlink or junction: socket-patch never creates
+/// links under `.socket/`, so a linked level points at a tree it does not
+/// own — another project's vendor store, say — and deleting through it
+/// would destroy that tree.
 pub async fn remove_tree_and_prune(dir: &Path, stop_dir: &Path) -> std::io::Result<()> {
+    if let Some(link) = linked_level(dir, stop_dir).await {
+        return Err(std::io::Error::other(format!(
+            "refusing to delete {}: {} is a symlink, and its target is not socket-patch's to remove",
+            dir.display(),
+            link.display()
+        )));
+    }
     crate::patch::copy_tree::remove_tree(dir).await?;
     if let Some(parent) = dir.parent() {
         prune_empty_dirs(parent, stop_dir).await;
     }
     Ok(())
+}
+
+/// The outermost of `dir` and its ancestors strictly below `stop_dir` that
+/// is a symlink (lstat), or `None`. Only `dir` itself is checked when it is
+/// not under `stop_dir`. Levels at or above `stop_dir` (the project path
+/// itself, `/tmp -> /private/tmp`) are the user's business.
+async fn linked_level<'a>(dir: &'a Path, stop_dir: &Path) -> Option<&'a Path> {
+    let levels: Vec<&Path> = if dir.starts_with(stop_dir) {
+        dir.ancestors().take_while(|a| *a != stop_dir).collect()
+    } else {
+        vec![dir]
+    };
+    for level in levels.into_iter().rev() {
+        if tokio::fs::symlink_metadata(level)
+            .await
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return Some(level);
+        }
+    }
+    None
 }
 
 /// Persist a committed JSON ledger: pretty-printed with a trailing newline
@@ -249,6 +283,62 @@ mod tests {
         remove_tree_and_prune(&other, &socket).await.unwrap();
         assert!(!socket.join("vendor").exists());
         assert!(socket.exists());
+    }
+
+    /// #664: an eco dir linked to a store another project shares. The
+    /// unit removal must refuse before deleting anything at the target,
+    /// and also when the unit dir itself is the link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_tree_and_prune_never_deletes_through_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        tokio::fs::create_dir_all(shared.join("uuid"))
+            .await
+            .unwrap();
+        tokio::fs::write(shared.join("uuid/a.tgz"), b"x")
+            .await
+            .unwrap();
+
+        let socket = tmp.path().join("p/.socket");
+        tokio::fs::create_dir_all(socket.join("vendor"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&shared, socket.join("vendor/npm")).unwrap();
+        let err = remove_tree_and_prune(&socket.join("vendor/npm/uuid"), &socket)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+        assert!(shared.join("uuid/a.tgz").is_file(), "target untouched");
+        assert!(socket.join("vendor/npm").is_symlink(), "link kept");
+
+        let socket2 = tmp.path().join("q/.socket");
+        tokio::fs::create_dir_all(socket2.join("vendor/npm"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(shared.join("uuid"), socket2.join("vendor/npm/uuid")).unwrap();
+        remove_tree_and_prune(&socket2.join("vendor/npm/uuid"), &socket2)
+            .await
+            .unwrap_err();
+        assert!(shared.join("uuid/a.tgz").is_file(), "target untouched");
+    }
+
+    /// Links at or above `stop_dir` (a project reached through a linked
+    /// path, `/tmp -> /private/tmp`) are not socket-patch's concern.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_tree_and_prune_allows_a_linked_project_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        tokio::fs::create_dir_all(real.join(".socket/vendor/npm/uuid"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+        let socket = tmp.path().join("link/.socket");
+        remove_tree_and_prune(&socket.join("vendor/npm/uuid"), &socket)
+            .await
+            .unwrap();
+        assert!(!real.join(".socket/vendor").exists());
     }
 
     #[derive(Serialize)]

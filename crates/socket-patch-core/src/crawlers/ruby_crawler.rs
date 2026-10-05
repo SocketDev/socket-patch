@@ -48,12 +48,14 @@ impl RubyCrawler {
             std::env::var_os("BUNDLE_PATH").as_deref(),
             std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
             ambient_home().as_deref(),
+            ambient_global_config_unless_ignored(&options.cwd).as_deref(),
         )
         .await
     }
 
     /// [`Self::get_gem_paths`] with the ambient `BUNDLE_PATH` /
-    /// `BUNDLE_APP_CONFIG` / home environment passed explicitly, so tests
+    /// `BUNDLE_APP_CONFIG` / home environment and the global bundler config
+    /// file ([`bundler_global_config_file`]) passed explicitly, so tests
     /// stay hermetic on machines where bundler is configured. (`gem env`
     /// still shells out; PATH-swapping tests keep covering that seam.)
     pub async fn get_gem_paths_with_env(
@@ -62,12 +64,17 @@ impl RubyCrawler {
         bundle_path_env: Option<&OsStr>,
         app_config_env: Option<&OsStr>,
         home_env: Option<&OsStr>,
+        global_config: Option<&Path>,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
-        Ok(
-            Self::gem_paths_and_discovery(options, bundle_path_env, app_config_env, home_env)
-                .await
-                .0,
+        Ok(Self::gem_paths_and_discovery(
+            options,
+            bundle_path_env,
+            app_config_env,
+            home_env,
+            global_config,
         )
+        .await
+        .0)
     }
 
     /// The gem paths plus the local-mode bundle-store discovery they came
@@ -79,6 +86,7 @@ impl RubyCrawler {
         bundle_path_env: Option<&OsStr>,
         app_config_env: Option<&OsStr>,
         home_env: Option<&OsStr>,
+        global_config: Option<&Path>,
     ) -> (Vec<PathBuf>, Option<BundleStoreDiscovery>) {
         if options.global || options.global_prefix.is_some() {
             if let Some(ref custom) = options.global_prefix {
@@ -93,6 +101,7 @@ impl RubyCrawler {
             bundle_path_env,
             app_config_env,
             home_env,
+            global_config,
         )
         .await;
         let mut paths = discovery.stores.clone();
@@ -147,6 +156,7 @@ impl RubyCrawler {
             std::env::var_os("BUNDLE_PATH").as_deref(),
             std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
             ambient_home().as_deref(),
+            ambient_global_config_unless_ignored(&options.cwd).as_deref(),
         )
         .await;
 
@@ -283,7 +293,7 @@ impl RubyCrawler {
         bundle_path_env: Option<&OsStr>,
         app_config_env: Option<&OsStr>,
     ) -> Vec<PathBuf> {
-        Self::discover_bundle_stores_with_env(cwd, bundle_path_env, app_config_env, None)
+        Self::discover_bundle_stores_with_env(cwd, bundle_path_env, app_config_env, None, None)
             .await
             .stores
     }
@@ -304,7 +314,11 @@ impl RubyCrawler {
     ///    value resolves against the project root, matching
     ///    `Bundler.bundle_path`; a leading `~` expands against home).
     ///    Trusted as-is: it is the user's own environment.
-    /// 3. `<cwd>/vendor/bundle` — the default deployment/`--path` location.
+    /// 3. the `BUNDLE_PATH:` entry of the global config file
+    ///    ([`bundler_global_config_file`], what `bundle config set --global
+    ///    path <dir>` records) — resolved like the env var, and trusted
+    ///    like it: it is the user's own machine state, not project input.
+    /// 4. `<cwd>/vendor/bundle` — the default deployment/`--path` location.
     ///
     /// The explicit roots can point anywhere (a machine-wide `BUNDLE_PATH`
     /// export must not pull another project's gem store into a non-Ruby
@@ -323,6 +337,7 @@ impl RubyCrawler {
         bundle_path_env: Option<&OsStr>,
         app_config_env: Option<&OsStr>,
         home_env: Option<&OsStr>,
+        global_config: Option<&Path>,
     ) -> BundleStoreDiscovery {
         let home = home_env.map(Path::new);
         let default_root = cwd.join("vendor").join("bundle");
@@ -343,6 +358,27 @@ impl RubyCrawler {
             }
             if let Some(v) = bundle_path_env.filter(|v| !v.is_empty()) {
                 roots.push(resolve_bundle_path(cwd, Path::new(v), home));
+            }
+            // The global config's path (`bundle config set --global path`)
+            // is the user's own machine state, so it is trusted like the
+            // env var: no containment guard. Bundler's `Settings#path`
+            // takes the FIRST tier that sets `path`, `path.system`, or
+            // `disable_shared_gems`, so a local or env setting shadows it
+            // entirely — even an empty env
+            // `BUNDLE_PATH`, which adds no root above but still stops
+            // Bundler (`explicit_path` is `""`). An env
+            // `BUNDLE_PATH__SYSTEM` or `BUNDLE_DISABLE_SHARED_GEMS` already
+            // dropped `global_config`, see
+            // [`global_path_config_unless_env_path_settings`].
+            let shadowed =
+                bundle_path_env.is_some() || Self::app_config_sets_path(cwd, app_config_env).await;
+            if !shadowed {
+                if let Some(value) = read_global_config(global_config, false)
+                    .await
+                    .and_then(|text| parse_bundle_config_path(&text))
+                {
+                    roots.push(resolve_bundle_path(cwd, Path::new(&value), home));
+                }
             }
         }
         roots.push(default_root.clone());
@@ -384,6 +420,7 @@ impl RubyCrawler {
             std::env::var_os("BUNDLE_PATH").as_deref(),
             std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
             ambient_home().as_deref(),
+            ambient_global_config_unless_ignored(cwd).as_deref(),
         )
         .await
     }
@@ -438,6 +475,25 @@ impl RubyCrawler {
             paths.push(flat_gems);
         }
         paths
+    }
+
+    /// Whether the app config file sets `path`, `path.system`, or
+    /// `disable_shared_gems` at all, including an empty string — any one
+    /// makes bundler stop at that tier (`Settings#path`), so the global
+    /// config's path never applies.
+    async fn app_config_sets_path(cwd: &Path, app_config_env: Option<&OsStr>) -> bool {
+        let config = bundler_app_config_dir(cwd, app_config_env).join("config");
+        crate::utils::fs::read_regular_to_string(&config)
+            .await
+            .is_ok_and(|text| {
+                [
+                    "BUNDLE_PATH",
+                    "BUNDLE_PATH__SYSTEM",
+                    "BUNDLE_DISABLE_SHARED_GEMS",
+                ]
+                .iter()
+                .any(|key| bundle_config_setting_including_empty(&text, key).is_some())
+            })
     }
 
     /// The `BUNDLE_PATH` recorded in bundler's app config file — the value
@@ -953,22 +1009,33 @@ pub async fn bundler_loaded_manifest(root: &Path) -> crate::formats::gem::manife
         std::env::var_os("BUNDLE_GEMFILE").as_deref(),
         std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
         bundler_ignores_config(),
+        ambient_bundler_global_config_file(root).as_deref(),
     )
     .await
 }
 
 /// [`bundler_loaded_manifest`] with the environment passed explicitly (hermetic
-/// tests). `ignore_config` is [`bundler_ignores_config`].
+/// tests). `ignore_config` is [`bundler_ignores_config`]; `global_config` is
+/// [`bundler_global_config_file`].
 pub async fn bundler_loaded_manifest_with_env(
     root: &Path,
     gemfile_env: Option<&OsStr>,
     app_config_env: Option<&OsStr>,
     ignore_config: bool,
+    global_config: Option<&Path>,
 ) -> crate::formats::gem::manifest::LoadedManifest {
     let config_value = read_app_config(root, app_config_env, ignore_config)
         .await
         .and_then(|text| crate::formats::gem::manifest::config_gemfile(&text));
-    crate::formats::gem::manifest::classify(root, gemfile_env, config_value.as_deref())
+    let global_value = read_global_config(global_config, ignore_config)
+        .await
+        .and_then(|text| crate::formats::gem::manifest::config_gemfile(&text));
+    crate::formats::gem::manifest::classify(
+        root,
+        gemfile_env,
+        config_value.as_deref(),
+        global_value.as_deref(),
+    )
 }
 
 /// The Bundler mirror setting that captures one of the patch-registry
@@ -1037,6 +1104,93 @@ async fn read_app_config(
     crate::utils::fs::read_regular_to_string(&config).await.ok()
 }
 
+/// The global config file's text (see [`bundler_global_config_file`]), or
+/// `None` when there is none, it is missing or unreadable, or
+/// `ignore_config` is set (bundler's `load_config` skips every file then).
+async fn read_global_config(global_config: Option<&Path>, ignore_config: bool) -> Option<String> {
+    if ignore_config {
+        return None;
+    }
+    crate::utils::fs::read_regular_to_string(global_config?)
+        .await
+        .ok()
+}
+
+/// Bundler's global (per-user) config file, following
+/// `Bundler::Settings#global_config_file` exactly: `$BUNDLE_CONFIG`, else
+/// `$BUNDLE_USER_CONFIG`, else `$BUNDLE_USER_HOME/config`, else
+/// `~/.bundle/config` (each env value only when non-empty). This is the
+/// file `bundle config set --global …` writes, and bundler consults it
+/// BELOW the local app config and the environment (`Bundler::Settings`
+/// priority: local → env → global → default). A relative value is read
+/// against the project root, where bundler runs.
+///
+/// Unlike the app config file it is the user's own machine state, not
+/// project input, so its values are trusted like the environment.
+pub(crate) fn bundler_global_config_file(
+    root: &Path,
+    bundle_config_env: Option<&OsStr>,
+    user_config_env: Option<&OsStr>,
+    user_home_env: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    let non_empty = |v: Option<&OsStr>| v.filter(|v| !v.is_empty()).map(PathBuf::from);
+    let file = non_empty(bundle_config_env)
+        .or_else(|| non_empty(user_config_env))
+        .or_else(|| non_empty(user_home_env).map(|h| h.join("config")))
+        .or_else(|| non_empty(home).map(|h| h.join(".bundle").join("config")))?;
+    Some(if file.is_absolute() {
+        file
+    } else {
+        root.join(file)
+    })
+}
+
+/// [`ambient_bundler_global_config_file`], or `None` under
+/// `BUNDLE_IGNORE_CONFIG` or when the environment sets `path.system` or
+/// `disable_shared_gems` — for the install-root probe, which takes no
+/// `ignore_config` flag of its own.
+fn ambient_global_config_unless_ignored(root: &Path) -> Option<PathBuf> {
+    if bundler_ignores_config() {
+        None
+    } else {
+        global_path_config_unless_env_path_settings(
+            ambient_bundler_global_config_file(root),
+            std::env::var_os("BUNDLE_PATH__SYSTEM").as_deref(),
+            std::env::var_os("BUNDLE_DISABLE_SHARED_GEMS").as_deref(),
+        )
+    }
+}
+
+/// The global config file for the install-root probe, or `None` when the
+/// env tier sets `path.system` or `disable_shared_gems`. Bundler's
+/// `Settings#path` stops at the first tier that sets either flag or `path`,
+/// and the env tier sits above the global one, so any flag value (even
+/// `"false"` or empty) shadows a global `path` — the env `BUNDLE_PATH` part
+/// of that rule is applied in [`RubyCrawler::discover_bundle_stores_with_env`].
+fn global_path_config_unless_env_path_settings(
+    global_config: Option<PathBuf>,
+    path_system_env: Option<&OsStr>,
+    disable_shared_gems_env: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if path_system_env.is_some() || disable_shared_gems_env.is_some() {
+        None
+    } else {
+        global_config
+    }
+}
+
+/// [`bundler_global_config_file`] for the ambient environment.
+pub(crate) fn ambient_bundler_global_config_file(root: &Path) -> Option<PathBuf> {
+    bundler_global_config_file(
+        root,
+        std::env::var_os("BUNDLE_CONFIG").as_deref(),
+        std::env::var_os("BUNDLE_USER_CONFIG").as_deref(),
+        std::env::var_os("BUNDLE_USER_HOME").as_deref(),
+        ambient_home().as_deref(),
+    )
+}
+
 /// Bundler's app-config dir for `root`, following `Bundler.app_config_path`
 /// exactly: `$BUNDLE_APP_CONFIG` when set (a relative value resolves against
 /// the project root, NOT the process cwd), else `<root>/.bundle` — e.g. the
@@ -1066,6 +1220,7 @@ pub async fn bundler_app_cache_dir(root: &Path) -> PathBuf {
         std::env::var_os("BUNDLE_CACHE_PATH").as_deref(),
         std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
         bundler_ignores_config(),
+        ambient_bundler_global_config_file(root).as_deref(),
     )
     .await
 }
@@ -1074,25 +1229,34 @@ pub async fn bundler_app_cache_dir(root: &Path) -> PathBuf {
 /// (hermetic tests). The `cache_path` setting follows `Bundler::Settings`
 /// priority like every other key: the app config file's
 /// `BUNDLE_CACHE_PATH:` (`bundle config set --local cache_path …`) first,
-/// then the `BUNDLE_CACHE_PATH` environment variable. A relative value is
+/// then the `BUNDLE_CACHE_PATH` environment variable, then the global
+/// config file's `BUNDLE_CACHE_PATH:` (`bundle config set --global
+/// cache_path …`, see [`bundler_global_config_file`]). A relative value is
 /// read against the project root; an absolute one stands alone (bundler
 /// `Pathname#join`s it onto the root). The result is only ever READ (a
 /// committed archive is hashed and named in a warning), so unlike a
 /// config-sourced `BUNDLE_PATH` it needs no containment: a value that
 /// points outside the project names exactly the file bundler installs from.
-/// With `ignore_config` ([`bundler_ignores_config`]) the file is skipped and
-/// only the environment and the default count.
+/// With `ignore_config` ([`bundler_ignores_config`]) both files are skipped
+/// and only the environment and the default count.
 pub async fn bundler_app_cache_dir_with_env(
     root: &Path,
     cache_env: Option<&OsStr>,
     app_config_env: Option<&OsStr>,
     ignore_config: bool,
+    global_config: Option<&Path>,
 ) -> PathBuf {
-    let configured = read_app_config(root, app_config_env, ignore_config)
+    let mut configured = read_app_config(root, app_config_env, ignore_config)
         .await
         .and_then(|text| bundle_config_setting(&text, "BUNDLE_CACHE_PATH"))
         .map(PathBuf::from)
         .or_else(|| cache_env.filter(|v| !v.is_empty()).map(PathBuf::from));
+    if configured.is_none() {
+        configured = read_global_config(global_config, ignore_config)
+            .await
+            .and_then(|text| bundle_config_setting(&text, "BUNDLE_CACHE_PATH"))
+            .map(PathBuf::from);
+    }
     match configured {
         // Component-wise, so `vendor/gems` uses the native separator.
         Some(value) => root.join(normalize_lexically(&value).unwrap_or(value)),
@@ -1212,11 +1376,19 @@ fn parse_bundle_config_path(contents: &str) -> Option<String> {
 /// empty value counts as unset. The colon must follow the key directly, so
 /// `BUNDLE_PATH__SYSTEM:` never matches `BUNDLE_PATH`.
 pub(crate) fn bundle_config_setting(contents: &str, key: &str) -> Option<String> {
+    bundle_config_setting_including_empty(contents, key).filter(|value| !value.is_empty())
+}
+
+/// Like [`bundle_config_setting`], but retains an explicitly empty string:
+/// Bundler's setting tiers stop at a present value even when it names no
+/// path. Callers that decide whether a lower tier applies need presence,
+/// not just a non-empty value.
+pub(crate) fn bundle_config_setting_including_empty(contents: &str, key: &str) -> Option<String> {
     let mut found = None;
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix(key).and_then(|r| r.strip_prefix(':')) {
             let v = unquote_bundle_config_value(rest);
-            found = (!v.is_empty()).then(|| v.to_string());
+            found = Some(v.to_string());
         }
     }
     found
@@ -1260,7 +1432,7 @@ mod tests {
             "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n",
         )
         .unwrap();
-        let m = bundler_loaded_manifest_with_env(dir.path(), None, None, false).await;
+        let m = bundler_loaded_manifest_with_env(dir.path(), None, None, false, None).await;
         assert!(matches!(
             m,
             crate::formats::gem::manifest::LoadedManifest::Unsupported {
@@ -1274,11 +1446,12 @@ mod tests {
             None,
             Some(std::ffi::OsStr::new("elsewhere")),
             false,
+            None,
         )
         .await;
         assert_eq!(m, crate::formats::gem::manifest::LoadedManifest::Default);
         // BUNDLE_IGNORE_CONFIG: bundler reads no config file at all.
-        let m = bundler_loaded_manifest_with_env(dir.path(), None, None, true).await;
+        let m = bundler_loaded_manifest_with_env(dir.path(), None, None, true, None).await;
         assert_eq!(m, crate::formats::gem::manifest::LoadedManifest::Default);
     }
 
@@ -1299,6 +1472,7 @@ mod tests {
             Some(std::ffi::OsStr::new("Gemfile")),
             None,
             false,
+            None,
         )
         .await;
         assert_eq!(
@@ -1318,18 +1492,19 @@ mod tests {
         let root = dir.path();
         let default = root.join("vendor").join("cache");
         assert_eq!(
-            bundler_app_cache_dir_with_env(root, None, None, false).await,
+            bundler_app_cache_dir_with_env(root, None, None, false, None).await,
             default
         );
         // The environment alone moves it.
         let env = std::ffi::OsStr::new("vendor/env-gems");
         assert_eq!(
-            bundler_app_cache_dir_with_env(root, Some(env), None, false).await,
+            bundler_app_cache_dir_with_env(root, Some(env), None, false, None).await,
             root.join("vendor").join("env-gems")
         );
         // An empty value is unset.
         assert_eq!(
-            bundler_app_cache_dir_with_env(root, Some(std::ffi::OsStr::new("")), None, false).await,
+            bundler_app_cache_dir_with_env(root, Some(std::ffi::OsStr::new("")), None, false, None)
+                .await,
             default
         );
         // `bundle config set --local cache_path vendor/gems` outranks it.
@@ -1341,11 +1516,11 @@ mod tests {
         .unwrap();
         let configured = root.join("vendor").join("gems");
         assert_eq!(
-            bundler_app_cache_dir_with_env(root, None, None, false).await,
+            bundler_app_cache_dir_with_env(root, None, None, false, None).await,
             configured
         );
         assert_eq!(
-            bundler_app_cache_dir_with_env(root, Some(env), None, false).await,
+            bundler_app_cache_dir_with_env(root, Some(env), None, false, None).await,
             configured
         );
         // BUNDLE_APP_CONFIG moves the config file: the env value applies.
@@ -1355,17 +1530,18 @@ mod tests {
                 Some(env),
                 Some(std::ffi::OsStr::new("elsewhere")),
                 false,
+                None,
             )
             .await,
             root.join("vendor").join("env-gems")
         );
         // BUNDLE_IGNORE_CONFIG skips the file: the env value, else the default.
         assert_eq!(
-            bundler_app_cache_dir_with_env(root, Some(env), None, true).await,
+            bundler_app_cache_dir_with_env(root, Some(env), None, true, None).await,
             root.join("vendor").join("env-gems")
         );
         assert_eq!(
-            bundler_app_cache_dir_with_env(root, None, None, true).await,
+            bundler_app_cache_dir_with_env(root, None, None, true, None).await,
             default
         );
         // An absolute value stands alone.
@@ -1376,7 +1552,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            bundler_app_cache_dir_with_env(root, None, None, false).await,
+            bundler_app_cache_dir_with_env(root, None, None, false, None).await,
             abs
         );
     }
@@ -1495,11 +1671,11 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            bundler_loaded_manifest_with_env(root, None, Some(OsStr::new("")), false).await,
+            bundler_loaded_manifest_with_env(root, None, Some(OsStr::new("")), false, None).await,
             crate::formats::gem::manifest::LoadedManifest::Unsupported { .. }
         ));
         assert_eq!(
-            bundler_app_cache_dir_with_env(root, None, Some(OsStr::new("")), false).await,
+            bundler_app_cache_dir_with_env(root, None, Some(OsStr::new("")), false, None).await,
             root.join("root-cache")
         );
         assert_eq!(bundler_app_config_dir(root, Some(OsStr::new(""))), root);
@@ -2202,6 +2378,337 @@ mod tests {
         );
     }
 
+    /// #577: the global config file follows `Settings#global_config_file`:
+    /// `$BUNDLE_CONFIG`, else `$BUNDLE_USER_CONFIG`, else
+    /// `$BUNDLE_USER_HOME/config`, else `~/.bundle/config`; empty values
+    /// are unset and a relative value is read against the project root.
+    #[test]
+    fn global_config_file_follows_bundler_lookup() {
+        let root = Path::new("/proj");
+        let os = |s: &'static str| Some(std::ffi::OsStr::new(s));
+        let abs = |s: &str| std::path::absolute(s).unwrap();
+        let home = abs("/home/u");
+        let home_os = Some(home.as_os_str());
+        assert_eq!(
+            bundler_global_config_file(root, None, None, None, home_os),
+            Some(home.join(".bundle").join("config"))
+        );
+        let user_home = abs("/bh");
+        assert_eq!(
+            bundler_global_config_file(root, None, None, Some(user_home.as_os_str()), home_os),
+            Some(user_home.join("config"))
+        );
+        let user_config = abs("/cfg/bundle");
+        assert_eq!(
+            bundler_global_config_file(
+                root,
+                None,
+                Some(user_config.as_os_str()),
+                Some(user_home.as_os_str()),
+                home_os
+            ),
+            Some(user_config.clone())
+        );
+        let legacy = abs("/legacy/config");
+        assert_eq!(
+            bundler_global_config_file(
+                root,
+                Some(legacy.as_os_str()),
+                Some(user_config.as_os_str()),
+                None,
+                home_os
+            ),
+            Some(legacy)
+        );
+        // Empty values are unset, and nothing set means no global file.
+        assert_eq!(
+            bundler_global_config_file(root, os(""), os(""), os(""), home_os),
+            Some(home.join(".bundle").join("config"))
+        );
+        assert_eq!(
+            bundler_global_config_file(root, None, None, None, os("")),
+            None
+        );
+        // A relative value is read against the project root.
+        assert_eq!(
+            bundler_global_config_file(root, None, os("cfg/bundle"), None, None),
+            Some(root.join("cfg/bundle"))
+        );
+    }
+
+    /// #577: `bundle config set --global cache_path` moves the cache dir,
+    /// below the local config and the environment.
+    #[tokio::test]
+    async fn app_cache_dir_reads_the_global_config_below_local_and_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let global = dir.path().join("global-config");
+        std::fs::write(&global, "---\nBUNDLE_CACHE_PATH: \"vendor/gems\"\n").unwrap();
+        let g = Some(global.as_path());
+        assert_eq!(
+            bundler_app_cache_dir_with_env(&root, None, None, false, g).await,
+            root.join("vendor").join("gems")
+        );
+        // The environment outranks it.
+        let env = std::ffi::OsStr::new("vendor/env-gems");
+        assert_eq!(
+            bundler_app_cache_dir_with_env(&root, Some(env), None, false, g).await,
+            root.join("vendor").join("env-gems")
+        );
+        // So does the local app config.
+        std::fs::create_dir(root.join(".bundle")).unwrap();
+        std::fs::write(
+            root.join(".bundle/config"),
+            "---\nBUNDLE_CACHE_PATH: \"vendor/local\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            bundler_app_cache_dir_with_env(&root, None, None, false, g).await,
+            root.join("vendor").join("local")
+        );
+        // BUNDLE_IGNORE_CONFIG skips the global file too.
+        std::fs::remove_file(root.join(".bundle/config")).unwrap();
+        assert_eq!(
+            bundler_app_cache_dir_with_env(&root, None, None, true, g).await,
+            root.join("vendor").join("cache")
+        );
+        // A missing global file is no setting.
+        let missing = dir.path().join("missing");
+        assert_eq!(
+            bundler_app_cache_dir_with_env(&root, None, None, false, Some(&missing)).await,
+            root.join("vendor").join("cache")
+        );
+    }
+
+    /// #577: a global `gemfile` setting is the third tier: below the local
+    /// config and the environment, and refused like a local one when it
+    /// names a manifest socket-patch does not wire.
+    #[tokio::test]
+    async fn loaded_manifest_reads_the_global_config_below_local_and_env() {
+        use crate::formats::gem::manifest::{GemfileSetting, LoadedManifest};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let global = dir.path().join("global-config");
+        std::fs::write(&global, "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n").unwrap();
+        let g = Some(global.as_path());
+        let m = bundler_loaded_manifest_with_env(&root, None, None, false, g).await;
+        assert_eq!(
+            m,
+            LoadedManifest::Unsupported {
+                value: "Gemfile.next".into(),
+                by: GemfileSetting::GlobalConfig
+            }
+        );
+        let detail = m.unsupported_detail().unwrap();
+        assert!(
+            detail.contains("bundle config unset --global gemfile"),
+            "{detail}"
+        );
+        // The environment outranks it.
+        assert_eq!(
+            bundler_loaded_manifest_with_env(
+                &root,
+                Some(std::ffi::OsStr::new("Gemfile")),
+                None,
+                false,
+                g
+            )
+            .await,
+            LoadedManifest::Configured {
+                manifest: "Gemfile",
+                by: GemfileSetting::Env
+            }
+        );
+        // So does the local app config.
+        std::fs::create_dir(root.join(".bundle")).unwrap();
+        std::fs::write(
+            root.join(".bundle/config"),
+            "---\nBUNDLE_GEMFILE: \"gems.rb\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            bundler_loaded_manifest_with_env(&root, None, None, false, g).await,
+            LoadedManifest::Configured {
+                manifest: "gems.rb",
+                by: GemfileSetting::AppConfig
+            }
+        );
+        // BUNDLE_IGNORE_CONFIG skips both files.
+        assert_eq!(
+            bundler_loaded_manifest_with_env(&root, None, None, true, g).await,
+            LoadedManifest::Default
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_gemfile_settings_shadow_global_without_erasing_the_environment() {
+        use crate::formats::gem::manifest::{GemfileSetting, LoadedManifest};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join(".bundle")).unwrap();
+        let global = dir.path().join("global-config");
+        std::fs::write(&global, "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n").unwrap();
+        let g = Some(global.as_path());
+
+        // An exported empty value shadows the global file and leaves
+        // Bundler's default Gemfile/gems.rb discovery active.
+        assert_eq!(
+            bundler_loaded_manifest_with_env(&root, Some(OsStr::new("")), None, false, g).await,
+            LoadedManifest::Default
+        );
+        // The same value written by `bundle config set --local gemfile ''`
+        // is present even though it names no file.
+        std::fs::write(root.join(".bundle/config"), "---\nBUNDLE_GEMFILE: \"\"\n").unwrap();
+        assert_eq!(
+            bundler_loaded_manifest_with_env(&root, None, None, false, g).await,
+            LoadedManifest::Default
+        );
+        // Bundler does not re-export an empty local setting, so an existing
+        // non-empty environment value still chooses the manifest.
+        assert_eq!(
+            bundler_loaded_manifest_with_env(&root, Some(OsStr::new("Gemfile")), None, false, g)
+                .await,
+            LoadedManifest::Configured {
+                manifest: "Gemfile",
+                by: GemfileSetting::Env
+            }
+        );
+    }
+
+    /// #577: `bundle config set --global path vendor/gems` is where bundler
+    /// installs, so agent-mode discovery must probe it (relative to the
+    /// project root, like bundler). A local or env `path` / `path.system`
+    /// shadows the global tier entirely (`Settings#path` stops at the first
+    /// tier that sets either).
+    #[tokio::test]
+    async fn discovery_probes_the_global_config_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        let store = root
+            .join("vendor")
+            .join("gems")
+            .join("ruby")
+            .join("3.3.0")
+            .join("gems");
+        std::fs::create_dir_all(store.join("colorize-0.8.1")).unwrap();
+        std::fs::write(root.join("Gemfile"), "gem \"colorize\"\n").unwrap();
+        let global = dir.path().join("global-config");
+        std::fs::write(&global, "---\nBUNDLE_PATH: \"vendor/gems\"\n").unwrap();
+        let g = Some(global.as_path());
+
+        let stores = RubyCrawler::discover_bundle_stores_with_env(&root, None, None, None, g)
+            .await
+            .stores;
+        assert_eq!(stores, vec![store.clone()]);
+
+        // No global file: the store is invisible (the #577 bug).
+        let stores = RubyCrawler::discover_bundle_stores_with_env(&root, None, None, None, None)
+            .await
+            .stores;
+        assert!(stores.is_empty(), "{stores:?}");
+
+        // A global `path.system` means the system gem home: nothing added.
+        let system = dir.path().join("global-system");
+        std::fs::write(
+            &system,
+            "---\nBUNDLE_PATH: \"vendor/gems\"\nBUNDLE_PATH__SYSTEM: \"true\"\n",
+        )
+        .unwrap();
+        let stores =
+            RubyCrawler::discover_bundle_stores_with_env(&root, None, None, None, Some(&system))
+                .await
+                .stores;
+        assert!(stores.is_empty(), "{stores:?}");
+
+        // The env var shadows the global tier.
+        let env_root = dir.path().join("env-bundle");
+        let stores = RubyCrawler::discover_bundle_stores_with_env(
+            &root,
+            Some(env_root.as_os_str()),
+            None,
+            None,
+            g,
+        )
+        .await
+        .stores;
+        assert!(stores.is_empty(), "{stores:?}");
+        // Even empty: Bundler stops at the env tier (`explicit_path` `""`).
+        let stores = RubyCrawler::discover_bundle_stores_with_env(
+            &root,
+            Some(OsStr::new("")),
+            None,
+            None,
+            g,
+        )
+        .await
+        .stores;
+        assert!(stores.is_empty(), "{stores:?}");
+
+        // Each local path setting stops Bundler at the local tier. Empty
+        // strings and false flags still count as present, just as the
+        // environment's empty path does above.
+        std::fs::create_dir(root.join(".bundle")).unwrap();
+        for setting in [
+            "BUNDLE_PATH: \"\"",
+            "BUNDLE_PATH__SYSTEM: \"true\"",
+            "BUNDLE_PATH__SYSTEM: \"false\"",
+            "BUNDLE_PATH__SYSTEM: \"\"",
+            "BUNDLE_DISABLE_SHARED_GEMS: \"true\"",
+            "BUNDLE_DISABLE_SHARED_GEMS: \"false\"",
+            "BUNDLE_DISABLE_SHARED_GEMS: \"\"",
+        ] {
+            std::fs::write(root.join(".bundle/config"), format!("---\n{setting}\n")).unwrap();
+            let stores = RubyCrawler::discover_bundle_stores_with_env(&root, None, None, None, g)
+                .await
+                .stores;
+            assert!(stores.is_empty(), "{setting}: {stores:?}");
+        }
+
+        // A non-Ruby directory never reads it (the explicit-roots gate).
+        let non_ruby = dir.path().join("not-ruby");
+        std::fs::create_dir_all(&non_ruby).unwrap();
+        let stores = RubyCrawler::discover_bundle_stores_with_env(&non_ruby, None, None, None, g)
+            .await
+            .stores;
+        assert!(stores.is_empty(), "{stores:?}");
+    }
+
+    /// An env `BUNDLE_PATH__SYSTEM` or `BUNDLE_DISABLE_SHARED_GEMS` — any
+    /// value, even `"false"` or empty — shadows a global `path`: Bundler's
+    /// `Settings#path` stops at the env tier (checked against Bundler
+    /// 4.0.17: `explicit_path` is `nil` for each value).
+    #[test]
+    fn env_path_flags_shadow_the_global_config_path() {
+        let global = Some(PathBuf::from("/home/u/.bundle/config"));
+        for value in ["true", "false", ""] {
+            assert_eq!(
+                global_path_config_unless_env_path_settings(
+                    global.clone(),
+                    Some(OsStr::new(value)),
+                    None
+                ),
+                None,
+                "BUNDLE_PATH__SYSTEM={value}"
+            );
+            assert_eq!(
+                global_path_config_unless_env_path_settings(
+                    global.clone(),
+                    None,
+                    Some(OsStr::new(value))
+                ),
+                None,
+                "BUNDLE_DISABLE_SHARED_GEMS={value}"
+            );
+        }
+        // Unset: the global file still applies.
+        assert_eq!(
+            global_path_config_unless_env_path_settings(global.clone(), None, None),
+            global
+        );
+    }
+
     #[tokio::test]
     async fn discovery_records_skipped_config_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -2221,7 +2728,7 @@ mod tests {
         .unwrap();
 
         let discovery =
-            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None).await;
+            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None, None).await;
         assert_eq!(
             discovery.skipped_config_path.as_deref(),
             Some(value.as_str()),
@@ -2240,7 +2747,7 @@ mod tests {
         .await
         .unwrap();
         let discovery =
-            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None).await;
+            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None, None).await;
         assert_eq!(discovery.skipped_config_path, None);
 
         // path.system=true → bundler ignores the path; not a refusal.
@@ -2251,7 +2758,7 @@ mod tests {
         .await
         .unwrap();
         let discovery =
-            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None).await;
+            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None, None).await;
         assert_eq!(discovery.skipped_config_path, None);
     }
 
@@ -2344,6 +2851,7 @@ mod tests {
             Some(OsStr::new("~/bundle-store")),
             None,
             Some(home.path().as_os_str()),
+            None,
         )
         .await;
         assert_eq!(

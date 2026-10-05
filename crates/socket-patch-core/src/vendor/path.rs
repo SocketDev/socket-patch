@@ -70,6 +70,56 @@ pub fn vendor_uuid_dir_rel(eco: &str, uuid: &str) -> Option<String> {
     Some(format!("{VENDOR_DIR}/{eco}/{uuid}"))
 }
 
+/// The first of `.socket/vendor`, `.socket/vendor/<eco>` and
+/// `.socket/vendor/<eco>/<uuid>` under `project_root` that is a symlink (or
+/// a Windows junction), project-relative and forward-slashed; `None` when
+/// none is. The `<eco>` level is only checked for a known ecosystem dir
+/// (`jvm` counts as `maven`, which also checks the JVM repository trees
+/// `.socket/vendor/maven2` and `.socket/vendor/gradle`) and the `<uuid>` level only for a canonical
+/// uuid.
+///
+/// Vendor staging creates these dirs itself and never writes symlinks, so a
+/// linked level is never ours: its target may be another project's vendor
+/// store (two projects sharing one `.socket/vendor/npm`). Writing a unit
+/// through it, or deleting one, reaches that other project. Every vendor
+/// and revert dispatch refuses on this before touching anything, as
+/// [`sweep_vendor_dirs`] already skips a linked eco or uuid dir.
+pub fn vendor_dir_symlink(project_root: &Path, eco: &str, uuid: Option<&str>) -> Option<String> {
+    // A `jvm` ledger entry is reverted by the maven backend, and every
+    // maven-family entry may own files in the JVM repository trees
+    // (`.socket/vendor/maven2`, `.socket/vendor/gradle`) as well as a
+    // `maven/<uuid>` unit.
+    let eco = if eco == "jvm" { "maven" } else { eco };
+    let mut levels = vec![VENDOR_DIR.to_string()];
+    if ECOSYSTEM_DIRS.contains(&eco) {
+        levels.push(format!("{VENDOR_DIR}/{eco}"));
+        if let Some(rel) = uuid.and_then(|u| vendor_uuid_dir_rel(eco, u)) {
+            levels.push(rel);
+        }
+        if eco == "maven" {
+            levels.extend(
+                super::jvm::apply::VENDOR_TREES
+                    .iter()
+                    .map(|t| t.to_string()),
+            );
+        }
+    }
+    levels.into_iter().find(|rel| {
+        std::fs::symlink_metadata(project_root.join(rel))
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+    })
+}
+
+/// The user-facing reason for a [`vendor_dir_symlink`] hit at `link`.
+pub fn vendor_dir_symlink_detail(link: &str) -> String {
+    format!(
+        "`{link}` is a symlink; socket-patch creates its vendor directories itself and \
+         will not write or delete vendored artifacts through a link, whose target may \
+         belong to another project. Replace the link with a real directory (copy the \
+         artifacts this project needs into it) and re-run"
+    )
+}
+
 /// One parsed vendored path (the output of [`parse_vendor_path`]).
 #[derive(Debug)]
 pub struct VendorPathParts {
@@ -351,6 +401,14 @@ pub struct SweptVendorDir {
 pub async fn sweep_vendor_dirs(project_root: &Path) -> Vec<SweptVendorDir> {
     let mut out = Vec::new();
     let vendor_root = project_root.join(VENDOR_DIR);
+    // A linked `.socket/vendor` makes every eco dir below it lstat as a
+    // real dir, so the eco-level check alone would follow it.
+    if !tokio::fs::symlink_metadata(&vendor_root)
+        .await
+        .is_ok_and(|meta| meta.is_dir())
+    {
+        return out;
+    }
     for eco in ECOSYSTEM_DIRS {
         let eco_root = vendor_root.join(eco);
         // Symlink-strict at the eco level too (lstat, not stat): staging
@@ -912,6 +970,119 @@ mod tests {
         assert!(
             swept.is_empty(),
             "a symlinked eco dir must not be swept (callers delete through it): {swept:?}"
+        );
+    }
+
+    /// #664: each linked level is found, outermost first; real dirs, a
+    /// missing tree and a non-canonical uuid report nothing.
+    #[cfg(unix)]
+    #[test]
+    fn vendor_dir_symlink_finds_the_outermost_linked_level() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join(UUID)).unwrap();
+
+        let real = tmp.path().join("real");
+        assert_eq!(
+            vendor_dir_symlink(&real, "npm", Some(UUID)),
+            None,
+            "missing tree"
+        );
+        std::fs::create_dir_all(real.join(".socket/vendor/npm").join(UUID)).unwrap();
+        assert_eq!(
+            vendor_dir_symlink(&real, "npm", Some(UUID)),
+            None,
+            "real dirs"
+        );
+
+        let eco = tmp.path().join("eco");
+        std::fs::create_dir_all(eco.join(".socket/vendor")).unwrap();
+        symlink(&outside, eco.join(".socket/vendor/npm")).unwrap();
+        assert_eq!(
+            vendor_dir_symlink(&eco, "npm", Some(UUID)).as_deref(),
+            Some(".socket/vendor/npm")
+        );
+        assert_eq!(vendor_dir_symlink(&eco, "pypi", Some(UUID)), None);
+
+        let unit = tmp.path().join("unit");
+        std::fs::create_dir_all(unit.join(".socket/vendor/npm")).unwrap();
+        symlink(
+            outside.join(UUID),
+            unit.join(".socket/vendor/npm").join(UUID),
+        )
+        .unwrap();
+        assert_eq!(
+            vendor_dir_symlink(&unit, "npm", Some(UUID)),
+            Some(format!(".socket/vendor/npm/{UUID}"))
+        );
+        assert_eq!(vendor_dir_symlink(&unit, "npm", Some("not-a-uuid")), None);
+
+        // `jvm` entries are maven-backed: the maven unit and the JVM
+        // repository tree are both checked.
+        let jvm = tmp.path().join("jvm");
+        std::fs::create_dir_all(jvm.join(".socket/vendor")).unwrap();
+        symlink(&outside, jvm.join(".socket/vendor/maven")).unwrap();
+        assert_eq!(
+            vendor_dir_symlink(&jvm, "jvm", Some(UUID)).as_deref(),
+            Some(".socket/vendor/maven")
+        );
+        let tree = tmp.path().join("tree");
+        std::fs::create_dir_all(tree.join(".socket/vendor/maven")).unwrap();
+        symlink(&outside, tree.join(".socket/vendor/maven2")).unwrap();
+        for eco in ["jvm", "maven"] {
+            assert_eq!(
+                vendor_dir_symlink(&tree, eco, Some(UUID)).as_deref(),
+                Some(".socket/vendor/maven2"),
+                "{eco}"
+            );
+        }
+        let gradle = tmp.path().join("gradle");
+        std::fs::create_dir_all(gradle.join(".socket/vendor/maven2")).unwrap();
+        symlink(&outside, gradle.join(".socket/vendor/gradle")).unwrap();
+        for eco in ["jvm", "maven"] {
+            assert_eq!(
+                vendor_dir_symlink(&gradle, eco, Some(UUID)).as_deref(),
+                Some(".socket/vendor/gradle"),
+                "{eco}"
+            );
+        }
+
+        let vendor = tmp.path().join("vendor");
+        std::fs::create_dir_all(vendor.join(".socket")).unwrap();
+        symlink(&outside, vendor.join(".socket/vendor")).unwrap();
+        assert_eq!(
+            vendor_dir_symlink(&vendor, "jvm", None).as_deref(),
+            Some(".socket/vendor")
+        );
+    }
+
+    /// #664: a linked `.socket/vendor` makes every eco dir below it lstat
+    /// as a real dir, so the sweep must stop at the vendor level too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_never_follows_a_symlinked_vendor_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let outside = root.join("outside");
+        tokio::fs::create_dir_all(outside.join("npm").join(UUID))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            outside.join("npm").join(UUID).join("lodash-4.17.21.tgz"),
+            b"x",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.join(".socket"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".socket/vendor")).unwrap();
+
+        let swept = sweep_vendor_dirs(root).await;
+        assert!(
+            swept.is_empty(),
+            "a linked vendor dir is never swept: {swept:?}"
         );
     }
 }

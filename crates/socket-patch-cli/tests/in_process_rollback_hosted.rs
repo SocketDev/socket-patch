@@ -1107,6 +1107,57 @@ async fn a_refused_pin_fails_closed_beside_a_restored_one() {
     );
 }
 
+/// #363: an older release rewired a git-pattern yarn-classic block to the
+/// hosted tarball. yarn 1 fetches that pattern with git, from `resolved`, so
+/// restoring a registry tarball there still fails every install. The pin is
+/// refused with the `git checkout` remedy and the lock left untouched,
+/// instead of a "success" that installs nothing; a registry pin beside it
+/// still restores.
+#[tokio::test]
+#[serial]
+async fn a_git_pattern_hosted_pin_is_refused_not_restored_to_the_registry() {
+    let server = MockServer::start().await;
+    mock_yarn_registry(&server, "left-pad", "1.2.3").await;
+    mock_yarn_registry(&server, "is-odd", "3.0.1").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let git_wired = format!(
+        "\"left-pad@git+https://github.com/stevemao/left-pad.git#v1.2.3\":\n  \
+         version \"1.2.3\"\n  resolved \"{LP_HOSTED_URL}\"\n  integrity sha512-PATCHEDpatched=="
+    );
+    std::fs::write(
+        tmp.path().join("yarn.lock"),
+        yarn_lock_content(&format!("{git_wired}\n\n{}", io_redirected_block())),
+    )
+    .unwrap();
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(code, 1, "{envelope}");
+    assert_eq!(envelope["status"], "partial_failure", "{envelope}");
+    assert_eq!(envelope["hosted"]["reverted"], serde_json::json!([IO_PURL]));
+    // Discovery already refuses to attribute the git-wired entry, so the
+    // pin fails closed as contested wiring before any restore is planned.
+    assert_eq!(
+        envelope["hosted"]["failed"].as_array().map(Vec::len),
+        Some(1),
+        "{envelope}"
+    );
+    assert!(
+        envelope["hosted"]["failed"][0]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("installs from git")
+                && e.contains("`git checkout -- yarn.lock`")),
+        "{envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_lock_content(&format!(
+            "{git_wired}\n\n{}",
+            yarn_upstream_block("is-odd", "3.0.1")
+        )),
+        "the git block is left as it was; the registry pin is restored"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 5. manifest-less hosted-only project vs. the truly-empty project
 // ---------------------------------------------------------------------------

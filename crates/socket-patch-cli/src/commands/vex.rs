@@ -671,12 +671,22 @@ async fn generate_vex(
             )
             .is_empty()
         };
+        //
+        // Nor did it look when pnpm keeps the installed virtual store
+        // outside the project (its global virtual store, or a
+        // `virtualStoreDir` that climbs out): only direct deps are linked
+        // into the project, so an npm purl not found may be an installed,
+        // unpatched transitive dep (#696).
+        let npm_store_hidden =
+            socket_patch_core::crawlers::npm_crawler::pnpm_store_outside_project(&common.cwd);
+        let hidden = |purl: &str| npm_store_hidden && purl.starts_with("pkg:npm/");
         let mut lockfile_attested = Vec::new();
         outcome.failed.retain(|f| {
             let excused = f.reason == "package_not_found"
                 && plan.lockfile_basis.contains(&f.purl)
                 && !mirror_refused(&f.purl)
-                && crawled(&f.purl);
+                && crawled(&f.purl)
+                && !hidden(&f.purl);
             if excused {
                 lockfile_attested.push(f.purl.clone());
             }
