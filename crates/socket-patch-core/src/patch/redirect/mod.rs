@@ -4317,6 +4317,29 @@ fn parse_bun_hosted_lock(
     Ok((lines, entries))
 }
 
+/// Leave `dep` on its registry resolution when the project's own
+/// `patchedDependencies` patches it (#367): Bun applies that patch only to
+/// the registry `name@version`, so a hosted pin would silently drop it from
+/// every install. Warns, and keeps the in-run VEX from assuming the uuid
+/// patched. `true` when `dep` was skipped.
+pub(crate) fn skip_bun_user_patched(
+    user_patched: &[String],
+    name: &str,
+    dep: &DepOverride,
+    result: &mut RewriteResult,
+) -> bool {
+    use crate::vendor::bun_lock_text::{patched_dependency_detail, patched_dependency_key};
+    let Some(key) = patched_dependency_key(user_patched, name, &dep.version) else {
+        return false;
+    };
+    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+    result.warnings.push(RewriteWarning {
+        code: "redirect_bun_patched_dependency_skipped".into(),
+        detail: patched_dependency_detail(key, name, &dep.version),
+    });
+    true
+}
+
 fn rewrite_bun_lock(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -4353,10 +4376,18 @@ fn rewrite_bun_lock(
         }
     };
 
+    let user_patched = crate::vendor::bun_lock_text::patched_dependency_keys(
+        files.get("package.json").map(String::as_str),
+        Some(content),
+    );
+
     let mut changed = false;
     let mut pinned_any = false;
     for dep in &npm {
         let fname = full_name(dep);
+        if skip_bun_user_patched(&user_patched, &fname, dep, result) {
+            continue;
+        }
         let Some(sha512) = dep.integrity.sha512.clone() else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_bun_missing_sha512".into(),
@@ -10173,6 +10204,73 @@ mod tests {
             "{:?}",
             r.warnings
         );
+    }
+
+    /// REGRESSION (#367): `bun patch --commit` keys the project's own patch
+    /// on the registry `name@version` in package.json (and bun.lock's
+    /// mirror). Rewiring that package to a hosted URL makes Bun drop the
+    /// user's patch on every install with exit 0. The entry stays on its
+    /// registry tuple, the run says why, and VEX never assumes it patched;
+    /// another granted package in the same lock is still rewired.
+    #[test]
+    fn bun_lock_user_patched_dependency_is_left_alone_loudly() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &sha512);
+        let mut other = npm_override("is-number", "7.0.0", "http://p.test/isn.tgz", &sha512);
+        other.patch_uuid = "22222222-2222-4222-8222-222222222222".into();
+        let entries = "\"is-number\": [\"is-number@7.0.0\", \"\", {}, \"sha512-UP==\"],\n    \
+                       \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"],";
+        let manifest = r#"{"name":"app","dependencies":{"left-pad":"1.3.0","is-number":"7.0.0"},"patchedDependencies":{"left-pad@1.3.0":"patches/left-pad@1.3.0.patch"}}"#;
+        let mirror = "  \"patchedDependencies\": {\n    \"left-pad@1.3.0\": \"patches/left-pad@1.3.0.patch\",\n  },\n  \"packages\": {";
+
+        // Each source alone triggers the gate: the manifest, or the lock's
+        // mirror of it (a lock-only read).
+        for (with_manifest, with_mirror) in [(true, false), (false, true), (true, true)] {
+            let mut lock = bun_lock_file(entries, 1);
+            if with_mirror {
+                lock = lock.replacen("  \"packages\": {", mirror, 1);
+            }
+            let mut files = BTreeMap::new();
+            files.insert("bun.lock".to_string(), lock.clone());
+            if with_manifest {
+                files.insert("package.json".to_string(), manifest.to_string());
+            }
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, &[ovr.clone(), other.clone()], &mut r);
+            assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+            assert_eq!(r.edits[0].key.as_deref(), Some("is-number"));
+            let out = r.files.get("bun.lock").expect("is-number rewired");
+            assert!(
+                out.contains("\"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"],"),
+                "the user-patched entry keeps its registry tuple: {out}"
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_bun_patched_dependency_skipped"],
+                "{:?}",
+                r.warnings
+            );
+            assert!(
+                r.warnings[0].detail.contains("left-pad@1.3.0")
+                    && r.warnings[0].detail.contains("bun patch"),
+                "{}",
+                r.warnings[0].detail
+            );
+            assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+            assert!(!r.bundled_skipped_uuids.contains(&other.patch_uuid));
+        }
+
+        // A patch for ANOTHER version of the package does not gate this one.
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), bun_lock_file(entries, 1));
+        files.insert(
+            "package.json".to_string(),
+            manifest.replace("left-pad@1.3.0\":", "left-pad@1.2.0\":"),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
 
     /// A CRLF bun.lock (Windows `core.autocrlf` checkout) must keep CRLF on

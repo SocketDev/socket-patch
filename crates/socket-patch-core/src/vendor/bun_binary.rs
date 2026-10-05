@@ -270,6 +270,8 @@ pub(crate) async fn vendor(
 pub(super) struct BinaryProject {
     lock: BunLockb,
     packages: Vec<BinaryPackage>,
+    /// The project's own `patchedDependencies` keys (#367).
+    user_patched: Vec<String>,
 }
 
 /// Read the lock, refusing (before any write) a symlinked, unreadable,
@@ -295,7 +297,12 @@ pub(super) async fn read_project(root: &Path) -> Result<BinaryProject, Box<Vendo
         Ok(v) => v,
         Err(e) => return Err(Box::new(refused("vendor_bun_lockb_invalid", e))),
     };
-    Ok(BinaryProject { lock, packages })
+    let user_patched = super::bun_lock::read_user_patched(root, None).await;
+    Ok(BinaryProject {
+        lock,
+        packages,
+        user_patched,
+    })
 }
 
 /// What the per-package pre-flight hands the vendoring: the records to
@@ -319,6 +326,7 @@ pub(super) fn preflight_package(
     coords: &NpmCoords,
     leaf: &str,
 ) -> Result<BinaryTargets, Box<VendorOutcome>> {
+    super::bun_lock::refuse_user_patched(&project.user_patched, &coords.name, &coords.version)?;
     let (bundled_only, matches): (Vec<_>, Vec<_>) = project
         .packages
         .iter()
