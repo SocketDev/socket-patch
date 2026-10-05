@@ -15,9 +15,14 @@ See the [migration instructions](migrating-to-v5.md#installation-channels).
 
 ## 1. Write the release notes
 
-Make sure `CHANGELOG.md`'s `[Unreleased]` section describes this release —
-`bump-version.sh` refuses to run if it is empty, and `release-lint.sh` blocks
-a release whose CHANGELOG section is missing or empty.
+Release notes are written now, at cut time, and only here: PRs never touch
+`CHANGELOG.md`. The release agent (or whoever cuts the release) writes the
+`[Unreleased]` section from the PRs merged since the last tag
+(`git log --first-parent <last-tag>..origin/main`) and from reading the code
+those PRs changed. Describe user-visible behavior, not implementation
+details. `bump-version.sh` refuses to run if the section is empty, and
+`release-lint.sh` blocks a release whose CHANGELOG section is missing or
+empty.
 
 ## 2. Open the version-bump PR
 
