@@ -2,7 +2,7 @@
 
 ## Part 7: Core infrastructure and agent (in-place) mode
 
-_Last checked against main @ 045d7ec on 2026-10-05 by audit-core. Owner: audit-core._ Only the timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing, UUID, env/home-dir, atomic-write, purl, dead-code, telemetry, apply/rollback-engine, diff-download, `apply.lock`, Maven-sidecar, group-commit-reader, socket.yml and spawn-deadline passages have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ 0d302dc on 2026-10-05 by audit-core. Owner: audit-core._ Re-checked on `0d302dc`: the `api/*` size row, the `client.rs` breakdown, the retry table, the registry-client timeout, process spawning and hash case. The timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing, UUID, env/home-dir, atomic-write, purl, dead-code, telemetry, apply/rollback-engine, diff-download, `apply.lock`, Maven-sidecar, group-commit-reader, socket.yml and spawn-deadline passages were re-checked on `045d7ec`; the rest is as of `2463257`.
 
 > Scope: `api/*`, `manifest/*`, `ledgers.rs`, `constants.rs`, `patch/` (excluding `redirect/`), `policy/*`, `rollout*`, `update/*`, the CLI `update_notifier.rs`/`update.rs`, `telemetry.rs`, and the generic `utils/*` and `hash/*`.
 
@@ -10,7 +10,7 @@ _Last checked against main @ 045d7ec on 2026-10-05 by audit-core. Owner: audit-c
 
 | Area | Prod | Inline tests | Main external tests |
 |---|---:|---:|---|
-| `api/*` (`client.rs` alone: 2,839 / 3,038) | 5,028 | 6,434 | retry e2e 787, proxy batch 326, blob fetcher 1,307 |
+| `api/*` (`client.rs` alone: 2,918 / 3,115 on `0d302dc`) | 5,208 | 6,613 | retry e2e 787, proxy batch 326, blob fetcher 1,307 |
 | `patch/*` without `redirect/` | 3,734 | 7,572 | apply/ + rollback/ 8,719, e2e_safety_* 4,362 |
 | generic `utils/*` | ~3,730 | ~3,400 | — |
 | `policy/*` | 1,942 | 1,186 | socket.yml e2e 1,025 |
@@ -22,7 +22,7 @@ That is about **19.6K production lines.** Comments are a large share of them: 25
 
 ### 7.2 API client
 
-**Why `client.rs` is 2,839 production lines:**
+**Why `client.rs` is 2,918 production lines** (on `0d302dc`; moving the vendor service out is {{C29}}):
 - **~950 lines: the vendoring service**, which is not the patch API. The two-step grant + download (`fetch_vendor_package` → `download_artifact_resuming`), its types, and `download_artifact_capped`.
 - **~320 lines: credentials.** Env/config resolution, a token-shape lint, org auto-resolve.
 - **~200 lines: legacy proxy fallback.** The per-package GET path, `is_batch_unsupported`.
@@ -49,7 +49,7 @@ The vendor policy also has three separate hand-written retry loops, plus a first
 **Batching is defined three times.** The CLI owns the batch sizes (500 authenticated, 100 proxy, the 256 KiB body cap) and accepts any `--batch-size`. The in-memory hosted engine keeps its own copy (default 100 on either endpoint, max 500, no body-cap split, a second `MAX_REFERENCE_BATCH`). `search_patches_batch` documents "Maximum 500" but does not enforce it, while `fetch_registry_references` chunks itself. {{C16}}
 
 **Other HTTP stacks** keep TLS and proxy settings consistent but diverge on timeouts, retry and error formatting:
-- `RegistryClient`: 60 s timeout, no retry.
+- `RegistryClient` (hosted upstream restore) and vendored Maven's per-fetch client: a 60 s *whole-request* deadline and no connect bound, so a slow but progressing artifact download is aborted at 60 s (shown by execution on `0d302dc`); no retry. `registry_fetch::download` hand-rolls `read_capped`. {{C49}}
 - `maven_repo.rs`: builds a fresh client for every fetch.
 - Self-update: its own clients with a custom redirect policy and no retry.
 - Telemetry: a new client for every event.
@@ -74,7 +74,7 @@ The vendor policy also has three separate hand-written retry loops, plus a first
 
   The narrow core match stays correct only because `apply_env_toggles` rewrites every truthy flag back into the env as `"1"`; all ten command entry points call it on `045d7ec`. "Empty means unset" is one private helper (`socket_cli_config::env_non_empty`) plus about 29 inline copies in 16 files. In this area there are at least six home-directory resolvers, and they disagree: `policy::home_dir` reads only `USERPROFILE` on Windows, while `utils::fs::home_dir` prefers `HOME`. The crawlers keep further variants.
 - **Atomic writes:** `utils/fs.rs` has six writers, which are four boolean policies (capture, fsync, keep mode, durability record) spelled as separate functions. `atomic_write_sync` re-implements `stage_and_rename` + `create_stage` + `commit_stage` in blocking form, with no drift yet. `blob_fetcher::write_cache_entry_atomic` is a third, deliberately non-fsyncing stage+rename. The self-update stage (`update/download.rs`, `update/swap.rs`) is legitimately separate. Correction: the artifact writers inside `utils::fs` don't capture into a group commit either, so bypassing `utils::fs` isn't itself a group-commit escape. {{C21}} `get` writes `.socket/blobs/<hash>` with neither: it uses an in-place `fs::write` and doesn't check the content's hash ({{C42}}).
-- **Process spawning** is well centralized in `process.rs::resolve_tool`/`command_for`, with one exception: `vendor/pypi_hatch.rs:118` runs `Command::new("hatch").current_dir(root)` (verified by execution on `045d7ec`). {{C04}} That is exactly the planted-binary pattern `process.rs:23-33` documents as unsafe: "a bare `Command::new("git")` would execute a `git` planted in the repository being scanned". Spawn *deadlines* are not centralized: the shared probe runners (`gem env`, `python --version`, `npm root -g`, …) have none, while four sites hand-roll `timeout` + `kill_on_drop` with 10/10/10/30–60 s budgets; on `045d7ec` a hung `gem` shim hung a local `scan` indefinitely. {{C48}}
+- **Process spawning** is centralized in `process.rs::resolve_tool`/`command_for`; on `0d302dc` no production `Command::new("<tool>")` remains. Vendored Hatch now resolves `hatch` through `resolve_tool_with` instead of a bare spawn in the project root (#617). {{C04}} Spawn *deadlines* are not centralized: the shared probe runners (`gem env`, `python --version`, `npm root -g`, …) have none, while four sites hand-roll `timeout` + `kill_on_drop` with 10/10/10/30–60 s budgets; on `045d7ec` a hung `gem` shim hung a local `scan` indefinitely. {{C48}}
 
 ### 7.4 Agent mode
 
@@ -145,7 +145,7 @@ Agent mode writes no Maven sidecar, and needs none: Maven 3.9.11 doesn't verify 
    - line endings;
    - env truthiness;
    - home dir;
-   - **fix the bare `hatch` spawn**.
+   - (the bare `hatch` spawn is already fixed, #617).
 
    Saves about −200.
 8. **Split `client.rs`** into client, vendor_service and credentials, and give it a single auth-vs-proxy URL policy.
@@ -159,6 +159,7 @@ Agent mode writes no Maven sidecar, and needs none: Maven 3.9.11 doesn't verify 
 - {{C41}} Hash case policy is decided per site. Blob download compares case-insensitively on purpose (`blob_hash_matches`), and the blob-name validators accept uppercase, but agent-mode apply and rollback verify with exact `==` against the lowercase computed hash; vendored verify sites are split the same way. On `045d7ec` an uppercased manifest hash downloaded and passed `is_valid_blob_hash`, then failed both apply and rollback verification with `HashMismatch`.
 - {{C42}} `.socket/blobs/<hash>` has two writers. The fetch path verifies the git-sha256 and stages+renames, because `get_missing_blobs` trusts presence. `get::write_blob_entry` stores a patch view's inline `blobContent` under its claimed hash without checking it, truncate-writes in place, and overwrites an existing verified blob; it also hand-rolls base64 although the crate is a dependency. On `045d7ec` a verified `blobs/<H>` was replaced with bytes that don't hash to `H`.
 - {{C46}} The vendored group-commit journal is replayed only inside `apply_lock::acquire`, so the lock-free readers never see a pending commit: after a crash past the journal, `vendor --check` fails every patch with `vendor_ledger_missing` (whose documented remedy is restoring `state.json` by hand) and pnpm `vex` omits the packages, while one locked command rolls the commit forward to the uninterrupted result (proved twice with `group_commit_file@1`).
+- {{C49}} Registry downloads (`build_registry_client`, `maven_repo::fetch_registry_bytes`) use a 60 s total deadline instead of `ApiTimeouts`' 10 s connect + 60 s idle bound. On `0d302dc`, a body trickling 64 KiB/s was aborted at 60.0 s after 3.9 MB by the registry client, while an `ApiTimeouts` client read all 4.6 MB in 69 s (twice). Hosted upstream restore and vendored Maven jar fetches go through it.
 - {{C48}} Child processes have no shared deadline. `SystemCommandRunner`/`GlobalProbeRunner` call `output()` unbounded, while `pipenv`, `hatch`, self-update `sanity_exec` and the `git check-ignore` exchange each hand-roll a timeout. On `045d7ec`, a `gem` shim that never answers made `scan --json` in a Bundler project hang with no output (killed at 45 s and at 90 s); with the real `gem` it finished in 1 s.
 
 ---

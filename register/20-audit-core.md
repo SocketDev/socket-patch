@@ -1,12 +1,12 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-05T09:53Z · main @ 045d7ec_
+_Last updated 2026-10-05T15:52Z · main @ 0d302dc_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
 | C01 | 1 | Unbounded zip inflate on tamperable input. `zip_bytes_match_after_hashes` pre-allocates from the archive's declared size and reads with no cap, and it runs on committed `.nupkg`/`.jar` files and service archives. There are three archive caps (512/256/128 MiB). | §1 #1 | #569 | fixed (#587); streams members, no cap per maintainer |
 | C02 | 1 | `ApiClient::new` and `plain_client()` set no HTTP timeout, and blob and diff fetches have no retry, so `scan`, `get` and `apply` can hang in CI. | §1 #2 | #570 | fixed (#581) |
 | C03 | 1 | `vendored_takeover` ignores `RevertOutcome.kept_artifact`. It deletes the ledger entry and reports the artifact as reverted on a drift-keep, while every other revert caller honors the flag. | §1 #3; 2.4 | #568 | filed #568 |
-| C04 | 1 | Planted-binary spawn: `vendor/pypi_hatch.rs` runs `Command::new("hatch").current_dir(root)` instead of `process::resolve_tool`. #442 didn't cover it. | §1 #4; 7.3 | #613 | in PR #617 |
+| C04 | 1 | Planted-binary spawn: `vendor/pypi_hatch.rs` runs `Command::new("hatch").current_dir(root)` instead of `process::resolve_tool`. #442 didn't cover it. | §1 #4; 7.3 | #613 | fixed (#617) |
 | C05 | 1 | `SOCKET_FORCE` is bound to `vendor --force`, `apply --force` and `--update --force`, so forcing a self-update also forces past hash checks. | §1 #6 | #615 | decision #615 |
 | C06 | 1 | `get` round-trips its arguments through `DownloadParams` and `..GlobalArgs::default()`, which silently resets `offline`, `patch_server_url` and more. `get` also builds a fake `ApplyArgs`, and `get` and `scan` call each other. | 2.1; 2.3; R7 | | rejected; resets inert on 045d7ec, cycle folded into C12 |
 | C07 | 1 | The URL builders disagree. When org auto-resolve fails, `patches_path` sends JSON calls to `/v0/orgs/default/…`, while `binary_url` and `vendor_package_url` send the same client to the public proxy. Telemetry has a fourth copy of this logic. | 7.2 | #648 | decision #648 |
@@ -31,7 +31,7 @@ _Last updated 2026-10-05T09:53Z · main @ 045d7ec_
 | C26 | 3 | `apply.lock` spends ~554 lines deleting the lock file on exit, and taking the lock replays the vendored group-commit journal, coupling vendored crash recovery to every command. | 7.4 | #808 | decision #808; layering (replay + barrier out of the lock) is option-independent |
 | C27 | 3 | Agent-mode sidecars don't handle Maven files at all. Verify whether in-place Maven patches leave stale checksum files behind. | 7.4 | | rejected; Maven 3.9.11 ignores stale local `.jar.sha1` (built twice on 045d7ec); Gradle gap is #551 |
 | C28 | 3 | socket.yml builds a hand-made YAML tree on serde-saphyr's event parser to read 8 keys. Target: serde with `deny_unknown_fields`. | 7.5 | | rejected; the tree implements the contract's scoped YAML refusals |
-| C29 | 3 | The `client.rs` split (2.8K lines) into client, vendor_service and credentials; the debug-ordering machinery (`HeldBack`) has 45 call sites. | 7.2; 7.6 #8 | | to verify |
+| C29 | 3 | The `client.rs` split (2.8K lines) into client, vendor_service and credentials; the debug-ordering machinery (`HeldBack`) has 45 call sites. | 7.2; 7.6 #8 | #871 | filed #871; vendor-service move (child 1); credentials move (~330 lines) not filed yet |
 | C30 | 2 | No shared test-support: `binary()` is defined in 103 files and `git_sha256` in 86, there are 15 `scrub_socket_env` (14 bodies), xorshift is implemented four times, and the VEX helpers are forked. | 6.4; 8.5 D | #824, #823 | filed #824, #823; #823 slice 1 merged as #850 (`common/hermetic.rs`, 8 of 15 `scrub_socket_env` copies deleted); slice 2 is the other 7 |
 | C31 | 3 | There are 207 test executables; the target is ~25. This needs C10 first. | 8.5 A | | to verify |
 | C32 | 3 | 328 exact-sentence assertions should become `--json`/`errorCode` checks plus snapshots. Triage the 402 covgap tests, 136 of which assert human text. | 2.5; 8.5 G/H | | to verify |
@@ -51,6 +51,7 @@ _Last updated 2026-10-05T09:53Z · main @ 045d7ec_
 | C46 | 3 | The group-commit journal is replayed only inside `apply_lock::acquire`: after a crash past the journal, lock-free `vendor --check` fails every patch with `vendor_ledger_missing` (remedy: restore `state.json` by hand) and pnpm `vex` omits the packages, while one locked command rolls forward to the clean result. | new finding | #809 | filed #809 |
 | C47 | 2 | 10 CLI test files spawn the binary with no `SOCKET_*` scrub; an ambient `SOCKET_DRY_RUN=true`/`SOCKET_OFFLINE=true` turns 18 of 19 `repair_vendor_e2e` tests red while scrubbed tests in the same target pass. | new finding | #823 | filed #823; 8 of 10 hermetic since #850; `scan_invariants` waits on #820/#849, `in_process_npm_multicopy` on #774 |
 | C48 | 2 | Child processes have no shared deadline: the crawler probe runners (`gem env`, `python --version`, `npm root -g`, …) call `output()` unbounded, while 4 sites hand-roll `timeout` + `kill_on_drop` (10/10/10/30–60 s); a hung `gem` shim hangs a local `scan` forever. | new finding | #845 | filed #845 |
+| C49 | 2 | Registry downloads use a 60 s whole-request deadline (`build_registry_client`, `maven_repo::fetch_registry_bytes`), not `ApiTimeouts`' idle bound: hosted upstream restore and vendored Maven abort a still-progressing artifact download at 60 s (128 MiB cap needs ≈2.2 MB/s); `registry_fetch::download` hand-rolls `read_capped`. | new finding | #872 | filed #872 |
 
 **Handed off** (to the CI janitor): report-only coverage and LTO `docker-base` off PRs; e2e from 148 to ~50 legs; a reusable compat workflow; no per-leg compiles; dead CI path filters (review 8.2, 8.5 B/C/E).
 
