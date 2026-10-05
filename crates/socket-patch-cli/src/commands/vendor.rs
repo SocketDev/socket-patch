@@ -2570,15 +2570,23 @@ pub(crate) async fn vendor_records_reusing(
                         .clone();
                     let refusal = match project {
                         Some(refusal) => Some(refusal),
-                        None => {
-                            socket_patch_core::vendor::yarn_berry_vendor_target_preflight(
-                                &common.cwd,
-                                candidate,
-                                pin,
-                                &restore_opts,
-                            )
-                            .await
-                        }
+                        None => match socket_patch_core::vendor::npm_tarball_gitignore_preflight(
+                            &common.cwd,
+                            &record.uuid,
+                        )
+                        .await
+                        {
+                            Some(refusal) => Some(refusal),
+                            None => {
+                                socket_patch_core::vendor::yarn_berry_vendor_target_preflight(
+                                    &common.cwd,
+                                    candidate,
+                                    pin,
+                                    &restore_opts,
+                                )
+                                .await
+                            }
+                        },
                     };
                     if let Some((code, detail)) = &refusal {
                         has_errors = true;

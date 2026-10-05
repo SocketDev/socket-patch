@@ -185,6 +185,22 @@ pub(super) struct NpmStagedPack {
 /// `vendor_artifact_gitignored` before anything is written, and once the
 /// tarball is in place `<uuid>/.gitignore` re-includes it against file rules
 /// such as Node.gitignore's `*.tgz`, then the written paths are probed again.
+/// The uuid-dir half of [`stage_patch_pack`]'s gitignore check, for callers
+/// that must refuse before an earlier irreversible step: the hosted->vendored
+/// takeover restores the registry entry first, so a `.socket/` rule caught
+/// only at staging would leave the package patched in neither mode.
+pub async fn npm_tarball_gitignore_preflight(
+    project_root: &Path,
+    uuid: &str,
+) -> Option<(&'static str, String)> {
+    let uuid_dir_rel = vendor_uuid_dir_rel("npm", uuid)?;
+    let rules = npm_dir::gitignored(project_root, &[format!("{uuid_dir_rel}/")]).await?;
+    Some((
+        npm_dir::GITIGNORED,
+        npm_dir::gitignored_detail(&uuid_dir_rel, &rules),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn stage_patch_pack(
     purl: &str,
