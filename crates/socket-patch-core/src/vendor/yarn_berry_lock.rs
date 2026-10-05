@@ -857,6 +857,18 @@ pub async fn revert_yarn_berry_opts(
         return outcome;
     }
 
+    if super::npm_flavor::keep_artifact_while_lock_references_it(
+        &mut outcome,
+        project_root,
+        &[YARN_LOCK, PACKAGE_JSON],
+        &entry.uuid,
+        &uuid_dir_rel,
+    )
+    .await
+    {
+        return outcome;
+    }
+
     // FAIL-CLOSED (same brick class as the unwired guard above, twin of
     // npm_lock's post-restore probe): the restore only rewrites the
     // fragments the wiring recorded, but yarn can still resolve through the
@@ -1412,9 +1424,15 @@ fn root_workspace_name(blocks: &[LockBlock]) -> Option<String> {
 /// (`compressionLevel: 0 # keep yarn default` is `0`, #370). A `#` with no
 /// whitespace before it stays part of a plain value, as in YAML.
 pub(crate) fn yarnrc_compression_level(rc: &str) -> Option<&str> {
+    yarnrc_scalar(rc, "compressionLevel")
+}
+
+/// The top-level `.yarnrc.yml` scalar `key`, when set, read as
+/// [`yarnrc_compression_level`] describes.
+pub(crate) fn yarnrc_scalar<'a>(rc: &'a str, key: &str) -> Option<&'a str> {
     let rc = rc.strip_prefix('\u{feff}').unwrap_or(rc);
     rc.lines().find_map(|line| {
-        let rest = line.strip_prefix("compressionLevel:")?.trim();
+        let rest = line.strip_prefix(key)?.strip_prefix(':')?.trim();
         if let Some(quote) = rest.chars().next().filter(|c| matches!(c, '\'' | '"')) {
             if let Some(end) = rest[1..].find(quote) {
                 return Some(&rest[1..1 + end]);

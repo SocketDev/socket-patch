@@ -27,11 +27,19 @@
 //!   overlap rather than add up), while a throttled run as a whole adds at
 //!   most about the window's length of waiting.
 //!
+//! A connection the peer drops while it is being established (reset,
+//! aborted, or closed mid-TLS-handshake — [`is_retryable_transport`]) is
+//! retried under the same budget and window, with the exponential backoff:
+//! the request was never sent, and a load balancer or proxy resetting a
+//! fresh connection is a transient blip, not an answer.
+//!
 //! Nothing else is retried here: other 4xx (401/403 keep driving the proxy
-//! fallback), other 5xx and transport errors surface on the first answer,
-//! exactly as before. Retries happen inside each request's future, so the
-//! callers' ordered folds (`ordered_concurrent`) see the same sequence of
-//! results a clean run produces.
+//! fallback), other 5xx and every other transport error (refused, timed
+//! out, DNS, TLS certificate, or a failure after the request went out)
+//! surface on the first answer, exactly as before. Retries happen inside
+//! each request's future, so the callers' ordered folds
+//! (`ordered_concurrent`) see the same sequence of results a clean run
+//! produces.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -127,6 +135,50 @@ impl ApiRetryPolicy {
     }
 }
 
+/// Default [`ApiTimeouts::connect`]: TCP connect plus the TLS handshake.
+pub const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default [`ApiTimeouts::read`]: the longest silence on an open
+/// connection (waiting for the response headers, or between body chunks).
+pub const API_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Transport bounds for every patch-API request: the JSON calls, the
+/// blob/diff downloads and the vendoring service, on both of
+/// [`crate::api::client::ApiClient`]'s HTTP clients.
+///
+/// Neither is a total deadline: `read` restarts after every chunk that
+/// arrives, so a large download that keeps streaming is never cut off,
+/// while a stalled proxy, load balancer or half-open connection fails the
+/// request as `ApiError::Network` instead of hanging the run. A stall is a
+/// transport error, so the JSON retry loop does not repeat it; the
+/// vendoring service's own per-attempt deadlines and retries still apply
+/// on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApiTimeouts {
+    /// Bound on establishing a connection.
+    pub connect: Duration,
+    /// Bound on one read waiting for data.
+    pub read: Duration,
+}
+
+impl Default for ApiTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: API_CONNECT_TIMEOUT,
+            read: API_READ_TIMEOUT,
+        }
+    }
+}
+
+impl ApiTimeouts {
+    /// `builder` with these bounds applied.
+    pub fn apply(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        builder
+            .connect_timeout(self.connect)
+            .read_timeout(self.read)
+    }
+}
+
 /// [`API_MAX_RETRIES_ENV`]'s value as a retry count, or `None` to keep the
 /// default (unset, empty, or not a non-negative integer).
 fn max_retries_override(raw: Option<&str>) -> Option<u32> {
@@ -140,6 +192,47 @@ pub fn is_retryable_status(status: StatusCode) -> bool {
         status,
         StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
     )
+}
+
+/// Is this transport error one the retry loop may repeat? Only a
+/// connection dropped while it was being ESTABLISHED (TCP connect or the
+/// TLS handshake): reset, aborted, or closed mid-handshake. No byte of the
+/// request has been sent at that point, so repeating it is safe for a POST
+/// too. Everything else stays final on the first failure: a refused
+/// connection (nothing listening — tests and offline runs rely on it
+/// failing fast), a connect or read timeout (a stall is not repeated, see
+/// [`ApiTimeouts`]), DNS and certificate errors, and any failure after the
+/// request went out.
+pub fn is_retryable_transport(error: &reqwest::Error) -> bool {
+    error.is_connect() && !error.is_timeout() && is_dropped_connection(error)
+}
+
+/// Whether `error`'s cause chain holds an I/O error saying the peer
+/// dropped the connection (reset, aborted, or EOF mid-handshake). The
+/// connector wraps the OS error in an `Other` I/O error whose `source()`
+/// skips it, so a wrapped error is looked through with `get_ref`.
+fn is_dropped_connection(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(error);
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+            ) {
+                return true;
+            }
+            if io
+                .get_ref()
+                .is_some_and(|inner| is_dropped_connection(inner))
+            {
+                return true;
+            }
+        }
+        source = cause.source();
+    }
+    false
 }
 
 /// A `Retry-After` header as a wait from `now_unix_secs`: delta-seconds

@@ -1179,6 +1179,178 @@ async fn scan_redirect_bun_bundled_copy_is_not_attested_in_run() {
     );
 }
 
+/// REGRESSION (#325): npm's half of #469. The hoisted entry is redirected,
+/// but a parent also bundles the same `name@version` (`inBundle: true` in
+/// `packages`, or the legacy `bundled: true` spelling in a v1
+/// `dependencies` tree). npm unpacks that copy from the parent's tarball,
+/// so it stays unpatched; the run warns
+/// `redirect_npm_bundled_instance_skipped`, and its in-run `--vex` must
+/// not attest the purl either.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_npm_bundled_copy_is_not_attested_in_run() {
+    let packages_lock = format!(
+        r#"{{
+  "name": "consumer",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {{
+    "": {{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}", "parent": "2.0.0" }} }},
+    "node_modules/{NAME}": {{
+      "version": "{VERSION}",
+      "resolved": "https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz",
+      "integrity": "sha512-UPSTREAMupstream=="
+    }},
+    "node_modules/parent": {{
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/parent/-/parent-2.0.0.tgz",
+      "integrity": "sha512-PARENT=="
+    }},
+    "node_modules/parent/node_modules/{NAME}": {{
+      "version": "{VERSION}",
+      "inBundle": true,
+      "integrity": "sha512-UPSTREAMupstream=="
+    }}
+  }}
+}}
+"#
+    );
+    let legacy_lock = format!(
+        r#"{{
+  "name": "consumer",
+  "version": "0.0.0",
+  "lockfileVersion": 1,
+  "requires": true,
+  "dependencies": {{
+    "{NAME}": {{
+      "version": "{VERSION}",
+      "resolved": "https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz",
+      "integrity": "sha512-UPSTREAMupstream=="
+    }},
+    "parent": {{
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/parent/-/parent-2.0.0.tgz",
+      "integrity": "sha512-PARENT==",
+      "dependencies": {{
+        "{NAME}": {{
+          "version": "{VERSION}",
+          "bundled": true
+        }}
+      }}
+    }}
+  }}
+}}
+"#
+    );
+    for (shape, lock) in [("inBundle", packages_lock), ("legacy bundled", legacy_lock)] {
+        let server = MockServer::start().await;
+        mock_discovery(&server).await;
+        mock_reference(&server).await;
+        mock_view(&server).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_project(tmp.path());
+        std::fs::write(tmp.path().join("package-lock.json"), &lock).unwrap();
+        let copy = tmp
+            .path()
+            .join("node_modules/parent/node_modules")
+            .join(NAME);
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(
+            copy.join("package.json"),
+            format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("node_modules/parent/package.json"),
+            format!(
+                r#"{{ "name": "parent", "version": "2.0.0", "bundleDependencies": ["{NAME}"] }}"#
+            ),
+        )
+        .unwrap();
+
+        let out = tmp.path().join("out.vex.json");
+        let mut args = redirect_args(tmp.path(), server.uri());
+        args.vex.vex = Some(out.clone());
+        args.vex.vex_product = Some("pkg:npm/consumer@0.0.0".into());
+        let _ = run(args).await;
+
+        let rewritten = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+        assert!(
+            rewritten.contains(HOSTED_URL),
+            "{shape}: the regular entry is redirected:\n{rewritten}"
+        );
+        let attested = std::fs::read_to_string(&out)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .is_some_and(|doc| doc.to_string().contains(PURL));
+        assert!(
+            !attested,
+            "{shape}: in-run VEX must not attest a purl whose bundled copy stays unpatched"
+        );
+    }
+}
+
+/// npm 7+ installs from the v2 `packages` map. An ignored legacy bundled
+/// flag must not block the hosted in-run attestation before that install.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_npm_stale_legacy_bundle_mirror_still_attests() {
+    for lockfile in ["package-lock.json", "npm-shrinkwrap.json"] {
+        let server = MockServer::start().await;
+        mock_discovery(&server).await;
+        mock_reference(&server).await;
+        mock_view(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_project(tmp.path());
+        std::fs::write(
+            tmp.path().join("node_modules").join(NAME).join("index.js"),
+            b"upstream bytes before the next install\n",
+        )
+        .unwrap();
+        let original = tmp.path().join("package-lock.json");
+        let mut lock: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&original).unwrap()).unwrap();
+        lock["lockfileVersion"] = serde_json::json!(2);
+        lock["dependencies"] = serde_json::json!({
+            NAME: {
+                "version": VERSION,
+                "resolved": format!("https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz"),
+                "integrity": "sha512-UPSTREAMupstream==",
+                "bundled": true
+            }
+        });
+        std::fs::write(&original, serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+        if lockfile != "package-lock.json" {
+            std::fs::rename(&original, tmp.path().join(lockfile)).unwrap();
+        }
+        let out = tmp.path().join("out.vex.json");
+        let mut args = redirect_args(tmp.path(), server.uri());
+        args.vex.vex = Some(out.clone());
+        args.vex.vex_product = Some("pkg:npm/consumer@0.0.0".into());
+        let exit = run(args).await;
+        assert_eq!(
+            exit, 0,
+            "{lockfile}: npm consumes the normal packages entry"
+        );
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        assert!(
+            document.to_string().contains(PURL),
+            "{lockfile}: {document:#}"
+        );
+        assert_eq!(document["statements"][0]["status"], "not_affected");
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join(lockfile)).unwrap()).unwrap();
+        assert_eq!(
+            rewritten["packages"][format!("node_modules/{NAME}")]["resolved"],
+            HOSTED_URL
+        );
+        assert_eq!(rewritten["dependencies"][NAME]["bundled"], true);
+    }
+}
+
 /// The bun 1.4 leg: `"lockfileVersion": 2` is the SAME emitted grammar as 1
 /// (bun 1.4 bumped the integer to gate stricter parse checks — oven-sh/bun
 /// PR #31539 — same-fixture locks are byte-identical except the integer), so

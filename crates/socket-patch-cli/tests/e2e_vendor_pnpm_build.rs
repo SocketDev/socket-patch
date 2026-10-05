@@ -1297,6 +1297,134 @@ fn pnpm8_lock_v60_hermetic_splice_idempotency_and_revert() {
     run_legacy_hermetic(PNPM8_LOCK, PNPM8_AFTER_TEMPLATE, "6.0");
 }
 
+/// #636: two packages vendored into a project with no `pnpm` table and no
+/// pnpm-workspace.yaml, then `vendor --revert` (purl order: is-number, the
+/// entry that created both, goes first). The lock was already byte-exact;
+/// package.json kept `"pnpm": { "overrides": {} }` and the scaffolded
+/// workspace file stayed behind. Both must now come back byte-identical.
+#[test]
+fn pnpm9_two_packages_vendor_revert_removes_created_scaffold() {
+    const LOCK: &str = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      is-number:
+        specifier: 7.0.0
+        version: 7.0.0
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+
+packages:
+
+  is-number@7.0.0:
+    resolution: {integrity: sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==}
+    engines: {node: '>=0.12.0'}
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+    deprecated: use String.prototype.padStart()
+
+snapshots:
+
+  is-number@7.0.0: {}
+
+  left-pad@1.3.0: {}
+";
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let orig = b"module.exports = function (x) { return x; };\n".to_vec();
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let mut patches = serde_json::Map::new();
+    for (name, version, uuid) in [
+        ("left-pad", "1.3.0", UUID),
+        ("is-number", "7.0.0", "2b3c4d5e-6f70-4a1b-8c2d-0123456789ac"),
+    ] {
+        let dir = proj.join("node_modules").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!("{{\"name\":\"{name}\",\"version\":\"{version}\"}}\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("index.js"), &orig).unwrap();
+        patches.insert(
+            format!("pkg:npm/{name}@{version}"),
+            serde_json::json!({
+                "uuid": uuid,
+                "exportedAt": "2026-01-01T00:00:00Z",
+                "files": { "package/index.js": {
+                    "beforeHash": git_sha256(&orig),
+                    "afterHash": git_sha256(&patched),
+                }},
+                "vulnerabilities": {},
+                "description": "two-package scaffold patch",
+                "license": "MIT",
+                "tier": "free",
+            }),
+        );
+    }
+    let socket = proj.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_string_pretty(&serde_json::json!({ "patches": patches })).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(socket.join("blobs").join(git_sha256(&patched)), &patched).unwrap();
+
+    let pkg_before = "{\n  \"name\": \"fx\",\n  \"version\": \"1.0.0\",\n  \"private\": true,\n  \
+                      \"dependencies\": {\n    \"left-pad\": \"1.3.0\",\n    \
+                      \"is-number\": \"7.0.0\"\n  }\n}\n";
+    std::fs::write(proj.join("package.json"), pkg_before).unwrap();
+    std::fs::write(proj.join("pnpm-lock.yaml"), LOCK).unwrap();
+    let cwd = proj.to_str().unwrap();
+
+    let (code, stdout, stderr) =
+        run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+    assert_eq!(code, 0, "vendor.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let env = parse_envelope(&stdout);
+    assert_eq!(
+        env["summary"]["applied"], 2,
+        "both packages vendored: {env}"
+    );
+    assert!(
+        proj.join("pnpm-workspace.yaml").is_file(),
+        "a 9.0 lock mirrors overrides into a scaffolded workspace file"
+    );
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &["vendor", "--revert", "--json", "--offline", "--cwd", cwd],
+    );
+    assert_eq!(code, 0, "revert.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let renv = parse_envelope(&stdout);
+    assert_eq!(
+        renv["summary"]["removed"], 2,
+        "both entries reverted: {renv}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("package.json")).unwrap(),
+        pkg_before,
+        "no empty pnpm.overrides left behind"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("pnpm-lock.yaml")).unwrap(),
+        LOCK
+    );
+    assert!(
+        !proj.join("pnpm-workspace.yaml").exists(),
+        "the scaffolded pnpm-workspace.yaml must be deleted"
+    );
+    assert!(!proj.join(".socket/vendor").exists());
+}
+
 /// The tarball's SRI (`sha512-<base64>`), the integrity spelling pnpm locks
 /// record.
 fn tarball_integrity(tgz: &Path) -> String {
