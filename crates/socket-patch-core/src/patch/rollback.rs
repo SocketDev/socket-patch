@@ -391,6 +391,105 @@ fn fold_copy_result(result: &mut RollbackResult, copy: &Path, copy_result: Rollb
     });
 }
 
+/// After deleting a patch-added file, undo the directories apply created
+/// for it (`create_dir_all` in `apply_file_patch_at`), so the package tree
+/// is back to its pre-apply shape. In site-packages a leftover empty
+/// directory still imports as a PEP 420 namespace package (#838).
+///
+/// For a `.py` file, its now-stale bytecode in the sibling `__pycache__/`
+/// (`<stem>.<tag>[.opt-N].pyc`) goes first. Then each parent directory is
+/// removed while it is empty, deepest first, stopping at `pkg_path`
+/// (never removed) or at the first directory that still holds anything.
+/// Apply records no list of the directories it created, so "empty once
+/// the patch's files are gone" is the test: a package directory holding
+/// only patch-added files did not exist before the patch.
+///
+/// Only real directories are removed: each is lstat'ed first, so a
+/// symlinked directory is neither removed nor walked above, and
+/// `remove_dir` refuses a non-empty one atomically. Read-only parents (Go
+/// module cache) are relaxed for the rmdir exactly as for the unlink.
+/// Best effort: the file delete already committed the rollback, so a
+/// directory that can't be removed is left in place rather than failing it.
+async fn prune_emptied_parents(pkg_path: &Path, filepath: &Path) {
+    let Some(rel) = filepath
+        .parent()
+        .and_then(|parent| parent.strip_prefix(pkg_path).ok())
+    else {
+        return;
+    };
+    // Every directory between the package root and the deleted file, top
+    // down. A symlink (or anything but a real directory) anywhere on the
+    // chain means the deeper levels live outside this tree: prune nothing.
+    let mut chain = Vec::new();
+    let mut cur = pkg_path.to_path_buf();
+    for component in rel.components() {
+        cur.push(component);
+        match tokio::fs::symlink_metadata(&cur).await {
+            Ok(meta) if meta.is_dir() => chain.push(cur.clone()),
+            _ => return,
+        }
+    }
+    if filepath.extension().is_some_and(|ext| ext == "py") {
+        if let Some(stem) = filepath.file_stem().and_then(|s| s.to_str()) {
+            let cache = filepath.with_file_name("__pycache__");
+            remove_stale_bytecode(&cache, stem).await;
+            remove_dir_if_empty(&cache).await;
+        }
+    }
+    for dir in chain.iter().rev() {
+        if !remove_dir_if_empty(dir).await {
+            return;
+        }
+    }
+}
+
+/// Delete the regular `<stem>.*.pyc` files in `cache`: bytecode compiled
+/// from a module the rollback just removed.
+async fn remove_stale_bytecode(cache: &Path, stem: &str) {
+    match tokio::fs::symlink_metadata(cache).await {
+        Ok(meta) if meta.is_dir() => {}
+        _ => return,
+    }
+    let Ok(mut entries) = tokio::fs::read_dir(cache).await else {
+        return;
+    };
+    let prefix = format!("{stem}.");
+    let mut stale = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(&prefix)
+            && name.ends_with(".pyc")
+            && entry.file_type().await.is_ok_and(|t| t.is_file())
+        {
+            stale.push(entry.path());
+        }
+    }
+    if stale.is_empty() {
+        return;
+    }
+    let guard = crate::patch::apply::DirWriteGuard::acquire(Some(cache)).await;
+    for path in stale {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    guard.restore().await;
+}
+
+/// Remove `dir` if it is a real (non-symlink) empty directory. Returns
+/// whether it is gone.
+async fn remove_dir_if_empty(dir: &Path) -> bool {
+    match tokio::fs::symlink_metadata(dir).await {
+        Ok(meta) if meta.is_dir() => {}
+        _ => return false,
+    }
+    let guard = crate::patch::apply::DirWriteGuard::acquire(dir.parent()).await;
+    let removed = tokio::fs::remove_dir(dir).await.is_ok();
+    guard.restore().await;
+    removed
+}
+
 /// The single-copy rollback engine behind [`rollback_package_patch`]:
 /// verifies and rolls back the package at exactly the one `pkg_path` it is
 /// given.
@@ -503,6 +602,7 @@ async fn rollback_package_patch_at(
                 result.error = Some(format!("Failed to delete {}: {}", file_name, e));
                 return result;
             }
+            prune_emptied_parents(pkg_path, &filepath).await;
             result.files_rolled_back.push(file_name.clone());
             continue;
         }
