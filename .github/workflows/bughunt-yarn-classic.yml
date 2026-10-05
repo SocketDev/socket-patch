@@ -1,0 +1,180 @@
+name: bughunt yarn-classic probe
+on:
+  push:
+    branches: ['bughunt/yarn-classic/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+        yarn: ['1.7.0', '1.10.1', '1.22.22']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.x'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Build socket-patch
+        run: cargo build --release -p socket-patch-cli
+      - name: Install yarn
+        run: npm install --prefix "$RUNNER_TEMP/y" yarn@${{ matrix.yarn }} && node "$RUNNER_TEMP/y/node_modules/yarn/bin/yarn.js" --version
+      - name: Write harness
+        run: |
+          mkdir -p "$RUNNER_TEMP/h"
+          cat > "$RUNNER_TEMP/h/mock.py" <<'MOCKEOF'
+          #!/usr/bin/env python3
+          """Minimal Socket patch API mock: left-pad@1.3.0 patch (prepends a marker to index.js)."""
+          import base64, gzip, hashlib, io, json, os, sys, tarfile, urllib.request
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8787
+          SRC = sys.argv[2] if len(sys.argv) > 2 else None   # optional local left-pad-1.3.0.tgz
+          BASE = f"http://127.0.0.1:{PORT}"
+          NAME, VER = "left-pad", "1.3.0"
+          PURL = f"pkg:npm/{NAME}@{VER}"
+          UUID = "11111111-2222-4333-8444-555555555555"
+          MARKER = b"/* SOCKET-PATCHED-MOCK */\n"
+
+          raw = open(SRC, "rb").read() if SRC else urllib.request.urlopen(
+              f"https://registry.npmjs.org/{NAME}/-/{NAME}-{VER}.tgz").read()
+          files = {}
+          with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as t:
+              for m in t.getmembers():
+                  if m.isfile():
+                      files[m.name] = t.extractfile(m).read()
+          orig = files["package/index.js"]
+          patched = MARKER + orig
+          files["package/index.js"] = patched
+          buf = io.BytesIO()
+          with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as t:
+              for n in sorted(files):
+                  ti = tarfile.TarInfo(n); ti.size = len(files[n]); ti.mtime = 0; ti.mode = 0o644
+                  t.addfile(ti, io.BytesIO(files[n]))
+          gz = io.BytesIO()
+          with gzip.GzipFile(fileobj=gz, mode="wb", mtime=0) as g:
+              g.write(buf.getvalue())
+          TGZ = gz.getvalue()
+
+          def gsha(b): return hashlib.sha256(b"blob %d\0" % len(b) + b).hexdigest()
+          BLOBS = {gsha(orig): orig, gsha(patched): patched}
+          SRI = "sha512-" + base64.b64encode(hashlib.sha512(TGZ).digest()).decode()
+          SHA1 = hashlib.sha1(TGZ).hexdigest()
+          ART = f"{BASE}/artifacts/{UUID}/{NAME}-{VER}.tgz"
+          SUMMARY = {"uuid": UUID, "purl": PURL, "tier": "free", "cveIds": ["CVE-2026-0001"],
+                     "ghsaIds": ["GHSA-aaaa-bbbb-cccc"], "severity": "high", "title": "mock"}
+          VIEW = {"uuid": UUID, "purl": PURL, "publishedAt": "2026-01-01T00:00:00Z",
+                  "files": {"package/index.js": {"beforeHash": gsha(orig), "afterHash": gsha(patched),
+                                                 "blobContent": base64.b64encode(patched).decode()}},
+                  "vulnerabilities": {"GHSA-aaaa-bbbb-cccc": {"cves": ["CVE-2026-0001"], "summary": "s",
+                                                               "severity": "high", "description": "d"}},
+                  "description": "x", "license": "MIT", "tier": "free"}
+          GRANT = {"status": "granted", "purl": PURL, "url": ART,
+                   "artifacts": [{"kind": "tarball", "url": ART, "integrity": {"sha512": SRI, "sha1": SHA1}}],
+                   "registryOverride": None}
+
+          class H(BaseHTTPRequestHandler):
+              def log_message(self, *a): sys.stderr.write("MOCK %s\n" % (a[0] % a[1:]))
+              def send(self, code, body, ctype="application/json"):
+                  if not isinstance(body, bytes): body = json.dumps(body).encode()
+                  self.send_response(code); self.send_header("Content-Type", ctype)
+                  self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+              def do_GET(self):
+                  p = self.path.split("?")[0]
+                  if p.startswith(f"/artifacts/{UUID}/"): return self.send(200, TGZ, "application/octet-stream")
+                  if "/by-package/" in p:
+                      return self.send(200, {"patches": [dict(SUMMARY, publishedAt="2026-01-01T00:00:00Z",
+                               description="x", license="MIT", vulnerabilities={})], "canAccessPaidPatches": False})
+                  if p.endswith(f"/view/{UUID}"): return self.send(200, VIEW)
+                  if "/blob/" in p:
+                      h = p.rsplit("/", 1)[1]
+                      return self.send(200, BLOBS[h], "application/octet-stream") if h in BLOBS else self.send(404, {})
+                  self.send(404, {"error": "nf"})
+              def do_POST(self):
+                  p = self.path.split("?")[0]
+                  body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode("utf-8", "replace")
+                  if p.endswith("/patches/batch") or p.endswith("/patch/batch"):
+                      pk = [{"purl": PURL, "patches": [SUMMARY]}] if (NAME + "@" + VER) in body.replace("%40", "@") else []
+                      return self.send(200, {"packages": pk, "canAccessPaidPatches": False})
+                  if p.endswith("/package"):
+                      return self.send(200, {"results": {UUID: GRANT} if UUID in body else {}})
+                  self.send(404, {"error": "nf"})
+
+          if __name__ == "__main__":
+              print(json.dumps({"sri": SRI, "sha1": SHA1, "after": gsha(patched)}), flush=True)
+              ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+          MOCKEOF
+          cat > "$RUNNER_TEMP/h/probe.sh" <<'PROBEEOF'
+          #!/usr/bin/env bash
+          # usage: probe.sh <socket-patch bin> <yarn cmd...>
+          set -u
+          BIN="$1"; shift; Y="$*"
+          W="${PROBE_WORK:-$PWD/work}"; rm -rf "$W"; mkdir -p "$W"
+          API="--api-url http://127.0.0.1:8787 --org o --api-token x"
+          MARK='SOCKET-PATCHED-MOCK'
+          res(){ echo "RESULT $1 $2 ${3:-}"; }
+          patched(){ grep -q "$MARK" "$1/node_modules/left-pad/index.js" 2>/dev/null; }
+          mk(){ local d="$W/$1"; mkdir -p "$d"; cd "$d"
+            echo '{"name":"p","version":"1.0.0","private":true,"dependencies":{"left-pad":"1.3.0"}}' > package.json
+            [ -n "${2:-}" ] && printf '%s\n' "$2" > .yarnrc
+            $Y install --no-progress --cache-folder "$W/cache-$1" > "$W/$1.install.log" 2>&1 || { cat "$W/$1.install.log"; res "$1" BLOCKED install; return 1; }
+            cp yarn.lock "$W/$1.lock.orig"; cp node_modules/left-pad/index.js "$W/$1.index.orig"; }
+
+          # --- A: agent apply + vex + rollback
+          if mk agent; then
+            $BIN scan --apply --mode agent --json --yes $API > "$W/agent.scan.json" 2>&1; echo "agent scan exit $?"
+            patched . && res agent-apply PASS || { cat "$W/agent.scan.json"; res agent-apply FAIL; }
+            $BIN vex --output v.json $API > "$W/agent.vex.log" 2>&1; echo "vex exit $?"
+            grep -q 'pkg:npm/left-pad@1.3.0' v.json 2>/dev/null && res agent-vex PASS || { cat "$W/agent.vex.log"; res agent-vex FAIL; }
+            $BIN rollback --json --yes $API > "$W/agent.rb.json" 2>&1; echo "rollback exit $?"
+            cmp -s node_modules/left-pad/index.js "$W/agent.index.orig" && res agent-rollback PASS || { cat "$W/agent.rb.json"; res agent-rollback FAIL; }
+            $BIN scan --apply --mode agent --json --yes $API > /dev/null 2>&1; $BIN scan --apply --mode agent --json --yes $API > "$W/agent.rerun.json" 2>&1; echo "agent rerun exit $?"
+            patched . && res agent-rerun PASS || res agent-rerun FAIL
+          fi
+
+          # --- T: agent -> vendored takeover, then rollback (#336 shape)
+          if mk take; then
+            $BIN scan --apply --mode agent --json --yes $API > /dev/null 2>&1
+            $BIN scan --mode vendored --vendor-source service --json --yes $API > "$W/take.v.json" 2>&1; echo "takeover exit $?"
+            grep -q 'file:./.socket/vendor/npm/' yarn.lock && res take-vendored-wired PASS || { cat "$W/take.v.json"; res take-vendored-wired FAIL; }
+            $BIN rollback --json --yes $API > "$W/take.rb.json" 2>&1; echo "take rollback exit $?"; cat "$W/take.rb.json" | head -40
+            cmp -s yarn.lock "$W/take.lock.orig" && res take-rollback-lock PASS || res take-rollback-lock FAIL
+            $Y install --frozen-lockfile --no-progress --cache-folder "$W/cache-take" > "$W/take.reinstall.log" 2>&1; tail -3 "$W/take.reinstall.log"
+            patched . && res take-rollback-tree FAIL "node_modules still patched after rollback (#336)" || res take-rollback-tree PASS
+          fi
+
+          # --- M: vendored + offline mirror (+pruning)
+          if mk mirror 'yarn-offline-mirror "./mirror"
+          yarn-offline-mirror-pruning true'; then
+            ls mirror
+            $BIN scan --mode vendored --vendor-source service --json --yes $API > "$W/mirror.v.json" 2>&1; echo "mirror vendored exit $?"
+            F="$W/mirror-fresh"; mkdir -p "$F"; cp -r package.json yarn.lock .yarnrc .socket mirror "$F/"
+            (cd "$F" && $Y install --frozen-lockfile --offline --no-progress --cache-folder "$W/cache-mfresh" > "$W/mfresh.log" 2>&1; echo "fresh install exit $?"; tail -3 "$W/mfresh.log")
+            patched "$F" && res mirror-vendored-fresh PASS || res mirror-vendored-fresh FAIL
+            $Y install --offline --no-progress --cache-folder "$W/cache-mirror2" > "$W/mirror.in.log" 2>&1; echo "in-place install exit $?"; ls mirror
+            patched . && res mirror-vendored-inplace PASS || res mirror-vendored-inplace FAIL
+            $BIN rollback --json --yes $API > "$W/mirror.rb.json" 2>&1; echo "mirror rollback exit $?"
+            cmp -s yarn.lock "$W/mirror.lock.orig" && res mirror-rollback-lock PASS || { diff "$W/mirror.lock.orig" yarn.lock; res mirror-rollback-lock FAIL; }
+            F2="$W/mirror-fresh2"; mkdir -p "$F2"; cp -r package.json yarn.lock .yarnrc mirror "$F2/"; [ -d .socket ] && echo ".socket left: $(find .socket | head)"
+            (cd "$F2" && $Y install --frozen-lockfile --offline --no-progress --cache-folder "$W/cache-mfresh2" > "$W/mfresh2.log" 2>&1; echo "post-rollback offline install exit $?"; tail -3 "$W/mfresh2.log")
+            [ -f "$F2/node_modules/left-pad/index.js" ] && ! patched "$F2" && res mirror-postrollback-install PASS || res mirror-postrollback-install FAIL
+          fi
+          echo DONE
+          PROBEEOF
+      - name: Probe
+        run: |
+          python "$RUNNER_TEMP/h/mock.py" 8787 > "$RUNNER_TEMP/mock.log" 2>&1 &
+          for i in $(seq 1 60); do curl -s -o /dev/null -XPOST http://127.0.0.1:8787/x/package -d '{}' && break; sleep 1; done
+          BIN="$GITHUB_WORKSPACE/target/release/socket-patch"; [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          cd "$RUNNER_TEMP" && PROBE_WORK="$RUNNER_TEMP/w" bash "$RUNNER_TEMP/h/probe.sh" "$BIN" node "$RUNNER_TEMP/y/node_modules/yarn/bin/yarn.js" 2>&1 | grep -v '^Warning: --api-token\|Got: x' | tee "$RUNNER_TEMP/probe.log"
+          echo "===== SUMMARY ${{ matrix.os }} yarn ${{ matrix.yarn }}"; grep '^RESULT' "$RUNNER_TEMP/probe.log"
