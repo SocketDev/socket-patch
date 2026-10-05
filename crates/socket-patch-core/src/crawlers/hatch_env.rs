@@ -119,8 +119,10 @@ pub(crate) async fn hatch_environments_with(
     let Some(env_dir) = virtual_env_dir(&root, config.as_ref(), var) else {
         return found;
     };
-    let in_project = env_dir.starts_with(&root)
-        || std::fs::canonicalize(&env_dir).is_ok_and(|d| d.starts_with(&root));
+    // Hatch: `root in data_directory.resolve().parents`, so `..` is
+    // resolved first and the project root itself is not "inside".
+    let resolved_env_dir = resolve(&env_dir);
+    let in_project = resolved_env_dir != root && resolved_env_dir.starts_with(&root);
     let shared_flat = home_dir(var).is_some_and(|h| same_path(&env_dir, &h.join(".virtualenvs")));
 
     for id in project_ids(&root) {
@@ -547,8 +549,42 @@ fn absolutize(root: &Path, path: &str) -> PathBuf {
 
 /// An env's explicit `path`, resolved like Hatch's `(root / path).resolve()`.
 fn resolve_env_path(root: &Path, path: &str) -> PathBuf {
-    let joined = absolutize(root, path);
-    std::fs::canonicalize(&joined).unwrap_or(joined)
+    resolve(&absolutize(root, path))
+}
+
+/// Python's `Path.resolve()` (non-strict): symlinks are followed in the
+/// longest existing prefix, and `.` / `..` in the rest are folded.
+fn resolve(path: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    let mut existing = path.to_path_buf();
+    let mut rest = Vec::new();
+    while let Some(name) = existing.file_name().map(|n| n.to_os_string()) {
+        if let Ok(real) = std::fs::canonicalize(&existing) {
+            existing = real;
+            break;
+        }
+        rest.push(name);
+        if !existing.pop() {
+            break;
+        }
+    }
+    let mut out = std::fs::canonicalize(&existing).unwrap_or(existing);
+    for name in rest.into_iter().rev() {
+        out.push(name);
+    }
+    let mut folded = PathBuf::new();
+    for part in out.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                folded.pop();
+            }
+            other => folded.push(other),
+        }
+    }
+    folded
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -795,6 +831,37 @@ mod tests {
                 "test.py3.11-a",
                 "test.py3.12-a"
             ]
+        );
+    }
+
+    /// Hatch decides "inside the project" on the resolved directory
+    /// (`root in data_directory.resolve().parents`), so `../envs` is an
+    /// outside directory with the nested `<name>/<id>/<env>` layout.
+    #[tokio::test]
+    async fn parent_relative_env_dir_is_not_in_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("pyproject.toml"), PYPROJECT).unwrap();
+        let config = tmp.path().join("hatch-config.toml");
+        std::fs::write(&config, "[dirs.env]\nvirtual = \"../envs\"\n").unwrap();
+        let root = std::fs::canonicalize(&project).unwrap();
+        let id = project_ids(&root).pop().unwrap();
+        let envs = tmp.path().join("envs");
+        let ours = envs.join("my-app-core").join(&id).join("my-app-core");
+        make_venv(&ours);
+        // Some other project's flat venv in the same directory.
+        make_venv(&envs.join("other"));
+        let var = env_of(&[
+            ("HATCH_CONFIG", config.display().to_string()),
+            ("HOME", tmp.path().join("home").display().to_string()),
+        ]);
+        let found = hatch_environments_with(&project, &var).await;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].name, "default");
+        assert_eq!(
+            std::fs::canonicalize(&found[0].prefix).unwrap(),
+            std::fs::canonicalize(&ours).unwrap()
         );
     }
 
