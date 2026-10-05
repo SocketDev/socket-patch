@@ -2072,3 +2072,37 @@ async fn nuget_non_invertible_goldens_restore_or_refuse_as_documented() {
         }
     }
 }
+
+/// #363: yarn 1 fetches a git-pattern block with git from its `resolved`,
+/// so restoring a registry tarball there would still fail every install.
+/// Handed such a pin directly (discovery already refuses to attribute it),
+/// the restorer refuses it and leaves the lock byte-identical, with no
+/// registry lookup.
+#[tokio::test]
+#[serial]
+async fn yarn_classic_git_pattern_pin_is_refused() {
+    let uuid = "55555555-5555-4555-8555-555555555555";
+    let lock = format!(
+        "# yarn lockfile v1\n\n\n\"left-pad@git+https://github.com/stevemao/left-pad.git#v1.3.0\":\n  \
+         version \"1.3.0\"\n  \
+         resolved \"https://patch.socket.dev/patch/npm/left-pad/1.3.0/66666666-6666-4666-8666-666666666666/{uuid}/left-pad-1.3.0.tgz\"\n  \
+         integrity sha512-PATCHEDpatched==\n"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("yarn.lock"), &lock).unwrap();
+    let pin = HostedPin {
+        purl: "pkg:npm/left-pad@1.3.0".into(),
+        uuid: uuid.into(),
+        files: vec!["yarn.lock".into()],
+    };
+    let outcome = restore_upstream(tmp.path(), &[pin], &RestoreOptions::default()).await;
+    assert!(outcome.flush_error.is_none(), "{:?}", outcome.flush_error);
+    match &outcome.pins[..] {
+        [p] => match &p.status {
+            PinStatus::Refused(why) => assert!(why.contains("installs from git"), "{why}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        },
+        other => panic!("one pin expected: {other:?}"),
+    }
+    assert_eq!(fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(), lock);
+}
