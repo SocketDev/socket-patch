@@ -48,7 +48,6 @@ const PENDING_RAW_SPAWNS: &[&str] = &[
     "apply/in_process_gem_multicopy.rs",
     "apply/in_process_npm_multicopy.rs",
     "apply/in_process_variant_apply_failure.rs",
-    "cli/cli_dry_run_paths_e2e.rs",
     "cli/covgap_api_client.rs",
     "cli/covgap_commands_list.rs",
     "cli/telemetry_e2e.rs",
