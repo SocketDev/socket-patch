@@ -63,9 +63,14 @@ fn hosted_wheel() -> Vec<u8> {
 /// Stage `.socket/manifest.json` + the after-hash blob so `vendor` builds
 /// the vendored wheel from the prebuilt fixture server, offline.
 fn stage_manifest(root: &Path) {
-    let after = compute_git_sha256_from_bytes(PATCHED);
+    stage_manifest_with(root, UUID, PATCHED);
+}
+
+/// [`stage_manifest`] for patch `uuid` producing `patched` bytes.
+fn stage_manifest_with(root: &Path, uuid: &str, patched: &[u8]) {
+    let after = compute_git_sha256_from_bytes(patched);
     let manifest = json!({ "patches": { PURL: {
-        "uuid": UUID,
+        "uuid": uuid,
         "exportedAt": "2026-01-01T00:00:00Z",
         "files": { "six.py": {
             "beforeHash": compute_git_sha256_from_bytes(ORIG),
@@ -83,7 +88,7 @@ fn stage_manifest(root: &Path) {
         serde_json::to_vec_pretty(&manifest).unwrap(),
     )
     .unwrap();
-    std::fs::write(socket.join("blobs").join(after), PATCHED).unwrap();
+    std::fs::write(socket.join("blobs").join(after), patched).unwrap();
 }
 
 /// The built binary with every ambient `SOCKET_*` var scrubbed. An EMPTY
@@ -326,9 +331,8 @@ async fn poetry_vendored_to_hosted() {
 
 const PIPFILE: &str = "[[source]]\nurl = \"https://pypi.org/simple\"\nverify_ssl = true\nname = \"pypi\"\n\n[packages]\nsix = \"==1.16.0\"\n\n[requires]\npython_version = \"3.11\"\n";
 
-#[tokio::test]
-async fn pipenv_vendored_to_hosted() {
-    let (_tmp, root) = project();
+/// Write a Pipenv project (Pipfile + a registry Pipfile.lock pinning six).
+fn write_pipenv_project(root: &Path) {
     std::fs::write(root.join("Pipfile"), PIPFILE).unwrap();
     let lock = json!({
         "_meta": {
@@ -350,7 +354,101 @@ async fn pipenv_vendored_to_hosted() {
     let mut text = serde_json::to_string_pretty(&lock).unwrap();
     text.push('\n');
     std::fs::write(root.join("Pipfile.lock"), text).unwrap();
+}
+
+#[tokio::test]
+async fn pipenv_vendored_to_hosted() {
+    let (_tmp, root) = project();
+    write_pipenv_project(&root);
     assert_vendored_to_hosted(&root, &["Pipfile.lock"]).await;
+}
+
+/// A superseding patch for the same release (a fixed patch, or one
+/// covering more CVEs).
+const UUID_B: &str = "6d4f2b3c-8e5a-4f7b-9c9d-2e3f4a5b6c7d";
+const PATCHED_B: &[u8] = b"# six\nVERSION = '1.16.0'\nSOCKET_PATCHED = 2\n";
+
+/// A virtualenv whose six was installed from the vendored wheel of patch
+/// A (`pipenv sync` after the first vendor): its files are A's patched
+/// bytes, not the pristine release patch B is diffed against.
+fn venv_installed_from_patch_a(venv: &Path) {
+    let site = venv.join("lib/python3.11/site-packages");
+    let dist = site.join("six-1.16.0.dist-info");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(site.join("six.py"), PATCHED).unwrap();
+    std::fs::write(
+        dist.join("METADATA"),
+        "Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dist.join("WHEEL"),
+        "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py2-none-any\nTag: py3-none-any\n",
+    )
+    .unwrap();
+    std::fs::write(dist.join("INSTALLER"), "pip\n").unwrap();
+    std::fs::write(
+        dist.join("RECORD"),
+        "six.py,,\nsix-1.16.0.dist-info/METADATA,,\nsix-1.16.0.dist-info/WHEEL,,\nsix-1.16.0.dist-info/INSTALLER,,\nsix-1.16.0.dist-info/RECORD,,\n",
+    )
+    .unwrap();
+}
+
+/// #769: a Pipenv project vendored at patch A moves to the superseding
+/// patch B when the manifest offers it, as the `would_revendor` preview
+/// and the CLI contract promise, whether the checkout is lock-only or its
+/// venv was installed from A's vendored wheel. Pipfile.lock is rewired to
+/// B, A's artifact is swept, and reverting B restores the registry pin.
+#[tokio::test]
+async fn pipenv_revendors_to_a_superseding_patch() {
+    for venv_present in [false, true] {
+        let lane = if venv_present {
+            "venv from A"
+        } else {
+            "lock-only"
+        };
+        let (_tmp, root) = project();
+        write_pipenv_project(&root);
+        let registry = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+        vendor_project(&root, &["Pipfile.lock"]);
+
+        let venv = root.join("../patched-venv");
+        let mut extra: Vec<(&str, &str)> = Vec::new();
+        if venv_present {
+            venv_installed_from_patch_a(&venv);
+            extra.push(("VIRTUAL_ENV", venv.to_str().unwrap()));
+        }
+        stage_manifest_with(&root, UUID_B, PATCHED_B);
+        let (code, env) = run_cli(&root, &["vendor"], &extra);
+        assert_eq!(code, 0, "{lane}: re-vendor to B: {env:#}");
+        assert!(
+            env.to_string().contains("vendor_stale_artifact_removed"),
+            "{lane}: A's artifact is swept: {env:#}"
+        );
+        let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+        assert!(
+            lock.contains(&format!(".socket/vendor/pypi/{UUID_B}/")) && !lock.contains(UUID),
+            "{lane}: Pipfile.lock is rewired to B:\n{lock}"
+        );
+        assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+        let wheels: Vec<_> = std::fs::read_dir(root.join(format!(".socket/vendor/pypi/{UUID_B}")))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".whl"))
+            .collect();
+        assert_eq!(wheels.len(), 1, "{lane}: B's wheel is vendored");
+
+        let (code, env) = run_cli(&root, &["vendor", "--revert"], &extra);
+        assert_eq!(code, 0, "{lane}: revert B: {env:#}");
+        let reverted: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("Pipfile.lock")).unwrap())
+                .unwrap();
+        let registry: Value = serde_json::from_str(&registry).unwrap();
+        assert_eq!(
+            reverted, registry,
+            "{lane}: revert restores the registry pin"
+        );
+    }
 }
 
 const UV_LOCK: &str = r#"version = 1
