@@ -1105,10 +1105,12 @@ fn revert_array_elements(
         return ArrayRevert::Drift;
     }
 
-    let Some(span) = locate_lock_array(lock_text, scope, key) else {
+    let span = match locate_lock_array(lock_text, scope, key) {
+        Ok(span) => span,
         // The whole key is gone (uv drops an emptied group): nothing in it
         // routes through the artifact.
-        return ArrayRevert::Converged;
+        Err(ArrayMiss::Absent) => return ArrayRevert::Converged,
+        Err(ArrayMiss::Unreadable) => return ArrayRevert::Drift,
     };
     if lock_text[span.clone()] == *new_array {
         // Untouched since vendoring: restore the recorded original verbatim.
@@ -1158,15 +1160,46 @@ fn revert_array_elements(
     ArrayRevert::Reverted(text)
 }
 
+/// Why [`locate_lock_array`] found no array.
+enum ArrayMiss {
+    /// The section or the key is provably not in the lock (uv drops an
+    /// emptied group, or a `[manifest]` with nothing left in it).
+    Absent,
+    /// Something is there but not in a shape we can read: the root unit is
+    /// missing, the key is spelled differently, or the array is
+    /// unbalanced. Fail closed — it may still route through the artifact.
+    Unreadable,
+}
+
 /// Byte span of the `[…]` array assigned to `key` at line start inside
-/// `scope`, or `None` when the section or key is absent.
-fn locate_lock_array(lock_text: &str, scope: ArrayScope, key: &str) -> Option<Range<usize>> {
+/// `scope`. A miss is [`ArrayMiss::Absent`] only when no line in the scope
+/// assigns `key` (or opens the section) in ANY spelling.
+fn locate_lock_array(
+    lock_text: &str,
+    scope: ArrayScope,
+    key: &str,
+) -> Result<Range<usize>, ArrayMiss> {
+    // A line that assigns `key` however it is spaced or quoted.
+    let assigns_key = |line: &str| {
+        let l = line.trim_start();
+        let rest = l
+            .strip_prefix(key)
+            .or_else(|| l.strip_prefix(&format!("\"{key}\"")));
+        rest.is_some_and(|r| r.trim_start().starts_with('='))
+    };
     let section = match scope {
         ArrayScope::RootRequiresDev => {
-            let unit = find_unit_span(lock_text, unit_is_root)?;
+            let unit = find_unit_span(lock_text, unit_is_root).ok_or(ArrayMiss::Unreadable)?;
+            let unit_text = &lock_text[unit.clone()];
             let header = "[package.metadata.requires-dev]";
-            let hdr = unit.start + lock_text[unit.clone()].find(header)?;
-            let start = hdr + header.len();
+            let Some(hdr_rel) = unit_text.find(header) else {
+                return Err(if unit_text.contains("requires-dev") {
+                    ArrayMiss::Unreadable
+                } else {
+                    ArrayMiss::Absent
+                });
+            };
+            let start = unit.start + hdr_rel + header.len();
             // Elements are indented, so a line-leading `[` is the next
             // sub-table header.
             let end = lock_text[start..unit.end]
@@ -1176,9 +1209,18 @@ fn locate_lock_array(lock_text: &str, scope: ArrayScope, key: &str) -> Option<Ra
         }
         ArrayScope::Manifest => {
             let index = line_index(lock_text);
-            let h = index
-                .iter()
-                .position(|(_, l)| l.trim_end() == "[manifest]")?;
+            let Some(h) = index.iter().position(|(_, l)| l.trim_end() == "[manifest]") else {
+                return Err(
+                    if index
+                        .iter()
+                        .any(|(_, l)| l.trim_start().starts_with("[manifest"))
+                    {
+                        ArrayMiss::Unreadable
+                    } else {
+                        ArrayMiss::Absent
+                    },
+                );
+            };
             let end = index[h + 1..]
                 .iter()
                 .find(|(_, l)| l.starts_with('['))
@@ -1187,13 +1229,21 @@ fn locate_lock_array(lock_text: &str, scope: ArrayScope, key: &str) -> Option<Ra
         }
     };
     let prefix = format!("{key} = [");
-    let line_off = line_index(&lock_text[section.clone()])
-        .into_iter()
+    let lines = line_index(&lock_text[section.clone()]);
+    let Some(line_off) = lines
+        .iter()
         .find(|(_, l)| l.starts_with(&prefix))
-        .map(|(off, _)| section.start + off)?;
+        .map(|(off, _)| section.start + off)
+    else {
+        return Err(if lines.iter().any(|(_, l)| assigns_key(l)) {
+            ArrayMiss::Unreadable
+        } else {
+            ArrayMiss::Absent
+        });
+    };
     let open = line_off + prefix.len() - 1;
-    let end = balanced_span(lock_text, open)?;
-    Some(open..end)
+    let end = balanced_span(lock_text, open).ok_or(ArrayMiss::Unreadable)?;
+    Ok(open..end)
 }
 
 /// The two files this backend edits — both are checked for symlinks before
@@ -6376,6 +6426,46 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
         let (py, lock) = read_pair(tmp.path()).await;
         assert_eq!(py, user_py);
         assert_eq!(lock, input_lock, "our element must not be stranded");
+    }
+
+    /// A key we can't read (here re-spelled `overrides=[…]`) is not proof
+    /// the array is gone: it still routes six through the artifact, so the
+    /// revert must fail closed — drift, neither file written — never read
+    /// the locator miss as convergence and delete the artifact.
+    #[tokio::test]
+    async fn revert_treats_an_unreadable_array_key_as_drift() {
+        let input_lock = TRANSITIVE_REGISTRY_LOCK.replace(
+            "requires-python = \">=3.10\"\n",
+            "requires-python = \">=3.10\"\n\n[manifest]\noverrides = [{ name = \"other\", path = \"o.whl\" }]\n",
+        );
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let (wired_py, wired_lock) = read_pair(tmp.path()).await;
+        let respelled = wired_lock.replace("overrides = [", "overrides=[");
+        assert_ne!(respelled, wired_lock);
+        tokio::fs::write(tmp.path().join("uv.lock"), &respelled)
+            .await
+            .unwrap();
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, wired_py);
+        assert_eq!(lock, respelled);
     }
 
     /// The pair gate: when a uv.lock record is GENUINELY drift-kept (our
