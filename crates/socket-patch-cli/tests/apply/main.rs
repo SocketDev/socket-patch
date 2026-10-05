@@ -20,3 +20,4 @@ mod in_process_gem_multicopy;
 mod in_process_npm_multicopy;
 mod in_process_variant_apply_failure;
 mod lockfile_only_skip;
+mod pnpm_global_virtual_store;

@@ -179,13 +179,17 @@ moved it to, as recorded in `node_modules/.modules.yaml`), vlt's
 `node_modules/.vlt`, Bun's isolated-linker store `node_modules/.bun`,
 Deno's isolated `nodeModulesDir` store `node_modules/.deno`, and
 `node_modules/.store`, written by npm's `install-strategy=linked` and by
-Yarn 4's pnpm linker (where each entry's `package/` dir is the copy). A recorded virtual store outside the project,
-notably pnpm's global virtual store (`enableGlobalVirtualStore`, under the
-pnpm store directory), is not walked: other projects on the machine load
-the same files, so patching it in place would patch them as well.
-For the same reason, agent-mode `apply` and `rollback` fail on a direct
-dependency whose `node_modules/<dep>` link resolves into that store
-(`<store>/v<N>/links`) instead of writing through it. PDM's symlink install
+Yarn 4's pnpm linker (where each entry's `package/` dir is the copy). A recorded virtual store outside the project is not
+listed: other projects on the machine load the same files, so patching it
+in place would patch them as well. For pnpm's global virtual store
+(`enableGlobalVirtualStore`, `<store>/v<N>/links` under the pnpm store
+directory), only the entries this project reaches are walked: its
+`node_modules/<dep>` links into the store, and each entry's dependency
+links on to other entries. A workspace member's `node_modules` has no
+`.modules.yaml` of its own (pnpm writes it only at the workspace root), so
+the root's record is used, and the member's own links seed the walk. Agent-mode `apply` and `rollback` then fail on
+those copies, direct and transitive alike, instead of writing through
+them, and never report a transitive one as "not installed". PDM's symlink install
 cache gets the same treatment: with `install.cache` and
 `cache_method = symlink` (PDM 2.0–2.12), `site-packages/<pkg>` links into
 `<cache>/packages/<wheel>/lib`, and that package is refused too. The error
