@@ -1,5 +1,5 @@
 ### Ecosystems and formats (`audit-ecosystems`)
-_Last updated 2026-10-05T00:54Z · main @ 045d7ec_
+_Last updated 2026-10-05T06:55Z · main @ 045d7ec_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -20,9 +20,9 @@ _Last updated 2026-10-05T00:54Z · main @ 045d7ec_
 | E15 | 2 | Cargo.toml `[package]` is read five ways: line scanners in `cargo_crawler.rs` and `vex/product.rs`, plus three ad hoc `toml_edit` lookups (`cargo_tag`, which also accepts `[project]`; `path_crate_version`; `declared_cargo_minor`). They have drifted on BOM, `[project]` and dotted keys. `plan_cargo_toml` uses a regex scanner and `toml_edit` in one rewriter. | 5.4; 3.7 #3 | #693, #757 | filed #693, #757; `[package]` readers (#693), hosted `plan_cargo_toml` scanner (#757) |
 | E16 | 2 | CRLF has five policies in the npm family and three for `toml_edit` output, and `common::detect_eol` contradicts `LineEndings::Mixed`. Target: one line-ending policy. | #814, #815 | filed #814, #815; tracking #814, child 1 #815 |
 | E17 | 2 | "Is a bun lock present" is asked at seven sites with three semantics (lstat, `exists`, `is_file`). With a dangling `bun.lock` symlink, Bun and the writers use `bun.lockb`, but the inventory returns nothing. | 4.4 | #735 | filed #735 |
-| E18 | 3 | JS helper copies: JSON-pointer escape ×2, wiring lines↔JSON ×3, `name@spec` split ×2, `KIND_*` re-spelled as literals, uneven recursion bounds, and regexes compiled inside per-dependency loops. | 4.4 | | to verify |
+| E18 | 3 | JS helper copies: JSON-pointer escape ×2, wiring lines↔JSON ×3, `name@spec` split ×2, `KIND_*` re-spelled as literals, uneven recursion bounds, and regexes compiled inside per-dependency loops. | 4.4 | #835 | filed #835; wiring kinds + lines↔JSON codec (pointer escape in #663; `name@spec`, recursion, regex still to verify) |
 | E19 | 3 | Gem has three section models and three DEPENDENCIES-name parsers (vendored sees only the first `GEM` section, so #779). Go: `go_crawler::parse_go_mod_module` has no production caller; `vex/product.rs` has its own `module` reader that misreads the block form; `go_mod_edit.rs` lives in `vendor/`. | 5.4 | #780, #781 | filed #780, #781; gem models (#780), go.mod `module` reader (#781) |
-| E20 | 3 | Pure codecs (`bun_lockb.rs`, `bun_lock_text.rs`, `vlt_lock_text.rs`) and the neutral types (`Edit`, `Warning`, `LockfileEntry`) live outside `formats/`, which creates `formats`↔`vendor`/`redirect`/`vex` cycles. | 2.1; 4.5 #2; 4.7 J | | to verify |
+| E20 | 3 | Pure codecs (`bun_lockb.rs`, `bun_lock_text.rs`, `vlt_lock_text.rs`) and the neutral types (`Edit`, `Warning`, `LockfileEntry`) live outside `formats/`, which creates `formats`↔`vendor`/`redirect`/`vex` cycles. | 2.1; 4.5 #2; 4.7 J | #833, #834 | filed #833, #834; tracking #833, child 1 #834 (entry types) |
 | E21 | 2 | Tracking: `VendorBackend` trait + registry. The ecosystem list is enumerated at 16 production sites, and the `vend!` / `vend_installed!` macros stand in for the trait. | 2.1; 5.2; 5.8 | | to verify |
 | E22 | 2 | The JS vendor driver skeleton is copied eight times (`guard_coordinates` → … → a literal `VendorEntry`). Target: one generic driver + `NpmLockBackend`. | 4.4; 4.7 C | | to verify |
 | E23 | 2 | The `pypi_{poetry,pdm,pipenv}.rs` backends repeat one skeleton: `load_*_project`, `classify_dependency`, `check_target_guards`, `wire_*`, `revert_*`. | 5.4 | | to verify |
@@ -63,6 +63,7 @@ _Last updated 2026-10-05T00:54Z · main @ 045d7ec_
 | E58 | 3 | Production `pub fn`s with no production caller, orphaned by #277: `VendorEntry::committed_artifact_intact` and `go_sum_edit::remove_lines` (no reference at all), the hosted-vlt ledger helpers `edit_dep_id` / `lock_node_ids` / `carried_pin_original` / `vlt_heal::ledger_targets`, plus three test-only helpers compiled into production. | new finding; 3.6 | #782 | filed #782 |
 | E59 | 2 | Vendored gem `edit_lock` finds the spec only in the first `GEM` section (`section_span(…, "GEM")`); Bundler 2 writes one per source, so a gem from any later source is refused with "GEM specs has no entry". Hosted and the shared parser read every section. | new finding | #779 | in PR #805 |
 | E60 | 3 | The "any `\r\n` → CRLF" terminator rule is written 14 times, mostly outside the npm family (`common::detect_eol`, byte-identical `pypi_uv::newline_of`, inline in gem/Maven/composer/Cargo restore/Pipenv/`.npmrc`/PEP 723), and `gradle::newline_of` uses a first-line rule under the same name; hosted Cargo refuses a mixed `Cargo.lock` that restore CRLF-expands (read, not executed). | new finding | #815 | filed #815; under tracking #814 |
+| E61 | 2 | The vendored-reference scan (`scan_vendor_references`, behind `repair`, the `vendor` stranded-ref gate and the orphan sweeps) never sees NuGet or Maven wiring: `nuget.config`/`pom.xml` lack the `VENDORED` role, and both reference the bare uuid dir, which `parse_vendor_path` rejects. With a missing ledger entry, the sweep deletes a still-wired feed or repository. | new finding | #832 | filed #832 |
 
 **Handed off:** none yet.
 

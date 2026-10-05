@@ -2,7 +2,7 @@
 
 ## Part 4: JavaScript lockfiles (npm, pnpm, yarn, bun, vlt)
 
-_Last checked against main @ 045d7ec on 2026-10-05 by audit-ecosystems (§4.4 pnpm, berry gates, package-lock walks, JSON writers, bun-lock presence and CRLF policies re-checked; the rest is as of `2463257`). Owner: `audit-ecosystems`._
+_Last checked against main @ 045d7ec on 2026-10-05 by audit-ecosystems (§4.4 pnpm, berry gates, package-lock walks, JSON writers, bun-lock presence, CRLF policies, wiring-kind and lines↔JSON helpers and the 4.5 #2 layering re-checked; the rest is as of `2463257`). Owner: `audit-ecosystems`._
 
 > Scope: `vendor/{npm_*,pnpm_*,yarn_*,bun_*,vlt_*,berry_zip}.rs`, `formats/{pnpm,yarn,bun,registry}`, `crawlers/npm_crawler*`, `vendor/lock_inventory/*`, `vex/discover/{npm,yarn,bun,vlt}.rs`, and the JS parts of `patch/redirect/` and `hosted/vlt.rs`. Line counts are production / inline-test, split at the first top-level `#[cfg(test)] mod`.
 
@@ -78,13 +78,13 @@ Each shares 55-67 distinct lines with `vendor_pnpm`. `read_project`, `preflight_
   - `common::JsonLayout`: keeps BOM, indent, EOL and trailer. Every package-lock writer (vendored, hosted, restore) and the npm and berry `package.json` writers use it since #357.
   - `common::serialize_json(indent)`: detected indent, always LF, no BOM. It still writes vendored pnpm's root `package.json` on vendor and revert ([`pnpm_lock.rs#L326-L327`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/vendor/pnpm_lock.rs#L326-L327)), which is parsed without BOM support, so a CRLF `package.json` comes back LF after `vendor --revert`. {{E53}}
   - `redirect::serialize_json`: fixed 2-space, LF; now used only for NuGet `packages.lock.json` (hosted and restore).
-- **Wiring lines ↔ JSON:** three copies with different handling of malformed input (`pnpm_lock.rs:3162`, `yarn_classic_lock.rs:1088`, `recover.rs::lines_of`).
+- **Wiring lines ↔ JSON:** two identical encoders (`yarn_classic_lock::lines_to_json`, `pnpm_lock::lines_value`) and three decoders that have drifted: yarn's `json_to_lines` refuses a non-string element, while `pnpm_lock::value_lines` and `recover::lines_of` silently drop it. {{E18}}
 - **sha512 SRI formatting** is inlined at `npm_pack.rs:27`, `bun_lock.rs:388` and `vlt_preflight.rs:70`. `utils/digest.rs` has no SRI helper.
 - **npm tarball URLs:** the canonical `registry_fetch::npm_tarball_url` is re-implemented at `lock_inventory/vlt.rs:141` and `bun_lockb.rs:235`. The latter hard-codes `registry.npmjs.org` and **ignores `SOCKET_NPM_REGISTRY`**. There are two `NPM_REGISTRY` constants, one with a trailing slash and one without. {{E02}}
 - **vlt `registry_base`:** two divergent implementations (`upstream/vlt.rs:55` vs `lock_inventory/vlt.rs:104`) with different fallback orders and unknown-alias behavior. {{E03}}
 - **"Is a bun lock present":** seven sites with three semantics. lstat (`lock_inventory/bun.rs::bun_text_lock_present`, which also feeds the GC in-use probe, and VEX `DiscoverCtx::exists`) treats a dangling `bun.lock` symlink as present; `Path::exists` (`hosted/engine.rs::bun_lock_present`, `bun_lock.rs::binary_lock_drives`, `bun_workspace.rs`, CLI `repair.rs`) and `is_file` (`pkg_managers.rs`) treat it as absent, like Bun itself. Proved on `045d7ec`: with a dangling `bun.lock` beside a `bun.lockb` that Bun installs from, the inventory returns nothing while vendored and hosted write `bun.lockb`. {{E17}}
 - **`name@spec` splitting** is written twice (`yarn_classic_lock::split_pattern`, `bun_lock_text::split_name_spec`). npm purl → (name, version) is parsed three more times outside `utils/purl.rs`.
-- **Wiring `KIND_*` constants** are private to each backend but re-spelled as string literals in `recover.rs` (7 sites), `state.rs` and `bun_lock.rs`.
+- **Wiring `KIND_*` constants** are private to each backend but re-spelled as string literals in `recover.rs` (7 production sites); the `state.rs` copy is test-only. {{E18}}
 - **Recursion depth:** the legacy npm `dependencies` recursion is bounded at 64 in two places and unbounded in two others.
 - **Regex compilation inside per-dependency loops** (`redirect:3013`, `:3305`).
 
@@ -102,9 +102,9 @@ Five different answers to one question, and every one of them is a bug class (se
 1. **Silos with no trait** (see 4.1).
 2. **Layering is inverted and cyclic.**
    - 33 non-test files in `patch/`, `vex/`, `formats/`, `hosted/` and `crawlers/` import grammar from `vendor::*` backends.
-   - `formats/pnpm/mod.rs:36-37` and `formats/bun/mod.rs:11` import from `vendor`, and `formats/pnpm/hosted.rs` imports `patch::redirect`.
+   - On `045d7ec`, `formats/{cargo,composer,gem,pnpm}/mod.rs` import the entry types from `vendor::lock_inventory`, `formats/bun/mod.rs:11` imports `vendor::bun_lock_text`, all four `formats/*/hosted.rs` import `patch::redirect`, and `formats/composer` and `formats/gem` import `crawlers`. {{E20}}
    - `vendor` imports `patch::redirect` in about 12 places.
-   - Several codecs are already pure and are simply in the wrong place. `bun_lockb.rs`, `bun_lock_text.rs` and `vlt_lock_text.rs` do no I/O and would pass the `formats` purity guard (`formats/mod.rs:43-91`) unchanged.
+   - Several codecs are already pure and are simply in the wrong place. `bun_lockb.rs`, `bun_lock_text.rs` and `vlt_lock_text.rs` do no I/O and would pass the `formats` purity guard (`formats/mod.rs:43-91`) unchanged. {{E20}}
 3. **God files and long functions.**
    - `pnpm_lock.rs` is 8,515 lines.
    - Longest drivers: `vendor_yarn_berry` 396 lines, `vendor_npm` 314, `vendor_bun` 304, `vendor_pnpm_legacy` 290, `vendor_pnpm` 251, `revert_pnpm_opts` 234, `rewrite_yarn_berry` 272, `plan_hosted` 236, `recover_lock_entry` 221, `bun_lockb::meta_hash` 187.
