@@ -235,9 +235,18 @@ mod tests {
     #[test]
     fn legacy_formats_warn_stale_install_risk_once() {
         for (fixture, warns) in [
-            (include_str!("../../../tests/fixtures/pdm-native/0.12.3.lock"), true),
-            (include_str!("../../../tests/fixtures/pdm-native/2.8.2.lock"), true),
-            (include_str!("../../../tests/fixtures/pdm-native/2.29.2.lock"), false),
+            (
+                include_str!("../../../tests/fixtures/pdm-native/0.12.3.lock"),
+                true,
+            ),
+            (
+                include_str!("../../../tests/fixtures/pdm-native/2.8.2.lock"),
+                true,
+            ),
+            (
+                include_str!("../../../tests/fixtures/pdm-native/2.29.2.lock"),
+                false,
+            ),
         ] {
             let mut result = RewriteResult::default();
             rewrite(
@@ -410,7 +419,11 @@ mod parse_reuse_equivalence_tests {
                     let what = format!("{fixture} extra={extra} crlf={crlf}");
                     let mut got = RewriteResult::default();
                     rewrite(&files, &deps, &mut got);
-                    g.case(what.replace(' ', "/"), &(&files, &deps), &format!("{got:?}"));
+                    g.case(
+                        what.replace(' ', "/"),
+                        &(&files, &deps),
+                        &format!("{got:?}"),
+                    );
                     confirmed += got.confirmed_pdm_uuids.len();
 
                     let mut again = files.clone();
@@ -427,5 +440,57 @@ mod parse_reuse_equivalence_tests {
         }
         assert!(confirmed > 100, "only {confirmed} confirmed");
         g.finish();
+    }
+
+    /// A dozen patched packages in one lock cost one whole-lock render and
+    /// re-parse, not one per package (#762).
+    #[test]
+    fn many_patches_render_the_lock_once() {
+        use crate::utils::lock_fragments::RENDERS;
+        let url = |name: &str| {
+            format!("https://patch.socket.dev/patch/pypi/{name}/a/{name}-1.26.18-py3-none-any.whl")
+        };
+        let mut checked = 0;
+        for (fixture, lock) in fixtures() {
+            for crlf in [false, true] {
+                let mut lock = grown(&lock.replace("\r\n", "\n"), 11);
+                if crlf {
+                    lock = lock.replace('\n', "\r\n");
+                }
+                let names = std::iter::once("urllib3".to_string())
+                    .chain((0..11).map(|n| format!("pkg{n}")));
+                let deps: Vec<DepOverride> = names
+                    .enumerate()
+                    .map(|(n, name)| DepOverride {
+                        ecosystem: "pypi".into(),
+                        artifact_url: url(&name),
+                        name,
+                        namespace: None,
+                        version: "1.26.18".into(),
+                        token: String::new(),
+                        patch_uuid: format!("00000000-0000-4000-8000-{n:012}"),
+                        registry_override: None,
+                        integrity: Integrity {
+                            sha256: Some("a".repeat(64)),
+                            ..Default::default()
+                        },
+                    })
+                    .collect();
+                let files = BTreeMap::from([("pdm.lock".to_string(), lock)]);
+                RENDERS.with(|renders| renders.set(0));
+                let mut got = RewriteResult::default();
+                rewrite(&files, &deps, &mut got);
+                if got.confirmed_pdm_uuids.len() != 12 {
+                    continue; // a generation this dep shape doesn't land on
+                }
+                checked += 1;
+                assert_eq!(
+                    RENDERS.with(|renders| renders.get()),
+                    1,
+                    "{fixture} crlf={crlf}"
+                );
+            }
+        }
+        assert!(checked >= 20, "only {checked} locks landed every dep");
     }
 }

@@ -92,7 +92,9 @@ pub(super) fn rewrite_poetry(
                             }
                         }
                         Err(detail) => {
-                            result.refused_python_lock_uuids.insert(dep.patch_uuid.clone());
+                            result
+                                .refused_python_lock_uuids
+                                .insert(dep.patch_uuid.clone());
                             result.warnings.push(RewriteWarning {
                                 code: "redirect_poetry_lock_unsupported".into(),
                                 detail: format!("{path}: {detail}"),
@@ -100,7 +102,9 @@ pub(super) fn rewrite_poetry(
                             continue;
                         }
                     }
-                    result.confirmed_python_lock_uuids.insert(dep.patch_uuid.clone());
+                    result
+                        .confirmed_python_lock_uuids
+                        .insert(dep.patch_uuid.clone());
                     content = rewrite.text;
                     if !stale_warned {
                         if let Some(format) =
@@ -136,14 +140,18 @@ pub(super) fn rewrite_poetry(
                 }
                 // Already redirected to this artifact (idempotent re-scan).
                 Ok(Some(_)) => {
-                    result.confirmed_python_lock_uuids.insert(dep.patch_uuid.clone());
+                    result
+                        .confirmed_python_lock_uuids
+                        .insert(dep.patch_uuid.clone());
                 }
                 Ok(None) => result.warnings.push(RewriteWarning {
                     code: "redirect_poetry_entry_not_found".into(),
                     detail: format!("no {path} entry for {}@{}", dep.name, dep.version),
                 }),
                 Err(detail) => {
-                    result.refused_python_lock_uuids.insert(dep.patch_uuid.clone());
+                    result
+                        .refused_python_lock_uuids
+                        .insert(dep.patch_uuid.clone());
                     result.warnings.push(RewriteWarning {
                         code: "redirect_poetry_lock_unsupported".into(),
                         detail: format!("{path}: {detail}"),
@@ -268,10 +276,40 @@ mod equivalence_tests {
                     let mut again = files.clone();
                     again.extend(got.files.clone());
                     let got = run(rewrite_poetry, &again, &deps);
-                    g.case(format!("{what}/re-run"), &(&again, &deps), &format!("{got:?}"));
+                    g.case(
+                        format!("{what}/re-run"),
+                        &(&again, &deps),
+                        &format!("{got:?}"),
+                    );
                 }
             }
         }
         g.finish();
+    }
+
+    /// A dozen patched packages in one lock cost one whole-lock render and
+    /// re-parse, not one per package (#760).
+    #[test]
+    fn many_patches_render_the_lock_once() {
+        use crate::utils::lock_fragments::RENDERS;
+        for version in VERSIONS.iter().filter(|version| !version.starts_with("0.")) {
+            for crlf in [false, true] {
+                let mut lock = grown(version, 11);
+                if crlf {
+                    lock = lock.replace('\n', "\r\n");
+                }
+                let files = BTreeMap::from([("poetry.lock".to_string(), lock)]);
+                let mut deps = vec![dep("urllib3", "1.26.18", Some(SHA), 0)];
+                deps.extend((0..11).map(|i| dep(&format!("pkg{i}"), "1.26.18", Some(SHA), i + 1)));
+                RENDERS.with(|renders| renders.set(0));
+                let got = run(rewrite_poetry, &files, &deps);
+                assert_eq!(got.confirmed_python_lock_uuids.len(), 12, "{version}");
+                assert_eq!(
+                    RENDERS.with(|renders| renders.get()),
+                    1,
+                    "{version} crlf={crlf}"
+                );
+            }
+        }
     }
 }

@@ -13,6 +13,13 @@ use toml_edit::Table;
 
 use crate::utils::line_endings::majority_terminator;
 
+#[cfg(test)]
+thread_local! {
+    /// Whole-lock renders this thread's rewrites took, each followed by a
+    /// full re-parse: what a hosted rewrite of N deps must not pay N times.
+    pub(crate) static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Takes `name`'s fragments of `text` from its (spanned) parse.
 pub(crate) type FragmentsIn =
     fn(&toml_edit::Document<String>, &str, &str) -> Result<Vec<String>, String>;
@@ -212,6 +219,8 @@ pub(crate) fn finish<'a>(
     before: Result<Vec<String>, String>,
     fragments_in: FragmentsIn,
 ) -> Result<FragmentRewrite<'a>, String> {
+    #[cfg(test)]
+    RENDERS.with(|renders| renders.set(renders.get() + 1));
     let before = before?;
     let rendered = crate::utils::python_lock::preserve_line_endings(text, rendered);
     let after_doc = toml_edit::Document::parse(rendered).map_err(|e| e.to_string())?;

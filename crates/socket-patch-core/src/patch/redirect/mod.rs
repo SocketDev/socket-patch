@@ -48,41 +48,41 @@ mod pdm;
 mod pipenv;
 pub mod presence;
 // The pnpm hosted planner lives with the format's model.
-use crate::formats::pnpm::plan_hosted;
+use crate::formats::cargo::hosted::CargoLockPlan;
+#[cfg(test)]
+use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
 use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::gemfile;
 use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
 use crate::formats::gem::lock_lists_direct_dependency;
-pub(crate) use crate::formats::yarn::is_berry_lock;
-use crate::formats::cargo::hosted::CargoLockPlan;
-#[cfg(test)]
-use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
+use crate::formats::pnpm::plan_hosted;
 use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
+pub(crate) use crate::formats::yarn::is_berry_lock;
+pub mod gradle;
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 mod poetry;
 #[cfg(test)]
 mod python_lock_equivalence_tests;
 mod requirements;
-pub mod gradle;
 pub use requirements::preflight_requirements_takeover;
+pub(crate) mod hosted_url;
 mod staged;
 mod state;
-pub(crate) mod hosted_url;
 pub mod upstream;
 pub mod vlt;
 pub mod vlt_heal;
 pub mod vlt_preflight;
-pub use state::{
-    load_redirect_state, save_redirect_state,
-    CorruptRedirectState, RedirectState, REDIRECT_STATE_REL,
-};
 /// Hosted-artifact leaf ownership rule, shared with `vex`'s bun lockfile
 /// discovery (which recovers a URL tuple's version from that leaf).
 pub(crate) use hosted_url::{hosted_url_names, hosted_url_version};
+pub use state::{
+    load_redirect_state, save_redirect_state, CorruptRedirectState, RedirectState,
+    REDIRECT_STATE_REL,
+};
 
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -4009,7 +4009,12 @@ fn rewrite_yarn_berry_with_manifests(
             result.edits.push(FileEdit {
                 path: BERRY_MANIFEST.into(),
                 kind: "redirect_yarn_berry_resolution".into(),
-                action: if original.is_some() { "rewritten" } else { "added" }.into(),
+                action: if original.is_some() {
+                    "rewritten"
+                } else {
+                    "added"
+                }
+                .into(),
                 key: Some(selector),
                 original: original.map(Value::String),
                 new: Some(Value::String(dep.artifact_url.clone())),
@@ -4251,7 +4256,10 @@ impl BerryResolutionsPin {
         }
         let mut changed = Vec::new();
         for selector in &self.selectors {
-            let previous = table.get(selector).and_then(Value::as_str).map(str::to_string);
+            let previous = table
+                .get(selector)
+                .and_then(Value::as_str)
+                .map(str::to_string);
             if previous.as_deref() != Some(url) {
                 table.insert(selector.clone(), Value::String(url.to_string()));
                 changed.push((selector.clone(), previous));
@@ -4433,7 +4441,11 @@ fn berry_catalog_selectors(yarnrc: Option<&str>, name: &str, ranges: &[&str]) ->
 /// order before the edit (`was_sorted`, from [`berry_entries_sorted`]; a
 /// hand-edited lock) keeps the entry in place, so a pin and its rollback
 /// still round-trip byte-exactly.
-pub(crate) fn berry_reposition_blocks(blocks: &mut Vec<String>, moved: &[String], was_sorted: bool) {
+pub(crate) fn berry_reposition_blocks(
+    blocks: &mut Vec<String>,
+    moved: &[String],
+    was_sorted: bool,
+) {
     if !was_sorted {
         return;
     }
@@ -4457,7 +4469,6 @@ pub(crate) fn berry_reposition_blocks(blocks: &mut Vec<String>, moved: &[String]
         blocks.insert(to, block);
     }
 }
-
 
 // ── bun.lock (text lockfile) ─────────────────────────────────────────────────
 // A registry 4-tuple `["name@version", "<registry>", {deps}, "sha512-…"]` is
@@ -5058,7 +5069,6 @@ fn rewrite_uv_lock(
         }
     }
 }
-
 
 // ── composer.lock ────────────────────────────────────────────────────────────
 /// Whether `text` points at `artifact_url` in any spelling a rewritten file may
@@ -8069,7 +8079,10 @@ mod tests {
             let files = BTreeMap::from([("nuget.config".into(), config)]);
             let result = rewrite_registry_redirect(&files, &[nuget_override()]);
             let out = result.files.get("nuget.config").expect("config rewritten");
-            assert!(out.contains(&source), "original source bytes preserved: {out}");
+            assert!(
+                out.contains(&source),
+                "original source bytes preserved: {out}"
+            );
             // XML normalizes literal attribute whitespace to spaces, but
             // preserves character references. The fallback must keep the
             // same source identity under a real XML reader, not just ours.
@@ -8626,7 +8639,11 @@ mod tests {
     #[test]
     fn yarn_berry_hosted_pin_routes_resolutions_to_a_tarball_entry() {
         let checksum = format!("10c0/{}", "7".repeat(128));
-        let scoped_url = berry_hosted_url("@isaacs/string-locale-compare", "string-locale-compare", "1.1.0");
+        let scoped_url = berry_hosted_url(
+            "@isaacs/string-locale-compare",
+            "string-locale-compare",
+            "1.1.0",
+        );
         let plain_url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
         let scoped = DepOverride {
             namespace: Some("@isaacs".into()),
@@ -8659,8 +8676,14 @@ mod tests {
             )),
             "unscoped entry re-keyed to its tarball: {out}"
         );
-        assert!(!out.contains("__archiveUrl") && !out.contains("@npm:"), "{out}");
-        assert!(out.ends_with("linkType: hard\n"), "trailing newline kept: {out:?}");
+        assert!(
+            !out.contains("__archiveUrl") && !out.contains("@npm:"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("linkType: hard\n"),
+            "trailing newline kept: {out:?}"
+        );
         let manifest: Value = serde_json::from_str(&r.files["package.json"]).unwrap();
         assert_eq!(
             manifest["resolutions"],
@@ -8672,11 +8695,17 @@ mod tests {
         );
         assert_eq!(manifest["name"], "app", "the rest of the manifest is kept");
         assert_eq!(
-            r.edits.iter().filter(|e| e.kind == "redirect_yarn_berry_entry").count(),
+            r.edits
+                .iter()
+                .filter(|e| e.kind == "redirect_yarn_berry_entry")
+                .count(),
             2
         );
         assert_eq!(
-            r.edits.iter().filter(|e| e.kind == "redirect_yarn_berry_resolution").count(),
+            r.edits
+                .iter()
+                .filter(|e| e.kind == "redirect_yarn_berry_resolution")
+                .count(),
             2
         );
     }
@@ -8909,10 +8938,7 @@ mod tests {
         rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         let out = &r.files["yarn.lock"];
-        let keys: Vec<&str> = out
-            .lines()
-            .filter(|l| l.starts_with('"'))
-            .collect();
+        let keys: Vec<&str> = out.lines().filter(|l| l.starts_with('"')).collect();
         assert_eq!(
             keys,
             vec![
@@ -8956,7 +8982,11 @@ mod tests {
         let mut again = RewriteResult::default();
         rewrite_yarn_berry(&pinned, std::slice::from_ref(&ovr), &mut again);
         assert!(again.warnings.is_empty(), "{:?}", again.warnings);
-        assert!(again.files.is_empty(), "repeat run rewrites nothing: {:?}", again.files);
+        assert!(
+            again.files.is_empty(),
+            "repeat run rewrites nothing: {:?}",
+            again.files
+        );
         // A pin already complete is confirmed without a write.
         assert!(again.confirmed_yarn_berry_uuids.contains(BERRY_UUID));
 
@@ -8969,7 +8999,10 @@ mod tests {
         assert!(out.contains(&format!("\"left-pad@{new_url}\":")), "{out}");
         assert!(!out.contains(BERRY_UUID), "{out}");
         let manifest: Value = serde_json::from_str(&repin.files["package.json"]).unwrap();
-        assert_eq!(manifest["resolutions"], json!({"left-pad@npm:^1.3.0": new_url}));
+        assert_eq!(
+            manifest["resolutions"],
+            json!({"left-pad@npm:^1.3.0": new_url})
+        );
     }
 
     /// The URL-keyed lock entry alone is half a pin: with its manifest
@@ -9216,7 +9249,9 @@ mod tests {
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         let out = &r.files["yarn.lock"];
         assert!(
-            out.contains(&format!("\"left-pad@{url}\":\n  version: 1.3.0\n  resolution: \"left-pad@{url}\"\n")),
+            out.contains(&format!(
+                "\"left-pad@{url}\":\n  version: 1.3.0\n  resolution: \"left-pad@{url}\"\n"
+            )),
             "{out}"
         );
         assert!(!out.contains("__archiveUrl"), "{out}");
@@ -9242,10 +9277,17 @@ mod tests {
                 "{{\n  \"name\": \"app\",\n  \"resolutions\": {{\n    \"{selector}\": \"1.3.0\"\n  }}\n}}\n"
             );
             let mut r = RewriteResult::default();
-            rewrite_yarn_berry(&berry_files(berry_lock("10c0"), manifest), std::slice::from_ref(&ovr), &mut r);
+            rewrite_yarn_berry(
+                &berry_files(berry_lock("10c0"), manifest),
+                std::slice::from_ref(&ovr),
+                &mut r,
+            );
             assert!(r.files.is_empty(), "{label}: {:?}", r.files);
             assert_eq!(
-                r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
+                r.warnings
+                    .iter()
+                    .map(|w| w.code.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["redirect_yarn_berry_resolutions_conflict"],
                 "{label}"
             );
@@ -9270,12 +9312,20 @@ mod tests {
             "mirror tarball"
         );
         // An unrelated user entry is kept as-is next to ours.
-        let manifest = "{\n  \"name\": \"app\",\n  \"resolutions\": {\n    \"other\": \"2.0.0\"\n  }\n}\n";
+        let manifest =
+            "{\n  \"name\": \"app\",\n  \"resolutions\": {\n    \"other\": \"2.0.0\"\n  }\n}\n";
         let mut r = RewriteResult::default();
-        rewrite_yarn_berry(&berry_files(berry_lock("10c0"), manifest.into()), std::slice::from_ref(&ovr), &mut r);
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), manifest.into()),
+            std::slice::from_ref(&ovr),
+            &mut r,
+        );
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         let m: Value = serde_json::from_str(&r.files["package.json"]).unwrap();
-        assert_eq!(m["resolutions"], json!({"other": "2.0.0", "left-pad@npm:^1.3.0": url}));
+        assert_eq!(
+            m["resolutions"],
+            json!({"other": "2.0.0", "left-pad@npm:^1.3.0": url})
+        );
 
         let mut files = BTreeMap::new();
         files.insert("yarn.lock".to_string(), berry_lock("10c0"));
@@ -9283,7 +9333,10 @@ mod tests {
         rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.is_empty(), "{:?}", r.files);
         assert_eq!(
-            r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
+            r.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
             vec!["redirect_yarn_berry_manifest_missing"]
         );
 
@@ -9294,10 +9347,17 @@ mod tests {
             berry_lock("10c0")
         );
         let mut r = RewriteResult::default();
-        rewrite_yarn_berry(&berry_files(with_patch, berry_manifest()), std::slice::from_ref(&ovr), &mut r);
+        rewrite_yarn_berry(
+            &berry_files(with_patch, berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut r,
+        );
         assert!(r.files.is_empty(), "{:?}", r.files);
         let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
-        assert!(codes.contains(&"redirect_yarn_berry_shared_descriptor"), "{codes:?}");
+        assert!(
+            codes.contains(&"redirect_yarn_berry_shared_descriptor"),
+            "{codes:?}"
+        );
     }
 
     /// Yarn routes a URL locator to its tarball fetcher only when it is an
@@ -9322,7 +9382,10 @@ mod tests {
             assert!(r.files.is_empty(), "{url}: nothing written");
             assert!(r.edits.is_empty(), "{url}: {:?}", r.edits);
             assert_eq!(
-                r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
+                r.warnings
+                    .iter()
+                    .map(|w| w.code.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["redirect_yarn_berry_artifact_url_unsupported"],
                 "{url}"
             );
@@ -12586,7 +12649,11 @@ mod tests {
                 let out = r.files.get("Gemfile.lock").expect("lock rewritten");
                 let rows: Vec<&str> = out
                     .lines()
-                    .filter(|l| l.trim_start().starts_with("rails (7.0.0)") && l.starts_with("  ") && !l.starts_with("    "))
+                    .filter(|l| {
+                        l.trim_start().starts_with("rails (7.0.0)")
+                            && l.starts_with("  ")
+                            && !l.starts_with("    ")
+                    })
                     .collect();
                 assert_eq!(
                     rows,
@@ -12599,7 +12666,11 @@ mod tests {
                     "{entry}: the entry keeps its line ending: {out:?}"
                 );
                 let model = crate::formats::gem::GemfileLock::parse(out);
-                assert_eq!(model.checksum("rails", "7.0.0"), Some(patched.as_str()), "{entry}");
+                assert_eq!(
+                    model.checksum("rails", "7.0.0"),
+                    Some(patched.as_str()),
+                    "{entry}"
+                );
                 assert!(!out.contains("\r\r"), "line endings kept: {out:?}");
                 let edit = r
                     .edits
@@ -12614,7 +12685,10 @@ mod tests {
                 files.insert("Gemfile.lock".to_string(), out.clone());
                 let again = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
                 assert!(
-                    !again.edits.iter().any(|e| e.kind == "redirect_gemfile_lock_checksum"),
+                    !again
+                        .edits
+                        .iter()
+                        .any(|e| e.kind == "redirect_gemfile_lock_checksum"),
                     "{entry}: rerun is a no-op: {:?}",
                     again.edits
                 );
@@ -13118,11 +13192,19 @@ mod tests {
         let redacted = format!(
             "https://patch.socket.dev/patch/npm/left-pad/1.3.0/<redacted>/{uuid}/left-pad-1.3.0.tgz?x=1"
         );
-        assert_eq!(redact_grant_token(&url, &url, uuid), redacted, "the URL alone");
+        assert_eq!(
+            redact_grant_token(&url, &url, uuid),
+            redacted,
+            "the URL alone"
+        );
         let text = format!("vlt would fail to verify {url}: fetch error GET {url}: reset");
-        let want = format!("vlt would fail to verify {redacted}: fetch error GET {redacted}: reset");
+        let want =
+            format!("vlt would fail to verify {redacted}: fetch error GET {redacted}: reset");
         assert_eq!(redact_grant_token(&text, &url, uuid), want, "every quote");
-        assert!(!redact_grant_token(&text, &url, uuid).contains(token), "no token left");
+        assert!(
+            !redact_grant_token(&text, &url, uuid).contains(token),
+            "no token left"
+        );
         let registry = format!("https://patch.socket.dev/patch-registry/npm/{token}/{uuid}");
         assert_eq!(
             redact_grant_token(&registry, &registry, uuid),
@@ -14877,7 +14959,10 @@ mod tests {
             ("crlf", lf.replace('\n', "\r\n")),
             ("tabs", lf.replace("  ", "\t")),
             ("bom", format!("\u{feff}{lf}")),
-            ("bom+crlf+tabs", format!("\u{feff}{}", lf.replace("  ", "\t").replace('\n', "\r\n"))),
+            (
+                "bom+crlf+tabs",
+                format!("\u{feff}{}", lf.replace("  ", "\t").replace('\n', "\r\n")),
+            ),
         ];
         for (shape, pristine) in shapes {
             let mut files = BTreeMap::new();
@@ -14893,7 +14978,10 @@ mod tests {
                     "http://patch.test/left-pad-1.3.0.tgz",
                 )
                 .replace("sha512-UPSTREAM==", "sha512-PATCHED==");
-            assert_eq!(out, &expected, "{shape}: only the rewired values may change");
+            assert_eq!(
+                out, &expected,
+                "{shape}: only the rewired values may change"
+            );
         }
     }
 
@@ -17237,7 +17325,8 @@ packages:
             );
 
             // One edit; its fragments are the on-disk bytes of the entry.
-            let lock_edits: Vec<&FileEdit> = r.edits.iter().filter(|e| e.path == "yarn.lock").collect();
+            let lock_edits: Vec<&FileEdit> =
+                r.edits.iter().filter(|e| e.path == "yarn.lock").collect();
             assert_eq!(lock_edits.len(), 1, "{label}");
             let edit = lock_edits[0];
             let (orig, new) = (
@@ -17247,15 +17336,8 @@ packages:
             assert_eq!(
                 (orig, new),
                 (
-                    respell(
-                        lf_edit
-                            .original
-                            .as_ref()
-                            .unwrap()
-                            .as_str()
-                            .unwrap()
-                    )
-                    .trim_start_matches('\u{feff}'),
+                    respell(lf_edit.original.as_ref().unwrap().as_str().unwrap())
+                        .trim_start_matches('\u{feff}'),
                     respell(lf_edit.new.as_ref().unwrap().as_str().unwrap())
                         .trim_start_matches('\u{feff}'),
                 ),
@@ -19326,7 +19408,11 @@ packages:
             format!(
                 "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n{key}:\n  version: 9.0.1\n  \
                  resolution: \"x\"\n{}  languageName: node\n  linkType: hard\n",
-                if bin { "  bin:\n    uuid: dist/bin/uuid\n" } else { "" }
+                if bin {
+                    "  bin:\n    uuid: dist/bin/uuid\n"
+                } else {
+                    ""
+                }
             )
         };
         let needs = |lock: String| berry_pin_needs_manifest(&berry_bin_entries(&lock), &dep);
@@ -19337,9 +19423,14 @@ packages:
         assert!(!needs(entry("\"uuid@npm:other-uuid@^9.0.0\"", true)));
         assert!(!needs(entry("\"uuid@npm:^9.0.0, other@npm:^1.0.0\"", true)));
         assert!(!needs(entry("\"uuid@patch:uuid@npm%3A9.0.1#x\"", true)));
-        assert!(!needs(entry("\"uuid@https://mirror.example/uuid-9.0.1.tgz\"", true)));
+        assert!(!needs(entry(
+            "\"uuid@https://mirror.example/uuid-9.0.1.tgz\"",
+            true
+        )));
         // Another version of the package (`9.0.10` shares the prefix).
-        assert!(!needs(entry("\"uuid@npm:^9.0.0\"", true).replace("9.0.1\n", "9.0.10\n")));
+        assert!(!needs(
+            entry("\"uuid@npm:^9.0.0\"", true).replace("9.0.1\n", "9.0.10\n")
+        ));
     }
 
     /// A bun URL 3-tuple already at the CURRENT artifact URL but with a stale
