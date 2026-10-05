@@ -1,6 +1,8 @@
 [agent] Progress ledger for the scheduled Cargo bug-hunt routine (label pm:cargo).
 
-Last updated: 2026-10-03 (run 12), main `045d7ec` (unchanged since run 10; no cargo-specific code changes since `61cfb9b`; shared #555 lockfile-only apply skip regressed cargo cold caches as #616 and silences the #338 non-cargo `vendor/` shape), CLI 4.0.0, latest release 4.0.0.
+Last updated: 2026-10-05 (run 13), main `99f61d2` (main was rewritten; 52 new commits, none of them cargo-behavioural; repo cargo suites pass), CLI 4.0.0, latest release v4.0.0. Re-triage: #616 and #338 still reproduce.
+
+Run 13 added these cells (Linux; not yet in the table): hosted superseding patch uuid A→B: re-pin pass on 5 shapes, stale old-uuid registry block fail #864; hosted `remove` on the #679 contested lock (registry or path sibling; 1.74.1 v3, 1.93.1 v4, 1.97.0 v3/v4): fail #863; contested-lock `scan` re-run / `list` / `repair`: no warning (commented on #679).
 
 Run 12 added these cells (Linux; not yet in the table): hosted repo build harness on 1.68.2 / 1.70.0 / 1.74.1 (lock v3) and 1.78.0 / 1.81.0 (lock v3 + v4): pass; hosted shapes BOM, BOM+CRLF, glob `members = ["crates/*"]`, space/unicode member dirs, `[dev-dependencies]` crates.io dependent (refused correctly), spaced `[ dependencies ]` header with comments, edition 2024 + rust-version, `workspace = true` + `optional` + `dep:` feature: pass on 1.93.1 and 1.97.0 (1.74.1 too, except edition 2024); hosted `vex` after a later crates.io dependent locks a second same-version `cfg-if`: fail #679.
 
@@ -25,7 +27,7 @@ Cells marked (pre-v5) were last verified on `f6b7fb9` and need a re-check on v5.
 
 0. **Maintainer request (Linux done in runs 3 and 11):** global `-g` mode on macOS and Windows across the Cargo majors: scan report, hosted refusal, apply, rollback and vex. The full checklist is in the 20261001T040000Z entry.
 1. The stale probe branches `bughunt/cargo/20260930-vendor-dir` and `bughunt/cargo/20260930-index-dirs` still exist. Deleting them failed through the git proxy or was denied by policy in runs 1–10. A maintainer needs to delete them. Until then, avoid new probe branches.
-2. (done run 12: pass) Hosted on cargo 1.68–1.81. Next: hosted `scan` re-run / `repair` / `list` on the #679 contested lock (does anything warn?), and the same contested shape with a git or path sibling of the same version.
+2. (done run 13: #863, #864, #679 comment) Next: `rollback` (no purl) and the hosted→vendored takeover on the #679 contested lock (same `restore` as #863); a v1 contested lock from an old cargo; #864 with two crates where only one is superseded.
 2b. Hosted with a `[patch]` override in `$CARGO_HOME/config.toml` or an ancestor config: same root cause as #480, so only worth a live check once #480 is fixed.
 3. Vendored on old cargo (`+1.41` / `+1.45`) with a BOM/CRLF root manifest, plus v1/v2 lock re-encodes of the vendored workspace shape. Also vendored on Windows and macOS.
 4. Re-triage #387 and #339 live once cargo code changes on main.
@@ -62,3 +64,5 @@ Cells marked (pre-v5) were last verified on `f6b7fb9` and need a re-check on v5.
 - `vendor -g` / `--revert -g` / `--check -g` exit 2 with `global_scope_unsupported` by design (#498/#499, run 9).
 - A stale `[[patch.unused]]` left in `Cargo.lock` after a `[patch]` entry is removed is tolerated by `--locked` on cargo 1.56.1, 1.84.1 and 1.93.1. The next plain build drops it, which is cargo normalising its own lock. Cosmetic (run 11).
 - An agent apply on a `cargo vendor --versioned-dirs` tree finds `vendor/<name>-<version>` correctly (run 11).
+- Hosted `list` shows nothing unless the pin's origin is `patch.socket.dev` or `--patch-server-url` / `SOCKET_PATCH_SERVER_URL`: documented (run 13).
+- The hosted restore lowercases the crates.io sparse-index path, so uppercase crate names (`Inflector`) restore correctly (run 13).
