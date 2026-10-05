@@ -18,6 +18,7 @@
 //! section at all) is collected in [`GemfileLock::problems`] for the
 //! readers that must refuse such a lock.
 
+pub(crate) mod gemfile;
 pub(crate) mod hosted;
 pub(crate) mod manifest;
 
@@ -126,6 +127,20 @@ impl<'t> GemfileLock<'t> {
     /// The `GEM` sections, in lock order.
     pub(crate) fn gem_sections(&self) -> impl Iterator<Item = &Section<'t>> {
         self.sections.iter().filter(|s| s.header == "GEM")
+    }
+
+    /// Every gem the non-registry source sections (`GIT`, `PATH`, `PLUGIN
+    /// SOURCE`) list in their specs (any version), mapped to the first such
+    /// section: bundler resolves those gems from there, not from a `GEM`
+    /// remote.
+    pub(crate) fn non_registry_sources(&self) -> HashMap<&'t str, &Section<'t>> {
+        let mut out = HashMap::new();
+        for section in self.sections.iter().filter(|s| s.header != "GEM") {
+            for spec in section.specs.iter().filter_map(|l| l.parsed) {
+                out.entry(spec.name).or_insert(section);
+            }
+        }
+        out
     }
 
     /// The DISTINCT [`Section::remote_bases`] across all `GEM` sections, in

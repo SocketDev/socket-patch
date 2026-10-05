@@ -8,8 +8,6 @@
 //! per-ecosystem backends own the placement (Tier A: write the archive; Tier B:
 //! extract it into the vendor directory) and the build-vs-service policy.
 
-use sha2::Digest as _;
-
 use crate::api::client::{SecondaryArtifact, VendorServiceOutcome};
 use crate::manifest::schema::PatchRecord;
 use crate::vendor::lock_inventory::LockIntegrity;
@@ -97,7 +95,7 @@ impl VerifiedArchive {
     /// Hex sha256 of [`Self::bytes`], digested once on first ask.
     pub(crate) fn sha256_hex(&self) -> &str {
         self.sha256_hex
-            .get_or_init(|| hex::encode(sha2::Sha256::digest(&self.bytes)))
+            .get_or_init(|| crate::utils::digest::sha256_hex_of(&self.bytes))
     }
 }
 

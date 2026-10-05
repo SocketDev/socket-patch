@@ -1805,6 +1805,87 @@ async fn pylock_whole_second_upload_times_round_trip() {
     assert_pypi_round_trip("uv export pylock", &input, &[urllib3_dep()], None).await;
 }
 
+/// A pylock as `pip lock` writes it (#804): PEP 751's array-of-tables
+/// spelling (`[[packages.wheels]]` with a `[packages.wheels.hashes]`
+/// sub-table), no `index`, and only the one artifact pip selected.
+/// `urllib3` is the entry under test: `wheel` picks the artifact pip
+/// recorded for it.
+fn pip_pylock(wheel: bool) -> String {
+    let urllib3 = if wheel {
+        format!(
+            "[[packages.wheels]]\nname = \"{URLLIB3_WHEEL}\"\nurl = \"{}\"\n\n\
+[packages.wheels.hashes]\nsha256 = \"{URLLIB3_WHEEL_SHA}\"\n",
+            pypi_file_url(URLLIB3_WHEEL)
+        )
+    } else {
+        format!(
+            "[packages.sdist]\nname = \"{URLLIB3_SDIST}\"\nurl = \"{}\"\n\n\
+[packages.sdist.hashes]\nsha256 = \"{URLLIB3_SDIST_SHA}\"\n",
+            pypi_file_url(URLLIB3_SDIST)
+        )
+    };
+    format!(
+        "lock-version = \"1.0\"\ncreated-by = \"pip\"\n\n\
+[[packages]]\nname = \"idna\"\nversion = \"3.7\"\n\n\
+[[packages.wheels]]\nname = \"idna-3.7-py3-none-any.whl\"\n\
+url = \"https://files.pythonhosted.org/packages/e5/3e/idna-3.7-py3-none-any.whl\"\n\n\
+[packages.wheels.hashes]\nsha256 = \"{a}\"\n\n\
+[[packages]]\nname = \"urllib3\"\nversion = \"1.26.18\"\n\n{urllib3}",
+        a = "a".repeat(64),
+    )
+}
+
+/// #804: `pip lock`'s `[[packages.wheels]]` siblings show the registry,
+/// and the restore writes back the one artifact pip recorded, in pip's
+/// spelling, byte for byte.
+#[tokio::test]
+#[serial]
+async fn pip_pylock_round_trips() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let lock = pip_pylock(true);
+    for eol in ["\n", "\r\n"] {
+        let input = tree(&[("pylock.toml", lock.replace('\n', eol))]);
+        assert_pypi_round_trip(&format!("pip lock {eol:?}"), &input, &[urllib3_dep()], None).await;
+    }
+}
+
+/// #804: a release with no wheel is recorded by pip as a
+/// `[packages.sdist]` table, and restored as one.
+#[tokio::test]
+#[serial]
+async fn pip_pylock_sdist_only_release_round_trips() {
+    let (name, version, files) = urllib3_release();
+    let sdist_only = files.into_iter().filter(|f| f.0 == URLLIB3_SDIST).collect();
+    let (_server, _env) = pypi_mock(&[(name, version, sdist_only)]).await;
+    let input = tree(&[("pylock.toml", pip_pylock(false))]);
+    let dep = pypi_dep("urllib3", "1.26.18", URLLIB3_WHEEL, PYPI_UUID);
+    assert_pypi_round_trip("pip lock sdist", &input, &[dep], None).await;
+}
+
+/// #804: which of several pure-Python wheels pip selected depends on the
+/// interpreter that ran `pip lock`, so it is refused, with the pin left
+/// wired, rather than guessed.
+#[tokio::test]
+#[serial]
+async fn pip_pylock_with_several_wheels_is_refused() {
+    let (name, version, mut files) = urllib3_release();
+    files.push((
+        "urllib3-1.26.18-1-py3-none-any.whl",
+        URLLIB3_WHEEL_SHA,
+        143835,
+        "2023-10-17T17:46:22.000000Z",
+    ));
+    let (_server, _env) = pypi_mock(&[(name, version, files)]).await;
+    let input = tree(&[("pylock.toml", pip_pylock(true))]);
+    let (why, _, after) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+    assert!(
+        after["pylock.toml"].contains("patch.socket.dev"),
+        "the pin stays wired"
+    );
+    assert!(why.contains("pip"), "{why}");
+    assert!(!why.contains("uv release"), "{why}");
+}
+
 /// Native uv 0.11.19 gives these two different declarations the same
 /// `extra == 'x'` marker. Once hosted URLs replace their specifiers, their
 /// provenance is ambiguous: refusing must retain both files byte for byte.
