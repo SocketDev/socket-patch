@@ -12,6 +12,9 @@ use socket_patch_cli::commands::remove::{run, RemoveArgs};
 use socket_patch_cli::{Cli, Commands};
 use std::path::PathBuf;
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
+
 fn parse_remove(extra: &[&str]) -> RemoveArgs {
     let mut argv = vec!["socket-patch", "remove"];
     argv.extend_from_slice(extra);
@@ -335,7 +338,7 @@ fn record_json(uuid: &str) -> String {
 /// Run the compiled `socket-patch remove` binary against `cwd`, fully offline
 /// and with telemetry disabled so the test never touches the network.
 fn run_remove_binary(cwd: &std::path::Path, extra: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+    hermetic::binary_command()
         .arg("remove")
         .arg("--cwd")
         .arg(cwd)

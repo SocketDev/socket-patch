@@ -96,7 +96,7 @@ async fn update_force_swaps_binary_end_to_end() {
     }
 
     // The new binary runs.
-    let out = std::process::Command::new(&install.bin)
+    let out = common::hermetic_command(&install.bin)
         .arg("--version")
         .output()
         .expect("spawn updated binary");
