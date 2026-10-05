@@ -186,7 +186,11 @@ frozen, locked, and ordinary installation outcomes separately where supported.
 
 Revert state retains the original wiring. Script and lock edits are treated as a
 pair: conflicting changes preserve both files and their recovery state rather
-than restoring only one side. Tests also cover restoring one package while
+than restoring only one side. When any uv.lock or pyproject.toml record has
+drifted, neither file is written. A relock that only re-serializes an array
+around socket-patch's unchanged element is not drift: `uv add --dev x` rewrites
+the dev group's `requires-dev` line, and `uv add y` sorts `[manifest] overrides`
+into its multi-line form. Revert restores or removes just that element. Tests also cover restoring one package while
 preserving another package's vendored entries.
 
 ## Reproduce the release-family matrix
