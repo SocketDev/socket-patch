@@ -66,6 +66,8 @@ const CVE: &str = "CVE-2024-99999";
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 #[path = "common/yarn_classic_vex.rs"]
@@ -125,7 +127,8 @@ fn binary() -> PathBuf {
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("corepack");
     cmd.arg(pm).args(args).current_dir(cwd);
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     cache_env::isolate(&mut cmd);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     for (k, v) in extra_env {
@@ -134,24 +137,12 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     cmd.output().expect("failed to run corepack")
 }
 
-/// Remove every ambient `SOCKET_*` var (so a developer's `SOCKET_DRY_RUN=1`
-/// etc. can't flip behavior) and the PM cache var the harness controls.
-fn scrub_socket_env(cmd: &mut Command) {
-    for (k, _) in std::env::vars_os() {
-        let k = k.to_string_lossy();
-        if k.starts_with("SOCKET_") {
-            cmd.env_remove(k.as_ref());
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("YARN_CACHE_FOLDER");
-}
-
 /// Run the socket-patch binary with a scrubbed environment.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
     cmd.current_dir(cwd);
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    cmd.env_remove("YARN_CACHE_FOLDER");
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (

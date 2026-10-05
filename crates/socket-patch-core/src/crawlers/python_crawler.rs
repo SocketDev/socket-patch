@@ -354,12 +354,13 @@ async fn find_local_venv_site_packages_with(
         return found;
     }
 
-    let pipenv = is_pipenv_project(cwd);
-    let poetry = if pipenv {
-        None
-    } else {
-        load_poetry_project(cwd, var).await
-    };
+    // Pipenv loads .env before deciding whether an activated venv applies.
+    // Resolve that decision within each supported settings view, together
+    // with the placement settings. Pipenv never falls back to `venv/`.
+    if is_pipenv_project(cwd) {
+        return pipenv_project_site_packages(cwd, var).await;
+    }
+    let poetry = load_poetry_project(cwd, var).await;
 
     // Poetry versions can use different placeholder roots. Apply its
     // recorded-env / active-shell / in-project precedence within each
@@ -372,7 +373,7 @@ async fn find_local_venv_site_packages_with(
     } else {
         let pdm_ignores_active =
             pdm_env_flag(var, "PDM_IGNORE_ACTIVE_VENV") && pdm_drives_project(cwd).await;
-        let active_prefix = if !pdm_ignores_active && (!pipenv || pipenv_uses_virtual_env(var)) {
+        let active_prefix = if !pdm_ignores_active {
             var("VIRTUAL_ENV")
         } else {
             None
@@ -383,15 +384,6 @@ async fn find_local_venv_site_packages_with(
                 return found;
             }
         }
-    }
-
-    // 2. A Pipenv project's venv is whatever Pipenv resolves, which is not
-    // the generic probe order below: Pipenv never uses `venv/`, and its
-    // in-project settings can rule out an existing `./.venv`. When Pipenv
-    // has no venv yet there is nothing to patch, so the generic probes must
-    // not fall back to a tree Pipenv will never use.
-    if pipenv {
-        return pipenv_project_site_packages(cwd, var).await;
     }
 
     // 4. Check .venv and venv in cwd
@@ -743,18 +735,469 @@ fn pipenv_venv_in_project(cwd: &Path, var: &impl Fn(&str) -> Option<String>) -> 
 ///   [`find_pipenv_virtualenv_site_packages`]). An explicit "in project"
 ///   with no `./.venv` means Pipenv has no venv yet, so nothing.
 /// - A `./.venv` directory and an explicit "in project": `./.venv` only.
-/// - A `./.venv` directory and an explicit "not in project": the
-///   WORKON_HOME venv only (Pipenv 2023+ ignores `./.venv` then).
+/// - A `./.venv` directory and an explicit "not in project": Pipenv
+///   2023.11.14+ ignores `./.venv` and uses WORKON_HOME, but 2018.11
+///   through 2023.10.24 use an existing `./.venv` directory whatever the
+///   setting says (and only 2026.2+ reads the Pipfile key).
 /// - A `./.venv` directory and nothing explicit: Pipenv up to 2026.1 uses
-///   it, 2026.2+ prefers an existing WORKON_HOME venv. Without running
-///   Pipenv the version is unknown, so both are returned, WORKON_HOME
-///   first, and whichever one the installed Pipenv uses gets patched.
+///   it, 2026.2+ prefers an existing WORKON_HOME venv.
+///
+/// In both of those cases the version is unknown without running Pipenv,
+/// so both venvs are returned, WORKON_HOME first, and whichever one the
+/// installed Pipenv uses gets patched.
+///
+/// Settings are resolved through concrete supported-generation views:
+/// current dotenv settings, then process-only settings (older commands
+/// cache placement before loading dotenv), then the 2018 and 2020 shell
+/// profiles with cached Project settings. Only 2018 uses the older parser
+/// and sets PIPENV_ACTIVE before its final placement lookup; 2020 uses
+/// modern parsing but still caches IGNORE/IN_PROJECT. Only project-owned
+/// environments from these views are
+/// returned, with duplicates removed.
 ///
 /// Never `./venv`: no Pipenv release uses it.
 async fn pipenv_project_site_packages(
     cwd: &Path,
     var: &impl Fn(&str) -> Option<String>,
 ) -> Vec<PathBuf> {
+    let text = pipenv_dotenv(cwd, var);
+    let dotenv = text
+        .as_deref()
+        .map(|text| parse_dotenv(text, var))
+        .unwrap_or_default();
+    let mut results = Vec::new();
+    if !dotenv.is_empty() {
+        let layered = |name: &str| {
+            dotenv
+                .iter()
+                .rev()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+                .or_else(|| var(name))
+        };
+        results = pipenv_settings_site_packages(cwd, &layered).await;
+    }
+    for site in pipenv_settings_site_packages(cwd, var).await {
+        if !results.contains(&site) {
+            results.push(site);
+        }
+    }
+    // Cached generations used Python bool(string), including "0" as true.
+    // The current profile above intentionally retains its newer flag parser.
+    if var("PIPENV_DONT_LOAD_ENV").is_some_and(|value| !value.is_empty()) {
+        return results;
+    }
+    if let Some(text) = text {
+        let legacy = parse_pipenv_2018_dotenv(&text, var);
+        if !legacy.is_empty() {
+            for site in
+                pipenv_cached_dotenv_site_packages(cwd, &legacy, var, PipenvCachedShell::V2018)
+                    .await
+            {
+                if !results.contains(&site) {
+                    results.push(site);
+                }
+            }
+        }
+    }
+    if !dotenv.is_empty() {
+        for site in
+            pipenv_cached_dotenv_site_packages(cwd, &dotenv, var, PipenvCachedShell::V2020).await
+        {
+            if !results.contains(&site) {
+                results.push(site);
+            }
+        }
+    }
+    results
+}
+
+/// The dotenv file configured when Pipenv starts: `PIPENV_DOTENV_LOCATION`
+/// (relative to the project), else `<project>/.env`, unless
+/// `bool(PIPENV_DONT_LOAD_ENV)`. Read it once for the supported parser and
+/// settings-timing profiles; Pipenv commands load it at different points.
+fn pipenv_dotenv(cwd: &Path, var: &impl Fn(&str) -> Option<String>) -> Option<String> {
+    let dont_load = match var("PIPENV_DONT_LOAD_ENV") {
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            other => !other.is_empty(),
+        },
+        None => false,
+    };
+    if dont_load {
+        return None;
+    }
+    let path = match var("PIPENV_DOTENV_LOCATION").filter(|v| !v.is_empty()) {
+        Some(location) => cwd.join(location),
+        None => cwd.join(".env"),
+    };
+    // Regular files only, non-blocking: a FIFO `.env` must not wedge
+    // discovery.
+    read_regular_to_string_sync(&path).ok()
+}
+
+/// python-dotenv bindings are a stream, not independent lines: quoted
+/// values may contain newlines and setting-like text. File reads normalize
+/// CRLF/CR like Python's text mode. Every quoted/unquoted value is then
+/// interpolated against preceding bindings before process variables.
+fn parse_dotenv(text: &str, var: &impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut rest = normalized.as_str();
+    let mut values: Vec<(String, Option<String>)> = Vec::new();
+    while !rest.is_empty() {
+        let binding = match dotenv_binding(&mut rest) {
+            Ok(binding) => binding,
+            Err(()) => {
+                // Native parser recovery discards the remaining physical
+                // line at the failure, not the next valid binding.
+                rest = rest.split_once('\n').map_or("", |(_, tail)| tail);
+                continue;
+            }
+        };
+        let Some((key, value)) = binding else {
+            continue;
+        };
+        let value = value.map(|value| {
+            let lookup = |name: &str| match values.iter().find(|(key, _)| key == name) {
+                // A valueless binding shadows the environment during
+                // interpolation, but is not exported after resolution.
+                Some((_, value)) => Some(value.clone().unwrap_or_default()),
+                None => var(name),
+            };
+            dotenv_interpolate(&value, &lookup)
+        });
+        if let Some((_, previous)) = values.iter_mut().find(|(name, _)| name == key) {
+            *previous = value;
+        } else {
+            values.push((key.to_string(), value));
+        }
+    }
+    // Last binding wins even when it has no value: native load_dotenv
+    // first builds its mapping, then exports only its non-None entries.
+    values
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+        .collect()
+}
+
+fn dotenv_whitespace(c: char) -> bool {
+    // Python's str.isspace additionally recognizes these separators.
+    c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}')
+}
+
+fn dotenv_inline_whitespace(c: char) -> bool {
+    c != '\n' && c != '\r' && dotenv_whitespace(c)
+}
+
+/// Consume one native python-dotenv binding. Failure keeps the cursor at
+/// the token that did not parse, matching its line-recovery semantics.
+fn dotenv_binding<'a>(rest: &mut &'a str) -> Result<Option<(&'a str, Option<String>)>, ()> {
+    *rest = rest.trim_start_matches(dotenv_whitespace);
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    if let Some(after) = rest.strip_prefix("export") {
+        if after.chars().next().is_some_and(dotenv_inline_whitespace) {
+            *rest = after.trim_start_matches(dotenv_inline_whitespace);
+        }
+    }
+    let key = if rest.starts_with('#') {
+        None
+    } else if let Some(after) = rest.strip_prefix('\'') {
+        let end = after.find('\'').filter(|end| *end > 0).ok_or(())?;
+        let key = &after[..end];
+        *rest = &after[end + 1..];
+        Some(key)
+    } else {
+        let end = rest
+            .find(|c| c == '=' || c == '#' || dotenv_whitespace(c))
+            .unwrap_or(rest.len());
+        if end == 0 {
+            return Err(());
+        }
+        let key = &rest[..end];
+        *rest = &rest[end..];
+        Some(key)
+    };
+    *rest = rest.trim_start_matches(dotenv_inline_whitespace);
+    let value = if let Some(after) = rest.strip_prefix('=') {
+        *rest = after.trim_start_matches(dotenv_inline_whitespace);
+        Some(dotenv_value(rest)?)
+    } else {
+        None
+    };
+    *rest = rest.trim_start_matches(dotenv_inline_whitespace);
+    if rest.starts_with('#') {
+        *rest = &rest[rest.find('\n').unwrap_or(rest.len())..];
+    }
+    *rest = rest.trim_start_matches(dotenv_inline_whitespace);
+    if let Some(after) = rest.strip_prefix('\n') {
+        *rest = after;
+    } else if !rest.is_empty() {
+        return Err(());
+    }
+    Ok(key.map(|key| (key, value)))
+}
+
+fn dotenv_value(rest: &mut &str) -> Result<String, ()> {
+    static SINGLE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\A'((?:\\'|[^'])*)'").unwrap());
+    static DOUBLE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"\A"((?:\\"|[^"])*)""#).unwrap());
+    let quote = rest.chars().next();
+    if matches!(quote, Some('\'' | '"')) {
+        let parser = if quote == Some('\'') {
+            &*SINGLE
+        } else {
+            &*DOUBLE
+        };
+        let captures = parser.captures(rest).ok_or(())?;
+        let body = captures.get(1).unwrap().as_str();
+        let value = dotenv_decode_escapes(body, quote.unwrap());
+        *rest = &rest[captures.get(0).unwrap().end()..];
+        return Ok(value);
+    }
+    let end = rest.find('\n').unwrap_or(rest.len());
+    let line = &rest[..end];
+    *rest = &rest[end..];
+    let comment = line
+        .char_indices()
+        .find_map(|(index, c)| {
+            (c == '#'
+                && line[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(dotenv_whitespace))
+            .then_some(index)
+        })
+        .unwrap_or(line.len());
+    Ok(line[..comment]
+        .trim_end_matches(dotenv_whitespace)
+        .to_string())
+}
+
+/// Decode only python-dotenv's escape set after the complete quoted body
+/// was parsed. Unknown escapes stay literal, including Windows paths.
+fn dotenv_decode_escapes(body: &str, quote: char) -> String {
+    let mut value = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            value.push(c);
+            continue;
+        }
+        let decoded = match (quote, chars.peek()) {
+            (_, Some('\\')) => Some('\\'),
+            (_, Some('\'')) => Some('\''),
+            ('"', Some('"')) => Some('"'),
+            ('"', Some('a')) => Some('\u{7}'),
+            ('"', Some('b')) => Some('\u{8}'),
+            ('"', Some('f')) => Some('\u{c}'),
+            ('"', Some('n')) => Some('\n'),
+            ('"', Some('r')) => Some('\r'),
+            ('"', Some('t')) => Some('\t'),
+            ('"', Some('v')) => Some('\u{b}'),
+            _ => None,
+        };
+        match decoded {
+            Some(decoded) => {
+                chars.next();
+                value.push(decoded);
+            }
+            None => value.push('\\'),
+        }
+    }
+    value
+}
+
+/// python-dotenv's variable grammar. Unsupported `${NAME:...}` and bare
+/// `$NAME` stay literal; defaults and expansions are not recursive.
+fn dotenv_interpolate(value: &str, lookup: &impl Fn(&str) -> Option<String>) -> String {
+    static VARIABLES: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\$\{([^}:]*)(?::-([^}]*))?\}").unwrap());
+    let mut out = String::new();
+    let mut end = 0;
+    for captures in VARIABLES.captures_iter(value) {
+        let whole = captures.get(0).unwrap();
+        out.push_str(&value[end..whole.start()]);
+        match lookup(captures.get(1).unwrap().as_str()) {
+            Some(found) => out.push_str(&found),
+            None => out.push_str(captures.get(2).map_or("", |default| default.as_str())),
+        }
+        end = whole.end();
+    }
+    out.push_str(&value[end..]);
+    out
+}
+
+/// Pipenv 2018's shell loads dotenv before resolving its location, while
+/// --venv/run may already have cached it. Its parser resolves the complete
+/// final mapping in insertion order, with process variables taking priority.
+/// This is one concrete legacy view, not arbitrary combinations of settings.
+fn parse_pipenv_2018_dotenv(
+    text: &str,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    static VARIABLES: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\$\{([^}]*)\}").unwrap());
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut values: Vec<(String, String)> = Vec::new();
+    for line in normalized.split('\n') {
+        let line = line.trim_matches(dotenv_whitespace);
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key
+            .strip_prefix("export ")
+            .unwrap_or(key)
+            .trim_matches(dotenv_whitespace);
+        if key.is_empty() {
+            continue;
+        }
+        let value = value.trim_matches(dotenv_whitespace);
+        let quote = value.chars().next();
+        let value = if matches!(quote, Some('\'' | '"')) && quote == value.chars().next_back() {
+            // Legacy parse_line encodes unicode-escape first, then decodes
+            // matching quotes: the inner text (including escapes) survives.
+            value
+                .get(1..value.len().saturating_sub(1))
+                .unwrap_or("")
+                .to_string()
+        } else {
+            pipenv_2018_unquoted_value(value)
+        };
+        if let Some((_, previous)) = values.iter_mut().find(|(name, _)| name == key) {
+            *previous = value;
+        } else {
+            values.push((key.to_string(), value));
+        }
+    }
+    for index in 0..values.len() {
+        let raw = values[index].1.clone();
+        let mut resolved = String::new();
+        let mut end = 0;
+        for captures in VARIABLES.captures_iter(&raw) {
+            let whole = captures.get(0).unwrap();
+            let name = captures.get(1).unwrap().as_str();
+            resolved.push_str(&raw[end..whole.start()]);
+            if let Some(value) = var(name).or_else(|| {
+                values
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+            }) {
+                resolved.push_str(&value);
+            }
+            end = whole.end();
+        }
+        resolved.push_str(&raw[end..]);
+        values[index].1 = resolved;
+    }
+    values
+}
+
+/// The legacy parser leaves unicode-escape encoding on unquoted values.
+/// Matching quoted values bypass this conversion above.
+fn pipenv_2018_unquoted_value(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            ' '..='~' => out.push(c),
+            c if (c as u32) <= 0xff => {
+                let _ = write!(out, "\\x{:02x}", c as u32);
+            }
+            c if (c as u32) <= 0xffff => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => {
+                let _ = write!(out, "\\U{:08x}", c as u32);
+            }
+        }
+    }
+    out
+}
+
+/// Two native shell timing profiles: both cache Project settings before
+/// dotenv; 2018 marks itself active before final placement, while 2020
+/// reads the active prefix first. Later releases reinitialize settings.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PipenvCachedShell {
+    V2018,
+    V2020,
+}
+
+async fn pipenv_cached_dotenv_site_packages(
+    cwd: &Path,
+    dotenv: &[(String, String)],
+    var: &impl Fn(&str) -> Option<String>,
+    shell: PipenvCachedShell,
+) -> Vec<PathBuf> {
+    let layered = |name: &str| {
+        dotenv
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .or_else(|| var(name))
+    };
+    // 2020's Project cached IGNORE before dotenv, but reads ACTIVE and
+    // VIRTUAL_ENV dynamically. In 2018 do_shell has already set ACTIVE,
+    // so an activated prefix cannot replace the final placement.
+    if shell == PipenvCachedShell::V2020
+        && layered("PIPENV_ACTIVE").is_none()
+        && var("PIPENV_IGNORE_VIRTUALENVS").is_none_or(|value| value.is_empty())
+    {
+        if let Some(prefix) = layered("VIRTUAL_ENV").filter(|prefix| !prefix.is_empty()) {
+            let found = find_site_packages_under(&cwd.join(prefix), "site-packages").await;
+            if !found.is_empty() {
+                return found;
+            }
+        }
+    }
+    let dot_venv = cwd.join(".venv");
+    // An existing directory always wins in this generation; the cached
+    // flag only selects a missing in-project env. A .venv file still wins
+    // over that flag and is resolved by the shared placement helper.
+    if dot_venv.is_dir()
+        || (!dot_venv.exists()
+            && var("PIPENV_VENV_IN_PROJECT").is_some_and(|value| !value.is_empty()))
+    {
+        return find_site_packages_under(&dot_venv, "site-packages").await;
+    }
+    let workon_home = pipenv_workon_home(&layered).map(|home| cwd.join(home));
+    let identity = |name: &str| match name {
+        // Project imported PIPFILE before dotenv; custom names did not
+        // exist yet. Path interpolation itself still sees the full overlay.
+        "PIPENV_PIPFILE" => var(name),
+        "PIPENV_CUSTOM_VENV_NAME" => None,
+        _ => layered(name),
+    };
+    find_pipenv_virtualenv_site_packages_at(cwd, workon_home.as_deref(), &identity).await
+}
+
+/// [`pipenv_project_site_packages`] for one settings view.
+async fn pipenv_settings_site_packages(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    if pipenv_uses_virtual_env(var) {
+        if let Some(prefix) = var("VIRTUAL_ENV").filter(|prefix| !prefix.is_empty()) {
+            // Pipenv evaluates a relative active prefix from the project,
+            // which can differ from this process's cwd (`--cwd`).
+            let found = find_site_packages_under(&cwd.join(prefix), "site-packages").await;
+            if !found.is_empty() {
+                return found;
+            }
+        }
+    }
     let in_project = pipenv_venv_in_project(cwd, var);
     let dot_venv = cwd.join(".venv");
     if !dot_venv.is_dir() {
@@ -768,9 +1211,7 @@ async fn pipenv_project_site_packages(
         return in_tree;
     }
     let mut results = find_pipenv_virtualenv_site_packages_with(cwd, var).await;
-    if in_project.is_none() {
-        results.extend(in_tree);
-    }
+    results.extend(in_tree);
     results
 }
 
@@ -1502,6 +1943,20 @@ async fn find_pipenv_virtualenv_site_packages_with(
     cwd: &Path,
     var: &impl Fn(&str) -> Option<String>,
 ) -> Vec<PathBuf> {
+    // Pipenv runs from the project, so a relative WORKON_HOME (from `.env`
+    // or the process) is the project's, not this process's cwd (`--cwd`).
+    let workon_home = pipenv_workon_home(var).map(|home| cwd.join(home));
+    find_pipenv_virtualenv_site_packages_at(cwd, workon_home.as_deref(), var).await
+}
+
+/// Resolve a placement using an already-expanded WORKON_HOME. Legacy
+/// Pipenv reads path variables after dotenv but caches project identity
+/// inputs beforehand, so those two lookups must stay separate.
+async fn find_pipenv_virtualenv_site_packages_at(
+    cwd: &Path,
+    workon_home: Option<&Path>,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
     if !is_pipenv_project(cwd) {
         return Vec::new();
     }
@@ -1516,15 +1971,15 @@ async fn find_pipenv_virtualenv_site_packages_with(
             if !name.is_empty() {
                 if name.contains('/') || name.contains('\\') {
                     venvs.push(cwd.join(name));
-                } else if let Some(home) = pipenv_workon_home(var) {
+                } else if let Some(home) = workon_home {
                     venvs.push(home.join(name));
                 }
             }
         }
     }
     if venvs.is_empty() {
-        if let Some(home) = pipenv_workon_home(var) {
-            venvs.extend(pipenv_workon_home_venvs(cwd, &home, var));
+        if let Some(home) = workon_home {
+            venvs.extend(pipenv_workon_home_venvs(cwd, home, var));
         }
     }
     let mut results = Vec::new();
@@ -4036,8 +4491,7 @@ mod tests {
     }
 
     /// #334: when Pipenv has no venv yet, discovery must not fall back to a
-    /// tree Pipenv will never use: a stray `venv/`, or a `./.venv` that an
-    /// explicit "not in project" rules out.
+    /// tree Pipenv will never use, such as a stray `venv/`.
     #[tokio::test]
     async fn pipenv_without_its_venv_does_not_fall_back_to_stray_trees() {
         let (_tmp, project, site, var) = pipenv_project_with_workon_venv(&[]);
@@ -4046,36 +4500,44 @@ mod tests {
         assert!(find_local_venv_site_packages_with(&project, &var)
             .await
             .is_empty());
-
-        let (_tmp, project, site, var) =
-            pipenv_project_with_workon_venv(&[("PIPENV_VENV_IN_PROJECT", "0".to_string())]);
-        std::fs::remove_dir_all(site.ancestors().nth(3).unwrap()).unwrap();
-        let _dot = fake_venv(&project, ".venv");
-        assert!(find_local_venv_site_packages_with(&project, &var)
-            .await
-            .is_empty());
     }
 
-    /// #334: an explicit "not in project" (`PIPENV_VENV_IN_PROJECT` falsy,
+    /// #645: an explicit "not in project" (`PIPENV_VENV_IN_PROJECT` falsy,
     /// `PIPENV_NO_VENV_IN_PROJECT` truthy, or Pipenv 2026.2+'s Pipfile
-    /// `[pipenv] venv_in_project = false`) makes Pipenv ignore a `./.venv`
-    /// directory. An explicit "in project" makes it use `./.venv` only, and
-    /// the environment variable beats the Pipfile.
+    /// `[pipenv] venv_in_project = false`) makes only Pipenv 2023.11.14+
+    /// ignore a `./.venv` directory (#334); 2018.11 through 2023.10.24 use
+    /// an existing `./.venv` directory whatever the setting says. The
+    /// version is unknown, so both venvs are returned, WORKON_HOME first,
+    /// and `./.venv` alone when it is the only one. An explicit "in project"
+    /// makes every version use `./.venv` only, and the environment variable
+    /// beats the Pipfile.
     #[tokio::test]
     async fn pipenv_venv_in_project_settings_decide_about_dot_venv() {
         for env in [
             ("PIPENV_VENV_IN_PROJECT", "0"),
             ("PIPENV_VENV_IN_PROJECT", "false"),
             ("PIPENV_VENV_IN_PROJECT", "Off"),
+            ("PIPENV_VENV_IN_PROJECT", "no"),
             ("PIPENV_NO_VENV_IN_PROJECT", "1"),
         ] {
             let (_tmp, project, site, var) =
                 pipenv_project_with_workon_venv(&[(env.0, env.1.to_string())]);
-            let _dot = fake_venv(&project, ".venv");
+            let dot = fake_venv(&project, ".venv");
             assert_eq!(
                 find_local_venv_site_packages_with(&project, &var).await,
-                vec![site],
-                "{}={:?} must skip ./.venv",
+                vec![site.clone(), dot.clone()],
+                "{}={:?}: Pipenv <= 2023.10.24 still uses ./.venv",
+                env.0,
+                env.1
+            );
+            // Only `./.venv` exists: that is the venv old Pipenv uses, so
+            // it is patched instead of falling through to the global
+            // interpreter.
+            std::fs::remove_dir_all(site.ancestors().nth(3).unwrap()).unwrap();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &var).await,
+                vec![dot],
+                "{}={:?} with only ./.venv",
                 env.0,
                 env.1
             );
@@ -4090,8 +4552,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             find_local_venv_site_packages_with(&project, &var).await,
-            vec![site.clone()],
-            "Pipfile venv_in_project = false must skip ./.venv"
+            vec![site.clone(), dot.clone()],
+            "Pipfile venv_in_project = false: only 2026.2+ reads it"
         );
         std::fs::write(
             project.join("Pipfile"),
@@ -4145,6 +4607,486 @@ mod tests {
             find_local_venv_site_packages_with(&project, &var).await,
             vec![dot]
         );
+    }
+
+    /// #546: every Pipenv command loads the project's `.env` (with
+    /// `override=True`) before it resolves the venv, so a
+    /// `PIPENV_CUSTOM_VENV_NAME` or `WORKON_HOME` set there moves the venv.
+    /// Discovery must find that venv instead of falling through to the
+    /// global interpreter. The process-environment venv is still returned
+    /// after it (older Pipenv cached some settings before loading `.env`).
+    #[tokio::test]
+    async fn pipenv_dotenv_settings_move_the_venv() {
+        // PIPENV_CUSTOM_VENV_NAME in .env, WORKON_HOME exported.
+        let (tmp, project, site, var) = pipenv_project_with_workon_venv(&[]);
+        let custom = fake_venv(&tmp.path().join("wh"), "myenv");
+        std::fs::write(project.join(".env"), "PIPENV_CUSTOM_VENV_NAME=myenv\n").unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![custom.clone(), site.clone()]
+        );
+        // Remove only the default venv (`wh/proj-<hash>`); the site-packages
+        // depth under it differs between POSIX and Windows.
+        let wh = tmp.path().join("wh");
+        let default_root = site.ancestors().find(|a| a.parent() == Some(wh.as_path()));
+        std::fs::remove_dir_all(default_root.unwrap()).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![custom.clone()],
+            "the .env-named venv alone"
+        );
+
+        // PIPENV_DONT_LOAD_ENV: Pipenv skips .env, so does discovery.
+        let dont = env_of(&[
+            (
+                "WORKON_HOME",
+                tmp.path().join("wh").to_string_lossy().into_owned(),
+            ),
+            ("PIPENV_DONT_LOAD_ENV", "1".to_string()),
+        ]);
+        assert!(find_local_venv_site_packages_with(&project, &dont)
+            .await
+            .is_empty());
+
+        // WORKON_HOME in .env with nothing exported (python-dotenv syntax:
+        // `export`, quotes, inline comments, `${VAR}` interpolation).
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("Pipfile"), "[packages]\nsix = \"==1.16.0\"\n").unwrap();
+        let real = std::fs::canonicalize(&project).unwrap();
+        let hash = pipenv_venv_hash(&pipenv_path_string(&real.join("Pipfile")));
+        // Forward slashes: python-dotenv decodes `\r`, `\t`... inside double
+        // quotes, so a quoted Windows path must not carry backslashes.
+        let base = tmp.path().to_string_lossy().replace('\\', "/");
+        let elsewhere = fake_venv(&tmp.path().join("elsewhere"), &format!("proj-{hash}"));
+        let home = env_of(&[(
+            "HOME",
+            tmp.path().join("home").to_string_lossy().into_owned(),
+        )]);
+        for dotenv in [
+            format!("WORKON_HOME={base}/elsewhere\n"),
+            format!("# venvs\nexport WORKON_HOME=\"{base}/elsewhere\"  # here\n"),
+            format!("WORKON_HOME='{base}/elsewhere'\n"),
+            format!("BASE={base}\nWORKON_HOME=${{BASE}}/elsewhere # comment\n"),
+        ] {
+            std::fs::write(project.join(".env"), &dotenv).unwrap();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &home).await,
+                vec![elsewhere.clone()],
+                ".env {dotenv:?}"
+            );
+        }
+
+        // PIPENV_DOTENV_LOCATION names the file (relative to the project).
+        std::fs::remove_file(project.join(".env")).unwrap();
+        std::fs::write(
+            project.join("ci.env"),
+            format!("WORKON_HOME={base}/elsewhere\n"),
+        )
+        .unwrap();
+        assert!(find_local_venv_site_packages_with(&project, &home)
+            .await
+            .is_empty());
+        let located = env_of(&[
+            (
+                "HOME",
+                tmp.path().join("home").to_string_lossy().into_owned(),
+            ),
+            ("PIPENV_DOTENV_LOCATION", "ci.env".to_string()),
+        ]);
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &located).await,
+            vec![elsewhere]
+        );
+    }
+
+    /// #546 / #645: `.env` also carries the in-project setting.
+    #[tokio::test]
+    async fn pipenv_dotenv_venv_in_project_is_honoured() {
+        // `.env` says "in project" and Pipenv has created `./.venv`, so
+        // `./.venv` comes first. The process-environment view (nothing
+        // explicit) still adds this project's own WORKON_HOME venv after it.
+        let (_tmp, project, site, var) = pipenv_project_with_workon_venv(&[]);
+        let dot = fake_venv(&project, ".venv");
+        std::fs::write(project.join(".env"), "PIPENV_VENV_IN_PROJECT=1\n").unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![dot.clone(), site.clone()]
+        );
+        // With no `./.venv` yet, the `.env` "in project" means Pipenv has
+        // no venv; only the process view's WORKON_HOME venv remains.
+        std::fs::remove_dir_all(project.join(".venv")).unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![site]
+        );
+    }
+
+    #[test]
+    fn pipenv_2018_dotenv_keeps_legacy_mapping_and_value_rules() {
+        let var = env_of(&[("ENV", "process".to_string())]);
+        for (text, expected) in [
+            (
+                "A=${B}\nB=forward\n",
+                vec![("A", "forward"), ("B", "forward")],
+            ),
+            (
+                "ENV=file\nA=${ENV}\n",
+                vec![("ENV", "file"), ("A", "process")],
+            ),
+            (
+                "A=first\nB=${A}\nA=last\n",
+                vec![("A", "last"), ("B", "last")],
+            ),
+            ("A=first\nA\nB=${A}\n", vec![("A", "first"), ("B", "first")]),
+            ("A=${MISSING:-default}\n", vec![("A", "")]),
+            ("A='literal\\ntext'\n", vec![("A", "literal\\ntext")]),
+            ("A=C:\\Temp\\x\n", vec![("A", "C:\\\\Temp\\\\x")]),
+            ("A=é\nB='é'\n", vec![("A", "\\xe9"), ("B", "é")]),
+            ("A=path # literal\n", vec![("A", "path # literal")]),
+        ] {
+            let expected = expected
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>();
+            assert_eq!(parse_pipenv_2018_dotenv(text, &var), expected, "{text:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pipenv_2020_dotenv_uses_cached_settings_and_dynamic_active_prefix() {
+        let (tmp, project, default, base_var) = pipenv_project_with_workon_venv(&[]);
+        let default_root = std::fs::read_dir(tmp.path().join("wh"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let leaf = default_root.file_name().unwrap().to_str().unwrap();
+        let modern_root = tmp.path().join("modern-workon");
+        let legacy_root = tmp.path().join("legacy-workon");
+        let modern = fake_venv(&modern_root, leaf);
+        let legacy = fake_venv(&legacy_root, leaf);
+        let var = |name: &str| match name {
+            "BASE" => Some(legacy_root.to_string_lossy().into_owned()),
+            _ => base_var(name),
+        };
+        std::fs::write(
+            project.join(".env"),
+            format!(
+                "BASE={}\nWORKON_HOME=${{BASE}}\nPIPENV_VENV_IN_PROJECT=1\n",
+                modern_root.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![default.clone(), legacy, modern.clone()],
+            "2020 cached IN_PROJECT before dotenv"
+        );
+        let already_in_project = |name: &str| {
+            if name == "PIPENV_VENV_IN_PROJECT" {
+                Some("1".to_string())
+            } else {
+                var(name)
+            }
+        };
+        assert!(
+            find_local_venv_site_packages_with(&project, &already_in_project)
+                .await
+                .is_empty(),
+            "a real cached in-project setting must not fall back to WORKON_HOME"
+        );
+
+        let var = |name: &str| {
+            if name == "VIRTUAL_ENV" {
+                Some(default_root.to_string_lossy().into_owned())
+            } else {
+                base_var(name)
+            }
+        };
+        std::fs::write(
+            project.join(".env"),
+            format!(
+                "VIRTUAL_ENV={}\nPIPENV_IGNORE_VIRTUALENVS=1\n",
+                modern_root.join(leaf).to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![default.clone(), modern],
+            "2020 cached IGNORE=false but reads the layered active prefix"
+        );
+        let already_active = |name: &str| {
+            if name == "PIPENV_ACTIVE" {
+                Some("1".to_string())
+            } else {
+                var(name)
+            }
+        };
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &already_active).await,
+            vec![default],
+            "an existing ACTIVE marker still vetoes the active prefix"
+        );
+    }
+
+    /// A relative WORKON_HOME names a directory under the project, not
+    /// under this process's cwd: `--cwd` scans must still find the venv.
+    #[tokio::test]
+    async fn pipenv_relative_workon_home_resolves_from_the_project() {
+        let (_tmp, project, site, base_var) = pipenv_project_with_workon_venv(&[]);
+        let var = |name: &str| {
+            if name == "WORKON_HOME" {
+                Some("../wh".to_string())
+            } else {
+                base_var(name)
+            }
+        };
+        let found = find_pipenv_virtualenv_site_packages_with(&project, &var).await;
+        let canon = |p: &PathBuf| std::fs::canonicalize(p).unwrap();
+        assert_eq!(
+            found.iter().map(canon).collect::<Vec<_>>(),
+            vec![canon(&site)]
+        );
+    }
+
+    #[tokio::test]
+    async fn pipenv_legacy_dotenv_shell_keeps_its_own_workon_home() {
+        let (tmp, project, default, base_var) = pipenv_project_with_workon_venv(&[]);
+        let leaf = std::fs::read_dir(tmp.path().join("wh"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name();
+        let legacy_root = tmp.path().join("legacy-workon");
+        let modern_root = tmp.path().join("modern-workon");
+        let legacy = fake_venv(&legacy_root, leaf.to_str().unwrap());
+        let modern = fake_venv(&modern_root, leaf.to_str().unwrap());
+        let unrelated = fake_venv(&legacy_root, "another-project-12345678");
+        let legacy_text = legacy_root.to_string_lossy().replace('\\', "/");
+        let modern_text = modern_root.to_string_lossy().replace('\\', "/");
+        for (text, process_base, expected) in [
+            (
+                format!("WORKON_HOME=${{BASE}}\nBASE={legacy_text}\n"),
+                None,
+                vec![default.clone(), legacy.clone()],
+            ),
+            (
+                format!("BASE={modern_text}\nWORKON_HOME=${{BASE}}\n"),
+                Some(legacy_text.clone()),
+                vec![modern.clone(), default.clone(), legacy.clone()],
+            ),
+        ] {
+            std::fs::write(project.join(".env"), &text).unwrap();
+            let var = |name: &str| {
+                if name == "BASE" {
+                    process_base.clone()
+                } else {
+                    base_var(name)
+                }
+            };
+            let found = find_local_venv_site_packages_with(&project, &var).await;
+            assert_eq!(found, expected, "dotenv {text:?}");
+            assert!(!found.contains(&unrelated));
+            let legacy_disabled = |name: &str| {
+                if name == "PIPENV_DONT_LOAD_ENV" {
+                    Some("0".to_string())
+                } else {
+                    var(name)
+                }
+            };
+            let without_legacy = expected
+                .into_iter()
+                .filter(|site| site != &legacy)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &legacy_disabled).await,
+                without_legacy,
+                "cached generations treat nonempty 0 as true, while current dotenv still loads"
+            );
+            let disabled = |name: &str| {
+                if name == "PIPENV_DONT_LOAD_ENV" {
+                    Some("1".to_string())
+                } else {
+                    var(name)
+                }
+            };
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &disabled).await,
+                vec![default.clone()]
+            );
+        }
+    }
+
+    #[test]
+    fn dotenv_bindings_match_native_quotes_and_record_boundaries() {
+        let var = env_of(&[("NAME", "ambient".to_string())]);
+        for (text, expected) in [
+            (
+                "NAME=actual\nCUSTOM='${NAME}'\n",
+                vec![("NAME", "actual"), ("CUSTOM", "actual")],
+            ),
+            ("'CUSTOM'=actual\n", vec![("CUSTOM", "actual")]),
+            ("export\tCUSTOM=actual\n", vec![("CUSTOM", "actual")]),
+            (
+                "CUSTOM=actual\nAPP=\"first\nCUSTOM=decoy\nlast\"\n",
+                vec![("CUSTOM", "actual"), ("APP", "first\nCUSTOM=decoy\nlast")],
+            ),
+            (
+                "CUSTOM=actual\nCUSTOM=\"decoy\" trailing\n",
+                vec![("CUSTOM", "actual")],
+            ),
+            (
+                "CUSTOM=actual\nCUSTOM=\"decoy\n",
+                vec![("CUSTOM", "actual")],
+            ),
+            ("NAME\nCUSTOM=${NAME:-default}\n", vec![("CUSTOM", "")]),
+            (
+                "NAME=first\nNAME\nCUSTOM=${NAME:-default}\n",
+                vec![("CUSTOM", "")],
+            ),
+            (
+                "CUSTOM=actual\t# first # second\n",
+                vec![("CUSTOM", "actual")],
+            ),
+            (
+                "CUSTOM=${NAME:unsupported}\n",
+                vec![("CUSTOM", "${NAME:unsupported}")],
+            ),
+            (
+                "APP='first\r\nsecond'\rCUSTOM=actual\r",
+                vec![("APP", "first\nsecond"), ("CUSTOM", "actual")],
+            ),
+        ] {
+            let expected = expected
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<Vec<_>>();
+            assert_eq!(parse_dotenv(text, &var), expected, "dotenv input {text:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pipenv_dotenv_syntax_keeps_the_native_project_environment() {
+        let (tmp, project, default, var) = pipenv_project_with_workon_venv(&[]);
+        let actual = fake_venv(&tmp.path().join("wh"), "actual");
+        let decoy = fake_venv(&tmp.path().join("wh"), "decoy");
+        for dotenv in [
+            "NAME=actual\nPIPENV_CUSTOM_VENV_NAME='${NAME}'\n",
+            "'PIPENV_CUSTOM_VENV_NAME'=actual\n",
+            "export\tPIPENV_CUSTOM_VENV_NAME=actual\n",
+            "PIPENV_CUSTOM_VENV_NAME=actual\nAPP_SETTINGS=\"first\nPIPENV_CUSTOM_VENV_NAME=decoy\nlast\"\n",
+        ] {
+            std::fs::write(project.join(".env"), dotenv).unwrap();
+            let found = find_local_venv_site_packages_with(&project, &var).await;
+            assert_eq!(found, vec![actual.clone(), default.clone()], "dotenv {dotenv:?}");
+            assert!(!found.contains(&decoy), "text inside a quoted value is not a setting");
+        }
+    }
+
+    #[tokio::test]
+    async fn pipenv_dotenv_active_settings_are_resolved_per_view() {
+        let (tmp, project, default, base_var) = pipenv_project_with_workon_venv(&[]);
+        let actual_root = tmp.path().join("wh/actual");
+        let actual = fake_venv(&tmp.path().join("wh"), "actual");
+        let ambient_root = tmp.path().join("ambient");
+        let ambient = fake_venv(tmp.path(), "ambient");
+        // An empty active prefix is falsy, not the project directory.
+        let _project_lib = fake_venv(&project, "");
+        let var = |key: &str| match key {
+            "VIRTUAL_ENV" => Some(ambient_root.to_string_lossy().into_owned()),
+            _ => base_var(key),
+        };
+        for dotenv in [
+            "PIPENV_IGNORE_VIRTUALENVS=1\nPIPENV_CUSTOM_VENV_NAME=actual\n".to_string(),
+            "PIPENV_ACTIVE=1\nPIPENV_CUSTOM_VENV_NAME=actual\n".to_string(),
+            format!(
+                "VIRTUAL_ENV='{}'\n",
+                actual_root.to_string_lossy().replace('\\', "/")
+            ),
+            "VIRTUAL_ENV=../wh/actual\n".to_string(),
+            "VIRTUAL_ENV=\nPIPENV_CUSTOM_VENV_NAME=actual\n".to_string(),
+        ] {
+            std::fs::write(project.join(".env"), &dotenv).unwrap();
+            let found = find_local_venv_site_packages_with(&project, &var)
+                .await
+                .into_iter()
+                .map(|site| site.canonicalize().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                found,
+                // Legacy shell ignores custom names and takes this
+                // project's own default even when an ambient env exists.
+                vec![
+                    actual.canonicalize().unwrap(),
+                    ambient.canonicalize().unwrap(),
+                    default.canonicalize().unwrap(),
+                ],
+                "dotenv {dotenv:?}"
+            );
+        }
+        std::fs::write(project.join(".env"), "PIPENV_IGNORE_VIRTUALENVS=0\n").unwrap();
+        let ignored = |key: &str| match key {
+            "PIPENV_IGNORE_VIRTUALENVS" => Some("1".to_string()),
+            _ => var(key),
+        };
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &ignored).await,
+            vec![ambient.clone(), default],
+            "dotenv can clear a process-level opt-out"
+        );
+        std::fs::write(
+            project.join(".env"),
+            "PIPENV_IGNORE_VIRTUALENVS=1\nPIPENV_CUSTOM_VENV_NAME=actual\n",
+        )
+        .unwrap();
+        let disabled = |key: &str| match key {
+            "PIPENV_DONT_LOAD_ENV" => Some("1".to_string()),
+            _ => var(key),
+        };
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &disabled).await,
+            vec![ambient]
+        );
+    }
+
+    #[test]
+    fn dotenv_parsing_follows_python_dotenv() {
+        let var = env_of(&[("OUTER", "out".to_string())]);
+        let text = "\
+# comment
+export A=1
+B = two words  # trailing
+C=\"quoted # not a comment\"
+D='single ${OUTER}'
+E=\"line\\nbreak\"
+F=${A}-${OUTER}-${MISSING:-dflt}
+H=\"C:\\Users\\dev\\Temp\"
+I='it\\'s'
+J='C:\\Temp\\x'
+NOVALUE
+G=
+=skipped
+";
+        let parsed = parse_dotenv(text, &var);
+        let get = |k: &str| parsed.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("A"), Some("1"));
+        assert_eq!(get("B"), Some("two words"));
+        assert_eq!(get("C"), Some("quoted # not a comment"));
+        assert_eq!(get("D"), Some("single out"));
+        assert_eq!(get("E"), Some("line\nbreak"));
+        assert_eq!(get("F"), Some("1-out-dflt"));
+        assert_eq!(get("NOVALUE"), None);
+        assert_eq!(get("G"), Some(""));
+        // Unknown escapes stay literal (Windows paths); `\'` and `\\` decode.
+        assert_eq!(get("H"), Some(r"C:\Users\dev\Temp"));
+        assert_eq!(get("I"), Some("it's"));
+        assert_eq!(get("J"), Some(r"C:\Temp\x"));
+        assert_eq!(parsed.len(), 10);
     }
 
     #[tokio::test]

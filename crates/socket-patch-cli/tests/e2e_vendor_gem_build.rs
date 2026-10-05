@@ -1867,3 +1867,99 @@ fn gem_vendor_second_gem_section_fresh_checkout_and_revert() {
     );
     assert!(!proj.join(".socket/vendor").exists());
 }
+
+/// #847: a declaration whose version comes from a splat, a method call or
+/// a constant. Vendor used to carry that positional argument after the
+/// inserted `path:` keyword, a Ruby syntax error, and exit 0 with a Gemfile
+/// every `bundle` command failed to parse. The exact pin supersedes it, so
+/// it is dropped like a quoted constraint (`require: false` survives). The
+/// real bundler must parse the rewritten Gemfile, install it frozen and load
+/// rack from the vendored path; revert restores the original bytes.
+#[test]
+#[ignore = "host capstone: shells out to a real bundler >= 1.17; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+fn gem_vendor_drops_positional_constraints() {
+    for gemfile in [
+        "source \"https://rubygems.org\"\n\nRV = [\"~> 3.1\"]\ngem \"rack\", *RV\n",
+        "source \"https://rubygems.org\"\n\ngem \"rack\", ENV.fetch(\"SOCKET_E2E_RV\", \"~> 3.1\")\n",
+        "source \"https://rubygems.org\"\n\nRACK_VERSION = \"~> 3.1\"\ngem \"rack\", RACK_VERSION, require: false\n",
+    ] {
+        let Some((_tmp, proj, _bundler, purl)) = staged_rack_project("positional args") else {
+            return;
+        };
+        std::fs::write(proj.join("Gemfile"), gemfile).unwrap();
+        let relock = bundle(&proj, &["install"], false);
+        assert!(
+            relock.status.success(),
+            "{gemfile:?} installs before vendor (test premise):\n{}",
+            String::from_utf8_lossy(&relock.stderr)
+        );
+        let lock_before = std::fs::read(proj.join("Gemfile.lock")).unwrap();
+
+        let (code, stdout, stderr) = run_socket(
+            &proj,
+            &[
+                "vendor",
+                "--json",
+                "--offline",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            code, 0,
+            "{gemfile:?}: vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let env = parse_envelope(&stdout);
+        assert_eq!(env["summary"]["applied"], 1, "{gemfile:?}: {env}");
+        let wired = std::fs::read_to_string(proj.join("Gemfile")).unwrap();
+
+        let install = bundle(&proj, &["install"], true);
+        assert!(
+            install.status.success(),
+            "{gemfile:?}: frozen install of the rewritten Gemfile failed:\n{wired}\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        let probe = bundle(
+            &proj,
+            &[
+                "exec",
+                "ruby",
+                "-e",
+                "print Gem.loaded_specs.fetch(\"rack\").full_gem_path",
+            ],
+            true,
+        );
+        let loaded = String::from_utf8_lossy(&probe.stdout);
+        assert!(
+            probe.status.success() && loaded.contains(".socket/vendor/gem/"),
+            "{gemfile:?}: rack must load from the vendored path ({purl}), got {loaded:?}:\n{}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+
+        let (code, stdout, stderr) = run_socket(
+            &proj,
+            &[
+                "vendor",
+                "--revert",
+                "--json",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            code, 0,
+            "{gemfile:?}: revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+            gemfile,
+            "revert restores the Gemfile byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(proj.join("Gemfile.lock")).unwrap(),
+            lock_before,
+            "revert restores Gemfile.lock byte-identical"
+        );
+    }
+}

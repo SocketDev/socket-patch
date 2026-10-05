@@ -15,16 +15,7 @@ use super::types::IgnoredPath;
 /// Marker files of the ecosystems the in-memory engine cannot inventory
 /// (disk discovers them only through installed-tree crawlers).
 pub const UNSUPPORTED_MARKERS: [(&str, &[&str]); 2] = [
-    (
-        "maven",
-        &[
-            "pom.xml",
-            "build.gradle",
-            "build.gradle.kts",
-            "settings.gradle",
-            "settings.gradle.kts",
-        ],
-    ),
+    ("maven", crate::crawlers::jvm_cache::JVM_PROJECT_MARKERS),
     (
         "nuget",
         &[

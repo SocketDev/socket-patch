@@ -32,7 +32,9 @@ use crate::args::GlobalArgs;
 use crate::commands::bun_preflight::bun_vendor_preflight_with_ledger;
 use crate::commands::get::{download_patch_records_reusing, DetachedDownload, DownloadParams};
 use crate::commands::lock_cli::lock_failure;
-use crate::commands::vendor::{note_classic_migration_risk, track_outcomes_for_vendor};
+use crate::commands::vendor::{
+    note_classic_migration_risk, symlinked_wiring_warnings, track_outcomes_for_vendor,
+};
 use crate::commands::vendored_backend::{records_manifest, ApplyRequest, VendoredBackend};
 use crate::commands::vlt_preflight::{vlt_refusal_for, vlt_vendor_preflight_selected};
 use crate::ecosystem_dispatch::NpmCrawlSnapshot;
@@ -121,17 +123,39 @@ pub(crate) async fn preview_vendor_json(
             Some(e) if e.uuid == p.uuid => serde_json::json!({
                 "purl": p.purl, "uuid": p.uuid, "action": "already_vendored",
             }),
-            Some(e) => serde_json::json!({
-                "purl": p.purl, "uuid": p.uuid,
-                "action": "would_revendor", "oldUuid": e.uuid,
-            }),
-            None => serde_json::json!({
-                "purl": p.purl, "uuid": p.uuid, "action": "would_vendor",
-            }),
+            Some(e) => with_symlink_warnings(
+                cwd,
+                &p.purl,
+                serde_json::json!({
+                    "purl": p.purl, "uuid": p.uuid,
+                    "action": "would_revendor", "oldUuid": e.uuid,
+                }),
+            ),
+            None => with_symlink_warnings(
+                cwd,
+                &p.purl,
+                serde_json::json!({
+                    "purl": p.purl, "uuid": p.uuid, "action": "would_vendor",
+                }),
+            ),
         })
         .collect();
     patches.sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
     serde_json::json!({ "dryRun": true, "patches": patches })
+}
+
+/// A `would_vendor` / `would_revendor` preview row, plus a `warnings` list
+/// naming each symlinked wiring file the wet run's commit refuses to rename
+/// over (see [`symlinked_wiring_warnings`]); no key when there are none.
+fn with_symlink_warnings(cwd: &Path, purl: &str, mut row: serde_json::Value) -> serde_json::Value {
+    let warnings: Vec<serde_json::Value> = symlinked_wiring_warnings(cwd, purl)
+        .into_iter()
+        .map(|w| serde_json::json!({ "code": w.code, "detail": w.detail }))
+        .collect();
+    if !warnings.is_empty() {
+        row["warnings"] = serde_json::Value::Array(warnings);
+    }
+    row
 }
 
 /// The purls of `selected` the wet run's Bun, vlt or npm package-lock preflight would refuse
@@ -190,6 +214,16 @@ pub(crate) fn print_dry_run_refusals(preview: &serde_json::Value) {
             p["errorCode"].as_str().unwrap_or_default(),
             p["error"].as_str().unwrap_or_default()
         );
+    }
+    for p in patches {
+        for w in p["warnings"].as_array().into_iter().flatten() {
+            println!(
+                "  [warning] {} ({}): {}",
+                p["purl"].as_str().unwrap_or_default(),
+                w["code"].as_str().unwrap_or_default(),
+                w["detail"].as_str().unwrap_or_default()
+            );
+        }
     }
 }
 
@@ -1288,6 +1322,40 @@ mod preview_tests {
                 "dryRun": true,
                 "patches": [{ "purl": NPM, "uuid": UUID, "action": "would_vendor" }],
             })
+        );
+    }
+
+    /// #627: `scan` / `get --mode vendored --dry-run` stop at this preview,
+    /// so it carries the symlink advisory the wet run's commit would turn
+    /// into `redirect_symlinked_file_unsupported` — for the npm purl whose
+    /// `yarn.lock` is a link, not the PyPI one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preview_warns_about_a_symlinked_wiring_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        std::fs::write(shared.path().join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        std::os::unix::fs::symlink(
+            shared.path().join("yarn.lock"),
+            tmp.path().join("yarn.lock"),
+        )
+        .unwrap();
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM), sel(UUID, PYPI)]).await;
+        let npm = action_of(&preview, NPM);
+        assert_eq!(npm["action"], "would_vendor", "{preview}");
+        assert_eq!(
+            npm["warnings"][0]["code"], "vendor_would_refuse_symlinked_file",
+            "{preview}"
+        );
+        assert!(
+            npm["warnings"][0]["detail"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("yarn.lock is a symbolic link")),
+            "{preview}"
+        );
+        assert!(
+            action_of(&preview, PYPI).get("warnings").is_none(),
+            "{preview}"
         );
     }
 

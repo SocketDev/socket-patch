@@ -273,6 +273,9 @@ struct BerryRedirectFixture {
     /// The root `package.json` BEFORE the hosted rewrite (#404 option C
     /// pins through its `resolutions`, so a revert restores both files).
     registry_pkg: Vec<u8>,
+    /// The dependency is declared `"catalog:"` (#632): `.yarnrc.yml` keeps
+    /// the catalog in every checkout.
+    catalog: bool,
     _server: MockServer,
 }
 
@@ -299,6 +302,17 @@ async fn berry_hosted_project(
     tamper_served_tarball: bool,
     driver: HostedDriver,
 ) -> Option<BerryRedirectFixture> {
+    berry_hosted_project_with(tag, tamper_served_tarball, driver, false).await
+}
+
+/// [`berry_hosted_project`], with the dependency declared through the
+/// default yarn catalog when `catalog` is set (#632).
+async fn berry_hosted_project_with(
+    tag: &str,
+    tamper_served_tarball: bool,
+    driver: HostedDriver,
+    catalog: bool,
+) -> Option<BerryRedirectFixture> {
     if !has_corepack_pm(yarn_berry()) {
         skip!(
             "SKIP e2e_redirect_yarn_berry_build ({tag}): `corepack {}` unavailable",
@@ -317,13 +331,17 @@ async fn berry_hosted_project(
     std::fs::write(
         proj.join("package.json"),
         format!(
-            r#"{{"name":"redirect-berry-capstone","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#
+            r#"{{"name":"redirect-berry-capstone","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{}"}}}}"#,
+            if catalog { "catalog:" } else { DEP_VERSION }
         ),
     )
     .unwrap();
     std::fs::write(
         proj.join(".yarnrc.yml"),
-        "nodeLinker: node-modules\nenableGlobalCache: false\n",
+        format!(
+            "nodeLinker: node-modules\nenableGlobalCache: false\n{}",
+            catalog_yarnrc(catalog)
+        ),
     )
     .unwrap();
 
@@ -580,6 +598,13 @@ async fn berry_hosted_project(
                 && v.as_str() == Some(hosted_url.as_str()))),
         "package.json must route {DEP} to the hosted tarball: {root_pkg}"
     );
+    if catalog {
+        assert_eq!(
+            root_pkg["resolutions"][format!("{DEP}@catalog:")],
+            hosted_url.as_str(),
+            "#632: the catalog descriptor yarn matches is routed too: {root_pkg}"
+        );
+    }
     assert!(
         !lock.contains("__archiveUrl"),
         "the hosted pin must not be an npm: locator; got:\n{lock}"
@@ -608,6 +633,7 @@ async fn berry_hosted_project(
         host,
         registry_lock,
         registry_pkg,
+        catalog,
         _server: server,
     })
 }
@@ -620,9 +646,19 @@ fn fresh_yarnrc(fx: &BerryRedirectFixture) -> String {
     format!(
         "nodeLinker: node-modules\nenableGlobalCache: false\n\
          unsafeHttpWhitelist:\n  - \"{}\"\n\
-         npmRegistryServer: \"http://127.0.0.1:1\"\n",
-        fx.host.split(':').next().unwrap_or("127.0.0.1")
+         npmRegistryServer: \"http://127.0.0.1:1\"\n{}",
+        fx.host.split(':').next().unwrap_or("127.0.0.1"),
+        catalog_yarnrc(fx.catalog)
     )
+}
+
+/// The `.yarnrc.yml` default catalog of a `"catalog:"` fixture (#632).
+fn catalog_yarnrc(catalog: bool) -> String {
+    if catalog {
+        format!("catalog:\n  {DEP}: {DEP_VERSION}\n")
+    } else {
+        String::new()
+    }
 }
 
 /// Fresh dir with only the committable files, then `yarn install --immutable
@@ -788,6 +824,47 @@ async fn berry_redirect_fresh_checkout_installs_patched_bytes() {
     assert_patch_host_got_no_auth(&fx).await;
 
     hosted_manifestless_vex_matrix(&fx, HostedDriver::Scan);
+}
+
+/// #632: a dependency declared through a yarn catalog (`"catalog:"`, yarn
+/// >= 4.10). Yarn matches `resolutions` before it expands the catalog, so a
+/// pin routing only the expanded `npm:` descriptor left the fresh
+/// `--immutable` install failing YN0028 (and a mutable one unpatched). The
+/// fresh checkout must install the patched bytes from the hosted tarball.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn berry_redirect_catalog_dependency_fresh_checkout_installs() {
+    let release = yarn_berry().strip_prefix("yarn@").unwrap_or(yarn_berry());
+    let minor: Vec<u32> = release
+        .split('.')
+        .take(2)
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    if minor.as_slice() < [4, 10].as_slice() {
+        // Not a skip of an available toolchain: catalogs do not exist before
+        // yarn 4.10, so there is nothing to exercise.
+        println!("SKIP berry catalog e2e: {release} predates yarn catalogs (4.10)");
+        return;
+    }
+    let Some(fx) = berry_hosted_project_with("catalog", false, HostedDriver::Scan, true).await
+    else {
+        return;
+    };
+
+    let (fresh, ci) = fresh_checkout_yarn_install(&fx);
+    assert!(
+        ci.status.success(),
+        "fresh-checkout `yarn install --immutable --check-cache` of a catalog dependency \
+         must succeed from the hosted patch tarball.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    let installed = std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+    assert_eq!(
+        installed, fx.patched,
+        "fresh install of the catalog dependency must be the patched content"
+    );
+    assert_patch_host_got_no_auth(&fx).await;
 }
 
 /// get-driven hosted twin (v4.0): `get <uuid> --mode hosted --json --yes`
