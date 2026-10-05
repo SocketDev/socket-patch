@@ -1,0 +1,103 @@
+{
+ "_comment": "Recorded 2026-10-02 from GET repos/SocketDev/socket-patch/issues/454/events, /issues/454/timeline and /pulls/456 (trimmed to the fields release.py reads, merged_by.login included; ids and timestamps verbatim). #454 was closed by merging PR #456: the `closed` event has commit_id null. The `labeled` release-blocker event is added for the test (the real issue never carried that label).",
+ "repo": "SocketDev/socket-patch",
+ "base": "a36432ee1ae7f52b8afd13393989e1a1b516281c",
+ "baseTime": "2026-10-01T16:51:09Z",
+ "since": "2026-08-20T00:00:00Z",
+ "issue": {
+  "number": 454,
+  "state": "closed",
+  "labels": [
+   {
+    "name": "release-blocker"
+   }
+  ],
+  "repository_url": "https://api.github.com/repos/SocketDev/socket-patch",
+  "closed_at": "2026-10-01T16:51:10Z"
+ },
+ "events": [
+  {
+   "actor": {
+    "login": "alice",
+    "type": "User"
+   },
+   "commit_id": null,
+   "commit_url": null,
+   "created_at": "2026-10-01T09:55:37Z",
+   "event": "labeled",
+   "id": 1,
+   "label": {
+    "name": "release-blocker"
+   }
+  },
+  {
+   "actor": {
+    "login": "mikolalysenko",
+    "type": "User"
+   },
+   "commit_id": null,
+   "commit_url": null,
+   "created_at": "2026-10-01T16:51:10Z",
+   "event": "closed",
+   "id": 32271163816,
+   "intent": null,
+   "node_id": "CE_lADOQS_zEM8AAAABUWGyXs8AAAAHg4LhqA",
+   "performed_via_github_app": null,
+   "state_reason": null,
+   "url": "https://api.github.com/repos/SocketDev/socket-patch/issues/events/32271163816"
+  }
+ ],
+ "timeline": [
+  {
+   "actor": {
+    "login": "mikolalysenko",
+    "type": "User"
+   },
+   "created_at": "2026-10-01T10:26:17Z",
+   "event": "cross-referenced",
+   "source": {
+    "issue": {
+     "number": 456,
+     "pull_request": {
+      "diff_url": "https://github.com/SocketDev/socket-patch/pull/456.diff",
+      "html_url": "https://github.com/SocketDev/socket-patch/pull/456",
+      "merged_at": "2026-10-01T16:51:08Z",
+      "patch_url": "https://github.com/SocketDev/socket-patch/pull/456.patch",
+      "url": "https://api.github.com/repos/SocketDev/socket-patch/pulls/456"
+     },
+     "repository": {
+      "full_name": "SocketDev/socket-patch"
+     },
+     "state": "closed"
+    },
+    "type": "issue"
+   },
+   "updated_at": "2026-10-01T10:26:17Z"
+  },
+  {
+   "actor": {
+    "login": "mikolalysenko",
+    "type": "User"
+   },
+   "commit_id": null,
+   "created_at": "2026-10-01T16:51:10Z",
+   "event": "closed",
+   "state_reason": null
+  }
+ ],
+ "pulls": {
+  "456": {
+   "base": {
+    "ref": "main"
+   },
+   "merge_commit_sha": "a36432ee1ae7f52b8afd13393989e1a1b516281c",
+   "merged": true,
+   "merged_at": "2026-10-01T16:51:08Z",
+   "number": 456,
+   "state": "closed",
+   "merged_by": {
+    "login": "mikolalysenko"
+   }
+  }
+ }
+}

@@ -334,3 +334,105 @@ async fn dry_run_eject_verifies_the_plan_and_writes_nothing() {
         "a dry run creates no .socket/"
     );
 }
+
+/// #687: a failed eject puts back only the files it wrote. `vendor --json >
+/// report.json` in the project root keeps the run's envelope (the rollback
+/// used to replace the redirect target with its empty pre-run bytes, so the
+/// envelope went to an unlinked inode), and a root file the eject never
+/// wrote keeps its inode, its hard link and its bytes.
+#[tokio::test]
+async fn failed_eject_leaves_root_files_it_never_wrote_alone() {
+    let server = MockServer::start().await;
+    mount_view_and_registry(&server, 404).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let hosted = write_fresh_hosted_checkout(root, &server.uri());
+    std::fs::write(root.join("README.md"), "# app\n").unwrap();
+    #[cfg(unix)]
+    std::fs::hard_link(root.join("README.md"), root.join("README.link")).unwrap();
+    #[cfg(unix)]
+    let inode = |rel: &str| {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(root.join(rel)).unwrap().ino()
+    };
+    #[cfg(unix)]
+    let readme_inode = inode("README.md");
+
+    let report = std::fs::File::create(root.join("report.json")).unwrap();
+    let out = eject_cmd(&server, root, false)
+        .stdout(report)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(root.join("report.json")).unwrap();
+    let v: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("report.json must hold the envelope ({e}): {text:?}"));
+    assert!(
+        v["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| w["code"] == "eject_rolled_back")),
+        "{v}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("package-lock.json")).unwrap(),
+        hosted,
+        "the files the eject did write are still rolled back"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("README.md")).unwrap(),
+        "# app\n"
+    );
+    #[cfg(unix)]
+    {
+        assert_eq!(inode("README.md"), readme_inode, "README.md was replaced");
+        assert_eq!(
+            inode("README.link"),
+            readme_inode,
+            "the hard link was broken"
+        );
+    }
+}
+
+/// #687: `vendor > vendor.log 2>&1` in the project root keeps the whole
+/// log of a failed eject, including the error and the rollback notice
+/// written after the rollback ran.
+#[tokio::test]
+async fn failed_eject_human_log_in_the_root_keeps_every_line() {
+    let server = MockServer::start().await;
+    mount_view_and_registry(&server, 404).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_fresh_hosted_checkout(root, &server.uri());
+    let log = std::fs::File::create(root.join("vendor.log")).unwrap();
+    let cmd = eject_cmd(&server, root, false);
+    // Human output: the same command without --json.
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .filter(|a| a != "--json")
+        .collect();
+    let mut human = cli();
+    human.args(&args);
+    for (k, v) in cmd.get_envs() {
+        if let Some(v) = v {
+            human.env(k, v);
+        }
+    }
+    let status = human
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(1));
+    let text = std::fs::read_to_string(root.join("vendor.log")).unwrap();
+    assert!(text.contains("Ejecting"), "{text}");
+    assert!(
+        text.lines().count() > 1 && text.to_lowercase().contains("fail"),
+        "the failure lines after the rollback must survive: {text}"
+    );
+}

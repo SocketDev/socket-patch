@@ -1060,3 +1060,118 @@ fn yarn_classic_vendor_refuses_a_gitignored_vendor_dir() {
         );
     }
 }
+
+/// #664: two yarn classic projects whose `.socket/vendor/npm` links point
+/// at one shared store, both vendored with the same patch. `rollback` in
+/// project A used to delete the shared uuid dir through the link and
+/// report success, so project B's frozen offline install then failed
+/// ("Tarball is not in network and can not be located in cache"). The
+/// revert now refuses the linked dir before touching anything: A's
+/// rollback fails naming the link, and B still installs the patched
+/// bytes from the shared store with an empty yarn cache.
+#[cfg(unix)]
+#[test]
+fn yarn_classic_rollback_keeps_a_shared_vendor_store_intact() {
+    if !require_yarn_classic("e2e_vendor_yarn_classic_build", |c| {
+        cache_env::isolate(c);
+    }) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("yarn-cache");
+    let shared = tmp.path().join("mono/shared");
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    let mut projects = Vec::new();
+    for name in ["a", "b"] {
+        let proj = tmp.path().join("mono").join(name);
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("package.json"),
+            format!(
+                r#"{{"name":"{name}","version":"1.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#
+            ),
+        )
+        .unwrap();
+        let install = corepack(
+            &proj,
+            &yarn_classic(),
+            &["install", "--no-progress"],
+            &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+        );
+        if !install.status.success() {
+            skip!(
+                "fixture `yarn install` failed (registry unreachable?):\n{}",
+                String::from_utf8_lossy(&install.stderr)
+            );
+            return;
+        }
+        let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js")).unwrap();
+        let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+        stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
+        let cwd = proj.to_str().unwrap().to_string();
+        let (code, stdout, stderr) =
+            run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", &cwd]);
+        assert_eq!(code, 0, "vendor {name}:\n{stdout}\n{stderr}");
+
+        // Share the store: the first project's unit moves into it, and
+        // both projects' eco dirs become links to it.
+        let npm = proj.join(".socket/vendor/npm");
+        if !shared.exists() {
+            std::fs::rename(&npm, &shared).unwrap();
+        } else {
+            std::fs::remove_dir_all(&npm).unwrap();
+        }
+        std::os::unix::fs::symlink(&shared, &npm).unwrap();
+        projects.push(proj);
+    }
+    let shared_tgz = shared.join(UUID).join(format!("{DEP}-{DEP_VERSION}.tgz"));
+    assert!(
+        shared_tgz.is_file(),
+        "sanity: the shared store holds the unit"
+    );
+
+    let a = &projects[0];
+    let a_lock = std::fs::read(a.join("yarn.lock")).unwrap();
+    let cwd = a.to_str().unwrap().to_string();
+    let (code, stdout, stderr) = run_socket(
+        a,
+        &["rollback", "--json", "--yes", "--offline", "--cwd", &cwd],
+    );
+    assert_eq!(
+        code, 1,
+        "A's rollback must fail, not delete:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains(".socket/vendor/npm` is a symlink"),
+        "the failure names the link:\n{stdout}"
+    );
+    assert!(shared_tgz.is_file(), "B's committed tarball survives");
+    assert_eq!(std::fs::read(a.join("yarn.lock")).unwrap(), a_lock);
+
+    // B's fresh, frozen, offline install still resolves the shared tarball.
+    let b = &projects[1];
+    std::fs::remove_dir_all(b.join("node_modules")).unwrap();
+    let empty_cache = tmp.path().join("empty-cache");
+    std::fs::create_dir_all(&empty_cache).unwrap();
+    let install = corepack(
+        b,
+        &yarn_classic(),
+        &["install", "--frozen-lockfile", "--offline", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", empty_cache.to_str().unwrap())],
+    );
+    assert!(
+        install.status.success(),
+        "B's frozen offline install:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    // yarn < 1.7 installs nothing for a `file:` tarball entry (see
+    // `installs_file_tarballs`); the frozen install succeeding is the proof
+    // there.
+    if yarn_classic_vex::installs_file_tarballs(&yarn_classic_vex::yarn_classic_version()) {
+        let installed = std::fs::read(b.join("node_modules").join(DEP).join("index.js")).unwrap();
+        assert!(
+            installed.starts_with(MARKER.as_bytes()),
+            "B installs the patched bytes"
+        );
+    }
+}
