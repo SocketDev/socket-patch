@@ -64,6 +64,7 @@ mod poetry;
 #[cfg(test)]
 mod python_lock_equivalence_tests;
 mod requirements;
+pub use requirements::preflight_requirements_takeover;
 mod staged;
 mod state;
 pub(crate) mod hosted_url;
@@ -276,8 +277,9 @@ pub struct RewriteResult {
     /// a scoped registry or jsr, which hosted mode leaves unpatched.
     pub vlt_foreign_uuids: std::collections::BTreeSet<String>,
     /// Patch uuids with a same-`name@version` bundled instance the rewriter
-    /// skipped (Bun's `bundled` entries/records, #469): that copy is
-    /// unpacked from its parent's tarball and stays unpatched, so a
+    /// skipped (Bun's `bundled` entries/records, #469), or a yarn classic
+    /// git-fetched entry (#363): that copy is unpacked from its parent's
+    /// tarball or checked out from git and stays unpatched, so a
     /// confirmation of the uuid must never stand in for the installed tree
     /// (in-run VEX verifies it instead). Left out of the golden digests
     /// while empty, so the blessed oracle outputs predating it still hold.
@@ -932,6 +934,10 @@ fn rewrite_one_npm_lock(
     // Entries npm installs from a git / url / `file:` spec: see
     // `vendor::npm_origin` (#326).
     let non_registry = npm_non_registry_entries(&lock, manifest_overrides);
+    // npm 7+ reads `packages` when it exists; the legacy `dependencies`
+    // mirror must not suppress an attestation for that install tree.
+    // Match the shared npm lock inventory's object-valued-map precedence.
+    let legacy_is_install_tree = lock.get("packages").and_then(Value::as_object).is_none();
     let mut changed = false;
     for dep in npm {
         let fname = full_name(dep);
@@ -966,9 +972,12 @@ fn rewrite_one_npm_lock(
                 // here would put the hosted URL in the lockfile (confirming
                 // and VEX-attesting the patch) while the unpatched bundled
                 // bytes keep installing. Mirrors the vendored backend's
-                // `vendor_bundled_instance_skipped` refusal.
+                // `vendor_bundled_instance_skipped` refusal. The uuid is
+                // recorded so the in-run `--vex` verifies instead of
+                // assuming the patch applied (#325, as Bun's #469).
                 if entry.get("inBundle").and_then(Value::as_bool) == Some(true) {
                     matched_any = true;
+                    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
                     result.warnings.push(RewriteWarning {
                         code: "redirect_npm_bundled_instance_skipped".into(),
                         detail: format!(
@@ -1019,6 +1028,7 @@ fn rewrite_one_npm_lock(
                 dep,
                 &sha512,
                 lockfile,
+                legacy_is_install_tree,
                 result,
                 &mut matched_any,
             ) || changed;
@@ -1100,6 +1110,7 @@ fn rewrite_npm_v2_deps(
     dep: &DepOverride,
     sha512: &str,
     lockfile: &str,
+    legacy_is_install_tree: bool,
     result: &mut RewriteResult,
     matched_any: &mut bool,
 ) -> bool {
@@ -1113,6 +1124,9 @@ fn rewrite_npm_v2_deps(
             // fail-open as the `packages` guard above.
             if entry.get("bundled").and_then(Value::as_bool) == Some(true) {
                 *matched_any = true;
+                if legacy_is_install_tree {
+                    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                }
                 result.warnings.push(RewriteWarning {
                     code: "redirect_npm_bundled_instance_skipped".into(),
                     detail: format!(
@@ -1146,6 +1160,7 @@ fn rewrite_npm_v2_deps(
                 dep,
                 sha512,
                 lockfile,
+                legacy_is_install_tree,
                 result,
                 matched_any,
             ) || changed;
@@ -3121,6 +3136,7 @@ fn rewrite_yarn_classic(
                 .expect("version regex from the escaped version is valid");
         let mut matched_any = false;
         let mut alias_skipped = false;
+        let mut git_skipped = false;
         for (i, block) in blocks.iter_mut().enumerate() {
             // The block's key line names its consumers; resolve every
             // comma-joined pattern to the REAL package it stands for
@@ -3138,6 +3154,29 @@ fn rewrite_yarn_classic(
                 continue;
             }
             let patterns = split_key_patterns(key);
+            // yarn 1 fetches a git pattern with git, handing it `resolved`
+            // as the remote (#363): a tarball there fails every install, so
+            // the block stays byte-identical and that copy keeps the git
+            // bytes — never assumed patched by the in-run VEX. Checked
+            // before the alias gate: an alias of a git range is git too.
+            let resolved = block
+                .lines()
+                .find_map(|l| l.strip_prefix("  resolved "))
+                .map(|v| v.trim().trim_matches('"'));
+            if crate::vendor::yarn_classic_lock::classic_block_is_git(&patterns, resolved) {
+                git_skipped = true;
+                result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_yarn_classic_git_skipped".into(),
+                    detail: format!(
+                        "lock entry `{key}` installs {fname}@{} from git, which yarn fetches \
+                         from the git source rather than a tarball; the hosted redirect leaves \
+                         it untouched, so this copy stays unpatched",
+                        dep.version
+                    ),
+                });
+                continue;
+            }
             // A block reached only through `alias@npm:<fname>@range`
             // descriptors is left byte-identical (mirroring the berry
             // rewriter), but never silently: that copy keeps installing the
@@ -3209,7 +3248,7 @@ fn rewrite_yarn_classic(
                 changed = true;
             }
         }
-        if !matched_any && !alias_skipped {
+        if !matched_any && !alias_skipped && !git_skipped {
             result.warnings.push(RewriteWarning {
                 code: "redirect_yarn_classic_entry_not_found".into(),
                 detail: format!("no yarn.lock entry resolving {fname}@{}", dep.version),
@@ -5073,6 +5112,120 @@ pub(crate) fn gem_line_trailing_options(tail: &str) -> String {
     }
 }
 
+/// Why the argument tail of a one-line `gem "name"…` declaration can't be
+/// rewritten in place (`None` = safe). Both Gemfile rewriters replace the
+/// declaration's LINE, so the tail must be the whole declaration: a `,`-led
+/// option list that ends on this line and carries no modifier. Anything else
+/// is refused fail-closed (#340):
+/// - a tail that continues on the next line (a dangling `,`, `=>`, key, `\`,
+///   an unclosed bracket or string) would leave the continuation orphaned
+///   after the rewrite, and bundler refuses the Gemfile;
+/// - a modifier (`if` / `unless` / `while` / `until` / `rescue` / `and` /
+///   `or`) or a `do` block would be dropped, silently changing when the gem
+///   is declared.
+///
+/// Only code outside ordinary string literals and before a `#` comment
+/// counts, so a keyword or `,` inside `require: "…"` or a comment is fine.
+/// Double-quoted interpolation can execute a heredoc, so its presence with
+/// a possible `<<` opener is refused conservatively too.
+/// Shared with the vendor backend's Gemfile rewrite (`vendor::gem`).
+pub(crate) fn gem_line_tail_blocks_edit(tail: &str) -> Option<String> {
+    const CONTINUES: &str = "the declaration continues on the next line";
+    let mut code = String::new();
+    let mut quote: Option<char> = None;
+    let mut interpolated = false;
+    let mut quoted_operator = false;
+    let mut depth: i64 = 0;
+    let mut chars = tail.chars();
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if c == '\\' {
+                chars.next();
+            } else if c == q {
+                quote = None;
+            } else if q == '"' && c == '#' && chars.as_str().starts_with('{') {
+                interpolated = true;
+            } else if c == '<' && chars.as_str().starts_with('<') {
+                quoted_operator = true;
+            }
+            // String contents never count as code: keep a placeholder so
+            // word boundaries and the final character stay meaningful.
+            code.push(if c == q && quote.is_none() { c } else { 'x' });
+            continue;
+        }
+        match c {
+            '#' => break,
+            '"' | '\'' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        code.push(c);
+    }
+    if quote.is_some() || depth > 0 {
+        return Some(CONTINUES.to_string());
+    }
+    let code = code.trim();
+    if code.is_empty() {
+        return None;
+    }
+    if depth < 0 || !code.starts_with(',') {
+        return Some("unexpected tokens after the gem name".to_string());
+    }
+    let last = code.chars().next_back().unwrap_or(',');
+    if !(last.is_alphanumeric() || matches!(last, '_' | '"' | '\'' | ')' | ']' | '}' | '?' | '!')) {
+        return Some(CONTINUES.to_string());
+    }
+    // A heredoc body lives on the following lines, past where the rewrite
+    // would insert its closing `end`. Interpolation is executable Ruby too
+    // (`"#{<<~NAME}"`), so do not let quote masking hide its opener. Literal
+    // and escaped-interpolation lookalikes remain masked.
+    if code.contains("<<") || (interpolated && quoted_operator) {
+        return Some(CONTINUES.to_string());
+    }
+    let bytes = code.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_ident(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_ident(bytes[i]) {
+            i += 1;
+        }
+        let word = &code[start..i];
+        // A symbol (`:if`), method call (`.if`) or variable sigil is a name,
+        // not a keyword; so is a predicate (`if?`). `if:` is a hash key only
+        // where an argument can start (after `,`, `(` or `{`) and not `if::`;
+        // straight after a value, `if:FLAG` is a modifier on symbol `:FLAG`.
+        let prev_ok = start == 0 || !matches!(bytes[start - 1], b':' | b'.' | b'@' | b'$');
+        let arg_start = matches!(
+            code[..start].trim_end().as_bytes().last(),
+            Some(b',' | b'(' | b'{')
+        );
+        let next_ok = match bytes.get(i) {
+            Some(b'?' | b'!') => false,
+            Some(b':') => !(arg_start && bytes.get(i + 1) != Some(&b':')),
+            _ => true,
+        };
+        if !(prev_ok && next_ok) {
+            continue;
+        }
+        match word {
+            "if" | "unless" | "while" | "until" => {
+                return Some(format!("conditional declaration (`{word}` modifier)"));
+            }
+            "rescue" | "and" | "or" | "do" => {
+                return Some(format!("a trailing `{word}` after the declaration"));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The source-selecting option a `gem` line's argument tail carries, if any
 /// (only the code before any `#` comment counts). Bundler allows ONE source
 /// per gem, so an option like `git:` preserved into the Socket source block
@@ -5591,6 +5744,20 @@ fn rewrite_gem(
                         result.warnings.push(RewriteWarning {
                             code: "redirect_gem_source_option".into(),
                             detail,
+                        });
+                        continue;
+                    }
+                    // Only a whole one-line declaration can move into the
+                    // block: a continuation would be orphaned after `end`
+                    // and a modifier silently dropped (#340).
+                    if let Some(reason) = gem_line_tail_blocks_edit(&tail) {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_gem_unrecognized_declaration".into(),
+                            detail: format!(
+                                "the `gem \"{}\"` declaration is in a form the \
+                                 rewriter cannot safely edit ({reason}); redirect skipped",
+                                dep.name
+                            ),
                         });
                         continue;
                     }
@@ -9111,6 +9278,93 @@ mod tests {
         assert_eq!(r.warnings[0].code, "redirect_yarn_classic_entry_not_found");
     }
 
+    /// #363: yarn 1 fetches a git-pattern block with its git fetcher from
+    /// the block's `resolved`, so a hosted tarball there makes every later
+    /// install fail. The block stays byte-identical with a named warning,
+    /// and since that copy installs the git bytes, the uuid is never
+    /// assumed applied by the in-run VEX.
+    #[test]
+    fn yarn_classic_git_pattern_block_is_skipped() {
+        let git_block = "\"left-pad@git+https://github.com/stevemao/left-pad.git#v1.3.0\":\n  \
+             version \"1.3.0\"\n  \
+             resolved \"git+https://github.com/stevemao/left-pad.git#ff8e7ba5b0b3a5ad2f1bb06a4e6aef1c6b2c3d4e\"\n";
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+
+        // Git block only: nothing to rewire, a specific warning (not the
+        // generic not-found).
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            format!("# yarn lockfile v1\n\n\n{git_block}"),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(codes, ["redirect_yarn_classic_git_skipped"]);
+        assert!(r.warnings[0].detail.contains("git"), "{:?}", r.warnings);
+
+        // Git block beside a registry block: the registry block is wired,
+        // the git block left alone, and the uuid flagged so in-run VEX
+        // verifies instead of assuming.
+        let registry_block = "left-pad@^1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n";
+        files.insert(
+            "yarn.lock".to_string(),
+            format!("# yarn lockfile v1\n\n\n{registry_block}\n{git_block}"),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        let out = &r.files["yarn.lock"];
+        assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
+        assert!(out.contains(git_block), "git block byte-identical:\n{out}");
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_yarn_classic_git_skipped"));
+        assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+
+        // An `npm:` alias of a git range is fetched with git too: beside a
+        // rewired registry block it still keeps the uuid out of the in-run
+        // VEX assumption.
+        files.insert(
+            "yarn.lock".to_string(),
+            format!(
+                "# yarn lockfile v1\n\n\n{registry_block}\n\
+                 \"safe-pad@npm:left-pad@git+https://github.com/stevemao/left-pad.git#v1.3.0\":\n  \
+                 version \"1.3.0\"\n  \
+                 resolved \"git+https://github.com/stevemao/left-pad.git#ff8e7ba\"\n"
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_yarn_classic_git_skipped"));
+        assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+
+        // The codeload shorthand is a tarball to yarn: still rewired.
+        files.insert(
+            "yarn.lock".to_string(),
+            "# yarn lockfile v1\n\n\nleft-pad@stevemao/left-pad#v1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://codeload.github.com/stevemao/left-pad/tar.gz/ff8e7ba\"\n"
+                .to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.warnings);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
     /// The opposite alias direction — `"alias@npm:<fname>@…"` consuming the
     /// patched package under another name — is skipped with a SPECIFIC
     /// warning (not silence, not a misleading not-found).
@@ -12412,6 +12666,181 @@ mod tests {
         }
     }
 
+    /// #340: a declaration whose tail continues on the next line, or that
+    /// carries a modifier (`if` / `unless` / …), is not a single-line
+    /// declaration the rewriter can move into a source block. Rewriting it
+    /// orphans the continuation after `end` (bundler refuses the Gemfile) or
+    /// silently drops the condition. Fail closed and leave both files alone.
+    #[test]
+    fn gemfile_multi_line_or_conditional_declaration_fails_closed() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    vuln-gem (1.0.0)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  vuln-gem\n\n\
+                    BUNDLED WITH\n   4.0.17\n";
+        for decl in [
+            // Continuations: a dangling `,`, `=>`, key, backslash, open bracket.
+            "gem \"vuln-gem\",\n  require: false",
+            "gem \"vuln-gem\", # keep it lazy\n  require: false",
+            "gem \"vuln-gem\",\r\n  require: false",
+            "gem \"vuln-gem\", :require =>\n  false",
+            "gem \"vuln-gem\", require:\n  false",
+            "gem \"vuln-gem\", \"1.0.0\", \\\n  require: false",
+            "gem \"vuln-gem\", platforms: [:mri,\n  :mingw]",
+            "gem \"vuln-gem\", platforms: [\n  :mri]",
+            "gem \"vuln-gem\", require: \"vuln\n/gem\"",
+            "gem(\"vuln-gem\",\n  require: false)",
+            // Modifiers and other non-option tails.
+            "gem \"vuln-gem\" if true",
+            "gem \"vuln-gem\" if ENV[\"WITH_VULN\"] != \"0\"",
+            "gem \"vuln-gem\", require: false if ENV[\"CI\"]",
+            "gem \"vuln-gem\", \"1.0.0\"\tunless RUBY_VERSION < \"3\"",
+            "gem \"vuln-gem\", \"1.0.0\" if(ENV[\"CI\"])",
+            "gem \"vuln-gem\", require: false rescue nil",
+            "gem(\"vuln-gem\") if true",
+            "gem \"vuln-gem\" do",
+            // A label-looking modifier straight after a value, and a heredoc.
+            "gem \"vuln-gem\", \"1.0.0\" if::FEATURE",
+            "gem \"vuln-gem\", \"1.0.0\" unless::FEATURE",
+            "gem \"vuln-gem\", \"1.0.0\" if:enabled == ENV[\"MODE\"].to_sym",
+            "gem \"vuln-gem\", require: <<~REQ.strip\n  vuln\nREQ",
+        ] {
+            let gemfile = format!("source \"https://rubygems.org\"\n\n{decl}\n");
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.clone());
+            files.insert("Gemfile.lock".to_string(), lock.to_string());
+            let r = rewrite_registry_redirect(&files, &[gem_override("vuln-gem", "1.0.0")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{decl:?} must not be rewritten: files={:?} edits={:?}",
+                r.files,
+                r.edits
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_unrecognized_declaration"],
+                "{decl:?}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn gemfile_quoted_and_interpolated_heredocs_fail_closed() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    vuln-gem (1.0.0)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  vuln-gem\n\n\
+                    BUNDLED WITH\n   4.0.17\n";
+        for decl in [
+            "gem \"vuln-gem\", require: <<'REQUIRE_PATH'\nvuln-gem\nREQUIRE_PATH",
+            "gem(\"vuln-gem\", require: <<\"REQUIRE_PATH\")\nvuln-gem\nREQUIRE_PATH",
+            "gem \"vuln-gem\", require: \"#{<<~REQUIRE_PATH}\".chomp\n  vuln_gem\nREQUIRE_PATH",
+        ] {
+            let gemfile = format!("source \"https://rubygems.org\"\n{decl}\n");
+            let files = BTreeMap::from([
+                ("Gemfile".to_string(), gemfile),
+                ("Gemfile.lock".to_string(), lock.to_string()),
+            ]);
+            let r = rewrite_registry_redirect(&files, &[gem_override("vuln-gem", "1.0.0")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{decl:?} must not be rewritten: {:?}",
+                r.files
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_unrecognized_declaration"],
+                "{decl:?}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn gem_line_tail_colon_and_heredoc_syntax_is_not_confused_with_literals() {
+        for tail in [
+            ", \"1.0.0\" if::FEATURE",
+            ", \"1.0.0\" unless::FEATURE",
+            ", \"1.0.0\" if:enabled == ENV[\"MODE\"].to_sym",
+            ", require: <<~REQUIRE_PATH.chomp",
+            ", require: <<'REQUIRE_PATH'",
+            ", require: <<\"REQUIRE_PATH\"",
+            ", require: \"#{<<~REQUIRE_PATH}\".chomp",
+        ] {
+            assert!(gem_line_tail_blocks_edit(tail).is_some(), "{tail:?}");
+        }
+        for tail in [
+            ", require: \"<<REQUIRE_PATH\"",
+            ", require: '<<~REQUIRE_PATH'",
+            ", require: '#{<<REQUIRE_PATH}'",
+            ", require: \"\\#{<<REQUIRE_PATH}\"",
+            ", require: \"#{ENV['REQUIRE_PATH']}\"",
+            ", require: \"#{ENV['REQUIRE_PATH']}\" # <<NOT_A_HEREDOC",
+            ", group: :unless",
+            ", require: { if: \"vuln-gem\", unless: \"other\" }.values",
+            ", require: loader(if: \"vuln-gem\")",
+            ", if: true",
+            ", require: false # if::FEATURE, <<REQUIRE_PATH",
+        ] {
+            assert_eq!(gem_line_tail_blocks_edit(tail), None, "{tail:?}");
+        }
+    }
+
+    /// Control for #340: single-line declarations whose tails merely look
+    /// like the refused shapes (a keyword inside a string or a comment, a
+    /// symbol or a key named like a keyword, a closed bracket) still
+    /// rewrite, keeping their options.
+    #[test]
+    fn gemfile_single_line_declaration_lookalikes_still_rewrite() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    vuln-gem (1.0.0)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  vuln-gem\n\n\
+                    BUNDLED WITH\n   4.0.17\n";
+        for (decl, opts) in [
+            ("gem \"vuln-gem\"", ""),
+            ("gem \"vuln-gem\" # only if needed,", ""),
+            (
+                "gem \"vuln-gem\", \"~> 1.0\" # pinned, unless told otherwise",
+                "",
+            ),
+            (
+                "gem \"vuln-gem\", require: \"if/unless\"",
+                "require: \"if/unless\"",
+            ),
+            ("gem \"vuln-gem\", require: 'a,'", "require: 'a,'"),
+            (
+                "gem \"vuln-gem\", require: { if: \"vuln-gem\" }.values",
+                "require: { if: \"vuln-gem\" }.values",
+            ),
+            (
+                "gem \"vuln-gem\", require: \"<<REQUIRE_PATH\"",
+                "require: \"<<REQUIRE_PATH\"",
+            ),
+            ("gem \"vuln-gem\", group: :unless", "group: :unless"),
+            (
+                "gem \"vuln-gem\", platforms: [:mri, :mingw]",
+                "platforms: [:mri, :mingw]",
+            ),
+            ("gem \"vuln-gem\", require: \"a#b\"", "require: \"a#b\""),
+            ("gem \"vuln-gem\", require: false\r", "require: false"),
+            ("gem(\"vuln-gem\", require: false)", "require: false"),
+        ] {
+            let gemfile = format!("source \"https://rubygems.org\"\n\n{decl}\n");
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.clone());
+            files.insert("Gemfile.lock".to_string(), lock.to_string());
+            let r = rewrite_registry_redirect(&files, &[gem_override("vuln-gem", "1.0.0")]);
+            assert!(
+                !warning_codes(&r).contains(&"redirect_gem_unrecognized_declaration"),
+                "{decl:?}: {:?}",
+                r.warnings
+            );
+            let out = r.files.get("Gemfile").expect("declaration rewritten");
+            let want = if opts.is_empty() {
+                "  gem \"vuln-gem\", \"1.0.0\"\nend".to_string()
+            } else {
+                format!("  gem \"vuln-gem\", \"1.0.0\", {opts}\nend")
+            };
+            assert!(out.contains(&want), "{decl:?}: {out}");
+        }
+    }
+
     /// #482: a DIRECT dependency the root Gemfile declares out of the
     /// rewriter's sight (`eval_gemfile`, a loop) is listed under the lock's
     /// DEPENDENCIES. Appending a source block for it declares it twice and
@@ -13686,6 +14115,10 @@ mod tests {
             "a bundled skip is a MATCH — not-found must stay quiet: {:?}",
             r.warnings
         );
+        assert!(
+            r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+            "#325: the skipped bundled copy must keep the patch out of the in-run VEX"
+        );
     }
 
     /// #326: npm installs a git, remote-tarball or `file:` dependency from
@@ -14050,6 +14483,10 @@ mod tests {
             "partial coverage must be surfaced: {:?}",
             r.warnings
         );
+        assert!(
+            r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+            "#325: a redirected sibling must not let the in-run VEX attest the patch"
+        );
     }
 
     /// The v1/v2 legacy `dependencies` tree spells the bundled flag
@@ -14097,6 +14534,62 @@ mod tests {
             "legacy bundled skip must warn: {:?}",
             r.warnings
         );
+        assert!(
+            r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+            "#325: the legacy bundled skip must be recorded like `inBundle`"
+        );
+    }
+
+    /// A stale v2 legacy mirror is not the install tree. Its bundled flag
+    /// must not suppress in-run VEX for a normal `packages` entry; genuine
+    /// bundled entries in `packages` still suppress the same patch.
+    #[test]
+    fn npm_stale_legacy_bundled_mirror_does_not_contest_packages() {
+        for nested in [false, true] {
+            for actual_bundle in [false, true] {
+                let bundled = json!({"version": "1.3.0", "bundled": true});
+                let legacy = if nested {
+                    json!({"parent": {"version": "2.0.0", "dependencies": {"left-pad": bundled}}})
+                } else {
+                    json!({"left-pad": bundled})
+                };
+                let mut lock = json!({
+                    "lockfileVersion": 2,
+                    "packages": {
+                        "": {"name": "app", "version": "1.0.0"},
+                        "node_modules/left-pad": {
+                            "version": "1.3.0",
+                            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                            "integrity": "sha512-UPSTREAM=="
+                        }
+                    },
+                    "dependencies": legacy
+                });
+                if actual_bundle {
+                    lock["packages"]["node_modules/parent/node_modules/left-pad"] =
+                        json!({"version": "1.3.0", "inBundle": true});
+                }
+                let files = BTreeMap::from([("package-lock.json".into(), lock.to_string())]);
+                let overrides = vec![npm_override(
+                    "left-pad",
+                    "1.3.0",
+                    "http://patch.test/lp.tgz",
+                    "sha512-PATCHED==",
+                )];
+                let r = rewrite_registry_redirect(&files, &overrides);
+                assert_eq!(
+                    r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+                    actual_bundle,
+                    "nested mirror={nested}, actual bundled install={actual_bundle}"
+                );
+                let out: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+                assert_eq!(
+                    out["packages"]["node_modules/left-pad"]["resolved"],
+                    "http://patch.test/lp.tgz"
+                );
+                assert_eq!(out["dependencies"], lock["dependencies"]);
+            }
+        }
     }
 
     /// An alias install (`npm i my-alias@npm:left-pad@1.3.0`) keys the lock

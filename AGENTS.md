@@ -9,4 +9,5 @@ agent, from the PRs merged since the last tag and the code itself. Put the
 details of a change in its commit messages and PR description instead.
 
 If a PR you work on already changes `CHANGELOG.md`, restore that file to its
-merge-base version. The only exception is a release PR (branch `release/v*`).
+merge-base version. The only exceptions are release PRs: a `release/v*`
+branch, or the release train's `release-sync` PR.

@@ -763,3 +763,216 @@ async fn classic_redirect_tampered_hosted_tarball_fails_integrity() {
         );
     }
 }
+
+/// #363: a git-sourced dependency (`git+file://…#v1.3.0`) locks as a block
+/// yarn 1 fetches with GIT, from its `resolved`. `scan --mode hosted` must
+/// leave that block byte-identical (rewriting `resolved` to the hosted
+/// tarball made every later install fail with `git ls-remote` on a `.tgz`),
+/// say so with `redirect_yarn_classic_git_skipped`, and attest nothing in
+/// its in-run VEX. The fresh-checkout `yarn install --frozen-lockfile` still
+/// succeeds. The git repo is local, so no registry is needed.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn classic_git_sourced_dependency_is_left_unrewired() {
+    if cfg!(windows) {
+        // `git+file:` urls over a drive-letter path are not a shape yarn 1
+        // parses reliably; the rewriter logic is OS-independent and unit
+        // tested.
+        println!("SKIP classic_git_sourced_dependency_is_left_unrewired: not on Windows");
+        return;
+    }
+    if !require_yarn_classic("e2e_redirect_yarn_classic_build (git)", |c| {
+        cache_env::isolate(c);
+    }) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // A local git source of left-pad@1.3.0, tagged v1.3.0.
+    let repo = tmp.path().join("lpgit");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join("package.json"),
+        format!(r#"{{"name":"{DEP}","version":"{DEP_VERSION}","main":"index.js"}}"#),
+    )
+    .unwrap();
+    let orig: &[u8] = b"module.exports = function leftPad(s) { return s; };\n";
+    std::fs::write(repo.join("index.js"), orig).unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["add", "-A"],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "v",
+        ],
+        &["tag", "v1.3.0"],
+    ] {
+        let st = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("git");
+        assert!(st.success(), "git {args:?}");
+    }
+
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        format!(
+            r#"{{"name":"git-classic","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"git+file://{}#v1.3.0"}}}}"#,
+            repo.display()
+        ),
+    )
+    .unwrap();
+    let cache = tmp.path().join("yarn-cache");
+    let install = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+    );
+    if !install.status.success() {
+        skip!(
+            "(git): fixture `yarn install` of the git source failed:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
+    let lock_pristine = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
+    assert!(
+        lock_pristine.contains("resolved \"git+file://"),
+        "fixture must lock a git block:\n{lock_pristine}"
+    );
+
+    // A granted hosted patch for the same name@version.
+    let installed_dir = proj.join("node_modules").join(DEP);
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig].concat();
+    let tgz_path = tmp.path().join("patched.tgz");
+    build_patched_tgz(&installed_dir, &patched, &tgz_path);
+    let tgz = std::fs::read(&tgz_path).unwrap();
+    let server = MockServer::start().await;
+    let hosted_url = format!(
+        "{}/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz",
+        server.uri()
+    );
+    let summary = serde_json::json!({
+        "uuid": UUID, "purl": PURL, "tier": "free",
+        "cveIds": [], "ghsaIds": [], "severity": "high", "title": "git classic fixture"
+    });
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{ "purl": PURL, "patches": [summary] }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": PURL, "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free", "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": { UUID: {
+                "status": "granted", "url": hosted_url, "purl": PURL,
+                "artifacts": [{ "kind": "tarball", "url": hosted_url,
+                    "integrity": { "sha512": sha512_sri(&tgz), "sha1": sha1_hex(&tgz) } }],
+                "registryOverride": null
+            } }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID, "purl": PURL, "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { "package/index.js": {
+                "beforeHash": compute_git_sha256_from_bytes(orig),
+                "afterHash": compute_git_sha256_from_bytes(&patched),
+            } },
+            "vulnerabilities": { GHSA: {
+                "cves": [CVE], "summary": "s", "severity": "high", "description": "d"
+            } },
+            "description": "x", "license": "MIT", "tier": "free"
+        })))
+        .mount(&server)
+        .await;
+
+    let api_url = server.uri();
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &api_url,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--vex",
+            "out.vex.json",
+            "--vex-product",
+            PRODUCT,
+        ],
+    );
+    println!("scan exit {code}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("scan --json output is not JSON: {e}\n{stdout}\n{stderr}"));
+    assert_eq!(
+        std::fs::read_to_string(proj.join("yarn.lock")).unwrap(),
+        lock_pristine,
+        "the git block must stay byte-identical: {env}"
+    );
+    assert!(
+        env.to_string()
+            .contains("redirect_yarn_classic_git_skipped"),
+        "the skip must be named: {env}"
+    );
+    let vex = std::fs::read_to_string(proj.join("out.vex.json")).unwrap_or_default();
+    assert!(
+        !vex.contains("not_affected"),
+        "nothing may be attested for the git copy:\n{vex}\n{env}"
+    );
+
+    // A fresh checkout still installs (from git, unpatched).
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
+    std::fs::copy(proj.join("yarn.lock"), fresh.join("yarn.lock")).unwrap();
+    let fresh_cache = tmp.path().join("fresh-yarn-cache");
+    let ci = corepack(
+        &fresh,
+        &yarn_classic(),
+        &["install", "--frozen-lockfile", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
+    );
+    assert!(
+        ci.status.success(),
+        "fresh `yarn install --frozen-lockfile` must still succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+}

@@ -417,6 +417,41 @@ pub async fn vendor_npm<'a>(
     done(result, Some(entry), warnings)
 }
 
+/// The project-level refusal [`vendor_npm`]'s step 2 raises whatever the
+/// purl: the primary lock (`npm-shrinkwrap.json`, else `package-lock.json`)
+/// is not parseable JSON or not a v2/v3 lock. `None` unless the project's
+/// npm flavor is package-lock (the probe `vendor_npm_any` routes on) and
+/// that lock fails the gate; a missing or unreadable lock is left to the
+/// backend's own refusal.
+///
+/// For the hosted→vendored mode takeover (`vendor`, `scan`/`get --mode
+/// vendored` over a hosted pin): the takeover restores the pin's upstream
+/// registry entry BEFORE this backend runs, and the restore keeps a v1 lock
+/// v1 — so without this preflight the refusal would land after the hosted
+/// pin was gone, leaving the package unpatched in both modes (#659).
+/// Returns `(code, detail)`, exactly the refusal the backend would raise.
+pub async fn npm_lock_vendor_preflight(project_root: &Path) -> Option<(&'static str, String)> {
+    use super::npm_flavor::{detect_npm_lock_flavor, NpmLockFlavor};
+    if !matches!(
+        detect_npm_lock_flavor(project_root).await,
+        Ok((NpmLockFlavor::PackageLock, _))
+    ) {
+        return None;
+    }
+    let (lock_name, lock_bytes, _) = select_lockfile(project_root).await.ok()??;
+    let gate = match LOCK_MEMO.parse(&lock_bytes, || parse_json_manifest(&lock_bytes)) {
+        Ok(lock) => lock_version_gate(&lock, &lock_name).err(),
+        Err(e) => Some(Box::new(refused(
+            "vendor_lockfile_version_unsupported",
+            format!("{lock_name} is not parseable JSON: {e}"),
+        ))),
+    };
+    match *gate? {
+        VendorOutcome::Refused { code, detail } => Some((code, detail)),
+        _ => None,
+    }
+}
+
 /// The lock version gate of [`vendor_npm`]'s step 2: only v2/v3 locks with
 /// a `packages` object are rewritten. `Ok` is the parsed `lockfileVersion`.
 fn lock_version_gate(lock: &Value, lock_name: &str) -> Result<Option<u64>, Box<VendorOutcome>> {
@@ -777,6 +812,18 @@ pub async fn revert_npm_opts(
     // entry), so the deletion — and the still-wired probe that exists only
     // to protect it — are skipped.
     if keep_artifact {
+        return outcome;
+    }
+
+    if super::npm_flavor::keep_artifact_while_lock_references_it(
+        &mut outcome,
+        project_root,
+        &[SHRINKWRAP, PACKAGE_LOCK],
+        &entry.uuid,
+        &uuid_dir_rel,
+    )
+    .await
+    {
         return outcome;
     }
 
@@ -1166,8 +1213,11 @@ fn revert_one_record(
         }
     };
     let Some(live) = live else {
+        // REMOVED, not drifted (#665): `npm uninstall` dropped the entry.
+        // The caller keeps the artifact only while a lock still resolves
+        // through it.
         warnings.push(VendorWarning::new(
-            "vendor_lock_entry_drifted",
+            super::LOCK_ENTRY_REMOVED_CODE,
             format!("lock entry `{key}` no longer exists; nothing to restore"),
         ));
         return;
@@ -2382,6 +2432,44 @@ mod tests {
         );
     }
 
+    /// The takeover preflight raises exactly the backend's own version
+    /// refusal on a v1 lock (#659), before any write.
+    #[tokio::test]
+    async fn preflight_matches_the_backend_v1_refusal() {
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 1,
+            "dependencies": {
+                "left-pad": { "version": "1.3.0", "resolved": REG_RESOLVED, "integrity": "sha512-orig==" }
+            }
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock).await;
+        let (code, detail) = npm_lock_vendor_preflight(fx.root())
+            .await
+            .expect("a v1 lock is refused");
+        assert_eq!(code, "vendor_lockfile_version_unsupported");
+        assert_eq!(
+            detail,
+            expect_refused(
+                fx.vendor(false).await,
+                "vendor_lockfile_version_unsupported"
+            )
+        );
+    }
+
+    /// A supported lock, and a project of another npm flavor, pass the
+    /// preflight.
+    #[tokio::test]
+    async fn preflight_passes_v3_and_other_flavors() {
+        let fx = fixture().await;
+        assert_eq!(npm_lock_vendor_preflight(fx.root()).await, None);
+        let yarn = tempfile::tempdir().unwrap();
+        std::fs::write(yarn.path().join("package.json"), b"{}").unwrap();
+        std::fs::write(yarn.path().join("yarn.lock"), b"# yarn lockfile v1\n").unwrap();
+        assert_eq!(npm_lock_vendor_preflight(yarn.path()).await, None);
+    }
+
     /// A merge-conflicted / truncated package-lock.json must refuse before
     /// any project write. Reusing the `vendor_lockfile_version_unsupported`
     /// code for a parse failure is the cross-backend convention (see
@@ -3233,6 +3321,164 @@ mod tests {
                 .exists(),
             "artifact pruned once the revert converges"
         );
+    }
+
+    /// #665: the user dropped the patched dependency (`npm uninstall
+    /// left-pad`), so npm deleted every lock entry the wiring recorded and
+    /// nothing in the lock resolves through the artifact any more. That is
+    /// not a third-party re-resolution to protect: the revert must succeed,
+    /// remove the artifact (so the CLI drops the ledger entry) and say why,
+    /// instead of drift-keeping it forever.
+    #[tokio::test]
+    async fn revert_after_dependency_removed_drops_the_unreferenced_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let mut live = fx.read_lock().await;
+        let packages = live["packages"].as_object_mut().unwrap();
+        packages.remove("node_modules/left-pad");
+        packages.remove("node_modules/foo/node_modules/left-pad");
+        packages[""]["dependencies"] = json!({});
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+        let uninstalled = tokio::fs::read(fx.lock_path()).await.unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_removed"
+                    && w.detail.contains("node_modules/left-pad")),
+            "the vanished entry is still surfaced: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "nothing resolves through the artifact, so it is removed"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            uninstalled,
+            "the user's post-uninstall lock is left byte-identical"
+        );
+    }
+
+    /// #665 guard: a recorded entry vanished but the lock still resolves
+    /// through the artifact under a key the wiring never recorded (npm
+    /// re-hoisted it). The artifact may be the only copy that install
+    /// needs, so it is kept, exactly like a drift-skip.
+    #[tokio::test]
+    async fn revert_keeps_artifact_when_a_vanished_entry_moved_to_an_unrecorded_key() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let mut live = fx.read_lock().await;
+        let packages = live["packages"].as_object_mut().unwrap();
+        let wired = packages.remove("node_modules/left-pad").unwrap();
+        packages.remove("node_modules/foo/node_modules/left-pad");
+        packages.insert("node_modules/bar/node_modules/left-pad".into(), wired);
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "the lock still resolves through the artifact"
+        );
+    }
+
+    /// #665 guard, escaped spelling: the moved entry's resolution is
+    /// written with JSON-escaped slashes (`.socket\/vendor\/npm\/...`),
+    /// which parses to the same path npm installs from. A literal-path scan
+    /// misses it, so the gate matches the uuid itself.
+    #[tokio::test]
+    async fn revert_keeps_artifact_when_a_moved_entry_uses_escaped_slashes() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let mut live = fx.read_lock().await;
+        let packages = live["packages"].as_object_mut().unwrap();
+        let wired = packages.remove("node_modules/left-pad").unwrap();
+        packages.remove("node_modules/foo/node_modules/left-pad");
+        packages.insert("node_modules/bar/node_modules/left-pad".into(), wired);
+        let text = String::from_utf8(serialize_json(&live, "  ").unwrap())
+            .unwrap()
+            .replace(".socket/vendor/npm/", ".socket\\/vendor\\/npm\\/");
+        assert!(!text.contains(".socket/vendor/npm/"), "{text}");
+        tokio::fs::write(fx.lock_path(), text).await.unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            fx.root().join(fx.expected_rel_tgz()).exists(),
+            "the escaped lock still resolves through the artifact"
+        );
+    }
+
+    /// #665 guard, unreadable alternate lock: package-lock.json no longer
+    /// has the entry, but an npm-shrinkwrap.json that exists and cannot be
+    /// read may be the lock an install resolves through. One readable,
+    /// clean lock is not proof of absence, so the artifact is kept.
+    #[tokio::test]
+    async fn revert_keeps_artifact_when_an_alternate_lock_is_unreadable() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let mut live = fx.read_lock().await;
+        let packages = live["packages"].as_object_mut().unwrap();
+        let wired = packages.remove("node_modules/left-pad").unwrap();
+        packages.remove("node_modules/foo/node_modules/left-pad");
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+        // Invalid UTF-8 makes the shrinkwrap unreadable even as root, where
+        // a permission bit would not.
+        let mut shrinkwrap = b"\xff".to_vec();
+        shrinkwrap.extend(serde_json::to_vec(&wired).unwrap());
+        tokio::fs::write(fx.root().join(SHRINKWRAP), shrinkwrap)
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            fx.root().join(fx.expected_rel_tgz()).exists(),
+            "an unreadable lock is not proof the artifact is unused"
+        );
+
+        // Once the shrinkwrap is gone, the same revert reclaims it.
+        tokio::fs::remove_file(fx.root().join(SHRINKWRAP))
+            .await
+            .unwrap();
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(!fx.root().join(fx.expected_rel_tgz()).exists());
     }
 
     /// The WIRED revert (non-empty wiring) fails closed on an unparseable
