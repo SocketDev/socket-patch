@@ -1086,8 +1086,8 @@ async fn pnpm_pinned_matrix_vendored_lifecycle_and_manifestless_vex() {
             run_pnpm_capstone(&pm, VendorDriver::VendorCli).await;
             run_pnpm_capstone(&pm, VendorDriver::GetUuid).await;
         }
-        7 => off_runtime(|| run_legacy_capstone(&pm, "lockfileVersion: 5.4")),
-        8 => off_runtime(|| run_legacy_capstone(&pm, "lockfileVersion: '6.0'")),
+        7 => off_runtime(|| run_legacy_capstone(&pm, "lockfileVersion: 5.4", "proj")),
+        8 => off_runtime(|| run_legacy_capstone(&pm, "lockfileVersion: '6.0'", "proj")),
         _ => off_runtime(|| run_unsupported_lock_refusal(&pm)),
     }
 }
@@ -1616,7 +1616,7 @@ fn pnpm7_real_lifecycle_same_path_frozen_and_moved_checkout_offline() {
         println!("SKIP: `corepack {PNPM_LEGACY_7}` unavailable");
         return;
     }
-    run_legacy_capstone(PNPM_LEGACY_7, "lockfileVersion: 5.4");
+    run_legacy_capstone(PNPM_LEGACY_7, "lockfileVersion: 5.4", "proj");
 }
 
 #[test]
@@ -1625,7 +1625,40 @@ fn pnpm8_real_lifecycle_same_path_frozen_and_moved_checkout_offline() {
         println!("SKIP: `corepack {PNPM_LEGACY_8}` unavailable");
         return;
     }
-    run_legacy_capstone(PNPM_LEGACY_8, "lockfileVersion: '6.0'");
+    run_legacy_capstone(PNPM_LEGACY_8, "lockfileVersion: '6.0'", "proj");
+}
+
+/// Project dir names holding a YAML indicator (#754). Windows forbids `:`
+/// in a path component, so the `: ` case runs on unix only.
+#[cfg(not(windows))]
+const YAML_INDICATOR_DIRS: &[&str] = &["hash #x", "colon: x"];
+#[cfg(windows)]
+const YAML_INDICATOR_DIRS: &[&str] = &["hash #x"];
+
+/// #754: the absolute specifier lands in the lock under a project path
+/// holding YAML indicators. Unquoted, ` #` turned the rest of the path
+/// into a comment (ERR_PNPM_OUTDATED_LOCKFILE) and `: ` broke the line
+/// (ERR_PNPM_BROKEN_LOCKFILE); the same-path frozen install must pass.
+#[test]
+fn pnpm7_real_lifecycle_under_yaml_indicator_paths() {
+    if !has_corepack_pm(PNPM_LEGACY_7) {
+        println!("SKIP: `corepack {PNPM_LEGACY_7}` unavailable");
+        return;
+    }
+    for dir in YAML_INDICATOR_DIRS {
+        run_legacy_capstone(PNPM_LEGACY_7, "lockfileVersion: 5.4", dir);
+    }
+}
+
+#[test]
+fn pnpm8_real_lifecycle_under_yaml_indicator_paths() {
+    if !has_corepack_pm(PNPM_LEGACY_8) {
+        println!("SKIP: `corepack {PNPM_LEGACY_8}` unavailable");
+        return;
+    }
+    for dir in YAML_INDICATOR_DIRS {
+        run_legacy_capstone(PNPM_LEGACY_8, "lockfileVersion: '6.0'", dir);
+    }
 }
 
 /// Full lifecycle against the REAL pinned legacy pnpm, spike-proven flags:
@@ -1643,9 +1676,9 @@ fn pnpm8_real_lifecycle_same_path_frozen_and_moved_checkout_offline() {
 ///    marker bytes (probe C);
 /// 5. idempotent re-vendor (byte-stable, already_vendored);
 /// 6. revert restores both files byte-identical and removes .socket/vendor.
-fn run_legacy_capstone(pm: &str, lock_head: &str) {
+fn run_legacy_capstone(pm: &str, lock_head: &str, proj_dir: &str) {
     let tmp = tempfile::tempdir().unwrap();
-    let proj = tmp.path().join("proj");
+    let proj = tmp.path().join(proj_dir);
     std::fs::create_dir_all(&proj).unwrap();
     let pkg_doc = serde_json::json!({
         "name": "pnpm-legacy-capstone",
