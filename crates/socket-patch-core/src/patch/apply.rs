@@ -780,10 +780,11 @@ async fn chown_blocking(
 /// the primary is AlreadyPatched, which is precisely the state a
 /// single-copy apply left behind (patched primary, vulnerable twin). A
 /// failed copy fails the whole result: claiming the CVE fixed while a
-/// physical copy remains unpatched is the fail-open this closes. The
-/// primary's per-file records are what the returned `ApplyResult`
-/// carries (the envelope shape is unchanged); copies contribute only
-/// success/error state.
+/// physical copy remains unpatched is the fail-open this closes. Each
+/// copy's per-file records are merged into the returned `ApplyResult`
+/// with the file qualified by the copy's path, so a write to a twin alone
+/// still reports the package as applied (see
+/// [`store_copies`](crate::patch::store_copies)).
 pub async fn apply_package_patch(
     package_key: &str,
     pkg_path: &Path,
@@ -793,50 +794,46 @@ pub async fn apply_package_patch(
     dry_run: bool,
     policy: MismatchPolicy,
 ) -> ApplyResult {
-    let mut result =
-        apply_package_patch_at(package_key, pkg_path, files, sources, uuid, dry_run, policy).await;
-    // Only npm purls can name pnpm or vlt store copies; everything else skips the
-    // (already cheap) discovery outright.
-    if result.success && package_key.starts_with("pkg:npm/") {
-        for copy in crate::crawlers::npm_crawler::find_store_peer_variant_copies(pkg_path).await {
-            let copy_result =
-                apply_package_patch_at(package_key, &copy, files, sources, uuid, dry_run, policy)
-                    .await;
-            fold_copy_result(&mut result, &copy, copy_result);
-        }
-    }
-    result
+    crate::patch::store_copies::fan_out(package_key, pkg_path, |path| async move {
+        apply_package_patch_at(package_key, &path, files, sources, uuid, dry_run, policy).await
+    })
+    .await
 }
 
-/// Merge one pnpm or vlt store copy's result into the primary's. A failed
-/// copy fails the whole result with a `store copy <path> failed to patch: …`
-/// note. A copy that patched fine but could not put file ownership back
-/// (`success: true, error: Some("<path>: patched, but ownership could not
-/// be restored…")`) keeps `success` and appends that advisory verbatim (it
-/// already names the copy's full file path), so the CLI's
-/// `ownership_not_restored` warning sees every copy. Only the ownership
-/// advisory is carried: the `--force` all-skipped note describes the copy
-/// alone and would mislead on a primary that actually patched.
-fn fold_copy_result(result: &mut ApplyResult, copy: &Path, copy_result: ApplyResult) {
-    let note = if copy_result.success {
-        match copy_result.error {
-            Some(advisory) if advisory.contains(OWNERSHIP_NOT_RESTORED_MARKER) => advisory,
-            _ => return,
+impl crate::patch::store_copies::CopyFold for ApplyResult {
+    const VERB: &'static str = "patch";
+
+    fn success(&self) -> bool {
+        self.success
+    }
+
+    fn mark_failed(&mut self) {
+        self.success = false;
+    }
+
+    fn error_mut(&mut self) -> &mut Option<String> {
+        &mut self.error
+    }
+
+    fn extend_files(&mut self, copy: &mut Self, qualify: &dyn Fn(&str) -> String) {
+        for mut verified in copy.files_verified.drain(..) {
+            // A successful copy's NotFound is a `--force` skip: like its
+            // all-skipped note, it describes that copy alone and must not
+            // turn an already-patched primary into a no-op "applied".
+            if copy.success && verified.status == VerifyStatus::NotFound {
+                continue;
+            }
+            verified.file = qualify(&verified.file);
+            self.files_verified.push(verified);
         }
-    } else {
-        result.success = false;
-        format!(
-            "store copy {} failed to patch: {}",
-            copy.display(),
-            copy_result
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
-        )
-    };
-    result.error = Some(match result.error.take() {
-        Some(prev) => format!("{prev}; {note}"),
-        None => note,
-    });
+        for file in copy.files_patched.drain(..) {
+            let qualified = qualify(&file);
+            if let Some(via) = copy.applied_via.remove(&file) {
+                self.applied_via.insert(qualified.clone(), via);
+            }
+            self.files_patched.push(qualified);
+        }
+    }
 }
 
 /// The substring every ownership advisory carries (see
@@ -3587,7 +3584,7 @@ mod tests {
     /// verbatim (it already names the copy's file path); a copy's `--force`
     /// all-skipped note is NOT carried (it describes the copy alone).
     #[test]
-    fn fold_copy_result_carries_ownership_advisories_and_failures() {
+    fn store_copy_fold_carries_ownership_advisories_and_failures() {
         let copy = Path::new("/store/pkg@1.0.0_peer");
         let clean = || ApplyResult {
             package_key: "pkg:npm/a@1.0.0".to_string(),
@@ -3601,14 +3598,14 @@ mod tests {
         };
 
         let mut primary = clean();
-        fold_copy_result(&mut primary, copy, clean());
+        crate::patch::store_copies::fold(&mut primary, copy, clean());
         assert!(primary.success && primary.error.is_none());
 
         let advisory = format!(
             "/store/pkg@1.0.0_peer/index.js: patched, but {OWNERSHIP_NOT_RESTORED_MARKER} to uid 1 gid 2: EPERM"
         );
         let mut primary = clean();
-        fold_copy_result(
+        crate::patch::store_copies::fold(
             &mut primary,
             copy,
             ApplyResult {
@@ -3620,7 +3617,7 @@ mod tests {
         assert_eq!(primary.error.as_deref(), Some(advisory.as_str()));
 
         let mut primary = clean();
-        fold_copy_result(
+        crate::patch::store_copies::fold(
             &mut primary,
             copy,
             ApplyResult {
@@ -3634,7 +3631,7 @@ mod tests {
         );
 
         let mut primary = clean();
-        fold_copy_result(
+        crate::patch::store_copies::fold(
             &mut primary,
             copy,
             ApplyResult {
