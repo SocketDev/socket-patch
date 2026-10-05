@@ -36,6 +36,7 @@ You never change product code. Other routines share the repository:
 - Take every timestamp from `date -u`; never estimate one.
 - Commit messages on the ledger branch end with `Assisted-by: Claude Code:claude-opus-5-5`. Never use Co-Authored-By.
 - Never create labels. Never touch PRs, the bug-hunt ledgers, or other agents' claims.
+- Never edit `CHANGELOG.md`, and never ask for changelog entries in issues or the living document. Release notes are written only by the release agent when a release is cut, from the merged PR log and the code.
 
 **Scope:** only the socket-patch CLI in this repository: `crates/socket-patch-core`, `crates/socket-patch-cli`, their tests, the npm, PyPI and gem wrapper packages, `docs/` and `CLI_CONTRACT.md`. Depscan, the Socket API, the patch service and other repositories are out of scope. So are CI cost, CI speed and flaky tests, which the CI janitor owns: list those under "Handed off" in your register and don't file them.
 

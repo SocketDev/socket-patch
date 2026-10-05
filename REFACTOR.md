@@ -28,6 +28,7 @@ The routine's prompt defines `{SLUG}` = `refactor` and `{REGISTER}` = `register/
   - force-push a branch you didn't create;
   - merge, approve or enable auto-merge;
   - touch the release, publish or version-bump workflows.
+  - add, edit or delete anything in `CHANGELOG.md`. Release notes are written only by the release agent when a release is cut, from the merged PR log and the code. If a PR you resume or hand off already changes `CHANGELOG.md`, restore that file to the base branch's version.
 - **GitHub access.**
   - Use the GitHub tools your session provides (the GitHub MCP) for writes, and REST via `curl` for reads.
   - The search API (`/search/issues`) is unavailable in cloud sessions. To search, list everything through the repository-scoped endpoints (`/repos/SocketDev/socket-patch/issues?state=all&per_page=100&page=<p>`, which includes PRs, and `/pulls?state=all`), save it once per run, and grep it locally.

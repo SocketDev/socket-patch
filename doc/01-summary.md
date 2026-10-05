@@ -236,7 +236,7 @@ Several patterns show code that outlived its purpose:
 
 **Suggested norms:**
 - delete the oracle in the PR that lands the refactor;
-- comments explain *why* and history goes in the CHANGELOG;
+- comments explain *why*; history lives in git and PR descriptions, and the CHANGELOG is written only when a release is cut;
 - generate reference docs from code;
 - cap PR size, or at least split mechanical moves from behavior changes.
 
