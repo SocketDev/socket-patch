@@ -1350,8 +1350,8 @@ jobs:
         run: |
           major="${MAVEN_VERSION%%.*}"
           url="https://archive.apache.org/dist/maven/maven-${major}/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"
-          curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/maven.tgz"
-          curl -fsSL --retry 3 "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
+          curl -fsSL --retry 5 --retry-all-errors "$url" -o "$RUNNER_TEMP/maven.tgz"
+          curl -fsSL --retry 5 --retry-all-errors "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
           python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
           # Python accepts native Windows paths for both archive and destination.
           python -m tarfile -e "$RUNNER_TEMP/maven.tgz" "$RUNNER_TEMP"
@@ -1366,8 +1366,8 @@ jobs:
           GRADLE_VERSION: ${{ matrix.gradle }}
         run: |
           url="https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
-          curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/gradle.zip"
-          curl -fsSL --retry 3 "$url.sha256" -o "$RUNNER_TEMP/gradle.sha256"
+          curl -fsSL --retry 5 --retry-all-errors "$url" -o "$RUNNER_TEMP/gradle.zip"
+          curl -fsSL --retry 5 --retry-all-errors "$url.sha256" -o "$RUNNER_TEMP/gradle.sha256"
           python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha256((p/"gradle.zip").read_bytes()).hexdigest() == (p/"gradle.sha256").read_text().strip()'
           unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
           launcher="$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin/gradle"
