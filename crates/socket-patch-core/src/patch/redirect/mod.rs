@@ -4354,6 +4354,7 @@ fn rewrite_bun_lock(
     };
 
     let mut changed = false;
+    let mut pinned_any = false;
     for dep in &npm {
         let fname = full_name(dep);
         let Some(sha512) = dep.integrity.sha512.clone() else {
@@ -4473,6 +4474,7 @@ fn rewrite_bun_lock(
             });
             changed = true;
         }
+        pinned_any |= matched_any;
         if !matched_any {
             // Mirrors the pnpm/berry/uv rewriters: a granted dep that matched
             // no rewritable tuple (lock re-resolved to another version, entry
@@ -4482,6 +4484,34 @@ fn rewrite_bun_lock(
                 code: "redirect_bun_entry_not_found".into(),
                 detail: format!("no rewritable bun.lock entry for {fname}@{}", dep.version),
             });
+        }
+    }
+    // A workspace lock Bun migrated from a hosted `bun.lockb` keeps the
+    // member paths the binary normalization wrote as inter-workspace
+    // literals; Bun's text reader then re-resolves the workspace and drops
+    // the pins this run just wrote or confirmed (#803). Restore the
+    // manifests' `workspace:` literals, Bun's own spelling. Only a lock that
+    // holds a pin is touched, and the manifests are the engine's advisory
+    // `<dir>/package.json` reads.
+    if pinned_any {
+        let heals = crate::vendor::bun_lock_text::heal_workspace_literals(&mut lines, |dir| {
+            let rel = if dir.is_empty() {
+                "package.json".to_string()
+            } else {
+                format!("{dir}/package.json")
+            };
+            files.get(&rel).cloned()
+        });
+        for heal in heals {
+            result.edits.push(FileEdit {
+                path: "bun.lock".into(),
+                kind: "redirect_bun_lock_workspace_literal".into(),
+                action: "rewritten".into(),
+                key: Some(heal.key),
+                original: Some(Value::String(heal.original)),
+                new: Some(Value::String(heal.new)),
+            });
+            changed = true;
         }
     }
     if changed {
@@ -9911,6 +9941,111 @@ mod tests {
             .expect("real v1 grammar must rewrite");
         assert!(out.contains(&format!("{ws_v1}\n")), "{out}");
         assert!(out.contains("left-pad@http://p.test/lp.tgz"), "{out}");
+    }
+
+    /// #803: Bun 1.4 migrates a hosted workspace `bun.lockb` to `bun.lock`
+    /// with the member paths the binary normalization wrote as the
+    /// inter-workspace literals, so its text reader re-resolves the
+    /// workspace and drops the pins. A hosted re-run that finds its pin
+    /// already in place must still restore the manifests' `workspace:`
+    /// literals; a fresh pin heals them in the same pass.
+    #[test]
+    fn bun_lock_migrated_workspace_path_literals_are_healed() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override(
+            "is-number",
+            "7.0.0",
+            "http://p.test/is-number-7.0.0.tgz",
+            &sha512,
+        );
+        let pinned = format!(
+            "    \"is-number\": [\"is-number@http://p.test/is-number-7.0.0.tgz\", {{}}, \"{sha512}\"],"
+        );
+        let registry = "    \"is-number\": [\"is-number@7.0.0\", \"\", {}, \"sha512-OLD==\"],";
+        let lock = |entry: &str, m1: &str, m2: &str| {
+            format!(
+                "{{\n  \"lockfileVersion\": 2,\n  \"configVersion\": 1,\n  \"workspaces\": {{\n    \
+                 \"\": {{\n      \"name\": \"w\",\n      \"dependencies\": {{\n        \
+                 \"m1\": \"{m1}\",\n      }},\n    }},\n    \"packages/m1\": {{\n      \
+                 \"name\": \"m1\",\n      \"version\": \"1.0.0\",\n      \"dependencies\": {{\n        \
+                 \"is-number\": \"7.0.0\",\n        \"m2\": \"{m2}\",\n      }},\n    }},\n    \
+                 \"packages/m2\": {{\n      \"name\": \"m2\",\n      \"version\": \"1.0.0\",\n    }},\n  \
+                 }},\n  \"packages\": {{\n{entry}\n\n    \"m1\": [\"m1@workspace:packages/m1\"],\n\n    \
+                 \"m2\": [\"m2@workspace:packages/m2\"],\n  }}\n}}\n"
+            )
+        };
+        let manifests = [
+            (
+                "package.json",
+                r#"{"name":"w","workspaces":["packages/*"],"dependencies":{"m1":"workspace:*"}}"#,
+            ),
+            (
+                "packages/m1/package.json",
+                r#"{"name":"m1","dependencies":{"is-number":"7.0.0","m2":"workspace:^"}}"#,
+            ),
+            ("packages/m2/package.json", r#"{"name":"m2"}"#),
+        ];
+        let migrated = lock(&pinned, "packages/m1", "packages/m2");
+        let healed = lock(&pinned, "workspace:*", "workspace:^");
+
+        // The pin is already in place: only the literals change.
+        let mut files: BTreeMap<String, String> = manifests
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        files.insert("bun.lock".to_string(), migrated.clone());
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(r.files.get("bun.lock"), Some(&healed));
+        let kinds: Vec<(&str, Option<&str>)> = r
+            .edits
+            .iter()
+            .map(|e| (e.kind.as_str(), e.key.as_deref()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (
+                    "redirect_bun_lock_workspace_literal",
+                    Some(":dependencies:m1")
+                ),
+                (
+                    "redirect_bun_lock_workspace_literal",
+                    Some("packages/m1:dependencies:m2")
+                ),
+            ]
+        );
+        assert!(!r.files.contains_key("package.json"));
+
+        // Converged: the healed lock is a no-op.
+        files.insert("bun.lock".to_string(), healed.clone());
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+
+        // A registry tuple is pinned and the literals healed in one pass.
+        files.insert(
+            "bun.lock".to_string(),
+            lock(registry, "packages/m1", "packages/m2"),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.files.get("bun.lock"), Some(&healed));
+        assert_eq!(r.edits.len(), 3, "{:?}", r.edits);
+
+        // Without the manifests nothing proves the literal: left alone.
+        let mut bare = BTreeMap::new();
+        bare.insert("bun.lock".to_string(), migrated.clone());
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&bare, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+
+        // No pin for this run's deps: the lock is not touched.
+        let other = npm_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &sha512);
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&other), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
     }
 
     /// A version-0 lock whose only `workspaces` key is the root `""` (bun

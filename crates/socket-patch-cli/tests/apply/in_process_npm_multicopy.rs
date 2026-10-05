@@ -398,6 +398,86 @@ fn apply_and_rollback_reach_both_transitive_only_vlt_store_copies() {
     assert_vlt_copies([&primary, &twin], false, "after rollback");
 }
 
+/// #601: a copy bundled inside ANOTHER package's vlt or pnpm store entry
+/// (`.vlt/~npm~bundler@1.0.0/node_modules/bundler/node_modules/dupvuln`)
+/// is what that package loads, so apply must patch it even when the same
+/// `name@version` is also installed normally, and rollback must restore
+/// it. Before the fix only the normal copy was patched.
+#[cfg(unix)]
+#[test]
+fn apply_and_rollback_reach_a_bundled_copy_beside_a_normal_install() {
+    for (store, normal_id, host_id) in [
+        (".vlt", "~npm~dupvuln@1.0.0", "~npm~bundler@1.0.0"),
+        (".pnpm", "dupvuln@1.0.0", "bundler@1.0.0"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let name = "dupvuln";
+        let original = b"module.exports = function(){ return 'VULNERABLE'; };\n";
+        let mut patched = original.to_vec();
+        patched.extend_from_slice(b"// SOCKET-PATCHED-MULTICOPY\n");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "bundled-root", "version": "0.0.0" }"#,
+        )
+        .unwrap();
+        let nm = root.join("node_modules");
+        let store_dir = nm.join(store);
+        let normal = write_copy(
+            &store_dir.join(normal_id).join("node_modules").join(name),
+            name,
+            "1.0.0",
+            original,
+        );
+        let host = store_dir.join(host_id).join("node_modules").join("bundler");
+        write_copy(
+            &host,
+            "bundler",
+            "1.0.0",
+            b"module.exports = require('dupvuln');\n",
+        );
+        let bundled = write_copy(
+            &host.join("node_modules").join(name),
+            name,
+            "1.0.0",
+            original,
+        );
+        std::os::unix::fs::symlink(
+            store_dir.join(normal_id).join("node_modules").join(name),
+            nm.join(name),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&host, nm.join("bundler")).unwrap();
+        stage_manifest_and_blob(
+            root,
+            "pkg:npm/dupvuln@1.0.0",
+            &git_sha256(original),
+            &git_sha256(&patched),
+            &patched,
+        );
+        std::fs::write(
+            root.join(".socket")
+                .join("blobs")
+                .join(git_sha256(original)),
+            original,
+        )
+        .unwrap();
+
+        let (code, v) = run_apply(root);
+        assert_eq!(code, 0, "{store}: apply must succeed; envelope={v}");
+        assert_eq!(v["status"], "success", "{store}: envelope={v}");
+        assert_vlt_copies([&normal, &bundled], true, &format!("{store} after apply"));
+
+        let (code, v) = run_rollback(root);
+        assert_eq!(code, 0, "{store}: rollback must succeed; envelope={v}");
+        assert_vlt_copies(
+            [&normal, &bundled],
+            false,
+            &format!("{store} after rollback"),
+        );
+    }
+}
+
 /// #626: a `node_modules/<name>` link to first-party source (an npm
 /// workspace member, which a `file:` directory dependency lays out the
 /// same way) that shares a patched package's `name@version` is the user's
