@@ -614,8 +614,16 @@ async fn pipenv_stale_install_warning(
     listings: &InstalledSiteListings,
     lock: &serde_json::Value,
 ) -> Option<VendorWarning> {
+    use crate::crawlers::hatch_env::{environment_of, hatch_environments};
     use crate::crawlers::python_crawler::find_local_venv_site_packages;
-    let sites = find_local_venv_site_packages(project_root).await;
+    // Pipenv's remedy cannot clear a Hatch env (Hatch never reads
+    // Pipfile.lock), so Hatch's own envs are not judged here (#335).
+    let hatch_envs = hatch_environments(project_root).await;
+    let sites: Vec<std::path::PathBuf> = find_local_venv_site_packages(project_root)
+        .await
+        .into_iter()
+        .filter(|site| environment_of(&hatch_envs, site).is_none())
+        .collect();
     let stale_dirs = stale_install_sites(&sites, purl, record, listings).await;
     if stale_dirs.is_empty() {
         return None;
@@ -2377,6 +2385,61 @@ mod tests {
             blobs,
             record,
         }
+    }
+
+    /// #335 review: Pipenv's remedy cannot clear a stale Hatch env (Hatch
+    /// never reads Pipfile.lock), so the Pipenv probe must not judge one;
+    /// the project's own venv still gets the warning.
+    #[tokio::test]
+    async fn pipenv_stale_install_skips_hatch_envs() {
+        let fx = e2e_fixture().await;
+        touch(
+            &fx.root,
+            "pyproject.toml",
+            "[project]\nname = \"proj\"\nversion = \"0.1.0\"\n\n[tool.hatch.envs.default]\npath = \".hatch-env\"\n",
+        )
+        .await;
+        let env = fx.root.join(".hatch-env");
+        let site = if cfg!(windows) {
+            env.join("Lib").join("site-packages")
+        } else {
+            env.join("lib").join("python3.12").join("site-packages")
+        };
+        tokio::fs::create_dir_all(site.join("six-1.16.0.dist-info"))
+            .await
+            .unwrap();
+        touch(&env, "pyvenv.cfg", "home = /usr/bin\n").await;
+        touch(&site, "six.py", std::str::from_utf8(ORIG).unwrap()).await;
+        touch(
+            &site.join("six-1.16.0.dist-info"),
+            "METADATA",
+            "Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n",
+        )
+        .await;
+        let lock: serde_json::Value = serde_json::from_str(
+            r#"{"_meta": {"pipfile-spec": 6}, "default": {"six": {"version": "==1.16.0"}}, "develop": {}}"#,
+        )
+        .unwrap();
+        let probe = || async {
+            pipenv_stale_install_warning(
+                &fx.root,
+                "pkg:pypi/six@1.16.0",
+                &fx.record,
+                &InstalledSiteListings::default(),
+                &lock,
+            )
+            .await
+        };
+        if !cfg!(windows) {
+            // The fixture's stale `./.venv` (POSIX layout) is still named.
+            let warning = probe().await.expect("the stale ./.venv is reported");
+            assert!(!warning.detail.contains(".hatch-env"), "{}", warning.detail);
+        }
+        // With only the Hatch env stale, there is nothing for Pipenv to say.
+        tokio::fs::remove_dir_all(fx.root.join(".venv"))
+            .await
+            .unwrap();
+        assert!(probe().await.is_none());
     }
 
     /// #790: the vendored stale-install remedy re-syncs the lock category
