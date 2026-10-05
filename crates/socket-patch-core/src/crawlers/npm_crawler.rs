@@ -767,9 +767,19 @@ fn pnpm_global_virtual_store_of_sync(nm: &Path) -> Option<PathBuf> {
 }
 
 /// The nearest `<ancestor>/node_modules/.modules.yaml` above the importer
-/// holding `nm` (a pnpm workspace root's record, for a member).
+/// holding `nm` (a pnpm workspace root's record, for a member). The
+/// importer is resolved to its real path first: under the default
+/// `--cwd .` `nm` is the relative `node_modules`, whose lexical
+/// ancestors never reach the workspace root.
 fn enclosing_pnpm_modules_yaml_sync(nm: &Path) -> Option<PathBuf> {
-    nm.parent()?.ancestors().skip(1).find_map(|dir| {
+    let parent = nm.parent()?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let importer = std::fs::canonicalize(parent).ok()?;
+    importer.ancestors().skip(1).find_map(|dir| {
         let candidate = dir.join("node_modules").join(PNPM_MODULES_YAML);
         std::fs::symlink_metadata(&candidate)
             .is_ok_and(|m| m.is_file())

@@ -216,3 +216,46 @@ fn workspace_member_transitive_global_virtual_store_dep_is_refused() {
     assert!(ev.to_string().contains("enableGlobalVirtualStore"), "{ev}");
     assert_eq!(std::fs::read(number.join("index.js")).unwrap(), BEFORE);
 }
+
+/// The same workspace member, with `apply` run from the member's own
+/// dir under the default `--cwd .`: the walked `node_modules` is then a
+/// relative path whose lexical ancestors never reach the workspace root,
+/// so the root's `.modules.yaml` must be found from the real path.
+#[test]
+fn workspace_member_refusal_holds_when_run_from_the_member() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (proj, number, _) = stage(tmp.path());
+    let root_nm = proj.join("node_modules");
+    let odd = std::fs::canonicalize(root_nm.join("is-odd")).unwrap();
+    #[cfg(unix)]
+    std::fs::remove_file(root_nm.join("is-odd")).unwrap();
+    #[cfg(windows)]
+    std::fs::remove_dir(root_nm.join("is-odd")).unwrap();
+    std::fs::write(
+        proj.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\n",
+    )
+    .unwrap();
+    let member = proj.join("packages").join("a");
+    let member_nm = member.join("node_modules");
+    std::fs::create_dir_all(&member_nm).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        r#"{ "name": "a", "version": "0.0.0", "dependencies": { "is-odd": "3.0.1" } }"#,
+    )
+    .unwrap();
+    link_dir(&odd, &member_nm.join("is-odd"));
+    write_manifest(&member, "pkg:npm/is-number@6.0.0");
+
+    let (code, stdout, stderr) = run_with_env(
+        &member,
+        &["apply", "--offline", "--json", "--cwd", "."],
+        &[("SOCKET_TELEMETRY_DISABLED", "1")],
+    );
+    let v = parse_json_envelope(&stdout);
+    assert_ne!(code, 0, "{v}\n{stderr}");
+    let ev = event(&v, "pkg:npm/is-number@6.0.0");
+    assert_ne!(ev["errorCode"], "package_not_installed", "{ev}");
+    assert!(ev.to_string().contains("enableGlobalVirtualStore"), "{ev}");
+    assert_eq!(std::fs::read(number.join("index.js")).unwrap(), BEFORE);
+}
