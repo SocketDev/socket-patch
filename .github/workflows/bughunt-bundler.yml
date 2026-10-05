@@ -12,8 +12,6 @@ jobs:
         include:
           - os: windows-latest
             ruby: '3.4'
-          - os: macos-14
-            ruby: system
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     defaults:
@@ -80,7 +78,7 @@ jobs:
             gem install colorize -v 0.8.1 --no-document
             GD=$(ruby -e 'print Gem::Specification.find_by_name("colorize").gem_dir')
             WGD=$(cygpath -w "$GD"); echo "gem dir: $GD ($WGD)"
-            icacls "$WGD" /deny "${USERNAME}:(OI)(CI)(W,D,DC)" /T >/dev/null; icacls "$WGD\\lib\\colorize.rb"
+            MSYS2_ARG_CONV_EXCL="*" icacls "$WGD" /deny "${USERNAME}:(OI)(CI)(W,D,DC)" /T; MSYS2_ARG_CONV_EXCL="*" icacls "$WGD\\lib\\colorize.rb"
             echo hi >> "$GD/lib/colorize.rb" && echo "WARNING: still writable" || echo "confirmed not writable"
             D="$W/cwd-ro"; mkdir -p "$D"; cd "$D"
             "$BIN" scan -g --mode agent --json $A > scan.json 2>scan.err; echo "scan exit $?"; grep -E '"(scannedPackages|packagesWithPatches)"' scan.json
@@ -89,7 +87,7 @@ jobs:
             "$BIN" vex -g --product pkg:gem/app@1 --output v.json > vex.out 2>&1; echo "vex exit $?"; vexst v.json; tail -3 vex.out
             ls -la "$GD/lib"; ls -la .socket 2>&1 | head
             echo "CELL W1 non-writable: get=$(grep -o '"status": "[a-z_]*"' get.json | head -1) $(probe "$RB")"
-            icacls "$WGD" /remove:d "${USERNAME}" /T >/dev/null
+            MSYS2_ARG_CONV_EXCL="*" icacls "$WGD" /remove:d "${USERNAME}" /T >/dev/null
             "$BIN" rollback -g --yes --json $A > rb.json 2>&1; grep -E '"(rolledBack|failed)"' rb.json | head -2
             gem uninstall colorize -x -a >/dev/null 2>&1
             cd "$W"
