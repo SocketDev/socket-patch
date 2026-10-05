@@ -1,0 +1,883 @@
+{
+  "_comment": "GitHub REST shapes (issues, issue events, compare) for release.py blockers; each issue's `events` is served at /issues/{n}/events and merged newest-first into /issues/events. Logins: approvers alice,bob,mikolalysenko; routine actors mikolalysenko,claude-routine-bot.",
+  "repo": "o/r",
+  "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "baseTime": "2026-10-12T11:00:00Z",
+  "since": "2026-08-20T00:00:00Z",
+  "approvers": "alice, bob, MikolaLysenko",
+  "routineActors": "mikolalysenko,claude-routine-bot",
+  "scenarios": {
+    "open_untouched_200_days": {
+      "issues": [
+        {
+          "number": 101,
+          "title": "Untrusted title #101 <script>",
+          "state": "open",
+          "labels": [
+            {
+              "name": "release-blocker"
+            }
+          ],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-03-26T09:00:00Z",
+          "closed_at": null,
+          "html_url": "https://github.com/o/r/issues/101",
+          "events": [
+            {
+              "id": 1,
+              "node_id": "E1",
+              "event": "labeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-03-26T09:05:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            }
+          ]
+        }
+      ],
+      "expect": [
+        101
+      ]
+    },
+    "closed_by_commit_not_in_base": {
+      "issues": [
+        {
+          "number": 102,
+          "title": "Untrusted title #102 <script>",
+          "state": "closed",
+          "labels": [
+            {
+              "name": "release-blocker"
+            }
+          ],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-09-02T00:00:00Z",
+          "closed_at": "2026-10-12T12:00:00Z",
+          "html_url": "https://github.com/o/r/issues/102",
+          "events": [
+            {
+              "id": 2,
+              "node_id": "E2",
+              "event": "labeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-09-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 3,
+              "node_id": "E3",
+              "event": "closed",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": "cccccccccccccccccccccccccccccccccccccccc",
+              "commit_url": null,
+              "created_at": "2026-10-12T12:00:00Z"
+            }
+          ]
+        }
+      ],
+      "compare": {
+        "cccccccccccccccccccccccccccccccccccccccc": "diverged"
+      },
+      "expect": [
+        102
+      ]
+    },
+    "closed_by_ancestor_commit": {
+      "issues": [
+        {
+          "number": 103,
+          "title": "Untrusted title #103 <script>",
+          "state": "closed",
+          "labels": [
+            {
+              "name": "release-blocker"
+            }
+          ],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-09-02T00:00:00Z",
+          "closed_at": "2026-10-12T12:00:00Z",
+          "html_url": "https://github.com/o/r/issues/103",
+          "events": [
+            {
+              "id": 4,
+              "node_id": "E4",
+              "event": "labeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-09-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 5,
+              "node_id": "E5",
+              "event": "closed",
+              "actor": {
+                "login": "github-actions[bot]",
+                "type": "Bot"
+              },
+              "commit_id": "dddddddddddddddddddddddddddddddddddddddd",
+              "commit_url": null,
+              "created_at": "2026-10-12T12:00:00Z"
+            }
+          ]
+        }
+      ],
+      "compare": {
+        "dddddddddddddddddddddddddddddddddddddddd": "ahead"
+      },
+      "expect": []
+    },
+    "closed_by_trusted_human_after_t": {
+      "issues": [
+        {
+          "number": 104,
+          "title": "Untrusted title #104 <script>",
+          "state": "closed",
+          "labels": [
+            {
+              "name": "release-blocker"
+            }
+          ],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-09-02T00:00:00Z",
+          "closed_at": "2026-10-12T11:30:00Z",
+          "html_url": "https://github.com/o/r/issues/104",
+          "events": [
+            {
+              "id": 6,
+              "node_id": "E6",
+              "event": "labeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-09-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 7,
+              "node_id": "E7",
+              "event": "closed",
+              "actor": {
+                "login": "bob",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-10-12T11:30:00Z"
+            }
+          ]
+        }
+      ],
+      "expect": [
+        104
+      ]
+    },
+    "closed_by_trusted_human_before_t": {
+      "issues": [
+        {
+          "number": 105,
+          "title": "Untrusted title #105 <script>",
+          "state": "closed",
+          "labels": [
+            {
+              "name": "release-blocker"
+            }
+          ],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-09-02T00:00:00Z",
+          "closed_at": "2026-10-12T10:00:00+00:00",
+          "html_url": "https://github.com/o/r/issues/105",
+          "events": [
+            {
+              "id": 8,
+              "node_id": "E8",
+              "event": "labeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-09-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 9,
+              "node_id": "E9",
+              "event": "closed",
+              "actor": {
+                "login": "bob",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-10-12T03:00:00-07:00"
+            }
+          ]
+        }
+      ],
+      "expect": []
+    },
+    "closed_by_routine_actor": {
+      "issues": [
+        {
+          "number": 106,
+          "title": "Untrusted title #106 <script>",
+          "state": "closed",
+          "labels": [
+            {
+              "name": "release-blocker"
+            }
+          ],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-09-02T00:00:00Z",
+          "closed_at": "2026-10-01T00:00:00Z",
+          "html_url": "https://github.com/o/r/issues/106",
+          "events": [
+            {
+              "id": 10,
+              "node_id": "E10",
+              "event": "labeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-09-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 11,
+              "node_id": "E11",
+              "event": "closed",
+              "actor": {
+                "login": "claude-routine-bot",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-10-01T00:00:00Z"
+            }
+          ]
+        }
+      ],
+      "expect": [
+        106
+      ]
+    },
+    "closed_by_mik_in_routine_fallback": {
+      "issues": [
+        {
+          "number": 107,
+          "title": "Untrusted title #107 <script>",
+          "state": "closed",
+          "labels": [
+            {
+              "name": "release-blocker"
+            }
+          ],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-09-02T00:00:00Z",
+          "closed_at": "2026-10-01T00:00:00Z",
+          "html_url": "https://github.com/o/r/issues/107",
+          "events": [
+            {
+              "id": 12,
+              "node_id": "E12",
+              "event": "labeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-09-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 13,
+              "node_id": "E13",
+              "event": "closed",
+              "actor": {
+                "login": "mikolalysenko",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-10-01T00:00:00Z"
+            }
+          ]
+        }
+      ],
+      "expect": [
+        107
+      ]
+    },
+    "unlabelled_by_routine_actor": {
+      "issues": [
+        {
+          "number": 108,
+          "title": "Untrusted title #108 <script>",
+          "state": "open",
+          "labels": [],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-09-02T00:00:00Z",
+          "closed_at": null,
+          "html_url": "https://github.com/o/r/issues/108",
+          "events": [
+            {
+              "id": 14,
+              "node_id": "E14",
+              "event": "labeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-09-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 15,
+              "node_id": "E15",
+              "event": "unlabeled",
+              "actor": {
+                "login": "mikolalysenko",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-10-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            }
+          ]
+        }
+      ],
+      "expect": [
+        108
+      ]
+    },
+    "unlabelled_by_routine_then_closed_by_routine": {
+      "issues": [
+        {
+          "number": 109,
+          "title": "Untrusted title #109 <script>",
+          "state": "closed",
+          "labels": [],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-09-02T00:00:00Z",
+          "closed_at": "2026-10-02T00:00:00Z",
+          "html_url": "https://github.com/o/r/issues/109",
+          "events": [
+            {
+              "id": 16,
+              "node_id": "E16",
+              "event": "labeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-09-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 17,
+              "node_id": "E17",
+              "event": "unlabeled",
+              "actor": {
+                "login": "claude-routine-bot",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-10-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 18,
+              "node_id": "E18",
+              "event": "closed",
+              "actor": {
+                "login": "claude-routine-bot",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-10-02T00:00:00Z"
+            }
+          ]
+        }
+      ],
+      "expect": [
+        109
+      ]
+    },
+    "unlabelled_by_non_approver": {
+      "issues": [
+        {
+          "number": 110,
+          "title": "Untrusted title #110 <script>",
+          "state": "open",
+          "labels": [],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-09-02T00:00:00Z",
+          "closed_at": null,
+          "html_url": "https://github.com/o/r/issues/110",
+          "events": [
+            {
+              "id": 19,
+              "node_id": "E19",
+              "event": "labeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-09-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 20,
+              "node_id": "E20",
+              "event": "unlabeled",
+              "actor": {
+                "login": "mallory",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-10-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            }
+          ]
+        }
+      ],
+      "expect": [
+        110
+      ]
+    },
+    "unlabelled_by_trusted_approver": {
+      "issues": [
+        {
+          "number": 111,
+          "title": "Untrusted title #111 <script>",
+          "state": "open",
+          "labels": [],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-09-02T00:00:00Z",
+          "closed_at": null,
+          "html_url": "https://github.com/o/r/issues/111",
+          "events": [
+            {
+              "id": 21,
+              "node_id": "E21",
+              "event": "labeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-09-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 22,
+              "node_id": "E22",
+              "event": "unlabeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-10-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            }
+          ]
+        }
+      ],
+      "expect": []
+    },
+    "relabelled_after_trusted_unlabel": {
+      "issues": [
+        {
+          "number": 112,
+          "title": "Untrusted title #112 <script>",
+          "state": "open",
+          "labels": [
+            {
+              "name": "release-blocker"
+            }
+          ],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-09-02T00:00:00Z",
+          "closed_at": null,
+          "html_url": "https://github.com/o/r/issues/112",
+          "events": [
+            {
+              "id": 23,
+              "node_id": "E23",
+              "event": "labeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-09-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 24,
+              "node_id": "E24",
+              "event": "unlabeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-10-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 25,
+              "node_id": "E25",
+              "event": "labeled",
+              "actor": {
+                "login": "reporter",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-10-02T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            }
+          ]
+        }
+      ],
+      "expect": [
+        112
+      ]
+    },
+    "reopened_after_fix_then_closed_by_routine": {
+      "issues": [
+        {
+          "number": 113,
+          "title": "Untrusted title #113 <script>",
+          "state": "closed",
+          "labels": [
+            {
+              "name": "release-blocker"
+            }
+          ],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-09-02T00:00:00Z",
+          "closed_at": "2026-10-05T00:00:00Z",
+          "html_url": "https://github.com/o/r/issues/113",
+          "events": [
+            {
+              "id": 26,
+              "node_id": "E26",
+              "event": "labeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-09-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 27,
+              "node_id": "E27",
+              "event": "closed",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "commit_url": null,
+              "created_at": "2026-09-10T00:00:00Z"
+            },
+            {
+              "id": 28,
+              "node_id": "E28",
+              "event": "reopened",
+              "actor": {
+                "login": "bob",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-09-20T00:00:00Z"
+            },
+            {
+              "id": 29,
+              "node_id": "E29",
+              "event": "closed",
+              "actor": {
+                "login": "claude-routine-bot",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-10-05T00:00:00Z"
+            }
+          ]
+        }
+      ],
+      "compare": {
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee": "ahead"
+      },
+      "expect": [
+        113
+      ]
+    },
+    "api_error": {
+      "issues": [
+        {
+          "number": 114,
+          "title": "Untrusted title #114 <script>",
+          "state": "closed",
+          "labels": [
+            {
+              "name": "release-blocker"
+            }
+          ],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-09-02T00:00:00Z",
+          "closed_at": "2026-10-01T00:00:00Z",
+          "html_url": "https://github.com/o/r/issues/114",
+          "events": [
+            {
+              "id": 30,
+              "node_id": "E30",
+              "event": "labeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-09-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 31,
+              "node_id": "E31",
+              "event": "closed",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": "ffffffffffffffffffffffffffffffffffffffff",
+              "commit_url": null,
+              "created_at": "2026-10-01T00:00:00Z"
+            }
+          ]
+        }
+      ],
+      "fail": [
+        "/repos/o/r/compare/"
+      ],
+      "expect": "error"
+    },
+    "nothing_labelled": {
+      "issues": [
+        {
+          "number": 115,
+          "title": "Untrusted title #115 <script>",
+          "state": "closed",
+          "labels": [],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-09-02T00:00:00Z",
+          "closed_at": "2026-10-01T00:00:00Z",
+          "html_url": "https://github.com/o/r/issues/115",
+          "events": [
+            {
+              "id": 32,
+              "node_id": "E32",
+              "event": "closed",
+              "actor": {
+                "login": "mallory",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-10-01T00:00:00Z"
+            }
+          ]
+        }
+      ],
+      "expect": []
+    },
+    "unlabel_before_last_stable_is_out_of_scope": {
+      "issues": [
+        {
+          "number": 116,
+          "title": "Untrusted title #116 <script>",
+          "state": "open",
+          "labels": [],
+          "user": {
+            "login": "reporter"
+          },
+          "created_at": "2026-01-02T00:00:00Z",
+          "closed_at": null,
+          "html_url": "https://github.com/o/r/issues/116",
+          "events": [
+            {
+              "id": 33,
+              "node_id": "E33",
+              "event": "labeled",
+              "actor": {
+                "login": "alice",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-01-03T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            },
+            {
+              "id": 34,
+              "node_id": "E34",
+              "event": "unlabeled",
+              "actor": {
+                "login": "mallory",
+                "type": "User"
+              },
+              "commit_id": null,
+              "commit_url": null,
+              "created_at": "2026-02-01T00:00:00Z",
+              "label": {
+                "name": "release-blocker",
+                "color": "b60205"
+              }
+            }
+          ]
+        }
+      ],
+      "expect": []
+    }
+  }
+}

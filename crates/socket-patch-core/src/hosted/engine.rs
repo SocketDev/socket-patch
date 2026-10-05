@@ -9,7 +9,8 @@
 //! 2. [`bun_lockb_symlinked`] — the binary-lock symlink refusal.
 //! 3. vlt artifact preflight ([`super::vlt`]) + [`withhold_everywhere`].
 //! 4. (caller) the apply lock, the ledger, the vendored→hosted takeover.
-//! 5. [`read_candidate_files`] → [`wheel_targets`] → (caller) wheel metadata.
+//! 5. [`read_candidate_files`] → [`wheel_targets`] → (caller) wheel metadata,
+//!    and [`yarn_berry_manifest_targets`] → (caller) served npm manifests.
 //! 6. [`rewrite`] — the rewriters, the pnpm `trustLockfile` and npm
 //!    `allow-remote` auto-configs, and the per-ecosystem confirmation.
 //! 7. [`guard`] — the symlink / unreadable-file refusal before any write.
@@ -547,10 +548,11 @@ async fn keep_bundler_loaded_gem_files(view: &ProjectView<'_>, out: &mut Candida
             let gemfile = config.as_deref().and_then(manifest::config_gemfile);
             let lockfile = config.as_deref().and_then(manifest::config_lockfile);
             let root = std::path::Path::new("/");
-            manifest::classify(root, None, gemfile.as_deref()).with_lockfile(
+            manifest::classify(root, None, gemfile.as_deref(), None).with_lockfile(
                 root,
                 None,
                 lockfile.as_deref(),
+                None,
                 view.is_file("gems.rb"),
             )
         }
@@ -663,6 +665,54 @@ pub fn wheel_metadata_unavailable(dep: &DepOverride, detail: &str) -> SkippedPat
         purl: format!("pkg:pypi/{}@{}", dep.name, dep.version),
         uuid: dep.patch_uuid.clone(),
         reason: "python_metadata_unavailable".to_string(),
+        detail: Some(detail.replace(&dep.artifact_url, "<hosted artifact>")),
+    }
+}
+
+/// The npm candidates whose yarn berry pin needs the served tarball's own
+/// `package.json`, in candidate order: yarn builds a tarball entry's `bin:`
+/// from that manifest, not from the registry metadata the locked `npm:`
+/// entry came from, and the two spell bin paths differently (#718). Only an
+/// entry the pin would re-key that carries a `bin:` map needs it (see
+/// `berry_pin_needs_manifest`; a fork alias never counts), so a berry
+/// project without bins fetches nothing.
+pub fn yarn_berry_manifest_targets<'a>(
+    candidates: &'a [Candidate],
+    files: &BTreeMap<String, String>,
+) -> Vec<&'a DepOverride> {
+    let Some(lock) = files
+        .get("yarn.lock")
+        .filter(|lock| crate::patch::redirect::is_berry_lock(lock))
+    else {
+        return Vec::new();
+    };
+    let lock = crate::utils::line_endings::to_lf(lock);
+    let bin_entries = crate::patch::redirect::berry_bin_entries(&lock);
+    if bin_entries.is_empty() {
+        return Vec::new();
+    }
+    let mut seen = BTreeSet::new();
+    candidates
+        .iter()
+        .map(|c| &c.dep)
+        .filter(|dep| dep.ecosystem == "npm")
+        .filter(|dep| crate::patch::redirect::berry_pin_needs_manifest(&bin_entries, dep))
+        .filter(|dep| seen.insert(dep.artifact_url.clone()))
+        .collect()
+}
+
+/// The skip recorded for an npm dep whose served `package.json` could not
+/// be fetched (the grant token in `detail` is redacted to `<hosted
+/// artifact>`).
+pub fn npm_manifest_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch {
+    SkippedPatch {
+        purl: format!(
+            "pkg:npm/{}@{}",
+            crate::patch::redirect::full_name(dep),
+            dep.version
+        ),
+        uuid: dep.patch_uuid.clone(),
+        reason: "npm_manifest_unavailable".to_string(),
         detail: Some(detail.replace(&dep.artifact_url, "<hosted artifact>")),
     }
 }

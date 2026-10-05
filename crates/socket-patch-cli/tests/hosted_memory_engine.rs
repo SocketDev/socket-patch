@@ -1158,3 +1158,111 @@ async fn a_twin_with_diverging_bundler_majors_is_refused() {
         assert!(changed_paths(&output).is_empty());
     }
 }
+
+/// #718 in the in-memory engine: a yarn berry pin of a package with a `bin`
+/// takes the map from the served tarball's own package.json (fetched
+/// through the provider, like wheel metadata), and a tarball it cannot
+/// fetch drops the patch instead of pinning an entry yarn rewrites.
+#[tokio::test]
+async fn yarn_berry_pin_takes_bin_from_the_served_tarball() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
+    const UUID: &str = "71717171-7171-4171-8171-717171717171";
+    let tarball = {
+        let manifest = br#"{"name":"uuid","version":"9.0.1","bin":{"uuid":"./dist/bin/uuid"}}"#;
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/package.json", &manifest[..])
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    };
+    let sha512 = format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&tarball))
+    );
+    let mut files = BTreeMap::new();
+    files.insert(
+        "package.json".to_string(),
+        b"{\n  \"name\": \"app\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"uuid\": \"^9.0.0\"\n  }\n}\n".to_vec(),
+    );
+    files.insert(
+        "yarn.lock".to_string(),
+        format!(
+            "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"app@workspace:.\":\n  version: 0.0.0-use.local\n  resolution: \"app@workspace:.\"\n  \
+             dependencies:\n    uuid: \"npm:^9.0.0\"\n  languageName: unknown\n  linkType: soft\n\n\
+             \"uuid@npm:^9.0.0\":\n  version: 9.0.1\n  resolution: \"uuid@npm:9.0.1\"\n  \
+             bin:\n    uuid: dist/bin/uuid\n  checksum: 10c0/{}\n  languageName: node\n  \
+             linkType: hard\n",
+            "1".repeat(128)
+        )
+        .into_bytes(),
+    );
+
+    for served in [true, false] {
+        let server = MockServer::start().await;
+        let artifact = format!("/patch/npm/uuid/9.0.1/tok/{UUID}/uuid-9.0.1.tgz");
+        let url = format!("{}{artifact}", server.uri());
+        let patch = common::Patch {
+            purl: "pkg:npm/uuid@9.0.1".into(),
+            uuid: UUID.into(),
+            reference: serde_json::json!({
+                "status": "granted",
+                "url": url,
+                "purl": null,
+                "artifacts": [
+                    { "kind": "tarball", "url": url, "integrity": { "sha512": sha512 } },
+                    { "kind": "yarn-berry-zip", "url": url,
+                      "integrity": { "yarnBerry10c0": format!("10c0/{}", "7".repeat(128)) } }
+                ],
+                "registryOverride": null,
+            }),
+        };
+        mount_api(&server, &[patch]).await;
+        Mock::given(method("GET"))
+            .and(path(artifact))
+            .respond_with(if served {
+                ResponseTemplate::new(200).set_body_bytes(tarball.clone())
+            } else {
+                ResponseTemplate::new(404)
+            })
+            .mount(&server)
+            .await;
+
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let project = &output.projects[0];
+        assert!(project.error.is_none(), "{:?}", project.error);
+        let changed = engine_changed(&output);
+        if served {
+            assert_eq!(project.redirected.len(), 1, "{:?}", project.skipped);
+            let lock = String::from_utf8(changed["yarn.lock"].clone()).unwrap();
+            assert!(
+                lock.contains(&format!(
+                    "\"uuid@{url}\":\n  version: 9.0.1\n  resolution: \"uuid@{url}\"\n  \
+                     bin:\n    uuid: ./dist/bin/uuid\n  checksum: 10c0/{}\n",
+                    "7".repeat(128)
+                )),
+                "{lock}"
+            );
+        } else {
+            assert!(project.redirected.is_empty(), "{:?}", project.redirected);
+            assert!(
+                project
+                    .skipped
+                    .iter()
+                    .any(|s| s.reason == "npm_manifest_unavailable"),
+                "{:?}",
+                project.skipped
+            );
+            assert!(!changed.contains_key("yarn.lock"), "{changed:?}");
+        }
+    }
+}

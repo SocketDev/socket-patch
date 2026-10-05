@@ -322,6 +322,10 @@ impl Fixture {
             "workspace-nested" => {
                 json!({"consumer":"workspace:*", "minimist":"1.2.8", "is-number":"7.0.0"})
             }
+            // REGRESSION (#739): a release and a same-version prerelease
+            // elsewhere in the lock must not fail the metadata hash check.
+            "prerelease" => json!({"minimist":"1.2.2", "is-number":"7.0.0",
+                "uuid":"8.0.0", "uuid-beta":"npm:uuid@8.0.0-beta.0"}),
             _ => json!({"minimist":"1.2.2", "is-number":"7.0.0"}),
         };
         let mut package = json!({"name":"native-binary-bun", "version":"1.0.0",
@@ -1007,6 +1011,7 @@ async fn native_binary_alias_and_transitive() {
         "workspace",
         "workspace-nested",
         "extensions",
+        "prerelease",
     ] {
         let Some(fixture) = Fixture::new(shape) else {
             return;

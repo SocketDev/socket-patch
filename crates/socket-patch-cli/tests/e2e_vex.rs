@@ -991,6 +991,90 @@ fn verify_mode_requires_every_installed_copy_patched() {
     assert_eq!(stmts[0]["status"], "not_affected");
 }
 
+/// Regression (#356): an npm alias install (`node_modules/lp` holding the
+/// real `dup-pkg@1.0.0`) is an installed copy of `pkg:npm/dup-pkg@1.0.0`.
+/// `vex` used to verify only `node_modules/dup-pkg`, so it attested the
+/// purl while the alias copy that `require('lp')` loads was unpatched.
+#[test]
+fn verify_mode_requires_npm_alias_copies_patched() {
+    let patched: &[u8] = b"patched dup index";
+    let pristine: &[u8] = b"pristine dup index";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    let before_hash = compute_git_sha256_from_bytes(pristine);
+
+    let run = |copies: &[(&str, &[u8])]| {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        for (dir, content) in copies {
+            let copy = cwd.join("node_modules").join(dir);
+            std::fs::create_dir_all(&copy).unwrap();
+            std::fs::write(
+                copy.join("package.json"),
+                r#"{"name":"dup-pkg","version":"1.0.0"}"#,
+            )
+            .unwrap();
+            std::fs::write(copy.join("index.js"), content).unwrap();
+        }
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/dup-pkg@1.0.0".to_string(),
+            make_record(
+                "44444444-4444-4444-8444-444444444444",
+                "package/index.js",
+                before_hash.as_str(),
+                after_hash.as_str(),
+                "GHSA-dup",
+                &["CVE-DUP"],
+            ),
+        );
+        write_manifest(cwd, &manifest);
+        let out = cli()
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--product",
+                "pkg:npm/test-app@1.0.0",
+            ])
+            .output()
+            .expect("invoke vex");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    // The plain copy is patched, an alias copy (plain or scoped) is not.
+    for alias in ["lp", "@x/dp"] {
+        let (ok, stdout, stderr) = run(&[("dup-pkg", patched), (alias, pristine)]);
+        assert!(
+            !ok && !stdout.contains("GHSA-dup"),
+            "an unpatched alias copy ({alias}) must keep the purl out of the \
+             VEX doc.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("Warning: omitting pkg:npm/dup-pkg@1.0.0 from VEX")
+                && stderr.contains("(not_applied)"),
+            "the omission must name the unpatched alias copy. got: {stderr}"
+        );
+    }
+
+    // Control: alias-only and plain + alias, every copy patched → attested.
+    for copies in [
+        vec![("lp", patched)],
+        vec![("dup-pkg", patched), ("lp", patched)],
+    ] {
+        let (ok, stdout, stderr) = run(&copies);
+        assert!(ok, "all copies patched must attest. stderr:\n{stderr}");
+        let doc: Value = serde_json::from_str(&stdout).unwrap();
+        let stmts = doc["statements"].as_array().unwrap();
+        assert_eq!(stmts.len(), 1, "doc:\n{stdout}");
+        assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-dup");
+        assert_eq!(stmts[0]["status"], "not_affected");
+    }
+}
+
 #[test]
 fn verify_mode_all_failed_exits_non_zero() {
     let tmp = tempfile::tempdir().unwrap();

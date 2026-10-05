@@ -15,7 +15,12 @@
 //!    cwd when it runs with `--cwd`). An environment value naming a file in
 //!    ANOTHER directory moves `Bundler.root` there, and bundler then reads
 //!    that root's app config, never this project's — so it decides alone;
-//! 3. otherwise `gems.rb` when present, else `Gemfile` (bundler >= 2; 1.x
+//! 3. `BUNDLE_GEMFILE:` in the global config file (`bundle config set
+//!    --global gemfile …`: `$BUNDLE_CONFIG`, `$BUNDLE_USER_CONFIG`,
+//!    `$BUNDLE_USER_HOME/config` or `~/.bundle/config`, see
+//!    [`crate::crawlers::ruby_crawler::bundler_global_config_file`]), read
+//!    against the project root like the app config value;
+//! 4. otherwise `gems.rb` when present, else `Gemfile` (bundler >= 2; 1.x
 //!    reads a `Gemfile` first, so callers treat a twin as ambiguous or
 //!    follow the >= 2 order, as the hosted rewriter does).
 //!
@@ -25,9 +30,9 @@
 //! rewriters and the lock readers only know the two default pairs, so the
 //! callers fail closed rather than wire a manifest Bundler never reads.
 //! Bundler 4's custom lockfile (`BUNDLE_LOCKFILE` from the environment,
-//! else `BUNDLE_LOCKFILE:` in the app config — `Bundler::CLI` checks the
-//! environment first) is layered on by [`LoadedManifest::with_lockfile`]: a
-//! value naming the lock of the pair bundler loads anyway changes nothing,
+//! else `BUNDLE_LOCKFILE:` in the app config, else in the global config —
+//! `Bundler::CLI` checks the environment before `Bundler.settings`) is
+//! layered on by [`LoadedManifest::with_lockfile`]: a value naming the lock of the pair bundler loads anyway changes nothing,
 //! and anything else is [`LoadedManifest::UnsupportedLockfile`] — the
 //! rewriters only edit the default lock of each pair, so wiring a project
 //! whose lock lives elsewhere would leave the lock bundler reads unpinned
@@ -38,14 +43,14 @@
 //! [`default_twin_manifest`] settles it from the `BUNDLED WITH` lines of
 //! the two locks (#751).
 //!
-//! The user-level `~/.bundle/config` is not consulted. The model is pure:
+//! The model is pure:
 //! the disk and environment reads live in
 //! [`crate::crawlers::ruby_crawler::bundler_loaded_manifest`].
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use crate::crawlers::ruby_crawler::bundle_config_setting;
+use crate::crawlers::ruby_crawler::{bundle_config_setting, bundle_config_setting_including_empty};
 use crate::utils::fs::normalize_lexically;
 
 /// Where a configured `BUNDLE_GEMFILE` came from.
@@ -55,6 +60,8 @@ pub enum GemfileSetting {
     Env,
     /// `BUNDLE_GEMFILE:` in the project's bundler app config file.
     AppConfig,
+    /// `BUNDLE_GEMFILE:` in the user's global bundler config file.
+    GlobalConfig,
 }
 
 impl GemfileSetting {
@@ -64,6 +71,9 @@ impl GemfileSetting {
             GemfileSetting::Env => "the BUNDLE_GEMFILE environment variable",
             GemfileSetting::AppConfig => {
                 "BUNDLE_GEMFILE in the bundler app config (.bundle/config)"
+            }
+            GemfileSetting::GlobalConfig => {
+                "BUNDLE_GEMFILE in the global bundler config (~/.bundle/config)"
             }
         }
     }
@@ -118,6 +128,10 @@ impl LoadedManifest {
                         "run `bundle config unset --local gemfile`, or point it at the \
                          project's Gemfile"
                     }
+                    GemfileSetting::GlobalConfig => {
+                        "run `bundle config unset --global gemfile`, or point it at the \
+                         project's Gemfile"
+                    }
                 };
                 Some(format!(
                     "bundler loads `{value}` ({}), not the project's Gemfile or gems.rb; \
@@ -136,6 +150,10 @@ impl LoadedManifest {
                         "BUNDLE_LOCKFILE in the bundler app config (.bundle/config)",
                         "run `bundle config unset --local lockfile`",
                     ),
+                    GemfileSetting::GlobalConfig => (
+                        "BUNDLE_LOCKFILE in the global bundler config (~/.bundle/config)",
+                        "run `bundle config unset --global lockfile`",
+                    ),
                 };
                 Some(format!(
                     "bundler reads the lockfile `{value}` ({knob}), not the Gemfile.lock or \
@@ -150,7 +168,8 @@ impl LoadedManifest {
 
     /// Layer Bundler 4's configured lockfile onto `self`: `lockfile_env`
     /// (`BUNDLE_LOCKFILE`) first, else `lockfile_config` (the app config's
-    /// `BUNDLE_LOCKFILE:`), as `Bundler::CLI` resolves it. A relative value
+    /// `BUNDLE_LOCKFILE:`), else `lockfile_global` (the global config's), as
+    /// `Bundler::CLI` resolves it. A relative value
     /// is read against `root`, like `BUNDLE_GEMFILE`. A value naming the
     /// default lock of the pair bundler loads (given whether the root holds
     /// a `gems.rb`) leaves `self` unchanged; any other value is
@@ -161,6 +180,7 @@ impl LoadedManifest {
         root: &Path,
         lockfile_env: Option<&OsStr>,
         lockfile_config: Option<&str>,
+        lockfile_global: Option<&str>,
         gems_rb_present: bool,
     ) -> LoadedManifest {
         let Some((_, lock)) = self.pair(gems_rb_present) else {
@@ -169,10 +189,12 @@ impl LoadedManifest {
         let (value, by) = match (
             lockfile_env.filter(|v| !v.is_empty()),
             lockfile_config.filter(|v| !v.is_empty()),
+            lockfile_global.filter(|v| !v.is_empty()),
         ) {
-            (Some(env), _) => (PathBuf::from(env), GemfileSetting::Env),
-            (None, Some(config)) => (PathBuf::from(config), GemfileSetting::AppConfig),
-            (None, None) => return self,
+            (Some(env), _, _) => (PathBuf::from(env), GemfileSetting::Env),
+            (None, Some(config), _) => (PathBuf::from(config), GemfileSetting::AppConfig),
+            (None, None, Some(global)) => (PathBuf::from(global), GemfileSetting::GlobalConfig),
+            (None, None, None) => return self,
         };
         let target = resolve_against(root, &value);
         let expected = resolve_against(root, Path::new(lock));
@@ -229,9 +251,10 @@ pub fn default_twin_manifest(
 }
 
 /// The `BUNDLE_GEMFILE:` value of a bundler app config file (flat YAML that
-/// bundler writes itself; an empty value counts as unset).
+/// bundler writes itself). An empty string still shadows the global tier;
+/// it does not replace a non-empty `BUNDLE_GEMFILE` already in the environment.
 pub fn config_gemfile(contents: &str) -> Option<String> {
-    bundle_config_setting(contents, "BUNDLE_GEMFILE")
+    bundle_config_setting_including_empty(contents, "BUNDLE_GEMFILE")
 }
 
 /// `value` resolved against `root` (an absolute value stands alone), made
@@ -251,14 +274,17 @@ fn resolve_against(root: &Path, value: &Path) -> Option<PathBuf> {
 /// anchors a relative value: the app config value first, then the
 /// environment — unless the environment names a manifest outside `root`,
 /// which moves bundler's root (and with it the app config bundler reads)
-/// away from this project. See the module doc.
+/// away from this project — then the global config value. See the module
+/// doc.
 pub fn classify(
     root: &Path,
     gemfile_env: Option<&OsStr>,
     config_value: Option<&str>,
+    global_value: Option<&str>,
 ) -> LoadedManifest {
     let env = gemfile_env.filter(|v| !v.is_empty()).map(PathBuf::from);
     let config = config_value.filter(|v| !v.is_empty()).map(PathBuf::from);
+    let global = global_value.filter(|v| !v.is_empty()).map(PathBuf::from);
     let env_keeps_root = |env: &Path| {
         let dir = resolve_against(root, env).and_then(|p| p.parent().map(Path::to_path_buf));
         dir.is_some() && dir == resolve_against(root, Path::new(""))
@@ -267,7 +293,16 @@ pub fn classify(
         (Some(env), Some(config)) if env_keeps_root(&env) => (config, GemfileSetting::AppConfig),
         (Some(env), _) => (env, GemfileSetting::Env),
         (None, Some(config)) => (config, GemfileSetting::AppConfig),
-        (None, None) => return LoadedManifest::Default,
+        // Settings#[] stops at a present empty value, so the global tier
+        // is shadowed. configure_custom_gemfile only exports non-empty
+        // values, leaving an existing non-empty env value in force above.
+        (None, None) if gemfile_env.is_some() || config_value.is_some() => {
+            return LoadedManifest::Default;
+        }
+        (None, None) => match global {
+            Some(global) => (global, GemfileSetting::GlobalConfig),
+            None => return LoadedManifest::Default,
+        },
     };
     let display = value.display().to_string();
     let target = resolve_against(root, &value);
@@ -292,20 +327,65 @@ mod tests {
 
     #[test]
     fn no_setting_is_bundlers_default_discovery() {
-        let m = classify(&root(), None, None);
+        let m = classify(&root(), None, None, None);
         assert_eq!(m, LoadedManifest::Default);
         assert_eq!(m.pair(true), Some(("gems.rb", "gems.locked")));
         assert_eq!(m.pair(false), Some(("Gemfile", "Gemfile.lock")));
         // An empty value is unset, as in bundler.
         assert_eq!(
-            classify(&root(), Some(OsStr::new("")), Some("")),
+            classify(&root(), Some(OsStr::new("")), Some(""), None),
             LoadedManifest::Default
         );
     }
 
     #[test]
+    fn empty_higher_tiers_shadow_global_but_preserve_a_nonempty_environment() {
+        for (env, config) in [(Some(""), None), (None, Some("")), (Some(""), Some(""))] {
+            assert_eq!(
+                classify(&root(), env.map(OsStr::new), config, Some("Gemfile.next")),
+                LoadedManifest::Default
+            );
+        }
+        // configure_custom_gemfile does not export the empty local value.
+        assert_eq!(
+            classify(
+                &root(),
+                Some(OsStr::new("Gemfile")),
+                Some(""),
+                Some("Gemfile.next")
+            ),
+            LoadedManifest::Configured {
+                manifest: "Gemfile",
+                by: GemfileSetting::Env
+            }
+        );
+        for env in ["Gemfile.next", "../other/Gemfile"] {
+            assert_eq!(
+                classify(&root(), Some(OsStr::new(env)), Some(""), Some("gems.rb")),
+                LoadedManifest::Unsupported {
+                    value: env.into(),
+                    by: GemfileSetting::Env
+                }
+            );
+        }
+        // A non-empty local setting still wins over an empty environment.
+        assert_eq!(
+            classify(
+                &root(),
+                Some(OsStr::new("")),
+                Some("gems.rb"),
+                Some("Gemfile.next")
+            ),
+            LoadedManifest::Configured {
+                manifest: "gems.rb",
+                by: GemfileSetting::AppConfig
+            }
+        );
+    }
+
+    #[test]
     fn config_naming_another_manifest_is_unsupported() {
-        let m = classify(&root(), None, Some("Gemfile.next"));
+        let m = classify(&root(), None, Some("Gemfile.next"), None);
         assert_eq!(
             m,
             LoadedManifest::Unsupported {
@@ -321,12 +401,12 @@ mod tests {
     fn config_naming_the_default_spellings_selects_that_pair() {
         // `bundle config set --local gemfile Gemfile` beside a gems.rb:
         // bundler loads Gemfile + Gemfile.lock, not gems.rb.
-        let m = classify(&root(), None, Some("Gemfile"));
+        let m = classify(&root(), None, Some("Gemfile"), None);
         assert_eq!(m.pair(true), Some(("Gemfile", "Gemfile.lock")));
-        let m = classify(&root(), None, Some("./gems.rb"));
+        let m = classify(&root(), None, Some("./gems.rb"), None);
         assert_eq!(m.pair(false), Some(("gems.rb", "gems.locked")));
         let abs = root().join("Gemfile");
-        let m = classify(&root(), None, Some(abs.to_str().unwrap()));
+        let m = classify(&root(), None, Some(abs.to_str().unwrap()), None);
         assert_eq!(m.pair(true), Some(("Gemfile", "Gemfile.lock")));
     }
 
@@ -337,7 +417,12 @@ mod tests {
     /// `BUNDLE_GEMFILE=Gemfile` makes bundler load `Gemfile.next` (#507).
     #[test]
     fn config_wins_over_env_like_bundler_settings() {
-        let m = classify(&root(), Some(OsStr::new("Gemfile")), Some("Gemfile.next"));
+        let m = classify(
+            &root(),
+            Some(OsStr::new("Gemfile")),
+            Some("Gemfile.next"),
+            None,
+        );
         assert_eq!(
             m,
             LoadedManifest::Unsupported {
@@ -352,7 +437,7 @@ mod tests {
             "{detail}"
         );
         // Both naming supported spellings: the config's pair is wired.
-        let m = classify(&root(), Some(OsStr::new("gems.rb")), Some("Gemfile"));
+        let m = classify(&root(), Some(OsStr::new("gems.rb")), Some("Gemfile"), None);
         assert_eq!(
             m,
             LoadedManifest::Configured {
@@ -360,7 +445,7 @@ mod tests {
                 by: GemfileSetting::AppConfig
             }
         );
-        let m = classify(&root(), Some(OsStr::new("Gemfile")), Some("gems.rb"));
+        let m = classify(&root(), Some(OsStr::new("Gemfile")), Some("gems.rb"), None);
         assert_eq!(m.pair(false), Some(("gems.rb", "gems.locked")));
     }
 
@@ -371,7 +456,7 @@ mod tests {
     /// file under the process cwd).
     #[test]
     fn env_applies_without_config_and_is_anchored_at_the_project_root() {
-        let m = classify(&root(), Some(OsStr::new("Gemfile")), None);
+        let m = classify(&root(), Some(OsStr::new("Gemfile")), None, None);
         assert_eq!(
             m,
             LoadedManifest::Configured {
@@ -379,7 +464,7 @@ mod tests {
                 by: GemfileSetting::Env
             }
         );
-        let m = classify(&root(), Some(OsStr::new("Gemfile.next")), None);
+        let m = classify(&root(), Some(OsStr::new("Gemfile.next")), None, None);
         assert!(matches!(
             m,
             LoadedManifest::Unsupported {
@@ -396,7 +481,7 @@ mod tests {
     #[test]
     fn env_gemfile_in_another_directory_is_never_overridden_by_project_config() {
         for env in ["../other/Gemfile", "sub/Gemfile", "/elsewhere/Gemfile"] {
-            let m = classify(&root(), Some(OsStr::new(env)), Some("Gemfile"));
+            let m = classify(&root(), Some(OsStr::new(env)), Some("Gemfile"), None);
             assert_eq!(
                 m,
                 LoadedManifest::Unsupported {
@@ -409,7 +494,7 @@ mod tests {
         // An absolute env value naming the root's own directory is the
         // same root: the config still wins.
         let abs = root().join("Gemfile.next");
-        let m = classify(&root(), Some(abs.as_os_str()), Some("Gemfile"));
+        let m = classify(&root(), Some(abs.as_os_str()), Some("Gemfile"), None);
         assert_eq!(m.pair(false), Some(("Gemfile", "Gemfile.lock")));
     }
 
@@ -417,10 +502,10 @@ mod tests {
     /// environment variable does nothing to a `.bundle/config` setting.
     #[test]
     fn unsupported_detail_names_the_knob_that_set_it() {
-        let env = classify(&root(), Some(OsStr::new("Gemfile.next")), None);
+        let env = classify(&root(), Some(OsStr::new("Gemfile.next")), None, None);
         let env = env.unsupported_detail().unwrap();
         assert!(env.contains("unset BUNDLE_GEMFILE"), "{env}");
-        let config = classify(&root(), None, Some("Gemfile.next"));
+        let config = classify(&root(), None, Some("Gemfile.next"), None);
         let config = config.unsupported_detail().unwrap();
         assert!(
             config.contains("bundle config unset --local gemfile"),
@@ -431,9 +516,9 @@ mod tests {
 
     #[test]
     fn a_manifest_in_another_directory_is_unsupported() {
-        let m = classify(&root(), None, Some("../other/Gemfile"));
+        let m = classify(&root(), None, Some("../other/Gemfile"), None);
         assert!(matches!(m, LoadedManifest::Unsupported { .. }));
-        let m = classify(&root(), None, Some("sub/Gemfile"));
+        let m = classify(&root(), None, Some("sub/Gemfile"), None);
         assert!(matches!(m, LoadedManifest::Unsupported { .. }));
     }
 
@@ -441,17 +526,24 @@ mod tests {
     /// loads; a manifest refusal stays the answer.
     #[test]
     fn with_lockfile_accepts_only_the_pairs_own_lock() {
-        let unset = classify(&root(), None, None).with_lockfile(&root(), None, None, false);
+        let unset =
+            classify(&root(), None, None, None).with_lockfile(&root(), None, None, None, false);
         assert_eq!(unset, LoadedManifest::Default);
-        let own = classify(&root(), None, None).with_lockfile(
+        let own = classify(&root(), None, None, None).with_lockfile(
             &root(),
             Some(OsStr::new("Gemfile.lock")),
+            None,
             None,
             false,
         );
         assert_eq!(own, LoadedManifest::Default);
-        let custom =
-            classify(&root(), None, None).with_lockfile(&root(), None, Some("custom.lock"), false);
+        let custom = classify(&root(), None, None, None).with_lockfile(
+            &root(),
+            None,
+            Some("custom.lock"),
+            None,
+            false,
+        );
         assert_eq!(
             custom,
             LoadedManifest::UnsupportedLockfile {
@@ -466,9 +558,10 @@ mod tests {
             "{detail}"
         );
         // The other pair's lock is not what bundler loads with this manifest.
-        let configured = classify(&root(), None, Some("Gemfile")).with_lockfile(
+        let configured = classify(&root(), None, Some("Gemfile"), None).with_lockfile(
             &root(),
             Some(OsStr::new("gems.locked")),
+            None,
             None,
             true,
         );
@@ -484,13 +577,42 @@ mod tests {
             .unwrap()
             .contains("unset BUNDLE_LOCKFILE"));
         // An unsupported manifest keeps its own refusal.
-        let manifest = classify(&root(), None, Some("Gemfile.next")).with_lockfile(
+        let manifest = classify(&root(), None, Some("Gemfile.next"), None).with_lockfile(
             &root(),
             Some(OsStr::new("custom.lock")),
+            None,
             None,
             false,
         );
         assert!(matches!(manifest, LoadedManifest::Unsupported { .. }));
+        // `bundle config set --global lockfile` is the lowest tier (#577's
+        // global file feeds `Bundler.settings[:lockfile]` too).
+        let global = classify(&root(), None, None, None).with_lockfile(
+            &root(),
+            None,
+            None,
+            Some("custom.lock"),
+            false,
+        );
+        assert_eq!(
+            global,
+            LoadedManifest::UnsupportedLockfile {
+                value: "custom.lock".into(),
+                by: GemfileSetting::GlobalConfig
+            }
+        );
+        assert!(global
+            .unsupported_detail()
+            .unwrap()
+            .contains("bundle config unset --global lockfile"));
+        let shadowed = classify(&root(), None, None, None).with_lockfile(
+            &root(),
+            None,
+            Some("Gemfile.lock"),
+            Some("custom.lock"),
+            false,
+        );
+        assert_eq!(shadowed, LoadedManifest::Default);
     }
 
     /// #751: bundler 1.x loads a twin's `Gemfile`, >= 2 its `gems.rb`;
@@ -536,7 +658,10 @@ mod tests {
             ),
             Some("Gemfile.next".into())
         );
-        assert_eq!(config_gemfile("---\nBUNDLE_GEMFILE: \"\"\n"), None);
+        assert_eq!(
+            config_gemfile("---\nBUNDLE_GEMFILE: \"\"\n"),
+            Some("".into())
+        );
         assert_eq!(config_gemfile("---\nBUNDLE_PATH: \"x\"\n"), None);
     }
 }
