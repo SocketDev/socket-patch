@@ -492,6 +492,57 @@ async fn revert_round_trip() {
     assert_eq!(env["summary"]["removed"], 0);
 }
 
+/// #665: `npm uninstall left-pad` after vendoring deletes the lock entry
+/// the wiring recorded, so nothing resolves through the vendored artifact
+/// any more. `rollback` used to report that as drift, keep the artifact
+/// and the ledger entry, and exit 1 on every run; `vendor --revert` then
+/// "succeeded" without cleaning anything up. Now the first rollback drops
+/// the unreferenced artifact and ledger entry, and every later run is a
+/// clean exit 0.
+#[tokio::test]
+async fn rollback_after_dependency_removed_cleans_up_and_converges() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    assert!(fx.tgz_path().exists(), "sanity: vendored");
+
+    // What `npm uninstall left-pad` leaves behind.
+    let mut lock = fx.lock_value();
+    let packages = lock["packages"].as_object_mut().unwrap();
+    packages.remove("node_modules/left-pad");
+    packages[""]["dependencies"] = json!({});
+    let mut uninstalled = serde_json::to_vec_pretty(&lock).unwrap();
+    uninstalled.push(b'\n');
+    std::fs::write(fx.lock_path(), &uninstalled).unwrap();
+    std::fs::remove_dir_all(fx.root().join("node_modules/left-pad")).unwrap();
+
+    let cwd = fx.root().to_str().unwrap();
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &["rollback", "--json", "--yes", "--offline", "--cwd", cwd],
+        &[],
+    );
+    assert_eq!(code, 0, "rollback must succeed:\n{stdout}\n{stderr}");
+    assert!(
+        !stdout.contains("vendor_artifact_kept"),
+        "nothing is kept:\n{stdout}"
+    );
+    assert!(
+        !fx.vendor_dir().exists(),
+        "the unreferenced artifact and ledger are cleaned up:\n{stdout}"
+    );
+    assert_eq!(fx.lock_bytes(), uninstalled, "the user's lock is untouched");
+
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &["rollback", "--json", "--yes", "--offline", "--cwd", cwd],
+        &[],
+    );
+    assert_eq!(code, 0, "a second rollback is a no-op:\n{stdout}\n{stderr}");
+    let (code, env) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(events(&env).is_empty(), "nothing left to revert: {env:#}");
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 5. revert works without a manifest
 // ─────────────────────────────────────────────────────────────────────

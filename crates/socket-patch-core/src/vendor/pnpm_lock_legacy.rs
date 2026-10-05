@@ -64,8 +64,8 @@ use crate::utils::fs::read_regular_to_string;
 use super::common::refused;
 use super::path::parse_vendor_path;
 use super::pnpm_lock::{
-    dep_field_lines, drifted, lines_value, revert_overrides_line, value_lines, vendor_value_is_for,
-    EditCtx, PnpmDialect, KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
+    dep_field_lines, drifted, lines_value, removed, revert_overrides_line, value_lines,
+    vendor_value_is_for, EditCtx, PnpmDialect, KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
 };
 use super::source::PackageSource;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
@@ -986,7 +986,7 @@ fn revert_value_line(
         *dirty = true;
         return;
     }
-    warnings.push(drifted(format!(
+    warnings.push(removed(format!(
         "{section} entry `{dep}` no longer exists; nothing to restore"
     )));
 }
@@ -1069,7 +1069,7 @@ fn revert_root_dep_pair(
         *dirty = true;
         return;
     }
-    warnings.push(drifted(format!(
+    warnings.push(removed(format!(
         "root dep `{key}` no longer exists; nothing to restore"
     )));
 }
@@ -1156,7 +1156,7 @@ fn revert_package_block(
             j = block.end;
         }
     }
-    warnings.push(drifted(format!(
+    warnings.push(removed(format!(
         "packages entry `{new_key}` no longer exists; nothing to restore"
     )));
 }
@@ -1229,7 +1229,7 @@ fn revert_pkg_dep_ref(
         }
         break;
     }
-    warnings.push(drifted(format!(
+    warnings.push(removed(format!(
         "dep ref `{key}` no longer exists; nothing to restore"
     )));
 }
@@ -2782,6 +2782,47 @@ packages:
         );
     }
 
+    /// Revert and assert the #665 removed-entry contract: success, no
+    /// drift, one `vendor_lock_entry_removed` warning containing `want`,
+    /// and the artifact kept exactly while the lock still resolves through
+    /// it (`still_referenced`). A removed artifact is put back afterwards
+    /// so the caller's next matrix case starts from the vendored state.
+    async fn assert_removed(fx: &Fixture, entry: &VendorEntry, want: &str, still_referenced: bool) {
+        let uuid_dir = fx.root().join(fx.rel_tgz()).parent().unwrap().to_path_buf();
+        let mut saved = Vec::new();
+        for file in std::fs::read_dir(&uuid_dir).unwrap() {
+            let path = file.unwrap().path();
+            saved.push((path.clone(), std::fs::read(&path).unwrap()));
+        }
+
+        let outcome = revert_pnpm_legacy(entry, fx.root(), false).await;
+        assert!(outcome.success, "{want}: {:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{want}: {:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_removed" && w.detail.contains(want)),
+            "expected a removed warning containing `{want}`: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            outcome.kept_artifact, still_referenced,
+            "{want}: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            fx.root().join(fx.rel_tgz()).exists(),
+            still_referenced,
+            "{want}: the artifact goes once nothing resolves through it"
+        );
+
+        std::fs::create_dir_all(&uuid_dir).unwrap();
+        for (path, bytes) in saved {
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+
     /// A dry run previews and records NOTHING through the legacy entry
     /// point, and a missing patch-target file fails the vendor before any
     /// pack — both land in the `staged == None` early return with the
@@ -3344,8 +3385,9 @@ packages:
     }
 
     /// v5.4 drift matrix: third-party re-resolutions are left alone with ONE
-    /// precise warning each, vanished fragments/sections warn, and every
-    /// case keeps the artifact.
+    /// precise warning each and keep the artifact; vanished sections warn
+    /// and keep; a vanished fragment warns as removed and the artifact goes
+    /// once nothing resolves through it (#665).
     #[tokio::test]
     async fn reresolved_and_vanished_fragments_drift_keep_v54() {
         let (fx, entry) = vendored(T7_BEFORE_LOCK).await;
@@ -3381,11 +3423,11 @@ packages:
         tokio::fs::write(fx.root().join(PNPM_LOCK), &tampered)
             .await
             .unwrap();
-        assert_drift_keep(
+        assert_removed(
             &fx,
             &entry,
             "specifiers entry `left-pad` no longer exists",
-            1,
+            false,
         )
         .await;
         rewire(&fx, &wired_pkg, &wired).await;
@@ -3412,11 +3454,11 @@ packages:
         tokio::fs::write(fx.root().join(PNPM_LOCK), &tampered)
             .await
             .unwrap();
-        assert_drift_keep(
+        assert_removed(
             &fx,
             &entry,
             "dep ref `file:consumer|left-pad` no longer exists",
-            1,
+            false,
         )
         .await;
         rewire(&fx, &wired_pkg, &wired).await;
@@ -3430,7 +3472,7 @@ packages:
             .await
             .unwrap();
         let want_block_gone = format!("packages entry `file:{rel}` no longer exists");
-        assert_drift_keep(&fx, &entry, &want_block_gone, 1).await;
+        assert_removed(&fx, &entry, &want_block_gone, false).await;
         rewire(&fx, &wired_pkg, &wired).await;
 
         // (f) the whole specifiers section is gone.
@@ -3482,11 +3524,13 @@ packages:
         tokio::fs::write(fx.root().join(PNPM_LOCK), &tampered)
             .await
             .unwrap();
-        assert_drift_keep(
+        // The surviving `specifier:` line still names the artifact, so it
+        // is kept.
+        assert_removed(
             &fx,
             &entry,
             "root dep `dependencies|left-pad` no longer exists",
-            1,
+            true,
         )
         .await;
         rewire(&fx, &wired_pkg, &wired).await;
@@ -4350,7 +4394,8 @@ packages:
     /// Our rekeyed block gone (user re-locked) AND the record's original
     /// stripped (corrupted ledger): with neither the live block nor a
     /// converged original to anchor on, the record warns `no longer exists`
-    /// and the artifact is kept.
+    /// (removed), and with nothing left resolving through the artifact it is
+    /// removed (#665).
     #[tokio::test]
     async fn missing_block_with_no_recorded_original_warns_no_longer_exists() {
         let (fx, mut entry) = vendored(T7_BEFORE_LOCK).await;
@@ -4369,11 +4414,11 @@ packages:
             .find(|r| r.kind == KIND_LOCK_PACKAGE)
             .unwrap();
         rec.original = None;
-        assert_drift_keep(
+        assert_removed(
             &fx,
             &entry,
             &format!("packages entry `file:{rel}` no longer exists"),
-            1,
+            false,
         )
         .await;
     }

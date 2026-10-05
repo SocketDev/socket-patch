@@ -999,6 +999,17 @@ pub(super) async fn revert_pnpm_dialect(
     // ran; the artifact dir stays behind (and the caller keeps the ledger
     // entry), so only the deletion is skipped.
     if !keep_artifact {
+        if super::npm_flavor::keep_artifact_while_lock_references_it(
+            &mut outcome,
+            project_root,
+            &[PNPM_LOCK, PACKAGE_JSON, PNPM_WORKSPACE],
+            &entry.uuid,
+            &uuid_dir_rel,
+        )
+        .await
+        {
+            return outcome;
+        }
         // The last npm-family entry leaves `.socket/vendor/npm/` (and
         // `.socket/vendor/`) empty: the shared helper prunes them so a
         // reverted project carries no vendor residue (non-recursive:
@@ -3108,7 +3119,7 @@ fn revert_importer_dep(
         }
         break;
     }
-    warnings.push(drifted(format!(
+    warnings.push(removed(format!(
         "importer dep `{key}` no longer exists; nothing to restore"
     )));
 }
@@ -3187,7 +3198,7 @@ fn revert_block(
             j = block.end;
         }
     }
-    warnings.push(drifted(format!(
+    warnings.push(removed(format!(
         "{section} entry `{new_key}` no longer exists; nothing to restore"
     )));
 }
@@ -3251,13 +3262,20 @@ fn revert_snapshot_ref(
         }
         break;
     }
-    warnings.push(drifted(format!(
+    warnings.push(removed(format!(
         "snapshot ref `{key}` no longer exists; nothing to restore"
     )));
 }
 
 pub(super) fn drifted(detail: impl Into<String>) -> VendorWarning {
     VendorWarning::new("vendor_lock_entry_drifted", detail.into())
+}
+
+/// A recorded lock entry that no longer exists (`pnpm remove` dropped the
+/// dependency). Not drift (#665): the revert keeps the artifact only while
+/// a wired file still resolves through it.
+pub(super) fn removed(detail: impl Into<String>) -> VendorWarning {
+    VendorWarning::new(super::LOCK_ENTRY_REMOVED_CODE, detail.into())
 }
 
 // ────────────────────────── surfaces commit + unwind ──────────────────────
@@ -6579,23 +6597,24 @@ snapshots:
             .await
             .unwrap();
 
+        // #665: a vanished block is not drift. Once the other recorded
+        // fragments are restored nothing resolves through the artifact, so
+        // it is removed instead of kept forever.
         let outcome = revert_pnpm(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert_warning(
             &outcome.warnings,
-            "vendor_lock_entry_drifted",
-            "no longer exists; nothing to restore",
-        );
-        assert_warning(
-            &outcome.warnings,
-            "vendor_lock_entry_drifted",
+            "vendor_lock_entry_removed",
             "packages entry `left-pad@file:",
         );
-        assert!(outcome.kept_artifact);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(!uuid_dir(&fx).exists(), "unreferenced artifact removed");
     }
 
-    /// Snapshot dep refs: the re-resolved (foreign value) arm and the
-    /// line-vanished arm both warn and keep.
+    /// Snapshot dep refs: the re-resolved (foreign value) arm warns and
+    /// keeps; the line-vanished arm warns `vendor_lock_entry_removed` and,
+    /// with nothing left resolving through the artifact, removes it (#665).
     #[tokio::test]
     async fn snapshot_ref_drift_and_vanished_arms_warn() {
         // Re-resolved behind our back.
@@ -6636,13 +6655,16 @@ snapshots:
         assert!(outcome.success, "{:?}", outcome.error);
         assert_warning(
             &outcome.warnings,
-            "vendor_lock_entry_drifted",
+            "vendor_lock_entry_removed",
             "snapshot ref `consumer@file:consumer|left-pad` no longer exists; nothing to restore",
         );
-        assert!(outcome.kept_artifact);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(!uuid_dir(&fx).exists(), "unreferenced artifact removed");
     }
 
-    /// The whole importer dep entry deleted since vendoring: warn + keep.
+    /// The whole importer dep entry deleted since vendoring: warned as
+    /// removed, and the artifact goes once nothing resolves through it
+    /// (#665).
     #[tokio::test]
     async fn vanished_importer_dep_entry_warns_nothing_to_restore() {
         let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
@@ -6665,10 +6687,11 @@ snapshots:
         assert!(outcome.success, "{:?}", outcome.error);
         assert_warning(
             &outcome.warnings,
-            "vendor_lock_entry_drifted",
+            "vendor_lock_entry_removed",
             "importer dep `.|left-pad` no longer exists; nothing to restore",
         );
-        assert!(outcome.kept_artifact);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(!uuid_dir(&fx).exists(), "unreferenced artifact removed");
     }
 
     /// The user hand-restored the importer dep to its pre-vendor pair before
@@ -7973,7 +7996,7 @@ snapshots:
             &mut warnings,
         );
         assert!(!dirty);
-        assert_warning(&warnings, "vendor_lock_entry_drifted", "no longer exists");
+        assert_warning(&warnings, "vendor_lock_entry_removed", "no longer exists");
     }
 
     /// A record whose `original` lost its `specifier`/`version` fields
@@ -8015,8 +8038,9 @@ snapshots:
     }
 
     /// A rekeyed block that vanished, where the recorded original ALSO
-    /// matches no live block, is drift ("no longer exists") — the converged
-    /// silent return applies only when the original block is live verbatim.
+    /// matches no live block, is warned as removed ("no longer exists") —
+    /// the converged silent return applies only when the original block is
+    /// live verbatim.
     #[test]
     fn packages_block_revert_with_no_live_or_original_match_warns_vanished() {
         let mut lines =
@@ -8047,10 +8071,10 @@ snapshots:
             &mut warnings,
         );
         assert!(!dirty);
-        assert_warning(&warnings, "vendor_lock_entry_drifted", "no longer exists");
+        assert_warning(&warnings, "vendor_lock_entry_removed", "no longer exists");
 
         // Same vanish with NO recorded original (a stripped/reconstructed
-        // record): the converged probe is skipped — still the same drift
+        // record): the converged probe is skipped — still the same removed
         // warning, never a silent pass.
         let rec = WiringRecord {
             original: None,
@@ -8068,7 +8092,7 @@ snapshots:
             &mut warnings,
         );
         assert!(!dirty);
-        assert_warning(&warnings, "vendor_lock_entry_drifted", "no longer exists");
+        assert_warning(&warnings, "vendor_lock_entry_removed", "no longer exists");
     }
 
     /// The unwind helper restores exactly what was written: with no
