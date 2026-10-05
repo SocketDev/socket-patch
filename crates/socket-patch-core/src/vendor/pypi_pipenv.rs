@@ -170,6 +170,23 @@ pub(super) fn check_target_guards(
     version: &str,
     hosted_origins: &[String],
 ) -> Result<PipenvTarget, (&'static str, String)> {
+    check_target_guards_superseding(p, canon_name, record_uuid, version, hosted_origins, None)
+}
+
+/// [`check_target_guards`], given `superseded`: the vendor-ledger entry
+/// that wired this package at an OLDER patch uuid. An entry still routed
+/// through that uuid's wheel is a superseding patch (#769): it re-wires in
+/// place when the ledger records exactly what was written there and the
+/// pre-vendor original to carry forward. Without that record it refuses, as
+/// a re-wire with no recorded original could never be reverted.
+pub(super) fn check_target_guards_superseding(
+    p: &PipenvProject,
+    canon_name: &str,
+    record_uuid: &str,
+    version: &str,
+    hosted_origins: &[String],
+    superseded: Option<&VendorEntry>,
+) -> Result<PipenvTarget, (&'static str, String)> {
     let entries = find_entries(&p.lock, canon_name);
     if entries.is_empty() {
         return Err((
@@ -196,12 +213,7 @@ pub(super) fn check_target_guards(
             match parse_vendor_path(file_ref) {
                 // Ours, same patch generation.
                 Some(parts) if parts.eco == "pypi" && parts.uuid == record_uuid => {
-                    let filename = file_ref.rsplit('/').next().unwrap_or("");
-                    let mut fields = filename.split('-');
-                    let matches_identity = fields
-                        .next()
-                        .is_some_and(|name| canonicalize_pypi_name(name) == canon_name)
-                        && fields.next() == Some(version);
+                    let matches_identity = wheel_identity_matches(file_ref, canon_name, version);
                     let conflicting_source = NON_REGISTRY_KEYS
                         .iter()
                         .filter(|key| **key != "path")
@@ -217,19 +229,35 @@ pub(super) fn check_target_guards(
                         "vendored wheel identity or source changed".into(),
                     ));
                 }
-                // Ours, but a STALE patch generation: wiring over it would
-                // lose the only recorded registry original — refuse with the
-                // repair path (mirrors gem's stale-checksum refusal).
+                // Ours, but an OLDER patch generation: a superseding patch
+                // (#769). Re-wire it in place when the ledger entry of that
+                // uuid recorded this very entry and its pre-vendor original
+                // (carried forward by the wire step); otherwise wiring over
+                // it would lose the only registry original — refuse with the
+                // repair path.
                 Some(parts) if parts.eco == "pypi" => {
+                    let why = match superseded_record(superseded, &parts.uuid, section, key) {
+                        None => " and the vendor ledger records no wiring for it to carry over",
+                        Some(rec) if rec.new.as_ref() != Some(*entry) => {
+                            " and the entry changed since vendoring"
+                        }
+                        Some(_) if !wheel_identity_matches(file_ref, canon_name, version) => {
+                            " for another release"
+                        }
+                        Some(_) => {
+                            all_in_sync = false;
+                            continue;
+                        }
+                    };
                     return Err((
                         "pypi_pipenv_source_already_exists",
                         format!(
                             "{LOCK_FILE} already routes {section}.{key} through \
-                             .socket/vendor/pypi/{} (an earlier socket-patch vendor); run \
+                             .socket/vendor/pypi/{} (an earlier socket-patch vendor){why}; run \
                              `socket-patch vendor --revert` for it and re-vendor",
                             parts.uuid
                         ),
-                    ))
+                    ));
                 }
                 // Socket's own HOSTED reference (`scan --mode hosted`): the
                 // two modes do not take each other over for Pipenv yet — name
@@ -280,6 +308,36 @@ pub(super) fn check_target_guards(
     })
 }
 
+/// Whether a vendored wheel reference names `canon_name` at `version` (the
+/// wheel filename's leading `<name>-<version>` fields).
+fn wheel_identity_matches(file_ref: &str, canon_name: &str, version: &str) -> bool {
+    let filename = file_ref.rsplit('/').next().unwrap_or("");
+    let mut fields = filename.split('-');
+    fields
+        .next()
+        .is_some_and(|name| canonicalize_pypi_name(name) == canon_name)
+        && fields.next() == Some(version)
+}
+
+/// The record `superseded` (the ledger entry at the older `uuid`) holds for
+/// the `section`/`key` lock entry, when it carries a pre-vendor original.
+fn superseded_record<'e>(
+    superseded: Option<&'e VendorEntry>,
+    uuid: &str,
+    section: &str,
+    key: &str,
+) -> Option<&'e WiringRecord> {
+    let prev = superseded.filter(|prev| prev.ecosystem == "pypi" && prev.uuid == uuid)?;
+    let wanted = format!("{section}:{key}");
+    prev.wiring.iter().find(|rec| {
+        rec.file == LOCK_FILE
+            && rec.kind == KIND_LOCK_ENTRY
+            && rec.action == WiringAction::Rewritten
+            && rec.key.as_deref() == Some(wanted.as_str())
+            && rec.original.is_some()
+    })
+}
+
 /// Wire Pipfile.lock for the vendored wheel: replace every matching entry
 /// in every package category (all keys but `_meta`) with the spike-captured
 /// file-ref shape (`path` instead of `file` when the entry carries extras;
@@ -298,9 +356,46 @@ pub(super) async fn wire_pipenv(
     record_uuid: &str,
     hosted_origins: &[String],
 ) -> Result<(Vec<WiringRecord>, PipenvMeta), (&'static str, String)> {
+    wire_pipenv_superseding(
+        p,
+        root,
+        canon_name,
+        version,
+        rel_wheel,
+        wheel_sha256_hex,
+        record_uuid,
+        hosted_origins,
+        None,
+    )
+    .await
+}
+
+/// [`wire_pipenv`] over entries `superseded` (the ledger entry of an OLDER
+/// patch uuid, see [`check_target_guards_superseding`]) wired: each one is
+/// re-wired in place and its record carries that entry's pre-vendor
+/// original forward, so reverting the new entry restores the registry pin.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn wire_pipenv_superseding(
+    p: &PipenvProject,
+    root: &Path,
+    canon_name: &str,
+    version: &str,
+    rel_wheel: &str,
+    wheel_sha256_hex: &str,
+    record_uuid: &str,
+    hosted_origins: &[String],
+    superseded: Option<&VendorEntry>,
+) -> Result<(Vec<WiringRecord>, PipenvMeta), (&'static str, String)> {
     // Before ANY write: a symlinked lock would be replaced by the rename-over.
     refuse_symlinked(root, &[LOCK_FILE], "pypi_pipenv_symlink_unsupported").await?;
-    match check_target_guards(p, canon_name, record_uuid, version, hosted_origins)? {
+    match check_target_guards_superseding(
+        p,
+        canon_name,
+        record_uuid,
+        version,
+        hosted_origins,
+        superseded,
+    )? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
         // "original").
@@ -364,22 +459,29 @@ pub(super) async fn wire_pipenv(
                 continue;
             }
             // Never record one of our own edits as the "original" — revert
-            // must restore the pre-vendor registry fragment (a vendor-pointing
-            // old entry can only reach here through a same-uuid hash refresh;
-            // stale uuids refuse in the guards).
-            let was_vendored = old
+            // must restore the pre-vendor registry fragment. A vendor-pointing
+            // old entry reaches here through a same-uuid hash refresh (the
+            // CLI carries the original forward from the ledger) or as a
+            // superseded uuid the guards admitted only with a recorded
+            // original, carried forward here.
+            let vendored_uuid = old
                 .get("file")
                 .or_else(|| old.get("path"))
                 .and_then(Value::as_str)
                 .and_then(parse_vendor_path)
-                .is_some();
+                .map(|parts| parts.uuid);
+            let original = match vendored_uuid {
+                None => Some(old),
+                Some(uuid) => superseded_record(superseded, &uuid, &section, &key)
+                    .and_then(|rec| rec.original.clone()),
+            };
             map.insert(key.clone(), new_value.clone());
             wiring.push(WiringRecord {
                 file: LOCK_FILE.to_string(),
                 kind: KIND_LOCK_ENTRY.to_string(),
                 action: WiringAction::Rewritten,
                 key: Some(format!("{section}:{key}")),
-                original: if was_vendored { None } else { Some(old) },
+                original,
                 new: Some(new_value),
             });
             if !sections.iter().any(|s| s == &section) {
