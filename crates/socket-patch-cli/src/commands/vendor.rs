@@ -1000,14 +1000,15 @@ async fn run_check(args: &VendorArgs) -> i32 {
             continue;
         }
         // No ledger entry means no purl to name: like repair, the event
-        // carries the uuid and the referenced path instead.
+        // carries the uuid and the referenced path instead. The message
+        // names only the ecosystem, keeping patch identifiers out of logs.
         let detail = format!(
-            "a lockfile references .socket/vendor/{eco}/{uuid}/ but the vendor ledger \
-             (.socket/vendor/state.json) has no entry for it; restore state.json from version \
-             control"
+            "a lockfile references a vendored {eco} artifact under .socket/vendor/{eco}/ but \
+             the vendor ledger (.socket/vendor/state.json) has no entry for it; restore \
+             state.json from version control"
         );
         if !args.common.json {
-            eprintln!("{rel}: {detail}");
+            eprintln!("vendor_ledger_missing: {detail}");
         }
         env.record(
             PatchEvent::artifact(PatchAction::Failed)
