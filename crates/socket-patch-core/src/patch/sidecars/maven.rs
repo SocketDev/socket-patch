@@ -17,8 +17,6 @@
 
 use std::path::{Path, PathBuf};
 
-use sha1::Digest as _;
-
 use super::{
     SidecarAdvisory, SidecarAdvisoryCode, SidecarError, SidecarFile, SidecarFileAction,
     SidecarPayload, SidecarSeverity,
@@ -44,7 +42,7 @@ impl Algo {
 
     fn digest(self, bytes: &[u8]) -> String {
         match self {
-            Algo::Sha1 => hex::encode(sha1::Sha1::digest(bytes)),
+            Algo::Sha1 => crate::utils::digest::sha1_hex_of(bytes),
             Algo::Md5 => hex::encode(md5(bytes)),
         }
     }

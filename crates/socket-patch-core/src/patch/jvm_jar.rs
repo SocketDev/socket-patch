@@ -25,8 +25,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use sha1::Digest as _;
-
 use crate::crawlers::gradle_cache;
 use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 use crate::manifest::schema::PatchFileInfo;
@@ -353,12 +351,11 @@ fn unpatched_members(
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest as _;
-    hex::encode(sha2::Sha256::digest(bytes))
+    crate::utils::digest::sha256_hex_of(bytes)
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {
-    hex::encode(sha1::Sha1::digest(bytes))
+    crate::utils::digest::sha1_hex_of(bytes)
 }
 
 /// `<socket_dir>/jvm-originals/<sha256>.jar`.
