@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-05 (run 21), main `4646693`, latest release 4.0.0.
+Last updated: 2026-10-05 (run 22), main `9c43dfc`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, package grant, hosted tarball, `/registry/<name>/<ver>` mirror). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -199,6 +199,17 @@ Run 21 additions (main `4646693`, Linux):
 
 Fixed on main `4646693` and re-verified with real pnpm in run 21: #356 (9 / 12), #360 (10.34.5), #557 (9 / 12), #626 (12), #636 (9 / 12), #661 / #696 (10.34.5 / 12.8.1), #662 (7 / 9 / 12), #754 (7 / 8). Read the older "fail" cells for those issues as fixed. #853 and #854 aren't regressions: release 4.0.0 behaves the same.
 
+Run 22 additions (main `9c43dfc`, Linux):
+
+| pnpm | Hosted from a member with its own lock (`sharedWorkspaceLockfile: false`) | Vendored from the same member | Hosted from a shared-lock member (#590 refusal) | Agent: GVS direct / transitive (#362 refusal) |
+| --- | --- | --- | --- | --- |
+| 9.15.9 (`.npmrc` layout) | pass (nested file written, harmless) | pass | pass (`redirect_pnpm_lockfile_elsewhere`) | n/a |
+| 10.34.5 (`.npmrc` layout) | pass (nested file written, harmless) | pass | untested | n/a on CI |
+| 11.28.3 | fail #880 | fail #881 (frozen fails; plain install silently unpatches) | untested | pass / pass (loud refusal, exit 1) |
+| 12.8.1 | fail #880 | fail #881 | untested | pass / pass |
+
+Fixed on main `9c43dfc` and re-verified with real pnpm in run 22: #362 (11 / 12), #590 (9). #435 (12.8.1) and #734 (9.15.9) still reproduce. #880 and #881 aren't regressions: release 4.0.0 behaves the same.
+
 Run 20 additions (main `045d7ec`, Linux):
 
 | pnpm (lock) | Vendored parent + vendored dep (`debug`→`ms`): `remove <parent>` / takeover → hosted / `rollback` | `remove <child>` (control) | Hosted parent + dep: remove parent / rollback | Mixed-case names (`Base64`, `JSONStream`): hosted / agent / vendored | User parent-selector / range-selector override (vendored) | Agent `symlink=false` / `hoist=false` | `list -g` |
@@ -247,8 +258,9 @@ Global mode (`-g`, v5 main `2463257`):
 7. `package-import-method=clone` on reflink (needs CI).
 8. #556 follow-ups: merging branch lockfiles after a hosted pin, and agent `vex` on the branch.
 8a. #830 follow-ups: a three-level vendored chain, a `scan --mode vendored` re-run over the broken `remove` state, and the pnpm 7/8 workspace dialect.
+8c. #880 / #881 follow-ups: a member of a workspace whose root uses `catalogs`, and the pnpm 7/8 dialect.
 8b. #853 follow-ups: the takeover over a peer-suffixed snapshot key and over a pnpm ≤6 legacy lock, and `vendor --dry-run` (manifest-driven) parity.
-9. Re-verify the open set when fixes land: #362, #435, #466, #492, #556, #590 (PR #598; include member-cwd `list`), #627 (PR #802), #633, #713, #714, #734, #756, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853 and #854.
+9. Re-verify the open set when fixes land: #435, #466, #492, #556, #633, #713, #714, #734, #756 (closed by #774; re-verify with a peer-dependency mock), #627 (closed by #802; re-verify), #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880 and #881.
 10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal, and the #853 un-hosting when switching from hosted; check that hosted handles the same checkout; hosted CRLF passes on Linux).
 
 ## Known non-bugs
@@ -310,3 +322,5 @@ Global mode (`-g`, v5 main `2463257`):
 - Vendored refuses a user parent-selector (`a>b`) or range-selector (`b@<2`) override for the target with `vendor_override_conflict` and writes nothing. The detail text is slightly off (it mentions an exact-pin takeover, or "package.json" on pnpm 12), which is cosmetic. (A bare-key exact pin in `pnpm-workspace.yaml` is NOT a genuine conflict: #854.)
 - An API that answers with lowercased npm purls for a mixed-case installed name (`Base64`) isn't matched by agent apply (`package_not_installed`). There's no evidence the real API lowercases, so treat it as hypothetical (run 20).
 - `scan --mode vendored --dry-run` over a hosted pin previews only `would_vendor` (no `vendor_would_revert_redirect`). It's not pnpm-specific, so it isn't filed here (run 21).
+- Fixture note: global (`-g`) cells must put the pnpm under test first on `PATH`. The sandbox ships pnpm 10.28.0 in `/opt/node22/bin`, and the CLI reads the global root from whichever `pnpm` it finds (run 22).
+- pnpm 9 ignores `sharedWorkspaceLockfile: false` in `pnpm-workspace.yaml` (only `.npmrc` `shared-workspace-lockfile=false` works there), so a 9.x member then has no lock of its own and the #590 refusal is correct.
