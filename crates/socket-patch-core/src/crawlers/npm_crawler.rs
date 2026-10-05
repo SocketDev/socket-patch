@@ -638,11 +638,53 @@ fn reachable_pnpm_global_virtual_store_entries_sync(nm: &Path) -> Vec<StoreEntry
 /// The real `links` dir of pnpm's global virtual store when `nm`'s
 /// `.modules.yaml` records one as its `virtualStoreDir`; `None` for the
 /// default store, a store inside the project, or any other outside dir.
+///
+/// A workspace member's `node_modules` has no `.modules.yaml`: pnpm
+/// writes it only at the workspace root. So when `nm` has none, the
+/// nearest enclosing `node_modules/.modules.yaml` is read instead. That
+/// record only names the store; the walk is still seeded from `nm`'s own
+/// links, so a record from some unrelated enclosing project can at worst
+/// let `nm`'s real links into a real global store be followed.
 fn pnpm_global_virtual_store_of_sync(nm: &Path) -> Option<PathBuf> {
-    let text = crate::utils::fs::read_regular_to_string_sync(&nm.join(PNPM_MODULES_YAML)).ok()?;
+    let own = nm.join(PNPM_MODULES_YAML);
+    let modules_yaml = if std::fs::symlink_metadata(&own).is_ok() {
+        own
+    } else {
+        enclosing_pnpm_modules_yaml_sync(nm)?
+    };
+    let text = crate::utils::fs::read_regular_to_string_sync(&modules_yaml).ok()?;
     let recorded = parse_modules_yaml_virtual_store_dir(&text)?;
-    let links = std::fs::canonicalize(nm.join(recorded)).ok()?;
+    let links = std::fs::canonicalize(modules_yaml.parent()?.join(recorded)).ok()?;
     crate::patch::shared_store::is_pnpm_global_virtual_store_dir(&links).then_some(links)
+}
+
+/// The nearest `<ancestor>/node_modules/.modules.yaml` above the importer
+/// holding `nm` (a pnpm workspace root's record, for a member).
+fn enclosing_pnpm_modules_yaml_sync(nm: &Path) -> Option<PathBuf> {
+    nm.parent()?.ancestors().skip(1).find_map(|dir| {
+        let candidate = dir.join("node_modules").join(PNPM_MODULES_YAML);
+        std::fs::symlink_metadata(&candidate)
+            .is_ok_and(|m| m.is_file())
+            .then_some(candidate)
+    })
+}
+
+/// Whether an importer `node_modules` listing without a `.modules.yaml`
+/// may still be a pnpm workspace member linked into the global virtual
+/// store (see [`pnpm_global_virtual_store_of_sync`]): it holds a package
+/// link or a scope dir. Keeps the enclosing-record lookup off plain
+/// npm/yarn trees, whose nested `node_modules` hold real dirs only.
+fn may_be_gvs_workspace_member(listing: &Listing) -> bool {
+    !listing
+        .entries
+        .iter()
+        .any(|e| e.name_str == PNPM_MODULES_YAML)
+        && listing.entries.iter().any(|e| {
+            !e.name_str.starts_with('.')
+                && e.file_type.is_some_and(|ft| {
+                    ft.is_symlink() || (ft.is_dir() && e.name_str.starts_with('@'))
+                })
+        })
 }
 
 /// The global-virtual-store entries `nm`'s package links point into: for
@@ -1502,9 +1544,16 @@ impl NpmCrawler {
                     .then_some((index, pkg_path))
             })
             .collect();
+        let gvs_member = !store_entry && may_be_gvs_workspace_member(&listing);
         let mut nested = Self::collect_nested_node_modules(&nm_path, listing);
         if store_entry {
             nested.extend(own_package_nested_node_modules_sync(&nm_path));
+        }
+        if gvs_member {
+            let entries = reachable_pnpm_global_virtual_store_entries_sync(&nm_path);
+            if !entries.is_empty() {
+                nested.push(NestedNodeModules::StoreEntries(entries));
+            }
         }
         ResolverVisit {
             store_entry,
@@ -1898,6 +1947,7 @@ impl NpmCrawler {
         store_entry: bool,
     ) -> Vec<ScanEvent> {
         let listing = listing.unwrap_or_else(|| list_dir_sync(node_modules_path));
+        let gvs_member = !store_entry && may_be_gvs_workspace_member(&listing);
         let mut pnpm_shaped_stores: Vec<(PathBuf, StoreLayout)> = Vec::new();
         let mut vlt_store: Option<PathBuf> = None;
         let mut npm_store: Option<PathBuf> = None;
@@ -2008,6 +2058,10 @@ impl NpmCrawler {
         .flatten()
         .collect();
         events.extend(Self::gather_own_packages(node_modules_path, own_packages));
+        if gvs_member {
+            global_store_entries =
+                reachable_pnpm_global_virtual_store_entries_sync(node_modules_path);
+        }
 
         for (store_path, layout) in pnpm_shaped_stores {
             let entries = Self::list_pnpm_shaped_store_entries_sync(&store_path, layout, true);
@@ -4690,6 +4744,74 @@ mod tests {
             !scanned.iter().any(|(p, _)| p == "pkg:npm/is-number@6.0.0"),
             "{scanned:?}"
         );
+    }
+
+    /// #362 in a workspace: pnpm writes `.modules.yaml` only at the
+    /// workspace root, so a member's `node_modules` (holding just its
+    /// own links into the global virtual store) has none. The member's
+    /// transitive deps must still be found through the root's record,
+    /// seeded from the member's own links only.
+    #[tokio::test]
+    async fn test_pnpm_global_virtual_store_workspace_member_entries_are_walked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base: PathBuf = std::fs::canonicalize(tmp.path())
+            .unwrap()
+            .components()
+            .collect();
+        let v11 = base.join("store").join("v11");
+        std::fs::create_dir_all(v11.join("files")).unwrap();
+        let links = v11.join("links");
+        let odd_nm = links.join("@/is-odd/3.0.1/aaa/node_modules");
+        write_pkg(&odd_nm.join("is-odd"), "is-odd", "3.0.1");
+        let number = links.join("@/is-number/6.0.0/bbb/node_modules/is-number");
+        write_pkg(&number, "is-number", "6.0.0");
+        link_dir(&number, &odd_nm.join("is-number"));
+        // Another project's package in the same store.
+        let other = links.join("@/left-pad/1.3.0/ddd/node_modules/left-pad");
+        write_pkg(&other, "left-pad", "1.3.0");
+
+        let root = base.join("proj");
+        let root_nm = root.join("node_modules");
+        std::fs::create_dir_all(root_nm.join(".pnpm/node_modules")).unwrap();
+        std::fs::write(
+            root_nm.join(".modules.yaml"),
+            "{\"layoutVersion\": 5, \"virtualStoreDir\": \"../../store/v11/links\"}",
+        )
+        .unwrap();
+        // The root's hoisted links live under `.pnpm/node_modules`.
+        link_dir(&other, &root_nm.join(".pnpm/node_modules/left-pad"));
+        std::fs::write(root.join("package.json"), "{\"name\": \"root\"}").unwrap();
+        let member_nm = root.join("packages/a/node_modules");
+        std::fs::create_dir_all(&member_nm).unwrap();
+        link_dir(&odd_nm.join("is-odd"), &member_nm.join("is-odd"));
+
+        let scanned = scan_paths(&root).await;
+        assert!(
+            scanned.contains(&("pkg:npm/is-number@6.0.0".to_string(), number.clone())),
+            "{scanned:?}"
+        );
+        assert!(
+            !scanned.iter().any(|(p, _)| p == "pkg:npm/left-pad@1.3.0"),
+            "{scanned:?}"
+        );
+
+        let found = NpmCrawler::new()
+            .find_by_purls(
+                &member_nm,
+                &[
+                    "pkg:npm/is-number@6.0.0".to_string(),
+                    "pkg:npm/left-pad@1.3.0".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        let paths = |purl: &str| {
+            found
+                .get(purl)
+                .map(|c| c.iter().map(|p| p.path.clone()).collect::<Vec<_>>())
+        };
+        assert_eq!(paths("pkg:npm/is-number@6.0.0"), Some(vec![number]));
+        assert_eq!(paths("pkg:npm/left-pad@1.3.0"), None);
     }
 
     /// Old pnpm records `virtualStoreDir` as an absolute path. A store

@@ -171,3 +171,48 @@ fn other_projects_global_virtual_store_entries_stay_invisible() {
     assert_eq!(ev["errorCode"], "package_not_installed", "{ev}");
     assert_eq!(std::fs::read(left_pad.join("index.js")).unwrap(), BEFORE);
 }
+
+/// A pnpm workspace (#362, review on #829): pnpm writes `.modules.yaml`
+/// only at the workspace root, and a member's `node_modules` holds just
+/// its own links into the store. The member's transitive `is-number` is
+/// refused as shared too, not reported as a lockfile-only skip.
+#[test]
+fn workspace_member_transitive_global_virtual_store_dep_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (proj, number, _) = stage(tmp.path());
+    // Move the direct link from the root to member `packages/a`.
+    let root_nm = proj.join("node_modules");
+    let odd = std::fs::canonicalize(root_nm.join("is-odd")).unwrap();
+    #[cfg(unix)]
+    std::fs::remove_file(root_nm.join("is-odd")).unwrap();
+    #[cfg(windows)]
+    std::fs::remove_dir(root_nm.join("is-odd")).unwrap();
+    std::fs::create_dir_all(root_nm.join(".pnpm").join("node_modules")).unwrap();
+    std::fs::write(
+        proj.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\n",
+    )
+    .unwrap();
+    let member = proj.join("packages").join("a");
+    let member_nm = member.join("node_modules");
+    std::fs::create_dir_all(&member_nm).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        r#"{ "name": "a", "version": "0.0.0", "dependencies": { "is-odd": "3.0.1" } }"#,
+    )
+    .unwrap();
+    link_dir(&odd, &member_nm.join("is-odd"));
+    write_manifest(&proj, "pkg:npm/is-number@6.0.0");
+
+    let (code, stdout, stderr) = run_with_env(
+        &proj,
+        &["apply", "--offline", "--json"],
+        &[("SOCKET_TELEMETRY_DISABLED", "1")],
+    );
+    let v = parse_json_envelope(&stdout);
+    assert_ne!(code, 0, "{v}\n{stderr}");
+    let ev = event(&v, "pkg:npm/is-number@6.0.0");
+    assert_ne!(ev["errorCode"], "package_not_installed", "{ev}");
+    assert!(ev.to_string().contains("enableGlobalVirtualStore"), "{ev}");
+    assert_eq!(std::fs::read(number.join("index.js")).unwrap(), BEFORE);
+}

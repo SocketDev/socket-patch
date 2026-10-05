@@ -158,7 +158,9 @@ in place would patch them as well. For pnpm's global virtual store
 (`enableGlobalVirtualStore`, `<store>/v<N>/links` under the pnpm store
 directory), only the entries this project reaches are walked: its
 `node_modules/<dep>` links into the store, and each entry's dependency
-links on to other entries. Agent-mode `apply` and `rollback` then fail on
+links on to other entries. A workspace member's `node_modules` has no
+`.modules.yaml` of its own (pnpm writes it only at the workspace root), so
+the root's record is used, and the member's own links seed the walk. Agent-mode `apply` and `rollback` then fail on
 those copies, direct and transitive alike, instead of writing through
 them, and never report a transitive one as "not installed". PDM's symlink install
 cache gets the same treatment: with `install.cache` and
