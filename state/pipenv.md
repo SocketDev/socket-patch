@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-05 ~03:40Z, main `045d7ec` (CLI 4.0.0, unchanged). The new Pipenv 2020.11.15 / 2021.5.29 rows pass hosted, vendored (incl. tamper), agent, stale warning + remedies, `get` / `remove`. Mixed-sources hosted rollback (6b), a symlinked lock (refused), a symlinked `.venv`, venv drift and a pdm-backend pyproject all pass. `pipenv --site-packages` gives a false VEX in hosted + vendored even on a fresh venv; that's #409 (pm:pip), commented. PR #654 (#645 + #546), PR #730 (#725) and PR #795 (#790) are still open.
+Last run: 2026-10-05 ~09:30Z, main `045d7ec` (CLI 4.0.0, unchanged). A Pipfile `[pipenv] venv_in_project = true` with no `./.venv` makes agent mode miss the WORKON_HOME venv on Pipenv 2018–2026.1 (only 2026.2+ read the key). It patches the system Python instead and vex attests `not_affected`: filed #842 (PR #654 doesn't fix it). PR #654 (#645 + #546), #730 (#725), #795 (#790) and #825 (#769) are still open.
 
 ## Coverage matrix
 
@@ -17,7 +17,7 @@ Cells marked v5 were re-run on `2463257` (v5: no hosted ledger, upstream-restore
 | Linux | 2020.11.15 (py3.8) | warm venv agent + rollback pass `045d7ec`; `.venv` + `PIPENV_VENV_IN_PROJECT=0` → global fallback fail #645 | untested | pass `045d7ec` (lock-only deploy / sync / vex / byte-exact rollback) | stale warning + both remedies + vex pass `045d7ec` | untested | pass `045d7ec` (lock-only, tamper rejected, `vendor --check` exit 1) | untested | untested | untested |
 | Linux | 2021.5.29 (py3.8) | same as 2020.11.15 (pass; #645 shape fails) | untested | pass `045d7ec` (+ `get CVE`, idempotent re-run, `remove` byte-exact) | stale warning + both remedies + vex pass `045d7ec` | untested | pass `045d7ec` (+ `get --mode vendored`, `remove` byte-exact) | untested | untested | untested |
 | Linux | 2024.4.1 | pass `61cfb9b`; multi-copy + rollback w/ modified copy pass `045d7ec` | untested | pass `61cfb9b` (default + `[docs]`, verify / requirements / sync / --deploy / vex / byte-exact rollback) | untested | untested | pass `61cfb9b` (both categories, sync / --deploy / vex / repair / rollback) | untested | untested | untested |
-| Linux | 2025.1.3 | multi-copy + rollback w/ modified copy pass `045d7ec` | untested | pass `61cfb9b` (same as 2024.4.1) | untested | untested | pass `61cfb9b` (same as 2024.4.1) | untested | untested | untested |
+| Linux | 2025.1.3 | multi-copy + rollback w/ modified copy pass `045d7ec`; Pipfile `venv_in_project = true` fail #842 `045d7ec` (also 2018 / 2023 / 2026.1) | untested | pass `61cfb9b` (same as 2024.4.1) | untested | untested | pass `61cfb9b` (same as 2024.4.1) | untested | untested | untested |
 | macOS | 2023.12.1 | pass | fail #334 | untested | untested | fail #333 | untested | untested | untested | fail #384 |
 | macOS | 2026.8.0 | pass | fail #334 | untested | untested | fail #333 | untested | untested | untested | fail #384 |
 | Windows | 2023.12.1 | pass | fail #334 | untested | untested | fail #333 | untested | untested | untested | fail #384 |
@@ -62,6 +62,8 @@ Stale-install remedy followed verbatim, `15:30Z` run, `045d7ec`: `default` patch
 
 `03:38Z` run (2026-10-05), `045d7ec`: mixed sources (a mirror named `pypi` first, pypi.org as `upstream`) hosted rollback on 2026: an index-less entry is restored byte-exact (pass); `index = "pypi"` (the mirror) is refused (documented). Symlinked `Pipfile` / `Pipfile.lock`: hosted `redirect_symlinked_file_unsupported` and vendored `pypi_pipenv_symlink_unsupported`, nothing written (pass). `.venv` symlinked to an out-of-tree directory (IN_PROJECT=1 / unset): pass. Venv drift (venv 1.15.0, lock 1.16.0), hosted + vendored: pass. Pipenv project with a pdm-backend `pyproject.toml`: pass. `list` on hosted: pass. `pipenv --site-packages` / `PIPENV_SITE_PACKAGES=1` with six in the base interpreter: hosted (2018 / 2022 / 2023 / 2026) and vendored (2018 / 2026) keep the base's unpatched six even in a fresh venv, give no warning, and vex attests `not_affected`: fail, #409 (commented).
 
+`09:32Z` run (2026-10-05), `045d7ec`: Pipfile `[pipenv] venv_in_project = true` with no `./.venv`, agent mode: fail #842 on 2018.11.26 / 2023.12.1 / 2025.1.3 / 2026.1.0 (WORKON venv unpatched, system Python patched, vex `not_affected`); pass on 2026.8.0 (`./.venv`) and on the key-less control; the PR #654 head `d8356ae` still fails. Relative `WORKON_HOME` with `--cwd` from another directory: misses the venv (see Known non-bugs).
+
 macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-03 03:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
@@ -76,7 +78,8 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 5. **Maintainer request (global `-g` mode):** still to do: macOS / Windows, `-g` on 2018 / 11, and `--global-prefix` as a venv root (scans 0; undocumented). Checklist in the 20261001T040000Z entry.
 6. Re-verify #725 once fixed (incl. the uuid-drift shapes), and #744. (`install <other>` on 2022 / 2023 and the vendor / apply dry-run VEX: done 2026-10-04 21:42Z, pass.) (Mirror-named `pypi` source and hosted path-prefix on 11 / 2018 / 2022 done 2026-10-03 21:36Z, pass.)
 6b. Re-verify #409 for Pipenv once fixed: `--site-packages` fresh + warm venv, hosted + vendored, 2018–2026 (stale warning or vex refusal expected). (Mixed-sources hosted rollback: done 2026-10-05, pass.)
-6c. Pipenv 2020 / 2021: the #790 `[dev-packages]` remedy, and include them in the #645 re-verification. A relative `WORKON_HOME` with `--cwd` run from another directory.
+6c. Pipenv 2020 / 2021: the #790 `[dev-packages]` remedy, and include them in the #645 re-verification. (Relative `WORKON_HOME` with `--cwd`: done 2026-10-05 09:32Z, see Known non-bugs.)
+6d. #842: verify the hosted shape (stale-install warning with a warm WORKON venv + `venv_in_project = true` on ≤ 2026.1), and re-verify once fixed (2018 / 2023 / 2025 / 2026.1 fail, 2026.2+ use `./.venv`). Also Pipfile key × `PIPENV_VENV_IN_PROJECT` precedence on 2026.2+.
 7. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546 / #645, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked until branch deletion through the git proxy works (still denied 2026-10-05 03:30Z).
 
 ## Known non-bugs
@@ -130,3 +133,4 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - A symlinked `Pipfile.lock` is refused in hosted (`redirect_symlinked_file_unsupported`) and vendored (`pypi_pipenv_symlink_unsupported`) mode, and nothing is written. Fail-closed by design.
 - `pipenv --site-packages` false VEX: not Pipenv-specific; tracked in #409 (pm:pip), with Pipenv evidence in a comment there. Don't re-file it.
 - Mock-API notes: the blob route must return the content for the requested hash (before or after), or agent rollback fails with a hash mismatch; `get CVE-…` needs a `/patches/by-cve/` route.
+- A relative `WORKON_HOME` (e.g. `.venvs`) is resolved against socket-patch's process cwd, as Python does, not against `--cwd`. So `scan --cwd app` run from the parent misses `app/.venvs/…`, while running inside `app/` passes. Not filed: the env var means whatever the reading process's cwd makes it, and Pipenv run from a subdirectory would differ too. The system-Python write that follows is #504.
