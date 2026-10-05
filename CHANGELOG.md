@@ -102,11 +102,6 @@ limits, and required install commands.
 
 ### Fixed
 
-- Hosted mode refuses a Yarn Berry project whose root `package.json` mixes CRLF
-  and LF line endings (`redirect_yarn_berry_mixed_line_endings`), as vendored
-  mode already did, instead of rewriting every minority line. Both modes now
-  share one set of berry project gates (line endings, `cacheKey`,
-  `compressionLevel`).
 - Global mode (`-g`) finds npm, yarn, pnpm, bun, RubyGems and Composer on
   Windows, where they install as `.cmd` / `.bat` shims, instead of reporting
   an empty scan. The yarn and npm-family global lookups no longer run from the
